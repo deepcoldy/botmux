@@ -40,7 +40,7 @@ import { currentDeviceIsolationFreezeLease } from './device-isolation-activation
 import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
 import { activeSessionKey, sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
-import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
+import type { TriggerErrorCode, TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { logger } from '../utils/logger.js';
 import type { CliTurnPayload } from '../types.js';
@@ -323,13 +323,19 @@ export function externalEventOpensOwnTopic(chatMode: ChatMode, regularGroupMode:
   return chatMode === 'topic' || regularGroupMode === 'new-topic';
 }
 
-function resolveWorkingDir(larkAppId: string, chatId: string): { ok: true; workingDir: string; fromBotDefault: boolean } | { ok: false; error: string } {
+function resolveWorkingDir(larkAppId: string, chatId: string, explicit?: string): { ok: true; workingDir: string; fromBotDefault: boolean } | { ok: false; errorCode: TriggerErrorCode; error: string } {
+  if (explicit !== undefined) {
+    const v = validateWorkingDir(explicit, localeForBot(larkAppId));
+    return v.ok
+      ? { ok: true, workingDir: v.resolvedPath, fromBotDefault: false }
+      : { ok: false, errorCode: 'bad_request', error: v.error };
+  }
   const bot = getBot(larkAppId);
   const oncall = oncallStore.getOncallStatus(larkAppId, chatId)?.workingDir;
   const botDefault = effectiveDefaultWorkingDir(bot.config);
   const candidate = oncall || botDefault || bot.config.workingDir || '~';
   const v = validateWorkingDir(candidate, localeForBot(larkAppId));
-  if (!v.ok) return { ok: false, error: v.error };
+  if (!v.ok) return { ok: false, errorCode: 'trigger_failed', error: v.error };
   // 仅当命中本 bot 自己的 defaultWorkingDir（layer 3，非 oncall 绑定）时才允许 auto-worktree。
   // 无 oncall 时 candidate 就是 botDefault（它排在 bot.config.workingDir/'~' 之前），故
   // `!oncall && botDefault` 即可刻画"来自本 bot 默认目录"。
@@ -1898,15 +1904,18 @@ async function triggerSessionTurnAdmitted(
 
   if (ds) return deliverToExisting(ds);
 
-  const resolvedWd = resolveWorkingDir(larkAppId, chatId);
+  const resolvedWd = resolveWorkingDir(larkAppId, chatId, req.options?.workingDir);
   if (!resolvedWd.ok) {
-    return { ok: false, errorCode: 'trigger_failed', error: resolvedWd.error };
+    return { ok: false, errorCode: resolvedWd.errorCode, error: resolvedWd.error };
   }
   // 个人助理模式：触发器建的会话归该群的主人、cwd 在主人 work/（不建 worktree）；
   // 群未认领（含私聊——触发器不知道是谁在说话）就拒绝。
   const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, 'group', undefined);
   if (assistantSpawn.kind === 'unclaimed') {
     return { ok: false, errorCode: 'trigger_failed', error: 'assistant mode: this chat has no assistant owner' };
+  }
+  if (assistantSpawn.kind === 'owner' && req.options?.workingDir !== undefined) {
+    return { ok: false, errorCode: 'bad_request', error: 'assistant mode: options.workingDir is not supported; the session runs in the chat owner work dir' };
   }
   const wd = assistantSpawn.kind === 'owner'
     ? { ok: true as const, workingDir: assistantSpawn.workDir, fromBotDefault: false }

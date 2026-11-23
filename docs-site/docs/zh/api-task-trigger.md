@@ -183,6 +183,7 @@ curl "http://<daemon-host>:7891/api/sessions/2eed60c4-.../trigger-result" \
 | `steer` | 布尔 | 允许把追问插进正在跑的那一轮（仅 Codex App），见 §6.5。和 `dryRun` 互斥 |
 | `allowChatMessages` | 布尔 | 允许这一轮主动往群里发消息，见 §6.6 |
 | `suppressFinalOutput` | 布尔 | 只在**即发即忘 + 真群**时生效：不发群里那条收尾回复 |
+| `workingDir` | 非空，≤4096 字符 | 本次新会话的工作目录，必须是已存在的目录，见 §5.7 |
 
 以上布尔字段都要求严格布尔值：传 `"true"`、`1` 会 400。
 
@@ -260,6 +261,7 @@ curl "http://<daemon-host>:7891/api/sessions/2eed60c4-.../trigger-result" \
 
 - **不建 worktree**：即使机器人开了「自动创建 worktree」，虚拟会话和同步/异步会话也**一律在基础目录直接跑**，避免每次程序调用都留下一个 worktree。只有「真群 + 即发即忘 + 落在机器人自己的默认目录」才会自动建 worktree。
 - **工作目录的选法更简单**：依次取 oncall 绑定目录 → 机器人默认目录（含 `defaultOncall.workingDir`）→ 机器人 `workingDir` → `~`。不会从兄弟会话继承目录（`botToBotSameDir` 在这里不生效），也不会自动绑定 oncall。需要固定目录时，请直接在机器人或 oncall 上配置好。
+- **按请求指定目录**：传 `options.workingDir` 时，新会话直接在这个目录跑，不走上面的顺序，也不建 worktree。和 `model` 一样只对新建的会话生效，落到已有会话时沿用该会话原来的目录。目录不存在或不是目录 → 400 `bad_request`；个人助理模式的群不支持，同样 400。只接受宿主级调用（Dashboard 转发或带宿主签名的直连）；core-only 模式下免鉴权的 `/api/trigger` 带这个字段会返回 **403 `working_dir_not_allowed`**。
 
 ---
 
@@ -602,6 +604,7 @@ curl -X POST "http://<host>:7891/api/sessions/:sessionId/close" \
 | 400 | `bad_json` / `bad_request` / `target_required` | 请求格式或组合不对 |
 | 400 | `bot_not_found` | `botId` 和这个 daemon 对不上 |
 | 403 | `bot_not_in_chat` | 机器人不在目标群 |
+| 403 | `working_dir_not_allowed` | 免鉴权调用带了 `options.workingDir`（见 §5.7） |
 | 404 | `session_not_found` | `target.sessionId` 不存在 |
 | 409 | `idempotency_conflict` | 同键不同内容 |
 | 410 | `legacy_workflow_retired` | `target.kind: "workflow"`（已退役） |

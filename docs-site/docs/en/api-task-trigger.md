@@ -183,6 +183,7 @@ Why `trusted` must be `false`: prompt-injection protection. The daemon wraps the
 | `steer` | boolean | Allow a follow-up to be merged into the running turn (Codex App only), see §6.5. Mutually exclusive with `dryRun` |
 | `allowChatMessages` | boolean | Let this turn post messages to the group, see §6.6 |
 | `suppressFinalOutput` | boolean | Only effective for **fire-and-forget + real group**: skip the closing reply in the group |
+| `workingDir` | non-empty, ≤4096 chars | Working directory for this new session; must be an existing directory, see §5.7 |
 
 All boolean fields must be real booleans: `"true"` or `1` is a 400.
 
@@ -260,6 +261,7 @@ The group is inherited from the session; no need to pass it.
 
 - **No worktree**: even if the bot has "auto-create worktree" on, virtual and sync/async sessions **always run in the base directory**, so programmatic calls don't leave a worktree behind each time. Only "real group + fire-and-forget + the bot's own default directory" gets an auto worktree.
 - **Simpler working-directory choice**: oncall-bound directory → bot default directory (including `defaultOncall.workingDir`) → bot `workingDir` → `~`. Directories aren't inherited from sibling sessions (`botToBotSameDir` doesn't apply here), and oncall isn't auto-bound. If you need a fixed directory, configure it on the bot or oncall.
+- **Per-request directory**: with `options.workingDir`, the new session runs in that directory instead of the order above, and no worktree is created. Like `model`, it only applies to newly created sessions; a request that lands in an existing session keeps that session's directory. A missing path or a non-directory → 400 `bad_request`; assistant-mode chats don't support it (also 400). Only host-level callers may set it (Dashboard-proxied or host-signed direct calls); on the unauthenticated core-only `/api/trigger` route the field returns **403 `working_dir_not_allowed`**.
 
 ---
 
@@ -602,6 +604,7 @@ If there was no result before closing, polling afterwards returns `state: "faile
 | 400 | `bad_json` / `bad_request` / `target_required` | Malformed request or invalid combination |
 | 400 | `bot_not_found` | `botId` doesn't match this daemon |
 | 403 | `bot_not_in_chat` | Bot isn't in the target group |
+| 403 | `working_dir_not_allowed` | An unauthenticated call carried `options.workingDir` (see §5.7) |
 | 404 | `session_not_found` | `target.sessionId` doesn't exist |
 | 409 | `idempotency_conflict` | Same key, different content |
 | 410 | `legacy_workflow_retired` | `target.kind: "workflow"` (retired) |

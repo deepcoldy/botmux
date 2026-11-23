@@ -13565,6 +13565,53 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     expect((await fetch(`${base}/api/asks/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"askId":"x","selections":[]}' })).status).toBe(401);
   });
 
+  const workingDirTriggerBody = JSON.stringify({
+    source: { type: 'webhook' },
+    target: { kind: 'turn', botId: 'local_smoke', sessionId: 'fixture-session' },
+    instruction: 'Run the analysis',
+    envelope: { sourceName: 'Example client', format: 'text', trusted: false },
+    options: { workingDir: '/tmp' },
+  });
+
+  it('refuses options.workingDir on the unauthenticated core-only public trigger route', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    setCoreOnlyReady();
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: workingDirTriggerBody,
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode: 'working_dir_not_allowed' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  it('lets a trusted-host trigger carry options.workingDir past the gate into session routing', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger', handle.port) },
+        body: workingDirTriggerBody,
+      });
+      // Past the gate the request reaches session routing; this fixture has no
+      // registered bot, so routing itself fails there.
+      expect(response.status).not.toBe(403);
+      expect(await response.json()).not.toMatchObject({ errorCode: 'working_dir_not_allowed' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
   it('rejects an unsigned owner IPC request before owner resolution without outer auth', async () => {
     setLarkAppId('cli_owner_without_outer_auth');
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });

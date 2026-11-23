@@ -125,6 +125,13 @@ export interface TriggerRequest {
      * drive-my-own-turn surface (core-only loopback); steer authorizes mid-turn
      * injection into the SAME tenant's turn, never a cross-session capability. */
     steer?: boolean;
+    /** Working directory for a freshly-spawned session, replacing the oncall /
+     *  bot-default choice (and therefore never auto-worktreed). Same
+     *  fresh-spawn-only semantics as `model`: a request that lands in an
+     *  existing session keeps that session's directory. The daemon accepts it
+     *  only from trusted-host callers, never on the unauthenticated core-only
+     *  loopback route. */
+    workingDir?: string;
   };
 }
 
@@ -132,6 +139,7 @@ export type TriggerErrorCode =
   | 'bad_json'
   | 'bad_request'
   | 'actor_not_allowed'
+  | 'working_dir_not_allowed'
   | 'owner_unresolved'
   | 'bot_not_found'
   | 'bot_not_in_chat'
@@ -374,6 +382,10 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   }
   if (options.model !== undefined && (typeof options.model !== 'string' || options.model.length > 200)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.model must be a string (<=200 chars)' } };
+  }
+  if (options.workingDir !== undefined
+    && (typeof options.workingDir !== 'string' || !options.workingDir.trim() || options.workingDir.length > 4096)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.workingDir must be a non-empty string (<=4096 chars)' } };
   }
   if (options.reasoningEffort !== undefined && !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(options.reasoningEffort as string)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.reasoningEffort must be one of low|medium|high|xhigh|max|ultra' } };

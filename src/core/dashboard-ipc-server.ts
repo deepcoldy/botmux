@@ -8892,6 +8892,9 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, owner
   if (ownerActorEndpoint !== (valid.request.actor === 'owner')) {
     return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
   }
+  if (valid.request.options?.workingDir !== undefined && !isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'working_dir_not_allowed' });
+  }
   if (valid.request.target.botId && valid.request.target.botId !== cachedLarkAppId) {
     return jsonRes(res, 400, {
       ok: false,

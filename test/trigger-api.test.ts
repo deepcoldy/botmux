@@ -113,6 +113,19 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
   });
 
+  it('accepts options.workingDir only as a non-empty string', () => {
+    const ok = request();
+    ok.options = { ...ok.options, workingDir: '/repo/worktree-1' };
+    expect(validateTriggerRequest(ok).ok).toBe(true);
+    for (const workingDir of ['', '   ', 42, null, 'x'.repeat(4097)]) {
+      const bad = request() as any;
+      bad.options.workingDir = workingDir;
+      const v = validateTriggerRequest(bad);
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+    }
+  });
+
   it('accepts payloadTrusted only as literal true on a webhook turn', () => {
     const ok = request();
     ok.payloadTrusted = true;

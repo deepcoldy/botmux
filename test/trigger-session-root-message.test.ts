@@ -3,6 +3,9 @@
 // touching live botmux data (see the helper).
 import './helpers/require-fenced-data-dir.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { resolveTurnOrigin } from '../src/core/turn-origin.js';
@@ -436,6 +439,50 @@ describe('triggerSessionTurn rootMessageId target', () => {
       const refused = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: empty });
       expect(refused).toMatchObject({ ok: false });
       expect(empty.size).toBe(0);
+      expect(mockForkWorker).not.toHaveBeenCalled();
+    } finally {
+      assistant.spawn = { kind: 'off' };
+    }
+  });
+
+  it('runs a new session in options.workingDir instead of the bot default and never auto-worktrees it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'trigger-workdir-'));
+    try {
+      mockBotAutoWorktreeEnabled.mockReturnValue(true);
+      const req = request();
+      req.options = { workingDir: dir };
+      const activeSessions = new Map<string, DaemonSession>();
+      const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+      expect(res).toMatchObject({ ok: true });
+      const ds = activeSessions.get(sessionKey(ROOT, APP));
+      expect(ds?.session.workingDir).toBe(dir);
+      expect(ds?.pendingRepo).toBeFalsy();
+      expect(mockRunAutoWorktreeCommit).not.toHaveBeenCalled();
+      expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a missing options.workingDir as a bad request without creating a session', async () => {
+    const req = request();
+    req.options = { workingDir: join(tmpdir(), 'trigger-workdir-missing-dir') };
+    const activeSessions = new Map<string, DaemonSession>();
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    expect(res).toMatchObject({ ok: false, errorCode: 'bad_request' });
+    expect(activeSessions.size).toBe(0);
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+
+  it('assistant mode refuses options.workingDir instead of silently running in the owner work dir', async () => {
+    try {
+      assistant.spawn = { kind: 'owner', openId: 'ou_owner_a', workDir: '/home/u/ou_owner_a/work' };
+      const req = request();
+      req.options = { workingDir: tmpdir() };
+      const activeSessions = new Map<string, DaemonSession>();
+      const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+      expect(res).toMatchObject({ ok: false, errorCode: 'bad_request' });
+      expect(activeSessions.size).toBe(0);
       expect(mockForkWorker).not.toHaveBeenCalled();
     } finally {
       assistant.spawn = { kind: 'off' };
@@ -1242,6 +1289,21 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(res).toMatchObject({ ok: true, action: 'queued', target: { sessionId: 'sess_existing', chatId: CHAT } });
     expect(mockCreateSession).not.toHaveBeenCalled();
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('follow:') }, { resume: true, turnId: expect.stringMatching(/^trg_/) });
+  });
+
+  it('keeps an existing session in its own directory when the request carries options.workingDir', async () => {
+    const ds = existingDs();
+    ds.session.workingDir = '/repo/original';
+    ds.workingDir = '/repo/original';
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const req = request();
+    req.options = { workingDir: tmpdir() };
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(res).toMatchObject({ ok: true, target: { sessionId: 'sess_existing' } });
+    expect(mockCreateSession).not.toHaveBeenCalled();
+    expect(ds.session.workingDir).toBe('/repo/original');
+    expect(ds.workingDir).toBe('/repo/original');
   });
 
   it('fails closed for a dormant ledger-only owner instead of reforking over it', async () => {
