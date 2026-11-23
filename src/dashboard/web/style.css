@@ -34905,7 +34905,8 @@ dialog.command-palette-dialog::backdrop {
    飞书右侧栏里只有 350–800px 宽：详情页单列，汇总页的行在窄屏把元信息折到第二行。
    颜色全部走 token，暗色主题自动跟随。
    ═══════════════════════════════════════════════════════════════════ */
-.dboard-page { gap: 14px; min-width: 0; }
+/* 单列网格的列宽封顶在容器宽度：标签栏（四个标签不换行）的最小宽度不能把整页撑出屏幕，窄了就在标签栏里横向滚。 */
+.dboard-page { gap: 14px; min-width: 0; grid-template-columns: minmax(0, 1fr); }
 .dboard-heading {
   position: sticky;
   top: 0;
@@ -35049,6 +35050,99 @@ a.dboard-join-btn {
 a.dboard-join-btn:hover { border-color: var(--accent); background: var(--accent); color: var(--on-accent); }
 .dboard-chat-tag { flex: none; padding: 0 6px; border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--accent-strong); font-size: var(--fs-11); font-weight: var(--fw-m); line-height: 18px; white-space: nowrap; }
 .dboard-chat-tag.is-warn { background: var(--warning-soft); color: var(--warning); }
+
+/* 父子任务：子任务排在上级后面、按层缩进（超过 4 层不再加缩进，手机侧栏放得下）。 */
+.dboard-row-item[data-depth] > .dboard-row { padding-left: calc(8px + min(var(--dboard-depth, 0), 4) * 18px); }
+.dboard-tree-mark { flex: none; color: var(--faint); font-family: var(--mono); font-size: var(--fs-12); }
+.dboard-row-tree { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; min-width: 0; color: var(--fg-2); font-size: var(--fs-12); }
+.dboard-row-parent { min-width: 0; color: var(--muted); overflow-wrap: anywhere; }
+.dboard-child-progress {
+  flex: none;
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  color: var(--fg-2);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-m);
+  line-height: 18px;
+  white-space: nowrap;
+}
+.dboard-child-progress.is-ready { background: var(--success-soft); color: var(--success); }
+.dboard-ready { flex: none; color: var(--success); font-size: var(--fs-12); font-weight: var(--fw-m); }
+
+/* 总览：分组 + 每组一张树形列表；每项第二行是跟进情况（在等谁 / 最近进展 / 复查时间 / 子任务）。 */
+.dboard-overview { display: grid; gap: 16px; min-width: 0; }
+.dboard-ov-summary { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; }
+.dboard-ov-chip {
+  padding: 2px 10px;
+  border-radius: var(--radius-full);
+  background: var(--surface-muted);
+  color: var(--fg-2);
+  font-size: var(--fs-12);
+  line-height: 20px;
+  white-space: nowrap;
+}
+.dboard-ov-chip b { color: inherit; font-weight: var(--fw-s); }
+.dboard-ov-chip.is-needs_you { background: var(--st-need-soft); color: var(--st-need); }
+.dboard-ov-chip.is-overdue,
+.dboard-ov-chip.is-stalled { background: var(--warning-soft); color: var(--warning); }
+.dboard-ov-section { display: grid; gap: 6px; min-width: 0; }
+.dboard-ov-head { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; margin: 0; font-size: var(--fs-14); font-weight: var(--fw-s); }
+.dboard-ov-head small { flex: 1 1 200px; min-width: 0; color: var(--muted); font-size: var(--fs-12); font-weight: var(--fw-r); }
+.dboard-ov-section[data-group="needs_you"] .dboard-ov-head-label { color: var(--st-need); }
+.dboard-ov-section[data-group="overdue"] .dboard-ov-head-label,
+.dboard-ov-section[data-group="stalled"] .dboard-ov-head-label { color: var(--warning); }
+.dboard-ov-row { min-width: 0; }
+.dboard-ov-row:hover { background: var(--surface-hover); }
+.dboard-ov-link {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px 14px;
+  padding-left: calc(14px + min(var(--dboard-depth, 0), 4) * 18px);
+  color: var(--fg);
+  text-decoration: none;
+}
+.dboard-ov-title { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.dboard-ov-title strong { min-width: 0; overflow-wrap: anywhere; font-weight: var(--fw-s); }
+.dboard-ov-title .dboard-row-dot { flex: none; line-height: inherit; }
+.dboard-ov-row.is-context .dboard-ov-title strong,
+.dboard-ov-row.is-context .dboard-seq { color: var(--faint); font-weight: var(--fw-r); }
+.dboard-ov-meta,
+.dboard-detail-track { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; min-width: 0; margin: 0; color: var(--muted); font-size: var(--fs-12); }
+.dboard-ov-meta .dboard-state { max-width: 220px; }
+.dboard-track-wait {
+  padding: 0 8px;
+  border-radius: var(--radius-full);
+  background: var(--surface-muted);
+  color: var(--fg-2);
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+.dboard-track-wait.is-owner { background: var(--accent-soft); color: var(--accent-strong); font-weight: var(--fw-m); }
+.dboard-track-wait.is-external { background: var(--info-soft); color: var(--info); }
+.dboard-track-time,
+.dboard-track-check { white-space: nowrap; }
+.dboard-track-time.is-stale,
+.dboard-track-check.is-due { color: var(--warning); font-weight: var(--fw-m); }
+
+/* 详情页：上级链接、子任务列表。.page 是 grid，链接要靠左，不能被拉满整行。 */
+.dboard-parent-link { justify-self: start; color: var(--muted); font-size: var(--fs-12); text-decoration: none; overflow-wrap: anywhere; }
+.dboard-parent-link:hover { color: var(--accent-strong); }
+.dboard-children-list {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+.dboard-children-list > li + li { border-top: 1px solid var(--border-soft); }
+.dboard-child { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 12px; color: var(--fg); font-size: var(--fs-13); text-decoration: none; }
+.dboard-child:hover { background: var(--surface-hover); }
+.dboard-child-title { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.dboard-child .dboard-state { flex: none; max-width: 45%; }
 
 /* 阶段是管家写的自由文本，可能很长：放不下就省略，全文在 title 里。 */
 .dboard-state {
@@ -35412,7 +35506,11 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .dboard-result-line.tone-error { color: var(--danger); }
 
 @media (max-width: 560px) {
+  .dboard-tabs > button { gap: 4px; padding: 0 9px; }
   .dboard-row { grid-template-columns: 12px minmax(0, 1fr); }
+  .dboard-row-item[data-depth] > .dboard-row { padding-left: calc(6px + min(var(--dboard-depth, 0), 4) * 12px); }
+  .dboard-ov-link { padding: 8px 10px; padding-left: calc(10px + min(var(--dboard-depth, 0), 4) * 12px); }
+  .dboard-ov-meta .dboard-state { max-width: 100%; }
   .dboard-row-join { min-width: 0; padding-right: 10px; }
   .dboard-row-meta { grid-column: 2; justify-content: flex-start; }
   .dboard-page .dboard-search { max-width: none; }

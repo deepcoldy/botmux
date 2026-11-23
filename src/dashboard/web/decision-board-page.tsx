@@ -56,6 +56,15 @@ import {
   BOARD_IMAGE_TYPES,
   BOARD_VIEW_LABEL_KEYS,
   BOARD_VIEW_ORDER,
+  OVERVIEW_GROUP_KEYS,
+  buildBoardOverview,
+  childProgressText,
+  nestBoardList,
+  overviewGroupCounts,
+  pageViewCount,
+  readyToWrapUp,
+  serverView,
+  trackingView,
   EMPTY_DRAFT,
   batchView,
   boardClock,
@@ -100,7 +109,9 @@ import {
   type BoardRoute,
   type BoardState,
   type BoardSummary,
-  type BoardView,
+  type BoardItemSummary,
+  type BoardPageView,
+  type ChildStats,
   type DraftInput,
   type DraftSaveState,
   type ItemChatView,
@@ -655,22 +666,60 @@ function CloseInChatButton(props: {
   </>;
 }
 
-function BoardRow(props: { appId: string; item: BoardListResponse['items'][number]; now: number; onChanged(): void }) {
+/** 树里第几层：给 CSS 算缩进（手机侧栏里超过 4 层不再加缩进）。 */
+function depthStyle(depth: number): Record<string, number> | undefined {
+  return depth ? { '--dboard-depth': depth } : undefined;
+}
+
+/** 子任务完成情况「子任务 3/5」+ 都结束了时的「可以收尾」。 */
+function ChildProgress(props: { state: BoardState; stats: ChildStats | undefined }) {
+  const tr = useT();
+  if (!props.stats?.total) return null;
+  const progress = childProgressText(props.stats, tr);
+  const ready = readyToWrapUp({ state: props.state, childStats: props.stats });
+  return (
+    <>
+      <span className={`dboard-child-progress${ready ? ' is-ready' : ''}`} title={progress.title} data-children={`${props.stats.done + props.stats.closed}/${props.stats.total}`}>
+        {progress.text}
+      </span>
+      {ready ? <span className="dboard-ready" data-ready="">✓ {tr('decisionBoard.readyToWrapUp')}</span> : null}
+    </>
+  );
+}
+
+/** 汇总行标题下：上级不在这一页时写「属于 #12 …」；有子任务时写完成情况。 */
+function RowTreeLine(props: { item: BoardItemSummary; showParent: boolean }) {
   const tr = useT();
   const { item } = props;
+  const parent = props.showParent ? item.parent : undefined;
+  if (!parent && !item.childStats?.total) return null;
+  return (
+    <span className="dboard-row-tree">
+      {parent ? <span className="dboard-row-parent" data-parent={parent.seq}>↑ {tr('decisionBoard.parentOf', { seq: parent.seq, title: parent.title })}</span> : null}
+      <ChildProgress state={item.state} stats={item.childStats} />
+    </span>
+  );
+}
+
+function BoardRow(props: { appId: string; item: BoardListResponse['items'][number]; now: number; depth?: number; onChanged(): void }) {
+  const tr = useT();
+  const { item } = props;
+  const depth = props.depth ?? 0;
   const asking = item.state === 'decide' || item.state === 'accept';
   const question = asking && item.question ? questionOneLine(item.question) : '';
   const chat = itemChatView(item, item.links);
   // 「进群」与整行的详情链接是兄弟元素：链接里不能再套链接。
   return (
-    <li className="dboard-row-item">
+    <li className="dboard-row-item" data-depth={depth || undefined} style={depthStyle(depth)}>
       <a className={`dboard-row${item.unseen ? ' is-unseen' : ''}`} href={boardItemHash(props.appId, item.seq)} data-seq={item.seq}>
         <span className="dboard-row-dot" aria-label={item.unseen ? tr('decisionBoard.unseenMark') : undefined}>{item.unseen ? '●' : ''}</span>
         <span className="dboard-row-main">
           <span className="dboard-row-title">
+            {depth ? <span className="dboard-tree-mark" aria-hidden="true">└</span> : null}
             <span className="dboard-seq">#{item.seq}</span>
             <strong>{item.title}</strong>
           </span>
+          <RowTreeLine item={item} showParent={depth === 0} />
           {item.state === 'closed' ? <span className="dboard-row-ask">{tr('decisionBoard.closeInChatDone')}</span> : null}
           {asking && (question || item.recommend) ? (
             <span className="dboard-row-ask">
@@ -701,15 +750,94 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
   );
 }
 
+/** 跟进情况一行：在等谁、最近进展（很久没动时标出来）、复查时间。总览行和详情页共用。 */
+function TrackingChips(props: { item: Parameters<typeof trackingView>[0]; now: number }) {
+  const tr = useT();
+  const track = trackingView(props.item, props.now, tr);
+  return (
+    <>
+      {track.waiting ? <span className={`dboard-track-wait is-${track.waiting.tone}`} data-waiting={track.waiting.tone}>{track.waiting.text}</span> : null}
+      <span className={`dboard-track-time${track.activity.stale ? ' is-stale' : ''}`} data-stale={track.activity.stale ? '' : undefined}>
+        {track.activity.stale ? '⏳ ' : ''}{track.activity.text}
+      </span>
+      {track.check ? (
+        <span className={`dboard-track-check${track.check.due ? ' is-due' : ''}`} data-check={track.check.due ? 'due' : 'later'}>
+          {track.check.due ? '⏰ ' : '💤 '}{track.check.text}
+        </span>
+      ) : null}
+    </>
+  );
+}
+
+function OverviewRowItem(props: { appId: string; row: ReturnType<typeof buildBoardOverview<BoardItemSummary>>[number]['rows'][number]; now: number }) {
+  const { item, depth, group } = props.row;
+  return (
+    <li className={`dboard-ov-row${group ? '' : ' is-context'}`} data-seq={item.seq} data-group={group ?? 'context'}
+      data-depth={depth || undefined} style={depthStyle(depth)}>
+      <a className="dboard-ov-link" href={boardItemHash(props.appId, item.seq)}>
+        <span className="dboard-ov-title">
+          {depth ? <span className="dboard-tree-mark" aria-hidden="true">└</span> : null}
+          <span className="dboard-seq">#{item.seq}</span>
+          <strong>{item.title}</strong>
+          {item.unseen ? <span className="dboard-row-dot" aria-hidden="true">●</span> : null}
+        </span>
+        {/* 顶格却有上级：搜索把上级筛掉了，写明属于谁。 */}
+        {!depth && item.parent ? <RowTreeLine item={{ ...item, childStats: undefined }} showParent /> : null}
+        <span className="dboard-ov-meta">
+          <StateChip state={item.state} stage={item.stage} />
+          <TrackingChips item={item} now={props.now} />
+          <ChildProgress state={item.state} stats={item.childStats} />
+        </span>
+      </a>
+    </li>
+  );
+}
+
+/**
+ * 总览：所有没结束的事项一屏看完，按「最该看的在最上面」分组（规则见 overview.ts）。每项写状态和阶段、在等谁、
+ * 最近一次进展、下次复查；一棵任务树整体放在它里面最该看的那一项所在的组。
+ */
+function BoardOverview(props: { appId: string; items: readonly BoardItemSummary[]; sections: ReturnType<typeof buildBoardOverview<BoardItemSummary>>; now: number }) {
+  const tr = useT();
+  // 顶上这一排按每一项自己的组数：一棵树被排进「要你拍板」时，树里过了复查时间的子任务照样算进「过了复查时间」。
+  const counts = overviewGroupCounts(props.items, props.now);
+  return (
+    <div className="dboard-overview">
+      <p className="dboard-ov-summary">
+        {[...counts].map(([group, n]) => (
+          <span key={group} className={`dboard-ov-chip is-${group}`} data-group={group}>
+            {tr(OVERVIEW_GROUP_KEYS[group].label)} <b>{n}</b>
+          </span>
+        ))}
+      </p>
+      {props.sections.map(section => (
+        <section key={section.group} className="dboard-ov-section" data-group={section.group}>
+          <h2 className="dboard-ov-head">
+            <span className="dboard-ov-head-label">{tr(OVERVIEW_GROUP_KEYS[section.group].label)}</span>
+            <span className="dboard-tab-count">{section.count}</span>
+            <small>{tr(OVERVIEW_GROUP_KEYS[section.group].hint)}</small>
+          </h2>
+          <ul className="dboard-list dboard-ov-list">
+            {section.rows.map(row => <OverviewRowItem key={row.item.seq} appId={props.appId} row={row} now={props.now} />)}
+          </ul>
+        </section>
+      ))}
+      <p className="dboard-legend">{tr('decisionBoard.ovTreeNote')}</p>
+    </div>
+  );
+}
+
 export function BoardSummaryView(props: { route: BoardRoute }) {
   const tr = useT();
   const [boards, setBoards] = useState<BoardSummary[] | null>(null);
   const [boardsError, setBoardsError] = useState<string | null>(null);
   const [appId, setAppId] = useState<string | undefined>(props.route.appId);
-  const [view, setView] = useState<BoardView>(props.route.view ?? 'decide');
+  const [view, setView] = useState<BoardPageView>(props.route.view ?? 'decide');
   const [query, setQuery] = useState(props.route.q ?? '');
   const [debouncedQuery, setDebouncedQuery] = useState(props.route.q ?? '');
   const [list, setList] = useState<BoardListResponse | null>(null);
+  /** list 是按哪个视图取的：切视图时新数据回来之前照旧显示旧列表（半透明），但不拿它排总览。 */
+  const [listView, setListView] = useState<BoardPageView | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [listLoading, setListLoading] = useState(false);
   const [submitSeqs, setSubmitSeqs] = useState<number[] | null>(null);
@@ -742,10 +870,16 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
     if (!activeAppId || !boardOnline) return;
     const seq = ++loadSeqRef.current;
     setListLoading(true);
-    void fetchBoardItems(activeAppId, view, debouncedQuery).then(res => {
+    void fetchBoardItems(activeAppId, serverView(view), debouncedQuery).then(res => {
       if (seq !== loadSeqRef.current) return;
       setList(res);
-      rememberNavList(navListFrom(activeAppId, view, debouncedQuery, res.items));
+      setListView(view);
+      // 详情页的上一项 / 下一项按这里显示的顺序走：总览按分组和树，其余按树。
+      const now = Date.now();
+      const shown = view === 'overview'
+        ? buildBoardOverview(res.items, now).flatMap(section => section.rows.map(r => r.item))
+        : nestBoardList(res.items).map(r => r.item);
+      rememberNavList(navListFrom(activeAppId, view, debouncedQuery, shown));
       setListError(null);
       setNow(Date.now());
     }).catch(err => {
@@ -778,7 +912,7 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
             label={`${tr('decisionBoard.stewardLabel')} ${board?.botName ?? activeAppId}`}
             value={activeAppId}
             options={boards.map(b => ({ value: b.larkAppId, label: b.botName, hint: b.counts ? tr('decisionBoard.tabDecideCount', { n: b.counts.decide }) : undefined }))}
-            onChange={next => { setAppId(next); setList(null); }}
+            onChange={next => { setAppId(next); setList(null); setListView(null); }}
           />
         ) : board ? <span className="dboard-heading-bot">{tr('decisionBoard.stewardLabel')} {board.botName}</span> : null}
       </div>
@@ -817,6 +951,8 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
   }
 
   const items = list?.items ?? [];
+  // 总览只列没结束的项（已结束的上级当层级显示），只用按总览取回来的数据排。
+  const overview = view === 'overview' && list && listView === 'overview' ? buildBoardOverview(items, now) : null;
   return (
     <section className="page dboard-page" data-board={activeAppId}>
       {heading}
@@ -841,7 +977,7 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
                   onClick={() => setView(key)}
                 >
                   {tr(BOARD_VIEW_LABEL_KEYS[key])}
-                  {counts ? <span className="dboard-tab-count">{counts[key]}</span> : null}
+                  {counts ? <span className="dboard-tab-count">{pageViewCount(counts, key)}</span> : null}
                 </button>
               ))}
             </div>
@@ -862,9 +998,15 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
           ) : null}
           {!list && listLoading ? <LoadingState label={tr('common.loading')} /> : null}
           {list ? (
-            items.length ? (
+            overview ? (
+              overview.length
+                ? <BoardOverview appId={activeAppId} items={items} sections={overview} now={now} />
+                : <p className="dboard-empty-line">{debouncedQuery ? tr('decisionBoard.emptySearch', { q: debouncedQuery }) : tr(BOARD_EMPTY_VIEW_KEYS[view])}</p>
+            ) : items.length ? (
               <ul className={`dboard-list${listLoading ? ' is-loading' : ''}`}>
-                {items.map(item => <BoardRow key={item.seq} appId={activeAppId} item={item} now={now} onChanged={() => setReloadTick(n => n + 1)} />)}
+                {nestBoardList(items).map(({ item, depth }) => (
+                  <BoardRow key={item.seq} appId={activeAppId} item={item} now={now} depth={depth} onChanged={() => setReloadTick(n => n + 1)} />
+                ))}
               </ul>
             ) : (
               <p className="dboard-empty-line">
@@ -874,7 +1016,7 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
               </p>
             )
           ) : null}
-          {list && items.length ? <p className="dboard-legend">{tr('decisionBoard.legend')}</p> : null}
+          {list && items.length && !overview ? <p className="dboard-legend">{tr('decisionBoard.legend')}</p> : null}
           {list ? <BatchList appId={activeAppId} batches={list.batches} now={now} onChanged={() => setReloadTick(n => n + 1)} /> : null}
         </>
       ) : null}
@@ -1599,11 +1741,19 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
     <section className="page dboard-page dboard-detail" data-seq={seq}>
       {back}
       <ItemNav neighbors={neighbors} busy={navigating} onGo={target => void goTo(target)} placement="top" />
+      {detail.parent ? (
+        <a className="dboard-parent-link" href={boardItemHash(appId, detail.parent.seq)} data-parent={detail.parent.seq}>
+          ↑ {tr('decisionBoard.parentOf', { seq: detail.parent.seq, title: detail.parent.title })}
+        </a>
+      ) : null}
       <header className="dboard-detail-head">
         <h1><span className="dboard-seq">#{item.seq}</span> {item.title}</h1>
         <StateChip state={item.state} stage={item.stage} />
       </header>
       <p className="dboard-detail-meta">{meta}</p>
+      <p className="dboard-detail-track">
+        <TrackingChips item={{ ...item, lastActivityAt: detail.lastActivityAt, ownActivityAt: detail.ownActivityAt, pendingDecisions: detail.pendingDecisions.length }} now={now} />
+      </p>
       {/* 包一层块容器：.page 是 grid，按钮直接做格子会被拉满整行（文字居中、整行都能点到）。 */}
       {closableInChat(item.state) ? (
         <div>
@@ -1622,6 +1772,27 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
       ) : null}
       <ExplainerPanel appId={appId} files={detail.files} />
       {loadError ? <p className="hint-warn">{tr('decisionBoard.loadFailed', { error: loadError.text })}</p> : null}
+
+      {detail.children?.length ? (
+        <section className="dboard-block dboard-children">
+          <h2 className="dboard-block-title">
+            {detail.childStats ? childProgressText(detail.childStats, tr).text : tr('decisionBoard.childrenTitle')}
+            {readyToWrapUp({ state: item.state, childStats: detail.childStats })
+              ? <span className="dboard-ready" data-ready="">✓ {tr('decisionBoard.readyToWrapUp')}</span> : null}
+          </h2>
+          <ul className="dboard-children-list">
+            {detail.children.map(child => (
+              <li key={child.seq}>
+                <a className="dboard-child" href={boardItemHash(appId, child.seq)} data-child={child.seq}>
+                  <span className="dboard-seq">#{child.seq}</span>
+                  <span className="dboard-child-title">{child.title}</span>
+                  <StateChip state={child.state} stage={child.stage} />
+                </a>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       {item.progress?.trim() ? (
         <section className="dboard-block">

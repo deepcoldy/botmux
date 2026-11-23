@@ -4,6 +4,16 @@
 // 类型只从 core 模型 type-import：那个模块会连带拉进 lark-hosts 等服务端代码，
 // 值导入会把它们打进浏览器 bundle。files.js 不依赖任何模块，可以值导入。
 import { boardFileKind, type BoardFileKind } from '../../core/decision-board/files.js';
+// overview.js 同样只 type-import 模型、不引服务端代码，可以值导入。
+import {
+  boardCheckStatus,
+  boardIdleTooLong,
+  boardLastActivity,
+  boardWaitingOn,
+  type BoardWaitingOn,
+  type ChildStats,
+  type OverviewGroup,
+} from '../../core/decision-board/overview.js';
 import type {
   BoardBatch,
   BoardChatCheck,
@@ -24,6 +34,13 @@ import type { ChatTaskKind, ChatTaskState, TaskHint, TaskHintKind } from '../../
 import type { NeedsYouReason } from '../../core/session-task-status.js';
 
 export type { ChatTaskKind, ChatTaskState, TaskHint, TaskHintKind };
+export type { BoardWaitingOn, ChildStats, OverviewGroup };
+export {
+  buildBoardOverview,
+  nestBoardList,
+  overviewGroupCounts,
+  readyToWrapUp,
+} from '../../core/decision-board/overview.js';
 
 export type {
   BoardBatch,
@@ -82,6 +99,14 @@ export interface ItemTaskFields {
   taskHint?: TaskHint;
 }
 
+/** 引用另一项（上级、子任务）时的几个字段。 */
+export interface BoardItemRef {
+  seq: number;
+  title: string;
+  state: BoardState;
+  stage?: string;
+}
+
 export interface BoardItemSummary extends BoardItem, ItemTaskFields {
   links: RenderedLink[];
   hasDraft: boolean;
@@ -91,6 +116,14 @@ export interface BoardItemSummary extends BoardItem, ItemTaskFields {
   appLink?: string;
   /** 图文说明（说明页 + 视频）个数；没有或旧 daemon 不带。 */
   explainers?: number;
+  /** 最近一次有人动过这一项或它的子孙的时间；旧 daemon 不带（按更新时间算）。 */
+  lastActivityAt?: number;
+  /** 同上，只看这一项自己（复查时间之后有没有动过按它算）。 */
+  ownActivityAt?: number;
+  /** 上级事项（按整张看板算）；没有上级或旧 daemon 不带。 */
+  parent?: BoardItemRef;
+  /** 直接子任务的完成情况（按整张看板算）；没有子任务或旧 daemon 不带。 */
+  childStats?: ChildStats;
 }
 
 // ─── 事项关联的群 ─────────────────────────────────────────────────────────────
@@ -148,6 +181,13 @@ export interface BoardDetailResponse extends ItemTaskFields {
    *（draft_outdated），原来的草稿已收进历史。旧 daemon 不给。
    */
   draftAskKey?: string;
+  /** 以下旧 daemon 不给。 */
+  lastActivityAt?: number;
+  ownActivityAt?: number;
+  parent?: BoardItemRef;
+  /** 直接子任务（全部状态），按编号。 */
+  children?: BoardItemRef[];
+  childStats?: ChildStats;
 }
 
 export interface BoardSummary {
@@ -158,7 +198,23 @@ export interface BoardSummary {
   counts?: BoardCounts;
 }
 
-export const BOARD_VIEW_ORDER: readonly BoardView[] = ['decide', 'active', 'all'];
+/**
+ * 汇总页的视图：服务端的三个视图，加上页面自己的「总览」（取全部事项，在页面上按树分组排序，见 overview.ts）。
+ * 总览放在「进行中」和「全部」之间：前两个是子集，总览是所有没结束的，「全部」还带上已结束的。
+ */
+export type BoardPageView = BoardView | 'overview';
+
+export const BOARD_VIEW_ORDER: readonly BoardPageView[] = ['decide', 'active', 'overview', 'all'];
+
+/** 向服务端要哪个视图：总览要全部（已结束的上级要当层级显示，子任务完成情况也要算上已结束的）。 */
+export function serverView(view: BoardPageView): BoardView {
+  return view === 'overview' ? 'all' : view;
+}
+
+/** 标签上的数：总览 = 没结束的（待你拍板 + 进行中）。 */
+export function pageViewCount(counts: BoardCounts, view: BoardPageView): number {
+  return view === 'overview' ? counts.decide + counts.active : counts[view];
+}
 
 /** 管家配置保存后发出：侧边栏据此重新判断要不要显示「决策看板」。 */
 export const DECISION_BOARD_CHANGED_EVENT = 'botmux:decision-board-changed';
@@ -168,12 +224,12 @@ export const DECISION_BOARD_CHANGED_EVENT = 'botmux:decision-board-changed';
 export interface BoardRoute {
   appId?: string;
   seq?: number;
-  view?: BoardView;
+  view?: BoardPageView;
   q?: string;
 }
 
-function isView(value: string | null | undefined): value is BoardView {
-  return value === 'decide' || value === 'active' || value === 'all';
+function isView(value: string | null | undefined): value is BoardPageView {
+  return value === 'decide' || value === 'active' || value === 'all' || value === 'overview';
 }
 
 function safeDecode(raw: string): string | null {
@@ -201,7 +257,7 @@ export function parseBoardHash(hash: string): BoardRoute | null {
   return route;
 }
 
-export function boardSummaryHash(route: { appId?: string; view?: BoardView; q?: string } = {}): string {
+export function boardSummaryHash(route: { appId?: string; view?: BoardPageView; q?: string } = {}): string {
   const params = new URLSearchParams();
   if (route.appId) params.set('bot', route.appId);
   if (route.view && route.view !== 'decide') params.set('view', route.view);
@@ -223,14 +279,14 @@ export function boardItemHash(appId: string, seq: number): string {
  */
 export interface BoardNavList {
   appId: string;
-  view: BoardView;
+  view: BoardPageView;
   q?: string;
   seqs: number[];
 }
 
 export const BOARD_NAV_STORAGE_KEY = 'botmux.decisionBoard.nav';
 
-export function navListFrom(appId: string, view: BoardView, q: string | undefined, items: readonly { seq: number }[]): BoardNavList {
+export function navListFrom(appId: string, view: BoardPageView, q: string | undefined, items: readonly { seq: number }[]): BoardNavList {
   const query = q?.trim();
   return { appId, view, ...(query ? { q: query } : {}), seqs: items.map(i => i.seq) };
 }
@@ -241,7 +297,7 @@ export function parseNavList(raw: unknown): BoardNavList | null {
   const r = raw as Record<string, unknown>;
   if (typeof r.appId !== 'string' || !r.appId || !isView(r.view as string)) return null;
   if (!Array.isArray(r.seqs) || !r.seqs.every(n => Number.isSafeInteger(n) && (n as number) > 0)) return null;
-  return { appId: r.appId, view: r.view as BoardView, ...(typeof r.q === 'string' && r.q ? { q: r.q } : {}), seqs: [...r.seqs as number[]] };
+  return { appId: r.appId, view: r.view as BoardPageView, ...(typeof r.q === 'string' && r.q ? { q: r.q } : {}), seqs: [...r.seqs as number[]] };
 }
 
 export interface BoardNeighbors {
@@ -250,7 +306,7 @@ export interface BoardNeighbors {
   /** 从 1 起的位置。 */
   position: number;
   total: number;
-  view: BoardView;
+  view: BoardPageView;
 }
 
 /** 当前项在列表里的前后项；列表不是这张看板的、或者当前项不在列表里，返回 null。 */
@@ -296,17 +352,76 @@ export const BOARD_STATE_LABEL_KEYS: Readonly<Record<BoardState, string>> = {
   closed: 'decisionBoard.stateClosed',
 };
 
-export const BOARD_VIEW_LABEL_KEYS: Readonly<Record<BoardView, string>> = {
+export const BOARD_VIEW_LABEL_KEYS: Readonly<Record<BoardPageView, string>> = {
   decide: 'decisionBoard.tabDecide',
   active: 'decisionBoard.tabActive',
+  overview: 'decisionBoard.tabOverview',
   all: 'decisionBoard.tabAll',
 };
 
-export const BOARD_EMPTY_VIEW_KEYS: Readonly<Record<BoardView, string>> = {
+export const BOARD_EMPTY_VIEW_KEYS: Readonly<Record<BoardPageView, string>> = {
   decide: 'decisionBoard.emptyListDecide',
   active: 'decisionBoard.emptyListActive',
+  overview: 'decisionBoard.emptyListOverview',
   all: 'decisionBoard.emptyListAll',
 };
+
+// ─── 总览与父子任务 ───────────────────────────────────────────────────────────
+
+/** 总览每一组的标题和一句说明。 */
+export const OVERVIEW_GROUP_KEYS: Readonly<Record<OverviewGroup, { label: string; hint: string }>> = {
+  needs_you: { label: 'decisionBoard.ovNeedsYou', hint: 'decisionBoard.ovNeedsYouHint' },
+  overdue: { label: 'decisionBoard.ovOverdue', hint: 'decisionBoard.ovOverdueHint' },
+  stalled: { label: 'decisionBoard.ovStalled', hint: 'decisionBoard.ovStalledHint' },
+  active: { label: 'decisionBoard.ovActive', hint: 'decisionBoard.ovActiveHint' },
+  waiting: { label: 'decisionBoard.ovWaiting', hint: 'decisionBoard.ovWaitingHint' },
+  parked: { label: 'decisionBoard.ovParked', hint: 'decisionBoard.ovParkedHint' },
+};
+
+/** 「在等你拍板」「管家在推进」「在等：PR 作者」……；tone 给页面上色（等你的最显眼）。 */
+function waitingOnText(w: BoardWaitingOn, tr: Translate): { text: string; tone: 'owner' | 'steward' | 'external' } {
+  if (w.kind === 'owner') return { text: tr(w.what === 'accept' ? 'decisionBoard.waitOwnerAccept' : 'decisionBoard.waitOwnerDecide'), tone: 'owner' };
+  if (w.kind === 'steward') return { text: tr(w.what === 'execute' ? 'decisionBoard.waitStewardExecute' : 'decisionBoard.waitStewardWork'), tone: 'steward' };
+  return { text: w.who ? tr('decisionBoard.waitExternal', { who: w.who }) : tr('decisionBoard.waitExternalUnknown'), tone: 'external' };
+}
+
+/**
+ * 一项的跟进情况（总览行、详情页共用）：在等谁、最近进展（很久没动时换成「N 天没动」）、复查时间（到点且之后没动 /
+ * 约在以后；到点后有过进展的不再显示）。已结束的项只给最近进展。规则和总览分组同一套（overview.ts）。
+ */
+export function trackingView(item: Pick<BoardItem, 'state' | 'stage' | 'waitingOn' | 'nextCheckAt' | 'updatedAt' | 'createdAt'>
+  & { lastActivityAt?: number; ownActivityAt?: number; pendingDecisions: number }, now: number, tr: Translate): {
+  waiting?: { text: string; tone: 'owner' | 'steward' | 'external' };
+  activity: { text: string; stale: boolean };
+  check?: { text: string; due: boolean };
+} {
+  const last = boardLastActivity(item);
+  const ended = isBoardItemEnded(item.state);
+  const idle = now - last;
+  const stale = boardIdleTooLong(item, now);
+  const check = ended ? 'none' : boardCheckStatus(item, now);
+  return {
+    ...(ended ? {} : { waiting: waitingOnText(boardWaitingOn(item), tr) }),
+    activity: {
+      text: stale ? tr('decisionBoard.idleDays', { n: Math.floor(idle / 86_400_000) }) : tr('decisionBoard.lastActivity', { time: boardRelativeTime(last, now, tr) }),
+      stale,
+    },
+    ...(item.nextCheckAt !== undefined && (check === 'due' || check === 'later') ? {
+      check: check === 'due'
+        ? { text: tr('decisionBoard.nextCheckDue', { time: boardClock(item.nextCheckAt) }), due: true }
+        : { text: tr('decisionBoard.nextCheck', { time: boardClock(item.nextCheckAt) }), due: false },
+    } : {}),
+  };
+}
+
+/** 「子任务 3/5」，以及悬停时的细分「2 项完成 · 1 项关闭 · 2 项没结束」。 */
+export function childProgressText(stats: ChildStats, tr: Translate): { text: string; title: string } {
+  const finished = stats.done + stats.closed;
+  return {
+    text: tr('decisionBoard.childProgress', { done: finished, total: stats.total }),
+    title: tr('decisionBoard.childProgressTitle', { done: stats.done, closed: stats.closed, open: stats.total - finished }),
+  };
+}
 
 export const BOARD_ACTOR_LABEL_KEYS: Readonly<Record<BoardEvent['actor'], string>> = {
   steward: 'decisionBoard.actorSteward',
