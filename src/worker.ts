@@ -445,6 +445,7 @@ import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
   generateCodexAppThreadTitle,
+  generateCodexAppNextStep,
   readCodexAppThreadMetadata,
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
@@ -40203,10 +40204,43 @@ function seedInitTurnTerminals(msg: Extract<DaemonToWorker, { type: 'init' }>): 
   }
 }
 
+let nextStepGeneration: AbortController | undefined;
+
 async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Promise<void> {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'request_next_step': {
+      const cfg = lastInitConfig;
+      if (!cfg || !isCodexFamilyCliId(cfg.cliId)) break;
+      const abortController = new AbortController();
+      nextStepGeneration?.abort();
+      nextStepGeneration = abortController;
+      nativeSessionTitleSyncAbortControllers.add(abortController);
+      try {
+        const adapter = createCliAdapterSync('codex', cfg.cliPathOverride);
+        const text = await generateCodexAppNextStep({
+          answer: msg.answer,
+          userPrompt: msg.userPrompt,
+          codexBin: adapter.resolvedBin,
+          env: codexNativeTitleEnv(cfg),
+          model: cfg.model,
+          timeoutMs: 15_000,
+          signal: abortController.signal,
+          detached: true,
+          registerForceClose: registerNativeTitleForceClose,
+        });
+        if (text && !abortController.signal.aborted && lastInitConfig === cfg) {
+          send({ type: 'prompt_suggestion', turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, text, editable: true });
+        }
+      } catch {
+        // Optional UI: a launcher or subprocess failure cannot fail the reply.
+      } finally {
+        nativeSessionTitleSyncAbortControllers.delete(abortController);
+        if (nextStepGeneration === abortController) nextStepGeneration = undefined;
+      }
+      break;
+    }
     case 'traex_model_pool_prune_result': {
       const pending = pendingTraexModelPoolPrunes.get(msg.requestId);
       if (!pending) break;
@@ -42600,7 +42634,7 @@ process.on('message', (raw: unknown, handle: unknown) => {
   }
   // Input for the CLI first gets the terminal's focus back (if botmux had
   // reported it away for an away summary), except for a deferred auto-compact.
-  restoreFocusForDaemonMessage(msg);
+  if (msg.type !== 'request_next_step') restoreFocusForDaemonMessage(msg);
   const execution = msg.sessionCommand?.execution;
   if (execution) workerSessionEventScope?.rememberExecution(execution);
   if (binding && workerSessionEventScope && msg.type !== 'init') return workerSessionEventScope.run(binding, () => handleContractDaemonMessage(msg, handle), execution, msg.sessionCommand?.operationId);
