@@ -23779,17 +23779,18 @@ function setupWorkerHandlers(
         const validSettingReceipt = !currentSettingsAttempt || msg.status !== 'succeeded'
           || (!!msg.topicEffort && msg.topicEffort.model === savedReadiness.requested.model
             && msg.topicEffort.effort === savedReadiness.requested.effort);
+        const effectiveStatus = validSettingReceipt ? msg.status : 'failed';
         const restartSettled = restartCoordinator.resolve(
           ds.session.sessionId,
           msg.attemptId,
-          validSettingReceipt ? msg.status : 'failed',
+          effectiveStatus,
         );
         // `settled=false` means the coordinator had no attempt under this id —
         // its status card keeps whatever it last showed (a 40s 重启超时) even
         // though the CLI reported success. Say which side lost the correlation:
         // without this the only symptom is a card that never leaves 重启超时
         // (2026-11-23).
-        logger.info(`[${t}] restart_result ${msg.status} attempt=${msg.attemptId.slice(0, 8)} settled=${restartSettled}`);
+        logger.info(`[${t}] restart_result ${effectiveStatus} attempt=${msg.attemptId.slice(0, 8)} settled=${restartSettled}`);
         // requestSessionRestart() fences the live generation by clearing
         // workerReady before asking the worker to respawn its CLI in place. An
         // in-worker respawn does not emit the process-level `ready` message

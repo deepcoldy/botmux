@@ -202,9 +202,38 @@ export class SessionController {
     if (!source.identity && owner && this.store.bindingProducer(this.ref, bindingId, owner)) return { version: 2, runtime: source.ref };
     if (sameRuntime(source.ref, current?.ref)) return { version: 2, runtime: source.ref };
     const execution = turnId ? this.store.executions(this.ref, turnId, dispatchAttempt)[0] : undefined;
+    // A re-attach keeps the runtime ref but advances its worker; that record is
+    // the handoff evidence for following the next continuation hop. Build the
+    // producer chain once, walking only forwards and never beyond the current
+    // owner's generation.
+    const produced = [source.ref];
+    let cursor = source.ref;
+    let producer = source.worker;
+    for (let handovers = 0; handovers < 16; handovers++) {
+      const continued = this.store.continuedRuntimes(this.ref, cursor, producer);
+      if (continued.length) {
+        produced.push(...continued);
+        cursor = continued.at(-1)!;
+      }
+      const handover = this.store.runtime(this.ref, cursor.runtimeId)?.worker;
+      if (!handover || handover.generation <= producer.generation
+        || handover.generation > (owner?.generation ?? producer.generation)) break;
+      producer = handover;
+    }
+    // Continuation proves the same physical process, not the same native
+    // conversation. A native mismatch has TWO valid orderings: a new session's
+    // hook may arrive BEFORE its runtime rebind, while an old session's delayed
+    // hook may arrive AFTER it. Reject only the latter — the reported id already
+    // names a retired runtime on this chain. An unseen id is the early-new case
+    // and still has to pass the continuation/current-owner checks below.
+    const nativeSessionAgrees = !(typeof nativeSessionId === 'string'
+      && typeof current?.identity?.nativeSessionId === 'string'
+      && current.identity.nativeSessionId !== nativeSessionId
+      && produced.some(runtime => !sameRuntime(runtime, current.ref)
+        && this.store.runtime(this.ref, runtime.runtimeId)?.identity?.nativeSessionId === nativeSessionId));
     // Hooks keep the binding their CLI was spawned under; the worker only
     // accepts commands aimed at its current runtime.
-    if (current && owner && sameWorker(current.worker, owner) && this.store.runtimeContinues(this.ref, source.ref, current.ref, owner)) {
+    if (nativeSessionAgrees && current && owner && sameWorker(current.worker, owner) && this.store.runtimeContinues(this.ref, source.ref, current.ref, owner)) {
       const ranHere = execution?.runtime && this.store.runtimeContinues(this.ref, source.ref, execution.runtime, owner)
         && this.store.runtimeContinues(this.ref, execution.runtime, current.ref, owner);
       return { version: 2, runtime: current.ref, ...(ranHere ? { execution: execution!.ref } : {}) };
@@ -218,16 +247,8 @@ export class SessionController {
     // CLI lost every SessionStart signal, including `source=compact`, where
     // before runtime bindings reached the pane it had none to be judged by and
     // the unbound path adopted it (2026-11-23 review of #3734).
-    //
-    // The chain can also be SPLIT across generations: `/clear` keeps the pid and
-    // rotates the native session id, so its hop is recorded by the live worker
-    // while the launcher hop belongs to the generation that spawned the CLI.
-    // Walking either side alone stops at the handoff, so splice them — any
-    // runtime on the producer's chain that the live worker then continued into
-    // the current one proves the same CLI, and the live worker owning that
-    // continuation is its proof of having taken the handoff point over.
-    if (current && owner && sameWorker(current.worker, owner) && !sameWorker(source.worker, owner)) {
-      const produced = [source.ref, ...this.store.continuedRuntimes(this.ref, source.ref, source.worker)];
+    // The current owner must still close the final hop into the selected runtime.
+    if (nativeSessionAgrees && current && owner && sameWorker(current.worker, owner) && !sameWorker(source.worker, owner)) {
       if (produced.some(runtime => this.store.runtimeContinues(this.ref, runtime, current.ref, owner))) {
         return { version: 2, runtime: current.ref };
       }

@@ -26,6 +26,7 @@ import { beginReplyTargetTurn, fallbackTurnId, frozenReplyContextForTurn, pickTu
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
+import { minimaxCompactQueueSuppressesPromptReady } from '../src/core/inject-queue-policy.js';
 
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { drainTraexRollout } from '../src/services/traex-transcript.js';
@@ -179,6 +180,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
   const release = vi.fn(() => { throw released; });
   const scope = {
     workerSessionEventScope: undefined,
+    minimaxCompactQueueSuppressesPromptReady, pendingRawInputs: [],
     lastInitConfig: { cliId }, codexBridgeQueue: queue, isStructuredBridgeLifecycleBlockingCli, isCodexAppCliId,
     rpcTurnsAwaitingActivation: new Set(), rpcLifecycleFailClosedOwners: new Set(), rpcTerminalHydrationOwners: new Set(),
     idleDetector: { isStartupPending: () => false, reset: vi.fn(), isReadyEvidenceWeak: () => false },

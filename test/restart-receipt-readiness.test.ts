@@ -28,6 +28,8 @@ function harness(scope: WorkerSessionEventScope) {
     backend: {},
     codexAutoUpgrade: undefined,
     pendingTopicEffortRestart: undefined,
+    lastInitConfig: { cliId: 'claude-code' },
+    pendingRawInputs: [],
     isPromptReady: true,
     workerSessionEventScope: scope,
     decideRestartReceipt,
@@ -83,6 +85,22 @@ describe('a restart receipt from a callback the relay superseded', () => {
     const run = harness(scope);
     scope.run(live, () => run.settle('restart continuation finished at the prompt', { republishPromptReady: true }));
     expect(run.sent.map(entry => entry.msg.type)).toEqual(['prompt_ready', 'restart_result']);
+  });
+
+  it.each([
+    ['same-process rebind', false],
+    ['explicit republish', true],
+  ])('keeps the MiniMax compact gate closed during %s', (_kind, explicit) => {
+    const { scope, launcher, live } = relayRebound();
+    const run = harness(scope);
+    run.state.lastInitConfig = { cliId: 'minimax' };
+    run.state.pendingRawInputs = [{ content: ' /compact ' }];
+    const callback = explicit ? live : launcher;
+    scope.run(callback, () => run.settle('restart continuation finished at the prompt', explicit ? { republishPromptReady: true } : undefined));
+
+    expect(run.sent.map(entry => entry.msg.type)).toEqual(['restart_result']);
+    expect(run.state.activeRestartAttemptId).toBeUndefined();
+    expect(run.state.pendingRawInputs).toEqual([{ content: ' /compact ' }]);
   });
 });
 
