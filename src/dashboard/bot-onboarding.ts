@@ -1068,7 +1068,7 @@ export class BotOnboardingManager {
       delete activating.activationDeactivating;
       delete activating.activationCommitting;
       next[addedBotIndex] = activating;
-      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next, bots);
     });
   }
 
@@ -1089,7 +1089,7 @@ export class BotOnboardingManager {
       const ready = { ...current, activationCommitted: { appId, jobId: id } };
       delete ready.activationStarting;
       next[addedBotIndex] = ready;
-      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next, bots);
     });
   }
 
@@ -1115,7 +1115,7 @@ export class BotOnboardingManager {
       delete pending.activationDeactivating;
       delete pending.activationCommitted;
       next[addedBotIndex] = pending;
-      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next, bots);
     });
     this.patch(id, {
       activationPending: true,
@@ -1144,7 +1144,7 @@ export class BotOnboardingManager {
       const ready = { ...current };
       delete ready.activationCommitted;
       next[addedBotIndex] = ready;
-      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next, bots);
     });
     this.finalizeManagedActivationJob(id);
   }
@@ -1174,7 +1174,7 @@ export class BotOnboardingManager {
       const ready = { ...current };
       delete ready.activationCommitted;
       next[addedBotIndex] = ready;
-      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next, bots);
     });
   }
 
@@ -1312,7 +1312,7 @@ export class BotOnboardingManager {
         activationPending: true,
         activationDeactivating: { appId, jobId: id },
       };
-      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next, bots);
     });
     this.patch(id, { activationPending: true, activationDeactivating: true });
     this.persistPermissionRecoveryJobs();
@@ -1334,7 +1334,7 @@ export class BotOnboardingManager {
       const pending = { ...current, activationPending: true };
       delete pending.activationDeactivating;
       next[addedBotIndex] = pending;
-      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next, bots);
     });
     this.patch(id, { activationPending: true, activationDeactivating: false });
   }
@@ -2024,11 +2024,11 @@ export class BotOnboardingManager {
       if (existing >= 0) {
         const next = [...bots];
         next[existing] = normalized;
-        writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+        writeBotsJsonAtomic(this.opts.botsJsonPath, next, bots);
         return existing;
       }
       const index = bots.length;
-      writeBotsJsonAtomic(this.opts.botsJsonPath, [...bots, normalized]);
+      writeBotsJsonAtomic(this.opts.botsJsonPath, [...bots, normalized], bots);
       return index;
     });
   }

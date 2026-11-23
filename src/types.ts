@@ -2288,6 +2288,7 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
+  | { type: 'request_next_step'; turnId: string; dispatchAttempt?: number; userPrompt?: string; answer: string }
   | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig | null; replyDelivery?: 'send' | 'transcript'; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true; failedTurnRewind?: FailedTurnRewindDirective }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
@@ -2900,7 +2901,7 @@ export type WorkerToDaemonBase =
   /** The CLI's own next-input suggestion on an idle screen (Claude Code's
    *  greyed-out prompt suggestion), sent when it appears or changes. turnId is
    *  the turn that just ended; the daemon shows it on that turn's last card. */
-  | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number; editable?: true }
   /** The CLI's own recap of the session (Claude Code's transcript away
    *  summary), written while idle after a turn; turnId is that turn. */
   | { type: 'cli_recap'; text: string; turnId?: string; dispatchAttempt?: number }
@@ -3030,8 +3031,11 @@ export type WorkerToDaemonBase =
    *  summary. `turnReply` marks the reply as the turn's final: a Claude
    *  folded turn has no other output, and under transcript delivery no
    *  completion receipt needs a carrier it can be written into. A Codex
-   *  steered turn still ends with its own final, so it never sets this. */
-  | { type: 'absorbed_reply'; turnId: string; dispatchAttempt?: number; answer: string; replyUuid: string; source: 'text' | 'thinking'; turnReply?: true }
+   *  steered turn still ends with its own final, so it never sets this.
+   *  `progress` (Codex): not an answer to a folded message but what the model
+   *  said to this turn mid-work before going back to it; the turn's own
+   *  final still follows. */
+  | { type: 'absorbed_reply'; turnId: string; dispatchAttempt?: number; answer: string; replyUuid: string; source: 'text' | 'thinking'; turnReply?: true; progress?: true }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
   /** Runtime lease recovery ACK. Emitted only after the exact durable attempt
    * was either removed from the worker queue or its owned CLI was fenced. */

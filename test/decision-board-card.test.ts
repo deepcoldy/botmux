@@ -525,7 +525,7 @@ describe('和网页提交冲突：以后提交的为准', () => {
     expect(cardText(currentCard())).toContain('管家已处理（批次 #2）');
   });
 
-  it('网页上那份草稿写在选项改动之前（选的选项已不在）：照常送达，但不覆盖卡片上的决定', async () => {
+  it('网页上那份草稿写在选项改动之前：选项一改就收进历史，之后提交被拒，卡片上的决定照旧是唯一一条', async () => {
     const seq = await addDecide();
     const item = service.store().getItem(APP, seq)!;
     const draft = service.putDraft(seq, 'owner', { choice: 'B', text: '', baseRev: item.rev }).draft!;
@@ -534,8 +534,10 @@ describe('和网页提交冲突：以后提交的为准', () => {
     deliverImpl = async () => { throw new Error('down'); };
     await click(currentCard(), { key: 'A' }).deliver!();
     deliverImpl = async input => { delivered.push(input); return { sessionId: 's' }; };
-    await service.submit({ author: 'owner', submitter: 'local', nonce: 'web-old', items: [{ seq, draftUpdatedAt: draft.updatedAt }] });
-    expect(service.store().decisionsFor(APP, seq, false).map(d => [d.batchId, d.supersededBy])).toEqual([[1, undefined], [2, undefined]]);
+    await expect(service.submit({ author: 'owner', submitter: 'local', nonce: 'web-old', items: [{ seq, draftUpdatedAt: draft.updatedAt }] }))
+      .rejects.toMatchObject({ code: 'draft_missing' });
+    expect(service.store().decisionsFor(APP, seq, false).map(d => [d.batchId, d.supersededBy])).toEqual([[1, undefined]]);
+    expect(service.store().events(APP, seq).filter(e => e.kind === 'draft').map(e => e.text.split('\n')[1])).toEqual(['选：B 不合']);
   });
 
   it('网页上连续两次提交（不涉及卡片）照旧逐批执行，不互相覆盖', async () => {

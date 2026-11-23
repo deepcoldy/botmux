@@ -85,13 +85,9 @@ describe('CliRecapObserver', () => {
 });
 
 describe('panel markdown', () => {
-  it('shows the CLI recap and says where it came from', () => {
-    expect(renderRecapMarkdown(claudeAwaySummaryText(awayWithHint), 'zh')!.split('\n\n')).toEqual([
-      claudeAwaySummaryText(awayWithHint),
-      "<font color='grey'>来自 CLI 自带的离开总结</font>",
-    ]);
-    expect(renderRecapMarkdown('Merged; CI is green.', 'en'))
-      .toBe("Merged; CI is green.\n\n<font color='grey'>Recap written by the CLI</font>");
+  it('is the CLI recap alone, with no line after it saying where it came from', () => {
+    expect(renderRecapMarkdown(claudeAwaySummaryText(awayWithHint))).toBe(claudeAwaySummaryText(awayWithHint));
+    expect(renderRecapMarkdown('Merged; CI is green.')).toBe('Merged; CI is green.');
   });
 
   // Rendering rules checked on a live card: prose decodes entities once.
@@ -100,17 +96,17 @@ describe('panel markdown', () => {
       '<at user_id="all">所有人</at> 看图 ![x](img_v3_key) <b>粗</b>',
       '提醒 <at user_id="all"> 和 <at id=all></at> 以及 </at>',
     ]) {
-      const markdown = renderRecapMarkdown(text, 'zh')!;
+      const markdown = renderRecapMarkdown(text)!;
       expect(markdown).not.toMatch(/<\/?at\b|&lt;\/?at\b/i);
       expect(markdown).not.toContain('![');
     }
-    expect(renderRecapMarkdown('<b>粗</b> a && b', 'zh')).toContain('&lt;b&gt;粗&lt;/b&gt; a &amp;&amp; b');
+    expect(renderRecapMarkdown('<b>粗</b> a && b')).toContain('&lt;b&gt;粗&lt;/b&gt; a &amp;&amp; b');
     // An entity-encoded tag stays text: the card decodes it once, to the entity.
-    expect(renderRecapMarkdown('&lt;at id=ou_x&gt;&lt;/at&gt;', 'zh')).toContain('&amp;lt;at id=ou_x&amp;gt;');
+    expect(renderRecapMarkdown('&lt;at id=ou_x&gt;&lt;/at&gt;')).toContain('&amp;lt;at id=ou_x&amp;gt;');
   });
 
   it('is empty without recap text', () => {
-    expect(renderRecapMarkdown(undefined, 'zh')).toBeUndefined();
-    expect(renderRecapMarkdown('  \n ', 'zh')).toBeUndefined();
+    expect(renderRecapMarkdown(undefined)).toBeUndefined();
+    expect(renderRecapMarkdown('  \n ')).toBeUndefined();
   });
 });

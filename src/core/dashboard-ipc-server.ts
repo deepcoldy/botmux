@@ -225,6 +225,7 @@ import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../servic
 import { prepareReplyCardNativeThinking, replyCardDispatchAttempt } from './turn-reply-card.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
 import { FEEDBACK_SEND_LEASE_ROUTE, handleFeedbackSendLeaseRelay } from '../services/feedback-send-lease-relay.js';
+import { resolveNamespaceLocalPid } from './pid-namespace-peer.js';
 import {
   emptyLinkRefExtractionStats,
   LINK_REF_REGISTER_MAX_BODY_BYTES,
@@ -491,7 +492,7 @@ export function setExactChatGrantHandler(handler: typeof applyExactChatGrantRequ
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
 // 时 PUT /api/bot-rename 降级为仅改 displayName。
 export type BotRenameOutcome =
-  | { ok: true; name: string }
+  | { ok: true; name: string; displayName?: string | null; localSyncError?: string }
   | { ok: false; reason: string; message: string };
 let botRenamer: ((newName: string) => Promise<BotRenameOutcome>) | null = null;
 export function setBotRenamer(fn: ((newName: string) => Promise<BotRenameOutcome>) | null): void {
@@ -2509,7 +2510,17 @@ ipcRoute('POST', `/api/sessions/:sessionId/${FEEDBACK_SEND_LEASE_ROUTE}`, async 
   // guards feedback maintenance; it does not perform a managed session action.
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body, { allowReceiver: true });
   if (!auth.ok || !ds) return jsonRes(res, 403, { ok: false, error: auth.ok ? 'session_not_active' : auth.error });
-  const result = handleFeedbackSendLeaseRelay(config.session.dataDir, ds.session.sessionId, body);
+  // A CLI in a PID namespace (Linux bwrap --unshare-pid) reports its
+  // namespace-local pid; the lease must name the host process. Linux always
+  // has procfs, so an unprovable mapping is refused rather than leasing
+  // whichever host process happens to share the number. Elsewhere (macOS)
+  // there is no PID namespace and the reported pid is the host pid.
+  const hostPid = typeof body.processId === 'number' ? resolveNamespaceLocalPid(body.processId, previewOwnerPids(ds)) : null;
+  if (hostPid === null && typeof body.processId === 'number' && process.platform === 'linux') {
+    return jsonRes(res, 409, { ok: false, error: 'feedback_process_identity_unavailable' });
+  }
+  const result = handleFeedbackSendLeaseRelay(config.session.dataDir, ds.session.sessionId,
+    hostPid ? { ...body, processId: hostPid } : body);
   return jsonRes(res, result.status, result.body);
 });
 
@@ -10861,6 +10872,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     codexBrowserAutoApproveOrigins: cardPrefs.codexBrowserAutoApproveOrigins,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     goalStatusCard: cardPrefs.goalStatusCard,
+    followUpReply: cardPrefs.followUpReply,
     privateCard: cardPrefs.privateCard,
     replyCardActions: cardPrefs.replyCardActions,
     replyCardNextStep: cardPrefs.replyCardNextStep,
@@ -11031,7 +11043,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardNativeCot?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; streamingCardFoldedLayout?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; replyCardNextStep?: unknown; replyCardRecap?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; streamingCardFoldedLayout?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; followUpReply?: unknown; privateCard?: unknown; replyCardActions?: unknown; replyCardNextStep?: unknown; replyCardRecap?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
@@ -11053,7 +11065,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardNativeCot?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; streamingCardFoldedLayout?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; replyCardNextStep?: boolean; replyCardRecap?: boolean; cotEnabled?: boolean;
+    disableStreamingCard?: boolean; streamingCardFoldedLayout?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; followUpReply?: boolean; privateCard?: boolean; replyCardActions?: boolean; replyCardNextStep?: boolean; replyCardRecap?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoStartExcludedChats?: string[]; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
@@ -11125,6 +11137,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   if (typeof body.replyCardShowTools === 'boolean') patch.replyCardShowTools = body.replyCardShowTools;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.goalStatusCard === 'boolean') patch.goalStatusCard = body.goalStatusCard;
+  if (typeof body.followUpReply === 'boolean') patch.followUpReply = body.followUpReply;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.replyCardActions === 'boolean') patch.replyCardActions = body.replyCardActions;
   if (typeof body.replyCardNextStep === 'boolean') patch.replyCardNextStep = body.replyCardNextStep;
@@ -11434,7 +11447,9 @@ ipcRoute('PUT', '/api/bot-ask-option-layout', requireBoundBot(async (req, res) =
 // 主路径：daemon 注册的 renamer 走开放平台自动化真改飞书应用名（改基础信息 +
 // 建版发布，群内显示名生效）；失败（Web 登录态过期 / 非协作者 / lark 租户等）
 // 自动降级为仅改 botmux 展示名 displayName，并把原因作为 warning 返回给前端。
-// 响应：{ ok, mode: 'feishu'|'local', botName, warning?, message? }。
+// 已发布但本地同步失败仍是 mode:feishu，带 localSyncError，绝不走本地降级。
+// 响应：{ ok, mode: 'feishu'|'local', botName, larkBotName?, displayName?,
+//          localSyncError?, warning?, message? }。
 ipcRoute('PUT', '/api/bot-rename', requireBoundBot(async (req, res) => {
   const body = await readJsonBodyOrBadJson<{ name?: unknown }>(req, res);
   if (body === BAD_JSON) return;
@@ -11458,7 +11473,14 @@ ipcRoute('PUT', '/api/bot-rename', requireBoundBot(async (req, res) => {
       renamed = { ok: false, reason: 'api_error', message: ipcErrorText(err) };
     }
     if (renamed.ok) {
-      return jsonRes(res, 200, { ok: true, mode: 'feishu', botName: getBotName() });
+      return jsonRes(res, 200, {
+        ok: true,
+        mode: 'feishu',
+        botName: renamed.displayName || renamed.name,
+        larkBotName: renamed.name,
+        displayName: renamed.displayName ?? null,
+        ...(renamed.localSyncError ? { localSyncError: renamed.localSyncError } : {}),
+      });
     }
     // 降级：仅改 botmux 展示名，带上飞书侧失败原因让前端明示。
     const fallback = await applyConfigField(cachedLarkAppId, spec, name);

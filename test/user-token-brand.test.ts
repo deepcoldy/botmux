@@ -47,7 +47,7 @@ describe('generateAuthUrl — brand-aware authorize host', () => {
 });
 
 describe('generateAuthUrl — 按需申请权限', () => {
-  const baseScopes = ['im:message:readonly', 'im:resource', 'offline_access'];
+  const baseScopes = ['im:message:readonly', 'offline_access'];
 
   it.each(['feishu', 'lark'] as const)('%s 基础授权不依赖云文档权限', (brand) => {
     const { authUrl } = generateAuthUrl('cli_chat_only', 'secret', brand, [], 'ou_alice');
@@ -57,7 +57,16 @@ describe('generateAuthUrl — 按需申请权限', () => {
 
   it.each(['docx:document:readonly', 'drive:drive.search:readonly'])('只追加显式请求的 %s', (scope) => {
     const { authUrl } = generateAuthUrl('cli_app', 'secret', 'feishu', [scope, scope, 'im:resource'], 'ou_alice');
-    expect(new URL(authUrl).searchParams.get('scope')?.split(' ')).toEqual([...baseScopes, scope]);
+    expect(new URL(authUrl).searchParams.get('scope')?.split(' ')).toEqual([...baseScopes, scope, 'im:resource']);
+  });
+
+  // 用户身份的 im:resource 要企业管理员审批：普通 /login 不再默认申请，下载图片/文件时
+  // 由 `/login --scope im:resource` 单独申请。
+  it.each(['feishu', 'lark'] as const)('%s 普通授权不申请 im:resource，显式申请才带上', (brand) => {
+    const plain = generateAuthUrl('cli_app', 'secret', brand, [], 'ou_alice');
+    expect(new URL(plain.authUrl).searchParams.get('scope')?.split(' ')).not.toContain('im:resource');
+    const explicit = generateAuthUrl('cli_app', 'secret', brand, ['im:resource'], 'ou_alice');
+    expect(new URL(explicit.authUrl).searchParams.get('scope')?.split(' ')).toContain('im:resource');
   });
 
   it('文档订阅仍申请自己的专项权限，不附带云盘搜索或表格权限', () => {

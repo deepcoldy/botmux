@@ -297,6 +297,8 @@ export async function handleDecisionBoardApi(
     if (!body) { json(res, 400, { ok: false, error: 'bad_json' }); return true; }
     await post(`${PREFIX}/items/${mm[1]}/draft`, {
       author: DRAFT_AUTHOR, choice: body.choice, text: body.text, fileIds: body.fileIds, baseRev: body.baseRev,
+      ...(typeof body.askKey === 'string' ? { askKey: body.askKey } : {}),
+      ...(body.archive === true ? { archive: true } : {}),
     });
     return true;
   }

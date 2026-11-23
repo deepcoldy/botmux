@@ -665,6 +665,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     codexBrowserAutoApproveOrigins: body.codexBrowserAutoApproveOrigins,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     goalStatusCard: body.goalStatusCard,
+    followUpReply: body.followUpReply,
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
     replyCardNextStep: body.replyCardNextStep,
@@ -2319,12 +2320,19 @@ function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot:
         patchBot(bot.larkAppId, current => ({
           ...current,
           botName: effective,
-          larkBotName: res.body.mode === 'feishu' ? nextName : current.larkBotName,
-          displayName: res.body.mode === 'feishu' ? null : nextName,
+          larkBotName: res.body.mode === 'feishu'
+            ? (typeof res.body.larkBotName === 'string' ? res.body.larkBotName : nextName)
+            : current.larkBotName,
+          displayName: res.body.mode === 'feishu'
+            ? (typeof res.body.displayName === 'string' ? res.body.displayName : null)
+            : nextName,
         }));
         setEditMode(false);
         if (res.body.mode === 'feishu') {
-          setStatus({ text: `✓ ${tr('botDefaults.renameOkFeishu')}`, ok: true });
+          const localSyncError = typeof res.body.localSyncError === 'string' ? res.body.localSyncError : '';
+          setStatus(localSyncError
+            ? { text: `⚠ ${localSyncError}` }
+            : { text: `✓ ${tr('botDefaults.renameOkFeishu')}`, ok: true });
           setLoginVisible(false);
         } else {
           setStatus({ text: `⚠ ${renameWarningText(String(res.body.warning ?? ''), res.body.message)}` });
@@ -6121,6 +6129,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [goalStatusCard, setGoalStatusCard] = useState(bot.goalStatusCard === true);
+  const [followUpReply, setFollowUpReply] = useState(bot.followUpReply === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
   const [nextStep, setNextStep] = useState(bot.replyCardNextStep === true);
@@ -6141,6 +6150,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setGoalStatusCard(bot.goalStatusCard === true);
+    setFollowUpReply(bot.followUpReply === true);
     setPrivateCard(bot.privateCard === true);
     setReplyActions(bot.replyCardActions === true);
     setNextStep(bot.replyCardNextStep === true);
@@ -6148,7 +6158,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6260,6 +6270,19 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               const previous = goalStatusCard;
               setGoalStatusCard(checked);
               void savePatch({ goalStatusCard: checked }, 'goal-status-card', () => setGoalStatusCard(previous));
+            }}
+          />
+          <ToggleRow
+            checked={followUpReply}
+            disabled={busy !== null}
+            dataAction="toggle-follow-up-reply"
+            title={tr('botDefaults.followUpReply')}
+            description={tr('botDefaults.followUpReplyDescription')}
+            help={tr('botDefaults.followUpReplyHelp')}
+            onChange={checked => {
+              const previous = followUpReply;
+              setFollowUpReply(checked);
+              void savePatch({ followUpReply: checked }, 'follow-up-reply', () => setFollowUpReply(previous));
             }}
           />
           <ToggleRow

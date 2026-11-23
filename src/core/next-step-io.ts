@@ -1,4 +1,7 @@
 /** Production wiring for core/next-step-suggestion.ts. */
+import { isCodexFamilyCliId } from '../adapters/cli/types.js';
+import type { DaemonToWorker } from '../types.js';
+import { isTurnOutcomeExcluded, turnFinalText } from './turn-outcome.js';
 import { getBot } from '../bot-registry.js';
 import { config } from '../config.js';
 import { localeForBot } from '../i18n/index.js';
@@ -25,13 +28,35 @@ export const nextStepIo: NextStepIo = {
     try { return getBot(ds.larkAppId).config.replyCardNextStep === true; } catch { return false; }
   },
   locale: ds => localeForBot(ds.larkAppId) === 'en' ? 'en' : 'zh',
-  issue: (ds, prompt) => issueSessionCardClickTurn({
+  issue: (ds, prompt, responseToTurnId) => issueSessionCardClickTurn({
     dataDir: config.session.dataDir,
     larkAppId: ds.larkAppId,
     sessionId: ds.session.sessionId,
     prompt,
+    responseToTurnId,
     ttlMs: NEXT_STEP_TOKEN_TTL_MS,
   }),
+  requestSuggestion(ds, turnId, dispatchAttempt) {
+    const init = ds.initConfig;
+    const worker = ds.worker;
+    if (!init || !isCodexFamilyCliId(init.cliId) || !worker?.connected
+      || ds.currentTurnId !== turnId || ds.session.status !== 'active'
+      || ds.lastTurnTerminalTurnId !== turnId || ds.lastTurnTerminalStatus !== 'completed'
+      || ds.lastTurnTerminalDispatchAttempt !== dispatchAttempt || isTurnOutcomeExcluded(ds, turnId)) return false;
+    const answer = turnFinalText(ds, turnId, config.session.dataDir);
+    if (!answer) return false;
+    const request: DaemonToWorker = {
+      type: 'request_next_step', turnId, dispatchAttempt, answer,
+      userPrompt: ds.lastCliInputTurnId === turnId ? ds.lastUserPrompt?.slice(0, 1200) : undefined,
+    };
+    try {
+      // Use the session-scoped sender installed by the worker pool.
+      worker.send(request, () => {});
+      return true;
+    } catch {
+      return false;
+    }
+  },
   async readCard(ds, messageId) {
     return messageCardContent(await getMessageDetail(ds.larkAppId, messageId, { userCardContent: true }), ds.chatId);
   },

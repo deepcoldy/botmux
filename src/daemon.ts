@@ -189,6 +189,7 @@ import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-com
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { peerAnswersTopicWithoutMention, resolveGroupMentionMode, resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
+import { createSerializedBotRenamer, persistRenamedBotName } from './services/bot-name-sync.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime, type DurableCoordinationMode } from './services/durable-coordination-runtime.js';
@@ -35086,22 +35087,44 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // （群内显示名跟随已发布版本，见 services/open-platform-rename.ts）。成功后同步
   // 内存 botName / bots-info 名册 / descriptor，并清掉冗余的 displayName 别名——
   // 飞书名已经是新名，保持单一事实来源。
-  setBotRenamer(async (newName) => {
+  setBotRenamer(createSerializedBotRenamer(async (newName) => {
+    // Resolve before publishing: after remote success no local exception may
+    // escape as a remote failure and trigger the IPC route's local-only fallback.
+    const bot = getBot(cfg.larkAppId);
     const r = await renameBotOnOpenPlatform(cfg.larkAppId, newName, cfg.brand);
     if (!r.ok) return r;
-    const bot = getBot(cfg.larkAppId);
-    bot.botName = newName;
-    noteLocalBotProfileWrite?.();
-    const spec = findConfigField('displayName');
-    if (spec && bot.config.displayName) {
-      // applyConfigField 的 displayName 钩子会顺带触发 refreshBotNameState。
-      await applyConfigField(cfg.larkAppId, spec, null);
-    } else {
-      refreshBotNameState();
-    }
-    try { writeBotInfoFile(config.session.dataDir); } catch { /* best effort */ }
-    return r;
-  });
+    // These warnings cross IPC into the UI. Never include raw exceptions or
+    // config validation reasons, which may contain credentials/config values.
+    const localErrors: string[] = [];
+    try {
+      bot.botName = r.name;
+      // Must be synchronous with the assignment, before waiting for config I/O.
+      noteLocalBotProfileWrite?.();
+    } catch { localErrors.push('运行时名称未完全同步'); }
+    try { bot.config.name = await persistRenamedBotName(cfg.larkAppId, r.name); }
+    catch { localErrors.push('本地配置名未同步'); }
+    try {
+      if (bot.config.displayName) {
+        const spec = findConfigField('displayName');
+        // applyConfigField also refreshes the effective name on success.
+        const cleared = spec ? await applyConfigField(cfg.larkAppId, spec, null) : undefined;
+        if (!cleared?.ok) localErrors.push('本地展示别名未清除');
+      }
+    } catch { localErrors.push('本地展示别名未清除'); }
+    // Refresh even when clearing the alias failed: displayName still wins over
+    // the newly published name, and the response must report that actual alias.
+    try { refreshBotNameState(); }
+    catch { localErrors.push('本地名称状态未完全刷新'); }
+    try { writeBotInfoFile(config.session.dataDir); }
+    catch { localErrors.push('本地名册未同步'); }
+    return {
+      ...r,
+      displayName: bot.config.displayName ?? null,
+      ...(localErrors.length ? {
+        localSyncError: `飞书已改名成功，但${localErrors.join('；')}。请修复本地配置，不要重复发布改名。`,
+      } : {}),
+    };
+  }));
   // 机器人真·改头像（dashboard 档案头头像入口）：开放平台自动化换飞书应用头像并
   // 发布新版本（群内头像跟随已发布版本，同 rename）。成功后用上传返回的 url
   // 同步内存 botAvatarUrl / descriptor / bots-info 让 dashboard 立即换图——该 url
