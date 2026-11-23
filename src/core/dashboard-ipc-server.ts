@@ -4558,6 +4558,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const originSender = choice.speaker?.openId ?? baseSender;
   const sender = delegated?.targetOpenId ?? originSender;
   if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  const cached = delegated ? undefined : getIdentity(bot.larkAppId, sender);
+  const user = delegated ? { type: 'user' as const, openId: sender }
+    : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
+      ? cached : await resolveVerifiedUserIdentity(bot.larkAppId, sender);
+  if (!user || user.type !== 'user' || user.openId !== sender) {
+    return jsonRes(res, 403, { ok: false, error: 'The current requesting user could not be verified' });
+  }
   // runAs was admitted at trigger time, possibly long before this call. Bound
   // lark-cli bypasses publishTurnCliIdentity, so enforce that turn's live
   // permission fence here as well. Owner actors deliberately keep their old
@@ -4585,13 +4592,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     if (!runAsCurrentlyAllowed()) {
       return jsonRes(res, 403, { ok: false, error: 'runAs person is not allowed to operate this bot in the target chat' });
     }
-  }
-  const cached = delegated ? undefined : getIdentity(bot.larkAppId, sender);
-  const user = delegated ? { type: 'user' as const, openId: sender }
-    : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
-      ? cached : await resolveVerifiedUserIdentity(bot.larkAppId, sender);
-  if (!user || user.type !== 'user' || user.openId !== sender) {
-    return jsonRes(res, 403, { ok: false, error: 'The current requesting user could not be verified' });
   }
   // The bot application's own grant first (the owner keeps its wider scopes);
   // anyone else can only get credentials through the platform, since a bot
