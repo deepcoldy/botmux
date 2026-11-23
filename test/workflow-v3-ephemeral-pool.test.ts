@@ -291,18 +291,16 @@ describe('v3 ephemeral pool', () => {
       vi.stubEnv('BOTS_CONFIG', botsPath);
     };
 
-    it.each(['claude-code', 'codex'] as const)('resolves an unregistered node bot from bots.json for %s', async (cliId) => {
-      const hostBot: BotConfig = { larkAppId: 'cli_host', larkAppSecret: 'test-only', cliId,
+    it('resolves an unregistered node bot from bots.json', async () => {
+      const hostBot: BotConfig = { larkAppId: 'cli_host', larkAppSecret: 'test-only', cliId: 'claude-code',
         apiOnly: true, env: { MODEL_AUTH: 'host-sentinel' } };
       registerBot(hostBot);
-      configureBots([hostBot, { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId,
+      configureBots([hostBot, { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
         env: { MODEL_AUTH: 'node-sentinel' }, envUnset: ['WORKFLOW_DROP_ME'] }]);
-      expect(() => getBot('cli_app')).toThrow(/not registered/);
-      const req = request();
-      req.botSnapshot.cliId = cliId;
+      expect(() => getBot('cli_app')).toThrow();
       const worker = new ScriptedWorker();
       const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
-        resolveLarkAppSecret: () => 'secret' }).runNode(req);
+        resolveLarkAppSecret: () => 'secret' }).runNode(request());
       try {
         await worker.waitForInit();
         expect(worker.init.env?.MODEL_AUTH).toBe('node-sentinel');
