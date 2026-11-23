@@ -35,6 +35,13 @@ import {
   protectedMcpConfiguredEnvKeys,
   type ProtectedMcpCapabilityConfigMap,
 } from './core/protected-mcp-capabilities.js';
+import {
+  readGlobalTaskRoutingConfigFromRaw,
+  validateGlobalTaskRoutingConfig,
+  type TaskRoutingGlobalConfig,
+} from './core/task-routing/model.js';
+
+export type { TaskRoutingGlobalConfig } from './core/task-routing/model.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -368,6 +375,9 @@ export interface GlobalConfig {
   /** Machine-wide multi-topic orchestration switch. Missing / enabled !== false
    *  preserves legacy behavior. `BOTMUX_MULTI_TOPIC_ENABLED` overrides it. */
   multiTopic?: MultiTopicGlobalConfig;
+  /** Machine-wide task routing (`botmux assign`). Missing / enabled !== true keeps
+   *  the feature OFF by default. */
+  taskRouting?: TaskRoutingGlobalConfig;
   /** Optional proxy for GitHub release assets and checksums, preferred over
    *  HTTP_PROXY/HTTPS_PROXY. Registry metadata and platform-package downloads
    *  use only environment proxies + NO_PROXY; package-manager installs use
@@ -1140,6 +1150,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (workflow) out.workflow = workflow;
   const multiTopic = readMultiTopic(raw.multiTopic);
   if (multiTopic) out.multiTopic = multiTopic;
+  const taskRouting = readGlobalTaskRoutingConfigFromRaw(raw.taskRouting);
+  if (taskRouting) out.taskRouting = taskRouting;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   // Lenient http(s) origin check; resolveOAuthRedirectUri re-validates shape.
   if (typeof raw.oauthRedirectBase === 'string' && /^https?:\/\//.test(raw.oauthRedirectBase.trim())) {
@@ -1177,6 +1189,28 @@ export function invalidateGlobalConfigCache(): void {
   readCache = null;
   vcMeetingAgentLiveCache = null;
   terminalEffortLiveCache = null;
+  taskRoutingLiveCache = null;
+}
+
+let taskRoutingLiveCache: { path: string; identity: string; value: TaskRoutingGlobalConfig | undefined } | null = null;
+/** Live global `taskRouting` config backed by file stat identity (`ino:mtimeMs:size`).
+ *  Bypasses the 2s `readGlobalConfig()` TTL so disabling `taskRouting.enabled` from
+ *  another process or Dashboard takes effect immediately mid-dispatch. */
+export function readGlobalTaskRoutingConfigLive(): TaskRoutingGlobalConfig | undefined {
+  const path = globalConfigPath();
+  try {
+    const stat = statSync(path);
+    const identity = `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+    if (taskRoutingLiveCache?.path === path && taskRoutingLiveCache.identity === identity) {
+      return taskRoutingLiveCache.value;
+    }
+    const value = readGlobalTaskRoutingConfigFromRaw(readRawConfig().taskRouting);
+    taskRoutingLiveCache = { path, identity, value };
+    return value;
+  } catch {
+    taskRoutingLiveCache = null;
+    return undefined;
+  }
 }
 
 let terminalEffortLiveCache: { path: string; identity: string; value: { enabled: boolean; epoch: number; enabledAtMs: number } } | null = null;
@@ -1596,4 +1630,24 @@ export function mergeMaintenanceConfig(patch: MaintenanceConfig): MaintenanceCon
 /** Convenience: set the global UI locale (or clear it when `null`). */
 export function setGlobalLocale(loc: Locale | null): void {
   mergeGlobalConfig({ lang: loc });
+}
+
+/** Machine-wide task routing (`botmux assign`) kill-switch. Off unless explicitly enabled. */
+export function isTaskRoutingEnabled(): boolean {
+  return readGlobalTaskRoutingConfigLive()?.enabled === true;
+}
+
+/** Read current global task routing configuration (undefined when not configured). */
+export function readGlobalTaskRoutingConfig(): TaskRoutingGlobalConfig | undefined {
+  return readGlobalTaskRoutingConfigLive();
+}
+
+/** Validate and persist global `taskRouting` configuration (null clears the block). */
+export function writeGlobalTaskRoutingConfig(
+  raw: unknown,
+): { ok: true; value: TaskRoutingGlobalConfig | undefined } | { ok: false; reason: string } {
+  const validated = validateGlobalTaskRoutingConfig(raw);
+  if (!validated.ok) return validated;
+  mergeGlobalConfig({ taskRouting: validated.value });
+  return { ok: true, value: readGlobalConfig().taskRouting };
 }
