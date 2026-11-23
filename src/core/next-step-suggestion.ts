@@ -147,6 +147,26 @@ export function noteNextStepCard(ds: DaemonSession, turnId: string, card: NextSt
   reconcile(ds, io);
 }
 
+/** Daemon-side staleness gate for a worker-generated editable suggestion.
+ * The producing turn must still be the session's current turn, whose latest
+ * terminal is a completed one for the same turn and dispatch attempt.
+ * CLI-native (non-editable) suggestions bypass it: their own latest-turn check
+ * in noteNextStepSuggestion is the contract for that path. */
+export function editableSuggestionIsCurrent(
+  facts: {
+    currentTurnId?: string;
+    lastTurnTerminalTurnId?: string;
+    lastTurnTerminalStatus?: string;
+    lastTurnTerminalDispatchAttempt?: number;
+  },
+  msg: { turnId?: string; dispatchAttempt?: number },
+): boolean {
+  return facts.currentTurnId === msg.turnId
+    && facts.lastTurnTerminalStatus === 'completed'
+    && facts.lastTurnTerminalTurnId === msg.turnId
+    && facts.lastTurnTerminalDispatchAttempt === msg.dispatchAttempt;
+}
+
 export function noteNextStepSuggestion(ds: DaemonSession, turnId: string | undefined, text: string, io: NextStepIo, editable = false): void {
   const trimmed = text.trim();
   if (!turnId || !trimmed) return;

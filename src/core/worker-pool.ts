@@ -52,7 +52,7 @@ import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, t
 import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../cli/topic-send-guard.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from '../im/lark/reply-card-footer-signature.js';
 import { messageCardContent } from '../im/lark/message-card-content.js';
-import { noteNextStepCard, noteNextStepSuggestion } from './next-step-suggestion.js';
+import { editableSuggestionIsCurrent, noteNextStepCard, noteNextStepSuggestion } from './next-step-suggestion.js';
 import { nextStepPlacement } from '../im/lark/next-step-card.js';
 import { nextStepIo } from './next-step-io.js';
 import { noteCliRecap, noteRecapCard } from './turn-recap-state.js';
@@ -24111,8 +24111,7 @@ function setupWorkerHandlers(
           if (nextStepIo.enabled(ds)) logger.info(`[${t}] Prompt suggestion dropped (${dropped}) turn=${msg.turnId?.substring(0, 16) ?? '-'}`);
           break;
         }
-        if (msg.editable && (ds.currentTurnId !== msg.turnId || ds.lastTurnTerminalStatus !== 'completed'
-          || ds.lastTurnTerminalTurnId !== msg.turnId || ds.lastTurnTerminalDispatchAttempt !== msg.dispatchAttempt)) break;
+        if (msg.editable && !editableSuggestionIsCurrent(ds, msg)) break;
         noteNextStepSuggestion(ds, msg.turnId, msg.text, nextStepIo, msg.editable === true);
         break;
       }
