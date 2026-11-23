@@ -249,6 +249,15 @@ import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { managedTmuxCandidateSockets, preferredManagedTmuxSocket, tmuxServerLabel } from '../adapters/backend/tmux-socket.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
+import {
+  collectBotmuxHcTerminals,
+  hcDiagnosticTarget,
+  killHcTerminal,
+  type HcBotmuxTerminal,
+  type HcKillOutcome,
+  type HcTarget,
+} from '../adapters/backend/hc/cli-ops.js';
+import { hcCoreAddress, hcCorePaths, queryHcCoreStatus, type HcCoreAddress } from '../adapters/backend/hc/core.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
 import { wrapperIdentityTokens } from '../setup/cli-selection.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
@@ -850,7 +859,7 @@ export function sessionSupportsIdleAutoCompact(ds: DaemonSession): boolean {
 }
 
 /** Whether this session can take 缓存过期自动压缩 (core/kimi-cache-expiry.ts):
- *  Kimi Code on a local PTY / tmux backend, in a session botmux owns. */
+ *  Kimi Code on a local PTY / tmux / hc backend, in a session botmux owns. */
 export function sessionSupportsKimiCacheExpiryAutoCompact(ds: DaemonSession): boolean {
   try {
     return supportsKimiCacheExpiryAutoCompact({
@@ -9753,7 +9762,10 @@ function backendOutageDeps(): BackendOutageDeps<DaemonSession> {
         if (status !== 'in_progress') onSettled(status);
       },
     }) !== undefined,
-    serverUp: socketName => probeTmuxServerUp(socketName),
+    // Connect-only probes on both families: neither starts a server.
+    serverUp: (socketName, backend) => backend === 'hc'
+      ? hcCoreAnswers(socketName)
+      : probeTmuxServerUp(socketName),
     eligible: ds => recoveryEligibility({
       active: ds.session.status === 'active',
       current: !activeSessionsRegistry || activeSessionsRegistry.get(activeSessionKey(ds)) === ds,
@@ -9813,6 +9825,13 @@ function backendOutageDeps(): BackendOutageDeps<DaemonSession> {
     },
     log: line => logger.warn(`[backend-outage] ${line}`),
   };
+}
+
+/** Whether an hc core answers `server.status` on `socket` (an hc outage is
+ *  keyed by the core's socket path). */
+async function hcCoreAnswers(socket: string | undefined): Promise<boolean> {
+  if (!socket) return false;
+  return (await queryHcCoreStatus(socket)).state === 'running';
 }
 
 /** Socket a managed session's pane lives on, as the worker recorded it. */
@@ -12204,18 +12223,42 @@ function liveLocalResidual(
  * suspend / next-message retry), but it CAN'T when it is hard-killed
  * (OOM/SIGKILL) while parked — then the daemon must do it, on the next refork
  * (forkWorker) or on close (destroyOrphanedBackingSession). Both ops are no-ops
- * when absent, so this is safe to call unconditionally for tmux sessions.
+ * when absent, so this is safe to call unconditionally for tmux and hc sessions.
  */
 function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
-  if (getSessionPersistentBackendType(ds) !== 'tmux') return;
-  // The worker parks it next to the managed session, whose server may have
-  // changed since (legacy default → dedicated socket), so sweep every candidate.
-  const target = ds.session.persistentBackendTarget;
-  const recordedSocket = target?.backendType === 'tmux' ? target.socketName : undefined;
-  for (const socketName of managedTmuxCandidateSockets(recordedSocket, preferredManagedTmuxSocket())) {
-    try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId), socketName); } catch { /* benign */ }
-  }
+  const backendType = getSessionPersistentBackendType(ds);
+  if (backendType === 'hc') {
+    const diagnostic = sessionHcDiagnosticTarget(ds);
+    if (diagnostic?.socket) {
+      let outcome: HcKillOutcome;
+      try { outcome = killHcTerminal(diagnostic, ds.session.sessionId); }
+      catch (err) { outcome = { result: 'unknown', reason: err instanceof Error ? err.message : String(err) }; }
+      if (outcome.result === 'mismatch' || outcome.result === 'unknown') {
+        logger.warn(
+          `[${tag(ds)}] Crash diagnostic ${diagnostic.sessionName} not reclaimed: `
+          + (outcome.result === 'mismatch' ? `held by ${outcome.owner ?? 'a non-botmux owner'}` : outcome.reason),
+        );
+      }
+    }
+  } else if (backendType === 'tmux') {
+    // The worker parks it next to the managed session, whose server may have
+    // changed since (legacy default → dedicated socket), so sweep every candidate.
+    const target = ds.session.persistentBackendTarget;
+    const recordedSocket = target?.backendType === 'tmux' ? target.socketName : undefined;
+    for (const socketName of managedTmuxCandidateSockets(recordedSocket, preferredManagedTmuxSocket())) {
+      try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId), socketName); } catch { /* benign */ }
+    }
+  } else return;
   try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); } catch { /* absent — benign */ }
+}
+
+/**
+ * The crash-diagnostic terminal an hc worker parks on the session's own core,
+ * labelled with the full session id like its CLI terminal.
+ */
+function sessionHcDiagnosticTarget(ds: DaemonSession): HcTarget | undefined {
+  const target = persistentBackendTargetForSession(ds);
+  return target?.backendType === 'hc' ? hcDiagnosticTarget(target, ds.session.sessionId) : undefined;
 }
 
 /**
@@ -12312,7 +12355,7 @@ export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['r
   const wrapper = cfg.wrapperCli?.trim();
   if ((cfg.cliId ?? ds.session.cliId) !== 'codex'
     || (wrapper && (wrapperIdentityTokens(wrapper).join(' ') !== 'aiden x codex' || ds.session.cliInstanceBinding || ds.initConfig?.cliInstanceBinding))
-    || cfg.backendType !== 'tmux' || ds.initConfig?.codexRpcInput
+    || (cfg.backendType !== 'tmux' && cfg.backendType !== 'hc') || ds.initConfig?.codexRpcInput
     || ds.session.sandbox || ds.initConfig?.sandbox || ds.initConfig?.readIsolation || sandboxEnabled()
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) return undefined;
   const model = ds.activeModel ?? cfg.model;
@@ -12335,7 +12378,7 @@ export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['r
 export function topicReasoningControl(ds: DaemonSession): { model: string; choices: readonly string[]; selected?: string; active?: string; pending: boolean } | undefined {
   const cfg = ds.initConfig ?? ds.session;
   if ((ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId) !== 'traex'
-    || !['pty', 'tmux'].includes(cfg.backendType ?? '') || cfg.wrapperCli || ds.initConfig?.traexAutoModel?.enabled
+    || !['pty', 'tmux', 'hc'].includes(cfg.backendType ?? '') || cfg.wrapperCli || ds.initConfig?.traexAutoModel?.enabled
     || ds.initConfig?.workflowNodeSession || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
     || sandboxBoolValue(cfg.sandbox) || sandboxEnabled() || ds.initConfig?.readIsolation) return;
   const model = ds.activeModel?.trim() || cfg.model?.trim();
@@ -12630,7 +12673,24 @@ export function destroySuspendBackingVerified(
     probe: probePersistentBackendTarget,
   },
 ): boolean {
-  if (ds.crashDiagnosticParked) {
+  const hcDiagnostic = ds.crashDiagnosticParked ? sessionHcDiagnosticTarget(ds) : undefined;
+  if (hcDiagnostic) {
+    let probe: SessionProbe = 'unknown';
+    for (let attempt = 1; attempt <= 2 && probe !== 'missing'; attempt++) {
+      try { ops.kill(hcDiagnostic, ds.session.sessionId); }
+      catch { /* the post-probe below is authoritative */ }
+      try { probe = ops.probe(hcDiagnostic); }
+      catch { probe = 'unknown'; }
+    }
+    if (probe !== 'missing') {
+      logger.error(
+        `[${tag(ds)}] Suspend refused: crash diagnostic teardown unverified on hc core ${hcDiagnostic.socket || '(unresolved)'} probe=${probe}`,
+      );
+      return false;
+    }
+    try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); }
+    catch { /* absent — benign */ }
+  } else if (ds.crashDiagnosticParked) {
     const diagnosticName = TmuxBackend.diagnosticSessionName(ds.session.sessionId);
     // The worker parks it next to the managed session, whose server may have
     // changed since (legacy default → dedicated socket): every candidate server
@@ -13560,7 +13620,8 @@ function isLegacyApiDocSubscription(managedBy: 'subscribe-lark-doc' | 'watch-com
  * generation it is about to repopulate. Those paths call this synchronous seam
  * first, while every bit of old-session state is still intact.
  *
- * Other backends retain their existing worker-side graceful teardown. Adopted,
+ * Other backends, tmux and hc included, retain their worker-side graceful
+ * teardown: killing a live worker's pane here races its exit handling. Adopted,
  * queued, and already-closed rows never own a ZMX process to destroy.
  */
 function teardownAuthoritativePersistentBackingBeforeCloseImpl(
@@ -15685,7 +15746,7 @@ export function updateCodexCliEffort(
   if ((ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId) !== 'codex'
     || !worker || worker.killed || !ds.workerReady
     || ds.session.status !== 'active' || isSessionTransferring(ds)
-    || !['pty', 'tmux'].includes(cfg.backendType ?? '') || cfg.wrapperCli
+    || !['pty', 'tmux', 'hc'].includes(cfg.backendType ?? '') || cfg.wrapperCli
     || sandboxBoolValue(cfg.sandbox) || sandboxEnabled() || ds.initConfig?.readIsolation
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
     || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds) || !effortAuthorityAllowed(canApply)) {
@@ -25367,13 +25428,20 @@ function setupWorkerHandlers(
           break;
         }
 
-        // The CLI did not fail: the shared tmux server holding its pane was
-        // lost, and every session on that server is reporting the same thing.
-        // One backend outage, handled once (backend-outage-coordinator.ts):
-        // no crash-loop count, no per-session crash notice, a single server
-        // recovery, one status card per topic and one owner summary.
+        // The CLI did not fail: the shared tmux server (or hc core) holding
+        // its pane was lost, and every session on that server is reporting
+        // the same thing. One backend outage, handled once
+        // (backend-outage-coordinator.ts): no crash-loop count, no
+        // per-session crash notice, a single server recovery, one status card
+        // per topic and one owner summary.
+        // tmux's `gone` is inferred from an empty socket, which a clean exit
+        // of a server's last session leaves too, so it needs corroboration.
+        // hc's `gone` is the core's own end reason (server_stop /
+        // host_shutdown), and a core outlives its last terminal.
+        const lostBackend = msg.backendLost?.backend ?? 'tmux';
         const serverLost = msg.backendLost
-          && (msg.backendLost.kind !== 'gone' || goneServerCorroborated(ds, msg.backendLost.socketName));
+          && (msg.backendLost.kind !== 'gone' || lostBackend === 'hc'
+            || goneServerCorroborated(ds, msg.backendLost.socketName));
         if (msg.backendLost && !serverLost) {
           logger.info(
             `[${t}] tmux server ${msg.backendLost.socketName ?? 'default'} is gone but held no other session of ours; `
@@ -25382,11 +25450,12 @@ function setupWorkerHandlers(
         }
         if (msg.backendLost && serverLost) {
           logger.warn(
-            `[${t}] ${sessionCliDisplayName(ds, botCfg)} lost its tmux server `
+            `[${t}] ${sessionCliDisplayName(ds, botCfg)} lost its ${lostBackend === 'hc' ? 'hc core' : 'tmux server'} `
             + `(${msg.backendLost.kind}); handing it to the backend outage recovery`,
           );
           backendOutage.onServerLost(ds, ds.session.sessionId, {
             larkAppId: ds.larkAppId,
+            ...(lostBackend === 'hc' ? { backend: 'hc' as const } : {}),
             ...(msg.backendLost.socketName !== undefined ? { socketName: msg.backendLost.socketName } : {}),
             kind: msg.backendLost.kind,
             cliName: sessionCliDisplayName(ds, botCfg),
@@ -30878,6 +30947,7 @@ export function killStalePids(
   cleanupPersistentBackendSessions('tmux', activeSessions_, runtimeSessions);
   cleanupPersistentBackendSessions('herdr', activeSessions_, runtimeSessions);
   cleanupPersistentBackendSessions('zmx', activeSessions_, runtimeSessions);
+  cleanupHcTerminals(activeSessions_, runtimeSessions);
 }
 
 /**
@@ -31210,6 +31280,130 @@ function cleanupPersistentBackendSessions(
           continue;
         }
       }
+    }
+  }
+
+  try {
+    mkdirSync(config.session.dataDir, { recursive: true });
+    atomicWriteFileSync(cliIdFile, currentCliId);
+  } catch (err) {
+    logger.warn(`Failed to write ${cliIdFile}: ${err}`);
+  }
+}
+
+/**
+ * Startup sweep of hc terminals. Every daemon of the uid shares one botmux
+ * core, and `bmx-<sid8>` is a name, not an owner: a terminal is this daemon's
+ * only when its `botmux_sid` label is a session id of its own store or
+ * runtime, and every kill re-checks that label (killHcTerminal).
+ */
+function cleanupHcTerminals(
+  activeSessions_: Session[],
+  runtimeSessions?: ReadonlyMap<string, DaemonSession>,
+): void {
+  const storedSessions = sessionStore.listSessions();
+  const runtimeSessionRows = runtimeSessions
+    ? [...runtimeSessions.values()].map(ds => ds.session)
+    : [];
+  const knownSessions = [...storedSessions, ...activeSessions_, ...runtimeSessionRows];
+  const anyBackend = getAllBots().some(b => (b.config.backendType ?? config.daemon.backendType) === 'hc')
+    || config.daemon.backendType === 'hc'
+    || knownSessions.some(s => s.backendType === 'hc' || s.persistentBackendTarget?.backendType === 'hc');
+  if (!anyBackend) return;
+
+  const cores = new Map<string, HcCoreAddress>();
+  const addCore = (core: HcCoreAddress): void => {
+    cores.set(JSON.stringify([core.hcSession, core.socket]), core);
+  };
+  try {
+    addCore(hcCoreAddress(hcCorePaths(process.env)));
+  } catch (err) {
+    logger.warn(`hc startup sweep skips the default core: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  for (const session of knownSessions) {
+    const target = session.persistentBackendTarget;
+    if (target?.backendType === 'hc' && target.hcSession && target.socket) {
+      addCore({ hcSession: target.hcSession, socket: target.socket });
+    }
+  }
+  // An hc client that cannot connect starts a core. A core whose socket file
+  // is gone serves no reachable terminal, so listing it would only start one.
+  const reachableCores = [...cores.values()].filter(core => existsSync(core.socket));
+  const sweep = reachableCores.length > 0
+    ? collectBotmuxHcTerminals(reachableCores)
+    : { terminals: [], failures: [] };
+  for (const failure of sweep.failures) {
+    logger.warn(`hc core ${failure.core.socket} gave no terminal listing; its terminals stay as they are: ${failure.reason}`);
+  }
+
+  const ownedSessionIds = new Set(knownSessions.map(s => s.sessionId));
+  // Quarantined rows stay active precisely because their backing could not be
+  // proven safe to tear down.
+  const runtimeSessionIds = new Set([
+    ...runtimeSessionRows,
+    ...activeSessions_.filter(s => s.cliInstanceBinding),
+    ...storedSessions.filter(s => s.status === 'active' && s.restoreQuarantinedAt),
+  ].map(s => s.sessionId));
+  const activeSessionIds = new Set([...activeSessions_.map(s => s.sessionId), ...runtimeSessionIds]);
+  const unsettledSessionIds = new Set(
+    activeSessions_.filter(hasProtectedSessionMutationOwnership).map(s => s.sessionId),
+  );
+  const killOwnedHcTerminal = (terminal: HcBotmuxTerminal, why: string): void => {
+    const label = `${terminal.target.sessionName} (${terminal.address} on ${terminal.target.socket}, session ${terminal.sessionId.substring(0, 8)})`;
+    let outcome: HcKillOutcome;
+    try {
+      outcome = killHcTerminal(terminal.target, terminal.sessionId);
+    } catch (err) {
+      outcome = { result: 'unknown', reason: err instanceof Error ? err.message : String(err) };
+    }
+    switch (outcome.result) {
+      case 'killed':
+      case 'removed':
+        logger.info(`${why}: ${outcome.result} hc terminal ${label}`);
+        return;
+      case 'missing':
+        return;
+      case 'mismatch':
+        logger.warn(`${why}: left hc terminal ${label} alone, its name now resolves to ${outcome.address} of ${outcome.owner ?? 'a non-botmux owner'}`);
+        return;
+      case 'unknown':
+        logger.warn(`${why}: could not end hc terminal ${label}: ${outcome.reason}`);
+        return;
+    }
+  };
+
+  const multiBot = getAllBots().length > 1;
+  const cliIdFile = join(config.session.dataDir, 'last-cli-id-hc');
+  let lastCliId: string | undefined;
+  try { lastCliId = readFileSync(cliIdFile, 'utf-8').trim(); } catch { /* first run */ }
+  const currentCliId = config.daemon.cliId;
+
+  if (!multiBot && lastCliId && lastCliId !== currentCliId) {
+    logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing this daemon's hc terminals`);
+    for (const terminal of sweep.terminals) {
+      if (!ownedSessionIds.has(terminal.sessionId)) continue;
+      if (unsettledSessionIds.has(terminal.sessionId)) {
+        logger.warn(`Preserving hc ${terminal.target.sessionName}: unsettled Codex App dispatch must reconcile first`);
+        continue;
+      }
+      if (runtimeSessionIds.has(terminal.sessionId)) continue;
+      killOwnedHcTerminal(terminal, 'CLI_ID changed');
+    }
+  } else {
+    const cliMismatchSessionIds = new Set<string>();
+    for (const session of activeSessions_) {
+      if (runtimeSessionIds.has(session.sessionId)) continue;
+      if (isExistingAppServerSharedAdoptPersistedSession(session)) continue;
+      const sessionCliId = session.cliId;
+      if (!sessionCliId || !session.larkAppId) continue;
+      let botCliId: CliId | undefined;
+      try { botCliId = getBot(session.larkAppId).config.cliId; } catch { continue; }
+      if (botCliId && sessionCliId !== botCliId) cliMismatchSessionIds.add(session.sessionId);
+    }
+    for (const terminal of sweep.terminals) {
+      if (!ownedSessionIds.has(terminal.sessionId)) continue;
+      if (!activeSessionIds.has(terminal.sessionId)) killOwnedHcTerminal(terminal, 'Orphaned');
+      else if (cliMismatchSessionIds.has(terminal.sessionId)) killOwnedHcTerminal(terminal, 'CLI mismatch');
     }
   }
 

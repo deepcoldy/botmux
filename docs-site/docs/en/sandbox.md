@@ -345,7 +345,7 @@ The sandbox cannot see the supervisor / daemon processes on the host. Running `b
 
 | Backend | With a sandbox |
 |---|---|
-| pty, tmux | Supported |
+| pty, tmux, hc | Supported |
 | zellij, herdr, zmx and other local persistent backends | Cannot set up the same file boundary, so the session **refuses to start**; switch to pty or tmux |
 | Riff, remote-runner and other remote backends | The CLI runs remotely, so the local sandbox **has no effect** (the session starts normally and isolation is up to the remote side); combined with `sandboxNetworkPolicy`, though, the session refuses to start |
 | mojo | Same as remote backends when it provably runs entirely remote; same as local backends (refuses to start) when it runs on this machine |

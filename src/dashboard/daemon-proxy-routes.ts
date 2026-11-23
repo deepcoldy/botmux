@@ -152,7 +152,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('sandbox'),
   // read-isolation：`{ enabled: boolean }`。
   putBotConfig('read-isolation'),
-  // backend-type：`{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'zmx'|'' }`（''/'auto' 清除覆盖）。
+  // backend-type：`{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'zmx'|'hc'|'' }`（''/'auto' 清除覆盖）。
   putBotConfig('backend-type'),
   // card-prefs：任意子集的 per-bot 行为布尔 / prompt 字符串。
   putBotConfig('card-prefs'),

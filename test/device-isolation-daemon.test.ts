@@ -239,6 +239,58 @@ describe('device-isolation daemon transaction', () => {
     });
   });
 
+  it('probes the frozen hc terminal of a workerless row instead of calling it quiescent', () => {
+    const hcTarget = (sessionName: string) => ({
+      backendType: 'hc' as const,
+      sessionName,
+      hcSession: 'botmux',
+      socket: '/tmp/frozen-core/herdr-core/botmux.sock',
+    });
+    const sessions = mergePersistedDeviceIsolationSessions([], [
+      { sessionId: 'hc-live', status: 'active', backendType: 'hc', persistentBackendTarget: hcTarget('bmx-hclive00') } as any,
+      { sessionId: 'hc-unknown', status: 'active', backendType: 'hc', persistentBackendTarget: hcTarget('bmx-hcunknow') } as any,
+      { sessionId: 'hc-gone', status: 'active', backendType: 'hc', persistentBackendTarget: hcTarget('bmx-hcgone00') } as any,
+    ]);
+    const probed: PersistentBackendTarget[] = [];
+    setDeviceIsolationDaemonDependenciesForTest({
+      dataDir: () => '/tmp/data',
+      listSessions: () => sessions,
+      processStart: pid => pid === process.pid ? 'daemon-start' : undefined,
+      processExists: () => false,
+      probePersistent: target => {
+        probed.push(target);
+        if (target.sessionName === 'bmx-hclive00') return 'exists';
+        if (target.sessionName === 'bmx-hcunknow') return 'unknown';
+        return 'missing';
+      },
+    });
+
+    const inventory = buildDeviceIsolationInventory();
+
+    expect(probed).toEqual(expect.arrayContaining([
+      hcTarget('bmx-hclive00'), hcTarget('bmx-hcunknow'), hcTarget('bmx-hcgone00'),
+    ]));
+    expect(inventory.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sessionId: 'hc-live',
+        backendType: 'hc',
+        disposition: 'blocked',
+        blocker: 'unattested_worker',
+        persistent: { target: hcTarget('bmx-hclive00'), probe: 'exists' },
+      }),
+      expect.objectContaining({
+        sessionId: 'hc-unknown',
+        disposition: 'blocked',
+        blocker: 'backend_probe_unknown',
+      }),
+      expect.objectContaining({
+        sessionId: 'hc-gone',
+        disposition: 'quiescent',
+        persistent: { target: hcTarget('bmx-hcgone00'), probe: 'missing' },
+      }),
+    ]));
+  });
+
   it('lets a runtime row win over a persisted active row with the same session id', () => {
     const runtime: DeviceIsolationRuntimeSession = {
       sessionId: 'same-session',

@@ -17,9 +17,9 @@ describe('host workspace resolver', () => {
     const sub = join(root, 'src'); mkdirSync(sub);
     const alias = join(dir(), 'alias'); symlinkSync(root, alias);
     const resolve = createWorkspaceResolver(() => 'host-a');
-    const [a, b, c] = await Promise.all([resolve(root, 'pty'), resolve(sub, 'tmux'), resolve(alias, 'zellij')]);
+    const [a, b, c, d] = await Promise.all([resolve(root, 'pty'), resolve(sub, 'tmux'), resolve(alias, 'zellij'), resolve(sub, 'hc')]);
     expect(a).toMatchObject({ kind: 'git', branch: 'main', state: 'resolved' });
-    expect(b.rootPath).toBe(a.rootPath); expect(c.rootPath).toBe(a.rootPath);
+    expect(b.rootPath).toBe(a.rootPath); expect(c.rootPath).toBe(a.rootPath); expect(d.rootPath).toBe(a.rootPath);
   });
   it('keeps linked worktrees separate and handles detached HEAD', async () => {
     const root = dir(); git(root, 'init'); git(root, 'symbolic-ref', 'HEAD', 'refs/heads/main');

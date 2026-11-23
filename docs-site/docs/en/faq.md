@@ -243,7 +243,7 @@ Pick one fix:
   PATH, nvm, and the like must live in the chosen shell's own startup file (such as `.zshrc`; for fish, `~/.config/fish/config.fish`).
 - **Fix the startup file**: only switch when you open a terminal by hand: `[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec zsh` (put PATH, nvm, etc. before this line).
 
-Then run `botmux restart` and send another message. This only affects backends that start through a shell (`tmux` / `zellij` / `zmx`); the `pty` backend starts the CLI directly and isn't affected.
+Then run `botmux restart` and send another message. This only affects backends that start through a shell (`tmux` / `zellij` / `zmx` / `hc`); the `pty` backend starts the CLI directly and isn't affected.
 
 ### The Workbench or terminal won't load on my phone?
 

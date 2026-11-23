@@ -21,19 +21,20 @@ const handles: Array<{ close(): void }> = [];
 const identity = (physicalId: string, nativeSessionId = 'native-task'): RuntimeIdentity =>
   ({ backend: 'tmux', physicalId, nativeSessionId, proof: 'process_start' });
 
-function fixture(phase: ExecutionPhase = 'submitting', dispatchAttempt?: number, appId = 'cli_continuation_test') {
+function fixture(phase: ExecutionPhase = 'submitting', dispatchAttempt?: number, appId = 'cli_continuation_test', backend = 'tmux') {
   const data = mkdtempSync(join(tmpdir(), 'execution-continuation-')); directories.push(data);
   const ref = { appId, sessionId: 'session-test' };
   const store = new SessionContractStore(data, ref.appId); handles.push(store);
   const ds = { larkAppId: ref.appId, chatId: 'oc_test', cliReadyGeneration: 0,
     session: { sessionId: ref.sessionId, status: 'active', cliId: 'traex' },
-    initConfig: { cliId: 'traex', backendType: 'tmux', traexAutoModel: { enabled: true, models: ['one', 'two'] } },
+    initConfig: { cliId: 'traex', backendType: backend, traexAutoModel: { enabled: true, models: ['one', 'two'] } },
   } as unknown as DaemonSession;
+  const ident = (physicalId: string): RuntimeIdentity => ({ ...identity(physicalId), backend });
   const controller = new SessionController(ds, store);
   const bootstrap = controller.bindWorker(1);
   const worker = bootstrap.worker;
   const source = controller.reserveBinding('source', worker);
-  controller.bindRuntime('source', worker, identity('source:1'));
+  controller.bindRuntime('source', worker, ident('source:1'));
   const execution = controller.admitInput('ordinary-task', dispatchAttempt);
   store.bindQueuedExecution(ref, execution, source);
   if (phase === 'succeeded' || phase === 'failed' || phase === 'cancelled') {
@@ -41,7 +42,7 @@ function fixture(phase: ExecutionPhase = 'submitting', dispatchAttempt?: number,
   } else if (phase !== 'queued') store.apply(ref, { type: 'execution_phase', execution, runtime: source, phase });
   const request: RuntimeExecutionContinuation = { reason: 'traex-auto-model', execution, from: source, nativeSessionId: 'native-task' };
   const reserve = () => controller.reserveBinding('replacement', worker, request);
-  const bind = (value = identity('replacement:2')) => controller.bindRuntime('replacement', worker, value);
+  const bind = (value = ident('replacement:2')) => controller.bindRuntime('replacement', worker, value);
   const currentExecution = () => store.execution(ref, execution.executionId)!;
   return { data, ref, store, ds, controller, bootstrap, worker, source, execution, request, reserve, bind, currentExecution };
 }
@@ -100,6 +101,14 @@ describe('ordinary execution continuation', () => {
         : s.reserve()).toThrow();
       expect(s.currentExecution().runtime).toEqual(s.source);
     });
+
+  it('grants the continuation on hc, whose CLI is a botmux-launched local process like tmux', () => {
+    const s = fixture('submitting', undefined, undefined, 'hc');
+    const target = s.reserve();
+    s.bind();
+    expect(s.store.executionContinuation(s.ref, 'replacement')).toEqual({ execution: s.execution, status: 'approved' });
+    expect(s.currentExecution().runtime).toEqual(target);
+  });
 
   it('does not complete the grant until a native identity is available', () => {
     const s = fixture(); const target = s.reserve();
@@ -360,8 +369,8 @@ describe('worker continuation gate', () => {
       expect(g.env.restartCliProcess.mock.calls[0][1]).not.toHaveProperty('restartCause');
     });
 
-  it('resumes the current turn with a continuation on a granting host and backend', () => {
-    const g = gate('tmux', true);
+  it.each(['tmux', 'hc'])('resumes the current turn with a continuation on a granting host and backend (%s)', backendType => {
+    const g = gate(backendType, true);
     expect(g.execute(g.action('capacity_timeout'), { resumeCurrentTurn: true })).toBe(true);
     expect(g.env.restartCliProcess.mock.calls[0][1]).toMatchObject({ restartCause: 'traex-auto-model', exactResumeSessionId: 'native-task' });
     expect(g.env.pendingMessages).toHaveLength(1);

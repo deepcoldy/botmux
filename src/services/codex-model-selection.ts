@@ -56,7 +56,7 @@ export interface CodexModelSelectionSession {
 export function supportsCodexModelSelection(session: CodexModelSelectionSession): boolean {
   return session.cliId === 'codex' && !session.adoptedFrom
     && !session.existingAppServerEndpoint && !session.dispatchLaunchSpec
-    && (!session.backendType || ['pty', 'tmux'].includes(session.backendType));
+    && (!session.backendType || ['pty', 'tmux', 'hc'].includes(session.backendType));
 }
 
 /** Read confirmed native SETTINGS, never turn_context (which can describe an

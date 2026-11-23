@@ -11,6 +11,7 @@ import type { DaemonSession } from '../core/types.js';
 import { getSessionPersistentBackendType, persistentBackendTargetForSession } from '../core/persistent-backend.js';
 import { readGlobalConfig, type LocalCliOpenMode } from '../global-config.js';
 import { resolveCliSpawn } from '../core/self-spawn.js';
+import { probeHcAvailability } from '../setup/ensure-hc.js';
 
 export const LOCAL_CLI_IDS = [
   'claude-code',
@@ -316,6 +317,26 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
     return {
       ok: true,
       command: `${prelude}; exec ${helper}`,
+    };
+  }
+  if (target.backendType === 'hc') {
+    if (!target.socket || !target.hcSession.trim()) {
+      return fail('missing_attach_target', 'This hc session has no recorded hc core socket.');
+    }
+    // The helper verifies the labels and attaches by address; pinning the binary
+    // this daemon drives keeps a login shell's PATH from picking another hc.
+    const hc = probeHcAvailability();
+    const attach = resolveCliSpawn(CLI_ENTRYPOINT, [
+      '__hc-attach-managed',
+      target.sessionName,
+      ds.session.sessionId,
+      target.hcSession,
+      target.socket,
+    ]);
+    const helper = [attach.command, ...attach.args].map(shellQuote).join(' ');
+    return {
+      ok: true,
+      command: hc.ok ? `export BOTMUX_HC_BIN=${shellQuote(hc.bin)}; exec ${helper}` : `exec ${helper}`,
     };
   }
   return fail('unsupported_backend', 'This session backend does not provide a safe local attach command.');

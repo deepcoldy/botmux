@@ -40,6 +40,55 @@ describe('offline explicit session backing cleanup', () => {
     expect(killPersistent).toHaveBeenCalledWith('zmx', 'bmx-abcd1234', SID);
   });
 
+  it('passes the exact owner session id when destroying an hc terminal by name', async () => {
+    const killPersistent = vi.fn();
+    const probePersistent = vi.fn(() => 'missing' as const);
+
+    await expect(cleanupExplicitSessionBacking(
+      { sessionId: SID, backendType: 'hc' },
+      { killPersistent, probePersistent },
+    )).resolves.toEqual({
+      ok: true,
+      kind: 'destroyed_persistent',
+      backendType: 'hc',
+      name: 'bmx-abcd1234',
+    });
+    expect(killPersistent).toHaveBeenCalledWith('hc', 'bmx-abcd1234', SID);
+    expect(probePersistent).toHaveBeenCalledWith('hc', 'bmx-abcd1234');
+  });
+
+  it('destroys an hc row on the core its terminal was frozen onto', async () => {
+    const target = { backendType: 'hc' as const, sessionName: 'bmx-abcd1234', hcSession: 'botmux', socket: '/tmp/frozen/herdr-core/botmux.sock' };
+    const killPersistent = vi.fn();
+    const probePersistent = vi.fn(() => 'missing' as const);
+    const killTarget = vi.fn();
+    const probeTarget = vi.fn(() => 'unknown' as const);
+    const result = await cleanupExplicitSessionBacking(
+      { sessionId: SID, backendType: 'hc', persistentBackendTarget: target },
+      { killPersistent, probePersistent, killTarget, probeTarget },
+    );
+    expect(result).toMatchObject({ ok: false, kind: 'persistent_destroy_failed', backendType: 'hc', error: 'backing_session_state_unknown' });
+    expect(killTarget).toHaveBeenCalledWith(target, SID);
+    expect(probeTarget).toHaveBeenCalledWith(target);
+    expect(killPersistent).not.toHaveBeenCalled();
+  });
+
+  it('reports an hc ownership refusal as a failed destroy', async () => {
+    const result = await cleanupExplicitSessionBacking(
+      { sessionId: SID, backendType: 'hc' },
+      {
+        killPersistent: vi.fn(() => { throw new Error('labels do not match'); }),
+        probePersistent: vi.fn(() => 'missing' as const),
+      },
+    );
+    expect(result).toEqual({
+      ok: false,
+      kind: 'persistent_destroy_failed',
+      backendType: 'hc',
+      error: 'labels do not match',
+    });
+  });
+
   it('destroys a tmux row on the server its pane was frozen onto', async () => {
     const target = { backendType: 'tmux' as const, sessionName: 'bmx-abcd1234', socketName: 'botmux' };
     const killPersistent = vi.fn();

@@ -11,6 +11,9 @@ import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { CodexArchiveSection } from '../src/dashboard/web/bot-defaults-page.js';
 import { codexArchiveInapplicableReason, codexArchiveSectionVisible } from '../src/dashboard/web/bot-defaults.js';
+import { ownedLocalCodex } from '../src/services/codex-cleanup-archive.js';
+import { EDITABLE_BACKEND_TYPES } from '../src/services/backend-type-store.js';
+import type { Session } from '../src/types.js';
 import { t } from '../src/dashboard/web/ui.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -122,6 +125,15 @@ describe('codexArchiveInapplicableReason / codexArchiveSectionVisible', () => {
     expect(codexArchiveInapplicableReason({ ...codex, sandboxMode: 'oncall' })).toBeNull();
     expect(codexArchiveInapplicableReason({ ...codex, backendType: 'herdr' })).toBe('backend');
     expect(codexArchiveInapplicableReason({ ...codex, defaultBackendType: 'zellij' })).toBe('backend');
+  });
+
+  it('says "backend" for exactly the backends whose sessions the daemon never archives', () => {
+    for (const backendType of [...EDITABLE_BACKEND_TYPES, 'riff', 'mojo', 'remote-runner', 'orca'] as const) {
+      const archived = ownedLocalCodex({ sessionId: 's', cliId: 'codex', backendType } as Session);
+      expect(codexArchiveInapplicableReason({ ...codex, backendType }), backendType).toBe(archived ? null : 'backend');
+      expect(codexArchiveInapplicableReason({ ...codex, backendType: null, defaultBackendType: backendType }), backendType)
+        .toBe(archived ? null : 'backend');
+    }
   });
 
   it('shows the section for Codex bots and for any bot that still carries an explicit override', () => {

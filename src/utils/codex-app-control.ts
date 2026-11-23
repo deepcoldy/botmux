@@ -2346,7 +2346,7 @@ export function takeCodexAppControlLocatorEndpoint(input: {
   return endpoint ? { endpoint, epoch: locator.epoch } : undefined;
 }
 
-const PERSISTENT_BACKEND_TYPES: ReadonlySet<BackendType> = new Set(['tmux', 'herdr', 'zellij']);
+const PERSISTENT_BACKEND_TYPES: ReadonlySet<BackendType> = new Set(['tmux', 'herdr', 'zellij', 'hc']);
 
 /** Missing/corrupt/legacy generations cannot prove a warm reattach. */
 export function shouldColdStartCodexAppReattach(input: {

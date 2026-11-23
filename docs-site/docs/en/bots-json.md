@@ -307,8 +307,8 @@ Requirements and limits:
 
 | Field | Description |
 |------|------|
-| `backendType` | Session backend: `tmux` (default), `zellij` (≥ 0.44), `herdr`, `zmx`, `pty`. If a persistent backend like tmux isn't available on the machine, you get a card asking you to install it; botmux never silently falls back to pty. `pty` is used only when set explicitly, and its sessions don't survive a daemon restart. See [tmux backend](/en/tmux), [ZMX backend](/en/zmx) |
-| `launchShell` | Shell used to launch the CLI, overriding the daemon's `$SHELL`. Use `zsh` / `bash` / `fish` / `sh` or an absolute path. For when the login shell's rc file does something like `exec zsh` and the session never starts (you see `parse error` in the terminal). Once set, put PATH, nvm and so on in that shell's rc file (`~/.config/fish/config.fish` for fish). Applies to new tmux / zellij / zmx sessions |
+| `backendType` | Session backend: `tmux` (default), `zellij` (≥ 0.44), `herdr`, `zmx`, `hc` (Linux only, explicit opt-in, bring your own herdr-core ≥ 0.1.19), `pty`. If a persistent backend like tmux isn't available on the machine, you get a card asking you to install it; botmux never silently falls back to pty. `pty` is used only when set explicitly, and its sessions don't survive a daemon restart. See [tmux backend](/en/tmux), [ZMX backend](/en/zmx), [hc backend](/en/hc) |
+| `launchShell` | Shell used to launch the CLI, overriding the daemon's `$SHELL`. Use `zsh` / `bash` / `fish` / `sh` or an absolute path. For when the login shell's rc file does something like `exec zsh` and the session never starts (you see `parse error` in the terminal). Once set, put PATH, nvm and so on in that shell's rc file (`~/.config/fish/config.fish` for fish). Applies to new tmux / zellij / zmx / hc sessions |
 | `lang` | UI language `zh` / `en`; falls back to the `BOTMUX_LANG` / `LANG` environment variables |
 | `p2pMode` | DM mode: `chat` (default, one continuous session), `thread` (each DM message starts its own session), `group` (each DM message gets its own session group). See [Group modes](/en/group) |
 | `regularGroupReplyMode` | Default reply shape after @bot in regular groups: `chat-topic` (default: top-level @-mentions share one continuous session, and each native topic opened in the group gets its own session), `chat` (the whole group shares one session, native topics fold into it too), `new-topic` (each @ opens a topic), `shared` (replies go in a topic but share one session). Override per group with `/reply-mode`. See [Slash commands](/en/slash-commands) |
@@ -664,7 +664,7 @@ What happens:
 
 - **Only the task and attachments are passed**: no botmux system prompt, per-turn reminders, identity info, role, whiteboard, memory or skill catalog. The CLI's own system prompt and the project's `AGENTS.md` are still handled by the CLI.
 - **Answers are forwarded automatically**: the final answer is taken from the CLI's session record and sent back to Feishu, mentioning the person who sent the task by default. Names of other bots in the group (like `@Reviewer`) become real Feishu mentions.
-- **Supported CLIs**: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao, Antigravity. Local backends only: tmux / pty / zellij / herdr / zmx (Antigravity doesn't support zmx). Cursor and Antigravity don't support the `scratch` sandbox. Hermes doesn't support the `oncall` sandbox (`~/.hermes/state.db` is not mounted into the host). Remote backends and v3 workflows are not supported yet.
+- **Supported CLIs**: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao, Antigravity. Local backends only: tmux / pty / zellij / herdr / zmx / hc (Antigravity doesn't support zmx). Cursor and Antigravity don't support the `scratch` sandbox. Hermes doesn't support the `oncall` sandbox (`~/.hermes/state.db` is not mounted into the host). Remote backends and v3 workflows are not supported yet.
 
 Technical details: [`docs/zero-prompt-injection.md`](https://github.com/deepcoldy/botmux/blob/master/docs/zero-prompt-injection.md).
 
@@ -911,7 +911,7 @@ Rules:
 - Within a layer, a variable is either "set" or "removed". "Restore inheritance" deletes this layer's entry, so the value falls back to the layer below.
 - `PATH` and `HOME` can be overridden but not removed.
 - A layer's sets and removes together are capped at 4 KB (tmux limits single command length). Saving more is rejected; an old config that's already over can always be made smaller.
-- For tmux / zellij / zmx sessions, removal is the last step of session startup, so same-named variables from the tmux server's global environment or shell startup files are removed too.
+- For tmux / zellij / zmx / hc sessions, removal is the last step of session startup, so same-named variables from the tmux server's global environment or shell startup files are removed too.
 - With lark-cli app binding on, botmux takes over `ZDOTDIR` / `BASH_ENV`; with trigger-user auth on, also `GIT_ASKPASS` / `GIT_CONFIG_*`. These can't be set or removed on that bot.
 - No migration needed: `env` is the bot layer's "set". Without `envUnset` / `sessionEnv`, everything works as before.
 - riff / mojo sessions don't run on this machine; only this bot's `env` goes with them, and the global layer and removals don't apply.
@@ -952,7 +952,7 @@ Bad formats, unknown fields and reserved names are rejected outright, never sile
 
 **When it applies**: on the next cold start of a session. Offline CLI edits only change the file; the daemon reads it on its next start. When the daemon restarts and restores sessions whose policy no longer matches, it closes the old session first and starts fresh; if it can't confirm the old one is gone, it refuses to start. Environment a CLI has already read can't be revoked.
 
-**Coverage**: strict mode covers PTY, tmux, zellij and zmx sessions started by botmux, plus local Codex / TraeX App Servers and helper processes such as title generation. tmux / zellij no longer load the `launchShell` startup files and launch the CLI with a clean environment, so PATH, nvm, mise and the like must come from the baseline or your explicit config. `TERM` defaults to `xterm-256color` when missing.
+**Coverage**: strict mode covers PTY, tmux, zellij, zmx and hc sessions started by botmux, plus local Codex / TraeX App Servers and helper processes such as title generation. tmux / zellij / hc no longer load the `launchShell` startup files and launch the CLI with a clean environment, so PATH, nvm, mise and the like must come from the baseline or your explicit config. `TERM` defaults to `xterm-256color` when missing.
 
 **Not supported**: Herdr, Riff, Mojo, Forge launch mode, adopted external processes and external App Servers can't provide the same isolation yet; strict mode refuses them. Config and credential files the CLI reads itself, file permissions and cloud accounts are outside this policy.
 

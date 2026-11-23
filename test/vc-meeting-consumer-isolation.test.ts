@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { evaluateVcMeetingConsumerIsolation } from '../src/services/vc-meeting-consumer-isolation.js';
 
 describe('VC meeting consumer managed side-effect isolation (plan B: operator owns sandbox)', () => {
-  it.each(['pty', 'tmux'] as const)(
+  it.each(['pty', 'tmux', 'hc'] as const)(
     'reports a real boundary for a Linux sandbox on the %s backend',
     (backendType) => {
       expect(evaluateVcMeetingConsumerIsolation({

@@ -2816,7 +2816,8 @@ export type WorkerToDaemonBase =
      *  pane was lost (crash / kill / replaced / unreachable). The daemon
      *  handles every such exit of one server as ONE backend outage
      *  (backend-outage-coordinator.ts), outside the per-session crash loop. */
-    backendLost?: { backend: 'tmux'; kind: 'replaced' | 'gone' | 'unreachable'; socketName?: string };
+    /** tmux: `socketName` is the `-L` name (absent = default server); hc: the core's socket path. */
+    backendLost?: { backend: 'tmux' | 'hc'; kind: 'replaced' | 'gone' | 'unreachable'; socketName?: string };
     turnId?: string;
     dispatchAttempt?: number;
   }

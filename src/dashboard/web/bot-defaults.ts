@@ -265,7 +265,7 @@ export function codexArchiveInapplicableReason(
   if (bot.wrapperCli) return 'wrapper';
   if ((bot.effectiveSandboxMode ?? bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off')) === 'scratch') return 'scratch';
   const backend = bot.backendType || bot.defaultBackendType;
-  if (backend && backend !== 'pty' && backend !== 'tmux') return 'backend';
+  if (backend && backend !== 'pty' && backend !== 'tmux' && backend !== 'hc') return 'backend';
   return null;
 }
 

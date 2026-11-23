@@ -33,7 +33,7 @@ import {
 /** Backends whose CLI runs in a local pane the worker can type into AND whose
  *  viewport the worker treats as authoritative (zmx can carry stale scrollback,
  *  so the keep-alive write gate could not trust it). */
-const LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij']);
+const LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'hc']);
 
 export function botPromptCachePolicy(bot: Pick<BotConfig, 'promptCache'>): ResolvedPromptCachePolicy {
   return resolvePromptCachePolicy(readGlobalConfig().promptCache, bot.promptCache);

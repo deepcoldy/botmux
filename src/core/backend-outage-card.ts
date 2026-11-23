@@ -52,7 +52,7 @@ function turnLine(view: OutageCardView, locale: Locale | undefined): string | un
 
 export function buildBackendOutageCard(view: OutageCardView, locale?: Locale): string {
   const elements: unknown[] = [
-    larkMdDiv(t('card.outage.cause', { server: view.serverLabel, cliName: view.cliName }, locale)),
+    larkMdDiv(t(view.backend === 'hc' ? 'card.outage.cause_hc' : 'card.outage.cause', { server: view.serverLabel, cliName: view.cliName }, locale)),
     larkMdDiv(stateBody(view, locale)),
   ];
   const turn = turnLine(view, locale);
@@ -87,7 +87,8 @@ export function formatBackendOutageSummary(summary: OutageSummary, botName: stri
   const stopped = summary.members.length - affected.length;
   const lines = [
     t('owner.outage.summary_title', { bot: botName }, locale),
-    t('owner.outage.summary_body', { server: summary.serverLabel, start: clock(summary.startedAt), total: affected.length }, locale),
+    t(summary.backend === 'hc' ? 'owner.outage.summary_body_hc' : 'owner.outage.summary_body',
+      { server: summary.serverLabel, start: clock(summary.startedAt), total: affected.length }, locale),
     t('owner.outage.summary_result', {
       recovered: recovered.length,
       failed: failed.length,

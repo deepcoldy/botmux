@@ -73,7 +73,7 @@ function harness(opts: {
   server?: { serverUp: boolean };
   /** Called as a restart starts (e.g. its new-session brings the server up). */
   onRestart?: (id: string) => void;
-  serverUpFn?: () => Promise<boolean>;
+  serverUpFn?: (socketName: string | undefined, backend: 'tmux' | 'hc') => Promise<boolean>;
   externalRecoveryInFlight?: (id: string) => boolean;
 } = {}) {
   const clock = opts.clock ?? new ManualClock();
@@ -99,9 +99,9 @@ function harness(opts: {
       opts.onRestart?.(ref.id);
       return true;
     },
-    serverUp: async () => {
+    serverUp: async (socketName, backend) => {
       probes.push(clock.now);
-      return opts.serverUpFn ? opts.serverUpFn() : state.serverUp;
+      return opts.serverUpFn ? opts.serverUpFn(socketName, backend) : state.serverUp;
     },
     eligible: ref => ref.eligibility,
     externalRecoveryInFlight: ref => opts.externalRecoveryInFlight?.(ref.id) ?? true,
@@ -807,5 +807,75 @@ describe('BackendOutageCoordinator', () => {
     expect(recoveryEligibility({ ...awake, dormant: true, transferring: true })).toBe('dormant');
     // Closed / replaced wins over sleeping.
     expect(recoveryEligibility({ ...awake, dormant: true, active: false })).toBe('never');
+  });
+});
+
+describe('hc core outages', () => {
+  const HC_SOCKET = '/run/user/0/herdr-core/botmux.sock';
+  const hcLoss = { backend: 'hc' as const, socketName: HC_SOCKET, kind: 'gone' as const };
+
+  it('folds every session that lost one hc core into ONE outage, apart from a tmux outage at the same time', async () => {
+    const up = { hc: false, tmux: false };
+    const asked: Array<[string | undefined, string]> = [];
+    const h = harness({ serverUpFn: async (socketName, backend) => { asked.push([socketName, backend]); return up[backend]; } });
+    for (const id of ['h1', 'h2', 'h3']) h.lose(id, hcLoss);
+    for (const id of ['t1', 't2']) h.lose(id, { socketName: 'botmux', kind: 'gone' });
+    await h.clock.advance(3_000);
+
+    // One canary per lost server, never one per session, and each server is
+    // asked about on its own family's probe.
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['h1', 't1']);
+    expect(new Set(asked.map(a => JSON.stringify(a)))).toEqual(new Set([
+      JSON.stringify([HC_SOCKET, 'hc']), JSON.stringify(['botmux', 'tmux']),
+    ]));
+
+    // The hc canary brought its core back while the tmux server stays down:
+    // only the hc sessions follow.
+    up.hc = true;
+    h.settleRestart('h1', 'succeeded');
+    await h.clock.advance(0);
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['h1', 't1', 'h2', 'h3']);
+    for (const id of ['h2', 'h3']) h.settleRestart(id, 'succeeded');
+    await h.clock.advance(0);
+    expect(['h1', 'h2', 'h3'].map(id => h.view(id).state)).toEqual(['recovered', 'recovered', 'recovered']);
+    expect(['t1', 't2'].map(id => h.view(id).state)).toEqual(['recovering', 'interrupted']);
+    expect(h.view('h1')).toMatchObject({ backend: 'hc', serverLabel: 'botmux' });
+    expect(h.view('t1')).not.toHaveProperty('backend');
+
+    up.tmux = true;
+    h.settleRestart('t1', 'succeeded');
+    await h.clock.advance(0);
+    h.settleRestart('t2', 'succeeded');
+    await h.clock.advance(0);
+    await h.clock.advance(60_000);
+    // One owner summary per outage.
+    expect(h.summaries).toHaveLength(2);
+    const hcSummary = h.summaries.find(summary => summary.backend === 'hc')!;
+    const tmuxSummary = h.summaries.find(summary => summary.backend === undefined)!;
+    expect(hcSummary.members.map(m => m.sessionId).sort()).toEqual(['h1', 'h2', 'h3']);
+    expect(hcSummary.serverLabel).toBe('botmux');
+    expect(tmuxSummary.members.map(m => m.sessionId).sort()).toEqual(['t1', 't2']);
+    expect([...h.cardsPerSession().values()]).toEqual([1, 1, 1, 1, 1]);
+  });
+
+  it('never puts an hc core and a tmux server into one outage, whatever their socket strings', async () => {
+    const h = harness({ serverUp: false });
+    h.lose('a', { backend: 'hc', socketName: 'botmux', kind: 'gone' });
+    h.lose('b', { socketName: 'botmux', kind: 'gone' });
+    await h.clock.advance(3_000);
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['a', 'b']);
+  });
+
+  it('a late `gone` from a member of an hc outage already back is checked against the core, not counted as down', async () => {
+    const asked: string[] = [];
+    const h = harness({ serverUpFn: async (_socket, backend) => { asked.push(backend); return true; } });
+    h.lose('h1', { ...hcLoss, kind: 'replaced' });
+    await h.clock.advance(3_000);
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['h1']);
+    asked.length = 0;
+    h.lose('h2', hcLoss);
+    await h.clock.advance(0);
+    expect(asked).toEqual(['hc']);
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['h1', 'h2']);
   });
 });

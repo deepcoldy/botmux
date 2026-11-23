@@ -40,12 +40,21 @@ describe('backend-type store', () => {
     return { registry, store };
   }
 
-  it('isEditableBackendType accepts all five backends and rejects junk', async () => {
+  it('isEditableBackendType accepts every editable backend and rejects junk', async () => {
     const { store } = await freshModules();
-    for (const v of ['pty', 'tmux', 'herdr', 'zellij', 'zmx']) expect(store.isEditableBackendType(v)).toBe(true);
-    for (const v of ['auto', '', 'foo', null, 3, undefined]) expect(store.isEditableBackendType(v)).toBe(false);
+    for (const v of ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'hc']) expect(store.isEditableBackendType(v)).toBe(true);
+    for (const v of ['auto', '', 'foo', 'HC', null, 3, undefined]) expect(store.isEditableBackendType(v)).toBe(false);
     expect(store.EDITABLE_BACKEND_TYPES).toContain('herdr');
     expect(store.EDITABLE_BACKEND_TYPES).toContain('zmx');
+    expect(store.EDITABLE_BACKEND_TYPES).toContain('hc');
+  });
+
+  it('sets and persists an hc override for one bot', async () => {
+    const { registry, store } = await loaded();
+    const r = await store.updateBotBackendType('app_default', 'hc');
+    expect(r).toMatchObject({ ok: true, backendType: 'hc' });
+    expect(readConfig().backendType).toBe('hc');
+    expect(registry.getBot('app_default').config.backendType).toBe('hc');
   });
 
   it('sets a per-bot backend override, round-tripping to disk and registry', async () => {

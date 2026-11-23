@@ -62,7 +62,7 @@ export function isScratchSandbox(opts?: {
  * (backendScreenEvidenceIsAuthoritativeForMutation) — the final would then be
  * held until the next user turn at best. cursor is unaffected (it emits the
  * final immediately rather than through that gate). */
-const ZERO_PROMPT_LOCAL_BACKENDS = ['pty', 'tmux', 'herdr', 'zellij', 'zmx'] as const;
+const ZERO_PROMPT_LOCAL_BACKENDS = ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'hc'] as const;
 
 export type ZeroPromptUnsupportedReason =
   | 'cli_unsupported'

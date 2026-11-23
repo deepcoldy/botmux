@@ -81,6 +81,15 @@ describe('SessionEnvEditor (bot scope)', () => {
     act(() => owner.unmount());
   });
 
+  it('warns about the login-shell wrapper for shell-wrapped backends (hc included) but not pty', async () => {
+    for (const [backendType, shown] of [['tmux', true], ['hc', true], ['pty', false]] as const) {
+      stubFetch({ ...botView(false), backendType });
+      const v = await render(React.createElement(SessionEnvEditor, { scope: { kind: 'bot', larkAppId: 'app_a' } }));
+      expect(text(v).includes(zh('sessionEnv.shellNote')), backendType).toBe(shown);
+      act(() => v.unmount());
+    }
+  });
+
   it('notifies the Bot payload owner after a successful env save', async () => {
     stubFetch(botView(true));
     const onEnvSaved = vi.fn();

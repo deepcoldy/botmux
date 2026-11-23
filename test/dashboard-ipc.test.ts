@@ -6572,6 +6572,62 @@ describe('PUT /api/bot-read-isolation', () => {
     }
   });
 
+  it('probes a closed hc row on the core its terminal was frozen onto', async () => {
+    const appId = 'test-read-isolation-hc-core';
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex-app',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      readIsolation: true,
+    } as any);
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    setLarkAppId(appId);
+    const frozen = {
+      backendType: 'hc' as const,
+      sessionName: 'bmx-s-hc-fro',
+      hcSession: 'botmux',
+      socket: '/tmp/frozen-hc-core/herdr-core/botmux.sock',
+    };
+    const listSpy = vi.spyOn(sessionStore, 'listSessions').mockReturnValue([{
+      sessionId: 's-hc-frozen',
+      chatId: 'oc_hc',
+      rootMessageId: 'om_hc',
+      title: 'closed on a frozen hc core',
+      status: 'closed',
+      createdAt: new Date().toISOString(),
+      larkAppId: appId,
+      backendType: 'hc',
+      persistentBackendTarget: frozen,
+    } as any]);
+    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentBackendTarget')
+      .mockImplementation(target => (target.backendType === 'hc' && target.socket === frozen.socket ? 'unknown' : 'missing'));
+    const nameProbeSpy = vi.spyOn(persistentBackend, 'probePersistentSession').mockReturnValue('missing');
+    const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation')
+      .mockResolvedValue({ ok: true, readIsolation: false });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'read_isolation_teardown_unverified' });
+      expect(updateSpy).not.toHaveBeenCalled();
+      expect(probeSpy).toHaveBeenCalledWith(frozen);
+      expect(nameProbeSpy).not.toHaveBeenCalled();
+    } finally {
+      updateSpy.mockRestore();
+      nameProbeSpy.mockRestore();
+      probeSpy.mockRestore();
+      listSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+    }
+  });
+
   it('does not synchronously fan out legacy closed rows across every persistent backend', async () => {
     const appId = 'test-read-isolation-legacy-backing';
     registerBot({

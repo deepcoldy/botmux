@@ -346,8 +346,11 @@ describe('supportsNativeAutoCompact', () => {
     expect(supportsNativeAutoCompact('cursor')).toBe(false);
   });
 
-  it('limits Codex unattended compaction to terminal-input tmux sessions', () => {
+  it('limits Codex unattended compaction to terminal-input tmux and hc sessions', () => {
     expect(supportsNativeAutoCompactRuntime('codex', 'tmux', false)).toBe(true);
+    expect(supportsNativeAutoCompactRuntime('codex', 'hc', false)).toBe(true);
+    expect(supportsNativeAutoCompactRuntime('codex', 'hc', true)).toBe(false);
+    expect(supportsNativeAutoCompactRuntime('codex', 'zmx', false)).toBe(false);
     expect(supportsNativeAutoCompactRuntime('codex', 'pty', false)).toBe(false);
     expect(supportsNativeAutoCompactRuntime('codex', 'zellij', false)).toBe(false);
     expect(supportsNativeAutoCompactRuntime('codex', 'herdr', false)).toBe(false);
