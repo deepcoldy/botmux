@@ -64,15 +64,22 @@ export class PaintTracker {
     // Settle a report prefix held across reads before touching the live hold.
     if (this.reportHeld.length > 0) {
       const held = this.reportHeld;
-      this.reportHeld = Buffer.alloc(0);
       const joined = Buffer.concat([held, input]);
       if (joined.indexOf(REPORT_OPEN) === 0) {
+        this.reportHeld = Buffer.alloc(0);
         this.state = 'reports';
         return this.dispatch(joined);
+      }
+      // Still a longer prefix of the opener: it is split across three or more
+      // reads. Keep holding until the opener completes or is disproven.
+      if (joined.length < REPORT_OPEN.length && isPrefix(joined, REPORT_OPEN)) {
+        this.reportHeld = Buffer.from(joined);
+        return [];
       }
       // The held prefix was live (e.g. an ESC opening a different sequence),
       // not a report. The paint before it was already complete, so close it with
       // an empty done marker before handing the held bytes back as live.
+      this.reportHeld = Buffer.alloc(0);
       this.state = 'live';
       const out: StreamSegment[] = [this.segment(Buffer.alloc(0), true, true)];
       out.push(this.segment(held, false));
