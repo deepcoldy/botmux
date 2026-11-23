@@ -230,7 +230,9 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
     expectVictimPreserved(runManifestGuard(victim, 'do-not-delete.txt'));
   }, 90_000);
 
-  it('settles a server that starts only after the test process exits', () => {
+  // 1s is the common case; 5s outlasts the fixed 2s waits the runner used to
+  // give an announced start (both of its sweeps), as a loaded CI host did.
+  for (const delaySeconds of [1, 5]) it(`settles a server that starts only after the test process exits (client delayed ${delaySeconds}s)`, () => {
     const root = mkdtempSync('/tmp/bmx-bun-runner-startup-reaper-');
     roots.push(root);
     mkdirSync(join(root, 'test'));
@@ -242,7 +244,7 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
     const fenceHelper = pathToFileURL(resolve('test/helpers/tmux-fence.ts')).href;
     const delayedBin = join(root, 'bin');
     mkdirSync(delayedBin);
-    writeFileSync(join(delayedBin, 'tmux'), `#!/bin/sh\nsleep 1\nexec ${JSON.stringify(realTmux!)} "$@"\n`, { mode: 0o755 });
+    writeFileSync(join(delayedBin, 'tmux'), `#!/bin/sh\nsleep ${delaySeconds}\nexec ${JSON.stringify(realTmux!)} "$@"\n`, { mode: 0o755 });
     writeFileSync(join(root, 'test', 'startup.test.ts'), `
       import { expect, it } from 'bun:test';
       import { spawn } from 'node:child_process';
