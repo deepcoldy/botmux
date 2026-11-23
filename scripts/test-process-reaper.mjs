@@ -241,10 +241,12 @@ function reapingCandidates(registered, intents) {
   const discovered = discoverTmuxServers(new Set(intents.keys()));
   const refs = new Map();
   for (const ref of [...registered, ...discovered.refs]) refs.set(`${ref.pid}\t${ref.identity}\t${ref.socket}`, ref);
-  const pending = [...intents.keys()].filter(socket => ![...refs.values()].some(ref => ref.socket === socket));
+  // Registered rows are append-only history: a dead server's row must not hide
+  // a later start on the same socket. Only a current discovery settles an intent.
+  const pending = [...intents.keys()].filter(socket => !discovered.refs.some(ref => ref.socket === socket));
   const unresolved = discovered.ok ? [] : pending
     .map(socket => ({ pid: 0, identity: 'inspection_unknown', socket }));
-  return { refs: [...refs.values()], pending, unresolved };
+  return { refs: [...refs.values()], discoveredRefs: discovered.refs, pending, unresolved };
 }
 
 function reapServer(ref) {
@@ -341,10 +343,13 @@ export function reapRegisteredTestProcesses(root) {
   const settled = new Set();
   let candidates;
   let tmuxFailed;
-  for (;;) {
+  const sweep = () => {
     candidates = reapingCandidates(registered, intents);
-    for (const ref of candidates.refs) settled.add(ref.socket);
+    for (const ref of candidates.discoveredRefs) settled.add(ref.socket);
     tmuxFailed = [...candidates.unresolved, ...candidates.refs.filter(ref => !reapServer(ref))];
+  };
+  for (;;) {
+    sweep();
     const now = Date.now();
     const starting = candidates.pending.filter((socket) => {
       if (settled.has(socket)) return false;
@@ -353,7 +358,13 @@ export function reapRegisteredTestProcesses(root) {
         ? [...clients].some(clientAlive)
         : now - start < LEGACY_INTENT_GRACE_MS;
     });
-    if (starting.length === 0) break;
+    if (starting.length === 0) {
+      // The last client can exit after the discovery above but before the
+      // liveness check, with its server becoming visible in that gap. A single
+      // sweep caller has no later pass to catch it, so close that window now.
+      if (candidates.pending.some(socket => !settled.has(socket))) sweep();
+      break;
+    }
     if (now - start >= INTENT_STARTUP_CAP_MS) {
       // Never report success over a server that may still appear.
       tmuxFailed.push(...starting.map(socket => ({ pid: 0, identity: 'startup_unsettled', socket })));
