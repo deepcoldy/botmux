@@ -163,7 +163,11 @@ describe('user authorization device flow', () => {
       if (missing) tokenBody.scope = auth.scopes.filter(scope => scope !== missing).join(' ');
       advance(5);
       if (missing) {
-        expect(await auth.poll()).toEqual({ status: 'failed', error: 'authorization_scope_missing' });
+        // 判定不变（照样拒绝、不落盘），但要点名缺的是哪一项；版本状态查不到时只列缺失项。
+        expect(await auth.poll()).toMatchObject({
+          status: 'failed', error: 'authorization_scope_missing', missingScopes: [missing],
+          appVersionReview: { state: 'unknown' },
+        });
         expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(existing);
       } else {
         expect(await auth.poll()).toEqual({ status: 'ready', token: TOKEN });
@@ -324,10 +328,98 @@ describe('user authorization device flow', () => {
     if (failure === 'identity') userBody = { code: 999, data: {} };
     advance(5);
     const expected = failure === 'identity' ? 'authorization_identity_unverified' : `authorization_${failure}_mismatch`;
-    expect(await auth.poll()).toEqual({
-      status: 'failed', error: failure === 'scope' ? 'authorization_scope_missing' : expected,
-    });
+    expect(await auth.poll()).toEqual(failure === 'scope'
+      ? {
+        status: 'failed', error: 'authorization_scope_missing', missingScopes: ['im:chat:read'],
+        appVersionReview: { state: 'unknown', reason: 'unexpected endpoint' },
+      }
+      : { status: 'failed', error: expected });
     expect(readdirSync(tokenDir)).toEqual([]);
+  });
+
+  describe('scopes held back by an app version under enterprise review', () => {
+    const REVIEW_SCOPES = ['docs:document.comment:delete', 'im:feed.flag:read'];
+    let versionsBody: unknown;
+    let tenantBody: unknown;
+
+    beforeEach(() => {
+      tenantBody = { code: 0, tenant_access_token: 'tenant-token' };
+      versionsBody = {
+        code: 0,
+        data: { items: [{ app_id: APP, version: '1.0.11', version_id: 'oav_pending', status: 3 }] },
+      };
+      const base = fetchMock.getMockImplementation() as (url: string, init: RequestInit) => Promise<Response>;
+      fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+        if (url.endsWith('/tenant_access_token/internal')) return json(tenantBody);
+        if (url.includes(`/application/v6/applications/${APP}/app_versions`)) return json(versionsBody);
+        return base(url, init);
+      });
+    });
+
+    it('names the missing scopes and the version under review, still refusing and saving nothing', async () => {
+      const auth = await requestUserAuthorization(APP, 'secret', 'feishu', ['docx:document:create', ...REVIEW_SCOPES], USER, () => current);
+      // 飞书照常发回 token，只是审核中版本里新增的那些权限不在里面。
+      tokenBody.scope = auth.scopes.filter(scope => !REVIEW_SCOPES.includes(scope)).join(' ');
+      advance(5);
+      expect(await auth.poll()).toEqual({
+        status: 'failed',
+        error: 'authorization_scope_missing',
+        missingScopes: REVIEW_SCOPES,
+        appVersionReview: { state: 'in_review', version: '1.0.11', versionId: 'oav_pending' },
+      });
+      expect(readdirSync(tokenDir)).toEqual([]);
+      // 版本状态用应用自己的 tenant token 查，不拿刚发回、尚未核实身份的 user token 去查。
+      const versionsCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/app_versions'))!;
+      expect(versionsCall[1].headers.Authorization).toBe('Bearer tenant-token');
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/user_info'))).toBe(false);
+      // 终态被缓存：再 poll 不会重复查版本。
+      expect(await auth.poll()).toMatchObject({ error: 'authorization_scope_missing', missingScopes: REVIEW_SCOPES });
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/app_versions'))).toHaveLength(1);
+    });
+
+    it.each([
+      ['the app lacks permission to read its versions', () => { versionsBody = { code: 99991672, msg: 'scope not applied' }; }],
+      ['the tenant token is refused', () => { tenantBody = { code: 10014, msg: 'app secret invalid' }; }],
+    ])('only lists the missing scopes when %s', async (_label, breakLookup) => {
+      breakLookup();
+      const auth = await requestUserAuthorization(APP, 'secret', 'feishu', REVIEW_SCOPES, USER, () => current);
+      tokenBody.scope = auth.scopes.filter(scope => !REVIEW_SCOPES.includes(scope)).join(' ');
+      advance(5);
+      expect(await auth.poll()).toMatchObject({
+        status: 'failed', error: 'authorization_scope_missing', missingScopes: REVIEW_SCOPES,
+        appVersionReview: { state: 'unknown' },
+      });
+      expect(readdirSync(tokenDir)).toEqual([]);
+    });
+
+    it('keeps the version lookup inside the poll deadline so `auth wait` never times out on it', async () => {
+      device.expires_in = 30;
+      const auth = await requestUserAuthorization(APP, 'secret', 'feishu', REVIEW_SCOPES, USER, () => current);
+      tokenBody.scope = auth.scopes.filter(scope => !REVIEW_SCOPES.includes(scope)).join(' ');
+      const base = fetchMock.getMockImplementation() as (url: string, init: RequestInit) => Promise<Response>;
+      fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+        if (!url.includes('/app_versions')) return base(url, init);
+        // 版本接口挂住：只有被中止才返回。
+        return new Promise<Response>((_resolve, reject) => {
+          init.signal!.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+        });
+      });
+      // 离授权码过期只剩 1 秒：这次 poll 的总预算就是 1 秒，版本查询不能再自带 5 秒。
+      advance(29);
+      const started = performance.now();
+      expect(await auth.poll()).toMatchObject({
+        status: 'failed', error: 'authorization_scope_missing', missingScopes: REVIEW_SCOPES,
+        appVersionReview: { state: 'unknown' },
+      });
+      expect(performance.now() - started).toBeLessThan(3_000);
+    });
+
+    it('does not look up versions when the grant is complete', async () => {
+      const auth = await requestUserAuthorization(APP, 'secret', 'feishu', REVIEW_SCOPES, USER, () => current);
+      advance(5);
+      expect(await auth.poll()).toEqual({ status: 'ready', token: TOKEN });
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/app_versions'))).toBe(false);
+    });
   });
 
   it('rechecks the current turn after user identity lookup', async () => {

@@ -988,6 +988,9 @@ async function finishOpenPlatformSetup(
     if (result.versionWarning) {
       say(`   ⚠️ 版本未确认提交发布：${result.versionWarning}`);
       say('      权限要等版本发布后才生效；请到开放平台「版本管理与发布」确认该版本状态。');
+    } else if (result.versionPendingReview) {
+      say(`   ⏳ 版本 ${result.pendingReviewAppVersion ?? result.versionId} 已提交，正在等待企业管理员审核。`);
+      say('      审核通过前新权限不生效（这不是 botmux 卡住）；审批进度可在飞书「审批」里查看，不用重复提交。');
     } else if (result.versionId) say(`   已提交发布版本: ${result.versionId}`);
     else if (result.publishSkipped) say('   本次未另行创建发布版本。');
     else say('   已创建版本；未从响应中解析到 versionId，请到开放平台确认是否需要手动发布。');

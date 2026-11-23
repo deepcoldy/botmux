@@ -74,6 +74,8 @@ export interface BotOnboardingPermission {
   skippedScopeCount?: number;
   /** 已提交发布的版本号 */
   versionId?: string;
+  /** 提交后回读仍是草稿或状态未知；有值时不能显示「已可使用 / 已提交发布」。 */
+  versionWarning?: string;
   /** 部分权限注册失败的告警 */
   scopeWarning?: string;
   eventWarning?: string;
@@ -89,6 +91,15 @@ export interface BotOnboardingPermission {
   redirectConfigured?: boolean;
   /** redirect 白名单未配置成功的原因。 */
   redirectWarning?: string;
+  /**
+   * 版本已提交，但停在「审核中」等企业管理员审批（自动化提交后回读得到的事实）。审核通过前
+   * 新权限不生效——前端要明确说「在等审核」，否则用户会以为 botmux 卡住了。
+   */
+  versionPendingReview?: boolean;
+  /** 停在审核中的版本号（形如 1.0.1）。 */
+  pendingReviewAppVersion?: string;
+  /** 审批预判里的真人审批人（拿得到时）。 */
+  approvalHumanApprovers?: string[];
   /** 失败原因 / 信息 (失败时给出手动步骤) */
   reason?: string;
   message?: string;
@@ -2289,6 +2300,7 @@ export class BotOnboardingManager {
           scopeCount: auto.scopeCount,
           skippedScopeCount: auto.skippedScopeCount,
           versionId: auto.versionId,
+          versionWarning: auto.versionWarning,
           scopeWarning: auto.scopeWarning,
           eventWarning: auto.eventWarning,
           eventMode: auto.eventMode,
@@ -2296,6 +2308,13 @@ export class BotOnboardingManager {
           // 白名单状态与 ok 分开透传：ok:true 也可能没写成 redirect（见类型注释）。
           redirectConfigured: auto.redirectConfigured,
           redirectWarning: auto.redirectWarning,
+          ...(auto.versionPendingReview
+            ? {
+                versionPendingReview: true,
+                pendingReviewAppVersion: auto.pendingReviewAppVersion,
+                approvalHumanApprovers: auto.approvalHumanApprovers,
+              }
+            : {}),
         }
       : {
           ok: false,
@@ -2307,6 +2326,18 @@ export class BotOnboardingManager {
           redirectConfigured: auto.redirectConfigured,
           redirectWarning: auto.redirectWarning,
         };
+    // 「卡在企业审核」要落日志：Dashboard 弹窗一关就看不到了，排查时日志是唯一记录。
+    if (auto.ok && auto.versionPendingReview) {
+      logger.info(
+        `[bot-onboarding] ${appId}: 版本 ${auto.pendingReviewAppVersion ?? auto.versionId ?? 'n/a'} 已提交，`
+        + '等待企业管理员审核（审核通过前新权限不生效，进度可在飞书「审批」里查看）',
+      );
+    } else if (!auto.ok && auto.reason === 'app_under_review') {
+      logger.info(
+        `[bot-onboarding] ${appId}: 应用有版本正在等待企业管理员审核，开放平台审核期间锁定配置，`
+        + '自动配置暂停（审核通过后再补齐剩余配置）',
+      );
+    }
     this.patch(id, {
       status,
       ...(addedBotIndex !== undefined ? { addedBotIndex } : {}),
