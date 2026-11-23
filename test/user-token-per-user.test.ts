@@ -447,11 +447,43 @@ describe('handleCallbackUrl — attribution must be proven, never assumed', () =
     );
     expect(new URL(authUrl).searchParams.get('scope')?.split(' ')).toEqual([
       'im:message:readonly',
-      'im:resource',
       'offline_access',
       'contact:user.base:readonly',
       'docs:document.comment:read',
     ]);
+  });
+
+  it('records an explicit /login --scope im:resource and keeps requesting it afterwards', async () => {
+    const mod = await fresh();
+    const { authUrl } = mod.generateAuthUrl(APP, 'sec', 'feishu', ['im:resource'], ALICE);
+    const requested = new URL(authUrl).searchParams.get('scope')!;
+    const state = new URL(authUrl).searchParams.get('state')!;
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => String(url).includes('/oauth/token')
+      ? { ok: true, json: async () => ({ access_token: 'AT', refresh_token: 'RT', token_type: 'Bearer', expires_in: 7200, refresh_token_expires_in: 604800, scope: requested }) }
+      : { ok: true, status: 200, json: async () => ({ code: 0, data: { open_id: ALICE } }) }));
+    expect(await mod.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=abc&state=${state}`)).toContain('✅');
+    expect(JSON.parse(files.get(perUserPath(APP, ALICE))!).onDemandScopes).toEqual(['im:resource']);
+    const next = mod.generateAuthUrl(APP, 'sec', 'feishu', [], ALICE);
+    expect(new URL(next.authUrl).searchParams.get('scope')!.split(' ')).toContain('im:resource');
+  });
+
+  it('does not record im:resource when Feishu did not actually grant it', async () => {
+    const mod = await fresh();
+    const { authUrl } = mod.generateAuthUrl(APP, 'sec', 'feishu', ['im:resource'], ALICE);
+    const granted = new URL(authUrl).searchParams.get('scope')!.split(' ').filter(s => s !== 'im:resource').join(' ');
+    const state = new URL(authUrl).searchParams.get('state')!;
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => String(url).includes('/oauth/token')
+      ? { ok: true, json: async () => ({ access_token: 'AT', refresh_token: 'RT', token_type: 'Bearer', expires_in: 7200, refresh_token_expires_in: 604800, scope: granted }) }
+      : { ok: true, status: 200, json: async () => ({ code: 0, data: { open_id: ALICE } }) }));
+    await mod.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=abc&state=${state}`);
+    expect(JSON.parse(files.get(perUserPath(APP, ALICE))!)).not.toHaveProperty('onDemandScopes');
+  });
+
+  it('does not keep requesting an im:resource that only came with the old default login', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({ appId: APP, brand: 'feishu', openId: ALICE, scope: 'im:message:readonly im:resource offline_access' }));
+    const mod = await fresh();
+    const next = mod.generateAuthUrl(APP, 'sec', 'feishu', [], ALICE);
+    expect(new URL(next.authUrl).searchParams.get('scope')!.split(' ')).not.toContain('im:resource');
   });
 
   // The forwarded-link case: Bob clicked Alice's link. Bob's token is Bob's.

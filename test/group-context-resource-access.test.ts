@@ -2,13 +2,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-const mocks = vi.hoisted(() => ({ request: vi.fn(), userToken: vi.fn() }));
+const mocks = vi.hoisted(() => ({ request: vi.fn(), userToken: vi.fn(), storedScopes: vi.fn() }));
 vi.mock('../src/bot-registry.js', () => ({
   getBotClient: () => ({ request: mocks.request }), getAllBots: () => [],
   getBot: () => ({ config: { larkAppId: 'cli_app', larkAppSecret: 'test-only', apiOnly: false } }),
   formatLarkError: String,
 }));
-vi.mock('../src/utils/user-token.js', () => ({ resolveUserToken: mocks.userToken }));
+vi.mock('../src/utils/user-token.js', () => ({
+  resolveUserToken: mocks.userToken, storedUserTokenScopes: mocks.storedScopes, RESOURCE_DOWNLOAD_OAUTH_SCOPES: ['im:resource'],
+}));
 import { downloadMessageResource } from '../src/im/lark/client.js';
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); vi.clearAllMocks(); vi.unstubAllGlobals(); });

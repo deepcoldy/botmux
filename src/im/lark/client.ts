@@ -12,7 +12,7 @@ import { config } from '../../config.js';
 import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
-import { resolveUserToken } from '../../utils/user-token.js';
+import { resolveUserToken, storedUserTokenScopes, RESOURCE_DOWNLOAD_OAUTH_SCOPES } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { getGroupContextSettings } from '../../services/group-context-settings-store.js';
@@ -218,8 +218,8 @@ export function assertLarkTransport(larkAppId: string, op: string): void {
  * "missing User Token, please /login" even though a valid token was used.
  */
 export class UserTokenMissingError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = 'UserTokenMissingError';
   }
 }
@@ -2034,14 +2034,34 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   const userToken = await resolveUserToken(
     bot.config.larkAppId, bot.config.larkAppSecret, brand, senderOpenId,
   );
+  const resourceLogin = `/login --scope ${RESOURCE_DOWNLOAD_OAUTH_SCOPES.join(' ')}`;
   if (!userToken) {
     throw new UserTokenMissingError(
       `App Token 无法下载此资源，且未找到可用的 User Token。` +
-      `请在话题中发送 /login 完成授权后重试。`
+      `请在话题中发送 ${resourceLogin} 完成授权后重试。`
     );
   }
+  // 与本次用的 token 同一时刻读：下载期间若另一处换发了 token，不能拿新 token 的 scope 下结论。
+  const granted = storedUserTokenScopes(bot.config.larkAppId, brand, senderOpenId);
 
-  await downloadWithUserToken(userToken, resourceMessageId, fileKey, apiType, savePath, brand, guard);
+  try {
+    await downloadWithUserToken(userToken, resourceMessageId, fileKey, apiType, savePath, brand, guard);
+  } catch (err) {
+    // 下载资源要用户身份的 im:resource，它已改为按需授权（不进 /login 默认集，见
+    // lark-scope-catalog.ts 的 ON_DEMAND_USER_SCOPES）。token 明确没有它、且是权限类拒绝
+    // （HTTP 400/403）时，这次失败就是「缺这项授权」，要提示单独授权；网络错误等照原样抛出，
+    // 不能把人推进一个可能要企业管理员审批的授权流程。
+    const status = (err as { status?: unknown })?.status;
+    if ((status === 400 || status === 403) && granted
+      && !RESOURCE_DOWNLOAD_OAUTH_SCOPES.every(scope => granted.includes(scope))) {
+      throw new UserTokenMissingError(
+        `App Token 无法下载此资源，你的 User Token 也还没有授权下载图片/文件（${RESOURCE_DOWNLOAD_OAUTH_SCOPES.join(' ')}）。` +
+        `请在话题中发送 ${resourceLogin} 完成授权后重试。`,
+        { cause: err },
+      );
+    }
+    throw err;
+  }
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
@@ -2108,7 +2128,7 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
         if (!partial.ok || !partial.body) {
           await partial.body?.cancel();
           if (partial.status === 401) {
-            throw new UserTokenMissingError('User Token 已失效（HTTP 401）。请在话题中发送 /login 重新授权后重试。');
+            throw new UserTokenMissingError(`User Token 已失效（HTTP 401）。请在话题中发送 /login --scope ${RESOURCE_DOWNLOAD_OAUTH_SCOPES.join(' ')} 重新授权后重试。`);
           }
           throw Object.assign(new Error(`Resource Range download failed: HTTP ${partial.status}`), { status: partial.status });
         }
@@ -2124,9 +2144,9 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
     // fine but THIS resource can't be fetched (cross-tenant, card image,
     // withdrawn) — surface as a plain failure so it does NOT trigger /login.
     if (res.status === 401) {
-      throw new UserTokenMissingError(`User Token 已失效（HTTP 401）。请在话题中发送 /login 重新授权后重试。`);
+      throw new UserTokenMissingError(`User Token 已失效（HTTP 401）。请在话题中发送 /login --scope ${RESOURCE_DOWNLOAD_OAUTH_SCOPES.join(' ')} 重新授权后重试。`);
     }
-    throw new Error(`Resource download failed: HTTP ${res.status} ${body}`);
+    throw Object.assign(new Error(`Resource download failed: HTTP ${res.status} ${body}`), { status: res.status });
   }
   const buf = Buffer.from(await res.arrayBuffer());
   await writeViaRename(savePath, async (fd) => { await fdWriteAll(fd, buf); }, guard);

@@ -29,6 +29,7 @@ import { logger } from './logger.js';
 import { withFileLockSync } from './file-lock.js';
 import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
 import { readGlobalConfig } from '../global-config.js';
+import { ON_DEMAND_USER_SCOPES, RESOURCE_DOWNLOAD_OAUTH_SCOPES } from './lark-scope-catalog.js';
 
 // ─── Token paths ──────────────────────────────────────────────────────────────
 
@@ -129,6 +130,12 @@ export interface TokenStore {
   openId?: string;
   /** 授权人姓名，仅用于 /status、/login status 等展示，非身份依据。 */
   userName?: string;
+  /**
+   * 本人**显式申请并拿到**的按需权限（ON_DEMAND_USER_SCOPES，如下载附件的 im:resource）。
+   * 只有记在这里的按需权限才随后续授权延续、并受「不降权」保护；旧 token 里随默认集带来、
+   * 没记在这里的，后续授权不再连带申请（否则会被飞书塞进待审版本卡住审核）。
+   */
+  onDemandScopes?: string[];
 }
 
 interface TokenResponse {
@@ -165,6 +172,8 @@ interface PendingLogin {
    * since (epoch ≥ 1) is refused and must /login again.
    */
   authEpoch?: number;
+  /** 这条链接显式申请的按需权限；回调拿到后记进 token 的 onDemandScopes。 */
+  onDemandScopes?: string[];
   createdAt: number;
 }
 
@@ -303,13 +312,22 @@ function replaceTokenForApp(
     const replacementScopes = new Set(splitScopes(token.scope));
     const droppedScopes = splitScopes(current?.token.scope)
       .filter(scope => !replacementScopes.has(scope));
-    if (policy === 'authorization' && droppedScopes.length > 0) {
-      return {
-        saved: false,
-        token: current!.token,
-        droppedScopes,
-        superseded: false,
-      };
+    if (policy === 'authorization') {
+      // 旧 token 里随默认集带来的按需权限，后续授权不再连带申请，新 token 不带它不算降权；
+      // 本人显式授权过的（记在 onDemandScopes）照样受保护——包括授权期间才拿到的那份。
+      const marked = current?.token.onDemandScopes ?? [];
+      const blocking = droppedScopes.filter(scope => !ON_DEMAND_USER_SCOPES.includes(scope) || marked.includes(scope));
+      if (blocking.length > 0) {
+        return {
+          saved: false,
+          token: current!.token,
+          droppedScopes: blocking,
+          superseded: false,
+        };
+      }
+      if (droppedScopes.length > 0) {
+        logger.info(`[user-token] ${appId}: 授权未再申请默认集带来的按需权限，新 token 不含 ${droppedScopes.join(' ')}`);
+      }
     }
     saveTokenForAppUnlocked(token, appId, openId);
     return { saved: true, token, droppedScopes, superseded: false };
@@ -517,6 +535,7 @@ async function refreshToken(
       // 没有，绝不在这里凭空归属给某个人。
       ...(token.openId ? { openId: token.openId } : {}),
       ...(token.userName ? { userName: token.userName } : {}),
+      ...onDemandMarker(token.onDemandScopes, data.scope || token.scope),
     };
 
     // 写回原来那个文件：per-person token 刷新后仍是 per-person，不能落到
@@ -629,21 +648,29 @@ export async function resolveUserToken(
 
 const DEFAULT_PORT = 9768;
 /**
- * 普通登录只申请消息读取、资源访问和授权续期。
+ * 普通登录只申请消息读取和授权续期。
  * 飞书会校验授权链接里的每个 scope；默认捆绑文档权限会让仅开通消息能力的
  * 应用在授权页直接失败（20027），连基础登录也无法完成。其它能力通过
  * `/login --scope ...` 或专项入口按需追加。对已经授权过的同一用户，再次按需
- * 授权时必须同时带上旧 token 的 scope，否则飞书返回的新 token 会覆盖旧 token，
- * 把本次未显式请求的既有能力静默降权。
+ * 授权时必须同时带上旧 token 的 scope（按需权限只带本人显式授权过的，见 ON_DEMAND_USER_SCOPES），
+ * 否则飞书返回的新 token 会覆盖旧 token，把本次未显式请求的既有能力静默降权。
  */
 const DEFAULT_SCOPES = [
   'im:message:readonly',
-  'im:resource',
   'offline_access',
 ].join(' ');
 
+export { ON_DEMAND_USER_SCOPES, RESOURCE_DOWNLOAD_OAUTH_SCOPES };
+
 function splitScopes(scope: string | undefined): string[] {
   return (scope ?? '').split(/\s+/).filter(Boolean);
+}
+
+/** 本次显式申请（或延续）的按需权限里，飞书真正授予了的那些；没有就不写这个字段。 */
+function onDemandMarker(requested: readonly string[] | undefined, grantedScope: string | undefined): { onDemandScopes?: string[] } {
+  const granted = new Set(splitScopes(grantedScope));
+  const kept = ON_DEMAND_USER_SCOPES.filter(scope => requested?.includes(scope) && granted.has(scope));
+  return kept.length ? { onDemandScopes: kept } : {};
 }
 
 /**
@@ -664,8 +691,19 @@ function authorizationScopes(
   return [...new Set([
     ...DEFAULT_SCOPES.split(' '),
     ...extraScopes,
-    ...splitScopes(existing?.token.scope),
+    // 按需权限只延续本人显式授权过的（onDemandScopes），默认集带来的不再连带申请。
+    ...splitScopes(existing?.token.scope).filter(scope => !ON_DEMAND_USER_SCOPES.includes(scope)
+      || (existing?.token.onDemandScopes ?? []).includes(scope)),
   ])];
+}
+
+/**
+ * 这个人在本应用下存的 User Token 声明了哪些 scope。没有 token、或 token 没记 scope 时
+ * 返回 undefined（无从判断，调用方别据此下结论）。
+ */
+export function storedUserTokenScopes(appId: string, brand: Brand, openId?: string): string[] | undefined {
+  const scopes = splitScopes(loadTokenForApp(appId, brand, openId)?.token.scope);
+  return scopes.length ? scopes : undefined;
 }
 
 type UserAuthorizationPollResult =
@@ -773,6 +811,7 @@ export async function requestUserAuthorization(
         brand,
         openId,
         ...(authorized.userName ? { userName: authorized.userName } : {}),
+        ...onDemandMarker(scopes, data.scope),
       }, appId, brand, openId, undefined, 'authorization', authEpoch);
       if (!replacement.saved) {
         return {
@@ -807,7 +846,7 @@ export async function requestUserAuthorization(
 
 /**
  * 飞书文档订阅入口（/subscribe-lark-doc）专用的额外 OAuth scope。**不进**全局
- * DEFAULT_SCOPES —— 否则所有 bot 的通用 /login（图片下载用）都会请求这些 scope，
+ * DEFAULT_SCOPES —— 否则所有 bot 的通用 /login 都会请求这些 scope，
  * 没在开发者后台启用它们的 app 会一起 20043 失败。改由 /subscribe-lark-doc 在
  * 需要时通过 generateAuthUrl 的 extraScopes 单独带上。
  *
@@ -890,6 +929,9 @@ export function generateAuthUrl(
     appSecret,
     brand,
     ...(isUsableOpenId(openId) ? { openId, authEpoch: readUserTokenEpoch(appId, openId) } : {}),
+    ...(scopes.some(scope => ON_DEMAND_USER_SCOPES.includes(scope))
+      ? { onDemandScopes: ON_DEMAND_USER_SCOPES.filter(scope => scopes.includes(scope)) }
+      : {}),
     createdAt: Date.now(),
   });
   savePendingLogin(pendingLogins.get(state)!);
@@ -1102,6 +1144,7 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
       brand: pending.brand,
       openId: ownerOpenId,
       ...(authorized.userName ? { userName: authorized.userName } : {}),
+      ...onDemandMarker(pending.onDemandScopes, data.scope),
     };
 
     // Normally generateAuthUrl already merged the requester's stored scopes.
