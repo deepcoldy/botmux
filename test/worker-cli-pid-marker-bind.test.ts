@@ -79,7 +79,7 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
         return true;
       },
     };
-    for (const name of ['withPidMarkerLock', 'writeCliPidMarker', 'restoreQueuedTurnsFromMarkerDisk', 'adoptInitialActiveTurn', 'activeAuthorityMatchesMarker', 'markerIdentityTurnId',
+    for (const name of ['withPidMarkerLock', 'writeCliPidMarker', 'restoreQueuedTurnsFromMarkerDisk', 'syncQueuedTurnsFromMarkerDisk', 'adoptInitialActiveTurn', 'activeAuthorityMatchesMarker', 'markerIdentityTurnId',
       'turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive', 'seedInitTurnTerminals']) {
       scope[name] = loadWorkerFunction(name, scope);
     }
@@ -164,6 +164,29 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
     expect(restored.snapshot()).toMatchObject({ turnId: 'trg_external', started: true });
     expect(restored.identity().provenanceIncomplete).toBe(true);
   });
+
+  for (const action of ['bind', 'write', 'sync'] as const) {
+    it(`ignores an empty marker turnId during ${action} without displacing the live turn`, () => {
+      const authority = scope.activeTurnAuthority as ActiveTurnAuthority;
+      authority.reserve({ turnId: 'om_live' });
+      authority.markStarted({ turnId: 'om_live' });
+      scope.currentBotmuxTurnId = 'om_live';
+      scope.queuedTypeAheadTurns = [{ turnId: 'om_next' }];
+      scope.adoptDisplacedActiveTurn = loadWorkerFunction('adoptDisplacedActiveTurn', scope);
+      writeFileSync(markerPath, JSON.stringify({
+        sessionId: 's-bind', turnId: '', procStart: readProcessStartIdentity(process.pid),
+      }));
+
+      if (action === 'bind') bind();
+      else if (action === 'write') (scope.writeCliPidMarker as () => void)();
+      else expect((scope.syncQueuedTurnsFromMarkerDisk as () => boolean)()).toBe(false);
+
+      expect(scope.currentBotmuxTurnId).toBe('om_live');
+      expect(authority.identity().turnId).toBe('om_live');
+      expect(scope.queuedTypeAheadTurns).toEqual([{ turnId: 'om_next' }]);
+      expect((scope.retiredTurnIds as Set<string>).has('om_live')).toBe(false);
+    });
+  }
 
   it('discards a marker stamped with another process birth time and adopts nothing', () => {
     writeFileSync(markerPath, JSON.stringify({
