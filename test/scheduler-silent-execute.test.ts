@@ -2026,7 +2026,9 @@ describe('independent PR2 round2 schedule admission', () => {
 });
 
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { precheckTraexRuntime as realRuntimePrecheck } from '../src/services/traex-runtime-gate.js';
+import { precheckTraexRuntime as realRuntimePrecheck, computeTraexInstallSignature } from '../src/services/traex-runtime-gate.js';
+import { resolveTraexRuntimeDomain } from '../src/services/traex-runtime-domain.js';
+import { acquireTraexRuntimeStart } from '../src/services/traex-runtime-registry.js';
 describe('independent PR2 round2 unknown schedule gate', () => {
   it('keeps a run waiting when the actual registry cannot be read', async () => {
     const isolated = mkdtempSync(join(tmpdir(), 'pr2-schedule-unknown-'));
@@ -2155,6 +2157,102 @@ describe('independent PR2 r7 actual session runtime classification', () => {
       );
       expect(outcome).toBe('dispatched');
       expect(forkWorkerMock).toHaveBeenCalledOnce();
+    } finally {
+      Object.assign(BOT.config, prior);
+      rmSync(isolated, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('retained TRAE scheduling uses the actual session launch', () => {
+  function retainedSession(executablePath: string, live: boolean): DaemonSession {
+    const session: Session = {
+      sessionId: live ? 'sess-traex-live' : 'sess-traex-cold',
+      chatId: CHAT, rootMessageId: ROOT, title: 'x',
+      status: 'active', createdAt: '2026-01-01T00:00:00.000Z',
+      cliId: 'traex', cliPathOverride: executablePath,
+      cliLaunchSnapshot: {
+        version: 1, state: 'resolved', entryId: 'traex', cliId: 'traex', cliRuntime: null,
+        cliPathOverride: executablePath, wrapperCli: null, cliLaunchMode: null,
+        model: null, reasoningEffort: null, launchShell: null, startupCommands: [],
+      },
+    };
+    store.set(session.sessionId, session);
+    return {
+      session, worker: live ? { killed: false } as any : null, workerPort: null, workerToken: null,
+      larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'thread',
+      spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
+      hasHistory: true, workingDir: '/tmp',
+    };
+  }
+
+  it('cold-resume prechecks the session-frozen release A when the Bot now points at B', async () => {
+    const isolated = mkdtempSync(join(tmpdir(), 'pr2-session-release-'));
+    const home = join(isolated, 'home');
+    const releaseA = join(isolated, 'release-a');
+    const releaseB = join(isolated, 'release-b');
+    mkdirSync(releaseA, { recursive: true });
+    mkdirSync(releaseB, { recursive: true });
+    writeFileSync(join(releaseA, 'traex'), 'release-a');
+    writeFileSync(join(releaseB, 'traex'), 'release-b');
+    const prior = { cliId: BOT.config.cliId, cliPathOverride: BOT.config.cliPathOverride, env: (BOT.config as any).env };
+    try {
+      BOT.config.cliId = 'traex';
+      (BOT.config as any).cliPathOverride = join(releaseB, 'traex');
+      (BOT.config as any).env = { TRAE_HOME: home };
+      const domain = resolveTraexRuntimeDomain(home);
+      expect(domain.kind).toBe('ready');
+      if (domain.kind !== 'ready') return;
+      const signatureA = computeTraexInstallSignature(releaseA);
+      const started = await acquireTraexRuntimeStart(domain.domain, {
+        occupantId: 'runtime-a', comboKey: 'content-a',
+        ...(signatureA ? { installSignature: signatureA } : {}),
+        cliPid: process.pid, workerPid: process.pid, daemonPid: process.pid,
+      });
+      expect(started.decision).toBe('start');
+      expect(realRuntimePrecheck({ traeHome: home, releaseDir: releaseA }).state).toBe('compatible');
+      expect(realRuntimePrecheck({ traeHome: home, releaseDir: releaseB }).state).toBe('blocked');
+
+      const existing = retainedSession(join(releaseA, 'traex'), false);
+      const active = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), existing]]);
+      const outcome = await executeScheduledTask(
+        baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+        active, refreshCliVersion,
+      );
+      expect(outcome).toBe('dispatched');
+      expect(forkWorkerMock).toHaveBeenCalledOnce();
+    } finally {
+      Object.assign(BOT.config, prior);
+      rmSync(isolated, { recursive: true, force: true });
+    }
+  });
+
+  it('injects into a live worker without a new-exec precheck', async () => {
+    const isolated = mkdtempSync(join(tmpdir(), 'pr2-live-no-precheck-'));
+    const home = join(isolated, 'home');
+    const releaseA = join(isolated, 'release-a');
+    const releaseB = join(isolated, 'release-b');
+    mkdirSync(join(home, 'skills'), { recursive: true });
+    mkdirSync(releaseA, { recursive: true });
+    mkdirSync(releaseB, { recursive: true });
+    writeFileSync(join(home, 'skills', '.botmux-traex-runtime.json'), '{broken');
+    writeFileSync(join(releaseA, 'traex'), 'release-a');
+    writeFileSync(join(releaseB, 'traex'), 'release-b');
+    const prior = { cliId: BOT.config.cliId, cliPathOverride: BOT.config.cliPathOverride, env: (BOT.config as any).env };
+    try {
+      BOT.config.cliId = 'traex';
+      (BOT.config as any).cliPathOverride = join(releaseB, 'traex');
+      (BOT.config as any).env = { TRAE_HOME: home };
+      expect(realRuntimePrecheck({ traeHome: home, releaseDir: releaseA }).state).toBe('unknown');
+      const existing = retainedSession(join(releaseA, 'traex'), true);
+      const active = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), existing]]);
+      const outcome = await executeScheduledTask(
+        baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+        active, refreshCliVersion,
+      );
+      expect(outcome).toBe('dispatched');
+      expect(sendWorkerInputMock).toHaveBeenCalledOnce();
+      expect(forkWorkerMock).not.toHaveBeenCalled();
     } finally {
       Object.assign(BOT.config, prior);
       rmSync(isolated, { recursive: true, force: true });

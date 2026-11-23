@@ -467,10 +467,11 @@ function markRuntimeRun(
   error?: string,
   deliveryError?: string,
   runId?: string,
+  options: { settleParked?: boolean } = {},
 ): { crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
   const before = runtimeTask(id);
   if (!authorityStore) {
-    const result = scheduleStore.markRun(id, success, error, deliveryError, runId) ?? {};
+    const result = scheduleStore.markRun(id, success, error, deliveryError, runId, options) ?? {};
     notifyAfterSettle(before, id);
     return result;
   }
@@ -479,7 +480,7 @@ function markRuntimeRun(
   mutateRuntimeTask(id, task => {
     if (runId !== undefined && task.lastRunId !== runId) return;
     const deferred = task.deferredRun;
-    if (!success && runId !== undefined && deferred?.runId === runId && deferredRunHasUnsettledTargets(deferred)) {
+    if (!success && !options.settleParked && runId !== undefined && deferred?.runId === runId && deferredRunHasUnsettledTargets(deferred)) {
       // The run is still owed targets (waiting / dispatching / ambiguous). A
       // failed retry attempt must not settle it: keep the parked identity and
       // retry clock, record no run outcome and consume no repeat/once. An
@@ -799,15 +800,15 @@ export function settleParkedRunOnce(
   const before = runtimeTask(id, appId);
   const deferred = before?.deferredRun;
   if (!before || !deferred || deferred.runId !== runId) return false;
-  let cleared = false;
-  mutateRuntimeTask(id, task => {
-    if (task.deferredRun?.runId !== runId) return;
-    cleared = true;
-    return { ...task, deferredRun: undefined };
-  }, appId);
-  if (!cleared) return false;
-  const result = markRuntimeRun(id, false, reason, undefined, runId);
+  // Clear the parked identity and record the terminal outcome in ONE task
+  // write. A crash between two separate writes would otherwise leave
+  // `lastStatus=deferred` without a deferredRun, which no restart exit owns.
+  const result = markRuntimeRun(id, false, reason, undefined, runId, { settleParked: true });
   const settled = runtimeTask(id, appId);
+  // A concurrent newer run (or a failed conditional mutation) owns no external
+  // settlement effects here. The exact-run check above and markRuntimeRun's
+  // guard make this a no-op rather than emitting a false failure for it.
+  if (settled && (settled.lastRunId !== runId || settled.deferredRun?.runId === runId)) return false;
   if (!settled) return true;
   if (result.crossedFailureThreshold) {
     emitFailureAlertIfNeeded(settled, result);

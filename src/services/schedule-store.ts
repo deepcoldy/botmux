@@ -1180,12 +1180,16 @@ export function markSkipped(id: string, nextRunAt?: string, runId?: string): voi
  * Record a run outcome and auto-manage repeat counter.  If the task has a
  * finite repeat count and we've hit it, the task is removed.
  */
+/** `settleParked` is reserved for the scheduler's exact-run terminal exits
+ * (timeout / ambiguous / worker exit). It lets that one write clear the parked
+ * state and record the outcome together, rather than a failed retry re-parking. */
 export function markRun(
   id: string,
   success: boolean,
   error?: string,
   deliveryError?: string,
   runId?: string,
+  options: { settleParked?: boolean } = {},
 ): { removedAfterTimes?: number; crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
   let crossedFailureThreshold = false;
   let consecutiveFailures = 0;
@@ -1195,7 +1199,7 @@ export function markRun(
     if (runId !== undefined && task.lastRunId !== runId) {
       return { result: undefined, changed: false };
     }
-    if (!success && deferredRunStillOwesTargets(task, runId)) {
+    if (!success && !options.settleParked && deferredRunStillOwesTargets(task, runId)) {
       // A failed retry attempt must not settle a run that still owes targets
       // (waiting / dispatching / ambiguous): keep the parked identity, record
       // no outcome and consume no repeat/once.

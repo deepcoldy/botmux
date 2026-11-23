@@ -360,7 +360,9 @@ describe('traex runtime registry', () => {
     const expiredDomain = domainFor(traeHome());
     const deadPid = 2_000_000_000;
     const expiredRelease = tempDir('botmux-traex-opaque-');
-    // wrapperCli / forge-traex: a NEW exec with no snapshot and no content key.
+    // Low-level unknown new exec: no snapshot and no content key. Production
+    // wrapper/forge launches no longer register such records, but the bounded
+    // registry cleanup remains defensive for any record written this way.
     await acquireTraexRuntimeStart(expiredDomain, {
       occupantId: 'opaque-orphan', comboKey: '', traexPath: expiredRelease,
       workerPid: deadPid, daemonPid: deadPid, now: Date.now() - 31 * 60_000,

@@ -43,6 +43,7 @@ beforeEach(() => {
 
 afterEach(() => {
   scheduler.stopScheduler();
+  scheduler.setScheduleFailureAlert(null);
   vi.useRealTimers();
   vi.restoreAllMocks();
   scheduler.setScheduleAuthorityStore(null);
@@ -438,6 +439,50 @@ describe('deferred scheduled run lifecycle', () => {
       .filter(entry => entry.outcome === 'error');
     expect(errors).toHaveLength(1);
     expect(errors[0].errorCode).toBe('deferred_unsettled');
+
+    // Even a stale record carrying both markers must privilege the exact
+    // acceptance fact. The terminal exit is only for a still-held turn.
+    const acceptedAndHeld = {
+      ...parked,
+      targets: { ...parked.targets, oc_a: 'dispatched' as const },
+      acceptedTargets: { oc_a: turnA },
+      heldTargets: { oc_a: turnA },
+    };
+    const settleAccepted = vi.fn(() => true);
+    expect(settleHeldScheduleRunsOnWorkerExit(
+      { scheduledRuns: { oc_a: runs.oc_a } },
+      APP,
+      { getDeferredRun: () => acceptedAndHeld, settle: settleAccepted },
+    )).toBe(0);
+    expect(settleAccepted).not.toHaveBeenCalled();
+  });
+
+  it('clears and settles a parked run in one authority write', async () => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    const runId = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!.runId;
+    scheduler.setScheduleFailureAlert(null);
+    const writes = vi.spyOn(store, 'updateTask');
+
+    expect(scheduler.settleParkedRunOnce(task.id, runId, 'atomic settlement test', APP)).toBe(true);
+    expect(writes).toHaveBeenCalledTimes(1);
+
+    // Reopen the real authority DB: both halves of the outcome must already be
+    // durable together, with no deferred/deferred-half-state left for startup.
+    scheduler.setScheduleAuthorityStore(null);
+    store.close();
+    store = ScheduleAuthorityStore.open(dataDir);
+    store.initializeApp(APP, []);
+    scheduler.setScheduleAuthorityStore(store);
+    scheduler.setOwnerFilter(APP, true);
+    const reloaded = scheduler.getRuntimeTask(task.id, APP)!;
+    expect(reloaded.deferredRun).toBeUndefined();
+    expect(reloaded.lastStatus).toBe('error');
+    expect(reloaded.lastError).toBe('atomic settlement test');
+    expect(reloaded.repeat?.completed).toBe(1);
   });
 
   it('does not let a stale run outcome clear a newer parked run', async () => {

@@ -5628,6 +5628,9 @@ function scheduledTraexRuntimeBlocker(
     ?? selected?.session.cliId
     ?? bot.config.cliId;
   if (targetCliId !== 'traex') return undefined;
+  // Injecting into a live worker does not start another runtime. If that worker
+  // later has to re-exec, its own final gate remains authoritative.
+  if (selected?.worker && !selected.worker.killed) return undefined;
   const launchSnapshot = selected?.session.cliLaunchSnapshot;
   const wrapperCli = launchSnapshot
     ? launchSnapshot.wrapperCli
@@ -5639,7 +5642,10 @@ function scheduledTraexRuntimeBlocker(
   // the scheduler must not invent a blocker the actual dispatch will ignore.
   if (!traexLaunchUsesSharedRuntimeGate({ wrapperCli, cliLaunchMode })) return undefined;
   try {
-    const executablePath = resolveCommandReal(bot.config.cliPathOverride?.trim() || 'traex');
+    const configuredPath = launchSnapshot
+      ? launchSnapshot.cliPathOverride
+      : selected?.session.cliPathOverride ?? bot.config.cliPathOverride;
+    const executablePath = resolveCommandReal(configuredPath?.trim() || 'traex');
     // Pre-check the SAME cache domain the CLI child will write. Using the
     // daemon's ambient TRAE_HOME here would read a different domain whenever
     // the bot has its own env.TRAE_HOME / envUnset, and could report

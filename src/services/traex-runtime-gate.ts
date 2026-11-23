@@ -456,10 +456,9 @@ export interface TraexRuntimeOccupancyInput {
    * registered beside an occupant because it is already alive; it is recorded
    * as unknown so it blocks every later start.
    *
-   * `false`/undefined authorizes a NEW exec whose content cannot be proven
-   * (wrapper/forge launchers). It is NOT exempt from the compatibility gate: an
-   * unknown new start must wait for every incompatible occupant to be proven
-   * gone, exactly like a proven-content start.
+   * `false`/undefined is the low-level fail-closed reservation for a NEW exec
+   * whose content cannot be proven. The worker's wrapper/forge launch modes do
+   * not call this API: they are excluded by traexLaunchUsesSharedRuntimeGate.
    */
   existingRuntime?: boolean;
   /** `false` for a session-private cache (scratch COW): freeze nothing and take
@@ -497,11 +496,9 @@ function privateOccupancyLease(releaseDir: string): TraexRuntimeLease {
  * parallel start, and a newer content waits for them to be proven gone. They
  * are never killed or retargeted.
  *
- * Wrapper/forge launchers are a NEW exec whose content cannot be hashed. They
- * MUST NOT use the existing-runtime bypass: they pass through the same
- * compatibility gate as a proven-content start, waiting for incompatible
- * occupants. Otherwise a fresh opaque launcher could start beside a live old
- * runtime and recreate the mixed-version cache this gate exists to prevent.
+ * The worker's wrapper/forge modes are excluded before reaching this function;
+ * see traexLaunchUsesSharedRuntimeGate. This API's unknown-new-exec branch stays
+ * fail-closed for any other low-level caller.
  */
 export async function acquireTraexRuntimeOccupancy(
   input: TraexRuntimeOccupancyInput,

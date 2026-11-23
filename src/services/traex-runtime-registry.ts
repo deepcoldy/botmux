@@ -108,8 +108,8 @@ export interface TraexStartRequest {
   fixedPath?: boolean;
   /** Register occupancy without demanding compatibility. Used ONLY for runtimes
    *  that are already alive and were not started by this worker
-   *  (adopt/reattach/existing endpoint). New execs — including wrapper/forge —
-   *  must NOT set this. */
+   *  (adopt/reattach/existing endpoint). New execs must NOT set this; the
+   *  worker's wrapper/forge modes do not register an occupant at all. */
   force?: boolean;
   /** Marks the record as an already-alive runtime (see TraexRuntimeOccupant). */
   occupancyOnly?: boolean;
@@ -300,8 +300,8 @@ function reconcileStartingOrphans(occupants: TraexRuntimeOccupant[], now: number
     }
     // A release-dir proof (no private snapshot) is shared by unrelated TRAE
     // processes, so it only ever proves "do not clean" and gets the longer
-    // grace. This covers occupancy-only AND opaque new execs (wrapper/forge),
-    // which also have no snapshotDir but must not become permanent orphans.
+    // grace. This covers occupancy-only AND any low-level unknown-new-exec
+    // record, which also has no snapshotDir and must not become permanent.
     const scanPath = occupant.snapshotDir ?? occupant.traexPath;
     const grace = occupant.snapshotDir
       ? TRAEX_STARTING_ORPHAN_GRACE_MS
