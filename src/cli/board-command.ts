@@ -14,6 +14,7 @@ import {
   boardExplainerMaxBytes,
   boardExplainerTooLargeText,
 } from '../core/decision-board/files.js';
+import { boardCheckStatus, boardIdleTooLong, boardLastActivity, nestBoardList, readyToWrapUp, type ChildStats } from '../core/decision-board/overview.js';
 
 const MB = 1024 * 1024;
 
@@ -51,6 +52,9 @@ export const BOARD_CLI_USAGE = `botmux board — 决策看板（只在管家 bot
                           | auto（去掉，回到默认）。没写时挂了 PR 的项按「挂的 PR 全部合入」判断
   --depends-on <编号…>    依赖的事项，如 66,70（整组替换；none 清空）。都结束后提示推进
   --next-check <时间>     下次复查：+2h / +3d / +1w，或带时区的 2026-11-10T09:30+08:00；none 清空
+  --parent <编号>         挂到另一项下面当子任务（它是那一项的一部分），可以多层；none 取消。
+                          和 --depends-on 不同：依赖是「等它先做完」，父子是「它是我的一部分」；不能依赖自己的上级
+  --waiting-on <谁>       在等谁：PR 作者 / 评审群 / 外部团队…（等待中的项写上，看板总览里显示；改成别的状态时自动清掉）；none 清空
   --dismiss-hint          仅 set：收起这一项当前的提示（「建议关闭 / 建议推进 / 该看一眼」），同一条不再出现
   --note <一句话>         同时往历史里记一句
   --title <新标题>        仅 set
@@ -66,7 +70,7 @@ export const BOARD_CLI_USAGE = `botmux board — 决策看板（只在管家 bot
 const VALUE_FLAGS = new Set([
   '--view', '--key', '--state', '--stage', '--kind', '--repo', '--summary', '--progress', '--ask',
   '--option', '--recommend', '--reason', '--link', '--unlink', '--note', '--title', '--session-id',
-  '--primary-chat', '--no-chat', '--close-when', '--depends-on', '--next-check',
+  '--primary-chat', '--no-chat', '--close-when', '--depends-on', '--next-check', '--parent', '--waiting-on',
 ]);
 const BOOL_FLAGS = new Set(['--json', '--handled', '--clear-ask', '--allow-unverified-chat', '--dismiss-hint', '--help', '-h']);
 
@@ -202,13 +206,18 @@ export function parseBoardArgs(argv: string[]): { ok: true; help: true } | { ok:
       if (dependsOn !== undefined) request.dependsOn = dependsOn;
       const nextCheck = single('--next-check');
       if (nextCheck !== undefined) request.nextCheck = nextCheck;
+      const parent = single('--parent');
+      if (parent !== undefined) request.parent = parent;
+      const waitingOn = single('--waiting-on');
+      if (waitingOn !== undefined) request.waitingOn = waitingOn;
       if (t.bools.has('--dismiss-hint')) {
         if (action === 'add') return { ok: false, error: 'add 不支持 --dismiss-hint，收起提示用 set <编号> --dismiss-hint' };
         request.dismissHint = true;
       }
       if (action === 'set' && Object.keys(request.fields as object).length === 0 && !request.options && !request.links && !request.unlinks
         && !request.clearAsk && request.primaryChat === undefined && request.noChat === undefined
-        && request.closeWhen === undefined && request.dependsOn === undefined && request.nextCheck === undefined && !request.dismissHint) {
+        && request.closeWhen === undefined && request.dependsOn === undefined && request.nextCheck === undefined && !request.dismissHint
+        && request.parent === undefined && request.waitingOn === undefined) {
         return { ok: false, error: 'set 至少要改一个字段' };
       }
       break;
@@ -300,9 +309,34 @@ export function readBoardExplainerFiles(paths: string[], read: (p: string) => Bu
 
 interface MainChat { text: string; url?: string; chatCheck?: 'verified' | 'unverified' }
 interface ListItem {
-  seq: number; title: string; stateLabel?: string; stage?: string; pendingDecisions?: number; appLink?: string; url?: string;
+  seq: number; title: string; state?: string; stateLabel?: string; stage?: string; pendingDecisions?: number; appLink?: string; url?: string;
   mainChat?: MainChat; chatCount?: number; noChatReason?: string; missingChat?: boolean;
   hint?: { kind?: string; reason?: string };
+  parentSeq?: number; childStats?: ChildStats; lastActivityAt?: number; ownActivityAt?: number; nextCheckAt?: number; waitingOn?: string;
+}
+
+const ENDED_STATES = new Set(['done', 'closed']);
+
+/**
+ * 跟进状况：「子任务 3/5（都已结束，可以收尾）」「在等：PR 作者」「⏰过了复查时间」「⏳4 天没动」。
+ * 旧 daemon 不给这些字段时是空串。
+ */
+function trackTag(i: ListItem, now: number): string {
+  const ended = !!i.state && ENDED_STATES.has(i.state);
+  const parts: string[] = [];
+  if (i.childStats?.total) {
+    const finished = i.childStats.done + i.childStats.closed;
+    const ready = !!i.state && readyToWrapUp({ state: i.state as never, childStats: i.childStats });
+    parts.push(`子任务 ${finished}/${i.childStats.total}${ready ? '（都已结束，可以收尾）' : ''}`);
+  }
+  if (!ended && i.waitingOn) parts.push(`在等：${i.waitingOn}`);
+  // 和看板总览同一口径（overview.ts）：到点且之后没动才算过了复查时间；有子任务的按子树里最晚的进展算几天没动。
+  if (!ended && i.lastActivityAt !== undefined) {
+    const t = { state: (i.state ?? 'active') as never, nextCheckAt: i.nextCheckAt, lastActivityAt: i.lastActivityAt, ownActivityAt: i.ownActivityAt, updatedAt: 0, createdAt: 0 };
+    if (boardCheckStatus(t, now) === 'due') parts.push('⏰过了复查时间');
+    else if (boardIdleTooLong(t, now)) parts.push(`⏳${Math.floor((now - boardLastActivity(t)) / 86_400_000)} 天没动`);
+  }
+  return parts.join('  ');
 }
 
 const HINT_TAGS: Record<string, string> = { close: '建议关闭', advance: '建议推进', stale: '该看一眼' };
@@ -324,7 +358,7 @@ function chatTag(i: ListItem): string {
 }
 
 /** 给人（和模型）读的输出；--json 时调用方直接打印原始 JSON。 */
-export function formatBoardResult(action: BoardAction, body: Record<string, unknown>): string {
+export function formatBoardResult(action: BoardAction, body: Record<string, unknown>, now = Date.now()): string {
   const linkOf = (o: { appLink?: string; url?: string }) => o.appLink ?? o.url ?? '';
   switch (action) {
     case 'guide':
@@ -338,12 +372,16 @@ export function formatBoardResult(action: BoardAction, body: Record<string, unkn
         missing ? `⚠ 本页 ${missing} 项缺群：botmux board set <编号> --link chat=oc_…，确实没有群写 --no-chat "<原因>"` : '',
       ].filter(Boolean).join('\n');
       if (!items.length) return [head, '（没有事项）'].filter(Boolean).join('\n');
-      return [head, ...items.map(i => {
+      // 子任务排在上级后面、缩进一级（上级不在这一页时照常顶格，标出属于谁）。
+      return [head, ...nestBoardList(items).map(({ item: i, depth }) => {
         const pending = i.pendingDecisions ? ` ⏳${i.pendingDecisions} 个决定待执行` : '';
         const chat = chatTag(i);
         const hint = hintTag(i);
+        const track = trackTag(i, now);
         const link = linkOf(i);
-        return `#${i.seq} ${i.stateLabel ?? ''}${i.stage ? `·${i.stage}` : ''} ${i.title}${pending}${hint ? `  ${hint}` : ''}${chat ? `  ${chat}` : ''}${link ? `  ${link}` : ''}`;
+        const indent = depth ? `${'  '.repeat(depth - 1)}└ ` : '';
+        const orphan = !depth && i.parentSeq !== undefined ? `（属于 #${i.parentSeq}）` : '';
+        return `${indent}#${i.seq} ${i.stateLabel ?? ''}${i.stage ? `·${i.stage}` : ''} ${i.title}${orphan}${pending}${track ? `  ${track}` : ''}${hint ? `  ${hint}` : ''}${chat ? `  ${chat}` : ''}${link ? `  ${link}` : ''}`;
       })].filter(Boolean).join('\n');
     }
     case 'add':
