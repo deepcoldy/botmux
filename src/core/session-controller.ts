@@ -209,6 +209,21 @@ export class SessionController {
         && this.store.runtimeContinues(this.ref, execution.runtime, current.ref, owner);
       return { version: 2, runtime: current.ref, ...(ranHere ? { execution: execution!.ref } : {}) };
     }
+    // A pane keeps the binding id its CLI was LAUNCHED under, and the env that
+    // carries it is written once per launch. After a daemon restart a later
+    // worker generation RE-ATTACHES that same CLI without respawning it, so its
+    // hooks still name the launcher binding of the generation that spawned it —
+    // and continuations are recorded per generation, so the branch above (which
+    // walks them as the live worker) finds nothing. Walk them as the generation
+    // that produced the binding instead, and admit only when the live worker
+    // owns the very runtime that chain ends at. Without this a re-attached CLI
+    // lost every SessionStart signal, including `source=compact`, where before
+    // runtime bindings reached the pane it had none to be judged by and the
+    // unbound path adopted it (2026-11-23 review of #3734).
+    if (current && owner && sameWorker(current.worker, owner) && !sameWorker(source.worker, owner)
+      && this.store.runtimeContinues(this.ref, source.ref, current.ref, source.worker)) {
+      return { version: 2, runtime: current.ref };
+    }
     const executor = execution?.runtime ? this.store.runtime(this.ref, execution.runtime.runtimeId) : undefined;
     if (executor?.identity && samePhysicalRuntimeIdentity(source.identity, executor.identity)) return { version: 2, runtime: executor.ref, execution: execution!.ref };
     if (typeof nativeSessionId === 'string' && current?.identity?.nativeSessionId === nativeSessionId

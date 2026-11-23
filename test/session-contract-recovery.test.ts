@@ -399,6 +399,44 @@ describe('hook signals from a CLI launched without a binding ID', () => {
   });
 });
 
+describe('hook signals from a CLI a later worker generation re-attached', () => {
+  // The pane's env carries the binding its CLI was LAUNCHED under and is written
+  // once per launch, so after a daemon restart the hooks of a re-attached CLI
+  // still name the generation that spawned it. Continuations are recorded per
+  // generation, so the live worker's own walk finds nothing: without following
+  // the producer's chain, a re-attached CLI loses every SessionStart signal
+  // (including source=compact) that the unbound path used to adopt.
+  function reattachedByNextGeneration(beforeHandover?: (s: ReturnType<typeof fixture>) => void) {
+    const s = fixture();
+    s.controller.reserveBinding('binding-launcher', s.worker);
+    s.controller.bindRuntime('binding-launcher', s.worker, { ...identity, physicalId: '900:launcher' });
+    const real = s.controller.bindRuntime('binding-real', s.worker,
+      { ...identity, physicalId: '901:cli' }, undefined, 'binding-launcher');
+    beforeHandover?.(s);
+    const next = s.controller.bindWorker(2).worker;
+    s.controller.reserveBinding('binding-reattach', next);
+    const adopted = s.controller.bindRuntime('binding-reattach', next, { ...identity, physicalId: '901:cli' });
+    return { s, next, real, adopted };
+  }
+
+  it('adopts a hook that names the launcher binding of the generation that spawned the CLI', () => {
+    const { s, real, adopted } = reattachedByNextGeneration();
+    expect(adopted.ref).toEqual(real.ref);
+    expect(s.controller.nativeSignal('binding-launcher', 'native-1')).toEqual({ version: 2, runtime: real.ref });
+  });
+
+  it('refuses a binding whose chain does not reach the runtime the live worker owns', () => {
+    // A sibling CLI of the same generation: proven, but nothing continues it
+    // into the runtime generation 2 re-attached.
+    const { s } = reattachedByNextGeneration(fix => {
+      fix.controller.reserveBinding('binding-elsewhere', fix.worker);
+      fix.controller.bindRuntime('binding-elsewhere', fix.worker,
+        { ...identity, physicalId: '902:other', nativeSessionId: 'native-other' });
+    });
+    expect(s.controller.nativeSignal('binding-elsewhere', 'native-other')).toBeUndefined();
+  });
+});
+
 describe('contract history stays bounded', () => {
   it('records one busy edge per turn rather than every working screen sample', () => {
     const s = fixture(); const count = () => rows(s.store, 'SELECT COUNT(*) AS count FROM events');

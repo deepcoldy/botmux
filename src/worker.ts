@@ -23001,7 +23001,20 @@ function settleRestartAttemptOnReady(
       pendingTopicEffortRestart = undefined;
     }
 
-    if (opts.republishPromptReady) send({ type: 'prompt_ready' });
+    // Readiness this same callback published a moment ago was judged under the
+    // binding it captured and refused — a pre-replacement callback may not
+    // declare the successor ready. Only the receipt below was re-scoped, so the
+    // daemon kept `cliReady` false: the card said 已重启 while the next
+    // passthrough cascade sat out its whole 120s idle budget (cli-idle-wait)
+    // against an idle screen, because nothing published readiness again
+    // (2026-11-23 review of #3734). The receipt proves THIS attempt reached a
+    // prompt in the live CLI of the same process, so publish readiness under
+    // that same proven origin. A callback of a REPLACED process gets no live
+    // origin and still cannot announce the new process ready.
+    const liveProcess = isPromptReady ? workerSessionEventScope?.liveProcessOrigin() : undefined;
+    const observer = workerSessionEventScope?.contextBinding();
+    const supersededInProcess = !!liveProcess && !!observer && observer.bindingId !== liveProcess.bindingId;
+    if (opts.republishPromptReady || supersededInProcess) send({ type: 'prompt_ready' }, liveProcess);
     send({
       type: 'restart_result',
       attemptId: activeRestartAttemptId,
