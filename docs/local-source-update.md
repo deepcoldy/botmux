@@ -1,9 +1,16 @@
 # 本地源码更新
 
-在 Dashboard「设置 → 版本与更新」里，源码安装提供两种更新方式：
+在 Dashboard「设置 → 版本与更新」里，源码安装提供以下更新方式：
 
 - **本地更新**：要求工作区干净，执行 `git pull --ff-only` 后构建。不会丢弃本地提交或文件。
 - **强制覆盖本地改动并更新**：先获取当前跟踪分支的版本，展示文件改动（含未跟踪文件）和本地提交。确认后，保存 Git 备份，将源码重置到预览的上游提交，安装锁定依赖并构建，再通过现有重启确认应用。
+- **切换到官方最新版**：当 GitHub 的 Git 连接超时、分支分叉或共享依赖阻止源码更新时，可下载官方发布的程序。源码目录、本地提交、未提交改动和依赖目录均保留；备份原启动入口后安装官方程序，再单独确认重启。重启后运行官方程序，本地定制功能不会生效。此操作也支持安装与当前源码标签相同的正式版本。
+
+官方版安装优先下载当前配置 registry 中对应版本的平台发布包，并校验 SHA-512 和程序版本；该路径失败时再尝试 GitHub Release。下载、校验或主机兼容性验证失败时，当前启动入口保留。下载期间启动入口被其他操作修改时，中止切换。
+
+页面展示原启动入口备份路径，形如 `~/.botmux/source-update-backups/<id>/launcher`。要恢复源码运行，可从保留的源码目录执行 `bun run use:here` 和 `bun run daemon:restart`。安装记录保存在本机私有配置目录中；页面进程重启或安装响应丢失后，会核验实际程序并恢复待重启状态。
+
+![源码安装切换官方最新版入口](assets/source-release-update.png)
 
 强制更新会移除当前源码中的本地定制功能。忽略文件（如依赖、本地配置）保留；如果上游新增文件与忽略文件冲突，则中止。未完成的合并、变基或挑选提交必须先处理。
 
@@ -39,3 +46,4 @@ bun run daemon:restart
 1. `POST /api/update/local-dev/preview` 返回目标提交、文件/提交列表与一次性确认 token。
 2. `POST /api/update/run`，JSON 为 `{ "forceLocal": true, "previewToken": "..." }`，在普通更新共用的安装锁与重启检查内执行备份和覆盖。
 3. 成功后 `restartRequired: true`，继续现有 `/api/update/restart` 流程。重启仍校验构建目录与提交，失败响应可携带 `backupRef`。
+4. 源码安装切换官方版：`POST /api/update/run`，JSON 为 `{ "installRelease": true, "version": "X.Y.Z" }`。版本必须与页面查询的最新正式版一致；不能同时指定强制源码更新参数。仅允许 Dashboard owner，使用与源码更新共用的安装锁和重启租约。成功响应包含 `sourceReleaseInstalled: true`、`backupLauncher` 和 `restartRequired: true`；后续重启验证并使用已安装的程序，不再回到原源码目录。

@@ -246,6 +246,7 @@ import {
   fetchRollbackVersions,
   compareVersions,
   isCanonicalStableVersion,
+  parseUpdateTarget,
   isNewerVersion,
   mirrorFallbackRetryMs,
   type ChangelogResult,
@@ -293,6 +294,7 @@ import { withFileLock, FileLockTimeoutError } from './utils/file-lock.js';
 // see dashboard/managed-spawn.ts.
 import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive, installDshProfileDeps } from './dashboard/managed-spawn.js';
 import { LocalDevForceUpdates } from './utils/local-dev-force-update.js';
+import { SourceReleaseInstall } from './core/source-release-install.js';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -2233,6 +2235,23 @@ let updateInFlight = false;
 // update, and restart requests do not reuse the removed old runtime realpath.
 let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
 let pendingBinaryRestart: { target: string; version: string } | undefined;
+let sourceReleaseBackup: string | null | undefined;
+const sourceReleaseInstall = new SourceReleaseInstall();
+
+function restoreSourceReleaseInstall(): void {
+  if (!isLocalDevInstall()) return;
+  const installed = sourceReleaseInstall.recover(botmuxInstallRoot(), (target, version) => verifyBinaryRestartTarget({ target, version }));
+  if (installed) {
+    pendingBinaryRestart = { target: installed.target, version: installed.version };
+    sourceReleaseBackup = installed.backupLauncher;
+    pendingLocalDevRestart = undefined;
+  } else {
+    // A deliberate source restoration must also retire this process's cached
+    // binary handoff, rather than keep blocking updates/restart on an old plan.
+    pendingBinaryRestart = undefined;
+    sourceReleaseBackup = undefined;
+  }
+}
 // Live progress of a standalone-binary download running in THIS dashboard
 // process (the ~174MB asset makes the run request long-lived). Surfaced via
 // /api/update/status for the UI poller; undefined outside a binary swap.
@@ -2280,7 +2299,7 @@ let rollbackVersionLookupInFlight: { current: string; value: Promise<RollbackVer
 async function cachedLatestVersion(force = false): Promise<LatestVersionCache> {
   const now = Date.now();
   const strategy = currentUpdateStrategy(botmuxInstallRoot());
-  const releaseBacked = strategy.kind === 'self-replace' || strategy.kind === 'install-release';
+  const releaseBacked = isLocalDevInstall() || strategy.kind === 'self-replace' || strategy.kind === 'install-release';
   if (!force
     && latestVersionCache?.releaseBacked === releaseBacked
     && now - latestVersionCache.at < latestVersionCache.ttlMs) {
@@ -2364,6 +2383,7 @@ async function cachedRollbackVersions(current: string, force = false): Promise<R
 }
 
 function currentInstalledVersion(): string {
+  restoreSourceReleaseInstall();
   if (pendingBinaryRestart) return pendingBinaryRestart.version;
   if (!lastSuccessfulUpdatePlan) return resolveCurrentVersion();
   const version = botmuxVersionAt(lastSuccessfulUpdatePlan.activePackageRoot);
@@ -5203,7 +5223,9 @@ const server = createServer(async (req, res) => {
       // and tell an npm user their install method is unsupported. Resolve the
       // strategy by BINARY LOCATION first; only fall back to the package-root
       // classification for the Node path (unchanged there).
-      const updateStrategy = currentUpdateStrategy(classifyRoot);
+      const updateStrategy = pendingBinaryRestart
+        ? { kind: 'self-replace' as const, target: pendingBinaryRestart.target }
+        : currentUpdateStrategy(classifyRoot);
       const installPlan = updateStrategy.kind === 'package-manager'
         ? tryResolveGlobalInstallPlan(updateStrategy.packageRoot)
         : null;
@@ -5240,7 +5262,7 @@ const server = createServer(async (req, res) => {
         ...(entry.installTarget ? { installTarget: entry.installTarget } : {}),
         lastCheckedAt: entry.lastCheckedAt,
       }));
-      const localDev = isLocalDevInstall();
+      const localDev = isLocalDevInstall() && !pendingBinaryRestart;
       const runningDaemons = registry.list().map(d => ({
         larkAppId: d.larkAppId,
         version: d.botmuxVersion,
@@ -5267,6 +5289,9 @@ const server = createServer(async (req, res) => {
         cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
         cliUpdates,
         localDevInstall: localDev,
+        sourceReleaseAvailable: localDev && releaseAssetName() !== null,
+        sourceReleasePending: isLocalDevInstall() && !!pendingBinaryRestart,
+        ...(sourceReleaseBackup ? { sourceReleaseBackup } : {}),
         // Local-dev can self-update via git pull + build only when the checkout
         // the wrapper points at is a real git worktree; otherwise the button
         // stays disabled (there is nothing to pull).
@@ -5332,10 +5357,18 @@ const server = createServer(async (req, res) => {
       // 不含「改代码并重启」——那属于 debug shell 同一档的整机控制权。
       if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       let forceToken: string | undefined;
+      let sourceReleaseVersion: string | undefined;
       if (req.headers['content-type']?.includes('application/json')) {
         try {
-          const body = await readJsonBody(req, 4096) as { forceLocal?: unknown; previewToken?: unknown } | null;
-          if (body?.forceLocal !== undefined) {
+          const body = await readJsonBody(req, 4096) as { forceLocal?: unknown; previewToken?: unknown; installRelease?: unknown; version?: unknown } | null;
+          if (body?.installRelease !== undefined) {
+            if (body.installRelease !== true || !isLocalDevInstall() || releaseAssetName() === null
+              || typeof body.version !== 'string' || !isCanonicalStableVersion(body.version)
+              || Object.keys(body).some(key => key !== 'installRelease' && key !== 'version')) {
+              return jsonRes(res, 400, { ok: false, error: 'invalid_source_release_install' });
+            }
+            sourceReleaseVersion = body.version;
+          } else if (body?.forceLocal !== undefined) {
             if (body.forceLocal !== true || typeof body.previewToken !== 'string' || !body.previewToken || !isLocalDevInstall()) {
               return jsonRes(res, 400, { ok: false, error: 'invalid_force_update' });
             }
@@ -5343,10 +5376,65 @@ const server = createServer(async (req, res) => {
           }
         } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
       }
+      restoreSourceReleaseInstall();
+      if (isLocalDevInstall() && pendingBinaryRestart) return jsonRes(res, 409, { ok: false, error: 'source_release_restart_required' });
+      if (sourceReleaseVersion) {
+        if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        updateInFlight = true;
+        let acquired = false;
+        let blockedByRestart = false;
+        let oldVersion = '';
+        let source: string | undefined;
+        let blockedBySourceRelease = false;
+        let installed: Awaited<ReturnType<SourceReleaseInstall['install']>> | undefined;
+        try {
+          const latest = await cachedLatestVersion(false);
+          if (!latest.value) return jsonRes(res, 503, { ok: false, error: 'version_lookup_failed' });
+          if (latest.value !== sourceReleaseVersion) return jsonRes(res, 409, { ok: false, error: 'source_release_version_changed' });
+          oldVersion = currentInstalledVersion();
+          await withFileLock(globalInstallUpdateLockTarget(), async () => {
+            acquired = true;
+            if (hasActiveRestartLease()) { blockedByRestart = true; return; }
+            restoreSourceReleaseInstall();
+            if (pendingBinaryRestart) { blockedBySourceRelease = true; return; }
+            installed = await sourceReleaseInstall.install(sourceReleaseVersion!, botmuxInstallRoot(), async (target, beforeSwap) => {
+              const result = await applyStandaloneUpdate(sourceReleaseVersion!, {
+                currentVersion: oldVersion, target, updateTarget: parseUpdateTarget(sourceReleaseVersion!)!,
+              }, {
+                onProgress: progress => {
+                  if (progress.phase === 'swap') beforeSwap();
+                  binaryUpdateProgress = { version: sourceReleaseVersion!, ...progress };
+                },
+              });
+              if (result.skipped) throw new Error('source release installation was skipped');
+              source = result.source;
+            });
+            pendingLocalDevRestart = undefined;
+            pendingBinaryRestart = { target: installed.target, version: installed.version };
+          }, { maxWaitMs: 2_000 });
+        } catch (error) {
+          if (!acquired && error instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          const code = (error as { code?: unknown }).code;
+          return jsonRes(res, typeof code === 'string' && code.startsWith('source_release_') ? 409 : 500, {
+            ok: false, error: typeof code === 'string' ? code : 'install_failed',
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          updateInFlight = false;
+          binaryUpdateProgress = undefined;
+        }
+        if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        if (blockedBySourceRelease) return jsonRes(res, 409, { ok: false, error: 'source_release_restart_required' });
+        return jsonRes(res, 200, {
+          ok: true, oldVersion, newVersion: sourceReleaseVersion, source,
+          changed: true, restartRequired: true, manager: 'binary', sourceReleaseInstalled: true,
+          backupLauncher: installed?.backupLauncher,
+        });
+      }
       // 本地 checkout：走 git pull --ff-only + bun run build（与 CLI cmdUpgradeLocalDev
       // 共用 local-dev-update 逻辑），而不是全局包管理器安装。重启仍走下方
       // /api/update/restart 的 lease/intent 路径。
-      if (isLocalDevInstall()) {
+      if (isLocalDevInstall() && !pendingBinaryRestart) {
         const node = checkNode();
         if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
         if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
@@ -5354,10 +5442,13 @@ const server = createServer(async (req, res) => {
         let acquired = false;
         let blockedByRestart = false;
         let result: Awaited<ReturnType<typeof runLocalDevUpdate>> | undefined;
+        let blockedBySourceRelease = false;
         try {
           await withFileLock(globalInstallUpdateLockTarget(), async () => {
             acquired = true;
             if (hasActiveRestartLease()) { blockedByRestart = true; return; }
+            restoreSourceReleaseInstall();
+            if (pendingBinaryRestart) { blockedBySourceRelease = true; return; }
             pendingLocalDevRestart = undefined;
             result = await runLocalDevUpdate(forceToken);
           }, { maxWaitMs: 2_000 });
@@ -5384,6 +5475,7 @@ const server = createServer(async (req, res) => {
           updateInFlight = false;
         }
         if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        if (blockedBySourceRelease) return jsonRes(res, 409, { ok: false, error: 'source_release_restart_required' });
         // Pin THIS build's checkout + HEAD so the follow-up restart applies it,
         // even if the wrapper is re-pointed by a concurrent `use:here` before the
         // user confirms the restart. Consumed (and re-verified) in /api/update/restart.
@@ -5407,7 +5499,9 @@ const server = createServer(async (req, res) => {
       // 编译版独立二进制（install.sh 形态）：没有包管理器拥有这个文件，改为下载
       // 对应平台的 release 资产、校验 SHA-256 后原子替换自身。npm 子包形态不走
       // 这里 —— 那棵树归 npm 所有，交回 npm 更新（见 binary-self-update.ts 头部）。
-      const runStrategy = currentUpdateStrategy(botmuxInstallRoot());
+      const runStrategy = pendingBinaryRestart
+        ? { kind: 'self-replace' as const, target: pendingBinaryRestart.target }
+        : currentUpdateStrategy(botmuxInstallRoot());
       if (runStrategy.kind === 'self-replace' || runStrategy.kind === 'install-release') {
         if (runStrategy.kind === 'install-release' && releaseAssetName() === null) {
           return jsonRes(res, 400, { ok: false, error: 'release_asset_unavailable' });
@@ -5727,6 +5821,7 @@ const server = createServer(async (req, res) => {
       // owner-only：重启会打断 owner 正在跑的所有会话。
       if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      restoreSourceReleaseInstall();
       // (pm2 shutdown-capability preflight removed with the fleet pm2→supervisor
       // migration: the supervisor has no "bootstrap-shutdown-protocol" policy to
       // probe. A restart failure surfaces through the detached child's own error
@@ -5745,7 +5840,7 @@ const server = createServer(async (req, res) => {
       // the build; on drift/absence fail closed rather than restart the wrong tree.
       let localDevRestartError: { status: number; body: Record<string, unknown> } | undefined;
       let localDevTarget: string | undefined;
-      if (isLocalDevInstall()) {
+      if (isLocalDevInstall() && !pendingBinaryRestart) {
         const pinned = pendingLocalDevRestart;
         pendingLocalDevRestart = undefined; // consume regardless of outcome
         const decision = resolveLocalDevRestartTarget(pinned, resolveLocalDevCheckoutDir(), {
