@@ -115,8 +115,11 @@ const LARK_CLI_TIMEOUT_MS = 30_000;
 const AUTO_POLL_COOLDOWN_MS = 60_000;
 
 /** Scopes the CLI needs to do the document/drive/wiki/sheets/IM reads a
- *  triggered task performs. Kept level with the old bot-OAuth DEFAULT_SCOPES so
- *  switching the issuing app does not silently narrow what works. */
+ *  triggered task performs. This is lark-cli's own issuer app, not the bot app:
+ *  the bot-OAuth DEFAULT_SCOPES no longer bundles the user-identity
+ *  `im:resource` (it needs enterprise-admin approval there, see
+ *  lark-scope-catalog.ts ON_DEMAND_USER_SCOPES), but this list keeps it so a
+ *  switch of issuer does not narrow what already works. */
 export const LARK_CLI_DEVICE_SCOPES = [
   'offline_access',
   'docx:document:readonly',

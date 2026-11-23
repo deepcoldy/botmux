@@ -17,6 +17,10 @@ vi.mock('../src/bot-registry.js', () => ({
 vi.mock('../src/utils/user-token.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/utils/user-token.js')>(),
   resolveUserToken: mocks.userToken,
+  resolveUserTokenWithScopes: async (...args: unknown[]) => {
+    const accessToken = await mocks.userToken(...args);
+    return accessToken ? { accessToken } : null;
+  },
 }));
 
 import { downloadMessageResource, UserTokenMissingError } from '../src/im/lark/client.js';

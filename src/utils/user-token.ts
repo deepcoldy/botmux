@@ -29,6 +29,7 @@ import { logger } from './logger.js';
 import { withFileLockSync } from './file-lock.js';
 import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
 import { readGlobalConfig } from '../global-config.js';
+import { ON_DEMAND_USER_SCOPES, RESOURCE_DOWNLOAD_OAUTH_SCOPES } from './lark-scope-catalog.js';
 
 // ─── Token paths ──────────────────────────────────────────────────────────────
 
@@ -129,6 +130,12 @@ export interface TokenStore {
   openId?: string;
   /** 授权人姓名，仅用于 /status、/login status 等展示，非身份依据。 */
   userName?: string;
+  /**
+   * 本人**显式申请并拿到**的按需权限（ON_DEMAND_USER_SCOPES，如下载附件的 im:resource）。
+   * 只有记在这里的按需权限才随后续授权延续、并受「不降权」保护；旧 token 里随默认集带来、
+   * 没记在这里的，后续授权不再连带申请（否则会被飞书塞进待审版本卡住审核）。
+   */
+  onDemandScopes?: string[];
 }
 
 interface TokenResponse {
@@ -165,6 +172,8 @@ interface PendingLogin {
    * since (epoch ≥ 1) is refused and must /login again.
    */
   authEpoch?: number;
+  /** 这条链接显式申请的按需权限；回调拿到后记进 token 的 onDemandScopes。 */
+  onDemandScopes?: string[];
   createdAt: number;
 }
 
@@ -303,16 +312,35 @@ function replaceTokenForApp(
     const replacementScopes = new Set(splitScopes(token.scope));
     const droppedScopes = splitScopes(current?.token.scope)
       .filter(scope => !replacementScopes.has(scope));
-    if (policy === 'authorization' && droppedScopes.length > 0) {
-      return {
-        saved: false,
-        token: current!.token,
-        droppedScopes,
-        superseded: false,
-      };
+    if (policy === 'authorization') {
+      // 旧 token 里随默认集带来的按需权限，后续授权不再连带申请，新 token 不带它不算降权；
+      // 本人显式授权过的（记在 onDemandScopes）照样受保护——包括授权期间才拿到的那份。
+      const marked = current?.token.onDemandScopes ?? [];
+      const blocking = droppedScopes.filter(scope => !ON_DEMAND_USER_SCOPES.includes(scope) || marked.includes(scope));
+      if (blocking.length > 0) {
+        return {
+          saved: false,
+          token: current!.token,
+          droppedScopes: blocking,
+          superseded: false,
+        };
+      }
+      if (droppedScopes.length > 0) {
+        logger.info(`[user-token] ${appId}: 授权未再申请默认集带来的按需权限，新 token 不含 ${droppedScopes.join(' ')}`);
+      }
     }
-    saveTokenForAppUnlocked(token, appId, openId);
-    return { saved: true, token, droppedScopes, superseded: false };
+    // 旧 pending 可能没有 onDemandScopes（升级前发起，或较早的授权流程），但它后完成时
+    // 不能把当前 token 上较新的显式授权标记擦掉。只继承 replacement 实际保留的 scope：
+    // 无标记的旧默认集不会凭空获得标记，刷新降权时也不会把已丢 scope 重新标回。
+    const inheritedOnDemandScopes = (current?.token.onDemandScopes ?? []).filter(scope =>
+      ON_DEMAND_USER_SCOPES.includes(scope)
+      && replacementScopes.has(scope)
+      && !token.onDemandScopes?.includes(scope));
+    const replacementToken = inheritedOnDemandScopes.length > 0
+      ? { ...token, onDemandScopes: [...(token.onDemandScopes ?? []), ...inheritedOnDemandScopes] }
+      : token;
+    saveTokenForAppUnlocked(replacementToken, appId, openId);
+    return { saved: true, token: replacementToken, droppedScopes, superseded: false };
   }, { maxWaitMs: 30_000 });
 }
 
@@ -517,6 +545,7 @@ async function refreshToken(
       // 没有，绝不在这里凭空归属给某个人。
       ...(token.openId ? { openId: token.openId } : {}),
       ...(token.userName ? { userName: token.userName } : {}),
+      ...onDemandMarker(token.onDemandScopes, data.scope || token.scope),
     };
 
     // 写回原来那个文件：per-person token 刷新后仍是 per-person，不能落到
@@ -579,6 +608,30 @@ export async function resolveOwnerUserToken(
 }
 
 /** {@link resolveUserToken} / {@link resolveOwnerUserToken} 共用的过期与刷新处理。 */
+async function resolveTokenStoreFrom(
+  loaded: { token: TokenStore; source: string } | null,
+  appId: string,
+  appSecret: string,
+  brand: Brand,
+  signal?: AbortSignal,
+): Promise<TokenStore | null> {
+  signal?.throwIfAborted();
+  if (!loaded) return null;
+  const { token } = loaded;
+
+  if (isValid(token.expires_at)) return token;
+
+  // access_token expired — try refresh
+  if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
+    const refreshed = await refreshToken(token, appId, appSecret, brand, signal);
+    signal?.throwIfAborted();
+    if (refreshed) return refreshed;
+  }
+
+  logger.debug('[user-token] Token expired and refresh_token also expired');
+  return null;
+}
+
 async function resolveTokenFrom(
   loaded: { token: TokenStore; source: string } | null,
   appId: string,
@@ -586,21 +639,30 @@ async function resolveTokenFrom(
   brand: Brand,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  signal?.throwIfAborted();
-  if (!loaded) return null;
-  const { token } = loaded;
+  return (await resolveTokenStoreFrom(loaded, appId, appSecret, brand, signal))?.access_token ?? null;
+}
 
-  if (isValid(token.expires_at)) return token.access_token;
+export interface UserTokenSnapshot {
+  accessToken: string;
+  /** 与 accessToken 来自同一次 TokenStore 加载/刷新；旧 token 没记 scope 时为 undefined。 */
+  scopes?: string[];
+}
 
-  // access_token expired — try refresh
-  if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
-    const refreshed = await refreshToken(token, appId, appSecret, brand, signal);
-    signal?.throwIfAborted();
-    if (refreshed) return refreshed.access_token;
-  }
-
-  logger.debug('[user-token] Token expired and refresh_token also expired');
-  return null;
+/**
+ * 同时解析 access token 和它的 scope 快照。调用方不能用另一次读盘补 scope：两读之间
+ * 另一进程可能换发 token，导致错误分类用的是另一份凭证的元数据。
+ */
+export async function resolveUserTokenWithScopes(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+  openId?: string,
+  signal?: AbortSignal,
+): Promise<UserTokenSnapshot | null> {
+  const resolved = await resolveTokenStoreFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand, signal);
+  if (!resolved) return null;
+  const scopes = splitScopes(resolved.scope);
+  return { accessToken: resolved.access_token, ...(scopes.length > 0 ? { scopes } : {}) };
 }
 
 /**
@@ -622,28 +684,36 @@ export async function resolveUserToken(
   // 按 (app, 人) 取盘上的 token。不匹配 / 别人的 → null，调用方提示 /login。
   // 这里刻意没有 env 覆盖：一个全局 FEISHU_USER_ACCESS_TOKEN 会绕过整个按人隔离
   // 边界，而且绕过时没有任何痕迹。
-  return resolveTokenFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand, signal);
+  return (await resolveUserTokenWithScopes(appId, appSecret, brand, openId, signal))?.accessToken ?? null;
 }
 
 // ─── Public API: OAuth login flow ─────────────────────────────────────────────
 
 const DEFAULT_PORT = 9768;
 /**
- * 普通登录只申请消息读取、资源访问和授权续期。
+ * 普通登录只申请消息读取和授权续期。
  * 飞书会校验授权链接里的每个 scope；默认捆绑文档权限会让仅开通消息能力的
  * 应用在授权页直接失败（20027），连基础登录也无法完成。其它能力通过
  * `/login --scope ...` 或专项入口按需追加。对已经授权过的同一用户，再次按需
- * 授权时必须同时带上旧 token 的 scope，否则飞书返回的新 token 会覆盖旧 token，
- * 把本次未显式请求的既有能力静默降权。
+ * 授权时必须同时带上旧 token 的 scope（按需权限只带本人显式授权过的，见 ON_DEMAND_USER_SCOPES），
+ * 否则飞书返回的新 token 会覆盖旧 token，把本次未显式请求的既有能力静默降权。
  */
 const DEFAULT_SCOPES = [
   'im:message:readonly',
-  'im:resource',
   'offline_access',
 ].join(' ');
 
+export { ON_DEMAND_USER_SCOPES, RESOURCE_DOWNLOAD_OAUTH_SCOPES };
+
 function splitScopes(scope: string | undefined): string[] {
   return (scope ?? '').split(/\s+/).filter(Boolean);
+}
+
+/** 本次显式申请（或延续）的按需权限里，飞书真正授予了的那些；没有就不写这个字段。 */
+function onDemandMarker(requested: readonly string[] | undefined, grantedScope: string | undefined): { onDemandScopes?: string[] } {
+  const granted = new Set(splitScopes(grantedScope));
+  const kept = ON_DEMAND_USER_SCOPES.filter(scope => requested?.includes(scope) && granted.has(scope));
+  return kept.length ? { onDemandScopes: kept } : {};
 }
 
 /**
@@ -664,7 +734,9 @@ function authorizationScopes(
   return [...new Set([
     ...DEFAULT_SCOPES.split(' '),
     ...extraScopes,
-    ...splitScopes(existing?.token.scope),
+    // 按需权限只延续本人显式授权过的（onDemandScopes），默认集带来的不再连带申请。
+    ...splitScopes(existing?.token.scope).filter(scope => !ON_DEMAND_USER_SCOPES.includes(scope)
+      || (existing?.token.onDemandScopes ?? []).includes(scope)),
   ])];
 }
 
@@ -773,6 +845,7 @@ export async function requestUserAuthorization(
         brand,
         openId,
         ...(authorized.userName ? { userName: authorized.userName } : {}),
+        ...onDemandMarker(scopes, data.scope),
       }, appId, brand, openId, undefined, 'authorization', authEpoch);
       if (!replacement.saved) {
         return {
@@ -807,7 +880,7 @@ export async function requestUserAuthorization(
 
 /**
  * 飞书文档订阅入口（/subscribe-lark-doc）专用的额外 OAuth scope。**不进**全局
- * DEFAULT_SCOPES —— 否则所有 bot 的通用 /login（图片下载用）都会请求这些 scope，
+ * DEFAULT_SCOPES —— 否则所有 bot 的通用 /login 都会请求这些 scope，
  * 没在开发者后台启用它们的 app 会一起 20043 失败。改由 /subscribe-lark-doc 在
  * 需要时通过 generateAuthUrl 的 extraScopes 单独带上。
  *
@@ -890,6 +963,9 @@ export function generateAuthUrl(
     appSecret,
     brand,
     ...(isUsableOpenId(openId) ? { openId, authEpoch: readUserTokenEpoch(appId, openId) } : {}),
+    ...(scopes.some(scope => ON_DEMAND_USER_SCOPES.includes(scope))
+      ? { onDemandScopes: ON_DEMAND_USER_SCOPES.filter(scope => scopes.includes(scope)) }
+      : {}),
     createdAt: Date.now(),
   });
   savePendingLogin(pendingLogins.get(state)!);
@@ -1102,6 +1178,7 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
       brand: pending.brand,
       openId: ownerOpenId,
       ...(authorized.userName ? { userName: authorized.userName } : {}),
+      ...onDemandMarker(pending.onDemandScopes, data.scope),
     };
 
     // Normally generateAuthUrl already merged the requester's stored scopes.
