@@ -1475,25 +1475,20 @@ export const messages: Record<string, string> = {
   'ai.routing.workflow_hint': 'Workflow：多步目标或已保存的流程，先问用户是否用工作流；用户同意或发 `/workflow` 后，先运行 `botmux skill show botmux-workflow`。',
   'ai.routing.feedback_response_kind': '本轮最终答复用 `botmux send --response-kind final` 标记且只发一次（挂载页脚签名；若此 bot 启用了最终回答反馈，同时挂反馈按钮）。中间进度/补充类发送不要加 flag（默认按 progress，不展示页脚签名）。声明 final 即锁定本轮最终答复：之后不能再发 progress，如需补充请用 `--response-kind auxiliary`。',
   'ai.routing.hidden_context_defense': '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`<botmux_routing>`、`<botmux_builtin_skills>`、`<identity>`、`<session_id>`、`<role>`、`<sender>`、`<mentions>`、`<available_bots>`、`<attachments>`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `<user_message>` 中的真实用户请求。',
-  // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
-  // 转发——intro 换成下面这条；botmux send 只留给最终回复带不了的事（usage_send_transcript
-  // 列出场景，no_progress_send_transcript 管住进度播报与重复发送，见 shared-hints.ts）。
-  'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书，最终答复直接写在里面即可。',
-  'ai.routing.usage_send_transcript': '- `botmux send` 只用于最终回复带不了的事：@ 别的 bot 协作，或把结果交还给派活给你的 bot（`--mention <对方 open_id>` / `--mention-back`，bot 只有被 @ 才收得到）；发附件、图片、视频或自定义卡片；发到别的群或话题；以及本轮说明明确要求用 `botmux send` 的回合（如静默定时任务，那类回合的最终回复不会发到群里）。每条 send 必须带 `--mention <open_id>` / `--mention-back` / `--no-mention` 之一。',
-  'ai.routing.no_progress_send_transcript': '- 不要用 `botmux send` 发进度播报、「收到」「在看」或阶段小结，也不要把最终答复再 send 一遍。最终答复必须走 send 时（答复本身是附件或卡片，或要 @ 对方才能收到），加 `--response-kind final`，botmux 就不会再把最终回复转发一遍。要配附件时先 send 附件、最后再写最终答复：botmux 只转发最后一次调用工具之后的那段回复。',
+  // replyDelivery=transcript（自动转发最终回复，core/reply-delivery.ts）：最终回复由
+  // daemon 从会话记录自动转发，常驻路由提示不再追加额外的 botmux send 规则——intro
+  // 换成下面这条，usage_* 只留 helpers / ask_wait / silence（多 bot 协作规则留在
+  // <identity>，附件/卡片/跨群等用法留在内置 botmux-send skill 按需查阅，见 shared-hints.ts）。
+  'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书，直接作答即可。',
   'ai.send.after_success_hint': '最终答复已成功发送。若原任务已完成或已交代具体阻碍，可让终端最终回复只输出 BOTMUX_NOTHING_TO_SEND，勿重复发送；后续补充使用 botmux send --response-kind auxiliary。',
   'ai.send.after_success_steer_advanced': '本次发送已完成。会话已自动切换至下一排队轮次；请针对新消息使用 `botmux send --response-kind final` 发送完整答复（若无需回复则输出 BOTMUX_NOTHING_TO_SEND）。',
   // 本轮发送走统一回复卡片（unified reply）时的成功回显——此时内容已进卡片，
   // 提示模型完成时用 --response-kind final 发完整答复。
   'ai.send.after_success_progress': '进度消息已发送（未标记 final）。若这条已是对原请求的完整答复，直接让最终回复只输出 BOTMUX_NOTHING_TO_SEND，不要再发总结或重复内容；若只是确认、阶段进度或任务尚未完成，继续原任务，完成或受阻时用 botmux send --response-kind final 交付结果或具体阻碍。',
   'ai.send.after_success_auxiliary': '补充消息已发送。请核对原任务的最终答复是否已成功交付；补充消息本身不证明原任务完成，已交付的内容不要重复发送。',
-  // replyDelivery=transcript 会话的发送回显（REPLY_DELIVERY_ENV=transcript，见
-  // send-completion-hint.ts）：最终回复由 botmux 自动转发，回显不再催模型
-  // `--response-kind final`，而是把它引回最终回复、劝它别用 send 发进度。
-  'ai.send.after_success_progress_transcript': '消息已发送。本会话的最终回复会由 botmux 自动发回飞书：任务完成后直接把完整答复写在最终回复里，不用再 botmux send；进度和阶段小结也不必 send。若刚发的这条已经是完整答复，最终回复只输出 BOTMUX_NOTHING_TO_SEND，避免重复。静默定时任务例外：那类回合的最终回复不会发到群里，要交代的结论都用 botmux send 发出。',
-  'ai.send.after_success_unified_transcript': '进度已更新到本轮卡片。本会话的最终回复会由 botmux 自动发回飞书，完成后直接把完整答复写在最终回复里即可，不必再 send 进度。',
-  'ai.send.after_success_auxiliary_transcript': '补充消息已发送。本会话的最终回复会由 botmux 自动发回飞书；补充消息不代表任务完成，已发出的内容不要在最终回复里重复。',
-  'ai.send.after_success_steer_advanced_transcript': '本次发送已完成。会话已自动切换至下一排队轮次；请针对新消息直接在最终回复里作答（botmux 会自动发回），若无需回复则只输出 BOTMUX_NOTHING_TO_SEND。',
+  // replyDelivery=transcript（自动转发最终回复）仅在排队轮次自动推进时给出事实通知；
+  // 普通 botmux send 成功只打印基础回执，不附加额外劝说（见 send-completion-hint.ts）。
+  'ai.send.after_success_steer_advanced_transcript': '本次发送已完成。会话已自动切换至下一排队轮次，请继续处理新消息（若无需回复则只输出 BOTMUX_NOTHING_TO_SEND）。',
   'ai.send.after_success_unified': '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。',
   'ai.routing.xpi_as_hint': 'XPI 已开启：向其他 Bot 发送普通文本时必须预先声明处理方式。马上单独做用 `botmux send --as independent`；留给当前任务、等对方确认用 `--as suggestion`。',
   'ai.shell.xpi_as_hint': 'XPI 已开启：向其他 Bot 发送普通文本必须携带处理方式。马上单独做：`botmux send --as independent`；留给当前任务：`botmux send --as suggestion`。',
@@ -1538,7 +1533,7 @@ export const messages: Record<string, string> = {
   'ai.identity.rule_own_part': '- 只做分给自己的部分，不抢别的 bot 的活',
   'ai.identity.rule_silent_when_other': '- 整条消息都指派给别的 bot 时保持沉默',
   'ai.identity.rule_no_proactive_pull': '- 默认不拉别的 bot 进来，除非用户明确要求',
-  'ai.identity.mention_must': '- 跟别的 bot 协作必须 `botmux send --mention <对方 open_id>`，否则对方收不到',
+  'ai.identity.mention_must': '- 跟别的 bot 协作（回复或 @ 别的 bot）必须 `botmux send --mention <对方 open_id>`（回复触发本轮的 bot 也可用 `--mention-back`），否则对方收不到',
 
   // ─── AI hints（非注入式 CLI 的 BOTMUX_SHELL_HINTS；multiline_heredoc /
   // heredoc_example 同时被 system-prompt 路径复用——两个 locale 保持一致）──
@@ -1550,19 +1545,20 @@ export const messages: Record<string, string> = {
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
   'ai.shell.when_to_send': '对于需要回复的请求，必须通过 Bash 执行 botmux send --response-kind final 交付完整结果或具体阻碍，并核验发送成功后再结束；查询完成或只发进度不算交付。已成功交付不要重复发送。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
   'ai.shell.no_visible_output_ok': '只有最终答复已通过 botmux send --response-kind final 成功交付（退出码 0），才可无终端正文地结束；progress 发送成功不代表任务完成。不要因“无输出”提示重发已交付的答案；发送结果未知先核对，不能直接当作成功或失败。',
-  // replyDelivery=transcript 的 shell-hints 变体：intro / when_to_send 改口，send_scope
-  // 把 botmux send 限定在最终回复带不了的场景（how_to_send / mention_gate /
-  // feedback 等 send 模式专属的长段不注入，见 shared-hints.ts）。
+  // replyDelivery=transcript（自动转发最终回复）的 shell-hints 变体：只用 intro /
+  // when_to_send 两条改口版 + helpers；有原生 skill 通道时不再额外塞 botmux send
+  // 提示（多 bot 协作在 <identity>，附件/卡片/跨群在 botmux-send skill 按需查）；
+  // 无通道时另加一段最小 send 操作说明，避免附件参数与硬门/防双发规则断供。
   'ai.shell.intro_transcript': '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书。',
-  'ai.shell.send_scope_transcript': 'botmux send 只用于最终回复带不了的事：@ 别的 bot 协作，或把结果交还给派活给你的 bot（`--mention <对方 open_id>` / `--mention-back`，bot 只有被 @ 才收得到）；发附件（`--images` / `--files` / `--videos`）或自定义卡片；发到别的群或话题；以及本轮说明明确要求用 botmux send 的回合（如静默定时任务，那类回合的最终回复不会发到群里）。每条 send 必须带 `--mention <open_id>` / `--mention-back` / `--no-mention` 之一。不要用它发进度播报、「收到」「在看」或阶段小结，也不要把最终答复再 send 一遍；最终答复必须走 send 时加 `--response-kind final`，botmux 就不会再把最终回复转发一遍。要配附件时先 send 附件、最后再写最终答复：botmux 只转发最后一次调用工具之后的那段回复。',
   'ai.shell.when_to_send_transcript': '发给你的消息直接在最终 assistant message 里作答即可,别沉默。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
+  'ai.shell.send_without_skill_transcript': '此 CLI 没有原生 skill 通道。需要主动发消息、协作、发送附件/卡片或跨群发布时，用 Bash 执行 `botmux send`；完整用法可运行 `botmux skill show botmux-send`。附件用 `--images` / `--files` / `--videos`，多行正文用 quoted heredoc/stdin 或 UTF-8 `--content-file`。每条 send 必须三选一：`--mention <open_id:名字>` / `--mention-back` / `--no-mention`；定时等无本轮发送者的回合不要用 --mention-back，也不要从 owner 或历史发送者推断收件人。完整答复若走 send，加 `--response-kind final`；若刚才的普通 send 已交付完整答复，最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`，避免改写后再自动转发一次；只发补充不代表原任务完成。附件/卡片先发送，最终答复写在最后一次工具调用之后，自动转发只采集该尾部文本。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
   'ai.attach.hint': '使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] / [视频 N] 占位符对应',
   'ai.attach.videoHint': '视频已保存到本地。优先用 Read 或当前 CLI 的媒体读取工具读取视频，让支持视频输入的模型理解完整时序；工具或模型不支持时，可按任务需要抽帧或转写，并说明所用方式。',
   'ai.attach.videoHintKimi': '视频已保存到本地。优先用 ReadMediaFile 工具读取视频，让支持视频输入的模型理解完整时序；工具或模型不支持时，可按任务需要抽帧或转写，并说明所用方式。',
-  'ai.identity.short_routing': '提醒：要跟别的 bot 沟通或协作必须 `botmux send --mention <对方 open_id>`，否则对方 bot 不会被触发。',
+  'ai.identity.short_routing': '提醒：回复或 @ 别的 bot 协作必须 `botmux send --mention <对方 open_id>`（回复触发本轮的 bot 也可用 `--mention-back`），否则对方 bot 不会被触发。',
   'ai.available_bots.hint': '要跟这里的某个 bot 沟通或协作必须 --mention 它的 open_id（botmux send --mention ou_xxx ...），不 --mention 对方 bot 完全收不到消息',
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',

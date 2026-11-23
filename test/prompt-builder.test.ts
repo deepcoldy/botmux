@@ -117,7 +117,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 // ─── Imports ──────────────────────────────────────────────────────────────
 
-import { buildNewTopicPrompt, buildNewTopicCliInput, buildFollowUpContent, buildFollowUpCliInput, buildReforkCliInput, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
+import { buildNewTopicPrompt, buildNewTopicCliInput, buildFollowUpContent, buildFollowUpCliInput, buildReforkCliInput, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock, buildSilentScheduleHint } from '../src/core/session-manager.js';
+import { validateMentionDecision } from '../src/services/send-policy.js';
 import { config } from '../src/config.js';
 import { buildExternalEventApplicationContext, buildExternalEventCodexAppContexts, buildExternalEventDataContext, buildExternalEventVisibleText, buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
 import type { TriggerRequest } from '../src/services/trigger-types.js';
@@ -1164,6 +1165,22 @@ describe('buildNewTopicPrompt with multi-user follow-ups', () => {
   });
 });
 
+// The command taught by a silent scheduled turn must pass the real default @ gate;
+// transcript mode no longer carries the long mention-gate prompt that used to teach it.
+describe('silent scheduled send guidance', () => {
+  it.each(['zh', 'en'] as const)('provides a valid no-recipient send command (%s)', locale => {
+    const hint = buildSilentScheduleHint('monitor', locale);
+    const command = hint.match(/`(botmux send[^`]*)`/)?.[1];
+    expect(command).toBeDefined();
+    const tokens = command!.split(/\s+/);
+    expect(validateMentionDecision({
+      enabled: true, sendTopLevel: false,
+      hasMentionArgs: tokens.includes('--mention'), mentionBack: tokens.includes('--mention-back'),
+      noMention: tokens.includes('--no-mention'), hasQuoteTargetSender: false,
+    }).ok, command).toBe(true);
+  });
+});
+
 // ─── replyDelivery=transcript — 信封改口 / solo 去壳 ─────────────────────────
 
 describe('replyDelivery=transcript envelope', () => {
@@ -1178,41 +1195,40 @@ describe('replyDelivery=transcript envelope', () => {
     delete mockBotConfig.apiOnly;
   });
 
-  it('缺省按 CLI 能力：claude-code 与 codex 缺省都等于显式 transcript；显式 send 不被覆盖', () => {
+  it('缺省一律 send：claude-code 与 codex 缺省都等于显式 send（字节相同）；显式 transcript 才切换', () => {
     delete mockBotConfig.replyDelivery;
     const followDefault = buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions });
     const topicDefault = buildNewTopicPrompt(
       '帮我看下', 'sess-rd', 'codex', undefined, attachments, mentions, undefined, undefined,
       { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
     );
-    // claude-code 缺省 transcript：续轮不带 reminder，等于显式 transcript。
-    expect(followDefault).not.toContain('<botmux_reminder>');
-    mockBotConfig.replyDelivery = 'transcript';
-    expect(buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions })).toBe(followDefault);
-    const topicTranscript = buildNewTopicPrompt(
-      '帮我看下', 'sess-rd', 'codex', undefined, attachments, mentions, undefined, undefined,
-      { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
-    );
-    // codex 缺省 transcript：首轮 routing 是改口版，等于显式 transcript；send 只留给
-    // 最终回复带不了的事，非 solo 的 <identity> 仍保留「协作必须 --mention」。
-    expect(topicTranscript).toBe(topicDefault);
-    expect(topicDefault).toContain(t('ai.shell.intro_transcript', undefined, 'zh'));
-    expect(topicDefault).toContain('只用于最终回复带不了的事');
-    expect(topicDefault).not.toContain('唯一方式');
-    expect(topicDefault).toMatch(/<identity>[\s\S]*<routing_rules>[\s\S]*botmux send --mention[\s\S]*<\/identity>/);
-
-    // 显式 send 是退回旧行为的出口：续轮带 reminder，首轮 routing 是 send 版。
+    // claude-code 缺省 send：续轮带 reminder，等于显式 send。
+    expect(followDefault).toContain('<botmux_reminder>');
     mockBotConfig.replyDelivery = 'send';
-    const followSend = buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions });
-    expect(followSend).toContain('<botmux_reminder>');
+    expect(buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions })).toBe(followDefault);
+    // codex 缺省 send：首轮 routing 是 send 版，等于显式 send。
     const topicSend = buildNewTopicPrompt(
       '帮我看下', 'sess-rd', 'codex', undefined, attachments, mentions, undefined, undefined,
       { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
     );
-    expect(topicSend).toContain('唯一方式');
-    expect(topicSend).not.toContain('只用于最终回复带不了的事');
+    expect(topicSend).toBe(topicDefault);
+    expect(topicDefault).toContain('唯一方式');
     // send 模式下 solo 标志是 no-op（去壳只在 transcript 下发生）。
-    expect(buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions, solo: true, selfMention })).toBe(followSend);
+    expect(buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions, solo: true, selfMention })).toBe(followDefault);
+
+    // 显式开启 transcript：续轮去掉 reminder；首轮 routing 不再加额外的 botmux send 或禁止发进度提示，
+    // 非 solo 的 <identity> 保留多 bot 协作提示（--mention / --mention-back）。
+    mockBotConfig.replyDelivery = 'transcript';
+    expect(buildFollowUpContent('继续', 'sess-rd', { ...base, cliId: 'claude-code', attachments, mentions }))
+      .not.toContain('<botmux_reminder>');
+    const topicTranscript = buildNewTopicPrompt(
+      '帮我看下', 'sess-rd', 'codex', undefined, attachments, mentions, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
+    );
+    expect(topicTranscript).toContain(t('ai.shell.intro_transcript', undefined, 'zh'));
+    expect(topicTranscript).not.toContain('唯一方式');
+    expect(topicTranscript).not.toContain('进度播报');
+    expect(topicTranscript).toMatch(/<identity>[\s\S]*<routing_rules>[\s\S]*botmux send --mention[\s\S]*--mention-back[\s\S]*<\/identity>/);
   });
 
   it('不支持转写的 CLI 缺省照旧 send：antigravity 缺省等于显式 send（字节相同）', () => {
@@ -1232,14 +1248,15 @@ describe('replyDelivery=transcript envelope', () => {
     )).toBe(topicDefault);
   });
 
-  it('transcript + solo 首轮：<identity> 只留 name/open_id；doubao 非 solo 也不加「协作必须 --mention」', () => {
-    delete mockBotConfig.replyDelivery;
+  it('transcript + solo 首轮：<identity> 只留 name/open_id；doubao 缺省 transcript 且非 solo 也不加「协作必须 --mention」', () => {
+    mockBotConfig.replyDelivery = 'transcript';
     const solo = buildNewTopicPrompt(
       '帮我看下', 'sess-solo', 'codex', undefined, [], [], undefined, undefined,
       { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1', solo: true },
     );
     expect(solo).toContain('<identity>');
     expect(solo).not.toContain('<routing_rules>');
+    delete mockBotConfig.replyDelivery;
     const doubao = buildNewTopicPrompt(
       '帮我看下', 'sess-db', 'doubao', undefined, [], [], undefined, undefined,
       { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
@@ -1331,25 +1348,28 @@ describe('replyDelivery=transcript envelope', () => {
     expect(out).not.toContain('<botmux_formatting>');
   });
 
-  it('transcript 首轮（非注入式 codex）：send 只留给最终回复带不了的事、非 solo identity 保留 short_routing；solo 时去壳', () => {
+  it('transcript 首轮（非注入式 codex）：routing 不加额外 botmux send 或禁止发进度提示，非 solo identity 保留协作规则；solo 时去壳', () => {
     mockBotConfig.replyDelivery = 'transcript';
     const build = (solo: boolean) => buildNewTopicPrompt(
       '@Bot 帮我看下', 'sess-t5', 'codex', undefined, attachments, mentions, undefined, undefined,
       { name: 'Bot', openId: 'ou_bot' }, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1', solo, selfMention },
     );
     const nonSolo = build(false);
-    expect(nonSolo).toContain('<botmux_routing>');
-    expect(nonSolo).toContain('自动转发回飞书');
-    expect(nonSolo).not.toContain('唯一方式');
-    expect(nonSolo).toContain('BOTMUX_NOTHING_TO_SEND');
-    expect(nonSolo).toContain('botmux history');
-    // routing 不再把 send 当回复通道，只留给协作 / 附件 / 跨群话题，并劝阻进度播报。
-    expect(nonSolo).toContain('只用于最终回复带不了的事');
-    expect(nonSolo).toContain('不要用它发进度播报');
-    expect(nonSolo).toContain("<<'EOF'");
-    // 最终回复卡不会 @ 触发本轮的 bot：协作 / 回报仍靠 --mention。
+    const routingBlock = nonSolo.match(/<botmux_routing>[\s\S]*?<\/botmux_routing>/)?.[0] ?? '';
+    expect(routingBlock).toContain('自动转发回飞书');
+    expect(routingBlock).not.toContain('唯一方式');
+    expect(routingBlock).toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(routingBlock).toContain('botmux history');
+    // 常驻 routing 块不再额外塞 botmux send / heredoc / 附件 / 禁止发进度提示。
+    expect(routingBlock).not.toContain('botmux send');
+    expect(routingBlock).not.toContain("<<'EOF'");
+    expect(routingBlock).not.toContain('--images');
+    expect(routingBlock).not.toContain('进度播报');
+    expect(routingBlock).not.toContain('「收到」');
+    expect(routingBlock).not.toContain('「在看」');
+    // 最终回复卡不会 @ 触发本轮的 bot：协作 / 回报留在 <identity> 的 <routing_rules> 里。
     expect(nonSolo).toContain('<identity>');
-    expect(nonSolo).toMatch(/<identity>[\s\S]*<routing_rules>[^<]*botmux send --mention[^<]*<\/routing_rules>/);
+    expect(nonSolo).toMatch(/<identity>[\s\S]*<routing_rules>[^<]*botmux send --mention[^<]*--mention-back[^<]*<\/routing_rules>/);
     expect(nonSolo).toContain('<user_message>');
     expect(nonSolo).toContain('<sender ');
     expect(nonSolo).toContain('<mentions>');
@@ -1366,6 +1386,30 @@ describe('replyDelivery=transcript envelope', () => {
     expect(solo).toContain('[附件]\n- x.jpg (/tmp/x.jpg)');
     expect(solo).toContain('[@提及]\n- @Alice');
     expect(solo).not.toContain('- @Bot');
+  });
+
+  it('transcript 给无原生 skill 通道的 CLI 保留最小发送契约，有通道 CLI 仍走按需 skill', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    const build = (cliId: 'hermes' | 'codex') => buildNewTopicPrompt(
+      '把报告发给我', `sess-no-skill-${cliId}`, cliId, undefined, undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' }, 'zh', sender,
+      { larkAppId: 'app_test', chatId: 'oc_1', solo: true, selfMention },
+    );
+    const routing = (prompt: string) => prompt.match(/<botmux_routing>[\s\S]*?<\/botmux_routing>/)?.[0] ?? '';
+    const hermes = routing(build('hermes'));
+    // 这些不是反进度劝说，而是缺少 skill catalog 时必须自足的协议规则。
+    for (const token of [
+      'botmux send', 'botmux skill show botmux-send', '--images', '--files', '--videos',
+      'heredoc', '--content-file', '--mention-back', '--no-mention', '--response-kind final',
+      'BOTMUX_NOTHING_TO_SEND', '最后一次工具调用之后',
+    ]) expect(hermes).toContain(token);
+
+    const codex = routing(build('codex'));
+    expect(codex).toContain('BOTMUX_NOTHING_TO_SEND');
+    for (const token of [
+      'botmux send', 'botmux skill show botmux-send', '--images', '--files',
+      'heredoc', '--content-file', '--no-mention', '--response-kind final',
+    ]) expect(codex).not.toContain(token);
   });
 
   it('buildReforkCliInput 读 ds.soloSession：transcript + solo 去壳，非 solo 保留壳', () => {

@@ -23,6 +23,7 @@ import {
   untilDoneDeadlineDue,
   untilDoneResumeNextRunAt,
 } from '../src/services/schedule-until-done.js';
+import { validateMentionDecision } from '../src/services/send-policy.js';
 import type { ScheduledTask } from '../src/types.js';
 
 const NOW = Date.parse('2026-10-24T02:00:00.000Z');
@@ -320,7 +321,16 @@ describe('run context and display', () => {
     const silent = buildUntilDoneRunPrompt({ ...base, silent: true }, 'run-final', fmt)!;
     expect(silent).toContain('botmux send --response-kind final');
     expect(silent).toContain('最终回复不会发到群里');
-    expect(silent.match(/botmux send --response-kind final/g)).toHaveLength(2);
+    const taughtCommands = [...silent.matchAll(/`(botmux send --response-kind final[^`]*)`/g)].map(match => match[1]);
+    expect(taughtCommands).toHaveLength(2);
+    for (const command of taughtCommands) {
+      const tokens = command.split(/\s+/);
+      expect(validateMentionDecision({
+        enabled: true, sendTopLevel: false,
+        hasMentionArgs: tokens.includes('--mention'), mentionBack: tokens.includes('--mention-back'),
+        noMention: tokens.includes('--no-mention'), hasQuoteTargetSender: false,
+      }).ok, command).toBe(true);
+    }
     expect(silent).toContain('交付结果');
     expect(silent).not.toContain('做不完就在最终答复里');
 

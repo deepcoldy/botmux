@@ -115,21 +115,22 @@ describe('supportsTranscriptReplyDelivery', () => {
 
 describe('defaultReplyDeliveryFor', () => {
   const cases: Array<[string | undefined, 'send' | 'transcript']> = [
-    // 有转写采集通道的 CLI 缺省 transcript：最终答复由 daemon 从转写取，
-    // botmux send 只留给协作 / 附件 / 跨群话题。
-    ['claude-code', 'transcript'],
-    ['codex', 'transcript'],
-    ['traex', 'transcript'],
-    ['coco', 'transcript'],
-    ['hermes', 'transcript'],
-    ['mtr', 'transcript'],
-    ['pi', 'transcript'],
-    ['oh-my-pi', 'transcript'],
-    ['ebsd', 'transcript'],
-    ['grok', 'transcript'],
-    ['cursor', 'transcript'],
+    // 除 doubao 外一律缺省 send：自动转发最终回复（transcript）按需显式开启，不随 CLI 自动翻转。
+    ['claude-code', 'send'],
+    ['codex', 'send'],
+    ['traex', 'send'],
+    ['coco', 'send'],
+    ['hermes', 'send'],
+    ['mtr', 'send'],
+    ['pi', 'send'],
+    ['oh-my-pi', 'send'],
+    ['ebsd', 'send'],
+    ['grok', 'send'],
+    ['cursor', 'send'],
+    // 唯一例外：doubao 的工具命令跑在共享常驻 service 进程里，`botmux send` 无法
+    // 可靠归属到当前会话，缺省改走 transcript（#2828）。
     ['doubao', 'transcript'],
-    // 没有转写采集通道的照旧 send：codex-app 自带自动转发、antigravity 只在零注入
+    // 没有转写采集通道的同样 send：codex-app 自带自动转发、antigravity 只在零注入
     // 下采集、claude 家族变体用各自的 cliId。
     ['codex-app', 'send'],
     ['antigravity', 'send'],
@@ -166,37 +167,38 @@ describe('effectiveReplyDelivery', () => {
     vi.mocked(getBot).mockReturnValue({ config } as any);
   }
 
-  it('未配置 + claude-code → transcript（缺省按 CLI 能力）', () => {
-    expect(effectiveReplyDelivery('app_a', 'claude-code')).toBe('transcript');
+  it('未配置 + 支持的 CLI（claude-code / codex / cursor / traex / pi / grok / hermes 等）→ send（默认关闭，需显式开启）', () => {
+    for (const cliId of ['claude-code', 'codex', 'traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok', 'cursor']) {
+      expect(effectiveReplyDelivery('app_a', cliId)).toBe('send');
+    }
     expect(resolveReplyDelivery).toHaveBeenCalledWith('app_a');
   });
 
-  it('未配置 + codex → transcript（CLI 缺省）', () => {
-    expect(effectiveReplyDelivery('app_a', 'codex')).toBe('transcript');
+  it('显式开启 transcript + 支持的 CLI → transcript（不受默认关闭影响）', () => {
+    vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+    for (const cliId of ['claude-code', 'codex', 'traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok', 'cursor', 'doubao']) {
+      expect(effectiveReplyDelivery('app_a', cliId)).toBe('transcript');
+    }
   });
 
-  it('未配置 + cursor → transcript', () => {
-    expect(effectiveReplyDelivery('app_a', 'cursor')).toBe('transcript');
-  });
-
-  it('未配置 + 不支持转写的 CLI → send（antigravity / opencode / relay / codex-app）', () => {
+  it('未配置 + 不支持自动转发的 CLI → send（antigravity / opencode / relay / codex-app）', () => {
     for (const cliId of ['antigravity', 'opencode', 'relay', 'codex-app']) {
       expect(effectiveReplyDelivery('app_a', cliId)).toBe('send');
     }
   });
 
-  it('显式 send 不被新缺省覆盖：每个缺省 transcript 的 CLI 都保持 send', () => {
+  it('显式 send 保持 send：包括缺省 transcript 的 doubao 也能显式退回', () => {
     vi.mocked(resolveReplyDelivery).mockReturnValue('send');
     for (const cliId of ['claude-code', 'codex', 'traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok', 'cursor', 'doubao']) {
       expect(effectiveReplyDelivery('app_a', cliId)).toBe('send');
     }
   });
 
-  it('缺省值在 scratch 下回落 send 不告警；显式 transcript 回落才告警，且只告一次', () => {
+  it('缺省值（doubao）在 scratch 下回落 send 不告警；显式 transcript 回落才告警，且只告一次', () => {
     const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     try {
       mockBotConfig({ sandbox: 'scratch' });
-      expect(effectiveReplyDelivery('app_warn_default', 'cursor')).toBe('send');
+      expect(effectiveReplyDelivery('app_warn_default', 'doubao')).toBe('send');
       expect(warn).not.toHaveBeenCalled();
       vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
       expect(effectiveReplyDelivery('app_warn_explicit', 'cursor')).toBe('send');
@@ -299,7 +301,7 @@ describe('effectiveReplyDelivery', () => {
     expect(supportsTranscriptReplyDeliveryForBot('hermes')).toBe(true);
   });
 
-  it('缺省/显式 transcript + hermes + oncall → 运行时回落 send，避免宿主采不到 state.db', () => {
+  it('显式 transcript + hermes + oncall → 运行时回落 send，避免宿主采不到 state.db', () => {
     mockBotConfig({ sandbox: 'oncall' });
     expect(effectiveReplyDelivery('app_a', 'hermes')).toBe('send');
     vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');

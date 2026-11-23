@@ -408,10 +408,10 @@ export function buildUntilDoneRunPrompt(
     return [
       `[botmux 跟进任务] 定时任务 ${task.id} 已到截止时间${deadline}，这是最后一次执行（第 ${attempt} 次）。`,
       task.silent === true
-        ? '- 按现状收尾：已经完成就先运行 `botmux schedule done self --note "<一句话结果>"`，再用 `botmux send --response-kind final` 交付结果（静默回合的最终回复不会发到群里，必须显式 send）。'
+        ? '- 按现状收尾：已经完成就先运行 `botmux schedule done self --note "<一句话结果>"`，再用 `botmux send --response-kind final --no-mention` 交付结果（有明确收件人时把 --no-mention 换成 --mention <open_id>；静默回合的最终回复不会发到群里，必须显式 send）。'
         : '- 按现状收尾：已经完成就先运行 `botmux schedule done self --note "<一句话结果>"`，再发最终答复。',
       task.silent === true
-        ? '- 做不完就用 `botmux send --response-kind final` 说明现状与原因（静默回合的最终回复不会发到群里，必须显式 send）。本轮结束后任务自动关闭，不会再执行。'
+        ? '- 做不完就用 `botmux send --response-kind final --no-mention` 说明现状与原因（有明确收件人时把 --no-mention 换成 --mention <open_id>；静默回合的最终回复不会发到群里，必须显式 send）。本轮结束后任务自动关闭，不会再执行。'
         : '- 做不完就在最终答复里说明现状与原因。本轮结束后任务自动关闭，不会再执行。',
     ].join('\n');
   }
