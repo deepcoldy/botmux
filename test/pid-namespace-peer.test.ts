@@ -122,4 +122,13 @@ describe('PID namespace peer translation', () => {
     expect(resolveNamespaceLocalPid(19, [], procRoot)).toBeNull();
     expect(resolveNamespaceLocalPid(18, [200], join(procRoot, 'missing'))).toBeNull();
   });
+
+  it('ignores procfs entries whose NSpid host column does not name the directory pid', () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'botmux-pid-namespace-local-'));
+    roots.push(procRoot);
+    processFixture(procRoot, 200, '1000', [200], 'pid:[host]');
+    // A foreign or malformed procfs: directory 321 claims a host-column pid 999.
+    processFixture(procRoot, 321, '2000', [999, 1200], 'pid:[sandbox]', 200);
+    expect(resolveNamespaceLocalPid(1200, [200], procRoot)).toBeNull();
+  });
 });

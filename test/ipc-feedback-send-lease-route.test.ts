@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { setIpcAuthSecret, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import * as pidNamespacePeer from '../src/core/pid-namespace-peer.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import { config } from '../src/config.js';
 import { beginFeedbackMaintenance, inspectFeedbackMaintenance } from '../src/services/feedback-maintenance.js';
@@ -104,6 +105,34 @@ describe('POST /api/sessions/:sessionId/feedback-send-lease', () => {
     expect(await post('sess-receiver', {
       originCapability: CAP_A, action: 'release', processId: pid, lease: acquired.body.lease, releaseToken: acquired.body.releaseToken,
     })).toEqual({ status: 200, body: { ok: true } });
+  });
+
+  it('maps a namespace-local sender pid onto its host pid before leasing and echoes it for release', async () => {
+    const pid = await setup({ 'sess-a': liveSession('sess-a', CAP_A) });
+    const resolve = vi.spyOn(pidNamespacePeer, 'resolveNamespaceLocalPid').mockReturnValue(pid);
+    const acquired = await post('sess-a', { originCapability: CAP_A, action: 'acquire', processId: 18 });
+    expect(resolve).toHaveBeenCalledWith(18, expect.any(Array));
+    expect(acquired.status).toBe(200);
+    // The lease and the response name the host pid, not the namespace-local 18.
+    expect(acquired.body.processId).toBe(pid);
+    expect(JSON.parse(readFileSync(join(dataDir!, 'feedback-send-leases', acquired.body.lease), 'utf8')))
+      .toMatchObject({ processId: pid, sessionId: 'sess-a' });
+    // The CLI releases with the daemon-named host pid echoed from acquisition.
+    const released = await post('sess-a', {
+      action: 'release', processId: acquired.body.processId,
+      lease: acquired.body.lease, releaseToken: acquired.body.releaseToken,
+    });
+    expect(released.status).toBe(200);
+    expect(leases()).toEqual([]);
+  });
+
+  it('keeps the reported pid unchanged when host resolution cannot prove a mapping', async () => {
+    const pid = await setup({ 'sess-a': liveSession('sess-a', CAP_A) });
+    vi.spyOn(pidNamespacePeer, 'resolveNamespaceLocalPid').mockReturnValue(null);
+    const acquired = await post('sess-a', { originCapability: CAP_A, action: 'acquire', processId: pid });
+    expect(acquired.status).toBe(200);
+    expect(acquired.body.processId).toBe(pid);
+    expect(leases()).toHaveLength(1);
   });
 
   it('releases after turn rotation, session deactivation and a daemon restart', async () => {
