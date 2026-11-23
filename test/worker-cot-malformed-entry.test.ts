@@ -1,5 +1,6 @@
 /**
- * A malformed activity entry (a text entry without text) is dropped by the
+ * A malformed activity entry (a field its kind promises is missing, or the kind
+ * is unknown) is dropped by the
  * worker's CoT intake instead of throwing out of the transcript drain and
  * taking the rest of the turn's activity with it.
  */
@@ -46,4 +47,27 @@ describe('worker CoT intake', () => {
     expect(() => w.observeCotEntries([{ kind: 'text', text: undefined } as any, ...tail], { turnId: 'om_bad' })).not.toThrow();
     expect(w.thinkingEntries).toEqual(tail);
   });
+
+  // Every kind's fields are checked, in both modes: a missing string would throw
+  // while counting, and an unknown kind would make the running total NaN, which
+  // silently switches off the accumulated cap.
+  const malformed: Record<string, unknown> = {
+    'thinking without text': { kind: 'thinking' },
+    'tool_call without name': { kind: 'tool_call', id: 't1', args: '{}' },
+    'tool_call without args': { kind: 'tool_call', id: 't1', name: 'Bash' },
+    'tool_call with a non-string subject': { kind: 'tool_call', id: 't1', name: 'Bash', args: '{}', subject: 42 },
+    'tool_result without result': { kind: 'tool_result', id: 't1' },
+    'unknown kind': { kind: 'image', url: 'x' },
+    'null entry': null,
+  };
+  for (const adoptMode of [false, true]) {
+    for (const [name, entry] of Object.entries(malformed)) {
+      it(`skips ${name}${adoptMode ? ' in an adopted session' : ''}`, () => {
+        const w = worker({ adoptMode });
+        expect(() => w.observeCotEntries([entry as any, ...tail], { turnId: 'om_bad' })).not.toThrow();
+        expect(w.thinkingEntries.map((e: CotEntry) => e.kind)).toEqual(['tool_call', 'tool_call', 'text']);
+        expect(Number.isFinite(w.thinkingTotalChars)).toBe(true);
+      });
+    }
+  }
 });
