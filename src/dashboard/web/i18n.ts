@@ -255,8 +255,8 @@ const zh = {
   'botOnboarding.permissionReviewApprovers': '（审批人：{names}）',
   'botOnboarding.listSeparator': '、',
   'botOnboarding.permissionUnderReview': '应用有版本正在等待企业管理员审核，审核期间开放平台锁定了应用配置，botmux 暂时无法继续自动配置——这不是 botmux 卡住。审批进度可在飞书「审批」里查看。{stuckHint}审核通过后再完成以下步骤：',
-  // 审批是规则驱动的：卡住多半是配置不合规，撤回重提前得先改配置；botmux 自己从不撤回。
-  'botOnboarding.reviewStuckHint': '若审批被驳回或长时间没有进展，多半是有配置不合规（最常见：权限的数据范围为「全部/全员」），需到开放平台看审批详情、改好后撤回该版本再重新提交（botmux 不会自动撤回）。',
+  // 卡审核的实测成因：版本里带了需企业管理员审批的敏感权限（取消该项即通过），或数据范围等配置问题。
+  'botOnboarding.reviewStuckHint': '若审批长时间没有进展或被驳回，通常是版本里有需要企业管理员审批的权限（例如用户身份的 im:resource），或权限数据范围为「全部/全员」等配置问题：到开放平台打开这一版的版本详情，用不到的敏感权限直接在那里取消该项；配置问题则改好后撤回该版本再重新提交。botmux 不会自动取消或撤回。',
   // redirect 白名单没写上 ≠ 建 bot 失败，但一点授权就 20029，必须单独说出来。
   'botOnboarding.permissionRedirectWarn': '回调地址（重定向 URL）未自动配置成功：{reason}。请到开放平台「安全设置 → 重定向 URL」补上，否则群聊模式 / 会话群标签 / `/login` 点授权会报 20029。',
   'botOnboarding.permissionRedirectWarnNoReason': '回调地址（重定向 URL）未自动配置成功。请到开放平台「安全设置 → 重定向 URL」补上，否则群聊模式 / 会话群标签 / `/login` 点授权会报 20029。',
@@ -5225,7 +5225,7 @@ const en: Record<keyof typeof zh, string> = {
   'botOnboarding.permissionReviewApprovers': ' (approvers: {names})',
   'botOnboarding.listSeparator': ', ',
   'botOnboarding.permissionUnderReview': 'A version of this app is waiting for enterprise admin review. The Open Platform locks the app configuration during review, so botmux cannot continue configuring it automatically — botmux is not stuck. Track the review in Feishu Approval. {stuckHint} After approval, complete these steps:',
-  'botOnboarding.reviewStuckHint': 'If the review is rejected or makes no progress for a long time, some configuration is usually non-compliant (most often a permission data range set to "All"): check the review details on the Open Platform, fix it, then withdraw that version and resubmit (botmux never withdraws it automatically).',
+  'botOnboarding.reviewStuckHint': 'If the review stalls or is rejected, the version usually contains a permission that needs enterprise admin approval (for example the user-identity im:resource) or a configuration issue such as a data range set to "All". Open the details of that version on the Open Platform: cancel a sensitive permission you do not need right there; for a configuration issue, fix it, then withdraw the version and resubmit. botmux never cancels or withdraws anything automatically.',
   'botOnboarding.permissionRedirectWarn': 'The callback (redirect) URL was not configured automatically: {reason}. Add it under Security Settings → Redirect URL on the Open Platform, otherwise group session mode, session-group tags and `/login` will fail authorization with error 20029.',
   'botOnboarding.permissionRedirectWarnNoReason': 'The callback (redirect) URL was not configured automatically. Add it under Security Settings → Redirect URL on the Open Platform, otherwise group session mode, session-group tags and `/login` will fail authorization with error 20029.',
   'botOnboarding.metaDir': 'Dir',
