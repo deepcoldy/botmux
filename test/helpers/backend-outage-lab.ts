@@ -93,8 +93,15 @@ export function prepareOutageLabWorld(world: OutageLabWorld): string {
 
 /** Start one real worker. The caller decides what talks to it (the test as
  *  the daemon, or the real daemon handlers via __testOnly_setupWorkerHandlers
- *  — attach them BEFORE calling `sendInit`). */
-export function startOutageLabSession(world: OutageLabWorld, index: number): OutageLabSession & { sendInit(): void } {
+ *  — attach them BEFORE calling `sendInit`). `backendType: 'hc'` runs the CLI
+ *  on this test file's private hc core (the hc test fence's runtime dir and
+ *  binary shim, which the worker keeps). */
+export function startOutageLabSession(
+  world: OutageLabWorld,
+  index: number,
+  opts: { backendType?: 'tmux' | 'hc' } = {},
+): OutageLabSession & { sendInit(): void } {
+  const backendType = opts.backendType ?? 'tmux';
   const sessionId = randomUUID();
   const rootMessageId = `om_root_${index}`;
   const workDir = join(world.root, `w${index}`);
@@ -109,8 +116,11 @@ export function startOutageLabSession(world: OutageLabWorld, index: number): Out
   };
   // Keep the fence marker: with it the session-scope code never derives the
   // host's user bus, so no real systemd unit is touched.
+  // The hc fence's shim and deny log stay too: they are what keeps an hc
+  // worker on this file's private core.
+  const kept = new Set(['BOTMUX_NO_CLAIM', 'BOTMUX_FENCED_RUN', ...(backendType === 'hc' ? ['BOTMUX_HC_BIN', 'BOTMUX_HC_FENCE_LOG'] : [])]);
   for (const key of Object.keys(env)) {
-    if (key.startsWith('BOTMUX_') && key !== 'BOTMUX_NO_CLAIM' && key !== 'BOTMUX_FENCED_RUN') delete env[key];
+    if (key.startsWith('BOTMUX_') && !kept.has(key)) delete env[key];
   }
   env.BOTMUX_TMUX_SOCKET = world.socket;
   delete env.TMUX;
@@ -123,7 +133,7 @@ export function startOutageLabSession(world: OutageLabWorld, index: number): Out
   worker.on('message', (m: any) => { ipc.push(m); });
   const init = {
     type: 'init', sessionId, chatId: 'oc_lab', rootMessageId, workingDir: workDir,
-    cliId: 'hermes', cliPathOverride: cli, backendType: 'tmux', prompt: '',
+    cliId: 'hermes', cliPathOverride: cli, backendType, prompt: '',
     apiOnly: true, larkAppId: 'app_lab', larkAppSecret: '', ownerOpenId: 'ou_owner', daemonBootId: 'boot-lab',
     loadedBotsConfigPath: bots, loadedBotsConfigProvenance: 'loaded', promptInjection: 'none',
   };

@@ -222,6 +222,11 @@ describe('dispatch launch versioned codecs', () => {
     })).toThrow();
   });
 
+  it('round-trips a launch identity frozen on an hc target bot', () => {
+    const hcOperation = { ...operation(), launchIdentity: { ...identity, backendType: 'hc' as const } };
+    expect(parseDispatchLaunchOperation(hcOperation).launchIdentity.backendType).toBe('hc');
+  });
+
   it('rejects requested/effective drift, unsupported identity, and invalid generations', () => {
     expect(() => parseDispatchLaunchOperation({
       ...operation(), effectiveOverride: { model: 'other', reasoningEffort: 'high' },
@@ -232,6 +237,9 @@ describe('dispatch launch versioned codecs', () => {
     expect(() => parseDispatchLaunchOperation({
       ...operation(), launchIdentity: { ...identity, codexRpcInput: true },
     })).toThrow('Invalid literal value');
+    expect(() => parseDispatchLaunchOperation({
+      ...operation(), launchIdentity: { ...identity, backendType: 'riff' },
+    })).toThrow('Invalid enum value');
     expect(() => parseDispatchLaunchOperation({
       ...operation(), state: 'awaiting_proof', rootMessageId: 'r', targetSessionId: 's',
       kickoffTurnId: 't', workerGeneration: 0,

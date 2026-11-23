@@ -6,7 +6,12 @@ import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { canonicalJson } from '../utils/canonical-input-hash.js';
 import { resolveCliRuntime, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { resolvePairedSpawnBackendType } from './persistent-backend.js';
-import { dispatchLaunchPolicyDigest, type DispatchLaunchIdentityV1 } from './dispatch-launch-contract.js';
+import {
+  DISPATCH_LAUNCH_BACKEND_TYPES,
+  dispatchLaunchPolicyDigest,
+  type DispatchLaunchBackendType,
+  type DispatchLaunchIdentityV1,
+} from './dispatch-launch-contract.js';
 
 function digest(value: unknown): string {
   return `sha256:${createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex')}`;
@@ -27,7 +32,7 @@ export function resolveDispatchLaunchIdentity(bot: BotConfig): DispatchLaunchIde
   const backendType = resolvePairedSpawnBackendType(
     bot.cliId, undefined, bot.backendType, config.daemon.backendType,
   );
-  if (!['pty', 'tmux', 'herdr', 'zellij', 'zmx'].includes(backendType)) {
+  if (!(DISPATCH_LAUNCH_BACKEND_TYPES as readonly string[]).includes(backendType)) {
     throw new Error('dispatch launch v1 requires a supported local session backend');
   }
   return {
@@ -35,7 +40,7 @@ export function resolveDispatchLaunchIdentity(bot: BotConfig): DispatchLaunchIde
     cliRuntimeDigest: digest(snapshotCliRuntime(runtime)),
     executable: runtime?.executable ?? bot.cliPathOverride ?? 'codex',
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
-    backendType: backendType as DispatchLaunchIdentityV1['backendType'],
+    backendType: backendType as DispatchLaunchBackendType,
     codexRpcInput: false,
     existingAppServer: false,
     botConfigDigest: digest({

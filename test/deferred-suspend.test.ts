@@ -404,6 +404,14 @@ describe('session reasoning effort changes', () => {
     }
   });
 
+  it('offers the control for a Codex TUI in an hc terminal, not for zmx', () => {
+    const { ds } = session();
+    ds.initConfig.backendType = 'hc';
+    expect(sessionReasoningControl(ds)).toMatchObject({ selected: 'ultra' });
+    ds.initConfig.backendType = 'zmx';
+    expect(sessionReasoningControl(ds)).toBeUndefined();
+  });
+
   it('does not offer an Aiden control with an instance binding', () => {
     const { ds } = session();
     ds.session.cliInstanceBinding = { source: 'pool', codexHome: '/unused-bound-home' };
@@ -587,6 +595,12 @@ describe('model-bound topic reasoning effort preferences', () => {
     expect(setTopicReasoningEffort(ds, 'medium')).toBe('busy');
     ds.lastScreenStatus = 'idle'; expect(setTopicReasoningEffort(ds, 'ultra')).toBe('invalid');
     expect(ds.session.topicReasoningEffort).toBeUndefined();
+  });
+  it('offers the topic control for a TraeX runtime in an hc terminal', () => {
+    const ds = topic(); ds.initConfig.backendType = 'hc';
+    expect(topicReasoningControl(ds)).toMatchObject({ model: 'GPT-6.1-Sol', active: 'xhigh' });
+    ds.initConfig.backendType = 'zmx';
+    expect(topicReasoningControl(ds)).toBeUndefined();
   });
   it.each(['cli', 'remote', 'adopt', 'wrapper', 'auto', 'workflow'])('withholds controls for %s', kind => {
     const ds = topic();

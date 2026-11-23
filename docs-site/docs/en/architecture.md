@@ -45,7 +45,7 @@ Take "@ the bot in a topic and say something" as an example:
 | Backend | How to enable | After a daemon restart |
 |---------|---------------|------------------------|
 | **tmux** (default) | Nothing to configure | The CLI keeps running; the next message reattaches automatically and context is kept |
-| zmx / zellij / herdr | Set explicitly via `backendType` or `BACKEND_TYPE` | Also persistent; requires the matching tool |
+| zmx / zellij / herdr / hc | Set explicitly via `backendType` or `BACKEND_TYPE` | Also persistent; requires the matching tool |
 | pty | Set explicitly via `BACKEND_TYPE=pty` or `backendType: "pty"` | The CLI exits with the worker and is relaunched after restart |
 
 If tmux isn't available, botmux **does not silently fall back to pty**. It blocks new sessions and shows a card asking you to install tmux. Details in [Persistent tmux sessions](/en/tmux) and [ZMX backend](/en/zmx).
@@ -73,7 +73,7 @@ If you want to change the code, start here:
 | `src/worker.ts` | Worker process: manages the CLI, renders cards, serves the web terminal |
 | `src/bot-registry.ts`, `src/config.ts` | Loading `bots.json` and global config |
 | `src/adapters/cli/` | CLI adapters, one file per CLI (launch args, input method, Skill directory, etc.) |
-| `src/adapters/backend/` | Session backends: tmux, pty, zmx, zellij, herdr and more |
+| `src/adapters/backend/` | Session backends: tmux, pty, zmx, hc, zellij, herdr and more |
 | `src/core/` | Session management, command table and routing (`command-schema.ts` / `command-router.ts`), worker pool, scheduler, etc. |
 | `src/im/lark/` | Lark: event dispatch, card building and callbacks, API calls, message parsing |
 | `src/skills/` | Built-in Skills injected into the CLI |

@@ -1,13 +1,15 @@
 /**
- * Every vitest config checked into the repo root must mount the tmux fence and
- * the per-file data-dir fence.
+ * Every vitest config checked into the repo root must mount the tmux fence, the
+ * hc fence and the per-file data-dir fence.
  *
  * The fences only exist where a config lists them: a config without
  * `tmux-fence-setup.ts` / `tmux-fence-global-setup.ts` lets the normal unit files
- * reach the host's tmux servers (the fleet's `-L botmux` server included), and
+ * reach the host's tmux servers (the fleet's `-L botmux` server included), one
+ * without `hc-fence-setup.ts` / `hc-fence-global-setup.ts` lets an hc client
+ * fall back to /run/user/<uid> and take over the host's live hc core socket, and
  * one without `unit-setup.ts` / `e2e-setup.ts` lets test stores inherit the
  * invoking shell's live SESSION_DATA_DIR. `vitest.non-linux-probe.config.ts`
- * shipped without the former. The configs are loaded as modules (not read as
+ * shipped without the tmux fence. The configs are loaded as modules (not read as
  * text), so this checks what vitest actually gets.
  */
 import { describe, expect, it } from 'vitest';
@@ -30,7 +32,7 @@ function projectsOf(config: { test?: TestOptions & { projects?: Array<{ test?: T
   return projects.length > 0 ? projects : [test];
 }
 
-describe('repo vitest configs keep the tmux and data-dir fences', () => {
+describe('repo vitest configs keep the tmux, hc and data-dir fences', () => {
   const files = readdirSync(ROOT).filter(name => CONFIG_RE.test(name));
 
   it('finds the repo configs', () => {
@@ -45,6 +47,17 @@ describe('repo vitest configs keep the tmux and data-dir fences', () => {
         .toContain('test/tmux-fence-setup.ts');
       expect(asList(project.globalSetup).map(p => p.replace(/^\.\//, '')), label)
         .toContain('test/tmux-fence-global-setup.ts');
+    }
+  });
+
+  it.each(files)('%s mounts the hc fence in every project', async (file) => {
+    const mod = await import(pathToFileURL(join(ROOT, file)).href);
+    for (const project of projectsOf(mod.default)) {
+      const label = `${file} › ${project.name ?? '(root)'}`;
+      expect(asList(project.setupFiles).map(p => p.replace(/^\.\//, '')), label)
+        .toContain('test/hc-fence-setup.ts');
+      expect(asList(project.globalSetup).map(p => p.replace(/^\.\//, '')), label)
+        .toContain('test/hc-fence-global-setup.ts');
     }
   });
 

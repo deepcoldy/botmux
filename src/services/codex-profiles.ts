@@ -40,8 +40,8 @@ export function assertCodexProfileConfig(cfg: ProfileLaunch): void {
       || cfg.existingAppServer || cfg.startupCommands?.length || cfg.env?.PATH
       || cfg.codexInstancePool?.enabled || cfg.codexAuthSync === 'isolated'
       || cfg.readIsolation || (cfg.sandbox && cfg.sandbox !== 'off')
-      || (cfg.backendType && !['pty', 'tmux'].includes(cfg.backendType))) fail('unsupported_launch');
-  if (cfg.codexRpcInput && cfg.backendType === 'tmux') fail('unsupported_rpc');
+      || (cfg.backendType && !['pty', 'tmux', 'hc'].includes(cfg.backendType))) fail('unsupported_launch');
+  if (cfg.codexRpcInput && (cfg.backendType === 'tmux' || cfg.backendType === 'hc')) fail('unsupported_rpc');
   if (cfg.serviceTier && cfg.serviceTier !== 'default') fail('unsupported_service_tier');
 }
 /**

@@ -32,9 +32,11 @@ import {
   type DeviceIsolationFreezeLease,
 } from './device-isolation-activation.js';
 import {
+  isSuspendableBackendType,
   killPersistentBackendTarget,
   probePersistentBackendTarget,
   resolvePersistentBackendTarget,
+  type PersistentBackendType,
 } from './persistent-backend.js';
 import { readProcessStartIdentity } from './session-marker.js';
 import type { DaemonSession } from './types.js';
@@ -44,7 +46,7 @@ export const DEVICE_ISOLATION_PREPARE_PATH = '/api/device-isolation/activation/p
 export const DEVICE_ISOLATION_COMMIT_PATH = '/api/device-isolation/activation/commit';
 export const DEVICE_ISOLATION_RELEASE_PATH = '/api/device-isolation/activation/release';
 
-type LocalPersistentBackend = 'tmux' | 'herdr' | 'zellij' | 'zmx';
+type LocalPersistentBackend = PersistentBackendType;
 type InventoryBackend = BackendType | 'unknown';
 type ProcessIdentity = { pid: number; procStart: string };
 
@@ -206,7 +208,7 @@ let transaction: ActivationTransaction | null = null;
 const QUARANTINE_UNREADABLE_SENTINEL = 'BOTMUX_MOJO_QUARANTINE_UNREADABLE';
 
 function isPersistentBackend(value: InventoryBackend): value is LocalPersistentBackend {
-  return value === 'tmux' || value === 'herdr' || value === 'zellij' || value === 'zmx';
+  return value !== 'unknown' && isSuspendableBackendType(value);
 }
 
 /**

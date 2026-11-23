@@ -311,7 +311,7 @@ describe('Codex App asymmetric control bootstrap and state', () => {
     const dir = tempDir();
     const bootstrap = createCodexAppControlBootstrap(dir, 'session-cold');
     const pending = mergeCodexAppControlCandidate(undefined, bootstrap.identity);
-    for (const backendType of ['tmux', 'herdr', 'zellij'] as const) {
+    for (const backendType of ['tmux', 'herdr', 'zellij', 'hc'] as const) {
       expect(shouldColdStartCodexAppReattach({
         cliId: 'codex-app', backendType, isReattach: true,
       })).toBe(true);

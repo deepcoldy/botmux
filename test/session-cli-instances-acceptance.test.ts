@@ -84,6 +84,11 @@ describe('A1: deterministic weighted allocation', () => {
 });
 
 describe('A2/A3/A7: explicit home, default and scope', () => {
+  it('refuses an hc bot with a reason that names the backend', () => {
+    for (const enabled of [true, false]) {
+      expect(() => normalizeCodexInstancePool({ ...pool(), enabled }, { ...bot(), backendType: 'hc' })).toThrow(/\bhc\b/);
+    }
+  });
   it('requires a real default ID and explicit absolute directories', () => {
     expect(() => normalizeCodexInstancePool({ ...pool(), defaultInstanceId: 'missing' }, bot())).toThrow();
     for (const codexHome of ['', './a', '~/a', '$HOME/a']) {

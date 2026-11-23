@@ -3,6 +3,13 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import * as realOs from 'node:os';
 import { fenceHomeRootedEnv } from './helpers/fence-home-env.js';
+import {
+  applyHcFenceEnv,
+  createHcFence,
+  hcFenceDenialError,
+  readHcFenceDenials,
+  teardownHcFence,
+} from './helpers/hc-fence.js';
 import { installSessionDataDirFence } from './helpers/session-data-dir-fence.js';
 import { installSystemdFence, systemdFenceError, takeSystemdFenceViolations } from './helpers/systemd-fence.js';
 import {
@@ -51,6 +58,9 @@ import {
 // bun test PROCESS — bun runs every file named on the command line in one
 // process — so the parent is the real tmpdir, captured before the os override.
 const { fileRoot } = installSessionDataDirFence(realOs.tmpdir(), 'botmux-bun-unit-');
+
+// Created before HOME moves, so the shim knows the host's own hc config.
+const hcFence = createHcFence(process.env);
 
 const fileHome = join(fileRoot, 'home');
 mkdirSync(fileHome);
@@ -135,4 +145,14 @@ afterAll(() => {
   const tmuxDenials = readTmuxFenceDenials(tmuxFence);
   teardownTmuxFence(tmuxFence);
   if (tmuxDenials.length > 0) throw tmuxFenceDenialError(tmuxDenials);
+});
+
+// Same hc fence as vitest (test/helpers/hc-fence.ts): no test may reach the
+// host's hc cores. One private runtime dir serves the whole invocation; hc's
+// config and state live in the fenced home.
+applyHcFenceEnv(hcFence, process.env, { home: fileHome });
+afterAll(() => {
+  const hcDenials = readHcFenceDenials(hcFence);
+  teardownHcFence(hcFence);
+  if (hcDenials.length > 0) throw hcFenceDenialError(hcDenials);
 });

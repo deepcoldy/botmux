@@ -835,6 +835,7 @@ import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
+import { probeHcAvailability } from './setup/ensure-hc.js';
 import { createGroupIdleCloseSweeper } from './core/group-idle-close-sweeper.js';
 import { coalesceSweepTriggers, sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import { resolveIdleSpinSuspendConfig } from './core/idle-spin-config.js';
@@ -859,6 +860,7 @@ import {
   getSessionPersistentBackendType,
   isRemoteBackendSession,
   isRemoteBackendType,
+  isSuspendableBackendType,
   killPersistentBackendTarget,
   killPersistentSession,
   probePersistentBackendTarget,
@@ -1497,7 +1499,7 @@ const VC_MEETING_DELIVERY_LEASE_SCAN_MS = 60_000;
 const VC_MEETING_RUNTIME_EXPIRY_ACK_TIMEOUT_MS = 3_000;
 const VC_MEETING_RUNTIME_EXPIRY_TEARDOWN_MS = 8_000;
 const VC_MEETING_RUNTIME_EXPIRY_REPROBE_MS = 5_000;
-const VC_MEETING_PERSISTENT_BACKENDS = ['tmux', 'herdr', 'zellij', 'zmx'] as const;
+const VC_MEETING_PERSISTENT_BACKENDS = ['tmux', 'herdr', 'zellij', 'zmx', 'hc'] as const satisfies readonly PersistentBackendType[];
 
 type VcMeetingDeliveryScope = {
   receiverSessionId: string;
@@ -1656,10 +1658,13 @@ function isVcMeetingBootRecoveryBlocked(request: VcMeetingDeliveryRequest): bool
 }
 
 function vcMeetingPersistentBackendAvailable(backendType: PersistentBackendType): boolean {
-  if (backendType === 'tmux') return TmuxBackend.isAvailable();
-  if (backendType === 'herdr') return HerdrBackend.isAvailable();
-  if (backendType === 'zellij') return ZellijBackend.isAvailable();
-  return ZmxBackend.isAvailable();
+  switch (backendType) {
+    case 'tmux': return TmuxBackend.isAvailable();
+    case 'herdr': return HerdrBackend.isAvailable();
+    case 'zellij': return ZellijBackend.isAvailable();
+    case 'zmx': return ZmxBackend.isAvailable();
+    case 'hc': return probeHcAvailability().ok;
+  }
 }
 
 /**
@@ -1702,11 +1707,9 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
   const persistedSession = ds?.session ?? sessionStore.getSession(sessionId);
   const persistedBackend = liveBackend ?? persistedSession?.backendType;
   if (persistedBackend === 'pty') return true;
-  const backendTypes: readonly PersistentBackendType[] =
-    persistedBackend === 'tmux' || persistedBackend === 'herdr'
-      || persistedBackend === 'zellij' || persistedBackend === 'zmx'
-      ? [persistedBackend]
-      : VC_MEETING_PERSISTENT_BACKENDS.filter(vcMeetingPersistentBackendAvailable);
+  const backendTypes: readonly PersistentBackendType[] = isSuspendableBackendType(persistedBackend)
+    ? [persistedBackend]
+    : VC_MEETING_PERSISTENT_BACKENDS.filter(vcMeetingPersistentBackendAvailable);
   let allMissing = true;
   for (const backendType of backendTypes) {
     const target = resolvePersistentBackendTarget(
@@ -2348,6 +2351,17 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
 
 export const __testOnly_createVcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery;
 
+function resolveVcMeetingMissingPersistentScope(sessionId: string): VcMeetingRuntimePersistentScope {
+  const backendType = sessionStore.getSession(sessionId)?.backendType;
+  if (isSuspendableBackendType(backendType)) return backendType;
+  return backendType === 'pty' ? 'none' : 'unknown';
+}
+
+export const __testOnly_vcMeetingPersistentScope = {
+  resolveMissing: resolveVcMeetingMissingPersistentScope,
+  backendAvailable: vcMeetingPersistentBackendAvailable,
+};
+
 const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
   findSession: findActiveBySessionId,
   sendExpiry(ds, message) {
@@ -2362,15 +2376,7 @@ const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
     const explicit = ds.initConfig?.backendType ?? ds.session.backendType;
     return explicit === 'pty' ? 'none' : 'unknown';
   },
-  resolveMissingPersistentScope(sessionId) {
-    const persisted = sessionStore.getSession(sessionId);
-    const backendType = persisted?.backendType;
-    if (backendType === 'tmux' || backendType === 'herdr'
-      || backendType === 'zellij' || backendType === 'zmx') {
-      return backendType;
-    }
-    return backendType === 'pty' ? 'none' : 'unknown';
-  },
+  resolveMissingPersistentScope: resolveVcMeetingMissingPersistentScope,
   resolvePersistentTarget(sessionId, ds) {
     return ds?.session.persistentBackendTarget
       ?? sessionStore.getSession(sessionId)?.persistentBackendTarget;

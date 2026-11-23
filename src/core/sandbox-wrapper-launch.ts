@@ -107,7 +107,7 @@ export function wrapperLaunchWiring(input: {
 
 /**
  * Whether this spawn builds a wrapper launch to run inside the sandbox.
- * Only local pty/tmux backends wrap a local command in a sandbox. A warm
+ * Only local pty/tmux/hc backends wrap a local command in a sandbox. A warm
  * reattach keeps the live pane exactly as it is: attach paths never consume
  * the launch, and building it (the aiden shim install can fail closed) must
  * not be able to refuse a healthy pane.
@@ -119,7 +119,7 @@ export function buildsSandboxWrapperLaunch(input: {
   reattach: boolean;
 }): boolean {
   return input.wrapperConfigured && input.sandboxRequested && !input.reattach
-    && (input.backendType === 'pty' || input.backendType === 'tmux');
+    && (input.backendType === 'pty' || input.backendType === 'tmux' || input.backendType === 'hc');
 }
 
 /**

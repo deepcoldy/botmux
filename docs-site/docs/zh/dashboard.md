@@ -382,7 +382,7 @@ Content-Type: application/json
 
 | 字段 | 含义 |
 |------|------|
-| `backendType` | 最近一次启动时用的后端（`pty` / `tmux` / `herdr` / `zellij` / `zmx`），可用于筛选和展示；冷恢复后可能随配置变化 |
+| `backendType` | 最近一次启动时用的后端（`pty` / `tmux` / `herdr` / `zellij` / `zmx` / `hc`），可用于筛选和展示；冷恢复后可能随配置变化 |
 | `backendSessionName` | 只有受管的持久后端会话才有，目前规则是 `bmx-<sessionId 前 8 位>`。PTY 会话、adopt 会话和部分老数据没有。它只是定位信息，**不代表进程或 socket 还活着** |
 | `titleUpdatedAt` | 标题最后更新时间（ISO-8601） |
 | `titleSource` | 标题来源：`initial` / `user` / `agent` / `cli` / `dashboard` / `system`。只用于展示和调试，**不能当作身份或审计依据** |

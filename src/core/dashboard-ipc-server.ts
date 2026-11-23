@@ -13379,10 +13379,11 @@ ipcRoute('PUT', '/api/bot-read-isolation', requireBoundBot(async (req, res) => {
           backendType,
           session.sessionId,
         );
-        // tmux rows may be frozen onto the dedicated socket (`socketName`); a
-        // name-only probe would ask the default server and read a live pane as
-        // gone. Rows without it resolve to the historical default-server target.
-        const probe = backendType === 'zmx' || backendType === 'tmux'
+        // tmux rows may be frozen onto the dedicated socket (`socketName`) and
+        // hc rows onto the core they were created on; a name-only probe would
+        // ask the default server and read a live pane as gone. Rows without a
+        // recorded address resolve to the historical default target.
+        const probe = backendType === 'zmx' || backendType === 'tmux' || backendType === 'hc'
           ? persistentBackend.probePersistentBackendTarget(persistentBackend.resolvePersistentBackendTarget(
             backendType, session.sessionId, session.persistentBackendTarget,
           ))

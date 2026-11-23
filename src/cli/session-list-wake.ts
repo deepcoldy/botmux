@@ -15,11 +15,14 @@ export type SessionListWakeResult =
   | { ok: true }
   | { ok: false; error: string; lastProbe?: SessionProbe };
 
+/** Backends `botmux list` can attach a terminal to. */
+export type ManagedAttachBackend = 'tmux' | 'zmx' | 'hc';
+
 export function canWakeDormantBackendForAttach(input: {
   isAdopt: boolean;
   probe: SessionProbe;
   realManagedSession: boolean;
-  attachBackend?: 'tmux' | 'zmx';
+  attachBackend?: ManagedAttachBackend;
   target?: PersistentBackendTarget;
 }): boolean {
   // tmux 3.6b on macOS reports an absent server socket as a connection-level
@@ -28,8 +31,8 @@ export function canWakeDormantBackendForAttach(input: {
   // wake is different — it does not claim the old pane is dead or delete it.
   // The owning daemon serializes the attempt, an existing worker wins as
   // `already_running`, and tmux session-name uniqueness fences a reachable old
-  // pane. Keep ZMX unknown fail-closed because its attach identity is PID/label
-  // sensitive rather than name-fenced by one shared server.
+  // pane. Keep ZMX and hc unknown fail-closed because their attach identity is
+  // label sensitive rather than name-fenced by one shared server.
   const recoverableProbe = input.probe === 'missing'
     || (input.probe === 'unknown' && input.attachBackend === 'tmux');
   return !input.isAdopt

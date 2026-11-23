@@ -12,6 +12,9 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { createServer, type Server } from 'node:net';
+import { join } from 'node:path';
 
 vi.mock('../src/im/lark/client.js', () => {
   class MessageWithdrawnError extends Error {
@@ -541,5 +544,93 @@ describe('daemon: a lost tmux server is one backend outage', () => {
     expect(ds.workerReady).toBe(true);
     expect(ds.crashDiagnosticParked).toBeUndefined();
     expect(isSessionLifecycleInFlight(ds)).toBe(false);
+  });
+});
+
+// hc: every bot's sessions sit on one botmux core. Losing its terminals
+// (holder lost, core stopped, state lost, unreachable) is the same outage,
+// keyed by the core's socket path and probed without ever starting a core.
+describe('daemon: a lost hc core is one backend outage', () => {
+  let root: string;
+  let socket: string;
+  let core: Server | undefined;
+  const sessions: Array<{ ds: DaemonSession; worker: any }> = [];
+  const lostCore = () => ({ type: 'claude_exit', code: null, signal: null, canParkDiagnostic: true,
+    backendLost: { backend: 'hc', kind: 'gone', socketName: socket } });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    restartCounts.clear();
+    __testOnly_resetRestartCoordinator();
+    root = mkdtempSync('/tmp/bo-hc-');
+    mkdirSync(join(root, 'herdr-core'));
+    socket = join(root, 'herdr-core', 'botmux.sock');
+    // The production serverUp: a connect-only `server.status` on the socket.
+    __testOnly_resetBackendOutage({}, { gatherMs: 30, gatherJitterMs: 0, canaryServerPollMs: 20, serverBackoffMs: [30, 30, 30], summarySettleMs: 60 });
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      notifyOwner: notifyOwnerMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 2,
+      closeSession: vi.fn(),
+    } as any);
+    sessions.length = 0;
+    const registry = new Map<string, DaemonSession>();
+    for (const id of ['hc-a', 'hc-b']) {
+      const worker = makeFakeWorker();
+      const ds = makeDs(id, worker);
+      (ds.session as any).persistentBackendTarget = { backendType: 'hc', sessionName: `bmx-${id}`, hcSession: 'botmux', socket };
+      __testOnly_setupWorkerHandlers(ds, worker);
+      sessions.push({ ds, worker });
+      registry.set(activeSessionKey(ds), ds);
+    }
+    setActiveSessionsRegistry(registry);
+  });
+
+  afterEach(async () => {
+    __testOnly_resetBackendOutage();
+    setActiveSessionsRegistry(undefined);
+    if (core) await new Promise<void>(resolve => core!.close(() => resolve()));
+    core = undefined;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('needs no corroboration for a core-reported `gone`, waits for the core to answer, and names the core', async () => {
+    const [a, b] = sessions;
+    for (const { worker } of sessions) worker.emit('message', lostCore());
+    await flush();
+    for (const { ds, worker } of sessions) {
+      expect(restartCounts.has(ds.session.sessionId)).toBe(false);
+      expect(restartsOf(worker)).toEqual([]);
+    }
+    await waitFor(() => sessions.every(({ ds }) => repliesTo(ds.session.sessionId).length === 1), 'cards');
+    for (const { ds } of sessions) {
+      const card = String(repliesTo(ds.session.sessionId)[0][1]);
+      expect(card).toContain('hc core「botmux」');
+      expect(card).not.toContain('tmux server');
+    }
+
+    // No core listens on the socket: one canary, the other session waits.
+    await waitFor(() => restartsOf(a!.worker).length + restartsOf(b!.worker).length === 1, 'canary');
+    const [canary, waiting] = restartsOf(a!.worker).length === 1 ? [a!, b!] : [b!, a!];
+    await new Promise(r => setTimeout(r, 150));
+    expect(restartsOf(waiting.worker)).toEqual([]);
+
+    // A core answers server.status now: the waiting session follows before the canary is even ready.
+    core = createServer(conn => conn.once('data', () => {
+      conn.end(`${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { version: '0.1.19', pid: 4242 } })}\n`);
+    }));
+    await new Promise<void>(resolve => core!.listen(socket, resolve));
+    await waitFor(() => restartsOf(waiting.worker).length === 1, 'restart once the core answers');
+    for (const member of [canary, waiting]) {
+      member.worker.emit('message', {
+        type: 'restart_result', attemptId: restartsOf(member.worker)[0].attemptId, status: 'succeeded', category: 'prompt_ready',
+      });
+    }
+    await waitFor(() => notifyOwnerMock.mock.calls.length === 1, 'owner summary');
+    const [, summary] = notifyOwnerMock.mock.calls[0];
+    expect(summary).toContain('hc core「botmux」');
+    expect(summary).toContain('已恢复 2 个');
+    expect(textReplies()).toEqual([]);
   });
 });

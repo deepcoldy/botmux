@@ -153,7 +153,7 @@ export function canResumeCotMessage(ds: Pick<DaemonSession, 'session' | 'larkApp
     const sandbox = ds.session.sandbox ?? ds.initConfig?.sandbox ?? cfg.sandbox;
     return ds.session.status === 'active'
       && ['antigravity', 'codex'].includes(ds.session.cliId ?? cfg.cliId)
-      && ds.session.backendType === 'tmux'
+      && (ds.session.backendType === 'tmux' || ds.session.backendType === 'hc')
       && !ds.session.adoptedFrom && !ds.initConfig?.adoptMode
       && typeof ds.session.cliSessionId === 'string' && !!ds.session.cliSessionId
       && (!sandbox || sandbox === 'off')
@@ -179,9 +179,9 @@ function recoveryIdentityMatches(
 
 function cotTargetKey(session: DaemonSession['session']): string {
   const target = session.persistentBackendTarget;
-  return target?.backendType === 'tmux'
-    ? JSON.stringify([target.sessionName, target.socketName ?? ''])
-    : JSON.stringify([`bmx-${session.sessionId.slice(0, 8)}`, '']);
+  if (target?.backendType === 'tmux') return JSON.stringify([target.sessionName, target.socketName ?? '']);
+  if (target?.backendType === 'hc') return JSON.stringify([target.sessionName, target.hcSession, target.socket]);
+  return JSON.stringify([`bmx-${session.sessionId.slice(0, 8)}`, '']);
 }
 
 const states = new WeakMap<DaemonSession, CotState>();

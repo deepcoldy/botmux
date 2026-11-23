@@ -123,6 +123,7 @@ describe('eligibility', () => {
   it('a local claude-code idle session is eligible', () => {
     expect(promptCacheKeepaliveIneligibility(session())).toBeUndefined();
     expect(promptCacheKeepaliveIneligibility(session({ initConfig: { cliId: 'claude-code', backendType: 'pty' } }))).toBeUndefined();
+    expect(promptCacheKeepaliveIneligibility(session({ initConfig: { cliId: 'claude-code', backendType: 'hc' } }))).toBeUndefined();
   });
 
   it('only a pending recovery wait holds keep-alives back, not a settled recovery', () => {

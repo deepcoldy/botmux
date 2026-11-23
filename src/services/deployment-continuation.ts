@@ -21,7 +21,7 @@ const MAX_AGE_MS = 24 * 60 * 60_000;
 export function deploymentContinuationEligible(session: Session): boolean {
   return session.status === 'active'
     && (session.cliLaunchSnapshot?.cliId ?? session.cliId) === 'codex'
-    && session.backendType === 'tmux'
+    && (session.backendType === 'tmux' || session.backendType === 'hc')
     && !session.adoptedFrom && !session.principalLane
     && !session.xpiSharedCwdAdmissionGroupId && !session.xpiSharedCwdAdmissionLease
     && !session.vcMeetingReceiver && !session.deferredScheduleRun

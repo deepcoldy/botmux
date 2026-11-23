@@ -97,8 +97,9 @@ function restoredReplacement(shape: Shape) {
 }
 
 describe('restored predecessor turns never hold their successors indefinitely', () => {
-  it('waits for the grant on Codex tmux and then settles both exact attempts', async () => {
-    const h = restoredReplacement({ cli: 'codex', backend: 'tmux' });
+  // hc keeps the Codex terminal across a worker restart exactly as tmux keeps the pane.
+  it.each(['tmux', 'hc'])('waits for the grant on Codex %s and then settles both exact attempts', async backend => {
+    const h = restoredReplacement({ cli: 'codex', backend });
     await h.drain();
     expect(h.sent).toEqual([]);
     await h.enrich();

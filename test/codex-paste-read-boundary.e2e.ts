@@ -7,10 +7,13 @@
  * BOTMUX_CODEX_PASTE_TEST_BIN=/path/to/codex [BOTMUX_CODEX_PASTE_ROUNDS=10] \
  *   [BOTMUX_CODEX_PASTE_ONLY=1012,2036] [BOTMUX_CODEX_PASTE_REPORT=<jsonl>] \
  *   bun x vitest run --project e2e test/codex-paste-read-boundary.e2e.ts
+ * The hc transport runs too when the hc test fence has a real binary
+ * (BOTMUX_HC_TEST_BIN=<herdr-core>): a private core, stopped afterwards.
  * ONLY limits the run to those body sizes (no routing-marker cases); REPORT
  * appends each transport's stranded inputs, for repeated before/after runs. */
 import { afterEach, expect, it, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -19,12 +22,18 @@ import { setTimeout as delay } from 'node:timers/promises';
 import xterm from '@xterm/headless';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { PtyBackend } from '../src/adapters/backend/pty-backend.js';
+import { HcBackend } from '../src/adapters/backend/hc-backend.js';
+import { hcTerminalName } from '../src/adapters/backend/hc/cli-ops.js';
+import { hcControlEnv, hcCoreAddress, hcCorePaths } from '../src/adapters/backend/hc/core.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { codexNativeComposerState } from '../src/services/codex-terminal-session.js';
 import { buildOpenAiResponsesTextEvents } from './helpers/mock-llm-server/openai-responses-sse.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
 const BIN = process.env.BOTMUX_CODEX_PASTE_TEST_BIN;
+/** A real herdr-core binary behind the hc test fence (whose shim is BOTMUX_HC_BIN). */
+const HC = process.env.BOTMUX_HC_TEST_BIN ? process.env.BOTMUX_HC_BIN : undefined;
+const TRANSPORTS = ['tmux', 'pty', ...(HC ? ['hc'] : [])] as const;
 const ROUNDS = Math.max(1, Number(process.env.BOTMUX_CODEX_PASTE_ROUNDS) || 1);
 /** Bytes the paste markers add around the body: ESC[200~ + ESC[201~. */
 const FRAME_BYTES = 12;
@@ -41,6 +50,8 @@ let server: Server | undefined;
 const stops: Array<() => void> = [];
 afterEach(async () => {
   while (stops.length) { try { stops.pop()!(); } catch { /* already gone */ } }
+  // This file's private core (the fence's own runtime dir), never a host one.
+  if (HC) spawnSync(HC, ['server', 'stop'], { env: hcControlEnv(process.env, hcCorePaths(process.env)), stdio: 'ignore', timeout: 20_000 });
   if (server) await new Promise<void>(resolve => server!.close(() => resolve()));
   server = undefined;
   vi.unstubAllEnvs();
@@ -60,7 +71,7 @@ function body(bytes: number, tag: string): string {
 
 type Pane = { target: PtyHandle; capture: () => { viewport: string; cursor: { x: number; y: number } } };
 
-it.skipIf(!BIN).each(['tmux', 'pty'] as const)('real Codex %s: pastes on the 1024-byte read boundary submit at once, exactly once', async transport => {
+it.skipIf(!BIN).each(TRANSPORTS)('real Codex %s: pastes on the 1024-byte read boundary submit at once, exactly once', async transport => {
   root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-codex-paste-boundary-')));
   const home = join(root, 'home');
   const codexHome = join(home, '.codex');
@@ -114,6 +125,17 @@ it.skipIf(!BIN).each(['tmux', 'pty'] as const)('real Codex %s: pastes on the 102
       stops.push(() => execFileSync('tmux', ['-L', socket, 'kill-server'], { stdio: 'ignore' }));
       const backend = new TmuxPipeBackend('fixture', { socketName: socket });
       backend.cliPid = Number(execFileSync('tmux', ['-L', socket, 'display-message', '-p', '-t', 'fixture', '#{pane_pid}'], { encoding: 'utf8' }).trim());
+      pane = { target: backend, capture: () => backend.captureInputState() ?? { viewport: '', cursor: { x: 0, y: 0 } } };
+    } else if (transport === 'hc') {
+      // The production hc path: a fresh terminal through the strict pane launcher.
+      const sid = randomUUID();
+      const backend = new HcBackend(
+        { backendType: 'hc', sessionName: hcTerminalName(sid), ...hcCoreAddress(hcCorePaths(process.env)) },
+        { sessionId: sid },
+      );
+      backend.spawn(BIN!, args, { cwd, cols: 100, rows: 30, env, strictEnv: true, paneLaunchDir: join(root!, 'launch', String(index)) });
+      stops.push(() => backend.destroySession());
+      backend.cliPid = backend.getChildPid()!;
       pane = { target: backend, capture: () => backend.captureInputState() ?? { viewport: '', cursor: { x: 0, y: 0 } } };
     } else {
       const terminal = new xterm.Terminal({ cols: 100, rows: 30, allowProposedApi: true });

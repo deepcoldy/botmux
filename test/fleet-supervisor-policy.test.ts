@@ -52,34 +52,33 @@ describe('fleet-supervisor-policy — decideOnExit (invariants 1 + 2)', () => {
     // The whole point of supervising a plugin service is crash-restart. If 90 were
     // honoured here the service would silently vanish, showing a bland 'stopped'.
     expect(decideOnExit(proc({ restarts: 0 }), { code: 90, signal: null }, undefined, false))
-      .toEqual({ action: 'restart', nextRestarts: 1 });
+      .toEqual({ action: 'restart', nextRestarts: 1, delayMs: DEFAULT_RESTART_POLICY.restartDelayMs });
   });
   it('crash under the cap → restart with incremented count', () => {
     expect(decideOnExit(proc({ restarts: 0 }), { code: 1, signal: null }))
-      .toEqual({ action: 'restart', nextRestarts: 1 });
-    expect(decideOnExit(proc({ restarts: 9 }), { code: 1, signal: null }))
-      .toEqual({ action: 'restart', nextRestarts: 10 });
+      .toEqual({ action: 'restart', nextRestarts: 1, delayMs: DEFAULT_RESTART_POLICY.restartDelayMs });
+    expect(decideOnExit(proc({ restarts: DEFAULT_RESTART_POLICY.maxRestarts - 1 }), { code: 1, signal: null }))
+      .toEqual({ action: 'restart', nextRestarts: DEFAULT_RESTART_POLICY.maxRestarts, delayMs: DEFAULT_RESTART_POLICY.restartDelayMs });
   });
-  it('crash AT the cap boundary (restarts would exceed max) → park errored', () => {
-    // maxRestarts=10: restarts=10 → next would be 11 > 10 → park.
-    expect(decideOnExit(proc({ restarts: 10 }), { code: 1, signal: null }))
-      .toEqual({ action: 'park', reason: 'max_restarts', atRestarts: 10 });
+  it('crash AT the cap boundary → keep retrying at the cooldown interval', () => {
+    expect(decideOnExit(proc({ restarts: DEFAULT_RESTART_POLICY.maxRestarts }), { code: 1, signal: null }))
+      .toEqual({ action: 'restart', nextRestarts: DEFAULT_RESTART_POLICY.maxRestarts, delayMs: DEFAULT_RESTART_POLICY.restartCooldownMs });
   });
   it('signal death counts as a crash and restarts', () => {
     expect(decideOnExit(proc({ restarts: 0 }), { code: null, signal: 'SIGKILL' }))
-      .toEqual({ action: 'restart', nextRestarts: 1 });
+      .toEqual({ action: 'restart', nextRestarts: 1, delayMs: DEFAULT_RESTART_POLICY.restartDelayMs });
   });
-  it('exactly maxRestarts restarts are allowed, the next is parked', () => {
+  it('bounds rapid retries without ever permanently parking a crashed service', () => {
     const p = DEFAULT_RESTART_POLICY;
     let restarts = 0;
-    let parked = false;
-    for (let i = 0; i < p.maxRestarts + 5; i++) {
+    for (let i = 0; i < p.maxRestarts + 20; i++) {
       const d = decideOnExit({ restarts }, { code: 1, signal: null });
-      if (d.action === 'restart') restarts = d.nextRestarts;
-      else if (d.action === 'park') { parked = true; break; }
+      expect(d.action).toBe('restart');
+      if (d.action !== 'restart') throw new Error('crashed service lost its retry');
+      expect(d.delayMs).toBe(i < p.maxRestarts ? p.restartDelayMs : p.restartCooldownMs);
+      restarts = d.nextRestarts;
     }
-    expect(restarts).toBe(p.maxRestarts); // 10 successful restarts
-    expect(parked).toBe(true);            // then parked
+    expect(restarts).toBe(p.maxRestarts);
   });
 });
 
@@ -89,16 +88,33 @@ describe('fleet-supervisor-policy — decideCrashExit (post-intent-guards path)'
     // explicitStop guards failed to match. A 90 at that point is unsolicited
     // (an external pkill/kill -TERM), so it restarts instead of retiring.
     expect(decideCrashExit(proc({ restarts: 0 })))
-      .toEqual({ action: 'restart', nextRestarts: 1 });
+      .toEqual({ action: 'restart', nextRestarts: 1, delayMs: DEFAULT_RESTART_POLICY.restartDelayMs });
   });
   it('can never return stop (no graceful outcome exists on this path)', () => {
-    for (let restarts = 0; restarts <= 12; restarts++) {
+    for (let restarts = 0; restarts <= DEFAULT_RESTART_POLICY.maxRestarts + 2; restarts++) {
       expect(decideCrashExit(proc({ restarts })).action).not.toBe('stop');
     }
   });
-  it('parks once the cap is exceeded, identical to decideOnExit for a crash', () => {
-    expect(decideCrashExit(proc({ restarts: 10 })))
-      .toEqual({ action: 'park', reason: 'max_restarts', atRestarts: 10 });
+  it('keeps the cooldown when an older state has already exceeded the cap', () => {
+    expect(decideCrashExit(proc({ restarts: DEFAULT_RESTART_POLICY.maxRestarts + 5 })))
+      .toEqual({ action: 'restart', nextRestarts: DEFAULT_RESTART_POLICY.maxRestarts, delayMs: DEFAULT_RESTART_POLICY.restartCooldownMs });
+  });
+  it('only resets the fast-restart budget after a stable run', () => {
+    const policy = { maxRestarts: 3, restartDelayMs: 7, restartCooldownMs: 500, resetAfterMs: 1000 };
+    const exhausted = proc({ restarts: policy.maxRestarts });
+    expect(decideCrashExit(exhausted, policy, policy.resetAfterMs - 1))
+      .toEqual({ action: 'restart', nextRestarts: policy.maxRestarts, delayMs: policy.restartCooldownMs });
+    expect(decideCrashExit(exhausted, policy, policy.resetAfterMs))
+      .toEqual({ action: 'restart', nextRestarts: 1, delayMs: policy.restartDelayMs });
+  });
+  it('supports a cooldown from the first failure when no fast retries are allowed', () => {
+    const policy = { maxRestarts: 0, restartDelayMs: 20, restartCooldownMs: 500 };
+    expect(decideCrashExit(proc(), policy))
+      .toEqual({ action: 'restart', nextRestarts: 0, delayMs: 500 });
+  });
+  it('keeps retrying at the cap, identical to decideOnExit for a crash', () => {
+    expect(decideCrashExit(proc({ restarts: DEFAULT_RESTART_POLICY.maxRestarts })))
+      .toEqual({ action: 'restart', nextRestarts: DEFAULT_RESTART_POLICY.maxRestarts, delayMs: DEFAULT_RESTART_POLICY.restartCooldownMs });
   });
 });
 

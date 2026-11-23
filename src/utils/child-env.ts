@@ -263,6 +263,14 @@ export const REDACTED_CHILD_ENV_KEYS = [
   // the source. Non-tmux CLIs are unaffected (they don't read TMUX).
   'TMUX',
   'TMUX_PANE',
+  // herdr-core client vars, for the same reason: hc sets the terminal pair in
+  // every program it runs, and a daemon started inside an hc terminal (or the
+  // botmux core's own env) carries the session/socket pair. A CLI inheriting
+  // them drives that core instead of starting its own hc. HC_SCOPE stays.
+  'HC_SESSION',
+  'HC_SOCKET',
+  'HC_TERMINAL_ID',
+  'HC_TERMINAL_SOCKET',
   // PM2 graceful-exit sentinel (BOTMUX_PM2_GRACEFUL_EXIT_CODE, defined as
   // PM2_GRACEFUL_EXIT_CODE_ENV in pm2-graceful-exit.ts). pm2 bakes it into the
   // daemon/dashboard env so ONLY those two managed cores exit with the sentinel
