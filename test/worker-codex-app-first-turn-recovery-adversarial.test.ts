@@ -7,9 +7,11 @@ import { CodexAppTurnDispatchQueue } from '../src/utils/codex-app-turn-dispatch.
 // the real queue/authority components; the existing AST harness reads cwd.
 if (process.env.BOTMUX_ATTESTATION_MUTATION_ROOT) process.chdir(process.env.BOTMUX_ATTESTATION_MUTATION_ROOT);
 
-function fixture() {
+function fixture(entryOverrides: Record<string, unknown> = {}) {
   const entry = { state: 'prepared', dispatchId: 'dispatch-original', turnId: 'om_original', dispatchAttempt: 3,
-    codexAppSteerable: true as const, replyTargetSenderOpenId: 'ou_original', replyTargetSenderIsBot: false };
+    codexAppSteerable: true as const, replyTargetSenderOpenId: 'ou_original', replyTargetSenderIsBot: false,
+    ...entryOverrides,
+  };
   const queue = new CodexAppTurnDispatchQueue(); queue.restore([entry]);
   const authority = new ActiveTurnAuthority();
   const scope: Record<string, any> = {
@@ -41,6 +43,17 @@ describe('warm first-turn attestation adversarial lifecycle probes', () => {
     expect(authority.snapshot()).toMatchObject({ turnId: 'om_original', dispatchAttempt: 3, started: true,
       caller: { requestLarkAppId: 'cli_original', requestUserOpenId: 'ou_original', senderType: 'user' } });
     expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
+  });
+  it('does not restore a cross-chat sender from a legacy steerable prepared entry', () => {
+    const { restore, authority, scope } = fixture({
+      replyTargetSenderOpenId: 'ou_stranger_b',
+      crossChatOrigin: {
+        sourceChatId: 'oc_origin', followedChatId: 'oc_followed', followedRootMessageId: 'om_followed_root',
+      },
+    });
+    restore('om_original', { generation: 'g1', seq: 1 });
+    expect(authority.snapshot()).toBeUndefined();
+    expect(scope.publishSandboxRelayCapability).not.toHaveBeenCalled();
   });
   it.each(['proof', 'missing-state', 'pending-state', 'empty-identities', 'multiple-identities', 'generation',
     'zero', 'negative', 'fractional', 'nan', 'infinite', 'unsafe-integer', 'committed-equal', 'committed-older'])(

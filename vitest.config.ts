@@ -71,8 +71,8 @@ export default defineConfig({
           // on master CI). This does not mask real failures: tests still assert
           // concrete outcomes and keep their own shorter internal deadlines.
           hookTimeout: 30_000,
-          globalSetup: ['./test/unit-global-setup.ts', './test/tmux-fence-global-setup.ts'],
-          setupFiles: ['./test/tmux-fence-setup.ts', './test/unit-setup.ts'],
+          globalSetup: ['./test/unit-global-setup.ts', './test/tmux-fence-global-setup.ts', './test/hc-fence-global-setup.ts'],
+          setupFiles: ['./test/tmux-fence-setup.ts', './test/hc-fence-setup.ts', './test/unit-setup.ts'],
         },
       },
       {
@@ -85,10 +85,11 @@ export default defineConfig({
           hookTimeout: 360_000,
           // unit-global-setup.ts provides the disposable root that e2e-setup.ts
           // carves each file's SESSION_DATA_DIR from (same as the unit project).
-          globalSetup: ['./test/global-setup.ts', './test/unit-global-setup.ts', './test/tmux-fence-global-setup.ts'],
-          // No test may reach the host's tmux servers (test/helpers/tmux-fence.ts),
-          // nor the live botmux data directory (test/e2e-setup.ts).
-          setupFiles: ['./test/tmux-fence-setup.ts', './test/e2e-setup.ts'],
+          globalSetup: ['./test/global-setup.ts', './test/unit-global-setup.ts', './test/tmux-fence-global-setup.ts', './test/hc-fence-global-setup.ts'],
+          // No test may reach the host's tmux servers (test/helpers/tmux-fence.ts)
+          // or hc cores (test/helpers/hc-fence.ts), nor the live botmux data
+          // directory (test/e2e-setup.ts).
+          setupFiles: ['./test/tmux-fence-setup.ts', './test/hc-fence-setup.ts', './test/e2e-setup.ts'],
         },
       },
     ],

@@ -12,6 +12,19 @@
  *    the plain composer.
  *  - traecli 0.213.1 / 0.214.1: the session writer-lock page (0.214.1 added a
  *    "←/esc dashboard" hint to its footer) and the composer after R.
+ *  - Kimi Code 2.5.3 (its own `kimi` family): the "cache expired" menu on an
+ *    idle submit (160x50, botmux's default pane) and on resume (80x24, row
+ *    descriptions cut to "..."), with the pointer on each row, plus the
+ *    compacting screen and the composer after Enter / Esc. Captured from the
+ *    real binary against a local fake API (the menu needs the managed
+ *    provider's cache rules, served by the same fake).
+ *  - Antigravity CLI 1.5.12 (its own `antigravity` family): the ask_question
+ *    picker (single / multi-select, an open write-in field, 60x24, with a
+ *    stacked statusLine row, the next question after Esc) and the
+ *    run_command permission dialog; plus the screens around them — the ask
+ *    hook still waiting (spinner, a message queued under it), the answer and
+ *    the skip in the transcript, the interrupt after Esc. Real binary against
+ *    a local fake Gemini API, 120x40 unless named.
  *
  * Every positive screen here was missed by the base classifier (footers,
  * "<Event> hooks" titles and the singular state line of these builds), so a
@@ -22,6 +35,9 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { classifyStuckPage, shouldHoldInputForStuckPage } from '../src/utils/stuck-detector.js';
+import { kimiCacheExpiryMenuTail, matchKimiCacheExpiryMenu } from '../src/utils/kimi-cache-expiry-menu.js';
+import { antigravityBlockingPageTail } from '../src/utils/antigravity-blocking-page.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import { diagnoseBackendSubmitFailure } from '../src/services/submit-failure-diagnosis.js';
 import { detectCliStartupBlocker, screenMayShowCredential } from '../src/core/cli-startup-blocker.js';
 
@@ -82,10 +98,69 @@ const NOT_PAGES = [
   ...CREDENTIAL_PAGES(),
 ];
 
+/** Kimi Code's cache-expiry menu, read as the `kimi` family. The page type
+ *  carries where the pointer is: Enter picks the highlighted row, so only
+ *  "Compact and continue" (`kimi cache expiry`) ever gets a key. */
+const KIMI_PAGES: Record<string, ReturnType<typeof classifyStuckPage>> = {
+  'kimi-2.5.3-cache-expiry-idle-submit.txt': 'kimi cache expiry',
+  'kimi-2.5.3-cache-expiry-resume-80x24.txt': 'kimi cache expiry',
+  'kimi-2.5.3-cache-expiry-highlight-new-session.txt': 'kimi cache expiry moved',
+  'kimi-2.5.3-cache-expiry-highlight-continue.txt': 'kimi cache expiry moved',
+  'kimi-2.5.3-cache-expiry-resume-highlight-never-80x24.txt': 'kimi cache expiry moved',
+};
+const KIMI_HIGHLIGHT: Record<string, string> = {
+  'kimi-2.5.3-cache-expiry-idle-submit.txt': 'compact',
+  'kimi-2.5.3-cache-expiry-resume-80x24.txt': 'compact',
+  'kimi-2.5.3-cache-expiry-highlight-new-session.txt': 'new',
+  'kimi-2.5.3-cache-expiry-highlight-continue.txt': 'continue',
+  'kimi-2.5.3-cache-expiry-resume-highlight-never-80x24.txt': 'never',
+};
+/** Kimi screens that are not the menu: compacting (the parked message queued
+ *  under "↑ to edit"), the composer after the re-sent reply, after Esc. */
+const KIMI_NOT_PAGES = [
+  'kimi-2.5.3-compacting-after-enter.txt',
+  'kimi-2.5.3-composer-after-compact-resend.txt',
+  'kimi-2.5.3-composer-after-esc-80x24.txt',
+];
+const isKimiFixture = (name: string) => name.startsWith('kimi-');
+
+/** Antigravity's pickers, read as the `antigravity` family. */
+const AGY_PAGES: Record<string, ReturnType<typeof classifyStuckPage>> = {
+  'agy-1.5.12-question-single-select.txt': 'antigravity question',
+  'agy-1.5.12-question-multi-select.txt': 'antigravity question',
+  'agy-1.5.12-question-write-in-open.txt': 'antigravity question',
+  'agy-1.5.12-question-60x24.txt': 'antigravity question',
+  // 44 columns: agy cuts the hint bar (`… · enter Select · esc`, `… · ent`).
+  'agy-1.5.12-question-44x30.txt': 'antigravity question',
+  'agy-1.5.12-question-multi-select-44x30.txt': 'antigravity question',
+  'agy-1.5.12-permission-run-command-44x30.txt': 'antigravity permission',
+  // 30 options in a 24-row pane: the title and `Question 1/1:` header are off screen.
+  'agy-1.5.12-question-header-scrolled-off-120x24.txt': 'antigravity question',
+  'agy-1.5.12-question-statusline.txt': 'antigravity question',
+  'agy-1.5.12-question-after-esc-skip.txt': 'antigravity question',
+  'agy-1.5.12-permission-run-command.txt': 'antigravity permission',
+};
+/** agy screens without a picker: input may go in (the composer, or agy's own
+ *  queue while the ask hook waits). The picker's text above the composer
+ *  (answered / skipped) is history, not a page. */
+const AGY_NOT_PAGES = [
+  'agy-1.5.12-hook-waiting.txt',
+  'agy-1.5.12-hook-waiting-queued-message.txt',
+  'agy-1.5.12-composer-after-hook-answer.txt',
+  'agy-1.5.12-composer-after-answer.txt',
+  'agy-1.5.12-composer-after-skip-all.txt',
+  'agy-1.5.12-interrupted-after-esc.txt',
+];
+const isAgyFixture = (name: string) => name.startsWith('agy-');
+const fixtureFamily = (name: string) => (isKimiFixture(name) ? 'kimi' : isAgyFixture(name) ? 'antigravity' : 'codex-family');
+
 describe('classifyStuckPage over real captures', () => {
   it('covers every plain-text fixture in the directory exactly once', () => {
     const plain = readdirSync(DIR).filter(name => name.endsWith('.txt') && !name.endsWith('.ansi.txt')).sort();
-    expect([...Object.keys(PAGES), ...NOT_PAGES].sort()).toEqual(plain);
+    expect([
+      ...Object.keys(PAGES), ...NOT_PAGES, ...Object.keys(KIMI_PAGES), ...KIMI_NOT_PAGES,
+      ...Object.keys(AGY_PAGES), ...AGY_NOT_PAGES,
+    ].sort()).toEqual(plain);
   });
 
   it.each(Object.entries(PAGES))('%s → %s, and holds queued input', (name, page) => {
@@ -104,9 +179,234 @@ describe('classifyStuckPage over real captures', () => {
     readdirSync(DIR).filter(name => name.endsWith('.ansi.txt')).sort(),
   )('%s (capture-pane -e) classifies like its plain capture', name => {
     const plain = name.replace(/\.ansi\.txt$/, '.txt');
-    expect(classifyStuckPage(fixture(name))).toBe(classifyStuckPage(fixture(plain)));
+    const family = fixtureFamily(name);
+    expect(classifyStuckPage(fixture(name), family)).toBe(classifyStuckPage(fixture(plain), family));
     // The pair must be a real page or a real non-page, never an unlisted one.
-    expect(plain in PAGES || NOT_PAGES.includes(plain)).toBe(true);
+    expect(plain in PAGES || NOT_PAGES.includes(plain) || plain in KIMI_PAGES || KIMI_NOT_PAGES.includes(plain)
+      || plain in AGY_PAGES || AGY_NOT_PAGES.includes(plain)).toBe(true);
+  });
+});
+
+describe('Kimi Code cache-expiry menu (kimi family) over real captures', () => {
+  it.each(Object.entries(KIMI_PAGES))('%s → %s, and holds queued input', (name, page) => {
+    const screen = fixture(name);
+    expect(classifyStuckPage(screen, 'kimi')).toBe(page);
+    expect(shouldHoldInputForStuckPage(screen, 'kimi')).toBe(true);
+    expect(matchKimiCacheExpiryMenu(screen)?.highlighted).toBe(KIMI_HIGHLIGHT[name]);
+  });
+
+  it.each(KIMI_NOT_PAGES)('%s is not the menu', name => {
+    expect(classifyStuckPage(fixture(name), 'kimi')).toBeUndefined();
+    expect(shouldHoldInputForStuckPage(fixture(name), 'kimi')).toBe(false);
+  });
+
+  // The worker also reads screens through xterm (snapshotToText,
+  // renderer.rawSnapshot): box-drawing rules blanked, runs of spaces collapsed.
+  it.each(Object.keys(KIMI_PAGES).concat(KIMI_NOT_PAGES))('%s classifies the same through the worker\'s xterm text', async name => {
+    const [cols, rows] = name.includes('80x24') ? [80, 24] : [160, 50];
+    const renderer = new TerminalRenderer(cols, rows);
+    try {
+      await renderer.writeAndFlush(fixture(name).replace(/\s+$/, '').split('\n').join('\r\n'));
+      const xtermText = renderer.rawSnapshot();
+      expect(xtermText).not.toContain('────');
+      expect(classifyStuckPage(xtermText, 'kimi')).toBe(KIMI_PAGES[name]);
+    } finally {
+      renderer.dispose();
+    }
+  });
+
+  it('pages are read per family: a Codex-family CLI never sees the Kimi menu, Kimi never a Codex page', () => {
+    for (const name of [...Object.keys(KIMI_PAGES), ...KIMI_NOT_PAGES]) {
+      expect(classifyStuckPage(fixture(name)), name).toBeUndefined();
+      expect(classifyStuckPage(fixture(name), 'codex-family'), name).toBeUndefined();
+    }
+    for (const name of [...Object.keys(PAGES), ...NOT_PAGES]) {
+      expect(classifyStuckPage(fixture(name), 'kimi'), name).toBeUndefined();
+    }
+  });
+
+  it.each([
+    // The menu quoted in the transcript, with the live composer below it.
+    (screen: string) => `${screen}\n ╭──────╮\n │ >    │\n ╰──────╯\n Never Ask  K3\n context: 1%\n extra row`,
+    // A row of the menu missing or reworded.
+    (screen: string) => screen.replace(/^.*Continue as-is.*$/m, ''),
+    (screen: string) => screen.replace('↑↓ navigate · Enter select · Esc cancel', 'Press enter to continue'),
+    (screen: string) => screen.replace('Cache expired — the next message', 'The docs say: Cache expired — the next message'),
+    (screen: string) => screen.split('\n').map(row => `> ${row}`).join('\n'),
+    // The title row anchor: rewording it must break the match.
+    (screen: string) => screen.replace(/^.*This session has been idle.*$/m, ' This session was idle for a while.'),
+    // The blank row between the hint and the body is part of the block. It
+    // must be FILLED, not deleted: deleting it shifts the block up a row and
+    // the title/hint anchors reject that first, so the blank-row anchor would
+    // never be the one biting. Filling it keeps every other row in place.
+    (screen: string) => screen.replace('Esc cancel\n\n  Cache expired', 'Esc cancel\n   (quoted note)\n  Cache expired'),
+  ])('does not recognise quoted, incomplete or reworded menus %#', change => {
+    const screen = change(fixture('kimi-2.5.3-cache-expiry-idle-submit.txt'));
+    expect(classifyStuckPage(screen, 'kimi')).toBeUndefined();
+  });
+
+  it('a menu quoted above the live composer is not recognised through the xterm text form either', async () => {
+    // capture-pane keeps the composer's box borders (covered by the raw case
+    // above); the worker's PTY renderer blanks them, so the quoted block is
+    // left with only its `>` input row plus the two live status rows below —
+    // which passes the footer row bound unless the composer input row is
+    // rejected. The quoted block is the menu's two rules and what is between
+    // them; the live screen's own status chrome is not part of that quote.
+    const fixtureRows = fixture('kimi-2.5.3-cache-expiry-idle-submit.txt').replace(/\s+$/, '').split('\n');
+    const ruleRows = fixtureRows.map((row, i) => (/^\s*─{8,}\s*$/.test(row) ? i : -1)).filter(i => i >= 0);
+    const quotedBlock = fixtureRows.slice(ruleRows[0], ruleRows[1]! + 1).join('\n');
+    const quoted = `${quotedBlock}\n ╭${'─'.repeat(156)}╮\n │ >${' '.repeat(155)}│\n ╰${'─'.repeat(156)}╯\n Never Ask  K3  /tmp/kimi-cache-probe\n context: 1% (201/256k)`;
+    const renderer = new TerminalRenderer(160, 50);
+    try {
+      await renderer.writeAndFlush(quoted.split('\n').join('\r\n'));
+      const xtermText = renderer.rawSnapshot();
+      expect(classifyStuckPage(xtermText, 'kimi')).toBeUndefined();
+      expect(matchKimiCacheExpiryMenu(xtermText)).toBeUndefined();
+    } finally {
+      renderer.dispose();
+    }
+  });
+
+  it('two pointers (a mid-redraw frame) is not read as the default row', () => {
+    const screen = fixture('kimi-2.5.3-cache-expiry-idle-submit.txt').replace('     Start a new session', '   ❯ Start a new session');
+    expect(matchKimiCacheExpiryMenu(screen)?.highlighted).toBeUndefined();
+    expect(classifyStuckPage(screen, 'kimi')).toBe('kimi cache expiry moved');
+  });
+
+  it('a card tail carries only the menu rows, never the conversation above it', () => {
+    const screen = fixture('kimi-2.5.3-cache-expiry-idle-submit.txt');
+    expect(screen).toContain('Summarize the project layout');
+    const tail = kimiCacheExpiryMenuTail(screen);
+    expect(tail).toContain('Cache expired — the next message re-sends the entire history at full price.');
+    expect(tail).toContain('❯ Compact and continue');
+    expect(tail).not.toContain('Summarize the project layout');
+    expect(tail).not.toContain('Never Ask');
+    expect(kimiCacheExpiryMenuTail(fixture('kimi-2.5.3-composer-after-esc-80x24.txt'))).toBe('');
+  });
+});
+
+describe('Antigravity pickers (antigravity family) over real captures', () => {
+  it.each(Object.entries(AGY_PAGES))('%s → %s, and holds queued input', (name, page) => {
+    const screen = fixture(name);
+    expect(classifyStuckPage(screen, 'antigravity')).toBe(page);
+    expect(shouldHoldInputForStuckPage(screen, 'antigravity')).toBe(true);
+  });
+
+  it.each(AGY_NOT_PAGES)('%s is not a picker', name => {
+    expect(classifyStuckPage(fixture(name), 'antigravity')).toBeUndefined();
+    expect(shouldHoldInputForStuckPage(fixture(name), 'antigravity')).toBe(false);
+  });
+
+  // The worker also reads screens through xterm (renderer.rawSnapshot): box
+  // rules blanked, runs of spaces collapsed.
+  it.each(Object.keys(AGY_PAGES).concat(AGY_NOT_PAGES))('%s classifies the same through the worker\'s xterm text', async name => {
+    const [cols, rows] = name.includes('60x24') ? [60, 24] : name.includes('44x30') ? [44, 30] : name.includes('120x24') ? [120, 24] : [120, 40];
+    const renderer = new TerminalRenderer(cols, rows);
+    try {
+      await renderer.writeAndFlush(fixture(name).replace(/\s+$/, '').split('\n').join('\r\n'));
+      const xtermText = renderer.rawSnapshot();
+      expect(xtermText).not.toContain('────');
+      expect(classifyStuckPage(xtermText, 'antigravity')).toBe(AGY_PAGES[name]);
+    } finally {
+      renderer.dispose();
+    }
+  });
+
+  it('pages are read per family: no other family sees an agy picker, agy sees no other family\'s page', () => {
+    for (const name of [...Object.keys(AGY_PAGES), ...AGY_NOT_PAGES]) {
+      expect(classifyStuckPage(fixture(name), 'codex-family'), name).toBeUndefined();
+      expect(classifyStuckPage(fixture(name), 'kimi'), name).toBeUndefined();
+    }
+    for (const name of [...Object.keys(PAGES), ...NOT_PAGES, ...Object.keys(KIMI_PAGES), ...KIMI_NOT_PAGES]) {
+      expect(classifyStuckPage(fixture(name), 'antigravity'), name).toBeUndefined();
+    }
+  });
+
+  const single = () => fixture('agy-1.5.12-question-single-select.txt');
+  it.each([
+    // The picker quoted in the transcript, the live composer and ready footer below it.
+    (screen: string) => screen.replace(/esc to cancel.*$/m, '─'.repeat(40) + '\n>\n' + '─'.repeat(40) + '\n? for shortcuts      Gemini 3.1 Pro · low'),
+    // A composer row under the busy status row is not the picker's screen.
+    (screen: string) => `${screen.trimEnd()}\n> typed\n`,
+    // The hint bar reworded or not directly above the busy status row.
+    (screen: string) => screen.replace('↑/↓ Navigate · → Next', 'Use the arrows · → Next'),
+    (screen: string) => screen.replace(/^(\s*↑\/↓ Navigate.*)$/m, '$1\n  a quoted note'),
+    // No busy status row under the bar (the bar is the bottom row).
+    (screen: string) => screen.replace(/^esc to cancel.*$/m, ''),
+    // Fewer than two numbered options left.
+    (screen: string) => screen.replace(/^\s*(?:>\s*)?[1-3]\. .*$/gm, ''),
+    // Neither the header + title nor the picker's own bottom rows.
+    (screen: string) => screen.replace('Question 1/2: Which', 'Which').replace('4. Write-in...', '4. Other')
+      .replace('enter Select · esc Skip', 'enter Select').replace('→ Next · ', ''),
+    // A header without its title is not enough either, without those bottom rows.
+    (screen: string) => screen.replace(/^Question$/m, '').replace('4. Write-in...', '4. Other')
+      .replace('enter Select · esc Skip', 'enter Select').replace('→ Next · ', ''),
+    // Not during a turn: the ready footer instead of the busy status row.
+    (screen: string) => screen.replace(/esc to cancel/, '? for shortcuts'),
+  ])('does not recognise quoted, incomplete or reworded question pickers %#', change => {
+    const screen = change(single());
+    expect(screen).not.toBe(single());
+    expect(classifyStuckPage(screen, 'antigravity')).toBeUndefined();
+  });
+
+  it.each([
+    (screen: string) => screen.replace('↑/↓ Navigate · tab Amend', 'Navigate · tab Amend'),
+    (screen: string) => screen.replace(/^\s*(?:>\s*)?\d+\. (?:Yes|No).*$/gm, ''),
+    // The write-in bar belongs to the question picker only.
+    (screen: string) => screen.replace(/^\s*↑\/↓ Navigate.*$/m, '  enter Submit All · esc Back'),
+  ])('does not recognise an incomplete permission dialog %#', change => {
+    const screen = change(fixture('agy-1.5.12-permission-run-command.txt'));
+    expect(classifyStuckPage(screen, 'antigravity')).toBeUndefined();
+  });
+
+  it.each([
+    // Without its header, a list is the question picker only by its own bottom
+    // rows: the write-in row above the bar, or a question-only hint.
+    (screen: string) => screen.replace('31. Write-in...', '31. Option number 31').replace('enter Select · esc Skip', 'enter Select'),
+    (screen: string) => screen.replace(/^\s*\d+\. Option number \d+$/gm, '').replace('31. Write-in...', ''),
+  ])('a list without its header and without the picker\'s own bottom rows is not the question picker %#', change => {
+    const screen = change(fixture('agy-1.5.12-question-header-scrolled-off-120x24.txt'));
+    expect(screen).not.toBe(fixture('agy-1.5.12-question-header-scrolled-off-120x24.txt'));
+    expect(classifyStuckPage(screen, 'antigravity')).toBeUndefined();
+  });
+
+  it('with its header or title off screen the picker is known by its bottom rows', () => {
+    for (const screen of [
+      single().replace('Question 1/2: Which', 'Which'),
+      single().replace(/^Question$/m, ''),
+    ]) expect(classifyStuckPage(screen, 'antigravity')).toBe('antigravity question');
+  });
+
+  it.each(['agy-1.5.12-permission-run-command.txt', 'agy-1.5.12-permission-run-command-44x30.txt'])(
+    '%s: the command the dialog asks about never leaves the terminal, even wrapped over rows',
+    name => {
+      const tail = antigravityBlockingPageTail(fixture(name));
+      expect(tail).toContain('Requesting permission for:');
+      expect(tail).toContain('‹hidden›');
+      expect(tail).not.toContain('/tmp/agy-probe-perm-marker-xyz');
+      expect(tail).not.toContain('echo');
+      expect(tail).toMatch(/Run this command\?/);
+    },
+  );
+
+  it('the narrow-pane captures really carry a cut hint bar, and the statusLine capture a row under the status row', () => {
+    expect(fixture('agy-1.5.12-question-44x30.txt')).toMatch(/enter Select · esc\s*$/m);
+    expect(fixture('agy-1.5.12-question-multi-select-44x30.txt')).toMatch(/space Toggle · ent\s*$/m);
+    expect(fixture('agy-1.5.12-question-statusline.txt')).toMatch(/esc to cancel.*\nSTATUSLINE_PROBE_ROW/);
+  });
+
+  it('a card tail carries only the picker rows, never the conversation above it', () => {
+    const tail = antigravityBlockingPageTail(single());
+    expect(tail).toContain('Question 1/2: Which database should we use?');
+    expect(tail).toContain('> 1. (Recommended) PostgreSQL');
+    expect(tail).not.toContain('please ask me');
+    expect(tail).not.toContain('Antigravity CLI');
+    expect(tail).not.toContain('esc to cancel');
+    const perm = antigravityBlockingPageTail(fixture('agy-1.5.12-permission-run-command.txt'));
+    expect(perm).toContain('Requesting permission for:');
+    expect(perm).toContain('4. No, cancel');
+    expect(perm).not.toContain('run it');
+    expect(antigravityBlockingPageTail(fixture('agy-1.5.12-composer-after-answer.txt'))).toBe('');
   });
 });
 

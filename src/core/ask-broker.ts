@@ -164,6 +164,8 @@ export interface AskAnswerActor {
   botSender?: boolean;
   /** Bot-locked union (evaluateTalk teamBot leg / evaluateBotTalk). */
   senderUnionId?: string;
+  /** Feishu-stamped bot app_id, paired with senderUnionId for external roster entries. */
+  senderAppId?: string;
   /** Raw sender union (evaluateTalk teamMember leg — may be a human union). */
   memberUnionId?: string;
 }
@@ -203,11 +205,20 @@ function invalidateClosedExplicitAsk(ask: InternalPending | undefined): void {
   }
 }
 
+function expireAskAtDeadline(ask: InternalPending | undefined): void {
+  if (ask && !ask.settled && ask.timeoutMs !== 0
+    && (!ask.timeoutStartsAfterDelivery || ask.timeoutStartedAt !== undefined)
+    && Date.now() >= ask.deadlineAt) {
+    settle(ask.askId, { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
+  }
+}
+
 function gateAskDecision(
   ask: InternalPending | undefined,
   input: { nonce?: string; by: string; actor?: AskAnswerActor },
 ): Exclude<AskClickOutcome, 'accepted' | 'toggled' | 'needs_empty_confirm'> | 'ready' {
   invalidateClosedExplicitAsk(ask);
+  expireAskAtDeadline(ask);
   const gate = gateHumanDecisionAttempt({
     exists: !!ask,
     nonceMatches: !!ask && (input.nonce === undefined || ask.nonce === input.nonce),
@@ -493,6 +504,7 @@ function sendCardForAsk(ask: InternalPending): void {
         const cur = pending.get(ask.askId);
         if (cur) {
           cur.cardMessageId = messageId;
+          cur.cardDeliveredAt ??= Date.now();
           // The caller can disconnect while send is in flight. The earlier
           // standalone-card notification had no messageId to patch; update it
           // now. Reply-card settlement does not need that id and is idempotent.
@@ -628,6 +640,7 @@ function persistFromInternal(ask: InternalPending, strict = false): void {
     timeoutStartsAfterDelivery: ask.timeoutStartsAfterDelivery,
     timeoutStartedAt: ask.timeoutStartedAt,
     cardMessageId: ask.cardMessageId,
+    cardDeliveredAt: ask.cardDeliveredAt,
     replyCardTarget: ask.replyCardTarget,
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
     ...(ask.answeredResult ? { answeredResult: ask.answeredResult, answeredAt: ask.settledAt ?? Date.now() } : {}),
@@ -1089,6 +1102,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       timeoutStartsAfterDelivery: p.timeoutStartsAfterDelivery === true,
       timeoutStartedAt: p.timeoutStartedAt,
       cardMessageId: p.cardMessageId,
+      cardDeliveredAt: p.cardDeliveredAt,
       replyCardTarget: p.replyCardTarget,
       // A stashed-answer restore is terminal-but-unclaimed: settled=true so
       // gcSettled/other paths treat it as done, dormant=true so a hook re-POST
@@ -1327,6 +1341,24 @@ export function invalidateExplicitAsk(input: CreateAskInput, reason: string): vo
   }
 }
 
+export function explicitAskSnapshot(input: CreateAskInput): PendingAsk | undefined {
+  const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
+  const ask = findByKey(key);
+  return ask?.originKind === 'host_explicit' && sameIdentity(ask, input) ? snapshot(ask) : undefined;
+}
+
+export function retireExplicitAsk(input: CreateAskInput, reason: string): AskResult | undefined {
+  const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
+  const ask = findByKey(key);
+  if (!ask || ask.originKind !== 'host_explicit' || ask.timeoutMs !== 0 || !sameIdentity(ask, input)) return undefined;
+  if (ask.terminalResult) return ask.terminalResult;
+  if (!persistStore) throw new Error('explicit Ask retirement requires durable storage');
+  const result: AskResult = { kind: 'invalidated', reason, selected: null, by: null, comment: null, timedOut: false };
+  persistFromInternal({ ...ask, answeredResult: result, settledAt: Date.now() }, true);
+  settle(ask.askId, result);
+  return ask.terminalResult;
+}
+
 export function releaseExplicitAskHandoff(input: CreateAskInput): void {
   const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
   const ask = findByKey(key);
@@ -1468,6 +1500,7 @@ export function submitAskFromDesktop(args: {
   gcSettled();
   const ask = pending.get(args.askId);
   invalidateClosedExplicitAsk(ask);
+  expireAskAtDeadline(ask);
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
 

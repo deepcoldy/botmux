@@ -31,6 +31,9 @@ import {
   shouldHoldInputForStuckPage,
 } from '../src/utils/stuck-detector.js';
 import { isAllowedStuckKeySequence, redactStuckPageTail, stuckScreenTail } from '../src/core/stuck-page-catalog.js';
+import { antigravityBlockingPageTail } from '../src/utils/antigravity-blocking-page.js';
+import { isKimiCacheExpiryPage } from '../src/utils/stuck-detector.js';
+import { kimiCacheExpiryMenuTail } from '../src/utils/kimi-cache-expiry-menu.js';
 import { detectCliStartupBlocker, screenMayShowCredential } from '../src/core/cli-startup-blocker.js';
 import { diagnoseSubmitFailure } from '../src/services/submit-failure-diagnosis.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from '../src/utils/stuck-key-guard.js';
@@ -45,6 +48,15 @@ const TRAEX_COMPOSER = page('traex-0.213.1-composer-after-hooks-esc.txt');
 const CODEX_L2 = page('codex-0.164.0-sessionstart-detail-l2.txt');
 const CODEX_STARTUP = page('codex-0.164.0-sessionstart-startup-menu.txt');
 const CODEX_COMPOSER = page('codex-0.164.0-startup-menu-after-esc.txt');
+const KIMI_MENU = page('kimi-2.5.3-cache-expiry-idle-submit.txt');
+const KIMI_MENU_MOVED = page('kimi-2.5.3-cache-expiry-highlight-new-session.txt');
+const KIMI_COMPOSER = page('kimi-2.5.3-composer-after-compact-resend.txt');
+const AGY_QUESTION = page('agy-1.5.12-question-single-select.txt');
+const AGY_QUESTION_NEXT = page('agy-1.5.12-question-after-esc-skip.txt');
+const AGY_PERMISSION = page('agy-1.5.12-permission-run-command.txt');
+const AGY_PERMISSION_NARROW = page('agy-1.5.12-permission-run-command-44x30.txt');
+const AGY_HOOK_WAITING = page('agy-1.5.12-hook-waiting.txt');
+const AGY_COMPOSER = page('agy-1.5.12-composer-after-skip-all.txt');
 /** What a frame looks like while codex repaints its startup menu (rows cleared
  *  and redrawn): the heading is there, the options are not yet. */
 const GROK_LOGIN = readFileSync(join(process.cwd(), 'test/fixtures/startup-blockers/grok-1.0.70-login.txt'), 'utf-8');
@@ -99,6 +111,7 @@ function harness(cliId: CliId, opts: {
   /** flushPending runs the real hook-review admission check before it
    *  "writes" the head item (instead of only counting calls). */
   gateFlush?: boolean;
+  kimiController?: { menuShown: () => void; menuGone: () => void; kick: () => void };
 } = {}): Harness {
   const sent: any[] = [];
   const logs: string[] = [];
@@ -160,6 +173,10 @@ function harness(cliId: CliId, opts: {
     screenMayShowCredential,
     diagnoseSubmitFailure,
     stuckDetector: { arm: () => { armCount += 1; } },
+    isKimiCacheExpiryPage,
+    kimiCacheExpiryMenuTail,
+    /** core/kimi-cache-expiry.ts controller: records what the hold tells it. */
+    kimiCacheExpiry: opts.kimiController ?? undefined,
   };
   for (const name of WORKER_FUNCTIONS) scope[name] = loadWorkerFunction(name, scope);
   const runTimers = () => {
@@ -195,6 +212,335 @@ describe('input hold scope follows the adapter declaration', () => {
     expect(h.scope.hookReviewInputHold).toBe(false);
     h.fn('refreshHookReviewInputHold')(CODEX_L2);
     expect(h.scope.hookReviewInputHold).toBe(true);
+  });
+});
+
+describe('Kimi Code: its cache-expiry menu is its own page family', () => {
+  const controller = () => {
+    const calls: string[] = [];
+    return {
+      calls,
+      menuShown: () => { calls.push('shown'); },
+      menuGone: () => { calls.push('gone'); },
+      kick: () => { calls.push('kick'); },
+    };
+  };
+
+  it('Kimi holds queued input on the menu (pointer anywhere) and on no Codex-family page', () => {
+    for (const screen of [KIMI_MENU, KIMI_MENU_MOVED]) {
+      const h = harness('kimi');
+      h.fn('refreshHookReviewInputHold')(screen);
+      expect(h.scope.hookReviewInputHold).toBe(true);
+    }
+    for (const screen of [TRAEX_STARTUP, TRAEX_L1, CODEX_L2, TRAEX_MIGRATION, TRAEX_LOCK, KIMI_COMPOSER]) {
+      const h = harness('kimi');
+      h.fn('refreshHookReviewInputHold')(screen);
+      expect(h.scope.hookReviewInputHold).toBe(false);
+    }
+  });
+
+  it.each(['codex', 'traex', 'claude-code', 'opencode', 'pi'] as const)('%s never holds on the Kimi menu', cliId => {
+    const h = harness(cliId);
+    h.fn('refreshHookReviewInputHold')(KIMI_MENU);
+    expect(h.scope.hookReviewInputHold).toBe(false);
+  });
+
+  it('the hold\'s lifecycle is the menu event: shown on a page, gone on a settled screen without it', () => {
+    const c = controller();
+    const h = harness('kimi', { screen: KIMI_MENU, kimiController: c });
+    h.fn('refreshHookReviewInputHold')(KIMI_MENU);
+    h.fn('refreshHookReviewInputHold')(KIMI_MENU);
+    expect(c.calls).toEqual(['shown']);
+    // A frame without the menu only schedules the settled re-capture.
+    h.scope.screen = KIMI_COMPOSER;
+    h.fn('refreshHookReviewInputHold')(KIMI_COMPOSER);
+    expect(c.calls).toEqual(['shown']);
+    h.runTimers();
+    expect(h.scope.hookReviewInputHold).toBe(false);
+    expect(c.calls).toEqual(['shown', 'gone']);
+  });
+
+  it('a message held off the menu is handed to the menu event, not carded directly', () => {
+    const c = controller();
+    const h = harness('kimi', { screen: KIMI_MENU, pending: [{ turnId: 'turn_held' }], kimiController: c });
+    h.fn('refreshHookReviewInputHold')(KIMI_MENU);
+    h.fn('notifyHookReviewInputHold')();
+    expect(c.calls).toEqual(['shown', 'kick']);
+    expect(h.sent).toEqual([]);
+  });
+
+  it('only the menu rows leave the terminal as a card tail', () => {
+    const h = harness('kimi', { screen: KIMI_MENU });
+    const tail = h.fn('shareableStuckScreenTail')(KIMI_MENU);
+    expect(tail).toBe(kimiCacheExpiryMenuTail(KIMI_MENU));
+    expect(tail).toContain('❯ Compact and continue');
+    expect(tail).not.toContain('Summarize the project layout');
+    expect(h.fn('shareableStuckScreenTail')(KIMI_COMPOSER)).toBe('');
+    // Another CLI never shares the Kimi menu.
+    expect(harness('codex').fn('shareableStuckScreenTail')(KIMI_MENU)).toBe('');
+  });
+});
+
+describe('Antigravity: its pickers are their own page family', () => {
+  // agy's question picker (the ask hook could not take the question) and its
+  // permission dialog read typed input as keystrokes: digits jump to an
+  // option, Enter picks the highlighted one. With type-ahead on, a queued
+  // message would be typed straight into them.
+  it('agy holds queued input on its question picker and permission dialog, not on the composer or while the hook waits', () => {
+    for (const screen of [AGY_QUESTION, AGY_QUESTION_NEXT, AGY_PERMISSION]) {
+      const h = harness('antigravity');
+      h.fn('refreshHookReviewInputHold')(screen);
+      expect(h.scope.hookReviewInputHold).toBe(true);
+    }
+    for (const screen of [AGY_HOOK_WAITING, AGY_COMPOSER, CODEX_L2, KIMI_MENU]) {
+      const h = harness('antigravity');
+      h.fn('refreshHookReviewInputHold')(screen);
+      expect(h.scope.hookReviewInputHold).toBe(false);
+    }
+  });
+
+  it.each(['codex', 'kimi', 'claude-code', 'traex'] as const)('%s never holds on an agy picker', cliId => {
+    const h = harness(cliId);
+    h.fn('refreshHookReviewInputHold')(AGY_QUESTION);
+    expect(h.scope.hookReviewInputHold).toBe(false);
+  });
+
+  it('a held message waits behind the picker and raises its card with the picker rows only', () => {
+    const h = harness('antigravity', { screen: AGY_QUESTION, pending: [{ turnId: 'turn_held', dispatchAttempt: 2 }], gateFlush: true });
+    h.scope.lastAnalyzerSnapshot = AGY_QUESTION;
+    expect(h.fn('hookReviewHoldsQueuedWrite')()).toBe(true);
+    expect(h.delivered()).toBe(0);
+    const cards = h.sent.filter(m => m.type === 'stuck_warning');
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      reason: 'input_held', matchedPattern: 'antigravity question', turnId: 'turn_held', dispatchAttempt: 2,
+    });
+    expect(cards[0].screenTail).toContain('Question 1/2: Which database should we use?');
+    // Only the picker: not the transcript rows above it, not agy's status row.
+    expect(cards[0].screenTail).not.toContain('? Which features to enable?');
+    expect(cards[0].screenTail).not.toContain('esc to cancel');
+    // The card's one key is agy's Skip; Enter (pick the highlighted row) never.
+    expect(isAllowedStuckKeySequence('antigravity question', ['Escape'])).toBe(true);
+    expect(isAllowedStuckKeySequence('antigravity question', ['Enter'])).toBe(false);
+    expect(isAllowedStuckKeySequence('antigravity permission', ['Enter'])).toBe(false);
+    expect(isAllowedStuckKeySequence('antigravity permission', ['Escape'])).toBe(false);
+  });
+
+  it('after the card\'s Esc: the next question gets its own card; the composer releases the message exactly once', () => {
+    const h = harness('antigravity', { screen: AGY_QUESTION, pending: [{ turnId: 'turn_held' }], gateFlush: true });
+    h.scope.lastAnalyzerSnapshot = AGY_QUESTION;
+    h.fn('hookReviewHoldsQueuedWrite')();
+    // Esc skipped question 1 of 2: agy shows question 2.
+    h.scope.screen = AGY_QUESTION_NEXT;
+    h.scope.lastAnalyzerSnapshot = AGY_QUESTION_NEXT;
+    h.fn('reevaluateHoldAfterStuckKey')(AGY_QUESTION_NEXT);
+    expect(h.sent.filter(m => m.type === 'stuck_warning')).toHaveLength(2);
+    expect(h.delivered()).toBe(0);
+    // Esc on the last question: the composer is back.
+    h.scope.screen = AGY_COMPOSER;
+    h.scope.lastAnalyzerSnapshot = AGY_COMPOSER;
+    h.fn('reevaluateHoldAfterStuckKey')(AGY_COMPOSER);
+    h.runTimers();
+    expect(h.scope.hookReviewInputHold).toBe(false);
+    expect(h.delivered()).toBe(1);
+    expect(h.fn('hookReviewHoldsQueuedWrite')()).toBe(false);
+    expect(h.delivered()).toBe(1);
+  });
+
+  it('the card tail masks credential shapes and home paths on the picker rows, and the whole permission command', () => {
+    const h = harness('antigravity');
+    const question = AGY_QUESTION.split('Which database should we use?').join('Use ghp_FAKEfake0000000000 or /home/alice/db?');
+    const tail = h.fn('shareableStuckScreenTail')(question);
+    expect(tail).toContain('Question 1/2: Use');
+    expect(tail).not.toContain('ghp_FAKEfake0000000000');
+    expect(tail).not.toContain('alice');
+    const permission = AGY_PERMISSION.replace('touch /tmp/agy-probe-perm-marker-xyz && echo done',
+      'curl -H "Authorization: Bearer eyJFAKEfake0000.FAKEfake0000" https://u:pw@example.invalid');
+    const permissionTail = h.fn('shareableStuckScreenTail')(permission);
+    expect(permissionTail).toContain('Requesting permission for:');
+    expect(permissionTail).not.toMatch(/Bearer|eyJFAKE|pw@|example\.invalid/);
+  });
+
+  it.each([
+    {
+      name: 'an option-shaped first command row',
+      fixture: AGY_PERMISSION,
+      original: '   touch /tmp/agy-probe-perm-marker-xyz && echo done',
+      command: [
+        '   1. Yes, this is ordinary document text',
+        '   opaque-private-value-7f39c2',
+        '   echo command-start',
+      ],
+    },
+    {
+      name: 'an option-shaped middle command row',
+      fixture: AGY_PERMISSION,
+      original: '   touch /tmp/agy-probe-perm-marker-xyz && echo done',
+      command: [
+        "   cat <<'EOF'",
+        '   1. Yes, this is ordinary document text',
+        '   opaque-private-value-7f39c2',
+        '   EOF',
+      ],
+    },
+    {
+      name: 'question-shaped command rows',
+      fixture: AGY_PERMISSION,
+      original: '   touch /tmp/agy-probe-perm-marker-xyz && echo done',
+      command: [
+        '   Question',
+        '   Question 1/1: this is ordinary document text',
+        '   1. First document item',
+        '   2. Second document item',
+        '   opaque-private-value-7f39c2',
+      ],
+    },
+    {
+      name: 'wrapped command rows on a 44-column pane',
+      fixture: AGY_PERMISSION_NARROW,
+      original: '   touch\n/tmp/agy-probe-perm-marker-xyz && echo\ndone',
+      command: [
+        "   cat <<'EOF'",
+        '   1. Yes, this is ordinary',
+        'document text continued',
+        'opaque-private-value-7f39c2',
+        'EOF',
+      ],
+    },
+  ])('the card tail masks the whole permission command with $name', ({ fixture, original, command }) => {
+    const screen = fixture.replace(original, command.join('\n'));
+    expect(screen).not.toBe(fixture);
+    expect(classifyStuckPage(screen, 'antigravity')).toBe('antigravity permission');
+    const unboundedTail = antigravityBlockingPageTail(screen);
+    for (const row of command) expect(unboundedTail).not.toContain(row);
+    expect(unboundedTail.match(/‹hidden›/g)).toHaveLength(command.length);
+    const h = harness('antigravity');
+    const tail = h.fn('shareableStuckScreenTail')(screen);
+    expect(tail).toContain('Run this command?');
+    expect(tail).toContain('4. No, cancel');
+    expect(tail).not.toContain('opaque-private-value-7f39c2');
+    expect(tail).not.toContain('1. Yes, this is ordinary');
+    for (const row of command) expect(tail).not.toContain(row);
+    expect(tail).toContain('‹hidden›');
+  });
+
+  it('a permission page with its request and prompt scrolled off shares only the option block', () => {
+    const screen = AGY_PERMISSION.replace(
+      /Requesting permission for:\n[\s\S]*?Run this command\?\n/,
+      '   opaque-private-value-7f39c2\n',
+    );
+    expect(classifyStuckPage(screen, 'antigravity')).toBe('antigravity permission');
+    const unboundedTail = antigravityBlockingPageTail(screen);
+    expect(unboundedTail).toContain('1. Yes, run command');
+    expect(unboundedTail).toContain('4. No, cancel');
+    expect(unboundedTail).not.toContain('opaque-private-value-7f39c2');
+    expect(unboundedTail).not.toContain('Run this command?');
+    const h = harness('antigravity');
+    expect(h.fn('shareableStuckScreenTail')(screen)).not.toContain('opaque-private-value-7f39c2');
+  });
+
+  it('on a non-authoritative screen the hold stays and the notice names agy\'s picker, not the Codex hook menu', () => {
+    const h = harness('antigravity', { screen: AGY_PERMISSION, authoritative: false, pending: [{ turnId: 't' }] });
+    h.fn('refreshHookReviewInputHold')(AGY_PERMISSION);
+    expect(h.scope.hookReviewInputHold).toBe(true);
+    h.fn('notifyHookReviewInputHold')();
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0].type).toBe('user_notify');
+    expect(h.sent[0].message).toContain('选择菜单');
+    expect(h.sent[0].message).not.toContain('Hook');
+  });
+});
+
+describe('Kimi Code: the screen-idle veto and the IPC switch', () => {
+  const vetoScope = (opts: { capture: () => string; hold?: boolean }) => {
+    const calls = { resets: 0, kicks: 0 };
+    const backend = { captureViewport: opts.capture };
+    const scope: Record<string, any> = {
+      cliAdapter: createCliAdapterSync('kimi'),
+      backend,
+      backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+      captureBackendScreen: (be: any) => be.captureViewport(),
+      classifyStuckPage,
+      isKimiCacheExpiryPage,
+      hookReviewInputHold: opts.hold ?? false,
+      hookReviewInputHoldSnapshot: opts.hold ? KIMI_MENU : '',
+      idleDetector: { reset: () => { calls.resets += 1; } },
+      kimiCacheExpiry: { kick: () => { calls.kicks += 1; } },
+      refreshHookReviewInputHold: () => {},
+      log: () => {},
+    };
+    const veto = loadWorkerFunction<(be: unknown) => boolean>('kimiCacheExpiryHoldsIdle', scope);
+    return { veto: () => veto(backend), calls };
+  };
+
+  it('vetoes a quiet-screen idle while the menu is up, and lets the composer through', () => {
+    const up = vetoScope({ capture: () => KIMI_MENU });
+    expect(up.veto()).toBe(true);
+    expect(up.calls).toEqual({ resets: 1, kicks: 1 });
+    expect(vetoScope({ capture: () => KIMI_COMPOSER }).veto()).toBe(false);
+  });
+
+  it.each([
+    ['throws', () => { throw new Error('capture-pane failed'); }],
+    ['comes back blank', () => ''],
+  ])('a capture that %s fails closed while the hold stands on the menu', (_label, capture) => {
+    const held = vetoScope({ capture, hold: true });
+    expect(held.veto()).toBe(true);
+    expect(held.calls.resets).toBe(1);
+    // Without a standing hold there is no evidence of a menu: not vetoed.
+    expect(vetoScope({ capture, hold: false }).veto()).toBe(false);
+  });
+
+  it('the automatic Enter goes through the stuck-key guard and asks the veto right before writing', async () => {
+    const writes: string[][] = [];
+    const backend = {};
+    const scope: Record<string, any> = {
+      backend,
+      cliLifetimeNonce: 4,
+      renderCols: 160,
+      renderRows: 50,
+      currentBotmuxTurnId: 'turn_2',
+      currentBotmuxDispatchAttempt: undefined,
+      screen: KIMI_MENU,
+      kimiStuckKeyCapture: async () => ({ content: scope.screen }),
+      classifyStuckPage,
+      handleTuiKeys: async (keys: string[]) => { writes.push(keys); return true; },
+      processStuckWarningTuiKeys,
+      isAllowedStuckKeySequence,
+      log: () => {},
+    };
+    const press = loadWorkerFunction<(lifetime: number, veto: () => string | undefined) => Promise<{ kind: string }>>('pressKimiCacheExpiryCompact', scope);
+    expect(await press(4, () => 'interrupted')).toEqual({ kind: 'expired' });
+    expect(writes).toEqual([]);
+    // Pointer moved, or a CLI replaced since the decision: refused as well.
+    scope.screen = KIMI_MENU_MOVED;
+    expect(await press(4, () => undefined)).toEqual({ kind: 'expired' });
+    scope.screen = KIMI_MENU;
+    expect(await press(3, () => undefined)).toEqual({ kind: 'expired' });
+    expect(writes).toEqual([]);
+    expect(await press(4, () => undefined)).toEqual({ kind: 'written' });
+    expect(writes).toEqual([['Enter']]);
+  });
+
+  it('counts interrupt-class keys and exact-turn interrupts at the IPC switch, and applies the live setting', async () => {
+    const scope: Record<string, any> = {
+      cliInterruptGeneration: 0,
+      kimiCacheExpiryAutoCompact: false,
+      isCriticalInterruptKey: (key: string) => key === 'ctrlc' || key === 'esc',
+      handleTermAction: async () => {},
+      handleExactTurnInterrupt: async () => {},
+      log: () => {},
+    };
+    const termAction = loadWorkerMessageHandler('term_action', scope);
+    for (const key of ['esc', 'up', 'ctrlc', 'enter']) await termAction({ type: 'term_action', key });
+    expect(scope.cliInterruptGeneration).toBe(2);
+    await loadWorkerMessageHandler('interrupt_turn', scope)({ type: 'interrupt_turn', requestId: 'r', turnId: 't' });
+    expect(scope.cliInterruptGeneration).toBe(3);
+    const setting = loadWorkerMessageHandler('kimi_cache_expiry_auto_compact', scope);
+    await setting({ type: 'kimi_cache_expiry_auto_compact', enabled: true });
+    expect(scope.kimiCacheExpiryAutoCompact).toBe(true);
+    await setting({ type: 'kimi_cache_expiry_auto_compact', enabled: false });
+    expect(scope.kimiCacheExpiryAutoCompact).toBe(false);
   });
 });
 
@@ -257,6 +603,17 @@ describe('a held message raises the stuck card', () => {
     expect(h.sent).toHaveLength(1);
     expect(h.sent[0].type).toBe('user_notify');
     expect(h.sent[0].message).toContain('TRAE CLI (traex)');
+  });
+
+  it('a Kimi hold on a non-authoritative screen names the cache-expiry menu, not the Codex hook menu', () => {
+    const h = harness('kimi', { screen: KIMI_MENU, authoritative: false, pending: [{ turnId: 't' }] });
+    h.fn('refreshHookReviewInputHold')(KIMI_MENU);
+    expect(h.scope.hookReviewInputHold).toBe(true);
+    h.fn('notifyHookReviewInputHold')();
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0].type).toBe('user_notify');
+    expect(h.sent[0].message).toContain('缓存过期');
+    expect(h.sent[0].message).not.toContain('Hook');
   });
 
   it('a CLI without the declaration never gets a key card', () => {

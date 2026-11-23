@@ -1,4 +1,5 @@
 import { parseSandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
+import { sandboxWithholdsBotSecret } from '../../adapters/cli/sandbox-mode.js';
 /**
  * Shared v3 bot resolution — selector → BotConfig → BotSnapshot.
  *
@@ -13,6 +14,7 @@ import { parseSandboxNetworkPolicy } from '../../core/sandbox-network-policy.js'
  */
 
 import { normalizeEnvPolicy } from '../../core/env-policy.js';
+import { normalizeCredentialsSourceDir } from '../../services/cli-credential-source.js';
 import { effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
 import {
   newSessionCodexInstanceState,
@@ -70,6 +72,11 @@ function sandboxPathsSnapshot(
 /** BotConfig → BotSnapshot (the runtime-frozen, secret-free per-node identity). */
 export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotSnapshot {
   if (bot.codexProfile) throw new Error('Codex profile is not supported by v3 workflow; choose a Bot without a profile');
+  // Workflow workers have no per-owner session, so they would get the bot-wide
+  // BOT_HOME / attachment bucket — exactly what assistant mode isolates.
+  if (bot.assistantMode === true) {
+    throw new Error(`v3 workflow does not support personal-assistant mode; bot "${bot.name ?? bot.larkAppId}" has assistantMode=true`);
+  }
   if (bot.disableCliBypass === true) {
     throw new Error(
       `v3 workflow requires CLI bypass permissions, but bot "${bot.name ?? bot.larkAppId}" ` +
@@ -77,12 +84,14 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     );
   }
   const instance = newSessionCodexInstanceState(bot, 'workflow');
+  const credentialsSourceDir = normalizeCredentialsSourceDir(bot.credentialsSourceDir);
   return {
     ...(instance.cliInstanceBinding ? { cliInstanceBinding: instance.cliInstanceBinding, cliRuntime: instance.cliRuntime } : {}),
     larkAppId: bot.larkAppId,
     ...(bot.envPolicy ? { envPolicy: normalizeEnvPolicy(bot.envPolicy) } : {}),
     cliId: bot.cliId,
     ...((instance.cliPathOverride ?? bot.cliPathOverride) ? { cliPathOverride: instance.cliPathOverride ?? bot.cliPathOverride } : {}),
+    ...(credentialsSourceDir ? { credentialsSourceDir } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
     ...(bot.sandbox === true || bot.sandbox === 'oncall'
@@ -97,6 +106,7 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     ...(bot.sandboxHidePaths?.length ? { sandboxHidePaths: [...bot.sandboxHidePaths] } : {}),
     ...(bot.sandboxReadonlyPaths?.length ? { sandboxReadonlyPaths: [...bot.sandboxReadonlyPaths] } : {}),
     ...(bot.sandboxNetwork === false ? { sandboxNetwork: false } : {}),
+    ...(sandboxWithholdsBotSecret(bot) ? { sandboxWithholdBotSecret: true as const } : {}),
     ...(bot.sandboxNetworkPolicy ? { sandboxNetworkPolicy: structuredClone(bot.sandboxNetworkPolicy) } : {}),
     workingDir: botWorkingDir(bot, workingDirOverride),
   };
@@ -163,6 +173,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'cliRuntime',
     'cliId',
     'cliPathOverride',
+    'credentialsSourceDir',
     'wrapperCli',
     'model',
     'reasoningEffort',
@@ -173,6 +184,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'sandboxReadonlyPaths',
     'sandboxNetwork',
     'sandboxNetworkPolicy',
+    'sandboxWithholdBotSecret',
     'workingDir',
   ]);
   const snapshots = new Map<string, BotSnapshot>();
@@ -182,6 +194,9 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     }
     const obj = value as Record<string, unknown>;
     if (obj.envPolicy !== undefined) normalizeEnvPolicy(obj.envPolicy);
+    if (obj.sandboxWithholdBotSecret !== undefined && obj.sandboxWithholdBotSecret !== true) {
+      throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].sandboxWithholdBotSecret must be true when present`);
+    }
     const extra = Object.keys(obj).filter((field) => !allowed.has(field));
     if (extra.length > 0) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}] has unsupported key(s): ${extra.join(', ')}`);
@@ -202,6 +217,10 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string`);
       }
     }
+    // Snapshot files are operator-editable artifacts: never trust their raw
+    // spelling. Normalize again so replay gets the same absolute, ~-expanded
+    // source path as the ordinary worker-pool path (and relative paths refuse).
+    const credentialsSourceDir = normalizeCredentialsSourceDir(obj.credentialsSourceDir);
     if (obj.reasoningEffort !== undefined && !isCodexReasoningEffort(obj.reasoningEffort)) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].reasoningEffort is invalid`);
     }
@@ -258,6 +277,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       ...(obj.envPolicy ? { envPolicy: normalizeEnvPolicy(obj.envPolicy) } : {}),
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
+      ...(credentialsSourceDir ? { credentialsSourceDir } : {}),
       ...(obj.wrapperCli !== undefined ? { wrapperCli: obj.wrapperCli as string } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
       ...(obj.reasoningEffort !== undefined
@@ -273,6 +293,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       ...(obj.sandboxReadonlyPaths !== undefined ? { sandboxReadonlyPaths: [...obj.sandboxReadonlyPaths as string[]] } : {}),
       ...(obj.sandboxNetwork !== undefined ? { sandboxNetwork: obj.sandboxNetwork as boolean } : {}),
       ...(obj.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(obj.sandboxNetworkPolicy) } : {}),
+      ...(obj.sandboxWithholdBotSecret === true ? { sandboxWithholdBotSecret: true as const } : {}),
       workingDir: obj.workingDir,
     });
   }

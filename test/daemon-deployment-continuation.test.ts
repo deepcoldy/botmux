@@ -16,6 +16,7 @@ import { WrittenInputLedger } from '../src/services/prompt-submission-match.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { controllerForSession } from '../src/core/session-controller.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
+import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import { cancelDeploymentContinuation, claimDeploymentContinuation, deploymentContinuationCandidate, recordDeploymentContinuation } from '../src/services/deployment-continuation.js';
 import { codexCapacityRecoveryCli } from '../src/services/codex-app-failure.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -72,7 +73,7 @@ function manualInput(failPersistence: boolean) {
   const code = ts.transpileModule(declaration.getText(pool).replace(/^export /, ''), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
   }).outputText;
-  const scope = {
+  const scope: Record<string, any> = {
     controllerForSession,
     cancelDeploymentContinuation, deploymentContinuationAuthority,
     sessionStore: failPersistence ? { updateDeploymentContinuation: () => { throw new Error('disk unavailable'); } } : store,
@@ -82,6 +83,8 @@ function manualInput(failPersistence: boolean) {
     withTurnCaller: (_session: unknown, message: unknown) => message, bufferTransferInput: () => false,
     afterWorkerIpcBootstrap: (_worker: unknown, effect: () => void) => { effect(); return true; },
   };
+  scope.assistantLiveInputAdmission = loadWorkerPoolFunction('assistantLiveInputAdmission', scope);
+  scope.assistantTransferInputDeliveryAllowed = loadWorkerPoolFunction('assistantTransferInputDeliveryAllowed', scope);
   return new Function('scope', `with (scope) { ${code}; return sendWorkerSessionInput; }`)(scope);
 }
 
@@ -96,7 +99,7 @@ function freshNativeTurn(turnId = 'om_first') {
     randomBytes, currentGatewayCallerOpenId, sameTrustedPrincipal,
     currentTurnProcessIdentities: () => undefined, noteTurnDispatchAttempt: () => {},
     ensureAutomaticTaskContinuationLease: () => {},
-    cancelDeploymentContinuation, deploymentContinuationAuthority, sessionStore: store,
+    cancelDeploymentContinuation, deploymentContinuationAuthority, sessionStore: store, sessionController: undefined,
   });
   const scope: any = { sessionId: ds.session.sessionId, lastInitConfig: { cliId: 'codex', larkAppId: 'app_test' },
     activeTurnAuthority: new ActiveTurnAuthority(), sandboxRelayCapability: null, sandboxPolicyCapability: null,

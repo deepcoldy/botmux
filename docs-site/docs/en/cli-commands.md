@@ -128,7 +128,7 @@ Keys in the interactive list:
 | Key | Action |
 |------|------|
 | `↑` / `↓` (or `k` / `j`) | Select a session |
-| `Enter` | Attach to the managed tmux / ZMX terminal; a suspended session is resumed first |
+| `Enter` | Attach to the managed tmux / ZMX / hc terminal; a suspended session is resumed first |
 | `d` (or `x`) | Delete the selected session (press `y` to confirm) |
 | `q` / `Esc` | Quit |
 
@@ -172,6 +172,22 @@ botmux term-link [id]
 ```
 
 Gets a writable Web terminal for a session. The link isn't printed in the terminal; the daemon sends it to the bot owner as a private card (only you can see it in a group; in topics or direct chats it falls back to a direct message). You can omit `id` when there's only one active session. See [Web Terminal](/en/web-terminal).
+
+## Post a message from a host shell
+
+CI jobs, alerting systems, and external agents can use `botmux post` to deliver text they already have. Select a running bot by App ID and provide a destination. The command needs no session ID and starts no AI session.
+
+```bash
+botmux post --bot cli_xxx --chat-id oc_xxx --request-id build_12345 --text "Build complete"
+botmux post --bot cli_xxx --chat-id oc_xxx --into om_xxx --text-file ./result.txt
+printf '%s\n' "Manual action required" | botmux post --bot cli_xxx --user-open-id ou_xxx --text-file -
+```
+
+Run the command in a trusted host shell with access to the local Botmux daemon. The bot must already be in the group. For a topic, supply its group ID and root message ID (`om_…`). For a direct message, use the recipient's `open_id` in the sending bot's app scope. Lark must allow that bot to reach the recipient. Use `--text` or `--text-file` for up to 8192 UTF-8 bytes.
+
+`--bot` accepts a Feishu App ID starting with `cli_`. CI and alerting systems should pass a stable event ID with `--request-id` (8–64 letters, digits, underscores or hyphens). The CLI generates an ID when omitted. A successful JSON receipt on stdout includes `requestId`, `messageId`, `replayed`, the bot and the destination. Group posts share deduplication records with the request-bound group API.
+
+Invalid arguments exit with status 2. Delivery errors exit with status 1 and a JSON error on stderr. A timeout, interrupted connection or unverifiable receipt returns `outcome_unknown`; the message may already be visible. When `retryable` is true, retry within 50 minutes of the first attempt using the same bot, destination, text and request ID. An unresolved attempt past that window returns `retryable: false` and needs manual verification. Reusing the ID with different text returns `request_conflict`. While a definite first rejection is retained, retrying the original text replays that `send_failed`. Use a new request ID for corrected text. Completed requests replay the original message ID for as long as their record is retained in the bounded archive.
 
 ## Dashboard login link
 
@@ -267,7 +283,7 @@ These commands only read state; they change nothing.
 
 | Command | Description |
 |------|------|
-| `botmux observe [--session <id>] [--lark-app <appId>]` | Query session and worker state live through the daemon (JSON). If it can't get an answer it shows unknown and never reads a cache |
+| `botmux observe [--session <id>] [--lark-app <appId>] [--include-task] [--active\|--since <duration>]` | Query session and worker state live through the daemon (JSON). If it can't get an answer it shows unknown and never reads a cache. `--include-task` adds each session's task status (needs you / working / delivered / unfinished / idle / closed, the same judgement as the Dashboard board); `--active` lists only sessions that are not closed and are running or had a message in the last 24 hours, `--since 6h` changes the window to 6 hours |
 | `botmux execution current --json` | Check which bot, session, turn, and worker the current process belongs to |
 | `botmux actor current --json` | Return the daemon-verified enterprise email of this turn's sender, plus the current group ID and turn ID (no open_id). Refused when not run inside a session process |
 
@@ -282,6 +298,7 @@ These commands only read state; they change nothing.
 | `botmux goal run <goal>` | Run one goal headless from the command line; `--json` prints the result | [Workflow](/en/workflow) |
 | `botmux create-group --bot <name> [--bot ...]` | Create a Lark group with one or more bots | [Multi-bot](/en/multi-bot) |
 | `botmux board ...` | Decision board (steward bot sessions only) | [Decision Board](/en/decision-board) |
+| `botmux owner-board boards\|list\|show\|decide --bot <appId>` | Let other local tools read a steward's decision board and submit decisions for you (JSON) | [Decision Board](/en/decision-board) |
 | `botmux whiteboard ...` | Local project whiteboard | [Whiteboard](/en/whiteboard) |
 
 For how the AI discovers and uses these commands, see [Skill + CLI](/en/skill-cli).
@@ -335,3 +352,27 @@ A session runs only on the replica that owns it, while Lark callbacks and browse
   - Cookies, Authorization, and other login credentials are never forwarded.
 - **What works across replicas**: only terminal links in Lark cards, which carry their own credential. The terminal embedded in the Dashboard, the touch-screen dynamic link, and takeover with write access must reach the owning replica directly (e.g. session-sticky load balancing); otherwise they return 403.
 - Deployments without primary mode are unaffected.
+
+## Evidence retrieval: index first, then selected details
+
+```bash
+botmux history --scope chat --view index --limit 50
+botmux history --view index --query "queue" --type text,interactive --since "2026-11-14T00:00:00+08:00"
+botmux quoted om_example_one om_example_two --no-download
+```
+
+The default full history and single-message quoted JSON remain compatible. Index mode avoids card/forward expansion and returns previews of up to 240 characters plus resource counts. `--no-download` preserves resource metadata without downloading attachment bytes. Batch quoted accepts up to 20 IDs, deduplicates them, preserves successful input order, and returns `messages`/`errors`; partial failure exits with code 1 while retaining successful results.
+
+Filters apply only within the fetched `--limit` window. `--since` is inclusive and `--until` exclusive; use ISO timestamps with a timezone. The `retrieval` block reports counts, filters, deferred details and detail failures. An index candidate marked `queryMatch=deferred` requires a detail read to verify the keyword. Index mode cannot be combined with `--with-card-json`. Message requests are coalesced only within one invocation, separately by app and representation; the next invocation reads afresh. Both commands support `--help`.
+
+## Worker Memory Protection
+
+`botmux worker-budget status` shows available memory, the reserve, the memory PSI limit, and whether worker startup is allowed. Background recovery failures are logged and batched into a DM to the bot owner. A rejected current request receives only a brief unavailable status in its conversation.
+
+Owner DMs are batched per bot over 2 seconds and count distinct affected sessions. Each bot/owner pair attempts at most one DM every 5 minutes, with a cooldown that survives daemon restarts. Failed sends also enter cooldown; a later rejection can trigger another attempt after it expires. An unresolved owner is logged. If the cooldown cannot be persisted, deduplication falls back to the current process. These notifications are independent of the optional Dashboard host overload monitor.
+
+## Background Recovery Diagnostics
+
+Process-start and DNS/runtime preparation failures during background recovery are batched into a DM to the bot's current owner. A current request receives only a brief unavailable status. Pi installation changes also notify the owner while retaining suspension after the current task settles and cold-starting on the new version for the next input. Startup, installation and memory alerts have independent 2-second batching windows and 5-minute cooldowns.
+
+Mojo lineage-quarantine and legacy-configuration notices remain pending through blank recovery and owner-only historical input replay. They are delivered only after a nonempty input with an explicit turn is accepted. A rejected input or failed notice delivery keeps the pending marker for a later input. Silent tasks, meeting receivers and sessions without an IM transport retain their existing output restrictions.

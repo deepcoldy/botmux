@@ -2,6 +2,9 @@ import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+import { HcBackend } from './hc-backend.js';
+import { hcTerminalName, probeHcTerminal, type HcTarget } from './hc/cli-ops.js';
+import { hcCoreAddress, hcCorePaths, type HcCoreAddress } from './hc/core.js';
 import { HerdrBackend } from './herdr-backend.js';
 import { PtyBackend } from './pty-backend.js';
 import { MojoBackend } from './mojo-backend.js';
@@ -17,6 +20,7 @@ import { TmuxPipeBackend } from './tmux-pipe-backend.js';
 import { managedTmuxCandidateSockets } from './tmux-socket.js';
 import { ZellijBackend } from './zellij-backend.js';
 import { ZmxBackend } from './zmx-backend.js';
+import { HC_MIN_VERSION } from '../../setup/ensure-hc.js';
 import { classifyTmuxProbeFailure } from '../../setup/ensure-tmux.js';
 import { isCodexAppCliId } from '../cli/types.js';
 import { resolveZmxSocketDir, zmxEnv } from '../../setup/ensure-zmx.js';
@@ -288,6 +292,75 @@ export function resolveManagedTmuxPlacement(opts: {
   return { socketName: opts.preferred, probe: 'missing' };
 }
 
+/** {@link TmuxGateResolution} for hc, plus the terminal the session is frozen to. */
+export interface HcGateResolution extends TmuxGateResolution {
+  /** Set whenever the gate does not refuse. */
+  target?: HcTarget;
+}
+
+function recordedHcTarget(target: PersistentBackendTarget | undefined): HcTarget | undefined {
+  if (target?.backendType !== 'hc') return undefined;
+  if (!target.sessionName.trim() || !target.hcSession.trim() || !target.socket) return undefined;
+  return target;
+}
+
+/**
+ * hc side of the worker's backend gate. 'missing' is authoritative (a core with
+ * neither a socket nor a holder runs nothing; hc starts any other core it
+ * cannot reach) and 'unknown' means hc gave no answer.
+ *
+ *   - No usable binary: gate with its reason; a live terminal is unreachable
+ *     without one too.
+ *   - A recorded target stays authoritative while its terminal is live or its
+ *     core cannot answer ('unknown' keeps the reattach bias, pinned to that
+ *     core, as {@link resolveManagedTmuxPlacement} does).
+ *   - Otherwise the default core of this env: a new terminal goes there, and a
+ *     live one there (a target whose report to the daemon was lost) is
+ *     reattached. A recorded core whose runtime dir is gone counts as missing:
+ *     its sockets lived there.
+ */
+export function resolveHcBackendGate(deps: {
+  sessionId: string;
+  recorded?: PersistentBackendTarget;
+  availability: () => { ok: true } | { ok: false; reason: string };
+  /** Throws a readable reason when this env names no usable core. */
+  defaultCore: () => HcCoreAddress;
+  /** Readable reason nothing can listen at this core (its runtime dir is gone), else null. */
+  coreUnreachable: (core: HcCoreAddress) => string | null;
+  probe: (target: HcTarget) => SessionProbe;
+}): HcGateResolution {
+  const refuse = (reason: string): HcGateResolution => ({
+    probe: 'unknown', available: false, reason, hasExistingSession: false, existingSessionUnknown: false,
+  });
+  const frozen = (target: HcTarget, probe: SessionProbe): HcGateResolution => ({
+    target,
+    probe,
+    available: true,
+    reason: '',
+    hasExistingSession: probe === 'exists',
+    existingSessionUnknown: probe === 'unknown',
+  });
+  const availability = deps.availability();
+  if (!availability.ok) return refuse(availability.reason);
+  const recorded = recordedHcTarget(deps.recorded);
+  if (recorded) {
+    const probe = deps.coreUnreachable(recorded) ? 'missing' : deps.probe(recorded);
+    if (probe !== 'missing') return frozen(recorded, probe);
+  }
+  let core: HcCoreAddress;
+  try {
+    core = deps.defaultCore();
+  } catch (err) {
+    return refuse(err instanceof Error ? err.message : String(err));
+  }
+  const unreachable = deps.coreUnreachable(core);
+  if (unreachable) return refuse(unreachable);
+  const target: HcTarget = { backendType: 'hc', sessionName: hcTerminalName(deps.sessionId), ...core };
+  const sameAsRecorded = recorded !== undefined && recorded.sessionName === target.sessionName
+    && recorded.socket === target.socket && recorded.hcSession === target.hcSession;
+  return frozen(target, sameAsRecorded ? 'missing' : deps.probe(target));
+}
+
 /**
  * Reattach-vs-fresh from a frozen tri-state existence probe (tmux / zellij).
  * Only an authoritative 'missing' cold-spawns. 'unknown' is biased toward
@@ -341,6 +414,8 @@ export function backendGateUserMessage(backend: BackendType, reason: string): st
       ? 'macOS: brew install tmux ｜ Debian/Ubuntu: sudo apt-get install -y tmux ｜ 其它发行版用对应包管理器安装 tmux'
       : backend === 'zmx'
         ? '需要 zmx >= 0.7.0（send 不再抢占 client leadership）｜macOS: brew install neurosnap/tap/zmx ｜ Linux: 装官方 release binary ｜ mise: mise use -g github:neurosnap/zmx@latest'
+      : backend === 'hc'
+        ? `需要 herdr-core >= ${HC_MIN_VERSION.join('.')}，仅支持 Linux ｜ 放到 botmux 数据目录的 bin/herdr-core，或用 BOTMUX_HC_BIN 指定绝对路径，或让 herdr-core / hc 出现在 PATH 上 ｜ botmux 不会自动安装或升级 hc ｜ 也可把该 bot 的 backendType 改回 tmux`
       : `请确认 ${backend} 已正确安装并可用`;
   return [
     `⚠️ 本机 ${backend} 不可用，无法启动会话。`,
@@ -353,7 +428,8 @@ export function backendGateUserMessage(backend: BackendType, reason: string): st
 
 /**
  * File/read isolation is currently enforced only when Botmux owns the local
- * launch wrapper (PTY or tmux). Herdr, Zellij, and ZMX own/spawn the child
+ * launch wrapper (PTY, tmux, or hc, whose pane runs tmux's launch file). Herdr,
+ * Zellij, and ZMX own/spawn the child
  * outside that bwrap/Seatbelt boundary, so they must fail before backend
  * selection or migration mutates any live resource. Riff is remote and applies
  * its own sandbox; local isolation is intentionally bypassed for it.
@@ -387,12 +463,13 @@ export function backendSandboxCompatibilityError(opts: {
   // runner cannot reach its authenticated control endpoint. Credential-only
   // bwrap keeps them visible and is not a file/read sandbox request here.
   if ((opts.platform ?? process.platform) === 'linux' && isCodexAppCliId(opts.cliId)
-    && (opts.backendType === 'pty' || opts.backendType === 'tmux')) {
+    && (opts.backendType === 'pty' || opts.backendType === 'tmux' || opts.backendType === 'hc')) {
     return 'codex_app_file_sandbox_unsupported';
   }
   if (
     opts.backendType === 'pty'
     || opts.backendType === 'tmux'
+    || opts.backendType === 'hc'
     || opts.backendType === 'riff'
     || opts.backendType === 'remote-runner'
   ) return undefined;
@@ -462,6 +539,8 @@ export function selectSessionBackend(opts: {
   hasExistingSession?: boolean;
   /** tmux server for the managed session (undefined = default server). */
   tmuxSocketName?: string;
+  /** Absolute root selected by a strict worker; persisted for daemon -S control. */
+  tmuxSocketRoot?: string;
   /** Host-persistent journal for fail-closed ZMX composer recovery. */
   zmxRecoveryStateDir?: string;
 }): SelectedSessionBackend {
@@ -725,12 +804,34 @@ export function selectSessionBackend(opts: {
     };
   }
 
+  if (opts.backendType === 'hc') {
+    // The worker freezes the target at its gate (resolveHcBackendGate); default
+    // callers get this env's core.
+    const target: HcTarget = recordedHcTarget(opts.persistentBackendTarget) ?? {
+      backendType: 'hc',
+      sessionName: hcTerminalName(opts.sessionId),
+      ...hcCoreAddress(hcCorePaths(process.env)),
+    };
+    const reattach = opts.hasExistingSession ?? probeHcTerminal(target) === 'exists';
+    return {
+      backend: new HcBackend(target, { sessionId: opts.sessionId, isReattach: reattach }),
+      isTmuxMode: false,
+      // Observed through its own attach stream and driven by AUTOMATIC_INPUT
+      // frames: the shared relay, never per-client `tmux attach`.
+      isPipeMode: true,
+      isZellijMode: false,
+      persistentSessionName: target.sessionName,
+      persistentBackendTarget: target,
+      isReattach: reattach,
+    };
+  }
+
   const sessionName = TmuxBackend.sessionName(opts.sessionId);
   const socketName = opts.tmuxSocketName;
   // Default-server targets keep the historical shape (no socketName key).
   const persistentBackendTarget: PersistentBackendTarget = socketName === undefined
-    ? { backendType: 'tmux', sessionName }
-    : { backendType: 'tmux', sessionName, socketName };
+    ? { backendType: 'tmux', sessionName, ...(opts.tmuxSocketRoot !== undefined ? { socketRoot: opts.tmuxSocketRoot } : {}) }
+    : { backendType: 'tmux', sessionName, socketName, ...(opts.tmuxSocketRoot !== undefined ? { socketRoot: opts.tmuxSocketRoot } : {}) };
   // Prefer the worker's frozen decision (tri-state probe resolved once at the
   // gate, biased toward reattach on 'unknown', refreshed to 'missing' after any
   // teardown) so the gate, the pre-spawn fresh/reattach setup and the backend

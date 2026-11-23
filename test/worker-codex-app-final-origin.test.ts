@@ -64,15 +64,21 @@ function harness(reattached: boolean | 'native-recovery' = false, ordinary = fal
     codexAppGenerationCommits: [], codexAppRecoveredDispatches: [], turnExecutionClock: new TurnExecutionClock(),
     codexAppPendingDaemonAcks: new Map(), CODEX_APP_DAEMON_PERSIST_TIMEOUT_MS: 30_000,
     closeRequested: false, frozenTurnLinkRefMode: () => undefined, isWorkflowWorker: () => false,
+    // This harness exercises signed control finals; JSONL bridge draining is
+    // an independent listener awakened by the same observer assignment.
+    codexBridgeDrainAndMaybeEmit: vi.fn(),
     log: vi.fn(), cliName: () => 'Codex App', rejectCodexAppControlMarker: vi.fn(),
     currentBotmuxTurnId: 'turn-next', currentBotmuxDispatchAttempt: 99,
     inputDeliveryEvidence: { start: vi.fn() }, cliSpawnGeneration: 1,
     emittedTurnTerminals: new TurnTerminalDeduper(), cancelSubmitFailureChainForTerminal: vi.fn(),
-    submitFailureChains: new Map(), releaseActiveTurnAuthority: () => true, retireTerminatedQueuedTurn: vi.fn(),
+    submitFailureChains: new Map(), releaseActiveTurnAuthority: () => true, scheduleConsumedQueuedTurnAdvance: vi.fn(), retireTerminatedQueuedTurn: vi.fn(),
     terminalReleasesDurableTurn: () => false,
     parseCodexAppControlWireRecord, verifyCodexAppSignedControlMarker, encodeCodexAppControlAck, committedCodexAppSequence,
     codexAppControlChannelId: 1, codexAppControlEndpointEpoch: 'epoch', codexAppControlActiveSocket: socket,
     codexAppControlReplayWindow: new CodexAppControlReplayWindow(), codexAppControlRecordApplicationGate: new CodexAppControlRecordApplicationGate(),
+    // Interrupt bookkeeping introduced with native turn interrupt: empty for the
+    // control-channel teardown probes, which only need it to be a safe no-op.
+    codexAppInterruptRequests: new Map(),
   };
   const wire: any[] = []; const admissions: any[] = []; const heldAcks: Array<() => void> = [];
   const ack = loadWorkerMessageHandler('codex_app_dispatch_persisted', env);
@@ -333,6 +339,26 @@ describe('authenticated native proof recovery across a bare intermediate observa
       expect(h.store.execution(h.ref, h.execution.executionId)?.phase).toBe('reconciling');
       expect(h.wire.filter(m => m.type === 'runtime_binding')).toHaveLength(0);
     });
+  it('takes the header-verified top-level conversation while the engine also holds subagent rollouts', async () => {
+    vi.useFakeTimers(); const h = harness('native-recovery');
+    h.env.findCodexRolloutSetByPid.mockReturnValue(new Set(['native-conversation', 'subagent-conversation']));
+    h.env.findCodexRolloutByPid.mockReturnValue(undefined);
+    h.env.readCodexLiveSessionId = vi.fn(() => 'native-conversation');
+    h.restoreNative(); await h.drainBindings();
+    expect(h.env.readCodexLiveSessionId).toHaveBeenCalledWith(222);
+    expect(h.wire.filter(m => m.type === 'runtime_binding').map(m => m.identity?.nativeSessionId)).toEqual(['native-conversation']);
+    const pending = h.final(); await vi.advanceTimersByTimeAsync(0); await pending;
+    expect(h.wire.find(m => m.type === 'final_output')?.sessionContract).toMatchObject({ scope: { runtime: h.historicalRuntime, execution: h.execution } });
+    expect(h.store.execution(h.ref, h.execution.executionId)?.phase).toBe('succeeded');
+  });
+  it('does not adopt a header-verified id the engine does not hold among its rollouts', async () => {
+    vi.useFakeTimers(); const h = harness('native-recovery');
+    h.env.findCodexRolloutSetByPid.mockReturnValue(new Set(['native-conversation', 'subagent-conversation']));
+    h.env.readCodexLiveSessionId = vi.fn(() => 'unheld-conversation');
+    h.restoreNative(); await h.drainBindings();
+    expect(h.store.execution(h.ref, h.execution.executionId)?.phase).toBe('reconciling');
+    expect(h.wire.filter(m => m.type === 'runtime_binding')).toHaveLength(0);
+  });
 });
 
 describe('control stop during final persistence wait', () => {

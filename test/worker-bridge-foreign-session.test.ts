@@ -4,8 +4,9 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
+import { BLIND_TURN_MIN_BUSY_MS, BridgeBlindTurnWatch } from '../src/services/claude-bridge-blind-turn.js';
 import { decideFingerprintSwitch, foreignNativeSessionIds, SESSION_ID_FILENAME_RE, sessionIdFromJsonlPath } from '../src/services/bridge-rotation-policy.js';
-import { findJsonlContainingFingerprint, findJsonlsContainingExactContent } from '../src/services/claude-transcript.js';
+import { findJsonlContainingFingerprint, findJsonlsContainingExactContent, ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 
 // The worker's fingerprint fallback, with real transcripts on disk and a
 // session-store stand-in: which file it switches to when one broadcast lands
@@ -123,23 +124,71 @@ describe('worker trust set: what the CLI proved vs what was only guessed or swit
     expect([...(scope.bridgeCliProvenSessionIds as Set<string>)]).toEqual([OWN]);
   });
 
-  it('a fingerprint switch trusts the new file without counting it as proven', () => {
+  it('a fingerprint switch trusts the new file and rebinds its model-request clock', () => {
     const scope = trustScope();
+    const modelRequestClock = new ClaudeModelRequestClock();
+    modelRequestClock.bind(OWN);
+    modelRequestClock.observe({
+      type: 'assistant', timestamp: '2026-11-21T10:00:30.000Z',
+      message: { role: 'assistant', content: [], usage: { input_tokens: 1 } },
+    });
+    expect(modelRequestClock.lastServedAt()).toBeDefined();
     Object.assign(scope, {
+      lastInitConfig: { cliId: 'claude-code' },
       bridgeJsonlPath: undefined, bridgeBaselineDone: false, bridgeWatcher: null, log: () => {},
       dirname: (p: string) => p.slice(0, p.lastIndexOf('/')),
-      drainTranscript: () => ({ newOffset: 0, events: [] }),
+      drainTranscript: () => {
+        expect(modelRequestClock.boundClaudeSessionId).toBe(SIBLING);
+        return { newOffset: 0, events: [] };
+      },
       splitTranscriptEventsByCutoff: () => ({ history: [], live: [] }),
       beginNewBridgeTranscriptGeneration: () => {},
       bridgeQueue: { absorb: () => {}, ingest: () => {} },
-      seedModelFallbackFromTranscript: () => {}, observeModelFallbackEvents: () => {},
+      seedModelFallbackFromTranscript: () => {}, seedModelRequestClockFromTranscript: () => {}, modelRequestClock, observeModelFallbackEvents: () => {},
       bridgeMarkStalePidStateForAcceptedSid: () => {},
       fsWatch: () => ({ close: () => {} }),
       performBridgeIngestAndScheduleQuietEmit: () => {},
+      ingestClaudeSwitchLiveAndSettleUnreadTurn: () => {},
     });
+    scope.bindModelRequestClockToTranscript = loadWorkerFunction('bindModelRequestClockToTranscript', scope);
     loadWorkerFunction<(m: string, r: string, c: number) => void>('bridgeApplyFingerprintSwitch', scope)(`/p/${SIBLING}.jsonl`, 'test', 0);
     expect([...(scope.bridgeKnownSessionIds as Set<string>)]).toEqual([SIBLING]);
     expect([...(scope.bridgeCliProvenSessionIds as Set<string>)]).toEqual([]);
+    expect(modelRequestClock.boundClaudeSessionId).toBe(SIBLING);
+    expect(modelRequestClock.lastServedAt()).toBeUndefined();
+    expect(loadWorkerFunction<() => Record<string, unknown>>('modelRequestPayload', scope)())
+      .toEqual({ awaySummaryPending: false, modelRequestSessionId: SIBLING });
+  });
+  it('a rotation also rebinds the model-request clock before folding the new file', () => {
+    const scope = trustScope();
+    const modelRequestClock = new ClaudeModelRequestClock();
+    modelRequestClock.bind(OWN);
+    modelRequestClock.observe({
+      type: 'assistant', timestamp: '2026-11-21T10:00:30.000Z',
+      message: { role: 'assistant', content: [], usage: { input_tokens: 1 } },
+    });
+    Object.assign(scope, {
+      lastInitConfig: { cliId: 'claude-code' },
+      bridgeJsonlPath: undefined, bridgeBaselineDone: false, bridgeWatcher: null, log: () => {},
+      bridgeOffset: 0, bridgePathConfirmedAtMs: 0,
+      dirname: (p: string) => p.slice(0, p.lastIndexOf('/')),
+      drainTranscript: () => {
+        expect(modelRequestClock.boundClaudeSessionId).toBe(SIBLING);
+        return { newOffset: 0, events: [] };
+      },
+      splitTranscriptEventsByCutoff: () => ({ history: [], live: [] }),
+      beginNewBridgeTranscriptGeneration: () => {},
+      bridgeQueue: { absorb: () => {} },
+      ingestClaudeSwitchLiveAndSettleUnreadTurn: () => {},
+      seedModelFallbackFromTranscript: () => {}, observeModelFallbackEvents: () => {},
+      observeClaudeBackgroundTasks: () => {}, modelRequestClock,
+      fsWatch: () => ({ close: () => {} }), performBridgeIngestAndScheduleQuietEmit: () => {},
+    });
+    scope.bindModelRequestClockToTranscript = loadWorkerFunction('bindModelRequestClockToTranscript', scope);
+    loadWorkerFunction<(p: string, c: number, r: string) => void>('performRotationSwitch', scope)(`/p/${SIBLING}.jsonl`, 0, 'test');
+    expect(modelRequestClock.boundClaudeSessionId).toBe(SIBLING);
+    expect(modelRequestClock.lastServedAt()).toBeUndefined();
+    expect(modelRequestClock.lastActivityAt()).toBeUndefined();
   });
 });
 
@@ -225,15 +274,15 @@ describe('proven trust-set: the whole pid/fd producer chain', () => {
     // Branch 1: pid state names a different transcript.
     const viaPid = relocationScope();
     Object.assign(viaPid, {
-      resolveJsonlFromPid: () => ({ path: `/d/${PID_SID}.jsonl`, cliSessionId: PID_SID }),
+      resolveJsonlFromPidState: () => ({ path: `/d/${PID_SID}.jsonl`, cliSessionId: PID_SID }),
       findOpenClaudeSessionIds: () => [],
     });
-    expect(loadWorkerFunction<(since: number) => boolean>('relocateUnreadClaudeTranscript', viaPid)(100_000)).toBe(true);
+    expect(loadWorkerFunction<(since: number) => string>('relocateUnreadClaudeTranscript', viaPid)(100_000)).toBe('moved');
     expect([...proven(viaPid)]).toEqual([PID_SID]);
     // Branch 2: pid state silent, an open session file is newer than the cutoff.
     const viaFd = relocationScope();
-    Object.assign(viaFd, { resolveJsonlFromPid: () => null });
-    expect(loadWorkerFunction<(since: number) => boolean>('relocateUnreadClaudeTranscript', viaFd)(100_000)).toBe(true);
+    Object.assign(viaFd, { resolveJsonlFromPidState: () => null });
+    expect(loadWorkerFunction<(since: number) => string>('relocateUnreadClaudeTranscript', viaFd)(100_000)).toBe('moved');
     expect([...proven(viaFd)]).toEqual([FD_SID]);
   });
 
@@ -253,7 +302,7 @@ describe('proven trust-set: the whole pid/fd producer chain', () => {
       newestPath: (paths: string[]) => paths[0],
       bridgeMarkStalePidStateForAcceptedSid: () => {},
       beginNewBridgeTranscriptGeneration: () => {},
-      seedModelFallbackFromTranscript: () => {},
+      seedModelFallbackFromTranscript: () => {}, seedModelRequestClockFromTranscript: () => {}, modelRequestClock: new ClaudeModelRequestClock(),
       fsWatch: () => ({ close: () => {} }),
       performBridgeIngestAndScheduleQuietEmit: () => {},
       setInterval: () => 0,
@@ -279,7 +328,7 @@ describe('proven trust-set: the whole pid/fd producer chain', () => {
       dirname: (p: string) => p.slice(0, p.lastIndexOf('/')),
       existsSyncSafe: () => false,
       beginNewBridgeTranscriptGeneration: () => {},
-      seedModelFallbackFromTranscript: () => {},
+      seedModelFallbackFromTranscript: () => {}, seedModelRequestClockFromTranscript: () => {}, modelRequestClock: new ClaudeModelRequestClock(),
       fsWatch: () => ({ close: () => {} }),
       performBridgeIngestAndScheduleQuietEmit: () => {},
       setInterval: () => 0,
@@ -300,6 +349,7 @@ describe('proven trust-set: the whole pid/fd producer chain', () => {
       bridgeSecondaryPaths: new Map(), orcaClaudeWebHistorySignature: undefined,
       bridgeFingerprintScanLastMs: new Map(),
       bridgeBlindTurnWatch: { reset: () => {} },
+      settleUnreadClaudeTurnLookOnTeardown: () => {},
       bridgeQueue: { clearPending: () => {} },
       beginNewBridgeTranscriptGeneration: () => {},
       bridgeRestoreGate: { markGenerationRetired: () => {} },
@@ -310,5 +360,43 @@ describe('proven trust-set: the whole pid/fd producer chain', () => {
     loadWorkerFunction('stopBridgeWatcher', scope)();
     expect([...proven(scope)]).toEqual([]);
     expect([...known(scope)]).toEqual([]);
+  });
+
+  it('stopBridgeWatcher tells the group about an unread run still being looked for, once', () => {
+    const scope = chainScope();
+    const watch = new BridgeBlindTurnWatch();
+    watch.noteTurnStarted({ path: `/d/${PID_SID}.jsonl`, offset: 0 }, 1_000);
+    watch.noteTurnEnded({ path: `/d/${PID_SID}.jsonl`, offset: 0 }, 1_000 + BLIND_TURN_MIN_BUSY_MS);
+    const send = vi.fn();
+    vi.useFakeTimers();
+    const look = vi.fn();
+    const timer = setTimeout(look, 1_000);
+    Object.assign(scope, {
+      bridgeJsonlPath: null, bridgeWatcher: null, bridgeFallbackTimer: null,
+      bridgeCliPid: 1, bridgeCliCwd: '/p', bridgeObservedCliSessionId: 'x',
+      bridgeStalePidStateSessionId: undefined,
+      bridgeSecondaryPaths: new Map(), orcaClaudeWebHistorySignature: undefined,
+      bridgeFingerprintScanLastMs: new Map(),
+      bridgeBlindTurnWatch: watch,
+      bridgeQueue: { clearPending: () => {} },
+      beginNewBridgeTranscriptGeneration: () => {},
+      bridgeRestoreGate: { markGenerationRetired: () => {} },
+      clearHerdrAdoptBridgeQuietTimer: () => {},
+      resetThinkingChannel: () => {},
+      bridgePreambleSent: true,
+      unreadClaudeTurnLook: { run: { path: `/d/${PID_SID}.jsonl`, blindSinceMs: 1_000, turnId: 'om_unread' }, timer },
+      send, t: (key: string) => key, cliName: () => 'Claude',
+    });
+    scope.notifyUnreadClaudeTurn = loadWorkerFunction('notifyUnreadClaudeTurn', scope);
+    scope.settleUnreadClaudeTurnLookOnTeardown = loadWorkerFunction('settleUnreadClaudeTurnLookOnTeardown', scope);
+    try {
+      loadWorkerFunction('stopBridgeWatcher', scope)();
+      vi.advanceTimersByTime(1_000);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(send.mock.calls).toEqual([[{ type: 'user_notify', message: 'worker.claude_bridge_turn_unread', turnId: 'om_unread' }]]);
+    expect(look).not.toHaveBeenCalled();
+    expect(scope.unreadClaudeTurnLook).toBeUndefined();
   });
 });

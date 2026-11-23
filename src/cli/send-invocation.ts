@@ -28,6 +28,8 @@ export const SEND_FLAG_SPECS: readonly SendFlagSpec[] = [
   { names: ['--dry-run'], kind: 'bool' },
   { names: ['--card', '--text'], kind: 'bool' },
   { names: ['--top-level'], kind: 'bool' },
+  { names: ['--follow-thread-at'], kind: 'bool' },
+  { names: ['--no-follow-thread'], kind: 'bool' },
   { names: ['--no-quote'], kind: 'bool' },
   { names: ['--mention-back'], kind: 'bool' },
   { names: ['--no-mention'], kind: 'bool' },

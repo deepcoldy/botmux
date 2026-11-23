@@ -248,6 +248,57 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
   });
 });
 
+describe('buildStreamingCard: primary control row narrow-screen layout', () => {
+  /** Every top-level element that carries a primary control (terminal URL, retry, compact, stop,
+   *  takeover, close/disconnect). The 「更多操作」 panel is nested and never matches. */
+  const PRIMARY = new Set(['retry_last_task', 'compact_session', 'stop_turn', 'takeover', 'disconnect', 'close']);
+  const isPrimary = (b: any) => b?.tag === 'button' && (!!b.multi_url || PRIMARY.has(b.value?.action));
+  function primaryModules(card: any): any[] {
+    return card.elements.filter((e: any) =>
+      (e.actions ?? []).some(isPrimary)
+      || (e.columns ?? []).some((c: any) => (c.elements ?? []).some(isPrimary)));
+  }
+  const ids = (mod: any) => mod.actions.map((a: any) => a.value?.action ?? 'url');
+
+  // flow：窄屏按文字宽度横排、放不下才折行（不截断），桌面宽卡排法不变。
+  it.each([
+    ['working', ['url', 'compact_session', 'stop_turn', 'close']],
+    ['analyzing', ['url', 'compact_session', 'stop_turn', 'close']],
+    ['stalled', ['url', 'compact_session', 'stop_turn', 'close']],
+    ['idle', ['url', 'compact_session', 'close']],
+    ['starting', ['url', 'compact_session', 'close']],
+  ] as const)('keeps all primary controls in ONE flow-layout action module while %s', (status, expected) => {
+    const card = build({ status, cliId: 'claude-code' });
+    const mods = primaryModules(card);
+    expect(mods).toHaveLength(1);
+    expect(mods[0]).toMatchObject({ tag: 'action', layout: 'flow' });
+    expect(ids(mods[0])).toEqual(expected);
+  });
+
+  it('applies the same layout to adopt cards (takeover / disconnect stay in the same module)', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'working' as any, 'claude-code' as any, 'hidden' as any,
+      undefined, undefined, true, true, undefined,
+    ));
+    const mods = primaryModules(card);
+    expect(mods).toHaveLength(1);
+    expect(mods[0]).toMatchObject({ tag: 'action', layout: 'flow' });
+    expect(ids(mods[0])).toEqual(['url', 'compact_session', 'stop_turn', 'takeover', 'disconnect']);
+  });
+
+  it('applies the same layout to the retry-ready limited card', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'limited' as any, 'claude-code' as any, 'hidden' as any,
+      undefined, undefined, false, false, undefined,
+      { limited: true, kind: 'usage', retryAtMs: 0, retryLabel: '', retryReady: true } as any,
+    ));
+    const mods = primaryModules(card);
+    expect(mods).toHaveLength(1);
+    expect(mods[0]).toMatchObject({ tag: 'action', layout: 'flow' });
+    expect(ids(mods[0])).toEqual(['url', 'retry_last_task', 'compact_session', 'close']);
+  });
+});
+
 describe('buildStreamingCard: context headroom lives ONLY in the usage footer', () => {
   // 防回归：曾经有一行独立的 `📊 上下文 N%`，与 usage footer 同源 ⟹ 同一个百分比在
   // 一张卡上出现两次（footer 还多带绝对值）。合并后整张卡对「上下文百分比」只能有一处。
@@ -447,6 +498,44 @@ describe('session reasoning selector', () => {
   it('does not invent a control without verified runtime support', () => {
     const card = build({ cliId: 'codex', usage: { context: null, tokens: null, reasoningEffort: 'high' } });
     expect(JSON.stringify(card)).not.toContain('set_reasoning_effort');
+  });
+});
+
+describe('buildStreamingCard: Kimi auto-compact on cache expiry toggle (toggle_kimi_expiry_compact)', () => {
+  const usageWith = (enabled: boolean) => ({ context: null, tokens: null, kimiCacheExpiryAutoCompact: { enabled } });
+  const button = (card: any, desired: 'on' | 'off') => {
+    const panel = card.elements.find((e: any) => e.tag === 'collapsible_panel');
+    const walk = (nodes: any[]): any[] => nodes.flatMap((n: any) => [
+      n,
+      ...(Array.isArray(n.columns) ? walk(n.columns.flatMap((c: any) => c.elements ?? [])) : []),
+      ...(Array.isArray(n.elements) ? walk(n.elements) : []),
+    ]);
+    return walk(panel?.elements ?? [])
+      .find((n: any) => n?.tag === 'button' && n.value?.action === 'toggle_kimi_expiry_compact' && n.value.desired === desired);
+  };
+
+  it('renders in the more-actions panel with the current state and the target state', () => {
+    const off = button(build({ status: 'idle', cliId: 'kimi', usage: usageWith(false) }), 'on');
+    expect(off.text.content).toContain('关');
+    expect(off.value.session_id).toBe(SID);
+    const on = button(build({ status: 'idle', cliId: 'kimi', usage: usageWith(true), locale: 'en' }), 'off');
+    expect(on.text.content).toMatch(/cache expiry: on/);
+  });
+
+  it('is not rendered without its snapshot state (non-Kimi or unsupported backend)', () => {
+    const card = build({ status: 'idle', cliId: 'claude-code', usage: { context: null, tokens: null, idleAutoCompact: { enabled: false, minutes: 55 } } });
+    expect(button(card, 'on')).toBeFalsy();
+    expect(button(card, 'off')).toBeFalsy();
+  });
+
+  it('follows the compact button\'s hidden-button setting', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'idle' as any, 'kimi' as any, 'hidden' as any,
+      undefined, undefined, false, false, undefined, undefined, undefined, false,
+      usageWith(true) as any, undefined, undefined, undefined, undefined, ['compact'],
+    ));
+    expect(button(card, 'on')).toBeFalsy();
+    expect(button(card, 'off')).toBeFalsy();
   });
 });
 

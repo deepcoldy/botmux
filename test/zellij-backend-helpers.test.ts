@@ -9,6 +9,7 @@ import {
   kdlString,
   buildLayoutString,
   ZELLIJ_CONFIG_KDL,
+  ZellijBackend,
   parseZellijServerProcs,
 } from '../src/adapters/backend/zellij-backend.js';
 import {
@@ -39,6 +40,15 @@ describe('zellij control namespace', () => {
     const layout = buildLayoutString('/bin/echo', [], { cwd: '/work', cols: 80, rows: 24, env });
     for (const key of ['TMPDIR', 'TMP', 'TEMP']) expect(layout).toContain(`${key}=/session/two`);
     expect(env.TMPDIR).toBe('/session/two');
+  });
+});
+
+describe('ZellijBackend stable pane identity', () => {
+  it('does not follow the public cliPid refinement', () => {
+    const backend = new ZellijBackend('bmx-test', { ownsSession: false });
+    Object.assign(backend, { resolvedCliPid: 123, cliPid: 456 });
+    expect(backend.getChildPid()).toBe(123);
+    expect(backend.getStablePanePid()).toBe(123);
   });
 });
 

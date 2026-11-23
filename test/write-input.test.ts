@@ -1141,6 +1141,27 @@ describe('claude-code writeInput submission confirmation', () => {
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
   });
 
+  it('recheck accepts one residual soft-newline backslash beside a genuine one', async () => {
+    const { oldPath } = makeClaudeJsonlPaths('recheck-soft-newline-residue');
+    const content = 'echo foo\\\nbar with enough content to identify the turn';
+    const recorded = 'echo foo\\\\\nbar with enough content to identify the turn';
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const pty: PtyHandle = {
+      claudeJsonlPath: oldPath,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(), // Every submit looks swallowed until recheck.
+    };
+
+    const result = await adapter.writeInput(pty, content);
+    expect(result).toMatchObject({ submitted: false });
+
+    writeFileSync(oldPath, JSON.stringify({
+      type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: recorded },
+    }) + '\n');
+    expect((result as any).recheck()).toBe(true);
+  });
+
   it('follows a new Claude JSONL when type-ahead is recorded as a queue enqueue', async () => {
     const { oldPath, newPath } = makeClaudeJsonlPaths('follow-queue');
     const adapter = createClaudeCodeAdapter('/bin/claude');

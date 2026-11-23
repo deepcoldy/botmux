@@ -57,6 +57,7 @@ describe('requestCredentialGrant', () => {
     expect(calls[0]!.opts.headers.authorization).toBe('Bearer mt-secret');
     expect(calls[0]!.body).toEqual({
       unionId: 'on_alice', tool: 'lark-cli', appId: 'cli_bot', sessionId: 'sess-1', turnId: 'om_turn', machineId: 'm-1',
+      machineConsent: true,
     });
     expect(platformCredentialsUrl({ binding: BINDING })).toBe('https://platform.example.test/credentials');
   });
@@ -88,6 +89,65 @@ describe('requestCredentialGrant', () => {
   ])('rejects a bytedcli grant with %s', async (_label, variables) => {
     const { http } = fakeHttp([{ status: 200, json: { ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables } }]);
     const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+    expect(!r.ok && r.reason).toBe('invalid_response');
+  });
+
+  // A daemon from before regional tokens rejects a whole grant carrying them,
+  // so a platform may only send them when the request names the partitions.
+  it('asks a bytedcli grant for every partition, and a lark-cli grant for none', async () => {
+    const reply = (tool: string, variables: Record<string, string>) =>
+      ({ status: 200, json: { ok: true, tool, unionId: 'on_alice', expiresAt: future(), variables } });
+    const { calls, http } = fakeHttp([
+      reply('bytedcli', { BYTEDCLI_USER_CLOUD_JWT: 'cloud' }),
+      reply('lark-cli', { LARKSUITE_CLI_APP_ID: 'a', LARKSUITE_CLI_USER_ACCESS_TOKEN: 't' }),
+    ]);
+    await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+    await requestCredentialGrant(REQ, { binding: BINDING, http });
+    expect((calls[0]!.body as Record<string, unknown>).cloudJwtRegions).toEqual(['i18n', 'i18nbd', 'tx', 'cn']);
+    expect(calls[1]!.body).not.toHaveProperty('cloudJwtRegions');
+  });
+
+  it('accepts the partition JWTs a bytedcli grant was asked for, and the partitions the platform tried', async () => {
+    const variables = {
+      BYTEDCLI_USER_CLOUD_JWT: 'cloud', BYTEDCLI_USER_CODE_JWT: 'code',
+      BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n', BYTEDCLI_USER_CLOUD_JWT_I18NBD: 'bd', BYTEDCLI_USER_CLOUD_JWT_TX: 'tx',
+      BYTEDCLI_USER_CLOUD_JWT_CN: 'cn',
+    };
+    const { http } = fakeHttp([{ status: 200, json: {
+      ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables, cloudJwtRegions: ['tx', 'i18n', 'cn', 'unknown', 7],
+    } }]);
+    const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+    expect(r.ok && r.value.variables).toEqual(variables);
+    // Only partitions this daemon asked for are read back.
+    expect(r.ok && r.value.cloudJwtRegions).toEqual(['i18n', 'tx', 'cn']);
+  });
+
+  it('reads no tried partitions from a platform that predates them', async () => {
+    const { http } = fakeHttp([
+      { status: 200, json: { ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables: { BYTEDCLI_USER_CLOUD_JWT: 'cloud' } } },
+      { status: 200, json: { ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables: { BYTEDCLI_USER_CLOUD_JWT: 'cloud' }, cloudJwtRegions: 'i18n' } },
+    ]);
+    for (let i = 0; i < 2; i++) {
+      const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+      expect(r.ok).toBe(true);
+      expect(r.ok && r.value).not.toHaveProperty('cloudJwtRegions');
+    }
+  });
+
+  it('drops only a partition JWT that arrives unusable, keeping the rest of the grant', async () => {
+    const { http } = fakeHttp([{ status: 200, json: { ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables: {
+      BYTEDCLI_USER_CLOUD_JWT: 'cloud', BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n',
+      BYTEDCLI_USER_CLOUD_JWT_TX: 'tx\nexport X=1', BYTEDCLI_USER_CLOUD_JWT_I18NBD: 7,
+    } } }]);
+    const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+    expect(r.ok && r.value.variables).toEqual({ BYTEDCLI_USER_CLOUD_JWT: 'cloud', BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n' });
+  });
+
+  it('rejects partition JWTs smuggled into a lark-cli grant', async () => {
+    const { http } = fakeHttp([{ status: 200, json: { ok: true, tool: 'lark-cli', unionId: 'on_alice', expiresAt: future(), variables: {
+      LARKSUITE_CLI_APP_ID: 'a', LARKSUITE_CLI_USER_ACCESS_TOKEN: 't', BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n',
+    } } }]);
+    const r = await requestCredentialGrant(REQ, { binding: BINDING, http });
     expect(!r.ok && r.reason).toBe('invalid_response');
   });
 

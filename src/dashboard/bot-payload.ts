@@ -1,14 +1,14 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeReplyFooter } from '../services/reply-footer.js';
-import { normalizeUsageDisplay, normalizeCotEnabled } from '../bot-registry.js';
-import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
+import { normalizeUsageDisplay, normalizeCotEnabled, type BotConfig } from '../bot-registry.js';
+import { normalizeHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from '../im/lark/streaming-card-buttons.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
 import { normalizeAskOptionLayout } from '../im/lark/ask-option-layout.js';
-import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { parseTriggerUserAuthConfig, capabilitiesOf, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import type { CodexServiceTier } from '../services/codex-service-tier.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
@@ -30,6 +30,8 @@ export interface DashboardBotDescriptor {
   botName?: string | null;
   botAvatarUrl?: string;
   cliId?: string;
+  /** True for local/core-only bots with no Feishu transport. */
+  apiOnly?: boolean;
   /** 租户品牌（bots.json 的 BotConfig.brand）。决定飞书后台深链 host。
    *  缺省 → 前端 normalizeBrand 兜底 feishu，向后兼容旧 payload。 */
   brand?: string;
@@ -85,7 +87,16 @@ export function brandMapByAppId(
  * builds every bot row, so one bad policy must not take the whole page down.
  */
 function normalizeTriggerUserAuthForClient(raw: unknown): TriggerUserAuthConfig | null {
-  try { return parseTriggerUserAuthConfig(raw); } catch { return null; }
+  try {
+    const parsed = parseTriggerUserAuthConfig(raw);
+    // The page edits capabilities, whichever form the config was stored in; `legacyCapabilities`
+    // says they were derived from `tools`, so the page does not describe them as an explicit choice.
+    return parsed && {
+      ...parsed,
+      capabilities: parsed.capabilities ?? [...capabilitiesOf({ ...parsed, enabled: true })],
+      ...(parsed.capabilities ? {} : { legacyCapabilities: true }),
+    };
+  } catch { return null; }
 }
 
 export function botSummaryPayload(bot: DashboardBotDescriptor) {
@@ -108,6 +119,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
   const base = {
     larkAppId: bot.larkAppId,
     botName: bot.botName,
+    apiOnly: bot.apiOnly === true || j?.apiOnly === true,
     ...(bot.cliId ? { cliId: bot.cliId } : {}),
     ...(bot.brand ? { brand: bot.brand } : {}),
     ...(bot.cliRuntime ? { cliRuntime: bot.cliRuntime } : {}),
@@ -222,6 +234,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',
     replyCardMode: j?.replyCardMode === 'unified' || j?.replyCardMode === 'final-only' ? 'unified' : 'legacy',
     hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(j?.hiddenStreamingCardButtons) ?? [],
+    streamingCardFoldedLayout: resolveStreamingCardFoldedLayout(j ?? {}),
     pinStreamingCard: j?.pinStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,
@@ -229,8 +242,11 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),
     codexBrowserAutoApproveOrigins: j?.codexBrowserAutoApproveOrigins === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
+    goalStatusCard: j?.goalStatusCard === true,
     privateCard: j?.privateCard === true,
     replyCardActions: j?.replyCardActions === true,
+    replyCardNextStep: j?.replyCardNextStep === true,
+    replyCardRecap: j?.replyCardRecap === true,
     cotEnabled: normalizeCotEnabled(j),
     replyCardShowTools: j?.replyCardShowTools !== false,
     replyCardNativeCot: j?.replyCardNativeCot === true,
@@ -268,11 +284,14 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
     oncallGroup: j?.oncallGroup && typeof j.oncallGroup === 'object' ? j.oncallGroup : null,
     steward: j?.steward && typeof j.steward === 'object' ? j.steward : null,
+    ownerGroupFollow: j?.ownerGroupFollow && typeof j.ownerGroupFollow === 'object' ? j.ownerGroupFollow : null,
     noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
     promptCache: j?.promptCache && typeof j.promptCache === 'object' ? j.promptCache : null,
+    providerRecovery: j?.providerRecovery && typeof j.providerRecovery === 'object' ? j.providerRecovery : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,
+    scheduleCreateByTalkers: j?.scheduleCreateByTalkers === true,
     grantRequestToOwnerDm: j?.grantRequestToOwnerDm === true,
     trustSameOwnerBots: j?.trustSameOwnerBots !== false,
     grantDelegateBots: Array.isArray(j?.grantDelegateBots)
@@ -316,7 +335,11 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     longTaskReminder: normalizeLongTaskReminderConfig(j?.longTaskReminder) ?? null,
     startupCommands: typeof j?.startupCommands === 'string' ? j.startupCommands : '',
     customPassthroughCommands: typeof j?.customPassthroughCommands === 'string' ? j.customPassthroughCommands : '',
+    defaultPassthroughCommands: Array.isArray(j?.defaultPassthroughCommands)
+      ? j.defaultPassthroughCommands.filter((command: unknown): command is string => typeof command === 'string' && command.startsWith('/'))
+      : undefined,
     canTalkDaemonCommands: typeof j?.canTalkDaemonCommands === 'string' ? j.canTalkDaemonCommands : '',
+    bareRenamePassthrough: j?.bareRenamePassthrough === true,
     launchShell: typeof j?.launchShell === 'string' ? j.launchShell : '',
     env: typeof j?.env === 'string' ? j.env : '',
     // env 值只写不读，变量名是刷新后唯一能证明「已保存」的信号——漏掉它，
@@ -344,7 +367,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
 export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   quotaFallbackBot: any;
   autoInviteOwnerOnGroupAdd: any;
+  apiOnly: boolean;
   larkToolBinding: boolean | undefined;
+  streamingCardFoldedLayout: boolean | undefined;
   askOptionLayout: any;
   trustSameOwnerBots: boolean | undefined;
   grantDelegateBots: string[] | undefined;
@@ -353,7 +378,10 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   return {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
     autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
+    apiOnly: rawEntry?.apiOnly === true,
     larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding : undefined,
+    streamingCardFoldedLayout: typeof rawEntry?.streamingCardFoldedLayout === 'boolean'
+      ? rawEntry.streamingCardFoldedLayout : undefined,
     askOptionLayout: rawEntry?.askOptionLayout,
     // 默认开：显式 false 不从这里带回，离线行会把已关闭的同机信任显示成开启。
     trustSameOwnerBots: typeof rawEntry?.trustSameOwnerBots === 'boolean' ? rawEntry.trustSameOwnerBots : undefined,
@@ -363,6 +391,41 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
       : undefined,
     // 显式开/关原样带回（否则 daemon 离线时会显示成「跟随全局」）；缺省或非法值不带，按跟随全局显示。
     archiveCodex: typeof rawEntry?.archiveCodex === 'boolean' ? rawEntry.archiveCodex : undefined,
+  };
+}
+
+export type ConfiguredBotAgentFields = Partial<Pick<BotConfig,
+  'cliRuntime' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'model'
+  | 'modelBackendVariant' | 'reasoningEffort' | 'codexProfile' | 'serviceTier' | 'nativeSubagentRuntime'
+  | 'traexAutoModel' | 'turnTimeoutMs' | 'dshRuntime' | 'dshProfile' | 'cliConfigDir' | 'apiOnly'
+>> & { cliId?: string };
+
+/** Merge registry descriptors with config fallbacks without losing transport identity. */
+export function withConfiguredCliId<T extends { larkAppId: string } & ConfiguredBotAgentFields>(
+  bot: T,
+  ids: Map<string, string> | Map<string, ConfiguredBotAgentFields>,
+): T & ConfiguredBotAgentFields {
+  const raw = ids.get(bot.larkAppId);
+  const fallback: ConfiguredBotAgentFields | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  return {
+    ...bot,
+    cliId: bot.cliId || fallback?.cliId,
+    apiOnly: bot.apiOnly ?? fallback?.apiOnly,
+    cliRuntime: bot.cliRuntime || fallback?.cliRuntime,
+    cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
+    wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
+    cliLaunchMode: bot.cliLaunchMode || fallback?.cliLaunchMode,
+    model: bot.model || fallback?.model,
+    traexAutoModel: bot.traexAutoModel ?? fallback?.traexAutoModel,
+    modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
+    reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
+    codexProfile: bot.codexProfile ?? fallback?.codexProfile,
+    serviceTier: bot.serviceTier || fallback?.serviceTier,
+    nativeSubagentRuntime: bot.nativeSubagentRuntime ?? fallback?.nativeSubagentRuntime,
+    turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
+    dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
+    dshProfile: bot.dshProfile ?? fallback?.dshProfile,
+    cliConfigDir: bot.cliConfigDir ?? fallback?.cliConfigDir,
   };
 }
 
@@ -378,6 +441,7 @@ export function mergeBotOncallFields(d: DashboardBotDescriptor, j: Record<string
   return {
     ...d,
     botName: d.botName ?? j.botName,
+    apiOnly: own('apiOnly') ? j.apiOnly === true : d.apiOnly === true,
     cliId: (j.cliId || d.cliId) as DashboardBotDescriptor['cliId'],
     cliRuntime: own('cliRuntime') ? j.cliRuntime ?? undefined : d.cliRuntime,
     cliPathOverride: own('cliPathOverride') ? j.cliPathOverride ?? undefined : d.cliPathOverride,

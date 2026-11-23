@@ -75,6 +75,7 @@ Day to day you only need tmux. If you really need to switch, use the `BACKEND_TY
 | `pty` | Emergency: tmux really can't run on this machine | No, the next message cold-resumes |
 | `herdr` / `zellij` | You already use one of these terminal tools and want to see bot sessions inside it | Yes |
 | `zmx` | You want the lightweight ZMX to host sessions; see [ZMX session backend](/en/zmx) | Yes |
+| `hc` | Many sessions and the tmux server has become the bottleneck (Linux only, bring your own herdr-core ≥ 0.1.19); see [hc session backend](/en/hc) | Yes |
 
 ```bash
 # Example: temporarily run the whole machine on pty (emergency only)
@@ -84,7 +85,7 @@ BACKEND_TYPE=pty botmux start
 A few things to keep in mind:
 
 - **Only new sessions are affected**: each session remembers the backend it was created with, so existing sessions don't move when you change the setting.
-- **Bots with the sandbox enabled** can only use `tmux` or `pty`. `herdr`, `zellij` and `zmx` don't support the sandbox's file isolation and are blocked before launch; see [Sandbox](/en/sandbox).
+- **Bots with the sandbox enabled** can only use `tmux`, `hc` or `pty`. `herdr`, `zellij` and `zmx` don't support the sandbox's file isolation and are blocked before launch; see [Sandbox](/en/sandbox).
 - **Remote-style CLIs bring their own backend**: `riff`, `mojo` and `remote-runner` don't run a process on this machine, so the backend automatically follows the CLI; you don't (and can't) set it separately. Conversely, if an ordinary CLI is configured with one of these backends, it automatically falls back to a local backend.
 
 ## herdr: where sessions are placed

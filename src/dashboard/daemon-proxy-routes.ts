@@ -89,6 +89,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('custom-passthrough'),
   // cantalk-daemon-commands：`{ canTalkDaemonCommands: string }`（逗号/空格分隔，'' = 清除）。
   putBotConfig('cantalk-daemon-commands'),
+  // bare-rename-passthrough：`{ bareRenamePassthrough: boolean }`（裸 /rename 交给 CLI 自己起名）。
+  putBotConfig('bare-rename-passthrough'),
   // launch-shell：`{ launchShell: string }`（shell 名或绝对路径；'' = 清除，回 $SHELL）。
   putBotConfig('launch-shell'),
   { ...putBotConfig('oncall-group'), decodeAppId: 'after-body' },
@@ -98,6 +100,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   { method: 'POST', path: botPath('oncall-target/check'), upstream: '/api/bot-oncall-target/check', body: NO_BODY },
   // steward：`{ steward: {...} | null }`（管家开关、管家群、提示词追加/替换）。
   putBotConfig('steward', { kind: 'json', maxBytes: 64 * 1024 }),
+  putBotConfig('owner-group-follow', { kind: 'json', maxBytes: 64 * 1024 }),
   // actor-owner-bindings：完整替换 target Bot 的 source Bot 双 ID → Owner 策略。
   putBotConfig('actor-owner-bindings'),
   putBotConfig('feedback'),
@@ -149,7 +152,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('sandbox'),
   // read-isolation：`{ enabled: boolean }`。
   putBotConfig('read-isolation'),
-  // backend-type：`{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'zmx'|'' }`（''/'auto' 清除覆盖）。
+  // backend-type：`{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'zmx'|'hc'|'' }`（''/'auto' 清除覆盖）。
   putBotConfig('backend-type'),
   // card-prefs：任意子集的 per-bot 行为布尔 / prompt 字符串。
   putBotConfig('card-prefs'),
@@ -231,6 +234,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('no-progress-notify'),
   // prompt-cache：`{ promptCache: { ttl?, keepalive? } | null }`（null = 删除本 bot 覆盖、回落全局）。
   putBotConfig('prompt-cache'),
+  // provider-recovery：`{ providerRecovery: { enabled?, maxWaitMinutes? } | null }`（null = 删除本 bot 覆盖、回落全局）。
+  putBotConfig('provider-recovery'),
   // idle-suspend-minutes：`{ idleSuspendMinutes: number | null }`（null = 关闭空闲 TTL）。
   putBotConfig('idle-suspend-minutes'),
   // session-owner-reminder：per-bot 周期性 owner 提醒策略；owning daemon 校验、落盘并热更新。

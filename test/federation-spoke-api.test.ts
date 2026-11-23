@@ -109,6 +109,32 @@ describe('handleFederationSpokeApi', () => {
     expect(json(res).error).toBe('not_a_local_bot');
   });
 
+  it.each(['unchanged', 'role', 'injectMode'])('conditional role updates preserve concurrent %s edits', async change => {
+    writeBots([{ larkAppId: 'cli_local', botOpenId: null, botName: 'Local', cliId: 'claude' }]);
+    const path = '/api/team/local-bots/cli_local/role';
+    const call = async (method: string, body?: unknown) => {
+      const res = makeRes();
+      await handleFederationSpokeApi(makeReq(method, path, body), res, url(path), { dataDir });
+      return res;
+    };
+    await call('PUT', { role: 'original', injectMode: 'once' });
+    const snapshot = json(await call('GET'));
+    const update = { role: 'policy update', injectMode: 'every', expectedRole: snapshot.role,
+      expectedInjectMode: snapshot.injectMode };
+    const req = makeReq('PUT', path, update);
+    req[Symbol.asyncIterator] = async function* () {
+      if (change !== 'unchanged') await call('PUT', { role: change === 'role' ? 'operator edit' : 'original',
+        injectMode: change === 'injectMode' ? 'every' : 'once' });
+      yield Buffer.from(JSON.stringify(update));
+    };
+    const res = makeRes();
+    await handleFederationSpokeApi(req, res, url(path), { dataDir });
+    expect(res.statusCode).toBe(change === 'unchanged' ? 200 : 409);
+    const actual = json(await call('GET'));
+    expect(actual.role).toBe(change === 'unchanged' ? 'policy update' : change === 'role' ? 'operator edit' : 'original');
+    expect(actual.injectMode).toBe(change === 'role' ? 'once' : 'every');
+  });
+
   it('identity: bind via /pair sets deployment owner + owns local bots (no-steal)', async () => {
     writeBots([
       { larkAppId: 'cli_mine', botOpenId: null, botName: '我的', cliId: 'claude' },

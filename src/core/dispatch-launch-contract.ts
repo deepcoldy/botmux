@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { canonicalJson } from '../utils/canonical-input-hash.js';
 import {
   CODEX_REASONING_EFFORTS,
-  cliModelSupportsReasoningEffort,
+  cliLaunchAcceptsReasoningEffort,
   type CodexReasoningEffort,
 } from '../services/codex-reasoning-effort.js';
 
@@ -109,12 +109,17 @@ export interface DispatchLaunchPolicyV1 {
   allowedReasoningEfforts: CodexReasoningEffort[];
 }
 
+/** Local session backends a v1 launch may run on (wire values). */
+export const DISPATCH_LAUNCH_BACKEND_TYPES = ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'hc'] as const;
+
+export type DispatchLaunchBackendType = typeof DISPATCH_LAUNCH_BACKEND_TYPES[number];
+
 export interface DispatchLaunchIdentityV1 {
   cliId: 'codex';
   cliRuntimeDigest: string;
   executable: string;
   wrapperCli?: string;
-  backendType: 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx';
+  backendType: DispatchLaunchBackendType;
   codexRpcInput: false;
   existingAppServer: false;
   botConfigDigest: string;
@@ -339,7 +344,7 @@ const launchIdentitySchema = z.object({
   cliRuntimeDigest: digestSchema,
   executable: controlledString(DISPATCH_LAUNCH_CONTROL_LIMITS.executableChars),
   wrapperCli: controlledString(DISPATCH_LAUNCH_CONTROL_LIMITS.wrapperChars).optional(),
-  backendType: z.enum(['pty', 'tmux', 'herdr', 'zellij', 'zmx']),
+  backendType: z.enum(DISPATCH_LAUNCH_BACKEND_TYPES),
   codexRpcInput: z.literal(false),
   existingAppServer: z.literal(false),
   botConfigDigest: digestSchema,
@@ -639,8 +644,12 @@ export function resolveDispatchLaunchOverride(input: {
     };
   }
   const effectiveEffort = input.requested.reasoningEffort ?? input.targetReasoningEffort;
+  // Same rule as the dispatching CLI (dispatch-launch-spec): the target's own
+  // saved pair passed its config load and is judged by that keep-rule.
+  const inheritsSavedPair = input.requested.reasoningEffort === undefined
+    && effectiveModel === input.targetModel?.trim();
   if (effectiveEffort !== undefined
-      && !cliModelSupportsReasoningEffort(input.cliId, effectiveModel, effectiveEffort)) {
+      && !cliLaunchAcceptsReasoningEffort(input.cliId, effectiveModel, effectiveEffort, inheritsSavedPair)) {
     return {
       ok: false,
       errorCode: 'INVALID_MODEL_EFFORT_COMBINATION',

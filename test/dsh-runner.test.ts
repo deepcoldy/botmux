@@ -6,12 +6,13 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readlinkSync, existsSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { captureDshProcessIdentity } from '../src/services/dsh-process-attestation.js';
 
 const RUNNER_PATH = resolve('src/dsh-runner.ts');
 const FAKE_SERVER = resolve('test/fixtures/fake-dsh-server.mjs');
@@ -156,6 +157,16 @@ describe('dsh-runner', () => {
     h = spawnRunner('happy');
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
 
+    expect(parseMarkers(h.stdout).find(m => m.kind === 'process_ready')?.payload).toEqual({});
+    if (process.platform === 'linux') {
+      const pid = h.child.pid!;
+      const runnerArgs = readFileSync(`/proc/${pid}/cmdline`, 'utf8').slice(0, -1).split('\0').slice(1);
+      const proof = captureDshProcessIdentity(pid, readlinkSync(`/proc/${pid}/exe`), runnerArgs);
+      expect(proof).toMatchObject({ runnerPid: pid });
+      expect(proof?.enginePid).not.toBe(pid);
+      expect(readFileSync(`/proc/${proof!.enginePid}/cmdline`, 'utf8')).toContain(FAKE_SERVER);
+    }
+
     h.child.stdin.write(makeFrame('你好'));
     await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
 
@@ -177,6 +188,27 @@ describe('dsh-runner', () => {
     expect(existsSync(join(h.home, '.dsh', 'profiles', 'botmux'))).toBe(true);
     // The legacy ~/.botmux/dsh path must not be created anymore.
     expect(existsSync(join(h.home, '.botmux', 'dsh'))).toBe(false);
+  });
+
+  it.skipIf(process.platform !== 'linux')('keeps the SDK usable without engine attestation when proof setup is unavailable', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-no-proof-'));
+    const blocker = join(home, 'not-a-directory');
+    writeFileSync(blocker, 'x');
+    // tsx also writes a cache under TMPDIR; disable only the loader cache so
+    // the real runner can reach the deliberately unavailable proof setup.
+    h = spawnRunner('happy', [], { TMPDIR: blocker, TSX_DISABLE_CACHE: '1' }, home);
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready without proof' }).catch(error => {
+      throw new Error(`${error}\nstdout:\n${h!.stdout}\nstderr:\n${h!.stderr}`);
+    });
+
+    const pid = h.child.pid!;
+    const runnerArgs = readFileSync(`/proc/${pid}/cmdline`, 'utf8').slice(0, -1).split('\0').slice(1);
+    expect(captureDshProcessIdentity(pid, readlinkSync(`/proc/${pid}/exe`), runnerArgs)).toBeUndefined();
+
+    h.child.stdin.write(makeFrame('无证明也要完成这一轮'));
+    await waitFor(() => parseMarkers(h!.stdout).some(m => m.kind === 'final'), { label: 'final without proof' });
+    expect(parseMarkers(h.stdout).find(m => m.kind === 'final')?.payload.content).toContain('你好，我是 dsh。');
+    expect(h.child.exitCode).toBeNull();
   });
 
   it('emits ordered CoT entries for reasoning without duplicating the final reply', async () => {
@@ -564,16 +596,36 @@ describe('dsh-runner', () => {
   }, 30_000);
 
   it('still terminates a turn that emits progress forever', async () => {
-    h = spawnRunner('endless-progress', ['--turn-timeout-ms', '300']);
+    // Progress arrives every 90ms; the 1s idle window leaves room for a loaded
+    // host's scheduling gaps, so only the 4s hard limit can end this turn.
+    h = spawnRunner('endless-progress', ['--turn-timeout-ms', '1000']);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
 
-    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('close', code => resolve(code)));
     h.child.stdin.write(makeFrame('never-ending task'));
     expect(await exitPromise).toBe(1);
 
     const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
     expect(finals).toHaveLength(1);
     expect(finals[0].payload.content).toContain('hard limit');
+  }, 30_000);
+
+  it('a watchdog that fires before the runtime accepts the prompt ends the turn with a final and recycles (no crash)', async () => {
+    // The runtime has not ACKed the prompt when the 300ms idle watchdog fires
+    // (a loaded host). That rejected turn must neither surface as an unhandled
+    // rejection (exit 1, no reply) nor wait for an ACK that may never come:
+    // here it would only arrive after the test's own timeout.
+    h = spawnRunner('endless-progress', ['--turn-timeout-ms', '300'], { FAKE_DSH_PROMPT_ACK_DELAY_MS: '60000' });
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const closed = new Promise<number | null>(resolve => h!.child.on('close', code => resolve(code)));
+    h.child.stdin.write(makeFrame('slow to accept'));
+    expect(await closed).toBe(1);
+
+    const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toContain('timed out after 300ms');
+    expect(h.stderr).not.toMatch(/unhandled|Unhandled/);
   }, 30_000);
 
   it('does not extend the watchdog for notifications without this turn receipt', async () => {

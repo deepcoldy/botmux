@@ -135,6 +135,8 @@ export interface GroupMemberDisplay {
   openId: string;
   name: string;
   memberType: 'user' | 'bot' | 'unknown';
+  /** The viewing bot's own row (it cannot be granted access to itself). */
+  self?: boolean;
 }
 
 export interface RoleProfileSummary {

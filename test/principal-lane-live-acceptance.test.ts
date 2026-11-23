@@ -965,6 +965,21 @@ describe('principal lane production live acceptance', () => {
     }
   });
 
+  it('does not open a principal lane in an assistant-owned session (everything stays the owner\'s)', async () => {
+    sourceDs.session.assistantOwnerOpenId = 'ou_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    try {
+      const data = message('b', 'om_assistant_b', 'B in an assistant group');
+      const ctx = context('om_assistant_b');
+      await __testOnly_dispatchHumanMessageViaHandlers(
+        appId, handlers, { data, ctx, ownsSession: true }, 0,
+      );
+      expect(legacyReply).toHaveBeenCalledOnce();
+      expect(laneByPrincipal('user:union:on_b')).toBeUndefined();
+    } finally {
+      sourceDs.session.assistantOwnerOpenId = undefined;
+    }
+  });
+
   it('rejects a full lane FIFO with a specific not-accepted notice', async () => {
     await dispatch('a', 'om_full_a1', 'source active');
     await dispatch('c', 'om_full_c1', 'materialize C');

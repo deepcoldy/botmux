@@ -247,6 +247,7 @@ import {
   reserveQueuedActivationTailAdmission,
 } from '../src/core/worker-pool.js';
 import { __testOnly_resetSessionTurnQueues, runSessionTurn } from '../src/core/session-turn-queue.js';
+import { readSessionTurns, recordSessionTurnInput, stageSessionTurnInbound } from '../src/services/session-turns.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
@@ -831,6 +832,43 @@ describe('/rename production routing — must not pre-create a session (review P
     rmSync(crossRefPath(), { force: true });
   });
 
+  it('does not download a new assistant owner attachment into the retiring owner bucket', async () => {
+    const ownerA = `ou_${'a'.repeat(32)}`;
+    const ownerB = `ou_${'b'.repeat(32)}`;
+    const { setAssistantOwner } = await import('../src/services/assistant-owner-store.js');
+    const { notifyAssistantOwnerChanged } = await import('../src/core/assistant-mode.js');
+    const bot = registerBot({
+      larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [ownerA, ownerB],
+      assistantMode: true, sandbox: 'oncall', workingDirs: ['/tmp'], disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [ownerA, ownerB];
+    const send = vi.fn();
+    const ds = seedLiveChatSession(send);
+    ds.hasHistory = true;
+    ds.session.cliSessionId = 'cli-owner-a';
+    ds.session.chatType = 'group';
+    ds.session.assistantOwnerOpenId = ownerA;
+    ds.session.sandbox = 'oncall';
+    ds.session.sandboxWithholdBotSecret = true;
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    setAssistantOwner(mocks.dataDir, APP, CHAT, ownerA, 'claimed');
+    // Model a remote close that has started but cannot settle: the stale active
+    // row must remain unable to persist new-owner data in the meantime.
+    mocks.closeWorkerPoolSession.mockImplementation(() => new Promise(() => {}));
+    setAssistantOwner(mocks.dataDir, APP, CHAT, ownerB, 'admin');
+    notifyAssistantOwnerChanged(APP, CHAT, ownerB);
+    const data = makeEventData('om_owner_b_secret', 'secret attachment');
+    data.sender.sender_id.open_id = ownerB;
+    data.message.message_type = 'file';
+    data.message.content = JSON.stringify({ file_key: 'file_owner_b_secret', file_name: 'secret.txt' });
+    await handleThreadReply(data, { ...makeCtx(CHAT, 'om_owner_b_secret'), scope: 'chat', anchor: CHAT });
+    const bucketOwners = mocks.downloadResources.mock.calls
+      .filter(call => call[1] === 'om_owner_b_secret')
+      .map(call => call[4]);
+    expect(bucketOwners).toEqual([]);
+    expect(send.mock.calls.some(call => call[0]?.type === 'message')).toBe(false);
+  });
+
   describe('async Ask production HTTP route and inbound answer wiring', () => {
     async function setup(scope: 'chat' | 'thread' = 'thread') {
       const root = scope === 'thread' ? 'om_async_review_root' : CHAT;
@@ -1332,6 +1370,52 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(activeSessions.size).toBe(1);
     expect(activeSessions.get(sessionKey('om_root_2', APP))).toBe(ds);
     expect(repliedText()).toContain('会话标题已更新');
+  });
+
+  it.each([
+    { entry: 'new-topic', sender: 'peer', expectedIsBot: true },
+    { entry: 'thread', sender: 'peer', expectedIsBot: true },
+    { entry: 'thread', sender: 'human', expectedIsBot: false },
+  ] as const)('bare /rename preserves the route-resolved sender identity ($entry, $sender)', async ({ entry, sender, expectedIsBot }) => {
+    const peerOpenId = 'ou_bare_rename_peer';
+    const senderOpenId = sender === 'peer' ? peerOpenId : OWNER;
+    mkdirSync(mocks.dataDir, { recursive: true });
+    writeFileSync(crossRefPath(), JSON.stringify({ PeerBot: peerOpenId }));
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER, peerOpenId],
+      bareRenamePassthrough: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER, peerOpenId];
+    const anchor = `om_bare_rename_${entry}_${sender}`;
+    const messageId = `${anchor}_message`;
+    const ds = seedThreadSession(anchor, 'bare rename sender identity');
+    ds.session.cliId = 'claude-code';
+    const send = vi.fn();
+    ds.worker = { killed: false, connected: true, send } as any;
+    const data = makeEventData(messageId, '/rename', entry === 'thread' ? anchor : undefined);
+    // Lark did not stamp sender_type. Only the route's cross-ref can distinguish
+    // the registered peer bot from the genuine human control.
+    data.sender = { sender_id: { open_id: senderOpenId } };
+
+    if (entry === 'new-topic') await handleNewTopic(data, makeCtx(anchor, messageId));
+    else await handleThreadReply(data, makeCtx(anchor, messageId));
+
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'raw_input', content: '/rename', turnId: messageId,
+    }));
+    expect(ds.session.quoteTargetSenderOpenId).toBe(senderOpenId);
+    expect(ds.session.quoteTargetSenderIsBot).toBe(expectedIsBot);
+    expect(ds.session.replyTargets?.[messageId]?.participants).toEqual([
+      expect.objectContaining({ openId: senderOpenId, isBot: expectedIsBot }),
+    ]);
+    expect(ds.session.turnReplyContexts?.[messageId]).toMatchObject({
+      replyTargetSenderOpenId: senderOpenId,
+      replyTargetSenderIsBot: expectedIsBot,
+    });
+    expect(mocks.updateSession).toHaveBeenCalledWith(ds.session);
   });
 
   it('non-allowedUsers sender: `/rename` is denied by canOperate on BOTH routes, nothing created/renamed', async () => {
@@ -3101,7 +3185,16 @@ describe('/rename production routing — must not pre-create a session (review P
     ds.pendingCodexAppFollowUpContexts = bufs.map(() => '');
     // Every buffered message was clean-input-accepted (all true) — must NOT leak
     // into a steer authorization at any layer.
-    ds.pendingCodexAppFollowUpGateAccepted = [...gates];
+    ds.pendingCodexAppFollowUpGateAccepted = [...gates]
+
+    // Read model: stage the inbound rows the real daemon writes on admission,
+    // BEFORE the coalesced release merges them into the last attributed turn.
+    for (const [i, tid] of turnIds.entries()) {
+      stageSessionTurnInbound(config.session.dataDir, ds.session.sessionId, tid, {
+        via: 'trigger', messageId: tid, text: bufs[i]!,
+        placement: { kind: 'thread', rootMessageId: anchor },
+      });
+    }
 
     await expect(releaseQueuedActivationReservation(ds)).resolves.toBe(true);
 
@@ -3126,6 +3219,21 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(msg.content).toContain('BUFFERED_ONE');
     if (bufs.length > 1) expect(msg.content).toContain('BUFFERED_TWO');
     expect(msg.codexAppSteerable).toBeUndefined();
+
+    // Replay the worker's default resolution (no explicit source ids) against
+    // the last attributed turnId: the release must have merged every buffered
+    // message's staged inbound into that turn.
+    const targetTurnId = turnIds.at(-1)!;
+    recordSessionTurnInput({
+      dataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId,
+      turnId: targetTurnId,
+      input: bufs.join('\n\n'),
+      cliId: 'codex',
+    });
+    const turnsPage = readSessionTurns(config.session.dataDir, ds.session.sessionId, 0, 50);
+    expect(turnsPage.turns.find(turn => turn.turnId === targetTurnId)?.inbound.map(m => m.text))
+      .toEqual(bufs);
   });
 
   it('routes Codex /fast verbatim to a live session but never cold-starts one', async () => {
@@ -5073,5 +5181,231 @@ describe('runtime passthrough cascade (PR-3)', () => {
     );
     expect(raws().map((m: any) => m.content)).toEqual(['/model opus']);
     expect(raws()[0].turnId).toBe('om_casc_4');
+  });
+});
+
+describe('remote-runner delegated slash production ingress (#3469)', () => {
+  const GUEST = 'ou_delegated_guest';
+  function remoteBot(extra: Record<string, unknown> = {}) {
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'remote-runner',
+      backendType: 'remote-runner', allowedUsers: [OWNER], defaultWorkingDir: '/tmp',
+      remoteRunner: { delegatedSlashCommands: ['/adopt', '/detach'] }, ...extra });
+    bot.resolvedAllowedUsers = [OWNER];
+    return bot;
+  }
+  beforeEach(() => { resetRouteTestState(); remoteBot(); });
+
+  for (const route of ['new-topic', 'thread'] as const) {
+    const invoke = (text: string, id: string, sender = OWNER) => {
+      const data = makeEventData(id, text, route === 'thread' ? `root_${id}` : undefined);
+      data.sender.sender_id.open_id = sender;
+      const ctx = makeCtx(route === 'thread' ? `root_${id}` : id, id);
+      return route === 'thread' ? handleThreadReply(data, ctx) : handleNewTopic(data, ctx);
+    };
+    it(`${route}: cold-starts adopt as an exact authenticated structured turn`, async () => {
+      await invoke('/ADOPT  reference-thread:alpha', `om_delegated_${route}`);
+      await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
+      const call = mocks.forkWorker.mock.calls[0]!;
+      expect(call[1]).toMatchObject({ content: '/ADOPT  reference-thread:alpha' });
+      const ds = call[0];
+      expect(ds.session.source).not.toBe('external');
+      expect(ds.session.lastTrustedCaller ?? ds.pendingTrustedCaller ?? (call[1] as any).trustedCaller
+        ?? (call[2] as any)?.trustedCaller ?? (call[3] as any)?.trustedCaller).toBeDefined();
+      expect(mocks.forkAdoptWorker).not.toHaveBeenCalled();
+    });
+    it.each(['/detach', '/disconnect'])(`${route}: %s without a session creates no provider or session`, async text => {
+      await invoke(text, `om_unbound_${route}_${text.slice(1)}`);
+      expect(mocks.createSession).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(activeSessions.size).toBe(0);
+      expect(repliedKey('cmd.remote_runner.no_binding')).toBe(true);
+    });
+    it(`${route}: keeps canOperate authorization even though delivery is a turn`, async () => {
+      remoteBot({ globalGrants: [GUEST] });
+      await invoke('/adopt alpha', `om_denied_${route}`, GUEST);
+      expect(mocks.createSession).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(repliedKey('daemon.cmd_allowed_users_only', { cmd: '/adopt' })).toBe(true);
+    });
+    it(`${route}: allows explicit canTalk downgrade but grant restriction remains first`, async () => {
+      remoteBot({ globalGrants: [GUEST], canTalkDaemonCommands: ['/adopt'], restrictGrantCommands: true });
+      await invoke('/adopt alpha', `om_grant_block_${route}`, GUEST);
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(repliedKey('cmd.grant_restricted', { cmd: '/adopt' })).toBe(true);
+      remoteBot({ globalGrants: [GUEST], canTalkDaemonCommands: ['/adopt'] });
+      await invoke('/adopt alpha', `om_downgrade_${route}`, GUEST);
+      await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
+    });
+  }
+
+  it('preserves a queued backlog head and appends delegated adopt as its exact successor', async () => {
+    const root = 'om_delegated_backlog';
+    const ds = seedThreadSession(root, 'backlog');
+    Object.assign(ds.session, { cliId: 'remote-runner', backendType: 'remote-runner',
+      queued: true, queuedPrompt: 'EXISTING_BACKLOG_TASK' });
+    ds.workingDir = '/tmp';
+    mocks.forkWorker.mockImplementationOnce((current: any) => {
+      current.worker = { killed: false, send: vi.fn() };
+      current.session.queuedActivationPending = true;
+      current.session.queuedActivationToken = 'delegated-backlog-head';
+      return true;
+    });
+    await handleThreadReply(makeEventData('om_backlog_adopt', '/adopt reference-thread:alpha', root),
+      makeCtx(root, 'om_backlog_adopt'));
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]![1].content).toContain('EXISTING_BACKLOG_TASK');
+    expect(mocks.forkWorker.mock.calls[0]![1].content).not.toContain('/adopt reference-thread:alpha');
+    expect(ds.session.queuedActivationTail).toEqual([expect.objectContaining({
+      turnId: 'om_backlog_adopt',
+      cliInput: expect.objectContaining({ content: '/adopt reference-thread:alpha',
+        trustedCaller: expect.objectContaining({ requestUserOpenId: OWNER }) }),
+    })]);
+  });
+
+  it('preserves detach/disconnect text and caller on a live worker without closing the local row', async () => {
+    const root = 'om_delegated_live';
+    const ds = seedThreadSession(root, 'remote binding');
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.session.remoteBackendState = { version: 1, provider: 'reference', generation: 1,
+      remoteSessionId: 'remote:1', agentThreadId: 'reference-thread:alpha' };
+    ds.workingDir = '/tmp';
+    const send = vi.fn(() => true);
+    ds.worker = { killed: false, send } as any;
+    ds.cliReady = true;
+    for (const [i, text] of ['/disconnect', '/adopt reference-thread:beta'].entries()) {
+      await handleThreadReply(makeEventData(`om_live_delegated_${i}`, text, root), makeCtx(root, `om_live_delegated_${i}`));
+    }
+    const inputs = send.mock.calls.map(([message]) => message).filter(message => message.type === 'message');
+    expect(inputs.map(message => message.content)).toEqual(['/disconnect', '/adopt reference-thread:beta']);
+    expect(inputs[0].trustedCaller).toMatchObject({ requestUserOpenId: OWNER, requestLarkAppId: APP });
+    expect(ds.session.status).toBe('active');
+    expect(ds.session.remoteBackendState.agentThreadId).toBe('reference-thread:alpha');
+    expect(mocks.closeWorkerPoolSession).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('delegated slash lifecycle guards', () => {
+  beforeEach(() => {
+    resetRouteTestState();
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'remote-runner',
+      backendType: 'remote-runner', allowedUsers: [OWNER], defaultWorkingDir: '/tmp',
+      remoteRunner: { delegatedSlashCommands: ['/adopt', '/detach'] } });
+    bot.resolvedAllowedUsers = [OWNER];
+  });
+  it.each(['new-topic', 'thread'])('rejects delegated detach in primary mode at %s ingress', async route => {
+    const coordination = await import('../src/services/durable-coordination-runtime.js');
+    const primary = vi.spyOn(coordination, 'coordinationModeIsPrimary').mockReturnValue(true);
+    try {
+      const root = 'om_primary_delegated_' + route;
+      const ds = seedThreadSession(root, 'primary');
+      ds.session.cliId = 'remote-runner';
+      ds.session.backendType = 'remote-runner';
+      const send = vi.fn();
+      ds.worker = { killed: false, send } as any;
+      const data = makeEventData('om_primary_msg_' + route, '/disconnect', route === 'thread' ? root : undefined);
+      if (route === 'thread') await handleThreadReply(data, makeCtx(root, 'om_primary_msg_' + route));
+      else await handleNewTopic(data, makeCtx('om_primary_msg_' + route, 'om_primary_msg_' + route));
+      expect(send).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(mocks.closeWorkerPoolSession).not.toHaveBeenCalled();
+      expect(repliedKey('cmd.detach.primary_unsupported')).toBe(true);
+    } finally { primary.mockRestore(); }
+  });
+  it('uses the frozen backend when the bot default changes', async () => {
+    const root = 'om_delegated_frozen';
+    const ds = seedThreadSession(root, 'local');
+    ds.session.cliId = 'claude-code';
+    ds.session.backendType = 'tmux';
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    await handleThreadReply(makeEventData('om_frozen_detach', '/detach', root), makeCtx(root, 'om_frozen_detach'));
+    expect(send).not.toHaveBeenCalled();
+    expect(repliedKey('cmd.detach.not_adopted')).toBe(true);
+  });
+  it.each([true, false])('treats a history-less restored row as bound only with a provider snapshot (snapshot=%s)', async snapshot => {
+    const root = 'om_delegated_restored_' + snapshot;
+    const ds = seedThreadSession(root, 'restored');
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    if (snapshot) {
+      ds.session.remoteBackendState = { version: 1, provider: 'reference', generation: 1,
+        remoteSessionId: 'remote:1', agentThreadId: 'reference-thread:alpha' };
+    }
+    ds.workingDir = '/tmp';
+    await handleThreadReply(makeEventData('om_restored_detach_' + snapshot, '/detach', root),
+      makeCtx(root, 'om_restored_detach_' + snapshot));
+    if (snapshot) {
+      await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
+      expect(mocks.forkWorker.mock.calls[0]![1]).toMatchObject({ content: '/detach' });
+      expect(repliedKey('cmd.remote_runner.no_binding')).toBe(false);
+    } else {
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(repliedKey('cmd.remote_runner.no_binding')).toBe(true);
+    }
+  });
+  const remoteSeed = (root: string) => {
+    const ds = seedThreadSession(root, 'remote binding');
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.workingDir = '/tmp';
+    return ds;
+  };
+  it('stages delegated adopt as the durable opening of a bare pending repo selection', async () => {
+    const root = 'om_delegated_repo_bare';
+    const ds = remoteSeed(root);
+    ds.pendingRepo = true;
+    ds.pendingPrompt = '';
+    await handleThreadReply(makeEventData('om_repo_bare_adopt', '/ADOPT  reference-thread:alpha', root),
+      makeCtx(root, 'om_repo_bare_adopt'));
+    expect(ds.pendingAcceptedInput).toMatchObject({ content: '/ADOPT  reference-thread:alpha',
+      trustedCaller: expect.objectContaining({ requestUserOpenId: OWNER }) });
+    expect(ds.session.pendingRepoSetup?.acceptedInput).toMatchObject({ content: '/ADOPT  reference-thread:alpha' });
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+  it('queues delegated detach behind an existing pending repo opening as an exact tail', async () => {
+    const root = 'om_delegated_repo_tail';
+    const ds = remoteSeed(root);
+    ds.pendingRepo = true;
+    ds.pendingPrompt = 'EXISTING_OPENING';
+    await handleThreadReply(makeEventData('om_repo_tail_detach', '/disconnect', root), makeCtx(root, 'om_repo_tail_detach'));
+    expect(ds.session.queuedActivationTail).toEqual([expect.objectContaining({ turnId: 'om_repo_tail_detach',
+      cliInput: expect.objectContaining({ content: '/disconnect',
+        trustedCaller: expect.objectContaining({ requestUserOpenId: OWNER }) }) })]);
+    expect(ds.pendingAcceptedInput).toBeUndefined();
+  });
+  it('queues delegated detach behind a reserved initial start as an exact tail', async () => {
+    const root = 'om_delegated_initial_tail';
+    const ds = remoteSeed(root);
+    ds.initialStartPending = true;
+    ds.pendingPrompt = 'OPENING_IN_PREPARATION';
+    await handleThreadReply(makeEventData('om_initial_tail_detach', '/detach', root), makeCtx(root, 'om_initial_tail_detach'));
+    await vi.waitFor(() => expect(ds.session.queuedActivationTail).toEqual([expect.objectContaining({
+      turnId: 'om_initial_tail_detach', cliInput: expect.objectContaining({ content: '/detach' }) })]));
+  });
+  it('sends delegated adopt as the exact opening of a live empty-start worker', async () => {
+    const root = 'om_delegated_live_opening';
+    const ds = remoteSeed(root);
+    const send = vi.fn(() => true);
+    ds.worker = { killed: false, send } as any;
+    ds.cliReady = true;
+    ds.session.initialUserTurnPending = true;
+    await handleThreadReply(makeEventData('om_live_opening_adopt', '/ADOPT  reference-thread:alpha', root),
+      makeCtx(root, 'om_live_opening_adopt'));
+    const inputs = send.mock.calls.map(call => (call as unknown[])[0] as any).filter(message => message.type === 'message');
+    expect(inputs.map(message => message.content)).toEqual(['/ADOPT  reference-thread:alpha']);
+    expect(inputs[0].trustedCaller).toMatchObject({ requestUserOpenId: OWNER, requestLarkAppId: APP });
+  });
+  it('re-forks a suspended empty-start provider with delegated adopt as its exact opening', async () => {
+    const root = 'om_delegated_refork_opening';
+    const ds = remoteSeed(root);
+    ds.session.initialUserTurnPending = true;
+    ds.session.remoteBackendState = { version: 1, provider: 'reference', generation: 1, remoteSessionId: 'remote:1' };
+    await handleThreadReply(makeEventData('om_refork_opening_adopt', '/ADOPT  reference-thread:alpha', root),
+      makeCtx(root, 'om_refork_opening_adopt'));
+    await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
+    expect(mocks.forkWorker.mock.calls[0]![1]).toMatchObject({ content: '/ADOPT  reference-thread:alpha',
+      trustedCaller: expect.objectContaining({ requestUserOpenId: OWNER }) });
   });
 });

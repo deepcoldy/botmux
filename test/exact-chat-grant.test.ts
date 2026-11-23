@@ -5,6 +5,13 @@ import {
   MAX_EXACT_CHAT_GRANT_SUBJECTS,
   type ExactChatGrantDeps,
 } from '../src/services/exact-chat-grant.js';
+import {
+  ChatMemberListTooLargeError,
+  CURRENT_CHAT_USER_MEMBER_PAGE_CAP,
+  scanChatMemberPages,
+} from '../src/im/lark/client.js';
+
+const PEOPLE_IN_CHAT = ['ou_person_in_chat', 'ou_owner'];
 
 function makeDeps() {
   const grants = new Set<string>();
@@ -16,6 +23,9 @@ function makeDeps() {
       { openId: 'ou_peer_a', displayName: 'Peer A' },
       { openId: 'ou_peer_b', displayName: 'Peer B' },
     ]),
+    // Feishu's /members never lists bots; it is the people side of membership.
+    findCurrentChatUserMembers: vi.fn(async (_appId: string, _chatId: string, openIds: string[]) =>
+      openIds.filter(openId => PEOPLE_IN_CHAT.includes(openId))),
     resolveCurrentChatBotOpenIdsByLarkAppIds: vi.fn(async (_receiver, _chatId, subjectLarkAppIds) => ({
       ok: true as const,
       mappings: subjectLarkAppIds.map(larkAppId => ({
@@ -60,7 +70,7 @@ describe('exact chat grant service', () => {
     expect(result).toMatchObject({
       ok: false,
       status: 409,
-      error: 'subject_not_current_chat_bot',
+      error: 'subject_not_current_chat_member',
       invalidSubjectOpenIds: ['ou_stale_observed'],
     });
     expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
@@ -326,6 +336,244 @@ describe('exact chat grant service', () => {
       subjectLarkAppIds: tooMany,
     }, fixture.deps)).toMatchObject({ ok: false, error: 'too_many_subject_lark_app_ids' });
     expect(fixture.deps.resolveCurrentChatBotOpenIdsByLarkAppIds).not.toHaveBeenCalled();
+  });
+});
+
+// Dashboard 群管理「成员权限」可以勾选真人：真人不在 /members/bots 里，必须按
+// 群成员名单校验；不在群的人（真人或机器人）仍然一律不能被授权。
+describe('exact chat grant membership: people and bots', () => {
+  let fixture: ReturnType<typeof makeDeps>;
+
+  beforeEach(() => {
+    fixture = makeDeps();
+  });
+
+  it('grants a person who is in the chat per the live member list', async () => {
+    const result = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      subjectOpenIds: ['ou_person_in_chat', 'ou_peer_a'],
+      quota: 3,
+    }, fixture.deps);
+
+    expect(result).toMatchObject({
+      ok: true,
+      operation: 'grant',
+      talkOnly: true,
+      grantsOperate: false,
+      subjects: [
+        { subjectOpenId: 'ou_person_in_chat', chatGrantActive: true, changed: true, grantsOperate: false },
+        { subjectOpenId: 'ou_peer_a', chatGrantActive: true, changed: true, grantsOperate: false },
+      ],
+    });
+    // Only the subjects the bot list did not confirm are looked up among people.
+    expect(fixture.deps.findCurrentChatUserMembers).toHaveBeenCalledWith('cli_receiver', 'oc_chat', ['ou_person_in_chat']);
+    expect(fixture.deps.addChatGrant).toHaveBeenCalledWith('cli_receiver', 'oc_chat', 'ou_person_in_chat', 3, undefined);
+    expect([...fixture.grants]).toEqual(['ou_person_in_chat', 'ou_peer_a']);
+  });
+
+  it('rejects the whole batch when a person is not in the chat, naming only that person', async () => {
+    const result = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      subjectOpenIds: ['ou_person_in_chat', 'ou_person_left', 'ou_peer_a'],
+    }, fixture.deps);
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 409,
+      error: 'subject_not_current_chat_member',
+      invalidSubjectOpenIds: ['ou_person_left'],
+    });
+    expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
+    expect(fixture.grants.size).toBe(0);
+  });
+
+  it('rejects the receiver bot itself before any membership lookup or write', async () => {
+    const result = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      subjectOpenIds: ['ou_person_in_chat', 'ou_receiver'],
+    }, fixture.deps);
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 400,
+      error: 'receiver_cannot_be_subject',
+      invalidSubjectOpenIds: ['ou_receiver'],
+    });
+    expect(fixture.deps.listCurrentChatBotMembers).not.toHaveBeenCalled();
+    expect(fixture.deps.findCurrentChatUserMembers).not.toHaveBeenCalled();
+    expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
+  });
+
+  it('keeps a bot-only batch independent of the human member list', async () => {
+    vi.mocked(fixture.deps.findCurrentChatUserMembers).mockRejectedValue(new Error('no member scope'));
+    const result = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      subjectOpenIds: ['ou_peer_a', 'ou_peer_b'],
+    }, fixture.deps);
+
+    expect(result.ok).toBe(true);
+    expect(fixture.deps.findCurrentChatUserMembers).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the member list is unavailable for a subject the bot list does not cover', async () => {
+    vi.mocked(fixture.deps.findCurrentChatUserMembers).mockRejectedValue(new Error('member list truncated'));
+    const result = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      subjectOpenIds: ['ou_person_in_chat'],
+    }, fixture.deps);
+
+    expect(result).toMatchObject({ ok: false, status: 502, error: 'live_membership_unavailable', message: 'member list truncated' });
+    expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
+  });
+
+  it('reports a member list too long to read to the end as its own error, not as "left" or "retry later"', async () => {
+    vi.mocked(fixture.deps.findCurrentChatUserMembers).mockRejectedValue(new ChatMemberListTooLargeError('oc_chat'));
+    const result = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      subjectOpenIds: ['ou_person_in_chat'],
+    }, fixture.deps);
+
+    expect(result).toMatchObject({ ok: false, status: 422, error: 'live_membership_too_large' });
+    expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
+  });
+
+  it('blames the failed bot lookup, not the chat size, when bots had to be looked for among people', async () => {
+    vi.mocked(fixture.deps.listCurrentChatBotMembers).mockRejectedValue(new Error('members/bots down'));
+    vi.mocked(fixture.deps.findCurrentChatUserMembers).mockRejectedValue(new ChatMemberListTooLargeError('oc_chat'));
+    const result = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      subjectOpenIds: ['ou_peer_a'],
+    }, fixture.deps);
+
+    expect(result).toMatchObject({ ok: false, status: 502, error: 'live_membership_unavailable', message: 'members/bots down' });
+    expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
+  });
+
+  it('keeps the stable app-id (bot-to-bot) path on the bot list only, with its original answers', async () => {
+    const byAppId = (input?: Partial<Parameters<typeof applyExactChatGrantByLarkAppIds>[0]>) => applyExactChatGrantByLarkAppIds({
+      operation: 'grant',
+      receiverLarkAppId: 'cli_receiver',
+      chatId: 'oc_chat',
+      subjectLarkAppIds: ['cli_pm'],
+      ...input,
+    }, fixture.deps);
+    // Resolution saw the bot, but the second live bot read no longer lists it.
+    vi.mocked(fixture.deps.resolveCurrentChatBotOpenIdsByLarkAppIds).mockResolvedValue({
+      ok: true,
+      mappings: [{ larkAppId: 'cli_pm', subjectOpenId: 'ou_peer_gone' }],
+    });
+    expect(await byAppId()).toMatchObject({
+      ok: false,
+      status: 409,
+      error: 'subject_not_current_chat_bot',
+      invalidSubjectOpenIds: ['ou_peer_gone'],
+    });
+
+    vi.mocked(fixture.deps.listCurrentChatBotMembers).mockRejectedValue(new Error('members/bots down'));
+    expect(await byAppId()).toMatchObject({ ok: false, status: 502, error: 'live_membership_unavailable', message: 'members/bots down' });
+
+    expect(fixture.deps.findCurrentChatUserMembers).not.toHaveBeenCalled();
+    expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
+  });
+
+  it('when only the bot list is down: people confirmed by the member list pass, anyone else is unknown, not "left"', async () => {
+    vi.mocked(fixture.deps.listCurrentChatBotMembers).mockRejectedValue(new Error('members/bots down'));
+
+    const people = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      subjectOpenIds: ['ou_person_in_chat'],
+    }, fixture.deps);
+    expect(people).toMatchObject({ ok: true, subjects: [{ subjectOpenId: 'ou_person_in_chat', chatGrantActive: true }] });
+
+    vi.mocked(fixture.deps.addChatGrant).mockClear();
+    const withBot = await applyExactChatGrant({
+      ...base,
+      operation: 'grant',
+      subjectOpenIds: ['ou_person_in_chat', 'ou_peer_a'],
+    }, fixture.deps);
+    expect(withBot).toMatchObject({ ok: false, status: 502, error: 'live_membership_unavailable', message: 'members/bots down' });
+    expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
+  });
+});
+
+// 授权级的真人成员查询：找齐即停；只有把名单读到底才能判定「不在群」，
+// 任何会让名单看起来比实际短的情况都必须抛错，而不是答「不在群」。
+describe('chat member page scan for grants', () => {
+  type Page = { code?: number; msg?: string; data?: any };
+  function pages(...list: Page[]) {
+    const tokens: Array<string | undefined> = [];
+    const fetchPage = vi.fn(async (pageToken: string | undefined) => {
+      tokens.push(pageToken);
+      const page = list[tokens.length - 1];
+      if (!page) throw new Error('read past the last page');
+      return page;
+    });
+    return { fetchPage, tokens };
+  }
+  const row = (id: unknown) => ({ member_id: id, member_id_type: 'open_id', name: String(id) });
+
+  it('stops paging once every wanted person is found', async () => {
+    const src = pages(
+      { code: 0, data: { items: [row('ou_a'), row('ou_x')], has_more: true, page_token: 'p2' } },
+      { code: 0, data: { items: [row('ou_b')], has_more: true, page_token: 'p3' } },
+    );
+    await expect(scanChatMemberPages('oc_chat', ['ou_a', 'ou_b'], src.fetchPage)).resolves.toEqual(new Set(['ou_a', 'ou_b']));
+    expect(src.tokens).toEqual([undefined, 'p2']);
+  });
+
+  it('rules someone out only after reading the list to the end', async () => {
+    const src = pages(
+      { code: 0, data: { items: [row('ou_a')], has_more: true, page_token: 'p2' } },
+      { code: 0, data: { items: [row('ou_c'), row(42), row(''), {}], has_more: false } },
+    );
+    await expect(scanChatMemberPages('oc_chat', ['ou_a', 'ou_gone'], src.fetchPage)).resolves.toEqual(new Set(['ou_a']));
+    expect(src.tokens).toEqual([undefined, 'p2']);
+  });
+
+  it('throws instead of answering from a list that may be cut short', async () => {
+    const scan = (...list: Page[]) => scanChatMemberPages('oc_chat', ['ou_gone'], pages(...list).fetchPage);
+    await expect(scan({ code: 99991672, msg: 'Access denied' })).rejects.toThrow('Access denied');
+    await expect(scan({ msg: 'no code', data: { items: [row('ou_a')], has_more: false } })).rejects.toThrow('no code');
+    await expect(scan({ code: 0 })).rejects.toThrow('no items array');
+    await expect(scan({ code: 0, data: { items: null, has_more: false } })).rejects.toThrow('no items array');
+    await expect(scan({ code: 0, data: { items: [row('ou_a')], has_more: true } })).rejects.toThrow('no page_token');
+    for (const hasMore of ['true', 1, undefined, null]) {
+      await expect(scan({ code: 0, data: { items: [row('ou_a')], has_more: hasMore, page_token: 'p2' } }))
+        .rejects.toThrow('no boolean has_more');
+    }
+  });
+
+  it('treats a page_token that comes back again as a broken list, not as a long one', async () => {
+    const src = pages(
+      { code: 0, data: { items: [row('ou_a')], has_more: true, page_token: 'same' } },
+      { code: 0, data: { items: [row('ou_b')], has_more: true, page_token: 'same' } },
+    );
+    const err = await scanChatMemberPages('oc_chat', ['ou_gone'], src.fetchPage).catch(e => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(ChatMemberListTooLargeError);
+    expect(String(err.message)).toContain('repeats an earlier page_token');
+    expect(src.tokens).toEqual([undefined, 'same']);
+  });
+
+  it('gives up with ChatMemberListTooLargeError at the page cap while someone is unconfirmed', async () => {
+    let n = 0;
+    const fetchPage = vi.fn(async () => ({ code: 0, data: { items: [row(`ou_${n}`)], has_more: true, page_token: `p${++n}` } }));
+    await expect(scanChatMemberPages('oc_chat', ['ou_gone'], fetchPage)).rejects.toBeInstanceOf(ChatMemberListTooLargeError);
+    expect(fetchPage).toHaveBeenCalledTimes(CURRENT_CHAT_USER_MEMBER_PAGE_CAP);
+  });
+
+  it('reads nothing when nobody is asked about', async () => {
+    const fetchPage = vi.fn();
+    await expect(scanChatMemberPages('oc_chat', [], fetchPage)).resolves.toEqual(new Set());
+    expect(fetchPage).not.toHaveBeenCalled();
   });
 });
 

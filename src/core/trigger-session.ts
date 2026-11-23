@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { resolveAssistantSpawn } from './assistant-spawn.js';
 import { outputDeliveryJournal } from '../services/output-delivery-journal.js';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
 import { messageListenerTaskAnchor } from './message-listener-silence.js';
@@ -11,13 +12,18 @@ import * as idempotencyStore from '../services/idempotency-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
-import { getBot, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { getBot, getStrictOwnerOpenId, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { resolveSender, type ResolvedSender } from '../im/lark/identity-cache.js';
+import { beginReplyTargetTurn } from './reply-target.js';
+import { renderInboundMessageLocation } from './reply-message.js';
 import { getChatMode, getMessageChatId, sendMessage, replyMessage, type ChatMode } from '../im/lark/client.js';
 import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
+import { stageSessionTurnInbound } from '../services/session-turns.js';
 import { markSessionActivity } from './session-activity.js';
+import { excludedTurnActivityAt } from './turn-outcome.js';
 import {
   closeSessionForBackgroundCleanup,
   forkWorker,
@@ -41,7 +47,7 @@ import type { CliTurnPayload } from '../types.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import { cliModelSupportsReasoningEffort } from '../services/codex-reasoning-effort.js';
+import { cliLaunchAcceptsReasoningEffort } from '../services/codex-reasoning-effort.js';
 import { allowsTaskModelOverride } from './launch-model-capability.js';
 import { headlessChatId, isHeadlessId, newHeadlessId, saveHeadlessSession, updateHeadlessSession } from '../services/headless-session-store.js';
 
@@ -194,6 +200,20 @@ export function isTrustedPayloadRequest(req: TriggerRequest): boolean {
 export function trustedPayloadSessionInScope(requestChatId: string | undefined, sessionChatId: string): boolean {
   if (requestChatId) return sessionChatId === requestChatId;
   return sessionChatId.startsWith('http_async_') || sessionChatId.startsWith('http_wait_');
+}
+
+/** Zero-injection prompt of an external trigger: the caller's instruction,
+ *  then the event data as-is. An event without data (no rawText, payload
+ *  absent or `{}`) sends the instruction alone — rendering the missing payload
+ *  as `{}` put a stray "{}" line under every bare "继续" a connector sent. A
+ *  request with neither still renders its (empty) payload, as before: an empty
+ *  input is not a turn the CLI would start. */
+export function buildZeroInjectionTriggerPrompt(req: Pick<TriggerRequest, 'instruction' | 'envelope'>): string {
+  const { rawText, payload } = req.envelope;
+  const emptyPayload = payload === undefined || payload === null
+    || (typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0);
+  const data = rawText ?? (emptyPayload ? undefined : JSON.stringify(payload));
+  return [req.instruction, data].filter(Boolean).join('\n\n') || JSON.stringify(payload ?? {});
 }
 
 export function buildUntrustedEventPrompt(req: TriggerRequest, triggerId: string): string {
@@ -734,6 +754,7 @@ function waitForSessionFinalOutput(
       resolve({ ok: false, triggerId, errorCode: 'wait_timeout', error: `wait timeout after ${timeoutMs}ms` });
     }, timeoutMs);
     ds.pendingWaitPromises!.set(triggerId, {
+      createdAt: Date.now(),
       resolve: (text: string) => {
         clearTimeout(timer);
         ds.pendingWaitPromises?.delete(triggerId);
@@ -823,11 +844,13 @@ function buildExistingSessionContent(
   codexAppApplicationContext: string,
   codexAppMessageContext: string,
   turnId: string,
+  owner?: ResolvedSender,
+  rootMessageId?: string,
 ) {
   ensureSessionWhiteboard(ds);
   const botCfg = getBot(larkAppId).config;
   return buildFollowUpCliInput(prompt, ds.session.sessionId, {
-    isAdoptMode: false,
+    isAdoptMode: !!owner && !!ds.adoptedFrom,
     cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
     cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
     locale: localeForBot(larkAppId),
@@ -842,7 +865,29 @@ function buildExistingSessionContent(
     sessionBackendType: ds.session.backendType,
     promptInjection: sessionPromptInjection(ds),
     turnId,
+    ...(owner ? {
+      sender: owner,
+      messageLocation: { rootMessageId },
+      trustedCaller: { requestLarkAppId: larkAppId, requestUserOpenId: owner.openId, senderType: 'user' },
+    } : {}),
   });
+}
+
+function stageTriggerReadModel(ds: DaemonSession, req: TriggerRequest, turnId: string, owner?: ResolvedSender, rootMessageId?: string): void {
+  if (ds.session.status === 'closed') return;
+  try {
+    stageSessionTurnInbound(config.session.dataDir, ds.session.sessionId, turnId, {
+      via: owner ? 'owner_actor' : 'trigger',
+      messageId: turnId,
+      text: req.instruction ?? '',
+      ...(owner ? { sender: { type: 'user', openId: owner.openId, name: owner.name } } : {}),
+      placement: rootMessageId || ds.scope === 'thread'
+        ? { kind: 'thread', rootMessageId: rootMessageId ?? ds.session.rootMessageId }
+        : { kind: 'chat' },
+    });
+  } catch {
+    logger.warn('Failed to stage structured trigger input');
+  }
 }
 
 async function triggerSessionTurnAdmitted(
@@ -851,7 +896,8 @@ async function triggerSessionTurnAdmitted(
   internal?: TriggerSessionInternalOptions,
 ): Promise<TriggerResponse> {
   const stableTurnId = internal?.stableTurnId?.trim();
-  const triggerId = stableTurnId || `trg_${randomUUID()}`;
+  const ownerActor = req.actor === 'owner';
+  const triggerId = stableTurnId || `trg_${ownerActor ? 'owner_' : ''}${randomUUID()}`;
   rememberTriggerTurn(triggerId, req.source.type);
   // HTTP opt-in for codex-app native in-flight steer (turn/steer). The flag is
   // pure AUTHORIZATION forwarded to the worker — the live runner decides whether
@@ -884,7 +930,7 @@ async function triggerSessionTurnAdmitted(
     // Every accepted external input owns its generated turn, including quiet
     // report follow-ups on an already-running worker. Keep its reply anchor
     // independent of presentation and final-output suppression options.
-    prepareTriggerPresentation(target, true);
+    prepareTriggerPresentation(target, !ownerActor);
     if (!stableTurnId || !internal?.beforeDispatch) return undefined;
     const currentWorkerGeneration = Math.max(
       target.workerGeneration ?? 0,
@@ -966,6 +1012,9 @@ async function triggerSessionTurnAdmitted(
     }
   };
   const larkAppId = deps.larkAppId;
+  const ownerOpenId = ownerActor ? getStrictOwnerOpenId(larkAppId) : undefined;
+  const ownerUnresolved = (): TriggerResponse => ({ ok: false, errorCode: 'owner_unresolved', error: 'configured bot owner is not in the resolved allowlist' });
+  if (ownerActor && !ownerOpenId) return ownerUnresolved();
   if (req.target.botId && req.target.botId !== larkAppId) {
     return { ok: false, errorCode: 'bot_not_found', error: 'request routed to the wrong daemon' };
   }
@@ -1007,19 +1056,19 @@ async function triggerSessionTurnAdmitted(
   }
 
   const dryRun = !!req.options?.dryRun;
-  const promptForSession = (target?: DaemonSession) => zeroPromptInjectionForBot(larkAppId, undefined,
+  const promptForSession = (target?: DaemonSession) => ownerActor ? req.instruction! : zeroPromptInjectionForBot(larkAppId, undefined,
     target ? sessionPromptInjection(target) : undefined)
-    ? [req.instruction, req.envelope.rawText ?? JSON.stringify(req.envelope.payload ?? {})].filter(Boolean).join('\n\n')
+    ? buildZeroInjectionTriggerPrompt(req)
     : buildUntrustedEventPrompt(req, triggerId);
   const prompt = promptForSession();
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
   const hasExplicitTopicMessage = typeof req.presentation?.topicMessage === 'string'
     && req.presentation.topicMessage.trim().length > 0;
-  const codexAppText = buildExternalEventVisibleText(req, larkAppId);
+  const codexAppText = ownerActor ? prompt : buildExternalEventVisibleText(req, larkAppId);
   const {
     application: codexAppApplicationContext,
     message: codexAppMessageContext,
-  } = buildExternalEventCodexAppContexts(req, triggerId);
+  } = ownerActor ? { application: '', message: '' } : buildExternalEventCodexAppContexts(req, triggerId);
   const promptPreview = prompt.length > 4000 ? prompt.slice(0, 4000) + '\n...[truncated]' : prompt;
 
   // ── Idempotency (fresh async virtual only — validator guarantees the shape) ──
@@ -1142,6 +1191,7 @@ async function triggerSessionTurnAdmitted(
   const turnRequestHash = turnLeaseKey
     ? computeInputHash({
         seam: 'turn',
+        ...(req.actor ? { actor: req.actor } : {}),
         sessionId: req.target.sessionId ?? null,
         instruction: req.instruction ?? null,
         ...(req.payloadTrusted ? { payloadTrusted: true } : {}),
@@ -1283,7 +1333,7 @@ async function triggerSessionTurnAdmitted(
     };
   }
 
-  let chatId = req.target.chatId ?? ds?.chatId;
+  let chatId = ownerActor ? ds?.chatId : req.target.chatId ?? ds?.chatId;
   if (rootMessageId && !req.target.sessionId) {
     const rootTarget = await validateRootMessageTarget(larkAppId, chatId, rootMessageId);
     if (!rootTarget.ok) {
@@ -1358,6 +1408,11 @@ async function triggerSessionTurnAdmitted(
 
   const deliverToExisting = async (target: DaemonSession): Promise<TriggerResponse> => {
     const prompt = promptForSession(target);
+    const owner = ownerOpenId
+      ? await resolveSender(larkAppId, ownerOpenId, 'user').catch(() => undefined)
+        ?? { openId: ownerOpenId, type: 'user' as const }
+      : undefined;
+    if (owner && getStrictOwnerOpenId(larkAppId) !== owner.openId) return ownerUnresolved();
     // Ownership guard (PR #597): the target must still be the live, registered
     // occupant before we dispatch. Validate by object identity at its canonical
     // key AND — because a session can legitimately be reached via a non-canonical
@@ -1369,7 +1424,7 @@ async function triggerSessionTurnAdmitted(
     const targetKey = activeSessionKey(target);
     const stillRegistered = deps.activeSessions.get(targetKey) === target
       || [...deps.activeSessions.values()].includes(target);
-    if (!stillRegistered || target.session.status !== 'active') {
+    if (!stillRegistered || target.session.status !== 'active' || (owner && target.larkAppId !== larkAppId)) {
       return {
         ok: false,
         triggerId,
@@ -1378,6 +1433,9 @@ async function triggerSessionTurnAdmitted(
       };
     }
     const workerIsLive = !!target.worker && !target.worker.killed;
+    if (owner && hasQueuedActivationAdmissionGate(target)) {
+      return { ok: false, triggerId, errorCode: 'session_not_runnable', error: 'wait for the session activation to complete before sending as owner' };
+    }
     if (!workerIsLive && (target.pendingRepo || target.initialStartPending
       || target.worktreeCreating || target.session.queued
       || hasProtectedSessionMutationOwnership(target))) {
@@ -1402,13 +1460,37 @@ async function triggerSessionTurnAdmitted(
         error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
       };
     }
+    const replyAnchor = target.currentReplyTarget ?? target.session.currentReplyTarget;
+    const ownerRoot = owner
+      ? target.scope === 'thread' ? target.session.rootMessageId : replyAnchor?.rootMessageId
+      : undefined;
+    if (!owner) stageTriggerReadModel(target, req, triggerId);
     const content = buildExistingSessionContent(
-      target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext, triggerId,
+      target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext,
+      owner ? renderInboundMessageLocation({ rootMessageId: ownerRoot }) : codexAppMessageContext, triggerId, owner, ownerRoot,
     );
+    const prepareExistingDispatch = (willFork: boolean): number | undefined => {
+      if (owner) {
+        beginReplyTargetTurn(target, ownerRoot, triggerId, undefined, {
+          senderOpenId: owner.openId,
+          participants: [{ openId: owner.openId, name: owner.name, isBot: false }],
+          quoteOnly: target.scope === 'chat' ? replyAnchor?.quoteOnly : undefined,
+          synthetic: true,
+        });
+        sessionStore.updateSession(target.session);
+        stageTriggerReadModel(target, req, triggerId, owner, ownerRoot);
+      }
+      return prepareStableDispatch(target, willFork);
+    };
     const queuedBehindActivation = workerIsLive
       && hasQueuedActivationAdmissionGate(target);
     const recordAcceptedInput = (): void => {
-      markSessionActivity(target);
+      // Registration and accepted-input publication can cross a millisecond
+      // boundary. Reuse the exact per-turn timestamp that the excluded-terminal
+      // hold will read, so this round cannot stay pending behind its own later
+      // wall-clock acceptance time. Never take max(lastMessageAt): a subsequent
+      // human input owns that later timestamp.
+      markSessionActivity(target, excludedTurnActivityAt(target, triggerId) ?? Date.now());
       rememberInput(target, prompt, content);
     };
 
@@ -1567,9 +1649,10 @@ async function triggerSessionTurnAdmitted(
             message: 'delivered to existing session and completed',
           }),
           () => {
-            const dispatchAttempt = prepareStableDispatch(target, false);
+            const dispatchAttempt = prepareExistingDispatch(false);
             armFinalOutputSuppression(target, dispatchAttempt);
             const accepted = sendWorkerInput(target, content, triggerId, {
+              ...(owner ? { trustedCaller: content.trustedCaller } : {}),
               ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
               ...(steerRequested ? { codexAppSteerable: true as const } : {}),
             });
@@ -1608,9 +1691,10 @@ async function triggerSessionTurnAdmitted(
         let accepted: boolean;
         try {
           beginAsyncTrigger(target, triggerId);
-          const dispatchAttempt = prepareStableDispatch(target, false);
+          const dispatchAttempt = prepareExistingDispatch(false);
           armFinalOutputSuppression(target, dispatchAttempt);
           accepted = sendWorkerInput(target, content, triggerId, {
+            ...(owner ? { trustedCaller: content.trustedCaller } : {}),
             ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
             // At-most-once: a keyed follow-up delivered to a LIVE worker must be
             // tagged so a CLI crash never replays it onto the auto-restarted CLI
@@ -1667,10 +1751,11 @@ async function triggerSessionTurnAdmitted(
         };
       }
 
-      const dispatchAttempt = prepareStableDispatch(target, false);
+      const dispatchAttempt = prepareExistingDispatch(false);
       armFinalOutputSuppression(target, dispatchAttempt);
       armLoudFinalSuppression(target);
       const accepted = sendWorkerInput(target, content, triggerId, {
+        ...(owner ? { trustedCaller: content.trustedCaller } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),
@@ -1718,7 +1803,7 @@ async function triggerSessionTurnAdmitted(
           message: 'delivered to existing session and completed',
         }),
         () => {
-          const dispatchAttempt = prepareStableDispatch(target, true);
+          const dispatchAttempt = prepareExistingDispatch(true);
           armFinalOutputSuppression(target, dispatchAttempt);
           forkWorker(target, withSteer(content), {
             resume: target.hasHistory,
@@ -1757,7 +1842,7 @@ async function triggerSessionTurnAdmitted(
       const atMostOnce = !!(turnLeaseKey && turnLease);
       try {
         beginAsyncTrigger(target, triggerId);
-        const dispatchAttempt = prepareStableDispatch(target, true);
+        const dispatchAttempt = prepareExistingDispatch(true);
         armFinalOutputSuppression(target, dispatchAttempt);
         forkWorker(target, withSteer(content), {
           resume: target.hasHistory,
@@ -1793,7 +1878,7 @@ async function triggerSessionTurnAdmitted(
       };
     }
 
-    const dispatchAttempt = prepareStableDispatch(target, true);
+    const dispatchAttempt = prepareExistingDispatch(true);
     armFinalOutputSuppression(target, dispatchAttempt);
     armLoudFinalSuppression(target);
     forkWorker(target, withSteer(content), {
@@ -1813,10 +1898,19 @@ async function triggerSessionTurnAdmitted(
 
   if (ds) return deliverToExisting(ds);
 
-  const wd = resolveWorkingDir(larkAppId, chatId);
-  if (!wd.ok) {
-    return { ok: false, errorCode: 'trigger_failed', error: wd.error };
+  const resolvedWd = resolveWorkingDir(larkAppId, chatId);
+  if (!resolvedWd.ok) {
+    return { ok: false, errorCode: 'trigger_failed', error: resolvedWd.error };
   }
+  // 个人助理模式：触发器建的会话归该群的主人、cwd 在主人 work/（不建 worktree）；
+  // 群未认领（含私聊——触发器不知道是谁在说话）就拒绝。
+  const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, 'group', undefined);
+  if (assistantSpawn.kind === 'unclaimed') {
+    return { ok: false, errorCode: 'trigger_failed', error: 'assistant mode: this chat has no assistant owner' };
+  }
+  const wd = assistantSpawn.kind === 'owner'
+    ? { ok: true as const, workingDir: assistantSpawn.workDir, fromBotDefault: false }
+    : resolvedWd;
 
   const bot = getBot(larkAppId);
   const acceptsTaskOverride = allowsTaskModelOverride(bot.config.cliId);
@@ -1824,9 +1918,12 @@ async function triggerSessionTurnAdmitted(
     ? req.options.model.trim()
     : bot.config.model;
   const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
+  // The bot's own saved pair passed config load; judge it by the same keep-rule
+  // (a Codex level on a model the table does not know is the launch check's).
+  const inheritedPair = effectiveModel === bot.config.model && !req.options?.reasoningEffort;
   if (acceptsTaskOverride && effectiveReasoningEffort
       && bot.config.cliId !== 'traex'
-      && !cliModelSupportsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort)) {
+      && !cliLaunchAcceptsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort, inheritedPair)) {
     return {
       ok: false,
       errorCode: 'bad_request',
@@ -1895,6 +1992,7 @@ async function triggerSessionTurnAdmitted(
     }
     session.lastMessageAt = nowIso;
     session.workingDir = wd.workingDir;
+    if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
     session.cliId = bot.config.cliId;
     // Per-turn model / reasoning-effort overrides follow the same explicit CLI
     // policy as schedules, independently of bot-level effort configuration.
@@ -2054,6 +2152,7 @@ async function triggerSessionTurnAdmitted(
     });
     throw err;
   }
+  stageTriggerReadModel(newDs, req, triggerId);
   const promptInput = buildNewTopicCliInput(
     prompt,
     session.sessionId,
@@ -2395,7 +2494,7 @@ export async function triggerSessionTurn(
           beforeDispatch: () => {
             beforeDispatch();
             const target = activeBySessionId(deps.activeSessions, req.target.sessionId!);
-            if (target && inheritTriggerReplyAnchor(target, triggerId)) {
+            if (!req.actor && target && inheritTriggerReplyAnchor(target, triggerId)) {
               sessionStore.updateSession(target.session);
             }
           },
@@ -2410,5 +2509,6 @@ export async function triggerSessionTurn(
   if (req.options?.steer === true && result.ok && result.idempotent !== true) {
     result.steer = true;
   }
+  if (req.actor === 'owner' && result.ok) result.actor = req.actor;
   return result;
 }

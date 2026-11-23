@@ -49,14 +49,14 @@ export function evaluateVcMeetingConsumerIsolation(input: {
     return {
       ok: false,
       reason: 'platform_unsupported',
-      error: `sandbox was requested but managed side-effect isolation is unavailable on ${input.platform}; turn sandbox off to run the meeting consumer unsandboxed, or use a Linux pty/tmux backend`,
+      error: `sandbox was requested but managed side-effect isolation is unavailable on ${input.platform}; turn sandbox off to run the meeting consumer unsandboxed, or use a Linux pty/tmux/hc backend`,
     };
   }
-  if (input.backendType !== 'pty' && input.backendType !== 'tmux') {
+  if (input.backendType !== 'pty' && input.backendType !== 'tmux' && input.backendType !== 'hc') {
     return {
       ok: false,
       reason: 'backend_unsupported',
-      error: `sandbox was requested but backend ${input.backendType} cannot enforce the managed Lark output boundary; turn sandbox off to run unsandboxed, or use a pty/tmux backend`,
+      error: `sandbox was requested but backend ${input.backendType} cannot enforce the managed Lark output boundary; turn sandbox off to run unsandboxed, or use a pty/tmux/hc backend`,
     };
   }
   return { ok: true, isolated: true };

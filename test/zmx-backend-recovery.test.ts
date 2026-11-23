@@ -445,6 +445,36 @@ describe('ZmxBackend history-authoritative transport', () => {
       .toBe(String(state.launchPid));
   });
 
+  it('re-reads the stable PTY root independently of cliPid refinement', () => {
+    const backend = spawnBackend();
+    expect(backend.getStablePanePid()).toBe(state.pid);
+    backend.cliPid = state.launchPid + 1000;
+    expect(backend.getChildPid()).toBe(state.launchPid + 1000);
+    expect(backend.getStablePanePid()).toBe(state.pid);
+    state.pid += 1;
+    expect(backend.getStablePanePid()).toBe(state.pid);
+  });
+
+  it('uses the frozen root only while the session list is unreadable', () => {
+    const backend = spawnBackend();
+    const frozenRoot = state.pid;
+    const defaultExec = childMocks.execFileSync.getMockImplementation()!;
+    let failNextList = true;
+    childMocks.execFileSync.mockImplementation((file: string, argv: string[], options?: any) => {
+      if (failNextList && argv[0] === 'list') {
+        failNextList = false;
+        throw new Error('zmx list temporarily unavailable');
+      }
+      return defaultExec(file, argv, options);
+    });
+    expect(backend.getStablePanePid()).toBe(frozenRoot);
+    expect(backend.getStablePanePid()).toBe(frozenRoot);
+    state.pid += 1;
+    expect(backend.getStablePanePid()).toBe(state.pid);
+    state.exists = false;
+    expect(backend.getStablePanePid()).toBeNull();
+  });
+
   it('creates the session through a TERM-pinned client while control clients keep the invoker env', () => {
     // The invoker env carries no TERM (the pm2-boundary scrub removes it). The
     // session PTY inherits the one-shot create client's env verbatim, so that

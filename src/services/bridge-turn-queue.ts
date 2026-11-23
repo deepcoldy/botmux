@@ -30,6 +30,7 @@
  */
 import {
   normaliseForFingerprint,
+  normaliseTranscriptFingerprintCandidates,
   isMeaningfulUserEvent,
   isMeaningfulQueuedCommand,
   isMidTurnAbsorbedQueuedCommand,
@@ -47,6 +48,7 @@ import {
   isSyntheticNoModelReplyEvent,
   classifyClaudeTerminalEvent,
   apiErrorMessageText,
+  AbsorbedReplyCollector,
   type ClaudeTerminalOutcome,
   type TranscriptEvent,
 } from './claude-transcript.js';
@@ -97,6 +99,13 @@ export interface BridgePendingTurn {
   /** Text of the API-error record that set a non-completed terminalOutcome
    *  (unmasked; the worker masks and clips it before it leaves). */
   terminalErrorDetail?: string;
+  /** Transcript time of the last real model reply this queue read before the
+   *  record that set a non-completed terminalOutcome — the last request the
+   *  provider answered, i.e. when its prompt cache was last refreshed. It may
+   *  belong to an earlier turn (a turn whose first request failed). Absent
+   *  when no reply was read since this queue started (e.g. right after a
+   *  worker restart, whose baseline skips history). */
+  terminalProviderLastSuccessAtMs?: number;
   /** Structured 429 observed for this turn. It remains owned by the existing
    * limited/reset path and must not be converted into ordinary ambiguity when
    * the following turn_duration closes the transcript boundary. */
@@ -215,6 +224,23 @@ export interface BridgePendingTurn {
    *  running (a mid-turn system reminder) instead of starting its own. It has
    *  no reply of its own and ends when that turn ends — see `absorbedTurns`. */
   absorbedIntoTurnId?: string;
+  /** uuid of the `attachment(queued_command)` record that folded this turn's
+   *  input into the host turn: where its reply starts in the transcript (see
+   *  absorbedInputReplyText). Set together with `absorbedIntoTurnId`. */
+  absorbedAtUuid?: string;
+  /** Host assistant-activity sequence when this input was folded. Two folds
+   *  with the same sequence have no output boundary between them. */
+  absorbedActivitySeqAtFold?: number;
+  /** Multiple inputs share one uninterrupted output segment, so the next
+   *  output cannot be attributed to this later input without guessing. */
+  absorbedReplyAmbiguous?: boolean;
+  /** The worker already sent this folded turn's reply live, while its host
+   *  turn was still running: the end of the host turn must not post it again,
+   *  and a failure the host meets afterwards is not this turn's. */
+  absorbedReplySent?: boolean;
+  /** The live check for this folded turn's reply has run (see
+   *  takeAbsorbedReplyCandidates); whatever it found, it does not run again. */
+  absorbedLiveChecked?: boolean;
   /** Lark turns folded into this one. They leave the queue right behind it and
    *  share its terminal, so each still gets the end signal its card waits for. */
   absorbedTurns?: BridgePendingTurn[];
@@ -268,6 +294,36 @@ export const BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 60_000;
  *  running. Either way the rotation fallback scan only needs the rare cadence. */
 export function isHeldPendingMark(turn: BridgePendingTurn): boolean {
   return !turn.started && (isHeldInCliQueue(turn) || turn.heldWhileBusyAtMs !== undefined);
+}
+
+/** Inputs folded into `host` whose reply `ev` may have completed. Feeds `ev` —
+ *  the next record attributed to the running host turn — to the collector of
+ *  each folded turn not yet checked, and returns the turns whose collector now
+ *  reports a complete, non-empty reply, marking them `absorbedLiveChecked` so
+ *  each is returned once. This is only the moment to look: the worker reads
+ *  the reply itself from the transcript (absorbedInputReplyText), because a
+ *  collector misses whatever the transcript reader ingested without this
+ *  observer, and it never sees the records that bound a reply (a later fold,
+ *  the turn's duration marker). A turn not answered live is answered when its
+ *  host turn ends. `collectors` holds the per-turn state between calls. */
+export function takeAbsorbedReplyCandidates(
+  host: BridgePendingTurn,
+  ev: TranscriptEvent,
+  collectors: WeakMap<BridgePendingTurn, AbsorbedReplyCollector>,
+): BridgePendingTurn[] {
+  const due: BridgePendingTurn[] = [];
+  for (const absorbed of host.absorbedTurns ?? []) {
+    if (absorbed.absorbedLiveChecked || absorbed.absorbedReplySent || !absorbed.absorbedAtUuid) continue;
+    let collector = collectors.get(absorbed);
+    if (!collector) {
+      collector = new AbsorbedReplyCollector();
+      collectors.set(absorbed, collector);
+    }
+    if (!collector.feed(ev)) continue;
+    absorbed.absorbedLiveChecked = true;
+    due.push(absorbed);
+  }
+  return due;
 }
 
 /** Claude's own transcript proves this input is waiting in its queue. There is
@@ -326,11 +382,98 @@ export function isTruncatedMatch(recordedNorm: string, markContentNorm?: string)
   return markContentNorm.endsWith(recordedNorm);
 }
 
+interface TranscriptMarkMatch {
+  /** Any transcript candidate contains the short mark fingerprint. */
+  fingerprintMatch: boolean;
+  /** Any transcript candidate contains the entire legacy-normalised mark. */
+  anyFullContentMatch: boolean;
+  /** Any transcript candidate is a provable truncation of the mark. */
+  truncationMatch: boolean;
+  /** Only the untouched legacy candidate can prove native consumption. */
+  legacyFullContentMatch: boolean;
+  /** A bind that exists only because the residue candidate was considered. */
+  residueOnlyMatch: boolean;
+  /** A strong bind that exists only because the residue candidate was considered. */
+  residueOnlyStrongMatch: boolean;
+}
+
+/** Compare transcript text against a legacy mark without weakening mark identity.
+ * Candidate zero is the legacy value returned by
+ * normaliseTranscriptFingerprintCandidates; the optional residue-tolerant
+ * candidate may bind a turn, but can never upgrade that bind to durable
+ * full-content consumption evidence. */
+function matchTranscriptAgainstMark(
+  candidates: readonly string[],
+  contentFingerprint?: string,
+  contentNormalized?: string,
+): TranscriptMarkMatch {
+  const legacy = candidates.slice(0, 1);
+  const residue = candidates.slice(1);
+  const fingerprint = (texts: readonly string[]) => !!contentFingerprint
+    && texts.some(text => text.includes(contentFingerprint));
+  const full = (texts: readonly string[]) => !!contentNormalized
+    && texts.some(text => text.includes(contentNormalized));
+  const truncated = (texts: readonly string[]) => texts.some(text => isTruncatedMatch(text, contentNormalized));
+  const legacyFingerprintMatch = fingerprint(legacy);
+  const legacyFull = full(legacy);
+  const legacyTruncationMatch = truncated(legacy);
+  const residueFingerprintMatch = fingerprint(residue);
+  const residueFull = full(residue);
+  const residueTruncationMatch = truncated(residue);
+  const legacyMatch = legacyFingerprintMatch || legacyTruncationMatch;
+  const legacyStrongMatch = legacyFull || legacyTruncationMatch;
+  return {
+    fingerprintMatch: legacyFingerprintMatch || residueFingerprintMatch,
+    anyFullContentMatch: legacyFull || residueFull,
+    truncationMatch: legacyTruncationMatch || residueTruncationMatch,
+    legacyFullContentMatch: legacyFull,
+    residueOnlyMatch: !legacyMatch && (residueFingerprintMatch || residueTruncationMatch),
+    residueOnlyStrongMatch: !legacyStrongMatch && (residueFull || residueTruncationMatch),
+  };
+}
+
+interface MarkMatchEvaluation {
+  turn: BridgePendingTurn;
+  match: TranscriptMarkMatch;
+}
+
+interface ResidueConflictGroup {
+  turns: Set<BridgePendingTurn>;
+  sinceMs: number;
+}
+
+function evaluateMarksAgainstTranscript(
+  turns: readonly BridgePendingTurn[],
+  candidates: readonly string[],
+): MarkMatchEvaluation[] {
+  return turns.map(turn => ({
+    turn,
+    match: matchTranscriptAgainstMark(candidates, turn.contentFingerprint, turn.contentNormalized),
+  }));
+}
+
+function residueAttributionConflictTurns(
+  evaluations: readonly MarkMatchEvaluation[],
+  head: MarkMatchEvaluation,
+): BridgePendingTurn[] {
+  if (!head.match.fingerprintMatch && !head.match.truncationMatch) return [];
+  const conflict: BridgePendingTurn[] = [];
+  for (const other of evaluations) {
+    if (other.turn === head.turn) continue;
+    if (!other.match.anyFullContentMatch && !other.match.truncationMatch) continue;
+    if (other.turn.contentNormalized === head.turn.contentNormalized) continue;
+    if (head.match.residueOnlyMatch || other.match.residueOnlyStrongMatch) conflict.push(other.turn);
+  }
+  return conflict.length > 0 ? [head.turn, ...conflict] : [];
+}
+
 /** How a transcript user/queued-command record bound a pending Lark turn.
- *  `fullContentMatch` is true only when the record's normalised text contains
- *  the ENTIRE normalised marked content — the one binding strong enough to
- *  prove that this exact input (envelope included) entered the conversation.
- *  Fingerprint-prefix and truncation binds remain attribution heuristics. */
+ *  `fullContentMatch` is true only when the record's untouched legacy-normalised
+ *  text contains the ENTIRE normalised marked content — the one binding strong
+ *  enough to prove that this exact input (envelope included) entered the
+ *  conversation. A residue-tolerant candidate may bind a turn, but always
+ *  reports false here; fingerprint-prefix and truncation binds are likewise
+ *  attribution heuristics, not consumption proof. */
 export interface BridgeTurnStartEvidence {
   fullContentMatch: boolean;
   sourceJsonlPath?: string;
@@ -357,7 +500,11 @@ export class BridgeTurnQueue {
    *  records read so far. `dequeue` records carry no content, so only the order
    *  says which input left. A mirror that started mid-queue can release a mark
    *  early, which falls back to the normal TTL. */
-  private cliQueue: Array<{ text: string; turn?: BridgePendingTurn }> = [];
+  private cliQueue: Array<{ text: string; candidates: string[]; turn?: BridgePendingTurn }> = [];
+  /** Pending marks and cancellation tombstones whose residue interpretations
+   * conflict. Members wait and expire as one group so TTL cannot leave one
+   * competitor behind to accept a late line as legacy full-content proof. */
+  private residueConflictGroups: ResidueConflictGroup[] = [];
   private queue: BridgePendingTurn[] = [];
   private collecting: BridgePendingTurn | null = null;
   private lastLocalTurnId?: string;
@@ -412,6 +559,16 @@ export class BridgeTurnQueue {
    *  each waiting out the bound. A marker read afterwards outranks this.
    *  Survives clearPending for the same reason as durationMarkerSeen. */
   private durationMarkerWaitExpired = false;
+  /** Transcript time of the newest real model reply read (any main-thread
+   *  assistant record that is not an API error or a no-model placeholder,
+   *  tool_use blocks included). Survives clearPending like the markers above:
+   *  it describes the provider session, not one generation's turns. */
+  private lastProviderReplyAtMs: number | undefined;
+
+  private stampProviderLastSuccess(turn: BridgePendingTurn): void {
+    if (this.lastProviderReplyAtMs !== undefined) turn.terminalProviderLastSuccessAtMs = this.lastProviderReplyAtMs;
+    else delete turn.terminalProviderLastSuccessAtMs;
+  }
 
   /** Record that this transcript writes `system/turn_duration` markers. */
   noteDurationMarkerObserved(): void {
@@ -550,6 +707,53 @@ export class BridgeTurnQueue {
     return turnId;
   }
 
+  private noteResidueConflict(turns: readonly BridgePendingTurn[], sinceMs: number): void {
+    const overlapping = this.residueConflictGroups.filter(group => turns.some(turn => group.turns.has(turn)));
+    const merged = new Set(turns);
+    let mergedSinceMs = sinceMs;
+    for (const group of overlapping) {
+      for (const turn of group.turns) merged.add(turn);
+      mergedSinceMs = Math.min(mergedSinceMs, group.sinceMs);
+    }
+    this.residueConflictGroups = this.residueConflictGroups.filter(group => !overlapping.includes(group));
+    this.residueConflictGroups.push({ turns: merged, sinceMs: mergedSinceMs });
+  }
+
+  /** A real turn start resolves one member. Explicit drops keep their
+   * tombstones; queue holds do not resolve anything because the input can
+   * still be another member's residue-bearing line until its actual user
+   * record is attributed. */
+  private resolveResidueConflictFor(turn: BridgePendingTurn): void {
+    for (let i = this.residueConflictGroups.length - 1; i >= 0; i--) {
+      const group = this.residueConflictGroups[i]!;
+      if (!group.turns.delete(turn)) continue;
+      if (group.turns.size < 2) this.residueConflictGroups.splice(i, 1);
+    }
+    this.discardInactiveResidueConflictGroups();
+  }
+
+  private residueConflictGroupFor(turn: BridgePendingTurn): ResidueConflictGroup | undefined {
+    return this.residueConflictGroups.find(group => group.turns.has(turn));
+  }
+
+  /** Tombstones have no independent expiry work of their own. Once no active
+   * queue member remains, there is no survivor to protect and the whole group
+   * can be forgotten instead of leaking into a later mark's conflict window. */
+  private discardInactiveResidueConflictGroups(): void {
+    this.residueConflictGroups = this.residueConflictGroups.filter(group =>
+      [...group.turns].some(turn => this.queue.includes(turn) && !turn.started));
+  }
+
+  /** Current candidates plus conflict tombstones. Dropped turns never become
+   * bindable heads, but their content still disambiguates later records. */
+  private attributionMatchTurns(turns: readonly BridgePendingTurn[]): BridgePendingTurn[] {
+    const all = [...turns];
+    for (const group of this.residueConflictGroups) {
+      for (const turn of group.turns) if (!all.includes(turn)) all.push(turn);
+    }
+    return all;
+  }
+
   /** Drop all pending turns. Used when the worker discovers it can't
    *  reliably attribute future events (e.g. baseline raced with a turn
    *  already in flight) and wants to clear the slate. */
@@ -557,6 +761,7 @@ export class BridgeTurnQueue {
     this.lastLocalTurnId = undefined;
     this.pendingBackgroundWake = undefined;
     this.cliQueue = [];
+    this.residueConflictGroups = [];
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
     return dropped;
@@ -579,6 +784,10 @@ export class BridgeTurnQueue {
     );
     if (idx === -1) return null;
     const [dropped] = this.queue.splice(idx, 1);
+    // Keep a dropped mark in its conflict group as a tombstone. Submit
+    // failure cancels this delivery attempt, not the possibility that its
+    // residue-bearing record arrives late and explains a competitor's line.
+    this.discardInactiveResidueConflictGroups();
     return dropped;
   }
 
@@ -616,6 +825,15 @@ export class BridgeTurnQueue {
     this.queue = this.queue.filter(t => {
       if (t.started) return true;
       if (t.markTimeMs === undefined) return true;
+      const conflict = this.residueConflictGroupFor(t);
+      // Group expiry is atomic and therefore outranks an individual write
+      // hold: retaining only the writer would erase the conflict and let a
+      // competitor's late line become its legacy full-content proof.
+      if (conflict) {
+        if (now - conflict.sinceMs <= CLI_QUEUE_HOLD_MAX_MS) return true;
+        dropped.push(t);
+        return false;
+      }
       if (t.writeInFlight) return true;
       if (isHeldInCliQueue(t) && now - t.cliQueuedAtMs! <= CLI_QUEUE_HOLD_MAX_MS) return true;
       if (busy && now - t.markTimeMs <= CLI_QUEUE_HOLD_MAX_MS) { t.heldWhileBusyAtMs = now; return true; }
@@ -629,6 +847,8 @@ export class BridgeTurnQueue {
       dropped.push(t);
       return false;
     });
+    for (const turn of dropped) this.resolveResidueConflictFor(turn);
+    this.discardInactiveResidueConflictGroups();
     return dropped;
   }
 
@@ -644,14 +864,20 @@ export class BridgeTurnQueue {
   ingest(
     events: TranscriptEvent[],
     sourceJsonlPath?: string,
-    /** Cosmetic side-channel observer: called at the moment an event is
+    /** Read-only side-channel observer: called at the moment an event is
      *  attributed to a turn (the then-collecting turn) for
      *    - every non-sidechain, non-error assistant event, and
      *    - every non-sidechain pure-tool_result user event (intra-turn tool
      *      output — skipped by turn-start handling but part of the turn).
-     *  Used by the worker to extract thinking/tool entries for the native
-     *  CoT message. Must never mutate the queue or influence attribution. */
+     *  The worker uses this for the native CoT message and for proof that a
+     *  replay actually attributed a reply to a turn. It must never mutate the
+     *  queue or influence attribution. */
     onAssistantAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
+    /** Read-only observer for a main-thread duration marker actually closing
+     *  the then-collecting turn. Unlike a raw timestamp match, this carries the
+     *  turn identity, so a replayed previous turn's marker cannot settle the
+     *  current unread run. Must not mutate the queue or influence attribution. */
+    onTurnDurationAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
   ): void {
     if (sourceJsonlPath && events.length > 0) this.onEventsRead?.(events, sourceJsonlPath);
     for (const ev of events) {
@@ -700,7 +926,7 @@ export class BridgeTurnQueue {
           if (this.collecting && onAssistantAttributed
             && (ev as any).isSidechain !== true
             && isPureToolResultUserEvent(ev.message?.content)) {
-            try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+            try { onAssistantAttributed(ev, this.collecting); } catch { /* observer channel — never break attribution */ }
           }
           continue;
         }
@@ -798,6 +1024,7 @@ export class BridgeTurnQueue {
               const detail = apiErrorMessageText(ev).trim();
               if (detail) this.collecting.terminalErrorDetail = detail;
               else delete this.collecting.terminalErrorDetail;
+              this.stampProviderLastSuccess(this.collecting);
             } else {
               // The `<synthetic>` placeholder is the WEAKEST terminal signal
               // there is - no model call happened at all (no requestId, usage
@@ -809,11 +1036,18 @@ export class BridgeTurnQueue {
               if (this.collecting.terminalOutcome === undefined) {
                 this.collecting.terminalOutcome = terminalOutcome;
                 this.collecting.terminalOutcomeAtMs = eventTimeMs(ev);
+                this.stampProviderLastSuccess(this.collecting);
               }
             }
             this.collecting.terminalObserved = true;
           }
           continue;
+        }
+        // A real model reply: the provider answered this request.
+        const replyAtMs = eventTimeMs(ev);
+        if (replyAtMs !== undefined
+          && (this.lastProviderReplyAtMs === undefined || replyAtMs > this.lastProviderReplyAtMs)) {
+          this.lastProviderReplyAtMs = replyAtMs;
         }
         const hasVisibleText = assistantHasVisibleText(ev.message?.content);
         if (hasVisibleText && !this.collecting) {
@@ -854,7 +1088,7 @@ export class BridgeTurnQueue {
         }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
         if (this.collecting && onAssistantAttributed) {
-          try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+          try { onAssistantAttributed(ev, this.collecting); } catch { /* observer channel — never break attribution */ }
         }
         if (isClaudeTurnTerminalEvent(ev) && this.collecting) {
           this.collecting.terminalObserved = true;
@@ -881,7 +1115,10 @@ export class BridgeTurnQueue {
         if (this.collecting) {
           this.collecting.terminalObserved = true;
           this.collecting.awaitingDurationMarker = false;
-          if (isClaudeTurnDurationEvent(ev)) this.collecting.closedByDurationMarker = true;
+          if (isClaudeTurnDurationEvent(ev)) {
+            this.collecting.closedByDurationMarker = true;
+            try { onTurnDurationAttributed?.(ev, this.collecting); } catch { /* observer channel — never break attribution */ }
+          }
           if (!this.collecting.rateLimited) {
             this.collecting.terminalOutcome ??= { status: 'completed' };
           }
@@ -1104,7 +1341,8 @@ export class BridgeTurnQueue {
   private observeCliQueueOperation(ev: TranscriptEvent): void {
     const atMs = typeof ev.timestamp === 'string' ? Date.parse(ev.timestamp) : NaN;
     if (!Number.isFinite(atMs)) return;
-    const text = typeof ev.content === 'string' ? normaliseForFingerprint(ev.content) : '';
+    const candidates = typeof ev.content === 'string' ? normaliseTranscriptFingerprintCandidates(ev.content) : [''];
+    const text = candidates[0]!;
     // Several dequeues can share one millisecond; replaying them is harmless
     // because a transcript switch empties the mirror first.
     if (ev.operation !== 'dequeue') {
@@ -1118,12 +1356,18 @@ export class BridgeTurnQueue {
       this.seen.add(key);
     }
     if (ev.operation === 'enqueue') {
-      const turn = this.queue.find(t => !t.started && t.cliQueuedAtMs === undefined
-        && t.markTimeMs !== undefined && atMs >= t.markTimeMs - CLI_QUEUE_MARK_SKEW_MS
-        && !!t.contentNormalized && t.contentNormalized.length >= TRUNCATION_MATCH_MIN_CHARS
-        && (text.includes(t.contentNormalized) || isTruncatedMatch(text, t.contentNormalized)));
+      const eligible = this.queue.filter(t => !(t.started || t.cliQueuedAtMs !== undefined
+        || t.markTimeMs === undefined || atMs < t.markTimeMs - CLI_QUEUE_MARK_SKEW_MS
+        || !t.contentNormalized || t.contentNormalized.length < TRUNCATION_MATCH_MIN_CHARS));
+      const evaluations = evaluateMarksAgainstTranscript(this.attributionMatchTurns(eligible), candidates);
+      const eligibleSet = new Set(eligible);
+      const first = evaluations.find(evaluation => eligibleSet.has(evaluation.turn)
+        && (evaluation.match.anyFullContentMatch || evaluation.match.truncationMatch));
+      const conflict = first ? residueAttributionConflictTurns(evaluations, first) : [];
+      if (conflict.length > 0) this.noteResidueConflict(conflict, atMs);
+      const turn = first && conflict.length === 0 ? first.turn : undefined;
       if (turn) turn.cliQueuedAtMs = atMs;
-      this.cliQueue.push({ text, ...(turn ? { turn } : {}) });
+      this.cliQueue.push({ text, candidates, ...(turn ? { turn } : {}) });
       return;
     }
     // A content-less remove (e.g. dropped by a hook) cannot say which input left.
@@ -1131,7 +1375,22 @@ export class BridgeTurnQueue {
       this.forgetCliQueue(atMs);
       return;
     }
-    const idx = ev.operation === 'dequeue' ? 0 : this.cliQueue.findIndex(item => item.text === text);
+    // A remove may match more than one mirror item once residue candidates
+    // are considered. Exact duplicates can leave in FIFO order, but an
+    // exact-vs-residue or multi-candidate ambiguity proves nothing about
+    // which input left: keep every mark held for dequeue/idle evidence.
+    let idx = ev.operation === 'dequeue' ? 0 : -1;
+    if (ev.operation !== 'dequeue') {
+      const exact: number[] = [];
+      const compatible: number[] = [];
+      for (let i = 0; i < this.cliQueue.length; i++) {
+        const item = this.cliQueue[i]!;
+        if (item.text === text) exact.push(i);
+        if (item.text === text || item.candidates.some(candidate => candidates.includes(candidate))) compatible.push(i);
+      }
+      if (exact.length > 0 && exact.length === compatible.length) idx = exact[0]!;
+      else if (exact.length === 0 && compatible.length === 1) idx = compatible[0]!;
+    }
     const [left] = idx >= 0 ? this.cliQueue.splice(idx, 1) : [];
     if (left?.turn) left.turn.cliQueueReleasedAtMs = atMs;
   }
@@ -1147,16 +1406,30 @@ export class BridgeTurnQueue {
   private handleAbsorbedInput(ev: TranscriptEvent, sourceJsonlPath?: string): void {
     const next = this.queue.find(t => !t.started);
     if (!next?.contentFingerprint) return;
-    const userText = normaliseForFingerprint(extractTurnStartText(ev));
-    if (!userText.includes(next.contentFingerprint) && !isTruncatedMatch(userText, next.contentNormalized)) return;
-    const fullContentMatch = !!next.contentNormalized && userText.includes(next.contentNormalized);
+    const evaluations = evaluateMarksAgainstTranscript(
+      this.attributionMatchTurns(this.queue.filter(turn => !turn.started)),
+      normaliseTranscriptFingerprintCandidates(extractTurnStartText(ev)),
+    );
+    const evaluation = evaluations.find(item => item.turn === next)!;
     const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
+    const eventTimeMs = Number.isFinite(tsParsed) ? tsParsed : Date.now();
+    const conflict = residueAttributionConflictTurns(evaluations, evaluation);
+    if (conflict.length > 0) this.noteResidueConflict(conflict, eventTimeMs);
+    if ((!evaluation.match.fingerprintMatch && !evaluation.match.truncationMatch)
+      || conflict.length > 0) return;
+    const fullContentMatch = evaluation.match.legacyFullContentMatch;
     next.started = true;
+    this.resolveResidueConflictFor(next);
     if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
-    next.markTimeMs = Number.isFinite(tsParsed) ? tsParsed : Date.now();
+    next.markTimeMs = eventTimeMs;
     const host = this.collecting;
     if (host && !host.terminalObserved) {
       next.absorbedIntoTurnId = host.turnId;
+      if (typeof ev.uuid === 'string' && ev.uuid) next.absorbedAtUuid = ev.uuid;
+      const activitySeq = host.attributedActivitySeq ?? 0;
+      const previous = host.absorbedTurns?.at(-1);
+      if (previous?.absorbedActivitySeqAtFold === activitySeq) next.absorbedReplyAmbiguous = true;
+      next.absorbedActivitySeqAtFold = activitySeq;
       (host.absorbedTurns ??= []).push(next);
     } else {
       // Nothing is collecting (e.g. the worker restarted mid-turn and lost the
@@ -1239,18 +1512,26 @@ export class BridgeTurnQueue {
     let fullContentMatch = false;
     if (next) {
       if (next.contentFingerprint) {
-        // Both sides normalised (whitespace-collapsed + trimmed) before
-        // the substring check so a transcript line that preserved newlines
-        // still matches a fingerprint built from the same text.
-        const userText = normaliseForFingerprint(extractTurnStartText(ev));
-        fullContentMatch = !!next.contentNormalized && userText.includes(next.contentNormalized);
-        if (userText.includes(next.contentFingerprint)) {
+        // The mark keeps its legacy identity. Transcript text additionally
+        // gets a residue-tolerant candidate, but only the legacy candidate
+        // can prove full-content consumption.
+        const evaluations = evaluateMarksAgainstTranscript(
+          this.attributionMatchTurns(this.queue.filter(turn => !turn.started)),
+          normaliseTranscriptFingerprintCandidates(extractTurnStartText(ev)),
+        );
+        const evaluation = evaluations.find(item => item.turn === next)!;
+        const match = evaluation.match;
+        const conflict = residueAttributionConflictTurns(evaluations, evaluation);
+        if (conflict.length > 0) this.noteResidueConflict(conflict, eventTimeMs);
+        const ambiguous = conflict.length > 0;
+        fullContentMatch = match.legacyFullContentMatch;
+        if (!ambiguous && match.fingerprintMatch) {
           next.started = true;
           if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
           next.markTimeMs = eventTimeMs;
           this.collecting = next;
           consumedNext = true;
-        } else if (isTruncatedMatch(userText, next.contentNormalized)) {
+        } else if (!ambiguous && match.truncationMatch) {
           // TRUNCATION-PROOF bind (capability-agnostic — see isTruncatedMatch).
           // The head-substring fingerprint didn't match because claude-code
           // TRUNCATES the leading envelope lines (`<user_message>` +
@@ -1280,6 +1561,7 @@ export class BridgeTurnQueue {
       }
     }
     if (consumedNext && next) {
+      this.resolveResidueConflictFor(next);
       this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
     }
     if (!consumedNext) {
@@ -1377,9 +1659,20 @@ export class BridgeTurnQueue {
         this.queue.splice(idx, 1);
         if (this.collecting === absorbed) this.collecting = null;
         absorbed.terminalObserved = head.terminalObserved;
+        if (absorbed.absorbedReplySent) {
+          // Already answered while the host ran: whatever the host meets
+          // afterwards (an API error, a usage limit) is the host's, not this
+          // turn's, so it settles as completed.
+          absorbed.terminalOutcome ??= { status: 'completed' };
+          out.push(absorbed);
+          continue;
+        }
         if (head.terminalOutcome && absorbed.terminalOutcome === undefined) {
           absorbed.terminalOutcome = head.terminalOutcome;
           if (head.terminalErrorDetail) absorbed.terminalErrorDetail = head.terminalErrorDetail;
+          if (head.terminalProviderLastSuccessAtMs !== undefined) {
+            absorbed.terminalProviderLastSuccessAtMs = head.terminalProviderLastSuccessAtMs;
+          }
         }
         if (head.rateLimited) absorbed.rateLimited = true;
         out.push(absorbed);

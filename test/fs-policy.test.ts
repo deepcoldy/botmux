@@ -531,6 +531,7 @@ describe('buildFsPolicy', () => {
     // schedules moved into per-bot BOT_HOMEs: the legacy shared path is no
     // longer granted (own store rides the BOT_HOME rw; sibling stores denied).
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedules.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/.dashboard-secret.dispatch-task-decisions/om_task.json').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite-wal').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/schedules.json').access).toBe('deny'); // sibling store
@@ -2126,3 +2127,174 @@ describe('buildFsPolicy — session skill manifest + skill snapshot', () => {
   });
 });
 
+
+// ─── 个人助理模式（assistantMode）：owner 的 USER_HOME 取代 BOT_HOME，附件按 owner 分桶 ───
+describe('buildFsPolicy — assistant mode (per-owner USER_HOME)', () => {
+  const botmuxHome = '/Users/u/.botmux';
+  const sd = `${botmuxHome}/data`;
+  const botHome = `${botmuxHome}/bots/cli_self`;
+  const A = 'ou_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const B = 'ou_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const ownerCtx = (owner: string) => ctx({
+    botHome: `${botHome}/users/${owner}`,
+    workingDir: `${botHome}/users/${owner}/work`,
+    attachmentsBucket: `${sd}/attachments/cli_self/u/${owner}`,
+    assistantMode: true,
+    // 助理模式不授角色库：worker 传 undefined（这里 ctx 默认就没有 roleLibrarySubtree）。
+  });
+
+  it('denies the bot-wide sessions.db (last user prompts) and send-cred.json (plaintext app secret)', () => {
+    const p = buildFsPolicy(ownerCtx(A));
+    expect(accessForPath(p.rules, `${sd}/session-stores/cli_self/sessions.db`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/send-cred.json`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/claude/.credentials.json`).access).toBe('deny');
+    // 非助理模式保持原样：sessions.db 只读、send-cred 随 BOT_HOME rw。
+    const q = buildFsPolicy(ctx());
+    expect(accessForPath(q.rules, `${sd}/session-stores/cli_self/sessions.db`).access).toBe('readOnly');
+  });
+
+  it.each(['darwin', 'linux'] as const)("does not hand the sandbox this bot's lark-cli appsecret + master key on %s", (platform) => {
+    const homeDir = platform === 'darwin' ? '/Users/u' : '/home/u';
+    const base = { platform, homeDir, botmuxHome: `${homeDir}/.botmux`, sessionDataDir: `${homeDir}/.botmux/data`,
+      botHome: `${homeDir}/.botmux/bots/cli_self/users/${A}`, workingDir: `${homeDir}/.botmux/bots/cli_self/users/${A}/work`,
+      attachmentsBucket: `${homeDir}/.botmux/data/attachments/cli_self/u/${A}` } as const;
+    const store = platform === 'darwin'
+      ? `${homeDir}/Library/Application Support/lark-cli`
+      : `${homeDir}/.local/share/lark-cli`;
+    const keyFiles = platform === 'darwin'
+      ? [`${store}/master.key.file`, `${store}/appsecret_cli_self.enc`]
+      : [`${store}/master.key`, `${store}/appsecret_cli_self.enc`];
+    const assistant = buildFsPolicy(ctx({ ...base, assistantMode: true }));
+    for (const f of keyFiles) expect(accessForPath(assistant.rules, f).access, f).toBe('deny');
+    // 对照：非助理模式这两个文件是只读放行（lark-cli 自己解密用）。
+    const normal = buildFsPolicy(ctx({ ...base, botHome: `${homeDir}/.botmux/bots/cli_self`, workingDir: `${homeDir}/proj`, attachmentsBucket: undefined }));
+    for (const f of keyFiles) expect(accessForPath(normal.rules, f).access, f).toBe('readOnly');
+  });
+
+  it("with the secret withheld (assistant mode implies it) the owner's attachment bucket is read-only and USER_HOME is pinned", () => {
+    const outbox = `${sd}/sandboxes/s/outbox`;
+    const p = buildFsPolicy(ctx({
+      botHome: `${botHome}/users/${A}`, workingDir: `${botHome}/users/${A}/work`,
+      attachmentsBucket: `${sd}/attachments/cli_self/u/${A}`, assistantMode: true,
+      withholdSendCredential: true, outbox,
+    }));
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${A}/om_x/a.png`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${B}/om_x/a.png`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${outbox}/x.req.json`).access).toBe('readWrite');
+    expect(p.pinnedDirs).toEqual(expect.arrayContaining([`${botHome}/users/${A}`, outbox]));
+  });
+
+  it("grants only the owner's USER_HOME; the real BOT_HOME and other owners stay denied", () => {
+    const p = buildFsPolicy(ownerCtx(A));
+    expect(accessForPath(p.rules, `${botHome}/users/${A}/work/notes.md`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${botHome}/users/${A}/claude/projects/x/memory/MEMORY.md`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${botHome}/users/${B}/work/notes.md`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/users/${B}/claude/.credentials.json`).access).toBe('deny');
+    // bot 级 claude/（共享记忆、共享凭证副本）对助理会话不存在。
+    expect(accessForPath(p.rules, `${botHome}/claude/.credentials.json`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/claude/projects/shared/memory/MEMORY.md`).access).toBe('deny');
+  });
+
+  it('attachments: only the owner bucket is readWrite; the bot-wide bucket and other owners are denied', () => {
+    const p = buildFsPolicy(ownerCtx(A));
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${A}/om_1/a.png`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${B}/om_2/b.png`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/om_3/c.png`).access).toBe('deny');
+  });
+
+  it('without attachmentsBucket the whole per-bot bucket stays readWrite (non-assistant behaviour unchanged)', () => {
+    const p = buildFsPolicy(ctx());
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/om_3/c.png`).access).toBe('readWrite');
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${A}/om_1/a.png`).access).toBe('readWrite');
+  });
+
+  it('keeps the no-transport assistant sessions.db denied while retaining other carve-outs', () => {
+    const p = buildFsPolicy(ownerCtx(A));
+    expect(accessForPath(p.rules, `${sd}/session-stores/cli_self/sessions.db`).access).toBe('deny');
+    const externalSd = '/var/botmux/data';
+    const noTransport = buildFsPolicy({ ...ownerCtx(A),
+      botmuxHome: '/var/botmux', sessionDataDir: externalSd,
+      botHome: '/var/assistant/users/a', workingDir: '/var/assistant/users/a/work',
+      attachmentsBucket: `${externalSd}/attachments/cli_self/u/${A}`,
+      larkTransportEnabled: false, mandatoryReadOnlyPaths: ['/Users/u'] });
+    expect(accessForPath(noTransport.rules, `${externalSd}/session-stores/cli_self/sessions.db`).access).toBe('deny');
+    expect(accessForPath(noTransport.rules, `${externalSd}/bots-info.json`).access).toBe('readOnly');
+    expect(accessForPath(noTransport.rules, `${externalSd}/bin/botmux`).access).toBe('readOnly');
+    const profile = compileToSeatbelt(noTransport);
+    const finalAllow = profile.lastIndexOf('(allow file-read* (subpath "/Users/u"))');
+    const finalDatabaseDeny = profile.lastIndexOf(`(deny file-read* (subpath "${externalSd}/session-stores"))`);
+    expect(finalAllow).toBeGreaterThanOrEqual(0);
+    expect(finalDatabaseDeny).toBeGreaterThan(finalAllow);
+  });
+
+  it('filters final ancestor grants that cover the real BOT_HOME', () => {
+    const p = buildFsPolicy({ ...ownerCtx(A), mandatoryReadOnlyPaths: ['/Users/u'] });
+    expect(p.finalReadOnlyPaths).not.toContain('/Users/u');
+    const profile = compileToSeatbelt(p);
+    const homeAllows = profile.match(/\(allow file-read\* \(subpath "\/Users\/u"\)\)/g) ?? [];
+    // Only the baseline HOME grant remains; the final pass must not re-emit it
+    // after the botmux/owner denies.
+    expect(homeAllows).toHaveLength(1);
+    expect(p.finalDenyPaths).toEqual(expect.arrayContaining([
+      `${sd}/session-stores`,
+      `${botmuxHome}/bots.json`,
+      `${botmuxHome}/.dashboard-secret`,
+      `${botmuxHome}/.dashboard-token`,
+    ]));
+    for (const sensitive of [
+      `${sd}/session-stores`,
+      `${botmuxHome}/bots.json`,
+      `${botmuxHome}/.dashboard-secret`,
+      `${botmuxHome}/.dashboard-token`,
+    ]) {
+      expect(profile.lastIndexOf(`(deny file-read* (subpath "${sensitive}"))`)).toBeGreaterThanOrEqual(0);
+    }
+    expect(accessForPath(p.rules, `${botHome}/users/${B}/claude/projects/x/memory/MEMORY.md`).access).toBe('deny');
+  });
+
+  it('does not reopen other apps or owners when an external BOT_HOME has a final ancestor grant', () => {
+    const p = buildFsPolicy({ ...ownerCtx(A),
+      botHome: '/var/assistant/users/a', workingDir: '/var/assistant/users/a/work',
+      larkTransportEnabled: false, mandatoryReadOnlyPaths: ['/Users/u'] });
+    expect(p.finalReadOnlyPaths).not.toContain('/Users/u');
+    const profile = compileToSeatbelt(p);
+    const homeAllows = profile.match(/\(allow file-read\* \(subpath "\/Users\/u"\)\)/g) ?? [];
+    expect(homeAllows).toHaveLength(1);
+    for (const denied of [
+      `${sd}/session-stores`,
+      `${botmuxHome}/bots.json`,
+      `${botmuxHome}/.dashboard-secret`,
+      `${botmuxHome}/.dashboard-token`,
+    ]) {
+      expect(profile).toContain(`(deny file-read* (subpath "${denied}"))`);
+    }
+    expect(accessForPath(p.rules, `${sd}/session-stores/cli_other/sessions.db`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${B}/om_2/b.png`).access).toBe('deny');
+  });
+
+  it('emits the assistant keystore deny after a final ancestor read-only grant', () => {
+    const store = '/Users/u/Library/Application Support/lark-cli';
+    const p = buildFsPolicy({ ...ownerCtx(A),
+      botmuxHome: '/var/botmux', sessionDataDir: '/var/botmux/data',
+      botHome: '/var/assistant/users/a', workingDir: '/var/assistant/users/a/work',
+      attachmentsBucket: `/var/botmux/data/attachments/cli_self/u/${A}`,
+      mandatoryReadOnlyPaths: ['/Users/u'] });
+    const profile = compileToSeatbelt(p);
+    const finalAllow = profile.lastIndexOf('(allow file-read* (subpath "/Users/u"))');
+    const finalKeyDeny = profile.lastIndexOf(`(deny file-read* (subpath "${store}"))`);
+    expect(finalAllow).toBeGreaterThanOrEqual(0);
+    expect(finalKeyDeny).toBeGreaterThan(finalAllow);
+  });
+
+  it("two owners' policies never grant each other's writable paths", () => {
+    const pa = buildFsPolicy(ownerCtx(A));
+    const pb = buildFsPolicy(ownerCtx(B));
+    const rwA = pa.rules.filter(r => r.access === 'readWrite').map(r => r.path);
+    const rwB = new Set(pb.rules.filter(r => r.access === 'readWrite').map(r => r.path));
+    const shared = rwA.filter(p => rwB.has(p) && !p.includes('/turn-send-ledger/'));
+    // 共享的只能是与 owner 无关的系统路径（工具链、tmp 等），绝不能含 users/<owner> 或 attachments/u/<owner>。
+    for (const p of shared) expect(p, p).not.toMatch(/\/users\/ou_|\/attachments\/cli_self\/u\//);
+    expect(rwA.some(p => p.includes(`/users/${A}`))).toBe(true);
+    expect(rwA.some(p => p.includes(`/users/${B}`))).toBe(false);
+  });
+});

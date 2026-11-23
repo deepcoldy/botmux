@@ -196,6 +196,25 @@ botmux board set <编号> --dismiss-hint                   # 收起巡检提示
 - `attach` 附图文说明：`.html` 说明页是单个文件（图片内嵌成 data URL，UTF-8，不超过 10MB）；`.mp4` / `.webm` 视频不超过 50MB，mp4 用 H.264 并加 `-movflags +faststart`。一次最多 4 个，可以和截图一起附。管家规则里有说明页的写法和最小模板（`botmux board guide`）。
 - 完整参数见 `botmux board --help`。
 
+## 从本机其他工具读看板、提交决定
+
+本机的其他工具（比如自己的脚本、本地飞书客户端）可以用 `botmux owner-board` 读管家的看板，替你提交决定。输出都是 JSON：
+
+```bash
+botmux owner-board boards                                      # 本机在线、开着管家的 Bot
+botmux owner-board list --bot <管家 appId> [--state decide,accept] [--query 关键词]
+botmux owner-board show --bot <管家 appId> <编号>
+botmux owner-board decide --bot <管家 appId> <编号> --ask-key <askKey> --request-id <id> \
+  [--choice A] [--text "说明"]
+```
+
+- `list` 默认列「待拍板 + 待验收」；`--state` 写 `decide` / `accept` / `active` / `waiting` / `done` / `closed` 的逗号组合，或 `all`。每项带问题、选项、推荐、主群、关联链接、更新时间和飞书侧栏链接。
+- `decide` 只接受待拍板、待验收的项，和在卡片上点选项一样：这一项单独成一个批次送给管家，看板时间线和管家群的卡片上都写明来自「本机客户端」。`--ask-key` 取 `list` / `show` 里这一项的 `askKey`，管家之后改过问题、选项或状态就拒绝，刷新后再提交。`--request-id` 由调用方生成，同一个 id 带同样的内容重试不会重复提交，上次没送到时会顺带重投；同一个 id 换了事项或内容会被拒绝。
+- 和卡片一样**以后提交的为准**：同一项较早、还没送到管家的决定（网页、卡片或本机客户端提交的都算）直接作废，已经送到的提醒管家先如实标记那一条；待验收的说明不互相作废，逐条交给管家。
+- 在 botmux 会话里（继承了 `BOTMUX_SESSION_ID`）运行 `decide` 会被拒绝：决定只能由 owner 自己的工具提交，不能由会话里的 Agent 代拍板。
+- 鉴权用宿主机 daemon 的本机凭证（和 `botmux observe` 相同，`~/.botmux/.dashboard-secret`），只连 `127.0.0.1`。沙箱会话读不到这个凭证，所以会话里的 Agent 用不了；Dashboard 的登录和接口都不变。
+- 不需要额外配置，daemon 升级重启后就能用。完整字段见 `botmux owner-board --help`。
+
 ## 数据存在哪
 
 看板存在 `<数据目录>/decision-board.sqlite`（整机一个文件，按管家 Bot 分开），截图和图文说明存在 `<数据目录>/decision-board/<app_id>/files/`（上传后还没附上的说明页 / 视频在同级的 `staging/`，1 小时后清掉）。第一次用看板时才创建。关闭管家不会删除看板数据。

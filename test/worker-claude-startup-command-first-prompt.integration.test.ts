@@ -36,7 +36,8 @@
  *      SessionStart, and the warning must follow it despite the redraws.
  */
 import { randomUUID } from 'node:crypto';
-import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { killPrivateTmuxServer } from '../scripts/test-process-reaper.mjs';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -288,6 +289,12 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
       return run;
     }
     if (scenario.swallowCommandEnter) {
+      // The acknowledgement wait starts only after Enter reaches the fake.
+      // Cold worker loading / CLI boot must not spend the notice's budget.
+      await waitFor(
+        () => readEvents(eventsFile).some(e => e.kind === 'swallowed'),
+        60_000 + scenario.bootMs, 'the startup command Enter to be swallowed',
+      );
       await waitFor(
         () => messages.some(m => m.type === 'user_notify' && m.message.includes('/effort xhigh')),
         60_000, 'the held-prompt notice',
@@ -315,7 +322,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
     // Never a bare kill-server: should TMUX_TMPDIR be missing, tmux silently
     // falls back to /tmp and the host's default server would be the target.
     const privateSocket = join(root, `tmux-${process.getuid?.() ?? 0}`, 'default');
-    try { execFileSync('tmux', ['-S', privateSocket, 'kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
+    killPrivateTmuxServer('tmux', privateSocket, { env: privateTmuxEnv(root) });
     rmSync(root, { recursive: true, force: true });
   }
   return run;
@@ -346,7 +353,9 @@ it.skipIf(!tmuxAvailable)(
   async () => {
     const [cold, swallowed, passthrough, held, stuck] = await Promise.all([
       runScenario({ name: 'A cold start', bootMs: 20_000, swallowCommandEnter: false }),
-      runScenario({ name: 'B swallowed command Enter', bootMs: 0, swallowCommandEnter: true }),
+      // Cold boot + the command acknowledgement wait exceed the old 60s
+      // spawn-relative notice budget, even on an otherwise idle runner.
+      runScenario({ name: 'B swallowed command Enter', bootMs: 45_000, swallowCommandEnter: true }),
       runScenario({ name: 'C cold-start passthrough', bootMs: 20_000, swallowCommandEnter: false, rawInput: '/model opus' }),
       // Past the ~100s after which PTY activity no longer held the old warning back.
       runScenario({ name: 'D record held until late SessionStart', bootMs: 0, swallowCommandEnter: false, lateSessionStartMs: 125_000, holdPromptRecord: true }),

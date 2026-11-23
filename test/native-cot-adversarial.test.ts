@@ -8,6 +8,7 @@ import { getBot, getBotClient } from '../src/bot-registry.js';
 import { finalizeCotMessage, handleCotThinkingUpdate, sweepOrphanCotMessages } from '../src/im/lark/cot-message.js';
 import { trackStartingCardPublication } from '../src/core/starting-card-publication.js';
 import { updateTurnReplyCard, updateReplyCardNativeThinking } from '../src/core/turn-reply-card.js';
+import { deferred } from './helpers/feedback-deferred.js';
 
 vi.mock('../src/bot-registry.js', () => ({ getBot: vi.fn(), getBotClient: vi.fn(), normalizeUsageDisplay: () => 'off' }));
 vi.mock('../src/core/cost-calculator.js', () => ({ getSessionUsageSnapshot: vi.fn() }));
@@ -65,7 +66,7 @@ describe('independent native CoT adversarial lifecycle', () => {
     ds = { larkAppId: 'app_adversarial', chatId: 'oc_chat', currentTurnId: 'om_turn',
       session: { sessionId: 'sid_adversarial', rootMessageId: 'om_root', status: 'active', cliId: 'codex', backendType: 'tmux' } };
   });
-  afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
   it('settles a slow create exactly once even when the operator disables native CoT before its ACK', async () => {
     let release!: () => void;
@@ -144,24 +145,36 @@ describe('independent native CoT adversarial lifecycle', () => {
   });
 
   it('holds the first answer until a slow native create and prologue both finish', async () => {
-    let releaseCreate: (() => void) | undefined;
-    let releasePrologue: (() => void) | undefined;
+    const create = deferred<() => void>();
+    const prologue = deferred<() => void>();
+    // Simulate a runner descheduled longer than the old 3s polling budget.
+    // Request arrival and release must still govern answer ordering.
+    let sampledTime = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => sampledTime += 4000);
     intercept = req => {
       if (req.method === 'POST' && req.url === '/open-apis/im/v1/message_cot') {
-        return new Promise(resolve => { releaseCreate = () => resolve(deliver(req)); });
+        return new Promise(resolve => { create.resolve(() => resolve(deliver(req))); });
       }
       if (req.method === 'PUT' && req.data.events.some((e: any) => e.event_type === 'RUN_STARTED')) {
-        return new Promise(resolve => { releasePrologue = () => resolve(deliver(req)); });
+        return new Promise(resolve => { prologue.resolve(() => resolve(deliver(req))); });
       }
     };
     const answer = vi.fn(async () => 'om_answer');
     const start = updateTurnReplyCard(ds, 'om_turn', { kind: 'final', text: 'answer', source: 'bridge',
       card: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"answer"}]}}' }, answer);
-    await until(() => releaseCreate !== undefined);
+    const releaseCreate = await create.promise;
+    await flush();
+    // Bun schedules the answer-card continuation one setImmediate hop later
+    // than the fake-timer drain; drain it too or the negative assertion below
+    // passes while a premature answer is already queued.
+    await nextImmediate();
     expect(answer).not.toHaveBeenCalled();
-    releaseCreate!(); await until(() => releasePrologue !== undefined);
+    releaseCreate();
+    const releasePrologue = await prologue.promise;
+    await flush();
+    await nextImmediate();
     expect(answer).not.toHaveBeenCalled();
-    releasePrologue!(); await start;
+    releasePrologue(); await start;
     expect(answer).toHaveBeenCalledTimes(1); expect(seq).toBe(1);
     finalizeCotMessage(ds, 'om_turn', 'completed'); await flush();
   });

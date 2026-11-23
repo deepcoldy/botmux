@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { SessionContractStore, SessionContractConflict, sessionContractStore } from '../src/services/session-contract-store.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
-import { contractReadiness } from '../src/services/session-contract.js';
+import { contractReadiness, reduceSessionContract, type ContractTransitionInput, type RuntimeIdentity } from '../src/services/session-contract.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 const ref = { appId: 'cli_contract_test', sessionId: 'session_test' };
 const worker = { workerId: 'worker_one', generation: 1 };
@@ -14,6 +14,133 @@ function open(directory = mkdtempSync(join(tmpdir(), 'session-contract-'))) { if
 function bind(store: SessionContractStore, owner = worker, physical = identity) { store.bindWorker(ref, owner); const runtime = store.reserveRuntime(ref, owner); return store.bindRuntime(ref, runtime, owner, physical); }
 afterEach(() => { vi.useRealTimers(); for (const store of stores.splice(0)) try { store.close(); } catch {} for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 describe('session identity and state contract', () => {
+  function settledRestart() {
+    const store = open(); store.bindWorker(ref, worker); store.apply(ref, { type: 'worker_online', worker });
+    const operation = store.beginOperation(ref, 'restart').operation;
+    const reserved = store.reserveRuntime(ref, worker, 'native-binding');
+    const { nativeSessionId, ...physical } = identity;
+    const runtime = store.bindRuntime(ref, reserved, worker, physical, operation.operationId);
+    store.apply(ref, { type: 'runtime_ready', runtime: runtime.ref });
+    store.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed', runtime: runtime.ref });
+    return { store, operation, reserved, runtime, nativeSessionId, physical };
+  }
+  it.each(['restart', 'resume'] as const)('enriches the current native identity after %s has already completed', kind => {
+    const store = open(); store.bindWorker(ref, worker);
+    const operation = store.beginOperation(ref, kind).operation;
+    const reserved = store.reserveRuntime(ref, worker);
+    const { nativeSessionId, ...physical } = identity;
+    const runtime = store.bindRuntime(ref, reserved, worker, physical, operation.operationId);
+    store.apply(ref, { type: 'runtime_ready', runtime: runtime.ref });
+    store.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed', runtime: runtime.ref });
+    expect(store.read(ref)?.activeOperationId).toBeUndefined();
+    const enriched = store.bindRuntime(ref, reserved, worker, { ...physical, nativeSessionId }, operation.operationId);
+    expect(enriched.phase).toBe('ready');
+    expect(enriched.promptReady).toBe(true);
+    expect(enriched.identity?.nativeSessionId).toBe(nativeSessionId);
+    expect(store.read(ref)?.activeRuntime).toEqual(runtime.ref);
+    expect(() => store.bindRuntime(ref, reserved, worker, { ...identity, physicalId: 'another-process' }, operation.operationId)).toThrow('runtime_identity_changed');
+  });
+  it('keeps a completed-operation replacement and a closing runtime fenced', () => {
+    const store = open(); store.bindWorker(ref, worker);
+    const operation = store.beginOperation(ref, 'restart').operation;
+    const { nativeSessionId, ...physical } = identity;
+    const reserved = store.reserveRuntime(ref, worker);
+    const runtime = store.bindRuntime(ref, reserved, worker, physical, operation.operationId);
+    store.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed', runtime: runtime.ref });
+    const stale = store.reserveRuntime(ref, worker);
+    expect(store.bindRuntime(ref, stale, worker, { ...identity, physicalId: 'new-process' }, operation.operationId).phase).toBe('retiring');
+    store.beginOperation(ref, 'close');
+    store.bindRuntime(ref, reserved, worker, { ...physical, nativeSessionId }, operation.operationId);
+    expect(store.read(ref)?.lifecycle).toBe('closing');
+    expect(contractReadiness(store.read(ref)!, store.runtime(ref)).cliReady).toBe(false);
+  });
+  it.each(['suspend', 'cancel', 'close'] as const)('keeps the current executor usable when %s rejects after late identity enrichment', kind => {
+    vi.useFakeTimers();
+    const { store, operation, reserved, runtime } = settledRestart();
+    const execution = store.admitExecution(ref, 'running-turn');
+    const control = store.beginOperation(ref, kind, { execution: kind === 'cancel' ? execution.ref : undefined }).operation;
+    setTimeout(() => store.bindRuntime(ref, reserved, worker, identity, operation.operationId), 100);
+    setTimeout(() => store.apply(ref, { type: 'control_result', operationId: control.operationId, phase: 'rejected' }), 200);
+    vi.advanceTimersByTime(100);
+    expect(store.runtime(ref)?.phase).toBe('ready');
+    expect(store.read(ref)?.activeOperationId).toBe(control.operationId);
+    expect(contractReadiness(store.read(ref)!, store.runtime(ref)).cliReady).toBe(false);
+    vi.advanceTimersByTime(100);
+    expect(store.read(ref)?.lifecycle).toBe('active');
+    expect(store.read(ref)?.activeOperationId).toBeUndefined();
+    expect(store.apply(ref, { type: 'runtime_ready', runtime: runtime.ref }).decision).toBe('applied');
+    expect(contractReadiness(store.read(ref)!, store.runtime(ref)).cliReady).toBe(true);
+  });
+  it.each(['confirmed', 'uncertain'] as const)('retains a %s suspend fence when the old identity callback arrives', phase => {
+    const { store, operation, reserved } = settledRestart();
+    const control = store.beginOperation(ref, 'suspend').operation;
+    store.apply(ref, { type: 'control_result', operationId: control.operationId, phase });
+    store.bindRuntime(ref, reserved, worker, identity, operation.operationId);
+    expect(store.read(ref)?.lifecycle).toBe(phase === 'confirmed' ? 'suspended' : 'suspending');
+    expect(store.read(ref)?.activeOperationId).toBe(phase === 'confirmed' ? undefined : control.operationId);
+    expect(contractReadiness(store.read(ref)!, store.runtime(ref)).cliReady).toBe(false);
+  });
+  it('rolls back identity publication atomically and retries after reopening', () => {
+    const { store, operation, reserved } = settledRestart();
+    const before = store.snapshot(ref); const writer = openDatabaseSyncOrThrow(store.filename);
+    writer.exec("CREATE TRIGGER reject_binding_update BEFORE UPDATE ON runtime_bindings BEGIN SELECT RAISE(ABORT,'binding publication failed'); END");
+    expect(() => store.bindRuntime(ref, reserved, worker, identity, operation.operationId)).toThrow('binding publication failed');
+    expect(store.snapshot(ref)).toEqual(before);
+    writer.exec('DROP TRIGGER reject_binding_update'); writer.close(); store.close();
+    const reopened = open(directories[0]);
+    expect(reopened.snapshot(ref)).toEqual(before);
+    expect(reopened.bindRuntime(ref, reserved, worker, identity, operation.operationId)).toMatchObject({ phase: 'ready', identity });
+  });
+  it('keeps readiness ticks and a later replacement independent of identity enrichment', () => {
+    vi.useFakeTimers(); const { store, operation, reserved, runtime } = settledRestart(); let tick = 0;
+    const timer = setInterval(() => store.apply(ref, { type: ++tick % 2 ? 'runtime_busy' : 'runtime_ready', runtime: runtime.ref }), 100);
+    setTimeout(() => store.bindRuntime(ref, reserved, worker, identity, operation.operationId), 450);
+    vi.advanceTimersByTime(450); clearInterval(timer);
+    expect(store.runtime(ref)).toMatchObject({ phase: 'ready', promptReady: true, promptReadySequence: 3, identity });
+    const replacement = store.beginOperation(ref, 'restart').operation;
+    const next = store.reserveRuntime(ref, worker);
+    store.bindRuntime(ref, next, worker, { ...identity, physicalId: 'new-process' }, replacement.operationId);
+    store.apply(ref, { type: 'control_result', operationId: replacement.operationId, phase: 'confirmed', runtime: next });
+    store.bindRuntime(ref, reserved, worker, { ...identity, nativeGeneration: 'next' }, operation.operationId);
+    expect(store.read(ref)?.activeRuntime).toEqual(next);
+    expect(store.runtime(ref, reserved.runtimeId)?.phase).toBe('retiring');
+  });
+  it.each([
+    'not_selected', 'other_runtime', 'other_worker', 'retiring', 'stopped', 'unresolved',
+    'suspended', 'resuming', 'closed', 'opaque', 'other_physical', 'native_session_changed', 'native_generation_changed',
+  ] as const)('does not accept late identity enrichment across the %s reducer fence', fence => {
+    const { store, operation } = settledRestart();
+    const input: ContractTransitionInput = { session: store.read(ref)!, runtime: store.runtime(ref)! };
+    // Call the reducer directly: store.bindRuntime's validation must not mask
+    // a missing guard in the state machine itself.
+    if (fence === 'not_selected') input.session.activeRuntime = { runtimeId: 'selected_elsewhere', epoch: 9 };
+    if (fence === 'other_runtime') {
+      input.runtime!.ref = { runtimeId: 'previous_runtime', epoch: 8 };
+      input.session.activeRuntime = input.runtime!.ref;
+    }
+    if (fence === 'other_worker') input.runtime!.worker = { workerId: 'old_worker', generation: 0 };
+    if (fence === 'retiring' || fence === 'stopped' || fence === 'unresolved') input.runtime!.phase = fence;
+    if (fence === 'suspended' || fence === 'resuming' || fence === 'closed') input.session.lifecycle = fence;
+    if (fence === 'opaque') input.runtime!.identity!.proof = 'opaque';
+    if (fence === 'native_session_changed') input.runtime!.identity!.nativeSessionId = 'already_known';
+    if (fence === 'native_generation_changed') input.runtime!.identity!.nativeGeneration = 'already_known';
+    const nextIdentity: RuntimeIdentity = { ...input.runtime!.identity!, nativeSessionId: identity.nativeSessionId, nativeGeneration: 'next' };
+    if (fence === 'other_physical') nextIdentity.physicalId = 'different_process';
+    const incoming = { ...store.runtime(ref)!, identity: nextIdentity, phase: 'ready' as const };
+    const result = reduceSessionContract(input, { type: 'runtime_bound', runtime: incoming, operationId: operation.operationId });
+    expect(result.decision).toBe('historical');
+    expect(result.runtime?.phase).toBe('retiring');
+    expect(result.session.activeRuntime).toEqual(input.session.activeRuntime);
+    expect(result.session.lifecycle).toBe(input.session.lifecycle);
+  });
+  it('preserves explicit retirement when a binding repeats exactly the same identity', () => {
+    const { store, runtime } = settledRestart();
+    const input = { session: store.read(ref)!, runtime };
+    const result = reduceSessionContract(input, { type: 'runtime_bound', runtime: { ...runtime, phase: 'retiring' } });
+    expect(result.decision).toBe('applied');
+    expect(result.runtime?.phase).toBe('retiring');
+    expect(contractReadiness(result.session, result.runtime).cliReady).toBe(false);
+  });
   it.each(['suspend', 'cancel'] as const)('retains an uncertain %s record while a reopened store starts one recovery restart', kind => {
     const store = open(); bind(store);
     const execution = store.admitExecution(ref, 'old-turn');

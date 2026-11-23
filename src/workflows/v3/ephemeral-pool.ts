@@ -15,7 +15,7 @@ import { SessionContractStore } from '../../services/session-contract-store.js';
 import { sessionContractsEnabled } from '../../services/session-contract.js';
 import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
-import { getBot } from '../../bot-registry.js';
+import { getBot, loadBotConfigsCached } from '../../bot-registry.js';
 import { statSync } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -83,6 +83,19 @@ export interface EphemeralPoolDeps {
   manifestSettleMs?: number;
 }
 
+/** Throws when the live bot runs personal-assistant mode (see runNodeImpl). */
+export function assertNotAssistantModeBot(larkAppId: string): void {
+  // A daemon registers only its own bot, and standalone runs register none:
+  // fall back to the configured bots. A bot absent from both has no secret to
+  // launch with either, so that case is left to the credential resolver.
+  let cfg: { assistantMode?: boolean } | undefined;
+  try { cfg = getBot(larkAppId).config; } catch {
+    try { cfg = loadBotConfigsCached().find(b => b.larkAppId === larkAppId); } catch { cfg = undefined; }
+  }
+  const assistant = cfg?.assistantMode === true;
+  if (assistant) throw new Error(`v3 workflow does not support personal-assistant mode; bot ${larkAppId} has assistantMode=true`);
+}
+
 /** Session env overlay for a workflow worker, from the live bot config. */
 function v3WorkerSessionEnv(
   larkAppId: string,
@@ -131,6 +144,11 @@ async function runNodeImpl(
       `v3 pool: attempt lease "${req.attemptLease.attemptId}" does not match request "${req.attemptId}"`,
     );
   }
+  // Personal-assistant mode is checked against the LIVE bot, not the frozen
+  // snapshot: a run paused before the mode was enabled resumes from its stored
+  // snapshot, and a workflow worker has no per-owner session (it would get the
+  // bot-wide BOT_HOME). Refuse before any side effect.
+  assertNotAssistantModeBot(req.botSnapshot.larkAppId);
   const cancelSignal = req.attemptLease?.signal ?? req.cancelSignal;
   const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH] ?? join(req.attemptDir, 'manifest.json');
   const ptyLogPath = join(req.attemptDir, 'pty.log');
@@ -302,6 +320,7 @@ async function runNodeImpl(
     cliInstanceBinding: req.botSnapshot.cliInstanceBinding,
     cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
+    credentialsSourceDir: req.botSnapshot.credentialsSourceDir,
     wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
     reasoningEffort: req.botSnapshot.reasoningEffort,

@@ -27,7 +27,8 @@ async function freshModules() {
   const botConfigStore = await import('../src/services/bot-config-store.js');
   const store = await import('../src/services/card-prefs-store.js');
   const pinStreamingCardChange = await import('../src/services/pin-streaming-card-change.js');
-  return { registry, botConfigStore, store, pinStreamingCardChange };
+  const awaySummaryFocusRevocation = await import('../src/services/away-summary-focus-revocation.js');
+  return { registry, botConfigStore, store, pinStreamingCardChange, awaySummaryFocusRevocation };
 }
 
 async function freshModulesWithConfigStoreMock(
@@ -44,7 +45,8 @@ async function freshModulesWithConfigStoreMock(
   const botConfigStore = await import('../src/services/bot-config-store.js');
   const store = await import('../src/services/card-prefs-store.js');
   const pinStreamingCardChange = await import('../src/services/pin-streaming-card-change.js');
-  return { registry, botConfigStore, store, pinStreamingCardChange };
+  const awaySummaryFocusRevocation = await import('../src/services/away-summary-focus-revocation.js');
+  return { registry, botConfigStore, store, pinStreamingCardChange, awaySummaryFocusRevocation };
 }
 
 function deferred<T = void>() {
@@ -83,6 +85,41 @@ describe('card-prefs store — 主动开工 fields', () => {
   function readConfig(): any {
     return JSON.parse(readFileSync(configPath, 'utf-8'))[0];
   }
+
+  it('publishes recap revocation to live config before a queued card settlement', async () => {
+    writeConfig({ replyCardRecap: true });
+    const { registry, store, awaySummaryFocusRevocation } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    const { noteRecapCard, noteRecapTurnStarted } = await import('../src/core/turn-recap-state.js');
+    const events: string[] = [];
+    const ds = { session: { sessionId: 'sess-card-prefs-race' }, larkAppId: 'app_default' } as any;
+    noteRecapTurnStarted(ds, 'turn1');
+    const io = {
+      enabled: () => registry.getBot('app_default').config.replyCardRecap === true,
+      awaySummaryWanted: () => true,
+      requestAwaySummary: () => { events.push('request'); },
+      locale: () => 'zh' as const,
+      readCard: async () => undefined,
+      cardId: async () => 'card',
+      insert: async () => {},
+      replace: async () => {},
+      now: () => Date.now(),
+      warn: () => {},
+    };
+    const dispose = awaySummaryFocusRevocation.registerAwaySummaryFocusRevocationHandler(() => {
+      events.push('cancel');
+      queueMicrotask(() => noteRecapCard(ds, 'turn1', { kind: 'legacy', messageId: 'card1' }, io));
+    });
+    try {
+      await store.updateBotCardPrefs('app_default', { replyCardRecap: false });
+      await Promise.resolve();
+      expect(events).toEqual(['cancel']);
+      expect(registry.getBot('app_default').config.replyCardRecap).not.toBe(true);
+      expect(readConfig().replyCardRecap).not.toBe(true);
+    } finally {
+      dispose();
+    }
+  });
 
   it('preserves legacy CoT opt-out across unrelated edits and migrates only an explicit toggle', async () => {
     writeConfig({ thinkingCard: false });
@@ -279,6 +316,28 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(clear.ok && clear.prefs.hiddenStreamingCardButtons).toEqual([]);
     expect(readConfig().hiddenStreamingCardButtons).toBeUndefined();
     expect(registry.getBot('app_default').config.hiddenStreamingCardButtons).toBeUndefined();
+  });
+
+  it('persists classic layout, hot-updates it, and restores the default without changing other preferences', async () => {
+    writeConfig({ hiddenStreamingCardButtons: ['close'], replyCardMode: 'unified', model: 'model-to-preserve' });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    const before = readConfig();
+    expect(store.getBotCardPrefs('app_default').streamingCardFoldedLayout).toBe(true);
+    expect(store.getBotCardPrefs('missing-bot').streamingCardFoldedLayout).toBe(true);
+
+    const off = await store.updateBotCardPrefs('app_default', { streamingCardFoldedLayout: false });
+    expect(off.ok && off.prefs.streamingCardFoldedLayout).toBe(false);
+    expect(readConfig()).toEqual({ ...before, streamingCardFoldedLayout: false });
+    expect(registry.getBot('app_default').config.streamingCardFoldedLayout).toBe(false);
+    expect(registry.loadBotConfigs()[0]!.streamingCardFoldedLayout).toBe(false);
+
+    await store.updateBotCardPrefs('app_default', { privateCard: true });
+    expect(readConfig().streamingCardFoldedLayout).toBe(false);
+    const on = await store.updateBotCardPrefs('app_default', { streamingCardFoldedLayout: true });
+    expect(on.ok && on.prefs.streamingCardFoldedLayout).toBe(true);
+    expect(readConfig()).toEqual({ ...before, privateCard: true });
+    expect(registry.getBot('app_default').config.streamingCardFoldedLayout).toBeUndefined();
   });
 
   it('autoStartOnGroupJoinSeed round-trips; blank clears back to the built-in i18n fallback', async () => {

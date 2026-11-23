@@ -19,6 +19,7 @@ import { parse } from 'dotenv';
 // (stripDashboardH5Env / redactChildEnv) keeps the family out of the daemon
 // process and every CLI child.
 export const DAEMON_ENV_KEYS = [
+  'BOTMUX_TOPIC_SEARCH',
   'WEB_HOST',
   'WEB_EXTERNAL_HOST',
   'WEB_EXTERNAL_PORT',
@@ -90,6 +91,14 @@ export const DAEMON_ENV_KEYS = [
   // value would be ignored on those paths, and deleting the key from
   // ~/.botmux/.env could never restore the default budget.
   'BOTMUX_SENDER_RESOLVE_TIMEOUT_MS',
+  // Per `git worktree add` budget (config.ts resolveWorktreeCreateTimeoutMs,
+  // default 60s). Same file-authority requirement as the sender timeout: the
+  // CLI pane does not scrub this key, so a session-origin (or detached
+  // self-upgrade) restart inherits the old daemon's budget and the daemon's
+  // dotenv load never overrides it. Without this entry a changed budget is
+  // ignored on those restarts and deleting the key can never restore the 60s
+  // default.
+  'BOTMUX_WORKTREE_CREATE_TIMEOUT_MS',
   // Extra source addresses accepted by the local-peer ring of the internal
   // HMAC endpoints (utils/loopback-peers.ts): hosts whose kernel reports a
   // same-machine loopback peer as a LAN IP. Consumed by both the daemons

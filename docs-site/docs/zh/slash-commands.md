@@ -18,7 +18,7 @@
 | `/lane close` | 安全关闭本人的独立 principal lane：有运行中/排队任务或未提交文件时拒绝，回收前先推送未发布提交，且不会自动合并或删除分支 |
 | `/retry` | 重试最近一个失败或被中断的 turn（10s 冷却） |
 | `/rewind [n\|n confirm]` | 回退会话上下文：不带参数列出最近检查点；`n` 预览、`n confirm` 回退到第 n 轮之前。仅 Claude Code，执行前自动备份 transcript，下条消息冷启动续上下文 |
-| `/idlecompact [on\|off\|分钟]` | 本会话闲置自动压缩：开启后 CLI 闲置 N 分钟（默认 55，可设 1–59）自动发送 `/compact`，趁 1 小时提示缓存未过期压缩上下文；上下文低于 100k tokens 时跳过。不带参数查看状态，等价于流式卡片「⏲️ 闲置自动压缩」按钮。仅 Claude Code 与 tmux 后端的 Codex |
+| `/idlecompact [on\|off\|分钟]` | 本会话闲置自动压缩：开启后 CLI 闲置 N 分钟（默认 55，可设 1–59）自动发送 `/compact`，趁 1 小时提示缓存未过期压缩上下文；上下文低于 100k tokens 时跳过。后台任务（如 CI 守望脚本）在跑时照样压缩，任务继续运行、回报照常送达；Claude Code 会话的缓存按最后一次实际请求计时（后台任务唤醒、定时任务也算），错过时机后若有新请求重新读热缓存，会在那时补压。不带参数查看状态，等价于流式卡片「⏲️ 闲置自动压缩」按钮。仅 Claude Code 与 tmux 后端的 Codex |
 | `/queue <消息>` | Codex App 活会话：将文字消息作为独立一轮排队，等当前任务结束后执行；空闲时直接开始。支持多行纯文本，暂不支持富文本和附件；需命令操作权限（可通过 canTalkDaemonCommands 授权）。无会话、尚未就绪或其它 CLI 会明确拒绝。开启 trigger-user 按人凭证时会在接纳前刷新本轮身份；但后续消息可覆盖单槽凭证，等待轮的 bytedcli/lark-cli 仍可能被 turn-mismatch 拒绝，需要重试。 |
 | `/stop` | 中断当前 turn，保留会话；等价于流式卡片里的「停止」按钮 |
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
@@ -28,11 +28,12 @@
 | `/cleanup-wt <ID>` | worktree 最终删除失败后重试已持久化的清理任务；删除前会重新校验权限、活动会话、worktree 身份和安全状态 |
 | `/fork <任务>` | 继承当前会话的完整上下文，新建一个并行的分身话题（私聊、话题群、普通群的会话话题内都能用）；源会话原样继续（Claude 系 / Codex 或 TraeX 终端模式） |
 | `/forklist` | 重发当前会话的分身任务面板，显示运行/结束状态和子话题链接 |
-| `/rename <标题>` | 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名 |
+| `/rename <标题>` | 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名；开启 `bareRenamePassthrough` 后，Claude Code 会话不带标题时由 Claude 自动起名 |
 | `/fork --create <新群名>` | 不建子话题，把当前空闲会话分身到一个新建群，源会话原样保留继续（Claude 系 / Codex 或 TraeX 终端模式；Hybrid RPC / 外部 app-server 会话不支持；需在源会话内发起） |
 | `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照）。`/card off`、`/card on` 控制本群是否出流式卡；`/card pin off`、`/card pin on`、`/card pin status` 控制当前群的流式卡片置顶开关。仅 `allowedUsers` 可执行（开关影响全群，飞书没有按人视图） |
 | `/cot` | CoT 开关：`/cot off` 关闭本群的思考与工具过程，`/cot on` 恢复，`/cot show` 在开关关闭时临时展示一次当前回合，`/cot status` 查看状态（bot 级总开关 `cotEnabled` 默认 on；支持 claude-code / codex / traex）。仅 `allowedUsers` 可执行 |
 | `/mention-mode [always\|topic\|never\|ambient\|status]` | 普通群的 @ 策略：什么时候可以不 @ 也回应。查询需对话权、修改需操作权；**仅普通群可设**（私聊/话题群/会话群会被拒绝）。四模式语义与各条免 @ 例外见 [@ 策略](/mention-mode) |
+| `/assistant [status\|claim\|owner @某人]` | 个人助理模式（bot 配置 `assistantMode`）下群的归属：不带参数查看本群的助理主人；`claim` 认领一个还没有主人（或主人已退群）的群；`owner @某人` 由 bot 管理员指定主人。私聊不需要认领。详见 [个人助理模式](/assistant-mode) |
 | `/term` | 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露） |
 | `/quote` | 弹出本群话题选择卡，选一个就把那个话题的聊天记录读进当前会话。补的是飞书本身的缺口——飞书的「引用」只能引单条消息，没有「引用整个话题」的入口。读完只回一句确认（多少条、时间跨度、主题），等你下一条指令 |
 | `/quote <指令>` | 同上，但选完话题直接执行你的指令，省一个来回。话题内容仍然会被明确标注为「资料而不是指令」注入 |
@@ -98,6 +99,7 @@ Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set
 两条命令都默认可用，需要操作权限（管理员 / `allowedUsers`，或用 `canTalkDaemonCommands` 放开）。
 
 - **`/rename <标题>`**：在已有会话里发，改 Botmux 会话名（Dashboard、`/sessions` 列表跟着变），运行中的 Codex / Claude Code 会同步改原生会话名。飞书群名、话题名不变。
+- **`/rename`（不带标题）**：默认只回用法提示。在 Dashboard「Bot 配置 → Slash 命令」打开「不带标题的 /rename 交给 CLI 起名」（`bots.json` 的 `bareRenamePassthrough`，也可以 `/botconfig set bareRenamePassthrough on`）后，Claude Code 会话里（含接管的 adopt 会话）会把 `/rename` 原样交给 Claude，由它根据对话自动起名。只改 Claude 自己的会话名，Botmux 会话标题不变。Claude Code 没在运行时会提示无法起名；其它 CLI 照旧回复用法。
 - **`/cli <cliId>`**：只给**还没启动 CLI** 的会话选 CLI，例如在新话题里第一条就发 `/cli codex`，再发任务，这个会话就用 Codex 跑，Bot 的默认 CLI 不变。`cliId` 取值见[支持的 CLI](/adapters#支持的-cli--agent)。也可以写程序名或简写，不区分大小写：`/cli cc` 或 `/cli claude` 选 Claude Code，`/cli omp` 选 Oh My Pi，`/cli agy` 选 Antigravity；完整 `cliId` 优先，所以 `/cli codex` 选的是 Codex 而不是同样跑 `codex` 的 Codex App。一个简写对应多个 CLI（如 `trae` 同时是 TRAE CLI 的新旧两代）时不替你选，会列出候选让你改发完整 ID。只发 `/cli` 列出全部可选 CLI 和简写。以下情况会被拒绝：会话已有历史或 CLI 已经起来、接管（adopt）的会话、排队中的会话、Bot 配了 `env`、用 Riff 后端、选的是 `riff`，以及所选 CLI 和 Bot 的零注入（`promptInjection: "none"`）或 `codexRpcInput` 不兼容。`/cli` 不在 `/help` 里显示。
 
 ## 群负责人（Agent 工具）
@@ -204,9 +206,9 @@ Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
 
 `/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Mojo 后端上，`/fast` 仍走透传分支，会被 fail-closed 明确拒绝、给出提示，而不会静默生效。Riff 后端则按上一段处理：`/fast` 不进透传，而是作为普通消息封装成一次远端任务，同样不会切换档位。
 
-部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex 默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。
+部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex / Seed / Relay / TRAE CLI（`traex`）默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。`/goal` 的子命令和行为以所用 CLI 版本为准。
 
-想放行更多命令，给该 bot 配 [`customPassthroughCommands`](/bots-json)（如 `["/export"]`）即可在上面白名单之外按需扩展。会遮蔽 botmux daemon 命令的项（如 `/status`、`/help`、`/cd`）会被自动丢弃——daemon 命令始终保留自身语义，无法被透传覆盖。
+想放行更多命令，给该 bot 配 [`customPassthroughCommands`](/bots-json)（如 `["/export"]`）即可在上面白名单之外按需扩展。会遮蔽 botmux daemon 命令的项（如 `/status`、`/help`、`/cd`）会被自动丢弃——daemon 命令始终保留自身语义，无法被透传覆盖。也可以在 Dashboard「Bot 配置 → Slash 命令 → 额外透传命令」里改：上方列出当前 CLI 已默认透传的命令，下方逐个增删额外命令（Enter、逗号或 Tab 生成一项，也可一次粘贴多个）。这里只填命令名，参数在会话里随命令一起发；额外命令只在 CLI 正在运行的会话里透传，不会像 `/goal` 那样在新话题里冷启动会话。
 
 **一条消息里级联多条透传命令**（会话内，CLI 已在跑）：每行一条透传命令，最后可以接正文，botmux 会按书写顺序逐条送出，每条之间等 CLI 空闲——
 
@@ -332,6 +334,8 @@ Dashboard 的「Bot 配置 → 权限与安全 → Slash 命令」还有一个�
 `/group <群名>`（别名 `/g`）：自动新建飞书群、邀请你进群、转让群主，整个群作为一个独立 CLI 会话。`@botA @botB /g <群名>` 可把多个机器人一并拉进新群。
 
 新群默认像群聊模式的会话群一样用渐变 logo 头像；不写群名时会在第一条消息后按内容自动改群名。
+
+加 `--start` 则正文就是任务：`/g --start 排查价格展示错误` 会按任务起群名、把引用和附件转发进新群，并让机器人在新群直接开工；引用一条消息只发 `/g --start` 则以被引用的消息为任务。机器人配置 `groupCreation.autoStart: true` 后默认就带任务开工，单次只想建群用 `/g --no-start <群名>`。
 
 加上 `--role-profile <profile>` 可以在新群里自动 bootstrap 一套按 bot 区分的角色：
 

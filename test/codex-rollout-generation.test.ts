@@ -2,10 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { codexGenerationSessionIdFromRolloutPath, codexSessionIdFromRolloutPath, drainCodexRollout, findCodexRolloutBySessionId } from '../src/services/codex-transcript.js';
+import { codexGenerationSessionIdFromRolloutPath, codexSessionIdFromRolloutPath, drainCodexRollout, findCodexRolloutBySessionId, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from '../src/services/codex-rollout-replay.js';
-import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CodexSteerReplyCollector, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 
 const SID = 'aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa';
 const GENERATION = 'bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb';
@@ -196,6 +196,40 @@ describe('Codex bridge replay across file generations', () => {
     expect(q.peek()).toEqual([]);
   });
 
+  it('does not compare bare byte offsets across rollout generations for a live steer reply', () => {
+    const assistant = line({ timestamp: T2, type: 'response_item', payload: {
+      type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'answer' }],
+    } });
+    const history = start('native-steer', T0) + user('main task', T0) + user('question', T1) + assistant;
+    const old = rollout('29', '', SID, metaWithByteLength(SID, 16_384) + history);
+    const next = rollout('30', `_${GENERATION}`, SID, meta() + history + line({
+      timestamp: '2026-09-30T01:00:03Z', type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'new-tool',
+        input: 'await tools.exec_command({ cmd: "npm test" })',
+      },
+    }));
+    const oldEvents = codexEventsWithStableIds(old, drainCodexRollout(old, 0).events);
+    const nextEvents = codexEventsWithStableIds(next, drainCodexRollout(next, 0).events);
+    const oldAnswerOffset = oldEvents.find(event => event.assistantMessage === 'answer')?.rolloutOffset;
+    const newToolOffset = nextEvents.find(event => event.toolCallBoundary)?.rolloutOffset;
+    expect(Number(oldAnswerOffset)).toBeGreaterThan(Number(newToolOffset));
+
+    const q = new CodexBridgeQueue();
+    q.mark('om_host', 'main task', Date.parse(T0));
+    q.mark('om_followup', 'question', Date.parse(T0));
+    const collectors = new WeakMap<CodexPendingTurn, CodexSteerReplyCollector>();
+    const replies: string[] = [];
+    q.setSteerReplyObserver((ev, turn) => {
+      let collector = collectors.get(turn);
+      if (!collector) collectors.set(turn, collector = new CodexSteerReplyCollector());
+      const reply = collector.feed(ev);
+      if (reply) replies.push(reply.text);
+    });
+    q.ingest(oldEvents);
+    q.ingest(nextEvents);
+    expect(replies).toEqual(['answer']);
+  });
+
   it('suppresses baseline history but does not absorb a terminal beyond the consumed cursor', () => {
     const q = new CodexBridgeQueue();
     q.setLocalTurns(true, 0);
@@ -265,10 +299,13 @@ describe('Codex bridge replay across file generations', () => {
     const splitAt = statSync(file).size;
     appendFileSync(file, final('native-turn-x', 'done', T2));
 
-    const forwardCots = drainCodexRollout(file, 0).events.filter(e => e.kind === 'cot');
+    // Timeline records only: the forward read also marks the call line itself
+    // (a bare toolCallBoundary), a different record a late attach never sees.
+    const timelineCots = (events: CodexBridgeEvent[]) => events.filter(e => e.kind === 'cot' && e.toolCallBoundary !== true);
+    const forwardCots = timelineCots(drainCodexRollout(file, 0).events);
     expect(forwardCots.length).toBeGreaterThan(0);
     const lateDrain = drainCodexRollout(file, splitAt);
-    const backwardCots = lateDrain.events.filter(e => e.kind === 'cot');
+    const backwardCots = timelineCots(lateDrain.events);
     expect(backwardCots.length).toBeGreaterThan(0);
     expect(backwardCots.map(e => e.rawId).sort()).toEqual(forwardCots.map(e => e.rawId).sort());
     expect(forwardCots.every(e => typeof e.rawId === 'string' && e.rawId.length === 64)).toBe(true);

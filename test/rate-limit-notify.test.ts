@@ -16,7 +16,7 @@
  * Run: pnpm vitest run test/rate-limit-notify.test.ts
  */
 import { EventEmitter } from 'node:events';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -129,6 +129,7 @@ function textReplies(sessionReply: ReturnType<typeof vi.fn>): string[] {
 }
 
 describe('rate-limit proactive notification', () => {
+  afterEach(() => vi.useRealTimers());
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-ratelimit-'));
@@ -331,6 +332,35 @@ describe('rate-limit proactive notification', () => {
     expect(texts[0]).toContain(`<at id=${OWNER}>`);
     const interactiveCalls = sessionReply.mock.calls.filter(c => c[2] === 'interactive');
     expect(interactiveCalls.length).toBeGreaterThan(0);
+  });
+
+  it.each(['screen_update', 'screenshot_uploaded'] as const)('patches the existing card when %s replaces an expired refusal', async firstFrame => {
+    vi.useFakeTimers();
+    setupPool(vi.fn(async () => 'om_reply'));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999, streamCardId: 'om_limit_card' }, APP_CARD_ON);
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const first = rateLimitState({ kind: 'usage', source: 'antigravity-error-composer', relativeResetKey: 'usage:60000:first', retryLabel: '1m' });
+    const emitLimit = async (usageLimit: CliUsageLimitState, type = 'screen_update') => {
+      const evidence = type === 'screen_update' ? { content: 'usage limit' } : { imageKey: 'img_limit' };
+      for (const listener of worker.listeners('message')) {
+        await listener({ type, status: 'limited', usageLimit, ...evidence });
+      }
+      await vi.advanceTimersByTimeAsync(0);
+    };
+    await emitLimit(first);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(ds.usageLimit?.retryReady).toBe(true);
+    const second = rateLimitState({ ...first, retryAtMs: Date.now() + 3_600_000, relativeResetKey: 'usage:3600000:second', retryLabel: '1h' });
+    const patchCount = mocks.updateMessage.mock.calls.length;
+    await emitLimit(second, firstFrame);
+    await emitLimit(second);
+
+    expect(mocks.updateMessage.mock.calls).toHaveLength(patchCount + 1);
+    const patch = mocks.updateMessage.mock.calls.at(-1);
+    expect(patch?.slice(0, 2)).toEqual([APP_CARD_ON, 'om_limit_card']);
+    expect(patch?.[2]).toContain('1h');
+    expect(patch?.[2]).not.toContain('retry_last_task');
   });
 
   it('owner 为空时不 @，直接发正文', async () => {

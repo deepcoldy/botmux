@@ -8,11 +8,12 @@ import {
   persistentSessionName,
   probePersistentBackendTarget,
   probePersistentSession,
+  type PersistentBackendType,
 } from './persistent-backend.js';
 
 export type ExplicitSessionBackingCleanupResult =
   | { ok: true; kind: 'skipped_adopted' | 'no_backing' }
-  | { ok: true; kind: 'destroyed_persistent'; backendType: 'tmux' | 'herdr' | 'zellij' | 'zmx'; name: string }
+  | { ok: true; kind: 'destroyed_persistent'; backendType: PersistentBackendType; name: string }
   | { ok: true; kind: 'cancelled_riff'; taskId: string }
   | {
       ok: false;
@@ -106,9 +107,9 @@ export async function cleanupExplicitSessionBacking(
       (deps.killTarget ?? killPersistentBackendTarget)(target, input.sessionId);
       after = (deps.probeTarget ?? probePersistentBackendTarget)(target);
     } else {
-      // ZMX destruction is identity-verified and refuses a name-only kill. Keep
-      // the established two-argument contract for the other backends.
-      if (input.backendType === 'zmx') kill(input.backendType, name, input.sessionId);
+      // ZMX and hc destruction is identity-verified and refuses a name-only
+      // kill. Keep the established two-argument contract for the other backends.
+      if (input.backendType === 'zmx' || input.backendType === 'hc') kill(input.backendType, name, input.sessionId);
       else kill(input.backendType, name);
       // Backend kill helpers are intentionally idempotent and historically
       // swallow command errors. Offline explicit abandon needs a stronger

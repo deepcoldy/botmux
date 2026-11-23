@@ -18,7 +18,11 @@ import {
 export interface UsageLimitTracker<S extends string = string> {
   currentTurn(): number;
   beginTurn(snapshot: string): number;
-  classify(content: string, status: S): { status: S | 'limited'; usageLimit?: CliUsageLimitState };
+  classify(
+    content: string,
+    status: S,
+    refineDetection?: (state: CliUsageLimitState) => CliUsageLimitState | undefined,
+  ): { status: S | 'limited'; usageLimit?: CliUsageLimitState };
   detectedThisTurn(seq: number): boolean;
   noteStructuredLimit(state: CliUsageLimitState): void;
   /**
@@ -172,6 +176,7 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
     classify(
       content: string,
       status: S,
+      refineDetection?: (state: CliUsageLimitState) => CliUsageLimitState | undefined,
     ): { status: S | 'limited'; usageLimit?: CliUsageLimitState } {
       // Gate the screen-scan verdict on the runtime status: while the CLI is
       // actively working, limit-shaped text on screen is its own output (a
@@ -187,7 +192,8 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
         suppressRateKind: opts.isRateKindSuppressed(),
         ...(outputActive !== undefined ? { outputActive } : {}),
       });
-      if (!detected.limited) {
+      const limit = detected.limited ? (refineDetection ? refineDetection(detected) : detected) : undefined;
+      if (!limit) {
         // Re-emit an authoritative structured limit recorded this turn so a
         // genuinely blocked CLI keeps its card (see activeStructured).
         if (activeStructured?.seq === turnSeq) {
@@ -196,7 +202,7 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
         return { status };
       }
 
-      const key = usageLimitStateKey(detected);
+      const key = usageLimitStateKey(limit);
       // (a) master's rule: a banner already on screen whose reset time has
       //     already passed is definitionally leftover.
       // (b) the new rule: a banner that was ALREADY on screen when this turn
@@ -205,13 +211,13 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       //     text is leftover no matter what its clock says. Without an
       //     answer we never suppress — a genuine re-refusal still reports.
       if (key === staleBannerKey
-        || (turnProducedAnswer && bannerTextIdentity(detected) === preExistingBannerKey)) {
+        || (turnProducedAnswer && bannerTextIdentity(limit) === preExistingBannerKey)) {
         return { status };
       }
 
       staleBannerKey = undefined;
       detectedTurn = turnSeq;
-      return { status: 'limited', usageLimit: detected };
+      return { status: 'limited', usageLimit: limit };
     },
     detectedThisTurn(seq: number): boolean {
       return detectedTurn === seq;

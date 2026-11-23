@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
+import type { IdentityRouteTool } from '../services/trigger-user-auth.js';
 import { getBot, type BotConfig } from '../bot-registry.js';
 import { localeForBot } from '../i18n/index.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
@@ -22,11 +23,12 @@ import { resolveScheduledRunIdentity, type ScheduledRunIdentity } from './schedu
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 import * as scheduler from './scheduler.js';
 import { publishTurnCliIdentity } from './turn-cli-identity.js';
+import { clearRestoredLapses } from './capability-authorization.js';
 import { releaseActiveIdentityTurn } from './active-identity-turns.js';
 import { larkTransportEnabled, type DaemonSession } from './types.js';
 import { findActiveBySessionId, identityStorageModelForDaemonSession } from './worker-pool.js';
 
-export type DetachedIdentityRouteTool = 'lark-cli' | 'bytedcli' | 'codebase';
+export type DetachedIdentityRouteTool = IdentityRouteTool;
 export interface AuthorizedScheduledSessionContext {
   ds?: DaemonSession; session: Session; larkAppId: string; chatId: string; botConfig: BotConfig;
   scheduledTurnId: string; taskId: string; authority: ScheduleAuthorityRecord; runIdentity: ScheduledRunIdentity;
@@ -191,7 +193,7 @@ export async function resolveDetachedScheduledExecutionIdentity(input: {
   const ctx = resolveRegisteredBackgroundContext(input);
   if (!ctx) return null;
   const turnId = `background:${ctx.job.id}`;
-  const referenceTool = input.tool === 'codebase' ? 'bytedcli' : input.tool;
+  const referenceTool = input.tool === 'codebase' || input.tool === 'bitscli' ? 'bytedcli' : input.tool;
   const current = () => recallProvenIdentityContent(input.sessionDataDir, input.sessionId, turnId, input.tool);
   // Legacy Lark UATs are opaque (no exp claim); ask the provider each time.
   if (referenceTool === 'lark-cli' || !current() || cachedIdentityNeedsRefresh(
@@ -203,9 +205,10 @@ export async function resolveDetachedScheduledExecutionIdentity(input: {
         if (!backgroundContextStillValid(input, ctx)) return;
         noteSenderUnionId(ctx.larkAppId, ctx.job.openId, ctx.job.unionId);
         try {
-          await publishTurnCliIdentity({ botConfig: ctx.botConfig, sessionDataDir: input.sessionDataDir,
+          const outcomes = await publishTurnCliIdentity({ botConfig: ctx.botConfig, sessionDataDir: input.sessionDataDir,
             sessionId: input.sessionId, senderOpenId: ctx.job.openId,
             locale: localeForBot(ctx.larkAppId), turnId, storageModel: 'proven' });
+          clearRestoredLapses({ appId: ctx.larkAppId, taskId: ctx.taskId, openId: ctx.job.openId, outcomes });
         } finally {
           // This cache is disposable, never an admitted ordinary message turn.
           releaseActiveIdentityTurn(input.sessionDataDir, input.sessionId, turnId);

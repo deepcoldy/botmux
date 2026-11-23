@@ -30,10 +30,6 @@
   <a href="https://deepcoldy.github.io/botmux/img/video-promo-en.mp4"><img src="docs/assets/botmux-promo-cover-en.gif" width="900" alt="botmux video intro: click to play"></a>
 </p>
 
-<p align="center">
-  <img src="docs/assets/botmux-product-panorama.png" width="1000" alt="botmux product panorama: Lark topics, live cards, web terminal, multi-agent orchestration, and 30+ CLI / agent adapters">
-</p>
-
 ---
 
 A daemon watches Lark messages and spawns an isolated session process for each new session, streaming the AI coding CLI / agent's output back as live Lark cards and offering an interactive web terminal. It **doesn't reimplement agent capabilities** — it bridges the tools you already use directly (**30+ CLI / agent adapters**, see [Supported CLIs & Agents](#supported-clis--agents)).
@@ -46,16 +42,19 @@ A daemon watches Lark messages and spawns an isolated session process for each n
 
 ## 5-Minute Setup
 
-> A single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (manual app creation / credential entry is also supported).
+> A single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (manual credential entry is also supported). For a bot with no Feishu app, use `botmux setup add --local` or Dashboard → Add bot → Local only. The saved `local_*` id is a stable local identity, not a Feishu app id.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 botmux setup                 # one scan to create app → pick CLI → pick working dir (auto-configured)
+botmux setup add --local --name lab --cli codex --default-working-dir ~ --json
+                             # local bot only: no QR, no Feishu App ID or secret
 botmux start                 # start the daemon (botmux autostart enable for auto-start on boot)
 ```
 
 - **Self-contained single-file binary**: Runtime and PTY are embedded — **no Node required on the host to install or run**. Supports Linux / macOS (x64 / arm64, stable Apple Developer ID signature for official macOS builds); on Windows, run inside WSL2.
 - **Seamless upgrade**: Run `botmux upgrade` or re-run the curl command above for safe in-place upgrades.
+- **Version reminders**: The global New version DM reminders switch is off by default. When enabled, it checks hourly and DMs the primary bot owner independently of auto-update. See [version notifications](docs/version-notifications.md).
 - **Source installs**: Dashboard version settings offer normal updates and a confirmed force update that backs up local changes before replacing them. See [source updates and recovery](docs/local-source-update.md).
 - **Full Guide**: Lark international edition, manual permission configuration, and troubleshooting are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
 

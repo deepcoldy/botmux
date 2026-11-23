@@ -91,6 +91,7 @@ export interface PersistedAsk {
    *  the card has NOT been confirmed sent — restore/re-attach must (idempotently,
    *  keyed by requestId) send it so the user always has exactly one live card. */
   cardMessageId?: string;
+  cardDeliveredAt?: number;
   replyCardTarget?: CreateAskInput['replyCardTarget'];
   /** Accumulated per-question selections (checkbox state), so a restart mid-
    *  multi-select keeps the boxes the user already ticked. */

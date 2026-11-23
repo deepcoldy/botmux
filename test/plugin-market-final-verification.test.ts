@@ -11,6 +11,7 @@ import { createHostPluginMarket, createPluginMarket, PluginMarketError } from '.
 import * as registry from '../src/services/plugin-registry-store.js';
 import * as guards from '../src/core/plugins/mutation-guard.js';
 import * as installer from '../src/core/plugins/install.js';
+import * as prerequisites from '../src/core/plugins/prerequisites.js';
 import * as services from '../src/core/plugins/service-manager.js';
 import * as materializer from '../src/core/plugins/materializer.js';
 import * as paths from '../src/core/plugins/paths.js';
@@ -189,6 +190,7 @@ function cliHarness(hooks: {
       if (name.endsWith('/paths.js')) return paths;
       if (name.endsWith('/global-config.js')) return globalConfig;
       if (name.endsWith('/install.js')) return installer;
+      if (name.endsWith('/prerequisites.js')) return prerequisites;
       if (name.endsWith('/init.js')) return { resolveOfficialPluginPackageSpec: (spec: string) => spec };
       if (name === 'node:fs') return { ...fs, renameSync: hooks.rename ?? fs.renameSync };
       throw new Error(`Unexpected import: ${name}`);

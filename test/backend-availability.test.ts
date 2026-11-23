@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ensureBackendAvailable, type BackendAvailabilityDeps } from '../src/services/backend-availability.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { resetHcAvailabilityCache } from '../src/setup/ensure-hc.js';
+import {
+  ensureBackendAvailable,
+  probeHcFunctional,
+  type BackendAvailabilityDeps,
+} from '../src/services/backend-availability.js';
 
 function deps(overrides: Partial<BackendAvailabilityDeps> = {}): BackendAvailabilityDeps {
   return {
@@ -7,6 +14,7 @@ function deps(overrides: Partial<BackendAvailabilityDeps> = {}): BackendAvailabi
     ensureHerdr: vi.fn(async () => ({ installed: true, version: 'herdr 0.7.3', freshInstall: false })),
     probeZellijFunctional: vi.fn(() => ({ ok: true, version: 'zellij 0.44.1' })),
     probeZmxFunctional: vi.fn(() => ({ ok: true, version: 'zmx 0.7.0' })),
+    probeHcFunctional: vi.fn(() => ({ ok: true, version: 'hc 0.1.19' })),
     ...overrides,
   };
 }
@@ -19,6 +27,7 @@ describe('ensureBackendAvailable', () => {
     expect(d.ensureHerdr).not.toHaveBeenCalled();
     expect(d.probeZellijFunctional).not.toHaveBeenCalled();
     expect(d.probeZmxFunctional).not.toHaveBeenCalled();
+    expect(d.probeHcFunctional).not.toHaveBeenCalled();
   });
 
   it('prepares tmux and herdr before a dashboard save is allowed', async () => {
@@ -70,5 +79,42 @@ describe('ensureBackendAvailable', () => {
     });
     expect(d.probeZmxFunctional).toHaveBeenCalledTimes(1);
     expect(d.probeZellijFunctional).not.toHaveBeenCalled();
+  });
+
+  it('probes hc on its own and never installs it', async () => {
+    const d = deps({
+      probeHcFunctional: vi.fn(() => ({ ok: false as const, reason: '没有可用的 herdr-core >= 0.1.19' })),
+    });
+    const result = await ensureBackendAvailable('hc', d);
+    expect(result).toMatchObject({ ok: false, backendType: 'hc', reason: '没有可用的 herdr-core >= 0.1.19' });
+    expect(result.ok === false && result.manualCommand).toContain('BOTMUX_HC_BIN');
+    expect(d.probeHcFunctional).toHaveBeenCalledTimes(1);
+    expect(d.probeZellijFunctional).not.toHaveBeenCalled();
+    expect(d.ensureTmux).not.toHaveBeenCalled();
+    expect(d.ensureHerdr).not.toHaveBeenCalled();
+
+    await expect(ensureBackendAvailable('hc', deps())).resolves.toEqual({ ok: true, backendType: 'hc', version: 'hc 0.1.19' });
+  });
+});
+
+describe('probeHcFunctional', () => {
+  it('refuses a usable binary whose runtime dir is missing, before any hc call', () => {
+    // Unix socket paths are capped at 107 bytes; keep them out of a long TMPDIR.
+    const root = mkdtempSync('/tmp/bmhcv-');
+    try {
+      const bin = join(root, 'herdr-core');
+      writeFileSync(bin, '#!/bin/sh\necho "hc 0.1.19"\n', { mode: 0o755 });
+      resetHcAvailabilityCache();
+      const env = { ...process.env, BOTMUX_HC_BIN: bin, XDG_RUNTIME_DIR: join(root, 'absent') };
+      const result = probeHcFunctional(env);
+      expect(result.ok).toBe(false);
+      expect(!result.ok && result.reason).toContain(join(root, 'absent'));
+
+      resetHcAvailabilityCache();
+      expect(probeHcFunctional({ ...env, XDG_RUNTIME_DIR: root })).toEqual({ ok: true, version: 'hc 0.1.19' });
+    } finally {
+      resetHcAvailabilityCache();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

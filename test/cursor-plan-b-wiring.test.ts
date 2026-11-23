@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { hasStructuredBridgeTurnTerminal } from '../src/services/turn-terminal-capability.js';
 
 // Source-level wiring for plan B (#932) ON TOP of #2009's footer-aware drain
 // and baseline. #2009 already guarantees attach never needs to wait on an
@@ -39,12 +40,11 @@ describe('cursor plan B worker wiring (on #2009)', () => {
     expect(source).toContain('const CURSOR_BUSY_REFRESH_MAX_MS = 120_000;');
   });
 
-  // 源码结构护栏(K3)：兜底链路埋在 worker.ts 闭包无行为入口，钉住源码不变量（理由见 describe 上方总注）。
-  it('codexBridgeFallbackActive suppresses cursor under the scratch COW sandbox for non-adopt spawns', () => {
-    const body = functionSlice('codexBridgeFallbackActive', 'isExistingAppServerSharedBridge');
-    expect(body).toContain("lastInitConfig?.cliId === 'cursor'");
-    expect(body).toContain("lastInitConfig?.adoptMode !== true");
-    expect(body).toContain("lastResolvedSandboxMode === 'scratch'");
+  // scratch 判定已抽成可导出的纯函数，直接验证行为而非读取实现文本。
+  it('structured bridge capability suppresses cursor under the scratch COW sandbox for non-adopt spawns', () => {
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'cursor', scratch: true, adoptMode: false })).toBe(false);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'cursor', scratch: true, adoptMode: true })).toBe(true);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'cursor', scratch: false, adoptMode: false })).toBe(true);
   });
 
   // 源码结构护栏(K3)：兜底链路埋在 worker.ts 闭包无行为入口，钉住源码不变量（理由见 describe 上方总注）。

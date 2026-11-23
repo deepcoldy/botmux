@@ -1,5 +1,6 @@
+import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from '../src/core/cli-execution-mode.js';
 import { matchingScheduleBotGrant } from '../src/core/schedule-bot-grant.js';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
@@ -11,7 +12,21 @@ import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/co
 import { isSilentMessageListenerSession, messageListenerSendBlocked } from '../src/core/message-listener-silence.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-config.js';
-import { TRIGGER_USER_AUTH_TOOLS } from '../src/services/trigger-user-auth.js';
+import { capabilityOn, parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
+import { capabilityOfTool } from '../src/core/identity-policy.js';
+import { validateScheduleChildOneShot } from '../src/core/schedule-child-one-shot.js';
+import { countLiveTalkerTasks, talkerSchedulePolicy, talkerScheduleScopeError } from '../src/core/schedule-talker.js';
+import {
+  assertScheduledAuthorityCurrent,
+  authorizeScheduledTurn,
+  parseScheduledTurnId,
+  readScheduledTaskFromAuthority,
+} from '../src/core/scheduled-turn-provenance.js';
+import * as realScheduler from '../src/core/scheduler.js';
+import { parseSchedule } from '../src/core/scheduler.js';
+import { config } from '../src/config.js';
+import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+import * as scheduleStore from '../src/services/schedule-store.js';
 
 // A real directory: capabilityScheduleWorkingDir realpaths both sides.
 const REPO = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-repo-')));
@@ -38,7 +53,7 @@ const handler = ${handler.getText(source)}`, {
  *  server-side live turn, never a body value. */
 const DIRECT_TURN = { directTurn: {
   turnId: 'om_kickoff', maxTasksPerTurn: SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
-} };
+}, creatingTurn: { sessionId: 'target-session', turnId: 'om_kickoff' } };
 
 function harness(overrides: Record<string, unknown> = {}) {
   const turnId = 'om_kickoff';
@@ -60,7 +75,9 @@ function harness(overrides: Record<string, unknown> = {}) {
       executionPosition: 'topic', larkAppId: 'cli_target' },
     ...overrides,
   };
-  const commitDelegatedTask = vi.fn(() => ({ ok: true, replay: false,
+  // Typed as the real result union so a test can stub a refusal.
+  const commitDelegatedTask = vi.fn((): { ok: boolean; replay?: boolean; task?: any; error?: string } => ({
+    ok: true, replay: false,
     task: { ...body.task, enabled: true, createdAt: '2026-09-28T00:00:00.000Z' } }));
   const scope: any = {
     readJsonBody: async () => body,
@@ -94,12 +111,21 @@ function harness(overrides: Record<string, unknown> = {}) {
     getDashboardAdminOpenIds: () => ['ou_user_target'],
     listChatMemberOpenIds: async () => ['ou_user_target'],
     resolveUnionIdFromOpenId: async () => 'on_user',
+    // Talker policy inputs (core/schedule-talker): off unless a test enables it.
+    talkerSchedulePolicy, talkerScheduleScopeError, countLiveTalkerTasks,
+    evaluateTalk: vi.fn(() => ({ allowed: true, reason: 'p2pOpen' })),
     computeInputHash,
+    validateScheduleChildOneShot,
+    assertScheduledAuthorityCurrent,
+    authorizeScheduledTurn,
+    parseScheduledTurnId,
+    readScheduledTaskFromAuthority,
     SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
-    TRIGGER_USER_AUTH_TOOLS,
-    scheduleAuthorityStore: {},
+    capabilityOn, configuredCliExecutionMode, delegatedCliExecutionAllowed,
+    capabilityOfTool,
+    scheduleAuthorityStore: { getRecord: vi.fn(() => undefined), listRecords: vi.fn((): unknown[] => []) },
     createHash,
-    scheduler: { commitDelegatedTask, addTask: vi.fn((task: unknown) => task) },
+    scheduler: { parseSchedule, commitDelegatedTask, addTask: vi.fn((task: unknown) => task) },
   };
   const run = new Function('scope', `with (scope) { ${code}; return handler; }`)(scope);
   return { ds, body, scope, commitDelegatedTask, run: () => run({}, {}) };
@@ -168,10 +194,10 @@ describe('delegated schedule add route', () => {
     h.scope.getBot = () => ({ config: {} });
     expect(await h.run()).toMatchObject({
       status: 201,
-      value: { task: { ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user' } },
+      value: { task: { owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' } } },
     });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
-      ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
+      owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' },
     }), DIRECT_TURN);
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
   });
@@ -285,6 +311,27 @@ describe('delegated schedule add route', () => {
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['lark-user and meego (bytedcli published for meego only)', ['lark-user', 'meego']],
+    ['bytecloud only', ['bytecloud']],
+  ])('requires target identity isolation for %s', async (_label, capabilities) => {
+    const h = harness();
+    h.scope.getBot = () => ({ config: { triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities }) } });
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_delegation_target_identity_isolation_required' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('accepts a target that runs lark-user and bytecloud as the sender', async () => {
+    const h = harness();
+    h.scope.getBot = () => ({ config: { triggerUserAuth: parseTriggerUserAuthConfig({
+      enabled: true, capabilities: ['lark-user', 'bytecloud'],
+    }) } });
+    expect((await h.run()).status).toBe(201);
+  });
+
   it('returns a clear forbidden response when the turn task limit is exhausted', async () => {
     const h = harness();
     h.commitDelegatedTask.mockReturnValue({ ok: false, error: 'grant_task_limit' });
@@ -326,6 +373,354 @@ describe('delegated schedule add route', () => {
       id: 'a1b2c3d4', larkAppId: 'cli_target',
     }));
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+});
+
+describe('scheduled turn one-shot child creation', () => {
+  const parentTaskId = 'b1c2d3e4';
+  const turnId = `schedule:${parentTaskId}:12345678-1234-1234-1234-123456789abc`;
+  const runAt = new Date(Date.now() + 10 * 60 * 60_000).toISOString();
+
+  function childHarness() {
+    const h = harness();
+    h.ds.managedTurnOrigin.turnId = h.body.originTurnId = turnId;
+    h.ds.activeInteractiveTurn = undefined;
+    h.ds.scheduledTurnCallers = new Map([[turnId, {
+      senderType: 'user', source: 'schedule_creator', requestLarkAppId: 'cli_target',
+      requestUserOpenId: 'ou_user_target', requestUserUnionId: 'on_user', taskId: parentTaskId,
+    }]]);
+    Object.assign(h.body.task, {
+      schedule: runAt,
+      executionPosition: 'topic',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      workingDir: REPO,
+      larkAppId: 'cli_target',
+    });
+    const parent = {
+      kind: 'direct', state: 'active',
+      task: {
+        id: parentTaskId, name: 'parent', schedule: '0 0 * * *',
+        parsed: { kind: 'cron', expr: '0 0 * * *', display: 'daily' },
+        prompt: 'parent', workingDir: REPO, chatId: 'oc_chat', larkAppId: 'cli_target',
+        ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
+        enabled: true, createdAt: '2026-11-01T00:00:00.000Z',
+      },
+      controlOpenId: 'ou_user_target', controlUnionId: 'on_user',
+      runScopes: [], selfManage: false,
+    };
+    h.scope.scheduleAuthorityStore = { getRecord: vi.fn(() => parent) };
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: {
+      childOneShotEnabled: true,
+      childOneShotMaxDelayMinutes: 24 * 60,
+      childOneShotMaxTasksPerTurn: 1,
+    } });
+    h.scope.resolveTargetAppOpenId = vi.fn(async () => ({ status: 'resolved', openId: 'ou_user_target' }));
+    h.scope.getDashboardAdminOpenIds = () => ['ou_user_target'];
+    h.scope.listChatMemberOpenIds = vi.fn(async () => ['ou_user_target']);
+    return { ...h, parent };
+  }
+
+  it('commits one ownerless child with a controller-bound tool identity in the current topic', async () => {
+    const h = childHarness();
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true, replay: false } });
+    expect(h.commitDelegatedTask).toHaveBeenCalledWith(expect.objectContaining({
+      grantId: expect.stringMatching(new RegExp(`^schedule-child:cli_target:${parentTaskId}:`)),
+      sourceMessageId: turnId,
+      sourceSessionId: 'target-session',
+      targetTurnId: turnId,
+      targetGeneration: 7,
+      maxTasksPerTurn: 1,
+      controllerBoundToolIdentity: true,
+      control: {
+        openId: 'ou_user_target', unionId: 'on_user', credentialOpenId: 'ou_user_target',
+        runScopes: [], selfManage: false,
+      },
+      params: expect.objectContaining({
+        larkAppId: 'cli_target', chatId: 'oc_chat', executionPosition: 'topic',
+        rootMessageId: 'om_root', workingDir: REPO,
+      }),
+    }));
+  });
+
+  it('is independent from cross-bot createEnabled but remains default-off', async () => {
+    const enabled = childHarness();
+    expect((await enabled.run()).status).toBe(201);
+    const disabled = childHarness();
+    disabled.scope.readGlobalConfig = () => ({ scheduleDelegation: {} });
+    expect(await disabled.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_disabled' },
+    });
+  });
+
+  it.each([
+    [{ schedule: '0 18 * * *' }, 'schedule_child_one_shot_requires_once'],
+    [{ chatId: 'oc_other' }, 'schedule_child_one_shot_scope_invalid'],
+    [{ rootMessageId: 'om_other' }, 'schedule_child_one_shot_scope_invalid'],
+    [{ workingDir: join(REPO, 'subdir') }, 'schedule_child_one_shot_scope_invalid'],
+    [{ executionPosition: 'top-level' }, 'schedule_child_one_shot_scope_invalid'],
+  ])('rejects child scope expansion %o', async (patch, error) => {
+    const h = childHarness();
+    if ('workingDir' in patch) mkdirSync(patch.workingDir as string, { recursive: true });
+    Object.assign(h.body.task, patch);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error } });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('rejects grandchildren and parents whose controller can no longer act', async () => {
+    const descendant = childHarness();
+    descendant.parent.kind = 'delegated';
+    expect(await descendant.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_descendant_denied' },
+    });
+
+    const revoked = childHarness();
+    revoked.scope.getDashboardAdminOpenIds = () => [];
+    expect(await revoked.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_parent_ineligible' },
+    });
+  });
+
+  it('requires identity isolation before committing the controller-bound child', async () => {
+    const h = childHarness();
+    h.scope.getBot = () => ({ config: {} });
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_identity_isolation_required' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('commits a bounded native child while retaining controller and ownerless limits', async () => {
+    const h = childHarness();
+    h.scope.getBot = () => ({ config: { larkToolBinding: false, triggerUserAuth: { enabled: false, tools: [] } } });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.commitDelegatedTask).toHaveBeenCalledWith(expect.objectContaining({
+      control: expect.objectContaining({ runScopes: [], selfManage: false }),
+    }));
+  });
+
+  it('maps the per-turn authority-store quota to the child-specific refusal', async () => {
+    const h = childHarness();
+    h.commitDelegatedTask.mockReturnValue({ ok: false, error: 'grant_task_limit' });
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_task_limit' },
+    });
+  });
+
+  it('returns the original task on an idempotent retry', async () => {
+    const h = childHarness();
+    h.commitDelegatedTask.mockReturnValue({ ok: true, replay: true,
+      task: { ...h.body.task, id: 'deadbeef', enabled: true, createdAt: new Date().toISOString() } });
+    expect(await h.run()).toMatchObject({
+      status: 200, value: { ok: true, replay: true, task: { id: 'deadbeef' } },
+    });
+  });
+
+  it('rechecks parent authority and policy after asynchronous identity resolution', async () => {
+    const authorityChanged = childHarness();
+    let changed = false;
+    authorityChanged.scope.scheduleAuthorityStore.getRecord = vi.fn(() => changed
+      ? { ...authorityChanged.parent, state: 'paused', task: {
+        ...authorityChanged.parent.task, enabled: false, disabledReason: 'manual',
+      } }
+      : authorityChanged.parent);
+    authorityChanged.scope.resolveTargetAppOpenId = vi.fn(async () => {
+      changed = true;
+      return { status: 'resolved', openId: 'ou_user_target' };
+    });
+    expect(await authorityChanged.run()).toMatchObject({
+      status: 409, value: { error: 'schedule_child_one_shot_authority_changed' },
+    });
+    expect(authorityChanged.commitDelegatedTask).not.toHaveBeenCalled();
+
+    const policyRevoked = childHarness();
+    let enabled = true;
+    policyRevoked.scope.readGlobalConfig = () => ({ scheduleDelegation: {
+      childOneShotEnabled: enabled,
+      childOneShotMaxDelayMinutes: 24 * 60,
+      childOneShotMaxTasksPerTurn: 1,
+    } });
+    policyRevoked.scope.resolveTargetAppOpenId = vi.fn(async () => {
+      enabled = false;
+      return { status: 'resolved', openId: 'ou_user_target' };
+    });
+    expect(await policyRevoked.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_disabled' },
+    });
+    expect(policyRevoked.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('allows a live one-shot parent to create its final bounded child', async () => {
+    const h = childHarness();
+    Object.assign(h.parent, { state: 'completed' });
+    Object.assign(h.parent.task, {
+      schedule: '2026-11-14T00:00:00Z',
+      parsed: { kind: 'once', runAt: '2026-11-14T00:00:00Z', display: 'once' },
+      enabled: false,
+      disabledReason: 'once_completed',
+    });
+    expect((await h.run()).status).toBe(201);
+  });
+
+  it('refuses a completed one-shot parent once its scheduled turn is no longer live', async () => {
+    const h = childHarness();
+    Object.assign(h.parent, { state: 'completed' });
+    Object.assign(h.parent.task, {
+      schedule: '2026-11-14T00:00:00Z',
+      parsed: { kind: 'once', runAt: '2026-11-14T00:00:00Z', display: 'once' },
+      enabled: false,
+      disabledReason: 'once_completed',
+    });
+    // The worker already reported this turn terminal; the managed origin can
+    // still name it until the next turn starts.
+    h.ds.scheduledTurnCallers = undefined;
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_parent_ineligible' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses a parent turn that runs as a claimant instead of the recorded controller', async () => {
+    const h = childHarness();
+    Object.assign(h.parent.task, { runAsClaim: {
+      openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: 'cli_target',
+      claimedAt: '2026-11-13T00:00:00.000Z',
+    } });
+    // Both people may operate the bot here; only the identity mismatch refuses.
+    h.scope.getDashboardAdminOpenIds = () => ['ou_user_target', 'ou_claimant'];
+    h.scope.listChatMemberOpenIds = vi.fn(async () => ['ou_user_target', 'ou_claimant']);
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_parent_ineligible' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the controller union_id no longer resolves to the recorded open_id', async () => {
+    const h = childHarness();
+    h.scope.resolveTargetAppOpenId = vi.fn(async () => ({ status: 'resolved', openId: 'ou_someone_else' }));
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_child_one_shot_parent_ineligible' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed controller-bound tool identity before authority commit', () => {
+    const previousDataDir = config.session.dataDir;
+    const dataDir = join(mkdtempSync(join(tmpdir(), 'botmux-sched-child-binding-')), 'data');
+    config.session.dataDir = dataDir;
+    scheduleStore.setScheduleScope('cli_target');
+    const store = ScheduleAuthorityStore.open(dataDir);
+    try {
+      store.initializeApp('cli_target', []);
+      realScheduler.setScheduleAuthorityStore(store);
+      const base = {
+        params: {
+          id: 'c0000001', name: 'child', schedule: 'every 30m', prompt: 'check',
+          workingDir: REPO, chatId: 'oc_chat', rootMessageId: 'om_root',
+          executionPosition: 'topic' as const, larkAppId: 'cli_target',
+        },
+        grantId: 'schedule-child:cli_target:parent01:schedule:parent01:run-1',
+        requestHash: 'hash-child',
+        control: {
+          openId: 'ou_user_target', unionId: 'on_user', credentialOpenId: 'ou_user_target',
+          runScopes: [] as const, selfManage: false,
+        },
+        sourceMessageId: 'om_source', sourceSessionId: 'source-session',
+        targetTurnId: 'schedule:parent01:12345678-1234-1234-1234-123456789abc',
+        targetGeneration: 1, maxTasksPerTurn: 1, controllerBoundToolIdentity: true,
+      };
+      const invalid = [
+        { controllerBoundToolIdentity: false },
+        { grantId: 'dispatch:delivery-1:cli_target' },
+        { control: { ...base.control, openId: '' } },
+        { control: { ...base.control, credentialOpenId: 'ou_other' } },
+        { control: { ...base.control, runScopes: ['bytedcli'] as const } },
+        { control: { ...base.control, selfManage: true } },
+      ];
+      for (const patch of invalid) {
+        expect(() => realScheduler.commitDelegatedTask({ ...base, ...patch }))
+          .toThrow('delegated_schedule_controller_binding_invalid');
+      }
+    } finally {
+      realScheduler.setScheduleAuthorityStore(null);
+      store.close();
+      config.session.dataDir = previousDataDir;
+      rmSync(join(dataDir, '..'), { recursive: true, force: true });
+    }
+  });
+
+  it('keys the child quota to the exact scheduled turn in the real authority store', async () => {
+    const previousDataDir = config.session.dataDir;
+    const dataDir = join(mkdtempSync(join(tmpdir(), 'botmux-sched-child-')), 'data');
+    config.session.dataDir = dataDir;
+    scheduleStore.setScheduleScope('cli_target');
+    const store = ScheduleAuthorityStore.open(dataDir);
+    try {
+      store.initializeApp('cli_target', []);
+      realScheduler.setScheduleAuthorityStore(store);
+      realScheduler.addTask({
+        id: parentTaskId, name: 'parent', schedule: '0 0 * * *', prompt: 'parent',
+        workingDir: REPO, chatId: 'oc_chat', rootMessageId: 'om_root', executionPosition: 'topic',
+        larkAppId: 'cli_target', owner: { kind: 'human' as const, openId: 'ou_user_target', unionId: 'on_user' },
+      });
+      const h = childHarness();
+      h.scope.scheduleAuthorityStore = store;
+      h.scope.scheduler = { parseSchedule, commitDelegatedTask: realScheduler.commitDelegatedTask };
+      const atTurn = (id: string, live = true) => {
+        h.ds.managedTurnOrigin.turnId = h.body.originTurnId = id;
+        h.ds.scheduledTurnCallers = live
+          ? new Map([[id, { senderType: 'user', source: 'schedule_creator', requestLarkAppId: 'cli_target',
+            requestUserOpenId: 'ou_user_target', requestUserUnionId: 'on_user', taskId: parentTaskId }]])
+          : undefined;
+      };
+      const request = (clientId: string, prompt: string) => Object.assign(h.body.task, { id: clientId, prompt });
+
+      request('a0000001', 'recheck');
+      const first = await h.run();
+      expect(first).toMatchObject({ status: 201, value: { ok: true, replay: false } });
+      const childId = (first.value as { task: { id: string } }).task.id;
+      const childRecord = store.getRecord('cli_target', childId)!;
+      expect(childRecord).toMatchObject({
+        kind: 'delegated', state: 'active', controlOpenId: 'ou_user_target', controlUnionId: 'on_user',
+        runScopes: [], selfManage: false,
+      });
+      expect(childRecord.task).not.toHaveProperty('ownerOpenId');
+      expect(childRecord.task).not.toHaveProperty('ownerUnionId');
+      // A retry carries a fresh client id; the committed request is the same.
+      request('a0000002', 'recheck');
+      expect(await h.run()).toMatchObject({ status: 200, value: { replay: true, task: { id: childId } } });
+      request('a0000003', 'another recheck');
+      expect(await h.run()).toMatchObject({
+        status: 403, value: { error: 'schedule_child_one_shot_task_limit' },
+      });
+      // Deleting the child does not refill this turn's quota.
+      expect(realScheduler.removeTask(childId)).toBe(true);
+      request('a0000004', 'third recheck');
+      expect(await h.run()).toMatchObject({
+        status: 403, value: { error: 'schedule_child_one_shot_task_limit' },
+      });
+
+      // The next fire of the same parent, in the same session, has its own quota.
+      atTurn(`schedule:${parentTaskId}:22345678-1234-1234-1234-123456789abc`);
+      request('a0000005', 'another recheck');
+      const next = await h.run();
+      expect(next).toMatchObject({ status: 201, value: { ok: true, replay: false } });
+      const nextChildId = (next.value as { task: { id: string } }).task.id;
+      expect(nextChildId).not.toBe(childId);
+
+      // The child's controller-bound tool identity still cannot schedule a grandchild.
+      atTurn(`schedule:${nextChildId}:32345678-1234-1234-1234-123456789abc`, false);
+      request('a0000006', 'grandchild');
+      expect(await h.run()).toMatchObject({
+        status: 403, value: { error: 'schedule_child_one_shot_descendant_denied' },
+      });
+    } finally {
+      realScheduler.stopScheduler();
+      realScheduler.setScheduleAuthorityStore(null);
+      store.close();
+      config.session.dataDir = previousDataDir;
+      rmSync(join(dataDir, '..'), { recursive: true, force: true });
+    }
   });
 });
 
@@ -410,7 +805,7 @@ describe('until-done schedule creation', () => {
     h.body.task.notify = ['failing', 'expired'];
     expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
-      untilDone, notify: ['failing', 'expired'], ownerOpenId: 'ou_user_target',
+      untilDone, notify: ['failing', 'expired'], owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' },
     }), DIRECT_TURN);
   });
 
@@ -604,7 +999,7 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
     const h = directHumanHarness();
     h.ds.scope = h.ds.session.scope = scope;
     expect(await h.run()).toMatchObject({ status: 201, value: { task: {
-      ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user', executionPosition: 'new-topic',
+      owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' }, executionPosition: 'new-topic',
     } } });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
@@ -618,7 +1013,7 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
       requestUserUnionId: 'on_active_user',
     } };
     h.ds.session.replyTargets = {};
-    expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerUnionId: 'on_active_user' } } });
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { owner: { unionId: 'on_active_user' } } } });
   });
 
   it('accepts a Remote Runner session tool only inside its frozen chat, root, and working directory', async () => {
@@ -748,7 +1143,7 @@ describe('auto-start-on-join first turn (join_ synthetic id)', () => {
   it('resolves the operator who added the bot as the direct human creator', async () => {
     const h = joinHarness();
     expect(await h.run()).toMatchObject({ status: 201, value: { task: {
-      ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
+      owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' },
     } } });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
@@ -798,6 +1193,7 @@ it('creates after same-turn revoke/republication without reviving the busy hint'
     currentGatewayCallerOpenId: (ds: any, turnId: string) => pickTurnReplyTarget(ds.session, turnId)?.senderOpenId,
     currentTurnProcessIdentities: () => undefined,
     noteTurnDispatchAttempt: vi.fn(), ensureAutomaticTaskContinuationLease: vi.fn(),
+    sessionController: undefined,
   };
   const dispatch = new Function('scope', 'msg', `with (scope) { ${ipcCode} }`);
   dispatch(scope, { type: 'managed_turn_origin_revoked', sessionId: 'target-session',
@@ -809,7 +1205,7 @@ it('creates after same-turn revoke/republication without reviving the busy hint'
   h.body.originCapability = 'd'.repeat(64);
   expect(h.ds.managedTurnOrigin.callerOpenId).toBe('ou_user_target');
   expect(await h.run()).toMatchObject({ status: 201, value: { task: {
-    ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user', executionPosition: 'new-topic',
+    owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' }, executionPosition: 'new-topic',
   } } });
   expect(h.ds.activeInteractiveTurn).toBeUndefined();
   expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
@@ -855,7 +1251,7 @@ describe('host-terminal --run-as identity', () => {
     expect(h.scope.canOperate).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_runner1', 'on_runner');
     const arg = addTaskArg(h);
     expect(arg).toMatchObject({
-      ownerOpenId: 'ou_runner1', ownerUnionId: 'on_runner', creatorLarkAppId: 'cli_target',
+      owner: { kind: 'human', openId: 'ou_runner1', unionId: 'on_runner' }, creatorLarkAppId: 'cli_target',
     });
     expect(arg).not.toHaveProperty('runAs');
   });
@@ -870,7 +1266,7 @@ describe('host-terminal --run-as identity', () => {
       .toHaveBeenCalledWith('cli_target', ['runner@example.com']);
     expect(h.scope.resolveUnionIdFromOpenId).toHaveBeenCalledWith('cli_target', 'ou_from_email');
     expect(addTaskArg(h)).toMatchObject({
-      ownerOpenId: 'ou_from_email', ownerUnionId: 'on_runner', creatorLarkAppId: 'cli_target',
+      owner: { kind: 'human', openId: 'ou_from_email', unionId: 'on_runner' }, creatorLarkAppId: 'cli_target',
     });
   });
 
@@ -910,8 +1306,7 @@ describe('host-terminal --run-as identity', () => {
     const h = hostRunAsHarness({ extraTask: { ownerOpenId: 'ou_evil', ownerUnionId: 'on_evil' } });
     expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
     const arg = addTaskArg(h);
-    expect(arg.ownerOpenId).toBeUndefined();
-    expect(arg.ownerUnionId).toBeUndefined();
+    expect(arg.owner).toEqual({ kind: 'ownerless' });
   });
 
   it('lets a verified --run-as override body-supplied owner fields and creator app', async () => {
@@ -924,7 +1319,225 @@ describe('host-terminal --run-as identity', () => {
     });
     expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
     expect(addTaskArg(h)).toMatchObject({
-      ownerOpenId: 'ou_runner1', ownerUnionId: 'on_runner', creatorLarkAppId: 'cli_target',
+      owner: { kind: 'human', openId: 'ou_runner1', unionId: 'on_runner' }, creatorLarkAppId: 'cli_target',
     });
+  });
+});
+
+/** A direct human who is NOT a bot administrator, on a bot that lets talkers
+ *  create their own tasks (scheduleCreateByTalkers). Same group turn as
+ *  directHumanHarness, shaped to the talker boundary (top level, own chat). */
+function talkerHarness() {
+  const h = directHumanHarness();
+  h.scope.getDashboardAdminOpenIds = () => [];
+  h.scope.getBot = () => ({ config: { scheduleCreateByTalkers: true } });
+  h.body.task.executionPosition = 'top-level';
+  return h;
+}
+
+const TALKER_TURN = { directTurn: { turnId: 'om_kickoff', maxTasksPerTurn: 1, maxLiveTasksPerOwner: 5 },
+  creatingTurn: { sessionId: 'target-session', turnId: 'om_kickoff' } };
+
+const talkerRecord = (controlOpenId: string, state = 'active', shape: { ownerAccess?: string; kind?: string } = { ownerAccess: 'talk' }) =>
+  ({ kind: shape.kind ?? 'direct', state, controlOpenId, task: { ownerAccess: shape.ownerAccess } });
+
+describe('talker schedule creation (scheduleCreateByTalkers)', () => {
+  it('lets a talk-only human create a task owned by themselves, one per turn, marked ownerAccess=talk', async () => {
+    const h = talkerHarness();
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+      owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' },
+      ownerAccess: 'talk', chatId: 'oc_chat', executionPosition: 'top-level', larkAppId: 'cli_target',
+    } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ ownerAccess: 'talk' }), TALKER_TURN);
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    // Talk access is re-evaluated for this exact chat and sender, not assumed from the turn.
+    expect(h.scope.evaluateTalk).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_user_target', undefined, 'on_user', 'group');
+  });
+
+  it('admits a human whose only talk source is platform team membership', async () => {
+    const h = talkerHarness();
+    h.scope.evaluateTalk = vi.fn((_app: string, _chat: string, _open: string, senderUnion: string | undefined, memberUnion: string | undefined) => ({
+      allowed: senderUnion === undefined && memberUnion === 'on_user',
+      reason: memberUnion === 'on_user' ? 'teamMember' : 'none',
+    }));
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerAccess: 'talk' } } });
+  });
+
+  it('keeps an administrator on the ordinary path (no talker marker, default per-turn limit)', async () => {
+    const h = talkerHarness();
+    h.scope.getDashboardAdminOpenIds = () => ['ou_user_target'];
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(
+      expect.not.objectContaining({ ownerAccess: 'talk' }), DIRECT_TURN);
+  });
+
+  it.each([
+    ['switch absent', {}],
+    ['switch explicitly off', { scheduleCreateByTalkers: false }],
+    ['switch as a truthy non-boolean', { scheduleCreateByTalkers: 'yes' }],
+  ])('refuses a non-administrator with the historical code when the %s', async (_label, config) => {
+    const h = talkerHarness();
+    h.scope.getBot = () => ({ config });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_operator_denied' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the talker has no resolvable union_id', async () => {
+    const h = talkerHarness();
+    h.scope.resolveUnionIdFromOpenId = async () => null;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_identity_unresolved' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['new-topic position', { executionPosition: 'new-topic' }],
+    ['another chat', { chatId: 'oc_elsewhere' }],
+    ['multi-chat targets', { chatIds: ['oc_chat', 'oc_other'] }],
+    ['local delivery', { deliver: 'local' }],
+    ['follow-active', { followActive: true }],
+    ['a topic title', { topicTitle: 'mine' }],
+    ['until-done', { untilDone: { deadline: '2099-01-01T00:00:00Z' } }],
+    ['notify', { notify: ['failing'] }],
+  ])('refuses a talker task that widens the scope: %s', async (_label, patch) => {
+    const h = talkerHarness();
+    Object.assign(h.body.task, patch);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_scope_invalid' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('binds a topic task to the current topic only', async () => {
+    const other = talkerHarness();
+    other.body.task.executionPosition = 'topic';
+    other.body.task.rootMessageId = 'om_other_topic';
+    expect(await other.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_root_mismatch' } });
+    expect(other.scope.scheduler.addTask).not.toHaveBeenCalled();
+
+    const current = talkerHarness();
+    current.body.task.executionPosition = 'topic';
+    current.body.task.rootMessageId = 'om_root';
+    expect(await current.run()).toMatchObject({ status: 201, value: { task: {
+      ownerAccess: 'talk', executionPosition: 'topic', rootMessageId: 'om_root',
+    } } });
+  });
+
+  it('refuses a root on a top-level task with 400', async () => {
+    const h = talkerHarness();
+    h.body.task.rootMessageId = 'om_root';
+    expect(await h.run()).toMatchObject({ status: 400, value: { error: 'schedule_talker_root_forbidden' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses a talker who can no longer talk here, even though the turn was admitted', async () => {
+    const h = talkerHarness();
+    h.scope.evaluateTalk = vi.fn(() => ({ allowed: false, reason: 'denied' }));
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_operator_denied' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses a talker who is not a member of the group', async () => {
+    const h = talkerHarness();
+    h.scope.listChatMemberOpenIds = vi.fn(async () => ['ou_someone_else']);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_operator_denied' } });
+    expect(h.scope.listChatMemberOpenIds).toHaveBeenCalledWith('cli_target', 'oc_chat');
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('lets a p2p talker schedule into the private chat without a membership lookup', async () => {
+    const h = talkerHarness();
+    h.ds.chatType = 'p2p';
+    h.scope.listChatMemberOpenIds = vi.fn(async () => []);
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerAccess: 'talk' } } });
+    expect(h.scope.listChatMemberOpenIds).not.toHaveBeenCalled();
+    expect(h.scope.evaluateTalk).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_user_target', undefined, 'on_user', 'p2p');
+  });
+
+  it('counts only this person\'s live talker tasks against the per-person quota (default 5)', async () => {
+    const h = talkerHarness();
+    h.scope.scheduleAuthorityStore.listRecords = vi.fn(() => [
+      talkerRecord('ou_user_target'), talkerRecord('ou_user_target'), talkerRecord('ou_user_target'),
+      talkerRecord('ou_user_target', 'paused'),
+      // None of these count: finished, revoked, someone else's, an administrator's, delegated.
+      talkerRecord('ou_user_target', 'completed'), talkerRecord('ou_user_target', 'revoked'),
+      talkerRecord('ou_other'), talkerRecord('ou_user_target', 'active', {}),
+      talkerRecord('ou_user_target', 'active', { ownerAccess: 'talk', kind: 'delegated' }),
+    ]);
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduleAuthorityStore.listRecords).toHaveBeenCalledWith('cli_target');
+
+    const full = talkerHarness();
+    full.scope.scheduleAuthorityStore.listRecords = () => [
+      talkerRecord('ou_user_target'), talkerRecord('ou_user_target'), talkerRecord('ou_user_target'),
+      talkerRecord('ou_user_target'), talkerRecord('ou_user_target', 'paused'),
+    ];
+    expect(await full.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_task_limit' } });
+    expect(full.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('lets an identical replay reach the store after the first task filled the quota', async () => {
+    const h = talkerHarness();
+    h.scope.getBot = () => ({ config: { scheduleCreateByTalkers: true, scheduleTalkerMaxTasks: 1 } });
+    const existing = talkerRecord('ou_user_target');
+    h.scope.scheduler.addTask = vi.fn((value: unknown) => {
+      h.scope.scheduleAuthorityStore.getRecord = () => existing;
+      h.scope.scheduleAuthorityStore.listRecords = () => [existing];
+      return value;
+    });
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { id: 'a1b2c3d4' } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledTimes(2);
+  });
+
+  it('honours a bot-level quota override', async () => {
+    const h = talkerHarness();
+    h.scope.getBot = () => ({ config: { scheduleCreateByTalkers: true, scheduleTalkerMaxTasks: 1 } });
+    h.scope.scheduleAuthorityStore.listRecords = () => [talkerRecord('ou_user_target')];
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_task_limit' } });
+  });
+
+  it('commits nothing when the switch is turned off during the identity lookups', async () => {
+    const h = talkerHarness();
+    h.scope.listChatMemberOpenIds = async () => {
+      h.scope.getBot = () => ({ config: {} });
+      return ['ou_user_target'];
+    };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_create_disabled' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('commits nothing when talk access is revoked during the membership lookup', async () => {
+    const h = talkerHarness();
+    let allowed = true;
+    h.scope.evaluateTalk = vi.fn(() => ({ allowed, reason: allowed ? 'chatGrant' : 'none' }));
+    h.scope.listChatMemberOpenIds = async () => {
+      allowed = false;
+      return ['ou_user_target'];
+    };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_operator_denied' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('maps the per-turn direct limit to 403 for a talker too', async () => {
+    const h = talkerHarness();
+    h.scope.scheduler.addTask = vi.fn(() => { throw new Error('schedule_direct_task_limit'); });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_direct_task_limit' } });
+  });
+
+  it('maps the transactional per-owner limit to 403 when the fast path was stale', async () => {
+    const h = talkerHarness();
+    h.scope.scheduler.addTask = vi.fn(() => { throw new Error('schedule_talker_task_limit'); });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_task_limit' } });
+  });
+
+  it('does not admit a scheduled-turn or bot caller as a talker', async () => {
+    const h = talkerHarness();
+    h.ds.activeInteractiveTurn = { turnId: 'om_kickoff', caller: {
+      senderType: 'user', source: 'schedule_creator', taskId: 'deadbeef',
+      requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_user_target', requestUserUnionId: 'on_user',
+    } };
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: {} });
+    const result = await h.run();
+    expect(result.status).toBe(403);
+    expect(result.value.error).not.toMatch(/talker/);
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
   });
 });

@@ -23,7 +23,7 @@ export interface SkillDef {
 
 const SCHEDULE_SKILL = `---
 name: botmux-schedule
-description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 botmux schedule 命令，支持增删查改暂停恢复）。触发场景：用户说"每天X点"、"每周X"（任意星期，不限周一）、"每月X号"、"N分钟后/N小时后"、"明天X点"、"提醒我"、"定时任务"、"周期任务"、"recurring"、"reminder"、"crontab" 时；或显式提到 botmux schedule。到点后 daemon 按任务的执行位置续跑；群内默认发到群顶层，要继续当前话题必须显式传 --topic。注意区分：本 skill 是飞书话题内提醒；要在云端跑 remote agent 用 superpowers:schedule；要在当前会话循环跑 prompt 用 loop。
+description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 botmux schedule 命令，支持增删查改暂停恢复）。触发场景：用户说"每天X点"、"每周X"（任意星期，不限周一）、"每月X号"、"N分钟后/N小时后"、"明天X点"、"提醒我"、"定时任务"、"周期任务"、"recurring"、"reminder"、"crontab" 时；或显式提到 botmux schedule。到点后 daemon 按任务的执行位置续跑；常规报告默认群顶层；当前话题创建的 --until-done 跟进默认保留原话题，显式位置优先。其他当前话题提醒请传 --topic。注意区分：本 skill 是飞书话题内提醒；要在云端跑 remote agent 用 superpowers:schedule；要在当前会话循环跑 prompt 用 loop。
 ---
 
 # botmux-schedule — 定时任务
@@ -33,7 +33,7 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ## 核心原则
 
 1. **创建前必须跟用户确认** schedule 和 prompt 的具体内容，避免误加
-2. **继续当前话题必须显式传 --topic** —— 群内省略执行位置会默认发到群顶层；在当前话题运行时可省略 --chat-id / --root-msg-id，由 botmux 推断话题锚点
+2. **跟进沿用原话题** —— 当前群话题创建的 --until-done 默认沿用原话题；常规报告默认群顶层，其他当前话题提醒显式传 --topic。显式位置始终优先；在当前话题可省略 --chat-id / --root-msg-id，由 botmux 推断锚点
 3. 创建后把 task id 和下次执行时间回显给用户
 4. 如果用户是在编程会话里顺手说"以后每天X点都这样做"，先问他：是否希望到点以后自动在当前话题里继续
 
@@ -58,7 +58,7 @@ botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --top
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
 非静默 \`--new-topic\` / \`task\` 的 \`--topic-title\` 支持触发时模板：\`{{date}}\` 是定时任务时区的自然日，\`{{date:-1d}}\` / \`{{date:+2d}}\` 按自然日偏移，\`{{owner}}\` 是任务创建人的真实飞书 mention。模板仅在每次触发时渲染，保存的任务配置保持不变；silent 延迟建根仅支持静态标题，动态模板会在创建或更新时被拒绝。
 可选 \`--silent\`：**静默执行**——到点不发「🕐 定时任务执行中」提示，也不发流卡片；由执行会话的模型自行判断，只有满足 prompt 里描述的报警/通知条件才 \`botmux send\`，否则整轮完全静默（适合"每30分钟检查服务，挂了才报警，没事别打扰我"这类监控任务；prompt 里务必写清报警条件）。斜杠命令里可在 prompt 前加"静默"关键字，如 \`/schedule 每30分钟 静默 检查服务状态，挂了才报警\`。
-执行位置是任务级可选项：**群内默认在群顶层执行，即使从话题内创建也不继承原话题**；要按用户要求在当前话题跟进、轮询或提醒，必须显式传 \`--topic\`（可自动推断当前话题锚点）；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
+执行位置是任务级可选项：**常规报告默认群顶层；同群真实话题创建的 --until-done 默认原话题，跨群不会继承**；显式执行位置优先。其他当前话题跟进、轮询或提醒请传 \`--topic\`（可自动推断当前话题锚点）；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
 可选 \`--model <id>\` / \`--reasoning-effort <low|medium|high|xhigh|max|ultra>\`：**只给这一个任务**换模型/思考强度，不动 Bot 配置（同一个 Bot 下高频哨兵用便宜模型、每日深度任务用最强模型）。仅 Codex / Claude Code / Grok / TraeX 支持。注意模型是 CLI **进程启动参数**：只有新建会话的那次触发能应用，所以 \`--new-topic\` 每次生效，\`--topic\`/\`--top-level\` 只在首次创建会话那次生效、之后复用会话时沿用旧模型。模型不支持所选强度、或 Bot 换了 CLI 时，触发会丢掉该项照常执行并记 warn，不会跳过执行。
 
 ### 查看
@@ -95,6 +95,8 @@ botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触�
 \`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
 
 ### 跟进任务：等某件事发生后再做（--until-done）
+
+创建后核对执行位置、检查频率、通知对象和停止条件。详情卡和 Dashboard 同时显示上次结果、连续失败与到期原因；派发成功不代表业务完成，完成以 done 状态为准。
 
 用户要你「等 X 之后再做 Y」「每天看一下，好了就处理」「某天之后去清理」时，建一个 \`--until-done\` 任务，不要在 prompt 里自己设计循环和停止条件：
 
@@ -242,6 +244,12 @@ description: 需要查看当前飞书会话历史消息时触发。话题/thread
 # 拉取最近 50 条（默认）
 botmux history
 
+# 先读精简索引（不展开卡片/转发，不下载附件）
+botmux history --view index --limit 50
+
+# 在本次读取窗口内按关键词、类型、时间筛选
+botmux history --view index --query "queue" --type text,interactive --since "2026-11-14T00:00:00+08:00"
+
 # 拉取最近 100 条
 botmux history --limit 100
 
@@ -259,6 +267,12 @@ botmux history --with-card-json
 \`\`\`
 
 ## 输出
+
+默认 \`--view full\` 保持完整消息输出。\`--view index\` 返回消息 id、发送人、时间、最多 240 个字符的 \`preview\`、资源数量/类型，卡片和合并转发留到指定消息的详情读取。索引不注册预览中的 LinkRef；需要可打开的完整链接时读取对应消息详情。
+
+筛选只覆盖 \`--limit\` 取得的最近消息窗口，\`--since\` 包含边界、\`--until\` 不包含边界，推荐 ISO 时间带时区。\`retrieval\` 返回列出/筛选/返回的数量、筛选范围、待展开消息和详情失败消息；\`countLimitReached\` 表示已碰到条数上限，不证明已检索全部历史。索引中 \`queryMatch=deferred\` 的卡片/转发仍需核验关键词，不能当作不匹配丢掉。\`--view index\` 与 \`--with-card-json\` 不能同时用。
+
+先从索引选择 id，再运行 \`botmux quoted <id> [<id> ...] --no-download\` 取文本详情；需要附件时去掉 \`--no-download\`。每次命令重新取证，命令内只合并同一消息、同一表示形式的重复请求，并限制读取并发。
 
 JSON 格式，字段：
 
@@ -312,12 +326,20 @@ description: 当 prompt 顶部出现 \`[用户引用了消息 用 botmux quoted 
 
 看到这种提示，先判断引用内容是否对当前任务必要：必要就调用 \`botmux quoted om_xxx\` 拉取，不必要就忽略（不要无脑调用、污染上下文）。
 
+**正文与关联附件**：读取由 botmux 新版本发送的主消息时，输出可包含 \`delivery\` 交付记录，列出文件/视频的显示名、status 与实际 messageId。只对所需 sent 项的 messageId 再运行 \`botmux quoted <附件消息ID>\` 下载。pending 表示中断后结果未确认，failed 表示该项发送失败，不自动重发；记录缺失时不要猜测附件关联。
+
 **不限于引用场景**：\`message_id\` 可以是任意你可见的消息 id——典型用法是从 \`botmux history\` 的输出里拿到某张卡片/图片消息的 \`messageId\`，再用本命令拉全文 + 把附件下载到本地（history 本身不下载附件）。
 
 ## 用法
 
 \`\`\`bash
 botmux quoted <message_id>
+
+# 只读取文本、卡片和资源信息，暂不下载附件
+botmux quoted <message_id> --no-download
+
+# 一次指定最多 20 个消息 id，避免重复启动 CLI
+botmux quoted <id_1> <id_2> --no-download
 
 # 附带原始内容：卡片消息输出 cardJson（结构化卡片 JSON，含精确字段值/按钮链接/图片 key），
 # 其它类型输出 rawContent（原始 body content）。适合告警卡等自动化解析场景。
@@ -327,6 +349,8 @@ botmux quoted <message_id> --raw
 \`message_id\` 从提示行或 \`botmux history\` 输出里复制即可。
 
 ## 输出
+
+单消息保持原有 JSON 形状。多消息返回 \`messages\`、\`errors\`、\`requestedCount\`、\`total\`、\`incomplete\`；重复 id 只读一次，成功消息保留输入顺序。部分失败时成功结果仍返回，退出码为 1，按 \`errors[].messageId\` 定向重试；不要重读已成功消息。\`--no-download\` 保留 \`resources\`，有资源时标 \`attachmentDownloadSkipped=true\`，不产生 \`attachments\` 本地路径。
 
 JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`resources\` / \`attachments\` 列表：
 
@@ -354,20 +378,33 @@ JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`r
 
 export const SEND_SKILL = `---
 name: botmux-send
-description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。修改已有文档后使用 send --diff 输出真实折叠预览。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 原地更新，或用 botmux card stream 做原生打字机流式更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
+description: 向飞书发送消息：@ 别的 bot 协作或把结果交还给派活的 bot、发图片/文件/视频附件或自定义卡片、发到别的群或话题。默认（转写回复）会话里最终答复直接写在回复里，botmux 会自动发回飞书，不要用 botmux send 发进度或把最终答复再发一遍；会话要求你自己发送回复（send 模式）时，用户要看到的内容（结论、方案、最终结果）都通过 botmux send 发送。修改已有文档后使用 send --diff 输出真实折叠预览。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 原地更新，或用 botmux card stream 做原生打字机流式更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
 ---
 
-# botmux-send — 向飞书话题发送消息
+# botmux-send — 向飞书发送消息
 
-**核心规则**：用户在飞书上阅读，看不到你的终端输出。想让用户看到的内容**必须**通过 \`botmux send\` 发送。
+用户在飞书上阅读，看不到你的终端输出。最终答复怎么到飞书，取决于本会话的回复方式——看系统提示（或首轮 \`<botmux_routing>\`）怎么说：
+
+- **转写回复（默认）**：提示说「最终 assistant message 会由 botmux 自动转发」。最终答复直接写在回复里，botmux 会自动发回飞书。\`botmux send\` 只用于最终回复带不了的事：@ 别的 bot 协作或把结果交还给派活给你的 bot（bot 只有被 @ 才收得到）、发附件/图片/视频或自定义卡片、发到别的群或话题、用 \`--attention\` 举手，以及本轮说明明确要求用 \`botmux send\` 的回合（如静默定时任务，那类回合的最终回复不会发到群里）。**不要**用它发进度播报、「收到」「在看」或阶段小结，也不要把最终答复再 send 一遍。最终答复必须走 send 时（附件或卡片本身就是答复，或要 @ 对方才能收到），加 \`--response-kind final\`，botmux 就不会再把最终回复转发一遍。
+- **send 模式**：提示要求「必须用 \`botmux send\` 发送回复」（bot 显式配置了 \`replyDelivery: "send"\`，或所用 CLI 不支持转写回复）。想让用户看到的内容**必须**通过 \`botmux send\` 发送，下面的「发送成功判定」适用。
 
 **话题不可用时遵循机器人配置**：默认保持原有发送和兜底行为。返回 \`TOPIC_SEND_BLOCKED\` 时停止发送，不得改用其他位置绕过；返回 \`TOPIC_SEND_CHECK_FAILED\` 表示查询失败，不代表话题已失效，可以重试原话题查询。
 
-**发送成功判定 & 不要重发**：\`botmux send\` 退出码为 0（返回 \`{"success":true,...}\`）代表本条消息已送达，不要重复发送。**消息送达不等于任务完成**：只发了确认或阶段进度时，progress / auxiliary 的成功回执不能代替最终交付。需要回复的请求，须先用 \`--response-kind final\` 交付完整结果或具体阻碍并核验成功，才可无终端正文地结束；完整答复已经用普通发送发出的，不要再补发 final 或总结，直接让最终回复只输出 \`BOTMUX_NOTHING_TO_SEND\`。不是发给你的消息保持静默。最终答复已送达时，不因“无可见输出”提示重发；发送结果未知先核对，明确未送达才重试。
+**发送成功判定 & 不要重发**：\`botmux send\` 退出码为 0（返回 \`{"success":true,...}\`）代表本条消息已送达，不要重复发送。send 模式下，**消息送达不等于任务完成**：只发了确认或阶段进度时，progress / auxiliary 的成功回执不能代替最终交付。需要回复的请求，须先用 \`--response-kind final\` 交付完整结果或具体阻碍并核验成功，才可无终端正文地结束；完整答复已经用普通发送发出的，不要再补发 final 或总结，直接让最终回复只输出 \`BOTMUX_NOTHING_TO_SEND\`。转写回复会话里刚发出的消息已经是完整答复时，同样让最终回复只输出 \`BOTMUX_NOTHING_TO_SEND\`，避免重复。不是发给你的消息保持静默。最终答复已送达时，不因“无可见输出”提示重发；发送结果未知先核对，明确未送达才重试。
 
 **格式自动处理**：普通回复统一用飞书卡片（schema 2.0）发送；单句纯文本仍保持轻量正文，Markdown 标题和表格转换为独立组件，代码块由富文本组件原生渲染。**该用 md 就用 md**——结构化内容不要手撸成纯文本或 ASCII 表格。
 
 ## 什么时候用
+
+两种回复方式都用：
+
+- @ 别的 bot 协作、派活，或把结果交还给派活给你的 bot
+- 发附件、图片、视频，或自定义卡片
+- 发到别的群或话题
+- 卡在只有人类能解除的阻碍上，用 \`--attention\` 举手
+- 本轮说明明确要求用 \`botmux send\`（如静默定时任务）
+
+send 模式下另外用它发：
 
 - 关键结论、方案（等用户确认再执行）
 - 最终结果
@@ -379,6 +416,7 @@ description: 向飞书话题发送消息。用户在飞书上阅读看不到终�
 - 中间过程的调试输出
 - 给自己看的分析笔记
 - 纯粹的代码操作（编辑/运行命令）
+- 转写回复会话里：进度播报、「收到」「在看」、阶段小结，以及已经写在最终回复里的答复
 
 ## 输出排版：按信息复杂度分流
 
@@ -830,11 +868,16 @@ sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加�
 | \`--urgent[=app\\|sms\\|phone]\` | 加急本轮触发者，必须与 \`--mention-back\` 同用；默认应用内加急 |
 | \`--top-level\` | 发顶层消息（不回复进当前话题）；自动跳过"发送给/cc" footer |
 | \`--chat-id <oc_xxx>\` | 指定目标群（默认当前会话所在群）；常和 \`--top-level\` 一起用做跨群发布 |
+| \`--into <om_xxx>\` | 指定回复进目标群的话题根消息（root_id）；跨群话题回复用 \`--chat-id <oc_xxx> --into <om_xxx>\` |
+| \`--follow-thread-at\` | 跨群发送时追踪该消息话题内的 @本bot 回复回源会话（默认开启） |
+| \`--no-follow-thread\` | 跨群发送时不追踪该消息话题内的回复回源会话 |
 | \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
 
 ## 输出
 
 成功返回 JSON: \`{"success":true,"messageId":"om_xxx","sessionId":"...","quotedMessageId":"om_yyy 或 null","mentioned":[{"open_id":"ou_x","name":"Codex"}]}\`
+正文与文件/视频附件会关联为交付记录，成功输出的 \`replyDeliveryId\` 标识这次附件交付；后续 quoted 主消息可找到各附件的真实 messageId。返回 \`failedAttachments\` / \`failedVideoAttachments\` 时，应向用户说明具体失败项；\`attachmentTrackingErrors\` 表示关联记录未完整保存，已成功发送的正文和附件仍然有效，请勿因此重发。
+
 其中 \`quotedMessageId\` 是实际引用的消息（纯发为 null），\`mentioned\` 是实际 @ 的对象。stderr 另给一行人类可读摘要。
 失败 exit 1；**未做 @ 决策 exit 2**（按提示补 \`--mention\`/\`--mention-back\`/\`--no-mention\`）。
 `;
@@ -918,10 +961,10 @@ botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群�
 botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
 \`\`\`
 
-team scope 输出的 \`agents[]\` 每项：\`appId\`（拉群/补人就用它）、\`name\`、\`specialties\`（专长标签数组，发现依据）、\`mentionable\`、\`online\`、\`owner\`、\`machineId/machineName\`。
+team scope 输出的 \`agents[]\` 每项：\`appId\`（拉群/补人就用它）、\`name\`、\`specialties\`（专长标签数组，发现依据）、\`mentionable\`、\`online\`、\`owner\`、\`machineId/machineName\`；\`external: true\` 是外部机器人（不跑在 botmux 上、由团队成员在平台登记，没有机器，owner 是登记人，照样能拉群/补人）。
 
 **必须知道的语义**：
-- **opt-in 闸**：发现列表**只含已加入团队的 agent**——即它的 owner 在平台「管理机器人」里把它显式加进了团队（\`team.bots\`）。没加进来的 agent 你看不到、也拉不动。查不到某个 agent？多半是对方 owner 还没 opt-in，不是命令坏了。
+- **opt-in 闸**：发现列表**只含已加入团队的 agent**——即它的 owner 在平台「管理机器人」里把它显式加进了团队（\`team.bots\`），或团队成员在平台把它登记成了外部机器人。没加进来的 agent 你看不到、也拉不动。查不到某个 agent？多半是对方 owner 还没 opt-in，不是命令坏了。
 - **specialties / mentionable / online 是 agent 自报**：仅供你挑选参考，**不是可信凭据**，别拿它当权限判断。
 - **CLI 不做任何授权判断**：团队成员校验、opt-in 闸全在平台。你只管发现 + 拉群/补人，平台会拒绝越权的调用。
 - **只认 appId、不需要 @**：正因为别人 bot 进你群前你根本 @不到它，team 拉群/补人全走 appId + machine-auth，天然绕开"看不见就点不着"。结果里 \`invalidBotIds\` / \`invalidOwnerUnionIds\` 是平台过滤掉的（未 opt-in / 拉不动），如实展示即可。
@@ -1440,7 +1483,7 @@ CLI 能力 \`ask_form_v1\` 只表示本地 CLI 理解表单；CLI 和 daemon 都
 
 ## Canonical 用法
 
-如果用户需要看到选择结果或后续结论，必须在 ask 返回后显式调用 \`botmux send\`。\`botmux ask buttons\` 只负责发卡片、阻塞等待、把选择写到当前 shell 的 stdout；它**不会自动把 stdout 发回飞书**。
+如果用户需要看到选择结果或后续结论，ask 返回后必须显式交付：转写回复（默认）会话写进最终回复即可，send 模式调用 \`botmux send\`（下面的示例按 send 模式写）。\`botmux ask buttons\` 只负责发卡片、阻塞等待、把选择写到当前 shell 的 stdout；它**不会自动把 stdout 发回飞书**。
 
 \`\`\`bash
 choice=$(botmux ask buttons --options "deploy=继续发布,rollback=回滚,abort=中止" "线上 latency 涨了 30%，下一步怎么处理？")
@@ -1971,7 +2014,7 @@ EOF
 - 首次创建白板，或首次更新关键状态时，用 \`botmux send\` 发一句短提示：\`已建立/更新 whiteboard:<id>，后续关键状态会维护在那里。\`
 - 小更新不要每次通知。
 - 需要其他 agent 接力时，在飞书 @ 对方并让它读 \`whiteboard:<id>\`；不要复制大段白板内容。
-- 用户可见结论、需要确认的决策、最终结果仍必须 \`botmux send\`。
+- 用户可见结论、需要确认的决策、最终结果仍要交付到飞书：转写回复（默认）会话写进最终回复，send 模式用 \`botmux send\`。
 `;
 
 export const ASK_SKILL_NAME = 'botmux-ask';

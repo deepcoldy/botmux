@@ -86,6 +86,13 @@ export function selectSessionPage<T extends SessionListRow>(
     if (!id) throw new Error('invalid_session_id');
     return { sessions: rows.filter(row => row.sessionId === id) };
   }
+  if (view === 'content') {
+    if (params.has('cursor')) throw new Error('invalid_session_cursor');
+    const query = params.get('q');
+    if (query === null) throw new Error('invalid_session_query');
+    parseQuery(query);
+    return { sessions: [] };
+  }
   if (view !== 'board' && view !== 'closed') throw new Error('invalid_session_view');
   const rawCursor = params.get('cursor');
   if (view === 'board' && rawCursor !== null) throw new Error('invalid_session_cursor');

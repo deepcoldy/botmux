@@ -5,12 +5,13 @@
  * getOwnerOpenId, and it never copies the session owner or creator into the
  * caller or the reply-target sender.
  */
+import { resolveAssistantSpawn } from '../core/assistant-spawn.js';
 import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getBot } from '../bot-registry.js';
 import { config } from '../config.js';
-import { loadOrCreateDashboardSecret } from '../dashboard/auth.js';
+import { cardClickTurnDir, cardClickTurnSecret } from './card-click-turn-secret.js';
 import { localeForBot } from '../i18n/index.js';
 import {
   canOperate,
@@ -25,7 +26,7 @@ import { getIdentity, resolveSender } from '../im/lark/identity-cache.js';
 import { sendMessage } from '../im/lark/client.js';
 import { extractLarkBusinessCode } from '../im/lark/lark-errors.js';
 import { beginReplyTargetTurn } from '../core/reply-target.js';
-import { sessionKey, type DaemonSession } from '../core/types.js';
+import { sessionAnchorId, sessionKey, type DaemonSession } from '../core/types.js';
 import { sessionPromptInjection } from '../core/prompt-injection.js';
 import { markSessionActivity } from '../core/session-activity.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, rememberLastCliInput } from '../core/session-manager.js';
@@ -71,6 +72,7 @@ export interface CardClickTurnBinderDeps {
 function boundFrom(ds: DaemonSession): CardClickBoundSession {
   return {
     sessionId: ds.session.sessionId,
+    anchorId: sessionAnchorId(ds),
     chatId: ds.chatId,
     chatType: ds.chatType,
     workingDir: ds.workingDir ?? ds.session.workingDir,
@@ -86,13 +88,7 @@ function directoryReady(dir: string): boolean {
   try { return existsSync(dir) && statSync(dir).isDirectory(); } catch { return false; }
 }
 
-const APP_ID_RE = /^[A-Za-z0-9_]{4,64}$/;
-
-/** Per-bot directory. The session data dir is shared by every bot daemon in a fleet. */
-export function cardClickTurnDir(dataDir: string, larkAppId: string): string {
-  if (!APP_ID_RE.test(larkAppId)) throw new Error('invalid app id');
-  return join(dataDir, 'card-click-turn', larkAppId);
-}
+export { cardClickTurnDir };
 
 /**
  * Known bot/app evidence for a card clicker. A cache miss is not evidence.
@@ -126,9 +122,7 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     nonceStores.set(larkAppId, store);
     return store;
   };
-  const secret = (larkAppId: string) => loadOrCreateDashboardSecret(
-    join(cardClickTurnDir(deps.dataDir(), larkAppId), 'secret'),
-  );
+  const secret = (larkAppId: string) => cardClickTurnSecret(deps.dataDir(), larkAppId);
 
   function findSession(larkAppId: string, claims: CardClickTurnClaims): CardClickBoundSession | undefined {
     if (claims.sessionId) {
@@ -149,6 +143,9 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     chatType: 'group' | 'p2p',
   ): Promise<{ ok: true; session: CardClickBoundSession } | { ok: false; reason: string }> {
     if (!claims.chatId || !claims.workingDir) return { ok: false, reason: 'working_dir_required' };
+    // 个人助理模式：会话归该 chat 的主人、cwd 在主人 work/（不用卡片里签的目录）；未认领不建。
+    const assistantSpawn = resolveAssistantSpawn(larkAppId, claims.chatId, chatType, senderOpenId);
+    if (assistantSpawn.kind === 'unclaimed') return { ok: false, reason: 'assistant_unclaimed' };
     const key = sessionKey(claims.chatId, larkAppId);
     const registered = await withActiveSessionKeyLock(deps.activeSessions, key, async () => {
       const current = deps.activeSessions.get(key);
@@ -162,7 +159,8 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       session.scope = 'chat';
       session.ownerOpenId = senderOpenId;
       session.creatorOpenId = senderOpenId;
-      session.workingDir = claims.workingDir;
+      session.workingDir = assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : claims.workingDir;
+      if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
       session.lastMessageAt = new Date(now).toISOString();
       sessionStore.updateSession(session);
       ensureQueue(claims.chatId!);
@@ -304,7 +302,10 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
   const runtimeDeps = (larkAppId: string): CardClickTurnRuntimeDeps => ({
     now: () => Date.now(),
     secret: () => secret(larkAppId),
-    nonces: { consume: (nonce, exp, now) => nonceStore(larkAppId).consume(nonce, exp, now) },
+    nonces: {
+      consume: (nonce, exp, now) => nonceStore(larkAppId).consume(nonce, exp, now),
+      release: nonce => nonceStore(larkAppId).release(nonce),
+    },
     isBotOrApp: (appId, openId, unionId) => cardClickOperatorIsBotOrApp(deps.dataDir(), appId, openId, unionId),
     evaluateTalk: (appId, chatId, openId, chatType, unionId) =>
       evaluateTalk(appId, chatId, openId, undefined, unionId, chatType),

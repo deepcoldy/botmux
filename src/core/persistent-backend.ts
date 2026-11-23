@@ -1,6 +1,6 @@
 /**
  * Shared helpers for sessions backed by a persistent multiplexer
- * (tmux / herdr / zellij / zmx). These backends keep the CLI alive across worker
+ * (tmux / herdr / zellij / zmx / hc). These backends keep the CLI alive across worker
  * exits BY DESIGN (idle-suspend, lazy restore), so several daemon paths must
  * resolve / name / probe / kill the backing session WITHOUT a live worker:
  * the restore-time zombie sweep and terminal wake (session-manager.ts), and
@@ -17,31 +17,41 @@ import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
+import {
+  hcTerminalName,
+  killHcTerminal,
+  probeHcTerminal,
+  probeHcTerminals,
+  type HcTarget,
+} from '../adapters/backend/hc/cli-ops.js';
+import { HC_CORE_SESSION, hcCoreAddress, hcCorePaths, type HcCoreAddress } from '../adapters/backend/hc/core.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
 import type { DaemonSession } from './types.js';
 
-export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx'>;
+export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'hc'>;
 
 /**
  * Decide whether a post-kill probe still blocks a cold replacement.
  *
- * ZMX owns sessions by labels + frozen PID, so an inconclusive confirmation
- * must remain fail-closed. The older mux backends only have best-effort
- * process/session probes: after a successful kill, `unknown` is not proof that
- * the target survived (notably zellij reports zero live sessions with exit 1).
+ * ZMX owns sessions by labels + frozen PID and hc by labels, so an
+ * inconclusive confirmation must remain fail-closed. The older mux backends
+ * only have best-effort process/session probes: after a successful kill,
+ * `unknown` is not proof that the target survived (notably zellij reports zero
+ * live sessions with exit 1).
  */
 export function shouldRejectPersistentPostKillProbe(
   backendType: PersistentBackendType,
   probe: SessionProbe,
 ): boolean {
-  return probe === 'exists' || (backendType === 'zmx' && probe === 'unknown');
+  return probe === 'exists' || ((backendType === 'zmx' || backendType === 'hc') && probe === 'unknown');
 }
 
 export function isSuspendableBackendType(
   backendType: BackendType | undefined,
 ): backendType is PersistentBackendType {
-  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij' || backendType === 'zmx';
+  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij' || backendType === 'zmx'
+    || backendType === 'hc';
 }
 
 /**
@@ -196,13 +206,33 @@ export function persistentSessionName(backendType: PersistentBackendType, sessio
   if (backendType === 'tmux') return TmuxBackend.sessionName(sessionId);
   if (backendType === 'zellij') return ZellijBackend.sessionName(sessionId);
   if (backendType === 'zmx') return ZmxBackend.sessionName(sessionId);
+  if (backendType === 'hc') return hcTerminalName(sessionId);
   return HerdrBackend.sessionName(sessionId);
+}
+
+/**
+ * This process's botmux hc core, for a row or name that recorded none. A host
+ * that cannot name one gets an empty socket, which every hc operation answers
+ * as unknown.
+ */
+function defaultHcCore(): HcCoreAddress {
+  try {
+    return hcCoreAddress(hcCorePaths(process.env));
+  } catch {
+    return { hcSession: HC_CORE_SESSION, socket: '' };
+  }
+}
+
+function hasRecordedHcCore(target: HcTarget): boolean {
+  return typeof target.socket === 'string' && target.socket.length > 0
+    && typeof target.hcSession === 'string' && target.hcSession.trim().length > 0;
 }
 
 /**
  * Resolve the exact backing resource for daemon lifecycle work. The persisted
  * worker-selected target wins only when it still matches the frozen backend;
- * legacy rows fall back to the historical deterministic whole-session target.
+ * legacy rows fall back to the historical deterministic whole-session target
+ * (for hc: on this process's botmux core).
  */
 export function resolvePersistentBackendTarget(
   backendType: PersistentBackendType,
@@ -210,7 +240,9 @@ export function resolvePersistentBackendTarget(
   persisted?: PersistentBackendTarget,
 ): PersistentBackendTarget {
   if (persisted?.backendType === backendType && persisted.sessionName.trim()) {
-    if (persisted.backendType !== 'herdr' || persisted.agentName === undefined || persisted.agentName.trim()) {
+    if (persisted.backendType === 'hc') {
+      if (hasRecordedHcCore(persisted)) return persisted;
+    } else if (persisted.backendType !== 'herdr' || persisted.agentName === undefined || persisted.agentName.trim()) {
       // Herdr's old exclusive host carries no agent identity. Keep the complete
       // owner beside the resolved (ephemeral) target so destructive lifecycle
       // work can distinguish `bmx-<sid8>` from shared/custom host sessions.
@@ -221,6 +253,7 @@ export function resolvePersistentBackendTarget(
   }
   const sessionName = persistentSessionName(backendType, sessionId);
   if (backendType === 'herdr') return { backendType, sessionName, sessionId };
+  if (backendType === 'hc') return { backendType, sessionName, ...defaultHcCore() };
   return { backendType, sessionName };
 }
 
@@ -250,12 +283,15 @@ function isExclusiveAgentlessHerdrTarget(
 }
 
 export function probePersistentBackendTarget(target: PersistentBackendTarget): SessionProbe {
-  if (target.backendType === 'tmux' && target.socketName !== undefined) {
-    return TmuxBackend.probeSession(target.sessionName, target.socketName);
+  if (target.backendType === 'tmux' && (target.socketName !== undefined || target.socketRoot !== undefined)) {
+    return target.socketRoot !== undefined
+      ? TmuxBackend.probeSession(target.sessionName, target.socketName, target.socketRoot)
+      : TmuxBackend.probeSession(target.sessionName, target.socketName);
   }
   if (target.backendType === 'zmx' && target.socketDir !== undefined) {
     return ZmxBackend.probeSession(target.sessionName, zmxEnv(process.env, target.socketDir));
   }
+  if (target.backendType === 'hc') return probeHcTerminal(target);
   if (target.backendType === 'herdr') {
     if (target.agentName?.trim()) {
       return HerdrBackend.probeAgent(target.sessionName, target.agentName);
@@ -270,10 +306,24 @@ export function probePersistentBackendTarget(target: PersistentBackendTarget): S
 }
 
 /**
- * `sessionId` is REQUIRED for ZMX: its destruction is identity-verified against
- * the botmux labels stamped on the session, and `killPersistentSession` refuses
- * a name-only ZMX kill rather than risk destroying a same-named user session.
- * Callers that hold the owning session must always pass it through.
+ * hc teardown, fail-closed like ZMX: `bmx-<sid8>` names no owner (every bot
+ * daemon of the uid shares one core), so only the complete session id matching
+ * the terminal's labels allows it, and anything short of a confirmed end or
+ * absence throws.
+ */
+function killHcTarget(target: HcTarget, sessionId: string | undefined): void {
+  const outcome = killHcTerminal(target, sessionId ?? '');
+  if (outcome.result === 'mismatch') {
+    throw new Error(`hc 终端 ${target.sessionName}（${outcome.address}）的所有权标签不匹配，已拒绝删除`);
+  }
+  if (outcome.result === 'unknown') throw new Error(outcome.reason);
+}
+
+/**
+ * `sessionId` is REQUIRED for ZMX and hc: their destruction is identity-verified
+ * against the botmux labels stamped on the session, and `killPersistentSession`
+ * refuses a name-only kill rather than risk destroying a same-named session of
+ * another owner. Callers that hold the owning session must always pass it through.
  */
 export function killPersistentBackendTarget(
   target: PersistentBackendTarget,
@@ -282,6 +332,10 @@ export function killPersistentBackendTarget(
   if (target.backendType === 'zmx' && target.socketDir !== undefined) {
     if (!sessionId) throw new Error('ZMX teardown requires the complete owning session id');
     ZmxBackend.killManagedSession(target.sessionName, sessionId, undefined, zmxEnv(process.env, target.socketDir));
+    return;
+  }
+  if (target.backendType === 'hc') {
+    killHcTarget(target, sessionId);
     return;
   }
   if (target.backendType === 'herdr') {
@@ -296,27 +350,31 @@ export function killPersistentBackendTarget(
     HerdrBackend.killSession(target.sessionName);
     return;
   }
-  if (target.backendType === 'tmux' && target.socketName !== undefined) {
-    TmuxBackend.killSession(target.sessionName, target.socketName);
+  if (target.backendType === 'tmux' && (target.socketName !== undefined || target.socketRoot !== undefined)) {
+    if (target.socketRoot !== undefined) TmuxBackend.killSession(target.sessionName, target.socketName, target.socketRoot);
+    else TmuxBackend.killSession(target.sessionName, target.socketName);
     return;
   }
   killPersistentSession(target.backendType, target.sessionName, sessionId);
 }
 
+/** By name on the backend's default namespace (for hc: this process's botmux core). */
 export function probePersistentSession(backendType: PersistentBackendType, name: string): SessionProbe {
   if (backendType === 'tmux') return TmuxBackend.probeSession(name);
   if (backendType === 'zellij') return ZellijBackend.probeSession(name);
   if (backendType === 'zmx') return ZmxBackend.probeSession(name);
+  if (backendType === 'hc') return probeHcTerminal({ backendType, sessionName: name, ...defaultHcCore() });
   return HerdrBackend.probeSession(name);
 }
 
 /**
  * Take one liveness snapshot for a set of backing-session names.
  *
- * ZMX and Zellij expose all session states in one command, so probing each row
- * separately would repeatedly scan the same control plane (and makes `botmux
- * list` quadratic for ZMX). tmux and Herdr keep their established per-session
- * probes, but duplicate names are still coalesced here.
+ * ZMX, Zellij and hc expose all session states in one command, so probing each
+ * row separately would repeatedly scan the same control plane (and makes
+ * `botmux list` quadratic for ZMX). tmux and Herdr keep their established
+ * per-session probes, but duplicate names are still coalesced here. `socketDir`
+ * is ZMX's; hc names are looked up on this process's botmux core.
  */
 export function probePersistentSessions(
   backendType: PersistentBackendType,
@@ -325,6 +383,8 @@ export function probePersistentSessions(
 ): ReadonlyMap<string, SessionProbe> {
   const uniqueNames = [...new Set(names)];
   const result = new Map<string, SessionProbe>();
+
+  if (backendType === 'hc') return probeHcTerminals(defaultHcCore(), uniqueNames);
 
   if (backendType === 'zmx') {
     const snapshot = socketDir === undefined
@@ -367,9 +427,11 @@ export function persistentBackendTargetKey(target: PersistentBackendTarget): str
     target.backendType === 'herdr' ? target.agentName ?? '' : '',
     target.backendType === 'herdr' && target.agentName === undefined ? target.sessionId ?? '' : '',
     target.backendType === 'zmx' ? target.socketDir ?? '' : '',
-    // Appended only when set so default-server keys stay byte-identical to the
-    // keys older code computed (caches/batches compare them across call sites).
     ...(target.backendType === 'tmux' && target.socketName !== undefined ? [target.socketName] : []),
+    // socketRoot is optional and appended only when present, preserving every
+    // key produced for legacy targets and for targets with only socketName.
+    ...(target.backendType === 'tmux' && target.socketRoot !== undefined ? [target.socketRoot] : []),
+    ...(target.backendType === 'hc' ? [target.hcSession, target.socket] : []),
   ]);
 }
 
@@ -379,6 +441,7 @@ export function probePersistentBackendTargets(
 ): ReadonlyMap<string, SessionProbe> {
   const result = new Map<string, SessionProbe>();
   const groups = new Map<string, Map<string, PersistentBackendTarget>>();
+  const hcCores = new Map<string, Map<string, HcTarget>>();
   for (const target of targets) {
     const key = persistentBackendTargetKey(target);
     // Both agent-scoped and legacy exclusive Herdr targets require the same
@@ -390,6 +453,13 @@ export function probePersistentBackendTargets(
     }
     if (target.backendType === 'tmux' && target.socketName !== undefined) {
       if (!result.has(key)) result.set(key, probePersistentBackendTarget(target));
+      continue;
+    }
+    if (target.backendType === 'hc') {
+      const coreKey = JSON.stringify([target.hcSession, target.socket]);
+      const core = hcCores.get(coreKey) ?? new Map<string, HcTarget>();
+      core.set(target.sessionName, target);
+      hcCores.set(coreKey, core);
       continue;
     }
     const socketDir = target.backendType === 'zmx' ? target.socketDir : undefined;
@@ -409,13 +479,19 @@ export function probePersistentBackendTargets(
       result.set(persistentBackendTargetKey(item), probes.get(name) ?? 'unknown');
     }
   }
+  for (const core of hcCores.values()) {
+    const probes = probeHcTerminals(core.values().next().value!, core.keys());
+    for (const [name, item] of core) {
+      result.set(persistentBackendTargetKey(item), probes.get(name) ?? 'unknown');
+    }
+  }
   return result;
 }
 
 /**
- * Kill a backing session. ZMX additionally requires the complete botmux UUID:
- * its public name contains only eight UUID characters, so name-only deletion
- * could destroy a different session after a prefix collision.
+ * Kill a backing session. ZMX and hc additionally require the complete botmux
+ * UUID: their public name contains only eight UUID characters, so name-only
+ * deletion could destroy a different session after a prefix collision.
  */
 export function killPersistentSession(
   backendType: PersistentBackendType,
@@ -428,6 +504,7 @@ export function killPersistentSession(
     if (!sessionId) throw new Error(`refusing name-only ZMX kill for ${name}`);
     ZmxBackend.killManagedSession(name, sessionId);
   }
+  else if (backendType === 'hc') killHcTarget({ backendType, sessionName: name, ...defaultHcCore() }, sessionId);
   else HerdrBackend.killSession(name);
 }
 

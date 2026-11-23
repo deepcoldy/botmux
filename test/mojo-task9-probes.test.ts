@@ -35,7 +35,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
 import {
@@ -274,7 +274,8 @@ exit 0`);
         const dataDir = mkdtempSync(join(binDir, 'p2c-store-'));
         const procRoot = mkdtempSync(join(binDir, 'p2c-proc-'));
         const nonce = `botmux-mojo-p2c-${process.pid}`;
-        const immortal = 4242;
+        // Synthetic members must differ from the runner identities excluded by scans.
+        const immortal = Math.max(process.pid, process.ppid) + 1;
         mkdirSync(join(procRoot, 'sys/kernel/random'), { recursive: true });
         const bootId = '99999999-8888-7777-6666-555555555555';
         writeFileSync(join(procRoot, 'sys/kernel/random/boot_id'), `${bootId}\n`);
@@ -289,6 +290,9 @@ exit 0`);
 
         const { config } = await import('../src/config.js');
         const prevDataDir = config.session.dataDir;
+        // A fake /proc does not isolate process.kill: its PIDs still address the
+        // host. Intercept this synthetic case only; the other probes use real children.
+        const killSpy = vi.spyOn(process, 'kill').mockReturnValue(true);
         config.session.dataDir = dataDir;
         try {
             recordContainmentHandle({
@@ -309,6 +313,7 @@ exit 0`);
             const result = await gen2.destroySession();
             note(`P2c: unkillable inherited member -> ${JSON.stringify(result)}`);
             note(`P2c: quiescence -> ${JSON.stringify(gen2.lastTurnQuiescence)}`);
+            expect(killSpy).toHaveBeenCalledWith(immortal, 'SIGKILL');
 
             // THE ASSERTION: an undischargeable handle must refuse the close.
             expect(result.ok).toBe(false);
@@ -317,6 +322,7 @@ exit 0`);
             expect(hasUnprovenContainment('probe2c-session', dataDir)).toBe(true);
             note(`P2c: blocker_retained=${hasUnprovenContainment('probe2c-session', dataDir)}`);
         } finally {
+            killSpy.mockRestore();
             config.session.dataDir = prevDataDir;
         }
     }, 40_000);

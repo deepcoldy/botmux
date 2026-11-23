@@ -2346,7 +2346,7 @@ export function takeCodexAppControlLocatorEndpoint(input: {
   return endpoint ? { endpoint, epoch: locator.epoch } : undefined;
 }
 
-const PERSISTENT_BACKEND_TYPES: ReadonlySet<BackendType> = new Set(['tmux', 'herdr', 'zellij']);
+const PERSISTENT_BACKEND_TYPES: ReadonlySet<BackendType> = new Set(['tmux', 'herdr', 'zellij', 'hc']);
 
 /** Missing/corrupt/legacy generations cannot prove a warm reattach. */
 export function shouldColdStartCodexAppReattach(input: {
@@ -2623,6 +2623,7 @@ export interface CodexAppControlAccepted {
   generation: string;
   challenge: string;
   endpointEpoch?: string;
+  turnInterrupt?: true;
 }
 
 export interface CodexAppControlAck {
@@ -2632,6 +2633,16 @@ export interface CodexAppControlAck {
   generation: string;
   challenge: string;
   seq: number;
+}
+
+export interface CodexAppControlInterrupt {
+  version: typeof CONTROL_WIRE_VERSION;
+  type: 'interrupt';
+  sessionId: string;
+  generation: string;
+  challenge: string;
+  requestId: string;
+  turnEpoch: number;
 }
 
 export interface CodexAppSignedControlMarker {
@@ -2651,7 +2662,12 @@ export type CodexAppControlWireRecord =
   | CodexAppControlAuth
   | CodexAppControlAccepted
   | CodexAppControlAck
+  | CodexAppControlInterrupt
   | CodexAppSignedControlMarker;
+
+export function encodeCodexAppControlInterrupt(input: Omit<CodexAppControlInterrupt, 'version' | 'type'>): string {
+  return JSON.stringify({ version: CONTROL_WIRE_VERSION, type: 'interrupt', ...input });
+}
 
 export function encodeCodexAppControlChallenge(sessionId: string, challenge: string): string {
   if (!sessionId || !isValidChallenge(challenge)) throw new Error('Codex App control challenge is invalid');
@@ -2663,6 +2679,7 @@ export function encodeCodexAppControlAccepted(
   generation: string,
   challenge: string,
   endpointEpoch?: string,
+  turnInterrupt?: true,
 ): string {
   if (!sessionId || !isValidGeneration(generation) || !isValidChallenge(challenge)) {
     throw new Error('Codex App control acceptance metadata is invalid');
@@ -2677,6 +2694,7 @@ export function encodeCodexAppControlAccepted(
     generation,
     challenge,
     ...(endpointEpoch ? { endpointEpoch } : {}),
+    ...(turnInterrupt ? { turnInterrupt } : {}),
   });
 }
 
@@ -2777,6 +2795,12 @@ export function parseCodexAppControlWireRecord(line: string): CodexAppControlWir
         && Number.isSafeInteger(value.seq) && Number(value.seq) > 0) {
       return value as unknown as CodexAppControlAck;
     }
+    if (value.type === 'interrupt' && isValidGeneration(value.generation)
+        && isValidChallenge(value.challenge)
+        && typeof value.requestId === 'string' && value.requestId.length > 0 && value.requestId.length <= 128
+        && Number.isSafeInteger(value.turnEpoch) && Number(value.turnEpoch) > 0) {
+      return value as unknown as CodexAppControlInterrupt;
+    }
     if (value.type === 'marker' && isValidGeneration(value.generation)
         && isValidChallenge(value.challenge)
         && Number.isSafeInteger(value.seq) && Number(value.seq) > 0
@@ -2793,8 +2817,9 @@ export function parseCodexAppControlWireRecord(line: string): CodexAppControlWir
 
 export type CodexAppControlRunnerHandshakeAction =
   | { type: 'authenticate'; challenge: string }
-  | { type: 'accepted'; challenge: string }
+  | { type: 'accepted'; challenge: string; turnInterrupt?: true }
   | { type: 'ack'; seq: number }
+  | { type: 'interrupt'; requestId: string; turnEpoch: number }
   | { type: 'reject' };
 
 /**
@@ -2829,7 +2854,7 @@ export class CodexAppControlRunnerHandshake {
         && (this.expectedEndpointEpoch === undefined
           || record.endpointEpoch === this.expectedEndpointEpoch)) {
       this.phase = 'active';
-      return { type: 'accepted', challenge: record.challenge };
+      return { type: 'accepted', challenge: record.challenge, ...(record.turnInterrupt === true ? { turnInterrupt: true } : {}) };
     }
     if (this.phase === 'active'
         && record.type === 'ack'
@@ -2838,6 +2863,10 @@ export class CodexAppControlRunnerHandshake {
         && record.seq > 0
         && record.seq <= sentThrough) {
       return { type: 'ack', seq: record.seq };
+    }
+    if (this.phase === 'active' && record.type === 'interrupt'
+        && record.generation === this.expectedGeneration && record.challenge === this.challengeValue) {
+      return { type: 'interrupt', requestId: record.requestId, turnEpoch: record.turnEpoch };
     }
     return { type: 'reject' };
   }
@@ -2935,6 +2964,9 @@ const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9
 export class CodexAppControlFinalAssembler {
   private active: CodexAppFinalAssemblyState | undefined;
 
+  constructor(private readonly maxBytes = CODEX_APP_CONTROL_FINAL_MAX_BYTES,
+    private readonly chunkBytes = CODEX_APP_CONTROL_FINAL_CHUNK_BYTES) {}
+
   accept(kind: string, payload: Record<string, unknown>): CodexAppFinalAssemblyResult {
     const isTransactionKind = kind === 'final-start' || kind === 'final-chunk' || kind === 'final-end';
     if (!isTransactionKind) {
@@ -2973,15 +3005,16 @@ export class CodexAppControlFinalAssembler {
         ? payload.index
         : -1;
       if (index !== assembly.chunks.length || index >= assembly.total
-          || typeof payload.data !== 'string' || !STRICT_BASE64_RE.test(payload.data)) {
+          || typeof payload.data !== 'string' || payload.data.length > 4 * Math.ceil(this.chunkBytes / 3)
+          || !STRICT_BASE64_RE.test(payload.data)) {
         return this.reject('invalid, duplicate, or out-of-order final chunk');
       }
       const chunk = Buffer.from(payload.data, 'base64');
-      if (chunk.length === 0 || chunk.length > CODEX_APP_CONTROL_FINAL_CHUNK_BYTES) {
+      if (chunk.length === 0 || chunk.length > this.chunkBytes) {
         return this.reject('final chunk size is invalid');
       }
       assembly.bytes += chunk.length;
-      if (assembly.bytes > CODEX_APP_CONTROL_FINAL_MAX_BYTES) {
+      if (assembly.bytes > this.maxBytes) {
         return this.reject('final transaction exceeds the byte limit');
       }
       assembly.chunks.push(chunk);

@@ -3,12 +3,12 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { detectModelsViaExec, parseDebugModelsJson, detectModelCapabilitiesViaExec } from './model-catalog-json.js';
-import type { CliAdapter, CliLaunchNotice, PtyHandle, StructuredBridgeSpec } from './types.js';
+import type { CliAdapter, CliLaunchNotice, PtyHandle, StructuredBridgeSpec, WriteInputContext } from './types.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { traeCliStatePath, traeConfigPath, traeHomeFor, traeInstallationIdPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
-  findTraexSessionIdByBotmuxSessionId,
+  resolveTraexResumeSessionId,
   traexHistoryMatchDelta,
   traexHistorySize,
   findTraexRolloutSetByPid,
@@ -373,8 +373,22 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   const resolvedBin = (): string => (cachedBin ??= resolveCommand(rawBin));
   let launchNotice: CliLaunchNotice | undefined;
+  const pressSubmit = (pty: PtyHandle): boolean => {
+    try {
+      if (pty.sendSpecialKeys) return pty.sendSpecialKeys('Enter') !== false;
+      return pty.write('\r') !== false;
+    } catch {
+      return false;
+    }
+  };
   return {
     id: 'traex',
+    pressComposerSubmit: pressSubmit,
+    // buildArgs has no --continue fallback. The worker resolves the same
+    // exact native mapping first and reports/fences a missing-ID fresh launch.
+    resumeRequiresCliSessionId: true,
+    // Native /goal starts work and can cold-start an empty topic.
+    defaultPassthroughCommands: ['/goal'],
     // codex_core-based TUI: hook-review flow + legacy-data migration picker.
     stuckPageFamily: 'codex-family',
     mcpGateway: {
@@ -413,19 +427,6 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const modelNudgeArgs = hideRateLimitModelNudge
         ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
         : [];
-      // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
-      // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
-      // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
-      // shape, so this is identical to the codex adapter's branch.
-      if (remoteWsUrl && remoteThreadId) {
-        // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
-        // so an interactive update dialog would freeze the resume. TraeX shares
-        // codex's config schema; disable at the process level, never user-global.
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', ...modelNudgeArgs, remoteThreadId];
-      }
-      // Releases before the baseline reject the hook-trust flag at argv parsing
-      // and exit; leave it out for them (they have no hook-trust gate to pass
-      // either) and tell the user to upgrade. Unknown version → pass it as before.
       let hookTrustFlag = !disableCliBypass && !!bypassHookTrust;
       if (hookTrustFlag) {
         const support = probeTraexHookTrustSupport(resolvedBin());
@@ -439,6 +440,23 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           };
         }
       }
+      // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
+      // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
+      // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
+      // shape, so this is identical to the codex adapter's branch.
+      if (remoteWsUrl && remoteThreadId) {
+        // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
+        // so an interactive update dialog would freeze the resume. TraeX shares
+        // codex's config schema; disable at the process level, never user-global.
+        return [
+          ...(hookTrustFlag ? [TRAEX_HOOK_TRUST_FLAG] : []),
+          '--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false',
+          ...modelNudgeArgs, remoteThreadId,
+        ];
+      }
+      // Releases before the baseline reject the hook-trust flag at argv parsing
+      // and exit; leave it out for them (they have no hook-trust gate to pass
+      // either) and tell the user to upgrade. Unknown version → pass it as before.
       const baseArgs = [
         ...(!disableCliBypass ? [
           '--dangerously-bypass-approvals-and-sandbox',
@@ -471,7 +489,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       if (workingDir) baseArgs.push('-C', workingDir);
       if (!resume) return baseArgs;
 
-      const traeSessionId = resumeSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
+      const traeSessionId = resolveTraexResumeSessionId(sessionId, resumeSessionId);
       if (!traeSessionId) return baseArgs;
       // Session fork: TraeX exposes the same native subcommand shape as Codex
       // (`traecli fork <id>`). It mints a new thread while leaving the source
@@ -481,7 +499,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
-      const sid = cliSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
+      const sid = resolveTraexResumeSessionId(sessionId, cliSessionId);
       if (!sid) return null;
       return `traex resume ${sid}`;
     },
@@ -505,7 +523,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       });
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
+    async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
       // /model is a native menu, not a model turn. Pasting a question into it
       // loses the paste and its Enter only dismisses the picker; history never
       // receives the question and the worker quarantines all later input.
@@ -513,9 +531,17 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // before writing any user text. Never select a model with submit retries.
       const pickerFailure = await dismissTraexModelPicker(pty);
       if (pickerFailure) return { submitted: false, failureReason: pickerFailure };
+      context?.submitGuard?.beforeWrite?.();
       // Same bracketed-paste strategy as the Codex adapter: multi-line user
       // messages must not be split into separate turns by embedded \n.
+      // A boolean false from sendSpecialKeys (e.g. tmux send-keys timing out
+      // under load) is not proof the Enter was lost: the key may still have
+      // reached the pane, and writeInput's history polling plus its recheck
+      // closure own that uncertainty. Only a thrown transport error fails the
+      // write here; the strict boolean contract stays on pressComposerSubmit,
+      // whose one-shot rescue must not guess.
       const trySendEnter = (): boolean => {
+        if (context?.submitGuard && !context.submitGuard.current()) return false;
         try {
           if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
           else pty.write('\r');
@@ -540,10 +566,6 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const historyPath = traeHistoryPath();
       const baseByte = traexHistorySize(historyPath);
 
-      const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
-        ? pty.cliPid
-        : undefined;
-
       // Two separable facts, matched with two different scans:
       //  - SUBMIT confirmation: any full-content match in the global submit log,
       //    ownership-INDEPENDENT (a foreign-first line or unknown pid must never
@@ -567,6 +589,15 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         traexHistoryMatchDelta(historyPath, baseByte, content, (sid) => traexHistorySidIsOwned(sid ?? '', owned));
       const anyMatch = () => traexHistoryMatchDelta(historyPath, baseByte, content);
 
+      // Every Enter first asks whether the input surface is still the
+      // composer: TRAE's question page can pop up in between (an agent asking
+      // mid-turn while this message is typed ahead), and an Enter there
+      // submits its highlighted option instead of this message.
+      const guard = context?.submitGuard;
+      const submitBlocked = async (phase: 'draft' | 'retry'): Promise<string | undefined> => {
+        try { return (await guard?.blocked(phase)) || undefined; } catch { return undefined; }
+      };
+
       try {
         if (pty.pasteText) pty.pasteText(content);
         else pty.write(wrapBracketedPaste(content));
@@ -574,6 +605,20 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         return { submitted: false };
       }
       await delay(200);
+      let blocked = await submitBlocked('draft');
+      if (blocked && guard) {
+        // The paste sits in the composer as a draft under the page. Wait for
+        // the page to go (answered on its card or in the terminal), then
+        // submit that same draft: pasting again would double it, and leaving
+        // it would prefix the next message.
+        const polls = Math.ceil(guard.maxWaitMs / guard.pollMs);
+        for (let poll = 0; blocked && poll < polls && guard.current(); poll++) {
+          await delay(guard.pollMs);
+          blocked = await submitBlocked('draft');
+        }
+        if (!guard.current()) return { submitted: false };
+        if (blocked) return { submitted: false, failureReason: blocked };
+      }
       if (!trySendEnter()) return { submitted: false };
 
       // `sawAnyText` remembers that the submit is proven (an any-text line
@@ -585,10 +630,19 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // result to return now, or null to keep waiting. `final` relaxes the
       // owned-wait: at budget end / on the worker recheck, confirm on any-text.
       const resolve = (final: boolean) => {
+        // The worker can rewire this same handle from a launcher/missing PID to
+        // the real TraeX leaf after writeInput returns its deferred recheck.
+        // Resolve ownership from the CURRENT pid on every poll, not a stale
+        // write-time snapshot that can never see the leaf's rollout fds.
+        const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
+          ? pty.cliPid
+          : undefined;
         const owned = cliPid ? findTraexRolloutSetByPid(cliPid) : undefined;
         if (owned !== undefined) {
           const m = ownedMatch(owned);
-          if (m.found && m.cliSessionId) return { submitted: true as const, cliSessionId: m.cliSessionId };
+          if (m.found && m.cliSessionId) return {
+            submitted: true as const, cliSessionId: m.cliSessionId, ownershipProven: true as const,
+          };
           // Enumeration works but no owned line yet. Note submit evidence but
           // keep waiting for the owned id — unless the budget is spent.
           if (anyMatch().found) sawAnyText = true;
@@ -606,8 +660,19 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         await delay(800);
         // Only re-Enter while the submit is still unproven; once any-text is
         // seen the message is committed and we're merely waiting for the owned
-        // rollout fd, so another Enter would risk a duplicate submit.
-        if (!sawAnyText && !trySendEnter()) return { submitted: false };
+        // rollout fd, so another Enter would risk a duplicate submit. The
+        // receipt usually lands during the wait (TRAE writes it at submit
+        // time, just after the first look): look again before pressing — a
+        // blind second Enter lands on whatever the turn has drawn by now.
+        if (sawAnyText) continue;
+        const late = resolve(false);
+        if (late) return late;
+        if (sawAnyText) continue;
+        // The first Enter may still be on its way into the transcript: a page
+        // up now only means no further Enter, not a failed submit — the
+        // receipt (or the worker's later recheck) decides.
+        if (await submitBlocked('retry')) continue;
+        if (!trySendEnter()) return { submitted: false };
       }
       const finalConfirmed = resolve(true);
       if (finalConfirmed) return finalConfirmed;
@@ -745,9 +810,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     },
     // RPC mode bridges native AskUserQuestion directly. Keep the normal
     // botmux-ask skill available too: TraeX sessions can fail closed to a
-    // standard PTY when RPC is unavailable, where native questions cannot
-    // reach the card bridge.
+    // standard PTY when RPC is unavailable.
     asksViaHook: false,
+    // On that terminal path the native AskUserQuestion page itself is turned
+    // into the same Lark question card (worker + core/traex-question-bridge.ts).
+    nativeQuestionPage: 'traex',
   };
 }
 

@@ -14,7 +14,9 @@
  * relay needs bun to run from source, the session scope needs a user systemd).
  */
 import { randomUUID } from 'node:crypto';
-import { execFileSync, spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { killPrivateTmuxServer } from '../../scripts/test-process-reaper.mjs';
+import { EventEmitter } from 'node:events';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -88,19 +90,37 @@ const record = o => {
     uuid: randomUUID(), timestamp: new Date().toISOString(), sessionId: sid, cwd: cfg.workingDir, ...o,
   }) + '\\n');
 };
-// Claude's own pid-state record, rewritten in place the way Claude does (never
-// through a rename): the worker has to read through a torn record. Withheld
-// until the gate file exists when the scenario wants a transcript nobody can
-// locate.
+// Default: rewrite in place the way Claude does, so the worker has to read
+// through a torn record. Runtime-handoff tests opt into atomic publication:
+// they control whether identity exists, rather than racing the 200ms writer.
+// Withheld until the gate file exists when the scenario wants a transcript
+// nobody can locate.
+const pidStateFile = path.join(cfg.claudeDir, 'sessions', process.pid + '.json');
+// While the stall file exists, a turn's end leaves the record the way Claude's
+// own rewrite on that busy→idle edge reads while the writer waits between its
+// truncate and its write: empty, until the test removes the file.
+let rewriteStalled = false;
+const stallPidStateRewrite = () => {
+  if (!fs.existsSync(cfg.rewriteStallFile) || !fs.existsSync(pidStateFile)) return;
+  fs.writeFileSync(pidStateFile, '');
+  rewriteStalled = true;
+};
 const pidState = () => {
   if (cfg.pidStateGate && !fs.existsSync(cfg.pidStateGate)) return;
+  if (rewriteStalled && fs.existsSync(cfg.rewriteStallFile)) return;
+  rewriteStalled = false;
   fs.mkdirSync(path.join(cfg.claudeDir, 'sessions'), { recursive: true });
-  fs.writeFileSync(path.join(cfg.claudeDir, 'sessions', process.pid + '.json'), JSON.stringify({
+  const file = pidStateFile;
+  const contents = JSON.stringify({
     pid: process.pid, cwd: cfg.workingDir, procStart, kind: 'interactive',
     // 2.1.123 keeps the spawn-time sessionId in the record across /clear.
     sessionId: cfg.stalePidState ? spawnSid : sid,
     version: cfg.stalePidState ? '2.1.123' : '2.1.305',
-  }));
+  });
+  if (cfg.atomicPidState) {
+    fs.writeFileSync(file + '.tmp', contents);
+    fs.renameSync(file + '.tmp', file);
+  } else fs.writeFileSync(file, contents);
 };
 // Claude holds the active session's tasks dir open, across /clear too.
 let tasksLock;
@@ -153,6 +173,7 @@ const runTurn = (prompt, reply) => {
     record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'text', text: reply }], stop_reason: 'end_turn' } });
     record({ type: 'system', subtype: 'turn_duration', durationMs: cfg.turnMs });
     busy = false;
+    stallPidStateRewrite();
     render();
     programStatus('idle');
     ev({ kind: 'turn', reply });
@@ -286,6 +307,10 @@ export interface Harness {
   /** The id a `--fork-session` launch mints. */
   forkSid: string;
   pidStateGate: string;
+  /** From now on a turn's end leaves the pid-state record mid-rewrite (empty)
+   *  until `landPidStateRewrite`. */
+  stallPidStateRewrite: () => void;
+  landPidStateRewrite: () => void;
   notify: (reply: string) => void;
   commands: () => string[];
   /** Every CLI launch: the session it opened and its argv. */
@@ -309,6 +334,81 @@ export interface Harness {
   /** `onPath` only: take the `claude` command off PATH, and put it back. */
   hideCli: () => void;
   restoreCli: () => void;
+}
+
+/** The subset of a worker child the event-driven wait needs. A real ChildProcess
+ *  satisfies it; a plain EventEmitter stands in for the unit test. */
+export interface MessageWaiterChild {
+  on(event: 'message', listener: (message: unknown) => void): unknown;
+  off(event: 'message', listener: (message: unknown) => void): unknown;
+  readonly exitCode: number | null;
+}
+
+/**
+ * Build a `waitFor` that re-checks a CONDITION as soon as the worker emits a
+ * message, instead of only when the 50 ms polling timer fires.
+ *
+ * Scope: a latency refinement of the test harness, NOT a change to what a wait
+ * can satisfy. The condition predicate stays the single source of truth and the
+ * deadline / child-exit guards are unchanged, so a report the worker never sends
+ * still fails the wait — the subscription only re-runs the predicate up to one
+ * 50 ms poll earlier. Two semantics that follow:
+ *  - The 50 ms timer remains as the fallback for conditions backed by logs or
+ *    files, which no message wakes.
+ *  - A message arriving after the deadline fails on the next predicate check
+ *    rather than on the next tick. This is therefore not a strict superset of
+ *    pure polling (which evaluates the predicate before the deadline and could
+ *    still pass on a tick just past it); the gap is bounded by one 50 ms
+ *    interval and the earlier fail-fast is intended.
+ *
+ * Timer ownership: a message wake clears the pending 50 ms timer. Otherwise a
+ * timer left over from the previous round fires later and nulls the NEXT round's
+ * `wake`, delaying a message that should have resolved the wait immediately.
+ */
+export function createMessageAwareWaiter(
+  child: MessageWaiterChild,
+  timeoutSnapshot: () => string,
+): (cond: () => boolean, what: string, timeoutMs?: number) => Promise<void> {
+  return async function waitFor(cond, what, timeoutMs = 45_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let wake: (() => void) | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onMessage = () => {
+      if (timer !== undefined) { clearTimeout(timer); timer = undefined; }
+      wake?.();
+    };
+    child.on('message', onMessage);
+    try {
+      while (!cond()) {
+        if (Date.now() >= deadline || child.exitCode !== null) {
+          throw new Error(`timed out waiting for ${what}\n${timeoutSnapshot()}`);
+        }
+        await new Promise<void>(done => {
+          wake = done;
+          timer = setTimeout(() => { timer = undefined; wake = undefined; done(); }, 50);
+          timer.unref?.();
+        });
+      }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      child.off('message', onMessage);
+    }
+  };
+}
+
+/** Test seam: a minimal child emitting in-memory messages like an IPC channel. */
+export function fakeMessageChild(exitCode: number | null = null): MessageWaiterChild & {
+  emitMessage(m: unknown): void;
+  messageListenerCount(): number;
+} {
+  const emitter = new EventEmitter();
+  return {
+    exitCode,
+    on: (event, listener) => emitter.on(event, listener),
+    off: (event, listener) => emitter.off(event, listener),
+    emitMessage: (m: unknown) => emitter.emit('message', m),
+    messageListenerCount: () => emitter.listenerCount('message'),
+  };
 }
 
 export interface Generation {
@@ -336,6 +436,10 @@ export async function cleanUpClaudeHarnesses(): Promise<void> {
 export function setupFakeClaude(opts: {
   turnMs: number;
   pidStateGated?: boolean;
+  /** Keep an existing PID identity readable across periodic writes. Opt-in
+   *  for runtime-handoff tests; default in-place writes retain torn-record
+   *  coverage, and pidStateGated still controls missing-identity scenarios. */
+  atomicPidState?: boolean;
   history?: { sid: string; reply: string };
   /** Launch the fake through a layer botmux does not know: a launcher that
    *  runs it as a child instead of exec'ing it.
@@ -374,6 +478,7 @@ export function setupFakeClaude(opts: {
   const transcript = (sid: string) => claudeJsonlPathForSession(sid, workingDir, claudeDir);
   const events = join(root, 'events.jsonl');
   const pidStateGate = join(root, 'pid-state-gate');
+  const rewriteStallFile = join(root, 'pid-state-rewrite-stall');
   if (opts.history) {
     // An older conversation of this session, answered an hour ago.
     const ago = (ms: number) => new Date(Date.now() - 3_600_000 + ms).toISOString();
@@ -386,9 +491,10 @@ export function setupFakeClaude(opts: {
   }
   const configFile = join(root, 'fake-claude.json');
   writeFileSync(configFile, JSON.stringify({
-    events, claudeDir, workingDir, notifyDir, clearSid, forkSid, turnMs: opts.turnMs,
+    events, claudeDir, workingDir, notifyDir, clearSid, forkSid, turnMs: opts.turnMs, rewriteStallFile,
     projectDir: dirname(transcript(sessionId)),
     ...(opts.pidStateGated ? { pidStateGate } : {}),
+    ...(opts.atomicPidState ? { atomicPidState: true } : {}),
     ...(opts.stalePidState ? { stalePidState: true, holdTasksDir: true } : {}),
     ...(opts.unknownLayer === 'cli-named-launcher' ? { commAsClaude: true } : {}),
     ...(opts.startupTicker ? { startupTicker: true } : {}),
@@ -422,7 +528,7 @@ child.on('exit', code => process.exit(code ?? 1));
     // Managed sessions live on the dedicated socket, both under this root.
     for (const name of new Set(['default', preferredManagedTmuxSocket() ?? 'default'])) {
       const socket = join(root, `tmux-${process.getuid?.() ?? 0}`, name);
-      try { execFileSync('tmux', ['-S', socket, 'kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* gone */ }
+      killPrivateTmuxServer('tmux', socket, { env: privateTmuxEnv(root) });
     }
   };
   cleanups.push(() => {
@@ -469,6 +575,8 @@ child.on('exit', code => process.exit(code ?? 1));
     hideCli: () => renameSync(fakeCli, parkedCli),
     restoreCli: () => renameSync(parkedCli, fakeCli),
     root, sessionId, workingDir, claudeDir, transcript, clearSid, forkSid, pidStateGate, killCli,
+    stallPidStateRewrite: () => writeFileSync(rewriteStallFile, ''),
+    landPidStateRewrite: () => rmSync(rewriteStallFile, { force: true }),
     // Staged outside notifyDir and renamed in: the fake polls notifyDir every
     // 100ms, and a file it reads between creation and write is an empty reply.
     notify: reply => {
@@ -521,15 +629,8 @@ child.on('exit', code => process.exit(code ?? 1));
         child, messages, logs, readyAt, kill,
         finals: () => messages.flatMap(m => (m.type === 'final_output' ? [m.content] : [])),
         notices: () => messages.filter((m): m is Extract<WorkerToDaemon, { type: 'user_notify' }> => m.type === 'user_notify'),
-        waitFor: async (cond, what, timeoutMs = 45_000) => {
-          const deadline = Date.now() + timeoutMs;
-          while (!cond()) {
-            if (Date.now() >= deadline || child.exitCode !== null) {
-              throw new Error(`timed out waiting for ${what}\n${logs.join('')}\n${JSON.stringify(messages.filter(m => m.type !== 'screen_update'))}`);
-            }
-            await new Promise(done => setTimeout(done, 50));
-          }
-        },
+        waitFor: createMessageAwareWaiter(child, () =>
+          `${logs.join('')}\n${JSON.stringify(messages.filter(m => m.type !== 'screen_update'))}`),
       };
       return generation;
     },

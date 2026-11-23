@@ -403,6 +403,22 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   }
 }
 
+/** An admitted terminal updates its exact turn's reply card without changing
+ * runtime state. Callers settle the turn's CoT stream synchronously themselves:
+ * it must not wait on this card's network PATCH. */
+export async function settleTurnReplyCardTerminal(
+  ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; status: 'completed' | 'failed' | 'cancelled' | 'ambiguous'; durationMs?: number; completedAtMs?: number },
+  send: ReplyCardSender, owns: () => boolean,
+): Promise<void> {
+  if (!owns() || replyCardModeFor(ds, msg.turnId) === 'legacy') return;
+  await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
+    logger.warn(`[reply-card] terminal tool flush: ${error.message}`);
+  });
+  await updateTurnReplyCard(ds, msg.turnId, {
+    kind: 'terminal', phase: msg.status, durationMs: msg.durationMs, completedAtMs: msg.completedAtMs,
+  }, send, { dispatchAttempt: msg.dispatchAttempt, owns });
+}
+
 /** UI retirement never asserts native task failure or changes task settlement. */
 export async function retireReplyCardDisplay(
   ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; message: string },

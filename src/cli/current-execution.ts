@@ -1,6 +1,8 @@
 import { loopbackFetchImpl } from '../core/loopback-fetch.js';
 import { GRANT_ROUTE_CLIENT_TIMEOUT_MS } from '../platform/credential-grant-budget.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from '../utils/daemon-discovery.js';
+import { IDENTITY_ROUTE_TOOLS } from '../services/trigger-user-auth.js';
+import { isCliExecutionInfo, type CliExecutionInfo } from '../core/cli-execution-mode.js';
 
 export const CURRENT_EXECUTION_SCHEMA = 'botmux.current-execution.v1' as const;
 export const CURRENT_EXECUTION_ROUTE = '/api/current-execution';
@@ -15,6 +17,7 @@ export const CURRENT_EXECUTION_TRIGGER_SOURCES = ['webhook', 'ui', 'workflow', '
  *  the key and answers without them; a CLI that predates them never asks, and
  *  so keeps receiving exactly the fields its strict key check accepts. */
 export const CURRENT_EXECUTION_ORIGIN_FIELD = 'origin' as const;
+export const CURRENT_EXECUTION_CLI_FIELD = 'cli' as const;
 
 export interface CurrentExecutionDocument {
   schema: typeof CURRENT_EXECUTION_SCHEMA;
@@ -32,6 +35,8 @@ export interface CurrentExecutionDocument {
   scheduleTaskId?: string;
   /** Only with origin `trigger`. */
   triggerSource?: typeof CURRENT_EXECUTION_TRIGGER_SOURCES[number];
+  /** 仅在请求 cli 字段时返回；来自实际 worker 启动报告。 */
+  cliExecution?: CliExecutionInfo;
 }
 
 const identifier = (value: unknown): value is string => typeof value === 'string'
@@ -56,13 +61,15 @@ export function isCurrentExecutionDocument(value: unknown): value is CurrentExec
       || (d.origin === 'trigger'
         && (CURRENT_EXECUTION_TRIGGER_SOURCES as readonly unknown[]).includes(d.triggerSource)))
     && (d.origin !== 'trigger' || d.triggerSource !== undefined)
+    && (d.cliExecution === undefined || isCliExecutionInfo(d.cliExecution))
     && Object.keys(d).every(key => ['schema', 'status', 'larkAppId', 'sessionId', 'chatId',
       'turnId', 'workerGeneration', 'dispatchAttempt', 'identityTurnId',
-      'origin', 'scheduleTaskId', 'triggerSource'].includes(key));
+      'origin', 'scheduleTaskId', 'triggerSource', 'cliExecution'].includes(key));
 }
 
 export function parseCurrentExecutionArgs(args: string[]): boolean {
-  return args.length === 2 && args[0] === 'current' && args[1] === '--json';
+  return (args.length === 2 || args.length === 3 && args[2] === '--cli')
+    && args[0] === 'current' && args[1] === '--json';
 }
 
 /** Routing comes from the existing ancestor resolver. The daemon derives the
@@ -72,6 +79,7 @@ export async function resolveCurrentExecution(options: {
   sessionId: string;
   larkAppId: string;
   fetchImpl?: typeof fetch;
+  includeCli?: boolean;
 }): Promise<CurrentExecutionDocument> {
   if (!Number.isSafeInteger(options.ipcPort) || options.ipcPort <= 0 || options.ipcPort > 65535
     || !identifier(options.sessionId) || !identifier(options.larkAppId)) {
@@ -80,7 +88,8 @@ export async function resolveCurrentExecution(options: {
   const response = await (options.fetchImpl ?? loopbackFetchImpl)(
     `http://127.0.0.1:${options.ipcPort}${CURRENT_EXECUTION_ROUTE}`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: options.sessionId, fields: [CURRENT_EXECUTION_ORIGIN_FIELD] }),
+      body: JSON.stringify({ sessionId: options.sessionId, fields: [CURRENT_EXECUTION_ORIGIN_FIELD,
+        ...(options.includeCli ? [CURRENT_EXECUTION_CLI_FIELD] : [])] }),
       redirect: 'error', signal: AbortSignal.timeout(5000),
     },
   );
@@ -95,7 +104,7 @@ export async function resolveCurrentExecution(options: {
 export const CURRENT_EXECUTION_IDENTITY_SCHEMA = 'botmux.current-execution-identity.v1' as const;
 export const CURRENT_EXECUTION_IDENTITY_ROUTE = '/api/current-execution-identity';
 
-const IDENTITY_TOOLS = ['lark-cli', 'bytedcli', 'codebase'] as const;
+const IDENTITY_TOOLS = IDENTITY_ROUTE_TOOLS;
 type IdentityToolName = typeof IDENTITY_TOOLS[number];
 const identityTool = (value: unknown): value is IdentityToolName =>
   typeof value === 'string' && (IDENTITY_TOOLS as readonly string[]).includes(value);
@@ -134,6 +143,8 @@ export const IDENTITY_REFUSAL_REASONS = [
   'identity_decision_missing', 'identity_decision_conflict', 'identity_model_single',
   // daemon: caller proven, no identity material for the turn (HTTP 404)
   'identity_material_unavailable',
+  // daemon: caller proven, BOTMUX_AS names nobody who spoke in this turn / cannot name anyone here
+  'as_not_speaker', 'as_unavailable',
   // client side
   'invalid_invocation', 'daemon_unreachable', 'daemon_timeout', 'response_mismatch', 'unspecified',
 ] as const;
@@ -170,6 +181,8 @@ export async function resolveCurrentExecutionIdentity(options: {
   sessionId: string;
   larkAppId: string;
   tool: string;
+  /** `BOTMUX_AS`: the speaker of the current turn this call runs as. */
+  as?: string;
   fetchImpl?: typeof fetch;
 }): Promise<CurrentExecutionIdentityDocument> {
   if (!Number.isSafeInteger(options.ipcPort) || options.ipcPort <= 0 || options.ipcPort > 65535
@@ -189,7 +202,7 @@ export async function resolveCurrentExecutionIdentity(options: {
     response = await (options.fetchImpl ?? loopbackFetchImpl)(
       `http://127.0.0.1:${ipcPort}${CURRENT_EXECUTION_IDENTITY_ROUTE}`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId: options.sessionId, tool: options.tool }),
+        body: JSON.stringify({ sessionId: options.sessionId, tool: options.tool, ...(options.as ? { as: options.as } : {}) }),
         redirect: 'error', signal: AbortSignal.timeout(GRANT_ROUTE_CLIENT_TIMEOUT_MS),
       },
     );

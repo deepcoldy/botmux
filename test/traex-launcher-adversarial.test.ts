@@ -9,6 +9,7 @@ import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launc
 import {
   CODEX_LEAF_SEARCH_DEPTH,
   cliIdForComm,
+  createElapsedDeadline,
   findLaunchedCliPid,
   isNonInteractiveCodexArgv,
   scheduleWrapperRealCliPid,
@@ -132,6 +133,8 @@ function makeWorkerFixture(options: {
     isNonInteractiveCodexArgv,
     cliAdapterBindsOwnershipPid,
     scheduleWrapperRealCliPid,
+    createElapsedDeadline: (maxElapsedMs: number | undefined) =>
+      createElapsedDeadline(maxElapsedMs, timers.now),
     // Inject every process-table boundary; none may inspect the host's PIDs.
     readComm: table.commOf,
     getChildPids: table.childrenOf,
@@ -268,6 +271,7 @@ describe('TRAE launcher adversarial lifecycle probes', () => {
         currentBotmuxLinkRefMode: undefined,
         activeTurnAuthority: {
           identity: () => ({ turnId: 'synthetic-turn', dispatchAttempt: 1 }),
+          speakers: () => [],
         },
         parseDaemonIpcPort: () => undefined,
         randomBytes: () => ({ toString: () => 'synthetic-new-token' }),

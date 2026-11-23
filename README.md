@@ -42,16 +42,19 @@ Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话
 
 ## 5 分钟接入
 
-> 一次飞书扫码即可连续建好应用、配全权限并自动发版（手动创建 / 粘贴凭证也是 setup 中的可选路径）。
+> 一次飞书扫码即可连续建好应用、配全权限并自动发版（手动粘贴凭证也是可选路径）。不需要飞书时用 `botmux setup add --local`，或在 Dashboard「添加机器人」里选「仅本地」。写进 `bots.json` 的 `local_*` id 只是本机身份，不是飞书 App ID。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 botmux setup                 # 一次扫码建应用 → 选 CLI → 选工作目录（自动配权限 + 发版）
+botmux setup add --local --name 研究室 --cli codex --default-working-dir ~ --json
+                             # 只创建本地机器人：不扫码、不绑定飞书 App ID / Secret
 botmux start                 # 启动 daemon（botmux autostart enable 设开机自启）
 ```
 
 - **自包含单文件二进制**：运行时与 PTY 已内嵌，**安装和运行都不依赖本机 Node**。支持 Linux / macOS（x64 / arm64，macOS 正式版提供稳定 Apple Developer ID 签名），Windows 用户请在 WSL2 中使用。
 - **平滑升级**：执行 `botmux upgrade` 或重跑上述 curl 命令即可原地安全更新。
+- **新版提醒**：全局设置中的“新版私聊提醒”默认关闭；开启后每小时检查新版并私聊通知主 bot owner，与自动更新独立。见[版本通知](docs/version-notifications.md)。
 - **源码安装更新**：Dashboard「版本与更新」支持普通更新，以及预览、确认并备份后强制覆盖本地改动；恢复方法见[本地源码更新](docs/local-source-update.md)。
 - **完整指南**：包含 Lark 国际版、手动配置权限与排查，见 [5 分钟快速接入文档](https://deepcoldy.github.io/botmux/quickstart)。
 

@@ -14,9 +14,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { BridgeTurnQueue, CLI_QUEUE_HOLD_MAX_MS, isHeldInCliQueue, isHeldPendingMark, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
+import { BridgeTurnQueue, CLI_QUEUE_HOLD_MAX_MS, isHeldInCliQueue, isHeldPendingMark, makeFingerprint, isTruncatedMatch, normaliseForFingerprint, takeAbsorbedReplyCandidates, type BridgePendingTurn } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
-import type { TranscriptEvent } from '../src/services/claude-transcript.js';
+import type { AbsorbedReplyCollector, TranscriptEvent } from '../src/services/claude-transcript.js';
 
 function user(uuid: string, content: string = `<input ${uuid}>`, timestamp?: string): TranscriptEvent {
   return { type: 'user', uuid, timestamp, message: { role: 'user', content } };
@@ -36,6 +36,11 @@ function assistantToolUse(uuid: string): TranscriptEvent {
     uuid,
     message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tool-1', name: 'Read' }] as any },
   };
+}
+/** Model the extra soft-newline backslash Ink leaves before every line break
+ * when its paste-burst heuristic fires. Existing backslashes are preserved. */
+function withSoftNewlineResidue(content: string): string {
+  return content.replace(/\r?\n/g, lineBreak => `\\${lineBreak}`);
 }
 function toolResult(uuid: string): TranscriptEvent {
   return {
@@ -175,6 +180,80 @@ describe('BridgeTurnQueue', () => {
       errorCode: 'provider_server_error',
       retryable: true,
     });
+  });
+
+  it('stamps a failure with the last request the provider answered before it, even from an earlier turn', () => {
+    const q = new BridgeTurnQueue();
+    const reply = (uuid: string, timestamp: string, extra: Partial<TranscriptEvent> = {}): TranscriptEvent => ({
+      type: 'assistant', uuid, timestamp,
+      message: { role: 'assistant', model: 'claude-x', content: [{ type: 'text', text: `reply ${uuid}` }], stop_reason: 'end_turn' },
+      ...extra,
+    });
+    const apiError = (uuid: string, timestamp: string, text: string): TranscriptEvent => ({
+      type: 'assistant', uuid, timestamp, isApiErrorMessage: true, error: 'server_error', apiErrorStatus: 503,
+      message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text }], stop_reason: 'stop_sequence' },
+    });
+    q.mark('t1');
+    q.ingest([user('u1', 'first'), reply('a1', '2026-11-13T11:07:58.000Z'),
+      { type: 'system', subtype: 'turn_duration', uuid: 'd1' }]);
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toHaveLength(1);
+    q.mark('t2');
+    q.ingest([
+      user('u2', 'second'),
+      // Neither a sub-agent's reply nor a no-model placeholder is an answer
+      // from the main conversation's provider.
+      reply('side', '2026-11-13T11:08:05.000Z', { isSidechain: true } as Partial<TranscriptEvent>),
+      apiError('e2', '2026-11-13T11:08:18.238Z',
+        'API Error: 503 no eligible upstream account; the earliest account is expected to be available at 2026-11-13T11:10:16Z.'),
+    ]);
+    const [failed] = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(failed.turnId).toBe('t2');
+    expect(failed.terminalOutcome).toEqual({
+      status: 'failed', errorCode: 'provider_server_error', retryable: true,
+      retryAtMs: Date.parse('2026-11-13T11:10:16Z'),
+    });
+    expect(failed.terminalProviderLastSuccessAtMs).toBe(Date.parse('2026-11-13T11:07:58.000Z'));
+  });
+
+  it('keeps the newest answer when older history is read again, and does not count a no-model placeholder', () => {
+    const q = new BridgeTurnQueue();
+    const record = (uuid: string, timestamp: string, model: string, text: string): TranscriptEvent => ({
+      type: 'assistant', uuid, timestamp,
+      message: { role: 'assistant', model, content: [{ type: 'text', text }], stop_reason: 'stop_sequence' },
+    });
+    q.mark('t1');
+    q.ingest([user('u1', 'first'),
+      record('a-new', '2026-11-13T11:07:58.000Z', 'claude-x', 'answer'),
+      { type: 'system', subtype: 'turn_duration', uuid: 'd1' }]);
+    q.drainEmittable({ explicitTerminalOnly: true });
+    q.mark('t2');
+    q.ingest([
+      user('u2', 'second'),
+      // A replayed record from before (journal restore / rotation) is older.
+      record('a-old', '2026-11-13T10:00:00.000Z', 'claude-x', 'old answer'),
+      // Claude Code's placeholder written without calling the model.
+      record('a-syn', '2026-11-13T11:08:10.000Z', '<synthetic>', 'No response requested.'),
+      {
+        type: 'assistant', uuid: 'e2', timestamp: '2026-11-13T11:08:18.238Z', isApiErrorMessage: true, error: 'server_error',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 503' }], stop_reason: 'stop_sequence' },
+      },
+      { type: 'system', subtype: 'turn_duration', uuid: 'd2' },
+    ]);
+    const [failed] = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(failed.terminalOutcome?.status).toBe('failed');
+    expect(failed.terminalProviderLastSuccessAtMs).toBe(Date.parse('2026-11-13T11:07:58.000Z'));
+  });
+
+  it('leaves the last success unknown when no reply was read since the queue started', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('t1');
+    q.ingest([user('u1'), {
+      type: 'assistant', uuid: 'e1', timestamp: '2026-11-13T11:08:18.238Z', isApiErrorMessage: true, error: 'server_error',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500' }], stop_reason: 'stop_sequence' },
+    }]);
+    const [failed] = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(failed.terminalOutcome?.status).toBe('failed');
+    expect(failed.terminalProviderLastSuccessAtMs).toBeUndefined();
   });
 
   it('preserves an unexpected EOF failure when turn_duration closes the boundary', () => {
@@ -706,6 +785,21 @@ describe('BridgeTurnQueue', () => {
       });
     });
 
+    it('a failure only the placeholder reports still carries the last answered request', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t0');
+      q.ingest([user('u0'), {
+        type: 'assistant', uuid: 'a0', timestamp: '2026-11-13T11:07:58.000Z',
+        message: { role: 'assistant', model: 'claude-opus-4-8', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] },
+      } as TranscriptEvent, turnDurationMarker('d0')]);
+      q.drainEmittable({ explicitTerminalOnly: true });
+      q.mark('t1');
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1')]);
+      const [failed] = q.drainEmittable();
+      expect(failed.terminalOutcome).toEqual({ status: 'failed', errorCode: 'provider_no_model_reply', retryable: true });
+      expect(failed.terminalProviderLastSuccessAtMs).toBe(Date.parse('2026-11-13T11:07:58.000Z'));
+    });
+
     it('control: the same record served by a real model is the completed reply', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
@@ -1200,7 +1294,7 @@ describe('BridgeTurnQueue', () => {
       // Not split: the running turn keeps collecting the reply.
       expect(q.peek().map(t => t.turnId)).toEqual(['tA', 'tB']);
       expect(q.peek()[0].assistantUuids).toEqual(['a-final']);
-      expect(q.peek()[1]).toMatchObject({ started: true, absorbedIntoTurnId: 'tA', assistantUuids: [] });
+      expect(q.peek()[1]).toMatchObject({ started: true, absorbedIntoTurnId: 'tA', absorbedAtUuid: 'q-absorbed', assistantUuids: [] });
       expect(started).toEqual(['tA:true', 'tB:true']);
 
       // A pruning pass cannot expire it any more: it is started.
@@ -1212,6 +1306,124 @@ describe('BridgeTurnQueue', () => {
       expect(ready[1].terminalOutcome).toEqual({ status: 'completed' });
       expect(ready[1].markTimeMs).toBe(5000);
       expect(q.size()).toBe(0);
+    });
+
+    it('binds an absorbed residue candidate without granting full-content evidence', () => {
+      const started: string[] = [];
+      const q = new BridgeTurnQueue(undefined, undefined, (turn, evidence) => {
+        started.push(`${turn.turnId}:${evidence.fullContentMatch}`);
+      });
+      const promptB = '<user_message>echo foo\\\nbar</user_message>';
+      q.mark('tA', makeFingerprint('进度如何'), 100, normaliseForFingerprint('进度如何'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', '进度如何'),
+        assistantToolUse('a-tool'),
+        absorbedQueued('q-absorbed-residue', withSoftNewlineResidue(promptB), new Date(5000).toISOString()),
+        assistant('a-final', 'both answered'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+
+      expect(q.peek()[1]).toMatchObject({ started: true, absorbedIntoTurnId: 'tA', absorbedAtUuid: 'q-absorbed-residue' });
+      expect(started).toEqual(['tA:true', 'tB:false']);
+      expect(q.drainEmittable({ explicitTerminalOnly: true }).map(turn => turn.turnId)).toEqual(['tA', 'tB']);
+    });
+
+    it('does not chain absorbed residue and legacy matches across different marks', () => {
+      const evidence: Array<{ turnId: string; fullContentMatch: boolean }> = [];
+      const q = new BridgeTurnQueue(undefined, undefined, (turn, e) => {
+        evidence.push({ turnId: turn.turnId, fullContentMatch: e.fullContentMatch });
+      });
+      const host = 'host turn with distinct content';
+      const a = 'echo foo\nbar with enough content to identify the turn';
+      const b = 'echo foo\\\nbar with enough content to identify the turn';
+      q.mark('host', makeFingerprint(host), 0, normaliseForFingerprint(host));
+      q.mark('lark-A', makeFingerprint(a), 1, normaliseForFingerprint(a));
+      q.mark('lark-B', makeFingerprint(b), 2, normaliseForFingerprint(b));
+      q.ingest([user('host-u', host), assistantToolUse('host-tool')]);
+      q.ingest([
+        absorbedQueued('local-B', b, new Date(1_000).toISOString()),
+        absorbedQueued('real-A', withSoftNewlineResidue(a), new Date(2_000).toISOString()),
+        absorbedQueued('real-B', withSoftNewlineResidue(b), new Date(3_000).toISOString()),
+      ]);
+
+      expect(q.peek().filter(turn => turn.turnId.startsWith('lark-')).map(turn => [turn.turnId, turn.started]))
+        .toEqual([['lark-A', false], ['lark-B', false]]);
+      expect(evidence).toEqual([{ turnId: 'host', fullContentMatch: true }]);
+    });
+
+    it('flags a folded message for its live reply once, when the model moves on from it', () => {
+      const promptB = '<user_message>现在用的是什么模型？</user_message>';
+      const collectors = new WeakMap<BridgePendingTurn, AbsorbedReplyCollector>();
+      const due: string[] = [];
+      const observe = (ev: TranscriptEvent, host: BridgePendingTurn) => {
+        for (const turn of takeAbsorbedReplyCandidates(host, ev, collectors)) due.push(turn.turnId);
+      };
+      const thinking = (uuid: string, text: string): TranscriptEvent => ({
+        type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'thinking', thinking: text } as any] },
+      });
+      const q = new BridgeTurnQueue();
+      q.mark('tA', makeFingerprint('跑用例'), 100, normaliseForFingerprint('跑用例'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([user('uA', '跑用例'), assistant('a0', 'starting'), assistantToolUse('a-t0'), toolResult('r0')], undefined, observe);
+      q.ingest([
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        thinking('a1', ''), assistantToolUse('a-t1'), toolResult('r1'),
+        thinking('a2', '用的是 gpt-6-astra。'),
+      ], undefined, observe);
+      // The answer is written, but the model may still add to it.
+      expect(due).toEqual([]);
+
+      q.ingest([assistantToolUse('a-t2'), toolResult('r2'), assistant('a3', 'more work'), assistantToolUse('a-t3')], undefined, observe);
+      expect(due).toEqual(['tB']);
+      // Flagged once, whatever the worker then finds in the transcript.
+      q.ingest([assistant('a-final', 'done'), { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent], undefined, observe);
+      expect(due).toEqual(['tB']);
+    });
+
+    it('does not flag a folded message whose reply is still open when the host turn ends', () => {
+      const promptB = '<user_message>顺便问一句</user_message>';
+      const collectors = new WeakMap<BridgePendingTurn, AbsorbedReplyCollector>();
+      const due: string[] = [];
+      const observe = (ev: TranscriptEvent, host: BridgePendingTurn) => {
+        for (const turn of takeAbsorbedReplyCandidates(host, ev, collectors)) due.push(turn.turnId);
+      };
+      const q = new BridgeTurnQueue();
+      q.mark('tA', makeFingerprint('跑用例'), 100, normaliseForFingerprint('跑用例'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', '跑用例'), assistantToolUse('a-t0'),
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        assistant('a-final', 'answer and summary in one closing message'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ], undefined, observe);
+      expect(due).toEqual([]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => t.turnId)).toEqual(['tA', 'tB']);
+    });
+
+    it('a folded turn already answered settles as completed even when its host then fails', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'quick question while busy';
+      const promptC = 'another one while busy';
+      q.mark('tA', makeFingerprint('first request'), 100, normaliseForFingerprint('first request'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.mark('tC', makeFingerprint(promptC), 300, normaliseForFingerprint(promptC), 1);
+      q.ingest([
+        user('uA', 'first request'), assistantToolUse('a-t0'),
+        absorbedQueued('q-b', promptB, new Date(5000).toISOString()),
+        absorbedQueued('q-c', promptC, new Date(6000).toISOString()),
+      ]);
+      q.peek().find(t => t.turnId === 'tB')!.absorbedReplySent = true;
+      q.ingest([
+        { ...assistant('err', 'API Error: 500 {"error":{"type":"api_error"}}'), isApiErrorMessage: true } as TranscriptEvent,
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      const outcome = (id: string) => ready.find(t => t.turnId === id)!.terminalOutcome?.status;
+      expect(outcome('tA')).not.toBe('completed');
+      expect(outcome('tB')).toBe('completed');
+      expect(outcome('tC')).toBe(outcome('tA'));
     });
 
     it('an API error that ends the host turn keeps its text, and the absorbed turn ends with the same error', () => {
@@ -1234,6 +1446,28 @@ describe('BridgeTurnQueue', () => {
       expect(ready.map(t => [t.turnId, t.terminalOutcome?.status, t.terminalErrorDetail])).toEqual([
         ['tA', 'failed', text],
         ['tB', 'failed', text],
+      ]);
+    });
+
+    it('the absorbed turn that fails with its host also carries the last answered request', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'second request while busy';
+      q.mark('tA', makeFingerprint('first request'), 100, normaliseForFingerprint('first request'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', 'first request'),
+        { ...assistantToolUse('a-tool'), timestamp: '2026-11-13T11:07:58.000Z' } as TranscriptEvent,
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        {
+          type: 'assistant', uuid: 'a-503', timestamp: '2026-11-13T11:08:18.000Z', isApiErrorMessage: true, error: 'server_error', apiErrorStatus: 503,
+          message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'API Error: 503' }] },
+        } as TranscriptEvent,
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => [t.turnId, t.terminalOutcome?.status, t.terminalProviderLastSuccessAtMs])).toEqual([
+        ['tA', 'failed', Date.parse('2026-11-13T11:07:58.000Z')],
+        ['tB', 'failed', Date.parse('2026-11-13T11:07:58.000Z')],
       ]);
     });
 
@@ -1411,7 +1645,143 @@ describe('BridgeTurnQueue', () => {
     });
   });
 
+  describe('soft-newline backslash left in the recorded user line', () => {
+    const sentWith = (genuineBackslashes: number, firstBreak = '\n'): string =>
+      '<summary_memory>' + '\\'.repeat(genuineBackslashes) + firstBreak
+      + '配置的记忆文件路径是 summary.md。\n</summary_memory>\n<user_message>\n可以提交 PR 吗\n</user_message>';
+    function marked(sent: string, evidence: boolean[]): BridgeTurnQueue {
+      const q = new BridgeTurnQueue(undefined, undefined, (_turn, e) => evidence.push(e.fullContentMatch));
+      q.mark('lark-1', makeFingerprint(sent), 100, makeFingerprintFull(sent));
+      return q;
+    }
+
+    // Claude Code input is typed as `\` + Enter per newline. When Ink takes
+    // the burst for a paste, one extra backslash is recorded per line break.
+    it('binds the Lark mark without upgrading a residue-only match to full-content evidence', () => {
+      const evidence: boolean[] = [];
+      const q = marked(sentWith(0), evidence);
+      q.ingest([user('u1', withSoftNewlineResidue(sentWith(0))), assistant('a1', 'reply')]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('lark-1');
+      expect(ready[0].isLocal).toBeFalsy();
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+      expect(evidence).toEqual([false]);
+    });
+
+    it.each([1, 2])('binds when the mark has %i genuine backslash(es) and the recording has one more', genuine => {
+      const evidence: boolean[] = [];
+      const sent = sentWith(genuine);
+      const q = marked(sent, evidence);
+      q.ingest([user('u1', withSoftNewlineResidue(sent)), assistant('a1', 'reply')]);
+      expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['lark-1']);
+      expect(evidence).toEqual([false]);
+    });
+
+    it('binds a genuine backslash plus residue before CRLF', () => {
+      const evidence: boolean[] = [];
+      const sent = sentWith(1, '\r\n');
+      const q = marked(sent, evidence);
+      q.ingest([user('u1', withSoftNewlineResidue(sent)), assistant('a1', 'reply')]);
+      expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['lark-1']);
+      expect(evidence).toEqual([false]);
+    });
+
+    it('keeps legacy full-content evidence for a genuine backslash with no residue', () => {
+      const evidence: boolean[] = [];
+      const sent = sentWith(1);
+      const q = marked(sent, evidence);
+      q.ingest([user('u1', sent), assistant('a1', 'reply')]);
+      expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['lark-1']);
+      expect(evidence).toEqual([true]);
+    });
+
+    it('does not let a different input missing the genuine backslash steal the mark', () => {
+      const evidence: boolean[] = [];
+      const sent = sentWith(1);
+      const q = marked(sent, evidence);
+      q.ingest([user('local-u', sentWith(0)), assistant('local-a', 'local reply')]);
+      expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['local-local-u']);
+      expect(q.peek().find(turn => turn.turnId === 'lark-1')?.started).toBe(false);
+      expect(evidence).toEqual([]);
+
+      q.ingest([user('real-u', withSoftNewlineResidue(sent)), assistant('real-a', 'Lark reply')]);
+      expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['lark-1']);
+      expect(evidence).toEqual([false]);
+    });
+
+    it('keeps literal backslashes significant in legacy mark identity', () => {
+      expect(normaliseForFingerprint('a\\b\nc')).toBe('a\\b c');
+      expect(normaliseForFingerprint('a\\\nb')).not.toBe(normaliseForFingerprint('a\nb'));
+    });
+  });
+
+  describe('soft-newline cross-mark ambiguity', () => {
+    const sent = (backslashes: number) => `echo foo${'\\'.repeat(backslashes)}\nbar with enough content to identify the turn`;
+
+    it('fails closed instead of chaining residue and legacy matches across different marks', () => {
+      const evidence: Array<{ turnId: string; fullContentMatch: boolean }> = [];
+      const q = new BridgeTurnQueue(undefined, undefined, (turn, e) => {
+        evidence.push({ turnId: turn.turnId, fullContentMatch: e.fullContentMatch });
+      });
+      const a = sent(0);
+      const b = sent(1);
+      q.mark('lark-A', makeFingerprint(a), 1_000, normaliseForFingerprint(a));
+      q.mark('lark-B', makeFingerprint(b), 2_000, normaliseForFingerprint(b));
+
+      q.ingest([
+        user('local-human', b), assistant('assistant-local', 'local answer'),
+        user('real-A', withSoftNewlineResidue(a)), assistant('assistant-A', 'answer A'),
+        user('real-B', withSoftNewlineResidue(b)), assistant('assistant-B', 'answer B'),
+      ]);
+
+      expect(q.drainEmittable().map(turn => turn.turnId)).toEqual([
+        'local-local-human', 'local-real-A', 'local-real-B',
+      ]);
+      expect(evidence).toEqual([]);
+      expect(q.peek().filter(turn => !turn.isLocal).map(turn => [turn.turnId, turn.started]))
+        .toEqual([['lark-A', false], ['lark-B', false]]);
+    });
+
+    it('keeps identical marks in FIFO order when their records carry residue', () => {
+      const evidence: boolean[] = [];
+      const q = new BridgeTurnQueue(undefined, undefined, (_turn, e) => evidence.push(e.fullContentMatch));
+      const content = sent(0);
+      q.mark('lark-A', makeFingerprint(content), 1_000, normaliseForFingerprint(content));
+      q.mark('lark-B', makeFingerprint(content), 2_000, normaliseForFingerprint(content));
+      q.ingest([
+        user('real-A', withSoftNewlineResidue(content)), assistant('assistant-A', 'answer A'),
+        user('real-B', withSoftNewlineResidue(content)), assistant('assistant-B', 'answer B'),
+      ]);
+      const ready = q.drainEmittable();
+      expect(ready.map(turn => turn.turnId)).toEqual(['lark-A', 'lark-B']);
+      expect(ready.map(turn => turn.assistantUuids)).toEqual([['assistant-A'], ['assistant-B']]);
+      expect(evidence).toEqual([false, false]);
+    });
+  });
+
   describe('truncation-proof bind in the queue (durable mark, mismatched head)', () => {
+    it('accepts a residue-bearing truncation candidate without granting full-content evidence', () => {
+      const evidence: boolean[] = [];
+      const q = new BridgeTurnQueue(undefined, undefined, (_turn, e) => evidence.push(e.fullContentMatch));
+      const marked = '<user_message>\n<botmux_task trusted="true">\necho foo\\\nbar with enough content</botmux_task>\n</user_message>';
+      const truncated = 'echo foo\\\nbar with enough content</botmux_task>\n</user_message>';
+      q.mark('t1', makeFingerprint(marked), 100, makeFingerprintFull(marked), 7);
+      q.ingest([user('u1', withSoftNewlineResidue(truncated)), assistant('a1', 'reply')]);
+      expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['t1']);
+      expect(evidence).toEqual([false]);
+    });
+
+    it('rejects a truncation candidate missing the mark\'s genuine backslash', () => {
+      const q = new BridgeTurnQueue();
+      const marked = '<user_message>\n<botmux_task trusted="true">\necho foo\\\nbar with enough content</botmux_task>\n</user_message>';
+      const different = 'echo foo\nbar with enough content</botmux_task>\n</user_message>';
+      q.mark('t1', makeFingerprint(marked), 100, makeFingerprintFull(marked), 7);
+      q.ingest([user('u1', different), assistant('a1', 'reply')]);
+      expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['local-u1']);
+      expect(q.peek().find(turn => turn.turnId === 't1')?.started).toBe(false);
+    });
+
     it('binds the durable mark when the recorded line is a provable truncation of the marked content', () => {
       const q = new BridgeTurnQueue();
       const marked = '<user_message>\n<botmux_task trusted="true">\nDo the migration and report</botmux_task>\n</user_message>';
@@ -1982,7 +2352,7 @@ describe('BridgeTurnQueue — bare (solo transcript) input fingerprint', () => {
 /** Local helper: full normalised content (what the worker stores as
  *  contentNormalized), distinct from the 30-char makeFingerprint. */
 function makeFingerprintFull(message: string): string {
-  return message.replace(/\s+/g, ' ').trim();
+  return normaliseForFingerprint(message);
 }
 
 // ── Native consumption evidence for shared group background ───────────────────
@@ -2058,6 +2428,216 @@ describe('input held in Claude\'s own queue', () => {
       absorbed('q1', text, 3_000),
     ]);
     expect(started).toEqual(['t1']);
+  });
+
+  it('holds and releases a mark whose queue records carry soft-newline residue', () => {
+    const sent = '<user_message>echo foo\\\nbar with enough content</user_message>';
+    const recorded = withSoftNewlineResidue(sent);
+    const q = marked(sent);
+    q.ingest([queueOp('enqueue', 1_000, recorded)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+    // Enqueue carried the residue; remove did not. Their candidate sets still
+    // describe the same input, so the mirror must not strand the held mark.
+    q.ingest([queueOp('remove', 2_000, sent, 'cancelled')]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('keeps both marks held when a remove has exact and residue-only interpretations', () => {
+    const first = '<user_message>echo foo\nbar with enough content</user_message>';
+    const second = '<user_message>echo foo\\\nbar with enough content</user_message>';
+    const q = marked(first, 'tA');
+    q.mark('tB', makeFingerprint(second), markAt, normaliseForFingerprint(second));
+    q.ingest([
+      queueOp('enqueue', 1_000, first),
+      queueOp('enqueue', 1_500, second),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+
+    q.ingest([queueOp('remove', 2_000, second, 'cancelled')]);
+    // The remove is exact for the second item but residue-compatible with the
+    // first. With no unique identity proof, releasing either mark is unsafe.
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+  });
+
+  it('does not hold competing marks for ambiguous enqueues', () => {
+    const a = 'echo foo\nbar with enough content to identify the turn';
+    const b = 'echo foo\\\nbar with enough content to identify the turn';
+    const q = marked(a, 'lark-A');
+    q.mark('lark-B', makeFingerprint(b), markAt + 1, normaliseForFingerprint(b));
+    q.ingest([queueOp('enqueue', 1_000, b)]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([false, false]);
+    q.ingest([queueOp('enqueue', 2_000, withSoftNewlineResidue(a))]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([false, false]);
+    q.ingest([queueOp('enqueue', 3_000, withSoftNewlineResidue(b))]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([false, true]);
+  });
+
+  it('keeps ambiguous enqueue competitors together through TTL and expires them as a group', () => {
+    const a = 'echo foo\nbar with enough content to identify the turn';
+    const b = 'echo foo\\\nbar with enough content to identify the turn';
+    const evidence: Array<{ turnId: string; fullContentMatch: boolean }> = [];
+    const q = new BridgeTurnQueue(undefined, undefined, (turn, e) => {
+      if (turn.turnId !== 'host') evidence.push({ turnId: turn.turnId, fullContentMatch: e.fullContentMatch });
+    });
+    const host = 'host turn with distinct content';
+    q.mark('host', makeFingerprint(host), markAt - 1_000, normaliseForFingerprint(host));
+    q.mark('lark-A', makeFingerprint(a), markAt, normaliseForFingerprint(a), 1);
+    q.mark('lark-B', makeFingerprint(b), markAt + 1, normaliseForFingerprint(b), 1);
+    q.ingest([user('host-u', host, iso(-1_000)), assistantToolUse('host-tool')]);
+    q.ingest([
+      queueOp('enqueue', 1_000, withSoftNewlineResidue(a)),
+      queueOp('enqueue', 2_000, withSoftNewlineResidue(b)),
+      { type: 'system', subtype: 'turn_duration', uuid: 'host-duration', timestamp: iso(3_000) } as TranscriptEvent,
+    ]);
+
+    // The host has closed, so the generic busy exemption cannot protect A.
+    // The conflict group must keep both competitors; B's own queue hold is
+    // not a resolution and must not let A expire alone.
+    expect(q.pruneExpired(TTL, markAt + TTL + 1)).toEqual([]);
+    q.ingest([
+      user('real-A', withSoftNewlineResidue(a), iso(121_000)),
+      assistant('assistant-A', 'answer A'),
+      user('real-B', withSoftNewlineResidue(b), iso(122_000)),
+      assistant('assistant-B', 'answer B'),
+    ]);
+    expect(q.drainEmittable().filter(turn => turn.turnId.startsWith('lark-'))).toEqual([]);
+    expect(evidence).toEqual([]);
+
+    // Once the shared hold bound is reached, no competitor remains behind to
+    // accept a late line as legacy full-content proof.
+    expect(q.pruneExpired(TTL, markAt + CLI_QUEUE_HOLD_MAX_MS + 2_000).map(turn => turn.turnId))
+      .toEqual(['lark-A', 'lark-B']);
+  });
+
+  it('expires a conflict group atomically when a member is write-held', () => {
+    const a = 'echo foo\nbar with enough content to identify the turn';
+    const b = 'echo foo\\\nbar with enough content to identify the turn';
+    const evidence: Array<{ turnId: string; fullContentMatch: boolean }> = [];
+    const q = new BridgeTurnQueue(undefined, undefined, (turn, e) => {
+      evidence.push({ turnId: turn.turnId, fullContentMatch: e.fullContentMatch });
+    });
+    q.mark('lark-A', makeFingerprint(a), markAt, normaliseForFingerprint(a), 1);
+    q.mark('lark-B', makeFingerprint(b), markAt + 1, normaliseForFingerprint(b), 1);
+    q.ingest([
+      queueOp('enqueue', 1_000, withSoftNewlineResidue(a)),
+      queueOp('enqueue', 2_000, withSoftNewlineResidue(b)),
+    ]);
+    q.holdForWrite('lark-B', 1);
+
+    const at = markAt + 1_000 + CLI_QUEUE_HOLD_MAX_MS + 1;
+    expect(q.pruneExpired(TTL, at).map(turn => turn.turnId)).toEqual(['lark-A', 'lark-B']);
+    q.releaseWriteHold('lark-B', 1, at + 1);
+    q.ingest([
+      user('late-real-A', withSoftNewlineResidue(a), iso(CLI_QUEUE_HOLD_MAX_MS + 2_000)),
+      assistant('assistant-A', 'answer A'),
+      user('real-B', withSoftNewlineResidue(b), iso(CLI_QUEUE_HOLD_MAX_MS + 3_000)),
+      assistant('assistant-B', 'answer B'),
+    ]);
+    expect(q.drainEmittable().filter(turn => turn.turnId.startsWith('lark-'))).toEqual([]);
+    expect(evidence).toEqual([]);
+  });
+
+  it('keeps a dropped member as conflict evidence for late lines', () => {
+    const a = 'echo foo\nbar with enough content to identify the turn';
+    const b = 'echo foo\\\nbar with enough content to identify the turn';
+    const evidence: Array<{ turnId: string; fullContentMatch: boolean }> = [];
+    const q = new BridgeTurnQueue(undefined, undefined, (turn, e) => {
+      evidence.push({ turnId: turn.turnId, fullContentMatch: e.fullContentMatch });
+    });
+    q.mark('lark-A', makeFingerprint(a), markAt, normaliseForFingerprint(a), 1);
+    q.mark('lark-B', makeFingerprint(b), markAt + 1, normaliseForFingerprint(b), 1);
+    q.ingest([
+      queueOp('enqueue', 1_000, withSoftNewlineResidue(a)),
+      queueOp('enqueue', 2_000, withSoftNewlineResidue(b)),
+    ]);
+    expect(q.dropPendingTurn('lark-A', 1)?.turnId).toBe('lark-A');
+
+    // Cancelling A does not prove that A's record will never arrive. Its
+    // tombstone must still prevent B from accepting that late line as its own.
+    q.ingest([
+      user('late-real-A', withSoftNewlineResidue(a), iso(121_000)),
+      assistant('assistant-A', 'answer A'),
+      user('real-B', withSoftNewlineResidue(b), iso(122_000)),
+      assistant('assistant-B', 'answer B'),
+    ]);
+    const ready = q.drainEmittable();
+    expect(ready.map(turn => turn.turnId)).toEqual(['local-late-real-A', 'lark-B']);
+    expect(evidence).toEqual([{ turnId: 'lark-B', fullContentMatch: false }]);
+    expect(q.pruneExpired(TTL, markAt + CLI_QUEUE_HOLD_MAX_MS + 2_000)).toEqual([]);
+  });
+
+  it('does not reuse tombstones after every active member is cancelled', () => {
+    const a = 'echo foo\nbar with enough content to identify the turn';
+    const b = 'echo foo\\\nbar with enough content to identify the turn';
+    const q = new BridgeTurnQueue();
+    q.mark('old-A', makeFingerprint(a), markAt, normaliseForFingerprint(a), 1);
+    q.mark('old-B', makeFingerprint(b), markAt + 1, normaliseForFingerprint(b), 1);
+    q.ingest([queueOp('enqueue', 1_000, withSoftNewlineResidue(a))]);
+    q.dropPendingTurn('old-A', 1);
+    q.dropPendingTurn('old-B', 1);
+
+    q.mark('new-B', makeFingerprint(b), markAt + 10_000, normaliseForFingerprint(b), 1);
+    q.mark('new-A', makeFingerprint(a), markAt + 10_001, normaliseForFingerprint(a), 1);
+    q.ingest([queueOp('enqueue', 20_000, withSoftNewlineResidue(a))]);
+    // The new conflict starts a new bounded window. Retaining the cancelled
+    // group's tombstones would instead merge and expire these marks at the old cap.
+    expect(q.pruneExpired(TTL, markAt + CLI_QUEUE_HOLD_MAX_MS + 10_000)).toEqual([]);
+  });
+
+  it('cleans remaining tombstones when the last active member starts', () => {
+    const a = 'echo foo\nbar with enough content to identify the turn';
+    const b = 'echo foo\\\nbar with enough content to identify the turn';
+    const c = 'echo foo\\\\\nbar with enough content to identify the turn';
+    const q = new BridgeTurnQueue();
+    q.mark('A', makeFingerprint(a), markAt, normaliseForFingerprint(a), 1);
+    q.mark('B', makeFingerprint(b), markAt + 1, normaliseForFingerprint(b), 1);
+    q.mark('C', makeFingerprint(c), markAt + 2, normaliseForFingerprint(c), 1);
+    q.ingest([
+      queueOp('enqueue', 1_000, withSoftNewlineResidue(a)),
+      queueOp('enqueue', 2_000, withSoftNewlineResidue(b)),
+      queueOp('enqueue', 3_000, withSoftNewlineResidue(c)),
+    ]);
+    q.dropPendingTurn('A', 1);
+    q.dropPendingTurn('B', 1);
+    q.ingest([user('real-C', withSoftNewlineResidue(c), iso(4_000)), assistant('answer-C', 'answer C')]);
+    expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['C']);
+
+    // C's real start leaves only cancelled tombstones. They must not merge a
+    // later mark into the old window or reject its valid residue record.
+    q.mark('new-A', makeFingerprint(a), markAt + CLI_QUEUE_HOLD_MAX_MS + 5_000, normaliseForFingerprint(a), 1);
+    q.ingest([
+      user('new-A-user', withSoftNewlineResidue(a), iso(CLI_QUEUE_HOLD_MAX_MS + 6_000)),
+      assistant('new-A-answer', 'new answer'),
+    ]);
+    expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['new-A']);
+  });
+
+  it('does not release a real mark for another input\'s ambiguous clean remove', () => {
+    const a = 'echo foo\nbar with enough content to identify the turn';
+    const local = 'echo foo\\\nbar with enough content to identify the turn';
+    const q = marked(a, 'lark-A');
+    q.ingest([
+      queueOp('enqueue', 1_000, withSoftNewlineResidue(a)),
+      queueOp('enqueue', 1_100, withSoftNewlineResidue(local)),
+    ]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+
+    q.ingest([queueOp('remove', 2_000, local, 'remove-local')]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+    expect(q.pruneExpired(120_000, markAt + 122_001)).toEqual([]);
+    q.ingest([
+      user('late-real-A', withSoftNewlineResidue(a), iso(123_000)),
+      assistant('late-assistant-A', 'late answer'),
+    ]);
+    expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['lark-A']);
+  });
+
+  it('does not hold a mark for an enqueue missing its genuine line-ending backslash', () => {
+    const sent = '<user_message>echo foo\\\nbar with enough content</user_message>';
+    const different = '<user_message>echo foo\nbar with enough content</user_message>';
+    const q = marked(sent);
+    q.ingest([queueOp('enqueue', 1_000, different)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
   });
 
   it('expires a mark with no enqueue record at the TTL, as before', () => {

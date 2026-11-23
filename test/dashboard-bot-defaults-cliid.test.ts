@@ -8,9 +8,10 @@ import {
   CardBehaviorSection,
   patchCardPrefsFromBody,
   CodexAppDisplaySection,
+  OwnerGroupFollowControls,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
-import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
+import { isOnboardingSubmitDisabled, onboardingRetryMode } from '../src/dashboard/web/bot-onboarding.js';
 import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 
 // Profile scanning has its own component/browser tests. Keep these agent-save
@@ -1938,6 +1939,36 @@ describe('bot onboarding Agent availability warning', () => {
     expect(isOnboardingSubmitDisabled(true, 'reuse')).toBe(true);
     expect(isOnboardingSubmitDisabled(false, 'checking')).toBe(true);
   });
+
+  it('keeps a failed local job on the local retry path', () => {
+    expect(onboardingRetryMode({ registrationMode: 'local' })).toBe('local');
+    expect(onboardingRetryMode({ registrationMode: 'web' })).toBe('web');
+    expect(onboardingRetryMode({ registrationMode: 'compat' })).toBe('web');
+  });
+});
+
+describe('owner group follow transport gate', () => {
+  it('shows an unavailable explanation for apiOnly while preserving Feishu controls', () => {
+    const render = (apiOnly: boolean) => {
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(OwnerGroupFollowControls, {
+          bot: { larkAppId: apiOnly ? 'local_x' : 'cli_x', apiOnly },
+          patchBot: vi.fn(),
+        }));
+      });
+      return renderer;
+    };
+    const local = render(true);
+    expect(local.root.findAll(node => node.props['data-owner-group-follow'] !== undefined)).toHaveLength(0);
+    expect(local.root.findAll(node => node.props['data-owner-group-follow-unavailable'] !== undefined)).toHaveLength(1);
+    act(() => { local.unmount(); });
+
+    const feishu = render(false);
+    expect(feishu.root.findAll(node => node.props['data-owner-group-follow'] !== undefined)).toHaveLength(1);
+    expect(feishu.root.findAll(node => node.props['data-owner-group-follow-unavailable'] !== undefined)).toHaveLength(0);
+    act(() => { feishu.unmount(); });
+  });
 });
 
 describe('riff CLI switch persistence (PR #467 P1)', () => {
@@ -2450,6 +2481,44 @@ describe('card behavior defaults', () => {
     expect(renderer.root.findByProps({ 'data-action': 'toggle-streaming-button-terminal' }).props.checked).toBe(false);
   });
 
+  it('places the default-on folded-layout switch beside the live-card buttons and saves both states', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, unknown>) => ({
+      ok: true, status: 200, body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_layout', hiddenStreamingCardButtons: ['close'] }, putCardPref,
+      }));
+    });
+    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-streaming-card-folded-layout' });
+    expect(toggle().props.checked).toBe(true);
+    const group = renderer.root.findByProps({ 'data-card-buttons-group': true });
+    expect(group.findByProps({ 'data-action': 'toggle-streaming-card-folded-layout' })).toBeDefined();
+    await act(async () => { toggle().props.onChange({ currentTarget: { checked: false } }); });
+    expect(putCardPref).toHaveBeenLastCalledWith({ streamingCardFoldedLayout: false });
+    expect(toggle().props.checked).toBe(false);
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-streaming-button-close' }).props.checked).toBe(false);
+    await act(async () => { toggle().props.onChange({ currentTarget: { checked: true } }); });
+    expect(putCardPref).toHaveBeenLastCalledWith({ streamingCardFoldedLayout: true });
+    expect(toggle().props.checked).toBe(true);
+    act(() => renderer.unmount());
+  });
+
+  it('rolls the folded-layout switch back after a failed save', async () => {
+    const putCardPref = vi.fn(async () => ({ ok: false, status: 500, body: { ok: false, error: 'save_failed' } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_layout_fail', streamingCardFoldedLayout: false }, putCardPref,
+      }));
+    });
+    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-streaming-card-folded-layout' });
+    await act(async () => { toggle().props.onChange({ currentTarget: { checked: true } }); });
+    expect(toggle().props.checked).toBe(false);
+    act(() => renderer.unmount());
+  });
+
   it('renders live-card controls in the compact button grid', () => {
     const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } }));
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -2639,6 +2708,11 @@ describe('reply footer controls', () => {
 
 
 describe('card pref save response backfills tool visibility onto the page row', () => {
+  it('clears stale classic layout when the response restores the default', () => {
+    const base = { larkAppId: 'layout', streamingCardFoldedLayout: false };
+    expect(patchCardPrefsFromBody(base, {}).streamingCardFoldedLayout).toBe(true);
+    expect(patchCardPrefsFromBody(base, { streamingCardFoldedLayout: false }).streamingCardFoldedLayout).toBe(false);
+  });
   it('maps replyCardShowTools from the PUT response body back onto the bot row', () => {
     const base = { larkAppId: 'cli_show_tools_backfill' };
     expect(patchCardPrefsFromBody(base, { replyCardShowTools: false }).replyCardShowTools).toBe(false);

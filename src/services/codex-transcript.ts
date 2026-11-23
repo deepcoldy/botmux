@@ -1,3 +1,4 @@
+import { appliedReasoningSelectionFromRecord, type AppliedReasoningSelection } from './native-reasoning-observation.js';
 /**
  * Reader for Codex's per-session rollout JSONL.
  *
@@ -50,6 +51,7 @@ import {
   type Dirent,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { nativeGoalFromEvent, type NativeGoalState } from './native-goal-state.js';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { codexHome, codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
@@ -58,6 +60,7 @@ import type { CodexThreadSettings } from './codex-service-tier.js';
 // cot-subject 与 process-open-files 只用语言/Node 内建，等价于内联，不违反本模块 dependency-free 口径。
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import { boundSubjectForTransport, subjectFromArgsString, subjectFromInputObject } from './cot-subject.js';
+import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 
 const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
 const UNTRUSTED_SESSION_SCAN_MAX_ENTRIES = 50_000;
@@ -180,6 +183,55 @@ export function codexHistorySidIsOwned(
   return ownedRollouts.has(cliSessionId.toLowerCase());
 }
 
+/** Select the sole top-level conversation id from the rollout files a live
+ *  Codex process holds open.
+ *
+ *  Codex keeps internal/subagent rollouts (`thread_source !== 'user'`,
+ *  `source.subagent`, `source.internal`) open alongside the user's top-level
+ *  rollout in the same process. Unlike `findCodexRolloutByPid`, which inspects
+ *  filenames alone and treats any multi-rollout fd table as ambiguous, this
+ *  helper verifies the first JSON record of every open rollout fd:
+ *   - Any unreadable, empty, partial-line, or invalid-JSON rollout fails closed
+ *     (`undefined`), because a newly opened file whose header is still being
+ *     flushed could be a `/new` top-level conversation.
+ *   - Verified `session_meta` rows flagged by `isInternalCodexSessionMeta` are
+ *     excluded as runtime helpers rather than top-level conversations.
+ *   - Every remaining rollout must agree on a single case-insensitive
+ *     `cliSessionId` (with `session_meta.payload.id`, when present, matching
+ *     the filename id); zero or multiple top-level ids return `undefined`. */
+export function selectCodexLiveSessionIdFromPaths(targets: Iterable<string>): string | undefined {
+  const byPath = new Map<string, CodexRolloutRef>();
+  for (const target of targets) {
+    const hit = matchCodexRolloutPath(target);
+    if (hit && !byPath.has(hit.path)) byPath.set(hit.path, hit);
+  }
+  if (byPath.size === 0) return undefined;
+  let topLevelId: string | undefined;
+  for (const hit of byPath.values()) {
+    const header = rolloutHeaderCheck(hit.path);
+    if (!header.verified) return undefined;
+    if (header.internal) continue;
+    if (header.sid && header.sid.toLowerCase() !== hit.cliSessionId.toLowerCase()) {
+      return undefined;
+    }
+    if (!topLevelId) {
+      topLevelId = hit.cliSessionId;
+    } else if (topLevelId.toLowerCase() !== hit.cliSessionId.toLowerCase()) {
+      return undefined;
+    }
+  }
+  return topLevelId;
+}
+
+/** Resolve the sole live top-level conversation id owned by `pid` from its
+ *  open rollout file descriptors, ignoring internal/subagent helper rollouts
+ *  while failing closed on unverified or multi-conversation fd tables. */
+export function readCodexLiveSessionId(pid: number): string | undefined {
+  const targets = listProcessOpenFiles(pid);
+  if (!targets) return undefined;
+  return selectCodexLiveSessionIdFromPaths(targets);
+}
+
 function findSingleCodexRollout(targets: Iterable<string>): CodexRolloutRef | undefined {
   let found: CodexRolloutRef | undefined;
   for (const target of targets) {
@@ -225,6 +277,16 @@ export interface CodexBridgeEvent {
    *  offset and of parse-time timestamp fallbacks. Absent only for events
    *  synthesized without a single backing record. */
   rawId?: string;
+  /** Byte offset of the originating record in this rollout generation. Kept
+   *  separately from {@link uuid} so content-addressed stable ids do not erase
+   *  the physical ordering evidence needed for deferred tool records. */
+  rolloutOffset?: number;
+  /** Rollout file that owns {@link rolloutOffset}. Byte offsets from different
+   *  generations have different origins and must never be ordered directly. */
+  rolloutPath?: string;
+  /** Physical tool-progress position for drivers without native timestamps.
+   * Compared only with the same file's submit cursor; never final evidence. */
+  progressCursor?: { jsonlPath: string; offset: number };
   /** Wall-clock ms parsed from the event's `timestamp` field. Falls back
    *  to Date.now() if missing/unparseable so the gate's window math still
    *  has something to compare against. */
@@ -249,11 +311,24 @@ export interface CodexBridgeEvent {
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
+  /** Model recorded on this final answer by its native transcript. */
+  replyModel?: string;
+  replyReasoningEffort?: string;
   /** Exact alternative input spellings proved by the CLI's user record
-   * (e.g. TRAE's native skill expansion). Never derived from assistant text. */
+   * (e.g. TRAE's native skill expansion). An empty list requires the recorded
+   * input itself to match exactly. Never derived from assistant text. */
   inputTextAliases?: string[];
   /** For kind 'cot': the thinking / tool-call entries parsed from this line. */
   cotEntries?: CodexCotEntry[];
+  /** For kind 'cot' (Codex): the text of an assistant message written inside
+   *  the turn — commentary, or the final answer just before `task_complete`.
+   *  Never a turn boundary and never part of the thinking timeline; it lets
+   *  the worker see what the model said right after a same-turn steer. */
+  assistantMessage?: string;
+  /** For kind 'cot' (Codex): the model called a tool here, but the call's
+   *  thinking-timeline entry is deferred (a wrapped shell call surfaces when
+   *  its command completes, or at the turn's end). Marks the moment only. */
+  toolCallBoundary?: true;
   /** Optional durable-delivery terminal outcome carried by bridges with an
    *  explicit completion record (for example Grok `turn_completed`). Codex
    *  final-answer records omit it and retain the historical completed
@@ -907,6 +982,9 @@ export function splitCodexEventsByCutoff(
 }
 
 export interface CodexDrainResult {
+  latestGoal?: NativeGoalState | null;
+  /** Native settings selection ACK, observed without waiting for turn_context. */
+  latestReasoningSelection?: import('./native-reasoning-observation.js').AppliedReasoningSelection;
   events: CodexBridgeEvent[];
   /** Byte offset of the last fully-parsed line + its trailing \n. The next
    *  drain should pass this back as fromOffset. */
@@ -948,6 +1026,7 @@ export interface CodexDrainState {
   nextOffset: number;
   turnStartOffset: number;
   activeNativeTurnId?: string;
+  activeTurnRuntime?: RolloutRuntimeSnapshot & { turnId: string };
   sourceSessionId?: string;
   sourcePath?: string;
 }
@@ -1001,9 +1080,11 @@ const SESSION_META_HEADER_MAX_BYTES = 1024 * 1024;
  *  - unverified: no complete first line could be read (missing, being
  *    written, larger than the cap, symlink refusal, IO/parse error). Callers
  *    that need positive identification must treat unverified as untrusted. */
-type RolloutHeaderCheck = { verified: true; sid: string | null } | { verified: false };
+type RolloutHeaderCheck =
+  | { verified: true; sid: string | null; internal: boolean }
+  | { verified: false };
 
-function rolloutHeaderCheck(path: string, noFollow = false): RolloutHeaderCheck {
+export function rolloutHeaderCheck(path: string, noFollow = false): RolloutHeaderCheck {
   let fd: number | undefined;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | (noFollow ? constants.O_NOFOLLOW : 0));
@@ -1031,11 +1112,16 @@ function rolloutHeaderCheck(path: string, noFollow = false): RolloutHeaderCheck 
     if (!complete) return { verified: false };
     let row: any;
     try { row = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return { verified: false }; }
+    const isMeta = row?.type === 'session_meta'
+      && !!row.payload
+      && typeof row.payload === 'object'
+      && !Array.isArray(row.payload);
     return {
       verified: true,
-      sid: row?.type === 'session_meta' && typeof row.payload?.id === 'string'
+      sid: isMeta && typeof row.payload.id === 'string'
         ? row.payload.id
         : null,
+      internal: isMeta && isInternalCodexSessionMeta(row.payload),
     };
   } catch { return { verified: false }; }
   finally { if (fd !== undefined) closeSync(fd); }
@@ -1715,7 +1801,9 @@ export function drainCodexRollout(
 
   const events: CodexBridgeEvent[] = [];
   const spawnedSubagents: CodexSpawnedSubagent[] = [];
+  let latestGoal: NativeGoalState | null | undefined;
   let latestThreadSettings: CodexThreadSettings | undefined;
+  let latestReasoningSelection: AppliedReasoningSelection | undefined;
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
   // Remember both deferred and ordinary calls seen in this drain. A plain
@@ -1736,6 +1824,7 @@ export function drainCodexRollout(
   };
   const turnExecEntries: TerminalExecEntry[] = [];
   let activeNativeTurnId = reusableState?.activeNativeTurnId;
+  let activeTurnRuntime = reusableState?.activeTurnRuntime;
   let nativeContextKnown = start === 0 || reusableState?.activeNativeTurnId !== undefined;
   let sourceSessionId = reusableState?.sourceSessionId;
   // Walk lines with their byte offsets so synthetic uuids are stable across
@@ -1746,6 +1835,7 @@ export function drainCodexRollout(
     const settings = codexThreadSettingsFromEvent(obj);
     if (settings) {
       latestThreadSettings = settings;
+      latestReasoningSelection = appliedReasoningSelectionFromRecord(obj) ?? latestReasoningSelection;
       continue;
     }
     // turn_context carries the executor model/effort on every turn (latest-wins,
@@ -1755,11 +1845,18 @@ export function drainCodexRollout(
     if (runtime) {
       if (runtime.model) latestModel = runtime.model;
       if (runtime.reasoningEffort) latestReasoningEffort = runtime.reasoningEffort;
+      const turnId = obj.payload.turn_id;
+      if (typeof turnId === 'string' && turnId) {
+        activeTurnRuntime = { ...runtime, turnId };
+        resolveTurnStartOffset();
+      }
       continue;
     }
     const p = obj?.payload;
     if (!p || typeof p !== 'object') continue;
     if (obj.type === 'session_meta' && typeof p.id === 'string' && p.id) sourceSessionId = p.id;
+    const goal = nativeGoalFromEvent(obj, sourceSessionId);
+    if (goal !== undefined) latestGoal = goal;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     const lineId = codexRolloutLineId(line);
@@ -1828,13 +1925,26 @@ export function drainCodexRollout(
     // collecting turn for the native CoT message; they never start or close
     // a turn (the boundaries above/below stay authoritative).
     if (obj.type === 'response_item') {
+      // Assistant messages: the final answer is still taken from task_complete
+      // (see below); this only exposes what the model said mid-turn.
+      if (p.type === 'message' && p.role === 'assistant') {
+        const message = joinTextBlocks(p.content, 'output_text');
+        if (message.trim()) {
+          events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries: [], assistantMessage: message });
+        }
+        continue;
+      }
       if (p.type === 'custom_tool_call' && typeof p.call_id === 'string' && p.call_id) {
         const deferred = p.name === 'exec' && hasWrappedExecCommand(typeof p.input === 'string' ? p.input : '');
         toolCallDeferralById.set(p.call_id, deferred);
-        if (deferred) continue;
+        if (deferred) {
+          events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries: [], toolCallBoundary: true });
+          continue;
+        }
       }
       if (p.type === 'function_call' && p.name === 'exec_command' && typeof p.call_id === 'string' && p.call_id) {
         toolCallDeferralById.set(p.call_id, true);
+        events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries: [], toolCallBoundary: true });
         continue;
       }
       if ((p.type === 'custom_tool_call_output' || p.type === 'function_call_output')
@@ -1874,6 +1984,7 @@ export function drainCodexRollout(
       && (p.type === 'task_complete' || p.type === 'turn_aborted')
       && (typeof p.turn_id !== 'string' || p.turn_id.length === 0)) {
       activeNativeTurnId = undefined;
+      activeTurnRuntime = undefined;
       nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
@@ -1896,6 +2007,7 @@ export function drainCodexRollout(
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
       const failed = p.error !== null && p.error !== undefined;
+      const replyRuntime = activeTurnRuntime?.turnId === p.turn_id ? activeTurnRuntime : undefined;
       const failureLimitKind = failed ? codexRolloutLimitKind(p.error) : undefined;
       const terminalTurnStart = turnFullyCovered
         ? (turnStartOffset ?? start)
@@ -1912,6 +2024,8 @@ export function drainCodexRollout(
         timestampMs,
         kind: 'assistant_final',
         text: typeof p.last_agent_message === 'string' ? p.last_agent_message : '',
+        ...(replyRuntime?.model ? { replyModel: replyRuntime.model } : {}),
+        ...(replyRuntime?.reasoningEffort ? { replyReasoningEffort: replyRuntime.reasoningEffort } : {}),
         ...(failed ? {
           terminalStatus: 'failed' as const,
           terminalErrorCode: codexRolloutFailureCode(p.error),
@@ -1922,6 +2036,7 @@ export function drainCodexRollout(
         ...(sourceSessionId ? { sourceSessionId } : {}),
       });
       activeNativeTurnId = undefined;
+      activeTurnRuntime = undefined;
       nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
@@ -1957,6 +2072,7 @@ export function drainCodexRollout(
         ...(sourceSessionId ? { sourceSessionId } : {}),
       });
       activeNativeTurnId = undefined;
+      activeTurnRuntime = undefined;
       nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
@@ -1974,14 +2090,17 @@ export function drainCodexRollout(
     newOffset,
     pendingTail,
     latestThreadSettings,
+    ...(latestReasoningSelection ? { latestReasoningSelection } : {}),
     latestModel,
     latestReasoningEffort,
+    ...(latestGoal !== undefined ? { latestGoal } : {}),
     ...(spawnedSubagents.length > 0 ? { spawnedSubagents } : {}),
     ...(turnStartOffset !== undefined ? {
       state: { nextOffset: newOffset, turnStartOffset,
         ...(activeNativeTurnId ? { activeNativeTurnId } : {}),
+        ...(activeTurnRuntime ? { activeTurnRuntime } : {}),
         ...(sourceSessionId ? { sourceSessionId } : {}),
-        ...(activeNativeTurnId || sourceSessionId ? { sourcePath: path } : {}),
+        ...(activeNativeTurnId || activeTurnRuntime || sourceSessionId ? { sourcePath: path } : {}),
       },
     } : {}),
   };

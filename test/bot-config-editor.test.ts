@@ -492,6 +492,12 @@ describe('applyBotConfigEdits', () => {
     expect(edited.backendType).toBe('zmx');
   });
 
+  it('accepts hc as a backendType and still rejects unknown ones', () => {
+    const base = { larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code' };
+    expect(applyBotConfigEdits(base, { backendType: 'hc' }).backendType).toBe('hc');
+    expect(() => applyBotConfigEdits(base, { backendType: 'herdr-core' })).toThrow(/hc/);
+  });
+
   it('accepts remote-runner as a backendType', () => {
     const edited = applyBotConfigEdits({
       larkAppId: 'cli_remote_runner',

@@ -1,3 +1,4 @@
+import { normalizeDelegatedSlashCommand } from './delegated-slash.js';
 /**
  * 命令路由器 —— 斜杠命令的**分类层**（设计 docs/design/2026-09-11-command-router.md R1 / §5）。
  *
@@ -39,7 +40,13 @@ export interface SlashCommandInvocation {
  *  are intentionally left for the CLI instead of being intercepted by the
  *  daemon; otherwise discussion text such as `/adopt <pane>` can accidentally
  *  trigger real daemon actions. */
-export function parseSlashCommandInvocation(content: string, cliId?: string): SlashCommandInvocation | null {
+export function parseSlashCommandInvocation(
+  content: string,
+  cliId?: string,
+  /** Commands that accept a multi-line body for this message only (see
+   *  `SlashRouteInput.multilineCommands`); on top of MULTILINE_COMMANDS. */
+  multilineCommands?: ReadonlySet<string>,
+): SlashCommandInvocation | null {
   // trim BOTH ends: a trailing newline/space rides into the returned `content`
   // and, for a passthrough command relayed verbatim to the CLI (raw_input), gets
   // typed as a literal trailing newline — which breaks the CLI's slash-command
@@ -67,7 +74,7 @@ export function parseSlashCommandInvocation(content: string, cliId?: string): Sl
   if (restNonBlank.length > 0) {
     // A list of slash commands is almost certainly discussion / planning text.
     if (!literalBody && restNonBlank.some(l => l.startsWith('/'))) return null;
-    if (!MULTILINE_COMMANDS.has(cmd) && !cliPayload) return null;
+    if (!MULTILINE_COMMANDS.has(cmd) && !multilineCommands?.has(cmd) && !cliPayload) return null;
   }
 
   return { cmd, content: trimmed };
@@ -108,9 +115,17 @@ export interface SlashRouteInput {
    *  与 isDisposableCommandScratch 不同）。只影响「仅无会话时认领」的命令（`/resume`）：空壳不算
    *  会话。缺省 = 不是空壳。 */
   sessionIsCommandScratch?: boolean;
+  /** A persisted backend runtime is real session evidence even before the first conversation turn. */
+  sessionHasBackendState?: boolean;
+  /** Precomputed opt-in set, empty unless the effective backend is remote-runner. */
+  delegatedCommands?: ReadonlySet<string>;
   /** 当前 bot 有效插件声明的飞书指令：指令名 → pluginId（两个插件同名时为 null，执行段 fail closed）。
    *  缺省 = 无插件指令，判定与改造前逐字一致。 */
   pluginCommands?: ReadonlyMap<string, string | null>;
+  /** 本条消息额外接受多行正文的命令（按 bot 配置 + 本条正文由入口算好）。今天只有
+   *  `/g` 带任务开工时（首行 `--start`，或 `groupCreation.autoStart: true` 且无
+   *  `--no-start`）才放进来；缺省 = 判定与改造前逐字一致。 */
+  multilineCommands?: ReadonlySet<string>;
 }
 
 /** runtime 级联的一项：透传命令行，或最后的正文。 */
@@ -130,6 +145,9 @@ export type SlashRouteDecision =
   | { kind: 'passthrough'; cmd: string; content: string; delivery: 'cold_start' | 'to_session' }
   /** botmux 自己的命令，带无会话时的会话政策。 */
   | { kind: 'daemon'; cmd: string; content: string; sessionPolicy: 'sessionless' | 'existing_only' | 'precreate' | 'existing' }
+  /** Remote Runner 显式下放的会话绑定命令：入口授权后带原文走普通结构化 turn。
+   *  unbound = 无会话的 detach，直接回复无绑定，不建会话、不启动 provider。 */
+  | { kind: 'delegated_turn'; cmd: string; content: string; sessionPolicy: 'precreate' | 'existing' | 'unbound' }
   /** 插件声明的飞书指令：不建会话、不进 CLI，由入口转给插件服务。pluginId 为 null = 同名冲突。 */
   | { kind: 'plugin'; cmd: string; content: string; pluginId: string | null }
   /** runtime 级联（PR-3）：≥1 条透传命令行 + 可选正文，按书写顺序逐条等 CLI 空闲后送出（§6）。 */
@@ -172,7 +190,7 @@ export function parseRuntimeCascade(text: string, passthrough: ReadonlySet<strin
 export type SlashCommandDecision = Extract<SlashRouteDecision, { cmd: string; content: string }>;
 
 export function isCommandDecision(decision: SlashRouteDecision): decision is SlashCommandDecision {
-  return decision.kind === 'special' || decision.kind === 'passthrough' || decision.kind === 'daemon';
+  return decision.kind === 'special' || decision.kind === 'passthrough' || decision.kind === 'daemon' || decision.kind === 'delegated_turn';
 }
 
 export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
@@ -182,7 +200,7 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
   }
 
   // ② parse：不以 `/` 开头是"没有命令"；占位符/多行是"讨论文本"。
-  const invocation = parseSlashCommandInvocation(input.text, input.cliId);
+  const invocation = parseSlashCommandInvocation(input.text, input.cliId, input.multilineCommands);
   if (!invocation) {
     if (!input.text.trim().startsWith('/')) return { kind: 'forward', reason: 'no_slash' };
     // 多行被今天的解析器判成"讨论文本"的，只在「thread + 活 worker + 无附件」下再试一次
@@ -198,6 +216,13 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
   //    所以先后顺序不可观测。
   const special = ROUTE_SPECIAL_COMMANDS.get(cmd);
   if (special) return { kind: 'special', cmd, content, handler: special };
+
+  const delegated = normalizeDelegatedSlashCommand(cmd);
+  if (delegated && input.delegatedCommands?.has(delegated)) {
+    const hasSession = phaseHasSession(input.phase) && input.phase !== 'closed' && (!input.sessionIsCommandScratch || input.sessionHasBackendState === true);
+    return { kind: 'delegated_turn', cmd, content,
+      sessionPolicy: hasSession ? 'existing' : delegated === '/adopt' ? 'precreate' : 'unbound' };
+  }
 
   const spec = commandSpec(cmd);
   const cliCommand = spec?.cliId !== undefined && commandCliIdMatches(spec.cliId, input.cliId);

@@ -46,6 +46,11 @@ import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-cap
 import { recordedSandboxTreeFlavour } from '../src/adapters/backend/sandbox-tree-teardown.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
 import { onTestProcessExit } from './helpers/exit-cleanup.js';
+import {
+  killPrivateTmuxServer,
+  registerSandboxScriptForCleanup,
+  registerTmuxServer,
+} from '../scripts/test-process-reaper.mjs';
 
 type SandboxFlavour = 'off' | 'credential-only' | 'oncall' | 'scratch';
 type Backend = 'tmux' | 'pty';
@@ -76,6 +81,8 @@ function runtimeAvailable(flavour: SandboxFlavour): boolean {
 }
 
 interface RelayResponse { code?: number; stdout?: string; stderr?: string }
+/** Present in the fake CLI's own directory: it fails at startup (see createLab). */
+const DIE_ON_START_BASENAME = 'die-on-start';
 interface Report { event: string; relay?: string | null; id?: string; error?: string }
 
 /** One hermetic session on a private tmux server, driven by real workers. */
@@ -127,6 +134,10 @@ function createLab(opts: { flavour: SandboxFlavour; backend: Backend }) {
 const fs = require('node:fs');
 const path = require('node:path');
 if (process.argv.includes('--version')) { console.log('2.1.0 (Claude Code)'); process.exit(0); }
+if (fs.existsSync(path.join(__dirname, ${JSON.stringify(DIE_ON_START_BASENAME)}))) {
+  console.error('fake-cli: injected startup failure');
+  process.exit(3);
+}
 const relay = process.env.BOTMUX_SEND_RELAY || null;
 const reportFile = path.join(relay || __dirname, 'fake-cli-report.jsonl');
 const report = (entry) => { try { fs.appendFileSync(reportFile, JSON.stringify(entry) + '\\n'); } catch {} };
@@ -157,6 +168,7 @@ process.stdin.on('data', (chunk) => {
 console.log('Ready >');
 setInterval(() => {}, 1 << 30);
 `, { mode: 0o755 });
+  registerSandboxScriptForCleanup(script);
   const reportFile = (): string => join(flavour === 'off' ? workDir : outbox, 'fake-cli-report.jsonl');
   const bin = join(dir, 'bin');
   mkdirSync(bin);
@@ -178,8 +190,60 @@ setInterval(() => {}, 1 << 30);
   // exited unexpectedly`. Scoped to the pane so unrelated kills/probes
   // (diagnostic sessions, backend selection) neither arm nor count.
   const exitingServerFlag = join(dir, 'exiting-server-on-post-kill-probe');
+  // `failPipePane` creates THIS session first, then rejects its subscription,
+  // exercising a spawn failure after the pane exists.
+  const failPipePaneFlag = join(dir, 'fail-pipe-pane');
+  // `cliDiesBeforePipePane` makes the fake CLI print one line and exit 3 the
+  // moment it starts. The shim splits the creating queue and holds only its
+  // pipe-pane suffix until tmux reports the pane dead, preserving the #3470
+  // diagnostic shape without delaying (and timing out) new-session itself.
+  const holdPipePaneFlag = join(dir, 'hold-pipe-pane-until-dead');
   const paneMarker = isolationPaneMarkerPath(dataDir, sessionId);
+  const interruptPipePane = join(dir, 'interrupt-pipe-pane.cjs');
+  writeFileSync(interruptPipePane, `
+const { spawnSync } = require('node:child_process');
+const [mode, real, socketPath, pane, ...args] = process.argv.slice(2);
+const create = args.indexOf('new-session');
+const boundary = args.lastIndexOf(';');
+const queued = create >= 0 && boundary > create && args.slice(boundary + 1)
+  .some(arg => arg === 'pipe-pane' || arg.startsWith('pipe-pane '));
+const run = argv => {
+  const result = spawnSync(real, ['-S', socketPath, ...argv], { stdio: 'inherit' });
+  if (result.error) console.error(String(result.error));
+  return result.error ? 1 : (result.status ?? 1);
+};
+if (mode === 'fail' && !queued) {
+  console.error('pipe-pane refused by test');
+  process.exit(1);
+}
+// Execute new-session and remain-on-exit first. Their printed identity must
+// reach the caller exactly as it does when a real queued subscription fails.
+if (queued) {
+  const status = run(args.slice(0, boundary));
+  if (status !== 0) process.exit(status);
+}
+if (mode === 'hold') {
+  for (let i = 0; i < 400; i++) {
+    const reply = spawnSync(real, [
+      '-S', socketPath, 'display-message', '-p', '-t', pane, '#{pane_dead}',
+    ], { encoding: 'utf8' });
+    if (reply.stdout.trim() === '1') break;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
+}
+if (mode === 'fail') {
+  console.error('pipe-pane refused by test');
+  process.exit(1);
+}
+process.exit(run(queued ? args.slice(boundary + 1) : args));
+`, { mode: 0o700 });
   writeFileSync(join(bin, 'tmux'), `#!/bin/sh
+# A strict worker pins its server with a leading explicit
+# \`-S <root>/tmux-<uid>/<label>\` (tmuxSocketArgs with a socket root). tmux
+# honours the LAST -S, which would beat this lab's own -S below and send the
+# call to a server that does not exist here; drop it so every call still lands
+# on the lab's private server, exactly like a -L or default-server call.
+if [ "$1" = -S ]; then shift 2; fi
 if [ -e '${failNewSessionFlag}' ]; then
   creating=0; ours=0
   for arg in "$@"; do
@@ -216,6 +280,18 @@ if [ -e '${exitingServerFlag}' ]; then
         echo 'server exited unexpectedly' >&2; exit 1
       fi
     done
+  fi
+fi
+if [ -e '${failPipePaneFlag}' ] || [ -e '${holdPipePaneFlag}' ]; then
+  mode=fail
+  [ -e '${holdPipePaneFlag}' ] && mode=hold
+  piping=0; ours=0
+  for arg in "$@"; do
+    case "$arg" in *pipe-pane*) piping=1 ;; esac
+    case "$arg" in *'${paneTarget}'*) ours=1 ;; esac
+  done
+  if [ $piping = 1 ] && [ $ours = 1 ]; then
+    exec node '${interruptPipePane}' "$mode" '${realTmux}' '${socket}' '${paneTarget}' "$@"
   fi
 fi
 if [ -e '${corruptProofFlag}' ]; then
@@ -259,9 +335,15 @@ exec '${realTmux}' -S '${socket}' "$@"
     ...(flavour === 'scratch' ? { sandbox: 'scratch', scratchStorage } : {}),
   });
   const workers = new Set<ChildProcess>();
-  const tmuxCommand = (args: string[]) => spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
+  const tmuxCommand = (args: string[]) => {
+    const result = spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
+    // The lab deliberately uses the real binary for its private socket; record
+    // the same durable identity the fence shim would capture on PATH.
+    registerTmuxServer(realTmux!, socket);
+    return result;
+  };
   const lab = {
-    sessionId, dataDir, sessionRoot, outbox, capabilityLeaf, script,
+    sessionId, dataDir, sessionRoot, outbox, capabilityLeaf, script, socket,
     reports: (): Report[] => readJsonLines<Report>(reportFile()),
     starts: (): Report[] => lab.reports().filter(entry => entry.event === 'start'),
     paneAlive: (): boolean => tmuxCommand(['has-session', '-t', paneTarget]).status === 0,
@@ -272,7 +354,12 @@ exec '${realTmux}' -S '${socket}' "$@"
       try { process.kill(pid, 0); return true; } catch { return false; }
     },
     failNewSession: (): void => writeFileSync(failNewSessionFlag, ''),
+    failPipePane: (): void => writeFileSync(failPipePaneFlag, ''),
     corruptProofOnPipePane: (): void => writeFileSync(corruptProofFlag, ''),
+    cliDiesBeforePipePane: (): void => {
+      writeFileSync(join(workDir, DIE_ON_START_BASENAME), '');
+      writeFileSync(holdPipePaneFlag, '');
+    },
     exitingServerOnPostKillProbes: (ordinals: number[]): void => {
       if (ordinals.length) writeFileSync(exitingServerFlag, ordinals.join(' '));
     },
@@ -334,7 +421,13 @@ exec '${realTmux}' -S '${socket}' "$@"
     },
     start(
       bootId: string,
-      startOpts: { env?: NodeJS.ProcessEnv; crashHook?: boolean; flavour?: SandboxFlavour; envPolicy?: { mode: 'strict' } } = {},
+      startOpts: {
+        env?: NodeJS.ProcessEnv;
+        crashHook?: boolean;
+        flavour?: SandboxFlavour;
+        envPolicy?: { mode: 'strict' };
+        adoptTarget?: string;
+      } = {},
     ): { worker: ChildProcess; logs: () => string; errors: () => string[] } {
       if (startOpts.flavour) applyFlavour(startOpts.flavour);
       const workerEnv = { ...env, ...startOpts.env };
@@ -353,7 +446,11 @@ exec '${realTmux}' -S '${socket}' "$@"
       worker.on('message', (message: { type?: string; message?: string }) => {
         if (message?.type === 'error') errors.push(String(message.message));
       });
-      worker.send({ ...init(bootId), ...(startOpts.envPolicy ? { envPolicy: startOpts.envPolicy } : {}) });
+      worker.send({
+        ...init(bootId),
+        ...(startOpts.adoptTarget ? { adoptMode: true, adoptTmuxTarget: startOpts.adoptTarget } : {}),
+        ...(startOpts.envPolicy ? { envPolicy: startOpts.envPolicy } : {}),
+      });
       return { worker, logs: () => logs, errors: () => errors };
     },
     async stop(worker: ChildProcess, how: 'SIGTERM' | 'transfer' | 'close'): Promise<void> {
@@ -377,7 +474,7 @@ exec '${realTmux}' -S '${socket}' "$@"
    *  pane outlives a worker by design), the CLI, the scratch overlay, the dir. */
   const takeDown = (): void => {
     for (const worker of workers) { try { worker.kill('SIGKILL'); } catch { /* gone */ } }
-    try { execFileSync(realTmux!, ['-S', socket, 'kill-server'], { stdio: 'ignore' }); } catch { /* gone */ }
+    killPrivateTmuxServer(realTmux!, socket);
     for (const pid of lab.cliHostPids()) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
     // Never leave a host overlay / tmpfs slot behind a failed assertion.
     if (everScratch) teardownScratchSession(sessionId, dataDir);
@@ -508,17 +605,46 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
     }
   }, 120_000);
 
-  // tmux creates the detached pane first, then the FIFO / wake fd / pipe-pane.
-  // A failure after the pane exists must retire exactly that pane before the
-  // tree goes — and keep the tree when that cannot be proven.
+  // tmux prepares the FIFO/reader, then creates the pane and subscribes in one
+  // server queue. A subscription failure after the pane exists must retire
+  // exactly that pane before the tree goes — and keep the tree when that cannot
+  // be proven.
   it.skipIf(!realTmux || !runtime)('tmux × fresh launch failing after its pane exists: retires that pane, then rolls the tree back', async () => {
     const lab = createLab({ flavour, backend: 'tmux' });
     try {
-      const first = lab.start('boot-1', { env: { BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL: '1' } });
+      lab.failPipePane();
+      const first = lab.start('boot-1');
       await workerExit(first);
-      expect(first.errors().join('\n'), first.logs()).toContain('EMFILE: injected by test');
+      expect(first.errors().join('\n'), first.logs()).toContain('pipe-pane refused by test');
       expect(first.logs()).toContain('retired the tmux session it had created');
       expect(lab.paneAlive()).toBe(false);
+      expect(existsSync(lab.sessionRoot), first.logs()).toBe(false);
+      if (flavour === 'scratch') {
+        expect(isMountpoint(join(lab.sessionRoot, 'root'))).toBe(false);
+        expect(existsSync(join('/var/tmp/botmux-scratch', lab.sessionId))).toBe(false);
+      }
+    } finally {
+      await lab.dispose();
+    }
+  }, 120_000);
+
+  // #3470: the CLI chain in the fresh pane exits before pipe-pane attaches, so
+  // tmux answers `target pane has exited`. The dead pane is retired and the
+  // tree rolled back as for any post-pane failure — and the worker's own log
+  // must say WHY (exit status, last screen). That reason used to travel only
+  // in the IPC error, so a CI flake of this shape showed nothing but
+  // "retired the tmux session it had created".
+  it.skipIf(!realTmux || !runtime)('tmux × fresh launch whose CLI exits before pipe-pane attaches: retires the dead pane, rolls the tree back, logs the pane\'s exit reason', async () => {
+    const lab = createLab({ flavour, backend: 'tmux' });
+    try {
+      lab.cliDiesBeforePipePane();
+      const first = lab.start('boot-1');
+      await workerExit(first);
+      expect(first.errors().join('\n'), first.logs()).toContain('fake-cli: injected startup failure');
+      expect(first.logs()).toContain('retired the tmux session it had created');
+      expect(first.logs(), first.errors().join('\n')).toContain('fake-cli: injected startup failure');
+      expect(lab.paneAlive()).toBe(false);
+      expect(lab.starts()).toEqual([]);
       expect(existsSync(lab.sessionRoot), first.logs()).toBe(false);
       if (flavour === 'scratch') {
         expect(isMountpoint(join(lab.sessionRoot, 'root'))).toBe(false);
@@ -533,9 +659,10 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
     const lab = createLab({ flavour, backend: 'tmux' });
     try {
       lab.failKillSession(true);
-      const first = lab.start('boot-1', { env: { BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL: '1' } });
+      lab.failPipePane();
+      const first = lab.start('boot-1');
       await workerExit(first);
-      expect(first.errors().join('\n'), first.logs()).toContain('EMFILE: injected by test');
+      expect(first.errors().join('\n'), first.logs()).toContain('pipe-pane refused by test');
       expect(first.logs()).toContain('keeping the sandbox tree for the pane that may still run');
       expect(lab.paneAlive()).toBe(true);
       expect(existsSync(lab.outbox), first.logs()).toBe(true);
@@ -758,6 +885,47 @@ describe('unsandboxed session across a real worker lifecycle', () => {
       await lab.stop(second.worker, 'close');
       expect(lab.paneAlive()).toBe(false);
       expect(existsSync(lab.sessionRoot)).toBe(false);
+    } finally {
+      await lab.dispose();
+    }
+  }, 120_000);
+
+  it.skipIf(!realTmux)('tmux × dead adopted pane: keeps off-screen history out of the fatal IPC error', async () => {
+    const lab = createLab({ flavour: 'off', backend: 'tmux' });
+    const marker = `offscreen-${randomUUID()}`;
+    const adoptSession = 'adopted-dead';
+    const adoptTarget = `${adoptSession}:0.0`;
+    const tmux = (args: string[]) => spawnSync(realTmux!, ['-S', lab.socket, ...args], { encoding: 'utf8' });
+    try {
+      // Build a long-lived user's pane, then scroll a private line off the
+      // visible screen before the CLI dies. The marker must remain within the
+      // 50-line history window so removing the fresh-only gate makes this red.
+      expect(tmux(['new-session', '-d', '-s', adoptSession, '-x', '80', '-y', '24', '/bin/sh']).status).toBe(0);
+      expect(tmux(['set-option', '-t', adoptSession, 'remain-on-exit', 'on']).status).toBe(0);
+      const adoptScript = join(lab.dataDir, 'adopt-dead.sh');
+      writeFileSync(adoptScript, `printf '%s\\n' '${marker}'
+i=0
+while [ "$i" -lt 30 ]; do
+  printf 'f-%s\\n' "$i"
+  i=$((i+1))
+done
+exit 3
+`);
+      expect(tmux(['send-keys', '-t', adoptTarget, `exec /bin/sh ${adoptScript}`, 'Enter']).status).toBe(0);
+      await vi.waitFor(() => {
+        const probe = tmux(['display-message', '-p', '-t', adoptTarget, '#{pane_dead}']);
+        expect(probe.stdout.trim(), tmux(['capture-pane', '-p', '-t', adoptTarget]).stdout).toBe('1');
+      }, { timeout: 20_000 });
+      expect(tmux(['capture-pane', '-p', '-t', adoptTarget]).stdout).not.toContain(marker);
+      expect(tmux(['capture-pane', '-p', '-S', '-50', '-t', adoptTarget]).stdout).toContain(marker);
+
+      const first = lab.start('boot-adopt', { adoptTarget });
+      await workerExit(first);
+      await vi.waitFor(() => expect(first.errors().length, first.logs()).toBeGreaterThan(0), { timeout: 20_000 });
+      const fatal = first.errors().join('\n');
+      expect(fatal, first.logs()).toContain('tmux pane');
+      expect(fatal).toContain('f-29'); // viewport evidence is still reported
+      expect(fatal).not.toContain(marker);
     } finally {
       await lab.dispose();
     }

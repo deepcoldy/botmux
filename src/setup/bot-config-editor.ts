@@ -446,6 +446,7 @@ export function parseBotSelection(
  */
 export const CLONE_EXCLUDED_KEYS = [
   'apiOnly',
+  'localIdentity',
   'name',
   'displayName',
   'messageListeners',
@@ -549,6 +550,12 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   bot: T,
   input: BotConfigEditInput,
 ): T {
+  if (bot.localIdentity === true && input.larkAppId !== undefined) {
+    const requestedAppId = trimmed(input.larkAppId);
+    if (requestedAppId !== bot.larkAppId) {
+      throw new Error('本地机器人 id 不可修改；请新建本地机器人。若需转飞书，请先显式移除 local 标记，再通过完整凭证校验。');
+    }
+  }
   const out: Record<string, any> = { ...bot };
 
   const appId = trimmed(input.larkAppId);
@@ -673,8 +680,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (backendType === '-') {
       delete out.backendType;
     } else if (backendType) {
-      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'riff' && backendType !== 'mojo' && backendType !== 'remote-runner') {
-        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", "riff", "mojo", or "remote-runner": ${backendType}`);
+      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'hc' && backendType !== 'riff' && backendType !== 'mojo' && backendType !== 'remote-runner') {
+        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", "hc", "riff", "mojo", or "remote-runner": ${backendType}`);
       }
       out.backendType = backendType;
     }

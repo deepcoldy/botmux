@@ -517,6 +517,7 @@ export interface WorkbenchGroupingOptions {
 export function groupWorkbenchSessionsForDimension(
   sessions: readonly WorkbenchSessionRow[],
   options: WorkbenchGroupingOptions,
+  contentMatches?: ReadonlySet<string>,
 ): WorkbenchDynamicGroup[] {
   const needle = String(options.query ?? '').trim().toLocaleLowerCase();
   const unreadIds = options.unreadIds;
@@ -528,7 +529,7 @@ export function groupWorkbenchSessionsForDimension(
   const buckets = new Map<string, WorkbenchDynamicGroup>();
   for (const session of sessions) {
     if (!validWorkbenchSessionId(session.sessionId)) continue;
-    if (needle && !sessionSearchText(session).includes(needle)) continue;
+    if (needle && !sessionSearchText(session).includes(needle) && !contentMatches?.has(session.sessionId)) continue;
     const unread = unreadIds?.has(session.sessionId) === true;
     if (classifyWorkbenchSession(session, unread) === 'needs-you') {
       needsYou.push(session);

@@ -14,6 +14,7 @@ import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { countHerdrTabGroups, herdrTabGroupKey, joinLiveTitle } from '../../utils/live-title.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
+import { formatClockTime } from '../../utils/clock-time.js';
 import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
@@ -27,7 +28,7 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { modelPinText } from '../../core/model-pin.js';
-import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
+import { BACKGROUND_WAIT_TEMPLATE, RECOVERY_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import type { SubstituteCardControl } from './substitute-card-control.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
@@ -88,12 +89,12 @@ function findCardElementById(value: unknown, elementId: string): any | undefined
 }
 
 function withoutKnownTurnTerminalReceipt(content: string): string {
-  const known = [
-    t('worker.turn_terminal_receipt.completed', undefined, 'zh'),
-    t('worker.turn_terminal_receipt.silent', undefined, 'zh'),
-    t('worker.turn_terminal_receipt.completed', undefined, 'en'),
-    t('worker.turn_terminal_receipt.silent', undefined, 'en'),
-  ];
+  const known = (['zh', 'en'] as const).flatMap(locale => [
+    'worker.turn_terminal_receipt.completed',
+    'worker.turn_terminal_receipt.silent',
+    'worker.turn_terminal_receipt.completed_superseded',
+    'worker.turn_terminal_receipt.silent_superseded',
+  ].map(key => t(key, undefined, locale)));
   let result = content;
   for (const label of known) {
     const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -112,13 +113,21 @@ function appendTurnTerminalReceiptToFooter(content: string, label: string): stri
   return `${base} · <font color='grey'>${label}</font>`;
 }
 
+function carriesTurnTerminalReceipt(content: string): boolean {
+  const body = /^<font color=['"]grey['"]>([\s\S]*)<\/font>$/.exec(content)?.[1] ?? content;
+  return withoutKnownTurnTerminalReceipt(body) !== body.trimEnd();
+}
+
 /** Build a footer-only CardKit update. Message reads may normalize Markdown;
  * never submit their body as the source of a full-card update. */
 export function buildTurnTerminalFooterPatch(
   cardJson: string,
   kind: TurnTerminalReceiptKind,
   locale?: Locale,
-): { content: string } | undefined {
+  /** A newer turn is already running: the card's turn ended, but the session
+   * is not awaiting input. */
+  opts: { superseded?: boolean } = {},
+): { content: string; alreadyApplied: boolean } | undefined {
   let card: any;
   try { card = JSON.parse(cardJson); } catch { return undefined; }
   if (card?.schema !== '2.0' || !Array.isArray(card.body?.elements)) return undefined;
@@ -126,9 +135,16 @@ export function buildTurnTerminalFooterPatch(
   if (footer?.tag !== 'markdown' || typeof footer.content !== 'string' || !footer.content.trim()) {
     return undefined;
   }
-  return { content: appendTurnTerminalReceiptToFooter(
-    footer.content, t(`worker.turn_terminal_receipt.${kind}`, undefined, locale),
-  ) };
+  // The receipt is the card's one fixed-sequence CardKit write: once any
+  // variant is on the footer, a replay must not try to write another.
+  if (carriesTurnTerminalReceipt(footer.content)) return { content: footer.content, alreadyApplied: true };
+  const content = appendTurnTerminalReceiptToFooter(
+    footer.content, t(`worker.turn_terminal_receipt.${kind}${opts.superseded ? '_superseded' : ''}`, undefined, locale),
+  );
+  // The append is idempotent, so an unchanged footer already carries this
+  // receipt (a replayed terminal). Re-sending its fixed CardKit sequence would
+  // only conflict with later element writes on the same card.
+  return { content, alreadyApplied: content === footer.content };
 }
 
 /** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
@@ -141,7 +157,7 @@ export function contextCompactThreshold(): number {
 
 /** 布尔字段按配置页的逻辑分组（与 dashboard 的 Bot Profiles 区块对应）。 */
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
-  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard', 'replyCardActions'] },
+  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard', 'replyCardActions', 'replyCardNextStep', 'replyCardRecap'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
   { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm', 'trustSameOwnerBots'] },
 ];
@@ -738,6 +754,7 @@ export function buildSlashListCard(
     cliName: string;
     builtin: string[];
     adapterDefaults?: string[];
+    delegatedCommands?: string[];
     custom: string[];
     discovered: { name: string; description?: string }[];
     workingDir: string;
@@ -749,6 +766,16 @@ export function buildSlashListCard(
   const { cliName, builtin, adapterDefaults = [], custom, discovered, workingDir, mcpServers, discoverySupported = true } = params;
   const asCode = (cmds: string[]) => cmds.map((c) => `\`${c}\``).join('  ');
   const elements: any[] = [];
+  if (params.delegatedCommands?.length) {
+    const commands = params.delegatedCommands;
+    elements.push({ tag: 'markdown', content: [
+      `**${t('slashlist.part_delegated', undefined, locale)}**`,
+      asCode(commands.flatMap(cmd => cmd === '/detach' ? [cmd, '/disconnect'] : [cmd])),
+      ...(commands.includes('/adopt') ? [t('help.remote_runner_adopt', undefined, locale)] : []),
+      ...(commands.includes('/detach') ? [t('help.remote_runner_detach', undefined, locale)] : []),
+    ].join('\n') });
+    elements.push({ tag: 'hr' });
+  }
 
   // ① 固定放行（内置透传白名单）
   elements.push({
@@ -974,8 +1001,23 @@ export interface ActivityCardLabel {
   progressAgeSeconds?: number;
 }
 
-/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}，或 {@link BackgroundWaitCardLabel}。 */
-export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | ActivityCardLabel;
+/** 普通轮次因暂态模型服务故障中断、自动续跑正在等上游恢复（续跑处于 backoff）。
+ *  只对 idle 生效（CLI 停在提示符上），卡头显示「⏳ 上游暂不可用 · 预计 HH:MM 自动续跑」，
+ *  免得「等待输入」让人以为任务卡死。`due`：预定时间已到（CLI 忙或正在提交），显示「即将」。 */
+export interface RecoveryWaitCardLabel {
+  recoveryAt: number;
+  due?: boolean;
+}
+
+/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}、{@link RecoveryWaitCardLabel}，
+ *  或 {@link BackgroundWaitCardLabel}。 */
+export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | ActivityCardLabel | RecoveryWaitCardLabel;
+
+/** 续跑等待标签；仅当状态为 idle 时有值。 */
+function recoveryWaitLabel(status: StreamStatus, label: boolean | StreamCardLabel | undefined): RecoveryWaitCardLabel | undefined {
+  if (status !== 'idle' || !label || typeof label !== 'object' || !('recoveryAt' in label)) return undefined;
+  return Number.isFinite(label.recoveryAt) ? label : undefined;
+}
 
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
 function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardLabel | undefined {
@@ -1002,6 +1044,12 @@ export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: bo
 function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | StreamCardLabel): string {
   const backgroundTasks = backgroundWaitCount(status, idleLabel);
   if (backgroundTasks !== undefined) return t('card.status.background_wait', { count: backgroundTasks }, locale);
+  const recoveryWait = recoveryWaitLabel(status, idleLabel);
+  if (recoveryWait) {
+    return recoveryWait.due
+      ? t('card.status.recovery_wait_due', undefined, locale)
+      : t('card.status.recovery_wait', { at: formatClockTime(recoveryWait.recoveryAt, locale) }, locale);
+  }
   if (status === 'working' && idleLabel && typeof idleLabel === 'object' && 'activity' in idleLabel) {
     if (idleLabel.activity === 'model_queue') return t('card.status.model_queue', undefined, locale);
     if (idleLabel.activity === 'tool') return t('card.status.tool_running', undefined, locale);
@@ -1083,7 +1131,7 @@ function pushStreamBody(
   const usageSeg = usage
     ? cardUsageFooterSegment(usage, locale, 'streaming', { compactHintThreshold: contextCompactThreshold() })
     : null;
-  const runtimeSeg = usage ? cardUsageRuntimeSegment(usage) : null;
+  const runtimeSeg = usage ? cardUsageRuntimeSegment(usage, locale) : null;
   if (usageSeg || runtimeSeg) {
     // Usage metrics + runtime identity render as ONE single-line text run in a
     // single markdown element, joined by ` · ` — not a two-column split. This
@@ -1162,6 +1210,9 @@ export function buildStreamingCard(
   /** Terminal-key grid expanded state, owned by the daemon session and carried
    *  through every PATCH so streaming refreshes don't snap the grid shut. */
   keysPanelOpen = false,
+  codexAppStopTarget?: string,
+  /** Default true preserves the current card; false restores the pre-folding layout. */
+  foldedLayout = true,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1174,6 +1225,7 @@ export function buildStreamingCard(
   };
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
   const backgroundWait = backgroundWaitCount(status, silentIdle) !== undefined;
+  const recoveryWait = recoveryWaitLabel(status, silentIdle) !== undefined;
 
   const elements: any[] = [];
 
@@ -1215,10 +1267,13 @@ export function buildStreamingCard(
   }
   // 「停止」仅在有 turn 可停时显示（working/analyzing/stalled）：idle 无 turn 可停，
   // starting CLI 未起，limited turn 已失败，只剩后台子任务时 ^C 也停不了后台任务。
-  // remote CLI 无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
-  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app' && !backgroundWait
+  // Codex App needs the native turn identity captured when this card was rendered.
+  if (!hidden.has('stop') && !isRemoteCliId(cliId) && (effectiveCliId !== 'codex-app' || codexAppStopTarget) && !backgroundWait
     && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
-    primaryActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', { action: 'stop_turn', ...actionBase }));
+    primaryActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', {
+      action: 'stop_turn', ...actionBase,
+      ...(codexAppStopTarget ? { codex_app_stop_target: codexAppStopTarget } : {}),
+    }));
   }
   if (adoptMode) {
     if (showTakeover) {
@@ -1230,7 +1285,11 @@ export function buildStreamingCard(
   } else if (!hidden.has('close')) {
     primaryActions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   }
-  if (primaryActions.length > 0) elements.push({ tag: 'action', actions: primaryActions });
+  // layout 是飞书 action 模块的「窄屏自适应布局方式」，只在窄屏（实测卡宽约 330px 以下）
+  // 生效；不设时窄屏把每个按钮拉成整行竖排。flow 让按钮按文字宽度横排、放不下才折行：
+  // 手机上主区行数减少（中文工作中常见 4 行 → 2 行），桌面宽卡排法不变。不用 bisected：
+  // 等分半宽列放不下「打开 Web 终端」「Open Web Terminal」等标签，会被截断。
+  if (foldedLayout && primaryActions.length > 0) elements.push({ tag: 'action', layout: 'flow', actions: primaryActions });
 
   // ── Secondary row + collapsible panels ──────────────────────────────────
   // The terminal-key grid is a daemon-controlled toggle (state must survive
@@ -1241,7 +1300,7 @@ export function buildStreamingCard(
   // back on the next streaming PATCH is harmless.
   const keysAvailable = displayMode === 'screenshot' && !isRemoteCliId(cliId);
   const primaryMode = coordinationModeIsPrimary();
-  if (keysAvailable && !primaryMode) {
+  if (foldedLayout && keysAvailable && !primaryMode) {
     elements.push({
       tag: 'action',
       actions: [
@@ -1304,6 +1363,16 @@ export function buildStreamingCard(
       { action: 'toggle_idle_compact', desired: idleCompact.enabled ? 'off' : 'on', ...actionBase },
     ));
   }
+  // 缓存过期自动压缩（Kimi Code，core/kimi-cache-expiry.ts）：同样随 usage 快照到卡、
+  // 跟随「压缩」的隐藏配置，按钮值带目标状态 desired。
+  const kimiExpiryCompact = !adoptMode && !hidden.has('compact') ? usage?.kimiCacheExpiryAutoCompact : undefined;
+  if (kimiExpiryCompact) {
+    morePanelButtons.push(callbackButton(
+      t(kimiExpiryCompact.enabled ? 'card.btn.kimi_expiry_compact_on' : 'card.btn.kimi_expiry_compact_off', undefined, locale),
+      'default',
+      { action: 'toggle_kimi_expiry_compact', desired: kimiExpiryCompact.enabled ? 'off' : 'on', ...actionBase },
+    ));
+  }
   // 「在本群关闭/开启替身模式」：per-bot + per-chat 运行态开关（不是会话设置）。
   // 按钮值携带明确的目标 desired，处理侧按目标写入而不是翻转，旧卡重复点击幂等。
   if (!hidden.has('substitute') && substituteControl) {
@@ -1313,7 +1382,22 @@ export function buildStreamingCard(
       { action: 'toggle_substitute', desired: substituteControl.enabled ? 'off' : 'on', ...actionBase },
     ));
   }
-  if (morePanelButtons.length > 0) {
+  if (!foldedLayout) {
+    // Restore the pre-#3101 order without rebuilding callbacks: capability,
+    // visibility, nonce and durable desired-state guards remain identical.
+    const order = [
+      'toggle_display', 'export_text', 'refresh_screenshot', 'terminal',
+      'open_local_cli', 'retry_last_task', 'get_write_link', 'compact_session',
+      'toggle_idle_compact', 'toggle_kimi_expiry_compact', 'toggle_substitute',
+      'stop_turn', 'takeover', 'disconnect', 'close',
+    ];
+    const rank = (button: any): number => {
+      const index = order.indexOf(button.value?.action ?? 'terminal');
+      return index === -1 ? order.length : index;
+    };
+    const actions = [...primaryActions, ...morePanelButtons].sort((a, b) => rank(a) - rank(b));
+    if (actions.length > 0) elements.push({ tag: 'action', actions });
+  } else if (morePanelButtons.length > 0) {
     // Two weighted columns keep labels on one line even on a phone-sized card;
     // an odd last button simply occupies the first column of the final row.
     const panelRows: any[] = [];
@@ -1398,11 +1482,27 @@ export function buildStreamingCard(
   //    事实源，新增远端 CLI 自动跟随）。weighted columns pin the keys into a
   //    fixed grid: the old `action` rows stacked every key full-width on narrow
   //    cards, which is what made the card a long vertical strip.
-  if (keysAvailable && (primaryMode || keysPanelOpen)) {
-    const mkKey = (label: string, key: string) => ({
-      ...callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }),
-      width: 'fill' as const,
+  const mkKey = (label: string, key: string) => ({
+    ...callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }),
+    ...(foldedLayout ? { width: 'fill' as const } : {}),
+  });
+  if (keysAvailable && !foldedLayout) {
+    elements.push({
+      tag: 'action',
+      actions: [
+        mkKey('Esc', 'esc'), mkKey('^C', 'ctrlc'), mkKey('Tab', 'tab'),
+        mkKey('␣ Space', 'space'), mkKey('↵ Enter', 'enter'),
+      ],
+    }, {
+      tag: 'action',
+      actions: [
+        mkKey('←', 'left'), mkKey('↑', 'up'), mkKey('↓', 'down'), mkKey('→', 'right'),
+        mkKey(t('card.btn.half_page_up', undefined, locale), 'half_page_up'),
+        mkKey(t('card.btn.half_page_down', undefined, locale), 'half_page_down'),
+      ],
     });
+  }
+  if (foldedLayout && keysAvailable && (primaryMode || keysPanelOpen)) {
     // Row widths are deliberately unequal: Feishu truncates button text with an
     // ellipsis when a weighted column gets narrower than the label. Labels are
     // therefore single symbols wherever possible (×/⇥/␣/↵/▲/▼) — even a
@@ -1466,7 +1566,9 @@ export function buildStreamingCard(
     extraConfig: { update_multi: true },
     header: cardHeader(
       `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}`,
-      backgroundWait ? BACKGROUND_WAIT_TEMPLATE : STREAM_STATUS_TEMPLATE_MAP[displayStatus],
+      backgroundWait ? BACKGROUND_WAIT_TEMPLATE
+        : recoveryWait ? RECOVERY_WAIT_TEMPLATE
+          : STREAM_STATUS_TEMPLATE_MAP[displayStatus],
     ),
     elements,
   });
@@ -2181,6 +2283,16 @@ export interface TurnFailedCardOpts {
   task?: string;
   /** Auto-continuation count, when a recovery ladder ran and gave up. */
   continuations?: number;
+  /** How many times in a row this input has now failed without any output
+   *  (≥ 2): the card is the one updated in place for each of them. */
+  repeatedFailures?: number;
+  /** The transcript shows nothing but the error for this turn (no tool call,
+   *  no text): the advice says so, and that retrying cuts the failure out and
+   *  re-sends the input (core/failed-turn-rewind.ts). Pair with `safe`. */
+  directFailure?: boolean;
+  /** The provider's own recovery time, when its error named one: the card
+   *  says when continuing makes sense. */
+  providerRetryAt?: Date;
   /** Retry affordance, decided by `turnRetryOffer` — the handler enforces the
    *  same policy, so `none` must not render a button. */
   retryOffer: TurnRetryOffer;
@@ -2220,6 +2332,9 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
   const lines: string[] = [];
   // 先 @ 人再讲事：飞书的通知摘要只取前一段，@ 放最后会被截掉。
   if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  if (o.repeatedFailures !== undefined && o.repeatedFailures > 1) {
+    lines.push(t('card.turn_failed.field_repeat', { count: String(o.repeatedFailures) }, locale));
+  }
   // errorCode 是闭集常量（`cli_exit` / `provider_*` / `codexTaskFailureCode` 的
   // 固定返回值），从不携带 provider 原文，所以用反引号包成行内代码而不是
   // escapeMd —— 后者会把 `a_b_c` 里的下划线转义成可见的反斜杠，正是这类码最常
@@ -2244,6 +2359,9 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
       count: String(o.continuations),
     }, locale));
   }
+  if (o.providerRetryAt) {
+    lines.push(t('card.turn_failed.provider_eta', { eta: formatClockTime(o.providerRetryAt.getTime(), locale) }, locale));
+  }
 
   const elements: any[] = [
     { tag: 'markdown', content: lines.join('\n') },
@@ -2260,9 +2378,11 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
       ? 'card.turn_failed.no_retry'
       : !o.retryTurnId
         ? 'card.turn_failed.no_input'
-        : o.retryOffer === 'safe'
-          ? 'card.turn_failed.retry_safe'
-          : 'card.turn_failed.retry_caveated';
+        : o.directFailure
+          ? 'card.turn_failed.retry_direct'
+          : o.retryOffer === 'safe'
+            ? 'card.turn_failed.retry_safe'
+            : 'card.turn_failed.retry_caveated';
   elements.push({ tag: 'markdown', content: t(adviceKey, undefined, locale) });
 
   const actions: any[] = [];
@@ -2331,10 +2451,20 @@ export interface RecoveryFailedCardOpts {
   /** i18n key of how far automatic recovery got (see recoveryOutcomeI18nKey). */
   outcomeKey: string;
   continuations: number;
+  /** Window-paced recovery that stopped on its window: the window's end, the
+   *  provider's own retry time if known, and the window length in minutes —
+   *  rendered into the outcome line and a short "why it stopped" note. */
+  recoveryWindow?: { endsAt: Date; minutes: number; providerRetryAt?: Date; followsCache?: boolean };
+  /** Automatic continuation is switched off: the failure was not continued.
+   *  The card says so (title, how to turn it on) and names the provider's own
+   *  recovery time when it gave one. */
+  continuationOff?: { providerRetryAt?: Date };
   /** Closed-set error codes, shown de-emphasised for whoever debugs it. */
   errorCodes: string[];
   task?: string;
   failedAt?: Date;
+  /** See {@link TurnFailedCardOpts.repeatedFailures}. */
+  repeatedFailures?: number;
   /** `available` renders the retry button; `retried` replaces it with who
    *  retried and when; `none` explains why there is nothing to re-deliver. */
   retry:
@@ -2365,7 +2495,15 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
   const { locale } = o;
   const lines: string[] = [];
   if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  if (o.repeatedFailures !== undefined && o.repeatedFailures > 1) {
+    lines.push(t('card.turn_failed.field_repeat', { count: String(o.repeatedFailures) }, locale));
+  }
   lines.push(t('card.recovery_failed.field_cause', { cause: t(o.causeKey, undefined, locale) }, locale));
+  if (o.continuationOff?.providerRetryAt) {
+    lines.push(t('card.recovery_failed.field_provider_eta', {
+      eta: formatClockTime(o.continuationOff.providerRetryAt.getTime(), locale),
+    }, locale));
+  }
   if (o.task) {
     lines.push(t('card.recovery_failed.field_task', { task: escapeMd(o.task) }, locale));
   }
@@ -2375,7 +2513,12 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
     }, locale));
   }
   lines.push(t('card.recovery_failed.field_recovery', {
-    outcome: t(o.outcomeKey, { count: String(o.continuations) }, locale),
+    outcome: t(o.outcomeKey, {
+      count: String(o.continuations),
+      ...(o.recoveryWindow ? { windowEnd: formatClockTime(o.recoveryWindow.endsAt.getTime(), locale) } : {}),
+      ...(o.recoveryWindow?.providerRetryAt
+        ? { eta: formatClockTime(o.recoveryWindow.providerRetryAt.getTime(), locale) } : {}),
+    }, locale),
   }, locale));
   const codes = [...new Set(o.errorCodes.filter(Boolean))]
     .map(code => `\`${code.replace(/[`<>]/g, '')}\``);
@@ -2387,6 +2530,16 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
     { tag: 'markdown', content: lines.join('\n') },
     { tag: 'hr' },
   ];
+  if (o.continuationOff) {
+    elements.push({ tag: 'markdown', content: t('card.recovery_failed.off_hint', undefined, locale) });
+  }
+  if (o.recoveryWindow) {
+    elements.push({
+      tag: 'markdown',
+      content: t(o.recoveryWindow.followsCache ? 'card.recovery_failed.window_hint_cache' : 'card.recovery_failed.window_hint',
+        { minutes: String(o.recoveryWindow.minutes) }, locale),
+    });
+  }
   const advice = o.retry.kind === 'available'
     ? t('card.recovery_failed.retry_hint', undefined, locale)
     : o.retry.kind === 'continue_legacy'
@@ -2453,7 +2606,8 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
   if (actions.length > 0) elements.push({ tag: 'action', actions });
 
   return JSON.stringify(wideCard({
-    header: cardHeader(t('card.recovery_failed.title', { cliName: plainTitle(o.cliName) }, locale), 'red'),
+    header: cardHeader(t(o.continuationOff ? 'card.recovery_failed.title_off' : 'card.recovery_failed.title',
+      { cliName: plainTitle(o.cliName) }, locale), 'red'),
     elements,
   }));
 }

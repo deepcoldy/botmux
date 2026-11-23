@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DecisionBoardService, type DecisionBoardServiceDeps } from '../src/core/decision-board/service.js';
 import {
+  DECISION_CARD_ACTION_CLOSE,
   DECISION_CARD_ACTION_NOTE,
   DECISION_CARD_ACTION_PICK,
   DECISION_CARD_NOTE_FIELD,
@@ -35,12 +36,12 @@ let updateImpl: (messageId: string) => Promise<void>;
 let service: DecisionBoardService;
 let owner: string | undefined;
 
-function makeService(): DecisionBoardService {
+function makeService(locale: 'zh' | 'en' = 'zh'): DecisionBoardService {
   return new DecisionBoardService({
     dataDir: dir,
     larkAppId: () => APP,
     steward: () => steward,
-    locale: () => 'zh',
+    locale: () => locale,
     brand: () => 'feishu',
     dashboardOrigin: () => 'https://dash.example',
     ownerOpenId: () => owner,
@@ -134,6 +135,76 @@ async function webSubmit(seq: number, choice: string, text: string, nonce: strin
   return res;
 }
 
+describe('仅关闭，不投递', () => {
+  const closeValue = (card: any) => callbackButtons(card).find(b => b.behaviors[0].value.action === DECISION_CARD_ACTION_CLOSE).behaviors[0].value;
+  it.each(['zh', 'en'] as const)('通用关闭文案（%s）：真实回调、owner历史和原地换卡不产生afterAck或批次', async locale => {
+    service.close();
+    service = makeService(locale);
+    const historyText = locale === 'en' ? 'Owner closed this item (no further decision needed)' : '本人关闭（无需再拍板）';
+    const seq = await addDecide();
+    const card = currentCard();
+    const button = card.body.elements.find((e: any) => e.behaviors?.[0]?.value?.action === DECISION_CARD_ACTION_CLOSE);
+    expect(button.text.content).toBe(locale === 'en' ? 'Close item' : '关闭此项');
+    expect(button.confirm.text.content).toContain(locale === 'en' ? 'needs no decision, or will not be done' : '不再需要决策或不做了');
+    expect(button.form_action_type).toBeUndefined();
+    const item = service.store().getItem(APP, seq)!;
+    service.putDraft(seq, 'owner', { choice: 'B', text: '不要投递的旧草稿', baseRev: item.rev });
+    setDecisionCardService(service);
+    const out = await handleDecisionCardAction({ operator: { open_id: OWNER },
+      action: { value: { ...closeValue(card), key: 'A' }, form_value: { [DECISION_CARD_NOTE_FIELD]: '也不能投递' } },
+      context: { open_message_id: sent[0]!.messageId } } as any, APP);
+    expect(out.afterAck).toBeUndefined();
+    expect(out.toast?.content).toBe(locale === 'en' ? 'Closed; no further decision needed' : '已关闭，无需再拍板');
+    expect(out.card.type).toBe('raw');
+    expect(out.card.data.header.template).toBe('grey');
+    expect(callbackButtons(out.card.data)).toHaveLength(0);
+    await service.cardsIdle();
+    expect(sent).toHaveLength(1);
+    expect(service.store().getCard(APP, seq)?.messageId).toBe(sent[0]!.messageId);
+    expect(service.cards!.render(seq)?.card).toEqual(out.card.data);
+    const detail = service.detail(seq, 'owner');
+    expect(detail.item).toMatchObject({ state: 'closed', rev: item.rev + 1 });
+    expect(detail.draft).toBeUndefined();
+    expect(detail.events.filter(e => e.text === historyText)).toMatchObject([{ actor: 'owner', kind: 'state' }]);
+    expect(service.store().listBatches(APP)).toEqual([]);
+    expect(service.store().latestDecision(APP, seq)).toBeUndefined();
+    await service.redeliverUndelivered();
+    expect(delivered).toEqual([]);
+    const again = service.cardClick({ operatorOpenId: OWNER, value: closeValue(card), messageId: sent[0]!.messageId });
+    expect(again.deliver).toBeUndefined();
+    expect(service.detail(seq, 'owner').events.filter(e => e.text === historyText)).toHaveLength(1);
+    // Old option callback and late autosave cannot turn closure into delivery.
+    expect(click(card).deliver).toBeUndefined();
+    expect(() => service.putDraft(seq, 'owner', { choice: 'A', baseRev: item.rev })).toThrow(BoardError);
+  });
+  it('在网页上关闭：同一张飞书卡片原地刷新为灰色终态，不再有能点的按钮，也不另发卡', async () => {
+    const seq = await addDecide();
+    const item = service.store().getItem(APP, seq)!;
+    updated.length = 0;
+    // Dashboard 的 close-in-chat 路由直接调 service.closeInChat，不经卡片回调。
+    service.closeInChat(seq, item.rev, 'u:on_owner');
+    await service.cardsIdle();
+    expect(sent).toHaveLength(1);
+    expect(updated.map(u => u.messageId)).toEqual([sent[0]!.messageId]);
+    expect(updated[0]!.card.header.template).toBe('grey');
+    expect(callbackButtons(updated[0]!.card)).toHaveLength(0);
+    expect(delivered).toEqual([]);
+  });
+  it('非 owner、旧版内容、被替换卡片和已禁用卡片均不能关闭', async () => {
+    const seq = await addDecide();
+    const value = closeValue(currentCard());
+    expect(service.cardClick({ operatorOpenId: 'ou_other', value }).toast?.type).toBe('error');
+    expect(service.cardClick({ operatorOpenId: OWNER, value, messageId: 'om_replaced' }).toast?.type).toBe('warning');
+    await service.cli({ action: 'set', ref: String(seq), fields: { summary: 'new revision' } }, { sessionId: 's' });
+    expect(service.cardClick({ operatorOpenId: OWNER, value }).toast?.type).toBe('warning');
+    steward = { enabled: true, chatId: 'oc_steward', decisionCards: false };
+    expect(service.cardClick({ operatorOpenId: OWNER, value }).toast?.type).toBe('warning');
+    expect(service.detail(seq, 'owner').item.state).toBe('decide');
+    expect(service.store().listBatches(APP)).toEqual([]);
+    expect(delivered).toEqual([]);
+  });
+});
+
 describe('发卡', () => {
   it('新建即待拍板：往管家群发一张卡，每个选项一个按钮、推荐项标出、带说明框和看板链接', async () => {
     const seq = await addDecide();
@@ -200,7 +271,9 @@ describe('原地更新', () => {
 
     await service.cli({ action: 'set', ref: String(seq), fields: { progress: '又跑了一轮 CI' } }, { sessionId: 's' });
     await service.cardsIdle();
-    expect(updated).toHaveLength(1);
+    // The close confirmation is revision-bound, so a content edit must refresh its revision too.
+    expect(updated).toHaveLength(2);
+    expect(updated[1]!.messageId).toBe(sent[0]!.messageId);
   });
 
   it('daemon 重启后照样更新原来那张卡（消息 id 落库）', async () => {
@@ -262,7 +335,8 @@ describe('降级', () => {
     const options = Array.from({ length: DECISION_CARD_MAX_OPTIONS + 1 }, (_, i) => `${String.fromCharCode(65 + i)}=选项${i}`);
     await addDecide(options, { recommend: 'A' });
     const card = sent[0]!.card;
-    expect(callbackButtons(card)).toHaveLength(0);
+    expect(pickButtons(card)).toHaveLength(0);
+    expect(callbackButtons(card).map(b => b.behaviors[0].value.action)).toEqual([DECISION_CARD_ACTION_CLOSE]);
     expect(linkButtons(card)).toHaveLength(1);
     expect(cardText(card)).toContain(`${DECISION_CARD_MAX_OPTIONS + 1} 个选项`);
   });

@@ -31,6 +31,7 @@ import {
   ordinaryTurnRecoveryCauseCode,
   type OrdinaryTurnRecoveryState,
   type OrdinaryTurnRecoveryStatus,
+  type OrdinaryTurnRecoveryStopReason,
 } from './ordinary-turn-recovery.js';
 
 /** A notice that cannot reach Feishu within this window is abandoned (logged):
@@ -100,6 +101,14 @@ export interface OrdinaryRecoveryNoticeRecord {
   /** The provider failure behind it, when known (e.g. provider_server_error). */
   causeErrorCode?: string;
   continuations: number;
+  /** Window-paced recovery: why it stopped, the window's end, and the
+   *  provider's own retry time when one was known — so the card can say why
+   *  it stopped and when trying again makes sense. */
+  stopReason?: OrdinaryTurnRecoveryStopReason;
+  windowEndsAt?: number;
+  providerRetryAt?: number;
+  windowMinutes?: number;
+  windowFollowsCache?: true;
   /** Human who sent the original message — @-mentioned, may press retry. */
   initiatorOpenId?: string;
   /** Short excerpt of the original message, for "which message was this". */
@@ -174,6 +183,13 @@ export function createOrdinaryRecoveryNotice(
     ...(state.lastErrorCode ? { errorCode: state.lastErrorCode } : {}),
     ...(causeErrorCode ? { causeErrorCode } : {}),
     continuations: state.continuationsStarted,
+    ...(state.status === 'exhausted' && state.stopReason ? { stopReason: state.stopReason } : {}),
+    ...(state.status === 'exhausted' && state.windowEndsAt !== undefined ? { windowEndsAt: state.windowEndsAt } : {}),
+    ...((state.status === 'exhausted' || state.lastErrorCode === 'recovery_off') && state.providerRetryAt !== undefined
+      ? { providerRetryAt: state.providerRetryAt } : {}),
+    ...(state.status === 'exhausted' && state.stopReason && state.windowMinutes !== undefined
+      ? { windowMinutes: state.windowMinutes } : {}),
+    ...(state.status === 'exhausted' && state.stopReason && state.windowFollowsCache ? { windowFollowsCache: true as const } : {}),
     ...(context.initiatorOpenId ? { initiatorOpenId: context.initiatorOpenId } : {}),
     ...(task ? { task } : {}),
     ...(context.retrySupported && input && context.retryCaller
@@ -246,14 +262,19 @@ export function recoveryCauseI18nKey(code: string | undefined): string {
 }
 
 /** i18n key for "how far did automatic recovery get". */
-export function recoveryOutcomeI18nKey(record: Pick<OrdinaryRecoveryNoticeRecord, 'errorCode' | 'recoveryStatus' | 'continuations'>): string {
+export function recoveryOutcomeI18nKey(record: Pick<OrdinaryRecoveryNoticeRecord, 'errorCode' | 'recoveryStatus' | 'continuations' | 'stopReason'>): string {
   if (record.errorCode === 'recovery_outcome_unverified') return 'card.recovery_failed.outcome.unverified';
+  if (record.errorCode === 'recovery_off') return 'card.recovery_failed.outcome.off';
+  if (record.errorCode === 'recovery_superseded_by_schedule') return 'card.recovery_failed.outcome.superseded_by_schedule';
   if (record.errorCode === 'recovery_queued_unrecovered') return 'card.recovery_failed.outcome.queued';
   if (record.errorCode === 'recovery_restart_unverified' || record.errorCode === 'recovery_dispatch_interrupted') {
     return 'card.recovery_failed.outcome.interrupted';
   }
   if (record.errorCode === 'recovery_enqueue_failed' || record.errorCode === 'recovery_delivery_failed') {
     return 'card.recovery_failed.outcome.not_submitted';
+  }
+  if (record.recoveryStatus === 'exhausted' && record.stopReason) {
+    return `card.recovery_failed.outcome.${record.stopReason}`;
   }
   if (record.recoveryStatus === 'exhausted') return 'card.recovery_failed.outcome.exhausted';
   return record.continuations > 0

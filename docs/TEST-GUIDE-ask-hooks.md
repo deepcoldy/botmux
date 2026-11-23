@@ -96,6 +96,18 @@ DSH 不走 Claude/OpenCode 原生 hook 文件，而是由 botmux 在启动 DSH p
 3. `BOTMUX_DSH_ASK_BRIDGE=0` 后重启会话，应不再注入 bridge patch。
 4. sandbox:true 下 bridge patch 目录必须只读可见，hook command 通过 `hookCommandParts()` 生成的 argv 可执行，不依赖全局 `botmux` shim。
 
+## 9. Antigravity（agy）ask_question
+
+botmux 往 agy 的全局 `~/.gemini/config/hooks.json` 写一个名为 `botmux` 的 PreToolUse 钩子（只匹配 `ask_question`，命令 `exec` 进 `botmux hook antigravity`）。agy 的钩子无法直接提供工具结果，答案以 `deny` 的 reason 回给模型（`A1: … / A2: …`，和 agy 原生菜单的结果格式一致），终端里不弹选择菜单。
+
+验证要点（agy 1.5.12 实测）：
+
+1. `cat ~/.gemini/config/hooks.json`：`botmux` 键下有 `PreToolUse` / `matcher: ask_question`，其他命名钩子原样保留；把它改成 `"enabled": false` 后再起会话，安装不会改回。
+2. 让 agy 用 ask_question 问两题（一题多选）：飞书出 botmux ask 卡，选项 / 「其他」文字 / 话题里直接回文字都能回到模型；终端只显示 `AskQuestion … Error: tool call denied by pre-tool hook: botmux showed these questions…`。
+3. 卡片等待中在会话卡点「停止」（或 Web 终端按 Esc）：钩子进程随之退出，卡片约 60 秒后变为「已失效」，期间话题里的文字照常送进 agy、不会被当成这张卡的答案。
+4. 独立运行的 agy（无 botmux 环境变量）：钩子空输出放行，照常弹 agy 自己的菜单。
+5. 钩子不可用时 agy 自己的提问菜单 / 权限确认框弹在终端：排队消息与透传命令都被暂扣，飞书出暂扣卡（提问菜单可点「Esc 跳过这个问题」）。
+
 ## 注意
 
 - Codex 别测 askUserQuestion——它没有结构化提问 hook，adapter 对它永远 passthrough（无害）。

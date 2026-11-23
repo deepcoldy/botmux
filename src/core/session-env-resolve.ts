@@ -19,13 +19,14 @@ import {
 } from './session-env.js';
 import { sanitizePerBotEnv } from './per-bot-env.js';
 import { sessionEnvFingerprint } from '../services/session-env-stamp.js';
+import { capabilityOn, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 
 /** The bot-config fields the overlay depends on. */
 export interface SessionEnvBotInput {
   env?: Record<string, string>;
   envUnset?: string[];
   envPolicy?: EnvPolicy;
-  triggerUserAuth?: { enabled?: boolean };
+  triggerUserAuth?: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'>;
   larkToolBinding?: boolean;
   apiOnly?: boolean;
   backendType?: BackendType;
@@ -55,7 +56,7 @@ export function sessionEnvLockContextForBot(bot: SessionEnvBotInput, facts: Sess
   const trigger = bot.triggerUserAuth?.enabled === true;
   const larkBinding = !facts.larkBindingOff && bot.larkToolBinding !== false && bot.apiOnly !== true
     && !isRemoteBackendId(bot.backendType ?? 'pty');
-  return { identityShell: trigger || larkBinding, identityGit: trigger };
+  return { identityShell: trigger || larkBinding, identityGit: capabilityOn(bot.triggerUserAuth, 'bytecloud') };
 }
 
 /**

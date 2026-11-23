@@ -4,6 +4,7 @@ import {
   buildBridgeSendMarkerContent,
   type BridgeSendMarker,
 } from './bridge-fallback-gate.js';
+import { recordCrossChatFollowThreadBinding } from './cross-chat-follow-thread-store.js';
 
 export interface RecordBridgeReplyMarkerInput {
   dataDir: string;
@@ -24,6 +25,8 @@ export interface RecordBridgeReplyMarkerInput {
   targetRootMessageId?: string;
   targetSessionId?: string;
   dispatchRootId?: string;
+  crossChatFollowThread?: BridgeSendMarker['crossChatFollowThread'];
+  followThreadEpoch?: BridgeSendMarker['followThreadEpoch'];
 }
 
 /**
@@ -49,10 +52,13 @@ export function recordBridgeReplyMarker(input: RecordBridgeReplyMarkerInput): Br
     ...(input.targetRootMessageId ? { targetRootMessageId: input.targetRootMessageId } : {}),
     ...(input.targetSessionId ? { targetSessionId: input.targetSessionId } : {}),
     ...(input.dispatchRootId ? { dispatchRootId: input.dispatchRootId } : {}),
+    ...(input.crossChatFollowThread ? { crossChatFollowThread: input.crossChatFollowThread } : {}),
+    ...(input.followThreadEpoch ? { followThreadEpoch: input.followThreadEpoch } : {}),
     ...buildBridgeSendMarkerContent(input.content),
   };
   const markerDir = join(input.dataDir, 'turn-sends');
   if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
   appendFileSync(join(markerDir, `${input.sessionId}.jsonl`), `${JSON.stringify(marker)}\n`);
+  recordCrossChatFollowThreadBinding(input.dataDir, input.sessionId, marker);
   return marker;
 }

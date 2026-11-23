@@ -13,6 +13,7 @@
  * other than what this module last wrote.
  */
 import { logger } from '../utils/logger.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { renewBytedcliJwts } from '../services/bytedcli-auth.js';
 import {
   recallProvenIdentityContent,
@@ -31,6 +32,7 @@ interface RenewalEntry {
   sessionDataDir: string;
   sessionId: string;
   credentialOpenId: string;
+  taskAuthorized?: () => Promise<boolean>;
   identity: BytedCliIdentity & { turnId: string };
 }
 
@@ -103,24 +105,59 @@ export async function renewExpiringBytedcliIdentities(
     if (expiresAt === undefined || expiresAt - now() > renewBeforeMs) continue;
     inFlight.add(key);
     try {
+      if (entry.taskAuthorized) {
+        let holds: boolean;
+        try {
+          holds = await entry.taskAuthorized();
+        } catch (error) {
+          // Transient validation unavailability is not a revocation: keep the
+          // entry so a later sweep can renew once the platform recovers.
+          logger.warn(`[bytedcli-renewal] task authorization check unavailable for ${entry.sessionId.slice(0, 8)}/${entry.identity.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`);
+          continue;
+        }
+        if (!holds) {
+          // A republished turn owns this key now; a stale entry must not delete it.
+          if (entries.get(key) !== entry) continue;
+          entries.delete(key);
+          continue;
+        }
+      }
       const jwts = await renewBytedcliJwts(entry.credentialOpenId);
       if (!jwts) {
         logger.warn(`[bytedcli-renewal] could not renew ${entry.sessionId.slice(0, 8)}/${entry.identity.turnId.slice(0, 12)}; keeping current tokens`);
         continue;
       }
+      if (entry.taskAuthorized) {
+        let holds: boolean;
+        try {
+          holds = await entry.taskAuthorized();
+        } catch (error) {
+          logger.warn(`[bytedcli-renewal] task authorization check unavailable for ${entry.sessionId.slice(0, 8)}/${entry.identity.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`);
+          continue;
+        }
+        if (!holds) {
+          if (entries.get(key) !== entry) continue;
+          entries.delete(key);
+          continue;
+        }
+      }
       // The turn may have ended or been republished while the CLI ran.
       if (entries.get(key) !== entry) continue;
       if (!stillPublished(entry)) { entries.delete(key); continue; }
+      // A default token that claims CN serves CN itself, and renewal then
+      // mints no separate CN token: an earlier one must not stay in its place.
+      const regionalCloudJwts = { ...entry.identity.regionalCloudJwts, ...jwts.regionalCloudJwts };
+      if (jwtClaims(jwts.cloudJwt)?.region === 'cn') delete regionalCloudJwts.cn;
       const identity: BytedCliIdentity & { turnId: string } = {
         tool: 'bytedcli',
         cloudJwt: jwts.cloudJwt,
         // Keep material the renewal could not refresh rather than drop it.
         ...(jwts.codeJwt ?? entry.identity.codeJwt ? { codeJwt: jwts.codeJwt ?? entry.identity.codeJwt } : {}),
-        ...(jwts.regionalCloudJwts || entry.identity.regionalCloudJwts
-          ? { regionalCloudJwts: { ...entry.identity.regionalCloudJwts, ...jwts.regionalCloudJwts } }
-          : {}),
+        ...(Object.keys(regionalCloudJwts).length ? { regionalCloudJwts } : {}),
+        ...(entry.identity.regionalCloudJwtSource ? { regionalCloudJwtSource: entry.identity.regionalCloudJwtSource } : {}),
         turnId: entry.identity.turnId,
         ...(entry.identity.openId ? { openId: entry.identity.openId } : {}),
+        ...(entry.identity.meegoHome ? { meegoHome: entry.identity.meegoHome } : {}),
       };
       writeSessionIdentity(entry.sessionDataDir, entry.sessionId, identity, 'proven');
       entries.set(key, { ...entry, identity });

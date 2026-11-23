@@ -13,6 +13,7 @@ import { join, basename } from 'node:path';
 import { hasTrailingBridgeSentinelLine, shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import {
   drainTranscript,
+  normaliseForFingerprint,
   pickAssistantTextEvents,
   extractAssistantText,
   joinAssistantText,
@@ -36,6 +37,8 @@ import {
   apiErrorMessageText,
   transcriptShowsTurnDurationMarker,
   transcriptHoldsConversation,
+  absorbedInputReplyText,
+  AbsorbedReplyCollector,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -437,6 +440,49 @@ describe('classifyClaudeTerminalEvent', () => {
       errorCode: 'provider_server_error',
       retryable: true,
     });
+  });
+
+  it('carries the provider\'s own retry time on a retryable failure (11-13 gateway record)', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'gateway-503',
+      timestamp: '2026-11-13T11:08:18.238Z',
+      isApiErrorMessage: true,
+      error: 'server_error',
+      apiErrorStatus: 503,
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: 503 no eligible upstream account is currently available; '
+          + 'the earliest account is expected to be available at 2026-11-13T11:10:16Z. This is a server-side '
+          + 'issue, usually temporary — try again in a moment.' }],
+      },
+    };
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+      retryAtMs: Date.parse('2026-11-13T11:10:16Z'),
+    });
+    // A relative hint is anchored at the record, not at whenever it is read.
+    expect(classifyClaudeTerminalEvent({
+      ...ev,
+      message: { ...ev.message!, content: [{ type: 'text', text: 'API Error: 529 overloaded, retry after 40s' }] },
+    })).toMatchObject({ retryAtMs: Date.parse('2026-11-13T11:08:58.238Z') });
+  });
+
+  it('keeps a retry time off a failure that is not retryable', () => {
+    const outcome = classifyClaudeTerminalEvent({
+      type: 'assistant',
+      uuid: 'auth-401',
+      timestamp: '2026-11-13T11:08:18.238Z',
+      isApiErrorMessage: true,
+      error: 'authentication_failed',
+      apiErrorStatus: 401,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 401 try again in 30 seconds' }] },
+    });
+    expect(outcome).toEqual({ status: 'failed', errorCode: 'provider_authentication_failed', retryable: false });
   });
 });
 
@@ -1731,6 +1777,32 @@ describe('findJsonlContainingFingerprint: acceptCandidate', () => {
   });
 });
 
+describe('soft-newline residue in transcript fingerprint searches', () => {
+  const sent = 'echo foo\\\nbar with enough content to identify the turn';
+  const recorded = 'echo foo\\\\\nbar with enough content to identify the turn';
+  const fingerprint = normaliseForFingerprint(sent).slice(0, 30);
+
+  it('matches residue-bearing user records in direct, fan-out, and exact-content searches', () => {
+    appendLine({ type: 'user', message: { role: 'user', content: recorded } });
+    expect(jsonlContainsFingerprint(path, fingerprint)).toBe(true);
+    expect(findJsonlContainingFingerprint(dir, fingerprint)).toBe(path);
+    expect(findJsonlsContainingExactContent(dir, normaliseForFingerprint(sent))).toEqual([path]);
+  });
+
+  it('matches residue-bearing queue operations when the caller opts in', () => {
+    appendLine({ type: 'queue-operation', operation: 'enqueue', content: recorded });
+    expect(jsonlContainsFingerprint(path, fingerprint, { includeQueueOperations: true })).toBe(true);
+    expect(findJsonlsContainingExactContent(dir, normaliseForFingerprint(sent), { includeQueueOperations: true })).toEqual([path]);
+  });
+
+  it('does not match a different record missing the genuine backslash', () => {
+    appendLine({ type: 'user', message: { role: 'user', content: 'echo foo\nbar with enough content to identify the turn' } });
+    expect(jsonlContainsFingerprint(path, fingerprint)).toBe(false);
+    expect(findJsonlContainingFingerprint(dir, fingerprint)).toBeNull();
+    expect(findJsonlsContainingExactContent(dir, normaliseForFingerprint(sent))).toEqual([]);
+  });
+});
+
 // ─── findJsonlsContainingExactContent ──────────────────────────────────────
 //
 // The unknown-sid /clear recovery path must accept ONLY candidates whose
@@ -2213,5 +2285,137 @@ describe('transcriptHoldsConversation', () => {
   it('does not take a nested "type":"user" for a conversation record', () => {
     appendLine({ type: 'file-history-snapshot', snapshot: { note: { type: 'user' } } });
     expect(transcriptHoldsConversation(path)).toBe(false);
+  });
+});
+
+describe('absorbedInputReplyText', () => {
+  const block = (uuid: string, content: unknown, extra: Record<string, unknown> = {}): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [content] }, ...extra,
+  } as TranscriptEvent);
+  const text = (uuid: string, t: string) => block(uuid, { type: 'text', text: t });
+  const thinking = (uuid: string, t: string) => block(uuid, { type: 'thinking', thinking: t, signature: 'sig' });
+  const tool = (uuid: string) => block(uuid, { type: 'tool_use', id: `tu-${uuid}`, name: 'Bash', input: {} });
+  const toolResult = (uuid: string): TranscriptEvent => ({
+    type: 'user', uuid, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x', content: 'ok' } as any] },
+  });
+  const folded = (uuid: string): TranscriptEvent => ({
+    type: 'attachment', uuid, attachment: { type: 'queued_command', prompt: '现在用的是什么模型？', commandMode: 'prompt' },
+  } as TranscriptEvent);
+  const duration: TranscriptEvent = { type: 'system', subtype: 'turn_duration', uuid: 'dur' };
+
+  it('answers with a thinking summary when the model wrote no text after the fold', () => {
+    // Shape of the reported session: redacted thinking + a lookup, then the
+    // answer only as a thinking summary, then the turn keeps working.
+    const events = [
+      text('a0', 'Verifying which code each kernel runs.'),
+      tool('t0'), toolResult('r0'),
+      folded('q1'),
+      thinking('a1', ''), tool('t1'), toolResult('r1'),
+      thinking('a2', ''),
+      thinking('a3', '这 3 个 case 用的是 gpt-6-astra，评分用 gpt-6.1-sol。\n\n'),
+      tool('t2'), toolResult('r2'),
+      thinking('a4', 'Both builds differ, so the identical result is real.'),
+      text('a5', 'Final summary of the whole turn.'),
+      duration,
+    ];
+    expect(absorbedInputReplyText(events, 'q1')).toEqual({
+      text: '这 3 个 case 用的是 gpt-6-astra，评分用 gpt-6.1-sol。',
+      lastUuid: 'a3',
+      source: 'thinking',
+    });
+  });
+
+  it('prefers text over the thinking that precedes it in the same run', () => {
+    const events = [
+      folded('q1'),
+      thinking('a1', 'The user asks which model; the rollout says gpt-6-astra.'),
+      text('a2', 'Cases run on gpt-6-astra.'),
+      text('a3', 'Grading uses gpt-6.1-sol.'),
+      tool('t1'),
+      text('a4', 'Back to the audit.'),
+    ];
+    expect(absorbedInputReplyText(events, 'q1')).toEqual({
+      text: 'Cases run on gpt-6-astra.\n\nGrading uses gpt-6.1-sol.',
+      lastUuid: 'a3',
+      source: 'text',
+    });
+  });
+
+  it('ignores output before the fold, sidechain chatter and API-error records', () => {
+    const events = [
+      text('a0', 'said before the message arrived'),
+      folded('q1'),
+      text('s1', 'sub-agent chatter'),
+      { ...text('e1', 'API Error: 500'), isApiErrorMessage: true } as TranscriptEvent,
+      text('a1', 'the answer'),
+    ];
+    (events[2] as any).isSidechain = true;
+    expect(absorbedInputReplyText(events, 'q1')).toEqual({ text: 'the answer', lastUuid: 'a1', source: 'text' });
+  });
+
+  it('does not reach past the end of the host turn', () => {
+    const userPrompt: TranscriptEvent = { type: 'user', uuid: 'u2', message: { role: 'user', content: 'next question' } };
+    expect(absorbedInputReplyText([folded('q1'), tool('t1'), duration, text('a1', 'next turn')], 'q1')).toBeUndefined();
+    expect(absorbedInputReplyText([folded('q1'), tool('t1'), userPrompt, text('a1', 'next turn')], 'q1')).toBeUndefined();
+  });
+
+  it('returns undefined when the fold record is not in the transcript', () => {
+    expect(absorbedInputReplyText([text('a1', 'anything')], 'missing')).toBeUndefined();
+  });
+
+  it('stops at the next folded input: what follows answers that one', () => {
+    // Claude Code renders a folded input to the model as a system reminder.
+    const reminder = (uuid: string, prompt: string): TranscriptEvent => ({
+      type: 'attachment', uuid, renderedRole: 'system',
+      attachment: { type: 'queued_command', prompt, commandMode: 'prompt' },
+    } as TranscriptEvent);
+    const events = [
+      reminder('qB', 'which model?'), thinking('aB', ''), tool('t1'), toolResult('r1'),
+      reminder('qC', 'is CI green?'), text('aC', 'CI is green.'), tool('t2'),
+    ];
+    expect(absorbedInputReplyText(events, 'qB')).toBeUndefined();
+    expect(absorbedInputReplyText(events, 'qC')).toEqual({ text: 'CI is green.', lastUuid: 'aC', source: 'text' });
+  });
+
+  it('reads past the request copy Claude Code writes before the answer', () => {
+    // Shape of a live 2.1.323 transcript: two messages folded together, then
+    // a uuid-less copy of the request's user content, then the answer.
+    const reminder = (uuid: string, prompt: string): TranscriptEvent => ({
+      type: 'attachment', uuid, renderedRole: 'system',
+      attachment: { type: 'queued_command', prompt, commandMode: 'prompt' },
+    } as TranscriptEvent);
+    const requestCopy = {
+      type: 'api-request-blob', sessionId: 's', hash: 'h',
+      message: { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'x', content: 'ok' },
+        { type: 'text', text: '<system-reminder>\nThe user sent a new message while you were working:\n等一下，先让我登录\n</system-reminder>' },
+        { type: 'text', text: '<system-reminder>\nThe user sent a new message while you were working:\n你先启动一个 case\n</system-reminder>' },
+      ] },
+    } as unknown as TranscriptEvent;
+    const events = [
+      tool('t0'), toolResult('r0'),
+      reminder('q1', '等一下，先让我登录'), reminder('q2', '你先启动一个 case'),
+      requestCopy, { type: 'api-request' } as unknown as TranscriptEvent,
+      thinking('a1', ''), thinking('a2', '已登录，先启动一个 case。'), tool('t1'),
+    ];
+    expect(absorbedInputReplyText(events, 'q1')).toBeUndefined();
+    expect(absorbedInputReplyText(events, 'q2')).toEqual({ text: '已登录，先启动一个 case。', lastUuid: 'a2', source: 'thinking' });
+  });
+});
+
+describe('AbsorbedReplyCollector (live feed)', () => {
+  const ev = (uuid: string, block: unknown): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [block] },
+  } as TranscriptEvent);
+
+  it('completes at the first tool call after output and ignores what follows', () => {
+    const c = new AbsorbedReplyCollector();
+    expect(c.feed(ev('a1', { type: 'tool_use', id: 't1', name: 'Bash', input: {} }))).toBe(false);
+    expect(c.reply()).toBeUndefined();
+    expect(c.feed(ev('a2', { type: 'thinking', thinking: 'it is gpt-6-astra' }))).toBe(false);
+    expect(c.reply()).toEqual({ text: 'it is gpt-6-astra', lastUuid: 'a2', source: 'thinking' });
+    expect(c.feed(ev('a3', { type: 'tool_use', id: 't2', name: 'Bash', input: {} }))).toBe(true);
+    expect(c.feed(ev('a4', { type: 'text', text: 'later narration' }))).toBe(true);
+    expect(c.reply()).toEqual({ text: 'it is gpt-6-astra', lastUuid: 'a2', source: 'thinking' });
   });
 });

@@ -29,6 +29,7 @@ import { readdirSync, statSync, rmSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { assertSafeAppId } from '../adapters/cli/read-isolation.js';
 import { listSessionsStrict } from '../services/session-store.js';
+import { REPLY_DELIVERY_DIRNAME } from '../services/reply-delivery-store.js';
 
 export const DEFAULT_ATTACHMENT_MAX_AGE_MS = 14 * 24 * 60 * 60_000;
 
@@ -109,6 +110,11 @@ function pruneAttachmentBucket(
   try {
     messageDirs = readdirSync(bucket, { withFileTypes: true })
       .filter(e => e.isDirectory())
+      // The reply-delivery index (<bucket>/deliveries/) is an evidence index,
+      // not a per-message download: quoted main messages must still resolve
+      // their attachment receipts after the 14-day download TTL. Its own JSON
+      // files carry the app/message identity and are re-validated on read.
+      .filter(e => e.name !== REPLY_DELIVERY_DIRNAME)
       .map(e => e.name);
   } catch {
     return 0;

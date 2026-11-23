@@ -20,7 +20,7 @@ Match your **symptom** first — each one has a different cause:
 | **No reaction at all** (not even an emoji) | Event subscription, release, or long connection not working | [A. No messages at all](#a-no-messages-at-all) |
 | Only **I (the owner)** can trigger it; others get an auth card or no reply | Others have no talk permission | [B. Others can't use it](#b-others-cant-use-it) |
 | It **only replies when @-mentioned** and you want it to reply without @ | The group's mention policy | [B. Others can't use it](#b-others-cant-use-it) |
-| The card says "working" and the terminal has output, but **nothing reaches Lark** | The model didn't call `botmux send` | [C. Terminal has output but nothing reached Lark](#c-terminal-has-output-but-nothing-reached-lark) |
+| The card says "working" and the terminal has output, but **nothing reaches Lark** | In send mode the model didn't call `botmux send`, or transcript replies couldn't read the session record | [C. Terminal has output but nothing reached Lark](#c-terminal-has-output-but-nothing-reached-lark) |
 | The session **won't start**, and the first message errors with `zsh: parse error` | The login shell's startup file switches shells | [Session does not start](#session-does-not-start) |
 
 ### A. No messages at all
@@ -57,13 +57,15 @@ Full rules: [Permissions & Access](/en/permissions).
 
 ### C. Terminal has output but nothing reached Lark
 
-Output printed in the terminal is not the same as a message sent to Lark. For CLIs that send explicitly (Claude Code, Codex CLI, Antigravity, CoCo, and others), the model must run `botmux send` for the group to see anything:
+Output printed in the terminal is not the same as a message sent to Lark. First check how this bot delivers replies:
 
-- Every send needs one of `--mention-back`, `--mention`, or `--no-mention`; otherwise it errors and sends nothing.
-- If it only uses `echo` / `print`, or forgets `botmux send`, nothing goes out.
-- Pass multi-line content with a heredoc; don't write `"line one\nline two"`.
+- **Transcript replies** (`replyDelivery: "transcript"`, the default for Claude Code, Codex, TraeX, CoCo, Pi, Grok, Cursor and others): botmux takes the turn's last answer from the CLI's session record and posts it. If nothing arrives, the session record usually wasn't read — the chat shows a notice that botmux couldn't read the turn; open the Web terminal for the result. You can also switch back to model-sent replies with `/botconfig set replyDelivery send`.
+- **Send mode** (`replyDelivery: "send"` set explicitly, or a CLI without transcript support such as Antigravity, OpenCode or Relay): the model must run `botmux send` for the group to see anything.
+  - Every send needs one of `--mention-back`, `--mention`, or `--no-mention`; otherwise it errors and sends nothing.
+  - If it only uses `echo` / `print`, or forgets `botmux send`, nothing goes out.
+  - Pass multi-line content with a heredoc; don't write `"line one\nline two"`.
 
-Two cases where the model doesn't need to send by itself:
+Two more cases where the model doesn't need to send by itself:
 
 - **`codex-app`** (the Codex App protocol): botmux forwards the final reply automatically. Don't call `botmux send` for normal replies or they'll be posted twice; use it only for mid-turn progress, attachments, or @-mentioning another bot.
 - **Zero prompt injection mode** (`promptInjection: "none"`): botmux picks the final answer from the CLI's transcript and posts it to Lark. See [bots.json](/en/bots-json).
@@ -241,7 +243,7 @@ Pick one fix:
   PATH, nvm, and the like must live in the chosen shell's own startup file (such as `.zshrc`; for fish, `~/.config/fish/config.fish`).
 - **Fix the startup file**: only switch when you open a terminal by hand: `[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec zsh` (put PATH, nvm, etc. before this line).
 
-Then run `botmux restart` and send another message. This only affects backends that start through a shell (`tmux` / `zellij` / `zmx`); the `pty` backend starts the CLI directly and isn't affected.
+Then run `botmux restart` and send another message. This only affects backends that start through a shell (`tmux` / `zellij` / `zmx` / `hc`); the `pty` backend starts the CLI directly and isn't affected.
 
 ### The Workbench or terminal won't load on my phone?
 

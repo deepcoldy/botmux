@@ -1,3 +1,4 @@
+import { claudePromptSuggestion } from '../../utils/claude-prompt-suggestion.js';
 import { randomBytes } from 'node:crypto';
 import {
   closeSync,
@@ -691,9 +692,14 @@ export function setClaudePidStateRereadSleepForTests(fn: ((ms: number) => void) 
   pidStateRereadSleepFn = fn ?? sleepSyncMs;
 }
 
-/** The parsed pid-state record; undefined when there is none or it never
- *  parses. Only a record that exists but does not parse is re-read: a missing
- *  one is the common answer for a pid that is not Claude, polled every tick. */
+/** readClaudePidState's answer for a record that exists but never parsed
+ *  within the re-reads: still mid-rewrite, not absent. */
+const PID_STATE_MID_REWRITE = Symbol('pid-state record mid-rewrite');
+
+/** The parsed pid-state record; undefined when there is none, or
+ *  PID_STATE_MID_REWRITE when it never parses. Only a record that exists but
+ *  does not parse is re-read: a missing one is the common answer for a pid that
+ *  is not Claude, polled every tick. */
 function readClaudePidState(path: string): unknown {
   for (let attempt = 0; ; attempt++) {
     let text: string;
@@ -705,7 +711,7 @@ function readClaudePidState(path: string): unknown {
     try {
       return JSON.parse(text);
     } catch {
-      if (attempt >= PID_STATE_REREAD_DELAYS_MS.length) return undefined;
+      if (attempt >= PID_STATE_REREAD_DELAYS_MS.length) return PID_STATE_MID_REWRITE;
       pidStateRereadSleepFn(PID_STATE_REREAD_DELAYS_MS[attempt]!);
     }
   }
@@ -718,8 +724,17 @@ function readClaudePidState(path: string): unknown {
  *  procStart is present but cannot be verified on Linux, fail closed; callers
  *  fall back to fingerprint detection. */
 export function resolveJsonlFromPid(pid: number, expectedCwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): { path: string; cliSessionId: string } | null {
+  const resolved = resolveJsonlFromPidState(pid, expectedCwd, dataDir);
+  return resolved === 'mid-rewrite' ? null : resolved;
+}
+
+/** resolveJsonlFromPid, telling a record Claude is still rewriting past the
+ *  re-reads ('mid-rewrite': an answer exists but cannot be read yet) apart
+ *  from no usable answer at all (null). */
+export function resolveJsonlFromPidState(pid: number, expectedCwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): { path: string; cliSessionId: string } | 'mid-rewrite' | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   const parsed: any = readClaudePidState(claudePidStatePath(pid, dataDir));
+  if (parsed === PID_STATE_MID_REWRITE) return 'mid-rewrite';
   if (!parsed || typeof parsed !== 'object') return null;
   if (parsed.pid !== pid) return null;
   if (typeof parsed.sessionId !== 'string' || !SESSION_UUID_RE.test(parsed.sessionId)) return null;
@@ -1162,6 +1177,8 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     },
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     supportsTypeAhead: true,
+    // Every Claude-family variant runs the same TUI and input box.
+    promptSuggestion: claudePromptSuggestion,
     supportsProgramStatus: variant.supportsProgramStatus,
     reliableTurnTerminal: variant.reliableTurnTerminal,
     // Isolation = worker-side whole-process Seatbelt wrapper. Claude's built-in
@@ -1733,12 +1750,15 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // `/effort` 不在此处——它是全局 PASSTHROUGH_COMMANDS 的成员（所有 CLI 尽力透传，
     // 且刻意不带冷启动语义）。这里只保留 `/goal`：它是「开启一段目标工作」的命令，需要
     // 空 topic 冷启动能力（isInitialSessionPassthrough 只认 adapter 层的这个字段）。
-    defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
+    defaultPassthroughCommands: ['claude-code', 'seed', 'relay'].includes(variant.id) ? ['/goal'] : undefined,
     // Seed shares most of this adapter but has not been verified to expose the
     // same native session-rename command. Keep the capability exact to Claude.
     buildSessionRenameCommand: variant.id === 'claude-code'
       ? (title) => `/rename ${title}`
       : undefined,
+    // Bare `/rename` makes Claude Code pick a name from the conversation and
+    // answer "Session renamed to: …" (verified on 2.1.323).
+    sessionAutoRenameCommand: variant.id === 'claude-code' ? '/rename' : undefined,
     systemHints: [],
     altScreen: false,
     // Claude Code (及 seed 同源 fork) 的 TUI 自管重绘整段 transcript，xterm/tmux

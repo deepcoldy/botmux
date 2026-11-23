@@ -4,6 +4,14 @@ export const SESSION_EVENT_PROTOCOL_VERSION = 2 as const;
 /** New worker boots always negotiate this contract. Legacy output recovery is
  * independent of executor admission; it cannot disable the state authority. */
 export function sessionContractsEnabled(): boolean { return true; }
+/** The host computes historical execution observer grants only for a persistent
+ * Codex CLI whose pane outlives its worker: tmux, and hc (a core-held terminal
+ * the next worker reattaches to, proven by the same process_start identity).
+ * The worker may wait for such a grant only under the same predicate; every
+ * other CLI/backend keeps the ordinary admission path. */
+export function executionObserverSupported(cliId: unknown, backend: unknown): boolean {
+  return cliId === 'codex' && (backend === 'tmux' || backend === 'hc');
+}
 export function contractTerminalStatus(status: unknown, errorCode: unknown): 'succeeded' | 'failed' | 'cancelled' | 'reconciling' {
   if (typeof errorCode === 'string' && (errorCode === 'rpc_turn_aborted'
     || errorCode === 'codex_turn_aborted' || errorCode.startsWith('codex_turn_aborted_')
@@ -34,9 +42,10 @@ export interface RuntimeExecutionContinuationFailure {
 }
 /** Local PTY-family backends whose process_start identity a continuation can
  * prove. Remote backends run off-box; zmx launches the CLI itself rather than
- * botmux, so neither can supply the required physical process proof. The host
- * gate and the Worker rotation gate must use this same set. */
-export const TRAEX_CONTINUATION_BACKENDS = ['pty', 'tmux', 'zellij', 'herdr'] as const;
+ * botmux, so neither can supply the required physical process proof. hc runs
+ * botmux's own pane launcher as a local process on this host, like tmux. The
+ * host gate and the Worker rotation gate must use this same set. */
+export const TRAEX_CONTINUATION_BACKENDS = ['pty', 'tmux', 'zellij', 'herdr', 'hc'] as const;
 export interface RuntimeIdentity {
   backend: string;
   physicalId: string;
@@ -121,6 +130,9 @@ export type ContractEvent =
   | { type: 'execution_admitted'; execution: ExecutionContract }
   | { type: 'execution_phase'; execution: ExecutionRef; runtime: RuntimeRef; phase: Exclude<ExecutionPhase, 'succeeded' | 'failed' | 'cancelled'> }
   | { type: 'execution_continued'; execution: ExecutionRef; from: RuntimeRef; runtime: RuntimeRef }
+  /** A successor worker re-attached the very CLI process `from` ran in, with
+   * the same native conversation, and that process now is `runtime`. */
+  | { type: 'execution_reattached'; execution: ExecutionRef; from: RuntimeRef; runtime: RuntimeRef }
   | { type: 'execution_terminal'; execution: ExecutionRef; runtime: RuntimeRef; status: 'succeeded' | 'failed' | 'cancelled' | 'reconciling'; evidence: string; errorCode?: string }
   | { type: 'execution_output'; execution: ExecutionRef; output: NonNullable<ExecutionContract['output']>; delivery?: ExecutionContract['deliveries'][number] }
   | { type: 'control_requested'; operation: ControlOperation }
@@ -186,7 +198,27 @@ export function reduceSessionContract(input: ContractTransitionInput, event: Con
       session.runtimeEpoch = event.epoch; return finish('applied');
     case 'runtime_bound': {
       if (!sameWorker(session.worker, event.runtime.worker)) return finish('stale');
-      if (session.lifecycle === 'closed' || session.lifecycle === 'closing') { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
+      if (session.lifecycle === 'closed') { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
+      const current = state.runtime;
+      const identity = current?.identity;
+      const nextIdentity = event.runtime.identity;
+      // A late native identity describes the selected executor; it does not
+      // repeat the control operation that originally started that executor.
+      if (current && ['active', 'suspending', 'closing'].includes(session.lifecycle)
+        && ['starting', 'ready'].includes(current.phase) && sameRuntime(session.activeRuntime, current.ref)
+        && sameRuntime(current.ref, event.runtime.ref) && sameWorker(current.worker, event.runtime.worker)
+        && identity && nextIdentity && identity.proof !== 'opaque'
+        && !reusableRuntimeIdentity(identity, nextIdentity)
+        && samePhysicalRuntimeIdentity(identity, nextIdentity)
+        && (identity.nativeSessionId === undefined || identity.nativeSessionId === nextIdentity.nativeSessionId)
+        && (identity.nativeGeneration === undefined || identity.nativeGeneration === nextIdentity.nativeGeneration)) {
+        state.runtime = { ...current, identity: nextIdentity };
+        return finish('applied');
+      }
+      const closeControl = state.operation?.kind === 'close'
+        && !!event.operationId && event.operationId === session.activeOperationId
+        && event.runtime.identity?.backend === 'remote-runner';
+      if (session.lifecycle === 'closing' && !closeControl) { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
       if (event.operationId && session.activeOperationId !== event.operationId) { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
       if (!event.operationId && session.activeOperationId) return finish('conflict', 'runtime_transition_in_progress');
       session.runtimeEpoch = Math.max(session.runtimeEpoch, event.runtime.ref.epoch);
@@ -220,6 +252,16 @@ export function reduceSessionContract(input: ContractTransitionInput, event: Con
       // This logical request was already accepted by the old CLI. Do not
       // make its original bytes runnable again on a fresh worker bootstrap.
       state.execution!.runtime = event.runtime; state.execution!.phase = 'accepted'; state.execution!.revision++;
+      return finish('applied');
+    case 'execution_reattached':
+      if (!sameExecution(state.execution?.ref, event.execution) || !sameRuntime(state.execution?.runtime, event.from)
+        || !sameRuntime(state.runtime?.ref, event.runtime) || !sameRuntime(session.activeRuntime, event.runtime)
+        || session.lifecycle !== 'active' || session.activeOperationId || state.execution?.terminal
+        || ['succeeded', 'failed', 'cancelled'].includes(state.execution?.phase ?? '')
+        || sameRuntime(event.from, event.runtime)) return finish('stale');
+      // The attempt never left that process: no input is replayed and its
+      // phase stands. Only the runtime it is reported under moves to the live one.
+      state.execution!.runtime = event.runtime; state.execution!.revision++;
       return finish('applied');
     case 'execution_phase':
       if (!sameExecution(state.execution?.ref, event.execution) || !sameRuntime(state.execution?.runtime, event.runtime)) return finish('stale');

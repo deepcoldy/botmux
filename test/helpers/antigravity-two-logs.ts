@@ -97,7 +97,7 @@ export function buildAntigravityTwoLogs(): AntigravityTwoLogs {
   }
   full.push({
     step_index: 25, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: created(25), ...tokens,
-    thinking: '合成的收尾思考', content: finalText,
+    thinking: '合成的收尾思考', content: finalText, model: 'gemini-4-carbon-high',
   });
 
   const compact = full.map(record => {

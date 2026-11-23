@@ -12,7 +12,7 @@ The backend version selection is independent of production credentials and schem
 
 ## Configure
 
-On a new interactive `botmux start`, select SQLite or PostgreSQL. Existing installations continue without a prompt. PostgreSQL accepts a JSON configuration file containing a credential reference:
+On a new interactive `botmux start`, select SQLite, PostgreSQL or Supabase. Existing installations continue without a prompt. PostgreSQL accepts a JSON configuration file containing a credential reference:
 
 ### Username and password
 
@@ -104,6 +104,12 @@ For a verified empty installation, run `botmux feedback storage enable-empty --y
 
 ## Migrate existing feedback
 
+Supabase uses the official `@supabase/supabase-js` SDK and an installation-bound
+transactional RPC, rather than a PostgreSQL connection string. SQLite and
+PostgreSQL sources can migrate to it. See [Supabase migration](feedback-supabase-migration.md)
+for candidate configuration, SQL bootstrap, maintenance, verification and recovery.
+Generating the bootstrap SQL does not execute it or switch the active backend.
+
 Webhook claims persist a request-stage marker in existing outbox error metadata.
 A claim abandoned before request admission can be recovered as known-unsent,
 including when SQLite contention prevents its immediate release. Admission
@@ -153,7 +159,7 @@ botmux feedback storage recovery acknowledge --kind webhook --id OUTBOX_ID \
   --evidence "ticket:receipt-and-idempotency-key"
 ```
 
-Use `--kind send` with the exact lease filename for a dead send process. Before acknowledging, verify the destination event/idempotency key or original send receipts and record the evidence reference. The service rejects live processes, in-flight webhooks and stale fingerprints. Acknowledgement retains the original marker/lease and records an audit entry; it neither sends anything nor clears unrelated items. New attempts or changed outcomes invalidate the old fingerprint.
+Use `--kind send` with the exact lease filename for a dead send process. A `botmux send` whose session sandbox cannot write the data directory (macOS read isolation) has its daemon take the lease for that CLI process; such a lease is listed, judged live or dead, and acknowledged exactly like any other. Relayed leases persist only a hash of their lease-scoped release credential, so the sender can still release after a turn rotation, session close or daemon restart. Before acknowledging, verify the destination event/idempotency key or original send receipts and record the evidence reference. The service rejects live processes, in-flight webhooks and stale fingerprints. Acknowledgement retains the original marker/lease and records an audit entry; it neither sends anything nor clears unrelated items. New attempts or changed outcomes invalidate the old fingerprint.
 
 The same operations are available under **Feedback storage → Manual recovery and resolution** in Dashboard. Host administrator and CSRF checks apply. Confirmation, reason and external evidence are mandatory; do not place credentials in audit text.
 

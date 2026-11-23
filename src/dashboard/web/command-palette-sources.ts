@@ -20,6 +20,7 @@ import { BOT_DEFAULTS_SECTIONS, BOT_DEFAULTS_TABS, BOT_DEFAULTS_TAB_LABEL_KEYS, 
 import { BOT_DEFAULTS_ALIASES } from './nav-items.js';
 import { SETTINGS_SECTIONS, type SettingsSection } from './settings-sections.js';
 import type { SkillRow } from './skills/types.js';
+import type { ContentSearchMatch } from './store.js';
 import type { PaletteItem, PaletteTone } from './command-palette-model.js';
 
 export interface PalettePageEntry {
@@ -151,11 +152,14 @@ export function buildSessionItems(
   rows: Iterable<Record<string, any>>,
   now = Date.now(),
   cache?: WeakMap<object, PaletteItem>,
+  contentMatches?: ReadonlyMap<string, ContentSearchMatch>,
 ): PaletteItem[] {
   return orderSessionsForPalette(rows).map(s => {
     const cached = cache?.get(s);
-    if (cached) return cached;
+    const excerpt = contentMatches?.get(String(s.sessionId))?.snippet;
+    if (cached && cached.excerpt === excerpt) return cached;
     const item = buildSessionItem(s, now);
+    if (excerpt !== undefined) item.excerpt = excerpt;
     cache?.set(s, item);
     return item;
   });

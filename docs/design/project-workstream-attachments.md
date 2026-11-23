@@ -8,6 +8,8 @@
 ```bash
 botmux project workstream inspect --root om_root --source-app cli_worker --source-session session-id
 botmux project workstream attach --root om_root --source-app cli_worker --source-session session-id --title "具体任务"
+botmux project workstream attach --root om_root --source-app cli_worker --source-session session-id --title "具体任务" --claim-owner
+botmux project workstream confirm --root om_root --source-app cli_worker --source-session session-id [--title "具体任务"]
 botmux project workstream rename --root om_root --title "新的具体标题"
 botmux project workstream update --root om_root --status in_progress --content "正在实现"
 botmux project workstream status
@@ -30,7 +32,21 @@ botmux project workstream attach --root om_root --source-app cli_worker --source
 ```
 
 grant 限当前源 session、话题、关联版本、项目群和主控 app，一小时有效，不授权
-读取私聊 transcript/终端。bot 触发回合、定时任务回合、未知 caller 不会被推测成人类。
+读取私聊 transcript/终端。bot 触发回合、定时任务回合、未知 caller 不会被推测成人类，
+拒绝码明确区分：
+
+- `actor_nonhuman`：当前回合不是真人直接发起（机器人转发、非迁入通知的后台/定时触发等），不可代本人认领或变更归属。
+- `source_owner_unknown`：源会话缺少 `ownerOpenId`/`ownerUnionId`（如早期无主会话迁入），不能走 `grant`，需由本人显式认领。
+- `source_owner_authorization_required`：源会话已有其他成员的 owner，需原主人在源话题执行 `grant` 后由主控带 `--grant` 登记。
+
+### 无主会话显式认领与迁入话题确认卡
+
+当无主会话迁入项目群时，不能凭机器人转发文字、`lastCaller` 或 relay 占位推断归属，支持两条经宿主鉴权并留存审计日志的显式认领路径：
+
+1. **迁入话题确认卡片（推荐）**：开启迁入通知（见下文「可选迁入通知」）时，宿主在投递迁入通知的同时，直接由主控应用在迁入后的目标话题内回复一张可见的「项目会话迁入」卡片（展示来源 Bot、会话摘要、迁入方式、当前是否已登记看板及未登记原因）；对已迁入的历史会话，主控也可执行 `botmux project workstream confirm` 补发/刷新该卡片。需要本人确认时卡片附带「确认登记」按钮，点击人经飞书回调 `operator` 校验确认为主控会话真人 owner 且具备源 Bot 的人类操作权限后，宿主将无主会话的 `ownerUnionId`（及经 `union_id` 在源应用解析出的 `ownerOpenId`，绝不跨应用复制 `ou_`）补写为本人并完成 `attach`；workflow、会议、监听、周期执行等专属会话一律不可认领（`source_managed_elsewhere`），同步更新项目置顶进度卡与话题卡片，全程记录 `[project-workstream-claim]` 与 `[project-import-card]` 审计日志。
+2. **本人真人回合显式认领**：本人在项目群直接 @主控 发话要求认领并登记时，主控可在该真人回合执行 `botmux project workstream attach ... --claim-owner` 完成认领与登记（非真人回合调用一律返回 `actor_nonhuman`；已有其他 owner 的会话一律返回 `source_owner_already_present`，绝不覆盖）。
+
+在宿主投递的 `project-import` 通知回合中，仅对当前通知绑定的 `(rootMessageId, sourceLarkAppId, sourceSessionId)` 放行 `inspect`、`confirm`、同主人会话的 `attach` 与该话题的 `rename`（使同主人会话能立即写入项目置顶进度卡并把话题卡更新为「已登记看板」）；其它源会话、`--claim-owner`、`--grant`、`notifications`、`update`、`status`、`grant` 一律返回 `actor_nonhuman`。通知回合的身份就是主控会话由真人建立的 owner，宿主不会因为一次迁入去设定或改写主控 owner。不放开静默回合的模型自由群发，避免提示词注入或后台重试噪音污染主群时间线。
 
 ## 安全与恢复
 
@@ -54,12 +70,18 @@ grant 限当前源 session、话题、关联版本、项目群和主控 app，�
 
 ## 可选迁入通知
 
-默认关闭，旧群升级后不增加模型回合。项目主控在本人当前回合显式选择：
+默认关闭，旧群升级后不增加模型回合、不多发消息。群级开关 `importedSessionPolicy`
+在 Dashboard「群组 → 项目模式 → 迁入会话时通知主控」配置（项目未初始化时也可开），
+项目已初始化后，主控也可在本人当前回合显式切换：
 
 ```bash
 botmux project workstream notifications --mode notify
 botmux project workstream notifications --mode ignore
 ```
+
+开启后：已初始化的项目里，迁入会话会让主控跑一轮静默通知回合（只可登记同主人会话），
+并由宿主在迁入话题发一张登记卡；项目尚未初始化时，宿主只在话题发「等待项目初始化」卡，
+通知留在 pending，等真人初始化项目后再投递给主控，并刷新卡片。
 
 只通知明确 relay/bind/adopt/import/fork 的项目 Worker 独立话题，非项目群不发。
 通知只含 app/session/root/source/revision，不附标题、cwd、transcript 或终端内容。

@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readlinkSync } from 'node:fs';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import { pidNotProvablyGone } from '../utils/process-alive.js';
 import type { FleetState } from './fleet-supervisor-policy.js';
+import type { BotmuxEntry } from './self-spawn.js';
 
 export interface FleetProcessAttestation {
   pid: number;
@@ -24,13 +25,14 @@ export type FleetProcessInspection =
   | { status: 'stale' }
   | { status: 'unverifiable' };
 
-const BUILTIN_FLEET_ENTRY_MARKERS = {
+const BUILTIN_FLEET_ENTRY_MARKERS: Partial<Record<BotmuxEntry, { token: string; script: string }>> = {
   daemon: { token: '__daemon', script: 'index-daemon.js' },
   dashboard: { token: '__dashboard', script: 'index-dashboard.js' },
+  'topic-indexer': { token: '__topic-indexer', script: 'index-topic-indexer.js' },
   supervisor: { token: '__supervisor', script: 'index-supervisor.js' },
   // Session workers: `fork(<dist>/worker.js)`, or `<binary> __worker` compiled.
   worker: { token: '__worker', script: 'worker.js' },
-} as const;
+};
 
 function commandLineHasArg(commandLine: string, arg: string): boolean {
   const escaped = arg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -44,10 +46,12 @@ function commandLineHasArg(commandLine: string, arg: string): boolean {
  * token. Both markers survive upgrades and worktree switches.
  */
 export function builtinFleetEntryMatches(
-  entry: keyof typeof BUILTIN_FLEET_ENTRY_MARKERS,
+  entry: BotmuxEntry,
   commandLine: string,
 ): boolean {
-  const { token, script } = BUILTIN_FLEET_ENTRY_MARKERS[entry];
+  const marker = BUILTIN_FLEET_ENTRY_MARKERS[entry];
+  if (!marker) return false;
+  const { token, script } = marker;
   if (commandLineHasArg(commandLine, token)) return true;
   const escaped = script.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`(?:^|[\\s\"'\\\\/])${escaped}(?:$|[\\s\"'])`).test(commandLine);

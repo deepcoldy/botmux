@@ -16,6 +16,7 @@ import {
   claudeJsonlPathForSession,
   claudePidStatePath,
   resolveJsonlFromPid,
+  resolveJsonlFromPidState,
   setClaudePidStateRereadSleepForTests,
 } from '../src/adapters/cli/claude-code.js';
 
@@ -107,6 +108,33 @@ describe('resolveJsonlFromPid reads through a record Claude is rewriting', () =>
 
     expect(resolveJsonlFromPid(pid, cwd, dataDir)?.cliSessionId).toBe(after);
     expect(sleeps).toEqual([]);
+  });
+});
+
+describe('resolveJsonlFromPidState tells a record still mid-rewrite from no record', () => {
+  it('a record that never parses within the re-reads is mid-rewrite, not absent', () => {
+    writeFileSync(recordPath, '');
+    watchSleeps();
+
+    expect(resolveJsonlFromPidState(pid, cwd, dataDir)).toBe('mid-rewrite');
+    expect(resolveJsonlFromPid(pid, cwd, dataDir)).toBeNull();
+  });
+
+  it('no record, or a record that is not this process\'s, is no answer', () => {
+    watchSleeps();
+    expect(resolveJsonlFromPidState(pid, cwd, dataDir)).toBeNull();
+    writeFileSync(recordPath, JSON.stringify({ pid: pid + 1, sessionId: after, cwd }));
+    expect(resolveJsonlFromPidState(pid, cwd, dataDir)).toBeNull();
+  });
+
+  it('a record that finishes its rewrite during the re-reads is read', () => {
+    writeFileSync(recordPath, '');
+    watchSleeps(() => writeFileSync(recordPath, record(after, 'idle')));
+
+    expect(resolveJsonlFromPidState(pid, cwd, dataDir)).toEqual({
+      path: claudeJsonlPathForSession(after, cwd, dataDir),
+      cliSessionId: after,
+    });
   });
 });
 

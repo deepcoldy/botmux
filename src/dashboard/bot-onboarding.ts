@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
+import { readBotsJsonOrEmpty, writeBotsJsonAtomic, mutateBotsJsonAtomic } from '../setup/bots-store.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { cloneBotConfig, normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
@@ -9,6 +9,7 @@ import {
   resolveScannerAllowedUser,
   resolveSessionEmailAllowedUser,
 } from '../setup/owner-identity.js';
+import { completeRegisteredApp, createRegistrationOptions } from '../setup/registration-manifest.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
 import {
   validateCredentials,
@@ -35,6 +36,9 @@ import {
 import type { CliId } from '../adapters/cli/types.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
 import { validateCliLaunchModeConfig } from '../core/cli-launch-mode.js';
+import { buildLocalBotRecord, reallocateLocalBotId } from '../setup/local-bot.js';
+import { checkCliAvailability } from '../setup/cli-availability.js';
+import { invalidWorkingDirs } from '../utils/working-dir.js';
 
 // Static default-imports of qrcode-terminal's vendored QRCode class (its public
 // API only prints to a terminal; we need the low-level class to render a QR into
@@ -53,7 +57,7 @@ export type BotOnboardingStatus =
   | 'verifying'
   // 正在自动配置开放平台权限 (导入 scope / redirect / 发版).
   | 'configuring_permissions'
-  // 仅显式兼容模式可能需要第二次扫码；Feishu 主路径不会进入此状态.
+  // 网页补配需要 owner 确认。
   | 'waiting_for_platform_scan'
   // 扫码人身份无法被新 app 验证 → 不落盘空 allowedUsers 的开放 bot, 等用户在
   // Dashboard 手动填写并通过校验的 owner 后才进入 completed (fail-closed).
@@ -72,6 +76,7 @@ export interface BotOnboardingPermission {
   versionId?: string;
   /** 部分权限注册失败的告警 */
   scopeWarning?: string;
+  eventWarning?: string;
   /** Exact same-session event mode ACK for MOSA-managed activation. */
   eventMode?: number;
   /** Exact baseline event + callback count ACK for MOSA-managed activation. */
@@ -106,7 +111,7 @@ export interface BotOnboardingSnapshot {
   permissionStatusMsg?: string;
   appId?: string;
   appName?: string;
-  registrationMode?: 'web' | 'compat';
+  registrationMode?: 'sdk' | 'web' | 'compat' | 'local';
   /** Existing onboarding job whose exact App permission setup is being resumed. */
   recoveryOfJobId?: string;
   /** Monotonic permission-recovery attempt within the same immutable target lineage. */
@@ -159,8 +164,8 @@ export interface BotOnboardingInput {
   /** 飞书应用名称；普通创建留空生成 botmux-N，克隆留空生成 源名称-copy-时间戳。 */
   appName?: string;
   cloneSourceAppId?: string;
-  /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 SDK 兼容模式。 */
-  registrationMode?: 'web' | 'compat';
+  /** 默认 Feishu 单码主路径；compat 是 SDK 兼容模式；sdk 是官方注册清单（仅显式传入）；local 不创建飞书应用。 */
+  registrationMode?: 'sdk' | 'web' | 'compat' | 'local';
   /**
    * reuse: 使用表单已展示并确认的身份，缓存失效时不静默弹码；
    * qr: 用户明确选择首次登录/更换账号，强制生成新二维码。
@@ -313,13 +318,14 @@ export interface BotOnboardingManagerOptions {
   pendingStorePath?: string;
   /** Private, secret-free recovery lineage used to turn restart into a fresh owner QR. */
   permissionRecoveryStorePath?: string;
-  /** 单次 Feishu Web 登录建应用主路径；测试可注入。 */
+  /** 显式网页创建和受管 onboarding 使用。 */
   createApp?: CreateAppFn;
   inspectSession?: InspectSessionFn;
-  /** SDK device flow fallback；显式只注入 registerApp 时保留旧测试路径。 */
+  /** 官方注册接口。 */
   registerApp?: RegisterAppFn;
   validateCredentials?: ValidateCredentialsFn;
   automateOpenPlatform?: AutomateOpenPlatformFn;
+  completeRegisteredApp?: typeof completeRegisteredApp;
   verifyCriticalScopes?: VerifyCriticalScopesFn;
   /**
    * A single complete application-info response is not an activation ACK:
@@ -432,11 +438,12 @@ export class BotOnboardingManager {
   // 避免在 owner 确认前就有一个空 allowlist 的可启动 bot 留在磁盘上（重启即 fail-open）。
   // 也不放进 jobs 快照（那个会序列化给前端、会泄漏 secret）。owner 校验通过后才 append。
   private readonly pendingBots = new Map<string, Record<string, any>>();
-  private readonly createApp?: CreateAppFn;
+  private readonly createApp: CreateAppFn;
   private readonly inspectSession: InspectSessionFn;
   private readonly registerApp: RegisterAppFn;
   private readonly validateCredentials: ValidateCredentialsFn;
   private readonly automateOpenPlatform: AutomateOpenPlatformFn;
+  private readonly completeRegisteredApp: typeof completeRegisteredApp;
   private readonly verifyCriticalScopes: VerifyCriticalScopesFn;
   private readonly criticalScopeStableReads: number;
   private readonly criticalScopeMaxAttempts: number;
@@ -453,13 +460,12 @@ export class BotOnboardingManager {
   private permissionRecoveryStateError?: string;
 
   constructor(private readonly opts: BotOnboardingManagerOptions) {
-    // 生产默认走单次 Web session；旧单测/外部注入若只给 registerApp，则明确
-    // 视为要求直接测 SDK 路径，避免批量改写既有测试缝。
-    this.createApp = opts.createApp ?? (opts.registerApp ? undefined : createFeishuOpenPlatformApp);
+    this.createApp = opts.createApp ?? createFeishuOpenPlatformApp;
     this.inspectSession = opts.inspectSession ?? (() => inspectCachedFeishuOpenPlatformSession());
     this.registerApp = opts.registerApp ?? tryRegisterApp;
     this.validateCredentials = opts.validateCredentials ?? validateCredentials;
     this.automateOpenPlatform = opts.automateOpenPlatform ?? automateOpenPlatformSetup;
+    this.completeRegisteredApp = opts.completeRegisteredApp ?? completeRegisteredApp;
     this.verifyCriticalScopes = opts.verifyCriticalScopes ?? readCriticalScopesFromApplicationInfo;
     this.criticalScopeStableReads = Number.isInteger(opts.criticalScopeStableReads)
       && (opts.criticalScopeStableReads ?? 0) > 0
@@ -1649,13 +1655,102 @@ export class BotOnboardingManager {
     this.patch(id, { platformQrScanConfirmedAt: confirmedAt });
   }
 
+  /** Persist a local bot. Does not call Feishu, scan a QR, or create an app. */
+  private async runLocal(id: string, input: BotOnboardingInput): Promise<void> {
+    this.patch(id, { registrationMode: 'local' });
+    if (input.cloneSourceAppId) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'local_clone_unsupported',
+        message: '克隆会新建飞书应用。本地模式只创建不关联飞书的机器人。',
+      });
+      return;
+    }
+    const workingDir = input.workingDir?.trim() || '~';
+    const bad = invalidWorkingDirs({ workingDir });
+    if (bad.length > 0) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_working_dir',
+        message: `目录不存在或不是目录: ${bad.join(', ')}`,
+      });
+      return;
+    }
+    const displayName = input.appName?.trim();
+    const cliId: CliId = input.cliId ?? 'claude-code';
+    const record = buildLocalBotRecord({
+      displayName,
+      cliId,
+      wrapperCli: input.wrapperCli,
+      cliLaunchMode: input.cliLaunchMode,
+      ...(input.dirMode === 'fixed' ? { defaultWorkingDir: workingDir } : { workingDir }),
+      model: input.model,
+      existingIds: readBotsJsonOrEmpty(this.opts.botsJsonPath)
+        .map((bot: { larkAppId?: string }) => bot?.larkAppId)
+        .filter((appId: string | undefined): appId is string => typeof appId === 'string' && appId.length > 0),
+    });
+    try {
+      validateCliLaunchModeConfig({
+        cliId: record.cliId,
+        cliLaunchMode: record.cliLaunchMode,
+        wrapperCli: record.wrapperCli,
+        cliRuntime: record.cliRuntime,
+        cliPathOverride: record.cliPathOverride,
+      }, 'Dashboard local bot');
+    } catch (error) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_launch_mode_config',
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+    const availability = checkCliAvailability({
+      cliId: record.cliId,
+      cliPathOverride: record.cliPathOverride,
+      wrapperCli: record.wrapperCli,
+      cliLaunchMode: record.cliLaunchMode,
+    });
+    if (!availability.available) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'cli_not_found',
+        message: `所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。未写入配置。`,
+      });
+      return;
+    }
+    const persisted = await this.persistNewLocalBot(record);
+    await this.runLiveStart(id, String(persisted.bot.larkAppId));
+    this.patch(id, {
+      status: 'completed',
+      appId: String(persisted.bot.larkAppId),
+      appName: displayName || String(persisted.bot.larkAppId),
+      cliId,
+      workingDir,
+      addedBotIndex: persisted.index,
+      message: 'larkAppId 是稳定的本地身份，不是飞书 App ID。',
+    });
+  }
+
   private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
+    if (input.registrationMode === 'local') {
+      await this.runLocal(id, input);
+      return;
+    }
     const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
     const cloneSource = input.cloneSourceAppId
       ? configuredBots.find((bot: any) => bot?.larkAppId === input.cloneSourceAppId)
       : undefined;
     if (input.cloneSourceAppId && !cloneSource) {
       this.patch(id, { status: 'failed', error: 'clone_source_not_found', message: '源机器人不存在' });
+      return;
+    }
+    if (cloneSource?.localIdentity === true) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'local_clone_unsupported',
+        message: '本地机器人不支持克隆；未创建飞书应用。',
+      });
       return;
     }
     // Freeze the resolved name before any asynchronous work. Later bot list
@@ -1668,8 +1763,9 @@ export class BotOnboardingManager {
           this.now(),
         )
       : resolveSetupAppName(input.appName, configuredBots.length);
+    const registrationMode = input.registrationMode ?? 'web';
     this.patch(id, {
-      registrationMode: input.registrationMode ?? 'web',
+      registrationMode,
       ...(input.requireCriticalScopesBeforeActivation
         ? { criticalScopeActivationRequired: true }
         : {}),
@@ -1679,11 +1775,11 @@ export class BotOnboardingManager {
     });
 
     let result: RegisterAppResult;
-    // Web 主路径的登录身份邮箱。免扫码/单扫链路没有 device-flow 的 userOpenId,
-    // 自动确认 owner 只能靠它——正是表单顶部「将使用 …」展示并确认过的账号。
+    // 网页创建使用已验证的会话邮箱作为 owner 候选。
     let sessionEmail: string | undefined;
-    if (input.registrationMode === 'compat' || !this.createApp) {
-      result = await this.registerWithSdk(id);
+    const registration = registrationMode === 'sdk' ? createRegistrationOptions(appName) : undefined;
+    if (registrationMode !== 'web') {
+      result = await this.registerWithSdk(id, registration);
     } else {
       const created = await this.createApp({
         name: appName,
@@ -1723,12 +1819,12 @@ export class BotOnboardingManager {
     }
 
     if (!result.ok) {
-      this.patch(id, { status: 'failed', error: result.error, message: result.message });
+      this.patch(id, { status: 'failed', error: result.error, message: result.message, qrUrl: undefined, qrDataUrl: undefined });
       return;
     }
     // brand (feishu / lark) 由扫码 tenant_brand 自动识别后落盘；daemon 链路
     // 全程从 BotConfig.brand 派生域名，feishu / lark 都能直接跑。
-    this.patch(id, { status: 'verifying', appId: result.appId, brand: result.brand, message: undefined });
+    this.patch(id, { status: 'verifying', appId: result.appId, brand: result.brand, message: undefined, qrUrl: undefined, qrDataUrl: undefined });
     const validation = await this.validateCredentials(result.appId, result.appSecret, result.brand);
     if (!validation.ok) {
       this.patch(id, {
@@ -1797,7 +1893,8 @@ export class BotOnboardingManager {
     const auto = await this.runPermissionAutomation(id, result.appId, result.brand, {
       cliId,
       workingDir,
-      registrationMode: input.registrationMode ?? 'web',
+      registrationMode,
+      registration: registration?.addons && { credentials: result, addons: registration.addons },
       requireVerifiedEvents: input.requireCriticalScopesBeforeActivation === true,
     });
     // Every managed initial App first reaches one durable activation-pending
@@ -1851,13 +1948,14 @@ export class BotOnboardingManager {
     }
   }
 
-  private async registerWithSdk(id: string): Promise<RegisterAppResult> {
+  private async registerWithSdk(id: string, options?: RegisterAppOptions): Promise<RegisterAppResult> {
     return this.registerApp({
+      ...options,
       onQRCodeReady: info => {
         this.patch(id, {
           status: 'waiting_for_scan',
           qrUrl: info.url,
-          qrDataUrl: this.renderQrDataUrl(info.url),
+          qrDataUrl: options?.addons ? undefined : this.renderQrDataUrl(info.url),
           expireAt: this.now() + info.expireIn * 1000,
         });
       },
@@ -1866,6 +1964,44 @@ export class BotOnboardingManager {
         if (info.status === 'domain_switched') this.patch(id, { message: 'domain_switched' });
       },
     });
+  }
+
+  /** Create-only local append: allocate against the locked generation, never upsert. */
+  private async persistNewLocalBot<T extends {
+    larkAppId?: string;
+    displayName?: string;
+    name?: string;
+  }>(record: T): Promise<{ bot: T & { larkAppId: string }; index: number }> {
+    let allocated: (T & { larkAppId: string }) | undefined;
+    try {
+      return await this.runBotsMutation(() => mutateBotsJsonAtomic(this.opts.botsJsonPath, bots => {
+        allocated = normalizeBotConfig(reallocateLocalBotId(
+          record,
+          bots.map((bot: any) => String(bot?.larkAppId ?? '')).filter(Boolean),
+        ));
+        const index = bots.length;
+        return {
+          bots: [...bots, allocated],
+          result: { bot: allocated, index },
+        };
+      }));
+    } catch (error) {
+      // The file rename may already have succeeded when a coordinator's
+      // post-write commit fails. Reconcile that exact record instead of letting
+      // a no-appId failure trigger a second create/append on local retry.
+      if (!allocated) throw error;
+      const expected = allocated as Record<string, any>;
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const index = bots.findIndex((bot: any) => (
+        bot?.larkAppId === expected.larkAppId
+        && bot?.localIdentity === true
+        && bot?.cliId === expected.cliId
+        && bot?.displayName === expected.displayName
+        && bot?.name === expected.name
+      ));
+      if (index < 0) throw error;
+      return { bot: bots[index], index };
+    }
   }
 
   /** 把 bot append/更新进 bots.json（按 larkAppId upsert, 幂等），返回它的行号。 */
@@ -1947,7 +2083,8 @@ export class BotOnboardingManager {
     meta: {
       cliId: string;
       workingDir: string;
-      registrationMode: 'web' | 'compat';
+      registrationMode: 'sdk' | 'web' | 'compat';
+      registration?: { credentials: Extract<RegisterAppResult, { ok: true }>; addons: NonNullable<RegisterAppOptions['addons']> };
       requireVerifiedEvents: boolean;
     },
   ): Promise<OpenPlatformAutomationResult> {
@@ -1975,7 +2112,19 @@ export class BotOnboardingManager {
     };
 
     try {
-      if (meta.registrationMode === 'compat') {
+      if (meta.registration && !meta.requireVerifiedEvents) {
+        const sessionFilePath = join(dirname(this.opts.botsJsonPath), 'onboarding-sessions', `${id}.json`);
+        try {
+          return await this.completeRegisteredApp(meta.registration.credentials, meta.registration.addons, this.automateOpenPlatform, {
+            ...callbacks,
+            sessionFilePath,
+            disableBytedcliFallback: true,
+          });
+        } finally {
+          rmSync(sessionFilePath, { force: true });
+        }
+      }
+      if (meta.registrationMode !== 'web') {
         const sessionFilePath = join(
           dirname(this.opts.botsJsonPath),
           'onboarding-sessions',
@@ -1988,18 +2137,16 @@ export class BotOnboardingManager {
           callbacks,
           sessionFilePath,
           meta.requireVerifiedEvents,
-          // compat 路径同样是「刚注册出来的新应用」（registerWithSdk），白名单必然为空。
           true,
+          meta.registrationMode === 'sdk' ? false : undefined,
         );
       }
       const first = await this.automateOpenPlatform({
         appId,
         brand,
-        // The Feishu primary path must never surprise the user with a second
-        // QR. It reuses the session created moments earlier or falls back to
-        // manual recovery. Only explicit compatibility mode may scan again.
-        disableQrLogin: meta.registrationMode === 'web',
-        disableBytedcliFallback: meta.registrationMode === 'web',
+        // 网页创建已取得会话，补配直接复用。
+        disableQrLogin: true,
+        disableBytedcliFallback: true,
         requireVerifiedEvents: meta.requireVerifiedEvents,
         // 这条链路只在 run() 的建应用流程里被调到（应用几分钟前刚由本任务创建），
         // 所以允许 redirect 白名单在读失败时覆盖写；存量 bot 的权限恢复走
@@ -2103,6 +2250,7 @@ export class BotOnboardingManager {
     sessionFilePath: string,
     requireVerifiedEvents: boolean,
     appJustCreated = false,
+    allowBlindRedirectWrite?: false,
   ): Promise<OpenPlatformAutomationResult> {
     try {
       return await this.automateOpenPlatform({
@@ -2114,6 +2262,7 @@ export class BotOnboardingManager {
         disableBytedcliFallback: true,
         requireVerifiedEvents,
         appJustCreated,
+        ...(allowBlindRedirectWrite === false ? { allowBlindRedirectWrite } : {}),
         ...callbacks,
       });
     } finally {
@@ -2141,6 +2290,7 @@ export class BotOnboardingManager {
           skippedScopeCount: auto.skippedScopeCount,
           versionId: auto.versionId,
           scopeWarning: auto.scopeWarning,
+          eventWarning: auto.eventWarning,
           eventMode: auto.eventMode,
           verifiedEventCount: auto.verifiedEventCount,
           // 白名单状态与 ok 分开透传：ok:true 也可能没写成 redirect（见类型注释）。
@@ -2161,6 +2311,8 @@ export class BotOnboardingManager {
       status,
       ...(addedBotIndex !== undefined ? { addedBotIndex } : {}),
       platformQrDataUrl: undefined,
+      qrUrl: undefined,
+      qrDataUrl: undefined,
       permission,
       ...(error ? { error } : {}),
       ...(auto.ok ? {} : { remainingSteps: buildRemainingSteps(appId, brand) }),

@@ -43,21 +43,25 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
     const command = args[0];
     const allowedByAction: Record<string, readonly string[]> = {
       inspect: ['--root', '--source-session', '--source-app', '--grant'],
-      attach: ['--root', '--source-session', '--source-app', '--title', '--purpose', '--revision', '--grant'],
-      rename: ['--root', '--title'],
+      attach: ['--root', '--source-session', '--source-app', '--title', '--purpose', '--revision', '--grant', '--claim-owner'],
+      confirm: ['--root', '--source-session', '--source-app', '--title', '--purpose'],
+      rename: ['--root', '--title', '--source-session', '--source-app'],
       update: ['--root', '--status', '--content', '--progress', '--remaining', '--milestone', '--revision'],
       status: ['--root'],
       grant: [],
       notifications: ['--mode'],
     };
-    if (!command || !allowedByAction[command]) return { ok: false, error: 'workstream 子命令: inspect|attach|rename|update|status|grant' };
+    if (!command || !allowedByAction[command]) return { ok: false, error: 'workstream 子命令: inspect|attach|confirm|rename|update|status|grant|notifications' };
     const rest = args.slice(1);
     const allowed = new Set([...allowedByAction[command]!, '--session-id', '--json']);
     for (let i = 0; i < rest.length; i++) {
       const token = rest[i]!;
       const flag = token.split('=')[0]!;
       if (!allowed.has(flag)) return { ok: false, error: `未知选项: ${token}` };
-      if (flag === '--json') continue;
+      if (flag === '--json' || flag === '--claim-owner') {
+        if (token.includes('=')) return { ok: false, error: `${flag} 不接受值` };
+        continue;
+      }
       const value = token.includes('=') ? token.slice(token.indexOf('=') + 1) : rest[++i];
       if (!value?.trim() || value.startsWith('--')) return { ok: false, error: `${flag} 需要一个值` };
     }
@@ -67,11 +71,18 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
       return { ok: false, error: '--mode 必须是 ignore 或 notify' };
     }
     if (root && !/^om_[A-Za-z0-9_-]{1,128}$/.test(root)) return { ok: false, error: '--root 必须是话题根消息 ID' };
-    if ((command === 'inspect' || command === 'attach') && (!one(rest, '--source-session') || !one(rest, '--source-app'))) {
+    if ((command === 'inspect' || command === 'attach' || command === 'confirm') && (!one(rest, '--source-session') || !one(rest, '--source-app'))) {
       return { ok: false, error: '--source-session 和 --source-app 必填' };
+    }
+    const claimOwner = has(rest, '--claim-owner');
+    if (claimOwner && one(rest, '--grant')) {
+      return { ok: false, error: '--claim-owner 与 --grant 互斥' };
     }
     const title = one(rest, '--title')?.trim();
     if (command === 'rename' && (!title || ['子任务', '子项目'].includes(title) || Array.from(title).length > 24)) {
+      return { ok: false, error: '--title 必须具体、非空且不超过 24 字' };
+    }
+    if ((command === 'confirm' || command === 'attach') && title !== undefined && (!title || ['子任务', '子项目'].includes(title) || Array.from(title).length > 24)) {
       return { ok: false, error: '--title 必须具体、非空且不超过 24 字' };
     }
     const status = one(rest, '--status');
@@ -86,7 +97,7 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
       workstream: {
         action: command, rootMessageId: root, sourceSessionId: one(rest, '--source-session'),
         sourceLarkAppId: one(rest, '--source-app'), title, purpose: one(rest, '--purpose'),
-        grant: one(rest, '--grant'), status, progress,
+        grant: one(rest, '--grant'), ...(claimOwner ? { claimOwner: true } : {}), status, progress,
         content: one(rest, '--content'), remaining: one(rest, '--remaining'), milestone: one(rest, '--milestone'),
         expectedRevision: revision ? Number(revision) : undefined,
         mode: one(rest, '--mode'),

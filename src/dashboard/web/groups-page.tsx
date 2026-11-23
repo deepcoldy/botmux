@@ -26,6 +26,7 @@ import {
   saveGroupCollaborationMode,
   setGroupPinStreamingCard,
   type ProjectGroupRuntimeSummary,
+  type ProjectProgressCardCompletedDisplay,
   type ProjectProgressCardConfig,
   type ProjectProgressCardSectionId,
   type ProjectProgressCardTemplateId,
@@ -1047,6 +1048,7 @@ function collaborationModeSignature(
   coordinatorAppId: string,
   workerAppIds: Iterable<string>,
   autoEnrollWorkers: boolean,
+  importNotify: boolean,
   progressCard: ProjectProgressCardConfig,
 ): string {
   return JSON.stringify({
@@ -1054,7 +1056,16 @@ function collaborationModeSignature(
     coordinatorAppId: mode === 'project' ? coordinatorAppId : '',
     workerAppIds: mode === 'project' ? [...workerAppIds].sort() : [],
     autoEnrollWorkers: mode === 'project' ? autoEnrollWorkers : false,
-    progressCard: mode === 'project' ? progressCard : null,
+    importNotify: mode === 'project' ? importNotify : false,
+    progressCard: mode === 'project'
+      ? {
+          schemaVersion: progressCard.schemaVersion,
+          templateId: progressCard.templateId,
+          sections: progressCard.sections,
+          milestonesExpanded: progressCard.milestonesExpanded,
+          completedDisplay: progressCard.completedDisplay ?? 'all',
+        }
+      : null,
   });
 }
 
@@ -1086,6 +1097,9 @@ export function ProjectGroupModeSection(props: {
   const [autoEnrollWorkers, setAutoEnrollWorkers] = useState(
     chat.collaborationMode === 'project' ? chat.projectAutoEnrollWorkers === true : true,
   );
+  const [importNotify, setImportNotify] = useState(
+    chat.collaborationMode === 'project' && chat.projectImportNotify === true,
+  );
   const [progressCard, setProgressCard] = useState<ProjectProgressCardConfig>(
     () => chat.projectProgressCard ?? defaultProjectProgressCardConfig(),
   );
@@ -1093,10 +1107,12 @@ export function ProjectGroupModeSection(props: {
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<{ text: string; tone: 'ok' | 'warn' } | null>(null);
   const savedSignatureRef = useRef(collaborationModeSignature(
-    mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, progressCard,
+    mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, importNotify, progressCard,
   ));
 
-  const signature = collaborationModeSignature(mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, progressCard);
+  const signature = collaborationModeSignature(
+    mode, coordinatorAppId, workerAppIds, autoEnrollWorkers, importNotify, progressCard,
+  );
   const dirty = signature !== savedSignatureRef.current;
 
   function selectMode(nextMode: 'standard' | 'project'): void {
@@ -1133,6 +1149,17 @@ export function ProjectGroupModeSection(props: {
     setStatus(null);
   }
 
+  function selectCompletedDisplay(completedDisplay: ProjectProgressCardCompletedDisplay): void {
+    setProgressCard(current => {
+      if (completedDisplay === 'all') {
+        const { completedDisplay: _omit, ...rest } = current;
+        return rest;
+      }
+      return { ...current, completedDisplay };
+    });
+    setStatus(null);
+  }
+
   async function save(): Promise<void> {
     if (props.disabled || saving || !dirty) return;
     if (mode === 'project' && !coordinatorAppId) {
@@ -1146,16 +1173,21 @@ export function ProjectGroupModeSection(props: {
         chat.chatId,
         mode === 'standard'
           ? { mode }
-          : { mode, coordinatorAppId, workerAppIds: [...workerAppIds], autoEnrollWorkers, progressCard },
+          : {
+              mode, coordinatorAppId, workerAppIds: [...workerAppIds], autoEnrollWorkers,
+              importedSessionPolicy: importNotify ? 'notify' : 'ignore', progressCard,
+            },
       );
       const nextCoordinator = response.config.coordinatorAppId ?? coordinatorAppId;
       const nextWorkers = response.config.workerAppIds ?? [];
       const nextAutoEnrollWorkers = response.config.autoEnrollWorkers === true;
+      const nextImportNotify = response.config.importedSessionPolicy === 'notify';
       const nextProgressCard = response.config.progressCard ?? progressCard;
       setAutoEnrollWorkers(nextAutoEnrollWorkers);
+      setImportNotify(nextImportNotify);
       setProgressCard(nextProgressCard);
       savedSignatureRef.current = collaborationModeSignature(
-        response.config.mode, nextCoordinator, nextWorkers, nextAutoEnrollWorkers, nextProgressCard,
+        response.config.mode, nextCoordinator, nextWorkers, nextAutoEnrollWorkers, nextImportNotify, nextProgressCard,
       );
       setRuntime(response.project);
       setStatus(response.cardRefresh === 'deferred'
@@ -1254,6 +1286,22 @@ export function ProjectGroupModeSection(props: {
                 <small>{tr('groups.projectAutoEnrollWorkersHelp')}</small>
               </span>
             </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                data-project-import-notify={chat.chatId}
+                checked={importNotify}
+                disabled={props.disabled || saving}
+                onChange={event => {
+                  setImportNotify(event.currentTarget.checked);
+                  setStatus(null);
+                }}
+              />
+              <span className="checkbox-row-main">
+                <strong>{tr('groups.projectImportNotify')}</strong>
+                <small>{tr('groups.projectImportNotifyHelp')}</small>
+              </span>
+            </label>
           </div>
           <section className="g-project-role-config" aria-labelledby={`project-role-config-${chat.chatId}`}>
             <header>
@@ -1324,6 +1372,19 @@ export function ProjectGroupModeSection(props: {
                 ))}
               </div>
             </div>
+            <label className="g-card-completed-display">
+              <span>{tr('groups.projectCardCompletedDisplay')}</span>
+              <select
+                data-project-completed-display={chat.chatId}
+                value={progressCard.completedDisplay ?? 'all'}
+                disabled={props.disabled || saving || !progressCard.sections.includes('workstreams')}
+                onChange={event => selectCompletedDisplay(event.currentTarget.value as ProjectProgressCardCompletedDisplay)}
+              >
+                <option value="all">{tr('groups.projectCardCompletedDisplayAll')}</option>
+                <option value="collapsed">{tr('groups.projectCardCompletedDisplayCollapsed')}</option>
+                <option value="recent">{tr('groups.projectCardCompletedDisplayRecent')}</option>
+              </select>
+            </label>
             <label className="checkbox-row g-card-milestone-default">
               <input
                 type="checkbox"

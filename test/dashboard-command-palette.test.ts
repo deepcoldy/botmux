@@ -521,7 +521,7 @@ describe('CommandPalette interaction', () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(CLOSED_HISTORY_SEARCH_DEBOUNCE_MS - 50); });
       expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/sessions'))).toEqual([]);
       await act(async () => { await vi.advanceTimersByTimeAsync(50); });
-      expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/sessions'))).toEqual([['/api/sessions?view=closed&q=ledger']]);
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/sessions'))).toEqual([['/api/sessions?view=closed&q=ledger'], ['/api/sessions?view=content&q=ledger']]);
       expect(titles()).toContain('Archived ledger migration');
     } finally {
       vi.useRealTimers();

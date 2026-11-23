@@ -11,9 +11,18 @@ import { codexGenerationSessionIdFromRolloutPath, drainCodexRollout, type CodexB
 export function codexEventsWithStableIds(path: string, events: CodexBridgeEvent[]): CodexBridgeEvent[] {
   const sid = codexGenerationSessionIdFromRolloutPath(path)?.toLowerCase();
   if (!sid) return events;
-  return events.map(event => (event.rawId
-    ? { ...event, uuid: `codex:${sid}:${event.rawId}` }
-    : event));
+  return events.map(event => {
+    if (!event.rawId) return event;
+    const prefix = `${path}:`;
+    const offset = event.uuid.startsWith(prefix) ? Number(event.uuid.slice(prefix.length)) : undefined;
+    return {
+      ...event,
+      ...(offset !== undefined && Number.isSafeInteger(offset) && offset >= 0
+        ? { rolloutOffset: offset, rolloutPath: path }
+        : {}),
+      uuid: `codex:${sid}:${event.rawId}`,
+    };
+  });
 }
 
 /** Baseline attaches skip parsing history. Before rotating, register just the

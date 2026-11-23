@@ -91,6 +91,7 @@ interface ManagedPlugin {
     dashboard?: Array<{ id: string; route: string; entry: string }>;
     cli?: { entry?: string; commands?: PluginCliCommand[] };
     service?: { entry?: string; mode?: string };
+    prerequisites?: { entry: string };
   };
   dependencies?: string[];
   skillsCount?: number;
@@ -127,6 +128,87 @@ type PluginServiceAction = 'start' | 'stop' | 'restart';
 type PendingToggles = ReadonlyMap<string, boolean>;
 type PluginDashboardApi = ReturnType<typeof pluginDashboardApi>;
 type PluginDashboardComponent = ComponentType<{ pluginId: string; api: PluginDashboardApi }>;
+interface PluginManagementContext {
+  presentation: { displayName: string; audience?: string; description?: string; version: string };
+  scope: {
+    globalEnabled: boolean;
+    globalPending: boolean;
+    busy: boolean;
+    bots: Array<{ id: string; name: string; enabled: boolean }>;
+    onToggle(scope: string, enabled: boolean): void;
+  };
+}
+interface IntegratedManagement {
+  Component?: ComponentType<{ pluginId: string; api: PluginDashboardApi; onReadinessChange(ready: boolean): void }>;
+  LayoutComponent?: ComponentType<{ pluginId: string; api: PluginDashboardApi; management: PluginManagementContext; onReadinessChange(ready: boolean): void }>;
+}
+
+export function integratedManagementExport(mod: unknown): IntegratedManagement | null {
+  const value = (mod as { management?: { version?: unknown; placement?: unknown; Component?: unknown } })?.management;
+  const layout = (mod as { managementLayout?: { version?: unknown; placement?: unknown; Component?: unknown } })?.managementLayout;
+  const Component = value?.version === 1 && value.placement === 'before-scope-controls' && typeof value.Component === 'function'
+    ? value.Component as IntegratedManagement['Component'] : undefined;
+  const LayoutComponent = layout?.version === 1 && layout.placement === 'dialog-body' && typeof layout.Component === 'function'
+    ? layout.Component as IntegratedManagement['LayoutComponent'] : undefined;
+  return Component || LayoutComponent ? {
+    ...(Component ? { Component } : {}), ...(LayoutComponent ? { LayoutComponent } : {}),
+  } : null;
+}
+
+/**
+ * The dialog can only mirror prerequisite readiness when a single same-origin
+ * management entry exists to mount. A prerequisites plugin without one has no
+ * surface to report state, so the frontend must not gate the toggles: the
+ * server-side assertPluginPrerequisitesReady stays the authoritative fail-closed
+ * check on every enable write.
+ */
+export function frontendManagesPrerequisiteGate(requiresPreparation: boolean, entryUrl: string | undefined): boolean {
+  return requiresPreparation && !!entryUrl;
+}
+
+function PluginManagementSurface(props: {
+  plugin: ManagedPlugin;
+  management: PluginManagementContext;
+  children(canEnable: boolean, layout: ReactNode): ReactNode;
+}): React.JSX.Element {
+  const [loaded, setLoaded] = useState(false);
+  const [surface, setSurface] = useState<IntegratedManagement | null>(null);
+  const [error, setError] = useState('');
+  const [ready, setReady] = useState(false);
+  const requiresPreparation = !!props.plugin.contributions?.prerequisites;
+  const entry = props.plugin.dashboard?.length === 1 ? props.plugin.dashboard[0] : undefined;
+  const managed = frontendManagesPrerequisiteGate(requiresPreparation, entry?.url);
+  useEffect(() => {
+    let cancelled = false;
+    setLoaded(false);
+    setSurface(null);
+    setError('');
+    setReady(false);
+    if (!entry?.url) { setLoaded(true); return; }
+    const url = new URL(entry!.url, location.href);
+    if (url.origin !== location.origin) { setLoaded(true); setError('插件管理入口必须来自当前宿主'); return; }
+    url.searchParams.set('managementVersion', props.plugin.version);
+    void import(/* @vite-ignore */ url.href).then(mod => {
+      if (!cancelled) { setSurface(integratedManagementExport(mod)); setLoaded(true); }
+    }).catch(() => {
+      if (!cancelled) { setError('插件管理面板加载失败，请刷新重试'); setLoaded(true); }
+    });
+    return () => { cancelled = true; };
+  }, [entry?.url, props.plugin.version]);
+  const api = useMemo(() => pluginDashboardApi(props.plugin.id), [props.plugin.id]);
+  const Component = surface?.Component;
+  const LayoutComponent = surface?.LayoutComponent;
+  return <>
+    {managed && !LayoutComponent ? <div data-plugin-prerequisites={props.plugin.id}>
+      {!loaded ? <div role="status" className="plugin-muted">正在检查安装和登录状态…</div>
+        : Component ? <Component pluginId={props.plugin.id} api={api} onReadinessChange={setReady} />
+          : <div className="plugin-warning" role="alert">{error || '前置状态暂不可用，请刷新重试'}</div>}
+    </div> : null}
+    {props.children(!managed || ready, LayoutComponent
+      ? <LayoutComponent pluginId={props.plugin.id} api={api} management={props.management} onReadinessChange={setReady} />
+      : null)}
+  </>;
+}
 
 async function fetchPluginEntries(): Promise<DashboardPluginEntry[]> {
   const res = await fetch('/api/plugins/dashboard');
@@ -541,6 +623,7 @@ function PluginEnableRow(props: {
   hint: string;
   checked: boolean;
   busy: boolean;
+  canEnable: boolean;
   onToggle(scope: string, enabled: boolean): void;
 }): React.JSX.Element {
   return (
@@ -554,7 +637,7 @@ function PluginEnableRow(props: {
         data-plugin-toggle={props.scope}
         data-plugin-id={props.plugin.id}
         checked={props.checked}
-        disabled={props.busy}
+        disabled={props.busy || (!props.checked && !props.canEnable)}
         onChange={event => props.onToggle(props.scope, event.currentTarget.checked)}
       />
       <span className="switch" aria-hidden="true"></span>
@@ -567,6 +650,7 @@ function PluginBotSettings(props: {
   bots: PluginBotScope[];
   pendingToggles: PendingToggles;
   busy: boolean;
+  canEnable: boolean;
   globalEnabled: boolean;
   globalTogglePending: boolean;
   onToggle(scope: string, enabled: boolean): void;
@@ -585,7 +669,7 @@ function PluginBotSettings(props: {
             data-plugin-toggle="global"
             data-plugin-id={plugin.id}
             checked={props.globalEnabled}
-            disabled={props.busy}
+            disabled={props.busy || (!props.globalEnabled && !props.canEnable)}
             onChange={event => props.onToggle('global', event.currentTarget.checked)}
           />
           <span className="switch" aria-hidden="true"></span>
@@ -609,6 +693,7 @@ function PluginBotSettings(props: {
                 hint={`当前${enabledState}`}
                 checked={checked}
                 busy={props.busy}
+                canEnable={props.canEnable}
                 onToggle={props.onToggle}
                 key={bot.id}
               />
@@ -693,16 +778,25 @@ function PluginCard(props: {
           <div><h2>{title}</h2></div>
           <button type="button" className="btn-link plugin-store-close" aria-label="关闭" title="关闭" onClick={() => setExpanded(false)}>×</button>
         </header>
-        <div className="plugin-store-introduction">
-          {plugin.audience ? <div className="plugin-store-audience"><span>{plugin.audience}</span></div> : null}
-          {description ? <p>{description}</p> : null}
-        </div>
         <div className="plugin-card-expanded" id={detailsId}>
+          {expanded ? <PluginManagementSurface plugin={plugin} management={{
+            presentation: { displayName: title, audience: plugin.audience, description, version: plugin.version },
+            scope: {
+              globalEnabled: enabledGlobal, globalPending: globalTogglePending, busy: props.busy,
+              bots: props.bots.map(bot => ({ id: bot.id, name: bot.name, enabled: pluginEnabledInScope(plugin, bot.id, props.pendingToggles) })),
+              onToggle: props.onToggle,
+            },
+          }}>{(canEnable, layout) => layout || <>
+          <div className="plugin-store-introduction">
+            {plugin.audience ? <div className="plugin-store-audience"><span>{plugin.audience}</span></div> : null}
+            {description ? <p>{description}</p> : null}
+          </div>
           <PluginBotSettings
             plugin={plugin}
             bots={props.bots}
             pendingToggles={props.pendingToggles}
             busy={props.busy}
+            canEnable={canEnable}
             globalEnabled={enabledGlobal}
             globalTogglePending={globalTogglePending}
             onToggle={props.onToggle}
@@ -740,6 +834,7 @@ function PluginCard(props: {
           <PluginActionArea plugin={plugin} busy={props.busy} onServiceAction={props.onServiceAction} />
           <div className="plugin-card-body"><PluginTabs plugin={plugin} /></div>
           </details>
+          </>}</PluginManagementSurface> : null}
           <footer className="plugin-store-dialog-foot">
             {props.marketEntry?.package === plugin.packageName ? <button type="button" className="btn-link" disabled={props.busy} onClick={() => { setExpanded(false); props.onPrepare(); }}>检查更新</button> : null}
             <button type="button" className="btn-link plugin-store-danger" disabled={props.busy} onClick={() => { setExpanded(false); props.onUninstall(); }}>卸载插件</button>
@@ -1032,6 +1127,7 @@ function pluginDashboardApi(pluginId: string) {
   }
   return {
     react: React,
+    managementFeatures: { dialogBody: true },
     getSettings: () => settings('GET'),
     saveSettings: (value: unknown) => settings('PUT', value),
     async listBots() { return (await fetchPluginManagement()).bots; },

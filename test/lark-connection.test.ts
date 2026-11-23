@@ -107,9 +107,10 @@ describe('startLarkConnection', () => {
     expect(getLarkConnectionHealth('app-test')).toBeUndefined();
   });
 
-  it('bounds bootstrap and connected sockets that stop receiving frames; real pongs reset the rebuild budget', () => {
+  it('throttles exhausted recovery without exiting; only current inbound frames reset the burst', () => {
     vi.stubEnv('BOTMUX_LARK_WS_MAX_REBUILDS', '1');
     vi.stubEnv('BOTMUX_LARK_WS_INBOUND_STALE_MS', '500');
+    vi.stubEnv('BOTMUX_LARK_WS_RECONNECT_STALE_MS', '200');
     const exit = vi.spyOn(process, 'exit').mockImplementation((): never => { throw new Error('fatal exit'); });
     const handle = startLarkConnection('app-test', '', eventDispatcher);
     now += 500;
@@ -127,9 +128,48 @@ describe('startLarkConnection', () => {
     tick(); // silent, but the inbound frame earned another rebuild
     expect(clients).toHaveLength(3);
     clients[2].getConnectionStatus = () => ({ state: 'failed', reconnectAttempts: 0 });
-    expect(() => tick()).toThrow('fatal exit');
-    expect(exit).toHaveBeenCalledWith(1);
+    second.hooks.onInbound?.(); // a retired generation cannot bypass cooldown
+    now += 499;
+    tick();
+    expect(clients).toHaveLength(3);
+    now++;
+    tick();
+    expect(clients).toHaveLength(4);
+    expect(clients[2].close).toHaveBeenCalledExactlyOnceWith({ force: true });
+    expect(exit).not.toHaveBeenCalled();
+    clients[3].hooks.onInbound?.();
+    clients[3].options.onReady?.();
+    clients[3].options.onReconnecting?.();
+    now += 200;
+    tick();
+    expect(clients).toHaveLength(5);
     handle.close();
+  });
+
+  it('keeps retrying a long outage at a bounded cadence and closes without later recovery', () => {
+    vi.stubEnv('BOTMUX_LARK_WS_MAX_REBUILDS', '1');
+    vi.stubEnv('BOTMUX_LARK_WS_RECONNECT_STALE_MS', '100');
+    vi.stubEnv('BOTMUX_LARK_WS_INBOUND_STALE_MS', '1000');
+    const exit = vi.spyOn(process, 'exit').mockImplementation((): never => { throw new Error('fatal exit'); });
+    const handle = startLarkConnection('app-test', '', eventDispatcher);
+    now += 100;
+    tick();
+    expect(clients).toHaveLength(2);
+    for (let cycle = 0; cycle < 5; cycle++) {
+      for (let i = 0; i < 9; i++) { now += 100; tick(); }
+      expect(clients).toHaveLength(2 + cycle);
+      now += 100;
+      tick();
+      expect(clients).toHaveLength(3 + cycle);
+    }
+    expect(exit).not.toHaveBeenCalled();
+    for (const old of clients.slice(0, -1)) expect(old.close).toHaveBeenCalledExactlyOnceWith({ force: true });
+    handle.close({ force: true });
+    now += 10000;
+    tick();
+    expect(clients).toHaveLength(7);
+    expect(clients.at(-1)!.close).toHaveBeenCalledOnce();
+    expect(getLarkConnectionHealth('app-test')).toBeUndefined();
   });
 });
 

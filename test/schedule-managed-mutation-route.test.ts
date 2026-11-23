@@ -11,6 +11,7 @@ import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/co
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 import { isUntilDoneClosed, UNTIL_DONE_NOTE_MAX_CHARS } from '../src/services/schedule-until-done.js';
 import { readManagedScheduleUpdate } from '../src/core/schedule-managed-update.js';
+import { isTalkerScheduledTask, talkerSchedulePolicy } from '../src/core/schedule-talker.js';
 
 // A real directory: capabilityScheduleWorkingDir realpaths both sides.
 const REPO = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-repo-')));
@@ -57,6 +58,9 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     pickTurnReplyTarget, dispatchCallerFromReply, registryTurnMayAuthenticateHuman,
     isTrustedHostIpcRequest: () => false,
     getDashboardAdminOpenIds: () => ['ou_admin'],
+    // Talker policy inputs (core/schedule-talker): off unless a test enables it.
+    isTalkerScheduledTask, talkerSchedulePolicy,
+    getBot: () => ({ config: {} }),
     parseScheduledTurnId,
     isUntilDoneClosed,
     UNTIL_DONE_NOTE_MAX_CHARS,
@@ -726,4 +730,53 @@ describe('direct schedule mutation after the active-turn hint is cleared', () =>
       expect(h.scheduler.disableTask).not.toHaveBeenCalled();
     },
   );
+});
+
+/** The current human is a talk-only person managing a task they created under
+ *  scheduleCreateByTalkers (core/schedule-talker). */
+function talkerOwnerHarness(action: 'update' | 'remove' | 'pause' | 'resume' | 'run' = 'pause') {
+  const h = harness(action);
+  h.ds.activeInteractiveTurn.caller.requestUserOpenId = 'ou_talker';
+  h.ds.activeInteractiveTurn.caller.requestUserUnionId = 'on_talker';
+  h.record.kind = 'direct';
+  h.record.controlOpenId = 'ou_talker';
+  h.record.controlUnionId = 'on_talker';
+  h.record.task = { ...h.record.task, enabled: true, ownerAccess: 'talk', ownerOpenId: 'ou_talker', ownerUnionId: 'on_talker' };
+  h.scope.getBot = () => ({ config: { scheduleCreateByTalkers: true } });
+  return h;
+}
+
+describe('talker-owned schedule management', () => {
+  it.each([
+    ['pause', 'disableTask'], ['resume', 'enableTask'], ['remove', 'removeTask'], ['run', 'runTaskNow'],
+    ['update', 'updateTask'],
+  ] as const)('lets the creator %s their own talker task', async (action, method) => {
+    const h = talkerOwnerHarness(action);
+    expect((await h.run()).status).toBe(200);
+    expect(h.scheduler[method]).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['someone else\'s talker task', (h: ReturnType<typeof harness>) => { h.record.controlOpenId = 'ou_other'; h.record.task.ownerOpenId = 'ou_other'; }],
+    ['an administrator-created task', (h: ReturnType<typeof harness>) => { delete h.record.task.ownerAccess; }],
+    ['a delegated task', (h: ReturnType<typeof harness>) => { h.record.kind = 'delegated'; }],
+    ['a task in another chat', (h: ReturnType<typeof harness>) => { h.record.task.chatId = 'oc_elsewhere'; }],
+    ['the switch turned off', (h: ReturnType<typeof harness>) => { h.scope.getBot = () => ({ config: {} }); }],
+    ['a union_id that no longer matches', (h: ReturnType<typeof harness>) => { h.record.controlUnionId = 'on_someone'; }],
+    ['a record without a controller union', (h: ReturnType<typeof harness>) => { delete h.record.controlUnionId; }],
+    ['a bot caller', (h: ReturnType<typeof harness>) => { h.ds.activeInteractiveTurn.caller.senderType = 'bot'; }],
+  ])('refuses a non-administrator on %s', async (_label, arrange) => {
+    const h = talkerOwnerHarness('remove');
+    arrange(h);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it('keeps an administrator able to manage a talker task even with the switch off', async () => {
+    const h = talkerOwnerHarness('remove');
+    h.scope.getBot = () => ({ config: {} });
+    h.scope.getDashboardAdminOpenIds = () => ['ou_talker'];
+    expect((await h.run()).status).toBe(200);
+    expect(h.scheduler.removeTask).toHaveBeenCalledOnce();
+  });
 });

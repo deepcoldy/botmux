@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  truncateSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,6 +14,7 @@ import {
   remoteRunnerSessionToolArgs,
   runRemoteRunnerSessionTool,
 } from '../src/services/remote-runner-session-tool.js';
+import { MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES } from '../src/adapters/backend/remote-runner-protocol.js';
 
 const roots: string[] = [];
 
@@ -21,6 +23,33 @@ afterEach(() => {
 });
 
 describe('remote runner session tool host bridge', () => {
+  it.each([0, 1])('retains the Remote Runner attachment byte boundary with offset %s', async offset => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-session-tool-limit-'));
+    roots.push(root);
+    const attachmentDir = join(root, 'attachments');
+    mkdirSync(attachmentDir);
+    const path = join(attachmentDir, 'image.png');
+    const size = MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES + offset;
+    writeFileSync(path, '');
+    truncateSync(path, size);
+    const fixture = join(root, 'fixture.mjs');
+    writeFileSync(fixture, `process.stdout.write(${JSON.stringify(JSON.stringify({
+      attachments: [{ path, name: 'image.png', type: 'image' }],
+    }))});`);
+    const result = await runRemoteRunnerSessionTool({ tool: 'quoted', messageId: 'om_boundary' }, {
+      sessionId: 'session-1', turnId: 'turn-1', chatId: 'oc_current', cliPath: fixture,
+      env: { PATH: process.env.PATH, SESSION_DATA_DIR: root },
+    });
+    if (offset === 0) {
+      expect(result.outcome).toBe('completed');
+      if (result.outcome !== 'completed') throw new Error('Expected a successful attachment transfer');
+      expect(result.exitCode).toBe(0);
+      expect(Buffer.from(result.attachments![0]!.dataBase64, 'base64').length).toBe(size);
+    } else {
+      expect(result).toMatchObject({ outcome: 'rejected', code: 'session_tool_attachment_rejected' });
+    }
+  });
+
   it('maps structured requests to an allowlisted current-session argv', () => {
     expect(remoteRunnerSessionToolArgs({
       tool: 'history',

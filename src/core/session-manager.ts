@@ -12,19 +12,21 @@ import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection
  * session restoration, and scheduled task execution.
  */
 import { existsSync, statSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 import { normalizeImageAttachment, imageSequenceHint } from './attachment-image-format.js';
 import { randomUUID } from 'node:crypto';
 import { recordScheduledSessionRun } from './scheduled-send.js';
 import { basename, dirname, join } from 'node:path';
 import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
+import { resolveAssistantSpawn } from './assistant-spawn.js';
 import * as sessionStore from '../services/session-store.js';
 import { groupContextEpoch, groupContextForPrompt } from '../services/group-context-prompt.js';
 import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, findActiveBySessionId, identityStorageModelForDaemonSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
 import { createCliAdapterSync, resolveCommandReal } from '../adapters/cli/registry.js';
 import { precheckTraexRuntime } from '../services/traex-runtime-gate.js';
 import { releaseDirForExecutable } from '../services/traex-runtime-snapshot.js';
@@ -32,8 +34,9 @@ import { resolveTraexChildHome } from '../services/traex-paths.js';
 import { botInjectedEnv } from './env-policy.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
+import { credentialSourceForcesBotHome } from '../services/cli-credential-source.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
-import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, feishuReplyPresentationGuidance } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, buildTurnSpeakersBlock, feishuReplyPresentationGuidance, transcriptPromptTeachesSend } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
 import {
@@ -42,7 +45,9 @@ import {
   buildBuiltinSkillCatalogBlock,
   builtinSkillHelpPointer,
   chatManagerEnabledForApp,
+  type BuiltinSkillEntry,
 } from '../skills/injection-mode.js';
+import { compactSkillTriggerSummary } from './skills/prompt.js';
 import { resolveConditionalLine } from '../skills/effective-builtins.js';
 import {
   getSessionPersistentBackendType,
@@ -77,13 +82,18 @@ import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
-import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
+import { sandboxEnabled } from '../adapters/backend/sandbox.js';
+import { codexRpcEligible } from '../codex-rpc-lifecycle.js';
+import type { AcceptedCommandInput, ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
+import { reconcileClosedSessionTurns } from '../services/session-turns.js';
 import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { messageMentionsBot, type MessageResource } from '../im/lark/message-parser.js';
-import type { ResolvedSender } from '../im/lark/identity-cache.js';
+import { getIdentity, type ResolvedSender } from '../im/lark/identity-cache.js';
+import { capabilityOn } from '../services/trigger-user-auth.js';
+import { isSerialGroupInput } from './trusted-session-controller.js';
 import {
   activeSessionKey,
   sessionKey,
@@ -107,7 +117,7 @@ import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../se
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { unpinnedSessionWorkingDir } from './working-dir-range.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
-import { getAttachmentsDir } from './attachment-path.js';
+import { attachmentsRoot, getAttachmentsDir, safeAttachmentFileName } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn, pickTurnReplyTarget } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
@@ -275,6 +285,7 @@ async function resumeRestoredPendingRepoSetup(
         promptInjection: sessionPromptInjection(ds),
         substituteTrigger: ds.pendingSubstituteTrigger,
         codexAppText: ds.pendingCodexAppText,
+        acceptedInput: ds.pendingAcceptedInput,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: ds.pendingCodexAppMessageContext,
         // This recovery completes the original fresh pending-repo launch.
@@ -504,8 +515,8 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
     try {
       killPersistentBackendTarget(target, ds.session.sessionId);
     } catch (err) {
-      // ZMX destruction is deliberately identity-verified and can fail on an
-      // inconclusive probe or a generation change. Never close the persisted
+      // ZMX and hc destruction is deliberately identity-verified and can fail on
+      // an inconclusive probe or a generation change. Never close the persisted
       // row in that state: doing so would orphan a possibly-live CLI with no
       // retryable ownership record. The caller skips this row and continues
       // restoring/sweeping unrelated sessions.
@@ -687,7 +698,7 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
 
 // ─── Attachment download ─────────────────────────────────────────────────────
 
-export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[], senderOpenId?: string): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
+export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[], senderOpenId?: string, assistantOwnerOpenId?: string): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
   if (resources.length === 0) return { attachments: [], needLogin: false };
 
   const attachments: LarkAttachment[] = [];
@@ -698,7 +709,7 @@ export async function downloadResources(larkAppId: string, messageId: string, re
   // return no attachments, same shape as a download failure — the text still processes.
   let dir: string;
   try {
-    dir = getAttachmentsDir(larkAppId, messageId);
+    dir = getAttachmentsDir(larkAppId, messageId, assistantOwnerOpenId);
   } catch (err: any) {
     logger.warn(`[${larkAppId}] skipping attachment download — unusable appId as path segment: ${err.message}`);
     return { attachments: [], needLogin: false };
@@ -706,14 +717,14 @@ export async function downloadResources(larkAppId: string, messageId: string, re
   let needLogin = false;
 
   for (const res of resources) {
-    const savePath = join(dir, res.name);
+    const savePath = join(dir, safeAttachmentFileName(res.name, res.key));
     try {
       const resMessageId = res.messageId ?? messageId;
       // Whose token backs the user-token fallback: the person who sent the
       // attachment. They can see what they just posted, and the download is
       // attributed to them rather than to whoever happens to be logged in.
       await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId,
-        res.fallbackMessageIds ? { fallbackMessageIds: res.fallbackMessageIds } : undefined);
+        { withinRoot: attachmentsRoot(), ...(res.fallbackMessageIds ? { fallbackMessageIds: res.fallbackMessageIds } : {}) });
       const attachment: LarkAttachment = { type: res.type, path: savePath, name: res.name, resourceKey: res.key };
       // Sniffing is best-effort: a successfully downloaded attachment must remain available.
       try {
@@ -1017,7 +1028,7 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
 function renderRoleContextBlock(
   larkAppId: string | undefined,
   chatId: string | undefined,
-  opts?: { followUp?: boolean },
+  opts?: { followUp?: boolean; escapeTagLikeContent?: boolean },
 ): string {
   if (!larkAppId || !chatId) return '';
 
@@ -1030,7 +1041,10 @@ function renderRoleContextBlock(
   if (opts?.followUp && injectMode === 'once') return '';
 
   const ctx = roleSource === 'team' ? 'team' : 'group';
-  return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${roleContent}\n</role>`;
+  const renderedRoleContent = opts?.escapeTagLikeContent
+    ? escapeXmlTagLikeTokens(roleContent)
+    : roleContent;
+  return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${renderedRoleContent}\n</role>`;
 }
 
 export function renderProjectGroupModeBlock(
@@ -1079,7 +1093,7 @@ export function renderStewardContextBlock(larkAppId: string | undefined, chatId:
 function renderApplicationRoleBlock(
   larkAppId: string | undefined,
   chatId: string | undefined,
-  opts?: { followUp?: boolean },
+  opts?: { followUp?: boolean; escapeTagLikeContent?: boolean },
 ): string {
   return [
     renderRoleContextBlock(larkAppId, chatId, opts),
@@ -1302,6 +1316,7 @@ function credentialBoundaryForPrompt(
   chatId: string | undefined,
   resume: boolean,
   locale?: Locale,
+  speakers?: ReadonlyArray<{ openId: string; name?: string }>,
 ): string {
   if (!larkAppId) return '';
   try {
@@ -1311,8 +1326,36 @@ function credentialBoundaryForPrompt(
       managedLarkToolAppIdForPrompt(larkAppId, sessionId, chatId, resume),
       locale,
       sessionIsNoTransport(larkAppId, chatId),
+      speakers,
     );
   } catch { return ''; }
+}
+
+/**
+ * The people of the running turn once `sender`'s message joins it, when that is more than one
+ * and the session can run a call as a chosen speaker (proven identity model, a per-person
+ * capability on). From the daemon's own speaker set plus the sender, who is not in it yet.
+ */
+export function turnSpeakersForPrompt(
+  larkAppId: string | undefined, sessionId: string, sender: ResolvedSender | undefined,
+): Array<{ openId: string; name?: string }> | undefined {
+  if (!larkAppId || config.crossPrincipalInterruption) return undefined;
+  let ds: ReturnType<typeof findActiveBySessionId>;
+  try {
+    const policy = getBot(larkAppId).config.triggerUserAuth;
+    if (policy?.allowSpeakerSwitch !== true
+      || !(capabilityOn(policy, 'lark-user') || capabilityOn(policy, 'bytecloud'))) return undefined;
+    ds = findActiveBySessionId(sessionId);
+    if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') return undefined;
+    // A serial group queues each message as its own turn: nobody merges into someone else's turn.
+    if (isSerialGroupInput(ds, { requestLarkAppId: larkAppId, senderType: 'user' })) return undefined;
+  } catch { return undefined; }
+  const openIds = (ds.managedTurnOrigin?.speakers ?? []).map(s => s.openId);
+  if (sender?.type === 'user' && sender.openId) openIds.push(sender.openId);
+  const people = [...new Set(openIds)];
+  return people.length > 1
+    ? people.map(openId => ({ openId, name: (sender?.openId === openId ? sender.name : undefined) ?? getIdentity(larkAppId, openId)?.name }))
+    : undefined;
 }
 
 /** 本会话的最终回复投递方式（per-bot replyDelivery × 该 CLI 的转写能力，见
@@ -1427,12 +1470,75 @@ type NewTopicOpts = {
   solo?: boolean;
   /** solo 裸文本时用于剥掉开头的自 @（同 buildBridgeInputContent）。 */
   selfMention?: { name?: string | null; openId?: string | null };
+  /** Force the compact first-turn envelope for a TraeX RPC session. */
+  traexRpcContextEnabled?: boolean;
 };
 
 type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
   | 'summaryMemory' | 'whiteboard' | 'groupJoin' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
+
+function buildCompactTraexRoutingHints(
+  locale: Locale | undefined,
+  noTransport: boolean,
+  replyDelivery: ReplyDelivery,
+): string[] {
+  const full = buildBotmuxShellHints(locale, noTransport, replyDelivery);
+  if (noTransport || replyDelivery === 'transcript') return full;
+
+  const verboseKeys = [
+    'ai.shell.intro',
+    'ai.shell.commands_are_shell',
+    'ai.shell.how_to_send',
+    'ai.shell.multiline_heredoc',
+    'ai.shell.heredoc_example',
+    'ai.shell.helpers',
+    'ai.shell.when_to_send',
+    'ai.shell.mention_gate',
+  ];
+  const replaced = new Set(verboseKeys.map(key => escapeXmlTagLikeTokens(t(key, undefined, locale))));
+  const preservedConditionalHints = full.filter(line => !replaced.has(line));
+  const en = (locale ?? getDefaultLocale()) === 'en';
+  const compact = en
+    ? [
+        'Lark session: terminal output is invisible; reply with the shell command `botmux send`.',
+        'For multiline text use quoted heredoc/stdin or UTF-8 `--content-file`; never pass literal \\n or JSON-escaped text. Attach with `--images`, `--files`, or `--videos` plus `--video-covers`.',
+        "Example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
+        'Helpers: `botmux history`; `botmux quoted <message_id>` only when the prompt says a message was quoted; `botmux bots list`.',
+        'Every `botmux send` must choose exactly one: `--mention <open_id:name>`, `--mention-back`, or `--no-mention`; collaboration with another bot requires `--mention`.',
+        'Respond to addressed messages at least once via `botmux send`; only unrelated messages use final `BOTMUX_NOTHING_TO_SEND`.',
+      ]
+    : [
+        '飞书会话中终端输出用户不可见；回复用 shell 命令 `botmux send`。',
+        '多行正文用 quoted heredoc/stdin 或 UTF-8 `--content-file`，不得传字面量 `\\n` 或 JSON 转义文本；附件用 `--images`/`--files`/`--videos` 及 `--video-covers`。',
+        "示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
+        '辅助：`botmux history`；仅在 prompt 提示引用时用 `botmux quoted <message_id>`；查群内 bot 用 `botmux bots list`。',
+        '每次 `botmux send` 必须三选一：`--mention <open_id:名字>` / `--mention-back` / `--no-mention`；与其他 bot 协作必须 `--mention`。',
+        '发给你的消息至少用 `botmux send` 回应一次；只有完全无关的消息才在 final 输出 `BOTMUX_NOTHING_TO_SEND`。',
+      ];
+  return [...compact.map(escapeXmlTagLikeTokens), ...preservedConditionalHints];
+}
+
+function buildCompactTraexBuiltinSkillCatalog(
+  entries: BuiltinSkillEntry[],
+  locale: Locale | undefined,
+): string {
+  if (entries.length === 0) return '';
+  const instruction = (locale ?? getDefaultLocale()) === 'en'
+    ? 'Trigger index; run `botmux skill show <name>` before using a matching skill.'
+    : '技能触发索引；匹配后先运行 `botmux skill show <name>` 读取完整说明。';
+  const skills = entries.map((entry) => {
+    const trigger = compactSkillTriggerSummary(entry.description);
+    return `  <skill name="${xmlEscape(entry.name)}"${trigger ? ` trigger="${xmlEscape(trigger)}"` : ''} />`;
+  });
+  return [
+    '<botmux_builtin_skills>',
+    `  <instruction>${escapeXmlTagLikeTokens(instruction)}</instruction>`,
+    ...skills,
+    '</botmux_builtin_skills>',
+  ].join('\n');
+}
 
 /** opening 的 hook 模式（#794 后续）：whiteboard/sender/mentions 搬进 hook envelope，
  *  PTY 文本只剩用户正文（+ role/summaryMemory 等稳定上下文）。与 follow-up 同一套
@@ -1472,7 +1578,17 @@ function buildNewTopicBlocks(
   // transcript + solo，首轮同样去壳。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection);
-  const bare = replyDelivery === 'transcript' && opts?.solo === true;
+  let compactTraexRpcContext = false;
+  if (cliId === 'traex') {
+    try {
+      compactTraexRpcContext = opts?.traexRpcContextEnabled
+        ?? getBot(opts?.larkAppId ?? '').config.codexRpcInput
+        ?? config.codexRpcInputDefault;
+    } catch {
+      compactTraexRpcContext = opts?.traexRpcContextEnabled ?? config.codexRpcInputDefault;
+    }
+  }
+  const bare = replyDelivery === 'transcript' && opts?.solo === true && !compactTraexRpcContext;
   // Built by the daemon, whose own env never carries a session marker: the
   // session row decides (a legacy node worker never comes through here).
   const sessionKind: WorkflowSessionKind = opts?.workflowNodeSession ? 'botNode' : 'ordinary';
@@ -1480,7 +1596,9 @@ function buildNewTopicBlocks(
   // hint list is unchanged.
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind, hideLocalAddresses: hideLocalAddressesFor(opts?.larkAppId) });
+    : compactTraexRpcContext
+      ? buildCompactTraexRoutingHints(locale, noTransport, replyDelivery)
+      : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind, hideLocalAddresses: hideLocalAddressesFor(opts?.larkAppId) });
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1518,7 +1636,9 @@ function buildNewTopicBlocks(
         excludeRoutingCovered: true,
         sessionKind,
       });
-      skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
+      skillBlock = compactTraexRpcContext
+        ? buildCompactTraexBuiltinSkillCatalog(entries, locale)
+        : buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {
       skillBlock = builtinSkillHelpPointer(locale, { sessionKind });
     }
@@ -1532,21 +1652,25 @@ function buildNewTopicBlocks(
     // the routing block above and the system-prompt identity path in
     // buildBotmuxSystemPromptText. botIdentity is passed even for a NORMAL bot
     // running an HTTP task (R1), so this block reaches HTTP turns and must gate too.
-    // transcript（含 solo）同样只留 name/open_id：short_routing 整句是「协作必须
-    // botmux send --mention」，transcript 模式的提示不再提 send；solo 会话更没有
-    // 别的 bot 可路由。
+    // transcript + solo 同样只留 name/open_id：solo 会话没有别的 bot 可路由。
+    // transcript 非 solo 保留 short_routing：最终回复卡不会 @ 触发本轮的 bot，
+    // 跟别的 bot 协作 / 回报仍只能靠 `botmux send --mention`（与系统提示路径的
+    // mention_must 同口径）。doubao 例外（transcriptPromptTeachesSend）：提示里
+    // 不教 send，这句也不加。
     identityBlock = [
       '<identity>',
       `  <name>${xmlEscape(botIdentity.name ?? unknown)}</name>`,
       `  <open_id>${xmlEscape(botIdentity.openId ?? unknown)}</open_id>`,
-      ...(noTransport || replyDelivery === 'transcript'
+      ...(noTransport || (replyDelivery === 'transcript' && (opts?.solo === true || !transcriptPromptTeachesSend(cliId)))
         ? []
         : [`  <routing_rules>${escapeXmlTagLikeTokens(t('ai.identity.short_routing', undefined, locale))}</routing_rules>`]),
       '</identity>',
     ].join('\n');
   }
 
-  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, {
+    escapeTagLikeContent: compactTraexRpcContext,
+  });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport,
@@ -1700,6 +1824,7 @@ export function buildNewTopicCliInput(
     chatId?: string;
     whiteboardId?: string;
     substituteTrigger?: SubstituteTrigger;
+    acceptedInput?: AcceptedCommandInput;
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
@@ -1717,6 +1842,7 @@ export function buildNewTopicCliInput(
     /** 见 NewTopicOpts 同名字段。 */
     solo?: boolean;
     selfMention?: { name?: string | null; openId?: string | null };
+    traexRpcContextEnabled?: boolean;
     /** opening 轮的权威 turnId（= 发给 worker 的 turnId，最终成为
      *  managedTurnOrigin.turnId）。hook 模式下用于 sidecar 绑定；缺失回退 inline。 */
     turnId?: string;
@@ -1753,6 +1879,8 @@ export function buildNewTopicCliInput(
     sessionBackendType: opts?.sessionBackendType,
     promptInjection: opts?.promptInjection,
     larkAppId: opts?.larkAppId,
+    sessionId,
+    opening: true,
   }) === 'hook' && hookTurnId) {
     const blocks = buildNewTopicBlocks(
       userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
@@ -1769,7 +1897,7 @@ export function buildNewTopicCliInput(
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return withInitialLinkRefSources({ content: ptyText }, userMessage, { ...opts, attachments });
+      return finalizeCliTurnInput({ content: ptyText }, userMessage, { ...opts, attachments, cliId });
     }
     // 无 envelope（无 whiteboard/sender/mentions）或超限 → 回退 inline。
   }
@@ -1780,10 +1908,10 @@ export function buildNewTopicCliInput(
   // Legacy pending buffers contain enriched strings. Only materialize those as
   // clean input when the caller also preserved their matching raw texts.
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) {
-    return withInitialLinkRefSources(
+    return finalizeCliTurnInput(
       { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
       userMessage,
-      { ...opts, attachments },
+      { ...opts, attachments, cliId },
     );
   }
   const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
@@ -1803,7 +1931,7 @@ export function buildNewTopicCliInput(
   const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
-  return withInitialLinkRefSources({
+  return finalizeCliTurnInput({
     content,
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
@@ -1824,7 +1952,7 @@ export function buildNewTopicCliInput(
       bufferedFollowUpsBlock: opts?.codexAppFollowUpContexts?.filter(Boolean).join('\n\n'),
       attachments,
     }),
-  }, userMessage, { ...opts, attachments });
+  }, userMessage, { ...opts, attachments, cliId });
 }
 
 /**
@@ -1854,6 +1982,7 @@ type FollowUpOpts = {
   chatId?: string;
   whiteboardId?: string;
   substituteTrigger?: SubstituteTrigger;
+  acceptedInput?: AcceptedCommandInput;
   codexAppText?: string;
   codexAppApplicationContext?: string;
   codexAppMessageContext?: string;
@@ -1880,6 +2009,11 @@ type FollowUpOpts = {
   /** 不注入 <botmux_reminder>（「至少回应一次」）：群秘书这类默认静默的回合用，
    *  否则提醒与「无事不发」直接矛盾。 */
   omitReminder?: boolean;
+  /** The session's frozen launch config writes through TraeX RPC: render the
+   *  self-contained compact envelope (role on every turn). Omitting blocks the
+   *  native thread already accepted happens only at the worker's RPC write
+   *  edge, never in a payload that is queued, persisted or re-forked. */
+  traexRpcContext?: true;
 };
 
 function buildFollowUpBlocks(
@@ -1900,8 +2034,11 @@ function buildFollowUpBlocks(
   // 采集关闭，按 live 改口不 send 会静默（见 replyDeliveryFor 注释）。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId, opts?.promptInjection, frozenSessionSandbox(sessionId)) === 'transcript';
-  const bare = transcript && opts?.solo === true;
-  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
+  const bare = transcript && opts?.solo === true && !opts?.traexRpcContext;
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, {
+    followUp: !opts?.traexRpcContext,
+    escapeTagLikeContent: !!opts?.traexRpcContext,
+  });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport,
@@ -1926,12 +2063,15 @@ function buildFollowUpBlocks(
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
   if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
-  if (noTransport && !skipSessionId) {
+  {
     const session = sessionStore.getSession(sessionId);
     const resume = !!session?.cliId || !!session?.lastCliInput || !!session?.backendType;
-    if (managedLarkToolAppIdForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume)) {
-      const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume, opts?.locale);
+    const speakers = turnSpeakersForPrompt(opts?.larkAppId, sessionId, opts?.sender);
+    if (noTransport && !skipSessionId && managedLarkToolAppIdForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume)) {
+      const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume, opts?.locale, speakers);
       if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
+    } else if (speakers) {
+      blocks.push({ key: 'credentials', text: buildTurnSpeakersBlock(speakers, opts?.locale) });
     }
   }
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
@@ -2054,7 +2194,7 @@ const HOOK_ENVELOPE_MAX_CHARS = 8000;
 
 /** Backends known to run the CLI on this host, where botmux's UserPromptSubmit
  *  hook can run (an allowlist). */
-const PROMPT_HOOK_LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'zmx']);
+const PROMPT_HOOK_LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'hc']);
 
 /**
  * 判定该 follow-up 是否走 hook 注入模式（#794 P1 方向 B）。四重条件全部满足：
@@ -2074,7 +2214,43 @@ type EnvelopeInjectionCfg = {
   cliPathOverride?: string;
   sessionBackendType?: BackendType;
   larkAppId?: string;
+  sessionId?: string;
+  /** A genuinely new opening has no prior worker generation to mirror. */
+  opening?: boolean;
 };
+
+/** Launch facts for the CLI generation that will actually read the settings.
+ * A live worker's init is authoritative: live bot config may have moved on,
+ * while its CLI/pane still uses the old home. Existing sessions without a live
+ * generation fail closed to inline; only a new opening may use live config. */
+function promptHookLaunchConfig(
+  cfg: EnvelopeInjectionCfg,
+  botConfig: BotConfig,
+): BotConfig | undefined {
+  if (!cfg.sessionId) return botConfig;
+  const registry = getActiveSessionsRegistry();
+  const ds = registry
+    ? [...registry.values()].find(candidate => candidate.session.sessionId === cfg.sessionId)
+    : undefined;
+  if (ds) {
+    const init = ds.initConfig;
+    if (!ds.worker || ds.worker.killed || ds.worker.connected === false || !init) return undefined;
+    return {
+      ...botConfig,
+      sandbox: init.sandbox,
+      readIsolation: init.readIsolation,
+      wrapperCli: init.wrapperCli,
+      credentialsSourceDir: init.credentialsSourceDir,
+      backendType: init.backendType,
+    };
+  }
+  if (!cfg.opening) {
+    try {
+      if (sessionStore.getSession(cfg.sessionId)) return undefined;
+    } catch { return undefined; }
+  }
+  return botConfig;
+}
 
 function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inline' {
   if (!cfg?.cliId || zeroPromptInjectionForBot(cfg.larkAppId, cfg.cliId, cfg.promptInjection)) return 'inline';
@@ -2097,7 +2273,9 @@ function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inl
     botConfig = getBot(cfg.larkAppId).config;
   } catch { return 'inline'; }
   if (botConfig.envelopeInjection !== 'auto') return 'inline';
-  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, cfg.larkAppId, cfg.sessionBackendType);
+  const launchConfig = promptHookLaunchConfig(cfg, botConfig);
+  if (!launchConfig) return 'inline';
+  const effectivePath = effectivePromptHookConfigPath(adapter, launchConfig, cfg.larkAppId, cfg.sessionBackendType);
   if (!effectivePath || !hasInstalledPromptHookCached(effectivePath)) return 'inline';
   return 'hook';
 }
@@ -2109,7 +2287,8 @@ function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inl
  * preflight 必须查这份而不是全局——per-bot 安装是 best-effort（provisionIsolatedBotHome
  * 吞异常），查全局会把安装失败误判为已装，导致该 session 每轮系统性丢 reminder。
  *
- * 与 worker willRedirectCliData 的微差保持一致：
+ * 与 worker willRedirectCliData 的微差保持一致（含不开沙箱但配了 credentialsSourceDir 的
+ * Claude bot，同样重定向到 BOT_HOME）：
  *  - backendType !== 'riff'：riff 后端的 CLI 跑在远端，本地 settings 不适用，
  *    hook 模式对它无意义（远端没有 botmux hook，sidecar 写了没人读）。
  *  - process.env.SESSION_DATA_DIR（不用 config.session.dataDir 的 packagedDataDir
@@ -2125,15 +2304,22 @@ function effectivePromptHookConfigPath(
   const base = adapter.hookInstall?.configPath;
   if (!base) return undefined;
   // scratch keeps the CLI's native home, like the worker (only oncall redirects).
-  let oncallRequested: boolean;
+  let sandboxMode: ReturnType<typeof resolveSandboxMode>;
   try {
-    oncallRequested = resolveSandboxMode({
+    sandboxMode = resolveSandboxMode({
       configSandbox: botConfig.sandbox,
       readIsolation: botConfig.readIsolation === true,
       envValue: process.env.BOTMUX_SANDBOX,
-    }) === 'oncall';
+    });
   } catch { return undefined; }
-  const willRedirect = oncallRequested
+  const credentialSourceHome = credentialSourceForcesBotHome({
+    sourceDir: botConfig.credentialsSourceDir,
+    // The adapter is built from the session's frozen CLI, which may differ from
+    // the bot's current default after /cli selection or a later config edit.
+    cliId: adapter.id,
+    sandboxRequested: sandboxMode !== 'off',
+  });
+  const willRedirect = (sandboxMode === 'oncall' || credentialSourceHome)
     && adapter.supportsReadIsolation === true
     && !botConfig.wrapperCli
     && (sessionBackendType ?? botConfig.backendType) !== 'riff'
@@ -2150,6 +2336,7 @@ export interface PromptHookTarget {
   cliConfigDir?: string;
   sessionBackendType?: BackendType;
   larkAppId: string;
+  sessionId?: string;
 }
 
 /** Whether botmux's UserPromptSubmit hook runs on every submit of a session's
@@ -2164,14 +2351,18 @@ export function promptHookRunsInCli(target: PromptHookTarget): boolean {
     botConfig = getBot(target.larkAppId).config;
   } catch { return false; }
   if (!adapter.hookInstall?.userPromptSubmitCommand) return false;
-  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, target.larkAppId, target.sessionBackendType);
+  const launchConfig = promptHookLaunchConfig(target, botConfig);
+  if (!launchConfig) return false;
+  const effectivePath = effectivePromptHookConfigPath(adapter, launchConfig, target.larkAppId, target.sessionBackendType);
   return !!effectivePath && hasInstalledPromptHookCached(effectivePath);
 }
 
-function withInitialLinkRefSources(
+function finalizeCliTurnInput(
   payload: CliTurnPayload,
   userText: string,
   opts: {
+    acceptedInput?: AcceptedCommandInput;
+    cliId?: string;
     linkRefMode?: LinkRefMode;
     linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
     sharedGroupContext?: string;
@@ -2179,6 +2370,14 @@ function withInitialLinkRefSources(
     attachments?: LarkAttachment[];
   } | undefined,
 ): CliTurnPayload {
+  // Host-accepted structured input owns its exact content and caller. Keep the
+  // shared LinkRefs finalization below, including when no CLI envelope is needed.
+  if (opts?.acceptedInput) {
+    if (opts.cliId !== 'remote-runner') throw new Error('Accepted provider input cannot cross into a different CLI');
+    payload = { ...payload, content: opts.acceptedInput.content,
+      ...(opts.acceptedInput.trustedCaller ? { trustedCaller: opts.acceptedInput.trustedCaller } : {}) };
+    userText = opts.acceptedInput.content;
+  }
   // Builders only describe explicitly model-visible sources. They do not read
   // mutable rollout configuration: the real fork/send boundary freezes that
   // decision after every await/defer. Keep callers without a daemon app scope
@@ -2189,6 +2388,7 @@ function withInitialLinkRefSources(
     ...payload,
     linkRefs: {
       mode,
+      ...(opts?.acceptedInput ? { presentation: 'registry-only' as const } : {}),
       sources: initialLinkRefSources({
         userText,
         userSourceType: opts?.linkRefSourceType,
@@ -2227,7 +2427,7 @@ export function buildFollowUpCliInput(
   // 输入框不再出现 <user_message>/<sender>/<mentions> 标签。代价：hook 注入内容不落
   // transcript，insight 发送者归因对 hook 模式会话降级为「未知用户」（用户已确认接受）。
   const hookTurnId = opts?.turnId;
-  if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
+  if (resolveEnvelopeInjectionMode({ ...opts, sessionId }) === 'hook' && hookTurnId) {
     const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
     // messageLocation 是宿主元数据，与 sender 同类：hook 模式下进 envelope，
     // 输入框与 transcript 仍只有用户正文。
@@ -2242,7 +2442,7 @@ export function buildFollowUpCliInput(
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return withInitialLinkRefSources(
+      return finalizeCliTurnInput(
         { content: ptyText, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
         content,
         opts,
@@ -2252,7 +2452,7 @@ export function buildFollowUpCliInput(
   }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
-    return withInitialLinkRefSources(
+    return finalizeCliTurnInput(
       { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
       content,
       opts,
@@ -2275,7 +2475,7 @@ export function buildFollowUpCliInput(
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale, opts.cliId);
   const mentionBlock = renderMentionBlock(opts.mentions);
-  return withInitialLinkRefSources({
+  return finalizeCliTurnInput({
     content: legacyContent,
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
@@ -2396,11 +2596,24 @@ export function buildBridgeInputContent(
 const STREAM_CARD_SENTINEL = '__posting__';
 
 /** Structured refork variant. Adopted external CLIs intentionally remain on
- * their existing raw bridge path and never receive a Codex App sidecar. */
+ * their existing raw bridge path and never receive a Codex App sidecar.
+ *  The compact RPC envelope only applies to a session whose frozen launch config
+ *  actually engages RPC: paste/sandbox/isolation/wrapper/startup-command sessions
+ *  have no turn/start transport and keep the legacy envelope. */
+export function traexRpcContextForSession(
+  ds: DaemonSession,
+  cliId: string | undefined,
+): FollowUpOpts['traexRpcContext'] {
+  if (cliId !== 'traex' || ds.adoptedFrom || !ds.initConfig || !ds.session.cliSessionId) return undefined;
+  if (!codexRpcEligible(ds.initConfig, { sandboxForced: sandboxEnabled() })) return undefined;
+  return true;
+}
+
 export function buildReforkCliInput(
   ds: DaemonSession,
   content: string,
   opts?: {
+    messageLocation?: InboundMessageLocation;
     attachments?: LarkAttachment[];
     mentions?: LarkMention[];
     cliId?: CliId;
@@ -2409,6 +2622,7 @@ export function buildReforkCliInput(
     locale?: Locale;
     sender?: ResolvedSender;
     substituteTrigger?: SubstituteTrigger;
+    acceptedInput?: AcceptedCommandInput;
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
@@ -2430,6 +2644,7 @@ export function buildReforkCliInput(
     };
   }
   return buildFollowUpCliInput(content, ds.session.sessionId, {
+    ...(opts?.messageLocation ? { messageLocation: opts.messageLocation } : {}),
     attachments: opts?.attachments,
     mentions: opts?.mentions,
     isAdoptMode: false,
@@ -2446,10 +2661,12 @@ export function buildReforkCliInput(
     linkRefSourceType: opts?.linkRefSourceType,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
+    acceptedInput: opts?.acceptedInput,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
     codexAppMessageContext: opts?.codexAppMessageContext,
     solo: ds.soloSession,
     selfMention: opts?.selfMention,
+    traexRpcContext: traexRpcContextForSession(ds, opts?.cliId),
   });
 }
 
@@ -2461,6 +2678,7 @@ export function buildReforkCliInput(
 export function persistStreamCardState(ds: DaemonSession): void {
   const cardId = ds.streamCardId === STREAM_CARD_SENTINEL ? undefined : ds.streamCardId;
   const s = ds.session;
+  const quotaHistory = ds.antigravityQuotaHistory ?? s.antigravityQuotaHistory;
   // Skip write if nothing actually changed — avoids disk churn on every screen_update.
   if (
     s.streamCardId === cardId &&
@@ -2471,6 +2689,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
     sameUsageLimit(s.usageLimit, ds.usageLimit) &&
+    isDeepStrictEqual(s.antigravityQuotaHistory, quotaHistory) &&
     s.modelFallback?.uuid === ds.modelFallback?.uuid &&
     s.modelFallback?.claudeSessionId === ds.modelFallback?.claudeSessionId &&
     s.lastUserPrompt === ds.lastUserPrompt &&
@@ -2488,6 +2707,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
   s.usageLimit = ds.usageLimit;
+  s.antigravityQuotaHistory = quotaHistory;
   s.modelFallback = ds.modelFallback;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;
@@ -2612,6 +2832,12 @@ export async function restoreActiveSessions(
   options: { prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined } = {},
 ): Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice> | undefined> {
   const sessions = sessionStore.listSessions();
+  try {
+    reconcileClosedSessionTurns(config.session.dataDir,
+      new Set(sessions.filter(session => session.status === 'closed').map(session => session.sessionId)));
+  } catch {
+    logger.warn('Failed to reconcile closed structured session turns');
+  }
   const restorePriority = (session: Session): number => {
     if (session.headless) return 2;
     if (session.adoptedFrom || session.cliId || session.cliLaunchSnapshot || session.lastCliInput || session.backendType) return 2;
@@ -3739,7 +3965,9 @@ export async function restoreActiveSessions(
             dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
           }
         : true;
-      if (liveBackendReattach.has(ds)) forkWorker(ds, prompt, resume, { reattachLiveBackend: true });
+      if (liveBackendReattach.has(ds)) forkWorker(ds, prompt, resume, {
+        reattachLiveBackend: true, memoryNoticeAudience: 'owner-only',
+      });
       else {
         const candidate = deploymentContinuationCandidate(ds.session);
         if (candidate && !recoverExactNonCodex) {
@@ -3762,10 +3990,11 @@ export async function restoreActiveSessions(
           try {
             forkWorker(ds, '', { resume: true, onIpcDispatchAttempted: () => { ipcAttempted = true; } }, {
               deploymentContinuation: claimed,
+              memoryNoticeAudience: 'owner-only',
               onAdmission: admission => { if (admission === 'rejected') releaseUndispatchedClaim(); },
             });
           } catch (error) { releaseUndispatchedClaim(); throw error; }
-        } else forkWorker(ds, prompt, resume);
+        } else forkWorker(ds, prompt, resume, { memoryNoticeAudience: 'owner-only' });
       }
     },
     RECOVERY_FORK_BATCH_SIZE,
@@ -4459,6 +4688,13 @@ export async function resumeSession(
  * instructs the model to post progress updates via `botmux send`; a silent
  * monitoring task needs the opposite default — say nothing unless the alert
  * condition in the task prompt is met. Exported for tests.
+ *
+ * The daemon drops a silent turn's final_output under EVERY replyDelivery
+ * (managedFinalOutputSuppressed → isSilentScheduledTurn), so `botmux send` is
+ * the only notification channel here. The last line states that explicitly:
+ * under `transcript` the session prompt says final replies are forwarded
+ * automatically, and a model that wrote the alert into its final reply would
+ * have it silently discarded.
  */
 export function buildSilentScheduleHint(taskName: string, locale?: Locale): string {
   if (locale === 'en') {
@@ -4468,6 +4704,7 @@ export function buildSilentScheduleHint(taskName: string, locale?: Locale): stri
       '- Do NOT send progress or confirmation messages ("started", "checked, all good", "done").',
       '- Only when the result meets the notify condition described in the task (an anomaly found, an alert threshold hit, or the task explicitly asks for a deliverable) should you `botmux send` the conclusion.',
       '- Otherwise finish the turn completely silently — do not call `botmux send` at all.',
+      '- This run\'s final reply is never posted to the chat, even when the session normally forwards final replies automatically; `botmux send` is the only way to notify.',
       '</botmux_silent_schedule>',
     ].join('\n');
   }
@@ -4477,6 +4714,7 @@ export function buildSilentScheduleHint(taskName: string, locale?: Locale): stri
     '- 不要发送过程性/确认性消息（“开始执行”“检查完毕，一切正常”“已完成”都不要发）。',
     '- 仅当结果满足任务描述中需要通知用户的条件（发现异常、达到报警阈值、任务本身要求交付产物）时，才用 `botmux send` 发送结论。',
     '- 不满足条件就完全静默地结束本轮，不要调用 `botmux send`。',
+    '- 本轮的最终回复不会发到群里（即使本会话平时会自动转发最终回复）；要通知只能用 `botmux send`。',
     '</botmux_silent_schedule>',
   ].join('\n');
 }
@@ -5237,7 +5475,15 @@ export async function executeScheduledTask(
     const runtimeScope: 'thread' | 'chat' = deferredFreshTopic
       ? 'chat'
       : scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
+    // 个人助理模式：定时会话归 chat 的主人（私聊 = 建任务的人），cwd 固定在主人的 work/；
+    // 群未认领 → 本次失败（宁可漏一次，也不在共享目录里起会话）。
+    const assistantSpawn = resolveAssistantSpawn(larkAppId, task.chatId, task.chatType === 'p2p' ? 'p2p' : 'group',
+      scheduledTrustedCaller?.requestUserOpenId ?? task.ownerOpenId);
+    if (assistantSpawn.kind === 'unclaimed') {
+      throw new Error(`assistant mode: chat ${task.chatId} has no assistant owner; scheduled run refused`);
+    }
     const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group', undefined, { source: 'schedule' });
+    if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;
@@ -5282,7 +5528,7 @@ export async function executeScheduledTask(
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: now,
       hasHistory: isContinuation,
-      workingDir: task.workingDir,
+      workingDir: assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : task.workingDir,
       initialStartPending: true,
       pendingPrompt: firePrompt,
       // In-memory only, exactly like the trigger API's per-turn model: persisting
@@ -5960,6 +6206,7 @@ async function forkOrShowRepoCard(
       whiteboardId: ds.session.whiteboardId,
       promptInjection: sessionPromptInjection(ds),
       codexAppText: ds.pendingCodexAppText,
+      acceptedInput: ds.pendingAcceptedInput,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
@@ -6046,6 +6293,7 @@ async function forkOrShowRepoCard(
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
     ds.pendingCodexAppText = undefined;
+    ds.pendingAcceptedInput = undefined;
     ds.pendingCodexAppApplicationContext = undefined;
     ds.pendingCodexAppMessageContext = undefined;
     ds.pendingChatContext = undefined;
@@ -6081,9 +6329,12 @@ export interface SpawnDashboardSessionArgs {
   title?: string;
   /** 是否在群里发一条可见的任务横幅（只由 creator/lead 那一次 spawn 发，避免 N 个 bot 重复刷屏）。 */
   postBanner?: boolean;
-  /** 会话归属人 open_id（本 bot 作用域）；缺省回退本 bot 首个 allowedUser。 */
-  ownerOpenId?: string;
+  /** 会话归属人 open_id（本 bot 作用域）；缺省回退本 bot 首个 allowedUser。
+   *  显式 null = foreign-bot 发起的无 owner 会话，不回退配置用户。 */
+  ownerOpenId?: string | null;
   ownerUnionId?: string;
+  /** 原始发起者；foreign-bot 无 owner 时仍保留给 report / 审计。 */
+  creatorOpenId?: string;
 }
 
 /** 在新建的飞书群里为某个 bot 拉起一条 chat-scope 会话（dashboard「创建会话」用）。
@@ -6100,6 +6351,9 @@ export async function spawnDashboardSession(
   let bot: ReturnType<typeof getBot>;
   try { bot = getBot(larkAppId); } catch { return { ok: false, error: 'bot_not_found' }; }
   const locale = localeForBot(larkAppId);
+  // 个人助理模式：看板任务也归该群的主人、cwd 在主人 work/；群未认领就不建。
+  const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, 'group', args.ownerOpenId ?? undefined);
+  if (assistantSpawn.kind === 'unclaimed') return { ok: false, error: 'assistant_unclaimed' };
 
   // chat-scope：锚点就是 chatId。先挡掉「同群同 bot 已有真会话」的撞键（会被
   // Map.set 覆盖而泄漏 worker）。queued 占位 / 纯 scratch 不算冲突。
@@ -6173,9 +6427,11 @@ export async function spawnDashboardSession(
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = 'chat';
-    session.ownerOpenId = args.ownerOpenId ?? getOwnerOpenId(larkAppId);
-    session.creatorOpenId = session.ownerOpenId;
-    if (args.ownerUnionId) session.ownerUnionId = args.ownerUnionId;
+    session.ownerOpenId = args.ownerOpenId === null
+      ? undefined
+      : (args.ownerOpenId ?? getOwnerOpenId(larkAppId));
+    session.creatorOpenId = args.creatorOpenId ?? session.ownerOpenId;
+    if (session.ownerOpenId && args.ownerUnionId) session.ownerUnionId = args.ownerUnionId;
     session.lastMessageAt = new Date(now).toISOString();
     if (args.attachments?.length) session.dashboardAttachments = args.attachments;
     if (column === 'backlog') {
@@ -6187,8 +6443,11 @@ export async function spawnDashboardSession(
       session.kanbanColumn = 'backlog';
     }
 
-    const workingDir = resolveDashboardSpawnWorkingDir(larkAppId, chatId);
+    const workingDir = assistantSpawn.kind === 'owner'
+      ? assistantSpawn.workDir
+      : resolveDashboardSpawnWorkingDir(larkAppId, chatId);
     if (workingDir) session.workingDir = workingDir;
+    if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
@@ -6410,10 +6669,9 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     sessionStore.updateSession(ds.session);
     return { ok: true };
   }
-  // Repo selection / auto-worktree already owns this activation attempt. Keep
-  // the durable queued payload as its crash-recovery journal and make repeated
-  // dashboard starts idempotent instead of posting a second picker/build.
-  if (ds.pendingRepo) return { ok: true };
+  // Repo selection / auto-worktree or another ingress already owns this
+  // activation attempt. Keep the durable queued payload as its crash journal.
+  if (ds.pendingRepo || ds.initialStartPending) return { ok: true };
   const activate = async (): Promise<{ ok: boolean; error?: string }> => {
     if (!ds.session.queued) {
       return (ds.worker && !ds.worker.killed) ? { ok: true } : { ok: false, error: 'not_queued' };
@@ -6480,6 +6738,9 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     if (registry.get(key) !== ds || ds.session.status !== 'active') {
       return { ok: false, error: 'session_not_active' };
     }
+    // The first check ran before lock acquisition. A normal inbound activation
+    // may have installed its opening reservation while this caller waited.
+    if (ds.pendingRepo || ds.initialStartPending) return { ok: true };
     return activate();
   });
 }

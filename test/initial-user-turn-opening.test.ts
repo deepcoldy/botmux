@@ -274,6 +274,10 @@ describe('empty-started session — first real business turn must use the new-to
       larkAppId: APP,
       larkAppSecret: 's',
       cliId: 'codex',
+      // These cases tell the opening envelope from the follow-up one by the
+      // follow-up's <botmux_reminder>, which only send delivery injects; codex
+      // otherwise defaults to transcript (no reminder at all).
+      replyDelivery: 'send',
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
     });
@@ -340,7 +344,7 @@ describe('empty-started session — first real business turn must use the new-to
       resume: true,
       larkAppId: APP,
       larkAppSecret: 's',
-      triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'] },
       larkToolBinding: false,
     };
     const bot = registerBot({
@@ -348,7 +352,7 @@ describe('empty-started session — first real business turn must use the new-to
       larkAppSecret: 's',
       cliId: 'codex',
       larkToolBinding: false,
-      triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'] },
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
     });
@@ -1012,6 +1016,7 @@ describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)',
     messageListener: false,
     vcMeetingReceiver: false,
     vcMeetingImTurnOrigin: false,
+    crossChatFollowUp: false,
   };
 
   it('authorizes ONLY a positive human sender with no special semantics', () => {
@@ -1028,7 +1033,7 @@ describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)',
   it('each special-source fact independently forces serial', () => {
     for (const key of [
       'adopted', 'isForeignBot', 'isBotSenderType', 'substituteTrigger',
-      'controlRewrite', 'messageListener', 'vcMeetingReceiver', 'vcMeetingImTurnOrigin',
+      'controlRewrite', 'messageListener', 'vcMeetingReceiver', 'vcMeetingImTurnOrigin', 'crossChatFollowUp',
     ] as const) {
       expect(computeCodexAppSteerable({ ...humanFacts, [key]: true })).toBe(false);
     }

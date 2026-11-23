@@ -50,6 +50,7 @@ const BOTMUX_CARD_ACTION_PREFIXES = [
   'stop_',
   'suspend_',
   'term_',
+  'tmux_',
   'toggle_',
   'tui_',
   'v3_',

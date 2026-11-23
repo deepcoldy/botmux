@@ -63,14 +63,17 @@ function harness(screen = '', options: { cliId?: 'claude-code' | 'kimi'; priorWo
     busyProbeRegion: (text: string) => text,
     dropFailedBridgeMark: vi.fn(), redriveRejectedStructuredReady: vi.fn(),
     deferNativeCodexInputCommit: () => false, queuePostSubmitNativeSessionTitle: vi.fn(),
+    codexBridgeNoteUnprovenCliSessionId: vi.fn(),
     buildSubmitMessagePreview, cliName: () => 'Claude', currentBotmuxTurnId: 'delivery',
     emitTurnTerminal: vi.fn(), log: vi.fn(), send, t: (key: string) => key,
   };
   scope.submitUnconfirmedNotice = loadWorkerFunction('submitUnconfirmedNotice', scope);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
-  schedule('status please', recheck, 'transcript', 'delivery', undefined, 1, { turnId: 'delivery' });
+  const onConfirmed = vi.fn();
+  schedule('status please', recheck, 'transcript', 'delivery', undefined, 1, { turnId: 'delivery' },
+    'failed', false, onConfirmed);
   return {
-    detector, recheck, chain, scope, backend,
+    detector, recheck, chain, scope, backend, onConfirmed,
     warnings: () => send.mock.calls.map(([message]) => message).filter(message => message.type === 'user_notify'),
   };
 }
@@ -78,6 +81,13 @@ function harness(screen = '', options: { cliId?: 'claude-code' | 'kimi'; priorWo
 describe('worker submit confirmation with native program status', () => {
   const rule = '─'.repeat(60);
   const composerScreen = (body: string) => ['Claude Code', rule, `❯ ${body}`, rule, '  ? for shortcuts'].join('\n');
+
+  it('forwards an unproven candidate separately from the confirmed native session id', async () => {
+    const h = harness();
+    h.recheck.mockReturnValue({ submitted: true, unprovenCliSessionId: 'candidate-new-thread' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.onConfirmed).toHaveBeenCalledExactlyOnceWith(undefined, 'candidate-new-thread');
+  });
 
   it.each([
     { kind: 'unpainted prompt', screen: '' },
@@ -127,7 +137,7 @@ describe('worker submit confirmation with native program status', () => {
     expect(h.chain.size()).toBe(0);
     expect(h.backend.write).not.toHaveBeenCalled();
     expect(h.backend.sendText).not.toHaveBeenCalled();
-    expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(h.backend.sendSpecialKeys).toHaveBeenCalledTimes(1);
   });
 
   it('lets the generic parked-draft screen gate override held working for another CLI', async () => {
@@ -157,6 +167,28 @@ describe('worker submit confirmation with native program status', () => {
     expect(pressComposerSubmit).toHaveBeenCalledTimes(1);
     expect(h.warnings()).toEqual([]);
     expect(h.chain.size()).toBe(0);
+  });
+
+  it('rescues the parked draft before busy-waiting when the busy footer and the draft coexist', async () => {
+    // A background turn keeps the real adapter busyPattern positive while the
+    // unsubmitted draft is still in the composer. The rescue must run first:
+    // busy-waiting here would mute the one-shot submit indefinitely.
+    const busyComposerScreen = [
+      'Claude Code', rule, '❯ status please', rule,
+      '  ⏵⏵ bypass permissions on · esc to interrupt',
+    ].join('\n');
+    const h = harness(busyComposerScreen, { priorWorking: true });
+    expect(h.scope.cliAdapter.busyPattern.test(busyComposerScreen)).toBe(true);
+    const pressComposerSubmit = vi.fn(() => true);
+    h.scope.cliAdapter = { ...h.scope.cliAdapter, pressComposerSubmit };
+    h.scope.sessionStartSignalAtMs = 15_000;
+    await vi.advanceTimersByTimeAsync(20_000);
+    // The 10s post-SessionStart grace has not elapsed yet at t=20s.
+    expect(pressComposerSubmit).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(20_000);
+    // At t=40s the busy footer is still positive; the rescue wins over busy waiting.
+    expect(pressComposerSubmit).toHaveBeenCalledTimes(1);
+    expect(h.warnings()).toEqual([]);
   });
 
   it.each(['Please run /login', 'hooks need review'])('keeps a visible blocking page actionable: %s', async screen => {

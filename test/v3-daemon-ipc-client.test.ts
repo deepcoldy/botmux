@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { readProcessStartIdentity } from '../src/core/session-marker.js';
 
 import {
   signWorkflowDaemonIpcResponse,
@@ -87,6 +91,42 @@ describe('Workflow daemon mutation client', () => {
     const init = fetchImpl.mock.calls[0]![1] as RequestInit;
     const headers = init.headers as Record<string, string>;
     expect(Object.keys(headers).some((key) => key.toLowerCase().startsWith('x-botmux-cli-'))).toBe(false);
+  });
+
+  it('signs the current per-turn session proof with the mutation body', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'workflow-ipc-client-'));
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: 'sess-scheduled',
+        turnId: 'schedule:task1:12345678-1234-1234-1234-123456789abc',
+        dispatchAttempt: 2,
+        capability: 'c'.repeat(64),
+        procStart: readProcessStartIdentity(process.pid),
+      }));
+      const path = '/__workflow-ipc/v1/runs/r/start';
+      const fetchImpl = vi.fn().mockResolvedValue(signedResponse({ bodyRaw: '{"ok":true}', status: 202, pathWithQuery: path }));
+      await postWorkflowDaemonMutation({
+        daemon: DAEMON,
+        runId: 'r',
+        mutation: 'start',
+        secret: SECRET,
+        timestamp: TIMESTAMP,
+        nonce: NONCE,
+        fetchImpl,
+        env: { SESSION_DATA_DIR: dataDir },
+        startPid: process.pid,
+      });
+      const init = fetchImpl.mock.calls[0]![1] as RequestInit;
+      expect(JSON.parse(String(init.body))).toEqual({
+        sessionId: 'sess-scheduled',
+        originTurnId: 'schedule:task1:12345678-1234-1234-1234-123456789abc',
+        originCapability: 'c'.repeat(64),
+        originDispatchAttempt: 2,
+      });
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it('encodes the run id as one path segment', () => {

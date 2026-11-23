@@ -1,0 +1,70 @@
+{
+  "zh": {
+    "tag": "collapsible_panel",
+    "element_id": "botmux_turn_recap",
+    "expanded": false,
+    "background_color": "grey-50",
+    "padding": "4px 12px 12px 12px",
+    "margin": "4px 0px 0px 0px",
+    "border": {
+      "color": "grey-50",
+      "corner_radius": "8px"
+    },
+    "header": {
+      "title": {
+        "tag": "plain_text",
+        "content": "🧭 本轮回顾"
+      },
+      "background_color": "grey-50",
+      "padding": "10px 12px 10px 12px",
+      "icon": {
+        "tag": "standard_icon",
+        "token": "down_outlined",
+        "color": "grey",
+        "size": "16px 16px"
+      },
+      "icon_position": "right",
+      "icon_expanded_angle": -180
+    },
+    "elements": [
+      {
+        "tag": "markdown",
+        "content": "已合入，CI 全绿。\n\n**做了什么**\n- 跑了 1 条命令，最后一条：`bun run build`"
+      }
+    ]
+  },
+  "en": {
+    "tag": "collapsible_panel",
+    "element_id": "botmux_turn_recap",
+    "expanded": false,
+    "background_color": "grey-50",
+    "padding": "4px 12px 12px 12px",
+    "margin": "4px 0px 0px 0px",
+    "border": {
+      "color": "grey-50",
+      "corner_radius": "8px"
+    },
+    "header": {
+      "title": {
+        "tag": "plain_text",
+        "content": "🧭 Turn recap"
+      },
+      "background_color": "grey-50",
+      "padding": "10px 12px 10px 12px",
+      "icon": {
+        "tag": "standard_icon",
+        "token": "down_outlined",
+        "color": "grey",
+        "size": "16px 16px"
+      },
+      "icon_position": "right",
+      "icon_expanded_angle": -180
+    },
+    "elements": [
+      {
+        "tag": "markdown",
+        "content": "已合入，CI 全绿。\n\n**做了什么**\n- 跑了 1 条命令，最后一条：`bun run build`"
+      }
+    ]
+  }
+}

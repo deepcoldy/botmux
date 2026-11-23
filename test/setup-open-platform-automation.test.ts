@@ -2649,6 +2649,71 @@ describe('readDefaultScopeManifest', () => {
 });
 
 describe('automateOpenPlatformSetup', () => {
+  it.each([false, true])('redirectOnly 不触碰权限、订阅和版本（白名单已回读：%s）', async redirectAlreadyConfigured => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-redirect-only-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const existing = 'https://example.com/custom-callback';
+    let redirectUrls = [existing];
+    const developerCalls: string[] = [];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home');
+      if (href.endsWith('/app/cli_redirect/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>');
+      const path = new URL(href).pathname;
+      developerCalls.push(path);
+      if (path === '/developers/v1/safe_setting/cli_redirect') {
+        return Response.json({ code: 0, data: { redirectURL: redirectUrls } });
+      }
+      if (path === '/developers/v1/safe_setting/update/cli_redirect') {
+        redirectUrls = JSON.parse(String(init?.body)).redirectURL;
+        return Response.json({ code: 0 });
+      }
+      throw new Error(`unexpected path: ${path}`);
+    };
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_redirect', sessionFilePath: sessionFile, disableQrLogin: true,
+      redirectOnly: true, redirectAlreadyConfigured, fetchImpl,
+    });
+
+    expect(result).toMatchObject({ ok: true, redirectConfigured: true, publishSkipped: true });
+    if (redirectAlreadyConfigured) {
+      expect(developerCalls).toEqual([]);
+    } else {
+      expect(developerCalls).toEqual([
+        '/developers/v1/safe_setting/cli_redirect',
+        '/developers/v1/safe_setting/update/cli_redirect',
+        '/developers/v1/safe_setting/cli_redirect',
+      ]);
+      expect(redirectUrls).toEqual(expect.arrayContaining([existing, BOTMUX_REDIRECT_URL]));
+    }
+  });
+
+  it('注册后的首次发版补配在白名单读取失败时不覆盖既有地址', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-redirect-protect-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const consoleWrites: string[] = [];
+    const fetchImpl: typeof fetch = async url => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home');
+      if (href.endsWith('/app/cli_redirect/auth')) return new Response('<script>window.csrfToken="csrf_auto"</script>');
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/safe_setting/cli_redirect') return Response.json({ code: 1, msg: 'read failed' });
+      if (path.includes('/safe_setting/update/')) consoleWrites.push(path);
+      return Response.json({ code: 1, msg: 'stop after redirect' });
+    };
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_redirect', sessionFilePath: sessionFile, disableQrLogin: true,
+      appJustCreated: true, allowBlindRedirectWrite: false, fetchImpl,
+    });
+
+    expect(result.redirectConfigured).toBe(false);
+    expect(consoleWrites).toEqual([]);
+  });
+
   it('forwards forceQrLogin so configure --switch-account ignores a valid cache', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-auto-force-'));
     const sessionFile = join(dir, 'feishu-session.json');

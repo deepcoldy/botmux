@@ -1,33 +1,43 @@
 import { execFile } from 'node:child_process';
-import { closeSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { closeSync, openSync, readdirSync, readSync, statSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
-import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
-import { doubaoTrajectoryPathForSession, drainDoubaoTranscript } from '../../services/doubao-transcript.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec, SubmitRecheckResult } from './types.js';
+import {
+  doubaoAssignmentHasInputSince,
+  doubaoAssignmentPathForSession,
+  doubaoLogSize,
+  doubaoTrajectoryPathForSession,
+  drainDoubaoTranscript,
+  type DoubaoBridgeDrainState,
+} from '../../services/doubao-transcript.js';
+import { busyProbeRegion } from '../../utils/busy-probe.js';
+import {
+  DOUBAO_BUSY_FOOTER,
+  DOUBAO_QUEUE_LINE,
+  doubaoComposerState,
+  doubaoScreenHoldsSubmittedInput,
+  doubaoScreenShowsNoPendingInput,
+} from './doubao-screen.js';
+
+export { DOUBAO_BUSY_FOOTER };
 
 import { delay } from '../../utils/timing.js';
+import { DOUBAO_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 
 /** Doubao session ids are decimal snowflakes (`38450922917357570`). `--resume`
  *  with anything else fails at the IM layer (`Invalid request parameters` /
  *  `IM request failed`), so only this shape is ever passed through. */
 const DOUBAO_SESSION_ID = /^\d{10,24}$/;
 
-/** `--effort` values accepted by doubao 2.31 (`none|minimal|low|medium|high|xhigh|max`).
+/** `--effort` values accepted by doubao 2.36 (`none|minimal|low|medium|high|xhigh|max`).
  *  botmux's `ultra` has no equivalent and is dropped rather than failing the launch. */
-const DOUBAO_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
-
-/**
- * Busy footer drawn directly above the composer while a turn runs:
- * `✦ Responding… (3s • esc to interrupt)` / `◈ Running tool… (8s • esc to interrupt)`.
- * The leading glyph animates and the counter ticks every second, so only the
- * static `esc to interrupt)` tail is anchored. It disappears when the turn ends
- * (replaced by `Worked for Ns` in the transcript). Verified on doubao 2.31.0.
- */
-export const DOUBAO_BUSY_FOOTER = /esc to interrupt\)/;
+const DOUBAO_EFFORTS = new Set(DOUBAO_REASONING_EFFORTS);
 
 /**
  * Composer evidence. The `❯  Ask Doubao to do anything` placeholder and the
@@ -50,6 +60,15 @@ export function doubaoDataRoot(env: NodeJS.ProcessEnv = process.env, platform = 
   return parent && isAbsolute(parent) ? join(parent, 'doubao_cli') : undefined;
 }
 
+/** A path that definitively holds no session: it does not exist, or one of its
+ *  components is a plain file where a directory belongs (e.g. Finder's
+ *  `.DS_Store` in `agent_mode/` or `agents/`). Unlike EACCES / EIO, neither can
+ *  hide a peer session, so neither makes the capture inventory incomplete. */
+function isAbsentPathError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
 /** Every `.sessions` directory under the data root (one per logged-in account). */
 export function doubaoSessionRoots(dataRoot: string | undefined = doubaoDataRoot()): string[] {
   if (!dataRoot) return [];
@@ -58,7 +77,14 @@ export function doubaoSessionRoots(dataRoot: string | undefined = doubaoDataRoot
   try { accounts = readdirSync(agentMode); } catch { return []; }
   return accounts
     .map(uid => join(agentMode, uid, 'workspace', '.sessions'))
-    .filter(dir => { try { return statSync(dir).isDirectory(); } catch { return false; } });
+    .filter(dir => {
+      try { return statSync(dir).isDirectory(); }
+      catch (error) {
+        // Retain unreadable candidates so the assignment scan can refuse an
+        // incomplete inventory, while genuinely absent account stores stay out.
+        return !isAbsentPathError(error);
+      }
+    });
 }
 
 function readTail(path: string, maxBytes: number, size: number): string {
@@ -77,6 +103,100 @@ export function doubaoSubmitFingerprint(content: string): string | undefined {
   return last ? last.slice(-200) : undefined;
 }
 
+/** Ownership is a standalone envelope line, before per-turn context or user
+ *  payload. Inline examples of the tag in routing instructions are not owners. */
+const SESSION_ID_MARKER_RE = /^[\t \ufeff]*<session_id>([^<\s]+)<\/session_id>[\t ]*\r?$/m;
+const SESSION_PAYLOAD_START_RE = /^[\t \ufeff]*<(?:role|summary_memory|whiteboard|chat_context_policy|chat_context|botmux_group_join|user_message)(?=[\s>])/m;
+
+/** Owning botmux session id parsed from a submitted prompt envelope, or
+ *  undefined for an envelope-less (zero-injection) submit. */
+export function doubaoSessionMarkerFromContent(content: string): string | undefined {
+  const match = SESSION_ID_MARKER_RE.exec(content);
+  if (match) {
+    const prefix = content.slice(0, match.index);
+    if (SESSION_PAYLOAD_START_RE.test(prefix)) return undefined;
+    // assignment.md appends turns. Only the first request's envelope can
+    // establish ownership; a later turn may merely quote another session.
+    if ((prefix.match(/^## \[[^\]\r\n]+\] /gm)?.length ?? 0) > 1) return undefined;
+  }
+  return match?.[1]?.trim() || undefined;
+}
+
+const DOUBAO_INPUT_ID_RE = /^botmux_input_id: ([0-9a-f]{32})[\t ]*\r?$/gm;
+
+function doubaoInputIdFromContent(content: string): string | undefined {
+  // The adapter appends its id after the original envelope, so the last id is
+  // authoritative even if the user payload already contained an example.
+  return [...content.matchAll(DOUBAO_INPUT_ID_RE)].at(-1)?.[1];
+}
+
+/** Correlate every submit from one adapter launch generation without changing
+ *  envelope-less (zero-injection) input. The id is reused across inputs until
+ *  capture succeeds, so a later input can still recover an earlier assignment. */
+export function doubaoContentWithCaptureId(content: string, captureId: string): string {
+  if (!doubaoSessionMarkerFromContent(content)) return content;
+  return `${content}\n\n<botmux_routing>\nbotmux_input_id: ${captureId}\n</botmux_routing>`;
+}
+
+function hasDoubaoInputId(content: string, captureId: string): boolean {
+  return new RegExp(`^botmux_input_id: ${captureId}[\\t ]*\\r?$`, 'm').test(content);
+}
+
+/** Minimum initial-turn read for short envelopes. The full correlated
+ *  submission expands this window without scanning resumed assignment history. */
+const SESSION_MARKER_HEAD_BYTES = 8192;
+
+function readHead(path: string, maxBytes: number, size: number): string {
+  const length = Math.min(size, maxBytes);
+  if (length === 0) return '';
+  const buf = Buffer.alloc(length);
+  const fd = openSync(path, 'r');
+  try { readSync(fd, buf, 0, length, 0); } finally { closeSync(fd); }
+  return buf.toString('utf-8');
+}
+
+/** Walk every account's `.sessions`, visiting assignment.md files modified at
+ *  or after `sinceMs`. The session dir's own mtime is not bumped by the nested
+ *  append, so freshness is checked on the assignment file itself. */
+function forEachDoubaoAssignment(
+  roots: readonly string[],
+  sinceMs: number,
+  visit: (sid: string, assignment: string, st: Stats) => void,
+): boolean {
+  let complete = true;
+  for (const root of roots) {
+    let sessions: string[];
+    try { sessions = readdirSync(root); } catch (error) {
+      if (!isAbsentPathError(error)) complete = false;
+      continue;
+    }
+    for (const sid of sessions) {
+      if (!DOUBAO_SESSION_ID.test(sid)) continue;
+      const agentsDir = join(root, sid, 'agents');
+      let agents: string[];
+      try {
+        agents = readdirSync(agentsDir);
+      } catch (error) {
+        if (!isAbsentPathError(error)) complete = false;
+        continue;
+      }
+      for (const agent of agents) {
+        const assignment = join(agentsDir, agent, 'system', 'assignment.md');
+        try {
+          const st = statSync(assignment);
+          if (st.mtimeMs < sinceMs) continue;
+          visit(sid, assignment, st);
+        } catch (error) {
+          // Missing / racing writers are retried by the poll; unreadable peers
+          // prevent proving uniqueness and must not narrow the inventory.
+          if (!isAbsentPathError(error)) complete = false;
+        }
+      }
+    }
+  }
+  return complete;
+}
+
 /**
  * Find the native session that just received `content`.
  *
@@ -85,42 +205,52 @@ export function doubaoSubmitFingerprint(content: string): string | undefined {
  * `## [<ts>] 需求` followed by the prompt) at submit time, including large
  * bracketed pastes the composer collapsed into `[Pasted text #n]`. The shared
  * `.sessions` root also holds every other doubao/Doubao-desktop session of the
- * account, so a candidate must both be written after `sinceMs` AND contain this
- * prompt's fingerprint. Ambiguity (two matches) yields undefined rather than a
+ * account.
+ *
+ * Two tiers, because concurrent cold starts in one account can submit prompts
+ * whose last-line fingerprints are byte-identical (a fixed routing suffix):
+ *   1. When the prompt envelope embeds `<session_id>{botmux id}</session_id>`,
+ *      the adapter also appends a fresh `botmux_input_id` for this launch
+ *      generation. Match that id at the assignment HEAD or in the latest turn;
+ *      unlike a session marker or payload, it cannot name an older generation.
+ *   2. A zero-injection submit carries no envelope, so fall back to the legacy
+ *      tail fingerprint.
+ * Either way, ambiguity (not exactly one match) yields undefined rather than a
  * guess: a wrong id would later `--resume` a sibling conversation.
  */
 export function findDoubaoSessionForSubmit(
   content: string,
   sinceMs: number,
   roots: readonly string[] = doubaoSessionRoots(),
+  windowBytes?: number,
 ): string | undefined {
+  const marker = doubaoSessionMarkerFromContent(content);
+  const window = Math.max(Buffer.byteLength(content, 'utf-8') * 2 + 4096, windowBytes ?? 0);
+  if (marker) {
+    const captureId = doubaoInputIdFromContent(content);
+    // Marker-only text is not generation evidence. The adapter must correlate
+    // its submissions; an old assignment can share both marker and payload.
+    if (!captureId) return undefined;
+    const headBytes = Math.max(SESSION_MARKER_HEAD_BYTES, window);
+    const matches = new Set<string>();
+    const complete = forEachDoubaoAssignment(roots, sinceMs, (sid, assignment, st) => {
+      // The per-launch id is the ownership proof, so it may appear in a later
+      // turn too. Check both the initial-turn window and the latest appended
+      // window; no file-growth or predicted-reattach assumption is involved.
+      if (hasDoubaoInputId(readHead(assignment, headBytes, st.size), captureId)
+        || hasDoubaoInputId(readTail(assignment, window, st.size), captureId)) {
+        matches.add(sid);
+      }
+    });
+    return complete && matches.size === 1 ? [...matches][0] : undefined;
+  }
   const fingerprint = doubaoSubmitFingerprint(content);
   if (!fingerprint) return undefined;
-  const window = Buffer.byteLength(content, 'utf-8') * 2 + 4096;
   const matches = new Set<string>();
-  for (const root of roots) {
-    let sessions: string[];
-    try { sessions = readdirSync(root); } catch { continue; }
-    for (const sid of sessions) {
-      if (!DOUBAO_SESSION_ID.test(sid)) continue;
-      const agentsDir = join(root, sid, 'agents');
-      let agents: string[];
-      try {
-        // Cheap pre-filter: the session dir's own mtime is not bumped by the
-        // nested append, so stat the agents dir entries instead.
-        agents = readdirSync(agentsDir);
-      } catch { continue; }
-      for (const agent of agents) {
-        const assignment = join(agentsDir, agent, 'system', 'assignment.md');
-        try {
-          const st = statSync(assignment);
-          if (st.mtimeMs < sinceMs) continue;
-          if (readTail(assignment, window, st.size).includes(fingerprint)) matches.add(sid);
-        } catch { /* missing / racing writer */ }
-      }
-    }
-  }
-  return matches.size === 1 ? [...matches][0] : undefined;
+  const complete = forEachDoubaoAssignment(roots, sinceMs, (sid, assignment, st) => {
+    if (readTail(assignment, window, st.size).includes(fingerprint)) matches.add(sid);
+  });
+  return complete && matches.size === 1 ? [...matches][0] : undefined;
 }
 
 /**
@@ -139,36 +269,95 @@ export function findDoubaoSessionForSubmit(
  */
 export const DOUBAO_SUBMIT_CAPTURE_BUDGET_MS = 20_000;
 export const DOUBAO_SUBMIT_CAPTURE_INTERVAL_MS = 250;
+/** Receipt wait for an input to an already bound session. Doubao appends the
+ *  request to assignment.md within seconds once it sends it; input parked in
+ *  its own send queue ends the wait early (see DOUBAO_QUEUE_LINE), so this
+ *  only bounds how long a silent miss holds the flush. */
+export const DOUBAO_SUBMIT_RECEIPT_BUDGET_MS = 10_000;
+/** The composer is read no earlier than this after Enter: Doubao clears it
+ *  synchronously on accept, but the pane needs a repaint to show that. */
+const DOUBAO_COMPOSER_SETTLE_MS = 1_000;
 
-/** Poll `find` until it yields a session id or the budget runs out. Split out
- *  of writeInput so the cold-start timing is testable without a real TUI. */
-export async function pollDoubaoSessionForSubmit(
-  find: () => string | undefined,
+const DOUBAO_PASTE_NOT_DELIVERED = 'The terminal did not confirm the paste and the Doubao input box is still empty; Enter was not sent. Retry the message.';
+
+async function captureDoubaoScreen(
+  pty: Pick<PtyHandle, 'captureViewportAsync' | 'captureCurrentScreen'>,
+): Promise<string | undefined> {
+  try {
+    if (pty.captureViewportAsync) return await pty.captureViewportAsync();
+    return pty.captureCurrentScreen?.();
+  } catch { return undefined; }
+}
+
+/**
+ * After Enter: wait for the submit receipt, and classify a miss by what the
+ * composer shows. Pressing Enter is not proof of submission — Doubao drops it
+ * while the composer cannot submit (initializing / switching / too long) and
+ * the draft simply stays in the box; and an Enter it does accept during a
+ * running turn is only queued.
+ *  - receipt found                 → submitted (the native record exists);
+ *  - Doubao's queue line is drawn  → taken into Doubao's own send queue; it is
+ *    sent when the running work ends, so stop waiting (unverified);
+ *  - draft still in the composer   → not submitted; nothing re-pastes it, and
+ *    the recheck lets a later manual submit confirm the same input;
+ *  - otherwise                     → unverified (the bridge's start lease decides).
+ */
+export async function awaitDoubaoSubmitReceipt(
+  pty: Pick<PtyHandle, 'captureViewportAsync' | 'captureCurrentScreen'>,
+  receipt: () => SubmitRecheckResult,
   opts: {
     budgetMs?: number;
     intervalMs?: number;
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
   } = {},
-): Promise<string | undefined> {
-  const budgetMs = opts.budgetMs ?? DOUBAO_SUBMIT_CAPTURE_BUDGET_MS;
-  const intervalMs = opts.intervalMs ?? DOUBAO_SUBMIT_CAPTURE_INTERVAL_MS;
+): Promise<void | { submitted: boolean; cliSessionId?: string; ownershipProven?: boolean; recheck?: () => SubmitRecheckResult }> {
   const now = opts.now ?? Date.now;
   const sleep = opts.sleep ?? delay;
-  const deadline = now() + budgetMs;
+  const intervalMs = opts.intervalMs ?? DOUBAO_SUBMIT_CAPTURE_INTERVAL_MS;
+  const enterAt = now();
+  const deadline = enterAt + (opts.budgetMs ?? DOUBAO_SUBMIT_RECEIPT_BUDGET_MS);
+  const confirmed = () => {
+    const result = receipt();
+    return result && typeof result === 'object' && result.submitted ? result : undefined;
+  };
+  let lastLook = Number.NEGATIVE_INFINITY;
   for (;;) {
-    const sid = find();
-    if (sid) return sid;
-    if (now() >= deadline) return undefined;
+    const hit = confirmed();
+    if (hit) return hit;
+    if (now() >= deadline) break;
+    if (now() - enterAt >= DOUBAO_COMPOSER_SETTLE_MS && now() - lastLook >= DOUBAO_COMPOSER_SETTLE_MS) {
+      lastLook = now();
+      const screen = await captureDoubaoScreen(pty);
+      if (screen && doubaoComposerState(screen) === 'empty'
+        && DOUBAO_QUEUE_LINE.test(busyProbeRegion(screen))) {
+        return confirmed() ?? undefined;
+      }
+    }
     await sleep(intervalMs);
   }
+  const late = confirmed();
+  if (late) return late;
+  const screen = await captureDoubaoScreen(pty);
+  if (screen && doubaoComposerState(screen) === 'draft') return { submitted: false, recheck: receipt };
 }
 
 /** True when the session directory exists locally; undefined when no session
- *  root is readable (cannot tell — let the worker's secondary guard decide). */
+ *  root is readable (cannot tell — let the worker's secondary guard decide).
+ *  A definite ENOENT/ENOTDIR on every root means "absent" (false); any other
+ *  stat failure (EACCES/EIO) means "unknown" (undefined), so a temporarily
+ *  unreadable account store cannot demote a valid `--resume` to a fresh spawn. */
 export function doubaoSessionExists(sessionId: string, roots: readonly string[] = doubaoSessionRoots()): boolean | undefined {
   if (roots.length === 0) return undefined;
-  return roots.some(root => { try { return statSync(join(root, sessionId)).isDirectory(); } catch { return false; } });
+  let indeterminate = false;
+  for (const root of roots) {
+    try {
+      if (statSync(join(root, sessionId)).isDirectory()) return true;
+    } catch (error) {
+      if (!isAbsentPathError(error)) indeterminate = true;
+    }
+  }
+  return indeterminate ? undefined : false;
 }
 
 /** Parse the model list doubao prints for an unsupported `--model` value:
@@ -178,6 +367,105 @@ export function parseDoubaoAvailableModels(output: string): string[] | null {
   if (!m) return null;
   const models = m[1]!.split(',').map(s => s.trim()).filter(Boolean);
   return models.length > 0 ? models : null;
+}
+
+const DOUBAO_MODEL_LIST_MIN_VERSION: readonly [number, number, number] = [2, 37, 1];
+const DOUBAO_DETECT_TIMEOUT_MS = 10_000;
+
+/** Parse `major.minor.patch` from `doubao --version` output (e.g. `doubao 2.37.1`). */
+export function parseDoubaoVersion(output: string): [number, number, number] | null {
+  const cleaned = output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+  const m = /(?:^|[^.\d])v?(\d+)\.(\d+)\.(\d+)(?![.\d])/.exec(cleaned);
+  if (!m) return null;
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  const patch = Number(m[3]);
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch)) {
+    return null;
+  }
+  return [major, minor, patch];
+}
+
+function isDoubaoVersionAtLeast(
+  version: readonly [number, number, number],
+  min: readonly [number, number, number],
+): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (version[i]! !== min[i]!) return version[i]! > min[i]!;
+  }
+  return true;
+}
+
+/** Parse `doubao model list --json` stdout (`result.models[]`, doubao >= 2.37.1).
+ *  Uses `id` as the authoritative `--model` launch value (`doubao --model`
+ *  matches `id` first and rejects duplicate `name`s as ambiguous); falls back to
+ *  `name` only when an entry omits `id` and that `name` is unique and does not
+ *  collide with any `id` in the list. */
+export function parseDoubaoModelListJson(stdout: string): string[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const envelope = parsed as { is_error?: unknown; result?: unknown };
+  if (envelope.is_error) return null;
+  if (typeof envelope.result !== 'object' || envelope.result === null) return null;
+  const models = (envelope.result as { models?: unknown }).models;
+  if (!Array.isArray(models)) return null;
+
+  const ids = new Set<string>();
+  const nameCounts = new Map<string, number>();
+  for (const entry of models) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const record = entry as { id?: unknown; name?: unknown };
+    const id = typeof record.id === 'string' ? record.id.trim() : '';
+    if (id) ids.add(id);
+    const name = typeof record.name === 'string' ? record.name.trim() : '';
+    if (name) nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+  }
+
+  const seen = new Set<string>();
+  const values: string[] = [];
+  for (const entry of models) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const record = entry as { id?: unknown; name?: unknown };
+    const id = typeof record.id === 'string' ? record.id.trim() : '';
+    const name = typeof record.name === 'string' ? record.name.trim() : '';
+    const candidate = id || (name && !ids.has(name) && nameCounts.get(name) === 1 ? name : '');
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    values.push(candidate);
+  }
+  return values.length > 0 ? values : null;
+}
+
+function execDoubaoProbe(
+  bin: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+  maxBuffer = 64 * 1024,
+): Promise<{ err: Error | null; stdout: string; stderr: string }> {
+  return new Promise(resolve => {
+    try {
+      execFile(bin, [...args], {
+        timeout: timeoutMs,
+        maxBuffer,
+        windowsHide: true,
+        env,
+      }, (err, stdout, stderr) => {
+        resolve({
+          err: err ?? null,
+          stdout: typeof stdout === 'string' ? stdout : String(stdout ?? ''),
+          stderr: typeof stderr === 'string' ? stderr : String(stderr ?? ''),
+        });
+      });
+    } catch (err) {
+      resolve({ err: err instanceof Error ? err : new Error(String(err)), stdout: '', stderr: '' });
+    }
+  });
 }
 
 /** Doubao CLI (`@bytedance-dev/doubao-cli` / `@bytedance/doubao-cli`).
@@ -196,23 +484,46 @@ export const doubaoBridgeSpec: StructuredBridgeSpec = {
   drain: (path, offset, ctx) => drainDoubaoTranscript(path, offset, {
     state: ctx.state,
     openTurns: ctx.openTurns,
+    ownsNativeInput: ctx.ownsNativeInput,
+    ownsNativeInputByFingerprint: ctx.ownsNativeInputByFingerprint,
+    nativeInputOwner: ctx.nativeInputOwner,
   }),
+  awaitsPendingInput: state => !!(state as DoubaoBridgeDrainState | undefined)?.parkedUserRow,
+  pendingInputOwner: state => {
+    const parked = (state as DoubaoBridgeDrainState | undefined)?.parkedUserRow;
+    return parked?.turnId ? { turnId: parked.turnId,
+      ...(parked.dispatchAttempt !== undefined ? { dispatchAttempt: parked.dispatchAttempt } : {}) } : undefined;
+  },
   locate: {
     bySessionId: sessionId => doubaoTrajectoryPathForSession(sessionId),
   },
 };
 
-export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
+export function createDoubaoAdapter(pathOverride?: string, deps: {
+  now?: () => number;
+  /** Clock for the post-Enter receipt wait (tests run it virtually). */
+  submitClock?: { now: () => number; sleep: (ms: number) => Promise<void> };
+} = {}): CliAdapter {
   const rawBin = pathOverride ?? 'doubao';
+  const now = deps.now ?? (() => Date.now());
   let cachedBin: string | undefined;
   // A fresh spawn learns its native id from the first submit that lands.
-  let capturePending = false;
+  // Each launch owns an immutable identity; per-input state lives on this
+  // object so an old poll can never clear a replacement launch's capture.
+  // `sessionId` is the conversation this launch is bound to (precise resume,
+  // or the captured id): later inputs take their submit receipt from it.
+  let launch: {
+    capture?: { id: string; sinceMs?: number; windowBytes: number };
+    sessionId?: string;
+  } = {};
   return {
     id: 'doubao',
     bridgeSpec: doubaoBridgeSpec,
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     // The npm launcher asks `Update now? [Y/N]` on an interactive start when a
     // newer version exists; botmux's first prompt would be eaten as the answer.
+    // Also listed in BOTMUX_INJECTED_ENV_KEYS: tmux/zellij/zmx panes only see
+    // adapter env that is on that allowlist.
     spawnEnv: { DOUBAO_CLI_NO_UPDATE_CHECK: '1' },
     // Login state (`~/.doubao-cli`, Linux data root). Kept writable inside the
     // file sandbox so token refresh persists; not yet verified end-to-end there.
@@ -220,7 +531,16 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ resume, resumeSessionId, model, reasoningEffort, disableCliBypass }) {
       const preciseResume = resume && !!resumeSessionId && DOUBAO_SESSION_ID.test(resumeSessionId);
-      capturePending = !preciseResume;
+      // Replace the whole launch object for every launch, including a
+      // predicted reattach that a backend later turns into a fresh spawn.
+      // Inputs from one launch share the id so delayed turns remain recoverable.
+      launch = preciseResume ? { sessionId: resumeSessionId } : {
+        capture: {
+          id: randomBytes(16).toString('hex'),
+          sinceMs: undefined,
+          windowBytes: 0,
+        },
+      };
       const args: string[] = [];
       // `always_allow` = act without per-tool approval (the TUI's dialog is not
       // reachable from Lark). `--dangerously-bypass-approvals-and-sandbox` would
@@ -248,33 +568,85 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
+      const current = launch;
+      const launchCapture = current.capture;
+      const submittedContent = launchCapture
+        ? doubaoContentWithCaptureId(content, launchCapture.id)
+        : content;
       const startedAt = Date.now();
+      if (launchCapture) {
+        // A later input must still be able to recover an earlier, longer turn
+        // from this same launch generation.
+        launchCapture.sinceMs ??= startedAt - 2000;
+        launchCapture.windowBytes = Math.max(launchCapture.windowBytes, Buffer.byteLength(submittedContent, 'utf-8') * 2 + 4096);
+      }
+      // Receipt source, fixed before any byte is written. A fresh launch finds
+      // its session through the per-launch capture id; a bound one checks only
+      // what its own assignment.md gains after this baseline.
+      let receipt: () => SubmitRecheckResult = () => false;
+      if (launchCapture) {
+        receipt = () => {
+          const sid = findDoubaoSessionForSubmit(
+            submittedContent,
+            launchCapture.sinceMs ?? startedAt - 2000,
+            undefined,
+            launchCapture.windowBytes,
+          );
+          if (!sid) return false;
+          // A stale write may still return its own SID for the worker's
+          // generation fence, but it must not disarm the replacement launch.
+          if (current.capture === launchCapture) current.capture = undefined;
+          current.sessionId = sid;
+          return { submitted: true, cliSessionId: sid, ownershipProven: true };
+        };
+      } else if (current.sessionId) {
+        const sessionId = current.sessionId;
+        const assignment = doubaoAssignmentPathForSession(sessionId);
+        const baseline = assignment ? doubaoLogSize(assignment) : undefined;
+        if (assignment && baseline !== undefined) {
+          receipt = () => doubaoAssignmentHasInputSince(assignment, baseline, submittedContent)
+            ? { submitted: true, cliSessionId: sessionId, ownershipProven: true }
+            : false;
+        }
+      }
       // Bracketed paste: the composer inserts the whole multi-line envelope as
       // content (large pastes collapse to `[Pasted text #n +N lines]` and are
       // expanded verbatim on submit); only the following Enter submits.
       // Per-line send-keys would turn each embedded newline into Enter.
       if (pty.pasteText && pty.sendSpecialKeys) {
-        pty.pasteText(content);
+        if (pty.pasteText(submittedContent) === false) {
+          // Never follow an unconfirmed paste with Enter. An empty composer
+          // proves nothing landed; anything else may be a partial draft.
+          const screen = await captureDoubaoScreen(pty);
+          return screen && doubaoComposerState(screen) === 'empty'
+            ? { submitted: false, failureReason: DOUBAO_PASTE_NOT_DELIVERED }
+            : { submitted: false, recheck: receipt };
+        }
         await delay(300);
-        if (pty.sendSpecialKeys('Enter') === false) return { submitted: false };
+        if (pty.sendSpecialKeys('Enter') === false) return { submitted: false, recheck: receipt };
       } else {
-        if (pty.write(wrapBracketedPaste(content)) === false) return { submitted: false };
+        if (pty.write(wrapBracketedPaste(submittedContent)) === false) return { submitted: false, recheck: receipt };
         await delay(1000);
-        if (pty.write('\r') === false) return { submitted: false };
+        if (pty.write('\r') === false) return { submitted: false, recheck: receipt };
       }
-      if (!capturePending) return;
-      // assignment.md is appended once doubao accepts the turn (later on a cold
-      // service start, see DOUBAO_SUBMIT_CAPTURE_BUDGET_MS). A miss stays armed
-      // for the next input instead of costing the session its resume id, and is
-      // reported as "unverified" (void) — never as a failed submit.
-      const sid = await pollDoubaoSessionForSubmit(
-        () => findDoubaoSessionForSubmit(content, startedAt - 2000),
-      );
-      if (sid) {
-        capturePending = false;
-        return { submitted: true, cliSessionId: sid };
-      }
+      // assignment.md is appended once doubao sends the turn (later on a cold
+      // service start, see DOUBAO_SUBMIT_CAPTURE_BUDGET_MS). A capture miss
+      // stays armed for the next input instead of costing the session its
+      // resume id; a miss is "unverified" unless the draft is visibly stuck.
+      return awaitDoubaoSubmitReceipt(pty, receipt, {
+        budgetMs: launchCapture ? DOUBAO_SUBMIT_CAPTURE_BUDGET_MS : DOUBAO_SUBMIT_RECEIPT_BUDGET_MS,
+        ...deps.submitClock,
+      });
     },
+
+    // A miss whose draft is still in the composer may yet be submitted by
+    // hand in the Web terminal: keep that turn attributable and hold later
+    // input instead of pasting it onto the draft (never re-pasted).
+    quarantineUnconfirmedSubmits: true,
+    screenHoldsSubmittedInput: doubaoScreenHoldsSubmittedInput,
+    // …and once the draft is gone from the composer (cleared or replaced by
+    // hand), stop holding later input behind it.
+    screenShowsNoPendingInput: doubaoScreenShowsNoPendingInput,
 
     completionPattern: undefined,
     readyPattern: DOUBAO_READY_PATTERN,
@@ -290,20 +662,44 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
     skillsDir: '~/Doubao/skills',
     modelChoices: CLI_MODEL_CHOICES['doubao'],
 
-    async detectModels() {
-      // Models are account-dependent display names. An unsupported --model makes
-      // doubao print the authoritative list and exit 1 before any session or
-      // model call is created.
-      const bin = cachedBin ??= resolveCommand(rawBin);
-      return new Promise<readonly string[] | null>(resolve => {
-        execFile(bin, ['--model', '__botmux_model_probe__', '-p', 'probe'], {
-          timeout: 10_000,
-          maxBuffer: 64 * 1024,
-          env: { ...process.env, DOUBAO_CLI_NO_UPDATE_CHECK: '1' },
-        }, (_err, stdout, stderr) => {
-          try { resolve(parseDoubaoAvailableModels(`${stdout ?? ''}\n${stderr ?? ''}`)); } catch { resolve(null); }
-        });
-      });
+    async detectModels(options) {
+      // Doubao CLI 2.37.1+ adds read-only `doubao model list --json`
+      // (`result.models[].id` / `.name`) and localizes its invalid `--model`
+      // diagnostic into Chinese, so the legacy English error probe resolves
+      // null on 2.37.1+. Check `doubao --version` asynchronously on demand first
+      // (never on adapter construction or session startup), sharing a single 10s
+      // deadline across both probes: >= 2.37.1 uses `model list --json`; older
+      // versions keep the unsupported `--model` probe unchanged.
+      try {
+        const bin = cachedBin ??= resolveCommand(rawBin);
+        const env: NodeJS.ProcessEnv = {
+          ...(options?.env ?? process.env),
+          DOUBAO_CLI_NO_UPDATE_CHECK: '1',
+        };
+        const deadline = now() + DOUBAO_DETECT_TIMEOUT_MS;
+        const remainingTimeoutMs = (): number | null => {
+          const remaining = Math.floor(deadline - now());
+          // Avoid passing <= 0 to execFile, where timeout: 0 disables timeouts.
+          return remaining >= 1 ? remaining : null;
+        };
+        const versionTimeout = remainingTimeoutMs();
+        if (versionTimeout === null) return null;
+        const versionRes = await execDoubaoProbe(bin, ['--version'], env, versionTimeout);
+        if (versionRes.err) return null;
+        const version = parseDoubaoVersion(versionRes.stdout || versionRes.stderr);
+        if (!version) return null;
+        const probeTimeout = remainingTimeoutMs();
+        if (probeTimeout === null) return null;
+        if (isDoubaoVersionAtLeast(version, DOUBAO_MODEL_LIST_MIN_VERSION)) {
+          const listRes = await execDoubaoProbe(bin, ['model', 'list', '--json'], env, probeTimeout, 1024 * 1024);
+          if (listRes.err) return null;
+          return parseDoubaoModelListJson(listRes.stdout);
+        }
+        const probeRes = await execDoubaoProbe(bin, ['--model', '__botmux_model_probe__', '-p', 'probe'], env, probeTimeout);
+        return parseDoubaoAvailableModels(`${probeRes.stdout}\n${probeRes.stderr}`);
+      } catch {
+        return null;
+      }
     },
   };
 }

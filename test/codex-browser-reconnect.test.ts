@@ -63,7 +63,265 @@ describe.sequential('browser connection recovery', () => {
   let broker: CodexBrowserBroker | undefined;
   afterEach(async () => { await broker?.close(); broker = undefined; });
 
-  it.each(['Browser is not available: 1', 'native pipe closed before response'])(
+  it('closes the service created by a failed plugin setup before retrying', async () => {
+    const f = fakeModules();
+    const close = vi.fn(async () => {});
+    f.modules.setupBrowserRuntime.mockRejectedValueOnce(new Error('plugin setup failed'));
+    broker = new CodexBrowserBroker({ sessionId: 'setup-cleanup', family: 'chrome', modules: { ...f.modules, close } });
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(false);
+    expect(close).toHaveBeenCalledOnce();
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+    expect(f.modules.setupBrowserRuntime).toHaveBeenCalledTimes(2);
+  });
+
+  it('tears down and rebuilds a dead Node runtime when discovery fails', async () => {
+    const close = vi.fn(async () => {});
+    const get = vi.fn(async () => {
+      throw new Error('Browser Node runtime exited; verify Node.js 22+ and start a fresh browser connection');
+    });
+    const setupBrowserRuntime = vi.fn(async () => ({ browsers: { get } }));
+    broker = new CodexBrowserBroker({
+      sessionId: 'dead-runtime-discovery',
+      family: 'chrome',
+      modules: { handleRpc: vi.fn(), setupBrowserRuntime, close },
+    });
+
+    const first = await broker.handleToolCall(call({ operation: 'list_tabs' }));
+    expect(first.success).toBe(false);
+    expect((first.contentItems[0] as { text: string }).text).toContain('Browser connection changed');
+    expect(close).toHaveBeenCalledOnce();
+
+    const second = await broker.handleToolCall(call({ operation: 'list_tabs' }));
+    expect(second.success).toBe(false);
+    // A fresh runtime must be built: the exited child cannot be reused.
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['discovery', 'operation'] as const)('rebuilds the runtime after teardown fails during %s', async phase => {
+    const stale = fakeModules();
+    const recovered = fakeModules();
+    const disconnected = new Error('Browser Node runtime exited');
+    const get = vi.fn(async () => stale.browser);
+    if (phase === 'discovery') get.mockRejectedValueOnce(disconnected);
+    else stale.browser.user.openTabs.mockRejectedValueOnce(disconnected);
+    const setupBrowserRuntime = recovered.modules.setupBrowserRuntime
+      .mockResolvedValueOnce({ browsers: { get } });
+    const close = vi.fn(async () => {}).mockRejectedValueOnce(new Error('temporary cleanup failure'));
+    broker = new CodexBrowserBroker({
+      sessionId: 'failed-invalidation',
+      family: 'chrome',
+      modules: { ...recovered.modules, setupBrowserRuntime, close },
+    });
+
+    const request = call({ operation: 'list_tabs' });
+    expect((await broker.handleToolCall(request)).success).toBe(false);
+    expect(setupBrowserRuntime).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(recovered.browser.user.openTabs).not.toHaveBeenCalled();
+
+    expect((await broker.handleToolCall(request)).success).toBe(true);
+    expect(recovered.browser.user.openTabs).toHaveBeenCalledOnce();
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('rebuilds even when every teardown close() keeps rejecting, not just the first one', async () => {
+    // Stricter than the reject-once case: recovery must come from resetting
+    // broker state in the teardown's finally, never from a later close() retry.
+    const recovered = fakeModules();
+    const disconnected = new Error('Browser Node runtime exited');
+    let getCalls = 0;
+    const get = vi.fn(async () => {
+      getCalls += 1;
+      if (getCalls === 1) throw disconnected;
+      return recovered.browser;
+    });
+    const setupBrowserRuntime = recovered.modules.setupBrowserRuntime
+      .mockResolvedValueOnce({ browsers: { get } });
+    const close = vi.fn().mockRejectedValue(new Error('persistent cleanup failure'));
+    broker = new CodexBrowserBroker({
+      sessionId: 'persistent-failed-invalidation',
+      family: 'chrome',
+      modules: { ...recovered.modules, setupBrowserRuntime, close },
+    });
+
+    const request = call({ operation: 'list_tabs' });
+    expect((await broker.handleToolCall(request)).success).toBe(false);
+    expect((await broker.handleToolCall(request)).success).toBe(true);
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
+    // Let afterEach's broker.close() resolve instead of replaying the mock error.
+    close.mockImplementation(async () => {});
+  });
+
+  it.each(['resolve', 'reject'] as const)(
+    'retires the old runtime when an ordinary disconnect clears init mid-close (close %s)',
+    async closeMode => {
+      let closeResolve!: () => void;
+      const closeGate = new Promise<void>(resolve => { closeResolve = resolve; });
+      const close = vi.fn(async () => {
+        await closeGate;
+        if (closeMode === 'reject') throw new Error('Browser Node runtime is unavailable: close failed');
+      });
+
+      let setupCalls = 0;
+      let aGate!: (e: Error) => void;
+      let bGate!: (e: Error) => void;
+      const aOpen = new Promise<never>((_, reject) => { aGate = reject; });
+      const bOpen = new Promise<never>((_, reject) => { bGate = reject; });
+      let openCall = 0;
+
+      const buildBinding = (generation: number) => ({
+        browserId: `browser-${generation}`,
+        nameSession: vi.fn(async () => {}),
+        tabs: { get: vi.fn(), list: vi.fn(async () => []), new: vi.fn(), selected: vi.fn() },
+        user: {
+          claimTab: vi.fn(),
+          openTabs: vi.fn(async () => {
+            // The rebuilt second-generation binding is healthy and always succeeds.
+            if (generation >= 2) return [{ id: 'recovered' }];
+            openCall += 1;
+            const n = openCall;
+            if (n === 1) return [{ id: 't1' }];
+            if (n === 2) return aOpen; // operation A
+            if (n === 3) return bOpen; // operation B
+            throw new Error('Browser is not available: stale agent still bound');
+          }),
+        },
+      });
+      const setupBrowserRuntime = vi.fn(async () => {
+        setupCalls += 1;
+        return { browsers: { get: vi.fn(async () => buildBinding(setupCalls)) } };
+      });
+      broker = new CodexBrowserBroker({
+        sessionId: 'interleaved-invalidation',
+        family: 'chrome',
+        modules: { handleRpc: vi.fn(), setupBrowserRuntime, close },
+      });
+
+      // Establish the cached browser/agent/modules/init first.
+      expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+
+      // A (dead Node runtime) and B (ordinary disconnect) run concurrently on
+      // the same cached browser/generation.
+      const a = broker.handleToolCall(call({ operation: 'list_tabs' }));
+      const b = broker.handleToolCall(call({ operation: 'list_tabs' }));
+      await vi.waitFor(() => expect(openCall).toBe(3));
+
+      // A fails first and parks inside the hanging close.
+      aGate(new Error('Browser Node runtime exited; verify Node.js 22+ and start a fresh browser connection'));
+      await new Promise(resolve => setTimeout(resolve, 20));
+      // B fails with an ordinary disconnect while A's close is still pending;
+      // this path clears this.init without replacing agent/modules.
+      bGate(new Error('Browser is not available: extension transport reset'));
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      closeResolve();
+      const [ra, rb] = await Promise.all([a, b]);
+      expect(ra.success).toBe(false);
+      expect(rb.success).toBe(false);
+
+      // The dead runtime must be retired despite B having cleared init: the next
+      // operation runs a fresh setupBrowserRuntime instead of reusing the closed agent.
+      const recovered = await broker.handleToolCall(call({ operation: 'list_tabs' }));
+      expect(setupCalls).toBeGreaterThanOrEqual(2);
+      expect(recovered.success).toBe(true);
+      close.mockImplementation(async () => {});
+    },
+  );
+
+  it('shares one invalidation promise so concurrent callers wait for the same teardown', async () => {
+    const closeDefers: Array<{ resolve: () => void }> = [];
+    const close = vi.fn(async () => new Promise<void>(resolve => {
+      closeDefers.push({ resolve });
+    }));
+    let getCalls = 0;
+    const setupBrowserRuntime = vi.fn(async () => ({
+      browsers: {
+        get: vi.fn(async () => {
+          getCalls += 1;
+          if (getCalls === 1) {
+            throw new Error('Browser Node runtime exited; verify Node.js 22+ and start a fresh browser connection');
+          }
+          return {
+            browserId: `browser-${getCalls}`,
+            nameSession: vi.fn(async () => {}),
+            tabs: { get: vi.fn(), list: vi.fn(async () => []), new: vi.fn(), selected: vi.fn() },
+            user: { claimTab: vi.fn(), openTabs: vi.fn(async () => [{ id: 't1' }]) },
+          };
+        }),
+      },
+    }));
+    broker = new CodexBrowserBroker({
+      sessionId: 'stale-invalidation',
+      family: 'chrome',
+      modules: { handleRpc: vi.fn(), setupBrowserRuntime, close },
+    });
+
+    // Both calls share the same rejected init and park on the one shared close.
+    const first = broker.handleToolCall(call({ operation: 'list_tabs' }));
+    const second = broker.handleToolCall(call({ operation: 'list_tabs' }));
+    await vi.waitFor(() => expect(closeDefers.length).toBe(1));
+    const secondSettled = vi.fn();
+    void second.then(secondSettled);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    // The shared-promise wait must not return early while close() is pending.
+    expect(secondSettled).not.toHaveBeenCalled();
+
+    // A third operation during the cleanup window joins the same wait instead
+    // of replaying the stale rejected init on its own.
+    const thirdSettled = vi.fn();
+    const third = broker.handleToolCall(call({ operation: 'list_tabs' }));
+    void third.then(thirdSettled);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(thirdSettled).not.toHaveBeenCalled();
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(1);
+
+    // Releasing the single close settles every shared waiter; the cleanup window
+    // produced no new setup, and all three operations report the failure.
+    closeDefers[0]!.resolve();
+    expect((await first).success).toBe(false);
+    expect((await second).success).toBe(false);
+    expect((await third).success).toBe(false);
+    expect(close).toHaveBeenCalledOnce();
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(1);
+    close.mockImplementation(async () => {});
+
+    // The next operation after the shared teardown rebuilds immediately, and
+    // later calls reuse that browser without a third setup.
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
+  });
+
+  it('serializes fire-and-forget turn-ended calls in event order', async () => {
+    const starts: number[] = [];
+    const handleTurnEnded = vi.fn(() => new Promise<void>(resolve => {
+      starts.push(Date.now());
+      setTimeout(resolve, 80);
+    }));
+    const f = fakeModules();
+    broker = new CodexBrowserBroker({
+      sessionId: 'turn-ended-tail',
+      family: 'chrome',
+      modules: { ...f.modules, handleTurnEnded },
+    });
+    // Initialize the runtime so pluginModules (and its handleTurnEnded) is wired.
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+
+    // Mirror codex-app-runner's void handleTurnEnded(...): do not await the
+    // first batch before dispatching the second notification.
+    void broker.handleTurnEnded('one').catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await broker.handleTurnEnded('two');
+
+    expect(handleTurnEnded).toHaveBeenCalledTimes(2);
+    // The second batch cannot start until the 80ms first batch fully settles.
+    expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(70);
+  });
+
+  it.each(['Browser is not available: 1', 'native pipe closed before response', 'Debugger unattached'])(
     'rediscovers after a cached browser disconnects: %s', async message => {
       const previousRuntime = (globalThis as any).nodeRepl;
       const stale = fakeModules();

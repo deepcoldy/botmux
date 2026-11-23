@@ -97,10 +97,13 @@ vi.mock('../src/services/team-groups-store.js', async () => {
 });
 
 import { registerBot, getBot } from '../src/bot-registry.js';
+import { config } from '../src/config.js';
+import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { parseSlashCommandInvocation } from '../src/core/command-handler.js';
 import {
   enforceMessageQuotaForCliInput,
+  __resetQuotaExhaustedNoticesForTest,
   grantRestrictedCommandText,
   grantRestrictedSlashCommandText,
   __testOnly_activeSessions as activeSessions,
@@ -123,6 +126,7 @@ function registerQuotaBot() {
 describe('message quota enforcement', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __resetQuotaExhaustedNoticesForTest();
     mocks.beginCharge.mockReturnValue('fresh');
     mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: true });
     mocks.removeChatGrant.mockResolvedValue({ ok: true, removed: true });
@@ -167,6 +171,34 @@ describe('message quota enforcement', () => {
         undefined, undefined, 'group', true,
       ),
     ).resolves.toBe(true);
+  });
+
+  it('external roster bot 在 quota 复查仍需 union + appId 配对', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-quota-external-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dir;
+    applyPlatformTeamSync(dir, { rev: 'r-ext', teams: [{
+      teamId: 't1', teamName: 'T1', groupChatIds: [],
+      bots: [{ appId: 'quota_app', unionId: 'on_quota' }, { appId: 'cli_ext', unionId: 'on_ext', external: true }],
+      memberUnionIds: [],
+    }] });
+    try {
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_public', 'ou_ext', 'om_ext_pair', 'om_anchor', 'on_ext', undefined, 'group', true,
+        { skipCharge: true, senderAppId: 'cli_ext' },
+      )).resolves.toBe(true);
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_public', 'ou_ext', 'om_ext_mismatch', 'om_anchor', 'on_ext', undefined, 'group', true,
+        { skipCharge: true, senderAppId: 'cli_other' },
+      )).resolves.toBe(false);
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_public', 'ou_ext', 'om_ext_missing', 'om_anchor', 'on_ext', undefined, 'group', true,
+        { skipCharge: true },
+      )).resolves.toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('同一条消息不标 bot（人的路径）仍按 evaluateTalk 拦下——团队拉群不放行真人', async () => {
@@ -266,6 +298,82 @@ describe('message quota enforcement', () => {
     )).resolves.toBe(true);
     expect(mocks.beginCharge).not.toHaveBeenCalled();
     expect(mocks.consumeQuota).not.toHaveBeenCalled();
+  });
+
+  describe('cross-chat followed-thread quota', () => {
+    const run = (senderOpenId = 'ou_chat', messageId = 'om_cross') => enforceMessageQuotaForCliInput(
+      'quota_app', 'oc_origin', senderOpenId, messageId, 'om_anchor',
+      undefined, undefined, 'group', false,
+      { crossChatFollowedThreadAuthorized: true, crossChatFollowedChatId: 'oc_1',
+        crossChatFollowedRootMessageId: 'om_followed_root', promptContent: 'hello' },
+    );
+
+    it('charges a finite grant in the followed chat and commits the exact message', async () => {
+      await expect(run()).resolves.toBe(true);
+      expect(mocks.beginCharge).toHaveBeenCalledWith('quota_app', 'om_cross');
+      expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'chat:oc_1:ou_chat', undefined, undefined);
+      expect(mocks.commitCharge).toHaveBeenCalledWith('quota_app', 'om_cross');
+    });
+
+    it('rejects an exhausted followed-chat grant and aborts rather than commits', async () => {
+      mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, used: 5, limit: 5 });
+      await expect(run()).resolves.toBe(false);
+      expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_cross');
+      expect(mocks.commitCharge).not.toHaveBeenCalled();
+      // Revoking the grant would make replay and later cross-chat messages
+      // degrade into the unmetered stranger exemption.
+      expect(mocks.removeChatGrant).not.toHaveBeenCalled();
+      expect(mocks.replyMessage.mock.calls[0]?.[1]).toBe('om_followed_root');
+    });
+
+    it('keeps an exhausted global grant as the durable cross-chat denial', async () => {
+      mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, used: 5, limit: 5 });
+      await expect(run('ou_global', 'om_cross_global')).resolves.toBe(false);
+      expect(mocks.removeGlobalGrant).not.toHaveBeenCalled();
+      expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_cross_global');
+    });
+
+    it('deduplicates only the exhaustion notice while every over-limit message stays denied', async () => {
+      mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, used: 5, limit: 5 });
+      await expect(run()).resolves.toBe(false);
+      await expect(run()).resolves.toBe(false);
+      await expect(run('ou_chat', 'om_next_after_exhaustion')).resolves.toBe(false);
+      expect(mocks.consumeQuota).toHaveBeenCalledTimes(3);
+      expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('notifies again after a successful refill is exhausted a second time', async () => {
+      mocks.consumeQuota
+        .mockResolvedValueOnce({ tracked: true, allow: false, used: 5, limit: 5 })
+        .mockResolvedValueOnce({ tracked: true, allow: true, used: 1, limit: 5 })
+        .mockResolvedValueOnce({ tracked: true, allow: false, used: 5, limit: 5 });
+      await expect(run()).resolves.toBe(false);
+      await expect(run('ou_chat', 'om_refilled')).resolves.toBe(true);
+      await expect(run('ou_chat', 'om_exhausted_again')).resolves.toBe(false);
+      expect(mocks.replyMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+      ['done', true], ['pending', false],
+    ])('preserves %s dedup semantics without consuming twice', async (state, expected) => {
+      mocks.beginCharge.mockReturnValue(state);
+      await expect(run()).resolves.toBe(expected);
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
+      expect(mocks.commitCharge).not.toHaveBeenCalled();
+    });
+
+    it('fails closed and aborts when followed-chat quota storage fails', async () => {
+      mocks.consumeQuota.mockRejectedValue(new Error('lock timeout'));
+      await expect(run()).resolves.toBe(false);
+      expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_cross');
+      expect(mocks.commitCharge).not.toHaveBeenCalled();
+    });
+
+    it('keeps the allowlist exemption unmetered when the sender has no quotaKey', async () => {
+      await expect(run('ou_stranger')).resolves.toBe(true);
+      expect(mocks.beginCharge).not.toHaveBeenCalled();
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    });
   });
 
   it('allows the exhausting chat-grant message but defers revoke/notify to the next message', async () => {
@@ -698,6 +806,58 @@ describe("p2pMode='group' 建群前扣费点：命令判定必须早于扣费", 
         senderOpenId: 'ou_chat',
         chatId: 'oc_1',
       });
+    });
+
+    it('resolves an indirect prompt only after talk authorization', async () => {
+      const resolvePrompt = vi.fn(async () => ({
+        promptContent: 'quoted task',
+        promptAttachments: [{ type: 'file', name: 'prod.env' }],
+      }));
+
+      await expect(enforceMessageQuotaForCliInput(
+        APP, DM_CHAT, 'ou_stranger', 'om_gate_unauthorized_resolver', 'om_anchor',
+        undefined, undefined, 'group', false, { resolvePrompt },
+      )).resolves.toBe(false);
+
+      expect(resolvePrompt).not.toHaveBeenCalled();
+      expect(mocks.beginCharge).not.toHaveBeenCalled();
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    });
+
+    it('adjudicates resolved text and attachment metadata before charging', async () => {
+      const seen = join(gateDir, 'seen-resolved.json');
+      installGate(`
+        import { writeFileSync } from 'node:fs';
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => { input += c; });
+        process.stdin.on('end', () => {
+          const p = JSON.parse(input);
+          writeFileSync(${JSON.stringify(seen)}, JSON.stringify(p));
+          const denied = String(p.content ?? '').includes('机密')
+            || (p.attachments ?? []).some(a => a.name.endsWith('.env'));
+          console.log(JSON.stringify(denied
+            ? { decision: 'deny', reason: 'resolved task rejected' }
+            : { decision: 'allow' }));
+        });
+      `);
+      const resolvePrompt = vi.fn(async () => ({
+        promptContent: '机密任务',
+        promptAttachments: [{ type: 'file', name: 'prod.env' }],
+      }));
+
+      await expect(enforceMessageQuotaForCliInput(
+        APP, DM_CHAT, GRANTEE, 'om_gate_resolved_deny', 'om_anchor',
+        undefined, undefined, 'group', false, { resolvePrompt },
+      )).resolves.toBe(false);
+
+      expect(resolvePrompt).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(readFileSync(seen, 'utf-8'))).toMatchObject({
+        content: '机密任务',
+        attachments: [{ type: 'file', name: 'prod.env' }],
+      });
+      expect(mocks.beginCharge).not.toHaveBeenCalled();
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
     });
 
     it('sees attachment metadata even though the files are not downloaded yet', async () => {

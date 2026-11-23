@@ -673,15 +673,15 @@ describe('who decided the edit: an overtaken wake turn or a scheduled turn is th
     });
 
     // 源码结构护栏(K3)：status/edit relay 第一次上线就是漏了这三个定时回合
-    // 依赖（沙盒主会话在发起人定时任务回合必 403）。两条 relay 路由都在
-    // daemon.ts 闭包内、没有可起 daemon 的轻量行为 seam；钉死它们都必须经
-    // 共享的 v3RelayScheduleAuth，不能各自手写一份。
-    it('daemon wires BOTH relay verb families (mutations and status/edit) through the shared schedule-auth factory', () => {
+    // 依赖（沙盒主会话在发起人定时任务回合必 403）。两条 session relay 路由与
+    // signed-envelope 路由都在 daemon.ts 闭包内、没有可起 daemon 的轻量行为 seam；
+    // 钉死它们都必须经共享的 v3RelayScheduleAuth，不能各自手写一份。
+    it('daemon wires relay and signed-envelope verb families through the shared schedule-auth factory', () => {
       const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
       const spreadCount = source.match(/\.\.\.v3RelayScheduleAuth\(ds\)/g)?.length ?? 0;
-      // One loop registers start/cancel/retry/grant, one loop registers
-      // edit/status: exactly two call sites, zero ad-hoc copies.
-      expect(spreadCount).toBe(2);
+      // One loop registers session start/cancel/retry/grant, one handles
+      // edit/status, and signed-envelope chat mutations share the same factory.
+      expect(spreadCount).toBe(3);
       expect(source).not.toContain('isScheduledTurnLive: turnId =>');
       expect(source).not.toContain('isScheduleOwnerAllowed: (larkAppId, ownerOpenId)');
       expect(source).not.toContain('loadScheduledTask: (appId, taskId)');

@@ -14,6 +14,8 @@ import { resolveEffectiveFeedbackPolicy, type FeedbackPolicyLayer } from '../src
 
 vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
   validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
+  // No live model catalogue: reasoning levels fall back to the static table.
+  loadCodexServiceTierCatalog: vi.fn(async () => null),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -52,7 +54,8 @@ async function freshModules() {
   const store = await import('../src/services/bot-config-store.js');
   const pinStreamingCardChange = await import('../src/services/pin-streaming-card-change.js');
   const sessionGroups = await import('../src/services/session-groups-store.js');
-  return { registry, store, pinStreamingCardChange, sessionGroups };
+  const awaySummaryFocusRevocation = await import('../src/services/away-summary-focus-revocation.js');
+  return { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation };
 }
 
 describe('bot-config store', () => {
@@ -83,10 +86,43 @@ describe('bot-config store', () => {
   }
   async function loaded(entry: Record<string, unknown> = {}) {
     writeConfig(entry);
-    const { registry, store, pinStreamingCardChange, sessionGroups } = await freshModules();
+    const { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation } = await freshModules();
     registry.loadBotConfigs().forEach((c: any) => registry.registerBot(c));
-    return { registry, store, pinStreamingCardChange, sessionGroups };
+    return { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation };
   }
+
+  it('publishes recap revocation to live config before a queued card settlement', async () => {
+    const { registry, store, awaySummaryFocusRevocation } = await loaded({ replyCardRecap: true });
+    const { noteRecapCard, noteRecapTurnStarted } = await import('../src/core/turn-recap-state.js');
+    const events: string[] = [];
+    const ds = { session: { sessionId: 'sess-config-race' }, larkAppId: 'app_default' } as any;
+    noteRecapTurnStarted(ds, 'turn1');
+    const io = {
+      enabled: () => registry.getBot('app_default').config.replyCardRecap === true,
+      awaySummaryWanted: () => true,
+      requestAwaySummary: () => { events.push('request'); },
+      locale: () => 'zh' as const,
+      readCard: async () => undefined,
+      cardId: async () => 'card',
+      insert: async () => {},
+      replace: async () => {},
+      now: () => Date.now(),
+      warn: () => {},
+    };
+    const dispose = awaySummaryFocusRevocation.registerAwaySummaryFocusRevocationHandler(() => {
+      events.push('cancel');
+      queueMicrotask(() => noteRecapCard(ds, 'turn1', { kind: 'legacy', messageId: 'card1' }, io));
+    });
+    try {
+      await store.applyConfigField('app_default', store.findConfigField('replyCardRecap')!, false);
+      await Promise.resolve();
+      expect(events).toEqual(['cancel']);
+      expect(registry.getBot('app_default').config.replyCardRecap).not.toBe(true);
+      expect(readConfig().replyCardRecap).not.toBe(true);
+    } finally {
+      dispose();
+    }
+  });
 
   it('checks a picker model snapshot inside the file lock before writing effort', async () => {
     const { registry, store } = await loaded({ model: 'opus' });
@@ -252,6 +288,28 @@ describe('bot-config store', () => {
     expect(readConfig().reasoningEffort).toBeUndefined();
   });
 
+  it('defaults owner group follow off and round-trips opt-in settings through persistence and hot config', async () => {
+    const { registry, store } = await loaded();
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
+    const spec = store.findConfigField('ownerGroupFollow')!;
+    const parsed = store.coerceConfigValue(spec, '{"enabled":true,"excludeChatIds":["oc_skip"]}');
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error('coercion failed');
+    expect((await store.applyConfigField('app_default', spec, parsed.value)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toEqual({ enabled: true, excludeChatIds: ['oc_skip'] });
+    expect(readConfig().ownerGroupFollow).toEqual({ enabled: true, excludeChatIds: ['oc_skip'] });
+    expect((await store.applyConfigField('app_default', spec, { enabled: 'true' })).ok).toBe(false);
+    expect(readConfig().ownerGroupFollow.enabled).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, { enabled: false })).ok).toBe(true);
+    expect(readConfig().ownerGroupFollow).toBeUndefined();
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
+  });
+
+  it('does not enable owner group follow from malformed disk configuration', async () => {
+    const { registry } = await loaded({ ownerGroupFollow: { enabled: 'true' } });
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
+  });
+
   it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
     const { registry, store } = await loaded({ envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] } });
     const spec = store.findConfigField('envPolicy')!;
@@ -283,8 +341,10 @@ describe('bot-config store', () => {
     expect(readConfig()).toMatchObject({ promptInjection: 'none', replyDelivery: 'send' });
     const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
     expect(effectiveReplyDelivery('app_default', 'codex')).toBe('transcript');
+    // An unconfigured codex bot follows the CLI default (transcript); turning
+    // zero injection off below must still land on app_default's explicit send.
     registry.registerBot({ larkAppId: 'plain', larkAppSecret: 's', cliId: 'codex' });
-    expect(effectiveReplyDelivery('plain', 'codex')).toBe('send');
+    expect(effectiveReplyDelivery('plain', 'codex')).toBe('transcript');
     const cli = store.findConfigField('cli')!;
     const changed = await store.applyConfigField('app_default', cli, 'opencode');
     expect(changed).toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
@@ -411,6 +471,17 @@ describe('bot-config store', () => {
     } finally {
       delete process.env.BACKEND_TYPE;
     }
+  });
+
+  it('/config set backendType accepts hc and persists it, and still rejects names that are not backends', async () => {
+    const { registry, store } = await loaded({ cliId: 'claude-code' });
+    const backend = store.findConfigField('backendType')!;
+    expect(store.coerceConfigValue(backend, 'herdr-core')).toEqual({ ok: false, reason: 'invalid_enum' });
+    const coerced = store.coerceConfigValue(backend, 'HC');
+    expect(coerced).toEqual({ ok: true, value: 'hc' });
+    expect((await store.applyConfigField('app_default', backend, coerced.ok ? coerced.value : undefined)).ok).toBe(true);
+    expect(readConfig().backendType).toBe('hc');
+    expect(registry.getBot('app_default').config.backendType).toBe('hc');
   });
 
   it('pairs a remote daemon default back to pty for a local CLI, as spawning does', async () => {
@@ -776,6 +847,27 @@ describe('bot-config store', () => {
     expect(readConfig().noProgressNotify).toBeUndefined();
   });
 
+  it('stores a per-bot providerRecovery override, survives a reload, rejects bad values and unsets', async () => {
+    const { store, registry } = await loaded();
+    const spec = store.findConfigField('providerRecovery')!;
+    expect(spec).toMatchObject({ kind: 'json', effect: 'immediate', clearable: true });
+    const value = { enabled: true, maxWaitMinutes: 30 };
+    const parsed = store.coerceConfigValue(spec, JSON.stringify(value));
+    expect(parsed).toEqual({ ok: true, value });
+    if (!parsed.ok) throw new Error(parsed.reason);
+    expect(await store.applyConfigField('app_default', spec, parsed.value)).toMatchObject({ ok: true });
+    expect(registry.getBot('app_default').config.providerRecovery).toEqual(value);
+    expect(readConfig().providerRecovery).toEqual(value);
+    const cold = await freshModules();
+    cold.registry.loadBotConfigs().forEach((c: any) => cold.registry.registerBot(c));
+    expect(cold.registry.getBot('app_default').config.providerRecovery).toEqual(value);
+    const bad = store.coerceConfigValue(spec, JSON.stringify({ enabled: true, maxWaitMinutes: 0 }));
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.reason).toMatch(/^invalid_provider_recovery: /);
+    expect(await store.applyConfigField('app_default', spec, null)).toMatchObject({ ok: true });
+    expect(readConfig().providerRecovery).toBeUndefined();
+  });
+
   it('keeps CLI progress notices and prompt-cache configuration independent across reload and unset', async () => {
     const { store } = await loaded();
     const noticeSpec = store.findConfigField('noProgressNotify')!;
@@ -815,6 +907,65 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, '{"agents":"bad"}').ok).toBe(false);
     await store.applyConfigField('app_default', spec, null);
     expect(readConfig().groupCreation).toBeUndefined();
+  });
+
+  it('persists, hot-applies, cold-loads and clears per-bot inviteConfig independently of /g defaults', async () => {
+    const groupCreation = { agents: ['cli_group'], tag: 'Work', avatar: 'name' };
+    const { registry, store } = await loaded({ groupCreation });
+    const spec = store.findConfigField('inviteConfig');
+    expect(spec).toBeDefined();
+    const value = { agents: ['Review', 'cli_build'] };
+    const parsed = store.coerceConfigValue(spec!, JSON.stringify({ agents: [' Review ', 'cli_build', 'Review'] }));
+    expect(parsed).toEqual({ ok: true, value });
+    if (!parsed.ok) throw new Error(parsed.reason);
+    expect(await store.applyConfigField('app_default', spec!, parsed.value)).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({ groupCreation, inviteConfig: value });
+    expect(registry.getBot('app_default').config.inviteConfig).toEqual(value);
+    const cold = await freshModules();
+    cold.registry.loadBotConfigs().forEach(c => cold.registry.registerBot(c));
+    expect(cold.registry.getBot('app_default').config).toMatchObject({ groupCreation, inviteConfig: value });
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('inviteConfig')!, null)).toMatchObject({ ok: true });
+    expect(readConfig().inviteConfig).toBeUndefined();
+    expect(cold.registry.getBot('app_default').config.inviteConfig).toBeUndefined();
+    expect(cold.registry.loadBotConfigs()[0].inviteConfig).toBeUndefined();
+    expect(readConfig().groupCreation).toEqual(groupCreation);
+  });
+
+  it.each([
+    { value: null }, { value: [] }, { value: 'bad' },
+    { value: { agents: 'Review' } }, { value: { agents: [''] } }, { value: { agents: ['  '] } },
+    { value: { agents: [1] } }, { value: { agents: [null] } },
+    { value: { avatar: 'name' } }, { value: { typo: [] } },
+  ])('rejects malformed inviteConfig on edits and cold loads: %j', async ({ value }) => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('inviteConfig');
+    expect(spec).toBeDefined();
+    expect(store.coerceConfigValue(spec!, JSON.stringify(value)).ok).toBe(false);
+    writeConfig({ inviteConfig: value });
+    expect(() => registry.loadBotConfigs()).toThrow();
+  });
+
+  it('updates only the selected bot\'s invitation defaults', async () => {
+    const { registry, store } = await loaded();
+    const other = {
+      larkAppId: 'app_other', larkAppSecret: 'secret', cliId: 'codex',
+      inviteConfig: { agents: ['cli_other'] },
+    };
+    writeFileSync(configPath, JSON.stringify([readConfig(), other]));
+    const value = { agents: ['cli_review'] };
+    expect(await store.applyConfigField('app_default', store.findConfigField('inviteConfig')!, value)).toMatchObject({ ok: true });
+    const configs = registry.loadBotConfigs();
+    expect(configs.find(c => c.larkAppId === 'app_default')?.inviteConfig).toEqual(value);
+    expect(configs.find(c => c.larkAppId === 'app_other')?.inviteConfig).toEqual(other.inviteConfig);
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))[1]).toEqual(other);
+  });
+
+  it.each([{}, { agents: [] }])('accepts an empty inviteConfig without adding defaults: %j', async value => {
+    const { registry, store } = await loaded({ inviteConfig: value });
+    const spec = store.findConfigField('inviteConfig');
+    expect(spec).toBeDefined();
+    expect(store.coerceConfigValue(spec!, JSON.stringify(value))).toEqual({ ok: true, value });
+    expect(registry.getBot('app_default').config.inviteConfig).toEqual(value);
   });
 
   it('persists Oncall button settings without changing feedback or chat overrides', async () => {
@@ -889,6 +1040,25 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().model).toBeUndefined();
     expect(registry.getBot('app_default').config.model).toBeUndefined();
+  });
+
+  it('bareRenamePassthrough is off by default, persists only true and applies without restart', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('bareRenamePassthrough')!;
+    expect(spec.effect).toBe('immediate');
+    expect(registry.getBot('app_default').config.bareRenamePassthrough).toBeUndefined();
+
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(readConfig().bareRenamePassthrough).toBe(true);
+    expect(registry.getBot('app_default').config.bareRenamePassthrough).toBe(true);
+    const [reloaded] = registry.parseBotConfigsFromText(readFileSync(configPath, 'utf8'));
+    expect(reloaded.bareRenamePassthrough).toBe(true);
+
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('bareRenamePassthrough');
+    expect(registry.getBot('app_default').config.bareRenamePassthrough).toBeUndefined();
+    const [invalid] = registry.parseBotConfigsFromText(JSON.stringify([{ ...readConfig(), bareRenamePassthrough: 'true' }]));
+    expect(invalid.bareRenamePassthrough).toBeUndefined();
   });
 
   it('archiveCodex preserves both overrides across reload and unset restores inheritance', async () => {
@@ -1329,6 +1499,29 @@ describe('bot-config store', () => {
     expect(readConfig().replyCardShowTools).toBeUndefined();
   });
 
+  it('defaultOn boolean (streamingCardFoldedLayout): inverted persistence — only explicit false is written', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('streamingCardFoldedLayout')!;
+
+    const r1 = await store.applyConfigField('app_default', spec, false);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().streamingCardFoldedLayout).toBe(false);
+    expect(registry.getBot('app_default').config.streamingCardFoldedLayout).toBe(false);
+
+    const r2 = await store.applyConfigField('app_default', spec, true);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
+    expect(readConfig().streamingCardFoldedLayout).toBeUndefined();
+    expect(registry.getBot('app_default').config.streamingCardFoldedLayout).toBeUndefined();
+
+    await store.applyConfigField('app_default', spec, false);
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3.newText).toBe('on');
+    expect(readConfig().streamingCardFoldedLayout).toBeUndefined();
+  });
+
   it('usageDisplay is an immediate three-state enum persisted verbatim, cleared via unset', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('usageDisplay')!;
@@ -1578,6 +1771,7 @@ describe('bot-config store', () => {
       intervalMinutes: 30,
       text: '请继续处理。',
       states: ['idle', 'tui_prompt'],
+      quietHours: { enabled: true, start: '23:00', end: '08:30' },
     };
     const saved = await reminderStore.updateSessionOwnerReminderConfig('app_default', value);
     expect(saved).toEqual({ ok: true, config: value });
@@ -1774,7 +1968,7 @@ describe('bot-config store', () => {
     expect(switched.registry.getBot('app_default').config.serviceTier).toBeUndefined();
   });
 
-  it('replyDelivery: defaults to send on every CLI; both values persist; unset clears back to that default', async () => {
+  it('replyDelivery: claude-code defaults to transcript; both values persist; unset clears back to that default', async () => {
     const { registry, store } = await loaded({ cliId: 'claude-code' });
     const spec = store.findConfigField('replyDelivery')!;
     expect(spec.kind).toBe('enum');
@@ -1784,32 +1978,32 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, 'send')).toEqual({ ok: true, value: 'send' });
     expect(store.coerceConfigValue(spec, 'auto')).toEqual({ ok: false, reason: 'invalid_enum' });
 
-    // 缺省展示是 send（而非 ∅），claude-code 也不例外——transcript 不随 CLI 自动翻转。
+    // 缺省展示是 transcript（而非 ∅）：claude-code 能采集转写，缺省由 botmux 转发最终回复。
     const before = store.getConfigSnapshot('app_default');
-    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
+    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('transcript');
     expect('replyDelivery' in readConfig()).toBe(false);
     expect(registry.resolveReplyDelivery('app_default')).toBeUndefined();
 
-    // set transcript：opt-in，显式落盘。
-    const r1 = await store.applyConfigField('app_default', spec, 'transcript');
+    // set send：退回旧行为，显式落盘。
+    const r1 = await store.applyConfigField('app_default', spec, 'send');
     expect(r1.ok).toBe(true);
-    if (r1.ok) expect(r1).toMatchObject({ oldText: 'send', newText: 'transcript', effect: 'next-session' });
-    expect(readConfig().replyDelivery).toBe('transcript');
-    expect(registry.getBot('app_default').config.replyDelivery).toBe('transcript');
-    expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
-
-    // set send：显式退回也落盘（与缺省同值，但意图是「钉住」，不靠缺省兜）。
-    const r2 = await store.applyConfigField('app_default', spec, 'send');
-    expect(r2.ok).toBe(true);
-    if (r2.ok) expect(r2).toMatchObject({ oldText: 'transcript', newText: 'send' });
+    if (r1.ok) expect(r1).toMatchObject({ oldText: 'transcript', newText: 'send', effect: 'next-session' });
     expect(readConfig().replyDelivery).toBe('send');
     expect(registry.getBot('app_default').config.replyDelivery).toBe('send');
     expect(registry.resolveReplyDelivery('app_default')).toBe('send');
 
-    // unset：删 key，回缺省 send，内存同步为 undefined。
+    // set transcript：显式钉住也落盘（与缺省同值，但不靠缺省兜）。
+    const r2 = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r2.ok).toBe(true);
+    if (r2.ok) expect(r2).toMatchObject({ oldText: 'send', newText: 'transcript' });
+    expect(readConfig().replyDelivery).toBe('transcript');
+    expect(registry.getBot('app_default').config.replyDelivery).toBe('transcript');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
+
+    // unset：删 key，回缺省 transcript，内存同步为 undefined。
     const r3 = await store.applyConfigField('app_default', spec, null);
     expect(r3.ok).toBe(true);
-    if (r3.ok) expect(r3).toMatchObject({ oldText: 'send', newText: 'send' });
+    if (r3.ok) expect(r3).toMatchObject({ oldText: 'transcript', newText: 'transcript' });
     expect('replyDelivery' in readConfig()).toBe(false);
     expect(registry.getBot('app_default').config.replyDelivery).toBeUndefined();
     expect(registry.resolveReplyDelivery('app_default')).toBeUndefined();
@@ -1823,23 +2017,23 @@ describe('bot-config store', () => {
     expect(snap.ok && snap.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
   });
 
-  it('replyDelivery: non-claude CLIs default to send; transcript persists on structured-bridge CLIs (codex) and unset clears', async () => {
+  it('replyDelivery: structured-bridge CLIs (codex) default to transcript; an explicit send persists and unset clears back', async () => {
     const { registry, store } = await loaded({ cliId: 'codex' });
     const spec = store.findConfigField('replyDelivery')!;
     const before = store.getConfigSnapshot('app_default');
-    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
+    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('transcript');
     expect(registry.resolveReplyDelivery('app_default')).toBeUndefined();
 
-    const r1 = await store.applyConfigField('app_default', spec, 'transcript');
+    const r1 = await store.applyConfigField('app_default', spec, 'send');
     expect(r1.ok).toBe(true);
-    if (r1.ok) expect(r1).toMatchObject({ oldText: 'send', newText: 'transcript' });
-    expect(readConfig().replyDelivery).toBe('transcript');
-    expect(registry.getBot('app_default').config.replyDelivery).toBe('transcript');
-    expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
+    if (r1.ok) expect(r1).toMatchObject({ oldText: 'transcript', newText: 'send' });
+    expect(readConfig().replyDelivery).toBe('send');
+    expect(registry.getBot('app_default').config.replyDelivery).toBe('send');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('send');
 
     const r2 = await store.applyConfigField('app_default', spec, null);
     expect(r2.ok).toBe(true);
-    if (r2.ok) expect(r2).toMatchObject({ oldText: 'transcript', newText: 'send' });
+    if (r2.ok) expect(r2).toMatchObject({ oldText: 'send', newText: 'transcript' });
     expect('replyDelivery' in readConfig()).toBe(false);
     expect(registry.getBot('app_default').config.replyDelivery).toBeUndefined();
   });
@@ -2313,6 +2507,17 @@ describe('bot-config store', () => {
     // pty/tmux are capable → the ordinary matrix verdict.
     const { store: pty } = await loaded({ oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
     expect(pty.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport).toBe('verified');
+  });
+
+  it('judges hc sandbox advice by the same worker gate that would launch it', async () => {
+    const { backendSandboxCompatibilityError } = await import('../src/adapters/backend/session-backend-selector.js');
+    const refused = backendSandboxCompatibilityError({
+      backendType: 'hc', cliId: 'claude-code', fileSandboxRequested: true, effectiveReadIsolationRequested: false,
+    });
+    const { store } = await loaded({ backendType: 'hc', oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    const advice = store.getConfigCardData('app_default')?.sandboxAdvice;
+    expect(advice?.reasons).toEqual(['oncall']);
+    expect(advice?.cliSupport).toBe(refused ? 'blocked' : 'verified');
   });
 
   it('a local mojo session (cloud off or unprovable env) is shown as blocked, cloud mojo is silent', async () => {

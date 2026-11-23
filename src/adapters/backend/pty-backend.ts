@@ -74,6 +74,10 @@ export class PtyBackend implements SessionBackend {
     return this.process?.pid ?? null;
   }
 
+  getStablePanePid(): number | null {
+    return this.process?.pid ?? null;
+  }
+
   kill(): void {
     if (this.process) {
       try { this.process.kill(); } catch { /* already dead */ }

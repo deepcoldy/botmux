@@ -112,6 +112,22 @@ describe('the draft clarifier\'s session', () => {
   });
 });
 
+describe('provider timing on a failed terminal', () => {
+  it('rides along on non-completed terminals only, and only as finite numbers', () => {
+    const w = worker(false);
+    const timing = { retryAtMs: Date.parse('2026-11-13T11:10:16Z'), lastSuccessAtMs: Date.parse('2026-11-13T11:07:58Z') };
+    w.emitTurnTerminal('om_f', 'failed', 'provider_server_error', undefined, undefined, true, undefined, undefined, undefined, timing);
+    w.emitTurnTerminal('om_c', 'completed', undefined, undefined, undefined, undefined, undefined, undefined, undefined, timing);
+    w.emitTurnTerminal('om_n', 'failed', 'provider_server_error', undefined, undefined, true, undefined, undefined, undefined,
+      { retryAtMs: Number.NaN });
+    const [failed, completed, nan] = terminals(w);
+    expect(failed).toMatchObject({ providerRetryAtMs: timing.retryAtMs, providerLastSuccessAtMs: timing.lastSuccessAtMs });
+    expect(completed).not.toHaveProperty('providerRetryAtMs');
+    expect(completed).not.toHaveProperty('providerLastSuccessAtMs');
+    expect(nan).not.toHaveProperty('providerRetryAtMs');
+  });
+});
+
 describe('the first init decides', () => {
   function initialized(flag: boolean) {
     return {

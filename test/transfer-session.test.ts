@@ -15,17 +15,30 @@
 import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 
-vi.mock('../src/services/session-store.js', () => ({
-  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
-  cleanupSessionBridgeSendMarkers: vi.fn(),
-  cleanupSessionBridgeSendMarkersNow: vi.fn(),
-  updateSession: vi.fn(),
-  updateSessionPid: vi.fn(),
-  getSession: vi.fn(),
-  getOwnedSession: vi.fn(),
-  listSessions: vi.fn(() => []),
-  closeSession: vi.fn(),
-}));
+vi.mock('../src/services/session-store.js', () => {
+  const updateSession = vi.fn();
+  const mutateOwnedSessionsAtomically = vi.fn((ids: string[], mutate: (rows: Map<string, any>) => unknown) => {
+    const rows = new Map<string, any>();
+    for (const id of ids) {
+      const row = [...updateSession.mock.calls].reverse().find(call => call[0]?.sessionId === id)?.[0];
+      if (!row) throw new Error('fixture session not persisted');
+      rows.set(id, structuredClone(row));
+    }
+    return { result: mutate(rows), rows };
+  });
+  return {
+    mutateOwnedSessionsAtomically,
+    updateSession,
+    registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+    cleanupSessionBridgeSendMarkers: vi.fn(),
+    cleanupSessionBridgeSendMarkersNow: vi.fn(),
+    updateSessionPid: vi.fn(),
+    getSession: vi.fn(),
+    getOwnedSession: vi.fn(),
+    listSessions: vi.fn(() => []),
+    closeSession: vi.fn(),
+  };
+});
 
 const getBotMock = vi.hoisted(() => vi.fn(() => ({
     config: { cliId: 'claude-code', larkAppId: 'cli_app_test', pinStreamingCard: false },
@@ -590,7 +603,74 @@ describe('transferSession', () => {
     expect(resume).toBe(true);
   });
 
+  it('withholds non-ordinary transfer replay after the target owner changes', async () => {
+    const { config } = await import('../src/config.js');
+    const { setAssistantOwner } = await import('../src/services/assistant-owner-store.js');
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const data = mkdtempSync(join(tmpdir(), 'botmux-assistant-transfer-owner-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = data;
+    const ownerA = `ou_${'a'.repeat(32)}`;
+    const ownerB = `ou_${'b'.repeat(32)}`;
+    try {
+      getBotMock.mockReturnValue({ config: {
+        cliId: 'claude-code', larkAppId: 'cli_app_test', pinStreamingCard: false,
+        assistantMode: true, sandbox: 'oncall',
+      }, botName: 'TestBot' });
+      setAssistantOwner(data, 'cli_app_test', 'oc_source', ownerA, 'claimed');
+      setAssistantOwner(data, 'cli_app_test', 'oc_target', ownerB, 'admin');
+      initWorkerPool({ sessionReply: vi.fn(async () => 'om_notice'), getSessionWorkingDir: () => '/tmp/project',
+        getActiveCount: () => 1, closeSession: vi.fn() });
+      let detachMessage: { type: string; requestId?: string } | undefined;
+      const oldWorker = Object.assign(new EventEmitter(), {
+        killed: false, connected: true, exitCode: null, signalCode: null,
+        send: vi.fn((message: any, callback?: (error: Error | null) => void) => {
+          if (message.type === 'detach_for_transfer') detachMessage = message;
+          callback?.(null);
+        }),
+        kill: vi.fn(),
+      }) as any;
+      const ds = makeDs({ worker: oldWorker });
+      ds.session.backendType = 'zmx';
+      ds.session.persistentBackendTarget = { backendType: 'zmx', sessionName: 'bmx-sess-abc' };
+      ds.session.assistantOwnerOpenId = ownerA;
+      ds.session.sandbox = 'oncall';
+      ds.session.sandboxWithholdBotSecret = true;
+      registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+      const replacementSend = vi.fn();
+      const replacementWorker = Object.assign(new EventEmitter(), {
+        killed: false, connected: true, exitCode: null, signalCode: null,
+        send: replacementSend, kill: vi.fn(),
+      }) as any;
+      const replacementFork = vi.fn((...args: Parameters<typeof forkWorker>) => {
+        ds.worker = replacementWorker;
+        ds.workerGeneration = 2;
+        ds.session.workerGeneration = 2;
+        sessionStore.updateSession(ds.session);
+        return forkWorkerSpy(...args);
+      });
+      const moving = transferSession(ds.session.sessionId, 'oc_target', 'om_M1_target', 'group', 'chat',
+        { forkWorkerImpl: replacementFork as typeof forkWorker });
+      await vi.waitFor(() => expect(oldWorker.send).toHaveBeenCalledTimes(1));
+      expect(sendWorkerSessionInput(ds, { type: 'raw_input', content: '/model opus', turnId: 'turn-raw' })).toBe(true);
+      oldWorker.emit('message', { type: 'transfer_detached', requestId: detachMessage!.requestId });
+      oldWorker.exitCode = 0;
+      oldWorker.emit('exit', 0, null);
+      expect(await moving).toEqual({ ok: true });
+      expect(replacementSend.mock.calls.some(call => call[0]?.type === 'raw_input'
+        && call[0]?.content === '/model opus')).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(data, { recursive: true, force: true });
+    }
+  });
+
   it('waits for detach ACK+exit and buffers new input for the replacement worker', async () => {
+    const sessionReply = vi.fn(async () => 'om_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/project',
+      getActiveCount: () => 1, closeSession: vi.fn() });
     const lifecycle: string[] = [];
     let detachMessage: { type: string; requestId?: string } | undefined;
     const send = vi.fn((
@@ -621,6 +701,9 @@ describe('transferSession', () => {
         },
       },
     });
+    ds.session.mojoQuarantineNoticePending = true;
+    ds.session.mojoQuarantinedLineage = 'prior-lineage';
+    ds.suppressedFinalOutputTurns = new Map([['turn-late', 7]]);
     registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
 
     const replacementSend = vi.fn((message: { type: string }) => {
@@ -639,6 +722,7 @@ describe('transferSession', () => {
       ds.worker = replacementWorker;
       ds.workerGeneration = 2;
       ds.session.workerGeneration = 2;
+      sessionStore.updateSession(ds.session);
       return forkWorkerSpy(...args);
     });
     const moving = transferSession(
@@ -728,6 +812,15 @@ describe('transferSession', () => {
       expect.any(Function),
     );
     expect(replacementSend).toHaveBeenNthCalledWith(3, rawDuringTransfer);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    __testOnly_setupWorkerHandlers(ds, replacementWorker, { ready: false, failureNotified: false }, 2);
+    replacementWorker.emit('message', { type: 'turn_input_received', turnId: 'om_transfer_late' });
+    replacementWorker.emit('message', { type: 'turn_input_received', turnId: 'om_transfer_late' });
+    await Promise.resolve(); await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[4]).toBe('om_transfer_late');
+    expect(ds.session.mojoQuarantineNoticePending).toBe(false);
   });
 
   it('fails safe on detach timeout using hard retirement without ordinary close cleanup', async () => {

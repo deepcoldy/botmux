@@ -505,7 +505,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     await primaryEffectsBarrier();
     expect(ds.streamCardId).toBe('om_new_card');
     expect(pinMessageMock).toHaveBeenCalledWith('app_test', 'om_new_card');
-    expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_frozen_predecessor');
+    expect(deleteMessageMock.mock.calls.map(call => call.slice(0, 2))).toContainEqual(['app_test', 'om_frozen_predecessor']);
 
     // A successor wins while the older Pin is still in flight. Primary recall
     // already happened; the old continuation may only compensate its own Pin.
@@ -542,7 +542,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     await primaryEffectsBarrier();
     expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card', expect.any(String), { beforeWrite: expect.any(Function) });
     expect(pinMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card');
-    expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_frozen_predecessor');
+    expect(deleteMessageMock.mock.calls.map(call => call.slice(0, 2))).toContainEqual(['app_test', 'om_frozen_predecessor']);
 
     ds.streamCardId = 'om_successor';
     resolvePin(sameAppPin('om_restored_card'));
@@ -601,6 +601,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
     expect(sessionReplyMock).toHaveBeenCalledTimes(2);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
+    await vi.waitFor(() => expect(pinMessageMock).toHaveBeenCalled());
     resolvePin(sameAppPin('om_new_card'));
     await __testOnly_waitForPinStreamingCardIdle();
   });
@@ -629,6 +630,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
     expect(sessionReplyMock).toHaveBeenCalledTimes(2);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
+    await vi.waitFor(() => expect(pinMessageMock).toHaveBeenCalled());
     resolvePin(sameAppPin('om_new_card'));
     await __testOnly_waitForPinStreamingCardIdle();
   });
@@ -986,6 +988,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
     expect(sessionReplyMock).toHaveBeenCalledTimes(2);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
+    await vi.waitFor(() => expect(pinMessageMock).toHaveBeenCalled());
     resolvePin(sameAppPin('om_new_card'));
     await __testOnly_waitForPinStreamingCardIdle();
   });
@@ -2157,7 +2160,7 @@ describe('worker-authoritative handoff live card', () => {
   async function prepare(disabled = false) {
     vi.clearAllMocks();
     getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', cliId: 'claude-code', disableStreamingCard: disabled }, resolvedAllowedUsers: [] });
-    const reply = vi.fn(async () => 'om_handoff_card');
+    const reply = vi.fn<Parameters<typeof postTurnStartingCard>[1]>(async () => 'om_handoff_card');
     const onStart = vi.fn((ds: DaemonSession, title: string, turnId: string) => {
       ds.currentTurnId = turnId; ds.currentTurnTitle = title;
       ds.streamCardPending = true; ds.streamCardPendingTurnId = turnId;
@@ -2189,11 +2192,53 @@ describe('worker-authoritative handoff live card', () => {
     await flush(); await flush();
     expect(onStart).toHaveBeenCalledExactlyOnceWith(ds, '审查上传取消修复', 'trg_review');
     expect(reply).toHaveBeenCalledTimes(1); expect(ds.streamCardId).toBe('om_handoff_card');
-    if (previous) expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_previous');
+    if (previous) expect(deleteMessageMock.mock.calls.map(call => call.slice(0, 2))).toContainEqual(['app_test', 'om_previous']);
     else expect(deleteMessageMock).not.toHaveBeenCalled();
     worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_review' });
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_unrelated_user' });
     await flush(); expect(reply).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['working', 'limited'] as const)('keeps a pending trigger screenshot (%s) off the old hidden card', async status => {
+    vi.useFakeTimers();
+    try {
+      const { ds, worker, reply, onStart } = await prepare();
+      const turnId = 'trg_review';
+      const captureRevision = 1;
+      const quota = {
+        limited: true, kind: 'usage', source: 'antigravity-error-composer', relativeResetKey: 'usage:3600000:queued',
+        retryAtMs: Date.now() + 3_600_000, retryLabel: '1h', retryReady: false,
+      } as const;
+      const screenshot = { type: 'screenshot_uploaded', turnId, captureRevision } as const;
+      armTriggerStreamingCard(ds, handoff, turnId);
+      worker.emit('message', { type: 'capture_identity', turnId, revision: captureRevision });
+      worker.emit('message', { ...screenshot, imageKey: 'img_queued', status, usageLimit: status === 'limited' ? quota : undefined });
+      await vi.advanceTimersByTimeAsync(0);
+      // The matching frame was accepted, but the trigger still owns no card.
+      expect(ds.currentImageKey).toBe('img_queued');
+      expect(ds.streamCardId).toBe('om_previous');
+      expect(updateMessageMock).not.toHaveBeenCalled();
+      expect(reply.mock.calls.filter(call => call[2] === 'interactive')).toHaveLength(0);
+
+      worker.emit('message', { type: 'turn_input_committed', turnId });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onStart).toHaveBeenCalledOnce();
+      expect(reply.mock.calls.filter(call => call[2] === 'interactive')).toHaveLength(1);
+      expect(ds.streamCardId).toBe('om_handoff_card');
+      const afterCommit = updateMessageMock.mock.calls.length;
+
+      worker.emit('message', {
+        ...screenshot, imageKey: 'img_committed', status: 'limited',
+        usageLimit: { ...quota, relativeResetKey: 'usage:3600000:committed' },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ds.currentImageKey).toBe('img_committed');
+      const framePatches = updateMessageMock.mock.calls.slice(afterCommit);
+      expect(framePatches.map(call => call.slice(0, 2))).toEqual([['app_test', 'om_handoff_card']]);
+      expect(JSON.parse(String(framePatches[0]?.[2])).status).toBe('limited');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps a manually posted replacement live and safe from repeated completion', async () => {

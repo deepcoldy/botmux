@@ -32,8 +32,10 @@ export interface PtyHandle {
    * double-Ctrl+C exit gestures can keep their own recovery outside the window.
    */
   readonly lastInjectedCancelAt?: number;
-  /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
-  pasteText?(text: string): void;
+  /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it).
+   *  `false` means the backend could not confirm the paste: some bytes may
+   *  still have landed, so callers must not follow it with a submit key. */
+  pasteText?(text: string): void | boolean;
   /** Absolute path to Claude Code's session JSONL; set by worker for claude-code adapter.
    *  Used by writeInput to verify a paste+Enter actually committed (new user-content
    *  line appended) and retry Enter if not — rather than trusting fixed sleep timing. */
@@ -92,6 +94,10 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  onInputPrepared?: (content: string) => void;
+  /** Durable replay identity. Runner adapters may forward this with turnId so
+   * late output from an older attempt cannot settle its successor. */
+  dispatchAttempt?: number;
   /** Owned, prompt-injected Codex input may carry a fresh correlation marker.
    * An exact post-write history match then proves ownership even when the OS
    * sandbox prevents reading the CLI's open rollout file descriptors. */
@@ -99,6 +105,27 @@ export interface WriteInputContext {
   trustedCaller?: TrustedCaller;
   /** codex-app only: this turn is authorized to steer into an active turn. */
   codexAppSteerable?: true;
+  /** Asked right before each submit key: has the CLI's input surface been
+   *  taken over meanwhile — TRAE's question page popping up between the paste
+   *  and its Enter — so the key would answer that page instead of submitting?
+   *  See TraeX's writeInput for how an adapter honours it. */
+  submitGuard?: SubmitGuard;
+}
+
+export interface SubmitGuard {
+  /** May reject before any paste bytes, after an adapter's awaited setup. */
+  beforeWrite?(): void;
+  /** A reason (shown to the user) while the surface is taken, else undefined.
+   *  `draft` = the message was pasted and its first Enter is pending (it sits
+   *  in the composer under the page); `retry` = a resend of an Enter that
+   *  may already have submitted. */
+  blocked(phase: 'draft' | 'retry'): Promise<string | undefined>;
+  /** False once the CLI this write started on is gone: stop waiting. */
+  current(): boolean;
+  /** How long a pasted draft may wait for the surface to come back. */
+  maxWaitMs: number;
+  /** Re-check cadence while waiting. */
+  pollMs: number;
 }
 
 /** A session discovered on disk that botmux can resume (import) into a topic —
@@ -129,7 +156,7 @@ export interface SkillDeliveryCapability {
 export interface McpGatewayInstallSpec {
   /** Stable CLI-global config file that receives the single `botmux` entry. */
   readonly configPath: string;
-  readonly format: 'codex-toml' | 'claude-json';
+  readonly format: 'codex-toml' | 'claude-json' | 'antigravity-json';
 }
 
 /** UTF-8 budget for a first prompt baked into launch argv.
@@ -298,6 +325,11 @@ export interface CliAdapter {
      *  others ignore. Note the accepted set is per-CLI: `ultra` is codex/traex
      *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Codex App only: whether its runner may use the bare local
+     * `codex debug models` catalogue when a missing-thread resume falls back to
+     * a fresh thread/start. False for wrappers, Codex profiles and remote
+     * backends, whose actual provider the bare catalogue cannot attest. */
+    allowCodexReasoningCatalog?: boolean;
     /** Codex-only thread service tier. Missing inherits the executor's config. */
     codexProfile?: string;
     serviceTier?: CodexServiceTier;
@@ -410,8 +442,11 @@ export interface CliAdapter {
   /** Only meaningful with passesInitialPromptViaArgs. If set, prompts whose
    *  UTF-8 byte length is GREATER than this adapter-specific limit are not
    *  baked into launch args; the worker defers them to the normal post-start
-   *  input queue. This guards backend launchers (notably tmux) whose command
-   *  string limit can be much lower than OS ARG_MAX. */
+   *  input queue. The budget dates from the old inline tmux launch, whose
+   *  command string tmux capped far below OS ARG_MAX; panes now read the full
+   *  launch argv from a private pane-launch file, so that cap no longer binds
+   *  and the number is retained only to keep the args-baked vs queued split
+   *  unchanged. */
   readonly maxInitialPromptArgBytes?: number;
 
   /** Only meaningful with passesInitialPromptViaArgs. When true, the CLI
@@ -621,7 +656,7 @@ export interface CliAdapter {
     /** 待写入的配置文件路径（~ 由 installer 展开）。 */
     readonly configPath: string;
     /** 写入格式：决定 installer 如何合并进既有配置。 */
-    readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks';
+    readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks' | 'antigravity-hooks';
     /** 可选：SessionStart「真就绪」hook 命令。
      *  - claude-settings：写进全局 settings.json（兼进程级 --settings）
      *  - grok-hooks：写进 `~/.grok/hooks/*.json` 的 SessionStart
@@ -646,6 +681,14 @@ export interface CliAdapter {
    *  skill 兜底）。注入机制由各 adapter 自行决定（Claude 走 --settings、
    *  OpenCode 走插件、CoCo 走 ensureAskHook）。 */
   readonly asksViaHook?: boolean;
+
+  /** The CLI's own native question page that the worker bridges to a Lark
+   *  question card on the terminal path (no RPC input): `traex` = TRAE CLI's
+   *  `AskUserQuestion` "Questions" panel (utils/traex-question-page.ts). While
+   *  it is on screen queued input is held off it, the quiet screen does not
+   *  end the turn, and the card's answer is entered as verified keys
+   *  (core/traex-question-bridge.ts). Undefined = no such page. */
+  readonly nativeQuestionPage?: 'traex';
 
   /** 命令式 hook 安装钩子：适用于无法靠纯写文件完成、需要 spawn CLI 子命令的场景
    *  （CoCo 需要 `coco plugin install`）。声明式写文件的 CLI 用 `hookInstall`；本方法
@@ -923,7 +966,9 @@ export interface CliAdapter {
    *  queued input is not typed ahead into the running turn: Enter would pick
    *  the dialog's default answer. It goes in after the turn's terminal report,
    *  like any input queued while not type-ahead capable. A `kind=question`
-   *  block is not held: the next message is its answer. */
+   *  block is not held here: the next message is its answer (an adapter whose
+   *  question page would only take it as a note declares `nativeQuestionPage`
+   *  instead). */
   readonly programStatusBlockedHoldsInput?: boolean;
 
   /** The transcript's own turn terminal (`assistant_final`, fed through
@@ -949,12 +994,42 @@ export interface CliAdapter {
    *  inputs survive for explicit recovery. */
   readonly quarantineUnconfirmedSubmits?: boolean;
 
-  /** This CLI renders the codex_core hook-review / migration pages recognised
-   *  by `classifyStuckPage` (utils/stuck-detector.ts). Opts the session into
-   *  the "CLI is stuck" card: queued input is held off any of those pages and
-   *  the card offers the page's safe keys (core/stuck-page-catalog.ts).
-   *  Undefined = only the legacy hook-review input hold, never a card. */
-  readonly stuckPageFamily?: 'codex-family';
+  /** The authoritative viewport proves the CLI still holds input it has
+   *  already taken and will start by itself: it is busy with earlier work, or
+   *  its own send queue is drawn (Doubao parks an Enter pressed during a turn
+   *  and writes the native user record only when that turn ends). While this
+   *  holds, unstarted structured heads keep their pre-start lease (bounded
+   *  from each mark), instead of being reported uncollected 20s after the
+   *  write. Undefined = no such evidence; leases run on their normal clock.
+   *  Contract: the CLI sends held input in submit order. A head the screen
+   *  showed NOT held after its write settled is not covered by a later busy
+   *  screen, and a receipt for a later input expires every earlier unstarted
+   *  head at once. */
+  screenHoldsSubmittedInput?(screen: string): boolean;
+
+  /** The authoritative viewport proves the CLI holds no pending input at all:
+   *  its composer is empty and it is neither busy nor showing queued input.
+   *  For an adapter that quarantines unconfirmed submits, two consecutive
+   *  receipt rechecks seeing this (receipt still missing) mean the parked
+   *  draft was cleared or replaced by hand; the quarantine and the turn's
+   *  attribution are released so later input is no longer held. */
+  screenShowsNoPendingInput?(screen: string): boolean;
+
+  /** Which blocking pages this CLI renders, as recognised by
+   *  `classifyStuckPage(screen, family)` (utils/stuck-detector.ts):
+   *  `codex-family` = the codex_core hook-review / migration / session-lock
+   *  pages; `kimi` = Kimi Code's cache-expiry menu. Opts the session into the
+   *  "CLI is stuck" card: queued input is held off any of those pages and the
+   *  card offers the page's safe keys (core/stuck-page-catalog.ts). Pages are
+   *  read as this family's only. Undefined = only the legacy hook-review input
+   *  hold, never a card. */
+  readonly stuckPageFamily?: import('../../utils/stuck-detector.js').StuckPageFamily;
+
+  /** The CLI's own prediction of the user's next input, read from the
+   *  rendered input box of an idle screen (cells, so dim/inverse attributes
+   *  survive). Undefined = none on screen or not recognised; adapters without
+   *  it never offer a next-step suggestion. */
+  readonly promptSuggestion?: (rows: readonly import('../../utils/terminal-cells.js').ScreenRow[]) => string | undefined;
 
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
@@ -1196,6 +1271,12 @@ export interface CliAdapter {
    *  command and must never receive a best-guess slash command. */
   buildSessionRenameCommand?(title: string): string;
 
+  /** CLI-native command that makes the CLI name the current interactive
+   *  session itself (Claude Code: a bare `/rename` derives a name from the
+   *  conversation). Botmux types it verbatim when `/rename` arrives without a
+   *  title. Undefined means a bare `/rename` keeps botmux's usage reply. */
+  readonly sessionAutoRenameCommand?: string;
+
   /** Structured-transcript bridge capability (see {@link StructuredBridgeSpec}).
    *  Declared by CLIs whose final answer can be harvested from an append-only
    *  transcript file when the model forgets `botmux send`. Absent = no
@@ -1217,6 +1298,7 @@ export type StructuredBridgeAttachMode =
 
 /** One incremental drain of a path-addressed transcript. */
 export interface StructuredBridgeDrainResult {
+  latestGoal?: import('../../services/native-goal-state.js').NativeGoalState | null;
   events: CodexBridgeEvent[];
   /** Byte offset of the last fully parsed line; hand it back as the next `offset`. */
   newOffset: number;
@@ -1236,6 +1318,9 @@ export interface StructuredBridgeDrainContext {
   state: unknown;
   /** Release a provisionally held trailing final (drivers that hold one). */
   flushTrailingFinal?: boolean;
+  /** Retire a whole conversation: later explicit inputs abandon earlier pending
+   *  turns instead of confirming their waiting narration (Antigravity only). */
+  retirePendingTurns?: boolean;
   /** Number of turns the ATTRIBUTION QUEUE currently holds as started with no
    *  terminal yet, measured by the worker immediately before the drain.
    *  Drivers whose user and final records live in SEPARATE files (doubao:
@@ -1246,6 +1331,21 @@ export interface StructuredBridgeDrainContext {
    *  any transcript record (Esc interrupt), which a file-derived counter can
    *  never observe and would then over-count forever. */
   openTurns?: number;
+  /** Whether a native user record with this text would start a turn the
+   *  attribution queue is waiting for (non-adopt; complete normalised input
+   *  containment, not merely the shared envelope-prefix fingerprint). Lets a
+   *  two-file driver tell botmux's request row, whose prompt record has not
+   *  been read yet, from an old retry or any other user row. */
+  ownsNativeInput?: (text: string) => boolean;
+  /** Legacy ownership fallback for journal-restored marks whose full input was
+   *  deliberately not persisted. The driver additionally applies the original
+   *  same-text retry digest guard before using this weaker proof. */
+  ownsNativeInputByFingerprint?: (text: string) => boolean;
+  /** Exact queue owner of a native request row. The driver persists only this
+   *  identity with its parked offset, so later receipt/prune operations do not
+   *  assume that the first unstarted queue head owns the row. */
+  nativeInputOwner?: (text: string, requireCompleteInput: boolean) =>
+    { turnId: string; dispatchAttempt?: number } | undefined;
 }
 
 /**
@@ -1258,6 +1358,14 @@ export interface StructuredBridgeDrainContext {
 export interface StructuredBridgeSpec {
   /** Incrementally read the transcript at `path` from `offset`. */
   drain(path: string, offset: number, ctx: StructuredBridgeDrainContext): StructuredBridgeDrainResult;
+  /** Pure view of the driver state: the driver is waiting at a native record
+   *  of the NEXT pending input whose prompt record has not been read yet
+   *  (Doubao: a request row ahead of its assignment section). The worker keeps
+   *  that head's pre-start lease alive meanwhile. */
+  awaitsPendingInput?(state: unknown): boolean;
+  /** Queue identity of the native row on which awaitsPendingInput is parked.
+   *  Undefined for legacy driver state that predates explicit ownership. */
+  pendingInputOwner?(state: unknown): { turnId: string; dispatchAttempt?: number } | undefined;
   /**
    * When the worker commits `result.state` back into its single state slot:
    *  - `'drain'`: on every drain, including the one-off attach-time drains

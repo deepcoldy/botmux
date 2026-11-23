@@ -7,6 +7,8 @@ import type { TriggerAction, TriggerErrorCode } from './trigger-types.js';
 export interface TriggerLogEntry {
   triggerId: string;
   connectorId?: string;
+  actor?: 'owner';
+  sourceName?: string;
   requestId?: string;
   action: TriggerAction | 'failed';
   status: 'ok' | 'error';

@@ -255,6 +255,16 @@ export function resolveDashboardSpec(): FleetBotSpec {
   };
 }
 
+export function resolveTopicIndexSpec(): FleetBotSpec {
+  return {
+    name: 'topic-index',
+    appId: '',
+    botIndex: -1,
+    entry: 'topic-indexer',
+    logBaseName: 'topic-index',
+  };
+}
+
 /**
  * Every process the supervisor manages: the bot daemons from bots.json PLUS the
  * dashboard. This is the list the supervisor `start()` reconciles and the set
@@ -263,7 +273,7 @@ export function resolveDashboardSpec(): FleetBotSpec {
  * rows) is unaffected.
  */
 export function resolveFleetMembers(): FleetBotSpec[] {
-  return [...resolveFleetBots(), resolveDashboardSpec()];
+  return [...resolveFleetBots(), resolveDashboardSpec(), ...(process.env.BOTMUX_TOPIC_SEARCH === '0' ? [] : [resolveTopicIndexSpec()])];
 }
 
 export function liveSupervisorTarget(
@@ -476,6 +486,13 @@ export interface WaitFleetOnlineResult {
   pending: string[];
 }
 
+function matchesFleetMember(member: string | FleetBotSpec, row: FleetStatusRow): boolean {
+  if (typeof member === 'string') return row.name === member;
+  return !member.external && (member.entry ?? 'daemon') === 'daemon' && member.appId
+    ? row.appId === member.appId
+    : row.name === member.name;
+}
+
 /**
  * Poll fleet-state until every configured bot shows online+alive, or timeout.
  * Replaces pm2's synchronous `readAndAssertConfiguredFleetOnline` health gate:
@@ -485,15 +502,13 @@ export interface WaitFleetOnlineResult {
  * what an unhealthy result means (warn vs. throw).
  */
 export function waitFleetOnline(
-  expectedNames: readonly string[],
+  expectedMembers: readonly (string | FleetBotSpec)[],
   timeoutMs = 30_000,
   statePath: string = fleetStatePath(),
 ): WaitFleetOnlineResult {
-  const expected = expectedNames.length;
+  const expected = expectedMembers.length;
   if (expected === 0) return { healthy: true, online: 0, expected: 0, pending: [] };
-  const want = new Set(expectedNames);
   const deadline = Date.now() + Math.max(0, timeoutMs);
-  let pending: string[] = [...want];
   for (;;) {
     const status = readFleetStatus(statePath);
     // Member rows are a projection owned by the supervisor. Never accept old
@@ -501,24 +516,19 @@ export function waitFleetOnline(
     // supervisor generation is attested, none of its projection proves that the
     // newly-started fleet is healthy. This closes the same cross-namespace/PID
     // reuse hole as stop/restart signalling.
-    const onlineNames = status.supervisorAlive
-      ? new Set(status.rows
-        .filter((r) => want.has(r.name) && r.status === 'online' && r.alive)
-        .map((r) => r.name))
-      : new Set<string>();
-    pending = [...want].filter((n) => !onlineNames.has(n));
+    const pending = expectedMembers.filter(member => !status.supervisorAlive
+      || !status.rows.some(row => matchesFleetMember(member, row) && row.status === 'online' && row.alive))
+      .map(member => typeof member === 'string' ? member : member.name);
     if (pending.length === 0) return { healthy: true, online: expected, expected, pending: [] };
     if (Date.now() >= deadline) return { healthy: false, online: expected - pending.length, expected, pending };
     sleepSyncMs(250);
   }
 }
 
-/** Every supervised member's name — the bot daemons PLUS the dashboard. This is
- *  what `botmux restart` health-gates on (waitFleetOnline), so a restart that
- *  brings the fleet back but leaves the dashboard down is reported unhealthy
- *  rather than silently "ok". */
-export function fleetMemberNames(): string[] {
-  return resolveFleetMembers().map((m) => m.name);
+/** Members `botmux restart` health-gates on: the bot daemons plus the
+ *  dashboard. The topic indexer is excluded so a restart never waits on it. */
+export function fleetHealthMembers(): FleetBotSpec[] {
+  return resolveFleetMembers().filter((m) => m.entry !== 'topic-indexer');
 }
 
 /** Resolve one bot's fleet spec by larkAppId (null if not in bots.json). */
@@ -558,9 +568,9 @@ export function startBotViaSupervisor(
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start', name: spec.name };
   }
   // Already online+alive? No-op.
-  const existing = readFleetStatus().rows.find((r) => r.name === spec.name);
+  const existing = readFleetStatus().rows.find((r) => matchesFleetMember(spec, r) && r.status === 'online' && r.alive);
   if (existing && existing.status === 'online' && existing.alive) {
-    return { ok: true, state: 'already-online', name: spec.name };
+    return { ok: true, state: 'already-online', name: existing.name };
   }
   enqueueFleetCommand(fleetCommandPath(), {
     id: idFactory(), op: 'start-bot', name: spec.name, appId: spec.appId, botIndex: spec.botIndex, at: nowIso(),
@@ -568,9 +578,16 @@ export function startBotViaSupervisor(
   if (!signalAttestedFleetProcess(supervisorTarget, 'SIGHUP')) {
     return { ok: false, reason: 'fleet_down', message: 'supervisor 已不在运行', name: spec.name };
   }
-  const health = waitFleetOnline([spec.name], timeoutMs);
-  if (health.healthy) return { ok: true, state: 'started', name: spec.name };
-  return { ok: false, reason: 'timeout', message: `${spec.name} 未在超时时间内上线`, name: spec.name };
+  // The supervisor may retain a pre-rename handle. Wait for the stable app
+  // identity instead of timing out after a successful, deduplicated start.
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  for (;;) {
+    const status = readFleetStatus();
+    const online = status.supervisorAlive && status.rows.find(r => matchesFleetMember(spec, r) && r.status === 'online' && r.alive);
+    if (online) return { ok: true, state: 'started', name: online.name };
+    if (Date.now() >= deadline) return { ok: false, reason: 'timeout', message: `${spec.name} 未在超时时间内上线`, name: spec.name };
+    sleepSyncMs(250);
+  }
 }
 
 /**
@@ -591,7 +608,7 @@ export function stopBotViaSupervisor(
   if (!supervisorTarget) {
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行', name: spec.name };
   }
-  const existing = readFleetStatus().rows.find((r) => r.name === spec.name);
+  const existing = readFleetStatus().rows.filter((r) => matchesFleetMember(spec, r));
   // Short-circuit as already-stopped ONLY when the bot is genuinely at rest with
   // no supervisor-side work pending: absent, 'stopped' (pid 0), or 'errored'
   // (parked, no restart timer). A 'launching' bot is mid-crash-backoff — the
@@ -600,7 +617,7 @@ export function stopBotViaSupervisor(
   // reappears ~200ms later. 'online' (with or without a live pid) likewise needs
   // the supervisor to act. In all those cases we must enqueue + SIGHUP so the
   // supervisor's stopOneBot cancels the timer and marks it stopped authoritatively.
-  const atRest = !existing || existing.status === 'stopped' || existing.status === 'errored';
+  const atRest = existing.every(r => r.status === 'stopped' || r.status === 'errored');
   if (atRest) {
     return { ok: true, state: 'already-stopped', name: spec.name };
   }
@@ -615,8 +632,8 @@ export function stopBotViaSupervisor(
   // (or the restart timer hasn't been cancelled yet), so keep waiting.
   const deadline = Date.now() + Math.max(0, timeoutMs);
   for (;;) {
-    const row = readFleetStatus().rows.find((r) => r.name === spec.name);
-    if (!row || row.status === 'stopped' || row.status === 'errored') return { ok: true, state: 'stopped', name: spec.name };
+    const rows = readFleetStatus().rows.filter((r) => matchesFleetMember(spec, r));
+    if (rows.every(r => r.status === 'stopped' || r.status === 'errored')) return { ok: true, state: 'stopped', name: spec.name };
     if (Date.now() >= deadline) return { ok: false, reason: 'timeout', message: `${spec.name} 未在超时时间内停止`, name: spec.name };
     sleepSyncMs(150);
   }

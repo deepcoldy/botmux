@@ -3,9 +3,29 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { invalidateGlobalConfigCache } from '../src/global-config.js';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig, withConfiguredCliId } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
+  it.each([
+    [false, false],
+    [true, true],
+    [undefined, true],
+    ['false', true],
+    [null, true],
+    [0, true],
+  ])('preserves saved folded layout %s in offline recovery', (saved, expected) => {
+    const raw = { streamingCardFoldedLayout: saved, larkToolBinding: false };
+    const before = { ...raw };
+    const overrides = sparseOverridesFromRawBotConfig(raw);
+    const payload = botDefaultsPayload({ larkAppId: 'app' }, overrides);
+    expect(payload.streamingCardFoldedLayout).toBe(expected);
+    expect(payload.larkToolBinding).toBe(false);
+    expect(raw).toEqual(before);
+  });
+  it('exposes folded layout as default-on and preserves explicit classic layout', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}).streamingCardFoldedLayout).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { streamingCardFoldedLayout: false }).streamingCardFoldedLayout).toBe(false);
+  });
   it('shows persisted legacy CoT preferences with explicit canonical values taking precedence', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, { thinkingCard: false }).cotEnabled).toBe(false);
     expect(botDefaultsPayload({ larkAppId: 'app' }, { thinkingCard: false, cotEnabled: true }).cotEnabled).toBe(true);
@@ -59,7 +79,7 @@ describe('dashboard bot payload helpers', () => {
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType', 'defaultBackendType',
       'usageDisplay', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
-      'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'privateCard',
+      'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'goalStatusCard', 'privateCard',
       'cotEnabled', 'replyCardShowTools', 'senderTag', 'senderTagHideEmail', 'overloadAlert', 'botToBotSameDir', 'autoInviteOwnerOnGroupAdd', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'groupJoinCommandEnabled', 'groupJoinCommand',
@@ -67,7 +87,7 @@ describe('dashboard bot payload helpers', () => {
       'summaryRange', 'summaryMemory', 'summaryMemoryPath',
       'regularGroupReplyMode', 'regularGroupMentionMode', 'docSubscribeDefaultMode',
       'substituteMode', 'feedback', 'replyStyle', 'askOptionLayout',
-      'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen', 'grantRequestToOwnerDm',
+      'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen', 'scheduleCreateByTalkers', 'grantRequestToOwnerDm',
       'grantDefaultDurationMs', 'messageQuotaDefaultLimit', 'p2pMode',
       'envelopeInjection', 'replyDelivery', 'replyDeliveryDefault', 'replyDeliverySupported', 'codexAuthSync', 'triggerUserAuth',
       'skillInjection', 'skillInjectionDefault', 'skillInjectionSupport',
@@ -179,7 +199,6 @@ describe('dashboard bot payload helpers', () => {
     const policy = {
       enabled: true,
       tools: ['lark-cli' as const],
-      fallback: 'none' as const,
       gitHost: 'code.example.com',
     };
     // An enabled policy survives whole — a refresh rebuilds the toggle, the tool
@@ -193,11 +212,11 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: null }))
       .toMatchObject({ triggerUserAuth: null });
     expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: { enabled: false } }))
-      .toMatchObject({ triggerUserAuth: { enabled: false, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' } });
+      .toMatchObject({ triggerUserAuth: { enabled: false, tools: ['lark-cli', 'bytedcli'] } });
 
     // A malformed policy must not throw here: this builds every bot row, so one
     // bad value would blank the whole Bot Defaults page rather than one toggle.
-    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: { enabled: true, fallback: 'device' } }))
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: { enabled: true, capabilities: ['bits'] } }))
       .toMatchObject({ triggerUserAuth: null });
     expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: 'yes' }))
       .toMatchObject({ triggerUserAuth: null });
@@ -356,6 +375,12 @@ describe('dashboard bot payload helpers', () => {
       customPassthroughCommands: '',
       canTalkDaemonCommands: '',
     });
+  });
+
+  it('projects daemon-provided default CLI command names without inventing them for old daemons', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { defaultPassthroughCommands: ['/goal', '/model', 3, 'invalid'] }))
+      .toMatchObject({ defaultPassthroughCommands: ['/goal', '/model'] });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}).defaultPassthroughCommands).toBeUndefined();
   });
 
   it('projects launchShell so the dashboard preserves it after refresh', () => {
@@ -732,6 +757,30 @@ describe('dashboard bot payload helpers', () => {
       invalidateGlobalConfigCache();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+  it('propagates apiOnly through live, descriptor and offline recovery payloads', () => {
+    expect(botDefaultsPayload({ larkAppId: 'local_descriptor', apiOnly: true }, {}).apiOnly).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'local_live' }, { apiOnly: true }).apiOnly).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'cli_live' }, {}).apiOnly).toBe(false);
+    const offline = botDefaultsPayload(
+      { larkAppId: 'local_offline' },
+      { displayName: null, larkBotName: null, ...sparseOverridesFromRawBotConfig({ apiOnly: true }) },
+    );
+    expect(offline.apiOnly).toBe(true);
+    expect(mergeBotOncallFields({ larkAppId: 'local_old', apiOnly: true }, {}).apiOnly).toBe(true);
+    expect(mergeBotOncallFields({ larkAppId: 'local_new' }, { apiOnly: true }).apiOnly).toBe(true);
+    expect(mergeBotOncallFields({ larkAppId: 'local_old', apiOnly: true }, { apiOnly: false }).apiOnly).toBe(false);
+  });
+
+  it('keeps apiOnly when merging an older daemon descriptor with config fallbacks', () => {
+    const fallback = new Map<string, { apiOnly?: boolean; cliId?: string }>([
+      ['local_old', { apiOnly: true, cliId: 'riff' }],
+      ['cli_old', { apiOnly: false, cliId: 'codex' }],
+    ]);
+    expect(withConfiguredCliId({ larkAppId: 'local_old' }, fallback)).toMatchObject({ apiOnly: true, cliId: 'riff' });
+    expect(withConfiguredCliId({ larkAppId: 'cli_old' }, fallback)).toMatchObject({ apiOnly: false, cliId: 'codex' });
+    // An explicit descriptor value remains authoritative over a stale config fallback.
+    expect(withConfiguredCliId({ larkAppId: 'local_old', apiOnly: false }, fallback).apiOnly).toBe(false);
   });
 });
 

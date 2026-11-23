@@ -138,6 +138,9 @@ describe('zeroPromptInjectionUnsupportedReason', () => {
     ['claude-code', {}, null],
     ['codex', { backendType: 'tmux' }, null],
     ['cursor', { sandbox: 'oncall' }, null],
+    ['hermes', { sandbox: 'oncall' }, 'oncall_unsupported_for_cli'],
+    ['hermes', {}, null],
+    ['antigravity', { sandbox: 'oncall' }, null],
     ['opencode', {}, 'cli_unsupported'],
     [undefined, {}, 'cli_unsupported'],
     ['claude-code', { backendType: 'riff' }, 'backend_unsupported'],
@@ -145,6 +148,8 @@ describe('zeroPromptInjectionUnsupportedReason', () => {
     ['antigravity', { sandbox: 'scratch' }, 'scratch_unsupported_for_cli'],
     ['antigravity', { backendType: 'zmx' }, 'zmx_unsupported_for_antigravity'],
     ['cursor', { backendType: 'zmx' }, null],
+    ['claude-code', { backendType: 'hc' }, null],
+    ['antigravity', { backendType: 'hc' }, null],
     // Order: an unsupported backend wins over the scratch / zmx specifics.
     ['antigravity', { backendType: 'riff', sandbox: 'scratch' }, 'backend_unsupported'],
     ['antigravity', { backendType: 'zmx', sandbox: 'scratch' }, 'scratch_unsupported_for_cli'],

@@ -2,7 +2,7 @@
  * `botmux setup add|configure --extra-scopes-file`：记下的路径怎么落盘、怎么沿用、怎么降级。
  *
  * 直接跑 cmdSetupScripted，读写 vitest 临时 HOME 下的真 bots.json；只替换开放平台自动配置、
- * supervisor 启动、旧 pm2 清理和凭证 / owner 校验这些要出网或碰进程的出口。
+ * 官方注册、supervisor 启动、旧 pm2 清理和凭证 / owner 校验这些要出网或碰进程的出口。
  *
  * Run: pnpm vitest run test/cli-setup-extra-scopes.test.ts
  */
@@ -15,6 +15,8 @@ const mocks = vi.hoisted(() => ({
   automateOpenPlatformSetup: vi.fn(),
   createFeishuOpenPlatformApp: vi.fn(),
   inspectCachedFeishuOpenPlatformSession: vi.fn(),
+  tryRegisterApp: vi.fn(),
+  completeRegisteredApp: vi.fn(),
   onReadDefaultScopeManifest: vi.fn(),
   startBotViaSupervisor: vi.fn(),
   validateCredentials: vi.fn(),
@@ -34,6 +36,15 @@ vi.mock('../src/setup/open-platform-automation.js', async importOriginal => {
     },
   };
 });
+
+vi.mock('../src/setup/register-app.js', () => ({
+  tryRegisterApp: mocks.tryRegisterApp,
+}));
+
+vi.mock('../src/setup/registration-manifest.js', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  completeRegisteredApp: mocks.completeRegisteredApp,
+}));
 
 vi.mock('../src/core/fleet-runtime.js', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -304,6 +315,49 @@ describe('setup add --extra-scopes-file', () => {
     expect(lastJson()).toMatchObject({ ok: true, action: 'add', extraScopes: { file: extraFile, merged: true } });
   });
 
+  it.each([false, true])('Lark 走官方注册时按实际申请的 addons 决定是否回读（跳过自动配置：%s）', async skipAuto => {
+    writeBots([botEntry('cli_a')]);
+    mocks.tryRegisterApp.mockResolvedValue({
+      ok: true, appId: 'cli_registered', appSecret: crypto.randomUUID(), brand: 'feishu',
+    });
+    mocks.completeRegisteredApp.mockResolvedValue({
+      ok: true, scopeCount: 42, skippedScopeCount: 0, redirectConfigured: true, publishSkipped: true,
+    });
+
+    await cmdSetupScripted([
+      'add', '--create-app', '--allowed-users', 'a@b.com', '--working-dir', scratch,
+      '--brand', 'lark', '--json', ...(skipAuto ? ['--no-open-platform-auto'] : []),
+    ]);
+
+    expect(mocks.createFeishuOpenPlatformApp).not.toHaveBeenCalled();
+    expect(readBots()[1]).toMatchObject({ larkAppId: 'cli_registered' });
+    expect(mocks.automateOpenPlatformSetup).not.toHaveBeenCalled();
+    const registration = mocks.tryRegisterApp.mock.calls[0][0];
+    if (skipAuto) {
+      expect(registration.addons).toBeUndefined();
+      expect(mocks.completeRegisteredApp).not.toHaveBeenCalled();
+      expect(lastJson().openPlatform.status).toBe('skipped');
+    } else {
+      expect(registration.addons.scopes.tenant).toContain('im:message');
+      expect(mocks.completeRegisteredApp).toHaveBeenCalledWith(
+        expect.objectContaining({ appId: 'cli_registered' }), registration.addons,
+        expect.any(Function), expect.objectContaining({ disableQrLogin: true }),
+      );
+      expect(lastJson().openPlatform).toMatchObject({ status: 'ready', scopeCount: 42 });
+    }
+  });
+
+  it('Lark 跳过自动配置时拒绝 --app-name，不建应用', async () => {
+    writeBots([botEntry('cli_a')]);
+    await cmdSetupScripted([
+      'add', '--create-app', '--brand', 'lark', '--app-name', 'my-bot', '--no-open-platform-auto',
+      '--allowed-users', 'a@b.com', '--working-dir', scratch, '--json',
+    ]);
+    expect(mocks.tryRegisterApp).not.toHaveBeenCalled();
+    expect(lastJson()).toMatchObject({ ok: false });
+    expect(readBots()).toHaveLength(1);
+  });
+
   it('应用已创建、配置未写入时的 partial JSON 也带 extraScopes，续跑命令带上清单路径', async () => {
     writeBots([botEntry('cli_a')]);
     const before = readFileSync(botsFile, 'utf8');
@@ -319,6 +373,12 @@ describe('setup add --extra-scopes-file', () => {
       '--extra-scopes-file', extraFile, '--json',
     ]);
 
+    // 飞书默认沿用网页登录态创建：有效登录态下免扫码，不走确认链接。
+    expect(mocks.tryRegisterApp).not.toHaveBeenCalled();
+    expect(mocks.createFeishuOpenPlatformApp).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      disableQrLogin: true,
+      expectedIdentity: { userId: 'u_1', tenantId: 't_1' },
+    }));
     const out = lastJson();
     expect(out).toMatchObject({ ok: false, partial: true, appId: 'cli_created', extraScopes: { file: extraFile, merged: true } });
     expect(out.continueCommand).toContain(`--extra-scopes-file ${extraFile}`);

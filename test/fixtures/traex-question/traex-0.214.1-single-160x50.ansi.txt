@@ -1,0 +1,50 @@
+
+  [1m[38;5;2m▄▄▄▄▄▄▄
+[0m[39m[49m  [1m[38;5;2m█[0m[39m[49m [1m[38;5;2m◆[0m[39m[49m [1m[38;5;2m◆[0m[39m[49m [1m[38;5;2m█[0m[39m[49m  [1m[38;5;2mTRAE CLI[0;2m[39m[49m (v0.214.1)
+[0m[39m[49m   [1m[38;5;2m▀▀▀▀▀▀
+[0m[39m[49m  /tmp/repo
+  [2mpermissions: [0;1m[38;5;5m[49mYOLO mode
+
+[0m[39m[49m  [1mTip:[0m[39m[49m [tui.keymap] in ~/.trae/traecli.toml lets you rebind supported shortcuts.
+
+
+[2m▍ [0m[39m[49mask me
+
+
+[38;2;166;227;161m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[39m  [2mQuestion 1/1 (1 unanswered)
+[0m[39m[49m  [38;2;166;227;161mWhich database should the new service use?
+
+[39m  [1;7m❯ 1. PostgreSQL (Recommended)  [0;7m[39m[49mMature, strong consistency[1m
+[0m[39m[49m    2. MySQL                     [2mWidely deployed
+[0m[39m[49m    3. SQLite                    [2mEmbedded, zero ops
+[0m[39m[49m    4. None of the above         [2mOptionally, add details in notes (tab).
+
+[0m[39m[49m  [1mtab[0;2m[39m[49m add notes  |  [0;1m[39m[49menter[0;2m[39m[49m submit answer  |  [0;1m[39m[49mesc[0;2m[39m[49m interrupt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

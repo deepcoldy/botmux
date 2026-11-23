@@ -25,17 +25,26 @@
  *   - TMUX_TMPDIR → a private existing directory, TMUX/TMUX_PANE dropped, and
  *     the tmux shim first on PATH that refuses any host socket (including the
  *     fleet's `-L botmux`); any refusal fails this run with exit 3;
- *   - unless --keep-user-bus: no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS,
- *     so `systemctl --user` / `busctl --user` cannot touch the real user
- *     manager (enable/stop units, stop a live session scope). botmux's own
- *     scope code sees BOTMUX_FENCED_RUN=1 (kept through strict envPolicy too)
- *     and uses only the bus variables it is given, never deriving
- *     /run/user/<uid>/bus (userSystemdBusEnv), so it takes the no-bus path too.
+ *   - the hc fence (test/helpers/hc-fence.ts): XDG_RUNTIME_DIR → a private
+ *     existing short directory, a unique HC_SESSION, XDG_STATE_HOME /
+ *     XDG_CONFIG_HOME under the temp home, no inherited HC_*, and `hc` /
+ *     `herdr-core` shims first on PATH (BOTMUX_HC_BIN names one) that refuse
+ *     the host's cores and run BOTMUX_HC_TEST_BIN; any refusal fails this run
+ *     with exit 3. Deleting XDG_RUNTIME_DIR instead would send hc to
+ *     /run/user/<uid>, onto the live core's socket;
+ *   - unless --keep-user-bus: no DBUS_SESSION_BUS_ADDRESS, and the only
+ *     XDG_RUNTIME_DIR is the hc fence's, which holds no bus, so
+ *     `systemctl --user` / `busctl --user` cannot touch the real user manager
+ *     (enable/stop units, stop a live session scope). botmux's own scope code
+ *     sees BOTMUX_FENCED_RUN=1 (kept through strict envPolicy too) and uses only
+ *     the bus variables it is given, never deriving /run/user/<uid>/bus
+ *     (userSystemdBusEnv), so it cannot reach the user manager either.
  *     With --keep-user-bus the child gets the invoker's bus variables, or the
- *     bus botmux would derive when the invoker exported none.
+ *     bus botmux would derive when the invoker exported none; the hc shim then
+ *     refuses every hc call, as XDG_RUNTIME_DIR is the host's again.
  *
  * Not covered: absolute paths the command hard-codes (e.g. /root/...), and
- * tmux invoked by absolute path. Pass paths through HOME in your probe.
+ * tmux or hc invoked by absolute path. Pass paths through HOME in your probe.
  */
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -43,11 +52,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fenceHomeRootedEnv } from '../test/helpers/fence-home-env.js';
 import {
+  applyHcFenceEnv,
+  createHcFence,
+  hcFenceDenialError,
+  readHcFenceDenials,
+  teardownHcFence,
+  type HcFence,
+} from '../test/helpers/hc-fence.js';
+import {
   applyTmuxFenceEnv,
   createTmuxFence,
   readTmuxFenceDenials,
   teardownTmuxFence,
   tmuxFenceDenialError,
+  type TmuxFence,
 } from '../test/helpers/tmux-fence.js';
 import { scrubSessionTurnMarkerEnv } from '../src/utils/child-env.js';
 import { userSystemdBusEnv } from '../src/core/session-scope.js';
@@ -68,14 +86,15 @@ export function parseFencedRunArgs(argv: readonly string[]): { keepUserBus: bool
 export function fencedRunEnv(
   base: NodeJS.ProcessEnv,
   home: string,
-  fence: ReturnType<typeof createTmuxFence>,
+  fences: { tmux: TmuxFence; hc: HcFence },
   opts: { keepUserBus: boolean; isBusSocket?: (path: string) => boolean },
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   env.HOME = home;
   if (process.platform === 'win32') env.USERPROFILE = home;
   fenceHomeRootedEnv(home, env);
-  applyTmuxFenceEnv(fence, env);
+  applyTmuxFenceEnv(fences.tmux, env);
+  applyHcFenceEnv(fences.hc, env, { home });
   // config.session.dataDir honours SESSION_DATA_DIR BEFORE the HOME-derived
   // fallback, so a redirected HOME alone does not keep a probe out of the live
   // fleet's data dir. BOTMUX_MOJO_WORKSPACE_ROOT is the same shape for mojo.
@@ -88,11 +107,14 @@ export function fencedRunEnv(
   // as this session even with a fenced HOME.
   scrubSessionTurnMarkerEnv(env);
   if (!opts.keepUserBus) {
-    delete env.XDG_RUNTIME_DIR;
     delete env.DBUS_SESSION_BUS_ADDRESS;
-  } else if (!env.XDG_RUNTIME_DIR && !env.DBUS_SESSION_BUS_ADDRESS) {
-    // Behind BOTMUX_FENCED_RUN botmux uses these variables as given and derives nothing.
-    Object.assign(env, userSystemdBusEnv({ env: base, isSocket: opts.isBusSocket }));
+  } else {
+    if (base.XDG_RUNTIME_DIR) env.XDG_RUNTIME_DIR = base.XDG_RUNTIME_DIR;
+    else delete env.XDG_RUNTIME_DIR;
+    if (!env.XDG_RUNTIME_DIR && !env.DBUS_SESSION_BUS_ADDRESS) {
+      // Behind BOTMUX_FENCED_RUN botmux uses these variables as given and derives nothing.
+      Object.assign(env, userSystemdBusEnv({ env: base, isSocket: opts.isBusSocket }));
+    }
   }
   env.BOTMUX_FENCED_RUN = '1';
   return env;
@@ -105,11 +127,11 @@ function main(): number {
     return 2;
   }
   const home = mkdtempSync(join(tmpdir(), 'bmx-fenced-home-'));
-  // Host socket dirs are detected from the INVOKING env, before it is fenced.
-  const fence = createTmuxFence(process.env);
+  // Host socket dirs / hc config are detected from the INVOKING env, before it is fenced.
+  const fences = { tmux: createTmuxFence(process.env), hc: createHcFence(process.env) };
   let status = 1;
   try {
-    const env = fencedRunEnv(process.env, home, fence, parsed);
+    const env = fencedRunEnv(process.env, home, fences, parsed);
     const [cmd, ...args] = parsed.command;
     const child = spawnSync(cmd!, args, { stdio: 'inherit', env });
     if (child.error) {
@@ -118,13 +140,19 @@ function main(): number {
     } else {
       status = child.status ?? 1;
     }
-    const denials = readTmuxFenceDenials(fence);
-    if (denials.length > 0) {
-      console.error(`fenced-run: ${tmuxFenceDenialError(denials).message}`);
+    const tmuxDenials = readTmuxFenceDenials(fences.tmux);
+    if (tmuxDenials.length > 0) {
+      console.error(`fenced-run: ${tmuxFenceDenialError(tmuxDenials).message}`);
+      status = FENCE_DENIED_EXIT;
+    }
+    const hcDenials = readHcFenceDenials(fences.hc);
+    if (hcDenials.length > 0) {
+      console.error(`fenced-run: ${hcFenceDenialError(hcDenials).message}`);
       status = FENCE_DENIED_EXIT;
     }
   } finally {
-    teardownTmuxFence(fence);
+    teardownTmuxFence(fences.tmux);
+    teardownHcFence(fences.hc);
     rmSync(home, { recursive: true, force: true });
   }
   return status;
