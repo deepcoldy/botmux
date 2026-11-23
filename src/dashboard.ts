@@ -2239,7 +2239,10 @@ let sourceReleaseBackup: string | null | undefined;
 const sourceReleaseInstall = new SourceReleaseInstall();
 
 function restoreSourceReleaseInstall(): void {
-  if (!isLocalDevInstall()) return;
+  if (!isLocalDevInstall()) {
+    sourceReleaseInstall.complete(process.execPath, isStandaloneBinary(), resolveCurrentVersion());
+    return;
+  }
   const installed = sourceReleaseInstall.recover(botmuxInstallRoot(), (target, version) => verifyBinaryRestartTarget({ target, version }));
   if (installed) {
     pendingBinaryRestart = { target: installed.target, version: installed.version };
@@ -5410,7 +5413,8 @@ const server = createServer(async (req, res) => {
               source = result.source;
             });
             pendingLocalDevRestart = undefined;
-            pendingBinaryRestart = { target: installed.target, version: installed.version };
+            pendingBinaryRestart = installed.state === 'completed' ? undefined : { target: installed.target, version: installed.version };
+            if (installed.state === 'completed') sourceReleaseBackup = undefined;
           }, { maxWaitMs: 2_000 });
         } catch (error) {
           if (!acquired && error instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
@@ -5427,7 +5431,9 @@ const server = createServer(async (req, res) => {
         if (blockedBySourceRelease) return jsonRes(res, 409, { ok: false, error: 'source_release_restart_required' });
         return jsonRes(res, 200, {
           ok: true, oldVersion, newVersion: sourceReleaseVersion, source,
-          changed: true, restartRequired: true, manager: 'binary', sourceReleaseInstalled: true,
+          changed: installed?.state !== 'completed', restartRequired: installed?.state !== 'completed',
+          manager: 'binary', sourceReleaseInstalled: true,
+          ...(installed?.state === 'completed' ? { sourceReleaseCompleted: true } : {}),
           backupLauncher: installed?.backupLauncher,
         });
       }
