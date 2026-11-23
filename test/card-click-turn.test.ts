@@ -128,6 +128,18 @@ describe('card click turn token', () => {
     }).ok).toBe(false);
   });
 
+  it.each([
+    'schedule:task_1:123e4567-e89b-42d3-a456-426614174000',
+    'om_root#model-123e4567-e89b-42d3-a456-426614174000',
+    'workflow-event:run.part_1:7',
+  ])('round-trips an editable response turn id: %s', turnId => {
+    const issued = issue({
+      chatId: undefined, sessionId: 'sess-id-1', workingDir: undefined, responseToTurnId: turnId,
+    });
+    expect(issued.claims.responseToTurnId).toBe(turnId);
+    expect(readCardClickTurnClaims(issued.payload, issued.sig, SECRET, NOW)).toMatchObject({ ok: true });
+  });
+
   it('builds a callback button that carries the signed payload', () => {
     const issued = issue();
     const card = buildCardClickTurnCard({

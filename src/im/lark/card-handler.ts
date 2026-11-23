@@ -2170,16 +2170,18 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       toast: { type: 'info', content: t('card.click_turn.pending', undefined, loc) },
       afterAck: () => accepted.run().then(async result => {
         const failed = result && typeof result === 'object' && 'ok' in result && result.ok === false;
+        const failureKey = failed && 'reason' in result && result.reason === 'expired'
+          ? 'card.click_turn.expired' : 'card.click_turn.delivery_failed';
         try {
           if (nextStep && accepted.anchorId) {
             // Stays in the session's own thread, like the reply it came from.
             const notice = failed
-              ? t('card.click_turn.delivery_failed', undefined, loc)
+              ? t(failureKey, undefined, loc)
               : t('card.next_step.started', { text: nextStepNoticeText(accepted.prompt ?? '') }, loc);
             await deps.sessionReply(accepted.anchorId, notice, 'text', larkAppId);
             return;
           }
-          const key = failed ? 'card.click_turn.delivery_failed' : 'card.click_turn.started';
+          const key = failed ? failureKey : 'card.click_turn.started';
           await sendMessage(larkAppId, accepted.chatId, t(key, undefined, loc), 'text');
         } catch (err) {
           logger.warn(`[card-click-turn] ${failed ? 'failure' : 'started'} notice failed: ${err instanceof Error ? err.message : String(err)}`);

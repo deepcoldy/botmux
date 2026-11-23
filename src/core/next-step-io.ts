@@ -1,7 +1,7 @@
 /** Production wiring for core/next-step-suggestion.ts. */
 import { isCodexFamilyCliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker } from '../types.js';
-import { isTurnOutcomeExcluded, turnFinalSummary } from './turn-outcome.js';
+import { isTurnOutcomeExcluded, turnFinalText } from './turn-outcome.js';
 import { getBot } from '../bot-registry.js';
 import { config } from '../config.js';
 import { localeForBot } from '../i18n/index.js';
@@ -43,7 +43,7 @@ export const nextStepIo: NextStepIo = {
       || ds.currentTurnId !== turnId || ds.session.status !== 'active'
       || ds.lastTurnTerminalTurnId !== turnId || ds.lastTurnTerminalStatus !== 'completed'
       || ds.lastTurnTerminalDispatchAttempt !== dispatchAttempt || isTurnOutcomeExcluded(ds, turnId)) return false;
-    const answer = turnFinalSummary(ds, turnId, config.session.dataDir);
+    const answer = turnFinalText(ds, turnId, config.session.dataDir);
     if (!answer) return false;
     const request: DaemonToWorker = {
       type: 'request_next_step', turnId, dispatchAttempt, answer,

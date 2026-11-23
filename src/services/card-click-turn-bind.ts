@@ -29,6 +29,7 @@ import { beginReplyTargetTurn } from '../core/reply-target.js';
 import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } from '../core/types.js';
 import { sessionPromptInjection } from '../core/prompt-injection.js';
 import { markSessionActivity } from '../core/session-activity.js';
+import { normalizeLastTurn } from '../core/session-task-status.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, rememberLastCliInput } from '../core/session-manager.js';
 import { forkWorker, getCurrentCliVersion, sendWorkerInput, withActiveSessionKeyLock } from '../core/worker-pool.js';
 import { ensureQueue } from './message-queue.js';
@@ -193,10 +194,30 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
 
   function nextStepCurrent(session: CardClickBoundSession, turnId: string): boolean {
     const ds = liveSession(session);
-    return deps.activeSessions.get(activeSessionKey(ds)) === ds
-      && ds.session.status === 'active' && ds.currentTurnId === turnId
-      && ds.lastTurnTerminalTurnId === turnId && ds.lastTurnTerminalStatus === 'completed'
-      && getBot(ds.larkAppId).config.replyCardNextStep === true;
+    if (deps.activeSessions.get(activeSessionKey(ds)) !== ds
+      || ds.session.status !== 'active'
+      || (ds.currentTurnId !== undefined && ds.currentTurnId !== turnId)
+      || getBot(ds.larkAppId).config.replyCardNextStep !== true) return false;
+    const delivered = normalizeLastTurn(ds.session.lastTurn);
+    const inputLineage = [ds.lastCliInputTurnId, ds.session.lastCliInputTurnId];
+    const routeLineage = [ds.currentReplyTarget?.turnId, ds.session.currentReplyTarget?.turnId];
+    if (inputLineage.some(candidate => candidate !== undefined && candidate !== turnId)
+      || routeLineage.some(candidate => candidate !== undefined && candidate !== turnId)) return false;
+    // Exact input/routing lineage wins because this turn's own activity stamp may
+    // be a few milliseconds later than startedAt. Without that lineage, use the
+    // timestamp only as a conservative fallback for a newer pending input.
+    const hasSameTurnLineage = inputLineage.includes(turnId) || routeLineage.includes(turnId);
+    const hasNewerActivity = delivered?.turnId === turnId && delivered.startedAt !== undefined
+      && !hasSameTurnLineage && ds.lastMessageAt > Math.max(delivered.startedAt, delivered.heldThrough ?? 0);
+    if (hasNewerActivity) return false;
+    const terminalKnown = ds.lastTurnTerminalTurnId !== undefined || ds.lastTurnTerminalStatus !== undefined;
+    const terminalCompleted = ds.lastTurnTerminalTurnId === turnId && ds.lastTurnTerminalStatus === 'completed';
+    if (terminalKnown && !terminalCompleted) return false;
+    if (terminalCompleted && ds.currentTurnId === turnId) return true;
+    // After a restart, a late matching terminal may arrive before currentTurnId
+    // is rebuilt. The durable result must include its dispatch timestamp so an
+    // outcome that settled after newer input cannot authorize the old button.
+    return delivered?.turnId === turnId && delivered.outcome === 'delivered' && delivered.startedAt !== undefined;
   }
 
   async function startTurn(
@@ -225,20 +246,36 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       quoteTargetSenderOpenId: ds.session.quoteTargetSenderOpenId,
       quoteTargetSenderIsBot: ds.session.quoteTargetSenderIsBot,
       lastCallerOpenId: ds.session.lastCallerOpenId,
-      replyTargets: ds.session.replyTargets ? structuredClone(ds.session.replyTargets) : undefined,
-      currentReplyTarget: ds.session.currentReplyTarget ? structuredClone(ds.session.currentReplyTarget) : undefined,
-      turnReplyContexts: ds.session.turnReplyContexts ? structuredClone(ds.session.turnReplyContexts) : undefined,
+      replyTarget: ds.session.replyTargets?.[turnId],
+      hadReplyTargets: ds.session.replyTargets !== undefined,
+      currentReplyTarget: ds.currentReplyTarget ? structuredClone(ds.currentReplyTarget) : undefined,
+      sessionCurrentReplyTarget: ds.session.currentReplyTarget ? structuredClone(ds.session.currentReplyTarget) : undefined,
+      turnReplyContext: ds.session.turnReplyContexts?.[turnId],
+      hadTurnReplyContexts: ds.session.turnReplyContexts !== undefined,
       activeInteractiveTurn: ds.activeInteractiveTurn,
     };
     const rollback = () => {
-      ds.session.quoteTargetId = prior.quoteTargetId;
-      ds.session.quoteTargetSenderOpenId = prior.quoteTargetSenderOpenId;
-      ds.session.quoteTargetSenderIsBot = prior.quoteTargetSenderIsBot;
-      ds.session.lastCallerOpenId = prior.lastCallerOpenId;
-      ds.session.replyTargets = prior.replyTargets;
-      ds.session.currentReplyTarget = prior.currentReplyTarget;
-      ds.session.turnReplyContexts = prior.turnReplyContexts;
-      ds.activeInteractiveTurn = prior.activeInteractiveTurn;
+      // Restore only state still owned by this cct turn. A different ingress may
+      // have taken over while identity preparation was awaiting external work.
+      if (ds.session.quoteTargetId === turnId) {
+        ds.session.quoteTargetId = prior.quoteTargetId;
+        ds.session.quoteTargetSenderOpenId = prior.quoteTargetSenderOpenId;
+        ds.session.quoteTargetSenderIsBot = prior.quoteTargetSenderIsBot;
+        ds.session.lastCallerOpenId = prior.lastCallerOpenId;
+      }
+      if (ds.session.replyTargets && (prior.replyTarget !== undefined || ds.session.replyTargets[turnId] !== undefined)) {
+        if (prior.replyTarget === undefined) delete ds.session.replyTargets[turnId];
+        else ds.session.replyTargets[turnId] = prior.replyTarget;
+        if (!prior.hadReplyTargets && Object.keys(ds.session.replyTargets).length === 0) ds.session.replyTargets = undefined;
+      }
+      if (ds.currentReplyTarget?.turnId === turnId) ds.currentReplyTarget = prior.currentReplyTarget;
+      if (ds.session.currentReplyTarget?.turnId === turnId) ds.session.currentReplyTarget = prior.sessionCurrentReplyTarget;
+      if (ds.session.turnReplyContexts && (prior.turnReplyContext !== undefined || ds.session.turnReplyContexts[turnId] !== undefined)) {
+        if (prior.turnReplyContext === undefined) delete ds.session.turnReplyContexts[turnId];
+        else ds.session.turnReplyContexts[turnId] = prior.turnReplyContext;
+        if (!prior.hadTurnReplyContexts && Object.keys(ds.session.turnReplyContexts).length === 0) ds.session.turnReplyContexts = undefined;
+      }
+      if (ds.activeInteractiveTurn?.turnId === turnId) ds.activeInteractiveTurn = prior.activeInteractiveTurn;
       try { sessionStore.updateSession(ds.session); } catch (err) {
         logger.warn(`[card-click-turn] rollback persist failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -284,7 +321,8 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     // we wait, and its routing state must never be replaced by our rollback.
     const mayRollback = () => args.responseToTurnId === undefined
       || (deps.activeSessions.get(activeSessionKey(ds)) === ds
-        && ds.session.status === 'active' && ds.currentTurnId === args.responseToTurnId);
+        && ds.session.status === 'active'
+        && (ds.currentTurnId === undefined || ds.currentTurnId === args.responseToTurnId));
     try {
       await deps.noteTurnReceived(ds, turnId, args.prompt, sender, turnId);
     } catch (err) {

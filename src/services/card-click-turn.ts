@@ -25,7 +25,9 @@ export const CARD_CLICK_TURN_MAX_WORKING_DIR_CHARS = 1024;
 
 const CHAT_ID_RE = /^oc_[A-Za-z0-9]+$/;
 const SESSION_ID_RE = /^[A-Za-z0-9-]{8,80}$/;
-const TURN_ID_RE = /^[A-Za-z0-9_-]{1,160}$/;
+// Real turn ids also include schedule:/workflow-event: prefixes, continuation
+// suffixes such as #model-*, and run ids containing dots.
+const TURN_ID_RE = /^[A-Za-z0-9_.:#-]{1,160}$/;
 const NONCE_RE = /^[A-Za-z0-9_-]{16,80}$/;
 const APP_ID_RE = /^[A-Za-z0-9_]{4,64}$/;
 
