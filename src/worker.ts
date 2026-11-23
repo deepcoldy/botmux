@@ -7156,7 +7156,13 @@ async function preflightTraexAutoModelBeforeSpawn(
 
   const startedAtMs = Date.now();
   let snapshot: TraexModelLoadSnapshot | null = null;
-  const ownerTurnId = cfg.turnId ?? controller.currentTurnId();
+  // 重启时 cfg 仍携带创建会话的首轮 ID；commitSwitch 已将控制器推进到当前回合。
+  // 预检围栏、目录清理和候选重选必须共用当前归属，避免误判 superseded 或退回首轮。
+  const ownerTurnId = controller.currentTurnId() ?? cfg.turnId;
+  // 后续回合的派发次数取自保留的排队项，不能继承首轮的 attempt。
+  const ownerInput = pendingMessages.find(item => item.turnId === ownerTurnId);
+  const ownerDispatchAttempt = ownerInput ? ownerInput.dispatchAttempt
+    : ownerTurnId === cfg.turnId ? cfg.dispatchAttempt : undefined;
   const current = () => options.spawnGeneration === cliSpawnGeneration && controller === traexAutoModelController
     && (!ownerTurnId || !controller.recoveryStopped(ownerTurnId))
     && (controller.currentTurnId() === ownerTurnId || (ownerTurnId !== undefined && controller.currentTurnId() === undefined));
@@ -7178,13 +7184,13 @@ async function preflightTraexAutoModelBeforeSpawn(
         || controller.awaitingModelActivity() || controller.capacityCurrentlyBlocking());
     const token = { controller, generation: options.spawnGeneration, turnId: ownerTurnId };
     traexCatalogRetryPending = token;
-    send({ type: 'user_notify', ...(cfg.turnId ? { turnId: cfg.turnId } : {}),
+    send({ type: 'user_notify', ...(ownerTurnId ? { turnId: ownerTurnId } : {}),
       message: t('worker.traex_auto_model.catalog_query_retry') });
     void readTraexCatalogWithRetry({ read, isCurrent: stillNeeded, firstReadFailed: true })
       .then(async result => {
         if (!stillNeeded()) return;
         if (result) {
-          if (!await reconcileTraexModelCatalog(result, controller, cfg, stillNeeded, ownerTurnId, cfg.dispatchAttempt)) return;
+          if (!await reconcileTraexModelCatalog(result, controller, cfg, stillNeeded, ownerTurnId, ownerDispatchAttempt)) return;
           rememberTraexModelLoadSnapshot(result);
           if (ownerTurnId && controller.capacityCurrentlyBlocking()) {
             const choice = controller.resolveModelLoads(ownerTurnId, result.loads);
@@ -7202,12 +7208,12 @@ async function preflightTraexAutoModelBeforeSpawn(
       });
     return;
   }
-  if (!await reconcileTraexModelCatalog(snapshot, controller, cfg, current, cfg.turnId, cfg.dispatchAttempt)) {
+  if (!await reconcileTraexModelCatalog(snapshot, controller, cfg, current, ownerTurnId, ownerDispatchAttempt)) {
     if (cfg.traexAutoModel?.catalogUnavailable) throw new Error(t('worker.traex_auto_model.catalog_empty'));
     throw new CliSpawnSupersededError();
   }
   rememberTraexModelLoadSnapshot(snapshot);
-  const catalogChoice = controller.catalogAdmissionDecision(cfg.turnId ?? `catalog-${options.spawnGeneration}`);
+  const catalogChoice = controller.catalogAdmissionDecision(ownerTurnId ?? `catalog-${options.spawnGeneration}`);
   if (catalogChoice.kind === 'exhausted') throw new Error(t('worker.traex_auto_model.catalog_empty'));
   if (catalogChoice.kind === 'switch') {
     controller.commitSwitch(catalogChoice);

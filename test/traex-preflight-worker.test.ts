@@ -14,6 +14,7 @@ function coldStartPreflight(controller: TraexAutoModelController, loads = new Ma
   const scope: Record<string, any> = {
     traexAutoModelController: controller,
     lastInitConfig: cfg,
+    pendingMessages: [],
     cliSpawnGeneration: 1, CliSpawnSupersededError,
     traexAutoModelRuntimeEligible: () => true,
     traexAutoModelPreflightEnabled,
@@ -154,5 +155,70 @@ describe('TraeX Worker independent-turn preflight seams', () => {
     expect(scope.pendingMessages).toEqual([item]);
     expect(controller.currentModel()).toBe('backup');
     expect(scope.flushPending).not.toHaveBeenCalled();
+  });
+
+  it('keeps a restart on the controller turn when the init config still carries the first turn', async () => {
+    const controller = preflightController();
+    controller.beginTurn('init-turn');
+    const decision = controller.preflightDecision('next', new Map([['core', 101], ['backup', 100]]));
+    expect(decision.kind).toBe('switch');
+    expect(controller.commitSwitch(decision as any)).toBe(true);
+    expect(controller.currentTurnId()).toBe('next');
+
+    const { cfg, run } = coldStartPreflight(controller, new Map([['core', 101], ['backup', 100]]));
+    // The restart spawn is built from the init config: it has no prompt and its
+    // turnId is still the message that created the session.
+    cfg.prompt = '';
+    cfg.turnId = 'init-turn';
+
+    await expect(run()).resolves.toBeUndefined();
+  });
+
+  it.each([
+    { available: 'backup', attempt: undefined, retry: false },
+    { available: 'backup', attempt: 2, retry: false },
+    { available: 'core', attempt: undefined, retry: false },
+    { available: 'backup', attempt: 2, retry: true },
+  ])('attributes restart catalog maintenance to the current turn (available=$available, attempt=$attempt, retry=$retry)', async ({ available, attempt, retry }) => {
+    const controller = preflightController();
+    controller.beginTurn('init-turn');
+    const decision = controller.preflightDecision('next', new Map([['core', 101], ['backup', 100]]));
+    if (decision.kind !== 'switch') throw new Error('Expected a model switch');
+    expect(controller.commitSwitch(decision)).toBe(true);
+    const { cfg, scope, run } = coldStartPreflight(controller);
+    Object.assign(cfg, { prompt: '', turnId: 'init-turn', dispatchAttempt: 1, model: 'backup',
+      traexAutoModel: controller.config });
+    scope.pendingMessages = [{ content: 'next request', turnId: 'next', dispatchAttempt: attempt }];
+    scope.pendingTraexModelPoolPrunes = new Map();
+    scope.randomUUID = () => 'restart-prune';
+    scope.send = vi.fn();
+    scope.t = (key: string) => key;
+    scope.readTraexModelLoadSnapshot.mockResolvedValue({ loads: new Map([[available, 10]]),
+      reasoningEfforts: new Map(), catalogModels: new Set([available]) });
+    scope.process = { send: vi.fn((message: any) => {
+      const pending = scope.pendingTraexModelPoolPrunes.get(message.requestId);
+      clearTimeout(pending.timeout);
+      scope.pendingTraexModelPoolPrunes.delete(message.requestId);
+      pending.resolve({ status: 'applied', removedModels: controller.config.models.filter(model => model !== available),
+        config: { ...controller.config, models: [available] } });
+    }) };
+
+    if (retry) {
+      vi.useFakeTimers();
+      scope.readTraexModelLoadSnapshot.mockResolvedValueOnce(null);
+    }
+    try {
+      await expect(run()).resolves.toBeUndefined();
+      if (retry) await vi.advanceTimersByTimeAsync(30_000);
+      expect(scope.process.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        type: 'traex_model_pool_prune', turnId: 'next',
+        ...(attempt === undefined ? {} : { dispatchAttempt: attempt }),
+      }));
+      expect(scope.process.send.mock.calls[0][0].dispatchAttempt).toBe(attempt);
+      expect(controller.currentTurnId()).toBe('next');
+      expect(controller.currentModel()).toBe(available);
+    } finally {
+      if (retry) { vi.clearAllTimers(); vi.useRealTimers(); }
+    }
   });
 });
