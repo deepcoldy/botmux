@@ -2444,9 +2444,9 @@ export interface BotConfig {
    */
   replyCardActions?: boolean;
   /**
-   * Per-bot opt-in for the「下一步」row: the CLI's own next-input suggestion
-   * (Claude Code's greyed-out prompt suggestion) as a button above the last
-   * reply card's footer. Default (undefined) keeps reply cards unchanged.
+   * Per-bot opt-in for the「下一步」row above the last reply card's footer.
+   * Claude Code uses its native prompt suggestion. Codex generates a draft
+   * after replying that the user can edit and confirm. Off by default.
    */
   replyCardNextStep?: boolean;
   /**

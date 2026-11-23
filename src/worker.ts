@@ -68,7 +68,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, rmSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -445,6 +445,7 @@ import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
   generateCodexAppThreadTitle,
+  generateCodexAppNextStep,
   readCodexAppThreadMetadata,
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
@@ -710,6 +711,7 @@ import {
   prepareCredentialOnlyRelayOutbox,
   attachCredentialOnlyRelayOutbox,
   probeHostCredentialIsolationMechanism,
+  prepareSandboxRelayOutbox,
   attachSandboxOutbox,
   sandboxTreeSurvivesWorkerExit,
   startOutboxWatcher,
@@ -23571,7 +23573,10 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
     effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
   })) return;
 
+  // Fence on this spawn, not on getChildPid(): on Herdr/ZMX it aliases the
+  // cliPid that launch-layer resolution rewires to Cursor itself mid-poll.
   const backendAtSpawn = backend;
+  const generationAtSpawn = cliSpawnGeneration;
   let attempts = 0;
   const maxAttempts = 60; // Cursor may open store.db only after its startup render settles.
   const tick = () => {
@@ -23580,11 +23585,14 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
       effectiveResume: lastSpawnEffectiveResume,
       effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
     })) return;
-    if (backend !== backendAtSpawn) return;
-    const currentPid = backend.getChildPid?.();
-    if (currentPid && currentPid !== pid) return;
+    if (backend !== backendAtSpawn || cliSpawnGeneration !== generationAtSpawn) return;
 
-    const realPid = findLaunchedCliPid(pid, 'cursor') ?? pid;
+    // `pid` can be a launch layer (session-scope sh, status relay) that stays
+    // Cursor's parent, and Cursor's comm (`MainThread`/`node`) is no Cursor
+    // name, so a comm search from it finds nothing and probing it finds no
+    // store.db. Probe the pid the transcript bridge uses: launch-layer
+    // resolution rewires backend.cliPid to the payload.
+    const realPid = currentCursorObservedPid() ?? pid;
     const chatId = findCursorChatIdByPid(realPid);
     if (chatId) {
       if (!shouldPersistObservedCursorChatId({
@@ -29396,14 +29404,22 @@ async function spawnCliBody(
     // provisions a fresh tree and bind. The probes below never create anything.
     const paneRelayBoundByInode = process.platform === 'linux'
       && (sandboxRequested || credentialOnlyBwrap);
+    // A full macOS oncall pane also requires a host relay. Unlike bwrap it does
+    // not bind the directory by inode, but a legacy live pane has no
+    // BOTMUX_SEND_RELAY in its frozen environment, so creating a directory on
+    // reattach cannot upgrade it. Missing relay therefore forces one cold spawn.
+    const paneRequiresSeatbeltRelay = process.platform === 'darwin'
+      && sandboxRequested && !scratchRequested;
     // The live pane runs against the tree of the flavour it was spawned with.
     // A policy flip that keeps the same isolation capabilities (oncall ↔
     // scratch) must not reattach it under the other flavour's arm.
     const recordedTreeFlavour = paneRelayBoundByInode
       ? recordedSandboxTreeFlavour(cfg.sessionId, isolationRuntimeDataDir)
       : null;
-    const paneRelayReattachable = !paneRelayBoundByInode
-      || (recordedTreeFlavour === requestedTreeFlavour && (scratchRequested
+    const paneRelayReattachable = (!paneRelayBoundByInode && !paneRequiresSeatbeltRelay)
+      || (paneRequiresSeatbeltRelay
+        ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir }) !== null
+        : recordedTreeFlavour === requestedTreeFlavour && (scratchRequested
         ? attachScratchSession({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
         : sandboxRequested
           ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
@@ -31347,21 +31363,22 @@ async function spawnCliBody(
       resolvedBin: canonical(cliAdapter.resolvedBin),
     }).map(canonical);
 
-    // Relay outbox (in the policy so the compiled plan grants it read-write).
-    // Linux: always (created by prepareDirectSandbox, bound into bwrap).
-    // macOS: only when the bot withholds its app secret from the sandbox — the
-    // Seatbelt pane then has no credential to call Lark with, so send / history /
-    // quoted go through this outbox like they do on Linux.
-    const darwinRelayOutbox = process.platform === 'darwin' && cfg.sandboxWithholdBotSecret === true;
-    const outbox = process.platform === 'linux' || darwinRelayOutbox
-      ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
-      : undefined;
-    // macOS has no prepareDirectSandbox: create the outbox here, before the
-    // policy drops grants for paths that do not exist. A warm reattach must
-    // reuse the pane's existing directory (checked below), never make one.
-    if (darwinRelayOutbox && outbox && !willReattachPersistent) {
-      mkdirSync(outbox, { recursive: true, mode: 0o700 });
+    // Seatbelt also needs host-side send: its confined CLI cannot execute the
+    // system ps used to acquire feedback send leases, even with bot credentials.
+    const seatbeltRelay = process.platform === 'darwin'
+      ? (willReattachPersistent
+          ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir })
+          : prepareSandboxRelayOutbox({ sessionId: cfg.sessionId, dataDir }))
+      : null;
+    if (process.platform === 'darwin' && !seatbeltRelay) {
+      throw new Error(
+        `[file-sandbox] refusing to start session ${cfg.sessionId}: Seatbelt relay outbox is unavailable`,
+      );
     }
+    if (seatbeltRelay) childEnv.BOTMUX_SEND_RELAY = seatbeltRelay.outbox;
+    const outbox = process.platform === 'linux'
+      ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
+      : seatbeltRelay?.outbox;
     // Pre-create the outbox BEFORE buildFsPolicy so it survives the allow-rule
     // existence-filter below (a not-yet-existing readWrite path is dropped, and
     // bwrap can't bind a missing source → the sandboxed `botmux send` relay
@@ -31893,8 +31910,7 @@ async function spawnCliBody(
           throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: relay outbox ${outbox} is missing`);
         }
         if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-        const sessionTree = dirname(outbox);
-        sandboxCleanup = () => { rmSync(sessionTree, { recursive: true, force: true }); };
+        sandboxCleanup = seatbeltRelay!.cleanup;
         sandboxRelayOutbox = outbox;
         sandboxStopWatcher = startOutboxWatcher(
           outbox,
@@ -31902,8 +31918,8 @@ async function spawnCliBody(
           cfg.sessionId,
           { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
         );
-        publishSandboxRelayCapability();
-        log(`[file-sandbox] bot secret withheld from the sandbox; send/history/quoted relay via outbox=${outbox}`);
+        publishSandboxRelayCapability({ failClosed: true });
+        log(`[file-sandbox] host send relay via outbox=${outbox}`);
       }
     } else if (willReattachPersistent) {
       // Warm reattach (daemon restart / transfer) to a live bwrap'd pane:
@@ -40212,10 +40228,43 @@ function seedInitTurnTerminals(msg: Extract<DaemonToWorker, { type: 'init' }>): 
   }
 }
 
+let nextStepGeneration: AbortController | undefined;
+
 async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Promise<void> {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'request_next_step': {
+      const cfg = lastInitConfig;
+      if (!cfg || !isCodexFamilyCliId(cfg.cliId)) break;
+      const abortController = new AbortController();
+      nextStepGeneration?.abort();
+      nextStepGeneration = abortController;
+      nativeSessionTitleSyncAbortControllers.add(abortController);
+      try {
+        const adapter = createCliAdapterSync('codex', cfg.cliPathOverride);
+        const text = await generateCodexAppNextStep({
+          answer: msg.answer,
+          userPrompt: msg.userPrompt,
+          codexBin: adapter.resolvedBin,
+          env: codexNativeTitleEnv(cfg),
+          model: cfg.model,
+          timeoutMs: 15_000,
+          signal: abortController.signal,
+          detached: true,
+          registerForceClose: registerNativeTitleForceClose,
+        });
+        if (text && !abortController.signal.aborted && lastInitConfig === cfg) {
+          send({ type: 'prompt_suggestion', turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, text, editable: true });
+        }
+      } catch {
+        // Optional UI: a launcher or subprocess failure cannot fail the reply.
+      } finally {
+        nativeSessionTitleSyncAbortControllers.delete(abortController);
+        if (nextStepGeneration === abortController) nextStepGeneration = undefined;
+      }
+      break;
+    }
     case 'traex_model_pool_prune_result': {
       const pending = pendingTraexModelPoolPrunes.get(msg.requestId);
       if (!pending) break;
@@ -42609,7 +42658,7 @@ process.on('message', (raw: unknown, handle: unknown) => {
   }
   // Input for the CLI first gets the terminal's focus back (if botmux had
   // reported it away for an away summary), except for a deferred auto-compact.
-  restoreFocusForDaemonMessage(msg);
+  if (msg.type !== 'request_next_step') restoreFocusForDaemonMessage(msg);
   const execution = msg.sessionCommand?.execution;
   if (execution) workerSessionEventScope?.rememberExecution(execution);
   if (binding && workerSessionEventScope && msg.type !== 'init') return workerSessionEventScope.run(binding, () => handleContractDaemonMessage(msg, handle), execution, msg.sessionCommand?.operationId);

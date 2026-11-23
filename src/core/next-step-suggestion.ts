@@ -39,7 +39,8 @@ export interface NextStepIo {
   enabled(ds: DaemonSession): boolean;
   locale(ds: DaemonSession): 'zh' | 'en';
   /** Signed card-click token that sends `prompt` to this session. */
-  issue(ds: DaemonSession, prompt: string): { payload: string; sig: string } | undefined;
+  issue(ds: DaemonSession, prompt: string, responseToTurnId?: string): { payload: string; sig: string } | undefined;
+  requestSuggestion?(ds: DaemonSession, turnId: string, dispatchAttempt?: number): boolean;
   /** The sent card's current JSON (user_card_content), or undefined. */
   readCard(ds: DaemonSession, messageId: string): Promise<string | undefined>;
   cardId(ds: DaemonSession, messageId: string): Promise<string>;
@@ -75,7 +76,8 @@ interface State {
   turnId?: string;
   /** That turn's last card, once settled. */
   card?: NextStepCard;
-  suggestion?: { turnId: string; text: string };
+  suggestion?: { turnId: string; text: string; editable: boolean };
+  requestedTurnId?: string;
   /** The row this module may have put on a card and not removed yet. */
   shown?: Shown;
   leftovers: Leftover[];
@@ -129,7 +131,7 @@ export function noteNextStepTurnStarted(ds: DaemonSession, turnId: string, io: N
   if (state.shown || state.leftovers.length) reconcile(ds, io);
 }
 
-export function noteNextStepCard(ds: DaemonSession, turnId: string, card: NextStepCard, io: NextStepIo): void {
+export function noteNextStepCard(ds: DaemonSession, turnId: string, card: NextStepCard, io: NextStepIo, dispatchAttempt?: number): void {
   const state = stateFor(ds);
   const latest = latestTurn(ds, state);
   if (latest !== undefined && latest !== turnId) {
@@ -138,10 +140,34 @@ export function noteNextStepCard(ds: DaemonSession, turnId: string, card: NextSt
   }
   state.turnId = turnId;
   state.card = card;
+  if (io.enabled(ds) && state.requestedTurnId !== turnId
+    && io.requestSuggestion?.(ds, turnId, dispatchAttempt)) {
+    state.requestedTurnId = turnId;
+  }
   reconcile(ds, io);
 }
 
-export function noteNextStepSuggestion(ds: DaemonSession, turnId: string | undefined, text: string, io: NextStepIo): void {
+/** Daemon-side staleness gate for a worker-generated editable suggestion.
+ * The producing turn must still be the session's current turn, whose latest
+ * terminal is a completed one for the same turn and dispatch attempt.
+ * CLI-native (non-editable) suggestions bypass it: their own latest-turn check
+ * in noteNextStepSuggestion is the contract for that path. */
+export function editableSuggestionIsCurrent(
+  facts: {
+    currentTurnId?: string;
+    lastTurnTerminalTurnId?: string;
+    lastTurnTerminalStatus?: string;
+    lastTurnTerminalDispatchAttempt?: number;
+  },
+  msg: { turnId?: string; dispatchAttempt?: number },
+): boolean {
+  return facts.currentTurnId === msg.turnId
+    && facts.lastTurnTerminalStatus === 'completed'
+    && facts.lastTurnTerminalTurnId === msg.turnId
+    && facts.lastTurnTerminalDispatchAttempt === msg.dispatchAttempt;
+}
+
+export function noteNextStepSuggestion(ds: DaemonSession, turnId: string | undefined, text: string, io: NextStepIo, editable = false): void {
   const trimmed = text.trim();
   if (!turnId || !trimmed) return;
   const state = stateFor(ds);
@@ -150,9 +176,9 @@ export function noteNextStepSuggestion(ds: DaemonSession, turnId: string | undef
     io.info?.(`${tag(ds)}: suggestion of ${short(turnId)} ignored: the session's latest turn is ${short(latest)}`);
     return;
   }
-  if (state.suggestion?.turnId === turnId && state.suggestion.text === trimmed) return;
+  if (state.suggestion?.turnId === turnId && state.suggestion.text === trimmed && state.suggestion.editable === editable) return;
   state.turnId = turnId;
-  state.suggestion = { turnId, text: trimmed };
+  state.suggestion = { turnId, text: trimmed, editable };
   reconcile(ds, io);
 }
 
@@ -221,12 +247,13 @@ async function apply(ds: DaemonSession, state: State, io: NextStepIo): Promise<v
   }
   if (!desired || !card || turnId === undefined) return;
   if (state.shown?.confirmed && state.shown.text === desired) return;
-  const token = io.issue(ds, desired);
+  const editable = state.suggestion?.editable === true;
+  const token = editable ? io.issue(ds, desired, turnId) : io.issue(ds, desired);
   if (!token) {
     io.warn(`${tag(ds)}: no button token for ${short(turnId)}; row not shown`);
     return;
   }
-  const next: NextStepButton = { text: desired, ...token };
+  const next: NextStepButton = { text: desired, ...token, ...(editable ? { editable: true } : {}) };
   if (card.kind === 'unified') {
     // Recorded before the write: the record may be persisted (and replayed by
     // recovery) even when its PATCH fails, so the next turn must clear it.

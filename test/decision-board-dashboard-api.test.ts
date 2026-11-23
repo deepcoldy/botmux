@@ -136,6 +136,17 @@ describe('handleDecisionBoardApi', () => {
     expect(JSON.parse(String(local.calls[0].init.body)).submitter).toBe('local');
   });
 
+  it('存草稿时页面带的 askKey（写给哪一轮拍板）原样转给 daemon，迟到的保存才拦得住', async () => {
+    const d = deps();
+    await call('PUT', '/api/decision-board/cli_s/items/3/draft', d.deps, { text: 't', fileIds: [], baseRev: 2, askKey: '0123456789ab' });
+    expect(JSON.parse(String(d.calls[0].init.body))).toEqual({ author: 'owner', text: 't', fileIds: [], baseRev: 2, askKey: '0123456789ab' });
+    await call('PUT', '/api/decision-board/cli_s/items/3/draft', d.deps, { text: 't', fileIds: [], baseRev: 2, askKey: '' });
+    expect(JSON.parse(String(d.calls[1].init.body)).askKey).toBe('');
+    // 「只收进历史、不存成草稿」也要转过去，否则 daemon 会把迟到的图存成草稿、顶掉别的标签页的那份。
+    await call('PUT', '/api/decision-board/cli_s/items/3/draft', d.deps, { text: '', fileIds: ['f1'], baseRev: 2, askKey: '0123456789ab', archive: true });
+    expect(JSON.parse(String(d.calls[2].init.body))).toMatchObject({ archive: true, fileIds: ['f1'] });
+  });
+
   it('写入要求 JSON 请求体；未知 bot 404', async () => {
     const d = deps();
     expect((await call('POST', '/api/decision-board/cli_s/submit', d.deps, { nonce: 'n' }, 'text/plain')).out.status).toBe(400);

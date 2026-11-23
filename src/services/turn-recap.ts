@@ -86,10 +86,9 @@ function prose(text: string): string {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-
-/** Markdown for the panel body: the CLI's recap and where it came from, or
- * undefined when there is no recap text. */
-export function renderRecapMarkdown(recap: string | undefined, locale?: 'zh' | 'en'): string | undefined {
+/** Markdown for the panel body: the CLI's recap alone, or undefined when
+ * there is no recap text. */
+export function renderRecapMarkdown(recap: string | undefined): string | undefined {
   if (!recap?.trim()) return undefined;
-  return `${prose(recap)}\n\n<font color='grey'>${locale === 'en' ? 'Recap written by the CLI' : '来自 CLI 自带的离开总结'}</font>`;
+  return prose(recap);
 }

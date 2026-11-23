@@ -5,6 +5,7 @@ import { join } from 'node:path';
 
 import {
   mapPidNamespacePeerToHost,
+  resolveNamespaceLocalPid,
   resolvePidNamespaceRoot,
 } from '../src/core/pid-namespace-peer.js';
 
@@ -93,5 +94,41 @@ describe('PID namespace peer translation', () => {
     expect(resolvePidNamespaceRoot(parent, procRoot)).toEqual({ pid: 200, procStart: '1000' });
     writeFileSync(join(procRoot, String(parent), 'task', String(parent), 'children'), '200 201\n');
     expect(resolvePidNamespaceRoot(parent, procRoot)).toBeNull();
+  });
+
+  it('resolves a pid reported from inside a session PID namespace to its host pid', () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'botmux-pid-namespace-local-'));
+    roots.push(procRoot);
+    processFixture(procRoot, 200, '1000', [200], 'pid:[host]');
+    processFixture(procRoot, 250, '1500', [250, 1], 'pid:[sandbox]', 200);
+    processFixture(procRoot, 321, '2000', [321, 1200], 'pid:[sandbox]', 250);
+    processFixture(procRoot, 400, '3000', [400], 'pid:[host]', 200);
+    processFixture(procRoot, 1200, '4000', [1200], 'pid:[host]');
+
+    expect(resolveNamespaceLocalPid(1200, [200], procRoot)).toBe(321);
+    expect(resolveNamespaceLocalPid(400, [undefined, 200], procRoot)).toBe(400);
+  });
+
+  it('fails closed outside the session lineage or when the local pid is ambiguous', () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'botmux-pid-namespace-local-'));
+    roots.push(procRoot);
+    processFixture(procRoot, 200, '1000', [200], 'pid:[host]');
+    processFixture(procRoot, 321, '2000', [321, 18], 'pid:[a]', 200);
+    processFixture(procRoot, 322, '2000', [322, 18], 'pid:[b]', 200);
+    processFixture(procRoot, 500, '3000', [500, 19], 'pid:[c]');
+
+    expect(resolveNamespaceLocalPid(18, [200], procRoot)).toBeNull();
+    expect(resolveNamespaceLocalPid(19, [200], procRoot)).toBeNull();
+    expect(resolveNamespaceLocalPid(19, [], procRoot)).toBeNull();
+    expect(resolveNamespaceLocalPid(18, [200], join(procRoot, 'missing'))).toBeNull();
+  });
+
+  it('ignores procfs entries whose NSpid host column does not name the directory pid', () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'botmux-pid-namespace-local-'));
+    roots.push(procRoot);
+    processFixture(procRoot, 200, '1000', [200], 'pid:[host]');
+    // A foreign or malformed procfs: directory 321 claims a host-column pid 999.
+    processFixture(procRoot, 321, '2000', [999, 1200], 'pid:[sandbox]', 200);
+    expect(resolveNamespaceLocalPid(1200, [200], procRoot)).toBeNull();
   });
 });

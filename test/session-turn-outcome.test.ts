@@ -40,7 +40,9 @@ import {
   noteTurnStarted,
   readFinalSendPreview,
   recordTurnOutcome,
+  turnFinalText,
 } from '../src/core/turn-outcome.js';
+import { nextStepIo } from '../src/core/next-step-io.js';
 import { messages as zhMessages } from '../src/i18n/zh.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { onSessionTaskEvent, type SessionTaskEvent } from '../src/core/session-task-events.js';
@@ -168,10 +170,11 @@ describe('recordTurnOutcome', () => {
     mkdirSync(join(dataDir, 'turn-sends'), { recursive: true });
     writeFileSync(join(dataDir, 'turn-sends', 's-preview.jsonl'), [
       JSON.stringify({ turnId: 't1', responseKind: 'progress', previewText: '进度' }),
-      JSON.stringify({ turnId: 't1', responseKind: 'final', previewText: '**结论**：可以合入' }),
+      JSON.stringify({ turnId: 't1', responseKind: 'final', previewText: '**结论**：可以合入\nLinux 分片仍失败' }),
       JSON.stringify({ turnId: 't0', responseKind: 'final', previewText: '上一轮' }),
       '{"turnId":"t1","respo',
     ].join('\n'));
+    expect(turnFinalText(ds, 't1', dataDir)).toBe('**结论**：可以合入\nLinux 分片仍失败');
     expect(readFinalSendPreview(dataDir, 's-preview', 't1')).toBe('结论：可以合入');
     expect(readFinalSendPreview(dataDir, 's-preview', 't9')).toBeUndefined();
     expect(readFinalSendPreview(dataDir, 's-missing', 't1')).toBeUndefined();
@@ -179,6 +182,22 @@ describe('recordTurnOutcome', () => {
       recoveryHandled: false, isFinalDelivered: () => true, now, dataDir,
     });
     expect(lastTurn?.summary).toBe('结论：可以合入');
+  });
+
+  it('passes the delivered multiline reply to Codex next-step generation', () => {
+    const turnId = 'om_next_context';
+    const ds = makeDs('s-next-context');
+    const send = vi.fn(() => true);
+    Object.assign(ds, {
+      initConfig: { cliId: 'codex' }, worker: { connected: true, send }, currentTurnId: turnId,
+      lastTurnTerminalTurnId: turnId, lastTurnTerminalDispatchAttempt: 3, lastTurnTerminalStatus: 'completed',
+    });
+    const answer = '已完成。\nLinux 分片仍失败。\n请先查看失败日志。';
+    noteFinalReplyText(ds, turnId, answer);
+    expect(nextStepIo.requestSuggestion?.(ds, turnId, 3)).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    const [request] = send.mock.calls[0] as unknown as [Record<string, unknown>];
+    expect(request).toMatchObject({ type: 'request_next_step', turnId, dispatchAttempt: 3, answer });
   });
 
   it('a completed turn whose only final is the empty-completion diagnostic is not delivered', async () => {

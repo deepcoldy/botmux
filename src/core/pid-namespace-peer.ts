@@ -116,3 +116,29 @@ export function mapPidNamespacePeerToHost(input: {
   }
   return matches.length === 1 ? matches[0]! : null;
 }
+
+/** Host pid of a process that reported `localPid` from its own (possibly
+ * nested) PID namespace, e.g. `process.pid` inside bwrap --unshare-pid. Only
+ * descendants of the session's host roots count, and the innermost NSpid
+ * column must match exactly once; outside a PID namespace that is the pid
+ * itself. Null when unprovable (no procfs, not a descendant, ambiguous). */
+export function resolveNamespaceLocalPid(
+  localPid: number,
+  rootPids: ReadonlyArray<number | undefined>,
+  procRoot = '/proc',
+): number | null {
+  const roots = rootPids.filter((pid): pid is number => Number.isSafeInteger(pid) && pid! > 1);
+  if (!Number.isSafeInteger(localPid) || localPid <= 1 || roots.length === 0) return null;
+  let entries: string[];
+  try {
+    entries = readdirSync(procRoot);
+  } catch {
+    return null;
+  }
+  const matches = entries.filter(entry => /^\d+$/.test(entry)).map(Number).filter((pid) => {
+    const nspids = namespacePids(pid, procRoot);
+    return nspids?.[0] === pid && nspids.at(-1) === localPid
+      && roots.some(root => descendsFrom(pid, root, procRoot));
+  });
+  return matches.length === 1 ? matches[0]! : null;
+}
