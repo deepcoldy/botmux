@@ -85,3 +85,45 @@ describe('a restart receipt from a callback the relay superseded', () => {
     expect(run.sent.map(entry => entry.msg.type)).toEqual(['prompt_ready', 'restart_result']);
   });
 });
+
+/**
+ * Call-site wiring for the receipt's envelope. settle() hands the receipt to the
+ * real send() without an explicit origin, so the re-scope actually happens here,
+ * in sessionEventMetadata — a helper-only test cannot see it, and deleting the
+ * restart_result branch there silently resurrects the retired-binding timeout.
+ */
+describe('sessionEventMetadata stamps the receipt with the live origin', () => {
+  const receipt = { type: 'restart_result', attemptId: ATTEMPT, status: 'succeeded', category: 'prompt_ready' } as never;
+
+  it('names the live binding and its runtime when the callback captured the retired one', () => {
+    const { scope, launcher, live } = relayRebound();
+    const metadata = loadWorkerFunction<(msg: never) => { sessionContract: { bindingId?: string; scope: { runtime?: unknown; operationId?: string } } }>(
+      'sessionEventMetadata', { workerSessionEventScope: scope });
+    const payload = scope.run(launcher, () => metadata(receipt));
+    expect(payload.sessionContract.bindingId).toBe(live.bindingId);
+    expect(payload.sessionContract.scope.runtime).toEqual({ runtimeId: 'runtime-real-cli', epoch: 2 });
+    // The host's restart_operation_mismatch fence still has to pass.
+    expect(payload.sessionContract.scope.operationId).toBe(ATTEMPT);
+  });
+
+  it('keeps the stale fence for a callback of a replaced process', () => {
+    const scope = new WorkerSessionEventScope({ appId: 'app', sessionId: 'session' }, { workerId: 'worker-1', generation: 1 });
+    const replaced = scope.beginRuntime(ATTEMPT, 'cli-process-1');
+    scope.assign(replaced.bindingId, { runtimeId: 'runtime-replaced', epoch: 1 });
+    replaced.identity = identity;
+    const respawned = scope.beginRuntime(ATTEMPT, 'cli-process-2');
+    scope.assign(respawned.bindingId, { runtimeId: 'runtime-respawned', epoch: 2 });
+    const metadata = loadWorkerFunction<(msg: never) => { sessionContract: { bindingId?: string } }>(
+      'sessionEventMetadata', { workerSessionEventScope: scope });
+    const payload = scope.run(replaced, () => metadata(receipt));
+    expect(payload.sessionContract.bindingId).toBe(replaced.bindingId);
+    expect(payload.sessionContract.bindingId).not.toBe(respawned.bindingId);
+  });
+
+  it('names the current binding when the callback carries no binding at all', () => {
+    const { scope, live } = relayRebound();
+    const metadata = loadWorkerFunction<(msg: never) => { sessionContract: { bindingId?: string } }>(
+      'sessionEventMetadata', { workerSessionEventScope: scope });
+    expect(metadata(receipt).sessionContract.bindingId).toBe(live.bindingId);
+  });
+});
