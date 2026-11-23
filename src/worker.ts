@@ -23556,7 +23556,10 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
     effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
   })) return;
 
+  // Fence on this spawn, not on getChildPid(): on Herdr/ZMX it aliases the
+  // cliPid that launch-layer resolution rewires to Cursor itself mid-poll.
   const backendAtSpawn = backend;
+  const generationAtSpawn = cliSpawnGeneration;
   let attempts = 0;
   const maxAttempts = 60; // Cursor may open store.db only after its startup render settles.
   const tick = () => {
@@ -23565,11 +23568,14 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
       effectiveResume: lastSpawnEffectiveResume,
       effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
     })) return;
-    if (backend !== backendAtSpawn) return;
-    const currentPid = backend.getChildPid?.();
-    if (currentPid && currentPid !== pid) return;
+    if (backend !== backendAtSpawn || cliSpawnGeneration !== generationAtSpawn) return;
 
-    const realPid = findLaunchedCliPid(pid, 'cursor') ?? pid;
+    // `pid` can be a launch layer (session-scope sh, status relay) that stays
+    // Cursor's parent, and Cursor's comm (`MainThread`/`node`) is no Cursor
+    // name, so a comm search from it finds nothing and probing it finds no
+    // store.db. Probe the pid the transcript bridge uses: launch-layer
+    // resolution rewires backend.cliPid to the payload.
+    const realPid = currentCursorObservedPid() ?? pid;
     const chatId = findCursorChatIdByPid(realPid);
     if (chatId) {
       if (!shouldPersistObservedCursorChatId({
