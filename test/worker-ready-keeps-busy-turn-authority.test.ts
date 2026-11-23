@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
+import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { hasAntigravityPendingTasks, type AntigravityTranscriptState } from '../src/services/antigravity-transcript.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -64,7 +65,7 @@ function harness(opts: {
     publishScreenStatus: vi.fn(),
     classifyUsageLimitWithNativeEvidence: () => ({}),
     projectedRuntimeScreenStatus: () => 'idle',
-    backgroundWaitPayload: () => ({}),
+    backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
     flushPending: vi.fn(),
     log: vi.fn(),
   };

@@ -14,6 +14,7 @@ import {
   RuntimeReservationRefusedError,
 } from './services/runtime-reservation.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
+import { shouldDeferAutoCompactForAwaySummary, type AutoCompactMaintenanceMessage } from './core/auto-compact.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
@@ -166,7 +167,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
@@ -9846,6 +9847,51 @@ function backgroundWaitPayload(): { backgroundTasks?: number } {
   return backgroundWaitTasks > 0 ? { backgroundTasks: backgroundWaitTasks } : {};
 }
 
+/** The main conversation's latest served model request and latest non-upkeep
+ *  response completion, from the transcript this worker follows. The first
+ *  times cache warmth from the request start; the second times real activity
+ *  from the response end (botmux's keep-alive and plugin upkeep excluded).
+ *  Rides on screen_update with its native-session identity (the sampler
+ *  publishes a change) so the daemon can rebind on rotation, time the prompt
+ *  cache from the last actual read, and count idle only after activity ended. */
+const modelRequestClock = new ClaudeModelRequestClock();
+
+/** Bind the clock to the native conversation before reading any of its events.
+ *  The screen_update identity lets the daemon perform the matching rebind. */
+function bindModelRequestClockToTranscript(path: string | undefined): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || !path) return;
+  const claudeSessionId = sessionIdFromJsonlPath(path);
+  if (claudeSessionId) modelRequestClock.bind(claudeSessionId);
+}
+
+/** A worker that starts on an existing transcript (a daemon restart, a
+ *  resume) cursors to its end, so the clock would know nothing until the
+ *  next request and the daemon would fall back to timing the cache and the
+ *  idle stretch from the stretch start. Read the tail once instead. */
+function seedModelRequestClockFromTranscript(): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || !bridgeJsonlPath) return;
+  // Bind even when the new file does not exist yet: a fresh native session
+  // must not inherit the retired transcript's cache/activity timestamps.
+  bindModelRequestClockToTranscript(bridgeJsonlPath);
+  if (!existsSyncSafe(bridgeJsonlPath)) return;
+  try { modelRequestClock.seedFromTail(bridgeJsonlPath); }
+  catch (err: any) { log(`Model request clock seed skipped: ${err?.message ?? err}`); }
+}
+
+function modelRequestPayload(): { awaySummaryPending: boolean; modelRequestSessionId?: string; lastModelRequestAt?: number; lastActivityRequestAt?: number } {
+  const claudeSessionId = modelRequestClock.boundClaudeSessionId;
+  const at = modelRequestClock.lastServedAt();
+  const activity = modelRequestClock.lastActivityAt();
+  return {
+    // Share the screen_update transport with the request clocks: automatic
+    // compact must see a one-shot recap before restoring focus.
+    awaySummaryPending: awaySummaryFocus.isActive,
+    ...(claudeSessionId ? { modelRequestSessionId: claudeSessionId } : {}),
+    ...(at !== undefined ? { lastModelRequestAt: at } : {}),
+    ...(activity !== undefined ? { lastActivityRequestAt: activity } : {}),
+  };
+}
+
 function refreshBackgroundWait(): void {
   const next = backgroundTaskTracker.backgroundWait();
   if (next > 0 && backgroundWaitTasks === 0) backgroundStopScanSinceMs = Date.now();
@@ -11852,6 +11898,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // trying to deliver.
   bridgeJsonlPath = matched;
   bridgeJsonlDir = dirname(matched);
+  bindModelRequestClockToTranscript(matched);
   // Split-live: drain `matched` from offset 0, partition by cutoffMs.
   // History (pre-mark) is absorbed into the seen set so the iTerm-side
   // turns the user accumulated before this Lark message DON'T re-emit
@@ -11871,6 +11918,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // previous session left behind) before folding this file's own events in.
   seedModelFallbackFromTranscript();
   observeModelFallbackEvents(matched, drained.events);
+  for (const ev of drained.events) modelRequestClock.observe(ev);
   bridgeBaselineDone = true;
   bridgePathConfirmedAtMs = Date.now();
   log(`Bridge fingerprint switch split: ${history.length} historical events absorbed, ${live.length} live events ingested (cutoff=${cutoffMs})`);
@@ -12140,6 +12188,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   }
   bridgeJsonlPath = newPath;
   bridgeJsonlDir = dirname(newPath);
+  bindModelRequestClockToTranscript(newPath);
 
   // Drain the new path from 0 ourselves (do NOT call bridgeAbsorbBaseline
   // — that would emit the preamble we want to suppress on rotation).
@@ -12159,6 +12208,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   // possibly before this switch noticed it. Launches replayed from an older
   // CLI process are ignored by the tracker itself.
   observeClaudeBackgroundTasks(result.events);
+  for (const ev of result.events) modelRequestClock.observe(ev);
   bridgeBaselineDone = true;
   bridgePathConfirmedAtMs = Date.now();
   log(`Bridge rotation split: ${history.length} historical events absorbed, ${live.length} live events ingested`);
@@ -12952,11 +13002,13 @@ function bridgeIngest(): void {
   if (!bridgeBaselineDone) {
     // Lazy baseline: file didn't exist at attach, baseline the moment it does.
     if (!existsSyncSafe(bridgeJsonlPath)) return;
+    // Bind/seed before baseline can trigger any immediate status publication.
+    seedModelRequestClockFromTranscript();
     bridgeAbsorbBaseline();
-    // Seed for the same reason startBridgeWatcher seeds after ITS baseline:
-    // the non-adopt branch cursors straight to EOF, so a switch already written
-    // to the file is never drained and only the tail scan can recover it. It
-    // also binds the tracker to this file's Claude session. Idempotent with the
+    // Seed the fallback tracker for the same reason as the request clock: the
+    // non-adopt branch cursors straight to EOF, so a switch already written to
+    // the file is never drained and only the tail scan can recover it. It also
+    // binds the tracker to this file's Claude session. Idempotent with the
     // adopt branch's own observe: the same record is deduped by uuid.
     seedModelFallbackFromTranscript();
     return;
@@ -12986,6 +13038,9 @@ function bridgeIngest(): void {
   // Fold background task launches / stops and the main turn's start / end, so
   // the idle edge (markPromptReady) and the card know what is still running.
   observeClaudeBackgroundTasks(result.events);
+  // Only the followed transcript: a retired path's tail is an older
+  // conversation, whose requests do not warm this one's cache.
+  for (const ev of result.events) modelRequestClock.observe(ev);
   // Structured rate-limit: Claude Code writes an `error:"rate_limit"` record
   // at the turn's terminal boundary. This is the authoritative "limited"
   // signal — read it here (event-driven, once per record) instead of scraping
@@ -13187,6 +13242,8 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   // baseline-existing branch re-proves `seen` from its file; fresh-empty
   // starts undecided, so its first split final gets the provisional wait.
   beginNewBridgeTranscriptGeneration();
+  // Bind/seed before baseline can publish status from a previous native session.
+  seedModelRequestClockFromTranscript();
   if (mode === 'fresh-empty') {
     // Non-adopt fallback: brand-new session, jsonl gets created on the first
     // user submit. We must NOT lazy-absorb the file when it appears — that
@@ -22448,6 +22505,7 @@ function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolea
     content,
     ...statusPayload,
     ...backgroundWaitPayload(),
+    ...modelRequestPayload(),
     turnId: opts?.clearTurnId ? undefined : currentBotmuxTurnId,
     dispatchAttempt: opts?.clearTurnId ? undefined : currentBotmuxDispatchAttempt,
     // Explicit direct-submit provenance: only the clearTurnId caller that
@@ -23270,6 +23328,7 @@ function markPromptReady(): void {
       content,
       ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
       ...backgroundWaitPayload(),
+      ...modelRequestPayload(),
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });
@@ -26285,6 +26344,10 @@ function startScreenUpdates(): void {
   let lastSentExpiredQuotaKey: string | undefined;
   let lastSentRecovery: UsageAwareScreen['usageLimitRecovery'];
   let lastSentBackgroundWait = 0;
+  let lastSentModelRequestAt: number | undefined;
+  let lastSentActivityRequestAt: number | undefined;
+  let lastSentModelRequestSessionId: string | undefined;
+  let lastSentAwaySummaryPending = false;
   let lastTextSnapshotHash = '';
   let lastContent = '';
   const permissionNotice = new ClaudePermissionNoticeTracker();
@@ -26565,16 +26628,25 @@ function startScreenUpdates(): void {
       const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
         || usageAware.usageLimitRecovery !== lastSentRecovery
-        || backgroundWaitTasks !== lastSentBackgroundWait) {
+        || backgroundWaitTasks !== lastSentBackgroundWait
+        || modelRequestClock.lastServedAt() !== lastSentModelRequestAt
+        || modelRequestClock.lastActivityAt() !== lastSentActivityRequestAt
+        || modelRequestClock.boundClaudeSessionId !== lastSentModelRequestSessionId
+        || awaySummaryFocus.isActive !== lastSentAwaySummaryPending) {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
         lastSentRecovery = usageAware.usageLimitRecovery;
         lastSentBackgroundWait = backgroundWaitTasks;
+        lastSentModelRequestAt = modelRequestClock.lastServedAt();
+        lastSentActivityRequestAt = modelRequestClock.lastActivityAt();
+        lastSentModelRequestSessionId = modelRequestClock.boundClaudeSessionId;
+        lastSentAwaySummaryPending = awaySummaryFocus.isActive;
         send({
           type: 'screen_update',
           content: snapshot.content,
           ...usageAware,
           ...backgroundWaitPayload(),
+          ...modelRequestPayload(),
           turnId: screenTurn.turnId,
           dispatchAttempt: screenTurn.dispatchAttempt,
         });
@@ -39875,13 +39947,27 @@ function describeUnattendedScreen(screen: UnattendedComposerScreen | undefined):
   return describeUnattendedComposerScreen(screen, cliAdapter?.readyPattern, { cols: renderCols, rows: renderRows });
 }
 
+/** Automatic compact must not restore focus and cancel a one-shot recap. This
+ *  predicate is shared by the IPC pre-restore hook and the final input gate. */
+function deferAutoCompactForAwaySummary(msg: AutoCompactMaintenanceMessage): boolean {
+  return shouldDeferAutoCompactForAwaySummary(msg, awaySummaryFocus.isActive);
+}
+
+/** Apply the normal focus restoration for human/CLI input, except for automatic
+ *  compact while recap is active. That refusal must leave the terminal blurred
+ *  so Claude can still write its one-shot summary. */
+function restoreFocusForDaemonMessage(msg: AutoCompactMaintenanceMessage): void {
+  if (!deferAutoCompactForAwaySummary(msg)) awaySummaryFocus.beforeDaemonMessage(msg.type ?? '');
+}
+
 /** Fail-closed probe for unattended raw input. Human passthrough intentionally
  * bypasses this additional gate; maintenance commands must prove that the live,
  * empty composer is on screen before the caller can write and press Enter. */
 function unattendedRawInputRefusal(
-  msg: { requireSafeComposer?: true },
+  msg: AutoCompactMaintenanceMessage,
 ): { refusal: PromptCacheKeepaliveRefusal; screen: UnattendedComposerScreen | undefined } | undefined {
   if (!msg.requireSafeComposer) return undefined;
+  if (deferAutoCompactForAwaySummary(msg)) return { refusal: 'away_summary_pending', screen: undefined };
   const isCodex = lastInitConfig?.cliId === 'codex';
   const screen = isCodex ? undefined : unattendedComposerScreen();
   let codexInputState: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined;
@@ -42327,8 +42413,8 @@ process.on('message', (raw: unknown, handle: unknown) => {
     }
   }
   // Input for the CLI first gets the terminal's focus back (if botmux had
-  // reported it away for an away summary).
-  awaySummaryFocus.beforeDaemonMessage(msg.type);
+  // reported it away for an away summary), except for a deferred auto-compact.
+  restoreFocusForDaemonMessage(msg);
   const execution = msg.sessionCommand?.execution;
   if (execution) workerSessionEventScope?.rememberExecution(execution);
   if (binding && workerSessionEventScope && msg.type !== 'init') return workerSessionEventScope.run(binding, () => handleContractDaemonMessage(msg, handle), execution, msg.sessionCommand?.operationId);

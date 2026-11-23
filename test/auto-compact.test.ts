@@ -3,7 +3,9 @@ import { readFileSync } from 'node:fs';
 import {
   AutoCompactCoordinator,
   isAutoCompactEligible,
+  reconcileAutoCompactAwaySummaryDeferral,
   settleAutoCompactSafeComposerRefusal,
+  shouldDeferAutoCompactForAwaySummary,
   supportsNativeAutoCompact,
   supportsNativeAutoCompactRuntime,
   type AutoCompactEligibilitySnapshot,
@@ -51,6 +53,55 @@ describe('AutoCompactCoordinator', () => {
     eligible = false;
     vi.advanceTimersByTime(5_000);
     expect(trigger).not.toHaveBeenCalled();
+  });
+
+  it('waits out an away-summary window and fires after it settles', () => {
+    let pending = true;
+    const trigger = vi.fn(() => true);
+    const coordinator = new AutoCompactCoordinator(5_000, 600_000, () => Date.now());
+    const observation = {
+      sessionId: 's1', idle: true, threshold: 75,
+      readThreshold: () => 75, readPercent: () => 90,
+      eligible: () => !pending, trigger,
+    };
+    coordinator.observe(observation);
+    vi.advanceTimersByTime(5_000);
+    expect(trigger).not.toHaveBeenCalled();
+    pending = false;
+    coordinator.observe(observation);
+    vi.advanceTimersByTime(5_000);
+    expect(trigger).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-arms threshold after a raced away-summary refusal once pending clears', () => {
+    const state = { awaySummaryPending: false, autoCompactAwaySummaryDeferred: false };
+    const trigger = vi.fn(() => true);
+    const coordinator = new AutoCompactCoordinator(5_000, 600_000, () => Date.now());
+    const observation = {
+      sessionId: 's1', idle: true, threshold: 75,
+      readThreshold: () => 75, readPercent: () => 90,
+      eligible: () => !state.awaySummaryPending, trigger,
+    };
+    // The pending frame loses the race: the timer fires and the worker refuses.
+    coordinator.observe(observation);
+    vi.advanceTimersByTime(5_000);
+    expect(trigger).toHaveBeenCalledTimes(1);
+    state.awaySummaryPending = true;
+    state.autoCompactAwaySummaryDeferred = true;
+    reconcileAutoCompactAwaySummaryDeferral(state, coordinator, 's1');
+    expect(state.autoCompactAwaySummaryDeferred).toBe(true);
+    coordinator.observe(observation);
+    vi.advanceTimersByTime(5_000);
+    expect(trigger).toHaveBeenCalledTimes(1);
+
+    // Recap settles: the false frame clears only this deferral and re-arms the
+    // ordinary debounce instead of waiting for an external screen change.
+    state.awaySummaryPending = false;
+    reconcileAutoCompactAwaySummaryDeferral(state, coordinator, 's1');
+    expect(state.autoCompactAwaySummaryDeferred).toBeUndefined();
+    coordinator.observe(observation);
+    vi.advanceTimersByTime(5_000);
+    expect(trigger).toHaveBeenCalledTimes(2);
   });
 
   it('cancels on busy and applies a cooldown after dispatch', () => {
@@ -222,6 +273,7 @@ describe('isAutoCompactEligible', () => {
     agentAttention: false,
     finalDeliveriesInFlight: 0,
     backgroundTaskCount: 0,
+    awaySummaryPending: false,
     adopted: false,
     headless: false,
     vcMeetingReceiver: false,
@@ -252,6 +304,7 @@ describe('isAutoCompactEligible', () => {
     ['agentAttention', true],
     ['finalDeliveriesInFlight', 1],
     ['backgroundTaskCount', 1],
+    ['awaySummaryPending', true],
     ['adopted', true],
     ['headless', true],
     ['vcMeetingReceiver', true],
@@ -263,6 +316,22 @@ describe('isAutoCompactEligible', () => {
       expect(isAutoCompactEligible({ ...eligible, [key]: value })).toBe(false);
     },
   );
+});
+
+describe('away-summary maintenance deferral', () => {
+  it.each([
+    ['threshold', 'auto-compact:abc'],
+    ['idle', 'auto-compact:idle:abc'],
+  ])('defers %s compact before focus restoration while recap is active', (_name, turnId) => {
+    expect(shouldDeferAutoCompactForAwaySummary({ type: 'raw_input', turnId, requireSafeComposer: true }, true)).toBe(true);
+  });
+
+  it('does not defer human input or compact after the recap settles', () => {
+    expect(shouldDeferAutoCompactForAwaySummary({ type: 'raw_input', turnId: 'om_human', requireSafeComposer: true }, true)).toBe(false);
+    expect(shouldDeferAutoCompactForAwaySummary({ type: 'message', turnId: 'auto-compact:abc', requireSafeComposer: true }, true)).toBe(false);
+    expect(shouldDeferAutoCompactForAwaySummary({ type: 'raw_input', turnId: 'auto-compact:abc', requireSafeComposer: true }, false)).toBe(false);
+    expect(shouldDeferAutoCompactForAwaySummary({ type: 'raw_input', turnId: 'auto-compact:abc' }, true)).toBe(false);
+  });
 });
 
 describe('supportsNativeAutoCompact', () => {
@@ -370,15 +439,18 @@ describe('auto-compact unattended worker write gate', () => {
       pendingInjections: [],
       pendingSessionRename: null,
       lastInitConfig: { cliId: 'claude-code' },
+      awaySummaryFocus: { isActive: false },
       ...overrides,
     };
     // The worker's own screen choice, over whatever backend / renderer this case has.
     scope.unattendedComposerScreen ??= loadWorkerFunction<() => unknown>('unattendedComposerScreen', scope);
-    const refuseWithScreen = loadWorkerFunction<(msg: { requireSafeComposer?: true }) => { refusal: string } | undefined>(
+    scope.shouldDeferAutoCompactForAwaySummary = shouldDeferAutoCompactForAwaySummary;
+    scope.deferAutoCompactForAwaySummary = loadWorkerFunction('deferAutoCompactForAwaySummary', scope);
+    const refuseWithScreen = loadWorkerFunction<(msg: { type?: string; turnId?: string; requireSafeComposer?: true }) => { refusal: string } | undefined>(
       'unattendedRawInputRefusal',
       scope,
     );
-    const refuse = (msg: { requireSafeComposer?: true }) => refuseWithScreen(msg)?.refusal;
+    const refuse = (msg: { type?: string; turnId?: string; requireSafeComposer?: true }) => refuseWithScreen(msg)?.refusal;
     return { refuse, scope };
   }
 
@@ -392,6 +464,17 @@ describe('auto-compact unattended worker write gate', () => {
     const { refuse, scope } = harness();
     expect(refuse({ requireSafeComposer: true })).toBeUndefined();
     expect(scope.renderer.viewportCells).toHaveBeenCalled();
+  });
+
+  it.each(['auto-compact:abc', 'auto-compact:idle:abc'])('refuses %s before screen probing while recap is active', (turnId) => {
+    const { refuse, scope } = harness({ awaySummaryFocus: { isActive: true } });
+    expect(refuse({ type: 'raw_input', turnId, requireSafeComposer: true })).toBe('away_summary_pending');
+    expect(scope.renderer.viewportCells).not.toHaveBeenCalled();
+  });
+
+  it('allows automatic compact after recap settles and leaves manual input immediate', () => {
+    expect(harness().refuse({ type: 'raw_input', turnId: 'auto-compact:abc', requireSafeComposer: true })).toBeUndefined();
+    expect(harness({ awaySummaryFocus: { isActive: true } }).refuse({ type: 'raw_input', turnId: 'om_human', requireSafeComposer: true })).toBeUndefined();
   });
 
   it('refuses a permission selector even though it contains the ready pattern', () => {

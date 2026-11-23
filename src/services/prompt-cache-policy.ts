@@ -276,11 +276,15 @@ export function decidePromptCacheKeepalive(
  * `BOTMUX_NOTHING_TO_SEND` is the existing "deliberately nothing to deliver"
  * sentinel every delivery path already honours.
  */
+/** Opening tag every keep-alive prompt starts with. The transcript records the
+ *  typed keep-alive as a person's prompt, so readers recognise it by this. */
+export const PROMPT_CACHE_KEEPALIVE_TAG = '<botmux_cache_keepalive>';
+
 export function buildPromptCacheKeepalivePrompt(locale?: Locale): string {
   if (locale === 'en') {
-    return '<botmux_cache_keepalive>Automatic prompt-cache keep-alive from botmux, not a user message and not a new task. '
+    return `${PROMPT_CACHE_KEEPALIVE_TAG}Automatic prompt-cache keep-alive from botmux, not a user message and not a new task. `
       + 'Do not call any tool, do not run botmux send, do not resume earlier work; reply with exactly BOTMUX_NOTHING_TO_SEND.</botmux_cache_keepalive>';
   }
-  return '<botmux_cache_keepalive>这是 botmux 自动发送的提示缓存保活消息，不是用户消息，也不是新任务。'
+  return `${PROMPT_CACHE_KEEPALIVE_TAG}这是 botmux 自动发送的提示缓存保活消息，不是用户消息，也不是新任务。`
     + '不要调用任何工具，不要执行 botmux send，不要继续之前的工作，只回复 BOTMUX_NOTHING_TO_SEND。</botmux_cache_keepalive>';
 }

@@ -90,7 +90,7 @@ import {
 } from '../services/statusline-snapshot.js';
 import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, promptCacheKeepaliveInFlight, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
 import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
-import { IDLE_AUTO_COMPACT_MAX_ATTEMPTS, clearIdleAutoCompactStretch, idleAutoCompactMinutes, invalidateIdleAutoCompactRetryForTurn, noteIdleAutoCompactDirectInput, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, noteIdleAutoCompactTurnEnded, supportsIdleAutoCompact } from './idle-auto-compact.js';
+import { IDLE_AUTO_COMPACT_MAX_ATTEMPTS, IDLE_AUTO_COMPACT_TURN_PREFIX, clearIdleAutoCompactStretch, idleAutoCompactMinutes, invalidateIdleAutoCompactRetryForTurn, noteIdleAutoCompactDirectInput, noteIdleAutoCompactTranscriptClock, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, noteIdleAutoCompactTurnEnded, supportsIdleAutoCompact } from './idle-auto-compact.js';
 import { parseUnattendedInputRefusal } from './unattended-input-refusal.js';
 import { getCardFooterExtensionSegments } from '../services/card-footer-extension.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
@@ -12857,6 +12857,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   // the dashboard hydrate this process-less logical session as idle/working.
   ds.lastScreenStatus = undefined;
   ds.backgroundTaskCount = undefined;
+  ds.awaySummaryPending = undefined;
   // Drop the TTL clock with it: a cold-resumed worker starts from a fresh idle
   // edge, otherwise a stale stamp could get the new worker TTL-suspended almost
   // immediately after resume.
@@ -24202,6 +24203,9 @@ function setupWorkerHandlers(
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
           : undefined;
+        ds.awaySummaryPending = msg.awaySummaryPending === true;
+        // Worker observations, so stale frames carry facts as truly as live ones.
+        noteIdleAutoCompactTranscriptClock(ds, msg);
         stampIdleSinceAt(ds, prevStatus);
         // Stale post-terminal busy frames must not move the card revision: a
         // bump here would invalidate the in-flight post-terminal idle
@@ -26273,6 +26277,10 @@ function setupWorkerHandlers(
           const idleRefusal = noteIdleAutoCompactRefused(ds, msg.turnId, composerRefusal);
           if (idleRefusal) {
             try { sessionStore.updateSession(ds.session); } catch { /* next status edge re-saves */ }
+          } else if (composerRefusal === 'away_summary_pending' && !msg.turnId.startsWith(IDLE_AUTO_COMPACT_TURN_PREFIX)) {
+            // Threshold compact has no periodic sweep. Remember this was a
+            // deferral so the next pending=false screen frame can re-arm it.
+            ds.autoCompactAwaySummaryDeferred = true;
           }
           // The worker deliberately refused an unattended maintenance write.
           // Clear this synthetic turn's pending-card marker immediately and

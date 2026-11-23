@@ -653,7 +653,7 @@ import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclare
 import { applyTopicModelSpec, resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
-import { AutoCompactCoordinator, isAutoCompactEligible, supportsNativeAutoCompactRuntime } from './core/auto-compact.js';
+import { AutoCompactCoordinator, autoCompactBlockers, isAutoCompactEligible, reconcileAutoCompactAwaySummaryDeferral, supportsNativeAutoCompactRuntime, type AutoCompactEligibilitySnapshot } from './core/auto-compact.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -7217,9 +7217,13 @@ function autoCompactPercent(ds: DaemonSession): number | undefined {
  * window always wins. Auto-compaction is local maintenance, never a reason to
  * wake a worker, mutate an adopted pane, or overtake queued durable input. */
 function autoCompactEligible(ds: DaemonSession): boolean {
+  return isAutoCompactEligible(autoCompactSnapshot(ds));
+}
+
+function autoCompactSnapshot(ds: DaemonSession): AutoCompactEligibilitySnapshot {
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-  return isAutoCompactEligible({
+  return {
     sessionActive: ds.session.status === 'active',
     workerAlive: !!ds.worker && !ds.worker.killed,
     workerReady: ds.workerReady === true,
@@ -7238,6 +7242,7 @@ function autoCompactEligible(ds: DaemonSession): boolean {
     agentAttention: !!ds.agentAttention,
     finalDeliveriesInFlight: ds.finalOutputDeliveriesInFlight?.size ?? 0,
     backgroundTaskCount: ds.backgroundTaskCount ?? 0,
+    awaySummaryPending: ds.awaySummaryPending === true,
     adopted: !!ds.adoptedFrom || !!ds.session.adoptedFrom,
     headless: !!ds.session.headless,
     vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
@@ -7248,10 +7253,11 @@ function autoCompactEligible(ds: DaemonSession): boolean {
       ds.initConfig?.codexRpcInput === true,
     )
       && resolvePassthroughCommands(ds.larkAppId, effectiveCliId).has('/compact'),
-  });
+  };
 }
 
 function observeAutoCompact(ds: DaemonSession, status: string): void {
+  reconcileAutoCompactAwaySummaryDeferral(ds, autoCompactCoordinator, ds.session.sessionId);
   autoCompactCoordinator.observe({
     sessionId: ds.session.sessionId,
     idle: status === 'idle',
@@ -7330,11 +7336,12 @@ function idleAutoCompactNoticeText(ds: DaemonSession, notice: IdleAutoCompactNot
 function runIdleAutoCompact(): void {
   runIdleAutoCompactSweep(activeSessions.values(), {
     supported: sessionSupportsIdleAutoCompact,
-    eligible: autoCompactEligible,
+    // The sweep gates on these in the same synchronous tick it sends in, and
+    // drops the exclusions the idle compact tolerates (idleAutoCompactBlockers).
+    blockers: ds => autoCompactBlockers(autoCompactSnapshot(ds)),
     contextTokens: idleAutoCompactContextTokens,
     persist: ds => sessionStore.updateSession(ds.session),
     compact: (ds, turnId) => {
-      if (!autoCompactEligible(ds)) return false;
       const anchor = sessionAnchorId(ds);
       let delivered = false;
       deliverPassthroughToExistingSession(ds, '/compact', '/compact', anchor, ds.larkAppId, {
