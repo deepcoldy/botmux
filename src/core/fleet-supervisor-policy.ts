@@ -11,15 +11,15 @@
  *  1. graceful-exit suppresses restart — a child that exits with
  *     DAEMON_GRACEFUL_EXIT_CODE (90) shut down cleanly and must NOT be restarted;
  *     every other exit (including signal death, which surfaces as a non-90 code
- *     or a signal) is a crash and restarts, under a backoff, up to maxRestarts.
+ *     or a signal) is a crash and restarts, under a backoff.
  *     The exit code alone is NOT proof the operator asked for the stop, so the
  *     live layer honours the sentinel only when IT initiated it (fleet-wide
  *     stopping flag / per-bot explicitStop set before the exit arrived); a 90
  *     that arrives without that intent is treated as a crash and restarted, so
  *     a stray signal from outside the supervision tree cannot permanently
  *     retire the fleet.
- *  2. max_restarts cap — after maxRestarts crash-restarts a proc is parked
- *     'errored' and left alone (no restart storm).
+ *  2. max_restarts limits fast retries; after that, keep retrying at a slower
+ *     rate so a temporary outage cannot permanently retire a service.
  *  3. projection identity — the fleet's proc set has unique names and no two
  *     live procs share a pid (a duplicate would mean we lost track of a child).
  *  4. idempotent start — starting a fleet that is already fully online is a
@@ -50,7 +50,7 @@ export interface FleetProcState {
    *  (name, generation) so a stale exit never mutates a newer generation. */
   generation: number;
   status: FleetProcStatus;
-  /** Crash-restart count since last clean start; compared against maxRestarts. */
+  /** Fast-restart count, reset after a stable run or an operator start. */
   restarts: number;
   /** Exit code of the last exit (null while running / never exited). */
   lastExitCode: number | null;
@@ -91,12 +91,22 @@ export interface FleetState {
 }
 
 export interface RestartPolicy {
+  /** Number of fast retries before switching to the cooldown. */
   maxRestarts: number;
   /** Base backoff between crash-restarts (ms); the live layer waits this long. */
   restartDelayMs: number;
+  /** Retry interval after the fast-restart budget is exhausted. */
+  restartCooldownMs?: number;
+  /** A child running this long gets a fresh budget on its next exit. */
+  resetAfterMs?: number;
 }
 
-export const DEFAULT_RESTART_POLICY: RestartPolicy = { maxRestarts: 10, restartDelayMs: 200 };
+export const DEFAULT_RESTART_POLICY = {
+  maxRestarts: 10,
+  restartDelayMs: 200,
+  restartCooldownMs: 60_000,
+  resetAfterMs: 60_000,
+} satisfies RestartPolicy;
 
 /** A child exit as reported by the OS: a numeric code XOR a signal. */
 export interface ChildExit {
@@ -127,40 +137,41 @@ export function isGracefulExit(exit: ChildExit, honoursSentinel = true): boolean
 
 export type ExitDecision =
   | { action: 'stop'; reason: 'graceful' }
-  | { action: 'restart'; nextRestarts: number }
-  | { action: 'park'; reason: 'max_restarts'; atRestarts: number };
+  | { action: 'restart'; nextRestarts: number; delayMs: number };
 
-/** A restart/park decision on a path where the graceful sentinel is NOT being
+/** A restart decision on a path where the graceful sentinel is NOT being
  *  honoured (an external/plugin member, or our own member's ordinary exit path
  *  on which a fleet stop / explicit stop-bot was already handled upstream).
  *  Deliberately excludes 'stop' so a caller that already owned the graceful
  *  outcome cannot carry a statically-dead branch. */
-export type CrashExitDecision = Extract<ExitDecision, { action: 'restart' } | { action: 'park' }>;
+export type CrashExitDecision = Extract<ExitDecision, { action: 'restart' }>;
 
 /**
- * Decide restart-vs-park for a non-graceful exit. The tally depends only on the
- * current restart count and the cap, not the exit code/signal (the live layer
- * records/logs those separately):
- *   • crash & under the cap   → restart (restarts+1)
- *   • crash & at/over the cap → park errored, stop restarting
+ * Bound the retry rate, not the service's lifetime. A stable run resets the
+ * fast-restart budget; repeated short failures keep retrying at the cooldown
+ * interval with a saturated counter. The live layer supplies elapsed uptime.
  */
 export function decideCrashExit(
   proc: Pick<FleetProcState, 'restarts'>,
   policy: RestartPolicy = DEFAULT_RESTART_POLICY,
+  uptimeMs = 0,
 ): CrashExitDecision {
-  const nextRestarts = proc.restarts + 1;
-  if (nextRestarts > policy.maxRestarts) {
-    return { action: 'park', reason: 'max_restarts', atRestarts: proc.restarts };
-  }
-  return { action: 'restart', nextRestarts };
+  const restarts = uptimeMs >= (policy.resetAfterMs ?? DEFAULT_RESTART_POLICY.resetAfterMs) ? 0 : proc.restarts;
+  return {
+    action: 'restart',
+    nextRestarts: Math.min(restarts + 1, policy.maxRestarts),
+    delayMs: restarts >= policy.maxRestarts
+      ? policy.restartCooldownMs ?? DEFAULT_RESTART_POLICY.restartCooldownMs
+      : policy.restartDelayMs,
+  };
 }
 
 /**
  * Decide what to do when a supervised proc exits. Pure: the live layer applies
- * the returned action (schedule respawn / write stopped / write errored).
+ * the returned action (schedule respawn / write stopped).
  *   • graceful (code 90)            → stop, never restart
  *   • crash & under the cap         → restart (restarts+1)
- *   • crash & at/over the cap       → park errored, stop restarting
+ *   • crash & at/over the cap       → retry after the cooldown
  *
  * A caller passes honoursSentinel:true ONLY when it independently knows the
  * stop was requested through the sanctioned channel (the live supervisor sets

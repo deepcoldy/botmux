@@ -27,12 +27,14 @@ export function issueSessionCardClickTurn(input: {
   sessionId: string;
   prompt: string;
   ttlMs?: number;
+  responseToTurnId?: string;
 }): { payload: string; sig: string } | undefined {
   const issued = issueCardClickTurn({
     secret: cardClickTurnSecret(input.dataDir, input.larkAppId),
     larkAppId: input.larkAppId,
     sessionId: input.sessionId,
     prompt: input.prompt,
+    responseToTurnId: input.responseToTurnId,
     ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}),
   });
   return issued.ok ? { payload: issued.payload, sig: issued.sig } : undefined;
