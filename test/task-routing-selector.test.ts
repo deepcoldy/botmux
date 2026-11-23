@@ -453,12 +453,15 @@ describe('bot one-shot matcher parsing and ref resolution', () => {
         { mode: 0o755 },
       );
       const crashRes = await runBotOneShotMatcher(req, {
-        botConfig: { larkAppId: 'cli_j', larkAppSecret: 's', cliId: 'claude-code', binPath: crashScript } as BotConfig,
+        botConfig: { larkAppId: 'cli_j', larkAppSecret: 's', cliId: 'claude-code', cliPathOverride: crashScript } as BotConfig,
         timeoutMs: 3_000,
         allowOneShot: () => true,
       });
       expect(crashRes.ok).toBe(false);
-      if (!crashRes.ok) expect(crashRes.errorCode).toBe('matcher_exec_failed');
+      if (!crashRes.ok) {
+        expect(crashRes.errorCode).toBe('matcher_exec_failed');
+        expect(crashRes.detail).toContain('137');
+      }
 
       // 2. Timeout kills the entire process group (wrapper ignoring SIGTERM + sleeping grandchild).
       if (process.platform !== 'win32') {
@@ -470,7 +473,7 @@ describe('bot one-shot matcher parsing and ref resolution', () => {
           { mode: 0o755 },
         );
         const timeoutRes = await runBotOneShotMatcher(req, {
-          botConfig: { larkAppId: 'cli_j', larkAppSecret: 's', cliId: 'claude-code', binPath: hangScript } as BotConfig,
+          botConfig: { larkAppId: 'cli_j', larkAppSecret: 's', cliId: 'claude-code', cliPathOverride: hangScript } as BotConfig,
           timeoutMs: 1_000,
           allowOneShot: () => true,
         });
@@ -479,14 +482,12 @@ describe('bot one-shot matcher parsing and ref resolution', () => {
 
         // Give the 1s SIGTERM->SIGKILL reap timer room to finish killing the process group.
         await new Promise(r => setTimeout(r, 1_300));
-        if (existsSync(pidFile)) {
-          const gpid = Number(readFileSync(pidFile, 'utf8').trim());
-          if (Number.isInteger(gpid) && gpid > 1) {
-            let alive = false;
-            try { process.kill(gpid, 0); alive = true; } catch { alive = false; }
-            expect(alive).toBe(false);
-          }
-        }
+        expect(existsSync(pidFile)).toBe(true);
+        const gpid = Number(readFileSync(pidFile, 'utf8').trim());
+        expect(Number.isInteger(gpid) && gpid > 1).toBe(true);
+        let alive = false;
+        try { process.kill(gpid, 0); alive = true; } catch { alive = false; }
+        expect(alive).toBe(false);
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });
