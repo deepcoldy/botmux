@@ -6,6 +6,9 @@
  *  consistency test fails until the CLI side catches up. */
 export const TRIGGER_SOURCE_TYPES = ['webhook', 'ui', 'workflow', 'schedule', 'vc_meeting', 'headless'] as const;
 export type TriggerSourceType = typeof TRIGGER_SOURCE_TYPES[number];
+/** Connector id of the `botmux report` relay: a dispatched bot handing its
+ *  result back to the source session through the ordinary trigger entry. */
+export const REPORT_RELAY_CONNECTOR_ID = 'botmux-report';
 export type TriggerTargetKind = 'turn' | 'workflow';
 export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
 export type TriggerAsyncStatus = 'pending' | 'completed';

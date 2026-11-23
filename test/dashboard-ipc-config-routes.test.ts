@@ -44,6 +44,7 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-skills', LEGACY],
   ['/api/bot-sandbox-network-policy', LEGACY],
   ['/api/bot-lark-tool-binding', LEGACY],
+  ['/api/bot-lark-user-owner-fallback', LEGACY],
 ];
 
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
@@ -158,6 +159,13 @@ const CASES: readonly Case[] = [
   ['/api/bot-lark-tool-binding', 'null', 400, { ok: false, error: 'no_valid_fields' }],
   ['/api/bot-lark-tool-binding', '[]', 400, { ok: false, error: 'no_valid_fields' }],
   ['/api/bot-lark-tool-binding', '"not_an_object"', 400, { ok: false, error: 'no_valid_fields' }],
+  // Default on: only an explicit off is stored.
+  ['/api/bot-lark-user-owner-fallback', '{"enabled":false}', 200, { ok: true, larkUserOwnerFallback: false }, { larkUserOwnerFallback: false }],
+  ['/api/bot-lark-user-owner-fallback', '{"enabled":true}', 200, { ok: true, larkUserOwnerFallback: true }, { larkUserOwnerFallback: undefined }],
+  ['/api/bot-lark-user-owner-fallback', '{"larkUserOwnerFallback":false}', 200, { ok: true, larkUserOwnerFallback: false }, { larkUserOwnerFallback: false }],
+  ['/api/bot-lark-user-owner-fallback', '{"enabled":true,"larkUserOwnerFallback":false}', 400, { ok: false, error: 'no_valid_fields' }],
+  ['/api/bot-lark-user-owner-fallback', '{"enabled":"off"}', 400, { ok: false, error: 'no_valid_fields' }],
+  ['/api/bot-lark-user-owner-fallback', 'null', 400, { ok: false, error: 'no_valid_fields' }],
 ];
 
 describe('config-field PUT routes (botConfigPutRoute)', () => {

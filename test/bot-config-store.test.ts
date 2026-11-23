@@ -2329,6 +2329,28 @@ describe('bot-config store', () => {
     expect(store2.getConfigCardData('app_default')?.customPassthroughCommands).toBeNull();
   });
 
+  it('larkUserOwnerFallback is default on: only off is stored, it applies at once, and the /botconfig card shows the live state', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('larkUserOwnerFallback')!;
+    const cardState = (key: string) => store.getConfigCardData('app_default')?.booleans.find(b => b.key === key)?.on;
+    // Unset means on, and the card says so (default-on toggles used to read as off).
+    expect(cardState('larkUserOwnerFallback')).toBe(true);
+    expect(cardState('trustSameOwnerBots')).toBe(true);
+    const off = await store.applyConfigField('app_default', spec, false);
+    expect(off).toMatchObject({ ok: true, oldText: 'on', newText: 'off', effect: 'immediate' });
+    expect(readConfig().larkUserOwnerFallback).toBe(false);
+    expect(registry.getBot('app_default').config.larkUserOwnerFallback).toBe(false);
+    expect(cardState('larkUserOwnerFallback')).toBe(false);
+    const on = await store.applyConfigField('app_default', spec, true);
+    expect(on).toMatchObject({ ok: true, oldText: 'off', newText: 'on' });
+    expect(readConfig()).not.toHaveProperty('larkUserOwnerFallback');
+    expect(registry.getBot('app_default').config.larkUserOwnerFallback).toBeUndefined();
+    expect(cardState('larkUserOwnerFallback')).toBe(true);
+    // A saved off survives a reload of bots.json.
+    const { registry: reloaded } = await loaded({ larkUserOwnerFallback: false });
+    expect(reloaded.getBot('app_default').config.larkUserOwnerFallback).toBe(false);
+  });
+
   it('startupCommands is a next-session stringList that keeps argument spaces (own parser)', async () => {
     const { store } = await freshModules();
     const spec = store.findConfigField('startupCommands')!;

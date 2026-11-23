@@ -621,6 +621,23 @@ import { isKnownLarkUserScope, isValidLarkScopeSyntax } from '../utils/lark-scop
 import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
 import { allowsPersonalIdentityForTurn, isRunAsTurnId, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import {
+  decideOwnerFallback,
+  onlyOwnerSpoke,
+  ownerActorTurnFallsBack,
+  ownerFallbackAuditLine,
+  ownerFallbackOriginStillHolds,
+  ownerFallbackPolicy,
+  ownerFallbackRefusalText,
+  ownerNotAuthorizedText,
+  principalIsBot,
+  scheduledTaskPersonOf,
+  type OwnerFallbackLookups,
+  type OwnerFallbackReason,
+} from './lark-user-owner-fallback.js';
+import { pickTurnReplyTarget } from './reply-target.js';
+import { isExternalTriggerTurn, isExternallySubmittedTriggerSource } from './turn-origin.js';
+import { resolveDispatchUser } from './dispatch-user-delegation.js';
+import {
   resolveRegisteredBackgroundContext,
   backgroundContextStillValid,
   registerScheduledBackgroundExecution,
@@ -4360,6 +4377,49 @@ function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: s
   } catch { return false; }
 }
 
+/** The daemon-side facts the owner fallback needs about one live turn
+ *  (core/lark-user-owner-fallback). Any lookup that fails answers "unknown". */
+function ownerFallbackLookups(ds: DaemonSession, appId: string, turnId: string): OwnerFallbackLookups {
+  return {
+    scheduledTaskPerson: taskId => {
+      try { return scheduledTaskPersonOf(scheduler.getScheduleAuthorityRecord(taskId, appId)); }
+      catch { return 'unknown'; }
+    },
+    externalTrigger: turnId => isExternalTriggerTurn(turnId),
+    signedRequester: async () => {
+      try {
+        const reply = pickTurnReplyTarget(ds.session, turnId);
+        const record = await resolveDispatchUser({
+          dataDir: config.session.dataDir,
+          secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+          appId, chatId: ds.chatId, turnId,
+          rootId: reply?.rootMessageId ?? (ds.scope !== 'chat' ? ds.session.rootMessageId ?? undefined : undefined),
+        });
+        if (!record) return { kind: 'none' };
+        const resolved = await resolveTargetAppOpenId(appId, record.authority.unionId);
+        return resolved.status === 'resolved' ? { kind: 'person', openId: resolved.openId } : { kind: 'unknown' };
+      } catch { return { kind: 'unknown' }; }
+    },
+  };
+}
+
+/** Whether an owner fallback decided earlier in a request still holds against
+ *  the live bot, the turn's speakers and the turn's origin. */
+function ownerFallbackStillHolds(
+  ds: DaemonSession | undefined,
+  fallback: { openId: string; reason: OwnerFallbackReason; turnId: string } | undefined,
+): boolean {
+  if (!fallback) return true;
+  if (!ds) return false;
+  let live: BotConfig;
+  try { live = getBot(ds.larkAppId).config; } catch { return false; }
+  const policy = ownerFallbackPolicy(live, ds.session, getOwnerOpenId(ds.larkAppId));
+  return policy.ok && policy.ownerOpenId === fallback.openId
+    && ds.managedTurnOrigin?.provenanceIncomplete !== true
+    && onlyOwnerSpoke(ds.managedTurnOrigin?.speakers, fallback.openId)
+    && ownerFallbackOriginStillHolds(fallback.reason, fallback.turnId, ownerFallbackLookups(ds, ds.larkAppId, fallback.turnId));
+}
+
 ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res, params) => {
   let body: Record<string, unknown>;
   let rawBody: Buffer;
@@ -4533,7 +4593,15 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     });
   }
   const identityTurnId = liveOrigin?.identityTurnId;
-  if (!allowsPersonalIdentityForTurn(identityTurnId ?? turnId, bot.triggerUserAuth)) {
+  // Under the owner fallback an owner-actor trigger is one more turn nobody
+  // started: it acts as the owner it names (core/lark-user-owner-fallback).
+  const ownerOpenId = getOwnerOpenId(bot.larkAppId);
+  const ownerActorFallback = !!liveOrigin && ownerActorTurnFallsBack({
+    bot, session: ds?.session, ownerOpenId, turnId: identityTurnId ?? turnId,
+    principalOpenId: turnCaller, speakers: liveOrigin.speakers,
+    provenanceIncomplete: liveOrigin.provenanceIncomplete,
+  });
+  if (!allowsPersonalIdentityForTurn(identityTurnId ?? turnId, bot.triggerUserAuth) && !ownerActorFallback) {
     return jsonRes(res, 403, { ok: false, error: 'unattended_turn' });
   }
   if (process.platform === 'linux' && !execution && !detachedForUser) {
@@ -4556,7 +4624,43 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
       ? 'BOTMUX_AS names nobody who spoke in this turn; run the command without it to act as the person who started the turn'
       : 'BOTMUX_AS cannot name anyone in this turn (this bot does not allow running a command for another speaker, or the turn is unattended or delegated); run the command without BOTMUX_AS' });
   }
-  const originSender = choice.speaker?.openId ?? baseSender;
+  // The turn's own principal (a person, a bot, or nobody) before any fallback.
+  const turnPrincipal = choice.speaker?.openId ?? baseSender;
+  // A turn nobody started (a script, a webhook, a schedule without a creator,
+  // a bot dispatch the owner signed) acts as the bot owner; a turn with a
+  // person keeps that person (core/lark-user-owner-fallback).
+  const fallbackTurnId = identityTurnId ?? turnId;
+  let ownerFallback: { openId: string; reason: OwnerFallbackReason; turnId: string } | undefined = ownerActorFallback && ownerOpenId
+    ? { openId: ownerOpenId, reason: 'owner_actor', turnId: fallbackTurnId } : undefined;
+  if (!ownerFallback && ds && liveOrigin && !detachedForUser && !delegated && body.as === undefined
+    && (!turnPrincipal || principalIsBot({ trustedCaller: liveOrigin.trustedCaller, principalOpenId: turnPrincipal }))) {
+    const decision = await decideOwnerFallback({
+      bot, session: ds.session, ownerOpenId,
+      turn: { turnId: fallbackTurnId, trustedCaller: liveOrigin.trustedCaller, principalOpenId: turnPrincipal,
+        speakers: liveOrigin.speakers, delegated: false, provenanceIncomplete: liveOrigin.provenanceIncomplete },
+      lookups: ownerFallbackLookups(ds, bot.larkAppId, fallbackTurnId),
+    });
+    if (decision.use === 'owner') {
+      ownerFallback = { openId: decision.openId, reason: decision.reason, turnId: fallbackTurnId };
+    } else if (decision.use === 'none') {
+      // Strict-mode switch/policy refusals deliberately keep their legacy quiet
+      // path. Every refusal that actually considered the fallback is audited,
+      // including origin_unknown, which intentionally keeps the generic text.
+      const refusal = ownerFallbackRefusalText(decision.refusal);
+      if (decision.refusal !== 'switch_off' && decision.refusal !== 'per_person_policy') {
+        logger.info(ownerFallbackAuditLine({ appId: bot.larkAppId, sessionId: params.sessionId, turnId: fallbackTurnId, decision }));
+      }
+      if (refusal) return jsonRes(res, 403, { ok: false, error: refusal });
+    }
+  }
+  const auditOwnerFallback = (result: string) => {
+    if (!ownerFallback) return;
+    logger.info(ownerFallbackAuditLine({
+      appId: bot.larkAppId, sessionId: params.sessionId, turnId: fallbackTurnId,
+      decision: { use: 'owner', openId: ownerFallback.openId, reason: ownerFallback.reason }, result,
+    }));
+  };
+  const originSender = ownerFallback?.openId ?? turnPrincipal;
   const sender = delegated?.targetOpenId ?? originSender;
   if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
   const cached = delegated ? undefined : getIdentity(bot.larkAppId, sender);
@@ -4611,17 +4715,26 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
       && (usesBoundScheduledToolActor
         ? ds.scheduledToolActors?.get(turnId)?.openId === scheduledToolActor.openId
           && ds.scheduledToolActors?.get(turnId)?.unionId === scheduledToolActor.unionId
-        // A human turn (including a BOTMUX_AS switch, which only rewrites originSender)
-        // stays anchored to its original principal turnCaller; an execution-only bound
-        // call keeps the master originSender comparison.
+        // A human turn (including a BOTMUX_AS switch, which only rewrites the chosen
+        // speaker) stays anchored to its original principal turnCaller; an
+        // execution-only bound call keeps comparing the turn's own principal
+        // (before any owner fallback, which is re-checked separately).
         : (ds.managedTurnOrigin?.callerOpenId ?? execution?.callerOpenId)
-          === (liveOrigin?.callerOpenId ? turnCaller : originSender))
+          === (liveOrigin?.callerOpenId ? turnCaller : turnPrincipal))
       && ds.managedTurnOrigin?.identityTurnId === identityTurnId)
     : (!!backgroundInput && !!detachedForUser && backgroundContextStillValid(backgroundInput, detachedForUser));
   if (!boundLarkToolRequest(req, params.sessionId, bot.larkAppId)
     || !stableAfterAwait
+    // The switch, the owner or the turn's speakers may have changed meanwhile.
+    || !ownerFallbackStillHolds(ds, ownerFallback)
     || (!detachedForUser && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId)) !== JSON.stringify(delegated))) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
+  }
+  // The owner has not authorized this application yet: the agent asks for the
+  // owner's authorization, which botmux delivers to the owner privately.
+  if (ownerFallback && !resolved.ok) {
+    auditOwnerFallback('owner_not_authorized');
+    return jsonRes(res, 403, { ok: false, error: ownerNotAuthorizedText(bot.larkAppId, ownerFallback.reason) });
   }
   // The credential lookup may have crossed an operator edit. Re-read the live
   // policy and allowlist immediately before any credential can enter the response.
@@ -4665,9 +4778,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   if (!resolved.ok) return jsonRes(res, 403, { ok: false, error: delegated
     ? `The original user's authorization for ${bot.larkAppId} is missing. Run botmux auth request --scope "<required scopes>" --json and send the link to that human, then retry with --as user. Do not ask the dispatch bot to authorize.`
     : `Application ${bot.larkAppId} needs this user's authorization. Run ${asPrefix}botmux auth request --scope "<required scopes>" --json${asPrefix ? ` and ${asPrefix}botmux auth wait` : ', or send /login in this conversation'}, then retry with --as user.` });
+  auditOwnerFallback('granted');
   return jsonRes(res, 200, {
     ok: true, appId: resolved.appId, mode: 'user', credentialType: 'user_access_token', credential: resolved.credential,
     ...(resolved.issuer ? { issuer: resolved.issuer } : {}),
+    ...(ownerFallback ? { actingAs: 'owner' } : {}),
   });
 });
 
@@ -5006,13 +5121,42 @@ for (const action of ['auth-request', 'auth-status']) {
     const speakersOf = (liveOrigin: typeof origin) => governedSpeakers({
       policy: cfg.triggerUserAuth, tool: 'lark-cli', sessionDataDir: config.session.dataDir, sessionId: params.sessionId, origin: liveOrigin,
     });
+    // A bound lark tool in a turn nobody started asks for the bot owner's
+    // authorization (core/lark-user-owner-fallback). Decided once per request;
+    // requestingUser re-checks it against the live bot and the live turn.
+    const fallbackTurnId = origin.identityTurnId ?? origin.turnId;
+    let ownerFallback: { openId: string; reason: OwnerFallbackReason; turnId: string; callerOpenId?: string } | undefined;
+    if (boundTool && body.as === undefined
+      && !getLarkToolDelegation(config.session.dataDir, params.sessionId, fallbackTurnId)) {
+      const ownerOpenId = getOwnerOpenId(ds.larkAppId);
+      const frozen = { turnId: fallbackTurnId, ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}) };
+      if (ownerOpenId && ownerActorTurnFallsBack({ bot: cfg, session: ds.session, ownerOpenId, turnId: fallbackTurnId,
+        principalOpenId: origin.callerOpenId, speakers: origin.speakers,
+        provenanceIncomplete: origin.provenanceIncomplete })) {
+        ownerFallback = { openId: ownerOpenId, reason: 'owner_actor', ...frozen };
+      } else if (!origin.callerOpenId || principalIsBot({ trustedCaller: origin.trustedCaller, principalOpenId: origin.callerOpenId })) {
+        const decision = await decideOwnerFallback({
+          bot: cfg, session: ds.session, ownerOpenId,
+          turn: { turnId: fallbackTurnId, trustedCaller: origin.trustedCaller, principalOpenId: origin.callerOpenId,
+            speakers: origin.speakers, delegated: false, provenanceIncomplete: origin.provenanceIncomplete },
+          lookups: ownerFallbackLookups(ds, ds.larkAppId, fallbackTurnId),
+        });
+        if (decision.use === 'owner') ownerFallback = { openId: decision.openId, reason: decision.reason, ...frozen };
+      }
+    }
+    const ownerFallbackLive = (liveOrigin: NonNullable<typeof origin>): boolean => !!ownerFallback
+      && (liveOrigin.identityTurnId ?? liveOrigin.turnId) === ownerFallback.turnId
+      && liveOrigin.callerOpenId === ownerFallback.callerOpenId
+      && ownerFallbackStillHolds(ds, ownerFallback);
     const requestingUser = (): string | undefined => {
       const liveOrigin = ds.managedTurnOrigin;
       if (!liveOrigin?.turnId) return undefined;
       const liveIdentityTurnId = liveOrigin.identityTurnId ?? liveOrigin.turnId;
-      if (!allowsPersonalIdentityForTurn(liveIdentityTurnId, getBot(ds.larkAppId).config.triggerUserAuth)) return undefined;
+      if (!allowsPersonalIdentityForTurn(liveIdentityTurnId, getBot(ds.larkAppId).config.triggerUserAuth)
+        && !(ownerFallback?.reason === 'owner_actor' && ownerFallbackLive(liveOrigin))) return undefined;
       const grant = currentLarkToolDelegation(config.session.dataDir, params.sessionId, liveIdentityTurnId);
       if (!grant) {
+        if (body.as === undefined && ownerFallbackLive(liveOrigin)) return ownerFallback!.openId;
         // `BOTMUX_AS` names the speaker asked; else the turn principal.
         const principal = liveOrigin.callerOpenId ? { openId: liveOrigin.callerOpenId, turnId: liveIdentityTurnId } : undefined;
         const speaker = chooseTurnSpeaker(principal, speakersOf(liveOrigin), body.as);
@@ -5028,6 +5172,13 @@ for (const action of ['auth-request', 'auth-status']) {
     if (body.as !== undefined && !speakersOf(origin)) return jsonRes(res, 403, { ok: false, error: 'as_unavailable' });
     const callerOpenId = requestingUser();
     if (!callerOpenId) return denyCurrentActor('caller_unavailable');
+    // The owner's authorization for a turn nobody started: its entry always
+    // goes to the owner privately, never into the conversation.
+    const actingAsOwner = !!ownerFallback && callerOpenId === ownerFallback.openId;
+    if (actingAsOwner && action === 'auth-request') {
+      logger.info(ownerFallbackAuditLine({ appId: ds.larkAppId, sessionId: params.sessionId, turnId: fallbackTurnId,
+        decision: { use: 'owner', openId: ownerFallback!.openId, reason: ownerFallback!.reason }, result: 'auth_request' }));
+    }
     const originCallerOpenId = origin.callerOpenId;
     const turnId = origin.turnId;
     const capability = origin.capability;
@@ -5230,8 +5381,11 @@ for (const action of ['auth-request', 'auth-status']) {
     // Authorization links reach only the initiator. In anything but the 1:1
     // chat with the bot, botmux DMs the link itself and the agent never sees it:
     // a link posted to a group lets any member authorize as themselves.
-    const privateChat = ds.chatType === 'p2p';
+    const privateChat = ds.chatType === 'p2p' && !actingAsOwner;
     const loc = localeForBot(ds.larkAppId);
+    const agentDeliveryKey = (delivery: string | undefined) => actingAsOwner
+      ? (delivery === 'ephemeral' ? 'auth_link.owner_fallback_ephemeral_agent' : 'auth_link.owner_fallback_dm_agent')
+      : (delivery === 'ephemeral' ? 'auth_link.request_ephemeral_agent' : 'auth_link.request_dm_agent');
     for (const [requestId, request] of sessionAuthRequests.entries()) {
       if (request.sessionId === params.sessionId && request.appId === cfg.larkAppId
         && request.callerOpenId === callerOpenId && request.status === 'pending' && request.isValid()
@@ -5244,7 +5398,7 @@ for (const action of ['auth-request', 'auth-status']) {
         if (!privateChat) {
           if (!request.delivery) return jsonRes(res, 409, { ok: false, requestId, error: 'auth_link_delivery_pending' });
           return jsonRes(res, 200, { ok: true, requestId, delivery: request.delivery,
-            message: t(request.delivery === 'ephemeral' ? 'auth_link.request_ephemeral_agent' : 'auth_link.request_dm_agent', undefined, loc),
+            message: t(agentDeliveryKey(request.delivery), undefined, loc),
             scopes: request.authorization.scopes, expiresIn: remaining, autoCallback: true });
         }
         return jsonRes(res, 200, { ok: true, requestId, authUrl: request.authorization.authUrl,
@@ -5276,7 +5430,7 @@ for (const action of ['auth-request', 'auth-status']) {
         privateChat: false,
         openId: callerOpenId,
         text: [
-          t('auth_link.request_dm_title', undefined, loc),
+          t(actingAsOwner ? 'auth_link.owner_fallback_dm_title' : 'auth_link.request_dm_title', undefined, loc),
           authorization.authUrl,
           t('auth_link.request_dm_footer', {
             scopes: authorization.scopes.join(' '),
@@ -5305,12 +5459,12 @@ for (const action of ['auth-request', 'auth-status']) {
         tracked?.dispose();
         sessionAuthRequests.delete(requestId);
         return jsonRes(res, 409, { ok: false, error: 'auth_link_private_delivery_failed',
-          message: t('auth_link.request_dm_failed_agent', undefined, loc) });
+          message: t(actingAsOwner ? 'auth_link.owner_fallback_dm_failed_agent' : 'auth_link.request_dm_failed_agent', undefined, loc) });
       }
       if (tracked) tracked.delivery = delivery;
       return jsonRes(res, 200, {
         ok: true, requestId, delivery,
-        message: t(delivery === 'ephemeral' ? 'auth_link.request_ephemeral_agent' : 'auth_link.request_dm_agent', undefined, loc),
+        message: t(agentDeliveryKey(delivery), undefined, loc),
         scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
       });
     }
@@ -8991,6 +9145,7 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, endpo
     }
     const result = await triggerSessionTurn(valid.request, {
       larkAppId: cachedLarkAppId, activeSessions,
+      externalRequest: isExternallySubmittedTriggerSource(valid.request.source),
       resolveRunAs: (chatId: string, runAs: string) => resolveRunAs(cachedLarkAppId, chatId, runAs),
     });
     const status = result.ok
@@ -10978,6 +11133,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     envelopeInjection,
     triggerUserAuth,
     larkToolBinding: getBot(cachedLarkAppId).config.larkToolBinding !== false,
+    larkUserOwnerFallback: getBot(cachedLarkAppId).config.larkUserOwnerFallback !== false,
     topicUnavailablePolicy: getBot(cachedLarkAppId).config.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery,
     replyDeliveryDefault,
@@ -13038,6 +13194,19 @@ botConfigPutRoute<{ enabled?: unknown; larkToolBinding?: unknown }>('/api/bot-la
     return fieldOk(on ? true : false);
   },
   respond: value => ({ ok: true, larkToolBinding: value !== false }),
+});
+
+// PUT /api/bot-lark-user-owner-fallback — 没有发起人时 lark-cli --as user 用主人的飞书身份（默认开）。
+// Body `{ enabled?: boolean; larkUserOwnerFallback?: boolean }`；每次调用实时读取，即时生效。
+botConfigPutRoute<{ enabled?: unknown; larkUserOwnerFallback?: unknown }>('/api/bot-lark-user-owner-fallback', 'larkUserOwnerFallback', {
+  normalize: body => {
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) return fieldInvalid('no_valid_fields');
+    const on = body.enabled === true || body.larkUserOwnerFallback === true;
+    const off = body.enabled === false || body.larkUserOwnerFallback === false;
+    if (on === off) return fieldInvalid('no_valid_fields');
+    return fieldOk(on);
+  },
+  respond: value => ({ ok: true, larkUserOwnerFallback: value !== false }),
 });
 
 /**

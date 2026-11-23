@@ -27584,6 +27584,8 @@ function setupWorkerHandlers(
               : {}),
           ...(msg.linkRefMode ? { linkRefMode: msg.linkRefMode } : {}),
           ...(msg.speakers?.length ? { speakers: msg.speakers } : {}),
+          ...(msg.provenanceIncomplete || (sameExecution && previousOrigin?.provenanceIncomplete)
+            ? { provenanceIncomplete: true } : {}),
           ...(callerOpenId ? { callerOpenId } : {}),
           ...(preexistingProcessIdentities
             ? { preexistingProcessIdentities }

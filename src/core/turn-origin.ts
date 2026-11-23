@@ -10,7 +10,7 @@
  * environment or files it can write.
  */
 import type { DaemonSession } from './types.js';
-import { TRIGGER_SOURCE_TYPES, type TriggerSourceType } from '../services/trigger-types.js';
+import { REPORT_RELAY_CONNECTOR_ID, TRIGGER_SOURCE_TYPES, type TriggerSourceType } from '../services/trigger-types.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 import { registryEntryProvesHumanSender, registryTurnMayAuthenticateHuman } from './reply-target.js';
 
@@ -57,8 +57,43 @@ export function rememberTriggerTurn(turnId: string, source: TriggerSourceType): 
   }
 }
 
+/**
+ * Trigger turns that a caller outside the daemon submitted through its public
+ * trigger entry: a script, a webhook connector, the platform or the Dashboard.
+ * The daemon and other bot daemons mint relays with the same machinery
+ * (`botmux report`, meeting transcripts, ask continuations, project-import
+ * notices, listener previews); those carry other people's content and are never
+ * recorded here. Only a turn recorded here may run as the bot owner when nobody
+ * started it (core/lark-user-owner-fallback). In memory only, like the table
+ * above: after a daemon restart the turn no longer qualifies (fail closed).
+ */
+const externalTriggerTurns = new Set<string>();
+
+export function rememberExternalTriggerTurn(turnId: string): void {
+  if (!turnId) return;
+  externalTriggerTurns.delete(turnId);
+  externalTriggerTurns.add(turnId);
+  while (externalTriggerTurns.size > TRIGGER_TURN_LIMIT) {
+    const oldest = externalTriggerTurns.values().next().value;
+    if (oldest === undefined) break;
+    externalTriggerTurns.delete(oldest);
+  }
+}
+
+export function isExternalTriggerTurn(turnId: string): boolean {
+  return externalTriggerTurns.has(turnId);
+}
+
+/** Whether a request arriving at the public trigger entry was submitted from
+ *  outside: relays other daemons send to the same entry are not. */
+export function isExternallySubmittedTriggerSource(source: { type: string; connectorId?: string }): boolean {
+  return source.type !== 'vc_meeting' && source.type !== 'headless' && source.type !== 'workflow'
+    && source.connectorId !== REPORT_RELAY_CONNECTOR_ID;
+}
+
 export function __testOnly_resetTriggerTurns(): void {
   triggerTurns.clear();
+  externalTriggerTurns.clear();
 }
 
 type OriginSession = Pick<DaemonSession, 'activeInteractiveTurn'> & {

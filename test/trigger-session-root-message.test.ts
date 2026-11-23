@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
 import type { DaemonSession } from '../src/core/types.js';
-import { resolveTurnOrigin } from '../src/core/turn-origin.js';
+import { isExternalTriggerTurn, resolveTurnOrigin } from '../src/core/turn-origin.js';
 
 const mockGetMessageChatId = vi.fn();
 const mockGetChatMode = vi.fn(async () => 'topic');
@@ -707,6 +707,15 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(triggerId).toMatch(/^trg_/);
     expect(resolveTurnOrigin({ session: {} } as any, triggerId)).toEqual({ origin: 'trigger', triggerSource: 'webhook' });
     expect(resolveTurnOrigin({ session: {} } as any, 'trg_never_admitted')).toEqual({ origin: 'unknown' });
+  });
+
+  it('records a turn as submitted from outside only when the public entry says so', async () => {
+    const internal = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: new Map() });
+    const internalId = (internal as { triggerId?: string }).triggerId!;
+    expect(resolveTurnOrigin({ session: {} } as any, internalId)).toMatchObject({ origin: 'trigger' });
+    expect(isExternalTriggerTurn(internalId)).toBe(false);
+    const external = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: new Map(), externalRequest: true });
+    expect(isExternalTriggerTurn((external as { triggerId?: string }).triggerId!)).toBe(true);
   });
 
   it('keeps the localized topic seed by default', () => {
