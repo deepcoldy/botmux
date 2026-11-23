@@ -410,4 +410,118 @@ describe('ensureVcMeetingEventsSubscribed', () => {
     expect(h.automate).not.toHaveBeenCalled();
     expect(h.dm).not.toHaveBeenCalled();
   });
+
+  it('passes approvalDeferredScopes as excludeScopes when auto-subscribing VC events', async () => {
+    const deferred = { tenant: ['im:message.group_msg'], user: ['offline_access'] };
+    h.bot = vcBot({ approvalDeferredScopes: deferred });
+    h.probe.mockResolvedValue({ ok: true, missingVcEvents: ['vc.bot.meeting_invited_v1'], eventModeReady: true });
+    h.automate.mockResolvedValue({ ok: true, subscribedEventCount: 3, versionId: 'v1' });
+    await ensureVcMeetingEventsSubscribed(APP);
+    expect(h.automate).toHaveBeenCalledWith(expect.objectContaining({
+      disableQrLogin: true,
+      excludeScopes: deferred,
+    }));
+  });
+
+  it('skips VC auto-subscribe when a required VC scope is already in approvalDeferredScopes', async () => {
+    h.bot = vcBot({
+      approvalDeferredScopes: { tenant: ['vc:meeting.bot.join:write'] },
+    });
+    h.probe.mockResolvedValue({ ok: true, missingVcEvents: ['vc.bot.meeting_invited_v1'], eventModeReady: true });
+    await ensureVcMeetingEventsSubscribed(APP);
+    expect(h.automate).not.toHaveBeenCalled();
+    expect(h.dm).not.toHaveBeenCalled();
+  });
+});
+
+describe('checkRequiredScopes — approvalDeferredScopes 保护', () => {
+  it('启动自愈跳过已因审批暂缓的缺失权限，不再悄悄补回或给 owner 发审批轰炸', async () => {
+    h.bot = makeBot({
+      approvalDeferredScopes: {
+        tenant: ['im:message.group_msg'],
+      },
+    });
+    stubLark({ granted: [...critical, ...optional].filter(name => name !== 'im:message.group_msg') });
+    await checkRequiredScopes(APP);
+    expect(h.automate).not.toHaveBeenCalled();
+    expect(h.register).not.toHaveBeenCalled();
+    expect(h.dm).not.toHaveBeenCalled();
+  });
+
+  it('同时缺失「已暂缓权限」与「未暂缓权限」时，只补未暂缓权限并把 excludeScopes 与 autoAvoidApproval 透传给自动化', async () => {
+    const deferred = { tenant: ['im:message.group_msg'], user: ['offline_access'] };
+    h.bot = makeBot({ approvalDeferredScopes: deferred });
+    h.automate.mockResolvedValue({
+      ok: true, scopeCount: 1, skippedScopeCount: 0, privilegeRangeCount: 0,
+      subscribedEventCount: 0, versionId: 'ver_partial', approvalAutoPassed: true,
+    });
+    stubLark({
+      granted: [...critical, ...optional].filter(
+        name => name !== 'im:message.group_msg' && name !== missingCriticalScope,
+      ),
+    });
+    await checkRequiredScopes(APP);
+    expect(h.automate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      appId: APP,
+      disableQrLogin: true,
+      excludeScopes: deferred,
+      autoAvoidApproval: true,
+    }));
+    const requestedManifest = h.automate.mock.calls[0][0].scopeManifest;
+    const requestedNames = [...requestedManifest.scopes.tenant, ...requestedManifest.scopes.user];
+    expect(requestedNames).toContain(missingCriticalScope);
+    expect(requestedNames).not.toContain('im:message.group_msg');
+  });
+
+  it('99991672 冷启动当 self_manage 已暂缓时跳过自动补权与确认链接；未暂缓时启用 autoAvoidApproval', async () => {
+    h.bot = makeBot({
+      approvalDeferredScopes: { tenant: ['application:application:self_manage'] },
+    });
+    stubLark({ code: 99991672 });
+    await checkRequiredScopes(APP);
+    expect(h.automate).not.toHaveBeenCalled();
+    expect(h.register).not.toHaveBeenCalled();
+    expect(h.dm).not.toHaveBeenCalled();
+
+    h.bot = makeBot();
+    h.automate.mockResolvedValue({
+      ok: true, scopeCount: 2, skippedScopeCount: 0, privilegeRangeCount: 0,
+      subscribedEventCount: 0, versionId: 'ver_cold', approvalAutoPassed: true,
+    });
+    await checkRequiredScopes(APP);
+    expect(h.automate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      appId: APP,
+      autoAvoidApproval: true,
+    }));
+  });
+
+  it('官方确认链接兜底（tryAutoFixScopes）按桶扣除已暂缓的双桶权限，不把 deferred user 桶漏回确认链接', async () => {
+    // im:chat:read 在默认清单里同属 tenant 和 user 两桶；若仅 user 桶被暂缓，确认链接只申请 tenant 桶
+    h.bot = makeBot({
+      approvalDeferredScopes: { user: ['im:chat:read'] },
+    });
+    stubLark({
+      granted: [...critical, ...optional].filter(name => name !== 'im:chat:read'),
+      approveRepair: true,
+    });
+    await checkRequiredScopes(APP);
+    expect(h.register).toHaveBeenCalledTimes(1);
+    const sentBuckets = h.register.mock.lastCall![0].addons.scopes;
+    expect(sentBuckets.tenant).toContain('im:chat:read');
+    expect(sentBuckets.user).not.toContain('im:chat:read');
+  });
+
+  it('autoAvoidApproval=false 时启动自愈透传 autoAvoidApproval: false，不触发草稿态二分避开', async () => {
+    h.bot = makeBot({ autoAvoidApproval: false });
+    h.automate.mockResolvedValue({
+      ok: true, scopeCount: 1, skippedScopeCount: 0, privilegeRangeCount: 0,
+      subscribedEventCount: 0, versionId: 'ver_optout', approvalAutoPassed: false,
+    });
+    stubLark({ granted: [...critical, ...optional].filter(name => name !== missingCriticalScope) });
+    await checkRequiredScopes(APP);
+    expect(h.automate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      appId: APP,
+      autoAvoidApproval: false,
+    }));
+  });
 });

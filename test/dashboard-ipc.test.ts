@@ -4326,6 +4326,54 @@ describe('lark-cli binding setting survives dashboard refresh', () => {
   });
 });
 
+describe('PUT + GET /api/bot-auto-avoid-approval — 卡审批自动避开开关刷新回显', () => {
+  it.each([undefined, false, true] as const)('persists and echoes autoAvoidApproval (initial=%s)', async initial => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-auto-avoid-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'cli_auto_avoid_refresh';
+    const previousConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'fixture-secret', cliId: 'claude-code',
+        ...(initial === undefined ? {} : { autoAvoidApproval: initial }),
+      }]));
+      loadBotConfigs().forEach((entry: any) => registerBot(entry));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const readDefaults = async () => {
+        const response = await fetch(`${base}/api/bot-default-oncall`);
+        expect(response.status).toBe(200);
+        return response.json();
+      };
+      expect(await readDefaults()).toHaveProperty('autoAvoidApproval', initial !== false);
+
+      for (const enabled of [false, true]) {
+        const saved = await fetch(`${base}/api/bot-auto-avoid-approval`, {
+          method: 'PUT', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        });
+        expect(saved.status).toBe(200);
+        expect(await saved.json()).toMatchObject({ ok: true, autoAvoidApproval: enabled });
+        const persisted = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+        if (enabled) expect(persisted.autoAvoidApproval).toBeUndefined();
+        else expect(persisted.autoAvoidApproval).toBe(false);
+        expect(getBot(appId).config.autoAvoidApproval !== false).toBe(enabled);
+        const refreshed = await readDefaults();
+        expect(refreshed).toHaveProperty('autoAvoidApproval', enabled);
+        expect(botDefaultsPayload({ larkAppId: appId }, refreshed).autoAvoidApproval).toBe(enabled);
+      }
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (previousConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previousConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT + GET /api/bot-trigger-user-auth — 开关刷新回显', () => {
   it('turning it on echoes the normalized policy back through GET /api/bot-default-oncall', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-trigger-user-auth-'));

@@ -1827,6 +1827,7 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
         appId: targetAppId,
         brand,
         maxWaitMs: 5_000,
+        excludeScopes: bot.approvalDeferredScopes,
         onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
       });
       if (result.ok) {
@@ -6435,6 +6436,7 @@ const server = createServer(async (req, res) => {
         workingDir?: unknown;
         dirMode?: unknown;
         model?: unknown;
+        autoAvoidApproval?: unknown;
         requireCriticalScopesBeforeActivation?: unknown;
       };
       try {
@@ -6543,6 +6545,7 @@ const server = createServer(async (req, res) => {
         workingDir,
         dirMode,
         model,
+        ...(parsed.autoAvoidApproval === false ? { autoAvoidApproval: false } : {}),
         ...(parsed.requireCriticalScopesBeforeActivation === true
           ? { requireCriticalScopesBeforeActivation: true }
           : {}),

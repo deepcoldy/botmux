@@ -11134,6 +11134,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     triggerUserAuth,
     larkToolBinding: getBot(cachedLarkAppId).config.larkToolBinding !== false,
     larkUserOwnerFallback: getBot(cachedLarkAppId).config.larkUserOwnerFallback !== false,
+    autoAvoidApproval: getBot(cachedLarkAppId).config.autoAvoidApproval !== false,
     topicUnavailablePolicy: getBot(cachedLarkAppId).config.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery,
     replyDeliveryDefault,
@@ -13209,6 +13210,17 @@ botConfigPutRoute<{ enabled?: unknown; larkUserOwnerFallback?: unknown }>('/api/
   respond: value => ({ ok: true, larkUserOwnerFallback: value !== false }),
 });
 
+// PUT /api/bot-auto-avoid-approval — 飞书开放平台卡审批草稿态自动避开开关。Body `{ enabled?: boolean; autoAvoidApproval?: boolean }`
+botConfigPutRoute<{ enabled?: unknown; autoAvoidApproval?: unknown }>('/api/bot-auto-avoid-approval', 'autoAvoidApproval', {
+  normalize: body => {
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) return fieldInvalid('no_valid_fields');
+    const on = body.enabled === true || body.autoAvoidApproval === true;
+    const off = body.enabled === false || body.autoAvoidApproval === false;
+    if (on === off) return fieldInvalid('no_valid_fields');
+    return fieldOk(on);
+  },
+  respond: value => ({ ok: true, autoAvoidApproval: value !== false }),
+});
 /**
  * The sandbox mode the worker will spawn this bot's CLI under
  * (resolveLocalSandboxMode: global BOTMUX_SANDBOX and the legacy readIsolation

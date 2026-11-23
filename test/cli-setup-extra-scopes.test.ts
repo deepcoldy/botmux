@@ -385,4 +385,156 @@ describe('setup add --extra-scopes-file', () => {
     expect(mocks.automateOpenPlatformSetup).not.toHaveBeenCalled();
     expect(readFileSync(botsFile, 'utf8')).toBe(before);
   });
+
+  it('setup add --create-app 合并 1.0.0 与 1.0.1 暂缓权限、透传 excludeScopes 并落盘到 bots.json', async () => {
+    writeBots([botEntry('cli_a')]);
+    mocks.inspectCachedFeishuOpenPlatformSession.mockResolvedValue({
+      ok: true,
+      identity: { userId: 'u_1', userName: 'Alice', tenantId: 't_1', tenantName: 'Example' },
+    });
+    mocks.createFeishuOpenPlatformApp.mockResolvedValue({
+      ok: true,
+      appId: 'cli_compat_cli',
+      appSecret: 'secret-compat',
+      brand: 'feishu',
+      approvalDeferredScopes: [
+        { bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' },
+      ],
+      approvalDisabledRefreshToken: true,
+      approvalCompatibility: {
+        triggered: true,
+        resolvedAutoApproved: true,
+        deferredScopes: [{ bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' }],
+        disabledRefreshToken: true,
+        initialHumanApprovers: ['王审核'],
+        remainingHumanApprovers: [],
+        probeCount: 3,
+        stopReason: 'resolved_exact',
+      },
+    });
+    mocks.automateOpenPlatformSetup.mockResolvedValue({
+      ok: true,
+      sessionSource: 'botmux_cache',
+      scopeCount: 10,
+      skippedScopeCount: 0,
+      privilegeRangeCount: 0,
+      subscribedEventCount: 5,
+      missingVcEvents: [],
+      eventModeReady: true,
+      redirectConfigured: true,
+      versionId: 'v-101',
+      approvalAutoPassed: true,
+      approvalDeferredScopes: [
+        { bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' },
+      ],
+    });
+
+    await cmdSetupScripted([
+      'add', '--create-app', '--allowed-users', 'a@b.com', '--working-dir', scratch, '--json',
+    ]);
+
+    expect(mocks.automateOpenPlatformSetup).toHaveBeenCalledWith(expect.objectContaining({
+      appId: 'cli_compat_cli',
+      excludeScopes: { user: ['offline_access'] },
+      autoAvoidApproval: true,
+    }));
+    const out = lastJson();
+    expect(out.ok).toBe(true);
+    expect(out.openPlatform).toMatchObject({
+      status: 'ready_with_warnings',
+      approvalDisabledRefreshToken: true,
+      approvalDeferredScopes: expect.arrayContaining([
+        expect.objectContaining({ bucket: 'user', name: 'offline_access' }),
+        expect.objectContaining({ bucket: 'tenant', name: 'im:message.group_msg' }),
+      ]),
+    });
+    expect(out.bot.approvalDeferredScopes).toEqual({
+      tenant: ['im:message.group_msg'],
+      user: ['offline_access'],
+    });
+    const saved = readBots().find(b => b.larkAppId === 'cli_compat_cli');
+    expect(saved?.approvalDeferredScopes).toEqual({
+      tenant: ['im:message.group_msg'],
+      user: ['offline_access'],
+    });
+  });
+
+  it('setup configure 干净通过时清除 bots.json 中旧的 approvalDeferredScopes，失败时保留原值', async () => {
+    writeBots([
+      botEntry('cli_cfg_clear', {
+        approvalDeferredScopes: { tenant: ['im:message.group_msg'], user: ['offline_access'] },
+      }),
+    ]);
+
+    // 1) 失败时绝不抹掉已记录的 approvalDeferredScopes
+    mocks.automateOpenPlatformSetup.mockResolvedValueOnce({
+      ok: false,
+      reason: 'app_under_review',
+      message: '审核中',
+    });
+    await cmdSetupScripted(['configure', 'cli_cfg_clear', '--json']);
+    expect(readBots()[0]?.approvalDeferredScopes).toEqual({
+      tenant: ['im:message.group_msg'],
+      user: ['offline_access'],
+    });
+
+    // 2) 非干净通过（approval_nodes/get 不可用 / versionWarning / 进人工审批）绝不误清历史暂缓集
+    for (const nonClean of [
+      { approvalAutoPassed: undefined },
+      { approvalAutoPassed: false },
+      { approvalAutoPassed: true, versionWarning: '仍停留在草稿态' },
+    ]) {
+      mocks.automateOpenPlatformSetup.mockResolvedValueOnce({
+        ok: true,
+        sessionSource: 'botmux_cache',
+        scopeCount: 12,
+        skippedScopeCount: 0,
+        privilegeRangeCount: 0,
+        subscribedEventCount: 5,
+        missingVcEvents: [],
+        eventModeReady: true,
+        redirectConfigured: true,
+        versionId: 'v-nonclean',
+        ...nonClean,
+      });
+      await cmdSetupScripted(['configure', 'cli_cfg_clear', '--json']);
+      expect(readBots()[0]?.approvalDeferredScopes).toEqual({
+        tenant: ['im:message.group_msg'],
+        user: ['offline_access'],
+      });
+      expect(lastJson().bot.approvalDeferredScopes).toEqual({
+        tenant: ['im:message.group_msg'],
+        user: ['offline_access'],
+      });
+    }
+
+    // 3) 后续干净重配（0 暂缓权限、无 scopeWarning/versionWarning 且已确认自动通过）时自动清除旧的 approvalDeferredScopes
+    mocks.automateOpenPlatformSetup.mockResolvedValueOnce({
+      ok: true,
+      sessionSource: 'botmux_cache',
+      scopeCount: 12,
+      skippedScopeCount: 0,
+      privilegeRangeCount: 0,
+      subscribedEventCount: 5,
+      missingVcEvents: [],
+      eventModeReady: true,
+      redirectConfigured: true,
+      versionId: 'v-102',
+      approvalAutoPassed: true,
+    });
+    await cmdSetupScripted(['configure', 'cli_cfg_clear', '--json']);
+    const out = lastJson();
+    expect(out.ok).toBe(true);
+    expect(out.bot.approvalDeferredScopes).toBeUndefined();
+    expect(readBots()[0]?.approvalDeferredScopes).toBeUndefined();
+  });
+
+  it('setup configure 尊重 bots.json 中 autoAvoidApproval: false 开关', async () => {
+    writeBots([botEntry('cli_cfg_optout', { autoAvoidApproval: false })]);
+    await cmdSetupScripted(['configure', 'cli_cfg_optout', '--json']);
+    expect(mocks.automateOpenPlatformSetup).toHaveBeenCalledWith(expect.objectContaining({
+      appId: 'cli_cfg_optout',
+      autoAvoidApproval: false,
+    }));
+  });
 });

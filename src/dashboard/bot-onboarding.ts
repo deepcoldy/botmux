@@ -24,10 +24,16 @@ import {
   automateOpenPlatformSetup,
   BOT_BASELINE_APP_EVENTS,
   BOT_BASELINE_CALLBACKS,
+  buildApprovalConsoleUrl,
   createFeishuOpenPlatformApp,
+  deferredScopesToBuckets,
   inspectCachedFeishuOpenPlatformSession,
+  mergeDeferredApprovalScopes,
+  resolveNextPersistedApprovalDeferredScopes,
+  type ApprovalDeferredScopeBuckets,
   type CreateFeishuOpenPlatformAppOptions,
   type CreateFeishuOpenPlatformAppResult,
+  type DeferredApprovalScope,
   type FeishuOpenPlatformSessionInspectionResult,
   type FeishuWebSessionIdentity,
   type OpenPlatformAutomationOptions,
@@ -100,6 +106,14 @@ export interface BotOnboardingPermission {
   pendingReviewAppVersion?: string;
   /** 审批预判里的真人审批人（拿得到时）。 */
   approvalHumanApprovers?: string[];
+  /** 注册/配置时因触发企业管理员审批而自动跳过的权限列表（供前端提示用户按需手动开通）。 */
+  approvalDeferredScopes?: DeferredApprovalScope[];
+  /** 为避开企业审批而自动关闭了应用的刷新 user_access_token 开关。 */
+  approvalDisabledRefreshToken?: boolean;
+  /** 初始预判命中人工审批时的审批人列表（用于向用户解释为何跳过了上述权限）。 */
+  approvalInitialApprovers?: string[];
+  /** 开放平台权限管理页深链（供用户按需手动勾选并提交审批）。 */
+  approvalConsoleUrl?: string;
   /** 失败原因 / 信息 (失败时给出手动步骤) */
   reason?: string;
   message?: string;
@@ -195,6 +209,10 @@ export interface BotOnboardingInput {
    */
   dirMode?: 'fixed' | 'card';
   model?: string;
+  /**
+   * 飞书开放平台卡审批时是否草稿态自动二分避开需审权限（默认 true；false 关闭并落盘到 bots.json）。
+   */
+  autoAvoidApproval?: boolean;
   /**
    * MOSA-managed onboarding only. When true, a bot with incomplete critical
    * scope readback is persisted as activation-pending and cannot be loaded by
@@ -1788,6 +1806,10 @@ export class BotOnboardingManager {
     let result: RegisterAppResult;
     // 网页创建使用已验证的会话邮箱作为 owner 候选。
     let sessionEmail: string | undefined;
+    let initialApprovalDeferredScopes: DeferredApprovalScope[] | undefined;
+    let initialApprovalDisabledRefreshToken = false;
+    let initialApprovalApprovers: string[] | undefined;
+    const autoAvoidApproval = input.autoAvoidApproval !== false;
     const registration = registrationMode === 'sdk' ? createRegistrationOptions(appName) : undefined;
     if (registrationMode !== 'web') {
       result = await this.registerWithSdk(id, registration);
@@ -1798,6 +1820,7 @@ export class BotOnboardingManager {
           ? { disableQrLogin: true, expectedIdentity: input.expectedIdentity }
           : { forceQrLogin: true }),
         disableBytedcliFallback: true,
+        autoAvoidApproval,
         onQrCode: info => {
           this.patch(id, {
             status: 'waiting_for_scan',
@@ -1813,6 +1836,15 @@ export class BotOnboardingManager {
       if (created.ok) {
         result = created;
         sessionEmail = created.sessionIdentity?.email?.trim() || undefined;
+        if (created.approvalDeferredScopes?.length) {
+          initialApprovalDeferredScopes = created.approvalDeferredScopes;
+        }
+        if (created.approvalDisabledRefreshToken) {
+          initialApprovalDisabledRefreshToken = true;
+        }
+        if (created.approvalCompatibility?.initialHumanApprovers.length) {
+          initialApprovalApprovers = created.approvalCompatibility.initialHumanApprovers;
+        }
       } else if (created.appId) {
         this.patch(id, {
           status: 'failed',
@@ -1877,6 +1909,12 @@ export class BotOnboardingManager {
       cliId = bot.cliId ?? 'claude-code';
       workingDir = bot.defaultWorkingDir ?? bot.workingDir ?? '~';
     }
+    if (input.autoAvoidApproval === false) {
+      bot.autoAvoidApproval = false;
+    } else if (input.autoAvoidApproval === true) {
+      delete bot.autoAvoidApproval;
+    }
+    const effectiveAutoAvoidApproval = bot.autoAvoidApproval !== false;
     try {
       validateCliLaunchModeConfig({
         cliId: bot.cliId,
@@ -1901,13 +1939,48 @@ export class BotOnboardingManager {
     // 只有「能确认 owner」时才落盘——见下方两条路径。
 
     // 跑 setup 同款开放平台自动配置 (导入权限 / 配 redirect / 建并发版)。
-    const auto = await this.runPermissionAutomation(id, result.appId, result.brand, {
+    const rawAuto = await this.runPermissionAutomation(id, result.appId, result.brand, {
       cliId,
       workingDir,
       registrationMode,
       registration: registration?.addons && { credentials: result, addons: registration.addons },
       requireVerifiedEvents: input.requireCriticalScopesBeforeActivation === true,
+      excludeScopes: deferredScopesToBuckets(initialApprovalDeferredScopes),
+      autoAvoidApproval: effectiveAutoAvoidApproval,
     });
+    const mergedDeferredScopes = mergeDeferredApprovalScopes(
+      initialApprovalDeferredScopes,
+      rawAuto.ok ? rawAuto.approvalDeferredScopes : undefined,
+    );
+    const mergedDisabledRefreshToken =
+      initialApprovalDisabledRefreshToken || (rawAuto.ok && rawAuto.approvalDisabledRefreshToken === true);
+    const auto: OpenPlatformAutomationResult = rawAuto.ok
+      ? {
+          ...rawAuto,
+          ...(mergedDeferredScopes.length > 0 ? { approvalDeferredScopes: mergedDeferredScopes } : {}),
+          ...(mergedDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+          ...(initialApprovalApprovers?.length && !rawAuto.approvalCompatibility?.initialHumanApprovers.length
+            ? {
+                approvalCompatibility: rawAuto.approvalCompatibility ?? {
+                  triggered: true,
+                  resolvedAutoApproved: true,
+                  deferredScopes: mergedDeferredScopes,
+                  disabledRefreshToken: mergedDisabledRefreshToken,
+                  initialHumanApprovers: initialApprovalApprovers,
+                  remainingHumanApprovers: [],
+                  probeCount: 0,
+                  stopReason: 'resolved_exact',
+                },
+              }
+            : {}),
+        }
+      : rawAuto;
+    const deferredBuckets = deferredScopesToBuckets(mergedDeferredScopes);
+    if (deferredBuckets) {
+      // 落盘到 bots.json（含 needs_owner → submitOwner 路径），避免 daemon 启动权限自愈
+      // 把这些需审批权限悄悄补回去把应用锁进审核中。
+      bot.approvalDeferredScopes = deferredBuckets;
+    }
     // Every managed initial App first reaches one durable activation-pending
     // snapshot. Even when scopes are immediately stable, starting here would
     // leave a crash window between the exact PM2 ACK and persistence of the
@@ -2097,6 +2170,8 @@ export class BotOnboardingManager {
       registrationMode: 'sdk' | 'web' | 'compat';
       registration?: { credentials: Extract<RegisterAppResult, { ok: true }>; addons: NonNullable<RegisterAppOptions['addons']> };
       requireVerifiedEvents: boolean;
+      excludeScopes?: ApprovalDeferredScopeBuckets;
+      autoAvoidApproval?: boolean;
     },
   ): Promise<OpenPlatformAutomationResult> {
     this.patch(id, {
@@ -2150,6 +2225,7 @@ export class BotOnboardingManager {
           meta.requireVerifiedEvents,
           true,
           meta.registrationMode === 'sdk' ? false : undefined,
+          meta.autoAvoidApproval,
         );
       }
       const first = await this.automateOpenPlatform({
@@ -2163,6 +2239,8 @@ export class BotOnboardingManager {
         // 所以允许 redirect 白名单在读失败时覆盖写；存量 bot 的权限恢复走
         // runPermissionRecovery，那边不传。
         appJustCreated: true,
+        ...(meta.excludeScopes ? { excludeScopes: meta.excludeScopes } : {}),
+        ...(meta.autoAvoidApproval !== undefined ? { autoAvoidApproval: meta.autoAvoidApproval } : {}),
         ...callbacks,
       });
       return first;
@@ -2196,6 +2274,11 @@ export class BotOnboardingManager {
     }
     this.patch(id, { status: 'configuring_permissions' });
     const sessionFilePath = join(dirname(this.opts.botsJsonPath), 'onboarding-sessions', `${id}.json`);
+    const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const targetBot = configuredBots[addedBotIndex]?.larkAppId === appId
+      ? configuredBots[addedBotIndex]
+      : configuredBots.find(b => b?.larkAppId === appId);
+    const targetAutoAvoidApproval = targetBot?.autoAvoidApproval !== false;
     const auto = await this.runOwnerPermissionAutomation(id, appId, brand, {
       onQrCode: (info: { qrText: string; qrPayload: string }) => {
         this.patch(id, {
@@ -2207,11 +2290,12 @@ export class BotOnboardingManager {
         this.confirmPlatformQrScan(id, info.confirmedAt);
       },
       onStatus: (msg: string) => this.patch(id, { permissionStatusMsg: msg }),
-    }, sessionFilePath, requireCriticalScopesBeforeActivation);
+    }, sessionFilePath, requireCriticalScopesBeforeActivation, false, undefined, targetAutoAvoidApproval);
     if (!auto.ok) {
       this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'failed', 'permission_recovery_failed');
       return;
     }
+    await this.syncBotApprovalDeferredScopes(appId, addedBotIndex, auto);
     if (requireCriticalScopesBeforeActivation && !hasExactManagedAutomationAck(auto)) {
       this.finalizePermissions(id, appId, brand, addedBotIndex, {
         ok: false,
@@ -2253,6 +2337,45 @@ export class BotOnboardingManager {
     await this.activateRecoveredBot(id, appId, addedBotIndex);
   }
 
+  private async syncBotApprovalDeferredScopes(
+    appId: string,
+    addedBotIndex: number,
+    auto: Extract<OpenPlatformAutomationResult, { ok: true }>,
+  ): Promise<void> {
+    // 快路径：新旧都没有任何 approvalDeferredScopes 时不触发额外的持久化写事务。
+    const preRead = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const preEntry = preRead[addedBotIndex]?.larkAppId === appId
+      ? preRead[addedBotIndex]
+      : preRead.find(b => b?.larkAppId === appId);
+    if (!auto.approvalDeferredScopes?.length && !preEntry?.approvalDeferredScopes) {
+      return;
+    }
+    await this.runBotsMutation(() => {
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const current = bots[addedBotIndex]?.larkAppId === appId
+        ? bots[addedBotIndex]
+        : bots.find(b => b?.larkAppId === appId);
+      if (!current || typeof current !== 'object') return;
+      const idx = bots.indexOf(current);
+      const existing = current.approvalDeferredScopes as ApprovalDeferredScopeBuckets | undefined;
+      const decision = resolveNextPersistedApprovalDeferredScopes(
+        existing,
+        auto,
+        auto.approvalDeferredScopes ?? [],
+      );
+      if (decision.action === 'keep') return;
+      const next = [...bots];
+      const updated = { ...current };
+      if (decision.action === 'set') updated.approvalDeferredScopes = decision.buckets;
+      else delete updated.approvalDeferredScopes;
+      if (JSON.stringify(current.approvalDeferredScopes ?? null) === JSON.stringify(updated.approvalDeferredScopes ?? null)) {
+        return;
+      }
+      next[idx] = updated;
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next, bots);
+    });
+  }
+
   private async runOwnerPermissionAutomation(
     id: string,
     appId: string,
@@ -2262,6 +2385,7 @@ export class BotOnboardingManager {
     requireVerifiedEvents: boolean,
     appJustCreated = false,
     allowBlindRedirectWrite?: false,
+    autoAvoidApproval?: boolean,
   ): Promise<OpenPlatformAutomationResult> {
     try {
       return await this.automateOpenPlatform({
@@ -2274,6 +2398,7 @@ export class BotOnboardingManager {
         requireVerifiedEvents,
         appJustCreated,
         ...(allowBlindRedirectWrite === false ? { allowBlindRedirectWrite } : {}),
+        ...(autoAvoidApproval !== undefined ? { autoAvoidApproval } : {}),
         ...callbacks,
       });
     } finally {
@@ -2314,6 +2439,16 @@ export class BotOnboardingManager {
                 pendingReviewAppVersion: auto.pendingReviewAppVersion,
                 approvalHumanApprovers: auto.approvalHumanApprovers,
               }
+            : {}),
+          ...(auto.approvalDeferredScopes?.length
+            ? {
+                approvalDeferredScopes: auto.approvalDeferredScopes,
+                approvalConsoleUrl: buildApprovalConsoleUrl(appId, brand),
+              }
+            : {}),
+          ...(auto.approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+          ...(auto.approvalCompatibility?.initialHumanApprovers.length
+            ? { approvalInitialApprovers: auto.approvalCompatibility.initialHumanApprovers }
             : {}),
         }
       : {

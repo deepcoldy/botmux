@@ -49,6 +49,8 @@ export function classifySetupOpenPlatformOutcome(
     || result.versionPendingReview
     || !result.redirectConfigured
     || result.redirectWarning
+    || Boolean(result.approvalDeferredScopes?.length)
+    || result.approvalDisabledRefreshToken === true
   );
   return { status: hasWarnings ? 'ready_with_warnings' : 'ready', result };
 }

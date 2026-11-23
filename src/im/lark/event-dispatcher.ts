@@ -54,7 +54,9 @@ import {
   VC_MEETING_REALTIME_VOICE_SCOPES,
   buildEventSubDeepLink,
   buildScopeDeepLink,
+  type RequiredScope,
 } from '../../setup/verify-permissions.js';
+import type { ApprovalDeferredScopeBuckets } from '../../setup/approval-scope-resolver.js';
 import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, CHAT_DISBANDED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
 import { tryRegisterApp } from '../../setup/register-app.js';
 import { describeMissingScopes, diffScopeBuckets, readRegistrationScopes, registrationScopeBuckets, scopeBucketCount } from '../../setup/registration-manifest.js';
@@ -389,12 +391,8 @@ async function tryWebAutoFixScopes(
       maxWaitMs: 60_000,
       disableQrLogin: opts?.disableQrLogin,
       scopeManifest,
-      // 已授权集合（按 tenant/user 分桶）：automation 据此对上面这份 manifest 再按桶
-      // 各自做一次差集，并按「确有新增」而非「发过 scope/update」置 mutated——「配置本
-      // 就齐全」时才能命中无变更短路。分桶是为了不让 tenant 授权误伤 user 桶同名
-      // scope（#1044）。与 scopeManifest 叠加安全：缺失判定用的扁平集合是分桶集合的
-      // 超集，故本路径上二次差集恒为空操作；它真正兜住的是「裁剪后为空」那一轮。
-      // 拿不到 granted（self_manage 冷启动）时不传，退回保守近似。
+      excludeScopes: bot.config.approvalDeferredScopes,
+      autoAvoidApproval: bot.config.autoAvoidApproval !== false,
       grantedScopeNames: opts?.grantedScopeNames,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
@@ -579,7 +577,14 @@ async function tryAutoFixScopes(
   active?.cancel.abort();
   if (!owner) return false;
   const requested = registrationScopeBuckets(filterScopeManifest(readDefaultScopeManifest(), names));
-  const missing = granted ? diffScopeBuckets(requested, granted) : requested;
+  const rawMissing = granted ? diffScopeBuckets(requested, granted) : requested;
+  const deferredBuckets = bot.config.approvalDeferredScopes;
+  const missing = deferredBuckets
+    ? diffScopeBuckets(rawMissing, {
+        tenant: deferredBuckets.tenant ?? [],
+        user: deferredBuckets.user ?? [],
+      })
+    : rawMissing;
   if (scopeBucketCount(missing) === 0) return false;
 
   const cancel = new AbortController();
@@ -640,6 +645,66 @@ async function tryAutoFixScopes(
   }
 }
 
+/**
+ * 过滤掉建 bot / 自动配置时因命中企业管理员审批而被主动跳过的权限，避免 daemon
+ * 启动自愈把它们悄悄补进草稿并再次把应用锁在审核中。
+ *
+ * 按桶语义对齐：如果某项缺失只在 `missingBuckets.tenant` 里，检查 `deferred.tenant`；
+ * 只在 `missingBuckets.user` 里，检查 `deferred.user`；两桶都缺时需两桶都已被延迟才跳过。
+ * 一旦用户后续在开放平台手动开通了该权限，它本就不在 `missing*` 里，历史延迟记录自然失效。
+ */
+export function filterDeferredRequiredScopes(
+  missingCritical: readonly RequiredScope[],
+  missingOptional: readonly RequiredScope[],
+  wholeMissingOptional: readonly RequiredScope[],
+  missingBuckets: { tenant: readonly string[]; user: readonly string[] },
+  deferred?: ApprovalDeferredScopeBuckets,
+): {
+  missingCritical: RequiredScope[];
+  missingOptional: RequiredScope[];
+  wholeMissingOptional: RequiredScope[];
+  skippedDeferred: RequiredScope[];
+} {
+  const deferredTenant = new Set(deferred?.tenant ?? []);
+  const deferredUser = new Set(deferred?.user ?? []);
+  if (deferredTenant.size === 0 && deferredUser.size === 0) {
+    return {
+      missingCritical: [...missingCritical],
+      missingOptional: [...missingOptional],
+      wholeMissingOptional: [...wholeMissingOptional],
+      skippedDeferred: [],
+    };
+  }
+  const missingT = new Set(missingBuckets.tenant);
+  const missingU = new Set(missingBuckets.user);
+  const isDeferred = (scopeName: string): boolean => {
+    const needT = missingT.has(scopeName);
+    const needU = missingU.has(scopeName);
+    if (needT || needU) {
+      return (!needT || deferredTenant.has(scopeName)) && (!needU || deferredUser.has(scopeName));
+    }
+    return deferredTenant.has(scopeName) || deferredUser.has(scopeName);
+  };
+  const skippedMap = new Map<string, RequiredScope>();
+  const keep = (list: readonly RequiredScope[]): RequiredScope[] => {
+    const out: RequiredScope[] = [];
+    for (const s of list) {
+      if (isDeferred(s.name)) {
+        skippedMap.set(s.name, s);
+      } else {
+        out.push(s);
+      }
+    }
+    return out;
+  };
+  return {
+    missingCritical: keep(missingCritical),
+    missingOptional: keep(missingOptional),
+    wholeMissingOptional: keep(wholeMissingOptional),
+    skippedDeferred: [...skippedMap.values()],
+  };
+}
+
 const activeScopeChecks = new Map<string, { owner: string | undefined }>();
 
 export async function checkRequiredScopes(larkAppId: string): Promise<void> {
@@ -685,6 +750,14 @@ async function checkRequiredScopesOnce(larkAppId: string, isCurrent: () => boole
     // scope 列表。这种"鸡生蛋"情况单独提示：让 admin 开通免审批的
     // self_manage 后下次重启就能自检了。
     if (infoData.code === LARK_CODE_APP_SCOPE_MISSING) {
+      // 如果 self_manage 本身在 approvalDeferredScopes 里，跳过冷启动自愈与确认链接，
+      // 避免每次重启反复烧版本号或反复给 owner 发确认链接。
+      if (bot.config.approvalDeferredScopes?.tenant?.includes(SELF_MANAGE_SCOPE)) {
+        logger.info(
+          `[${larkAppId}] scope 自检 API 返回 99991672，但 ${SELF_MANAGE_SCOPE} 已记录在 approvalDeferredScopes 中，跳过自动补权。`,
+        );
+        return;
+      }
       // 有有效网页登录态时静默补齐全部必需权限，用户无需操作；审核中同样直接返回。
       if (brand === 'feishu') {
         const requiredNow = BOTMUX_REQUIRED_SCOPES.map(s => ({ name: s.name, desc: s.desc }));
@@ -842,16 +915,30 @@ async function checkRequiredScopesOnce(larkAppId: string, isCurrent: () => boole
     ));
     const missingBuckets = diffScopeBuckets(required, grantedScopeBuckets);
     const missingNames = new Set([...missingBuckets.tenant, ...missingBuckets.user]);
-    const missingCritical = BOTMUX_REQUIRED_SCOPES.filter(scope =>
+    const rawMissingCritical = BOTMUX_REQUIRED_SCOPES.filter(scope =>
       scope.critical && (!grantedScopes.has(scope.name) || missingBuckets.tenant.includes(scope.name)),
     );
-    const criticalNames = new Set(missingCritical.map(scope => scope.name));
-    const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(scope => !criticalNames.has(scope.name)
+    const criticalNames = new Set(rawMissingCritical.map(scope => scope.name));
+    const rawMissingOptional = BOTMUX_REQUIRED_SCOPES.filter(scope => !criticalNames.has(scope.name)
       && (missingNames.has(scope.name) || (!scope.critical && !grantedScopes.has(scope.name))),
     );
     // 网页静默补齐沿用 master 的判定：只补名字整项缺失的可选权限。只缺用户身份那一份的
     // 不在此列，否则这类存量应用每次重启都会被静默提交一个新版本。
-    const wholeMissingOptional = BOTMUX_REQUIRED_SCOPES.filter(scope => !scope.critical && !grantedScopes.has(scope.name));
+    const rawWholeMissingOptional = BOTMUX_REQUIRED_SCOPES.filter(scope => !scope.critical && !grantedScopes.has(scope.name));
+    const filteredRequired = filterDeferredRequiredScopes(
+      rawMissingCritical,
+      rawMissingOptional,
+      rawWholeMissingOptional,
+      missingBuckets,
+      bot.config.approvalDeferredScopes,
+    );
+    if (filteredRequired.skippedDeferred.length > 0) {
+      logger.info(
+        `[${larkAppId}] skipping ${filteredRequired.skippedDeferred.length} approval-deferred required scope(s) during startup self-heal `
+        + `(${filteredRequired.skippedDeferred.map(s => s.name).join(', ')}); user may enable manually on Open Platform`,
+      );
+    }
+    const { missingCritical, missingOptional, wholeMissingOptional } = filteredRequired;
 
     const reviewVersion = infoData.data?.app?.unaudit_version_id;
     let inReviewVersionId = typeof reviewVersion === 'string' && reviewVersion ? reviewVersion : undefined;
@@ -1000,14 +1087,31 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
       logger.info(`[${larkAppId}] VC meeting events already subscribed (long-connection mode)`);
       return;
     }
+    const deferredVcScopes = VC_MEETING_FEATURE_SCOPES.filter(
+      s =>
+        bot.config.approvalDeferredScopes?.tenant?.includes(s.name)
+        || bot.config.approvalDeferredScopes?.user?.includes(s.name),
+    );
+    if (deferredVcScopes.length > 0) {
+      logger.info(
+        `[${larkAppId}] VC events missing, but required VC scope(s) (${deferredVcScopes.map(s => s.name).join(', ')}) are in approvalDeferredScopes; skipping auto-subscribe to avoid repeated version publishes.`,
+      );
+      return;
+    }
     logger.info(
       `[${larkAppId}] VC events missing (${probe.missingVcEvents.join('、') || '事件模式非长连接'}); auto-subscribing via Open Platform...`,
+    );
+    const vcScopeManifest = filterScopeManifest(
+      readDefaultScopeManifest(),
+      VC_MEETING_FEATURE_SCOPES.map(s => s.name),
     );
     const result = await automateOpenPlatformSetup({
       appId: bot.config.larkAppId,
       brand,
       maxWaitMs: 60_000,
       disableQrLogin: true,
+      scopeManifest: vcScopeManifest,
+      excludeScopes: bot.config.approvalDeferredScopes,
       onStatus: (msg) => logger.info(`[${larkAppId}] vc-event-autoconfig: ${msg}`),
       onQrCode: () => {
         logger.warn(`[${larkAppId}] vc-event-autoconfig: cached Feishu web session expired; run \`botmux setup\` to refresh, then restart.`);
