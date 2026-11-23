@@ -19,12 +19,11 @@ import {
   findCodexSessionIdByBotmuxSessionId,
   type CodexDrainState,
 } from '../../services/codex-transcript.js';
-import { bindCodexSessionFromCorrelatedInput, codexFooterSessionId, codexNativeComposerState, codexNativeFooterRows, codexSessionRenameSurface, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
+import { bindCodexSessionFromCorrelatedInput, CODEX_ACTIVE_BUSY_PATTERN, codexFooterSessionId, codexNativeComposerState, codexNativeFooterRows, codexSessionRenameSurface, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { codexTranscriptCloseable, prepareCodexTranscriptInput, settleCodexInputBox } from '../../services/codex-transcript-input.js';
 
-const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
 /** First codex-cli release that emits OSC 7501 program status (see the
  *  adapter's supportsProgramStatus note). */
 export const CODEX_PROGRAM_STATUS_MIN_VERSION = '0.163.0';
@@ -624,8 +623,8 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     defaultPassthroughCommands: ['/goal'],
     buildSessionRenameCommand: (title) => `/rename ${title}`,
     sessionRenameSurface: codexSessionRenameSurface,
-    watchSessionRename: (command) => watchNativeSessionIndex(
-      join(codexHome(), 'session_index.jsonl'), command.replace(/^\/rename /, ''),
+    watchSessionRename: (command, { getCliSessionId, fromByte }) => watchNativeSessionIndex(
+      join(codexHome(), 'session_index.jsonl'), command.replace(/^\/rename /, ''), getCliSessionId, fromByte,
     ),
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:

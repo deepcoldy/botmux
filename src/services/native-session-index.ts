@@ -17,13 +17,18 @@ export function nativeSessionIndexSize(path: string): number {
 const MAX_DELTA_BYTES = 1024 * 1024;
 
 /**
- * Whether a line appended after `fromByte` names a thread exactly `title`.
+ * Whether a line appended after `fromByte` names `sessionId` exactly `title`.
  * A partial first line (the file was rewritten) or malformed lines are
  * skipped; an unreadable or not-yet-grown index proves nothing.
  */
-export function nativeSessionIndexNamedSince(path: string, fromByte: number, title: string): boolean {
+export function nativeSessionIndexNamedSince(
+  path: string,
+  fromByte: number,
+  title: string,
+  sessionId: string,
+): boolean {
   const wanted = title.trim();
-  if (!wanted) return false;
+  if (!wanted || !sessionId.trim()) return false;
   let size: number;
   try { size = statSync(path).size; } catch { return false; }
   if (size <= fromByte) return false;
@@ -46,8 +51,8 @@ export function nativeSessionIndexNamedSince(path: string, fromByte: number, tit
   for (const line of buffer.toString('utf8').split('\n')) {
     if (!line.trim()) continue;
     try {
-      const record = JSON.parse(line) as { thread_name?: unknown };
-      if (typeof record.thread_name === 'string' && record.thread_name.trim() === wanted) return true;
+      const record = JSON.parse(line) as { id?: unknown; thread_name?: unknown };
+      if (record.id === sessionId && typeof record.thread_name === 'string' && record.thread_name.trim() === wanted) return true;
     } catch { /* partial or foreign line */ }
   }
   return false;
@@ -55,10 +60,24 @@ export function nativeSessionIndexNamedSince(path: string, fromByte: number, tit
 
 /**
  * A probe armed right before the rename command is typed: true once the
- * index records `title` after that moment. Used by the TRAE and Codex
- * adapters' `watchSessionRename`.
+ * index records `title` for this exact native thread after that moment.
+ * Without a native id there is no safe shared-file fallback: another thread's
+ * same-title rename must never release this session's queued input.
  */
-export function watchNativeSessionIndex(path: string, title: string): () => boolean {
-  const fromByte = nativeSessionIndexSize(path);
-  return () => nativeSessionIndexNamedSince(path, fromByte, title);
+export function watchNativeSessionIndex(
+  path: string,
+  title: string,
+  getSessionId: () => string | undefined,
+  fromByte?: number,
+): () => boolean {
+  const baseline = fromByte ?? nativeSessionIndexSize(path);
+  return () => {
+    // Identity can be proven AFTER a persistent reattach armed this probe.
+    // Keep the original baseline so the valid receipt written meanwhile still
+    // counts; while no id is proven, no same-title record can release input.
+    const sessionId = getSessionId();
+    return sessionId?.trim()
+      ? nativeSessionIndexNamedSince(path, baseline, title, sessionId)
+      : false;
+  };
 }

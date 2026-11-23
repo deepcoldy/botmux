@@ -180,6 +180,10 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'clearStatuslineSnapshot') return clearStatuslineSnapshot;
     if (key === 'confirmedTerminalEffortChoice') return () => undefined;
     if (key === 'noteTerminalEffortInput') return () => {};
+    // Most extracted input-path fixtures never model a persistent respawn;
+    // keep the new reattach reconciliation inert unless a test loads it as
+    // the function under test with its own explicit backend/generation scope.
+    if (key === 'recoverSessionRenameAfterPersistentReattach') return () => false;
     if (key === 'recordStructuredInput') return () => {};
     if (key === 'updateSessionTurnNativeAnchor') return () => {};
     if (key === 'claudeEffortObserver') {
@@ -280,6 +284,7 @@ export function loadWorkerMessageHandler(name: string, scope: Record<string, unk
       const scopedDefault = defaultScopedWorkerState(scope, key);
       if (scopedDefault !== undefined) return scopedDefault;
       if (key === 'recordStructuredInput') return () => {};
+      if (key === 'recoverSessionRenameAfterPersistentReattach') return () => false;
       if (key === 'updateSessionTurnNativeAnchor') return () => {};
       if (key === 'revokePromptReadiness') return loadWorkerFunction('revokePromptReadiness', scope);
       return (globalThis as any)[key];

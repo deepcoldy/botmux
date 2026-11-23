@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -58,23 +58,36 @@ interface Harness {
   logs: string[];
   submissions: () => string[];
   renames: () => string[];
+  recordNativeRename: (id: string, title: string) => void;
   userPressesEnter: () => void;
   /** The TUI stops reading its input for `ms` (host load); bytes written
    *  meanwhile reach it in one read afterwards. Resolves once it stopped. */
   stallReading: (ms: number) => Promise<void>;
+  /** SIGKILL this worker and attach a replacement to the same surviving tmux
+   *  pane/session store. The fake CLI process itself stays alive. */
+  restartWorker: () => Promise<void>;
 }
 
 /** @param swallowedRenameEnters how many Enters the fake takes as a newline
  *  while `/rename …` sits in its composer (1 = the rename's own Enter).
  *  @param unknownFooterAfterRename once renamed, draw a footer no screen
- *  predicate knows (a future TRAE layout). */
-async function startWorker(swallowedRenameEnters: number, unknownFooterAfterRename = false): Promise<Harness> {
+ *  predicate knows (a future TRAE layout).
+ *  @param outputWhileStalled emit cursor-only frames while stdin is paused:
+ *  terminal output that neither consumes input nor changes the viewport. */
+async function startWorker(
+  swallowedRenameEnters: number,
+  unknownFooterAfterRename = false,
+  outputWhileStalled = false,
+  forceTmux = false,
+  unknownFooterWhileUnsubmitted = false,
+): Promise<Harness> {
   const sessionId = randomUUID();
   const root = mkdtempSync(join(tmpdir(), 'botmux-traex-rename-hold-'));
   tempDirs.add(root);
   const dataDir = join(root, 'session');
   const traeHome = join(root, '.trae');
   const cliDir = join(traeHome, 'cli');
+  const indexPath = join(cliDir, 'session_index.jsonl');
   const rolloutDir = join(cliDir, 'sessions', '2026', '11', '23');
   const nativeSessionId = '00000000-0000-7000-8000-000000000777';
   const rolloutPath = join(rolloutDir, `rollout-2026-11-23T00-00-00-${nativeSessionId}.jsonl`);
@@ -85,7 +98,11 @@ async function startWorker(swallowedRenameEnters: number, unknownFooterAfterRena
   const stalledPath = join(root, 'stalled');
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(rolloutDir, { recursive: true });
-  writeFileSync(rolloutPath, '');
+  writeFileSync(rolloutPath, `${JSON.stringify({
+    timestamp: '2026-11-23T00:00:00Z',
+    type: 'session_meta',
+    payload: { id: nativeSessionId, thread_source: 'user', timestamp: '2026-11-23T00:00:00Z' },
+  })}\n`);
   writeFileSync(join(cliDir, 'history.jsonl'), '');
   writeFileSync(submissionsPath, '');
   writeFileSync(renamesPath, '');
@@ -96,7 +113,7 @@ const fs = require('node:fs');
 // A live rollout fd proves this process owns the history SID.
 const rolloutFd = fs.openSync(${JSON.stringify(rolloutPath)}, 'a');
 const historyPath = ${JSON.stringify(join(cliDir, 'history.jsonl'))};
-const indexPath = ${JSON.stringify(join(cliDir, 'session_index.jsonl'))};
+const indexPath = ${JSON.stringify(indexPath)};
 const sessionId = ${JSON.stringify(nativeSessionId)};
 let swallow = ${swallowedRenameEnters};
 let footer = '  GPT-6-Astra xhigh · Context 90% left';
@@ -114,13 +131,20 @@ function render() {
 }
 function enter(fromUser) {
   if (draft.startsWith('/rename ')) {
-    if (swallow > 0 && !fromUser) { swallow--; draft += '\\n'; render(); return; }
+    if (swallow > 0 && !fromUser) {
+      swallow--;
+      draft += '\\n';
+      if (${unknownFooterWhileUnsubmitted}) footer = '  GPT-6-Astra xhigh · an unreadable status cell';
+      render();
+      return;
+    }
     const name = draft.slice(8).trim();
     draft = '';
     fs.appendFileSync(${JSON.stringify(renamesPath)}, line({ name }));
     fs.appendFileSync(indexPath, line({ id: sessionId, thread_name: name, updated_at: new Date().toISOString() }));
     last = '◆ Thread renamed to ' + name;
     if (${unknownFooterAfterRename}) footer = '  GPT-6-Astra xhigh · a status cell from a newer release';
+    if (${unknownFooterWhileUnsubmitted}) footer = '  GPT-6-Astra xhigh · Context 90% left';
     render();
     return;
   }
@@ -172,7 +196,13 @@ setInterval(() => {
     fs.rmSync(${JSON.stringify(stallPath)});
     process.stdin.pause();
     fs.writeFileSync(${JSON.stringify(stalledPath)}, '');
-    setTimeout(() => process.stdin.resume(), ms);
+    const noise = ${outputWhileStalled}
+      ? setInterval(() => process.stdout.write('\\x1b[?25l\\x1b[?25h'), 25)
+      : undefined;
+    setTimeout(() => {
+      if (noise) clearInterval(noise);
+      process.stdin.resume();
+    }, ms);
   }
 }, 25);
 `);
@@ -181,7 +211,8 @@ setInterval(() => {
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
   const workerBinary = process.env.BOTMUX_TEST_WORKER_BINARY;
-  if (workerBinary) tmuxSessions.add(`bmx-${sessionId.slice(0, 8)}`);
+  const backendType = workerBinary || forceTmux ? 'tmux' : 'pty';
+  if (backendType === 'tmux') tmuxSessions.add(`bmx-${sessionId.slice(0, 8)}`);
   const options: SpawnOptions = {
     cwd: resolve('.'),
     env: {
@@ -196,41 +227,56 @@ setInterval(() => {
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   };
-  const child = workerBinary
-    ? spawn(workerBinary, ['__worker'], options)
-    : spawnNodeTsScript(resolve('src/worker.ts'), [], options);
-  children.add(child);
-  child.on('message', raw => messages.push(raw as WorkerToDaemon));
-  child.stdout?.on('data', chunk => logs.push(chunk.toString()));
-  child.stderr?.on('data', chunk => logs.push(chunk.toString()));
-  child.send({
-    type: 'init',
-    sessionId,
-    chatId: 'oc_test',
-    rootMessageId: 'om_root',
-    workingDir: dataDir,
-    cliId: 'traex',
-    cliPathOverride: fakeTraex,
-    cliSessionId: nativeSessionId,
-    resume: true,
-    backendType: workerBinary ? 'tmux' : 'pty',
-    prompt: '',
-    larkAppId: 'app_test',
-    larkAppSecret: 'secret',
-  } satisfies DaemonToWorker);
+  let child!: ChildProcess;
+  const launchWorker = () => {
+    child = workerBinary
+      ? spawn(workerBinary, ['__worker'], options)
+      : spawnNodeTsScript(resolve('src/worker.ts'), [], options);
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.send({
+      type: 'init',
+      sessionId,
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'traex',
+      cliPathOverride: fakeTraex,
+      cliSessionId: nativeSessionId,
+      nativeSessionTitle: TITLE,
+      resume: true,
+      backendType,
+      prompt: '',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+  };
+  launchWorker();
   await waitFor(child, () => messages.some(m => m.type === 'prompt_ready'), logs, 'resumed TRAE prompt', 30_000);
   return {
-    child,
+    get child() { return child; },
     messages,
     logs,
     // The worker may append its own context block (e.g. a refreshed Skill
     // catalog) below the user's text; the user's text is the first line.
     submissions: () => readJsonLines<{ text: string }>(submissionsPath).map(s => s.text.split('\n')[0]!),
     renames: () => readJsonLines<{ name: string }>(renamesPath).map(r => r.name),
+    recordNativeRename: (id, title) => appendFileSync(indexPath, `${JSON.stringify({ id, thread_name: title })}\n`),
     userPressesEnter: () => writeFileSync(userEnterPath, ''),
     stallReading: async (ms: number) => {
       writeFileSync(stallPath, String(ms));
       await waitFor(child, () => existsSync(stalledPath), logs, 'TUI input stall');
+    },
+    restartWorker: async () => {
+      const previous = child;
+      const exited = new Promise<void>(done => previous.once('exit', () => done()));
+      previous.kill('SIGKILL');
+      await Promise.race([exited, new Promise<void>(done => setTimeout(done, 2_000))]);
+      const prompts = messages.filter(message => message.type === 'prompt_ready').length;
+      launchWorker();
+      await waitFor(child, () => messages.filter(message => message.type === 'prompt_ready').length > prompts, logs, 'warm reattach prompt', 30_000);
     },
   };
 }
@@ -262,12 +308,54 @@ describe('TRAE native rename left in the composer', () => {
     expect(h.submissions()).toEqual([FOLLOW_UP]);
   }, 90_000);
 
-  it('does not take the pre-rename composer of a TUI stalled past the rename wait for a finished rename', async () => {
-    const h = await startWorker(1);
-    // Past the 5s wait: the screen keeps showing the empty composer it had
-    // before the command, then the TUI reads the command and its Enter at once.
+  it('accepts this thread\'s valid rename receipt after a persistent worker replacement', async () => {
+    const h = await startWorker(0, false, false, true);
+    await h.restartWorker();
+    await send(h.child, { type: 'rename_session', title: TITLE });
+    await send(h.child, { type: 'message', content: FOLLOW_UP, turnId: 'om_follow' });
+    await waitFor(h.child, () => h.submissions().includes(FOLLOW_UP), h.logs, 'follow-up after warm reattach', 40_000);
+    expect(h.renames()).toEqual([TITLE]);
+    expect(h.submissions()).toEqual([FOLLOW_UP]);
+  }, 90_000);
+
+  it('completes a surviving unsubmitted rename before restored input after worker replacement', async () => {
+    const h = await startWorker(2, false, false, true);
+    await send(h.child, { type: 'rename_session', title: TITLE });
+    await waitFor(h.child, () => h.logs.some(line => line.includes('pressed Enter once')), h.logs, 'recovery Enter before replacement');
+    expect(h.renames()).toEqual([]);
+    await h.restartWorker();
+    await send(h.child, { type: 'message', content: FOLLOW_UP, turnId: 'om_follow' });
+    await waitFor(h.child, () => h.submissions().includes(FOLLOW_UP), h.logs, 'restored follow-up after surviving rename', 40_000);
+    expect(h.renames()).toEqual([TITLE]);
+    expect(h.submissions()).toEqual([FOLLOW_UP]);
+  }, 90_000);
+
+  it('holds restored input on unknown surviving evidence and recovers after the user completes the rename', async () => {
+    const h = await startWorker(1, false, false, true, true);
+    await send(h.child, { type: 'rename_session', title: TITLE });
+    await waitFor(h.child, () => h.logs.some(line => line.includes('Native session rename not confirmed (unknown)')), h.logs, 'unknown surviving surface');
+    await h.restartWorker();
+    await send(h.child, { type: 'message', content: FOLLOW_UP, turnId: 'om_follow' });
+    const notices = () => h.messages.filter(message => message.type === 'user_notify' && message.turnId === 'om_follow');
+    await sleep(6_000);
+    expect(h.renames()).toEqual([]);
+    expect(h.submissions()).toEqual([]);
+    expect(notices()).toHaveLength(1);
+    h.userPressesEnter();
+    await waitFor(h.child, () => h.submissions().includes(FOLLOW_UP), h.logs, 'follow-up after unknown surface settles', 40_000);
+    expect(h.renames()).toEqual([TITLE]);
+    expect(h.submissions()).toEqual([FOLLOW_UP]);
+    expect(notices()).toHaveLength(1);
+  }, 90_000);
+
+  it('ignores unrelated output and another thread\'s same-title receipt while the TUI has not read the rename', async () => {
+    const h = await startWorker(1, false, true);
+    // The screen stays at the pre-rename empty composer while cursor-only
+    // frames keep advancing the worker's global PTY output generation.
     await h.stallReading(6_500);
     await send(h.child, { type: 'rename_session', title: TITLE });
+    await waitFor(h.child, () => h.logs.some(line => line.includes('Native session rename command sent')), h.logs, 'rename write');
+    h.recordNativeRename('another-thread', TITLE);
     await send(h.child, { type: 'message', content: FOLLOW_UP, turnId: 'om_follow' });
     await waitFor(h.child, () => h.submissions().includes(FOLLOW_UP), h.logs, 'follow-up turn', 40_000);
     expect(h.renames()).toEqual([TITLE]);

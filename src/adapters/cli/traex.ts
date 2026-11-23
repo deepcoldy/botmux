@@ -793,8 +793,8 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // text with a full-width at sign so the command remains a single submit.
     buildSessionRenameCommand: (title) => `/rename ${title.replaceAll('@', '＠')}`,
     sessionRenameSurface: ({ viewport }, command) => traexSessionRenameSurface(viewport, command),
-    watchSessionRename: (command) => watchNativeSessionIndex(
-      join(traeHome(), 'cli', 'session_index.jsonl'), command.replace(/^\/rename /, ''),
+    watchSessionRename: (command, { getCliSessionId, fromByte }) => watchNativeSessionIndex(
+      join(traeHome(), 'cli', 'session_index.jsonl'), command.replace(/^\/rename /, ''), getCliSessionId, fromByte,
     ),
     altScreen: false,
     skillsDir: '~/.trae/skills',

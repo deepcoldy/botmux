@@ -274,6 +274,25 @@ describe('auto-model Worker admission and original-input retirement', () => {
     expect(h.scope.pendingMessages).toHaveLength(1);
   });
 
+  it('does not turn an ambiguous failed rename write into a composer-empty release', () => {
+    const successor = { content: 'next ask', turnId: 'next' };
+    const h = harness({
+      pendingMessages: [successor], pendingAdoptMessages: [], pendingRawInputs: [],
+      isPromptReady: false, flushPending: vi.fn(), armSessionRenameIdleTimeout: vi.fn(),
+      sessionRenamePhase: 'writing', sessionRenameResubmitted: false,
+      sessionRenameHoldLogged: false, sessionRenameHoldNoticeSent: true,
+      sessionRenameSurfaceNow: () => 'settled', sessionRenameRecorded: () => false,
+      decideSessionRenameSettlement, cliName: () => 'TRAE', notifySessionRenameInputHeld: vi.fn(),
+    });
+    h.scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', h.scope);
+    loadWorkerFunction('settleFailedSessionRenameWrite', h.scope)();
+    expect(h.scope.sessionRenamePhase).toBe('sent');
+    loadWorkerFunction<(source: 'timer') => void>('settleSessionRename', h.scope)('timer');
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toEqual([successor]);
+    expect(h.scope.armSessionRenameIdleTimeout).toHaveBeenCalledOnce();
+  });
+
   it('keeps interruption scanning enabled when rename timeout resets the model with an unfinished predecessor', async () => {
     vi.useFakeTimers();
     try {
@@ -288,9 +307,13 @@ describe('auto-model Worker admission and original-input retirement', () => {
       });
       const reset = loadAutoModelReset(h.scope);
       h.scope.flushPending = vi.fn(() => reset());
-      // The timeout releases only on a settled composer; this test is about
-      // what that release's flush does, so the composer reads as settled.
-      Object.assign(h.scope, { sessionRenameSurfaceNow: () => 'settled', decideSessionRenameSettlement });
+      // The timeout releases only after this thread records the rename; this
+      // test is about what that release's flush does, so provide that receipt.
+      Object.assign(h.scope, {
+        sessionRenameSurfaceNow: () => 'settled',
+        sessionRenameRecorded: () => true,
+        decideSessionRenameSettlement,
+      });
       h.scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', h.scope);
       h.scope.settleSessionRename = loadWorkerFunction('settleSessionRename', h.scope);
       expect(h.scope.activeTurnAuthority.snapshot()).toMatchObject({ turnId: 'turn', started: true });
