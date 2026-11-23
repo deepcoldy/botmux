@@ -2272,9 +2272,22 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   const explicitOrigin = origin ?? (msg.type === 'managed_turn_origin' && typeof pendingManagedTurnOriginScope !== 'undefined'
     ? pendingManagedTurnOriginScope
     : undefined);
+  // The restart receipt is a statement about THIS ATTEMPT, not a runtime
+  // observation: it says the attempt the daemon minted reached a prompt. The
+  // relay rebinds in process (launcher pid → the real CLI behind it) while the
+  // callbacks armed during spawn keep the launcher's binding, and the host then
+  // judges the receipt against a retired runtime and never hands it to the
+  // restart coordinator — `/restart` reported 等待就绪超时 forty seconds after a
+  // CLI that was already at its prompt (2026-11-23). So name the live binding of
+  // the same physical CLI. Readiness keeps the captured binding on purpose: a
+  // pre-replacement callback must not publish the successor's readiness
+  // (session-contract-gateway.test.ts).
+  const liveProcessOrigin = msg.type === 'restart_result'
+    ? workerSessionEventScope.liveProcessOrigin()
+    : undefined;
   // Runtime identity follows the physical observer's binding. A submitted
   // turn may still name the previous runtime after an in-process rebind.
-  const captured = explicitOrigin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()
+  const captured = explicitOrigin ?? liveProcessOrigin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()
     : workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined)) ?? operationOrigin;
   const context = workerSessionEventScope.envelope(captured);
   if (!context.scope.execution && 'turnId' in msg) {
@@ -22996,6 +23009,12 @@ function settleRestartAttemptOnReady(
       category: 'prompt_ready',
       ...(topicEffort ? { topicEffort } : {}),
     });
+    // The success receipt is the ONLY edge that closes the restart's status card
+    // and lifts the daemon's workerReady fence, and until now nothing on either
+    // side said whether it was sent. A `/restart` card that sat at 重启超时 while
+    // the CLI was plainly back at its prompt could not be told apart from a
+    // receipt that never left the worker (2026-11-23). One line per restart.
+    log(`${trigger}: restart receipt sent (attempt=${activeRestartAttemptId.slice(0, 8)}, status=succeeded)`);
     activeRestartAttemptId = undefined;
     return;
   }
