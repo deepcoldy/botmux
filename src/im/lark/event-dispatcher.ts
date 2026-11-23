@@ -444,10 +444,15 @@ async function tryWebAutoFixScopes(
         ? '无变更，已跳过发版'
         : result.versionWarning
           ? `version ${result.versionId ?? 'n/a'} NOT published（${result.versionWarning}）`
-          : `version ${result.versionId ?? 'n/a'} ${result.versionReused ? '(复用既有草稿) ' : ''}published`;
+          : result.versionPendingReview
+            ? `version ${result.pendingReviewAppVersion ?? result.versionId ?? 'n/a'} ${result.versionReused ? '(复用既有草稿) ' : ''}submitted, awaiting enterprise review`
+            : `version ${result.versionId ?? 'n/a'} ${result.versionReused ? '(复用既有草稿) ' : ''}published`;
       // 「秒过」与「要人审」是两种截然不同的结局，日志必须分开——否则运维看到
       // published 会以为权限已经生效，而实际上可能还在等某个人点同意。
-      const approvalDetail = result.approvalAutoPassed === true
+      // 回读到「停在审核中」是事实，优先于审批预判（预判说自动通过的版本也会卡在审核中）。
+      const approvalDetail = result.versionPendingReview
+        ? '（等待企业管理员审核，审核通过前新权限不生效）'
+        : result.approvalAutoPassed === true
         ? '（审批流自动通过，已即时生效）'
         : result.approvalHumanApprovers?.length
           ? `（需人工审批：${result.approvalHumanApprovers.join('、')}）`
@@ -480,6 +485,12 @@ async function tryWebAutoFixScopes(
         //   ③ 判不出来 → 保持中性措辞，不猜
         const versionLine = result.versionWarning
           ? `⚠️ 但新版本**没有成功提交发布**（${result.versionWarning}）。权限要等版本发布后才生效。`
+          : result.versionPendingReview
+            ? `新版本 ${result.pendingReviewAppVersion ?? result.versionId ?? ''} 已提交，正在**等待企业管理员审核**`
+              + `${result.approvalHumanApprovers?.length ? `（审批人：${result.approvalHumanApprovers.join('、')}）` : ''}，`
+              + '通过后权限才生效——不用重复提交，审批进度可在飞书「审批」里查看。'
+              + '若审批被驳回或长时间没有进展，多半是有配置不合规（最常见：权限的数据范围为「全部/全员」），'
+              + '需到开放平台看审批详情、改好后撤回该版本再重新提交（botmux 不会自动撤回）。'
           : result.approvalAutoPassed === true
             ? '新版本已提交，审批流**自动通过**，权限已即时生效。'
             : result.approvalHumanApprovers?.length
@@ -489,12 +500,17 @@ async function tryWebAutoFixScopes(
         await dmAdmin(
           larkAppId,
           adminOpenId,
-          (autoFixEffective && !result.versionWarning
+          (autoFixEffective && !result.versionWarning && result.versionPendingReview
+            ? `⏳ botmux 已为机器人 "${bot.botName ?? larkAppId}" 补齐以下缺失权限并提交了新版本，正在等待企业管理员审核：\n\n`
+            : autoFixEffective && !result.versionWarning
             ? `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n`
             : `⚠️ botmux 尝试自动为机器人 "${bot.botName ?? larkAppId}" 补齐以下权限，但没能全部落地，需要你手动收尾：\n\n`) +
           `${missingList}\n\n` +
           `${scopeDetail}，${versionLine}\n` +
-          `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`,
+          (result.versionPendingReview
+            // 一项都没补进清单时，审核通过了也不会多出权限，不能说「即生效」。
+            ? (autoFixEffective ? '审核通过后权限即生效。' : '')
+            : `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`),
           autoFixEffective ? `auto-fixed ${fixedList.length} scopes` : `auto-fix could not apply ${fixedList.length} scopes`,
         );
       }
@@ -877,7 +893,7 @@ async function checkRequiredScopesOnce(larkAppId: string, isCurrent: () => boole
       const summary = missingCritical.map(s => `${s.name} (${s.desc})`).join('、');
       logger.warn(
         `[${larkAppId}] 缺少 ${missingCritical.length} 项必需权限（${summary}），` +
-        '但应用有一个版本卡在飞书审核中、配置暂时不可写；需人工修配置后撤回重提，botmux 无法自动解决。',
+        '但应用有一个版本在等待企业管理员审核、配置暂时不可写；若审批被驳回或长期没有进展，需人工修配置后撤回重提，botmux 不会自动撤回。',
       );
       const reviewAdmin = getAdminOpenId(bot);
       // 🔴 同一个待审版本只打扰一次。不做节流的话，卡在审核中是个持续数天的状态
@@ -896,10 +912,10 @@ async function checkRequiredScopesOnce(larkAppId: string, isCurrent: () => boole
           `⏳ 机器人 "${bot.botName ?? larkAppId}" 还缺 ${missingCritical.length} 项必需权限，`
           + `而它有一个版本**卡在飞书审核中**，开放平台锁定了配置写入，botmux 补不了：\n\n`
           + `${missingCritical.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n')}\n\n`
-          + `**为什么会进审核**：触发企业审批通常说明有配置不合规，最常见是权限的「数据范围」`
+          + `审批进度可在飞书「审批」里查看。**如果审批被驳回或长时间没有进展**，通常说明有配置不合规，最常见是权限的「数据范围」`
           + `没配、默认成「全部/全员」，撞上租户「非必要不申请全员数据，如申请全员范围需提供`
           + `充分理由、视情况加签至 CEO-2」的规则。${rangeHint}\n\n`
-          + `**怎么修**（这一版不会自己通过，需要人工）：\n`
+          + `**怎么修**（审批被驳回或长时间没有进展时，需要人工）：\n`
           + `1. 开放平台 →「版本管理与发布」→ 点进审核中那一版的**版本详情**，看审批详情里被卡的项\n`
           + `2. 修掉不合规项（如把权限的数据范围从「全部」改成「与应用的可用范围一致」）\n`
           + `3. 在版本详情页点 **Withdraw** 撤回该版本\n`
@@ -997,7 +1013,7 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
       },
     });
     if (result.ok) {
-      logger.info(`[${larkAppId}] VC events auto-subscribed: ${result.subscribedEventCount} events, version ${result.versionId ?? 'n/a'} published`);
+      logger.info(`[${larkAppId}] VC events auto-subscribed: ${result.subscribedEventCount} events, version ${result.pendingReviewAppVersion ?? result.versionId ?? 'n/a'} ${result.versionPendingReview ? 'submitted, awaiting enterprise review (events take effect after approval)' : 'published'}`);
       return;
     }
     // Automation failed (session expired mid-run / api error). Log; DM the admin

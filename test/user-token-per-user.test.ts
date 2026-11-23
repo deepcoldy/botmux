@@ -495,6 +495,106 @@ describe('handleCallbackUrl — attribution must be proven, never assumed', () =
 });
 
 /**
+ * /login 授权码回调拿回的 token 缺了申请的 scope（典型：那些权限还在应用新版本的企业审核
+ * 里）。这条链路的保存判定不变，但不能只回一句「授权成功」——用户紧接着重试会再撞缺权限。
+ */
+describe('handleCallbackUrl — scopes the grant left out', () => {
+  beforeEach(() => { files.clear(); vi.unstubAllGlobals(); });
+
+  async function callbackGranting(
+    grantedScope: (requested: string[]) => string | undefined,
+    versions: unknown,
+    opts: { legacyPending?: boolean } = {},
+  ) {
+    let mod = await fresh();
+    const { authUrl } = mod.generateAuthUrl(APP, 'sec', 'feishu', ['docx:document:create', 'im:feed.flag:read'], ALICE);
+    const requested = new URL(authUrl).searchParams.get('scope')!.split(' ');
+    const state = new URL(authUrl).searchParams.get('state')!;
+    if (opts.legacyPending) {
+      // 升级前生成的 pending 文件没有 scopes 字段；换一个模块实例，只能从盘上读到它。
+      const path = [...files.keys()].find(p => p.endsWith(`${state}.json`))!;
+      const { scopes: _scopes, ...legacy } = JSON.parse(files.get(path)!);
+      files.set(path, JSON.stringify(legacy));
+      mod = await fresh();
+    }
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      calls.push(String(url));
+      if (String(url).includes('/oauth/token')) {
+        return Response.json({
+          access_token: 'AT', refresh_token: 'RT', token_type: 'Bearer',
+          expires_in: 7200, refresh_token_expires_in: 604800, scope: grantedScope(requested),
+        });
+      }
+      if (String(url).endsWith('/user_info')) return Response.json({ code: 0, data: { open_id: ALICE, name: '爱丽丝' } });
+      if (String(url).endsWith('/tenant_access_token/internal')) return Response.json({ code: 0, tenant_access_token: 'tt' });
+      if (String(url).includes(`/applications/${APP}/app_versions`)) return Response.json(versions);
+      throw new Error(`unexpected ${url}`);
+    }));
+    const detailed = await mod.handleCallbackUrlDetailed(`http://127.0.0.1:9768/callback?code=abc&state=${state}`);
+    const msg = detailed!.warning ? `${detailed!.message}\n${detailed!.warning}` : detailed!.message;
+    return { msg, detailed: detailed!, calls };
+  }
+
+  const inReview = { code: 0, data: { items: [{ version: '1.0.11', version_id: 'oav_p', status: 3 }] } };
+
+  it('still saves, but names the missing scope and the version under review', async () => {
+    const { msg } = await callbackGranting(requested => requested.filter(s => s !== 'im:feed.flag:read').join(' '), inReview);
+    expect(msg).toContain('✅');
+    expect(files.has(perUserPath(APP, ALICE))).toBe(true);
+    expect(msg).toContain('im:feed.flag:read');
+    expect(msg).not.toContain('docx:document:create');
+    expect(msg).toContain('1.0.11');
+  });
+
+  it('names the missing scope without a review claim when the version state is unreadable', async () => {
+    const { msg } = await callbackGranting(
+      requested => requested.filter(s => s !== 'im:feed.flag:read').join(' '),
+      { code: 99991672, msg: 'scope not applied' },
+    );
+    expect(msg).toContain('✅');
+    expect(msg).toContain('im:feed.flag:read');
+    // 查不到版本状态就不能声称「在审核」——审核是这里唯一被禁止猜测的原因。
+    expect(msg).not.toContain('1.0.11');
+    expect(msg).not.toContain('审核');
+  });
+
+  it('hands the note back separately so auto-callback pages can show it', async () => {
+    const { detailed } = await callbackGranting(requested => requested.filter(s => s !== 'im:feed.flag:read').join(' '), inReview);
+    expect(detailed.message).toContain('✅');
+    expect(detailed.message).not.toContain('im:feed.flag:read');
+    expect(detailed.warning).toContain('im:feed.flag:read');
+    expect(detailed.warning).toContain('1.0.11');
+  });
+
+  it('does not blame a pending version that does not carry the missing scope', async () => {
+    const unrelated = { code: 0, data: { items: [{ version: '1.0.11', status: 3, scopes: [{ scope: 'contact:user.base:readonly', token_types: ['user'] }] }] } };
+    const { msg } = await callbackGranting(requested => requested.filter(s => s !== 'im:feed.flag:read').join(' '), unrelated);
+    expect(msg).toContain('im:feed.flag:read');
+    expect(msg).not.toContain('审核');
+  });
+
+  it.each([
+    ['the token response carries no scope field', { grant: () => undefined, legacyPending: false }],
+    ['the pending file predates the scopes record', {
+      grant: (requested: string[]) => requested.filter(s => s !== 'im:feed.flag:read').join(' '), legacyPending: true,
+    }],
+  ])('says nothing extra when %s', async (_label, { grant, legacyPending }) => {
+    const { msg, calls } = await callbackGranting(grant, inReview, { legacyPending });
+    expect(msg).toContain('✅');
+    expect(msg).not.toContain('⚠️');
+    expect(calls.some(url => url.includes('/app_versions'))).toBe(false);
+  });
+
+  it('adds nothing and queries nothing when every requested scope was granted', async () => {
+    const { msg, calls } = await callbackGranting(requested => requested.join(' '), inReview);
+    expect(msg).toContain('✅');
+    expect(msg).not.toContain('⚠️');
+    expect(calls.some(url => url.includes('/app_versions'))).toBe(false);
+  });
+});
+
+/**
  * The readers, not the writer.
  *
  * Per-person storage is only half a feature: `/login` writes

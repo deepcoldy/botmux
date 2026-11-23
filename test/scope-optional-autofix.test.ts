@@ -30,6 +30,7 @@ import { checkRequiredScopes, ensureVcMeetingEventsSubscribed } from '../src/im/
 import { readDefaultScopeManifest } from '../src/setup/open-platform-automation.js';
 import type { RegisterAppOptions } from '../src/setup/register-app.js';
 import { BOTMUX_REQUIRED_SCOPES } from '../src/setup/verify-permissions.js';
+import { logger } from '../src/utils/logger.js';
 
 const APP = 'cli_scope_selfcheck';
 const makeBot = (config: Record<string, unknown> = {}) => ({
@@ -140,6 +141,45 @@ describe('checkRequiredScopes — 官方增量确认', () => {
     expect(h.register).not.toHaveBeenCalled();
     expect(h.dm).toHaveBeenCalledTimes(1);
     expect(h.dm.mock.calls[0][2]).toContain('卡在飞书审核中');
+  });
+
+  describe('网页补齐提交的版本停在企业审核', () => {
+    const pending = (patch: Record<string, unknown> = {}) => ({
+      ok: true, scopeCount: 1, skippedScopeCount: 0, privilegeRangeCount: 0, subscribedEventCount: 0,
+      versionId: 'ver_fixed', approvalAutoPassed: false, versionPendingReview: true, pendingReviewAppVersion: '1.0.7', ...patch,
+    });
+    const logged = (spy: { mock: { calls: unknown[][] } }) => spy.mock.calls.map(call => String(call[0]));
+
+    it('私信和日志都说在等企业管理员审核，不说已发布/已生效', async () => {
+      const info = vi.spyOn(logger, 'info');
+      const warn = vi.spyOn(logger, 'warn');
+      try {
+        h.automate.mockResolvedValue(pending());
+        stubLark({ granted: [...critical, ...optional].filter(name => name !== missingCriticalScope) });
+        await checkRequiredScopes(APP);
+        expect(h.dm).toHaveBeenCalledTimes(1);
+        const text = String(h.dm.mock.calls[0][2]);
+        expect(text).toContain('1.0.7');
+        expect(text).toContain('企业管理员审核');
+        expect(text).not.toContain('已自动为');
+        expect(text).not.toContain('1-2 分钟生效');
+        const summary = [...logged(info), ...logged(warn)].find(line => /auto-fix (succeeded|could NOT)/.test(line))!;
+        expect(summary).toContain('1.0.7');
+        expect(summary).not.toMatch(/\bpublished\b/);
+      } finally {
+        info.mockRestore();
+        warn.mockRestore();
+      }
+    });
+
+    it('一项权限都没补进清单时，不承诺「审核通过后权限即生效」', async () => {
+      h.automate.mockResolvedValue(pending({ scopeCount: 0, scopeWarning: '1 项权限申请被拒' }));
+      stubLark({ granted: [...critical, ...optional].filter(name => name !== missingCriticalScope) });
+      await checkRequiredScopes(APP);
+      const text = String(h.dm.mock.calls.at(-1)?.[2] ?? '');
+      expect(text).toContain('企业管理员审核');
+      expect(text).not.toContain('即生效');
+    });
   });
 
   it('所有权限已授权时无需确认链接', async () => {
@@ -330,6 +370,21 @@ describe('ensureVcMeetingEventsSubscribed', () => {
     h.automate.mockResolvedValue({ ok: false, reason: 'api_error', message: 'boom' });
     await ensureVcMeetingEventsSubscribed(APP);
     expect(h.dm).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs a version stuck in enterprise review as awaiting review, not published', async () => {
+    h.bot = vcBot();
+    h.probe.mockResolvedValue({ ok: true, missingVcEvents: ['vc.bot.meeting_invited_v1'], eventModeReady: true });
+    h.automate.mockResolvedValue({ ok: true, subscribedEventCount: 3, versionId: 'v1', versionPendingReview: true, pendingReviewAppVersion: '1.0.3' });
+    const info = vi.spyOn(logger, 'info');
+    try {
+      await ensureVcMeetingEventsSubscribed(APP);
+      const line = info.mock.calls.map(call => String(call[0])).find(message => message.includes('VC events auto-subscribed'))!;
+      expect(line).toContain('1.0.3');
+      expect(line).not.toMatch(/\bpublished\b/);
+    } finally {
+      info.mockRestore();
+    }
   });
 
   it('degrades quietly when the read-only probe fails', async () => {

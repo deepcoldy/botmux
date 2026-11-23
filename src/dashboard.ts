@@ -362,8 +362,8 @@ import {
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
-import { generateAuthUrl, handleCallbackUrl, isCallbackUrl, callbackOrigin } from './utils/user-token.js';
-import { answerOAuthLoopbackCallback } from './utils/oauth-loopback-page.js';
+import { generateAuthUrl, handleCallbackUrl, handleCallbackUrlDetailed, isCallbackUrl, callbackOrigin } from './utils/user-token.js';
+import { answerOAuthLoopbackCallback, dashboardOAuthCallbackBody } from './utils/oauth-loopback-page.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, rmwBotEntry, writeRawConfigAtomic } from './services/config-store.js';
 import {
   emitCodexNotifierOutboxItem,
@@ -1837,7 +1837,11 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
         if (!scopeCheck.ok) {
           return {
             ok: false,
-            error: `vcMeetingBot_preflight_missing_scopes_after_auto: ${scopeCheck.error}。请到开放平台手动开通 VC 会议权限后重试。`,
+            error: `vcMeetingBot_preflight_missing_scopes_after_auto: ${scopeCheck.error}。${result.versionPendingReview
+              // 版本停在企业审核时权限还没生效，此时「手动开通」既做不到也不必要。
+              ? `新版本 ${result.pendingReviewAppVersion ?? result.versionId ?? ''} 已提交，正在等待企业管理员审核，`
+                + '审核通过后权限才生效，届时再重试（审批进度可在飞书「审批」里查看）。'
+              : '请到开放平台手动开通 VC 会议权限后重试。'}`,
           };
         }
         // 事件订阅同样关键：缺任一 VC 事件都收不到会议邀请(用 missingVcEvents 判定,
@@ -1879,11 +1883,12 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
         if (!scopeCheck.ok) {
           // 「应用正在审核中」时**手动也开不了**：审核期间开放平台锁定配置写入，连
           // scope/update 都拒（实测 code=10046）。给「请手动开通」这种做不到的建议
-          // 比不给更糟，所以这条单独措辞成「等审批通过」。
-          // ⚠️ 不说「等审批通过」：触发审批通常意味着有配置不合规，那一版不会自己通过。
+          // 比不给更糟。审批可能正常排队等企业管理员处理，也可能因配置不合规被卡住，
+          // 两种情况都要说清：先看审批进度，被驳回/长期不动再人工修配置后撤回重提。
           const advice = reason === 'app_under_review'
-            ? '该应用有一个版本卡在飞书审核中，配置写入被锁（手动开通同样会被拒）。触发审批通常说明有配置不合规'
-              + '（最常见：权限的数据范围默认成「全部/全员」）；需人工到开放平台看审批详情、修掉不合规项后撤回该版本重提，再重试。'
+            ? '该应用有一个版本正在等待企业管理员审核，配置写入被锁（手动开通同样会被拒），审批进度可在飞书「审批」里查看，审核通过后再重试。'
+              + '若审批被驳回或长时间没有进展，多半是有配置不合规（最常见：权限的数据范围默认成「全部/全员」），'
+              + '需人工到开放平台看审批详情、修掉不合规项后撤回该版本重提，再重试。'
             : '请手动开通后重试。';
           return {
             ok: false,
@@ -4381,7 +4386,7 @@ const server = createServer(async (req, res) => {
         return;
       }
       // state 只在生成链接的那个 daemon 进程内存里，逐个询问在线 daemon。
-      let outcome: { ok: boolean; message: string } | null = null;
+      let outcome: { ok: boolean; message: string; warning?: string } | null = null;
       for (const d of registry.list()) {
         try {
           const r = await fetchDaemonIpc(d.ipcPort, '/api/oauth-callback', {
@@ -4390,7 +4395,10 @@ const server = createServer(async (req, res) => {
             body: JSON.stringify({ url: url.toString() }),
           });
           const j: any = await r.json().catch(() => null);
-          if (j?.matched) { outcome = { ok: !!j.ok, message: String(j.message ?? '') }; break; }
+          if (j?.matched) {
+            outcome = { ok: !!j.ok, message: String(j.message ?? ''), ...(typeof j.warning === 'string' && j.warning ? { warning: j.warning } : {}) };
+            break;
+          }
         } catch { /* daemon offline mid-iteration — try the next */ }
       }
       if (!outcome) {
@@ -4399,7 +4407,7 @@ const server = createServer(async (req, res) => {
       }
       page(
         outcome.ok ? '授权完成' : '授权失败',
-        outcome.ok ? '已完成授权，本页可以关闭。回到 Dashboard 即可看到状态更新。' : outcome.message,
+        dashboardOAuthCallbackBody(outcome),
         outcome.ok,
       );
       return;
@@ -8469,7 +8477,7 @@ const oauthCallbackServer = createServer(async (req, res) => {
   // to send it.
   const page = await answerOAuthLoopbackCallback(url.toString(), {
     origin: callbackOrigin,
-    consume: handleCallbackUrl,
+    consume: handleCallbackUrlDetailed,
     onError: error => logger.warn(`[dashboard] OAuth loopback callback failed: ${(error as Error).message}`),
   });
   res.writeHead(page.status, {

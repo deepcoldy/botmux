@@ -242,6 +242,15 @@ export type OpenPlatformAutomationResult =
       approvalAutoPassed?: boolean;
       /** 需要真人审批时，那些审批人的姓名（抄送人不算——抄送只知会、不阻塞）。 */
       approvalHumanApprovers?: string[];
+      /**
+       * 提交后回读，这一版**停在「审核中」**（等企业管理员审批；已留出免审自动通过的几秒）。
+       * 这是**事实**，优先于 {@link approvalAutoPassed} 那个**预判**：实测审批预览写着
+       * 「仅协作者免审策略 · 自动通过」的版本照样卡在审核中几个小时。审核通过前新权限
+       * 不生效，调用方必须如实说「在等企业管理员审核」，不能报「已发布 / 已生效」。
+       */
+      versionPendingReview?: boolean;
+      /** 停在审核中的那一版的版本号（console `appVersion`，形如 1.0.11；读不到时缺省）。 */
+      pendingReviewAppVersion?: string;
     }
   | {
       ok: false;
@@ -345,6 +354,11 @@ export interface OpenPlatformAutomationOptions {
    * 调用方可传更紧的预算；测试也用它验证在飞请求的取消。
    */
   redirectWriteTimeoutMs?: number;
+  /**
+   * 提交版本后回读到「审核中」时，再隔多久各复查一次（毫秒），用来等免审版本的自动通过
+   * （实测提交到上线约 2 秒）。缺省 {@link DEFAULT_REVIEW_SETTLE_DELAYS_MS}；测试传 `[]`。
+   */
+  reviewSettleDelaysMs?: readonly number[];
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
   /** Emitted once only after Feishu reports this exact QR as scanned. */
   onQrScanConfirmed?: (info: { confirmedAt: number }) => void | Promise<void>;
@@ -2142,6 +2156,8 @@ export async function automateOpenPlatformSetup(
     let versionWarning: string | undefined;
     let approvalAutoPassed: boolean | undefined;
     let approvalHumanApprovers: string[] | undefined;
+    let versionPendingReview: boolean | undefined;
+    let pendingReviewAppVersion: string | undefined;
     if (versionId) {
       // 提交前先问一句「这一版提交后会不会秒过」。判据见 {@link predictApprovalFlow}：
       // 全自动通过 + 零真人审批人 ⟹ 提交不打扰任何人、立即生效，尽管提。
@@ -2170,6 +2186,24 @@ export async function automateOpenPlatformSetup(
         if (!isVersionCommitted(after, versionId)) {
           versionWarning =
             `版本 ${versionId} 提交后回读仍是「未提交审核」草稿：请到开放平台「版本管理」手动点「申请发布」`;
+        } else {
+          // 提交了 ≠ 生效了：这一版可能停在「审核中」等企业管理员审批（审批预判说「自动通过」
+          // 也一样会卡，见 versionPendingReview 的注释）。不说清楚，用户看到「已提交发布」会
+          // 以为 botmux 卡住了。只读回读，不撤回、不重提、不绕过审核。
+          const review = await settleCommittedVersionReview(
+            postJson, options.appId, versionId, after, options.reviewSettleDelaysMs ?? DEFAULT_REVIEW_SETTLE_DELAYS_MS,
+          );
+          if (review.inReview) {
+            versionPendingReview = true;
+            pendingReviewAppVersion = review.appVersion;
+            approvalAutoPassed = false;
+            // 进度回调只是展示；它出错不能把「审核中」这个回读事实改判成「回读失败」。
+            try {
+              await options.onStatus?.(
+                `版本 ${review.appVersion ?? versionId} 已提交，正在等待企业管理员审核（审核通过前新权限不生效，进度可在飞书「审批」里查看）`,
+              );
+            } catch { /* 进度展示失败不影响结论 */ }
+          }
         }
       } catch (err: any) {
         versionWarning = `版本 ${versionId} 提交状态回读失败（无法确认是否已提交）: ${safeErrorMessage(err)}`;
@@ -2196,6 +2230,7 @@ export async function automateOpenPlatformSetup(
       versionWarning,
       approvalAutoPassed,
       approvalHumanApprovers,
+      ...(versionPendingReview ? { versionPendingReview, pendingReviewAppVersion } : {}),
       ...(options.requireVerifiedEvents
         ? {
             eventMode: eventState?.eventMode,
@@ -3542,6 +3577,54 @@ export function isVersionCommitted(payload: unknown, versionId: string): boolean
   // 版本号在列表里找不到 → 无法证明它已提交，保守判 false（宁可多报一句 warning，
   // 也不要重复上一次「拿 code=0 当已发布」的错）。
   return false;
+}
+
+/** 免审版本从提交到上线实测约 2 秒；回读到「审核中」后按这个节奏复查，合计约 4 秒。 */
+const DEFAULT_REVIEW_SETTLE_DELAYS_MS: readonly number[] = [1_500, 2_500];
+
+/**
+ * `app_version/list` 里某个 versionId 的状态与版本号。找不到返回 undefined。
+ */
+function findConsoleVersion(
+  payload: unknown,
+  versionId: string,
+): { versionStatus: unknown; appVersion?: string } | undefined {
+  const data = asRecord(asRecord(payload).data);
+  const versions = Array.isArray(data.versions) ? data.versions : [];
+  for (const item of versions) {
+    const record = asRecord(item);
+    if (pickString(record, ['versionId', 'version_id', 'id']) !== versionId) continue;
+    const appVersion = pickString(record, ['appVersion']);
+    return { versionStatus: record.versionStatus, ...(appVersion ? { appVersion } : {}) };
+  }
+  return undefined;
+}
+
+/**
+ * 刚提交的版本是不是**停在审核中**。首读是审核中时按 `delaysMs` 再复查，免审版本会在
+ * 这几秒里自己上线；复查读失败就以最后一次观察为准（那次就是审核中）。
+ */
+async function settleCommittedVersionReview(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  versionId: string,
+  firstReadback: unknown,
+  delaysMs: readonly number[],
+): Promise<{ inReview: boolean; appVersion?: string }> {
+  let record = findConsoleVersion(firstReadback, versionId);
+  for (const delay of delaysMs) {
+    if (record?.versionStatus !== CONSOLE_VERSION_STATUS_IN_REVIEW) break;
+    await sleep(delay);
+    try {
+      record = findConsoleVersion(await postJson(`/developers/v1/app_version/list/${appId}`, {}), versionId) ?? record;
+    } catch {
+      break;
+    }
+  }
+  return {
+    inReview: record?.versionStatus === CONSOLE_VERSION_STATUS_IN_REVIEW,
+    ...(record?.appVersion ? { appVersion: record.appVersion } : {}),
+  };
 }
 
 /**

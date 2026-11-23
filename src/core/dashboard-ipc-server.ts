@@ -605,7 +605,8 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
-import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization, type UserAuthorizationPollResult } from '../utils/user-token.js';
+import { describeMissingUserScopes, type AppVersionReviewLookup } from '../utils/lark-app-version.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
 import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
 import { tokenStoreProtection, triggerUserAuthApplies, larkUserNative, credentialSourceOf, capabilityOn, capabilitiesOf, IDENTITY_ROUTE_TOOLS, type IdentityRouteTool, type TriggerUserAuthConfig, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
@@ -4625,6 +4626,27 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   });
 });
 
+/**
+ * `auth wait` 的失败详情。目前只有 `authorization_scope_missing` 有：点名缺了哪几项 scope，
+ * 查得到应用新版本卡在企业审核时一并说明——光一个错误码会让 agent 猜原因（实测猜成
+ * 「默认 scope 里混了应用身份专属权限」）。错误码本身不变，调用方的判定逻辑不受影响。
+ */
+export function authorizationFailureDetails(
+  result: Extract<UserAuthorizationPollResult, { status: 'failed' }>,
+  locale: Locale,
+): { missingScopes?: string[]; appVersionReview?: { state: AppVersionReviewLookup['state']; version?: string }; message?: string } {
+  if (!result.missingScopes?.length) return {};
+  const review = result.appVersionReview;
+  return {
+    missingScopes: result.missingScopes,
+    // 只透出状态与版本号；查不到时的内部原因（接口错误码等）只进日志。
+    ...(review ? {
+      appVersionReview: { state: review.state, ...(review.state !== 'unknown' && review.version ? { version: review.version } : {}) },
+    } : {}),
+    message: describeMissingUserScopes(result.missingScopes, review, locale),
+  };
+}
+
 // Pending auth-request registry (session-scoped singleton) lives in
 // session-auth-requests.js so terminal identity GC can read it too.
 
@@ -5003,7 +5025,10 @@ for (const action of ['auth-request', 'auth-status']) {
       const result = await request.poll();
       if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
       if (result.status === 'failed') {
-        return jsonRes(res, 400, { ok: false, status: 'failed', error: result.error });
+        return jsonRes(res, 400, {
+          ok: false, status: 'failed', error: result.error,
+          ...authorizationFailureDetails(result, localeForBot(ds.larkAppId)),
+        });
       }
       if (isCurrent() && request.isCurrent()) {
         if (!boundTool) {
@@ -12222,7 +12247,10 @@ ipcRoute('POST', '/api/oauth-callback', async (req, res) => {
   }
   const result = await tryHandleCallbackUrl(body.url.trim());
   if (!result) return jsonRes(res, 200, { ok: false, matched: false, message: 'not a callback url' });
-  jsonRes(res, 200, { ok: result.ok, matched: result.matched, message: result.message });
+  jsonRes(res, 200, {
+    ok: result.ok, matched: result.matched, message: result.message,
+    ...(result.warning ? { warning: result.warning } : {}),
+  });
 });
 
 // POST /api/session-group-tag-auth — 生成带 feed-group scope 的授权链接。
