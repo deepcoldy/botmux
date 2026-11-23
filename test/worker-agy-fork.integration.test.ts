@@ -1,6 +1,6 @@
 import type { ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -156,7 +156,8 @@ setInterval(() => { void handles; }, 1000);
     await new Promise<void>(done => worker.once('exit', () => done()));
     clearTimeout(timer);
   }
-  return { root, state, release, parentFile, launchLog, cliPids, byteLog, children, start, stop, inputs };
+  const nativeLog = join(state, 'botmux', `${encodeURIComponent(sessionId)}.log`);
+  return { root, state, nativeLog, release, parentFile, launchLog, cliPids, byteLog, children, start, stop, inputs };
 }
 
 afterEach(async () => {
@@ -175,6 +176,10 @@ describe.skipIf(process.platform !== 'linux')('worker Antigravity native fork', 
     const f = setup(); fixtures.push(f);
     const run = f.start({ fork: false, prompt: '' });
     await waitFor(() => run.messages.some(msg => msg.type === 'prompt_ready'), run.logs);
+    // A fresh side-question reader sees only the final 256 KiB. The original
+    // stream identity is now outside that window, but the live worker fence
+    // still proves this is the same native conversation.
+    appendFileSync(f.nativeLog, `${'x'.repeat(300 * 1024)}\n`);
     run.worker.send({
       type: 'antigravity_btw', question: 'Read the inherited value', nativeSessionId: parentId, messageId: 'om_side',
     } satisfies DaemonToWorker);

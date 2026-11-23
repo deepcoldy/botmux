@@ -1280,6 +1280,7 @@ export const messages: Record<string, string> = {
   'cmd.fork.mid_turn': '⚠️ 会话正在处理中（mid-turn），无法 fork。请等它空闲（idle）后再发 /fork。',
   'cmd.fork.queued': '已排队。原会话空闲后会自动执行 /fork。BotMux 重启后需重新发送。',
   'cmd.fork.topic_pending': '分支会话还在准备中。请等执行卡片出现后再发。',
+  'cmd.fork.session_group_topic_root': '⚠️ 请在专属群顶层直接发送 /fork，不要引用其他消息或在已有话题内发送。',
   'cmd.fork.source_changed': '等待期间源会话已切换。本次 /fork 已取消。',
   'cmd.fork.source_check_failed': '无法确认原 /fork 指令仍可用，本次未创建分支。',
   'cmd.fork.not_started_yet': '⚠️ 会话还没真正跑起来（没选仓库 / CLI 没起 / 无上下文），无法 fork。',

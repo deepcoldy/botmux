@@ -641,7 +641,7 @@ import {
   type ResolveSubtopicHandoffDeps,
 } from './services/subtopic-mentionless-handoff.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
-import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, drainQueuedForks, isPendingForkTopic, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
+import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, cancelQueuedForks, drainQueuedForks, isPendingForkTopic, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { commandSpec } from './core/command-schema.js';
 import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
@@ -7646,6 +7646,20 @@ const commandDeps: CommandHandlerDeps = {
   getActiveCount,
   lastRepoScan,
   resumeQueuedForks,
+  canRunQueuedFork: (ds, message) => {
+    // Match the inbound route's grant-only restriction as well as the command
+    // permission itself; both may be tightened while this request waits.
+    if (grantRestrictedSlashCommandText(ds.larkAppId, ds.chatId, message.senderId, '/fork')) return false;
+    const larkStampedBot = message.senderType === 'app' || message.senderType === 'bot';
+    const senderIsBot = larkStampedBot || isKnownPeerBot(config.session.dataDir, ds.larkAppId, message.senderId);
+    return canRunDaemonCommand(
+      ds.larkAppId, ds.chatId, message.senderId,
+      larkStampedBot ? message.senderUnionId : undefined,
+      '/fork', message.senderUnionId, ds.chatType,
+      senderIsBot, larkStampedBot,
+      larkStampedBot ? message.senderAppId : undefined,
+    );
+  },
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
   submitQueuedMessage,
@@ -35798,6 +35812,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
         );
       }
+    },
+    onSessionRetired(ds) {
+      void cancelQueuedForks(ds, 'source_changed').catch(error =>
+        logger.warn(`[${tag(ds)}] queued /fork cancellation failed: ${String(error)}`));
     },
     async onSessionClosed(session, context) {
       autoCompactCoordinator.cancel(session.sessionId);

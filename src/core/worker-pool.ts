@@ -1547,6 +1547,10 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     context: { sessionId: string; workerGeneration: number; code: number | null; signal: NodeJS.Signals | null },
   ) => void | Promise<void>;
+  /** The exact old daemon-session object has left the active registry and is
+   * marked closed. Its in-memory queued work must be retired before any same-key
+   * replacement can become ready. Notifications remain the callback's job. */
+  onSessionRetired?: (ds: DaemonSession) => void;
   /** Runs only after closeSession has durably closed the row and the exact
    * worker-exit fence has proved that generation can no longer write. Narrow
    * XPI shared-cwd coordinator migration is performed here, never by a hot
@@ -14138,6 +14142,8 @@ async function closeSessionBody(
     // those continuations from re-forking the closed session after its await.
     ds.session.status = 'closed';
     ds.session.closedAt ??= new Date().toISOString();
+    try { callbacks?.onSessionRetired?.(ds); }
+    catch (error) { logger.warn(`[${tag(ds)}] retired-session callback failed: ${String(error)}`); }
     ds.session.crossPrincipalInterruptions = undefined;
     clearTimeout(ds.crossPrincipalWaitTimer);
     ds.crossPrincipalWaitTimer = undefined;
@@ -16665,9 +16671,16 @@ type ForkSessionOptions = {
 export function isForkSourceBusy(ds: DaemonSession): boolean {
   if (isSessionLifecycleInFlight(ds) || isSessionTransferring(ds)) return true;
   if (!ds.worker || ds.worker.killed) return false;
-  return (ds.lastScreenStatus !== 'idle' && ds.lastScreenStatus !== 'limited')
-    || hasPendingOrdinaryImInput(ds)
-    || (cliReportsTurnTerminals(ds) && hasUnsettledAcceptedInput(ds));
+  if (hasPendingOrdinaryImInput(ds)) return true;
+  if (cliReportsTurnTerminals(ds) && hasUnsettledAcceptedInput(ds)) return true;
+  if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') return false;
+  // A stale-working terminal exception still requires quiescent background
+  // work. Keep the established idle/limited behavior above unchanged.
+  if ((ds.backgroundTaskCount ?? 0) > 0) return true;
+  // A completed terminal settles the exact source turn even when no later idle
+  // frame arrives. Never fake screen idleness: newer turns/retries and direct
+  // submit live-work remain busy through the shared post-terminal predicate.
+  return ds.lastTurnTerminalStatus !== 'completed' || sessionHasLiveWorkAfterTerminal(ds);
 }
 
 /**

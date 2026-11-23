@@ -20261,7 +20261,11 @@ async function handleAntigravitySideQuestion(
   antigravitySideQuestionPending = true;
   try {
     const logReader = new AntigravitySessionLog(sessionId);
-    if (logReader.read().currentId !== msg.nativeSessionId) {
+    const loggedNativeId = logReader.read().currentId;
+    // A fresh reader scans only the log's last 256 KiB. Missing history is not
+    // a conflict: current() already proves the observed native identity. Refuse
+    // only an explicit different id; receipt + transcript checks stay intact.
+    if (loggedNativeId && loggedNativeId !== msg.nativeSessionId) {
       send({ ...result, reason: 'unavailable' });
       return;
     }
@@ -20278,7 +20282,7 @@ async function handleAntigravitySideQuestion(
     const deadline = Date.now() + BTW_ANSWER_WINDOW_MS;
     while (current() && Date.now() < deadline) {
       const state = logReader.read();
-      if (state.currentId !== msg.nativeSessionId) break;
+      if (state.currentId && state.currentId !== msg.nativeSessionId) break;
       const receipt = state.sideQuestion;
       if (receipt && receipt !== previous && receipt.conversationId !== msg.nativeSessionId) {
         if (receipt.outcome !== 'answered') break;

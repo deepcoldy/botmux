@@ -52,6 +52,7 @@ function nativeSessionHandler(s: ReturnType<typeof fixture>, cliId = 'codex-app'
   const env: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
     logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => cliId,
     isLocalCliOpenReady: () => false, managedAuxUiSuppressed: () => true,
+    syncAntigravityGroupTitle: vi.fn(),
     isSharedAdoptSession: () => false, recordOwnershipForDaemonSession: vi.fn(),
     noteProjectAssociationChanged: vi.fn(),
     sessionStore: { updateSession: (session: unknown) => persisted.push(structuredClone(session)) },

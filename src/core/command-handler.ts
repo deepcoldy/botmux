@@ -679,6 +679,9 @@ export interface CommandHandlerDeps {
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
   resumeQueuedForks?: (source: DaemonSession) => void;
+  /** Re-run the daemon's CURRENT route authorization at queued execution time.
+   * Missing policy wiring fails closed rather than reviving a revoked fork. */
+  canRunQueuedFork?: (source: DaemonSession, message: LarkMessage) => boolean;
   prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
   submitQueuedMessage?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
   /** Task text attached to a successful native effort change uses normal input delivery. */
@@ -2020,6 +2023,33 @@ async function checkForkSourceMessage(appId: string, messageId: string): Promise
   }
 }
 
+async function notifyQueuedFork(ds: DaemonSession, request: QueuedFork, text: string): Promise<void> {
+  const appId = ds.larkAppId;
+  try {
+    await request.deps.sessionReply(request.rootId, text, 'text', appId, request.message.messageId,
+      request.replyTarget ? { replyTarget: request.replyTarget } : undefined);
+  } catch (error) {
+    // State settlement must not depend on a best-effort Lark notice. In
+    // particular, one failed cancellation must not strand later queue entries.
+    logger.warn(`[${ds.session.sessionId.substring(0, 8)}] queued /fork notice failed: ${String(error)}`);
+  }
+}
+
+/** Close/replacement owns the old queue, not the successor's future idle edge.
+ * Clear synchronously before notifying so a reused DaemonSession cannot revive it. */
+export async function cancelQueuedForks(ds: DaemonSession, reason: 'source_changed' = 'source_changed'): Promise<void> {
+  startingForkTopicRoots.delete(ds);
+  const queue = queuedForks.get(ds);
+  if (!queue) return;
+  const requests = [...queue.requests.values()];
+  queue.requests.clear();
+  queue.startingTopicRoot = undefined;
+  queuedForks.delete(ds);
+  for (const request of requests) {
+    await notifyQueuedFork(ds, request, t(`cmd.fork.${reason}`, undefined, localeForBot(ds.larkAppId)));
+  }
+}
+
 /** Called at the source's idle or exact turn-terminal edge. */
 export async function drainQueuedForks(
   ds: DaemonSession,
@@ -2038,25 +2068,41 @@ export async function drainQueuedForks(
       for (const [id, request] of queue.requests) {
         const { rootId, message, deps, nativeSessionId, replyTarget } = request;
         const appId = ds.larkAppId;
-        const sourceIsCurrent = () => ds.session.status === 'active' && deps.activeSessions.get(sessionKey(rootId, appId)) === ds;
+        const sourceSession = ds.session;
+        const sourceIsCurrent = () => queuedForks.get(ds) === queue
+          && ds.session === sourceSession && ds.session.status === 'active'
+          && deps.activeSessions.get(sessionKey(rootId, appId)) === ds;
         if (!sourceIsCurrent()) { queue.requests.delete(id); continue; }
         if (isForkSourceBusy(ds)) return;
-        const reply = (key: 'cmd.fork.source_changed' | 'cmd.fork.source_check_failed') =>
-          deps.sessionReply(rootId, t(key, undefined, localeForBot(appId)), 'text', appId, id,
-            replyTarget ? { replyTarget } : undefined);
         const unavailable = await checkForkSourceMessage(appId, id);
+        // Cancellation/replacement owns the await window too. In particular a
+        // reused DaemonSession with the same native id must not revive this turn.
+        if (!sourceIsCurrent()) { queue.requests.delete(id); continue; }
         if (unavailable) {
           queue.requests.delete(id);
-          if (unavailable === 'source_check_failed') await reply('cmd.fork.source_check_failed');
+          if (unavailable === 'source_check_failed') {
+            await notifyQueuedFork(ds, request, t('cmd.fork.source_check_failed', undefined, localeForBot(appId)));
+          }
           continue;
         }
         if (!sourceIsCurrent()) { queue.requests.delete(id); continue; }
         if (isForkSourceBusy(ds)) return;
         if (nativeSessionId && nativeSessionId !== ds.session.cliSessionId) {
           queue.requests.delete(id);
-          await reply('cmd.fork.source_changed');
+          await notifyQueuedFork(ds, request, t('cmd.fork.source_changed', undefined, localeForBot(appId)));
           continue;
         }
+        // Authorization is live execution state, not an admission-time souvenir.
+        // Check after the provider await so revocation during that window wins.
+        let authorized = false;
+        try { authorized = deps.canRunQueuedFork?.(ds, message) === true; }
+        catch (error) { logger.warn(`[${ds.session.sessionId.substring(0, 8)}] queued /fork authorization failed: ${String(error)}`); }
+        if (!authorized) {
+          queue.requests.delete(id);
+          await notifyQueuedFork(ds, request, t('daemon.cmd_allowed_users_only', { cmd: '/fork' }, localeForBot(appId)));
+          continue;
+        }
+        if (!sourceIsCurrent()) { queue.requests.delete(id); continue; }
         queue.startingTopicRoot = replyTarget?.rootMessageId;
         queue.requests.delete(id);
         try {
@@ -2075,7 +2121,7 @@ export async function drainQueuedForks(
     } while (queue.wakeRequested && queue.requests.size > 0);
   } finally {
     queue.draining = false;
-    if (queue.requests.size === 0) queuedForks.delete(ds);
+    if (queue.requests.size === 0 && queuedForks.get(ds) === queue) queuedForks.delete(ds);
   }
 }
 
@@ -7106,14 +7152,26 @@ export async function handleCommand(
           }
         }
 
+        if (!createsGroup && fromSessionGroup && !isForkCommandTopicRoot(message)) {
+          // A quoted top-level command is not a verified topic root. Do not
+          // open an unreserved bot-owned anchor where early replies can win.
+          await sessionReply(rootId, t('cmd.fork.session_group_topic_root', undefined, loc));
+          break;
+        }
+
         const replyTarget = !createsGroup && fromSessionGroup && isForkCommandTopicRoot(message)
           ? { mode: 'thread' as const, rootMessageId: message.messageId }
           : undefined;
         const expectedSourceCliSessionId = queuedFork?.nativeSessionId ?? ds.session.cliSessionId;
+        const forkSourceSession = ds.session;
         const forkReply = (text: string) => replyTarget && queuedFork
           ? deps.sessionReply(rootId, text, 'text', forkAppId, message.messageId, { replyTarget })
           : sessionReply(rootId, text);
         const queueForIdle = async (attempt: number) => {
+          // A close/replacement may finish while a fork attempt is in flight.
+          // Never let that old operation enqueue itself into the successor.
+          if (ds.session !== forkSourceSession || ds.session.status !== 'active'
+            || deps.activeSessions.get(sessionKey(rootId, forkAppId)) !== ds) return;
           const added = enqueueFork(ds, { rootId, message, deps, nativeSessionId: expectedSourceCliSessionId, attempt, replyTarget });
           if (!added || queuedFork) return;
           const text = t('cmd.fork.queued', undefined, loc);
