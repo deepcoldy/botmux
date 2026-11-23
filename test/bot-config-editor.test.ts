@@ -723,6 +723,12 @@ describe('assertUniqueBotProcessNames', () => {
     ])).toThrow(/botmux-dashboard.*保留名/);
   });
 
+  it.each(['plugin-demo', 'botmux-plugin-demo'])('rejects the reserved plugin service prefix in %j', name => {
+    expect(() => assertUniqueBotProcessNames([
+      { larkAppId: 'app_a', name },
+    ])).toThrow(/botmux-plugin-demo.*插件 service 保留前缀/);
+  });
+
   it('allows unique process names', () => {
     expect(() => assertUniqueBotProcessNames([
       { larkAppId: 'app_a', name: 'claude-main' },

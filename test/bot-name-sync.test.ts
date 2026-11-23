@@ -87,7 +87,7 @@ describe('persist renamed bot name', () => {
     await expect(persistRenamedBotName('cli_missing', 'new', path)).rejects.toThrow('bot_not_in_config');
     expect(readFileSync(path, 'utf8')).toBe(before);
   });
-  it.each(['', '   ', '---', 'botmux-dashboard'])('rejects an unusable process name %j without persisting it', async name => {
+  it.each(['', '   ', '---', 'botmux-dashboard', 'plugin-demo', 'botmux-plugin-demo'])('rejects an unusable process name %j without persisting it', async name => {
     const before = readFileSync(path, 'utf8');
     await expect(persistRenamedBotName('cli_a', name, path)).rejects.toThrow();
     expect(readFileSync(path, 'utf8')).toBe(before);

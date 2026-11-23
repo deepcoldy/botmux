@@ -343,6 +343,10 @@ export function assertUniqueBotProcessNames(
     if (reserved.has(name)) {
       throw new Error(`进程名 "${name}" 是保留名, 请改用其他 "name" 值.`);
     }
+    const pluginPrefix = `${prefix}-plugin-`;
+    if (name.startsWith(pluginPrefix)) {
+      throw new Error(`进程名 "${name}" 使用了插件 service 保留前缀 "${pluginPrefix}", 请改 "name" 避免使用该前缀.`);
+    }
     const firstIndex = seen.get(name);
     if (firstIndex !== undefined) {
       throw new Error(
