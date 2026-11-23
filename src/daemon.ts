@@ -109,6 +109,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from './core/botmux-wrapper.js';
+import { writeBotmuxWrapperFilesWithRetry } from './core/botmux-wrapper-writer.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
 import {
   evaluateOverload,
@@ -130,7 +131,7 @@ import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-re
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
 import { startOwnerGroupFollow } from './services/owner-group-follow-runtime.js';
-import { startMaintenance, stopMaintenance } from './core/maintenance.js';
+import { startMaintenance, stopMaintenance, globalInstallUpdateLockTarget } from './core/maintenance.js';
 import { createBotmuxUpdateNotifier, buildBotmuxUpdateNoticeCard } from './core/botmux-update-notify.js';
 import {
   selectCodexRuntimeUpdateTargets,
@@ -6404,40 +6405,27 @@ function writePidFile(): void {
   // the binary itself (see botmuxWrapperFiles' standalone branch: there is no
   // cli.js on disk, only a process-private /$bunfs/ path).
   try {
-    mkdirSync(BOTMUX_BIN_DIR, { recursive: true });
     const cliScript = join(__dirname, 'cli.js');  // dist/cli.js
     const standalone = isStandaloneBinary();
-    // POSIX `sh` wrapper always; plus a `botmux.cmd` on Windows so native shells
-    // resolve `botmux` (otherwise `botmux send` from a Windows CLI session fails).
-    for (const file of botmuxWrapperFiles(cliScript, process.execPath, process.platform, standalone)) {
-      const wrapper = join(BOTMUX_BIN_DIR, file.name);
-      const isMainWrapper = file.name === 'botmux' || file.name === 'botmux.cmd';
-      // NEVER overwrite the running executable. install.sh installs the compiled
-      // binary to exactly this path (~/.botmux/bin/botmux), so without this guard
-      // the daemon replaced its own 94MB executable with a 47-byte script on every
-      // boot — verified, inode and all. The `existing !== file.content` check below
-      // is NOT protection: a binary's bytes never equal the wrapper text, so it
-      // rewrote every single start. Compare resolved real paths because either side
-      // may be a symlink, and skip rather than fail: the binary already IS a working
-      // `botmux` on PATH, so there is nothing a wrapper needs to add.
-      let isRunningBinary = false;
-      try {
-        isRunningBinary = isMainWrapper && realpathSync(wrapper) === realpathSync(process.execPath);
-      } catch { /* wrapper absent (first boot) or unreadable → not the binary */ }
-      if (isRunningBinary) {
-        logger.info(`Wrapper skipped: ${wrapper} is this running executable (self-contained binary already on PATH)`);
-        continue;
-      }
-      // Only write if changed (avoid unnecessary disk writes on every restart)
-      let existing = '';
-      try { existing = readFileSync(wrapper, 'utf-8'); } catch { /* doesn't exist yet */ }
-      if (existing !== file.content) {
-        // 原子写：并发会话随时在 exec 这个 wrapper，半截脚本会让它们的
-        // `botmux send` 全体失败。
-        atomicWriteFileSync(wrapper, file.content, { mode: file.mode });
-        logger.info(`Wrapper script written: ${wrapper} → ${standalone ? process.execPath : cliScript}`);
-      }
-    }
+    const files = botmuxWrapperFiles(cliScript, process.execPath, process.platform, standalone);
+    writeBotmuxWrapperFilesWithRetry({
+      binDir: BOTMUX_BIN_DIR,
+      files,
+      runningExecutable: process.execPath,
+      lockTarget: globalInstallUpdateLockTarget(),
+      onResult: ({ written, skipped, deferred }) => {
+        for (const wrapper of skipped) {
+          logger.info(`Wrapper skipped: ${wrapper} is this running executable (self-contained binary already on PATH)`);
+        }
+        for (const wrapper of deferred) {
+          logger.info(`Wrapper write deferred: ${wrapper} changed while waiting for the installation lock`);
+        }
+        for (const wrapper of written) {
+          logger.info(`Wrapper script written: ${wrapper} → ${standalone ? process.execPath : cliScript}`);
+        }
+      },
+      onError: err => logger.warn(`Failed to write botmux wrapper script: ${err instanceof Error ? err.message : String(err)}`),
+    });
   } catch (err: any) {
     logger.warn(`Failed to write botmux wrapper script: ${err.message}`);
   }

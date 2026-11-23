@@ -340,6 +340,10 @@ const OTHER_BOT_APP_ID = 'app-bot-b';
 const USER_OPEN_ID = 'ou_user_123';
 
 beforeEach(() => {
+  // Ordinary routing fixtures must not leave native mention-retry timers
+  // running into later cases. The dedicated reverify suite opts in and owns
+  // its controlled timer boundary.
+  vi.stubEnv('BOTMUX_MENTION_REVERIFY', '0');
   mockP2pForceTopicRoots.clear();
   mockIsP2pForceTopicRoot.mockClear();
   mockRecordP2pForceTopicRoot.mockClear();
@@ -16012,8 +16016,8 @@ describe('im.message.receive_v1 — mention late-resolution reverify', () => {
   });
 
   afterEach(() => {
-    vi.useRealTimers();
     vi.clearAllTimers();
+    vi.useRealTimers();
   });
 
   it('drops the message at the @ gate, then recovers it once the mention resolves', async () => {
