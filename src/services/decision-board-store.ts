@@ -399,6 +399,15 @@ function migrateDraftColumns(db: DatabaseSyncLike): void {
   if (events.size > 0 && !events.has('dedupe_key')) db.exec('ALTER TABLE board_events ADD COLUMN dedupe_key TEXT;');
 }
 
+/**
+ * 自动提示事件属于哪一轮（key）。旧行没有这一列时无法判定轮次，只在下一次新提示时补记，不回填猜测。
+ * 可空补列、不升 schema 版本：旧构建的显式列 INSERT 与 SELECT * 照常工作。
+ */
+function migrateHintEventColumns(db: DatabaseSyncLike): void {
+  const events = new Set((db.prepare('PRAGMA table_info(board_events)').all() as Array<{ name?: unknown }>).map(c => c.name));
+  if (events.size > 0 && !events.has('hint_key')) db.exec('ALTER TABLE board_events ADD COLUMN hint_key TEXT;');
+}
+
 function healChatFields(db: DatabaseSyncLike): void {
   db.exec(`UPDATE board_items SET primary_chat = NULL
     WHERE primary_chat IS NOT NULL AND NOT EXISTS (SELECT 1 FROM board_links l
@@ -512,6 +521,7 @@ export class DecisionBoardStore {
       migrateCardColumns(db);
       migrateHintColumns(db);
       migrateDraftColumns(db);
+      migrateHintEventColumns(db);
       db.exec(`
         CREATE TABLE IF NOT EXISTS board_items (
           app_id TEXT NOT NULL,
@@ -587,7 +597,9 @@ export class DecisionBoardStore {
           -- 只有 kind = draft：这份草稿写给的那一轮（ask-key.ts 的 draftAskKey）；NULL = 不知道。
           ask_key TEXT,
           -- 只有 kind = draft：结构化内容 + 事项生命周期的去重指纹，不随界面语言变化。
-          dedupe_key TEXT
+          dedupe_key TEXT,
+          -- 自动提示的轮次 key；只有系统新标提示时写，owner / 管家的收起说明不写。
+          hint_key TEXT
         );
         CREATE INDEX IF NOT EXISTS board_events_item ON board_events(app_id, seq, id);
         CREATE TABLE IF NOT EXISTS board_files (
@@ -714,10 +726,11 @@ export class DecisionBoardStore {
   }
 
   private insertEvent(appId: string, seq: number, at: number, actor: BoardActor, actorRef: string | undefined,
-    kind: BoardEventKind, text: string, fileIds: string[] = [], batchId?: number, askKey?: string | null, dedupeKey?: string | null): number {
-    const r = this.stmt(`INSERT INTO board_events (app_id, seq, at, actor, actor_ref, kind, text, file_ids_json, batch_id, ask_key, dedupe_key)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(appId, seq, at, actor, actorRef ?? null, kind, text,
-      fileIds.length ? JSON.stringify(fileIds) : null, batchId ?? null, askKey ?? null, dedupeKey ?? null);
+    kind: BoardEventKind, text: string, fileIds: string[] = [], batchId?: number, askKey?: string | null,
+    dedupeKey?: string | null, hintKey?: string | null): number {
+    const r = this.stmt(`INSERT INTO board_events (app_id, seq, at, actor, actor_ref, kind, text, file_ids_json, batch_id, ask_key, dedupe_key, hint_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(appId, seq, at, actor, actorRef ?? null, kind, text,
+      fileIds.length ? JSON.stringify(fileIds) : null, batchId ?? null, askKey ?? null, dedupeKey ?? null, hintKey ?? null);
     if (actor === 'steward') {
       this.stmt('UPDATE board_items SET steward_event_at = ? WHERE app_id = ? AND seq = ?').run(at, appId, seq);
     }
@@ -1170,7 +1183,8 @@ export class DecisionBoardStore {
         throw new BoardError('item_not_deciding', '这一项已经不再等待决定，请刷新看板');
       }
       this.dismissCurrentHint(appId, seq, row);
-      this.stmt(`UPDATE board_items SET state = 'closed', state_at = ?, updated_at = ?, rev = rev + 1
+      // owner 关闭也离开等待语境：直接状态更新不能绕过 updateItem 的 waiting_on 清理，否则重开为 waiting 会复活旧值。
+      this.stmt(`UPDATE board_items SET state = 'closed', state_at = ?, updated_at = ?, waiting_on = NULL, rev = rev + 1
         WHERE app_id = ? AND seq = ?`).run(now, now, appId, seq);
       this.insertEvent(appId, seq, now, 'owner', actorRef, 'state', locale === 'en'
         ? 'Owner closed this item (no further decision needed)' : '本人关闭（无需再拍板）');
@@ -1271,11 +1285,15 @@ export class DecisionBoardStore {
           setHint.run(next ? JSON.stringify(next) : null, appId, item.seq);
           if (next) {
             marked++;
-            // 同一条提示清掉后又原样标回来（中间条件短暂不成立）：历史里不再重复记一句。
+            // 同一 key 在这项的历史里只记一次；A→B→A 也不能把第一次 A 再记一遍。
+            // 文案不能代表轮次：不同复查时间、子任务重开再结束都可能得到同一句原因，但新 key 必须留历史。
             const text = hintEventText(next, facts.locale);
-            const lastHint = this.stmt(`SELECT text FROM board_events WHERE app_id = ? AND seq = ? AND kind = 'hint' ORDER BY id DESC LIMIT 1`)
-              .get(appId, item.seq) as { text: string } | undefined;
-            if (lastHint?.text !== text) this.insertEvent(appId, item.seq, now, 'system', undefined, 'hint', text);
+            const seen = this.stmt(`SELECT 1 AS seen FROM board_events
+              WHERE app_id = ? AND seq = ? AND kind = 'hint' AND hint_key = ? LIMIT 1`)
+              .get(appId, item.seq, next.key) as { seen: number } | undefined;
+            if (!seen) {
+              this.insertEvent(appId, item.seq, now, 'system', undefined, 'hint', text, [], undefined, undefined, undefined, next.key);
+            }
           } else {
             cleared++;
           }

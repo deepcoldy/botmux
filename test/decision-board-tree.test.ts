@@ -214,6 +214,52 @@ describe('复核补充：收尾提示的轮次、最近进展、复查口径、�
   const upd = (seq: number, patch: Record<string, unknown>, at: number) => store().updateItem(APP, seq, patch, 's', at);
   const hintNotices = () => delivered.filter(d => d.prompt.includes('可以收尾')).length;
 
+  it('不同复查时间的提示即使文案相同也分别记历史；同一 key 清掉再恢复仍由既有用例守住不重复', () => {
+    const seq = mk('两轮复查', { nextCheckAt: T0 + 1_000 }, T0);
+    store().sweepHints(APP, { now: T0 + 2_000, locale: 'zh', prState: () => undefined }, T0 + 2_000);
+    expect(store().getItem(APP, seq)!.hint?.key).toBe(`stale:${T0 + 1_000}`);
+    store().appendHistory(APP, seq, '看过第一轮', {}, T0 + 3_000);
+    upd(seq, { nextCheckAt: T0 + 4_000 }, T0 + 3_000);
+    store().sweepHints(APP, { now: T0 + 5_000, locale: 'zh', prState: () => undefined }, T0 + 5_000);
+    expect(store().getItem(APP, seq)!.hint?.key).toBe(`stale:${T0 + 4_000}`);
+    const events = store().events(APP, seq).filter(e => e.kind === 'hint');
+    expect(events).toHaveLength(2);
+    expect(new Set(events.map(e => e.text)).size).toBe(1);
+  });
+
+  it('提示 A→B→A：同一个 key 在这项的历史里只记一次，不被中间轮次打乱去重', () => {
+    const condition = mk('关闭条件', {}, T0);
+    const seq = mk('两轮提示', { closeWhen: { kind: 'item', seq: condition }, nextCheckAt: T0 + 1_000 }, T0);
+    const sweep = (at: number) => store().sweepHints(APP, { now: at, locale: 'zh', prState: () => undefined }, at);
+    sweep(T0 + 2_000);
+    expect(store().getItem(APP, seq)!.hint?.key).toBe(`stale:${T0 + 1_000}`);
+    upd(condition, { state: 'done' }, T0 + 3_000);
+    sweep(T0 + 4_000);
+    expect(store().getItem(APP, seq)!.hint?.key).toBe(`close:item:${condition}`);
+    upd(condition, { state: 'active' }, T0 + 5_000);
+    sweep(T0 + 6_000);
+    expect(store().getItem(APP, seq)!.hint?.key).toBe(`stale:${T0 + 1_000}`);
+    const history = store().events(APP, seq).filter(e => e.kind === 'hint').map(e => e.text);
+    expect(history).toHaveLength(2);
+  });
+
+  it('子任务重开再完成是同文案的新提示轮次：换 key 并记第二条历史', async () => {
+    steward = { enabled: true, chatId: 'oc_steward', closeHints: true };
+    const big = mk('大任务', {}, T0);
+    const child = mk('子任务', { parentSeq: big }, T0);
+    upd(child, { state: 'done' }, T0 + H);
+    await service.sweepHints(T0 + 2 * H);
+    const first = store().getItem(APP, big)!.hint!;
+    upd(child, { state: 'active' }, T0 + 3 * H);
+    upd(child, { state: 'done' }, T0 + 4 * H);
+    await service.sweepHints(T0 + 5 * H);
+    const second = store().getItem(APP, big)!.hint!;
+    expect(second.key).not.toBe(first.key);
+    const events = store().events(APP, big).filter(e => e.kind === 'hint');
+    expect(events).toHaveLength(2);
+    expect(new Set(events.map(e => e.text)).size).toBe(1);
+  });
+
   it('通知过「可以收尾」后子任务重开、再由 owner 在看板上关掉：算新的一轮，再通知一次', async () => {
     steward = { enabled: true, chatId: 'oc_steward', closeHints: true };
     const big = mk('大任务', {}, T0);
@@ -368,6 +414,15 @@ describe('复核补充：收尾提示的轮次、最近进展、复查口径、�
     expect(store().getItem(APP, seq)!.waitingOn).toBe('评审群');
   });
 
+  it('owner 关闭带「在等谁」的待拍板项也清掉；之后重开为等待中不复活旧值', () => {
+    const seq = mk('待拍板', { state: 'decide', question: '继续吗？', waitingOn: '旧评审' }, T0);
+    store().closeInChat(APP, seq, store().getItem(APP, seq)!.rev, 'local', T0 + H);
+    expect(store().getItem(APP, seq)!.state).toBe('closed');
+    expect(store().getItem(APP, seq)!.waitingOn).toBeUndefined();
+    upd(seq, { state: 'waiting' }, T0 + 2 * H);
+    expect(store().getItem(APP, seq)!.waitingOn).toBeUndefined();
+  });
+
   it('最近进展：收进历史的草稿不算，owner 提交的决定算；子任务完成情况在筛过的视图里照样按整张看板算', async () => {
     const seq = mk('拍板', { question: '合不合？', options: [{ key: 'A', label: '合' }] }, T0);
     store().putDraft(APP, seq, 'owner', { text: '迟到', baseRev: 1, archive: true }, T0 + H);
@@ -444,18 +499,23 @@ describe('CLI', () => {
 });
 
 describe('存储迁移', () => {
-  it('改动前建的库：打开时补上 parent_seq / waiting_on，旧行没有上级、照常显示；版本号不升', () => {
+  it('改动前建的库：打开时补上 parent_seq / waiting_on / hint_key，旧行照常显示；版本号不升', () => {
     let store = DecisionBoardStore.open(dir);
     const seq = store.addItem(APP, { title: 'old', noChatReason: 'x' }, undefined, 500).item.seq;
     store.close();
     const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
     for (const c of ['parent_seq', 'waiting_on']) db.exec(`ALTER TABLE board_items DROP COLUMN ${c};`);
+    db.exec('ALTER TABLE board_events DROP COLUMN hint_key');
     db.close();
     store = DecisionBoardStore.open(dir);
     expect(store.getItem(APP, seq)).not.toHaveProperty('parentSeq');
     const child = store.addItem(APP, { title: 'new', noChatReason: 'x', parentSeq: seq, waitingOn: '外部' }, undefined, 600).item.seq;
     expect(store.getItem(APP, child)).toMatchObject({ parentSeq: seq, waitingOn: '外部' });
     expect(store.listItems(APP, 'all').find(i => i.seq === seq)!.childStats).toEqual({ total: 1, done: 0, closed: 0 });
+    // 旧事件表补出 hint_key 后，新提示能实际写入，而不是只在 PRAGMA 里看到一列。
+    store.updateItem(APP, seq, { nextCheckAt: 700 }, undefined, 600);
+    store.sweepHints(APP, { now: 800, locale: 'zh', prState: () => undefined }, 800);
+    expect(store.events(APP, seq).filter(e => e.kind === 'hint')).toHaveLength(1);
     store.close();
     const raw = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
     expect((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(3);

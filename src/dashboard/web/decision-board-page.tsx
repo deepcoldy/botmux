@@ -122,6 +122,7 @@ import {
 
 const AUTOSAVE_MS = 800;
 const SEARCH_DEBOUNCE_MS = 300;
+const OVERVIEW_CLOCK_MS = 30_000;
 
 /** 汇总页最后一次的地址（含看板、视图、搜索词）：详情页的「返回」回到这里。 */
 let lastSummaryHash = '#/board';
@@ -838,6 +839,10 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
   const [list, setList] = useState<BoardListResponse | null>(null);
   /** list 是按哪个视图取的：切视图时新数据回来之前照旧显示旧列表（半透明），但不拿它排总览。 */
   const [listView, setListView] = useState<BoardPageView | null>(null);
+  /** 同一份列表对应的搜索词；旧数据不能在新搜索词下重写导航。 */
+  const [listQuery, setListQuery] = useState<string | null>(null);
+  /** list 属于哪张看板：慢响应不能把 A 的数据展示或记成当前 B 的导航。 */
+  const [listAppId, setListAppId] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [listLoading, setListLoading] = useState(false);
   const [submitSeqs, setSubmitSeqs] = useState<number[] | null>(null);
@@ -867,21 +872,20 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
   const boardOnline = board?.online !== false;
 
   useEffect(() => {
-    if (!activeAppId || !boardOnline) return;
+    // 切看板、变离线也要让旧请求失效；离线分支本身不发新请求，不能只在发请求前递增。
     const seq = ++loadSeqRef.current;
+    if (!activeAppId || !boardOnline) return;
     setListLoading(true);
     void fetchBoardItems(activeAppId, serverView(view), debouncedQuery).then(res => {
       if (seq !== loadSeqRef.current) return;
+      // 展示和详情导航共用同一时钟读数，避免边界恰好落在两次 Date.now() 之间。
+      const at = Date.now();
       setList(res);
       setListView(view);
-      // 详情页的上一项 / 下一项按这里显示的顺序走：总览按分组和树，其余按树。
-      const now = Date.now();
-      const shown = view === 'overview'
-        ? buildBoardOverview(res.items, now).flatMap(section => section.rows.map(r => r.item))
-        : nestBoardList(res.items).map(r => r.item);
-      rememberNavList(navListFrom(activeAppId, view, debouncedQuery, shown));
+      setListQuery(debouncedQuery);
+      setListAppId(activeAppId);
       setListError(null);
-      setNow(Date.now());
+      setNow(at);
     }).catch(err => {
       if (seq !== loadSeqRef.current) return;
       setListError(errorText(err));
@@ -889,6 +893,22 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
       if (seq === loadSeqRef.current) setListLoading(false);
     });
   }, [activeAppId, boardOnline, view, debouncedQuery, reloadTick]);
+
+  // 总览的分组依赖当前时间：页面常开也要在复查到点、闲置跨过阈值后自动重排，不等下一次网络请求。
+  useEffect(() => {
+    if (view !== 'overview' || !list || listView !== 'overview' || listAppId !== activeAppId) return;
+    const timer = window.setInterval(() => setNow(Date.now()), OVERVIEW_CLOCK_MS);
+    return () => window.clearInterval(timer);
+  }, [activeAppId, view, list, listView, listAppId]);
+
+  // 详情页的上一项 / 下一项按当前展示顺序走；时钟刷新导致总览换组时一并重建。
+  useEffect(() => {
+    if (!activeAppId || !list || listAppId !== activeAppId || listView !== view || listQuery !== debouncedQuery) return;
+    const shown = view === 'overview'
+      ? buildBoardOverview(list.items, now).flatMap(section => section.rows.map(r => r.item))
+      : nestBoardList(list.items).map(r => r.item);
+    rememberNavList(navListFrom(activeAppId, view, debouncedQuery, shown));
+  }, [activeAppId, view, debouncedQuery, list, listView, listQuery, listAppId, now]);
 
   // 视图 / 搜索 / 看板记进地址（replaceState 不触发重挂载），从详情页返回时原样恢复。
   useEffect(() => {
@@ -898,8 +918,9 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
     if (location.hash !== hash) history.replaceState(history.state, '', `${location.pathname}${location.search}${hash}`);
   }, [boards, activeAppId, view, debouncedQuery]);
 
-  const draftCount = list?.drafts.length ?? 0;
-  const counts = list?.counts;
+  const currentList = list && listAppId === activeAppId ? list : null;
+  const draftCount = currentList?.drafts.length ?? 0;
+  const counts = currentList?.counts;
   const heading = (
     <div className="page-heading dboard-heading">
       <div className="dboard-heading-main">
@@ -912,7 +933,7 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
             label={`${tr('decisionBoard.stewardLabel')} ${board?.botName ?? activeAppId}`}
             value={activeAppId}
             options={boards.map(b => ({ value: b.larkAppId, label: b.botName, hint: b.counts ? tr('decisionBoard.tabDecideCount', { n: b.counts.decide }) : undefined }))}
-            onChange={next => { setAppId(next); setList(null); setListView(null); }}
+            onChange={next => { setAppId(next); setList(null); setListView(null); setListQuery(null); setListAppId(null); }}
           />
         ) : board ? <span className="dboard-heading-bot">{tr('decisionBoard.stewardLabel')} {board.botName}</span> : null}
       </div>
@@ -922,7 +943,7 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
             type="button"
             className="primary dboard-submit-btn"
             disabled={draftCount === 0}
-            onClick={() => list && setSubmitSeqs(list.drafts.map(d => d.seq))}
+            onClick={() => currentList && setSubmitSeqs(currentList.drafts.map(d => d.seq))}
           >
             {draftCount > 0 ? tr('decisionBoard.submitN', { n: draftCount }) : tr('decisionBoard.submitNone')}
           </button>
@@ -950,14 +971,14 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
     );
   }
 
-  const items = list?.items ?? [];
-  // 总览只列没结束的项（已结束的上级当层级显示），只用按总览取回来的数据排。
-  const overview = view === 'overview' && list && listView === 'overview' ? buildBoardOverview(items, now) : null;
+  const items = currentList?.items ?? [];
+  // 总览只列没结束的项（已结束的上级当层级显示），只用属于当前看板、按总览取回来的数据排。
+  const overview = view === 'overview' && currentList && listView === 'overview' ? buildBoardOverview(items, now) : null;
   return (
     <section className="page dboard-page" data-board={activeAppId}>
       {heading}
       {!boardOnline ? <p className="dboard-banner tone-warn">{tr('decisionBoard.botOffline')}</p> : null}
-      {boardOnline && list && !list.steward.ready ? (
+      {boardOnline && currentList && !currentList.steward.ready ? (
         <p className="dboard-banner tone-warn">
           {tr('decisionBoard.stewardNotReady')}{' '}
           <a className="dboard-inline-link" href={stewardConfigHref(activeAppId)}>{tr('decisionBoard.openBotConfig')}</a>
@@ -996,8 +1017,8 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
               <button type="button" className="dboard-text-btn" onClick={() => setReloadTick(n => n + 1)}>{tr('decisionBoard.retry')}</button>
             </p>
           ) : null}
-          {!list && listLoading ? <LoadingState label={tr('common.loading')} /> : null}
-          {list ? (
+          {!currentList && listLoading ? <LoadingState label={tr('common.loading')} /> : null}
+          {currentList ? (
             overview ? (
               overview.length
                 ? <BoardOverview appId={activeAppId} items={items} sections={overview} now={now} />
@@ -1016,8 +1037,8 @@ export function BoardSummaryView(props: { route: BoardRoute }) {
               </p>
             )
           ) : null}
-          {list && items.length && !overview ? <p className="dboard-legend">{tr('decisionBoard.legend')}</p> : null}
-          {list ? <BatchList appId={activeAppId} batches={list.batches} now={now} onChanged={() => setReloadTick(n => n + 1)} /> : null}
+          {currentList && items.length && !overview ? <p className="dboard-legend">{tr('decisionBoard.legend')}</p> : null}
+          {currentList ? <BatchList appId={activeAppId} batches={currentList.batches} now={now} onChanged={() => setReloadTick(n => n + 1)} /> : null}
         </>
       ) : null}
       {submitSeqs ? (

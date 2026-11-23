@@ -50,6 +50,8 @@ beforeEach(() => {
   vi.stubGlobal('window', {
     setTimeout: (fn: () => void, ms?: number) => globalThis.setTimeout(fn, ms),
     clearTimeout: (id?: ReturnType<typeof setTimeout>) => globalThis.clearTimeout(id),
+    setInterval: (fn: () => void, ms?: number) => globalThis.setInterval(fn, ms),
+    clearInterval: (id?: ReturnType<typeof setInterval>) => globalThis.clearInterval(id),
     requestAnimationFrame: (fn: () => void) => globalThis.setTimeout(fn, 0),
     addEventListener: () => {},
     removeEventListener: () => {},
@@ -1197,6 +1199,8 @@ describe('overview and task trees', () => {
     vi.stubGlobal('window', {
       setTimeout: (fn: () => void, ms?: number) => globalThis.setTimeout(fn, ms),
       clearTimeout: (id?: ReturnType<typeof setTimeout>) => globalThis.clearTimeout(id),
+      setInterval: (fn: () => void, ms?: number) => globalThis.setInterval(fn, ms),
+      clearInterval: (id?: ReturnType<typeof setInterval>) => globalThis.clearInterval(id),
       requestAnimationFrame: (fn: () => void) => globalThis.setTimeout(fn, 0),
       addEventListener: () => {},
       removeEventListener: () => {},
@@ -1220,7 +1224,7 @@ describe('overview and task trees', () => {
     { seq: 51, title: '看过了但没重设复查', state: 'active', nextCheckAt: NOW - 2 * DAY, updatedAt: NOW - 3 * DAY, lastActivityAt: NOW - DAY, ownActivityAt: NOW - DAY },
   ];
 
-  function serve(): void {
+  function serve(rows = items): void {
     routes = (url, init) => {
       const method = init.method ?? 'GET';
       if (url.endsWith('/api/decision-board/boards')) {
@@ -1228,8 +1232,9 @@ describe('overview and task trees', () => {
       }
       if (url.includes('/items?') && method === 'GET') {
         return json({ ok: true, view: new URL(url, 'http://x').searchParams.get('view'), steward: { enabled: true, ready: true },
-          counts: { decide: 1, active: 7, all: 9 },
-          items: items.map(i => ({ ...boardItem(i.seq, { stage: undefined, question: undefined, options: [], recommend: undefined }), createdAt: NOW - 20 * DAY,
+          counts: { decide: rows.filter(i => i.state === 'decide' || i.state === 'accept').length,
+            active: rows.filter(i => i.state === 'active' || i.state === 'waiting').length, all: rows.length },
+          items: rows.map(i => ({ ...boardItem(i.seq, { stage: undefined, question: undefined, options: [], recommend: undefined }), createdAt: NOW - 20 * DAY,
             links: [], hasDraft: false, pendingDecisions: 0, unseen: false, ...i })),
           drafts: [], batches: [] });
       }
@@ -1247,6 +1252,8 @@ describe('overview and task trees', () => {
   const sections = () => renderer!.root.findAll(n => n.type === 'section' && n.props['data-group']);
   const rowsOf = (section: ReactTestInstance) => section.findAll(n => n.type === 'li' && n.props['data-seq'] !== undefined)
     .map(li => `${li.props['data-depth'] ?? 0}:#${li.props['data-seq']}:${li.props['data-group']}`);
+  const visibleSeqs = () => sections().flatMap(section => section.findAll(n => n.type === 'li' && n.props['data-seq'] !== undefined)
+    .map(li => Number(li.props['data-seq'])));
 
   it('the overview tab lists every open item once, grouped with what needs attention first; trees go with their most urgent item', async () => {
     serve();
@@ -1255,7 +1262,7 @@ describe('overview and task trees', () => {
     expect(calls('GET', '/items?').map(c => new URL(c.url, 'http://x').searchParams.get('view'))).toEqual(['all']);
     const tab = renderer!.root.find(n => n.type === 'button' && n.props.role === 'tab' && textOf(n).includes(zh('decisionBoard.tabOverview')));
     expect(tab.props['aria-selected']).toBe(true);
-    expect(textOf(tab)).toContain('8');
+    expect(textOf(tab)).toContain('7');
 
     expect(sections().map(s => s.props['data-group'])).toEqual(['needs_you', 'overdue', 'stalled', 'active', 'parked']);
     expect(rowsOf(sections()[0]!)).toEqual(['0:#10:active', '1:#12:needs_you', '1:#13:waiting']);
@@ -1265,6 +1272,82 @@ describe('overview and task trees', () => {
     expect(rowsOf(sections()[4]!)).toEqual(['0:#40:parked']);
     expect(text()).not.toContain('早就做完的');
     expect(text()).not.toContain('修启动崩溃');
+  });
+
+  it('the overview clock regroups due items without a refetch and rebuilds detail navigation in the same order', async () => {
+    const clockItems = [
+      { seq: 1, title: '即将到复查时间', state: 'waiting', nextCheckAt: NOW + 60_000, updatedAt: NOW - DAY },
+      { seq: 2, title: '仍在推进', state: 'active', updatedAt: NOW - DAY },
+    ];
+    serve(clockItems);
+    await open('overview');
+    expect(visibleSeqs()).toEqual([2, 1]);
+    expect(JSON.parse(String(storedNav.mock.calls.at(-1)![1])).seqs).toEqual([2, 1]);
+    const requests = calls('GET', '/items?').length;
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
+    expect(visibleSeqs()).toEqual([1, 2]);
+    expect(JSON.parse(String(storedNav.mock.calls.at(-1)![1])).seqs).toEqual([1, 2]);
+    expect(calls('GET', '/items?')).toHaveLength(requests);
+  });
+
+  it('a response arriving across a time boundary still saves navigation in the visible overview order', async () => {
+    const clockItems = [
+      { seq: 1, title: '即将到复查时间', state: 'waiting', nextCheckAt: NOW + 60_000, updatedAt: NOW - DAY },
+      { seq: 2, title: '仍在推进', state: 'active', updatedAt: NOW - DAY },
+    ];
+    serve(clockItems);
+    const originalRoutes = routes;
+    const listResponse = originalRoutes('/api/decision-board/cli_a/items?view=all', {}) as Response;
+    let release!: () => void;
+    const pending = new Promise<Response>(resolve => { release = () => resolve(listResponse); });
+    routes = (url, init) => url.includes('/items?') ? pending : originalRoutes(url, init);
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BoardSummaryView, { route: { view: 'overview' } }));
+    });
+    await flush();
+
+    // 旧实现连续读两次 Date.now()：第一次给导航，第二次给渲染；这里让边界落在两次读数之间。
+    const clock = vi.spyOn(Date, 'now').mockReturnValueOnce(NOW).mockReturnValueOnce(NOW + 120_000);
+    try {
+      await act(async () => { release(); });
+      for (let i = 0; i < 4; i += 1) await flush();
+      const nav = JSON.parse(String(storedNav.mock.calls.at(-1)![1]));
+      expect(nav.seqs).toEqual(visibleSeqs());
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('a late response from board A after switching to offline board B is ignored and cannot rewrite B navigation', async () => {
+    const listResponse = json({ ok: true, view: 'all', steward: { enabled: true, ready: true }, counts: { decide: 0, active: 2, all: 2 }, drafts: [], batches: [],
+      items: [101, 102].map(seq => ({ ...boardItem(seq, { title: `A 的事项 ${seq}`, state: 'active', stage: undefined, question: undefined, options: [] }),
+        createdAt: NOW - DAY, updatedAt: NOW - DAY, links: [], hasDraft: false, pendingDecisions: 0, unseen: false })) });
+    let release!: () => void;
+    const pending = new Promise<Response>(resolve => { release = () => resolve(listResponse); });
+    routes = url => {
+      if (url.endsWith('/api/decision-board/boards')) return json({ ok: true, boards: [
+        { larkAppId: 'cli_a', botName: 'A', online: true, steward: { enabled: true, ready: true } },
+        { larkAppId: 'cli_b', botName: 'B', online: false, steward: { enabled: true, ready: true } },
+      ] });
+      if (url.includes('/items?')) return pending;
+      return json({ ok: false, error: 'not_found' }, 404);
+    };
+    const navCalls = storedNav.mock.calls.length;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BoardSummaryView, { route: { appId: 'cli_a', view: 'overview' } }));
+    });
+    for (let i = 0; i < 4; i += 1) await flush();
+    expect(calls('GET', '/items?')).toHaveLength(1);
+
+    const switcher = renderer!.root.find(n => n.props.id === 'dboard-board-switch');
+    await act(async () => { switcher.props.onChange('cli_b'); });
+    await act(async () => { release(); });
+    for (let i = 0; i < 4; i += 1) await flush();
+
+    expect(calls('GET', '/items?')).toHaveLength(1);
+    expect(text()).not.toContain('A 的事项');
+    expect(storedNav.mock.calls).toHaveLength(navCalls);
   });
 
   it('each overview row says who it is waiting on, when it last moved, when to look again, and how far its subtasks are', async () => {
