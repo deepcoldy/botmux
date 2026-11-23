@@ -26,7 +26,7 @@ import { getIdentity, resolveSender } from '../im/lark/identity-cache.js';
 import { sendMessage } from '../im/lark/client.js';
 import { extractLarkBusinessCode } from '../im/lark/lark-errors.js';
 import { beginReplyTargetTurn } from '../core/reply-target.js';
-import { sessionAnchorId, sessionKey, type DaemonSession } from '../core/types.js';
+import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } from '../core/types.js';
 import { sessionPromptInjection } from '../core/prompt-injection.js';
 import { markSessionActivity } from '../core/session-activity.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, rememberLastCliInput } from '../core/session-manager.js';
@@ -191,9 +191,17 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     return { ok: true, session: boundFrom(registered.ds) };
   }
 
+  function nextStepCurrent(session: CardClickBoundSession, turnId: string): boolean {
+    const ds = liveSession(session);
+    return deps.activeSessions.get(activeSessionKey(ds)) === ds
+      && ds.session.status === 'active' && ds.currentTurnId === turnId
+      && ds.lastTurnTerminalTurnId === turnId && ds.lastTurnTerminalStatus === 'completed'
+      && getBot(ds.larkAppId).config.replyCardNextStep === true;
+  }
+
   async function startTurn(
     session: CardClickBoundSession,
-    args: { senderOpenId: string; memberUnionId?: string; prompt: string },
+    args: { senderOpenId: string; memberUnionId?: string; prompt: string; responseToTurnId?: string },
   ): Promise<{ ok: true; turnId: string } | { ok: false; reason: string }> {
     const ds = liveSession(session);
     const senderOpenId = args.senderOpenId;
@@ -209,6 +217,9 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     }
     const turnId = `cct_${randomUUID()}`;
     const sender = await resolveSender(ds.larkAppId, senderOpenId, 'user');
+    if (args.responseToTurnId !== undefined && !nextStepCurrent(session, args.responseToTurnId)) {
+      return { ok: false, reason: 'expired' };
+    }
     const prior = {
       quoteTargetId: ds.session.quoteTargetId,
       quoteTargetSenderOpenId: ds.session.quoteTargetSenderOpenId,
@@ -269,12 +280,21 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
         promptInjection: sessionPromptInjection(ds),
         trustedCaller,
       });
+    // Identity preparation can await Lark. A newer input may take over while
+    // we wait, and its routing state must never be replaced by our rollback.
+    const mayRollback = () => args.responseToTurnId === undefined
+      || (deps.activeSessions.get(activeSessionKey(ds)) === ds
+        && ds.session.status === 'active' && ds.currentTurnId === args.responseToTurnId);
     try {
       await deps.noteTurnReceived(ds, turnId, args.prompt, sender, turnId);
     } catch (err) {
-      rollback();
+      if (mayRollback()) rollback();
       logger.warn(`[card-click-turn] noteTurnReceived failed for ${turnId}: ${err instanceof Error ? err.message : String(err)}`);
       return { ok: false, reason: 'delivery_failed' };
+    }
+    if (args.responseToTurnId !== undefined && !nextStepCurrent(session, args.responseToTurnId)) {
+      if (mayRollback()) rollback();
+      return { ok: false, reason: 'expired' };
     }
     ds.activeInteractiveTurn = {
       turnId,
@@ -325,6 +345,7 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       if (config.crossPrincipalInterruption) return 'cross_principal';
       return 'ok';
     },
+    nextStepCurrent,
     startTurn,
   });
 
@@ -335,6 +356,7 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       operatorUnionId?: string;
       payload?: string;
       sig?: string;
+      editedPrompt?: unknown;
     }) {
       return acceptCardClickTurn(input, runtimeDeps(input.larkAppId));
     },

@@ -79,7 +79,7 @@ vi.mock('../src/services/platform-team-store.js', () => ({ isPlatformTeamBot: ()
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { createCardClickTurnBinder } from '../src/services/card-click-turn-bind.js';
 import { issueSessionCardClickTurn } from '../src/services/card-click-turn-secret.js';
-import { buildNextStepElement } from '../src/im/lark/next-step-card.js';
+import { buildNextStepElement, NEXT_STEP_PROMPT_FIELD } from '../src/im/lark/next-step-card.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 
 const APP = 'cli_app_next';
@@ -103,14 +103,18 @@ function liveSession(): DaemonSession {
   } as unknown as DaemonSession;
 }
 
-function setup() {
+function setup(noteTurnReceived = async () => {}) {
   const ds = liveSession();
+  ds.session.status = 'active';
+  ds.currentTurnId = 'om_completed';
+  ds.lastTurnTerminalTurnId = 'om_completed';
+  ds.lastTurnTerminalStatus = 'completed';
   const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
   const beginNewTurn = vi.fn();
   const binder = createCardClickTurnBinder({
     activeSessions,
     dataDir: () => mocks.dataDir,
-    noteTurnReceived: async () => {},
+    noteTurnReceived,
     beginNewTurn,
     trustedCallerForInboundTurn: async (_app, openId) => ({ senderType: 'user', requestUserOpenId: openId } as any),
   });
@@ -206,5 +210,90 @@ describe('next-step button click', () => {
     const notice = (sessionReply.mock.calls[0] as unknown[])[1] as string;
     expect(notice).not.toMatch(/<at\b/i);
     expect(notice).toContain('所有人');
+  });
+});
+
+function editableClick(prompt?: string) {
+  const text = '查 CI 结果';
+  const token = issueSessionCardClickTurn({
+    dataDir: mocks.dataDir, larkAppId: APP, sessionId: SID, prompt: text, responseToTurnId: 'om_completed',
+  })!;
+  const row = buildNextStepElement({ text, ...token, editable: true }) as any;
+  const panel = row.elements[0];
+  const [field, submit] = panel.elements;
+  return {
+    row, panel, field, submit,
+    data: {
+      operator: { open_id: CLICKER }, context: { open_message_id: 'om_reply_card' },
+      action: { value: submit.behaviors[0].value,
+        ...(prompt === undefined ? {} : { form_value: { [NEXT_STEP_PROMPT_FIELD]: prompt } }) },
+    },
+  };
+}
+
+describe('editable Codex next step', () => {
+  it('renders a collapsed draft and delivers only the confirmed edited text, once', async () => {
+    const { deps, sessionReply } = setup();
+    const { row, panel, field, submit, data } = editableClick('只查 Linux CI 的失败日志');
+    expect(row.tag).toBe('form');
+    expect(panel.expanded).toBe(false);
+    expect(panel.behaviors).toBeUndefined();
+    expect(field.default_value).toBe('查 CI 结果');
+    expect(field.max_length).toBeLessThanOrEqual(1000);
+    expect(submit.form_action_type).toBe('submit');
+    const accepted = await handleCardAction(data, deps, APP);
+    expect(accepted?.toast.type).toBe('info');
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    await accepted?.afterAck?.(false);
+    expect(mocks.sendWorkerInput).toHaveBeenCalledTimes(1);
+    const [, input] = mocks.sendWorkerInput.mock.calls[0] as unknown as [unknown, { content: string }];
+    expect(input.content).toBe('只查 Linux CI 的失败日志');
+    expect(sessionReply).toHaveBeenCalledWith(ROOT, expect.stringContaining('只查 Linux CI 的失败日志'), 'text', APP);
+    expect((await click(data, deps)).toast.type).toBe('error');
+    expect(mocks.sendWorkerInput).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([undefined, '', ' '.repeat(10), 'x'.repeat(1001)])('rejects an invalid draft without consuming the button (%s)', async invalid => {
+    const { deps } = setup();
+    const { data } = editableClick(invalid);
+    expect((await click(data, deps)).toast.type).toBe('error');
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    await click({ ...data, action: { ...data.action, form_value: { [NEXT_STEP_PROMPT_FIELD]: '查看 CI' } } }, deps);
+    expect(mocks.sendWorkerInput).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not dispatch if another message takes over before the callback is acknowledged', async () => {
+    const { ds, deps } = setup();
+    const accepted = await handleCardAction(editableClick('查看 CI').data, deps, APP);
+    ds.currentTurnId = 'om_new_turn';
+    await accepted?.afterAck?.(false);
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+  });
+
+  it.each(['resolve', 'reject'] as const)('preserves a newer turn when identity preparation later %ss', async finish => {
+    const preparing = Promise.withResolvers<void>();
+    const prepared = Promise.withResolvers<void>();
+    const { ds, deps } = setup(() => {
+      preparing.resolve();
+      return prepared.promise;
+    });
+    const accepted = await handleCardAction(editableClick('查看 CI').data, deps, APP);
+    const dispatch = accepted?.afterAck?.(false);
+    await preparing.promise;
+    ds.currentTurnId = 'om_new_turn';
+    ds.session.quoteTargetId = 'om_new_turn';
+    if (finish === 'resolve') prepared.resolve();
+    else prepared.reject(new Error('temporary identity error'));
+    await dispatch;
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    expect(ds.session.quoteTargetId).toBe('om_new_turn');
+  });
+
+  it('cannot use form data to replace a prompt signed as a fixed button', async () => {
+    const { deps } = setup();
+    const data = nextStepClick('固定输入');
+    data.action.form_value = { [NEXT_STEP_PROMPT_FIELD]: '尝试替换输入' };
+    expect((await click(data, deps)).toast.type).toBe('error');
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
   });
 });

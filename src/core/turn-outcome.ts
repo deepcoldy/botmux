@@ -174,7 +174,7 @@ export function readFinalSendPreview(dataDir: string, sessionId: string, turnId:
   }
 }
 
-function finalSummary(ds: DaemonSession, turnId: string, dataDir: string): string | undefined {
+export function turnFinalSummary(ds: DaemonSession, turnId: string, dataDir: string): string | undefined {
   return finalTexts.get(ds)?.get(turnId) ?? readFinalSendPreview(dataDir, ds.session.sessionId, turnId);
 }
 
@@ -249,7 +249,7 @@ export async function recordTurnOutcome(
   }
   heldBackNoOutput.delete(ds);
   const summary = outcome === 'delivered'
-    ? finalSummary(ds, terminal.turnId, opts.dataDir ?? config.session.dataDir)
+    ? turnFinalSummary(ds, terminal.turnId, opts.dataDir ?? config.session.dataDir)
     : undefined;
   const lastTurn: SessionLastTurn = {
     turnId: terminal.turnId,
@@ -281,7 +281,7 @@ export function noteLateFinalReply(
   const heldBackTurn = heldBack?.turnId === turnId && !(ds.lastMessageAt > heldBack.at);
   if (!sameTurnNoOutput && !heldBackTurn) return undefined;
   heldBackNoOutput.delete(ds);
-  const summary = finalSummary(ds, turnId, opts.dataDir ?? config.session.dataDir);
+  const summary = turnFinalSummary(ds, turnId, opts.dataDir ?? config.session.dataDir);
   const startedAt = turnStarts.get(ds)?.get(turnId);
   const lastTurn: SessionLastTurn = {
     turnId,

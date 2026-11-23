@@ -416,3 +416,20 @@ describe('PromptSuggestionPublisher', () => {
     expect(publisher.take('idle', { turnId: 't2' })).toBeUndefined();
   });
 });
+
+it('requests generation for the current settled card once and never shows a late edit on its successor', async () => {
+  const ds = session();
+  const requestSuggestion = vi.fn(() => true);
+  const { io } = fakeIo({ requestSuggestion });
+  const publish = vi.fn(async () => {});
+  const card = { kind: 'unified', publish } as const;
+  noteNextStepTurnStarted(ds, 'turn-1', io);
+  expect(requestSuggestion).not.toHaveBeenCalled();
+  noteNextStepCard(ds, 'turn-1', card, io, 3);
+  noteNextStepCard(ds, 'turn-1', card, io, 3);
+  expect(requestSuggestion).toHaveBeenCalledExactlyOnceWith(ds, 'turn-1', 3);
+  noteNextStepTurnStarted(ds, 'turn-2', io);
+  noteNextStepSuggestion(ds, 'turn-1', '迟到的建议', io, true);
+  await nextStepIdle(ds);
+  expect(publish).not.toHaveBeenCalled();
+});

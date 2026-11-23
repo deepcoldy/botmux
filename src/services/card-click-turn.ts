@@ -19,10 +19,13 @@ export const CARD_CLICK_TURN_DEFAULT_TTL_MS = 60 * 60 * 1000;
 export const CARD_CLICK_TURN_MIN_TTL_MS = 60 * 1000;
 export const CARD_CLICK_TURN_MAX_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const CARD_CLICK_TURN_MAX_PROMPT_CHARS = 1500;
+// Feishu Card JSON 2.0 caps text input fields at 1,000 characters.
+export const CARD_CLICK_TURN_MAX_EDITED_PROMPT_CHARS = 1000;
 export const CARD_CLICK_TURN_MAX_WORKING_DIR_CHARS = 1024;
 
 const CHAT_ID_RE = /^oc_[A-Za-z0-9]+$/;
 const SESSION_ID_RE = /^[A-Za-z0-9-]{8,80}$/;
+const TURN_ID_RE = /^[A-Za-z0-9_-]{1,160}$/;
 const NONCE_RE = /^[A-Za-z0-9_-]{16,80}$/;
 const APP_ID_RE = /^[A-Za-z0-9_]{4,64}$/;
 
@@ -36,6 +39,8 @@ export interface CardClickTurnClaims {
   sessionId?: string;
   workingDir?: string;
   chatType?: CardClickChatType;
+  /** When present, the click must submit editable text for this completed turn. */
+  responseToTurnId?: string;
   nonce: string;
   /** Absolute expiry, epoch milliseconds. */
   exp: number;
@@ -76,6 +81,7 @@ export function canonicalCardClickTurnPayload(claims: CardClickTurnClaims): stri
     claims.chatType ?? '',
     claims.nonce,
     claims.exp,
+    ...(claims.responseToTurnId !== undefined ? [claims.responseToTurnId] : []),
   ]);
 }
 
@@ -111,6 +117,7 @@ export function issueCardClickTurn(input: {
   ttlMs?: number;
   now?: number;
   nonce?: string;
+  responseToTurnId?: string;
 }): { ok: true; claims: CardClickTurnClaims; payload: string; sig: string }
   | { ok: false; error: string } {
   if (!input.secret) return { ok: false, error: 'missing_secret' };
@@ -122,6 +129,10 @@ export function issueCardClickTurn(input: {
   if (!!chatId === !!sessionId) return { ok: false, error: 'target_required' };
   if (chatId && !CHAT_ID_RE.test(chatId)) return { ok: false, error: 'invalid_chat' };
   if (sessionId && !SESSION_ID_RE.test(sessionId)) return { ok: false, error: 'invalid_session' };
+  const responseToTurnId = input.responseToTurnId;
+  if (responseToTurnId !== undefined && (!sessionId || !TURN_ID_RE.test(responseToTurnId))) {
+    return { ok: false, error: 'invalid_response_turn' };
+  }
   const workingDir = input.workingDir?.trim() ?? '';
   if (workingDir && !isAbsoluteNormalizedDir(workingDir)) return { ok: false, error: 'invalid_working_dir' };
   if (input.chatType && input.chatType !== 'group' && input.chatType !== 'p2p') {
@@ -144,6 +155,7 @@ export function issueCardClickTurn(input: {
     ...(input.chatType ? { chatType: input.chatType } : {}),
     nonce,
     exp: now + ttlMs,
+    ...(responseToTurnId !== undefined ? { responseToTurnId } : {}),
   };
   const payload = canonicalCardClickTurnPayload(claims);
   return { ok: true, claims, payload, sig: signCardClickTurnPayload(payload, input.secret) };
@@ -160,8 +172,8 @@ export function readCardClickTurnClaims(
   if (!signaturesMatch(sig, expected)) return { ok: false, reason: 'bad_signature' };
   let parsed: unknown;
   try { parsed = JSON.parse(payload); } catch { return { ok: false, reason: 'bad_signature' }; }
-  if (!Array.isArray(parsed) || parsed.length !== 9) return { ok: false, reason: 'bad_signature' };
-  const [v, larkAppId, prompt, chatId, sessionId, workingDir, chatType, nonce, exp] = parsed;
+  if (!Array.isArray(parsed) || (parsed.length !== 9 && parsed.length !== 10)) return { ok: false, reason: 'bad_signature' };
+  const [v, larkAppId, prompt, chatId, sessionId, workingDir, chatType, nonce, exp, responseToTurnId] = parsed;
   if (v !== CLAIMS_VERSION || typeof larkAppId !== 'string' || typeof prompt !== 'string'
     || typeof chatId !== 'string' || typeof sessionId !== 'string' || typeof workingDir !== 'string'
     || typeof chatType !== 'string' || typeof nonce !== 'string' || typeof exp !== 'number') {
@@ -173,6 +185,9 @@ export function readCardClickTurnClaims(
   }
   if (!!chatId === !!sessionId) return { ok: false, reason: 'bad_signature' };
   if (chatId && !CHAT_ID_RE.test(chatId)) return { ok: false, reason: 'bad_signature' };
+  if (parsed.length === 10 && (!sessionId || typeof responseToTurnId !== 'string' || !TURN_ID_RE.test(responseToTurnId))) {
+    return { ok: false, reason: 'bad_signature' };
+  }
   if (sessionId && !SESSION_ID_RE.test(sessionId)) return { ok: false, reason: 'bad_signature' };
   if (workingDir && !isAbsoluteNormalizedDir(workingDir)) return { ok: false, reason: 'bad_signature' };
   if (chatType !== '' && chatType !== 'group' && chatType !== 'p2p') return { ok: false, reason: 'bad_signature' };
@@ -186,6 +201,7 @@ export function readCardClickTurnClaims(
     ...(chatType === 'group' || chatType === 'p2p' ? { chatType } : {}),
     nonce,
     exp,
+    ...(responseToTurnId !== undefined ? { responseToTurnId } : {}),
   };
   if (canonicalCardClickTurnPayload(claims) !== payload) return { ok: false, reason: 'bad_signature' };
   if (now >= exp) return { ok: false, reason: 'expired' };

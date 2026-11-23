@@ -1024,7 +1024,7 @@ import { turnRetryOffer, shouldNotifyTurnFailure } from '../services/turn-failur
 import { isBotMentionEntry, knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
-import { isCodexAppCliId, type CliId } from '../adapters/cli/types.js';
+import { isCodexAppCliId, isCodexFamilyCliId, type CliId } from '../adapters/cli/types.js';
 import { isStructuredBridgeAdoptCli, isStructuredBridgeLifecycleBlockingCli } from '../services/structured-bridge-clis.js';
 import { hasTurnTerminalCapability } from '../services/turn-terminal-capability.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
@@ -24111,7 +24111,9 @@ function setupWorkerHandlers(
           if (nextStepIo.enabled(ds)) logger.info(`[${t}] Prompt suggestion dropped (${dropped}) turn=${msg.turnId?.substring(0, 16) ?? '-'}`);
           break;
         }
-        noteNextStepSuggestion(ds, msg.turnId, msg.text, nextStepIo);
+        if (msg.editable && (ds.currentTurnId !== msg.turnId || ds.lastTurnTerminalStatus !== 'completed'
+          || ds.lastTurnTerminalTurnId !== msg.turnId || ds.lastTurnTerminalDispatchAttempt !== msg.dispatchAttempt)) break;
+        noteNextStepSuggestion(ds, msg.turnId, msg.text, nextStepIo, msg.editable === true);
         break;
       }
 
@@ -26332,8 +26334,12 @@ function setupWorkerHandlers(
           const replyCardSend: Parameters<typeof settleTurnReplyCardTerminal>[2] =
             (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite });
           void settleTurnReplyCardTerminal(ds, msg, replyCardSend, ownsLifecycleMutation)
-            .then(() => {
+            .then(async () => {
               if (msg.status !== 'completed') return;
+              if (nextStepIo.enabled(ds) && isCodexFamilyCliId(terminalCliId)) {
+                await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+                if (!ownsLifecycleMutation()) return;
+              }
               // The row outlives this worker: its removal runs when the next
               // turn starts, possibly on a replacement worker (suspend,
               // restart, crash). Ownership is the session, not this process.
@@ -26342,7 +26348,7 @@ function setupWorkerHandlers(
               noteNextStepCard(ds, msg.turnId, { kind: 'unified', publish: async next => {
                 await updateTurnReplyCard(ds, msg.turnId, { kind: 'next_step', ...(next ? { nextStep: next } : {}) },
                   replyCardSend, { dispatchAttempt: msg.dispatchAttempt, owns: ownsCard });
-              } }, nextStepIo);
+              } }, nextStepIo, msg.dispatchAttempt);
               if (recapWanted) {
                 noteRecapCard(ds, msg.turnId, { kind: 'unified', publish: async markdown => {
                   await updateTurnReplyCard(ds, msg.turnId, { kind: 'recap', markdown },
@@ -26944,7 +26950,7 @@ function setupWorkerHandlers(
         // once it has settled: after its footer receipt, or — transcript
         // delivery posts none — once the daemon's own final has landed.
         const noteSettledReplyCard = (messageId: string): void => {
-          noteNextStepCard(ds, msg.turnId, { kind: 'legacy', messageId }, nextStepIo);
+          noteNextStepCard(ds, msg.turnId, { kind: 'legacy', messageId }, nextStepIo, msg.dispatchAttempt);
           if (recapWanted) {
             noteRecapCard(ds, msg.turnId, { kind: 'legacy', messageId }, turnRecapIo);
           }
@@ -29845,7 +29851,6 @@ function deliverFinalOutput(
           kind: sendReplyFile ? 'non_patchable' : 'standard_reply_card',
           responseKind: 'final',
         });
-        if (!sendReplyFile) placeReplyCardRowsOnLateFinal(ds, msg.turnId, messageId);
       }
       recordPrimaryOutput(messageId);
       const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
@@ -29855,6 +29860,7 @@ function deliverFinalOutput(
           emptyCompletedNotice: msg.emptyCompletedNotice,
           text: explicit?.finalText ?? safeAssistantText,
         });
+        if (!sendReplyFile) placeReplyCardRowsOnLateFinal(ds, msg.turnId, messageId);
       }
       if (!managedReceiver && !sendReplyFile) {
         recordOncallGroupDelivery(config.session.dataDir, {

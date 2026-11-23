@@ -1771,6 +1771,7 @@ export const messages: Record<string, string> = {
   'card.click_turn.delivery_failed': 'The turn could not be delivered to the session',
   'card.click_turn.unavailable': 'This button is currently unavailable',
   'card.next_step.started': 'Got it, starting: {text}',
+  'card.next_step.invalid_prompt': 'Enter 1–1000 characters before confirming.',
   'card.action.stop_sent': '⏹ Stop signal sent (^C), session kept alive',
   'card.action.stop_unsupported': '⚠️ Card stop is not supported for this CLI mode (experimental RPC input). Use /close to end the session.',
   'card.action.stop_no_worker': '⚠️ CLI is not running; nothing to stop',

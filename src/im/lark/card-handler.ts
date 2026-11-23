@@ -23,7 +23,7 @@ import { config } from '../../config.js';
 import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
-import { NEXT_STEP_CLICK_NOTICE } from './next-step-card.js';
+import { NEXT_STEP_CLICK_NOTICE, NEXT_STEP_PROMPT_FIELD } from './next-step-card.js';
 import { noteReplyCardTurnStarted } from '../../core/reply-card-turn-start.js';
 import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from './streaming-card-buttons.js';
 import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
@@ -215,6 +215,7 @@ export interface CardHandlerDeps {
     operatorUnionId?: string;
     payload?: string;
     sig?: string;
+    editedPrompt?: unknown;
   }) => Promise<{ ok: true; chatId: string; anchorId?: string; prompt?: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
 }
 
@@ -1629,6 +1630,7 @@ export function nextStepNoticeText(prompt: string): string {
 
 function cardClickTurnToastKey(reason: string): string {
   switch (reason) {
+    case 'invalid_prompt': return 'card.next_step.invalid_prompt';
     case 'expired': return 'card.click_turn.expired';
     case 'replayed': return 'card.click_turn.replayed';
     case 'no_identity': return 'card.click_turn.no_identity';
@@ -2158,6 +2160,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       operatorUnionId: typeof data?.operator?.union_id === 'string' ? data.operator.union_id : undefined,
       payload: value.payload,
       sig: value.sig,
+      ...(action?.form_value?.[NEXT_STEP_PROMPT_FIELD] !== undefined
+        ? { editedPrompt: action.form_value[NEXT_STEP_PROMPT_FIELD] } : {}),
     });
     if (!accepted.ok) {
       return { toast: { type: 'error', content: t(cardClickTurnToastKey(accepted.reason), undefined, loc) } };

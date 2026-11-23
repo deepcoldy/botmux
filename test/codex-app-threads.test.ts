@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { waitForPidFile } from './helpers/pid-file.js';
 import {
   generateCodexAppThreadTitle,
+  generateCodexAppNextStep,
   setCodexAppThreadName,
 } from '../src/services/codex-app-threads.js';
 
@@ -1073,5 +1074,35 @@ describe('Codex archive lifecycle RPC', () => {
   it.each(['archive-error', 'hang-archive'])('propagates bounded RPC failure (%s)', async behavior => {
     const p = await probe(true, false, behavior);
     await expect(p.promise).rejects.toThrow();
+  });
+});
+
+describe('generateCodexAppNextStep', () => {
+  it('suggests a continuation in an isolated structured turn and shuts it down', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-next-step-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+    const text = await generateCodexAppNextStep({
+      userPrompt: '帮我看一下 CI',
+      answer: 'Linux 分片失败，构建成功。',
+      codexBin: process.execPath,
+      codexArgs: [FAKE_CODEX],
+      env: fakeCodexEnv(dir, {
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_FINAL_TEXT: JSON.stringify({ suggestion: '先查看 Linux 分片的失败日志。' }),
+      }),
+      timeoutMs: 5000,
+    });
+    expect(text).toBe('先查看 Linux 分片的失败日志。');
+    const rows = readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(rows.find(row => row.method === 'thread/start').params).toMatchObject({
+      ephemeral: true, sandbox: 'read-only', environments: [], approvalPolicy: 'never', dynamicTools: null,
+    });
+    const turn = rows.find(row => row.method === 'turn/start').params;
+    expect(turn.outputSchema.required).toEqual(['suggestion']);
+    expect(JSON.parse(turn.input[0].text)).toMatchObject({
+      user_message: '帮我看一下 CI', assistant_reply: 'Linux 分片失败，构建成功。',
+    });
+    expect(rows.some(row => row.method === 'thread/unsubscribe')).toBe(true);
   });
 });
