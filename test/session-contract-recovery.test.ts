@@ -382,6 +382,21 @@ describe('hook signals from a CLI launched without a binding ID', () => {
     const { operation } = s.controller.beginControl('restart'); s.controller.controlStarted(operation.operationId);
     expect(s.controller.nativeSignal(undefined, 'native-1')).toBeUndefined();
   });
+  it('accepts a signal that names the binding its CLI was spawned under, mid-restart', () => {
+    // Transport counterpart of the refusal above. The worker hands every CLI the
+    // binding it was spawned under (BOTMUX_RUNTIME_BINDING_ID — on the child-env
+    // allowlist so tmux panes receive it too) and the SessionStart hook sends it
+    // back, so a restart no longer has to look SETTLED for its own readiness
+    // signal to land. Until 2026-11-23 that key never reached a tmux pane: every
+    // hook arrived unbound, the branch above refused it mid-restart, and
+    // `/restart` reported a timeout after the worker sat out its whole 45s
+    // ready-gate fallback — for a CLI that was already at its prompt.
+    const s = fixture();
+    const { operation } = s.controller.beginControl('restart'); s.controller.controlStarted(operation.operationId);
+    const replacement = s.controller.reserveBinding('binding-restarted', s.worker);
+    expect(s.controller.nativeSignal(undefined, 'native-1')).toBeUndefined();
+    expect(s.controller.nativeSignal('binding-restarted', 'native-1')).toEqual({ version: 2, runtime: replacement });
+  });
 });
 
 describe('contract history stays bounded', () => {

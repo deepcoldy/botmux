@@ -399,6 +399,19 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_SESSION_ID',
   'BOTMUX_SESSION_SCOPE',
   'BOTMUX_CHAT_ID',
+  // Per-launch runtime binding the worker opened for THIS CLI process (spawnCli
+  // → WorkerSessionEventScope.beginRuntime). Session-scoped hooks carry it back
+  // so the daemon can prove which runtime is signalling: without it
+  // SessionController.nativeSignal() falls to its unbound path, which only a
+  // settled sole runtime may use — and a restart is by definition unsettled, so
+  // the SessionStart ready signal was dropped as `runtime_scope_unproven` and
+  // every `/restart` waited out the worker's 45s fallback before reporting a
+  // timeout (2026-11-23). It must be on THIS list, not only on childEnv: the
+  // pty backend inherits childEnv wholesale, but tmux/zellij panes only receive
+  // what buildBotmuxEnvAssignments forwards from here. Being listed also gets a
+  // stale id scrubbed from a shared tmux server and unset in co-tenant panes,
+  // which a per-launch value needs.
+  'BOTMUX_RUNTIME_BINDING_ID',
   // Session-scoped plugin MCP relay. The worker owns the credential-bearing
   // Gateway; the CLI and its native MCP launcher receive only this socket
   // capability plus a fail-closed marker.
