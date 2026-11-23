@@ -163,9 +163,8 @@ async function apply(ds: DaemonSession, state: State, io: RecapIo): Promise<void
   const turnId = state.turnId;
   const card = state.card;
   if (!card || turnId === undefined || !io.enabled(ds)) return;
-  const locale = io.locale(ds);
   // No panel until the CLI has recapped this turn.
-  const markdown = renderRecapMarkdown(state.cli?.turnId === turnId ? state.cli.text : undefined, locale);
+  const markdown = renderRecapMarkdown(state.cli?.turnId === turnId ? state.cli.text : undefined);
   if (!markdown) return;
   const previous = state.shown && state.shown.turnId === turnId && sameCard(state.shown.card, card) ? state.shown : undefined;
   if (previous?.confirmed && previous.markdown === markdown) return;
@@ -179,7 +178,7 @@ async function apply(ds: DaemonSession, state: State, io: RecapIo): Promise<void
     return;
   }
   const { messageId } = card;
-  const element = buildRecapElement(markdown, locale);
+  const element = buildRecapElement(markdown, io.locale(ds));
   const cardId = previous?.cardId ?? await io.cardId(ds, messageId);
   const shown: Shown = { turnId, card, markdown, cardId, confirmed: false };
   state.shown = shown;

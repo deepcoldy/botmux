@@ -124,7 +124,8 @@ describe('legacy reply card', () => {
     noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     await settle(ds);
     expect(run.writes).toEqual([expect.objectContaining({ op: 'insert', target: 'botmux_reply_footer' })]);
-    expect(run.writes[0]!.markdown.split('\n\n')).toEqual([SUMMARY, "<font color='grey'>来自 CLI 自带的离开总结</font>"]);
+    // The panel holds the recap and nothing else.
+    expect(run.panelOf(messageId).elements).toEqual([{ tag: 'markdown', content: SUMMARY }]);
 
     // The same recap again (a re-read transcript), or the same card settling
     // again (a replayed terminal), changes nothing.
@@ -364,9 +365,31 @@ describe('unified reply card', () => {
     noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     await settle(ds);
-    expect(published).toHaveLength(1);
-    expect(published[0]).toContain(SUMMARY);
+    expect(published).toEqual([SUMMARY]);
     expect(run.writes).toEqual([]);
+  });
+});
+
+describe('English-locale bot', () => {
+  it('titles the panel in English and puts the recap in it with nothing after it', async () => {
+    const ds = session();
+    const run = harness({ locale: () => 'en' });
+    const messageId = run.send('om_card1');
+    noteRecapTurnStarted(ds, 'om_turn1');
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId }, run.io);
+    noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
+    await settle(ds);
+    expect(run.panelOf(messageId).header.title.content).toBe('🧭 Turn recap');
+    expect(run.panelOf(messageId).elements).toEqual([{ tag: 'markdown', content: SUMMARY }]);
+
+    const published: string[] = [];
+    const unified = harness({ locale: () => 'en' });
+    const other = session();
+    noteRecapTurnStarted(other, 'om_turn1');
+    noteRecapCard(other, 'om_turn1', { kind: 'unified', publish: async markdown => { published.push(markdown); } }, unified.io);
+    noteCliRecap(other, 'om_turn1', SUMMARY, unified.io);
+    await settle(other);
+    expect(published).toEqual([SUMMARY]);
   });
 });
 
