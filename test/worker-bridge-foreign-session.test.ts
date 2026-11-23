@@ -157,7 +157,7 @@ describe('worker trust set: what the CLI proved vs what was only guessed or swit
     expect(modelRequestClock.boundClaudeSessionId).toBe(SIBLING);
     expect(modelRequestClock.lastServedAt()).toBeUndefined();
     expect(loadWorkerFunction<() => Record<string, unknown>>('modelRequestPayload', scope)())
-      .toEqual({ modelRequestSessionId: SIBLING });
+      .toEqual({ awaySummaryPending: false, modelRequestSessionId: SIBLING });
   });
   it('a rotation also rebinds the model-request clock before folding the new file', () => {
     const scope = trustScope();

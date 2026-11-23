@@ -14,6 +14,7 @@ import {
   RuntimeReservationRefusedError,
 } from './services/runtime-reservation.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
+import { shouldDeferAutoCompactForAwaySummary, type AutoCompactMaintenanceMessage } from './core/auto-compact.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
@@ -9877,11 +9878,14 @@ function seedModelRequestClockFromTranscript(): void {
   catch (err: any) { log(`Model request clock seed skipped: ${err?.message ?? err}`); }
 }
 
-function modelRequestPayload(): { modelRequestSessionId?: string; lastModelRequestAt?: number; lastActivityRequestAt?: number } {
+function modelRequestPayload(): { awaySummaryPending: boolean; modelRequestSessionId?: string; lastModelRequestAt?: number; lastActivityRequestAt?: number } {
   const claudeSessionId = modelRequestClock.boundClaudeSessionId;
   const at = modelRequestClock.lastServedAt();
   const activity = modelRequestClock.lastActivityAt();
   return {
+    // Share the screen_update transport with the request clocks: automatic
+    // compact must see a one-shot recap before restoring focus.
+    awaySummaryPending: awaySummaryFocus.isActive,
     ...(claudeSessionId ? { modelRequestSessionId: claudeSessionId } : {}),
     ...(at !== undefined ? { lastModelRequestAt: at } : {}),
     ...(activity !== undefined ? { lastActivityRequestAt: activity } : {}),
@@ -26343,6 +26347,7 @@ function startScreenUpdates(): void {
   let lastSentModelRequestAt: number | undefined;
   let lastSentActivityRequestAt: number | undefined;
   let lastSentModelRequestSessionId: string | undefined;
+  let lastSentAwaySummaryPending = false;
   let lastTextSnapshotHash = '';
   let lastContent = '';
   const permissionNotice = new ClaudePermissionNoticeTracker();
@@ -26626,7 +26631,8 @@ function startScreenUpdates(): void {
         || backgroundWaitTasks !== lastSentBackgroundWait
         || modelRequestClock.lastServedAt() !== lastSentModelRequestAt
         || modelRequestClock.lastActivityAt() !== lastSentActivityRequestAt
-        || modelRequestClock.boundClaudeSessionId !== lastSentModelRequestSessionId) {
+        || modelRequestClock.boundClaudeSessionId !== lastSentModelRequestSessionId
+        || awaySummaryFocus.isActive !== lastSentAwaySummaryPending) {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
         lastSentRecovery = usageAware.usageLimitRecovery;
@@ -26634,6 +26640,7 @@ function startScreenUpdates(): void {
         lastSentModelRequestAt = modelRequestClock.lastServedAt();
         lastSentActivityRequestAt = modelRequestClock.lastActivityAt();
         lastSentModelRequestSessionId = modelRequestClock.boundClaudeSessionId;
+        lastSentAwaySummaryPending = awaySummaryFocus.isActive;
         send({
           type: 'screen_update',
           content: snapshot.content,
@@ -39940,13 +39947,27 @@ function describeUnattendedScreen(screen: UnattendedComposerScreen | undefined):
   return describeUnattendedComposerScreen(screen, cliAdapter?.readyPattern, { cols: renderCols, rows: renderRows });
 }
 
+/** Automatic compact must not restore focus and cancel a one-shot recap. This
+ *  predicate is shared by the IPC pre-restore hook and the final input gate. */
+function deferAutoCompactForAwaySummary(msg: AutoCompactMaintenanceMessage): boolean {
+  return shouldDeferAutoCompactForAwaySummary(msg, awaySummaryFocus.isActive);
+}
+
+/** Apply the normal focus restoration for human/CLI input, except for automatic
+ *  compact while recap is active. That refusal must leave the terminal blurred
+ *  so Claude can still write its one-shot summary. */
+function restoreFocusForDaemonMessage(msg: AutoCompactMaintenanceMessage): void {
+  if (!deferAutoCompactForAwaySummary(msg)) awaySummaryFocus.beforeDaemonMessage(msg.type ?? '');
+}
+
 /** Fail-closed probe for unattended raw input. Human passthrough intentionally
  * bypasses this additional gate; maintenance commands must prove that the live,
  * empty composer is on screen before the caller can write and press Enter. */
 function unattendedRawInputRefusal(
-  msg: { requireSafeComposer?: true },
+  msg: AutoCompactMaintenanceMessage,
 ): { refusal: PromptCacheKeepaliveRefusal; screen: UnattendedComposerScreen | undefined } | undefined {
   if (!msg.requireSafeComposer) return undefined;
+  if (deferAutoCompactForAwaySummary(msg)) return { refusal: 'away_summary_pending', screen: undefined };
   const isCodex = lastInitConfig?.cliId === 'codex';
   const screen = isCodex ? undefined : unattendedComposerScreen();
   let codexInputState: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined;
@@ -42392,8 +42413,8 @@ process.on('message', (raw: unknown, handle: unknown) => {
     }
   }
   // Input for the CLI first gets the terminal's focus back (if botmux had
-  // reported it away for an away summary).
-  awaySummaryFocus.beforeDaemonMessage(msg.type);
+  // reported it away for an away summary), except for a deferred auto-compact.
+  restoreFocusForDaemonMessage(msg);
   const execution = msg.sessionCommand?.execution;
   if (execution) workerSessionEventScope?.rememberExecution(execution);
   if (binding && workerSessionEventScope && msg.type !== 'init') return workerSessionEventScope.run(binding, () => handleContractDaemonMessage(msg, handle), execution, msg.sessionCommand?.operationId);

@@ -194,6 +194,7 @@ export function idleAutoCompactRefusalReason(refusal: PromptCacheKeepaliveRefusa
     case 'restarting':
     case 'prompt_not_ready':
     case 'input_pending':
+    case 'away_summary_pending':
     case 'bare_shell': return 'busy';
     default: return 'unknown';
   }

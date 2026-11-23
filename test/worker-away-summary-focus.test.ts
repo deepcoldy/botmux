@@ -5,7 +5,9 @@
  * write the focus report).
  */
 import { describe, expect, it, vi } from 'vitest';
-import { awaySummaryFocusRefusal } from '../src/services/away-summary-focus.js';
+import { AwaySummaryFocus, awaySummaryFocusRefusal, FOCUS_IN, FOCUS_OUT } from '../src/services/away-summary-focus.js';
+import { shouldDeferAutoCompactForAwaySummary } from '../src/core/auto-compact.js';
+import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { promptSuggestionReportTurn } from '../src/utils/prompt-suggestion-publisher.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 
@@ -78,6 +80,70 @@ describe('worker away-summary cancellation and keepalive', () => {
     expect(scope.pendingInjections).toEqual([]);
     expect(scope.flushPendingInjections).not.toHaveBeenCalled();
     expect(scope.setCaptureIdentity).not.toHaveBeenCalled();
+  });
+
+  it.each(['waiting', 'blurred'] as const)('defers automatic compact without cancelling %s recap, then settles', (stage) => {
+    const turnId = 'om_recap_turn';
+    const writes: string[] = [];
+    const focus = new AwaySummaryFocus({
+      now: () => Date.UTC(2026, 10, 22, 1, 0, 0),
+      setTimer: () => () => {},
+      refusal: () => undefined,
+      currentTurnId: () => turnId,
+      watched: () => false,
+      write: bytes => { writes.push(bytes); return true; },
+      log: () => {},
+    });
+    focus.request(turnId);
+    if (stage === 'blurred') focus.noteSuggestion(turnId);
+    expect(focus.isActive).toBe(true);
+    const scope: Record<string, any> = { awaySummaryFocus: focus, shouldDeferAutoCompactForAwaySummary };
+    scope.deferAutoCompactForAwaySummary = loadWorkerFunction('deferAutoCompactForAwaySummary', scope);
+    const restore = loadWorkerFunction<(msg: Record<string, unknown>) => void>('restoreFocusForDaemonMessage', scope);
+    const refuse = loadWorkerFunction<(msg: Record<string, unknown>) => { refusal: string } | undefined>('unattendedRawInputRefusal', scope);
+    const msg = { type: 'raw_input', turnId: 'auto-compact:idle:test', requireSafeComposer: true };
+    restore(msg);
+    expect(focus.isActive).toBe(true);
+    expect(writes).toEqual(stage === 'blurred' ? [FOCUS_OUT] : []);
+    expect(refuse(msg)?.refusal).toBe('away_summary_pending');
+    expect(writes).toEqual(stage === 'blurred' ? [FOCUS_OUT] : []);
+
+    focus.noteRecap({ turnId });
+    expect(focus.isActive).toBe(false);
+    expect(writes).toEqual(stage === 'blurred' ? [FOCUS_OUT, FOCUS_IN] : []);
+    expect(scope.deferAutoCompactForAwaySummary(msg)).toBe(false);
+  });
+
+  it('restores focus immediately for a human raw input even while recap is active', () => {
+    const turnId = 'om_recap_turn';
+    const writes: string[] = [];
+    const focus = new AwaySummaryFocus({
+      now: () => Date.UTC(2026, 10, 22, 1, 0, 0), setTimer: () => () => {},
+      refusal: () => undefined, currentTurnId: () => turnId, watched: () => false,
+      write: bytes => { writes.push(bytes); return true; }, log: () => {},
+    });
+    focus.request(turnId);
+    focus.noteSuggestion(turnId);
+    const scope: Record<string, any> = { awaySummaryFocus: focus, shouldDeferAutoCompactForAwaySummary };
+    scope.deferAutoCompactForAwaySummary = loadWorkerFunction('deferAutoCompactForAwaySummary', scope);
+    loadWorkerFunction('restoreFocusForDaemonMessage', scope)({ type: 'raw_input', turnId: 'om_human', requireSafeComposer: true });
+    expect(writes).toEqual([FOCUS_OUT, FOCUS_IN]);
+    expect(focus.isActive).toBe(false);
+  });
+
+  it('reports the away-summary pending transition in the screen_update payload', () => {
+    const turnId = 'om_recap_turn';
+    const focus = new AwaySummaryFocus({
+      now: () => Date.UTC(2026, 10, 22, 1, 0, 0), setTimer: () => () => {},
+      refusal: () => undefined, currentTurnId: () => turnId, watched: () => false,
+      write: () => true, log: () => {},
+    });
+    focus.request(turnId);
+    const scope: Record<string, unknown> = { awaySummaryFocus: focus, modelRequestClock: new ClaudeModelRequestClock() };
+    const payload = loadWorkerFunction<() => Record<string, unknown>>('modelRequestPayload', scope);
+    expect(payload()).toEqual({ awaySummaryPending: true });
+    focus.noteRecap({ turnId });
+    expect(payload()).toEqual({ awaySummaryPending: false });
   });
 
   it('resolves the folded turn once for both focus and transcript recap attribution', () => {

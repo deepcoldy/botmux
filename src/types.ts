@@ -2875,6 +2875,10 @@ export type WorkerToDaemonBase =
        *  otherwise. Never changes the reported status; the card shows it and the
        *  idle-worker sweeper will not suspend a session while it is set. */
       backgroundTasks?: number;
+      /** Claude's one-shot away summary is waiting or blurred. Automatic
+       *  compact must defer maintenance input rather than restore focus and
+       *  cancel it. Always emitted by current workers; absent = older worker. */
+      awaySummaryPending?: boolean;
       /** Native Claude session the two request clocks below belong to. A
        *  transcript rotation changes this identity and makes the daemon drop
        *  the previous conversation's timestamps before merging the new ones. */

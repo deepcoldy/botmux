@@ -653,7 +653,7 @@ import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclare
 import { applyTopicModelSpec, resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
-import { AutoCompactCoordinator, autoCompactBlockers, isAutoCompactEligible, supportsNativeAutoCompactRuntime, type AutoCompactEligibilitySnapshot } from './core/auto-compact.js';
+import { AutoCompactCoordinator, autoCompactBlockers, isAutoCompactEligible, reconcileAutoCompactAwaySummaryDeferral, supportsNativeAutoCompactRuntime, type AutoCompactEligibilitySnapshot } from './core/auto-compact.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -7242,6 +7242,7 @@ function autoCompactSnapshot(ds: DaemonSession): AutoCompactEligibilitySnapshot 
     agentAttention: !!ds.agentAttention,
     finalDeliveriesInFlight: ds.finalOutputDeliveriesInFlight?.size ?? 0,
     backgroundTaskCount: ds.backgroundTaskCount ?? 0,
+    awaySummaryPending: ds.awaySummaryPending === true,
     adopted: !!ds.adoptedFrom || !!ds.session.adoptedFrom,
     headless: !!ds.session.headless,
     vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
@@ -7256,6 +7257,7 @@ function autoCompactSnapshot(ds: DaemonSession): AutoCompactEligibilitySnapshot 
 }
 
 function observeAutoCompact(ds: DaemonSession, status: string): void {
+  reconcileAutoCompactAwaySummaryDeferral(ds, autoCompactCoordinator, ds.session.sessionId);
   autoCompactCoordinator.observe({
     sessionId: ds.session.sessionId,
     idle: status === 'idle',

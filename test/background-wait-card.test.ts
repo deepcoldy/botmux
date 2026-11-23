@@ -708,3 +708,12 @@ describe('last served model request on screen_update', () => {
     expect([ds.lastModelRequestAt, ds.lastActivityRequestAt]).toEqual([read + 60_000, read + 60_000]);
   });
 });
+
+describe('away-summary pending on screen_update', () => {
+  it('mirrors the worker pending flag in both directions', async () => {
+    await screenUpdate('idle', 1, { awaySummaryPending: true });
+    expect(ds.awaySummaryPending).toBe(true);
+    await screenUpdate('idle', 1, { awaySummaryPending: false });
+    expect(ds.awaySummaryPending).toBe(false);
+  });
+});

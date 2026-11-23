@@ -66,6 +66,9 @@ export interface AutoCompactEligibilitySnapshot {
   agentAttention: boolean;
   finalDeliveriesInFlight: number;
   backgroundTaskCount: number;
+  /** Claude's one-shot away summary is waiting or blurred. Maintenance input
+   *  must not restore focus and cancel it. Optional for older producers. */
+  awaySummaryPending?: boolean;
   adopted: boolean;
   headless: boolean;
   vcMeetingReceiver: boolean;
@@ -79,7 +82,7 @@ export type AutoCompactBlocker =
   | 'stream_card_pending' | 'transferring' | 'protected_mutation' | 'pending_turns'
   | 'pending_prompt' | 'pending_raw_input' | 'pending_follow_up_input' | 'queued_activation'
   | 'cascade_in_flight' | 'usage_limited' | 'agent_attention' | 'final_delivery_in_flight'
-  | 'background_tasks' | 'adopted' | 'headless' | 'vc_meeting_receiver' | 'remote_runner'
+  | 'background_tasks' | 'away_summary_pending' | 'adopted' | 'headless' | 'vc_meeting_receiver' | 'remote_runner'
   | 'compact_unsupported';
 
 const AUTO_COMPACT_GATE: ReadonlyArray<readonly [AutoCompactBlocker, (s: AutoCompactEligibilitySnapshot) => boolean]> = [
@@ -101,6 +104,7 @@ const AUTO_COMPACT_GATE: ReadonlyArray<readonly [AutoCompactBlocker, (s: AutoCom
   ['agent_attention', s => s.agentAttention],
   ['final_delivery_in_flight', s => s.finalDeliveriesInFlight !== 0],
   ['background_tasks', s => s.backgroundTaskCount !== 0],
+  ['away_summary_pending', s => s.awaySummaryPending === true],
   ['adopted', s => s.adopted],
   ['headless', s => s.headless],
   ['vc_meeting_receiver', s => s.vcMeetingReceiver],
@@ -122,6 +126,26 @@ export function isAutoCompactEligible(input: AutoCompactEligibilitySnapshot): bo
 export interface AutoCompactRefusalProjection {
   streamCardPending?: boolean;
   streamCardPendingTurnId?: string;
+}
+
+export interface AutoCompactMaintenanceMessage {
+  type?: string;
+  turnId?: string;
+  requireSafeComposer?: true;
+}
+
+/** Both automatic compact paths carry an `auto-compact:` turn id and require a
+ *  safe composer. While a one-shot recap is active, that maintenance input must
+ *  be deferred BEFORE the worker restores terminal focus. Human passthrough
+ *  deliberately does not match, even when it happens to use the same command. */
+export function shouldDeferAutoCompactForAwaySummary(
+  msg: AutoCompactMaintenanceMessage,
+  awaySummaryPending: boolean,
+): boolean {
+  return awaySummaryPending
+    && msg.type === 'raw_input'
+    && msg.requireSafeComposer === true
+    && msg.turnId?.startsWith('auto-compact:') === true;
 }
 
 export function isAutoCompactSafeComposerRefusal(
@@ -221,10 +245,36 @@ export class AutoCompactCoordinator {
     this.states.delete(sessionId);
   }
 
+  /** An away-summary refusal is a deferral, not a spent compact attempt. Clear
+   *  only that attempt; the next eligible observation re-arms the normal
+   *  debounce. Other safe-composer refusals keep their cooldown. */
+  defer(sessionId: string): void {
+    const state = this.states.get(sessionId);
+    if (state) state.lastAttemptAt = undefined;
+  }
+
   private cancelTimer(sessionId: string): void {
     const state = this.states.get(sessionId);
     if (!state?.timer) return;
     clearTimeout(state.timer);
     state.timer = undefined;
   }
+}
+
+export interface AutoCompactAwaySummaryDeferralState {
+  awaySummaryPending?: boolean;
+  autoCompactAwaySummaryDeferred?: boolean;
+}
+
+/** Reconcile a threshold refusal after the recap settles. The worker may have
+ *  refused before its pending frame reached the daemon, so the false frame must
+ *  clear the spent attempt and let THIS observation re-arm the debounce. */
+export function reconcileAutoCompactAwaySummaryDeferral(
+  state: AutoCompactAwaySummaryDeferralState,
+  coordinator: Pick<AutoCompactCoordinator, 'defer'>,
+  sessionId: string,
+): void {
+  if (!state.autoCompactAwaySummaryDeferred || state.awaySummaryPending) return;
+  state.autoCompactAwaySummaryDeferred = undefined;
+  coordinator.defer(sessionId);
 }

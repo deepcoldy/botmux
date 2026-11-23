@@ -43,6 +43,7 @@ import {
 } from '../src/core/idle-auto-compact.js';
 import { idleAutoCompactCardState, stampIdleSinceAt } from '../src/core/worker-pool.js';
 import { autoCompactBlockers, isAutoCompactEligible, type AutoCompactBlocker, type AutoCompactEligibilitySnapshot } from '../src/core/auto-compact.js';
+import { AwaySummaryFocus, FOCUS_IN, FOCUS_OUT } from '../src/services/away-summary-focus.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const MIN = 60_000;
@@ -1196,6 +1197,54 @@ describe('idle auto-compact with long-running background tasks', () => {
     snapshot = gate({ backgroundTaskCount: 1 });
     expect(h.sweepAt([ds], T0 + 58 * MIN)).toBe(1);
     expect(log.mock.calls.at(-1)![0]).toContain('not waiting for: background_tasks');
+  });
+});
+
+describe('away-summary one-shot maintenance', () => {
+  it('waits for the blurred recap to settle instead of restoring focus, then compacts', () => {
+    const turnId = 'om_recap_turn';
+    const writes: string[] = [];
+    const focus = new AwaySummaryFocus({
+      now: () => T0,
+      setTimer: () => () => {},
+      refusal: () => undefined,
+      currentTurnId: () => turnId,
+      watched: () => false,
+      write: bytes => { writes.push(bytes); return true; },
+      log: () => {},
+    });
+    focus.request(turnId);
+    focus.noteSuggestion(turnId);
+    expect(focus.isBlurred).toBe(true);
+    const ds = makeDs('away0001', { enabled: true, minutes: 1 });
+    edge(ds, 'idle', T0);
+    const h = harness({
+      blockers: () => autoCompactBlockers(gate({ awaySummaryPending: focus.isActive })),
+      compact: (target, id) => {
+        // Mirrors the worker's pre-handler: once recap has settled this is a
+        // no-op; it must never run while the one-shot is active.
+        focus.beforeDaemonMessage('raw_input');
+        target.session.lastMessageAt = new Date(h.clock.now).toISOString();
+        noteIdleAutoCompactTurnStarted(target, id);
+        return true;
+      },
+    });
+    expect(h.sweepAt([ds], T0 + MIN)).toBe(0);
+    expect(focus.isActive).toBe(true);
+    expect(writes).toEqual([FOCUS_OUT]);
+    focus.noteRecap({ turnId });
+    expect(focus.isActive).toBe(false);
+    expect(h.sweepAt([ds], T0 + 2 * MIN)).toBe(1);
+    expect(writes).toEqual([FOCUS_OUT, FOCUS_IN]);
+  });
+
+  it('maps the worker pending refusal to the existing retry path', () => {
+    const ds = makeDs('away0002', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    expect(noteIdleAutoCompactRefused(ds, h.compact.mock.calls[0][1], 'away_summary_pending'))
+      .toEqual({ reason: 'busy', attempt: 1, retry: true });
   });
 });
 

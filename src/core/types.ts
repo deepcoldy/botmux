@@ -589,6 +589,14 @@ export interface DaemonSession {
    *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
    *  with the CLI). In-memory only. */
   backgroundTaskCount?: number;
+  /** Last screen_update's away-summary state (waiting or blurred). Automatic
+   *  compact must not restore focus and cancel Claude's one-shot recap.
+   *  In-memory; absent from older workers means unknown/false. */
+  awaySummaryPending?: boolean;
+  /** Threshold auto-compact was refused only because the one-shot recap was
+   *  active. Cleared by observeAutoCompact once pending is false, allowing the
+   *  normal debounce to re-arm instead of leaving a spent cooldown. In-memory. */
+  autoCompactAwaySummaryDeferred?: boolean;
   /** Wall-clock of the most recent `turn_terminal` observed for this session,
    *  and the turn it named. The terminal edge is the daemon's authority that a
    *  turn is over, so these drive the post-terminal display settle (see
