@@ -8138,8 +8138,9 @@ export async function startForkSubtopicSession(
     if (fromSessionGroup && usesCommandAnchor) {
       anchorId = message.messageId;
       groupTopicPending = true;
+      const uuid = createHash('sha256').update(`fork-topic:${appId}:${anchorId}`).digest('hex').slice(0, 40);
       groupTopicReplyId = await replyMessage(appId, anchorId, seedPost, 'post', true,
-        `fork-topic:${appId}:${anchorId}`, undefined, sourceOptions);
+        uuid, undefined, sourceOptions);
       childThreadId = (await getMessageThreadId(appId, groupTopicReplyId)) ?? undefined;
       if (!childThreadId?.startsWith('omt_')) {
         const orphanTopic = !await recallAnchor();

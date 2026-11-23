@@ -2552,6 +2552,7 @@ describe('handleCommand', () => {
       expect(vi.mocked(replyMessage).mock.calls[0]?.slice(0, 5)).toEqual([
         LARK_APP_ID, 'om_fork_command', expect.stringContaining(task), 'post', true,
       ]);
+      expect(vi.mocked(replyMessage).mock.calls[0]?.[5]).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
       if (threadCreated) {
         expect(forkSession).toHaveBeenCalledWith('sess-001', CHAT_ID, 'om_fork_command', 'group', 'thread',
           expect.objectContaining({ turnId: 'om_fork_command', larkThreadId: 'omt_fork_child', forkTaskText: task }));
