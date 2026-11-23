@@ -4609,8 +4609,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
       ? 'BOTMUX_AS names nobody who spoke in this turn; run the command without it to act as the person who started the turn'
       : 'BOTMUX_AS cannot name anyone in this turn (this bot does not allow running a command for another speaker, or the turn is unattended or delegated); run the command without BOTMUX_AS' });
   }
-  const originSender = choice.speaker?.openId ?? baseSender;
-  let sender = delegated?.targetOpenId ?? originSender;
+  // The turn's own principal (a person, a bot, or nobody) before any fallback.
+  const turnPrincipal = choice.speaker?.openId ?? baseSender;
   // A turn nobody started (a script, a webhook, a schedule without a creator,
   // a bot dispatch the owner signed) acts as the bot owner; a turn with a
   // person keeps that person (core/lark-user-owner-fallback).
@@ -4618,16 +4618,15 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   let ownerFallback: { openId: string; reason: OwnerFallbackReason; turnId: string } | undefined = ownerActorFallback && ownerOpenId
     ? { openId: ownerOpenId, reason: 'owner_actor', turnId: fallbackTurnId } : undefined;
   if (!ownerFallback && ds && liveOrigin && !detachedForUser && !delegated && body.as === undefined
-    && (!originSender || principalIsBot({ trustedCaller: liveOrigin.trustedCaller, principalOpenId: originSender }))) {
+    && (!turnPrincipal || principalIsBot({ trustedCaller: liveOrigin.trustedCaller, principalOpenId: turnPrincipal }))) {
     const decision = await decideOwnerFallback({
       bot, session: ds.session, ownerOpenId,
-      turn: { turnId: fallbackTurnId, trustedCaller: liveOrigin.trustedCaller, principalOpenId: originSender,
+      turn: { turnId: fallbackTurnId, trustedCaller: liveOrigin.trustedCaller, principalOpenId: turnPrincipal,
         speakers: liveOrigin.speakers, delegated: false },
       lookups: ownerFallbackLookups(ds, bot.larkAppId, fallbackTurnId),
     });
     if (decision.use === 'owner') {
       ownerFallback = { openId: decision.openId, reason: decision.reason, turnId: fallbackTurnId };
-      sender = decision.openId;
     } else if (decision.use === 'none') {
       // A switched-off or per-person bot, and an origin that cannot be
       // established, keep the refusal below unchanged.
@@ -4645,6 +4644,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
       decision: { use: 'owner', openId: ownerFallback.openId, reason: ownerFallback.reason }, result,
     }));
   };
+  const originSender = ownerFallback?.openId ?? turnPrincipal;
+  const sender = delegated?.targetOpenId ?? originSender;
   if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
   const cached = delegated ? undefined : getIdentity(bot.larkAppId, sender);
   const user = delegated ? { type: 'user' as const, openId: sender }
@@ -4670,11 +4671,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
       && (usesBoundScheduledToolActor
         ? ds.scheduledToolActors?.get(turnId)?.openId === scheduledToolActor.openId
           && ds.scheduledToolActors?.get(turnId)?.unionId === scheduledToolActor.unionId
-        // A human turn (including a BOTMUX_AS switch, which only rewrites originSender)
-        // stays anchored to its original principal turnCaller; an execution-only bound
-        // call keeps the master originSender comparison.
+        // A human turn (including a BOTMUX_AS switch, which only rewrites the chosen
+        // speaker) stays anchored to its original principal turnCaller; an
+        // execution-only bound call keeps comparing the turn's own principal
+        // (before any owner fallback, which is re-checked separately).
         : (ds.managedTurnOrigin?.callerOpenId ?? execution?.callerOpenId)
-          === (liveOrigin?.callerOpenId ? turnCaller : originSender))
+          === (liveOrigin?.callerOpenId ? turnCaller : turnPrincipal))
       && ds.managedTurnOrigin?.identityTurnId === identityTurnId)
     : (!!backgroundInput && !!detachedForUser && backgroundContextStillValid(backgroundInput, detachedForUser));
   if (!boundLarkToolRequest(req, params.sessionId, bot.larkAppId)
