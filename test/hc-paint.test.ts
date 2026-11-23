@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_PAINT_BYTES, PAINT_START, PaintTracker, type StreamSegment } from '../src/adapters/backend/hc/paint.js';
+import { MAX_PAINT_BYTES, PAINT_START, REPORT_OPEN, PaintTracker, type StreamSegment } from '../src/adapters/backend/hc/paint.js';
 
 const SCREEN = Buffer.from('\x1b[?9l\x1b[?1000l\x1b[H\x1b[2J\x1b[1;1Hready\x1b[2;1H$ \x1b]2;sh\x1b\\', 'latin1');
 const MODE = Buffer.from('\x1b[?9001l', 'latin1');
@@ -105,5 +105,40 @@ describe('PaintTracker', () => {
     expect(seen).toBeGreaterThan(MAX_PAINT_BYTES);
     expect(tracker.inPaint).toBe(false);
     expect(tracker.push(LIVE)).toEqual([{ bytes: LIVE, paint: false, firstPaint: false, paintDone: false }]);
+  });
+
+  it('keeps a report whose REPORT_OPEN prefix is split across reads inside the paint', () => {
+    // hc cuts frames at a fixed 16 KiB, so a paint's trailing status report can
+    // be split at any byte. A proper prefix of ESC ] 7 5 0 1 ; held at a read
+    // boundary must not end the paint early and tear that report into live text.
+    const paint = paintOf(REPORT);
+    const stream = Buffer.concat([paint, LIVE]);
+    const reportStart = paint.indexOf(REPORT);
+    for (let k = 1; k < REPORT_OPEN.length; k++) {
+      const splitAt = reportStart + k; // split inside ESC ] 7 5 0 1 ;
+      const segments = feed(new PaintTracker(), stream, [splitAt]);
+      const { paint: painted, live, done } = split(segments);
+      expect(painted.equals(paint), `REPORT_OPEN split after ${k} bytes: paint bytes`).toBe(true);
+      expect(live.equals(LIVE), `REPORT_OPEN split after ${k} bytes: live bytes`).toBe(true);
+      expect(done, `REPORT_OPEN split after ${k} bytes: one paintDone`).toBe(1);
+      expect(segments.filter(s => s.paint).every(s => s.firstPaint)).toBe(true);
+    }
+  });
+
+  it('still closes the paint with paintDone when a held prefix turns out to be live output', () => {
+    // LIVE begins with ESC (the first byte of REPORT_OPEN). Held across a read
+    // and disproven by the next byte, the paint before it must still get its
+    // single paintDone, and the ESC stays with the live output.
+    const paint = paintOf();
+    const stream = Buffer.concat([paint, LIVE]);
+    const cut = paint.length; // the ESC opening LIVE is the held byte
+    const segments = feed(new PaintTracker(), stream, [cut]);
+    const { paint: painted, live, done } = split(segments);
+    expect(painted.equals(paint)).toBe(true);
+    expect(live.equals(LIVE)).toBe(true);
+    expect(done).toBe(1);
+    const doneSegment = segments.filter(s => s.paintDone);
+    expect(doneSegment).toHaveLength(1);
+    expect(doneSegment[0]!.paint).toBe(true);
   });
 });

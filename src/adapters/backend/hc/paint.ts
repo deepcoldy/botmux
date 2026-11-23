@@ -11,7 +11,8 @@ export const PAINT_START = Buffer.from('\x18\x1b[!p\x1b[?2026l', 'latin1');
 const MODE_ON = Buffer.from('\x1b[?9001h', 'latin1');
 const MODE_OFF = Buffer.from('\x1b[?9001l', 'latin1');
 const MARKER_BYTES = MODE_ON.length;
-const REPORT_OPEN = Buffer.from('\x1b]7501;', 'latin1');
+/** Exported for boundary tests: the OSC 7501 opener that can be split across frames. */
+export const REPORT_OPEN = Buffer.from('\x1b]7501;', 'latin1');
 const REPORT_CLOSE = Buffer.from('\x1b\\', 'latin1');
 
 /** A paint that never shows its closing marker is treated as over after this much. */
@@ -27,13 +28,30 @@ export interface StreamSegment {
   paintDone: boolean;
 }
 
-type State = 'live' | 'screen' | 'reports' | 'report-body';
+type State = 'live' | 'screen' | 'reports' | 'report-body' | 'report-hold';
+
+/** Where a paint ends; `wait` means the read ended while another report could still follow. */
+interface PaintEnd {
+  /** Index just past the confirmed paint bytes. */
+  at: number;
+  /** The paint is not proven finished: keep parsing as paint on the next read. */
+  wait: boolean;
+  /** Bytes at the read's tail held back because they begin REPORT_OPEN (`wait` only). */
+  hold: number;
+}
 
 export class PaintTracker {
   private state: State = 'live';
   private carry: Buffer = Buffer.alloc(0);
   /** Live bytes ending a read that could be the start of a paint split across frames. */
-  private held: Buffer = Buffer.alloc(0);
+  private held = Buffer.alloc(0);
+  /**
+   * Paint bytes held at a read boundary while `reports` expected another OSC
+   * report: the tail was a proper prefix of REPORT_OPEN. The next read decides
+   * whether they stay paint (the report continues) or become live (the paint
+   * had really ended).
+   */
+  private reportHeld = Buffer.alloc(0);
   private paintBytes = 0;
   private first = false;
   private seenFirst = false;
@@ -43,8 +61,30 @@ export class PaintTracker {
   }
 
   push(input: Buffer): StreamSegment[] {
+    // Settle a report prefix held across reads before touching the live hold.
+    if (this.reportHeld.length > 0) {
+      const held = this.reportHeld;
+      this.reportHeld = Buffer.alloc(0);
+      const joined = Buffer.concat([held, input]);
+      if (joined.indexOf(REPORT_OPEN) === 0) {
+        this.state = 'reports';
+        return this.dispatch(joined);
+      }
+      // The held prefix was live (e.g. an ESC opening a different sequence),
+      // not a report. The paint before it was already complete, so close it with
+      // an empty done marker before handing the held bytes back as live.
+      this.state = 'live';
+      const out: StreamSegment[] = [this.segment(Buffer.alloc(0), true, true)];
+      out.push(this.segment(held, false));
+      if (input.length > 0) out.push(...this.push(input));
+      return out;
+    }
     const chunk = this.held.length > 0 ? Buffer.concat([this.held, input]) : input;
     this.held = Buffer.alloc(0);
+    return this.dispatch(chunk);
+  }
+
+  private dispatch(chunk: Buffer): StreamSegment[] {
     const out: StreamSegment[] = [];
     let at = 0;
     while (at < chunk.length) {
@@ -73,24 +113,43 @@ export class PaintTracker {
         if (over) this.state = 'live';
         break;
       }
-      this.paintBytes += end - at;
-      out.push(this.segment(chunk.subarray(at, end), true, true));
+      this.paintBytes += end.at - at;
+      if (end.at > at) out.push(this.segment(chunk.subarray(at, end.at), true, !end.wait));
+      if (end.wait) {
+        // Not proven finished. A non-empty held prefix parks in report-hold; an
+        // empty one just leaves the tracker in `reports` for the next read.
+        if (end.hold > 0) {
+          this.reportHeld = Buffer.from(chunk.subarray(end.at));
+          this.state = 'report-hold';
+        }
+        break;
+      }
       this.state = 'live';
-      at = end;
+      at = end.at;
     }
     return out;
   }
 
   /** Live bytes still held back because they might have begun a paint; call when the stream ends. */
   flush(): StreamSegment[] {
-    if (this.held.length === 0) return [];
+    const out: StreamSegment[] = [];
+    if (this.reportHeld.length > 0) {
+      // The stream ends with no next read to finish the report: the held bytes
+      // came from the paint region and are handed back as its tail.
+      const tail = this.reportHeld;
+      this.reportHeld = Buffer.alloc(0);
+      this.state = 'live';
+      out.push(this.segment(tail, true, true));
+    }
+    if (this.held.length === 0) return out;
     const bytes = this.held;
     this.held = Buffer.alloc(0);
-    return [this.segment(bytes, false)];
+    out.push(this.segment(bytes, false));
+    return out;
   }
 
-  /** Index in `chunk` just past the paint, or null when the paint runs past this chunk. */
-  private paintEnd(chunk: Buffer, from: number): number | null {
+  /** The paint's end in this chunk, or null when the paint runs past this chunk. */
+  private paintEnd(chunk: Buffer, from: number): PaintEnd | null {
     let at = from;
     if (this.state === 'screen') {
       const search = this.carry.length > 0 ? Buffer.concat([this.carry, chunk.subarray(at)]) : chunk.subarray(at);
@@ -115,15 +174,32 @@ export class PaintTracker {
         this.carry = Buffer.alloc(0);
         this.state = 'reports';
       }
-      if (!startsWithAt(chunk, at, REPORT_OPEN)) return at;
-      this.state = 'report-body';
-      at += REPORT_OPEN.length;
+      if (startsWithAt(chunk, at, REPORT_OPEN)) {
+        this.state = 'report-body';
+        at += REPORT_OPEN.length;
+        continue;
+      }
+      // A proper prefix of REPORT_OPEN at the read's tail means the next read
+      // may finish a report: hold it so the report is not torn into live text.
+      // An empty remainder (the read ended exactly on a boundary) keeps the
+      // historical immediate-close behaviour; the worker's status de-dup still
+      // absorbs a whole report that then arrives one read later.
+      const remaining = chunk.length - at;
+      if (remaining > 0 && remaining < REPORT_OPEN.length && isPrefix(chunk.subarray(at), REPORT_OPEN)) {
+        return { at, wait: true, hold: remaining };
+      }
+      return { at, wait: false, hold: 0 };
     }
   }
 
   private segment(bytes: Buffer, paint: boolean, done = false): StreamSegment {
     return { bytes, paint, firstPaint: paint && this.first, paintDone: paint && done };
   }
+}
+
+/** True when `part` is a (possibly empty) proper-or-empty prefix of `full`. */
+function isPrefix(part: Buffer, full: Buffer): boolean {
+  return part.length <= full.length && full.compare(part, 0, part.length, 0, part.length) === 0;
 }
 
 /** Length of the longest proper prefix of PAINT_START that ends `chunk` at or after `from`. */
