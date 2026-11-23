@@ -243,6 +243,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     codexBrowserAutoApproveOrigins: j?.codexBrowserAutoApproveOrigins === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     goalStatusCard: j?.goalStatusCard === true,
+    followUpReply: j?.followUpReply === true,
     privateCard: j?.privateCard === true,
     replyCardActions: j?.replyCardActions === true,
     replyCardNextStep: j?.replyCardNextStep === true,

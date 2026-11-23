@@ -8610,6 +8610,14 @@ describe('handleCommand', () => {
         );
       });
 
+      // 附件下载失败的提示让人发 `/login --scope im:resource` 单独授权；它不在建 bot 用的
+      // 用户权限清单里（用户身份要企业管理员审批），但必须能申请。
+      it('accepts the on-demand attachment download scope', async () => {
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope im:resource'), deps, LARK_APP_ID);
+        expect(generateAuthUrl).toHaveBeenCalledWith('app-1', 'secret-1', 'feishu', ['im:resource'], 'ou_sender');
+      });
+
       // A typo does not degrade — Feishu rejects the whole authorize URL with
       // 20043 and the person is handed a link that just fails to open, with no
       // hint which word was wrong. Catch it here where we can name it.

@@ -36,7 +36,8 @@ describe('user-token pending OAuth state', () => {
         token_type: 'Bearer',
         expires_in: 7200,
         refresh_token_expires_in: 2_592_000,
-        scope: 'im:feed_group_v1:read offline_access',
+        // 授予全部申请的 scope：缺项会额外触发一次只读的应用版本查询，不属于本用例要钉的两次调用。
+        scope: authorize.searchParams.get('scope'),
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     });
     vi.stubGlobal('fetch', stubbedFetch);

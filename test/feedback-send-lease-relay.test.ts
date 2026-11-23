@@ -176,6 +176,20 @@ describe('CLI send lease with daemon fallback', () => {
     expect(relay.calls.map(call => call.action)).toEqual(['acquire', 'release']);
   });
 
+  it('releases under the host pid the daemon recorded for a PID-namespaced sender', async () => {
+    const directory = await dataDir();
+    const child = await sender();
+    const real = relayTo(directory);
+    // The daemon route maps the namespace-local pid (here 18) onto the host pid.
+    const relay: FeedbackSendLeaseRelay = async (body, signal) =>
+      real(body.action === 'acquire' ? { ...body, processId: child.pid } : body, signal);
+    const release = await acquireFeedbackSendLeaseWithRelay({ acquireLocal: sandboxDenied, relay, processId: 18 });
+    expect(inspectSendRecovery(directory)).toEqual([expect.objectContaining({ processId: child.pid, live: true })]);
+    await release();
+    expect(await leaseFiles(directory)).toEqual([]);
+    expect(real.calls.at(-1)).toMatchObject({ action: 'release', processId: child.pid });
+  });
+
   it('does not route admission refusals or other failures through the daemon', async () => {
     const directory = await dataDir();
     const relay = relayTo(directory);

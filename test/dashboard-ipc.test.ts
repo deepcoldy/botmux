@@ -2523,6 +2523,43 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — mid-turn replies (followUpReply)', () => {
+  it('is default-off, persists only the explicit on value, and reads back through the bot payload', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-follow-up-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-follow-up-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const put = (body: unknown) => fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).followUpReply).toBe(false);
+      const on = await put({ followUpReply: true });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, followUpReply: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].followUpReply).toBe(true);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).followUpReply).toBe(true);
+
+      const off = await put({ followUpReply: false });
+      expect(await off.json()).toMatchObject({ ok: true, followUpReply: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).not.toHaveProperty('followUpReply');
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — goal status card', () => {
   it('is default-off and persists only the explicit on value', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-goal-card-'));
@@ -11407,6 +11444,33 @@ describe('PUT /api/bot-rename', () => {
       // The local alias surfaces on the bot-defaults GET.
       const get = await (await fetch(`${base}/api/bot-default-oncall`)).json();
       expect(get).toMatchObject({ displayName: '小助手' });
+    });
+  });
+
+  it.each([null, 'Existing alias'])('preserves remote success and reports local sync failure with alias %j', async displayName => {
+    await withRenameServer(async (base, configPath) => {
+      const before = readFileSync(configPath, 'utf8');
+      const localSyncError = 'Remote rename succeeded; local configuration still needs repair.';
+      setBotRenamer(async name => ({ ok: true, name, displayName, localSyncError }));
+
+      const response = await fetch(`${base}/api/bot-rename`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'New name' }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        ok: true,
+        mode: 'feishu',
+        botName: displayName || 'New name',
+        larkBotName: 'New name',
+        displayName,
+        localSyncError,
+      });
+      // The remote publish already succeeded. Never execute the local-only
+      // fallback, which would overwrite the alias and claim the remote failed.
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
     });
   });
 

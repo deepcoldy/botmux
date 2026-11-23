@@ -23851,11 +23851,18 @@ function setupWorkerHandlers(
         const validSettingReceipt = !currentSettingsAttempt || msg.status !== 'succeeded'
           || (!!msg.topicEffort && msg.topicEffort.model === savedReadiness.requested.model
             && msg.topicEffort.effort === savedReadiness.requested.effort);
+        const effectiveStatus = validSettingReceipt ? msg.status : 'failed';
         const restartSettled = restartCoordinator.resolve(
           ds.session.sessionId,
           msg.attemptId,
-          validSettingReceipt ? msg.status : 'failed',
+          effectiveStatus,
         );
+        // `settled=false` means the coordinator had no attempt under this id —
+        // its status card keeps whatever it last showed (a 40s 重启超时) even
+        // though the CLI reported success. Say which side lost the correlation:
+        // without this the only symptom is a card that never leaves 重启超时
+        // (2026-11-23).
+        logger.info(`[${t}] restart_result ${effectiveStatus} attempt=${msg.attemptId.slice(0, 8)} settled=${restartSettled}`);
         // requestSessionRestart() fences the live generation by clearing
         // workerReady before asking the worker to respawn its CLI in place. An
         // in-worker respawn does not emit the process-level `ready` message
@@ -26307,6 +26314,7 @@ function setupWorkerHandlers(
           );
           break;
         }
+        if (effectiveCliId === 'codex') terminateProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
         // The「本轮回顾」panel goes on the turn's last card once it settles —
         // and only if the CLI recaps the turn (core/turn-recap-state.ts).
         const recapWanted = msg.status === 'completed' && turnRecapIo.enabled(ds);
@@ -27778,9 +27786,14 @@ function setupWorkerHandlers(
       }
 
       case 'final_output': {
-        if (!msg.handoff) { await processFinalOutput(msg); break; }
+        if (!msg.handoff) {
+          if (effectiveCliId === 'codex' && msg.sessionId === ds.session.sessionId) terminateProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
+          await processFinalOutput(msg);
+          break;
+        }
         try {
           if (!journal || msg.handoff.version !== 2 || msg.handoff.token !== ds.initConfig?.finalOutputHandoff?.token || msg.sessionId !== ds.session.sessionId) throw new Error('output_handoff_not_authorized');
+          if (effectiveCliId === 'codex') terminateProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
           const snapshot = outputSnapshot(ds.larkAppId, msg);
           if (snapshot.id !== msg.handoff.id || snapshot.fingerprint !== msg.handoff.fingerprint) throw new Error('output_handoff_conflict');
           const existing = journal.read(snapshot.id);
@@ -27844,9 +27857,11 @@ function setupWorkerHandlers(
       case 'absorbed_reply': {
         // The answer to a Lark message the CLI folded into its running turn
         // (Claude Code adopt: a mid-turn system reminder; Codex: a same-turn
-        // steer), posted as soon as the model answered it. Replied under that
-        // message, which the reply quotes, so the card omits the question.
-        // Presentation only: the turn's lifecycle is unchanged.
+        // steer), posted as soon as the model answered it — or, with
+        // `progress` (Codex), what the model said to that turn mid-work.
+        // Replied under that message, which the reply quotes, so the card
+        // omits the question. Presentation only: the turn's lifecycle is
+        // unchanged.
         if (!ds.adoptedFrom && effectiveCliId !== 'codex') {
           logger.warn(`[${t}] Ignored absorbed_reply from a session that cannot fold input`);
           break;
@@ -27871,7 +27886,8 @@ function setupWorkerHandlers(
           ? `${truncateUtf16WellFormed(msg.answer, BTW_ANSWER_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
           : msg.answer;
         const cardJson = buildContextualReplyCard({
-          title: tr(msg.source === 'thinking' ? 'card.absorbed_reply_thinking' : 'card.absorbed_reply', undefined, loc),
+          title: tr(msg.progress ? 'card.mid_turn_progress'
+            : msg.source === 'thinking' ? 'card.absorbed_reply_thinking' : 'card.absorbed_reply', undefined, loc),
           assistantText: repairReplyMarkdown(answer),
           assistantLabel: sessionCliDisplayName(ds, botCfg),
           recipientOpenId: daemonCardFooterRecipientOpenId(ds, effectiveCliId),
@@ -27880,15 +27896,40 @@ function setupWorkerHandlers(
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
         });
+        // Where the turn's own final goes: the inbound message captured for
+        // this turn, not the session's current reply target, which a later
+        // turn may have moved (a topic thread's root, or a newer quote).
+        const replyTarget = isMeetingDrivenTurn(ds, msg.turnId, msg.dispatchAttempt)
+          ? undefined
+          : frozenReplyContextForTurn(ds, fallbackTurnId(ds, msg.turnId)).target;
+        const uuid = absorbedReplyUuid(ds.session.sessionId, msg.turnId, msg.replyUuid);
+        if (msg.progress) {
+          // Progress is best effort: the turn's final does not wait for it,
+          // nor does a graceful shutdown. A newer progress or the exact turn
+          // terminal supersedes every older queued retry.
+          const progressDelivery = beginProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
+          if (!progressDelivery) break;
+          const stillWanted = () => {
+            if (!progressDeliveryIsCurrent(ds, progressDelivery)) return false;
+            if (!ownsLifecycleMutation() || managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) return false;
+            try { return getBot(ds.larkAppId).config.followUpReply === true; } catch { return false; }
+          };
+          const result = await deliverWithRetry(
+            () => scopedReply(cardJson, 'interactive', msg.turnId, { uuid, ...(replyTarget ? { replyTarget } : {}) }),
+            stillWanted,
+            (attempt, err) => logger.warn(`[${t}] Progress reply attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`),
+          );
+          if (!result.delivered) logger.warn(`[${t}] Progress reply for turn ${msg.turnId.substring(0, 8)} not delivered`);
+          break;
+        }
         // The worker sends this reply once. Retry it like a bridge final — a
         // daemon-owned delivery a graceful shutdown waits for — and let the
         // provider key keep an attempt whose response was lost from posting a
         // second copy.
-        const uuid = absorbedReplyUuid(ds.session.sessionId, msg.turnId, msg.replyUuid);
         const finishDelivery = beginFinalOutputDelivery(ds, msg.turnId);
         try {
           const result = await deliverWithRetry(
-            () => scopedReply(cardJson, 'interactive', msg.turnId, { uuid }),
+            () => scopedReply(cardJson, 'interactive', msg.turnId, { uuid, ...(replyTarget ? { replyTarget } : {}) }),
             ownsLifecycleMutation,
             (attempt, err) => logger.warn(`[${t}] Follow-up reply attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`),
           );
@@ -28104,11 +28145,19 @@ function setupWorkerHandlers(
     // current without a requesting user, and losing its identity decision
     // leaves every proven identity wrapper refused (exit 77), so both must be
     // visible in production. So must losing a terminal-local turn's start: a
-    // zero-prompt session then has nowhere to send that turn's final.
+    // zero-prompt session then has nowhere to send that turn's final. And so
+    // must a dropped restart receipt: it is the only edge that closes the
+    // restart status card and lifts the workerReady fence, so a scope rejection
+    // here leaves the card stuck at 重启超时 and fork/relay at worker_busy for a
+    // CLI that is plainly back at its prompt — diagnosable at debug level only,
+    // which production never has on (2026-11-23).
     const logRejected = (reason: string) => {
       if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked' || msg.type === 'session_identity_decision'
-        || msg.type === 'terminal_turn_started') && ds.worker === worker) {
-        logger.warn(`[${t}] Dropped ${msg.type} from current worker turn=${msg.turnId ?? '-'} reason=${reason}`);
+        || msg.type === 'terminal_turn_started' || msg.type === 'restart_result') && ds.worker === worker) {
+        const detail = msg.type === 'restart_result'
+          ? `attempt=${msg.attemptId.slice(0, 8)} status=${msg.status}`
+          : `turn=${msg.turnId ?? '-'}`;
+        logger.warn(`[${t}] Dropped ${msg.type} from current worker ${detail} reason=${reason}`);
       } else if (msg.type === 'final_output' && ds.worker === worker) {
         reportUndeliveredFinal(msg, reason);
       } else {
@@ -28121,11 +28170,24 @@ function setupWorkerHandlers(
       if (metadata) sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId, msg);
       return;
     }
-    if (admission.kind === 'defer') return;
+    // A deferral parks the event until its binding proves an identity, and says
+    // nothing — which is wrong for the two messages whose loss is user-visible:
+    // a parked `prompt_ready` leaves the session looking busy, and a parked
+    // restart receipt leaves the status card at 重启超时 for a CLI that is at its
+    // prompt. Both are sent once, so a parked one is simply lost. Until this
+    // line a lost receipt was indistinguishable from one the worker never sent
+    // (2026-11-23).
+    const logDeferred = (stage: string) => {
+      if (msg.type === 'prompt_ready' || msg.type === 'restart_result') {
+        logger.warn(`[${t}] Deferred ${msg.type} from current worker at ${stage}`
+          + ` binding=${metadata?.bindingId?.slice(0, 8) ?? '-'} — waiting for that binding to bind an identity`);
+      }
+    };
+    if (admission.kind === 'defer') { logDeferred('ingest'); return; }
     await sessionController.flushPrimary();
     admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin);
     if (admission.kind === 'reject') { logRejected(admission.reason); return; }
-    if (admission.kind === 'defer') return;
+    if (admission.kind === 'defer') { logDeferred('gateway'); return; }
     // A verified native success is stronger than a lost input commit ACK.
     // Ambiguous/failed/cancelled boundaries do not prove queue admission.
     if ((admission.kind === 'current' || admission.kind === 'historical')
@@ -28504,6 +28566,59 @@ const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
  *  returns the message already posted instead of posting another. */
 export function absorbedReplyUuid(sessionId: string, turnId: string, replyUuid: string): string {
   return `ar_${createHash('sha256').update(`${sessionId}:${turnId}:${replyUuid}`, 'utf8').digest('hex').slice(0, 46)}`;
+}
+
+interface ProgressDeliveryToken { key: string; epoch: number }
+interface ProgressDeliveryState { epoch: number }
+const PROGRESS_ACTIVE_DELIVERY_STATE_MAX = 256;
+const progressDeliveryStates = new WeakMap<DaemonSession, Map<string, ProgressDeliveryState>>();
+// Terminal truth is not retry bookkeeping: active epochs may be LRU-evicted,
+// but an exact turn/attempt that ended must never accept reordered progress.
+// These per-session keys live no longer than the DaemonSession itself.
+const progressDeliveryTerminals = new WeakMap<DaemonSession, Set<string>>();
+const progressDeliveryKey = (turnId: string, dispatchAttempt?: number): string =>
+  JSON.stringify([turnId, dispatchAttempt ?? null]);
+
+function writeProgressDeliveryState(
+  ds: DaemonSession, key: string, state: ProgressDeliveryState,
+): void {
+  let states = progressDeliveryStates.get(ds);
+  if (!states) progressDeliveryStates.set(ds, states = new Map());
+  states.delete(key);
+  states.set(key, state);
+  // Eviction cancels an active retry but cannot erase a terminal tombstone.
+  while (states.size > PROGRESS_ACTIVE_DELIVERY_STATE_MAX) {
+    const oldest = states.keys().next().value;
+    if (oldest === undefined) break;
+    states.delete(oldest);
+  }
+}
+
+/** One newer progress or terminal supersedes every older retry for the exact
+ * turn attempt. A terminal tombstone also rejects IPC reordered after it. */
+function beginProgressDelivery(
+  ds: DaemonSession, turnId: string, dispatchAttempt?: number,
+): ProgressDeliveryToken | undefined {
+  const key = progressDeliveryKey(turnId, dispatchAttempt);
+  if (progressDeliveryTerminals.get(ds)?.has(key)) return undefined;
+  const previous = progressDeliveryStates.get(ds)?.get(key);
+  const epoch = (previous?.epoch ?? 0) + 1;
+  writeProgressDeliveryState(ds, key, { epoch });
+  return { key, epoch };
+}
+
+function progressDeliveryIsCurrent(ds: DaemonSession, token: ProgressDeliveryToken): boolean {
+  if (progressDeliveryTerminals.get(ds)?.has(token.key)) return false;
+  const state = progressDeliveryStates.get(ds)?.get(token.key);
+  return state !== undefined && state.epoch === token.epoch;
+}
+
+function terminateProgressDelivery(ds: DaemonSession, turnId: string, dispatchAttempt?: number): void {
+  const key = progressDeliveryKey(turnId, dispatchAttempt);
+  progressDeliveryStates.get(ds)?.delete(key);
+  let terminals = progressDeliveryTerminals.get(ds);
+  if (!terminals) progressDeliveryTerminals.set(ds, terminals = new Set());
+  terminals.add(key);
 }
 
 /** Run `attempt` on the bridge-final backoff until it resolves. Retries stop
