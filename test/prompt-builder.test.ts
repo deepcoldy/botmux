@@ -117,7 +117,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 // ─── Imports ──────────────────────────────────────────────────────────────
 
-import { buildNewTopicPrompt, buildNewTopicCliInput, buildFollowUpContent, buildFollowUpCliInput, buildReforkCliInput, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
+import { buildNewTopicPrompt, buildNewTopicCliInput, buildFollowUpContent, buildFollowUpCliInput, buildReforkCliInput, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock, buildSilentScheduleHint } from '../src/core/session-manager.js';
+import { validateMentionDecision } from '../src/services/send-policy.js';
 import { config } from '../src/config.js';
 import { buildExternalEventApplicationContext, buildExternalEventCodexAppContexts, buildExternalEventDataContext, buildExternalEventVisibleText, buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
 import type { TriggerRequest } from '../src/services/trigger-types.js';
@@ -1164,6 +1165,22 @@ describe('buildNewTopicPrompt with multi-user follow-ups', () => {
   });
 });
 
+// The command taught by a silent scheduled turn must pass the real default @ gate;
+// transcript mode no longer carries the long mention-gate prompt that used to teach it.
+describe('silent scheduled send guidance', () => {
+  it.each(['zh', 'en'] as const)('provides a valid no-recipient send command (%s)', locale => {
+    const hint = buildSilentScheduleHint('monitor', locale);
+    const command = hint.match(/`(botmux send[^`]*)`/)?.[1];
+    expect(command).toBeDefined();
+    const tokens = command!.split(/\s+/);
+    expect(validateMentionDecision({
+      enabled: true, sendTopLevel: false,
+      hasMentionArgs: tokens.includes('--mention'), mentionBack: tokens.includes('--mention-back'),
+      noMention: tokens.includes('--no-mention'), hasQuoteTargetSender: false,
+    }).ok, command).toBe(true);
+  });
+});
+
 // ─── replyDelivery=transcript — 信封改口 / solo 去壳 ─────────────────────────
 
 describe('replyDelivery=transcript envelope', () => {
@@ -1369,6 +1386,30 @@ describe('replyDelivery=transcript envelope', () => {
     expect(solo).toContain('[附件]\n- x.jpg (/tmp/x.jpg)');
     expect(solo).toContain('[@提及]\n- @Alice');
     expect(solo).not.toContain('- @Bot');
+  });
+
+  it('transcript 给无原生 skill 通道的 CLI 保留最小发送契约，有通道 CLI 仍走按需 skill', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    const build = (cliId: 'hermes' | 'codex') => buildNewTopicPrompt(
+      '把报告发给我', `sess-no-skill-${cliId}`, cliId, undefined, undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' }, 'zh', sender,
+      { larkAppId: 'app_test', chatId: 'oc_1', solo: true, selfMention },
+    );
+    const routing = (prompt: string) => prompt.match(/<botmux_routing>[\s\S]*?<\/botmux_routing>/)?.[0] ?? '';
+    const hermes = routing(build('hermes'));
+    // 这些不是反进度劝说，而是缺少 skill catalog 时必须自足的协议规则。
+    for (const token of [
+      'botmux send', 'botmux skill show botmux-send', '--images', '--files', '--videos',
+      'heredoc', '--content-file', '--mention-back', '--no-mention', '--response-kind final',
+      'BOTMUX_NOTHING_TO_SEND', '最后一次工具调用之后',
+    ]) expect(hermes).toContain(token);
+
+    const codex = routing(build('codex'));
+    expect(codex).toContain('BOTMUX_NOTHING_TO_SEND');
+    for (const token of [
+      'botmux send', 'botmux skill show botmux-send', '--images', '--files',
+      'heredoc', '--content-file', '--no-mention', '--response-kind final',
+    ]) expect(codex).not.toContain(token);
   });
 
   it('buildReforkCliInput 读 ds.soloSession：transcript + solo 去壳，非 solo 保留壳', () => {

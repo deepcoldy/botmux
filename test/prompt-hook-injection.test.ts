@@ -63,8 +63,8 @@ const getBotMock = vi.fn(() => ({
   config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
 }));
 // core/reply-delivery.ts 读 per-bot replyDelivery 的入口。本文件的 hook 注入用例都以
-// **显式 send** 为前提（claude-code 未配置时缺省已是 transcript、不注入 reminder——
-// 见下方 transcript 用例），所以 mock 缺省返回显式 'send' 而非 undefined。
+// **显式 send** 为前提（除下方专门覆盖缺省 send 与显式 transcript 的用例），
+// 所以 mock 缺省返回显式 'send' 而非 undefined。
 const replyDeliveryMock = vi.fn((..._args: unknown[]): 'send' | 'transcript' | undefined => 'send');
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: unknown[]) => getBotMock(...args),
@@ -493,8 +493,8 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     }
   });
 
-  it('未显式配置 + claude-code：缺省即 transcript，与显式 transcript 字节相同（无 reminder）', () => {
-    replyDeliveryMock.mockReturnValue('transcript');
+  it('未显式配置 + claude-code：缺省 send，与显式 send 的 PTY 相同且 reminder 进 sidecar', () => {
+    replyDeliveryMock.mockReturnValue('send');
     let explicit: string;
     try {
       explicit = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined })).content;
@@ -504,8 +504,10 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     try {
       const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined }));
       expect(result.content).toBe(explicit);
-      expect(result.content).not.toContain('<botmux_reminder>');
-      expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toContain('<sender ');
+      expect(result.content).toBe('帮我修个 bug');
+      const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+      expect(envelope).toContain('<botmux_reminder>');
+      expect(envelope).toContain('<sender ');
     } finally {
       replyDeliveryMock.mockReturnValue('send');
     }

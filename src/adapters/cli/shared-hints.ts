@@ -154,7 +154,7 @@ export function buildBotmuxShellHints(
   noTransport?: boolean,
   replyDelivery?: ReplyDelivery,
   cliId?: CliId,
-  opts: { sessionKind?: WorkflowSessionKind; hideLocalAddresses?: boolean } = {},
+  opts: { sessionKind?: WorkflowSessionKind; hideLocalAddresses?: boolean; hasNativeSkillChannel?: boolean } = {},
 ): string[] {
   // No-transport session (apiOnly core-only bot OR HTTP virtual chat): drop the
   // whole send/@/helpers/silence collaboration block — same rationale as the
@@ -173,7 +173,9 @@ export function buildBotmuxShellHints(
   // commands_are_shell / how_to_send / heredoc / mention_gate / attachments /
   // feedback / 反重发提示全部不注入（附件、卡片、跨群等用法留在内置 botmux-send
   // skill 按需查阅；多 bot 协作的 `--mention` / `--mention-back` 留在 `<identity>`
-  // 块里，doubao 例外）。'send' 时下面每一行与改动前逐字相同。
+  // 块里，doubao 例外）。没有原生 skill 通道的 CLI 例外保留一段最小操作说明：
+  // 否则模型既没有附件/heredoc/@ 硬门参数，也没有 sentinel 防双发规则可查。
+  // 'send' 时下面每一行与改动前逐字相同。
   const transcript = replyDelivery === 'transcript';
   const workflowHint = workflowDiscoveryHint(locale, opts);
   const hints = (transcript
@@ -181,6 +183,9 @@ export function buildBotmuxShellHints(
       t('ai.shell.intro_transcript', undefined, locale),
       t('ai.shell.helpers', undefined, locale),
       t('ai.shell.when_to_send_transcript', undefined, locale),
+      ...(opts.hasNativeSkillChannel === false && transcriptPromptTeachesSend(cliId)
+        ? [t('ai.shell.send_without_skill_transcript', undefined, locale)]
+        : []),
       // XPI 身份提示与投递方式无关（谁在说话 ≠ 回复怎么送），两个分支都要。
       ...(xpiAsHintOn() ? [t('ai.shell.xpi_as_hint', undefined, locale)] : []),
       // Workflow discovery — omitted when the machine-wide workflow switch is off.

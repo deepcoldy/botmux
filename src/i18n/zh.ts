@@ -1541,10 +1541,12 @@ export const messages: Record<string, string> = {
   'ai.shell.when_to_send': '对于需要回复的请求，必须通过 Bash 执行 botmux send --response-kind final 交付完整结果或具体阻碍，并核验发送成功后再结束；查询完成或只发进度不算交付。已成功交付不要重复发送。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
   'ai.shell.no_visible_output_ok': '只有最终答复已通过 botmux send --response-kind final 成功交付（退出码 0），才可无终端正文地结束；progress 发送成功不代表任务完成。不要因“无输出”提示重发已交付的答案；发送结果未知先核对，不能直接当作成功或失败。',
   // replyDelivery=transcript（自动转发最终回复）的 shell-hints 变体：只用 intro /
-  // when_to_send 两条改口版 + helpers，常驻路由块不再额外塞 botmux send 提示
-  // （多 bot 协作规则在 <identity>，附件/卡片/跨群等在 botmux-send skill 按需查）。
+  // when_to_send 两条改口版 + helpers；有原生 skill 通道时不再额外塞 botmux send
+  // 提示（多 bot 协作在 <identity>，附件/卡片/跨群在 botmux-send skill 按需查）；
+  // 无通道时另加一段最小 send 操作说明，避免附件参数与硬门/防双发规则断供。
   'ai.shell.intro_transcript': '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书。',
   'ai.shell.when_to_send_transcript': '发给你的消息直接在最终 assistant message 里作答即可,别沉默。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
+  'ai.shell.send_without_skill_transcript': '此 CLI 没有原生 skill 通道。需要主动发消息、协作、发送附件/卡片或跨群发布时，用 Bash 执行 `botmux send`；完整用法可运行 `botmux skill show botmux-send`。附件用 `--images` / `--files` / `--videos`，多行正文用 quoted heredoc/stdin 或 UTF-8 `--content-file`。每条 send 必须三选一：`--mention <open_id:名字>` / `--mention-back` / `--no-mention`；定时等无本轮发送者的回合不要用 --mention-back，也不要从 owner 或历史发送者推断收件人。完整答复若走 send，加 `--response-kind final`；若刚才的普通 send 已交付完整答复，最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`，避免改写后再自动转发一次；只发补充不代表原任务完成。附件/卡片先发送，最终答复写在最后一次工具调用之后，自动转发只采集该尾部文本。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────

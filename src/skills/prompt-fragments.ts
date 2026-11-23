@@ -204,6 +204,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     gateLabel: '仅 replyDelivery=transcript（自动转发最终回复）时替代标准版',
   },
   {
+    key: 'ai.shell.send_without_skill_transcript', block: 'routing_shell', stage: 'new', kind: 'editable',
+    label: 'Shell：无原生 skill 通道时的最小发送操作说明',
+    gateLabel: '仅 replyDelivery=transcript 且适配器没有 skillsDir/pluginDir（当前为 Hermes）时注入；doubao 不教 send',
+  },
+  {
     key: 'ai.shell.no_visible_output_ok', block: 'routing_shell', stage: 'new', kind: 'editable',
     label: 'Shell：「无可见输出也正常」防重发提示',
     gate: 'dashboard.noVisibleOutputHint',
