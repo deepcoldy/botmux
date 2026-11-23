@@ -171,6 +171,21 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== 'linux')('worker Antigravity native fork', () => {
+  it('answers a side question as the first write after resuming the native session', async () => {
+    const f = setup(); fixtures.push(f);
+    const run = f.start({ fork: false, prompt: '' });
+    await waitFor(() => run.messages.some(msg => msg.type === 'prompt_ready'), run.logs);
+    run.worker.send({
+      type: 'antigravity_btw', question: 'Read the inherited value', nativeSessionId: parentId, messageId: 'om_side',
+    } satisfies DaemonToWorker);
+    await waitFor(() => run.messages.some(msg => msg.type === 'antigravity_btw_result'), run.logs);
+    expect(run.messages.find(msg => msg.type === 'antigravity_btw_result')).toMatchObject({
+      messageId: 'om_side', answer: 'ISOLATED_SIDE_ANSWER',
+    });
+    expect(f.inputs()).toEqual([{ id: parentId, text: '/btw Read the inherited value' }]);
+    expect(run.finals()).toHaveLength(0);
+  }, 60_000);
+
   it('delivers an Antigravity side answer without reassigning the running main turn', async () => {
     const f = setup(); fixtures.push(f);
     const run = f.start({ fork: false });

@@ -27777,7 +27777,9 @@ function setupWorkerHandlers(
         const loc = localeForBot(ds.larkAppId);
         const sideReplyOptions: Omit<WorkerSessionReplyOptions, 'sourceSessionId'> | undefined = side ? {
           replyTarget: { mode: 'thread', rootMessageId: side.messageId },
-          uuid: createHash('sha256').update(`agy-btw:${ds.larkAppId}:${side.messageId}`).digest('hex').slice(0, 40),
+          uuid: createHash('sha256')
+            .update(`agy-btw:${ds.larkAppId}:${side.messageId}:${'reason' in side ? side.reason : 'answer'}`)
+            .digest('hex').slice(0, 40),
           beforeWrite: () => {
             if (!ownsLifecycleMutation() || privateReplyEnabled(ds.session)) throw new Error('Antigravity side reply lost its source session');
           },

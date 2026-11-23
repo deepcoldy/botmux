@@ -20252,8 +20252,9 @@ async function handleAntigravitySideQuestion(
     return;
   }
   if (antigravitySideQuestionPending || commandLineWritesPending || isFlushing || injectionFlushing
-    || sessionRenameInFlight() || rawInputRestartGate || startupCommandsInProgress
-    || !firstWriteLivenessConfirmed) {
+    || sessionRenameInFlight() || rawInputRestartGate || startupCommandsInProgress || startupCommandAckHold
+    || (!hasRunStartupCommands && cfg.startupCommands?.length)
+    || (!firstWriteLivenessConfirmed && hasPendingInputForFlush())) {
     send({ ...result, reason: 'busy' });
     return;
   }
@@ -20267,7 +20268,7 @@ async function handleAntigravitySideQuestion(
     const previous = logReader.read().sideQuestion;
     await sendRawCommandLineWithRecoveryFence(target, `/btw ${msg.question}`, () => {
       const screen = btwOverlayScreen();
-      if (!current() || heldStuckPage(screen) || !hasAntigravitySideQuestionComposer(screen)) {
+      if (!current() || heldStuckPage(screen) || !hasAntigravitySideQuestionComposer(screen) || !firstWriteMayProceed()) {
         throw new SubmissionWriteError('Antigravity /btw requires an empty native composer', undefined, false);
       }
     });
