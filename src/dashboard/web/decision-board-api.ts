@@ -84,14 +84,19 @@ export async function markBoardItemSeen(appId: string, seq: number): Promise<voi
 
 /**
  * 存草稿；空草稿等于删除（回 draft:null）。`keepalive` 用于离开页面时的最后一次保存
- * （浏览器在页面卸载后仍把请求发完）。
+ * （浏览器在页面卸载后仍把请求发完）。`askKey` 是详情接口给的 draftAskKey（这份草稿写给哪一轮拍板）：
+ * 那一轮已经变了时服务端拒绝（draft_outdated），不把写给旧问题的内容记到新的一轮上；旧 daemon 不给就不带。
  */
-export async function saveBoardDraft(appId: string, seq: number, draft: DraftInput, baseRev: number, opts: { keepalive?: boolean } = {}): Promise<BoardDraft | null> {
+export async function saveBoardDraft(appId: string, seq: number, draft: DraftInput, baseRev: number,
+  opts: { keepalive?: boolean; askKey?: string; archive?: boolean } = {}): Promise<BoardDraft | null> {
   const body = await call<{ draft: BoardDraft | null }>(`${appPath(appId)}/items/${seq}/draft`, jsonInit('PUT', {
     ...(draft.choice ? { choice: draft.choice } : {}),
     text: draft.text,
     fileIds: draft.fileIds,
     baseRev,
+    ...(opts.askKey !== undefined ? { askKey: opts.askKey } : {}),
+    // 只收进历史、不存成草稿（输入框清空之后才传完的图）。
+    ...(opts.archive ? { archive: true } : {}),
   }, opts.keepalive ? { keepalive: true } : {}));
   return body.draft ?? null;
 }

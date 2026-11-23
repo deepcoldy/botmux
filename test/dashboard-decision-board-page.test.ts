@@ -260,8 +260,8 @@ describe('submit dialog', () => {
     expect(buttonByText(zh('decisionBoard.redeliver'))).toBeTruthy();
   });
 
-  it('lists a leftover draft on an ended item as not submittable and leaves it out of the request', async () => {
-    // 管家把 #1 改成已完成时不清草稿：确认框照样列出它，但不能勾选，请求里只带 #2（带上 #1 服务端会拒掉整批）。
+  it('leaves a draft on an ended item out of the dialog and the request (an old daemon may still return it)', async () => {
+    // 新 daemon 在事项结束时把草稿收进历史；旧 daemon 还会给，确认框不列它，也不算在「提交 N 项」里。
     const details: Record<string, BoardDetailResponse> = {
       '/items/1': detail(1, { item: boardItem(1, { state: 'done' }), draft: { seq: 1, author: 'owner', choice: 'B', text: '管家改状态前写的', fileIds: [], baseRev: 5, updatedAt: 11 } }),
       '/items/2': detail(2, { draft: { seq: 2, author: 'owner', choice: 'A', text: '开关放 Bot 配置页', fileIds: [], baseRev: 4, updatedAt: 22 } }),
@@ -280,10 +280,42 @@ describe('submit dialog', () => {
     await flush();
 
     const boxes = renderer!.root.findAll(n => n.type === 'input' && n.props.type === 'checkbox');
-    expect(boxes.map(b => [b.props.checked, b.props.disabled])).toEqual([[false, true], [true, false]]);
-    expect(text()).toContain(zh('decisionBoard.endedRow'));
+    expect(boxes).toHaveLength(1);
+    expect(text()).not.toContain('管家改状态前写的');
+    expect(text()).toContain(zh('decisionBoard.submitDialogTitle', { n: 1 }));
     await act(async () => { buttonByText(zh('decisionBoard.confirmSubmit', { n: 1 })).props.onClick(); });
     expect(calls('POST', '/submit').map(c => c.body.items)).toEqual([[{ seq: 2, draftUpdatedAt: 22 }]]);
+  });
+
+  it('never says "submit 0": with nothing submittable the title and button carry no number and the button is disabled', async () => {
+    serveDrafts();
+    await open();
+    // 两项都取消勾选：标题回到「提交决定」，按钮是不带数字的「确认提交」且置灰。
+    for (const box of renderer!.root.findAll(n => n.type === 'input' && n.props.type === 'checkbox')) {
+      act(() => box.props.onChange({ currentTarget: { checked: false } }));
+    }
+    expect(text()).not.toContain(zh('decisionBoard.submitDialogTitle', { n: 0 }));
+    expect(text()).not.toContain(zh('decisionBoard.confirmSubmit', { n: 0 }));
+    expect(renderer!.root.find(n => n.type === 'h3').children.join('')).toBe(zh('decisionBoard.submitNone'));
+    const confirmBtn = renderer!.root.find(n => n.type === 'button' && n.props.className === 'btn-primary');
+    expect(textOf(confirmBtn)).toBe(zh('decisionBoard.confirmSubmitNone'));
+    expect(confirmBtn.props.disabled).toBe(true);
+  });
+
+  it('a dialog opened only for ended items shows no number either', async () => {
+    routes = (url, init) => {
+      if (url.endsWith('/api/decision-board/cli_a/items/1') && (init.method ?? 'GET') === 'GET') {
+        return json({ ok: true, ...detail(1, { item: boardItem(1, { state: 'done' }), draft: { seq: 1, author: 'owner', choice: 'A', text: '', fileIds: [], baseRev: 5, updatedAt: 11 } }) });
+      }
+      return json({ ok: false, error: 'not_found' }, 404);
+    };
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(SubmitDialog, { appId: 'cli_a', seqs: [1], onClose: vi.fn() }));
+    });
+    await flush();
+    expect(renderer!.root.find(n => n.type === 'h3').children.join('')).toBe(zh('decisionBoard.submitNone'));
+    expect(text()).toContain(zh('decisionBoard.submitDialogEmpty'));
+    expect(text()).not.toContain(zh('decisionBoard.submitDialogTitle', { n: 0 }));
   });
 
   it('uses a fresh nonce after the server answered with a rejection', async () => {
@@ -374,6 +406,264 @@ describe('item detail', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
     expect(radio('A').props.checked).toBe(false);
     expect(calls('PUT', '/items/31/draft').at(-1)!.body).toEqual({ text: '旧想法', fileIds: [], baseRev: 5 });
+  });
+});
+
+describe('item detail · an item that is no longer waiting for a decision', () => {
+  it('shows no options (even if the item still has some) and does not send a choice left over in the draft', async () => {
+    vi.useFakeTimers();
+    routes = (url, init) => {
+      const method = init.method ?? 'GET';
+      if (url.endsWith('/items/31') && method === 'GET') {
+        return json({ ok: true, ...detail(31, { item: boardItem(31, { state: 'active', question: undefined }), draftAskKey: '',
+          draft: { seq: 31, author: 'owner', choice: 'A', text: '旧想法', fileIds: [], baseRev: 5, updatedAt: 100 } }) });
+      }
+      if (url.endsWith('/seen')) return json({ ok: true });
+      if (url.endsWith('/items/31/draft') && method === 'PUT') {
+        const body = JSON.parse(String(init.body));
+        return json({ ok: true, draft: { seq: 31, author: 'owner', text: body.text, fileIds: body.fileIds, baseRev: body.baseRev, updatedAt: 200 } });
+      }
+      return json({ ok: false, error: 'not_found' }, 404);
+    };
+    await act(async () => { renderer = TestRenderer.create(React.createElement(ItemDetailView, { appId: 'cli_a', seq: 31 })); });
+    await flush();
+    expect(renderer!.root.findAll(n => n.type === 'input' && n.props.type === 'radio')).toEqual([]);
+    expect(text()).not.toContain(zh('decisionBoard.askTitle'));
+    act(() => renderer!.root.findByType('textarea').props.onChange({ currentTarget: { value: '旧想法，补一句' } }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(calls('PUT', '/items/31/draft').map(c => c.body)).toEqual([{ text: '旧想法，补一句', fileIds: [], baseRev: 5, askKey: '' }]);
+  });
+});
+
+describe('item detail · the steward changes the item while the owner is typing', () => {
+  const OLD_KEY = 'aaaaaaaaaaaa';
+  const outdatedMessage = '这一项在你写草稿时被管家改过（状态或待拍板的选项变了），这次没有存成草稿，刚写的内容已收进这一项的历史。';
+  let changed: boolean;
+  let gate: Promise<void> | undefined;
+  let archivedTexts: string[];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    changed = false;
+    gate = undefined;
+    archivedTexts = [];
+    routes = async (url, init) => {
+      const method = init.method ?? 'GET';
+      if (url.endsWith('/api/decision-board/cli_a/items/31') && method === 'GET') {
+        return json({
+          ok: true,
+          ...(changed
+            ? detail(31, {
+              item: boardItem(31, { state: 'active', rev: 6 }),
+              draftAskKey: '',
+              events: archivedTexts.map((t, i) => ({ id: 9 + i, seq: 31, at: 3, actor: 'owner' as const, kind: 'draft' as const, text: t, fileIds: [] })),
+            })
+            : detail(31, { draftAskKey: OLD_KEY, draft: { seq: 31, author: 'owner', choice: 'A', text: '旧想法', fileIds: [], baseRev: 5, updatedAt: 100 },
+              drafts: [{ seq: 31, updatedAt: 100 }, { seq: 12, updatedAt: 50 }] })),
+        });
+      }
+      if (url.endsWith('/items/31/seen') && method === 'POST') return json({ ok: true });
+      if (url.endsWith('/items/31/draft') && method === 'PUT') {
+        const body = JSON.parse(String(init.body));
+        if (gate) await gate;
+        if (changed && body.askKey === OLD_KEY) {
+          archivedTexts.push(`这一项改成了「进行中」，这份草稿没有提交（没有发给管家），收在这里留底。\n说明：\n${body.text}`);
+          return json({ ok: false, error: 'draft_outdated', message: outdatedMessage }, 409);
+        }
+        return json({ ok: true, draft: { seq: 31, author: 'owner', ...(body.choice ? { choice: body.choice } : {}), text: body.text, fileIds: body.fileIds, baseRev: body.baseRev, updatedAt: 300 } });
+      }
+      if (url.endsWith('/files') && method === 'POST') {
+        if (gate) await gate;
+        return json({ ok: true, file: { id: 'img1', sha256: 'x', mime: 'image/png', bytes: 10, name: 'a.png', by: 'owner', createdAt: 1 } });
+      }
+      return json({ ok: false, error: 'not_found' }, 404);
+    };
+  });
+
+  async function openDetail(): Promise<void> {
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(ItemDetailView, { appId: 'cli_a', seq: 31 }));
+    });
+    await flush();
+  }
+  const type = (value: string) => act(() => renderer!.root.findByType('textarea').props.onChange({ currentTarget: { value } }));
+  const settle = async () => { await act(async () => { await vi.advanceTimersByTimeAsync(1_000); }); await flush(); };
+
+  it('the late save is refused and its text goes to the history; the box is cleared with a notice and the item is reloaded', async () => {
+    await openDetail();
+    changed = true;
+    type('旧想法，再补一句');
+    await settle();
+    expect(calls('PUT', '/items/31/draft').map(c => [c.body.askKey, c.body.text])).toEqual([[OLD_KEY, '旧想法，再补一句']]);
+    expect(calls('GET', '/items/31').length).toBe(2);
+    // 已是进行中：不再显示选项；输入框清空，提示刚写的内容已收进历史，历史里看得到原话。
+    expect(renderer!.root.findAll(n => n.type === 'input' && n.props.type === 'radio')).toEqual([]);
+    expect(renderer!.root.findByType('textarea').props.value).toBe('');
+    expect(renderer!.root.find(n => n.props['data-draft-archived'] !== undefined)).toBeTruthy();
+    expect(text()).toContain(zh('decisionBoard.eventDraft'));
+    expect(text()).toContain('旧想法，再补一句');
+    // 清空后不再自动保存；之后接着写就按现在这一轮存，提示消失。
+    await settle();
+    expect(calls('PUT', '/items/31/draft')).toHaveLength(1);
+    type('按进行中推进');
+    await settle();
+    expect(calls('PUT', '/items/31/draft').map(c => c.body.askKey)).toEqual([OLD_KEY, '']);
+    expect(renderer!.root.findAll(n => n.props['data-draft-archived'] !== undefined)).toEqual([]);
+  });
+
+  it('text typed while the refused save was in flight is sent once more for the old round, not left in the box or re-filed under the new one', async () => {
+    await openDetail();
+    changed = true;
+    let release!: () => void;
+    gate = new Promise(r => { release = r; });
+    type('第一句');
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    type('第一句，第二句');
+    gate = undefined;
+    release();
+    await flush();
+    await flush();
+    await settle();
+    expect(calls('PUT', '/items/31/draft').map(c => [c.body.askKey, c.body.text])).toEqual([[OLD_KEY, '第一句'], [OLD_KEY, '第一句，第二句']]);
+    expect(renderer!.root.findByType('textarea').props.value).toBe('');
+    // 离开页面：输入框已空，不再补存。
+    act(() => renderer!.unmount());
+    renderer = undefined;
+    await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+    expect(calls('PUT', '/items/31/draft')).toHaveLength(2);
+  });
+
+  it('a late save that hits an item the steward has just finished is handled the same way: archived, box cleared, page reloaded', async () => {
+    const base = routes;
+    let ended = false;
+    routes = async (url, init) => {
+      const method = init.method ?? 'GET';
+      if (ended && url.endsWith('/items/31') && method === 'GET') {
+        return json({ ok: true, ...detail(31, { item: boardItem(31, { state: 'done', rev: 7 }), draftAskKey: '' }) });
+      }
+      if (ended && url.endsWith('/items/31/draft') && method === 'PUT') {
+        return json({ ok: false, error: 'draft_outdated', message: '这一项已经结束，不能再保存决定草稿；刚写的内容已收进这一项的历史。' }, 409);
+      }
+      return base(url, init);
+    };
+    await openDetail();
+    ended = true;
+    type('再补一句');
+    await settle();
+    expect(calls('GET', '/items/31').length).toBe(2);
+    expect(renderer!.root.findAll(n => n.type === 'textarea')).toEqual([]);
+    expect(renderer!.root.find(n => n.props['data-draft-archived'] !== undefined)).toBeTruthy();
+    expect(text()).not.toContain(zh('decisionBoard.endedDraft'));
+  });
+
+  it('an old daemon answering item_ended has not archived anything: the text stays in the box with the error', async () => {
+    const base = routes;
+    routes = async (url, init) => {
+      if (url.endsWith('/items/31/draft') && init.method === 'PUT') {
+        return json({ ok: false, error: 'item_ended', message: '这一项已处理，不能再保存决定草稿' }, 409);
+      }
+      return base(url, init);
+    };
+    await openDetail();
+    type('别丢了这句');
+    await settle();
+    expect(renderer!.root.findByType('textarea').props.value).toBe('别丢了这句');
+    expect(renderer!.root.findAll(n => n.props['data-draft-archived'] !== undefined)).toEqual([]);
+    expect(text()).toContain('这一项已处理');
+  });
+
+  it('while the item is being re-read after the refusal, the old options and the box are locked and submit is off; once it lands, writing saves for the new round', async () => {
+    await openDetail();
+    changed = true;
+    let releaseGet!: () => void;
+    const getGate = new Promise<void>(r => { releaseGet = r; });
+    const base = routes;
+    let slowGet = true;
+    routes = async (url, init) => {
+      if (slowGet && url.endsWith('/items/31') && (init.method ?? 'GET') === 'GET') { slowGet = false; await getGate; }
+      return base(url, init);
+    };
+    type('第一句');
+    await settle();
+    expect(calls('PUT', '/items/31/draft')).toHaveLength(1);
+    // 重新读还没回来：页面上还是旧选项，不能照着点、也不能写或提交。
+    expect(renderer!.root.findByType('textarea').props.readOnly).toBe(true);
+    expect(renderer!.root.findAll(n => n.type === 'input' && n.props.type === 'radio').every(r => r.props.disabled)).toBe(true);
+    // 另外还有一项草稿：平时这个按钮是能点的，重新读期间置灰。
+    expect(buttonByText(zh('decisionBoard.submitOthers', { n: 1 })).props.disabled).toBe(true);
+    releaseGet();
+    await flush();
+    await settle();
+    expect(renderer!.root.findByType('textarea').props.readOnly).toBe(false);
+    type('看了新内容之后写的');
+    await settle();
+    expect(calls('PUT', '/items/31/draft').map(c => [c.body.askKey, c.body.text])).toEqual([[OLD_KEY, '第一句'], ['', '看了新内容之后写的']]);
+  });
+
+  it('if re-reading the item fails once, it tries again a moment later before unlocking', async () => {
+    await openDetail();
+    changed = true;
+    const base = routes;
+    let failures = 1;
+    routes = async (url, init) => {
+      if (failures > 0 && url.endsWith('/items/31') && (init.method ?? 'GET') === 'GET') { failures -= 1; return json({ ok: false, error: 'daemon_offline' }, 503); }
+      return base(url, init);
+    };
+    type('第一句');
+    await settle();
+    expect(calls('GET', '/items/31')).toHaveLength(2);
+    expect(renderer!.root.findByType('textarea').props.readOnly).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_600); });
+    await flush();
+    expect(calls('GET', '/items/31')).toHaveLength(3);
+    expect(renderer!.root.findByType('textarea').props.readOnly).toBe(false);
+    // 读到的是新内容（进行中，不再给选项）。
+    expect(renderer!.root.findAll(n => n.type === 'input' && n.props.type === 'radio')).toEqual([]);
+  });
+
+  it('after the refusal the box shows the draft another tab has just saved for the new round, instead of staying empty', async () => {
+    await openDetail();
+    changed = true;
+    const base = routes;
+    routes = async (url, init) => {
+      if (changed && url.endsWith('/items/31') && (init.method ?? 'GET') === 'GET') {
+        return json({ ok: true, ...detail(31, { item: boardItem(31, { state: 'active', rev: 6 }), draftAskKey: '',
+          draft: { seq: 31, author: 'owner', text: '另一个标签页刚写的', fileIds: [], baseRev: 6, updatedAt: 400 } }) });
+      }
+      return base(url, init);
+    };
+    type('这个标签页写的');
+    await settle();
+    expect(renderer!.root.findByType('textarea').props.value).toBe('另一个标签页刚写的');
+  });
+
+  it('an image that finishes uploading after the box was cleared is not added back into it', async () => {
+    vi.stubGlobal('FileReader', class {
+      result: string | null = null;
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      readAsDataURL() { this.result = 'data:image/png;base64,iVBORw0KGgo='; this.onload?.(); }
+    });
+    await openDetail();
+    let release!: () => void;
+    gate = new Promise(r => { release = r; });
+    const input = renderer!.root.find(n => n.type === 'input' && n.props.type === 'file');
+    // 上传卡在 gate 上（还没传完）。
+    await act(async () => { input.props.onChange({ currentTarget: { files: [{ type: 'image/png', size: 10, name: 'a.png' }], value: '' } }); });
+    await flush();
+    expect(calls('POST', '/files')).toHaveLength(1);
+    changed = true;
+    gate = undefined;
+    type('补一句');
+    await settle();
+    expect(renderer!.root.findByType('textarea').props.value).toBe('');
+    release();
+    await flush();
+    await settle();
+    // 传完的图没有塞进清空后的编辑器；按开始传时的那一轮只收进历史（archive），不存成草稿。
+    expect(renderer!.root.findAll(n => n.type === 'img' && String(n.props.src).includes('/files/img1'))).toEqual([]);
+    expect(calls('PUT', '/items/31/draft').filter(c => c.body.fileIds.length).map(c => c.body))
+      .toEqual([{ text: '', fileIds: ['img1'], baseRev: 5, askKey: OLD_KEY, archive: true }]);
   });
 });
 

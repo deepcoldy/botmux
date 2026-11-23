@@ -16,7 +16,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
 import { dirname, join } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike, type StatementLike } from './sqlite-compat.js';
 import type { Locale } from '../i18n/types.js';
-import { decisionAskKey } from '../core/decision-board/ask-key.js';
+import { DRAFT_ASK_KEY_RE, decisionAskKey, draftAskKey, isCurrentDraftAskKey } from '../core/decision-board/ask-key.js';
 import { BOARD_EXPLAINER_EXT, boardFileKind } from '../core/decision-board/files.js';
 import {
   BOARD_LIMITS,
@@ -343,6 +343,23 @@ function migrateCardColumns(db: DatabaseSyncLike): void {
   addMissing('board_decisions', 'ask_key', 'TEXT');
 }
 
+/**
+ * 草稿写给哪一轮拍板：board_drafts.ask_key（见 ask-key.ts 的 draftAskKey）和写下它时的 ask_key_at（= 那次保存的
+ * updated_at）。照 migrateChatColumns 按列在不在补，幂等；可空，存量草稿是 NULL = 旧构建存的、不知道写给哪一轮
+ *（reconcileDrafts 对它们只认已结束和「存下之后离开了待拍板」两种情况）。旧构建的显式列 INSERT 照常可用，不升版本号。
+ * 旧构建改草稿走 UPSERT，只改内容和 updated_at、不碰这两列：ask_key_at 对不上 updated_at 时按旧构建存的处理，
+ * 不拿上一轮的指纹去判回滚期间重写的草稿。
+ */
+function migrateDraftColumns(db: DatabaseSyncLike): void {
+  const have = new Set((db.prepare('PRAGMA table_info(board_drafts)').all() as Array<{ name?: unknown }>).map(c => c.name));
+  if (have.size === 0) return;
+  if (!have.has('ask_key')) db.exec('ALTER TABLE board_drafts ADD COLUMN ask_key TEXT;');
+  if (!have.has('ask_key_at')) db.exec('ALTER TABLE board_drafts ADD COLUMN ask_key_at INTEGER;');
+  // 收进历史的草稿写给的那一轮（只有 kind = draft 的事件有）：迟到的保存只和同一轮收进去的那条比，判重。
+  const events = new Set((db.prepare('PRAGMA table_info(board_events)').all() as Array<{ name?: unknown }>).map(c => c.name));
+  if (events.size > 0 && !events.has('ask_key')) db.exec('ALTER TABLE board_events ADD COLUMN ask_key TEXT;');
+}
+
 function healChatFields(db: DatabaseSyncLike): void {
   db.exec(`UPDATE board_items SET primary_chat = NULL
     WHERE primary_chat IS NOT NULL AND NOT EXISTS (SELECT 1 FROM board_links l
@@ -350,6 +367,72 @@ function healChatFields(db: DatabaseSyncLike): void {
   db.exec(`UPDATE board_items SET no_chat_reason = NULL
     WHERE no_chat_reason IS NOT NULL AND EXISTS (SELECT 1 FROM board_links l
       WHERE l.app_id = board_items.app_id AND l.seq = board_items.seq AND l.kind = 'chat');`);
+}
+
+interface DraftRow {
+  seq: number; author: string; choice: string | null; text: string; file_ids_json: string; base_rev: number; updated_at: number;
+  /** 补列前的旧库读出来没有这两列（undefined），与 NULL 同样处理。 */
+  ask_key?: string | null;
+  ask_key_at?: number | null;
+}
+
+/**
+ * 草稿写给哪一轮；旧构建存的、之后被旧构建改过（ask_key_at 对不上）、或是旧版本指纹算法算的，都返回 null
+ *（不知道写给哪一轮）。
+ */
+function draftRowAskKey(r: DraftRow): string | null {
+  return typeof r.ask_key === 'string' && r.ask_key_at === r.updated_at && isCurrentDraftAskKey(r.ask_key) ? r.ask_key : null;
+}
+
+function rowToDraft(r: DraftRow): BoardDraft {
+  return { seq: r.seq, author: r.author, ...(r.choice ? { choice: r.choice } : {}), text: r.text,
+    fileIds: parseIds(r.file_ids_json), baseRev: r.base_rev, updatedAt: r.updated_at };
+}
+
+const isAskingState = (state: BoardState): boolean => state === 'decide' || state === 'accept';
+
+/** 草稿为什么不再算待提交：这一项结束了（owner 自己关的单独说）、离开了待拍板、或待拍板的问题 / 选项换了。 */
+export type DraftArchiveReason = 'ended' | 'owner_closed' | 'left' | 'ask_changed' | 'unsaved';
+
+/**
+ * 这份草稿还算不算待提交；不算时给出原因。
+ *   - 这一项已结束：不算（结束的事项不再收决定）。
+ *   - 写给某一轮拍板（ask_key 非空）：这一项还在待拍板、问题和选项也还是那一版才算。
+ *   - 不针对哪个问题的说明（ask_key 为空串）：只要没结束就算。
+ *   - 旧构建存的（ask_key 为 NULL，不知道写给哪一轮）：只认得出「存下之后这一项离开了待拍板」——现在不在
+ *     待拍板，且状态是草稿最后一次保存之后才变的；问题 / 选项改没改看不出来，留着（页面照旧标「管家改过」）。
+ */
+export function draftArchiveReason(draft: { askKey: string | null; updatedAt: number }, item: Pick<BoardItem, 'state' | 'stateAt' | 'question' | 'options'>):
+  DraftArchiveReason | undefined {
+  if (isEndedState(item.state)) return 'ended';
+  if (draft.askKey === null) {
+    return !isAskingState(item.state) && draft.updatedAt < item.stateAt ? 'left' : undefined;
+  }
+  if (draft.askKey === '' || draft.askKey === draftAskKey(item)) return undefined;
+  return isAskingState(item.state) ? 'ask_changed' : 'left';
+}
+
+/**
+ * 草稿收进历史时的那一条（owner 自己的话原样保留，不截断）：为什么收、选了什么、写了什么、附了几张图。
+ * 选项原文只在草稿写给的就是 labels 这一版时附上（问题 / 选项换过之后同一个键可能是别的意思）。
+ */
+export function draftArchiveText(draft: BoardDraft, reason: DraftArchiveReason, item: Pick<BoardItem, 'state'>,
+  labels: readonly BoardOption[] | undefined, locale: Locale): string {
+  const zh = locale !== 'en';
+  const stateLabel = BOARD_STATE_LABELS[zh ? 'zh' : 'en'][item.state];
+  const why = reason === 'owner_closed' ? (zh ? '你关闭了这一项' : 'You closed this item')
+    : reason === 'ended' ? (zh ? `这一项${stateLabel}` : `This item is ${stateLabel.toLowerCase()}`)
+      : reason === 'left' ? (zh ? `这一项改成了「${stateLabel}」` : `This item moved to "${stateLabel}"`)
+        : reason === 'unsaved' ? (zh ? '编辑器已经清空' : 'The editor had been cleared')
+          : (zh ? '待拍板的问题或选项改了' : 'The question or options changed');
+  const lines = [zh ? `${why}，这份草稿没有提交（没有发给管家），收在这里留底。` : `${why}. This draft was not submitted (nothing was sent to the steward); it is kept here for reference.`];
+  if (draft.choice) {
+    const label = labels?.find(o => o.key === draft.choice)?.label;
+    lines.push(zh ? `选：${draft.choice}${label ? ` ${label}` : ''}` : `Choice: ${draft.choice}${label ? ` ${label}` : ''}`);
+  }
+  if (draft.text.trim()) lines.push(`${zh ? '说明：' : 'Note:'}\n${draft.text}`);
+  if (draft.fileIds.length) lines.push(zh ? `附图：${draft.fileIds.length} 张` : `Images: ${draft.fileIds.length}`);
+  return lines.join('\n');
 }
 
 export class DecisionBoardStore {
@@ -377,6 +460,7 @@ export class DecisionBoardStore {
       migrateChatColumns(db);
       migrateCardColumns(db);
       migrateHintColumns(db);
+      migrateDraftColumns(db);
       db.exec(`
         CREATE TABLE IF NOT EXISTS board_items (
           app_id TEXT NOT NULL,
@@ -444,7 +528,9 @@ export class DecisionBoardStore {
           kind TEXT NOT NULL,
           text TEXT NOT NULL,
           file_ids_json TEXT,
-          batch_id INTEGER
+          batch_id INTEGER,
+          -- 只有 kind = draft：这份草稿写给的那一轮（ask-key.ts 的 draftAskKey）；NULL = 不知道。
+          ask_key TEXT
         );
         CREATE INDEX IF NOT EXISTS board_events_item ON board_events(app_id, seq, id);
         CREATE TABLE IF NOT EXISTS board_files (
@@ -471,6 +557,10 @@ export class DecisionBoardStore {
           file_ids_json TEXT NOT NULL DEFAULT '[]',
           base_rev INTEGER NOT NULL,
           updated_at INTEGER NOT NULL,
+          -- 写给哪一轮拍板（ask-key.ts 的 draftAskKey）：'' = 不针对哪个问题的说明；NULL = 旧构建存的。
+          ask_key TEXT,
+          -- 写下 ask_key 那次保存的 updated_at；对不上 = 之后被旧构建改过，按旧构建存的处理。
+          ask_key_at INTEGER,
           PRIMARY KEY (app_id, seq, author)
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS board_batches (
@@ -567,10 +657,10 @@ export class DecisionBoardStore {
   }
 
   private insertEvent(appId: string, seq: number, at: number, actor: BoardActor, actorRef: string | undefined,
-    kind: BoardEventKind, text: string, fileIds: string[] = [], batchId?: number): number {
-    const r = this.stmt(`INSERT INTO board_events (app_id, seq, at, actor, actor_ref, kind, text, file_ids_json, batch_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(appId, seq, at, actor, actorRef ?? null, kind, text,
-      fileIds.length ? JSON.stringify(fileIds) : null, batchId ?? null);
+    kind: BoardEventKind, text: string, fileIds: string[] = [], batchId?: number, askKey?: string | null): number {
+    const r = this.stmt(`INSERT INTO board_events (app_id, seq, at, actor, actor_ref, kind, text, file_ids_json, batch_id, ask_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(appId, seq, at, actor, actorRef ?? null, kind, text,
+      fileIds.length ? JSON.stringify(fileIds) : null, batchId ?? null, askKey ?? null);
     if (actor === 'steward') {
       this.stmt('UPDATE board_items SET steward_event_at = ? WHERE app_id = ? AND seq = ?').run(at, appId, seq);
     }
@@ -891,6 +981,10 @@ export class DecisionBoardStore {
       } else if (sets.length || trackEdits.length) {
         this.clearStaleHint(appId, seq);
       }
+      // 这一项离开了待拍板、结束了，或问题 / 选项换了：写给原来那一轮的草稿不再算待提交，同一事务里收进历史。
+      if (stateChanged || questionChanged || optionsChanged) {
+        this.archiveStaleDrafts(appId, { seq, locale, now, before });
+      }
       return rowToItem(this.itemRow(appId, seq)!);
     });
   }
@@ -912,10 +1006,10 @@ export class DecisionBoardStore {
       this.dismissCurrentHint(appId, seq, row);
       this.stmt(`UPDATE board_items SET state = 'closed', state_at = ?, updated_at = ?, rev = rev + 1
         WHERE app_id = ? AND seq = ?`).run(now, now, appId, seq);
-      // Remove only this item's drafts so a later bulk submission cannot send its old option.
-      this.stmt('DELETE FROM board_drafts WHERE app_id = ? AND seq = ?').run(appId, seq);
       this.insertEvent(appId, seq, now, 'owner', actorRef, 'state', locale === 'en'
         ? 'Owner closed this item (no further decision needed)' : '本人关闭（无需再拍板）');
+      // 这一项的草稿收进历史（原话留底），之后的批量提交不会再带上它原来的选项。
+      this.archiveStaleDrafts(appId, { seq, locale, now, before: item, ownerClosed: true });
       return { item: rowToItem(this.itemRow(appId, seq)!), duplicate: false };
     });
   }
@@ -1116,9 +1210,7 @@ export class DecisionBoardStore {
 
   listItems(appId: string, view: BoardView, opts: { author?: string; query?: string } = {}): ItemSummary[] {
     const rows = this.stmt('SELECT * FROM board_items WHERE app_id = ? ORDER BY seq').all(appId) as ItemRow[];
-    const drafts = new Set(opts.author
-      ? (this.stmt('SELECT seq FROM board_drafts WHERE app_id = ? AND author = ?').all(appId, opts.author) as Array<{ seq: number }>).map(r => r.seq)
-      : []);
+    const drafts = new Set(opts.author ? this.listDrafts(appId, opts.author).map(d => d.seq) : []);
     const pending = new Map((this.stmt('SELECT seq, COUNT(*) AS n FROM board_decisions WHERE app_id = ? AND handled_at IS NULL GROUP BY seq')
       .all(appId) as Array<{ seq: number; n: number }>).map(r => [r.seq, r.n]));
     const explainers = this.explainerCounts(appId);
@@ -1298,52 +1390,155 @@ export class DecisionBoardStore {
   // ─── 草稿 ───────────────────────────────────────────────────────────────
 
   getDraft(appId: string, seq: number, author: string): BoardDraft | undefined {
-    const r = this.stmt('SELECT * FROM board_drafts WHERE app_id = ? AND seq = ? AND author = ?').get(appId, seq, author) as
-      { seq: number; author: string; choice: string | null; text: string; file_ids_json: string; base_rev: number; updated_at: number } | undefined;
-    if (!r) return undefined;
-    return { seq: r.seq, author: r.author, ...(r.choice ? { choice: r.choice } : {}), text: r.text,
-      fileIds: parseIds(r.file_ids_json), baseRev: r.base_rev, updatedAt: r.updated_at };
+    const r = this.stmt('SELECT * FROM board_drafts WHERE app_id = ? AND seq = ? AND author = ?').get(appId, seq, author) as DraftRow | undefined;
+    return r ? rowToDraft(r) : undefined;
   }
 
+  /**
+   * 还算待提交的草稿（已结束事项上的不算）。读之前由 service 先 {@link reconcileDrafts}，所以正常情况下不会有
+   * 要跳过的；这里再按状态挡一次，旧构建回滚期间留下的也不会算进「提交 N 项」。
+   */
   listDrafts(appId: string, author: string): BoardDraft[] {
     // 同一毫秒保存的几份草稿按编号排，不留给 SQLite 自行决定。
-    const seqs = (this.stmt('SELECT seq FROM board_drafts WHERE app_id = ? AND author = ? ORDER BY updated_at, seq')
-      .all(appId, author) as Array<{ seq: number }>).map(r => r.seq);
-    return seqs.map(seq => this.getDraft(appId, seq, author)!).filter(Boolean);
+    return (this.stmt(`SELECT d.* FROM board_drafts d JOIN board_items i ON i.app_id = d.app_id AND i.seq = d.seq
+      WHERE d.app_id = ? AND d.author = ? AND i.state NOT IN ('done', 'closed') ORDER BY d.updated_at, d.seq`)
+      .all(appId, author) as DraftRow[]).map(rowToDraft);
   }
 
-  /** 空草稿（没选项、没文字、没图）等于删除。 */
-  putDraft(appId: string, seq: number, author: string, input: { choice?: string; text?: string; fileIds?: string[]; baseRev: number },
-    now = Date.now()): BoardDraft | undefined {
+  /**
+   * 空草稿（没选项、没文字、没图）等于删除。
+   *
+   * askKey 是页面打开这一项时看到的那一轮拍板（详情接口给的 draftAskKey）；不带（旧页面）按现在这一轮算。
+   * 页面看到的那一轮已经不在了（管家改了状态、问题或选项，原来的草稿已收进历史），或这一项已经结束：非空的内容不存成
+   * 草稿，收进这一项的历史留底再拒绝（draft_outdated，旧 daemon 不会回这个码，页面据此才敢清空输入框）——不把写给旧问题
+   * 的内容记到新的一轮上，也不让离开页面时补存的最后几个字悄悄丢掉。空草稿照常删除。
+   *
+   * 选项只在待拍板 / 待验收时能选：进行中、等待中的事项上留着的旧选项不再是要定的事，带了就去掉、只存文字和图
+   *（新页面本来就不发，旧页面发了也不至于整份存不进去）；只剩一个选项、别的什么都没有时拒绝（choice_not_deciding）。
+   */
+  putDraft(appId: string, seq: number, author: string, input: { choice?: string; text?: string; fileIds?: string[]; baseRev: number; askKey?: string; archive?: boolean },
+    now = Date.now(), locale: Locale = 'zh'): BoardDraft | undefined {
     const text = (input.text ?? '').replace(/\r\n/g, '\n');
     checkLen('决定', text, BOARD_LIMITS.longText);
     const fileIds = [...new Set(input.fileIds ?? [])];
     if (fileIds.length > BOARD_LIMITS.filesPerDraft) throw new BoardError('too_many_files', `每项最多附 ${BOARD_LIMITS.filesPerDraft} 张图`);
     const item = this.getItem(appId, seq);
     if (!item) throw new BoardError('item_not_found', `没有 #${seq}`);
-    if (isEndedState(item.state) && (input.choice?.trim() || text.trim() || fileIds.length)) {
-      throw new BoardError('item_ended', '这一项已处理，不能再保存决定草稿');
-    }
-    const choice = input.choice?.trim() || undefined;
-    if (choice && !item.options.some(o => o.key === choice)) throw new BoardError('unknown_choice', `没有选项 ${choice}`);
-    for (const id of fileIds) {
-      const f = this.getFile(appId, id);
-      if (!f || f.file.by !== 'owner') throw new BoardError('unknown_file', '附图不存在');
-    }
+    let choice = input.choice?.trim() || undefined;
     if (!choice && !text.trim() && fileIds.length === 0) {
       this.clearDraft(appId, seq, author);
       return undefined;
     }
-    this.stmt(`INSERT INTO board_drafts (app_id, seq, author, choice, text, file_ids_json, base_rev, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    for (const id of fileIds) {
+      const f = this.getFile(appId, id);
+      if (!f || f.file.by !== 'owner') throw new BoardError('unknown_file', '附图不存在');
+    }
+    const current = draftAskKey(item);
+    // 不带、格式不对、或是旧版本指纹算法算的（页面在服务端升级前打开）：按现在这一轮算。
+    let seen = input.askKey !== undefined && DRAFT_ASK_KEY_RE.test(input.askKey) && isCurrentDraftAskKey(input.askKey) ? input.askKey : current;
+    // 选了选项就是写给某一轮拍板的：页面报「不针对问题」（空串）却带着选项时，按现在这一轮记，不当成随手写的说明。
+    if (choice && seen === '' && isAskingState(item.state)) seen = current;
+    const late = isEndedState(item.state) ? 'ended' as const : seen !== '' && seen !== current ? (isAskingState(item.state) ? 'ask_changed' as const : 'left' as const) : undefined;
+    // archive：页面清空输入框之后才传完的图——只收进历史，不存成草稿（不能顶掉别的标签页刚存的那份）。
+    if (input.archive) {
+      this.tx(() => this.archiveDraftContent(appId, { seq, author, ...(choice ? { choice } : {}), text, fileIds, baseRev: input.baseRev, updatedAt: now },
+        late ?? 'unsaved', item, undefined, locale, now, { dedupe: true, askKey: seen }));
+      return this.getDraft(appId, seq, author);
+    }
+    if (late) {
+      this.tx(() => this.archiveDraftContent(appId, { seq, author, ...(choice ? { choice } : {}), text, fileIds, baseRev: input.baseRev, updatedAt: now },
+        late, item, undefined, locale, now, { dedupe: true, askKey: seen }));
+      throw new BoardError('draft_outdated', late === 'ended'
+        ? '这一项已经结束，不能再保存决定草稿；刚写的内容已收进这一项的历史。'
+        : '这一项在你写草稿时被管家改过（状态或待拍板的问题 / 选项变了），这次没有存成草稿，刚写的内容已收进这一项的历史。'
+          + '先看一眼最新内容再决定要不要重写。');
+    }
+    if (choice && !isAskingState(item.state)) {
+      if (!text.trim() && fileIds.length === 0) {
+        throw new BoardError('choice_not_deciding', '这一项现在不在待拍板，不能选选项；要说什么写在说明里');
+      }
+      choice = undefined;
+    }
+    if (choice && !item.options.some(o => o.key === choice)) throw new BoardError('unknown_choice', `没有选项 ${choice}`);
+    this.stmt(`INSERT INTO board_drafts (app_id, seq, author, choice, text, file_ids_json, base_rev, updated_at, ask_key, ask_key_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(app_id, seq, author) DO UPDATE SET choice = excluded.choice, text = excluded.text,
-        file_ids_json = excluded.file_ids_json, base_rev = excluded.base_rev, updated_at = excluded.updated_at`)
-      .run(appId, seq, author, choice ?? null, text, JSON.stringify(fileIds), input.baseRev, now);
+        file_ids_json = excluded.file_ids_json, base_rev = excluded.base_rev, updated_at = excluded.updated_at,
+        ask_key = excluded.ask_key, ask_key_at = excluded.ask_key_at`)
+      .run(appId, seq, author, choice ?? null, text, JSON.stringify(fileIds), input.baseRev, now, seen, now);
     return this.getDraft(appId, seq, author);
   }
 
   clearDraft(appId: string, seq: number, author: string): void {
     this.stmt('DELETE FROM board_drafts WHERE app_id = ? AND seq = ? AND author = ?').run(appId, seq, author);
+  }
+
+  /** 不再算待提交的草稿（见 {@link draftArchiveReason}），连同它所在的事项和原因。只给 seq 时只看这一项。 */
+  private staleDrafts(appId: string, seq?: number): Array<{ row: DraftRow; item: BoardItem; reason: DraftArchiveReason }> {
+    const rows = (seq === undefined
+      ? this.stmt('SELECT * FROM board_drafts WHERE app_id = ? ORDER BY seq, author').all(appId)
+      : this.stmt('SELECT * FROM board_drafts WHERE app_id = ? AND seq = ? ORDER BY author').all(appId, seq)) as DraftRow[];
+    const out: Array<{ row: DraftRow; item: BoardItem; reason: DraftArchiveReason }> = [];
+    for (const row of rows) {
+      const item = this.getItem(appId, row.seq);
+      const reason = item && draftArchiveReason({ askKey: draftRowAskKey(row), updatedAt: row.updated_at }, item);
+      if (item && reason) out.push({ row, item, reason });
+    }
+    return out;
+  }
+
+  /**
+   * 在调用方的事务里把不再算待提交的草稿收进历史：每份记一条 owner 的 draft 历史（原话、选项、附图），附图挂到
+   * 这一项上，然后删掉草稿。返回收掉的事项编号。
+   */
+  private archiveStaleDrafts(appId: string, opts: { seq?: number; locale?: Locale; now?: number; before?: BoardItem; ownerClosed?: boolean }): number[] {
+    const archived: number[] = [];
+    const now = opts.now ?? Date.now();
+    for (const { row, item, reason: found } of this.staleDrafts(appId, opts.seq)) {
+      const reason: DraftArchiveReason = found === 'ended' && opts.ownerClosed ? 'owner_closed' : found;
+      const askKey = draftRowAskKey(row);
+      // 选项原文按草稿写给的那一版取：updateItem 里是改之前的事项；旧草稿不知道写给哪一版，按现在的取。
+      const source = [opts.before, item].find(v => v && (askKey === null || draftAskKey(v) === askKey));
+      this.archiveDraftContent(appId, rowToDraft(row), reason, item, source?.options, opts.locale ?? 'zh', now, { askKey });
+      this.clearDraft(appId, row.seq, row.author);
+      if (!archived.includes(row.seq)) archived.push(row.seq);
+    }
+    return archived;
+  }
+
+  /**
+   * 在调用方的事务里把一份草稿内容记成一条 owner 的 draft 历史（原话、选项、附图），附图挂到这一项上。
+   *
+   * dedupe 只给迟到的保存用：离开页面时的补存常常就是刚收进去的那一份，内容（选项键、原话、附图集合）和这一项最近
+   * 一条 draft 历史完全相同时不再记。管家改状态 / 选项时第一次收一份草稿不去重——同一个选项键在两轮里可能是两个意思。
+   */
+  private archiveDraftContent(appId: string, draft: BoardDraft, reason: DraftArchiveReason, item: BoardItem,
+    labels: readonly BoardOption[] | undefined, locale: Locale, now: number, opts: { dedupe?: boolean; askKey?: string | null } = {}): void {
+    const text = draftArchiveText(draft, reason, item, labels, locale);
+    // 只和同一轮收进去的那条比：不同轮里同一个选项键、同一句话可能是两个意思。
+    if (opts.dedupe && opts.askKey) {
+      // 比内容不比原因：去掉第一行（原因），「选：」那一行只比选项键（迟到的保存附不上选项原文）；附图比集合。
+      const content = (t: string) => t.split('\n').slice(1).map((line, i) => i === 0 ? line.replace(/^(选：|Choice: )(\S+).*$/, '$1$2') : line).join('\n');
+      const files = (ids: readonly string[]) => [...new Set(ids)].sort().join(',');
+      const last = this.stmt(`SELECT text, file_ids_json, ask_key FROM board_events WHERE app_id = ? AND seq = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1`)
+        .get(appId, draft.seq) as { text: string; file_ids_json: string | null; ask_key: string | null } | undefined;
+      if (last && last.ask_key === opts.askKey && content(last.text) === content(text)
+        && files(parseIds(last.file_ids_json)) === files(draft.fileIds)) return;
+    }
+    for (const fid of draft.fileIds) {
+      this.stmt('UPDATE board_files SET seq = ? WHERE app_id = ? AND id = ? AND seq IS NULL').run(draft.seq, appId, fid);
+    }
+    this.insertEvent(appId, draft.seq, now, 'owner', draft.author, 'draft', text, draft.fileIds, undefined, opts.askKey ?? null);
+  }
+
+  /**
+   * 把不再算待提交的草稿收进历史（单独调用，自己开事务）。列表、详情、提交之前都会调：管家改状态 / 问题时
+   * updateItem 已经在同一事务里收过，这里兜住旧构建留下的（含已结束事项上的老草稿）。先在事务外看一眼，
+   * 没有要收的就不加写锁。
+   */
+  reconcileDrafts(appId: string, opts: { seq?: number; locale?: Locale; now?: number } = {}): number[] {
+    if (!this.staleDrafts(appId, opts.seq).length) return [];
+    return this.tx(() => this.archiveStaleDrafts(appId, opts));
   }
 
   // ─── 提交批次 ───────────────────────────────────────────────────────────

@@ -143,6 +143,11 @@ export interface BoardDetailResponse extends ItemTaskFields {
   appLink?: string;
   steward: StewardStatus;
   drafts: DraftStamp[];
+  /**
+   * 这一项现在的这一轮拍板（存草稿时原样带回去）：管家之后改了状态、问题或选项，服务端拒绝迟到的保存
+   *（draft_outdated），原来的草稿已收进历史。旧 daemon 不给。
+   */
+  draftAskKey?: string;
 }
 
 export interface BoardSummary {
@@ -389,6 +394,7 @@ export const BOARD_EVENT_KIND_KEYS: Readonly<Record<BoardEvent['kind'], string>>
   attach: 'decisionBoard.eventAttach',
   link: 'decisionBoard.eventLink',
   hint: 'decisionBoard.eventHint',
+  draft: 'decisionBoard.eventDraft',
 };
 
 /** 「待拍板·在审」：状态 + 自由文本阶段。 */
@@ -535,10 +541,13 @@ export interface SubmitCandidate {
   stale: boolean;
 }
 
-/** 确认框里的一行；这一项已经没有草稿时返回 null（在别处提交或清空了）。 */
+/**
+ * 确认框里的一行；这一项已经没有草稿（在别处提交或清空了）、或已经结束时返回 null。结束的事项不再收决定：
+ * 新 daemon 会把上面的草稿收进历史，旧 daemon 可能还给，也不列进确认框。
+ */
 export function submitCandidateFromDetail(detail: Pick<BoardDetailResponse, 'item' | 'draft'>): SubmitCandidate | null {
   const { item, draft } = detail;
-  if (!draft || isDraftEmpty(draftFromServer(draft))) return null;
+  if (!draft || isDraftEmpty(draftFromServer(draft)) || isBoardItemEnded(item.state)) return null;
   const option = draft.choice ? item.options.find(o => o.key === draft.choice) : undefined;
   return {
     seq: item.seq,
@@ -565,8 +574,8 @@ export function orderSubmitCandidates(candidates: readonly SubmitCandidate[], fi
 }
 
 /**
- * 已完成 / 已关闭的事项不再收决定：服务端拒绝给它存草稿、拒绝提交它的草稿。管家改状态时不清草稿，
- * 所以这类事项上可能还留着一份草稿——页面上只能清空，不能再提交。
+ * 已完成 / 已关闭的事项不再收决定：服务端拒绝给它存草稿、拒绝提交它的草稿，事项结束时把草稿收进历史。
+ * 旧 daemon 结束时不收草稿，这类事项上可能还留着一份——页面上只能清空，不能再提交。
  */
 export function isBoardItemEnded(state: BoardState): boolean {
   return state === 'done' || state === 'closed';
@@ -660,6 +669,7 @@ export function boardErrorText(body: unknown, status: number, tr: Translate, loc
     unauthorized: 'decisionBoard.errUnauthorized',
     draft_changed: 'decisionBoard.errDraftChanged',
     draft_missing: 'decisionBoard.errDraftMissing',
+    draft_outdated: 'decisionBoard.errDraftOutdated',
     nothing_to_submit: 'decisionBoard.errNothingToSubmit',
     item_not_found: 'decisionBoard.notFound',
     bot_not_found: 'decisionBoard.errBotNotFound',
