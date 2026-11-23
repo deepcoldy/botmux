@@ -328,6 +328,14 @@ describe('v3 ephemeral pool', () => {
       }
     });
 
+    it('refuses an unregistered assistant-mode node bot before spawning', async () => {
+      configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code', assistantMode: true }]);
+      const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
+      await expect(createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret' }).runNode(request())).rejects.toThrow();
+      expect(spawn).not.toHaveBeenCalled();
+    });
+
     it.each(['missing', 'throwing'] as const)('does not override an explicit %s resolver with bots.json', async (behavior) => {
       configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
         env: { MODEL_AUTH: 'file-sentinel' } }]);
