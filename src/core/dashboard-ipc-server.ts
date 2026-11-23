@@ -225,6 +225,7 @@ import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../servic
 import { prepareReplyCardNativeThinking, replyCardDispatchAttempt } from './turn-reply-card.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
 import { FEEDBACK_SEND_LEASE_ROUTE, handleFeedbackSendLeaseRelay } from '../services/feedback-send-lease-relay.js';
+import { resolveNamespaceLocalPid } from './pid-namespace-peer.js';
 import {
   emptyLinkRefExtractionStats,
   LINK_REF_REGISTER_MAX_BODY_BYTES,
@@ -2508,7 +2509,17 @@ ipcRoute('POST', `/api/sessions/:sessionId/${FEEDBACK_SEND_LEASE_ROUTE}`, async 
   // guards feedback maintenance; it does not perform a managed session action.
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body, { allowReceiver: true });
   if (!auth.ok || !ds) return jsonRes(res, 403, { ok: false, error: auth.ok ? 'session_not_active' : auth.error });
-  const result = handleFeedbackSendLeaseRelay(config.session.dataDir, ds.session.sessionId, body);
+  // A CLI in a PID namespace (Linux bwrap --unshare-pid) reports its
+  // namespace-local pid; the lease must name the host process. Linux always
+  // has procfs, so an unprovable mapping is refused rather than leasing
+  // whichever host process happens to share the number. Elsewhere (macOS)
+  // there is no PID namespace and the reported pid is the host pid.
+  const hostPid = typeof body.processId === 'number' ? resolveNamespaceLocalPid(body.processId, previewOwnerPids(ds)) : null;
+  if (hostPid === null && typeof body.processId === 'number' && process.platform === 'linux') {
+    return jsonRes(res, 409, { ok: false, error: 'feedback_process_identity_unavailable' });
+  }
+  const result = handleFeedbackSendLeaseRelay(config.session.dataDir, ds.session.sessionId,
+    hostPid ? { ...body, processId: hostPid } : body);
   return jsonRes(res, result.status, result.body);
 });
 
