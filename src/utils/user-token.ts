@@ -329,8 +329,18 @@ function replaceTokenForApp(
         logger.info(`[user-token] ${appId}: 授权未再申请默认集带来的按需权限，新 token 不含 ${droppedScopes.join(' ')}`);
       }
     }
-    saveTokenForAppUnlocked(token, appId, openId);
-    return { saved: true, token, droppedScopes, superseded: false };
+    // 旧 pending 可能没有 onDemandScopes（升级前发起，或较早的授权流程），但它后完成时
+    // 不能把当前 token 上较新的显式授权标记擦掉。只继承 replacement 实际保留的 scope：
+    // 无标记的旧默认集不会凭空获得标记，刷新降权时也不会把已丢 scope 重新标回。
+    const inheritedOnDemandScopes = (current?.token.onDemandScopes ?? []).filter(scope =>
+      ON_DEMAND_USER_SCOPES.includes(scope)
+      && replacementScopes.has(scope)
+      && !token.onDemandScopes?.includes(scope));
+    const replacementToken = inheritedOnDemandScopes.length > 0
+      ? { ...token, onDemandScopes: [...(token.onDemandScopes ?? []), ...inheritedOnDemandScopes] }
+      : token;
+    saveTokenForAppUnlocked(replacementToken, appId, openId);
+    return { saved: true, token: replacementToken, droppedScopes, superseded: false };
   }, { maxWaitMs: 30_000 });
 }
 
@@ -598,6 +608,30 @@ export async function resolveOwnerUserToken(
 }
 
 /** {@link resolveUserToken} / {@link resolveOwnerUserToken} 共用的过期与刷新处理。 */
+async function resolveTokenStoreFrom(
+  loaded: { token: TokenStore; source: string } | null,
+  appId: string,
+  appSecret: string,
+  brand: Brand,
+  signal?: AbortSignal,
+): Promise<TokenStore | null> {
+  signal?.throwIfAborted();
+  if (!loaded) return null;
+  const { token } = loaded;
+
+  if (isValid(token.expires_at)) return token;
+
+  // access_token expired — try refresh
+  if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
+    const refreshed = await refreshToken(token, appId, appSecret, brand, signal);
+    signal?.throwIfAborted();
+    if (refreshed) return refreshed;
+  }
+
+  logger.debug('[user-token] Token expired and refresh_token also expired');
+  return null;
+}
+
 async function resolveTokenFrom(
   loaded: { token: TokenStore; source: string } | null,
   appId: string,
@@ -605,21 +639,30 @@ async function resolveTokenFrom(
   brand: Brand,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  signal?.throwIfAborted();
-  if (!loaded) return null;
-  const { token } = loaded;
+  return (await resolveTokenStoreFrom(loaded, appId, appSecret, brand, signal))?.access_token ?? null;
+}
 
-  if (isValid(token.expires_at)) return token.access_token;
+export interface UserTokenSnapshot {
+  accessToken: string;
+  /** 与 accessToken 来自同一次 TokenStore 加载/刷新；旧 token 没记 scope 时为 undefined。 */
+  scopes?: string[];
+}
 
-  // access_token expired — try refresh
-  if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
-    const refreshed = await refreshToken(token, appId, appSecret, brand, signal);
-    signal?.throwIfAborted();
-    if (refreshed) return refreshed.access_token;
-  }
-
-  logger.debug('[user-token] Token expired and refresh_token also expired');
-  return null;
+/**
+ * 同时解析 access token 和它的 scope 快照。调用方不能用另一次读盘补 scope：两读之间
+ * 另一进程可能换发 token，导致错误分类用的是另一份凭证的元数据。
+ */
+export async function resolveUserTokenWithScopes(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+  openId?: string,
+  signal?: AbortSignal,
+): Promise<UserTokenSnapshot | null> {
+  const resolved = await resolveTokenStoreFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand, signal);
+  if (!resolved) return null;
+  const scopes = splitScopes(resolved.scope);
+  return { accessToken: resolved.access_token, ...(scopes.length > 0 ? { scopes } : {}) };
 }
 
 /**
@@ -641,7 +684,7 @@ export async function resolveUserToken(
   // 按 (app, 人) 取盘上的 token。不匹配 / 别人的 → null，调用方提示 /login。
   // 这里刻意没有 env 覆盖：一个全局 FEISHU_USER_ACCESS_TOKEN 会绕过整个按人隔离
   // 边界，而且绕过时没有任何痕迹。
-  return resolveTokenFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand, signal);
+  return (await resolveUserTokenWithScopes(appId, appSecret, brand, openId, signal))?.accessToken ?? null;
 }
 
 // ─── Public API: OAuth login flow ─────────────────────────────────────────────
@@ -695,15 +738,6 @@ function authorizationScopes(
     ...splitScopes(existing?.token.scope).filter(scope => !ON_DEMAND_USER_SCOPES.includes(scope)
       || (existing?.token.onDemandScopes ?? []).includes(scope)),
   ])];
-}
-
-/**
- * 这个人在本应用下存的 User Token 声明了哪些 scope。没有 token、或 token 没记 scope 时
- * 返回 undefined（无从判断，调用方别据此下结论）。
- */
-export function storedUserTokenScopes(appId: string, brand: Brand, openId?: string): string[] | undefined {
-  const scopes = splitScopes(loadTokenForApp(appId, brand, openId)?.token.scope);
-  return scopes.length ? scopes : undefined;
 }
 
 type UserAuthorizationPollResult =

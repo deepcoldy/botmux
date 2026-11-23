@@ -9,7 +9,13 @@ vi.mock('../src/bot-registry.js', () => ({
   formatLarkError: String,
 }));
 vi.mock('../src/utils/user-token.js', () => ({
-  resolveUserToken: mocks.userToken, storedUserTokenScopes: mocks.storedScopes,
+  resolveUserToken: mocks.userToken,
+  resolveUserTokenWithScopes: vi.fn(async (appId: string, appSecret: string, brand: string, openId?: string) => {
+    const accessToken = await mocks.userToken(appId, appSecret, brand, openId);
+    if (!accessToken) return null;
+    const scopes = mocks.storedScopes(appId, brand, openId);
+    return { accessToken, ...(scopes ? { scopes } : {}) };
+  }),
 }));
 import { downloadMessageResource } from '../src/im/lark/client.js';
 const dirs: string[] = [];

@@ -207,6 +207,22 @@ describe('user authorization device flow', () => {
       expect(JSON.parse(readFileSync(tokenPath(), 'utf8')).scope.split(' ')).toContain('im:resource');
     });
 
+    it('keeps the explicit marker when an older flow finishes with the scope still present', async () => {
+      writeFileSync(tokenPath(), stored('im:message:readonly offline_access'));
+      const older = await requestUserAuthorization(APP, 'secret', 'feishu', ['docx:document:readonly'], USER, () => current);
+      const resource = await requestUserAuthorization(APP, 'secret', 'feishu', ['im:resource'], USER, () => current);
+      advance(5);
+      tokenBody.scope = resource.scopes.join(' ');
+      expect(await resource.poll()).toEqual({ status: 'ready', token: TOKEN });
+      // 较早发起的授权后完成，但回包仍带 im:resource：不应被 stale 拦截，也不能因此
+      // 把较新授权写下的 onDemandScopes 擦掉，否则下一次授权就会把它当旧默认集剥掉。
+      tokenBody.scope = [...older.scopes, 'im:resource'].join(' ');
+      expect(await older.poll()).toEqual({ status: 'ready', token: TOKEN });
+      expect(JSON.parse(readFileSync(tokenPath(), 'utf8')).onDemandScopes).toEqual(['im:resource']);
+      const later = await requestUserAuthorization(APP, 'secret', 'feishu', ['base:field:read'], USER, () => current);
+      expect(later.scopes).toContain('im:resource');
+    });
+
     it('survives a token refresh', async () => {
       writeFileSync(tokenPath(), stored('im:message:readonly im:resource offline_access', {
         expires_at: '2026-09-18T00:00:00.000Z', onDemandScopes: ['im:resource'],
