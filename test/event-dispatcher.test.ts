@@ -16240,7 +16240,17 @@ describe('im.message.receive_v1 — mention late-resolution reverify', () => {
         sender: { id: USER_OPEN_ID, id_type: 'open_id', sender_type: 'user' },
       }],
     });
-    await vi.advanceTimersByTimeAsync(16_000);
+    // 分档推进并在每档后 settle：单次 advance 16s 会把三档定时器放进同一轮
+    // tick 批处理，worker 高负载时撤回终止的微任务链可能来不及落地就被后续
+    // 档位接续（CI 实测 mock 被调 3 次）。与本 describe 重试梯用例同款节奏，
+    // 每档都断言仍为 1 次，比单次推进的断言更严格。
+    await vi.advanceTimersByTimeAsync(2_500);
+    await settle();
+    expect(mockGetMessageDetail).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(7_000 - 2_500);
+    await settle();
+    expect(mockGetMessageDetail).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(16_000 - 7_000);
     await settle();
     expect(mockGetMessageDetail).toHaveBeenCalledTimes(1);
     expect(reverifyPendingCount()).toBe(0);
