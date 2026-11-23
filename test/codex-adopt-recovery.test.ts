@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CodexBridgeQueue, CodexMidTurnReplyCollector, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CodexMidTurnReplyCollector, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import { splitCodexEventsByCutoff, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from '../src/services/codex-adopt-recovery.js';
 import { readBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
@@ -307,14 +307,143 @@ describe('adopted Codex recovery around a passed mark', () => {
     return queue;
   };
 
-  it('never journals a passed mark, so a restart cannot replay what passed it', () => {
+  it('restores a passed mark so its own late record still revives the original input', () => {
+    const queue = adoptQueue(12_000);
+    queue.mark('om_typo', typo, 10_000);
+    // Equal timestamps must not let the drainage-reordered journal reverse FIFO.
+    queue.mark('om_ask', ask, 10_000);
+    queue.ingest([event('user', 11_000, ask)]);
+    expect(queue.peek().find(turn => turn.turnId === 'om_typo')?.passedBySuccessor).toBe(true);
+    checkpointCodexAdoptTurns(path, rollout, queue, 500);
+    const journal = readBridgeTurnJournal(path);
+    expect(journal).toHaveLength(2);
+    expect(journal.find(entry => entry.turnId === 'om_typo')).toMatchObject(
+      { passedBySuccessor: { replayFloorMs: 11_000 }, offsetAtMark: 500 });
+    expect(journal.find(entry => entry.turnId === 'om_ask')).toMatchObject({ offsetAtMark: 500 });
+
+    const restored = adoptQueue(25_000);
+    const recovery = restoreCodexAdoptTurns(path, rollout, restored, [
+      event('user', 11_000, ask), event('assistant_final', 12_000, 'answer B'),
+      event('user', 21_000, typo), event('assistant_final', 22_000, 'late answer A'),
+    ], 15_000, 25_000);
+    expect(recovery.restored).toBe(2);
+    expect(restored.peek().map(turn => turn.turnId)).toEqual(['om_typo', 'om_ask']);
+    expect(restored.peek().find(turn => turn.turnId === 'om_typo')?.passedBySuccessor).toBe(true);
+    restored.absorb(recovery.history);
+    restored.ingest(recovery.live);
+    expect(restored.drainEmittable().map(turn => [turn.turnId, turn.isLocal === true, turn.finalText])).toEqual([
+      ['om_ask', false, 'answer B'],
+      ['om_typo', false, 'late answer A'],
+    ]);
+  });
+
+  it('does not replay the already drained successor while restoring a passed mark', () => {
+    const queue = adoptQueue(12_000);
+    queue.mark('om_typo', typo, 10_000);
+    queue.mark('om_ask', ask, 10_500);
+    queue.ingest([event('user', 11_000, ask), event('assistant_final', 12_000, 'answer B')]);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_ask', finalText: 'answer B' }]);
+    checkpointCodexAdoptTurns(path, rollout, queue, 700);
+    expect(readBridgeTurnJournal(path)).toMatchObject([
+      { turnId: 'om_typo', passedBySuccessor: { replayFloorMs: 12_000 }, offsetAtMark: 700 },
+    ]);
+
+    const restored = adoptQueue(30_000);
+    const recovery = restoreCodexAdoptTurns(path, rollout, restored, [
+      event('user', 11_000, ask), event('assistant_final', 12_000, 'answer B'),
+      event('user', 21_000, typo), event('assistant_final', 22_000, 'late answer A'),
+    ], 25_000, 30_000);
+    expect(restored.peek().find(turn => turn.turnId === 'om_typo')?.passedBySuccessor).toBe(true);
+    restored.absorb(recovery.history);
+    restored.ingest(recovery.live);
+    expect(restored.drainEmittable().map(turn => [turn.turnId, turn.isLocal === true, turn.finalText])).toEqual([
+      ['om_typo', false, 'late answer A'],
+    ]);
+  });
+
+  it('uses the passed byte cursor to reject old rows without losing a same-ms late append', () => {
+    const atOffset = (kind: CodexBridgeEvent['kind'], timestampMs: number, text: string, offset: number): CodexBridgeEvent => ({
+      ...event(kind, timestampMs, text), uuid: `stable-${kind}-${text}`, rolloutPath: rollout, rolloutOffset: offset,
+    });
+    const queue = adoptQueue(12_000);
+    queue.mark('om_typo', typo, 10_000);
+    queue.mark('om_ask', ask, 10_500);
+    queue.ingest([atOffset('user', 11_000, ask, 100), atOffset('assistant_final', 12_000, 'answer B', 200)]);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_ask', finalText: 'answer B' }]);
+    checkpointCodexAdoptTurns(path, rollout, queue, 250);
+
+    const restored = adoptQueue(30_000);
+    const recovery = restoreCodexAdoptTurns(path, rollout, restored, [
+      atOffset('user', 11_000, ask, 100), atOffset('assistant_final', 12_000, 'answer B', 200),
+      // The append happened after the checkpoint but shares its millisecond
+      // timestamp. Only the newer byte offset can distinguish it from history.
+      atOffset('user', 12_000, typo, 250), atOffset('assistant_final', 12_000, 'late answer A', 300),
+    ], 25_000, 30_000);
+    expect(restored.peek().find(turn => turn.turnId === 'om_typo')?.passedBySuccessor).toBe(true);
+    restored.absorb(recovery.history);
+    restored.ingest(recovery.live);
+    expect(restored.drainEmittable().map(turn => [turn.turnId, turn.isLocal === true, turn.finalText])).toEqual([
+      ['om_typo', false, 'late answer A'],
+    ]);
+  });
+
+  it('keeps a restored passed mark through attach-prune until its late record arrives', () => {
+    const queue = adoptQueue(12_000);
+    queue.mark('om_typo', typo, 10_000, undefined, { jsonlPath: rollout, offsetAtMark: 0 });
+    queue.mark('om_ask', ask, 10_500, undefined, { jsonlPath: rollout, offsetAtMark: 100 });
+    queue.ingest([event('user', 11_000, ask)]);
+    checkpointCodexAdoptTurns(path, rollout, queue, 500);
+
+    let now = 25_000;
+    const restored = new CodexBridgeQueue(() => now);
+    restored.setLocalTurns(true, 9_000);
+    restored.setWholeInputPassing(true);
+    const recovery = restoreCodexAdoptTurns(path, rollout, restored, [
+      event('user', 11_000, ask), event('assistant_final', 12_000, 'answer B'),
+    ], 15_000, now);
+    restored.absorb(recovery.history);
+    restored.ingest(recovery.live);
+    const emitted: CodexPendingTurn[] = [];
+    const dropped = pruneExpiredPreStartHeadsAndEmit(
+      restored, () => emitted.push(...restored.drainEmittable()), now,
+    );
+    const ready = [...emitted, ...restored.drainEmittable()];
+    expect(ready.map(turn => [turn.turnId, turn.finalText])).toEqual([['om_ask', 'answer B']]);
+    expect(dropped).toEqual([]);
+    expect(restored.peek().find(turn => turn.turnId === 'om_typo')?.passedBySuccessor).toBe(true);
+    checkpointCodexAdoptTurns(path, rollout, restored, 700);
+    expect(readBridgeTurnJournal(path).map(entry => entry.turnId)).toEqual(['om_typo']);
+
+    restored.ingest([event('user', 21_000, typo), event('assistant_final', 22_000, 'late answer A')]);
+    expect(restored.drainEmittable().map(turn => [turn.turnId, turn.isLocal === true, turn.finalText])).toEqual([
+      ['om_typo', false, 'late answer A'],
+    ]);
+  });
+
+  it('bounds the restored revival lease without treating it as previous-worker activity', () => {
     const queue = adoptQueue(12_000);
     queue.mark('om_typo', typo, 10_000);
     queue.mark('om_ask', ask, 10_500);
     queue.ingest([event('user', 11_000, ask)]);
-    expect(queue.peek().find(turn => turn.turnId === 'om_typo')?.passedBySuccessor).toBe(true);
-    checkpointCodexAdoptTurns(path, rollout, queue);
-    expect(readBridgeTurnJournal(path).map(entry => entry.turnId)).toEqual(['om_ask']);
+    checkpointCodexAdoptTurns(path, rollout, queue, 500);
+
+    let now = 25_000;
+    const restored = new CodexBridgeQueue(() => now);
+    restored.setLocalTurns(true, 9_000);
+    restored.setWholeInputPassing(true);
+    const recovery = restoreCodexAdoptTurns(path, rollout, restored, [
+      event('user', 11_000, ask), event('assistant_final', 12_000, 'answer B'),
+    ], 15_000, now);
+    restored.absorb(recovery.history);
+    restored.ingest(recovery.live);
+    expect(restored.drainEmittable().map(turn => turn.turnId)).toEqual(['om_ask']);
+    const passed = restored.peek().find(turn => turn.turnId === 'om_typo');
+    expect(passed?.restoredPassedRevivalUntilMs).toBeDefined();
+    expect(selectStaleRestoredJournalTurns(restored.peek())).toEqual([]);
+    now = passed!.restoredPassedRevivalUntilMs!;
+    expect(restored.pruneExpiredPreStartHeads(now)).toEqual([]);
+    now += 1;
+    expect(restored.pruneExpiredPreStartHeads(now).map(turn => turn.turnId)).toEqual(['om_typo']);
   });
 
   it('a restart before the pass still gives the reply to the input whose whole text arrived', () => {

@@ -26242,6 +26242,7 @@ function setupWorkerHandlers(
           );
           break;
         }
+        if (effectiveCliId === 'codex') terminateProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
         // The「本轮回顾」panel goes on the turn's last card once it settles —
         // and only if the CLI recaps the turn (core/turn-recap-state.ts).
         const recapWanted = msg.status === 'completed' && turnRecapIo.enabled(ds);
@@ -27709,9 +27710,14 @@ function setupWorkerHandlers(
       }
 
       case 'final_output': {
-        if (!msg.handoff) { await processFinalOutput(msg); break; }
+        if (!msg.handoff) {
+          if (effectiveCliId === 'codex' && msg.sessionId === ds.session.sessionId) terminateProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
+          await processFinalOutput(msg);
+          break;
+        }
         try {
           if (!journal || msg.handoff.version !== 2 || msg.handoff.token !== ds.initConfig?.finalOutputHandoff?.token || msg.sessionId !== ds.session.sessionId) throw new Error('output_handoff_not_authorized');
+          if (effectiveCliId === 'codex') terminateProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
           const snapshot = outputSnapshot(ds.larkAppId, msg);
           if (snapshot.id !== msg.handoff.id || snapshot.fingerprint !== msg.handoff.fingerprint) throw new Error('output_handoff_conflict');
           const existing = journal.read(snapshot.id);
@@ -27802,9 +27808,12 @@ function setupWorkerHandlers(
         const uuid = absorbedReplyUuid(ds.session.sessionId, msg.turnId, msg.replyUuid);
         if (msg.progress) {
           // Progress is best effort: the turn's final does not wait for it,
-          // nor does a graceful shutdown, and a retry stops once the bot turns
-          // the option off or the turn's UI is suppressed.
+          // nor does a graceful shutdown. A newer progress or the exact turn
+          // terminal supersedes every older queued retry.
+          const progressDelivery = beginProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
+          if (!progressDelivery) break;
           const stillWanted = () => {
+            if (!progressDeliveryIsCurrent(ds, progressDelivery)) return false;
             if (!ownsLifecycleMutation() || managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) return false;
             try { return getBot(ds.larkAppId).config.followUpReply === true; } catch { return false; }
           };
@@ -28439,6 +28448,59 @@ const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
  *  returns the message already posted instead of posting another. */
 export function absorbedReplyUuid(sessionId: string, turnId: string, replyUuid: string): string {
   return `ar_${createHash('sha256').update(`${sessionId}:${turnId}:${replyUuid}`, 'utf8').digest('hex').slice(0, 46)}`;
+}
+
+interface ProgressDeliveryToken { key: string; epoch: number }
+interface ProgressDeliveryState { epoch: number }
+const PROGRESS_ACTIVE_DELIVERY_STATE_MAX = 256;
+const progressDeliveryStates = new WeakMap<DaemonSession, Map<string, ProgressDeliveryState>>();
+// Terminal truth is not retry bookkeeping: active epochs may be LRU-evicted,
+// but an exact turn/attempt that ended must never accept reordered progress.
+// These per-session keys live no longer than the DaemonSession itself.
+const progressDeliveryTerminals = new WeakMap<DaemonSession, Set<string>>();
+const progressDeliveryKey = (turnId: string, dispatchAttempt?: number): string =>
+  JSON.stringify([turnId, dispatchAttempt ?? null]);
+
+function writeProgressDeliveryState(
+  ds: DaemonSession, key: string, state: ProgressDeliveryState,
+): void {
+  let states = progressDeliveryStates.get(ds);
+  if (!states) progressDeliveryStates.set(ds, states = new Map());
+  states.delete(key);
+  states.set(key, state);
+  // Eviction cancels an active retry but cannot erase a terminal tombstone.
+  while (states.size > PROGRESS_ACTIVE_DELIVERY_STATE_MAX) {
+    const oldest = states.keys().next().value;
+    if (oldest === undefined) break;
+    states.delete(oldest);
+  }
+}
+
+/** One newer progress or terminal supersedes every older retry for the exact
+ * turn attempt. A terminal tombstone also rejects IPC reordered after it. */
+function beginProgressDelivery(
+  ds: DaemonSession, turnId: string, dispatchAttempt?: number,
+): ProgressDeliveryToken | undefined {
+  const key = progressDeliveryKey(turnId, dispatchAttempt);
+  if (progressDeliveryTerminals.get(ds)?.has(key)) return undefined;
+  const previous = progressDeliveryStates.get(ds)?.get(key);
+  const epoch = (previous?.epoch ?? 0) + 1;
+  writeProgressDeliveryState(ds, key, { epoch });
+  return { key, epoch };
+}
+
+function progressDeliveryIsCurrent(ds: DaemonSession, token: ProgressDeliveryToken): boolean {
+  if (progressDeliveryTerminals.get(ds)?.has(token.key)) return false;
+  const state = progressDeliveryStates.get(ds)?.get(token.key);
+  return state !== undefined && state.epoch === token.epoch;
+}
+
+function terminateProgressDelivery(ds: DaemonSession, turnId: string, dispatchAttempt?: number): void {
+  const key = progressDeliveryKey(turnId, dispatchAttempt);
+  progressDeliveryStates.get(ds)?.delete(key);
+  let terminals = progressDeliveryTerminals.get(ds);
+  if (!terminals) progressDeliveryTerminals.set(ds, terminals = new Set());
+  terminals.add(key);
 }
 
 /** Run `attempt` on the bridge-final backoff until it resolves. Retries stop

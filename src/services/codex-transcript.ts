@@ -1786,7 +1786,7 @@ function terminalExecFallbacks(
     ]);
     return [{
       uuid: `${path}:${call.outputOffset}`, rawId: call.outputRawId, timestampMs: call.outputTimestampMs ?? Date.now(),
-      kind: 'cot' as const, text: '', cotEntries,
+      kind: 'cot' as const, text: '', cotEntries, toolCompletion: true as const,
     }];
   });
 }

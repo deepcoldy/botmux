@@ -76,6 +76,10 @@ export const STRUCTURED_TASK_START_CORROBORATION_GRACE_MS = 10 * 60_000;
  *  This covers Codex/CoCo's in-band polling plus the 20s deferred recheck,
  *  while remaining bounded if an adapter promise or recheck is stranded. */
 export const STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS = 30_000;
+/** A restored passed mark has no live submit-verification flag, but its own
+ * rollout record may still be appended just after attach. Keep a short revival
+ * window that does not participate in stale-restored lifecycle classification. */
+export const STRUCTURED_RESTORED_PASS_REVIVIAL_GRACE_MS = 30_000;
 
 export interface CodexPendingTurn {
   turnId: string;
@@ -107,6 +111,10 @@ export interface CodexPendingTurn {
    *  the lower bound of the "did `botmux send` happen for this turn?"
    *  window. Optional only for legacy / test-injected turns. */
   markTimeMs?: number;
+  /** Monotonic submission order within this queue. Queue rows move ahead of
+   * unstarted/passed marks, so their current array position is not FIFO proof.
+   * Restored marks use a negative range older than every pre-attach live mark. */
+  markOrder?: number;
   /** Transcript identity and durable byte frontier observed at mark time.
    * Stored on the turn because the path may not be officially attached yet;
    * a later checkpoint must not replace this with an attach/post-ingest cursor. */
@@ -133,6 +141,10 @@ export interface CodexPendingTurn {
    *  running and its own submit verification has run out. A positive submit
    *  receipt, or its own whole-input record, takes the presumption back. */
   passedBySuccessor?: true;
+  /** Local-clock deadline for a restored passed mark's own late user record.
+   * Unlike submit verification this never marks the previous worker's lifecycle
+   * as active and never holds the session busy; it only delays attribution prune. */
+  restoredPassedRevivalUntilMs?: number;
   /** Wall-clock millis when an authoritative adapter/history check confirmed
    *  the submit. Unverified writes deliberately leave this unset. */
   submitConfirmedAtMs?: number;
@@ -228,6 +240,15 @@ function rolloutLineOffset(uuid: string): number | undefined {
   return Number.isSafeInteger(offset) ? offset : undefined;
 }
 
+/** Byte position used by restart recovery to distinguish already-checkpointed
+ * rows from late append-only records. Stable replay ids carry it explicitly;
+ * raw drain ids encode it as <path>:<offset>. */
+export function codexBridgeEventRolloutOffset(
+  ev: Pick<CodexBridgeEvent, 'uuid' | 'rolloutOffset'>,
+): number | undefined {
+  return ev.rolloutOffset ?? rolloutLineOffset(ev.uuid);
+}
+
 /** Rollout file of a raw `<path>:<offset>` event id. Stable content ids carry
  * the same information explicitly in `rolloutPath`. */
 function rolloutLinePath(uuid: string): string | undefined {
@@ -262,14 +283,14 @@ export class CodexMidTurnReplyCollector {
     const message = ev.assistantMessage?.trim();
     if (message) {
       this.run.push({ text: message, uuid: ev.uuid, timestampMs: ev.timestampMs,
-        offset: ev.rolloutOffset ?? rolloutLineOffset(ev.uuid),
+        offset: codexBridgeEventRolloutOffset(ev),
         path: ev.rolloutPath ?? rolloutLinePath(ev.uuid) });
       return undefined;
     }
     const toolCall = ev.toolCompletion !== true
       && (ev.toolCallBoundary === true || ev.cotEntries?.some(entry => entry.kind === 'tool_call'));
     if (this.run.length === 0 || !toolCall) return undefined;
-    const at = ev.rolloutOffset ?? rolloutLineOffset(ev.uuid);
+    const at = codexBridgeEventRolloutOffset(ev);
     const path = ev.rolloutPath ?? rolloutLinePath(ev.uuid);
     const said = this.run[this.run.length - 1];
     if (path === said.path && at !== undefined && said.offset !== undefined && at < said.offset) return undefined;
@@ -289,6 +310,9 @@ export class CodexBridgeQueue {
   private seen = new Set<string>();
   private seenNativeUserMessages = new Map<string, true>();
   private queue: CodexPendingTurn[] = [];
+  private nextMarkOrder = 0;
+  private nextRestoredMarkOrder = 0;
+  private lastTranscriptEventTimeMs: number | undefined;
   private collecting: CodexPendingTurn | null = null;
   /** Recently closed native turns. Providers can replay terminal/CoT records
    *  after the owning local turn has already drained; without this tombstone
@@ -389,19 +413,35 @@ export class CodexBridgeQueue {
     return { mark, ahead };
   }
 
-  /** Which unstarted mark a transcript user record starts: the head by its
-   *  fingerprint, unless (adopt with passing) a later mark is its whole input,
-   *  or a passed mark's own whole input arrives after all. */
+  /** Current array order is deliberately not submission order: started marks
+   * move ahead of unstarted/passed rows so their replies can drain. */
+  private isEarlierSubmission(left: CodexPendingTurn, right: CodexPendingTurn): boolean {
+    const leftOrder = left.markOrder ?? left.markTimeMs ?? Number.MAX_SAFE_INTEGER;
+    const rightOrder = right.markOrder ?? right.markTimeMs ?? Number.MAX_SAFE_INTEGER;
+    if (leftOrder !== rightOrder) return leftOrder < rightOrder;
+    return this.queue.indexOf(left) < this.queue.indexOf(right);
+  }
+
+  /** Which unstarted mark a transcript user record starts: the earliest exact
+   * eligible submission. A later whole-input successor may pass dead heads;
+   * an older passed mark whose own identical record arrives late revives first. */
   private userRecordOwner(ev: CodexBridgeEvent): { next?: CodexPendingTurn; passed: CodexPendingTurn[] } {
     const head = this.queue.find(turn => !turn.started && !turn.passedBySuccessor);
-    if (head && this.exactlyMatchesUserInput(head, ev)) return { next: head, passed: [] };
+    const exactHead = head && this.exactlyMatchesUserInput(head, ev) ? head : undefined;
     const successor = this.wholeInputSuccessor(ev);
-    if (successor) return { next: successor.mark, passed: successor.ahead };
     const revived = this.localTurnsEnabled && this.wholeInputPassing
       ? this.queue.find(turn => turn.passedBySuccessor && !turn.started && turn.finalText === undefined
         && !(turn.markTimeMs !== undefined && ev.timestampMs < turn.markTimeMs)
         && this.exactlyMatchesUserInput(turn, ev))
       : undefined;
+    const exact = [exactHead, successor?.mark, revived].filter((turn): turn is CodexPendingTurn => !!turn);
+    const earliest = exact.reduce<CodexPendingTurn | undefined>(
+      (best, turn) => !best || this.isEarlierSubmission(turn, best) ? turn : best,
+      undefined,
+    );
+    if (earliest && earliest === revived) return { next: revived, passed: [] };
+    if (earliest && earliest === exactHead) return { next: exactHead, passed: [] };
+    if (successor && earliest === successor.mark) return { next: successor.mark, passed: successor.ahead };
     return { next: revived ?? head, passed: [] };
   }
 
@@ -542,10 +582,25 @@ export class CodexBridgeQueue {
     return fallback;
   }
 
+  private observeTranscriptEventTimes(events: readonly CodexBridgeEvent[]): void {
+    for (const ev of events) {
+      if (!Number.isFinite(ev.timestampMs)) continue;
+      this.lastTranscriptEventTimeMs = Math.max(this.lastTranscriptEventTimeMs ?? ev.timestampMs, ev.timestampMs);
+    }
+  }
+
+  /** High watermark of transcript rows already absorbed or ingested. A passed
+   * mark's journal uses it only as a fallback when a replay event lacks a byte
+   * offset; append-only offsets remain the authoritative recovery partition. */
+  transcriptEventTimeUpperBound(): number | undefined {
+    return this.lastTranscriptEventTimeMs;
+  }
+
   /** Register events as historical without producing pending-turn side
    *  effects. Used at attach time when resume mode wants to swallow prior
    *  conversation as already-processed. */
   absorb(events: CodexBridgeEvent[]): void {
+    this.observeTranscriptEventTimes(events);
     for (const ev of events) this.seen.add(ev.uuid);
   }
 
@@ -620,6 +675,7 @@ export class CodexBridgeQueue {
       dispatchAttempt,
       ...(linkRefMode ? { linkRefMode } : {}),
       started: false,
+      markOrder: this.nextMarkOrder++,
       contentFingerprint: makeFingerprint(message),
       nativeInputText: normaliseForFingerprint(message),
       wholeInputHash: wholeInputHash(message),
@@ -640,6 +696,7 @@ export class CodexBridgeQueue {
     fingerprint: string;
     inputTextHash?: string;
     wholeInputHash?: string;
+    passedBySuccessor?: { replayFloorMs: number };
     markTimeMs: number;
     linkRefMode?: 'observe' | 'enabled';
     jsonlPath?: string;
@@ -657,6 +714,10 @@ export class CodexBridgeQueue {
       existing.add(entry.turnId);
       restored.push({ turnId: entry.turnId, started: false,
         restoredFromJournal: true,
+        ...(entry.passedBySuccessor ? {
+          passedBySuccessor: true as const,
+          restoredPassedRevivalUntilMs: this.now() + STRUCTURED_RESTORED_PASS_REVIVIAL_GRACE_MS,
+        } : {}),
         ...(entry.linkRefMode ? { linkRefMode: entry.linkRefMode } : {}),
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
         ...(entry.inputTextHash ? { inputTextHash: entry.inputTextHash } : {}),
@@ -673,6 +734,11 @@ export class CodexBridgeQueue {
         } : {}),
         unconfirmedAttributionStartedAtMs: entry.markTimeMs });
     }
+    if (restored.length > 0) {
+      const base = this.nextRestoredMarkOrder - restored.length;
+      restored.forEach((turn, index) => { turn.markOrder = base + index; });
+      this.nextRestoredMarkOrder = base;
+    }
     this.queue.unshift(...restored);
   }
 
@@ -683,6 +749,7 @@ export class CodexBridgeQueue {
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
     this.bufferedUnmatched = [];
     this.lastClosedAssistantFinalTimeMs = undefined;
+    this.lastTranscriptEventTimeMs = undefined;
     return dropped;
   }
 
@@ -743,9 +810,14 @@ export class CodexBridgeQueue {
       // started), so its attribution lease no longer applies. Retire it
       // wherever it sits: a later mark whose start was rolled back can be
       // ahead of it and must not hold its notice behind that mark's lease.
-      // Only an in-flight submit check may still prove it arrived.
+      // Only an in-flight submit check or late delivery evidence may still
+      // prove it arrived. Setters for positive evidence also revoke the pass,
+      // but keep this guard fail-closed against every future evidence field.
       const passed = this.queue.find(turn => turn.passedBySuccessor
         && !turn.started && turn.finalText === undefined
+        && !this.mayStillArrive(turn)
+        && !(turn.restoredPassedRevivalUntilMs !== undefined
+          && nowMs <= turn.restoredPassedRevivalUntilMs)
         && !(turn.submitVerificationStartedAtMs !== undefined
           && nowMs - turn.submitVerificationStartedAtMs <= STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS));
       if (passed) {
@@ -755,7 +827,8 @@ export class CodexBridgeQueue {
         continue;
       }
 
-      const head = this.queue.find(turn => !turn.started && turn.finalText === undefined);
+      const head = this.queue.find(turn => !turn.started && !turn.passedBySuccessor
+        && turn.finalText === undefined);
       if (!head) break;
 
       // An RPC turn is running server-side with no local transcript to ingest.
@@ -862,6 +935,7 @@ export class CodexBridgeQueue {
     if (!turn) return false;
     // The CLI did take this input after all: its record is coming.
     turn.passedBySuccessor = undefined;
+    turn.restoredPassedRevivalUntilMs = undefined;
     turn.submitVerificationStartedAtMs = undefined;
     turn.unconfirmedAttributionStartedAtMs = undefined;
     turn.submitConfirmedAtMs = confirmedAtMs;
@@ -908,6 +982,10 @@ export class CodexBridgeQueue {
       && candidate.dispatchAttempt === dispatchAttempt
       && candidate.finalText === undefined);
     if (!turn) return false;
+    // A server-side ACK is positive late delivery evidence, just like an
+    // adapter submit receipt: the earlier successor's presumption is revoked.
+    turn.passedBySuccessor = undefined;
+    turn.restoredPassedRevivalUntilMs = undefined;
     turn.rpcActive = true;
     turn.submitVerificationStartedAtMs = undefined;
     turn.unconfirmedAttributionStartedAtMs = undefined;
@@ -929,7 +1007,17 @@ export class CodexBridgeQueue {
   setInputDeliveryQuarantined(turnId: string, quarantined: boolean, dispatchAttempt?: number): void {
     const turn = this.queue.find(candidate => candidate.turnId === turnId
       && candidate.dispatchAttempt === dispatchAttempt);
-    if (turn) turn.inputDeliveryQuarantined = quarantined ? true : undefined;
+    if (!turn) return;
+    if (quarantined) {
+      // The CLI still owns a parked draft. This evidence can arrive after a
+      // successor already passed the mark, so restore attribution before the
+      // next prune rather than letting the passed fast path delete the draft.
+      turn.passedBySuccessor = undefined;
+      turn.restoredPassedRevivalUntilMs = undefined;
+      turn.inputDeliveryQuarantined = true;
+    } else {
+      turn.inputDeliveryQuarantined = undefined;
+    }
   }
 
   /** Start bounded adapter/history verification before awaiting writeInput. */
@@ -1094,6 +1182,7 @@ export class CodexBridgeQueue {
   /** Process newly-appended events. Idempotent on uuid: events with seen
    *  uuids are skipped, so callers can replay safely. */
   ingest(events: CodexBridgeEvent[]): void {
+    this.observeTranscriptEventTimes(events);
     for (const ev of events) {
       if (!ev.uuid || this.seen.has(ev.uuid)) continue;
       this.seen.add(ev.uuid);
@@ -1407,7 +1496,11 @@ export class CodexBridgeQueue {
       if (willStartNext) {
         next!.started = true;
         next!.passedBySuccessor = undefined;
-        for (const turn of passed) turn.passedBySuccessor = true;
+        next!.restoredPassedRevivalUntilMs = undefined;
+        for (const turn of passed) {
+          turn.passedBySuccessor = true;
+          turn.restoredPassedRevivalUntilMs = undefined;
+        }
         this.moveAheadOfUnstarted(next!);
         next!.submitVerificationStartedAtMs = undefined;
         next!.unconfirmedAttributionStartedAtMs = undefined;

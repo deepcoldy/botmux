@@ -358,6 +358,24 @@ describe('Codex mid-turn replies: progress, and the answer to a same-turn steer'
     expect(q.drainEmittable().map(t => [t.turnId, t.finalText])).toEqual([['om_task', 'Final answer.']]);
   });
 
+  it('does not take an unmatched terminal exec fallback after the final message for new progress', () => {
+    const now = Date.parse(at(0));
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('om_task', 'Keep working', now);
+    const replies = observed(q);
+    writeFileSync(path, [
+      { timestamp: at(0), type: 'event_msg', payload: { type: 'task_started', turn_id: native } },
+      userResponseItem('Keep working', at(1)),
+      execCall('unmatched-after-final', 2),
+      assistantMessageResponseItem('Final answer.', 'final_answer', at(3)),
+      toolOutput('unmatched-after-final', 4),
+      { timestamp: at(5), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'Final answer.' } },
+    ].map(ev).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(replies).toEqual([]);
+    expect(q.drainEmittable().map(t => [t.turnId, t.finalText])).toEqual([['om_task', 'Final answer.']]);
+  });
+
   // A fresh conversation (new session, /clear, /new) opens with Codex's
   // AGENTS.md block as role=user in the same native turn as the first input.
   it('does not take the first message after AGENTS.md opens a conversation for a steer', () => {
@@ -2411,6 +2429,54 @@ describe('a Lark input that never reached Codex does not take the next input\'s 
       userRecord('first request', 4, 'N2'), taskComplete('N2', 'first answer', 5)]);
     expect(q.drainEmittable().map(turn => [turn.turnId, turn.finalText])).toEqual([
       ['second', 'second answer'], ['first', 'first answer']]);
+  });
+
+  it('a late identical record revives the older passed mark instead of a newer head', () => {
+    const q = new CodexBridgeQueue(() => t0);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('first', '继续', t0);
+    q.mark('passing', 'different input', t0 + 100);
+    const feed = rollout(q);
+    feed([userRecord('different input', 1, 'N1'), taskComplete('N1', 'passing answer', 2)]);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'passing', finalText: 'passing answer' }]);
+    expect(shape(q)).toEqual([{ turnId: 'first', started: false, passed: true }]);
+
+    // Deliberately reuse the original mark timestamp: submission order, not a
+    // timestamp tie-break or the reordered queue position, must decide ownership.
+    q.mark('newer-same-text', '继续', t0);
+    feed([
+      userRecord('继续', 3, 'N-first-late'), taskComplete('N-first-late', 'first answer', 4),
+      userRecord('继续', 5, 'N-newer'), taskComplete('N-newer', 'newer answer', 6),
+    ]);
+    expect(q.drainEmittable().map(turn => [turn.turnId, turn.sourceTurnId, turn.finalText])).toEqual([
+      ['first', 'N-first-late', 'first answer'],
+      ['newer-same-text', 'N-newer', 'newer answer'],
+    ]);
+  });
+
+  it('late quarantine evidence revokes a pass and survives the successor terminal', () => {
+    let now = t0;
+    const q = new CodexBridgeQueue(() => now);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('parked', 'first request', t0);
+    q.beginSubmitVerification('parked', t0);
+    q.mark('later', 'second request', t0 + 500);
+    const feed = rollout(q);
+    feed([userRecord('second request', 1, 'N1')]);
+    expect(shape(q).find(turn => turn.turnId === 'parked')?.passed).toBe(true);
+
+    // writeInput can arm quarantine only after the later transcript record has
+    // already passed this mark. That new evidence must restore its old lease.
+    now = t0 + 2_000;
+    q.finishSubmitVerification('parked', now);
+    q.setInputDeliveryQuarantined('parked', true);
+    feed([taskComplete('N1', 'second answer', 3)]);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'later', finalText: 'second answer' }]);
+    now = t0 + STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS + 4_000;
+    expect(q.pruneExpiredPreStartHeads(now)).toEqual([]);
+    expect(q.peek()).toMatchObject([{ turnId: 'parked', passedBySuccessor: undefined, inputDeliveryQuarantined: true }]);
   });
 
   it('never passes an input the CLI reported it is still holding', () => {

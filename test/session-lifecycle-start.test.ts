@@ -12521,6 +12521,45 @@ describe('folded-turn reply relay', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
   });
 
+  it('drops an older progress retry once a newer progress supersedes it', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply')
+      .mockRejectedValueOnce(new Error('lark 5xx (transient)'));
+    const { worker } = forkWithReply({}, sessionReply);
+    worker.emit('message', { ...reply('om_task', 'P1 stale', 'text', 'om_task-p1'), progress: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    worker.emit('message', { ...reply('om_task', 'P2 newer', 'text', 'om_task-p2'), progress: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(String(sessionReply.mock.calls[1][1])).toContain('P2 newer');
+  });
+
+  it('cancels a progress retry at turn terminal and keeps its tombstone through active-state churn', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply')
+      .mockRejectedValueOnce(new Error('lark 5xx (transient)'));
+    const { ds, worker } = forkWithReply({}, sessionReply);
+    worker.emit('message', { ...reply('om_task', 'P1 stale', 'text', 'om_task-p1'), progress: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_task', status: 'completed' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 256; i++) {
+      worker.emit('message', {
+        ...reply(`om_other_${i}`, `progress ${i}`, 'text', `om_other_${i}-a1`), progress: true,
+      });
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(257);
+    worker.emit('message', { ...reply('om_task', 'late progress', 'text', 'om_task-late'), progress: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(257);
+  });
+
   it('drops an empty answer and one for a session without a Lark transport', async () => {
     const live = forkWithReply(adopted);
     live.worker.emit('message', reply('om_blank', '  \n '));

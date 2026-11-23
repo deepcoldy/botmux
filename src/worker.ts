@@ -21850,6 +21850,9 @@ interface InputDeliveryQuarantine {
   cancelReceipt?: () => void;
   draftRescueAttempted?: true;
   submitWarningSent?: true;
+  /** The deferred warning/terminal chain owns negative settlement once armed.
+   * The independent observer must drive it, not drop attribution ahead of it. */
+  onNegativeEvidence?: () => Promise<void>;
 }
 let inputDeliveryQuarantine: InputDeliveryQuarantine | null = null;
 const inputDeliveryEvidence = new InputDeliveryEvidenceTracker();
@@ -22031,7 +22034,16 @@ function armInputDeliveryQuarantine(
         if (screen && cliAdapter!.screenShowsNoPendingInput!(screen)) {
           if (++noPendingInputPolls >= 2) {
             log(`${cliName()} no longer holds the quarantined input (empty idle composer on two receipt polls) — releasing`);
-            releaseInputDeliveryQuarantine(quarantine, 'unconfirmed input no longer pending in the CLI', { redriveTerminal: true });
+            if (quarantine.onNegativeEvidence) {
+              // The deferred chain owns the exact attempt's terminal/notice.
+              // Let it perform release + drop + settlement in one callback.
+              await quarantine.onNegativeEvidence();
+            } else {
+              releaseInputDeliveryQuarantine(quarantine, 'unconfirmed input no longer pending in the CLI', { redriveTerminal: true });
+              // With no deferred owner (manual arm / already-settled chain), the
+              // observer itself must retire stale attribution before a retry.
+              dropFailedBridgeMark(quarantine.turnId, quarantine.dispatchAttempt);
+            }
           }
         } else {
           noPendingInputPolls = 0;
@@ -23899,6 +23911,8 @@ function scheduleSubmitFailureNotify(
   // Consecutive rechecks on which the CLI showed that it no longer holds this
   // unconfirmed input anywhere (screenShowsNoPendingInput).
   let noPendingInputChecks = 0;
+  let observerProvedInputGone = false;
+  let negativeSettlementToken: symbol | undefined;
   let activeSilenceExtra = 0;
   let busySilenceExtra = 0;
   let composerSubmitRescued = false;
@@ -24005,7 +24019,7 @@ function scheduleSubmitFailureNotify(
         // 弱 pty-output 最多再重查一次，仍无强证据就进入单次 warning，避免无限链。
         if (sessionStartGated) break;
         log(`Deferred recheck missing but later ${action.evidence} shows ${cliName()} is active — suppressing submit warning. preview="${preview}"`);
-        if (deferredRecheckAttempts < SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS) {
+        if (!observerProvedInputGone && deferredRecheckAttempts < SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS) {
           armDeferredRecheck();
           return;
         }
@@ -24039,7 +24053,7 @@ function scheduleSubmitFailureNotify(
     // missing) see an empty composer and nothing held by the CLI, the input is
     // gone. Release its quarantine and attribution so later input is not held
     // until a restart; warn once if that has not happened yet.
-    let pendingInputGone = false;
+    let pendingInputGone = observerProvedInputGone;
     if (retainQuarantinedReceipt && cliAdapter?.screenShowsNoPendingInput
       && backendScreenEvidenceIsAuthoritativeForMutation() && submitDiagnosisScreen
       && cliAdapter.screenShowsNoPendingInput(submitDiagnosisScreen)) {
@@ -24289,6 +24303,29 @@ function scheduleSubmitFailureNotify(
       send(notice);
     }
   };
+  if (quarantineAtSchedule && currentInputDeliveryQuarantine() === quarantineAtSchedule) {
+    quarantineAtSchedule.onNegativeEvidence = async (): Promise<void> => {
+      observerProvedInputGone = true;
+      // Cancel the timer before driving the same settlement function directly.
+      // Any already-running deferred callback sees its controller token revoked
+      // and returns without side effects after its awaited recheck.
+      submitFailureChains.cancel(chainKey);
+      const token = Symbol('negative-quarantine-settlement');
+      negativeSettlementToken = token;
+      const chainIsCurrent = (): boolean => negativeSettlementToken === token
+        && deferredAttemptIsCurrent()
+        && currentInputDeliveryQuarantine() === quarantineAtSchedule;
+      if (bridgeTurnId
+        && !codexBridgeQueue.hasPendingTurn(bridgeTurnId, turnIdentity?.dispatchAttempt)
+        && !codexBridgeQueue.hasTerminalTurn(bridgeTurnId, turnIdentity?.dispatchAttempt)) {
+        // Another path already settled the exact mark. Only release its leftover
+        // quarantine; emitting a second durable terminal would be a regression.
+        releaseInputDeliveryQuarantine(quarantineAtSchedule, 'unconfirmed input no longer pending in the CLI', { redriveTerminal: true });
+        return;
+      }
+      await runDeferredRecheck(chainIsCurrent);
+    };
+  }
   const armDeferredRecheck = (): void => {
     deferredRecheckAttempts++;
     const { armed, replaced } = submitFailureChains.schedule(
