@@ -734,7 +734,8 @@ import {
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
 import { backfillOwnerUnionId, claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { offerAuthorizationAtCreation, clearRestoredLapses, privateNoticeSender, unattendedTask } from './core/capability-authorization.js';
-import { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
+import { allowsPersonalIdentityForTurn, isPersonActorTurnId, isRunAsTurnId, isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
+import { resolveRunAs } from './core/run-as.js';
 import { capabilityOn, delegatesOnMention, dispatchOnlyToolsForTurn, TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
 import { capabilityOfTool } from './core/identity-policy.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
@@ -4767,7 +4768,7 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
     return finishScheduledAdmission(prepareScheduledTurnCliIdentity(ds, turnId));
   }
   if (!triggerUserAuthEnabledFor(ds)) return;
-  if (isOwnerActorTurnId(turnId)) {
+  if (isPersonActorTurnId(turnId)) {
     const prepareKey = JSON.stringify([ds.workerGeneration ?? null, ds.managedTurnOrigin?.dispatchAttempt ?? null]);
     let preparations = ownerActorIdentityRestores.get(ds);
     const previous = preparations?.get(turnId);
@@ -5039,7 +5040,9 @@ const ownerActorIdentityRestores = new WeakMap<DaemonSession, Map<string, { key:
  *  republishes the turn's origin. Before this daemon has published anything
  *  for the session, prepare that turn again through the entry its original
  *  publication used: the schedule authority for a scheduled run, the
- *  session's reply target for a human message or a resolved owner actor turn. */
+ *  session's reply target for a human message or a resolved owner / runAs turn.
+ *  Owner and runAs turns are prepared on every live origin, not only the
+ *  session's first: nothing publishes them before dispatch. */
 async function restoreTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   // daemon 重启后原生定时轮也需重建控制人证明，但不发布个人凭据。
   if (parseScheduledTurnId(turnId) && configuredCliExecutionMode(getBot(ds.larkAppId).config) === 'native') {
@@ -5051,11 +5054,16 @@ async function restoreTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     ds.scheduledControlActors?.delete(turnId);
     if (ds.scheduledControlActors?.size === 0) ds.scheduledControlActors = undefined;
   }
-  if (ds.lastPublishedIdentityModel !== undefined || !triggerUserAuthEnabledFor(ds)
-    || identityStorageModelForDaemonSession(ds) !== 'proven'
-    // Owner turns are synthetic but carry a daemon-resolved human sender. Other
-    // external triggers stay excluded; publication rechecks allowOwnerActor.
-    || !(parseScheduledTurnId(turnId) || isHumanInboundTurnId(turnId) || isOwnerActorTurnId(turnId))
+  // A person-actor turn is never prepared before dispatch (its write fence needs the
+  // live turn), so an earlier publication in the session does not cover it.
+  if ((ds.lastPublishedIdentityModel !== undefined && !isPersonActorTurnId(turnId)) || !triggerUserAuthEnabledFor(ds)
+    // runAs has no pre-dispatch publication on either model, so its live origin
+    // must also prepare file-backed identity. Every other turn keeps the old
+    // proven-only restore rule; owner-actor behavior is unchanged here.
+    || (!isRunAsTurnId(turnId) && identityStorageModelForDaemonSession(ds) !== 'proven')
+    // Owner and runAs turns are synthetic but carry a daemon-resolved human sender. Other
+    // external triggers stay excluded; publication rechecks the turn's policy.
+    || !(parseScheduledTurnId(turnId) || isHumanInboundTurnId(turnId) || isPersonActorTurnId(turnId))
     || !identityDecisionTurnIsLive(ds, turnId)) return;
   const replay = prepareTurnCliIdentity(ds, turnId);
   if (replay) await trackTurnIdentityPublication(config.session.dataDir, ds.session.sessionId, replay);
@@ -5414,16 +5422,22 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
     || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
     ? undefined : reply?.senderOpenId;
-  const ownerActor = isOwnerActorTurnId(turnId);
-  const ownerPersonalAllowedAtStart = ownerActor && allowsPersonalIdentityForTurn(turnId, botConfig.triggerUserAuth);
-  const ownerOrigin = ownerActor && ds.managedTurnOrigin?.turnId === turnId
+  const personActor = isPersonActorTurnId(turnId);
+  const ownerPersonalAllowedAtStart = personActor && allowsPersonalIdentityForTurn(turnId, botConfig.triggerUserAuth);
+  const ownerOrigin = personActor && ds.managedTurnOrigin?.turnId === turnId
     ? { generation: ds.workerGeneration, dispatchAttempt: ds.managedTurnOrigin.dispatchAttempt }
     : undefined;
-  const validateBeforeWrite = !ownerActor ? undefined : (): boolean => {
+  // A runAs person is admitted again at publication (the request-time check may
+  // be minutes old); the union id is fetched here because the write fence is synchronous.
+  const runAsUnionId = isRunAsTurnId(turnId) && turnSenderOpenId
+    ? await resolveUnionIdFromOpenId(ds.larkAppId, turnSenderOpenId) : null;
+  const validateBeforeWrite = !personActor ? undefined : (): boolean => {
     let currentBotConfig;
     try { currentBotConfig = getBot(ds.larkAppId).config; } catch { return false; }
-    if (!allowsPersonalIdentityForTurn(turnId, currentBotConfig.triggerUserAuth)
-      || !turnSenderOpenId || getStrictOwnerOpenId(ds.larkAppId) !== turnSenderOpenId) return false;
+    if (!allowsPersonalIdentityForTurn(turnId, currentBotConfig.triggerUserAuth) || !turnSenderOpenId) return false;
+    if (isRunAsTurnId(turnId)
+      ? !runAsUnionId || !canOperate(ds.larkAppId, ds.chatId, turnSenderOpenId, runAsUnionId)
+      : getStrictOwnerOpenId(ds.larkAppId) !== turnSenderOpenId) return false;
     const turnIsLive = ds.worker
       ? identityDecisionTurnIsLive(ds, turnId)
       : ds.session.status === 'active' && !ds.terminalIdentityTurnIds?.has(turnId);
@@ -10587,19 +10601,15 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     const { runAs, ownerOpenId: _ownerOpenId, ownerUnionId: _ownerUnionId, ...hostTask } = task;
     let runAsOwner: scheduler.ScheduleOwner = { kind: 'ownerless' };
     if (runAs !== undefined) {
-      if (!selfDaemonLarkAppId || typeof runAs !== 'string'
-        || !/^(ou_[A-Za-z0-9_-]{1,160}|[^\s@]{1,128}@[^\s@]{1,128})$/.test(runAs)) {
+      const person = selfDaemonLarkAppId ? await resolveRunAs(selfDaemonLarkAppId, task.chatId, runAs) : undefined;
+      if (!person || (!person.ok && person.reason === 'invalid')) {
         return jsonRes(res, 400, { ok: false, error: 'schedule_run_as_invalid' });
       }
-      const openId = runAs.startsWith('ou_')
-        ? runAs
-        : (await resolveAllowedUsersWithMap(selfDaemonLarkAppId, [runAs])).map.get(runAs);
-      const unionId = openId ? await resolveUnionIdFromOpenId(selfDaemonLarkAppId, openId) : null;
-      if (!openId || !unionId) return jsonRes(res, 403, { ok: false, error: 'schedule_run_as_unresolved' });
-      if (!canOperate(selfDaemonLarkAppId, task.chatId, openId, unionId)) {
-        return jsonRes(res, 403, { ok: false, error: 'schedule_run_as_not_allowed' });
+      if (!person.ok) {
+        return jsonRes(res, 403, { ok: false,
+          error: person.reason === 'unresolved' ? 'schedule_run_as_unresolved' : 'schedule_run_as_not_allowed' });
       }
-      runAsOwner = { kind: 'human', openId, unionId };
+      runAsOwner = { kind: 'human', openId: person.openId, unionId: person.unionId };
     }
     try {
       const created = scheduler.addTask({
