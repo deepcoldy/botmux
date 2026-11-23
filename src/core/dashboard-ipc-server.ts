@@ -492,7 +492,7 @@ export function setExactChatGrantHandler(handler: typeof applyExactChatGrantRequ
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
 // 时 PUT /api/bot-rename 降级为仅改 displayName。
 export type BotRenameOutcome =
-  | { ok: true; name: string }
+  | { ok: true; name: string; displayName?: string | null; localSyncError?: string }
   | { ok: false; reason: string; message: string };
 let botRenamer: ((newName: string) => Promise<BotRenameOutcome>) | null = null;
 export function setBotRenamer(fn: ((newName: string) => Promise<BotRenameOutcome>) | null): void {
@@ -11420,7 +11420,9 @@ ipcRoute('PUT', '/api/bot-ask-option-layout', requireBoundBot(async (req, res) =
 // 主路径：daemon 注册的 renamer 走开放平台自动化真改飞书应用名（改基础信息 +
 // 建版发布，群内显示名生效）；失败（Web 登录态过期 / 非协作者 / lark 租户等）
 // 自动降级为仅改 botmux 展示名 displayName，并把原因作为 warning 返回给前端。
-// 响应：{ ok, mode: 'feishu'|'local', botName, warning?, message? }。
+// 已发布但本地同步失败仍是 mode:feishu，带 localSyncError，绝不走本地降级。
+// 响应：{ ok, mode: 'feishu'|'local', botName, larkBotName?, displayName?,
+//          localSyncError?, warning?, message? }。
 ipcRoute('PUT', '/api/bot-rename', requireBoundBot(async (req, res) => {
   const body = await readJsonBodyOrBadJson<{ name?: unknown }>(req, res);
   if (body === BAD_JSON) return;
@@ -11444,7 +11446,14 @@ ipcRoute('PUT', '/api/bot-rename', requireBoundBot(async (req, res) => {
       renamed = { ok: false, reason: 'api_error', message: ipcErrorText(err) };
     }
     if (renamed.ok) {
-      return jsonRes(res, 200, { ok: true, mode: 'feishu', botName: getBotName() });
+      return jsonRes(res, 200, {
+        ok: true,
+        mode: 'feishu',
+        botName: renamed.displayName || renamed.name,
+        larkBotName: renamed.name,
+        displayName: renamed.displayName ?? null,
+        ...(renamed.localSyncError ? { localSyncError: renamed.localSyncError } : {}),
+      });
     }
     // 降级：仅改 botmux 展示名，带上飞书侧失败原因让前端明示。
     const fallback = await applyConfigField(cachedLarkAppId, spec, name);

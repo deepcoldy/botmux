@@ -2319,12 +2319,19 @@ function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot:
         patchBot(bot.larkAppId, current => ({
           ...current,
           botName: effective,
-          larkBotName: res.body.mode === 'feishu' ? nextName : current.larkBotName,
-          displayName: res.body.mode === 'feishu' ? null : nextName,
+          larkBotName: res.body.mode === 'feishu'
+            ? (typeof res.body.larkBotName === 'string' ? res.body.larkBotName : nextName)
+            : current.larkBotName,
+          displayName: res.body.mode === 'feishu'
+            ? (typeof res.body.displayName === 'string' ? res.body.displayName : null)
+            : nextName,
         }));
         setEditMode(false);
         if (res.body.mode === 'feishu') {
-          setStatus({ text: `✓ ${tr('botDefaults.renameOkFeishu')}`, ok: true });
+          const localSyncError = typeof res.body.localSyncError === 'string' ? res.body.localSyncError : '';
+          setStatus(localSyncError
+            ? { text: `⚠ ${localSyncError}` }
+            : { text: `✓ ${tr('botDefaults.renameOkFeishu')}`, ok: true });
           setLoginVisible(false);
         } else {
           setStatus({ text: `⚠ ${renameWarningText(String(res.body.warning ?? ''), res.body.message)}` });
