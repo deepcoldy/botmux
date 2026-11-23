@@ -1772,6 +1772,7 @@ export const messages: Record<string, string> = {
   'card.click_turn.delivery_failed': '没能把这一轮送进会话',
   'card.click_turn.unavailable': '这个按钮当前不可用',
   'card.next_step.started': '收到并开始执行：{text}',
+  'card.next_step.invalid_prompt': '请输入 1–1000 字的内容后再确认发送。',
   'card.action.stop_sent': '⏹ 已发送停止信号（^C），会话保留',
   'card.action.stop_unsupported': '⚠️ 当前 CLI 模式不支持卡片停止（实验性 RPC 输入），请用 /close 关闭会话',
   'card.action.stop_no_worker': '⚠️ CLI 未运行，无法停止',

@@ -2392,6 +2392,7 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
+  | { type: 'request_next_step'; turnId: string; dispatchAttempt?: number; userPrompt?: string; answer: string }
   | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig | null; replyDelivery?: 'send' | 'transcript'; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true; failedTurnRewind?: FailedTurnRewindDirective }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
@@ -3026,7 +3027,7 @@ export type WorkerToDaemonBase =
   /** The CLI's own next-input suggestion on an idle screen (Claude Code's
    *  greyed-out prompt suggestion), sent when it appears or changes. turnId is
    *  the turn that just ended; the daemon shows it on that turn's last card. */
-  | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number; editable?: true }
   /** The CLI's own recap of the session (Claude Code's transcript away
    *  summary), written while idle after a turn; turnId is that turn. */
   | { type: 'cli_recap'; text: string; turnId?: string; dispatchAttempt?: number }

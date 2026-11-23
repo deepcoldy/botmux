@@ -104,6 +104,7 @@ import {
 import type { DaemonSession, GroupJoinContext } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
+import { noteTurnStarted } from './turn-outcome.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
 import { resolveScheduleModelOverride } from './schedule-model-override.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
@@ -5371,6 +5372,9 @@ export async function executeScheduledTask(
             + `(running on ${existing.session.model ?? 'the CLI default'})`,
           );
         }
+        // Keep the dispatch timestamp with the durable outcome so a restored
+        // next-step button can distinguish later input from this scheduled run.
+        noteTurnStarted(existing, scheduledTurnId);
         // Identity preparation may reject after a concurrent pause/revocation.
         // Run it before changing the retained conversation's routing or prompt.
         await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
@@ -5536,6 +5540,7 @@ export async function executeScheduledTask(
       // resume of this session (see resolveSessionLaunchModel).
       ...(modelOverride.model ? { spawnModelOverride: modelOverride.model } : {}),
     };
+    noteTurnStarted(ds, scheduledTurnId);
     if (sharedTopicRootId) {
       beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId);
       sessionStore.updateSession(ds.session);
