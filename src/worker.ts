@@ -7837,6 +7837,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             trustedCaller: activeIdentity.caller ?? null,
             identityTurnId: activeIdentity.identityTurnId ?? activeIdentity.turnId,
             ...(activeIdentity.speakers?.length ? { speakers: [...activeIdentity.speakers] } : {}),
+            ...(activeIdentity.provenanceIncomplete ? { provenanceIncomplete: true as const } : {}),
           } : {}),
           ...(readIsolationOriginChannelId
             ? { originChannelId: readIsolationOriginChannelId }
@@ -8049,7 +8050,7 @@ function adoptInitialActiveTurn(parsed: {
   trustedController?: TrustedCaller;
   steerPromotedTurn?: boolean;
   callerOpenId?: string;
-}): void {
+}, fromPidMarker = false): void {
   setCaptureIdentity(
     parsed.turnId,
     typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
@@ -8067,6 +8068,9 @@ function adoptInitialActiveTurn(parsed: {
     dispatchAttempt: currentBotmuxDispatchAttempt,
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
+    // The CLI-writable marker cannot prove the complete speaker/input history.
+    // Never let a restored turn regain owner fallback by omitting that history.
+    ...(fromPidMarker ? { provenanceIncomplete: true as const } : {}),
   });
   activeTurnAuthority.markStarted({
     turnId: parsed.turnId,
@@ -8118,6 +8122,7 @@ function adoptDisplacedActiveTurn(parsed: {
     dispatchAttempt: currentBotmuxDispatchAttempt,
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
+    provenanceIncomplete: true,
   });
   activeTurnAuthority.markStarted({
     turnId: parsed.turnId,
@@ -8125,6 +8130,16 @@ function adoptDisplacedActiveTurn(parsed: {
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
   });
+}
+
+/** A same-process duplicate bind is harmless only when the exact started
+ * authority is already in memory. A matching currentBotmuxTurnId alone is not
+ * enough: init may have set it before marker authority restoration completed. */
+function activeAuthorityMatchesMarker(parsed: { turnId: string; dispatchAttempt?: unknown }): boolean {
+  const active = activeTurnAuthority.snapshot();
+  const dispatchAttempt = typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined;
+  return active?.started === true && active.turnId === parsed.turnId
+    && active.dispatchAttempt === dispatchAttempt;
 }
 
 // PID marker 文件锁（withFileLockSync）不可重入：writeCliPidMarker / restoreQueuedTurns /
@@ -8155,7 +8170,7 @@ function writeCliPidMarker(): void {
           try {
             const raw = readFileSync(markerPath, 'utf-8');
             const parsed = JSON.parse(raw);
-            if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+            if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || !activeAuthorityMatchesMarker(parsed))) {
               if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
                 // Disk holds an older turn that worker memory has already retired/advanced past.
                 // Do not adopt it back; allow write to overwrite disk with currentBotmuxTurnId.
@@ -8177,8 +8192,8 @@ function writeCliPidMarker(): void {
                   publishSandboxRelayCapability();
                   rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
                   log(`Adopted active turn advance from PID marker before write: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)}`);
-                } else if (!currentBotmuxTurnId) {
-                  adoptInitialActiveTurn(parsed);
+                } else if (!currentBotmuxTurnId || parsed.turnId === currentBotmuxTurnId) {
+                  adoptInitialActiveTurn(parsed, true);
                   rememberQueuedTurnAdvanceForPendingReady();
                 } else {
                   const prevTurnId = currentBotmuxTurnId;
@@ -8271,11 +8286,11 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
     withPidMarkerLock(markerPath, () => {
       const raw = readFileSync(markerPath, 'utf-8');
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || !activeAuthorityMatchesMarker(parsed))) {
         if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
           // Disk holds an older turn that has already terminated; do not re-adopt it.
-        } else if (!currentBotmuxTurnId) {
-          adoptInitialActiveTurn(parsed);
+        } else if (!currentBotmuxTurnId || parsed.turnId === currentBotmuxTurnId) {
+          adoptInitialActiveTurn(parsed, true);
         } else {
           adoptDisplacedActiveTurn(parsed);
         }
@@ -8373,7 +8388,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
       withPidMarkerLock(markerPath, () => {
         const raw = readFileSync(markerPath, 'utf-8');
         const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+        if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || !activeAuthorityMatchesMarker(parsed))) {
           if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
             // Disk holds an older turn that worker memory has already retired/advanced past.
           } else {
@@ -8398,8 +8413,8 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
               anySynced = true;
               rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
               log(`Synced active turn advance from PID marker: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
-            } else if (!currentBotmuxTurnId) {
-              adoptInitialActiveTurn(parsed);
+            } else if (!currentBotmuxTurnId || parsed.turnId === currentBotmuxTurnId) {
+              adoptInitialActiveTurn(parsed, true);
               anySynced = true;
               rememberQueuedTurnAdvanceForPendingReady();
             } else {

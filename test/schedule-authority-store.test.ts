@@ -9,6 +9,7 @@ import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import { canonicalScheduleInput } from '../src/services/schedule-store.js';
 import type { ScheduledTask } from '../src/types.js';
 import * as sqliteCompat from '../src/services/sqlite-compat.js';
+import { scheduledTaskPersonOf } from '../src/core/lark-user-owner-fallback.js';
 
 const APP = 'cli_target';
 function task(id = 'a1b2c3d4', patch: Partial<ScheduledTask> = {}): ScheduledTask {
@@ -149,6 +150,32 @@ describe('host-only schedule authority store', () => {
       .toMatchObject({ ok: true, replay: false, task: { id: 'deadbeef' } });
     expect(store.commitDelegated({ ...base, grantId: 'grant-2', requestHash: 'hash-2' }))
       .toEqual({ ok: false, error: 'task_id_conflict' });
+  });
+
+  it('keeps owner-fallback person detection aligned with live authority and revocation', () => {
+    store.initializeApp(APP, []);
+    const direct = task('direct01', {
+      parsed: { kind: 'once', runAt: '2026-09-28T00:00:00.000Z', display: 'once' },
+    });
+    store.createDirect(direct);
+    expect(scheduledTaskPersonOf(store.getRecord(APP, direct.id))).toBe('none');
+
+    store.updateTask(APP, direct.id, current => ({ ...current, enabled: false, disabledReason: 'manual' }));
+    expect(store.getRecord(APP, direct.id)?.state).toBe('paused');
+    expect(scheduledTaskPersonOf(store.getRecord(APP, direct.id))).toBe('none');
+
+    store.updateTask(APP, direct.id, current => ({ ...current, disabledReason: 'once_completed' }));
+    expect(store.getRecord(APP, direct.id)?.state).toBe('completed');
+    expect(scheduledTaskPersonOf(store.getRecord(APP, direct.id))).toBe('none');
+
+    expect(store.revoke(APP, direct.id)).toBe(true);
+    expect(store.getRecord(APP, direct.id)?.state).toBe('revoked');
+    expect(scheduledTaskPersonOf(store.getRecord(APP, direct.id))).toBe('unknown');
+
+    const legacyApp = 'cli_legacy';
+    store.initializeApp(legacyApp, [task('legacy01', { larkAppId: legacyApp })]);
+    expect(store.getRecord(legacyApp, 'legacy01')).toMatchObject({ kind: 'legacy', state: 'active' });
+    expect(scheduledTaskPersonOf(store.getRecord(legacyApp, 'legacy01'))).toBe('none');
   });
 
   it('accepts ownerless legacy rows but refuses an explicit app mismatch before the marker', () => {

@@ -1068,6 +1068,9 @@ export interface DaemonSession {
     /** Humans whose messages are in the running turn, in order of their latest
      * message (the last one spoke last). Worker-reported, never CLI-supplied. */
     speakers?: TurnSpeaker[];
+    /** Worker cannot prove the complete input history (a non-speaker adoption or
+     * PID-marker recovery). Owner fallback stays disabled for this execution. */
+    provenanceIncomplete?: true;
     /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
     linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the

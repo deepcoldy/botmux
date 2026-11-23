@@ -27,11 +27,13 @@ Botmux 提供的短期 bot token。
 边界：
 - **别人不能借主人的身份。** 有真人发起的回合只用这个人自己的授权，缺授权就拒绝，不改用主人；没有发起人的回合里只要有主人以外的人插过话（消息并入了正在跑的回合），这一轮就不再用主人的授权。取到凭据前后各核一次，中途有人插话、开关被关、主人变了或来源不再是「没人」（比如定时任务被认领），这次调用以 409 结束，不交出凭据。
 - 来源不明的回合（发送方类型不明、恢复回合、跨群跟进、工作流事件等）不回退，保持原来的拒绝。
+- 回退只覆盖开场来源已经确认、且之后每次并入的输入都能由发言人记录解释的回合。后来并入 Bot、定时/恢复 caller 或其他无法由 `speakers` 表示的输入后，本次执行不再回退；从 CLI PID marker 重接的进行中回合因无法恢复完整输入历史，也同样拒绝。
+- 定时任务被删除（authority 为 `revoked`）后，仍在运行的回合不再回退；已暂停任务的进行中回合，以及自动完成的 one-shot / until-done 收尾回合，可以按既有语义继续。
 - 外部触发只认 daemon 公共入口在接收时记下的标记（内存，daemon 重启后不再认，按拒绝处理）；`trg_` 前缀本身不算数，daemon 内部用同一套机制转来的别人内容（`botmux report` 回传等）不回退。
 - bot 发来的消息只有签名派发记录写明发起人是主人才回退：任何 bot 都可能被能跟它说话的人驱动，没签名、绑定失败或记录读不到都不能当成「没人」。
 - 沙箱扣留 bot 凭据（`sandboxWithholdBotSecret`）的会话、个人助理模式下不属于主人的会话不回退：前者连 bot 身份都不给，后者属于另一个人。
 - **主人还没授权本应用**：`--as user` 被拒，提示 agent 运行 `botmux auth request --scope "<所需权限>" --json`。授权链接由 botmux 私聊发给主人（私聊发不出去时在本群发一张仅主人可见的卡片），即使在单聊里也不交给 agent，agent 拿到的结果不含链接；主人授权后 `botmux auth wait` 完成，重试即可。不会让任何人「到群里发一句话」。
-- 每次用主人授权的调用都写一行审计日志：`[lark-tool:owner-fallback:audit] bot=<app> session=<会话> turn=<回合> owner=<主人> reason=<external_trigger|owner_actor|schedule_without_creator|owner_dispatch> result=<granted|owner_not_authorized|auth_request>`；开关开启时因插话等原因不回退的调用记 `result=declined refusal=<原因>`。lark-cli 包装器成功时在 stderr 提示「本轮没有真人发起，--as user 使用 bot 主人的飞书授权」。
+- 每次用主人授权的调用都写一行审计日志：`[lark-tool:owner-fallback:audit] bot=<app> session=<会话> turn=<回合> owner=<主人> reason=<external_trigger|owner_actor|schedule_without_creator|owner_dispatch> result=<granted|owner_not_authorized|auth_request>`；开关开启时因插话、来源不明等原因不回退的调用记 `result=declined refusal=<原因>`（显式关闭开关或 per-person policy 覆盖时保持原有静默拒绝路径）。lark-cli 包装器成功时在 stderr 提示「本轮没有真人发起，--as user 使用 bot 主人的飞书授权」。
 - 关闭：Dashboard（Bot 配置 → 隔离与权限 → lark-cli 应用绑定 →「没有发起人时用主人的飞书身份」）、`/botconfig` 卡片的安全区，或 `/config set larkUserOwnerFallback off`。每次调用实时读取配置，改完立即生效，不需要重启会话。
 
 与按触发人鉴权的叠加：`triggerUserAuth` 开启且覆盖 lark-cli（勾了「飞书用户身份」，或旧配置的 `tools` 含 `lark-cli`）时，`--as user` 只认发起人本人，这个开关不生效，行为与以前完全一致（含无人值守回合的私信通知、平台授权卡片）。`triggerUserAuth` 开启但不含飞书用户身份时，`--as user` 原生执行（见下表），同样不涉及这个开关。只有 `triggerUserAuth` 关闭，或开启但只覆盖其他工具（旧配置 `tools: ["bytedcli"]`）时才会回退。`larkToolBinding` 关闭时 lark-cli 走宿主原生环境，也不涉及这个开关。

@@ -34,6 +34,8 @@ import * as dispatchUserDelegation from '../src/core/dispatch-user-delegation.js
 import * as dispatchReportBinding from '../src/core/dispatch-report-binding.js';
 import { logger } from '../src/utils/logger.js';
 import { rememberExternalTriggerTurn } from '../src/core/turn-origin.js';
+import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
+import type { TrustedCaller } from '../src/types.js';
 import {
   createProtectedLoopbackProxyAttestation,
   PROTECTED_LOOPBACK_ATTESTATION_HEADER,
@@ -1161,6 +1163,22 @@ describe('lark-cli --as user in a turn nobody started uses the bot owner (larkUs
     if (trustedCaller === undefined) delete session.managedTurnOrigin.trustedCaller;
     else session.managedTurnOrigin.trustedCaller = trustedCaller;
   };
+  const adoptIntoTrigger = (caller: TrustedCaller, envelopeTurnId: string) => {
+    callerless(TRIGGER);
+    const authority = new ActiveTurnAuthority();
+    authority.reserve({ turnId: TRIGGER });
+    authority.markStarted({ turnId: TRIGGER });
+    expect(authority.adoptEnvelopePreservingPrincipal({ turnId: envelopeTurnId, caller })).toBe(true);
+    const identity = authority.identity();
+    const speakers = authority.speakers();
+    session.managedTurnOrigin = {
+      ...session.managedTurnOrigin,
+      turnId: identity.turnId, identityTurnId: identity.identityTurnId ?? identity.turnId,
+      trustedCaller: identity.caller ?? null,
+      ...(speakers.length ? { speakers } : {}),
+      ...(identity.provenanceIncomplete ? { provenanceIncomplete: true } : {}),
+    };
+  };
   const tokenCallsFor = (person: string) => vi.mocked(tokens.resolveUserToken).mock.calls.filter(call => call[3] === person);
   const auditLines = () => vi.mocked(logger.info).mock.calls.map(call => String(call[0]))
     .filter(line => line.startsWith('[lark-tool:owner-fallback:audit]'));
@@ -1242,15 +1260,31 @@ describe('lark-cli --as user in a turn nobody started uses the bot owner (larkUs
     expect(await gated.json()).toMatchObject({ error: 'unattended_turn' });
   });
 
+  it('a marker-restored owner-actor turn cannot regain owner fallback', async () => {
+    session.managedTurnOrigin.turnId = 'trg_owner_abc';
+    session.managedTurnOrigin.identityTurnId = 'trg_owner_abc';
+    session.managedTurnOrigin.callerOpenId = OWNER;
+    session.managedTurnOrigin.trustedCaller = { requestLarkAppId: 'cli_bound', requestUserOpenId: OWNER, senderType: 'user' };
+    session.managedTurnOrigin.provenanceIncomplete = true;
+    const response = await request('user');
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ error: 'unattended_turn' });
+    expect(tokenCallsFor(OWNER)).toHaveLength(0);
+    expect((await authRequest()).status).toBe(403);
+  });
+
   it('a schedule without a creator uses the owner; one created by someone else never does', async () => {
     const authority = vi.spyOn(schedulerModule, 'getScheduleAuthorityRecord').mockReturnValue({ kind: 'direct', state: 'active', task: { id: 'a1b2c3d4' } } as any);
     callerless(SCHEDULE);
     expect(await (await request('user')).json()).toMatchObject({ credential: 'owner-token', actingAs: 'owner' });
     expect(auditLines().at(-1)).toContain('reason=schedule_without_creator');
+    authority.mockReturnValue({ kind: 'legacy', state: 'active', task: { id: 'a1b2c3d4' } } as any);
+    expect(await (await request('user')).json()).toMatchObject({ credential: 'owner-token', actingAs: 'owner' });
     vi.mocked(tokens.resolveUserToken).mockClear();
     for (const record of [
       { kind: 'direct', state: 'active', task: { id: 'a1b2c3d4', ownerOpenId: 'ou_sender', ownerUnionId: 'on_sender' } },
       { kind: 'delegated', state: 'active', task: { id: 'a1b2c3d4' } },
+      { kind: 'direct', state: 'revoked', task: { id: 'a1b2c3d4' } },
       undefined,
     ]) {
       authority.mockReturnValue(record as any);
@@ -1295,10 +1329,32 @@ describe('lark-cli --as user in a turn nobody started uses the bot owner (larkUs
     expect(await late.text()).not.toContain('late-owner-token');
   });
 
+  it.each([
+    ['an unsigned bot', {
+      requestLarkAppId: 'cli_bound', requestUserOpenId: 'ou_unsigned_bot', requestUserUnionId: 'on_unsigned_bot', senderType: 'bot',
+    } as TrustedCaller, 'om_unsigned_bot'],
+    ['another person\'s failed-turn recovery', {
+      requestLarkAppId: 'cli_bound', requestUserOpenId: 'ou_sender', requestUserUnionId: 'on_sender',
+      senderType: 'user', source: 'failed_turn_recovery',
+    } as TrustedCaller, 'bmx-recovery-other'],
+  ])('never uses the owner after %s joins the external turn', async (_label, caller, envelopeTurnId) => {
+    adoptIntoTrigger(caller, envelopeTurnId);
+    const response = await request('user');
+    expect(response.status).toBe(403);
+    expect(await response.text()).not.toContain('owner-token');
+    expect(tokenCallsFor(OWNER)).toHaveLength(0);
+    expect(auditLines().at(-1)).toContain('result=declined refusal=origin_unknown');
+    // The authorization entry is governed by the same incomplete provenance.
+    const scope = await authRequest();
+    expect(scope.status).toBe(403);
+    expect(await scope.json()).toMatchObject({ error: 'current_actor_unverified' });
+  });
+
   it('switched off, the strict refusal comes back unchanged and takes effect without a restart', async () => {
     callerless(TRIGGER);
     expect(await (await request('user')).json()).toMatchObject({ credential: 'owner-token' });
     vi.mocked(tokens.resolveUserToken).mockClear();
+    vi.mocked(logger.info).mockClear();
     useBot({ larkUserOwnerFallback: false });
     const off = await request('user');
     expect(off.status).toBe(403);
@@ -1315,6 +1371,7 @@ describe('lark-cli --as user in a turn nobody started uses the bot owner (larkUs
       useBot(strict);
       expect(await (await request('user')).json()).toEqual({ ok: false, error: 'No current requesting user; --as user requires their authorization' });
     }
+    expect(auditLines()).toEqual([]);
   });
 
   it('per-person authorization covering the Feishu user identity keeps the strict behaviour', async () => {
@@ -1393,7 +1450,19 @@ describe('lark-cli --as user in a turn nobody started uses the bot owner (larkUs
       expect(response.status).toBe(403);
       expect(await response.text()).not.toContain('owner-token');
       expect(tokenCallsFor(OWNER)).toHaveLength(0);
+      expect(auditLines().at(-1)).toContain('result=declined refusal=origin_unknown');
     });
+  });
+
+  it('an incomplete-provenance transition during the owner credential fetch returns no credential', async () => {
+    callerless(TRIGGER);
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      session.managedTurnOrigin.provenanceIncomplete = true;
+      return 'late-owner-token';
+    });
+    const late = await request('user');
+    expect(late.status).toBe(409);
+    expect(await late.text()).not.toContain('late-owner-token');
   });
 
   it('a schedule that gains a person while the owner\'s grant is fetched gets nothing', async () => {

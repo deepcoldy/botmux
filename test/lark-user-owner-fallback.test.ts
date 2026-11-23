@@ -108,6 +108,17 @@ describe('which turns fall back to the bot owner', () => {
     expect(await decide({ speakers: [{ openId: OWNER, turnId: 'om_later' }] })).toMatchObject({ use: 'owner' });
   });
 
+  it('fails closed when adoption or recovery makes the complete input history unavailable', async () => {
+    expect(await decide({ provenanceIncomplete: true })).toEqual({ use: 'none', refusal: 'origin_unknown' });
+    const signedRequester = vi.fn(async () => ({ kind: 'person' as const, openId: OWNER }));
+    expect(await decide({
+      turnId: 'om_bot_msg', trustedCaller: PEER_BOT, principalOpenId: 'ou_peer_bot', provenanceIncomplete: true,
+    }, { lookups: lookups({ signedRequester }) })).toEqual({ use: 'none', refusal: 'origin_unknown' });
+    expect(signedRequester).not.toHaveBeenCalled();
+    // The marker constrains only owner fallback; a real person's turn is unchanged.
+    expect(await decide({ principalOpenId: 'ou_sender', provenanceIncomplete: true })).toEqual({ use: 'principal' });
+  });
+
   it('the switch, a per-person lark-cli policy, a missing owner and protected sessions keep the refusal', async () => {
     expect(await decide({}, { bot: { larkUserOwnerFallback: false } })).toEqual({ use: 'none', refusal: 'switch_off' });
     for (const policy of [{ enabled: true, capabilities: ['lark-user'] }, { enabled: true, tools: ['lark-cli'] }, { enabled: true }]) {
@@ -140,16 +151,34 @@ describe('which turns fall back to the bot owner', () => {
     expect(ownerActorTurnFallsBack({ ...base, bot: { larkUserOwnerFallback: false } })).toBe(false);
     expect(ownerActorTurnFallsBack({ ...base, bot: { triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities: ['lark-user'] }) } })).toBe(false);
     expect(ownerActorTurnFallsBack({ ...base, speakers: [{ openId: 'ou_other', turnId: 'om_x' }] })).toBe(false);
+    expect(ownerActorTurnFallsBack({ ...base, provenanceIncomplete: true })).toBe(false);
   });
 
-  it('a scheduled task has a person when it records a creator, a claimant or a delegation', () => {
+  it('a live direct or legacy scheduled task has a person only when it records a creator, claimant or delegation', () => {
     expect(scheduledTaskPersonOf(undefined)).toBe('unknown');
-    expect(scheduledTaskPersonOf({ kind: 'direct', task: {} })).toBe('none');
-    expect(scheduledTaskPersonOf({ kind: 'delegated', task: {} })).toBe('person');
-    expect(scheduledTaskPersonOf({ kind: 'direct', task: { ownerOpenId: 'ou_x' } })).toBe('person');
-    expect(scheduledTaskPersonOf({ kind: 'direct', task: { ownerUnionId: 'on_x' } })).toBe('person');
-    expect(scheduledTaskPersonOf({ kind: 'direct', task: { runAsClaim: { openId: 'ou_x' } } })).toBe('person');
-    expect(scheduledTaskPersonOf({ kind: 'direct', task: { ownerAccess: 'talk' } })).toBe('person');
+    expect(scheduledTaskPersonOf({ kind: 'direct', state: 'active', task: {} })).toBe('none');
+    expect(scheduledTaskPersonOf({ kind: 'legacy', state: 'active', task: {} })).toBe('none');
+    expect(scheduledTaskPersonOf({ kind: 'delegated', state: 'active', task: {} })).toBe('person');
+    for (const kind of ['direct', 'legacy']) {
+      expect(scheduledTaskPersonOf({ kind, state: 'active', task: { ownerOpenId: 'ou_x' } })).toBe('person');
+      expect(scheduledTaskPersonOf({ kind, state: 'active', task: { ownerUnionId: 'on_x' } })).toBe('person');
+      expect(scheduledTaskPersonOf({ kind, state: 'active', task: { runAsClaim: { openId: 'ou_x' } } })).toBe('person');
+      expect(scheduledTaskPersonOf({ kind, state: 'active', task: { ownerAccess: 'talk' } })).toBe('person');
+    }
+  });
+
+  it('accepts only live schedule authority, with the existing auto-completion exception', () => {
+    expect(scheduledTaskPersonOf({ kind: 'direct', state: 'revoked', task: {} })).toBe('unknown');
+    expect(scheduledTaskPersonOf({ kind: 'legacy', state: 'revoked', task: {} })).toBe('unknown');
+    expect(scheduledTaskPersonOf({ kind: 'direct', task: {} })).toBe('unknown');
+    expect(scheduledTaskPersonOf({ kind: 'other', state: 'active', task: {} })).toBe('unknown');
+    expect(scheduledTaskPersonOf({ kind: 'direct', state: 'paused', task: {} })).toBe('none');
+    expect(scheduledTaskPersonOf({ kind: 'direct', state: 'completed', task: {
+      disabledReason: 'once_completed', parsed: { kind: 'interval', minutes: 30, display: 'every 30m' },
+    } })).toBe('unknown');
+    expect(scheduledTaskPersonOf({ kind: 'direct', state: 'completed', task: {
+      disabledReason: 'once_completed', parsed: { kind: 'once', runAt: '2026-11-23T00:00:00.000Z', display: 'once' },
+    } })).toBe('none');
   });
 
   it('only requests submitted from outside count as external triggers at the public entry', () => {

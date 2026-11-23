@@ -4402,6 +4402,7 @@ function ownerFallbackStillHolds(
   try { live = getBot(ds.larkAppId).config; } catch { return false; }
   const policy = ownerFallbackPolicy(live, ds.session, getOwnerOpenId(ds.larkAppId));
   return policy.ok && policy.ownerOpenId === fallback.openId
+    && ds.managedTurnOrigin?.provenanceIncomplete !== true
     && onlyOwnerSpoke(ds.managedTurnOrigin?.speakers, fallback.openId)
     && ownerFallbackOriginStillHolds(fallback.reason, fallback.turnId, ownerFallbackLookups(ds, ds.larkAppId, fallback.turnId));
 }
@@ -4585,6 +4586,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const ownerActorFallback = !!liveOrigin && ownerActorTurnFallsBack({
     bot, session: ds?.session, ownerOpenId, turnId: identityTurnId ?? turnId,
     principalOpenId: turnCaller, speakers: liveOrigin.speakers,
+    provenanceIncomplete: liveOrigin.provenanceIncomplete,
   });
   if (!allowsPersonalIdentityForTurn(identityTurnId ?? turnId, bot.triggerUserAuth) && !ownerActorFallback) {
     return jsonRes(res, 403, { ok: false, error: 'unattended_turn' });
@@ -4622,19 +4624,20 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     const decision = await decideOwnerFallback({
       bot, session: ds.session, ownerOpenId,
       turn: { turnId: fallbackTurnId, trustedCaller: liveOrigin.trustedCaller, principalOpenId: turnPrincipal,
-        speakers: liveOrigin.speakers, delegated: false },
+        speakers: liveOrigin.speakers, delegated: false, provenanceIncomplete: liveOrigin.provenanceIncomplete },
       lookups: ownerFallbackLookups(ds, bot.larkAppId, fallbackTurnId),
     });
     if (decision.use === 'owner') {
       ownerFallback = { openId: decision.openId, reason: decision.reason, turnId: fallbackTurnId };
     } else if (decision.use === 'none') {
-      // A switched-off or per-person bot, and an origin that cannot be
-      // established, keep the refusal below unchanged.
+      // Strict-mode switch/policy refusals deliberately keep their legacy quiet
+      // path. Every refusal that actually considered the fallback is audited,
+      // including origin_unknown, which intentionally keeps the generic text.
       const refusal = ownerFallbackRefusalText(decision.refusal);
-      if (refusal) {
+      if (decision.refusal !== 'switch_off' && decision.refusal !== 'per_person_policy') {
         logger.info(ownerFallbackAuditLine({ appId: bot.larkAppId, sessionId: params.sessionId, turnId: fallbackTurnId, decision }));
-        return jsonRes(res, 403, { ok: false, error: refusal });
       }
+      if (refusal) return jsonRes(res, 403, { ok: false, error: refusal });
     }
   }
   const auditOwnerFallback = (result: string) => {
@@ -5061,13 +5064,14 @@ for (const action of ['auth-request', 'auth-status']) {
       const ownerOpenId = getOwnerOpenId(ds.larkAppId);
       const frozen = { turnId: fallbackTurnId, ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}) };
       if (ownerOpenId && ownerActorTurnFallsBack({ bot: cfg, session: ds.session, ownerOpenId, turnId: fallbackTurnId,
-        principalOpenId: origin.callerOpenId, speakers: origin.speakers })) {
+        principalOpenId: origin.callerOpenId, speakers: origin.speakers,
+        provenanceIncomplete: origin.provenanceIncomplete })) {
         ownerFallback = { openId: ownerOpenId, reason: 'owner_actor', ...frozen };
       } else if (!origin.callerOpenId || principalIsBot({ trustedCaller: origin.trustedCaller, principalOpenId: origin.callerOpenId })) {
         const decision = await decideOwnerFallback({
           bot: cfg, session: ds.session, ownerOpenId,
           turn: { turnId: fallbackTurnId, trustedCaller: origin.trustedCaller, principalOpenId: origin.callerOpenId,
-            speakers: origin.speakers, delegated: false },
+            speakers: origin.speakers, delegated: false, provenanceIncomplete: origin.provenanceIncomplete },
           lookups: ownerFallbackLookups(ds, ds.larkAppId, fallbackTurnId),
         });
         if (decision.use === 'owner') ownerFallback = { openId: decision.openId, reason: decision.reason, ...frozen };

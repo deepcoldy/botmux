@@ -95,7 +95,7 @@ function harness(opts: { markerPath?: string } = {}) {
       adoptInitialActiveTurn: vi.fn(), adoptDisplacedActiveTurn: vi.fn(),
       markerIdentityTurnId: loadWorkerFunction('markerIdentityTurnId', { isValidMarkerIdentityTurnId }),
     });
-    names.push('syncQueuedTurnsFromMarkerDisk', 'writeCliPidMarker', 'markerQueuedTurnStillLive');
+    names.push('syncQueuedTurnsFromMarkerDisk', 'writeCliPidMarker', 'markerQueuedTurnStillLive', 'activeAuthorityMatchesMarker');
   }
   for (const name of names) scope[name] = loadWorkerFunction(name, scope);
   return scope;

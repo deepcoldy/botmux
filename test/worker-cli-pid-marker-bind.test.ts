@@ -79,7 +79,7 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
         return true;
       },
     };
-    for (const name of ['withPidMarkerLock', 'writeCliPidMarker', 'restoreQueuedTurnsFromMarkerDisk', 'adoptInitialActiveTurn', 'markerIdentityTurnId',
+    for (const name of ['withPidMarkerLock', 'writeCliPidMarker', 'restoreQueuedTurnsFromMarkerDisk', 'adoptInitialActiveTurn', 'activeAuthorityMatchesMarker', 'markerIdentityTurnId',
       'turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive', 'seedInitTurnTerminals']) {
       scope[name] = loadWorkerFunction(name, scope);
     }
@@ -111,6 +111,54 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
       .toMatchObject({ turnId: 'om_live', identityTurnId: 'om_opening', caller });
     expect(published).toEqual(['om_live']);
     expect(onDisk()).toMatchObject({ turnId: 'om_live', identityTurnId: 'om_opening', capability: 'c'.repeat(64) });
+  });
+
+  it('marks a marker-reattached merged turn as provenance-incomplete', () => {
+    const authority = scope.activeTurnAuthority as ActiveTurnAuthority;
+    authority.reserve({ turnId: 'trg_external' });
+    authority.markStarted({ turnId: 'trg_external' });
+    authority.adoptEnvelopePreservingPrincipal({ turnId: 'om_other', caller });
+    expect(authority.speakers()).toEqual([{ openId: 'ou_asker', turnId: 'om_other' }]);
+    scope.currentBotmuxTurnId = 'om_other';
+    scope.cliPidMarker = markerPath;
+    (scope.writeCliPidMarker as () => void)();
+    expect(onDisk()).toMatchObject({ turnId: 'om_other', identityTurnId: 'trg_external' });
+
+    // Reattach with only the fields that actually survived on disk. The marker
+    // does not carry the earlier speaker list, so fallback must stay disabled.
+    scope.activeTurnAuthority = new ActiveTurnAuthority();
+    scope.currentBotmuxTurnId = undefined;
+    scope.currentBotmuxCallerOpenId = undefined;
+    scope.sandboxRelayCapability = null;
+    bind();
+
+    const restored = scope.activeTurnAuthority as ActiveTurnAuthority;
+    expect(restored.speakers()).toEqual([]);
+    expect(restored.identity()).toMatchObject({
+      turnId: 'om_other', identityTurnId: 'trg_external', provenanceIncomplete: true,
+    });
+  });
+
+  it('restores provenance fail-closed when init already set the marker turn but authority is empty', () => {
+    writeFileSync(markerPath, JSON.stringify({
+      sessionId: 's-bind', turnId: 'trg_external', procStart: readProcessStartIdentity(process.pid),
+    }));
+    scope.currentBotmuxTurnId = 'trg_external';
+
+    // A complete, exact, started in-memory authority makes a duplicate bind a no-op.
+    const authority = scope.activeTurnAuthority as ActiveTurnAuthority;
+    authority.reserve({ turnId: 'trg_external' });
+    authority.markStarted({ turnId: 'trg_external' });
+    bind();
+    expect(authority.identity().provenanceIncomplete).toBeUndefined();
+
+    // Half recovery: init's turn survived, but the authority did not. The same
+    // marker must now be adopted with incomplete provenance, not skipped.
+    scope.activeTurnAuthority = new ActiveTurnAuthority();
+    bind();
+    const restored = scope.activeTurnAuthority as ActiveTurnAuthority;
+    expect(restored.snapshot()).toMatchObject({ turnId: 'trg_external', started: true });
+    expect(restored.identity().provenanceIncomplete).toBe(true);
   });
 
   it('discards a marker stamped with another process birth time and adopts nothing', () => {

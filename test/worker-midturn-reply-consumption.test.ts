@@ -96,6 +96,7 @@ function markerWorker(dataDir: string) {
     queuedTypeAheadTurns: [{ turnId: 'om_b' }],
     markTurnRetired: () => {},
     markActiveTurnStarted: () => {},
+    rememberQueuedTurnAdvanceForPendingReady: () => {},
     publishActiveTurn: () => {},
     publishSandboxRelayCapability: () => false,
     log: () => {},
@@ -105,7 +106,7 @@ function markerWorker(dataDir: string) {
     queueMicrotask: (fn: () => void) => fn(),
   };
   for (const name of ['withPidMarkerLock', 'writeCliPidMarker', 'restoreQueuedTurnsFromMarkerDisk',
-    'markerIdentityTurnId', 'turnTerminalEmitted', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive',
+    'activeAuthorityMatchesMarker', 'adoptInitialActiveTurn', 'setCaptureIdentity', 'markerIdentityTurnId', 'turnTerminalEmitted', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive',
     'markReplyInputConsumed', 'acknowledgeNativeInputConsumed', 'scheduleConsumedQueuedTurnAdvance']) {
     scope[name] = loadWorkerFunction(name, scope);
   }

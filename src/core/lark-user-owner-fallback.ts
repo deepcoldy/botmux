@@ -35,6 +35,7 @@ import type { TurnSpeaker } from './turn-speakers.js';
 import { triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { isOwnerActorTurnId } from './workflow-event-turn.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
+import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
 
 /** Why a turn has no person of its own. Written to the audit log. */
 export type OwnerFallbackReason =
@@ -104,6 +105,8 @@ export interface OwnerFallbackTurn {
   /** The principal the route resolved for the turn, when there is one. */
   principalOpenId: string | undefined;
   speakers: readonly TurnSpeaker[] | undefined;
+  /** A non-speaker adoption or PID-marker recovery made the full input history unavailable. */
+  provenanceIncomplete?: boolean;
   /** A signed delegation the per-person policy already remembered for the turn. */
   delegated: boolean;
 }
@@ -148,6 +151,10 @@ export async function decideOwnerFallback(input: {
   // Switched off, or per-person authorization governs lark-cli: the refusal stays as it was.
   if (input.bot.larkUserOwnerFallback === false) return { use: 'none', refusal: 'switch_off' };
   if (triggerUserAuthApplies(input.bot.triggerUserAuth, 'lark-cli')) return { use: 'none', refusal: 'per_person_policy' };
+  // The original origin proof covers only the opening input. Once a later input
+  // cannot be represented by speakers (or recovery lost that history), the turn
+  // is no longer positively known to carry no other person.
+  if (turn.provenanceIncomplete) return { use: 'none', refusal: 'origin_unknown' };
   // Only origins positively known to carry no person fall back.
   const origin = botPrincipal ? undefined : originWithoutPerson(turn, lookups);
   if (origin && 'refusal' in origin) return { use: 'none', refusal: origin.refusal };
@@ -217,8 +224,9 @@ export function ownerActorTurnFallsBack(input: {
   turnId: string;
   principalOpenId: string | undefined;
   speakers: readonly TurnSpeaker[] | undefined;
+  provenanceIncomplete?: boolean;
 }): boolean {
-  if (!isOwnerActorTurnId(input.turnId)) return false;
+  if (!isOwnerActorTurnId(input.turnId) || input.provenanceIncomplete) return false;
   const policy = ownerFallbackPolicy(input.bot, input.session, input.ownerOpenId);
   return policy.ok && input.principalOpenId === policy.ownerOpenId && onlyOwnerSpoke(input.speakers, policy.ownerOpenId);
 }
@@ -226,11 +234,19 @@ export function ownerActorTurnFallsBack(input: {
 /** What a scheduled task records about the person it runs for. */
 export function scheduledTaskPersonOf(record: {
   kind: string;
-  task: { ownerOpenId?: string; ownerUnionId?: string; runAsClaim?: unknown; ownerAccess?: string };
+  state?: string;
+  task: {
+    ownerOpenId?: string; ownerUnionId?: string; runAsClaim?: unknown; ownerAccess?: string;
+  } & Parameters<typeof isAutoCompletedSchedule>[0];
 } | undefined): 'none' | 'person' | 'unknown' {
-  if (!record) return 'unknown';
-  // A delegated task runs for the person whose dispatch created it.
-  if (record.kind !== 'direct') return 'person';
+  if (!record || !['active', 'paused', 'completed'].includes(record.state ?? '')) return 'unknown';
+  // A revoked row is only a tombstone, never live authority. A completed row is
+  // valid only for the existing auto-completed one-shot/until-done completion exception.
+  if (record.state === 'completed' && !isAutoCompletedSchedule(record.task)) return 'unknown';
+  // Only a delegated task inherently runs for its dispatch's control person.
+  // Direct and migrated legacy rows both use their recorded creator/claim fields.
+  if (record.kind === 'delegated') return 'person';
+  if (record.kind !== 'direct' && record.kind !== 'legacy') return 'unknown';
   const { task } = record;
   return task.ownerOpenId || task.ownerUnionId || task.runAsClaim || task.ownerAccess ? 'person' : 'none';
 }
