@@ -95,6 +95,19 @@ describe('parseBotSelection', () => {
     expect(parseBotSelection('app_b', bots)).toBe(1);
   });
 
+  it('selects the current display name without changing the process identity', () => {
+    expect(parseBotSelection('Current name', [
+      { larkAppId: 'app_a', name: 'old-process-name', displayName: 'Current name' },
+    ])).toBe(0);
+  });
+
+  it('does not guess between identical display names', () => {
+    expect(parseBotSelection('Shared', [
+      { larkAppId: 'app_a', name: 'a', displayName: 'Shared' },
+      { larkAppId: 'app_b', name: 'b', displayName: 'Shared' },
+    ])).toBeUndefined();
+  });
+
   it('rejects unknown selections', () => {
     expect(parseBotSelection('botmux-9', bots)).toBeUndefined();
     expect(parseBotSelection('missing', bots)).toBeUndefined();

@@ -402,7 +402,7 @@ function applyOptionalBoolean(
 
 export function parseBotSelection(
   input: string,
-  bots: Array<{ larkAppId?: string; name?: unknown }>,
+  bots: Array<{ larkAppId?: string; name?: unknown; displayName?: unknown }>,
 ): number | undefined {
   const raw = input.trim();
   if (!raw) return undefined;
@@ -424,7 +424,10 @@ export function parseBotSelection(
   if (byConfiguredName >= 0) return byConfiguredName;
 
   const byProcessName = bots.findIndex((b, i) => botProcessName(b, i) === raw);
-  return byProcessName >= 0 ? byProcessName : undefined;
+  if (byProcessName >= 0) return byProcessName;
+  const displayed = bots.map((bot, index) => ({ bot, index }))
+    .filter(({ bot }) => typeof bot.displayName === 'string' && bot.displayName.trim() === raw);
+  return displayed.length === 1 ? displayed[0]!.index : undefined;
 }
 
 /**

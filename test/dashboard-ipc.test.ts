@@ -11410,6 +11410,33 @@ describe('PUT /api/bot-rename', () => {
     });
   });
 
+  it.each([null, 'Existing alias'])('preserves remote success and reports local sync failure with alias %j', async displayName => {
+    await withRenameServer(async (base, configPath) => {
+      const before = readFileSync(configPath, 'utf8');
+      const localSyncError = 'Remote rename succeeded; local configuration still needs repair.';
+      setBotRenamer(async name => ({ ok: true, name, displayName, localSyncError }));
+
+      const response = await fetch(`${base}/api/bot-rename`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'New name' }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        ok: true,
+        mode: 'feishu',
+        botName: displayName || 'New name',
+        larkBotName: 'New name',
+        displayName,
+        localSyncError,
+      });
+      // The remote publish already succeeded. Never execute the local-only
+      // fallback, which would overwrite the alias and claim the remote failed.
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+    });
+  });
+
   it('rejects empty and over-long names without calling the renamer', async () => {
     await withRenameServer(async (base, configPath) => {
       let called = 0;
