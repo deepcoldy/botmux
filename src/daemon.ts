@@ -12575,7 +12575,18 @@ async function handleSessionLifecycleSignal(req: IncomingMessage, res: ServerRes
     const signal = compaction ? 'claude-compaction-start' : 'session-ready';
     const controller = compaction ? undefined : controllerForSession(ds);
     const sessionCommand = controller?.nativeSignal(raw.runtimeBindingId, raw.nativeSessionId);
-    if (controller && !sessionCommand) return jsonRes(res, 200, { ok: true, ignored: 'runtime_scope_unproven' });
+    if (controller && !sessionCommand) {
+      // Silent until 2026-11-23: an UNBOUND signal (CLI launched without
+      // BOTMUX_RUNTIME_BINDING_ID) is refusable whenever the runtime is not
+      // settled — which is exactly what a restart looks like — and the worker
+      // then waits out its entire ready-gate fallback. Say so: otherwise the
+      // only visible symptom is `/restart` reporting a timeout with nothing
+      // anywhere to explain why the readiness signal never landed.
+      logger.warn(`[${sessionId.slice(0, 8)}] ${signal} signal dropped: runtime scope unproven`
+        + ` (binding=${typeof raw.runtimeBindingId === 'string' ? raw.runtimeBindingId.slice(0, 8) : 'unbound'}`
+        + `, source=${source ?? '?'})`);
+      return jsonRes(res, 200, { ok: true, ignored: 'runtime_scope_unproven' });
+    }
     const requestId = randomUUID();
     const ack = waitForSessionReadyAck(requestId, 2_000);
     try {
@@ -12692,7 +12703,15 @@ ipcRoute('POST', '/api/turn-idle', async (req, res) => {
     const controller = controllerForSession(ds);
     const sessionCommand = controller?.nativeSignal(raw.runtimeBindingId, raw.nativeSessionId,
       typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined, positiveInt(raw.originDispatchAttempt));
-    if (controller && !sessionCommand) return jsonRes(res, 200, { ok: true, ignored: 'runtime_scope_unproven' });
+    if (controller && !sessionCommand) {
+      // Same silent fence as /api/session-ready above: name the refusal so a
+      // dropped end-of-turn report is traceable instead of looking like the
+      // CLI never reported at all.
+      logger.warn(`[${sessionId.slice(0, 8)}] turn-idle signal dropped: runtime scope unproven`
+        + ` (binding=${typeof raw.runtimeBindingId === 'string' ? raw.runtimeBindingId.slice(0, 8) : 'unbound'}`
+        + `, turn=${typeof raw.originTurnId === 'string' ? raw.originTurnId.slice(0, 12) : '?'})`);
+      return jsonRes(res, 200, { ok: true, ignored: 'runtime_scope_unproven' });
+    }
     try {
       ds.worker.send({
         type: 'turn_idle',
