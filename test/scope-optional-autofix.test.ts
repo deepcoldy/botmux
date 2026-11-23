@@ -387,6 +387,22 @@ describe('ensureVcMeetingEventsSubscribed', () => {
     }
   });
 
+  it('logs a version readback warning as NOT published', async () => {
+    h.bot = vcBot();
+    h.probe.mockResolvedValue({ ok: true, missingVcEvents: ['vc.bot.meeting_invited_v1'], eventModeReady: true });
+    const versionWarning = '版本提交后复查又回到草稿';
+    h.automate.mockResolvedValue({ ok: true, subscribedEventCount: 3, versionId: 'v1', versionWarning });
+    const warn = vi.spyOn(logger, 'warn');
+    try {
+      await ensureVcMeetingEventsSubscribed(APP);
+      const line = warn.mock.calls.map(call => String(call[0])).find(message => message.includes('VC events auto-subscribed'))!;
+      expect(line).toContain('NOT published');
+      expect(line).toContain(versionWarning);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('degrades quietly when the read-only probe fails', async () => {
     h.bot = vcBot();
     h.probe.mockResolvedValue({ ok: false, reason: 'missing_session', message: 'no cached session' });

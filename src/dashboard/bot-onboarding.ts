@@ -74,6 +74,8 @@ export interface BotOnboardingPermission {
   skippedScopeCount?: number;
   /** 已提交发布的版本号 */
   versionId?: string;
+  /** 提交后回读仍是草稿或状态未知；有值时不能显示「已可使用 / 已提交发布」。 */
+  versionWarning?: string;
   /** 部分权限注册失败的告警 */
   scopeWarning?: string;
   eventWarning?: string;
@@ -2298,6 +2300,7 @@ export class BotOnboardingManager {
           scopeCount: auto.scopeCount,
           skippedScopeCount: auto.skippedScopeCount,
           versionId: auto.versionId,
+          versionWarning: auto.versionWarning,
           scopeWarning: auto.scopeWarning,
           eventWarning: auto.eventWarning,
           eventMode: auto.eventMode,

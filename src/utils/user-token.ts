@@ -1075,9 +1075,10 @@ export function callbackOrigin(url: string): 'own' | 'expired' | 'unknown' {
  * 返回空串 = 没缺（或旧 pending 文件没记录申请了哪些 scope，无从对照）。
  */
 async function describeCallbackMissingScopes(pending: PendingLogin, grantedScope: string | undefined): Promise<string | undefined> {
+  // 只有响应没携带 scope 字段时才无从对照。显式空串是「一项都没授予」，
+  // 必须继续枚举缺失项，不能和字段缺省一样静默跳过。
+  if (grantedScope == null) return undefined;
   const granted = new Set(splitScopes(grantedScope));
-  // 响应里压根没带 scope 字段时无从对照，宁可不说，也不把全部申请项误报成缺失。
-  if (granted.size === 0) return undefined;
   const missing = (pending.scopes ?? []).filter(scope => !granted.has(scope));
   if (missing.length === 0) return undefined;
   const review = await lookupAppVersionReview(pending.appId, pending.appSecret, pending.brand);

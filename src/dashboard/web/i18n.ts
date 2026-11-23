@@ -250,6 +250,7 @@ const zh = {
   'botOnboarding.permissionManual': '权限未能自动配置，请手动完成以下步骤：',
   // 版本停在「审核中」：要明确说是在等企业管理员，不然用户会以为 botmux 卡住了。
   'botOnboarding.completedReviewPending': '「{name}」已创建，正在等待企业管理员审核',
+  'botOnboarding.completedVersionWarning': '「{name}」已创建，版本发布状态待确认',
   'botOnboarding.permissionReviewPending': '新版本 {version} 已提交，正在等待企业管理员审核{approvers}。审核通过前新申请的权限不会生效——这不是 botmux 卡住，无需重复提交；审批进度可在飞书「审批」里查看。{stuckHint}',
   'botOnboarding.permissionReviewPendingNoVersion': '新版本已提交，正在等待企业管理员审核{approvers}。审核通过前新申请的权限不会生效——这不是 botmux 卡住，无需重复提交；审批进度可在飞书「审批」里查看。{stuckHint}',
   'botOnboarding.permissionReviewApprovers': '（审批人：{names}）',
@@ -5220,6 +5221,7 @@ const en: Record<keyof typeof zh, string> = {
   'botOnboarding.permissionVersion': 'Submitted version {version}.',
   'botOnboarding.permissionManual': 'Permissions could not be auto-configured. Complete these steps manually:',
   'botOnboarding.completedReviewPending': '“{name}” was created and is waiting for enterprise admin review',
+  'botOnboarding.completedVersionWarning': '“{name}” was created, but its version publishing status needs confirmation',
   'botOnboarding.permissionReviewPending': 'Version {version} was submitted and is waiting for enterprise admin review{approvers}. Newly requested permissions take effect only after approval — botmux is not stuck and there is no need to resubmit. Track the review in Feishu Approval. {stuckHint}',
   'botOnboarding.permissionReviewPendingNoVersion': 'A new version was submitted and is waiting for enterprise admin review{approvers}. Newly requested permissions take effect only after approval — botmux is not stuck and there is no need to resubmit. Track the review in Feishu Approval. {stuckHint}',
   'botOnboarding.permissionReviewApprovers': ' (approvers: {names})',

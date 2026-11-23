@@ -2194,7 +2194,15 @@ export async function automateOpenPlatformSetup(
           const review = await settleCommittedVersionReview(
             postJson, options.appId, versionId, after, options.reviewSettleDelaysMs ?? DEFAULT_REVIEW_SETTLE_DELAYS_MS,
           );
-          if (review.inReview) {
+          if (review.versionStatus === CONSOLE_VERSION_STATUS_DRAFT) {
+            // 人工可能在复查窗口内撤回。最终已回到草稿时不能沿用首读的 committed 结论，
+            // 更不能保留提交前的「自动通过」预判，否则又会变成纯 ready 的假绿灯。
+            versionWarning =
+              `版本 ${review.appVersion ?? versionId} 提交后复查又回到「未提交审核」草稿（可能刚被撤回）：`
+              + '请到开放平台「版本管理」确认并重新申请发布';
+            approvalAutoPassed = false;
+            approvalHumanApprovers = undefined;
+          } else if (review.versionStatus === CONSOLE_VERSION_STATUS_IN_REVIEW) {
             versionPendingReview = true;
             pendingReviewAppVersion = review.appVersion;
             approvalAutoPassed = false;
@@ -3602,8 +3610,11 @@ function findConsoleVersion(
 }
 
 /**
- * 刚提交的版本是不是**停在审核中**。首读是审核中时按 `delaysMs` 再复查，免审版本会在
+ * 刚提交的版本在复查窗口结束时的状态。首读是审核中时按 `delaysMs` 再复查，免审版本会在
  * 这几秒里自己上线；复查读失败就以最后一次观察为准（那次就是审核中）。
+ *
+ * 必须带回最终的 `versionStatus`，不能只回 `inReview`：人工在窗口内撤回后版本会回到
+ * 草稿（0），调用方要据此保留「未提交」告警，而不是把首读的 committed 当成最终事实。
  */
 async function settleCommittedVersionReview(
   postJson: OpenPlatformPostJson,
@@ -3611,7 +3622,7 @@ async function settleCommittedVersionReview(
   versionId: string,
   firstReadback: unknown,
   delaysMs: readonly number[],
-): Promise<{ inReview: boolean; appVersion?: string }> {
+): Promise<{ versionStatus: unknown; appVersion?: string }> {
   let record = findConsoleVersion(firstReadback, versionId);
   for (const delay of delaysMs) {
     if (record?.versionStatus !== CONSOLE_VERSION_STATUS_IN_REVIEW) break;
@@ -3623,7 +3634,7 @@ async function settleCommittedVersionReview(
     }
   }
   return {
-    inReview: record?.versionStatus === CONSOLE_VERSION_STATUS_IN_REVIEW,
+    versionStatus: record?.versionStatus,
     ...(record?.appVersion ? { appVersion: record.appVersion } : {}),
   };
 }

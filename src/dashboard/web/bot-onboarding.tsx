@@ -36,6 +36,8 @@ type OnboardingPermission = {
   scopeCount?: number;
   skippedScopeCount?: number;
   versionId?: string;
+  /** 提交后回读仍是草稿或状态未知；有值时不能显示已发布/已可使用。 */
+  versionWarning?: string;
   scopeWarning?: string;
   /** 与 ok 独立：权限/发版全绿也可能没写上 redirect 白名单（见服务端同名字段注释）。 */
   redirectConfigured?: boolean;
@@ -188,10 +190,14 @@ export function statusText(job: OnboardingJob): string {
     if (job.registrationMode === 'local') {
       return t('botOnboarding.completedLocal', { name: job.appName ?? t('botOnboarding.botFallback') });
     }
-    // 版本卡在企业审核时不能说「已可使用」：权限（甚至应用本身）要等审批通过才生效。
-    return waitingForEnterpriseReview(job.permission)
-      ? t('botOnboarding.completedReviewPending', { name: job.appName ?? t('botOnboarding.botFallback') })
-      : t('botOnboarding.completed', { name: job.appName ?? t('botOnboarding.botFallback') });
+    // 审核中、或复查发现仍是草稿/状态未知时，都不能说「已可使用」。
+    if (waitingForEnterpriseReview(job.permission)) {
+      return t('botOnboarding.completedReviewPending', { name: job.appName ?? t('botOnboarding.botFallback') });
+    }
+    if (job.permission?.ok && job.permission.versionWarning) {
+      return t('botOnboarding.completedVersionWarning', { name: job.appName ?? t('botOnboarding.botFallback') });
+    }
+    return t('botOnboarding.completed', { name: job.appName ?? t('botOnboarding.botFallback') });
   }
   if (job.status === 'failed') {
     if (job.appId) return t('botOnboarding.partialFailureTitle');
@@ -396,7 +402,7 @@ export function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Elem
       parts.push(t('botOnboarding.permissionSkipped', { count: permission.skippedScopeCount }));
     }
     // 「已提交发布版本 x」在等审核时会被读成「已经生效」，改由下面那条审核提示说清楚。
-    if (permission.versionId && !permission.versionPendingReview) {
+    if (permission.versionId && !permission.versionPendingReview && !permission.versionWarning) {
       parts.push(t('botOnboarding.permissionVersion', { version: permission.versionId }));
     }
     return (
@@ -404,6 +410,9 @@ export function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Elem
         <p className="hint-ok">{parts.join(' ')}</p>
         {permission.versionPendingReview ? (
           <p className="hint-warn" data-onboarding-review-pending="">{reviewPendingText(permission)}</p>
+        ) : null}
+        {permission.versionWarning ? (
+          <p className="hint-warn" data-onboarding-version-warning="">{permission.versionWarning}</p>
         ) : null}
         {permission.scopeWarning ? <p className="hint-warn">{permission.scopeWarning}</p> : null}
         <RedirectWarning permission={permission} />

@@ -69,6 +69,16 @@ describe('onboarding result when the version waits for enterprise review', () =>
     })));
   });
 
+  it('shows a version readback warning instead of published or ready', () => {
+    const versionWarning = '版本 1.0.1 提交后复查又回到未提交草稿';
+    const job = completed({ ok: true, scopeCount: 9, versionId: 'v-new', versionWarning });
+    const view = render(job);
+    expect(view.all).toContain(versionWarning);
+    expect(view.all).not.toContain(t('botOnboarding.permissionVersion', { version: 'v-new' }));
+    expect(statusText(job)).not.toBe(statusText(completed({ ok: true, scopeCount: 9, versionId: 'v-new' })));
+    expect(statusText(job)).toContain('botmux-7');
+  });
+
   it('keeps the normal summary when nothing waits for review', () => {
     const ok = completed({ ok: true, scopeCount: 120, versionId: 'opaque-version-id' });
     const okView = render(ok);

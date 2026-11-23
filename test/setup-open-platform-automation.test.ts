@@ -1422,7 +1422,7 @@ describe('提交后停在「企业管理员审核中」', () => {
   const flow = (nodes: Array<Record<string, unknown>>) => ({ code: 0, data: { applyInstanceInfo: { applyNodes: nodes } } });
 
   /** `afterCommit` 是提交后每次回读 v-new 的 console versionStatus（用尽后沿用最后一个）。 */
-  async function run(label: string, afterCommit: number[], settle: readonly number[] = [0, 0], failStatus = false) {
+  async function run(label: string, afterCommit: number[], settle: readonly number[] = [0, 0], failStatus = false, humanApproval = false) {
     const dir = mkdtempSync(join(tmpdir(), `review-${label}-`));
     const sessionFile = join(dir, 'feishu-session.json');
     writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
@@ -1441,8 +1441,11 @@ describe('提交后停在「企业管理员审核中」', () => {
         return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
       }
       if (path.includes('/privilege/all/')) return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
-      // 审批预判说「自动通过」——线上卡住的版本当时也是这么预判的。
-      if (path.includes('/approval_nodes/get/')) return Response.json(flow([{ nodeName: '仅协作者免审策略', nodeType: '自动通过', nodeUser: [] }]));
+      if (path.includes('/approval_nodes/get/')) {
+        return Response.json(flow(humanApproval
+          ? [{ nodeName: '安全审批', nodeType: '', nodeUser: [{ approver: { name: '审批人A', id: 'u1' } }] }]
+          : [{ nodeName: '仅协作者免审策略', nodeType: '自动通过', nodeUser: [] }]));
+      }
       if (path.includes('/publish/commit/')) { committed = true; return Response.json({ code: 0, data: { isOk: true } }); }
       if (path.includes('/app_version/list/')) {
         const versions: Array<Record<string, unknown>> = [{ appVersion: '1.0.0', versionId: 'live', versionStatus: 2 }];
@@ -1485,6 +1488,25 @@ describe('提交后停在「企业管理员审核中」', () => {
     // 只读：不撤回、不重提。
     expect(calls.filter(p => p.includes('/publish/commit/'))).toHaveLength(1);
     expect(calls.some(p => p.includes('/cancel_commit/'))).toBe(false);
+  });
+
+  it('复查发现版本已回到草稿时不报纯 ready 或自动通过', async () => {
+    const { r, readsAfterCommit } = await run('withdrawn', [1, 0]);
+    expect(r.ok, `ok=false ${(r as any).message}`).toBe(true);
+    if (!r.ok) return;
+    expect(readsAfterCommit).toBe(2);
+    expect(r.versionPendingReview).toBeUndefined();
+    expect(r.versionWarning).toBeDefined();
+    expect(r.approvalAutoPassed).toBe(false);
+    expect(classifySetupOpenPlatformOutcome(r).status).toBe('ready_with_warnings');
+  });
+
+  it('复查撤回后不再携带提交前的人工审批预判', async () => {
+    const { r } = await run('withdrawn-human', [1, 0], [0, 0], false, true);
+    expect(r.ok, `ok=false ${(r as any).message}`).toBe(true);
+    if (!r.ok) return;
+    expect(r.versionWarning).toBeDefined();
+    expect(r.approvalHumanApprovers).toBeUndefined();
   });
 
   it('进度回调出错不会把「审核中」改判成「回读失败」', async () => {

@@ -1014,7 +1014,14 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
       },
     });
     if (result.ok) {
-      logger.info(`[${larkAppId}] VC events auto-subscribed: ${result.subscribedEventCount} events, version ${result.pendingReviewAppVersion ?? result.versionId ?? 'n/a'} ${result.versionPendingReview ? 'submitted, awaiting enterprise review (events take effect after approval)' : 'published'}`);
+      const versionState = result.versionWarning
+        ? `NOT published (${result.versionWarning})`
+        : result.versionPendingReview
+          ? 'submitted, awaiting enterprise review (events take effect after approval)'
+          : 'published';
+      const line = `[${larkAppId}] VC events auto-subscribed: ${result.subscribedEventCount} events, version ${result.pendingReviewAppVersion ?? result.versionId ?? 'n/a'} ${versionState}`;
+      if (result.versionWarning) logger.warn(line);
+      else logger.info(line);
       return;
     }
     // Automation failed (session expired mid-run / api error). Log; DM the admin

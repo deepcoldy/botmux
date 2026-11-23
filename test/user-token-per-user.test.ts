@@ -574,6 +574,18 @@ describe('handleCallbackUrl — scopes the grant left out', () => {
     expect(msg).not.toContain('审核');
   });
 
+  it('treats an explicitly empty scope as granting none of the requested scopes', async () => {
+    const { msg, detailed, calls } = await callbackGranting(() => '', inReview);
+    expect(msg).toContain('✅');
+    expect(detailed.warning).toBeDefined();
+    expect(files.has(perUserPath(APP, ALICE))).toBe(true);
+    for (const scope of [
+      'im:message:readonly', 'im:resource', 'offline_access',
+      'docx:document:create', 'im:feed.flag:read',
+    ]) expect(msg).toContain(scope);
+    expect(calls.some(url => url.includes('/app_versions'))).toBe(true);
+  });
+
   it.each([
     ['the token response carries no scope field', { grant: () => undefined, legacyPending: false }],
     ['the pending file predates the scopes record', {

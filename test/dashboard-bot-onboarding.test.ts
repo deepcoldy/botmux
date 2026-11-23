@@ -945,6 +945,26 @@ describe('BotOnboardingManager', () => {
     }
   });
 
+  it('keeps a version readback warning in the terminal permission snapshot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-version-warning-'));
+    const versionWarning = '版本提交后复查又回到草稿';
+    try {
+      const manager = new BotOnboardingManager({
+        botsJsonPath: join(dir, 'bots.json'),
+        registerApp: async () => ({ ok: true, appId: 'cli_warning', appSecret: 's', brand: 'feishu' }),
+        validateCredentials: async () => ({ ok: true }),
+        automateOpenPlatform: async () => ({ ...autoOk(), versionId: 'v-new', versionWarning }),
+      });
+      const job = manager.start({ registrationMode: 'sdk', cliId: 'claude-code', workingDir: '~' });
+      await job.done;
+      expect(manager.get(job.id)?.permission).toMatchObject({
+        ok: true, versionId: 'v-new', versionWarning,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('does not log a review wait when the version went live', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-live-'));
     const info = vi.spyOn(logger, 'info');
