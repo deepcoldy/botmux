@@ -528,7 +528,7 @@ v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」�
 | `cardFooterExtension` | 在用量后面追加几段自定义文字，内容来自你配置的命令：`{"command": "<命令>", "refreshSeconds": 60}`。命令交给 `/bin/sh -c` 执行，每个 bot 跑一份；`refreshSeconds` 默认 60，范围 10–3600。输出按行（或 `{"segments": [...]}`）取最多 4 段，每段最多 40 字。命令超过 3 秒算失败，失败时沿用上次结果，连续 10 分钟没成功就不显示。见[实时流式卡片](/cards) |
 | `brandLabel` | 卡片底部签名。不填显示默认的 `botmux` 链接；`""` 隐藏；其它文字原样显示（支持 markdown）。Dashboard「全局设置 → 飞书卡片」里的总开关关掉时，所有 bot 都不显示签名 |
 | `replyCardActions` | 普通答复卡上显示一个紧凑的操作菜单（打开终端 / 切换模型 / 关闭会话）。默认关闭 |
-| `askOptionLayout` | `botmux ask` 选项按钮的排布：`compact`（默认，自动换行）或 `vertical`（每行一个，长选项更好读） |
+| `askOptionLayout` | 已不影响排版：提问卡现在每个选项一行勾选框。旧值 `compact` / `vertical` 仍可保留，不会报错 |
 | `writableTerminalLinkInCard` | `true` 时卡片里直接放可写终端链接（看得到卡片的人都能操作终端）。默认藏在「获取写权限」按钮后面，只私发给点击的人 |
 | `goalStatusCard` | `true` 时，Codex / TRAE 会话设定原生目标后发一张目标状态卡，原地更新状态和 CLI 累计时长；默认关闭。静默、私有回复、文档、会议等会话不显示 |
 | `privateCard` | `true` 时 `/card` 只发给管理员可见的私有卡片，只在普通群有效，且不会实时刷新 |
