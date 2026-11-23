@@ -269,6 +269,25 @@ describe('downloadMessageResource wiring', () => {
     expect(expired).toBeInstanceOf(UserTokenMissingError);
     expect(expired.message).toContain('401');
   });
+  // 判定缺授权用的 scope 必须在下载请求发出前读取：下载期间另一流程可能换发 token
+  // （例如本人恰好在此刻完成 /login --scope im:resource），若失败后才读盘，拿到的是新
+  // token 的 scope，本次 403 明明缺授权却不会给出授权引导。
+  it('judges the missing-scope prompt from scopes snapshotted before the download', async () => {
+    const output = await outputPath(); mocks.request.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    mocks.userToken.mockResolvedValue('test-user-token');
+    let tokenRefreshed = false;
+    mocks.storedScopes.mockImplementation(() => tokenRefreshed
+      ? ['im:message:readonly', 'im:resource', 'offline_access']
+      : ['im:message:readonly', 'offline_access']);
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      tokenRefreshed = true;
+      return new Response('{"code":99991679}', { status: 403 });
+    });
+    const error = await downloadMessageResource('cli_test', 'om_test', 'file_test', 'file', output, 'ou_sender').catch(err => err);
+    expect(error).toBeInstanceOf(UserTokenMissingError);
+    expect(error.message).toContain('/login --scope im:resource');
+    expect(mocks.storedScopes.mock.invocationCallOrder[0]).toBeLessThan(fetchMock.mock.invocationCallOrder[0]);
+  });
   it('asks for the resource scope when no user token exists at all', async () => {
     const output = await outputPath(); mocks.request.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
     mocks.userToken.mockResolvedValue(null);
