@@ -7839,7 +7839,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             trustedCaller: activeIdentity.caller ?? null,
             identityTurnId: activeIdentity.identityTurnId ?? activeIdentity.turnId,
             ...(activeIdentity.speakers?.length ? { speakers: [...activeIdentity.speakers] } : {}),
-            ...(activeIdentity.provenanceIncomplete ? { provenanceIncomplete: true as const } : {}),
+            ...(activeIdentity.provenanceIncomplete ? { provenanceIncomplete: true } : {}),
           } : {}),
           ...(readIsolationOriginChannelId
             ? { originChannelId: readIsolationOriginChannelId }
@@ -8072,7 +8072,7 @@ function adoptInitialActiveTurn(parsed: {
     controller: parsed.trustedController,
     // The CLI-writable marker cannot prove the complete speaker/input history.
     // Never let a restored turn regain owner fallback by omitting that history.
-    ...(fromPidMarker ? { provenanceIncomplete: true as const } : {}),
+    ...(fromPidMarker ? { provenanceIncomplete: true } : {}),
   });
   activeTurnAuthority.markStarted({
     turnId: parsed.turnId,
@@ -8134,13 +8134,15 @@ function adoptDisplacedActiveTurn(parsed: {
   });
 }
 
-/** A same-process duplicate bind is harmless only when the exact started
- * authority is already in memory. A matching currentBotmuxTurnId alone is not
- * enough: init may have set it before marker authority restoration completed. */
+/** Same-turn marker recovery is for a persistent CLI reattach, never a fresh
+ * spawn (which simply has not built its first authority yet). A duplicate bind
+ * is harmless only when the exact authority is already in memory (reserved or
+ * started). Callers separately exempt the exact last release, which must
+ * advance its queue rather than resurrect the released turn. */
 function activeAuthorityMatchesMarker(parsed: { turnId: string; dispatchAttempt?: unknown }): boolean {
   const active = activeTurnAuthority.snapshot();
   const dispatchAttempt = typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined;
-  return active?.started === true && active.turnId === parsed.turnId
+  return !!active && active.turnId === parsed.turnId
     && active.dispatchAttempt === dispatchAttempt;
 }
 
@@ -8172,7 +8174,7 @@ function writeCliPidMarker(): void {
           try {
             const raw = readFileSync(markerPath, 'utf-8');
             const parsed = JSON.parse(raw);
-            if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || !activeAuthorityMatchesMarker(parsed))) {
+            if (parsed && typeof parsed.turnId === 'string' && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
               if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
                 // Disk holds an older turn that worker memory has already retired/advanced past.
                 // Do not adopt it back; allow write to overwrite disk with currentBotmuxTurnId.
@@ -8288,7 +8290,7 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
     withPidMarkerLock(markerPath, () => {
       const raw = readFileSync(markerPath, 'utf-8');
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || !activeAuthorityMatchesMarker(parsed))) {
+      if (parsed && typeof parsed.turnId === 'string' && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
         if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
           // Disk holds an older turn that has already terminated; do not re-adopt it.
         } else if (!currentBotmuxTurnId || parsed.turnId === currentBotmuxTurnId) {
@@ -8390,7 +8392,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
       withPidMarkerLock(markerPath, () => {
         const raw = readFileSync(markerPath, 'utf-8');
         const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || !activeAuthorityMatchesMarker(parsed))) {
+        if (parsed && typeof parsed.turnId === 'string' && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
           if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
             // Disk holds an older turn that worker memory has already retired/advanced past.
           } else {

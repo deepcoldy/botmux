@@ -145,9 +145,13 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
     }));
     scope.currentBotmuxTurnId = 'trg_external';
 
-    // A complete, exact, started in-memory authority makes a duplicate bind a no-op.
+    // Exact reserved (pre-write) and started authorities are both legitimate
+    // same-process states: neither may be mistaken for a half-restored one.
     const authority = scope.activeTurnAuthority as ActiveTurnAuthority;
     authority.reserve({ turnId: 'trg_external' });
+    bind();
+    expect(authority.snapshot()?.started).toBe(false);
+    expect(authority.identity().provenanceIncomplete).toBeUndefined();
     authority.markStarted({ turnId: 'trg_external' });
     bind();
     expect(authority.identity().provenanceIncomplete).toBeUndefined();

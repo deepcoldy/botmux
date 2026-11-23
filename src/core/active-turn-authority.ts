@@ -90,6 +90,9 @@ export function sameTrustedPrincipal(
 export class ActiveTurnAuthority {
   private active?: ActiveTurnAuthoritySnapshot;
   private executionActive = false;
+  /** Exact turn most recently released, used to distinguish a normal release
+   * from a same-turn authority restoration that lost its in-memory history. */
+  private lastReleased?: ActiveTurnAuthoritySnapshot;
 
   constructor(private readonly onActiveEnvelopeChanged?: (previousTurnId: string, turnId: string) => void) {}
 
@@ -115,6 +118,13 @@ export class ActiveTurnAuthority {
     return [...(this.active?.speakers ?? [])];
   }
 
+  /** Whether this exact turn/attempt is the one most recently released. */
+  matchesLastRelease(identity: { turnId?: string; dispatchAttempt?: unknown }): boolean {
+    const dispatchAttempt = typeof identity.dispatchAttempt === 'number' ? identity.dispatchAttempt : undefined;
+    return !!identity.turnId && this.lastReleased?.turnId === identity.turnId
+      && this.lastReleased.dispatchAttempt === dispatchAttempt;
+  }
+
   identity(): TurnAuthorityIdentity {
     if (!this.active) return {};
     return {
@@ -135,6 +145,7 @@ export class ActiveTurnAuthority {
     if (this.active) {
       return !this.blocks(identity);
     }
+    this.lastReleased = undefined;
     this.active = Object.freeze({
       turnId: identity.turnId,
       ...(identity.identityTurnId ? { identityTurnId: identity.identityTurnId } : {}),
@@ -270,6 +281,7 @@ export class ActiveTurnAuthority {
 
   clear(): ActiveTurnAuthoritySnapshot | undefined {
     const prior = this.active;
+    if (prior) this.lastReleased = prior;
     this.active = undefined;
     this.executionActive = false;
     return prior;

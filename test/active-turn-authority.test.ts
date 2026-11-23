@@ -296,6 +296,21 @@ describe('ActiveTurnAuthority', () => {
       turnId: 'om_restored', identityTurnId: 'trg_external', provenanceIncomplete: true,
     });
   });
+
+  it('remembers only the exact last release until a new execution reserves', () => {
+    const authority = new ActiveTurnAuthority();
+    const first = { turnId: 'om_first' };
+    authority.reserve(first);
+    authority.markStarted(first);
+    expect(authority.matchesLastRelease(first)).toBe(false);
+    authority.releaseExact(first);
+    expect(authority.matchesLastRelease(first)).toBe(true);
+    expect(authority.matchesLastRelease({ turnId: 'om_first', dispatchAttempt: null })).toBe(true);
+    expect(authority.matchesLastRelease({ turnId: 'om_first', dispatchAttempt: 2 })).toBe(false);
+    expect(authority.matchesLastRelease({ turnId: 'om_other', dispatchAttempt: 1 })).toBe(false);
+    authority.reserve({ turnId: 'om_next' });
+    expect(authority.matchesLastRelease(first)).toBe(false);
+  });
 });
 
 for (const caller of [humanA, { ...humanA, requestUserOpenId: 'ou_b', requestUserUnionId: 'on_b' }]) {

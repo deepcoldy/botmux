@@ -466,6 +466,28 @@ describe('queued type-ahead advance skips turns whose terminal already went out'
     });
   });
 
+  it('does not re-adopt a just-released current turn before promoting the queued successor', () => {
+    withMarker(marker => {
+      const h = harness({ markerPath: marker });
+      startTurn(h, 'om_A');
+      h.queuedTypeAheadTurns.push({ turnId: 'om_B' });
+      h.writeCliPidMarker();
+      h.releaseActiveTurnAuthority('prompt_ready');
+      expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+      expect(h.currentBotmuxTurnId).toBe('om_A');
+      expect(JSON.parse(readFileSync(marker, 'utf8')).turnId).toBe('om_A');
+
+      // A released turn is not a half-restored one: sync must leave it alone so
+      // the ordinary in-memory queue can advance instead of re-adopting A.
+      expect(h.syncQueuedTurnsFromMarkerDisk()).toBe(false);
+      expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+      expect(h.advanceQueuedTypeAheadTurn('prompt_ready')).toBe(true);
+      expect(h.currentBotmuxTurnId).toBe('om_B');
+      expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_B');
+      expect(h.queuedTypeAheadTurns).toEqual([]);
+    });
+  });
+
   for (const status of ['completed', 'cancelled'] as const) {
     it(`does not refill an attempt-qualified record whose generic-key terminal is ${status}`, () => {
       withMarker(marker => {
