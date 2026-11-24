@@ -595,6 +595,9 @@ export interface DaemonSession {
    *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
    *  with the CLI). In-memory only. */
   backgroundTaskCount?: number;
+  /** A completed turn whose CoT message is left open while background tasks
+   *  run; closing it renders 「任务已完成」. See finalizeOrHoldCotMessage. */
+  cotHeldForBackground?: { turnId: string; dispatchAttempt?: number };
   /** Last screen_update's away-summary state (waiting or blurred). Automatic
    *  compact must not restore focus and cancel Claude's one-shot recap.
    *  In-memory; absent from older workers means unknown/false. */

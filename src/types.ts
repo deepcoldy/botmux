@@ -3119,6 +3119,9 @@ export type WorkerToDaemonBase =
        *  reached a final assistant turn; it does not imply any Lark fallback
        *  message was posted (silent/suppressed turns also complete). */
       status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
+      /** Background tasks (agents, workflows, shells, monitors) still running
+       *  when a `completed` turn ended. Absent means none. */
+      backgroundTasks?: number;
       errorCode?: string;
       /** With `errorCode: 'safe_composer_required'` only: why the worker
        *  refused the unattended maintenance write. Absent from older workers;
