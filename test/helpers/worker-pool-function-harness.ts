@@ -54,7 +54,8 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
   if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
-    'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed'].includes(key)) {
+    'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
+    'releaseHeldCotMessage', 'finalizeOrHoldCotMessage'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];
