@@ -457,6 +457,7 @@ export type BotDefaultsRow = {
     /** One command can run as another speaker of a multi-person turn. Absent = off. */
     allowSpeakerSwitch?: boolean;
     gitHost?: string;
+    gitCommitIdentity?: boolean;
     gitTokenExchangeUrl?: string;
   } | null;
   /** lark-cli 应用绑定开关（默认开启）。默认开启以当前 Bot 应用凭证调用并支持 --profile 透传；设为 false 显式关闭。 */

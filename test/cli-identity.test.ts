@@ -36,6 +36,7 @@ import {
   installIdentityWrapper,
   identityWrapperInstalled,
   renderGitAskpassScript,
+  renderGitCommitWrapper,
   installGitAskpass,
   gitIdentityConfigEnv,
   gitIdentityConfigPairs,
@@ -49,6 +50,56 @@ beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'botmux-cli-identity-')); })
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 const SESSION = 'sess-abc123';
+
+describe('per-turn git commit identity', () => {
+  it('looks up each commit, preserves authors on replay and refuses an unverified writer', () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const repo = join(dir, 'repository');
+    const actor = join(dir, 'current actor');
+    const wrapper = join(dir, 'git');
+    writeFileSync(wrapper, renderGitCommitWrapper(realGit, ['cat', actor]), { mode: 0o755 });
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1' };
+    const git = (...args: string[]) => execFileSync(wrapper, ['-C', repo, ...args],
+      { env, encoding: 'utf8' }).trim();
+    const identity = () => git('log', '-1', '--format=%an <%ae> | %cn <%ce>');
+    execFileSync(realGit, ['init', '-q', '-b', 'main', repo], { env });
+    git('config', 'user.name', 'Host');
+    git('config', 'user.email', 'host@example.org');
+    git('config', 'author.email', 'host-author@example.org');
+    git('config', 'committer.email', 'host-committer@example.org');
+    writeFileSync(actor, 'one@example.org');
+    git('commit', '--allow-empty', '-m', 'one');
+    expect(identity()).toBe('one <one@example.org> | one <one@example.org>');
+    git('checkout', '-qb', 'topic');
+    writeFileSync(actor, 'two@example.org');
+    writeFileSync(join(repo, 'change'), 'two');
+    git('add', 'change');
+    git('commit', '-m', 'two');
+    expect(identity()).toBe('two <two@example.org> | two <two@example.org>');
+    git('checkout', '-q', 'main');
+    writeFileSync(actor, 'one@example.org');
+    git('cherry-pick', 'topic');
+    expect(identity()).toBe('two <two@example.org> | one <one@example.org>');
+    git('-c', 'user.email=explicit@example.org', 'commit', '--allow-empty',
+      '--author=Guest <guest@example.org>', '-m', 'override');
+    expect(identity()).toBe('Guest <guest@example.org> | one <explicit@example.org>');
+    const head = git('rev-parse', 'HEAD');
+    rmSync(actor);
+    expect(spawnSync(wrapper, ['-C', repo, 'commit', '--allow-empty', '-m', 'refused'], { env }).status).toBe(77);
+    expect(git('status', '--porcelain')).toBe('');
+    expect(git('rev-parse', 'HEAD')).toBe(head);
+  });
+
+  it('installs the wrapper only for opted-in sessions and removes it on respawn', () => {
+    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH };
+    const policy = { enabled: true, tools: ['bytedcli' as const], gitCommitIdentity: true };
+    prepareTriggerUserCliEnv(env, dir, SESSION, policy, () => {}, 'single');
+    const wrapper = join(env.BOTMUX_IDENTITY_BIN!, 'git');
+    expect(readFileSync(wrapper, 'utf8')).toContain('--git-actor-email');
+    prepareTriggerUserCliEnv(env, dir, SESSION, { ...policy, gitCommitIdentity: false }, () => {}, 'single');
+    expect(existsSync(wrapper)).toBe(false);
+  });
+});
 
 describe('renderIdentityEnv', () => {
   it('emits the pair lark-cli needs — token alone makes it refuse outright', () => {

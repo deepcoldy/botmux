@@ -178,6 +178,12 @@ describe('tokenStoreProtection', () => {
 // rather than compiled in — which means the parser is the only thing standing
 // between a typo and a broken (or unsafe) git setup.
 describe('git attribution settings', () => {
+  it('requires explicit opt-in for per-turn commit identity', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true })?.gitCommitIdentity).toBeUndefined();
+    expect(parseTriggerUserAuthConfig({ enabled: true, gitCommitIdentity: true })?.gitCommitIdentity).toBe(true);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, gitCommitIdentity: 'false' })).toThrow(/gitCommitIdentity/);
+  });
+
   it('accepts a bare hostname and an https endpoint', () => {
     const c = parseTriggerUserAuthConfig({
       enabled: true,

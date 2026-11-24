@@ -2198,6 +2198,49 @@ export function renderGitAskpassScript(bytedcliPath: string, exchangeUrl?: strin
   ].join('\n');
 }
 
+const GIT_COMMIT_WRAPPER_MARKER = '# botmux trigger-user git commit identity';
+
+/** Parse global options in a function so exec receives the original argv. */
+export function renderGitCommitWrapper(realGit: string, resolver: readonly string[]): string {
+  return [
+    '#!/bin/sh',
+    GIT_COMMIT_WRAPPER_MARKER,
+    `real_git=${shellSingleQuote(realGit)}`,
+    // Role-specific config outranks user.* even across config scopes. Capture
+    // explicit user.* options before overriding the host's four role defaults.
+    'capture_user_config() {',
+    '  case "$1" in -c) pair=$2 ;; *) pair=${1#--config-env=} ;; esac',
+    '  case "${pair%%=*}" in',
+    '    [uU][sS][eE][rR].[eE][mM][aA][iI][lL]) override_email=$("$real_git" "$@" config --get user.email) || exit 1 ;;',
+    '    [uU][sS][eE][rR].[nN][aA][mM][eE]) override_name=$("$real_git" "$@" config --get user.name) || exit 1 ;;',
+    '  esac',
+    '}',
+    'unset override_name override_email',
+    'needs_actor() {',
+    '  while [ "$#" -gt 0 ]; do',
+    '    case "$1" in',
+    '      -c) [ "$#" -ge 2 ] || return 1; capture_user_config -c "$2"; shift 2 ;;',
+    '      --config-env=*) capture_user_config "$1"; shift ;;',
+    '      --config-env) [ "$#" -ge 2 ] || return 1; capture_user_config "--config-env=$2"; shift 2 ;;',
+    '      -C|--git-dir|--work-tree|--namespace|--super-prefix|--attr-source) [ "$#" -ge 2 ] || return 1; shift 2 ;;',
+    '      -*) shift ;;',
+    '      commit|commit-tree|merge|cherry-pick|revert|rebase|am|pull)',
+    '        case "$#:${2-}" in 2:--abort|2:--quit|2:-h|2:--help) return 1 ;; esac',
+    '        return 0 ;;',
+    '      *) return 1 ;;',
+    '    esac',
+    '  done',
+    '  return 1',
+    '}',
+    'if ! needs_actor "$@"; then exec "$real_git" "$@"; fi',
+    `email="$(${resolver.map(shellSingleQuote).join(' ')})" || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    'name=${override_name-${email%@*}}',
+    'email=${override_email-$email}',
+    'exec "$real_git" -c "user.name=$name" -c "user.email=$email" -c "author.name=$name" -c "author.email=$email" -c "committer.name=$name" -c "committer.email=$email" "$@"',
+    '',
+  ].join('\n');
+}
+
 /** Filename of the git askpass helper inside a session's wrapper dir. */
 export const GIT_ASKPASS_BASENAME = 'botmux-git-askpass';
 
@@ -2424,6 +2467,20 @@ export function prepareTriggerUserCliEnv(
       log(`[trigger-user-auth] WARN could not remove ungoverned wrappers: ${(e as Error).message}`);
     }
   }
+  if (sessionDataDir && !(policy?.enabled && policy.tools.length && policy.gitCommitIdentity)) {
+    const git = join(sessionIdentityBinDir(sessionDataDir, sessionId), 'git');
+    try {
+      const stat = lstatSync(git);
+      if (stat.isFile() && stat.size <= 64 * 1024
+        && readFileSync(git, 'utf8').split('\n', 2)[1] === GIT_COMMIT_WRAPPER_MARKER) {
+        rmSync(git, { force: true });
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log(`[trigger-user-auth] WARN could not remove git commit wrapper: ${(error as Error).message}`);
+      }
+    }
+  }
   if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return [];
   const canonicalPaths = options?.canonicalPaths === true;
   sessionDataDir = sessionVisiblePath(sessionDataDir, canonicalPaths);
@@ -2433,16 +2490,20 @@ export function prepareTriggerUserCliEnv(
   // Turn-authored git -c pairs; returned to the caller for the pane carrier.
   let gitConfigPairs: Array<[string, string]> = [];
   let identityResolver: string[] | undefined;
-  if (model === 'proven' && process.platform === 'linux' && execution) {
+  let gitResolver: string[] | undefined;
+  if (policy.gitCommitIdentity || (model === 'proven' && process.platform === 'linux' && execution)) {
     const moduleDir = dirname(fileURLToPath(import.meta.url));
     const sourceExecArgs = process.execArgv.map((arg, index, args) =>
       args[index - 1] === '--import' && arg === 'tsx' ? createRequire(import.meta.url).resolve('tsx') : arg);
     const runner = moduleDir.endsWith('/src/core')
       ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../cli-identity-runner.ts')] }
       : resolveEntrySpawn('cli-identity-runner', resolve(moduleDir, '..'));
-    identityResolver = [...[runner.command, ...runner.args].map(p => sessionVisiblePath(p, canonicalPaths)),
-      '--data-dir', sessionDataDir, '--session-id', sessionId, '--app-id', execution.appId,
-      '--ipc-port', String(execution.ipcPort), '--tool'];
+    const launcher = [runner.command, ...runner.args].map(p => sessionVisiblePath(p, canonicalPaths));
+    if (policy.gitCommitIdentity) gitResolver = [...launcher, '--git-actor-email'];
+    if (model === 'proven' && process.platform === 'linux' && execution) {
+      identityResolver = [...launcher, '--data-dir', sessionDataDir, '--session-id', sessionId,
+        '--app-id', execution.appId, '--ipc-port', String(execution.ipcPort), '--tool'];
+    }
   }
   // Initialize the directory for THIS model before sandbox spawn so its bound
   // directory survives the existence-filter and leftovers from the other model
@@ -2462,6 +2523,13 @@ export function prepareTriggerUserCliEnv(
     log(`[trigger-user-auth] WARN could not initialize identity storage: ${(e as Error).message}`);
   }
   let installedAny = false;
+  if (gitResolver) {
+    const realGit = findRealToolBinary('git', childEnv.PATH, [wrapperDir]);
+    if (!realGit) throw new Error('gitCommitIdentity requires git on PATH');
+    mkdirSync(wrapperDir, { recursive: true });
+    atomicWriteFileSync(join(wrapperDir, 'git'),
+      renderGitCommitWrapper(sessionVisiblePath(realGit, canonicalPaths), gitResolver), { mode: 0o755 });
+  }
   for (const [tool, commandName] of identityTools.flatMap(tool =>
     [tool, ...(IDENTITY_WRAPPER_ALIASES[tool] ?? [])].map(name => [tool, name] as const))) {
     try {
@@ -2490,7 +2558,7 @@ export function prepareTriggerUserCliEnv(
     log('[trigger-user-auth] WARN no tool wrapper installed — this session is NOT running under '
       + 'trigger-user identity; calls will use whatever credentials the machine has');
   }
-  if (installedAny) {
+  if (installedAny || gitResolver) {
     childEnv.PATH = [wrapperDir, ...(childEnv.PATH ?? '').split(delimiter).filter(p => p !== wrapperDir)].join(delimiter);
     // A prepend alone loses to path_helper in the login shell the agent's
     // tool calls run through — see installLoginShellPathShim. These three
