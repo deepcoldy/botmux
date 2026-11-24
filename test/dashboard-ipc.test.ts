@@ -1637,6 +1637,35 @@ describe('POST /api/session-origin/attest', () => {
     }
   });
 
+  it('carries only the caller session location, and drops a row that does not fit', async () => {
+    const fixture = installManagedOriginFixture();
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const attest = async () => {
+        const nonce = randomBytes(32).toString('hex');
+        const response = await postAttestation(handle!.port, {
+          sessionId: fixture.sessionId, channelId: CHANNEL, originCapability: CAPABILITY, nonce,
+        });
+        expect(response.status).toBe(200);
+        return JSON.parse(readFileSync(fixture.proofPath(nonce), 'utf8'));
+      };
+      // The fixture row has no chat location (a legacy/synthetic shape).
+      expect(await attest()).not.toHaveProperty('session');
+      Object.assign(fixture.active.session, {
+        status: 'active', chatId: 'oc_chat', rootMessageId: 'om_first', scope: 'chat', chatType: 'group',
+        workingDir: '/srv/work', ownerOpenId: 'ou_starter', ownerUnionId: 'on_starter',
+        assistantOwnerOpenId: 'ou_assistant_owner', lastMessage: 'someone else said this',
+        replyTargets: { [TURN_ID]: { rootMessageId: 'om_this_turn_topic' } },
+      });
+      expect((await attest()).session).toEqual({
+        status: 'active', chatId: 'oc_chat', rootMessageId: 'om_first', turnRootMessageId: 'om_this_turn_topic',
+        workingDir: '/srv/work', chatType: 'group', scope: 'chat',
+        ownerOpenId: 'ou_starter', ownerUnionId: 'on_starter',
+      });
+    } finally { fixture.cleanup(); }
+  });
+
   it('attests ownerless schedule permission from the live bot, ignoring requested identity', async () => {
     const fixture = installManagedOriginFixture();
     try {

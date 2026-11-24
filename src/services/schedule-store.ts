@@ -1035,6 +1035,20 @@ export function listTasks(appId?: string): ScheduledTask[] {
   return [...stateFor(getFilePath(appId)).tasks.values()];
 }
 
+/** listTasks for a caller that must not mistake an unreadable store for an
+ *  empty one (the scoped CLI listing). A store that exists but cannot be read
+ *  — a sandbox that withholds it, a corrupt file — throws instead of listing
+ *  nothing; a store that has never been written still lists as empty. */
+export function listTasksStrict(appId?: string): ScheduledTask[] {
+  const fp = getFilePath(appId);
+  try { readFileSync(fp, 'utf-8'); } catch (err: any) {
+    if (err?.code !== 'ENOENT') throw err;
+    return listTasks(appId);
+  }
+  readDiskSnapshot(fp, true);
+  return listTasks(appId);
+}
+
 /** Aggregate view across several bots' stores (unsandboxed admin CLI). Bots
  *  whose store cannot be read (sandbox deny / missing BOT_HOME) are skipped —
  *  callers inside a sandbox naturally collapse to their own bot. */
