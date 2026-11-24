@@ -3689,11 +3689,10 @@ export interface RoutingContext {
    *  service is idempotent, but only via its async in-flight/titled guards, so
    *  a duplicate call still burns a bounded retry round. */
   sessionGroupTitleScheduled?: boolean;
-  /** Session-group birth only: the in-group intro message id used as the
-   *  turn's REPLY anchor (quote target / session rootMessageId), so the first
-   *  turn's outputs land in the group. `messageId` stays the ORIGINAL inbound
-   *  DM message id — resource downloads and merge-forward expansion must keep
-   *  using it (the resource keys belong to the source message, PR review P1). */
+  /** Visible reply/quote target when it differs from the Session identity in
+   * `anchor`. Used by session-group birth and forward-followup pairing.
+   * `messageId` stays the ORIGINAL inbound message for resource downloads and
+   * merge-forward expansion; their keys belong to that source message. */
   replyAnchorMessageId?: string;
   larkAppId: string;
   /** 本轮 inbound 的接纳阶段标记，由 daemon 的普通消息入口初始化、各接纳点翻转。
@@ -3721,6 +3720,9 @@ interface PendingForwardTopicPayload {
   data: any;
   ctx: RoutingContext;
   ownsSession: boolean;
+  /** Original Lark root of an auto-start topic dispatch. Lets replies that
+   * arrive while creation is in flight find the eventual canonical anchor. */
+  autoStartTopicRootId?: string;
 }
 
 function listenerRoutingContext(input: {
@@ -4302,8 +4304,17 @@ export async function __recoverDurablePrimaryIngressOnceForTest(input: {
 
 // Reserve before joining the canonical anchor queue. The raw routing lane is
 // released as soon as work is enqueued, so completion records alone leave a gap
-// for another edit (or receive/edit crossing different ingress lanes).
-const pendingMessageTriggers = new Set<string>();
+// for another edit (or receive/edit crossing different ingress lanes). Sharing
+// the actual promise also lets a restored runtime wait for an older runtime's
+// in-flight dispatch instead of mistaking duplicate suppression for success.
+const pendingMessageTriggers = new Map<string, Promise<void>>();
+const RESTORE_PENDING_DISPATCH_WAIT_MS = 30_000;
+class InFlightDispatchTimeoutError extends Error {
+  constructor(messageId: string) {
+    super(`in-flight dispatch wait timed out msg=${messageId.substring(0, 12)}; original dispatch remains the only executor`);
+    this.name = 'InFlightDispatchTimeoutError';
+  }
+}
 
 function messageTriggerKey(larkAppId: string, messageId: string): string {
   return `${larkAppId}:${messageId}`;
@@ -4319,48 +4330,79 @@ async function dispatchHumanMessageViaHandlers(
   handlers: EventHandlers,
   payload: PendingForwardTopicPayload,
   capMs?: number,
+  pendingWaitMs = 0,
 ): Promise<void> {
   const appId = payload.ctx.larkAppId ?? larkAppId;
   const messageId = payload.ctx.messageId;
-  if (messageId && isMessageTriggerClaimed(appId, messageId)) {
+  if (messageId && hasTriggeredMessage(appId, messageId)) {
     logger.debug(`[message-trigger:${appId}] duplicate dispatch ignored msg=${messageId.substring(0, 12)}`);
     return;
   }
   const key = messageId ? messageTriggerKey(appId, messageId) : undefined;
-  if (key) pendingMessageTriggers.add(key);
+  const pending = key ? pendingMessageTriggers.get(key) : undefined;
+  if (pending) {
+    logger.debug(`[message-trigger:${appId}] waiting for in-flight dispatch msg=${messageId.substring(0, 12)}`);
+    if (pendingWaitMs <= 0) {
+      await pending;
+      return;
+    }
+    // A restored runtime must not start a competing task when an old runtime is
+    // stuck. Bound only the wait, keep the durable record, and leave the old work
+    // as the sole executor; a later restore can retry after the actual settlement.
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        pending,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new InFlightDispatchTimeoutError(messageId!)), pendingWaitMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    return;
+  }
   let completed = false;
+  const work = (async () => {
+    try {
+      if (payload.ctx.crossChatThreadFollowUp) {
+        const targetAnchor = payload.ctx.runtimeRoutingAnchor ?? payload.ctx.anchor;
+        await serializeByAnchor(targetAnchor, () => handlers.handleThreadReply(payload.data, payload.ctx), capMs);
+        completed = true;
+        return;
+      }
+      const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId)
+        ?? payload.ownsSession;
+      if (handlers.handlePrincipalLaneMessage
+          && await handlers.handlePrincipalLaneMessage(payload.data, payload.ctx, ownsSession)) {
+        completed = true;
+        return;
+      }
+      await serializeByAnchor(payload.ctx.anchor, () => {
+        const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
+        return ownsSession
+          ? handlers.handleThreadReply(payload.data, payload.ctx)
+          : handlers.handleNewTopic(payload.data, payload.ctx);
+      }, capMs);
+      completed = true;
+    } finally {
+      // A pre-admission failure can be retried by a later edit. Once admitted,
+      // even a subsequent presentation error must not allow the task to run again.
+      if (messageId && shouldPersistTriggeredMessage({
+        durablePrimaryDispatch: !!payload.ctx.durablePrimaryDispatch,
+        handlerCompleted: completed,
+        admitted: payload.ctx.ingressAdmission?.admitted === true,
+      })) {
+        markMessageTriggered(appId, messageId);
+      }
+    }
+  })();
+  if (key) pendingMessageTriggers.set(key, work);
   try {
-    if (payload.ctx.crossChatThreadFollowUp) {
-      const targetAnchor = payload.ctx.runtimeRoutingAnchor ?? payload.ctx.anchor;
-      await serializeByAnchor(targetAnchor, () => handlers.handleThreadReply(payload.data, payload.ctx), capMs);
-      completed = true;
-      return;
-    }
-    const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId)
-      ?? payload.ownsSession;
-    if (handlers.handlePrincipalLaneMessage
-        && await handlers.handlePrincipalLaneMessage(payload.data, payload.ctx, ownsSession)) {
-      completed = true;
-      return;
-    }
-    await serializeByAnchor(payload.ctx.anchor, () => {
-      const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
-      return ownsSession
-        ? handlers.handleThreadReply(payload.data, payload.ctx)
-        : handlers.handleNewTopic(payload.data, payload.ctx);
-    }, capMs);
-    completed = true;
+    await work;
   } finally {
-    // A pre-admission failure can be retried by a later edit. Once admitted,
-    // even a subsequent presentation error must not allow the task to run again.
-    if (messageId && shouldPersistTriggeredMessage({
-      durablePrimaryDispatch: !!payload.ctx.durablePrimaryDispatch,
-      handlerCompleted: completed,
-      admitted: payload.ctx.ingressAdmission?.admitted === true,
-    })) {
-      markMessageTriggered(appId, messageId);
-    }
-    if (key) pendingMessageTriggers.delete(key);
+    if (key && pendingMessageTriggers.get(key) === work) pendingMessageTriggers.delete(key);
   }
 }
 
@@ -4579,8 +4621,13 @@ export function __resetMessageListenerPollCursorForTest(): void {
   messageListenerPollCursor.clear();
 }
 
-function usesForwardFollowupDelay(mentionMode: GroupMentionMode): boolean {
-  return mentionMode === 'never' || mentionMode === 'ambient';
+function usesForwardFollowupDelay(
+  mentionMode: GroupMentionMode,
+  autoStartOnNewTopic = false,
+): boolean {
+  return mentionMode === 'never'
+    || mentionMode === 'ambient'
+    || (mentionMode === 'topic' && autoStartOnNewTopic);
 }
 
 /**
@@ -5818,6 +5865,17 @@ export function createLarkEventDispatcherRuntime(
     config.daemon.forwardFollowupWaitMs,
     err => logger.error(`Error flushing delayed topic seed: ${err}`),
   );
+  const topicAutoStartEnabled = (chatId: string): boolean => {
+    const botConfig = getBot(larkAppId).config;
+    return botConfig.autoStartOnNewTopic === true
+      && !botConfig.autoStartExcludedChats?.includes(chatId);
+  };
+  const forwardFollowupDelayEnabled = (chatId: string): boolean => {
+    return usesForwardFollowupDelay(
+      resolveGroupMentionMode(larkAppId, chatId),
+      topicAutoStartEnabled(chatId),
+    );
+  };
   // Barrier that resolves once restoreActiveSessions() completes. Flushes wait
   // on it so isSessionOwner reads the populated activeSessions map. If the app
   // was already marked ready (e.g. tests or a restart within the same process),
@@ -5826,24 +5884,70 @@ export function createLarkEventDispatcherRuntime(
   const sessionsReady = new Promise<void>(resolve => { resolveSessionsReady = resolve; });
   if (sessionsReadyApps.has(larkAppId)) resolveSessionsReady();
   sessionsReadyBarriers.set(larkAppId, { promise: sessionsReady, resolve: resolveSessionsReady });
-  const dispatchHumanMessage = async (payload: PendingForwardTopicPayload): Promise<void> => {
+  const dispatchHumanMessage = async (
+    payload: PendingForwardTopicPayload,
+    pendingWaitMs = 0,
+  ): Promise<void> => {
     // capMs=0: forward-followup dispatch serializes STRICTLY per anchor (wait for
     // prior same-anchor work to fully settle, no 5s cap fallback to concurrent),
     // so a follow-up never races the seed's in-flight session spawn (PR #597
     // durable turn ownership/ordering). The shared helper's other caller (polled
     // message-listener) keeps serializeByAnchor's default cap.
-    await dispatchHumanMessageViaHandlers(larkAppId, handlers, payload, 0);
+    await dispatchHumanMessageViaHandlers(larkAppId, handlers, payload, 0, pendingWaitMs);
   };
-  const dispatchPersistedForwardFollowup = async (
+  const autoStartTopicStarts = new Map<string, {
+    settled: Promise<void>;
+    complete: () => void;
+  }>();
+  const trackAutoStartTopic = (payload: PendingForwardTopicPayload) => {
+    const rootId = payload.autoStartTopicRootId;
+    if (!rootId) return undefined;
+    const existing = autoStartTopicStarts.get(rootId);
+    if (existing) return existing;
+    let complete!: () => void;
+    const settled = new Promise<void>(resolve => { complete = resolve; });
+    const entry = { settled, complete };
+    autoStartTopicStarts.set(rootId, entry);
+    return entry;
+  };
+  const dispatchWithAutoStartTracking = async (
+    payload: PendingForwardTopicPayload,
+    dispatch: () => Promise<void>,
+  ): Promise<void> => {
+    const rootId = payload.autoStartTopicRootId;
+    if (!rootId) {
+      await dispatch();
+      return;
+    }
+    const entry = trackAutoStartTopic(payload)!;
+    try {
+      await dispatch();
+    } finally {
+      if (autoStartTopicStarts.get(rootId) === entry) autoStartTopicStarts.delete(rootId);
+      entry.complete();
+    }
+  };
+  const dispatchPersistedForwardFollowup = (
     seedMessageId: string,
     payload: PendingForwardTopicPayload,
-  ): Promise<void> => {
+  ): Promise<void> => dispatchWithAutoStartTracking(payload, async () => {
     // Wait for activeSessions to be rehydrated before checking ownership, so a
     // thread reply isn't misrouted to handleNewTopic during daemon startup.
     await sessionsReady;
-    await dispatchHumanMessage(payload);
+    // The buffer entry has already been consumed when a paired dispatch starts.
+    // Retry one transient pre-admission failure in-process; the durable record is
+    // still removed only after success and remains available for restart recovery.
+    try {
+      await dispatchHumanMessage(payload, RESTORE_PENDING_DISPATCH_WAIT_MS);
+    } catch (err) {
+      if (err instanceof InFlightDispatchTimeoutError) throw err;
+      logger.warn(
+        `[forward-followup] dispatch failed for seed=${seedMessageId.substring(0, 12)}; retrying once: ${err}`,
+      );
+      await dispatchHumanMessage(payload, RESTORE_PENDING_DISPATCH_WAIT_MS);
+    }
     removeForwardFollowup(larkAppId, seedMessageId);
-  };
+  });
   // Load persisted seeds into the buffer immediately so root-linked
   // clarifications can pair with them while the WS is already receiving
   // events. Flushes (timer expiry or immediate) wait on sessionsReady above.
@@ -5864,7 +5968,7 @@ export function createLarkEventDispatcherRuntime(
     const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
     // Startup restore precedes signed-default hydration; cold cache is
     // deliberately fail-closed until the next authorized human message.
-    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId, chatId));
+    const delayStillEnabled = forwardFollowupDelayEnabled(chatId);
     if (isUnpairedSeed && delayStillEnabled && remainingMs > 0 && forwardFollowups.hold({
       larkAppId,
       chatId,
@@ -5879,7 +5983,7 @@ export function createLarkEventDispatcherRuntime(
     }
   }
   const seedRoutingGates = new Map<string, { ready: Promise<void>; complete: () => void }>();
-  const waitForSeedRoutingGate = async (messageId: string): Promise<void> => {
+  const waitForSeedRoutingGate = async (messageId: string, preserveAutoStartReply = false): Promise<void> => {
     const gate = seedRoutingGates.get(messageId);
     if (!gate) return;
     const timeoutMs = Math.max(1, config.daemon.forwardFollowupWaitMs);
@@ -5893,10 +5997,18 @@ export function createLarkEventDispatcherRuntime(
     ]);
     if (timer) clearTimeout(timer);
     if (outcome === 'timeout') {
-      logger.warn(
-        `[forward-followup] seed routing gate timed out after ${timeoutMs}ms `
-        + `for root=${messageId.substring(0, 12)}; continuing without pairing`,
-      );
+      if (preserveAutoStartReply) {
+        logger.warn(
+          `[forward-followup] seed routing gate timed out after ${timeoutMs}ms `
+          + `for root=${messageId.substring(0, 12)}; still waiting so the auto-start reply is not dropped`,
+        );
+        await gate.ready;
+      } else {
+        logger.warn(
+          `[forward-followup] seed routing gate timed out after ${timeoutMs}ms `
+          + `for root=${messageId.substring(0, 12)}; continuing without pairing`,
+        );
+      }
     }
   };
   const registerSeedRoutingGate = (messageId: string) => {
@@ -7114,38 +7226,47 @@ export function createLarkEventDispatcherRuntime(
       const commandLeadsMessage = commandPrecedesMentions(message);
       let pairedForwardSeed;
       let stalePendingSeed;
+      let releaseStalePendingSeed = false;
       // Require isAllowed before pairing: a root-linked clarification from a
       // sender who was /revoked within the grace window must not consume the
       // seed from the buffer or overwrite the durable paired record. The seed
-      // stays in the buffer and flushes on its original timer. Paired seeds
-      // only arise under never/ambient modes, where a legitimate merge always
-      // requires isAllowed anyway.
+      // stays in the buffer and flushes on its original timer. In topic mode
+      // only an auto-start-enabled chat holds seeds; an ordinary unmentioned
+      // reply therefore finds nothing to pair with and keeps its @ gate.
       if (!crossChatFollowUp && !yieldToImportedTopicHandler && senderOpenId && isAllowed && message.root_id && !isControlCommand) {
-        await waitForSeedRoutingGate(message.root_id);
+        const pairingMentionMode = resolveGroupMentionMode(larkAppId, chatId);
+        const pairingDelayEnabled = forwardFollowupDelayEnabled(chatId);
+        await waitForSeedRoutingGate(
+          message.root_id,
+          pairingMentionMode === 'topic' && pairingDelayEnabled,
+        );
         const pairingInput = {
           larkAppId,
           chatId,
           senderOpenId,
           rootId: message.root_id,
         };
-        const pairingMentionMode = resolveGroupMentionMode(larkAppId, chatId);
-        const pairingDelayEnabled = usesForwardFollowupDelay(pairingMentionMode);
-        const ambientRedirect = pairingDelayEnabled
-          && pairingMentionMode === 'ambient'
+        const pairingRedirect = pairingDelayEnabled
+          && (pairingMentionMode === 'ambient' || pairingMentionMode === 'topic')
           && !explicitlyMentionedThisBot
           && await mentionsOtherInChat();
-        if (pairingDelayEnabled && !ambientRedirect) {
+        if (pairingDelayEnabled && !pairingRedirect) {
           pairedForwardSeed = forwardFollowups.take(pairingInput);
         } else if (!pairingDelayEnabled) {
-          stalePendingSeed = forwardFollowups.take(pairingInput);
+          // Do not consume the old seed until the current reply has passed its
+          // admission gates. A rejected reply must leave the original timer intact.
+          releaseStalePendingSeed = true;
         }
       }
       if (pairedForwardSeed) {
-        // The clarification becomes the visible Lark topic root. The earlier
-        // forwarded seed is retained only as prompt context, so the bot never
-        // emits a reply under the forwarding bubble itself.
+        // Register before any later await so another reply already queued behind
+        // the root gate cannot slip between the pairing and the actual dispatch.
+        trackAutoStartTopic(pairedForwardSeed.payload);
+        // The Session remains anchored at the original Lark root so all later
+        // replies keep resolving to it. Only the visible first-reply target moves
+        // to the clarification (replyAnchorMessageId below), away from the
+        // forwarding bubble itself.
         routing.scope = 'thread';
-        routing.anchor = messageId;
         routingSource = 'topic-chat';
         replyRootId = undefined;
         ownsSession = false;
@@ -7162,11 +7283,12 @@ export function createLarkEventDispatcherRuntime(
                 chatType,
                 larkAppId,
                 scope: 'thread',
-                anchor: messageId,
+                replyAnchorMessageId: messageId,
                 replyRootId: undefined,
                 forwardSeedData: pairedForwardSeed.payload.data,
               },
               ownsSession: false,
+              autoStartTopicRootId: pairedForwardSeed.payload.autoStartTopicRootId,
             },
           });
         } catch (err) {
@@ -7176,6 +7298,31 @@ export function createLarkEventDispatcherRuntime(
           `[forward-followup] merged seed=${pairedForwardSeed.messageId.substring(0, 12)} ` +
           `into msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
         );
+      }
+
+      // A topic auto-start remains the owner of its original Lark root while
+      // handleNewTopic is still creating the Session. Hold same-root replies at
+      // this boundary, then re-check ownership. The per-anchor serializer
+      // preserves their dispatch order after the creation settles. An already
+      // admitted root is not disowned by a later autoStart/excluded config edit.
+      const inFlightAutoStart = !pairedForwardSeed
+        && !explicitlyMentionedThisBot
+        && !messageListener
+        && !substituteTrigger
+        && !crossChatFollowUp
+        && !yieldToImportedTopicHandler
+        && message.root_id
+        ? autoStartTopicStarts.get(message.root_id)
+        : undefined;
+      if (inFlightAutoStart) {
+        logger.debug(
+          `[auto-start:新话题] 等待会话创建后投递同话题回复 ` +
+          `root=${String(message.root_id).substring(0, 12)} msg=${messageId.substring(0, 12)}`,
+        );
+        await inFlightAutoStart.settled;
+        routing.scope = 'thread';
+        routingSource = 'real-thread';
+        ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
       }
 
       // Permission gating — same shape as before, just keyed on
@@ -7293,9 +7440,10 @@ export function createLarkEventDispatcherRuntime(
         // 默认 'always' 在多人群里必须 @，想要话题内免@续话就把 mentionMode 配成
         // 'topic'（下方条款已同时覆盖话题群 thread 与普通群 shared topic），
         // 'never'/'ambient' 亦按各自语义生效。1人1bot 群在 solo 开关启用时走末条放行。
-        // 注：pairedForwardSeed 仅在 never/ambient 模式下产生，且 ambient redirect
-        // 已在配对前排除，故 isAllowed=true 时下方 never/ambient 条款必然放行；
-        // 不在此单独加 clause，以免 isAllowed=false 时绕过权限检查。
+        // 注：pairedForwardSeed 只在 never/ambient 或开启自动开工的 topic 群产生；
+        // ambient/topic 的 @其他成员让路已在配对前排除，故 isAllowed=true 时下方
+        // paired 条款可安全放行；普通 topic 回复没有可配对的暂存根，仍受原门禁约束。
+        // 不在无 isAllowed 的情况下放行，以免绕过权限检查。
         // 末条 solo 放行不看 mentionsOther：消息 @ 了别的具体成员时,上面已用
         // revalidateSolo 重查过人数——「刚拉新 bot、缓存仍是陈旧 {1,1}」会查出多 bot
         // 而不放行；重查后仍是 1人1bot,说明被 @ 的人不在群里（飞书允许 @ 群外的人）,
@@ -7308,6 +7456,7 @@ export function createLarkEventDispatcherRuntime(
           return;
         }
         const relax = !!crossChatFollowUp
+          || (!!pairedForwardSeed && isAllowed)
           || (!!replyRootId && isAllowed)
           || (!!substituteTrigger && isAllowed)
           || !!messageListener
@@ -7384,7 +7533,28 @@ export function createLarkEventDispatcherRuntime(
               ownsSession,
             });
             if (!autoTopic) {
-              logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
+              const botConfig = getBot(larkAppId).config;
+              const autoStartEnabled = botConfig.autoStartOnNewTopic === true
+                && !botConfig.autoStartExcludedChats?.includes(chatId);
+              const unownedAutoTopicReply = autoStartEnabled
+                && !ownsSession
+                && !mentionsOther
+                && mentionMode === 'topic'
+                && routingSource === 'real-thread'
+                && !!message.root_id
+                && getCachedChatMode(larkAppId, chatId) === 'topic';
+              if (unownedAutoTopicReply) {
+                // Narrow enough not to log ordinary group chatter, but visible at
+                // the default level if an auto-start creation race still drops a reply.
+                logger.info(
+                  `[auto-start:新话题] 同话题回复未入会话 reason=unowned_auto_topic_reply ` +
+                  `chat=${chatId.substring(0, 12)} root=${String(message.root_id).substring(0, 12)} ` +
+                  `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'} ` +
+                  `mode=${mentionMode} source=${routingSource}`,
+                );
+              } else {
+                logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
+              }
               // mention 晚落定补偿（测试版）：正文带 @ 占位符却被 @ 闸忽略时，
               // 延迟权威回读重判再决定是否补派发——见 mention-reverify.ts 头注。
               scheduleMentionReverify({ larkAppId, messageId, chatId, message, source: 'receive-ignore' });
@@ -7437,6 +7607,7 @@ export function createLarkEventDispatcherRuntime(
         substituteTrigger,
         messageListener,
         forwardSeedData: pairedForwardSeed?.payload.data,
+        ...(pairedForwardSeed ? { replyAnchorMessageId: messageId } : {}),
         ...(
           primary
           && typeof (primary.context as Partial<DurableLarkCanonicalHandlerContext>)
@@ -7472,10 +7643,27 @@ export function createLarkEventDispatcherRuntime(
       if (chatType === 'p2p' && forceTopicApplied) {
         recordP2pForceTopicRoot(larkAppId, messageId, chatId);
       }
-      const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
-      const groupMentionMode = resolveGroupMentionMode(larkAppId, chatId);
+      const autoStartTopicRootId = pairedForwardSeed?.payload.autoStartTopicRootId ?? (
+        topicAutoStartEnabled(chatId)
+        && resolveGroupMentionMode(larkAppId, chatId) === 'topic'
+        && routingSource === 'topic-chat'
+        && ctx.scope === 'thread'
+        && ctx.anchor === messageId
+        && !ownsSession
+          ? messageId
+          : undefined
+      );
+      const payload = { data, ctx, ownsSession, autoStartTopicRootId } satisfies PendingForwardTopicPayload;
+      if (releaseStalePendingSeed && senderOpenId && message.root_id) {
+        stalePendingSeed = forwardFollowups.take({
+          larkAppId,
+          chatId,
+          senderOpenId,
+          rootId: message.root_id,
+        });
+      }
       const shouldDelayTopicSeed = config.daemon.forwardFollowupWaitMs > 0
-        && usesForwardFollowupDelay(groupMentionMode)
+        && forwardFollowupDelayEnabled(chatId)
         && !pairedForwardSeed
         && !isControlCommand
         && !!senderOpenId
@@ -7541,13 +7729,16 @@ export function createLarkEventDispatcherRuntime(
         // synchronously to the same canonical FIFO; their handler completion is
         // deliberately not awaited by the raw lane.
         void sessionsReady.then(() => {
-          void dispatchHumanMessage(stalePendingSeed.payload)
+          void dispatchWithAutoStartTracking(
+            stalePendingSeed.payload,
+            () => dispatchHumanMessage(stalePendingSeed.payload),
+          )
             .then(() => removeForwardFollowup(larkAppId, stalePendingSeed.messageId))
             .catch(err => logger.warn(
               `[forward-followup] failed to flush stale seed=${stalePendingSeed.messageId.substring(0, 12)}; `
               + `continuing current msg=${messageId.substring(0, 12)}: ${err}`,
             ));
-          void dispatchHumanMessage(payload)
+          void dispatchWithAutoStartTracking(payload, () => dispatchHumanMessage(payload))
             .catch(err => logger.error(`Error handling message event: ${err}`));
         }).catch(err => logger.error(`Error awaiting restored sessions for stale seed: ${err}`));
         return;
@@ -7567,7 +7758,7 @@ export function createLarkEventDispatcherRuntime(
         await dispatchHumanMessage(payload);
         return primaryResult(ctx, primary);
       }
-      void dispatchHumanMessage(payload)
+      void dispatchWithAutoStartTracking(payload, () => dispatchHumanMessage(payload))
         .catch(err => logger.error(`Error handling message event: ${err}`));
     } catch (err) {
       logger.error(`Error handling message event: ${err}`);
@@ -8258,7 +8449,6 @@ export function createLarkEventDispatcherRuntime(
         && rawMessage?.message_id
         && rawMessage.chat_type !== 'p2p'
         && !rawMessage.root_id
-        && !rawMessage.thread_id
         && rawSenderType !== 'app'
         && rawSenderType !== 'bot'
       ) {
@@ -8584,6 +8774,9 @@ export function createLarkEventDispatcherRuntime(
       listenerPollTimer = undefined;
       initialListenerPollTimer = undefined;
       forwardFollowups.clear();
+      // Closing the transport does not cancel an in-flight handleNewTopic.
+      // Keep autoStartTopicStarts waiters attached to its real settlement; a
+      // replacement runtime shares the same per-message dispatch promise.
       if (typeof wsClient?.close === 'function') wsClient.close({ force: true });
       wsClient = undefined;
     },

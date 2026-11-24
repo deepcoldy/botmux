@@ -420,12 +420,825 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(clarification, expect.objectContaining({
       scope: 'thread',
-      anchor: 'msg-forward-clarification',
+      anchor: 'msg-forward-seed',
+      replyAnchorMessageId: 'msg-forward-clarification',
       messageId: 'msg-forward-clarification',
       forwardSeedData: seed,
     }));
     await new Promise(resolve => setTimeout(resolve, 30));
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('coalesces an unmentioned forward and clarification before topic auto-start creates the session', async () => {
+    capturedHandlers = {};
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'topic',
+      autoStartOnNewTopic: true,
+      chatSoloGroupMentionBypass: { 'chat-auto-forward': false },
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: '{}',
+      messageType: 'merge_forward',
+      messageId: 'om_auto_forward_seed',
+      chatId: 'chat-auto-forward',
+      chatType: 'group',
+    });
+    const clarification = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '调研学习' }),
+      rootId: 'om_auto_forward_seed',
+      messageId: 'om_auto_forward_clarification',
+      chatId: 'chat-auto-forward',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    await capturedHandlers['im.message.receive_v1'](clarification);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(clarification, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'om_auto_forward_seed',
+      replyAnchorMessageId: 'om_auto_forward_clarification',
+      forwardSeedData: seed,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('still rejects an unmentioned reply in an unowned topic when auto-start is disabled', async () => {
+    capturedHandlers = {};
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'topic',
+      autoStartOnNewTopic: false,
+      chatSoloGroupMentionBypass: { 'chat-manual-topic': false },
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const reply = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '普通话题里的续话' }),
+      rootId: 'om_manually_started_topic',
+      messageId: 'om_manual_topic_reply',
+      chatId: 'chat-manual-topic',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](reply);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('keeps an auto-start forward seed pending when its clarification addresses someone else', async () => {
+    capturedHandlers = {};
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'topic',
+      autoStartOnNewTopic: true,
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: '{}',
+      messageType: 'merge_forward',
+      messageId: 'om_auto_forward_redirect_seed',
+      chatId: 'chat-auto-forward-redirect',
+      chatType: 'group',
+    });
+    const redirectedClarification = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Alice 请看一下' }),
+      rootId: 'om_auto_forward_redirect_seed',
+      messageId: 'om_auto_forward_redirect_clarification',
+      chatId: 'chat-auto-forward-redirect',
+      chatType: 'group',
+      mentions: [{ key: '@_alice', name: 'Alice', id: { open_id: 'ou_alice' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](redirectedClarification);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(seed, expect.objectContaining({
+      forwardSeedData: undefined,
+    }));
+  });
+
+  it('logs an unowned auto-start topic reply drop with routing ids at info level', async () => {
+    capturedHandlers = {};
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'topic',
+      autoStartOnNewTopic: true,
+    });
+    mockGetCachedChatMode.mockReturnValueOnce('topic');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const reply = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '会话尚未登记时的回复' }),
+      rootId: 'om_auto_drop_root',
+      messageId: 'om_auto_drop_reply',
+      chatId: 'chat-auto-drop',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](reply);
+    await flushEventWork();
+
+    const dropLogs = vi.mocked(logger.info).mock.calls.flat().join('\n').split('\n')
+      .filter(line => line.includes('reason=unowned_auto_topic_reply'));
+    expect(dropLogs).toHaveLength(1);
+    expect(dropLogs[0]).toContain('chat=chat-auto-dr');
+    expect(dropLogs[0]).toContain('root=om_auto_drop');
+    expect(dropLogs[0]).toContain('msg=om_auto_drop');
+    expect(dropLogs[0]).toContain('mode=topic');
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('delivers replies in order when the auto-start seed has expired but creation is still running', async () => {
+    capturedHandlers = {};
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'topic',
+      autoStartOnNewTopic: true,
+      soloGroupMentionBypass: false,
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: '{}',
+      messageType: 'merge_forward',
+      messageId: 'om_creation_seed',
+      chatId: 'chat-creation-race',
+      chatType: 'group',
+    });
+    const first = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '第一条迟到回复' }),
+      rootId: 'om_creation_seed',
+      messageId: 'om_creation_first',
+      chatId: 'chat-creation-race',
+      chatType: 'group',
+    });
+    const second = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '第二条迟到回复' }),
+      rootId: 'om_creation_seed',
+      messageId: 'om_creation_second',
+      chatId: 'chat-creation-race',
+      chatType: 'group',
+    });
+    let releaseCreation!: () => void;
+    const creation = new Promise<void>(resolve => { releaseCreation = resolve; });
+    let owned = false;
+    handlers.isSessionOwner.mockImplementation(anchor => owned && anchor === 'om_creation_seed');
+    handlers.handleNewTopic.mockImplementation(async data => {
+      if (data === seed) await creation;
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(seed, expect.anything());
+
+    await capturedHandlers['im.message.receive_v1'](first);
+    await capturedHandlers['im.message.receive_v1'](second);
+    await flushEventWork();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+
+    owned = true;
+    releaseCreation();
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
+    expect(handlers.handleThreadReply.mock.calls.map(call => call[0])).toEqual([first, second]);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(first, expect.objectContaining({ anchor: 'om_creation_seed' }));
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(second, expect.objectContaining({ anchor: 'om_creation_seed' }));
+  });
+
+  it('routes all clarifications to the original root after paired creation finishes', async () => {
+    capturedHandlers = {};
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'topic',
+      autoStartOnNewTopic: true,
+      soloGroupMentionBypass: false,
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: '{}',
+      messageType: 'merge_forward',
+      messageId: 'om_multi_pair_seed',
+      chatId: 'chat-multi-pair',
+      chatType: 'group',
+    });
+    const first = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '第一条留言' }),
+      rootId: 'om_multi_pair_seed',
+      messageId: 'om_multi_pair_first',
+      chatId: 'chat-multi-pair',
+      chatType: 'group',
+    });
+    const second = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '第二条留言' }),
+      rootId: 'om_multi_pair_seed',
+      messageId: 'om_multi_pair_second',
+      chatId: 'chat-multi-pair',
+      chatType: 'group',
+    });
+    const third = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '第三条留言' }),
+      rootId: 'om_multi_pair_seed',
+      messageId: 'om_multi_pair_third',
+      chatId: 'chat-multi-pair',
+      chatType: 'group',
+    });
+    let releaseCreation!: () => void;
+    const creation = new Promise<void>(resolve => { releaseCreation = resolve; });
+    let ownedAnchor: string | undefined;
+    handlers.isSessionOwner.mockImplementation(anchor => anchor === ownedAnchor);
+    handlers.handleNewTopic.mockImplementation(async (data, ctx) => {
+      if (data === first) {
+        await creation;
+        ownedAnchor = ctx.anchor;
+      }
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](first);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(first, expect.objectContaining({
+      forwardSeedData: seed,
+    }));
+
+    await capturedHandlers['im.message.receive_v1'](second);
+    await capturedHandlers['im.message.receive_v1'](third);
+    await flushEventWork();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+
+    releaseCreation();
+    await flushEventWork();
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
+    expect(handlers.handleThreadReply.mock.calls.map(call => call[0])).toEqual([second, third]);
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(second, expect.objectContaining({
+      anchor: 'om_multi_pair_seed',
+    }));
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(third, expect.objectContaining({
+      anchor: 'om_multi_pair_seed',
+    }));
+  });
+
+  it('routes a reply that arrives after paired creation has settled to the original root', async () => {
+    capturedHandlers = {};
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'topic',
+      autoStartOnNewTopic: true,
+      soloGroupMentionBypass: false,
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: '{}',
+      messageType: 'merge_forward',
+      messageId: 'om_settled_pair_seed',
+      chatId: 'chat-settled-pair',
+      chatType: 'group',
+    });
+    const first = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '首条留言' }),
+      rootId: 'om_settled_pair_seed',
+      messageId: 'om_settled_pair_first',
+      chatId: 'chat-settled-pair',
+      chatType: 'group',
+    });
+    const late = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '创建完成后的后续回复' }),
+      rootId: 'om_settled_pair_seed',
+      messageId: 'om_settled_pair_late',
+      chatId: 'chat-settled-pair',
+      chatType: 'group',
+    });
+    let ownedAnchor: string | undefined;
+    handlers.isSessionOwner.mockImplementation(anchor => anchor === ownedAnchor);
+    handlers.handleNewTopic.mockImplementation(async (_data, ctx) => {
+      ownedAnchor = ctx.anchor;
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](first);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+
+    await capturedHandlers['im.message.receive_v1'](late);
+    await flushEventWork();
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(late, expect.objectContaining({
+      anchor: 'om_settled_pair_seed',
+    }));
+  });
+
+  it('keeps waiting after the root gate warning so a slow auto-start seed can still pair', async () => {
+    vi.useFakeTimers();
+    let resolveTopic!: (mode: 'topic') => void;
+    let releaseCreation!: () => void;
+    try {
+      const delayedTopic = new Promise<'topic'>(resolve => { resolveTopic = resolve; });
+      const creation = new Promise<void>(resolve => { releaseCreation = resolve; });
+      mockGetChatMode.mockImplementationOnce(() => delayedTopic).mockResolvedValue('topic');
+      capturedHandlers = {};
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupMentionMode: 'topic',
+        autoStartOnNewTopic: true,
+        soloGroupMentionBypass: false,
+      });
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      const seed = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: '{}',
+        messageType: 'merge_forward',
+        messageId: 'om_slow_gate_seed',
+        chatId: 'chat-slow-gate',
+        chatType: 'group',
+      });
+      const clarification = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '慢路由期间的第一条留言' }),
+        rootId: 'om_slow_gate_seed',
+        messageId: 'om_slow_gate_reply',
+        chatId: 'chat-slow-gate',
+        chatType: 'group',
+      });
+      const second = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '同时等待的第二条留言' }),
+        rootId: 'om_slow_gate_seed',
+        messageId: 'om_slow_gate_second',
+        chatId: 'chat-slow-gate',
+        chatType: 'group',
+      });
+      let ownedAnchor: string | undefined;
+      handlers.isSessionOwner.mockImplementation(anchor => anchor === ownedAnchor);
+      handlers.handleNewTopic.mockImplementation(async (data, ctx) => {
+        if (data === clarification) {
+          ownedAnchor = ctx.anchor;
+          await creation;
+        }
+      });
+      const flushFake = async () => {
+        for (let i = 0; i < 8; i++) await vi.advanceTimersByTimeAsync(0);
+      };
+      capturedHandlers['im.message.receive_v1'](seed);
+      await flushFake();
+      capturedHandlers['im.message.receive_v1'](clarification);
+      capturedHandlers['im.message.receive_v1'](second);
+      await flushFake();
+
+      await vi.advanceTimersByTimeAsync(5_000 + 25);
+      await flushFake();
+      expect(vi.mocked(logger.warn).mock.calls.flat().join('\n')).toContain('still waiting');
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      resolveTopic('topic');
+      await flushFake();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(clarification, expect.objectContaining({
+        forwardSeedData: seed,
+      }));
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+
+      releaseCreation();
+      await flushFake();
+      expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+      expect(handlers.handleThreadReply).toHaveBeenCalledWith(second, expect.objectContaining({
+        anchor: 'om_slow_gate_seed',
+      }));
+    } finally {
+      resolveTopic('topic');
+      releaseCreation();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['disable-auto-start', 'exclude-chat', 'mention-always'] as const)(
+    'does not strand a pending seed when policy changes to %s and the reply is rejected',
+    async change => {
+      capturedHandlers = {};
+      const state = setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupMentionMode: 'topic',
+        autoStartOnNewTopic: true,
+        soloGroupMentionBypass: false,
+      });
+      const chatId = `chat-policy-${change}`;
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      const seed = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: '{}',
+        messageType: 'merge_forward',
+        messageId: `om-policy-${change}-seed`,
+        chatId,
+        chatType: 'group',
+      });
+      const clarification = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '配置变化后的普通回复' }),
+        rootId: `om-policy-${change}-seed`,
+        messageId: `om-policy-${change}-reply`,
+        chatId,
+        chatType: 'group',
+      });
+      await capturedHandlers['im.message.receive_v1'](seed);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      if (change === 'disable-auto-start') state.config.autoStartOnNewTopic = false;
+      if (change === 'exclude-chat') state.config.autoStartExcludedChats = [chatId];
+      if (change === 'mention-always') state.config.regularGroupMentionMode = 'always';
+      await capturedHandlers['im.message.receive_v1'](clarification);
+      await flushEventWork();
+      await new Promise(resolve => setTimeout(resolve, 30));
+
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(seed, expect.objectContaining({
+        forwardSeedData: undefined,
+      }));
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['disable-auto-start', 'exclude-chat'] as const)(
+    'keeps replies attached to an admitted creation when %s changes mid-flight',
+    async change => {
+      capturedHandlers = {};
+      const state = setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupMentionMode: 'topic',
+        autoStartOnNewTopic: true,
+        soloGroupMentionBypass: false,
+      });
+      const chatId = `chat-midflight-${change}`;
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      const seed = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: '{}',
+        messageType: 'merge_forward',
+        messageId: `om-midflight-${change}-seed`,
+        chatId,
+        chatType: 'group',
+      });
+      const reply = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '创建中改变配置后的回复' }),
+        rootId: `om-midflight-${change}-seed`,
+        messageId: `om-midflight-${change}-reply`,
+        chatId,
+        chatType: 'group',
+      });
+      let releaseCreation!: () => void;
+      const creation = new Promise<void>(resolve => { releaseCreation = resolve; });
+      let owned = false;
+      handlers.isSessionOwner.mockImplementation(anchor => owned && anchor === seed.message.message_id);
+      handlers.handleNewTopic.mockImplementation(async data => {
+        if (data === seed) await creation;
+      });
+
+      await capturedHandlers['im.message.receive_v1'](seed);
+      await flushEventWork();
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(seed, expect.anything());
+      if (change === 'disable-auto-start') state.config.autoStartOnNewTopic = false;
+      if (change === 'exclude-chat') state.config.autoStartExcludedChats = [chatId];
+
+      await capturedHandlers['im.message.receive_v1'](reply);
+      await flushEventWork();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+      owned = true;
+      releaseCreation();
+      await flushEventWork();
+
+      expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+      expect(handlers.handleThreadReply).toHaveBeenCalledWith(reply, expect.objectContaining({
+        anchor: seed.message.message_id,
+      }));
+    },
+  );
+
+  it('retries a transient paired dispatch failure without waiting for a restart', async () => {
+    capturedHandlers = {};
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'topic',
+      autoStartOnNewTopic: true,
+      soloGroupMentionBypass: false,
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: '{}',
+      messageType: 'merge_forward',
+      messageId: 'om-retry-seed',
+      chatId: 'chat-pair-retry',
+      chatType: 'group',
+    });
+    const clarification = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '需要重试的留言' }),
+      rootId: 'om-retry-seed',
+      messageId: 'om-retry-reply',
+      chatId: 'chat-pair-retry',
+      chatType: 'group',
+    });
+    handlers.handleNewTopic.mockRejectedValueOnce(new Error('injected transient failure'));
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](clarification);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(2);
+    expect(handlers.handleNewTopic).toHaveBeenNthCalledWith(1, clarification, expect.objectContaining({ forwardSeedData: seed }));
+    expect(handlers.handleNewTopic).toHaveBeenNthCalledWith(2, clarification, expect.objectContaining({ forwardSeedData: seed }));
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a waiting reply attached when close and restore overlap an unfinished creation', async () => {
+    vi.useFakeTimers();
+    const runtimes: Array<ReturnType<typeof createLarkEventDispatcherRuntime>> = [];
+    let releaseCreation!: () => void;
+    let owned = false;
+    const flushFake = async () => {
+      for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(0);
+    };
+    const makeRuntime = () => {
+      capturedHandlers = {};
+      const next = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+      runtimes.push(next);
+      next.connect();
+      markForwardFollowupsSessionsReady(MY_APP_ID);
+      return next;
+    };
+    try {
+      capturedHandlers = {};
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupMentionMode: 'topic',
+        autoStartOnNewTopic: true,
+        soloGroupMentionBypass: false,
+      });
+      mockGetChatMode.mockResolvedValue('topic');
+      makeRuntime();
+      const seed = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: '{}',
+        messageType: 'merge_forward',
+        messageId: 'om-close-wait-seed',
+        chatId: 'chat-close-wait',
+        chatType: 'group',
+      });
+      const reply = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: 'close 期间仍在等待的回复' }),
+        rootId: 'om-close-wait-seed',
+        messageId: 'om-close-wait-reply',
+        chatId: 'chat-close-wait',
+        chatType: 'group',
+      });
+      const creation = new Promise<void>(resolve => { releaseCreation = resolve; });
+      handlers.isSessionOwner.mockImplementation(anchor => owned && anchor === 'om-close-wait-seed');
+      handlers.handleNewTopic.mockImplementation(async data => {
+        if (data === seed) await creation;
+      });
+
+      capturedHandlers['im.message.receive_v1'](seed);
+      await flushFake();
+      await vi.advanceTimersByTimeAsync(25);
+      await flushFake();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(seed, expect.anything());
+      capturedHandlers['im.message.receive_v1'](reply);
+      await flushFake();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+      const persistedCall = mockWriteFileSync.mock.calls.findLast(call =>
+        String(call[0]).includes('forward-followups-') && String(call[1]).includes('om-close-wait-seed'));
+      const serialized = String(persistedCall?.[1]);
+
+      runtimes[0]!.close();
+      await flushFake();
+      mockReadFileSync.mockImplementation(path => String(path).includes('forward-followups-') ? serialized : '[]');
+      makeRuntime();
+      await flushFake();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+
+      owned = true;
+      releaseCreation();
+      await flushFake();
+      expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+      expect(handlers.handleThreadReply).toHaveBeenCalledWith(reply, expect.objectContaining({
+        anchor: 'om-close-wait-seed',
+      }));
+    } finally {
+      owned = true;
+      releaseCreation();
+      for (const item of runtimes) item.close();
+      await flushFake();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the durable record when restore shares an old dispatch that later fails twice', async () => {
+    vi.useFakeTimers();
+    const runtimes: Array<ReturnType<typeof createLarkEventDispatcherRuntime>> = [];
+    let releaseCreation!: () => void;
+    const flushFake = async () => {
+      for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(0);
+    };
+    const makeRuntime = () => {
+      capturedHandlers = {};
+      const next = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+      runtimes.push(next);
+      next.connect();
+      markForwardFollowupsSessionsReady(MY_APP_ID);
+      return next;
+    };
+    try {
+      capturedHandlers = {};
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupMentionMode: 'topic',
+        autoStartOnNewTopic: true,
+        soloGroupMentionBypass: false,
+      });
+      mockGetChatMode.mockResolvedValue('topic');
+      makeRuntime();
+      const seed = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: '{}',
+        messageType: 'merge_forward',
+        messageId: 'om-restore-race-seed',
+        chatId: 'chat-restore-race',
+        chatType: 'group',
+      });
+      const creation = new Promise<void>(resolve => { releaseCreation = resolve; });
+      handlers.handleNewTopic.mockImplementationOnce(async () => {
+        await creation;
+        throw new Error('old first dispatch fails after restore');
+      }).mockRejectedValueOnce(new Error('old second dispatch fails'));
+
+      capturedHandlers['im.message.receive_v1'](seed);
+      await flushFake();
+      await vi.advanceTimersByTimeAsync(25);
+      await flushFake();
+      const persistedCall = mockWriteFileSync.mock.calls.findLast(call =>
+        String(call[0]).includes('forward-followups-') && String(call[1]).includes('om-restore-race-seed'));
+      let stored = String(persistedCall?.[1]);
+      mockWriteFileSync.mockImplementation((path, content) => {
+        if (String(path).includes('forward-followups-')) stored = String(content);
+      });
+      mockReadFileSync.mockImplementation(path => String(path).includes('forward-followups-') ? stored : '[]');
+
+      runtimes[0]!.close();
+      makeRuntime();
+      await flushFake();
+      const removedWhileOldDispatchPending = stored === '[]';
+      releaseCreation();
+      await flushFake();
+      expect(removedWhileOldDispatchPending).toBe(false);
+      expect(stored).not.toBe('[]');
+      expect(handlers.handleNewTopic).toHaveBeenCalledTimes(2);
+
+      makeRuntime();
+      await flushFake();
+      expect(handlers.handleNewTopic).toHaveBeenCalledTimes(3);
+    } finally {
+      releaseCreation();
+      for (const item of runtimes) item.close();
+      await flushFake();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds a restored wait without replacing a stuck original dispatch', async () => {
+    vi.useFakeTimers();
+    const runtimes: Array<ReturnType<typeof createLarkEventDispatcherRuntime>> = [];
+    let releaseCreation!: () => void;
+    const flushFake = async () => {
+      for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(0);
+    };
+    const makeRuntime = () => {
+      capturedHandlers = {};
+      const next = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+      runtimes.push(next);
+      next.connect();
+      markForwardFollowupsSessionsReady(MY_APP_ID);
+      return next;
+    };
+    try {
+      capturedHandlers = {};
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupMentionMode: 'topic',
+        autoStartOnNewTopic: true,
+        soloGroupMentionBypass: false,
+      });
+      mockGetChatMode.mockResolvedValue('topic');
+      makeRuntime();
+      const seed = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: '{}',
+        messageType: 'merge_forward',
+        messageId: 'om-restore-stuck-seed',
+        chatId: 'chat-restore-stuck',
+        chatType: 'group',
+      });
+      const creation = new Promise<void>(resolve => { releaseCreation = resolve; });
+      handlers.handleNewTopic.mockImplementation(async data => {
+        if (data === seed) await creation;
+      });
+
+      capturedHandlers['im.message.receive_v1'](seed);
+      await flushFake();
+      await vi.advanceTimersByTimeAsync(25);
+      await flushFake();
+      const persistedCall = mockWriteFileSync.mock.calls.findLast(call =>
+        String(call[0]).includes('forward-followups-') && String(call[1]).includes('om-restore-stuck-seed'));
+      let stored = String(persistedCall?.[1]);
+      mockWriteFileSync.mockImplementation((path, content) => {
+        if (String(path).includes('forward-followups-')) stored = String(content);
+      });
+      mockReadFileSync.mockImplementation(path => String(path).includes('forward-followups-') ? stored : '[]');
+
+      runtimes[0]!.close();
+      makeRuntime();
+      await flushFake();
+      await vi.advanceTimersByTimeAsync(30_000);
+      await flushFake();
+
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(stored).not.toBe('[]');
+      expect(vi.mocked(logger.error).mock.calls.flat().join('\n')).toContain('in-flight dispatch wait timed out');
+    } finally {
+      releaseCreation();
+      for (const item of runtimes) item.close();
+      await flushFake();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps explicit mentions immediate in a chat excluded from auto-start', async () => {
+    capturedHandlers = {};
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'topic',
+      autoStartOnNewTopic: true,
+      soloGroupMentionBypass: false,
+    });
+    mockGetBot().config.autoStartExcludedChats = ['chat-excluded-forward'];
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA immediate request' }),
+      messageId: 'om-excluded-explicit',
+      chatId: 'chat-excluded-forward',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      forwardSeedData: undefined,
+    }));
   });
 
   it('waits for an earlier seed still resolving routing before matching the clarification', async () => {
@@ -459,7 +1272,8 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
 
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(clarification, expect.objectContaining({
-      anchor: 'msg-racing-clarification',
+      anchor: 'msg-racing-seed',
+      replyAnchorMessageId: 'msg-racing-clarification',
       forwardSeedData: seed,
     }));
   });
