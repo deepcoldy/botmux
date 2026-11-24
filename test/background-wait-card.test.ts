@@ -22,7 +22,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {
 } }));
 import {
   initWorkerPool, setActiveSessionsRegistry, getActiveSessionsRegistry, streamCardLabel,
-  usageRefreshShouldRun, syncUsageRefreshTimer, USAGE_REFRESH_INTERVAL_MS,
+  usageRefreshShouldRun, syncUsageRefreshTimer, USAGE_REFRESH_INTERVAL_MS, sendWorkerInput,
   __testOnly_setupWorkerHandlers as setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { registerBot } from '../src/bot-registry.js';
@@ -37,6 +37,7 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { composeRowFromActive } from '../src/core/dashboard-rows.js';
+import { armSilentScheduledTurn, noteNonSilentTurnActivity } from '../src/core/silent-schedule-turns.js';
 import { markSessionActivity } from '../src/core/session-activity.js';
 import { normalizeExecutionActivity } from '../src/core/execution-activity.js';
 import { sessionLastActivityAt } from '../src/dashboard/web/sessions.js';
@@ -715,5 +716,208 @@ describe('away-summary pending on screen_update', () => {
     expect(ds.awaySummaryPending).toBe(true);
     await screenUpdate('idle', 1, { awaySummaryPending: false });
     expect(ds.awaySummaryPending).toBe(false);
+  });
+});
+
+describe('activeTurnSilentSchedule projection and SSE updates', () => {
+  it('publishes activeTurnSilentSchedule on dashboard row and SSE transitions', async () => {
+    const patches: Array<Record<string, unknown>> = [];
+    const unsubscribe = dashboardEventBus.subscribe(ev => {
+      if (ev.type === 'session.update' && ev.body.sessionId === ds.session.sessionId) {
+        patches.push(ev.body.patch);
+      }
+    });
+    try {
+      await screenUpdate('idle');
+      patches.length = 0;
+
+      armSilentScheduledTurn(ds, 'schedule:poll:1');
+      ds.currentTurnId = 'schedule:poll:1';
+      await screenUpdate('working', undefined, { turnId: 'schedule:poll:1' });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBe(true);
+      expect(patches.at(-1)).toMatchObject({ status: 'working', activeTurnSilentSchedule: true });
+
+      // A human turn takes over while status stays working → patch flips false immediately.
+      ds.currentTurnId = 'om_human_next';
+      await screenUpdate('working', undefined, { turnId: 'om_human_next' });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBeUndefined();
+      expect(patches.at(-1)).toMatchObject({ activeTurnSilentSchedule: false });
+
+      // Settling back to idle clears lastScreenTurnId and keeps flag absent.
+      await screenUpdate('idle', undefined, { turnId: 'om_human_next' });
+      expect(ds.lastScreenTurnId).toBeUndefined();
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBeUndefined();
+      expect(patches.at(-1)).toMatchObject({ status: 'idle', activeTurnSilentSchedule: false });
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('recognizes shared-session silent schedule after finished human turn and clears on Web Terminal direct submit or terminated turn frame', async () => {
+    const patches: Array<Record<string, unknown>> = [];
+    const unsubscribe = dashboardEventBus.subscribe(ev => {
+      if (ev.type === 'session.update' && ev.body.sessionId === ds.session.sessionId) {
+        patches.push(ev.body.patch);
+      }
+    });
+    try {
+      // Previous human turn finished; ds.currentTurnId still holds the old human ID.
+      ds.currentTurnId = 'om_human_prev';
+      noteNonSilentTurnActivity(ds);
+      await screenUpdate('idle', undefined, { turnId: 'om_human_prev' });
+      patches.length = 0;
+
+      // Silent schedule fires on shared session without modifying ds.currentTurnId.
+      armSilentScheduledTurn(ds, 'schedule:poll:2');
+      await screenUpdate('working', undefined, { turnId: 'schedule:poll:2' });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBe(true);
+      expect(patches.at(-1)).toMatchObject({ status: 'working', activeTurnSilentSchedule: true });
+
+      // Silent schedule terminates, then a user submits directly in Web Terminal.
+      ds.lastTurnTerminalTurnId = 'schedule:poll:2';
+      ds.lastTurnTerminalStatus = 'completed';
+      await worker.listeners('message')[0]({ type: 'terminal_input', submitted: true });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBeUndefined();
+      expect(patches.at(-1)).toMatchObject({ activeTurnSilentSchedule: false });
+
+      // Direct-submit busy frame (no turnId) and stale frame naming terminated schedule must stay non-silent.
+      await screenUpdate('working', undefined, { turnId: undefined, directSubmit: true });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBeUndefined();
+
+      await screenUpdate('working', undefined, { turnId: 'schedule:poll:2' });
+      expect(ds.lastScreenTurnId).toBeUndefined();
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBeUndefined();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('flips activeTurnSilentSchedule false immediately when sendWorkerInput admits a non-silent retry without touching ds.currentTurnId', async () => {
+    const patches: Array<Record<string, unknown>> = [];
+    const unsubscribe = dashboardEventBus.subscribe(ev => {
+      if (ev.type === 'session.update' && ev.body.sessionId === ds.session.sessionId) {
+        patches.push(ev.body.patch);
+      }
+    });
+    try {
+      (worker as any).send.mockReturnValue(true);
+      await screenUpdate('idle');
+      patches.length = 0;
+
+      armSilentScheduledTurn(ds, 'schedule:poll:retry');
+      expect(sendWorkerInput(ds, { content: 'silent poll' }, 'schedule:poll:retry')).toBe(true);
+      await screenUpdate('working', undefined, { turnId: 'schedule:poll:retry' });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBe(true);
+      expect(patches.at(-1)).toMatchObject({ status: 'working', activeTurnSilentSchedule: true });
+      patches.length = 0;
+
+      // Mirror retry_turn / retry_last_task / decision-board non-silent injection:
+      // sendWorkerInput admits a new non-silent turnId without updating ds.currentTurnId.
+      const accepted = sendWorkerInput(ds, { content: 'human retry' }, 'retry-human-1');
+      expect(accepted).toBe(true);
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBeUndefined();
+      expect(patches.at(-1)).toEqual({ activeTurnSilentSchedule: false });
+
+      // A lagging or type-ahead folded frame still naming the old silent turnId must stay non-silent.
+      await screenUpdate('working', undefined, { turnId: 'schedule:poll:retry' });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBeUndefined();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('flips activeTurnSilentSchedule false on a directSubmit working frame even without a preceding terminal_input', async () => {
+    const patches: Array<Record<string, unknown>> = [];
+    const unsubscribe = dashboardEventBus.subscribe(ev => {
+      if (ev.type === 'session.update' && ev.body.sessionId === ds.session.sessionId) {
+        patches.push(ev.body.patch);
+      }
+    });
+    try {
+      await screenUpdate('idle');
+      patches.length = 0;
+
+      armSilentScheduledTurn(ds, 'schedule:poll:direct');
+      await screenUpdate('working', undefined, { turnId: 'schedule:poll:direct' });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBe(true);
+      patches.length = 0;
+
+      // Direct-submit busy frame arrives WITHOUT any prior terminal_input IPC.
+      await screenUpdate('working', undefined, { turnId: undefined, directSubmit: true });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBeUndefined();
+      expect(patches.at(-1)).toMatchObject({ activeTurnSilentSchedule: false });
+
+      // Subsequent lagging frame naming the old silent turnId stays non-silent.
+      await screenUpdate('working', undefined, { turnId: 'schedule:poll:direct' });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBeUndefined();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('clears activeTurnSilentSchedule and publishes SSE false when turn_terminal lands for the silent turn', async () => {
+    const patches: Array<Record<string, unknown>> = [];
+    const unsubscribe = dashboardEventBus.subscribe(ev => {
+      if (ev.type === 'session.update' && ev.body.sessionId === ds.session.sessionId) {
+        patches.push(ev.body.patch);
+      }
+    });
+    try {
+      await screenUpdate('idle');
+      patches.length = 0;
+
+      armSilentScheduledTurn(ds, 'schedule:poll:terminal');
+      await screenUpdate('working', undefined, { turnId: 'schedule:poll:terminal' });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBe(true);
+      patches.length = 0;
+
+      // Exact turn_terminal arrives before any idle screen_update.
+      await worker.listeners('message')[0]({
+        type: 'turn_terminal',
+        sessionId: ds.session.sessionId,
+        turnId: 'schedule:poll:terminal',
+        status: 'completed',
+      });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBeUndefined();
+      expect(patches.at(-1)).toEqual({ activeTurnSilentSchedule: false });
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('clears activeTurnSilentSchedule and backgroundTaskCount on worker exit in both row and SSE patch', async () => {
+    const patches: Array<Record<string, unknown>> = [];
+    const unsubscribe = dashboardEventBus.subscribe(ev => {
+      if (ev.type === 'session.update' && ev.body.sessionId === ds.session.sessionId) {
+        patches.push(ev.body.patch);
+      }
+    });
+    try {
+      await screenUpdate('idle');
+      patches.length = 0;
+
+      armSilentScheduledTurn(ds, 'schedule:poll:exit');
+      await screenUpdate('working', 2, { turnId: 'schedule:poll:exit' });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false })).toMatchObject({
+        activeTurnSilentSchedule: true,
+        backgroundTaskCount: 2,
+      });
+      patches.length = 0;
+
+      worker.killed = true;
+      worker.emit('exit', 1, null);
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBeUndefined();
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).backgroundTaskCount).toBeUndefined();
+      const mergedPatch = Object.assign({}, ...patches);
+      expect(mergedPatch).toMatchObject({
+        status: 'dormant',
+        webPort: null,
+        workerPid: null,
+        backgroundTaskCount: null,
+        activeTurnSilentSchedule: false,
+      });
+    } finally {
+      unsubscribe();
+    }
   });
 });
