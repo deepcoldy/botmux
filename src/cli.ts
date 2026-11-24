@@ -9049,6 +9049,27 @@ async function detectConfinedCurrentSession(): Promise<CurrentSession | null> {
   };
 }
 
+/** The confined CLI's own session row, rebuilt from the daemon's proof for
+ *  the live turn. Only the session this process runs in qualifies, and the row
+ *  only routes the command: every request still authenticates to the daemon. */
+async function confinedSessionRow(sid: string): Promise<SessionData | undefined> {
+  if (sid !== process.env.BOTMUX_SESSION_ID) return undefined;
+  const current = await detectConfinedCurrentSession();
+  if (!current || current.sessionId !== sid || !current.larkAppId) return undefined;
+  return {
+    sessionId: current.sessionId,
+    status: 'active',
+    larkAppId: current.larkAppId,
+    chatId: current.chatId,
+    rootMessageId: current.rootMessageId,
+    chatType: current.chatType,
+    scope: current.scope,
+    workingDir: current.workingDir,
+    ownerOpenId: current.ownerOpenId,
+    ownerUnionId: current.ownerUnionId,
+  } as unknown as SessionData;
+}
+
 /**
  * Resolve the session whose live CLI process is an authenticated ancestor.
  *
@@ -10358,7 +10379,15 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
       return { sid, larkAppId: riff.session.larkAppId!, session: riff.session };
     }
   }
-  const s = await requireSessionById(sid);
+  const resolved = await resolveSessionById(sid, { dataDir: resolveDataDir() });
+  let s: SessionData | undefined = resolved.ok ? resolved.session as unknown as SessionData : undefined;
+  // Assistant mode withholds both the daemon secret and the session store
+  // from the confined CLI, so the lookup above cannot see its own session.
+  if (!resolved.ok && resolved.reason === 'not_found') s = await confinedSessionRow(sid);
+  if (!s) {
+    console.error(resolved.ok ? `未找到 session ${sid}` : resolved.message);
+    process.exit(1);
+  }
   if (!s.larkAppId) {
     console.error(`session ${sid} 缺少 larkAppId，无法获取消息`);
     process.exit(1);
