@@ -133,4 +133,51 @@ describe('Antigravity recovery delivery through the real screen sampler', () => 
     expect(messages).toHaveLength(3);
     expect(messages[2]?.usageLimit.directFailure).toBeUndefined();
   });
+
+  it('deduplicates a stable non-agy limit while its wall-clock deadline is recomputed', async () => {
+    vi.useFakeTimers();
+    let retryReady = false;
+    class FakeRenderer {
+      snapshot() { return { content: 'same-generic-limit', changed: false }; }
+      rawSnapshot() { return 'same-generic-limit'; }
+      dispose() {}
+    }
+    class FakePromptSuggestions { observe() {} take() { return undefined; } }
+    const messages: Array<Record<string, any>> = [];
+    const startScreenUpdates = loadWorkerFunction<() => void>('startScreenUpdates', {
+      TerminalRenderer: FakeRenderer, PromptSuggestionPublisher: FakePromptSuggestions,
+      renderCols: 80, renderRows: 24, screenUpdateTimer: undefined, SCREEN_UPDATE_INTERVAL_MS: 20,
+      backend: {}, cliSpawnGeneration: 1, awaitingFirstPrompt: false, observedPaneGridRevision: 0,
+      lastPtyActivityAtMs: 0, shouldCaptureScreen: () => true, isScreenSelfDriven: () => false,
+      snapshotToText: async () => null, snapshotWithLatestRuntimeStatus, projectedRuntimeScreenStatus: () => 'idle',
+      classifyUsageLimitWithNativeEvidence: () => ({
+        status: 'limited',
+        usageLimit: {
+          limited: true, kind: 'usage', retryAtMs: Date.now() + 60_000,
+          retryLabel: '1m', retryReady, relativeResetKey: 'usage:stable-generic-limit',
+        },
+      }),
+      cliAdapter: { id: 'traex' }, lastInitConfig: { cliId: 'traex' }, lastAnalyzerSnapshot: '',
+      traexQuestionBridgeActive: () => false, traexQuestionFlowVisible: () => false,
+      observeTraexAutoModelCapacity: () => {}, publishNativeReasoningFooter: () => {},
+      promptSuggestionReportTurn: () => undefined, settleBackgroundTasksFromSiblings: () => {},
+      refreshBackgroundWait: () => {}, backgroundWaitTasks: 0, startupInputHeld: () => false,
+      backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
+      currentBotmuxTurnId: 'turn-generic', currentBotmuxDispatchAttempt: 1,
+      send: (message: Record<string, unknown>) => messages.push(message), log: () => {},
+    });
+
+    startScreenUpdates();
+    await vi.advanceTimersByTimeAsync(20);
+    expect(messages).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(messages).toHaveLength(1);
+
+    retryReady = true;
+    await vi.advanceTimersByTimeAsync(20);
+    expect(messages).toHaveLength(2);
+    expect(messages[1]?.usageLimit.retryReady).toBe(true);
+    await vi.advanceTimersByTimeAsync(40);
+    expect(messages).toHaveLength(2);
+  });
 });

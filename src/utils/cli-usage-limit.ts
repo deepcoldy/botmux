@@ -13,6 +13,9 @@ export interface CliUsageLimitState {
   source?: 'antigravity-error-composer' | 'antigravity-native-log';
   /** Stable native failure identity, independent of the reset-time format. */
   nativeEpisodeKey?: string;
+  /** When a composer episode was observed together with agy's log, persist that
+   * exact log key. A different later log key must not inherit old recovery. */
+  nativeLogEpisodeKey?: string;
   /** The exact failed input has durable proof of no assistant/tool progress. */
   directFailure?: true;
 }

@@ -152,6 +152,25 @@ describe('raw ANSI tmux quota classification', () => {
     expect(usageLimitTracker.detectedThisTurn(turn)).toBe(true);
   });
 
+  it('does not let an old composer veto a different native-log key', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const footerless = currentQuotaScreen.slice(0, currentQuotaScreen.indexOf('\n? for shortcuts'));
+    let screen = footerless;
+    let nativeKey = 'native-composer-a';
+    const { classify } = classifier(() => screen, 'antigravity', true, false, undefined,
+      () => ({ key: nativeKey, text: screen }));
+    expect(classify('', 'idle').usageLimit).toMatchObject({
+      source: 'antigravity-error-composer', nativeEpisodeKey: expect.stringMatching(/^composer:/),
+    });
+
+    screen = currentQuotaScreen;
+    nativeKey = 'native-log-b-different-timestamp';
+    expect(classify('', 'idle')).toMatchObject({
+      status: 'limited',
+      usageLimit: { source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-log-b-different-timestamp' },
+    });
+  });
+
   it('re-arms an answered turn for a different native-log episode on identical pixels', () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
     let nativeKey = 'native-answered-old';

@@ -370,6 +370,23 @@ describe('usage-limit sticky state self-heal', () => {
     expect(ds.rateLimitNotifiedKey).toBe(usageLimitStateKey(fresh));
   });
 
+  it('notifies a new confirmed native episode even when the previous one is still limited', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const base = {
+      ...rateLimitState(), source: 'antigravity-native-log' as const, relativeResetKey: 'usage:same-native-pixels',
+    };
+    const first = { ...base, nativeEpisodeKey: 'log:native-a' };
+    await dispatch(worker, { type: 'screen_update', content: 'same native quota', status: 'limited', usageLimit: first });
+    expect(ds.rateLimitNotifiedKey).toBe(usageLimitStateKey(first));
+
+    const replacement = { ...base, nativeEpisodeKey: 'log:native-b' };
+    await dispatch(worker, { type: 'screen_update', content: 'same native quota', status: 'limited', usageLimit: replacement });
+    expect(ds.usageLimit?.nativeEpisodeKey).toBe('log:native-b');
+    expect(ds.rateLimitNotifiedKey).toBe(usageLimitStateKey(replacement));
+  });
+
   it('persists native provenance when a partial quota frame later gains its complete composer', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 9, 1));

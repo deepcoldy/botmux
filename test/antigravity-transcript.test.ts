@@ -148,17 +148,17 @@ describe('unwrapAntigravityUserInput', () => {
 describe('antigravityTurnFailedWithoutOutput', () => {
   it('accepts the exact last input followed only by non-output bookkeeping', () => {
     writeFileSync(path, line(userRecord(USER_REQUEST)) + line({ type: 'CHECKPOINT', content: 'checkpoint' }));
-    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(true);
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST, { cliVersion: '1.2.13' })).toBe(true);
   });
 
   it('accepts a repeated prompt after multi-hop replay when the last input has no output', () => {
     writeFileSync(path, line(userRecord(USER_REQUEST)) + line(userRecord(USER_REQUEST)));
-    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(true);
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST, { cliVersion: '1.2.13' })).toBe(true);
   });
 
   it('accepts a repeated prompt after an older completed turn', () => {
     writeFileSync(path, line(userRecord('继续')) + line(plannerStep({ content: '好的' })) + line(userRecord('继续')));
-    expect(antigravityTurnFailedWithoutOutput(path, '继续')).toBe(true);
+    expect(antigravityTurnFailedWithoutOutput(path, '继续', { cliVersion: '1.2.13' })).toBe(true);
   });
 
   it.each([
@@ -166,12 +166,12 @@ describe('antigravityTurnFailedWithoutOutput', () => {
     ['assistant text', line(plannerStep({ content: 'partial answer' }))],
   ])('rejects a repeated last prompt followed by %s', (_name, suffix) => {
     writeFileSync(path, line(userRecord(USER_REQUEST)) + line(userRecord(USER_REQUEST)) + suffix);
-    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(false);
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST, { cliVersion: '1.2.13' })).toBe(false);
   });
 
   it('normalizes CRLF in the submitted input before matching', () => {
     writeFileSync(path, line(userRecord('first line\nsecond line')));
-    expect(antigravityTurnFailedWithoutOutput(path, 'first line\r\nsecond line')).toBe(true);
+    expect(antigravityTurnFailedWithoutOutput(path, 'first line\r\nsecond line', { cliVersion: '1.2.13' })).toBe(true);
   });
 
   it.each([
@@ -182,21 +182,22 @@ describe('antigravityTurnFailedWithoutOutput', () => {
     ['a later user input', line(userRecord('newer input'))],
   ])('fails closed after %s', (_name, suffix) => {
     writeFileSync(path, line(userRecord(USER_REQUEST)) + suffix);
-    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(false);
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST, { cliVersion: '1.2.13' })).toBe(false);
   });
 
   it('ignores progress belonging only to an older input and rejects a partial later record', () => {
     writeFileSync(path, line(userRecord('older input')) + line(plannerStep({ toolCalls: [toolCall('old_tool')] }))
       + line(userRecord(USER_REQUEST)));
-    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(true);
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST, { cliVersion: '1.2.13' })).toBe(true);
     appendFileSync(path, '{"type":"PLANNER_RESPONSE"');
-    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(false);
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST, { cliVersion: '1.2.13' })).toBe(false);
   });
 
   it('attaches the proof in the worker only while the exact turn has no progress', () => {
     const prove = loadWorkerFunction<(limit: CliUsageLimitState) => CliUsageLimitState>(
       'withAntigravityDirectFailureProof', {
         codexBridgeRolloutPath: path,
+        lastInitConfig: { cliVersion: '1.2.13' },
         lastWrittenCliInput: { turnId: 'turn-1', content: USER_REQUEST },
         currentBotmuxTurnId: 'turn-1', antigravityTurnFailedWithoutOutput,
       },
@@ -246,7 +247,7 @@ describe('antigravityTurnFailedWithoutOutput', () => {
     writeFileSync(fullPath, user);
     writeFileSync(path, user + tool);
     expect(antigravityTurnFailedWithoutOutput(fullPath, USER_REQUEST)).toBe(false);
-    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(false);
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST, { cliVersion: '1.2.13' })).toBe(false);
   });
 
   it('accepts a consistent full/compact pair with no output after the last input', () => {
@@ -305,6 +306,28 @@ describe('antigravityTurnFailedWithoutOutput', () => {
     writeFileSync(fullPath, line(userRecord(USER_REQUEST)));
     writeFileSync(path, line(userRecord(USER_REQUEST)) + '{"type":"PLANNER_RESPONSE"');
     expect(antigravityTurnFailedWithoutOutput(fullPath, USER_REQUEST)).toBe(false);
+  });
+
+  it('requires a verified old version for compact-only proof, even across transient full creation', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const user = line(userRecord(USER_REQUEST));
+    for (const cliVersion of [undefined, '1.4.7']) {
+      writeFileSync(path, user);
+      let checked = false;
+      expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST, {
+        cliVersion,
+        existsSync: candidate => {
+          if (!checked && candidate === fullPath) {
+            checked = true;
+            writeFileSync(fullPath, user + line(plannerStep({ toolCalls: [toolCall('create_the_file')] })));
+            rmSync(fullPath);
+          }
+          return false;
+        },
+      })).toBe(false);
+      expect(checked).toBe(true);
+    }
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST, { cliVersion: '1.2.13' })).toBe(true);
   });
 
   it('fails closed on a different input or a missing transcript', () => {

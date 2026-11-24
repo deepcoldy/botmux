@@ -10017,7 +10017,7 @@ function withAntigravityDirectFailureProof(limit: CliUsageLimitState): CliUsageL
       transcriptPath = nativeSessionId ? resolveAntigravityTranscriptPath(nativeSessionId) ?? undefined : undefined;
     }
   }
-  return antigravityTurnFailedWithoutOutput(transcriptPath, written)
+  return antigravityTurnFailedWithoutOutput(transcriptPath, written, { cliVersion: lastInitConfig?.cliVersion })
     ? { ...limit, directFailure: true }
     : limit;
 }
@@ -10065,6 +10065,11 @@ function classifyUsageLimitWithNativeEvidence(
     evidence = stripAnsiScreenText(evidence);
     if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
     const nativeQuota = readAntigravityNativeQuota();
+    const linkComposerToNativeLog = (state: CliUsageLimitState): CliUsageLimitState => {
+      if (state.source !== 'antigravity-error-composer' || !state.nativeEpisodeKey || !nativeQuota) return state;
+      const logKey = `log:${nativeQuota.key}`;
+      return state.nativeLogEpisodeKey === logKey ? state : { ...state, nativeLogEpisodeKey: logKey };
+    };
     const previousFor = (state: CliUsageLimitState, nativeKey?: string): CliUsageLimitState | undefined => {
       const key = state.relativeResetKey;
       const episode = nativeKey ? `log:${nativeKey}` : cliUsageLimitEpisodeKey(state) ?? key;
@@ -10075,7 +10080,8 @@ function classifyUsageLimitWithNativeEvidence(
         // returned. Only that composer source may share the relative key;
         // another native-log episode with the same countdown is NOT a match.
         ?? (nativeKey && key
-          ? history?.find(entry => entry.relativeResetKey === key && entry.source === 'antigravity-error-composer')
+          ? history?.find(entry => entry.relativeResetKey === key && entry.source === 'antigravity-error-composer'
+            && entry.nativeLogEpisodeKey === `log:${nativeKey}`)
           : undefined)
         // Before an Error ID arrived, only an unconfirmed partial frame can
         // provide the first deadline. Confirmed other episodes never lend it.
@@ -10088,7 +10094,7 @@ function classifyUsageLimitWithNativeEvidence(
     if (nativeQuota) {
       const candidate = detectCliUsageLimit(evidence);
       if (candidate.limited) {
-        const composerCandidate = annotateAntigravityUsageLimit(evidence, candidate);
+        const composerCandidate = linkComposerToNativeLog(annotateAntigravityUsageLimit(evidence, candidate));
         const annotated = annotateAntigravityUsageLimit(evidence, composerCandidate, {
           text: nativeQuota.text, key: nativeQuota.key, previous: previousFor(composerCandidate, nativeQuota.key),
         });
@@ -10098,7 +10104,7 @@ function classifyUsageLimitWithNativeEvidence(
     let expiredAntigravityQuota: CliUsageLimitState | undefined;
     const result = usageLimitTracker.classify(evidence, status, state => {
       const key = state.relativeResetKey;
-      const composerObserved = annotateAntigravityUsageLimit(evidence, state);
+      const composerObserved = linkComposerToNativeLog(annotateAntigravityUsageLimit(evidence, state));
       const previous = previousFor(composerObserved, nativeQuota?.key);
       const annotated = annotateAntigravityUsageLimit(evidence, composerObserved, {
         text: nativeQuota?.text, key: nativeQuota?.key, previous,
@@ -19487,7 +19493,7 @@ async function captureAndUpload(): Promise<void> {
   // fresh key and is delivered once.
   const limitIdentity = (limit: CliUsageLimitState | undefined): string | undefined => limit
     ? JSON.stringify([
-      limit.kind, limit.retryAtMs, limit.retryLabel, limit.retryReady,
+      limit.kind, limit.retryLabel, limit.retryReady,
       limit.nativeEpisodeKey, limit.relativeResetKey, limit.source, limit.directFailure === true,
     ])
     : undefined;
@@ -27773,7 +27779,7 @@ function startScreenUpdates(): void {
       const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
       const usageLimit = usageAware.usageLimit;
       const usageLimitEvidence = usageLimit ? JSON.stringify([
-        usageLimit.kind, usageLimit.retryAtMs, usageLimit.retryLabel, usageLimit.retryReady,
+        usageLimit.kind, usageLimit.retryLabel, usageLimit.retryReady,
         usageLimit.nativeEpisodeKey, usageLimit.relativeResetKey, usageLimit.source, usageLimit.directFailure === true,
       ]) : undefined;
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey

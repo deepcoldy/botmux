@@ -198,8 +198,8 @@ export function clearLimitedFailedTurn(
   authorization: { currentGenerationCompleted?: boolean } = {},
 ): void {
   const record = ds.session.lastFailedTurn;
-  cancelLimitedFailedTurnClearRetry(ds);
   if (!record?.limitedSnapshot || record.recovery || turnId !== undefined && record.turnId !== turnId) return;
+  cancelLimitedFailedTurnClearRetry(ds);
   delete ds.session.lastFailedTurn;
   try {
     store.updateSession(ds.session);

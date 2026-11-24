@@ -246,10 +246,15 @@ export function rememberAntigravityQuota(
 ): readonly CliUsageLimitState[] | undefined {
   const episode = cliUsageLimitEpisodeKey(state);
   if (state.source !== 'antigravity-error-composer' && state.source !== 'antigravity-native-log'
-    || !episode || history?.some(entry => cliUsageLimitEpisodeKey(entry) === episode)) {
-    return history;
-  }
-  return [...(history?.slice(1 - ANTIGRAVITY_QUOTA_HISTORY_LIMIT) ?? []), state];
+    || !episode) return history;
+  const existing = history?.find(entry => cliUsageLimitEpisodeKey(entry) === episode);
+  if (!existing) return [...(history?.slice(1 - ANTIGRAVITY_QUOTA_HISTORY_LIMIT) ?? []), state];
+  // A composer may first be seen before its log arrives. Attach the first exact
+  // log association without moving the episode or allowing a later key to
+  // overwrite it.
+  if (existing.nativeLogEpisodeKey || !state.nativeLogEpisodeKey) return history;
+  return history!.map(entry => entry === existing
+    ? { ...entry, nativeLogEpisodeKey: state.nativeLogEpisodeKey } : entry);
 }
 
 /** Walk the tail of a viewport (ready footer → separators → composer) and

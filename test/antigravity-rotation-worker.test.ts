@@ -718,6 +718,31 @@ describe('Antigravity worker-pool replay safety', () => {
     expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(0);
   });
 
+  it('records a screenshot-only replacement turn before evaluating the new limited episode', async () => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    const first = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-turn-a', h.nowMs);
+    h.ds.usageLimit = first;
+    h.ds.session.usageLimit = first;
+    h.ds.lastScreenStatus = 'limited';
+    h.ds.suppressRecoveryCard = true;
+    h.ds.lastCliInputTurnId = 'turn-2';
+    h.ds.session.lastCliInputTurnId = 'turn-2';
+    h.ds.lastCliInput = 'task two';
+    h.ds.lastUserPrompt = 'task two';
+    h.ds.activeInteractiveTurn = { turnId: 'turn-2', caller: {
+      senderType: 'user', requestLarkAppId: h.ds.larkAppId, requestUserOpenId: 'ou_owner',
+    } };
+    h.sessionStore.updateSession(h.ds.session);
+    const replacement = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-turn-b', h.nowMs);
+
+    await Promise.all(h.worker.listeners('message').map(listener => listener({
+      type: 'screenshot_uploaded', imageKey: 'img-new-turn', status: 'limited', turnId: 'turn-2', usageLimit: replacement,
+    })));
+    await h.flush();
+    expect(h.ds.session.lastFailedTurn).toMatchObject({ turnId: 'turn-2', limitedSnapshot: true });
+    expect(h.sessionStore.getSessionFresh(h.ds.session.sessionId)?.lastFailedTurn?.turnId).toBe('turn-2');
+  });
+
   it('reports pool exhaustion and the observed reset duration instead of leaving a working card', async () => {
     const h = await setupRotationScenario({ directFailure: true, accountCount: 1 });
     const retryOffsetMs = ((2 * 60 + 39) * 60 + 35) * 1000;

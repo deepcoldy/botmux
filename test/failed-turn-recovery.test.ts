@@ -511,7 +511,7 @@ describe('controlled failed-turn recovery', () => {
     recordLimitedFailedTurn(ds, request.turnId);
     expect(ds.session.lastFailedTurn.directFailure).toBeUndefined();
   });
-  it.each(['clone', 'new-turn', 'new-failed-at', 'recovery-claim', 'ownership-lost', 'generation-change', 'current-turn', 'new-limit'] as const)('owns cleanup retry across %s', async mode => {
+  it.each(['clone', 'new-turn', 'new-failed-at', 'recovery-claim', 'ownership-lost', 'generation-change', 'current-turn', 'new-limit', 'unrelated-completed'] as const)('owns cleanup retry across %s', async mode => {
     vi.useFakeTimers();
     try {
       const original = { ...ds.session.lastFailedTurn, limitedSnapshot: true };
@@ -520,6 +520,7 @@ describe('controlled failed-turn recovery', () => {
       vi.mocked(store.updateSession).mockImplementation(() => {
         if (fail) throw new Error('injected cleanup write failure');
       });
+      if (mode === 'unrelated-completed') ds.session.workerGeneration = 1;
       expect(() => clearLimitedFailedTurn(ds, request.turnId)).toThrow('injected cleanup write failure');
       expect(ds.session.lastFailedTurn).toMatchObject({ turnId: request.turnId, failedAt: request.failedAt });
 
@@ -543,9 +544,14 @@ describe('controlled failed-turn recovery', () => {
       if (mode === 'new-limit') ds.usageLimit = {
         limited: true, kind: 'usage', source: 'antigravity-native-log', nativeEpisodeKey: 'log:new-limit',
       };
+      if (mode === 'unrelated-completed') {
+        ds.session.workerGeneration = 1;
+        recordFailedTurnTerminal(ds, { turnId: 'om_unrelated', status: 'completed' },
+          { workerGeneration: 1, caller: undefined, silent: false });
+      }
       fail = false;
       await vi.advanceTimersByTimeAsync(500);
-      if (mode === 'clone') expect(ds.session.lastFailedTurn).toBeUndefined();
+      if (mode === 'clone' || mode === 'unrelated-completed') expect(ds.session.lastFailedTurn).toBeUndefined();
       else if (mode === 'new-turn') expect(ds.session.lastFailedTurn).toMatchObject({ turnId: 'om_newer' });
       else if (mode === 'new-failed-at') {
         expect(ds.session.lastFailedTurn).toMatchObject({ failedAt: '2026-10-16T00:01:00.000Z' });
