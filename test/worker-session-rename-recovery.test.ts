@@ -84,6 +84,53 @@ describe('native rename recovery after persistent worker reattach', () => {
     }
   });
 
+  it('arms the receipt watcher before reading the surface so an intervening receipt counts', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-rename-arm-race-'));
+    try {
+      const path = join(dir, 'session_index.jsonl');
+      writeFileSync(path, '');
+      const receipt = `${JSON.stringify({ id: 'native-id', thread_name: TITLE })}\n`;
+      const h = recoveryHarness('unsubmitted');
+      h.scope.cliAdapter.watchSessionRename = (_command: string, opts: {
+        getCliSessionId: () => string | undefined; fromByte?: number;
+      }) => watchNativeSessionIndex(path, TITLE, opts.getCliSessionId, opts.fromByte);
+      h.scope.sessionRenameSurfaceNow = () => {
+        // The receipt lands in the exact window between arming and screen read.
+        appendFileSync(path, receipt);
+        return 'unsubmitted';
+      };
+      expect(h.recover()).toBe(true);
+      expect(h.scope.sessionRenameRecorded()).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reuses the same armed watcher across unknown retries without losing an intervening receipt', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-rename-unknown-reuse-'));
+    try {
+      const path = join(dir, 'session_index.jsonl');
+      writeFileSync(path, '');
+      let arms = 0;
+      const h = recoveryHarness('unknown');
+      h.scope.cliAdapter.watchSessionRename = (_command: string, opts: {
+        getCliSessionId: () => string | undefined; fromByte?: number;
+      }) => {
+        arms++;
+        return watchNativeSessionIndex(path, TITLE, opts.getCliSessionId, opts.fromByte);
+      };
+      expect(h.recover()).toBe(true);
+      expect(arms).toBe(1);
+
+      appendFileSync(path, `${JSON.stringify({ id: 'native-id', thread_name: TITLE })}\n`);
+      expect(h.recover()).toBe(true);
+      expect(arms).toBe(1);
+      expect(h.scope.sessionRenameRecorded?.()).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('releases restored input at the hard cap when surviving evidence stays unknown', () => {
     const h = recoveryHarness('unknown');
     Object.assign(h.scope, {
@@ -123,7 +170,7 @@ describe('native rename recovery after persistent worker reattach', () => {
     expect(h.recover()).toBe(false);
     expect(h.scope.sessionRenamePhase).toBe('idle');
     expect(h.scope.sessionRenameCommand).toBeUndefined();
-    expect(h.watchSessionRename).not.toHaveBeenCalled();
+    expect(h.scope.sessionRenameRecorded).toBeUndefined();
   });
 
   it('blocks unknown evidence, schedules another read, and never guesses that the composer is safe', () => {
@@ -185,14 +232,69 @@ describe('sessionRenameNativeSessionIdNow', () => {
     const scope: Record<string, any> = {
       inputDeliveryObservedCliSessionId: 'thread-a',
       lastInitConfig: { cliId: 'codex' },
-      backend: {}, codexRpcEngine: undefined, codexBridgeRolloutPath: undefined,
+      backend: {}, codexRpcEngine: undefined, codexBridgeRolloutPath: '/tmp/rollout-thread-a.jsonl',
       currentCodexObservedPid: () => 123,
-      findCodexRolloutSetByPid: () => new Set(['thread-b']),
+      findCodexRolloutSetByPid: () => new Set(['thread-a', 'thread-b']),
       readCodexLiveSessionId: () => 'thread-b',
+      codexGenerationSessionIdFromRolloutPath: () => 'thread-a',
       codexHistorySidIsOwned: (sid: string, owned: Set<string>) => owned.has(sid),
     };
     const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
     expect(resolve()).toBe('thread-b');
+    expect(scope.inputDeliveryObservedCliSessionId).toBe('thread-b');
+  });
+
+  it('refuses ambiguous Codex bridge/cache identity with multiple owned rollouts, then relies on the hold cap', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-rename-multi-codex-'));
+    try {
+      const scope: Record<string, any> = {
+        inputDeliveryObservedCliSessionId: 'thread-a',
+        lastInitConfig: { cliId: 'codex' },
+        backend: {}, codexRpcEngine: undefined, codexBridgeRolloutPath: '/tmp/rollout-thread-a.jsonl',
+        currentCodexObservedPid: () => 123,
+        findCodexRolloutSetByPid: () => new Set(['thread-a', 'thread-b']),
+        readCodexLiveSessionId: () => undefined,
+        codexGenerationSessionIdFromRolloutPath: () => 'thread-a',
+        codexHistorySidIsOwned: (sid: string, owned: Set<string>) => owned.has(sid),
+      };
+      const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
+      expect(resolve()).toBeUndefined();
+      expect(scope.inputDeliveryObservedCliSessionId).toBe('thread-a');
+
+      // A newer cache value must not be overwritten by a different bridge id
+      // when neither can identify the current top-level thread.
+      scope.inputDeliveryObservedCliSessionId = 'thread-b';
+      expect(resolve()).toBeUndefined();
+      expect(scope.inputDeliveryObservedCliSessionId).toBe('thread-b');
+
+      const path = join(dir, 'session_index.jsonl');
+      writeFileSync(path, '');
+      const recorded = watchNativeSessionIndex(path, TITLE, resolve);
+      appendFileSync(path, `${JSON.stringify({ id: 'thread-a', thread_name: TITLE })}\n`);
+      appendFileSync(path, `${JSON.stringify({ id: 'thread-b', thread_name: TITLE })}\n`);
+      expect(recorded()).toBe(false);
+      expect(decideSessionRenameSettlement({
+        surface: 'unknown', recorded: recorded(), resubmitted: true, fromPrompt: false,
+      })).toBe('hold');
+      expect(decideSessionRenameSettlement({
+        surface: 'unknown', recorded: recorded(), resubmitted: true, fromPrompt: false, holdExpired: true,
+      })).toBe('release_unconfirmed');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses ambiguous TRAE bridge/cache identity with multiple owned rollouts', () => {
+    const scope: Record<string, any> = {
+      inputDeliveryObservedCliSessionId: 'thread-b',
+      lastInitConfig: { cliId: 'traex' },
+      backend: {}, codexBridgeRolloutPath: '/tmp/rollout-thread-a.jsonl',
+      currentTraexObservedPid: () => 123,
+      findTraexRolloutSetByPid: () => new Set(['thread-a', 'thread-b']),
+      traexSessionIdFromRolloutPath: () => 'thread-a',
+    };
+    const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
+    expect(resolve()).toBeUndefined();
     expect(scope.inputDeliveryObservedCliSessionId).toBe('thread-b');
   });
 

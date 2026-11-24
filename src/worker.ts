@@ -6309,8 +6309,10 @@ function sessionRenameNativeSessionIdNow(): string | undefined {
     if (!owned) return undefined;
     const owns = (sid: string): boolean => owned.has(sid) || owned.has(sid.toLowerCase());
     const bridgeSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
-    if (bridgeSid && owns(bridgeSid)) observed = bridgeSid;
-    if (!observed && inputDeliveryObservedCliSessionId && owns(inputDeliveryObservedCliSessionId)) {
+    // Multiple owned rollouts prove possession, not which top-level thread is
+    // current. Bridge/cache are usable only when ownership is already unique.
+    if (owned.size === 1 && bridgeSid && owns(bridgeSid)) observed = bridgeSid;
+    if (!observed && owned.size === 1 && inputDeliveryObservedCliSessionId && owns(inputDeliveryObservedCliSessionId)) {
       observed = inputDeliveryObservedCliSessionId;
     }
     if (!observed && owned.size === 1) {
@@ -6324,8 +6326,10 @@ function sessionRenameNativeSessionIdNow(): string | undefined {
     const liveSid = readCodexLiveSessionId(pid);
     if (liveSid && owns(liveSid)) observed = liveSid;
     const bridgeSid = codexBridgeRolloutPath ? codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
-    if (!observed && bridgeSid && owns(bridgeSid)) observed = bridgeSid;
-    if (!observed && inputDeliveryObservedCliSessionId && owns(inputDeliveryObservedCliSessionId)) {
+    // A live thread id outranks ambiguity. Without one, multiple rollouts make
+    // bridge/cache ownership-only evidence, never proof of the current thread.
+    if (!observed && owned.size === 1 && bridgeSid && owns(bridgeSid)) observed = bridgeSid;
+    if (!observed && owned.size === 1 && inputDeliveryObservedCliSessionId && owns(inputDeliveryObservedCliSessionId)) {
       observed = inputDeliveryObservedCliSessionId;
     }
     if (!observed && owned.size === 1) {
@@ -6532,6 +6536,18 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
   const command = adapter.buildSessionRenameCommand(title);
   if (!sessionRenameSentAtMs) sessionRenameSentAtMs = Date.now();
   sessionRenameCommand = command;
+  if (!sessionRenameRecorded) {
+    try {
+      // Arm BEFORE the first surface read: a receipt landing between these two
+      // observations belongs to this recovery. Keep the same probe across every
+      // unknown retry so its baseline never moves and swallows an intervening write.
+      sessionRenameRecorded = adapter.watchSessionRename?.(command, {
+        getCliSessionId: sessionRenameNativeSessionIdNow,
+        // No fromByte: 0. Historical same-title receipts cannot prove that the
+        // exact draft surviving in this pane has executed.
+      });
+    } catch { sessionRenameRecorded = undefined; }
+  }
   const surface = sessionRenameSurfaceNow();
   if (surface === 'unknown') {
     sessionRenameCommand = undefined;
@@ -6564,18 +6580,11 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
     sessionRenameHoldTimeoutLogged = false;
     sessionRenameHoldTimeoutNoticeSent = false;
     sessionRenameSentAtMs = 0;
+    sessionRenameRecorded = undefined;
     return false;
   }
   sessionRenamePhase = 'sent';
   sessionRenameResubmitted = false;
-  try {
-    sessionRenameRecorded = adapter.watchSessionRename?.(command, {
-      getCliSessionId: sessionRenameNativeSessionIdNow,
-      // Only a receipt appended AFTER this recovery began may release unknown
-      // evidence. A historical same-title receipt cannot prove that the exact
-      // draft surviving in this pane has executed.
-    });
-  } catch { sessionRenameRecorded = undefined; }
   log(`Recovered native session rename state after persistent reattach (${surface}); restored input stays held`);
   armSessionRenameIdleTimeout();
   return true;
