@@ -2859,6 +2859,10 @@ export type CreateFeishuOpenPlatformAppResult =
       /** 应用已经建成但读取 Secret 失败时返回，调用方不得再创建一个重复应用。 */
       appId?: string;
       sessionFile?: string;
+      /** 创建后步骤失败/提交结果未知时，仍需传递给续跑调用方的审批诊断。 */
+      approvalDeferredScopes?: DeferredApprovalScope[];
+      approvalDisabledRefreshToken?: boolean;
+      approvalCompatibility?: ApprovalCompatibilityOutcome;
     };
 
 export interface CreateFeishuOpenPlatformAppOptions extends FeishuWebSessionOptions {
@@ -2880,7 +2884,15 @@ export interface CreateFeishuOpenPlatformAppOptions extends FeishuWebSessionOpti
 }
 
 class CreatedOpenPlatformAppError extends Error {
-  constructor(readonly appId: string, cause: unknown) {
+  constructor(
+    readonly appId: string,
+    readonly diagnostics: {
+      approvalDeferredScopes?: DeferredApprovalScope[];
+      approvalDisabledRefreshToken?: boolean;
+      approvalCompatibility?: ApprovalCompatibilityOutcome;
+    },
+    cause: unknown,
+  ) {
     super(`应用 ${appId} 已创建，但启用机器人能力或读取 AppSecret 失败: ${safeErrorMessage(cause)}`);
   }
 }
@@ -3057,6 +3069,9 @@ export async function createOpenPlatformAppWithClient(
 
   const description = options.description?.trim() || 'AI coding assistant powered by botmux';
   let appId: string | undefined;
+  let approvalDeferredScopes: DeferredApprovalScope[] | undefined;
+  let approvalDisabledRefreshToken: boolean | undefined;
+  let approvalCompatibility: ApprovalCompatibilityOutcome | undefined;
   try {
     const created = await client.postJson(
       '/developers/v1/manifest/upsert_by_template',
@@ -3135,9 +3150,6 @@ export async function createOpenPlatformAppWithClient(
     // 对未命中「仅协作者免审」的账号/部门，1.0.0 本身就会被企业审批拦住并锁死整个应用。
     // 提交前先做一次审批流预判：免审账号零额外写入直接 commit；命中真人审批时在草稿态
     // 自动二分避开触发项，确保 1.0.0 自动上架后再进入 1.0.1。
-    let approvalDeferredScopes: DeferredApprovalScope[] | undefined;
-    let approvalDisabledRefreshToken: boolean | undefined;
-    let approvalCompatibility: ApprovalCompatibilityOutcome | undefined;
     if (options.autoAvoidApproval !== false) {
       const initialVisibility = {
         visibleSuggest: {
@@ -3196,8 +3208,8 @@ export async function createOpenPlatformAppWithClient(
             onStatus: options.onStatus,
           });
           approvalCompatibility = compat;
+          if (compat.deferredScopes.length > 0) approvalDeferredScopes = compat.deferredScopes;
           if (compat.resolvedAutoApproved) {
-            if (compat.deferredScopes.length > 0) approvalDeferredScopes = compat.deferredScopes;
             if (compat.disabledRefreshToken) approvalDisabledRefreshToken = true;
           }
         } catch {
@@ -3225,7 +3237,11 @@ export async function createOpenPlatformAppWithClient(
       ...(approvalCompatibility ? { approvalCompatibility } : {}),
     };
   } catch (err) {
-    throw new CreatedOpenPlatformAppError(appId, err);
+    throw new CreatedOpenPlatformAppError(appId, {
+      ...(approvalDeferredScopes?.length ? { approvalDeferredScopes } : {}),
+      ...(approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+      ...(approvalCompatibility ? { approvalCompatibility } : {}),
+    }, err);
   }
 }
 
@@ -3413,7 +3429,7 @@ export async function createFeishuOpenPlatformApp(
       ok: false,
       reason: /默认应用图标/.test(message) ? 'missing_icon' : 'api_error',
       message,
-      ...(err instanceof CreatedOpenPlatformAppError ? { appId: err.appId } : {}),
+      ...(err instanceof CreatedOpenPlatformAppError ? { appId: err.appId, ...err.diagnostics } : {}),
       sessionFile: prepared.sessionFile,
     };
   }

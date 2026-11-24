@@ -2491,7 +2491,14 @@ export async function cmdSetupScripted(
       const appName = resolveSetupAppName(cmd.flags.appName, existing.length);
       let credentials:
         | { ok: true; appId: string; appSecret: string; brand: Brand }
-        | { ok: false; message: string; appId?: string };
+        | {
+            ok: false;
+            message: string;
+            appId?: string;
+            approvalDeferredScopes?: import('./setup/approval-scope-resolver.js').DeferredApprovalScope[];
+            approvalDisabledRefreshToken?: boolean;
+            approvalInitialApprovers?: string[];
+          };
       let appliedAppName = false;
 
       // 只有带权限清单的注册（Lark 默认）会带上应用名称；兼容模式和跳过自动配置的 Lark 都不带。
@@ -2567,6 +2574,11 @@ export async function cmdSetupScripted(
               ok: false,
               appId: created.appId,
               message: `应用已创建但后续步骤失败 (${created.reason}): ${created.message}`,
+              ...(created.approvalDeferredScopes?.length ? { approvalDeferredScopes: created.approvalDeferredScopes } : {}),
+              ...(created.approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+              ...(created.approvalCompatibility?.initialHumanApprovers.length
+                ? { approvalInitialApprovers: created.approvalCompatibility.initialHumanApprovers }
+                : {}),
             };
           } else {
             credentials = {
@@ -2581,9 +2593,26 @@ export async function cmdSetupScripted(
         const continueCommand = credentials.appId
           ? setupAddContinuationCommand(credentials.appId, requestedBrand, undefined, extraScopesFile)
           : undefined;
+        const { buildApprovalConsoleUrl } = await import('./setup/open-platform-automation.js');
         failSetupScripted(cmd.json,
           `${credentials.message}${credentials.appId ? `；已创建 AppID ${credentials.appId}，请从开放平台读取 App Secret 后运行 ${continueCommand} 继续，未重复创建。` : ''}`,
-          credentials.appId ? { partial: true, appId: credentials.appId, appName, ...extraScopesJson, continueCommand } : {},
+          credentials.appId ? {
+            partial: true,
+            appId: credentials.appId,
+            appName,
+            ...extraScopesJson,
+            continueCommand,
+            ...(credentials.approvalDeferredScopes?.length
+              ? { approvalDeferredScopes: credentials.approvalDeferredScopes }
+              : {}),
+            ...(credentials.approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+            ...(credentials.approvalInitialApprovers?.length
+              ? { approvalInitialApprovers: credentials.approvalInitialApprovers }
+              : {}),
+            ...(credentials.approvalDeferredScopes?.length || credentials.approvalDisabledRefreshToken
+              ? { approvalConsoleUrl: buildApprovalConsoleUrl(credentials.appId, requestedBrand) }
+              : {}),
+          } : {},
         );
         return;
       }

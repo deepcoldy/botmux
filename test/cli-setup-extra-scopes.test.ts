@@ -636,6 +636,49 @@ describe('setup add --extra-scopes-file', () => {
     expect(mocks.createFeishuOpenPlatformApp).not.toHaveBeenCalled();
   });
 
+  it('1.0.0 commit 失败的 partial JSON 保留续跑所需审批诊断与恢复链接', async () => {
+    writeBots([]);
+    mocks.inspectCachedFeishuOpenPlatformSession.mockResolvedValue({
+      ok: true,
+      identity: { userId: 'u_create_fail', userName: 'Create Owner', tenantId: 't_create', tenantName: 'Create Corp' },
+    });
+    mocks.createFeishuOpenPlatformApp.mockResolvedValue({
+      ok: false,
+      reason: 'api_error',
+      message: 'commit response lost',
+      appId: 'cli_create_failure',
+      approvalDeferredScopes: [{ bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' }],
+      approvalDisabledRefreshToken: true,
+      approvalCompatibility: {
+        triggered: true,
+        resolvedAutoApproved: true,
+        deferredScopes: [{ bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' }],
+        disabledRefreshToken: true,
+        initialHumanApprovers: ['审批人'],
+        remainingHumanApprovers: [],
+        probeCount: 2,
+        stopReason: 'resolved_exact',
+      },
+    });
+
+    await cmdSetupScripted([
+      'add', '--create-app', '--allowed-users', 'a@b.com', '--working-dir', scratch, '--json',
+    ]);
+
+    const out = lastJson();
+    expect(out).toMatchObject({
+      ok: false,
+      partial: true,
+      appId: 'cli_create_failure',
+      approvalDisabledRefreshToken: true,
+      approvalInitialApprovers: ['审批人'],
+      approvalConsoleUrl: 'https://open.feishu.cn/app/cli_create_failure/auth',
+    });
+    expect(out.approvalDeferredScopes).toEqual([
+      expect.objectContaining({ bucket: 'user', name: 'offline_access' }),
+    ]);
+  });
+
   it('clone 源显式关闭避审时，创建 1.0.0 前就透传 autoAvoidApproval=false', async () => {
     writeBots([botEntry('cli_clone_optout', { autoAvoidApproval: false })]);
     mocks.inspectCachedFeishuOpenPlatformSession.mockResolvedValue({

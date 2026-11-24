@@ -4966,6 +4966,60 @@ describe('draft-time approval compatibility (1.0.0 & 1.0.1)', () => {
     expect(result.scopeCount).toBe(2);
   });
 
+  it('keeps 1.0.0 approval deferrals when commit fails after template draft reduction', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-create-approval-commit-failure-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const staged = new Set(['user:17']);
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/app/upload/image') return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      if (path === '/developers/v1/manifest/upsert_by_template') return Response.json({ code: 0, data: { appId: 'cli_create100_commit' } });
+      if (path === '/developers/v1/privilege/all/cli_create100_commit') return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      if (path === '/developers/v1/app_version/create/cli_create100_commit') return Response.json({ code: 0, data: { versionId: 'v-100' } });
+      if (path === '/developers/v1/scope/all/cli_create100_commit') {
+        return Response.json({ code: 0, data: { scopes: [
+          { id: '1', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 1 } },
+          { id: '17', name: 'offline_access', scopeType2ScopeLevel: { '1': 4 }, scopeType2ScopeStatus: { '1': 1 } },
+        ] } });
+      }
+      if (path === '/developers/v1/safe_setting/cli_create100_commit') {
+        return Response.json({ code: 0, data: { allowRefreshToken: false, redirectURL: [], ipWhiteList: [], safeServerDomain: [] } });
+      }
+      if (path === '/developers/v1/scope/update/cli_create100_commit') {
+        const body = JSON.parse(String(init?.body));
+        for (const id of body.userScopeIDs ?? []) {
+          if (body.operation === 'del') staged.delete(`user:${id}`);
+          else staged.add(`user:${id}`);
+        }
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/approval_nodes/get/cli_create100_commit') {
+        return Response.json(staged.has('user:17') ? humanApprovalFlow : autoPassFlow);
+      }
+      if (path.includes('/publish/commit/')) return Response.json({ code: 500, msg: 'response lost after commit' }, { status: 500 });
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await createFeishuOpenPlatformApp({
+      name: 'create-commit-failure',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      fetchImpl,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.appId).toBe('cli_create100_commit');
+    expect(result.approvalCompatibility).toMatchObject({ resolvedAutoApproved: true });
+    expect(result.approvalDeferredScopes).toEqual([
+      expect.objectContaining({ bucket: 'user', name: 'offline_access' }),
+    ]);
+    expect(staged.has('user:17')).toBe(false);
+  });
+
   it('keeps resolved approval deferrals when publish/commit fails after the draft was reduced', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-approval-commit-failure-'));
     const sessionFile = join(dir, 'feishu-session.json');

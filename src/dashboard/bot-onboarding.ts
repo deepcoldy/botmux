@@ -1851,6 +1851,21 @@ export class BotOnboardingManager {
           status: 'failed',
           appId: created.appId,
           error: created.reason,
+          permission: {
+            ok: false,
+            reason: created.reason,
+            message: created.message,
+            ...(created.approvalDeferredScopes?.length
+              ? { approvalDeferredScopes: created.approvalDeferredScopes }
+              : {}),
+            ...(created.approvalDeferredScopes?.length || created.approvalDisabledRefreshToken
+              ? { approvalConsoleUrl: buildApprovalConsoleUrl(created.appId, 'feishu') }
+              : {}),
+            ...(created.approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+            ...(created.approvalCompatibility?.initialHumanApprovers.length
+              ? { approvalInitialApprovers: created.approvalCompatibility.initialHumanApprovers }
+              : {}),
+          },
           message: `${created.message}；应用已经创建。为避免重复创建，本任务不会重试创建。可在开放平台读取 App Secret 后运行 botmux setup add --app-id ${created.appId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto 继续。`,
         });
         return;

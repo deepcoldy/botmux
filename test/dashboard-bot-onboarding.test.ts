@@ -2898,6 +2898,45 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('preserves 1.0.0 approval diagnostics in the create-failure snapshot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-create-deferred-failure-'));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp: async () => ({
+        ok: false,
+        reason: 'api_error',
+        message: 'commit response lost',
+        appId: 'cli_create_failure',
+        approvalDeferredScopes: [{ bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' }],
+        approvalDisabledRefreshToken: true,
+        approvalCompatibility: {
+          triggered: true,
+          resolvedAutoApproved: true,
+          deferredScopes: [{ bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' }],
+          disabledRefreshToken: true,
+          initialHumanApprovers: ['审批人'],
+          remainingHumanApprovers: [],
+          probeCount: 2,
+          stopReason: 'resolved_exact',
+        },
+      }),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({ registrationMode: 'web' });
+    await job.done;
+
+    expect(manager.get(job.id)).toMatchObject({ status: 'failed', appId: 'cli_create_failure' });
+    expect(manager.get(job.id)?.permission).toMatchObject({
+      ok: false,
+      approvalDisabledRefreshToken: true,
+      approvalInitialApprovers: ['审批人'],
+      approvalConsoleUrl: 'https://open.feishu.cn/app/cli_create_failure/auth',
+      approvalDeferredScopes: [expect.objectContaining({ bucket: 'user', name: 'offline_access' })],
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('surfaces the approval console link when only refresh-token was disabled', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-refresh-only-'));
     batchGetIdMock.mockResolvedValueOnce({
