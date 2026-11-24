@@ -328,7 +328,7 @@ import {
   type FleetCommand,
 } from './cli/sandbox-host-hint.js';
 import { formatSessionLookupMissLine } from './cli/session-lookup-diagnostic.js';
-import { describeReportRelayFallback, REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
+import { describeReportRelayFallback, REPORT_SESSION_RELAY_ROUTE, resolveReportRelayFallbackTarget } from './core/report-session-relay.js';
 import {
   WORKFLOW_NODE_REPORT_ROUTE,
   parseWorkflowReportArgs,
@@ -16830,7 +16830,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       if (!secret) return false;
       const parsed: unknown = JSON.parse(readFileSync(join(resolveDataDir(), 'orchestrate-dispatch.json'), 'utf-8'));
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
-      return hasVerifiedDispatchReportBindingForCaller({
+      if (hasVerifiedDispatchReportBindingForCaller({
         registry: parsed as Record<string, unknown>,
         secret,
         dispatchRoot: intoRoot,
@@ -16838,7 +16838,35 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         callerSessionId: sid,
         callerChatId: s.chatId,
         callerScope: s.scope ?? 'thread',
+      })) return true;
+      const resolved = resolveVerifiedDispatchReportTarget({
+        registry: parsed as Record<string, unknown>, secret, dispatchRoot: intoRoot,
       });
+      // 旧绑定没有 targetScope/targetChatId。只有现有 report relay 的同一套
+      // 窄回退能证明“原会话已关闭/缺失，当前调用方是唯一活跃同群续接者”时，
+      // 才保留协议；活跃原会话、跨群、thread-scope 与多候选都继续 fail-closed。
+      if (!resolved.ok || resolved.binding.targetLarkAppId !== appId) return false;
+      const binding = resolved.binding;
+      const sessions = [...loadSessions().values()].map(session => ({
+        sessionId: session.sessionId,
+        larkAppId: session.larkAppId ?? '',
+        ...(session.chatId ? { chatId: session.chatId } : {}),
+        ...(session.scope ? { scope: session.scope } : {}),
+        ...(session.status ? { status: session.status } : {}),
+      }));
+      const originalSession = sessions.find(session =>
+        session.sessionId === binding.targetSessionId && session.larkAppId === binding.targetLarkAppId);
+      const fallback = resolveReportRelayFallbackTarget({
+        originalTarget: {
+          sessionId: binding.targetSessionId,
+          larkAppId: binding.targetLarkAppId,
+          ...(binding.targetChatId ? { chatId: binding.targetChatId } : {}),
+          ...(binding.targetScope ? { scope: binding.targetScope } : {}),
+        },
+        ...(originalSession ? { originalSession } : {}),
+        sessions,
+      });
+      return fallback.ok && fallback.target.larkAppId === appId && fallback.target.sessionId === sid;
     } catch {
       return false;
     }
@@ -16927,13 +16955,23 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   });
   // `--into` 验签先行：命中指向本调用方的已签名绑定时保留精确回报协议；
   // 未绑定时，仅跨话题 legacy `--bot` 保留兼容协议，同话题或 `--bot-app` 不再追加无效的 `--dispatch-root`。
-  // chat-scope 仅按本轮精确 turnId（优先祖先上下文，缺失时回退宿主注入的 BOTMUX_TURN_ID）判定同话题，
-  // 不借用可能已被后续入队消息覆盖的 currentReplyTarget。
+  // chat-scope 只信新鲜进程树 marker / protected claim 的精确 turnId；宿主 watcher
+  // 重执行仅在其授权标记与 worker 父子绑定同时成立时使用刚注入的 turnId。
+  // 普通 BOTMUX_TURN_ID 是长驻 CLI 的启动快照，不能证明当前回合；引用回复也不是话题内落点。
+  const trustedHostRelayTurnId = process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1'
+    && isTrustedVcMeetingHostRelayParent(true, s.pid, process.ppid)
+    ? (process.env.BOTMUX_TURN_ID?.trim() || undefined)
+    : undefined;
   const exactChatTurnId = dispatchOrigin.sessionId === s.sessionId
-    ? (dispatchTurnId ?? (process.env.BOTMUX_TURN_ID?.trim() || undefined))
+    ? (dispatchTurnId ?? trustedHostRelayTurnId)
+    : undefined;
+  const exactChatReplyTarget = (s.scope ?? 'thread') === 'chat' && exactChatTurnId
+    ? pickTurnReplyTarget(s, exactChatTurnId)
     : undefined;
   const currentTopicRoot = (s.scope ?? 'thread') === 'chat'
-    ? (exactChatTurnId ? pickTurnReplyTarget(s, exactChatTurnId)?.rootMessageId : undefined)
+    ? (exactChatReplyTarget && exactChatReplyTarget.quoteOnly !== true
+      ? exactChatReplyTarget.rootMessageId
+      : undefined)
     : s.rootMessageId;
   const isSameTopicInto = !!intoRoot && currentTopicRoot === intoRoot;
   const appendIntoCompletionProtocol = !!intoRoot && !standby && (

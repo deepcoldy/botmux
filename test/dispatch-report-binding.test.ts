@@ -257,6 +257,25 @@ describe('dispatch report binding', () => {
     })).toBe(false);
   });
 
+  it('rejects a chat-scope successor when the signed binding has no target chat id', () => {
+    const reportBinding = createDispatchReportBinding(SECRET, {
+      dispatchRoot: 'om_chat_without_id',
+      targetLarkAppId: 'cli_orchestrator',
+      targetSessionId: 'session-chat-original',
+      targetScope: 'chat',
+      sourceName: '子任务',
+      issuedAt: '2026-11-24T00:00:00.000Z',
+    });
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      registry: { om_chat_without_id: { reportBinding } },
+      secret: SECRET,
+      dispatchRoot: 'om_chat_without_id',
+      callerAppId: 'cli_orchestrator',
+      callerSessionId: 'session-chat-successor',
+      callerScope: 'chat',
+    })).toBe(false);
+  });
+
 });
 
 describe('imported dispatch report attachment', () => {
