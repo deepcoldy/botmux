@@ -514,7 +514,7 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   countAntigravityUserInputMatches,
   hashAntigravitySubmittedText,
@@ -10461,6 +10461,17 @@ const backgroundTaskPins = new BackgroundTaskPinSnapshot();
  *  Rides on screen_update and changes no status decision; the daemon shows it
  *  on the card and keeps the session from being suspended while it is set. */
 let backgroundWaitTasks = 0;
+/** Antigravity 常规模式原生页脚报告的后台任务/计时器数；与前台 activeTurnAuthority 解耦，
+ *  仅经 refreshBackgroundWait 汇入 screen_update.backgroundTasks。 */
+let antigravityFooterBackgroundTasks = 0;
+
+function observeAntigravityFooterBackgroundTasks(screen: string | undefined): void {
+  if (lastInitConfig?.cliId !== 'antigravity' || !screen) return;
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
+  const parsed = parseAntigravityFooterBackgroundTasks(screen);
+  if (parsed === undefined) return;
+  antigravityFooterBackgroundTasks = parsed;
+}
 
 function backgroundWaitPayload(): { backgroundTasks?: number } {
   return backgroundWaitTasks > 0 ? { backgroundTasks: backgroundWaitTasks } : {};
@@ -10626,7 +10637,8 @@ function modelRequestPayload(): { awaySummaryPending: boolean; modelRequestSessi
 }
 
 function refreshBackgroundWait(): void {
-  const next = backgroundTaskTracker.backgroundWait();
+  const footerTasks = typeof antigravityFooterBackgroundTasks === 'number' ? antigravityFooterBackgroundTasks : 0;
+  const next = Math.max(backgroundTaskTracker.backgroundWait(), footerTasks);
   if (next > 0 && backgroundWaitTasks === 0) backgroundStopScanSinceMs = Date.now();
   if (next === 0) backgroundStopScanOffsets.clear();
   backgroundWaitTasks = next;
@@ -24407,6 +24419,9 @@ function markPromptReady(): void {
   // finishTurnReactions() — a premature ✅ DONE mid-turn (and a
   // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
   // correct 'working' publish for these paths, so this idle must not escape first.
+  if (typeof observeAntigravityFooterBackgroundTasks === 'function') {
+    observeAntigravityFooterBackgroundTasks(renderer?.rawSnapshot() || lastAnalyzerSnapshot);
+  }
   refreshBackgroundWait();
   if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
@@ -24495,7 +24510,12 @@ function persistCliSessionId(cliSessionId: string): void {
   // During an interactive fork the CLI temporarily resumes the parent. Its
   // early PID/transcript observations must never acknowledge the pending fork.
   if (nativeSessionForkPending()) return;
+  const previousCliSessionId = inputDeliveryObservedCliSessionId;
   inputDeliveryObservedCliSessionId = cliSessionId;
+  if (lastInitConfig?.cliId === 'antigravity' && previousCliSessionId && previousCliSessionId !== cliSessionId) {
+    antigravityFooterBackgroundTasks = 0;
+    refreshBackgroundWait();
+  }
   const published = publishCliSessionIdToDaemon({
     cliSessionId,
     // Snapshot only worker-owned, durable local Codex roots. Never infer an
@@ -27710,8 +27730,13 @@ function startScreenUpdates(): void {
 
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
         observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
-        if (snapshot.refreshed && status === 'idle' && snapshot.nativeScreen) {
-          publishNativeReasoningFooter(snapshot.nativeScreen, snapshot.observedAtMs);
+        if (snapshot.refreshed && snapshot.nativeScreen) {
+          if (typeof observeAntigravityFooterBackgroundTasks === 'function') {
+            observeAntigravityFooterBackgroundTasks(snapshot.nativeScreen);
+          }
+          if (status === 'idle') {
+            publishNativeReasoningFooter(snapshot.nativeScreen, snapshot.observedAtMs);
+          }
         }
       }
       // Kimi paints its cache-expiry menu once and then sits still: the
@@ -27826,6 +27851,7 @@ function stopScreenUpdates(): void {
   if (screenUpdateTimer) { clearInterval(screenUpdateTimer); screenUpdateTimer = null; }
   if (renderer) { renderer.dispose(); renderer = null; }
   lastAnalyzerSnapshot = '';
+  antigravityFooterBackgroundTasks = 0;
 }
 
 // ─── PTY Management ──────────────────────────────────────────────────────────
@@ -28841,6 +28867,7 @@ async function spawnCliBody(
   // its tasks; startBridgeWatcher rebuilds them from its transcript.
   backgroundTaskTracker.reset(Math.floor(Date.now() / 1000) * 1000);
   backgroundWaitTasks = 0;
+  antigravityFooterBackgroundTasks = 0;
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(homedir(), '.botmux', 'data');
   const sessionScratchDir = ensureSessionTempDir(isolationRuntimeDataDir, cfg.sessionId);

@@ -191,6 +191,57 @@ export function isAntigravityWorkingScreen(screen: string): boolean {
   return /(?:^|\n)[ \t]*esc to cancel(?:\s|$)/i.test(stripAnsiScreenText(screen));
 }
 
+const ANTIGRAVITY_FOOTER_START_RE = /^(?:\? for shortcuts|esc to cancel)(?:\s|$)/i;
+const ANTIGRAVITY_FOOTER_TASKS_RE = /(?:^|·|\s)(\d+)\s+task\(s\)(?:\s|$|·)/i;
+
+/** 从 Antigravity 当前视口底部的原生页脚解析仍在运行的后台任务数。
+ *  仅认视口末尾带分隔线边界的真实 `? for shortcuts` / `esc to cancel` 页脚，
+ *  避免正文引用或旧滚屏误报：
+ *  - 识别到页脚且带 `N task(s)` → 返回 `N`；
+ *  - 识别到页脚但不带 `task(s)` → 返回 `0`（用于任务完成/取消后清零）；
+ *  - 未见真实页脚（采集失败、遮罩弹层、启动中或无页脚错误态）→ 返回 `undefined`，调用方保留原值。 */
+export function parseAntigravityFooterBackgroundTasks(screen: string): number | undefined {
+  if (!screen) return undefined;
+  const rows = stripAnsiScreenText(screen)
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map(row => row.trim());
+  let end = rows.length;
+  while (end > 0 && rows[end - 1] === '') end--;
+  if (end === 0) return undefined;
+
+  let footerIdx = -1;
+  if (ANTIGRAVITY_FOOTER_START_RE.test(rows[end - 1]!)) {
+    footerIdx = end - 1;
+  } else if (
+    end >= 2
+    && !/^[─━]+$/.test(rows[end - 1]!)
+    && !/^[>●⎿]/.test(rows[end - 1]!)
+    && ANTIGRAVITY_FOOTER_START_RE.test(rows[end - 2]!)
+  ) {
+    // 窄终端下页脚可能折成两行（如 `? for shortcuts ... ·\n1 task(s) · /tasks`）
+    footerIdx = end - 2;
+  }
+  if (footerIdx <= 0) return undefined;
+  const aboveFooter = rows[footerIdx - 1]!;
+  if (!/^[─━]{4,}$/.test(aboveFooter)) {
+    // PTY rawSnapshot 会把盒画分隔线清成空行；无可见分隔线时，必须有正向原生空输入框证据，
+    // 绝不把普通正文或权限提示后的空行误当成页脚边界。
+    if (aboveFooter !== '') return undefined;
+    const normalizedForComposer = rows
+      .slice(0, footerIdx)
+      .concat('? for shortcuts')
+      .join('\n');
+    if (readyComposerRowAbove(normalizedForComposer) === undefined) return undefined;
+  }
+
+  const footerText = rows.slice(footerIdx, end).join(' ');
+  const match = ANTIGRAVITY_FOOTER_TASKS_RE.exec(footerText);
+  if (!match) return 0;
+  const count = Number(match[1]);
+  return Number.isSafeInteger(count) && count >= 0 ? count : 0;
+}
+
 /** Preserve provenance only for the CLI's own quota/error/composer layout,
  * not generic quota-shaped text in model/tool output. */
 export function annotateAntigravityUsageLimit(screen: string, state: CliUsageLimitState): CliUsageLimitState {
