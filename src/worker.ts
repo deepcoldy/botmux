@@ -460,7 +460,8 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, readCodexLiveSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, readCodexLiveSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, codexRolloutHasAsyncQuestionReply, findPendingCodexAsyncQuestion, selectNewCodexAsyncQuestions, type CodexAsyncQuestionRecord, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { parseCodexAsyncQuestions } from './services/codex-async-user-input.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
@@ -479,7 +480,8 @@ import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
-import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
+import type { AskQuestion } from './core/ask-types.js';
+import { traexQuestionFlowVisible, traexPendingAsyncQuestionCount, traexPendingAsyncQuestionVisible, parseTraexQuestionPage, traexQuestionSignature, traexQuestionState, type TraexQuestionPage } from './utils/traex-question-page.js';
 import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession, doubaoLiveUser } from './services/doubao-transcript.js';
@@ -16551,6 +16553,10 @@ function codexBridgeIngest(opts: {
     backend.appendWebHistory(renderOrcaTranscriptHistory(result.events));
   }
   codexBridgeQueue.ingest(result.events);
+  if (structuredBridgeIs('codex')) {
+    observeCodexTuiAsyncQuestions(result.events);
+    maybeRestoreCodexTuiAsyncQuestion();
+  }
   const hasAssistantFinal = result.events.some(event => event.kind === 'assistant_final');
   // Keep a complete-line frontier for the already attributed live owner.
   // Do not advance it past an undelivered terminal: a successor must replay
@@ -19894,6 +19900,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
 const KEY_TO_ANSI: Record<string, string> = {
   Up: '\x1b[A', Down: '\x1b[B', Left: '\x1b[D', Right: '\x1b[C',
   Enter: '\r', Space: ' ', Tab: '\t', Escape: '\x1b',
+  'M-Up': '\x1b[1;3A', 'C-u': '\x15',
 };
 
 /** Turn already preempted by a new user message. One preemption per turn: a
@@ -20596,20 +20603,61 @@ function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispat
 
 /** One answer input into the current CLI, serialized with other terminal
  *  writes; false when the backend changed or refused it. */
-async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void): Promise<boolean> {
+async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, expected?: TraexQuestionPage): Promise<boolean> {
   const target = backend;
+  const lifetime = cliLifetimeNonce;
   if (!target || cliRestartInProgress || nativeSessionForkPending()) return false;
   try {
     return await runAfterAmbiguousSubmissionWrites(
       target,
-      () => {
-        if (backend !== target) return false;
+      async () => {
+        if (backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress || nativeSessionForkPending()) return false;
+        if (expected) {
+          const screen = await traexQuestionCapture();
+          if (!screen || backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress
+            || nativeSessionForkPending() || !traexQuestionBridgeActive()) return false;
+          const page = parseTraexQuestionPage(screen);
+          if (!page || traexQuestionSignature(page) !== traexQuestionSignature(expected)
+            || traexQuestionState(page) !== traexQuestionState(expected)) return false;
+        }
         invalidatePromptReadinessEvidence();
         return write(readinessTrackedInput(adapterInputHandle(target))) !== false;
       },
     );
   } catch (err: any) {
     log(`TraeX question answer write failed: ${err?.message ?? err}`);
+    return false;
+  }
+}
+
+/** 打开异步问题的收起面板。序列化等待后再次采集，不能把快捷键写给已换页/换代的 CLI。 */
+function traexQuestionMayOpenPending(known?: TraexQuestionPage): boolean {
+  // 重挂时静止的 CLI 不会重放 OSC；恢复身份或已经生成的原题卡片可用于打开面板，
+  // 但不能替代实际答复时的完整题目、输入状态和进程核验。
+  return traexQuestionBlockReported() || known?.delivery === 'async'
+    || (lastInitConfig?.resume === true && cliOutlivesWorker && lastSpawnEffectiveResume);
+}
+
+async function traexQuestionOpenPending(known?: TraexQuestionPage): Promise<boolean> {
+  const target = backend;
+  const lifetime = cliLifetimeNonce;
+  if (!target || !traexQuestionBridgeActive() || !traexQuestionMayOpenPending(known) || cliRestartInProgress || nativeSessionForkPending()) return false;
+  try {
+    return await runAfterAmbiguousSubmissionWrites(target, async () => {
+      if (backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress
+        || nativeSessionForkPending() || !traexQuestionBridgeActive() || !traexQuestionMayOpenPending(known)) return false;
+      const screen = await traexQuestionCapture();
+      if (!screen || backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress
+        || nativeSessionForkPending() || !traexQuestionBridgeActive() || !traexQuestionMayOpenPending(known)
+        || !traexPendingAsyncQuestionVisible(screen)) return false;
+      const input = readinessTrackedInput(adapterInputHandle(target));
+      invalidatePromptReadinessEvidence();
+      if (input.sendSpecialKeys) return input.sendSpecialKeys('M-Up') !== false;
+      input.write(KEY_TO_ANSI['M-Up']!);
+      return true;
+    });
+  } catch (err: any) {
+    log(`TraeX pending question could not be opened: ${err?.message ?? err}`);
     return false;
   }
 }
@@ -20625,8 +20673,10 @@ const traexQuestionBridge = new TraexQuestionBridge({
   enabled: () => traexQuestionBridgeActive() && !cliRestartInProgress,
   lifetime: () => cliLifetimeNonce,
   capture: traexQuestionCapture,
+  openPending: traexQuestionOpenPending,
+  mayOpenPending: traexQuestionMayOpenPending,
   // The same daemon ask broker (and card) as the RPC path's native questions.
-  ask: (question, signal) => {
+  ask: (question, signal, page) => {
     const cfg = lastInitConfig;
     if (!cfg) return Promise.reject(new Error('session not initialised'));
     return postCodexAsk({
@@ -20636,18 +20686,19 @@ const traexQuestionBridge = new TraexQuestionBridge({
       rootMessageId: cfg.rootMessageId,
       originTurnId: currentBotmuxTurnId,
       originDispatchAttempt: currentBotmuxDispatchAttempt,
+      ...(page?.delivery === 'async' ? { standalone: true } : {}),
     }, [question], signal);
   },
-  writeKey: key => traexQuestionWrite(target => {
+  writeKey: (key, expected) => traexQuestionWrite(target => {
     if (target.sendSpecialKeys) return target.sendSpecialKeys(key);
     target.write(KEY_TO_ANSI[key] ?? key);
     return true;
-  }),
-  paste: text => traexQuestionWrite(target => {
+  }, expected),
+  paste: (text, expected) => traexQuestionWrite(target => {
     if (target.pasteText) target.pasteText(text);
     else target.write(wrapBracketedPaste(text));
     return true;
-  }),
+  }, expected),
   notify: (key, params) => send({
     type: 'user_notify',
     turnId: currentBotmuxTurnId,
@@ -20656,6 +20707,136 @@ const traexQuestionBridge = new TraexQuestionBridge({
   }),
   log,
 });
+
+// ─── Codex TUI async questions ───────────────────────────────────────────────
+
+/** A Codex TUI session writes `request_user_input_async` to its rollout as an
+ *  AgentMessage with delivery=async, but has no JSON-RPC channel to the
+ *  daemon. Card the same question here; the daemon's existing async-answer
+ *  path writes the native reply envelope back as a normal user message.
+ *  Hybrid RPC sessions already bridge the item through the app-server. */
+function codexTuiAsyncQuestionEligible(): boolean {
+  return cliAdapter?.id === 'codex'
+    && !codexRpcEngine
+    && lastInitConfig?.codexRpcInput !== true
+    && !!backend && !remoteWsUrl
+    && lastInitConfig?.adoptMode !== true
+    && !(lastInitConfig && isRemoteBackendType(lastInitConfig.backendType));
+}
+
+function codexTuiAsyncQuestionThread(): string | undefined {
+  return lastInitConfig?.cliSessionId
+    ?? (codexBridgeRolloutPath ? codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined);
+}
+
+/** The rollout stores plain titles and option labels; the card expects the
+ *  same bounded AskQuestion shape the RPC path parses. */
+function codexTuiAsyncAskQuestions(question: CodexAsyncQuestionRecord): AskQuestion[] {
+  try {
+    return parseCodexAsyncQuestions({
+      type: 'agentMessage',
+      delivery: 'async',
+      questions: question.questions.map(item => ({
+        title: item.title,
+        ...(item.options.length ? { options: item.options } : {}),
+      })),
+    });
+  } catch {
+    return [];
+  }
+}
+
+const codexTuiAsyncQuestionsSeen = new Set<string>();
+const codexTuiAsyncQuestionAborts = new Map<string, AbortController>();
+let codexTuiAsyncRestoreChecked = false;
+let codexTuiAsyncRestoreFirstSeenAtMs: number | undefined;
+/** Let the TUI repaint after a restart before concluding a question is gone. */
+const CODEX_TUI_RESTORE_SETTLE_MS = 5_000;
+
+async function openCodexTuiAsyncQuestion(question: CodexAsyncQuestionRecord, restored = false): Promise<void> {
+  const cfg = lastInitConfig;
+  const threadId = question.threadId ?? codexTuiAsyncQuestionThread();
+  if (!cfg || !threadId) return;
+  // The user may have answered in the terminal between the drain and this
+  // task; a card for a settled question would only invite a duplicate reply.
+  if (codexBridgeRolloutPath && codexRolloutHasAsyncQuestionReply(codexBridgeRolloutPath, question.itemId)) return;
+  const questions = codexTuiAsyncAskQuestions(question);
+  if (!questions.length) return;
+  const controller = new AbortController();
+  codexTuiAsyncQuestionAborts.set(question.itemId, controller);
+  try {
+    const result = await postCodexAsk({
+      sessionId: cfg.sessionId,
+      larkAppId: cfg.larkAppId,
+      chatId: cfg.chatId,
+      rootMessageId: cfg.rootMessageId,
+      originTurnId: currentBotmuxTurnId,
+      originDispatchAttempt: currentBotmuxDispatchAttempt,
+    }, questions, controller.signal, {
+      threadId,
+      itemId: question.itemId,
+      ...(question.nativeTurnId ? { nativeTurnId: question.nativeTurnId } : {}),
+    }, undefined, restored);
+    if (result.kind !== 'answered') log(`Codex async question ${question.itemId} ended: ${result.kind}`);
+  } catch (err: any) {
+    if (!controller.signal.aborted) {
+      // The card was never delivered; allow a later recovery check to retry.
+      codexTuiAsyncQuestionsSeen.delete(question.itemId);
+      log(`Codex async question ${question.itemId} card failed: ${err?.message ?? err}`);
+    }
+  } finally {
+    if (codexTuiAsyncQuestionAborts.get(question.itemId) === controller) {
+      codexTuiAsyncQuestionAborts.delete(question.itemId);
+    }
+  }
+}
+
+/** Card each async question once. A native reply already in the rollout (the
+ *  user answered in the terminal) withdraws the pending card instead. */
+function observeCodexTuiAsyncQuestions(events: CodexBridgeEvent[]): void {
+  if (!codexTuiAsyncQuestionEligible()) return;
+  for (const event of events) {
+    if (event.kind !== 'user' || !event.text.includes('send_user_message_question_reply')) continue;
+    for (const [itemId, controller] of codexTuiAsyncQuestionAborts) {
+      if (!event.text.includes(itemId)) continue;
+      controller.abort();
+      codexTuiAsyncQuestionAborts.delete(itemId);
+    }
+  }
+  for (const question of selectNewCodexAsyncQuestions(events, codexTuiAsyncQuestionThread(), codexTuiAsyncQuestionsSeen)) {
+    void openCodexTuiAsyncQuestion(question);
+  }
+}
+
+/** Re-offer the last unanswered question after a worker restart: the
+ *  incremental drain baselines at the end and never replays the record. */
+function maybeRestoreCodexTuiAsyncQuestion(): void {
+  if (codexTuiAsyncRestoreChecked || !codexTuiAsyncQuestionEligible()) return;
+  if (!codexBridgeRolloutPath || !backend) return;
+  const now = Date.now();
+  codexTuiAsyncRestoreFirstSeenAtMs ??= now;
+  let screen = '';
+  try { screen = captureBackendScreen(backend); } catch { return; }
+  // An empty capture is not evidence that the question is gone; retry later.
+  if (!screen.trim()) return;
+  if (traexPendingAsyncQuestionCount(screen) === undefined) {
+    // The TUI repaints after the first tick. Concluding "no question" from a
+    // screen captured too early would permanently skip a pending question, so
+    // wait out a short settle window before giving up.
+    if (now - codexTuiAsyncRestoreFirstSeenAtMs >= CODEX_TUI_RESTORE_SETTLE_MS) {
+      codexTuiAsyncRestoreChecked = true;
+    }
+    return;
+  }
+  const question = findPendingCodexAsyncQuestion(codexBridgeRolloutPath);
+  codexTuiAsyncRestoreChecked = true;
+  if (!question || codexTuiAsyncQuestionsSeen.has(question.itemId)) return;
+  if (codexRolloutHasAsyncQuestionReply(codexBridgeRolloutPath, question.itemId)) return;
+  const ownedThread = codexTuiAsyncQuestionThread();
+  if (ownedThread && question.threadId && question.threadId !== ownedThread) return;
+  codexTuiAsyncQuestionsSeen.add(question.itemId);
+  void openCodexTuiAsyncQuestion(question, true);
+}
 
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
@@ -27410,7 +27591,7 @@ function startScreenUpdates(): void {
       // one the per-chunk hold check missed (its card is raised from a fresh
       // capture, see core/traex-question-bridge.ts).
       if (traexQuestionBridgeActive()
-        && [lastAnalyzerSnapshot, renderer?.rawSnapshot() ?? ''].some(screen => traexQuestionFlowVisible(screen))) {
+        && [lastAnalyzerSnapshot, renderer?.rawSnapshot() ?? ''].some(screen => traexQuestionFlowVisible(screen) || traexPendingAsyncQuestionVisible(screen))) {
         traexQuestionBridge.kick();
       }
 
