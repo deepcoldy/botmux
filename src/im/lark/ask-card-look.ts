@@ -1,4 +1,5 @@
 import type { AskOption, AskQuestion, AskResult, PendingAsk } from '../../core/ask-types.js';
+import { isNativeAsyncAskOrigin } from '../../core/ask-types.js';
 import { ASK_CUSTOM_MAX_LENGTH, supportsAskCustomInput } from '../../core/ask-custom-input.js';
 import { hasAskForm } from '../../core/ask-form.js';
 import { isHookPermissionAsk, permissionAnswerAllows } from '../../core/ask-hook/types.js';
@@ -334,7 +335,7 @@ export function buildAskChoiceBody(ask: PendingAsk, options: AskBodyOptions): { 
 /** Footer hint for an unsettled Ask, if it has one: how to answer in text instead of on the card. */
 export function askReplyHint(ask: PendingAsk, locale: Locale): string | undefined {
   if (ask.deliveryTarget) return t('card.ask.document_reply_hint', undefined, locale);
-  if (ask.originKind === 'native-user-input-async') return t('card.ask.async_reply_hint', undefined, locale);
+  if (isNativeAsyncAskOrigin(ask.originKind)) return t('card.ask.async_reply_hint', undefined, locale);
   const presentation = askPresentation(ask);
   if (presentation === 'text_reply') return t('card.ask.text_reply_hint', undefined, locale);
   if (presentation === 'quick' && isHookPermissionAsk(ask)) return t('card.ask.permission_reply_hint', undefined, locale);

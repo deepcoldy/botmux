@@ -5,6 +5,7 @@ import type { AskQuestion, AskResult, CreateAskInput, PendingAsk } from '../src/
 import claude from '../src/core/ask-hook/claude-code.js';
 import { buildAskCard, handleAskCardAction, renderAskCard } from '../src/im/lark/ask-card.js';
 import { buildTurnReplyAskElements } from '../src/im/lark/turn-reply-ask-elements.js';
+import { askReplyHint } from '../src/im/lark/ask-card-look.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 import type { TurnReplyCardRecord } from '../src/services/turn-reply-card.js';
@@ -45,7 +46,7 @@ async function open(questions: AskQuestion[], over: Partial<CreateAskInput> = {}
   const ask = sent.at(-1)!;
   return { ask, answer, card: JSON.parse(buildAskCard(ask)) };
 }
-function submit(ask: PendingAsk, value: Record<string, unknown>, formValue: Record<string, unknown>, by = 'ou_owner') {
+function submit(ask: PendingAsk, value: Record<string, unknown>, formValue: unknown, by = 'ou_owner') {
   return handleAskCardAction({ operator: { open_id: by },
     action: { value: { ask_id: ask.askId, nonce: ask.nonce, ...value } as Record<string, unknown>, form_value: formValue } }) as Promise<any>;
 }
@@ -219,6 +220,27 @@ describe('不支持自填的提问（宿主审批等）', () => {
     expect(await answer).toMatchObject({ kind: 'answered', answers: [['one'], ['park']] });
   });
 
+  it.each([
+    ['缺失', undefined], ['字符串', 'opt_0_0=true'], ['数组', ['opt_0_0']], ['null', null], ['数字', 1],
+  ])('顶层 form_value 为%s时不猜成全不勾：普通提交与空提交确认都拒收', async (_shape, formValue) => {
+    const { ask, card } = await open([multi({ allowCustom: false })], closed);
+    const submitValue = submitOf(card);
+    for (const value of [submitValue, { ...submitValue, confirm_empty: 'true' }]) {
+      const response = await submit(ask, value, formValue);
+      expect(response).toEqual({ toast: { type: 'warning', content: t('card.ask.toast.unreadable') } });
+      expect(getAskSnapshot(ask.askId)).toMatchObject({ settled: false });
+      expect(getAskSnapshot(ask.askId)?.result).toBeUndefined();
+    }
+  });
+
+  it('空对象仍是可读的全不勾：照常经过空提交确认后作答', async () => {
+    const { ask, answer, card } = await open([multi({ allowCustom: false })], closed);
+    const armed = await submit(ask, submitOf(card), {});
+    expect(armed.toast.content).toBe(t('card.ask.toast.empty_confirm_needed'));
+    await submit(ask, submitOf(armed.card.data), {});
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [[]] });
+  });
+
   it('单问单选、无预选 → 点一下即提交；有预选 → 改为勾选 + 提交', async () => {
     const quick = (await open([single({ allowCustom: false })], closed)).card;
     expect(all(quick).filter(n => n.tag === 'interactive_container').map(callbackOf).map((v: any) => v.action))
@@ -334,6 +356,7 @@ describe('Claude 权限确认卡', () => {
     ['en', ['allow'], null, 'green', 'card.ask.header.permission_allowed'],
     ['zh', ['deny'], null, 'grey', 'card.ask.header.permission_denied'],
     ['en', ['deny'], null, 'grey', 'card.ask.header.permission_denied'],
+    ['zh', ['allow'], '先别删，换个目录', 'grey', 'card.ask.header.permission_denied'],
     // A thread reply settles with no option and a comment: the hook denies and forwards the text.
     ['zh', [], '先别删，换个目录', 'grey', 'card.ask.header.permission_denied'],
   ] as Array<[Locale, string[], string | null, string, string]>)('%s：选 %j / 回复 %j → %s 标题 %s', (locale, keys, comment, template, title) => {
@@ -403,6 +426,16 @@ describe('元素上限（Card 2.0 每卡 200）与字节预算', () => {
       // The settled card of such an Ask stays within the limit too.
       const settled = renderAskCard(pending(qs), { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
       expect(tagged(JSON.parse(settled.json))).toBeLessThanOrEqual(FEISHU_CARD_ELEMENT_LIMIT);
+    });
+
+  it.each(['native-user-input-async', 'native-user-input-async-restore', 'native-user-input-standalone'])(
+    '%s：普通卡与纯文字列表都提示引用本卡回复', originKind => {
+      const ask = { ...pending([multi()]), originKind };
+      const hint = t('card.ask.async_reply_hint', undefined, 'zh');
+      expect(askReplyHint(ask, 'zh')).toBe(hint);
+      const list = JSON.parse(renderAskCard({ ...ask, questions: many(20, 8) }).json);
+      expect(list.body.elements.at(-1).content).toContain(hint);
+      expect(list.body.elements.at(-1).content).not.toContain(t('card.ask.list_reply_hint', undefined, 'zh'));
     });
 
   it('题少时用一行一个勾选框的完整样式；放不下时下拉框列全选项、说明转附件', () => {

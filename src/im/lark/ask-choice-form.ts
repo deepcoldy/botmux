@@ -47,7 +47,10 @@ export function formValueTypes(value: unknown): Record<string, string> {
 }
 
 export function parseAskChoiceFormValue(questions: ReadonlyArray<AskQuestion>, formValue: unknown): AskChoiceFormValue {
-  const values = formValue && typeof formValue === 'object' && !Array.isArray(formValue) ? formValue as Record<string, unknown> : {};
+  if (!formValue || typeof formValue !== 'object' || Array.isArray(formValue)) {
+    return { kind: 'unreadable', fieldTypes: formValueTypes(formValue) };
+  }
+  const values = formValue as Record<string, unknown>;
   const chosen = questions.map(() => new Set<string>());
   const fields: Record<string, unknown> = {};
   let sawChoiceField = false;

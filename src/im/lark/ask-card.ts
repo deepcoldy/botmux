@@ -10,7 +10,7 @@ import type {
   AskResult,
   PendingAsk,
 } from '../../core/ask-types.js';
-import { AskDispatchError } from '../../core/ask-types.js';
+import { AskDispatchError, isNativeAsyncAskOrigin } from '../../core/ask-types.js';
 import { applyAskForm, getAskSnapshot, submitAsk, submitAskChoices, submitAskForm, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { askChoiceProblem } from '../../core/ask-choice.js';
 import { logger } from '../../utils/logger.js';
@@ -626,7 +626,7 @@ function renderAskCardWithCap(
     header = pendingHeader(ask, locale, 'text_reply');
     if (mention) elements.push({ tag: 'markdown', content: mention });
     elements.push(...body.elements, askFooter(deadlineLine(ask, locale), [
-      ask.deliveryTarget || ask.originKind === 'native-user-input-async' ? askReplyHint(ask, locale) ?? ''
+      ask.deliveryTarget || isNativeAsyncAskOrigin(ask.originKind) ? askReplyHint(ask, locale) ?? ''
         : t('card.ask.list_reply_hint', undefined, locale),
       body.descriptionsTruncated ? t('card.ask.descriptions_truncated', undefined, locale) : '',
     ]));

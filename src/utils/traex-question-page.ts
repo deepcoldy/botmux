@@ -500,6 +500,7 @@ export function traexQuestionAnswerFromAsk(page: TraexQuestionPage, result: AskR
   if (numbers.length === 0) return 'no option selected';
   if (!page.multiSelect && numbers.length !== 1) return 'more than one option for a single-choice question';
   const note = sanitizeTraexQuestionNote(result.notes?.[0] ?? '');
+  if (note && page.delivery === 'async') return 'async option answers cannot carry notes';
   return { kind: 'options', numbers: numbers.sort((a, b) => a - b), ...(note ? { note } : {}) };
 }
 
@@ -540,6 +541,7 @@ export function nextTraexQuestionStep(page: TraexQuestionPage, answer: TraexQues
   const other = page.options[page.options.length - 1]!.number;
   if (page.delivery === 'async') {
     if (answer.kind === 'options') {
+      if (answer.note) return { kind: 'fail', reason: 'async option answers cannot carry notes' };
       const [number] = answer.numbers;
       if (answer.numbers.length !== 1 || !number || number >= other) return { kind: 'fail', reason: 'invalid option' };
       if (page.notesText) return { kind: 'fail', reason: 'the notes field contains other text' };
@@ -603,7 +605,14 @@ function optionsWithNoteStep(page: TraexQuestionPage, numbers: number[], note: s
     }
     return { kind: 'key', key: 'Tab', final: false };
   }
-  if (!page.multiSelect && page.highlighted !== numbers[0]) return { kind: 'fail', reason: 'the notes field belongs to another option' };
+  if (page.multiSelect) {
+    const wanted = new Set(numbers);
+    const checked = page.options.filter(option => option.checked === true);
+    if (wanted.size === 0 || wanted.size !== numbers.length || wanted.has(other)
+      || checked.length !== numbers.length || checked.some(option => !wanted.has(option.number))) {
+      return { kind: 'fail', reason: 'the selected options do not match the answer' };
+    }
+  } else if (page.highlighted !== numbers[0]) return { kind: 'fail', reason: 'the notes field belongs to another option' };
   if (page.notesText === undefined) return { kind: 'fail', reason: 'the notes field is not visible' };
   if (page.notesText === '') return { kind: 'paste', text: note };
   if (notesHold(page.notesText, note)) return { kind: 'key', key: 'Enter', final: true };
