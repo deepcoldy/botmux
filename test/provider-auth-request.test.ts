@@ -27,7 +27,7 @@ beforeEach(() => {
   deps = {
     requestMeegoLogin: vi.fn(async () => meego),
     bytedcliAuthorized: vi.fn(async () => false as boolean | 'unknown'),
-    adoptBytedcliForTurn: vi.fn(async () => 'none' as 'adopted' | 'already' | 'none'),
+    adoptBytedcliForTurn: vi.fn(async () => 'none' as 'adopted' | 'already' | 'none' | 'unavailable'),
     startBytedcliLogin: vi.fn(async () => ({ state: 'challenge', challenge: { authUrl: BYTED_URL, completeToken: 'tok-b' } }) as BytedcliLoginStart),
     deliver: vi.fn(async () => delivery),
     now: () => clock,
@@ -212,5 +212,24 @@ describe('requestProviderAuth — ByteCloud already authorized mid-turn', () => 
     const r = await ask('bytedcli');
     expect(r.status).toBe('ready');
     expect(r.message).toContain('不需要再登录');
+  });
+
+  it('returns unavailable instead of ready when adopting the login fails transiently', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => 'unavailable' as const);
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('unavailable');
+    expect(r.message).toContain('暂时不可用');
+    expect(r.message).toContain('不要重复登录');
+    expect(deps.deliver).not.toHaveBeenCalled();
+  });
+
+  it('catches unexpected errors thrown by adoptBytedcliForTurn and returns unavailable', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => { throw new Error('bytedcli authorization service unavailable'); });
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('unavailable');
+    expect(r.message).toContain('暂时不可用');
+    expect(deps.deliver).not.toHaveBeenCalled();
   });
 });

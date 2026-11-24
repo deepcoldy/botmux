@@ -42,9 +42,9 @@ export interface ProviderAuthDeps {
   /** A link to send; or `authorized` when bytedcli already holds a confirmed
    *  login; or `failed` with a redacted reason. */
   startBytedcliLogin: (openId: string) => Promise<BytedcliLoginStart>;
-  /** Hands a finished ByteCloud login to the running turn; true when the turn
-   *  can use it now. */
-  adoptBytedcliForTurn: (openId: string) => Promise<'adopted' | 'already' | 'none'>;
+  /** Hands a finished ByteCloud login to the running turn; `'unavailable'` when
+   *  minting the turn's personal JWT fails transiently. */
+  adoptBytedcliForTurn: (openId: string) => Promise<'adopted' | 'already' | 'none' | 'unavailable'>;
   /** {@link deliverAuthLink} bound to this conversation and person. */
   deliver: (text: string, privateCommand: string) => Promise<AuthLinkDelivery>;
   now?: () => number;
@@ -85,7 +85,15 @@ export async function requestProviderAuth(
       ? { state: 'authorized' as const }
       : await deps.startBytedcliLogin(openId);
     if (started.state === 'authorized') {
-      const adopted = await deps.adoptBytedcliForTurn(openId);
+      let adopted: 'adopted' | 'already' | 'none' | 'unavailable';
+      try {
+        adopted = await deps.adoptBytedcliForTurn(openId);
+      } catch {
+        adopted = 'unavailable';
+      }
+      if (adopted === 'unavailable') {
+        return { status: 'unavailable', message: t('provider_auth.ready_bytedcli_unavailable', undefined, locale) };
+      }
       const key = { adopted: 'provider_auth.ready_bytedcli_now', already: 'provider_auth.ready_bytedcli_already', none: 'provider_auth.ready_bytedcli' }[adopted];
       return { status: 'ready', message: t(key, undefined, locale) };
     }
