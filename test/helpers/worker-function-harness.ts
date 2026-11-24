@@ -150,6 +150,8 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   }
   if (key === 'cliRestartEpoch') return (scope.cliRestartEpoch ??= 0);
   if (key === 'deferredSessionReady') return (scope.deferredSessionReady ??= []);
+  if (key === 'pendingAbsorbedReplyDeliveries') return (scope.pendingAbsorbedReplyDeliveries ??= new Map());
+  if (key === 'deferredAbsorbedReplyFinals') return (scope.deferredAbsorbedReplyFinals ??= new Map());
   return undefined;
 }
 
