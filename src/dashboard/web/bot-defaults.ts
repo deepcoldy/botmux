@@ -103,6 +103,12 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardTaskHints', 'botDefaults.stewardGuide'],
   },
   {
+    id: 'task-routing',
+    tab: 'sessions',
+    titleKey: 'botDefaults.sectionTaskRouting',
+    fieldKeys: ['botDefaults.taskRoutingEnabled'],
+  },
+  {
     id: 'substitute',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionSubstitute',
@@ -142,7 +148,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'codex-auth', tab: 'security', titleKey: 'botDefaults.sectionCodexAuth', fieldKeys: ['botDefaults.codexAuthSyncLabel'] },
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
   { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention', 'botDefaults.triggerUserAuthAllowSpeakerSwitch'] },
-  { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle'] },
+  { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle', 'botDefaults.larkUserOwnerFallbackToggle'] },
   {
     id: 'grant',
     tab: 'security',
@@ -454,6 +460,8 @@ export type BotDefaultsRow = {
   } | null;
   /** lark-cli 应用绑定开关（默认开启）。默认开启以当前 Bot 应用凭证调用并支持 --profile 透传；设为 false 显式关闭。 */
   larkToolBinding?: boolean;
+  /** 没有发起人时 lark-cli --as user 用主人的飞书身份（默认开启）；false 回到只认发起人的严格行为。 */
+  larkUserOwnerFallback?: boolean;
   /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
   sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
   sandboxNetworkPolicyPlatform?: string | null;
@@ -555,6 +563,8 @@ export type BotDefaultsRow = {
   oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
   /** 管家（决策看板）配置；null / 缺省 = 未开启。 */
   steward?: import('../../core/decision-board/model.js').StewardConfig | null;
+  /** Per-bot task-routing profile; null/absent = not participating. */
+  taskRouting?: import('../../core/task-routing/model.js').BotTaskRoutingConfig | null;
   /** Codex App 无进展提醒（#1162）。null = 默认（开启，90s）。 */
   noProgressNotify?: import('../../services/no-progress-notify-policy.js').NoProgressNotifyPolicy | null;
   /** Per-bot prompt-cache override; null/absent = inherit the global default. */

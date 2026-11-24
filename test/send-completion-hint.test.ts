@@ -39,46 +39,26 @@ describe('post-send completion guidance', () => {
     }
   });
 
-  describe('transcript sessions (final reply forwarded by botmux)', () => {
-    it.each(['zh', 'en'] as const)('every receipt resolves to catalog text (%s)', locale => {
+  describe('transcript sessions (auto-forward final reply)', () => {
+    it('non-steer sends emit no extra completion hint or persuasion', () => {
       for (const unified of [false, true]) {
         for (const kind of ['progress', 'final', 'auxiliary'] as const) {
-          for (const advanced of [undefined, 'next-turn']) {
-            const key = sendCompletionHintKey(kind, unified, advanced, 'transcript');
-            expect(t(key, undefined, locale)).not.toBe(key);
-          }
+          expect(sendCompletionHintKey(kind, unified, undefined, 'transcript')).toBeNull();
         }
       }
     });
 
-    it.each(['zh', 'en'] as const)('a progress receipt points back at the final reply instead of another final send (%s)', locale => {
-      for (const unified of [false, true]) {
-        const hint = t(sendCompletionHintKey('progress', unified, undefined, 'transcript'), undefined, locale);
-        expect(hint).not.toContain('--response-kind final');
-        expect(sendCompletionHintKey('progress', unified, undefined, 'transcript'))
-          .not.toBe(sendCompletionHintKey('progress', unified));
+    it.each(['zh', 'en'] as const)('a promoted successor emits a factual steer-advance notice without persuasion (%s)', locale => {
+      for (const kind of ['progress', 'final', 'auxiliary'] as const) {
+        const key = sendCompletionHintKey(kind, false, 'next-turn', 'transcript');
+        expect(key).toBe('ai.send.after_success_steer_advanced_transcript');
+        const text = t(key!, undefined, locale);
+        expect(text).not.toBe(key);
+        expect(text).not.toContain('--response-kind final');
+        expect(text).not.toContain('不必 send');
+        expect(text).not.toContain('progress');
+        expect(text).toContain('BOTMUX_NOTHING_TO_SEND');
       }
-      // A plain send that already carried the whole answer must be able to end
-      // without the transcript final posting it a second time.
-      expect(t(sendCompletionHintKey('progress', false, undefined, 'transcript'), undefined, locale))
-        .toContain('BOTMUX_NOTHING_TO_SEND');
-    });
-
-    it.each(['zh', 'en'] as const)('a supplement still never invites ending (%s)', locale => {
-      for (const unified of [false, true]) {
-        expect(t(sendCompletionHintKey('auxiliary', unified, undefined, 'transcript'), undefined, locale))
-          .not.toContain('BOTMUX_NOTHING_TO_SEND');
-      }
-    });
-
-    it('a declared final keeps the shared receipt: its marker retires the transcript final in both modes', () => {
-      for (const unified of [false, true]) {
-        expect(sendCompletionHintKey('final', unified, undefined, 'transcript')).toBe('ai.send.after_success_hint');
-      }
-    });
-
-    it.each(['progress', 'final', 'auxiliary'] as const)('a promoted successor after %s is answered in the final reply', kind => {
-      expect(sendCompletionHintKey(kind, false, 'next-turn', 'transcript')).toBe('ai.send.after_success_steer_advanced_transcript');
     });
 
     it('reads the spawn snapshot strictly: only an exact transcript value switches the wording', () => {

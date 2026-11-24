@@ -216,3 +216,21 @@ describe('/botconfig free-input quota', () => {
     expect(registry.getBot('app_config').config.messageQuota).toBeUndefined();
   });
 });
+
+describe('/botconfig toggles of default-on switches', () => {
+  it('the first click on an unset default-on switch turns it off, the next one back on', async () => {
+    const { registry, handler } = await fresh();
+    const click = () => handler.handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: 'config_toggle', field: 'larkUserOwnerFallback', loc: 'en' } },
+    }, deps, 'app_config');
+    const stored = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0].larkUserOwnerFallback;
+
+    await click();
+    expect(stored()).toBe(false);
+    expect(registry.getBot('app_config').config.larkUserOwnerFallback).toBe(false);
+    await click();
+    expect(stored()).toBeUndefined();
+    expect(registry.getBot('app_config').config.larkUserOwnerFallback).toBeUndefined();
+  });
+});

@@ -70,6 +70,12 @@ describe('classifySlash 的级联接入条件', () => {
   it('bot 门先于一切', () => {
     expect(classifySlash({ ...base, senderIsBot: true, acceptSlashFromBots: false })).toEqual({ kind: 'forward', reason: 'bot_gated' });
   });
+  it('keeps all lines of an Antigravity side question out of the main turn', () => {
+    const text = '/btw Which setting applies?\nCompare it with the previous setup.';
+    expect(classifySlash({ ...base, cliId: 'antigravity', text }))
+      .toEqual({ kind: 'passthrough', cmd: '/btw', delivery: 'to_session', content: text });
+    expect(classifySlash({ ...base, cliId: 'codex', text }).kind).toBe('cascade');
+  });
 });
 
 describe('MULTILINE_COMMANDS 豁免（§9 补测）', () => {

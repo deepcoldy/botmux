@@ -46,6 +46,7 @@ const settings: Settings = {
   sessionCleanup: { enabled: false, olderThanHours: 24, intervalMinutes: 60 },
   promptCache: null,
   multiTopic: { enabled: false },
+  taskRouting: { enabled: false },
   remoteAccess: false,
   oauthRedirectBase: '',
   httpProxy: '',
@@ -130,6 +131,33 @@ describe('stuck-card initiator switch', () => {
     expect(key).toBe('stuckCardInitiatorKeys');
     expect(patch).toEqual({ stuckCardInitiatorKeys: false });
     expect(update(settings).stuckCardInitiatorKeys).toBe(false);
+  });
+});
+
+describe('task-routing global switch', () => {
+  it('saves only enabled in the request and preserves advanced config in the optimistic view', async () => {
+    const onSave = vi.fn(async () => {});
+    let body!: TestRenderer.ReactTestRenderer;
+    await act(async () => { body = renderSettingsPageParts(onSave); });
+    const block = body.root.find(node => isBlock(node) && node.props.id === 'settings-task-routing');
+    const toggle = block.findByProps({ 'data-action': 'toggle-task-routing' });
+    expect(toggle.props.checked).toBe(false);
+    await act(async () => { toggle.props.onChange({ currentTarget: { checked: true } }); });
+    act(() => body.unmount());
+
+    expect(onSave).toHaveBeenCalledTimes(1);
+    const [key, patch, update] = onSave.mock.calls[0] as unknown as [string, unknown, (s: Settings) => Settings];
+    expect(key).toBe('taskRouting');
+    expect(patch).toEqual({ taskRouting: { enabled: true } });
+    const advanced = {
+      ...settings,
+      taskRouting: {
+        enabled: false,
+        policy: '保留原则',
+        matcher: { mode: 'bot' as const, botAppId: 'cli_judge' },
+      },
+    };
+    expect(update(advanced).taskRouting).toEqual({ ...advanced.taskRouting, enabled: true });
   });
 });
 

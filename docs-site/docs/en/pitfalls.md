@@ -46,7 +46,9 @@ When you wrap the CLI in your own script (for example to go through an internal 
 ## Input / submission
 
 - **A multi-line message gets submitted as several messages**: some TUIs treat newlines and tabs in the prompt as Enter or autocomplete. botmux now types into Codex and CoCo as one bracketed paste. When you send multi-line content with `botmux send` yourself, use a heredoc too.
-- **The model answered in the terminal but nothing reached Lark, or it keeps calling `botmux send` within one turn**: in send mode the final reply relies on the model calling `botmux send` itself, and weak or wrapped models tend to forget it or keep calling it without stopping. → Supported CLIs (Claude Code, Codex, CoCo and others) now default to `replyDelivery: "transcript"`: botmux takes the last answer of the turn straight from the CLI's transcript and posts it to Lark, so it no longer depends on the model calling `botmux send`, and the prompt asks the model not to use it for progress. If a bot sets `"send"` explicitly, remove it or change it to `"transcript"`; for unsupported CLIs, use a stronger model or firmer prompt constraints. See `replyDelivery` in [bots.json Configuration](/en/bots-json).
+- **The model answered in the terminal, but nothing reached Lark**: by default, the final reply relies on the model calling `botmux send` itself. Weak or wrapped models tend to forget it, or keep calling it without stopping. → Two options:
+  - Use a stronger model, or add firmer prompt constraints;
+  - For supported CLIs (Claude Code, Codex, CoCo and others), turn on **Auto-forward final reply** (`replyDelivery: "transcript"`): botmux takes the last answer of the turn straight from the CLI's session record and posts it to Lark, so it no longer depends on the model calling `botmux send`. See `replyDelivery` in [bots.json Configuration](/en/bots-json).
 - **`botmux send --images` with 6 or more images may fail silently**: → Send at most 4 at a time, in batches.
 
 ### A message got no response: read the diagnosis card {#submit-failure-diagnosis}

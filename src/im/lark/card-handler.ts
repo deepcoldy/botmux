@@ -40,6 +40,7 @@ import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
 import {
   findConfigField,
   applyConfigField,
+  configBooleanOn,
   coerceConfigValue,
   getConfigCardData,
 } from '../../services/bot-config-store.js';
@@ -2808,7 +2809,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     let r;
     if (value.action === 'config_toggle') {
       if (spec.kind !== 'boolean') return { toast: { type: 'error', content: t('cmd.config.invalid_bool', { field: spec.key, value: '' }, loc) } };
-      const cur = (cbot.config as any)[spec.configKey] === true;
+      const cur = configBooleanOn(spec, (cbot.config as any)[spec.configKey]);
       r = await applyConfigField(larkAppId, spec, !cur);
     } else {
       const raw = (action as any)?.option ?? (action as any)?.input_value ?? '';

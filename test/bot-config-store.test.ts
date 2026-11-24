@@ -341,10 +341,10 @@ describe('bot-config store', () => {
     expect(readConfig()).toMatchObject({ promptInjection: 'none', replyDelivery: 'send' });
     const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
     expect(effectiveReplyDelivery('app_default', 'codex')).toBe('transcript');
-    // An unconfigured codex bot follows the CLI default (transcript); turning
-    // zero injection off below must still land on app_default's explicit send.
+    // An unconfigured codex bot defaults to send; turning zero injection off
+    // below must still land on app_default's explicit send.
     registry.registerBot({ larkAppId: 'plain', larkAppSecret: 's', cliId: 'codex' });
-    expect(effectiveReplyDelivery('plain', 'codex')).toBe('transcript');
+    expect(effectiveReplyDelivery('plain', 'codex')).toBe('send');
     const cli = store.findConfigField('cli')!;
     const changed = await store.applyConfigField('app_default', cli, 'opencode');
     expect(changed).toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
@@ -1968,7 +1968,7 @@ describe('bot-config store', () => {
     expect(switched.registry.getBot('app_default').config.serviceTier).toBeUndefined();
   });
 
-  it('replyDelivery: claude-code defaults to transcript; both values persist; unset clears back to that default', async () => {
+  it('replyDelivery: claude-code defaults to send; both values persist; unset clears back to that default', async () => {
     const { registry, store } = await loaded({ cliId: 'claude-code' });
     const spec = store.findConfigField('replyDelivery')!;
     expect(spec.kind).toBe('enum');
@@ -1978,32 +1978,32 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, 'send')).toEqual({ ok: true, value: 'send' });
     expect(store.coerceConfigValue(spec, 'auto')).toEqual({ ok: false, reason: 'invalid_enum' });
 
-    // 缺省展示是 transcript（而非 ∅）：claude-code 能采集转写，缺省由 botmux 转发最终回复。
+    // 缺省展示是 send（而非 ∅），claude-code 也不例外——自动转发最终回复按需显式开启。
     const before = store.getConfigSnapshot('app_default');
-    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('transcript');
+    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
     expect('replyDelivery' in readConfig()).toBe(false);
     expect(registry.resolveReplyDelivery('app_default')).toBeUndefined();
 
-    // set send：退回旧行为，显式落盘。
-    const r1 = await store.applyConfigField('app_default', spec, 'send');
+    // set transcript：opt-in，显式落盘。
+    const r1 = await store.applyConfigField('app_default', spec, 'transcript');
     expect(r1.ok).toBe(true);
-    if (r1.ok) expect(r1).toMatchObject({ oldText: 'transcript', newText: 'send', effect: 'next-session' });
-    expect(readConfig().replyDelivery).toBe('send');
-    expect(registry.getBot('app_default').config.replyDelivery).toBe('send');
-    expect(registry.resolveReplyDelivery('app_default')).toBe('send');
-
-    // set transcript：显式钉住也落盘（与缺省同值，但不靠缺省兜）。
-    const r2 = await store.applyConfigField('app_default', spec, 'transcript');
-    expect(r2.ok).toBe(true);
-    if (r2.ok) expect(r2).toMatchObject({ oldText: 'send', newText: 'transcript' });
+    if (r1.ok) expect(r1).toMatchObject({ oldText: 'send', newText: 'transcript', effect: 'next-session' });
     expect(readConfig().replyDelivery).toBe('transcript');
     expect(registry.getBot('app_default').config.replyDelivery).toBe('transcript');
     expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
 
-    // unset：删 key，回缺省 transcript，内存同步为 undefined。
+    // set send：显式退回也落盘（与缺省同值，但意图是「钉住」，不靠缺省兜）。
+    const r2 = await store.applyConfigField('app_default', spec, 'send');
+    expect(r2.ok).toBe(true);
+    if (r2.ok) expect(r2).toMatchObject({ oldText: 'transcript', newText: 'send' });
+    expect(readConfig().replyDelivery).toBe('send');
+    expect(registry.getBot('app_default').config.replyDelivery).toBe('send');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('send');
+
+    // unset：删 key，回缺省 send，内存同步为 undefined。
     const r3 = await store.applyConfigField('app_default', spec, null);
     expect(r3.ok).toBe(true);
-    if (r3.ok) expect(r3).toMatchObject({ oldText: 'transcript', newText: 'transcript' });
+    if (r3.ok) expect(r3).toMatchObject({ oldText: 'send', newText: 'send' });
     expect('replyDelivery' in readConfig()).toBe(false);
     expect(registry.getBot('app_default').config.replyDelivery).toBeUndefined();
     expect(registry.resolveReplyDelivery('app_default')).toBeUndefined();
@@ -2017,23 +2017,23 @@ describe('bot-config store', () => {
     expect(snap.ok && snap.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
   });
 
-  it('replyDelivery: structured-bridge CLIs (codex) default to transcript; an explicit send persists and unset clears back', async () => {
+  it('replyDelivery: non-claude CLIs (codex) default to send; transcript persists on opt-in and unset clears back', async () => {
     const { registry, store } = await loaded({ cliId: 'codex' });
     const spec = store.findConfigField('replyDelivery')!;
     const before = store.getConfigSnapshot('app_default');
-    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('transcript');
+    expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
     expect(registry.resolveReplyDelivery('app_default')).toBeUndefined();
 
-    const r1 = await store.applyConfigField('app_default', spec, 'send');
+    const r1 = await store.applyConfigField('app_default', spec, 'transcript');
     expect(r1.ok).toBe(true);
-    if (r1.ok) expect(r1).toMatchObject({ oldText: 'transcript', newText: 'send' });
-    expect(readConfig().replyDelivery).toBe('send');
-    expect(registry.getBot('app_default').config.replyDelivery).toBe('send');
-    expect(registry.resolveReplyDelivery('app_default')).toBe('send');
+    if (r1.ok) expect(r1).toMatchObject({ oldText: 'send', newText: 'transcript' });
+    expect(readConfig().replyDelivery).toBe('transcript');
+    expect(registry.getBot('app_default').config.replyDelivery).toBe('transcript');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
 
     const r2 = await store.applyConfigField('app_default', spec, null);
     expect(r2.ok).toBe(true);
-    if (r2.ok) expect(r2).toMatchObject({ oldText: 'send', newText: 'transcript' });
+    if (r2.ok) expect(r2).toMatchObject({ oldText: 'transcript', newText: 'send' });
     expect('replyDelivery' in readConfig()).toBe(false);
     expect(registry.getBot('app_default').config.replyDelivery).toBeUndefined();
   });
@@ -2327,6 +2327,28 @@ describe('bot-config store', () => {
     expect(store.getConfigCardData('app_default')?.customPassthroughCommands).toBe('/goal /export');
     const { store: store2 } = await loaded();
     expect(store2.getConfigCardData('app_default')?.customPassthroughCommands).toBeNull();
+  });
+
+  it('larkUserOwnerFallback is default on: only off is stored, it applies at once, and the /botconfig card shows the live state', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('larkUserOwnerFallback')!;
+    const cardState = (key: string) => store.getConfigCardData('app_default')?.booleans.find(b => b.key === key)?.on;
+    // Unset means on, and the card says so (default-on toggles used to read as off).
+    expect(cardState('larkUserOwnerFallback')).toBe(true);
+    expect(cardState('trustSameOwnerBots')).toBe(true);
+    const off = await store.applyConfigField('app_default', spec, false);
+    expect(off).toMatchObject({ ok: true, oldText: 'on', newText: 'off', effect: 'immediate' });
+    expect(readConfig().larkUserOwnerFallback).toBe(false);
+    expect(registry.getBot('app_default').config.larkUserOwnerFallback).toBe(false);
+    expect(cardState('larkUserOwnerFallback')).toBe(false);
+    const on = await store.applyConfigField('app_default', spec, true);
+    expect(on).toMatchObject({ ok: true, oldText: 'off', newText: 'on' });
+    expect(readConfig()).not.toHaveProperty('larkUserOwnerFallback');
+    expect(registry.getBot('app_default').config.larkUserOwnerFallback).toBeUndefined();
+    expect(cardState('larkUserOwnerFallback')).toBe(true);
+    // A saved off survives a reload of bots.json.
+    const { registry: reloaded } = await loaded({ larkUserOwnerFallback: false });
+    expect(reloaded.getBot('app_default').config.larkUserOwnerFallback).toBe(false);
   });
 
   it('startupCommands is a next-session stringList that keeps argument spaces (own parser)', async () => {

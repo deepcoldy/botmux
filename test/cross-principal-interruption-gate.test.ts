@@ -37,6 +37,7 @@ import {
   buildBotmuxSystemPromptText,
 } from '../src/adapters/cli/shared-hints.js';
 import { renderBotmuxSendSkill } from '../src/skills/reply-style-guide.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
@@ -265,6 +266,35 @@ describe('XPI switch — adoption semantics against the real authority', () => {
       started: false,
       reservedAtMs: 456,
     });
+  });
+
+  it('queueAfterActiveTurn prevents runAs adoption through the real worker gate while XPI is off', () => {
+    const workerGate = () => {
+      const activeTurnAuthority = new ActiveTurnAuthority();
+      activeTurnAuthority.reserve({ turnId: 'om_a', caller: A });
+      activeTurnAuthority.markStarted({ turnId: 'om_a', caller: A });
+      const env: Record<string, any> = {
+        activeTurnAuthority,
+        crossPrincipalIsolationOn: () => false,
+        log: vi.fn(),
+      };
+      env.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', env);
+      env.adoptActiveTurnWhenIsolationOff = loadWorkerFunction('adoptActiveTurnWhenIsolationOff', env);
+      env.reserveActiveTurn = loadWorkerFunction('reserveActiveTurn', env);
+      return { authority: activeTurnAuthority, reserve: env.reserveActiveTurn as (input: any) => boolean };
+    };
+
+    const control = workerGate();
+    expect(control.reserve({ turnId: 'trg_runas_control', trustedCaller: B })).toBe(true);
+    expect(control.authority.snapshot()).toMatchObject({ turnId: 'trg_runas_control', caller: A });
+
+    const serial = workerGate();
+    expect(serial.reserve({
+      turnId: 'trg_runas_serial', trustedCaller: B, queueAfterActiveTurn: true,
+    })).toBe(false);
+    expect(serial.authority.snapshot()?.turnId).toBe('om_a');
+    expect(serial.authority.snapshot()?.caller).toEqual(A);
+    expect(serial.authority.snapshot()?.identityTurnId).toBeUndefined();
   });
 });
 

@@ -472,11 +472,13 @@ describe('daemon close barrier used by botmux delete', () => {
     config.session.dataDir = dataDir;
     sessionStore.init('app-xpi-close-unproven');
     const onSessionClosed = vi.fn(async () => undefined);
+    const onSessionRetired = vi.fn();
     workerPool.initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
       getSessionWorkingDir: () => '/tmp',
       getActiveCount: () => 1,
       closeSession: vi.fn(async () => true),
+      onSessionRetired,
       onSessionClosed,
     });
 
@@ -505,6 +507,7 @@ describe('daemon close barrier used by botmux delete', () => {
 
       await workerPool.closeSession(session.sessionId);
 
+      expect(onSessionRetired).toHaveBeenCalledExactlyOnceWith(ds);
       expect(onSessionClosed).toHaveBeenCalledWith(
         expect.objectContaining({ sessionId: session.sessionId, status: 'closed' }),
         { workerGeneration: 9, workerExitProven: false },

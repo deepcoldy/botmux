@@ -46,7 +46,9 @@
 ## 输入 / 提交
 
 - **多行消息被拆成好几条提交**：有些 TUI 会把 prompt 里的换行、Tab 当成回车或补全键。botmux 对 Codex、CoCo 已改成「整段粘贴」（bracketed paste）的方式输入。你自己用 `botmux send` 发多行内容时，也请用 heredoc。
-- **模型在终端里答了，飞书里却没回复，或者一轮里反复 `botmux send` 刷屏**：send 模式下最终回复要靠模型自己调用 `botmux send`，弱模型或套壳模型容易忘了调，或者反复调停不下来。→ 支持的 CLI（Claude Code、Codex、CoCo 等）现在默认就是 `replyDelivery: "transcript"`：botmux 直接从 CLI 记录里取本轮最后一段回答发到飞书，不再依赖模型调用 `botmux send`，提示词也要求别用它发进度。如果某个 bot 显式写了 `"send"`，删掉这项或改成 `"transcript"` 即可；不支持的 CLI 只能换更强的模型或加更明确的提示约束。配置方法见 [bots.json 配置](/bots-json) 里的 `replyDelivery`。
+- **模型在终端里答了，飞书里却没回复**：默认情况下最终回复要靠模型自己调用 `botmux send`。弱模型或套壳模型容易忘了调，或者反复调停不下来。→ 两个办法：
+  - 换更强的模型，或加更明确的提示约束；
+  - 对支持的 CLI（Claude Code、Codex、CoCo 等）打开「自动转发最终回复」（`replyDelivery: "transcript"`）：botmux 直接从 CLI 记录里取本轮最后一段回答发到飞书，不再依赖模型调用 `botmux send`。配置方法见 [bots.json 配置](/bots-json) 里的 `replyDelivery`。
 - **`botmux send --images` 一次 6 张以上可能静默失败**：→ 一次最多 4 张，分批发。
 
 ### 消息发出去没反应：看诊断卡 {#submit-failure-diagnosis}

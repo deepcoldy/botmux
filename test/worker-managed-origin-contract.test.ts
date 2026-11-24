@@ -101,6 +101,22 @@ describe('managed origin publication through the session contract', () => {
     expect(h.store.execution(h.controller.ref, h.execution.executionId)).toMatchObject({ phase: 'queued' });
     expect(h.store.execution(h.controller.ref, h.execution.executionId)?.runtime).toBeUndefined();
   });
+  it('publishes incomplete provenance through worker IPC and retains it in the daemon origin', async () => {
+    const h = fixture({ preAdmit: true });
+    h.scope.run(h.startup, () => h.scope.rememberExecution(h.execution));
+    h.authority.adoptEnvelopePreservingPrincipal({
+      turnId: h.execution.turnId,
+      caller: { requestLarkAppId: h.ds.larkAppId, requestUserOpenId: 'ou_bot', senderType: 'bot' as const },
+    });
+    h.scope.run(h.current, () => {
+      h.scope.enterTurn(h.execution.turnId);
+      h.env.publishSandboxRelayCapability();
+    });
+    await h.drain();
+    expect(h.wire[0]).toMatchObject({ type: 'managed_turn_origin', provenanceIncomplete: true });
+    expect(h.ds.managedTurnOrigin).toMatchObject({ turnId: h.execution.turnId, provenanceIncomplete: true });
+  });
+
   it('rejects a publication from an old semantic context even if the PID marker and authority have the new turn', async () => {
     const h = fixture({ preAdmit: true }); h.scope.rememberExecution(h.execution, h.current);
     h.scope.run(h.startup, () => h.env.publishSandboxRelayCapability()); await h.drain();

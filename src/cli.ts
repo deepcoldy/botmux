@@ -7163,6 +7163,35 @@ ${SESSION_RENAME_USAGE}
   console.log('飞书话题（omt）标题平台无开放接口，不会改变，话题列表仍显示首条消息；`botmux chat rename` 改的是整个群名，与本命令不同。');
 }
 
+/** `botmux assign …`：智能任务分配 CLI。解析与输出在 cli/assign-command.ts，执行逻辑在 cli/assign-runner.ts。 */
+async function cmdAssign(argv: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const dataDir = resolveDataDir();
+  const { runAssignCommand } = await import('./cli/assign-runner.js');
+  const exitCode = await runAssignCommand(argv, {
+    dataDir,
+    sessionTransport: {
+      detectSessionId: () => findAncestorSessionId(),
+      resolveSessionAppId: async (sessionId: string) => {
+        const resolved = await resolveSessionById(sessionId, { dataDir });
+        if (resolved.ok && resolved.session.larkAppId) return resolved.session.larkAppId;
+        return process.env.BOTMUX_LARK_APP_ID?.trim() || undefined;
+      },
+      postSessionTaskRouting: async ({ sessionId, larkAppId, body }) => {
+        const response = await postCurrentSessionDaemonRoute({
+          path: `/api/sessions/${encodeURIComponent(sessionId)}/task-routing`,
+          sessionId,
+          larkAppId,
+          body,
+        });
+        const parsed = await response.json().catch(() => ({})) as Record<string, unknown>;
+        return { status: response.status, body: parsed };
+      },
+    },
+  });
+  if (exitCode !== 0) process.exitCode = exitCode;
+}
+
 /** `botmux board …`：管家写决策看板。解析与输出在 cli/board-command.ts，这里只负责找会话和发 IPC。 */
 async function cmdBoard(argv: string[]): Promise<void> {
   const {
@@ -8569,6 +8598,7 @@ ${SEND_HELP_BODY}
                                        自动化会话接口：后台运行、查询结果、
                                        并按需发布/绑定到群或话题
   dispatch --bot <name> [...]          多话题编排：开子话题并把 bot 派进去（详见 \`botmux dispatch --help\`）
+  assign status|recommend|run|history  任务分配：结合画像与实时状态选 Bot 并派发/兜底（详见 \`botmux assign --help\`）
   report [...]                         交接 Review / 进展 / 结果并继承会话位置（详见 \`botmux report --help\`）
   project init|status|update|close|resume [...]
                                        普通群项目控制面与置顶进度卡（详见 \`botmux project --help\`）
@@ -15540,11 +15570,13 @@ async function cmdSend(
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
     const sendLocale = localeForBot(appId);
     // REPLY_DELIVERY_ENV is the spawn snapshot of how this pane's final reply
-    // reaches Lark. Under transcript the hint points the model back at its
-    // final reply instead of another `botmux send` (no hard limit on sends:
-    // collaboration and attachments legitimately need several per turn).
-    console.error(t(sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId,
-      replyDeliveryFromEnv(process.env)), undefined, sendLocale));
+    // reaches Lark. Under transcript (auto-forward final reply), normal sends
+    // return null so the receipt stays purely factual with no extra persuasion.
+    const completionHintKey = sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId,
+      replyDeliveryFromEnv(process.env));
+    if (completionHintKey) {
+      console.error(t(completionHintKey, undefined, sendLocale));
+    }
     if (asChoice) {
       console.error(t(
         asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
@@ -22558,6 +22590,7 @@ switch (command) {
     break;
   }
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
+  case 'assign':   await cmdAssign(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'grant': await cmdExactChatGrant(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;

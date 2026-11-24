@@ -26,6 +26,7 @@ import { rmwBotEntry } from '../src/services/config-store.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
+import * as runAsModule from '../src/core/run-as.js';
 import { invalidateGlobalConfigCache, setGroupOwnerNoticeEnabled } from '../src/global-config.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
@@ -3079,60 +3080,60 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
     });
   });
 
-  it('claude-code: GET 生效值缺省 transcript（按 CLI 能力），PUT send / transcript 都落盘，PUT 空串 unset 回缺省', async () => {
+  it('claude-code: GET 生效值缺省 send（按需显式开启），PUT transcript / send 都落盘，PUT 空串 unset 回缺省', async () => {
     await withBot('claude-code', async (base, configPath, appId) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(initial).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: true });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
 
-      // send：退回旧行为，显式落盘，之后不再跟随缺省。
-      const off = await put(base, 'send');
-      expect(off.status).toBe(200);
-      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
-      expect(persisted(configPath).replyDelivery).toBe('send');
-      expect(getBot(appId).config.replyDelivery).toBe('send');
-      const afterOff = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(afterOff).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
-
-      // transcript：显式钉住也落盘（与缺省同值，但不靠缺省兜）。
+      // transcript：opt-in，显式落盘。
       const on = await put(base, 'transcript');
       expect(on.status).toBe(200);
-      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript' });
+      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'send' });
       expect(persisted(configPath).replyDelivery).toBe('transcript');
       expect(getBot(appId).config.replyDelivery).toBe('transcript');
+      const afterOn = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(afterOn).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'send', replyDeliverySupported: true });
 
-      // '' / 未知值删 key，回缺省 transcript。
+      // send：显式退回也落盘（与缺省同值，但意图是钉住，不靠缺省兜）。
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
+      expect(getBot(appId).config.replyDelivery).toBe('send');
+
+      // '' / 未知值删 key，回缺省 send。
       const cleared = await put(base, '');
       expect(cleared.status).toBe(200);
-      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'transcript' });
+      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
       expect(getBot(appId).config.replyDelivery).toBeUndefined();
     });
   });
 
-  it('cursor: GET 缺省 transcript/supported（#932 起普通 spawn 也有转写采集），PUT send 落盘可退回', async () => {
+  it('cursor: GET 缺省 send/supported，PUT transcript 落盘（#932 起普通 spawn 也有转写采集）', async () => {
     await withBot('cursor', async (base, configPath, appId) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(initial).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: true });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
-
-      const off = await put(base, 'send');
-      expect(off.status).toBe(200);
-      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
-      expect(persisted(configPath).replyDelivery).toBe('send');
-      expect(getBot(appId).config.replyDelivery).toBe('send');
 
       const on = await put(base, 'transcript');
       expect(on.status).toBe(200);
-      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript' });
+      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'send' });
       expect(persisted(configPath).replyDelivery).toBe('transcript');
+      expect(getBot(appId).config.replyDelivery).toBe('transcript');
+
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
     });
   });
 
-  it('hermes + oncall: state.db 无宿主挂载，GET 生效值回落 send、开关 unsupported', async () => {
+  it('hermes + oncall: state.db 无宿主挂载，GET 生效值与缺省均为 send、开关 unsupported', async () => {
     await withBot('hermes', async (base, configPath) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: false });
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: false });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
     }, { sandbox: 'oncall' });
   });
@@ -12405,12 +12406,38 @@ describe('POST /api/groups/create', () => {
       body: JSON.stringify({ larkAppIds: ['test-app'], bindWorkingDir: '/definitely/not/a/real/botmux/path' }),
     });
     expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ accepted: false });
     expect(createSpy).not.toHaveBeenCalled();
     expect(addSpy).not.toHaveBeenCalled();
     expect(bindSpy).not.toHaveBeenCalled();
     bindSpy.mockRestore();
     addSpy.mockRestore();
     createSpy.mockRestore();
+  });
+
+  it('returns the created chat id without accepted:false when a later step fails', async () => {
+    setLarkAppId('test-app');
+    const createSpy = vi.spyOn(groupsStore, 'createChat').mockResolvedValue({
+      chatId: 'oc_created_before_failure',
+      invalidBotIds: [],
+      invalidUserIds: [],
+    });
+    const linkSpy = vi.spyOn(groupsStore, 'getChatShareLink').mockRejectedValue(new Error('share link unavailable'));
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/create`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ larkAppIds: ['test-app'] }),
+      });
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body).toMatchObject({ ok: false, chatId: 'oc_created_before_failure' });
+      expect(body).not.toHaveProperty('accepted');
+    } finally {
+      linkSpy.mockRestore();
+      createSpy.mockRestore();
+    }
   });
 });
 
@@ -13627,6 +13654,150 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     expect((await fetch(`${base}/api/asks/pending`)).status).toBe(401);
     // /api/asks/answer is deliberately excluded from the allowlist → 401.
     expect((await fetch(`${base}/api/asks/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"askId":"x","selections":[]}' })).status).toBe(401);
+  });
+
+  const workingDirTriggerBody = JSON.stringify({
+    source: { type: 'webhook' },
+    target: { kind: 'turn', botId: 'local_smoke', sessionId: 'fixture-session' },
+    instruction: 'Run the analysis',
+    envelope: { sourceName: 'Example client', format: 'text', trusted: false },
+    options: { workingDir: '/tmp' },
+  });
+
+  it('refuses options.workingDir on the unauthenticated core-only public trigger route', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    setCoreOnlyReady();
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: workingDirTriggerBody,
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode: 'working_dir_not_allowed' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  it('lets a trusted-host trigger carry options.workingDir past the gate into session routing', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger/host`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger/host', handle.port) },
+        body: workingDirTriggerBody,
+      });
+      // Past the gate the request reaches session routing; this fixture has no
+      // registered bot, so routing itself fails there.
+      expect(response.status).not.toBe(403);
+      expect(await response.json()).not.toMatchObject({ errorCode: 'working_dir_not_allowed' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  const runAsTriggerBody = JSON.stringify({
+    runAs: 'ou_person',
+    source: { type: 'webhook' },
+    target: { kind: 'turn', botId: 'local_smoke', sessionId: 'fixture-session' },
+    instruction: 'Run the analysis',
+    envelope: { sourceName: 'Example client', format: 'text', trusted: false },
+  });
+
+  it('refuses runAs on the unauthenticated core-only public trigger route', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    setCoreOnlyReady();
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: runAsTriggerBody,
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode: 'run_as_not_allowed' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  it('lets a trusted-host trigger carry runAs past the gate into session routing', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger/host`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger/host', handle.port) },
+        body: runAsTriggerBody,
+      });
+      expect(response.status).toBe(500);
+      expect(await response.json()).toMatchObject({ errorCode: 'trigger_failed', error: 'Bot not registered: local_smoke' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  it.each([
+    ['workingDir', workingDirTriggerBody, 'working_dir_not_allowed'],
+    ['runAs', runAsTriggerBody, 'run_as_not_allowed'],
+  ] as const)('rejects %s on the legacy ordinary route even with a trusted-host signature', async (_field, body, errorCode) => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger', handle.port) },
+        body,
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  it.each([
+    ['unresolved', 'run_as_unresolved'],
+    ['not_allowed', 'run_as_not_allowed'],
+  ] as const)('answers 403 %s when the trusted-host runAs admission refuses the person', async (reason, errorCode) => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    registerBot({ larkAppId: 'local_smoke', larkAppSecret: 'fixture', cliId: 'codex', workingDir: process.cwd() });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const admission = vi.spyOn(runAsModule, 'resolveRunAs').mockResolvedValue({ ok: false, reason });
+    const inChat = vi.spyOn(groupsStore, 'isInChat').mockResolvedValue(true);
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    const ds: any = { larkAppId: 'local_smoke', chatId: 'oc_runas_chat', chatType: 'group', scope: 'thread',
+      session: { sessionId: 'runas-session', status: 'active', chatId: 'oc_runas_chat' } };
+    workerPool.setActiveSessionsRegistry(new Map([['oc_runas_chat:thread', ds]]));
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger/host`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger/host', handle.port) },
+        body: JSON.stringify({ ...JSON.parse(runAsTriggerBody), target: { kind: 'turn', botId: 'local_smoke', sessionId: 'runas-session' } }),
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode });
+      expect(admission).toHaveBeenCalledWith('local_smoke', 'oc_runas_chat', 'ou_person');
+    } finally {
+      admission.mockRestore();
+      inChat.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
   });
 
   it('rejects an unsigned owner IPC request before owner resolution without outer auth', async () => {

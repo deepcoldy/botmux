@@ -49,7 +49,7 @@ async function main(): Promise<void> {
       body: payload, signal: AbortSignal.timeout(GRANT_ROUTE_CLIENT_TIMEOUT_MS),
     });
     const raw = await response.text();
-    const result = JSON.parse(raw) as { ok?: boolean; appId?: string; mode?: string; credentialType?: string; credential?: string; native?: boolean; error?: string; code?: string; issuer?: string };
+    const result = JSON.parse(raw) as { ok?: boolean; appId?: string; mode?: string; credentialType?: string; credential?: string; native?: boolean; error?: string; code?: string; issuer?: string; actingAs?: string };
     if (!response.ok || result.ok !== true) throw new Error(result.error ?? result.code ?? 'lark_tool_identity_unavailable');
     // The daemon says `native` when this bot leaves `--as user` to the machine's own lark-cli login.
     native = invocation.mode === 'user' && result.native === true;
@@ -66,6 +66,10 @@ async function main(): Promise<void> {
         throw new Error('The lark-cli identity does not match this invocation');
       }
       identity = { mode: invocation.mode, credential: result.credential, ...(platformUser ? { appId: result.appId } : {}) };
+      // No person started this turn: the daemon used the bot owner's own grant.
+      if (invocation.mode === 'user' && result.actingAs === 'owner') {
+        process.stderr.write('botmux: 本轮没有真人发起，--as user 使用 bot 主人的飞书授权\n');
+      }
     }
   }
   if (invocation.showHelp) {

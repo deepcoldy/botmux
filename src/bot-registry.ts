@@ -134,6 +134,7 @@ import {
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import { cliConfigDirEnvKey, cliSupportsConfigDir, normalizeCliConfigDir } from './core/cli-config-dir.js';
 import { normalizeStewardConfig, type StewardConfig } from './core/decision-board/model.js';
+import { normalizeBotTaskRoutingConfig, type BotTaskRoutingConfig } from './core/task-routing/model.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -1705,15 +1706,17 @@ export interface BotConfig {
    */
   envelopeInjection?: 'auto' | 'off';
   /**
-   * 最终回复投递方式。`send`：模型必须自己执行 `botmux send` 把回复发到飞书，
-   * 系统提示与每轮 reminder 都这么要求。`transcript`：daemon 从 CLI 转写自动取
-   * 本轮最后的 assistant 文本发最终回复卡（即原来的 bridge fallback 升为主通道），
-   * 系统提示只把 `botmux send` 留给协作 / 附件 / 跨群话题、不再注入每轮 reminder；
-   * solo 会话（私聊 / 仅 owner 的 1v1 群）还会去掉 `<user_message>` 壳与 `<sender/>`。
-   * 只对有转写采集的 CLI 有效（见 core/reply-delivery.ts），不支持的 CLI 运行时自动
-   * 回落 send。缺省见 `defaultReplyDeliveryFor`（有转写采集的 CLI 缺省 transcript，
-   * 其余缺省 send）；显式 `'send'` / `'transcript'` 都持久化、不被缺省覆盖。系统提示
-   * 部分需 /restart 生效，逐轮信封立即生效。
+   * 最终回复投递方式。`send`（除 doubao 外所有 CLI 的默认）：模型必须自己执行
+   * `botmux send` 把回复发到飞书，系统提示与每轮 reminder 都这么要求。`transcript`
+   * （自动转发最终回复，按需显式开启）：daemon 从 CLI 会话记录自动取本轮最后的
+   * assistant 文本发最终回复卡（即原来的 bridge fallback 升为主通道），系统提示不再
+   * 要求用 `botmux send` 回复、不再注入每轮 reminder（仅在多 bot 协作提示里保留
+   * `--mention` / `--mention-back`）；solo 会话（私聊 / 仅 owner 的 1v1 群）还会
+   * 去掉 `<user_message>` 壳与 `<sender/>`。只对支持读取会话记录的 CLI 有效（见
+   * core/reply-delivery.ts），不支持的 CLI 运行时自动回落 send。缺省见
+   * `defaultReplyDeliveryFor`（doubao 缺省 transcript，其余 CLI 缺省 send）；显式
+   * `'send'` / `'transcript'` 都持久化、不被缺省覆盖。系统提示部分需 /restart 生效，
+   * 逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
   turnResults?: { enabled: boolean };
@@ -1813,6 +1816,15 @@ export interface BotConfig {
    * 显式关闭（false）：不安装托管包装器，完全沿用宿主机环境及按触发人鉴权规则。需 /restart 重启或新建会话生效。
    */
   larkToolBinding?: boolean;
+  /**
+   * 没有发起人时用主人的飞书身份（默认开启）。
+   * 绑定会话里 `lark-cli --as user` 原本只认本轮发起人；脚本、Webhook、平台、无创建人的定时任务、
+   * 发起人是主人的 bot 签名派发等回合没有可用的发起人，调用一律被拒。开启（未配置或 true）时这类回合改用
+   * bot 主人（getOwnerOpenId）对本应用的授权；有真人发起的回合仍用发起人自己的授权。
+   * 显式关闭（false）回到只认发起人的严格行为。triggerUserAuth 覆盖 lark-cli 时不生效。
+   * 每次调用实时读取，改完立即生效。见 core/lark-user-owner-fallback.ts。
+   */
+  larkUserOwnerFallback?: boolean;
   /**
    * Local file sandbox selection.
    *   true/"oncall" — per-session deny-by-default three-tier whitelist
@@ -2572,6 +2584,12 @@ export interface BotConfig {
    * 校验与「等于默认不写盘」见 core/decision-board/model.ts 的 normalizeStewardConfig。
    */
   steward?: StewardConfig;
+  /**
+   * 任务分配（`botmux assign`）画像配置。默认关闭（未配置或不设 `enabled: true`
+   * 不参与自动分配池）；管家与 apiOnly bot 始终排除。
+   * 校验与稀疏存储见 core/task-routing/model.ts 的 normalizeBotTaskRoutingConfig。
+   */
+  taskRouting?: BotTaskRoutingConfig;
   /** Chat IDs excluded from group-join and new-topic auto-start (explicit requests still work). */
   autoStartExcludedChats?: string[];
   /** Bot-wide default listener. It applies to every joined group without an override. */
@@ -3102,8 +3120,8 @@ export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
 }
 
 /** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
- *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（有转写采集的
- *  CLI 缺省 transcript，其余缺省 send）。只读内存
+ *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（doubao 缺省
+ *  transcript，其余缺省 send）。只读内存
  *  registry：worker 通过 init IPC 拿冻结值，不需要磁盘 mtime 缓存。 */
 export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' | undefined {
   const v = bots.get(larkAppId)?.config.replyDelivery;
@@ -4534,6 +4552,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
       larkToolBinding: typeof entry.larkToolBinding === 'boolean' ? entry.larkToolBinding : undefined,
+      larkUserOwnerFallback: typeof entry.larkUserOwnerFallback === 'boolean' ? entry.larkUserOwnerFallback : undefined,
       // Wire representation stays backwards compatible: oncall = legacy `true`;
       // only scratch is a string; off serializes as false.
       sandbox: sandboxMode === 'oncall' ? true : sandboxMode === 'scratch' ? 'scratch' : false,
@@ -4755,6 +4774,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 非法的 steward 配置按关处理（不阻断 bot 启动）；Dashboard / /config 写入时已校验。
       steward: (() => {
         const parsed = normalizeStewardConfig(entry.steward);
+        return parsed.ok ? parsed.value ?? undefined : undefined;
+      })(),
+      // 非法的 taskRouting 配置按关处理（不阻断 bot 启动）；写入路径已校验。
+      taskRouting: (() => {
+        const parsed = normalizeBotTaskRoutingConfig(entry.taskRouting);
         return parsed.ok ? parsed.value ?? undefined : undefined;
       })(),
       autoStartExcludedChats: Array.isArray(entry.autoStartExcludedChats) ? entry.autoStartExcludedChats.filter((id: unknown): id is string => typeof id === 'string') : undefined,

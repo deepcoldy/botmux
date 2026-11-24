@@ -148,6 +148,14 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(mockForkWorker).toHaveBeenCalledTimes(1);
   });
 
+  it('same key with a runAs person against a request without one → 409, no second fork', async () => {
+    await triggerSessionTurn(freshAsyncReq('k-runas'), { larkAppId: APP, activeSessions: new Map() });
+    const conflict = await triggerSessionTurn({ ...freshAsyncReq('k-runas'), runAs: 'ou_person' }, { larkAppId: APP, activeSessions: new Map() });
+    expect(conflict.ok).toBe(false);
+    expect(conflict.errorCode).toBe('idempotency_conflict');
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+  });
+
   it('same key, same instruction, but DIFFERENT options.status → 409 (requestHash covers full options)', async () => {
     // codex #776 round-4: status firing→resolved changes the rendered prompt; the
     // hash must change too, else the resolved event silently reuses the firing turn.

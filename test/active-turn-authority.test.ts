@@ -245,6 +245,72 @@ describe('ActiveTurnAuthority', () => {
     expect(authority.markStarted(queuedWithCaller)).toBe(true);
     expect(authority.identity()).toEqual(queuedWithCaller);
   });
+
+  it('marks adopted non-speaker input as incomplete provenance until the execution ends', () => {
+    const authority = new ActiveTurnAuthority();
+    const bot = { ...humanA, requestUserOpenId: 'ou_bot', requestUserUnionId: 'on_bot', senderType: 'bot' as const };
+    authority.reserve({ turnId: 'trg_external' });
+    authority.markStarted({ turnId: 'trg_external' });
+    expect(authority.identity().provenanceIncomplete).toBeUndefined();
+
+    authority.adoptEnvelopePreservingPrincipal({ turnId: 'om_bot', caller: bot });
+    expect(authority.identity()).toMatchObject({
+      turnId: 'om_bot', identityTurnId: 'trg_external', provenanceIncomplete: true,
+    });
+    expect(authority.speakers()).toEqual([]);
+
+    // A later ordinary human speaker is recorded, but cannot erase the earlier gap.
+    authority.adoptEnvelopePreservingPrincipal({ turnId: 'om_owner', caller: humanA });
+    expect(authority.identity().provenanceIncomplete).toBe(true);
+    expect(authority.speakers()).toEqual([{ openId: 'ou_a', turnId: 'om_owner' }]);
+
+    // Envelope advancement within the same execution cannot erase the gap.
+    authority.markStarted({ turnId: 'trg_followup' });
+    expect(authority.identity().provenanceIncomplete).toBe(true);
+
+    authority.releaseExact({ turnId: 'trg_followup' });
+    authority.reserve({ turnId: 'trg_next' });
+    expect(authority.identity().provenanceIncomplete).toBeUndefined();
+  });
+
+  it('does not taint an opening bot turn or an ordinary human adoption', () => {
+    const openingBot = new ActiveTurnAuthority();
+    openingBot.reserve({ turnId: 'om_bot', caller: { ...humanA, senderType: 'bot' as const } });
+    expect(openingBot.identity().provenanceIncomplete).toBeUndefined();
+
+    const authority = new ActiveTurnAuthority();
+    authority.reserve({ turnId: 'trg_external' });
+    authority.adoptEnvelopePreservingPrincipal({ turnId: 'om_human', caller: humanA });
+    expect(authority.identity().provenanceIncomplete).toBeUndefined();
+    expect(authority.speakers()).toEqual([{ openId: 'ou_a', turnId: 'om_human' }]);
+  });
+
+  it('merges an incoming incomplete-provenance marker during reserve/markStarted rotation', () => {
+    const authority = new ActiveTurnAuthority();
+    authority.reserve({ turnId: 'trg_external' });
+    authority.markStarted({ turnId: 'trg_external' });
+    const restored = { turnId: 'om_restored', identityTurnId: 'trg_external', provenanceIncomplete: true as const };
+    expect(authority.reserve(restored)).toBe(true);
+    expect(authority.markStarted(restored)).toBe(true);
+    expect(authority.identity()).toMatchObject({
+      turnId: 'om_restored', identityTurnId: 'trg_external', provenanceIncomplete: true,
+    });
+  });
+
+  it('remembers only the exact last release until a new execution reserves', () => {
+    const authority = new ActiveTurnAuthority();
+    const first = { turnId: 'om_first' };
+    authority.reserve(first);
+    authority.markStarted(first);
+    expect(authority.matchesLastRelease(first)).toBe(false);
+    authority.releaseExact(first);
+    expect(authority.matchesLastRelease(first)).toBe(true);
+    expect(authority.matchesLastRelease({ turnId: 'om_first', dispatchAttempt: null })).toBe(true);
+    expect(authority.matchesLastRelease({ turnId: 'om_first', dispatchAttempt: 2 })).toBe(false);
+    expect(authority.matchesLastRelease({ turnId: 'om_other', dispatchAttempt: 1 })).toBe(false);
+    authority.reserve({ turnId: 'om_next' });
+    expect(authority.matchesLastRelease(first)).toBe(false);
+  });
 });
 
 for (const caller of [humanA, { ...humanA, requestUserOpenId: 'ou_b', requestUserUnionId: 'on_b' }]) {

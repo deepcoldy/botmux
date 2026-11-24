@@ -79,7 +79,7 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
         return true;
       },
     };
-    for (const name of ['withPidMarkerLock', 'writeCliPidMarker', 'restoreQueuedTurnsFromMarkerDisk', 'adoptInitialActiveTurn', 'markerIdentityTurnId',
+    for (const name of ['withPidMarkerLock', 'writeCliPidMarker', 'restoreQueuedTurnsFromMarkerDisk', 'syncQueuedTurnsFromMarkerDisk', 'adoptInitialActiveTurn', 'activeAuthorityMatchesMarker', 'markerIdentityTurnId',
       'turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive', 'seedInitTurnTerminals']) {
       scope[name] = loadWorkerFunction(name, scope);
     }
@@ -112,6 +112,81 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
     expect(published).toEqual(['om_live']);
     expect(onDisk()).toMatchObject({ turnId: 'om_live', identityTurnId: 'om_opening', capability: 'c'.repeat(64) });
   });
+
+  it('marks a marker-reattached merged turn as provenance-incomplete', () => {
+    const authority = scope.activeTurnAuthority as ActiveTurnAuthority;
+    authority.reserve({ turnId: 'trg_external' });
+    authority.markStarted({ turnId: 'trg_external' });
+    authority.adoptEnvelopePreservingPrincipal({ turnId: 'om_other', caller });
+    expect(authority.speakers()).toEqual([{ openId: 'ou_asker', turnId: 'om_other' }]);
+    scope.currentBotmuxTurnId = 'om_other';
+    scope.cliPidMarker = markerPath;
+    (scope.writeCliPidMarker as () => void)();
+    expect(onDisk()).toMatchObject({ turnId: 'om_other', identityTurnId: 'trg_external' });
+
+    // Reattach with only the fields that actually survived on disk. The marker
+    // does not carry the earlier speaker list, so fallback must stay disabled.
+    scope.activeTurnAuthority = new ActiveTurnAuthority();
+    scope.currentBotmuxTurnId = undefined;
+    scope.currentBotmuxCallerOpenId = undefined;
+    scope.sandboxRelayCapability = null;
+    bind();
+
+    const restored = scope.activeTurnAuthority as ActiveTurnAuthority;
+    expect(restored.speakers()).toEqual([]);
+    expect(restored.identity()).toMatchObject({
+      turnId: 'om_other', identityTurnId: 'trg_external', provenanceIncomplete: true,
+    });
+  });
+
+  it('restores provenance fail-closed when init already set the marker turn but authority is empty', () => {
+    writeFileSync(markerPath, JSON.stringify({
+      sessionId: 's-bind', turnId: 'trg_external', procStart: readProcessStartIdentity(process.pid),
+    }));
+    scope.currentBotmuxTurnId = 'trg_external';
+
+    // Exact reserved (pre-write) and started authorities are both legitimate
+    // same-process states: neither may be mistaken for a half-restored one.
+    const authority = scope.activeTurnAuthority as ActiveTurnAuthority;
+    authority.reserve({ turnId: 'trg_external' });
+    bind();
+    expect(authority.snapshot()?.started).toBe(false);
+    expect(authority.identity().provenanceIncomplete).toBeUndefined();
+    authority.markStarted({ turnId: 'trg_external' });
+    bind();
+    expect(authority.identity().provenanceIncomplete).toBeUndefined();
+
+    // Half recovery: init's turn survived, but the authority did not. The same
+    // marker must now be adopted with incomplete provenance, not skipped.
+    scope.activeTurnAuthority = new ActiveTurnAuthority();
+    bind();
+    const restored = scope.activeTurnAuthority as ActiveTurnAuthority;
+    expect(restored.snapshot()).toMatchObject({ turnId: 'trg_external', started: true });
+    expect(restored.identity().provenanceIncomplete).toBe(true);
+  });
+
+  for (const action of ['bind', 'write', 'sync'] as const) {
+    it(`ignores an empty marker turnId during ${action} without displacing the live turn`, () => {
+      const authority = scope.activeTurnAuthority as ActiveTurnAuthority;
+      authority.reserve({ turnId: 'om_live' });
+      authority.markStarted({ turnId: 'om_live' });
+      scope.currentBotmuxTurnId = 'om_live';
+      scope.queuedTypeAheadTurns = [{ turnId: 'om_next' }];
+      scope.adoptDisplacedActiveTurn = loadWorkerFunction('adoptDisplacedActiveTurn', scope);
+      writeFileSync(markerPath, JSON.stringify({
+        sessionId: 's-bind', turnId: '', procStart: readProcessStartIdentity(process.pid),
+      }));
+
+      if (action === 'bind') bind();
+      else if (action === 'write') (scope.writeCliPidMarker as () => void)();
+      else expect((scope.syncQueuedTurnsFromMarkerDisk as () => boolean)()).toBe(false);
+
+      expect(scope.currentBotmuxTurnId).toBe('om_live');
+      expect(authority.identity().turnId).toBe('om_live');
+      expect(scope.queuedTypeAheadTurns).toEqual([{ turnId: 'om_next' }]);
+      expect((scope.retiredTurnIds as Set<string>).has('om_live')).toBe(false);
+    });
+  }
 
   it('discards a marker stamped with another process birth time and adopts nothing', () => {
     writeFileSync(markerPath, JSON.stringify({

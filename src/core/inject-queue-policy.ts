@@ -85,3 +85,14 @@ export function canStartInjectionFlush(gate: InjectionFlushGate): boolean {
     && gate.commandLineWritesPending === 0
     && !gate.bareShellLaunchBlocked;
 }
+
+/** A queued MiniMax compact owns the daemon's compact-button readiness fence.
+ * Both an ordinary prompt edge and a restart receipt's readiness republication
+ * must honor it, or a second non-idempotent compact can be accepted while the
+ * first one is still queued. */
+export function minimaxCompactQueueSuppressesPromptReady(
+  cliId: string | undefined,
+  pendingRawInputs: readonly { content: string }[],
+): boolean {
+  return cliId === 'minimax' && pendingRawInputs.some(input => input.content.trim() === '/compact');
+}

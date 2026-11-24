@@ -5,20 +5,20 @@
  * worker-pool 都从这里取同一套判定，避免三处各写一份白名单。
  *
  * - `send`：模型必须自己 `botmux send`，系统提示与每轮 reminder 都这么要求。
- * - `transcript`：daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡
- *   （bridge fallback 升为主通道）；系统提示只把 `botmux send` 留给最终回复带不了
- *   的事（@ 别的 bot 协作/回报、附件或卡片、发到别的群或话题），不注入每轮
- *   reminder；solo 会话去掉 `<user_message>` 壳与 `<sender/>`。
+ * - `transcript`（自动转发最终回复）：daemon 从 CLI 会话记录自动取本轮最后的 assistant
+ *   文本发最终回复卡（bridge fallback 升为主通道）；系统提示不再把 `botmux send` 当成
+ *   必填回复通道、不注入每轮 reminder（仅在多 bot 协作提示里保留 `--mention` /
+ *   `--mention-back`）；solo 会话去掉 `<user_message>` 壳与 `<sender/>`。
  *
- * 缺省按 CLI 能力区分（`defaultReplyDeliveryFor`）：有转写采集通道的 CLI 缺省
- * `transcript`，其余缺省 `send`；bots.json 显式写 `transcript` / `send` 都覆盖缺省。
- * 所有判定 fail-closed：拿不准就回到 `send` / 非 solo。
+ * 缺省按 CLI 区分（`defaultReplyDeliveryFor`）：doubao 缺省 `transcript`（账号级常驻
+ * service 进程使 `botmux send` 归属不可靠，见该函数注释），其余 CLI 缺省 `send`、与
+ * 既有行为一致；bots.json 显式写 `transcript` / `send` 都覆盖缺省。所有判定
+ * fail-closed：拿不准就回到 `send` / 非 solo。
  */
 import { getBot, getOwnerOpenId, resolveReplyDelivery } from '../bot-registry.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { logger } from '../utils/logger.js';
 import { zeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
-import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
 import { supportsTranscriptReplyDeliveryForBot, supportsZeroPromptInjection, type ZeroPromptSandboxValue } from './zero-prompt-support.js';
 
 export type ReplyDelivery = 'send' | 'transcript';
@@ -31,30 +31,32 @@ export { supportsTranscriptReplyDeliveryForBot } from './zero-prompt-support.js'
 export type { TranscriptDeliveryCapabilityOpts } from './zero-prompt-support.js';
 
 /**
- * 未显式配置时的缺省投递方式：CLI 有转写采集通道（`supportsTranscriptReplyDelivery`：
- * claude-code 与 structured bridge ALWAYS 集合）就缺省 `transcript`，否则 `send`。
+ * 未显式配置时的缺省投递方式：除 doubao 外**一律 `send`**——模型照旧自己执行
+ * `botmux send` 发送回复。doubao 是唯一例外（缺省 `transcript`），原因见函数体注释。
  *
- * 为什么缺省 transcript：send 模式要求模型每轮自己 `botmux send`，部分模型（典型是
- * GPT 系）会把进度、阶段结论、最终答复都 send 一遍，群里被频繁打扰；transcript 下
- * 最终答复由 daemon 从转写取、只发一张卡，`botmux send` 退回到协作与附件这类最终
- * 回复带不了的场景。
+ * 「自动转发最终回复」（`replyDelivery: "transcript"`）在其余 CLI 上默认关闭（opt-in）：
+ * 它改的不只是投递路径，还会改写系统提示、去掉逐轮 `<botmux_reminder>`、并让 solo
+ * 会话的信封去壳，且 `/adopt` 不再按内容识别这类会话。交给使用者在 Dashboard 或
+ * bots.json 里按需显式打开；验证成熟后再评估是否改为默认。
  *
- * 只按 CLI 判，不看沙盒：cursor / doubao 在 scratch 沙盒下采集不到，这一层仍返回
- * `transcript`，由 `effectiveReplyDelivery` 在运行时按沙盒回落 `send`（缺省值回落
- * 不告警，只有显式配置的 transcript 回落才告警）。Dashboard 的「当前 CLI 缺省」
- * 展示也取这里，与沙盒无关。
- *
- * 显式写 `send` 的 bot 保持 send：`effectiveReplyDelivery` 先取显式配置，缺省只在
- * 未配置时补位。Doubao 历来缺省 transcript（账号级常驻 service 进程使 `botmux
- * send` 归属不可靠，#2828），现在只是与其它可采集 CLI 同一条规则。
+ * 只按 CLI 判，不看沙盒：doubao 在 scratch 沙盒下采集不到，这一层仍返回 `transcript`，
+ * 由 `effectiveReplyDelivery` 在运行时按沙盒回落 `send`（缺省值回落不告警，只有显式
+ * 配置的 transcript 回落才告警）。Dashboard 的「当前 CLI 默认」展示也取这里。
  */
 export function defaultReplyDeliveryFor(cliId: string | undefined): ReplyDelivery {
-  return supportsTranscriptReplyDelivery(cliId) ? 'transcript' : 'send';
+  // Doubao 例外，缺省 transcript：它的工具命令由账号级常驻 `doubao --type=service`
+  // 进程执行，所有 TUI 共用一个；该进程的环境变量与进程树来自**第一个**拉起它的
+  // 终端，而不是当前收到消息的会话。模型自己跑 `botmux send` 时，provenance 会按
+  // 那棵进程树解析出别的会话（甚至别的 bot），回复被投到错误的群/身份下。
+  // 自动转发最终回复模式下 daemon 从本会话 assignment.md / trajectory.jsonl 收最终
+  // 回复，系统提示也不再教 `botmux send`，绕开这条串号路径。显式写 `send` 仍可退回。
+  if (cliId === 'doubao') return 'transcript';
+  return 'send';
 }
 
-/** The default before transcript became the default for every transcript CLI:
- *  doubao transcript (#2828), everything else send. Only used to tell a worker
- *  what prompt a pane started by that botmux runs with (see
+/** Pre-snapshot default (before BOTMUX_REPLY_DELIVERY existed in pane env):
+ *  doubao transcript (#2828), everything else send. Used only when re-attaching
+ *  a legacy persistent pane without a launch env snapshot (see
  *  services/pane-reply-delivery.ts) — never to decide a new spawn. */
 export function legacyDefaultReplyDeliveryFor(cliId: string | undefined): ReplyDelivery {
   return cliId === 'doubao' ? 'transcript' : 'send';

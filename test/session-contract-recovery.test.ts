@@ -382,6 +382,115 @@ describe('hook signals from a CLI launched without a binding ID', () => {
     const { operation } = s.controller.beginControl('restart'); s.controller.controlStarted(operation.operationId);
     expect(s.controller.nativeSignal(undefined, 'native-1')).toBeUndefined();
   });
+  it('accepts a signal that names the binding its CLI was spawned under, mid-restart', () => {
+    // Transport counterpart of the refusal above. The worker hands every CLI the
+    // binding it was spawned under (BOTMUX_RUNTIME_BINDING_ID — on the child-env
+    // allowlist so tmux panes receive it too) and the SessionStart hook sends it
+    // back, so a restart no longer has to look SETTLED for its own readiness
+    // signal to land. Until 2026-11-23 that key never reached a tmux pane: every
+    // hook arrived unbound, the branch above refused it mid-restart, and
+    // `/restart` reported a timeout after the worker sat out its whole 45s
+    // ready-gate fallback — for a CLI that was already at its prompt.
+    const s = fixture();
+    const { operation } = s.controller.beginControl('restart'); s.controller.controlStarted(operation.operationId);
+    const replacement = s.controller.reserveBinding('binding-restarted', s.worker);
+    expect(s.controller.nativeSignal(undefined, 'native-1')).toBeUndefined();
+    expect(s.controller.nativeSignal('binding-restarted', 'native-1')).toEqual({ version: 2, runtime: replacement });
+  });
+});
+
+describe('hook signals across a native /clear boundary', () => {
+  it('rejects a delayed pre-clear hook on the same-worker continuation', () => {
+    const s = fixture();
+    s.controller.reserveBinding('binding-launcher', s.worker);
+    s.controller.bindRuntime('binding-launcher', s.worker, { ...identity, physicalId: '900:launcher' });
+    const real = s.controller.bindRuntime('binding-real', s.worker,
+      { ...identity, physicalId: '901:cli' }, undefined, 'binding-launcher');
+    // The new session's hook may win the race with its runtime rebind.
+    expect(s.controller.nativeSignal('binding-launcher', 'native-2')).toEqual({ version: 2, runtime: real.ref });
+    const cleared = s.controller.bindRuntime('binding-after-clear', s.worker,
+      { ...identity, physicalId: '901:cli', nativeSessionId: 'native-2' }, undefined, 'binding-real');
+
+    expect(s.controller.nativeSignal('binding-launcher', 'native-1')).toBeUndefined();
+    expect(s.controller.nativeSignal('binding-launcher', 'native-2')).toEqual({ version: 2, runtime: cleared.ref });
+  });
+});
+
+describe('hook signals from a CLI a later worker generation re-attached', () => {
+  // The pane's env carries the binding its CLI was LAUNCHED under and is written
+  // once per launch, so after a daemon restart the hooks of a re-attached CLI
+  // still name the generation that spawned it. Continuations are recorded per
+  // generation, so the live worker's own walk finds nothing: without following
+  // the producer's chain, a re-attached CLI loses every SessionStart signal
+  // (including source=compact) that the unbound path used to adopt.
+  function reattachedByNextGeneration(beforeHandover?: (s: ReturnType<typeof fixture>) => void) {
+    const s = fixture();
+    s.controller.reserveBinding('binding-launcher', s.worker);
+    s.controller.bindRuntime('binding-launcher', s.worker, { ...identity, physicalId: '900:launcher' });
+    const real = s.controller.bindRuntime('binding-real', s.worker,
+      { ...identity, physicalId: '901:cli' }, undefined, 'binding-launcher');
+    beforeHandover?.(s);
+    const next = s.controller.bindWorker(2).worker;
+    s.controller.reserveBinding('binding-reattach', next);
+    const adopted = s.controller.bindRuntime('binding-reattach', next, { ...identity, physicalId: '901:cli' });
+    return { s, next, real, adopted };
+  }
+
+  it('adopts a hook that names the launcher binding of the generation that spawned the CLI', () => {
+    const { s, real, adopted } = reattachedByNextGeneration();
+    expect(adopted.ref).toEqual(real.ref);
+    expect(s.controller.nativeSignal('binding-launcher', 'native-1')).toEqual({ version: 2, runtime: real.ref });
+  });
+
+  it('refuses a binding whose chain does not reach the runtime the live worker owns', () => {
+    // A sibling CLI of the same generation: proven, but nothing continues it
+    // into the runtime generation 2 re-attached.
+    const { s } = reattachedByNextGeneration(fix => {
+      fix.controller.reserveBinding('binding-elsewhere', fix.worker);
+      fix.controller.bindRuntime('binding-elsewhere', fix.worker,
+        { ...identity, physicalId: '902:other', nativeSessionId: 'native-other' });
+    });
+    expect(s.controller.nativeSignal('binding-elsewhere', 'native-other')).toBeUndefined();
+  });
+
+  it('splices the chain when /clear after the handover adds a hop of its own', () => {
+    // `/clear` keeps the pid and rotates the native session id, so generation 2
+    // records that hop while the launcher hop belongs to generation 1. Walking
+    // either side alone stops at the handoff point.
+    const { s, next, adopted } = reattachedByNextGeneration();
+    // Same ordering race across a worker handoff: native-2 is not stale yet.
+    expect(s.controller.nativeSignal('binding-launcher', 'native-2')).toEqual({ version: 2, runtime: adopted.ref });
+    const cleared = s.controller.bindRuntime('binding-after-clear', next,
+      { ...identity, physicalId: '901:cli', nativeSessionId: 'native-2' }, undefined, 'binding-reattach');
+    expect(s.controller.nativeSignal('binding-launcher', 'native-1')).toBeUndefined();
+    expect(s.controller.nativeSignal('binding-launcher', 'native-2')).toEqual({ version: 2, runtime: cleared.ref });
+  });
+
+  it('follows continuation handoffs through a third worker generation', () => {
+    const { s, next } = reattachedByNextGeneration();
+    const cleared = s.controller.bindRuntime('binding-after-clear', next,
+      { ...identity, physicalId: '901:cli', nativeSessionId: 'native-2' }, undefined, 'binding-reattach');
+    const third = s.controller.bindWorker(3).worker;
+    s.controller.reserveBinding('binding-reattach-3', third);
+    const adopted = s.controller.bindRuntime('binding-reattach-3', third,
+      { ...identity, physicalId: '901:cli', nativeSessionId: 'native-2' });
+    expect(adopted.ref).toEqual(cleared.ref);
+
+    expect(s.controller.nativeSignal('binding-launcher', 'native-1')).toBeUndefined();
+    expect(s.controller.nativeSignal('binding-launcher', 'native-2')).toEqual({ version: 2, runtime: adopted.ref });
+  });
+
+  it('does not follow a producer chain into a different current process', () => {
+    const { s, next } = reattachedByNextGeneration();
+    s.controller.bindRuntime('binding-after-clear', next,
+      { ...identity, physicalId: '901:cli', nativeSessionId: 'native-2' }, undefined, 'binding-reattach');
+    const third = s.controller.bindWorker(3).worker;
+    s.controller.reserveBinding('binding-new-process-3', third);
+    s.controller.bindRuntime('binding-new-process-3', third,
+      { ...identity, physicalId: '999:new-process', nativeSessionId: 'native-2' });
+
+    expect(s.controller.nativeSignal('binding-launcher', 'native-2')).toBeUndefined();
+  });
 });
 
 describe('contract history stays bounded', () => {
