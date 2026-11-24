@@ -178,7 +178,7 @@ import {
   type StreamingCardButtonId,
 } from '../im/lark/streaming-card-buttons.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
-import { claimPromptContext } from '../services/prompt-context-store.js';
+import { claimPromptContextAmongTurns } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
@@ -2864,10 +2864,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/turns/:triggerId/interrupt', async (_
  * Host-side atomic claim/pop for the UserPromptSubmit hook（#794 方向 B）。
  *
  * 沙箱内的 `botmux user-prompt-hook` 不能在 read-only 的 `prompt-ctx/<sid>` 里
- * unlink（HIGH-2），同正文多轮也不能靠 FIFO 猜（HIGH-1：某轮漏 claim 会串轮到
- * 后续轮）。hook 把 (session 凭据 + fingerprint) 提交到这里，宿主按
- * **managedTurnOrigin.turnId 权威 turn 绑定**精确取该轮的 envelope，先删再返回。
- * 漏 claim 只孤儿化自己那条，不污染后续轮；上一轮的 stale sidecar 永远不会被返回。
+ * unlink（HIGH-2），同正文多轮也不能靠 FIFO 猜（HIGH-1）。hook 提交
+ * (session 凭据 + fingerprint)，宿主在 managedTurnOrigin 与 worker 报告的
+ * type-ahead 候选集里做全局唯一匹配，先删再返回。任何歧义都不消费：
+ * 漏 claim 只孤儿化自己那条，不污染后续轮。
  *
  * 鉴权与 /close、/slash 同构：trusted-host HMAC，或本会话 rotating per-turn
  * capability（沙箱内读 host secret 失败时的回退）。任何未命中/失败 → 404/403，
@@ -2901,13 +2901,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/prompt-ctx/claim', async (req, res, p
       });
     } catch { /* IPC gone */ }
   }
-  // 权威 turnId：daemon 当前这轮的 turnId（worker 发布的 managed_turn_origin）。
-  // hook 不需要、也不应自己提供 turnId——daemon 只认自己的权威值，避免 FIFO 串轮。
+  // 当前轮与 worker 报告的排队轮组成一个候选集。hook 不提供 turnId，因此
+  // 只有全局唯一精确/前缀匹配才能领取；同正文多候选必须 fail-open，不能按队序猜。
   const turnId = ds?.managedTurnOrigin?.turnId;
   if (!turnId) return jsonRes(res, 404, { ok: false, error: 'no_active_turn' });
-  const envelope = claimPromptContext(params.sessionId, turnId, fingerprint, prefix);
-  if (!envelope) return jsonRes(res, 404, { ok: false, error: 'not_found' });
-  jsonRes(res, 200, { ok: true, envelope });
+  const claimed = claimPromptContextAmongTurns(params.sessionId,
+    [turnId, ...(ds?.typeAheadPromptTurnIds ?? [])], fingerprint, prefix);
+  if (!claimed) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  if (ds?.typeAheadPromptTurnIds?.includes(claimed.turnId)) {
+    ds.typeAheadPromptTurnIds = ds.typeAheadPromptTurnIds.filter(id => id !== claimed.turnId);
+  }
+  jsonRes(res, 200, { ok: true, envelope: claimed.envelope });
 });
 
 /** Return only the live bot's normalized native-subagent policy. The session
