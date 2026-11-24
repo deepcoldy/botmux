@@ -33,6 +33,9 @@ interface RenewalEntry {
   sessionId: string;
   credentialOpenId: string;
   taskAuthorized?: () => Promise<boolean>;
+  /** The ordinary person-turn authority fence captured at publication. Checked
+   *  again around asynchronous renewal; a throw fails closed. */
+  validateBeforeWrite?: () => boolean;
   identity: BytedCliIdentity & { turnId: string };
 }
 
@@ -86,6 +89,10 @@ function stillPublished(entry: RenewalEntry): boolean {
   return current !== undefined && current === renderIdentityEnv(publishedIdentityShape(entry.sessionDataDir, entry.sessionId, entry.identity));
 }
 
+function publicationValid(entry: RenewalEntry): boolean {
+  try { return entry.validateBeforeWrite?.() !== false; } catch { return false; }
+}
+
 const inFlight = new Set<string>();
 
 /**
@@ -122,6 +129,13 @@ export async function renewExpiringBytedcliIdentities(
           continue;
         }
       }
+      // The task check above may itself await. Re-check the ordinary person-turn
+      // fence immediately before minting, without letting a stale entry remove
+      // a replacement registered for the same turn meanwhile.
+      if (!publicationValid(entry)) {
+        if (entries.get(key) === entry) entries.delete(key);
+        continue;
+      }
       const jwts = await renewBytedcliJwts(entry.credentialOpenId);
       if (!jwts) {
         logger.warn(`[bytedcli-renewal] could not renew ${entry.sessionId.slice(0, 8)}/${entry.identity.turnId.slice(0, 12)}; keeping current tokens`);
@@ -143,6 +157,9 @@ export async function renewExpiringBytedcliIdentities(
       }
       // The turn may have ended or been republished while the CLI ran.
       if (entries.get(key) !== entry) continue;
+      // Authority may also have changed while the CLI ran. This check and the
+      // body CAS below are synchronous with the write that follows them.
+      if (!publicationValid(entry)) { entries.delete(key); continue; }
       if (!stillPublished(entry)) { entries.delete(key); continue; }
       // A default token that claims CN serves CN itself, and renewal then
       // mints no separate CN token: an earlier one must not stay in its place.

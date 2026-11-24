@@ -447,7 +447,7 @@ async function publishOne(
     writeSessionIdentity(sessionDataDir, sessionId, stamped, storageModel);
     if (localMint && turnId && storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
       trackBytedcliIdentityRenewal({
-        sessionDataDir, sessionId, credentialOpenId: senderOpenId, identity: { ...stamped, turnId },
+        sessionDataDir, sessionId, credentialOpenId: senderOpenId, identity: { ...stamped, turnId }, validateBeforeWrite,
       });
     }
     return { tool, state: 'user' };
@@ -791,6 +791,7 @@ async function runLocalTransientRetry(
         trackBytedcliIdentityRenewal({
           sessionDataDir: entry.sessionDataDir, sessionId: entry.sessionId,
           credentialOpenId: entry.senderOpenId, identity: { ...stamped, turnId: entry.turnId },
+          validateBeforeWrite: entry.validateBeforeWrite,
         });
       }
       drop();
@@ -896,8 +897,10 @@ async function runTransientRetry(
  *
  * Returns `'none'` (leaving the turn as is) when the turn does not hold an
  * adoptable refusal, belongs to another principal/delegation/unattended run,
- * or changed concurrently; returns `'unavailable'` when minting the local JWT
- * fails transiently so the caller does not report ready or throw HTTP 500.
+ * or the person definitely has no local login; returns `'superseded'` when a
+ * live policy, delegation, credential epoch, or published snapshot changed
+ * around the mint; returns `'unavailable'` when minting fails transiently so
+ * the caller does not report ready or throw HTTP 500.
  */
 export async function adoptLocalBytedcliAuthorization(args: {
   sessionDataDir: string;
@@ -912,7 +915,10 @@ export async function adoptLocalBytedcliAuthorization(args: {
     return 'none';
   }
   const initialPolicy = localBytedcliPolicy(currentPolicy, botConfig);
-  if (!initialPolicy) return 'none';
+  // With no live reader this is simply a caller whose static policy is not
+  // locally adoptable. A live reader, however, means the request's config was
+  // already superseded (or can no longer be read): never promise next-turn use.
+  if (!initialPolicy) return currentPolicy ? 'superseded' : 'none';
   const before = recallProvenIdentityContent(sessionDataDir, sessionId, turnId, 'bytedcli');
   const stampedOwner = stampedOpenIdOf(before);
   if (stampedOwner && stampedOwner !== senderOpenId) return 'none';
@@ -931,15 +937,15 @@ export async function adoptLocalBytedcliAuthorization(args: {
   }
   const after = recallProvenIdentityContent(sessionDataDir, sessionId, turnId, 'bytedcli');
   const livePolicy = localBytedcliPolicy(currentPolicy, botConfig);
-  if (!livePolicy || getLarkToolDelegation(sessionDataDir, sessionId, turnId)) return 'none';
-  if (readCliAuthEpoch(senderOpenId) !== epochBefore) return 'none';
+  if (!livePolicy || getLarkToolDelegation(sessionDataDir, sessionId, turnId)) return 'superseded';
+  if (readCliAuthEpoch(senderOpenId) !== epochBefore) return 'superseded';
   if (after !== before) {
     // Another concurrent adoption or local transient retry already installed
     // this same person's identity for this turn.
     if (after?.includes("BOTMUX_IDENTITY_MODE='user'") && stampedOpenIdOf(after) === senderOpenId) {
       return 'already';
     }
-    return 'none';
+    return 'superseded';
   }
   if (!identity) return 'none';
   const stamped = withMeegoStore({ ...identity, turnId, openId: senderOpenId }, livePolicy);
@@ -955,9 +961,10 @@ export async function adoptLocalBytedcliAuthorization(args: {
  * - `adopted`: the turn's refusal was replaced with the person's identity.
  * - `already`: the turn already holds the person's identity, so there is nothing to take up.
  * - `unavailable`: minting the turn's personal JWT failed transiently; do not report ready.
- * - `none`: the turn does not hold an adoptable refusal (or it changed mid-mint).
+ * - `superseded`: policy, delegation, credential epoch, or the published snapshot changed around the mint.
+ * - `none`: the turn does not hold an adoptable refusal, or the person definitely has no local login.
  */
-export type AdoptResult = 'adopted' | 'already' | 'none' | 'unavailable';
+export type AdoptResult = 'adopted' | 'already' | 'none' | 'unavailable' | 'superseded';
 
 /** @internal test-only */
 export function __resetTransientRefusalsForTest(): void {

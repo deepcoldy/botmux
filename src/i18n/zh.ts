@@ -926,6 +926,7 @@ export const messages: Record<string, string> = {
   'provider_auth.ready_bytedcli_now': 'botmux: ByteCloud 已授权并对本轮生效，命令未执行。请直接重试刚才的命令，不用让用户再发消息。',
   'provider_auth.ready_bytedcli': 'botmux: ByteCloud 已授权，但本轮开始时还没有，本轮用不上，命令未执行。请发起人再发一条消息，下一轮即可使用。',
   'provider_auth.ready_bytedcli_unavailable': 'botmux: ByteCloud 授权服务暂时不可用，暂时无法为本轮签发凭据，命令未执行。已有授权会保留，请不要重复登录，稍后重试。',
+  'provider_auth.ready_bytedcli_superseded': 'botmux: ByteCloud 授权接管因本轮策略或身份状态变化而中止，命令未执行。请重试以按最新策略检查；不要假设本轮或下一轮已经获得本次登录的凭据。',
   'provider_auth.delivered_inline': 'botmux: {provider} 需要你本人授权，授权链接已由 botmux 发在这个私聊里，命令未执行。不要转述链接；等用户授权后重试即可。',
   'provider_auth.delivered_dm': 'botmux: {provider} 需要本轮发起人本人授权，授权链接已由 botmux 私聊发给 TA，群里也已提示，命令未执行。不要索要或转述链接；等 TA 授权后重试即可。',
   'provider_auth.delivered_ephemeral': 'botmux: {provider} 需要本轮发起人本人授权。私聊发不出去，授权链接已作为只有 TA 能看到的卡片发在本群，群里也已提示，命令未执行。不要索要或转述链接；等 TA 授权后重试即可。',

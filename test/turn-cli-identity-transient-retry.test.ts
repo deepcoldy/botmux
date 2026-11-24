@@ -696,7 +696,8 @@ describe('transient local bytedcli refusal within a turn', () => {
       .mockRejectedValueOnce(new Error('bytedcli authorization service unavailable (status)'))
       .mockResolvedValueOnce({ cloudJwt: 'local-recovered-jwt', codeJwt: 'local-code-jwt' });
 
-    const outcomes = await prepareLocal();
+    const validateBeforeWrite = vi.fn(() => true);
+    const outcomes = await prepareLocal({ validateBeforeWrite });
     expect(outcomes.find(o => o.tool === 'bytedcli')?.state).toBe('unavailable');
     expect(current()).toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(current()).toContain('[reason=provider_unavailable]');
@@ -716,11 +717,20 @@ describe('transient local bytedcli refusal within a turn', () => {
     expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='local-recovered-jwt'");
     expect(current('codebase')).not.toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(localTrackRenewal).toHaveBeenCalledTimes(1);
+    expect(localTrackRenewal).toHaveBeenCalledWith(expect.objectContaining({ validateBeforeWrite }));
 
     // Recovered: no further mints on later calls.
     later();
     await retry(localConfig);
     expect(mintBytedcliJwts).toHaveBeenCalledTimes(2);
+  });
+
+  it('passes the publication fence to renewal after an initial local mint', async () => {
+    mintBytedcliJwts.mockResolvedValueOnce({ cloudJwt: 'initial-local-jwt' });
+    const validateBeforeWrite = vi.fn(() => true);
+    await prepareLocal({ validateBeforeWrite });
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='initial-local-jwt'");
+    expect(localTrackRenewal).toHaveBeenCalledWith(expect.objectContaining({ validateBeforeWrite }));
   });
 
   it('stops retrying after TRANSIENT_REFUSAL_MAX_RETRIES while the local provider stays unavailable', async () => {

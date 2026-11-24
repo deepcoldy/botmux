@@ -208,7 +208,7 @@ describe('adoptLocalBytedcliAuthorization', () => {
       message: 'botmux: revoked\n[reason=platform_forbidden]',
     } as any, 'proven');
     release({ cloudJwt: 'stale-jwt' });
-    expect(await pending).toBe('none');
+    expect(await pending).toBe('superseded');
     expect(current()).toContain('[reason=platform_forbidden]');
     expect(current()).not.toContain('stale-jwt');
 
@@ -223,7 +223,7 @@ describe('adoptLocalBytedcliAuthorization', () => {
     await vi.waitFor(() => expect(releaseRevoke).toBeTypeOf('function'));
     authEpoch = 1;
     releaseRevoke({ cloudJwt: 'post-logout-jwt' });
-    expect(await pendingRevoke).toBe('none');
+    expect(await pendingRevoke).toBe('superseded');
     expect(current()).toContain('[reason=provider_unavailable]');
     expect(current()).not.toContain('post-logout-jwt');
   });
@@ -245,6 +245,19 @@ describe('adoptLocalBytedcliAuthorization', () => {
     expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='concurrent-winner-jwt'");
   });
 
+  it('reports superseded when the live policy no longer allows local adoption', async () => {
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli', mode: 'denied', turnId: TURN, openId: ALICE,
+      message: 'botmux: unavailable\n[reason=provider_unavailable]',
+    } as any, 'proven');
+    minted = { cloudJwt: 'must-not-mint' };
+    expect(await adopt({
+      currentPolicy: () => parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }),
+    })).toBe('superseded');
+    expect(current()).toContain('[reason=provider_unavailable]');
+    expect(bytedcliAuth.mintBytedcliJwts).not.toHaveBeenCalled();
+  });
+
   it('refuses adoption if live policy disables bytecloud or switches to platform mid-mint', async () => {
     writeSessionIdentity(dir, SESSION, {
       tool: 'bytedcli', mode: 'denied', turnId: TURN, openId: ALICE,
@@ -257,7 +270,7 @@ describe('adoptLocalBytedcliAuthorization', () => {
     await vi.waitFor(() => expect(release).toBeTypeOf('function'));
     livePolicy = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }) ?? undefined;
     release({ cloudJwt: 'should-not-write' });
-    expect(await pending).toBe('none');
+    expect(await pending).toBe('superseded');
     expect(current()).toContain('[reason=provider_unavailable]');
     expect(current()).not.toContain('should-not-write');
   });

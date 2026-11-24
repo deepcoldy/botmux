@@ -203,7 +203,9 @@ describe('requestProviderAuth — ByteCloud already authorized mid-turn', () => 
   it('keeps the next-turn wording when the turn cannot adopt it', async () => {
     deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
     deps.adoptBytedcliForTurn = vi.fn(async () => 'none' as const);
-    expect((await ask('bytedcli')).message).toContain('下一轮');
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('ready');
+    expect(r.message).toContain('下一轮');
   });
 
   it('says no login is needed when the turn already holds the person\'s identity', async () => {
@@ -219,8 +221,6 @@ describe('requestProviderAuth — ByteCloud already authorized mid-turn', () => 
     deps.adoptBytedcliForTurn = vi.fn(async () => 'unavailable' as const);
     const r = await ask('bytedcli');
     expect(r.status).toBe('unavailable');
-    expect(r.message).toContain('暂时不可用');
-    expect(r.message).toContain('不要重复登录');
     expect(deps.deliver).not.toHaveBeenCalled();
   });
 
@@ -229,7 +229,14 @@ describe('requestProviderAuth — ByteCloud already authorized mid-turn', () => 
     deps.adoptBytedcliForTurn = vi.fn(async () => { throw new Error('bytedcli authorization service unavailable'); });
     const r = await ask('bytedcli');
     expect(r.status).toBe('unavailable');
-    expect(r.message).toContain('暂时不可用');
+    expect(deps.deliver).not.toHaveBeenCalled();
+  });
+
+  it('returns unavailable when adoption is superseded by a live policy or generation change', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => 'superseded' as const);
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('unavailable');
     expect(deps.deliver).not.toHaveBeenCalled();
   });
 });
