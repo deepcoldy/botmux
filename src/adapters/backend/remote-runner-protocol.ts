@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { normalizeHistoryReadFilters, type HistoryReadFilterOptions } from '../../core/history-read-options.js';
 
 export const REMOTE_RUNNER_PROTOCOL = 'botmux.remote-runner';
 export const REMOTE_RUNNER_PROTOCOL_VERSION = 1;
@@ -191,12 +192,12 @@ export type RemoteRunnerSessionToolRequest =
       tool: 'history';
       limit?: number;
       scope?: 'session' | 'thread' | 'chat' | 'ambient';
-      withCardJson?: boolean;
-    }
+    } & HistoryReadFilterOptions
   | {
       tool: 'quoted';
       messageId: string;
       raw?: boolean;
+      download?: boolean;
     }
   | { tool: 'bots.list' }
   | { tool: 'skill.list' }
@@ -787,7 +788,7 @@ export function normalizeRemoteRunnerSessionToolRequest(
   if (!raw || typeof raw.tool !== 'string') return undefined;
 
   if (raw.tool === 'history') {
-    const allowed = new Set(['tool', 'limit', 'scope', 'withCardJson']);
+    const allowed = new Set(['tool', 'limit', 'scope', 'withCardJson', 'view', 'query', 'types', 'since', 'until']);
     if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
     const limit = raw.limit === undefined ? undefined : nonNegativeInteger(raw.limit);
     if (raw.limit !== undefined && (limit === undefined || limit < 1 || limit > 100)) {
@@ -797,27 +798,28 @@ export function normalizeRemoteRunnerSessionToolRequest(
     if (scope !== undefined && !['session', 'thread', 'chat', 'ambient'].includes(scope)) {
       return undefined;
     }
-    if (raw.withCardJson !== undefined && typeof raw.withCardJson !== 'boolean') {
-      return undefined;
-    }
+    const filters = normalizeHistoryReadFilters(raw);
+    if (!filters) return undefined;
     return {
       tool: 'history',
       ...(limit !== undefined ? { limit } : {}),
       ...(scope !== undefined ? { scope: scope as 'session' | 'thread' | 'chat' | 'ambient' } : {}),
-      ...(raw.withCardJson !== undefined ? { withCardJson: raw.withCardJson } : {}),
+      ...filters,
     };
   }
 
   if (raw.tool === 'quoted') {
-    const allowed = new Set(['tool', 'messageId', 'raw']);
+    const allowed = new Set(['tool', 'messageId', 'raw', 'download']);
     if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
     const messageId = nonEmptyString(raw.messageId, 256);
     if (!messageId || !/^om_[A-Za-z0-9_-]+$/.test(messageId)) return undefined;
     if (raw.raw !== undefined && typeof raw.raw !== 'boolean') return undefined;
+    if (raw.download !== undefined && typeof raw.download !== 'boolean') return undefined;
     return {
       tool: 'quoted',
       messageId,
       ...(raw.raw !== undefined ? { raw: raw.raw } : {}),
+      ...(raw.download !== undefined ? { download: raw.download } : {}),
     };
   }
 

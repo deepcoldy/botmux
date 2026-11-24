@@ -8,55 +8,9 @@ import type { ExpandMergeForwardFn, ResolveMergedCardFn } from './quoted-render.
 export const HISTORY_READ_USAGE = 'botmux history [--limit N] [--scope session|thread|chat|ambient] [--view full|index] [--query text] [--type text,interactive] [--since ISO] [--until ISO] [--with-card-json] [--session-id id]';
 export const QUOTED_READ_USAGE = 'botmux quoted <message_id> [<id> ...] [--raw] [--no-download] [--session-id id] (at most 20 ids)';
 
-export interface HistoryReadOptions {
-  view: 'full' | 'index';
-  query?: string;
-  types: string[];
-  since?: number;
-  until?: number;
-}
-
-export function parseHistoryReadOptions(args: string[]): HistoryReadOptions {
-  // Same two spellings unknownFlags() admits: `--flag value` and `--flag=value`.
-  // An admitted spelling that is not read here would silently fall back to the
-  // unfiltered full view.
-  const value = (flag: string): string | undefined => {
-    for (let index = 0; index < args.length; index++) {
-      const arg = args[index]!;
-      if (arg.startsWith(`${flag}=`)) {
-        const inline = arg.slice(flag.length + 1);
-        if (!inline) throw new Error(`${flag} requires a value`);
-        return inline;
-      }
-      if (arg !== flag) continue;
-      const next = args[index + 1];
-      if (!next || next.startsWith('--')) throw new Error(`${flag} requires a value`);
-      return next;
-    }
-    return undefined;
-  };
-  const view = value('--view') ?? 'full';
-  if (view !== 'full' && view !== 'index') throw new Error('--view must be full or index');
-  if (view === 'index' && args.includes('--with-card-json')) throw new Error('--with-card-json requires --view full');
-  const query = value('--query')?.trim();
-  if (query === '') throw new Error('--query must not be empty');
-  const rawTypes = value('--type');
-  const types = (rawTypes ?? '').split(',').map(type => type.trim()).filter(Boolean);
-  if (rawTypes !== undefined && (!types.length || types.some(type => !/^[a-z_]+$/.test(type)))) {
-    throw new Error('--type requires comma-separated message types');
-  }
-  const timestamp = (flag: string): number | undefined => {
-    const text = value(flag);
-    if (text === undefined) return undefined;
-    const parsed = Date.parse(text);
-    if (!/^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(text) || !Number.isFinite(parsed)) throw new Error(`${flag} requires an ISO date or timestamp`);
-    return parsed;
-  };
-  const since = timestamp('--since');
-  const until = timestamp('--until');
-  if (since !== undefined && until !== undefined && since >= until) throw new Error('--since must be earlier than --until');
-  return { view, ...(query ? { query } : {}), types, ...(since !== undefined ? { since } : {}), ...(until !== undefined ? { until } : {}) };
-}
+export { parseHistoryReadOptions } from '../core/history-read-options.js';
+export type { HistoryReadOptions } from '../core/history-read-options.js';
+import type { HistoryReadOptions } from '../core/history-read-options.js';
 
 export async function mapHistoryReads<T, U>(items: readonly T[], work: (item: T) => Promise<U>, concurrency = 4): Promise<U[]> {
   if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error('Invalid message read concurrency');

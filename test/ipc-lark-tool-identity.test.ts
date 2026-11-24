@@ -651,6 +651,36 @@ describe('session application identity route', () => {
     expect(response.status).toBe(409);
     expect(await response.text()).not.toContain('late-user-token');
   });
+  it.each([
+    ['application', () => { session.larkAppId = 'cli_other'; }],
+    ['chat', () => { session.chatId = 'oc_other'; }],
+    ['stored chat', () => { session.session.chatId = 'oc_other'; }],
+    ['session', () => { session.session.sessionId = 'other-session'; }],
+    ['headless metadata', () => { session.session.headless = { id: headlessId, source: 'cli' }; }],
+    ['disabled transport', () => {
+      vi.mocked(bots.getBot).mockReturnValue({ config: {
+        larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', apiOnly: true,
+      } } as any);
+    }],
+    ['disabled binding', () => {
+      vi.mocked(bots.getBot).mockReturnValue({ config: {
+        larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: false,
+      } } as any);
+    }],
+    ['missing configuration', () => {
+      vi.mocked(bots.getBot).mockImplementation(() => { throw new Error('bot removed'); });
+    }],
+  ] as const)('does not export a user credential after the request target changes: %s', async (_name, change) => {
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      change();
+      return 'late-user-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    expect(body).not.toHaveProperty('credential');
+    expect(JSON.stringify(body)).not.toContain('late-user-token');
+  });
   it.skipIf(process.platform !== 'linux')('allows a callerless scheduled execution with a scoped delegated user', async () => {
     await delegate();
     delete session.managedTurnOrigin.callerOpenId;

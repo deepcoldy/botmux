@@ -4513,6 +4513,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const detachedScheduled = backgroundInput ? resolveRegisteredBackgroundContext(backgroundInput) : null;
   const targetLarkAppId = ds?.larkAppId ?? detachedScheduled?.larkAppId;
   const targetChatId = ds?.chatId ?? detachedScheduled?.chatId;
+  const targetSessionChatId = ds?.session.chatId;
   const validHeadlessSession = !!ds?.session.headless
     && ds.session.headless.source === 'cli'
     && isHeadlessId(ds.session.headless.id)
@@ -4782,7 +4783,22 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
           === (liveOrigin?.callerOpenId ? turnCaller : turnPrincipal))
       && ds.managedTurnOrigin?.identityTurnId === identityTurnId)
     : (!!backgroundInput && !!detachedForUser && backgroundContextStillValid(backgroundInput, detachedForUser));
-  if (!boundLarkToolRequest(req, params.sessionId, bot.larkAppId)
+  // Caller/turn stability does not imply that the original transport still
+  // exists. Unlike bot credentials, personal credentials must never enter a
+  // headless session, including one created while the provider was awaited.
+  let userTargetStillValid = false;
+  try {
+    const liveBot = getBot(targetLarkAppId!).config;
+    userTargetStillValid = liveBot.larkAppId === targetLarkAppId && liveBot.apiOnly !== true
+      && boundLarkToolRequest(req, params.sessionId, targetLarkAppId, liveBot)
+      && (ds
+        ? ds.larkAppId === targetLarkAppId && ds.chatId === targetChatId
+          && ds.session.sessionId === params.sessionId && ds.session.chatId === targetSessionChatId
+          && !ds.session.headless && !sessionTransportDisabled(ds)
+        : !!detachedForUser && detachedForUser.larkAppId === targetLarkAppId
+          && detachedForUser.chatId === targetChatId && !sessionTransportDisabled(detachedForUser));
+  } catch { /* Unknown live configuration cannot authorize credential export. */ }
+  if (!userTargetStillValid
     || !stableAfterAwait
     // The switch, the owner or the turn's speakers may have changed meanwhile.
     || !ownerFallbackStillHolds(ds, ownerFallback)
