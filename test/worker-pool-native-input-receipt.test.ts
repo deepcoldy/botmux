@@ -245,7 +245,7 @@ describe('prompt_submitted_input fencing', () => {
 describe('type_ahead_queued tracking', () => {
   beforeEach(() => { vi.clearAllMocks(); });
 
-  it('records the live worker\'s type-ahead turns once each, oldest first', async () => {
+  it('records, reconciles and drops only the live worker generation\'s type-ahead turns', async () => {
     initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
     const worker = makeFakeWorker();
     const ds = makeDs(worker);
@@ -258,8 +258,25 @@ describe('type_ahead_queued tracking', () => {
 
     ds.worker = makeFakeWorker();
     worker.emit('message', { type: 'type_ahead_queued', turnId: 'om_turn_4' });
+    worker.emit('message', { type: 'type_ahead_turn_dropped', turnId: 'om_turn_2' });
+    worker.emit('message', { type: 'type_ahead_queue_snapshot', turnIds: [] });
     await flush();
     expect(ds.typeAheadPromptTurnIds).toEqual(['om_turn_2', 'om_turn_3']);
+
+    ds.worker = worker;
+    worker.emit('message', { type: 'type_ahead_queue_snapshot', turnIds: ['om_turn_3', 'om_turn_5'] });
+    worker.emit('message', { type: 'type_ahead_turn_dropped', turnId: 'om_turn_3' });
+    await flush();
+    expect(ds.typeAheadPromptTurnIds).toEqual(['om_turn_5']);
+
+    worker.emit('message', { type: 'capture_identity', revision: 1, turnId: 'om_turn_5' });
+    await flush();
+    expect(ds.typeAheadPromptTurnIds).toEqual([]);
+
+    ds.typeAheadPromptTurnIds = ['om_turn_6'];
+    worker.emit('message', { type: 'capture_identity', revision: 0, turnId: 'om_turn_6' });
+    await flush();
+    expect(ds.typeAheadPromptTurnIds).toEqual(['om_turn_6']);
   });
 });
 

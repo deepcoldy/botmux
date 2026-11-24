@@ -2320,7 +2320,11 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // A failed-turn rewind is reported from inside a CLI restart: the runtime
   // it began under is being retired and the message's turn has not run yet.
   // It is this worker's account of its own input queue, like the backlog.
-  if (msg.type === 'cli_input_backlog' || msg.type === 'failed_turn_rewind') {
+  // Type-ahead registrations, drops and restore snapshots are queue observations
+  // too: they may name a queued execution, but never assert that it has started.
+  if (msg.type === 'cli_input_backlog' || msg.type === 'failed_turn_rewind'
+    || msg.type === 'type_ahead_queued' || msg.type === 'type_ahead_turn_dropped'
+    || msg.type === 'type_ahead_queue_snapshot') {
     delete context.scope.execution;
     delete context.scope.runtime;
     delete context.scope.operationId;
@@ -8666,9 +8670,13 @@ function bindCliPidMarker(markerPath: string, pid: number): void {
     && (currentBotmuxTurnId !== turnBefore || currentBotmuxDispatchAttempt !== attemptBefore)) {
     log(`Restored executing turn ${currentBotmuxTurnId.slice(0, 12)} from the CLI PID marker`);
     // On success its tail rewrites the marker with the fresh capability.
-    if (publishSandboxRelayCapability()) return;
+    if (publishSandboxRelayCapability()) {
+      send({ type: 'type_ahead_queue_snapshot', turnIds: queuedTypeAheadTurns.map(turn => turn.turnId) });
+      return;
+    }
   }
   writeCliPidMarker();
+  send({ type: 'type_ahead_queue_snapshot', turnIds: queuedTypeAheadTurns.map(turn => turn.turnId) });
 }
 
 function syncQueuedTurnsFromMarkerDisk(): boolean {
@@ -39553,9 +39561,11 @@ function dropQueuedTurnRecord(
   queuedTypeAheadTurns = queuedTypeAheadTurns.filter(queued => queued.turnId !== turnId
     || (queued.dispatchAttempt !== undefined && queued.dispatchAttempt !== dispatchAttempt));
   if (queuedTypeAheadTurns.length === before) return false;
-  // A retry of the same turn under another attempt is still live work.
-  if (opts.tombstone !== false
-    && !queuedTypeAheadTurns.some(queued => queued.turnId === turnId)) markTurnRetired(turnId);
+  // A retry of the same turn under another attempt is still live work. Its
+  // sidecar is keyed by turnId, so only the last queued sibling may retire it.
+  const hasLiveSibling = queuedTypeAheadTurns.some(queued => queued.turnId === turnId);
+  if (!hasLiveSibling) send({ type: 'type_ahead_turn_dropped', turnId });
+  if (opts.tombstone !== false && !hasLiveSibling) markTurnRetired(turnId);
   return true;
 }
 

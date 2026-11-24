@@ -2,6 +2,7 @@ import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecuti
 import { isLeadOnlySession } from './lead-only.js';
 import { decideAssistantAdmission, decideAssistantLiveInputAdmission } from './assistant-spawn.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
+import { dropTypeAheadPromptTurn, noteTypeAheadPromptTurn, promoteTypeAheadPromptTurn, reconcileTypeAheadPromptTurns } from './type-ahead-prompt-queue.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { runtimeStartRefusal } from '../services/runtime-reservation.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
@@ -1235,9 +1236,6 @@ const CLOSE_FENCE_WARN_MS = 8_000;
 const TRANSFER_DETACH_FENCE_MS = 3_500;
 // Side answers are capped before rendering to fit the Lark card limit.
 const BTW_ANSWER_MAX_CHARS = 6_000;
-// Claimed type-ahead turns leave the claim list; the cap bounds turns whose
-// hook never claims.
-const TYPE_AHEAD_PROMPT_TURNS_MAX = 32;
 // In-process picker relay (card-handler relay_confirm) runs with no HTTP abort
 // above it — its card ACK already degrades to a background "处理中" toast at 2.5s
 // and the real result is delivered as a visible message. So it can afford a
@@ -22752,6 +22750,10 @@ function setupWorkerHandlers(
             + `(current rev=${String(currentCaptureIdentity(ds, workerGeneration)?.revision ?? '-')})`,
           );
         } else {
+          // Advancing a queued turn promotes it to the current candidate. Remove
+          // only its queue entry; its sidecar remains available for a delayed
+          // current-turn hook claim. Rejected/out-of-order identities do neither.
+          if (msg.turnId) promoteTypeAheadPromptTurn(ds, msg.turnId);
           if (msg.turnId) activateStartingCardHealth(ds, msg.turnId);
           if (cardWasWaiting && !streamingCardTurnQueued(ds)) {
             // The waiting turn has become the terminal producer. Repaint even
@@ -22934,19 +22936,20 @@ function setupWorkerHandlers(
         }
         break;
       }
-      case 'type_ahead_queued': {
+      case 'type_ahead_queued':
+      case 'type_ahead_turn_dropped':
+      case 'type_ahead_queue_snapshot': {
         if (
           ds.worker !== worker
           || ds.workerGeneration !== workerGeneration
           || ds.session.workerGeneration !== workerGeneration
         ) {
-          logger.warn(`[${t}] Ignored type_ahead_queued from stale worker generation`);
+          logger.warn(`[${t}] Ignored ${msg.type} from stale worker generation`);
           break;
         }
-        const turnIds = ds.typeAheadPromptTurnIds ?? [];
-        if (!turnIds.includes(msg.turnId)) {
-          ds.typeAheadPromptTurnIds = [...turnIds, msg.turnId].slice(-TYPE_AHEAD_PROMPT_TURNS_MAX);
-        }
+        if (msg.type === 'type_ahead_queued') noteTypeAheadPromptTurn(ds, msg.turnId);
+        else if (msg.type === 'type_ahead_turn_dropped') dropTypeAheadPromptTurn(ds, msg.turnId);
+        else reconcileTypeAheadPromptTurns(ds, msg.turnIds);
         break;
       }
       case 'direct_submit_started': {
