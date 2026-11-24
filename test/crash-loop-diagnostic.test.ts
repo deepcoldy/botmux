@@ -223,6 +223,21 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { code: 0, before: 'idle', after: 'idle' },
+    { code: 0, before: 'working', after: 'interrupted' },
+    { code: 0, before: 'starting', after: 'interrupted' },
+    { code: 1, before: 'idle', after: 'interrupted' },
+    { code: 1, before: 'working', after: 'interrupted' },
+  ] as const)('projects exit $code after $before as $after without inventing an active task', async ({ code, before, after }) => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-exit-projection', worker);
+    ds.lastScreenStatus = before;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    await crashTimes(worker, 1, false, code);
+    expect(ds.lastScreenStatus).toBe(after);
+  });
+
   it('after >3 tmux crashes: keeps the worker + marks lazy cold-resume (survives restart)', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs('sid-diag-keep', worker);
