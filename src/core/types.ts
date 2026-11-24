@@ -511,8 +511,12 @@ export interface DaemonSession {
   /** Native write observations, scoped to the worker generation and exact attempt. */
   replyExecutionStarts?: Map<string, {
     startedAtMs: number; workerGeneration: number;
-    /** Exact terminal observed; retain timing for reply rendering, suppress reminders. */
+    /** Execution retired (terminal, superseded, or screen-idle on non-terminal CLI);
+     *  retain timing for reply rendering, suppress reminders. */
     completed?: boolean;
+    /** True only when retired by an authoritative terminal/supersede edge (not
+     *  heuristic screen-idle), permanently preventing same-attempt revival. */
+    completedByTerminal?: boolean;
     stage?: 'model_output' | 'tool_started' | 'tool_returned';
     lastProgressAtMs?: number;
     /** Ephemeral Dashboard publication throttle, scoped to this exact turn. */
