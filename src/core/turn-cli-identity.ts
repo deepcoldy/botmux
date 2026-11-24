@@ -42,12 +42,16 @@ import {
   meegoStoreShape,
   clearSessionIdentity,
   recallProvenIdentityContent,
+  recallProvenIdentitySnapshot,
+  type ProvenIdentitySnapshot,
+  publishedIdentityShape,
   type BytedCliIdentity,
   type CliIdentity,
 } from './cli-identity.js';
 import { allowsPersonalIdentityForTurn, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import { trackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
 import { GRANT_WAIT_CAP_MS } from '../platform/credential-grant-budget.js';
+import { BYTEDCLI_OVERSEAS_REGIONS, type BytedcliOverseasRegion } from '../platform/bytedcli-grant-regions.js';
 
 /** What was published for one tool this turn — drives the user-visible notice. */
 export interface ToolIdentityOutcome {
@@ -441,10 +445,16 @@ async function publishOne(
   const withheld = async () =>
     withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat);
 
-  const publish = (identity: CliIdentity, localMint = false): ToolIdentityOutcome => {
+  const publish = (identity: CliIdentity, localMint = false, platformUnionId?: string): ToolIdentityOutcome => {
     if (!publicationValid(validateBeforeWrite)) return { tool, state: 'off' };
     const stamped = withMeegoStore({ ...identity, ...(turnId ? { turnId } : {}), openId: senderOpenId }, policy);
-    writeSessionIdentity(sessionDataDir, sessionId, stamped, storageModel);
+    if (platformUnionId && turnId && storageModel === 'proven') {
+      writeProvenPlatformIdentity({
+        sessionDataDir, sessionId, botConfig, turnId, senderOpenId, validateBeforeWrite,
+      }, stamped, platformUnionId);
+    } else {
+      writeSessionIdentity(sessionDataDir, sessionId, stamped, storageModel);
+    }
     if (localMint && turnId && storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
       trackBytedcliIdentityRenewal({
         sessionDataDir, sessionId, credentialOpenId: senderOpenId, identity: { ...stamped, turnId }, validateBeforeWrite,
@@ -462,9 +472,9 @@ async function publishOne(
   //   platform         → platform grant or refusal; local is never consulted.
   const { platform, local, decision } = await gatherCredentials(tool, botConfig, policy, senderOpenId, sessionId, turnId);
   if (decision.kind === 'person') {
-    return decision.source === 'platform'
-      ? publish((platform as Extract<PlatformIdentityResolution, { state: 'granted' }>).identity)
-      : publish(local!, true);
+    if (decision.source !== 'platform') return publish(local!, true);
+    const grant = platform as Extract<PlatformIdentityResolution, { state: 'granted' }>;
+    return publish(grant.identity, false, grant.unionId);
   }
   if (decision.entry === 'private-link') return await withheld();
 
@@ -509,6 +519,135 @@ async function gatherCredentials(
     localLogin: !!local,
   });
   return { platform, local, decision };
+}
+
+interface RegionalGrantContext {
+  sessionDataDir: string;
+  sessionId: string;
+  turnId: string;
+  botConfig: BotConfig;
+  senderOpenId: string;
+  validateBeforeWrite?: () => boolean;
+}
+
+interface RegionalGrantAttempt {
+  count: number;
+  retryAfter: number;
+  inFlight?: Promise<void>;
+}
+
+interface RegionalGrantPublication extends RegionalGrantContext {
+  identity: BytedCliIdentity;
+  snapshot: ProvenIdentitySnapshot;
+  unionId: string;
+  authEpoch: number;
+  attempts: Map<BytedcliOverseasRegion, RegionalGrantAttempt>;
+}
+
+// Once a publication is superseded, revoked or collected, its retry state
+// follows it out of the proven store. Never retain a second cache of a turn's JWTs.
+const regionalGrantPublications = new WeakMap<ProvenIdentitySnapshot, RegionalGrantPublication>();
+const REGIONAL_GRANT_RETRY_INTERVAL_MS = 10_000;
+const REGIONAL_GRANT_MAX_ATTEMPTS = 2;
+
+function writeProvenPlatformIdentity(
+  context: RegionalGrantContext,
+  identity: CliIdentity,
+  unionId: string,
+): void {
+  const { sessionDataDir, sessionId, turnId, senderOpenId } = context;
+  if (identity.tool !== 'bytedcli' || 'mode' in identity
+    || identity.regionalCloudJwtSource !== 'platform'
+    || BYTEDCLI_OVERSEAS_REGIONS.every(region => identity.regionalCloudJwts?.[region])) {
+    writeSessionIdentity(sessionDataDir, sessionId, identity, 'proven');
+    return;
+  }
+  const shaped = publishedIdentityShape(sessionDataDir, sessionId, {
+    ...identity, retryRegionalCloudJwts: true,
+  });
+  writeSessionIdentity(sessionDataDir, sessionId, shaped, 'proven');
+  const snapshot = recallProvenIdentitySnapshot(sessionDataDir, sessionId, turnId, 'bytedcli')!;
+  regionalGrantPublications.set(snapshot, {
+    ...context, snapshot, identity: shaped, unionId,
+    authEpoch: readCliAuthEpoch(senderOpenId), attempts: new Map(),
+  });
+}
+
+/** Refresh one missing partition for the already-proven speaker. Concurrent
+ * calls for a partition share a grant. Distinct partitions merge into the
+ * same publication without replacing any of the original credentials. */
+export async function retryMissingRegionalGrant(args: {
+  sessionDataDir: string;
+  sessionId: string;
+  turnId: string;
+  region: BytedcliOverseasRegion;
+  speakerOpenId?: string;
+  currentPolicy: () => TriggerUserAuthConfig | undefined;
+  executionStillCurrent: () => boolean;
+  waitMs: number;
+}): Promise<void> {
+  const { sessionDataDir, sessionId, turnId, region } = args;
+  const current = () => recallProvenIdentitySnapshot(sessionDataDir, sessionId, turnId, 'bytedcli');
+  const snapshot = current();
+  const entry = snapshot && regionalGrantPublications.get(snapshot);
+  if (!entry || entry.identity.regionalCloudJwts?.[region]
+    || (args.speakerOpenId !== undefined && args.speakerOpenId !== entry.senderOpenId)) return;
+  const state = entry.identity.regionalCloudJwtStates?.[region];
+  if (state === 'not_authorized' || state === 'reauth_required') return;
+
+  const stillAllowed = () => {
+    if (current() !== entry.snapshot || readCliAuthEpoch(entry.senderOpenId) !== entry.authEpoch
+      || getLarkToolDelegation(sessionDataDir, sessionId, turnId)
+      || !publicationValid(entry.validateBeforeWrite) || !args.executionStillCurrent()) return false;
+    const policy = args.currentPolicy();
+    const effective = policyFromConfig(policy);
+    return effective.capabilities.has('bytecloud') && effective.credentialSource !== 'local'
+      && allowsPersonalIdentityForTurn(turnId, policy);
+  };
+  if (!publicationValid(stillAllowed)) return;
+  let attempt = entry.attempts.get(region);
+  if (!attempt) {
+    attempt = { count: 0, retryAfter: 0 };
+    entry.attempts.set(region, attempt);
+  }
+  if (!attempt.inFlight) {
+    if (attempt.count >= REGIONAL_GRANT_MAX_ATTEMPTS || Date.now() < attempt.retryAfter) return;
+    attempt.count++;
+    const active = attempt;
+    attempt.inFlight = (async () => {
+      const grant = await resolvePlatformIdentity({
+        botConfig: entry.botConfig, tool: 'bytedcli', unionId: entry.unionId,
+        sessionId, turnId, cloudJwtRegions: [region],
+      });
+      if (grant.state !== 'granted' || grant.identity.tool !== 'bytedcli' || !stillAllowed()) return;
+      const jwt = grant.identity.regionalCloudJwts?.[region];
+      const reportedState = grant.identity.regionalCloudJwtStates?.[region];
+      const nextState = jwt ? 'minted' : reportedState === 'minted' ? 'failed' : reportedState;
+      if (!jwt && !nextState) return;
+      // Read the latest identity at commit: another partition may have
+      // finished while this request was in flight.
+      const merged = {
+        ...entry.identity,
+        ...(jwt ? { regionalCloudJwts: { ...entry.identity.regionalCloudJwts, [region]: jwt } } : {}),
+        regionalCloudJwtStates: { ...entry.identity.regionalCloudJwtStates, [region]: nextState },
+      };
+      writeSessionIdentity(sessionDataDir, sessionId, merged, 'proven');
+      const replacement = current()!;
+      regionalGrantPublications.delete(entry.snapshot);
+      entry.snapshot = replacement;
+      entry.identity = merged;
+      regionalGrantPublications.set(replacement, entry);
+    })().catch(() => {
+      logger.warn(`[trigger-user-auth] bytedcli regional grant retry failed for partition ${region}`);
+    }).finally(() => {
+      active.retryAfter = Date.now() + REGIONAL_GRANT_RETRY_INTERVAL_MS;
+      active.inFlight = undefined;
+    });
+  }
+  if (args.waitMs <= 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([attempt.inFlight, new Promise<void>(resolve => { timer = setTimeout(resolve, args.waitMs); })]);
+  clearTimeout(timer);
 }
 
 /** Gives a bytedcli identity the person's Meego store, only while Meego is a
@@ -852,9 +991,9 @@ async function runTransientRetry(
         drop();
         return;
       }
-      writeSessionIdentity(entry.sessionDataDir, entry.sessionId, withMeegoStore(
+      writeProvenPlatformIdentity(entry, withMeegoStore(
         { ...platform.identity, turnId: entry.turnId, openId: entry.senderOpenId },
-        wanted), 'proven');
+        wanted), platform.unionId);
       drop();
       logger.info(`[trigger-user-auth] platform ${entry.tool} grant recovered for session ${entry.sessionId} on retry`);
       return;
