@@ -274,6 +274,7 @@ describe('usage-limit sticky state self-heal', () => {
         readAntigravityNativeQuota: () => undefined,
         withAntigravityDirectFailureProof: (limit: any) => limit,
         reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
+        lastConfirmedAntigravityQuota: undefined,
         unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
       },
     );

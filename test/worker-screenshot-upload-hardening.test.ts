@@ -210,6 +210,57 @@ describe('worker screenshot upload hardening', () => {
     expect(uploadImageBuffer).toHaveBeenCalledTimes(3);
   });
 
+  it.each(['snapshot', 'upload'] as const)('cancels an old direct-input generation during %s and recaptures the new one', async stage => {
+    let resolveSnapshot!: (value: any) => void;
+    let resolveUpload!: (key: string) => void;
+    let snapshots = 0;
+    let uploads = 0;
+    const send = vi.fn();
+    const snapshotToPng = vi.fn(() => {
+      snapshots += 1;
+      if (stage === 'snapshot' && snapshots === 1) return new Promise(resolve => { resolveSnapshot = resolve; });
+      return Promise.resolve({ ansi: 'same-quota', png: Buffer.from('png'), content: 'same-quota' });
+    });
+    const uploadImageBuffer = vi.fn(() => {
+      uploads += 1;
+      if (stage === 'upload' && uploads === 1) return new Promise<string>(resolve => { resolveUpload = resolve; });
+      return Promise.resolve('img_new_generation');
+    });
+    const harness = executeProductionCapture({
+      logScreenshotSkip: vi.fn(), snapshotToPng, backend: {}, renderCols: 80, renderRows: 24, renderer: null,
+      createHash: vi.fn(), clamp: vi.fn(), captureToPng: vi.fn(), uploadImageBuffer,
+      logError: vi.fn(), log: vi.fn(), projectedRuntimeScreenStatus: () => 'idle', send,
+      classifyScreenUsageLimit: () => ({
+        status: 'limited',
+        usageLimit: {
+          limited: true, kind: 'usage', retryAtMs: 100_000, retryLabel: '1m', retryReady: false,
+          relativeResetKey: 'usage:60000:',
+        },
+      }),
+      currentBotmuxTurnId: 'turn_1', currentBotmuxDispatchAttempt: 1,
+      cliAdapter: { id: 'antigravity' },
+    });
+
+    const pending = harness.captureAndUpload();
+    if (stage === 'snapshot') {
+      harness.setInputGeneration(1);
+      resolveSnapshot({ ansi: 'old-quota', png: Buffer.from('old'), content: 'old-quota' });
+    } else {
+      for (let i = 0; i < 6 && uploads === 0; i++) await Promise.resolve();
+      expect(uploads).toBe(1);
+      harness.setInputGeneration(1);
+      resolveUpload('img_old_generation');
+    }
+    await pending;
+    expect(send).not.toHaveBeenCalled();
+
+    await new Promise(resolve => setTimeout(resolve, 0));
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0]?.[0]).toMatchObject({ type: 'screenshot_uploaded', status: 'limited' });
+    expect(send.mock.calls[0]?.[0].imageKey).not.toBe('img_old_generation');
+  });
+
   it('keeps other CLIs on the original unchanged-pixel fast path without reclassifying', async () => {
     const classifyScreenUsageLimit = vi.fn(() => ({ status: 'idle' }));
     const harness = executeProductionCapture({

@@ -9984,6 +9984,9 @@ const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
 });
 
 let antigravityQuotaHistory: readonly CliUsageLimitState[] | undefined;
+/** Last episode actually confirmed by the classifier, including replacements.
+ * Unlike first-seen history order, this is the only identity a reader gap may retain. */
+let lastConfirmedAntigravityQuota: CliUsageLimitState | undefined;
 let unconfirmedAntigravityQuotas = new Map<string, CliUsageLimitState>();
 let antigravityNativeQuotaLog: AntigravityNativeQuotaLog | undefined;
 
@@ -10130,17 +10133,31 @@ function classifyUsageLimitWithNativeEvidence(
           replaceComposerWithNativeLog = true;
         }
       }
-      // A temporary log-reader gap must not erase an already established link.
-      // A different current key is handled above as a replacement, never as a
-      // rebind of the old composer.
-      const composerWithEstablishedLink = !nativeQuota?.key && existingComposer?.nativeLogEpisodeKey
-        ? { ...composerObserved, nativeLogEpisodeKey: existingComposer.nativeLogEpisodeKey }
-        : composerObserved;
+      // A temporary reader gap may retain only the last episode actually
+      // confirmed by this classifier. Never re-derive an older link from
+      // first-seen history: after A→B, doing so would resurrect consumed A.
+      let composerWithEstablishedLink = composerObserved;
+      const confirmed = lastConfirmedAntigravityQuota;
+      if (!nativeQuota?.key && confirmed && confirmed.relativeResetKey === key
+        && (confirmed.source === 'antigravity-error-composer' || confirmed.source === 'antigravity-native-log')
+        && (confirmed.source === 'antigravity-native-log' || confirmed.nativeEpisodeKey === composerObserved.nativeEpisodeKey)) {
+        composerWithEstablishedLink = {
+          ...composerObserved,
+          source: confirmed.source,
+          nativeEpisodeKey: confirmed.nativeEpisodeKey,
+        };
+        if (confirmed.nativeLogEpisodeKey) composerWithEstablishedLink.nativeLogEpisodeKey = confirmed.nativeLogEpisodeKey;
+        else delete composerWithEstablishedLink.nativeLogEpisodeKey;
+      }
       const composerForAnnotation = composerLogLink ?? composerWithEstablishedLink;
       const previous = previousFor(composerForAnnotation, nativeQuota?.key);
-      const annotated = annotateAntigravityUsageLimit(evidence, composerForAnnotation, {
-        text: nativeQuota?.text, key: nativeQuota?.key, previous, replaceComposer: replaceComposerWithNativeLog,
-      });
+      const annotated = composerWithEstablishedLink !== composerObserved
+        // The retained last-confirmed episode is already fully annotated. A
+        // footerless composer regex would otherwise overwrite B back to A.
+        ? composerWithEstablishedLink
+        : annotateAntigravityUsageLimit(evidence, composerForAnnotation, {
+          text: nativeQuota?.text, key: nativeQuota?.key, previous, replaceComposer: replaceComposerWithNativeLog,
+        });
       const observed = withAntigravityDirectFailureProof(annotated);
       if (!key) return observed;
 
@@ -10156,6 +10173,10 @@ function classifyUsageLimitWithNativeEvidence(
     });
     // 只用已上报且带 Error ID 的部分帧固定首次截止时间。看到原生证据后再把它计入历史。
     const limit = expiredAntigravityQuota ?? result.usageLimit;
+    if (expiredAntigravityQuota) lastConfirmedAntigravityQuota = undefined;
+    else if (limit?.source === 'antigravity-error-composer' || limit?.source === 'antigravity-native-log') {
+      lastConfirmedAntigravityQuota = limit;
+    }
     const key = limit?.relativeResetKey;
     if (composerLogLink) antigravityQuotaHistory = rememberAntigravityQuota(antigravityQuotaHistory, composerLogLink);
     if (limit && key) {
@@ -10173,6 +10194,7 @@ function classifyUsageLimitWithNativeEvidence(
     // 当前错误可以合法地保留同一页脚，不能用页脚本身区分这两种形态。
     if (!expiredAntigravityQuota && !nativeLogQuotaObserved
       && nativeViewportCaptured && isAntigravityReadyComposerScreen(evidence)) {
+      lastConfirmedAntigravityQuota = undefined;
       usageLimitTracker.noteScreenRecovery();
       return { status, usageLimitRecovery: 'antigravity-ready-composer' };
     }
@@ -19718,7 +19740,8 @@ async function captureAndUpload(): Promise<void> {
     || capturedRevision !== captureRevision
     || capturedDisplayGeneration !== screenshotDisplayGeneration
     || capturedTurnId !== currentBotmuxTurnId
-    || capturedAttempt !== currentBotmuxDispatchAttempt;
+    || capturedAttempt !== currentBotmuxDispatchAttempt
+    || capturedInputGeneration !== webTerminalInputGeneration;
   // Dedup is bound to the full identity: the same pixels under a new capture
   // identity or display cycle are a NEW first frame, never a duplicate. Native
   // quota evidence can change while pixels stay fixed (late no-progress proof,
@@ -41710,6 +41733,8 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       antigravityQuotaHistory = msg.antigravityQuotaHistory;
       unconfirmedAntigravityQuotas = new Map();
       const restoredQuota = msg.antigravityActiveQuota;
+      lastConfirmedAntigravityQuota = restoredQuota?.source === 'antigravity-error-composer'
+        || restoredQuota?.source === 'antigravity-native-log' ? restoredQuota : undefined;
       const restoredKey = restoredQuota?.relativeResetKey;
       if (restoredQuota?.kind === 'usage' && !restoredQuota.source && restoredKey && !restoredKey.endsWith(':')) {
         unconfirmedAntigravityQuotas.set(restoredKey, restoredQuota);

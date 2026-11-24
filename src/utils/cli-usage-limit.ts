@@ -364,9 +364,8 @@ export function reconcileUsageLimitState(
       ...incoming,
       retryAtMs: previous.retryAtMs,
       retryReady: previous.retryReady || nowMs >= previous.retryAtMs,
-      ...(previous.source ? { source: previous.source } : {}),
-      ...(previous.nativeEpisodeKey ? { nativeEpisodeKey: previous.nativeEpisodeKey } : {}),
-      ...(previous.nativeLogEpisodeKey ? { nativeLogEpisodeKey: previous.nativeLogEpisodeKey } : {}),
+      // Synthetic cooldowns share only their first deadline. Native identity
+      // still belongs to the incoming episode, including A→B replacements.
     };
   }
   const sameEpisode = previous && (

@@ -42,6 +42,7 @@ describe('Antigravity recovery delivery through the real screen sampler', () => 
       readAntigravityNativeQuota: () => ({ key: 'native-old', text: nativeError }),
       withAntigravityDirectFailureProof: (limit: CliUsageLimitState) => limit, detectCliUsageLimit, cliUsageLimitEpisodeKey,
       usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
+      lastConfirmedAntigravityQuota: undefined,
       unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
     });
     let snapshotReads = 0;

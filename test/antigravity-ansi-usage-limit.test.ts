@@ -20,6 +20,7 @@ function classifier(raw: () => string, cliId = 'antigravity', authoritative = tr
     readAntigravityNativeQuota: readNative ?? (() => nativeText ? { key: 'native-test', text: nativeText } : undefined),
     withAntigravityDirectFailureProof: (limit: CliUsageLimitState) => limit, detectCliUsageLimit, cliUsageLimitEpisodeKey,
     usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
+    lastConfirmedAntigravityQuota: undefined,
     unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
   });
   return { classify, capture, usageLimitTracker };
@@ -201,6 +202,32 @@ describe('raw ANSI tmux quota classification', () => {
       source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-B',
     });
     expect(classify('', 'idle').usageLimit?.nativeLogEpisodeKey).toBeUndefined();
+  });
+
+  it('retains the replacement native-log episode across a reader gap instead of reviving consumed composer A', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const refusal = '⚠ Individual quota reached. Resets in 1m.\nError ID: shared-error\n────\n>\n────\n';
+    let nativeKey: string | undefined = 'native-A';
+    const { classify } = classifier(() => refusal, 'antigravity', true, false, undefined,
+      () => nativeKey ? { key: nativeKey, text: refusal } : undefined);
+    expect(classify('', 'idle').usageLimit).toMatchObject({
+      source: 'antigravity-error-composer', nativeLogEpisodeKey: 'log:native-A',
+    });
+    nativeKey = 'native-B';
+    expect(classify('', 'idle').usageLimit).toMatchObject({
+      source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-B',
+    });
+
+    nativeKey = undefined;
+    expect(classify('', 'idle').usageLimit).toMatchObject({
+      source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-B',
+    });
+    expect(classify('', 'idle').usageLimit?.nativeLogEpisodeKey).toBeUndefined();
+
+    nativeKey = 'native-B';
+    expect(classify('', 'idle').usageLimit).toMatchObject({
+      source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-B',
+    });
   });
 
   it('does not leave a previously unlinked composer owning a newly arrived log episode', () => {

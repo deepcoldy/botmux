@@ -38,6 +38,7 @@ export function antigravityScreenProducer(send: (frame: WorkerToDaemon) => void)
     withAntigravityDirectFailureProof: (limit: any) => limit, detectCliUsageLimit, cliUsageLimitEpisodeKey, usageLimitEvidenceKey,
     annotateAntigravityUsageLimit, usageLimitTracker: createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false }),
     reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
+    lastConfirmedAntigravityQuota: undefined,
     unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
     displayMode: 'screenshot', captureRevision: 0, screenshotDisplayGeneration: 0,
     apiOnlyForUpload: false, larkAppIdForUpload: 'app', larkAppSecretForUpload: 'secret',
