@@ -44,6 +44,15 @@ export interface BridgeTurnJournalEntry {
   /** Only newly admitted turns under the negotiated protocol opt in. */
   handoffVersion?: 1;
   pendingFinal?: FinalOutputSnapshot;
+  /** Ordinary missing-final warning awaiting daemon persistence/delivery ACK.
+   * Such an entry is recovery-only and must never restore a CLI business turn. */
+  pendingNotice?: {
+    noticeId: string;
+    message: string;
+    createdAtMs: number;
+    /** Display-only retirement after an already delivered/submit-noticed turn. */
+    silent?: boolean;
+  };
   dispatchAttempt?: number;
   /** Admission-frozen mode for this exact turn. Absence is disabled and keeps
    *  journals written by older Botmux versions byte-compatible on read. */
@@ -194,6 +203,13 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
         || entry.pendingFinal.output.turnId !== entry.turnId)) {
         throw new Error('Invalid pending final handoff journal');
       }
+      if (entry.pendingNotice && (!/^[a-f0-9]{32}$/.test(entry.pendingNotice.noticeId)
+        || typeof entry.pendingNotice.message !== 'string'
+        || (!entry.pendingNotice.message && entry.pendingNotice.silent !== true)
+        || Buffer.byteLength(entry.pendingNotice.message) > 8 * 1024
+        || !Number.isFinite(entry.pendingNotice.createdAtMs))) {
+        throw new Error('Invalid pending bridge notice journal');
+      }
       const { mergedExecution, claimedAtMs, inputTextHash, wholeInputHash, ...rest } = entry;
       const plain = {
         ...rest,
@@ -217,25 +233,28 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
     });
 }
 
-export function writeBridgeTurnJournal(path: string, pending: BridgeTurnJournalEntry[], acknowledgedIntentId?: string): void {
-  // Takeover/pruning callers may know only CLI marks. Until its exact ACK,
-  // a persisted final snapshot must survive those older lifecycle operations.
-  const pinned = readBridgeTurnJournal(path).filter(entry => entry.pendingFinal && entry.pendingFinal.intentId !== acknowledgedIntentId);
+export function writeBridgeTurnJournal(path: string, pending: BridgeTurnJournalEntry[], acknowledgedIntentId?: string, acknowledgedNoticeId?: string): void {
+  // Takeover/pruning callers may know only CLI marks. Until their exact ACK,
+  // persisted final snapshots and notice obligations survive those operations.
+  const pinned = readBridgeTurnJournal(path).filter(entry =>
+    (entry.pendingFinal && entry.pendingFinal.intentId !== acknowledgedIntentId)
+    || (entry.pendingNotice && entry.pendingNotice.noticeId !== acknowledgedNoticeId));
   pending = [...pending];
   for (const entry of pinned) {
     const index = pending.findIndex(item => item.turnId === entry.turnId && item.dispatchAttempt === entry.dispatchAttempt);
     if (index < 0) pending.push(entry);
     else pending[index] = entry;
   }
-  const retained = pending.filter(entry => !!entry.pendingFinal || entry.handoffVersion === 1);
+  const retained = pending.filter(entry => !!entry.pendingFinal || !!entry.pendingNotice || entry.handoffVersion === 1);
   if (retained.length > MAX_JOURNAL_ENTRIES) throw new Error('final_output_handoff_backpressure');
   const slots = MAX_JOURNAL_ENTRIES - retained.length;
-  const ordinary = pending.filter(entry => !entry.pendingFinal && entry.handoffVersion !== 1);
+  const ordinary = pending.filter(entry => !entry.pendingFinal && !entry.pendingNotice && entry.handoffVersion !== 1);
   const selected = new Set([...retained, ...(slots > 0 ? ordinary.slice(-slots) : [])]);
   const bounded = pending.filter(entry => selected.has(entry));
   const payload: BridgeTurnJournalFile = { version: 1, pending: bounded };
   mkdirSync(dirname(path), { recursive: true });
-  atomicWriteFileSync(path, `${JSON.stringify(payload)}\n`, { mode: 0o600, followTargetSymlink: false, durable: pending.some(entry => entry.handoffVersion === 1) });
+  atomicWriteFileSync(path, `${JSON.stringify(payload)}\n`, { mode: 0o600, followTargetSymlink: false,
+    durable: pending.some(entry => entry.handoffVersion === 1 || entry.pendingNotice) });
 }
 
 export function stageBridgeFinalOutput(path: string, snapshot: FinalOutputSnapshot, allowFinalSnapshot = false): void {
@@ -262,6 +281,42 @@ export function acknowledgeBridgeFinalOutput(path: string, snapshot: FinalOutput
   writeBridgeTurnJournal(path, entries.filter(item => item !== entry), snapshot.intentId);
 }
 
+/** Atomically turn a missing-final owner into a durable notice obligation.
+ * The entry remains pinned until the daemon acknowledges its own durable record. */
+export function stageBridgeTurnNotice(
+  path: string,
+  input: { turnId: string; noticeId: string; message: string; createdAtMs: number; silent?: boolean },
+): void {
+  if (!/^[a-f0-9]{32}$/.test(input.noticeId) || (!input.message && input.silent !== true) || Buffer.byteLength(input.message) > 8 * 1024
+    || !Number.isFinite(input.createdAtMs)) throw new Error('invalid_bridge_notice');
+  const entries = readBridgeTurnJournal(path);
+  let entry = entries.find(item => item.turnId === input.turnId && item.dispatchAttempt === undefined);
+  if (entry?.pendingNotice && entry.pendingNotice.noticeId !== input.noticeId) throw new Error('bridge_notice_conflict');
+  if (!entry) {
+    entry = { turnId: input.turnId, markTimeMs: input.createdAtMs, jsonlPath: 'structured-notice', offsetAtMark: 0 };
+    entries.push(entry);
+  }
+  entry.pendingNotice = { noticeId: input.noticeId, message: input.message, createdAtMs: input.createdAtMs,
+    ...(input.silent ? { silent: true } : {}) };
+  writeBridgeTurnJournal(path, entries);
+}
+
+/** ACK cleanup is replay-safe. A failed write leaves the worker copy pending. */
+export function acknowledgeBridgeTurnNotice(path: string, turnId: string, noticeId: string): void {
+  const entries = readBridgeTurnJournal(path);
+  const entry = entries.find(item => item.pendingNotice?.noticeId === noticeId);
+  if (!entry) return;
+  if (entry.turnId !== turnId) throw new Error('bridge_notice_ack_mismatch');
+  let remaining = entries.filter(item => item !== entry);
+  if (entry.pendingFinal) {
+    const finalOnly = { ...entry };
+    delete finalOnly.pendingNotice;
+    remaining.push(finalOnly);
+  }
+  if (remaining.length === 0) { rmSync(path, { force: true }); return; }
+  writeBridgeTurnJournal(path, remaining, entry.pendingFinal?.intentId, noticeId);
+}
+
 export function appendBridgeTurnJournalEntry(path: string, entry: BridgeTurnJournalEntry): void {
   const pending = readBridgeTurnJournal(path)
     .filter(existing => !(existing.turnId === entry.turnId && existing.dispatchAttempt === entry.dispatchAttempt));
@@ -276,7 +331,7 @@ export function removeBridgeTurnJournalEntry(
 ): void {
   const pending = readBridgeTurnJournal(path);
   const remaining = pending.filter(entry =>
-    entry.pendingFinal || !(entry.turnId === turnId
+    entry.pendingFinal || entry.pendingNotice || !(entry.turnId === turnId
       && (dispatchAttempt === undefined || entry.dispatchAttempt === dispatchAttempt)));
   if (remaining.length === pending.length) return;
   if (remaining.length === 0) {
@@ -287,7 +342,7 @@ export function removeBridgeTurnJournalEntry(
 }
 
 export function clearBridgeTurnJournal(path: string): void {
-  const pinned = readBridgeTurnJournal(path).filter(entry => !!entry.pendingFinal);
+  const pinned = readBridgeTurnJournal(path).filter(entry => !!entry.pendingFinal || !!entry.pendingNotice);
   if (pinned.length > 0) { writeBridgeTurnJournal(path, pinned); return; }
   rmSync(path, { force: true });
 }
@@ -319,7 +374,8 @@ export function selectRestorableBridgeTurns(
   const maxAgeMs = opts.maxAgeMs ?? BRIDGE_TURN_RESTORE_MAX_AGE_MS;
   const liveCliStartedAtMs = opts.liveCliStartedAtMs;
   return entries
-    .filter(entry => entry.jsonlPath === opts.currentJsonlPath
+    .filter(entry => !entry.pendingNotice
+      && entry.jsonlPath === opts.currentJsonlPath
       && nowMs - entry.markTimeMs <= maxAgeMs
       && (liveCliStartedAtMs === undefined
         || (entry.claimedAtMs ?? entry.markTimeMs) >= liveCliStartedAtMs - LIVE_CLI_START_TOLERANCE_MS)

@@ -192,7 +192,8 @@ import { appendUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTa
 import { UniversalOutputHandoff } from './services/universal-output-handoff.js';
 import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
-import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
+import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, stageBridgeTurnNotice, acknowledgeBridgeTurnNotice, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
+import { RECOVERY_NOTICE_MAX_AGE_MS } from './services/ordinary-recovery-notice.js';
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
@@ -11562,22 +11563,28 @@ function codexAdoptJournalPath(): string | undefined {
   return base && lastInitConfig?.adoptMode && structuredBridgeIs('codex') ? `${base}.codex-adopt` : undefined;
 }
 
-function checkpointCodexAdoptRecovery(): void {
+function checkpointCodexAdoptRecovery(strict = false): void {
   if (traexQuotaPending?.failedTurn) return;
   const path = codexAdoptJournalPath();
   // The first attach must consume the previous generation's journal before a
   // new pre-path input or an early empty drain can replace it.
   if (!path || !codexBridgeRolloutPath || !codexAdoptRecoveryAttempted) return;
   try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset); }
-  catch (error: unknown) { log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
+  catch (error: unknown) {
+    if (strict) throw error;
+    log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
-function checkpointStructuredBridgeRecovery(): void {
+function checkpointStructuredBridgeRecovery(strict = false): void {
   if (traexQuotaPending?.failedTurn) return;
   const path = structuredBridgeJournalPath();
   if (!path || !codexBridgeRolloutPath || !structuredBridgeRecoveryAttempted) return;
   try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset, structuredBridgeIs('doubao')); }
-  catch (error: unknown) { log(`Structured bridge checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
+  catch (error: unknown) {
+    if (strict) throw error;
+    log(`Structured bridge checkpoint failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /** Per-session durable file of built-in CronCreate task → topic anchors.
@@ -15058,6 +15065,7 @@ function codexBridgeStartTimer(): void {
         // Worker-function harnesses for older ticker branches provide only the
         // dependencies of that branch; the full worker always supplies this.
         if (typeof maybeSettleMissingStructuredFinal === 'function') maybeSettleMissingStructuredFinal();
+        if (typeof flushMissingFinalNotices === 'function') flushMissingFinalNotices();
       } catch (err: any) {
         log(`Missing-final turn settlement error: ${err.message}`);
       }
@@ -17146,13 +17154,97 @@ function retireRpcLifecycleFromStructuredTerminal(
   codexBridgeQueue.stopRpcActive(identity.turnId, identity.dispatchAttempt);
 }
 
-function notifyMissingFinalTurn(turnId: string): void {
-  send({
-    type: 'user_notify',
-    message: t('worker.structured_final_not_collected', { cliName: cliName() }),
-    kind: 'structured_turn_not_collected',
-    turnId,
-  });
+interface PendingMissingFinalNotice {
+  path: string;
+  turnId: string;
+  noticeId: string;
+  message: string;
+  silent: boolean;
+  createdAtMs: number;
+  nextAttemptAtMs: number;
+}
+const pendingMissingFinalNotices = new Map<string, PendingMissingFinalNotice>();
+
+function transmitMissingFinalNotice(record: PendingMissingFinalNotice): void {
+  if (closeRequested) return;
+  const now = Date.now();
+  // Stop before the daemon expires its delivered dedupe tombstone. Cleanup
+  // failure keeps the expired record for another cleanup attempt, never a send.
+  if (now - record.createdAtMs > RECOVERY_NOTICE_MAX_AGE_MS) {
+    acknowledgeMissingFinalNotice(record.turnId, record.noticeId);
+    return;
+  }
+  record.nextAttemptAtMs = now + 5_000;
+  try {
+    if (record.silent) {
+      send({
+        type: 'turn_display_retired', turnId: record.turnId,
+        message: '', silent: true, noticeId: record.noticeId,
+      });
+    } else {
+      send({
+        type: 'user_notify',
+        message: record.message,
+        kind: 'structured_turn_not_collected',
+        turnId: record.turnId,
+        noticeId: record.noticeId,
+      });
+    }
+  } catch (error) {
+    // Disk remains the owner; the structured ticker retries the exact noticeId.
+    log(`Missing-final notice IPC deferred: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function notifyMissingFinalTurn(turnId: string, silent = false): void {
+  const path = codexAdoptJournalPath() ?? structuredBridgeJournalPath();
+  if (!path || !sessionId || !lastInitConfig?.larkAppId) throw new Error('missing-final notice journal unavailable');
+  const message = silent ? '' : t('worker.structured_final_not_collected', { cliName: cliName() });
+  const noticeId = createHash('sha256').update(JSON.stringify([
+    'structured_final_not_collected', lastInitConfig.larkAppId, sessionId, turnId,
+  ])).digest('hex').slice(0, 32);
+  // This atomic write is the authoritative recovery transition. A later
+  // best-effort checkpoint failure cannot restore the old business owner.
+  const createdAtMs = Date.now();
+  stageBridgeTurnNotice(path, { turnId, noticeId, message, createdAtMs, silent });
+  const record = { path, turnId, noticeId, message, silent, createdAtMs, nextAttemptAtMs: 0 };
+  pendingMissingFinalNotices.set(noticeId, record);
+  transmitMissingFinalNotice(record);
+}
+
+function restoreMissingFinalNotices(): void {
+  const paths = [...new Set([codexAdoptJournalPath(), structuredBridgeJournalPath()].filter((path): path is string => !!path))];
+  for (const path of paths) {
+    for (const entry of readBridgeTurnJournal(path)) {
+      const pending = entry.pendingNotice;
+      if (!pending) continue;
+      pendingMissingFinalNotices.set(pending.noticeId, {
+        path, turnId: entry.turnId, noticeId: pending.noticeId,
+        message: pending.message, nextAttemptAtMs: 0, silent: pending.silent === true,
+        createdAtMs: pending.createdAtMs,
+      });
+    }
+  }
+  for (const record of pendingMissingFinalNotices.values()) transmitMissingFinalNotice(record);
+}
+
+function flushMissingFinalNotices(): void {
+  if (closeRequested) return;
+  const now = Date.now();
+  for (const record of pendingMissingFinalNotices.values()) {
+    if (record.nextAttemptAtMs <= now) transmitMissingFinalNotice(record);
+  }
+}
+
+function acknowledgeMissingFinalNotice(turnId: string, noticeId: string): void {
+  const record = pendingMissingFinalNotices.get(noticeId);
+  if (!record || record.turnId !== turnId) return;
+  try {
+    acknowledgeBridgeTurnNotice(record.path, turnId, noticeId);
+    pendingMissingFinalNotices.delete(noticeId);
+  } catch (error) {
+    log(`Missing-final notice ACK cleanup deferred: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function missingFinalTurnDeliveredBySend(turn: CodexPendingTurn, nextBoundaryMs: number | undefined): boolean {
@@ -17269,38 +17361,43 @@ function maybeSettleMissingStructuredFinal(): void {
   // the drop can advance/replay the next started successor.
   const nextBoundaryMs = codexBridgeQueue.peek().slice(1)
     .find(candidate => candidate.started)?.markTimeMs;
+  let retireSilently = false;
+  if (turn.dispatchAttempt === undefined) {
+    const hasSubmitNotice = structuredTurnsWithSubmitNotice.has(turn.turnId);
+    retireSilently = hasSubmitNotice || missingFinalTurnDeliveredBySend(turn, nextBoundaryMs);
+    try {
+      // Stage + IPC happen before the in-memory drop for BOTH warning and silent
+      // retirement. A stage failure retains the owner; IPC failures retry on disk.
+      notifyMissingFinalTurn(turn.turnId, retireSilently);
+    } catch (error) {
+      log(`Missing-final notice staging failed; keeping the owner: ${error instanceof Error ? error.message : String(error)}`);
+      structuredMissingFinalWatchdog.observe(undefined);
+      return;
+    }
+  }
   const dropped = codexBridgeQueue.dropPendingTurn(turn.turnId, turn.dispatchAttempt, true);
   structuredMissingFinalWatchdog.observe(undefined);
   if (!dropped) return;
   // Universal output handoff can make emitReadyCodexTurns return before its
-  // legacy checkpoint. Persist the exact drop before any terminal/notice so a
-  // restart cannot resurrect and notify this same owner a second time.
-  checkpointCodexAdoptRecovery();
-  checkpointStructuredBridgeRecovery();
+  // legacy checkpoint. The ordinary warning above already has its own pinned
+  // pendingNotice; this secondary checkpoint cannot restore that business owner.
+  let checkpointError: unknown;
+  try { checkpointCodexAdoptRecovery(true); } catch (error) { checkpointError = error; }
+  try { checkpointStructuredBridgeRecovery(true); } catch (error) { checkpointError ??= error; }
   log(`Structured transcript stayed idle without a final for turn ${turn.turnId}; ending the wait and directing the user to the Web terminal`);
   if (turn.dispatchAttempt !== undefined) {
     emitTurnTerminal(turn.turnId, 'ambiguous', 'structured_final_not_collected', turn.dispatchAttempt);
   }
   retireStructuredTurnAttribution([...(dropped.supersededTurns ?? []), dropped]);
-  if (turn.dispatchAttempt === undefined) {
-    const hasSubmitNotice = structuredTurnsWithSubmitNotice.delete(turn.turnId);
-    const deliveredBySend = missingFinalTurnDeliveredBySend(turn, nextBoundaryMs);
-    if (hasSubmitNotice || deliveredBySend) {
-      // This exact input already got its own notice or a user-visible botmux
-      // send. Do not post a contradictory warning; still close the working card.
-      send({
-        type: 'turn_display_retired',
-        turnId: turn.turnId,
-        message: '',
-        silent: true,
-      });
-    } else {
-      notifyMissingFinalTurn(turn.turnId);
-    }
+  if (turn.dispatchAttempt === undefined && retireSilently) {
+    structuredTurnsWithSubmitNotice.delete(turn.turnId);
   }
   // Dropping the dead head can replay a buffered successor user/final pair.
   emitReadyCodexTurns();
   redriveRejectedStructuredReady();
+  // Cleanup and successor replay must not be half-skipped. The pinned notice
+  // owns ordinary recovery; surface the strict checkpoint failure afterwards.
+  if (checkpointError) throw checkpointError;
 }
 
 /** An ordinary Lark turn whose transcript start never arrived is a reply the
@@ -23666,6 +23763,14 @@ function redriveRejectedStructuredReady(): void {
     return;
   }
   if (hasStructuredLifecycleBlock()) {
+    // Head advance re-evaluates the same still-current idle boundary against
+    // the NEW started owner. Never carry the predecessor's proof across, and
+    // never bind an unstarted head: that would re-admit a pre-start edge.
+    if (ptyOutputGeneration.isCurrent(readyEvidenceGeneration)) {
+      const head = codexBridgeQueue.peek()[0];
+      structuredRejectedReadyEvidenceStartUuid = head?.started && head.finalText === undefined
+        ? head.nativeUserProof?.uuid : undefined;
+    }
     const nextRemainingMs = codexBridgeQueue.preStartLeaseRemainingMs();
     if (nextRemainingMs !== undefined) scheduleStructuredStartGraceRecheck(nextRemainingMs);
     return;
@@ -41566,6 +41671,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       activeRestartAttemptId = msg.restartAttemptId;
       seedInitTurnTerminals(msg);
       initializeFinalOutputHandoff(msg);
+      restoreMissingFinalNotices();
       applyInitFinalOutputBackpressure(msg, ordinaryImTurnId);
       // Dashboard grants stay per-boot, while the Lark-card capability is
       // revocable at the logical Session lifecycle boundary.
@@ -42163,6 +42269,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     case 'final_output_accepted': {
       try { workerFinalOutputHandoff?.acknowledge(msg); }
       catch (error) { log(`Final output ACK cleanup deferred: ${String(error)}`); }
+      break;
+    }
+
+    case 'structured_turn_not_collected_ack': {
+      acknowledgeMissingFinalNotice(msg.turnId, msg.noticeId);
       break;
     }
 

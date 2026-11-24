@@ -5,10 +5,11 @@ import { tmpdir } from 'node:os';
 import type { DaemonSession } from '../src/core/types.js';
 import { config } from '../src/config.js';
 import { getBot, getBotClient } from '../src/bot-registry.js';
-import { updateMessage } from '../src/im/lark/client.js';
+import { updateMessage, MessageWithdrawnError } from '../src/im/lark/client.js';
 import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnReplyCard, updateReplyCardNativeThinking, prepareReplyCardNativeThinking, retireReplyCardDisplay, supersedeTurnReplyCard, __testOnlyDrainTurnReplyTools } from '../src/core/turn-reply-card.js';
 import { abortCotMessage, handleCotThinkingSuperseded, handleCotThinkingUpdate, finalizeCotMessage } from '../src/im/lark/cot-message.js';
-import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
+import { TurnReplyCardStore, ReplyCardWithdrawnError } from '../src/services/turn-reply-card.js';
+import { deliverStructuredNotice, StructuredNoticeCardPendingError } from '../src/services/structured-notice-delivery.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
 import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
@@ -39,7 +40,7 @@ describe('unified replies with an independent native CoT channel', () => {
     vi.mocked(getBot).mockReturnValue(bot);
     request = vi.fn(async (req: any) => ({ code: 0, data: req.method === 'POST' ? { cot_id: 'cot_native', message_id: 'om_cot' } : {} }));
     vi.mocked(getBotClient).mockReturnValue({ request } as any);
-    vi.mocked(updateMessage).mockClear();
+    vi.mocked(updateMessage).mockReset().mockResolvedValue(undefined);
     send = vi.fn(async (_body: string, _type: string, _uuid: string, beforeWrite: () => unknown) => {
       await beforeWrite(); return 'om_answer';
     });
@@ -556,6 +557,111 @@ describe('unified replies with an independent native CoT channel', () => {
     const record = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' });
     expect(record).toMatchObject({ phase: 'ambiguous', progress: ['Transcript unavailable'] });
   });
+
+  it('dedupes a durable structured notice when its daemon ACK is lost', async () => {
+    const worker = { send: vi.fn() };
+    const sessionStore = { updateSession: vi.fn() };
+    const scope: Record<string, any> = {
+      ds, worker, sessionStore, deliverStructuredNotice, StructuredNoticeCardPendingError,
+      TurnReplyCardStore, ReplyCardWithdrawnError, config,
+      t: 'fixture', logger: { warn: vi.fn(), error: vi.fn() },
+      emitSessionLifecycleHook: vi.fn(), managedAuxUiSuppressed: () => false, ownsLifecycleMutation: () => true,
+      retireReplyCardDisplay,
+      scopedReply: (body: string, type: string, _turn: string, opts: any) => send(body, type, opts.uuid, opts.beforeWrite),
+    };
+    scope.retireStructuredNoticeCard = loadWorkerPoolFunction('retireStructuredNoticeCard', scope);
+    const handle = loadWorkerPoolMessageHandlers(['user_notify'], scope, true);
+    const msg = { type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn',
+      message: 'Transcript unavailable', noticeId: 'a'.repeat(32) };
+    await handle(msg);
+    await handle(msg); // same UUID after the first ACK was not observed by the worker
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(worker.send).toHaveBeenCalledTimes(2);
+    expect(worker.send).toHaveBeenCalledWith({
+      type: 'structured_turn_not_collected_ack', turnId: 'om_turn', noticeId: 'a'.repeat(32),
+    });
+    expect(ds.session.turnNotices).toHaveLength(1);
+    expect(ds.session.turnNotices?.[0]?.delivery).toMatchObject({ uuid: msg.noticeId, state: 'delivered' });
+    expect(new TurnReplyCardStore(dir).read({
+      larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+    })).toMatchObject({ phase: 'ambiguous', progress: ['Transcript unavailable'] });
+  });
+
+  it('keeps an unknown warning PATCH on the card and withholds ACK until its replay succeeds', async () => {
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    const worker = { send: vi.fn() };
+    const sessionStore = { updateSession: vi.fn() };
+    const textRetry = vi.fn(async () => {});
+    const scope: Record<string, any> = {
+      ds, worker, sessionStore, deliverStructuredNotice, StructuredNoticeCardPendingError,
+      TurnReplyCardStore, ReplyCardWithdrawnError, config,
+      turnNoticeOutbox: { deliver: textRetry }, turnNoticeHost: vi.fn(),
+      t: 'fixture', logger: { warn: vi.fn(), error: vi.fn() },
+      emitSessionLifecycleHook: vi.fn(), managedAuxUiSuppressed: () => false, ownsLifecycleMutation: () => true,
+      retireReplyCardDisplay,
+      scopedReply: (body: string, type: string, _turn: string, opts: any) => send(body, type, opts.uuid, opts.beforeWrite),
+    };
+    scope.retireStructuredNoticeCard = loadWorkerPoolFunction('retireStructuredNoticeCard', scope);
+    const handle = loadWorkerPoolMessageHandlers(['user_notify'], scope, true);
+    const msg = { type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn',
+      message: 'Transcript unavailable', noticeId: 'a'.repeat(32) };
+    vi.mocked(updateMessage).mockRejectedValue(new Error('socket hang up'));
+    await handle(msg);
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(textRetry).not.toHaveBeenCalled();
+    expect(ds.session.turnNotices?.[0]?.delivery.state).toBe('pending');
+    expect(new TurnReplyCardStore(dir).read({
+      larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+    })?.pendingPatch).toBeDefined();
+
+    vi.mocked(updateMessage).mockResolvedValue(undefined);
+    await handle(msg);
+    expect(textRetry).not.toHaveBeenCalled();
+    expect(worker.send).toHaveBeenCalledOnce();
+    expect(worker.send).toHaveBeenCalledWith({
+      type: 'structured_turn_not_collected_ack', turnId: 'om_turn', noticeId: msg.noticeId,
+    });
+    const retired = new TurnReplyCardStore(dir).read({
+      larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+    });
+    expect(retired).toMatchObject({ phase: 'ambiguous', progress: ['Transcript unavailable'] });
+    expect(retired?.pendingPatch).toBeUndefined();
+  }, 10_000);
+
+  it('uses the stable-UUID text outbox after a definitive human card withdrawal', async () => {
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    const worker = { send: vi.fn() };
+    const sessionStore = { updateSession: vi.fn() };
+    const textRetry = vi.fn(async () => {});
+    const scope: Record<string, any> = {
+      ds, worker, sessionStore, deliverStructuredNotice, StructuredNoticeCardPendingError,
+      TurnReplyCardStore, ReplyCardWithdrawnError, config,
+      turnNoticeOutbox: { deliver: textRetry }, turnNoticeHost: vi.fn(() => ({})),
+      t: 'fixture', logger: { warn: vi.fn(), error: vi.fn() },
+      emitSessionLifecycleHook: vi.fn(), managedAuxUiSuppressed: () => false, ownsLifecycleMutation: () => true,
+      retireReplyCardDisplay,
+      scopedReply: (body: string, type: string, _turn: string, opts: any) => send(body, type, opts.uuid, opts.beforeWrite),
+    };
+    scope.retireStructuredNoticeCard = loadWorkerPoolFunction('retireStructuredNoticeCard', scope);
+    const handle = loadWorkerPoolMessageHandlers(['user_notify'], scope, true);
+    const msg = { type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn',
+      message: 'Transcript unavailable', noticeId: 'a'.repeat(32) };
+    vi.mocked(updateMessage).mockRejectedValue(new MessageWithdrawnError());
+    await handle(msg);
+    await handle(msg);
+
+    expect(textRetry).toHaveBeenCalledTimes(2);
+    expect(textRetry.mock.calls.every(([, id]) => id === msg.noticeId)).toBe(true);
+    expect(worker.send).toHaveBeenCalledTimes(2);
+    expect(worker.send).toHaveBeenCalledWith({
+      type: 'structured_turn_not_collected_ack', turnId: 'om_turn', noticeId: msg.noticeId,
+    });
+    expect(new TurnReplyCardStore(dir).read({
+      larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+    })?.withdrawn).toBe(true);
+    expect(send).toHaveBeenCalledOnce();
+  }, 15_000);
 
   it('still persists retirement when the preceding buffered tool PATCH exhausts its retries', async () => {
     bot.config.cotEnabled = true;

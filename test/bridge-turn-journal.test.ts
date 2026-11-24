@@ -25,6 +25,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   appendBridgeTurnJournalEntry,
+  acknowledgeBridgeTurnNotice,
+  stageBridgeTurnNotice,
   BRIDGE_TURN_RECOVERY_MAX_BYTES,
   BridgeRestoreGate,
   claimRetiredGenerationEntries,
@@ -148,6 +150,32 @@ describe('bridge turn journal file ops', () => {
     expect(kept.at(-1)!.turnId).toBe('t49');
     // Sanity: the payload really is a single JSON object, not an append log.
     expect(JSON.parse(readFileSync(path, 'utf8')).version).toBe(1);
+  });
+
+  it('pins a staged notice until exact ACK without ever restoring its business owner', () => {
+    const noticeId = 'a'.repeat(32);
+    appendBridgeTurnJournalEntry(path, entry({ turnId: 'om_notice', fingerprint: 'question' }));
+    stageBridgeTurnNotice(path, { turnId: 'om_notice', noticeId, message: 'Open the Web terminal', createdAtMs: 1_000_100 });
+    expect(readBridgeTurnJournal(path)[0]?.pendingNotice).toEqual({
+      noticeId, message: 'Open the Web terminal', createdAtMs: 1_000_100,
+    });
+    expect(selectRestorableBridgeTurns(readBridgeTurnJournal(path), {
+      currentJsonlPath: '/tmp/session.jsonl', nowMs: 1_000_100,
+    })).toEqual([]);
+
+    // Ordinary lifecycle rewrites cannot silently discard the owed notice.
+    removeBridgeTurnJournalEntry(path, 'om_notice');
+    clearBridgeTurnJournal(path);
+    expect(readBridgeTurnJournal(path)[0]?.pendingNotice?.noticeId).toBe(noticeId);
+    expect(() => stageBridgeTurnNotice(path, {
+      turnId: 'om_notice', noticeId: 'b'.repeat(32), message: 'conflict', createdAtMs: 1_000_101,
+    })).toThrow('bridge_notice_conflict');
+    acknowledgeBridgeTurnNotice(path, 'om_notice', 'b'.repeat(32));
+    expect(readBridgeTurnJournal(path)[0]?.pendingNotice?.noticeId).toBe(noticeId);
+
+    acknowledgeBridgeTurnNotice(path, 'om_notice', noticeId);
+    expect(readBridgeTurnJournal(path)).toEqual([]);
+    expect(existsSync(path)).toBe(false);
   });
 });
 

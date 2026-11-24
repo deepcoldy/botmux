@@ -17,6 +17,7 @@ import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 import { writeFakeDoubaoTui } from './helpers/fake-doubao-tui.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
+import { readBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 let child: ChildProcess | undefined;
@@ -84,7 +85,15 @@ function startScenario() {
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
-  child.on('message', raw => messages.push(raw as WorkerToDaemon));
+  child.on('message', raw => {
+    const msg = raw as WorkerToDaemon;
+    messages.push(msg);
+    if (msg.type === 'user_notify' && msg.kind === 'structured_turn_not_collected' && msg.noticeId && msg.turnId) {
+      child?.send({ type: 'structured_turn_not_collected_ack', turnId: msg.turnId, noticeId: msg.noticeId });
+    } else if (msg.type === 'turn_display_retired' && msg.noticeId) {
+      child?.send({ type: 'structured_turn_not_collected_ack', turnId: msg.turnId, noticeId: msg.noticeId });
+    }
+  });
   child.stdout?.on('data', data => logs.push(data.toString()));
   child.stderr?.on('data', data => logs.push(data.toString()));
   sessionName = TmuxBackend.sessionName(sessionId);
@@ -131,6 +140,11 @@ describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('structured tran
       type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn_1',
     });
     expect(typeof s.notices('om_turn_1')[0]?.message).toBe('string');
+    expect(s.notices('om_turn_1')[0]?.noticeId).toMatch(/^[a-f0-9]{32}$/);
+    const journal = join(s.dataDir, 'turn-marks', `${s.sessionId}.json.structured`);
+    await s.waitUntil(() => !readBridgeTurnJournal(journal).some(entry => entry.pendingNotice), 'daemon ACK clears notice journal');
+    await pause(5_500);
+    expect(s.notices('om_turn_1')).toHaveLength(1);
     expect(s.finals('om_turn_1')).toEqual([]);
 
     s.clear('no-trajectory');

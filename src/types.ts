@@ -2281,6 +2281,7 @@ type DaemonToWorkerBase =
   | { type: 'execution_contract_assigned'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   | import('./services/universal-output-handoff.js').OutputHandoffReceipt
   | import('./services/final-output-handoff.js').FinalOutputAccepted
+  | { type: 'structured_turn_not_collected_ack'; turnId: string; noticeId: string }
   | { type: 'deployment_continuation_cancelled'; requestId: string; ok: boolean }
   | { type: 'codex_cli_effort'; requestId: string; effort: string; deadline: number }
   | { type: 'codex_cli_effort_cancel'; requestId: string }
@@ -2943,7 +2944,7 @@ export type WorkerToDaemonBase =
    * bridges. Cosmetic channel: it must never influence turn
    * settlement, final_output attribution, or durable receipts. */
   /** Cosmetic closure when a structured attribution lease retires without a task terminal. */
-  | { type: 'turn_display_retired'; turnId: string; dispatchAttempt?: number; message: string; silent?: boolean }
+  | { type: 'turn_display_retired'; turnId: string; dispatchAttempt?: number; message: string; silent?: boolean; noticeId?: string }
   | { type: 'thinking_update'; sessionId?: string; entries: CotEntry[]; turnId: string; dispatchAttempt?: number }
   /** A confirmed steer retired this exact timeline. Cosmetic only: this is
    * not a turn_terminal or a successful durable-delivery receipt. */
@@ -3020,6 +3021,9 @@ export type WorkerToDaemonBase =
          *  (restart-interruption.ts). During a backend outage the daemon folds
          *  it into the topic's single outage status card. */
         | 'restart_interruption';
+      /** Durable missing-final notice UUID. The worker retries until the daemon's
+       * persisted notice record acknowledges it; older notices omit this field. */
+      noticeId?: string
       /** Permission prompt persisted across fresh worker captures; no daemon-side grace needed. */
       permissionPromptStable?: boolean;
       /** Bounded plain-text bottom of the screen for an input_not_submitted
