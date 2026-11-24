@@ -5,7 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { checkCollabGateAdmission, collabCommandExempt } from '../src/core/collab-gate-admission.js';
+import { checkCollabGateAdmission, collabCommandExempt, collabGateAdmissionDecision } from '../src/core/collab-gate-admission.js';
 import { classifySlash } from '../src/core/command-router.js';
 import { buildInitialCollabGate, writeCollabGate, patchCollabGate } from '../src/services/collab-gate-store.js';
 import { readCollabChatQueue } from '../src/services/collab-chat-queue-store.js';
@@ -159,6 +159,19 @@ describe('F1：真实 classifySlash → gate 用例', () => {
     const d = classifySlash({ ...input, text: '/compact', passthrough: new Set(['/compact']) });
     expect(d.kind).toBe('passthrough');
     expect(collabCommandExempt(d)).toBe(false);
+  });
+
+  it('真实 thread 命令接缝：collabGateAdmissionDecision 对 /compact（passthrough）block:true', () => {
+    // thread context 的 /compact → passthrough，gate initializing + talk allowed → block。
+    const threadInput = { ...input, context: 'thread' as const, phase: 'running' as const, passthrough: new Set(['/compact']) };
+    const d = classifySlash({ ...threadInput, text: '/compact' });
+    expect(d.kind).toBe('passthrough');
+    const g = gate({ phase: 'initializing' });
+    const r = collabGateAdmissionDecision({
+      dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk, gate: g,
+      slashDecision: d, sourceMessageId: 'om_compact', routingEvent: { chatId: CHAT, messageId: 'om_compact', content: '/compact', resources: [] },
+    });
+    expect(r.block).toBe(true); // 未 open，/compact 被拦（不投递 CLI）
   });
 });
 

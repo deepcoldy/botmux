@@ -21,6 +21,34 @@ import type { TalkEvaluation } from '../im/lark/event-dispatcher.js';
 import type { SlashRouteDecision } from './command-router.js';
 import type { CollabGateFile, SessionGroupCollaborationConfig } from '../services/collab-group-config.js';
 
+/**
+ * 有类型、可序列化的规范化重放事件（F2 残留）：重放时恢复原准入所需的完整身份与路由上下文。
+ * 四个构造点复用同一结构，恢复时用原 source facts 重新授权/分类，不序列化过期能力。
+ */
+export interface NormalizedCollabRoutingEvent {
+  chatId: string;
+  messageId: string;
+  /** 原发送者 type（'user' | 'app' | 'bot' | …）。缺 type 不假定是真人。 */
+  senderType?: string;
+  senderOpenId?: string;
+  senderUnionId?: string;
+  /** 源应用身份（evaluateBotTalk 判定用）。 */
+  teamTrustAppId?: string;
+  teamTrustUnionId?: string;
+  /** bot 归属（isBotSenderType / isForeignBotSender）。 */
+  isBotSenderType?: boolean;
+  isForeignBotSender?: boolean;
+  chatType?: string;
+  scope?: string;
+  anchor?: string;
+  replyRootId?: string;
+  threadId?: string;
+  parentId?: string;
+  content: string;
+  mentions?: unknown;
+  resources: Array<{ type: string; key?: string; name: string; messageId?: string; fallbackMessageIds?: string[] }>;
+}
+
 export type CollabGateAdmissionResult =
   | { kind: 'not-collab' }
   | { kind: 'open' }
@@ -60,7 +88,7 @@ export interface CollabGateAdmissionOpts {
   config?: SessionGroupCollaborationConfig | undefined;
   now?: () => number;
   /** 规范化路由事件（持久化进队列，供重放）。 */
-  routingEvent?: unknown;
+  routingEvent?: NormalizedCollabRoutingEvent | unknown;
   /** 本轮消息 id（同 (targetAppId, sourceMessageId) 去重）。 */
   sourceMessageId?: string;
   enqueueImpl?: (dataDir: string, chatId: string, item: { sourceMessageId: string; targetAppId: string; routingEvent: unknown; deliveryStatus: 'pending'; enqueuedAt: number }) => boolean;
