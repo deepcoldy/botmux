@@ -66,6 +66,16 @@ worker 保留原 payload/token，daemon 保留 `pendingRawInput` 和 ACK gate。
 处理下一次输入触发的恢复，避免既没有 ACK 又没有可执行恢复所有者。
 关闭/暂停及转移中的会话不能由这条入口重新拉起。
 
+tokened raw activation 创建时，同一持久化序列把 literal raw 与 turnId 写入 optional
+`queuedActivationRawInput` / `queuedActivationRawTurnId`；runtime-only `pendingRawInput`
+在 prompt-ready 清空后仍有精确副本。daemon restore 与 queued activate 都从该副本重建
+`pendingRawInput`，所以 immediate raw 没有 `pendingRepoSetup` 也不会被空 opening 顶替。
+adapter submission ACK 到达时，这些字段随 activation journal 一并清理，无需数据迁移。
+
+parent-exit shutdown 在首个 RPC await 前提升 `cliRestartEpoch`、结算被取消的 restart callback
+并清理 restart timer。deferred title 与 deferred RPC-stop 交叠时，旧 replacement continuation
+也不能在退休期间重新拉起进程，避免与后继 activation 形成第二个重放所有者。
+
 CLI 物理退出不撤销已经送达的任务结果：没有新输入时仍保留 `delivered`；
 后来的输入使旧结果失效时才投影为中断。既有 attention 仍优先于已交付结果。
 跨 runtime 的物理退出仍要求可信 producer/channel；本次只补这条已有边界的回归。

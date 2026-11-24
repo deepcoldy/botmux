@@ -311,6 +311,48 @@ describe('startup circuit versus delayed / in-flight restart continuations', () 
     expect(h.scope.spawnCli).toHaveBeenCalledTimes(2);
     expect(h.scope.sendFatalWorkerErrorAndExit).not.toHaveBeenCalled();
   });
+  it('cancels an old restart continuation before parent-exit waits for RPC teardown', async () => {
+    const h = harness('codex');
+    const title = deferred();
+    const rpcStop = deferred();
+    h.scope.prepareCodexNativeTitleGeneration.mockImplementationOnce(() => title.promise);
+    await h.restart();
+    await vi.advanceTimersToNextTimerAsync();
+    expect(h.scope.spawnCli).toHaveBeenCalledOnce();
+    expect(h.scope.cliRestartInProgress).toBe(true);
+    h.scope.backend = null; // replacement's second startup failure
+    Object.assign(h.scope, {
+      stopScreenshotLoop: vi.fn(),
+      codexRpcEngine: { stopAndWait: vi.fn(() => rpcStop.promise) },
+      armRpcStartupDialogDismiss: vi.fn(),
+      saveUnsentInputsForSuccessor: vi.fn(),
+      sandboxTreeOutlivesWorker: false,
+      cliOutlivesWorker: false,
+      currentBotmuxTurnId: null,
+      isCodexAppCliId: () => false,
+      handsCliPidMarkerToSuccessor: () => false,
+      cleanup: vi.fn(),
+      process: { exit: vi.fn() },
+    });
+    const shutdown = loadWorkerFunction<(reason: string, code: number) => Promise<void>>(
+      'shutdownWorkerForParentExitImpl', h.scope,
+    );
+    const stopped = shutdown('SIGTERM', 0);
+    const killCallsBeforeShutdown = h.scope.killCli.mock.calls.length;
+    expect(h.scope.codexRpcEngine.stopAndWait).toHaveBeenCalledOnce();
+    expect(h.scope.process.exit).not.toHaveBeenCalled();
+
+    title.resolve();
+    await title.promise;
+    await vi.runAllTimersAsync();
+    expect(h.scope.spawnCli).toHaveBeenCalledOnce();
+    expect(h.scope.sendFatalWorkerErrorAndExit).not.toHaveBeenCalled();
+
+    rpcStop.resolve();
+    await stopped;
+    expect(h.scope.killCli).toHaveBeenCalledTimes(killCallsBeforeShutdown + 1);
+    expect(h.scope.process.exit).toHaveBeenCalledWith(0);
+  });
 });
 
 

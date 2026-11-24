@@ -43332,6 +43332,14 @@ function shutdownWorkerForParentExit(reason: string, exitCode = 0): void {
 }
 
 async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Promise<void> {
+  // Retirement starts before the first await. A title/plugin/teardown continuation
+  // may otherwise respawn a replacement while RPC shutdown is still waiting,
+  // reviving the generation this process is supposed to retire.
+  ++cliRestartEpoch;
+  const cancelRestart = cancelPendingCliRestart;
+  cancelPendingCliRestart = undefined;
+  cancelRestart?.();
+  if (tmuxRestartTimer) { clearTimeout(tmuxRestartTimer); tmuxRestartTimer = null; }
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);

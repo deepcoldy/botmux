@@ -1087,6 +1087,7 @@ import {
   type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { retainQueuedActivationRawInput } from './pending-repo-journal.js';
 import { failedTurnRewindInFlight, mergeFailedTurnInput, planFailedTurnRewind, turnAnswersInChat } from './failed-turn-rewind.js';
 import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
 import { BackendOutageCoordinator, recoveryEligibility, type BackendOutageDeps, type BackendOutageTimings } from './backend-outage-coordinator.js';
@@ -17341,6 +17342,8 @@ type QueuedWorkerForkSnapshot = {
   queuedActivationPending: Session['queuedActivationPending'];
   queuedActivationToken: Session['queuedActivationToken'];
   queuedActivationInput: Session['queuedActivationInput'];
+  queuedActivationRawInput: Session['queuedActivationRawInput'];
+  queuedActivationRawTurnId: Session['queuedActivationRawTurnId'];
   queuedActivationTurnId: Session['queuedActivationTurnId'];
   queuedActivationDispatchAttempt: Session['queuedActivationDispatchAttempt'];
   queuedActivationResume: Session['queuedActivationResume'];
@@ -17352,6 +17355,8 @@ type QueuedActivationJournalSnapshot = Pick<
   | 'queuedActivationPending'
   | 'queuedActivationToken'
   | 'queuedActivationInput'
+  | 'queuedActivationRawInput'
+  | 'queuedActivationRawTurnId'
   | 'queuedActivationTurnId'
   | 'queuedActivationDispatchAttempt'
   | 'queuedActivationResume'
@@ -17366,6 +17371,8 @@ function snapshotQueuedActivationJournal(session: Session): QueuedActivationJour
     queuedActivationPending: session.queuedActivationPending,
     queuedActivationToken: session.queuedActivationToken,
     queuedActivationInput: session.queuedActivationInput,
+    queuedActivationRawInput: session.queuedActivationRawInput,
+    queuedActivationRawTurnId: session.queuedActivationRawTurnId,
     queuedActivationTurnId: session.queuedActivationTurnId,
     queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
     queuedActivationResume: session.queuedActivationResume,
@@ -17389,6 +17396,8 @@ function clearQueuedActivationJournal(session: Session): void {
   session.queuedActivationPending = undefined;
   session.queuedActivationToken = undefined;
   session.queuedActivationInput = undefined;
+  session.queuedActivationRawInput = undefined;
+  session.queuedActivationRawTurnId = undefined;
   session.queuedActivationTurnId = undefined;
   session.queuedActivationDispatchAttempt = undefined;
   session.queuedActivationResume = undefined;
@@ -20014,6 +20023,8 @@ function forkWorkerPrepared(
         queuedActivationPending: ds.session.queuedActivationPending,
         queuedActivationToken: ds.session.queuedActivationToken,
         queuedActivationInput: ds.session.queuedActivationInput,
+        queuedActivationRawInput: ds.session.queuedActivationRawInput,
+        queuedActivationRawTurnId: ds.session.queuedActivationRawTurnId,
         queuedActivationTurnId: ds.session.queuedActivationTurnId,
         queuedActivationDispatchAttempt: ds.session.queuedActivationDispatchAttempt,
         queuedActivationResume: ds.session.queuedActivationResume,
@@ -20277,6 +20288,12 @@ function forkWorkerPrepared(
       migrated = true;
     }
     if (migrated) sessionStore.updateSession(ds.session);
+  }
+  if (queuedActivationToken && ds.pendingRawInput) {
+    // Runtime-only pendingRawInput is cleared at prompt_ready. Persist the exact
+    // literal command with the activation journal so immediate raw starts can
+    // also rebuild it after a daemon restart; the ACK clears this copy.
+    retainQueuedActivationRawInput(ds.session, ds.pendingRawInput, ds.pendingRawTurnId ?? ds.session.queuedActivationTurnId);
   }
 
   // Snapshot the prior durable FIFO before accepting this fork's new prompt.

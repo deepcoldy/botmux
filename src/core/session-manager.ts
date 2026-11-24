@@ -98,7 +98,7 @@ import {
   larkTransportEnabled,
 } from './types.js';
 import type { DaemonSession, GroupJoinContext } from './types.js';
-import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
+import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime, restoreQueuedActivationRawInput } from './pending-repo-journal.js';
 import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
 import { noteTurnStarted } from './turn-outcome.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
@@ -3412,6 +3412,8 @@ export async function restoreActiveSessions(
             queuedActivationPending: session.queuedActivationPending,
             queuedActivationToken: session.queuedActivationToken,
             queuedActivationInput: session.queuedActivationInput,
+            queuedActivationRawInput: session.queuedActivationRawInput,
+            queuedActivationRawTurnId: session.queuedActivationRawTurnId,
             queuedActivationTurnId: session.queuedActivationTurnId,
             queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
             queuedActivationResume: session.queuedActivationResume,
@@ -3423,6 +3425,8 @@ export async function restoreActiveSessions(
           session.queuedActivationPending = undefined;
           session.queuedActivationToken = undefined;
           session.queuedActivationInput = undefined;
+          session.queuedActivationRawInput = undefined;
+          session.queuedActivationRawTurnId = undefined;
           session.queuedActivationTurnId = undefined;
           session.queuedActivationDispatchAttempt = undefined;
           session.queuedActivationResume = undefined;
@@ -3470,6 +3474,7 @@ export async function restoreActiveSessions(
         pendingAttachments: session.queuedAttachments,
         currentTurnTitle: session.currentTurnTitle ?? session.title,
       };
+      restoreQueuedActivationRawInput(ds);
       const restoredPendingRepo = restorePendingRepoRuntime(ds);
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
@@ -3623,8 +3628,10 @@ export async function restoreActiveSessions(
     // Literal pending-repo passthroughs have an empty init prompt and therefore
     // no Codex ledger entry. Their setup journal is the exact replay owner; the
     // recovered worker sends it at prompt_ready with the retained token.
-    if (session.queuedActivationPending && session.pendingRepoSetup?.rawInput) {
+    restoreQueuedActivationRawInput(ds);
+    if (ds.pendingRawInput === undefined && session.queuedActivationPending && session.pendingRepoSetup?.rawInput) {
       ds.pendingRawInput = session.pendingRepoSetup.rawInput;
+      ds.pendingRawTurnId = session.pendingRepoSetup.turnId ?? session.queuedActivationTurnId;
     }
     try {
       const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
@@ -6482,6 +6489,8 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     ds.session.queuedActivationPending = undefined;
     ds.session.queuedActivationToken = undefined;
     ds.session.queuedActivationInput = undefined;
+    ds.session.queuedActivationRawInput = undefined;
+    ds.session.queuedActivationRawTurnId = undefined;
     ds.session.queuedActivationTurnId = undefined;
     ds.session.queuedActivationDispatchAttempt = undefined;
     ds.session.queuedActivationResume = undefined;
@@ -6509,6 +6518,7 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     try {
       const exactRetry = ds.session.queuedActivationInput;
       if (exactRetry) {
+        restoreQueuedActivationRawInput(ds);
         forkWorker(ds, exactRetry, {
           resume: ds.session.queuedActivationResume ?? ds.hasHistory,
           turnId: ds.session.queuedActivationTurnId,

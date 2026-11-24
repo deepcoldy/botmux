@@ -845,6 +845,11 @@ export interface Session {
   /** Exact final worker input retained for retry. This may include a triggering
    * group reply in addition to the original dashboard backlog prompt. */
   queuedActivationInput?: CliTurnPayload;
+  /** Literal raw opening retained while its activation has no submission ACK.
+   * Unlike pendingRawInput, this survives daemon restart and immediate raw starts
+   * that never had a pendingRepoSetup. Cleared with the activation journal. */
+  queuedActivationRawInput?: string;
+  queuedActivationRawTurnId?: string;
   queuedActivationTurnId?: string;
   queuedActivationDispatchAttempt?: number;
   /** Frozen resume mode for the exact journal head. Backlog activations are

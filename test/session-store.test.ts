@@ -3473,6 +3473,8 @@ describe('reactivateClosedSession()', () => {
     legacy.queuedActivationPending = true;
     legacy.queuedActivationToken = 'legacy-token';
     legacy.queuedActivationInput = { content: 'legacy head' };
+    legacy.queuedActivationRawInput = '/goal legacy raw';
+    legacy.queuedActivationRawTurnId = 'legacy-raw-turn';
     legacy.queuedActivationTail = [{
       id: 'legacy-tail', order: 1, userPrompt: 'tail', cliInput: { content: 'legacy tail' }, turnId: 'tail-turn',
     }];
@@ -3502,6 +3504,8 @@ describe('reactivateClosedSession()', () => {
     expect(reloaded.queuedActivationPending).toBeUndefined();
     expect(reloaded.queuedActivationToken).toBeUndefined();
     expect(reloaded.queuedActivationInput).toBeUndefined();
+    expect(reloaded.queuedActivationRawInput).toBeUndefined();
+    expect(reloaded.queuedActivationRawTurnId).toBeUndefined();
     expect(reloaded.queuedActivationTail).toBeUndefined();
     expect(reloaded.principalLaneQueuedTurns).toBeUndefined();
   });
