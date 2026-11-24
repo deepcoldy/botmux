@@ -55,14 +55,31 @@ interface RegexGroup {
   choices: boolean;
   wide: boolean;
   adjacentVariableWidths: number;
+  initialAdjacentVariableWidths: number;
+  alternateAdjacentVariableWidths: number;
+}
+
+interface RegexAtom {
+  choices: boolean;
+  wide: boolean;
+  variableTail: boolean;
+  initialAdjacentVariableWidths?: number;
+}
+
+function regexGroup(adjacentVariableWidths: number): RegexGroup {
+  return {
+    choices: false, wide: false, adjacentVariableWidths,
+    initialAdjacentVariableWidths: adjacentVariableWidths,
+    alternateAdjacentVariableWidths: 0,
+  };
 }
 
 /** Reject obvious backtracking risks before testing a pattern. */
 function isSafeRegex(pattern: string): boolean {
-  const groups: RegexGroup[] = [{ choices: false, wide: false, adjacentVariableWidths: 0 }];
+  const groups: RegexGroup[] = [regexGroup(0)];
   let wideVariableWidths = 0;
   let totalVariableWidths = 0;
-  let atom: { wide: boolean; choices: boolean } | undefined;
+  let atom: RegexAtom | undefined;
   for (const [token] of pattern.matchAll(regexTokens)) {
     if (/^\\(?:[1-9]|k<)/.test(token)) return false;
     const group = groups[groups.length - 1]!;
@@ -75,35 +92,50 @@ function isSafeRegex(pattern: string): boolean {
         : quantifier[2] ? Number(quantifier[3] || Infinity) : min;
       if (atom.choices && max > 1) return false;
       if (min < max) {
+        // A quantified group adds a segment next to the prefix that was active
+        // on entry, even when fixed content hid that prefix inside the group.
+        if (atom.initialAdjacentVariableWidths !== undefined) {
+          group.adjacentVariableWidths = Math.max(group.adjacentVariableWidths, atom.initialAdjacentVariableWidths);
+        }
         group.choices = true;
         if (++group.adjacentVariableWidths >= 3 || ++totalVariableWidths > 8) return false;
         if (atom.wide && ++wideVariableWidths >= 3) return false;
-      } else {
+      } else if (!atom.variableTail || max === 0) {
+        // An identity quantifier does not turn a group's variable tail into a
+        // fixed-width separator. Other fixed repetitions do separate segments.
         group.adjacentVariableWidths = 0;
       }
       atom = undefined;
       continue;
     }
-    // A fixed-width atom separates adjacent variable-width segments. Track
-    // adjacency inside each group without clearing the parent group's count.
-    if (atom) group.adjacentVariableWidths = 0;
+    // Only a fixed tail separates adjacent variable-width segments. Group
+    // boundaries themselves are transparent to the adjacency scan.
+    if (atom && !atom.variableTail) group.adjacentVariableWidths = 0;
     atom = undefined;
     if (token.startsWith('(')) {
-      groups.push({ choices: false, wide: false, adjacentVariableWidths: 0 });
+      groups.push(regexGroup(group.adjacentVariableWidths));
     } else if (token === ')' && groups.length > 1) {
-      atom = groups.pop()!;
+      const inner = groups.pop()!;
       const outer = groups[groups.length - 1]!;
-      outer.choices ||= atom.choices;
-      outer.wide ||= atom.wide;
+      const tail = Math.max(inner.adjacentVariableWidths, inner.alternateAdjacentVariableWidths);
+      outer.adjacentVariableWidths = tail;
+      if (tail >= 3) return false;
+      outer.choices ||= inner.choices;
+      outer.wide ||= inner.wide;
+      atom = {
+        choices: inner.choices, wide: inner.wide, variableTail: tail > 0,
+        initialAdjacentVariableWidths: inner.initialAdjacentVariableWidths,
+      };
     } else if (token === '|') {
       group.choices = true;
-      group.adjacentVariableWidths = 0;
+      group.alternateAdjacentVariableWidths = Math.max(group.alternateAdjacentVariableWidths, group.adjacentVariableWidths);
+      group.adjacentVariableWidths = group.initialAdjacentVariableWidths;
       if (groups.length === 1) {
         wideVariableWidths = 0;
         totalVariableWidths = 0;
       }
     } else {
-      atom = { wide: isWideRegexAtom(token), choices: false };
+      atom = { wide: isWideRegexAtom(token), choices: false, variableTail: false };
       group.wide ||= atom.wide;
     }
   }

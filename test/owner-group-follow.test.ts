@@ -470,6 +470,14 @@ describe('owner follow policy validation', () => {
     'a?[a]?'.repeat(12) + 'a'.repeat(24),
     String.raw`[\S]+x\D+y[\x00-\xff]+z`,
     'a?b'.repeat(9),
+    '(a*a*)(a*a*)f',
+    '(a*a*)(a*a*)(a*a*)(a*a*)f',
+    'a*(a*b*)',
+    'a*a*(a*b)',
+    '(a*b*)?',
+    '(a*b*){2}',
+    '(a*b*){1}a*',
+    'a*(a*|b)c*',
   ])
     ('rejects high-risk regex %s and skips evaluation if it was not normalized', pattern => {
       const rule = { ...includeAlert, op: 'regex', pattern } as const;
@@ -482,6 +490,7 @@ describe('owner follow policy validation', () => {
     String.raw`(?:\d{2}:){2}\d{2}`, '(?:[0-9a-f]{4}-){3}', '(?:[A-Z]{2}-)+', '(?i:alert){2}',
     String.raw`\d+-\d+-\d+`, String.raw`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}`,
     '[0-9]+-[0-9]+-[0-9]+', 'a?b'.repeat(8) + '|' + 'c?d'.repeat(8), '(?:a??b){1}',
+    '(a*b*){1}', 'a*(a*b){1}', '(a*|b)c*',
   ])
     ('accepts safe regex %s', pattern => {
       expect(validateOwnerGroupFollowRule({ ...includeAlert, op: 'regex', pattern })).toBeUndefined();
