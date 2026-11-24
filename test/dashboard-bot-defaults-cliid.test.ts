@@ -2505,6 +2505,47 @@ describe('reply-card usage display mode', () => {
     expect(renderer.root.findByProps({ 'data-card-pref-status': '' }).children.join(''))
       .toContain('write_failed');
   });
+
+  it('toggles showUsageQuota independently, rolls back on error, and hides when usageSupported is false', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, unknown>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_quota', usageSupported: true },
+        putCardPref,
+      }));
+    });
+    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-show-usage-quota' });
+    expect(toggle().props.checked).toBe(true);
+
+    await act(async () => {
+      toggle().props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenLastCalledWith({ showUsageQuota: false });
+    expect(toggle().props.checked).toBe(false);
+
+    // Rollback on failure
+    putCardPref.mockResolvedValueOnce({ ok: false, status: 500, body: { error: 'write_failed' } });
+    await act(async () => {
+      toggle().props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+    expect(toggle().props.checked).toBe(false);
+
+    // Hidden when usageSupported is false
+    act(() => {
+      renderer.update(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_quota', usageSupported: false },
+        putCardPref,
+      }));
+    });
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-show-usage-quota' })).toHaveLength(0);
+  });
 });
 
 describe('card behavior defaults', () => {

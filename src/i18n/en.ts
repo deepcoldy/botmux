@@ -1187,6 +1187,7 @@ export const messages: Record<string, string> = {
   'config.label.disableStreamingCard': 'Disable live card',
   'config.label.pinStreamingCard': 'Pin live card',
   'config.label.usageDisplay': 'Usage display',
+  'config.label.showUsageQuota': 'Show account quota (5h / 7d)',
   'config.label.silentTurnReactions': 'Disable status reactions',
   'config.label.writableTerminalLinkInCard': 'Writable terminal in card',
   'config.label.privateCard': 'Private snapshot card',

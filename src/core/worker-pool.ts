@@ -291,7 +291,7 @@ import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, 
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
-import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay, resolveShowUsageQuota } from '../bot-registry.js';
 import { assistantInitFields } from './assistant-mode.js';
 import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from '../im/lark/streaming-card-buttons.js';
 import { resolveSubstituteCardControl, type SubstituteCardControl } from '../im/lark/substitute-card-control.js';
@@ -697,6 +697,8 @@ function readDaemonSessionUsageSnapshot(
       ?? ds.adoptedFrom?.cliId
       ?? getBot(ds.larkAppId).config.cliId
     ) as CliId;
+    const larkAppId = ds.larkAppId ?? ds.session.larkAppId;
+    const showUsageQuota = larkAppId ? resolveShowUsageQuota(larkAppId) : true;
     const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
     if (backendType === 'remote-runner') {
       const usage = normalizeRemoteRunnerUsageReport(ds.session.remoteRunnerUsage);
@@ -726,13 +728,13 @@ function readDaemonSessionUsageSnapshot(
       // sandboxed bots (same as the ledger and dashboard-row readers). Without
       // it a read-isolated bot's transcript is invisible and the card shows no
       // usage even though it exists under BOT_HOME.
-      larkAppId: ds.larkAppId ?? ds.session.larkAppId,
+      larkAppId,
       // Reply cards read at the exact turn boundary (fresh); the live streaming
       // card refreshes on every status tick and rides the reader's reparse
       // throttle instead (fresh:false) to stay off the disk.
       fresh: opts?.fresh ?? true,
       // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
-      pricing: resolvePricingForBot(ds.larkAppId ?? ds.session.larkAppId),
+      pricing: resolvePricingForBot(larkAppId),
     });
     // Claude Code / Antigravity statusline 快照（`botmux statusline` 落盘的 ctx / 5h / 7d 百分比）：
     // 回复卡页脚、流式卡用量行、IPC /usage 三个读取点都经本函数，只在这里合并一次。
@@ -747,7 +749,7 @@ function readDaemonSessionUsageSnapshot(
         });
         const expectedModel = resolveExpectedStatuslineModel(ds);
         if (snap && isStatuslineModelCompatible(resolvedCliId, snap.model, expectedModel)) {
-          const quota = toCardQuota(snap);
+          const quota = toCardQuota(snap, { includeRateLimits: showUsageQuota });
           if (quota) return { ...snapshot, quota };
         }
       } catch { /* best-effort */ }

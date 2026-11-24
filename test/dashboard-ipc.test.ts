@@ -4344,6 +4344,36 @@ describe('PUT /api/bot-card-prefs — reply-card usage display mode', () => {
       expect(off.status).toBe(200);
       expect(await off.json()).toMatchObject({ ok: true, usageDisplay: 'off' });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBe('off');
+
+      // showUsageQuota defaults to true, persists explicit false, drops key on true, rejects non-boolean.
+      expect(initial.showUsageQuota).toBe(true);
+      const quotaOff = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ showUsageQuota: false }),
+      });
+      expect(quotaOff.status).toBe(200);
+      expect(await quotaOff.json()).toMatchObject({ ok: true, showUsageQuota: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].showUsageQuota).toBe(false);
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ showUsageQuota: false });
+
+      const quotaBad = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ showUsageQuota: 'off' }),
+      });
+      expect(quotaBad.status).toBe(400);
+      expect(await quotaBad.json()).toMatchObject({ ok: false, error: 'invalid_show_usage_quota' });
+
+      const quotaOn = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ showUsageQuota: true }),
+      });
+      expect(quotaOn.status).toBe(200);
+      expect(await quotaOn.json()).toMatchObject({ ok: true, showUsageQuota: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].showUsageQuota).toBeUndefined();
     } finally {
       if (handle) await handle.close();
       handle = null;

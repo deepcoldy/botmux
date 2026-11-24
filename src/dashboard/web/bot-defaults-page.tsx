@@ -664,6 +664,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     ...Object.fromEntries(REPLY_FOOTER_KEYS.map(key => [key, body[key] !== false])),
     showReplyTiming: body.showReplyTiming,
     usageDisplay: body.usageDisplay,
+    showUsageQuota: body.showUsageQuota !== false,
     disableStreamingCard: body.disableStreamingCard,
     replyCardMode: body.replyCardMode,
     hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
@@ -6591,6 +6592,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [showTiming, setShowTiming] = useState(bot.showReplyTiming === true);
   useEffect(() => { setFooterPrefs(normalizeReplyFooter(bot)); setShowTiming(bot.showReplyTiming === true); }, [bot.replyFooterEnabled, bot.replyFooterBrand, bot.replyFooterModel, bot.replyFooterUsage, bot.replyFooterRecipients, bot.replyFooterVoice, bot.showReplyTiming]);
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
+  const [showUsageQuota, setShowUsageQuota] = useState(bot.showUsageQuota !== false);
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
   const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
@@ -6612,6 +6614,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
 
   useEffect(() => {
     setUsageDisplay(bot.usageDisplay ?? 'streaming');
+    setShowUsageQuota(bot.showUsageQuota !== false);
     setDisableStreaming(bot.disableStreamingCard === true);
     setReplyMode(bot.replyCardMode ?? 'legacy');
     setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
@@ -6628,7 +6631,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.showUsageQuota, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6907,6 +6910,21 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             </div>
           )}
           <div className="bd-card-control-list">
+            {bot.usageSupported === true && (
+              <ToggleRow
+                checked={showUsageQuota}
+                disabled={busy !== null}
+                dataAction="toggle-show-usage-quota"
+                title={tr('botDefaults.showUsageQuota')}
+                description={tr('botDefaults.showUsageQuotaDescription')}
+                help={tr('botDefaults.showUsageQuotaHelp')}
+                onChange={checked => {
+                  const previous = showUsageQuota;
+                  setShowUsageQuota(checked);
+                  void savePatch({ showUsageQuota: checked }, 'showUsageQuota', () => setShowUsageQuota(previous));
+                }}
+              />
+            )}
             <ToggleRow
               checked={writableLink}
               disabled={busy !== null}

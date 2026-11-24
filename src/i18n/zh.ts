@@ -1184,6 +1184,7 @@ export const messages: Record<string, string> = {
   'config.label.disableStreamingCard': '关闭实时卡片',
   'config.label.pinStreamingCard': '置顶实时卡片',
   'config.label.usageDisplay': '用量显示位置',
+  'config.label.showUsageQuota': '显示账号额度（5h / 7d）',
   'config.label.silentTurnReactions': '关闭状态 reaction',
   'config.label.writableTerminalLinkInCard': '卡内嵌可写终端',
   'config.label.privateCard': '私有快照卡',

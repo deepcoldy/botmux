@@ -89,6 +89,9 @@ vi.mock('../src/bot-registry.js', () => ({
   // Streaming-card usage gate reads this; 'streaming' lets the snapshot flow
   // (the reader then finds no transcript → empty snapshot, asserted below).
   resolveUsageDisplay: vi.fn(() => 'streaming'),
+  // Sibling per-bot display gate read by the same usage snapshot reader;
+  // default ON keeps 5h/7d quota segments in the synthesized snapshot.
+  resolveShowUsageQuota: vi.fn(() => true),
 }));
 
 vi.mock('../src/config.js', () => ({

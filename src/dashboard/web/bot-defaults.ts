@@ -190,7 +190,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.followUpReply', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
-      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
+      'botDefaults.usageDisplay', 'botDefaults.showUsageQuota', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
       'botDefaults.replyCardRecap',
       'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
       'botDefaults.replyFooterEnabled', 'botDefaults.replyFooterBrand', 'botDefaults.replyFooterModel',
@@ -514,6 +514,7 @@ export type BotDefaultsRow = {
   /** daemon 的默认后端：`backendType` 没有覆盖时会话实际用它（见 effectiveBackendType）。 */
   defaultBackendType?: string | null;
   usageDisplay?: 'streaming' | 'footer' | 'off';
+  showUsageQuota?: boolean;
   replyFooterEnabled?: boolean;
   replyFooterBrand?: boolean;
   replyFooterModel?: boolean;
