@@ -11,6 +11,7 @@ import { buildTurnReplyAskElements, turnReplyAskSummary } from '../src/im/lark/t
 import { _resetForTest, _getPending, applyAskForm, registerAsk, setCardDispatcher, setCanTalkChecker, submitAsk, submitAskForm, submitCustomReply, submitAskFromDesktop, toggleAsk, registerHostAsk } from '../src/core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest } from '../src/core/explicit-ask-continuation.js';
 import type { AskQuestion, CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
+import { t } from '../src/i18n/index.js';
 
 const questions: AskQuestion[] = [
   { prompt: 'AI introduced?', multiSelect: false, options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }], defaultSelectedKeys: [] },
@@ -168,6 +169,22 @@ describe('production broker and card callback', () => {
     expect(submitCustomReply({ askId: sent.askId, by: 'ou_requester', text: 'No, 0.5 days, extra note' })).toBe('accepted');
     expect(await result).toMatchObject({ answers: [[], [], []], comment: 'No, 0.5 days, extra note' });
     expect(await result).not.toHaveProperty('inputs');
+  });
+  // Questions are checked in order and the toast names the first one at fault, input fields included.
+  it.each([
+    ['数字超出范围', questions, { q0: 'no', q1: '30', q2: '' }, 'card.ask.toast.invalid_input', 2],
+    ['数字写成文字', questions, { q0: 'no', q1: 'abc', q2: '' }, 'card.ask.toast.invalid_input', 2],
+    ['文字超长', questions, { q0: 'no', q1: '1', q2: 'x'.repeat(51) }, 'card.ask.toast.invalid_input', 3],
+    ['必填数字没填', questions, { q0: 'no', q1: '', q2: '' }, 'card.ask.toast.unanswered', 2],
+    ['输入题在前、后面的单选也没选', [questions[1], questions[0]], { q0: 'abc' }, 'card.ask.toast.invalid_input', 1],
+    ['输入题都对、单选没选', [questions[1], questions[0]], { q0: '3' }, 'card.ask.toast.unanswered', 2],
+  ] as Array<[string, AskQuestion[], Record<string, string>, string, number]>)('输入表单提交失败（%s）：提示点名真正出错的那道题', async (_case, qs, form_value, key, n) => {
+    const result = registerAsk({ ...base, questions: qs }); await vi.advanceTimersByTimeAsync(0);
+    const response = await handleAskCardAction({ operator: { open_id: 'ou_requester' },
+      action: { value: { action: 'ask_form_submit', ask_id: sent.askId, nonce: sent.nonce }, form_value } } as any);
+    expect(response).toEqual({ toast: { type: 'warning', content: t(key, { n }) } });
+    expect(_getPending(sent.askId)?.settled).toBe(false);
+    expect(submitAskForm({ ...args(), values: qs === questions ? values : { q0: '3', q1: 'no' } })).toBe('accepted'); await result;
   });
   it('invalid callback only toasts, valid callback renders terminal form without losing inputs', async () => {
     const result = registerAsk(base); await vi.advanceTimersByTimeAsync(0);

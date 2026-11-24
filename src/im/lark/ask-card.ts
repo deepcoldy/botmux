@@ -1,4 +1,4 @@
-import { hasAskForm } from '../../core/ask-form.js';
+import { checkAskFormValues, hasAskForm, type AskFormProblem } from '../../core/ask-form.js';
 import { renderAskFormBody } from './ask-form-elements.js';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -239,9 +239,13 @@ function askDraftFits(draft: PendingAsk): boolean {
 function choiceProblemToast(
   questions: PendingAsk['questions'], selections: ReadonlyArray<ReadonlyArray<string>>, texts: ReadonlyArray<string | null>, locale: Locale,
 ): { toast: { type: string; content: string } } | undefined {
-  const problem = askChoiceProblem(questions, selections, texts);
+  return problemToast(askChoiceProblem(questions, selections, texts), locale);
+}
+
+function problemToast(problem: AskFormProblem | undefined, locale: Locale): { toast: { type: string; content: string } } | undefined {
   if (!problem) return undefined;
-  const key = problem.kind === 'too_many' ? 'card.ask.toast.too_many' : 'card.ask.toast.unanswered';
+  const key = problem.kind === 'too_many' ? 'card.ask.toast.too_many'
+    : problem.kind === 'invalid_input' ? 'card.ask.toast.invalid_input' : 'card.ask.toast.unanswered';
   return { toast: { type: 'warning', content: t(key, { n: problem.questionIndex + 1 }, locale) } };
 }
 
@@ -251,7 +255,7 @@ function unreadableFormToast(askId: string, fieldTypes: Record<string, string>, 
 }
 
 /** Input form: turn ticked checkers / dropdown picks into the `q<i>` values the form validator reads. */
-function inputFormValues(ask: PendingAsk, formValue: unknown): ReturnType<typeof parseAskChoiceFormValue> | { kind: 'values'; values: Record<string, unknown>; selections: string[][] } {
+function inputFormValues(ask: PendingAsk, formValue: unknown): ReturnType<typeof parseAskChoiceFormValue> | { kind: 'values'; values: Record<string, unknown> } {
   const parsed = parseAskChoiceFormValue(ask.questions, formValue);
   if (parsed.kind !== 'ok') return parsed;
   const values = { ...parsed.fields };
@@ -260,7 +264,7 @@ function inputFormValues(ask: PendingAsk, formValue: unknown): ReturnType<typeof
     const keys = parsed.selections[i]!;
     values[`q${i}`] = q.multiSelect || keys.length !== 1 ? keys : keys[0];
   });
-  return { kind: 'values', values, selections: parsed.selections };
+  return { kind: 'values', values };
 }
 
 export async function handleAskCardAction(
@@ -297,8 +301,9 @@ export async function handleAskCardAction(
     if (read?.kind === 'unreadable') return unreadableFormToast(askId, read.fieldTypes, locale);
     const outcome = submitAskForm({ askId, nonce, by, values: read?.kind === 'values' ? read.values : data.action?.form_value });
     if (outcome === 'invalid_form' && pending && read?.kind === 'values') {
-      const answered = choiceProblemToast(pending.questions, read.selections, pending.questions.map(q => q.input ? 'input' : null), locale);
-      if (answered) return answered;
+      const checked = checkAskFormValues(pending.questions, read.values);
+      const named = checked.ok ? undefined : problemToast(checked.problem, locale);
+      if (named) return named;
     }
     if (outcome !== 'accepted') return outcomeResponse(outcome);
     const result = getAskSnapshot(askId)?.result;

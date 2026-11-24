@@ -2605,6 +2605,7 @@ export const messages: Record<string, string> = {
   'card.ask.note_line': 'Note: {note}',
   'card.ask.toast.too_many': 'Question {n} takes one answer: keep only one option ticked',
   'card.ask.toast.unanswered': 'Question {n} has no answer yet',
+  'card.ask.toast.invalid_input': 'Question {n}: check the format, range or length of what you entered',
   'card.ask.toast.unreadable': "Couldn't read the choices on this card. Reply with your answer in the chat instead.",
   'card.ask.list_reply_hint': '💬 Too many options to fit as checkboxes on this card: reply with your answer in the chat (label each answer for several questions).',
 

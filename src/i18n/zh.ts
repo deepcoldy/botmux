@@ -2609,6 +2609,7 @@ export const messages: Record<string, string> = {
   'card.ask.note_line': '备注：{note}',
   'card.ask.toast.too_many': '第 {n} 题是单选，只能勾一项',
   'card.ask.toast.unanswered': '第 {n} 题还没有回答',
+  'card.ask.toast.invalid_input': '第 {n} 题填写的内容不符合要求，请检查格式、范围或长度',
   'card.ask.toast.unreadable': '没能读到这张卡上的选择，请直接在对话里回复你的答案',
   'card.ask.list_reply_hint': '💬 选项太多，卡片里放不下勾选框：请直接在对话里回复你的答案（多题请逐题写明）。',
 
