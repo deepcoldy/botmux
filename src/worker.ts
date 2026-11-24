@@ -14430,7 +14430,12 @@ function resolveLiveAntigravityTranscriptPath(): string | undefined {
  *  a viewport that explicitly shows an interrupted turn. */
 function hasLiveAntigravityPendingTasks(): boolean {
   if (!structuredBridgeIs('antigravity') || cliAdapter?.runnerFramedInput) return false;
-  if (awaitingFirstPrompt && !activeTurnAuthority.snapshot()?.started) return false;
+  const activeTurnStarted = activeTurnAuthority.snapshot()?.started === true;
+  // In ordinary send mode disk pending state is meaningful only while this
+  // worker owns a started turn. Otherwise a stale/abandoned RUNNING can flip a
+  // later idle edge back to working after the first ready exemption has passed.
+  if (!activeTurnStarted && !codexBridgeFallbackActive()) return false;
+  if (awaitingFirstPrompt && !activeTurnStarted) return false;
   if (backend && backendScreenEvidenceIsAuthoritativeForMutation()) {
     try {
       const screen = captureBackendScreen(backend);

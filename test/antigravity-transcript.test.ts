@@ -398,7 +398,7 @@ describe('drainAntigravityTranscript', () => {
   it('a mixed tool_calls batch (poll tool + any foreground tool) clears pending like a foreground tool', () => {
     writeFileSync(path, [
       line(userRecord('q')),
-      line(BG_RUNNING_RECORD),
+      line({ ...BG_RUNNING_RECORD, content: 'Created At: ...\nTool is running as a background task\n' }),
       line(plannerStep({ toolCalls: [toolCall('manage_task'), toolCall('run_command')], step: 3, createdAt: '2026-09-29T03:00:12Z' })),
       line(plannerStep({ content: '前台命令拿到结果，收尾答复。', step: 4, createdAt: '2026-09-29T03:00:20Z' })),
     ].join(''));
@@ -850,6 +850,368 @@ describe('hasAntigravityTranscriptPendingTasks & multi-task/daemon tracking', ()
     expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
   });
 
+  it('does not foreground-recover a tracked task ID without its command result', () => {
+    const taskId = `${convId}/task-single-foreground`;
+    writeFileSync(path, [
+      line(userRecord('单个已知 ID 后台任务仍在运行')),
+      line(taskRunning(1, taskId, 'single-command')),
+      line(plannerStep({ step: 46, toolCalls: [{ name: 'read_file', args: { path: 'README.md' } }] })),
+      line(plannerStep({ step: 47, content: 'read_file 不是后台任务完成证据。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toEqual([taskId]);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
+  it('does not clear multiple tracked tasks for an unrelated foreground recovery', () => {
+    const t1 = `${convId}/task-foreground-1`;
+    const t2 = `${convId}/task-foreground-2`;
+    writeFileSync(path, [
+      line(userRecord('两个后台任务仍在运行')),
+      line(taskRunning(1, t1, 'cmd-1')),
+      line(taskRunning(2, t2, 'cmd-2')),
+      line(plannerStep({ step: 46, toolCalls: [{ name: 'read_file', args: { path: 'README.md' } }] })),
+      line(plannerStep({ step: 47, content: '读取文件不能证明后台任务都结束。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toEqual([t1, t2]);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
+  it('recovers only the task that owned the adjacent DONE when launching a subagent', () => {
+    const t1 = `${convId}/task-launch-1`;
+    const t2 = `${convId}/task-launch-2`;
+    writeFileSync(path, [
+      line(userRecord('两个后台任务共用一个完成结果')),
+      line(taskRunning(1, t1, 'cmd-1')),
+      line(taskRunning(2, t2, 'cmd-2')),
+      line({ step_index: 3, source: 'MODEL', type: 'GENERIC', status: 'DONE', content: 'cmd-2 result' }),
+      line(plannerStep({ step: 4, toolCalls: [toolCall('invoke_subagent')] })),
+      line(plannerStep({ step: 5, content: 'cmd-2 已恢复，cmd-1 仍在运行。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toEqual([t1]);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
+  it.each([
+    { name: 'different descriptions', ordinaryCommand: 'npm test', daemonCommand: 'pnpm dev' },
+    { name: 'identical descriptions', ordinaryCommand: 'npm test', daemonCommand: 'npm test' },
+  ])('does not hide a late ordinary RUNNING behind newer all-daemon hints with $name', ({ ordinaryCommand, daemonCommand }) => {
+    const ordinaryId = `${convId}/task-late-ordinary`;
+    const daemonId = `${convId}/task-late-daemon`;
+    writeFileSync(path, [
+      line(userRecord('普通 launch 与 daemon launch 乱序')),
+      line(plannerStep({ step: 1, toolCalls: [{ name: 'run_command', args: { CommandLine: ordinaryCommand } }] })),
+      line(plannerStep({ step: 3, toolCalls: [{ name: 'run_command', args: { CommandLine: daemonCommand, IsDaemon: true } }] })),
+      line(taskRunning(2, ordinaryId, ordinaryCommand)),
+      line(taskRunning(4, daemonId, daemonCommand)),
+      line(plannerStep({ step: 5, content: '等待普通任务。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toContain(ordinaryId);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
+  it('does not use all-daemon descriptions without any positive launch correlation', () => {
+    const ordinaryId = `${convId}/task-no-step-ordinary`;
+    writeFileSync(path, [
+      line(userRecord('缺少步骤信息的乱序记录')),
+      line(plannerStep({ step: 1, toolCalls: [{ name: 'run_command', args: { CommandLine: 'npm test' } }] })),
+      line({
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test', IsDaemon: true } }],
+      }),
+      line({ ...taskRunning(2, ordinaryId, 'npm test'), step_index: undefined }),
+      line(plannerStep({ step: 5, content: '没有步骤或唯一描述，不能排除普通任务。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toContain(ordinaryId);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
+  it('uses an exact step to exclude a pure daemon without a Task Description', () => {
+    const daemonId = `${convId}/task-no-description-daemon`;
+    writeFileSync(path, [
+      line(userRecord('启动无描述常驻任务')),
+      line(plannerStep({ step: 1, toolCalls: [{ name: 'run_command', args: { CommandLine: 'pnpm dev', IsDaemon: true } }] })),
+      line({
+        step_index: 2,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${daemonId}\n`,
+      }),
+      line(plannerStep({ step: 3, content: 'Dev server 已启动。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.events.filter(event => event.kind === 'assistant_final').map(event => event.text))
+      .toEqual(['Dev server 已启动。']);
+  });
+
+  it('preserves a provisional final when an ignored daemon notification arrives', () => {
+    const daemonId = `${convId}/task-daemon-notice`;
+    writeFileSync(path, [
+      line(userRecord('启动常驻服务')),
+      line(plannerStep({ step: 1, toolCalls: [{ name: 'run_command', args: { CommandLine: 'pnpm dev', IsDaemon: true } }] })),
+      line(taskRunning(2, daemonId, 'pnpm dev')),
+      line(plannerStep({ step: 3, content: 'Dev server 已启动。' })),
+      line(taskDoneMsg(4, daemonId)),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.events.filter(event => event.kind === 'assistant_final').map(event => event.text))
+      .toEqual(['Dev server 已启动。']);
+  });
+
+  it('remembers daemon identity across turns so an old notification cannot clear a new anonymous wait', () => {
+    const daemonId = `${convId}/task-old-daemon`;
+    writeFileSync(path, [
+      line(userRecord('第一轮启动 daemon')),
+      line(plannerStep({ step: 1, toolCalls: [{ name: 'run_command', args: { CommandLine: 'pnpm dev', IsDaemon: true } }] })),
+      line(taskRunning(2, daemonId, 'pnpm dev')),
+      line(plannerStep({ step: 3, content: 'daemon 已启动。' })),
+      line({ ...userRecord('第二轮匿名普通任务'), step_index: 4 }),
+      line({
+        step_index: 5,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task\nTask Description: anonymous-command\n',
+      }),
+      line(taskDoneMsg(6, daemonId)),
+      line(plannerStep({ step: 7, content: '旧 daemon 通知不代表新任务完成。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.hasPendingAnonymousTask).toBe(true);
+    expect(drained.events.filter(event => event.kind === 'assistant_final').map(event => event.text))
+      .toEqual(['daemon 已启动。']);
+  });
+
+  it('does not clear an anonymous wait for an unrelated manage_task kill ID', () => {
+    writeFileSync(path, [
+      line(userRecord('匿名任务与无关 kill')),
+      line({
+        step_index: 1,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task\nTask Description: anonymous-command\n',
+      }),
+      line(plannerStep({
+        step: 2,
+        toolCalls: [{ name: 'manage_task', args: { Action: 'kill', TaskId: `${convId}/task-unrelated` } }],
+      })),
+      line(plannerStep({ step: 3, content: '无关 kill 不能结算匿名任务。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.hasPendingAnonymousTask).toBe(true);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
+  it('does not let an ignored daemon completion clear an anonymous ordinary wait', () => {
+    const daemonId = `${convId}/task-daemon-completion`;
+    writeFileSync(path, [
+      line(userRecord('匿名普通任务与常驻任务并发')),
+      line({
+        step_index: 1,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task\nTask Description: anonymous-command\n',
+      }),
+      line(plannerStep({
+        step: 2,
+        toolCalls: [{ name: 'schedule', args: { CronExpression: '*/5 * * * *', IsDaemon: true, Prompt: '巡检' } }],
+      })),
+      line(taskRunning(3, daemonId, 'Cron: */5 * * * *')),
+      line(plannerStep({ step: 4, content: '等待匿名普通任务。' })),
+      line(taskDoneMsg(5, daemonId)),
+      line(plannerStep({ step: 6, content: 'daemon 通知不代表匿名任务完成。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.hasPendingAnonymousTask).toBe(true);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
+  it('fails closed when no transcript window can establish the current turn boundary', () => {
+    writeFileSync(path, [
+      line(userRecord('超过尾部窗口的长回合')),
+      line(taskRunning(1, `${convId}/task-long-turn`, 'long-running-command')),
+      line({
+        step_index: 2,
+        source: 'MODEL',
+        type: 'CHECKPOINT',
+        status: 'DONE',
+        content: 'x'.repeat(4 * 1024 * 1024 + 200_000),
+      }),
+      line(plannerStep({ step: 3, content: '仍在等待窗口外的后台任务。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+  });
+
+  it('finds a completed long-turn boundary beyond the capped tail window', () => {
+    writeFileSync(path, [
+      line(userRecord('超过尾部窗口但已完成的回合')),
+      line({
+        step_index: 1,
+        source: 'MODEL',
+        type: 'CHECKPOINT',
+        status: 'DONE',
+        content: 'x'.repeat(4 * 1024 * 1024 + 200_000),
+      }),
+      line(plannerStep({ step: 2, content: '长回合已经正常完成。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
+  });
+
+  it('does not settle an anonymous wait for a sender-less ignored daemon completion', () => {
+    const daemonId = `${convId}/task-legacy-daemon`;
+    writeFileSync(path, [
+      line(userRecord('匿名任务与 legacy daemon 通知')),
+      line({
+        step_index: 1,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task\nTask Description: anonymous-command\n',
+      }),
+      line(plannerStep({ step: 2, toolCalls: [{ name: 'schedule', args: { CronExpression: '*/5 * * * *', IsDaemon: true } }] })),
+      line(taskRunning(3, daemonId, 'Cron: */5 * * * *')),
+      line({
+        step_index: 4,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: `<SYSTEM_MESSAGE>\n[Message] Task id: ${daemonId} finished with result: code 0\n</SYSTEM_MESSAGE>`,
+      }),
+      line(plannerStep({ step: 5, content: 'legacy daemon 通知不能结算匿名任务。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.hasPendingAnonymousTask).toBe(true);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
+  it('keeps anonymous work when a daemon completion lands before its RUNNING record', () => {
+    const daemonId = `${convId}/task-early-daemon`;
+    writeFileSync(path, [
+      line(userRecord('daemon 通知先于 RUNNING')),
+      line({
+        step_index: 1,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task\nTask Description: anonymous-command\n',
+      }),
+      line(plannerStep({ step: 2, toolCalls: [{ name: 'schedule', args: { CronExpression: '*/5 * * * *', IsDaemon: true } }] })),
+      line(taskDoneMsg(4, daemonId)),
+      line(taskRunning(3, daemonId, 'Cron: */5 * * * *')),
+      line(plannerStep({ step: 5, toolCalls: [{ name: 'manage_task', args: { Action: 'kill', TaskId: daemonId } }] })),
+      line(plannerStep({ step: 6, content: '早到通知与 kill 都不能结算匿名任务。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.hasPendingAnonymousTask).toBe(true);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
+  it.each(['cancel', 'error'])('keeps old daemon identity across %s so its notice cannot clear a later anonymous wait', (kind) => {
+    const daemonId = `${convId}/task-daemon-${kind}`;
+    writeFileSync(path, [
+      line(userRecord('老回合 daemon')),
+      line(plannerStep({ step: 1, toolCalls: [{ name: 'run_command', args: { CommandLine: 'pnpm dev', IsDaemon: true } }] })),
+      line(taskRunning(2, daemonId, 'pnpm dev')),
+      line(kind === 'cancel'
+        ? { step_index: 3, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', status: 'DONE', content: 'The user request was canceled.' }
+        : { step_index: 3, source: 'SYSTEM', type: 'ERROR_MESSAGE', status: 'DONE', content: 'synthetic error' }),
+      line({ ...userRecord('新回合匿名任务'), step_index: 4 }),
+      line({
+        step_index: 5,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task\nTask Description: anonymous-command\n',
+      }),
+      line(taskDoneMsg(6, daemonId)),
+      line(plannerStep({ step: 7, content: '老 daemon 通知不能结算新匿名任务。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.hasPendingAnonymousTask).toBe(true);
+    expect(drained.events.filter(event => event.kind === 'assistant_final').map(event => event.text)).toEqual([]);
+  });
+
+  it('expands a truncated window when an old daemon completion needs earlier provenance', () => {
+    const daemonId = `${convId}/task-window-daemon`;
+    writeFileSync(path, [
+      line(userRecord('老 daemon 回合')),
+      line(plannerStep({ step: 1, toolCalls: [{ name: 'run_command', args: { CommandLine: 'pnpm dev', IsDaemon: true } }] })),
+      line(taskRunning(2, daemonId, 'pnpm dev')),
+      line(plannerStep({ step: 3, content: '老 daemon 已启动。' })),
+      line({ step_index: 4, source: 'MODEL', type: 'CHECKPOINT', status: 'DONE', content: 'x'.repeat(100_000) }),
+      line({ ...userRecord('新匿名任务回合'), step_index: 5 }),
+      line({
+        step_index: 6,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task\nTask Description: anonymous-command\n',
+      }),
+      line(taskDoneMsg(7, daemonId)),
+      line(plannerStep({ step: 8, content: '新匿名任务仍在运行。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+  });
+
+  it('retains adjacent DONE evidence per task ID during foreground recovery', () => {
+    const a = `${convId}/task-result-a`;
+    const b = `${convId}/task-result-b`;
+    const c = `${convId}/task-result-c`;
+    writeFileSync(path, [
+      line(userRecord('多个任务分别有完成证据')),
+      line(taskRunning(1, a, 'cmd-a')),
+      line({ step_index: 2, source: 'MODEL', type: 'GENERIC', status: 'DONE', content: 'cmd-a result' }),
+      line(taskRunning(3, b, 'cmd-b')),
+      line({ step_index: 4, source: 'MODEL', type: 'GENERIC', status: 'DONE', content: 'cmd-b result' }),
+      line(taskRunning(5, c, 'cmd-c')),
+      line(plannerStep({ step: 46, toolCalls: [{ name: 'read_file', args: { path: 'README.md' } }] })),
+      line(plannerStep({ step: 47, content: 'a/b 已恢复，c 仍在运行。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toEqual([c]);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
   it('does not block idle for IsDaemon: true dev servers or standing crons, while preserving normal sibling tasks', () => {
     writeFileSync(path, [
       line(userRecord('启动 dev server')),
@@ -859,7 +1221,8 @@ describe('hasAntigravityTranscriptPendingTasks & multi-task/daemon tracking', ()
     ].join(''));
     expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
     const daemonDrain = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
-    expect(daemonDrain.state).toEqual({});
+    expect(daemonDrain.state.hasPendingTask).toBeUndefined();
+    expect(daemonDrain.state.pendingTaskIds).toBeUndefined();
     expect(daemonDrain.events.filter(e => e.kind === 'assistant_final').map(e => e.text))
       .toEqual(['Dev server 已在后台启动。']);
 

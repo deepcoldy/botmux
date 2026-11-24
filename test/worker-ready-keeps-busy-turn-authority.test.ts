@@ -282,6 +282,23 @@ describe('hasLiveAntigravityPendingTasks in default replyDelivery=send mode (str
     expect(h.publishScreenStatus).toHaveBeenCalledWith('idle');
   });
 
+  it('does not hold a later idle edge with no started turn when an old transcript still has RUNNING', () => {
+    const cid = '22222222-2222-2222-2222-222222222222';
+    const { h } = sendModeHarness({
+      awaitingFirstPrompt: false,
+      turnStarted: false,
+      records: [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\n旧会话任务\n</USER_REQUEST>' },
+        { step_index: 1, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: `Tool is running as a background task with task id: ${cid}/task-old\n` },
+      ],
+    });
+
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.isPromptReady).toBe(true);
+    expect(h.publishScreenStatus).toHaveBeenCalledWith('idle');
+    expect(h.publishScreenStatus).not.toHaveBeenCalledWith('working');
+  });
+
   it('releases authority when the authoritative viewport explicitly shows an interrupted turn', () => {
     const cid = '22222222-2222-2222-2222-222222222222';
     const interruptedScreen = [

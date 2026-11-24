@@ -99,6 +99,42 @@ const finishGate = ${JSON.stringify(finishGate)};
 const mixedFinishGate = ${JSON.stringify(mixedFinishGate)};
 const nativeId = ${JSON.stringify(nativeId)};
 const taskId = nativeId + '/task-178';
+const extraTurns = {
+  MULTI_RECOVERY_TURN_MARKER: {
+    body: '两个后台任务仍在运行，read_file 不应释放。',
+    records: [
+      { step_index: 20, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\\nMULTI_RECOVERY_TURN_MARKER\\n</USER_REQUEST>' },
+      { step_index: 21, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task with task id: ' + nativeId + '/task-foreground-1\\nTask Description: cmd-1\\n' },
+      { step_index: 22, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task with task id: ' + nativeId + '/task-foreground-2\\nTask Description: cmd-2\\n' },
+      { step_index: 46, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', args: { path: 'README.md' } }] },
+      { step_index: 47, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '两个后台任务仍在运行，read_file 不应释放。' },
+    ],
+  },
+  LATE_DAEMON_TURN_MARKER: {
+    body: '乱序普通任务仍在运行，all-daemon 不应吞掉它。',
+    records: [
+      { step_index: 50, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\\nLATE_DAEMON_TURN_MARKER\\n</USER_REQUEST>' },
+      { step_index: 51, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test' } }] },
+      { step_index: 53, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test', IsDaemon: true } }] },
+      { step_index: 52, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task with task id: ' + nativeId + '/task-late-ordinary\\nTask Description: npm test\\n' },
+      { step_index: 54, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task with task id: ' + nativeId + '/task-late-daemon\\nTask Description: npm test\\n' },
+      { step_index: 55, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '乱序普通任务仍在运行，all-daemon 不应吞掉它。' },
+    ],
+  },
+  ANON_DAEMON_TURN_MARKER: {
+    body: 'daemon 通知已到达，匿名普通任务仍在运行。',
+    records: [
+      { step_index: 70, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\\nANON_DAEMON_TURN_MARKER\\n</USER_REQUEST>' },
+      { step_index: 71, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task\\nTask Description: anonymous-command\\n' },
+      { step_index: 72, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'schedule', args: { CronExpression: '*/5 * * * *', IsDaemon: true, Prompt: '巡检' } }] },
+      { step_index: 73, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task with task id: ' + nativeId + '/task-anon-daemon\\nTask Description: Cron: */5 * * * *\\n' },
+      { step_index: 74, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '等待匿名普通任务。' },
+      { step_index: 75, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>\\n[Message] sender=' + nativeId + '/task-anon-daemon content=Task id "' + nativeId + '/task-anon-daemon" finished with result: code 0\\n</SYSTEM_MESSAGE>' },
+      { step_index: 76, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'daemon 通知已到达，匿名普通任务仍在运行。' },
+    ],
+  },
+};
+const handledExtraTurns = new Set();
 process.stdin.setRawMode?.(true);
 const drawIdle = (body) => process.stdout.write('\\x1b[2J\\x1b[H' + body + '\\r\\n────────\\r\\n>\\r\\n────────\\r\\n? for shortcuts\\r\\n');
 setTimeout(() => drawIdle('Antigravity ready'), 100);
@@ -159,6 +195,15 @@ process.stdin.on('data', chunk => {
       drawIdle('普通任务已完成，常驻任务继续运行。');
     };
     pollMixedFinish();
+  }
+  for (const [marker, scenario] of Object.entries(extraTurns)) {
+    if (handledExtraTurns.has(marker) || !buf.includes(marker)) continue;
+    handledExtraTurns.add(marker);
+    fs.appendFileSync(historyPath, JSON.stringify({
+      display: marker, workspace: ${JSON.stringify(dataDir)}, timestamp: Date.now(),
+    }) + '\\n');
+    fs.appendFileSync(transcriptPath, scenario.records.map(record => JSON.stringify(record)).join('\\n') + '\\n');
+    drawIdle(scenario.body);
   }
 });
 setInterval(() => {}, 1_000);
@@ -298,5 +343,35 @@ setInterval(() => {}, 1_000);
         && messages.slice(mixedMessageStartIndex).some(m => m.type === 'screen_update' && m.status === 'idle'),
       logs,
     );
-  }, 45_000);
+
+    const assertTurnHeld = async (turnId: string, marker: string) => {
+      const messageStart = messages.length;
+      const logStart = logs.join('').length;
+      child.send({
+        type: 'message',
+        content: marker,
+        turnId,
+        caller: {
+          requestUserOpenId: 'ou_tester',
+          requestLarkAppId: 'app_test',
+          senderType: 'user',
+        },
+      } satisfies DaemonToWorker);
+      await waitFor(
+        () => logs.join('').slice(logStart).includes('Idle prompt while Antigravity background task(s)/subagent(s) pending')
+          && messages.slice(messageStart).some(m => m.type === 'managed_turn_origin' && m.turnId === turnId),
+        logs,
+      );
+      expect(logs.join('').slice(logStart)).not.toContain(`Released active turn authority ${turnId.slice(0, 12)}`);
+      const current = messages.slice(messageStart);
+      const originIndex = current.findIndex(m => m.type === 'managed_turn_origin' && m.turnId === turnId);
+      expect(originIndex).toBeGreaterThanOrEqual(0);
+      expect(current.filter(m => m.type === 'managed_turn_origin_revoked' && m.turnId === turnId)).toEqual([]);
+      expect(current.slice(originIndex + 1).filter(m => m.type === 'screen_update' && m.status === 'idle')).toEqual([]);
+    };
+
+    await assertTurnHeld('om_bg_turn_multi_recovery', 'MULTI_RECOVERY_TURN_MARKER');
+    await assertTurnHeld('om_bg_turn_late_daemon', 'LATE_DAEMON_TURN_MARKER');
+    await assertTurnHeld('om_bg_turn_anon_daemon', 'ANON_DAEMON_TURN_MARKER');
+  }, 90_000);
 });

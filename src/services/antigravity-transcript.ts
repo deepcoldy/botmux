@@ -304,15 +304,24 @@ export interface AntigravityTranscriptState {
    *  accepted as callback-less command-result evidence; poll results can be
    *  physically written before their lower-step tool_call. */
   pendingTaskRunningStep?: number;
+  /** Task ID that owns pendingTaskRunningStep and any adjacent DONE evidence.
+   *  Recovery of one known command must not clear its running siblings. */
+  pendingTaskRunningTaskId?: string;
   /** The command RUNNING step's immediate non-launch DONE successor landed.
    *  invoke_subagent may use this narrower callback-less recovery signal;
    *  the launch alone does not prove an independent command ended. */
   hasPendingTaskResult?: boolean;
+  /** Known task IDs with their own adjacent DONE evidence. Unlike the legacy
+   *  singleton fields, this survives interleaved RUNNING records. */
+  pendingTaskResultIds?: string[];
   /** Launched subagents whose first notifications have not arrived,
    *  deduplicated by id. A notification can request guidance rather than
    *  finish the work; send_message does not re-arm this wait because it does
    *  not promise a reply. An array keeps carried worker state serializable. */
   pendingSubagentIds?: string[];
+  /** Daemon task IDs intentionally excluded from turn-blocking waits. Their
+   *  completion/scheduled notifications must not settle an anonymous command. */
+  ignoredDaemonTaskIds?: string[];
   /** Ephemeral launch hints for `IsDaemon: true` background calls in the latest
    *  tool_calls batch so standing daemons (dev servers / standing crons) are
    *  not latched as turn-blocking waits. Mixed batches retain ordinary
@@ -406,12 +415,15 @@ export function hasAntigravityPendingTasks(state: AntigravityTranscriptState): b
 
 function commandState(state: AntigravityTranscriptState | undefined): AntigravityTranscriptState {
   const hasPending = !!state?.hasPendingTask || !!state?.pendingTaskIds?.length;
+  const resultIds = state?.pendingTaskResultIds?.filter(id => state.pendingTaskIds?.includes(id));
   return hasPending ? {
     hasPendingTask: true,
     ...(state?.pendingTaskIds?.length ? { pendingTaskIds: [...state.pendingTaskIds] } : {}),
     ...(state?.hasPendingAnonymousTask ? { hasPendingAnonymousTask: true } : {}),
     ...(state?.pendingTaskRunningStep !== undefined ? { pendingTaskRunningStep: state.pendingTaskRunningStep } : {}),
+    ...(state?.pendingTaskRunningTaskId ? { pendingTaskRunningTaskId: state.pendingTaskRunningTaskId } : {}),
     ...(state?.hasPendingTaskResult ? { hasPendingTaskResult: true } : {}),
+    ...(resultIds?.length ? { pendingTaskResultIds: [...resultIds] } : {}),
   } : {};
 }
 
@@ -419,7 +431,19 @@ function pendingState(state: AntigravityTranscriptState | undefined): Antigravit
   return {
     ...commandState(state),
     ...(state?.pendingSubagentIds?.length ? { pendingSubagentIds: [...state.pendingSubagentIds] } : {}),
+    ...ignoredDaemonTaskState(state),
   };
+}
+
+function ignoredDaemonTaskState(state: AntigravityTranscriptState | undefined): AntigravityTranscriptState {
+  return state?.ignoredDaemonTaskIds?.length
+    ? { ignoredDaemonTaskIds: [...state.ignoredDaemonTaskIds] }
+    : {};
+}
+
+function commandWaitCount(state: AntigravityTranscriptState | undefined): number {
+  const identifiedAndAnonymous = (state?.pendingTaskIds?.length ?? 0) + (state?.hasPendingAnonymousTask ? 1 : 0);
+  return identifiedAndAnonymous || (state?.hasPendingTask ? 1 : 0);
 }
 
 function subagentState(ids: readonly string[] | undefined): AntigravityTranscriptState {
@@ -492,7 +516,12 @@ function isDaemonBackgroundRecord(
   hints: AntigravityTranscriptState['pendingDaemonHints'],
 ): boolean {
   if (!hints) return false;
-  if (hints.allDaemon) return true;
+  if (hints.allDaemon) {
+    // The latest batch being all-daemon says nothing about older/out-of-order
+    // records. Exact logical-step correlation alone is sufficient for its own
+    // launches, even when a compact RUNNING omits Task Description.
+    return hints.stepHints?.some(hint => hint.isDaemon && hint.stepIndex === obj.step_index) === true;
+  }
   const desc = backgroundTaskDescription(obj);
   if (!desc) return false;
   const matches = (candidate: string) => candidate.startsWith(desc) || desc.startsWith(candidate);
@@ -520,6 +549,7 @@ function removePendingTaskId(
     if (!completedId || !ids.includes(completedId)) return commandState(state);
     const remaining = ids.filter(id => id !== completedId);
     if (remaining.length > 0) {
+      const remainingResultIds = state.pendingTaskResultIds?.filter(id => remaining.includes(id));
       // RUNNING-step/result evidence belongs to the command that produced it.
       // The legacy fields do not record that owner, so never transfer them to
       // a surviving sibling after another task completes.
@@ -527,6 +557,7 @@ function removePendingTaskId(
         hasPendingTask: true,
         pendingTaskIds: remaining,
         ...(state.hasPendingAnonymousTask ? { hasPendingAnonymousTask: true } : {}),
+        ...(remainingResultIds?.length ? { pendingTaskResultIds: remainingResultIds } : {}),
       };
     }
     return state.hasPendingAnonymousTask
@@ -600,6 +631,10 @@ function abandonCommandWaits(state: AntigravityTranscriptState, toolCalls: any[]
     const action = decodeArgumentValue(args?.Action);
     const taskId = decodeArgumentValue(args?.TaskId);
     if (action !== 'kill' || typeof taskId !== 'string' || !taskId.trim()) continue;
+    // A concrete kill ID cannot be correlated to an anonymous legacy wait.
+    // Completion notifications retain their legacy recovery semantics, but an
+    // explicit kill for another/unknown task must not erase that wait.
+    if (!state.pendingTaskIds?.length && state.hasPendingTask) continue;
     const nextCmd = removePendingTaskId(state, taskId.trim());
     const {
       provisionalFinal: _final,
@@ -607,7 +642,9 @@ function abandonCommandWaits(state: AntigravityTranscriptState, toolCalls: any[]
       pendingTaskIds: _taskIds,
       hasPendingAnonymousTask: _anonymous,
       pendingTaskRunningStep: _step,
+      pendingTaskRunningTaskId: _taskId,
       hasPendingTaskResult: _res,
+      pendingTaskResultIds: _resultIds,
       ...rest
     } = state;
     state = { ...rest, ...nextCmd };
@@ -674,14 +711,18 @@ function foldRecord(
     }
     const raw = typeof obj.content === 'string' ? obj.content : '';
     const text = unwrapAntigravityUserInput(raw);
+    // Turn-scoped waits reset at an explicit input, but daemon identity must
+    // survive so a late notification from an older turn cannot settle a new
+    // anonymous ordinary wait.
+    const carriedDaemonIds = ignoredDaemonTaskState(state);
     if (text) {
       const next = adoptMode ? { sourceTurnId: uuid } : {};
       events.push({ uuid, timestampMs, kind: 'user', text, ...next,
         ...(adoptMode ? { inputTextAliases: [] } : {}),
       });
-      return next;
+      return { ...next, ...carriedDaemonIds };
     }
-    return {};
+    return carriedDaemonIds;
   }
 
   if (type === 'PLANNER_RESPONSE') {
@@ -719,12 +760,31 @@ function foldRecord(
       // Ordinary foreground work retains the legacy recovery heuristic. A
       // subagent launch is narrower: it recovers a missing callback only after
       // a command-result DONE, never while the command is still merely RUNNING.
-      const launchRecovery = state.hasPendingTaskResult
+      const launchRecovery = (state.hasPendingTaskResult || !!state.pendingTaskResultIds?.length)
         && obj.tool_calls.some(isSubagentLaunchToolCall);
+      const provenResultIds = [...new Set([
+        ...(state.pendingTaskResultIds ?? []),
+        ...(state.hasPendingTaskResult && state.pendingTaskRunningTaskId ? [state.pendingTaskRunningTaskId] : []),
+      ])];
+      let recoveredCommand = commandState(state);
+      if (foregroundRecovery || launchRecovery) {
+        if (state.pendingTaskIds?.length) {
+          // Each known command needs its own adjacent DONE. Recover every
+          // proven ID while retaining any sibling still lacking that evidence.
+          for (const taskId of provenResultIds) {
+            recoveredCommand = removePendingTaskId(recoveredCommand, taskId);
+          }
+        } else if (commandWaitCount(state) <= 1) {
+          // Only the anonymous legacy wait retains the old foreground recovery
+          // heuristic; a concrete task ID requires its own result evidence.
+          recoveredCommand = {};
+        }
+      }
       return {
         ...turn,
-        ...(!foregroundRecovery && !launchRecovery ? commandState(state) : {}),
+        ...recoveredCommand,
         ...subagentState(state.pendingSubagentIds),
+        ...ignoredDaemonTaskState(state),
         ...(daemonHints ? { pendingDaemonHints: daemonHints } : {}),
       };
     }
@@ -758,9 +818,22 @@ function foldRecord(
     if (isDaemonBackgroundRecord(obj, state.pendingDaemonHints)) {
       // Standing daemon processes (`IsDaemon: true`, e.g. dev servers or
       // recurring crons meant to outlive the turn) must not block turn idle.
-      return { ...turn, ...pendingState(state), ...daemonHintState(state) };
+      // Retain their IDs only to distinguish their notifications from an
+      // anonymous ordinary command completion.
+      const daemonTaskId = backgroundTaskId(obj);
+      const withDaemonId = daemonTaskId ? {
+        ...state,
+        ignoredDaemonTaskIds: [...new Set([...(state.ignoredDaemonTaskIds ?? []), daemonTaskId])],
+      } : state;
+      return { ...turn, ...pendingState(withDaemonId), ...daemonHintState(state) };
     }
-    const { hasPendingTaskResult: _staleResult, pendingTaskRunningStep: _staleStep, ...rest } = state;
+    const {
+      hasPendingTaskResult: _staleResult,
+      pendingTaskRunningStep: _staleStep,
+      pendingTaskRunningTaskId: _staleTaskId,
+      pendingTaskResultIds: _staleResultIds,
+      ...rest
+    } = state;
     const runningStep = typeof obj.step_index === 'number' && Number.isInteger(obj.step_index)
       ? obj.step_index
       : undefined;
@@ -768,12 +841,15 @@ function foldRecord(
     const nextTaskIds = taskId
       ? [...new Set([...(state.pendingTaskIds ?? []), taskId])]
       : state.pendingTaskIds;
+    const nextResultIds = state.pendingTaskResultIds?.filter(id => id !== taskId);
     return {
       ...rest,
       hasPendingTask: true,
       ...(nextTaskIds?.length ? { pendingTaskIds: nextTaskIds } : {}),
       ...(!taskId ? { hasPendingAnonymousTask: true } : {}),
       ...(runningStep !== undefined ? { pendingTaskRunningStep: runningStep } : {}),
+      ...(taskId ? { pendingTaskRunningTaskId: taskId } : {}),
+      ...(nextResultIds?.length ? { pendingTaskResultIds: nextResultIds } : {}),
     };
   }
   if (type === 'GENERIC') {
@@ -791,9 +867,17 @@ function foldRecord(
       && ids.length === 0
       && state.pendingTaskRunningStep !== undefined
       && obj.step_index === state.pendingTaskRunningStep + 1;
+    const resultOwner = commandResult ? state.pendingTaskRunningTaskId : undefined;
+    const withCommandResult = commandResult ? {
+      ...state,
+      hasPendingTaskResult: true,
+      ...(resultOwner ? {
+        pendingTaskResultIds: [...new Set([...(state.pendingTaskResultIds ?? []), resultOwner])],
+      } : {}),
+    } : state;
     return {
       ...turn,
-      ...pendingState(commandResult ? { ...state, hasPendingTaskResult: true } : state),
+      ...pendingState(withCommandResult),
       ...subagentState([...new Set([...(state.pendingSubagentIds ?? []), ...ids])]),
       ...daemonHintState(state),
     };
@@ -821,30 +905,46 @@ function foldRecord(
     if (!header && !legacyTaskResult) {
       const trimmedPayload = payload.trim();
       if (!/^Reminder:/i.test(trimmedPayload) && SYSTEM_CANCEL_RE.test(trimmedPayload)) {
-        return { ...turn };
+        return { ...turn, ...ignoredDaemonTaskState(state) };
       }
-      const commandWaitCount = (state.pendingTaskIds?.length ?? 0)
-        + (state.hasPendingAnonymousTask ? 1 : 0)
-        || (state.hasPendingTask ? 1 : 0);
+      const pendingCommands = commandWaitCount(state);
       if (!/^Reminder:/i.test(trimmedPayload)
-        && commandWaitCount === 1
+        && pendingCommands === 1
         && !state.pendingSubagentIds?.length
         && SYSTEM_SINGLE_TASK_CANCEL_RE.test(trimmedPayload)) {
-        return { ...turn };
+        return { ...turn, ...ignoredDaemonTaskState(state) };
       }
       return state;
     }
     const ids = state.pendingSubagentIds?.filter(id => id !== sender);
+    const ignoredDaemonCompletion = (taskSender && sender !== undefined
+      && state.ignoredDaemonTaskIds?.includes(sender) === true)
+      || (legacyTaskResult && legacyTaskId !== undefined
+        && state.ignoredDaemonTaskIds?.includes(legacyTaskId) === true);
+    // While a daemon launch is still awaiting its RUNNING record, an unrelated
+    // or early completion cannot prove that an anonymous ordinary task ended.
+    // Keep both the wait and launch hints so a later RUNNING can establish the
+    // daemon identity instead of being latched or killed as ordinary work.
+    if (!ignoredDaemonCompletion
+      && (taskSender || legacyTaskResult)
+      && !state.pendingTaskIds?.length
+      && state.hasPendingTask
+      && state.pendingDaemonHints) {
+      return state;
+    }
+    if (ignoredDaemonCompletion) return state;
     return {
       ...turn,
       ...(taskSender || legacyTaskResult
         ? removePendingTaskId(state, taskSender ? sender : legacyTaskId)
         : commandState(state)),
       ...subagentState(ids),
+      ...ignoredDaemonTaskState(state),
+      ...daemonHintState(state),
     };
   }
   if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
-    return { ...turn, ...subagentState(state.pendingSubagentIds) };
+    return { ...turn, ...subagentState(state.pendingSubagentIds), ...ignoredDaemonTaskState(state) };
   }
 
   // CHECKPOINT / TASK_NOTIFICATION / unknown types neither confirm nor cancel;
@@ -882,7 +982,8 @@ export function drainAntigravityTranscript(
     // screen cannot prove the turn is done.
     if (options.flushTrailingFinal && incomingState.provisionalFinal && !hasAntigravityPendingTasks(incomingState)) {
       const events = [incomingState.provisionalFinal];
-      return { events, newOffset: fromOffset, pendingTail: '', state: pendingState(incomingState) };
+      const nextState = pendingState(incomingState);
+      return { events, newOffset: fromOffset, pendingTail: '', state: nextState };
     }
     return { events: [], newOffset: fromOffset, pendingTail: '', state: cloneState(incomingState) };
   }
@@ -942,6 +1043,18 @@ function isExplicitUserInput(rec: any): boolean {
   return rec?.type === 'USER_INPUT' && (rec.source === undefined || rec.source === 'USER_EXPLICIT');
 }
 
+function isTaskResultRecord(rec: any): boolean {
+  if (rec?.type !== 'SYSTEM_MESSAGE' || typeof rec.content !== 'string') return false;
+  const content = rec.content;
+  const header = systemMessageHeader(content);
+  const sender = header.match(/(?:^|\s)sender=([A-Za-z0-9._/-]+)(?:\s|$)/)?.[1];
+  if (sender !== undefined && /\/task-[A-Za-z0-9._-]+$/.test(sender)) return true;
+  const payload = header
+    ? (header.match(/(?:^|\s)content=(.*)/)?.[1] ?? header)
+    : systemMessagePayload(content);
+  return LEGACY_TASK_RESULT_RE.test(payload);
+}
+
 function scanTranscriptTailForPendingTasks(
   transcriptPath: string,
   maxChunkBytes: number,
@@ -976,15 +1089,20 @@ function scanTranscriptTailForPendingTasks(
             break;
           }
         }
-        if (turnStart >= 0 || chunkSize >= stats.size) {
+        const needsEarlierProvenance = stats.size > chunkSize && parsed.some(isTaskResultRecord);
+        if (turnStart >= 0 && !needsEarlierProvenance) {
           let state: AntigravityTranscriptState = {};
           const events: CodexBridgeEvent[] = [];
-          const start = turnStart >= 0 ? turnStart : 0;
-          for (let i = start; i < parsed.length; i++) {
+          // Fold the whole retained window: each USER_INPUT resets turn waits,
+          // while daemon IDs are deliberately carried forward. Starting at the
+          // latest input would lose older daemon identity needed to reject its
+          // late notification in a newer anonymous-task turn.
+          for (let i = 0; i < parsed.length; i++) {
             state = foldRecord(transcriptPath, i, parsed[i], 0, events, state, false, false);
           }
           return { bounded: true, pending: hasAntigravityPendingTasks(state) };
         }
+        if (chunkSize >= stats.size) return { bounded: false, pending: false };
         if (chunkSize >= maxChunkBytes) break;
         chunkSize = Math.min(stats.size, Math.min(chunkSize * 4, maxChunkBytes));
       }
@@ -1022,7 +1140,13 @@ export function hasAntigravityTranscriptPendingTasks(transcriptPath: string): bo
   if (primary.bounded) return primary.pending;
   const compactSibling = antigravityCompactSiblingPath(transcriptPath);
   if (compactSibling && existsSync(compactSibling)) {
-    return scanTranscriptTailForPendingTasks(compactSibling, PENDING_SCAN_COMPACT_MAX_CHUNK).pending;
+    const compact = scanTranscriptTailForPendingTasks(compactSibling, PENDING_SCAN_COMPACT_MAX_CHUNK);
+    if (compact.bounded) return compact.pending;
   }
-  return primary.pending;
+  // A capped window without an explicit USER_INPUT boundary is inconclusive,
+  // not proof of either state. Widen once to the whole file so long completed
+  // turns can release while a RUNNING beyond the cap still holds authority.
+  // Only a file with no explicit turn boundary at all remains fail-closed.
+  const exhaustive = scanTranscriptTailForPendingTasks(transcriptPath, Number.MAX_SAFE_INTEGER);
+  return exhaustive.bounded ? exhaustive.pending : true;
 }
