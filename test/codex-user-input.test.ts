@@ -6,7 +6,8 @@ vi.mock('../src/core/managed-origin-capability.js', () => ({ readManagedOriginCa
 vi.mock('../src/utils/daemon-discovery.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/utils/daemon-discovery.js')>(), findOnlineDaemon: mocks.daemon,
 }));
-import { bridgeCodexUserInput, codexUserInputAnswer, parseCodexUserInputQuestions } from '../src/services/codex-user-input.js';
+import { bridgeCodexUserInput, postCodexAsk, codexUserInputAnswer, parseCodexUserInputQuestions } from '../src/services/codex-user-input.js';
+import { NATIVE_STANDALONE_ASK_ORIGIN } from '../src/core/ask-types.js';
 const params = { threadId: 'native-thread', turnId: 'native-turn', questions: [
   { id: 'environment', question: 'Choose environment', options: [
     { label: 'Staging (Recommended)', description: 'Test first' }, { label: 'Production', description: 'Live traffic' },
@@ -22,6 +23,13 @@ beforeEach(() => {
   mocks.loopback.mockResolvedValue(Response.json(result));
 });
 describe('Codex native user input bridge', () => {
+  it('marks standalone native questions without changing their authenticated origin or recipient', async () => {
+    await postCodexAsk({ ...context, standalone: true }, [{ prompt: 'Native question', multiSelect: false,
+      options: [{ key: '1', label: 'A' }, { key: '2', label: 'B' }] }]);
+    expect(JSON.parse(mocks.post.mock.calls[0][2].body)).toMatchObject({ sessionId: context.sessionId,
+      larkAppId: context.larkAppId, chatId: context.chatId, rootMessageId: context.rootMessageId,
+      originTurnId: context.originTurnId, originKind: NATIVE_STANDALONE_ASK_ORIGIN });
+  });
   it('preserves question ids, option labels and descriptions without accepting a recommended answer automatically', () => {
     const questions = parseCodexUserInputQuestions(params);
     expect(questions[0].question.prompt).toContain('Production: Live traffic');

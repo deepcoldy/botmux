@@ -8,6 +8,9 @@
 
 import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
 
+/** 原生异步问题不属于当前回复卡，正文结束时仍应保留回答入口。 */
+export const NATIVE_STANDALONE_ASK_ORIGIN = 'native-user-input-standalone';
+
 /** A single selectable option on an ask card. `key` is the stable identifier
  *  returned via stdout; `label` is the human-facing button text. When the user
  *  writes `--options "yes,no"`, `key === label`. With `--options "yes=继续"`,

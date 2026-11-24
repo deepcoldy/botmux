@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AskResult, AskQuestion } from '../core/ask-types.js';
+import { NATIVE_STANDALONE_ASK_ORIGIN } from '../core/ask-types.js';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';
 import { loopbackFetch } from '../core/loopback-fetch.js';
@@ -15,6 +16,8 @@ export interface CodexUserInputContext {
   /** Botmux reply identity, not the app-server's native turn id. */
   originTurnId?: string;
   originDispatchAttempt?: number;
+  /** 异步原生问题的卡片应独立于回复正文，不能在正文终局时被收走。 */
+  standalone?: boolean;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -142,7 +145,8 @@ export async function postCodexAsk(
       // A server request belongs to this process/turn. Do not reattach a card
       // from an older runner merely because its JSON-RPC id was reused.
       requestId: asyncUserInput?.itemId ?? randomUUID(),
-      originKind: asyncUserInput ? 'native-user-input-async' : 'native-user-input',
+      originKind: asyncUserInput ? 'native-user-input-async'
+        : context.standalone ? NATIVE_STANDALONE_ASK_ORIGIN : 'native-user-input',
       ...(asyncUserInput ? { asyncUserInput } : {}),
       ...(asyncFailure ? { asyncFailure } : {}),
       ...(claim ? { originCapability: claim.capability } : {}),

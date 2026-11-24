@@ -7,6 +7,14 @@
 import { describe, expect, it } from 'vitest';
 
 import { parseAskBody, verifiedAskMention } from '../src/core/ask-api.js';
+import { NATIVE_STANDALONE_ASK_ORIGIN } from '../src/core/ask-types.js';
+
+it('accepts a native standalone question with one option and a custom answer path', () => {
+  const q = [{ prompt: 'Native choice', options: [{ key: '1', label: 'Confirm' }], multiSelect: false }];
+  expect(parseAskBody(validBody({ originKind: NATIVE_STANDALONE_ASK_ORIGIN, questions: q })))
+    .toMatchObject({ questions: q, originKind: NATIVE_STANDALONE_ASK_ORIGIN });
+  expect(parseAskBody(validBody({ originKind: 'hook', questions: q }))).toHaveProperty('error');
+});
 
 function validBody(over: Record<string, unknown> = {}) {
   return {

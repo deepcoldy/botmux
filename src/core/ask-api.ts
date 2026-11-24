@@ -10,7 +10,7 @@ import { registerAsk, resolveHookAskFromCli } from './ask-broker.js';
 import { parseOption, parseAskQuestions } from './ask-questions.js';
 export { parseAskQuestions } from './ask-questions.js';
 import type { CreateAskInput, AskResult, AskOption, AskQuestion, CliPermissionOutcome } from './ask-types.js';
-import { isCliPermissionOutcome, shouldReturnAskStartupNotReady } from './ask-types.js';
+import { isCliPermissionOutcome, shouldReturnAskStartupNotReady, NATIVE_STANDALONE_ASK_ORIGIN } from './ask-types.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import type { VcMeetingLiveManagedOrigin } from '../services/vc-meeting-send-policy.js';
 import { CODEX_ASYNC_ASK_ORIGIN, parseCodexAsyncUserInput, type CodexAsyncUserInput } from '../services/codex-async-user-input.js';
@@ -146,7 +146,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (Array.isArray(r.questions)) {
     // 新格式：questions[] 多问多选
     if (r.questions.length === 0) return { error: 'bad_questions' };
-    const parsed = parseAskQuestions(r.questions, { allowSingleOption: !!asyncUserInput, clampDescription: originKind === 'hook' });
+    const parsed = parseAskQuestions(r.questions, { allowSingleOption: !!asyncUserInput || originKind === NATIVE_STANDALONE_ASK_ORIGIN, clampDescription: originKind === 'hook' });
     if (typeof parsed === 'string') return { error: parsed };
     questions = parsed;
   } else if (Array.isArray(r.options) && typeof r.prompt === 'string' && r.prompt.trim()) {

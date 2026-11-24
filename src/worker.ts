@@ -468,7 +468,7 @@ import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
-import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
+import { traexQuestionFlowVisible, traexPendingAsyncQuestionVisible, parseTraexQuestionPage, traexQuestionSignature, traexQuestionState, type TraexQuestionPage } from './utils/traex-question-page.js';
 import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession, doubaoLiveUser } from './services/doubao-transcript.js';
@@ -19294,6 +19294,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
 const KEY_TO_ANSI: Record<string, string> = {
   Up: '\x1b[A', Down: '\x1b[B', Left: '\x1b[D', Right: '\x1b[C',
   Enter: '\r', Space: ' ', Tab: '\t', Escape: '\x1b',
+  'M-Up': '\x1b[1;3A', 'C-u': '\x15',
 };
 
 /** Turn already preempted by a new user message. One preemption per turn: a
@@ -19995,20 +19996,61 @@ function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispat
 
 /** One answer input into the current CLI, serialized with other terminal
  *  writes; false when the backend changed or refused it. */
-async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void): Promise<boolean> {
+async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, expected?: TraexQuestionPage): Promise<boolean> {
   const target = backend;
+  const lifetime = cliLifetimeNonce;
   if (!target || cliRestartInProgress || nativeSessionForkPending()) return false;
   try {
     return await runAfterAmbiguousSubmissionWrites(
       target,
-      () => {
-        if (backend !== target) return false;
+      async () => {
+        if (backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress || nativeSessionForkPending()) return false;
+        if (expected) {
+          const screen = await traexQuestionCapture();
+          if (!screen || backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress
+            || nativeSessionForkPending() || !traexQuestionBridgeActive()) return false;
+          const page = parseTraexQuestionPage(screen);
+          if (!page || traexQuestionSignature(page) !== traexQuestionSignature(expected)
+            || traexQuestionState(page) !== traexQuestionState(expected)) return false;
+        }
         invalidatePromptReadinessEvidence();
         return write(readinessTrackedInput(adapterInputHandle(target))) !== false;
       },
     );
   } catch (err: any) {
     log(`TraeX question answer write failed: ${err?.message ?? err}`);
+    return false;
+  }
+}
+
+/** 打开异步问题的收起面板。序列化等待后再次采集，不能把快捷键写给已换页/换代的 CLI。 */
+function traexQuestionMayOpenPending(known?: TraexQuestionPage): boolean {
+  // 重挂时静止的 CLI 不会重放 OSC；恢复身份或已经生成的原题卡片可用于打开面板，
+  // 但不能替代实际答复时的完整题目、输入状态和进程核验。
+  return traexQuestionBlockReported() || known?.delivery === 'async'
+    || (lastInitConfig?.resume === true && cliOutlivesWorker && lastSpawnEffectiveResume);
+}
+
+async function traexQuestionOpenPending(known?: TraexQuestionPage): Promise<boolean> {
+  const target = backend;
+  const lifetime = cliLifetimeNonce;
+  if (!target || !traexQuestionBridgeActive() || !traexQuestionMayOpenPending(known) || cliRestartInProgress || nativeSessionForkPending()) return false;
+  try {
+    return await runAfterAmbiguousSubmissionWrites(target, async () => {
+      if (backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress
+        || nativeSessionForkPending() || !traexQuestionBridgeActive() || !traexQuestionMayOpenPending(known)) return false;
+      const screen = await traexQuestionCapture();
+      if (!screen || backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress
+        || nativeSessionForkPending() || !traexQuestionBridgeActive() || !traexQuestionMayOpenPending(known)
+        || !traexPendingAsyncQuestionVisible(screen)) return false;
+      const input = readinessTrackedInput(adapterInputHandle(target));
+      invalidatePromptReadinessEvidence();
+      if (input.sendSpecialKeys) return input.sendSpecialKeys('M-Up') !== false;
+      input.write(KEY_TO_ANSI['M-Up']!);
+      return true;
+    });
+  } catch (err: any) {
+    log(`TraeX pending question could not be opened: ${err?.message ?? err}`);
     return false;
   }
 }
@@ -20024,8 +20066,10 @@ const traexQuestionBridge = new TraexQuestionBridge({
   enabled: () => traexQuestionBridgeActive() && !cliRestartInProgress,
   lifetime: () => cliLifetimeNonce,
   capture: traexQuestionCapture,
+  openPending: traexQuestionOpenPending,
+  mayOpenPending: traexQuestionMayOpenPending,
   // The same daemon ask broker (and card) as the RPC path's native questions.
-  ask: (question, signal) => {
+  ask: (question, signal, page) => {
     const cfg = lastInitConfig;
     if (!cfg) return Promise.reject(new Error('session not initialised'));
     return postCodexAsk({
@@ -20035,18 +20079,19 @@ const traexQuestionBridge = new TraexQuestionBridge({
       rootMessageId: cfg.rootMessageId,
       originTurnId: currentBotmuxTurnId,
       originDispatchAttempt: currentBotmuxDispatchAttempt,
+      ...(page?.delivery === 'async' ? { standalone: true } : {}),
     }, [question], signal);
   },
-  writeKey: key => traexQuestionWrite(target => {
+  writeKey: (key, expected) => traexQuestionWrite(target => {
     if (target.sendSpecialKeys) return target.sendSpecialKeys(key);
     target.write(KEY_TO_ANSI[key] ?? key);
     return true;
-  }),
-  paste: text => traexQuestionWrite(target => {
+  }, expected),
+  paste: (text, expected) => traexQuestionWrite(target => {
     if (target.pasteText) target.pasteText(text);
     else target.write(wrapBracketedPaste(text));
     return true;
-  }),
+  }, expected),
   notify: (key, params) => send({
     type: 'user_notify',
     turnId: currentBotmuxTurnId,
@@ -26636,7 +26681,7 @@ function startScreenUpdates(): void {
       // one the per-chunk hold check missed (its card is raised from a fresh
       // capture, see core/traex-question-bridge.ts).
       if (traexQuestionBridgeActive()
-        && [lastAnalyzerSnapshot, renderer?.rawSnapshot() ?? ''].some(screen => traexQuestionFlowVisible(screen))) {
+        && [lastAnalyzerSnapshot, renderer?.rawSnapshot() ?? ''].some(screen => traexQuestionFlowVisible(screen) || traexPendingAsyncQuestionVisible(screen))) {
         traexQuestionBridge.kick();
       }
 
