@@ -6223,6 +6223,10 @@ const SESSION_RENAME_IDLE_TIMEOUT_MS = 5_000;
 const SESSION_RENAME_RECHECK_MS = 2_000;
 const SESSION_RENAME_SLOW_RECHECK_MS = 10_000;
 const SESSION_RENAME_FAST_RECHECK_WINDOW_MS = 30_000;
+/** A missing durable receipt may delay delivery, never disable it indefinitely.
+ *  Leave the fast-recheck window intact, then allow one slower final grace
+ *  period before a positively writable composer fails open with a warning. */
+const SESSION_RENAME_HOLD_TIMEOUT_MS = 45_000;
 let sessionRenameIdleTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionRenameReattachRetryTimer: ReturnType<typeof setTimeout> | null = null;
 /** The rename in flight: the exact command typed, the adapter's durable-record
@@ -6232,6 +6236,8 @@ let sessionRenameRecorded: (() => boolean) | undefined;
 let sessionRenameResubmitted = false;
 let sessionRenameHoldLogged = false;
 let sessionRenameHoldNoticeSent = false;
+let sessionRenameHoldTimeoutLogged = false;
+let sessionRenameHoldTimeoutNoticeSent = false;
 let sessionRenameSentAtMs = 0;
 
 function sessionRenameInFlight(): boolean {
@@ -6254,6 +6260,8 @@ function forceClearSessionRenameInFlight(): void {
   sessionRenameResubmitted = false;
   sessionRenameHoldLogged = false;
   sessionRenameHoldNoticeSent = false;
+  sessionRenameHoldTimeoutLogged = false;
+  sessionRenameHoldTimeoutNoticeSent = false;
   sessionRenameSentAtMs = 0;
 }
 
@@ -6281,7 +6289,6 @@ function sessionRenameSurfaceNow(): SessionRenameSurface | undefined {
  * Never fall back to lastInitConfig.cliSessionId: configuration alone cannot
  * prove which native thread a surviving pane owns. */
 function sessionRenameNativeSessionIdNow(): string | undefined {
-  if (inputDeliveryObservedCliSessionId) return inputDeliveryObservedCliSessionId;
   const cliId = lastInitConfig?.cliId;
   if (cliId !== 'codex' && cliId !== 'traex') return undefined;
   if (cliId === 'codex') {
@@ -6302,6 +6309,9 @@ function sessionRenameNativeSessionIdNow(): string | undefined {
     const owns = (sid: string): boolean => owned.has(sid) || owned.has(sid.toLowerCase());
     const bridgeSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
     if (bridgeSid && owns(bridgeSid)) observed = bridgeSid;
+    if (!observed && inputDeliveryObservedCliSessionId && owns(inputDeliveryObservedCliSessionId)) {
+      observed = inputDeliveryObservedCliSessionId;
+    }
     if (!observed && owned.size === 1) {
       const rollout = findTraexRolloutByPid(pid);
       if (rollout && owns(rollout.cliSessionId)) observed = rollout.cliSessionId;
@@ -6314,6 +6324,9 @@ function sessionRenameNativeSessionIdNow(): string | undefined {
     if (liveSid && owns(liveSid)) observed = liveSid;
     const bridgeSid = codexBridgeRolloutPath ? codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
     if (!observed && bridgeSid && owns(bridgeSid)) observed = bridgeSid;
+    if (!observed && inputDeliveryObservedCliSessionId && owns(inputDeliveryObservedCliSessionId)) {
+      observed = inputDeliveryObservedCliSessionId;
+    }
     if (!observed && owned.size === 1) {
       const rollout = findCodexRolloutByPid(pid);
       if (rollout && owns(rollout.cliSessionId)) observed = rollout.cliSessionId;
@@ -6355,6 +6368,25 @@ function notifySessionRenameInputHeld(): void {
   });
 }
 
+/** The hard-cap outcome is a different notice from the initial "still waiting"
+ *  message, so it is not swallowed by that earlier notification's latch. */
+function notifySessionRenameInputTimeout(outcome: 'held' | 'released'): void {
+  const head = pendingMessages[0] ?? pendingAdoptMessages[0];
+  const rawHead = pendingRawInputs[0];
+  if ((outcome === 'held' && sessionRenameHoldTimeoutNoticeSent) || (!head && !rawHead)) return;
+  if (outcome === 'held') sessionRenameHoldTimeoutNoticeSent = true;
+  send({
+    type: 'user_notify',
+    turnId: head?.turnId ?? rawHead?.turnId ?? currentBotmuxTurnId,
+    dispatchAttempt: head?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+    message: t(outcome === 'released'
+      ? 'worker.session_rename_release_timeout'
+      : 'worker.session_rename_hold_timeout', {
+      cliName: cliName(), seconds: Math.round(SESSION_RENAME_HOLD_TIMEOUT_MS / 1000),
+    }),
+  });
+}
+
 /** Judge the rename in flight and act on it: release queued input, press the
  *  one recovery Enter, or keep holding and re-read. `prompt` is a screen-idle
  *  edge (markPromptReady already restores readiness and flushes); `timer` is
@@ -6363,18 +6395,24 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
   if (sessionRenamePhase !== 'sent') return;
   const surface = sessionRenameSurfaceNow();
   const recorded = surface !== undefined && surface !== 'unsubmitted' && sessionRenameRecorded?.() === true;
+  const holdExpired = Date.now() - sessionRenameSentAtMs >= SESSION_RENAME_HOLD_TIMEOUT_MS;
   const step = decideSessionRenameSettlement({
     surface,
     recorded,
     resubmitted: sessionRenameResubmitted,
     fromPrompt: source === 'prompt',
+    holdExpired,
   });
-  if (step === 'release') {
+  if (step === 'release' || step === 'release_unconfirmed') {
     const held = sessionRenameHoldLogged;
+    const timedOut = step === 'release_unconfirmed';
+    if (timedOut) notifySessionRenameInputTimeout('released');
     forceClearSessionRenameInFlight();
     const evidence = surface === undefined ? 'unjudged' : 'recorded by the CLI';
     if (source === 'prompt') {
-      if (held) log(`Native session rename confirmed (${evidence}); releasing queued input`);
+      if (held || timedOut) log(timedOut
+        ? `WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; the ${cliName()} composer is writable, releasing queued input without a receipt`
+        : `Native session rename confirmed (${evidence}); releasing queued input`);
       return;
     }
     // The timer means prompt redraw detection failed. Restore the gate
@@ -6382,9 +6420,11 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
     // flushPending would keep waiting for the very signal this timer replaces.
     isPromptReady = true;
     reattachOpenTurnGate = false;
-    log(surface === undefined
-      ? `Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`
-      : `Native session rename confirmed (${evidence}); releasing queued input`);
+    log(timedOut
+      ? `WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; the ${cliName()} composer is writable, releasing queued input without a receipt`
+      : surface === undefined
+        ? `Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`
+        : `Native session rename confirmed (${evidence}); releasing queued input`);
     void flushPending();
     return;
   }
@@ -6393,7 +6433,8 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
       sessionRenameResubmitted = true;
       log(`Native session rename command is still in the ${cliName()} composer; pressed Enter once to submit it`);
     }
-    armSessionRenameIdleTimeout(SESSION_RENAME_RECHECK_MS);
+    const remainingMs = SESSION_RENAME_HOLD_TIMEOUT_MS - (Date.now() - sessionRenameSentAtMs);
+    armSessionRenameIdleTimeout(remainingMs > 0 ? Math.min(SESSION_RENAME_RECHECK_MS, remainingMs) : SESSION_RENAME_RECHECK_MS);
     return;
   }
   if (source === 'prompt') return;  // the armed timer re-reads and owns notice/recovery
@@ -6401,9 +6442,20 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
     sessionRenameHoldLogged = true;
     log(`Native session rename not confirmed (${surface}${sessionRenameResubmitted ? ' after one resubmit' : ''}); holding queued input until this rename is recorded and the ${cliName()} input surface is writable`);
   }
-  notifySessionRenameInputHeld();
-  armSessionRenameIdleTimeout(Date.now() - sessionRenameSentAtMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
-    ? SESSION_RENAME_RECHECK_MS : SESSION_RENAME_SLOW_RECHECK_MS);
+  if (holdExpired) {
+    if (!sessionRenameHoldTimeoutLogged) {
+      sessionRenameHoldTimeoutLogged = true;
+      log(`WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms on a ${surface} surface; queued input remains held for safety`);
+    }
+    notifySessionRenameInputTimeout('held');
+  } else {
+    notifySessionRenameInputHeld();
+  }
+  const elapsedMs = Date.now() - sessionRenameSentAtMs;
+  const cadenceMs = elapsedMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
+    ? SESSION_RENAME_RECHECK_MS : SESSION_RENAME_SLOW_RECHECK_MS;
+  const remainingMs = SESSION_RENAME_HOLD_TIMEOUT_MS - elapsedMs;
+  armSessionRenameIdleTimeout(remainingMs > 0 ? Math.min(cadenceMs, remainingMs) : cadenceMs);
 }
 
 /** A prompt can release rename only after the command Enter was actually sent.
@@ -6428,7 +6480,9 @@ function settleFailedSessionRenameWrite(): void {
  * redraw output for IdleDetector to rediscover the prompt. Without an adapter
  * verdict this fails open, so one administrative command cannot wedge all
  * later Lark messages; with one, queued input waits for this thread's durable
- * rename receipt and a writable input surface. */
+ * rename receipt and a writable input surface. The hard cap releases only a
+ * positively settled surface without a receipt; every other surface produces
+ * an explicit timeout notice and keeps the anti-title-corruption hold. */
 function armSessionRenameIdleTimeout(delayMs = SESSION_RENAME_IDLE_TIMEOUT_MS): void {
   if (sessionRenamePhase !== 'sent') return;
   if (sessionRenameIdleTimer) clearTimeout(sessionRenameIdleTimer);
@@ -6445,8 +6499,11 @@ function armSessionRenameReattachRecoveryRetry(): void {
   if (sessionRenameReattachRetryTimer) return;
   if (!sessionRenameSentAtMs) sessionRenameSentAtMs = Date.now();
   const generation = cliSpawnGeneration;
-  const delayMs = Date.now() - sessionRenameSentAtMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
+  const elapsedMs = Date.now() - sessionRenameSentAtMs;
+  const cadenceMs = elapsedMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
     ? SESSION_RENAME_RECHECK_MS : SESSION_RENAME_SLOW_RECHECK_MS;
+  const remainingMs = SESSION_RENAME_HOLD_TIMEOUT_MS - elapsedMs;
+  const delayMs = remainingMs > 0 ? Math.min(cadenceMs, remainingMs) : cadenceMs;
   sessionRenameReattachRetryTimer = setTimeout(() => {
     sessionRenameReattachRetryTimer = null;
     if (generation === cliSpawnGeneration) void flushPending();
@@ -6471,6 +6528,7 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
     return false;
   }
   const command = adapter.buildSessionRenameCommand(title);
+  if (!sessionRenameSentAtMs) sessionRenameSentAtMs = Date.now();
   sessionRenameCommand = command;
   const surface = sessionRenameSurfaceNow();
   if (surface === 'unknown') {
@@ -6479,7 +6537,15 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
       sessionRenameHoldLogged = true;
       log('Native session rename recovery cannot classify the surviving terminal; holding restored input and retrying');
     }
-    notifySessionRenameInputHeld();
+    if (Date.now() - sessionRenameSentAtMs >= SESSION_RENAME_HOLD_TIMEOUT_MS) {
+      if (!sessionRenameHoldTimeoutLogged) {
+        sessionRenameHoldTimeoutLogged = true;
+        log(`WARN Native session rename recovery remains unknown after ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; restored input stays held`);
+      }
+      notifySessionRenameInputTimeout('held');
+    } else {
+      notifySessionRenameInputHeld();
+    }
     armSessionRenameReattachRecoveryRetry();
     return true;
   }
@@ -6488,23 +6554,23 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
     sessionRenameReattachRetryTimer = null;
   }
   sessionRenameReattachRecoveryGeneration = generation;
-  sessionRenameSentAtMs = 0;
   if (surface === undefined || surface === 'settled') {
     sessionRenameCommand = undefined;
     sessionRenameHoldLogged = false;
     sessionRenameHoldNoticeSent = false;
+    sessionRenameHoldTimeoutLogged = false;
+    sessionRenameHoldTimeoutNoticeSent = false;
+    sessionRenameSentAtMs = 0;
     return false;
   }
   sessionRenamePhase = 'sent';
-  sessionRenameSentAtMs = Date.now();
   sessionRenameResubmitted = false;
   try {
     sessionRenameRecorded = adapter.watchSessionRename?.(command, {
       getCliSessionId: sessionRenameNativeSessionIdNow,
-      // The predecessor may have completed the rename before it died. That
-      // existing exact receipt releases only AFTER the current surface stops
-      // being occupied/unsubmitted; it never hides the surviving draft.
-      fromByte: 0,
+      // Only a receipt appended AFTER this recovery began may release unknown
+      // evidence. A historical same-title receipt cannot prove that the exact
+      // draft surviving in this pane has executed.
     });
   } catch { sessionRenameRecorded = undefined; }
   log(`Recovered native session rename state after persistent reattach (${surface}); restored input stays held`);
@@ -25408,6 +25474,8 @@ async function flushPending(): Promise<void> {
           sessionRenameResubmitted = false;
           sessionRenameHoldLogged = false;
           sessionRenameHoldNoticeSent = false;
+          sessionRenameHoldTimeoutLogged = false;
+          sessionRenameHoldTimeoutNoticeSent = false;
           try {
             // This is the live, observed native identity, not a possibly stale
             // init-time resume target. An adopt/reattach that has not proven its

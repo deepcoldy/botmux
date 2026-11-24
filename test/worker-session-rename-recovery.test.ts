@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { decideSessionRenameSettlement } from '../src/core/session-rename-settlement.js';
+import { watchNativeSessionIndex } from '../src/services/native-session-index.js';
 
 const TITLE = '[BotMux·Lark] restored title';
 const COMMAND = `/rename ${TITLE}`;
@@ -27,9 +31,11 @@ function recoveryHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'unkn
     sessionRenameHoldLogged: false,
     sessionRenameHoldNoticeSent: false,
     sessionRenameSentAtMs: 0,
+    SESSION_RENAME_HOLD_TIMEOUT_MS: 45_000,
     sessionRenameReattachRetryTimer: null,
     armSessionRenameReattachRecoveryRetry: vi.fn(),
     notifySessionRenameInputHeld: vi.fn(),
+    notifySessionRenameInputTimeout: vi.fn(),
     armSessionRenameIdleTimeout: vi.fn(),
     log: vi.fn(),
   };
@@ -37,7 +43,7 @@ function recoveryHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'unkn
 }
 
 describe('native rename recovery after persistent worker reattach', () => {
-  it('re-arms an exact surviving draft with the original receipt baseline and dynamic identity', () => {
+  it('re-arms an exact surviving draft with a fresh receipt baseline and dynamic identity', () => {
     const h = recoveryHarness('unsubmitted');
     expect(h.recover()).toBe(true);
     expect(h.scope.sessionRenamePhase).toBe('sent');
@@ -45,12 +51,60 @@ describe('native rename recovery after persistent worker reattach', () => {
     expect(h.scope.armSessionRenameIdleTimeout).toHaveBeenCalledOnce();
     expect(h.watchSessionRename).toHaveBeenCalledWith(COMMAND, {
       getCliSessionId: h.scope.sessionRenameNativeSessionIdNow,
-      fromByte: 0,
     });
     expect(h.recover()).toBe(false);
     expect(h.scope.armSessionRenameIdleTimeout).toHaveBeenCalledOnce();
   });
 
+  it('does not let a historical same-title receipt release an unknown surviving surface', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-rename-recovery-index-'));
+    try {
+      const path = join(dir, 'session_index.jsonl');
+      const receipt = `${JSON.stringify({ id: 'native-id', thread_name: TITLE, updated_at: '2026-11-24T00:00:00Z' })}\n`;
+      writeFileSync(path, receipt);
+      const h = recoveryHarness('unsubmitted');
+      h.scope.cliAdapter.watchSessionRename = (_command: string, opts: {
+        getCliSessionId: () => string | undefined; fromByte?: number;
+      }) => watchNativeSessionIndex(path, TITLE, opts.getCliSessionId, opts.fromByte);
+      expect(h.recover()).toBe(true);
+
+      h.scope.sessionRenameSurfaceNow = () => 'unknown';
+      expect(h.scope.sessionRenameRecorded()).toBe(false);
+      expect(decideSessionRenameSettlement({
+        surface: 'unknown', recorded: h.scope.sessionRenameRecorded(), resubmitted: true, fromPrompt: false,
+      })).toBe('hold');
+
+      appendFileSync(path, receipt);
+      expect(h.scope.sessionRenameRecorded()).toBe(true);
+      expect(decideSessionRenameSettlement({
+        surface: 'unknown', recorded: h.scope.sessionRenameRecorded(), resubmitted: true, fromPrompt: false,
+      })).toBe('release');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('notifies on the hard cap even when surviving evidence stays unknown', () => {
+    const h = recoveryHarness('unknown');
+    Object.assign(h.scope, {
+      sessionRenameSentAtMs: Date.now() - 45_000,
+      SESSION_RENAME_HOLD_TIMEOUT_MS: 45_000,
+      notifySessionRenameInputTimeout: vi.fn(),
+    });
+    expect(h.recover()).toBe(true);
+    expect(h.scope.notifySessionRenameInputTimeout).toHaveBeenCalledWith('held');
+    expect(h.scope.armSessionRenameReattachRecoveryRetry).toHaveBeenCalledOnce();
+  });
+
+  it('keeps one recovery clock when an unknown surface becomes an exact surviving draft', () => {
+    const h = recoveryHarness('unknown');
+    const startedAt = Date.now() - 1_000;
+    h.scope.sessionRenameSentAtMs = startedAt;
+    expect(h.recover()).toBe(true);
+    h.scope.sessionRenameSurfaceNow = () => 'unsubmitted';
+    expect(h.recover()).toBe(true);
+    expect(h.scope.sessionRenameSentAtMs).toBe(startedAt);
+  });
   it('holds an occupied surface even when the predecessor already wrote this exact receipt', () => {
     const h = recoveryHarness('occupied');
     expect(h.recover()).toBe(true);
@@ -119,6 +173,21 @@ describe('sessionRenameNativeSessionIdNow', () => {
     const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
     expect(resolve()).toBe('native-id');
     expect(scope.inputDeliveryObservedCliSessionId).toBe('native-id');
+  });
+
+  it('follows the live Codex thread instead of polling a previously cached thread id', () => {
+    const scope: Record<string, any> = {
+      inputDeliveryObservedCliSessionId: 'thread-a',
+      lastInitConfig: { cliId: 'codex' },
+      backend: {}, codexRpcEngine: undefined, codexBridgeRolloutPath: undefined,
+      currentCodexObservedPid: () => 123,
+      findCodexRolloutSetByPid: () => new Set(['thread-b']),
+      readCodexLiveSessionId: () => 'thread-b',
+      codexHistorySidIsOwned: (sid: string, owned: Set<string>) => owned.has(sid),
+    };
+    const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
+    expect(resolve()).toBe('thread-b');
+    expect(scope.inputDeliveryObservedCliSessionId).toBe('thread-b');
   });
 
   it('uses an explicitly bound remote Codex thread without requiring a local rollout fd', () => {

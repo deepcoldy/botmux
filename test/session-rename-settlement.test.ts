@@ -55,6 +55,19 @@ describe('decideSessionRenameSettlement', () => {
     expect(decide({ surface: 'unsubmitted', recorded: true })).toBe('resubmit');
     expect(decide({ surface: 'unsubmitted', recorded: true, resubmitted: true })).toBe('hold');
   });
+
+  it('fails open after the hold cap only on a positively writable idle composer', () => {
+    expect(decide({ surface: 'settled', holdExpired: true })).toBe('release_unconfirmed');
+    expect(decide({ surface: 'settled', recorded: true, holdExpired: true })).toBe('release');
+    expect(decide({ surface: 'unknown', holdExpired: true })).toBe('hold');
+    expect(decide({ surface: 'occupied', holdExpired: true })).toBe('hold');
+  });
+
+  it('never turns the hold cap into a late automatic Enter or release of a visible rename command', () => {
+    expect(decide({ surface: 'unsubmitted', holdExpired: true })).toBe('hold');
+    expect(decide({ surface: 'unsubmitted', recorded: true, holdExpired: true })).toBe('hold');
+    expect(decide({ surface: 'unsubmitted', resubmitted: true, holdExpired: true })).toBe('hold');
+  });
 });
 
 describe('sessionRenameWriteFailureAction', () => {
@@ -203,6 +216,14 @@ describe('watchNativeSessionIndex', () => {
     appendFileSync(path, record(TITLE));
     expect(recorded()).toBe(false);
     nativeId = NATIVE_ID;
+    expect(recorded()).toBe(true);
+  });
+
+  it('matches UUID thread ids case-insensitively', () => {
+    const path = index();
+    const lower = '01a20bdb-47c4-7702-8188-21c3628071d2';
+    const recorded = watchNativeSessionIndex(path, TITLE, () => lower.toUpperCase());
+    appendFileSync(path, record(TITLE, lower));
     expect(recorded()).toBe(true);
   });
 
