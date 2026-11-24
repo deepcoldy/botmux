@@ -76,6 +76,42 @@ export function collabCreatorAdmissionOperationId(initId: string): string {
   return sha256Hex(canonicalJson([initId, 'creator-admission']));
 }
 
+/** forward operation 的稳定 uuid = sha256(canonicalJson([initId, 'forward'])).slice(0,32)。 */
+export function collabForwardUuid(initId: string): string {
+  return sha256Hex(canonicalJson([initId, 'forward'])).slice(0, 32);
+}
+
+/** payloadHash = sha256(canonicalJson(payload))，逐 operation 落账用（§10.1）。 */
+export function collabPayloadHash(payload: unknown): string {
+  return sha256Hex(canonicalJson(payload));
+}
+
+/** 建群 uuid 去重窗口（§10.3）：飞书同 uuid 10h 内去重，超窗不自动重建。 */
+export const COLLAB_CREATE_UUID_WINDOW_MS = 10 * 60 * 60 * 1000;
+
+/**
+ * 阶段 2 持久化的 creator 扣费回执（防崩溃重投二次扣费）。幂等键 =
+ * creatorAdmissionOperationId；origin* provenance 供 S1 registerSessionGroup 恢复，
+ * 避免后续 creator 消息走无限额 oncall。
+ */
+export interface CreatorAdmissionReceipt {
+  operationId: string;
+  /** 扣费所用的 quotaKey（来自 evaluateTalk；无 = 无限额授权）。 */
+  quotaKey?: string;
+  /** 扣费后 used 值（无限额时 0）。 */
+  used: number;
+  /** 扣费成功时刻（epoch ms）。 */
+  chargedAt: number;
+  /** 恒 true（本 receipt 只在扣费成功后落盘）。 */
+  allow: true;
+  /** 来源授权 reason（evaluateTalk.reason；originReason 以 string 存，避免 import cycle）。 */
+  originReason?: string;
+  /** 来源授权 quotaKey（= quotaKey）。 */
+  originQuotaKey?: string;
+  /** 来源 chat（= 出生前那个 DM）。 */
+  originChatId?: string;
+}
+
 // ─── configVersion（§4.2）─────────────────────────────────────────────────
 
 /**

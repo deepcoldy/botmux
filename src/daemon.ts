@@ -1230,6 +1230,7 @@ import { getAssistantOwner, markAssistantOwnerLeft, setAssistantOwner } from './
 import { assistantScheduleCreatorAllowed, assistantSessionStillOwned, isAssistantOwnerOfChat, resolveAssistantSpawn } from './core/assistant-spawn.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
 import { preflightCollabGroupBirth, startCollabGroupBirth, releaseCollabGroupBirth } from './core/collab-group-birth.js';
+import { buildCreatorAdmissionReceipt, persistCreatorAdmissionReceipt } from './core/collab-orchestrator.js';
 import { scheduleSessionGroupTitle, subscribeSessionGroupTitles } from './services/session-group-title.js';
 import { hasPendingGroupAutoTitle, scheduleGroupAutoTitle } from './services/group-auto-title.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
@@ -28151,9 +28152,29 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       return;
     }
     quotaConsumedBeforeSessionGroupBirth = true;
-    // 协作 ready 走 startCollabGroupBirth（阶段 3 占位，S1–S5 编排 PR-2）；legacy 走原 maybeBirthSessionGroup。
+    // 协作 ready 走 startCollabGroupBirth（S1 create 编排）；legacy 走原 maybeBirthSessionGroup。
     if (collabPreflight.kind === 'ready') {
-      const result = await startCollabGroupBirth(data, ctx, collabPreflight.initId, /* creatorAdmissionReceipt */ undefined);
+      // 阶段 2：扣费成功后构建并持久化 creatorAdmissionReceipt（防崩溃重投二次扣费）。
+      const talkEv = evaluateTalk(larkAppId, chatId, quotaSenderOpenId, quotaTeamTrustUnionId, quotaSenderUnionId, chatType);
+      const quotaUsed = talkEv.quotaKey
+        ? (getBot(larkAppId).config.quotaState?.[talkEv.quotaKey]?.used ?? 0)
+        : 0;
+      const receipt = buildCreatorAdmissionReceipt({
+        operationId: collabPreflight.creatorAdmissionOperationId,
+        talk: { allowed: talkEv.allowed, reason: talkEv.reason, quotaKey: talkEv.quotaKey },
+        used: quotaUsed,
+        chargedAt: Date.now(),
+        originChatId: chatId,
+      });
+      await persistCreatorAdmissionReceipt({
+        dataDir: config.session.dataDir,
+        creatorAppId: larkAppId,
+        initId: collabPreflight.initId,
+        receipt,
+        now: Date.now(),
+      }).catch(() => { /* receipt 落盘失败不阻断 S1，但会失去二次扣费防护 */ });
+
+      const result = await startCollabGroupBirth(data, ctx, collabPreflight.initId, receipt);
       // 收到 collab-handled 后不递归 handleNewTopic、不落 DM thread（铁律 1）。
       if (result.kind === 'collab-handled') return;
       if (result.kind === 'legacy' && result.ctx) {

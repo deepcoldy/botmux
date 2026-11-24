@@ -218,3 +218,90 @@ export function markCollabInitTerminal(opts: {
     writeStore(opts.dataDir, opts.creatorAppId, store);
   });
 }
+
+// ─── entry patch 原语（S1 编排逐 operation 落账，PR-2）────────────────────
+
+/**
+ * 在 per-app mutex 内原子 patch 一个 entry（读→改→写，同文件同次原子写）。
+ * `mutate` 返回 false 表示「不写盘」（no-op），true 表示需落盘。
+ * 返回 patch 后的 entry（entry 不存在返回 undefined）。
+ */
+export function patchCollabInitEntry(
+  opts: {
+    dataDir: string;
+    creatorAppId: string;
+    initId: string;
+    mutate: (entry: CollabGroupInitEntry) => boolean;
+  },
+): Promise<CollabGroupInitEntry | undefined> {
+  return queueFor(opts.creatorAppId).run(async () => {
+    const store = readCollabInitStore(opts.dataDir, opts.creatorAppId);
+    const entry = store.entries[opts.initId];
+    if (!entry) return undefined;
+    const dirty = opts.mutate(entry);
+    if (dirty) writeStore(opts.dataDir, opts.creatorAppId, store);
+    return entry;
+  });
+}
+
+/** 读取单个 entry（不写，不在 mutex 内）。 */
+export function readCollabInitEntry(
+  dataDir: string,
+  creatorAppId: string,
+  initId: string,
+): CollabGroupInitEntry | undefined {
+  return readCollabInitStore(dataDir, creatorAppId).entries[initId];
+}
+
+/**
+ * 原子推进某个 step 的状态（S1 编排用）。同文件同次原子写；entry 不存在为 no-op。
+ */
+export function advanceCollabStep(opts: {
+  dataDir: string;
+  creatorAppId: string;
+  initId: string;
+  step: CollabStepKey;
+  status: CollabStepStatus;
+  now: number;
+  error?: string;
+}): Promise<void> {
+  return queueFor(opts.creatorAppId).run(async () => {
+    const store = readCollabInitStore(opts.dataDir, opts.creatorAppId);
+    const entry = store.entries[opts.initId];
+    if (!entry) return;
+    entry.steps[opts.step] = { status: opts.status, at: opts.now, ...(opts.error !== undefined ? { error: opts.error } : {}) };
+    entry.updatedAt = opts.now;
+    writeStore(opts.dataDir, opts.creatorAppId, store);
+  });
+}
+
+/**
+ * 原子写入/更新一个 operation（逐 operation 落账 §10.1）。`opKey` 即 operations 的
+ * 键（如 creatorAdmissionOperationId / createUuid / forwardUuid）。同文件同次原子写；
+ * entry 不存在为 no-op。重入判 payloadHash 由调用方负责。
+ */
+export function writeCollabOperation(opts: {
+  dataDir: string;
+  creatorAppId: string;
+  initId: string;
+  opKey: string;
+  op: {
+    kind: CollabOperationKind;
+    status: CollabOperationStatus;
+    uuid?: string;
+    firstAttemptAt?: number;
+    payloadHash: string;
+    receipt?: unknown;
+    error?: string;
+  };
+  now: number;
+}): Promise<void> {
+  return queueFor(opts.creatorAppId).run(async () => {
+    const store = readCollabInitStore(opts.dataDir, opts.creatorAppId);
+    const entry = store.entries[opts.initId];
+    if (!entry) return;
+    entry.operations[opts.opKey] = opts.op;
+    entry.updatedAt = opts.now;
+    writeStore(opts.dataDir, opts.creatorAppId, store);
+  });
+}

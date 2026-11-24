@@ -22,6 +22,7 @@ import {
   COLLAB_CREATE_ATTEMPT_INITIAL,
   validateSessionGroupCollaborationConfig,
   type CollabValidationDeps,
+  type CreatorAdmissionReceipt,
   type SessionGroupCollaborationConfig,
 } from '../services/collab-group-config.js';
 import { loadBotConfigsCached } from '../bot-registry.js';
@@ -29,6 +30,10 @@ import {
   markCollabInitTerminal,
   placeCollabGroupInit,
 } from '../services/collab-init-store.js';
+import { createChatWithUuid } from '../services/groups-store.js';
+import { registerSessionGroup } from '../services/session-groups-store.js';
+import { forwardMessage } from '../im/lark/client.js';
+import { runCollabGroupBirthS1, type CollabS1Deps } from './collab-orchestrator.js';
 import type { RoutingContext } from '../im/lark/event-dispatcher.js';
 
 export type CollabPreflightResult =
@@ -189,22 +194,34 @@ export async function preflightCollabGroupBirth(
 }
 
 /**
- * 阶段 3：建群编排入口（S1–S5 本体留 PR-2，本单只给签名与占位语义）。
+ * 阶段 3：建群编排入口（PR-2a 落地 S1 create；S2–S5 留 PR-2b/PR-3）。
  *
  * 调用方收到 `collab-handled` 后不得递归 `handleNewTopic`、不落 DM thread；
  * `legacy` 才继续现有 `maybeBirthSessionGroup` 路径。creator 是否 immediate /
  * afterAgentTurn 完全由 S5 决定（PR-3）。
+ *
+ * `creatorAdmissionReceipt` 已在 daemon 接缝扣费成功后持久化到 entry；恢复路径
+ * （entry 已有 receipt）跳过扣费直接进 S1。
  */
 export async function startCollabGroupBirth(
-  _data: any,
-  _ctx: RoutingContext,
+  data: any,
+  ctx: RoutingContext,
   initId: string,
-  _creatorAdmissionReceipt: unknown,
+  creatorAdmissionReceipt: CreatorAdmissionReceipt,
+  depsOverride?: Partial<CollabS1Deps>,
 ): Promise<SessionGroupBirthResult> {
-  // PR-2 占位：真实编排（createUuid 建群、邀请、授权、角色、kickoff）尚未实现。
-  // 显式 enabled 的 bot 在 PR-1 不会走到这里被静默吞掉——daemon 接缝在 PR-1 仍把
-  // preflight 判定为 ready 的回合标记为 collab-handled，等待 PR-2 编排落地。
-  return { kind: 'collab-handled', initId, status: 'running' };
+  const dataDir = depsOverride?.dataDir ?? config.session.dataDir;
+  const deps: CollabS1Deps = {
+    dataDir,
+    now: depsOverride?.now ?? (() => Date.now()),
+    createChat: depsOverride?.createChat ?? (async (creatorAppId, opts) =>
+      createChatWithUuid(creatorAppId, opts)),
+    forward: depsOverride?.forward ?? ((larkAppId, messageId, chatId, uuid) =>
+      forwardMessage(larkAppId, messageId, chatId, uuid)),
+    registerGroup: depsOverride?.registerGroup ?? ((chatId, entry) =>
+      registerSessionGroup(chatId, entry)),
+  };
+  return runCollabGroupBirthS1(data, ctx, initId, creatorAdmissionReceipt, deps);
 }
 
 /**

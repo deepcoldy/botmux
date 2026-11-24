@@ -394,10 +394,11 @@ describe('协作初始化入口：fail-closed 不扣费不建群', () => {
 
       await handleNewTopic(dmEvent('ready 协作任务', 'om_ready'), dmCtx('om_ready'));
 
-      // ready 后走 startCollabGroupBirth 占位（collab-handled，不建群不递归），扣费恰好 1 次
+      // ready 后走 startCollabGroupBirth 的 S1 编排（createChatWithUuid，非 createGroupWithBots），
+      // 扣费恰好 1 次；S1 内部建群走 im.v1.chat.create（本测试未 mock，抛错被记为 create_unknown，
+      // 仍返回 collab-handled 不递归、不落 legacy）。S1 内部顺序由 collab-orchestrator.test.ts 覆盖。
       expect(chargedUnits()).toBe(1);
       expect(mocks.createGroupWithBots).not.toHaveBeenCalled();
-      // 残留 running 是 PR-1 占位语义（编排未实现前的测试 seam 场景，非生产路径）
     } finally {
       __testOnly_setCollabPeerPreflight(undefined);
     }
