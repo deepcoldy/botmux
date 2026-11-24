@@ -217,6 +217,7 @@ export const messages: Record<string, string> = {
   'worker.quota_chain.continue_prompt': '[Botmux 额度切换] {from} 的额度已用完，本会话已切换到 {to}。请继续完成上一条请求；上一个模型可能已经做了一部分，先检查当前状态，已经成功的操作不要重复执行。',
   'worker.quota_chain.request_label': '被打断的请求原文：',
   'worker.quota_chain.retrying': '⏳ {from} 被限流，先在原 CLI 上自动重试（最多 {max} 次），仍不行再切换到 {to}。',
+  'worker.quota_chain.reset_unknown': '恢复时间未知',
   'worker.traex_auto_model.catalog_prune': '⚠️ 实时完整目录已确认以下模型在当前 TraeX 入口不可用：{models}。即将永久删除它们在自动模型池中的条目及独立设置；其余模型和原会话历史保留。',
   'worker.traex_auto_model.catalog_switch': '↪️ {fromModel} 已不在当前可用目录中，正在使用白名单内的 {toModel} 续接原会话；不保证免排队，也不会重新发送原始任务。',
   'worker.traex_auto_model.catalog_empty': '⚠️ 自动模型池已没有可用模型，已停止选模。请前往控制台重新配置模型池；不会使用池外模型或清空原会话。',

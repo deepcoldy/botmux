@@ -2379,6 +2379,12 @@ function finalizeCliTurnInput(
       ...(opts.acceptedInput.trustedCaller ? { trustedCaller: opts.acceptedInput.trustedCaller } : {}) };
     userText = opts.acceptedInput.content;
   }
+  // Keep the structured attachments beside the exact input for daemon-side
+  // failure recovery. The legacy/structured model input was already built above;
+  // this metadata is not sent as a new worker control field.
+  if (opts?.attachments?.length) {
+    payload = { ...payload, attachments: opts.attachments.map(attachment => ({ ...attachment })) };
+  }
   // Builders only describe explicitly model-visible sources. They do not read
   // mutable rollout configuration: the real fork/send boundary freezes that
   // decision after every await/defer. Keep callers without a daemon app scope
@@ -2759,6 +2765,8 @@ export function rememberLastCliInput(
   ds.session.lastCliInputTurnId = inputTurnId;
   if (replayCodexAppInput) ds.session.lastCodexAppInput = replayCodexAppInput;
   else delete ds.session.lastCodexAppInput;
+  if (normalized.attachments?.length) ds.session.lastAttachments = structuredClone(normalized.attachments);
+  else delete ds.session.lastAttachments;
   ds.session.replyThreadAliases = ds.replyThreadAliases;
   ds.session.currentReplyTarget = ds.currentReplyTarget;
   sessionStore.updateSession(ds.session);

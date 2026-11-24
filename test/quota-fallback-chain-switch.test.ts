@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const killWorkerMock = vi.fn();
 const forkWorkerMock = vi.fn((..._args: any[]) => true);
 const prepareMock = vi.fn(async (..._args: any[]) => {});
+const waitExitMock = vi.fn((worker: any) => new Promise(resolve => worker.once('exit', () => resolve(true))));
 const destroyPaneMock = vi.fn();
 let activeDs: any;
 
@@ -29,16 +30,24 @@ vi.mock('../src/core/worker-pool.js', () => ({
   isSessionRestartInFlight: () => false,
   isSessionTransferring: () => false,
   WORKER_SIGKILL_BACKSTOP_MS: 7_000,
-  waitForWorkerExit: (worker: any) => new Promise(resolve => worker.once('exit', () => resolve(true))),
+  waitForWorkerExit: (worker: any) => waitExitMock(worker),
 }));
 vi.mock('../src/core/session-manager.js', () => ({
-  buildNewTopicCliInput: (prompt: string, _sid: string, cliId: string) => ({ content: `<opening ${cliId}>${prompt}` }),
+  buildNewTopicCliInput: (prompt: string, _sid: string, cliId: string, _cliPath?: string, attachments?: any[]) => ({
+    content: `<opening ${cliId}>${prompt}${attachments?.map(attachment => `\n${attachment.path}`).join('') ?? ''}`,
+    ...(attachments?.length ? { attachments } : {}),
+  }),
   buildFollowUpCliInput: (prompt: string) => ({ content: `<follow-up>${prompt}` }),
   persistStreamCardState: () => {},
   rememberLastCliInput: (ds: any, userPrompt: string, input: any, turnId: string) => {
     ds.lastUserPrompt = userPrompt;
     ds.lastCliInput = input.content;
     ds.lastCliInputTurnId = turnId;
+    ds.session.lastUserPrompt = userPrompt;
+    ds.session.lastCliInput = input.content;
+    ds.session.lastCliInputTurnId = turnId;
+    if (input.attachments?.length) ds.session.lastAttachments = structuredClone(input.attachments);
+    else delete ds.session.lastAttachments;
   },
 }));
 const recoverMock = vi.fn(async (..._args: any[]): Promise<any> => ({ ok: true, state: 'accepted', turnId: 'bmx-recovery-1' }));
@@ -119,6 +128,7 @@ describe('quota fallback chain switch', () => {
     vi.clearAllMocks();
     forkWorkerMock.mockImplementation(() => true);
     prepareMock.mockImplementation(async () => {});
+    waitExitMock.mockImplementation((worker: any) => new Promise(resolve => worker.once('exit', () => resolve(true))));
     registerBot({
       larkAppId: APP,
       larkAppSecret: 'secret',
@@ -165,6 +175,77 @@ describe('quota fallback chain switch', () => {
     expect(reply).toHaveBeenCalledTimes(1);
     expect(reply.mock.calls[0]![0]).toContain('TRAE · GPT-6.1-Sol');
     expect(fallThrough).not.toHaveBeenCalled();
+  });
+
+  it('carries the interrupted input attachments into a fresh CLI without relying on a transcript', async () => {
+    const attachments = [{ type: 'image' as const, name: 'evidence.png', path: '/tmp/quota-evidence.png' }];
+    const ds = makeDs({}, { lastAttachments: attachments });
+    ds.lastUserPrompt = '请分析这张截图';
+    ds.lastCliInput = '请分析这张截图\n<attachments><image n="1" path="/tmp/quota-evidence.png" /></attachments>';
+    activeDs = ds;
+    expect(startQuotaFallbackChainSwitch(ds, trigger(ds, 'usage').args)).toBe(true);
+    await settle();
+
+    const [, input] = forkWorkerMock.mock.calls[0]!;
+    expect(input.attachments).toEqual(attachments);
+    expect(input.content).toContain('/tmp/quota-evidence.png');
+  });
+
+  it('keeps attachments through a same-CLI hop for a later fresh-CLI hop', async () => {
+    const attachments = [{ type: 'image' as const, name: 'evidence.png', path: '/tmp/evidence.png' }];
+    registerBot({
+      larkAppId: APP, larkAppSecret: 'secret', cliId: 'traex', model: 'model-A', allowedUsers: ['ou_owner'],
+      quotaFallbackChain: {
+        enabled: true, kinds: ['usage', 'rate'],
+        steps: [{ cliId: 'traex', model: 'model-B' }, { cliId: 'codex', model: 'gpt-5.5' }],
+      },
+    } as any);
+    const ds = makeDs({}, {
+      cliId: 'traex', model: 'model-A', cliSessionId: 'traex-native-1', lastAttachments: attachments,
+    });
+    activeDs = ds;
+    expect(startQuotaFallbackChainSwitch(ds, trigger(ds, 'usage').args)).toBe(true);
+    await settle();
+    const firstTurnId = forkWorkerMock.mock.calls[0]![2].turnId;
+    expect(ds.session.quotaFallback).toMatchObject({ step: 1, cliId: 'traex', model: 'model-B' });
+    expect(ds.session.lastAttachments).toEqual(attachments);
+
+    ds.worker = fakeWorker();
+    const second = trigger(ds, 'usage');
+    expect(startQuotaFallbackChainSwitch(ds, { ...second.args, sourceTurnId: firstTurnId })).toBe(true);
+    await settle();
+    const [, input] = forkWorkerMock.mock.calls[1]!;
+    expect(input.attachments).toEqual(attachments);
+    expect(input.content).toContain('/tmp/evidence.png');
+    expect(input.content).toContain('TRAE · model-B');
+  });
+
+  it('uses the authenticated caller recorded for a scheduled TraeX terminal', async () => {
+    const caller = {
+      requestUserOpenId: HUMAN, requestLarkAppId: APP, senderType: 'user' as const,
+      source: 'schedule_creator' as const, taskId: 'scheduled-quota-task',
+    };
+    const ds = makeDs({}, {
+      cliId: 'traex', model: 'GPT-6.1-Sol', cliSessionId: 'traex-thread-1',
+      cliLaunchSnapshot: { version: 1, state: 'resolved', entryId: 'traex', cliId: 'traex', model: 'GPT-6.1-Sol' },
+      quotaFallback: { step: 1, cliId: 'traex', model: 'GPT-6.1-Sol' },
+    });
+    // Terminal processing has released the live caller before chain admission.
+    ds.activeInteractiveTurn = undefined;
+    ds.scheduledTurnCallers = undefined;
+    ds.session.replyTargets[TURN].participants = [];
+    ds.session.lastFailedTurn = {
+      turnId: TURN, failedAt: '2026-11-24T00:00:00.000Z', status: 'failed', retryCount: 0,
+      userPrompt: ds.lastUserPrompt, cliInput: ds.lastUserPrompt, trustedCaller: caller,
+    };
+    activeDs = ds;
+    expect(startQuotaFallbackChainSwitch(ds, trigger(ds, 'usage').args)).toBe(true);
+    await settle();
+
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    const [, , opts] = forkWorkerMock.mock.calls[0]!;
+    expect(opts.trustedCaller).toMatchObject({ source: 'schedule_creator', taskId: 'scheduled-quota-task' });
+    expect(opts.turnId).toMatch(/^schedule:scheduled-quota-task:/);
   });
 
   it('switches the model on the same CLI by resuming its native conversation', async () => {
@@ -272,6 +353,74 @@ describe('quota fallback chain switch', () => {
     expect(reply.mock.calls.at(-1)![0]).toMatch(/^<at id=ou_owner><\/at> /);
   });
 
+  it('restores the interrupted turn when worker retirement fails before the old CLI is killed', async () => {
+    killWorkerMock.mockImplementationOnce(() => { throw new Error('stream card persist failed'); });
+    const ds = makeDs();
+    ds.lastScreenStatus = 'limited';
+    ds.usageLimit = { limited: true, kind: 'rate', retryAtMs: Date.now() + 60_000, retryLabel: '5 min', retryReady: false };
+    activeDs = ds;
+    const { reply, fallThrough, args } = trigger(ds);
+    expect(startQuotaFallbackChainSwitch(ds, args)).toBe(true);
+    await settle();
+
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(args.worker);
+    expect(ds.lastCliInputTurnId).toBe(TURN);
+    expect(ds.activeInteractiveTurn.turnId).toBe(TURN);
+    expect(ds.session.failedTurnRecovery).toBeUndefined();
+    expect(Object.keys(ds.session.replyTargets)).toEqual([TURN]);
+    expect(ds.session.quotaFallback).toBeUndefined();
+    expect(fallThrough).toHaveBeenCalledTimes(1);
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('hands a terminal-only quota episode back when retirement fails before close', async () => {
+    killWorkerMock.mockImplementationOnce(() => { throw new Error('pre-close failure'); });
+    const ds = makeDs();
+    activeDs = ds;
+    const { reply, fallThrough, args } = trigger(ds, 'usage');
+    expect(startQuotaFallbackChainSwitch(ds, args)).toBe(true);
+    await settle();
+
+    expect(ds.worker).toBe(args.worker);
+    expect(ds.worker.killed).toBe(false);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(ds.activeInteractiveTurn.turnId).toBe(TURN);
+    expect(fallThrough).toHaveBeenCalledTimes(1);
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('does not overwrite a replacement generation installed while the old worker exits', async () => {
+    let finishExit!: (value: boolean) => void;
+    waitExitMock.mockImplementationOnce(() => new Promise(resolve => { finishExit = resolve; }));
+    const ds = makeDs();
+    activeDs = ds;
+    const { reply, fallThrough, args } = trigger(ds);
+    expect(startQuotaFallbackChainSwitch(ds, args)).toBe(true);
+    await settle();
+    expect(killWorkerMock).toHaveBeenCalledTimes(1);
+
+    const replacement = fakeWorker();
+    const recoveredTurn = 'bmx-recovery-newer';
+    ds.worker = replacement;
+    ds.workerGeneration = 2;
+    ds.session.workerGeneration = 2;
+    ds.lastCliInputTurnId = recoveredTurn;
+    ds.activeInteractiveTurn = { turnId: recoveredTurn, caller: ds.activeInteractiveTurn.caller, userPrompt: ds.lastUserPrompt };
+    ds.session.failedTurnRecovery = { originalTurnId: TURN, turnId: recoveredTurn, caller: ds.activeInteractiveTurn.caller };
+    finishExit(true);
+    await settle();
+
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(destroyPaneMock).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(replacement);
+    expect(ds.lastCliInputTurnId).toBe(recoveredTurn);
+    expect(ds.activeInteractiveTurn.turnId).toBe(recoveredTurn);
+    expect(ds.session.quotaFallback).toBeUndefined();
+    expect(reply).not.toHaveBeenCalled();
+    expect(fallThrough).not.toHaveBeenCalled();
+  });
+
   it('stops quietly when the session is closed while the old worker exits', async () => {
     const ds = makeDs();
     activeDs = ds;
@@ -356,6 +505,69 @@ describe('quota fallback chain switch', () => {
       await vi.advanceTimersByTimeAsync(30_000);
       expect(recoverMock).toHaveBeenCalledTimes(1);
       expect(ds.quotaFallbackChainRetries.timer).toBeUndefined();
+    });
+
+    it('keeps ownership while the recovery Promise is in flight', async () => {
+      vi.useFakeTimers();
+      let finish!: (result: any) => void;
+      recoverMock.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+      const ds = makeDs();
+      activeDs = ds;
+      limitedOn(ds, TURN);
+      const first = trigger(ds, 'rate', true);
+      startQuotaFallbackChainSwitch(ds, first.args);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(recoverMock).toHaveBeenCalledTimes(1);
+
+      const duplicate = trigger(ds, 'rate', true);
+      expect(startQuotaFallbackChainSwitch(ds, duplicate.args)).toBe(true);
+      finish({ ok: true, state: 'accepted', turnId: 'bmx-recovery-accepted' });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(recoverMock).toHaveBeenCalledTimes(1);
+      expect(first.fallThrough).not.toHaveBeenCalled();
+      expect(duplicate.fallThrough).not.toHaveBeenCalled();
+    });
+
+    it('settles the latest guarded episode when an in-flight recovery refuses', async () => {
+      vi.useFakeTimers();
+      let finish!: (result: any) => void;
+      recoverMock.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+      const ds = makeDs();
+      activeDs = ds;
+      limitedOn(ds, TURN);
+      const first = trigger(ds, 'rate', true);
+      startQuotaFallbackChainSwitch(ds, first.args);
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      const latest = trigger(ds, 'rate', true);
+      expect(startQuotaFallbackChainSwitch(ds, latest.args)).toBe(true);
+      finish({ ok: false, error: 'session_not_active' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(recoverMock).toHaveBeenCalledTimes(1);
+      expect(first.fallThrough).not.toHaveBeenCalled();
+      expect(latest.fallThrough).toHaveBeenCalledTimes(1);
+    });
+
+    it('replaces the old timer when the same logical turn is manually recovered', async () => {
+      vi.useFakeTimers();
+      const ds = makeDs();
+      activeDs = ds;
+      limitedOn(ds, TURN);
+      const first = trigger(ds, 'rate', true);
+      startQuotaFallbackChainSwitch(ds, first.args);
+
+      const manualTurn = 'bmx-recovery-manual';
+      ds.session.failedTurnRecovery = { originalTurnId: TURN, turnId: manualTurn, caller: ds.activeInteractiveTurn.caller };
+      ds.activeInteractiveTurn = { ...ds.activeInteractiveTurn, turnId: manualTurn };
+      limitedOn(ds, manualTurn);
+      const second = trigger(ds, 'rate', true);
+      expect(startQuotaFallbackChainSwitch(ds, { ...second.args, sourceTurnId: manualTurn })).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(first.fallThrough).not.toHaveBeenCalled();
+      expect(second.fallThrough).not.toHaveBeenCalled();
+      expect(recoverMock).toHaveBeenCalledTimes(1);
+      expect(recoverMock.mock.calls[0]![1]).toMatchObject({ turnId: manualTurn, mode: 'retry' });
     });
 
     it.each([

@@ -214,6 +214,7 @@ export const messages: Record<string, string> = {
   'worker.quota_chain.continue_prompt': '[Botmux quota switch] {from} ran out of quota and this session switched to {to}. Continue the last request; the previous model may have finished part of it, so check the current state first and do not repeat operations that already succeeded.',
   'worker.quota_chain.request_label': 'Interrupted request:',
   'worker.quota_chain.retrying': '⏳ {from} is rate limited. Retrying on the same CLI first (up to {max} times), then switching to {to} if it still fails.',
+  'worker.quota_chain.reset_unknown': 'reset time unknown',
   'worker.traex_auto_model.catalog_prune': '⚠️ A complete live TraeX catalog confirms these models are unavailable for the current CLI/account: {models}. Their saved automatic-pool entries and individual settings will be permanently removed; other models and the original conversation are preserved.',
   'worker.traex_auto_model.catalog_switch': '↪️ {fromModel} is no longer in the current catalog. Resuming the original session with allowlisted {toModel}; queue-free service is not guaranteed and the original request will not be replayed.',
   'worker.traex_auto_model.catalog_empty': '⚠️ The automatic pool has no available models. Model selection has stopped. Reconfigure the pool in the console; no out-of-pool model or fresh conversation will be used.',

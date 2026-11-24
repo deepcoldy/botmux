@@ -20,7 +20,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ChildProcess } from 'node:child_process';
 import type { CliId } from '../adapters/cli/types.js';
-import type { CliTurnPayload, Session, SessionCliLaunchSnapshotV1, TrustedCaller } from '../types.js';
+import type { CliTurnPayload, LarkAttachment, Session, SessionCliLaunchSnapshotV1, TrustedCaller } from '../types.js';
 import type { DaemonSession } from './types.js';
 import { getBot } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
@@ -95,6 +95,7 @@ interface PlannedSwitch {
   /** The user's turn that the source turn retries or continues. */
   logicalTurnId: string;
   userPrompt: string;
+  attachments?: LarkAttachment[];
   caller: TrustedCaller;
 }
 
@@ -127,7 +128,7 @@ function planSwitch(ds: DaemonSession, trigger: QuotaFallbackChainTrigger): Plan
     return undefined;
   }
   // Like the failure card's retry, the continuation runs only as a known original caller.
-  const caller = failedTurnCaller(ds, sourceTurnId);
+  const caller = failedTurnCaller(ds, sourceTurnId, { includeRecordedCaller: true });
   if (!caller) return undefined;
   const freshCli = planned.state.cliId !== fromCliId;
   if (freshCli && (botCfg.riff !== undefined
@@ -137,13 +138,15 @@ function planSwitch(ds: DaemonSession, trigger: QuotaFallbackChainTrigger): Plan
   return {
     next: planned.state,
     freshCli,
-    from: quotaFallbackAgentLabel(fromCliId, ds.session.model),
+    from: quotaFallbackAgentLabel(fromCliId,
+      ds.session.quotaFallback?.cliId === fromCliId ? ds.session.quotaFallback.model : ds.session.model),
     to: quotaFallbackAgentLabel(planned.state.cliId, planned.state.model),
     fromCliId,
     sourceTurnId,
     logicalTurnId: ds.session.failedTurnRecovery?.turnId === sourceTurnId
       ? ds.session.failedTurnRecovery.originalTurnId : sourceTurnId,
     userPrompt,
+    attachments: ds.session.lastAttachments,
     caller,
   };
 }
@@ -182,14 +185,19 @@ function applyFreshCliLaunch(ds: DaemonSession, snapshot: SessionCliLaunchSnapsh
 function buildInput(ds: DaemonSession, plan: PlannedSwitch, prompt: string, turnId: string,
   snapshot: SessionCliLaunchSnapshotV1 | undefined, caller: TrustedCaller, locale: Locale): CliTurnPayload {
   if (!snapshot) {
-    return buildFollowUpCliInput(prompt, ds.session.sessionId, {
+    const input = buildFollowUpCliInput(prompt, ds.session.sessionId, {
       larkAppId: ds.larkAppId, chatId: ds.chatId, cliId: plan.next.cliId, locale, turnId,
     });
+    // The native conversation already has the attachments. Retain only their
+    // daemon-side replay metadata so a later fresh-CLI hop can still use them.
+    return plan.attachments?.length
+      ? { ...input, attachments: structuredClone(plan.attachments) }
+      : input;
   }
   const bot = getBot(ds.larkAppId);
   return buildNewTopicCliInput(
     prompt, ds.session.sessionId, plan.next.cliId, snapshot.cliPathOverride ?? undefined,
-    undefined, undefined, undefined, undefined,
+    plan.attachments, undefined, undefined, undefined,
     { name: bot.botName, openId: bot.botOpenId }, locale, undefined,
     {
       larkAppId: ds.larkAppId,
@@ -307,11 +315,29 @@ async function runSwitch(ds: DaemonSession, trigger: QuotaFallbackChainTrigger, 
 
     // Point of no return: the exhausted CLI is retired.
     const retiring = trigger.worker;
-    killWorker(ds);
-    if (!await waitForWorkerExit(retiring, WORKER_EXIT_WAIT_MS)) {
-      logger.warn(`[quota-chain] ${ds.session.sessionId}: previous worker still running after ${WORKER_EXIT_WAIT_MS}ms`);
+    const retiringGeneration = ds.workerGeneration ?? ds.session.workerGeneration;
+    try {
+      killWorker(ds);
+      if (!await waitForWorkerExit(retiring, WORKER_EXIT_WAIT_MS)) {
+        logger.warn(`[quota-chain] ${ds.session.sessionId}: previous worker still running after ${WORKER_EXIT_WAIT_MS}ms`);
+      }
+    } catch (error) {
+      logger.warn(`[quota-chain] ${ds.session.sessionId}: previous CLI retirement failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (!registered()) return 'gone';
+      restoreRouting();
+      restoreLaunch();
+      persistBestEffort();
+      const oldWorkerIntact = ds.worker === retiring && !retiring.killed;
+      return oldWorkerIntact ? 'declined' : 'failed';
     }
-    if (!registered()) return 'gone';
+    // The old worker is gone, but the wait itself may have overlapped a new
+    // generation or recovery. Never let this stale switch overwrite either.
+    const retirementOwned = registered()
+      && ds.worker === null
+      && (ds.workerGeneration ?? ds.session.workerGeneration) === retiringGeneration
+      && ds.lastCliInputTurnId === plan.sourceTurnId
+      && !hasNewerInput(ds);
+    if (!retirementOwned) return 'gone';
     let input: CliTurnPayload | undefined;
     try {
       destroyLivePaneBeforeRestart(ds);
@@ -369,8 +395,19 @@ function scheduleSameCliRetry(ds: DaemonSession, trigger: QuotaFallbackChainTrig
   attempt: number, tagged: string): void {
   const delayMs = SAME_CLI_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
   logger.info(`${tagged}: transient rate limit, same-CLI retry ${attempt}/${QUOTA_FALLBACK_SAME_CLI_RETRIES} in ${delayMs}ms`);
+  const retry: NonNullable<DaemonSession['quotaFallbackChainRetries']> = {
+    logicalTurnId: plan.logicalTurnId,
+    sourceTurnId: plan.sourceTurnId,
+    worker: trigger.worker,
+    attempts: attempt,
+    fallThrough: trigger.fallThrough,
+  };
   const timer = setTimeout(() => {
-    if (ds.quotaFallbackChainRetries?.timer === timer) ds.quotaFallbackChainRetries.timer = undefined;
+    // Object identity is the attempt token. A cleared/replaced timer and a
+    // stopped turn must never recover or fall through from this stale closure.
+    if (ds.quotaFallbackChainRetries !== retry || retry.inFlight) return;
+    retry.timer = undefined;
+    retry.inFlight = true;
     const record = ds.session.lastFailedTurn;
     const sent = record?.turnId === plan.sourceTurnId
       ? recoverFailedTurn(ds.session.sessionId, {
@@ -378,19 +415,24 @@ function scheduleSameCliRetry(ds: DaemonSession, trigger: QuotaFallbackChainTrig
       })
       : Promise.resolve({ ok: false as const, error: 'failure_changed' });
     void sent.then(result => {
+      if (ds.quotaFallbackChainRetries !== retry) return;
+      retry.inFlight = false;
       if (result.ok && result.state === 'accepted') {
         logger.info(`${tagged}: same-CLI retry ${attempt} sent as ${result.turnId}`);
         return;
       }
       logger.info(`${tagged}: same-CLI retry ${attempt} not sent: ${result.ok ? result.state : result.error}`);
-      trigger.fallThrough?.();
+      retry.fallThrough?.();
     }, error => {
+      if (ds.quotaFallbackChainRetries !== retry) return;
+      retry.inFlight = false;
       logger.warn(`${tagged}: same-CLI retry ${attempt} failed: ${error instanceof Error ? error.message : String(error)}`);
-      trigger.fallThrough?.();
+      retry.fallThrough?.();
     });
   }, delayMs);
   timer.unref?.();
-  ds.quotaFallbackChainRetries = { logicalTurnId: plan.logicalTurnId, attempts: attempt, timer };
+  retry.timer = timer;
+  ds.quotaFallbackChainRetries = retry;
 }
 
 /**
@@ -400,7 +442,12 @@ function scheduleSameCliRetry(ds: DaemonSession, trigger: QuotaFallbackChainTrig
  * retired hands the limit back through `fallThrough`.
  */
 export function startQuotaFallbackChainSwitch(ds: DaemonSession, trigger: QuotaFallbackChainTrigger): boolean {
-  if (ds.quotaFallbackChainSwitching) return true;
+  if (ds.quotaFallbackChainSwitching) {
+    // The in-flight switch still owns the worker, but its original episode may
+    // already be stale. Settle the latest guarded fallback if it declines.
+    ds.quotaFallbackChainSwitchFallThrough = trigger.fallThrough;
+    return true;
+  }
   const plan = planSwitch(ds, trigger);
   if (!plan) return false;
   const locale = localeForBot(ds.larkAppId);
@@ -411,8 +458,15 @@ export function startQuotaFallbackChainSwitch(ds: DaemonSession, trigger: QuotaF
     });
   };
   const previous = ds.quotaFallbackChainRetries;
-  // A limited frame while a retry is still waiting belongs to the same attempt.
-  if (previous?.timer && previous.logicalTurnId === plan.logicalTurnId) return true;
+  // Only the exact source turn and worker share an attempt. Timer fire does not
+  // release ownership: the recovery Promise may still be in flight. Meanwhile a
+  // manual recovery of the same logical turn must replace the stale attempt.
+  if (previous && previous.logicalTurnId === plan.logicalTurnId
+    && previous.sourceTurnId === plan.sourceTurnId && previous.worker === trigger.worker
+    && (previous.timer || previous.inFlight)) {
+    previous.fallThrough = trigger.fallThrough;
+    return true;
+  }
   if (previous?.timer) clearTimeout(previous.timer);
   if (trigger.transient) {
     const spent = previous?.logicalTurnId === plan.logicalTurnId ? previous.attempts : 0;
@@ -427,13 +481,14 @@ export function startQuotaFallbackChainSwitch(ds: DaemonSession, trigger: QuotaF
   }
   ds.quotaFallbackChainRetries = undefined;
   ds.quotaFallbackChainSwitching = true;
+  ds.quotaFallbackChainSwitchFallThrough = trigger.fallThrough;
   logger.info(`${tagged}: ${plan.from} -> ${plan.to} (step ${plan.next.step}, kind=${trigger.kind}, freshCli=${plan.freshCli})`);
   const settle = (outcome: SwitchOutcome): void => {
     logger.info(`${tagged}: switch to ${plan.to} ${outcome}`);
     if (outcome === 'switched') {
       reply(t('worker.quota_chain.switched', { from: plan.from, to: plan.to }, locale));
     } else if (outcome === 'declined') {
-      trigger.fallThrough?.();
+      ds.quotaFallbackChainSwitchFallThrough?.();
     } else if (outcome === 'failed') {
       const body = t('worker.quota_chain.switch_failed', { from: plan.from, to: plan.to }, locale);
       const owner = ds.session.ownerOpenId;
@@ -445,6 +500,9 @@ export function startQuotaFallbackChainSwitch(ds: DaemonSession, trigger: QuotaF
       logger.error(`${tagged}: switch to ${plan.to} threw: ${error instanceof Error ? error.message : String(error)}`);
       settle('declined');
     })
-    .finally(() => { ds.quotaFallbackChainSwitching = false; });
+    .finally(() => {
+      ds.quotaFallbackChainSwitching = false;
+      ds.quotaFallbackChainSwitchFallThrough = undefined;
+    });
   return true;
 }
