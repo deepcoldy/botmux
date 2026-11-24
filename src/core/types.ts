@@ -879,6 +879,9 @@ export interface DaemonSession {
     installAtSpawn: import('../services/cli-install-identity.js').ExecutableIdentity;
     /** Frozen object actually exec'd when it differs from the source install. */
     launchTargetIdentity?: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** Legacy snapshot attestation: source release identity frozen at claim time. */
+    sourceReleaseDir?: string;
+    sourceSignature?: string;
     workerGeneration: number;
     cliSpawnGeneration?: number;
     cliPid?: number;

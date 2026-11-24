@@ -10,7 +10,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
-  chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
+  chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -711,10 +711,23 @@ describe('launch provenance', () => {
     const installAtSpawn = resolveInstallIdentity(entry)!;
     const launchTargetIdentity = resolveInstallIdentity(snapshot.traexPath)!;
     select(join(releaseB, 'traex'));
+    const sourceBackup = join(root, 'release-a-original');
+    const upgradeSource = () => {
+      renameSync(releaseA, sourceBackup);
+      renameSync(releaseB, releaseA);
+    };
+    const revertSource = () => {
+      renameSync(releaseA, releaseB);
+      renameSync(sourceBackup, releaseA);
+    };
     return {
       entry,
       select,
+      upgradeSource,
+      revertSource,
       releaseA,
+      snapshotPath: snapshot.traexPath,
+      sourceSignature: snapshot.manifest.sourceSignature!,
       running: launchTargetIdentity,
       launchTargetIdentity,
       installAtSpawn,
@@ -743,6 +756,17 @@ describe('launch provenance', () => {
       cliInstallEntry: fixture.entry,
       cliInstallAtSpawn: fixture.installAtSpawn,
       cliLaunchTargetIdentity: fixture.launchTargetIdentity,
+      cliSpawnGeneration: 1,
+    };
+  }
+
+  function legacySnapshotAttestation(fixture: Awaited<ReturnType<typeof snapshotUpgrade>>) {
+    return {
+      backendType: 'tmux' as const,
+      credentialIsolated: false,
+      cliExe: fixture.running,
+      cliInstallEntry: fixture.snapshotPath,
+      cliInstallAtSpawn: fixture.running,
       cliSpawnGeneration: 1,
     };
   }
@@ -786,6 +810,42 @@ describe('launch provenance', () => {
     ds.lastScreenStatus = 'idle';
     __testOnly_runPendingSuspendIfSettled(ds);
     expect((ds.worker as any).send).not.toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+
+  it('reclaims a legacy snapshot attestation after the source release changes', async () => {
+    const fixture = await snapshotUpgrade();
+    fixture.upgradeSource();
+    const ds = makeDs({
+      lastScreenStatus: 'working',
+      localProcessAttestation: legacySnapshotAttestation(fixture),
+    });
+    const worker = ds.worker as any;
+    expect(observeTraexInstall(ds, 'traex')).toMatchObject({ state: 'stale' });
+    expect(sweepTraexInstallChanges([ds], { cliId: 'traex' })).toBe(1);
+    expect(ds.pendingSuspendInstallClaim).toMatchObject({
+      sourceReleaseDir: fixture.releaseA,
+      sourceSignature: fixture.sourceSignature,
+    });
+
+    ds.lastScreenStatus = 'idle';
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+  });
+
+  it('cancels a legacy snapshot claim only when the source signature really reverts', async () => {
+    const fixture = await snapshotUpgrade();
+    fixture.upgradeSource();
+    const ds = makeDs({
+      lastScreenStatus: 'working',
+      localProcessAttestation: legacySnapshotAttestation(fixture),
+    });
+    const worker = ds.worker as any;
+    expect(sweepTraexInstallChanges([ds], { cliId: 'traex' })).toBe(1);
+    fixture.revertSource();
+    ds.lastScreenStatus = 'idle';
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
     expect(ds.pendingSuspendReason).toBeUndefined();
   });
 

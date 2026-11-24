@@ -5,6 +5,7 @@ import { controllerForSession, type WorkerContractContext } from './session-cont
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { runtimeStartRefusal } from '../services/runtime-reservation.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
+import { traexReleaseSignature } from '../services/traex-runtime-snapshot.js';
 import { handleResumeFallbackReport } from '../services/resume-fallback-notice.js';
 import {
   compareRunningToInstall,
@@ -13072,6 +13073,15 @@ function revalidateInstallChangeClaim(
     if (!actual) return 'unknown';
     if (!sameExecutableObject(actual, claim.running)) return 'replaced';
   }
+  // Legacy snapshot attestation names the snapshot as its install entry, but
+  // "changed" means the SOURCE release changed. Comparing the snapshot with
+  // itself would falsely revert every upgrade claim.
+  if (claim.sourceReleaseDir !== undefined || claim.sourceSignature !== undefined) {
+    if (!claim.sourceReleaseDir || !claim.sourceSignature) return 'unknown';
+    const sourceSignature = traexReleaseSignature(claim.sourceReleaseDir);
+    if (!sourceSignature) return 'unknown';
+    return sourceSignature === claim.sourceSignature ? 'reverted' : 'stale';
+  }
   const install = resolveInstallIdentity(claim.entry);
   if (!install) return 'unknown';
   if (!sameExecutableObject(claim.running, claim.launchTargetIdentity ?? claim.installAtSpawn)) return 'unknown';
@@ -13329,6 +13339,8 @@ export function requestInstallChangeSuspend(
     running: ExecutableIdentity;
     installAtSpawn: ExecutableIdentity;
     launchTargetIdentity?: ExecutableIdentity;
+    sourceReleaseDir?: string;
+    sourceSignature?: string;
     install: ExecutableIdentity;
   },
   opts: { tryNow?: boolean } = {},
@@ -13350,6 +13362,8 @@ export function requestInstallChangeSuspend(
       running: detail.running,
       installAtSpawn: detail.installAtSpawn,
       ...(detail.launchTargetIdentity ? { launchTargetIdentity: detail.launchTargetIdentity } : {}),
+      ...(detail.sourceReleaseDir ? { sourceReleaseDir: detail.sourceReleaseDir } : {}),
+      ...(detail.sourceSignature ? { sourceSignature: detail.sourceSignature } : {}),
       workerGeneration: ds.workerGeneration ?? 0,
       ...(att?.cliSpawnGeneration !== undefined ? { cliSpawnGeneration: att.cliSpawnGeneration } : {}),
       ...(att?.cliPid !== undefined ? { cliPid: att.cliPid } : {}),
