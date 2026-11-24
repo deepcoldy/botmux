@@ -299,6 +299,8 @@ export type CliOption = {
   available?: boolean;
   availabilityStatus?: import('../../setup/cli-availability.js').CliAvailabilityStatus;
   command?: string;
+  /** Launch commands and short aliases from the CLI registry, used only for search. */
+  searchTerms?: readonly string[];
   availabilityReason?: string;
   cliLaunchMode?: 'forge-traex';
   /** 静态模型候选（后端精选列表；不支持模型的 CLI 为 []）。live 探测结果走 /api/cli-options/models。 */
