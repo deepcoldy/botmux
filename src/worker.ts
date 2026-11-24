@@ -496,7 +496,7 @@ import { baselineCursorTranscript, drainCursorTranscript, findCursorChatIdByPid,
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from './services/antigravity-cot.js';
 import { KimiActivityObserver } from './services/kimi-cot.js';
-import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
+import { findAntigravityConversationIdByPid, inspectAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { AntigravitySessionLog } from './services/antigravity-session-fork.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
 import {
@@ -9991,9 +9991,12 @@ function withAntigravityDirectFailureProof(limit: CliUsageLimitState): CliUsageL
     // prompt-injection session may not enable the fallback bridge, but agy's
     // own transcript is still the only safe source of replay evidence.
     const pid = (backend as { cliPid?: number } | null)?.cliPid;
-    const liveConversationId = pid ? findAntigravityConversationIdByPid(pid) : undefined;
-    if (liveConversationId) {
-      transcriptPath = resolveAntigravityTranscriptPath(liveConversationId) ?? undefined;
+    const live = pid ? inspectAntigravityConversationIdByPid(pid) : undefined;
+    // A PID that proves multiple possible conversations is positive ambiguity,
+    // not absence of evidence. Never fall back to a stored transcript here.
+    if (live?.kind === 'ambiguous') return limit;
+    if (live?.kind === 'unique') {
+      transcriptPath = resolveAntigravityTranscriptPath(live.conversationId) ?? undefined;
     } else {
       const spawnedId = lastSpawnEffectiveCliSessionId;
       const configuredId = lastInitConfig?.cliSessionId;

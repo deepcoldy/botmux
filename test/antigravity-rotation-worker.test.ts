@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { annotateAntigravityUsageLimit } from '../src/adapters/cli/antigravity.js';
@@ -64,6 +64,7 @@ async function setupRotationScenario(input: {
   session.lastUserPrompt = 'do work';
   session.lastCliInputTurnId = 'turn-1';
   session.antigravityAccountId = 'acc1';
+  session.cliSessionId = 'native-rotation-conversation';
   session.lastFailedTurn = {
     turnId: 'turn-1',
     cliInput: 'do work',
@@ -77,7 +78,7 @@ async function setupRotationScenario(input: {
   sessionStore.updateSession(session);
   const worker = Object.assign(new EventEmitter(), {
     killed: false,
-    pid: 4242,
+    pid: process.pid,
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
   });
@@ -123,6 +124,13 @@ async function setupRotationScenario(input: {
     saveAntigravityAccount(`acc${i}`, { sourceTokenPath: source });
   }
   __testOnly_setupWorkerHandlers(ds as never, worker as never);
+  const transcriptPath = join(home, '.gemini', 'antigravity-cli', 'brain',
+    session.cliSessionId, '.system_generated', 'logs', 'transcript_full.jsonl');
+  mkdirSync(dirname(transcriptPath), { recursive: true });
+  writeFileSync(transcriptPath, JSON.stringify({
+    step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE',
+    content: '<USER_REQUEST>\ndo work\n</USER_REQUEST>',
+  }) + '\n');
   const flush = async () => {
     for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 0));
   };
@@ -134,7 +142,7 @@ async function setupRotationScenario(input: {
     else process.env.SESSION_DATA_DIR = previousDataDir;
     rmSync(root, { recursive: true, force: true });
   });
-  return { ds, worker, sent, replies, flush, nowMs, sessionStore };
+  return { ds, worker, sent, replies, flush, nowMs, sessionStore, transcriptPath };
 }
 
 function nativeUsageLimit(screen: string, key: string, nowMs: number): CliUsageLimitState {
@@ -404,6 +412,39 @@ describe('Antigravity worker-pool replay safety', () => {
     expect(statuses).toContain('idle');
   });
 
+  it('retries provisional failed-turn cleanup after recovery when its SQLite write fails', async () => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    const usageLimit = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-1', h.nowMs);
+    h.ds.usageLimit = usageLimit;
+    h.ds.lastScreenStatus = 'limited';
+    h.ds.suppressRecoveryCard = true;
+    h.ds.session.usageLimit = usageLimit;
+    h.ds.session.consumedAntigravityQuotaKeys = ['log:native-episode-1'];
+    h.sessionStore.updateSession(h.ds.session);
+
+    let writes = 0;
+    h.sessionStore.__testOnly_setBeforeRowPersist(() => {
+      writes += 1;
+      if (writes === 2) throw new Error('injected failed-turn cleanup failure');
+    });
+    cleanups.push(() => h.sessionStore.__testOnly_setBeforeRowPersist(undefined));
+    h.worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-cleanup-retry', status: 'limited', turnId: 'turn-1', usageLimit,
+    });
+    await h.flush();
+    h.sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    expect(writes).toBeGreaterThanOrEqual(2);
+    expect(h.ds.usageLimit).toBeUndefined();
+    expect(h.ds.lastScreenStatus).toBe('idle');
+    expect(h.ds.session.lastFailedTurn?.turnId).toBe('turn-1');
+    expect(h.sessionStore.getSessionFresh(h.ds.session.sessionId)?.lastFailedTurn?.turnId).toBe('turn-1');
+
+    await new Promise(resolve => setTimeout(resolve, 600));
+    await h.flush();
+    expect(h.ds.session.lastFailedTurn).toBeUndefined();
+    expect(h.sessionStore.getSessionFresh(h.ds.session.sessionId)?.lastFailedTurn).toBeUndefined();
+  });
+
   it('records a limited failed turn when the first native evidence is a screenshot', async () => {
     const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
     delete h.ds.session.lastFailedTurn;
@@ -520,6 +561,20 @@ describe('Antigravity worker-pool replay safety', () => {
     const stored = h.sessionStore.getSessionFresh(h.ds.session.sessionId);
     expect(stored?.usageLimit?.directFailure).toBeUndefined();
     expect(stored?.lastFailedTurn?.directFailure).toBe(true);
+
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(0);
+  });
+
+  it('re-reads no-progress proof at settlement when the transcript advances without another frame', async () => {
+    const h = await setupRotationScenario({ directFailure: true });
+    const restart = await emitQuotaAndStart(h);
+    appendFileSync(h.transcriptPath, JSON.stringify({
+      step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE',
+      tool_calls: [{ id: 'late-tool', name: 'create_the_file', args: {} }],
+    }) + '\n');
 
     h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
     h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });

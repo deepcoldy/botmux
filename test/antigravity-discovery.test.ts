@@ -6,6 +6,7 @@ import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import {
   findAntigravityConversationId,
   findAntigravityConversationIdByPid,
+  inspectAntigravityConversationIdByPid,
   findAntigravityConversationIdByWorkspace,
   readAntigravityConversationTitle,
 } from '../src/services/antigravity-discovery.js';
@@ -55,6 +56,28 @@ describe('antigravity-discovery', () => {
     unlinkSync(join(fd, '4'));
     symlinkSync(join(cliHome, 'brain', newId), join(fd, '6'));
     expect(findAntigravityConversationIdByPid(4100, convDir, procRoot)).toBe(newId);
+  });
+
+  it('distinguishes unique, ambiguous and missing presence for proof readers', () => {
+    const procRoot = join(tmpDir, 'proc-inspection');
+    const cliHome = join(tmpDir, 'antigravity-inspection');
+    const convDir = join(cliHome, 'conversations');
+    const fd = join(procRoot, '4300', 'fd');
+    const first = 'a4331552-f261-4f1f-a460-e15e7f2fe0ea';
+    const second = '61fc8ef7-1886-40af-9bac-c6ee8f8d172e';
+    mkdirSync(fd, { recursive: true });
+    expect(inspectAntigravityConversationIdByPid(4300, convDir, procRoot)).toEqual({ kind: 'missing' });
+    expect(findAntigravityConversationIdByPid(4300, convDir, procRoot)).toBeNull();
+
+    symlinkSync(join(cliHome, 'presence', `${first}.lock`), join(fd, '3'));
+    expect(inspectAntigravityConversationIdByPid(4300, convDir, procRoot)).toEqual({
+      kind: 'unique', conversationId: first,
+    });
+    expect(findAntigravityConversationIdByPid(4300, convDir, procRoot)).toBe(first);
+
+    symlinkSync(join(cliHome, 'presence', `${second}.lock`), join(fd, '4'));
+    expect(inspectAntigravityConversationIdByPid(4300, convDir, procRoot)).toEqual({ kind: 'ambiguous' });
+    expect(findAntigravityConversationIdByPid(4300, convDir, procRoot)).toBeNull();
   });
 
   it('matches kernel-canonicalized fds when the CLI home is reached through a symlink', () => {

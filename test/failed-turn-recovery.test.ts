@@ -511,6 +511,40 @@ describe('controlled failed-turn recovery', () => {
     recordLimitedFailedTurn(ds, request.turnId);
     expect(ds.session.lastFailedTurn.directFailure).toBeUndefined();
   });
+  it.each(['clone', 'new-turn', 'new-failed-at', 'recovery-claim'] as const)('owns cleanup retry across %s', async mode => {
+    vi.useFakeTimers();
+    try {
+      const original = { ...ds.session.lastFailedTurn, limitedSnapshot: true };
+      ds.session.lastFailedTurn = structuredClone(original);
+      let fail = true;
+      vi.mocked(store.updateSession).mockImplementation(() => {
+        if (fail) throw new Error('injected cleanup write failure');
+      });
+      expect(() => clearLimitedFailedTurn(ds, request.turnId)).toThrow('injected cleanup write failure');
+      expect(ds.session.lastFailedTurn).toMatchObject({ turnId: request.turnId, failedAt: request.failedAt });
+
+      if (mode === 'clone') {
+        ds.session.lastFailedTurn = structuredClone(ds.session.lastFailedTurn);
+      } else if (mode === 'new-turn') {
+        ds.session.lastFailedTurn = { ...original, turnId: 'om_newer', failedAt: '2026-10-16T00:01:00.000Z' };
+      } else if (mode === 'new-failed-at') {
+        ds.session.lastFailedTurn = { ...original, failedAt: '2026-10-16T00:01:00.000Z' };
+      } else {
+        ds.session.lastFailedTurn.recovery = {
+          requestId: 'claim-current', mode: 'retry', turnId: 'bmx-current', sessionId: 'old', state: 'attempting',
+        };
+      }
+      fail = false;
+      await vi.advanceTimersByTimeAsync(500);
+      if (mode === 'clone') expect(ds.session.lastFailedTurn).toBeUndefined();
+      else if (mode === 'new-turn') expect(ds.session.lastFailedTurn).toMatchObject({ turnId: 'om_newer' });
+      else if (mode === 'new-failed-at') {
+        expect(ds.session.lastFailedTurn).toMatchObject({ failedAt: '2026-10-16T00:01:00.000Z' });
+      } else expect(ds.session.lastFailedTurn?.recovery?.state).toBe('attempting');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it('never rewrites a real terminal record when quota proof changes', () => {
     ds.activeInteractiveTurn = { turnId: request.turnId, caller };
     ds.lastUserPrompt = 'task'; ds.lastCliInput = 'wrapped';

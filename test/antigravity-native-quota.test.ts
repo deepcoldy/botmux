@@ -140,9 +140,11 @@ describe('Antigravity native quota log evidence', () => {
       currentBotmuxTurnId: 'turn-1', lastWrittenCliInput: { turnId: 'turn-1', content: 'do work' },
       lastSpawnEffectiveCliSessionId: 'conversation-a', lastInitConfig: { cliSessionId: 'conversation-b' },
       backend: { cliPid: 4242 },
-      findAntigravityConversationIdByPid: (pid: number) => {
+      findAntigravityConversationIdByPid: (pid: number) => pid === 4242 ? 'conversation-b' : null,
+      inspectAntigravityConversationIdByPid: (pid: number) => {
         pidCalls++;
-        return pid === 4242 ? 'conversation-b' : undefined;
+        return pid === 4242
+          ? { kind: 'unique', conversationId: 'conversation-b' } : { kind: 'missing' };
       },
       resolveAntigravityTranscriptPath: (sessionId: string) => sessionId === 'conversation-a'
         ? '/tmp/conversation-a-no-output.jsonl' : '/tmp/conversation-b-has-output.jsonl',
@@ -151,6 +153,22 @@ describe('Antigravity native quota log evidence', () => {
     const withProof = loadWorkerFunction<(limit: any) => any>('withAntigravityDirectFailureProof', scope);
     expect(withProof({ limited: true, kind: 'usage', source: 'antigravity-native-log' }).directFailure).toBeUndefined();
     expect(pidCalls).toBe(1);
+  });
+
+  it('fails closed on ambiguous live PID presence instead of using a stored transcript', () => {
+    const resolve = (sessionId: string) => sessionId === 'conversation-a' ? '/tmp/conversation-a-no-output.jsonl' : null;
+    const scope: Record<string, any> = {
+      cliAdapter: { id: 'antigravity' }, codexBridgeRolloutPath: undefined,
+      currentBotmuxTurnId: 'turn-1', lastWrittenCliInput: { turnId: 'turn-1', content: 'do work' },
+      lastSpawnEffectiveCliSessionId: 'conversation-a', lastInitConfig: { cliSessionId: 'conversation-a' },
+      backend: { cliPid: 4242 },
+      findAntigravityConversationIdByPid: () => null,
+      inspectAntigravityConversationIdByPid: () => ({ kind: 'ambiguous' }),
+      resolveAntigravityTranscriptPath: resolve,
+      antigravityTurnFailedWithoutOutput: (path: string | undefined) => path === '/tmp/conversation-a-no-output.jsonl',
+    };
+    const withProof = loadWorkerFunction<(limit: any) => any>('withAntigravityDirectFailureProof', scope);
+    expect(withProof({ limited: true, kind: 'usage', source: 'antigravity-native-log' }).directFailure).toBeUndefined();
   });
 
   it('normalizes CRLF before comparing the native input', () => {

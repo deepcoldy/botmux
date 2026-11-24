@@ -92,12 +92,17 @@ function matchingPrefix(link: string, prefixes: readonly string[]): string | und
  * prefix while callers resolve the logical one from `homedir()`; every prefix
  * is matched in both variants.
  */
-export function findAntigravityConversationIdByPid(
+export type AntigravityConversationIdInspection =
+  | { kind: 'unique'; conversationId: string }
+  | { kind: 'ambiguous' }
+  | { kind: 'missing' };
+
+export function inspectAntigravityConversationIdByPid(
   pid: number,
   conversationsDir?: string,
   procRoot = '/proc',
-): string | null {
-  if (!Number.isFinite(pid) || pid <= 0) return null;
+): AntigravityConversationIdInspection {
+  if (!Number.isFinite(pid) || pid <= 0) return { kind: 'missing' };
   const useProcfs = process.platform === 'linux' || procRoot !== '/proc';
   const links = useProcfs
     ? getProcessFds(pid, procRoot)
@@ -111,7 +116,9 @@ export function findAntigravityConversationIdByPid(
     const id = link.slice(presencePrefix.length, -'.lock'.length);
     if (UUID_RE.test(id)) active.add(id.toLowerCase());
   }
-  if (active.size > 0) return active.size === 1 ? [...active][0] : null;
+  if (active.size > 0) return active.size === 1
+    ? { kind: 'unique', conversationId: [...active][0]! }
+    : { kind: 'ambiguous' };
 
   if (useProcfs) {
     for (const child of getProcessChildPids(pid, procRoot)) links.push(...getProcessFds(child, procRoot));
@@ -131,10 +138,19 @@ export function findAntigravityConversationIdByPid(
       }
     }
     if (!id || !UUID_RE.test(id)) continue;
-    if (found && found.toLowerCase() !== id.toLowerCase()) return null;
+    if (found && found.toLowerCase() !== id.toLowerCase()) return { kind: 'ambiguous' };
     found ??= id;
   }
-  return found;
+  return found ? { kind: 'unique', conversationId: found } : { kind: 'missing' };
+}
+
+export function findAntigravityConversationIdByPid(
+  pid: number,
+  conversationsDir?: string,
+  procRoot = '/proc',
+): string | null {
+  const result = inspectAntigravityConversationIdByPid(pid, conversationsDir, procRoot);
+  return result.kind === 'unique' ? result.conversationId : null;
 }
 
 function uriToPath(uri: string): string {

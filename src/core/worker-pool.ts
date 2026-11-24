@@ -1097,7 +1097,8 @@ import { buildBackendOutageCard, formatBackendOutageSummary } from './backend-ou
 import { probeTmuxServerUp } from '../adapters/backend/tmux-pipe-backend.js';
 import { getSessionGroup, isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
-import { readAntigravityConversationTitle } from '../services/antigravity-discovery.js';
+import { readAntigravityConversationTitle, inspectAntigravityConversationIdByPid } from '../services/antigravity-discovery.js';
+import { antigravityTurnFailedWithoutOutput, resolveAntigravityTranscriptPath } from '../services/antigravity-transcript.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
@@ -21768,6 +21769,16 @@ function setupWorkerHandlers(
     // matching the exact recorded turn. Without `provenTurn` (e.g. a
     // direct Web Terminal prompt), rotate + restart cleanly and ask the
     // user to resend rather than replaying an older completed Lark turn.
+    const currentTranscriptProvesDirectFailure = (cliInput: string): boolean => {
+      const pid = ds.worker?.pid;
+      const live = pid ? inspectAntigravityConversationIdByPid(pid) : undefined;
+      if (live?.kind === 'ambiguous') return false;
+      const nativeSessionId = live?.kind === 'unique' ? live.conversationId : ds.session.cliSessionId;
+      const path = resolveAntigravityTranscriptPath(nativeSessionId) ?? undefined;
+      // Frame-time proof is only a latch. Re-read the exact current transcript
+      // at the settlement edge so late assistant/tool progress revokes replay.
+      return antigravityTurnFailedWithoutOutput(path, cliInput);
+    };
     const replayPayloadForCurrentProof = () => {
       const capturedFailedTurn = ds.session.lastFailedTurn;
       const currentLimit = ds.usageLimit;
@@ -21778,6 +21789,7 @@ function setupWorkerHandlers(
         && currentLimit?.directFailure === true
         && cliUsageLimitEpisodeKey(currentLimit) === cliUsageLimitEpisodeKey(limit)
         && capturedFailedTurn?.directFailure === true
+        && currentTranscriptProvesDirectFailure(capturedFailedTurn.cliInput)
         && capturedFailedTurn.status === 'failed'
         && !capturedFailedTurn.recovery
         && capturedFailedTurn.retryable !== false

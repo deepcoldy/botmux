@@ -3,6 +3,7 @@ import type { FailedTurnRecord, TrustedCaller, CliTurnPayload, Session } from '.
 import type { DaemonSession } from './types.js';
 import { activeSessionKey } from './types.js';
 import * as store from '../services/session-store.js';
+import { logger } from '../utils/logger.js';
 import { buildFailedTurnRecord } from '../services/failed-turn-retry.js';
 import { turnAnswersInChat } from './failed-turn-rewind.js';
 import { isAutoCompactSafeComposerRefusal } from './auto-compact.js';
@@ -134,13 +135,61 @@ export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | unde
   }
 }
 
+const limitedFailedTurnClearRetries = new WeakMap<DaemonSession, {
+  timer: ReturnType<typeof setTimeout>;
+  record: FailedTurnRecord;
+}>();
+
+function cancelLimitedFailedTurnClearRetry(ds: DaemonSession): void {
+  const pending = limitedFailedTurnClearRetries.get(ds);
+  if (pending) clearTimeout(pending.timer);
+  limitedFailedTurnClearRetries.delete(ds);
+}
+
+/** The usage-limit clear and failed-turn clear are separate SQLite writes. Own
+ * the second write independently so recovery does not depend on another frame. */
+function retryLimitedFailedTurnClear(ds: DaemonSession, record: FailedTurnRecord): void {
+  let delayMs = 500;
+  const schedule = (): void => {
+    const timer = setTimeout(() => {
+      if (limitedFailedTurnClearRetries.get(ds)?.timer !== timer) return;
+      limitedFailedTurnClearRetries.delete(ds);
+      // A replacement failure or durable recovery claim owns the field now.
+      // Compare stable record identity, not object identity: a session reload
+      // may legitimately clone the same provisional observation.
+      const current = ds.session.lastFailedTurn;
+      if (!current?.limitedSnapshot || current.recovery
+        || current.turnId !== record.turnId || current.failedAt !== record.failedAt) return;
+      try {
+        delete ds.session.lastFailedTurn;
+        store.updateSession(ds.session);
+      } catch (error) {
+        ds.session.lastFailedTurn = record;
+        logger.warn(`[recovery] limited failed-turn cleanup retry failed: ${String(error)}`);
+        delayMs = Math.min(delayMs * 2, 30_000);
+        schedule();
+      }
+    }, delayMs);
+    timer.unref();
+    limitedFailedTurnClearRetries.set(ds, { timer, record });
+  };
+  schedule();
+}
+
 /** Invalidate only unclaimed provisional observations. Durable recovery
  * receipts and real failed terminals must survive status/terminal updates. */
 export function clearLimitedFailedTurn(ds: DaemonSession, turnId?: string): void {
   const record = ds.session.lastFailedTurn;
+  cancelLimitedFailedTurnClearRetry(ds);
   if (!record?.limitedSnapshot || record.recovery || turnId !== undefined && record.turnId !== turnId) return;
   delete ds.session.lastFailedTurn;
-  store.updateSession(ds.session);
+  try {
+    store.updateSession(ds.session);
+  } catch (error) {
+    ds.session.lastFailedTurn = record;
+    retryLimitedFailedTurnClear(ds, record);
+    throw error;
+  }
 }
 
 /** Terminal bookkeeping shares the provisional snapshot's lifecycle owner.
