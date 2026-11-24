@@ -46,6 +46,7 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/trigger-user-auth', '/api/bot-trigger-user-auth', 'raw'],
   ['PUT', '/api/bots/cli_a/lark-tool-binding', '/api/bot-lark-tool-binding', 'raw'],
   ['PUT', '/api/bots/cli_a/lark-user-owner-fallback', '/api/bot-lark-user-owner-fallback', 'raw'],
+  ['PUT', '/api/bots/cli_a/auto-avoid-approval', '/api/bot-auto-avoid-approval', 'raw'],
   ['GET', '/api/bots/cli_a/trigger-user-auth-status', '/api/bot-trigger-user-auth-status', 'none'],
   ['PUT', '/api/bots/cli_a/riff', '/api/bot-riff', 'raw'],
   ['PUT', '/api/bots/cli_a/herdr', '/api/bot-herdr', 'raw'],

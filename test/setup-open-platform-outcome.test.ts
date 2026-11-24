@@ -38,6 +38,16 @@ describe('classifySetupOpenPlatformOutcome', () => {
       .toBe('ready_with_warnings');
     expect(classifySetupOpenPlatformOutcome(success({ versionId: undefined })).status)
       .toBe('ready_with_warnings');
+    const deferredOutcome = classifySetupOpenPlatformOutcome(success({
+      approvalDeferredScopes: [{ bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' }],
+    }));
+    expect(deferredOutcome.status).toBe('ready_with_warnings');
+    expect(blocksSetupBotStart(deferredOutcome)).toBe(false);
+    const refreshTokenOutcome = classifySetupOpenPlatformOutcome(success({
+      approvalDisabledRefreshToken: true,
+    }));
+    expect(refreshTokenOutcome.status).toBe('ready_with_warnings');
+    expect(blocksSetupBotStart(refreshTokenOutcome)).toBe(false);
   });
 
   it('无变更短路（publishSkipped）不算 warning：versionId 空、scopeCount 0 都是预期结果', () => {

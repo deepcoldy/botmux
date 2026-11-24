@@ -2168,6 +2168,8 @@ describe('createFeishuOpenPlatformApp', () => {
       // 收窄——这个 mock 的 privilege/all 返回空,所以只有读、没有 privilege/update。
       '/developers/v1/privilege/all/cli_created',
       '/developers/v1/app_version/create/cli_created',
+      // 提交前只读预判审批流：免审账号零额外写入直接 commit，命中人工审批才会二分避开。
+      '/developers/v1/approval_nodes/get/cli_created',
       '/developers/v1/publish/commit/cli_created/v-enable',
       '/developers/v1/secret/cli_created',
     ]);
@@ -2223,6 +2225,7 @@ describe('createFeishuOpenPlatformApp', () => {
       // 回退路径（裸自建应用）同样在发版前收窄数据范围。
       '/developers/v1/privilege/all/cli_fallback',
       '/developers/v1/app_version/create/cli_fallback',
+      '/developers/v1/approval_nodes/get/cli_fallback',
       '/developers/v1/publish/commit/cli_fallback/v-enable',
       '/developers/v1/secret/cli_fallback',
     ]);
@@ -4646,5 +4649,787 @@ describe('safeErrorMessage', () => {
   it('仍然脱敏长 token', () => {
     const err = new Error(`bad token ${'a'.repeat(32)}`);
     expect(safeErrorMessage(err)).toBe('bad token ***');
+  });
+});
+
+describe('draft-time approval compatibility (1.0.0 & 1.0.1)', () => {
+  const autoPassFlow = {
+    code: 0,
+    data: {
+      applyInstanceInfo: {
+        applyNodes: [{ nodeName: '免审策略', nodeType: '自动通过', nodeUser: [] }],
+      },
+    },
+  };
+  const humanApprovalFlow = {
+    code: 0,
+    data: {
+      applyInstanceInfo: {
+        applyNodes: [{ nodeName: '企业管理员审批', nodeType: '或签', nodeUser: [{ approver: { name: '王审核' } }] }],
+      },
+    },
+  };
+
+  it('1.0.0 模板发版前预判命中人工审批时，草稿态自动二分移除触发权限并自动上架', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-approval-100-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+
+    // 模拟 developer_console 模板自带的 level-3 + level-4 权限（含触发审批的 user:offline_access）
+    const staged = new Set<string>(['tenant:1', 'tenant:10', 'tenant:11', 'user:17']);
+    const scopeUpdates: Array<{ operation: string; appScopeIDs: string[]; userScopeIDs: string[] }> = [];
+    let commitHappened = false;
+
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/app/upload/image') {
+        return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      }
+      if (path === '/developers/v1/manifest/upsert_by_template') {
+        return Response.json({ code: 0, data: { appId: 'cli_compat_100' } });
+      }
+      if (path === '/developers/v1/privilege/all/cli_compat_100') {
+        return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      }
+      if (path === '/developers/v1/app_version/create/cli_compat_100') {
+        return Response.json({ code: 0, data: { versionId: 'v-100' } });
+      }
+      if (path === '/developers/v1/scope/all/cli_compat_100') {
+        return Response.json({
+          code: 0,
+          data: {
+            scopes: [
+              { id: '1', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 1 } },
+              { id: '10', name: 'application:bot.basic_info:read', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 1 } },
+              { id: '11', name: 'docs:document.comment:create', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 1 } },
+              { id: '17', name: 'offline_access', scopeType2ScopeLevel: { '1': 4 }, scopeType2ScopeStatus: { '1': 1 } },
+            ],
+          },
+        });
+      }
+      if (path === '/developers/v1/safe_setting/cli_compat_100') {
+        return Response.json({ code: 0, data: { allowRefreshToken: false, redirectURL: [], ipWhiteList: [], safeServerDomain: [] } });
+      }
+      if (path === '/developers/v1/scope/update/cli_compat_100') {
+        const body = JSON.parse(String(init?.body));
+        scopeUpdates.push({
+          operation: body.operation,
+          appScopeIDs: body.appScopeIDs ?? [],
+          userScopeIDs: body.userScopeIDs ?? [],
+        });
+        for (const id of body.appScopeIDs ?? []) {
+          if (body.operation === 'del') staged.delete(`tenant:${id}`);
+          else staged.add(`tenant:${id}`);
+        }
+        for (const id of body.userScopeIDs ?? []) {
+          if (body.operation === 'del') staged.delete(`user:${id}`);
+          else staged.add(`user:${id}`);
+        }
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/approval_nodes/get/cli_compat_100') {
+        return Response.json(staged.has('user:17') ? humanApprovalFlow : autoPassFlow);
+      }
+      if (path === '/developers/v1/publish/commit/cli_compat_100/v-100') {
+        commitHappened = true;
+        // 提交那一刻草稿必须已经去掉触发审批的 user:17，且保留其它未触发审批的 level-4 权限
+        expect(staged.has('user:17')).toBe(false);
+        expect(staged.has('tenant:10')).toBe(true);
+        expect(staged.has('tenant:11')).toBe(true);
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/secret/cli_compat_100') {
+        return Response.json({ code: 0, data: { secret: 'secret-100' } });
+      }
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await createFeishuOpenPlatformApp({
+      name: 'compat-bot-100',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      fetchImpl,
+    });
+
+    expect(commitHappened).toBe(true);
+    expect(scopeUpdates.some(u => u.operation === 'del' && u.userScopeIDs.includes('17'))).toBe(true);
+    expect(result).toMatchObject({
+      ok: true,
+      appId: 'cli_compat_100',
+      appSecret: 'secret-100',
+      approvalDeferredScopes: [
+        expect.objectContaining({ bucket: 'user', name: 'offline_access', isolation: 'exact' }),
+      ],
+      approvalCompatibility: expect.objectContaining({
+        triggered: true,
+        resolvedAutoApproved: true,
+        initialHumanApprovers: ['王审核'],
+        stopReason: 'resolved_exact',
+      }),
+    });
+  });
+
+  it('1.0.1 权限配置避开触发审批的新增权限、不删线上已有权限、尊重 excludeScopes 并调整 scopeCount', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-approval-101-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+
+    const sub = openPlatformSubscriptionMock('cli_compat_101');
+    // tenant:100（lv3）与 tenant:150（lv4）均是线上已有权限（status=5），绝不能在试探时被 del 掉；
+    // 尤其是 lv4 的 tenant:150：若漏掉 status===5 守卫，Step 1 删全部敏感权限时会立刻删掉它！
+    // tenant:202 是本次新增但会触发人工审批的 level-4 权限；
+    // user:301 在 excludeScopes 中（1.0.0 已暂缓），1.0.1 根本不该申请它。
+    const staged = new Set<string>(['tenant:100', 'tenant:150']);
+    const delCalls: Array<{ appScopeIDs: string[]; userScopeIDs: string[] }> = [];
+    const addCalls: Array<{ appScopeIDs: string[]; userScopeIDs: string[] }> = [];
+
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_compat_101/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/safe_setting/cli_compat_101') {
+        return Response.json({
+          code: 0,
+          data: {
+            allowRefreshToken: false,
+            redirectURL: [BOTMUX_REDIRECT_URL],
+            ipWhiteList: [],
+            safeServerDomain: [],
+          },
+        });
+      }
+      if (path === '/developers/v1/scope/all/cli_compat_101') {
+        return Response.json({
+          code: 0,
+          data: {
+            scopes: [
+              { id: '100', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 5 } },
+              { id: '150', name: 'application:bot.basic_info:read', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 5 } },
+              { id: '201', name: 'contact:user.base:readonly', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 0 } },
+              { id: '202', name: 'im:message.group_msg', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 0 } },
+              { id: '301', name: 'offline_access', scopeType2ScopeLevel: { '1': 4 }, scopeType2ScopeStatus: { '1': 0 } },
+            ],
+          },
+        });
+      }
+      if (path === '/developers/v1/scope/update/cli_compat_101') {
+        const body = JSON.parse(String(init?.body));
+        if (body.operation === 'del') {
+          delCalls.push({ appScopeIDs: body.appScopeIDs ?? [], userScopeIDs: body.userScopeIDs ?? [] });
+          for (const id of body.appScopeIDs ?? []) staged.delete(`tenant:${id}`);
+          for (const id of body.userScopeIDs ?? []) staged.delete(`user:${id}`);
+        } else {
+          addCalls.push({ appScopeIDs: body.appScopeIDs ?? [], userScopeIDs: body.userScopeIDs ?? [] });
+          for (const id of body.appScopeIDs ?? []) staged.add(`tenant:${id}`);
+          for (const id of body.userScopeIDs ?? []) staged.add(`user:${id}`);
+        }
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/privilege/all/cli_compat_101') {
+        return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      }
+      if (path === '/developers/v1/app_version/list/cli_compat_101') {
+        return Response.json({
+          code: 0,
+          data: { versions: [{ appVersion: '1.0.0', versionId: 'v-100', versionStatus: 2 }] },
+        });
+      }
+      if (path === '/developers/v1/app_version/create/cli_compat_101') {
+        return Response.json({ code: 0, data: { versionId: 'v-101' } });
+      }
+      if (path === '/developers/v1/approval_nodes/get/cli_compat_101') {
+        return Response.json(staged.has('tenant:202') ? humanApprovalFlow : autoPassFlow);
+      }
+      if (path === '/developers/v1/publish/commit/cli_compat_101/v-101') {
+        expect(staged.has('tenant:202')).toBe(false);
+        expect(staged.has('tenant:201')).toBe(true);
+        expect(staged.has('tenant:150')).toBe(true);
+        expect(staged.has('tenant:100')).toBe(true);
+        expect(staged.has('user:301')).toBe(false);
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/app_version/v-101/cli_compat_101') {
+        return Response.json({ code: 0, data: { versionId: 'v-101', versionStatus: 2 } });
+      }
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_compat_101',
+      brand: 'feishu',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      appJustCreated: true,
+      scopeManifest: {
+        scopes: {
+          tenant: ['im:message', 'application:bot.basic_info:read', 'contact:user.base:readonly', 'im:message.group_msg'],
+          user: ['offline_access'],
+        },
+      },
+      excludeScopes: { user: ['offline_access'] },
+      fetchImpl,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('expected ok');
+    // excludeScopes 生效：user:301 从未被 add
+    expect(addCalls.some(c => c.userScopeIDs.includes('301'))).toBe(false);
+    // 线上已有 status=5 的权限（含 level-4 的 tenant:150）从未被 del
+    expect(delCalls.some(c => c.appScopeIDs.includes('100') || c.appScopeIDs.includes('150'))).toBe(false);
+    expect(result.approvalAutoPassed).toBe(true);
+    expect(result.approvalHumanApprovers).toBeUndefined();
+    expect(result.approvalDeferredScopes).toEqual([
+      expect.objectContaining({ bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact' }),
+    ]);
+    // 原本导入 4 项 tenant，移除 1 项 → 3
+    expect(result.scopeCount).toBe(3);
+  });
+
+  it('1.0.1 关闭 allowRefreshToken 即可自动通过时，保留全部权限并上报 approvalDisabledRefreshToken', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-approval-rt-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+
+    const sub = openPlatformSubscriptionMock('cli_compat_rt');
+    let allowRefreshToken = true;
+
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_compat_rt/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/safe_setting/cli_compat_rt') {
+        return Response.json({
+          code: 0,
+          data: {
+            allowRefreshToken,
+            redirectURL: [BOTMUX_REDIRECT_URL],
+            ipWhiteList: [],
+            safeServerDomain: [],
+          },
+        });
+      }
+      if (path === '/developers/v1/safe_setting/update/cli_compat_rt') {
+        const body = JSON.parse(String(init?.body));
+        if (typeof body.allowRefreshToken === 'boolean') allowRefreshToken = body.allowRefreshToken;
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/scope/all/cli_compat_rt') {
+        return Response.json({
+          code: 0,
+          data: {
+            scopes: [
+              { id: '100', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 0 } },
+              { id: '201', name: 'im:message.group_msg', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 0 } },
+            ],
+          },
+        });
+      }
+      if (path === '/developers/v1/privilege/all/cli_compat_rt') {
+        return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      }
+      if (path === '/developers/v1/app_version/list/cli_compat_rt') {
+        return Response.json({ code: 0, data: { versions: [{ appVersion: '1.0.0', versionId: 'v-100', versionStatus: 2 }] } });
+      }
+      if (path === '/developers/v1/app_version/create/cli_compat_rt') {
+        return Response.json({ code: 0, data: { versionId: 'v-101' } });
+      }
+      if (path === '/developers/v1/approval_nodes/get/cli_compat_rt') {
+        return Response.json(allowRefreshToken ? humanApprovalFlow : autoPassFlow);
+      }
+      if (path === '/developers/v1/app_version/v-101/cli_compat_rt') {
+        return Response.json({ code: 0, data: { versionId: 'v-101', versionStatus: 2 } });
+      }
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_compat_rt',
+      brand: 'feishu',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      autoAvoidApproval: true,
+      scopeManifest: { scopes: { tenant: ['im:message', 'im:message.group_msg'], user: [] } },
+      fetchImpl,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('expected ok');
+    expect(allowRefreshToken).toBe(false);
+    expect(result.approvalAutoPassed).toBe(true);
+    expect(result.approvalDisabledRefreshToken).toBe(true);
+    expect(result.approvalDeferredScopes).toBeUndefined();
+    expect(result.scopeCount).toBe(2);
+  });
+
+  it('keeps 1.0.0 approval deferrals when commit fails after template draft reduction', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-create-approval-commit-failure-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const staged = new Set(['user:17']);
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/app/upload/image') return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      if (path === '/developers/v1/manifest/upsert_by_template') return Response.json({ code: 0, data: { appId: 'cli_create100_commit' } });
+      if (path === '/developers/v1/privilege/all/cli_create100_commit') return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      if (path === '/developers/v1/app_version/create/cli_create100_commit') return Response.json({ code: 0, data: { versionId: 'v-100' } });
+      if (path === '/developers/v1/scope/all/cli_create100_commit') {
+        return Response.json({ code: 0, data: { scopes: [
+          { id: '1', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 1 } },
+          { id: '17', name: 'offline_access', scopeType2ScopeLevel: { '1': 4 }, scopeType2ScopeStatus: { '1': 1 } },
+        ] } });
+      }
+      if (path === '/developers/v1/safe_setting/cli_create100_commit') {
+        return Response.json({ code: 0, data: { allowRefreshToken: false, redirectURL: [], ipWhiteList: [], safeServerDomain: [] } });
+      }
+      if (path === '/developers/v1/scope/update/cli_create100_commit') {
+        const body = JSON.parse(String(init?.body));
+        for (const id of body.userScopeIDs ?? []) {
+          if (body.operation === 'del') staged.delete(`user:${id}`);
+          else staged.add(`user:${id}`);
+        }
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/approval_nodes/get/cli_create100_commit') {
+        return Response.json(staged.has('user:17') ? humanApprovalFlow : autoPassFlow);
+      }
+      if (path.includes('/publish/commit/')) return Response.json({ code: 500, msg: 'response lost after commit' }, { status: 500 });
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await createFeishuOpenPlatformApp({
+      name: 'create-commit-failure',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      fetchImpl,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.appId).toBe('cli_create100_commit');
+    expect(result.approvalCompatibility).toMatchObject({ resolvedAutoApproved: true });
+    expect(result.approvalDeferredScopes).toEqual([
+      expect.objectContaining({ bucket: 'user', name: 'offline_access' }),
+    ]);
+    expect(staged.has('user:17')).toBe(false);
+  });
+
+  it('keeps resolved approval deferrals when publish/commit fails after the draft was reduced', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-approval-commit-failure-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_commit_failure');
+    const staged = new Set<string>();
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_commit_failure/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/safe_setting/cli_commit_failure') {
+        return Response.json({ code: 0, data: { allowRefreshToken: false, redirectURL: [BOTMUX_REDIRECT_URL], ipWhiteList: [], safeServerDomain: [] } });
+      }
+      if (path === '/developers/v1/scope/all/cli_commit_failure') {
+        return Response.json({ code: 0, data: { scopes: [
+          { id: '100', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 0 } },
+          { id: '202', name: 'im:message.group_msg', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 0 } },
+        ] } });
+      }
+      if (path === '/developers/v1/scope/update/cli_commit_failure') {
+        const body = JSON.parse(String(init?.body));
+        for (const id of body.appScopeIDs ?? []) {
+          if (body.operation === 'del') staged.delete(`tenant:${id}`);
+          else staged.add(`tenant:${id}`);
+        }
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/privilege/all/cli_commit_failure') return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      if (path === '/developers/v1/app_version/list/cli_commit_failure') return Response.json({ code: 0, data: { versions: [{ appVersion: '1.0.0', versionId: 'v-100', versionStatus: 2 }] } });
+      if (path === '/developers/v1/app_version/create/cli_commit_failure') return Response.json({ code: 0, data: { versionId: 'v-101' } });
+      if (path === '/developers/v1/approval_nodes/get/cli_commit_failure') {
+        return Response.json(staged.has('tenant:202') ? humanApprovalFlow : autoPassFlow);
+      }
+      if (path.includes('/publish/commit/')) return Response.json({ code: 500, msg: 'response lost after commit' }, { status: 500 });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_commit_failure',
+      brand: 'feishu',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      autoAvoidApproval: true,
+      scopeManifest: { scopes: { tenant: ['im:message', 'im:message.group_msg'], user: [] } },
+      fetchImpl,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.approvalCompatibility).toMatchObject({ resolvedAutoApproved: true });
+    expect(result.approvalDeferredScopes).toEqual([
+      expect.objectContaining({ bucket: 'tenant', name: 'im:message.group_msg' }),
+    ]);
+    expect(staged.has('tenant:202')).toBe(false);
+  });
+
+  it('🔴 mutation_failed 且还原未完成时，1.0.1 与 1.0.0 均 fail-closed 中止 publish/commit，绝不发布残缺草稿', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-approval-failclosed-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+
+    // 1.0.1 场景：二分期间 add 失败且恢复期也失败 -> 绝不调 publish/commit
+    const sub = openPlatformSubscriptionMock('cli_fc_101');
+    const staged101 = new Set<string>();
+    let commit101Called = false;
+    let scopeAddCount = 0;
+    const fetch101 = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_fc_101/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/safe_setting/cli_fc_101') {
+        return Response.json({ code: 0, data: { allowRefreshToken: false, redirectURL: [BOTMUX_REDIRECT_URL], ipWhiteList: [], safeServerDomain: [] } });
+      }
+      if (path === '/developers/v1/scope/all/cli_fc_101') {
+        return Response.json({
+          code: 0,
+          data: {
+            scopes: [
+              { id: '100', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 0 } },
+              { id: '201', name: 'contact:user.base:readonly', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 0 } },
+              { id: '202', name: 'im:message.group_msg', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 0 } },
+            ],
+          },
+        });
+      }
+      if (path === '/developers/v1/scope/update/cli_fc_101') {
+        const body = JSON.parse(String(init?.body));
+        if (body.operation === 'add') {
+          scopeAddCount += 1;
+          if (scopeAddCount >= 2) return Response.json({ code: 500, msg: 'transient write error' }, { status: 500 });
+          for (const id of body.appScopeIDs ?? []) staged101.add(`tenant:${id}`);
+        } else {
+          for (const id of body.appScopeIDs ?? []) staged101.delete(`tenant:${id}`);
+        }
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/privilege/all/cli_fc_101') return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      if (path === '/developers/v1/app_version/list/cli_fc_101') return Response.json({ code: 0, data: { versions: [{ appVersion: '1.0.0', versionId: 'v-100', versionStatus: 2 }] } });
+      if (path === '/developers/v1/app_version/create/cli_fc_101') return Response.json({ code: 0, data: { versionId: 'v-101' } });
+      if (path === '/developers/v1/approval_nodes/get/cli_fc_101') {
+        return Response.json(staged101.has('tenant:202') ? humanApprovalFlow : autoPassFlow);
+      }
+      if (path.includes('/publish/commit/')) {
+        commit101Called = true;
+        return Response.json({ code: 0 });
+      }
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const r101 = await automateOpenPlatformSetup({
+      appId: 'cli_fc_101',
+      brand: 'feishu',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      autoAvoidApproval: true,
+      scopeManifest: { scopes: { tenant: ['im:message', 'contact:user.base:readonly', 'im:message.group_msg'], user: [] } },
+      fetchImpl: fetch101,
+    });
+    expect(r101.ok).toBe(false);
+    expect(commit101Called).toBe(false);
+    expect(r101.approvalCompatibility).toMatchObject({
+      stopReason: 'mutation_failed',
+      restored: false,
+    });
+    // 失败发生在任何权限被精确定位之前，不虚构 deferral；诊断本身仍必须保留。
+    expect(r101.approvalDeferredScopes).toBeUndefined();
+
+    // 1.0.0 场景：同样在 mutation_failed 且 !restored 时中止 commit（并保留 appId 避免重复建应用）
+    let commit100Called = false;
+    let del100Count = 0;
+    const fetch100 = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/app/upload/image') return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      if (path === '/developers/v1/manifest/upsert_by_template') return Response.json({ code: 0, data: { appId: 'cli_fc_100' } });
+      if (path === '/developers/v1/privilege/all/cli_fc_100') return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      if (path === '/developers/v1/app_version/create/cli_fc_100') return Response.json({ code: 0, data: { versionId: 'v-100' } });
+      if (path === '/developers/v1/scope/all/cli_fc_100') {
+        return Response.json({
+          code: 0,
+          data: {
+            scopes: [
+              { id: '1', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 1 } },
+              { id: '10', name: 'docs:document.comment:create', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 1 } },
+              { id: '17', name: 'offline_access', scopeType2ScopeLevel: { '1': 4 }, scopeType2ScopeStatus: { '1': 1 } },
+            ],
+          },
+        });
+      }
+      if (path === '/developers/v1/safe_setting/cli_fc_100') {
+        return Response.json({ code: 0, data: { allowRefreshToken: false, redirectURL: [], ipWhiteList: [], safeServerDomain: [] } });
+      }
+      if (path === '/developers/v1/scope/update/cli_fc_100') {
+        const body = JSON.parse(String(init?.body));
+        if (body.operation === 'del') {
+          del100Count += 1;
+          return Response.json({ code: 0 });
+        }
+        return Response.json({ code: 500, msg: 'write failed' }, { status: 500 });
+      }
+      if (path === '/developers/v1/approval_nodes/get/cli_fc_100') {
+        return Response.json(del100Count === 0 ? humanApprovalFlow : autoPassFlow);
+      }
+      if (path.includes('/publish/commit/')) {
+        commit100Called = true;
+        return Response.json({ code: 0 });
+      }
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const r100 = await createFeishuOpenPlatformApp({
+      name: 'fc-bot-100',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      fetchImpl: fetch100,
+    });
+    expect(r100.ok).toBe(false);
+    if (!r100.ok) expect(r100.appId).toBe('cli_fc_100');
+    expect(commit100Called).toBe(false);
+  });
+
+  it('覆盖三类候选集边界：双桶 tenant=5 不掩盖未申请 user 桶、全线上仅关 refreshToken、复用草稿残留 status=1 权限', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-approval-edges-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+
+    // 4a: 双桶 im:resource 顶层 status=5 + tenant=5，但 user 桶缺键（未申请）且为 level-4 触发审批
+    const subA = openPlatformSubscriptionMock('cli_edge_4a');
+    const stagedA = new Set<string>(['tenant:99']);
+    const fetchA = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_edge_4a/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/safe_setting/cli_edge_4a') {
+        return Response.json({ code: 0, data: { allowRefreshToken: false, redirectURL: [BOTMUX_REDIRECT_URL], ipWhiteList: [], safeServerDomain: [] } });
+      }
+      if (path === '/developers/v1/scope/all/cli_edge_4a') {
+        return Response.json({
+          code: 0,
+          data: {
+            scopes: [
+              // 注意：顶层 status=5，分桶 map 只有 '2':5、没有 '1' 键
+              { id: '99', name: 'im:resource', status: 5, scopeType2ScopeLevel: { '2': 3, '1': 4 }, scopeType2ScopeStatus: { '2': 5 } },
+            ],
+          },
+        });
+      }
+      if (path === '/developers/v1/scope/update/cli_edge_4a') {
+        const body = JSON.parse(String(init?.body));
+        for (const id of body.userScopeIDs ?? []) {
+          if (body.operation === 'del') stagedA.delete(`user:${id}`);
+          else stagedA.add(`user:${id}`);
+        }
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/privilege/all/cli_edge_4a') return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      if (path === '/developers/v1/app_version/list/cli_edge_4a') return Response.json({ code: 0, data: { versions: [{ appVersion: '1.0.0', versionId: 'v-100', versionStatus: 2 }] } });
+      if (path === '/developers/v1/app_version/create/cli_edge_4a') return Response.json({ code: 0, data: { versionId: 'v-101' } });
+      if (path === '/developers/v1/approval_nodes/get/cli_edge_4a') return Response.json(stagedA.has('user:99') ? humanApprovalFlow : autoPassFlow);
+      if (path === '/developers/v1/app_version/v-101/cli_edge_4a') return Response.json({ code: 0, data: { versionId: 'v-101', versionStatus: 2 } });
+      return subA.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const rA = await automateOpenPlatformSetup({
+      appId: 'cli_edge_4a',
+      brand: 'feishu',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      autoAvoidApproval: true,
+      scopeManifest: { scopes: { tenant: ['im:resource'], user: ['im:resource'] } },
+      fetchImpl: fetchA,
+    });
+    expect(rA.ok).toBe(true);
+    if (!rA.ok) throw new Error('expected ok');
+    expect(rA.approvalAutoPassed).toBe(true);
+    expect(rA.approvalDeferredScopes).toEqual([
+      expect.objectContaining({ bucket: 'user', name: 'im:resource', isolation: 'exact' }),
+    ]);
+
+    // 4b: 清单权限全为线上 status=5（appliedCandidates 为空），但 allowRefreshToken=true 触发审批
+    const subB = openPlatformSubscriptionMock('cli_edge_4b');
+    let rtB = true;
+    const fetchB = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_edge_4b/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/safe_setting/cli_edge_4b') {
+        return Response.json({ code: 0, data: { allowRefreshToken: rtB, redirectURL: [BOTMUX_REDIRECT_URL], ipWhiteList: [], safeServerDomain: [] } });
+      }
+      if (path === '/developers/v1/safe_setting/update/cli_edge_4b') {
+        const body = JSON.parse(String(init?.body));
+        if (typeof body.allowRefreshToken === 'boolean') rtB = body.allowRefreshToken;
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/scope/all/cli_edge_4b') {
+        return Response.json({
+          code: 0,
+          data: { scopes: [{ id: '100', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 5 } }] },
+        });
+      }
+      if (path === '/developers/v1/privilege/all/cli_edge_4b') return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      if (path === '/developers/v1/app_version/list/cli_edge_4b') return Response.json({ code: 0, data: { versions: [{ appVersion: '1.0.0', versionId: 'v-100', versionStatus: 2 }] } });
+      if (path === '/developers/v1/app_version/create/cli_edge_4b') return Response.json({ code: 0, data: { versionId: 'v-101' } });
+      if (path === '/developers/v1/approval_nodes/get/cli_edge_4b') return Response.json(rtB ? humanApprovalFlow : autoPassFlow);
+      if (path === '/developers/v1/app_version/v-101/cli_edge_4b') return Response.json({ code: 0, data: { versionId: 'v-101', versionStatus: 2 } });
+      return subB.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const rB = await automateOpenPlatformSetup({
+      appId: 'cli_edge_4b',
+      brand: 'feishu',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      autoAvoidApproval: true,
+      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+      fetchImpl: fetchB,
+    });
+    expect(rB.ok).toBe(true);
+    if (!rB.ok) throw new Error('expected ok');
+    expect(rtB).toBe(false);
+    expect(rB.approvalAutoPassed).toBe(true);
+    expect(rB.approvalDisabledRefreshToken).toBe(true);
+
+    // 4c: 复用旧草稿且草稿残留 status=1 的需审权限（已在 excludeScopes 中），自动 del 清理并秒过
+    const subC = openPlatformSubscriptionMock('cli_edge_4c');
+    const stagedC = new Set<string>(['tenant:100', 'tenant:202']);
+    const fetchC = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_edge_4c/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/safe_setting/cli_edge_4c') {
+        return Response.json({ code: 0, data: { allowRefreshToken: false, redirectURL: [BOTMUX_REDIRECT_URL], ipWhiteList: [], safeServerDomain: [] } });
+      }
+      if (path === '/developers/v1/scope/all/cli_edge_4c') {
+        return Response.json({
+          code: 0,
+          data: {
+            scopes: [
+              { id: '100', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 5 } },
+              { id: '202', name: 'im:message.group_msg', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 1 } },
+            ],
+          },
+        });
+      }
+      if (path === '/developers/v1/scope/update/cli_edge_4c') {
+        const body = JSON.parse(String(init?.body));
+        for (const id of body.appScopeIDs ?? []) {
+          if (body.operation === 'del') stagedC.delete(`tenant:${id}`);
+          else stagedC.add(`tenant:${id}`);
+        }
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/privilege/all/cli_edge_4c') return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      if (path === '/developers/v1/app_version/list/cli_edge_4c') {
+        return Response.json({
+          code: 0,
+          data: {
+            versions: [
+              { appVersion: '1.0.1', versionId: 'v-draft', versionStatus: 0 },
+              { appVersion: '1.0.0', versionId: 'v-100', versionStatus: 2 },
+            ],
+          },
+        });
+      }
+      if (path === '/developers/v1/approval_nodes/get/cli_edge_4c') return Response.json(stagedC.has('tenant:202') ? humanApprovalFlow : autoPassFlow);
+      if (path === '/developers/v1/publish/commit/cli_edge_4c/v-draft') {
+        expect(stagedC.has('tenant:202')).toBe(false);
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/app_version/v-draft/cli_edge_4c') return Response.json({ code: 0, data: { versionId: 'v-draft', versionStatus: 2 } });
+      return subC.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const rC = await automateOpenPlatformSetup({
+      appId: 'cli_edge_4c',
+      brand: 'feishu',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      autoAvoidApproval: true,
+      scopeManifest: { scopes: { tenant: ['im:message', 'im:message.group_msg'], user: [] } },
+      excludeScopes: { tenant: ['im:message.group_msg'] },
+      fetchImpl: fetchC,
+    });
+    expect(rC.ok).toBe(true);
+    if (!rC.ok) throw new Error('expected ok');
+    expect(rC.versionReused).toBe(true);
+    expect(rC.approvalAutoPassed).toBe(true);
+  });
+
+  it('同一 appId 并发调用 automateOpenPlatformSetup 严格串行化，避免并发写入污染二分草稿', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-approval-mutex-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+
+    const sub = openPlatformSubscriptionMock('cli_mutex');
+    let activeMutators = 0;
+    let maxConcurrent = 0;
+    const makeFetch = () => (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_mutex/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/safe_setting/cli_mutex') {
+        return Response.json({ code: 0, data: { allowRefreshToken: false, redirectURL: [BOTMUX_REDIRECT_URL], ipWhiteList: [], safeServerDomain: [] } });
+      }
+      if (path === '/developers/v1/scope/all/cli_mutex') {
+        activeMutators += 1;
+        maxConcurrent = Math.max(maxConcurrent, activeMutators);
+        await new Promise(r => setTimeout(r, 20));
+        return Response.json({ code: 0, data: { scopes: [{ id: '100', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 0 } }] } });
+      }
+      if (path === '/developers/v1/privilege/all/cli_mutex') return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      if (path === '/developers/v1/app_version/list/cli_mutex') return Response.json({ code: 0, data: { versions: [{ appVersion: '1.0.0', versionId: 'v-100', versionStatus: 2 }] } });
+      if (path === '/developers/v1/app_version/create/cli_mutex') return Response.json({ code: 0, data: { versionId: 'v-101' } });
+      if (path === '/developers/v1/approval_nodes/get/cli_mutex') return Response.json(autoPassFlow);
+      if (path === '/developers/v1/publish/commit/cli_mutex/v-101') {
+        activeMutators -= 1;
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/app_version/v-101/cli_mutex') return Response.json({ code: 0, data: { versionId: 'v-101', versionStatus: 2 } });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const [a, b] = await Promise.all([
+      automateOpenPlatformSetup({
+        appId: 'cli_mutex',
+        brand: 'feishu',
+        sessionFilePath: sessionFile,
+        disableBytedcliFallback: true,
+        scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+        fetchImpl: makeFetch(),
+      }),
+      automateOpenPlatformSetup({
+        appId: 'cli_mutex',
+        brand: 'feishu',
+        sessionFilePath: sessionFile,
+        disableBytedcliFallback: true,
+        scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+        fetchImpl: makeFetch(),
+      }),
+    ]);
+
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    expect(maxConcurrent).toBe(1);
   });
 });
