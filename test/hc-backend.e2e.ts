@@ -75,6 +75,7 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
   let root: string;
   let cli: string;
   let hostBefore: string[];
+  let initialCoreEnv: NodeJS.ProcessEnv;
   const opened: HcBackend[] = [];
 
   beforeAll(() => {
@@ -84,6 +85,11 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
     hostBefore = hostEntries();
     resetHcAvailabilityCache();
     root = mkdtempSync('/tmp/bmhce-');
+    // Exercise the macOS default address while keeping the real hc invocations
+    // under the test fence's XDG_RUNTIME_DIR.
+    initialCoreEnv = process.platform === 'darwin'
+      ? { ...process.env, SESSION_DATA_DIR: join(root, 'data'), XDG_RUNTIME_DIR: undefined }
+      : process.env;
     mkdirSync(join(root, 'home'));
     cli = join(root, 'cli.sh');
     writeFileSync(cli, CLI);
@@ -93,25 +99,27 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
 
   afterAll(() => {
     for (const backend of opened.splice(0)) backend.destroySession();
-    if (process.env.BOTMUX_HC_BIN) {
+    if (process.env.BOTMUX_HC_BIN && initialCoreEnv) {
       // `server stop` only connects: it never starts a core.
-      spawnSync(process.env.BOTMUX_HC_BIN, ['server', 'stop'], {
-        env: hcControlEnv(process.env, hcCorePaths(process.env)),
-        cwd: '/',
-        stdio: 'ignore',
-        timeout: 20_000,
-      });
+      for (const socketEnv of new Set([process.env, initialCoreEnv])) {
+        spawnSync(process.env.BOTMUX_HC_BIN, ['server', 'stop'], {
+          env: hcControlEnv(process.env, hcCorePaths(socketEnv)),
+          cwd: '/',
+          stdio: 'ignore',
+          timeout: 20_000,
+        });
+      }
     }
     resetHcAvailabilityCache();
     if (root) rmSync(root, { recursive: true, force: true });
   });
 
-  function workerGate(sessionId: string, recorded?: PersistentBackendTarget) {
+  function workerGate(sessionId: string, recorded?: PersistentBackendTarget, coreEnv = process.env) {
     return resolveHcBackendGate({
       sessionId,
       recorded,
       availability: () => probeHcAvailability({ env: process.env }),
-      defaultCore: () => hcCoreAddress(hcCorePaths(process.env)),
+      defaultCore: () => hcCoreAddress(hcCorePaths(coreEnv)),
       coreUnreachable: core => hcRuntimeDirError(hcCorePaths(process.env, { core })),
       probe: target => probeHcTerminal(target),
     });
@@ -144,7 +152,7 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
 
   it('runs a CLI, reattaches it from a new worker instance and ends it from the daemon', async () => {
     const sessionId = randomUUID();
-    const gate = workerGate(sessionId);
+    const gate = workerGate(sessionId, undefined, initialCoreEnv);
     expect(gate).toMatchObject({ available: true, probe: 'missing', hasExistingSession: false });
     const selected = selectSessionBackend({
       backendType: 'hc', sessionId, persistentBackendTarget: gate.target, hasExistingSession: gate.hasExistingSession,
@@ -156,7 +164,9 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
       backendType: 'hc',
       sessionName: hcTerminalName(sessionId),
       hcSession: 'botmux',
-      socket: join(process.env.XDG_RUNTIME_DIR!, 'herdr-core', 'botmux.sock'),
+      socket: process.platform === 'darwin'
+        ? join(root, 'hc', 'botmux.sock')
+        : join(process.env.XDG_RUNTIME_DIR!, 'herdr-core', 'botmux.sock'),
     });
     // Deciding needed no core; the spawn starts the first one, from the control env.
     expect(existsSync(target.socket)).toBe(false);

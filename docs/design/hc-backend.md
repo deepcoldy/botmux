@@ -12,12 +12,12 @@
 ## 1. 命名与选择
 
 - `BackendType` 加 `'hc'`；bot 级 `backendType: "hc"` 或 `BACKEND_TYPE=hc` 选中。
-- 不加进 `detectDefaultBackend()`。hc 不可用（无二进制、版本低于下限、非 Linux）时，selector 硬失败并给出可读原因，和 zmx 的 opt-in 闸门一致（`src/setup/ensure-zmx.ts`）。
+- 不加进 `detectDefaultBackend()`。hc 不可用（无二进制、版本低于下限、系统不支持）时，selector 硬失败并给出可读原因，和 zmx 的 opt-in 闸门一致（`src/setup/ensure-zmx.ts`）。
 
 ## 2. botmux 私有 core
 
 - **二进制发现**：依次尝试 `BOTMUX_HC_BIN` → `<botmux 数据根>/bin/herdr-core` → PATH 上的 `herdr-core` → PATH 上的 `hc`，取第一个 `--version` 输出 `hc X.Y.Z` 且版本 ≥ `HC_MIN_VERSION = 0.1.19` 的。不得用低于下限的二进制，也不得修改用户的 `~/.local/bin/hc`。
-- **core 身份**：`HC_SESSION=botmux`，`HC_SOCKET=<XDG_RUNTIME_DIR 或 /run/user/<uid>>/herdr-core/botmux.sock`，显式传入，并冻结进 target。
+- **core 身份**：`HC_SESSION=botmux`，`HC_SOCKET` 优先使用 `$XDG_RUNTIME_DIR/herdr-core/botmux.sock`（要求绝对路径）。未设置时，Linux 用 `/run/user/<uid>/herdr-core/botmux.sock`，macOS 用 `<botmux 数据根>/hc/botmux.sock`，显式传入，并冻结进 target。
 - **私有配置**：`XDG_CONFIG_HOME=<botmux 数据根>/hc/config`，其下 `herdr-core/config.toml` 由 botmux 写入：
   - `notes = false`：hc 不自己往终端里打字；
   - `headless = "160x50"`：与 `DEFAULT_RENDER_COLS/ROWS` 一致，daemon 重启的空窗期 CLI 不会被拉到 200x120；
@@ -27,7 +27,7 @@
   - `XDG_STATE_HOME = hcStateHome(socket)`，即 `<socket 去扩展名>.state`：只由 socket 决定，所有 daemon 对同一 core 算出同一个 state 目录。state 目录不同的 core 会在 bind 前 unlink 正在服务的 socket（上游 #200）。
   - 有意偏离报告 05：provider 凭据（`ANTHROPIC_*` 等）**不额外剥离**。tmux 下 daemon env 会经 server 全局表进入 pane，多剥会导致功能缺失；hc 的 core env 跨 restart 持久，语义与 tmux server 全局表相同。
 - **拉起**：只走显式的 `herdr-core server start`，并带 control env。**每一次** hc CLI 调用都用 control env，这样即使触发了 hc 的连不上就自动拉起，env 也是干净的。
-  - `XDG_RUNTIME_DIR == /run/user/<uid>` 时，hc 自己用 `systemd-run --user` 起 `hc-serve-*`/`hc-hold-*` 单元，独立于 daemon 的 cgroup，daemon 重启后程序仍在。
+  - `XDG_RUNTIME_DIR == /run/user/<uid>` 时，hc 自己用 `systemd-run --user` 起 `hc-serve-*`/`hc-hold-*` 单元，独立于 daemon 的 cgroup，daemon 重启后程序仍在。macOS 由 hc 自己通过 launchd 启动 core。
 - **版本**：连上后用 `server.status` 读出运行中 core 的版本；低于下限就拒绝创建，不自动 restart。
 
 ## 3. 持久 target

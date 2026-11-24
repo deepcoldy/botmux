@@ -307,7 +307,7 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 
 | 字段 | 说明 |
 |------|------|
-| `backendType` | 会话后端：`tmux`（默认）、`zellij`（≥ 0.44）、`herdr`、`zmx`、`hc`（仅 Linux，需显式选用并自备 herdr-core ≥ 0.1.19）、`pty`。tmux 这类持久后端在本机不可用时，会弹卡提示安装，不会悄悄降级成 pty。`pty` 只在显式指定时使用，daemon 重启后会话不保留。见 [tmux 后端](/tmux)、[ZMX 后端](/zmx)、[hc 后端](/hc) |
+| `backendType` | 会话后端：`tmux`（默认）、`zellij`（≥ 0.44）、`herdr`、`zmx`、`hc`（Linux / macOS，需显式选用并自备 herdr-core ≥ 0.1.19）、`pty`。tmux 这类持久后端在本机不可用时，会弹卡提示安装，不会悄悄降级成 pty。`pty` 只在显式指定时使用，daemon 重启后会话不保留。见 [tmux 后端](/tmux)、[ZMX 后端](/zmx)、[hc 后端](/hc) |
 | `launchShell` | 启动 CLI 用的 shell，覆盖 daemon 的 `$SHELL`。填 `zsh` / `bash` / `fish` / `sh` 或绝对路径。用在登录 shell 的 rc 文件里有 `exec zsh` 之类跳转、导致会话起不来（终端里出现 `parse error`）的情况。指定后，PATH、nvm 等要写在所选 shell 的 rc 文件里（fish 是 `~/.config/fish/config.fish`）。对 tmux / zellij / zmx / hc 的新会话生效 |
 | `lang` | 界面语言 `zh` / `en`；不填时看 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `p2pMode` | 私聊模式：`chat`（默认，一个连续会话）、`thread`（每条私聊消息开一个独立会话）、`group`（每条私聊消息自动建一个专属会话群）。见[群聊模式](/group) |

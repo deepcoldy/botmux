@@ -415,7 +415,7 @@ export function backendGateUserMessage(backend: BackendType, reason: string): st
       : backend === 'zmx'
         ? '需要 zmx >= 0.7.0（send 不再抢占 client leadership）｜macOS: brew install neurosnap/tap/zmx ｜ Linux: 装官方 release binary ｜ mise: mise use -g github:neurosnap/zmx@latest'
       : backend === 'hc'
-        ? `需要 herdr-core >= ${HC_MIN_VERSION.join('.')}，仅支持 Linux ｜ 放到 botmux 数据目录的 bin/herdr-core，或用 BOTMUX_HC_BIN 指定绝对路径，或让 herdr-core / hc 出现在 PATH 上 ｜ botmux 不会自动安装或升级 hc ｜ 也可把该 bot 的 backendType 改回 tmux`
+        ? `需要 herdr-core >= ${HC_MIN_VERSION.join('.')}，支持 Linux 和 macOS ｜ 放到 botmux 数据目录的 bin/herdr-core，或用 BOTMUX_HC_BIN 指定绝对路径，或让 herdr-core / hc 出现在 PATH 上 ｜ botmux 不会自动安装或升级 hc ｜ 也可把该 bot 的 backendType 改回 tmux`
       : `请确认 ${backend} 已正确安装并可用`;
   return [
     `⚠️ 本机 ${backend} 不可用，无法启动会话。`,
