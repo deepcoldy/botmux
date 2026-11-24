@@ -719,6 +719,32 @@ describe('independent turn terminal receipt', () => {
     expect(ds.terminalReceiptTurnIds?.has(turnId)).toBe(true);
   });
 
+  it('does not patch a deferred fallback final while background tasks run', async () => {
+    const ds = makeDs();
+    const turnId = 'om_turn_background_progress_then_fallback';
+    bindLarkTurn(ds, turnId);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId, messageId: 'om_progress_card',
+      responseKind: 'progress', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    let releaseDelivery: ((messageId: string) => void) | undefined;
+    sessionReplyMock.mockImplementationOnce(
+      () => new Promise<string>(resolve => { releaseDelivery = resolve; }) as any,
+    );
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: 'sid-terminal-receipt', content: '最终答复正文',
+      lastUuid: 'uuid-fallback-final', turnId,
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg(turnId, { backgroundTasks: 1 }));
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    releaseDelivery!('om_fallback_final_card');
+    await settle(ds);
+    expect(patchCardStreamElement).not.toHaveBeenCalled();
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    expect(ds.terminalReceiptTurnIds?.has(turnId)).not.toBe(true);
+  });
+
   it.each(['progress', 'auxiliary'] as const)(
     'keeps an interim-only %s turn footerless when no fallback final lands',
     async responseKind => {

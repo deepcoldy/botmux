@@ -312,6 +312,13 @@ import {
   readScheduledTaskAnchors,
   upsertScheduledTaskAnchor,
 } from './services/bridge-scheduled-anchors.js';
+import {
+  normalizeBackgroundTranscriptPath,
+  normalizeBackgroundTranscriptSegments,
+  readBackgroundTranscriptChain,
+  writeBackgroundTranscriptChain,
+  type BackgroundTranscriptSegment,
+} from './services/background-transcript-chain.js';
 import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from './services/codex-adopt-recovery.js';
 import {
   defaultGatewayEntry,
@@ -521,7 +528,7 @@ import {
 } from './services/antigravity-bridge-decision.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
-import { baselineJsonlCursor, scanJsonlFromOffset } from './services/jsonl-cursor.js';
+import { baselineJsonlCursor, scanJsonlFromOffset, type JsonlCursor } from './services/jsonl-cursor.js';
 import { fileURLToPath } from 'node:url';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { RiffHostTools, RIFF_HOST_TOOLS_ROUTE } from './services/riff-host-tools.js';
@@ -10189,23 +10196,118 @@ function seedModelRequestClockFromTranscript(): void {
   catch (err: any) { log(`Model request clock seed skipped: ${err?.message ?? err}`); }
 }
 
+let backgroundTranscriptPaths: BackgroundTranscriptSegment[] = [];
+let backgroundTranscriptChainLoaded = false;
+
+function backgroundTranscriptChainFilePath(): string | undefined {
+  if (!process.env.SESSION_DATA_DIR || !sessionId) return undefined;
+  return join(process.env.SESSION_DATA_DIR, 'turn-marks', `${sessionId}.background-transcripts.json`);
+}
+
+function persistBackgroundTranscriptChain(): void {
+  const path = backgroundTranscriptChainFilePath();
+  if (!path) return;
+  try { writeBackgroundTranscriptChain(path, backgroundTranscriptPaths); }
+  catch (error) { log(`Background transcript chain persist failed: ${error instanceof Error ? error.message : String(error)}`); }
+}
+
+function latestClosedTranscriptOffset(path: string): number {
+  for (let i = backgroundTranscriptPaths.length - 1; i >= 0; i--) {
+    const segment = backgroundTranscriptPaths[i];
+    if (segment.path === path && segment.toOffset !== undefined) return segment.toOffset;
+  }
+  return 0;
+}
+
+/** Restore ordered byte ranges only for a surviving CLI. Every start without
+ * a live re-attach is a new CLI generation and starts a new chain. */
+function prepareBackgroundTranscriptReplay(attachPath: string, currentPath: string): BackgroundTranscriptSegment[] {
+  const attach = normalizeBackgroundTranscriptPath(attachPath);
+  const current = normalizeBackgroundTranscriptPath(currentPath);
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode) return [{ path: current, fromOffset: 0 }];
+  if (bridgeLiveCliStartedAtMs === undefined) {
+    backgroundTranscriptPaths = [];
+    backgroundTranscriptChainLoaded = true;
+  } else if (!backgroundTranscriptChainLoaded) {
+    const storePath = backgroundTranscriptChainFilePath();
+    backgroundTranscriptPaths = storePath ? readBackgroundTranscriptChain(storePath) : [];
+    backgroundTranscriptChainLoaded = true;
+  }
+  let changed = false;
+  if (!backgroundTranscriptPaths.some(segment => segment.path === attach)) {
+    backgroundTranscriptPaths.unshift({ path: attach, fromOffset: 0 });
+    changed = true;
+  }
+  const last = backgroundTranscriptPaths.at(-1);
+  if (last?.path !== current || last.toOffset !== undefined) {
+    backgroundTranscriptPaths.push({ path: current, fromOffset: latestClosedTranscriptOffset(current) });
+    changed = true;
+  }
+  if (changed) persistBackgroundTranscriptChain();
+  return backgroundTranscriptPaths.map(segment => ({ ...segment }));
+}
+
+/** Close the old visit at its drained byte frontier and open the new one. A
+ * revisit gets a NEW segment from that path's last closed frontier; deduping
+ * by path would reorder A→B→A into A→A→B. */
+function recordBackgroundTranscriptRotation(previousPath: string | undefined, nextPath: string, drainedOffset?: number): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode) return;
+  if (!backgroundTranscriptChainLoaded) {
+    const storePath = backgroundTranscriptChainFilePath();
+    backgroundTranscriptPaths = storePath ? readBackgroundTranscriptChain(storePath) : [];
+    backgroundTranscriptChainLoaded = true;
+  }
+  const previous = previousPath ? normalizeBackgroundTranscriptPath(previousPath) : undefined;
+  const next = normalizeBackgroundTranscriptPath(nextPath);
+  const last = backgroundTranscriptPaths.at(-1);
+  if (last !== undefined && drainedOffset !== undefined && last.path === previous && last.toOffset === undefined
+    && drainedOffset >= last.fromOffset) {
+    last.toOffset = drainedOffset;
+  }
+  if (last === undefined || last.path !== next || last.toOffset !== undefined) {
+    backgroundTranscriptPaths.push({ path: next, fromOffset: latestClosedTranscriptOffset(next) });
+  }
+  persistBackgroundTranscriptChain();
+}
+
 /** A worker that re-attached to a surviving Claude CLI starts with an empty
  *  tracker although the CLI's background tasks are still running. Replay the
- *  transcript with the CLI's start time as the launch cutoff, line by line so
- *  a long transcript is never held in memory at once. */
-function seedBackgroundTasksFromTranscript(): void {
+ *  ordered transcript segments, line by line so long transcripts are never
+ *  held in memory at once. The current segment's frontier is shared with the
+ *  bridge baseline: later appends remain readable instead of falling between
+ *  two independently-read EOFs. */
+function seedBackgroundTasksFromTranscript(paths?: readonly (string | BackgroundTranscriptSegment)[]): JsonlCursor | null | undefined {
   if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode
-    || bridgeLiveCliStartedAtMs === undefined || !bridgeJsonlPath || !existsSyncSafe(bridgeJsonlPath)) return;
+    || bridgeLiveCliStartedAtMs === undefined || !bridgeJsonlPath || !existsSyncSafe(bridgeJsonlPath)) return undefined;
+  const currentPath = normalizeBackgroundTranscriptPath(bridgeJsonlPath);
+  const inputs = (paths ?? []).map(segment => typeof segment === 'string' ? { path: segment, fromOffset: 0 } : segment);
+  if (!inputs.some(segment => segment.path === currentPath)) inputs.push({ path: currentPath, fromOffset: 0 });
+  const replaySegments = normalizeBackgroundTranscriptSegments(inputs)
+    .filter(segment => existsSyncSafe(segment.path));
   backgroundTaskTracker.reset(bridgeLiveCliStartedAtMs);
-  scanJsonlFromOffset(bridgeJsonlPath, 0, {
-    onLine(line) {
-      let ev: unknown;
-      try { ev = JSON.parse(line); } catch { return; }
-      if (ev && typeof ev === 'object') backgroundTaskTracker.observe(ev as TranscriptEvent);
-    },
-    onError(err: any) { log(`Background task seed incomplete: ${err?.message ?? err}`); },
-  });
+  let currentCursor: JsonlCursor | undefined;
+  for (const segment of replaySegments) {
+    const cursor = scanJsonlFromOffset(segment.path, segment.fromOffset, {
+      ...(segment.toOffset !== undefined ? { endOffset: segment.toOffset } : {}),
+      onLine(line) {
+        let ev: unknown;
+        try { ev = JSON.parse(line); } catch { return; }
+        if (ev && typeof ev === 'object') backgroundTaskTracker.observe(ev as TranscriptEvent);
+      },
+      onError(err: any) { log(`Background task seed incomplete (${segment.path}): ${err?.message ?? err}`); },
+    });
+    if (!cursor) {
+      // Never publish a partial replay: a launch read without its later stop
+      // would otherwise pin a dead task forever. Fail back to the old empty
+      // tracker; the next lazy baseline retries the whole replay.
+      backgroundTaskTracker.reset(bridgeLiveCliStartedAtMs);
+      refreshBackgroundWait();
+      return null;
+    }
+    if (segment.path === currentPath) currentCursor = cursor;
+  }
   refreshBackgroundWait();
+  return currentCursor;
 }
 
 function modelRequestPayload(): { awaySummaryPending: boolean; modelRequestSessionId?: string; lastModelRequestAt?: number; lastActivityRequestAt?: number } {
@@ -12047,7 +12149,10 @@ function refreshOrcaClaudeWebHistory(): void {
   setOrcaClaudeWebHistory(paths.flatMap(path => drainTranscript(path, 0).events));
 }
 
-function bridgeAbsorbBaseline(): void {
+function bridgeAbsorbBaseline(backgroundTasksCursor?: JsonlCursor | null): void {
+  // A failed seed has no trustworthy frontier. Stay un-baselined so the next
+  // lazy pass retries the replay instead of skipping records up to a later EOF.
+  if (backgroundTasksCursor === null) return;
   if (!bridgeJsonlPath) return;
   // The transcript file exists (or just appeared): this CLI session HAS
   // user-visible history. Recorded here (attach/lazy-baseline modes; the
@@ -12069,8 +12174,8 @@ function bridgeAbsorbBaseline(): void {
     // baseline BEHIND their recorded offsets instead of skipping to EOF — the
     // interrupted turn's user line and partial assistant output are then
     // re-attributed and delivered through the normal fallback gate.
-    if (tryRestoreInterruptedBridgeTurns()) return;
-    const cursor = baselineJsonlCursor(bridgeJsonlPath);
+    if (tryRestoreInterruptedBridgeTurns(backgroundTasksCursor)) return;
+    const cursor = backgroundTasksCursor ?? baselineJsonlCursor(bridgeJsonlPath);
     bridgeOffset = cursor.newOffset;
     bridgeBaselineDone = true;
     return;
@@ -12114,7 +12219,7 @@ function bridgeAbsorbBaseline(): void {
  *    - the send-marker gate still applies at emit — turn-sends markers
  *      persist across restarts, so an answer the model already `botmux
  *      send`-ed before the kill stays suppressed. */
-function tryRestoreInterruptedBridgeTurns(): boolean {
+function tryRestoreInterruptedBridgeTurns(backgroundTasksCursor?: JsonlCursor): boolean {
   // At-most-once, and only on this worker process's FIRST bridge baseline. Any
   // baseline that runs after a watcher teardown is an in-worker CLI restart
   // whose InflightInputTracker carryover already re-delivers the interrupted
@@ -12141,11 +12246,13 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
     try { writeBridgeTurnJournal(journalPath, restorable); } catch { /* best-effort */ }
   }
   if (restorable.length === 0) return false;
-  let transcriptSize = Number.NaN;
-  try { transcriptSize = statSync(bridgeJsonlPath).size; } catch { /* plan fails closed below */ }
+  let transcriptSize = backgroundTasksCursor?.newOffset ?? Number.NaN;
+  if (backgroundTasksCursor === undefined) {
+    try { transcriptSize = statSync(bridgeJsonlPath).size; } catch { /* plan fails closed below */ }
+  }
   const recoveryPlan = planBridgeTurnRecovery(restorable, transcriptSize);
   const skipRecovery = (reason: string): true => {
-    const cursor = baselineJsonlCursor(bridgeJsonlPath!);
+    const cursor = backgroundTasksCursor ?? baselineJsonlCursor(bridgeJsonlPath!);
     bridgeOffset = cursor.newOffset;
     bridgeBaselineDone = true;
     clearBridgeTurnJournal(journalPath);
@@ -12161,7 +12268,27 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
   }
   let drained: ReturnType<typeof drainTranscript>;
   try {
-    drained = drainTranscript(bridgeJsonlPath, recoveryPlan.fromOffset);
+    if (!backgroundTasksCursor) {
+      drained = drainTranscript(bridgeJsonlPath, recoveryPlan.fromOffset);
+    } else {
+      // Recovery attribution may read an older range, but must stop at the
+      // exact frontier already folded into the background tracker. Bytes
+      // appended later stay unread for the normal live drain.
+      const events: TranscriptEvent[] = [];
+      let scanError: unknown;
+      const cursor = scanJsonlFromOffset(bridgeJsonlPath, recoveryPlan.fromOffset, {
+        endOffset: backgroundTasksCursor.newOffset,
+        onLine(line) {
+          try {
+            const ev: unknown = JSON.parse(line);
+            if (ev && typeof ev === 'object') events.push(ev as TranscriptEvent);
+          } catch { /* match drainTranscript's malformed-line tolerance */ }
+        },
+        onError(error) { scanError = error; },
+      });
+      if (!cursor) throw scanError ?? new Error('background-task-frontier scan failed');
+      drained = { events, newOffset: cursor.newOffset, pendingTail: cursor.pendingTail };
+    }
   } catch (error) {
     return skipRecovery(`drain-failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -12221,15 +12348,17 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // finished"). If the drained user/assistant events still need follow-up
   // appends on the old path, retainSecondaryPathIfStillReferenced() keeps
   // the old path in the polling rotation.
-  if (bridgeJsonlPath && bridgeBaselineDone) {
-    let postDrainOffset = bridgeOffset;
+  const previousJsonlPath = bridgeJsonlPath;
+  let postDrainOffset: number | undefined;
+  if (previousJsonlPath && bridgeBaselineDone) {
+    postDrainOffset = bridgeOffset;
     try {
-      const drained = drainPathInto(bridgeJsonlPath, bridgeOffset);
+      const drained = drainPathInto(previousJsonlPath, bridgeOffset);
       postDrainOffset = drained.offset;
     } catch (err: any) {
       log(`Bridge final-drain on fingerprint switch failed (${err.message}); continuing`);
     }
-    retainSecondaryPathIfStillReferenced(bridgeJsonlPath, postDrainOffset);
+    retainSecondaryPathIfStillReferenced(previousJsonlPath, postDrainOffset);
   }
   log(`Bridge transcript switched: ${bridgeJsonlPath} → ${matched} (${reason})`);
   if (bridgeWatcher) {
@@ -12242,6 +12371,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // turn. Clearing here would race-drop exactly the message we're
   // trying to deliver.
   bridgeJsonlPath = matched;
+  recordBackgroundTranscriptRotation(previousJsonlPath, matched, postDrainOffset);
   bridgeJsonlDir = dirname(matched);
   bindModelRequestClockToTranscript(matched);
   // Split-live: drain `matched` from offset 0, partition by cutoffMs.
@@ -12515,15 +12645,17 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   // Drain-before-switch: pull any unread bytes from the old path so a
   // late assistant append doesn't vanish. Mirrors the other rotation
   // helpers.
-  if (bridgeJsonlPath && bridgeBaselineDone) {
-    let postDrainOffset = bridgeOffset;
+  const previousJsonlPath = bridgeJsonlPath;
+  let postDrainOffset: number | undefined;
+  if (previousJsonlPath && bridgeBaselineDone) {
+    postDrainOffset = bridgeOffset;
     try {
-      const drained = drainPathInto(bridgeJsonlPath, bridgeOffset);
+      const drained = drainPathInto(previousJsonlPath, bridgeOffset);
       postDrainOffset = drained.offset;
     } catch (err: any) {
       log(`Bridge final-drain on rotation (${reason}) failed (${err.message}); continuing`);
     }
-    retainSecondaryPathIfStillReferenced(bridgeJsonlPath, postDrainOffset);
+    retainSecondaryPathIfStillReferenced(previousJsonlPath, postDrainOffset);
   }
 
   log(`Bridge transcript switched (${reason}): ${bridgeJsonlPath ?? '(none)'} → ${newPath}`);
@@ -12532,6 +12664,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
     bridgeWatcher = null;
   }
   bridgeJsonlPath = newPath;
+  recordBackgroundTranscriptRotation(previousJsonlPath, newPath, postDrainOffset);
   bridgeJsonlDir = dirname(newPath);
   bindModelRequestClockToTranscript(newPath);
 
@@ -13349,7 +13482,8 @@ function bridgeIngest(): void {
     if (!existsSyncSafe(bridgeJsonlPath)) return;
     // Bind/seed before baseline can trigger any immediate status publication.
     seedModelRequestClockFromTranscript();
-    bridgeAbsorbBaseline();
+    const backgroundTasksCursor = seedBackgroundTasksFromTranscript(backgroundTranscriptPaths);
+    bridgeAbsorbBaseline(backgroundTasksCursor);
     // Seed the fallback tracker for the same reason as the request clock: the
     // non-adopt branch cursors straight to EOF, so a switch already written to
     // the file is never drained and only the tail scan can recover it. It also
@@ -13423,6 +13557,7 @@ function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void 
       content: currentUsageLimitSnapshot(),
       status: 'limited',
       usageLimit,
+      ...backgroundWaitPayload(),
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });
@@ -13517,6 +13652,7 @@ function performBridgeIngestAndScheduleQuietEmit(): void {
 }
 
 function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?: string; mode?: 'baseline-existing' | 'fresh-empty'; dataDir?: string; liveCliStartedAtMs?: number }): void {
+  const attachJsonlPath = jsonlPath;
   bridgeLiveCliStartedAtMs = opts?.liveCliStartedAtMs;
   bridgeJsonlPath = jsonlPath;
   bridgeJsonlDir = dirname(jsonlPath);
@@ -13589,7 +13725,8 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   beginNewBridgeTranscriptGeneration();
   // Bind/seed before baseline can publish status from a previous native session.
   seedModelRequestClockFromTranscript();
-  seedBackgroundTasksFromTranscript();
+  const replayPaths = prepareBackgroundTranscriptReplay(attachJsonlPath, bridgeJsonlPath);
+  const backgroundTasksCursor = seedBackgroundTasksFromTranscript(replayPaths);
   if (mode === 'fresh-empty') {
     // Non-adopt fallback: brand-new session, jsonl gets created on the first
     // user submit. We must NOT lazy-absorb the file when it appears — that
@@ -13601,7 +13738,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
     bridgeBaselineDone = true;
     log(`Bridge fresh-empty mode: ${bridgeJsonlPath} (waiting for file to appear; no baseline absorb)`);
   } else if (existsSyncSafe(bridgeJsonlPath)) {
-    bridgeAbsorbBaseline();
+    bridgeAbsorbBaseline(backgroundTasksCursor);
     log(`Bridge baselined: ${bridgeJsonlPath} (offset=${bridgeOffset})`);
   } else {
     log(`Bridge transcript not yet present at ${bridgeJsonlPath}; will baseline on first appearance`);
@@ -16551,6 +16688,7 @@ function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]):
       content: currentUsageLimitSnapshot(),
       status: 'limited',
       usageLimit,
+      ...backgroundWaitPayload(),
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });

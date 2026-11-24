@@ -204,6 +204,40 @@ describe('CoT message of a turn that ended with background tasks running', () =>
     expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps the held CoT message open when the same terminal is replayed', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    terminal(worker, { backgroundTasks: 1 });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    expect(ds.cotHeldForBackground).toEqual({ turnId: 'om_turn', dispatchAttempt: 1 });
+    screen(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['stalled', 'limited'] as const)('does not treat a positive count on a %s frame as zero', status => {
+    const { worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    worker.emit('message', {
+      type: 'screen_update', content: 'still waiting', status, turnId: 'om_turn', dispatchAttempt: 1,
+      backgroundTasks: 1,
+    });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    screen(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases on a raw idle zero frame even when a sticky limit projects limited', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    ds.usageLimit = {
+      limited: true, kind: 'rate', retryAtMs: Date.now() + 60_000,
+      retryLabel: '1 min', retryReady: false,
+    };
+    terminal(worker, { backgroundTasks: 1 });
+    screen(worker);
+    expect(ds.lastScreenStatus).toBe('limited');
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+  });
+
   it('closes the held CoT message when a later terminal arrives', () => {
     const { ds, worker } = setup({ cliId: 'claude-code' });
     terminal(worker, { backgroundTasks: 1 });

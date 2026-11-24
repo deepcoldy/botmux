@@ -12830,12 +12830,19 @@ type CotTerminal = Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'tur
  *  closed when the session's background task count reaches 0, the worker is
  *  suspended, or a later terminal arrives. */
 function finalizeOrHoldCotMessage(ds: DaemonSession, msg: CotTerminal): void {
+  if (isReplayOfHeldCotTerminal(ds, msg)) return;
   releaseHeldCotMessage(ds);
   if (msg.status === 'completed' && msg.backgroundTasks) {
     ds.cotHeldForBackground = { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
     return;
   }
   finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+}
+
+function isReplayOfHeldCotTerminal(ds: DaemonSession, msg: CotTerminal): boolean {
+  const held = ds.cotHeldForBackground;
+  return msg.status === 'completed' && !!held
+    && held.turnId === msg.turnId && held.dispatchAttempt === msg.dispatchAttempt;
 }
 
 function releaseHeldCotMessage(ds: DaemonSession): void {
@@ -24360,7 +24367,13 @@ function setupWorkerHandlers(
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
           : undefined;
-        if (ds.backgroundTaskCount === undefined) releaseHeldCotMessage(ds);
+        // Only the worker's raw working/idle frame uses omission as the same
+        // tracker's explicit zero. A stalled/limited frame (including sticky
+        // usage-limit projection) cannot turn a positive count into zero.
+        if ((msg.status === 'working' || msg.status === 'idle')
+          && !(typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0)) {
+          releaseHeldCotMessage(ds);
+        }
         ds.awaySummaryPending = msg.awaySummaryPending === true;
         // Worker observations, so stale frames carry facts as truly as live ones.
         noteIdleAutoCompactTranscriptClock(ds, msg);
@@ -27132,7 +27145,7 @@ function setupWorkerHandlers(
         // still receive its footer; without one the interim card stays
         // footerless by design (and no claim is left behind).
         const awaitInterimFinalCarrier = interimCarrierOnly
-          && terminalReceiptRouteEligible;
+          && terminalReceiptRouteEligible && !msg.backgroundTasks;
         // Deliberate-silence closure (positive evidence only — the same
         // 'nothing_to_send' contract as the async settle above):
         //   ① mark the session so every idle-card rebuild renders
@@ -28236,7 +28249,9 @@ function setupWorkerHandlers(
     if (admission.kind === 'historical' && msg.type === 'turn_terminal' && !msg.continuationFailure) {
       const ownsDisplay = () => ownsWorkerSession() && !isSessionTransferring(ds);
       const turnId = msg.turnId;
-      if (ownsDisplay()) finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+      if (ownsDisplay() && !isReplayOfHeldCotTerminal(ds, msg)) {
+        finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+      }
       if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
         await settleTurnReplyCardTerminal(ds, msg,
           (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsDisplay)
