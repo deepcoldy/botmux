@@ -764,6 +764,41 @@ describe('contract gateway and real worker boundaries', () => {
     expect(s.store.execution(s.ref, execution.executionId)?.runtime).toBeUndefined();
   });
 
+  it('admits a current physical exit carrying an older runtime execution without granting a forged producer', () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('old-turn');
+    s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    const before = s.store.execution(s.ref, execution.executionId);
+    const next = s.controller.reserveBinding('fresh-physical', s.worker);
+    s.controller.bindRuntime('fresh-physical', s.worker, {
+      backend: 'tmux', physicalId: '222:new-start', nativeSessionId: 'new-native', proof: 'process_start',
+    });
+    const workerScope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = workerScope.beginRuntime();
+    workerScope.assign(binding.bindingId, next);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', {
+      workerSessionEventScope: workerScope,
+    });
+    // The worker removes execution from physical exits; the controller enriches
+    // the turnId back to the old execution. Exercise that real producer chain.
+    const wire = workerScope.run(binding, () => metadata({ type: 'claude_exit', code: 1, turnId: execution.turnId }));
+    expect(wire.sessionContract.scope.execution).toBeUndefined();
+    expect(s.controller.ingest(wire, s.worker).kind).toBe('current');
+    expect(s.store.runtime(s.ref, next.runtimeId)?.phase).toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)).toEqual(before);
+
+    // Same channel, but a runtime only a different worker has proven. Merely
+    // knowing its reference (and a valid old execution) must not authorize it.
+    const foreign = s.controller.bindWorker(2).worker;
+    const foreignRuntime = s.controller.reserveBinding('foreign-runtime', foreign);
+    s.controller.bindRuntime('foreign-runtime', foreign, { backend: 'tmux', physicalId: '333:foreign', proof: 'process_start' });
+    expect(s.controller.ingest({ type: 'claude_exit', code: 1,
+      sessionContract: s.context(50, { runtime: foreignRuntime, execution }) }, s.worker))
+      .toMatchObject({ kind: 'reject', reason: 'runtime_producer_unproven' });
+    expect(s.store.runtime(s.ref, foreignRuntime.runtimeId)?.phase).not.toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)).toEqual(before);
+  });
+
   it('records predecessor loss as history in the reserve-only window and still handles the later current crash', async () => {
     const s = fixture(); const execution = s.controller.admitInput('old-turn'); s.store.bindQueuedExecution(s.ref, execution, s.runtime);
     s.controller.ingest({ type: 'ready', sessionContract: s.context(1, {}) }, s.worker);
