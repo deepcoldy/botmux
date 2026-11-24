@@ -275,6 +275,7 @@ import {
   normalizeQuotaFallbackBotConfig,
   type QuotaFallbackBotConfig,
 } from '../services/quota-fallback.js';
+import { normalizeQuotaFallbackChainConfig } from '../services/quota-fallback-chain.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode, repoPickerScanOptions } from '../global-config.js';
@@ -5007,6 +5008,7 @@ async function handleProviderAuthRequest(
     adoptBytedcliForTurn: person => adoptLocalBytedcliAuthorization({
       sessionDataDir: config.session.dataDir, sessionId, turnId: publishedTurnId,
       botConfig: cfg, senderOpenId: person,
+      currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
     }),
     deliver: authLinkDeliverer(ds, cfg, openId, provider as AuthProvider, published),
   });
@@ -11474,6 +11476,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     ...normalizeReplyFooter(cardPrefs),
     showReplyTiming: cardPrefs.showReplyTiming,
     usageDisplay: cardPrefs.usageDisplay,
+    showUsageQuota: cardPrefs.showUsageQuota,
     // Whether this bot's CLI can produce native usage at all. When false the
     // dashboard hides the usage-display control (offering it would be a knob
     // that is always empty — the CLI has no resolvable transcript).
@@ -11519,6 +11522,10 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
     quotaFallbackBot: (() => {
       try { return getBot(cachedLarkAppId).config.quotaFallbackBot ?? null; }
+      catch { return null; }
+    })(),
+    quotaFallbackChain: (() => {
+      try { return getBot(cachedLarkAppId).config.quotaFallbackChain ?? null; }
       catch { return null; }
     })(),
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
@@ -11650,6 +11657,42 @@ ipcRoute('PUT', '/api/bot-quota-fallback', requireBoundBot(async (req, res) => {
   }
 }, NOT_BOUND_BODY.okFalse));
 
+// Per-bot same-bot CLI/model chain. Validated against the bot's own CLI, which
+// is step 0 of the chain.
+ipcRoute('PUT', '/api/bot-quota-fallback-chain', requireBoundBot(async (req, res) => {
+  let body: Record<string, unknown>;
+  try {
+    const raw = await readJsonBody(req);
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_quota_fallback_chain' });
+    }
+    body = raw as Record<string, unknown>;
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const bot = getBot(cachedLarkAppId).config;
+  const normalized = body.enabled === true
+    ? normalizeQuotaFallbackChainConfig(body, {
+      cliId: bot.cliId, model: bot.model, backendType: bot.backendType, codexRpcInput: bot.codexRpcInput,
+    })
+    : {};
+  if (body.enabled === true && !normalized.config) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_quota_fallback_chain', reason: normalized.error });
+  }
+  const config = normalized.config ?? null;
+  try {
+    const result = await rmwBotEntry(cachedLarkAppId, entry => {
+      if (config) entry.quotaFallbackChain = config;
+      else delete entry.quotaFallbackChain;
+    });
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+    bot.quotaFallbackChain = config ?? undefined;
+    jsonRes(res, 200, { ok: true, quotaFallbackChain: config });
+  } catch (error: any) {
+    jsonRes(res, 500, { ok: false, error: 'quota_fallback_chain_save_failed', reason: ipcErrorText(error) });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
 // Per-bot card-behaviour toggles. Body may carry any subset of booleans; only
 // present keys are applied.
 ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
@@ -11665,6 +11708,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardShowTools?: unknown;
     replyCardNativeCot?: unknown;
     usageDisplay?: unknown;
+    showUsageQuota?: unknown;
     replyCardMode?: unknown;
     disableStreamingCard?: unknown; streamingCardFoldedLayout?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; followUpReply?: unknown; privateCard?: unknown; replyCardActions?: unknown; replyCardNextStep?: unknown; replyCardRecap?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
@@ -11687,6 +11731,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardShowTools?: boolean;
     replyCardNativeCot?: boolean;
     usageDisplay?: UsageDisplayMode;
+    showUsageQuota?: boolean;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
     disableStreamingCard?: boolean; streamingCardFoldedLayout?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; followUpReply?: boolean; privateCard?: boolean; replyCardActions?: boolean; replyCardNextStep?: boolean; replyCardRecap?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
@@ -11709,6 +11754,12 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     }
   }
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
+  if (body.showUsageQuota !== undefined) {
+    if (typeof body.showUsageQuota !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_show_usage_quota' });
+    }
+    patch.showUsageQuota = body.showUsageQuota;
+  }
   if (body.replyCardMode !== undefined) {
     if (body.replyCardMode !== 'legacy' && body.replyCardMode !== 'unified') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_reply_card_mode' });

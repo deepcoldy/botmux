@@ -100,8 +100,16 @@ const openConversation = () => {
 // agy keeps redrawing its working line (spinner and elapsed time) while a turn runs.
 let spinner;
 let spin = 0;
-const ready = () => { clearInterval(spinner); spinner = undefined; process.stdout.write('\\x1b[2J\\x1b[H? for shortcuts\\r\\n'); };
+const ready = () => {
+  clearInterval(spinner); spinner = undefined;
+  if (cfg.plainBusy) process.stdout.write('\\x1b[2J\\x1b[H────────\\r\\n>\\r\\n────────\\r\\n? for shortcuts\\r\\n');
+  else process.stdout.write('\\x1b[2J\\x1b[H? for shortcuts\\r\\n');
+};
 const busy = () => {
+  if (cfg.plainBusy) {
+    process.stdout.write('\\x1b[2J\\x1b[H────────\\r\\n>\\r\\n────────\\r\\n? for shortcuts\\r\\n');
+    return;
+  }
   const draw = () => process.stdout.write('\\x1b[2J\\x1b[H  ' + '|/-\\\\'[spin++ % 4] + ' Working… (' + spin + 's)  esc to cancel\\r\\n');
   draw();
   if (!spinner) spinner = setInterval(draw, 250);
@@ -132,6 +140,8 @@ function submit(payload) {
   busy();
   record({ step_index: step++, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE',
     content: '<USER_REQUEST>\\n' + payload + '\\n</USER_REQUEST>' });
+  if (cfg.plainBusy) record({ step_index: step++, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE',
+    tool_calls: [{ name: 'run_command', args: { CommandLine: 'sleep 3600' } }] });
   ev({ kind: 'submit', text: payload });
   const finish = setInterval(() => {
     if (!fs.existsSync(cfg.finishGate)) return;
@@ -145,7 +155,7 @@ function submit(payload) {
 setInterval(() => { void presence; void conversation; }, 1000);
 `;
 
-function liveAntigravitySession() {
+function liveAntigravitySession(opts: { plainBusy?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'bmx-agy-reattach-'));
   const workingDir = join(root, 'work');
   const dataDir = join(root, 'data');
@@ -155,7 +165,7 @@ function liveAntigravitySession() {
   const events = join(root, 'events.jsonl');
   const finishGate = join(root, 'finish-gate');
   const configFile = join(root, 'fake-agy.json');
-  writeFileSync(configFile, JSON.stringify({ home: root, workingDir, conversationId, events, finishGate }));
+  writeFileSync(configFile, JSON.stringify({ home: root, workingDir, conversationId, events, finishGate, plainBusy: opts.plainBusy === true }));
   // An extensionless script follows the nearest package.json; never inherit a
   // stray `"type": "module"` from a parent directory.
   writeFileSync(join(root, 'package.json'), '{"type":"commonjs"}');
@@ -261,7 +271,8 @@ function liveAntigravitySession() {
   const turnReplies = () => replies().filter(text => text.includes(`reply: ${TEXT}`));
   const notice = (['zh', 'en'] as const).map(locale => t('worker.final_output_undelivered', undefined, locale).split('{recovery}')[0]!);
   const undeliveredNotices = () => replies().filter(text => notice.some(head => text.startsWith(head)));
-  const submitted = () => readEvents().some(e => e.kind === 'submit' && String(e.text).includes(TEXT));
+  const submitted = (text = TEXT) => readEvents().some(e => e.kind === 'submit' && String(e.text).includes(text));
+  const submitCount = (text = TEXT) => readEvents().filter(e => e.kind === 'submit' && String(e.text).includes(text)).length;
   const answered = () => readEvents().some(e => e.kind === 'turn' && String(e.reply).includes(TEXT));
   const execution = () => first.controller.store.executions(first.controller.ref).find(value => value.ref.turnId === TURN);
   const agyPids = () => new Set(readEvents().filter(e => e.kind === 'start').map(e => e.pid as number));
@@ -296,7 +307,7 @@ function liveAntigravitySession() {
   };
   const finish = () => writeFileSync(finishGate, 'go');
   return { root, dataDir, conversationId, first, execution, startTurn, restartDaemon, finish, answered,
-    turnReplies, undeliveredNotices, agyPids };
+    turnReplies, undeliveredNotices, agyPids, submitted, submitCount };
 }
 
 describe.skipIf(!runnable)('an Antigravity turn running across a daemon restart', () => {
@@ -347,5 +358,28 @@ describe.skipIf(!runnable)('an Antigravity turn running across a daemon restart'
     await vi.waitFor(() => expect(s.execution()?.phase).toBe('succeeded'), { timeout: 10_000 });
     // Nothing was held back on the bot's machine either.
     expect(existsSync(join(s.dataDir, 'undelivered-replies')) && readdirSync(join(s.dataDir, 'undelivered-replies')).length > 0).toBe(false);
+  }, 240_000);
+
+  it('keeps reattach input held, then releases it through a fresh /restart cold resume', async () => {
+    const s = liveAntigravitySession({ plainBusy: true });
+    await s.startTurn();
+    const { g: next, ds, controller } = await s.restartDaemon();
+    await next.waitFor(() => next.messages.some(m => m.type === 'ready'), 'the worker to reattach a plain busy composer');
+    const followUp = 'queued follow-up released by cold restart';
+    expect(workerPool.sendWorkerInput(ds, followUp, 'om_agy_cold_restart_escape', { trustedCaller: caller })).toBe(true);
+    await sleep(7_500);
+    // The surviving CLI has only a type-ahead composer and an unfinished tool:
+    // strict reattach must not trust that composer as turn-terminal evidence.
+    expect(s.submitted(followUp)).toBe(false);
+    expect(next.messages.some(m => m.type === 'prompt_ready')).toBe(false);
+
+    const { operation } = controller.beginControl('restart');
+    controller.controlStarted(operation.operationId);
+    const attemptId = operation.operationId;
+    next.child.send({ type: 'restart', attemptId } satisfies DaemonToWorker);
+    await next.waitFor(() => s.submitted(followUp), 'the queued follow-up after the fresh cold resume', 30_000);
+    expect(s.submitCount(followUp)).toBe(1);
+    await next.waitFor(() => next.messages.some(m => m.type === 'restart_result'
+      && m.attemptId === attemptId && m.status === 'succeeded'), 'the cold restart receipt', 15_000);
   }, 240_000);
 });

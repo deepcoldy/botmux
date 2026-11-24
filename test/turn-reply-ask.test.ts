@@ -5,8 +5,9 @@ import { tmpdir } from 'node:os';
 import { config } from '../src/config.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
+import { NATIVE_STANDALONE_ASK_ORIGIN } from '../src/core/ask-types.js';
 import { _allAskIds, _resetForTest, getAskSnapshot, registerAsk, setCanTalkChecker, setCardDispatcher,
-  setAskPersistStore, restorePersistedAsks, submitAskFromDesktop } from '../src/core/ask-broker.js';
+  setAskPersistStore, restorePersistedAsks, submitAskFromDesktop, invalidateReplyCardAsks } from '../src/core/ask-broker.js';
 import { createAskPersistStore } from '../src/core/ask-persist-store.js';
 import { createLarkAskCardDispatcher, handleAskCardAction } from '../src/im/lark/ask-card.js';
 import { publishReplyCardAsk, replyCardAskTarget } from '../src/core/turn-reply-ask.js';
@@ -377,6 +378,19 @@ describe('Ask inside the running reply card', () => {
     expect(body).not.toContain('ask_select');
     expect(body).toContain('已失效');
     expect(body).toContain('执行状态待确认');
+  });
+
+  it('keeps a native asynchronous question answerable after the originating reply ends', async () => {
+    const ds = { larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
+      session: { sessionId: 'sid', rootMessageId: 'om_root' } } as DaemonSession;
+    const nativeInput = { ...input, originKind: NATIVE_STANDALONE_ASK_ORIGIN };
+    const target = replyCardAskTarget(ds, nativeInput, { originTurnId: 'om_turn' });
+    expect(target).toBeUndefined();
+    const { snapshot, answer } = await ask({ originKind: NATIVE_STANDALONE_ASK_ORIGIN, replyCardTarget: target });
+    invalidateReplyCardAsks(key, 'native_task_complete');
+    expect(getAskSnapshot(snapshot.askId)?.settled).toBe(false);
+    submitAskFromDesktop({ askId: snapshot.askId, selections: [['yes']] });
+    expect((await answer).kind).toBe('answered');
   });
 
   it('admits only a matching running turn and retains independent presentation for oversized questions', () => {

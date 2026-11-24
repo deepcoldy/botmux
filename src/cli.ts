@@ -328,7 +328,7 @@ import {
   type FleetCommand,
 } from './cli/sandbox-host-hint.js';
 import { formatSessionLookupMissLine } from './cli/session-lookup-diagnostic.js';
-import { describeReportRelayFallback, REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
+import { describeReportRelayFallback, REPORT_SESSION_RELAY_ROUTE, resolveReportRelayFallbackTarget } from './core/report-session-relay.js';
 import {
   WORKFLOW_NODE_REPORT_ROUTE,
   parseWorkflowReportArgs,
@@ -338,7 +338,12 @@ import {
 import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
 import { scheduleIpcErrorMessage } from './core/schedule-ipc-errors.js';
-import { DISPATCH_REPORT_REGISTER_ROUTE, readDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './core/dispatch-report-binding.js';
+import {
+  DISPATCH_REPORT_REGISTER_ROUTE,
+  hasVerifiedDispatchReportBindingForCaller,
+  readDispatchReportBindingSecret,
+  resolveVerifiedDispatchReportTarget,
+} from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus, type CliPermissionOutcome } from './core/ask-types.js';
 import { permissionAnswerAllows, type PermissionOutcomeWatcher } from './core/ask-hook/types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
@@ -7810,7 +7815,9 @@ async function readCardUsageSnapshotForSend(
         const observedModel = snapshot.tokens?.model?.trim();
         const expectedModel = observedModel || configuredRuntime.model || session.model;
         if (snap && isStatuslineModelCompatible(resolvedCliId, snap.model, expectedModel)) {
-          const quota = toCardQuota(snap);
+          const quota = toCardQuota(snap, {
+            includeRateLimits: larkAppId ? resolveShowUsageQuota(larkAppId) : true,
+          });
           if (quota) return { ...configuredRuntime, ...snapshot, quota };
         }
       }
@@ -10942,6 +10949,7 @@ import {
   resolveBrandLabel,
   resolveReplyStyleConfig,
   resolveUsageDisplay,
+  resolveShowUsageQuota,
   resolveReplyFooterPreferences,
 } from './bot-registry.js';
 import type { ReplyCardPresentation, ReplyCardRenderSnapshot } from './services/reply-card-render.js';
@@ -11660,6 +11668,7 @@ async function registerSelfFromCredFile(): Promise<void> {
   // setting); only an isolated sandbox falls back to the worker's snapshot.
   // The cred file outlives the sandboxed session that wrote it.
   const hideLocalAddresses = resolveHideLocalAddresses(appId);
+  const showUsageQuota = resolveShowUsageQuota(appId);
   registerBot({
     larkAppId: appId,
     larkAppSecret: cred.larkAppSecret ?? '',
@@ -11675,6 +11684,7 @@ async function registerSelfFromCredFile(): Promise<void> {
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    showUsageQuota: showUsageQuota ? undefined : false,
     hideLocalAddresses: hideLocalAddresses || undefined,
   } as import('./bot-registry.js').BotConfig);
 }
@@ -11764,6 +11774,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    showUsageQuota: process.env.BOTMUX_SHOW_USAGE_QUOTA === 'false' ? false : undefined,
     hideLocalAddresses: process.env.BOTMUX_HIDE_LOCAL_ADDRESSES === '1' || undefined,
   } as unknown as import('./bot-registry.js').BotConfig;
 
@@ -17170,6 +17181,58 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('reply 仅支持从真人话题新建单个项目 Bot 的委托；已有派单继续使用原投递方式。');
     process.exit(1);
   }
+  const hasVerifiedIntoBinding = (() => {
+    if (!intoRoot || standby) return false;
+    try {
+      const secret = readDispatchReportBindingSecret(resolveDataDir()) ?? '';
+      if (!secret) return false;
+      const parsed: unknown = JSON.parse(readFileSync(join(resolveDataDir(), 'orchestrate-dispatch.json'), 'utf-8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+      if (hasVerifiedDispatchReportBindingForCaller({
+        registry: parsed as Record<string, unknown>,
+        secret,
+        dispatchRoot: intoRoot,
+        callerAppId: appId,
+        callerSessionId: sid,
+        callerChatId: s.chatId,
+        callerScope: s.scope ?? 'thread',
+      })) return true;
+      const resolved = resolveVerifiedDispatchReportTarget({
+        registry: parsed as Record<string, unknown>, secret, dispatchRoot: intoRoot,
+      });
+      // 旧绑定没有 targetScope/targetChatId。只有现有 report relay 的同一套
+      // 窄回退能证明“原会话已关闭/缺失，当前调用方是唯一活跃同群续接者”时，
+      // 才保留协议；活跃原会话、跨群、thread-scope 与多候选都继续 fail-closed。
+      if (!resolved.ok || resolved.binding.targetLarkAppId !== appId) return false;
+      const binding = resolved.binding;
+      const sessions = [...loadSessions().values()].map(session => ({
+        sessionId: session.sessionId,
+        larkAppId: session.larkAppId ?? '',
+        ...(session.chatId ? { chatId: session.chatId } : {}),
+        ...(session.scope ? { scope: session.scope } : {}),
+        ...(session.status ? { status: session.status } : {}),
+      }));
+      const originalSession = sessions.find(session =>
+        session.sessionId === binding.targetSessionId && session.larkAppId === binding.targetLarkAppId);
+      const fallback = resolveReportRelayFallbackTarget({
+        originalTarget: {
+          sessionId: binding.targetSessionId,
+          larkAppId: binding.targetLarkAppId,
+          ...(binding.targetChatId ? { chatId: binding.targetChatId } : {}),
+          ...(binding.targetScope ? { scope: binding.targetScope } : {}),
+        },
+        ...(originalSession ? { originalSession } : {}),
+        sessions,
+      });
+      return fallback.ok && fallback.target.larkAppId === appId && fallback.target.sessionId === sid;
+    } catch {
+      return false;
+    }
+  })();
+  if (intoRoot && !standby && resultDelivery !== 'relay' && !hasVerifiedIntoBinding) {
+    console.error(`--result-delivery ${resultDelivery} 仅适用于当前会话已注册的派单话题；${intoRoot} 没有指向本会话的有效派单绑定。`);
+    process.exit(1);
+  }
 
   let requestedLaunch: { model?: string; reasoningEffort?: CodexReasoningEffort } | undefined;
   let effectiveRuntime: { model: string; reasoningEffort?: CodexReasoningEffort } | undefined;
@@ -17248,11 +17311,35 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     sameTopicSendEnabled,
     resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay' | 'reply',
   });
+  // `--into` 验签先行：命中指向本调用方的已签名绑定时保留精确回报协议；
+  // 未绑定时，仅跨话题 legacy `--bot` 保留兼容协议，同话题或 `--bot-app` 不再追加无效的 `--dispatch-root`。
+  // chat-scope 只信新鲜进程树 marker / protected claim 的精确 turnId；宿主 watcher
+  // 重执行仅在其授权标记与 worker 父子绑定同时成立时使用刚注入的 turnId。
+  // 普通 BOTMUX_TURN_ID 是长驻 CLI 的启动快照，不能证明当前回合；引用回复也不是话题内落点。
+  const trustedHostRelayTurnId = process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1'
+    && isTrustedVcMeetingHostRelayParent(true, s.pid, process.ppid)
+    ? (process.env.BOTMUX_TURN_ID?.trim() || undefined)
+    : undefined;
+  const exactChatTurnId = dispatchOrigin.sessionId === s.sessionId
+    ? (dispatchTurnId ?? trustedHostRelayTurnId)
+    : undefined;
+  const exactChatReplyTarget = (s.scope ?? 'thread') === 'chat' && exactChatTurnId
+    ? pickTurnReplyTarget(s, exactChatTurnId)
+    : undefined;
+  const currentTopicRoot = (s.scope ?? 'thread') === 'chat'
+    ? (exactChatReplyTarget && exactChatReplyTarget.quoteOnly !== true
+      ? exactChatReplyTarget.rootMessageId
+      : undefined)
+    : s.rootMessageId;
+  const isSameTopicInto = !!intoRoot && currentTopicRoot === intoRoot;
+  const appendIntoCompletionProtocol = !!intoRoot && !standby && (
+    hasVerifiedIntoBinding || (!exactReportRootEnabled && resultDelivery === 'relay' && !isSameTopicInto)
+  );
   let built;
   try {
     built = buildDispatchMessages({
       title: title.trim() || '子项目',
-      brief: intoRoot && !standby ? briefWithCompletionProtocol(intoRoot) : brief,
+      brief: appendIntoCompletionProtocol ? briefWithCompletionProtocol(intoRoot!) : brief,
       bots,
     });
   } catch (err: any) {

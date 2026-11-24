@@ -617,6 +617,7 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
 
 ## 附图文说明（待拍板涉及代码或界面改动时）
 - 让 owner 不用翻群就能看懂要定什么：写成 decide 的同时附一份说明页，写清背景、改了什么、改前改后对比、测试结果：\`botmux board attach <编号> explainer.html --note "图文说明"\`。能录屏的再附一段视频（.mp4 / .webm，不超过 50MB；mp4 用 H.264、加 \`-movflags +faststart\`），可以和说明页放在同一条 attach 里。
+- 更新同一份说明时沿用同一个文件名，看板会自动只显示最新版，旧版收进「历史版本」。
 - 说明页是单个 .html 文件（UTF-8，不超过 10MB）：截图内嵌成 data URL，样式写在 \`<style>\` 里。看板上不跑脚本、不加载外链（网址图片、CDN 样式和字体都会被拦掉）；相关链接挂到事项的 \`--link\` 上，不写进说明页。
 - 最小模板（截图转 data URL：\`echo "data:image/png;base64,$(base64 -w0 shot.png)"\`）：
 \`\`\`html
@@ -688,6 +689,7 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
 
 ## Attaching an explainer (decisions that involve code or UI changes)
 - Let the owner understand what to decide without reading the chats: when you make such an item decide, attach an explainer page covering the background, what changed, before / after, and test results: \`botmux board attach <n> explainer.html --note "explainer"\`. If it can be screen-recorded, attach a video too (.mp4 / .webm, at most 50MB; mp4 in H.264 with \`-movflags +faststart\`); it can go in the same attach as the page.
+- When updating the same explainer, reuse its filename; the board shows only the latest version and folds older ones into "History".
 - The page is a single .html file (UTF-8, at most 10MB): screenshots inlined as data URLs, styles in \`<style>\`. The board runs no scripts and loads nothing external (image URLs, CDN styles and fonts are all blocked); put related links on the item with \`--link\`, not in the page.
 - Minimal template (screenshot to data URL: \`echo "data:image/png;base64,$(base64 -w0 shot.png)"\`):
 \`\`\`html

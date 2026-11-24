@@ -248,6 +248,8 @@ The usage line looks like `ctx 23% · 5h 18% · 7d 5% · This turn ↑12k ↓3k 
 
 This only affects display, not usage accounting.
 
+To hide only the `5h` / `7d` rolling account quota segments while keeping context and token usage visible, turn off **Show account quota (5h / 7d)** under **Bot Config → Message cards → Card content**, or run `/botconfig set showUsageQuota off` (`"showUsageQuota": false` in `bots.json`, takes effect immediately).
+
 ### Showing timing
 
 Off by default. Turn it on in the Dashboard under **Bot Config → Message cards → Task Cards → Waiting and execution time**, or send `/botconfig set showReplyTiming on` (`showReplyTiming` in `bots.json`). Once on, the final reply footer shows "waited 3.2s · ran 23.4s", starting with newly received messages.

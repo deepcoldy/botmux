@@ -37,6 +37,7 @@ import {
   traexQuestionSignature,
   traexQuestionState,
   traexQuestionStepAllowed,
+  traexPendingAsyncQuestionCount,
   type TraexQuestionAnswer,
   type TraexQuestionPage,
 } from '../utils/traex-question-page.js';
@@ -52,8 +53,9 @@ export const TRAEX_QUESTION_GONE_MS = 1_500;
 /** How long one input may take to show on screen. */
 export const TRAEX_QUESTION_STEP_TIMEOUT_MS = 2_500;
 const STEP_POLL_MS = 100;
-/** Longest input sequence an answer may need (4 options + Other). */
-const MAX_STEPS = 16;
+/** Minimum input budget; async batches derive a larger bound from their options. */
+const MIN_ANSWER_STEPS = 16;
+const MAX_OPEN_PENDING_ATTEMPTS = 3;
 /** While a question that gets no further card is still on screen, look this
  *  often whether it has left (then it may be carded again). */
 const SETTLED_WATCH_MS = 5_000;
@@ -87,11 +89,15 @@ export interface TraexQuestionBridgeDeps {
   lifetime(): number;
   /** Fresh authoritative screen of the current CLI; undefined when none. */
   capture(): Promise<string | undefined>;
+  /** 只打开收起的异步问题，不提交答案；写入前由宿主重新核对页面与 CLI。 */
+  openPending?(known?: TraexQuestionPage): Promise<boolean>;
+  /** 初次打开需原生信号；已验证的恢复上下文也可用于只打开面板。 */
+  mayOpenPending?(): boolean;
   /** Raise the card and wait for it; aborting `signal` withdraws it. */
-  ask(question: AskQuestion, signal: AbortSignal): Promise<AskResult>;
+  ask(question: AskQuestion, signal: AbortSignal, page?: TraexQuestionPage): Promise<AskResult>;
   /** One key / one bracketed paste into the current CLI; false = not written. */
-  writeKey(key: string): Promise<boolean>;
-  paste(text: string): Promise<boolean>;
+  writeKey(key: string, expected?: TraexQuestionPage): Promise<boolean>;
+  paste(text: string, expected?: TraexQuestionPage): Promise<boolean>;
   notify(key: TraexQuestionNoticeKey, params?: Record<string, string>): void;
   log(message: string): void;
 }
@@ -124,6 +130,7 @@ export class TraexQuestionBridge {
   /** The question flow is on screen but its options cannot be read (e.g. a
    *  narrow pane wraps the labels): since when, and whether it was said. */
   private unreadable: { since: number; notified: boolean } | undefined;
+  private openingPending: { lifetime: number; count: number; attempts: number; nextAttemptAt: number; seenPage: boolean; notified: boolean } | undefined;
 
   constructor(private readonly deps: TraexQuestionBridgeDeps) {}
 
@@ -161,6 +168,7 @@ export class TraexQuestionBridge {
     this.settled.clear();
     this.noPageSince = undefined;
     this.unreadable = undefined;
+    this.openingPending = undefined;
     const card = this.card;
     this.card = undefined;
     if (card) {
@@ -189,6 +197,8 @@ export class TraexQuestionBridge {
       this.kick();
     } else if (this.candidate) {
       this.kick(TRAEX_QUESTION_STABLE_MS);
+    } else if (this.openingPending && !this.openingPending.seenPage && !this.openingPending.notified) {
+      this.kick(Math.max(0, this.openingPending.nextAttemptAt - this.deps.now()));
     } else if ((this.card && !this.card.answering) || (this.unreadable && !this.unreadable.notified)) {
       this.kick(TRAEX_QUESTION_POLL_MS);
     } else if (this.settled.size > 0) {
@@ -213,13 +223,51 @@ export class TraexQuestionBridge {
     const page = parseTraexQuestionPage(screen);
     const now = this.deps.now();
     if (!page) {
+      const pendingCount = traexPendingAsyncQuestionCount(screen);
+      // 操作者回到主输入框不等于取消异步问题；但剩余题数变化证明当前卡
+      // 已不属于这个批次，必须撤掉旧卡并允许新题重新展开。
+      if (pendingCount !== undefined && this.card?.page.delivery === 'async') {
+        const remaining = this.card.page.total - this.card.page.index + 1;
+        if (pendingCount === remaining) {
+          this.card.missingSince = undefined;
+          return;
+        }
+        this.withdraw('the pending question batch changed');
+        this.openingPending = undefined;
+      }
+      if (this.deps.mayOpenPending?.() === false) this.openingPending = undefined;
+      if (pendingCount !== undefined && this.deps.openPending && this.deps.mayOpenPending?.() !== false) {
+        let opening = this.openingPending;
+        if (!opening || opening.lifetime !== lifetime || opening.count !== pendingCount) {
+          opening = { lifetime, count: pendingCount, attempts: 0, nextAttemptAt: now, seenPage: false, notified: false };
+          this.openingPending = opening;
+        }
+        // A page seen before its card became stable is not a delivered card.
+        // If it collapsed again, retry the same bounded opening sequence.
+        if (opening.seenPage && !this.card) {
+          opening.seenPage = false;
+          opening.nextAttemptAt = now;
+        }
+        if (!opening.seenPage && !opening.notified) {
+          if (opening.attempts < MAX_OPEN_PENDING_ATTEMPTS && now >= opening.nextAttemptAt) {
+            opening.attempts++;
+            const opened = await this.deps.openPending();
+            if (this.disposed || this.deps.lifetime() !== lifetime || this.openingPending !== opening) return;
+            opening.nextAttemptAt = this.deps.now() + (opened ? TRAEX_QUESTION_STABLE_MS : TRAEX_QUESTION_POLL_MS * opening.attempts);
+          } else if (opening.attempts >= MAX_OPEN_PENDING_ATTEMPTS && now >= opening.nextAttemptAt) {
+            opening.notified = true;
+            this.deps.notify('worker.traex_question.unreadable');
+          }
+        }
+      }
       this.candidate = undefined;
       if (this.card) {
         this.card.missingSince ??= now;
         if (now - this.card.missingSince >= TRAEX_QUESTION_GONE_MS) this.withdraw('the question left the screen');
       }
       this.observeUnreadable(screen, now);
-      if (!traexQuestionFlowVisible(screen)) {
+      if (pendingCount === undefined && !traexQuestionFlowVisible(screen)) {
+        this.openingPending = undefined;
         this.noPageSince ??= now;
         if (now - this.noPageSince >= TRAEX_QUESTION_GONE_MS) this.settled.clear();
       }
@@ -227,6 +275,7 @@ export class TraexQuestionBridge {
     }
     this.noPageSince = undefined;
     this.unreadable = undefined;
+    if (this.openingPending) this.openingPending.seenPage = true;
     const signature = traexQuestionSignature(page);
     if (this.card) {
       if (this.card.signature === signature) {
@@ -266,7 +315,7 @@ export class TraexQuestionBridge {
     this.deps.log(`TraeX question ${page.index}/${page.total} is on screen — raising its card`);
     let pending: Promise<AskResult>;
     try {
-      pending = this.deps.ask(traexQuestionAskQuestion(page), card.controller.signal);
+      pending = this.deps.ask(traexQuestionAskQuestion(page), card.controller.signal, page);
     } catch (error) {
       pending = Promise.reject(error);
     }
@@ -327,9 +376,20 @@ export class TraexQuestionBridge {
   /** Fresh page for `card`: the same question — or why not. The CLI
    *  lifetime is checked by the caller after this (its last) await. */
   private async freshPage(card: OpenCard): Promise<TraexQuestionPage | { reason: string; kind: NotWrittenKind }> {
-    if (!this.deps.enabled() || this.deps.lifetime() !== card.lifetime) return { reason: 'the CLI was replaced', kind: 'changed' };
-    const screen = await this.deps.capture();
+    if (this.card !== card || !this.deps.enabled() || this.deps.lifetime() !== card.lifetime) return { reason: 'the CLI was replaced', kind: 'changed' };
+    let screen = await this.deps.capture();
+    if (this.card !== card || this.deps.lifetime() !== card.lifetime) return { reason: 'the CLI was replaced', kind: 'changed' };
     if (screen === undefined) return { reason: 'no screen capture', kind: 'failed' };
+    if (card.page.delivery === 'async' && traexPendingAsyncQuestionCount(screen) !== undefined && this.deps.openPending) {
+      await this.deps.openPending(card.page);
+      const deadline = this.deps.now() + TRAEX_QUESTION_STEP_TIMEOUT_MS;
+      do {
+        await new Promise<void>(resolve => { this.deps.setTimer(resolve, STEP_POLL_MS); });
+        if (!this.deps.enabled() || this.deps.lifetime() !== card.lifetime || this.card !== card) return { reason: 'the CLI was replaced', kind: 'changed' };
+        screen = await this.deps.capture();
+      } while (screen !== undefined && traexPendingAsyncQuestionCount(screen) !== undefined && this.deps.now() < deadline);
+      if (screen === undefined) return { reason: 'no screen capture', kind: 'failed' };
+    }
     const page = parseTraexQuestionPage(screen);
     if (!page) return { reason: 'the question is no longer on screen', kind: 'changed' };
     if (traexQuestionSignature(page) !== card.signature) return { reason: 'another question is on screen', kind: 'changed' };
@@ -346,7 +406,10 @@ export class TraexQuestionBridge {
       if (notesOpenedHere) await this.closeOwnNotes(card, answer);
       this.notWritten(card, reason, kind);
     };
-    for (let count = 0; count < MAX_STEPS; count++) {
+    const maxSteps = card.page.delivery === 'async'
+      ? Math.max(MIN_ANSWER_STEPS, card.page.options.length + 2)
+      : MIN_ANSWER_STEPS;
+    for (let count = 0; count < maxSteps; count++) {
       const page = await this.freshPage(card);
       if (!('index' in page)) return stop(page.reason, page.kind);
       const step = nextTraexQuestionStep(page, answer);
@@ -354,14 +417,15 @@ export class TraexQuestionBridge {
       if (!traexQuestionStepAllowed(page, step)) return stop('input not allowed on this page', 'failed');
       // The capture above was the last await: nothing may have replaced the
       // CLI between it and the write.
-      if (!this.deps.enabled() || this.deps.lifetime() !== card.lifetime) return this.notWritten(card, 'the CLI was replaced', 'changed');
+      if (this.card !== card || !this.deps.enabled() || this.deps.lifetime() !== card.lifetime) return this.notWritten(card, 'the CLI was replaced', 'changed');
       const final = step.kind === 'key' && step.final;
-      const written = step.kind === 'paste' ? await this.deps.paste(step.text) : await this.deps.writeKey(step.key);
+      const written = step.kind === 'paste' ? await this.deps.paste(step.text, page) : await this.deps.writeKey(step.key, page);
       if (!written) return stop('the terminal did not take the input', 'failed');
       if (step.kind === 'paste' || (step.kind === 'key' && step.key === 'Tab')) notesOpenedHere = true;
       this.deps.log(`TraeX question ${page.index}/${page.total}: entered ${step.kind === 'paste' ? 'note text' : `key ${step.key}`}`);
       const outcome = await this.settle(card, traexQuestionState(page), final);
       if (outcome === 'advanced') {
+        this.openingPending = undefined;
         this.deps.log(`TraeX question ${page.index}/${page.total}: card answer entered`);
         return;
       }
@@ -384,6 +448,15 @@ export class TraexQuestionBridge {
    *  nothing but this answer's text (or cannot be seen), on this question. A
    *  slow Tab may only now take effect: give it the step timeout to show. */
   private async closeOwnNotes(card: OpenCard, answer: TraexQuestionAnswer): Promise<void> {
+    // 异步 Other 的 Tab 会提交答案，不能用于同步页的失败回滚。
+    if (card.page.delivery === 'async') {
+      const page = await this.freshPage(card);
+      if (!('index' in page) || !page.notesOpen || !page.notesText || answer.kind !== 'custom'
+        || page.notesText.replace(/\s+/g, '') !== answer.text.replace(/\s+/g, '')) return;
+      if (this.card !== card || !this.deps.enabled() || this.deps.lifetime() !== card.lifetime) return;
+      if (await this.deps.writeKey('C-u', page)) this.deps.log('TraeX async question: cleared only the custom text entered by this answer');
+      return;
+    }
     let page = await this.freshPage(card);
     const deadline = this.deps.now() + TRAEX_QUESTION_STEP_TIMEOUT_MS;
     while ('index' in page && !page.notesOpen && this.deps.now() < deadline) {
@@ -401,7 +474,7 @@ export class TraexQuestionBridge {
       || (text !== undefined && page.notesText.replace(/\s+/g, '') === text.replace(/\s+/g, ''));
     if (page.highlighted !== anchor || !ours) return;
     if (!this.deps.enabled() || this.deps.lifetime() !== card.lifetime) return;
-    if (await this.deps.writeKey('Tab')) this.deps.log(`TraeX question ${page.index}/${page.total}: closed the notes field this answer opened`);
+    if (await this.deps.writeKey('Tab', page)) this.deps.log(`TraeX question ${page.index}/${page.total}: closed the notes field this answer opened`);
   }
 
   /** Wait for one input to show: a final input moves TRAE off this question,
@@ -410,7 +483,7 @@ export class TraexQuestionBridge {
     const deadline = this.deps.now() + TRAEX_QUESTION_STEP_TIMEOUT_MS;
     while (this.deps.now() < deadline) {
       await new Promise<void>(resolve => { this.deps.setTimer(resolve, STEP_POLL_MS); });
-      if (this.deps.lifetime() !== card.lifetime) return 'lost';
+      if (this.card !== card || !this.deps.enabled() || this.deps.lifetime() !== card.lifetime) return 'lost';
       const screen = await this.deps.capture();
       if (screen === undefined) continue;
       const page = parseTraexQuestionPage(screen);

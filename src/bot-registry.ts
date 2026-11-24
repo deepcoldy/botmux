@@ -130,6 +130,10 @@ import {
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
 import {
+  normalizeQuotaFallbackChainConfig,
+  type QuotaFallbackChainConfig,
+} from './services/quota-fallback-chain.js';
+import {
   normalizeTraexAutoModelConfig,
   TRAEX_AUTO_MODEL_ID,
   type TraexAutoModelConfig,
@@ -1982,6 +1986,12 @@ export interface BotConfig {
    */
   quotaFallbackBot?: QuotaFallbackBotConfig;
   /**
+   * Optional same-bot CLI/model chain used before `quotaFallbackBot`: on a
+   * usage or rate limit the session restarts in place on the next step.
+   * Missing/invalid/disabled means sessions stay on the bot's own CLI.
+   */
+  quotaFallbackChain?: QuotaFallbackChainConfig;
+  /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
    * heads-up that botmux session cold-starts may time out and false-die. Host
@@ -2321,6 +2331,15 @@ export interface BotConfig {
    * `usageDisplay` set is read as `'off'` (see {@link resolveUsageDisplay}).
    */
   usageDisplay?: UsageDisplayMode;
+  /**
+   * Whether to show 5h / 7d rolling account quota percentages in the card usage
+   * line (streaming card body & reply-card footer). Default ON (absent = true);
+   * only an explicit `false` hides the 5h / 7d segments while keeping context
+   * usage (`ctx`), token counts, cache hit rate, custom extensions and model
+   * identity visible. Display only — statusline persistence and quota fallback
+   * are unaffected.
+   */
+  showUsageQuota?: boolean;
   replyFooterEnabled?: boolean;
   replyFooterBrand?: boolean;
   replyFooterModel?: boolean;
@@ -2776,6 +2795,7 @@ export function __testOnly_resetBotRegistry(): void {
   brandLabelCache = null;
   cachedLarkUploadHttpPool = undefined;
   usageDisplayCache = null;
+  showUsageQuotaCache = null;
   replyStyleCache = null;
 }
 
@@ -3313,7 +3333,13 @@ export function findOncallChatForAnyBot(chatId: string): OncallChat | undefined 
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
 let usageDisplayCache: { mtimeMs: number; map: Map<string, UsageDisplayMode> } | null = null;
+let showUsageQuotaCache: { mtimeMs: number; map: Map<string, boolean> } | null = null;
 let replyStyleCache: { mtimeMs: number; map: Map<string, ReplyStyleConfig | undefined> } | null = null;
+
+/** Default ON: only an explicit `false` hides the 5h / 7d quota segments. */
+export function normalizeShowUsageQuota(entry?: { showUsageQuota?: unknown }): boolean {
+  return entry?.showUsageQuota !== false;
+}
 
 /** Normalize a raw bots.json entry's usage-display intent to the enum, applying
  *  backward compat: an explicit `usageDisplay` wins; otherwise a legacy
@@ -3474,6 +3500,42 @@ export function resolveUsageDisplay(larkAppId: string): UsageDisplayMode {
   } catch {
     return DEFAULT_USAGE_DISPLAY;
   }
+}
+
+/**
+ * Whether to show 5h / 7d rolling account quota percentages in card usage
+ * lines (default ON). Live registry first, disk bots.json second (so host
+ * `botmux send` sees hot `/botconfig` updates), own-bot spawn env fallback for
+ * sandboxed / remote sessions where bots.json is unreadable.
+ */
+export function resolveShowUsageQuota(larkAppId: string): boolean {
+  const inMem = bots.get(larkAppId);
+  if (inMem) return normalizeShowUsageQuota(inMem.config);
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (path) {
+    try {
+      const stat = statSync(path);
+      if (!showUsageQuotaCache || showUsageQuotaCache.mtimeMs !== stat.mtimeMs) {
+        const raw = JSON.parse(readFileSync(path, 'utf-8'));
+        const map = new Map<string, boolean>();
+        if (Array.isArray(raw)) {
+          for (const entry of raw) {
+            if (entry && typeof entry.larkAppId === 'string') {
+              map.set(entry.larkAppId, normalizeShowUsageQuota(entry));
+            }
+          }
+        }
+        showUsageQuotaCache = { mtimeMs: stat.mtimeMs, map };
+      }
+      const configured = showUsageQuotaCache.map.get(larkAppId);
+      if (configured !== undefined) return configured;
+    } catch { /* isolated send: disk is intentionally unreadable */ }
+  }
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && process.env.BOTMUX_SHOW_USAGE_QUOTA === 'false') {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -4373,6 +4435,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ? (traexAutoModel ? TRAEX_AUTO_MODEL_ID : undefined)
       : requestedModel;
 
+    const normalizedQuotaFallbackChain = normalizeQuotaFallbackChainConfig(entry.quotaFallbackChain, {
+      cliId: entryCliId,
+      model,
+      backendType: typeof entry.backendType === 'string' ? entry.backendType : undefined,
+      codexRpcInput: entry.codexRpcInput === true,
+    });
+    if (normalizedQuotaFallbackChain.error) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] quotaFallbackChain ignored: ${normalizedQuotaFallbackChain.error}`,
+      );
+    }
+
     // Shared effort applies only where a model has no independent entry.
     const sharedEffortModels = traexAutoModel
       ? traexAutoModel.models.filter(id => !Object.prototype.hasOwnProperty.call(traexAutoModel.modelSettings ?? {}, id))
@@ -4610,6 +4684,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       longTaskReminder: normalizeLongTaskReminderConfig(entry.longTaskReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,
+      quotaFallbackChain: normalizedQuotaFallbackChain.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
@@ -4704,6 +4779,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
         ? undefined
         : normalizeUsageDisplay(entry),
+      // Default ON: only an explicit false hides 5h / 7d quota segments.
+      showUsageQuota: entry.showUsageQuota === false ? false : undefined,
       ...normalizeReplyFooter(entry),
       showReplyTiming: entry.showReplyTiming === true || undefined,
       // Retired final-only preference must not opt into an extra terminal card.
