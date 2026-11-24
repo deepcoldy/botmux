@@ -5143,6 +5143,25 @@ function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
     && !!limit.relativeResetKey && limit.retryAtMs <= Date.now();
 }
 
+/** Drop a consumed native episode at the ingress boundary, before usageLimit,
+ * lastFailedTurn, Dashboard or the recovery card can observe it. If the same
+ * episode is still sticky in memory, clear it first and let the ordinary idle
+ * path publish the resulting state instead of maintaining a second UI path. */
+function filterConsumedAntigravityQuotaFrame(frame: {
+  status: ScreenStatus;
+  usageLimit?: CliUsageLimitState;
+  expiredAntigravityQuota?: CliUsageLimitState;
+}, ds: DaemonSession): void {
+  const limit = frame.usageLimit;
+  const key = limit?.nativeEpisodeKey;
+  if (!key || (limit?.source !== 'antigravity-error-composer' && limit?.source !== 'antigravity-native-log')
+    || !ds.session.consumedAntigravityQuotaKeys?.includes(key)) return;
+  if (ds.usageLimit?.nativeEpisodeKey === key) clearUsageLimitState(ds);
+  frame.status = ds.usageLimit ? 'limited' : frame.status === 'limited' ? 'idle' : frame.status;
+  frame.usageLimit = undefined;
+  frame.expiredAntigravityQuota = undefined;
+}
+
 const usageLimitPersistRetries = new WeakMap<DaemonSession, {
   timer: ReturnType<typeof setTimeout>;
   owns: () => boolean;
@@ -21572,21 +21591,6 @@ function setupWorkerHandlers(
     // `quotaFallbackBot` handoff; when disabled or exhausted, fall through
     // so existing notifications and backup-bot handoff run as before.
     const effectiveCliId = sessionCliId(ds, botCfg);
-    if (effectiveCliId === 'antigravity'
-      && (limit.source === 'antigravity-error-composer' || limit.source === 'antigravity-native-log')
-      && limit.nativeEpisodeKey
-      && ds.session.consumedAntigravityQuotaKeys?.includes(limit.nativeEpisodeKey)) {
-      // A resumed viewport can still contain the refusal consumed by the last
-      // successful rotation. It is not a fresh provider episode; clear the
-      // stale card without restarting or charging another account.
-      try {
-        clearUsageLimitState(ds);
-        if (ds.lastScreenStatus === 'limited') ds.lastScreenStatus = 'idle';
-      } catch (err: any) {
-        logger.warn(`[${t}] Failed to clear consumed Antigravity quota episode: ${err?.message ?? err}`);
-      }
-      return;
-    }
     // Only replay when the limited frame carries a proven `provenTurn`
     // matching the exact recorded turn. Without `provenTurn` (e.g. a
     // direct Web Terminal prompt), rotate + restart cleanly and ask the
@@ -24309,6 +24313,7 @@ function setupWorkerHandlers(
         // Any real screen frame supersedes the post-terminal fallback: the card
         // is once again driven by live worker evidence.
         if (!ownsLifecycleMutation()) break;
+        filterConsumedAntigravityQuotaFrame(msg, ds);
         // Project the frame's effective status once: reused for the in-memory
         // status assignment below and the stale-post-terminal gate.
         const previousLimit = ds.usageLimit;
@@ -24764,6 +24769,7 @@ function setupWorkerHandlers(
         // Drop uploads that arrived during a new-turn handoff — the image_key may
         // reflect previous turn's content. Next 10s cycle picks up fresh content.
         if (ds.streamCardPending) break;
+        if (ownsLifecycleMutation()) filterConsumedAntigravityQuotaFrame(msg, ds);
         // Source + target fence. The worker binds capture revision/tuple at
         // capture start and drops frames that outlive them; here the frame must
         // also match this generation's observed capture identity exactly, its
@@ -24828,6 +24834,26 @@ function setupWorkerHandlers(
           closePostTerminalLiveWorkEpisode(ds);
         }
         if (!stalePostTerminalShot) bumpStreamCardStatusRevision(ds);
+        // Screenshot mode can deliver the first native limit before any
+        // screen_update. Reuse the same status bridge for BOTH entering and
+        // leaving limited so lastFailedTurn is recorded before rotation and a
+        // consumed sticky episode is cleared after recovery.
+        if (!stalePostTerminalShot && ownsLifecycleMutation()
+          && prevStatus !== ds.lastScreenStatus
+          && (prevStatus === 'limited' || ds.lastScreenStatus === 'limited')) {
+          try {
+            const published = cb.onScreenStatus?.(ds, {
+              prevStatus,
+              status: ds.lastScreenStatus,
+              turnId: provenScreenTurnId(frameVerdict.source.turnId, frameVerdict.source.dispatchAttempt),
+            });
+            void Promise.resolve(published).catch((err: any) => {
+              logger.debug(`[${t}] screenshot status bridge failed: ${err?.message ?? err}`);
+            });
+          } catch (err: any) {
+            logger.debug(`[${t}] screenshot status bridge threw: ${err?.message ?? err}`);
+          }
+        }
         // Same deferred-suspend checkpoint as the screen_update branch, and
         // deferred for the same reason (see runPendingSuspendIfSettled).
         // The predicate is defense-in-depth here: the handler's fence already
@@ -24841,6 +24867,18 @@ function setupWorkerHandlers(
           imageKey: msg.imageKey,
           content: ds.lastScreenContent ?? '',
         });
+        // Screenshot-only sessions need the same coarse status edge as text
+        // frames. In particular, a consumed limited episode must publish idle
+        // after its sticky state clears instead of leaving Dashboard stale.
+        if (prevStatus !== ds.lastScreenStatus) {
+          dashboardEventBus.publish({
+            type: 'session.update',
+            body: {
+              sessionId: ds.session.sessionId,
+              patch: { status: ds.lastScreenStatus, lastMessageAt: ds.lastMessageAt },
+            },
+          });
+        }
         // Ordinary screenshots never ARM the usage refresh — screen_update owns
         // that authorization. Here we only tear it down on leaving `working` or
         // on a managed/silent turn. After those gates, a frame that actually

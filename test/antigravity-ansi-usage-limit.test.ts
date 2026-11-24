@@ -1,18 +1,23 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { reconcileUsageLimitState, detectCliUsageLimit, cliUsageLimitEpisodeKey, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
+import { AntigravityNativeQuotaLog, currentAntigravityNativeQuota } from '../src/services/antigravity-native-quota.js';
 
-function classifier(raw: () => string, cliId = 'antigravity', authoritative = true, outputActive = false, nativeText?: string) {
+function classifier(raw: () => string, cliId = 'antigravity', authoritative = true, outputActive = false, nativeText?: string,
+  readNative?: () => { key: string; text: string } | undefined) {
   const capture = vi.fn(raw);
   const usageLimitTracker = createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => outputActive });
   const classify = loadWorkerFunction<(content: string, status: string) => any>('classifyUsageLimitWithNativeEvidence', {
     cliAdapter: { id: cliId }, backend: {}, captureBackendScreen: capture,
     backendScreenEvidenceIsAuthoritativeForMutation: () => authoritative,
     stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, annotateAntigravityUsageLimit,
-    readAntigravityNativeQuota: () => nativeText ? { key: 'native-test', text: nativeText } : undefined,
+    readAntigravityNativeQuota: readNative ?? (() => nativeText ? { key: 'native-test', text: nativeText } : undefined),
     withAntigravityDirectFailureProof: (limit: CliUsageLimitState) => limit, detectCliUsageLimit, cliUsageLimitEpisodeKey,
     usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
     unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
@@ -53,6 +58,30 @@ describe('raw ANSI tmux quota classification', () => {
       kind: 'usage', retryLabel: '2h39m35s', source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-test',
     });
     expect(result.usageLimit.retryAtMs).toBe(Date.now() + ((2 * 60 + 39) * 60 + 35) * 1000);
+  });
+
+  it('reports a large-turn quota on the first idle sample instead of emitting a false recovery edge', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-agy-large-quota-'));
+    try {
+      const path = join(root, 'session.log');
+      const log = new AntigravityNativeQuotaLog(path);
+      const noise = (bytes: number) => Array.from({ length: Math.ceil(bytes / 1024) }, () =>
+        `I1123 13:39:08.000000 300 runner.go:1] ${'x'.repeat(1000)}`).join('\n') + '\n';
+      writeFileSync(path, noise(9 * 1024));
+      expect(log.read().quota).toBeUndefined();
+      appendFileSync(path,
+        'I1123 13:39:07.000000 100 input_loop.go:104] HandleUserInput called with text: "large task"\n'
+        + noise(350 * 1024)
+        + 'E1123 13:39:10.000000 200 errorreport.go:282] agent executor error: generating and executing: transport error (ResourceExhausted, HTTP 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.\n');
+      const { classify } = classifier(() => currentQuotaScreen, 'antigravity', true, false, undefined,
+        () => currentAntigravityNativeQuota(log.read(), 'large task'));
+      expect(classify('', 'idle')).toMatchObject({
+        status: 'limited',
+        usageLimit: { source: 'antigravity-native-log', retryLabel: '2h39m35s' },
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('does not treat the same footer as recovery while fresh output still suppresses the working-frame verdict', () => {

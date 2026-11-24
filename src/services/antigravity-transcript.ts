@@ -309,21 +309,25 @@ export function antigravityTurnFailedWithoutOutput(
     const lines = buf.subarray(0, count).toString('utf8').split('\n');
     if (offset > 0) lines.shift();
     const pendingTail = lines.pop() ?? '';
+    const normalizedWrittenInput = writtenInput.replace(/\r\n?/g, '\n');
     let matched = false;
+    let hasOutputAfter = false;
     for (const line of lines) {
       if (!line.trim()) continue;
       let rec: any;
-      try { rec = JSON.parse(line); } catch { if (matched) return false; else continue; }
+      try { rec = JSON.parse(line); } catch { if (matched) hasOutputAfter = true; continue; }
       if (rec?.type === 'USER_INPUT') {
-        if (matched) return false;
-        if (rec.source === 'USER_EXPLICIT' && typeof rec.content === 'string'
-          && unwrapAntigravityUserInput(rec.content) === writtenInput) matched = true;
+        // Multi-hop replay and repeated user prompts can append the exact same
+        // text more than once. Only the LAST native input owns the current turn.
+        matched = rec.source === 'USER_EXPLICIT' && typeof rec.content === 'string'
+          && unwrapAntigravityUserInput(rec.content).replace(/\r\n?/g, '\n') === normalizedWrittenInput;
+        hasOutputAfter = false;
         continue;
       }
       if (!matched || rec?.type === 'CHECKPOINT' || rec?.type === 'TASK_NOTIFICATION') continue;
-      return false;
+      hasOutputAfter = true;
     }
-    return matched && !pendingTail.trim();
+    return matched && !hasOutputAfter && !pendingTail.trim();
   } catch {
     return false;
   } finally {

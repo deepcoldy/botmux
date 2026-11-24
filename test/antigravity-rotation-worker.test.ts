@@ -18,7 +18,9 @@ afterEach(() => {
 });
 
 let scenarioSeq = 0;
-async function setupRotationScenario(input: { directFailure: boolean; accountCount?: number; limitedDirectFailure?: boolean }) {
+async function setupRotationScenario(input: {
+  directFailure: boolean; accountCount?: number; limitedDirectFailure?: boolean; recordStatus?: boolean;
+}) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-agy-worker-rotation-'));
   const previousHome = process.env.HOME;
   const previousDataDir = process.env.SESSION_DATA_DIR;
@@ -41,12 +43,20 @@ async function setupRotationScenario(input: { directFailure: boolean; accountCou
     disableStreamingCard: true,
   } as never);
   sessionStore.init(app);
+  const failedTurnRecovery = input.recordStatus
+    ? await import('../src/core/failed-turn-recovery.js') : undefined;
   const replies: unknown[][] = [];
   initWorkerPool({
     sessionReply: async (...args: unknown[]) => { replies.push(args); return 'om_reply'; },
     getSessionWorkingDir: () => root,
     getActiveCount: () => 1,
     closeSession: () => {},
+    ...(failedTurnRecovery ? {
+      onScreenStatus: (ds: any, context: any) => {
+        if (context.status === 'limited') failedTurnRecovery.recordLimitedFailedTurn(ds, context.turnId);
+        else if (context.prevStatus === 'limited') failedTurnRecovery.clearLimitedFailedTurn(ds, context.turnId);
+      },
+    } : {}),
   } as never);
   const session = sessionStore.createSession('oc_probe', 'om_root', 'rotation probe', 'group', 'chat');
   session.ownerOpenId = 'ou_owner';
@@ -124,7 +134,13 @@ async function setupRotationScenario(input: { directFailure: boolean; accountCou
     else process.env.SESSION_DATA_DIR = previousDataDir;
     rmSync(root, { recursive: true, force: true });
   });
-  return { ds, worker, sent, replies, flush, nowMs };
+  return { ds, worker, sent, replies, flush, nowMs, sessionStore };
+}
+
+function nativeUsageLimit(screen: string, key: string, nowMs: number): CliUsageLimitState {
+  const detected = detectCliUsageLimit(screen, new Date(nowMs));
+  if (!detected.limited) throw new Error('incident quota text was not detected');
+  return annotateAntigravityUsageLimit(screen, detected, { text: screen, key });
 }
 
 async function emitQuotaAndStart(
@@ -145,9 +161,7 @@ async function emitQuotaAndStart(
   };
   let content = 'quota exceeded';
   if (nativeScreen) {
-    const detected = detectCliUsageLimit(nativeScreen, new Date(h.nowMs));
-    if (!detected.limited) throw new Error('incident quota text was not detected');
-    usageLimit = annotateAntigravityUsageLimit(nativeScreen, detected, { text: nativeScreen, key: nativeEpisodeKey });
+    usageLimit = nativeUsageLimit(nativeScreen, nativeEpisodeKey, h.nowMs);
     content = nativeScreen;
   }
   h.worker.emit('message', {
@@ -260,6 +274,108 @@ describe('Antigravity worker-pool replay safety', () => {
     expect(h.sent.filter(msg => msg.type === 'restart')).toHaveLength(1);
     expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(1);
     expect(h.ds.usageLimit).toBeUndefined();
+  });
+
+  it.each([
+    { suppressRecoveryCard: true, frameType: 'screen_update' as const },
+    { suppressRecoveryCard: false, frameType: 'screen_update' as const },
+    { suppressRecoveryCard: true, frameType: 'screenshot_uploaded' as const },
+    { suppressRecoveryCard: false, frameType: 'screenshot_uploaded' as const },
+  ])('filters a consumed episode before persistent state (restore=$suppressRecoveryCard, frame=$frameType)', async ({
+    suppressRecoveryCard, frameType,
+  }) => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    delete h.ds.session.lastFailedTurn;
+    h.ds.session.consumedAntigravityQuotaKeys = ['log:native-episode-1'];
+    h.ds.suppressRecoveryCard = suppressRecoveryCard;
+    h.ds.lastScreenStatus = 'idle';
+    h.ds.activeInteractiveTurn = { turnId: 'turn-1', caller: {
+      senderType: 'user', requestLarkAppId: h.ds.larkAppId, requestUserOpenId: 'ou_owner',
+    } };
+    h.sessionStore.updateSession(h.ds.session);
+    const { dashboardEventBus } = await import('../src/core/dashboard-events.js');
+    const dashboardStatuses: unknown[] = [];
+    const off = dashboardEventBus.subscribe((event: any) => {
+      if (event.type === 'session.update' && event.body.sessionId === h.ds.session.sessionId) {
+        dashboardStatuses.push(event.body.patch.status);
+      }
+    });
+    cleanups.push(off);
+    const usageLimit = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-1', h.nowMs);
+    h.worker.emit('message', frameType === 'screen_update'
+      ? { type: frameType, content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1', usageLimit }
+      : { type: frameType, imageKey: 'img-consumed', status: 'limited', turnId: 'turn-1', usageLimit });
+    await h.flush();
+
+    const stored = h.sessionStore.getSessionFresh(h.ds.session.sessionId);
+    expect(h.sent.filter(msg => msg.type === 'restart')).toHaveLength(0);
+    expect(h.ds.usageLimit).toBeUndefined();
+    expect(h.ds.lastScreenStatus).not.toBe('limited');
+    expect(stored?.usageLimit).toBeUndefined();
+    expect(stored?.lastFailedTurn).toBeUndefined();
+    expect(dashboardStatuses).not.toContain('limited');
+  });
+
+  it('publishes screenshot recovery after clearing a sticky consumed episode', async () => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    const usageLimit = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-1', h.nowMs);
+    h.ds.usageLimit = usageLimit;
+    h.ds.lastScreenStatus = 'limited';
+    h.ds.suppressRecoveryCard = true;
+    h.ds.session.usageLimit = usageLimit;
+    h.ds.session.consumedAntigravityQuotaKeys = ['log:native-episode-1'];
+    h.ds.session.lastFailedTurn = {
+      turnId: 'turn-1', cliInput: 'do work', userPrompt: 'do work',
+      failedAt: new Date().toISOString(), status: 'failed', retryCount: 0,
+      limitedSnapshot: true,
+    };
+    h.sessionStore.updateSession(h.ds.session);
+    const { dashboardEventBus } = await import('../src/core/dashboard-events.js');
+    const statuses: unknown[] = [];
+    const off = dashboardEventBus.subscribe((event: any) => {
+      if (event.type === 'session.update' && event.body.sessionId === h.ds.session.sessionId) {
+        statuses.push(event.body.patch.status);
+      }
+    });
+    cleanups.push(off);
+
+    h.worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-consumed-recovery', status: 'limited', turnId: 'turn-1', usageLimit,
+    });
+    await h.flush();
+
+    const stored = h.sessionStore.getSessionFresh(h.ds.session.sessionId);
+    expect(h.ds.lastScreenStatus).toBe('idle');
+    expect(stored?.usageLimit).toBeUndefined();
+    expect(stored?.lastFailedTurn).toBeUndefined();
+    expect(statuses).toContain('idle');
+  });
+
+  it('records a limited failed turn when the first native evidence is a screenshot', async () => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    delete h.ds.session.lastFailedTurn;
+    h.ds.activeInteractiveTurn = { turnId: 'turn-1', caller: {
+      senderType: 'user', requestLarkAppId: h.ds.larkAppId, requestUserOpenId: 'ou_owner',
+    } };
+    h.sessionStore.updateSession(h.ds.session);
+    const usageLimit = {
+      ...nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-1', h.nowMs),
+      directFailure: true as const,
+    };
+    h.worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-first-limit', status: 'limited', turnId: 'turn-1', usageLimit,
+    });
+    await h.flush();
+
+    expect(h.ds.session.lastFailedTurn).toMatchObject({
+      turnId: 'turn-1', limitedSnapshot: true, directFailure: true,
+    });
+    const restart = h.sent.find(msg => msg.type === 'restart');
+    expect(restart?.attemptId).toBeDefined();
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    expect(h.sent.find(msg => msg.type === 'message')).toMatchObject({ content: 'do work' });
   });
 
   it('reports pool exhaustion and the observed reset duration instead of leaving a working card', async () => {

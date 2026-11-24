@@ -150,6 +150,29 @@ describe('antigravityTurnFailedWithoutOutput', () => {
     expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(true);
   });
 
+  it('accepts a repeated prompt after multi-hop replay when the last input has no output', () => {
+    writeFileSync(path, line(userRecord(USER_REQUEST)) + line(userRecord(USER_REQUEST)));
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(true);
+  });
+
+  it('accepts a repeated prompt after an older completed turn', () => {
+    writeFileSync(path, line(userRecord('继续')) + line(plannerStep({ content: '好的' })) + line(userRecord('继续')));
+    expect(antigravityTurnFailedWithoutOutput(path, '继续')).toBe(true);
+  });
+
+  it.each([
+    ['a tool call', line(plannerStep({ toolCalls: [toolCall('create_the_file')] }))],
+    ['assistant text', line(plannerStep({ content: 'partial answer' }))],
+  ])('rejects a repeated last prompt followed by %s', (_name, suffix) => {
+    writeFileSync(path, line(userRecord(USER_REQUEST)) + line(userRecord(USER_REQUEST)) + suffix);
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(false);
+  });
+
+  it('normalizes CRLF in the submitted input before matching', () => {
+    writeFileSync(path, line(userRecord('first line\nsecond line')));
+    expect(antigravityTurnFailedWithoutOutput(path, 'first line\r\nsecond line')).toBe(true);
+  });
+
   it.each([
     ['assistant text', line(plannerStep({ content: 'partial answer' }))],
     ['a tool call', line(plannerStep({ toolCalls: [toolCall('create_the_file')] }))],
