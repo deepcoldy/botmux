@@ -9,7 +9,7 @@
  */
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -19,6 +19,7 @@ import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 import { writeFakeDoubaoTui } from './helpers/fake-doubao-tui.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { WorkerOutputJournal } from '../src/services/worker-output-journal.js';
 
 let child: ChildProcess | undefined;
 let root: string | undefined;
@@ -51,7 +52,7 @@ afterEach(async () => {
 
 const pause = (ms: number) => new Promise(done => setTimeout(done, ms));
 
-function startScenario(opts: { submitDelayMs?: number } = {}) {
+function startScenario(opts: { submitDelayMs?: number; fresh?: boolean; exportOnly?: boolean; backend?: 'tmux' | 'pty'; handoff?: boolean } = {}) {
   root = mkdtempSync(join(tmpdir(), 'doubao-late-start-'));
   const dataDir = join(root, 'data');
   mkdirSync(dataDir);
@@ -61,11 +62,14 @@ function startScenario(opts: { submitDelayMs?: number } = {}) {
     '.sessions', nativeId, 'agents', 'main', 'system');
   mkdirSync(systemDir, { recursive: true });
   const assignment = join(systemDir, 'assignment.md');
-  writeFileSync(assignment, '## [2026-01-01T00:00:00Z] 需求\nOld prompt\n\n');
-  writeFileSync(join(systemDir, 'trajectory.jsonl'), JSON.stringify({ role: 'assistant', content: 'Old answer' }) + '\n');
+  writeFileSync(assignment, opts.fresh ? '' : '## [2026-01-01T00:00:00Z] 需求\nOld prompt\n\n');
+  const trajectory = join(systemDir, 'trajectory.jsonl');
+  writeFileSync(trajectory, opts.fresh ? '' : JSON.stringify({ role: 'assistant', content: 'Old answer' }) + '\n');
   const ctlDir = join(root, 'ctl');
   const inputLog = join(root, 'input.jsonl');
   const fakeCli = writeFakeDoubaoTui(root, { systemDir, ctlDir, inputLog });
+  writeFileSync(join(ctlDir, 'export.json'), JSON.stringify(opts.fresh ? [] : [{ query: 'Old prompt', response: 'Old answer' }]));
+  if (opts.exportOnly) writeFileSync(join(ctlDir, 'export-only'), '');
   if (opts.submitDelayMs) writeFileSync(join(ctlDir, 'submit-delay'), String(opts.submitDelayMs));
   // Unix socket paths are bounded; keep the private tmux dir short.
   tmuxRoot = mkdtempSync('/tmp/bmx-dl-');
@@ -84,16 +88,24 @@ function startScenario(opts: { submitDelayMs?: number } = {}) {
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
-  child.on('message', raw => messages.push(raw as WorkerToDaemon));
+  child.on('message', raw => {
+    const message = raw as WorkerToDaemon;
+    messages.push(message);
+    if (opts.handoff && message.type === 'final_output' && message.handoff) {
+      child!.send({ type: 'final_output_settled', ...message.handoff });
+    }
+  });
   child.stdout?.on('data', data => logs.push(data.toString()));
   child.stderr?.on('data', data => logs.push(data.toString()));
   sessionName = TmuxBackend.sessionName(sessionId);
   child.send({
     type: 'init', sessionId, daemonBootId: 'doubao-late-start-boot', chatId: 'oc_test', chatType: 'group',
     rootMessageId: 'om_root', workingDir: dataDir, cliId: 'doubao', cliPathOverride: fakeCli,
-    cliSessionId: nativeId, resume: true, backendType: 'tmux', launchShell: '/bin/bash',
+    ...(opts.fresh ? {} : { cliSessionId: nativeId, resume: true }),
+    backendType: opts.backend ?? 'tmux', launchShell: '/bin/bash', replyDelivery: 'transcript',
     prompt: 'first task: inspect the build', turnId: 'om_turn_1',
     larkAppId: 'app_doubao', larkAppSecret: 'test-only', apiOnly: true,
+    ...(opts.handoff ? { finalOutputHandoff: { version: 2, token: 'fixture-token', admitNew: true } } : {}),
   } satisfies DaemonToWorker);
   const waitUntil = async (check: () => boolean, what: string, timeoutMs = 20_000) => {
     const deadline = Date.now() + timeoutMs;
@@ -126,6 +138,7 @@ function startScenario(opts: { submitDelayMs?: number } = {}) {
   return {
     messages, logs, waitUntil, control, clear, assignmentText, pastes, finals, uncollected, sendMessage,
     pressEnterInTerminal, pressInTerminal, pane, notices,
+    trajectory, ctlDir, dataDir, sessionId,
   };
 }
 
@@ -138,6 +151,78 @@ async function finishFirstTurn(s: ReturnType<typeof startScenario>): Promise<voi
 }
 
 describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('Doubao input accepted while the CLI is busy', () => {
+  it.each(['tmux', 'pty'] as const)('export recovery collects a fresh tool-less first answer once on %s, including consecutive turns and late logs', async backend => {
+    const s = startScenario({ fresh: true, exportOnly: true, backend });
+    await s.waitUntil(() => s.assignmentText().includes('first task'), 'first assignment proof', 30_000);
+    expect(readFileSync(s.trajectory, 'utf8')).toBe('');
+    s.control('finish-1', 'EXPORTED_FIRST');
+    await s.waitUntil(() => s.finals('om_turn_1').length > 0, 'exported first answer', 30_000);
+    s.sendMessage('om_turn_2', 'second tool-less task');
+    await s.waitUntil(() => s.assignmentText().includes('second tool-less'), 'second assignment proof', 30_000);
+    // A late id-less final from the recovered first turn must never close N+1.
+    appendFileSync(s.trajectory, JSON.stringify({ role: 'assistant', content: 'EXPORTED_FIRST' }) + '\n');
+    await pause(2_000);
+    expect(s.finals('om_turn_2')).toEqual([]);
+    s.control('finish-2', 'EXPORTED_SECOND');
+    await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'exported successor', 30_000);
+    await pause(2_000);
+    expect(s.finals('om_turn_1').map(msg => (msg as { content: string }).content)).toEqual(['EXPORTED_FIRST']);
+    expect(s.finals('om_turn_2').map(msg => (msg as { content: string }).content)).toEqual(['EXPORTED_SECOND']);
+    expect(s.messages.filter(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_turn_1')).toHaveLength(1);
+    expect(s.messages.filter(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_turn_2')).toHaveLength(1);
+  }, 100_000);
+
+  it('export recovery settles an idle turn with an uncollected failure when export remains unavailable', async () => {
+    const s = startScenario({ fresh: true, exportOnly: true });
+    s.control('export-error');
+    await s.waitUntil(() => s.assignmentText().includes('first task'), 'first assignment proof', 30_000);
+    s.control('finish-1', 'ONLY_IN_TERMINAL');
+    await s.waitUntil(() => s.messages.some(msg => msg.type === 'turn_terminal'
+      && msg.turnId === 'om_turn_1'), 'bounded terminal', 90_000);
+    expect(s.finals('om_turn_1')).toEqual([]);
+    expect(s.messages.filter(msg => msg.type === 'turn_display_retired' && msg.turnId === 'om_turn_1')).toHaveLength(1);
+    expect(s.messages.find(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_turn_1'))
+      .toMatchObject({ status: 'ambiguous', errorCode: 'doubao_reply_not_collected' });
+    await pause(2_000);
+    expect(s.messages.filter(msg => msg.type === 'turn_display_retired' && msg.turnId === 'om_turn_1')).toHaveLength(1);
+  }, 130_000);
+
+  it('export recovery never publishes a stopped turn and still recovers its successor', async () => {
+    const s = startScenario({ fresh: true, exportOnly: true });
+    await s.waitUntil(() => s.assignmentText().includes('first task'), 'first assignment proof', 30_000);
+    child!.send({ type: 'interrupt_turn', requestId: 'stop-first', turnId: 'om_turn_1' } satisfies DaemonToWorker);
+    await s.waitUntil(() => s.messages.some(msg => msg.type === 'turn_interrupt_result'
+      && msg.requestId === 'stop-first'), 'stop receipt');
+    expect(s.messages.find(msg => msg.type === 'turn_interrupt_result' && msg.requestId === 'stop-first'))
+      .toMatchObject({ delivered: true });
+    s.sendMessage('om_turn_2', 'successor after stop');
+    await s.waitUntil(() => s.assignmentText().includes('successor after stop'), 'successor proof', 30_000);
+    s.control('finish-2', 'AFTER_STOP');
+    await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'successor reply', 30_000);
+    expect(s.finals('om_turn_1')).toEqual([]);
+    expect(s.finals('om_turn_2').map(msg => (msg as { content: string }).content)).toEqual(['AFTER_STOP']);
+  }, 90_000);
+
+  it('export recovery retries the real output journal after only the mode barrier committed', async () => {
+    const s = startScenario({ fresh: true, exportOnly: true, backend: 'pty', handoff: true });
+    await s.waitUntil(() => s.assignmentText().includes('first task'), 'first assignment proof', 30_000);
+    const journal = new WorkerOutputJournal(s.dataDir, 'app_doubao', s.sessionId);
+    rmSync(journal.directory, { recursive: true });
+    writeFileSync(journal.directory, 'block the publication write');
+    s.control('finish-1', 'AFTER_DISK_REPAIR');
+    await s.waitUntil(() => s.logs.some(line => line.includes('ENOTDIR')), 'real publication failure', 30_000);
+    expect(s.finals('om_turn_1')).toEqual([]);
+    expect(s.messages.filter(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_turn_1')).toEqual([]);
+    rmSync(journal.directory);
+    mkdirSync(journal.directory);
+    await s.waitUntil(() => s.finals('om_turn_1').length > 0, 'retry after disk repair', 30_000);
+    await s.waitUntil(() => s.messages.some(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_turn_1'), 'ordered terminal');
+    await s.waitUntil(() => journal.readPending().length === 0, 'handoff ACK');
+    await pause(2_000);
+    expect(s.finals('om_turn_1').map(msg => (msg as { content: string }).content)).toEqual(['AFTER_DISK_REPAIR']);
+    expect(s.messages.filter(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_turn_1')).toHaveLength(1);
+  }, 100_000);
+
   it('holds a follow-up in botmux while Doubao is still running, then delivers it and its reply', async () => {
     const s = startScenario({ submitDelayMs: 3_000 });
     await s.waitUntil(() => s.messages.some(msg => msg.type === 'ready'), 'worker ready');

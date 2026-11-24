@@ -36,6 +36,9 @@ import { join } from 'node:path';
  *                       ms later;
  *   - `panel`           a full-screen panel (Ctrl+Q queue manager) covers the
  *                       conversation, busy footer, composer and queue line.
+ *   - `export-only`     answers are exported but no trajectory rows are written;
+ *   - `export-error`    the read-only export command exits nonzero;
+ *   - `export-delay`    delays returning an export snapshot, in milliseconds.
  * Every stdin chunk is appended to `inputLog` as one JSON line.
  */
 export function writeFakeDoubaoTui(dir: string, opts: {
@@ -58,6 +61,15 @@ const ctl = name => path.join(CTL, name);
 const has = name => fs.existsSync(ctl(name));
 const read = name => { try { return fs.readFileSync(ctl(name), 'utf8').trim(); } catch { return ''; } };
 const appendJson = row => fs.appendFileSync(TRAJECTORY, JSON.stringify(row) + '\\n');
+const EXPORT = ctl('export.json');
+if (process.argv.includes('--export')) {
+  fs.appendFileSync(ctl('exports.log'), 'export\\n');
+  if (has('export-error')) process.exit(2);
+  const snapshot = has('export-invalid') ? '{' : (has('export.json') ? fs.readFileSync(EXPORT, 'utf8') : '[]');
+  setTimeout(() => { process.stdout.write(snapshot); process.exit(0); }, Number(read('export-delay')) || 0);
+  return;
+}
+const exported = has('export.json') ? JSON.parse(fs.readFileSync(EXPORT, 'utf8')) : [];
 
 let composer = '';
 let pasted = 0;
@@ -115,11 +127,14 @@ function pump() {
   if (turn || background || queue.length === 0) return;
   const prompt = queue.shift();
   const n = ++turnCount;
-  turn = { n, startedAt: Date.now(), midDone: false };
+  turn = { n, startedAt: Date.now(), midDone: false, prompt, exportIndex: exported.length };
   setTimeout(() => {
     if (!turn || turn.n !== n) return;
     const section = () => fs.appendFileSync(ASSIGNMENT, '## [' + new Date().toISOString() + '] 需求\\n' + prompt + '\\n\\n');
     if (has('row-first')) setTimeout(section, Number(read('row-first')) || 3000); else section();
+    exported.push({ query: prompt, response: '' });
+    fs.writeFileSync(EXPORT, JSON.stringify(exported));
+    if (has('export-only')) return;
     if (has('row-after')) setTimeout(() => appendJson({ role: 'user', content: prompt }), Number(read('row-after')) || 400);
     else appendJson({ role: 'user', content: prompt });
     appendJson({ role: 'assistant', content: '', tool_calls: [{ id: 'call-' + n, function: { name: 'Read', arguments: '{}' } }] });
@@ -193,9 +208,15 @@ setInterval(() => {
       appendJson({ role: 'assistant', content: read('midfinal-' + n) || 'Still working on it.' });
     }
     if (has('finish-' + n)) {
-      appendJson({ role: 'tool', tool_call_id: 'call-' + n, content: 'ok' });
       const answer = read('finish-' + n) || ('ANSWER_' + n);
-      appendJson({ role: 'assistant', content: answer });
+      if (!has('export-only')) {
+        appendJson({ role: 'tool', tool_call_id: 'call-' + n, content: 'ok' });
+        appendJson({ role: 'assistant', content: answer });
+      }
+      if (exported[turn.exportIndex]) {
+        exported[turn.exportIndex].response = answer;
+        fs.writeFileSync(EXPORT, JSON.stringify(exported));
+      }
       transcript.push(answer);
       turn = null;
       setTimeout(pump, 200);

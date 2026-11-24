@@ -2701,6 +2701,7 @@ export const messages: Record<string, string> = {
   'worker.cli_flag_needs_upgrade': '⚠️ 本机 {cliName} 是 {version}，低于 {minVersion}，不支持启动参数 {flag}，这次启动已经去掉了它（旧版本没有 hooks 信任确认这一步，启动不受影响）。建议升级到 {minVersion} 或更新的版本；PATH 上装了多份时，请确认 bot 实际用的是哪一份（`which -a traex traecli`）。',
   'worker.cli_rejected_argument': '⚠️ {cliName} 启动失败：它不认识启动参数 {flag}（unexpected argument），一般是 CLI 版本太旧。请把 {cliName} 升级到最新版；PATH 上装了多份时，请确认 bot 用的是新版（`which -a traex traecli`）。',
   'worker.traex_resume_target_in_default_home': '⚠️ 这个话题上次的 TRAE 会话（{sessionId}）记在默认目录 {defaultHome} 里，但这个 bot 现在的 TRAE_HOME 是 {traeHome}，TRAE 在新目录里找不到这个会话，这次可能接不上之前的上下文。botmux 不会去读旧目录（在那里找到的会话，TRAE 也恢复不了）。要继续旧会话，可以把那条会话的记录迁到新目录，或者去掉这个 bot 的 TRAE_HOME；不需要的话直接继续用即可。',
+  'worker.doubao_reply_not_collected': '⚠️ Doubao 已回到空闲状态，但 botmux 未能在等待窗口内安全回收这一轮的最终回答。请在 Web 终端查看结果；不要仅因未收到正文就重复执行任务。',
   'worker.structured_turn_not_collected': '⚠️ 这条消息已经发给 {cliName}，但它的会话记录（transcript）里一直没出现这一轮，botmux 采集不到本轮回复，结论不会自动转发到群里。{cliName} 若已在终端里作答，请打开 Web 终端查看；确认没被处理再重发。',
   'worker.structured_turn_not_collected_fd_denied': '⚠️ 这条消息已经发给 {cliName}，但系统拒绝 botmux 读取 {cliName} 进程（pid {pid}）打开的文件（权限被拒，{code}），定位不到它的会话记录（transcript），采集不到本轮回复，结论不会自动转发到群里。{hint}{cliName} 若已在终端里作答，请打开 Web 终端查看；确认没被处理再重发。',
   'worker.fd_denied_setuid_bwrap_hint': '原因：沙盒用的 {path} 带 setuid root，它建出的沙盒归 root 所有，以普通用户运行的 botmux 无权读取其中进程的 /proc/<pid>/fd。',

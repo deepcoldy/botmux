@@ -473,6 +473,7 @@ import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
 import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession, doubaoLiveUser } from './services/doubao-transcript.js';
+import { commitDoubaoExportMode, doubaoExportOwnsTerminals, DoubaoExportRecovery, exportDoubaoSession } from './services/doubao-export-recovery.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath, restoreFilteredHermesUserEvents } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
@@ -14462,6 +14463,9 @@ function structuredBridgeIngestPath(
 ): StructuredBridgeDrainResult {
   const spec = bridgeSpecFor(lastInitConfig?.cliId);
   if (spec) {
+    if (structuredBridgeIs('doubao') && doubaoExportOwnsTerminals(config.session.dataDir, path)) {
+      structuredBridgeDriverState = { ...(structuredBridgeDriverState as object ?? {}), exportOnly: true };
+    }
     const result = spec.drain(path, offset, {
       // adoptMode gates the drainer's bare-sentinel synthesis: adopt posts
       // transcript text verbatim, so a synthesised token would leak into Lark.
@@ -14788,11 +14792,54 @@ function codexBridgeStartTimer(): void {
       // completion created by that replay in the same call stack.
       try {
         pruneExpiredStructuredHeadsAndEmit('structured bridge tick');
+        if (structuredBridgeIs('doubao')) void doubaoExportRecovery.tick();
       } catch (err: any) {
         log(`Codex bridge tick expiry error: ${err.message}`);
       }
     }
   }, 1000);
+}
+
+const doubaoExportRecovery = new DoubaoExportRecovery({
+  view: () => {
+    if (!structuredBridgeIs('doubao') || lastInitConfig?.adoptMode || !codexBridgeRolloutPath
+      || !cliAdapter || !backend || cliRestartInProgress || lastResolvedSandboxMode === 'scratch') return;
+    const nativeId = inputDeliveryObservedCliSessionId;
+    if (!nativeId) return;
+    // PTY has no native capture. Keep box rules in xterm's viewport: Doubao's
+    // structural composer recognizer deliberately refuses display-cleaned text.
+    const screen = backend.captureViewport?.() ?? backend.captureCurrentScreen?.()
+      ?? renderer?.rawSnapshot({ preserveFormatting: true }) ?? '';
+    const idle = backendScreenEvidenceIsAuthoritativeForMutation()
+      && cliAdapter.screenShowsNoPendingInput?.(screen) === true;
+    return {
+      path: codexBridgeRolloutPath, sessionId: nativeId,
+      generation: `${cliSpawnGeneration}:${cliInterruptGeneration}:${webTerminalInputGeneration}`,
+      idle, turns: codexBridgeQueue.peek()
+    };
+  },
+  readExport: nativeId => exportDoubaoSession(cliAdapter!.resolvedBin, nativeId, {
+    cwd: lastInitConfig?.workingDir,
+    env: { ...redactChildEnv(process.env), ...lastInitConfig?.env, DOUBAO_CLI_NO_UPDATE_CHECK: '1' },
+  }),
+  commitMode: path => commitDoubaoExportMode(config.session.dataDir, path),
+  settle: settleDoubaoExportTurn,
+});
+
+function settleDoubaoExportTurn(turn: CodexPendingTurn, answer: string | undefined): void {
+  turn.finalText = answer ?? '';
+  if (answer === undefined) {
+    turn.terminalStatus = 'ambiguous';
+    turn.terminalErrorCode = 'doubao_reply_not_collected';
+  }
+  checkpointStructuredBridgeRecovery();
+  if (answer === undefined) send({
+    type: 'turn_display_retired', turnId: turn.turnId,
+    ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+    message: t('worker.doubao_reply_not_collected')
+  });
+  emitReadyCodexTurns();
+  redriveRejectedStructuredReady();
 }
 
 function hermesBridgeAttach(mode: 'baseline-existing' | 'fresh-empty'): void {

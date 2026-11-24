@@ -9,7 +9,7 @@
  * Every lookup is handed the temp root explicitly so these tests never touch
  * the real logged-in account's session store.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -22,13 +22,197 @@ import {
   drainDoubaoTranscript,
   doubaoLiveUser,
   doubaoWorkspaceForSession,
+  doubaoExportAnswer,
+  doubaoExportFrontier,
 } from '../src/services/doubao-transcript.js';
+import { commitDoubaoExportMode, doubaoExportOwnsTerminals, DoubaoExportRecovery } from '../src/services/doubao-export-recovery.js';
 import { doubaoBridgeSpec } from '../src/adapters/cli/doubao.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const SID = '38459999999999999';
 const AGENT = 'm_agent1';
+
+describe('Doubao export recovery authority', () => {
+  function rig() {
+    const root = mkdtempSync(join(tmpdir(), 'doubao-export-'));
+    const { assignment, trajectory } = makeSession(root);
+    writeFileSync(assignment, '');
+    writeFileSync(trajectory, '');
+    let now = 1_000_000;
+    const q = new CodexBridgeQueue(() => now);
+    let state: unknown;
+    let offset = 0;
+    let idle = true;
+    let generation = 'generation-1';
+    const exported: Array<{ query: string; response: string }> = [];
+    const emitted: Array<{ turnId: string; answer?: string; status?: string }> = [];
+    const drain = () => {
+      if (doubaoExportOwnsTerminals(root, trajectory)) state = { ...(state as object ?? {}), exportOnly: true };
+      const r = drainDoubaoTranscript(trajectory, offset, {
+        state,
+        openTurns: q.peek().filter(turn => turn.started && turn.finalText === undefined).length
+      });
+      state = r.state; offset = r.newOffset;
+      q.ingest(r.events);
+    };
+    const collect = () => {
+      for (const turn of q.drainEmittable()) emitted.push({
+        turnId: turn.turnId,
+        answer: turn.finalText, status: turn.terminalStatus
+      });
+    };
+    const request = (id: string, text: string) => {
+      q.mark(id, text, now);
+      appendFileSync(assignment, `## [${new Date(now).toISOString()}] 需求\n${text}\n\n`);
+      exported.push({ query: text, response: '' });
+      drain();
+      return q.peek().find(turn => turn.turnId === id)!;
+    };
+    const readExport = vi.fn(async () => structuredClone(exported) as unknown);
+    const commitMode = vi.fn((path: string) => commitDoubaoExportMode(root, path));
+    const settle = vi.fn((turn: (ReturnType<typeof q.peek>)[number], answer: string | undefined) => {
+      turn.finalText = answer ?? '';
+      if (answer === undefined) turn.terminalStatus = 'ambiguous';
+      collect();
+    });
+    const view = vi.fn(() => ({ path: trajectory, sessionId: SID, generation, idle, turns: q.peek() }));
+    const recovery = new DoubaoExportRecovery({
+      view,
+      readExport, commitMode, settle, now: () => now, graceMs: 10, deadlineMs: 100_000,
+    });
+    const eligible = async () => { await recovery.tick(); now += 20; };
+    return {
+      q, request, exported, readExport, commitMode, settle, recovery, eligible, emitted, drain, collect,
+      assignment, trajectory, root, view, advance: (ms: number) => { now += ms; },
+      setIdle: (value: boolean) => { idle = value; }, changeGeneration: () => { generation += '-next'; }
+    };
+  }
+
+  it('uses the exact assignment occurrence, not a response to an old identical input', async () => {
+    const r = rig();
+    const first = r.request('om_first', 'repeat');
+    r.exported[0]!.response = 'OLD';
+    await r.eligible(); await r.recovery.tick();
+    r.advance(1_000);
+    const second = r.request('om_second', 'repeat');
+    const frontier = doubaoExportFrontier(r.trajectory, second)!;
+    expect(doubaoExportAnswer(frontier, [{ query: 'repeat', response: 'OLD' }])).toBeUndefined();
+    expect(doubaoExportAnswer(frontier, [{ query: 'repeat', response: 'OLD' }, { query: 'repeat', response: 'NEW' }])).toBe('NEW');
+    r.exported[1]!.response = 'NEW';
+    await r.eligible(); await r.recovery.tick(); await r.recovery.tick();
+    expect(r.emitted.map(t => [t.turnId, t.answer])).toEqual([['om_first', 'OLD'], ['om_second', 'NEW']]);
+    expect(r.readExport).toHaveBeenCalledTimes(2);
+    expect(doubaoExportFrontier(r.trajectory, { ...second, nativeUserProof: undefined })).toBeUndefined();
+    expect(doubaoExportFrontier(r.trajectory, { ...second, nativeUserProof: { ...first.nativeUserProof!, hash: 'wrong' } })).toBeUndefined();
+    expect(doubaoExportFrontier(r.trajectory, { ...second, wholeInputHash: 'wrong' })).toBeUndefined();
+  });
+
+  it('rejects truncated, reordered and prefix-only exported history and torn assignment input', async () => {
+    const r = rig();
+    const turn = r.request('om_first', 'shared prefix but exact suffix');
+    const frontier = doubaoExportFrontier(r.trajectory, turn)!;
+    for (const exported of [null, {}, [{ query: 'shared prefix', response: 'WRONG' }],
+      [{ query: frontier.queries[0], response: 123 }],
+      [{ query: frontier.queries[0], response: 'OLD' }, { query: 'extra', response: 'OTHER' }]]) {
+      expect(doubaoExportAnswer(frontier, exported)).toBeUndefined();
+    }
+    appendFileSync(r.assignment, '## [2026-11-24T00:01:00Z] 需求\n');
+    expect(doubaoExportFrontier(r.trajectory, turn)).toBeUndefined();
+    await r.eligible(); await r.recovery.tick();
+    expect(r.readExport).not.toHaveBeenCalled();
+    expect(r.emitted).toEqual([]);
+  });
+
+  it.each(['stop', 'new-generation', 'rewritten-assignment', 'native-final'] as const)(
+    'revalidates authority after export IO: %s', async action => {
+      const r = rig();
+      r.request('om_first', 'read once');
+      r.exported[0]!.response = 'EXPORTED';
+      let complete!: (value: unknown) => void;
+      r.readExport.mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
+      await r.eligible();
+      const flight = r.recovery.tick();
+      r.advance(6_000);
+      await r.recovery.tick();
+      expect(r.readExport).toHaveBeenCalledTimes(1);
+      if (action === 'stop') r.q.dropPendingTurn('om_first', undefined, true);
+      if (action === 'new-generation') r.changeGeneration();
+      if (action === 'rewritten-assignment') appendFileSync(r.assignment,
+        '\n## [2026-11-24T00:01:00Z] 需求\nexternal successor\n\n');
+      if (action === 'native-final') {
+        appendFileSync(r.trajectory, JSON.stringify({ role: 'assistant', content: 'NATIVE' }) + '\n');
+        r.drain(); r.collect();
+      }
+      complete(structuredClone(r.exported)); await flight;
+      expect(r.commitMode).not.toHaveBeenCalled();
+      expect(r.emitted).toEqual(action === 'native-final' ? [{ turnId: 'om_first', answer: 'NATIVE', status: undefined }] : []);
+    });
+
+  it('keeps late terminal rows from closing a successor, including a new reader after reattach', async () => {
+    const r = rig();
+    r.request('om_first', 'first'); r.exported[0]!.response = 'FIRST';
+    await r.eligible(); await r.recovery.tick();
+    r.advance(1_000);
+    r.request('om_second', 'second');
+    appendFileSync(r.trajectory, JSON.stringify({ role: 'assistant', content: 'FIRST' }) + '\n');
+    r.drain(); r.collect();
+    expect(r.emitted).toHaveLength(1);
+    // The durable mode survives controller/reader replacement; no outcome or
+    // prompt is recorded in the barrier, so publication can still retry.
+    const reattached = drainDoubaoTranscript(r.trajectory, 0, {
+      state: {
+        assignmentOffset: 0, trajectoryOffset: 0,
+        exportOnly: doubaoExportOwnsTerminals(r.root, r.trajectory) ? true : undefined
+      },
+    });
+    expect(reattached.events.some(e => e.kind === 'assistant_final')).toBe(false);
+    r.exported[1]!.response = 'SECOND';
+    await r.eligible(); await r.recovery.tick();
+    expect(r.emitted.map(t => t.answer)).toEqual(['FIRST', 'SECOND']);
+  });
+
+  it.each(['barrier', 'publication'] as const)('retries when only half of recovery commits: %s', async failure => {
+    const r = rig();
+    r.request('om_first', 'read'); r.exported[0]!.response = 'ANSWER';
+    if (failure === 'barrier') r.commitMode.mockImplementationOnce(() => { throw new Error('disk full'); });
+    else r.settle.mockImplementationOnce(() => { throw new Error('output journal unavailable'); });
+    await r.eligible(); await r.recovery.tick();
+    expect(r.emitted).toEqual([]);
+    expect(r.q.hasPendingTurn('om_first')).toBe(true);
+    r.advance(6_000); await r.recovery.tick(); await r.recovery.tick();
+    expect(r.emitted.map(t => t.answer)).toEqual(['ANSWER']);
+  });
+
+  it('bounds native-idle waiting without expiring running work or letting a late export win the timeout', async () => {
+    const r = rig();
+    r.request('om_first', 'read');
+    r.setIdle(false); await r.recovery.tick(); r.advance(200_000); await r.recovery.tick();
+    expect(r.settle).not.toHaveBeenCalled();
+    r.setIdle(true); await r.eligible();
+    let complete!: (value: unknown) => void;
+    r.readExport.mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
+    const flight = r.recovery.tick();
+    r.advance(200_000); await r.recovery.tick();
+    complete([{ query: 'read', response: 'TOO_LATE' }]); await flight;
+    expect(r.emitted).toEqual([{ turnId: 'om_first', answer: '', status: 'ambiguous' }]);
+    expect(r.settle).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a failed viewport capture non-authoritative without rejecting the background tick', async () => {
+    const r = rig();
+    r.request('om_first', 'read');
+    await r.eligible();
+    r.advance(200_000);
+    r.view.mockImplementationOnce(() => { throw new Error('pane capture unavailable'); });
+    await expect(r.recovery.tick()).resolves.toBeUndefined();
+    expect(r.readExport).not.toHaveBeenCalled();
+    expect(r.settle).not.toHaveBeenCalled();
+    r.exported[0]!.response = 'AFTER_VIEW_RECOVERY';
+    await r.eligible(); await r.recovery.tick();
+    expect(r.emitted).toEqual([{ turnId: 'om_first', answer: 'AFTER_VIEW_RECOVERY', status: undefined }]);
+  });
+});
 
 describe('Doubao live submission proof', () => {
   const stamp = Date.parse('2026-11-12T00:00:00Z');

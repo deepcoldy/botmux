@@ -109,6 +109,34 @@ function harness(
 }
 
 describe('worker: expired structured heads', () => {
+  it('export recovery queues an ambiguous uncollected terminal before retiring the display, and uses the shared emitter for replies', () => {
+    const queue = new CodexBridgeQueue();
+    const scope = {
+      checkpointStructuredBridgeRecovery: vi.fn(),
+      emitReadyCodexTurns: vi.fn(() => queue.drainEmittable()),
+      redriveRejectedStructuredReady: vi.fn(),
+      send: vi.fn(), t: () => 'uncollected reply',
+    };
+    const settle = loadWorkerFunction<(turn: CodexPendingTurn, answer?: string) => void>('settleDoubaoExportTurn', scope);
+    const first: CodexPendingTurn = { turnId: 'om_missing', started: true };
+    queue.restoreDrained([first]);
+    settle(first);
+    expect(scope.checkpointStructuredBridgeRecovery).toHaveBeenCalledOnce();
+    expect(scope.emitReadyCodexTurns.mock.results[0]!.value).toEqual([
+      expect.objectContaining({ turnId: 'om_missing', finalText: '', terminalStatus: 'ambiguous', terminalErrorCode: 'doubao_reply_not_collected' }),
+    ]);
+    expect(queue.hasPendingTurn('om_missing')).toBe(false);
+    expect(scope.redriveRejectedStructuredReady).toHaveBeenCalledOnce();
+    expect(scope.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'turn_display_retired', turnId: 'om_missing' }));
+    const second: CodexPendingTurn = { turnId: 'om_answer', started: true };
+    queue.restoreDrained([second]);
+    settle(second, 'RECOVERED');
+    expect(scope.emitReadyCodexTurns.mock.results[1]!.value).toEqual([
+      expect.objectContaining({ turnId: 'om_answer', finalText: 'RECOVERED' }),
+    ]);
+    expect(scope.send).toHaveBeenCalledOnce();
+  });
+
   it('tells the thread about an ordinary Lark turn only', () => {
     const { scope, prune } = harness([
       { turnId: 'om_ordinary', started: false },

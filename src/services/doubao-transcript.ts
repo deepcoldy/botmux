@@ -32,6 +32,7 @@ import { logger } from '../utils/logger.js';
 import type { CodexBridgeEvent, CodexCotEntry } from './codex-transcript.js';
 import { doubaoSessionRoots } from '../adapters/cli/doubao.js';
 import { boundSubjectForTransport, subjectFromArgsString } from './cot-subject.js';
+import { wholeInputHash, type CodexPendingTurn } from './codex-bridge-queue.js';
 
 const SESSION_ID_RE = /^\d{10,24}$/;
 const ASSIGNMENT_FILE = 'assignment.md';
@@ -41,6 +42,8 @@ const TRAJECTORY_FILE = 'trajectory.jsonl';
 const SECTION_HEADING_RE = /^## \[([^\]]+)\]\s*需求\s*$/;
 
 export interface DoubaoBridgeDrainState {
+  /** Durable export mode: raw terminal rows may belong to a retired turn. */
+  exportOnly?: true;
   /** Byte frontier in assignment.md (start of the next unparsed byte). */
   assignmentOffset: number;
   /** Byte frontier in trajectory.jsonl. */
@@ -312,6 +315,51 @@ export function doubaoLiveUser(path: string,
   } catch { return; }
 }
 
+export interface DoubaoExportFrontier {
+  sessionId: string;
+  assignmentHash: string;
+  queries: string[];
+  index: number;
+}
+
+/** Export has no message ids. Only a complete, unchanged assignment history
+ * plus the exact attributed section can prove an occurrence (including repeats).
+ * Never use prefix matching or select the last non-empty exported response. */
+export function doubaoExportFrontier(path: string, turn: CodexPendingTurn): DoubaoExportFrontier | undefined {
+  const proof = turn.nativeUserProof;
+  const sessionId = /[/\\]\.sessions[/\\](\d{10,24})[/\\]agents[/\\]/.exec(path)?.[1];
+  if (!sessionId || !proof || !turn.wholeInputHash) return;
+  const assignment = join(dirname(path), ASSIGNMENT_FILE);
+  try {
+    if (statSync(assignment).size > 4 * 1024 * 1024) return;
+    const bytes = readFileSync(assignment);
+    if (bytes.length > 4 * 1024 * 1024 || bytes.at(-1) !== 10) return;
+    // Parse the bytes whose digest we revalidate, not a second file read.
+    const sections = parseAssignmentSections(assignment, bytes.toString('utf8'), 0);
+    if (sections.length === 0 || sections.some(section => section.incomplete || !section.event)) return;
+    const index = sections.findIndex(section => section.event!.uuid === proof.uuid);
+    const user = sections[index]?.event;
+    if (!user || user.timestampMs !== proof.timestampMs
+      || createHash('sha256').update(user.text).digest('hex') !== proof.hash
+      || wholeInputHash(user.text) !== turn.wholeInputHash) return;
+    return {
+      sessionId, index, queries: sections.map(section => section.event!.text),
+      assignmentHash: createHash('sha256').update(bytes).digest('hex')
+    };
+  } catch { return; }
+}
+
+export function doubaoExportAnswer(frontier: DoubaoExportFrontier, exported: unknown): string | undefined {
+  if (!Array.isArray(exported) || exported.length !== frontier.queries.length) return;
+  for (let i = 0; i < exported.length; i++) {
+    const row = exported[i];
+    if (!row || typeof row.query !== 'string' || typeof row.response !== 'string'
+      || wholeInputHash(row.query) !== wholeInputHash(frontier.queries[i]!)) return;
+  }
+  const response = exported[frontier.index]?.response;
+  return typeof response === 'string' && response.trim() ? response : undefined;
+}
+
 /** One parsed trajectory row: a bridge event, or the whitespace-normalised
  *  text of a `role:user` row (a request boundary, never emitted itself). */
 interface ParsedTrajectoryEvent {
@@ -506,7 +554,8 @@ export function drainDoubaoTranscript(
           text = text.slice(end);
           skipTrajectoryTail = false;
         }
-        trajectoryEvents = parseTrajectoryWindow(path, text, start);
+        trajectoryEvents = parseTrajectoryWindow(path, text, start)
+          .filter(row => !prevState.exportOnly || row.event?.kind !== 'assistant_final');
         trajectoryOffset = window.newOffset;
         pendingTail = window.pendingTail;
       }
@@ -711,6 +760,7 @@ export function drainDoubaoTranscript(
     newOffset: Math.max(trajectoryOffset, fromOffset),
     pendingTail,
     state: {
+      ...(prevState.exportOnly ? { exportOnly: true } : {}),
       assignmentOffset,
       trajectoryOffset,
       ...(skipTrajectoryTail ? { skipTrajectoryTail: true } : {}),
