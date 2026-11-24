@@ -235,14 +235,19 @@ export interface BridgePendingTurn {
   /** Multiple inputs share one uninterrupted output segment, so the next
    *  output cannot be attributed to this later input without guessing. */
   absorbedReplyAmbiguous?: boolean;
-  /** The worker already sent this folded turn's reply live, while its host
-   *  turn was still running: the end of the host turn must not post it again,
-   *  and a failure the host meets afterwards is not this turn's. */
+  /** The worker handed this folded turn's reply to the daemon. The host still
+   *  carries its text unless actual delivery is confirmed, and a failure the
+   *  host meets afterwards is not this turn's. */
   absorbedReplySent?: boolean;
-  /** Records whose text went out whole as this folded turn's live reply
-   *  (empty for a thinking summary, or a reply too long for one card). They
-   *  are the host turn's records too, so the host's own final leaves them
-   *  out — see liveFoldedReplyUuids. */
+  /** The daemon confirmed the live card's actual POST. Distinct from IPC
+   *  handoff: a failed host may settle on a confirmed reply, but an unconfirmed
+   *  one still needs its own final fallback. */
+  absorbedReplyDelivered?: boolean;
+  /** Records whose text is known to have gone out whole as this folded turn's
+   *  live reply (empty for a thinking summary, a reply too long for one card,
+   *  or a delivery not confirmed by the daemon). They are the host turn's
+   *  records too, so the host's own final leaves them out — see
+   *  liveFoldedReplyUuids. */
   absorbedReplyTextUuids?: string[];
   /** Records the host turn's final carried whole into the chat this folded
    *  message came from (noteHostFinalCarried). An answer among them is not

@@ -29,6 +29,7 @@ import * as groupsStore from '../src/services/groups-store.js';
 import * as runAsModule from '../src/core/run-as.js';
 import { invalidateGlobalConfigCache, setGroupOwnerNoticeEnabled } from '../src/global-config.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
+import * as followUpReplyChange from '../src/services/follow-up-reply-change.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import { resolveScheduleModelOverride } from '../src/core/schedule-model-override.js';
 import {
@@ -2601,6 +2602,9 @@ describe('PUT /api/bot-card-prefs — mid-turn replies (followUpReply)', () => {
     const own = worker();
     const ownKilled = { ...worker(), killed: true };
     const otherBot = worker();
+    const unregisterFollowUpReply = followUpReplyChange.registerFollowUpReplyChangeHandler((app, enabled) => {
+      followUpReplyChange.broadcastFollowUpReplyToWorkers(workerPool.getActiveSessionsRegistry()?.values() ?? [], app, enabled);
+    });
     try {
       process.env.BOTS_CONFIG = configPath;
       writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code' }], null, 2));
@@ -2626,7 +2630,8 @@ describe('PUT /api/bot-card-prefs — mid-turn replies (followUpReply)', () => {
       expect(ownKilled.sent).toEqual([]);
       expect(otherBot.sent).toEqual([]);
     } finally {
-      workerPool.setActiveSessionsRegistry(new Map());
+      unregisterFollowUpReply();
+      workerPool.setActiveSessionsRegistry(undefined);
       if (handle) await handle.close();
       handle = null;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;

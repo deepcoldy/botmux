@@ -183,6 +183,7 @@ import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } f
 import { buildMarkdownCard, contextPercentUsed } from './im/lark/md-card.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField, setAssistantModeEnabledHook } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
+import { broadcastFollowUpReplyToWorkers, registerFollowUpReplyChangeHandler } from './services/follow-up-reply-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
@@ -35921,6 +35922,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // so dashboard IPC and other consumers can list/lookup live sessions.
   setActiveSessionsRegistry(activeSessions);
   registerPinStreamingCardChangeHandler(reconcileBotStreamingCardPins);
+  registerFollowUpReplyChangeHandler((larkAppId, enabled) => {
+    broadcastFollowUpReplyToWorkers(activeSessions.values(), larkAppId, enabled);
+  });
 
   if (cfg.dispatchLaunchPolicy?.enabled === true) {
     const operationStore = createDispatchLaunchOperationStore({

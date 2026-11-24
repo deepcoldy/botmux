@@ -10893,37 +10893,151 @@ function followUpReplyEnabled(): boolean {
  *  undefined until the switch changes after this worker started. */
 let followUpReplyLive: boolean | undefined;
 
+/** Live replies awaiting proof that the daemon actually posted them. Without
+ *  that proof their text remains eligible for the host turn's final. Bounded
+ *  because a failed delivery never gets a receipt; an evicted/late receipt is
+ *  deliberately ignored, which can duplicate but can never silently drop. */
+const pendingAbsorbedReplyDeliveries = new Map<string, { turn: BridgePendingTurn; uuids: string[] }>();
+const PENDING_ABSORBED_REPLY_DELIVERIES_MAX = 32;
+
+type EmitReadyTurnsOptions = {
+  explicitTerminalOnly?: boolean;
+  releaseHeldTerminals?: boolean;
+  /** Pass-through identity gate for the no-idle watchdog. */
+  onlyTurn?: { turnId: string; dispatchAttempt?: number };
+};
+
+/** A same-batch transcript read can finish its host before the daemon's POST
+ *  has even started. Defer that host briefly instead of posting both channels.
+ *  The bound covers the daemon's 0/5s/15s retry schedule plus transport slack;
+ *  after it, emitting the unfiltered final is the no-loss fallback. */
+const ABSORBED_REPLY_DELIVERY_WAIT_MS = 30_000;
+const deferredAbsorbedReplyFinals = new Map<BridgePendingTurn, {
+  opts: EmitReadyTurnsOptions;
+  timer: ReturnType<typeof setTimeout>;
+}>();
+
+function absorbedReplyDeliveryKey(turnId: string, dispatchAttempt: number | undefined, replyUuid: string): string {
+  return JSON.stringify([turnId, dispatchAttempt ?? null, replyUuid]);
+}
+
 /** The daemon pushed a change of the bot's followUpReply switch. */
 function setFollowUpReplyLive(enabled: boolean): void {
   followUpReplyLive = enabled;
   log(`followUpReply → ${enabled ? 'on' : 'off'}`);
 }
 
+/** A fresh accepted init is the config baseline. In particular, a live value
+ *  left by an earlier logical session must not override the new init config. */
+function resetFollowUpReplyStateForInit(): void {
+  followUpReplyLive = undefined;
+  pendingAbsorbedReplyDeliveries.clear();
+  for (const deferred of deferredAbsorbedReplyFinals.values()) clearTimeout(deferred.timer);
+  deferredAbsorbedReplyFinals.clear();
+}
+
 /** followUpReply for Claude Code adopt folds, which follows the switch while
  *  the worker runs, as the daemon's posting gate does: a live reply leaves the
- *  host turn's final, so one the daemon drops would otherwise be lost. Codex
- *  replies leave nothing out of a final and keep the spawn-time value. */
+ *  host turn's final only after its actual delivery is confirmed. Codex replies
+ *  leave nothing out of a final and keep the spawn-time value. */
 function foldReplyEnabled(): boolean {
   return followUpReplyLive ?? followUpReplyEnabled();
 }
 
-/** Post a folded turn's reply and mark it answered. */
+/** Whether this host must wait for at least one live delivery receipt. */
+function hostWithPendingAbsorbedReply(host: BridgePendingTurn): boolean {
+  for (const pending of pendingAbsorbedReplyDeliveries.values()) {
+    if (host.absorbedTurns?.includes(pending.turn)) return true;
+  }
+  return false;
+}
+
+function deferredHostForAbsorbedReply(turn: BridgePendingTurn): BridgePendingTurn | undefined {
+  for (const host of deferredAbsorbedReplyFinals.keys()) {
+    if (host.absorbedTurns?.includes(turn)) return host;
+  }
+  return undefined;
+}
+
+function runDeferredAbsorbedReplyFinal(host: BridgePendingTurn): void {
+  const deferred = deferredAbsorbedReplyFinals.get(host);
+  if (!deferred) return;
+  clearTimeout(deferred.timer);
+  deferredAbsorbedReplyFinals.delete(host);
+  try { emitReadyTurns(deferred.opts); }
+  catch (error) { log(`Deferred folded-turn final failed: ${String(error)}`); }
+}
+
+function timeOutDeferredAbsorbedReplyFinal(host: BridgePendingTurn): void {
+  // Timeout is the decision to use the unfiltered final. Invalidate this host's
+  // pending receipts so the wait gate cannot simply re-arm itself; a late ACK
+  // then finds no entry and cannot retract text after the fallback went out.
+  for (const [key, pending] of pendingAbsorbedReplyDeliveries) {
+    if (host.absorbedTurns?.includes(pending.turn)) pendingAbsorbedReplyDeliveries.delete(key);
+  }
+  runDeferredAbsorbedReplyFinal(host);
+}
+
+function deferAbsorbedReplyFinal(host: BridgePendingTurn, opts: EmitReadyTurnsOptions): void {
+  if (deferredAbsorbedReplyFinals.has(host)) return;
+  const timer = setTimeout(() => timeOutDeferredAbsorbedReplyFinal(host), ABSORBED_REPLY_DELIVERY_WAIT_MS);
+  timer.unref?.();
+  deferredAbsorbedReplyFinals.set(host, { opts, timer });
+}
+
+/** Confirm the exact live reply the daemon posted. No receipt arrives for a
+ *  reply rejected by the live switch or one whose POST retries were exhausted. */
+function noteAbsorbedReplyDelivered(turnId: string, dispatchAttempt: number | undefined, replyUuid: string): void {
+  const key = absorbedReplyDeliveryKey(turnId, dispatchAttempt, replyUuid);
+  const pending = pendingAbsorbedReplyDeliveries.get(key);
+  if (!pending) return;
+  pendingAbsorbedReplyDeliveries.delete(key);
+  pending.turn.absorbedReplyDelivered = true;
+  pending.turn.absorbedReplyTextUuids = pending.uuids;
+  const host = deferredHostForAbsorbedReply(pending.turn);
+  // Partial confirmation must neither release the host early nor renew its
+  // no-loss timeout. The last pending receipt releases the original wait.
+  if (host && !hostWithPendingAbsorbedReply(host)) runDeferredAbsorbedReplyFinal(host);
+}
+
+/** Post a folded turn's reply and mark it handed to the daemon. */
 function sendAbsorbedReply(turn: BridgePendingTurn, reply: AbsorbedInputReply, when: 'live' | 'at turn end'): void {
-  send({
-    type: 'absorbed_reply',
-    turnId: turn.turnId,
-    ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
-    answer: reply.text,
-    replyUuid: reply.lastUuid,
-    source: reply.source,
-    // The folded turn has no other reply. Under transcript delivery, which
-    // posts no completion receipt, it stands as the turn's final.
-    ...(replyDeliveryMode() === 'transcript' ? { turnReply: true as const } : {}),
-  });
-  // Marked once handed over: a send that throws leaves the reply to the host.
+  const wholeText = reply.source === 'text' && reply.text.length <= ABSORBED_REPLY_MAX_CHARS;
+  const pendingKey = when === 'live' && wholeText
+    ? absorbedReplyDeliveryKey(turn.turnId, turn.dispatchAttempt, reply.lastUuid)
+    : undefined;
+  if (pendingKey) {
+    pendingAbsorbedReplyDeliveries.set(pendingKey, { turn, uuids: reply.uuids });
+    if (pendingAbsorbedReplyDeliveries.size > PENDING_ABSORBED_REPLY_DELIVERIES_MAX) {
+      pendingAbsorbedReplyDeliveries.delete(pendingAbsorbedReplyDeliveries.keys().next().value!);
+    }
+  }
+  try {
+    // Live receipts may be dispatched as soon as the daemon's POST completes;
+    // initialize the unconfirmed state before handing the message over.
+    turn.absorbedReplyDelivered = false;
+    turn.absorbedReplyTextUuids = [];
+    send({
+      type: 'absorbed_reply',
+      turnId: turn.turnId,
+      ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      answer: reply.text,
+      replyUuid: reply.lastUuid,
+      source: reply.source,
+      // The folded turn has no other reply. Under transcript delivery, which
+      // posts no completion receipt, it stands as the turn's final.
+      ...(replyDeliveryMode() === 'transcript' ? { turnReply: true as const } : {}),
+    });
+  } catch (error) {
+    if (pendingKey) pendingAbsorbedReplyDeliveries.delete(pendingKey);
+    delete turn.absorbedReplyTextUuids;
+    throw error;
+  }
+  // A synchronous IPC throw above leaves the reply to the host. A live reply's
+  // text is excluded later, only by noteAbsorbedReplyDelivered. At turn end the
+  // host final has already gone out, so there is no later exclusion to wait for.
   turn.absorbedReplySent = true;
-  turn.absorbedReplyTextUuids = reply.source === 'text' && reply.text.length <= ABSORBED_REPLY_MAX_CHARS
-    ? reply.uuids : [];
+  if (when === 'at turn end') turn.absorbedReplyTextUuids = wholeText ? reply.uuids : [];
   log(`Folded turn ${turn.turnId.substring(0, 8)} answered ${when} (${reply.source}, ${reply.text.length} chars)`);
 }
 
@@ -13664,6 +13778,10 @@ function stopBridgeWatcher(): void {
   // is cleared below (an exit outside drainReliableTerminalBeforeInterrupt:
   // ordinary and adopt turns), as it would have been without the hold.
   if (bridgeJsonlPath && bridgeBaselineDone) {
+    // Teardown must not clear a host that is parked only in the in-memory ACK
+    // wait. Synchronously choose its no-loss fallback before clearPending();
+    // the release-held pass below still covers a final awaiting its marker.
+    for (const host of [...deferredAbsorbedReplyFinals.keys()]) timeOutDeferredAbsorbedReplyFinal(host);
     try { emitReadyTurns({ explicitTerminalOnly: true, releaseHeldTerminals: true }); } catch (err: any) {
       log(`Bridge held-terminal release failed: ${err.message}`);
     }
@@ -13825,12 +13943,7 @@ function bridgeDrainAndMaybeEmit(opts: { releaseHeldTerminals?: boolean } = {}):
  *
  *  Caches per-path drains so a batch of turns from the same file only reads
  *  the transcript once (O(jsonl size) per distinct path). */
-function emitReadyTurns(opts: {
-  explicitTerminalOnly?: boolean;
-  releaseHeldTerminals?: boolean;
-  /** Pass-through identity gate for the no-idle watchdog. */
-  onlyTurn?: { turnId: string; dispatchAttempt?: number };
-} = {}): void {
+function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
   // Retire the journal entries of turns the queue dropped head-of-line. These
   // never reach `ready`, so this must run BEFORE the empty-`ready` early return
   // below — a drop very often coincides with a tick that emits nothing.
@@ -13910,6 +14023,22 @@ function emitReadyTurns(opts: {
     // this worker generation. Re-freeze its exact journaled mode before the
     // final crosses workerIpcPayload, which deliberately ignores caller fields.
     rememberTurnLinkRefMode(turn.turnId, turn.dispatchAttempt, turn.linkRefMode);
+    // A release-held teardown pass must settle NOW, not create a new ACK wait
+    // immediately before clearPending(). Its unconfirmed uuid set is empty, so
+    // bypassing the wait takes the conservative full-final path.
+    if (!opts.releaseHeldTerminals && adoptMode && foldReplyEnabled() && turn.absorbedTurns?.length && hostWithPendingAbsorbedReply(turn)) {
+      // The live IPC and a batched terminal can be read in ONE worker stack.
+      // Wait for the daemon's actual POST rather than immediately including the
+      // same text in final_output and duplicating it when that POST succeeds.
+      // Failed hosts wait too: their timeout fallback is the folded turn's own
+      // final below, not the failed host's suppressed final.
+      deferAbsorbedReplyFinal(turn, opts);
+      const remaining = ready.slice(i);
+      bridgeQueue.restoreDrained(remaining);
+      for (const item of remaining) unsubmitted.add(item.turnId);
+      log(`Bridge final for turn ${turn.turnId.substring(0, 8)} waits for folded-reply delivery confirmation`);
+      break;
+    }
     // Claude API-error text is execution metadata, not a model answer. The
     // structured terminal below owns retry/attention; never leak the raw
     // provider error through transcript fallback (regardless of send markers).
@@ -13963,19 +14092,41 @@ function emitReadyTurns(opts: {
       explicitReplyMarkers,
     );
 
-    // A folded turn answered live while its host ran (observeAbsorbedReplies):
-    // its reply is out, so it settles without posting it a second time.
-    if (adoptMode && turn.absorbedReplySent) {
-      observedOutputTurns.add(turn);
-      continue;
-    }
-
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
     if (!path) continue;
     let drained = cache.get(path);
     if (!drained) {
       drained = drainTranscript(path, 0);
       cache.set(path, drained);
+    }
+    const absorbedHost = turn.absorbedIntoTurnId
+      ? ready.find(candidate => candidate.turnId === turn.absorbedIntoTurnId)
+      : undefined;
+    if (adoptMode && turn.absorbedReplySent && !turn.absorbedReplyDelivered
+      && absorbedHost?.terminalOutcome && absorbedHost.terminalOutcome.status !== 'completed') {
+      // A failed host has no final to provide the no-loss fallback. Once the
+      // original live reply has timed out without its delivery receipt, put
+      // this fold's own answer through the ordinary final_output path instead
+      // of settling it completed on an IPC handoff alone.
+      const reply = turn.absorbedReplyAmbiguous || !turn.absorbedAtUuid
+        ? undefined
+        : absorbedInputReplyText(drained.events, turn.absorbedAtUuid);
+      if (reply?.source === 'text') {
+        observedOutputTurns.add(turn);
+        emittedFinalOutputTurns.add(turn);
+        send({
+          type: 'final_output', content: reply.text, lastUuid: reply.lastUuid, turnId: turn.turnId,
+          ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+        });
+      }
+      continue;
+    }
+    // A folded turn handed over live while its host ran does not post another
+    // direct reply here. Its text stays in the host final unless the daemon
+    // confirmed that the live card was actually delivered.
+    if (adoptMode && turn.absorbedReplySent) {
+      observedOutputTurns.add(turn);
+      continue;
     }
     // Adopt: a message Claude Code folded into the running turn has no reply
     // of its own — everything after it is attributed to the host turn — so
@@ -13986,8 +14137,10 @@ function emitReadyTurns(opts: {
       const reply = turn.absorbedReplyAmbiguous
         ? undefined
         : absorbedInputReplyText(drained.events, turn.absorbedAtUuid);
-      // The host's final, posted before this, already says it all: the answer
-      // goes out once, there, whole and with the host's own delivery.
+      // Text is the only source the host's joined final can carry. Require an
+      // actual uuid subset too: after a sessionId rotation the fold may come
+      // from a NEW jsonl while the host still drains the OLD one, so `carried`
+      // cannot contain the answer and this turn must post its own reply.
       const carried = turn.absorbedHostFinalUuids;
       if (reply?.source === 'text' && carried && reply.uuids.every(uuid => carried.has(uuid))) {
         observedOutputTurns.add(turn);
@@ -13999,9 +14152,10 @@ function emitReadyTurns(opts: {
       continue;
     }
     const set = new Set(turn.assistantUuids);
-    // Adopt: what already went out live as the reply to a message folded into
-    // this turn is not posted again in this turn's own final.
-    const liveReplyUuids = adoptMode && foldReplyEnabled() ? liveFoldedReplyUuids(turn) : undefined;
+    // Actual delivery is a historical fact: keep confirmed live text out even
+    // if the switch has since been turned off. Unconfirmed replies have an empty
+    // uuid set, so switching off still leaves their text in this final.
+    const liveReplyUuids = adoptMode ? liveFoldedReplyUuids(turn) : undefined;
     const matched = drained.events.filter(e => e.uuid && set.has(e.uuid) && !liveReplyUuids?.has(e.uuid));
     /** This turn's final went out, `whole` or cut: folded turns whose answer
      *  it carries whole into the chat settle on it (see the folded branch). */
@@ -40988,6 +41142,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         }
       }
       lastInitConfig = msg;
+      resetFollowUpReplyStateForInit();
       antigravityQuotaHistory = msg.antigravityQuotaHistory;
       unconfirmedAntigravityQuotas = new Map();
       const restoredQuota = msg.antigravityActiveQuota;
@@ -42779,10 +42934,14 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'set_follow_up_reply': {
-      // The dashboard flipped the bot's mid-turn reply switch. The daemon
-      // gates posting on it live, so the worker follows: off, a folded turn's
-      // reply stays in its host's final instead of being dropped from both.
+      // Any config entry point flipped the bot's mid-turn reply switch. The
+      // daemon gates posting on it live, so the worker follows the same value.
       setFollowUpReplyLive(msg.enabled);
+      break;
+    }
+
+    case 'absorbed_reply_delivered': {
+      noteAbsorbedReplyDelivered(msg.turnId, msg.dispatchAttempt, msg.replyUuid);
       break;
     }
 

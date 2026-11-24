@@ -54,6 +54,7 @@ import {
   notifyPinStreamingCardChanged,
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
+import { notifyFollowUpReplyChanged } from './follow-up-reply-change.js';
 import {
   normalizeHiddenStreamingCardButtons,
   resolveStreamingCardFoldedLayout,
@@ -618,6 +619,7 @@ async function updateBotCardPrefsInternal(
   if (patch.pinStreamingCard !== undefined && previousPinStreamingCard !== nextPinStreamingCard) {
     notifyPinStreamingCardChanged(larkAppId, nextPinStreamingCard);
   }
+  if (patch.followUpReply !== undefined) notifyFollowUpReplyChanged(larkAppId, r.result.followUpReply);
   logger.info(
     `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
     `disableStreamingCard=${r.result.disableStreamingCard} ` +

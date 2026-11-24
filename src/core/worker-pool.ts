@@ -28053,6 +28053,18 @@ function setupWorkerHandlers(
             recordTurnTerminalCarrier(ds, msg.turnId, { messageId: result.value, kind: 'non_patchable', responseKind: 'final' });
             noteFinalOutputReceipt(ds, msg.turnId, { text: msg.answer });
           }
+          // IPC arrival is not delivery. Only the successful POST lets the
+          // producer exclude this text from its host final. Address the exact
+          // producer, not a replacement that may now own ds.worker.
+          try {
+            if (!worker.killed) worker.send({
+              type: 'absorbed_reply_delivered', turnId: msg.turnId,
+              ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+              replyUuid: msg.replyUuid,
+            });
+          } catch (error) {
+            logger.debug(`[${t}] Follow-up reply delivery receipt not sent: ${error instanceof Error ? error.message : String(error)}`);
+          }
         } finally {
           finishDelivery();
         }

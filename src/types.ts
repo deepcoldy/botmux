@@ -2395,6 +2395,9 @@ type DaemonToWorkerBase =
   | { type: 'set_locale'; locale: 'zh' | 'en' }
   /** The bot's followUpReply switch changed while this worker runs. */
   | { type: 'set_follow_up_reply'; enabled: boolean }
+  /** A non-progress folded-turn reply was actually delivered by the daemon.
+   *  Only this receipt lets the worker leave its text out of the host final. */
+  | { type: 'absorbed_reply_delivered'; turnId: string; dispatchAttempt?: number; replyUuid: string }
   | { type: 'term_action'; key: TermActionKey }
   /** Exact turn-level interruption. The worker verifies `turnId` against its
    * own active turn before injecting Ctrl+C and acknowledges the result. */
