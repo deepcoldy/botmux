@@ -104,10 +104,11 @@ function defaultDeps(dataDir: string, creatorAppId: string): CollabPreflightDeps
       const found = loadBotConfigsCached().find(c => c.larkAppId === appId);
       return found ? { exists: true, apiOnly: found.apiOnly === true } : undefined;
     },
-    // PR-3b-2 B：gate 已接入 + 全链路测试绿后，生产 defaultDeps 切回真实 peer preflight。
-    // 测试经 __testOnly_setCollabPeerPreflight 注入 {ok:true} 验证 ready 分支；生产走
-    // realCollabPeerPreflight（逐 peer findOnlineDaemon + collab.preflight）。
-    peerPreflight: __testOnlyPeerPreflight ?? (async (ctx: CollabPeerPreflightContext) => realCollabPeerPreflight(ctx)),
+    // S2-S5 编排尚未接入生产（startCollabGroupBirth 只跑 S1），若切回真实 preflight 会让
+    // 合法 enabled 配置走 ready → 扣费 → S1 后运行链断裂、同 DM busy、永远无法完成
+    // （违反铁律2「全链路测试绿后才切回」）。生产 defaultDeps 保持 fail-closed；测试经
+    // __testOnly_setCollabPeerPreflight 注入 {ok:true} 验证 ready 分支。
+    peerPreflight: __testOnlyPeerPreflight ?? (async () => ({ ok: false, errors: ['协作初始化 S2-S5 编排未接入生产，生产 fail-closed'] })),
   };
 }
 
