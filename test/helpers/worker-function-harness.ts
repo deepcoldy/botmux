@@ -148,6 +148,7 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'publishedActiveRuntimeSeeded') {
     return (scope.publishedActiveRuntimeSeeded ??= false);
   }
+  if (key === 'cliRestartEpoch') return (scope.cliRestartEpoch ??= 0);
   if (key === 'deferredSessionReady') return (scope.deferredSessionReady ??= []);
   return undefined;
 }

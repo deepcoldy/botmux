@@ -284,6 +284,8 @@ export interface DaemonSession {
    *  resolved launch model so that recovery does not relaunch on a stale one.
    *  Cleared when a worker generation reports ready. In-memory only. */
   crashDiagnosticParked?: boolean;
+  /** Safe startup circuit reason; cleared only when a new launch is attempted. */
+  cliStartupFailureReason?: string;
   /** Daemon-side bounded auto-retry state for TRANSIENT worker startup
    *  failures (e.g. "spawnSync tmux ETIMEDOUT" during a post-outage restart
    *  storm — see worker-startup-retry.ts). `attempts` counts the current

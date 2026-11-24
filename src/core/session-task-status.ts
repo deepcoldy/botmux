@@ -157,6 +157,7 @@ export function deriveSessionTaskStatus(input: FactsInput, now: number = Date.no
   if (facts.pendingRepo) return needsYou('pending_repo');
   if (status === 'limited') return needsYou('limited');
   if (status === 'stalled') return needsYou('stalled');
+  if (status === 'interrupted') return needsYou('interrupted', attention?.reason ?? currentLastTurn(facts)?.errorCode, attention?.at);
   // daemon 自己举的手（失败卡、最终回复投递失败、续跑失败、审核拦截等）都是这一轮没走完。
   if (attention) return needsYou('interrupted', attention.reason, attention.at);
   if (busy) {

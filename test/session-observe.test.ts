@@ -60,6 +60,18 @@ describe('session-observe normalizer', () => {
     expect(observe.raw).toBeUndefined();
   });
 
+  it.each([undefined, { kind: 'blocked', reason: 'CLI startup failed (exit code 1)', at: OBSERVED_AT }])(
+    'does not call a dead CLI working while its diagnostic worker remains alive: %j', attention => {
+      const observe = normalizeSessionRow(makeRow({ status: 'interrupted', agentAttention: attention }), {
+        observedAt: OBSERVED_AT, includeTask: true,
+      });
+      expect(observe.schemaVersion).toBe(1);
+      expect(observe.turn).toBe('interrupted');
+      expect(observe.task).toMatchObject({ kind: 'needs_you', reason: 'interrupted' });
+      if (attention) expect(observe.task?.detail).toBe(attention.reason);
+    },
+  );
+
   it('maps an idle row to alive/idle', () => {
     const observe = normalizeSessionRow(
       makeRow({ status: 'idle', queued: false }),

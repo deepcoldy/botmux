@@ -8427,9 +8427,11 @@ export function scheduleCardPatch(
   if (opts?.onSettled) pendingStreamingCardPatchSettlement.set(ds, opts.onSettled);
   const cardFence = captureStreamingCardPatchFence(ds, cardId, turnId);
   pendingStreamingCardPatchFence.set(ds, () => cardFence() && (!opts?.owns || opts.owns()));
-  const renderJson = startingCardHealthStalledStatus(ds, turnId)
-    ? buildStreamingCardJson(ds, 'stalled')
-    : cardJson;
+  const renderJson = ds.cliStartupFailureReason
+    ? buildStreamingCardJson(ds, 'interrupted')
+    : startingCardHealthStalledStatus(ds, turnId)
+      ? buildStreamingCardJson(ds, 'stalled')
+      : cardJson;
   ds.pendingCardJson = renderJson;
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
   // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
@@ -9645,6 +9647,7 @@ export function requestSessionRestart(
               replyDelivery: latestReplyDeliveryForRespawn(ds),
               ...latestLaunchCommandsForRespawn(ds),
               ...(nextStatuslineLaunchGen ? { statuslineLaunchGen: nextStatuslineLaunchGen } : {}) }) } as DaemonToWorker);
+          ds.cliStartupFailureReason = undefined;
         } catch (sendError) {
           // IPC send failed before the worker was told to respawn: roll back
           // the pre-persisted launch model so the still-running CLI keeps its
@@ -9718,7 +9721,7 @@ export function __testOnly_resetRestartCoordinator(): void {
  * showing the last startup output and respawns the CLI itself on the next
  * message. Shared by the crash-loop give-up and the backend-outage give-up.
  */
-function parkCrashDiagnosticWorker(ds: DaemonSession, opts: { terminal?: boolean } = {}): void {
+function parkCrashDiagnosticWorker(ds: DaemonSession, opts: { terminal?: boolean; failPending?: boolean } = {}): void {
   // Ask the worker to park a lightweight tmux diagnostic shell under
   // bmx-diag-<sid> NOW (deferred from its exit so transient restarts
   // don't pay for it). Keep its web server alive so the existing
@@ -9730,7 +9733,7 @@ function parkCrashDiagnosticWorker(ds: DaemonSession, opts: { terminal?: boolean
   // next message must carry the current launch model. Cleared once a
   // worker generation reports ready again.
   ds.crashDiagnosticParked = true;
-  ds.worker!.send({ type: 'park_diagnostic', ...(opts.terminal === false ? { terminal: false } : {}) } as DaemonToWorker);
+  ds.worker!.send({ type: 'park_diagnostic', ...(opts.terminal === false ? { terminal: false } : {}), ...(opts.failPending ? { failPending: true } : {}) } as DaemonToWorker);
   restartCounts.delete(ds.session.sessionId);
   const crashPrevScreenStatus = ds.lastScreenStatus;
   ds.lastScreenStatus = 'idle';
@@ -13714,6 +13717,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
     resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
+    ds.cliStartupFailureReason,
   );
 }
 
@@ -18047,6 +18051,7 @@ export function sendWorkerInput(
       rollbackIdleRetry();
       return false;
     }
+    if (ds.crashDiagnosticParked) ds.cliStartupFailureReason = undefined;
   } catch {
     rollbackAcceptedCodexAppDispatch(
       ds,
@@ -21178,6 +21183,7 @@ function setupWorkerHandlers(
   // （127/77）就会被直接熔断，连自己唯一的一次重启机会都拿不到。in-worker 的
   // CLI 崩溃自动重启不换 worker、不经过这里，#2551 的快速退出循环熔断照常。
   restartCounts.delete(ds.session.sessionId);
+  ds.cliStartupFailureReason = undefined;
   // Tier authority belongs to this exact worker generation. Start unknown and
   // wait for the new worker's rollout-bound observation; this also clears a
   // Codex badge before a role switch starts a non-Codex worker.
@@ -23678,6 +23684,10 @@ function setupWorkerHandlers(
         // and wait for the NEXT set instead of trusting a stale `true`.
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
+        if (ds.lastScreenStatus === 'interrupted' && !ds.cliStartupFailureReason) {
+          ds.lastScreenStatus = 'idle';
+          bumpStreamCardStatusRevision(ds);
+        }
         const recoveringParkedDiagnostic = ds.crashDiagnosticParked === true;
         if (recoveringParkedDiagnostic) {
           // The next-message retry respawns INSIDE the existing worker, so no
@@ -23872,6 +23882,12 @@ function setupWorkerHandlers(
         // blocked as `worker_busy`.
         if (restartSettled && validSettingReceipt && msg.status === 'succeeded') {
           ds.workerReady = true;
+          // A correlated ready receipt proves the replacement exists. Do not
+          // keep its predecessor's physical-exit status fencing fork/relay.
+          if (ds.lastScreenStatus === 'interrupted' && !ds.cliStartupFailureReason) {
+            ds.lastScreenStatus = 'idle';
+            bumpStreamCardStatusRevision(ds);
+          }
         }
         if (restartSettled && currentSettingsAttempt) {
           if (msg.untouched) {
@@ -25238,6 +25254,8 @@ function setupWorkerHandlers(
         // pair that issued it. A delayed message from a replaced Node worker
         // must neither clear nor restart the replacement generation.
         const workerSession = ds.session;
+        const exitedRuntime = controllerForSession(ds)?.currentRuntime();
+        const restartAtExit = restartCoordinator.activeAttemptId(ds.session.sessionId);
         if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
@@ -25268,6 +25286,16 @@ function setupWorkerHandlers(
         // exit) is covered — a later prompt_ready can only come from the next
         // generation. The monotonic counter is deliberately left untouched.
         ds.cliReady = false;
+        // A living Node worker is not evidence of a living CLI. Publish the
+        // physical loss before any async reconciliation / restart decision.
+        if (!isRemoteBackendSession(ds) && !isSharedAdoptSession(ds)) {
+          ds.lastScreenStatus = 'interrupted';
+          bumpStreamCardStatusRevision(ds);
+          clearUsageRefreshTimer(ds);
+          dashboardEventBus.publish({ type: 'session.update', body: {
+            sessionId: ds.session.sessionId, patch: { status: 'interrupted' },
+          } });
+        }
         // The live-send capability dies with this backend. Preserve the
         // worker-generation policy capability only while this local worker is
         // still eligible for same-worker crash recovery. Branches that cannot
@@ -25312,6 +25340,8 @@ function setupWorkerHandlers(
           ds.worker !== worker
           || ds.workerGeneration !== workerGeneration
           || ds.session !== workerSession
+          || (exitedRuntime && !sameRuntime(exitedRuntime, controllerForSession(ds)?.currentRuntime()))
+          || (exitedRuntime && restartAtExit !== restartCoordinator.activeAttemptId(ds.session.sessionId))
           || isSessionTransferring(ds)
         ) {
           logger.warn(`[${t}] Suppressed stale claude_exit lifecycle continuation`);
@@ -25558,10 +25588,35 @@ function setupWorkerHandlers(
           prev: restartCounts.get(key),
           now: Date.now(),
           code: msg.code,
+          startupFailure: msg.startupFailure,
         });
         if (decision.shouldRestart) {
           restartCounts.set(key, decision.next);
         } else {
+          if (decision.reason === 'startup_failure') {
+            // Only safe numeric exit evidence leaves the host. CLI stderr may
+            // contain tokens, command-line prompts or provider credentials.
+            const reason = tr('worker.startup_circuit_stopped', {
+              cliName: sessionCliDisplayName(ds, botCfg), code: msg.code ?? '?',
+            }, loc);
+            ds.cliStartupFailureReason = reason;
+            ds.managedTurnOrigin = undefined;
+            resetStartingCardHealth(ds);
+            restartCoordinator.failSession(key);
+            parkCrashDiagnosticWorker(ds, { terminal: false, failPending: true });
+            ds.lastScreenStatus = 'interrupted';
+            bumpStreamCardStatusRevision(ds);
+            raiseDaemonAttention(ds, 'blocked', reason, msg.turnId);
+            publishAttentionPatch(ds);
+            if (!suppressExitUi && !ds.suppressRecoveryCard) {
+              scheduleCardPatch(ds, buildStreamingCardJson(ds, 'interrupted'));
+              // Each explicit next-message retry owns a new bounded batch,
+              // even though it reuses this Node worker's startupState.
+              startupState.failureNotified = false;
+              await notifyStartupFailure(reason, msg.turnId, msg.dispatchAttempt);
+            }
+            break;
+          }
           const rc = decision.next;
           restartCounts.set(key, rc);
           ds.managedTurnOrigin = undefined;

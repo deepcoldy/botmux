@@ -750,6 +750,20 @@ describe('contract gateway and real worker boundaries', () => {
       expect(controller.allowsInput()).toBe(false);
     } finally { scope.restartCoordinator.reset(); }
   });
+  it('admits startup exit with an argv opening turn not yet bound by a transcript start', async () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('argv-opening-turn');
+    const legacy = vi.fn(); const worker = { send: vi.fn() }; s.ds.worker = worker as any;
+    const env: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'startup-exit', handleLegacyWorkerMessage: legacy };
+    const handle = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', env);
+    await handle({ type: 'claude_exit', code: 1, turnId: execution.turnId,
+      sessionContract: s.context(1, { runtime: s.runtime, execution }) });
+    expect(legacy).toHaveBeenCalledWith(expect.objectContaining({ type: 'claude_exit', code: 1 }));
+    expect(s.store.runtime(s.ref)?.phase).toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)?.runtime).toBeUndefined();
+  });
+
   it('records predecessor loss as history in the reserve-only window and still handles the later current crash', async () => {
     const s = fixture(); const execution = s.controller.admitInput('old-turn'); s.store.bindQueuedExecution(s.ref, execution, s.runtime);
     s.controller.ingest({ type: 'ready', sessionContract: s.context(1, {}) }, s.worker);
