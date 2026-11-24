@@ -16,6 +16,7 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     codexBridgeQueue: queue,
     backgroundTaskTracker: { pendingTurnAgents: () => 0 },
     structuredBridgeIs: (id: string) => id === cliId,
+    antigravityPendingRebind: false,
     antigravityBridgeState: () => ({}),
     hasAntigravityPendingTasks: () => false,
     idleDetector: { programStatusHeldBusy: () => false },
@@ -25,6 +26,7 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     ptyOutputGeneration: new PtyOutputGeneration(),
     lastStructuredBridgeActivityAtMs: 0,
     cliSpawnGeneration: 1,
+    structuredTurnsWithSubmitNotice: new Set<string>(),
     structuredMissingFinalWatchdog: new StructuredMissingFinalWatchdog(),
     codexBridgeIngest: vi.fn(),
     dropPendingTurn: undefined,
@@ -78,9 +80,13 @@ describe('worker: missing structured final timeout', () => {
 
   it('does not run in send mode, after stop, or after a native final', () => {
     const send = workerRig('codex', { delivery: 'send' });
-    vi.spyOn(Date, 'now').mockReturnValue(100_000);
+    const clock = vi.spyOn(Date, 'now');
+    clock.mockReturnValue(0);
+    send.settle();
+    clock.mockReturnValue(20_000);
     send.settle();
     expect(send.queue.peek()).toHaveLength(1);
+    expect(send.scope.send).not.toHaveBeenCalled();
 
     const stopped = workerRig('doubao');
     vi.spyOn(Date, 'now').mockReturnValue(0);
@@ -123,6 +129,42 @@ describe('worker: missing structured final timeout', () => {
     r.settle();
     expect(r.queue.peek()).toEqual([]);
     expect(r.scope.emitTurnTerminal.mock.calls).toEqual([['om_turn', 'ambiguous', 'structured_final_not_collected', 2]]);
+  });
+
+  it('does not time out while an authoritative Antigravity rebind is pending', () => {
+    const r = workerRig('antigravity');
+    const clock = vi.spyOn(Date, 'now');
+    r.scope.antigravityPendingRebind = true;
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(100_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    expect(r.scope.codexBridgeIngest).not.toHaveBeenCalled();
+    expect(r.scope.send).not.toHaveBeenCalled();
+
+    // Once the authoritative file is bound, the same owner gets a fresh full
+    // window; clearing rebind does not inherit the frozen 100 seconds.
+    r.scope.antigravityPendingRebind = false;
+    r.settle();
+    clock.mockReturnValue(120_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
+  });
+
+  it('suppresses a duplicate IM warning but retires the working display when a submit notice exists', () => {
+    const r = workerRig('doubao');
+    const clock = vi.spyOn(Date, 'now');
+    r.scope.structuredTurnsWithSubmitNotice.add('om_turn');
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
+    expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([{
+      type: 'turn_display_retired', turnId: 'om_turn', message: 'worker.structured_final_not_collected',
+    }]);
+    expect(r.scope.structuredTurnsWithSubmitNotice.size).toBe(0);
   });
 
   it('resets the wait on output and supports a lifecycle-blocked rejected idle edge', () => {

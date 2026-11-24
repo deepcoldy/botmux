@@ -16928,6 +16928,10 @@ function structuredMissingFinalTarget(): StructuredMissingFinalTarget | undefine
   if (replyDeliveryMode() !== 'transcript' && !zeroPromptTerminalSync()) return undefined;
   const turn = codexBridgeQueue.peek()[0];
   if (!turn?.started || turn.finalText !== undefined || turn.isLocal) return undefined;
+  // The authoritative replacement transcript is not bound yet. Ingest and the
+  // existing Antigravity quiet flush both bail here, so a timeout cannot prove
+  // that the final is absent from the unbound file either.
+  if (structuredBridgeIs('antigravity') && antigravityPendingRebind) return undefined;
   if (backgroundTaskTracker.pendingTurnAgents() > 0) return undefined;
   if (structuredBridgeIs('antigravity') && hasAntigravityPendingTasks(antigravityBridgeState())) return undefined;
   if (idleDetector?.programStatusHeldBusy()) return undefined;
@@ -16975,7 +16979,17 @@ function maybeSettleMissingStructuredFinal(): void {
   }
   retireStructuredTurnAttribution([dropped]);
   if (turn.dispatchAttempt === undefined) {
-    notifyMissingFinalTurn(turn.turnId);
+    if (structuredTurnsWithSubmitNotice.delete(turn.turnId)) {
+      // This exact input already got its own submit notice. Do not post a second
+      // warning card, but still close any eagerly published working display.
+      send({
+        type: 'turn_display_retired',
+        turnId: turn.turnId,
+        message: t('worker.structured_final_not_collected', { cliName: cliName() }),
+      });
+    } else {
+      notifyMissingFinalTurn(turn.turnId);
+    }
   }
   // Dropping the dead head can replay a buffered successor user/final pair.
   emitReadyCodexTurns();
