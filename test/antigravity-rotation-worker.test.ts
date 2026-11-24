@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { annotateAntigravityUsageLimit } from '../src/adapters/cli/antigravity.js';
@@ -64,7 +64,7 @@ async function setupRotationScenario(input: {
   session.lastUserPrompt = 'do work';
   session.lastCliInputTurnId = 'turn-1';
   session.antigravityAccountId = 'acc1';
-  session.cliSessionId = 'native-rotation-conversation';
+  session.cliSessionId = 'a4331552-f261-4f1f-a460-e15e7f2fe0ea';
   session.lastFailedTurn = {
     turnId: 'turn-1',
     cliInput: 'do work',
@@ -103,6 +103,7 @@ async function setupRotationScenario(input: {
     lastUserPrompt: 'do work',
     lastCliInputTurnId: 'turn-1',
     antigravityAccountId: 'acc1',
+    localProcessAttestation: { cliPid: process.pid },
   };
   setActiveSessionsRegistry(new Map([[activeSessionKey(ds as never), ds]]));
   const nowMs = Date.now();
@@ -131,6 +132,8 @@ async function setupRotationScenario(input: {
     step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE',
     content: '<USER_REQUEST>\ndo work\n</USER_REQUEST>',
   }) + '\n');
+  const transcriptFd = openSync(transcriptPath, 'r');
+  cleanups.push(() => closeSync(transcriptFd));
   const flush = async () => {
     for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 0));
   };
@@ -561,6 +564,39 @@ describe('Antigravity worker-pool replay safety', () => {
     const stored = h.sessionStore.getSessionFresh(h.ds.session.sessionId);
     expect(stored?.usageLimit?.directFailure).toBeUndefined();
     expect(stored?.lastFailedTurn?.directFailure).toBe(true);
+
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(0);
+  });
+
+  it('uses the attested CLI PID rather than the worker PID for settlement proof', async () => {
+    const h = await setupRotationScenario({ directFailure: true });
+    const restart = await emitQuotaAndStart(h);
+    h.ds.worker.pid = 999999;
+    delete h.ds.session.cliSessionId;
+
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(1);
+  });
+
+  it.each(['no-attestation', 'missing', 'ambiguous', 'stored-conflict'] as const)('rejects settlement without a unique attested current identity (%s)', async mode => {
+    const h = await setupRotationScenario({ directFailure: true });
+    const restart = await emitQuotaAndStart(h);
+    if (mode === 'no-attestation') delete h.ds.localProcessAttestation;
+    if (mode === 'missing') h.ds.localProcessAttestation.cliPid = 999999;
+    if (mode === 'ambiguous') {
+      const otherPath = join(process.env.HOME!, '.gemini', 'antigravity-cli', 'brain',
+        '61fc8ef7-1886-40af-9bac-c6ee8f8d172e', '.system_generated', 'logs', 'transcript_full.jsonl');
+      mkdirSync(dirname(otherPath), { recursive: true });
+      writeFileSync(otherPath, '');
+      const otherFd = openSync(otherPath, 'r');
+      cleanups.push(() => closeSync(otherFd));
+    }
+    if (mode === 'stored-conflict') h.ds.session.cliSessionId = '61fc8ef7-1886-40af-9bac-c6ee8f8d172e';
 
     h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
     h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
