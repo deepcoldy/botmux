@@ -7156,9 +7156,13 @@ async function preflightTraexAutoModelBeforeSpawn(
 
   const startedAtMs = Date.now();
   let snapshot: TraexModelLoadSnapshot | null = null;
-  // 重启时 cfg 仍携带创建会话的首轮 ID；commitSwitch 已将控制器推进到当前回合。
-  // 预检围栏、目录清理和候选重选必须共用当前归属，避免误判 superseded 或退回首轮。
-  const ownerTurnId = controller.currentTurnId() ?? cfg.turnId;
+  // Fresh init 的 prompt/turnId 属于新回合；恢复运行时可能仍带旧 recovery turn，
+  // 且 beginTurn 的重选动作可能尚未提交，不能让旧回合接管目录归属。
+  // Promptless in-worker restart 则相反：cfg 仍是首轮 ID，控制器已经 commitSwitch 到当前回合。
+  // 两种入口分别选择归属，预检围栏、目录清理和候选重选共用同一结果。
+  const ownerTurnId = cfg.prompt
+    ? cfg.turnId ?? controller.currentTurnId()
+    : controller.currentTurnId() ?? cfg.turnId;
   // 后续回合的派发次数取自保留的排队项，不能继承首轮的 attempt。
   const ownerInput = pendingMessages.find(item => item.turnId === ownerTurnId);
   const ownerDispatchAttempt = ownerInput ? ownerInput.dispatchAttempt
