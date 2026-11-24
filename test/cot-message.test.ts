@@ -19,7 +19,7 @@ vi.mock('../src/bot-registry.js', () => ({
 import { mkdtempSync, existsSync, readdirSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
+import { handleCotThinkingUpdate, finalizeCotMessage, cotMessageFinishStatus, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
 import { getBot } from '../src/bot-registry.js';
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import { t, localeForBot } from '../src/i18n/index.js';
@@ -802,6 +802,18 @@ describe('finalizeCotMessage', () => {
     await settleCotMessageForShutdown(ds);
     await flush();
     expect(request.mock.calls.length).toBe(calls);
+  });
+
+  it('reports the first finish status for the exact turn and attempt', () => {
+    const ds = makeDs();
+    expect(cotMessageFinishStatus(ds, { turnId: 'om_turn1', dispatchAttempt: 1 })).toBeUndefined();
+    finalizeCotMessage(ds, 'om_turn1', 'failed', 1);
+    expect(cotMessageFinishStatus(ds, { turnId: 'om_turn1', dispatchAttempt: 1 })).toBe('interrupted');
+    finalizeCotMessage(ds, 'om_turn1', 'completed', 1);
+    expect(cotMessageFinishStatus(ds, { turnId: 'om_turn1', dispatchAttempt: 1 })).toBe('interrupted');
+    finalizeCotMessage(ds, 'om_turn1', 'completed', 2);
+    expect(cotMessageFinishStatus(ds, { turnId: 'om_turn1', dispatchAttempt: 2 })).toBe('done');
+    expect(cotMessageFinishStatus(ds, { turnId: 'om_other', dispatchAttempt: 1 })).toBeUndefined();
   });
 
   it('returns false for unknown turns and disabled states', async () => {

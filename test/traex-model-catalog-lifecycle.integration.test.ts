@@ -294,7 +294,7 @@ function connectWorker(h: ReturnType<typeof hostFixture>, dispatchAttempt?: numb
   const c = new TraexAutoModelController(pool); c.beginTurn('om_turn');
   const cfg: any = { traexAutoModel: structuredClone(pool), turnId: 'om_turn', dispatchAttempt };
   const jobs: Promise<void>[] = [];
-  const scope: any = { lastInitConfig: cfg, pendingTraexModelPoolPrunes: new Map(), randomUUID,
+  const scope: any = { lastInitConfig: cfg, pendingMessages: [], pendingTraexModelPoolPrunes: new Map(), randomUUID,
     traexAutoModelRuntimeEligible: () => true,
     traexAutoModelPolicyKey, send: vi.fn(), t: (key: string) => key,
     process: { send: vi.fn((msg: any) => { jobs.push(h.handle(msg)); }) } };

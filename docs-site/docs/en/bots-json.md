@@ -78,6 +78,7 @@ Two bots, one on Claude Code and one on Codex:
 | Start working without being @-mentioned | `autoStartOnNewTopic`, `autoStartOnGroupJoin` |
 | DM the owner a welcome message when the bot first comes online | `welcomeMessage` (see [Welcome message](#welcome-message)) |
 | Watch an alert group and handle every alert | Group message listener (see [Group message listener](#message-listener)) |
+| Continue on another CLI / model when quota runs out | `quotaFallbackChain` |
 | Hand off to another bot when quota runs out | `quotaFallbackBot` |
 | Stop botmux from adding anything to the prompt | `promptInjection: "none"` |
 | Control how much memory sessions use | `maxLiveWorkers`, `idleSuspendMinutes` |
@@ -119,6 +120,7 @@ The optional `brand` says which platform the app belongs to: `feishu` (default, 
 | `customPassthroughCommands` | Extra slash commands passed through to the CLI, e.g. `["/export"]`. Entries that would clash with botmux's own commands are dropped. `/list-slash-command` shows the full list. See [Slash commands](/en/slash-commands) |
 | `bareRenamePassthrough` | Off by default. When `true`, a `/rename` without a title goes to the CLI as is, and the CLI names the session from the conversation (Claude Code only for now, adopted sessions included). See [Slash commands](/en/slash-commands#rename-cli) |
 | `startupCommands` | Commands sent to the CLI after it starts and before the first message, e.g. `["/effort ultracode"]`. Re-sent on every fresh start and resume |
+| `quotaFallbackChain` | When CLI quota runs out, the same bot moves the session to the next CLI / model and continues. Off by default. See [Quota CLI / model switch](#quota-fallback-chain) below |
 | `quotaFallbackBot` | Hand the session to another bot when CLI quota runs out. Off by default. See [Quota handoff](#quota-fallback) below |
 | `codexCapacityRecovery` | Codex / Codex App only: automatically continue after an explicit model-capacity error. Off by default; at most two recovery inputs per task. Ordinary rate limits and exhausted quota don't count |
 | `suppressDeliveredFinalFailureNotice` | Experimental, off by default. Once a turn's final answer has been delivered, a later model-service error no longer posts a "model connection failed" notice |
@@ -155,6 +157,39 @@ This only affects new subagents created by TraeX's native `spawn_agent`, not the
 - Leaving both out: delete the whole field. `inherit` is not a valid mode.
 
 Switching to another CLI removes this field automatically.
+
+### Quota CLI / model switch {#quota-fallback-chain}
+
+With `quotaFallbackChain`, when a session hits a quota limit the same bot moves it, in place, to the next CLI and model and continues the interrupted request. The chain starts from the bot's own `cliId` and `model` and walks `steps` in order.
+
+```json
+{
+  "cliId": "claude-code",
+  "model": "claude-opus-5-5",
+  "quotaFallbackChain": {
+    "enabled": true,
+    "kinds": ["usage", "rate"],
+    "steps": [
+      { "cliId": "traex", "model": "GPT-6.1-Sol" },
+      { "cliId": "traex", "model": "DeepSeek-V4.1-Flash" }
+    ]
+  }
+}
+```
+
+| Field | Description |
+|------|------|
+| `enabled` | Only `true` turns it on |
+| `kinds` | `usage` (usage cap) and/or `rate` (rate limit); both if omitted. Claude Code quota exhaustion is only recognized as `rate`, so with `usage` alone Claude never switches |
+| `steps` | Ordered switch steps, each with a `cliId`; omit `model` to use that CLI's default model. A step that stays on the same CLI must name a model |
+
+Good to know:
+
+- A rate limit without a reset time (e.g. a bare 429) is first retried on the same CLI 5 times, with the delay doubling from 30 seconds; a limit with a reset time or a quota error code switches at once.
+- A model change on the same CLI resumes the native conversation. A CLI change starts a new native conversation whose first message is a handoff: read the previous CLI's session file, then the topic with `botmux history`, check the working directory, and continue the interrupted request from where it stopped.
+- The continued request runs as its original sender and replies in the original topic; a notice is posted once the switch is done. When the switch cannot start (for example a newer message is already waiting, or the original sender is unknown), the usual owner notice and backup-bot handoff happen instead.
+- A different CLI starts with its own local sign-in and without this bot's `env`. The chain cannot return to a CLI it has left.
+- A session only moves forward and never switches back; it stays on its step across daemon restarts. New sessions start from the bot's own configuration.
 
 ### Quota handoff {#quota-fallback}
 
@@ -494,6 +529,7 @@ Rules:
 - When someone who hasn't authorized makes a call, the command is refused and the refusal carries an authorization link. The AI can also send that person a link itself with `botmux auth request` (see [Agent-initiated authorization](/en/cli-commands#agent-auth-request)), or ask them to send `/login` in the topic. Retry after authorizing.
 - It never falls back to running as the bot or as anyone else, and there is no machine-login fallback option; a legacy `fallback` field in old configs is ignored. `bytedcli` has no bot identity, so an unauthorized call simply fails.
 - Optional fields: `credentialSource` (`auto` by default / `platform` [central platform](/en/platform) only / `local` local QR login only), `delegateOnMention` (default `true`, see [Carry the sender over on @ handoffs](/en/permissions#delegate-on-mention)), `allowSpeakerSwitch` (default `false`: when `true`, a multi-speaker topic lets you prefix a single command with `BOTMUX_AS=<open_id>` to run it as another speaker of the current turn; when off, the default, `BOTMUX_AS` is always refused), `gitHost` (git pushes to that code host also authenticate as the current turn's sender).
+- Set `triggerUserAuth.gitCommitIdentity: true` on a shared Linux host to use the verified turn actor as the default Git author and committer for `commit`, `commit-tree`, `merge`, `cherry-pick`, `revert`, `rebase`, `am` and `pull`. The session PATH wrapper resolves the actor on each invocation and refuses these commands if verification fails (including fast-forward pulls). Git retains original authors during replay and honors explicit identity overrides. Ambient `GIT_AUTHOR_*` / `GIT_COMMITTER_*` identity environment variables are cleared on the governed path so shell profiles cannot override the attested actor. Absolute Git paths and aliases are outside this wrapper’s coverage. Governed commands do not currently support `BOTMUX_AS` and refuse it. Oncall with networking disabled, or slirp isolating the daemon loopback, is rejected at session startup. The option defaults to false and takes effect on session spawn; it is also available as a toggle in the bot's Security section of the Dashboard.
 
 #### Upgrade note: old-format authorizations need a fresh `/login` {#legacy-user-token}
 
@@ -514,6 +550,7 @@ What the cards look like and what each switch does: see [Live streaming cards](/
 | `pinStreamingCard` | `true` pins the current live status card; off by default. A failed pin doesn't affect anything else. Turn it off for one group with `/card pin off` |
 | `cotEnabled` | On by default: show the model's thinking and tool calls live as a native Feishu "thinking" message. Turn off for one group with `/cot off` |
 | `usageDisplay` | Where Context / Token usage shows: `streaming` (default, live card body), `footer` (answer card footer), `off`. Display only; usage accounting is unaffected. Legacy `showUsageInCardFooter: false` means `off` |
+| `showUsageQuota` | Whether to show `5h` / `7d` rolling account quota in the card usage line; on by default. Set `false` to hide `5h` / `7d` while keeping context usage, token stats, custom extensions, and model info. Display only |
 | `cardFooterExtension` | Append a few custom text segments after the usage, produced by a command you configure: `{"command": "<command>", "refreshSeconds": 60}`. The command runs via `/bin/sh -c`, one copy per bot; `refreshSeconds` defaults to 60, range 10–3600. Output is read line by line (or as `{"segments": [...]}`), up to 4 segments of up to 40 characters each. A command that takes over 3 seconds counts as failed; failures keep the last result, and after 10 minutes without a success the text is hidden. See [Live streaming cards](/en/cards) |
 | `brandLabel` | Card signature. Empty shows the default `botmux` link; `""` hides it; any other text is shown as-is (markdown allowed). If the master switch in Dashboard "Global Settings → Feishu cards" is off, no bot shows a signature |
 | `replyCardActions` | Show a compact action menu (open terminal / switch model / close session) on ordinary answer cards. Off by default |

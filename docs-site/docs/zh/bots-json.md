@@ -78,6 +78,7 @@
 | 不 @ 也自动开工 | `autoStartOnNewTopic`、`autoStartOnGroupJoin` |
 | 机器人首次上线后私聊主人一句欢迎语 | `welcomeMessage`（见[上线欢迎语](#welcome-message)） |
 | 盯住告警群，有告警就自动处理 | 群消息监听（见[群消息监听](#message-listener)） |
+| 额度用完换一个 CLI / 模型接着做 | `quotaFallbackChain` |
 | 额度用完自动交给另一个 bot | `quotaFallbackBot` |
 | 不让 botmux 往 prompt 里塞任何东西 | `promptInjection: "none"` |
 | 控制会话占用的内存 | `maxLiveWorkers`、`idleSuspendMinutes` |
@@ -119,6 +120,7 @@
 | `customPassthroughCommands` | 额外允许透传给 CLI 的斜杠命令，例如 `["/export"]`。会和 botmux 自己命令重名的项会被丢掉。用 `/list-slash-command` 看完整放行清单。见[斜杠命令](/slash-commands) |
 | `bareRenamePassthrough` | 默认关闭。设 `true` 后，不带标题的 `/rename` 会原样交给 CLI，由 CLI 根据对话给会话起名（目前只有 Claude Code 支持，接管的会话也算）。见[斜杠命令](/slash-commands#rename-cli) |
 | `startupCommands` | 会话启动后、第一条消息之前自动发给 CLI 的命令，例如 `["/effort ultracode"]`。每次新启动或恢复都会重发 |
+| `quotaFallbackChain` | CLI 额度用完后，同一个 bot 换到下一个 CLI / 模型继续当前会话。默认关闭。见下方[额度用完切换 CLI / 模型](#quota-fallback-chain) |
 | `quotaFallbackBot` | CLI 额度用完后自动交接给另一个 bot。默认关闭。见下方[额度用完自动交接](#quota-fallback) |
 | `codexCapacityRecovery` | 仅 Codex / Codex App：遇到明确的模型容量错误时自动续跑。默认关闭；每个任务最多追加两条续跑输入。普通限流和额度用完不算 |
 | `suppressDeliveredFinalFailureNotice` | 实验性，默认关闭。同一轮已经送达最终答复后，再遇到模型服务错误时不再补发「模型连接失败」通知 |
@@ -155,6 +157,39 @@
 - 两项都不写：直接删掉整个字段。`inherit` 不是有效模式。
 
 切换到其它 CLI 时会自动删除这个字段。
+
+### 额度用完切换 CLI / 模型 {#quota-fallback-chain}
+
+`quotaFallbackChain` 让同一个 Bot 在当前会话撞上额度限制时，原地换到下一步的 CLI 和模型，接着做被打断的那条请求。起点是本 Bot 自己的 `cliId` 和 `model`，`steps` 按顺序往后走。
+
+```json
+{
+  "cliId": "claude-code",
+  "model": "claude-opus-5-5",
+  "quotaFallbackChain": {
+    "enabled": true,
+    "kinds": ["usage", "rate"],
+    "steps": [
+      { "cliId": "traex", "model": "GPT-6.1-Sol" },
+      { "cliId": "traex", "model": "DeepSeek-V4.1-Flash" }
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `enabled` | 只有 `true` 才开启 |
+| `kinds` | `usage`（用量上限）、`rate`（速率限制），不填两种都处理。Claude Code 的额度耗尽只会识别为 `rate`，只填 `usage` 时 Claude 不会切换 |
+| `steps` | 按顺序的切换步骤，每步一个 `cliId`；`model` 不填表示该 CLI 的默认模型。留在同一个 CLI 的一步必须写明模型 |
+
+几点要知道：
+
+- 没带恢复时间的临时限流（比如单纯的 429）先在原 CLI 上自动重试 5 次，间隔从 30 秒起逐次翻倍，都失败再切；带恢复时间或额度错误码的直接切。
+- 同一个 CLI 只换模型时，续接原来的原生会话；换 CLI 时重开原生会话，第一条消息是交接说明：先读上一个 CLI 的会话记录，再用 `botmux history` 看话题历史、检查工作目录，然后从它停下的地方继续被打断的原请求。
+- 续跑的请求按原发起人身份执行，回复落在原话题；切换完成后话题里会发一条通知。切换没能开始（例如切换前又来了新消息、找不到原发起人）时，照旧提示负责人并交接备用 Bot。
+- 切到其他 CLI 时按该 CLI 本机原生登录启动，不带本 Bot 的 `env`。一个 CLI 离开后不能再回到它。
+- 会话只往后走，不会自动切回；daemon 重启后仍停在当前这一步。新会话从本 Bot 自己的配置开始。
 
 ### 额度用完自动交接 {#quota-fallback}
 
@@ -505,6 +540,7 @@ MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allo
 - 没授权过的人调用时，命令会被拒绝，拒绝信息里附带授权链接。AI 也会自己用 `botmux auth request` 把链接发给这个人（见 [Agent 自助发起授权](/cli-commands#agent-auth-request)），或者让他在话题里发 `/login`。授权完成后重试即可。
 - 绝不会退回到 Bot 或其他人的身份代跑，也没有「退回机器登录态」的选项。旧配置里的 `fallback` 字段会被忽略。`bytedcli` 没有 Bot 身份，没授权就是失败。
 - 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用[中心化平台](/platform) / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`allowSpeakerSwitch`（默认 `false`：设为 `true` 后，多人话题里才能在某一条命令前加 `BOTMUX_AS=<open_id>` 用本轮另一位发言人的身份执行；默认关闭时 `BOTMUX_AS` 一律被拒）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
+- 共享 Linux 开发机可设置 `triggerUserAuth.gitCommitIdentity: true`。会话 PATH 中的 Git 包装器会在每次执行 `commit`、`commit-tree`、`merge`、`cherry-pick`、`revert`、`rebase`、`am` 和 `pull` 时核验本轮触发人，用其邮箱作为默认作者与提交者。核验失败会拒绝这些操作（包括快进 pull）。Git 保留重放提交的原作者，显式指定身份仍按 Git 规则生效；受管路径上会清理环境中的 `GIT_AUTHOR_*` / `GIT_COMMITTER_*` 身份变量，shell 配置里的导出不能覆盖已核验的触发人。绝对路径与 Git 别名不在覆盖范围内。受管命令暂不支持 `BOTMUX_AS`，会拒绝执行；oncall 禁网或 slirp 隔离 daemon loopback 时，该组合会在会话启动时被拒绝。此项默认关闭，启动会话时生效，也可在 Dashboard 该 Bot 设置的「安全」区开关。
 
 #### 升级注意：旧格式授权要重新 `/login` {#legacy-user-token}
 
@@ -525,6 +561,7 @@ v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」�
 | `pinStreamingCard` | `true` 时自动置顶当前的实时状态卡，默认关闭。置顶失败不影响其它功能。单个群可以用 `/card pin off` 关掉 |
 | `cotEnabled` | 默认开启：用飞书原生「思考过程」消息实时展示模型的思考和工具调用。单个群可用 `/cot off` 关掉 |
 | `usageDisplay` | Context / Token 用量显示在哪：`streaming`（默认，实时卡正文）、`footer`（答复卡页脚）、`off`（不显示）。只影响显示，不影响用量统计。旧字段 `showUsageInCardFooter: false` 等同 `off` |
+| `showUsageQuota` | 是否在卡片用量行中显示 `5h` / `7d` 账号周期额度，默认开启；设 `false` 仅隐藏 `5h` / `7d`，仍保留上下文占用、token 统计、自定义扩展段与模型名。只影响显示，不影响后台额度检测 |
 | `cardFooterExtension` | 在用量后面追加几段自定义文字，内容来自你配置的命令：`{"command": "<命令>", "refreshSeconds": 60}`。命令交给 `/bin/sh -c` 执行，每个 bot 跑一份；`refreshSeconds` 默认 60，范围 10–3600。输出按行（或 `{"segments": [...]}`）取最多 4 段，每段最多 40 字。命令超过 3 秒算失败，失败时沿用上次结果，连续 10 分钟没成功就不显示。见[实时流式卡片](/cards) |
 | `brandLabel` | 卡片底部签名。不填显示默认的 `botmux` 链接；`""` 隐藏；其它文字原样显示（支持 markdown）。Dashboard「全局设置 → 飞书卡片」里的总开关关掉时，所有 bot 都不显示签名 |
 | `replyCardActions` | 普通答复卡上显示一个紧凑的操作菜单（打开终端 / 切换模型 / 关闭会话）。默认关闭 |

@@ -10,6 +10,7 @@ import {
   type TraexAutoModelConfig,
   type TraexAutoModelRuntimeState,
 } from '../services/traex-auto-model.js';
+import type { QuotaFallbackSessionState } from '../services/quota-fallback-chain.js';
 
 /** Minimal shape of the runtime session needed to resolve a launch model. */
 export type LaunchModelSession = {
@@ -20,6 +21,7 @@ export type LaunchModelSession = {
     modelPin?: ModelPin;
     cliSessionId?: string;
     traexAutoModelRuntime?: TraexAutoModelRuntimeState;
+    quotaFallback?: QuotaFallbackSessionState;
     groupDefaultModels?: GroupDefaultModels;
     scope?: 'thread' | 'chat';
     chatType?: 'group' | 'p2p';
@@ -91,6 +93,8 @@ export function resolveSessionLaunchModelChoice(
   let logicalModel: string | undefined;
   if (ds.session.dispatchLaunchSpec) {
     logicalModel = ds.session.dispatchLaunchSpec.effective.model;
+  } else if (ds.session.quotaFallback && ds.session.quotaFallback.cliId === cliId) {
+    logicalModel = ds.session.quotaFallback.model;
   } else if (ds.spawnModelOverride) {
     logicalModel = ds.spawnModelOverride;
   } else if (supportsCodexModelSelection(ds.session) && ds.session.codexModelSelection?.override
@@ -140,23 +144,25 @@ export function resolveSessionLaunchModelChoice(
  *
  * Precedence:
  *   1. a persisted dispatch launch specification.
- *   2. `spawnModelOverride` — an explicit per-trigger choice (trigger API
+ *   2. the quota fallback chain step this session moved to, while its CLI is
+ *      the session's CLI (`undefined` model = that CLI's default).
+ *   3. `spawnModelOverride` — an explicit per-trigger choice (trigger API
  *      `options.model`), in-memory only, see DaemonSession.
- *   3. a confirmed native Codex model override, bound to this conversation
+ *   4. a confirmed native Codex model override, bound to this conversation
  *      (local Codex PTY/tmux only). Applying a BotMux pin also drives the
  *      native CLI to that model, at which point the override self-clears, so a
  *      pin resumes governing once the native setting catches up.
- *   4. an explicit `modelPin` — only while cliMatchesBot and the session is
+ *   5. an explicit `modelPin` — only while cliMatchesBot and the session is
  *      not a shared adopt. A pin is a user action, never a frozen copy of a bot
  *      default (#773), and can be cleared.
- *   5. the group default captured at topic creation, for the selected CLI.
+ *   6. the group default captured at topic creation, for the selected CLI.
  *      Later group edits never alter this snapshot.
- *   6. the live bot config, **only when the session's frozen `cliId` still
+ *   7. the live bot config, **only when the session's frozen `cliId` still
  *      matches the bot's** — a session pinned to another CLI (a bot that
  *      switched CLI later, or a Codex App thread takeover that forces
  *      `codex-app`) must not be handed a model string meant for a different
  *      CLI.
- *   7. the model this session was last launched with (`session.model`, stamped
+ *   8. the model this session was last launched with (`session.model`, stamped
  *      by sessionAgentConfig on every spawn), as a last resort for exactly that
  *      mismatch case: it is the value that CLI actually ran with. Never
  *      consulted while the live config applies, which is what makes a dashboard

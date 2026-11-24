@@ -6,11 +6,12 @@ import { _resetForTest, applyAskForm, getAskSnapshot, registerAsk, registerHostA
   setCardDispatcher, setAskPersistStore, restorePersistedAsks, submitAskFromDesktop } from '../src/core/ask-broker.js';
 import { createAskPersistStore } from '../src/core/ask-persist-store.js';
 import type { CreateAskInput, PendingAsk, AskResult } from '../src/core/ask-types.js';
+import { NATIVE_STANDALONE_ASK_ORIGIN } from '../src/core/ask-types.js';
 import { handleAskCardAction, buildAskCard } from '../src/im/lark/ask-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from '../src/im/lark/turn-reply-ask-elements.js';
 import { parseAskQuestions } from '../src/core/ask-questions.js';
 import { codexUserInputAnswer } from '../src/services/codex-user-input.js';
-import { codexAsyncAnswerText } from '../src/services/codex-async-user-input.js';
+import { codexAsyncAnswerText, CODEX_ASYNC_RESTORE_ASK_ORIGIN } from '../src/services/codex-async-user-input.js';
 import claude from '../src/core/ask-hook/claude-code.js';
 import opencode from '../src/core/ask-hook/opencode.js';
 import dsh from '../src/core/ask-hook/dsh.js';
@@ -168,6 +169,14 @@ describe('per-question custom form', () => {
     expect(applyAskForm({ ...args, fields: { custom_0: 'yes' } })).toBe('invalid_custom');
     expect(parseAskQuestions([{ ...questions[0], allowCustom: false }])).toMatchObject([{ allowCustom: false }]);
     expect(typeof parseAskQuestions([{ ...questions[0], allowCustom: 'yes' }])).toBe('string');
+  });
+
+  it.each([NATIVE_STANDALONE_ASK_ORIGIN, CODEX_ASYNC_RESTORE_ASK_ORIGIN])('keeps native async custom answers in the card form with quote-specific reply guidance: %s', async originKind => {
+    const { ask } = await start({ originKind });
+    expect(supportsAskCustomInput(ask)).toBe(true);
+    const card = buildAskCard(ask);
+    expect(descendants(JSON.parse(card)).filter(n => n.tag === 'input')).toHaveLength(2);
+    expect(card).toBe(buildAskCard({ ...ask, originKind: 'native-user-input-async' }));
   });
 
   it('inline and settled cards preserve per-question answers', async () => {

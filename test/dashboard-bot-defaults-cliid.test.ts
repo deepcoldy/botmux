@@ -1,7 +1,8 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
+import { displayCliId, type BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
+import { normalizeOwnerGroupFollowConfig } from '../src/services/owner-group-follow-policy.js';
 import {
   BotAgentSection,
   BotDefaultsTabs,
@@ -1971,6 +1972,164 @@ describe('owner group follow transport gate', () => {
   });
 });
 
+describe('owner group follow rule editor', () => {
+  const defect = { field: 'name', op: 'endsWith', pattern: '[缺陷同步群]' } as const;
+  const alertDescription = { field: 'description', op: 'regex', pattern: '报警处理群|告警处理|值班处理|alarm group|incident triage' } as const;
+  const closed = { field: 'name', op: 'contains', pattern: '[已关单]' } as const;
+  function render(config?: BotDefaultsRow['ownerGroupFollow']) {
+    let bot: BotDefaultsRow = { larkAppId: 'cli_follow', ownerGroupFollow: config };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    const request = vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string);
+      return new Response(JSON.stringify({ ok: true, ownerGroupFollow: normalizeOwnerGroupFollowConfig(body.ownerGroupFollow) ?? null }));
+    });
+    vi.stubGlobal('fetch', request);
+    const element = (): React.ReactElement => React.createElement(OwnerGroupFollowControls, {
+      bot,
+      patchBot: (appId, patch) => {
+        if (appId !== bot.larkAppId) return;
+        bot = typeof patch === 'function' ? patch(bot) : { ...bot, ...patch };
+        renderer.update(element());
+      },
+    });
+    act(() => { renderer = TestRenderer.create(element()); });
+    const action = (name: string) => renderer.root.findByProps({ 'data-action': name });
+    const click = (name: string) => act(() => { action(name).props.onClick(); });
+    return {
+      renderer, request, action, click,
+      preset: (name: string) => renderer.root.findByProps({ 'data-owner-group-follow-preset': name }),
+      list: (list: 'includeRules' | 'excludeRules') => renderer.root.findByProps({ 'data-owner-group-follow-rules': list }),
+      patterns: (list: 'includeRules' | 'excludeRules') => renderer.root
+        .findByProps({ 'data-owner-group-follow-rules': list }).findAllByProps({ 'data-input': 'ownerGroupFollowRulePattern' })
+        .map(node => node.props.value),
+      input: (name: string) => renderer.root.findByProps({ 'data-input': name }),
+      status: () => renderer.root.findByProps({ 'data-owner-group-follow-status': '' }).children.join(''),
+      async save() { await act(async () => { action('save-owner-group-follow-exclusions').props.onClick(); }); },
+      async toggle(checked: boolean) {
+        await act(async () => { action('toggle-owner-group-follow').props.onChange({ currentTarget: { checked } }); });
+      },
+      lastBody() { return JSON.parse(request.mock.lastCall![1].body as string).ownerGroupFollow; },
+      updateBot(next: BotDefaultsRow) { act(() => { bot = next; renderer.update(element()); }); },
+    };
+  }
+  const type = (node: TestRenderer.ReactTestInstance, value: string) => act(() => node.props.onChange({ currentTarget: { value } }));
+
+  it('switches scope with presets, deduplicates repeated clicks and clears only the include rules in all mode', async () => {
+    const h = render({ enabled: true, pollIntervalSeconds: 90, excludeChatIds: ['oc_legacy'] });
+    expect(h.action('owner-group-follow-scope-all').props['aria-pressed']).toBe(true);
+    expect(h.renderer.root.findAllByProps({ 'data-owner-group-follow-rules': 'includeRules' })).toHaveLength(0);
+    act(() => h.preset('exclude-closed').props.onClick());
+    expect(h.action('owner-group-follow-scope-all').props['aria-pressed']).toBe(true);
+    for (const name of ['defect-sync', 'alert-description', 'alert-description', 'generic-alert']) act(() => h.preset(name).props.onClick());
+    expect(h.action('owner-group-follow-scope-filtered').props['aria-pressed']).toBe(true);
+    expect(h.preset('alert-description').props).toMatchObject({ 'aria-pressed': true, className: 'is-applied' });
+    expect(h.patterns('includeRules')).toEqual([
+      defect.pattern, alertDescription.pattern, '告警|报警|故障|oncall|incident|🚨',
+    ]);
+    expect(h.patterns('excludeRules')).toEqual([closed.pattern]);
+    type(h.input('ownerGroupFollowExcluded'), 'oc_legacy\noc_new');
+    await h.save();
+    expect(h.request.mock.lastCall?.[0]).toBe('/api/bots/cli_follow/owner-group-follow');
+    expect(h.request.mock.lastCall?.[1].method).toBe('PUT');
+    expect(h.lastBody()).toEqual({
+      enabled: true, pollIntervalSeconds: 90, excludeChatIds: ['oc_legacy', 'oc_new'],
+      includeRules: [defect, alertDescription,
+        { field: 'any', op: 'regex', pattern: '告警|报警|故障|oncall|incident|🚨' },
+      ],
+      excludeRules: [closed],
+    });
+    h.click('owner-group-follow-scope-all');
+    expect(h.renderer.root.findAllByProps({ 'data-owner-group-follow-rules': 'includeRules' })).toHaveLength(0);
+    await h.save();
+    expect(h.lastBody()).toEqual({ enabled: true, pollIntervalSeconds: 90, excludeChatIds: ['oc_legacy', 'oc_new'], excludeRules: [closed] });
+  });
+
+  it('allows manual editing and blocks saving an empty, invalid or unsafe rule', async () => {
+    const h = render({ includeRules: [defect] });
+    expect(h.action('owner-group-follow-scope-filtered').props['aria-pressed']).toBe(true);
+    act(() => h.list('includeRules').findByProps({ className: 'ogf-remove-btn' }).props.onClick());
+    await h.save();
+    expect(h.status()).toMatch(/至少添加一条有效的包含规则|at least one valid include rule/);
+    expect(h.request).not.toHaveBeenCalled();
+
+    h.click('owner-group-follow-add-includeRules');
+    h.click('owner-group-follow-add-excludeRules');
+    const include = () => h.list('includeRules');
+    const exclude = () => h.list('excludeRules');
+    const includePattern = () => include().findByProps({ 'data-input': 'ownerGroupFollowRulePattern' });
+    const excludePattern = () => exclude().findByProps({ 'data-input': 'ownerGroupFollowRulePattern' });
+    type(include().findByProps({ 'data-input': 'ownerGroupFollowRuleField' }), 'description');
+    type(include().findByProps({ 'data-input': 'ownerGroupFollowRuleOp' }), 'regex');
+    type(includePattern(), '^Auto-created');
+    act(() => include().findByProps({ className: 'ogf-case-btn' }).props.onClick());
+    expect(include().findByProps({ className: 'ogf-case-btn' }).props['aria-pressed']).toBe(true);
+    expect(includePattern().props.className).toBe('is-mono');
+
+    type(exclude().findByProps({ 'data-input': 'ownerGroupFollowRuleOp' }), 'regex');
+    type(excludePattern(), '[');
+    expect(excludePattern().props['aria-invalid']).toBe(true);
+    expect(exclude().findByProps({ className: 'ogf-rule-error' }).children.join('')).toMatch(/语法有误|syntax error/);
+    await h.save();
+    expect(h.request).not.toHaveBeenCalled();
+    type(excludePattern(), '(a|aa)+');
+    expect(exclude().findByProps({ className: 'ogf-rule-error' }).children.join('')).toMatch(/高风险|risky repetition/);
+    await h.save();
+    expect(h.request).not.toHaveBeenCalled();
+    type(excludePattern(), '^Internal');
+    expect(excludePattern().props['aria-invalid']).toBe(false);
+    act(() => exclude().findByProps({ className: 'ogf-remove-btn' }).props.onClick());
+    expect(h.patterns('excludeRules')).toEqual([]);
+    await h.save();
+    expect(h.lastBody()).toEqual({
+      excludeChatIds: [], includeRules: [{ field: 'description', op: 'regex', pattern: '^Auto-created', caseSensitive: true }],
+    });
+  });
+
+  it('tests the unsaved draft against sample metadata and reports the winning rule', () => {
+    const h = render();
+    expect(h.renderer.root.findByType('details').props.open).toBeUndefined();
+    act(() => h.preset('defect-sync').props.onClick());
+    act(() => h.preset('alert-description').props.onClick());
+    act(() => h.preset('exclude-closed').props.onClick());
+    const result = () => h.renderer.root.findByType('output');
+    type(h.input('ownerGroupFollowTestName'), '日常讨论');
+    expect(result().props.className).toContain('is-skip');
+    expect(result().children.join('')).toMatch(/未命中任何包含规则|No include rule matched/);
+    type(h.input('ownerGroupFollowTestDescription'), 'Auto-created alarm group for latency triage');
+    expect(result().props.className).toContain('is-match');
+    expect(result().children.join('')).toMatch(/(?:命中包含规则|Matched include rule) #2/);
+    type(h.input('ownerGroupFollowTestName'), '[已关单] 日常讨论');
+    expect(result().props.className).toContain('is-skip');
+    expect(result().children.join('')).toMatch(/(?:命中排除规则|Matched exclude rule) #1/);
+    expect(h.request).not.toHaveBeenCalled();
+  });
+
+  it('toggles only saved settings and resets draft on authoritative filter changes and bot switches', async () => {
+    const saved = { enabled: true, pollIntervalSeconds: 90, includeRules: [defect], excludeRules: [closed], excludeChatIds: ['oc_saved'] };
+    const h = render(saved);
+    expect(h.action('owner-group-follow-toggle-exclude-rules').props['aria-expanded']).toBe(true);
+    h.click('owner-group-follow-toggle-exclude-rules');
+    expect(h.patterns('excludeRules')).toEqual([]);
+    h.click('owner-group-follow-toggle-exclude-rules');
+    expect(h.patterns('excludeRules')).toEqual([closed.pattern]);
+    act(() => h.preset('alert-description').props.onClick());
+    type(h.input('ownerGroupFollowExcluded'), 'oc_draft');
+    await h.toggle(false);
+    expect(h.lastBody()).toEqual({ ...saved, enabled: false });
+    expect(h.patterns('includeRules')).toHaveLength(2);
+    expect(h.input('ownerGroupFollowExcluded').props.value).toBe('oc_draft');
+    h.updateBot({ larkAppId: 'cli_follow', ownerGroupFollow: { ...saved, excludeChatIds: ['oc_remote'] } });
+    expect(h.patterns('includeRules')).toEqual([defect.pattern]);
+    expect(h.input('ownerGroupFollowExcluded').props.value).toBe('oc_remote');
+    type(h.input('ownerGroupFollowTestName'), 'draft test');
+    h.updateBot({ larkAppId: 'cli_new', ownerGroupFollow: { excludeRules: [closed] } });
+    expect(h.action('owner-group-follow-scope-all').props['aria-pressed']).toBe(true);
+    expect(h.patterns('excludeRules')).toEqual([closed.pattern]);
+    expect(h.input('ownerGroupFollowExcluded').props.value).toBe('');
+    expect(h.input('ownerGroupFollowTestName').props.value).toBe('');
+  });
+});
+
 describe('riff CLI switch persistence (PR #467 P1)', () => {
   it('save-riff saves the riff config first, then persists the CLI selection (PUT /riff → /agent)', async () => {
     const requests: Array<{ method: string; url: string; body: any }> = [];
@@ -2345,6 +2504,47 @@ describe('reply-card usage display mode', () => {
     expect(menu().props.value).toBe('streaming');
     expect(renderer.root.findByProps({ 'data-card-pref-status': '' }).children.join(''))
       .toContain('write_failed');
+  });
+
+  it('toggles showUsageQuota independently, rolls back on error, and hides when usageSupported is false', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, unknown>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_quota', usageSupported: true },
+        putCardPref,
+      }));
+    });
+    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-show-usage-quota' });
+    expect(toggle().props.checked).toBe(true);
+
+    await act(async () => {
+      toggle().props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenLastCalledWith({ showUsageQuota: false });
+    expect(toggle().props.checked).toBe(false);
+
+    // Rollback on failure
+    putCardPref.mockResolvedValueOnce({ ok: false, status: 500, body: { error: 'write_failed' } });
+    await act(async () => {
+      toggle().props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+    expect(toggle().props.checked).toBe(false);
+
+    // Hidden when usageSupported is false
+    act(() => {
+      renderer.update(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_quota', usageSupported: false },
+        putCardPref,
+      }));
+    });
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-show-usage-quota' })).toHaveLength(0);
   });
 });
 

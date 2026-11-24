@@ -47,6 +47,51 @@ describe('long-task card transport', () => {
     expect(JSON.parse(longTaskReminderCard(task(mode), 12)).elements[0].text)
       .toEqual({ tag: 'plain_text', content: '<at id=all> user task' });
   });
+
+  it('sanitizes leading @botName/@mention prefixes, normalizes whitespace, and truncates safely by code points', async () => {
+    const { formatLongTaskReminderTitle, longTaskReminderCard } = await import('../src/services/long-task-reminder-notification.js');
+
+    // Long bot name containing spaces (real Feishu group-thread pattern).
+    expect(formatLongTaskReminderTitle(
+      '@风控平台 x Botmux 远端开发助手 - Antigravity （注：刚尝试用日志工具查该笔',
+      '风控平台 x Botmux 远端开发助手 - Antigravity',
+    )).toBe('（注：刚尝试用日志工具查该笔');
+
+    // 50-char title truncated mid-way through @<botName> falls back cleanly.
+    expect(formatLongTaskReminderTitle(
+      '@风控平台 x Botmux 远端开发助手 - Anti',
+      '风控平台 x Botmux 远端开发助手 - Antigravity',
+    )).toBe('当前任务');
+
+    // Generic leading mentions (including unspaced CJK punctuation) and mention-only titles.
+    expect(formatLongTaskReminderTitle('@SomeBot   @Helper\n排查  502  尖刺')).toBe('排查 502 尖刺');
+    expect(formatLongTaskReminderTitle('@SomeBot，帮我查一下线上502原因')).toBe('帮我查一下线上502原因');
+    expect(formatLongTaskReminderTitle('@张三，帮我查一下 502 报错')).toBe('帮我查一下 502 报错');
+    expect(formatLongTaskReminderTitle('@SomeBot:排查502')).toBe('排查502');
+    expect(formatLongTaskReminderTitle('@My Bot: 修复线上 502', 'My Bot')).toBe('修复线上 502');
+    expect(formatLongTaskReminderTitle('@My Bot:', 'My Bot')).toBe('当前任务');
+    expect(formatLongTaskReminderTitle('@My Bot: @OtherBot 修复 502', 'My Bot')).toBe('修复 502');
+    expect(formatLongTaskReminderTitle('@My Bot Helper帮我查502', 'My Bot Helper')).toBe('帮我查502');
+    expect(formatLongTaskReminderTitle('@OnlyMention')).toBe('当前任务');
+    expect(formatLongTaskReminderTitle('   \n\t  ')).toBe('当前任务');
+    expect(formatLongTaskReminderTitle(undefined)).toBe('当前任务');
+
+    // Scoped package names starting with `@scope/pkg` are preserved.
+    expect(formatLongTaskReminderTitle('@byted/pipo-sdk 构建报错')).toBe('@byted/pipo-sdk 构建报错');
+
+    // Codepoint-safe truncation preserves surrogate-pair emojis without splitting them.
+    const emojiTitle = `${'🚀'.repeat(45)}`;
+    const truncated = formatLongTaskReminderTitle(emojiTitle);
+    expect(Array.from(truncated)).toHaveLength(41);
+    expect(truncated.endsWith('…')).toBe(true);
+    expect(truncated).toBe(`${'🚀'.repeat(40)}…`);
+
+    // Card builder uses the sanitized title in its plain_text header block.
+    const t = task('thread');
+    t.session.session.title = '@My Bot Helper 修复线上 502 问题';
+    expect(JSON.parse(longTaskReminderCard(t, 10, 'My Bot Helper')).elements[0].text)
+      .toEqual({ tag: 'plain_text', content: '修复线上 502 问题' });
+  });
 });
 
 describe('long-task preferences persistence', () => {

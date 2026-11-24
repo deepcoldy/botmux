@@ -266,6 +266,57 @@ function matchCodexRolloutPath(target: string): CodexRolloutRef | undefined {
   return { path: target, cliSessionId: sid };
 }
 
+/** A non-blocking question the model asked through `request_user_input_async`.
+ *  The Codex app-server delivers the same item over JSON-RPC; a TUI session
+ *  has no such channel, so its rollout record is the only place the question
+ *  exists. Bounded and strict: a malformed record is ignored, never guessed. */
+export interface CodexAsyncQuestionRecord {
+  itemId: string;
+  threadId?: string;
+  nativeTurnId?: string;
+  questions: Array<{ title: string; options: string[] }>;
+}
+
+const CODEX_ASYNC_QUESTION_MAX = 8;
+const CODEX_ASYNC_QUESTION_OPTIONS_MAX = 20;
+const CODEX_ASYNC_QUESTION_TITLE_MAX = 4000;
+const CODEX_ASYNC_QUESTION_OPTION_MAX = 500;
+
+function codexAsyncQuestionRecord(payload: any): CodexAsyncQuestionRecord | undefined {
+  const item = payload?.item;
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return undefined;
+  if (typeof item.type !== 'string' || item.type.toLowerCase() !== 'agentmessage') return undefined;
+  if (item.delivery !== 'async' || !Array.isArray(item.questions) || item.questions.length === 0) return undefined;
+  const itemId = typeof item.id === 'string' ? item.id : '';
+  if (!itemId || itemId.length > 128) return undefined;
+  const questions: CodexAsyncQuestionRecord['questions'] = [];
+  for (const raw of item.questions.slice(0, CODEX_ASYNC_QUESTION_MAX)) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    // The RPC parser refuses secret questions; a rollout card must not leak
+    // one into the chat either. Reject the whole batch, never downgrade it.
+    if (raw.isSecret === true) return undefined;
+    const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+    if (!title || title.length > CODEX_ASYNC_QUESTION_TITLE_MAX) return undefined;
+    const rawOptions = raw.options;
+    if (rawOptions !== undefined && rawOptions !== null && !Array.isArray(rawOptions)) return undefined;
+    const options: string[] = [];
+    if (Array.isArray(rawOptions)) {
+      if (rawOptions.length > CODEX_ASYNC_QUESTION_OPTIONS_MAX) return undefined;
+      for (const option of rawOptions) {
+        if (typeof option !== 'string' || !option.trim()) return undefined;
+        options.push(option.slice(0, CODEX_ASYNC_QUESTION_OPTION_MAX));
+      }
+    }
+    questions.push({ title, options });
+  }
+  return {
+    itemId,
+    ...(typeof payload.thread_id === 'string' && payload.thread_id ? { threadId: payload.thread_id } : {}),
+    ...(typeof payload.turn_id === 'string' && payload.turn_id ? { nativeTurnId: payload.turn_id } : {}),
+    questions,
+  };
+}
+
 export interface CodexBridgeEvent {
   /** Synthetic uuid for dedup: `<absPath>:<byteOffset>` of the line start.
    *  Stable across re-drains because rollout files are append-only. The
@@ -307,7 +358,7 @@ export interface CodexBridgeEvent {
    *     instead of expiring, but is NOT started (the running work is not it)
    *   - 'cli_settled' (Pi) says the CLI finished all queued work; a head
    *     still held by it was not taken up and resumes its normal lease */
-  kind: 'user' | 'turn_started' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot' | 'input_queued' | 'cli_settled';
+  kind: 'user' | 'turn_started' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot' | 'input_queued' | 'cli_settled' | 'async_question';
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
@@ -320,6 +371,9 @@ export interface CodexBridgeEvent {
   inputTextAliases?: string[];
   /** For kind 'cot': the thinking / tool-call entries parsed from this line. */
   cotEntries?: CodexCotEntry[];
+  /** For kind 'async_question': a non-blocking question the model asked. The
+   *  TUI has no JSON-RPC channel for it; it never starts or closes a turn. */
+  asyncQuestion?: CodexAsyncQuestionRecord;
   /** For kind 'cot' (Codex): the text of an assistant message written inside
    *  the turn — commentary, or the final answer just before `task_complete`.
    *  Never a turn boundary and never part of the thinking timeline; it lets
@@ -1975,6 +2029,16 @@ export function drainCodexRollout(
         continue;
       }
     }
+    // A non-blocking question is a completed async AgentMessage. It is not a
+    // turn boundary and not cosmetic CoT: surface it as its own event so the
+    // worker can card it without touching the queue's turn attribution.
+    if (obj.type === 'event_msg' && p.type === 'item_completed') {
+      const asyncQuestion = codexAsyncQuestionRecord(p);
+      if (asyncQuestion) {
+        events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'async_question', text: '', asyncQuestion });
+        continue;
+      }
+    }
     if (obj.type === 'event_msg' && p.type === 'item_completed' && p.item?.type === 'CommandExecution') {
       const item = p.item;
       const command = Array.isArray(item.command) ? item.command : [];
@@ -2233,4 +2297,81 @@ export function readLatestRolloutRuntime(path: string, scanMaxBytes: number): Ro
 
 export function readLatestCodexRuntime(path: string): RolloutRuntimeSnapshot {
   return readLatestRolloutRuntime(path, CODEX_RUNTIME_SCAN_MAX_BYTES);
+}
+
+/** Bounded tail read shared by the async-question recovery helpers. The
+ *  records they need are written by the active turn, so a multi-megabyte
+ *  rollout does not need a full scan. */
+function readRolloutTail(path: string, maxBytes: number): string | undefined {
+  if (!path) return undefined;
+  try {
+    const end = statSync(path).size;
+    const start = Math.max(0, end - Math.max(0, maxBytes));
+    if (end <= start) return undefined;
+    const fd = openSync(path, 'r');
+    try {
+      const buffer = Buffer.allocUnsafe(end - start);
+      const read = readSync(fd, buffer, 0, buffer.length, start);
+      return buffer.subarray(0, read).toString('utf8');
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether this rollout already carries the native reply envelope for the
+ *  question. The reply is an ordinary user message written after the
+ *  question, so a tail scan is sufficient. */
+export function codexRolloutHasAsyncQuestionReply(
+  path: string, itemId: string, maxBytes = 4 * 1024 * 1024,
+): boolean {
+  if (!itemId) return false;
+  const text = readRolloutTail(path, maxBytes);
+  return !!text && text.includes('send_user_message_question_reply') && text.includes(itemId);
+}
+
+/** The latest async question in the rollout tail that has no reply envelope
+ *  after it. A worker restart baselines the incremental drain at the end and
+ *  never replays the question, so recovery asks this once. */
+export function findPendingCodexAsyncQuestion(
+  path: string, maxBytes = 8 * 1024 * 1024,
+): CodexAsyncQuestionRecord | undefined {
+  const text = readRolloutTail(path, maxBytes);
+  if (!text) return undefined;
+  let pending: CodexAsyncQuestionRecord | undefined;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let parsed: any;
+    try { parsed = JSON.parse(line); } catch { continue; }
+    if (parsed?.type === 'event_msg' && parsed.payload?.type === 'item_completed') {
+      const question = codexAsyncQuestionRecord(parsed.payload);
+      if (question) { pending = question; continue; }
+    }
+    if (pending && line.includes('send_user_message_question_reply') && line.includes(pending.itemId)) {
+      pending = undefined;
+    }
+  }
+  return pending;
+}
+
+/** First occurrence of each async question in this drain, restricted to the
+ *  session's own native thread. The caller owns `seen`, so a re-drained range
+ *  cannot card the same item twice. */
+export function selectNewCodexAsyncQuestions(
+  events: ReadonlyArray<CodexBridgeEvent>,
+  ownedThread: string | undefined,
+  seen: Set<string>,
+): CodexAsyncQuestionRecord[] {
+  const selected: CodexAsyncQuestionRecord[] = [];
+  for (const event of events) {
+    if (event.kind !== 'async_question' || !event.asyncQuestion) continue;
+    const question = event.asyncQuestion;
+    if (seen.has(question.itemId)) continue;
+    if (ownedThread && question.threadId && question.threadId !== ownedThread) continue;
+    seen.add(question.itemId);
+    selected.push(question);
+  }
+  return selected;
 }

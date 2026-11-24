@@ -328,7 +328,7 @@ import {
   type FleetCommand,
 } from './cli/sandbox-host-hint.js';
 import { formatSessionLookupMissLine } from './cli/session-lookup-diagnostic.js';
-import { describeReportRelayFallback, REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
+import { describeReportRelayFallback, REPORT_SESSION_RELAY_ROUTE, resolveReportRelayFallbackTarget } from './core/report-session-relay.js';
 import {
   WORKFLOW_NODE_REPORT_ROUTE,
   parseWorkflowReportArgs,
@@ -338,7 +338,12 @@ import {
 import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
 import { scheduleIpcErrorMessage } from './core/schedule-ipc-errors.js';
-import { DISPATCH_REPORT_REGISTER_ROUTE, readDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './core/dispatch-report-binding.js';
+import {
+  DISPATCH_REPORT_REGISTER_ROUTE,
+  hasVerifiedDispatchReportBindingForCaller,
+  readDispatchReportBindingSecret,
+  resolveVerifiedDispatchReportTarget,
+} from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus, type CliPermissionOutcome } from './core/ask-types.js';
 import { PERMISSION_ALLOW_KEY, type PermissionOutcomeWatcher } from './core/ask-hook/types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
@@ -921,6 +926,16 @@ async function finishOpenPlatformSetup(
     appJustCreated?: boolean;
     /** 内置清单 + --extra-scopes-file 合并后的权限清单；不传用内置默认清单。 */
     scopeManifest?: import('./setup/open-platform-automation.js').ScopeManifest;
+    /** 跳过已在上一步（如 1.0.0）确认触发审批而暂缓的权限，避免重复试探。 */
+    excludeScopes?: import('./setup/approval-scope-resolver.js').ApprovalDeferredScopeBuckets;
+    /** 是否在提交前预判审批并自动避开触发审批的权限（默认 true）。 */
+    autoAvoidApproval?: boolean;
+    /** 上一步（1.0.0 创建应用）已暂缓的权限，用于合并展示与落盘。 */
+    initialApprovalDeferredScopes?: import('./setup/approval-scope-resolver.js').DeferredApprovalScope[];
+    /** 上一步（1.0.0 创建应用）是否关闭了刷新 user_access_token 开关。 */
+    initialApprovalDisabledRefreshToken?: boolean;
+    /** 上一步（1.0.0 创建应用）最初命中的真人审批人名单。 */
+    initialApprovalApprovers?: string[];
   } = {},
 ): Promise<SetupOpenPlatformOutcome> {
   const say = (...args: unknown[]) => { if (!options.quiet) console.log(...args); };
@@ -931,7 +946,11 @@ async function finishOpenPlatformSetup(
   const {
     parseSetupOpenPlatformAutoFlag,
     automateOpenPlatformSetup,
+    withOpenPlatformAppLock,
     collectBotmuxRedirectUrls,
+    mergeDeferredApprovalScopes,
+    describeDeferredScopeGroup,
+    buildApprovalConsoleUrl,
   } = await import('./setup/open-platform-automation.js');
   const redirectUrls = safeCollectBotmuxRedirectUrls(collectBotmuxRedirectUrls);
   if (!parseSetupOpenPlatformAutoFlag(process.argv.slice(3))) {
@@ -945,20 +964,78 @@ async function finishOpenPlatformSetup(
     say(options.reuseOnly ? '将复用 Feishu Web session 补充配置。' : '将获取或复用 Feishu Web session 补充配置。');
   }
 
-  const result = options.registeredAppSecret
-    ? await finishRegisteredAppSetup(appId, options.registeredAppSecret, brand, automateOpenPlatformSetup, options)
-    : await automateOpenPlatformSetup({
-        appId,
-        brand,
-        forceQrLogin: options.forceQrLogin,
-        disableQrLogin: options.reuseOnly,
-        disableBytedcliFallback: options.reuseOnly || options.forceQrLogin,
-        appJustCreated: options.appJustCreated,
-        scopeManifest: options.scopeManifest,
-      });
+  const {
+    result,
+    mergedDeferredScopes,
+    mergedDisabledRefreshToken,
+    mergedInitialApprovers,
+    deferredPersistWarning,
+  } = await withOpenPlatformAppLock(appId, async () => {
+    const rawResult = options.registeredAppSecret
+      ? await finishRegisteredAppSetup(appId, options.registeredAppSecret, brand, automateOpenPlatformSetup, options)
+      : await automateOpenPlatformSetup({
+          appId,
+          brand,
+          forceQrLogin: options.forceQrLogin,
+          disableQrLogin: options.reuseOnly,
+          disableBytedcliFallback: options.reuseOnly || options.forceQrLogin,
+          appJustCreated: options.appJustCreated,
+          scopeManifest: options.scopeManifest,
+          excludeScopes: options.excludeScopes,
+          autoAvoidApproval: options.autoAvoidApproval ?? true,
+        });
+
+    const mergedDeferredScopes = mergeDeferredApprovalScopes(
+      options.initialApprovalDeferredScopes,
+      rawResult.approvalDeferredScopes,
+    );
+    const mergedDisabledRefreshToken = Boolean(
+      options.initialApprovalDisabledRefreshToken || rawResult.approvalDisabledRefreshToken,
+    );
+    const mergedInitialApprovers = rawResult.approvalCompatibility?.initialHumanApprovers.length
+      ? rawResult.approvalCompatibility.initialHumanApprovers
+      : (options.initialApprovalApprovers ?? []);
+    const result = {
+      ...rawResult,
+      ...(mergedDeferredScopes.length > 0 ? { approvalDeferredScopes: mergedDeferredScopes } : {}),
+      ...(mergedDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+      ...(rawResult.ok && mergedInitialApprovers.length > 0 && !rawResult.approvalCompatibility
+        ? {
+            approvalCompatibility: {
+              triggered: true,
+              resolvedAutoApproved: true,
+              deferredScopes: mergedDeferredScopes,
+              disabledRefreshToken: mergedDisabledRefreshToken,
+              initialHumanApprovers: mergedInitialApprovers,
+              remainingHumanApprovers: [],
+              probeCount: 0,
+              stopReason: 'resolved_exact' as const,
+            },
+          }
+        : {}),
+    } as import('./setup/open-platform-automation.js').OpenPlatformAutomationResult;
+
+    let deferredPersistWarning: string | undefined;
+    const canCleanExistingDeferrals = result.ok
+      && !result.scopeWarning
+      && !result.versionWarning
+      && !result.versionPendingReview
+      && (result.skippedScopeCount ?? 0) === 0
+      && (result.approvalAutoPassed === true || result.publishSkipped === true);
+    if (mergedDeferredScopes.length > 0 || canCleanExistingDeferrals) {
+      const persisted = await persistBotApprovalDeferredScopes(appId, result, mergedDeferredScopes);
+      if (!persisted.ok && persisted.reason !== 'bot_not_in_config') {
+        deferredPersistWarning = `未能把审批暂缓权限记录写入 bots.json（${persisted.reason}）`;
+        result.approvalDeferredPersistWarning = deferredPersistWarning;
+      }
+    }
+    return { result, mergedDeferredScopes, mergedDisabledRefreshToken, mergedInitialApprovers, deferredPersistWarning };
+  });
+
   const outcome = classifySetupOpenPlatformOutcome(result);
   if (result.ok) {
     say('✅ 开放平台自动配置完成');
+    if (deferredPersistWarning) say(`   ⚠️ ${deferredPersistWarning}`);
     if (result.sessionSource) say(`   Session 来源: ${result.sessionSource}`);
     const skipped = result.skippedScopeCount ?? 0;
     say(`   ${options.registeredAppSecret ? '已回读确认授予' : '已导入权限数'}: ${result.scopeCount}${skipped > 0 ? `（另有 ${skipped} 项当前租户目录中没有，已跳过）` : ''}`);
@@ -966,10 +1043,38 @@ async function finishOpenPlatformSetup(
       const names = [...result.skippedScopes.tenant.map(n => `${n}(tenant)`), ...result.skippedScopes.user.map(n => `${n}(user)`)];
       say(`   已跳过的权限: ${names.join(', ')}`);
     }
+    if (mergedDeferredScopes.length > 0 || mergedDisabledRefreshToken) {
+      const approverHint = mergedInitialApprovers.length > 0
+        ? `（原审批人：${mergedInitialApprovers.join('、')}）`
+        : '';
+      say(`   ⚠️ 为避免卡住企业管理员审批${approverHint}，已自动跳过 ${mergedDeferredScopes.length} 项需审批权限${mergedDisabledRefreshToken ? '，并关闭了「刷新 user_access_token」开关' : ''}（不影响机器人基础注册与收发消息）`);
+      const byGroup = new Map<string, typeof mergedDeferredScopes>();
+      for (const s of mergedDeferredScopes) {
+        const list = byGroup.get(s.group) ?? [];
+        list.push(s);
+        byGroup.set(s.group, list);
+      }
+      if (mergedDeferredScopes.length <= 12) {
+        for (const s of mergedDeferredScopes) {
+          const identity = s.bucket === 'user' ? '用户身份' : '应用身份';
+          say(`      - ${s.name} [${identity}]${s.desc ? ` — ${s.desc}` : ''}`);
+        }
+      } else {
+        for (const [group, items] of byGroup) {
+          const preview = items.slice(0, 4).map(s => `${s.name}(${s.bucket === 'user' ? '用户' : '应用'})`).join(', ');
+          const rest = items.length > 4 ? ` 等 ${items.length} 项` : '';
+          say(`      - ${describeDeferredScopeGroup(group, 'zh-CN')}：${preview}${rest}`);
+        }
+      }
+      if (mergedDisabledRefreshToken) {
+        say('      - 安全设置「允许刷新 user_access_token」已自动关闭（用户授权过期时需重新点击登录链接）');
+      }
+      say(`      如需上述能力，请前往开放平台「权限管理」手动勾选并提交审批：${buildApprovalConsoleUrl(appId, brand)}`);
+    }
     if (result.scopeWarning) {
       say(`   ⚠️ 权限注册未全部成功（部分租户对个别权限有限制）：${result.scopeWarning}`);
       say('      可稍后到开放平台「权限管理」手动补齐缺失权限。');
-    } else if (result.scopeCount === 0) {
+    } else if (result.scopeCount === 0 && !result.publishSkipped) {
       say('   ⚠️ 本次没有成功导入任何权限，请到开放平台「权限管理」手动导入 ~/.botmux/lark-scopes.json。');
     }
     if (result.eventWarning) say(`   ⚠️ ${result.eventWarning}`);
@@ -1010,11 +1115,18 @@ async function finishRegisteredAppSetup(
   appSecret: string,
   brand: Brand,
   web: typeof import('./setup/open-platform-automation.js').automateOpenPlatformSetup,
-  options: { quiet?: boolean; scopeManifest?: import('./setup/open-platform-automation.js').ScopeManifest },
+  options: {
+    quiet?: boolean;
+    scopeManifest?: import('./setup/open-platform-automation.js').ScopeManifest;
+    excludeScopes?: import('./setup/approval-scope-resolver.js').ApprovalDeferredScopeBuckets;
+    autoAvoidApproval?: boolean;
+  },
 ) {
   const { completeRegisteredApp, createRegistrationOptions } = await import('./setup/registration-manifest.js');
   return completeRegisteredApp({ appId, appSecret, brand }, createRegistrationOptions(undefined, options.scopeManifest).addons!, web, {
     disableQrLogin: options.quiet,
+    ...(options.excludeScopes ? { excludeScopes: options.excludeScopes } : {}),
+    autoAvoidApproval: options.autoAvoidApproval ?? true,
     onStatus: message => { process.stderr.write(`${message}\n`); },
   });
 }
@@ -1192,7 +1304,7 @@ async function pickExistingAppCredentials(
  */
 export async function obtainCredentials(
   rl: ReturnType<typeof createInterface>,
-  options: { isFirstStep?: boolean } = {},
+  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean } = {},
 ): Promise<
   | {
       ok: true;
@@ -1210,6 +1322,10 @@ export async function obtainCredentials(
       registeredWithAddons?: boolean;
       /** 这个应用是本次 setup 现场创建出来的（而不是「选择已有」/「手动输入」的存量应用）。 */
       appJustCreated?: boolean;
+      /** 1.0.0 建应用阶段因触发审批而暂缓的权限，供 1.0.1 跳过、合并提示并落盘。 */
+      approvalDeferredScopes?: import('./setup/approval-scope-resolver.js').DeferredApprovalScope[];
+      approvalDisabledRefreshToken?: boolean;
+      approvalInitialApprovers?: string[];
     }
   | { ok: false; reason: 'cancelled' }
 > {
@@ -1279,6 +1395,7 @@ export async function obtainCredentials(
           ? { disableQrLogin: true, expectedIdentity }
           : { forceQrLogin: true }),
         disableBytedcliFallback: true,
+        autoAvoidApproval: options.autoAvoidApproval !== false,
         onSessionReady: ({ identity, source }) => {
           process.stderr.write(`已确认飞书账号：${identity.userName} · ${identity.tenantName}${source === 'botmux_cache' ? '（免扫码）' : ''}\n`);
         },
@@ -1300,6 +1417,11 @@ export async function obtainCredentials(
           brand: 'feishu',
           webSessionReady: true,
           appJustCreated: true,
+          ...(webResult.approvalDeferredScopes?.length ? { approvalDeferredScopes: webResult.approvalDeferredScopes } : {}),
+          ...(webResult.approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+          ...(webResult.approvalCompatibility?.initialHumanApprovers.length
+            ? { approvalInitialApprovers: webResult.approvalCompatibility.initialHumanApprovers }
+            : {}),
         };
       }
 
@@ -1429,7 +1551,7 @@ async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Prom
  */
 async function promptBotConfig(
   rl: ReturnType<typeof createInterface>,
-  options: { isFirstStep?: boolean } = {},
+  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean } = {},
 ): Promise<Record<string, any> | null> {
   const creds = await obtainCredentials(rl, options);
   if (!creds.ok) return null;
@@ -1573,6 +1695,12 @@ async function promptBotConfig(
 
   if (!ensureBotWorkingDirsExist(bot, '仓库扫描根目录')) return null;
 
+  if (creds.approvalDeferredScopes?.length) {
+    const { deferredScopesToBuckets } = await import('./setup/approval-scope-resolver.js');
+    const initialDeferredBuckets = deferredScopesToBuckets(creds.approvalDeferredScopes);
+    if (initialDeferredBuckets) bot.approvalDeferredScopes = initialDeferredBuckets;
+  }
+
   const normalized = normalizeBotConfig(bot);
   if (creds.webSessionReady) {
     Object.defineProperty(normalized, SETUP_WEB_SESSION_READY, { value: true, enumerable: false });
@@ -1582,6 +1710,16 @@ async function promptBotConfig(
   }
   if (creds.appJustCreated) {
     Object.defineProperty(normalized, SETUP_APP_JUST_CREATED, { value: true, enumerable: false });
+  }
+  if (creds.approvalDeferredScopes?.length || creds.approvalDisabledRefreshToken || creds.approvalInitialApprovers?.length) {
+    Object.defineProperty(normalized, SETUP_INITIAL_APPROVAL_COMPAT, {
+      value: {
+        deferredScopes: creds.approvalDeferredScopes,
+        disabledRefreshToken: creds.approvalDisabledRefreshToken,
+        initialApprovers: creds.approvalInitialApprovers,
+      },
+      enumerable: false,
+    });
   }
   return normalized;
 }
@@ -1594,12 +1732,23 @@ const SETUP_WEB_SESSION_READY = Symbol('setup-web-session-ready');
  */
 const SETUP_APP_JUST_CREATED = Symbol('setup-app-just-created');
 const SETUP_REGISTERED_WITH_ADDONS = Symbol('setup-registered-with-addons');
+const SETUP_INITIAL_APPROVAL_COMPAT = Symbol('setup-initial-approval-compat');
 
 function finishInteractiveOpenPlatformSetup(bot: Record<string | symbol, any>): Promise<SetupOpenPlatformOutcome> {
+  const initialCompat = bot[SETUP_INITIAL_APPROVAL_COMPAT] as {
+    deferredScopes?: import('./setup/approval-scope-resolver.js').DeferredApprovalScope[];
+    disabledRefreshToken?: boolean;
+    initialApprovers?: string[];
+  } | undefined;
   return finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {
     reuseOnly: bot[SETUP_WEB_SESSION_READY] === true,
     appJustCreated: bot[SETUP_APP_JUST_CREATED] === true,
     registeredAppSecret: bot[SETUP_REGISTERED_WITH_ADDONS] ? bot.larkAppSecret : undefined,
+    excludeScopes: bot.approvalDeferredScopes,
+    autoAvoidApproval: bot.autoAvoidApproval !== false,
+    initialApprovalDeferredScopes: initialCompat?.deferredScopes,
+    initialApprovalDisabledRefreshToken: initialCompat?.disabledRefreshToken,
+    initialApprovalApprovers: initialCompat?.initialApprovers,
   });
 }
 
@@ -1837,7 +1986,7 @@ function parseDotEnvToBotConfig(): Record<string, any> {
  */
 async function writeSingleBotConfig(
   botsSnapshot: readonly any[],
-  options: { isFirstStep?: boolean } = {},
+  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean } = {},
 ): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const bot = await promptBotConfig(rl, options);
@@ -1907,6 +2056,48 @@ async function persistBotExtraScopesFile(larkAppId: string, value: string | null
     return { write: true, result: undefined };
   }, { path: BOTS_JSON_FILE });
   if (!result.ok) throw new Error(result.reason);
+}
+
+/**
+ * 锁内重读 bots.json，按安全规则更新这一个机器人的 approvalDeferredScopes：
+ * 仅当本次配置干净通过（无 scopeWarning/versionWarning 且已确认自动通过或无变更跳过发版）
+ * 时才允许清空历史暂缓集；不确定/失败/进人工审批的路径绝不抹掉已有暂缓记录。
+ * 显式返回 ok/reason，避免 rmwBotEntry 失败时静默吞掉导致内存视图与磁盘分叉。
+ */
+async function persistBotApprovalDeferredScopes(
+  larkAppId: string,
+  result: import('./setup/open-platform-automation.js').OpenPlatformAutomationResult,
+  mergedDeferred: readonly import('./setup/approval-scope-resolver.js').DeferredApprovalScope[],
+): Promise<
+  | { ok: true; buckets: import('./setup/approval-scope-resolver.js').ApprovalDeferredScopeBuckets | undefined }
+  | { ok: false; reason: string }
+> {
+  try {
+    const { rmwBotEntry } = await import('./services/config-store.js');
+    const { resolveNextPersistedApprovalDeferredScopes } = await import('./setup/approval-scope-resolver.js');
+    const rmw = await rmwBotEntry(larkAppId, entry => {
+      const existing = entry.approvalDeferredScopes as
+        | import('./setup/approval-scope-resolver.js').ApprovalDeferredScopeBuckets
+        | undefined;
+      const decision = resolveNextPersistedApprovalDeferredScopes(existing, result, mergedDeferred);
+      if (decision.action === 'keep') {
+        return { write: false, result: existing };
+      }
+      const nextBuckets = decision.action === 'set' ? decision.buckets : undefined;
+      const prevJson = JSON.stringify(existing ?? null);
+      const nextJson = JSON.stringify(nextBuckets ?? null);
+      if (prevJson === nextJson) {
+        return { write: false, result: nextBuckets };
+      }
+      if (nextBuckets) entry.approvalDeferredScopes = nextBuckets;
+      else delete entry.approvalDeferredScopes;
+      return { write: true, result: nextBuckets };
+    }, { path: BOTS_JSON_FILE });
+    if (!rmw.ok) return { ok: false, reason: rmw.reason };
+    return { ok: true, buckets: rmw.result };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 function printSetupExtraScopes(report: SetupExtraScopes['report']): void {
@@ -2038,7 +2229,31 @@ export async function cmdSetupScripted(
       forceQrLogin: cmd.switchAccount,
       quiet: cmd.json,
       scopeManifest: extraScopes.manifest,
+      autoAvoidApproval: bot.autoAvoidApproval !== false,
     });
+    if (openPlatform.status === 'ready' || openPlatform.status === 'ready_with_warnings') {
+      const onDisk = loadBotsJson().find(b => b?.larkAppId === bot.larkAppId);
+      if (onDisk?.approvalDeferredScopes) bot.approvalDeferredScopes = onDisk.approvalDeferredScopes;
+      else delete bot.approvalDeferredScopes;
+    }
+    if (openPlatform.status !== 'skipped' && openPlatform.result.approvalDeferredPersistWarning) {
+      const continueCommand = setupOpenPlatformRetryCommand(bot.larkAppId, openPlatform)!;
+      failSetupScripted(
+        cmd.json,
+        `开放平台处理完成，但审批暂缓记录未能写入 bots.json（${openPlatform.result.approvalDeferredPersistWarning}）。机器人配置保留，未自动上线；请重试 ${continueCommand}。`,
+        {
+          partial: true,
+          action: 'configure',
+          bot: botJsonView(bot, index),
+          appId: bot.larkAppId,
+          openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+          ...extraScopesJson,
+          continueCommand,
+          next: continueCommand,
+        },
+      );
+      return;
+    }
     if (openPlatform.status === 'failed' || openPlatform.status === 'manual') {
       const continueCommand = setupOpenPlatformRetryCommand(bot.larkAppId, openPlatform);
       const next = continueCommand ?? 'manual_open_platform_setup';
@@ -2186,6 +2401,9 @@ export async function cmdSetupScripted(
     let createdAppId: string | undefined;
     let createdWithAddons = false;
     let createdAppName: string | undefined;
+    let createdApprovalDeferredScopes: import('./setup/approval-scope-resolver.js').DeferredApprovalScope[] | undefined;
+    let createdApprovalDisabledRefreshToken: boolean | undefined;
+    let createdApprovalInitialApprovers: string[] | undefined;
     const requestedBrand = normalizeBrand(cmd.flags.brand);
     // 追加权限清单在建应用之前就读取校验：文件写错不该留下一个已创建的半成品应用。
     let extraScopes: SetupExtraScopes;
@@ -2278,7 +2496,14 @@ export async function cmdSetupScripted(
       const appName = resolveSetupAppName(cmd.flags.appName, existing.length);
       let credentials:
         | { ok: true; appId: string; appSecret: string; brand: Brand }
-        | { ok: false; message: string; appId?: string };
+        | {
+            ok: false;
+            message: string;
+            appId?: string;
+            approvalDeferredScopes?: import('./setup/approval-scope-resolver.js').DeferredApprovalScope[];
+            approvalDisabledRefreshToken?: boolean;
+            approvalInitialApprovers?: string[];
+          };
       let appliedAppName = false;
 
       // 只有带权限清单的注册（Lark 默认）会带上应用名称；兼容模式和跳过自动配置的 Lark 都不带。
@@ -2338,6 +2563,7 @@ export async function cmdSetupScripted(
             ...(cmd.flags.appIcon?.trim() ? { iconFilePath: resolve(cmd.flags.appIcon.trim()) } : {}),
             ...sessionOptions,
             disableBytedcliFallback: true,
+            autoAvoidApproval: cloneSource?.autoAvoidApproval !== false,
             onSessionReady: ({ identity, source }) => {
               process.stderr.write(`已确认飞书账号：${identity.userName} · ${identity.tenantName}${source === 'botmux_cache' ? '（免扫码）' : ''}\n`);
             },
@@ -2345,11 +2571,19 @@ export async function cmdSetupScripted(
           if (created.ok) {
             credentials = created;
             appliedAppName = true;
+            createdApprovalDeferredScopes = created.approvalDeferredScopes;
+            createdApprovalDisabledRefreshToken = created.approvalDisabledRefreshToken;
+            createdApprovalInitialApprovers = created.approvalCompatibility?.initialHumanApprovers;
           } else if (created.appId) {
             credentials = {
               ok: false,
               appId: created.appId,
               message: `应用已创建但后续步骤失败 (${created.reason}): ${created.message}`,
+              ...(created.approvalDeferredScopes?.length ? { approvalDeferredScopes: created.approvalDeferredScopes } : {}),
+              ...(created.approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+              ...(created.approvalCompatibility?.initialHumanApprovers.length
+                ? { approvalInitialApprovers: created.approvalCompatibility.initialHumanApprovers }
+                : {}),
             };
           } else {
             credentials = {
@@ -2364,9 +2598,26 @@ export async function cmdSetupScripted(
         const continueCommand = credentials.appId
           ? setupAddContinuationCommand(credentials.appId, requestedBrand, undefined, extraScopesFile)
           : undefined;
+        const { buildApprovalConsoleUrl } = await import('./setup/open-platform-automation.js');
         failSetupScripted(cmd.json,
           `${credentials.message}${credentials.appId ? `；已创建 AppID ${credentials.appId}，请从开放平台读取 App Secret 后运行 ${continueCommand} 继续，未重复创建。` : ''}`,
-          credentials.appId ? { partial: true, appId: credentials.appId, appName, ...extraScopesJson, continueCommand } : {},
+          credentials.appId ? {
+            partial: true,
+            appId: credentials.appId,
+            appName,
+            ...extraScopesJson,
+            continueCommand,
+            ...(credentials.approvalDeferredScopes?.length
+              ? { approvalDeferredScopes: credentials.approvalDeferredScopes }
+              : {}),
+            ...(credentials.approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+            ...(credentials.approvalInitialApprovers?.length
+              ? { approvalInitialApprovers: credentials.approvalInitialApprovers }
+              : {}),
+            ...(credentials.approvalDeferredScopes?.length || credentials.approvalDisabledRefreshToken
+              ? { approvalConsoleUrl: buildApprovalConsoleUrl(credentials.appId, requestedBrand) }
+              : {}),
+          } : {},
         );
         return;
       }
@@ -2464,6 +2715,11 @@ export async function cmdSetupScripted(
 
     try {
       if (typeof extraScopes.persist === 'string') bot.extraScopesFile = extraScopes.persist;
+      if (createdApprovalDeferredScopes?.length) {
+        const { deferredScopesToBuckets } = await import('./setup/approval-scope-resolver.js');
+        const initialDeferredBuckets = deferredScopesToBuckets(createdApprovalDeferredScopes);
+        if (initialDeferredBuckets) bot.approvalDeferredScopes = initialDeferredBuckets;
+      }
       writeBotsJsonAtomic([...existing, bot], bots);
     } catch (err) {
       const continueCommand = createdAppId
@@ -2504,7 +2760,40 @@ export async function cmdSetupScripted(
         // 直接传进来的存量应用绝不能拿到盲写授权。
         appJustCreated: createdAppId !== undefined && createdAppId === bot.larkAppId,
         scopeManifest: extraScopes.manifest,
+        excludeScopes: bot.approvalDeferredScopes,
+        autoAvoidApproval: bot.autoAvoidApproval !== false,
+        initialApprovalDeferredScopes: createdApprovalDeferredScopes,
+        initialApprovalDisabledRefreshToken: createdApprovalDisabledRefreshToken,
+        initialApprovalApprovers: createdApprovalInitialApprovers,
       });
+      if (openPlatform.status === 'ready' || openPlatform.status === 'ready_with_warnings') {
+        const onDisk = loadBotsJson().find(b => b?.larkAppId === bot.larkAppId);
+        if (onDisk?.approvalDeferredScopes) bot.approvalDeferredScopes = onDisk.approvalDeferredScopes;
+        else delete bot.approvalDeferredScopes;
+      }
+    }
+
+    if (openPlatform.status !== 'skipped' && openPlatform.result.approvalDeferredPersistWarning) {
+      const continueCommand = setupOpenPlatformRetryCommand(bot.larkAppId, openPlatform)!;
+      const index = existing.length;
+      failSetupScripted(
+        cmd.json,
+        `机器人配置已写入，但审批暂缓记录未能写入 bots.json（${openPlatform.result.approvalDeferredPersistWarning}），未自动上线；请重试 ${continueCommand}，不会重复创建应用。`,
+        {
+          partial: true,
+          action: 'add',
+          bot: botJsonView(bot, index),
+          appId: bot.larkAppId,
+          ...(createdAppName ? { appName: createdAppName } : {}),
+          botsFile: BOTS_JSON_FILE,
+          envMigrated: migratedEnv || undefined,
+          openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+          ...extraScopesJson,
+          continueCommand,
+          next: continueCommand,
+        },
+      );
+      return;
     }
 
     const index = existing.length;
@@ -2895,7 +3184,9 @@ async function cmdSetup(): Promise<void> {
         // appId 切换 = 换了一个飞书应用, 新 appId 大概率需要重新申请权限 + 配重定向 URL.
         // 把 printRemainingSteps 的深链端给用户, 比 README 警告里那句"历史数据不迁移"更可操作.
         if (appIdChanged) {
-          await finishOpenPlatformSetup(edited.larkAppId, botBrand(edited));
+          await finishOpenPlatformSetup(edited.larkAppId, botBrand(edited), {
+            autoAvoidApproval: edited.autoAvoidApproval !== false,
+          });
         }
         console.log(`${t('setup.common.next_restart')}\n`);
         return;
@@ -7524,7 +7815,9 @@ async function readCardUsageSnapshotForSend(
         const observedModel = snapshot.tokens?.model?.trim();
         const expectedModel = observedModel || configuredRuntime.model || session.model;
         if (snap && isStatuslineModelCompatible(resolvedCliId, snap.model, expectedModel)) {
-          const quota = toCardQuota(snap);
+          const quota = toCardQuota(snap, {
+            includeRateLimits: larkAppId ? resolveShowUsageQuota(larkAppId) : true,
+          });
           if (quota) return { ...configuredRuntime, ...snapshot, quota };
         }
       }
@@ -10656,6 +10949,7 @@ import {
   resolveBrandLabel,
   resolveReplyStyleConfig,
   resolveUsageDisplay,
+  resolveShowUsageQuota,
   resolveReplyFooterPreferences,
 } from './bot-registry.js';
 import type { ReplyCardPresentation, ReplyCardRenderSnapshot } from './services/reply-card-render.js';
@@ -11374,6 +11668,7 @@ async function registerSelfFromCredFile(): Promise<void> {
   // setting); only an isolated sandbox falls back to the worker's snapshot.
   // The cred file outlives the sandboxed session that wrote it.
   const hideLocalAddresses = resolveHideLocalAddresses(appId);
+  const showUsageQuota = resolveShowUsageQuota(appId);
   registerBot({
     larkAppId: appId,
     larkAppSecret: cred.larkAppSecret ?? '',
@@ -11389,6 +11684,7 @@ async function registerSelfFromCredFile(): Promise<void> {
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    showUsageQuota: showUsageQuota ? undefined : false,
     hideLocalAddresses: hideLocalAddresses || undefined,
   } as import('./bot-registry.js').BotConfig);
 }
@@ -11478,6 +11774,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    showUsageQuota: process.env.BOTMUX_SHOW_USAGE_QUOTA === 'false' ? false : undefined,
     hideLocalAddresses: process.env.BOTMUX_HIDE_LOCAL_ADDRESSES === '1' || undefined,
   } as unknown as import('./bot-registry.js').BotConfig;
 
@@ -16884,6 +17181,58 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('reply 仅支持从真人话题新建单个项目 Bot 的委托；已有派单继续使用原投递方式。');
     process.exit(1);
   }
+  const hasVerifiedIntoBinding = (() => {
+    if (!intoRoot || standby) return false;
+    try {
+      const secret = readDispatchReportBindingSecret(resolveDataDir()) ?? '';
+      if (!secret) return false;
+      const parsed: unknown = JSON.parse(readFileSync(join(resolveDataDir(), 'orchestrate-dispatch.json'), 'utf-8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+      if (hasVerifiedDispatchReportBindingForCaller({
+        registry: parsed as Record<string, unknown>,
+        secret,
+        dispatchRoot: intoRoot,
+        callerAppId: appId,
+        callerSessionId: sid,
+        callerChatId: s.chatId,
+        callerScope: s.scope ?? 'thread',
+      })) return true;
+      const resolved = resolveVerifiedDispatchReportTarget({
+        registry: parsed as Record<string, unknown>, secret, dispatchRoot: intoRoot,
+      });
+      // 旧绑定没有 targetScope/targetChatId。只有现有 report relay 的同一套
+      // 窄回退能证明“原会话已关闭/缺失，当前调用方是唯一活跃同群续接者”时，
+      // 才保留协议；活跃原会话、跨群、thread-scope 与多候选都继续 fail-closed。
+      if (!resolved.ok || resolved.binding.targetLarkAppId !== appId) return false;
+      const binding = resolved.binding;
+      const sessions = [...loadSessions().values()].map(session => ({
+        sessionId: session.sessionId,
+        larkAppId: session.larkAppId ?? '',
+        ...(session.chatId ? { chatId: session.chatId } : {}),
+        ...(session.scope ? { scope: session.scope } : {}),
+        ...(session.status ? { status: session.status } : {}),
+      }));
+      const originalSession = sessions.find(session =>
+        session.sessionId === binding.targetSessionId && session.larkAppId === binding.targetLarkAppId);
+      const fallback = resolveReportRelayFallbackTarget({
+        originalTarget: {
+          sessionId: binding.targetSessionId,
+          larkAppId: binding.targetLarkAppId,
+          ...(binding.targetChatId ? { chatId: binding.targetChatId } : {}),
+          ...(binding.targetScope ? { scope: binding.targetScope } : {}),
+        },
+        ...(originalSession ? { originalSession } : {}),
+        sessions,
+      });
+      return fallback.ok && fallback.target.larkAppId === appId && fallback.target.sessionId === sid;
+    } catch {
+      return false;
+    }
+  })();
+  if (intoRoot && !standby && resultDelivery !== 'relay' && !hasVerifiedIntoBinding) {
+    console.error(`--result-delivery ${resultDelivery} 仅适用于当前会话已注册的派单话题；${intoRoot} 没有指向本会话的有效派单绑定。`);
+    process.exit(1);
+  }
 
   let requestedLaunch: { model?: string; reasoningEffort?: CodexReasoningEffort } | undefined;
   let effectiveRuntime: { model: string; reasoningEffort?: CodexReasoningEffort } | undefined;
@@ -16962,11 +17311,35 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     sameTopicSendEnabled,
     resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay' | 'reply',
   });
+  // `--into` 验签先行：命中指向本调用方的已签名绑定时保留精确回报协议；
+  // 未绑定时，仅跨话题 legacy `--bot` 保留兼容协议，同话题或 `--bot-app` 不再追加无效的 `--dispatch-root`。
+  // chat-scope 只信新鲜进程树 marker / protected claim 的精确 turnId；宿主 watcher
+  // 重执行仅在其授权标记与 worker 父子绑定同时成立时使用刚注入的 turnId。
+  // 普通 BOTMUX_TURN_ID 是长驻 CLI 的启动快照，不能证明当前回合；引用回复也不是话题内落点。
+  const trustedHostRelayTurnId = process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1'
+    && isTrustedVcMeetingHostRelayParent(true, s.pid, process.ppid)
+    ? (process.env.BOTMUX_TURN_ID?.trim() || undefined)
+    : undefined;
+  const exactChatTurnId = dispatchOrigin.sessionId === s.sessionId
+    ? (dispatchTurnId ?? trustedHostRelayTurnId)
+    : undefined;
+  const exactChatReplyTarget = (s.scope ?? 'thread') === 'chat' && exactChatTurnId
+    ? pickTurnReplyTarget(s, exactChatTurnId)
+    : undefined;
+  const currentTopicRoot = (s.scope ?? 'thread') === 'chat'
+    ? (exactChatReplyTarget && exactChatReplyTarget.quoteOnly !== true
+      ? exactChatReplyTarget.rootMessageId
+      : undefined)
+    : s.rootMessageId;
+  const isSameTopicInto = !!intoRoot && currentTopicRoot === intoRoot;
+  const appendIntoCompletionProtocol = !!intoRoot && !standby && (
+    hasVerifiedIntoBinding || (!exactReportRootEnabled && resultDelivery === 'relay' && !isSameTopicInto)
+  );
   let built;
   try {
     built = buildDispatchMessages({
       title: title.trim() || '子项目',
-      brief: intoRoot && !standby ? briefWithCompletionProtocol(intoRoot) : brief,
+      brief: appendIntoCompletionProtocol ? briefWithCompletionProtocol(intoRoot!) : brief,
       bots,
     });
   } catch (err: any) {

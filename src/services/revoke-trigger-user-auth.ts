@@ -12,11 +12,12 @@
 import { existsSync } from 'node:fs';
 import type { Brand } from '../im/lark/lark-hosts.js';
 import { dropPublishedIdentitiesForOpenId } from '../core/cli-identity.js';
+import { clearAuthorizationNoticesForUser } from '../core/capability-authorization.js';
 import { clearUserToken, isUsableOpenId } from '../utils/user-token.js';
 import { bumpCliAuthEpoch } from './cli-auth-epoch.js';
 import { bytedcliHomeFor, clearBytedcliAuth, logoutBytedcli } from './bytedcli-auth.js';
 import { clearLarkCliAuth, larkCliHomeFor, logoutLarkCli } from './lark-cli-auth.js';
-import { clearMeegoAuth } from './meego-auth.js';
+import { clearMeegoAuth, stopMeegoPollersForUser } from './meego-auth.js';
 
 export type RemoteLogout = 'skipped' | 'ok' | 'failed';
 
@@ -52,6 +53,8 @@ export async function revokeTriggerUserAuth(args: {
   // Required before logoutBytedcli AND clearBytedcliAuth: SDK children can
   // recreate deleted files, but cannot stamp the newly persisted epoch.
   bumpCliAuthEpoch(args.openId);
+  stopMeegoPollersForUser(args.openId);
+  clearAuthorizationNoticesForUser(args.openId);
 
   const larkHome = larkCliHomeFor(args.openId);
   const bytedHome = bytedcliHomeFor(args.openId);
@@ -69,6 +72,9 @@ export async function revokeTriggerUserAuth(args: {
   const meego = clearMeegoAuth(args.openId);
   const userToken = clearUserToken(args.appId, args.brand, args.openId);
   const identitiesDropped = dropPublishedIdentitiesForOpenId(args.sessionDataDir, args.openId);
+  // Close the whole asynchronous revocation window: offers that started while
+  // remote logout was in flight must not survive the deletion of their login.
+  clearAuthorizationNoticesForUser(args.openId);
 
   return {
     ok: true,

@@ -54,7 +54,8 @@ import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
 import { ALL_CLI_IDS, cliAliasesSelecting, createCliAdapterSync, resolveCliName } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
-import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
+import { resolveCliRuntime, runtimeInstallationKey } from '../adapters/cli/runtime.js';
+import { cliSelectionSnapshot } from './cli-selection-snapshot.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError, forwardMessage, getChatName } from '../im/lark/client.js';
 import type { OutboundMessageOptions } from '../im/lark/client.js';
@@ -143,7 +144,7 @@ import {
   readRoleProfileEntry,
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
-import type { LarkMessage, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, SessionCliLaunchSnapshotV1, CliTurnPayload } from '../types.js';
+import type { LarkMessage, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, CliTurnPayload } from '../types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, principalLaneRoutingAnchorId, markRepoCardConsumed } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -220,28 +221,6 @@ export { SESSIONLESS_DAEMON_COMMANDS } from './command-schema.js';
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
 export { EXISTING_SESSION_ONLY_DAEMON_COMMANDS } from './command-schema.js';
-
-function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
-  const runtime = snapshotCliRuntime(resolveCliRuntime({
-    cliId,
-    context: `CLI selection ${cliId}`,
-  }));
-  return {
-    version: 1,
-    state: 'pending',
-    entryId: cliId,
-    cliId,
-    cliRuntime: runtime ?? null,
-    cliPathOverride: runtime?.source === 'configured' || runtime?.source === 'legacy-path' ? runtime.executable : null,
-    wrapperCli: null,
-    cliLaunchMode: null,
-    model: null,
-    reasoningEffort: null,
-    modelBackendVariant: null,
-    launchShell: null,
-    startupCommands: [],
-  };
-}
 
 function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean; sandbox?: boolean | 'off' | 'oncall' | 'scratch' }, cliId: string, promptInjection: PromptInjection): string | undefined {
   if (promptInjection === 'none' && !supportsZeroPromptInjectionForBot(cliId, botCfg)) return 'zero prompt injection requires a CLI with automatic final reply capture';
