@@ -2393,6 +2393,8 @@ type DaemonToWorkerBase =
   | { type: 'coco_drive_picker'; navKeys: string[]; needsReviewSubmit: boolean; comment?: string | null }
   | { type: 'set_display_mode'; mode: DisplayMode }
   | { type: 'set_locale'; locale: 'zh' | 'en' }
+  /** The bot's followUpReply switch changed while this worker runs. */
+  | { type: 'set_follow_up_reply'; enabled: boolean }
   | { type: 'term_action'; key: TermActionKey }
   /** Exact turn-level interruption. The worker verifies `turnId` against its
    * own active turn before injecting Ctrl+C and acknowledges the result. */

@@ -168,8 +168,8 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, ABSORBED_REPLY_MAX_CHARS, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, liveFoldedReplyUuids, noteHostFinalCarried, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -10883,15 +10883,32 @@ function observeThinkingAttribution(ev: TranscriptEvent, turn: BridgePendingTurn
 /** Per folded turn: the live trigger's state (takeAbsorbedReplyCandidates). */
 const absorbedReplyCollectors = new WeakMap<BridgePendingTurn, AbsorbedReplyCollector>();
 
-/** Opt-in per bot (followUpReply), fixed for this worker process. Off, a
- *  folded input is handled exactly as before: no reply of its own. */
+/** Opt-in per bot (followUpReply), as this worker process started with it.
+ *  Off, a folded input is handled exactly as before: no reply of its own. */
 function followUpReplyEnabled(): boolean {
   return lastInitConfig?.followUpReply === true;
 }
 
+/** The bot's followUpReply as the daemon last pushed it (set_follow_up_reply);
+ *  undefined until the switch changes after this worker started. */
+let followUpReplyLive: boolean | undefined;
+
+/** The daemon pushed a change of the bot's followUpReply switch. */
+function setFollowUpReplyLive(enabled: boolean): void {
+  followUpReplyLive = enabled;
+  log(`followUpReply → ${enabled ? 'on' : 'off'}`);
+}
+
+/** followUpReply for Claude Code adopt folds, which follows the switch while
+ *  the worker runs, as the daemon's posting gate does: a live reply leaves the
+ *  host turn's final, so one the daemon drops would otherwise be lost. Codex
+ *  replies leave nothing out of a final and keep the spawn-time value. */
+function foldReplyEnabled(): boolean {
+  return followUpReplyLive ?? followUpReplyEnabled();
+}
+
 /** Post a folded turn's reply and mark it answered. */
 function sendAbsorbedReply(turn: BridgePendingTurn, reply: AbsorbedInputReply, when: 'live' | 'at turn end'): void {
-  turn.absorbedReplySent = true;
   send({
     type: 'absorbed_reply',
     turnId: turn.turnId,
@@ -10903,6 +10920,10 @@ function sendAbsorbedReply(turn: BridgePendingTurn, reply: AbsorbedInputReply, w
     // posts no completion receipt, it stands as the turn's final.
     ...(replyDeliveryMode() === 'transcript' ? { turnReply: true as const } : {}),
   });
+  // Marked once handed over: a send that throws leaves the reply to the host.
+  turn.absorbedReplySent = true;
+  turn.absorbedReplyTextUuids = reply.source === 'text' && reply.text.length <= ABSORBED_REPLY_MAX_CHARS
+    ? reply.uuids : [];
   log(`Folded turn ${turn.turnId.substring(0, 8)} answered ${when} (${reply.source}, ${reply.text.length} chars)`);
 }
 
@@ -10915,7 +10936,7 @@ const FOLD_READ_OFFSETS_MAX = 32;
 
 /** Called by the polling read with the batch it is about to ingest. */
 function noteFoldReadOffsets(events: readonly TranscriptEvent[], path: string, batchOffset: number): void {
-  if (!followUpReplyEnabled()) return;
+  if (!foldReplyEnabled()) return;
   for (const ev of events) {
     if (!ev.uuid || !isMidTurnAbsorbedQueuedCommand(ev)) continue;
     foldReadOffsets.set(ev.uuid, { path, offset: batchOffset });
@@ -10943,7 +10964,7 @@ function readFoldReply(turn: BridgePendingTurn): AbsorbedInputReply | undefined 
  *  observer's local-turn exit. The reply is read from the transcript, not
  *  from what this observer saw: see takeAbsorbedReplyCandidates. */
 function observeAbsorbedReplies(ev: TranscriptEvent, host: BridgePendingTurn): void {
-  if (lastInitConfig?.adoptMode !== true || !followUpReplyEnabled() || !host.absorbedTurns?.length) return;
+  if (lastInitConfig?.adoptMode !== true || !foldReplyEnabled() || !host.absorbedTurns?.length) return;
   for (const turn of takeAbsorbedReplyCandidates(host, ev, absorbedReplyCollectors)) {
     const reply = readFoldReply(turn);
     if (reply) sendAbsorbedReply(turn, reply, 'live');
@@ -13961,18 +13982,30 @@ function emitReadyTurns(opts: {
     // answer it the way the live path does (observeAbsorbedReplies): with the
     // model's first output after the fold, which may exist only as a thinking
     // summary. It settles with its host either way.
-    if (adoptMode && followUpReplyEnabled() && turn.absorbedIntoTurnId && turn.absorbedAtUuid) {
+    if (adoptMode && foldReplyEnabled() && turn.absorbedIntoTurnId && turn.absorbedAtUuid) {
       const reply = turn.absorbedReplyAmbiguous
         ? undefined
         : absorbedInputReplyText(drained.events, turn.absorbedAtUuid);
-      if (reply) {
+      // The host's final, posted before this, already says it all: the answer
+      // goes out once, there, whole and with the host's own delivery.
+      const carried = turn.absorbedHostFinalUuids;
+      if (reply?.source === 'text' && carried && reply.uuids.every(uuid => carried.has(uuid))) {
+        observedOutputTurns.add(turn);
+        log(`Folded turn ${turn.turnId.substring(0, 8)} answered by its host turn's final`);
+      } else if (reply) {
         sendAbsorbedReply(turn, reply, 'at turn end');
         observedOutputTurns.add(turn);
       }
       continue;
     }
     const set = new Set(turn.assistantUuids);
-    const matched = drained.events.filter(e => e.uuid && set.has(e.uuid));
+    // Adopt: what already went out live as the reply to a message folded into
+    // this turn is not posted again in this turn's own final.
+    const liveReplyUuids = adoptMode && foldReplyEnabled() ? liveFoldedReplyUuids(turn) : undefined;
+    const matched = drained.events.filter(e => e.uuid && set.has(e.uuid) && !liveReplyUuids?.has(e.uuid));
+    /** This turn's final went out, `whole` or cut: folded turns whose answer
+     *  it carries whole into the chat settle on it (see the folded branch). */
+    const noteFinalCarried = (whole: boolean) => { noteHostFinalCarried(turn, matched, whole); };
     // Non-adopt fallback posts the turn's FINAL answer (text after the last
     // tool_use), not the whole-turn narration collage — joining every interim
     // block both reads as noise in Lark and inflates finalText past the
@@ -13987,7 +14020,15 @@ function emitReadyTurns(opts: {
       : trailingAssistantText(drained.events, turn.assistantUuids, replyDeliveryMode() === 'transcript'
         ? { isHousekeepingToolUse: block => isClaudeMemoryToolUse(block, path), endsWithSentinel: hasTrailingBridgeSentinelLine }
         : {});
-    if (assistantText.length === 0) continue;
+    if (assistantText.length === 0) {
+      // All this turn said went out live as replies to the messages folded
+      // into it: that is its output, so it settles as answered, with no final.
+      if (liveReplyUuids && turn.assistantUuids.some(uuid => liveReplyUuids.has(uuid))) {
+        observedOutputTurns.add(turn);
+        log(`Bridge final for turn ${turn.turnId.substring(0, 8)} not posted: all its text went out as replies to folded messages`);
+      }
+      continue;
+    }
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
     const gateInput = bridgeGateInputForTurn(sessionId, turn, {
@@ -14059,6 +14100,7 @@ function emitReadyTurns(opts: {
           kind: 'local-turn',
           userText: fields.userText,
         });
+        noteFinalCarried(postText.trim().length <= LOCAL_TURN_ASSISTANT_MAX);
         continue;
       }
       // Headless local turn — see formatHeadlessLocalTurnContent for context.
@@ -14073,6 +14115,7 @@ function emitReadyTurns(opts: {
         ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
         kind: 'local-turn-headless',
       });
+      noteFinalCarried(postText.trim().length <= LOCAL_TURN_ASSISTANT_MAX);
       continue;
     }
 
@@ -14094,6 +14137,7 @@ function emitReadyTurns(opts: {
         log(`Final output snapshot was not committed; retaining queue/journal: ${String(error)}`);
         break;
       }
+      noteFinalCarried(true);
       continue;
     }
     observedOutputTurns.add(turn);
@@ -14117,6 +14161,7 @@ function emitReadyTurns(opts: {
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
       ...(restoredTurn ? { restoredTurn } : {}),
     });
+    noteFinalCarried(true);
   }
   } catch (error) {
     bridgeQueue.restoreDrained(ready.slice(emitIndex));
@@ -42730,6 +42775,14 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // without a session restart.
       setDefaultLocale(msg.locale);
       log(`Locale → ${msg.locale}`);
+      break;
+    }
+
+    case 'set_follow_up_reply': {
+      // The dashboard flipped the bot's mid-turn reply switch. The daemon
+      // gates posting on it live, so the worker follows: off, a folded turn's
+      // reply stays in its host's final instead of being dropped from both.
+      setFollowUpReplyLive(msg.enabled);
       break;
     }
 

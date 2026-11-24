@@ -11836,6 +11836,16 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
       || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
     return jsonRes(res, status, { ok: false, error: r.reason });
   }
+  // The daemon gates mid-turn replies on the live switch; push it to this
+  // bot's running workers so they stop leaving a reply the daemon now drops
+  // out of its host turn's final (and start answering when it is turned on).
+  if (patch.followUpReply !== undefined) {
+    const registry = getActiveSessionsRegistry();
+    for (const ds of registry?.values() ?? []) {
+      if (ds.larkAppId !== cachedLarkAppId || !ds.worker || ds.worker.killed) continue;
+      try { ds.worker.send({ type: 'set_follow_up_reply', enabled: r.prefs.followUpReply }); } catch { /* worker gone */ }
+    }
+  }
   jsonRes(res, 200, { ok: true, ...r.prefs });
 }));
 
