@@ -263,6 +263,18 @@ describe('independent turn terminal receipt', () => {
     expect(call[5]?.uuid).toMatch(/^tr_[0-9a-f]{47}$/);
   });
 
+  it('posts no completed strip while the turn ended with background tasks running', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_background');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    await deliver(ds, terminalMsg('om_turn_background', { backgroundTasks: 1 }));
+    await settle(ds);
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+  });
+
   it('still posts the strip when a suspend is queued for the turn, then carries the suspend out', async () => {
     // The suspend route queues `botmux suspend` while the session works; the
     // turn's terminal is where it may run. It must not take the worker before

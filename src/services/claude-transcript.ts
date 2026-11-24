@@ -898,6 +898,8 @@ export function eventTimeMs(ev: TranscriptEvent): number | undefined {
  *  Code's structured `toolUseResult` (the launch-ack text is for the model and
  *  is not parsed here):
  *  - Agent `run_in_background` → `{ isAsync:true, status:'async_launched', agentId }`;
+ *  - Workflow → `{ status:'async_launched', taskType:'local_workflow', taskId }`,
+ *    tracked like an agent: it wakes the model when it finishes;
  *  - Bash `run_in_background` (or a command the user backgrounded) →
  *    `{ backgroundTaskId }`;
  *  - Monitor → `{ taskId, timeoutMs, persistent }`. A non-persistent Monitor
@@ -917,6 +919,9 @@ export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunc
   if (!r || typeof r !== 'object' || Array.isArray(r)) return [];
   if ((r.isAsync === true || r.status === 'async_launched') && typeof r.agentId === 'string' && r.agentId) {
     return [{ taskId: r.agentId, kind: 'agent' }];
+  }
+  if (r.status === 'async_launched' && r.taskType === 'local_workflow' && typeof r.taskId === 'string' && r.taskId) {
+    return [{ taskId: r.taskId, kind: 'agent' }];
   }
   if (typeof r.backgroundTaskId === 'string' && r.backgroundTaskId) {
     return [{ taskId: r.backgroundTaskId, kind: 'shell' }];

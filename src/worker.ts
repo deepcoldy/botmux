@@ -521,7 +521,7 @@ import {
 } from './services/antigravity-bridge-decision.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
-import { baselineJsonlCursor } from './services/jsonl-cursor.js';
+import { baselineJsonlCursor, scanJsonlFromOffset } from './services/jsonl-cursor.js';
 import { fileURLToPath } from 'node:url';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { RiffHostTools, RIFF_HOST_TOOLS_ROUTE } from './services/riff-host-tools.js';
@@ -10189,6 +10189,25 @@ function seedModelRequestClockFromTranscript(): void {
   catch (err: any) { log(`Model request clock seed skipped: ${err?.message ?? err}`); }
 }
 
+/** A worker that re-attached to a surviving Claude CLI starts with an empty
+ *  tracker although the CLI's background tasks are still running. Replay the
+ *  transcript with the CLI's start time as the launch cutoff, line by line so
+ *  a long transcript is never held in memory at once. */
+function seedBackgroundTasksFromTranscript(): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode
+    || bridgeLiveCliStartedAtMs === undefined || !bridgeJsonlPath || !existsSyncSafe(bridgeJsonlPath)) return;
+  backgroundTaskTracker.reset(bridgeLiveCliStartedAtMs);
+  scanJsonlFromOffset(bridgeJsonlPath, 0, {
+    onLine(line) {
+      let ev: unknown;
+      try { ev = JSON.parse(line); } catch { return; }
+      if (ev && typeof ev === 'object') backgroundTaskTracker.observe(ev as TranscriptEvent);
+    },
+    onError(err: any) { log(`Background task seed incomplete: ${err?.message ?? err}`); },
+  });
+  refreshBackgroundWait();
+}
+
 function modelRequestPayload(): { awaySummaryPending: boolean; modelRequestSessionId?: string; lastModelRequestAt?: number; lastActivityRequestAt?: number } {
   const claudeSessionId = modelRequestClock.boundClaudeSessionId;
   const at = modelRequestClock.lastServedAt();
@@ -13570,6 +13589,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   beginNewBridgeTranscriptGeneration();
   // Bind/seed before baseline can publish status from a previous native session.
   seedModelRequestClockFromTranscript();
+  seedBackgroundTasksFromTranscript();
   if (mode === 'fresh-empty') {
     // Non-adopt fallback: brand-new session, jsonl gets created on the first
     // user submit. We must NOT lazy-absorb the file when it appears — that
@@ -28232,9 +28252,10 @@ async function spawnCliBody(
   // respawns pass through killCli() (e.g. the retry after a crash-loop park),
   // so the per-process picker state must be reset here too.
   resetCodexModelMigrationState();
-  // Same for background tasks: they die with the CLI process. Launches the
-  // new process replays from a resumed transcript are older than this mark
-  // (floored to the second — Grok's fallback record timestamp is in seconds).
+  // A new CLI process starts without background tasks: launches replayed from
+  // a resumed transcript are older than this mark (floored to the second —
+  // Grok's fallback record timestamp is in seconds). A re-attached CLI keeps
+  // its tasks; startBridgeWatcher rebuilds them from its transcript.
   backgroundTaskTracker.reset(Math.floor(Date.now() / 1000) * 1000);
   backgroundWaitTasks = 0;
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
@@ -39595,6 +39616,7 @@ function emitTurnTerminal(
     ? turnFailureDiagnostics({ errorDetail, screen: turnFailureScreen() })
     : {};
   const directFailure = status === 'failed' && turnFailedWithoutOutput(turnId, errorCode);
+  const backgroundTasks = status === 'completed' ? backgroundTaskTracker.backgroundWait() : 0;
   const terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }> = {
     type: 'turn_terminal',
     sessionId,
@@ -39613,6 +39635,7 @@ function emitTurnTerminal(
     ...(status !== 'completed' && Number.isFinite(providerTiming?.lastSuccessAtMs)
       ? { providerLastSuccessAtMs: providerTiming!.lastSuccessAtMs } : {}),
     ...(directFailure ? { directFailure: true as const } : {}),
+    ...(backgroundTasks > 0 ? { backgroundTasks } : {}),
     ...(composerRefusal && errorCode === 'safe_composer_required' ? { composerRefusal } : {}),
   };
   const scope = workerSessionEventScope;

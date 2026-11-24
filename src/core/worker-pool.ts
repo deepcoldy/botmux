@@ -12822,6 +12822,29 @@ export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_
   const result = suspendWorker(ds, reason, stillOwned, managedSuspendAttemptId(ds, expectedOperationId));
   return primarySuspendInFlight.get(ds) ?? result;
 }
+
+type CotTerminal = Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'turnId' | 'status' | 'dispatchAttempt' | 'backgroundTasks'>;
+
+/** Closing the turn's CoT message renders 「任务已完成」. A completed turn that
+ *  ended with background tasks still running leaves it open; the message is
+ *  closed when the session's background task count reaches 0, the worker is
+ *  suspended, or a later terminal arrives. */
+function finalizeOrHoldCotMessage(ds: DaemonSession, msg: CotTerminal): void {
+  releaseHeldCotMessage(ds);
+  if (msg.status === 'completed' && msg.backgroundTasks) {
+    ds.cotHeldForBackground = { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
+    return;
+  }
+  finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+}
+
+function releaseHeldCotMessage(ds: DaemonSession): void {
+  const held = ds.cotHeldForBackground;
+  if (!held) return;
+  ds.cotHeldForBackground = undefined;
+  finalizeCotMessage(ds, held.turnId, 'completed', held.dispatchAttempt);
+}
+
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean, expectedOperationId?: string): boolean {
   const continuingController = primarySuspendApplying.has(ds) || expectedOperationId ? controllerForSession(ds) : undefined;
   const continuingOperationId = expectedOperationId ?? continuingController?.operation()?.operationId;
@@ -12922,6 +12945,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   // the dashboard hydrate this process-less logical session as idle/working.
   ds.lastScreenStatus = undefined;
   ds.backgroundTaskCount = undefined;
+  releaseHeldCotMessage(ds);
   ds.awaySummaryPending = undefined;
   // Drop the TTL clock with it: a cold-resumed worker starts from a fresh idle
   // edge, otherwise a stale stamp could get the new worker TTL-suspended almost
@@ -24336,6 +24360,7 @@ function setupWorkerHandlers(
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
           : undefined;
+        if (ds.backgroundTaskCount === undefined) releaseHeldCotMessage(ds);
         ds.awaySummaryPending = msg.awaySummaryPending === true;
         // Worker observations, so stale frames carry facts as truly as live ones.
         noteIdleAutoCompactTranscriptClock(ds, msg);
@@ -26498,7 +26523,7 @@ function setupWorkerHandlers(
             })
             .catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
         }
-        finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+        finalizeOrHoldCotMessage(ds, msg);
         ds.cotForced = undefined;
         ds.lastThinkingUpdate = undefined;
         // 「执行失败」只在下一条 IM 消息入轮时清（beginNewTurn / 输入提交）。在
@@ -27059,7 +27084,7 @@ function setupWorkerHandlers(
         // An explicit progress/auxiliary send is positive proof that the
         // visible card is non-final. The CLI already persists responseKind;
         // never overwrite that contract with a mechanical completion footer.
-        if (msg.status === 'completed' && !interimCarrierOnly) {
+        if (msg.status === 'completed' && !interimCarrierOnly && !msg.backgroundTasks) {
           // A successful explicit send is visible output even though the
           // model's final assistant block is the required suppression sentinel.
           // Only a genuinely bodyless turn may claim "AI determined no reply".
