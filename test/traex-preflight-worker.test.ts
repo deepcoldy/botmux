@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 import {
   TraexAutoModelController,
   traexAutoModelPreflightEnabled,
@@ -209,7 +210,10 @@ describe('TraeX Worker independent-turn preflight seams', () => {
     }
     try {
       await expect(run()).resolves.toBeUndefined();
-      if (retry) await vi.advanceTimersByTimeAsync(30_000);
+      // Pump the 30s catalog-retry delay in steps. A single
+      // advanceTimersByTimeAsync only flushes one microtask round under bun:test,
+      // which leaves the multi-await retry chain short of process.send.
+      if (retry) await flushFakeTimers(31_000, 50);
       expect(scope.process.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
         type: 'traex_model_pool_prune', turnId: 'next',
         ...(attempt === undefined ? {} : { dispatchAttempt: attempt }),
