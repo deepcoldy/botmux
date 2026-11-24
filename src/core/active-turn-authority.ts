@@ -7,6 +7,10 @@ export interface TurnAuthorityIdentity {
   turnId?: string;
   identityTurnId?: string;
   dispatchAttempt?: number;
+  /** The exact input history is no longer available (for example after PID-marker
+   * recovery), or an adopted input cannot be represented by `speakers`. Owner
+   * fallback must fail closed while this logical execution remains active. */
+  provenanceIncomplete?: true;
   caller?: TrustedCaller;
   /** Stable controller of the surrounding task/session. The active caller may
    * be a reviewer bot or scheduled continuation, but that must not demote the
@@ -19,6 +23,8 @@ export interface ActiveTurnAuthoritySnapshot extends TurnAuthorityIdentity {
   reservedAtMs: number;
   /** Humans whose messages are in this turn, in order of their latest message. */
   speakers?: readonly TurnSpeaker[];
+  /** Monotonic for the life of this active execution; cleared only with it. */
+  provenanceIncomplete?: true;
 }
 
 function mayControlActiveTurn(
@@ -84,6 +90,9 @@ export function sameTrustedPrincipal(
 export class ActiveTurnAuthority {
   private active?: ActiveTurnAuthoritySnapshot;
   private executionActive = false;
+  /** Exact turn most recently released, used to distinguish a normal release
+   * from a same-turn authority restoration that lost its in-memory history. */
+  private lastReleased?: ActiveTurnAuthoritySnapshot;
 
   constructor(private readonly onActiveEnvelopeChanged?: (previousTurnId: string, turnId: string) => void) {}
 
@@ -109,6 +118,13 @@ export class ActiveTurnAuthority {
     return [...(this.active?.speakers ?? [])];
   }
 
+  /** Whether this exact turn/attempt is the one most recently released. */
+  matchesLastRelease(identity: { turnId?: string; dispatchAttempt?: unknown }): boolean {
+    const dispatchAttempt = typeof identity.dispatchAttempt === 'number' ? identity.dispatchAttempt : undefined;
+    return !!identity.turnId && this.lastReleased?.turnId === identity.turnId
+      && this.lastReleased.dispatchAttempt === dispatchAttempt;
+  }
+
   identity(): TurnAuthorityIdentity {
     if (!this.active) return {};
     return {
@@ -119,6 +135,7 @@ export class ActiveTurnAuthority {
       ...(this.active.dispatchAttempt !== undefined
         ? { dispatchAttempt: this.active.dispatchAttempt }
         : {}),
+      ...(this.active.provenanceIncomplete ? { provenanceIncomplete: true } : {}),
     };
   }
 
@@ -128,12 +145,14 @@ export class ActiveTurnAuthority {
     if (this.active) {
       return !this.blocks(identity);
     }
+    this.lastReleased = undefined;
     this.active = Object.freeze({
       turnId: identity.turnId,
       ...(identity.identityTurnId ? { identityTurnId: identity.identityTurnId } : {}),
       ...(identity.dispatchAttempt !== undefined
         ? { dispatchAttempt: identity.dispatchAttempt }
         : {}),
+      ...(identity.provenanceIncomplete ? { provenanceIncomplete: true } : {}),
       ...(identity.caller ? { caller: frozenCaller(identity.caller) } : {}),
       ...(identity.controller ? { controller: frozenCaller(identity.controller) } : {}),
       speakers: withSpeaker(undefined, speakerOf(identity)),
@@ -159,6 +178,12 @@ export class ActiveTurnAuthority {
   ): boolean {
     if (!identity.turnId) return false;
     const active = this.active;
+    const speaker = speakerOf(identity);
+    // `speakers` can represent only ordinary human IM input. A later bot,
+    // schedule/recovery caller, or callerless input adopted under an existing
+    // principal must permanently revoke owner fallback for this execution.
+    const provenanceIncomplete = active?.provenanceIncomplete === true
+      || identity.provenanceIncomplete === true || (!!active && !speaker);
     this.active = Object.freeze({
       turnId: identity.turnId,
       ...(active
@@ -177,7 +202,8 @@ export class ActiveTurnAuthority {
         : identity.controller
         ? { controller: frozenCaller(identity.controller) }
         : {}),
-      speakers: withSpeaker(active?.speakers, speakerOf(identity)),
+      ...(provenanceIncomplete ? { provenanceIncomplete: true } : {}),
+      speakers: withSpeaker(active?.speakers, speaker),
       started: false,
       reservedAtMs: nowMs,
     });
@@ -197,6 +223,8 @@ export class ActiveTurnAuthority {
         ...(identity.dispatchAttempt !== undefined
           ? { dispatchAttempt: identity.dispatchAttempt }
           : {}),
+        ...(previous.provenanceIncomplete || identity.provenanceIncomplete
+          ? { provenanceIncomplete: true } : {}),
         ...(identity.caller ? { caller: frozenCaller(identity.caller) } : {}),
         ...(this.active.controller
           ? { controller: this.active.controller }
@@ -253,6 +281,7 @@ export class ActiveTurnAuthority {
 
   clear(): ActiveTurnAuthoritySnapshot | undefined {
     const prior = this.active;
+    if (prior) this.lastReleased = prior;
     this.active = undefined;
     this.executionActive = false;
     return prior;

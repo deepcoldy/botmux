@@ -246,6 +246,7 @@ import {
   fetchRollbackVersions,
   compareVersions,
   isCanonicalStableVersion,
+  parseUpdateTarget,
   isNewerVersion,
   mirrorFallbackRetryMs,
   type ChangelogResult,
@@ -293,6 +294,7 @@ import { withFileLock, FileLockTimeoutError } from './utils/file-lock.js';
 // see dashboard/managed-spawn.ts.
 import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive, installDshProfileDeps } from './dashboard/managed-spawn.js';
 import { LocalDevForceUpdates } from './utils/local-dev-force-update.js';
+import { SourceReleaseInstall } from './core/source-release-install.js';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -362,8 +364,8 @@ import {
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
-import { generateAuthUrl, handleCallbackUrl, isCallbackUrl, callbackOrigin } from './utils/user-token.js';
-import { answerOAuthLoopbackCallback } from './utils/oauth-loopback-page.js';
+import { generateAuthUrl, handleCallbackUrl, handleCallbackUrlDetailed, isCallbackUrl, callbackOrigin } from './utils/user-token.js';
+import { answerOAuthLoopbackCallback, dashboardOAuthCallbackBody } from './utils/oauth-loopback-page.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, rmwBotEntry, writeRawConfigAtomic } from './services/config-store.js';
 import {
   emitCodexNotifierOutboxItem,
@@ -413,7 +415,9 @@ import {
 } from './dashboard/compat.js';
 import { serveMissingDashboardChunk } from './dashboard/stale-chunk-http.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
-import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, withOpenPlatformAppLock, vcListenerEventGateError } from './setup/open-platform-automation.js';
+import { approvalAutomationOptionsForBot, mergeApprovalDeferredScopeBuckets, persistNewApprovalDeferredScopes } from './services/approval-deferred-scopes-store.js';
+import { buildApprovalConsoleUrl } from './setup/approval-scope-resolver.js';
 import { repairOpenPlatformRedirects } from './setup/open-platform-redirect-repair.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
@@ -1381,6 +1385,8 @@ interface ResolvedDashboardSettings {
   /** Machine-wide multi-topic orchestration switch. Default ON; the nested
    *  dispatch task-tree card switch is default OFF. */
   multiTopic: { enabled: boolean; taskTreeCard: boolean };
+  /** Machine-wide task-routing config, including advanced fields for round-trip preservation. */
+  taskRouting: import('./core/task-routing/model.js').TaskRoutingGlobalConfig & { enabled: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1821,14 +1827,34 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
     }
   } else {
     try {
-      const result = await automateOpenPlatformSetup({
-        appId: targetAppId,
-        brand,
-        maxWaitMs: 5_000,
-        onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
+      const { result, deferredPersistWarning } = await withOpenPlatformAppLock(targetAppId, async () => {
+        const result = await automateOpenPlatformSetup({
+          appId: targetAppId,
+          brand,
+          maxWaitMs: 5_000,
+          ...approvalAutomationOptionsForBot(bot),
+          onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
+        });
+        let deferredPersistWarning = '';
+        if (result.approvalDeferredScopes?.length) {
+          const persisted = await persistNewApprovalDeferredScopes(targetAppId, result.approvalDeferredScopes, {
+            onCommitted: buckets => {
+              bot.approvalDeferredScopes = mergeApprovalDeferredScopeBuckets(bot.approvalDeferredScopes, buckets);
+            },
+          });
+          if (!persisted.ok) {
+            deferredPersistWarning = `；暂缓记录写入 bots.json 失败（${persisted.reason}），下次运行仍会重试`;
+            logger.warn(`[vc-agent] failed to persist approval-deferred scopes for ${targetAppId}: ${persisted.reason}`);
+          }
+        }
+        return { result, deferredPersistWarning };
       });
       if (result.ok) {
+        const deferredNotice = result.approvalDeferredScopes?.length
+          ? `本次有 ${result.approvalDeferredScopes.length} 项权限因需人工审批被暂缓，尚未开通；请到 ${buildApprovalConsoleUrl(targetAppId, brand)} 手动申请${deferredPersistWarning}`
+          : '';
         logger.info(`[vc-agent] auto-imported ${result.scopeCount} scopes, subscribed ${result.subscribedEventCount} events for bot ${targetAppId}`);
+        if (deferredNotice) logger.warn(`[vc-agent] ${deferredNotice}`);
         if (result.scopeWarning) logger.warn(`[vc-agent] scope import warning: ${result.scopeWarning}`);
         if (result.eventWarning) logger.warn(`[vc-agent] event subscription warning: ${result.eventWarning}`);
         // 自动化「成功」不等于权限真开了：internal scope/update 可能静默跳过本租户
@@ -1837,7 +1863,11 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
         if (!scopeCheck.ok) {
           return {
             ok: false,
-            error: `vcMeetingBot_preflight_missing_scopes_after_auto: ${scopeCheck.error}。请到开放平台手动开通 VC 会议权限后重试。`,
+            error: `vcMeetingBot_preflight_missing_scopes_after_auto: ${scopeCheck.error}。${result.versionPendingReview
+              // 版本停在企业审核时权限还没生效，此时「手动开通」既做不到也不必要。
+              ? `新版本 ${result.pendingReviewAppVersion ?? result.versionId ?? ''} 已提交，正在等待企业管理员审核，`
+                + '审核通过后权限才生效，届时再重试（审批进度可在飞书「审批」里查看）。'
+              : '请到开放平台手动开通 VC 会议权限后重试。'}${deferredNotice ? `。${deferredNotice}` : ''}`,
           };
         }
         // 事件订阅同样关键：缺任一 VC 事件都收不到会议邀请(用 missingVcEvents 判定,
@@ -1879,11 +1909,13 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
         if (!scopeCheck.ok) {
           // 「应用正在审核中」时**手动也开不了**：审核期间开放平台锁定配置写入，连
           // scope/update 都拒（实测 code=10046）。给「请手动开通」这种做不到的建议
-          // 比不给更糟，所以这条单独措辞成「等审批通过」。
-          // ⚠️ 不说「等审批通过」：触发审批通常意味着有配置不合规，那一版不会自己通过。
+          // 比不给更糟。审批可能正常排队等企业管理员处理，也可能被版本里需企业管理员审批的
+          // 敏感权限或配置不合规卡住：先看审批进度，长期不动再取消敏感权限或修配置后撤回重提。
           const advice = reason === 'app_under_review'
-            ? '该应用有一个版本卡在飞书审核中，配置写入被锁（手动开通同样会被拒）。触发审批通常说明有配置不合规'
-              + '（最常见：权限的数据范围默认成「全部/全员」）；需人工到开放平台看审批详情、修掉不合规项后撤回该版本重提，再重试。'
+            ? '该应用有一个版本正在等待企业管理员审核，配置写入被锁（手动开通同样会被拒），审批进度可在飞书「审批」里查看，审核通过后再重试。'
+              + '若审批长时间没有进展或被驳回，通常是版本里有需要企业管理员审批的权限（例如用户身份的 im:resource），'
+              + '或权限数据范围默认成「全部/全员」等配置问题：在开放平台这一版的版本详情里取消用不到的敏感权限，'
+              + '或修好配置后撤回该版本重提，再重试。'
             : '请手动开通后重试。';
           return {
             ok: false,
@@ -2037,6 +2069,10 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     multiTopic: {
       enabled: global.multiTopic?.enabled !== false, // default ON
       taskTreeCard: global.multiTopic?.taskTreeCard === true, // default OFF
+    },
+    taskRouting: {
+      ...global.taskRouting,
+      enabled: global.taskRouting?.enabled === true, // default OFF
     },
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
@@ -2233,6 +2269,26 @@ let updateInFlight = false;
 // update, and restart requests do not reuse the removed old runtime realpath.
 let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
 let pendingBinaryRestart: { target: string; version: string } | undefined;
+let sourceReleaseBackup: string | null | undefined;
+const sourceReleaseInstall = new SourceReleaseInstall();
+
+function restoreSourceReleaseInstall(): void {
+  if (!isLocalDevInstall()) {
+    sourceReleaseInstall.complete(process.execPath, isStandaloneBinary(), resolveCurrentVersion());
+    return;
+  }
+  const installed = sourceReleaseInstall.recover(botmuxInstallRoot(), (target, version) => verifyBinaryRestartTarget({ target, version }));
+  if (installed) {
+    pendingBinaryRestart = { target: installed.target, version: installed.version };
+    sourceReleaseBackup = installed.backupLauncher;
+    pendingLocalDevRestart = undefined;
+  } else {
+    // A deliberate source restoration must also retire this process's cached
+    // binary handoff, rather than keep blocking updates/restart on an old plan.
+    pendingBinaryRestart = undefined;
+    sourceReleaseBackup = undefined;
+  }
+}
 // Live progress of a standalone-binary download running in THIS dashboard
 // process (the ~174MB asset makes the run request long-lived). Surfaced via
 // /api/update/status for the UI poller; undefined outside a binary swap.
@@ -2280,7 +2336,7 @@ let rollbackVersionLookupInFlight: { current: string; value: Promise<RollbackVer
 async function cachedLatestVersion(force = false): Promise<LatestVersionCache> {
   const now = Date.now();
   const strategy = currentUpdateStrategy(botmuxInstallRoot());
-  const releaseBacked = strategy.kind === 'self-replace' || strategy.kind === 'install-release';
+  const releaseBacked = isLocalDevInstall() || strategy.kind === 'self-replace' || strategy.kind === 'install-release';
   if (!force
     && latestVersionCache?.releaseBacked === releaseBacked
     && now - latestVersionCache.at < latestVersionCache.ttlMs) {
@@ -2364,6 +2420,7 @@ async function cachedRollbackVersions(current: string, force = false): Promise<R
 }
 
 function currentInstalledVersion(): string {
+  restoreSourceReleaseInstall();
   if (pendingBinaryRestart) return pendingBinaryRestart.version;
   if (!lastSuccessfulUpdatePlan) return resolveCurrentVersion();
   const version = botmuxVersionAt(lastSuccessfulUpdatePlan.activePackageRoot);
@@ -4381,7 +4438,7 @@ const server = createServer(async (req, res) => {
         return;
       }
       // state 只在生成链接的那个 daemon 进程内存里，逐个询问在线 daemon。
-      let outcome: { ok: boolean; message: string } | null = null;
+      let outcome: { ok: boolean; message: string; warning?: string } | null = null;
       for (const d of registry.list()) {
         try {
           const r = await fetchDaemonIpc(d.ipcPort, '/api/oauth-callback', {
@@ -4390,7 +4447,10 @@ const server = createServer(async (req, res) => {
             body: JSON.stringify({ url: url.toString() }),
           });
           const j: any = await r.json().catch(() => null);
-          if (j?.matched) { outcome = { ok: !!j.ok, message: String(j.message ?? '') }; break; }
+          if (j?.matched) {
+            outcome = { ok: !!j.ok, message: String(j.message ?? ''), ...(typeof j.warning === 'string' && j.warning ? { warning: j.warning } : {}) };
+            break;
+          }
         } catch { /* daemon offline mid-iteration — try the next */ }
       }
       if (!outcome) {
@@ -4399,7 +4459,7 @@ const server = createServer(async (req, res) => {
       }
       page(
         outcome.ok ? '授权完成' : '授权失败',
-        outcome.ok ? '已完成授权，本页可以关闭。回到 Dashboard 即可看到状态更新。' : outcome.message,
+        dashboardOAuthCallbackBody(outcome),
         outcome.ok,
       );
       return;
@@ -5203,7 +5263,9 @@ const server = createServer(async (req, res) => {
       // and tell an npm user their install method is unsupported. Resolve the
       // strategy by BINARY LOCATION first; only fall back to the package-root
       // classification for the Node path (unchanged there).
-      const updateStrategy = currentUpdateStrategy(classifyRoot);
+      const updateStrategy = pendingBinaryRestart
+        ? { kind: 'self-replace' as const, target: pendingBinaryRestart.target }
+        : currentUpdateStrategy(classifyRoot);
       const installPlan = updateStrategy.kind === 'package-manager'
         ? tryResolveGlobalInstallPlan(updateStrategy.packageRoot)
         : null;
@@ -5240,7 +5302,7 @@ const server = createServer(async (req, res) => {
         ...(entry.installTarget ? { installTarget: entry.installTarget } : {}),
         lastCheckedAt: entry.lastCheckedAt,
       }));
-      const localDev = isLocalDevInstall();
+      const localDev = isLocalDevInstall() && !pendingBinaryRestart;
       const runningDaemons = registry.list().map(d => ({
         larkAppId: d.larkAppId,
         version: d.botmuxVersion,
@@ -5267,6 +5329,9 @@ const server = createServer(async (req, res) => {
         cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
         cliUpdates,
         localDevInstall: localDev,
+        sourceReleaseAvailable: localDev && releaseAssetName() !== null,
+        sourceReleasePending: isLocalDevInstall() && !!pendingBinaryRestart,
+        ...(sourceReleaseBackup ? { sourceReleaseBackup } : {}),
         // Local-dev can self-update via git pull + build only when the checkout
         // the wrapper points at is a real git worktree; otherwise the button
         // stays disabled (there is nothing to pull).
@@ -5332,10 +5397,18 @@ const server = createServer(async (req, res) => {
       // 不含「改代码并重启」——那属于 debug shell 同一档的整机控制权。
       if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       let forceToken: string | undefined;
+      let sourceReleaseVersion: string | undefined;
       if (req.headers['content-type']?.includes('application/json')) {
         try {
-          const body = await readJsonBody(req, 4096) as { forceLocal?: unknown; previewToken?: unknown } | null;
-          if (body?.forceLocal !== undefined) {
+          const body = await readJsonBody(req, 4096) as { forceLocal?: unknown; previewToken?: unknown; installRelease?: unknown; version?: unknown } | null;
+          if (body?.installRelease !== undefined) {
+            if (body.installRelease !== true || !isLocalDevInstall() || releaseAssetName() === null
+              || typeof body.version !== 'string' || !isCanonicalStableVersion(body.version)
+              || Object.keys(body).some(key => key !== 'installRelease' && key !== 'version')) {
+              return jsonRes(res, 400, { ok: false, error: 'invalid_source_release_install' });
+            }
+            sourceReleaseVersion = body.version;
+          } else if (body?.forceLocal !== undefined) {
             if (body.forceLocal !== true || typeof body.previewToken !== 'string' || !body.previewToken || !isLocalDevInstall()) {
               return jsonRes(res, 400, { ok: false, error: 'invalid_force_update' });
             }
@@ -5343,10 +5416,68 @@ const server = createServer(async (req, res) => {
           }
         } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
       }
+      restoreSourceReleaseInstall();
+      if (isLocalDevInstall() && pendingBinaryRestart) return jsonRes(res, 409, { ok: false, error: 'source_release_restart_required' });
+      if (sourceReleaseVersion) {
+        if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        updateInFlight = true;
+        let acquired = false;
+        let blockedByRestart = false;
+        let oldVersion = '';
+        let source: string | undefined;
+        let blockedBySourceRelease = false;
+        let installed: Awaited<ReturnType<SourceReleaseInstall['install']>> | undefined;
+        try {
+          const latest = await cachedLatestVersion(false);
+          if (!latest.value) return jsonRes(res, 503, { ok: false, error: 'version_lookup_failed' });
+          if (latest.value !== sourceReleaseVersion) return jsonRes(res, 409, { ok: false, error: 'source_release_version_changed' });
+          oldVersion = currentInstalledVersion();
+          await withFileLock(globalInstallUpdateLockTarget(), async () => {
+            acquired = true;
+            if (hasActiveRestartLease()) { blockedByRestart = true; return; }
+            restoreSourceReleaseInstall();
+            if (pendingBinaryRestart) { blockedBySourceRelease = true; return; }
+            installed = await sourceReleaseInstall.install(sourceReleaseVersion!, botmuxInstallRoot(), async (target, beforeSwap) => {
+              const result = await applyStandaloneUpdate(sourceReleaseVersion!, {
+                currentVersion: oldVersion, target, updateTarget: parseUpdateTarget(sourceReleaseVersion!)!,
+              }, {
+                onProgress: progress => {
+                  if (progress.phase === 'swap') beforeSwap();
+                  binaryUpdateProgress = { version: sourceReleaseVersion!, ...progress };
+                },
+              });
+              if (result.skipped) throw new Error('source release installation was skipped');
+              source = result.source;
+            });
+            pendingLocalDevRestart = undefined;
+            pendingBinaryRestart = installed.state === 'completed' ? undefined : { target: installed.target, version: installed.version };
+            if (installed.state === 'completed') sourceReleaseBackup = undefined;
+          }, { maxWaitMs: 2_000 });
+        } catch (error) {
+          if (!acquired && error instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          const code = (error as { code?: unknown }).code;
+          return jsonRes(res, typeof code === 'string' && code.startsWith('source_release_') ? 409 : 500, {
+            ok: false, error: typeof code === 'string' ? code : 'install_failed',
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          updateInFlight = false;
+          binaryUpdateProgress = undefined;
+        }
+        if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        if (blockedBySourceRelease) return jsonRes(res, 409, { ok: false, error: 'source_release_restart_required' });
+        return jsonRes(res, 200, {
+          ok: true, oldVersion, newVersion: sourceReleaseVersion, source,
+          changed: installed?.state !== 'completed', restartRequired: installed?.state !== 'completed',
+          manager: 'binary', sourceReleaseInstalled: true,
+          ...(installed?.state === 'completed' ? { sourceReleaseCompleted: true } : {}),
+          backupLauncher: installed?.backupLauncher,
+        });
+      }
       // 本地 checkout：走 git pull --ff-only + bun run build（与 CLI cmdUpgradeLocalDev
       // 共用 local-dev-update 逻辑），而不是全局包管理器安装。重启仍走下方
       // /api/update/restart 的 lease/intent 路径。
-      if (isLocalDevInstall()) {
+      if (isLocalDevInstall() && !pendingBinaryRestart) {
         const node = checkNode();
         if (!node.ok) return jsonRes(res, 400, { ok: false, error: 'node_too_old', node });
         if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
@@ -5354,10 +5485,13 @@ const server = createServer(async (req, res) => {
         let acquired = false;
         let blockedByRestart = false;
         let result: Awaited<ReturnType<typeof runLocalDevUpdate>> | undefined;
+        let blockedBySourceRelease = false;
         try {
           await withFileLock(globalInstallUpdateLockTarget(), async () => {
             acquired = true;
             if (hasActiveRestartLease()) { blockedByRestart = true; return; }
+            restoreSourceReleaseInstall();
+            if (pendingBinaryRestart) { blockedBySourceRelease = true; return; }
             pendingLocalDevRestart = undefined;
             result = await runLocalDevUpdate(forceToken);
           }, { maxWaitMs: 2_000 });
@@ -5384,6 +5518,7 @@ const server = createServer(async (req, res) => {
           updateInFlight = false;
         }
         if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        if (blockedBySourceRelease) return jsonRes(res, 409, { ok: false, error: 'source_release_restart_required' });
         // Pin THIS build's checkout + HEAD so the follow-up restart applies it,
         // even if the wrapper is re-pointed by a concurrent `use:here` before the
         // user confirms the restart. Consumed (and re-verified) in /api/update/restart.
@@ -5407,7 +5542,9 @@ const server = createServer(async (req, res) => {
       // 编译版独立二进制（install.sh 形态）：没有包管理器拥有这个文件，改为下载
       // 对应平台的 release 资产、校验 SHA-256 后原子替换自身。npm 子包形态不走
       // 这里 —— 那棵树归 npm 所有，交回 npm 更新（见 binary-self-update.ts 头部）。
-      const runStrategy = currentUpdateStrategy(botmuxInstallRoot());
+      const runStrategy = pendingBinaryRestart
+        ? { kind: 'self-replace' as const, target: pendingBinaryRestart.target }
+        : currentUpdateStrategy(botmuxInstallRoot());
       if (runStrategy.kind === 'self-replace' || runStrategy.kind === 'install-release') {
         if (runStrategy.kind === 'install-release' && releaseAssetName() === null) {
           return jsonRes(res, 400, { ok: false, error: 'release_asset_unavailable' });
@@ -5727,6 +5864,7 @@ const server = createServer(async (req, res) => {
       // owner-only：重启会打断 owner 正在跑的所有会话。
       if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      restoreSourceReleaseInstall();
       // (pm2 shutdown-capability preflight removed with the fleet pm2→supervisor
       // migration: the supervisor has no "bootstrap-shutdown-protocol" policy to
       // probe. A restart failure surfaces through the detached child's own error
@@ -5745,7 +5883,7 @@ const server = createServer(async (req, res) => {
       // the build; on drift/absence fail closed rather than restart the wrong tree.
       let localDevRestartError: { status: number; body: Record<string, unknown> } | undefined;
       let localDevTarget: string | undefined;
-      if (isLocalDevInstall()) {
+      if (isLocalDevInstall() && !pendingBinaryRestart) {
         const pinned = pendingLocalDevRestart;
         pendingLocalDevRestart = undefined; // consume regardless of outcome
         const decision = resolveLocalDevRestartTarget(pinned, resolveLocalDevCheckoutDir(), {
@@ -6325,6 +6463,7 @@ const server = createServer(async (req, res) => {
         workingDir?: unknown;
         dirMode?: unknown;
         model?: unknown;
+        autoAvoidApproval?: unknown;
         requireCriticalScopesBeforeActivation?: unknown;
       };
       try {
@@ -6433,6 +6572,7 @@ const server = createServer(async (req, res) => {
         workingDir,
         dirMode,
         model,
+        ...(typeof parsed.autoAvoidApproval === 'boolean' ? { autoAvoidApproval: parsed.autoAvoidApproval } : {}),
         ...(parsed.requireCriticalScopesBeforeActivation === true
           ? { requireCriticalScopesBeforeActivation: true }
           : {}),
@@ -8469,7 +8609,7 @@ const oauthCallbackServer = createServer(async (req, res) => {
   // to send it.
   const page = await answerOAuthLoopbackCallback(url.toString(), {
     origin: callbackOrigin,
-    consume: handleCallbackUrl,
+    consume: handleCallbackUrlDetailed,
     onError: error => logger.warn(`[dashboard] OAuth loopback callback failed: ${(error as Error).message}`),
   });
   res.writeHead(page.status, {

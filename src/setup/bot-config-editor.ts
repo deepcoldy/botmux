@@ -244,6 +244,8 @@ export interface BotConfigEditInput {
    *   - '' / '-' → 清空（回到默认 ON）
    */
   showInTeam?: string;
+  /** 飞书开放平台预判卡审批时草稿态自动二分避开需审权限（默认 ON；仅 false 落盘）。 */
+  autoAvoidApproval?: string;
   /** UI 语言：zh 或 en；'-' 或 null 清空。 */
   lang?: string | null;
 }
@@ -343,6 +345,10 @@ export function assertUniqueBotProcessNames(
     if (reserved.has(name)) {
       throw new Error(`进程名 "${name}" 是保留名, 请改用其他 "name" 值.`);
     }
+    const pluginPrefix = `${prefix}-plugin-`;
+    if (name.startsWith(pluginPrefix)) {
+      throw new Error(`进程名 "${name}" 使用了插件 service 保留前缀 "${pluginPrefix}", 请改 "name" 避免使用该前缀.`);
+    }
     const firstIndex = seen.get(name);
     if (firstIndex !== undefined) {
       throw new Error(
@@ -402,7 +408,7 @@ function applyOptionalBoolean(
 
 export function parseBotSelection(
   input: string,
-  bots: Array<{ larkAppId?: string; name?: unknown }>,
+  bots: Array<{ larkAppId?: string; name?: unknown; displayName?: unknown }>,
 ): number | undefined {
   const raw = input.trim();
   if (!raw) return undefined;
@@ -424,7 +430,10 @@ export function parseBotSelection(
   if (byConfiguredName >= 0) return byConfiguredName;
 
   const byProcessName = bots.findIndex((b, i) => botProcessName(b, i) === raw);
-  return byProcessName >= 0 ? byProcessName : undefined;
+  if (byProcessName >= 0) return byProcessName;
+  const displayed = bots.map((bot, index) => ({ bot, index }))
+    .filter(({ bot }) => typeof bot.displayName === 'string' && bot.displayName.trim() === raw);
+  return displayed.length === 1 ? displayed[0]!.index : undefined;
 }
 
 /**
@@ -470,6 +479,7 @@ export const CLONE_EXCLUDED_KEYS = [
   'activationStarting',
   'activationCommitted',
   'extraScopesFile',
+  'approvalDeferredScopes',
 ] as const;
 
 /**
@@ -559,7 +569,13 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   const out: Record<string, any> = { ...bot };
 
   const appId = trimmed(input.larkAppId);
-  if (appId) out.larkAppId = appId;
+  if (appId) {
+    if (appId !== bot.larkAppId) {
+      // approvalDeferredScopes 是原飞书应用的权限审批记录，换绑新应用后不得继承。
+      delete out.approvalDeferredScopes;
+    }
+    out.larkAppId = appId;
+  }
 
   const name = normalizeBotProcessName(input.name);
   if (input.name !== undefined) {
@@ -717,6 +733,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
 
   // 平台团队展示默认 ON → 只把显式 false 落盘。
   applyOptionalBoolean(out, 'showInTeam', input.showInTeam, true);
+  // 开放平台卡审批自动避开默认 ON → 只把显式 false 落盘。
+  applyOptionalBoolean(out, 'autoAvoidApproval', input.autoAvoidApproval, true);
 
   if (input.lang !== undefined) {
     if (input.lang === null || input.lang.trim() === '-') {

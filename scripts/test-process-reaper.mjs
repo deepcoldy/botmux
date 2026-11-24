@@ -130,19 +130,36 @@ function registeredServers(root) {
   return [...refs.values()];
 }
 
+/** Socket -> pids of the clients that announced a server start on it. A
+ *  record without a pid (older fence) has an empty set. */
 function registeredServerIntents(root) {
-  const sockets = new Set();
+  const intents = new Map();
   for (const file of registryFiles(root, TMUX_SERVER_LOG_BASENAME)) {
     let lines = [];
     try { lines = readFileSync(file, 'utf8').split('\n').filter(Boolean); } catch { continue; }
     for (const line of lines) {
-      if (line.startsWith('pending\t')) {
-        const socket = line.slice('pending\t'.length);
-        if (socket.startsWith('/')) sockets.add(socket);
-      }
+      if (!line.startsWith('pending\t')) continue;
+      const [, socket, rawPid] = line.split('\t');
+      if (!socket?.startsWith('/')) continue;
+      const clients = intents.get(socket) ?? new Set();
+      const pid = Number(rawPid);
+      if (Number.isSafeInteger(pid) && pid > 1) clients.add(pid);
+      intents.set(socket, clients);
     }
   }
-  return sockets;
+  return intents;
+}
+
+/** A live, non-zombie process. Unknown evidence counts as alive. */
+function clientAlive(pid) {
+  if (process.platform === 'linux') {
+    let stat;
+    try { stat = readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch (error) {
+      return error?.code !== 'ENOENT' && error?.code !== 'ESRCH';
+    }
+    return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3) !== 'Z';
+  }
+  try { process.kill(pid, 0); return true; } catch (error) { return error?.code === 'EPERM'; }
 }
 
 /** Parse `lsof -n -U -F pcn` for non-Linux hosts (notably macOS). */
@@ -221,13 +238,15 @@ function discoverTmuxServers(sockets) {
 }
 
 function reapingCandidates(registered, intents) {
-  const discovered = discoverTmuxServers(intents);
+  const discovered = discoverTmuxServers(new Set(intents.keys()));
   const refs = new Map();
   for (const ref of [...registered, ...discovered.refs]) refs.set(`${ref.pid}\t${ref.identity}\t${ref.socket}`, ref);
-  const pending = [...intents].filter(socket => ![...refs.values()].some(ref => ref.socket === socket));
+  // Registered rows are append-only history: a dead server's row must not hide
+  // a later start on the same socket. Only a current discovery settles an intent.
+  const pending = [...intents.keys()].filter(socket => !discovered.refs.some(ref => ref.socket === socket));
   const unresolved = discovered.ok ? [] : pending
     .map(socket => ({ pid: 0, identity: 'inspection_unknown', socket }));
-  return { refs: [...refs.values()], pending, unresolved };
+  return { refs: [...refs.values()], discoveredRefs: discovered.refs, pending, unresolved };
 }
 
 function reapServer(ref) {
@@ -306,19 +325,51 @@ function sandboxPids(scripts) {
  * Last-chance cleanup for a fence root or a Bun child's scratch root. Nested
  * bmxt-* directories cover a child killed before its own afterAll could run.
  */
+/** Bounds for a server start announced by a client that may still be running. */
+const LEGACY_INTENT_GRACE_MS = 2_000;
+const INTENT_STARTUP_CAP_MS = 15_000;
+
 export function reapRegisteredTestProcesses(root) {
   const registered = registeredServers(root);
   const intents = registeredServerIntents(root);
-  // A client may have detached its server without binding the socket yet. Give
-  // that startup a bounded chance to publish evidence instead of treating the
-  // first empty snapshot as death. The runner invokes this BEFORE killTree too.
-  const intentDeadline = Date.now() + 2_000;
+  // A client may have detached its server without binding the socket yet. A
+  // fixed window lost that race on a loaded CI host: the server came up after
+  // the wait and outlived the run. Wait as long as the announcing client is
+  // alive (it exits once its server is up or has failed), bounded; a record
+  // without a client pid keeps the old short grace. A socket whose server was
+  // already found is settled, even though its reaped server no longer shows.
+  // The runner invokes this BEFORE killTree too.
+  const start = Date.now();
+  const settled = new Set();
   let candidates;
   let tmuxFailed;
-  for (;;) {
+  const sweep = () => {
     candidates = reapingCandidates(registered, intents);
+    for (const ref of candidates.discoveredRefs) settled.add(ref.socket);
     tmuxFailed = [...candidates.unresolved, ...candidates.refs.filter(ref => !reapServer(ref))];
-    if (candidates.pending.length === 0 || Date.now() >= intentDeadline) break;
+  };
+  for (;;) {
+    sweep();
+    const now = Date.now();
+    const starting = candidates.pending.filter((socket) => {
+      if (settled.has(socket)) return false;
+      const clients = intents.get(socket);
+      return clients.size > 0
+        ? [...clients].some(clientAlive)
+        : now - start < LEGACY_INTENT_GRACE_MS;
+    });
+    if (starting.length === 0) {
+      // The last client can exit after the discovery above but before the
+      // liveness check, with its server becoming visible in that gap. A single
+      // sweep caller has no later pass to catch it, so close that window now.
+      if (candidates.pending.some(socket => !settled.has(socket))) sweep();
+      break;
+    }
+    if (now - start >= INTENT_STARTUP_CAP_MS) {
+      // Never report success over a server that may still appear.
+      tmuxFailed.push(...starting.map(socket => ({ pid: 0, identity: 'startup_unsettled', socket })));
+      break;
+    }
     sleep(25);
   }
   const scripts = new Set(registeredSandboxScripts(root));

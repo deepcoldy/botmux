@@ -56,7 +56,7 @@ describe('structured turn send attribution retirement', () => {
         markerIdentityTurnId: loadWorkerFunction('markerIdentityTurnId', { isValidMarkerIdentityTurnId }),
         emittedTurnTerminals: new TurnTerminalDeduper(),
       });
-      for (const name of ['setCaptureIdentity', 'adoptInitialActiveTurn', 'writeCliPidMarker',
+      for (const name of ['setCaptureIdentity', 'adoptInitialActiveTurn', 'writeCliPidMarker', 'activeAuthorityMatchesMarker',
         'turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive']) {
         h[name] = loadWorkerFunction(name, h);
       }
@@ -151,6 +151,7 @@ describe('structured turn send attribution retirement', () => {
       for (const name of ['turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive']) {
         h[name] = loadWorkerFunction(name, h);
       }
+      h.activeAuthorityMatchesMarker = loadWorkerFunction('activeAuthorityMatchesMarker', h);
       h.writeCliPidMarker = loadWorkerFunction('writeCliPidMarker', h);
       h.retireStructuredTurnAttribution([{ turnId: 'first' }, { turnId: 'extra' }]);
       const saved = JSON.parse(readFileSync(marker, 'utf8'));

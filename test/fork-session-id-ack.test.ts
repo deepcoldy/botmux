@@ -17,6 +17,7 @@ function setup() {
     sessionStore: { updateSession: update }, recordOwnershipForDaemonSession: ownership,
     noteProjectAssociationChanged: associationChanged,
     managedAuxUiSuppressed: () => true,
+    syncAntigravityGroupTitle: vi.fn(),
   });
   return { ds, update, ownership, associationChanged, handle };
 }

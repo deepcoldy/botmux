@@ -179,9 +179,9 @@ describe('巡检提示', () => {
     await service.sweepHints(t0 + 4 * HOUR);
     expect(item(seq).hint).toBeUndefined();
 
-    // 重设复查时间：新的时间到了再标、再通知一次（key 带复查时间）。
-    await set(seq, { nextCheck: '+1h' });
-    await service.sweepHints(Date.now() + 2 * HOUR);
+    // 重设复查时间：新的时间到了再标、再通知一次（key 带复查时间）。时间按前面的往后走（历史是 t0+3.5h 记的）。
+    service.store().updateItem(APP, seq, { nextCheckAt: t0 + 5 * HOUR }, 'sess-1', t0 + 4 * HOUR);
+    await service.sweepHints(t0 + 6 * HOUR);
     expect(item(seq).hint).toMatchObject({ kind: 'stale' });
     expect(delivered).toHaveLength(2);
 

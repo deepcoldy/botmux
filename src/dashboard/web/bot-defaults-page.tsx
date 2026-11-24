@@ -665,6 +665,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     codexBrowserAutoApproveOrigins: body.codexBrowserAutoApproveOrigins,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     goalStatusCard: body.goalStatusCard,
+    followUpReply: body.followUpReply,
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
     replyCardNextStep: body.replyCardNextStep,
@@ -1161,6 +1162,7 @@ function BotDefaultsCard(props: {
           <BdTabGrid>
             <section className="bd-tile" id={botDefaultsSectionDomId('session-mode')}><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('steward')}><StewardSection bot={bot} patchBot={patchBot} active={props.activeTab === 'sessions'} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('task-routing')}><TaskRoutingSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('substitute')}><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('command-trigger')}><CommandTriggerSection bot={bot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('cross-bot')}>
@@ -1197,6 +1199,9 @@ function BotDefaultsCard(props: {
             ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('trigger-user-auth')}><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('lark-tool-binding')}><LarkToolBindingSection bot={bot} patchBot={patchBot} /></section>
+            {!bot.apiOnly && bot.brand !== 'lark' ? (
+              <section className="bd-tile" id={botDefaultsSectionDomId('approval-compat')}><AutoAvoidApprovalSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('grant')}><GrantSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('blocked-users')}><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('slash-commands')}><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
@@ -1235,7 +1240,7 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('envelope-injection')}><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
-            {/* 转写回复模式对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
+            {/* 自动转发最终回复开关对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
                 避免用户在别的 tab 找不到这个开关却在 /botconfig 里能设。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('prompt-injection')}>
               <PromptInjectionSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} />
@@ -2319,12 +2324,19 @@ function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot:
         patchBot(bot.larkAppId, current => ({
           ...current,
           botName: effective,
-          larkBotName: res.body.mode === 'feishu' ? nextName : current.larkBotName,
-          displayName: res.body.mode === 'feishu' ? null : nextName,
+          larkBotName: res.body.mode === 'feishu'
+            ? (typeof res.body.larkBotName === 'string' ? res.body.larkBotName : nextName)
+            : current.larkBotName,
+          displayName: res.body.mode === 'feishu'
+            ? (typeof res.body.displayName === 'string' ? res.body.displayName : null)
+            : nextName,
         }));
         setEditMode(false);
         if (res.body.mode === 'feishu') {
-          setStatus({ text: `✓ ${tr('botDefaults.renameOkFeishu')}`, ok: true });
+          const localSyncError = typeof res.body.localSyncError === 'string' ? res.body.localSyncError : '';
+          setStatus(localSyncError
+            ? { text: `⚠ ${localSyncError}` }
+            : { text: `✓ ${tr('botDefaults.renameOkFeishu')}`, ok: true });
           setLoginVisible(false);
         } else {
           setStatus({ text: `⚠ ${renameWarningText(String(res.body.warning ?? ''), res.body.message)}` });
@@ -4836,7 +4848,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   );
 }
 
-function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot, patchBot } = props;
   const bound = bot.larkToolBinding !== false;
@@ -4857,6 +4869,29 @@ function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
+  // 没有发起人时 --as user 用主人的飞书身份。按触发人鉴权覆盖飞书用户身份时只认发起人本人，
+  // 应用绑定关闭时 lark-cli 走本机原生环境：两种情况下这个开关都不起作用。
+  const ownerFallback = bot.larkUserOwnerFallback !== false;
+  const tua = bot.triggerUserAuth;
+  const perPersonLark = tua?.enabled === true
+    && (tua.capabilities ? tua.capabilities.includes('lark-user') : (tua.tools ?? []).includes('lark-cli'));
+  const [fallbackBusy, setFallbackBusy] = useState(false);
+  const [fallbackStatus, setFallbackStatus] = useState<StatusMessage>(null);
+
+  async function saveOwnerFallback(next: boolean): Promise<void> {
+    const previous = ownerFallback;
+    patchBot(bot.larkAppId, { larkUserOwnerFallback: next });
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/lark-user-owner-fallback`, {
+        enabled: next,
+      }),
+      setStatus: setFallbackStatus,
+      setBusy: setFallbackBusy,
+      saved: tr('botDefaults.larkUserOwnerFallbackSaved'),
+      rollback: () => patchBot(bot.larkAppId, { larkUserOwnerFallback: previous }),
+    });
+  }
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionLarkToolBinding')}</h3>
@@ -4870,6 +4905,61 @@ function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
       />
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-lark-tool-binding-status': '' }} />
+      </div>
+      <ToggleRow
+        checked={ownerFallback}
+        disabled={fallbackBusy || !bound || perPersonLark}
+        dataAction="toggle-lark-user-owner-fallback"
+        title={tr('botDefaults.larkUserOwnerFallbackToggle')}
+        help={tr('botDefaults.larkUserOwnerFallbackHelp')}
+        onChange={checked => void saveOwnerFallback(checked)}
+      />
+      {perPersonLark ? (
+        <p className="bd-section-note" data-lark-user-owner-fallback-note="per-person">{tr('botDefaults.larkUserOwnerFallbackPerPerson')}</p>
+      ) : !bound ? (
+        <p className="bd-section-note" data-lark-user-owner-fallback-note="unbound">{tr('botDefaults.larkUserOwnerFallbackUnbound')}</p>
+      ) : null}
+      <div className="actions">
+        <StatusSpan status={fallbackStatus} attr={{ 'data-lark-user-owner-fallback-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+function AutoAvoidApprovalSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const enabled = bot.autoAvoidApproval !== false;
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = enabled;
+    patchBot(bot.larkAppId, { autoAvoidApproval: next });
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/auto-avoid-approval`, {
+        enabled: next,
+      }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.autoAvoidApprovalSaved'),
+      rollback: () => patchBot(bot.larkAppId, { autoAvoidApproval: previous }),
+    });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionApprovalCompat')}</h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-auto-avoid-approval"
+        title={tr('botDefaults.autoAvoidApprovalToggle')}
+        help={tr('botDefaults.autoAvoidApprovalHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-auto-avoid-approval-status': '' }} />
       </div>
     </section>
   );
@@ -6121,6 +6211,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [goalStatusCard, setGoalStatusCard] = useState(bot.goalStatusCard === true);
+  const [followUpReply, setFollowUpReply] = useState(bot.followUpReply === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
   const [nextStep, setNextStep] = useState(bot.replyCardNextStep === true);
@@ -6141,6 +6232,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setGoalStatusCard(bot.goalStatusCard === true);
+    setFollowUpReply(bot.followUpReply === true);
     setPrivateCard(bot.privateCard === true);
     setReplyActions(bot.replyCardActions === true);
     setNextStep(bot.replyCardNextStep === true);
@@ -6148,7 +6240,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6260,6 +6352,19 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               const previous = goalStatusCard;
               setGoalStatusCard(checked);
               void savePatch({ goalStatusCard: checked }, 'goal-status-card', () => setGoalStatusCard(previous));
+            }}
+          />
+          <ToggleRow
+            checked={followUpReply}
+            disabled={busy !== null}
+            dataAction="toggle-follow-up-reply"
+            title={tr('botDefaults.followUpReply')}
+            description={tr('botDefaults.followUpReplyDescription')}
+            help={tr('botDefaults.followUpReplyHelp')}
+            onChange={checked => {
+              const previous = followUpReply;
+              setFollowUpReply(checked);
+              void savePatch({ followUpReply: checked }, 'follow-up-reply', () => setFollowUpReply(previous));
             }}
           />
           <ToggleRow
@@ -7438,6 +7543,45 @@ function SessionModeSection(props: {
         </div>
         <div className="actions"><StatusSpan status={docStatus} attr={{ 'data-doc-subscribe-mode-status': '' }} /></div>
       </div>
+    </section>
+  );
+}
+
+/** Per-bot participation switch. Advanced cost/profile fields round-trip unchanged. */
+export function TaskRoutingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const current = props.bot.taskRouting ?? null;
+  const ineligible = props.bot.apiOnly === true || props.bot.steward?.enabled === true;
+
+  async function save(enabled: boolean): Promise<void> {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/task-routing`, {
+        taskRouting: { ...current, enabled },
+      }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.taskRoutingSaved'),
+      onSaved: body => {
+        props.patchBot(props.bot.larkAppId, { taskRouting: body.taskRouting ?? null });
+      },
+    });
+  }
+
+  return (
+    <section className="bd-section" data-task-routing-section>
+      <h3 className="bd-section-title">{tr('botDefaults.sectionTaskRouting')}</h3>
+      <ToggleRow
+        checked={current?.enabled === true}
+        disabled={busy || ineligible}
+        dataAction="toggle-task-routing"
+        title={tr('botDefaults.taskRoutingEnabled')}
+        help={tr('botDefaults.taskRoutingEnabledHelp')}
+        description={ineligible ? tr('botDefaults.taskRoutingIneligible') : undefined}
+        onChange={checked => { void save(checked); }}
+      />
+      <div className="bd-mode-group-side"><StatusSpan status={status} attr={{ 'data-task-routing-status': '' }} /></div>
     </section>
   );
 }

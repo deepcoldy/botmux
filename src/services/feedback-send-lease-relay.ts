@@ -19,7 +19,7 @@ const RELAYED_ERRORS = new Set([
 
 export interface FeedbackSendLeaseRelayResponse {
   status: 200 | 400 | 409;
-  body: { ok: true; lease?: string; releaseToken?: string } | { ok: false; error: string };
+  body: { ok: true; lease?: string; releaseToken?: string; processId?: number } | { ok: false; error: string };
 }
 
 /** Daemon half. Acquisition uses the authenticated live session; release uses
@@ -35,7 +35,7 @@ export function handleFeedbackSendLeaseRelay(
   try {
     if (body.action === 'acquire') {
       const acquired = acquireFeedbackSendLeaseFor(dataDir, { processId, sessionId });
-      return { status: 200, body: { ok: true, ...acquired } };
+      return { status: 200, body: { ok: true, ...acquired, processId } };
     }
     if (body.action === 'release' && typeof body.lease === 'string' && typeof body.releaseToken === 'string') {
       releaseFeedbackSendLeaseFor(dataDir, {
@@ -113,13 +113,16 @@ export async function acquireFeedbackSendLeaseWithRelay(input: {
     const lease = (acquired.body as { lease?: unknown } | undefined)?.lease;
     const releaseToken = (acquired.body as { releaseToken?: unknown } | undefined)?.releaseToken;
     if (!acquired.ok || typeof lease !== 'string' || typeof releaseToken !== 'string') throw new Error(relayError(acquired));
+    // The daemon names the host pid it recorded (it differs inside a PID namespace).
+    const leasePid = (acquired.body as { processId?: unknown }).processId;
+    const leaseProcessId = typeof leasePid === 'number' ? leasePid : processId;
     const warn = input.warn ?? ((message: string) => console.error(message));
     return async () => {
       // The message is already delivered: a lost release leaves a lease that
       // turns into an acknowledgeable unknown outcome after this process exits,
       // never a failed send.
       try {
-        const released = await request({ action: 'release', processId, lease, releaseToken });
+        const released = await request({ action: 'release', processId: leaseProcessId, lease, releaseToken });
         if (!released.ok) warn(`botmux send: feedback send lease release failed: ${relayError(released)}`);
       } catch (error) {
         warn(`botmux send: feedback send lease release failed: ${error instanceof Error ? error.message : String(error)}`);

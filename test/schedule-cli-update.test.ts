@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -583,6 +583,96 @@ describe('schedule CLI prompt updates', () => {
 });
 
 const STACK_FRAME = /^\s+at /m;
+
+describe('schedule CLI in an assistant-mode sandbox', () => {
+  /** Assistant mode denies the confined CLI the per-bot session store; the
+   *  only source of the session's location is the daemon's attestation proof. */
+  async function assistantSession(
+    f: ReturnType<typeof fixture>,
+    observed: Array<Record<string, unknown>>,
+    customize?: (proof: ManagedOriginAttestation) => void,
+  ) {
+    await managed(f, proof => {
+      proof.session = { status: 'active', chatId: 'oc_chat', rootMessageId: 'om_root', scope: 'thread',
+        chatType: 'group', workingDir: f.root, ownerOpenId: 'ou_owner', ownerUnionId: 'on_owner' };
+      customize?.(proof);
+    }, 'om_live', observed);
+    rmSync(join(f.dataDir, 'session-stores'), { recursive: true, force: true });
+  }
+
+  it('creates a task in the current topic from the proof alone', async () => {
+    const f = fixture(); const observed: Array<Record<string, unknown>> = [];
+    await assistantSession(f, observed);
+    const result = await f.run(['add', '1m', 'remind me', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    const request = observed.find(item => 'task' in item)!;
+    expect(request.sessionId).toBe(sid);
+    expect(request.task).toMatchObject({ chatId: 'oc_chat', rootMessageId: 'om_root', executionPosition: 'topic' });
+    expect(f.read()['11223344']).toMatchObject({ chatId: 'oc_chat', rootMessageId: 'om_root' });
+  });
+
+  it('reports an unreadable task store instead of listing no tasks', async () => {
+    const f = fixture(); const observed: Array<Record<string, unknown>> = [];
+    await assistantSession(f, observed);
+    writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...f.task, enabled: true } }));
+    chmodSync(f.path, 0o000);
+    try {
+      const unreadable = await f.run(['list']);
+      expect(unreadable.code).toBe(1);
+      expect(unreadable.output).toContain('读不到定时任务列表');
+      expect(unreadable.output).not.toContain('暂无定时任务');
+    } finally { chmodSync(f.path, 0o600); }
+    writeFileSync(f.path, '{not json');
+    const corrupt = await f.run(['list']);
+    expect(corrupt.code).toBe(1);
+    expect(corrupt.output).not.toContain('暂无定时任务');
+    rmSync(f.path);
+    const missing = await f.run(['list']);
+    expect(missing.code, missing.output).toBe(0);
+    expect(missing.output).toContain('暂无定时任务');
+  });
+
+  it('manages an existing task through the same proof-located session', async () => {
+    const f = fixture(); const observed: Array<Record<string, unknown>> = [];
+    await assistantSession(f, observed);
+    writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...f.task, enabled: true } }));
+    const result = await f.run(['pause', f.task.id]);
+    expect(result.code, result.output).toBe(0);
+    expect(observed.find(item => item.action === 'pause')?.sessionId).toBe(sid);
+    expect(f.read()[f.task.id]).toMatchObject({ enabled: false, disabledReason: 'manual' });
+  });
+
+  it('updates a task, which needs the caller proven from the same proof', async () => {
+    const f = fixture(); const observed: Array<Record<string, unknown>> = [];
+    await assistantSession(f, observed);
+    const result = await f.run(['update', f.task.id, '--prompt', 'from the assistant']);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()[f.task.id].prompt).toBe('from the assistant');
+  });
+
+  it('shows the daemon refusal instead of a missing chat-id, and never retries as a host task', async () => {
+    const f = fixture(); const observed: Array<Record<string, unknown>> = [];
+    // An old daemon: a valid proof without the session location.
+    await assistantSession(f, observed, proof => { delete proof.session; });
+    const implicit = await f.run(['add', '1m', 'remind me', '--id', '11223344']);
+    expect(implicit.code, implicit.output).not.toBe(0);
+    expect(implicit.output).toContain('authenticated schedule session is no longer active');
+    expect(implicit.output).not.toContain('无法推断 chat-id');
+    const explicit = await f.run(['add', '1m', 'remind me', '--chat-id', 'oc_chat', '--id', '11223344']);
+    expect(explicit.code, explicit.output).not.toBe(0);
+    expect(explicit.output).toContain('authenticated schedule session is no longer active');
+    expect(observed.some(item => 'task' in item)).toBe(false);
+    expect(f.read()['11223344']).toBeUndefined();
+  });
+
+  it('ignores a proof location for a session that is no longer active', async () => {
+    const f = fixture(); const observed: Array<Record<string, unknown>> = [];
+    await assistantSession(f, observed, proof => { proof.session!.status = 'closed'; });
+    const result = await f.run(['add', '1m', 'remind me', '--id', '11223344']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(observed.some(item => 'task' in item)).toBe(false);
+  });
+});
 
 describe('schedule CLI frequency updates', () => {
   it('sends the new frequency with the prompt and prints the new rule and next run', async () => {

@@ -239,7 +239,7 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
       const refused = await spawnDashboardSession(empty, undefined, {
         larkAppId: APP, chatId: CHAT, content: 'task', column: 'backlog', role: 'solo',
       });
-      expect(refused).toEqual({ ok: false, error: 'assistant_unclaimed' });
+      expect(refused).toEqual({ ok: false, error: 'assistant_unclaimed', accepted: false });
       expect(empty.size).toBe(0);
     } finally {
       assistant.spawn = { kind: 'off' };
@@ -936,10 +936,23 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
 
     await expect(spawnDashboardSession(active, undefined, {
       larkAppId: APP, chatId: CHAT, content: 'opening task', column: 'in_progress', role: 'solo',
-    })).resolves.toEqual({ ok: false, error: 'spawn preaccept failed' });
+    })).resolves.toEqual({ ok: false, error: 'spawn preaccept failed', accepted: false });
 
     expect(active.has(sessionKey(CHAT, APP))).toBe(false);
     expect(sessionStore.closeSession).toHaveBeenCalledWith('sess-1');
+  });
+
+  it('does not emit accepted:false when the unaccepted session cannot be closed', async () => {
+    const active = new Map<string, DaemonSession>();
+    forkWorkerMock.mockImplementationOnce(() => { throw new Error('spawn preaccept failed'); });
+    vi.mocked(sessionStore.closeSession).mockImplementationOnce(() => { throw new Error('close failed'); });
+
+    const result = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: 'opening task', column: 'in_progress', role: 'solo',
+    });
+
+    expect(result).toEqual({ ok: false, error: 'spawn preaccept failed' });
+    expect(result).not.toHaveProperty('accepted');
   });
 
   it('unpublishes and closes only the new row when auto-worktree staging fails', async () => {
@@ -958,7 +971,7 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
 
     await expect(spawnDashboardSession(active, undefined, {
       larkAppId: APP, chatId: CHAT, content: 'opening worktree task', column: 'in_progress', role: 'solo',
-    })).resolves.toEqual({ ok: false, error: 'stage setup unavailable' });
+    })).resolves.toEqual({ ok: false, error: 'stage setup unavailable', accepted: false });
 
     expect(active.has(sessionKey(CHAT, APP))).toBe(false);
     expect(sessionStore.closeSession).toHaveBeenCalledWith('sess-1');
@@ -1014,6 +1027,7 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
     });
 
     expect(result).toEqual({ ok: false, error: 'fallback fork unavailable' });
+    expect(result).not.toHaveProperty('accepted');
     const ds = active.get(sessionKey(CHAT, APP))!;
     expect(ds).toBeDefined();
     expect(ds.pendingRepo).toBe(true);

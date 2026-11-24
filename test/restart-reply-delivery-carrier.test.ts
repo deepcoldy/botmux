@@ -17,15 +17,17 @@ describe('latestReplyDeliveryForRespawn (daemon-side carrier)', () => {
     vi.spyOn(botRegistry, 'resolveReplyDelivery').mockReturnValue(config.replyDelivery as any);
   };
 
-  it('follows the per-CLI default when unconfigured, and an explicit send once set', () => {
+  it('follows the per-CLI default when unconfigured (send except doubao), and an explicit transcript once set', () => {
     bot({ cliId: 'claude-code' });
-    expect(latestReplyDeliveryForRespawn(makeSession())).toBe('transcript');
-    bot({ cliId: 'claude-code', replyDelivery: 'send' });
     expect(latestReplyDeliveryForRespawn(makeSession())).toBe('send');
+    bot({ cliId: 'claude-code', replyDelivery: 'transcript' });
+    expect(latestReplyDeliveryForRespawn(makeSession())).toBe('transcript');
+    bot({ cliId: 'doubao' });
+    expect(latestReplyDeliveryForRespawn(makeSession())).toBe('transcript');
   });
 
   it('resolves for the CLI frozen on the session, not the bot default CLI', () => {
-    bot({ cliId: 'claude-code' });
+    bot({ cliId: 'claude-code', replyDelivery: 'transcript' });
     expect(latestReplyDeliveryForRespawn(makeSession('antigravity'))).toBe('send');
   });
 

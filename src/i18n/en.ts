@@ -910,6 +910,14 @@ export const messages: Record<string, string> = {
   'auth_link.request_dm_agent': 'botmux sent the authorization link privately to this turn\'s requester; the result carries no link. Do not post any authorization link in the group; just tell the user to open it in their private chat with the bot, then run botmux auth wait --request-id <requestId> --json.',
   'auth_link.request_ephemeral_agent': 'botmux sent a requester-only authorization card in the main group chat view; the result carries no link. Tell the requester to open that card. Never post authorization links publicly; then run botmux auth wait --request-id <requestId> --json.',
   'auth_link.request_dm_failed_agent': 'Neither the direct message nor the requester-only group card could be delivered. Never post authorization links publicly. Ask the requester to apply for permission to use this app, then return to the original conversation and retry authorization once approved. App access and personal OAuth authorization are separate; personal authorization must still be completed and verified.',
+  'auth_link.owner_fallback_dm_title': '🔐 Your bot needs to call lark-cli with your Feishu identity (as the bot owner) in a turn no person started (a script, webhook, platform request, scheduled task and so on). Open the link below to approve (sent only to you; do not forward it):',
+  'auth_link.owner_fallback_dm_agent': 'No person started this turn, so --as user uses the bot owner\'s authorization: botmux sent the authorization link privately to the bot owner; the result carries no link. Do not post any authorization link, and do not ask anyone to send a message in the chat; run botmux auth wait --request-id <requestId> --json for the owner, and if it does not complete, report that the bot owner must authorize before retrying.',
+  'auth_link.owner_fallback_ephemeral_agent': 'No person started this turn, so --as user uses the bot owner\'s authorization: the direct message failed, so botmux sent an owner-only authorization card in the main group chat view; the result carries no link. Do not post any authorization link, and do not ask anyone to send a message in the chat; run botmux auth wait --request-id <requestId> --json for the owner.',
+  'auth_link.owner_fallback_dm_failed_agent': 'No person started this turn, so --as user uses the bot owner\'s authorization, but neither the direct message nor the owner-only card reached the owner. Do not post any authorization link or ask someone else to authorize; report that the bot owner must authorize in a private chat with the bot before retrying.',
+  'auth_scope_missing.plain': 'Authorization not completed: the grant Feishu returned is missing these scopes: {scopes}. This grant was not saved.',
+  'auth_scope_missing.in_review': 'Authorization not completed: the grant Feishu returned is missing these scopes: {scopes}. App version {version} is waiting for enterprise review, and newly requested scopes only take effect once it is approved. Authorize/retry after approval (track it in Feishu Approval). Re-authorizing during the review will not grant these scopes.',
+  'auth_scope_missing.in_review_no_version': 'Authorization not completed: the grant Feishu returned is missing these scopes: {scopes}. A new app version is waiting for enterprise review, and newly requested scopes only take effect once it is approved. Authorize/retry after approval (track it in Feishu Approval). Re-authorizing during the review will not grant these scopes.',
+  'auth_scope_missing.not_in_review_version': ' Of these, {scopes} are not in that pending version, so approval will not grant them; they must be enabled for the app on the Open Platform separately.',
   'auth_link.sent_privately': '🔐 I sent you the authorization link in a direct message; open it there. Authorization links go only to the person who asked, never into a group.',
   'auth_link.sent_ephemeral': '🔐 I could not message you directly, so the authorization link is in a card only you can see in this group (main chat view); nobody else sees it. Authorization links are never posted in a group.',
   'auth_link.dm_failed': '🔐 Neither the direct message nor the requester-only group card could be delivered. The authorization link will not be posted publicly. Please apply for permission to use this app, then return to the original conversation and retry authorization with {command} once approved. App access does not replace the personal authorization required for this task.',
@@ -945,7 +953,7 @@ export const messages: Record<string, string> = {
   'cmd.login.step2_auto_fallback': '   If the browser stops on an error page (callback temporarily unreachable), sending the full address-bar URL back to this topic also completes it.',
   'cmd.login.step2': '2. After authorizing, the browser redirects to a page that fails to load ("This site can\'t be reached / ERR_CONNECTION_REFUSED") — this is expected (the callback points at 127.0.0.1, but the daemon runs remotely).',
   'cmd.login.step3': '3. Copy the full http://127.0.0.1:9768/callback?code=... URL from the address bar and send it back to this topic.\n   ⚠️ If the address bar doesn\'t show it (intercepted / no redirect): press F12 → Network tab → enable All → click Authorize → find the request to 127.0.0.1:9768 → right-click → Copy → Copy URL → send it here.\n   If BotMux also runs on your computer, the browser shows "this authorization was not started by this BotMux" — send the URL back here all the same.',
-  'cmd.login.footer': 'With auth you can download images and resources from third-party cards.',
+  'cmd.login.footer': 'This lets the bot read messages as you. To download images/files, also send `/login --scope im:resource` to authorize that separately.',
   'cmd.login.status_hint': 'Check status: /login status',
   'cmd.subdoc.no_session': '⚠️ /subscribe-lark-doc needs a live session: start a session in this topic first, then subscribe to a doc.',
   'cmd.subdoc.usage': 'Usage:\n• /subscribe-lark-doc <doc link> — call the Feishu API to subscribe the doc and bind it to this session\n• /subscribe-lark-doc list — list docs subscribed by this session\n• /subscribe-lark-doc off — unsubscribe every doc from this session',
@@ -1181,6 +1189,7 @@ export const messages: Record<string, string> = {
   'config.label.p2pOpen': 'Open DMs',
   'config.label.grantRequestToOwnerDm': 'Forward requests to owner DM',
   'config.label.trustSameOwnerBots': 'Trust same-owner local bots',
+  'config.label.larkUserOwnerFallback': 'Use the owner\'s Feishu identity when nobody started the turn',
   'card.config.note': '🟢=on ⚪=off, tap to flip & refresh (model/cli take effect next session). Language: `/botconfig zh` | `/botconfig en`.\nMore fields via "✏️ Text fields"; allowedUsers / oncall use `/botconfig help`.',
   'card.config.text_btn': '✏️ Text fields',
   'card.config.text_title': '✏️ {name} · text fields',
@@ -1281,6 +1290,11 @@ export const messages: Record<string, string> = {
   'cmd.fork.wrong_bot': '⚠️ Fork can only clone the current session to **this same bot** (the clone must run the same CLI). No need to @ another bot; just `/fork --create <new group name>` — it defaults to the current bot.',
   'cmd.fork.unsupported_backend': 'ℹ️ Botmux has not integrated fork for the current {cli} session (supported: Claude family, Grok, Antigravity, and Codex / TraeX terminal modes; Codex App, RPC, and pure-remote sessions are not supported yet).',
   'cmd.fork.mid_turn': '⚠️ The session is mid-turn and cannot be forked. Wait until it is idle, then /fork.',
+  'cmd.fork.queued': 'Fork queued. It will run automatically when the source session is idle. Send it again if BotMux restarts.',
+  'cmd.fork.topic_pending': 'The fork is still being prepared. Send your message again when its execution card appears.',
+  'cmd.fork.session_group_topic_root': '⚠️ Send /fork directly at the dedicated group\'s top level, without quoting another message or using an existing topic.',
+  'cmd.fork.source_changed': 'The source conversation changed while waiting. This fork was cancelled.',
+  'cmd.fork.source_check_failed': 'The original fork command could not be verified. No fork was created.',
   'cmd.fork.not_started_yet': '⚠️ The session has not really started (no repo / CLI not up / no context) and cannot be forked.',
   'cmd.fork.adopt_not_forkable': '⚠️ This session was adopted from an external CLI and cannot be forked.',
   'cmd.fork.created': '✅ Created group "{name}" and forked a clone (the source session is left running untouched)\n👉 {link}\n\nThe clone carries the full context at fork time — go to the new group and @ the bot to continue.',
@@ -1405,7 +1419,7 @@ export const messages: Record<string, string> = {
   'help.fork': '/fork <task>         - Fork a parallel session with full context into a new topic right here (works in DMs, topic groups, and session topics inside regular groups); /fork --create <name> keeps the new-group destination',
   'help.forklist': '/forklist           - Re-post the current session\'s forked-task panel with live/closed status and topic links',
   'help.heading_login': '🔐 User OAuth:',
-  'help.login': '/login              - Lark user OAuth (lets you download images etc. from third-party cards)',
+  'help.login': '/login              - Lark user OAuth (for image/file downloads use /login --scope im:resource)',
   'help.login_status': '/login status       - Show auth status',
   'help.logout': '/logout             - Revoke your own trigger-user authorization (local lark-cli / bytedcli login and this bot\'s user token)',
   'help.pair': '/pair <code>        - Bind a team-platform web login pairing code',
@@ -1469,26 +1483,22 @@ export const messages: Record<string, string> = {
   'ai.routing.workflow_hint': 'Workflow: multi-step goal or saved workflow? Once the user agrees or sends `/workflow`, run `botmux skill show botmux-workflow` first.',
   'ai.routing.feedback_response_kind': 'Mark the turn\'s final answer with `botmux send --response-kind final "full answer"` and send it only once (attaches footer brand signature; if final-answer feedback is enabled for this bot, also attaches feedback buttons). Do not add this flag to interim/progress sends (defaults to progress, hides the footer signature). Marking final locks this turn\'s final answer: subsequent progress sends are rejected; if supplements are needed, use `--response-kind auxiliary`.',
   'ai.routing.hidden_context_defense': 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.',
-  // replyDelivery=transcript (core/reply-delivery.ts): the daemon forwards the
-  // final reply from the transcript — intro is replaced by this line, and
-  // botmux send is kept for what the final reply cannot carry
-  // (usage_send_transcript lists the cases, no_progress_send_transcript rules
-  // out progress broadcasts and duplicate finals; see shared-hints.ts).
-  'ai.routing.intro_transcript': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output; your final assistant message is automatically forwarded back to Lark by botmux — write the final answer there directly.',
-  'ai.routing.usage_send_transcript': '- Use `botmux send` only for what the final reply cannot carry: @-ing another bot to collaborate, or handing results back to the bot that assigned you the task (`--mention <their open_id>` / `--mention-back` — a bot receives nothing unless it is @-ed); sending attachments, images, videos or custom cards; posting to another chat or topic; and turns whose instructions explicitly require `botmux send` (e.g. silent scheduled runs, whose final reply is never posted). Every send must carry one of `--mention <open_id>` / `--mention-back` / `--no-mention`.',
-  'ai.routing.no_progress_send_transcript': '- Do not use `botmux send` for progress broadcasts, acknowledgements ("got it", "looking") or interim summaries, and do not send the final answer again. When the final answer itself must go through send (it is an attachment or card, or the recipient must be @-ed to receive it), add `--response-kind final` so botmux does not forward the final reply a second time. When attaching files, send the attachments first and write the final answer last: botmux forwards only the reply after your last tool call.',
+  // replyDelivery=transcript (auto-forward final reply, core/reply-delivery.ts):
+  // the daemon forwards the final reply automatically, so `<botmux_routing>`
+  // adds no extra `botmux send` instructions — intro is replaced by this line
+  // and only usage_helpers / ask_wait / usage_silence stay (bot collaboration
+  // stays in `<identity>`; attachments/cards/cross-chat stay on-demand in the
+  // built-in `botmux-send` skill; see shared-hints.ts).
+  'ai.routing.intro_transcript': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output; your final assistant message is automatically forwarded back to Lark by botmux — just answer directly.',
   'ai.send.after_success_hint': 'The final answer was sent successfully. If the task is complete or its concrete blocker has been delivered, end with BOTMUX_NOTHING_TO_SEND without resending. Use botmux send --response-kind auxiliary for later supplements.',
   'ai.send.after_success_steer_advanced': 'This send is complete. The session has automatically advanced to the next queued turn; send the full answer for the new message with `botmux send --response-kind final` (or output BOTMUX_NOTHING_TO_SEND if no response is needed).',
   'ai.send.after_success_progress': 'Progress was sent (not marked final). If this message already contains the complete answer to the request, end with just BOTMUX_NOTHING_TO_SEND; do not send a summary or repeat it. If it was only an acknowledgement or interim progress, or the task is unfinished, continue the original task and deliver the result or a concrete blocker with botmux send --response-kind final.',
   'ai.send.after_success_auxiliary': 'The supplement was sent. Check whether the original final answer was delivered successfully; a supplement alone does not prove completion. Do not resend content already delivered.',
   'ai.send.after_success_unified': 'Progress was posted to this turn’s card. When done, send the full answer with `botmux send --response-kind final`.',
-  // Post-send echoes for replyDelivery=transcript sessions (REPLY_DELIVERY_ENV,
-  // see send-completion-hint.ts): the final reply is forwarded by botmux, so
-  // they point the model back at its final reply instead of another send.
-  'ai.send.after_success_progress_transcript': 'Message sent. This session\'s final reply is forwarded to Lark by botmux automatically: when the task is done, write the complete answer in your final reply instead of running botmux send again; progress updates and interim summaries need no send either. If the message you just sent already is the complete answer, end with just BOTMUX_NOTHING_TO_SEND to avoid a duplicate. Silent scheduled runs are the exception: their final reply is never posted, so send every conclusion with botmux send.',
-  'ai.send.after_success_unified_transcript': 'Progress was posted to this turn’s card. This session\'s final reply is forwarded by botmux automatically — when done, write the complete answer in your final reply; no further progress sends are needed.',
-  'ai.send.after_success_auxiliary_transcript': 'The supplement was sent. This session\'s final reply is forwarded by botmux automatically; a supplement does not complete the task, and do not repeat already-sent content in your final reply.',
-  'ai.send.after_success_steer_advanced_transcript': 'This send is complete. The session has automatically advanced to the next queued turn; answer the new message directly in your final reply (botmux forwards it), or output BOTMUX_NOTHING_TO_SEND if no response is needed.',
+  // replyDelivery=transcript (auto-forward final reply): only emit a factual
+  // state-change notice when a queued turn was promoted; normal sends print
+  // only the bare delivery receipt with no extra persuasion.
+  'ai.send.after_success_steer_advanced_transcript': 'This send is complete. The session has automatically advanced to the next queued turn; continue with the new message (or output BOTMUX_NOTHING_TO_SEND if no response is needed).',
   'ai.routing.xpi_as_hint': 'XPI is enabled: every plain-text message directed to another bot must declare its handling up front. Start a separate task with `botmux send --as independent`; leave it for the current task with `--as suggestion`.',
   'ai.shell.xpi_as_hint': 'XPI is enabled: every plain-text message to another bot must include a handling choice. Start separately: `botmux send --as independent`. Leave it for the current task: `botmux send --as suggestion`.',
   'xpi.choice.independent': 'Start a new task',
@@ -1532,7 +1542,7 @@ export const messages: Record<string, string> = {
   'ai.identity.rule_own_part': '- Do only your part; do not pick up work assigned to other bots',
   'ai.identity.rule_silent_when_other': '- If the whole message is for another bot, stay silent',
   'ai.identity.rule_no_proactive_pull': '- Do not pull other bots in unless the user explicitly asks',
-  'ai.identity.mention_must': '- To collaborate with another bot you MUST `botmux send --mention <their open_id>` — without it they receive nothing',
+  'ai.identity.mention_must': '- To reply to or @-mention another bot to collaborate, you MUST `botmux send --mention <their open_id>` (or `--mention-back` to reply to the bot that triggered this turn) — without it they receive nothing',
 
   // ─── AI hints (BOTMUX_SHELL_HINTS for non-injecting CLIs; multiline_heredoc /
   // heredoc_example are also reused by the system-prompt path — keep both locales aligned) ──
@@ -1544,20 +1554,21 @@ export const messages: Record<string, string> = {
   'ai.shell.helpers': 'Helpers: `botmux history` (read this session\'s history — thread/topic sessions are topic-scoped; regular-group chat-scope sessions are group-wide), `botmux quoted <message_id>` (fetch a quoted message — only use it when the prompt header shows `[user quoted message ...]`), `botmux bots list` (list other bots in the group).',
   'ai.shell.when_to_send': 'For requests requiring a reply, use Bash to deliver the result or a concrete blocker with botmux send --response-kind final and verify success before ending. Completed queries or progress sends are not final delivery. Do not resend delivered answers. Only when a message is not for you at all make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
   'ai.shell.no_visible_output_ok': 'Ending with no terminal body is normal only after successful final delivery via botmux send --response-kind final (exit code 0); a successful progress send does not complete the task. Do not resend delivered answers on a no-output nudge. Reconcile unknown send outcomes before treating them as success or failure.',
-  // replyDelivery=transcript shell-hints variant: reworded intro / when_to_send,
-  // and send_scope keeps botmux send for what the final reply cannot carry
-  // (the send-mode how_to_send / mention_gate / feedback paragraphs are not
-  // injected, see shared-hints.ts).
+  // replyDelivery=transcript (auto-forward final reply) shell-hints variant:
+  // reworded intro / when_to_send plus helpers. With a native skill channel,
+  // no extra `botmux send` prompts appear in `<botmux_routing>` (collaboration
+  // lives in `<identity>`; complex delivery stays in the on-demand skill).
+  // Without one, a minimal operational block preserves the send contract.
   'ai.shell.intro_transcript': 'You are running inside a Lark (Feishu) conversation. The user reads on Lark and cannot see your terminal output; your final assistant message is automatically forwarded back to Lark by botmux.',
-  'ai.shell.send_scope_transcript': 'Use botmux send only for what the final reply cannot carry: @-ing another bot to collaborate, or handing results back to the bot that assigned you the task (`--mention <their open_id>` / `--mention-back` — a bot receives nothing unless it is @-ed); sending attachments (`--images` / `--files` / `--videos`) or custom cards; posting to another chat or topic; and turns whose instructions explicitly require botmux send (e.g. silent scheduled runs, whose final reply is never posted). Every send must carry one of `--mention <open_id>` / `--mention-back` / `--no-mention`. Do not use it for progress broadcasts, acknowledgements ("got it", "looking") or interim summaries, and do not send the final answer again; when the final answer itself must go through send, add `--response-kind final` so botmux does not forward the final reply a second time. When attaching files, send the attachments first and write the final answer last: botmux forwards only the reply after your last tool call.',
   'ai.shell.when_to_send_transcript': 'Answer messages addressed to you directly in your final assistant message — never stay silent. Only when a message is not for you at all make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
+  'ai.shell.send_without_skill_transcript': 'This CLI has no native skill channel. For proactive messages, collaboration, attachments/cards or cross-chat publishing, run `botmux send` via Bash; read the full guide with `botmux skill show botmux-send`. Use `--images` / `--files` / `--videos` for attachments and quoted heredoc/stdin or UTF-8 `--content-file` for multiline text. Every send must choose exactly one of `--mention <open_id:name>`, `--mention-back` and `--no-mention`; automatic turns without a current sender must not use --mention-back or infer a recipient from the owner or history. Mark a final answer sent through botmux with `--response-kind final`; if the preceding ordinary send already delivered the complete answer, end with only `BOTMUX_NOTHING_TO_SEND` so a rewritten final is not forwarded again. An auxiliary send alone does not complete the original task. Send attachments/cards first and write the final answer after the last tool call: only that trailing text is auto-forwarded.',
   'ai.shell.mention_gate': '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a specific person/bot; REQUIRED to communicate or collaborate with another bot) / `--mention-back` (@ the triggerer of THIS turn) / `--no-mention` (none). First decide WHETHER to @ by VALUE: substantive conclusion the other party should read/confirm/decide → @ someone; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent. Then pick HOW by recipient: it is the person/bot that triggered this turn → --mention-back; it is someone else (in a multi-person chat the right recipient is often not the triggerer) → --mention to name them. Do not default to --no-mention, and do not @ people for nothing. For automatic turns such as scheduled tasks with no current sender, use --mention only for an explicit recipient, otherwise use --no-mention. Do not use --mention-back or infer a recipient from the session owner or a historical sender.',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
   'ai.attach.hint': 'Read these with the Read tool. The index matches the [image N] / [file N] / [video N] placeholders in the body.',
   'ai.attach.videoHint': 'The video is saved locally. Prefer Read or the current CLI media-reading tool to provide the full sequence to a video-capable model. If the tool or model cannot accept video, extract frames or transcribe as the task requires and state the method used.',
   'ai.attach.videoHintKimi': 'The video is saved locally. Prefer ReadMediaFile to provide the full sequence to a video-capable model. If the tool or model cannot accept video, extract frames or transcribe as the task requires and state the method used.',
-  'ai.identity.short_routing': 'Reminder: communicating or collaborating with another bot REQUIRES `botmux send --mention <their open_id>` — without it, the other bot is not triggered.',
+  'ai.identity.short_routing': 'Reminder: to reply to or @-mention another bot to collaborate, you MUST `botmux send --mention <their open_id>` (or `--mention-back` to reply to the bot that triggered this turn) — without it, the other bot is not triggered.',
   'ai.available_bots.hint': 'To communicate or collaborate with a bot listed here you MUST --mention its open_id (botmux send --mention ou_xxx ...). Without --mention the other bot receives nothing.',
   'ai.available_bots.hint_collapsed': 'To communicate or collaborate with another bot, first run `botmux bots list` to get its open_id, then --mention it. Without --mention the other bot receives nothing.',
   'ai.available_bots.collapsed_line': 'There are {count} collaborator bots in this chat: {names}.',
@@ -2116,7 +2127,7 @@ export const messages: Record<string, string> = {
   'daemon.auto_start_join_seed': '🚀 Joined this chat — getting to work…',
   'daemon.cmd_requires_session': '{cmd} requires an existing session (send a normal message first to start the CLI).',
   'daemon.cmd_allowed_users_only': '⚠️ {cmd} is a management command, restricted to `allowedUsers`. To authorize, ask the owner to add you to this bot\'s `allowedUsers` (Dashboard or bots.json).',
-  'daemon.download_failed_need_login': '⚠️ Some images/files failed to download (missing User Token). Send `/login` in this topic to authorize, then resend.',
+  'daemon.download_failed_need_login': '⚠️ Some images/files failed to download (no user authorization to download images/files). Send `/login --scope im:resource` in this topic to authorize (this permission may need enterprise admin approval), then resend.',
   'daemon.prompt_gate_denied': '🚫 This message was blocked by a pre-submit check and was not sent to the CLI.',
   'daemon.prompt_gate_denied_reason': '🚫 This message was blocked by a pre-submit check and was not sent to the CLI: {reason}',
   'daemon.plugin_command_unavailable': '⚠️ Plugin command {cmd} is unavailable right now. Try again later or contact the bot admin.',
@@ -2164,6 +2175,10 @@ export const messages: Record<string, string> = {
   'daemon.topic_header_effort_unsupported_cli': 'This CLI ({cli}) has no reasoning-effort control',
   'daemon.topic_header_effort_unsupported_model': 'Model {model} does not support reasoning effort {effort}',
   'daemon.fast_unsupported_backend': "⚠️ /fast can't toggle Codex's tier on this session's backend (RPC input mode / Riff runs turns off the terminal, so the keystroke never reaches the executor). The card badge still reflects the tier Codex is actually running.",
+  'daemon.antigravity_btw_usage': 'Usage: /btw <question>. The question can contain up to 4,000 characters.',
+  'daemon.antigravity_btw_unavailable': '/btw requires an active Antigravity conversation in this chat with a local interactive terminal.',
+  'daemon.antigravity_btw_busy': 'The terminal is receiving input, showing a menu, or handling another side question. Send /btw again when it is ready.',
+  'daemon.antigravity_btw_unconfirmed': 'Could not confirm the full Antigravity side answer. Check the side question in the web terminal.',
   'daemon.enriched_mentions_label': '@mentions in this message:',
   'daemon.topic_continuity.resumed': '↩️ The previous session in this topic ({id}) was closed; this message continues it, with its earlier context.',
   'daemon.topic_continuity.fresh_after_close': '⚠️ The previous session in this topic ({id}) is closed and could not be resumed; a new session handles this message without the earlier context.',
@@ -2601,6 +2616,7 @@ export const messages: Record<string, string> = {
   'card.btw_answer': '💬 /btw side answer',
   'card.absorbed_reply': '💬 Reply to your follow-up (the main task continues)',
   'card.absorbed_reply_thinking': '💭 Thinking summary on your follow-up (the main task continues)',
+  'card.mid_turn_progress': '⏳ Progress so far (the task continues)',
   'card.btw_answer_truncated': '_(Answer truncated; see the web terminal for the full text.)_',
   'card.btw_answer_from_screen': '_(Read from the terminal screen; a long answer may be incomplete.)_',
   'card.local_turn_resumed': '🖥️ Local terminal turn resumed (model was mid-output during the daemon restart)',
@@ -2663,6 +2679,7 @@ export const messages: Record<string, string> = {
   'worker.submit_impossible': '⚠️ Your last message was not safely written to {cliName}.\nReason: {reason}\nAddress the reason above and verify the terminal state before trying again.\nStart: {preview}',
   'worker.first_write_input_box_held': '⚠️ {cliName} has been starting for over {seconds}s and its input box is still not ready. Queued messages have not been written; they are sent once the input box is ready. Check the terminal for a pending dialog or an unsent draft.',
   'worker.opening_input_held': '⏳ The message has not been written to {cliName} yet.\nReason: {reason}\nIt stays queued and is sent automatically once the input box is clear; no need to resend.',
+  'worker.session_rename_input_held': '⏳ The {cliName} session rename has not been confirmed yet, so queued messages are held to keep them out of the session title.\nThey are sent automatically once it is confirmed; no need to resend. If this does not recover, open the Web terminal: if the full /rename command is still in the input box, press Enter; if only part of it is, clear the input box. If the input box is already empty and nothing recovers, send /restart; queued messages are kept and sent after the restart.',
   'worker.activation_submit_unconfirmed': '⚠️ Opening message submission remains unconfirmed\nStage: input submission\nError code: submit_unconfirmed\nBotMux has not confirmed in {transcriptLabel} that {cliName} received the opening message. It may still be running or may already have run. Later messages are waiting for this confirmation.\nOpen the Web terminal and inspect the original input and run state. If the original input is still unsubmitted, submit it there. BotMux will keep observing its receipt and release the queue when confirmation arrives.\nResending in chat only adds to the queue. If the terminal cannot recover, close this session and start again.\nOriginal message: {preview}',
   'worker.startup_command_dialog_pending': '⚠️ Startup command {command} is waiting for a confirmation\n{cliName} opened a confirmation dialog for it, and BotMux does not choose for you. Your first message is held in the queue, not submitted.\nOpen the Web terminal and choose in the dialog whether to switch. Once you choose, BotMux delivers the held message automatically.',
   'worker.startup_command_unconfirmed': '⚠️ Startup command {command} is not confirmed yet\n{cliName} left no execution record within {secs} seconds. Your first message is held in the queue, not submitted, so it cannot merge with the command.\nOpen the Web terminal: if the command is still in the input box, press Enter to run it. Once the command is confirmed, BotMux delivers the held message automatically.',

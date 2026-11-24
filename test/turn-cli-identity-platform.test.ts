@@ -16,6 +16,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 vi.mock('../src/utils/user-token.js', () => ({
+  // im/lark/client.ts imports this (attachment download); bun rejects a mock
+  // missing an imported export at link time.
+  resolveUserTokenWithScopes: vi.fn(async () => null),
   resolveUserToken: vi.fn(async () => null),
   lookupAuthorizedUserName: vi.fn(() => undefined),
   // cli-identity.ts imports this. vitest tolerates a missing mock export; bun

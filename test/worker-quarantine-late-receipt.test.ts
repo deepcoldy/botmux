@@ -102,6 +102,44 @@ describe('quarantine receipt outlives bounded warning and bridge attribution', (
     expect(h.recheck).not.toHaveBeenCalled();
   });
 
+  it('retires revived attribution when two empty screens prove the parked draft is gone', async () => {
+    const h = harness();
+    h.scope.pendingMessages.splice(0);
+    Object.assign(h.scope, {
+      captureBackendScreen: () => 'empty idle composer',
+      backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+    });
+    h.scope.cliAdapter.screenShowsNoPendingInput = () => true;
+    const q = h.queue;
+    q.setLocalTurns(true, 0);
+    q.setWholeInputPassing(true);
+    q.mark('om_old', '继续', 0);
+    q.mark('om_other', 'different input', 100);
+    q.ingest([{ uuid: 'user-other', timestampMs: 200, kind: 'user', text: 'different input' }]);
+    expect(q.peek().find(turn => turn.turnId === 'om_old')?.passedBySuccessor).toBe(true);
+    q.ingest([{ uuid: 'final-other', timestampMs: 300, kind: 'assistant_final', text: 'other answer' }]);
+    expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['om_other']);
+
+    h.scope.armInputDeliveryQuarantine(h.scope.backend, { turnId: 'om_old' }, '继续');
+    expect(q.peek().find(turn => turn.turnId === 'om_old')).toMatchObject({
+      passedBySuccessor: undefined, inputDeliveryQuarantined: true,
+    });
+    // No recheck closure: the receipt observer itself performs the two empty
+    // screen checks and takes the negative (draft gone) release path.
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(q.hasPendingTurn('om_old', undefined)).toBe(false);
+
+    q.mark('om_retry', '继续', 41_000);
+    q.ingest([
+      { uuid: 'user-retry', timestampMs: 42_000, kind: 'user', text: '继续' },
+      { uuid: 'final-retry', timestampMs: 43_000, kind: 'assistant_final', text: 'retry answer' },
+    ]);
+    expect(q.drainEmittable().map(turn => [turn.turnId, turn.finalText])).toEqual([
+      ['om_retry', 'retry answer'],
+    ]);
+  });
+
   it('yields to a retained bridge mark while it is live, then takes over after the mark drops', async () => {
     const h = harness();
     // Stop the harness's own flush from arming the built-in 'delivery' turn, so

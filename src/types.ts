@@ -2402,6 +2402,7 @@ type DaemonToWorkerBase =
    *  a separate `message` IPC could write into the PTY first. */
   | { type: 'terminal_effort_writeback_ack'; nonce: string; preference: string }
   | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch; turnCallerOpenId?: string; requireSafeComposer?: true }
+  | { type: 'antigravity_btw'; question: string; messageId: string; nativeSessionId: string }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
@@ -3147,6 +3148,10 @@ export type WorkerToDaemonBase =
     source: 'clipboard' | 'screen';
     turnId?: string;
   }
+  | { type: 'antigravity_btw_result'; messageId: string; question: string } & (
+    | { answer: string }
+    | { reason: 'busy' | 'unavailable' | 'unconfirmed' }
+  )
   /** Adopt: the reply to a Lark message Claude Code folded into the running
    *  turn (a mid-turn system reminder). Sent as soon as the model moved on
    *  from it, or when the host turn ends if it never did. `turnId` is the
@@ -3157,8 +3162,11 @@ export type WorkerToDaemonBase =
    *  summary. `turnReply` marks the reply as the turn's final: a Claude
    *  folded turn has no other output, and under transcript delivery no
    *  completion receipt needs a carrier it can be written into. A Codex
-   *  steered turn still ends with its own final, so it never sets this. */
-  | { type: 'absorbed_reply'; turnId: string; dispatchAttempt?: number; answer: string; replyUuid: string; source: 'text' | 'thinking'; turnReply?: true }
+   *  steered turn still ends with its own final, so it never sets this.
+   *  `progress` (Codex): not an answer to a folded message but what the model
+   *  said to this turn mid-work before going back to it; the turn's own
+   *  final still follows. */
+  | { type: 'absorbed_reply'; turnId: string; dispatchAttempt?: number; answer: string; replyUuid: string; source: 'text' | 'thinking'; turnReply?: true; progress?: true }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
   /** Runtime lease recovery ACK. Emitted only after the exact durable attempt
    * was either removed from the worker queue or its owned CLI was fenced. */
@@ -3169,7 +3177,7 @@ export type WorkerToDaemonBase =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; speakers?: TurnSpeaker[]; linkRefMode?: 'observe' | 'enabled' }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; speakers?: TurnSpeaker[]; provenanceIncomplete?: true; linkRefMode?: 'observe' | 'enabled' }
   /** Worker→daemon single-source identity storage decision, sent right after
    *  the worker resolved the actual spawn (or RPC engine): the effective model
    *  plus the spawn facts it was derived from. The daemon publishes identity

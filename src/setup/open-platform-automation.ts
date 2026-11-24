@@ -1,5 +1,6 @@
 /** Developer-console fallback for setup, platform configuration and permission recovery. */
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -11,6 +12,7 @@ import bundledScopeManifest from './lark-scopes.json' with { type: 'json' };
 import { BOTMUX_APP_ICON_BASE64, BOTMUX_APP_ICON_BYTES } from './app-icon-data.js';
 import { registerBotmuxRedirectUrlCollector, VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 import { readGlobalConfig } from '../global-config.js';
+import { withFileLock } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import {
@@ -18,6 +20,28 @@ import {
   VisibilityParseError,
   type VisibilitySuggest,
 } from './open-platform-visibility.js';
+import {
+  resolveAutoApprovedScopes,
+  type ApprovalCandidateScope,
+  type ApprovalCompatibilityOutcome,
+  type ApprovalDeferredScopeBuckets,
+  type DeferredApprovalScope,
+} from './approval-scope-resolver.js';
+
+export type {
+  ApprovalCandidateScope,
+  ApprovalCompatibilityOutcome,
+  ApprovalDeferredScopeBuckets,
+  DeferredApprovalScope,
+} from './approval-scope-resolver.js';
+export {
+  buildApprovalConsoleUrl,
+  deferredScopesToBuckets,
+  describeDeferredScopeGroup,
+  mergeDeferredApprovalScopes,
+  normalizeApprovalDeferredScopes,
+  resolveNextPersistedApprovalDeferredScopes,
+} from './approval-scope-resolver.js';
 
 /**
  * All non-VC events (application identity) that the botmux dispatcher consumes.
@@ -136,6 +160,16 @@ export interface OpenPlatformScopeEntry {
   id: string;
   name: string;
   bucket?: 'tenant' | 'user';
+  /** Per-bucket sensitivity level from `scopeType2ScopeLevel` (`'2'`=tenant, `'1'`=user; 3=免审, 4=需审). */
+  tenantLevel?: number;
+  userLevel?: number;
+  /** Fallback top-level sensitivity level from `levels[0]`. */
+  level?: number;
+  /** Per-bucket grant/draft status from `scopeType2ScopeStatus` (0=unapplied, 1=draft, 3=auditing, 5=online, 6=auto-draft). */
+  tenantStatus?: number;
+  userStatus?: number;
+  status?: number;
+  desc?: string;
 }
 
 export interface MappedScopeIds {
@@ -242,6 +276,23 @@ export type OpenPlatformAutomationResult =
       approvalAutoPassed?: boolean;
       /** 需要真人审批时，那些审批人的姓名（抄送人不算——抄送只知会、不阻塞）。 */
       approvalHumanApprovers?: string[];
+      /**
+       * 提交后回读，这一版**停在「审核中」**（等企业管理员审批；已留出免审自动通过的几秒）。
+       * 这是**事实**，优先于 {@link approvalAutoPassed} 那个**预判**：实测审批预览写着
+       * 「仅协作者免审策略 · 自动通过」的版本照样卡在审核中几个小时。审核通过前新权限
+       * 不生效，调用方必须如实说「在等企业管理员审核」，不能报「已发布 / 已生效」。
+       */
+      versionPendingReview?: boolean;
+      /** 停在审核中的那一版的版本号（console `appVersion`，形如 1.0.11；读不到时缺省）。 */
+      pendingReviewAppVersion?: string;
+      /** 因触发企业审批而被草稿态自动跳过、留待用户按需手动开通的权限清单。 */
+      approvalDeferredScopes?: DeferredApprovalScope[];
+      /** 为避开企业审批而自动关闭了应用的「刷新 user_access_token」开关。 */
+      approvalDisabledRefreshToken?: boolean;
+      /** 审批兼容自动排查的结构化诊断结果（仅在初始预判需人工审批时有值）。 */
+      approvalCompatibility?: ApprovalCompatibilityOutcome;
+      /** 平台处理完成，但本地 approvalDeferredScopes 持久化失败；--json 必须显式暴露。 */
+      approvalDeferredPersistWarning?: string;
     }
   | {
       ok: false;
@@ -286,6 +337,15 @@ export type OpenPlatformAutomationResult =
       verifiedEventCount?: number;
       /** Exact published version ACK, preserved across later scope propagation failure. */
       versionId?: string;
+      /** 提交结果未知/失败时仍需保留的审批兼容结果，供调用方防止回灌已删减权限。 */
+      approvalDeferredScopes?: DeferredApprovalScope[];
+      approvalDisabledRefreshToken?: boolean;
+      approvalCompatibility?: ApprovalCompatibilityOutcome;
+      /** 审批预判状态（成功解析并已见证时可能为 true；失败不等于 false）。 */
+      approvalAutoPassed?: boolean;
+      approvalHumanApprovers?: string[];
+      /** 平台处理完成或结果未知时，本地暂缓记录仍落盘失败。 */
+      approvalDeferredPersistWarning?: string;
       /**
        * `app_under_review` 专用：当前那个**待审版本**的 id（读不到时 undefined）。
        * 只用于上层「同一个待审版本别重复打扰管理员」的节流 key —— undefined 时上层
@@ -338,6 +398,18 @@ export interface OpenPlatformAutomationOptions {
    * 与 name 不可直接比，故差集只能在 mapped 之前的 name 空间做。
    */
   grantedScopeNames?: { tenant: string[]; user: string[] };
+  /**
+   * 明确排除不申请的权限（例如在 `1.0.0` 建应用阶段已确认会触发审批并跳过的权限，
+   * `1.0.1` 不应把它们再加回来重撞一遍审批）。按 tenant / user 分桶。
+   */
+  excludeScopes?: ApprovalDeferredScopeBuckets;
+  /**
+   * 提交前若审批预判命中真人审批，是否在草稿态自动分组/二分排查并避开需审权限，
+   * 以免阻断新 bot 注册。缺省在 `appJustCreated === true` 时开启。
+   */
+  autoAvoidApproval?: boolean;
+  /** 草稿态审批排查的最大 `approval_nodes/get` 探测次数上限（测试可调小）。 */
+  approvalMaxProbes?: number;
   pollIntervalMs?: number;
   maxWaitMs?: number;
   /**
@@ -345,6 +417,11 @@ export interface OpenPlatformAutomationOptions {
    * 调用方可传更紧的预算；测试也用它验证在飞请求的取消。
    */
   redirectWriteTimeoutMs?: number;
+  /**
+   * 提交版本后回读到「审核中」时，再隔多久各复查一次（毫秒），用来等免审版本的自动通过
+   * （实测提交到上线约 2 秒）。缺省 {@link DEFAULT_REVIEW_SETTLE_DELAYS_MS}；测试传 `[]`。
+   */
+  reviewSettleDelaysMs?: readonly number[];
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
   /** Emitted once only after Feishu reports this exact QR as scanned. */
   onQrScanConfirmed?: (info: { confirmedAt: number }) => void | Promise<void>;
@@ -816,15 +893,237 @@ async function narrowRequiredPrivilegeRanges(
   return needFill.length;
 }
 
-export function buildScopeUpdatePayload(appId: string, mapped: Pick<MappedScopeIds, 'tenantScopeIds' | 'userScopeIds'>) {
+export function buildScopeUpdatePayload(
+  appId: string,
+  mapped: Pick<MappedScopeIds, 'tenantScopeIds' | 'userScopeIds'>,
+  operation: 'add' | 'del' = 'add',
+) {
   return {
     clientId: appId,
     appScopeIDs: mapped.tenantScopeIds,
     userScopeIDs: mapped.userScopeIds,
     scopeIds: [],
-    operation: 'add',
+    operation,
     isDeveloperPanel: true,
   };
+}
+
+function candidatesToMappedScopeIds(
+  scopes: readonly ApprovalCandidateScope[],
+): Pick<MappedScopeIds, 'tenantScopeIds' | 'userScopeIds'> {
+  return {
+    tenantScopeIds: uniqueStrings(scopes.filter(s => s.bucket === 'tenant').map(s => s.id)),
+    userScopeIds: uniqueStrings(scopes.filter(s => s.bucket === 'user').map(s => s.id)),
+  };
+}
+
+function findCatalogEntry(
+  catalog: readonly OpenPlatformScopeEntry[],
+  scopeName: string,
+  bucket: 'tenant' | 'user',
+): OpenPlatformScopeEntry | undefined {
+  return (
+    catalog.find(entry => entry.name === scopeName && entry.bucket === bucket) ??
+    catalog.find(entry => entry.name === scopeName && entry.bucket === undefined)
+  );
+}
+
+function catalogEntryLevel(entry: OpenPlatformScopeEntry, bucket: 'tenant' | 'user'): number | undefined {
+  const bucketLevel = bucket === 'tenant' ? entry.tenantLevel : entry.userLevel;
+  return bucketLevel ?? entry.level;
+}
+
+function catalogEntryStatus(entry: OpenPlatformScopeEntry, bucket: 'tenant' | 'user'): number | undefined {
+  // 服务端返回了分桶状态 map（scopeType2ScopeStatus）时，map 里缺另一桶键即表示该桶
+  // 尚未申请，绝不回落读顶层聚合 status（否则 tenant=5 的双桶权限会误判成 user=5）。
+  if (entry.tenantStatus !== undefined || entry.userStatus !== undefined) {
+    return bucket === 'tenant' ? entry.tenantStatus : entry.userStatus;
+  }
+  return entry.status;
+}
+
+/** Collect scopes currently staged in an uncommitted draft (status 1=draft or 6=auto-draft, excluding online status 5). */
+function buildDraftStagedApprovalCandidates(
+  catalog: readonly OpenPlatformScopeEntry[],
+): ApprovalCandidateScope[] {
+  const out: ApprovalCandidateScope[] = [];
+  const seen = new Set<string>();
+  const isDraft = (st: number | undefined): boolean => st === 1 || st === 6;
+  const push = (bucket: 'tenant' | 'user', entry: OpenPlatformScopeEntry): void => {
+    const key = `${bucket}:${entry.id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      bucket,
+      name: entry.name,
+      id: entry.id,
+      level: catalogEntryLevel(entry, bucket),
+      ...(entry.desc ? { desc: entry.desc } : {}),
+    });
+  };
+  for (const entry of catalog) {
+    if (entry.bucket === 'tenant' || entry.bucket === 'user') {
+      if (isDraft(catalogEntryStatus(entry, entry.bucket))) push(entry.bucket, entry);
+      continue;
+    }
+    if (entry.tenantStatus !== undefined || entry.userStatus !== undefined) {
+      if (isDraft(entry.tenantStatus)) push('tenant', entry);
+      if (isDraft(entry.userStatus)) push('user', entry);
+    } else if (isDraft(entry.status)) {
+      if (entry.tenantLevel !== undefined) push('tenant', entry);
+      if (entry.userLevel !== undefined) push('user', entry);
+      if (entry.tenantLevel === undefined && entry.userLevel === undefined) push('tenant', entry);
+    }
+  }
+  return out;
+}
+
+/** Merge two candidate lists by (bucket, id), preserving first occurrence. */
+function mergeApprovalCandidates(
+  primary: readonly ApprovalCandidateScope[],
+  extra: readonly ApprovalCandidateScope[],
+): ApprovalCandidateScope[] {
+  const out: ApprovalCandidateScope[] = [];
+  const seen = new Set<string>();
+  for (const item of [...primary, ...extra]) {
+    const key = `${item.bucket}:${item.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+/**
+ * Per-appId mutual exclusion across both same-process callers (e.g. startup
+ * checkRequiredScopes + ensureVcMeetingEventsSubscribed) and cross-process
+ * callers (CLI / Dashboard / daemon) so concurrent writes cannot pollute an
+ * uncommitted Feishu console draft mid-bisection before `publish/commit`.
+ */
+const openPlatformAppQueues = new Map<string, Promise<void>>();
+const openPlatformAppLockContext = new AsyncLocalStorage<string>();
+
+/**
+ * Serialize one app's draft mutation AND its approvalDeferredScopes persistence.
+ * The async-context reentrant fast path lets callers wrap `automateOpenPlatformSetup`
+ * together with result persistence without deadlocking on the lock it takes internally.
+ */
+export async function withOpenPlatformAppLock<T>(appId: string, fn: () => Promise<T>): Promise<T> {
+  if (openPlatformAppLockContext.getStore() === appId) return fn();
+  const prev = openPlatformAppQueues.get(appId) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>(resolve => { release = resolve; });
+  const tail = prev.then(() => next);
+  openPlatformAppQueues.set(appId, tail);
+  await prev;
+  try {
+    return await openPlatformAppLockContext.run(appId, async () => {
+      const safeId = appId.replace(/[^A-Za-z0-9_-]/g, '_');
+      const lockDir = join(homedir(), '.botmux', 'data', 'locks');
+      let canFileLock = false;
+      try {
+        mkdirSync(lockDir, { recursive: true });
+        canFileLock = true;
+      } catch {
+        // Read-only / restricted filesystem: retain in-process FIFO exclusion.
+      }
+      if (!canFileLock) return await fn();
+      return await withFileLock(join(lockDir, `open-platform-${safeId}`), fn, { maxWaitMs: 120_000 });
+    });
+  } finally {
+    release();
+    if (openPlatformAppQueues.get(appId) === tail) {
+      openPlatformAppQueues.delete(appId);
+    }
+  }
+}
+
+/** Collect newly staged candidate scopes for draft-time approval resolution (skipping already-online status=5 scopes). */
+function buildApprovalCandidatesForManifest(
+  manifest: ScopeManifest,
+  catalog: readonly OpenPlatformScopeEntry[],
+): ApprovalCandidateScope[] {
+  const out: ApprovalCandidateScope[] = [];
+  const pushBucket = (names: readonly string[], bucket: 'tenant' | 'user'): void => {
+    for (const name of uniqueStrings([...names])) {
+      const entry = findCatalogEntry(catalog, name, bucket);
+      if (!entry) continue;
+      // Do not touch scopes that were already granted & online (status=5) before this run.
+      if (catalogEntryStatus(entry, bucket) === 5) continue;
+      out.push({
+        bucket,
+        name,
+        id: entry.id,
+        level: catalogEntryLevel(entry, bucket),
+        ...(entry.desc ? { desc: entry.desc } : {}),
+      });
+    }
+  };
+  pushBucket(manifest.scopes?.tenant ?? [], 'tenant');
+  pushBucket(manifest.scopes?.user ?? [], 'user');
+  return out;
+}
+
+/** Extract currently staged (non-zero status) template scopes from `scope/all` for `1.0.0` approval resolution. */
+function buildApprovalCandidatesFromActiveCatalog(
+  catalog: readonly OpenPlatformScopeEntry[],
+): ApprovalCandidateScope[] {
+  const out: ApprovalCandidateScope[] = [];
+  const seen = new Set<string>();
+  const add = (bucket: 'tenant' | 'user', entry: OpenPlatformScopeEntry): void => {
+    const key = `${bucket}:${entry.id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      bucket,
+      name: entry.name,
+      id: entry.id,
+      level: catalogEntryLevel(entry, bucket),
+      ...(entry.desc ? { desc: entry.desc } : {}),
+    });
+  };
+  for (const entry of catalog) {
+    if (entry.bucket === 'tenant' || entry.bucket === 'user') {
+      const st = catalogEntryStatus(entry, entry.bucket);
+      if (st === undefined || st !== 0) add(entry.bucket, entry);
+      continue;
+    }
+    if (entry.tenantStatus !== undefined || entry.userStatus !== undefined) {
+      if (entry.tenantStatus !== undefined && entry.tenantStatus !== 0) add('tenant', entry);
+      if (entry.userStatus !== undefined && entry.userStatus !== 0) add('user', entry);
+    } else if (entry.status !== undefined && entry.status !== 0) {
+      if (entry.tenantLevel !== undefined) add('tenant', entry);
+      if (entry.userLevel !== undefined) add('user', entry);
+      if (entry.tenantLevel === undefined && entry.userLevel === undefined) add('tenant', entry);
+    }
+  }
+  return out;
+}
+
+async function readAllowRefreshTokenBestEffort(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+): Promise<boolean | undefined> {
+  try {
+    const payload = await postJson(`/developers/v1/safe_setting/${appId}`, {});
+    const root = asRecord(payload);
+    const wrapped = asRecord(root.data);
+    const data = Object.keys(wrapped).length > 0 ? wrapped : root;
+    return typeof data.allowRefreshToken === 'boolean' ? data.allowRefreshToken : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeAllowRefreshToken(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  allowRefreshToken: boolean,
+): Promise<void> {
+  await postJson(`/developers/v1/safe_setting/update/${appId}`, {
+    clientId: appId,
+    allowRefreshToken,
+  });
 }
 
 export function buildSafeSettingPayload(appId: string, extraRedirectUrls: string[] = []) {
@@ -1537,6 +1836,7 @@ export async function automateOpenPlatformSetup(
 
   const sessionFile = preparedSession.sessionFile;
   const session = new MutableCookieJar(preparedSession.cookies);
+  return withOpenPlatformAppLock(options.appId, async () => {
   const defaultOrigin = 'https://open.feishu.cn';
   const defaultAppHome = `${defaultOrigin}/app/${options.appId}`;
   // The botmux-managed Feishu Web login yields reusable cookies, not Open
@@ -1547,6 +1847,10 @@ export async function automateOpenPlatformSetup(
   let csrfToken: string | null = null;
   let apiOrigin = defaultOrigin;
   let appHome = defaultAppHome;
+  // Approval diagnostics must survive every later commit/readback failure path.
+  let approvalDeferredScopes: DeferredApprovalScope[] | undefined;
+  let approvalDisabledRefreshToken: boolean | undefined;
+  let approvalCompatibility: ApprovalCompatibilityOutcome | undefined;
   try {
     const authPage = await session.fetchTextWithUrl(fetcher, `${defaultAppHome}/auth`);
     apiOrigin = new URL(authPage.finalUrl).origin;
@@ -1707,17 +2011,47 @@ export async function automateOpenPlatformSetup(
   const grantedUser = options.grantedScopeNames
     ? new Set(options.grantedScopeNames.user)
     : undefined;
-  const hasGrantedSignal = !!(grantedTenant || grantedUser);
-  const effectiveManifest: ScopeManifest = hasGrantedSignal
+  const excludedTenant = options.excludeScopes?.tenant?.length
+    ? new Set(options.excludeScopes.tenant)
+    : undefined;
+  const excludedUser = options.excludeScopes?.user?.length
+    ? new Set(options.excludeScopes.user)
+    : undefined;
+  const hasFilterSignal = !!(grantedTenant || grantedUser || excludedTenant || excludedUser);
+  const effectiveManifest: ScopeManifest = hasFilterSignal
     ? {
         scopes: {
-          tenant: (manifest.scopes?.tenant ?? []).filter(name => !grantedTenant?.has(name)),
-          user: (manifest.scopes?.user ?? []).filter(name => !grantedUser?.has(name)),
+          tenant: (manifest.scopes?.tenant ?? []).filter(
+            name => !grantedTenant?.has(name) && !excludedTenant?.has(name),
+          ),
+          user: (manifest.scopes?.user ?? []).filter(
+            name => !grantedUser?.has(name) && !excludedUser?.has(name),
+          ),
         },
       }
     : manifest;
   const catalog = extractOpenPlatformScopeEntries(allScopesPayload);
   const mapped = mapManifestScopesToOpenPlatformIds(effectiveManifest, catalog);
+  const appliedCandidates = buildApprovalCandidatesForManifest(effectiveManifest, catalog);
+  const draftStagedAll = buildDraftStagedApprovalCandidates(catalog);
+  // 若上一次异常中断留下了未提交草稿，且其中残留着本次明确 excludeScopes 的权限，先清理掉。
+  const staleExcludedDraftScopes = draftStagedAll.filter(s =>
+    s.bucket === 'tenant' ? excludedTenant?.has(s.name) === true : excludedUser?.has(s.name) === true,
+  );
+  const deletedStaleKeys = new Set<string>();
+  if (staleExcludedDraftScopes.length > 0) {
+    try {
+      await postJson(
+        `/developers/v1/scope/update/${options.appId}`,
+        buildScopeUpdatePayload(options.appId, candidatesToMappedScopeIds(staleExcludedDraftScopes), 'del'),
+      );
+      for (const s of staleExcludedDraftScopes) deletedStaleKeys.add(`${s.bucket}:${s.id}`);
+      mutated = true;
+    } catch {
+      // Best-effort cleanup; remaining draft-staged scopes are still merged into candidates below.
+    }
+  }
+  const remainingDraftStaged = draftStagedAll.filter(s => !deletedStaleKeys.has(`${s.bucket}:${s.id}`));
   const missing = [...mapped.missingTenantScopes, ...mapped.missingUserScopes];
   const skippedScopeCount = missing.length;
   const skippedScopes = { tenant: mapped.missingTenantScopes, user: mapped.missingUserScopes };
@@ -1812,10 +2146,11 @@ export async function automateOpenPlatformSetup(
         ok: false,
         reason: 'app_under_review',
         message:
-          '应用正在飞书审核中，开放平台暂时锁定了它的配置写入（权限申请、机器人能力、回调白名单都改不了）。'
-          + '**审批被触发通常意味着有配置不合规**（最常见：权限的「数据范围」没配，默认成「全部/全员」，'
-          + '撞上租户「非必要不申请全员数据」的加签规则）。需要人工处理：到开放平台看审批详情 → 修掉不合规项 '
-          + '→ 撤回该待审版本 → 重新提交。注意：撤回后直接重提**不会**自动通过，规则会再拦一次。',
+          '应用有版本在企业管理员审核中，开放平台暂时锁定了它的配置写入（权限申请、机器人能力、回调白名单都改不了）。'
+          + '长时间没有进展或被驳回时，通常是版本里有**需要企业管理员审批的权限**（例如用户身份的 im:resource），'
+          + '或有**配置不合规**（最常见：权限的「数据范围」没配，默认成「全部/全员」，撞上租户「非必要不申请全员数据」的加签规则）。'
+          + '需要人工处理：到开放平台看这一版的版本详情 → 用不到的敏感权限直接取消该项；配置不合规则修掉后撤回该待审版本、'
+          + '再重新提交。注意：不改配置直接撤回重提**不会**自动通过，规则会再拦一次。',
         sessionFile,
         redirectConfigured,
         redirectWarning,
@@ -2142,17 +2477,15 @@ export async function automateOpenPlatformSetup(
     let versionWarning: string | undefined;
     let approvalAutoPassed: boolean | undefined;
     let approvalHumanApprovers: string[] | undefined;
+    let versionPendingReview: boolean | undefined;
+    let pendingReviewAppVersion: string | undefined;
     if (versionId) {
       // 提交前先问一句「这一版提交后会不会秒过」。判据见 {@link predictApprovalFlow}：
       // 全自动通过 + 零真人审批人 ⟹ 提交不打扰任何人、立即生效，尽管提。
       //
-      // 反过来，有真人审批人时**仍然照常提交**——这是既有行为，不改：botmux 建 bot /
-      // 补权限本来就需要发版才生效，替用户提审是本来的分工。这里查流程的作用是**把
-      // 「秒过」与「要人审」分开告知**：秒过的一声不吭办完；要人审的明确说「已提交，
-      // 需要 X 审批」，让用户知道在等谁、以及别再重复点。
-      //
-      // 判不出来（known:false，接口报错 / 没有可判定的关卡）时不猜：既不宣称秒过，
-      // 也不宣称要人审，只在日志里留原因。
+      // 当开启审批兼容排查（新应用创建缺省开启，或调用方显式 autoAvoidApproval:true）且
+      // 预判命中真人审批时，在草稿态通过分组/有界二分自动避开触发审批的权限，再提交可自动
+      // 发布的版本，并把跳过的权限带回提示用户。
       const prediction = await fetchApprovalFlowPrediction(postJson, options.appId, versionId, visibility);
       if (prediction.known) {
         approvalAutoPassed = prediction.autoApproved;
@@ -2160,6 +2493,77 @@ export async function automateOpenPlatformSetup(
       } else if (prediction.reason) {
         await options.onStatus?.(`审批流程预判不可用（${prediction.reason}），按常规提交`);
       }
+
+      const shouldAutoAvoidApproval =
+        options.autoAvoidApproval ?? options.appJustCreated === true;
+      const approvalCandidates = importedScopeCount > 0
+        ? mergeApprovalCandidates(appliedCandidates, remainingDraftStaged)
+        : remainingDraftStaged;
+      if (
+        shouldAutoAvoidApproval
+        && prediction.known
+        && !prediction.autoApproved
+      ) {
+        const initialAllowRefreshToken = await readAllowRefreshTokenBestEffort(postJson, options.appId);
+        const compat = await resolveAutoApprovedScopes({
+          initialPrediction: prediction,
+          candidates: approvalCandidates,
+          initialAllowRefreshToken,
+          maxProbes: options.approvalMaxProbes,
+          removeScopes: async scopes => {
+            await postJson(
+              `/developers/v1/scope/update/${options.appId}`,
+              buildScopeUpdatePayload(options.appId, candidatesToMappedScopeIds(scopes), 'del'),
+            );
+          },
+          addScopes: async scopes => {
+            await postJson(
+              `/developers/v1/scope/update/${options.appId}`,
+              buildScopeUpdatePayload(options.appId, candidatesToMappedScopeIds(scopes), 'add'),
+            );
+          },
+          onScopesAdded: async scopes => {
+            if (scopes.some(s => s.name.startsWith('vc:') || s.name.startsWith('task:'))) {
+              await narrowRequiredPrivilegeRanges({ postJson }, options.appId).catch(() => {});
+            }
+          },
+          setAllowRefreshToken: async enabled => {
+            await writeAllowRefreshToken(postJson, options.appId, enabled);
+          },
+          probeApproval: () => fetchApprovalFlowPrediction(postJson, options.appId, versionId, visibility),
+          onStatus: options.onStatus,
+        });
+        approvalCompatibility = compat;
+        if (compat.deferredScopes.length > 0) approvalDeferredScopes = compat.deferredScopes;
+        if (!compat.resolvedAutoApproved && compat.restored === false) {
+          return {
+            ok: false,
+            reason: 'api_error',
+            message: '草稿态审批兼容排查中断且未能确认完整还原草稿，已中止发版以免发布残缺权限；请到开放平台核对草稿后重试。',
+            sessionFile,
+            subscribedEventCount,
+            eventWarning,
+            missingVcEvents,
+            eventModeReady,
+            redirectConfigured,
+            redirectWarning,
+            approvalCompatibility,
+            ...(approvalDeferredScopes?.length ? { approvalDeferredScopes } : {}),
+            ...(approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+          };
+        }
+        if (compat.resolvedAutoApproved) {
+          approvalAutoPassed = true;
+          approvalHumanApprovers = undefined;
+          if (compat.deferredScopes.length > 0) {
+            importedScopeCount = Math.max(0, importedScopeCount - compat.deferredScopes.length);
+          }
+          if (compat.disabledRefreshToken) {
+            approvalDisabledRefreshToken = true;
+          }
+        }
+      }
+
       await postJson(`/developers/v1/publish/commit/${options.appId}/${versionId}`, { clientId: options.appId });
       // commit 返回 code=0 ≠ 版本真的提交了：线上实测过 commit 回 `{code:0,isOk:true}`
       // 而版本仍停在草稿态，于是日志谎报「published」，留下的草稿正是卡死后续自愈的
@@ -2170,6 +2574,32 @@ export async function automateOpenPlatformSetup(
         if (!isVersionCommitted(after, versionId)) {
           versionWarning =
             `版本 ${versionId} 提交后回读仍是「未提交审核」草稿：请到开放平台「版本管理」手动点「申请发布」`;
+        } else {
+          // 提交了 ≠ 生效了：这一版可能停在「审核中」等企业管理员审批（审批预判说「自动通过」
+          // 也一样会卡，见 versionPendingReview 的注释）。不说清楚，用户看到「已提交发布」会
+          // 以为 botmux 卡住了。只读回读，不撤回、不重提、不绕过审核。
+          const review = await settleCommittedVersionReview(
+            postJson, options.appId, versionId, after, options.reviewSettleDelaysMs ?? DEFAULT_REVIEW_SETTLE_DELAYS_MS,
+          );
+          if (review.versionStatus === CONSOLE_VERSION_STATUS_DRAFT) {
+            // 人工可能在复查窗口内撤回。最终已回到草稿时不能沿用首读的 committed 结论，
+            // 更不能保留提交前的「自动通过」预判，否则又会变成纯 ready 的假绿灯。
+            versionWarning =
+              `版本 ${review.appVersion ?? versionId} 提交后复查又回到「未提交审核」草稿（可能刚被撤回）：`
+              + '请到开放平台「版本管理」确认并重新申请发布';
+            approvalAutoPassed = false;
+            approvalHumanApprovers = undefined;
+          } else if (review.versionStatus === CONSOLE_VERSION_STATUS_IN_REVIEW) {
+            versionPendingReview = true;
+            pendingReviewAppVersion = review.appVersion;
+            approvalAutoPassed = false;
+            // 进度回调只是展示；它出错不能把「审核中」这个回读事实改判成「回读失败」。
+            try {
+              await options.onStatus?.(
+                `版本 ${review.appVersion ?? versionId} 已提交，正在等待企业管理员审核（审核通过前新权限不生效，进度可在飞书「审批」里查看）`,
+              );
+            } catch { /* 进度展示失败不影响结论 */ }
+          }
         }
       } catch (err: any) {
         versionWarning = `版本 ${versionId} 提交状态回读失败（无法确认是否已提交）: ${safeErrorMessage(err)}`;
@@ -2196,6 +2626,10 @@ export async function automateOpenPlatformSetup(
       versionWarning,
       approvalAutoPassed,
       approvalHumanApprovers,
+      ...(versionPendingReview ? { versionPendingReview, pendingReviewAppVersion } : {}),
+      ...(approvalDeferredScopes?.length ? { approvalDeferredScopes } : {}),
+      ...(approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+      ...(approvalCompatibility ? { approvalCompatibility } : {}),
       ...(options.requireVerifiedEvents
         ? {
             eventMode: eventState?.eventMode,
@@ -2216,8 +2650,12 @@ export async function automateOpenPlatformSetup(
       eventModeReady,
       redirectConfigured,
       redirectWarning,
+      ...(approvalCompatibility ? { approvalCompatibility } : {}),
+      ...(approvalDeferredScopes?.length ? { approvalDeferredScopes } : {}),
+      ...(approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
     };
   }
+  });
 }
 
 /**
@@ -2401,6 +2839,12 @@ export type CreateFeishuOpenPlatformAppResult =
       sessionFile: string;
       sessionSource: FeishuWebSessionSource;
       sessionIdentity: FeishuWebSessionIdentity;
+      /** `1.0.0` 模板初始版提交前因命中企业审批而自动跳过的权限（`1.0.1` 需排除以免重加）。 */
+      approvalDeferredScopes?: DeferredApprovalScope[];
+      /** `1.0.0` 阶段为避开企业审批而关闭了刷新 user_access_token。 */
+      approvalDisabledRefreshToken?: boolean;
+      /** `1.0.0` 阶段审批兼容自动排查的诊断结果（仅在初始预判需人工审批时有值）。 */
+      approvalCompatibility?: ApprovalCompatibilityOutcome;
     }
   | {
       ok: false;
@@ -2415,6 +2859,10 @@ export type CreateFeishuOpenPlatformAppResult =
       /** 应用已经建成但读取 Secret 失败时返回，调用方不得再创建一个重复应用。 */
       appId?: string;
       sessionFile?: string;
+      /** 创建后步骤失败/提交结果未知时，仍需传递给续跑调用方的审批诊断。 */
+      approvalDeferredScopes?: DeferredApprovalScope[];
+      approvalDisabledRefreshToken?: boolean;
+      approvalCompatibility?: ApprovalCompatibilityOutcome;
     };
 
 export interface CreateFeishuOpenPlatformAppOptions extends FeishuWebSessionOptions {
@@ -2424,6 +2872,10 @@ export interface CreateFeishuOpenPlatformAppOptions extends FeishuWebSessionOpti
   iconFilePath?: string;
   /** Dashboard 表单打开时显示过的缓存身份；创建前必须仍是同一人、同一企业。 */
   expectedIdentity?: Pick<FeishuWebSessionIdentity, 'userId' | 'tenantId'>;
+  /** `1.0.0` 提交前若预判命中真人审批，是否自动排查并避开模板自带的需审权限（默认开启）。 */
+  autoAvoidApproval?: boolean;
+  /** `1.0.0` 审批排查最大探测次数上限。 */
+  approvalMaxProbes?: number;
   /** 已拿到并验证账号/企业、但尚未创建应用时触发。 */
   onSessionReady?: (info: {
     source: FeishuWebSessionSource;
@@ -2432,7 +2884,15 @@ export interface CreateFeishuOpenPlatformAppOptions extends FeishuWebSessionOpti
 }
 
 class CreatedOpenPlatformAppError extends Error {
-  constructor(readonly appId: string, cause: unknown) {
+  constructor(
+    readonly appId: string,
+    readonly diagnostics: {
+      approvalDeferredScopes?: DeferredApprovalScope[];
+      approvalDisabledRefreshToken?: boolean;
+      approvalCompatibility?: ApprovalCompatibilityOutcome;
+    },
+    cause: unknown,
+  ) {
     super(`应用 ${appId} 已创建，但启用机器人能力或读取 AppSecret 失败: ${safeErrorMessage(cause)}`);
   }
 }
@@ -2570,8 +3030,22 @@ export async function createOpenPlatformAppWithClient(
   // creatorUserId 必填:首次「启用发布」的版本可见范围必须含创建者,否则发布后
   // 应用不会自动上架启用。调用方(createFeishuOpenPlatformApp)已保证 session
   // identity 可用才会走到这里。
-  options: { name: string; description?: string; iconFilePath?: string; creatorUserId: string },
-): Promise<{ appId: string; appSecret: string }> {
+  options: {
+    name: string;
+    description?: string;
+    iconFilePath?: string;
+    creatorUserId: string;
+    autoAvoidApproval?: boolean;
+    approvalMaxProbes?: number;
+    onStatus?: (message: string) => void | Promise<void>;
+  },
+): Promise<{
+  appId: string;
+  appSecret: string;
+  approvalDeferredScopes?: DeferredApprovalScope[];
+  approvalDisabledRefreshToken?: boolean;
+  approvalCompatibility?: ApprovalCompatibilityOutcome;
+}> {
   const name = options.name.trim();
   if (!name) throw new Error('应用名称不能为空');
   if (!options.creatorUserId) throw new Error('创建应用缺少创建者 userId,无法完成上架启用');
@@ -2595,6 +3069,9 @@ export async function createOpenPlatformAppWithClient(
 
   const description = options.description?.trim() || 'AI coding assistant powered by botmux';
   let appId: string | undefined;
+  let approvalDeferredScopes: DeferredApprovalScope[] | undefined;
+  let approvalDisabledRefreshToken: boolean | undefined;
+  let approvalCompatibility: ApprovalCompatibilityOutcome | undefined;
   try {
     const created = await client.postJson(
       '/developers/v1/manifest/upsert_by_template',
@@ -2668,15 +3145,103 @@ export async function createOpenPlatformAppWithClient(
     if (!enableVersionId) {
       throw new Error('上架启用版本创建返回成功但没有 versionId(可能已留下未发布草稿);请到开放平台确认后重试');
     }
+
+    // 模板应用（developer_console）出生自带 8 项 level-4 权限及 allowRefreshToken=true；
+    // 对未命中「仅协作者免审」的账号/部门，1.0.0 本身就会被企业审批拦住并锁死整个应用。
+    // 提交前先做一次审批流预判：免审账号零额外写入直接 commit；命中真人审批时在草稿态
+    // 自动二分避开触发项，确保 1.0.0 自动上架后再进入 1.0.1。
+    if (options.autoAvoidApproval !== false) {
+      const initialVisibility = {
+        visibleSuggest: {
+          isAll: 0,
+          departments: [] as string[],
+          members: [options.creatorUserId],
+          groups: [] as string[],
+        },
+        blackVisibleSuggest: {
+          isAll: 0,
+          departments: [] as string[],
+          members: [] as string[],
+          groups: [] as string[],
+        },
+      };
+      const initialPrediction = await fetchApprovalFlowPrediction(
+        client.postJson,
+        appId,
+        enableVersionId,
+        initialVisibility,
+      );
+      if (initialPrediction.known && !initialPrediction.autoApproved) {
+        try {
+          const allScopesPayload = await client.postJsonIdempotent(`/developers/v1/scope/all/${appId}`, {});
+          const activeCandidates = buildApprovalCandidatesFromActiveCatalog(
+            extractOpenPlatformScopeEntries(allScopesPayload),
+          );
+          const initialAllowRefreshToken = await readAllowRefreshTokenBestEffort(client.postJson, appId);
+          const compat = await resolveAutoApprovedScopes({
+            initialPrediction,
+            candidates: activeCandidates,
+            initialAllowRefreshToken,
+            maxProbes: options.approvalMaxProbes,
+            removeScopes: async scopes => {
+              await client.postJson(
+                `/developers/v1/scope/update/${appId}`,
+                buildScopeUpdatePayload(appId, candidatesToMappedScopeIds(scopes), 'del'),
+              );
+            },
+            addScopes: async scopes => {
+              await client.postJson(
+                `/developers/v1/scope/update/${appId}`,
+                buildScopeUpdatePayload(appId, candidatesToMappedScopeIds(scopes), 'add'),
+              );
+            },
+            onScopesAdded: async scopes => {
+              if (scopes.some(s => s.name.startsWith('vc:') || s.name.startsWith('task:'))) {
+                await narrowRequiredPrivilegeRanges(client, appId).catch(() => {});
+              }
+            },
+            setAllowRefreshToken: async enabled => {
+              await writeAllowRefreshToken(client.postJson, appId, enabled);
+            },
+            probeApproval: () =>
+              fetchApprovalFlowPrediction(client.postJson, appId, enableVersionId, initialVisibility),
+            onStatus: options.onStatus,
+          });
+          approvalCompatibility = compat;
+          if (compat.deferredScopes.length > 0) approvalDeferredScopes = compat.deferredScopes;
+          if (compat.resolvedAutoApproved) {
+            if (compat.disabledRefreshToken) approvalDisabledRefreshToken = true;
+          }
+        } catch {
+          // Best-effort: never fail app creation if scope inspection fails before 1.0.0 commit.
+        }
+        if (approvalCompatibility && !approvalCompatibility.resolvedAutoApproved && approvalCompatibility.restored === false) {
+          throw new Error(
+            '1.0.0 草稿态审批兼容排查中断且未能确认完整还原草稿，已中止发版以免发布残缺权限；请到开放平台核对草稿后重试。',
+          );
+        }
+      }
+    }
+
     await client.postJson(`/developers/v1/publish/commit/${appId}/${enableVersionId}`, { clientId: appId });
 
     // 读 Secret 是纯只读 POST(getAppSecret 同款,不触碰 reset),幂等可重试:
     // 应用已建成、已发布,唯独最后一步读 Secret 撞网络抖动而失败最可惜——
     // 重试让它自愈,而不是把整条链路判死。
     const appSecret = await fetchOpenPlatformAppSecret(client, appId!, { idempotentRetry: true });
-    return { appId, appSecret };
+    return {
+      appId,
+      appSecret,
+      ...(approvalDeferredScopes?.length ? { approvalDeferredScopes } : {}),
+      ...(approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+      ...(approvalCompatibility ? { approvalCompatibility } : {}),
+    };
   } catch (err) {
-    throw new CreatedOpenPlatformAppError(appId, err);
+    throw new CreatedOpenPlatformAppError(appId, {
+      ...(approvalDeferredScopes?.length ? { approvalDeferredScopes } : {}),
+      ...(approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+      ...(approvalCompatibility ? { approvalCompatibility } : {}),
+    }, err);
   }
 }
 
@@ -2864,7 +3429,7 @@ export async function createFeishuOpenPlatformApp(
       ok: false,
       reason: /默认应用图标/.test(message) ? 'missing_icon' : 'api_error',
       message,
-      ...(err instanceof CreatedOpenPlatformAppError ? { appId: err.appId } : {}),
+      ...(err instanceof CreatedOpenPlatformAppError ? { appId: err.appId, ...err.diagnostics } : {}),
       sessionFile: prepared.sessionFile,
     };
   }
@@ -3379,6 +3944,16 @@ function classifyFeishuLoginError(err: unknown): FeishuWebSessionFailureReason {
   return 'login_failed';
 }
 
+function firstNumericValue(val: unknown): number | undefined {
+  if (typeof val === 'number' && Number.isFinite(val)) return val;
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      if (typeof item === 'number' && Number.isFinite(item)) return item;
+    }
+  }
+  return undefined;
+}
+
 function collectScopeEntries(value: unknown, bucket: 'tenant' | 'user' | undefined, out: OpenPlatformScopeEntry[]): void {
   if (Array.isArray(value)) {
     for (const item of value) collectScopeEntries(item, bucket, out);
@@ -3388,7 +3963,29 @@ function collectScopeEntries(value: unknown, bucket: 'tenant' | 'user' | undefin
   const record = value as Record<string, unknown>;
   const name = pickString(record, ['scope_name', 'scopeName', 'name', 'key', 'scopeKey']);
   const id = pickString(record, ['id', 'scope_id', 'scopeId', 'scopeID']);
-  if (name && id) out.push({ name, id, bucket });
+  if (name && id) {
+    const levelMap = asRecord(record.scopeType2ScopeLevel);
+    const statusMap = asRecord(record.scopeType2ScopeStatus);
+    const tenantLevel = firstNumericValue(levelMap['2']);
+    const userLevel = firstNumericValue(levelMap['1']);
+    const level = firstNumericValue(record.levels) ?? firstNumericValue(record.level);
+    const tenantStatus = firstNumericValue(statusMap['2']);
+    const userStatus = firstNumericValue(statusMap['1']);
+    const status = firstNumericValue(record.status);
+    const desc = pickString(record, ['desc', 'description'])?.trim() || undefined;
+    out.push({
+      name,
+      id,
+      bucket,
+      ...(tenantLevel !== undefined ? { tenantLevel } : {}),
+      ...(userLevel !== undefined ? { userLevel } : {}),
+      ...(level !== undefined ? { level } : {}),
+      ...(tenantStatus !== undefined ? { tenantStatus } : {}),
+      ...(userStatus !== undefined ? { userStatus } : {}),
+      ...(status !== undefined ? { status } : {}),
+      ...(desc ? { desc } : {}),
+    });
+  }
   for (const [key, child] of Object.entries(record)) {
     const nextBucket = /user/i.test(key)
       ? 'user'
@@ -3542,6 +4139,57 @@ export function isVersionCommitted(payload: unknown, versionId: string): boolean
   // 版本号在列表里找不到 → 无法证明它已提交，保守判 false（宁可多报一句 warning，
   // 也不要重复上一次「拿 code=0 当已发布」的错）。
   return false;
+}
+
+/** 免审版本从提交到上线实测约 2 秒；回读到「审核中」后按这个节奏复查，合计约 4 秒。 */
+const DEFAULT_REVIEW_SETTLE_DELAYS_MS: readonly number[] = [1_500, 2_500];
+
+/**
+ * `app_version/list` 里某个 versionId 的状态与版本号。找不到返回 undefined。
+ */
+function findConsoleVersion(
+  payload: unknown,
+  versionId: string,
+): { versionStatus: unknown; appVersion?: string } | undefined {
+  const data = asRecord(asRecord(payload).data);
+  const versions = Array.isArray(data.versions) ? data.versions : [];
+  for (const item of versions) {
+    const record = asRecord(item);
+    if (pickString(record, ['versionId', 'version_id', 'id']) !== versionId) continue;
+    const appVersion = pickString(record, ['appVersion']);
+    return { versionStatus: record.versionStatus, ...(appVersion ? { appVersion } : {}) };
+  }
+  return undefined;
+}
+
+/**
+ * 刚提交的版本在复查窗口结束时的状态。首读是审核中时按 `delaysMs` 再复查，免审版本会在
+ * 这几秒里自己上线；复查读失败就以最后一次观察为准（那次就是审核中）。
+ *
+ * 必须带回最终的 `versionStatus`，不能只回 `inReview`：人工在窗口内撤回后版本会回到
+ * 草稿（0），调用方要据此保留「未提交」告警，而不是把首读的 committed 当成最终事实。
+ */
+async function settleCommittedVersionReview(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  versionId: string,
+  firstReadback: unknown,
+  delaysMs: readonly number[],
+): Promise<{ versionStatus: unknown; appVersion?: string }> {
+  let record = findConsoleVersion(firstReadback, versionId);
+  for (const delay of delaysMs) {
+    if (record?.versionStatus !== CONSOLE_VERSION_STATUS_IN_REVIEW) break;
+    await sleep(delay);
+    try {
+      record = findConsoleVersion(await postJson(`/developers/v1/app_version/list/${appId}`, {}), versionId) ?? record;
+    } catch {
+      break;
+    }
+  }
+  return {
+    versionStatus: record?.versionStatus,
+    ...(record?.appVersion ? { appVersion: record.appVersion } : {}),
+  };
 }
 
 /**

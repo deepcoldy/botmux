@@ -44,8 +44,13 @@ export function classifySetupOpenPlatformOutcome(
     // JSON 路径若报 `ready` 就是**假绿灯**——恰好是这次线上事故的形态（commit 回
     // code=0 而版本停在草稿态）。daemon 自愈路径自己 warn + DM 了，别的调用方靠这里。
     || result.versionWarning
+    // 版本提交了，但停在「审核中」等企业管理员审批：审批通过前新权限同样不生效，报 `ready`
+    // 一样是假绿灯（用户会以为配好了、却处处缺权限）。
+    || result.versionPendingReview
     || !result.redirectConfigured
     || result.redirectWarning
+    || Boolean(result.approvalDeferredScopes?.length)
+    || result.approvalDisabledRefreshToken === true
   );
   return { status: hasWarnings ? 'ready_with_warnings' : 'ready', result };
 }
@@ -69,6 +74,9 @@ export function setupOpenPlatformRetryCommand(
   appId: string,
   outcome: SetupOpenPlatformOutcome,
 ): string | undefined {
+  if (outcome.status !== 'skipped' && outcome.result.approvalDeferredPersistWarning) {
+    return `botmux setup configure ${appId}`;
+  }
   if (outcome.status !== 'failed') return undefined;
   const switchAccount = SESSION_RETRY_REASONS.has(outcome.result.reason) ? ' --switch-account' : '';
   return `botmux setup configure ${appId}${switchAccount}`;

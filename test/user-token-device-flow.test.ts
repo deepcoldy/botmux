@@ -23,6 +23,7 @@ describe('user authorization device flow', () => {
   let userFetch: (init: RequestInit) => Promise<Response>;
   let fetchMock: ReturnType<typeof vi.fn>;
   let requestUserAuthorization: typeof import('../src/utils/user-token.js').requestUserAuthorization;
+  let resolveUserToken: typeof import('../src/utils/user-token.js').resolveUserToken;
 
   beforeEach(async () => {
     root = mkdtempSync(join(tmpdir(), 'botmux-user-device-'));
@@ -33,7 +34,7 @@ describe('user authorization device flow', () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-09-19T00:00:00Z'));
     vi.resetModules();
-    ({ requestUserAuthorization } = await import('../src/utils/user-token.js'));
+    ({ requestUserAuthorization, resolveUserToken } = await import('../src/utils/user-token.js'));
     current = true;
     device = {
       device_code: DEVICE_CODE,
@@ -133,7 +134,6 @@ describe('user authorization device flow', () => {
 
     expect(auth.scopes).toEqual([
       'im:message:readonly',
-      'im:resource',
       'offline_access',
       'contact:user.base:readonly',
       'docs:document.comment:read',
@@ -141,6 +141,9 @@ describe('user authorization device flow', () => {
     expect(grantedScope).toBe(auth.scopes.join(' '));
   });
 
+  // 旧 token 里的用户身份 im:resource 是按需权限：为别的能力增量授权时不再连带申请（它会被
+  // 飞书一起塞进自动生成的「Scope Authorization」版本、卡在企业管理员审批），新 token 不带它
+  // 也照常保存；其余旧权限仍然一项不能少。
   it.each([undefined, 'base:field:read', 'base:record:read'])(
     'bundles task scopes in one incremental grant and refuses missing %s', async missing => {
       const path = join(tokenDir, `user-token-${APP}-${USER}.json`);
@@ -152,7 +155,7 @@ describe('user authorization device flow', () => {
       writeFileSync(path, JSON.stringify(existing));
       const scopes = ['base:field:read', 'base:record:read'];
       const auth = await requestUserAuthorization(APP, 'secret', 'feishu', scopes, USER, () => current);
-      expect(auth.scopes).toEqual([...existing.scope.split(' '), ...scopes]);
+      expect(auth.scopes).toEqual(['im:message:readonly', 'offline_access', ...scopes]);
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(new URLSearchParams(fetchMock.mock.calls[0][1].body as URLSearchParams).get('scope'))
         .toBe(auth.scopes.join(' '));
@@ -160,7 +163,11 @@ describe('user authorization device flow', () => {
       if (missing) tokenBody.scope = auth.scopes.filter(scope => scope !== missing).join(' ');
       advance(5);
       if (missing) {
-        expect(await auth.poll()).toEqual({ status: 'failed', error: 'authorization_scope_missing' });
+        // 判定不变（照样拒绝、不落盘），但要点名缺的是哪一项；版本状态查不到时只列缺失项。
+        expect(await auth.poll()).toMatchObject({
+          status: 'failed', error: 'authorization_scope_missing', missingScopes: [missing],
+          appVersionReview: { state: 'unknown' },
+        });
         expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(existing);
       } else {
         expect(await auth.poll()).toEqual({ status: 'ready', token: TOKEN });
@@ -172,6 +179,79 @@ describe('user authorization device flow', () => {
       expect(existsSync(join(tokenDir, `user-token-${APP}-ou_other.json`))).toBe(false);
     },
   );
+
+  describe('an im:resource the person explicitly authorized', () => {
+    const tokenPath = () => join(tokenDir, `user-token-${APP}-${USER}.json`);
+    const stored = (scope: string, extra: Record<string, unknown> = {}) => JSON.stringify({
+      access_token: 'old-token', refresh_token: 'old-refresh', token_type: 'Bearer',
+      expires_at: '2026-09-19T01:00:00.000Z', refresh_expires_at: '2026-10-19T00:00:00.000Z',
+      scope, appId: APP, brand: 'feishu', openId: USER, ...extra,
+    });
+
+    it('is recorded, then carried by later authorizations for other capabilities', async () => {
+      writeFileSync(tokenPath(), stored('im:message:readonly offline_access'));
+      const grant = await requestUserAuthorization(APP, 'secret', 'feishu', ['im:resource'], USER, () => current);
+      advance(5);
+      expect(await grant.poll()).toEqual({ status: 'ready', token: TOKEN });
+      expect(JSON.parse(readFileSync(tokenPath(), 'utf8')).onDemandScopes).toEqual(['im:resource']);
+      const later = await requestUserAuthorization(APP, 'secret', 'feishu', ['docx:document:readonly'], USER, () => current);
+      expect(later.scopes).toContain('im:resource');
+    });
+
+    it('cannot be stripped by an older authorization that finishes later', async () => {
+      writeFileSync(tokenPath(), stored('im:message:readonly offline_access'));
+      const older = await requestUserAuthorization(APP, 'secret', 'feishu', ['docx:document:readonly'], USER, () => current);
+      const resource = await requestUserAuthorization(APP, 'secret', 'feishu', ['im:resource'], USER, () => current);
+      expect(older.scopes).not.toContain('im:resource');
+      advance(5);
+      tokenBody.scope = resource.scopes.join(' ');
+      expect(await resource.poll()).toEqual({ status: 'ready', token: TOKEN });
+      tokenBody.scope = older.scopes.join(' ');
+      expect(await older.poll()).toEqual({ status: 'failed', error: 'authorization_scope_stale' });
+      expect(JSON.parse(readFileSync(tokenPath(), 'utf8')).scope.split(' ')).toContain('im:resource');
+    });
+
+    it('keeps the explicit marker when an older flow finishes with the scope still present', async () => {
+      writeFileSync(tokenPath(), stored('im:message:readonly offline_access'));
+      const older = await requestUserAuthorization(APP, 'secret', 'feishu', ['docx:document:readonly'], USER, () => current);
+      const resource = await requestUserAuthorization(APP, 'secret', 'feishu', ['im:resource'], USER, () => current);
+      advance(5);
+      tokenBody.scope = resource.scopes.join(' ');
+      expect(await resource.poll()).toEqual({ status: 'ready', token: TOKEN });
+      // 较早发起的授权后完成，但回包仍带 im:resource：不应被 stale 拦截，也不能因此
+      // 把较新授权写下的 onDemandScopes 擦掉，否则下一次授权就会把它当旧默认集剥掉。
+      tokenBody.scope = [...older.scopes, 'im:resource'].join(' ');
+      expect(await older.poll()).toEqual({ status: 'ready', token: TOKEN });
+      expect(JSON.parse(readFileSync(tokenPath(), 'utf8')).onDemandScopes).toEqual(['im:resource']);
+      const later = await requestUserAuthorization(APP, 'secret', 'feishu', ['base:field:read'], USER, () => current);
+      expect(later.scopes).toContain('im:resource');
+    });
+
+    it('survives a token refresh', async () => {
+      writeFileSync(tokenPath(), stored('im:message:readonly im:resource offline_access', {
+        expires_at: '2026-09-18T00:00:00.000Z', onDemandScopes: ['im:resource'],
+      }));
+      tokenBody.scope = 'im:message:readonly im:resource offline_access';
+      expect(await resolveUserToken(APP, 'secret', 'feishu', USER)).toBe(TOKEN);
+      expect(JSON.parse(readFileSync(tokenPath(), 'utf8'))).toMatchObject({ access_token: TOKEN, onDemandScopes: ['im:resource'] });
+    });
+  });
+
+  it('requests im:resource only when asked for explicitly, and keeps it strict then', async () => {
+    const path = join(tokenDir, `user-token-${APP}-${USER}.json`);
+    writeFileSync(path, JSON.stringify({
+      access_token: 'old-token', refresh_token: 'old-refresh', token_type: 'Bearer',
+      expires_at: '2026-09-19T01:00:00.000Z', refresh_expires_at: '2026-10-19T00:00:00.000Z',
+      scope: 'im:message:readonly offline_access docs:document.comment:read', appId: APP, brand: 'feishu', openId: USER,
+    }));
+    const auth = await requestUserAuthorization(APP, 'secret', 'feishu', ['im:resource'], USER, () => current);
+    expect(auth.scopes).toContain('im:resource');
+    // 显式申请了就必须拿到：缺了照样拒绝，不落盘。
+    tokenBody.scope = auth.scopes.filter(scope => scope !== 'im:resource').join(' ');
+    advance(5);
+    expect(await auth.poll()).toMatchObject({ status: 'failed', error: 'authorization_scope_missing' });
+    expect(JSON.parse(readFileSync(path, 'utf8')).access_token).toBe('old-token');
+  });
 
   it('does not overwrite a token whose scopes expanded while authorization was pending', async () => {
     const path = join(tokenDir, `user-token-${APP}-${USER}.json`);
@@ -248,10 +328,98 @@ describe('user authorization device flow', () => {
     if (failure === 'identity') userBody = { code: 999, data: {} };
     advance(5);
     const expected = failure === 'identity' ? 'authorization_identity_unverified' : `authorization_${failure}_mismatch`;
-    expect(await auth.poll()).toEqual({
-      status: 'failed', error: failure === 'scope' ? 'authorization_scope_missing' : expected,
-    });
+    expect(await auth.poll()).toEqual(failure === 'scope'
+      ? {
+        status: 'failed', error: 'authorization_scope_missing', missingScopes: ['im:chat:read'],
+        appVersionReview: { state: 'unknown', reason: 'unexpected endpoint' },
+      }
+      : { status: 'failed', error: expected });
     expect(readdirSync(tokenDir)).toEqual([]);
+  });
+
+  describe('scopes held back by an app version under enterprise review', () => {
+    const REVIEW_SCOPES = ['docs:document.comment:delete', 'im:feed.flag:read'];
+    let versionsBody: unknown;
+    let tenantBody: unknown;
+
+    beforeEach(() => {
+      tenantBody = { code: 0, tenant_access_token: 'tenant-token' };
+      versionsBody = {
+        code: 0,
+        data: { items: [{ app_id: APP, version: '1.0.11', version_id: 'oav_pending', status: 3 }] },
+      };
+      const base = fetchMock.getMockImplementation() as (url: string, init: RequestInit) => Promise<Response>;
+      fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+        if (url.endsWith('/tenant_access_token/internal')) return json(tenantBody);
+        if (url.includes(`/application/v6/applications/${APP}/app_versions`)) return json(versionsBody);
+        return base(url, init);
+      });
+    });
+
+    it('names the missing scopes and the version under review, still refusing and saving nothing', async () => {
+      const auth = await requestUserAuthorization(APP, 'secret', 'feishu', ['docx:document:create', ...REVIEW_SCOPES], USER, () => current);
+      // 飞书照常发回 token，只是审核中版本里新增的那些权限不在里面。
+      tokenBody.scope = auth.scopes.filter(scope => !REVIEW_SCOPES.includes(scope)).join(' ');
+      advance(5);
+      expect(await auth.poll()).toEqual({
+        status: 'failed',
+        error: 'authorization_scope_missing',
+        missingScopes: REVIEW_SCOPES,
+        appVersionReview: { state: 'in_review', version: '1.0.11', versionId: 'oav_pending' },
+      });
+      expect(readdirSync(tokenDir)).toEqual([]);
+      // 版本状态用应用自己的 tenant token 查，不拿刚发回、尚未核实身份的 user token 去查。
+      const versionsCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/app_versions'))!;
+      expect(versionsCall[1].headers.Authorization).toBe('Bearer tenant-token');
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/user_info'))).toBe(false);
+      // 终态被缓存：再 poll 不会重复查版本。
+      expect(await auth.poll()).toMatchObject({ error: 'authorization_scope_missing', missingScopes: REVIEW_SCOPES });
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/app_versions'))).toHaveLength(1);
+    });
+
+    it.each([
+      ['the app lacks permission to read its versions', () => { versionsBody = { code: 99991672, msg: 'scope not applied' }; }],
+      ['the tenant token is refused', () => { tenantBody = { code: 10014, msg: 'app secret invalid' }; }],
+    ])('only lists the missing scopes when %s', async (_label, breakLookup) => {
+      breakLookup();
+      const auth = await requestUserAuthorization(APP, 'secret', 'feishu', REVIEW_SCOPES, USER, () => current);
+      tokenBody.scope = auth.scopes.filter(scope => !REVIEW_SCOPES.includes(scope)).join(' ');
+      advance(5);
+      expect(await auth.poll()).toMatchObject({
+        status: 'failed', error: 'authorization_scope_missing', missingScopes: REVIEW_SCOPES,
+        appVersionReview: { state: 'unknown' },
+      });
+      expect(readdirSync(tokenDir)).toEqual([]);
+    });
+
+    it('keeps the version lookup inside the poll deadline so `auth wait` never times out on it', async () => {
+      device.expires_in = 30;
+      const auth = await requestUserAuthorization(APP, 'secret', 'feishu', REVIEW_SCOPES, USER, () => current);
+      tokenBody.scope = auth.scopes.filter(scope => !REVIEW_SCOPES.includes(scope)).join(' ');
+      const base = fetchMock.getMockImplementation() as (url: string, init: RequestInit) => Promise<Response>;
+      fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+        if (!url.includes('/app_versions')) return base(url, init);
+        // 版本接口挂住：只有被中止才返回。
+        return new Promise<Response>((_resolve, reject) => {
+          init.signal!.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+        });
+      });
+      // 离授权码过期只剩 1 秒：这次 poll 的总预算就是 1 秒，版本查询不能再自带 5 秒。
+      advance(29);
+      const started = performance.now();
+      expect(await auth.poll()).toMatchObject({
+        status: 'failed', error: 'authorization_scope_missing', missingScopes: REVIEW_SCOPES,
+        appVersionReview: { state: 'unknown' },
+      });
+      expect(performance.now() - started).toBeLessThan(3_000);
+    });
+
+    it('does not look up versions when the grant is complete', async () => {
+      const auth = await requestUserAuthorization(APP, 'secret', 'feishu', REVIEW_SCOPES, USER, () => current);
+      advance(5);
+      expect(await auth.poll()).toEqual({ status: 'ready', token: TOKEN });
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/app_versions'))).toBe(false);
+    });
   });
 
   it('rechecks the current turn after user identity lookup', async () => {

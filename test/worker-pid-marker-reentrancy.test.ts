@@ -70,6 +70,7 @@ describe('pid marker reentrancy + capability persistence', () => {
     // The three functions share one scope so the module-level lock-depth Set and
     // sibling calls resolve to the same real implementations.
     const withPidMarkerLock = loadWorkerFunction<(p: string, fn: () => void) => void>('withPidMarkerLock', scope);
+    scope.activeAuthorityMatchesMarker = loadWorkerFunction('activeAuthorityMatchesMarker', scope);
     const writeCliPidMarker = loadWorkerFunction<() => void>('writeCliPidMarker', scope);
     scope.withPidMarkerLock = withPidMarkerLock;
     for (const name of ['turnTerminalEmitted', 'dropQueuedTurnRecord', 'retireTerminatedMarkerTurn', 'markerQueuedTurnStillLive']) {

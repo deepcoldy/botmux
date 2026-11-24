@@ -30,6 +30,7 @@ const perAppPath = (appId: string) => join(DIR, `user-token-${appId}.json`);
 const perUserPath = (appId: string, openId: string) => join(DIR, `user-token-${appId}-${openId}.json`);
 
 const files = new Map<string, string>();
+let afterRead: ((path: string) => void) | undefined;
 
 // The real atomicWriteFileSync goes through openSync/fsyncSync/realpathSync/rename;
 // stubbing it keeps these tests about WHICH FILE gets written, not about durable-write
@@ -53,8 +54,12 @@ vi.mock('node:fs', async (importOriginal) => {
       .filter(p => p.startsWith(`${DIR}/`))
       .map(p => p.slice(DIR.length + 1))),
     readFileSync: vi.fn((p: string) => {
-      if (files.has(p)) return files.get(p)!;
-      const err: any = new Error('ENOENT'); err.code = 'ENOENT'; throw err;
+      const value = files.get(p);
+      if (value === undefined) {
+        const err: any = new Error('ENOENT'); err.code = 'ENOENT'; throw err;
+      }
+      afterRead?.(p);
+      return value;
     }),
   };
 });
@@ -86,6 +91,22 @@ describe('resolveUserToken — per-user isolation', () => {
     const { resolveUserToken } = await fresh();
     expect(await resolveUserToken(APP, 'sec', 'feishu', ALICE)).toBe('TOK_ALICE');
     expect(await resolveUserToken(APP, 'sec', 'feishu', BOB)).toBe('TOK_BOB');
+  });
+
+  it('returns access token and scopes from the same loaded credential', async () => {
+    const path = perUserPath(APP, ALICE);
+    files.set(path, tokenFor({ access_token: 'OLD', appId: APP, brand: 'feishu', openId: ALICE, scope: 'offline_access' }));
+    afterRead = p => {
+      if (p !== path) return;
+      afterRead = undefined;
+      // 第一次读取拿到 OLD 后换发文件；若实现再读一次补 scope，就会把 NEW 的元数据
+      // 错配到 OLD 上。快照必须仍返回第一次加载的完整凭证。
+      files.set(path, tokenFor({ access_token: 'NEW', appId: APP, brand: 'feishu', openId: ALICE, scope: 'offline_access im:resource' }));
+    };
+    const { resolveUserTokenWithScopes } = await fresh();
+    await expect(resolveUserTokenWithScopes(APP, 'sec', 'feishu', ALICE)).resolves.toEqual({
+      accessToken: 'OLD', scopes: ['offline_access'],
+    });
   });
 
   it('never hands back another person\'s token when the asked-for one is absent', async () => {
@@ -242,6 +263,26 @@ describe('resolveUserToken — per-user isolation', () => {
       scope: 'offline_access',
       openId: ALICE,
     });
+  });
+
+  it('returns a refreshed snapshot and keeps the reduced-scope warning', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      access_token: 'EXPIRED', refresh_token: 'OLD_RT', appId: APP, brand: 'feishu', openId: ALICE,
+      scope: 'offline_access im:resource', onDemandScopes: ['im:resource'],
+    }, -60_000));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      access_token: 'FRESH', refresh_token: 'ROTATED_RT', token_type: 'Bearer',
+      expires_in: 7200, refresh_token_expires_in: 2_592_000, scope: 'offline_access',
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    const mod = await fresh();
+    const { logger } = await import('../src/utils/logger.js');
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    await expect(mod.resolveUserTokenWithScopes(APP, 'sec', 'feishu', ALICE)).resolves.toEqual({
+      accessToken: 'FRESH', scopes: ['offline_access'],
+    });
+    expect(JSON.parse(files.get(perUserPath(APP, ALICE))!)).not.toHaveProperty('onDemandScopes');
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('im:resource'));
+    warn.mockRestore();
   });
 
   it('does not invent an owner when refreshing an unattributed file', async () => {
@@ -447,11 +488,82 @@ describe('handleCallbackUrl — attribution must be proven, never assumed', () =
     );
     expect(new URL(authUrl).searchParams.get('scope')?.split(' ')).toEqual([
       'im:message:readonly',
-      'im:resource',
       'offline_access',
       'contact:user.base:readonly',
       'docs:document.comment:read',
     ]);
+  });
+
+  it('records an explicit /login --scope im:resource and keeps requesting it afterwards', async () => {
+    const mod = await fresh();
+    const { authUrl } = mod.generateAuthUrl(APP, 'sec', 'feishu', ['im:resource'], ALICE);
+    const requested = new URL(authUrl).searchParams.get('scope')!;
+    const state = new URL(authUrl).searchParams.get('state')!;
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => String(url).includes('/oauth/token')
+      ? { ok: true, json: async () => ({ access_token: 'AT', refresh_token: 'RT', token_type: 'Bearer', expires_in: 7200, refresh_token_expires_in: 604800, scope: requested }) }
+      : { ok: true, status: 200, json: async () => ({ code: 0, data: { open_id: ALICE } }) }));
+    expect(await mod.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=abc&state=${state}`)).toContain('✅');
+    expect(JSON.parse(files.get(perUserPath(APP, ALICE))!).onDemandScopes).toEqual(['im:resource']);
+    const next = mod.generateAuthUrl(APP, 'sec', 'feishu', [], ALICE);
+    expect(new URL(next.authUrl).searchParams.get('scope')!.split(' ')).toContain('im:resource');
+  });
+
+  it('does not record im:resource when Feishu did not actually grant it', async () => {
+    const mod = await fresh();
+    const { authUrl } = mod.generateAuthUrl(APP, 'sec', 'feishu', ['im:resource'], ALICE);
+    const granted = new URL(authUrl).searchParams.get('scope')!.split(' ').filter(s => s !== 'im:resource').join(' ');
+    const state = new URL(authUrl).searchParams.get('state')!;
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => String(url).includes('/oauth/token')
+      ? { ok: true, json: async () => ({ access_token: 'AT', refresh_token: 'RT', token_type: 'Bearer', expires_in: 7200, refresh_token_expires_in: 604800, scope: granted }) }
+      : { ok: true, status: 200, json: async () => ({ code: 0, data: { open_id: ALICE } }) }));
+    await mod.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=abc&state=${state}`);
+    expect(JSON.parse(files.get(perUserPath(APP, ALICE))!)).not.toHaveProperty('onDemandScopes');
+  });
+
+  it('keeps a newer explicit marker when an old pending callback retains the scope', async () => {
+    const oldFlow = await fresh();
+    const { authUrl, state } = oldFlow.generateAuthUrl(APP, 'sec', 'feishu', ['im:resource'], ALICE);
+    const requested = new URL(authUrl).searchParams.get('scope')!;
+    // 升级前落盘的 pending 没有 onDemandScopes；重新 import 让回调只从持久文件读取它。
+    const pendingPath = join(DIR, 'oauth-pending', `${state}.json`);
+    const pending = JSON.parse(files.get(pendingPath)!);
+    delete pending.onDemandScopes;
+    files.set(pendingPath, JSON.stringify(pending));
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      appId: APP, brand: 'feishu', openId: ALICE, scope: requested, onDemandScopes: ['im:resource'],
+    }));
+    const mod = await fresh();
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => String(url).includes('/oauth/token')
+      ? { ok: true, json: async () => ({ access_token: 'NEW_AT', refresh_token: 'NEW_RT', token_type: 'Bearer', expires_in: 7200, refresh_token_expires_in: 604800, scope: requested }) }
+      : { ok: true, status: 200, json: async () => ({ code: 0, data: { open_id: ALICE } }) }));
+    expect(await mod.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=abc&state=${state}`)).toContain('✅');
+    expect(JSON.parse(files.get(perUserPath(APP, ALICE))!).onDemandScopes).toEqual(['im:resource']);
+    const later = mod.generateAuthUrl(APP, 'sec', 'feishu', ['base:field:read'], ALICE);
+    expect(new URL(later.authUrl).searchParams.get('scope')!.split(' ')).toContain('im:resource');
+  });
+
+  it('does not invent an explicit marker for a legacy-default scope retained by a callback', async () => {
+    const mod = await fresh();
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      appId: APP, brand: 'feishu', openId: ALICE,
+      scope: 'im:message:readonly im:resource offline_access',
+    }));
+    const { authUrl, state } = mod.generateAuthUrl(APP, 'sec', 'feishu', ['base:field:read'], ALICE);
+    const requested = new URL(authUrl).searchParams.get('scope')!;
+    expect(requested.split(' ')).not.toContain('im:resource');
+    const granted = `${requested} im:resource`;
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => String(url).includes('/oauth/token')
+      ? { ok: true, json: async () => ({ access_token: 'NEW_AT', refresh_token: 'NEW_RT', token_type: 'Bearer', expires_in: 7200, refresh_token_expires_in: 604800, scope: granted }) }
+      : { ok: true, status: 200, json: async () => ({ code: 0, data: { open_id: ALICE } }) }));
+    expect(await mod.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=abc&state=${state}`)).toContain('✅');
+    expect(JSON.parse(files.get(perUserPath(APP, ALICE))!)).not.toHaveProperty('onDemandScopes');
+  });
+
+  it('does not keep requesting an im:resource that only came with the old default login', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({ appId: APP, brand: 'feishu', openId: ALICE, scope: 'im:message:readonly im:resource offline_access' }));
+    const mod = await fresh();
+    const next = mod.generateAuthUrl(APP, 'sec', 'feishu', [], ALICE);
+    expect(new URL(next.authUrl).searchParams.get('scope')!.split(' ')).not.toContain('im:resource');
   });
 
   // The forwarded-link case: Bob clicked Alice's link. Bob's token is Bob's.
@@ -491,6 +603,119 @@ describe('handleCallbackUrl — attribution must be proven, never assumed', () =
     // And the person is told to retry rather than left believing they are done.
     expect(msg).toContain('无法确认');
     expect(msg).toContain('/login');
+  });
+});
+
+/**
+ * /login 授权码回调拿回的 token 缺了申请的 scope（典型：那些权限还在应用新版本的企业审核
+ * 里）。这条链路的保存判定不变，但不能只回一句「授权成功」——用户紧接着重试会再撞缺权限。
+ */
+describe('handleCallbackUrl — scopes the grant left out', () => {
+  beforeEach(() => { files.clear(); vi.unstubAllGlobals(); });
+
+  async function callbackGranting(
+    grantedScope: (requested: string[]) => string | undefined,
+    versions: unknown,
+    opts: { legacyPending?: boolean } = {},
+  ) {
+    let mod = await fresh();
+    const { authUrl } = mod.generateAuthUrl(APP, 'sec', 'feishu', ['docx:document:create', 'im:feed.flag:read'], ALICE);
+    const requested = new URL(authUrl).searchParams.get('scope')!.split(' ');
+    const state = new URL(authUrl).searchParams.get('state')!;
+    if (opts.legacyPending) {
+      // 升级前生成的 pending 文件没有 scopes 字段；换一个模块实例，只能从盘上读到它。
+      const path = [...files.keys()].find(p => p.endsWith(`${state}.json`))!;
+      const { scopes: _scopes, ...legacy } = JSON.parse(files.get(path)!);
+      files.set(path, JSON.stringify(legacy));
+      mod = await fresh();
+    }
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      calls.push(String(url));
+      if (String(url).includes('/oauth/token')) {
+        return Response.json({
+          access_token: 'AT', refresh_token: 'RT', token_type: 'Bearer',
+          expires_in: 7200, refresh_token_expires_in: 604800, scope: grantedScope(requested),
+        });
+      }
+      if (String(url).endsWith('/user_info')) return Response.json({ code: 0, data: { open_id: ALICE, name: '爱丽丝' } });
+      if (String(url).endsWith('/tenant_access_token/internal')) return Response.json({ code: 0, tenant_access_token: 'tt' });
+      if (String(url).includes(`/applications/${APP}/app_versions`)) return Response.json(versions);
+      throw new Error(`unexpected ${url}`);
+    }));
+    const detailed = await mod.handleCallbackUrlDetailed(`http://127.0.0.1:9768/callback?code=abc&state=${state}`);
+    const msg = detailed!.warning ? `${detailed!.message}\n${detailed!.warning}` : detailed!.message;
+    return { msg, detailed: detailed!, calls };
+  }
+
+  const inReview = { code: 0, data: { items: [{ version: '1.0.11', version_id: 'oav_p', status: 3 }] } };
+
+  it('still saves, but names the missing scope and the version under review', async () => {
+    const { msg } = await callbackGranting(requested => requested.filter(s => s !== 'im:feed.flag:read').join(' '), inReview);
+    expect(msg).toContain('✅');
+    expect(files.has(perUserPath(APP, ALICE))).toBe(true);
+    expect(msg).toContain('im:feed.flag:read');
+    expect(msg).not.toContain('docx:document:create');
+    expect(msg).toContain('1.0.11');
+  });
+
+  it('names the missing scope without a review claim when the version state is unreadable', async () => {
+    const { msg } = await callbackGranting(
+      requested => requested.filter(s => s !== 'im:feed.flag:read').join(' '),
+      { code: 99991672, msg: 'scope not applied' },
+    );
+    expect(msg).toContain('✅');
+    expect(msg).toContain('im:feed.flag:read');
+    // 查不到版本状态就不能声称「在审核」——审核是这里唯一被禁止猜测的原因。
+    expect(msg).not.toContain('1.0.11');
+    expect(msg).not.toContain('审核');
+  });
+
+  it('hands the note back separately so auto-callback pages can show it', async () => {
+    const { detailed } = await callbackGranting(requested => requested.filter(s => s !== 'im:feed.flag:read').join(' '), inReview);
+    expect(detailed.message).toContain('✅');
+    expect(detailed.message).not.toContain('im:feed.flag:read');
+    expect(detailed.warning).toContain('im:feed.flag:read');
+    expect(detailed.warning).toContain('1.0.11');
+  });
+
+  it('does not blame a pending version that does not carry the missing scope', async () => {
+    const unrelated = { code: 0, data: { items: [{ version: '1.0.11', status: 3, scopes: [{ scope: 'contact:user.base:readonly', token_types: ['user'] }] }] } };
+    const { msg } = await callbackGranting(requested => requested.filter(s => s !== 'im:feed.flag:read').join(' '), unrelated);
+    expect(msg).toContain('im:feed.flag:read');
+    expect(msg).not.toContain('审核');
+  });
+
+  it('treats an explicitly empty scope as granting none of the requested scopes', async () => {
+    const { msg, detailed, calls } = await callbackGranting(() => '', inReview);
+    expect(msg).toContain('✅');
+    expect(detailed.warning).toBeDefined();
+    expect(files.has(perUserPath(APP, ALICE))).toBe(true);
+    // #3724 后 DEFAULT_SCOPES 不再含 im:resource：无既有 token 时申请集就是下面四项
+    for (const scope of [
+      'im:message:readonly', 'offline_access',
+      'docx:document:create', 'im:feed.flag:read',
+    ]) expect(msg).toContain(scope);
+    expect(calls.some(url => url.includes('/app_versions'))).toBe(true);
+  });
+
+  it.each([
+    ['the token response carries no scope field', { grant: () => undefined, legacyPending: false }],
+    ['the pending file predates the scopes record', {
+      grant: (requested: string[]) => requested.filter(s => s !== 'im:feed.flag:read').join(' '), legacyPending: true,
+    }],
+  ])('says nothing extra when %s', async (_label, { grant, legacyPending }) => {
+    const { msg, calls } = await callbackGranting(grant, inReview, { legacyPending });
+    expect(msg).toContain('✅');
+    expect(msg).not.toContain('⚠️');
+    expect(calls.some(url => url.includes('/app_versions'))).toBe(false);
+  });
+
+  it('adds nothing and queries nothing when every requested scope was granted', async () => {
+    const { msg, calls } = await callbackGranting(requested => requested.join(' '), inReview);
+    expect(msg).toContain('✅');
+    expect(msg).not.toContain('⚠️');
+    expect(calls.some(url => url.includes('/app_versions'))).toBe(false);
   });
 });
 

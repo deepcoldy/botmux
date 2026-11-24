@@ -64,6 +64,8 @@ import {
 import { DAEMON_ENV_KEYS } from '../cli/daemon-lifecycle-env.js';
 import { bindRestartLeaseTo } from '../services/restart-intent-store.js';
 import { readFleetDaemonEnvFile, resolveFleetDaemonEnv, type FleetDaemonEnvFileRead } from './fleet-runtime.js';
+import { globalInstallUpdateLockTargetIn } from './global-install-lock.js';
+export { globalInstallUpdateLockTargetIn } from './global-install-lock.js';
 export {
   DETACHED_RESTART_ENV_FALLBACK,
   DETACHED_RESTART_ENV_REFRESH,
@@ -294,12 +296,6 @@ export function installLatestBotmuxSync(plan: GlobalInstallPlan = resolveGlobalI
  * so the two never write the active global install concurrently. Both sides acquire
  * `withFileLock(Sync)` on this path.
  */
-export function globalInstallUpdateLockTargetIn(dataDir: string): string {
-  // Keep the historical filename so old/new daemon-dashboard processes still
-  // serialize correctly during a rolling upgrade.
-  return join(dataDir, 'npm-global-update');
-}
-
 export function globalInstallUpdateLockTarget(): string {
   return globalInstallUpdateLockTargetIn(config.session.dataDir);
 }

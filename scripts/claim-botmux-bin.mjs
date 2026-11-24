@@ -27,6 +27,9 @@ import { homedir } from 'node:os';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, unlinkSync, realpathSync, chmodSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { delimiter } from 'node:path';
+import { withFileLockSync } from '../src/utils/file-lock.ts';
+import { resolveBotmuxDataDir } from '../src/core/data-dir.ts';
+import { globalInstallUpdateLockTargetIn } from '../src/core/global-install-lock.ts';
 
 // 原子写（与 src/utils/atomic-write.ts 同构，.mjs 不依赖 dist 故内联）：
 // 这个 wrapper 随时被并发会话 exec，裸写半截会让它们的 `botmux send` 全体失败。
@@ -189,44 +192,43 @@ if (useBinary) {
 
 const cliScript = target;
 
-// 自毁守卫。`--binary` 让 wrapper 的**内容**指向一个真实二进制，而 install.sh 把二进制
-// 装在 `~/.botmux/bin/botmux` —— 正是这个 wrapper 自己的路径。若两者是同一个文件，写入
-// 会把可执行本体替换成 47 字节的 sh 壳（8386f34dd 实测：147,392,640 → 47 字节，inode 变化
-// 证明 rename 顶掉了本体），随后 `botmux` 彻底不可用，而 fleet 里每个 worker 都把这个目录
-// 前置 PATH，所有会话的 `botmux send` 会一起坏。
-//
-// 判据用 realpath 比对而不是字符串比较：两边可能经不同的 symlink 到达同一 inode。
-if (useBinary) {
-  let sameFile = false;
-  try { sameFile = realpathSync(wrapper) === realpathSync(target); }
-  catch { /* wrapper 尚不存在 ⟹ 不可能是同一个文件 */ }
-  if (sameFile) {
-    console.error(
-      `❌ 拒绝写入：${wrapper} 就是 ${target} 本身。\n`
-      + '   写下去会把二进制覆盖成一个几十字节的 sh 壳（历史事故 8386f34dd），\n'
-      + '   全局 botmux 当场不可用，且 fleet 里所有会话的 `botmux send` 会一起坏。\n'
-      + '   这种情况下本来就不需要认领：该二进制已经在 wrapper 的位置上了。',
-    );
-    process.exit(1);
-  }
-}
-
 try {
   mkdirSync(binDir, { recursive: true });
-  let existing = '';
-  try { existing = readFileSync(wrapper, 'utf-8'); } catch { /* 尚不存在 */ }
-  if (existing === content) {
-    console.log(`✓ 全局 botmux 已指向${useBinary ? '编译版二进制' : '本 checkout'}（${cliScript}）`);
-  } else {
-    atomicWriteFileSync(wrapper, content, 0o755);
-    console.log(`✅ 全局 botmux → ${useBinary ? '编译版二进制' : '本 checkout'}（${cliScript}）`);
+  const dataDir = resolveBotmuxDataDir();
+  mkdirSync(dataDir, { recursive: true });
+  // Source-release installation holds this lock through the final candidate
+  // rename. Serialize the self-destruct check and wrapper write with it, so
+  // `use:here` cannot land between the installer's fingerprint check and swap.
+  withFileLockSync(globalInstallUpdateLockTargetIn(dataDir), () => {
+    // 自毁守卫。`--binary` 让 wrapper 的**内容**指向一个真实二进制，而 install.sh 把二进制
+    // 装在 `~/.botmux/bin/botmux` —— 正是这个 wrapper 自己的路径。若两者是同一个文件，写入
+    // 会把可执行本体替换成几十字节的 sh 壳，随后全局 botmux 与 fleet 内的 `botmux send` 全坏。
+    // 用 realpath 比较：两边可能经不同 symlink 到达同一 inode。
     if (useBinary) {
-      console.log('   下一步 `botmux restart` 让 fleet 跑编译版——之后日常使用的就是用户拿到的形态。');
-      console.log('   切回源码态：`bun run use:here`（不带 --binary）。');
-    } else {
-      console.log('   下一步 `bun run daemon:restart` 即从本 checkout 重启 daemon（避免 PATH 中的旧全局 botmux 抢先）。');
+      let sameFile = false;
+      try { sameFile = realpathSync(wrapper) === realpathSync(target); }
+      catch { /* wrapper 尚不存在 ⟹ 不可能是同一个文件 */ }
+      if (sameFile) {
+        throw new Error(
+          `拒绝写入：${wrapper} 就是 ${target} 本身；该二进制已经在 wrapper 的位置上，无需认领。`,
+        );
+      }
     }
-  }
+    let existing = '';
+    try { existing = readFileSync(wrapper, 'utf-8'); } catch { /* 尚不存在 */ }
+    if (existing === content) {
+      console.log(`✓ 全局 botmux 已指向${useBinary ? '编译版二进制' : '本 checkout'}（${cliScript}）`);
+    } else {
+      atomicWriteFileSync(wrapper, content, 0o755);
+      console.log(`✅ 全局 botmux → ${useBinary ? '编译版二进制' : '本 checkout'}（${cliScript}）`);
+      if (useBinary) {
+        console.log('   下一步 `botmux restart` 让 fleet 跑编译版——之后日常使用的就是用户拿到的形态。');
+        console.log('   切回源码态：`bun run use:here`（不带 --binary）。');
+      } else {
+        console.log('   下一步 `bun run daemon:restart` 即从本 checkout 重启 daemon（避免 PATH 中的旧全局 botmux 抢先）。');
+      }
+    }
+  });
 } catch (err) {
   console.warn(`⚠️  写 botmux wrapper 失败：${err.message}`);
   process.exit(1);
