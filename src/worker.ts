@@ -9987,6 +9987,9 @@ let antigravityQuotaHistory: readonly CliUsageLimitState[] | undefined;
 /** Last episode actually confirmed by the classifier, including replacements.
  * Unlike first-seen history order, this is the only identity a reader gap may retain. */
 let lastConfirmedAntigravityQuota: CliUsageLimitState | undefined;
+/** Effective episode key whose ready-composer recovery must survive later old
+ * viewport frames and worker restoration. A different native key breaks it. */
+let recoveredAntigravityQuotaKey: string | undefined;
 let unconfirmedAntigravityQuotas = new Map<string, CliUsageLimitState>();
 let antigravityNativeQuotaLog: AntigravityNativeQuotaLog | undefined;
 
@@ -10173,8 +10176,9 @@ function classifyUsageLimitWithNativeEvidence(
     });
     // 只用已上报且带 Error ID 的部分帧固定首次截止时间。看到原生证据后再把它计入历史。
     const limit = expiredAntigravityQuota ?? result.usageLimit;
-    if (expiredAntigravityQuota) lastConfirmedAntigravityQuota = undefined;
-    else if (limit?.source === 'antigravity-error-composer' || limit?.source === 'antigravity-native-log') {
+    if (limit?.source === 'antigravity-error-composer' || limit?.source === 'antigravity-native-log') {
+      // Keep the identity after expiry/recovery: it is also the tombstone that
+      // prevents an old viewport from acquiring a fresh deadline in a reader gap.
       lastConfirmedAntigravityQuota = limit;
     }
     const key = limit?.relativeResetKey;
@@ -10190,11 +10194,24 @@ function classifyUsageLimitWithNativeEvidence(
         }
       }
     }
+    // A recovered episode remains a tombstone when the old footerless viewport
+    // returns or the log reader has a gap. Only a different native episode may
+    // break it; expiry has its own durable proof path below.
+    const confirmedEpisodeKey = limit && cliUsageLimitEpisodeKey(limit);
+    if (!expiredAntigravityQuota && recoveredAntigravityQuotaKey
+      && confirmedEpisodeKey === recoveredAntigravityQuotaKey) {
+      usageLimitTracker.noteScreenRecovery();
+      return { status, usageLimitRecovery: 'antigravity-ready-composer' };
+    }
+    if (confirmedEpisodeKey && confirmedEpisodeKey !== recoveredAntigravityQuotaKey) {
+      recoveredAntigravityQuotaKey = undefined;
+    }
     // shortcuts 页脚只证明旧版 footerless 错误已经恢复；带原生日志证据的
     // 当前错误可以合法地保留同一页脚，不能用页脚本身区分这两种形态。
     if (!expiredAntigravityQuota && !nativeLogQuotaObserved
       && nativeViewportCaptured && isAntigravityReadyComposerScreen(evidence)) {
-      lastConfirmedAntigravityQuota = undefined;
+      recoveredAntigravityQuotaKey = lastConfirmedAntigravityQuota
+        ? cliUsageLimitEpisodeKey(lastConfirmedAntigravityQuota) : recoveredAntigravityQuotaKey;
       usageLimitTracker.noteScreenRecovery();
       return { status, usageLimitRecovery: 'antigravity-ready-composer' };
     }
@@ -41733,8 +41750,15 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       antigravityQuotaHistory = msg.antigravityQuotaHistory;
       unconfirmedAntigravityQuotas = new Map();
       const restoredQuota = msg.antigravityActiveQuota;
-      lastConfirmedAntigravityQuota = restoredQuota?.source === 'antigravity-error-composer'
-        || restoredQuota?.source === 'antigravity-native-log' ? restoredQuota : undefined;
+      const restoredConfirmed = restoredQuota?.source === 'antigravity-error-composer'
+        || restoredQuota?.source === 'antigravity-native-log'
+        ? restoredQuota : antigravityQuotaHistory?.at(-1);
+      lastConfirmedAntigravityQuota = restoredConfirmed;
+      // No active native quota means the persisted episode was already cleared.
+      // Its history remains a recovery tombstone, not a fresh refusal.
+      recoveredAntigravityQuotaKey = restoredQuota?.source === 'antigravity-error-composer'
+        || restoredQuota?.source === 'antigravity-native-log' || !restoredConfirmed
+        ? undefined : cliUsageLimitEpisodeKey(restoredConfirmed);
       const restoredKey = restoredQuota?.relativeResetKey;
       if (restoredQuota?.kind === 'usage' && !restoredQuota.source && restoredKey && !restoredKey.endsWith(':')) {
         unconfirmedAntigravityQuotas.set(restoredKey, restoredQuota);

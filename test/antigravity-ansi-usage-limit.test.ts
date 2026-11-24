@@ -21,6 +21,7 @@ function classifier(raw: () => string, cliId = 'antigravity', authoritative = tr
     withAntigravityDirectFailureProof: (limit: CliUsageLimitState) => limit, detectCliUsageLimit, cliUsageLimitEpisodeKey,
     usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
     lastConfirmedAntigravityQuota: undefined,
+    recoveredAntigravityQuotaKey: undefined,
     unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
   });
   return { classify, capture, usageLimitTracker };
@@ -227,6 +228,51 @@ describe('raw ANSI tmux quota classification', () => {
     nativeKey = 'native-B';
     expect(classify('', 'idle').usageLimit).toMatchObject({
       source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-B',
+    });
+  });
+
+  it('keeps an expired linked episode inactive across reader gaps until a new native key arrives', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const refusal = '⚠ Individual quota reached. Resets in 1m.\nError ID: shared-error\n────\n>\n────\n';
+    let nativeKey: string | undefined = 'native-A';
+    const { classify } = classifier(() => refusal, 'antigravity', true, false, undefined,
+      () => nativeKey ? { key: nativeKey, text: refusal } : undefined);
+    const first = classify('', 'idle').usageLimit;
+    expect(first).toMatchObject({ source: 'antigravity-error-composer', nativeLogEpisodeKey: 'log:native-A' });
+
+    vi.advanceTimersByTime(61_000);
+    nativeKey = undefined;
+    expect(classify('', 'idle')).toMatchObject({
+      status: 'idle', expiredAntigravityQuota: { nativeLogEpisodeKey: 'log:native-A', retryAtMs: first.retryAtMs },
+    });
+    expect(classify('', 'idle')).toMatchObject({
+      status: 'idle', expiredAntigravityQuota: { nativeLogEpisodeKey: 'log:native-A', retryAtMs: first.retryAtMs },
+    });
+
+    nativeKey = 'native-B';
+    expect(classify('', 'idle')).toMatchObject({
+      status: 'limited', usageLimit: { source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-B' },
+    });
+  });
+
+  it('keeps ready recovery as a tombstone across footerless gaps until a new native key arrives', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const refusal = '⚠ Individual quota reached. Resets in 1m.\nError ID: shared-error\n────\n>\n────\n';
+    let screen = refusal;
+    let nativeKey: string | undefined = 'native-A';
+    const { classify } = classifier(() => screen, 'antigravity', true, false, undefined,
+      () => nativeKey ? { key: nativeKey, text: refusal } : undefined);
+    expect(classify('', 'idle').usageLimit).toMatchObject({ nativeLogEpisodeKey: 'log:native-A' });
+
+    nativeKey = undefined;
+    screen = refusal + '? for shortcuts';
+    expect(classify('', 'idle')).toEqual({ status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+    screen = refusal;
+    expect(classify('', 'idle')).toEqual({ status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+
+    nativeKey = 'native-B';
+    expect(classify('', 'idle')).toMatchObject({
+      status: 'limited', usageLimit: { source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-B' },
     });
   });
 
