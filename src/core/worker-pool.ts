@@ -8873,6 +8873,8 @@ export function killWorker(
     destroyOrphanedBackingSession(ds, {
       ...(opts.mojoCancelAlreadyProven ? { skipRemoteCancel: true } : {}),
     });
+    // Orphan destroy is best-effort and cannot prove the backing CLI is gone.
+    // Leave background state untouched here rather than interrupting live work.
     if (opts.remoteCloseCommitRequestId
         && ds.remoteCloseState?.requestId === opts.remoteCloseCommitRequestId) {
       ds.remoteCloseState = undefined;
@@ -8911,6 +8913,9 @@ export function killWorker(
   ds.workerToken = null;
   ds.workerViewToken = null;
   ds.workerCardViewToken = null;
+  // Late claude_exit/exit events are intentionally stale after the worker slot
+  // is cleared. Retire their background projection now, while success is known.
+  settleRetiredWorkerBackgroundState(ds);
 }
 
 /**
@@ -12867,6 +12872,30 @@ function releaseHeldCotMessage(ds: DaemonSession): void {
   if (!held) return;
   ds.cotHeldForBackground = undefined;
   finalizeCotMessage(ds, held.turnId, 'completed', held.dispatchAttempt);
+}
+
+/** Background tasks and their held CoT belong to the concrete CLI lifetime.
+ *  Returns whether a dashboard count needs clearing. */
+function settleBackgroundStateOnCliLoss(ds: DaemonSession): boolean {
+  const hadBackgroundTaskCount = ds.backgroundTaskCount !== undefined;
+  ds.backgroundTaskCount = undefined;
+  const held = ds.cotHeldForBackground;
+  if (held) {
+    ds.cotHeldForBackground = undefined;
+    finalizeCotMessage(ds, held.turnId, 'failed', held.dispatchAttempt);
+  }
+  return hadBackgroundTaskCount;
+}
+
+function publishBackgroundTaskCountCleared(ds: DaemonSession): void {
+  dashboardEventBus.publish({ type: 'session.update', body: {
+    sessionId: ds.session.sessionId,
+    patch: { backgroundTaskCount: null },
+  } });
+}
+
+function settleRetiredWorkerBackgroundState(ds: DaemonSession): void {
+  if (settleBackgroundStateOnCliLoss(ds)) publishBackgroundTaskCountCleared(ds);
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean, expectedOperationId?: string): boolean {
@@ -25458,15 +25487,7 @@ function setupWorkerHandlers(
           // A clean exit after an already idle/completed turn is not a failed
           // task. It still must not inherit a stale working projection.
           const exitStatus = msg.code === 0 && idleAtExit ? 'idle' : 'interrupted';
-          const backgroundTaskCountAtExit = ds.backgroundTaskCount;
-          ds.backgroundTaskCount = undefined;
-          const heldCot = ds.cotHeldForBackground;
-          if (heldCot) {
-            // Background work dies with this CLI. Settle the held turn here with
-            // the physical loss, before any restart can publish a zero frame.
-            ds.cotHeldForBackground = undefined;
-            finalizeCotMessage(ds, heldCot.turnId, 'failed', heldCot.dispatchAttempt);
-          }
+          const hadBackgroundTaskCount = settleBackgroundStateOnCliLoss(ds);
           ds.lastScreenStatus = exitStatus;
           bumpStreamCardStatusRevision(ds);
           clearUsageRefreshTimer(ds);
@@ -25476,7 +25497,7 @@ function setupWorkerHandlers(
               status: exitStatus,
               // Background work dies with this CLI. Clear it with the physical
               // loss publication; a stopped sampler cannot provide a zero frame.
-              ...(backgroundTaskCountAtExit !== undefined ? { backgroundTaskCount: null } : {}),
+              ...(hadBackgroundTaskCount ? { backgroundTaskCount: null } : {}),
             },
           } });
         }

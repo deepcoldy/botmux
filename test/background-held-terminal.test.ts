@@ -112,7 +112,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
   LoggerLevel: { info: 2 },
 }));
 
-import { __testOnly_setSuspendBackingVerifier, __testOnly_setupWorkerHandlers, initWorkerPool, suspendWorker } from '../src/core/worker-pool.js';
+import { __testOnly_setSuspendBackingVerifier, __testOnly_setupWorkerHandlers, initWorkerPool, killWorker, suspendWorker } from '../src/core/worker-pool.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -299,6 +299,45 @@ describe('CoT message of a turn that ended with background tasks running', () =>
     terminal(worker, { backgroundTasks: 1 });
     expect(ds.cotHeldForBackground).toBeUndefined();
     expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears and interrupts background state on shared worker retirement', () => {
+    const { ds } = setup({ cliId: 'claude-code' });
+    ds.backgroundTaskCount = 1;
+    ds.cotHeldForBackground = { turnId: 'om_turn', dispatchAttempt: 1 };
+    killWorker(ds);
+    expect(ds.worker).toBeNull();
+    expect(ds.backgroundTaskCount).toBeUndefined();
+    expect(ds.cotHeldForBackground).toBeUndefined();
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'failed', 1);
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith({
+      type: 'session.update',
+      body: { sessionId: ds.session.sessionId, patch: { backgroundTaskCount: null } },
+    });
+  });
+
+  it('keeps background state when remote worker retirement is refused', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code', backendType: 'remote-runner' });
+    ds.backgroundTaskCount = 1;
+    ds.cotHeldForBackground = { turnId: 'om_turn', dispatchAttempt: 1 };
+    killWorker(ds);
+    expect(ds.worker).toBe(worker);
+    expect(ds.backgroundTaskCount).toBe(1);
+    expect(ds.cotHeldForBackground).toEqual({ turnId: 'om_turn', dispatchAttempt: 1 });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    expect(dashboardEventBus.publish).not.toHaveBeenCalled();
+  });
+
+  it('does not infer CLI loss from worker-less best-effort orphan cleanup', () => {
+    const { ds } = setup({ cliId: 'claude-code', adopted: true });
+    ds.worker = null;
+    ds.backgroundTaskCount = 1;
+    ds.cotHeldForBackground = { turnId: 'om_turn', dispatchAttempt: 1 };
+    killWorker(ds);
+    expect(ds.backgroundTaskCount).toBe(1);
+    expect(ds.cotHeldForBackground).toEqual({ turnId: 'om_turn', dispatchAttempt: 1 });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    expect(dashboardEventBus.publish).not.toHaveBeenCalled();
   });
 
   it('closes the held CoT message when a later terminal arrives', () => {
