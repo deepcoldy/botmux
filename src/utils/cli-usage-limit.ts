@@ -330,7 +330,7 @@ export function cliUsageLimitEpisodeKey(state: CliUsageLimitState): string | und
 export function usageLimitEvidenceKey(state: CliUsageLimitState): string {
   return JSON.stringify([
     state.kind,
-    ...(cliUsageLimitEpisodeKey(state) ? [] : [state.retryAtMs]),
+    ...(cliUsageLimitEpisodeKey(state) || isTransientRateLimit(state) ? [] : [state.retryAtMs]),
     state.retryLabel, state.retryReady, state.nativeEpisodeKey, state.nativeLogEpisodeKey, state.relativeResetKey,
     state.source, state.directFailure === true,
   ]);
@@ -350,6 +350,19 @@ export function reconcileUsageLimitState(
   incoming: CliUsageLimitState,
   nowMs = Date.now(),
 ): CliUsageLimitState {
+  // A synthetic hard-429 cooldown is not a new episode at a bucket boundary.
+  // Preserve its first deadline even if pixels change and emit another frame.
+  if (previous && isTransientRateLimit(previous) && isTransientRateLimit(incoming)
+    && previous.kind === incoming.kind && Number.isFinite(previous.retryAtMs)) {
+    return {
+      ...incoming,
+      retryAtMs: previous.retryAtMs,
+      retryReady: previous.retryReady || nowMs >= previous.retryAtMs,
+      ...(previous.source ? { source: previous.source } : {}),
+      ...(previous.nativeEpisodeKey ? { nativeEpisodeKey: previous.nativeEpisodeKey } : {}),
+      ...(previous.nativeLogEpisodeKey ? { nativeLogEpisodeKey: previous.nativeLogEpisodeKey } : {}),
+    };
+  }
   const sameEpisode = previous && (
     cliUsageLimitEpisodeKey(previous) === cliUsageLimitEpisodeKey(incoming)
     // An unconfirmed frame gains its native Error ID only later. A confirmed
@@ -365,6 +378,7 @@ export function reconcileUsageLimitState(
     retryReady: previous.retryReady || nowMs >= previous.retryAtMs,
     ...(previous.source ? { source: previous.source } : {}),
     ...(previous.nativeEpisodeKey ? { nativeEpisodeKey: previous.nativeEpisodeKey } : {}),
+    ...(previous.nativeLogEpisodeKey ? { nativeLogEpisodeKey: previous.nativeLogEpisodeKey } : {}),
   };
 }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
-import { usageLimitEvidenceKey, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
+import { usageLimitEvidenceKey, reconcileUsageLimitState, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { snapshotWithLatestRuntimeStatus } from '../src/utils/runtime-screen-status.js';
 import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -49,6 +49,61 @@ describe('worker usage-limit frame identity', () => {
       if (scope.screenUpdateTimer) clearInterval(scope.screenUpdateTimer);
       vi.useRealTimers();
     }
+  });
+
+  it('keeps a synthetic hard-429 cooldown across bucket recomputation', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const usageLimitTracker = createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false });
+    const messages: Array<Record<string, any>> = [];
+    class RateRenderer {
+      snapshot() { return { content: 'status: 429\n', changed: false }; }
+      rawSnapshot() { return 'status: 429\n'; }
+      dispose() {}
+    }
+    const scope: Record<string, any> = {
+      TerminalRenderer: RateRenderer, PromptSuggestionPublisher: FakePromptSuggestions,
+      renderCols: 80, renderRows: 24, screenUpdateTimer: undefined, SCREEN_UPDATE_INTERVAL_MS: 20,
+      backend: {}, cliSpawnGeneration: 1, awaitingFirstPrompt: false, observedPaneGridRevision: 0,
+      lastPtyActivityAtMs: 0, shouldCaptureScreen: () => true, isScreenSelfDriven: () => false,
+      snapshotToText: async () => null, snapshotWithLatestRuntimeStatus, projectedRuntimeScreenStatus: () => 'idle',
+      classifyUsageLimitWithNativeEvidence: (content: string, status: string) => usageLimitTracker.classify(content, status),
+      usageLimitEvidenceKey,
+      cliAdapter: { id: 'grok' }, lastInitConfig: { cliId: 'grok' }, lastAnalyzerSnapshot: '',
+      traexQuestionBridgeActive: () => false, traexQuestionFlowVisible: () => false,
+      observeTraexAutoModelCapacity: () => {}, publishNativeReasoningFooter: () => {},
+      promptSuggestionReportTurn: () => undefined, settleBackgroundTasksFromSiblings: () => {},
+      refreshBackgroundWait: () => {}, backgroundWaitTasks: 0, startupInputHeld: () => false,
+      backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
+      currentBotmuxTurnId: 'turn-1', currentBotmuxDispatchAttempt: 1,
+      send: (message: Record<string, unknown>) => messages.push(message), log: () => {},
+    };
+    try {
+      const startScreenUpdates = loadWorkerFunction<() => void>('startScreenUpdates', scope);
+      startScreenUpdates();
+      await vi.advanceTimersByTimeAsync(115);
+      expect(messages).toHaveLength(1);
+      let current = messages[0].usageLimit as CliUsageLimitState;
+      const firstDeadline = current.retryAtMs;
+      for (const elapsed of [300_000, 300_000, 300_000]) {
+        await vi.advanceTimersByTimeAsync(elapsed);
+        current = reconcileUsageLimitState(current, messages.at(-1)!.usageLimit, Date.now());
+      }
+      expect(messages).toHaveLength(1);
+      expect(current.retryAtMs).toBe(firstDeadline);
+      expect(current.retryReady).toBe(true);
+    } finally {
+      if (scope.screenUpdateTimer) clearInterval(scope.screenUpdateTimer);
+      vi.useRealTimers();
+    }
+  });
+
+  it('reconciles a synthetic hard-429 to its first deadline even with a newer input', () => {
+    const previous: CliUsageLimitState = {
+      limited: true, kind: 'rate', retryAtMs: 600_000, retryLabel: '5-10 min', retryReady: false,
+    };
+    const result = reconcileUsageLimitState(previous, { ...previous, retryAtMs: 900_000 }, 600_000);
+    expect(result).toMatchObject({ retryAtMs: 600_000, retryReady: true });
   });
 
   it('drops dynamic deadlines only when a stable episode owns the identity', () => {

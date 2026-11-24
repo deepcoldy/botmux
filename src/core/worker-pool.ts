@@ -5159,6 +5159,19 @@ function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
     && !!limit.relativeResetKey && limit.retryAtMs <= Date.now();
 }
 
+function antigravityNativeEpisodeKeys(limit?: CliUsageLimitState): string[] {
+  return limit
+    ? [...new Set([limit.nativeEpisodeKey, limit.nativeLogEpisodeKey].filter((key): key is string => !!key))]
+    : [];
+}
+
+function hasConsumedAntigravityQuotaKey(
+  limit: CliUsageLimitState | undefined,
+  consumed: readonly string[] | undefined,
+): boolean {
+  return antigravityNativeEpisodeKeys(limit).some(key => consumed?.includes(key));
+}
+
 /** Drop a consumed native episode at the ingress boundary, before usageLimit,
  * lastFailedTurn, Dashboard or the recovery card can observe it. If the same
  * episode is still sticky in memory, clear it first and let the ordinary idle
@@ -5172,10 +5185,10 @@ function filterConsumedAntigravityQuotaFrame(frame: {
   directSubmit?: boolean;
 }, ds: DaemonSession, owns: () => boolean, afterRecovered: () => void): boolean {
   const limit = frame.usageLimit;
-  const key = limit?.nativeEpisodeKey;
-  if (!key || (limit?.source !== 'antigravity-error-composer' && limit?.source !== 'antigravity-native-log')
-    || !ds.session.consumedAntigravityQuotaKeys?.includes(key)) return true;
-  if (ds.usageLimit?.nativeEpisodeKey === key) {
+  const consumed = ds.session.consumedAntigravityQuotaKeys;
+  if ((limit?.source !== 'antigravity-error-composer' && limit?.source !== 'antigravity-native-log')
+    || !hasConsumedAntigravityQuotaKey(limit, consumed)) return true;
+  if (hasConsumedAntigravityQuotaKey(ds.usageLimit, consumed)) {
     try {
       clearUsageLimitState(ds);
     } catch (error) {
@@ -21935,11 +21948,11 @@ function setupWorkerHandlers(
           ds.session.antigravityAccountId = accountId;
           dirty = true;
         }
-        const consumedKey = limit.nativeEpisodeKey;
-        if (consumedKey && !ds.session.consumedAntigravityQuotaKeys?.includes(consumedKey)) {
-          ds.session.consumedAntigravityQuotaKeys = [
-            ...(ds.session.consumedAntigravityQuotaKeys ?? []), consumedKey,
-          ].slice(-ANTIGRAVITY_QUOTA_HISTORY_LIMIT);
+        const consumedKeys = antigravityNativeEpisodeKeys(limit);
+        if (consumedKeys.some(key => !ds.session.consumedAntigravityQuotaKeys?.includes(key))) {
+          ds.session.consumedAntigravityQuotaKeys = [...new Set([
+            ...(ds.session.consumedAntigravityQuotaKeys ?? []), ...consumedKeys,
+          ])].slice(-ANTIGRAVITY_QUOTA_HISTORY_LIMIT);
           dirty = true;
         }
         if (dirty) sessionStore.updateSession(ds.session);

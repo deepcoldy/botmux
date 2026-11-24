@@ -336,6 +336,51 @@ describe('Antigravity worker-pool replay safety', () => {
     expect(dashboardStatuses).not.toContain('limited');
   });
 
+  it('filters a consumed log episode when it returns in composer form', async () => {
+    const h = await setupRotationScenario({ directFailure: true, accountCount: 3 });
+    h.ds.usageLimit = undefined;
+    h.ds.lastScreenStatus = 'idle';
+    h.ds.session.consumedAntigravityQuotaKeys = ['log:native-episode-a'];
+    h.sessionStore.updateSession(h.ds.session);
+    const usageLimit = {
+      ...nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-a', h.nowMs),
+      source: 'antigravity-error-composer' as const,
+      nativeEpisodeKey: 'composer:shared-error', nativeLogEpisodeKey: 'log:native-episode-a',
+    };
+    h.worker.emit('message', { type: 'screen_update', content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1', usageLimit });
+    await h.flush();
+    expect(h.sent.filter(msg => msg.type === 'restart')).toHaveLength(0);
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(0);
+  });
+
+  it('consumes both linked keys and filters the later log representation', async () => {
+    const h = await setupRotationScenario({ directFailure: true, accountCount: 3 });
+    const linked = {
+      ...nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-a', h.nowMs),
+      source: 'antigravity-error-composer' as const,
+      nativeEpisodeKey: 'composer:shared-error', nativeLogEpisodeKey: 'log:native-episode-a', directFailure: true as const,
+    };
+    h.worker.emit('message', { type: 'screen_update', content: 'working\nesc to cancel', status: 'working', turnId: 'turn-1' });
+    await h.flush();
+    h.worker.emit('message', { type: 'screen_update', content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1', usageLimit: linked });
+    await h.flush();
+    const restart = h.sent.find(msg => msg.type === 'restart');
+    expect(restart?.attemptId).toBeDefined();
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    expect(h.ds.session.consumedAntigravityQuotaKeys).toEqual(expect.arrayContaining([
+      'composer:shared-error', 'log:native-episode-a',
+    ]));
+
+    h.ds.lastScreenStatus = 'idle';
+    h.worker.emit('message', { type: 'screen_update', content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1',
+      usageLimit: { ...linked, source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-episode-a', nativeLogEpisodeKey: undefined } });
+    await h.flush();
+    expect(h.sent.filter(msg => msg.type === 'restart')).toHaveLength(1);
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(1);
+  });
+
   it('publishes screenshot recovery after clearing a sticky consumed episode', async () => {
     const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
     const usageLimit = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-1', h.nowMs);
