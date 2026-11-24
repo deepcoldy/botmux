@@ -27423,7 +27423,15 @@ function setupWorkerHandlers(
             })();
           }
         }
-        if (replyCardRoute === 'transcript_rows' && replyCardRowsWanted) {
+        // A receipt-route turn whose completion footer and strip are suppressed
+        // because background tasks still run still owes its opt-in next-step
+        // row and recap panel to its final reply card. This branch only places
+        // those rows: it writes no footer and posts no receipt strip, so the
+        // backgroundTasks gating above stays intact.
+        const placeReplyCardRows = replyCardRowsWanted
+          && (replyCardRoute === 'transcript_rows'
+            || (replyCardRoute === 'receipt' && !!msg.backgroundTasks));
+        if (placeReplyCardRows) {
           // The daemon sends a transcript-delivered final itself; the worker
           // queues final_output before turn_terminal, so that send is in flight
           // (or done) here. Its card has settled once it has landed.
