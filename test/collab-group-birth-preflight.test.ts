@@ -229,9 +229,9 @@ describe('preflightCollabGroupBirth', () => {
     expect(next.kind).toBe('ready');
   });
 
-  it('生产默认：gate 准入未接入 → 合法 enabled 配置 fail-closed（不把 ready 切开放行，R1）', async () => {
+  it('生产默认：gate 已接入后切回真实 peer preflight（creator-only 无 peer → ready）', async () => {
     __testOnly_setBotConfig(APP, collabEnabledConfig());
-    // 不注入 peerPreflight：生产 defaultDeps 保持 fail-closed（gate 未接入前不开放 ready）。
+    // 不注入 peerPreflight：生产 defaultDeps 走 realCollabPeerPreflight。creator-only 配置无 peer → ready。
     const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), {
       dataDir: tempDir,
       now,
@@ -239,8 +239,7 @@ describe('preflightCollabGroupBirth', () => {
       resolveTeamRole: () => null,
       resolveAgent: (appId) => (appId === APP ? { exists: true, apiOnly: false } : undefined),
     });
-    expect(r.kind).toBe('failed');
-    if (r.kind === 'failed') expect(r.reason).toContain('gate 准入未接入');
+    expect(r.kind).toBe('ready');
   });
 
   it('R4：creator 被 afterAgentTurn 依赖且 backendType=herdr（不声明能力）→ 未就绪', async () => {

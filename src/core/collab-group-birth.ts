@@ -104,10 +104,10 @@ function defaultDeps(dataDir: string, creatorAppId: string): CollabPreflightDeps
       const found = loadBotConfigsCached().find(c => c.larkAppId === appId);
       return found ? { exists: true, apiOnly: found.apiOnly === true } : undefined;
     },
-    // R1：per-participant gate 尚未接入消息准入（§8.1/§8.3），生产不能把 ready 切开放行
-    // ——否则 initializing 群消息仍扣费并启动 CLI（违反 §3 铁律2）。生产 defaultDeps 保持
-    // fail-closed；测试经 __testOnly_setCollabPeerPreflight 注入 {ok:true} 验证 ready 分支。
-    peerPreflight: __testOnlyPeerPreflight ?? (async () => ({ ok: false, errors: ['协作初始化 gate 准入未接入，生产 fail-closed'] })),
+    // PR-3b-2 B：gate 已接入 + 全链路测试绿后，生产 defaultDeps 切回真实 peer preflight。
+    // 测试经 __testOnly_setCollabPeerPreflight 注入 {ok:true} 验证 ready 分支；生产走
+    // realCollabPeerPreflight（逐 peer findOnlineDaemon + collab.preflight）。
+    peerPreflight: __testOnlyPeerPreflight ?? (async (ctx: CollabPeerPreflightContext) => realCollabPeerPreflight(ctx)),
   };
 }
 

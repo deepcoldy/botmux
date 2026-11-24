@@ -783,7 +783,7 @@ import {
   parseCollabPreflightRequest,
 } from './core/collab-preflight-ipc.js';
 import { parseCollabKickoffRequest, validateCollabKickoffPrepare, type CollabKickoffMutation } from './core/collab-kickoff-ipc.js';
-import { prepareCollabKickoff, cancelCollabKickoff, readCollabKickoffOperation } from './core/collab-kickoff-store.js';
+import { prepareCollabKickoff, startCollabKickoff, cancelCollabKickoff, readCollabKickoffOperation } from './core/collab-kickoff-store.js';
 import { collabPayloadHash } from './services/collab-group-config.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isHumanInboundTurnId, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
@@ -9336,6 +9336,14 @@ async function collabPreflightRoute(req: IncomingMessage, res: ServerResponse, p
 ipcRoute('POST', `${COLLAB_IPC_ROUTE_PREFIX}/:initId/preflight`, collabPreflightRoute);
 
 // ─── collab.kickoff（PR-3a）────────────────────────────────────────────────
+// 会话激活 seam（PR-3b-2 B）：target 收 kickoff.start 后真实 fork/activate。生产由
+// forkWorker 走 queued session + startGroupTask 语义；测试注入假 fork 返回固定三元组，
+// 不真起 CLI。默认（未注入）= 未就绪（fail-closed，PR-3b 收口前不假报 started）。
+let collabKickoffActivator: ((kickoffId: string) => Promise<{ ok: boolean; sessionId?: string; turnId?: string; acceptedAt?: string }>) | undefined;
+export function __testOnly_setCollabKickoffActivator(fn: typeof collabKickoffActivator): void {
+  collabKickoffActivator = fn;
+}
+
 async function collabKickoffRoute(req: IncomingMessage, res: ServerResponse, params: Record<string, string>, action?: CollabKickoffMutation): Promise<void> {
   if (!selfV3LarkAppId || !selfV3BootInstanceId) {
     return jsonRes(res, 404, { ok: false, error: 'not_found' });
@@ -9417,8 +9425,29 @@ async function collabKickoffRoute(req: IncomingMessage, res: ServerResponse, par
       if (startBody.configVersion !== read.operation.configVersion || startBody.payloadHash !== read.operation.payloadHash) {
         return reply(409, { ok: false, errorCode: 'OPERATION_CONFLICT', message: 'start configVersion/payloadHash mismatch' });
       }
-      // 真实会话激活未实现（PR-3b），保持 prepared，返回 NOT_IMPLEMENTED。
-      return reply(501, { ok: false, errorCode: 'NOT_IMPLEMENTED', message: 'target session activation not implemented (PR-3b)' });
+      // 取消后迟到 activate 不得启动：operation 已 cancelled/failed 时拒绝。
+      if (read.operation.state === 'cancelled' || read.operation.state === 'failed') {
+        return reply(409, { ok: false, errorCode: 'INVALID_STATE', message: `cannot start from ${read.operation.state}` });
+      }
+      // 真实会话激活（fork/activate seam）。重复 start 幂等由 startCollabKickoff 的 done 短路
+      // 兜底（已 started 直接返回原 operation，不二 fork）。
+      const activator = collabKickoffActivator ?? (async () => ({ ok: false }));
+      const activated = await activator(params.kickoffId);
+      if (!activated.ok || !activated.sessionId || !activated.turnId || !activated.acceptedAt) {
+        return reply(503, { ok: false, errorCode: 'NOT_READY', message: 'target session activation not ready (missing session/turn/acceptedAt)' });
+      }
+      const result = startCollabKickoff({
+        dataDir,
+        targetLarkAppId: selfV3LarkAppId,
+        kickoffId: params.kickoffId,
+        sessionId: activated.sessionId,
+        turnId: activated.turnId,
+        acceptedAt: activated.acceptedAt,
+        now: new Date().toISOString(),
+      });
+      return result.ok
+        ? reply(200, { ok: true, operation: result.operation })
+        : reply(result.errorCode === 'OPERATION_NOT_FOUND' ? 404 : 409, { ok: false, errorCode: result.errorCode, message: result.message });
     }
     // cancel：绑定原 initId。
     const read = readCollabKickoffOperation(dataDir, selfV3LarkAppId, params.kickoffId, true);
