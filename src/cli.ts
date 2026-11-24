@@ -9430,9 +9430,21 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     return;
   }
   if (!sub || sub === 'list' || sub === 'ls') {
-    const tasks = cliScopeAppId
-      ? scheduleStore.listTasks()
-      : scheduleStore.listTasksForBots(allBotAppIds());
+    let tasks: ReturnType<typeof scheduleStore.listTasksStrict>;
+    try {
+      tasks = cliScopeAppId
+        ? scheduleStore.listTasksStrict()
+        : scheduleStore.listTasksForBots(allBotAppIds());
+    } catch (error) {
+      // Never print "no tasks" for a store this process cannot read: inside a
+      // personal-assistant sandbox the bot-level store is withheld on purpose
+      // (it holds every owner's tasks), and an empty listing would send the
+      // agent looking for tasks that do exist.
+      const code = (error as NodeJS.ErrnoException)?.code;
+      console.error(`botmux schedule: 读不到定时任务列表（${code ?? (error as Error)?.message ?? 'unknown'}）。`
+        + '个人助理模式的沙盒里看不到任务列表；管理任务请用创建时返回的任务 id。');
+      process.exit(1);
+    }
     if (tasks.length === 0) {
       console.log('暂无定时任务。\n\n用法:\n  botmux schedule add "每日17:50" "帮我看AI新闻"\n  botmux schedule add "every 2h" "检查构建"\n  botmux schedule add "0 9 * * *" "每天早安"');
       return;

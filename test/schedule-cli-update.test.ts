@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -609,6 +609,27 @@ describe('schedule CLI in an assistant-mode sandbox', () => {
     expect(request.sessionId).toBe(sid);
     expect(request.task).toMatchObject({ chatId: 'oc_chat', rootMessageId: 'om_root', executionPosition: 'topic' });
     expect(f.read()['11223344']).toMatchObject({ chatId: 'oc_chat', rootMessageId: 'om_root' });
+  });
+
+  it('reports an unreadable task store instead of listing no tasks', async () => {
+    const f = fixture(); const observed: Array<Record<string, unknown>> = [];
+    await assistantSession(f, observed);
+    writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...f.task, enabled: true } }));
+    chmodSync(f.path, 0o000);
+    try {
+      const unreadable = await f.run(['list']);
+      expect(unreadable.code).toBe(1);
+      expect(unreadable.output).toContain('读不到定时任务列表');
+      expect(unreadable.output).not.toContain('暂无定时任务');
+    } finally { chmodSync(f.path, 0o600); }
+    writeFileSync(f.path, '{not json');
+    const corrupt = await f.run(['list']);
+    expect(corrupt.code).toBe(1);
+    expect(corrupt.output).not.toContain('暂无定时任务');
+    rmSync(f.path);
+    const missing = await f.run(['list']);
+    expect(missing.code, missing.output).toBe(0);
+    expect(missing.output).toContain('暂无定时任务');
   });
 
   it('manages an existing task through the same proof-located session', async () => {
