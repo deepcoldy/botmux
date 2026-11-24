@@ -6049,10 +6049,11 @@ export async function enforceMessageQuotaForCliInput(
      *  consumed used。仅在本次扣费真正成功（含无限额 tracked=false 放行）时调用一次。
      *  提供的是**本次判定的事实快照**，不是事后重新 evaluateTalk。 */
     onChargeCommitted?: (charge: { reason: string; quotaKey?: string; used: number; chargedAt: number }) => void;
-    /** 协作 creator 准入：扣费与回执同事务原子落盘（PR-2a F1/F2）。传入 receiptId 时，
+    /** 协作 creator 准入：扣费与回执同事务原子落盘（PR-2a F1/F2/G1）。传入 receiptId 时，
      *  本闸改用 consumeCollabAdmissionOnce（原子扣费+回执）替代普通 consumeQuota，免额度
-     *  授权也会写 used=0 回执；成功时经 onChargeCommitted 产出当次 facts。 */
-    collabCharge?: { receiptId: string; sourceOpenId: string; grantChatId?: string };
+     *  授权也会写 used=0 回执；成功时经 onChargeCommitted 产出当次 facts。来源 scope 由
+     *  当次 ev.quotaKey 决定（chat/global），调用方不传 grantChatId。 */
+    collabCharge?: { receiptId: string; sourceOpenId: string };
   },
 ): Promise<boolean> {
   if (opts?.crossChatFollowedThreadAuthorized) {
@@ -6258,7 +6259,6 @@ export async function enforceMessageQuotaForCliInput(
         receiptId: opts.collabCharge.receiptId,
         quotaKey: ev.quotaKey,
         sourceOpenId: opts.collabCharge.sourceOpenId,
-        grantChatId: opts.collabCharge.grantChatId,
         reason: ev.reason,
       });
       if (!r.allow) {
@@ -6266,7 +6266,8 @@ export async function enforceMessageQuotaForCliInput(
         return false;
       }
       commitCharge(larkAppId, messageId);
-      opts.onChargeCommitted?.({ reason: ev.reason, quotaKey: r.quotaKey, used: r.used, chargedAt: Date.parse(r.chargedAt) || Date.now() });
+      // G2：facts 从持久回执回放（r 已是完整持久结果），不用当前 ev.reason / 当前时间。
+      opts.onChargeCommitted?.({ reason: r.reason ?? ev.reason, quotaKey: r.quotaKey, used: r.used, chargedAt: Date.parse(r.chargedAt) || Date.now() });
       return true;
     } catch (err) {
       logger.warn(`[quota:${larkAppId}] collab admission consume failed; dropping message ${messageId.substring(0, 12)}: ${err}`);
@@ -28201,7 +28202,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     let chargeFact: { reason: string; quotaKey?: string; used: number; chargedAt: number } | undefined;
     // 协作 ready：扣费与回执同事务原子落盘（F1/F2）。legacy 路径 collabCharge=undefined。
     const collabCharge = collabPreflight.kind === 'ready'
-      ? { receiptId: collabCreatorAdmissionReceiptId(collabPreflight.initId), sourceOpenId: quotaSenderOpenId ?? '', grantChatId: chatId }
+      ? { receiptId: collabCreatorAdmissionReceiptId(collabPreflight.initId), sourceOpenId: quotaSenderOpenId ?? '' }
       : undefined;
     if (!await enforceMessageQuotaForCliInput(
       larkAppId,

@@ -119,7 +119,7 @@ vi.mock('../src/services/session-group-title.js', async () => {
 
 import { loadBotConfigs, registerBot, getBot } from '../src/bot-registry.js';
 import { __testOnly_handleNewTopic as handleNewTopic } from '../src/daemon.js';
-import { addChatGrant, chatQuotaKey, consumeQuota } from '../src/services/grant-store.js';
+import { addChatGrant, addGlobalGrant, chatQuotaKey, consumeQuota, globalQuotaKey } from '../src/services/grant-store.js';
 import { readCollabInitStore, placeCollabGroupInit } from '../src/services/collab-init-store.js';
 import { __testOnly_setCollabPeerPreflight } from '../src/core/collab-group-birth.js';
 import { collabCreatorAdmissionOperationId, collabInitId, collabSourceKey } from '../src/services/collab-group-config.js';
@@ -447,6 +447,32 @@ describe('协作初始化入口：fail-closed 不扣费不建群', () => {
       const store = readCollabInitStore(mocks.dataDir, APP);
       const entry = Object.values(store.entries)[0];
       // 未因「缺回执」被 release failed：entry 仍在（state=running，因 create_unknown 或已占位）
+      expect(entry).toBeTruthy();
+      expect(entry.state).not.toBe('failed');
+    } finally {
+      __testOnly_setCollabPeerPreflight(undefined);
+    }
+  });
+
+  it('G1：globalGrant 来源（当前 DM 无 chatGrant）合法扣费一次并进 S1，不写拒绝回执', async () => {
+    __testOnly_setCollabPeerPreflight(async () => ({ ok: true }));
+    try {
+      writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([botConfig(validCollab)]));
+      loadBotConfigs().forEach(cfg => registerBot(cfg));
+      const bot = getBot(APP);
+      bot.resolvedAllowedUsers = [OWNER];
+      delete bot.config.chatGrants;
+      delete bot.config.quotaState;
+      // 只给 globalGrant（无 chatGrant）：GRANTEE 走 globalGrant 腿，quotaKey=global:ou_collab_grantee。
+      await addGlobalGrant(APP, GRANTEE, 3);
+
+      await handleNewTopic(dmEvent('global 授权任务', 'om_global'), dmCtx('om_global'));
+
+      // 扣费一次（global 额度）
+      expect(getBot(APP).config.quotaState?.[globalQuotaKey(GRANTEE)]?.used).toBe(1);
+      // 未因误判写 allow=false 拒绝回执：entry 不是 failed
+      const store = readCollabInitStore(mocks.dataDir, APP);
+      const entry = Object.values(store.entries)[0];
       expect(entry).toBeTruthy();
       expect(entry.state).not.toBe('failed');
     } finally {

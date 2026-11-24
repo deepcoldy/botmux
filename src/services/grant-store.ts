@@ -315,37 +315,48 @@ export async function consumeDispatchLaunchQuotaOnce(
 }
 
 /**
- * 协作 creator 准入扣费（PR-2a F1/F2/R3）：扣费与准入回执同事务原子落盘。
+ * 协作 creator 准入扣费（PR-2a F1/F2/R3/G1/G2）：扣费与准入回执同事务原子落盘。
  *
  * 幂等键 = `creatorAdmissionOperationId`（`adm_<64hex>`），quotaKey 用当次 ev.quotaKey。
  * 免额度授权（owner/allowedUser，无 quotaKey）只写回执、不动额度（used=0）。回执携带
- * 当次 reason/quotaKey/used 事实快照，供恢复路径重建 provenance（不二扣也不丢已扣额度）。
+ * 当次 reason/quotaKey/used/chargedAt 事实快照，供恢复路径重建 provenance。
+ *
+ * G1：来源 scope 由 quotaKey 决定（`chat:…` = chatGrant，`global:…` = globalGrant），
+ * 不靠「grantChatId 是否存在」判断——否则 DM 恒传 chatId 会让合法 globalGrant 永远不匹配。
+ * G2：命中/新写两条路径都从持久回执回放完整事实（allow/used/reason/quotaKey/chargedAt），
+ * 禁止用当前输入的 quotaKey / 当前时间拼接，同 key 重投事实恒等。
  *
  * 保留 creator 身份边界：quotaKey 只用当次 evaluateTalk 产出的 key，不用调用方拼的 key。
  */
 export async function consumeCollabAdmissionOnce(
-  input: { larkAppId: string; receiptId: string; quotaKey?: string; sourceOpenId: string; grantChatId?: string; reason: string },
-): Promise<{ allow: boolean; used: number; quotaKey?: string; chargedAt: string }> {
-  const { larkAppId, receiptId, quotaKey, sourceOpenId, grantChatId, reason } = input;
+  input: { larkAppId: string; receiptId: string; quotaKey?: string; sourceOpenId: string; reason: string },
+): Promise<{ allow: boolean; used: number; quotaKey?: string; chargedAt: string; reason?: string }> {
+  const { larkAppId, receiptId, quotaKey, sourceOpenId, reason } = input;
   getBot(larkAppId); // throw → 调用方 fail-closed
   const chargedAt = new Date().toISOString();
-  const r = await mutateGrantState<{ allow: boolean; used: number }>(larkAppId, (tx) => {
+  const r = await mutateGrantState<{ allow: boolean; used: number; chargedAt: string; reason?: string; quotaKey?: string }>(larkAppId, (tx) => {
     const existing = tx.receiptGet(receiptId);
     if (existing && typeof existing.allow === 'boolean') {
-      return { write: false, result: { allow: existing.allow, used: existing.used ?? 0 } };
+      // G2：命中早退回放完整持久回执（含 chargedAt/reason/quotaKey），不拼接当前输入。
+      return {
+        write: false,
+        result: { allow: existing.allow, used: existing.used ?? 0, chargedAt: existing.chargedAt, reason: existing.reason, quotaKey: existing.quotaKey },
+      };
     }
     // 免额度：无 quotaKey → 直接放行，写 used=0 回执。
     if (!quotaKey) {
       tx.receiptSet(receiptId, { allow: true, chargedAt, used: 0, reason, quotaKey: undefined });
-      return { write: true, result: { allow: true, used: 0 } };
+      return { write: true, result: { allow: true, used: 0, chargedAt, reason, quotaKey: undefined } };
     }
-    const rec = tx.quotaGet(quotaKey);
-    const chatGrantMatches = grantChatId !== undefined
-      && quotaKey === chatQuotaKey(grantChatId, sourceOpenId)
-      && tx.chatHas(grantChatId, sourceOpenId);
-    const globalGrantMatches = grantChatId === undefined
-      && quotaKey === globalQuotaKey(sourceOpenId)
+    // G1：来源 scope 由 quotaKey 决定，不靠 grantChatId 是否存在。
+    const scope = parseGrantKey(quotaKey);
+    const chatGrantMatches = scope?.scope === 'chat'
+      && scope.openId === sourceOpenId
+      && tx.chatHas(scope.chatId, sourceOpenId);
+    const globalGrantMatches = scope?.scope === 'global'
+      && scope.openId === sourceOpenId
       && tx.globalHas(sourceOpenId);
+    const rec = tx.quotaGet(quotaKey);
     const allow = (chatGrantMatches || globalGrantMatches) && (!rec || rec.used < rec.limit);
     let used = rec?.used ?? 0;
     if (allow && rec) {
@@ -353,9 +364,9 @@ export async function consumeCollabAdmissionOnce(
       tx.quotaSet(quotaKey, quota);
       used = quota.used;
       if (quota.used >= quota.limit) {
-        if (quotaKey.startsWith('chat:') && grantChatId) {
-          tx.chatRemove(grantChatId, sourceOpenId);
-        } else if (quotaKey.startsWith('global:')) {
+        if (scope?.scope === 'chat') {
+          tx.chatRemove(scope.chatId, sourceOpenId);
+        } else if (scope?.scope === 'global') {
           tx.globalRemove(sourceOpenId);
         }
         tx.quotaSet(quotaKey, null);
@@ -363,10 +374,10 @@ export async function consumeCollabAdmissionOnce(
       }
     }
     tx.receiptSet(receiptId, { allow, chargedAt, used, reason, quotaKey });
-    return { write: true, result: { allow, used } };
+    return { write: true, result: { allow, used, chargedAt, reason, quotaKey } };
   });
   if (!r.ok) throw new Error(`collab admission quota RMW failed: ${r.reason}`);
-  return { allow: r.result.allow, used: r.result.used, quotaKey, chargedAt };
+  return { allow: r.result.allow, used: r.result.used, chargedAt: r.result.chargedAt, reason: r.result.reason, quotaKey: r.result.quotaKey };
 }
 
 /**
