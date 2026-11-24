@@ -87,9 +87,10 @@ export function normalizeRoleContent(content: string): string {
   return truncateToByteLimit(content.trim());
 }
 
-/** roleContentHash = sha256(utf8Bytes(normalizeRoleContent(content)))。 */
+/** roleContentHash = sha256(utf8Bytes(normalizeRoleContent(content)))。直接 hash 规范化后的
+ *  UTF-8 字节（sha256Hex 内部按 utf-8 update），**不**先 toString('hex') 再 hash hex 文本。 */
 export function roleContentHash(content: string): string {
-  return sha256Hex(Buffer.from(normalizeRoleContent(content), 'utf-8').toString('hex'));
+  return sha256Hex(normalizeRoleContent(content));
 }
 
 export type StrictRoleRead =
@@ -108,17 +109,13 @@ export function readRoleFileStrict(larkAppId: string, chatId: string): StrictRol
     return { kind: 'read-error', error: 'invalid role chat id' };
   }
   const filePath = roleFilePath(larkAppId, chatId);
-  let exists: boolean;
-  try {
-    exists = existsSync(filePath);
-  } catch (err: any) {
-    return { kind: 'read-error', error: err?.message ?? String(err) };
-  }
-  if (!exists) return { kind: 'missing' };
   let raw: string;
   try {
     raw = readFileSync(filePath, 'utf-8');
   } catch (err: any) {
+    // 仅 ENOENT（文件不存在）判 missing；其它错误（EACCES/EISDIR/ENOTDIR 等）保留 read-error，
+    // 不把「不可遍历父目录」「不可读旧文件」误判成「缺失」。
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return { kind: 'missing' };
     return { kind: 'read-error', error: err?.message ?? String(err) };
   }
   const content = normalizeRoleContent(raw);

@@ -35,7 +35,7 @@ vi.mock('../src/bot-registry.js', () => {
 
 // 直接 import（避免 config.js 的 SESSION_DATA_DIR 依赖）——preflight 用 deps.dataDir。
 import { __testOnly_setBotConfig } from '../src/bot-registry.js';
-import { preflightCollabGroupBirth, startCollabGroupBirth, releaseCollabGroupBirth } from '../src/core/collab-group-birth.js';
+import { preflightCollabGroupBirth, startCollabGroupBirth, releaseCollabGroupBirth, realCollabPeerPreflight } from '../src/core/collab-group-birth.js';
 import { readCollabInitStore, __testOnly_resetCollabInitMutexes } from '../src/services/collab-init-store.js';
 import { collabInitId, collabSourceKey } from '../src/services/collab-group-config.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
@@ -229,9 +229,9 @@ describe('preflightCollabGroupBirth', () => {
     expect(next.kind).toBe('ready');
   });
 
-  it('生产默认：无 peer（creator-only 配置）时真实 peer preflight 返回 ready（PR-2b 切换真实 preflight）', async () => {
+  it('生产默认：gate 准入未接入 → 合法 enabled 配置 fail-closed（不把 ready 切开放行，R1）', async () => {
     __testOnly_setBotConfig(APP, collabEnabledConfig());
-    // 不注入 peerPreflight：走 realCollabPeerPreflight。creator-only 配置无 peer → 直接 ready。
+    // 不注入 peerPreflight：生产 defaultDeps 保持 fail-closed（gate 未接入前不开放 ready）。
     const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), {
       dataDir: tempDir,
       now,
@@ -239,6 +239,29 @@ describe('preflightCollabGroupBirth', () => {
       resolveTeamRole: () => null,
       resolveAgent: (appId) => (appId === APP ? { exists: true, apiOnly: false } : undefined),
     });
-    expect(r.kind).toBe('ready');
+    expect(r.kind).toBe('failed');
+    if (r.kind === 'failed') expect(r.reason).toContain('gate 准入未接入');
+  });
+
+  it('R4：creator 被 afterAgentTurn 依赖且 backendType=herdr（不声明能力）→ 未就绪', async () => {
+    __testOnly_setBotConfig(APP, { backendType: 'herdr', sessionGroup: undefined });
+    // creator 被 peer 依赖，但 creator 自己 backendType=herdr 不声明 durable-turn-output-receipt-v1。
+    const r = await realCollabPeerPreflight({
+      config: {
+        enabled: true,
+        agents: [{ appId: APP, roleMode: 'no-chat-role' }, { appId: 'cli_peer', roleMode: 'no-chat-role' }],
+        kickoff: [
+          { appId: APP, trigger: 'immediate' },
+          { appId: 'cli_peer', trigger: 'afterAgentTurn', afterAppId: APP, artifact: { type: 'marked-url', hosts: ['x.com'] } },
+        ],
+      } as any,
+      initId: 'a'.repeat(64),
+      sourceMessageId: 'om_src',
+      configVersion: 'cv',
+      creatorAppId: APP,
+      dataDir: tempDir,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errors.some(e => e.includes('creator') && e.includes('durable-turn-output-receipt'))).toBe(true);
   });
 });

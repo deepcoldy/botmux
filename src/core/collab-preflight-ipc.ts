@@ -53,6 +53,7 @@ export function parseCollabPreflightRequest(bodyRaw: string):
   let parsed: unknown;
   try { parsed = JSON.parse(bodyRaw); } catch { return { ok: false, error: 'bad_json' }; }
   if (JSON.stringify(parsed) !== bodyRaw) return { ok: false, error: 'bad_json' };
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, error: 'bad_body' };
   const r = parsed as Record<string, unknown>;
   if (
     r.schemaVersion !== 1
@@ -137,6 +138,10 @@ export async function preflightCollabPeer(
   } catch {
     return { ok: false, errorCode: 'RESPONSE_READ_FAILED', message: 'failed to read response body' };
   }
+  // R5：严格验证成功 HTTP 状态。非 200 一律未就绪。
+  if (response.status !== 200) {
+    return { ok: false, errorCode: 'HTTP_ERROR', message: `peer preflight http ${response.status}` };
+  }
   const respSignature = response.headers.get(DISPATCH_LAUNCH_IPC_HEADERS.responseSignature);
   const signatureValid = verifyDispatchLaunchIpcResponseSignature({
     secret, requestNonce: nonce, method, pathWithQuery, status: response.status, body: respBody, target, signature: respSignature ?? undefined,
@@ -146,18 +151,31 @@ export async function preflightCollabPeer(
   }
   let parsed: unknown;
   try { parsed = JSON.parse(respBody); } catch { return { ok: false, errorCode: 'BAD_RESPONSE', message: 'response not JSON' }; }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, errorCode: 'BAD_RESPONSE', message: 'response not object' };
+  }
   const r = parsed as Record<string, unknown>;
-  if (r.ok === true) {
+  if (r.ok !== true) {
     return {
-      ok: true,
-      protocolVersion: typeof r.protocolVersion === 'number' ? r.protocolVersion : COLLAB_IPC_PROTOCOL_VERSION,
-      capabilities: Array.isArray(r.capabilities) ? r.capabilities.filter((c): c is string => typeof c === 'string') : [],
-      workingDirAccepted: r.workingDirAccepted === true,
+      ok: false,
+      errorCode: typeof r.errorCode === 'string' ? r.errorCode : 'PEER_REJECTED',
+      message: typeof r.message === 'string' ? r.message : 'peer rejected preflight',
     };
   }
+  // R5：协议版本与 workingDirAccepted 必须严格验证，缺失/不兼容不得补默认成功。
+  if (r.protocolVersion !== COLLAB_IPC_PROTOCOL_VERSION) {
+    return { ok: false, errorCode: 'PROTOCOL_VERSION_MISMATCH', message: `protocol version ${String(r.protocolVersion)}` };
+  }
+  if (r.workingDirAccepted !== true) {
+    return { ok: false, errorCode: 'WORKING_DIR_NOT_ACCEPTED', message: 'peer did not accept working dir' };
+  }
+  if (!Array.isArray(r.capabilities) || r.capabilities.some((c) => typeof c !== 'string')) {
+    return { ok: false, errorCode: 'BAD_RESPONSE', message: 'capabilities malformed' };
+  }
   return {
-    ok: false,
-    errorCode: typeof r.errorCode === 'string' ? r.errorCode : 'PEER_REJECTED',
-    message: typeof r.message === 'string' ? r.message : 'peer rejected preflight',
+    ok: true,
+    protocolVersion: r.protocolVersion,
+    capabilities: r.capabilities as string[],
+    workingDirAccepted: true,
   };
 }

@@ -55,6 +55,19 @@ describe('readRoleFileStrict 四态', () => {
     expect(r.kind).toBe('read-error');
   });
 
+  it('R3：父目录不可遍历（非 ENOENT）判 read-error 不判 missing', () => {
+    mkdirSync(join(dataDir, 'roles'), { recursive: true });
+    const appDir = join(dataDir, 'roles', APP);
+    mkdirSync(appDir, { recursive: true });
+    chmodSync(appDir, 0o000); // 不可读/不可遍历
+    try {
+      const r = readRoleFileStrict(APP, CHAT);
+      expect(r.kind).toBe('read-error');
+    } finally {
+      chmodSync(appDir, 0o755);
+    }
+  });
+
   it('invalid chat id → read-error（不是 missing）', () => {
     expect(readRoleFileStrict(APP, 'not-a-valid-id').kind).toBe('read-error');
   });
@@ -70,6 +83,11 @@ describe('normalizeRoleContent / roleContentHash 与 writeRoleFile 同源', () =
   it('roleContentHash 是规范化后落盘字节的 sha256，与原始输入无关', () => {
     expect(roleContentHash('  abc  ')).toBe(roleContentHash('abc'));
     expect(roleContentHash('abc')).not.toBe(roleContentHash('def')); // 不同内容
+  });
+
+  it('R6：roleContentHash 直接 hash UTF-8 字节，符合已知 SHA-256 协议值', () => {
+    // sha256(utf8('abc')) = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+    expect(roleContentHash('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
   });
 
   it('writeRoleFile 落盘后 roleContentHash 与 readRoleFileStrict readable 一致', () => {

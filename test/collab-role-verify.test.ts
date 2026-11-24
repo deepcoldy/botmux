@@ -24,7 +24,9 @@ function deps(overrides: Partial<RoleVerifyDeps> = {}): RoleVerifyDeps {
     dataDir,
     now: () => Date.now(),
     readProfile: () => '你好',
+    readTeamRole: () => null,
     writeRole: () => {},
+    deleteRole: () => {},
     readRole: () => ({ kind: 'missing' as const }),
     ...overrides,
   };
@@ -82,6 +84,18 @@ describe('runCollabRoleVerification', () => {
     }));
     expect(r.ready).toBe(true);
     expect(writes).toBe(0); // 已是期望状态，不写
+  });
+
+  it('R3：代写前 read-error → fail-closed，不写不覆盖旧角色', () => {
+    let writes = 0;
+    const r = runCollabRoleVerification(APP, CHAT, config([{ appId: APP, profileId: 'p1' }]), deps({
+      readProfile: () => '你好',
+      writeRole: () => { writes++; },
+      readRole: () => ({ kind: 'read-error', error: 'EACCES' }),
+    }));
+    expect(r.ready).toBe(false);
+    expect(writes).toBe(0); // 不代写
+    expect(r.conflict).toContain('read-error');
   });
 });
 

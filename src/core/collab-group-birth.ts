@@ -35,7 +35,7 @@ import { registerSessionGroup } from '../services/session-groups-store.js';
 import { forwardMessage } from '../im/lark/client.js';
 import { runCollabGroupBirthS1, type CollabS1Deps } from './collab-orchestrator.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
-import { preflightCollabPeer, COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT } from './collab-preflight-ipc.js';
+import { preflightCollabPeer, COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT, declaresDurableTurnOutputReceipt } from './collab-preflight-ipc.js';
 import type { RoutingContext } from '../im/lark/event-dispatcher.js';
 
 export type CollabPreflightResult =
@@ -103,7 +103,10 @@ function defaultDeps(dataDir: string, creatorAppId: string): CollabPreflightDeps
       const found = loadBotConfigsCached().find(c => c.larkAppId === appId);
       return found ? { exists: true, apiOnly: found.apiOnly === true } : undefined;
     },
-    peerPreflight: __testOnlyPeerPreflight,
+    // R1：per-participant gate 尚未接入消息准入（§8.1/§8.3），生产不能把 ready 切开放行
+    // ——否则 initializing 群消息仍扣费并启动 CLI（违反 §3 铁律2）。生产 defaultDeps 保持
+    // fail-closed；测试经 __testOnly_setCollabPeerPreflight 注入 {ok:true} 验证 ready 分支。
+    peerPreflight: __testOnlyPeerPreflight ?? (async () => ({ ok: false, errors: ['协作初始化 gate 准入未接入，生产 fail-closed'] })),
   };
 }
 
@@ -113,13 +116,22 @@ function defaultDeps(dataDir: string, creatorAppId: string): CollabPreflightDeps
  * 未就绪（fail-closed）。含 afterAgentTurn 依赖的 kickoff 目标必须声明
  * durable-turn-output-receipt-v1。
  */
-async function realCollabPeerPreflight(ctx: CollabPeerPreflightContext): Promise<{ ok: true } | { ok: false; errors: string[] }> {
+export async function realCollabPeerPreflight(ctx: CollabPeerPreflightContext): Promise<{ ok: true } | { ok: false; errors: string[] }> {
   const errors: string[] = [];
   const requiresDurableReceipt = new Set(
     ctx.config.kickoff
       .filter(k => k.trigger === 'afterAgentTurn')
       .map(k => k.afterAppId as string),
   );
+  // R4：creator 若被依赖（peer 的 afterAgentTurn 依赖 creator），也要按本地能力判定
+  // durable-turn-output-receipt-v1，不能只靠 backendType 字段、不能因 peers 排除 creator 而漏检。
+  if (requiresDurableReceipt.has(ctx.creatorAppId)) {
+    const creatorCfg = getBot(ctx.creatorAppId).config;
+    const creatorCapable = declaresDurableTurnOutputReceipt(creatorCfg.backendType);
+    if (!creatorCapable) {
+      errors.push(`creator ${ctx.creatorAppId} 被 afterAgentTurn 依赖但未声明 durable-turn-output-receipt-v1`);
+    }
+  }
   // 只 preflight 非 creator participant（creator 走本地）。
   const peers = ctx.config.agents.filter(a => a.appId !== ctx.creatorAppId);
   for (const agent of peers) {

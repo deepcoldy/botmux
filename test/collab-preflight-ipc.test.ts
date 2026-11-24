@@ -8,7 +8,9 @@ import {
   COLLAB_IPC_ROUTE_PREFIX,
   COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT,
   preflightCollabPeer,
+  collabPreflightPath,
 } from '../src/core/collab-preflight-ipc.js';
+import { signDispatchLaunchIpcResponse, DISPATCH_LAUNCH_IPC_HEADERS } from '../src/core/dispatch-launch-ipc-auth.js';
 
 function validReq() {
   return {
@@ -34,6 +36,12 @@ describe('parseCollabPreflightRequest', () => {
 
   it('非 canonical JSON（多余空白/字段重排）拒绝', () => {
     expect(parseCollabPreflightRequest(JSON.stringify({ ...validReq() }) + '\n').ok).toBe(false);
+  });
+
+  it('R5：parseCollabPreflightRequest("null") 不抛 TypeError，返回 bad_body', () => {
+    expect(parseCollabPreflightRequest('null').ok).toBe(false);
+    expect(parseCollabPreflightRequest('null').error).toBe('bad_body');
+    expect(parseCollabPreflightRequest('[]').ok).toBe(false);
   });
 });
 
@@ -68,6 +76,48 @@ describe('preflightCollabPeer fail-closed', () => {
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.errorCode).toBe('PEER_OFFLINE');
+  });
+
+  it('R5：protocolVersion 不兼容的已签名响应被拒（不补默认成功）', async () => {
+    const secret = 's'.repeat(32);
+    const target = { larkAppId: 'cli_peer', ipcPort: 12345, bootInstanceId: 'x'.repeat(43) };
+    const nonce = 'n'.repeat(43);
+    const pathWithQuery = collabPreflightPath(validReq().initId);
+    const body = JSON.stringify({ ok: true, protocolVersion: 99, capabilities: [], workingDirAccepted: true });
+    const signature = signDispatchLaunchIpcResponse({ secret, requestNonce: nonce, method: 'POST', pathWithQuery, status: 200, body, target });
+    const fakeFetch = (async () => ({
+      status: 200,
+      headers: { get: (k: string) => (k === DISPATCH_LAUNCH_IPC_HEADERS.responseSignature ? signature : null) },
+      text: async () => body,
+    })) as any;
+    const r = await preflightCollabPeer(
+      { larkAppId: 'cli_peer', ipcPort: 12345, bootInstanceId: 'x'.repeat(43), dispatchLaunchIpcProtocol: 'v1' } as any,
+      validReq(),
+      { secret, nonce, fetchImpl: fakeFetch },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errorCode).toBe('PROTOCOL_VERSION_MISMATCH');
+  });
+
+  it('R5：workingDirAccepted=false 的已签名响应被拒', async () => {
+    const secret = 's'.repeat(32);
+    const target = { larkAppId: 'cli_peer', ipcPort: 12345, bootInstanceId: 'x'.repeat(43) };
+    const nonce = 'n'.repeat(43);
+    const pathWithQuery = collabPreflightPath(validReq().initId);
+    const body = JSON.stringify({ ok: true, protocolVersion: 1, capabilities: [], workingDirAccepted: false });
+    const signature = signDispatchLaunchIpcResponse({ secret, requestNonce: nonce, method: 'POST', pathWithQuery, status: 200, body, target });
+    const fakeFetch = (async () => ({
+      status: 200,
+      headers: { get: (k: string) => (k === DISPATCH_LAUNCH_IPC_HEADERS.responseSignature ? signature : null) },
+      text: async () => body,
+    })) as any;
+    const r = await preflightCollabPeer(
+      { larkAppId: 'cli_peer', ipcPort: 12345, bootInstanceId: 'x'.repeat(43), dispatchLaunchIpcProtocol: 'v1' } as any,
+      validReq(),
+      { secret, nonce, fetchImpl: fakeFetch },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errorCode).toBe('WORKING_DIR_NOT_ACCEPTED');
   });
 });
 
