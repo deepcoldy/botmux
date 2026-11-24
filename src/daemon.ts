@@ -1231,6 +1231,8 @@ import { assistantScheduleCreatorAllowed, assistantSessionStillOwned, isAssistan
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
 import { preflightCollabGroupBirth, startCollabGroupBirth, releaseCollabGroupBirth } from './core/collab-group-birth.js';
 import { buildCreatorAdmissionReceipt, persistCreatorAdmissionReceipt } from './core/collab-orchestrator.js';
+import { readCollabInitEntry } from './services/collab-init-store.js';
+import type { CreatorAdmissionReceipt } from './services/collab-group-config.js';
 import { scheduleSessionGroupTitle, subscribeSessionGroupTitles } from './services/session-group-title.js';
 import { hasPendingGroupAutoTitle, scheduleGroupAutoTitle } from './services/group-auto-title.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
@@ -6043,6 +6045,10 @@ export async function enforceMessageQuotaForCliInput(
       promptContent?: string;
       promptAttachments?: Array<{ type: string; name: string }>;
     }>;
+    /** 扣费成功后的不可变事实回调（协作准入 receipt 用）：当次 reason/quotaKey/实际
+     *  consumed used。仅在本次扣费真正成功（含无限额 tracked=false 放行）时调用一次。
+     *  提供的是**本次判定的事实快照**，不是事后重新 evaluateTalk。 */
+    onChargeCommitted?: (charge: { reason: string; quotaKey?: string; used: number; chargedAt: number }) => void;
   },
 ): Promise<boolean> {
   if (opts?.crossChatFollowedThreadAuthorized) {
@@ -6259,6 +6265,7 @@ export async function enforceMessageQuotaForCliInput(
   // 无额度记录（无限授权）：放行；标 done 去重后续重投。
   if (!quota.tracked) {
     commitCharge(larkAppId, messageId);
+    opts?.onChargeCommitted?.({ reason: ev.reason, quotaKey: ev.quotaKey, used: 0, chargedAt: Date.now() });
     return true;
   }
   // 已超额：fail-closed drop。**绝不 commit 成 done**（否则同条重投会被 'done' 直接放行，
@@ -6272,6 +6279,7 @@ export async function enforceMessageQuotaForCliInput(
   }
   // 扣费成功才定论为 done。
   commitCharge(larkAppId, messageId);
+  opts?.onChargeCommitted?.({ reason: ev.reason, quotaKey: ev.quotaKey, used: quota.used, chargedAt: Date.now() });
   // exhausted=当前这条刚好用完额度（但依然放行给 AI 处理）。
   // 不在此时发通知，避免给用户"本条已被拒绝"的错觉；
   // 也不提前 revoke —— 把 quotaState 的 {limit, used>=limit} 记录保留下来，
@@ -28092,6 +28100,15 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       return;
     }
     if (collabPreflight.kind === 'existing') {
+      // R4：paid-but-not-created 重投可继续 S1 且 quota 不变。preflight 已确认同 source；
+      // 若 entry 已有 durable creatorAdmissionReceipt 但尚无 chatId（崩溃于扣费后、S1 前），
+      // 直接续跑 S1（不二次扣费），否则退回进度回执。
+      const existingEntry = readCollabInitEntry(config.session.dataDir, larkAppId, collabPreflight.initId);
+      const receipt = existingEntry?.creatorAdmissionReceipt as CreatorAdmissionReceipt | undefined;
+      if (receipt && !existingEntry?.chatId && existingEntry?.state === 'running') {
+        const resumeResult = await startCollabGroupBirth(data, ctx, collabPreflight.initId, receipt);
+        if (resumeResult.kind === 'collab-handled') return;
+      }
       await replyMessage(larkAppId, messageId, tr('sg.collab_existing', { status: collabPreflight.status }, localeForBot(larkAppId)), 'text')
         .catch(() => { /* best-effort notice */ });
       return;
@@ -28127,6 +28144,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     } catch (err) {
       logger.debug(`[hooks:${larkAppId}] birth-turn prompt preview failed, gating on metadata only: ${err}`);
     }
+    // 本次扣费的不可变事实快照（R3）：由 enforceMessageQuotaForCliInput 的
+    // onChargeCommitted 产出当次 reason/quotaKey/used，不事后重新 evaluateTalk。
+    let chargeFact: { reason: string; quotaKey?: string; used: number; chargedAt: number } | undefined;
     if (!await enforceMessageQuotaForCliInput(
       larkAppId,
       chatId,
@@ -28137,7 +28157,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       quotaSenderUnionId,
       chatType,
       undefined,
-      { promptContent: birthPromptContent, promptAttachments: birthPromptAttachments },
+      { promptContent: birthPromptContent, promptAttachments: birthPromptAttachments, onChargeCommitted: (c) => { chargeFact = c; } },
     )) {
       // 扣费被拒（或闸未通过）：preflight 若已占位，释放 DM 占位，避免同 DM 永久 busy。
       if (collabPreflight.kind === 'ready') {
@@ -28154,25 +28174,39 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     quotaConsumedBeforeSessionGroupBirth = true;
     // 协作 ready 走 startCollabGroupBirth（S1 create 编排）；legacy 走原 maybeBirthSessionGroup。
     if (collabPreflight.kind === 'ready') {
-      // 阶段 2：扣费成功后构建并持久化 creatorAdmissionReceipt（防崩溃重投二次扣费）。
-      const talkEv = evaluateTalk(larkAppId, chatId, quotaSenderOpenId, quotaTeamTrustUnionId, quotaSenderUnionId, chatType);
-      const quotaUsed = talkEv.quotaKey
-        ? (getBot(larkAppId).config.quotaState?.[talkEv.quotaKey]?.used ?? 0)
-        : 0;
+      // 阶段 2：用本次扣费事实快照构建并持久化 receipt（防崩溃重投二次扣费）。
+      // R1：receipt 未确认 durable 前不得进 S1；落盘失败显式失败并释放占位。
+      if (!chargeFact) {
+        await releaseCollabGroupBirth({
+          dataDir: config.session.dataDir, creatorAppId: larkAppId, initId: collabPreflight.initId,
+          dmChatId: chatId, now: () => Date.now(),
+        }).catch(() => { /* best-effort */ });
+        await replyMessage(larkAppId, messageId, tr('sg.collab_failed', { reason: 'admission receipt missing' }, localeForBot(larkAppId)), 'text').catch(() => {});
+        return;
+      }
       const receipt = buildCreatorAdmissionReceipt({
         operationId: collabPreflight.creatorAdmissionOperationId,
-        talk: { allowed: talkEv.allowed, reason: talkEv.reason, quotaKey: talkEv.quotaKey },
-        used: quotaUsed,
-        chargedAt: Date.now(),
+        talk: { allowed: true, reason: chargeFact.reason, quotaKey: chargeFact.quotaKey },
+        used: chargeFact.used,
+        chargedAt: chargeFact.chargedAt,
         originChatId: chatId,
       });
-      await persistCreatorAdmissionReceipt({
+      const persisted = await persistCreatorAdmissionReceipt({
         dataDir: config.session.dataDir,
         creatorAppId: larkAppId,
         initId: collabPreflight.initId,
         receipt,
         now: Date.now(),
-      }).catch(() => { /* receipt 落盘失败不阻断 S1，但会失去二次扣费防护 */ });
+      });
+      if (!persisted) {
+        // receipt 未 durable → 不进 S1（R1）。
+        await releaseCollabGroupBirth({
+          dataDir: config.session.dataDir, creatorAppId: larkAppId, initId: collabPreflight.initId,
+          dmChatId: chatId, now: () => Date.now(),
+        }).catch(() => { /* best-effort */ });
+        await replyMessage(larkAppId, messageId, tr('sg.collab_failed', { reason: 'admission receipt persist failed' }, localeForBot(larkAppId)), 'text').catch(() => {});
+        return;
+      }
 
       const result = await startCollabGroupBirth(data, ctx, collabPreflight.initId, receipt);
       // 收到 collab-handled 后不递归 handleNewTopic、不落 DM thread（铁律 1）。

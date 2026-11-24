@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { runCollabGroupBirthS1, buildCreatorAdmissionReceipt, persistCreatorAdmissionReceipt, type CollabS1Deps } from '../src/core/collab-orchestrator.js';
+import { runCollabGroupBirthS1, buildCreatorAdmissionReceipt, persistCreatorAdmissionReceipt, type CollabS1Deps, type CollabS1CreateChatOpts } from '../src/core/collab-orchestrator.js';
 import {
   placeCollabGroupInit,
   readCollabInitEntry,
@@ -17,6 +17,7 @@ import {
   collabCreateUuid,
   collabCreatorAdmissionOperationId,
   collabInitId,
+  collabPayloadHash,
   collabSourceKey,
   COLLAB_CREATE_ATTEMPT_INITIAL,
   type SessionGroupCollaborationConfig,
@@ -285,3 +286,121 @@ describe('init-store patch 原语', () => {
     expect(entry.operations['op1'].status).toBe('attempting');
   });
 });
+
+// ─── R1/R2/R5/R6 缺陷修复用例 ───
+
+describe('R1：receipt 落盘失败不进 S1', () => {
+  it('persistCreatorAdmissionReceipt 返回 false 时（模拟写盘失败）不进 S1', async () => {
+    const { initId } = await seedEntry();
+    // 直接 mock patch 失败：把 init-store 的 writeStore 触发异常。这里用不存在的 dataDir 模拟。
+    const rec = receipt();
+    const ok = await persistCreatorAdmissionReceipt({ dataDir: '/nonexistent/dir', creatorAppId: APP, initId, receipt: rec, now: now() });
+    expect(ok).toBe(false);
+    // 此时不应进 S1（由 daemon 短路，此处验证 persist 的返回语义）
+  });
+
+  it('persist 成功返回 true 且读回一致', async () => {
+    const { initId } = await seedEntry();
+    const rec = receipt();
+    const ok = await persistCreatorAdmissionReceipt({ dataDir: tempDir, creatorAppId: APP, initId, receipt: rec, now: now() });
+    expect(ok).toBe(true);
+  });
+});
+
+describe('R2：chatId 已落但 create op 未 done → 补齐不二次 create', () => {
+  it('预置 chatId + create op=attempting + 时钟 10h1m → 不二次 create，直接补齐 done', async () => {
+    const { initId } = await seedEntry();
+    // 预置 chatId 且 create op 状态为 attempting（崩溃于「落 chatId 后、写 done 前」）
+    const createUuid = collabCreateUuid(initId, 0);
+    await patchCollabInitEntryForTest(tempDir, APP, initId, (e) => {
+      e.chatId = 'oc_preset';
+      e.operations[createUuid] = { kind: 'create', status: 'attempting', uuid: createUuid, firstAttemptAt: 1, payloadHash: collabPayloadHash({ initId, createAttempt: 0, name: '' }) };
+      return true;
+    });
+    // 时钟拨到 10h+1m（超窗）
+    clock = 10 * 60 * 60 * 1000 + 60 * 1000;
+    const beforeCalls = chatCreateCalls.length;
+    const r = await runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), deps());
+    expect(r.kind).toBe('collab-handled');
+    // 不二次 create（chatId 已存在短路）
+    expect(chatCreateCalls.length).toBe(beforeCalls);
+    const entry = readCollabInitEntry(tempDir, APP, initId)!;
+    expect(entry.operations[createUuid].status).toBe('done');
+    expect(entry.chatId).toBe('oc_preset');
+  });
+
+  it('create unknown 超窗 → awaiting-input(CREATE_UNKNOWN_EXPIRED) 不自动重建', async () => {
+    const { initId } = await seedEntry();
+    const createUuid = collabCreateUuid(initId, 0);
+    await patchCollabInitEntryForTest(tempDir, APP, initId, (e) => {
+      e.operations[createUuid] = { kind: 'create', status: 'unknown', uuid: createUuid, firstAttemptAt: 1, payloadHash: collabPayloadHash({ initId, createAttempt: 0, name: '' }), error: 'timeout' };
+      return true;
+    });
+    clock = 10 * 60 * 60 * 1000 + 60 * 1000;
+    const beforeCalls = chatCreateCalls.length;
+    const r = await runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), deps());
+    expect(r.kind).toBe('collab-handled');
+    if (r.kind === 'collab-handled') expect(r.status).toBe('awaiting_input');
+    expect(chatCreateCalls.length).toBe(beforeCalls); // 不自动重建
+    const entry = readCollabInitEntry(tempDir, APP, initId)!;
+    expect(entry.state).toBe('awaiting-input');
+    expect(entry.awaiting?.reason).toBe('CREATE_UNKNOWN_EXPIRED');
+  });
+});
+
+describe('R5：payloadHash 判重完整（含 origin*，done 也拒绝冲突）', () => {
+  it('register done 但换 owner/source/receipt 再调 → 报冲突', async () => {
+    const { initId } = await seedEntry();
+    await runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), deps());
+    // 换 owner/receipt 再调（同 initId，但冻结身份变了）
+    const badData = {
+      sender: { sender_id: { open_id: 'ou_other_owner' }, sender_type: 'user' },
+      message: { message_id: SRC, chat_id: DM, chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text: 'hi' }) },
+    };
+    const r = await runCollabGroupBirthS1(badData, ctx(SRC), initId, receipt({ originReason: 'none', originQuotaKey: undefined }), deps());
+    expect(r.kind).toBe('collab-handled');
+    if (r.kind === 'collab-handled') expect(r.status).toBe('failed'); // register conflict → failed
+    const entry = readCollabInitEntry(tempDir, APP, initId)!;
+    expect(entry.state).toBe('failed');
+  });
+
+  it('sourceMessageId mismatch → failed（冻结请求身份校验）', async () => {
+    const { initId } = await seedEntry();
+    const badCtx = { ...ctx('om_different_source'), chatId: DM };
+    const r = await runCollabGroupBirthS1(data('om_different_source'), badCtx, initId, receipt(), deps());
+    expect(r.kind).toBe('collab-handled');
+    if (r.kind === 'collab-handled') expect(r.status).toBe('failed');
+  });
+});
+
+describe('R6：S1 并发重入无重复外部副作用', () => {
+  it('并发两执行者 → create/register/forward 各一次', async () => {
+    const { initId } = await seedEntry();
+    // createChat 带一个真实异步延迟，制造并发窗口；mutex 串行化后第二个执行者读已 done 的
+    // operation 而跳过，外部副作用各一次。
+    const slowCreate = async (_appId: string, opts: CollabS1CreateChatOpts) => {
+      await new Promise(r => setTimeout(r, 10));
+      chatCreateCalls.push({ data: { bot_id_list: opts.botIds, user_id_list: opts.userIds, chat_mode: opts.chatMode }, params: { uuid: opts.uuid } });
+      return { chatId: 'oc_created', invalidBotIds: [], invalidUserIds: [] };
+    };
+    const d = deps({ createChat: slowCreate });
+    const [r1, r2] = await Promise.all([
+      runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), d),
+      runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), d),
+    ]);
+    expect(r1.kind).toBe('collab-handled');
+    expect(r2.kind).toBe('collab-handled');
+    expect(chatCreateCalls).toHaveLength(1); // create 只一次
+    expect(registeredGroups).toHaveLength(1); // register 只一次
+    expect(forwarded).toHaveLength(1); // forward 只一次
+  });
+});
+
+// 测试 helper：直接 patch entry
+async function patchCollabInitEntryForTest(
+  dataDir: string, creatorAppId: string, initId: string,
+  mutate: (e: any) => boolean,
+): Promise<void> {
+  const { patchCollabInitEntry } = await import('../src/services/collab-init-store.js');
+  await patchCollabInitEntry({ dataDir, creatorAppId, initId, mutate });
+}

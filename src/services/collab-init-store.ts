@@ -84,6 +84,29 @@ function queueFor(appId: string): AsyncSerialQueue {
 /** 仅测试用：清空进程内 mutex（避免跨用例串扰）。 */
 export function __testOnly_resetCollabInitMutexes(): void {
   queues.clear();
+  initIdQueues.clear();
+}
+
+// ─── per-initId 异步 mutex（S1 编排并发认领，R6）──────────────────────────
+
+const initIdQueues = new Map<string, AsyncSerialQueue>();
+
+function initIdQueueFor(initId: string): AsyncSerialQueue {
+  let q = initIdQueues.get(initId);
+  if (!q) {
+    q = new AsyncSerialQueue();
+    initIdQueues.set(initId, q);
+  }
+  return q;
+}
+
+/**
+ * 串行化同一 initId 的 S1 编排（含外部副作用）：store 的 per-app mutex 只覆盖单个
+ * JSON 读改写，覆盖不了「两个执行者都读到未完成并各自调外部 create/register/forward」。
+ * 用本 mutex 把整个 S1 临界区串起来，后来者进入时会重读已完成的 operation 而跳过。
+ */
+export function withCollabInitIdMutex<T>(initId: string, task: () => Promise<T>): Promise<T> {
+  return initIdQueueFor(initId).run(task);
 }
 
 // ─── 读写（数据目录显式传入，不做内存缓存）───────────────────────────────
