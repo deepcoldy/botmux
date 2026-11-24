@@ -518,8 +518,9 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     const tenant = new Set<string>(manifest.scopes?.tenant ?? []);
     const user = new Set<string>(manifest.scopes?.user ?? []);
 
-    // lark-cli 的更新回复接口同时接受 comment:update 与 comment:write_only，而后者仍在
-    // user 桶；块转换没有内置 user 工作流，未来确需时走 extra-scopes / 按需授权。
+    // lark-cli 的更新回复与 fileComment.patch（解决/恢复评论）同时接受 comment:update 和
+    // comment:write_only，而后者仍在 user 桶；块转换没有内置 user 工作流，未来确需时走
+    // extra-scopes / 按需授权。
     const removedUser = [
       'docs:document.comment:update',
       'docx:document.block:convert',
