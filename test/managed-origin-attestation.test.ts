@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import {
   existsSync,
@@ -104,6 +105,39 @@ describe('managed-origin host proof sidecar', () => {
         return new Response(null, { status: 200 });
       },
     })).rejects.toBeInstanceOf(ManagedOriginAttestationError);
+  });
+
+  it('returns the attested session location and rejects a malformed one', async () => {
+    const dataDir = makeRoot();
+    const location = { status: 'active', chatId: 'oc_chat', rootMessageId: 'om_root',
+      turnRootMessageId: 'om_topic', scope: 'chat', chatType: 'group', workingDir: '/work',
+      ownerOpenId: 'ou_owner', ownerUnionId: 'on_owner' };
+    const attempt = (session: unknown) => {
+      let now = 50_000;
+      const nonce = randomBytes(32).toString('hex');
+      return attestManagedOrigin({
+        context: { dataDir, sessionId: 'session-a', channelId: CHANNEL,
+          capability: 'ab'.repeat(32), ipcPortFallback: 4321 },
+        nonce, timeoutMs: 3, now: () => now, wait: async delay => { now += delay; },
+        fetchImpl: async () => {
+          writeManagedOriginAttestationProof({ dataDir, proof: {
+            domain: MANAGED_ORIGIN_PROOF_DOMAIN, version: 1, nonce,
+            channelId: CHANNEL, sessionId: 'session-a', turnId: 'turn-live',
+            requiresCodexAppLedger: false, issuedAtMs: now, session,
+          } as any });
+          return new Response(null, { status: 200 });
+        },
+      });
+    };
+    expect((await attempt(location)).session).toEqual(location);
+    for (const rootMessageId of ['oc_chat', 'schedule-run:aabbccdd:run-1', 'ml:om_source']) {
+      expect((await attempt({ ...location, rootMessageId })).session).toMatchObject({ rootMessageId });
+    }
+    for (const bad of [{ ...location, chatId: 'not-a-chat' }, { ...location, workingDir: 'relative' },
+      { ...location, status: 'unknown' }, { ...location, rootMessageId: undefined },
+      { ...location, rootMessageId: 'has space' }, { ...location, rootMessageId: '' }]) {
+      await expect(attempt(bad)).rejects.toBeInstanceOf(ManagedOriginAttestationError);
+    }
   });
 
   it('rejects expired proof bytes even when HTTP returns 200', async () => {

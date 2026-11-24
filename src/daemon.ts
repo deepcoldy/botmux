@@ -1226,7 +1226,7 @@ import { addBotToChat, isInChat, listChatMemberDisplays, addUsersToChatByOpenId 
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
 import { isValidAssistantOpenId, resolveAssistantOwnerOpenId, setAssistantOwnerChangedListener } from './core/assistant-mode.js';
 import { getAssistantOwner, markAssistantOwnerLeft, setAssistantOwner } from './services/assistant-owner-store.js';
-import { assistantSessionStillOwned, resolveAssistantSpawn } from './core/assistant-spawn.js';
+import { assistantScheduleCreatorAllowed, assistantSessionStillOwned, resolveAssistantSpawn } from './core/assistant-spawn.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
 import { scheduleSessionGroupTitle, subscribeSessionGroupTitles } from './services/session-group-title.js';
 import { hasPendingGroupAutoTitle, scheduleGroupAutoTitle } from './services/group-auto-title.js';
@@ -10886,6 +10886,20 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         : `dispatch:${delegation.deliveryId}:${ds.larkAppId}`;
       sourceMessageId = delegation.messageId!;
       sourceSessionId = delegation.sourceSessionId;
+    }
+    // 个人助理模式：会话归主人一人，非管理员里只有主人能在里面创建定时任务；bot
+    // 管理员不受此限（与 Dashboard 一样视为宿主管理面）。这只收窄不放宽：主人仍须过
+    // 下面的常规准入（管理员，或开了 scheduleCreateByTalkers 的对话用户），任务的
+    // 执行期复核与管理权限沿用原规则。闸放在 daemon 侧、对每条创建路径（真人直发、
+    // Remote Runner、bot 转授、定时子任务）的最终控制人生效，且来源会话与目标 chat
+    // 两头都要是这个人的——否则 --chat-id 能把任务投进别人的助理群、在对方目录里
+    // 执行。沙盒里的 CLI 检查可被会话内进程绕过，不能作数。
+    const assistantOwner = ds.session.assistantOwnerOpenId;
+    const targetChatType = task.chatId === ds.chatId && ds.chatType === 'p2p' ? 'p2p' : 'group';
+    const botAdmin = !!controlOpenId && getDashboardAdminOpenIds(ds.larkAppId).includes(controlOpenId);
+    if (!botAdmin && ((assistantOwner && controlOpenId !== assistantOwner)
+      || !assistantScheduleCreatorAllowed(ds.larkAppId, task.chatId, targetChatType, controlOpenId))) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_assistant_owner_only' });
     }
     if (!controlOpenId || !controlUnionId
       || !(talkerOwner || getDashboardAdminOpenIds(ds.larkAppId).includes(controlOpenId))

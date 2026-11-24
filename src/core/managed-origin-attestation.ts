@@ -31,6 +31,44 @@ export interface ManagedOriginAttestationContext {
   ipcPortFallback?: number;
 }
 
+/** Where the caller's own live session sits, as the owning daemon sees it.
+ *  Assistant mode denies a confined CLI the per-bot session store (its rows
+ *  carry other people's last messages), so this is the only way such a CLI
+ *  can resolve the chat and topic it runs in. It names nothing beyond the
+ *  caller's own session. */
+export interface ManagedOriginSessionLocation {
+  status: 'active' | 'closed';
+  chatId: string;
+  rootMessageId: string;
+  /** The reply topic of the attested turn (chat-scope sessions only). */
+  turnRootMessageId?: string;
+  workingDir?: string;
+  chatType?: 'group' | 'p2p';
+  scope?: 'thread' | 'chat';
+  ownerOpenId?: string;
+  ownerUnionId?: string;
+}
+
+// A session anchor is not always a message id: chat sessions and silent
+// scheduled runs use synthetic anchors (`oc_…`, `schedule-run:…`).
+const SESSION_ANCHOR = /^[A-Za-z0-9_][A-Za-z0-9_:.-]{0,255}$/;
+
+export function isManagedOriginSessionLocation(value: unknown): value is ManagedOriginSessionLocation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  const optionalString = (key: string, test: (s: string) => boolean) =>
+    v[key] === undefined || (typeof v[key] === 'string' && test(v[key] as string));
+  return (v.status === 'active' || v.status === 'closed')
+    && typeof v.chatId === 'string' && /^oc_[A-Za-z0-9_-]{1,128}$/.test(v.chatId)
+    && typeof v.rootMessageId === 'string' && SESSION_ANCHOR.test(v.rootMessageId)
+    && optionalString('turnRootMessageId', s => SESSION_ANCHOR.test(s))
+    && optionalString('workingDir', s => s.length > 0 && s.length <= 4096 && s.startsWith('/'))
+    && (v.chatType === undefined || v.chatType === 'group' || v.chatType === 'p2p')
+    && (v.scope === undefined || v.scope === 'thread' || v.scope === 'chat')
+    && optionalString('ownerOpenId', s => /^ou_[A-Za-z0-9]+$/.test(s))
+    && optionalString('ownerUnionId', s => /^on_[A-Za-z0-9]+$/.test(s));
+}
+
 export interface ManagedOriginAttestation {
   sessionId: string;
   turnId: string;
@@ -47,6 +85,8 @@ export interface ManagedOriginAttestation {
   /** Owning bot's live host policy. Missing on old proofs means disabled. */
   allowArbitraryMention?: boolean;
   requiresCodexAppLedger: boolean;
+  /** Missing on old daemons; see ManagedOriginSessionLocation. */
+  session?: ManagedOriginSessionLocation;
 }
 
 export interface ManagedOriginAttestationProof extends ManagedOriginAttestation {
@@ -178,6 +218,7 @@ function validateProof(input: {
       && proof.linkRefMode !== 'observe'
       && proof.linkRefMode !== 'enabled')
     || (proof.allowArbitraryMention !== undefined && typeof proof.allowArbitraryMention !== 'boolean')
+    || (proof.session !== undefined && !isManagedOriginSessionLocation(proof.session))
     || typeof proof.issuedAtMs !== 'number' || !Number.isFinite(proof.issuedAtMs)
     || proof.issuedAtMs > input.nowMs + 1_000
     || input.nowMs - proof.issuedAtMs > MANAGED_ORIGIN_PROOF_TTL_MS
@@ -207,6 +248,7 @@ function validateProof(input: {
       ? { allowArbitraryMention: proof.allowArbitraryMention }
       : {}),
     requiresCodexAppLedger: proof.requiresCodexAppLedger,
+    ...(isManagedOriginSessionLocation(proof.session) ? { session: proof.session } : {}),
   };
 }
 

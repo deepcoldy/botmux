@@ -127,6 +127,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     scheduleAuthorityStore: { getRecord: vi.fn(() => undefined), listRecords: vi.fn((): unknown[] => []) },
     createHash,
     scheduler: { parseSchedule, commitDelegatedTask, addTask: vi.fn((task: unknown) => task) },
+    assistantScheduleCreatorAllowed: vi.fn((): boolean => true),
   };
   // The real shared admission rule, over the harness's replaceable lookups.
   scope.resolveRunAs = (appId: string, chatId: string, runAs: unknown) => resolveRunAs(appId, chatId, runAs, {
@@ -743,6 +744,65 @@ function directHumanHarness() {
   delete h.body.task.rootMessageId;
   return h;
 }
+
+describe('assistant-mode schedule creation', () => {
+  it('lets the assistant owner create a task under the ordinary admission rules', async () => {
+    const owner = directHumanHarness();
+    owner.ds.session.assistantOwnerOpenId = 'ou_user_target';
+    expect(await owner.run()).toMatchObject({ status: 201 });
+    expect(owner.scope.scheduler.addTask).toHaveBeenCalledTimes(1);
+    // Narrowing only: an owner who is neither an administrator nor admitted by
+    // the talker policy is still refused, so fire-time and management checks
+    // never meet a task they cannot authorize.
+    const plain = directHumanHarness();
+    plain.ds.session.assistantOwnerOpenId = 'ou_user_target';
+    plain.scope.getDashboardAdminOpenIds = () => [];
+    expect(await plain.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_operator_denied' } });
+  });
+
+  it('refuses a non-owner who is not a bot administrator, and leaves administrators alone', async () => {
+    const outsider = directHumanHarness();
+    outsider.ds.session.assistantOwnerOpenId = 'ou_assistant_owner';
+    outsider.scope.getDashboardAdminOpenIds = () => [];
+    expect(await outsider.run()).toEqual({ status: 403, value: { ok: false, error: 'schedule_assistant_owner_only' } });
+    expect(outsider.scope.scheduler.addTask).not.toHaveBeenCalled();
+    // A bot administrator (getDashboardAdminOpenIds) is not restricted by ownership.
+    const admin = directHumanHarness();
+    admin.ds.session.assistantOwnerOpenId = 'ou_assistant_owner';
+    admin.scope.assistantScheduleCreatorAllowed = vi.fn((): boolean => false);
+    expect(await admin.run()).toMatchObject({ status: 201 });
+  });
+
+  it('applies to a task delegated by another bot on a non-owner\'s behalf', async () => {
+    const h = harness();
+    h.ds.session.assistantOwnerOpenId = 'ou_assistant_owner';
+    h.scope.getDashboardAdminOpenIds = () => [];
+    expect(await h.run()).toEqual({ status: 403, value: { ok: false, error: 'schedule_assistant_owner_only' } });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('judges the target chat as well: a task may not be aimed at another owner\'s assistant chat', async () => {
+    const h = directHumanHarness();
+    h.ds.session.assistantOwnerOpenId = 'ou_user_target';
+    h.body.task.chatId = 'oc_other_owner';
+    h.scope.listChatMemberOpenIds = async () => ['ou_user_target'];
+    h.scope.getDashboardAdminOpenIds = () => [];
+    h.scope.assistantScheduleCreatorAllowed = vi.fn((_app: string, chatId: string, _type: string, openId?: string) =>
+      chatId !== 'oc_other_owner' && openId === 'ou_user_target');
+    expect(await h.run()).toEqual({ status: 403, value: { ok: false, error: 'schedule_assistant_owner_only' } });
+    expect(h.scope.assistantScheduleCreatorAllowed).toHaveBeenCalledWith('cli_target', 'oc_other_owner', 'group', 'ou_user_target');
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('leaves ordinary sessions to the existing admission rules', async () => {
+    const h = directHumanHarness();
+    expect(h.ds.session.assistantOwnerOpenId).toBeUndefined();
+    expect(await h.run()).toMatchObject({ status: 201 });
+    const outsider = directHumanHarness();
+    outsider.scope.getDashboardAdminOpenIds = () => [];
+    expect(await outsider.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_operator_denied' } });
+  });
+});
 
 describe('schedules created by a silent message listener task', () => {
   function silentHarness() {

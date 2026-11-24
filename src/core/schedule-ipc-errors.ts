@@ -58,6 +58,8 @@ const SCHEDULE_IPC_ERROR_TEXT: Record<string, string> = {
     '发起人当前不能在目标群对话或已不是群成员，不能创建定时任务。定时任务未创建。',
   schedule_talker_task_limit:
     '你在本 bot 的定时任务已达上限（启用或暂停中的都算）；请先删除不再需要的任务。定时任务未创建。',
+  schedule_assistant_owner_only:
+    '这是个人助理模式的会话，只有助理的主人（或 bot 管理员）能在这里创建定时任务。定时任务未创建。',
   silent_message_listener:
     '来源群已设置静默执行，不能把定时任务投到来源群；任务需要定时发往其他群时请显式指定 --chat-id。定时任务未创建。',
 };

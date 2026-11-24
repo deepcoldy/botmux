@@ -41,6 +41,19 @@ export function resolveAssistantSpawn(
   return { kind: 'owner', openId: owner, workDir };
 }
 
+/** 个人助理模式下谁能让任务投到某个 chat：只有该 chat 的主人本人。模式关着不限；群还没认领则
+ *  谁都不行。按**目标** chat 判定——来源会话的主人能建，不代表能把任务投进别人的助理群。 */
+export function assistantScheduleCreatorAllowed(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p',
+  openId: string | undefined,
+): boolean {
+  const spawn = resolveAssistantSpawn(larkAppId, chatId, chatType, openId);
+  if (spawn.kind === 'off') return true;
+  return spawn.kind === 'owner' && !!openId && spawn.openId === openId;
+}
+
 /** 一个已存在的会话还能不能按当前归属继续用（恢复 / 话题延续）：模式关着不管；模式开着时
  *  会话的 owner 必须正是当前解析出的 owner。 */
 export function assistantSessionStillOwned(
