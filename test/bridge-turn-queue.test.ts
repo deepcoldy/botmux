@@ -764,9 +764,9 @@ describe('BridgeTurnQueue', () => {
     function turnDurationMarker(uuid: string): TranscriptEvent {
       return { type: 'system', subtype: 'turn_duration', uuid } as TranscriptEvent;
     }
-    function syntheticNoReply(uuid: string, model = '<synthetic>'): TranscriptEvent {
+    function syntheticNoReply(uuid: string, model = '<synthetic>', timestamp?: string): TranscriptEvent {
       return {
-        type: 'assistant', uuid, isApiErrorMessage: false,
+        type: 'assistant', uuid, timestamp, isApiErrorMessage: false,
         message: { role: 'assistant', model, stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'No response requested.' }] },
       } as TranscriptEvent;
     }
@@ -794,10 +794,40 @@ describe('BridgeTurnQueue', () => {
       } as TranscriptEvent, turnDurationMarker('d0')]);
       q.drainEmittable({ explicitTerminalOnly: true });
       q.mark('t1');
-      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1')]);
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', '<synthetic>', '2026-11-13T11:08:01.000Z')]);
       const [failed] = q.drainEmittable();
       expect(failed.terminalOutcome).toEqual({ status: 'failed', errorCode: 'provider_no_model_reply', retryable: true });
       expect(failed.terminalProviderLastSuccessAtMs).toBe(Date.parse('2026-11-13T11:07:58.000Z'));
+    });
+
+    it('does not credit a synthetic local tool call as the last answered request', () => {
+      const q = new BridgeTurnQueue();
+      const lastRealReplyAt = Date.parse('2026-11-24T08:00:10.000Z');
+      q.mark('t0');
+      q.ingest([user('u0'), {
+        type: 'assistant', uuid: 'real-reply', timestamp: '2026-11-24T08:00:10.000Z',
+        message: { role: 'assistant', model: 'claude-opus-4-8', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] },
+      } as TranscriptEvent, turnDurationMarker('d0')]);
+      q.drainEmittable({ explicitTerminalOnly: true });
+
+      q.mark('t1');
+      const attributed: string[] = [];
+      q.ingest([user('u1'), {
+        type: 'assistant', uuid: 'synthetic-tool', timestamp: '2026-11-24T09:00:00.000Z', isApiErrorMessage: false,
+        message: {
+          role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence',
+          content: [{ type: 'tool_use', id: 'local-read', name: 'Read', input: { file_path: '/a' } }],
+        },
+      } as TranscriptEvent, {
+        ...apiErrorLine('api-error'), timestamp: '2026-11-24T09:00:10.000Z',
+      }, turnDurationMarker('d1')], undefined, ev => attributed.push(ev.uuid!));
+      const [failed] = q.drainEmittable({ explicitTerminalOnly: true });
+      // Skipping provider-success accounting must not skip ordinary attribution.
+      expect(attributed).toContain('synthetic-tool');
+      expect(failed.terminalOutcome).toEqual({
+        status: 'failed', errorCode: 'provider_server_error', retryable: true,
+      });
+      expect(failed.terminalProviderLastSuccessAtMs).toBe(lastRealReplyAt);
     });
 
     it('control: the same record served by a real model is the completed reply', () => {
