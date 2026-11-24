@@ -44,12 +44,19 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-skills', LEGACY],
   ['/api/bot-sandbox-network-policy', LEGACY],
   ['/api/bot-lark-tool-binding', LEGACY],
+  ['/api/bot-lark-user-owner-fallback', LEGACY],
+  ['/api/bot-task-routing', LEGACY],
 ];
 
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
 type Case = readonly [string, string, number, unknown, Record<string, unknown>?];
+const followInclude = { field: 'description', op: 'contains', pattern: 'alarm group' };
+const followExclude = { field: 'name', op: 'contains', pattern: '[已关单]' };
+const followConfig = { enabled: true, includeRules: [followInclude], excludeRules: [followExclude] };
 const CASES: readonly Case[] = [
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true,"excludeChatIds":["oc_skip"]}}', 200, { ok: true, ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }, { ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }],
+  ['/api/bot-owner-group-follow', JSON.stringify({ ownerGroupFollow: { ...followConfig, includeRules: [followInclude, { ...followInclude, caseSensitive: false }] } }), 200, { ok: true, ownerGroupFollow: followConfig }, { ownerGroupFollow: followConfig }],
+  ['/api/bot-owner-group-follow', JSON.stringify({ ownerGroupFollow: { excludeRules: [{ field: 'any', op: 'regex', pattern: '(a|aa)+' }] } }), 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}', 200, { ok: true, ownerGroupFollow: null }, { ownerGroupFollow: undefined }],
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":"true"}}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"excludeChatIds":["ou_other"]}}', 400, { ok: false, error: 'invalid_json' }],
@@ -62,11 +69,11 @@ const CASES: readonly Case[] = [
   ['/api/bot-topic-unavailable-policy', '[]', 400, { ok: false, error: 'invalid_topic_unavailable_policy' }],
   // Zero injection forces transcript delivery; the response carries the effective value.
   ['/api/bot-prompt-injection', '{"promptInjection":"none"}', 200, { ok: true, promptInjection: 'none', replyDelivery: 'transcript' }, { promptInjection: 'none' }],
-  // Leaving zero injection falls back to the CLI default (claude-code: transcript).
-  ['/api/bot-prompt-injection', '{"promptInjection":"default"}', 200, { ok: true, promptInjection: 'default', replyDelivery: 'transcript' }, { promptInjection: 'default' }],
+  // Leaving zero injection falls back to the CLI default (claude-code: send).
+  ['/api/bot-prompt-injection', '{"promptInjection":"default"}', 200, { ok: true, promptInjection: 'default', replyDelivery: 'send' }, { promptInjection: 'default' }],
   ['/api/bot-prompt-injection', '{"promptInjection":"x"}', 400, { ok: false, error: 'invalid_prompt_injection' }],
-  ['/api/bot-reply-delivery', '{"replyDelivery":"transcript"}', 200, { ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'transcript' }, { replyDelivery: 'transcript' }],
-  ['/api/bot-reply-delivery', '{"replyDelivery":"send"}', 200, { ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' }, { replyDelivery: 'send' }],
+  ['/api/bot-reply-delivery', '{"replyDelivery":"transcript"}', 200, { ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'send' }, { replyDelivery: 'transcript' }],
+  ['/api/bot-reply-delivery', '{"replyDelivery":"send"}', 200, { ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' }, { replyDelivery: 'send' }],
   ['/api/bot-skill-injection', '{"skillInjection":"global"}', 200, { ok: true, skillInjection: 'global' }, { skillInjection: 'global' }],
   ['/api/bot-skill-injection', '{"skillInjection":"zz"}', 200, { ok: true, skillInjection: null }, { skillInjection: undefined }],
   ['/api/bot-startup-commands', '{"startupCommands":"/effort high, /foo"}', 200, { ok: true, startupCommands: '/effort high\n/foo' }, { startupCommands: ['/effort high', '/foo'] }],
@@ -158,6 +165,22 @@ const CASES: readonly Case[] = [
   ['/api/bot-lark-tool-binding', 'null', 400, { ok: false, error: 'no_valid_fields' }],
   ['/api/bot-lark-tool-binding', '[]', 400, { ok: false, error: 'no_valid_fields' }],
   ['/api/bot-lark-tool-binding', '"not_an_object"', 400, { ok: false, error: 'no_valid_fields' }],
+  // Default on: only an explicit off is stored.
+  ['/api/bot-lark-user-owner-fallback', '{"enabled":false}', 200, { ok: true, larkUserOwnerFallback: false }, { larkUserOwnerFallback: false }],
+  ['/api/bot-lark-user-owner-fallback', '{"enabled":true}', 200, { ok: true, larkUserOwnerFallback: true }, { larkUserOwnerFallback: undefined }],
+  ['/api/bot-lark-user-owner-fallback', '{"larkUserOwnerFallback":false}', 200, { ok: true, larkUserOwnerFallback: false }, { larkUserOwnerFallback: false }],
+  ['/api/bot-lark-user-owner-fallback', '{"enabled":true,"larkUserOwnerFallback":false}', 400, { ok: false, error: 'no_valid_fields' }],
+  ['/api/bot-lark-user-owner-fallback', '{"enabled":"off"}', 400, { ok: false, error: 'no_valid_fields' }],
+  ['/api/bot-lark-user-owner-fallback', 'null', 400, { ok: false, error: 'no_valid_fields' }],
+  ['/api/bot-task-routing', '{"taskRouting":{"enabled":true,"costTier":"low","strengths":"小修和文案","limitations":"不做大重构"}}', 200, {
+    ok: true,
+    taskRouting: { enabled: true, costTier: 'low', strengths: '小修和文案', limitations: '不做大重构' },
+  }, {
+    taskRouting: { enabled: true, costTier: 'low', strengths: '小修和文案', limitations: '不做大重构' },
+  }],
+  ['/api/bot-task-routing', '{"taskRouting":{"enabled":false}}', 200, { ok: true, taskRouting: null }, { taskRouting: undefined }],
+  ['/api/bot-task-routing', '{"taskRouting":null}', 200, { ok: true, taskRouting: null }, { taskRouting: undefined }],
+  ['/api/bot-task-routing', '{"taskRouting":{"enabled":true,"costTier":"ultra"}}', 400, { ok: false }],
 ];
 
 describe('config-field PUT routes (botConfigPutRoute)', () => {

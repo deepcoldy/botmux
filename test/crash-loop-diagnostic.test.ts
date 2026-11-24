@@ -223,6 +223,21 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { code: 0, before: 'idle', after: 'idle' },
+    { code: 0, before: 'working', after: 'interrupted' },
+    { code: 0, before: 'starting', after: 'interrupted' },
+    { code: 1, before: 'idle', after: 'interrupted' },
+    { code: 1, before: 'working', after: 'interrupted' },
+  ] as const)('projects exit $code after $before as $after without inventing an active task', async ({ code, before, after }) => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-exit-projection', worker);
+    ds.lastScreenStatus = before;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    await crashTimes(worker, 1, false, code);
+    expect(ds.lastScreenStatus).toBe(after);
+  });
+
   it('after >3 tmux crashes: keeps the worker + marks lazy cold-resume (survives restart)', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs('sid-diag-keep', worker);
@@ -234,13 +249,13 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     // diagnostic shell (deferred park) and keeps it alive (no close).
     // auto-restart 捎带最新 per-bot env、模型、两个鉴权配置和 replyDelivery；本 fixture 未配置
     // env/model/triggerUserAuth，均以 null 明确清空，larkToolBinding 默认开启为 true；
-    // replyDelivery 未配 → 按 claude-code 缺省 transcript。
+    // replyDelivery 未配 → 按 claude-code 缺省 send。
     // 并标记 reason: 'cli_crash' 区分 operator 主动 restart；经 restart coordinator 发出，
     // 必带 attemptId（#1863：只有关联回执能放开 workerReady 栅栏）。
     expect(worker.send).toHaveBeenCalledWith({
       type: 'restart', attemptId: expect.any(String), reason: 'cli_crash',
       env: null, envUnset: null, envFingerprint: expect.any(String), model: null, larkToolBinding: true,
-      replyDelivery: 'transcript',
+      replyDelivery: 'send',
       triggerUserAuth: null,
       codexRpcInput: false, traexAutoModel: null, startupCommands: null, launchShell: null,
       statuslineLaunchGen: expect.any(String),
@@ -279,7 +294,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     const message = worker.send.mock.calls.map((c: any[]) => c[0]).find((m: any) => m.type === 'message');
     expect(message?.model).toBe('opus');
-    expect(message?.replyDelivery).toBe('transcript');
+    expect(message?.replyDelivery).toBe('send');
     // Same for the startup commands / shell edited while parked (the recovery
     // spawn replays them).
     expect(message?.startupCommands).toEqual(['/effort xhigh']);

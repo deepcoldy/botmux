@@ -22,7 +22,8 @@ const chatLinks = [
   { kind: 'chat', ref: 'oc_release', text: '发版群', url: 'https://example.test/chat/oc_release', chatCheck: 'verified' },
 ];
 const steward = { enabled: true, ready: true, chatId: 'oc_steward' };
-const counts = { decide: 0, active: 2, all: 2 };
+// 计数取得大一些：四个标签带四五位数时标签栏最宽，最能把整页撑出侧栏（真实看板用久了全部能到几百上千）。
+const counts = { decide: 1234, active: 5678, all: 99999 };
 const LIST = {
   ok: true, view: 'all', steward, counts, drafts: [], batches: [],
   items: [LONG_SEQ, SHORT_SEQ].map(seq => ({
@@ -74,7 +75,7 @@ describe('decision board: a long free-text stage never squeezes the title', () =
           const seq = Number(new URLSearchParams(location.search).get('seq'));
           createRoot(document.getElementById('root')).render(seq
             ? <ItemDetailView appId="${APP}" seq={seq} />
-            : <BoardSummaryView route={{ appId: '${APP}', view: 'all' }} />);
+            : <BoardSummaryView route={{ appId: '${APP}', view: new URLSearchParams(location.search).get('view') ?? 'all' }} />);
         `,
       },
       bundle: true,
@@ -172,6 +173,26 @@ describe('decision board: a long free-text stage never squeezes the title', () =
       if (long.chip.truncated && long.chip.title !== long.chip.text) failures.push(`${width}: truncated chip has no full-text title (${long.chip.title})`);
       if (short.chip.truncated) failures.push(`${width}: short stage chip is truncated`);
       await page.close();
+    }
+    expect(failures).toEqual([]);
+  });
+
+  it('summary page: the four tabs and the overview stay inside the page at Feishu sidebar widths', async () => {
+    const failures: string[] = [];
+    for (const width of [350, 375]) {
+      for (const view of ['all', 'overview']) {
+        await open(width, `?view=${view}`, view === 'overview' ? '.dboard-ov-row >> nth=0' : 'a.dboard-row >> nth=0');
+        const over = await page.evaluate(() => {
+          const pageBox = document.querySelector('.dboard-page')!.getBoundingClientRect();
+          // 标签栏自己横向滚动：里面的标签超出栏宽是被裁掉的，不算撑出页面。
+          return Array.from(document.querySelectorAll('.dboard-page *'))
+            .filter(el => !el.closest('.dboard-tabs > *') && el.getBoundingClientRect().right > pageBox.right + 0.5)
+            .map(el => `${el.tagName.toLowerCase()}.${Array.from(el.classList).join('.')}`)
+            .concat(pageBox.right > window.innerWidth - 16 + 0.5 ? [`page right ${pageBox.right}`] : []);
+        });
+        if (over.length) failures.push(`${width} ${view}: ${[...new Set(over)].slice(0, 5).join(', ')}`);
+        await page.close();
+      }
     }
     expect(failures).toEqual([]);
   });

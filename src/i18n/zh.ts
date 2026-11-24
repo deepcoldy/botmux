@@ -207,6 +207,17 @@ export const messages: Record<string, string> = {
   'worker.agy_rotate.settle_failed': '⚠️ 已切换至 Antigravity 账号 {toAccount} 并重启会话，但重启后的状态落盘失败，自动重发未执行；请检查会话后重试。',
   'worker.agy_rotate.replay_uncertain': '⚠️ Antigravity 账号 {toAccount} 的自动重发结果不确定，输入可能已被执行。请先检查 Web Terminal，不要直接重发。',
   'worker.agy_rotate.stop_cancelled': '🛑 已取消本轮账号轮换后的自动重发（会话切号重启完成后不会重放原消息）。',
+  'worker.quota_chain.switched': '🔄 {from} 触发额度限制，本会话已切换到 {to}，继续处理上一条请求。',
+  'worker.quota_chain.switch_failed': '⚠️ {from} 触发额度限制，切换到 {to} 失败，请重发上一条请求。',
+  'worker.quota_chain.handoff_prompt': '[Botmux 额度切换交接] 这个会话原来由 {from} 处理，它的额度用完了，现在换你（{to}）接着做。你没有之前的对话记忆，先按下面的步骤把上一个 Agent 的会话读一遍，再从它停下的地方继续。',
+  'worker.quota_chain.handoff_transcript': '1. 读上一个 Agent 的会话记录：{path}\n   这是它的原始会话文件。从后往前读，弄清楚三件事：用户最近要它做什么；它已经做完了哪些步骤（改了哪些文件、跑了哪些命令、结果如何）；它停在哪一步、接下来打算做什么。文件很大时先读最后一部分，不够再往前翻；读不到这个文件就跳过这一步。',
+  'worker.quota_chain.handoff_no_transcript': '1. 上一个 Agent 的会话记录没找到，以下面的话题记录和工作目录为准。',
+  'worker.quota_chain.handoff_history': '2. 运行 `botmux history` 看本话题的聊天记录，补上用户在飞书里提过的要求和已经回复过的内容。',
+  'worker.quota_chain.handoff_check': '3. 看工作目录现状（例如 git status、git diff），核对它实际改到了哪里。\n4. 从它停下的地方继续。已经成功的操作（改过的文件、发出的消息、建好的单子）不要重复做；做完照常在话题里回复。',
+  'worker.quota_chain.continue_prompt': '[Botmux 额度切换] {from} 的额度已用完，本会话已切换到 {to}。请继续完成上一条请求；上一个模型可能已经做了一部分，先检查当前状态，已经成功的操作不要重复执行。',
+  'worker.quota_chain.request_label': '被打断的请求原文：',
+  'worker.quota_chain.retrying': '⏳ {from} 被限流，先在原 CLI 上自动重试（最多 {max} 次），仍不行再切换到 {to}。',
+  'worker.quota_chain.reset_unknown': '恢复时间未知',
   'worker.traex_auto_model.catalog_prune': '⚠️ 实时完整目录已确认以下模型在当前 TraeX 入口不可用：{models}。即将永久删除它们在自动模型池中的条目及独立设置；其余模型和原会话历史保留。',
   'worker.traex_auto_model.catalog_switch': '↪️ {fromModel} 已不在当前可用目录中，正在使用白名单内的 {toModel} 续接原会话；不保证免排队，也不会重新发送原始任务。',
   'worker.traex_auto_model.catalog_empty': '⚠️ 自动模型池已没有可用模型，已停止选模。请前往控制台重新配置模型池；不会使用池外模型或清空原会话。',
@@ -907,6 +918,14 @@ export const messages: Record<string, string> = {
   'auth_link.request_dm_agent': '授权链接已由 botmux 私聊发给本轮发起人，结果里不含链接。不要在群里贴任何授权链接，只需在群里告诉用户去和机器人的私聊里点开授权；然后运行 botmux auth wait --request-id <requestId> --json。',
   'auth_link.request_ephemeral_agent': '授权链接已由 botmux 发到本群主界面，仅本轮发起人可见，结果里不含链接。请用户在群聊主界面打开授权卡；不要在群里贴任何授权链接。然后运行 botmux auth wait --request-id <requestId> --json。',
   'auth_link.request_dm_failed_agent': '私聊和群内仅本人可见授权卡片均发送失败。不要在群里贴任何授权链接。请提示用户主动申请本应用的使用权限，申请通过后回到原会话重试授权。应用使用权限与个人 OAuth 授权是两回事，仍需完成个人授权并回查结果。',
+  'auth_link.owner_fallback_dm_title': '🔐 你的机器人在一个没有真人发起的回合里（脚本、Webhook、平台、定时任务等）需要以你（bot 主人）的飞书身份调用 lark-cli，点开下面的链接确认（只发给你本人，请勿转发）：',
+  'auth_link.owner_fallback_dm_agent': '本轮没有真人发起，--as user 用的是 bot 主人的授权：授权链接已由 botmux 私聊发给 bot 主人，结果里不含链接。不要在群里贴任何授权链接，也不要让任何人到群里发消息；然后运行 botmux auth wait --request-id <requestId> --json 等主人授权，等不到就如实报告需要 bot 主人授权后重试。',
+  'auth_link.owner_fallback_ephemeral_agent': '本轮没有真人发起，--as user 用的是 bot 主人的授权：私聊发不出去，授权卡已发到本群主界面、仅 bot 主人可见，结果里不含链接。不要在群里贴任何授权链接，也不要让任何人到群里发消息；然后运行 botmux auth wait --request-id <requestId> --json 等主人授权。',
+  'auth_link.owner_fallback_dm_failed_agent': '本轮没有真人发起，--as user 用的是 bot 主人的授权，但给主人的私聊和群内仅主人可见授权卡都没发出去。不要在群里贴任何授权链接，也不要让别人代为授权；如实报告需要 bot 主人先和机器人私聊完成授权后再重试。',
+  'auth_scope_missing.plain': '授权未完成：飞书发回的授权缺少以下权限：{scopes}。本次没有保存这份授权。',
+  'auth_scope_missing.in_review': '授权未完成：飞书发回的授权缺少以下权限：{scopes}。应用新版本 {version} 正在企业审核，新申请的权限要等审核通过后才生效，请审核通过后再授权/重试（审批进度可在飞书「审批」里查看）。审核期间重复发起授权拿不到这些权限。',
+  'auth_scope_missing.in_review_no_version': '授权未完成：飞书发回的授权缺少以下权限：{scopes}。应用的新版本正在企业审核，新申请的权限要等审核通过后才生效，请审核通过后再授权/重试（审批进度可在飞书「审批」里查看）。审核期间重复发起授权拿不到这些权限。',
+  'auth_scope_missing.not_in_review_version': '其中 {scopes} 不在这个待审版本里，审核通过后也拿不到，需另在开放平台为应用开通。',
   'auth_link.sent_privately': '🔐 授权链接已私聊发给你，请在和我的私聊里打开。授权链接只发给发起人本人，不会贴在群里。',
   'auth_link.sent_ephemeral': '🔐 我没法私聊你，授权链接已作为只有你能看到的卡片发在本群（群聊主界面），其他人看不到。授权链接不会贴在群里。',
   'auth_link.dm_failed': '🔐 私聊和群内仅本人可见授权卡片均发送失败，授权链接不会公开贴在群里。请你主动申请本应用的使用权限，申请通过后回到原会话用 {command} 重试授权。取得应用使用权限后，仍需完成本次个人授权。',
@@ -917,6 +936,8 @@ export const messages: Record<string, string> = {
   'provider_auth.ready_bytedcli_already': 'botmux: ByteCloud 已经授权，不需要再登录，可以直接执行命令。',
   'provider_auth.ready_bytedcli_now': 'botmux: ByteCloud 已授权并对本轮生效，命令未执行。请直接重试刚才的命令，不用让用户再发消息。',
   'provider_auth.ready_bytedcli': 'botmux: ByteCloud 已授权，但本轮开始时还没有，本轮用不上，命令未执行。请发起人再发一条消息，下一轮即可使用。',
+  'provider_auth.ready_bytedcli_unavailable': 'botmux: ByteCloud 授权服务暂时不可用，暂时无法为本轮签发凭据，命令未执行。已有授权会保留，请不要重复登录，稍后重试。',
+  'provider_auth.ready_bytedcli_superseded': 'botmux: ByteCloud 授权接管因本轮策略或身份状态变化而中止，命令未执行。请重试以按最新策略检查；不要假设本轮或下一轮已经获得本次登录的凭据。',
   'provider_auth.delivered_inline': 'botmux: {provider} 需要你本人授权，授权链接已由 botmux 发在这个私聊里，命令未执行。不要转述链接；等用户授权后重试即可。',
   'provider_auth.delivered_dm': 'botmux: {provider} 需要本轮发起人本人授权，授权链接已由 botmux 私聊发给 TA，群里也已提示，命令未执行。不要索要或转述链接；等 TA 授权后重试即可。',
   'provider_auth.delivered_ephemeral': 'botmux: {provider} 需要本轮发起人本人授权。私聊发不出去，授权链接已作为只有 TA 能看到的卡片发在本群，群里也已提示，命令未执行。不要索要或转述链接；等 TA 授权后重试即可。',
@@ -942,7 +963,7 @@ export const messages: Record<string, string> = {
   'cmd.login.step2_auto_fallback': '   若浏览器停在报错页（回调地址暂时不可达），把地址栏里那条完整网址发回本话题也能完成。',
   'cmd.login.step2': '2. 授权后浏览器会跳到一个「打不开 / 无法访问此网站（ERR_CONNECTION_REFUSED）」的页面——这是正常的（回调地址是本机 127.0.0.1，daemon 在远端故连不上）',
   'cmd.login.step3': '3. 复制地址栏里那条 http://127.0.0.1:9768/callback?code=... 的完整网址，发回本话题即可。\n   ⚠️ 若地址栏看不到（被页面拦截 / 没跳转）：按 F12 开控制台 → Network（网络）→ 勾 All（全部）→ 再点「授权」→ 找到对 127.0.0.1:9768 的那条请求 → 右键 Copy → Copy URL，发回本话题。\n   本机也运行着 BotMux 时，浏览器会显示「这条授权不是本机 BotMux 发起的」，照样把网址发回本话题即可。',
-  'cmd.login.footer': '授权后可下载第三方卡片中的图片等资源。',
+  'cmd.login.footer': '授权后可读取消息。需要下载图片/文件时，另外发送 /login --scope im:resource 单独授权。',
   'cmd.login.status_hint': '查看状态：/login status',
   'cmd.subdoc.no_session': '⚠️ /subscribe-lark-doc 需要在一个活跃会话里用：先在本话题正常发起会话，再订阅文档。',
   'cmd.subdoc.usage': '用法：\n• /subscribe-lark-doc <飞书文档链接> — 调用飞书 API 订阅该文档，并绑定当前会话\n• /subscribe-lark-doc list — 查看本会话已订阅的文档\n• /subscribe-lark-doc off — 退订本会话所有文档',
@@ -1178,6 +1199,7 @@ export const messages: Record<string, string> = {
   'config.label.p2pOpen': '私聊全开',
   'config.label.grantRequestToOwnerDm': '申请卡转投私聊',
   'config.label.trustSameOwnerBots': '信任同 owner 的同机 Bot',
+  'config.label.larkUserOwnerFallback': '没有发起人时用主人的飞书身份',
   'card.config.note': '🟢=开 ⚪=关，点一下即切换并刷新（model/cli 下个新会话起效）。语言：`/botconfig zh`｜`/botconfig en`。\n更多字段点「✏️ 文本设置」；allowedUsers / oncall 用 `/botconfig help`。',
   'card.config.text_btn': '✏️ 文本设置',
   'card.config.text_title': '✏️ {name} · 文本设置',
@@ -1278,6 +1300,11 @@ export const messages: Record<string, string> = {
   'cmd.fork.wrong_bot': '⚠️ fork 只能把当前会话复制给**当前这个机器人**（分身要跑同一个 CLI）。不用 @ 别的机器人；直接 `/fork --create <新群名>` 即可，会默认用当前机器人。',
   'cmd.fork.unsupported_backend': 'ℹ️ 当前 {cli} 会话尚未接入 Botmux fork（已支持 Claude 系、Grok、Antigravity，以及 Codex / TraeX 终端模式；Codex App、RPC 和纯远端会话暂不支持）。',
   'cmd.fork.mid_turn': '⚠️ 会话正在处理中（mid-turn），无法 fork。请等它空闲（idle）后再发 /fork。',
+  'cmd.fork.queued': '已排队。原会话空闲后会自动执行 /fork。BotMux 重启后需重新发送。',
+  'cmd.fork.topic_pending': '分支会话还在准备中。请等执行卡片出现后再发。',
+  'cmd.fork.session_group_topic_root': '⚠️ 请在专属群顶层直接发送 /fork，不要引用其他消息或在已有话题内发送。',
+  'cmd.fork.source_changed': '等待期间源会话已切换。本次 /fork 已取消。',
+  'cmd.fork.source_check_failed': '无法确认原 /fork 指令仍可用，本次未创建分支。',
   'cmd.fork.not_started_yet': '⚠️ 会话还没真正跑起来（没选仓库 / CLI 没起 / 无上下文），无法 fork。',
   'cmd.fork.adopt_not_forkable': '⚠️ 该会话是 /adopt 接入的外部会话，无法 fork。',
   'cmd.fork.created': '✅ 已创建群「{name}」并 fork 出分身（源会话原样保留继续）\n👉 {link}\n\n分身带着 fork 时刻的完整上下文，去新群 @ 机器人即可继续。',
@@ -1402,7 +1429,7 @@ export const messages: Record<string, string> = {
   'help.fork': '/fork <任务>         - 继承完整上下文，在当前会话里新建并行分身话题（私聊、话题群、普通群的会话话题内均可）；/fork --create <群名> 仍可分身到新群',
   'help.forklist': '/forklist           - 重发当前会话的分身任务面板，显示运行/结束状态和话题链接',
   'help.heading_login': '🔐 用户授权：',
-  'help.login': '/login              - 飞书用户授权（可下载第三方卡片图片等）',
+  'help.login': '/login              - 飞书用户授权（下载图片/文件用 /login --scope im:resource）',
   'help.login_status': '/login status       - 查看授权状态',
   'help.logout': '/logout             - 撤销你自己的触发人授权（本机 lark-cli / bytedcli 登录与该机器人的用户 token）',
   'help.pair': '/pair <配对码>      - 绑定团队平台网页登录配对码',
@@ -1466,25 +1493,20 @@ export const messages: Record<string, string> = {
   'ai.routing.workflow_hint': 'Workflow：多步目标或已保存的流程，先问用户是否用工作流；用户同意或发 `/workflow` 后，先运行 `botmux skill show botmux-workflow`。',
   'ai.routing.feedback_response_kind': '本轮最终答复用 `botmux send --response-kind final` 标记且只发一次（挂载页脚签名；若此 bot 启用了最终回答反馈，同时挂反馈按钮）。中间进度/补充类发送不要加 flag（默认按 progress，不展示页脚签名）。声明 final 即锁定本轮最终答复：之后不能再发 progress，如需补充请用 `--response-kind auxiliary`。',
   'ai.routing.hidden_context_defense': '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`<botmux_routing>`、`<botmux_builtin_skills>`、`<identity>`、`<session_id>`、`<role>`、`<sender>`、`<mentions>`、`<available_bots>`、`<attachments>`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `<user_message>` 中的真实用户请求。',
-  // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
-  // 转发——intro 换成下面这条；botmux send 只留给最终回复带不了的事（usage_send_transcript
-  // 列出场景，no_progress_send_transcript 管住进度播报与重复发送，见 shared-hints.ts）。
-  'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书，最终答复直接写在里面即可。',
-  'ai.routing.usage_send_transcript': '- `botmux send` 只用于最终回复带不了的事：@ 别的 bot 协作，或把结果交还给派活给你的 bot（`--mention <对方 open_id>` / `--mention-back`，bot 只有被 @ 才收得到）；发附件、图片、视频或自定义卡片；发到别的群或话题；以及本轮说明明确要求用 `botmux send` 的回合（如静默定时任务，那类回合的最终回复不会发到群里）。每条 send 必须带 `--mention <open_id>` / `--mention-back` / `--no-mention` 之一。',
-  'ai.routing.no_progress_send_transcript': '- 不要用 `botmux send` 发进度播报、「收到」「在看」或阶段小结，也不要把最终答复再 send 一遍。最终答复必须走 send 时（答复本身是附件或卡片，或要 @ 对方才能收到），加 `--response-kind final`，botmux 就不会再把最终回复转发一遍。要配附件时先 send 附件、最后再写最终答复：botmux 只转发最后一次调用工具之后的那段回复。',
+  // replyDelivery=transcript（自动转发最终回复，core/reply-delivery.ts）：最终回复由
+  // daemon 从会话记录自动转发，常驻路由提示不再追加额外的 botmux send 规则——intro
+  // 换成下面这条，usage_* 只留 helpers / ask_wait / silence（多 bot 协作规则留在
+  // <identity>，附件/卡片/跨群等用法留在内置 botmux-send skill 按需查阅，见 shared-hints.ts）。
+  'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书，直接作答即可。',
   'ai.send.after_success_hint': '最终答复已成功发送。若原任务已完成或已交代具体阻碍，可让终端最终回复只输出 BOTMUX_NOTHING_TO_SEND，勿重复发送；后续补充使用 botmux send --response-kind auxiliary。',
   'ai.send.after_success_steer_advanced': '本次发送已完成。会话已自动切换至下一排队轮次；请针对新消息使用 `botmux send --response-kind final` 发送完整答复（若无需回复则输出 BOTMUX_NOTHING_TO_SEND）。',
   // 本轮发送走统一回复卡片（unified reply）时的成功回显——此时内容已进卡片，
   // 提示模型完成时用 --response-kind final 发完整答复。
   'ai.send.after_success_progress': '进度消息已发送（未标记 final）。若这条已是对原请求的完整答复，直接让最终回复只输出 BOTMUX_NOTHING_TO_SEND，不要再发总结或重复内容；若只是确认、阶段进度或任务尚未完成，继续原任务，完成或受阻时用 botmux send --response-kind final 交付结果或具体阻碍。',
   'ai.send.after_success_auxiliary': '补充消息已发送。请核对原任务的最终答复是否已成功交付；补充消息本身不证明原任务完成，已交付的内容不要重复发送。',
-  // replyDelivery=transcript 会话的发送回显（REPLY_DELIVERY_ENV=transcript，见
-  // send-completion-hint.ts）：最终回复由 botmux 自动转发，回显不再催模型
-  // `--response-kind final`，而是把它引回最终回复、劝它别用 send 发进度。
-  'ai.send.after_success_progress_transcript': '消息已发送。本会话的最终回复会由 botmux 自动发回飞书：任务完成后直接把完整答复写在最终回复里，不用再 botmux send；进度和阶段小结也不必 send。若刚发的这条已经是完整答复，最终回复只输出 BOTMUX_NOTHING_TO_SEND，避免重复。静默定时任务例外：那类回合的最终回复不会发到群里，要交代的结论都用 botmux send 发出。',
-  'ai.send.after_success_unified_transcript': '进度已更新到本轮卡片。本会话的最终回复会由 botmux 自动发回飞书，完成后直接把完整答复写在最终回复里即可，不必再 send 进度。',
-  'ai.send.after_success_auxiliary_transcript': '补充消息已发送。本会话的最终回复会由 botmux 自动发回飞书；补充消息不代表任务完成，已发出的内容不要在最终回复里重复。',
-  'ai.send.after_success_steer_advanced_transcript': '本次发送已完成。会话已自动切换至下一排队轮次；请针对新消息直接在最终回复里作答（botmux 会自动发回），若无需回复则只输出 BOTMUX_NOTHING_TO_SEND。',
+  // replyDelivery=transcript（自动转发最终回复）仅在排队轮次自动推进时给出事实通知；
+  // 普通 botmux send 成功只打印基础回执，不附加额外劝说（见 send-completion-hint.ts）。
+  'ai.send.after_success_steer_advanced_transcript': '本次发送已完成。会话已自动切换至下一排队轮次，请继续处理新消息（若无需回复则只输出 BOTMUX_NOTHING_TO_SEND）。',
   'ai.send.after_success_unified': '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。',
   'ai.routing.xpi_as_hint': 'XPI 已开启：向其他 Bot 发送普通文本时必须预先声明处理方式。马上单独做用 `botmux send --as independent`；留给当前任务、等对方确认用 `--as suggestion`。',
   'ai.shell.xpi_as_hint': 'XPI 已开启：向其他 Bot 发送普通文本必须携带处理方式。马上单独做：`botmux send --as independent`；留给当前任务：`botmux send --as suggestion`。',
@@ -1529,7 +1551,7 @@ export const messages: Record<string, string> = {
   'ai.identity.rule_own_part': '- 只做分给自己的部分，不抢别的 bot 的活',
   'ai.identity.rule_silent_when_other': '- 整条消息都指派给别的 bot 时保持沉默',
   'ai.identity.rule_no_proactive_pull': '- 默认不拉别的 bot 进来，除非用户明确要求',
-  'ai.identity.mention_must': '- 跟别的 bot 协作必须 `botmux send --mention <对方 open_id>`，否则对方收不到',
+  'ai.identity.mention_must': '- 跟别的 bot 协作（回复或 @ 别的 bot）必须 `botmux send --mention <对方 open_id>`（回复触发本轮的 bot 也可用 `--mention-back`），否则对方收不到',
 
   // ─── AI hints（非注入式 CLI 的 BOTMUX_SHELL_HINTS；multiline_heredoc /
   // heredoc_example 同时被 system-prompt 路径复用——两个 locale 保持一致）──
@@ -1541,19 +1563,20 @@ export const messages: Record<string, string> = {
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
   'ai.shell.when_to_send': '对于需要回复的请求，必须通过 Bash 执行 botmux send --response-kind final 交付完整结果或具体阻碍，并核验发送成功后再结束；查询完成或只发进度不算交付。已成功交付不要重复发送。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
   'ai.shell.no_visible_output_ok': '只有最终答复已通过 botmux send --response-kind final 成功交付（退出码 0），才可无终端正文地结束；progress 发送成功不代表任务完成。不要因“无输出”提示重发已交付的答案；发送结果未知先核对，不能直接当作成功或失败。',
-  // replyDelivery=transcript 的 shell-hints 变体：intro / when_to_send 改口，send_scope
-  // 把 botmux send 限定在最终回复带不了的场景（how_to_send / mention_gate /
-  // feedback 等 send 模式专属的长段不注入，见 shared-hints.ts）。
+  // replyDelivery=transcript（自动转发最终回复）的 shell-hints 变体：只用 intro /
+  // when_to_send 两条改口版 + helpers；有原生 skill 通道时不再额外塞 botmux send
+  // 提示（多 bot 协作在 <identity>，附件/卡片/跨群在 botmux-send skill 按需查）；
+  // 无通道时另加一段最小 send 操作说明，避免附件参数与硬门/防双发规则断供。
   'ai.shell.intro_transcript': '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书。',
-  'ai.shell.send_scope_transcript': 'botmux send 只用于最终回复带不了的事：@ 别的 bot 协作，或把结果交还给派活给你的 bot（`--mention <对方 open_id>` / `--mention-back`，bot 只有被 @ 才收得到）；发附件（`--images` / `--files` / `--videos`）或自定义卡片；发到别的群或话题；以及本轮说明明确要求用 botmux send 的回合（如静默定时任务，那类回合的最终回复不会发到群里）。每条 send 必须带 `--mention <open_id>` / `--mention-back` / `--no-mention` 之一。不要用它发进度播报、「收到」「在看」或阶段小结，也不要把最终答复再 send 一遍；最终答复必须走 send 时加 `--response-kind final`，botmux 就不会再把最终回复转发一遍。要配附件时先 send 附件、最后再写最终答复：botmux 只转发最后一次调用工具之后的那段回复。',
   'ai.shell.when_to_send_transcript': '发给你的消息直接在最终 assistant message 里作答即可,别沉默。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
+  'ai.shell.send_without_skill_transcript': '此 CLI 没有原生 skill 通道。需要主动发消息、协作、发送附件/卡片或跨群发布时，用 Bash 执行 `botmux send`；完整用法可运行 `botmux skill show botmux-send`。附件用 `--images` / `--files` / `--videos`，多行正文用 quoted heredoc/stdin 或 UTF-8 `--content-file`。每条 send 必须三选一：`--mention <open_id:名字>` / `--mention-back` / `--no-mention`；定时等无本轮发送者的回合不要用 --mention-back，也不要从 owner 或历史发送者推断收件人。完整答复若走 send，加 `--response-kind final`；若刚才的普通 send 已交付完整答复，最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`，避免改写后再自动转发一次；只发补充不代表原任务完成。附件/卡片先发送，最终答复写在最后一次工具调用之后，自动转发只采集该尾部文本。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
   'ai.attach.hint': '使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] / [视频 N] 占位符对应',
   'ai.attach.videoHint': '视频已保存到本地。优先用 Read 或当前 CLI 的媒体读取工具读取视频，让支持视频输入的模型理解完整时序；工具或模型不支持时，可按任务需要抽帧或转写，并说明所用方式。',
   'ai.attach.videoHintKimi': '视频已保存到本地。优先用 ReadMediaFile 工具读取视频，让支持视频输入的模型理解完整时序；工具或模型不支持时，可按任务需要抽帧或转写，并说明所用方式。',
-  'ai.identity.short_routing': '提醒：要跟别的 bot 沟通或协作必须 `botmux send --mention <对方 open_id>`，否则对方 bot 不会被触发。',
+  'ai.identity.short_routing': '提醒：回复或 @ 别的 bot 协作必须 `botmux send --mention <对方 open_id>`（回复触发本轮的 bot 也可用 `--mention-back`），否则对方 bot 不会被触发。',
   'ai.available_bots.hint': '要跟这里的某个 bot 沟通或协作必须 --mention 它的 open_id（botmux send --mention ou_xxx ...），不 --mention 对方 bot 完全收不到消息',
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
@@ -1772,6 +1795,7 @@ export const messages: Record<string, string> = {
   'card.click_turn.delivery_failed': '没能把这一轮送进会话',
   'card.click_turn.unavailable': '这个按钮当前不可用',
   'card.next_step.started': '收到并开始执行：{text}',
+  'card.next_step.invalid_prompt': '请输入 1–1000 字的内容后再确认发送。',
   'card.action.stop_sent': '⏹ 已发送停止信号（^C），会话保留',
   'card.action.stop_unsupported': '⚠️ 当前 CLI 模式不支持卡片停止（实验性 RPC 输入），请用 /close 关闭会话',
   'card.action.stop_no_worker': '⚠️ CLI 未运行，无法停止',
@@ -1819,6 +1843,7 @@ export const messages: Record<string, string> = {
   'worker.working_dir_missing_text': '⚠️ 会话的工作目录已不存在：{path}\n这条消息没有送达，CLI 也没有在其它目录运行。可以用 `/cd <路径>` 换到别的目录，或把该目录恢复后重发消息。',
   'worker.working_dir_missing_opening_text': '⚠️ 工作目录不存在：{path}\n这条消息还没有开始处理，CLI 也没有在其它目录运行。在本话题发送 `/repo <路径|项目名>` 选一个目录，消息会在那里开始。',
   'worker.cli_install_changed': '♻️ {cli} 已升级到 {installed}，当前进程还是旧版 {running}，旧进程按需加载的模块会报 Cannot find module。本轮结束后会自动休眠这个会话，下一条消息用新版本冷启动并接着原会话；刚才失败的消息重发即可。',
+  'worker.startup_circuit_stopped': '⚠️ {cliName} 启动失败（退出码 {code}）：启动阶段连续退出，已停止自动重启。挂起的输入已终止；修复安装或配置后，发新消息可重新启动。',
   'worker.crash_loop_stopped': '⚠️ {cliName} 在 1 分钟内崩溃 {count} 次，已停止自动重启。发消息可触发重新启动。',
   'worker.crash_permanent_exit_stopped': '⚠️ {cliName} 因确定性错误退出（退出码 {code}），已停止自动重启——这类失败重启也不会变好（常见原因：身份/凭证缺失、CLI 未安装或路径不可用）。修复后发消息可重新启动。',
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
@@ -2119,7 +2144,7 @@ export const messages: Record<string, string> = {
   'daemon.auto_start_join_seed': '🚀 已加入本群，开始工作…',
   'daemon.cmd_requires_session': '{cmd} 需要在已有会话内使用（先发一条普通消息启动 CLI）。',
   'daemon.cmd_allowed_users_only': '⚠️ {cmd} 是管理命令，仅 allowedUsers 可执行。需要授权请让 owner 把你加入该 Bot 的 allowedUsers（Dashboard 或 bots.json）。',
-  'daemon.download_failed_need_login': '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。',
+  'daemon.download_failed_need_login': '⚠️ 部分图片/文件下载失败（缺少下载图片/文件的用户授权）。请在话题中发送 /login --scope im:resource 授权后重新发送（这项授权可能需要企业管理员审批）。',
   'daemon.prompt_gate_denied': '🚫 本条消息被前置校验拦截，未提交给 CLI。',
   'daemon.prompt_gate_denied_reason': '🚫 本条消息被前置校验拦截，未提交给 CLI：{reason}',
   'daemon.plugin_command_unavailable': '⚠️ 插件指令 {cmd} 暂不可用，请稍后重试或联系 bot 管理员。',
@@ -2167,6 +2192,10 @@ export const messages: Record<string, string> = {
   'daemon.topic_header_effort_unsupported_cli': '当前 CLI（{cli}）没有推理档位开关',
   'daemon.topic_header_effort_unsupported_model': '模型 {model} 不支持推理档位 {effort}',
   'daemon.fast_unsupported_backend': '⚠️ 这个会话的后端下 /fast 切不了 Codex 档位（RPC 输入模式 / Riff 的对话不走终端，按键到不了执行端）。卡片徽标仍会如实反映 Codex 实际运行的档位。',
+  'daemon.antigravity_btw_usage': '用法：/btw <问题>，问题最多 4000 个字符。',
+  'daemon.antigravity_btw_unavailable': '/btw 需要当前聊天中已启动、使用本机交互终端的 Antigravity 会话。',
+  'daemon.antigravity_btw_busy': '终端正在接收输入、显示选择界面或处理另一条旁问。请稍后重发 /btw。',
+  'daemon.antigravity_btw_unconfirmed': '未能确认 Antigravity 旁问的完整回答。可以在 Web 终端检查旁问结果。',
   'daemon.enriched_mentions_label': '消息中的 @mention：',
   'daemon.topic_continuity.resumed': '↩️ 本话题之前的会话（{id}）已关闭，这条消息接着它继续处理，之前的上下文都在。',
   'daemon.topic_continuity.fresh_after_close': '⚠️ 本话题之前的会话（{id}）已关闭且无法恢复，这条消息由新开的会话处理，之前的上下文不在了。',
@@ -2604,6 +2633,7 @@ export const messages: Record<string, string> = {
   'card.btw_answer': '💬 /btw 旁路回答',
   'card.absorbed_reply': '💬 对追问的回复（主任务仍在继续）',
   'card.absorbed_reply_thinking': '💭 对追问的思考摘要（主任务仍在继续）',
+  'card.mid_turn_progress': '⏳ 中途进展（任务仍在继续）',
   'card.btw_answer_truncated': '_（回答过长，已截断，完整内容见 Web 终端）_',
   'card.btw_answer_from_screen': '_（从终端屏幕读取，较长的回答可能不完整）_',
   'card.local_turn_resumed': '🖥️ 终端本地对话续传（daemon 重启时模型正在输出）',
@@ -2666,6 +2696,7 @@ export const messages: Record<string, string> = {
   'worker.submit_impossible': '⚠️ 刚才那条消息没有安全写入 {cliName}。\n原因：{reason}\n请处理上述原因并确认终端状态后再试。\n开头：{preview}',
   'worker.first_write_input_box_held': '⚠️ {cliName} 启动超过 {seconds} 秒，输入框仍未就绪；排队的消息还没写入，输入框就绪后会自动发送。请在终端里检查是否有待处理的对话框或未发送的草稿。',
   'worker.opening_input_held': '⏳ 消息暂未写入 {cliName}。\n原因：{reason}\n消息保留在队列中，输入框空出来后会自动发送，无需重发。',
+  'worker.session_rename_input_held': '⏳ {cliName} 的会话改名还没确认完成，排队的消息暂未写入，以免被并进会话标题。\n确认后会自动发送，无需重发。若长时间没有恢复，请打开 Web 终端查看输入框：留着完整的 /rename 命令就按回车执行，只有半截就清空输入框；输入框已经是空的仍没有恢复时，发送 /restart 重启会话，排队的消息会保留并在重启后发送。',
   'worker.activation_submit_unconfirmed': '⚠️ 首条消息的提交尚未确认\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 尚未在{transcriptLabel}确认 {cliName} 收到首条消息；它可能仍在执行或已经执行。后续消息会等待这条确认。\n请打开 Web 终端核对原输入与执行状态；若原输入仍未提交，请在终端完成提交。BotMux 会继续观察原提交回执，确认到达后自动释放队列。\n此时在飞书重发只会继续排队。若终端无法恢复，请关闭该会话后重新开始。\n原消息：{preview}',
   'worker.startup_command_dialog_pending': '⚠️ 启动命令 {command} 正在等待确认\n{cliName} 执行它时弹出了确认框，BotMux 不会替你选择；首条消息已暂存在队列中，尚未提交。\n请打开 Web 终端，在确认框里选择是否切换。选择之后，BotMux 会自动投递暂存的消息。',
   'worker.startup_command_unconfirmed': '⚠️ 启动命令 {command} 尚未确认执行\n{cliName} 在 {secs} 秒内没有留下执行记录，首条消息已暂存在队列中，尚未提交，避免和命令拼在一起。\n请打开 Web 终端查看：命令若仍停在输入框里，按回车执行即可。确认执行后，BotMux 会自动投递暂存的消息。',

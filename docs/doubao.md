@@ -92,7 +92,7 @@ botmux restart
 
 要在普通回复卡片内直接显示工具执行过程，可为 Doubao Bot 配置 `replyCardMode: "unified"`，并保持 `cotEnabled` 与 `replyCardShowTools` 开启。`legacy` 模式沿用飞书原生进度气泡；仅收到气泡创建成功的回执，不代表客户端已经展示工具明细。
 
-Doubao Bot 的 `replyDelivery` 缺省为 `transcript`（与其它支持转写回复的 CLI 一样）：系统提示不教模型调用 `botmux send`（其它 CLI 的 transcript 提示会把 send 留给 @ 别的 bot、附件等场景，Doubao 刻意不教），最终回复只从上述日志收取。原因是 Doubao 的工具命令由账号级常驻进程 `doubao --type=service` 执行，同一台机器上所有 Doubao 终端共用它；该进程的环境变量和进程树沿用**第一个**拉起它的终端。模型在工具里执行 `botmux send` 时，botmux 会按那棵进程树判断归属，可能把回复投到另一个会话、另一个群，甚至以另一个 Bot 的身份发出。不建议显式改回 `send`；确有需要时，请保证这台机器上只有一个 Doubao 会话，并在切换后重启常驻进程。
+Doubao Bot 的 `replyDelivery` 缺省为 `transcript`（自动转发最终回复；其它 CLI 缺省仍是 `send`）：系统提示不教模型调用 `botmux send`，最终回复只从上述日志收取。原因是 Doubao 的工具命令由账号级常驻进程 `doubao --type=service` 执行，同一台机器上所有 Doubao 终端共用它；该进程的环境变量和进程树沿用**第一个**拉起它的终端。模型在工具里执行 `botmux send` 时，botmux 会按那棵进程树判断归属，可能把回复投到另一个会话、另一个群，甚至以另一个 Bot 的身份发出。不建议显式改回 `send`；确有需要时，请保证这台机器上只有一个 Doubao 会话，并在切换后重启常驻进程。
 
 首轮的原生 Session ID 在提交后最多等待 20 秒捕获（常驻进程冷启动时，`assignment.md` 要 7～8 秒才写入）。
 

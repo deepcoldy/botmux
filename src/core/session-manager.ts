@@ -98,8 +98,9 @@ import {
   larkTransportEnabled,
 } from './types.js';
 import type { DaemonSession, GroupJoinContext } from './types.js';
-import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
+import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime, restoreQueuedActivationRawInput } from './pending-repo-journal.js';
 import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
+import { noteTurnStarted } from './turn-outcome.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
 import { resolveScheduleModelOverride } from './schedule-model-override.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
@@ -1594,7 +1595,11 @@ function buildNewTopicBlocks(
     ? []
     : compactTraexRpcContext
       ? buildCompactTraexRoutingHints(locale, noTransport, replyDelivery)
-      : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind, hideLocalAddresses: hideLocalAddressesFor(opts?.larkAppId) });
+      : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, {
+        sessionKind,
+        hideLocalAddresses: hideLocalAddressesFor(opts?.larkAppId),
+        hasNativeSkillChannel: Boolean(adapter.skillsDir || adapter.pluginDir),
+      });
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -2374,6 +2379,12 @@ function finalizeCliTurnInput(
       ...(opts.acceptedInput.trustedCaller ? { trustedCaller: opts.acceptedInput.trustedCaller } : {}) };
     userText = opts.acceptedInput.content;
   }
+  // Keep the structured attachments beside the exact input for daemon-side
+  // failure recovery. The legacy/structured model input was already built above;
+  // this metadata is not sent as a new worker control field.
+  if (opts?.attachments?.length) {
+    payload = { ...payload, attachments: opts.attachments.map(attachment => ({ ...attachment })) };
+  }
   // Builders only describe explicitly model-visible sources. They do not read
   // mutable rollout configuration: the real fork/send boundary freezes that
   // decision after every await/defer. Keep callers without a daemon app scope
@@ -2754,6 +2765,8 @@ export function rememberLastCliInput(
   ds.session.lastCliInputTurnId = inputTurnId;
   if (replayCodexAppInput) ds.session.lastCodexAppInput = replayCodexAppInput;
   else delete ds.session.lastCodexAppInput;
+  if (normalized.attachments?.length) ds.session.lastAttachments = structuredClone(normalized.attachments);
+  else delete ds.session.lastAttachments;
   ds.session.replyThreadAliases = ds.replyThreadAliases;
   ds.session.currentReplyTarget = ds.currentReplyTarget;
   sessionStore.updateSession(ds.session);
@@ -3407,6 +3420,8 @@ export async function restoreActiveSessions(
             queuedActivationPending: session.queuedActivationPending,
             queuedActivationToken: session.queuedActivationToken,
             queuedActivationInput: session.queuedActivationInput,
+            queuedActivationRawInput: session.queuedActivationRawInput,
+            queuedActivationRawTurnId: session.queuedActivationRawTurnId,
             queuedActivationTurnId: session.queuedActivationTurnId,
             queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
             queuedActivationResume: session.queuedActivationResume,
@@ -3418,6 +3433,8 @@ export async function restoreActiveSessions(
           session.queuedActivationPending = undefined;
           session.queuedActivationToken = undefined;
           session.queuedActivationInput = undefined;
+          session.queuedActivationRawInput = undefined;
+          session.queuedActivationRawTurnId = undefined;
           session.queuedActivationTurnId = undefined;
           session.queuedActivationDispatchAttempt = undefined;
           session.queuedActivationResume = undefined;
@@ -3465,6 +3482,7 @@ export async function restoreActiveSessions(
         pendingAttachments: session.queuedAttachments,
         currentTurnTitle: session.currentTurnTitle ?? session.title,
       };
+      restoreQueuedActivationRawInput(ds);
       const restoredPendingRepo = restorePendingRepoRuntime(ds);
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
@@ -3618,8 +3636,10 @@ export async function restoreActiveSessions(
     // Literal pending-repo passthroughs have an empty init prompt and therefore
     // no Codex ledger entry. Their setup journal is the exact replay owner; the
     // recovered worker sends it at prompt_ready with the retained token.
-    if (session.queuedActivationPending && session.pendingRepoSetup?.rawInput) {
+    restoreQueuedActivationRawInput(ds);
+    if (ds.pendingRawInput === undefined && session.queuedActivationPending && session.pendingRepoSetup?.rawInput) {
       ds.pendingRawInput = session.pendingRepoSetup.rawInput;
+      ds.pendingRawTurnId = session.pendingRepoSetup.turnId ?? session.queuedActivationTurnId;
     }
     try {
       const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
@@ -4698,7 +4718,7 @@ export function buildSilentScheduleHint(taskName: string, locale?: Locale): stri
       '<botmux_silent_schedule trusted="true">',
       `This is a SILENT run of scheduled task "${taskName}". No trigger message was posted in the chat; the user does not know this run is happening.`,
       '- Do NOT send progress or confirmation messages ("started", "checked, all good", "done").',
-      '- Only when the result meets the notify condition described in the task (an anomaly found, an alert threshold hit, or the task explicitly asks for a deliverable) should you `botmux send` the conclusion.',
+      '- Only when the result meets the notify condition described in the task (an anomaly found, an alert threshold hit, or the task explicitly asks for a deliverable) should you `botmux send --no-mention` the conclusion; replace --no-mention with --mention <open_id> only for an explicit recipient.',
       '- Otherwise finish the turn completely silently — do not call `botmux send` at all.',
       '- This run\'s final reply is never posted to the chat, even when the session normally forwards final replies automatically; `botmux send` is the only way to notify.',
       '</botmux_silent_schedule>',
@@ -4708,7 +4728,7 @@ export function buildSilentScheduleHint(taskName: string, locale?: Locale): stri
     '<botmux_silent_schedule trusted="true">',
     `本次是定时任务「${taskName}」的静默执行：群里没有发送任何触发提示，用户不知道本次运行。`,
     '- 不要发送过程性/确认性消息（“开始执行”“检查完毕，一切正常”“已完成”都不要发）。',
-    '- 仅当结果满足任务描述中需要通知用户的条件（发现异常、达到报警阈值、任务本身要求交付产物）时，才用 `botmux send` 发送结论。',
+    '- 仅当结果满足任务描述中需要通知用户的条件（发现异常、达到报警阈值、任务本身要求交付产物）时，才用 `botmux send --no-mention` 发送结论；仅在有明确收件人时把 --no-mention 换成 --mention <open_id>，不要从 owner 或历史发送者推断。',
     '- 不满足条件就完全静默地结束本轮，不要调用 `botmux send`。',
     '- 本轮的最终回复不会发到群里（即使本会话平时会自动转发最终回复）；要通知只能用 `botmux send`。',
     '</botmux_silent_schedule>',
@@ -5238,6 +5258,9 @@ export async function executeScheduledTask(
             + `(running on ${existing.session.model ?? 'the CLI default'})`,
           );
         }
+        // Keep the dispatch timestamp with the durable outcome so a restored
+        // next-step button can distinguish later input from this scheduled run.
+        noteTurnStarted(existing, scheduledTurnId);
         // Identity preparation may reject after a concurrent pause/revocation.
         // Run it before changing the retained conversation's routing or prompt.
         await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
@@ -5400,6 +5423,7 @@ export async function executeScheduledTask(
       // resume of this session (see resolveSessionLaunchModel).
       ...(modelOverride.model ? { spawnModelOverride: modelOverride.model } : {}),
     };
+    noteTurnStarted(ds, scheduledTurnId);
     if (sharedTopicRootId) {
       beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId);
       sessionStore.updateSession(ds.session);
@@ -6143,14 +6167,14 @@ export async function spawnDashboardSession(
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion | undefined,
   args: SpawnDashboardSessionArgs,
-): Promise<{ ok: true; sessionId: string } | { ok: false; error: string }> {
+): Promise<{ ok: true; sessionId: string } | { ok: false; error: string; accepted?: false }> {
   const { larkAppId, chatId, content, column, role } = args;
   let bot: ReturnType<typeof getBot>;
-  try { bot = getBot(larkAppId); } catch { return { ok: false, error: 'bot_not_found' }; }
+  try { bot = getBot(larkAppId); } catch { return { ok: false, error: 'bot_not_found', accepted: false }; }
   const locale = localeForBot(larkAppId);
   // 个人助理模式：看板任务也归该群的主人、cwd 在主人 work/；群未认领就不建。
   const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, 'group', args.ownerOpenId ?? undefined);
-  if (assistantSpawn.kind === 'unclaimed') return { ok: false, error: 'assistant_unclaimed' };
+  if (assistantSpawn.kind === 'unclaimed') return { ok: false, error: 'assistant_unclaimed', accepted: false };
 
   // chat-scope：锚点就是 chatId。先挡掉「同群同 bot 已有真会话」的撞键（会被
   // Map.set 覆盖而泄漏 worker）。queued 占位 / 纯 scratch 不算冲突。
@@ -6204,7 +6228,11 @@ export async function spawnDashboardSession(
   const userContent = composeSpawnUserContent({ content, role, coworkers: args.coworkers, locale });
   const codexAppMessageContext = composeSpawnCodexAppContext({ role, coworkers: args.coworkers, locale });
 
-  const registered = await withActiveSessionKeyLock(activeSessions, key, async () => {
+  const registered = await withActiveSessionKeyLock<
+    | { ds: DaemonSession; session: Session }
+    | { error: string; accepted?: false }
+    | undefined
+  >(activeSessions, key, async () => {
     // Re-check under the key lock: the scan above runs before the banner /
     // attachment awaits, so a restore can quarantine this anchor in between.
     // Every other creation path performs this check at registration time.
@@ -6309,10 +6337,15 @@ export async function spawnDashboardSession(
         }
         // No durable or live owner accepted the opening. Roll back only our
         // exact runtime claim and close only our row; a concurrently published
-        // successor must survive.
-        if (activeSessions.get(key) === ds) activeSessions.delete(key);
-        try { sessionStore.closeSession(session.sessionId); }
-        catch (closeErr) {
+        // successor must survive. `accepted:false` is emitted only after both
+        // steps succeed, so task-routing can safely choose another bot.
+        const removedExactOwner = activeSessions.get(key) === ds;
+        if (removedExactOwner) activeSessions.delete(key);
+        let closedExactOwner = false;
+        try {
+          sessionStore.closeSession(session.sessionId);
+          closedExactOwner = true;
+        } catch (closeErr) {
           logger.error(
             `[createSession] failed to close unaccepted session ${session.sessionId}: `
             + `${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
@@ -6320,14 +6353,19 @@ export async function spawnDashboardSession(
         }
         return {
           error: err instanceof Error ? err.message : String(err),
+          ...(removedExactOwner && closedExactOwner ? { accepted: false as const } : {}),
         };
       }
     }
     return { ds, session };
   });
   if (!registered) return { ok: false, error: 'session_exists' };
-  if ('error' in registered && typeof registered.error === 'string') {
-    return { ok: false, error: registered.error };
+  if (!('ds' in registered)) {
+    return {
+      ok: false,
+      error: registered.error,
+      ...(registered.accepted === false ? { accepted: false as const } : {}),
+    };
   }
   // PR #597 builds `ds`, registers it, and runs forkOrShowRepoCard INSIDE the
   // key lock above (returning { ds, session }); master's post-lock ds
@@ -6459,6 +6497,8 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     ds.session.queuedActivationPending = undefined;
     ds.session.queuedActivationToken = undefined;
     ds.session.queuedActivationInput = undefined;
+    ds.session.queuedActivationRawInput = undefined;
+    ds.session.queuedActivationRawTurnId = undefined;
     ds.session.queuedActivationTurnId = undefined;
     ds.session.queuedActivationDispatchAttempt = undefined;
     ds.session.queuedActivationResume = undefined;
@@ -6486,6 +6526,7 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     try {
       const exactRetry = ds.session.queuedActivationInput;
       if (exactRetry) {
+        restoreQueuedActivationRawInput(ds);
         forkWorker(ds, exactRetry, {
           resume: ds.session.queuedActivationResume ?? ds.hasHistory,
           turnId: ds.session.queuedActivationTurnId,

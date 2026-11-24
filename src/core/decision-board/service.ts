@@ -68,6 +68,8 @@ import {
   cardNoteText,
   decisionAskKey,
 } from './card.js';
+import { draftAskKey } from './ask-key.js';
+import { parseParentSpec } from './overview.js';
 import {
   BOARD_STATE_LABELS,
   CHAT_REF_PATTERN,
@@ -233,6 +235,10 @@ export interface BoardCliRequest {
   nextCheck?: unknown;
   /** `--dismiss-hint`：收起当前提示。 */
   dismissHint?: unknown;
+  /** `--parent 12 | none`：挂到另一项下面当子任务 / 取消。 */
+  parent?: unknown;
+  /** `--waiting-on "<在等谁>" | none` */
+  waitingOn?: unknown;
 }
 
 /** 建项缺群时的报错：写清楚三种写法（管家照着改命令即可）。 */
@@ -500,6 +506,17 @@ export class DecisionBoardService {
       patch.nextCheckAt = parsed;
     }
     if (req.dismissHint === true) patch.dismissHint = true;
+    if (req.parent !== undefined) {
+      if (typeof req.parent !== 'string') throw new BoardError('invalid_parent', '--parent 必须是字符串');
+      const parsed = parseParentSpec(req.parent);
+      if (parsed !== null && typeof parsed === 'object') throw new BoardError('invalid_parent', parsed.error);
+      patch.parentSeq = parsed;
+    }
+    if (req.waitingOn !== undefined) {
+      if (typeof req.waitingOn !== 'string') throw new BoardError('invalid_waiting_on', '--waiting-on 必须是字符串');
+      const value = req.waitingOn.trim();
+      patch.waitingOn = !value || value.toLowerCase() === 'none' ? null : value;
+    }
     if (req.clearAsk === true) {
       patch.question = null;
       patch.options = [];
@@ -617,7 +634,11 @@ export class DecisionBoardService {
         const items = store.listItems(app, view).map(i => ({
           seq: i.seq, title: i.title, state: i.state, stateLabel: BOARD_STATE_LABELS[this.deps.locale()][i.state],
           ...(i.stage ? { stage: i.stage } : {}), ...(i.key ? { key: i.key } : {}), ...(i.repo ? { repo: i.repo } : {}),
-          pendingDecisions: i.pendingDecisions, updatedAt: i.updatedAt, ...this.itemLinks(i.seq),
+          pendingDecisions: i.pendingDecisions, updatedAt: i.updatedAt, lastActivityAt: i.lastActivityAt, ownActivityAt: i.ownActivityAt,
+          ...(i.nextCheckAt !== undefined ? { nextCheckAt: i.nextCheckAt } : {}),
+          ...(i.waitingOn ? { waitingOn: i.waitingOn } : {}),
+          ...(i.parent ? { parentSeq: i.parent.seq } : {}), ...(i.childStats ? { childStats: i.childStats } : {}),
+          ...this.itemLinks(i.seq),
           ...this.chatState(i, i.links),
           ...(this.withVisibleHint(i).hint ? { hint: i.hint } : {}),
         }));
@@ -628,8 +649,12 @@ export class DecisionBoardService {
         const detail = store.detail(app, seq)!;
         return {
           item: this.itemOut(seq),
+          ...(detail.parent ? { parent: detail.parent } : {}),
+          ...(detail.children.length ? { children: detail.children, childStats: detail.childStats } : {}),
+          lastActivityAt: detail.lastActivityAt,
           links: this.renderLinks(detail.links, detail.item.primaryChat),
-          events: detail.events.slice(0, 30).map(e => ({ at: e.at, actor: e.actor, kind: e.kind, text: e.text,
+          // owner 没提交的草稿（收进历史留底的）不给管家看：草稿点提交才发给管家。
+          events: detail.events.filter(e => e.kind !== 'draft').slice(0, 30).map(e => ({ at: e.at, actor: e.actor, kind: e.kind, text: e.text,
             ...(e.batchId ? { batchId: e.batchId } : {}), ...(e.fileIds.length ? { files: e.fileIds.length } : {}) })),
           pendingDecisions: detail.pendingDecisions,
         };
@@ -758,8 +783,23 @@ export class DecisionBoardService {
     };
   }
 
+  /**
+   * 列表、详情、提交之前：不再算待提交的草稿先收进历史（旧构建留下的、已结束事项上的老草稿）。
+   * 列表和详情是读接口：收的时候写失败（库被别的管家 daemon 锁着等）只记日志、照常读——listDrafts 按状态挡掉了
+   * 已结束事项上的，下次打开再收；提交之前必须收成功（strict），否则不提交。
+   */
+  private reconcileDrafts(opts: { strict?: boolean } = {}): void {
+    try {
+      this.store().reconcileDrafts(this.appId, { locale: this.deps.locale() });
+    } catch (error) {
+      if (opts.strict) throw error;
+      this.deps.log('warn', `[decision-board] reconcile drafts failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   list(view: BoardView, author: string, query?: string) {
     const store = this.store();
+    this.reconcileDrafts();
     return {
       ...this.meta(),
       items: store.listItems(this.appId, view, { author, query }).map(i => ({
@@ -773,10 +813,13 @@ export class DecisionBoardService {
 
   detail(seq: number, author: string) {
     const store = this.store();
+    this.reconcileDrafts();
     const detail = store.detail(this.appId, seq, author);
     if (!detail) throw new BoardError('item_not_found', `没有 #${seq}`);
     return {
       ...detail,
+      // 页面存草稿时带回来：这一轮拍板之后变了（草稿已收进历史），迟到的保存会被拒（draft_outdated）。
+      draftAskKey: draftAskKey(detail.item),
       item: this.withVisibleHint(this.withoutStaleReason(detail.item, detail.links)),
       links: this.renderLinks(detail.links, detail.item.primaryChat),
       missingChat: itemMissingChat(detail.item, detail.links),
@@ -917,7 +960,7 @@ export class DecisionBoardService {
     this.store().markSeen(this.appId, seq);
   }
 
-  putDraft(seq: number, author: string, body: { choice?: unknown; text?: unknown; fileIds?: unknown; baseRev?: unknown }) {
+  putDraft(seq: number, author: string, body: { choice?: unknown; text?: unknown; fileIds?: unknown; baseRev?: unknown; askKey?: unknown; archive?: unknown }) {
     const fileIds = Array.isArray(body.fileIds) ? body.fileIds.filter((x): x is string => typeof x === 'string') : [];
     const baseRev = typeof body.baseRev === 'number' && Number.isSafeInteger(body.baseRev) ? body.baseRev : 0;
     const draft = this.store().putDraft(this.appId, seq, author, {
@@ -925,7 +968,9 @@ export class DecisionBoardService {
       text: typeof body.text === 'string' ? body.text : '',
       fileIds,
       baseRev,
-    });
+      ...(typeof body.askKey === 'string' ? { askKey: body.askKey } : {}),
+      ...(body.archive === true ? { archive: true } : {}),
+    }, undefined, this.deps.locale());
     return { draft: draft ?? null };
   }
 
@@ -949,6 +994,8 @@ export class DecisionBoardService {
   }
 
   async submit(input: { author: string; submitter?: string; authorName?: string; nonce: string; items: Array<{ seq: number; draftUpdatedAt: number }> }) {
+    // 确认框打开之后这一项被改掉的：草稿先收进历史，下面按「草稿已经不在了」拒，不把写给旧问题的决定发出去。
+    this.reconcileDrafts({ strict: true });
     const res = this.store().submit(this.appId, input);
     if (!res.duplicate) for (const d of res.decisions) this.syncCard(d.seq);
     if (res.duplicate && (res.batch.delivery === 'delivered' || res.batch.delivery === 'dispatched')) {
@@ -1098,6 +1145,8 @@ export class DecisionBoardService {
       ...(item.recommendReason ? { recommendReason: item.recommendReason } : {}),
       askKey: ownerBoardAskKey(item),
       rev: item.rev,
+      ...(item.parentSeq !== undefined ? { parentSeq: item.parentSeq } : {}),
+      ...(item.waitingOn ? { waitingOn: item.waitingOn } : {}),
       ...(primary ? { primaryChatId: primary.ref } : {}),
       links: rendered.map(l => ({ kind: l.kind, ref: l.ref, text: l.text, ...(l.url ? { url: l.url } : {}), ...(l.primary ? { primary: true as const } : {}) })),
       createdAt: item.createdAt,
@@ -1142,7 +1191,8 @@ export class DecisionBoardService {
         ...this.ownerItem(item, detail.links, detail.pendingDecisions.length),
         ...(item.progress ? { progress: item.progress } : {}),
         ...(item.noChatReason ? { noChatReason: item.noChatReason } : {}),
-        events: detail.events.slice(0, OWNER_BOARD_EVENT_LIMIT).map(e => ({
+        // owner 没提交的草稿不往外给：这个接口在管家会话里也调得通（只拦 decide），草稿点提交才发给管家。
+        events: detail.events.filter(e => e.kind !== 'draft').slice(0, OWNER_BOARD_EVENT_LIMIT).map(e => ({
           at: e.at, actor: e.actor, kind: e.kind, text: e.text, ...(e.batchId !== undefined ? { batchId: e.batchId } : {}),
         })),
       },
@@ -1570,7 +1620,8 @@ export function boardErrorStatus(error: unknown): { status: number; error: strin
       : error.code === 'staging_full' ? 507
       : error.code === 'item_not_found' || error.code === 'batch_not_found' ? 404
         : error.code === 'storage_unavailable' ? 503
-          : error.code === 'draft_changed' || error.code === 'draft_missing' || error.code === 'key_conflict'
+          : error.code === 'draft_changed' || error.code === 'draft_missing' || error.code === 'draft_outdated' || error.code === 'key_conflict'
+            || error.code === 'choice_not_deciding'
             || error.code === 'item_ended' || error.code === 'item_changed' || error.code === 'item_not_deciding'
             || error.code === 'item_not_awaiting' || error.code === 'ask_changed'
             || error.code === 'request_id_reused' ? 409

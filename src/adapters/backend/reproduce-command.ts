@@ -110,6 +110,16 @@ export function buildReproduceCommand(input: ReproduceCommandInput): string | nu
     const eq = token.indexOf('=');
     if (eq <= 0) continue;
     const key = token.slice(0, eq);
+    // A runtime binding proves the worker-launched process, not a second CLI
+    // started by this reproduce command. Keep it in the pane allowlist, but never
+    // copy that authority to another process whose SessionStart hook could
+    // otherwise release the original session's ready gate.
+    if (key === 'BOTMUX_RUNTIME_BINDING_ID') {
+      // Omitting the assignment is not enough in a pane whose parent shell has
+      // already exported the old value: explicitly scrub it from the repro child.
+      if (!removals.includes(key)) removals.push(key);
+      continue;
+    }
     const val = token.slice(eq + 1);
     assignments.push(`${key}=${shq(val)}`);
   }

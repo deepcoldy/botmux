@@ -46,6 +46,18 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: 'settings-whiteboard', module: 'settings.moduleGeneral', section: 'settings.sectionWhiteboard', fields: ['settings.whiteboardEnable'] },
   { id: 'settings-workflow', module: 'settings.moduleGeneral', section: 'settings.sectionWorkflow', fields: ['settings.workflowEnable', 'settings.workflowNodeExecutorBot', 'settings.workflowHandoffIdentity'] },
   { id: 'settings-multi-topic', module: 'settings.moduleGeneral', section: 'settings.sectionMultiTopic', fields: ['settings.multiTopicEnable'] },
+  {
+    id: 'settings-task-routing',
+    module: 'settings.moduleGeneral',
+    section: 'settings.sectionTaskRouting',
+    fields: [
+      'settings.taskRoutingEnable',
+      'settings.taskRoutingPolicy',
+      'settings.taskRoutingMatcherMode',
+      'settings.taskRoutingMatcherBot',
+      'settings.taskRoutingMatcherTimeout',
+    ],
+  },
   { id: 'settings-repo-picker', module: 'settings.moduleGeneral', section: 'settings.sectionRepoPicker', fields: ['settings.repoPickerMode'] },
   { id: 'settings-worktree', module: 'settings.moduleGeneral', section: 'settings.sectionWorktree', fields: ['settings.worktreeRoot'] },
   { id: 'settings-schedule', module: 'settings.moduleGeneral', section: 'settings.sectionSchedule', fields: ['settings.scheduleTimeZone', 'settings.sessionCleanupEnable', 'settings.sessionCleanupArchiveCodex'] },

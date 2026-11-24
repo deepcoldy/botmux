@@ -95,7 +95,7 @@ function harness(opts: { markerPath?: string } = {}) {
       adoptInitialActiveTurn: vi.fn(), adoptDisplacedActiveTurn: vi.fn(),
       markerIdentityTurnId: loadWorkerFunction('markerIdentityTurnId', { isValidMarkerIdentityTurnId }),
     });
-    names.push('syncQueuedTurnsFromMarkerDisk', 'writeCliPidMarker', 'markerQueuedTurnStillLive');
+    names.push('syncQueuedTurnsFromMarkerDisk', 'writeCliPidMarker', 'markerQueuedTurnStillLive', 'activeAuthorityMatchesMarker');
   }
   for (const name of names) scope[name] = loadWorkerFunction(name, scope);
   return scope;
@@ -463,6 +463,28 @@ describe('queued type-ahead advance skips turns whose terminal already went out'
       h.emitTurnTerminal('om_host', 'completed');
       expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
       expect(h.activeTurnBlocks({ turnId: 'schedule:task:2', queueAfterActiveTurn: true })).toBe(false);
+    });
+  });
+
+  it('does not re-adopt a just-released current turn before promoting the queued successor', () => {
+    withMarker(marker => {
+      const h = harness({ markerPath: marker });
+      startTurn(h, 'om_A');
+      h.queuedTypeAheadTurns.push({ turnId: 'om_B' });
+      h.writeCliPidMarker();
+      h.releaseActiveTurnAuthority('prompt_ready');
+      expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+      expect(h.currentBotmuxTurnId).toBe('om_A');
+      expect(JSON.parse(readFileSync(marker, 'utf8')).turnId).toBe('om_A');
+
+      // A released turn is not a half-restored one: sync must leave it alone so
+      // the ordinary in-memory queue can advance instead of re-adopting A.
+      expect(h.syncQueuedTurnsFromMarkerDisk()).toBe(false);
+      expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+      expect(h.advanceQueuedTypeAheadTurn('prompt_ready')).toBe(true);
+      expect(h.currentBotmuxTurnId).toBe('om_B');
+      expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_B');
+      expect(h.queuedTypeAheadTurns).toEqual([]);
     });
   });
 

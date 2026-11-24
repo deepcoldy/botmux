@@ -152,7 +152,7 @@ export async function completeRegisteredApp(
   identity: RegistrationIdentity,
   addons: AppAddons,
   web: WebAutomation,
-  options: Pick<OpenPlatformAutomationOptions, 'onQrCode' | 'onStatus' | 'disableQrLogin' | 'sessionFilePath' | 'disableBytedcliFallback'> = {},
+  options: Pick<OpenPlatformAutomationOptions, 'onQrCode' | 'onStatus' | 'disableQrLogin' | 'sessionFilePath' | 'disableBytedcliFallback' | 'autoAvoidApproval' | 'excludeScopes'> = {},
 ): Promise<OpenPlatformAutomationResult> {
   const wanted = { tenant: addons.scopes?.tenant ?? [], user: addons.scopes?.user ?? [] };
   const token = await registrationToken(identity);

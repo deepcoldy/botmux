@@ -6,7 +6,7 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, expect, it, vi } from 'vitest';
-import { PromptInjectionSection, zeroPromptSupportedFor } from '../src/dashboard/web/bot-defaults-page.js';
+import { PromptInjectionSection, ReplyDeliverySection, zeroPromptSupportedFor } from '../src/dashboard/web/bot-defaults-page.js';
 import type { BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 afterEach(() => { vi.unstubAllGlobals(); });
@@ -89,4 +89,33 @@ it('follows the row’s current CLI / backend / sandbox instead of a load-time s
   })));
   expect(toggle(scratch).props.disabled).toBe(false);
   act(() => scratch.unmount());
+});
+
+it('ReplyDeliverySection uses plain auto-forward wording, defaults off for claude-code, and opts in via PUT', async () => {
+  const fetcher = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true, replyDelivery: 'transcript' }) }));
+  vi.stubGlobal('fetch', fetcher);
+  const patchBot = vi.fn();
+  let view!: TestRenderer.ReactTestRenderer;
+  const row = {
+    larkAppId: 'app_a',
+    cliId: 'claude-code',
+    promptInjection: 'default',
+    replyDelivery: 'send',
+    replyDeliveryDefault: 'send',
+    replyDeliverySupported: true,
+  } as BotDefaultsRow;
+  act(() => { view = TestRenderer.create(React.createElement(ReplyDeliverySection, { bot: row, patchBot })); });
+  const text = JSON.stringify(view.toJSON());
+  expect(text).toContain('自动转发最终回复');
+  expect(text).not.toContain('转写回复');
+  expect(text).not.toContain('不用它发进度');
+  const sw = view.root.findByProps({ 'data-action': 'toggle-reply-delivery' });
+  expect(sw.props.checked).toBe(false);
+  expect(sw.props.disabled).toBe(false);
+  await act(async () => { sw.props.onChange({ currentTarget: { checked: true } }); });
+  expect(fetcher).toHaveBeenCalledWith('/api/bots/app_a/reply-delivery', expect.objectContaining({
+    method: 'PUT', body: JSON.stringify({ replyDelivery: 'transcript' }),
+  }));
+  expect(patchBot).toHaveBeenCalledWith('app_a', { replyDelivery: 'transcript' });
+  act(() => view.unmount());
 });

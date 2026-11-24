@@ -20,7 +20,7 @@ Match your **symptom** first — each one has a different cause:
 | **No reaction at all** (not even an emoji) | Event subscription, release, or long connection not working | [A. No messages at all](#a-no-messages-at-all) |
 | Only **I (the owner)** can trigger it; others get an auth card or no reply | Others have no talk permission | [B. Others can't use it](#b-others-cant-use-it) |
 | It **only replies when @-mentioned** and you want it to reply without @ | The group's mention policy | [B. Others can't use it](#b-others-cant-use-it) |
-| The card says "working" and the terminal has output, but **nothing reaches Lark** | In send mode the model didn't call `botmux send`, or transcript replies couldn't read the session record | [C. Terminal has output but nothing reached Lark](#c-terminal-has-output-but-nothing-reached-lark) |
+| The card says "working" and the terminal has output, but **nothing reaches Lark** | In send mode the model didn't call `botmux send`, or auto-forward final reply couldn't read the session record | [C. Terminal has output but nothing reached Lark](#c-terminal-has-output-but-nothing-reached-lark) |
 | The session **won't start**, and the first message errors with `zsh: parse error` | The login shell's startup file switches shells | [Session does not start](#session-does-not-start) |
 
 ### A. No messages at all
@@ -59,11 +59,11 @@ Full rules: [Permissions & Access](/en/permissions).
 
 Output printed in the terminal is not the same as a message sent to Lark. First check how this bot delivers replies:
 
-- **Transcript replies** (`replyDelivery: "transcript"`, the default for Claude Code, Codex, TraeX, CoCo, Pi, Grok, Cursor and others): botmux takes the turn's last answer from the CLI's session record and posts it. If nothing arrives, the session record usually wasn't read — the chat shows a notice that botmux couldn't read the turn; open the Web terminal for the result. You can also switch back to model-sent replies with `/botconfig set replyDelivery send`.
-- **Send mode** (`replyDelivery: "send"` set explicitly, or a CLI without transcript support such as Antigravity, OpenCode or Relay): the model must run `botmux send` for the group to see anything.
+- **Default (send) mode** (default for every CLI except Doubao): the model must run `botmux send` for the group to see anything.
   - Every send needs one of `--mention-back`, `--mention`, or `--no-mention`; otherwise it errors and sends nothing.
   - If it only uses `echo` / `print`, or forgets `botmux send`, nothing goes out.
   - Pass multi-line content with a heredoc; don't write `"line one\nline two"`.
+- **Auto-forward final reply** (`replyDelivery: "transcript"`, opt-in; default for Doubao): botmux takes the turn's last answer from the CLI's session record and posts it. If nothing arrives, the session record usually wasn't read — the chat shows a notice that botmux couldn't read the turn; open the Web terminal for the result. You can also switch back to model-sent replies with `/botconfig set replyDelivery send`.
 
 Two more cases where the model doesn't need to send by itself:
 

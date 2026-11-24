@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CodexExecutable, CodexProcess } from '../src/services/codex-session-upgrade.js';
 import { classifyMergedRestart, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings } from '../src/core/restart-followup-policy.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
+import { minimaxCompactQueueSuppressesPromptReady } from '../src/core/inject-queue-policy.js';
 
 const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 const parsed = ts.createSourceFile('worker.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -46,6 +47,11 @@ function harness() {
   const delivered: unknown[] = [];
   const state: Record<string, any> = {
     config: { autoUpgradeCodexSessions: true },
+    // `settleRestartAttemptOnReady` reads the session-contract scope to decide
+    // whether the readiness riding its receipt needs re-scoping. These cases
+    // exercise legacy IPC, so the identifier must exist and be unset — `with`
+    // throws ReferenceError on a name the scope object does not carry at all.
+    workerSessionEventScope: undefined,
     isCodexAppCliId,
     lastInitConfig: {
       cliId: 'codex', cliSessionId: threadId, sessionId: 'botmux-session',
@@ -120,6 +126,7 @@ function harness() {
     restartWindowLaunch: undefined,
     pendingLaunchConvergence: undefined,
     decideRestartReceipt,
+    minimaxCompactQueueSuppressesPromptReady,
     classifyMergedRestart,
     decideUpgradeLaunchConvergence,
     restartLaunchSettings,

@@ -62,7 +62,11 @@ export interface BoardLink {
 export type BoardChatCheck = 'verified' | 'unverified';
 
 export type BoardActor = 'steward' | 'owner' | 'system';
-export type BoardEventKind = 'create' | 'note' | 'state' | 'edit' | 'decision' | 'reply' | 'attach' | 'link' | 'hint';
+/**
+ * draft：owner 没提交的草稿，在这一项离开待拍板、结束或换了问题 / 选项时收进历史留底（不是决定，没有发给管家，
+ * 管家的 `board show` 也不列出来）。
+ */
+export type BoardEventKind = 'create' | 'note' | 'state' | 'edit' | 'decision' | 'reply' | 'attach' | 'link' | 'hint' | 'draft';
 
 /**
  * 这一项什么时候可以关：
@@ -125,6 +129,13 @@ export interface BoardItem {
   nextCheckAt?: number;
   /** 后台巡检当前给的提示；没有提示时缺省。 */
   hint?: BoardHint;
+  /**
+   * 上级事项（`--parent`）：这一项是它的一部分（子任务），可以多层。和依赖（等它先做完）不是一回事，
+   * 见 overview.ts。没有上级时缺省。
+   */
+  parentSeq?: number;
+  /** 管家写的「在等谁」（`--waiting-on`），如「PR 作者」「评审群双审」「外部团队」；没写时缺省。 */
+  waitingOn?: string;
 }
 
 export interface BoardEvent {
@@ -150,6 +161,10 @@ export interface BoardFile {
   createdAt: number;
 }
 
+/**
+ * owner 的草稿（一项一份）。只在它写给的那一轮拍板还在时算待提交：这一项离开待拍板、结束，或问题 / 选项
+ * 换了，就收进历史（kind = draft），不再出现在「提交 N 项」里。
+ */
 export interface BoardDraft {
   seq: number;
   author: string;
@@ -583,12 +598,14 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
   确实没有群（只有 issue、还没开工、你自己处理）：写明原因 \`--no-chat "<原因>"\`，看板上显示「无群：<原因>」。
   群查不到时会拒绝写入：先核对群 ID；确实要先写上，加 \`--allow-unverified-chat\`（看板上标「未核实」）。
 - 已经有的用 \`botmux board set\` 更新，不重复建。\`botmux board list\` 里标「缺群」的项，补上群（\`set <编号> --link chat=oc_…\`）或无群原因。交代得不清楚的，先在群里问清楚。
+- 大任务拆成几步时，每一步建一项挂到大任务下面：\`--parent <大任务编号>\`（可以多层，\`--parent none\` 取消）。父子是「它是我的一部分」，依赖（\`--depends-on\`）是「等它先做完」：一项不能依赖自己的上级。子任务都结束后，看板会标出大任务「可以收尾」，核对后把大任务改成 done。
 
 ## 推进
 - 默认用你自己的 bot 身份到相关群发消息推进：\`botmux send --chat-id <群> --top-level --mention <open_id:名字> "…"\`。
   一条消息只 @ 一个 bot，@ 放在句首；对方正在工作就先不发，记进历史，下次再发；短时间内催过、对方没有新进展的，不重复催。
 - 看现场：\`botmux history --session-id <会话> --scope chat\`，以及仓库自己的工具（如 gh）。
 - 进展和卡点及时回写：\`botmux board set <编号> --state … --stage … --progress …\`，一句话用 \`--note\` 进历史。
+- 在等别人（PR 作者、评审、外部团队）时改成 waiting，写清在等谁和什么时候再看：\`--state waiting --waiting-on "PR 作者 改评审意见" --next-check +2d\`。暂时搁置的也这样写（waiting + \`--next-check\`），看板总览把它归到「暂时搁置」，到点移到「过了复查时间」。超过 3 天没有任何更新、又没约复查时间的项，总览会标「很久没动」：要么推进，要么写进展、约下次复查。
 - 按下方「推进标准」判断哪些事你能直接做。没写推进标准时只汇报和催办，不替 owner 合并、关闭、发版、部署、删除。
 
 ## 要 owner 拍板
@@ -600,6 +617,7 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
 
 ## 附图文说明（待拍板涉及代码或界面改动时）
 - 让 owner 不用翻群就能看懂要定什么：写成 decide 的同时附一份说明页，写清背景、改了什么、改前改后对比、测试结果：\`botmux board attach <编号> explainer.html --note "图文说明"\`。能录屏的再附一段视频（.mp4 / .webm，不超过 50MB；mp4 用 H.264、加 \`-movflags +faststart\`），可以和说明页放在同一条 attach 里。
+- 更新同一份说明时沿用同一个文件名，看板会自动只显示最新版，旧版收进「历史版本」。
 - 说明页是单个 .html 文件（UTF-8，不超过 10MB）：截图内嵌成 data URL，样式写在 \`<style>\` 里。看板上不跑脚本、不加载外链（网址图片、CDN 样式和字体都会被拦掉）；相关链接挂到事项的 \`--link\` 上，不写进说明页。
 - 最小模板（截图转 data URL：\`echo "data:image/png;base64,$(base64 -w0 shot.png)"\`）：
 \`\`\`html
@@ -653,12 +671,14 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
   If there really is no chat (only an issue, not started yet, or you handle it yourself), say why: \`--no-chat "<reason>"\`; the board shows "No chat: <reason>".
   A chat that cannot be found is rejected: check the chat ID first; to write it anyway, add \`--allow-unverified-chat\` (shown as "Unverified").
 - Update existing items with \`botmux board set\` instead of creating duplicates. For items marked "missing chat" in \`botmux board list\`, add the chat (\`set <n> --link chat=oc_…\`) or a no-chat reason. Ask in the chat first if the request is unclear.
+- When a big task splits into steps, create one item per step under it: \`--parent <big task n>\` (several levels are fine; \`--parent none\` detaches). Parent/child means "it is part of me"; a dependency (\`--depends-on\`) means "wait for it to finish first", so an item cannot depend on its own parent. Once all children have ended, the board marks the parent "ready to wrap up"; verify, then set the parent to done.
 
 ## Pushing work forward
 - By default, post as your own bot in the relevant chat: \`botmux send --chat-id <chat> --top-level --mention <open_id:name> "…"\`.
   Mention exactly one bot per message, at the start. If that bot is busy, do not post; note it in the history and retry later. Do not nag about the same thing again soon if nothing changed.
 - Check the facts: \`botmux history --session-id <session> --scope chat\`, plus the repository's own tools (e.g. gh).
 - Write progress and blockers back: \`botmux board set <n> --state … --stage … --progress …\`; add a one-line \`--note\` for the history.
+- When waiting on someone else (a PR author, reviewers, another team), set it to waiting and say who and when to look again: \`--state waiting --waiting-on "PR author addressing review" --next-check +2d\`. Do the same for anything parked for now (waiting + \`--next-check\`): the board overview files it under "Parked" and moves it to "Past check time" when due. Items with no update for over 3 days and no check time are flagged "Stalled" in the overview: push them forward, or write progress and set the next check.
 - Use the "Standard" section below to decide what you may do on your own. Without a standard, only report and nudge; never merge, close, release, deploy or delete on the owner's behalf.
 
 ## Asking the owner to decide
@@ -669,6 +689,7 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
 
 ## Attaching an explainer (decisions that involve code or UI changes)
 - Let the owner understand what to decide without reading the chats: when you make such an item decide, attach an explainer page covering the background, what changed, before / after, and test results: \`botmux board attach <n> explainer.html --note "explainer"\`. If it can be screen-recorded, attach a video too (.mp4 / .webm, at most 50MB; mp4 in H.264 with \`-movflags +faststart\`); it can go in the same attach as the page.
+- When updating the same explainer, reuse its filename; the board shows only the latest version and folds older ones into "History".
 - The page is a single .html file (UTF-8, at most 10MB): screenshots inlined as data URLs, styles in \`<style>\`. The board runs no scripts and loads nothing external (image URLs, CDN styles and fonts are all blocked); put related links on the item with \`--link\`, not in the page.
 - Minimal template (screenshot to data URL: \`echo "data:image/png;base64,$(base64 -w0 shot.png)"\`):
 \`\`\`html

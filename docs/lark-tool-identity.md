@@ -9,6 +9,35 @@ Botmux 支持将会话内的 `lark-cli` 绑定到当前 bot 配置中的 App ID 
 `npm i -g @larksuite/cli@latest` 保持更新。旧版只识别 App Secret，无法使用
 Botmux 提供的短期 bot token。
 
+## 没有发起人的回合：用 bot 主人的授权（`larkUserOwnerFallback`）
+
+`--as user` 默认用本轮发起人自己的授权。脚本、Webhook、平台派发、没有创建人的定时任务这类回合**没有真人发起**，以前在这里一律被拒（`No current requesting user`）。`larkUserOwnerFallback`（默认开启）让这类回合改用 **bot 主人**对本 bot 应用的授权；主人按现有规则认定（`ownerOpenId` 显式配置且仍在管理员名单里优先，否则是名单里第一个 `ou_`）。`--as bot` 不受影响。
+
+| 回合 | 开关开启（默认） | 开关关闭 |
+|---|---|---|
+| 外部触发：经 daemon 公共入口 `/api/trigger` 提交的脚本、Webhook、平台、Dashboard 请求（本轮没有绑定真人） | 主人的授权 | 拒绝 |
+| Dashboard 管理员以主人身份续轮（`actor: "owner"`，`trg_owner_…`） | 主人的授权（不需要 `allowOwnerActor`） | 拒绝（`unattended_turn`） |
+| 定时任务，任务里既没有创建人也没有认领人（旧版本建的、无人回合里由 agent 建的） | 主人的授权 | 拒绝 |
+| 定时任务，有创建人/认领人 | 创建人/认领人自己的授权；拿不到这个人时拒绝，不改用主人 | 同左 |
+| bot 发来的消息，带签名派发记录且发起人是主人（`botmux dispatch` / `--mention` 交接） | 主人的授权 | 拒绝 |
+| bot 发来的消息，签名派发记录的发起人是别人，或者没有（未签名、绑定失败、记录读不到） | 拒绝 | 拒绝 |
+| `botmux report` 回传、会议转写、ask 续答、项目迁入通知、群监听预览等 daemon 内部中继（虽然也是 `trg_…`） | 拒绝 | 拒绝 |
+| 真人发起的回合（含主人本人） | 发起人自己的授权 | 同左 |
+
+边界：
+- **别人不能借主人的身份。** 有真人发起的回合只用这个人自己的授权，缺授权就拒绝，不改用主人；没有发起人的回合里只要有主人以外的人插过话（消息并入了正在跑的回合），这一轮就不再用主人的授权。取到凭据前后各核一次，中途有人插话、开关被关、主人变了或来源不再是「没人」（比如定时任务被认领），这次调用以 409 结束，不交出凭据。
+- 来源不明的回合（发送方类型不明、恢复回合、跨群跟进、工作流事件等）不回退，保持原来的拒绝。
+- 回退只覆盖开场来源已经确认、且之后每次并入的输入都能由发言人记录解释的回合。后来并入 Bot、定时/恢复 caller 或其他无法由 `speakers` 表示的输入后，本次执行不再回退；从 CLI PID marker 重接的进行中回合因无法恢复完整输入历史，也同样拒绝。
+- 定时任务被删除（authority 为 `revoked`）后，仍在运行的回合不再回退；已暂停任务的进行中回合，以及自动完成的 one-shot / until-done 收尾回合，可以按既有语义继续。
+- 外部触发只认 daemon 公共入口在接收时记下的标记（内存，daemon 重启后不再认，按拒绝处理）；`trg_` 前缀本身不算数，daemon 内部用同一套机制转来的别人内容（`botmux report` 回传等）不回退。
+- bot 发来的消息只有签名派发记录写明发起人是主人才回退：任何 bot 都可能被能跟它说话的人驱动，没签名、绑定失败或记录读不到都不能当成「没人」。
+- 沙箱扣留 bot 凭据（`sandboxWithholdBotSecret`）的会话、个人助理模式下不属于主人的会话不回退：前者连 bot 身份都不给，后者属于另一个人。
+- **主人还没授权本应用**：`--as user` 被拒，提示 agent 运行 `botmux auth request --scope "<所需权限>" --json`。授权链接由 botmux 私聊发给主人（私聊发不出去时在本群发一张仅主人可见的卡片），即使在单聊里也不交给 agent，agent 拿到的结果不含链接；主人授权后 `botmux auth wait` 完成，重试即可。不会让任何人「到群里发一句话」。
+- 每次用主人授权的调用都写一行审计日志：`[lark-tool:owner-fallback:audit] bot=<app> session=<会话> turn=<回合> owner=<主人> reason=<external_trigger|owner_actor|schedule_without_creator|owner_dispatch> result=<granted|owner_not_authorized|auth_request>`；开关开启时因插话、来源不明等原因不回退的调用记 `result=declined refusal=<原因>`（显式关闭开关或 per-person policy 覆盖时保持原有静默拒绝路径）。lark-cli 包装器成功时在 stderr 提示「本轮没有真人发起，--as user 使用 bot 主人的飞书授权」。
+- 关闭：Dashboard（Bot 配置 → 隔离与权限 → lark-cli 应用绑定 →「没有发起人时用主人的飞书身份」）、`/botconfig` 卡片的安全区，或 `/config set larkUserOwnerFallback off`。每次调用实时读取配置，改完立即生效，不需要重启会话。
+
+与按触发人鉴权的叠加：`triggerUserAuth` 开启且覆盖 lark-cli（勾了「飞书用户身份」，或旧配置的 `tools` 含 `lark-cli`）时，`--as user` 只认发起人本人，这个开关不生效，行为与以前完全一致（含无人值守回合的私信通知、平台授权卡片）。`triggerUserAuth` 开启但不含飞书用户身份时，`--as user` 原生执行（见下表），同样不涉及这个开关。只有 `triggerUserAuth` 关闭，或开启但只覆盖其他工具（旧配置 `tools: ["bytedcli"]`）时才会回退。`larkToolBinding` 关闭时 lark-cli 走宿主原生环境，也不涉及这个开关。
+
 ## 与按触发人鉴权（triggerUserAuth）的关系
 
 `larkToolBinding` 与 `triggerUserAuth` 职责明确分立：
@@ -107,7 +136,7 @@ bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不�
 
 新会话启动时生成自己的工具入口和配置，记录当前 App ID、品牌与真实 lark-cli 路径。botmux 用已有执行权威确定当前请求者，并查询该用户在同一应用下的授权。会话入口的访问密钥绑定应用；Linux user 调用同时复用 `execution current` 的 socket 进程血缘检查，并在异步取得 token 后复核 turn、attempt 和 worker generation 等执行状态。旧轮后台进程及其新建子进程无法取得新轮用户凭证。机器触发的执行可在没有真人 actor 时使用该轮明确许可的工具委托身份。
 
-工具启动前清除继承的旧应用/用户凭证变量，再注入本次 App ID、品牌及 bot 或 user 凭证。用户 token 不得跨应用使用，未知用户不会借用 owner 或机器默认账户。CLI 原有 stdout、stderr、退出码和工作目录保持。
+工具启动前清除继承的旧应用/用户凭证变量，再注入本次 App ID、品牌及 bot 或 user 凭证。用户 token 不得跨应用使用；有发起人但无法核验的回合不会借用 owner 或机器默认账户，只有确认没有发起人的回合才按 `larkUserOwnerFallback` 使用 owner 自己的授权（见上文）。CLI 原有 stdout、stderr、退出码和工作目录保持。
 
 bot 调用从当前应用的 SDK 获取 tenant access token，复用其缓存和到期刷新，再通过 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN` 交给工具；不向工具传递 App Secret，也不在会话启动时固定 token。凭证获取失败时拒绝执行。
 

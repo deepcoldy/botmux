@@ -54,3 +54,8 @@ and H5 or platform identities cannot submit an actor and receive
 Owner attribution alone does not publish personal CLI credentials. For a bot
 that uses trigger-user authentication, set `triggerUserAuth.allowOwnerActor`
 to `true` to opt into that bot's configured per-user credential policy.
+The one exception is `lark-cli --as user` in a bound session of a bot whose
+trigger-user authentication does not cover lark-cli: under
+`larkUserOwnerFallback` (default on) it uses the owner's own grant to the bot
+application, like any other turn nobody started. See
+[lark-tool-identity.md](lark-tool-identity.md).

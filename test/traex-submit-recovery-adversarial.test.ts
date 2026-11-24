@@ -5,6 +5,7 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
 import { createSubmitFailureChainController } from '../src/services/submit-failure-chain.js';
 import { combineSubmitCurrentFences, settleDeferredSubmitConfirmation } from '../src/services/submit-confirmation.js';
+import { createQueuedActivationReceiptObserver } from '../src/services/queued-activation-receipts.js';
 import { buildSubmitMessagePreview } from '../src/services/submit-notification.js';
 import { claudeComposerHoldsInput, decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure,
   diagnoseSubmitFailure, shouldWaitThroughBusyTurn } from '../src/services/submit-failure-diagnosis.js';
@@ -52,6 +53,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     webTerminalInputGeneration: 1, cliInterruptGeneration: 0, cliLifetimeNonce: 'lifetime',
     inputDeliveryQuarantine: null, inputDeliveryEvidence: evidence, codexBridgeQueue: queue,
     submitFailureChains: chain, combineSubmitCurrentFences, settleDeferredSubmitConfirmation,
+    createQueuedActivationReceiptObserver,
     usageLimitTracker: { currentTurn: () => 1, detectedThisTurn: () => false },
     submitActivityEvidenceSince: () => 'pty-output', readyGate: { isArmed: false },
     SUBMIT_DEFERRED_RECHECK_MS: 20_000, SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS: 2,
@@ -131,6 +133,27 @@ describe('TRAE recovery adversarial interleavings', () => {
     expect(h.backend.sendSpecialKeys).toHaveBeenCalledWith('C-c');
     expect(h.scope.cliInterruptGeneration).toBe(1);
     expect(h.backend.sendSpecialKeys.mock.calls.filter(([key]) => key === 'Enter')).toHaveLength(0);
+  });
+
+  it('settles durable submit_unconfirmed exactly once when the observer wins the second-empty-screen race', async () => {
+    const h = fixture({ dispatchAttempt: 1, acceptsRescue: false });
+    h.scope.cliAdapter.screenShowsNoPendingInput = () => true;
+    h.scope.armQuarantine(h.backend, { turnId: 'delivery', dispatchAttempt: 1 }, content);
+    h.start();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.queue.hasPendingTurn('delivery', 1)).toBe(true);
+    expect(h.scope.emitTurnTerminal).not.toHaveBeenCalled();
+
+    // The independent observer was armed before the deferred chain. Its second
+    // empty-screen verdict therefore runs first at 40s, but must drive the same
+    // synchronous release + drop + durable terminal settlement, not just drop.
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.queue.hasPendingTurn('delivery', 1)).toBe(false);
+    expect(h.scope.emitTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(h.scope.emitTurnTerminal).toHaveBeenCalledWith('delivery', 'failed', 'submit_unconfirmed', 1);
+    await vi.advanceTimersByTimeAsync(80_000);
+    expect(h.scope.emitTurnTerminal).toHaveBeenCalledTimes(1);
   });
 
   it.each([40_000, 120_000])('keeps one rescue and notice budget when the same attempt is scheduled again at %sms', async delay => {

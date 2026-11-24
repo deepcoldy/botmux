@@ -858,6 +858,11 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_STATUSLINE_CHAIN');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_STATUSLINE_GEN');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_STATUSLINE_GEN');
+    // Per-launch runtime binding: the session-scoped hooks send it back as the
+    // proof of which runtime is signalling. Off the allowlist it never reaches
+    // a tmux pane, so the daemon saw every signal as unbound and refused the
+    // ones raised while a restart was still in flight (2026-11-23).
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_RUNTIME_BINDING_ID');
   });
 
   it('keeps SSL_CERT_FILE OUT of the injected list and in its own CA-bundle list', () => {

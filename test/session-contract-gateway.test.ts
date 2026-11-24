@@ -52,6 +52,7 @@ function nativeSessionHandler(s: ReturnType<typeof fixture>, cliId = 'codex-app'
   const env: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
     logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => cliId,
     isLocalCliOpenReady: () => false, managedAuxUiSuppressed: () => true,
+    syncAntigravityGroupTitle: vi.fn(),
     isSharedAdoptSession: () => false, recordOwnershipForDaemonSession: vi.fn(),
     noteProjectAssociationChanged: vi.fn(),
     sessionStore: { updateSession: (session: unknown) => persisted.push(structuredClone(session)) },
@@ -749,6 +750,55 @@ describe('contract gateway and real worker boundaries', () => {
       expect(controller.allowsInput()).toBe(false);
     } finally { scope.restartCoordinator.reset(); }
   });
+  it('admits startup exit with an argv opening turn not yet bound by a transcript start', async () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('argv-opening-turn');
+    const legacy = vi.fn(); const worker = { send: vi.fn() }; s.ds.worker = worker as any;
+    const env: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'startup-exit', handleLegacyWorkerMessage: legacy };
+    const handle = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', env);
+    await handle({ type: 'claude_exit', code: 1, turnId: execution.turnId,
+      sessionContract: s.context(1, { runtime: s.runtime, execution }) });
+    expect(legacy).toHaveBeenCalledWith(expect.objectContaining({ type: 'claude_exit', code: 1 }));
+    expect(s.store.runtime(s.ref)?.phase).toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)?.runtime).toBeUndefined();
+  });
+
+  it('admits a current physical exit carrying an older runtime execution without granting a forged producer', () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('old-turn');
+    s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    const before = s.store.execution(s.ref, execution.executionId);
+    const next = s.controller.reserveBinding('fresh-physical', s.worker);
+    s.controller.bindRuntime('fresh-physical', s.worker, {
+      backend: 'tmux', physicalId: '222:new-start', nativeSessionId: 'new-native', proof: 'process_start',
+    });
+    const workerScope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = workerScope.beginRuntime();
+    workerScope.assign(binding.bindingId, next);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', {
+      workerSessionEventScope: workerScope,
+    });
+    // The worker removes execution from physical exits; the controller enriches
+    // the turnId back to the old execution. Exercise that real producer chain.
+    const wire = workerScope.run(binding, () => metadata({ type: 'claude_exit', code: 1, turnId: execution.turnId }));
+    expect(wire.sessionContract.scope.execution).toBeUndefined();
+    expect(s.controller.ingest(wire, s.worker).kind).toBe('current');
+    expect(s.store.runtime(s.ref, next.runtimeId)?.phase).toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)).toEqual(before);
+
+    // Same channel, but a runtime only a different worker has proven. Merely
+    // knowing its reference (and a valid old execution) must not authorize it.
+    const foreign = s.controller.bindWorker(2).worker;
+    const foreignRuntime = s.controller.reserveBinding('foreign-runtime', foreign);
+    s.controller.bindRuntime('foreign-runtime', foreign, { backend: 'tmux', physicalId: '333:foreign', proof: 'process_start' });
+    expect(s.controller.ingest({ type: 'claude_exit', code: 1,
+      sessionContract: s.context(50, { runtime: foreignRuntime, execution }) }, s.worker))
+      .toMatchObject({ kind: 'reject', reason: 'runtime_producer_unproven' });
+    expect(s.store.runtime(s.ref, foreignRuntime.runtimeId)?.phase).not.toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)).toEqual(before);
+  });
+
   it('records predecessor loss as history in the reserve-only window and still handles the later current crash', async () => {
     const s = fixture(); const execution = s.controller.admitInput('old-turn'); s.store.bindQueuedExecution(s.ref, execution, s.runtime);
     s.controller.ingest({ type: 'ready', sessionContract: s.context(1, {}) }, s.worker);
@@ -1676,5 +1726,100 @@ describe('contract gateway and real worker boundaries', () => {
     vi.stubEnv('BOTMUX_SESSION_CONTRACT_V2', '0'); const s = fixture();
     const controller = controllerForSession(s.ds, true)!;
     expect(controller).toBeDefined(); expect(controller.ingest({ type: 'ready' }, s.worker).kind).toBe('reject');
+  });
+});
+
+describe('session_ready across a worker-local rebind', () => {
+  const cleanups: Array<() => void> = [];
+  afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
+
+  function readyHarness() {
+    const scope = new WorkerSessionEventScope({ appId: 'app', sessionId: 'session' }, { workerId: 'worker', generation: 1 });
+    const oldRuntime = { runtimeId: 'runtime-old', epoch: 1 };
+    const old = scope.beginRuntime(undefined, 'same-process');
+    scope.assign(old.bindingId, oldRuntime);
+    const readyCalls: any[] = [];
+    const state: Record<string, any> = {
+      workerSessionEventScope: scope,
+      deferredSessionReady: [],
+      admitSessionCommand,
+      log: vi.fn(),
+      restoreFocusForDaemonMessage: () => {},
+      currentBotmuxTurnId: undefined,
+      pendingMessages: [],
+      closeRequested: false,
+    };
+    state.deferSessionReadyUntilRuntimeAssigned = loadWorkerFunction('deferSessionReadyUntilRuntimeAssigned', state);
+    state.takeDeferredSessionReady = loadWorkerFunction('takeDeferredSessionReady', state);
+    state.replayDeferredSessionReady = loadWorkerFunction('replayDeferredSessionReady', state);
+    const assigned = loadWorkerFunction<(msg: any) => void>('handleContractDaemonMessage', state);
+    state.handleContractDaemonMessage = (msg: any) => {
+      if (msg.type === 'runtime_contract_assigned') return assigned(msg);
+      readyCalls.push(msg);
+    };
+    state.dispatchDaemonMessage = loadWorkerFunction('dispatchDaemonMessage', state);
+    const clear = loadWorkerFunction<() => void>('clearDeferredSessionReady', state);
+    cleanups.push(clear);
+    return { scope, state, oldRuntime, readyCalls };
+  }
+
+  function replacement(h: ReturnType<typeof readyHarness>, physicalId = 'same-process') {
+    const binding = h.scope.beginRuntime(undefined, physicalId);
+    const runtime = { runtimeId: 'runtime-new', epoch: 2 };
+    return { binding, runtime };
+  }
+
+  function readyMessage(runtime: { runtimeId: string; epoch: number }) {
+    return { type: 'session_ready', source: 'clear', requestId: 'ready-request', sessionCommand: { version: 2 as const, runtime } };
+  }
+
+  function assign(h: ReturnType<typeof readyHarness>, bindingId: string, runtime: { runtimeId: string; epoch: number }) {
+    h.state.handleContractDaemonMessage({ type: 'runtime_contract_assigned', bindingId, runtime, mayExecute: true });
+  }
+
+  it('admits immediately before the worker rebinds', () => {
+    const h = readyHarness();
+    h.state.dispatchDaemonMessage(readyMessage(h.oldRuntime));
+    expect(h.readyCalls.map(msg => msg.sessionCommand.runtime)).toEqual([h.oldRuntime]);
+    expect(h.state.deferredSessionReady).toHaveLength(0);
+  });
+
+  it('defers a stale target until assignment, then replays it under the proven new runtime', () => {
+    const h = readyHarness();
+    const next = replacement(h);
+    h.state.dispatchDaemonMessage(readyMessage(h.oldRuntime));
+    expect(h.readyCalls).toHaveLength(0);
+    expect(h.state.deferredSessionReady).toHaveLength(1);
+
+    assign(h, next.binding.bindingId, next.runtime);
+    expect(h.state.deferredSessionReady).toHaveLength(0);
+    expect(h.readyCalls.map(msg => msg.sessionCommand.runtime)).toEqual([next.runtime]);
+  });
+
+  it('does not replay a deferred hook into a different physical process', () => {
+    vi.useFakeTimers();
+    const h = readyHarness();
+    const next = replacement(h, 'different-process');
+    h.state.dispatchDaemonMessage(readyMessage(h.oldRuntime));
+    assign(h, next.binding.bindingId, next.runtime);
+    expect(h.readyCalls).toHaveLength(0);
+    expect(h.state.deferredSessionReady).toHaveLength(1);
+
+    vi.advanceTimersByTime(5_001);
+    expect(h.state.deferredSessionReady).toHaveLength(0);
+    expect(h.readyCalls).toHaveLength(0);
+  });
+
+  it('expires a deferred hook when no runtime assignment arrives', () => {
+    vi.useFakeTimers();
+    const h = readyHarness();
+    const next = replacement(h);
+    h.state.dispatchDaemonMessage(readyMessage(h.oldRuntime));
+    expect(h.state.deferredSessionReady).toHaveLength(1);
+    vi.advanceTimersByTime(5_001);
+    expect(h.state.deferredSessionReady).toHaveLength(0);
+
+    assign(h, next.binding.bindingId, next.runtime);
+    expect(h.readyCalls).toHaveLength(0);
   });
 });

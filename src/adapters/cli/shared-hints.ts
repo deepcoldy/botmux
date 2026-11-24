@@ -154,7 +154,7 @@ export function buildBotmuxShellHints(
   noTransport?: boolean,
   replyDelivery?: ReplyDelivery,
   cliId?: CliId,
-  opts: { sessionKind?: WorkflowSessionKind; hideLocalAddresses?: boolean } = {},
+  opts: { sessionKind?: WorkflowSessionKind; hideLocalAddresses?: boolean; hasNativeSkillChannel?: boolean } = {},
 ): string[] {
   // No-transport session (apiOnly core-only bot OR HTTP virtual chat): drop the
   // whole send/@/helpers/silence collaboration block — same rationale as the
@@ -167,30 +167,25 @@ export function buildBotmuxShellHints(
   if (noTransport) {
     return [hiddenContextDefense(locale)].map(escapeXmlTagLikeTokens);
   }
-  // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
-  // 转发——intro / when_to_send 换成改口版，send_scope 把 `botmux send` 限定在最终
-  // 回复带不了的事（@ 别的 bot 协作 / 回报、附件或卡片、跨群或话题、本轮说明明确
-  // 要求 send 的回合），并劝阻进度播报与重复发送；commands_are_shell、heredoc 与
-  // 附件行照旧（这些场景仍要正确地 send）。how_to_send / mention_gate / feedback /
-  // 反重发这几段 send 模式专属的长段不注入。'send' 时下面每一行与改动前逐字相同。
-  // doubao 例外（transcriptPromptTeachesSend）：只留 intro / helpers / when_to_send
-  // 改口版，与改动前逐字相同，不把 send 教给归属不可靠的常驻进程。
+  // replyDelivery=transcript（自动转发最终回复，core/reply-delivery.ts）：最终回复由
+  // daemon 从会话记录自动转发，这里不再把 `botmux send` 写进常驻提示——只留 intro /
+  // helpers / when_to_send 的改口版、XPI（开时）、workflow 与防注入；围绕 send 的
+  // commands_are_shell / how_to_send / heredoc / mention_gate / attachments /
+  // feedback / 反重发提示全部不注入（附件、卡片、跨群等用法留在内置 botmux-send
+  // skill 按需查阅；多 bot 协作的 `--mention` / `--mention-back` 留在 `<identity>`
+  // 块里，doubao 例外）。没有原生 skill 通道的 CLI 例外保留一段最小操作说明：
+  // 否则模型既没有附件/heredoc/@ 硬门参数，也没有 sentinel 防双发规则可查。
+  // 'send' 时下面每一行与改动前逐字相同。
   const transcript = replyDelivery === 'transcript';
-  const teachSend = transcriptPromptTeachesSend(cliId);
   const workflowHint = workflowDiscoveryHint(locale, opts);
   const hints = (transcript
     ? [
       t('ai.shell.intro_transcript', undefined, locale),
-      ...(teachSend
-        ? [
-          t('ai.shell.commands_are_shell', undefined, locale),
-          t('ai.shell.send_scope_transcript', undefined, locale),
-          ...multilineHeredocLines(locale),
-          t('ai.routing.usage_attachments', undefined, locale),
-        ]
-        : []),
       t('ai.shell.helpers', undefined, locale),
       t('ai.shell.when_to_send_transcript', undefined, locale),
+      ...(opts.hasNativeSkillChannel === false && transcriptPromptTeachesSend(cliId)
+        ? [t('ai.shell.send_without_skill_transcript', undefined, locale)]
+        : []),
       // XPI 身份提示与投递方式无关（谁在说话 ≠ 回复怎么送），两个分支都要。
       ...(xpiAsHintOn() ? [t('ai.shell.xpi_as_hint', undefined, locale)] : []),
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
@@ -386,16 +381,17 @@ export function buildBotmuxSystemPromptText(opts: {
    *  bot-default / explicit-user guidance instead. */
   larkToolAppId?: string;
   /** Per-bot replyDelivery frozen for this session (core/reply-delivery.ts).
-   *  'transcript': the daemon forwards the final assistant message from the CLI
-   *  transcript, so the routing block reframes `botmux send` as the channel for
-   *  what the final reply cannot carry — intro_transcript, usage_send_transcript
-   *  (cross-bot @ / hand-back, attachments or cards, other chats/topics, turns
-   *  that explicitly require send), heredoc, attachments, no_progress_send_transcript,
-   *  helpers, the BOTMUX_NOTHING_TO_SEND silence sentinel, XPI, workflow,
-   *  hidden-context defense and whiteboard; the send-mode usage_send / mention
-   *  gate / feedback / anti-resend lines are dropped. <identity> keeps its full
-   *  routing_rules (mention_must included) unless the session is solo.
-   *  `noTransport` wins over it. Omitted/'send' = today. */
+   *  'transcript' (auto-forward final reply): the daemon forwards the final
+   *  assistant message from the CLI session record, so `<botmux_routing>` does
+   *  not inject extra `botmux send` prompts — only intro_transcript, helpers,
+   *  ask_wait, the BOTMUX_NOTHING_TO_SEND silence sentinel, XPI (when enabled
+   *  and non-solo), workflow, hidden-context defense and whiteboard survive;
+   *  usage_send / heredoc / mention gate / attachments / feedback / anti-resend
+   *  are dropped (attachments, cards, cross-chat stay on-demand in the built-in
+   *  `botmux-send` skill). `<identity>` keeps its collaboration routing_rules
+   *  (including `mention_must` for replying to / @-mentioning other bots) unless
+   *  the session is solo or `transcriptPromptTeachesSend(cliId)` is false.
+   *  `noTransport` wins over it. Omitted/'send' = default send wording. */
   replyDelivery?: ReplyDelivery;
   /** transcript-only: solo chat (owner + this bot). The identity block keeps
    *  name/open_id but drops routing_rules — there is no other bot to route to. */
@@ -432,8 +428,8 @@ export function buildBotmuxSystemPromptText(opts: {
   // non-injects path (short_routing) which is gated the same way.
   // transcript + solo（只有 owner 和本 bot）同样只留 name/open_id：多 bot 归属规则
   // 在 solo 会话里没有对象。transcript 非 solo 保留全部归属规则，含 mention_must：
-  // transcript 的最终回复卡不会 @ 触发本轮的 bot，跟别的 bot 协作 / 回报仍只能靠
-  // `botmux send --mention`。
+  // 自动转发的最终回复卡不会 @ 触发本轮的 bot，回复或 @ 别的 bot 协作仍要靠
+  // `botmux send --mention` / `--mention-back`（doubao 例外，不教 send）。
   const identityBlock =
     botName || botOpenId
       ? [
@@ -449,7 +445,7 @@ export function buildBotmuxSystemPromptText(opts: {
             `    ${prose('ai.identity.rule_own_part')}`,
             `    ${prose('ai.identity.rule_silent_when_other')}`,
             `    ${prose('ai.identity.rule_no_proactive_pull')}`,
-            `    ${prose('ai.identity.mention_must')}`,
+            ...(transcript && !transcriptPromptTeachesSend(cliId) ? [] : [`    ${prose('ai.identity.mention_must')}`]),
             '  </routing_rules>',
           ]),
         '</identity>',
@@ -475,30 +471,24 @@ export function buildBotmuxSystemPromptText(opts: {
   // The identity block's routing_rules carry the same @/collaboration semantics
   // and are gated on the SAME flag — see identityBlock above, which keeps the
   // harmless name/open_id and drops only the rules.
-  // transcript（三分支中优先级低于 noTransport）：最终答复写在最终回复里，`botmux
-  // send` 只留给最终回复带不了的事——改口 intro、usage_send_transcript（场景清单 +
-  // @ 三选一）、heredoc、附件、no_progress_send_transcript（不发进度、最终答复走
-  // send 时标 final）、helpers、usage_silence 的哨兵（仍是转写 fallback 的抑制规则）、
-  // XPI、workflow、防注入与白板；send 模式的 usage_send / mention_gate /
-  // feedback_response_kind / no_visible_output_ok 不注入。
+  // transcript（自动转发最终回复，三分支中优先级低于 noTransport）：常驻路由块不再
+  // 追加额外的 `botmux send` 提示——只留改口 intro、helpers、ask_wait、usage_silence
+  // 哨兵、后台任务说明、XPI（非 solo 且开启时）、workflow、防注入与白板；多 bot 协作
+  // 怎么用 `botmux send --mention` / `--mention-back` 留在上面的 `<identity>` 块里，
+  // 附件、卡片、跨群等用法留在内置 `botmux-send` skill 按需查阅。
   const routingInner = noTransport
     ? [hiddenContextDefense(locale)]
     : transcript
     ? [
       prose('ai.routing.intro_transcript'),
       '',
-      prose('ai.routing.usage_send_transcript'),
-      `- ${heredocRule}`,
-      heredocExample,
-      prose('ai.routing.usage_attachments'),
-      prose('ai.routing.no_progress_send_transcript'),
       prose('ai.routing.usage_helpers'),
       prose('ai.routing.ask_wait'),
       prose('ai.routing.usage_silence'),
       // Follows the sentinel line it relies on (BOTMUX_NOTHING_TO_SEND).
       ...claudeBackgroundTaskNote(cliId, locale).map(escapeXmlTagLikeTokens),
-      // XPI governs sends to other bots, which transcript sessions still make.
-      ...(xpiAsHintOn() ? [prose('ai.routing.xpi_as_hint')] : []),
+      // XPI governs sends to other bots, which non-solo sessions still make.
+      ...(xpiAsHintOn() && solo !== true ? [prose('ai.routing.xpi_as_hint')] : []),
       ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
       hiddenContextDefense(locale),
       ...whiteboardRouting,

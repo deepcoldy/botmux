@@ -230,7 +230,9 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
     expectVictimPreserved(runManifestGuard(victim, 'do-not-delete.txt'));
   }, 90_000);
 
-  it('settles a server that starts only after the test process exits', () => {
+  // 1s is the common case; 5s outlasts the fixed 2s waits the runner used to
+  // give an announced start (both of its sweeps), as a loaded CI host did.
+  for (const delaySeconds of [1, 5]) it(`settles a server that starts only after the test process exits (client delayed ${delaySeconds}s)`, () => {
     const root = mkdtempSync('/tmp/bmx-bun-runner-startup-reaper-');
     roots.push(root);
     mkdirSync(join(root, 'test'));
@@ -242,10 +244,11 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
     const fenceHelper = pathToFileURL(resolve('test/helpers/tmux-fence.ts')).href;
     const delayedBin = join(root, 'bin');
     mkdirSync(delayedBin);
-    writeFileSync(join(delayedBin, 'tmux'), `#!/bin/sh\nsleep 1\nexec ${JSON.stringify(realTmux!)} "$@"\n`, { mode: 0o755 });
+    writeFileSync(join(delayedBin, 'tmux'), `#!/bin/sh\nsleep ${delaySeconds}\nexec ${JSON.stringify(realTmux!)} "$@"\n`, { mode: 0o755 });
     writeFileSync(join(root, 'test', 'startup.test.ts'), `
       import { expect, it } from 'bun:test';
       import { spawn } from 'node:child_process';
+      import { readFileSync } from 'node:fs';
       import { join } from 'node:path';
       import { applyTmuxFenceEnv, createTmuxFence } from ${JSON.stringify(fenceHelper)};
       it('exits while the real client is still starting the server', () => {
@@ -255,6 +258,16 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
         const client = spawn(tmux, ['-S', ${JSON.stringify(socket)}, 'new-session', '-d', '-s', 'late', 'sleep 60'], { stdio: 'ignore', detached: true });
         client.unref();
         expect(client.pid).toBeGreaterThan(1);
+        // Wait only until the shim has recorded its synchronous pending intent
+        // (right before exec'ing the delayed wrapper's sleep). Otherwise a busy
+        // CI host can let bun exit before the detached shell even starts.
+        const serverLog = process.env.BOTMUX_TMUX_SERVER_LOG!;
+        const marker = \`pending\\t\${${JSON.stringify(socket)}}\\t\${client.pid}\`;
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline && !readFileSync(serverLog, 'utf8').includes(marker)) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        }
+        expect(readFileSync(serverLog, 'utf8')).toContain(marker);
         // The delayed real tmux has not created the server yet, and this test
         // deliberately has no afterAll. The outer runner must settle the start.
       });
@@ -272,6 +285,78 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
     try {
       expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
       for (let attempt = 0; attempt < 24; attempt++) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 75);
+      }
+      const query = spawnSync(realTmux!, ['-S', socket, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' });
+      expect(query.status, `${query.stdout}\n${query.stderr}`).not.toBe(0);
+    } finally {
+      const query = spawnSync(realTmux!, ['-S', socket, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' });
+      if (query.status === 0) {
+        const pid = Number(query.stdout.trim());
+        if (testProcessIdentity(pid)) {
+          try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        }
+      }
+    }
+  }, 90_000);
+
+  it('reaps a delayed restart when a dead server is registered on the same socket', () => {
+    const root = mkdtempSync('/tmp/bmx-bun-runner-restart-reaper-');
+    roots.push(root);
+    mkdirSync(join(root, 'test'));
+    symlinkSync(resolve('test/helpers'), join(root, 'test', 'helpers'), 'dir');
+    symlinkSync(resolve('node_modules'), join(root, 'node_modules'), 'dir');
+    const socketRoot = mkdtempSync('/tmp/bmx-bun-runner-restart-socket-');
+    roots.push(socketRoot);
+    const socket = join(socketRoot, 'socket');
+    const fenceHelper = pathToFileURL(resolve('test/helpers/tmux-fence.ts')).href;
+    const reaperHelper = pathToFileURL(resolve('scripts/test-process-reaper.mjs')).href;
+    const delayedBin = join(root, 'bin');
+    mkdirSync(delayedBin);
+    writeFileSync(join(delayedBin, 'tmux'), `#!/bin/sh\nsleep 1\nexec ${JSON.stringify(realTmux!)} "$@"\n`, { mode: 0o755 });
+    writeFileSync(join(root, 'test', 'restart.test.ts'), `
+      import { expect, it } from 'bun:test';
+      import { spawn, spawnSync } from 'node:child_process';
+      import { readFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      import { applyTmuxFenceEnv, createTmuxFence } from ${JSON.stringify(fenceHelper)};
+      import { registerTmuxServer } from ${JSON.stringify(reaperHelper)};
+      it('leaves a delayed client after retaining the previous server registration', () => {
+        const fence = createTmuxFence(process.env);
+        applyTmuxFenceEnv(fence);
+        const tmux = join(fence.binDir, 'tmux');
+        const socket = ${JSON.stringify(socket)};
+        const oldClient = spawnSync(tmux, ['-S', socket, 'new-session', '-d', '-s', 'old', 'sleep 60'], { encoding: 'utf8' });
+        expect(oldClient.status, oldClient.stderr).toBe(0);
+        expect(registerTmuxServer(${JSON.stringify(realTmux!)}, socket, { env: process.env })).not.toBeNull();
+        const oldKill = spawnSync(${JSON.stringify(realTmux!)}, ['-S', socket, 'kill-server'], { encoding: 'utf8' });
+        expect(oldKill.status, oldKill.stderr).toBe(0);
+        // The append-only registry still contains the old pending row and full
+        // server identity. They must not hide this new start on the same socket.
+        const client = spawn(tmux, ['-S', socket, 'new-session', '-d', '-s', 'new', 'sleep 60'], { stdio: 'ignore', detached: true });
+        client.unref();
+        expect(client.pid).toBeGreaterThan(1);
+        const serverLog = process.env.BOTMUX_TMUX_SERVER_LOG!;
+        const marker = \`pending\\t\${socket}\\t\${client.pid}\`;
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline && !readFileSync(serverLog, 'utf8').includes(marker)) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        }
+        expect(readFileSync(serverLog, 'utf8')).toContain(marker);
+        // Deliberately no teardownTmuxFence: both outer-runner sweeps must settle it.
+      });
+    `);
+    const result = spawnSync(process.execPath, [resolve('scripts/run-bun-tests.mjs')], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 60_000,
+      env: { ...process.env, CI: 'true', BOTMUX_BUN_TEST_CONCURRENCY: '1',
+        PATH: `${delayedBin}:${process.env.PATH}` },
+    });
+
+    try {
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+      for (let attempt = 0; attempt < 34; attempt++) {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 75);
       }
       const query = spawnSync(realTmux!, ['-S', socket, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' });

@@ -475,6 +475,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
   transferSession: vi.fn(async () => ({ ok: true })),
   forkSession: vi.fn(async () => ({ ok: true, childSessionId: 'child-sess-1' })),
   isForkCapableSession: vi.fn(() => true),
+  isForkSourceBusy: (ds: DaemonSession) => !!ds.worker && !ds.worker.killed
+    && ds.lastScreenStatus !== 'idle' && ds.lastScreenStatus !== 'limited',
   // /relay --create empty-leader path closes the scratch via this; default
   // resolves as idempotent close so unrelated tests don't need to think
   // about it.
@@ -754,7 +756,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession, discoverResumableSessionsForBot } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, cancelQueuedForks, drainQueuedForks, isPendingForkTopic, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession, discoverResumableSessionsForBot } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { setChatStreamingCardPin } from '../src/services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
@@ -961,6 +963,7 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
     getActiveCount: vi.fn(() => activeSessions.size),
     lastRepoScan: new Map(),
     prewarmDocCommentSession: vi.fn(async () => {}),
+    canRunQueuedFork: vi.fn(() => true),
   };
 }
 
@@ -2533,6 +2536,243 @@ describe('handleCommand', () => {
   });
 
   describe('/fork sub-topic', () => {
+    it.each(['available', 'withdrawn', 'source changed', 'source replaced'] as const)(
+      'queues a dedicated-group /fork until idle with original command %s', async condition => {
+        vi.mocked(isSessionGroup).mockReturnValue(true);
+        onTestFinished(() => { vi.mocked(isSessionGroup).mockReturnValue(false); });
+        vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({
+          items: [{ message_id: id, deleted: condition === 'withdrawn' }],
+        }));
+        const ds = makeLegacyLarkSession({ scope: 'chat', lastScreenStatus: 'working', session: makeSession({
+          cliId: 'antigravity', scope: 'chat', rootMessageId: CHAT_ID, ownerOpenId: 'ou_sender', cliSessionId: 'agy-parent',
+        }) });
+        const deps = makeDeps(ds);
+        const key = sessionKey(CHAT_ID, LARK_APP_ID);
+        deps.activeSessions.set(key, ds);
+        const msg = makeLarkMessage('/fork 继承上下文', { messageId: 'om_waiting_fork', chatId: CHAT_ID, rootId: '' });
+        await handleCommand('/fork', CHAT_ID, msg, deps, LARK_APP_ID);
+        await handleCommand('/fork', CHAT_ID, msg, deps, LARK_APP_ID);
+        await drainQueuedForks(ds);
+        const target = { mode: 'thread', rootMessageId: msg.messageId };
+        expect(deps.sessionReply).toHaveBeenCalledExactlyOnceWith(CHAT_ID, expect.any(String),
+          'interactive', LARK_APP_ID, msg.messageId, { replyTarget: target, uuid: expect.stringMatching(/^[a-f0-9]{40}$/) });
+        expect(replyMessage).not.toHaveBeenCalled();
+        expect(forkSession).not.toHaveBeenCalled();
+        expect(isPendingForkTopic(ds, msg.messageId)).toBe(true);
+
+        if (condition === 'source changed') ds.session.cliSessionId = 'agy-new';
+        if (condition === 'source replaced') deps.activeSessions.set(key, makeDaemonSession());
+        ds.lastScreenStatus = 'idle';
+        await Promise.all([drainQueuedForks(ds), drainQueuedForks(ds)]);
+        await drainQueuedForks(ds);
+        expect(isPendingForkTopic(ds, msg.messageId)).toBe(false);
+        if (condition === 'available') {
+          expect(replyMessage).toHaveBeenCalledTimes(1);
+          expect(vi.mocked(replyMessage).mock.calls[0]?.slice(0, 5)).toEqual([
+            LARK_APP_ID, msg.messageId, expect.any(String), 'post', true,
+          ]);
+          expect(forkSession).toHaveBeenCalledExactlyOnceWith('sess-001', CHAT_ID, msg.messageId, 'group', 'thread',
+            expect.objectContaining({ turnId: msg.messageId, forkTaskText: '继承上下文' }));
+        } else {
+          expect(forkSession).not.toHaveBeenCalled();
+          expect(replyMessage).not.toHaveBeenCalled();
+          if (condition === 'source changed') {
+            expect(deps.sessionReply).toHaveBeenLastCalledWith(CHAT_ID, expect.any(String),
+              'text', LARK_APP_ID, msg.messageId, { replyTarget: target });
+          }
+        }
+      },
+    );
+
+    async function queueDedicatedForkForTest(messageId = 'om_queued_fixture') {
+      vi.mocked(isSessionGroup).mockReturnValue(true);
+      onTestFinished(() => { vi.mocked(isSessionGroup).mockReturnValue(false); });
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({
+        items: [{ message_id: id, deleted: false }],
+      }));
+      const ds = makeLegacyLarkSession({ scope: 'chat', lastScreenStatus: 'working', session: makeSession({
+        cliId: 'antigravity', scope: 'chat', rootMessageId: CHAT_ID, ownerOpenId: 'ou_sender', cliSessionId: 'agy-parent',
+      }) });
+      const deps = makeDeps(ds);
+      const key = sessionKey(CHAT_ID, LARK_APP_ID);
+      deps.activeSessions.set(key, ds);
+      const msg = makeLarkMessage('/fork 继承上下文', { messageId, chatId: CHAT_ID, rootId: '' });
+      await handleCommand('/fork', CHAT_ID, msg, deps, LARK_APP_ID);
+      expect(isPendingForkTopic(ds, messageId)).toBe(true);
+      expect(forkSession).not.toHaveBeenCalled();
+      return { ds, deps, msg, key };
+    }
+
+    it('re-checks live route authorization before executing a queued fork', async () => {
+      const { ds, deps, msg } = await queueDedicatedForkForTest('om_fork_revoked');
+      deps.canRunQueuedFork = vi.fn(() => false);
+      ds.lastScreenStatus = 'idle';
+      await drainQueuedForks(ds);
+      expect(deps.canRunQueuedFork).toHaveBeenCalledExactlyOnceWith(ds, msg);
+      expect(forkSession).not.toHaveBeenCalled();
+      expect(isPendingForkTopic(ds, msg.messageId)).toBe(false);
+      expect(deps.sessionReply).toHaveBeenLastCalledWith(CHAT_ID, expect.any(String),
+        'text', LARK_APP_ID, msg.messageId, { replyTarget: { mode: 'thread', rootMessageId: msg.messageId } });
+    });
+
+    it('settles the old queue on close before replacement readiness without draining the old object', async () => {
+      const { ds, deps, msg, key } = await queueDedicatedForkForTest('om_fork_close_replaced');
+      ds.session.status = 'closed';
+      deps.activeSessions.delete(key);
+      await cancelQueuedForks(ds, 'source_changed');
+      const replacement = makeDaemonSession({ scope: 'chat', lastScreenStatus: 'idle' });
+      deps.activeSessions.set(key, replacement);
+      await drainQueuedForks(replacement);
+      expect(isPendingForkTopic(ds, msg.messageId)).toBe(false);
+      expect(isPendingForkTopic(replacement, msg.messageId)).toBe(false);
+      expect(forkSession).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenLastCalledWith(CHAT_ID, expect.any(String),
+        'text', LARK_APP_ID, msg.messageId, { replyTarget: { mode: 'thread', rootMessageId: msg.messageId } });
+    });
+
+    it('does not resume a provider-waiting drain after cancellation and same-object replacement', async () => {
+      const { ds, deps, msg, key } = await queueDedicatedForkForTest('om_fork_cancel_provider_wait');
+      ds.lastScreenStatus = 'idle';
+      let releaseProvider!: () => void;
+      const providerWait = new Promise<void>(resolve => { releaseProvider = resolve; });
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => {
+        await providerWait;
+        return { items: [{ message_id: id, deleted: false }] };
+      });
+      const draining = drainQueuedForks(ds);
+      await vi.waitFor(() => expect(getMessageDetail).toHaveBeenCalledOnce());
+      await cancelQueuedForks(ds, 'source_changed');
+      // Keep both the DaemonSession object and native id: only the Session
+      // generation changes, which must still invalidate the old awaiter.
+      ds.session = makeSession({ sessionId: 'sess-provider-replacement', cliId: 'antigravity', scope: 'chat',
+        rootMessageId: CHAT_ID, cliSessionId: 'agy-parent' });
+      deps.activeSessions.set(key, ds);
+      releaseProvider();
+      await draining;
+      expect(deps.canRunQueuedFork).not.toHaveBeenCalled();
+      expect(forkSession).not.toHaveBeenCalled();
+      expect(isPendingForkTopic(ds, msg.messageId)).toBe(false);
+    });
+
+    it('does not requeue an in-flight fork after close replaces its source session', async () => {
+      const { ds, deps, msg, key } = await queueDedicatedForkForTest('om_fork_inflight_replaced');
+      ds.lastScreenStatus = 'idle';
+      vi.mocked(forkSession).mockImplementationOnce(async () => {
+        await cancelQueuedForks(ds, 'source_changed');
+        ds.session = makeSession({ sessionId: 'sess-replacement', cliId: 'antigravity', scope: 'chat', rootMessageId: CHAT_ID });
+        deps.activeSessions.set(key, ds);
+        return { ok: false, error: 'worker_busy' };
+      });
+      await drainQueuedForks(ds);
+      expect(forkSession).toHaveBeenCalledOnce();
+      expect(isPendingForkTopic(ds, msg.messageId)).toBe(false);
+    });
+
+    it('continues with the next queued fork when one cancellation notice fails', async () => {
+      const { ds, deps, key } = await queueDedicatedForkForTest('om_fork_notice_a');
+      const second = makeLarkMessage('/fork 第二个任务', { messageId: 'om_fork_notice_b', chatId: CHAT_ID, rootId: '' });
+      await handleCommand('/fork', CHAT_ID, second, deps, LARK_APP_ID);
+      expect(deps.activeSessions.get(key)).toBe(ds);
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => {
+        if (id === 'om_fork_notice_a') throw new Error('provider lookup failed');
+        return { items: [{ message_id: id, deleted: false }] };
+      });
+      vi.mocked(deps.sessionReply).mockRejectedValueOnce(new Error('provider write failed'));
+      ds.lastScreenStatus = 'idle';
+      await expect(drainQueuedForks(ds)).resolves.toBeUndefined();
+      expect(isPendingForkTopic(ds, 'om_fork_notice_a')).toBe(false);
+      expect(isPendingForkTopic(ds, 'om_fork_notice_b')).toBe(false);
+      expect(forkSession).toHaveBeenCalledTimes(1);
+      expect(forkSession).toHaveBeenCalledWith('sess-001', CHAT_ID, 'om_fork_notice_b', 'group', 'thread',
+        expect.objectContaining({ turnId: 'om_fork_notice_b' }));
+    });
+
+    it('rejects a quoted session-group fork before creating an unprotected topic anchor', async () => {
+      vi.mocked(isSessionGroup).mockReturnValue(true);
+      onTestFinished(() => { vi.mocked(isSessionGroup).mockReturnValue(false); });
+      const ds = makeLegacyLarkSession({ scope: 'chat', lastScreenStatus: 'idle', session: makeSession({
+        cliId: 'antigravity', scope: 'chat', rootMessageId: CHAT_ID, ownerOpenId: 'ou_sender', cliSessionId: 'agy-parent',
+      }) });
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
+      const quoted = makeLarkMessage('/fork 引用任务', {
+        messageId: 'om_fork_quoted', rootId: 'om_some_other_message', chatId: CHAT_ID,
+      });
+      await handleCommand('/fork', CHAT_ID, quoted, deps, LARK_APP_ID);
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(replyMessage).not.toHaveBeenCalled();
+      expect(getAvailableBots).not.toHaveBeenCalled();
+      expect(forkSession).not.toHaveBeenCalled();
+      expect(isPendingForkTopic(ds, quoted.messageId)).toBe(false);
+      expect(deps.sessionReply).toHaveBeenCalledOnce();
+    });
+
+    it('uses the idle notification that arrives while the failed fork seed is being recalled', async () => {
+      vi.mocked(isSessionGroup).mockReturnValue(true);
+      onTestFinished(() => { vi.mocked(isSessionGroup).mockReturnValue(false); });
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: false }] }));
+      const ds = makeLegacyLarkSession({ scope: 'chat', lastScreenStatus: 'working', session: makeSession({
+        cliId: 'antigravity', scope: 'chat', rootMessageId: CHAT_ID, ownerOpenId: 'ou_sender', cliSessionId: 'agy-parent',
+      }) });
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
+      const msg = makeLarkMessage('/fork 继续任务', { messageId: 'om_fork_retry', chatId: CHAT_ID, rootId: '' });
+      await handleCommand('/fork', CHAT_ID, msg, deps, LARK_APP_ID);
+      vi.mocked(replyMessage).mockResolvedValueOnce('om_seed_first').mockResolvedValueOnce('om_seed_retry');
+      vi.mocked(forkSession).mockImplementationOnce(async () => {
+        ds.lastScreenStatus = 'working';
+        return { ok: false, error: 'worker_busy' };
+      });
+      vi.mocked(deleteMessage).mockImplementationOnce(async () => {
+        ds.lastScreenStatus = 'idle';
+        await drainQueuedForks(ds);
+        return true;
+      });
+      ds.lastScreenStatus = 'idle';
+      await drainQueuedForks(ds);
+      expect(forkSession).toHaveBeenCalledTimes(2);
+      expect(deleteMessage).toHaveBeenCalledExactlyOnceWith(LARK_APP_ID, 'om_seed_first');
+      expect(vi.mocked(replyMessage).mock.calls[0]?.[5]).not.toBe(vi.mocked(replyMessage).mock.calls[1]?.[5]);
+      expect(ds.session.forkChildSessionIds).toEqual(['child-sess-1']);
+      expect(isPendingForkTopic(ds, msg.messageId)).toBe(false);
+    });
+
+    it.each([true, false])('uses an Antigravity session-group command as the topic root (thread created: %s)', async threadCreated => {
+      vi.mocked(isSessionGroup).mockReturnValue(true);
+      onTestFinished(() => { vi.mocked(isSessionGroup).mockReturnValue(false); });
+      vi.mocked(replyMessage).mockResolvedValue('om_fork_seed');
+      vi.mocked(getMessageThreadId).mockResolvedValue(threadCreated ? 'omt_fork_child' : null);
+      const ds = makeDaemonSession({ scope: 'chat', lastScreenStatus: 'idle', session: makeSession({
+        cliId: 'antigravity', scope: 'chat', rootMessageId: CHAT_ID, ownerOpenId: 'ou_sender', cliSessionId: 'agy-parent',
+      }) });
+      const deps = makeDeps(ds);
+      const task = '检查继承的上下文';
+      deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
+      vi.mocked(replyMessage).mockImplementationOnce(async () => {
+        expect(isPendingForkTopic(ds, 'om_fork_command')).toBe(true);
+        return 'om_fork_seed';
+      });
+      await handleCommand('/fork', CHAT_ID, makeLarkMessage(`/fork ${task}`, {
+        messageId: 'om_fork_command', rootId: 'om_fork_command', chatId: CHAT_ID,
+      }), deps, LARK_APP_ID);
+
+      expect(isPendingForkTopic(ds, 'om_fork_command')).toBe(false);
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(vi.mocked(replyMessage).mock.calls[0]?.slice(0, 5)).toEqual([
+        LARK_APP_ID, 'om_fork_command', expect.stringContaining(task), 'post', true,
+      ]);
+      expect(vi.mocked(replyMessage).mock.calls[0]?.[5]).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+      if (threadCreated) {
+        expect(forkSession).toHaveBeenCalledWith('sess-001', CHAT_ID, 'om_fork_command', 'group', 'thread',
+          expect.objectContaining({ turnId: 'om_fork_command', larkThreadId: 'omt_fork_child', forkTaskText: task }));
+        expect(ds.session.forkChildSessionIds).toEqual(['child-sess-1']);
+        expect(deps.sessionReply).not.toHaveBeenCalled();
+      } else {
+        expect(forkSession).not.toHaveBeenCalled();
+        expect(deleteMessage).toHaveBeenCalledExactlyOnceWith(LARK_APP_ID, 'om_fork_seed');
+      }
+    });
+
     it.each([
       ['codex', 'topic'],
       ['claude-code', 'topic'],
@@ -8368,6 +8608,14 @@ describe('handleCommand', () => {
         expect(generateAuthUrl).toHaveBeenCalledWith(
           'app-1', 'secret-1', 'feishu', ['docx:document:write_only', 'drive:file:upload'], 'ou_sender',
         );
+      });
+
+      // 附件下载失败的提示让人发 `/login --scope im:resource` 单独授权；它不在建 bot 用的
+      // 用户权限清单里（用户身份要企业管理员审批），但必须能申请。
+      it('accepts the on-demand attachment download scope', async () => {
+        const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope im:resource'), deps, LARK_APP_ID);
+        expect(generateAuthUrl).toHaveBeenCalledWith('app-1', 'secret-1', 'feishu', ['im:resource'], 'ou_sender');
       });
 
       // A typo does not degrade — Feishu rejects the whole authorize URL with

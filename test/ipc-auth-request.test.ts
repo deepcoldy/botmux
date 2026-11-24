@@ -441,6 +441,40 @@ describe('agent authorization', () => {
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
 
+  it('tells the agent which scopes the grant left out and that the app version awaits enterprise review', async () => {
+    requestId = (await (await post()).json()).requestId;
+    const missingScopes = ['docs:document.comment:delete', 'im:feed.flag:read'];
+    poll.mockResolvedValue({
+      status: 'failed', error: 'authorization_scope_missing', missingScopes,
+      appVersionReview: { state: 'in_review', version: '1.0.11', versionId: 'oav_pending' },
+    });
+    const response = await post('auth-status', { requestId });
+    expect(response.status).toBe(400);
+    const body = await response.json() as Record<string, any>;
+    // 错误码不变：既有调用方照旧按 authorization_scope_missing 处理。
+    expect(body).toMatchObject({
+      ok: false, status: 'failed', error: 'authorization_scope_missing', missingScopes,
+      appVersionReview: { state: 'in_review', version: '1.0.11' },
+    });
+    for (const scope of missingScopes) expect(body.message).toContain(scope);
+    expect(body.message).toContain('1.0.11');
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+  });
+
+  it('only lists the missing scopes when the app version state is unknown', async () => {
+    requestId = (await (await post()).json()).requestId;
+    poll.mockResolvedValue({
+      status: 'failed', error: 'authorization_scope_missing', missingScopes: ['im:feed.flag:read'],
+      appVersionReview: { state: 'unknown', reason: 'app_versions code=99991672' },
+    });
+    const body = await (await post('auth-status', { requestId })).json() as Record<string, any>;
+    expect(body).toMatchObject({ ok: false, error: 'authorization_scope_missing', missingScopes: ['im:feed.flag:read'] });
+    expect(body.appVersionReview).toEqual({ state: 'unknown' });
+    expect(body.message).toContain('im:feed.flag:read');
+    // 内部诊断（接口错误码等）只进日志，不进给用户/agent 的说明。
+    expect(body.message).not.toContain('99991672');
+  });
+
   it('hands the granted token to the same human’s live follow-up turn', async () => {
     requestId = (await (await post()).json()).requestId;
     // The follow-up turn is live BEFORE the waiting CLI polls again, and that
@@ -1136,6 +1170,51 @@ esac
     expect(body.message).toBe(t('provider_auth.ready_bytedcli', undefined, 'zh'));
     expect(dm).not.toHaveBeenCalled();
     expect(replies).toEqual([]);
+  });
+
+  it('adopts a recovered local ByteCloud login when the turn started with [reason=provider_unavailable]', async () => {
+    session.reportedIdentityModel.model = 'proven';
+    cliIdentity.writeSessionIdentity(config.session.dataDir, 'auth-session', {
+      tool: 'bytedcli', mode: 'denied', turnId: 'om_turn', openId: 'ou_sender',
+      message: 'botmux: bytedcli 授权服务暂时不可用。\n[reason=provider_unavailable]',
+    }, 'proven');
+    onTestFinished(() => cliIdentity.forgetProvenIdentityContent(config.session.dataDir, 'auth-session'));
+    vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'authorized' });
+    vi.spyOn(bytedcliAuth, 'mintBytedcliJwts').mockResolvedValue({ cloudJwt: 'recovered-cloud-jwt' });
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const response = await ask({ provider: 'bytedcli' });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { message: string };
+    expect(body).toMatchObject({
+      ok: true, provider: 'bytedcli', status: 'ready',
+      message: t('provider_auth.ready_bytedcli_now', undefined, 'zh'),
+    });
+    expect(cliIdentity.recallProvenIdentityContent(config.session.dataDir, 'auth-session', 'om_turn', 'bytedcli'))
+      .toContain("BYTEDCLI_USER_CLOUD_JWT='recovered-cloud-jwt'");
+    expect(dm).not.toHaveBeenCalled();
+    expect(replies).toEqual([]);
+  });
+
+  it('returns status unavailable (HTTP 200) instead of 500 or ready when adopting local ByteCloud hits a second transient failure', async () => {
+    session.reportedIdentityModel.model = 'proven';
+    cliIdentity.writeSessionIdentity(config.session.dataDir, 'auth-session', {
+      tool: 'bytedcli', mode: 'denied', turnId: 'om_turn', openId: 'ou_sender',
+      message: 'botmux: bytedcli 授权服务暂时不可用。\n[reason=provider_unavailable]',
+    }, 'proven');
+    onTestFinished(() => cliIdentity.forgetProvenIdentityContent(config.session.dataDir, 'auth-session'));
+    vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'authorized' });
+    vi.spyOn(bytedcliAuth, 'mintBytedcliJwts').mockRejectedValue(
+      new Error('bytedcli authorization service unavailable (mint personal JWT)'),
+    );
+    const response = await ask({ provider: 'bytedcli' });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { message: string };
+    expect(body).toMatchObject({
+      ok: true, provider: 'bytedcli', status: 'unavailable',
+      message: t('provider_auth.ready_bytedcli_unavailable', undefined, 'zh'),
+    });
+    expect(cliIdentity.recallProvenIdentityContent(config.session.dataDir, 'auth-session', 'om_turn', 'bytedcli'))
+      .toContain('[reason=provider_unavailable]');
   });
 
   it('an attended ByteCloud refusal also carries the Meego link when that login is missing too: one DM', async () => {

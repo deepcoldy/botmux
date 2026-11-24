@@ -421,11 +421,11 @@ describe('claude-code buildArgs', () => {
       for (const prompt of prompts) {
         expect(prompt).toContain('botmux skill show botmux-send');
       }
-      // Transcript delivery still sends attachments / cross-bot messages, so it
-      // keeps the pointer; no-transport sessions and doubao's transcript prompt
-      // (send is deliberately untaught there) do not advertise send at all.
-      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).toContain('botmux skill show botmux-send');
-      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).toContain('botmux skill show botmux-send');
+      // No-transport and transcript (auto-forward final reply) modes keep the
+      // routing block minimal: attachments / cards / cross-chat stay on-demand
+      // in the built-in `botmux-send` skill rather than in the always-on prompt.
+      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).not.toContain('botmux skill show botmux-send');
       expect(buildBotmuxSystemPromptText({ locale, noTransport: true })).not.toContain('botmux skill show botmux-send');
       expect(buildBotmuxShellHints(locale, true).join('\n')).not.toContain('botmux skill show botmux-send');
       expect(buildBotmuxShellHints(locale, false, 'transcript', 'doubao').join('\n')).not.toContain('botmux skill show botmux-send');
@@ -540,32 +540,27 @@ describe('claude-code buildArgs', () => {
     expect(buildBotmuxShellHints('en', false, 'send').join('\n')).toBe(shellDefault);
   });
 
-  // ── replyDelivery=transcript（支持转写的 CLI 的缺省）：最终回复由 daemon 从转写
-  //    自动转发。两条注入路径都不再把 botmux send 当回复通道（没有「必须 send 回复」
-  //    「唯一方式」、反馈页脚与反重发这些 send 模式专属提示），只把它留给最终回复带
-  //    不了的事：跨 bot @ / 回报、附件、多行 heredoc 的正确写法；哨兵、上下文命令与
-  //    防注入照旧。
-  it('keeps botmux send on BOTH injection paths only for what the final reply cannot carry under replyDelivery=transcript', () => {
+  // ── replyDelivery=transcript（自动转发最终回复，按需显式开启）：最终回复由 daemon
+  //    从会话记录自动转发。常驻路由块不再额外塞 `botmux send` 提示，也没有「不要发
+  //    进度 / 收到 / 阶段小结」这类限制；附件/卡片/跨群留在 botmux-send skill 按需
+  //    查阅；仅在多 bot `<identity>` 协作块里说明用 `--mention` / `--mention-back`。
+  it('adds no extra botmux send or anti-progress prompts to routing on EITHER injection path under replyDelivery=transcript', () => {
     const sys = buildBotmuxSystemPromptText({ locale: 'en', replyDelivery: 'transcript' });
     const shell = buildBotmuxShellHints('en', false, 'transcript').join('\n');
     for (const prompt of [sys, shell]) {
       expect(prompt).toContain('automatically forwarded back to Lark');
-      // The reply channel is the final message, not a send.
+      // No extra `botmux send` instructions or anti-progress prohibitions in routing.
+      expect(prompt).not.toContain('botmux send');
       expect(prompt).not.toContain('you MUST reply via');
       expect(prompt).not.toContain('the only way');
       expect(prompt).not.toContain('feedback buttons');
       expect(prompt).not.toContain('no visible');
-      // send survives for collaboration / hand-back, attachments and other chats,
-      // with the @ decision, multi-line heredoc and a ban on progress sends.
-      expect(prompt).toContain('only for what the final reply cannot carry');
-      expect(prompt).toContain('--mention-back');
-      expect(prompt).toContain('--no-mention');
-      expect(prompt).toContain("<<'EOF'");
-      expect(prompt).toContain('--images');
-      expect(prompt).toContain('progress broadcasts');
-      // An answer that must itself go through send is declared final, so the
-      // forwarded final reply does not post it a second time.
-      expect(prompt).toContain('--response-kind final');
+      expect(prompt).not.toContain("<<'EOF'");
+      expect(prompt).not.toContain('--images');
+      expect(prompt).not.toContain('--response-kind final');
+      expect(prompt).not.toContain('progress broadcasts');
+      expect(prompt).not.toContain('interim summaries');
+      expect(prompt).not.toContain('got it');
       // 哨兵语义与上下文命令保留。
       expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
       expect(prompt).toContain('botmux history');
@@ -575,10 +570,15 @@ describe('claude-code buildArgs', () => {
     const shellZh = buildBotmuxShellHints('zh', false, 'transcript').join('\n');
     for (const prompt of [sysZh, shellZh]) {
       expect(prompt).toContain('自动转发回飞书');
-      expect(prompt).toContain('只用于最终回复带不了的事');
-      expect(prompt).toContain('不要用');
+      expect(prompt).not.toContain('botmux send');
       expect(prompt).not.toContain('唯一方式');
       expect(prompt).not.toContain('必须用 `botmux send` 发送回复');
+      expect(prompt).not.toContain('进度播报');
+      expect(prompt).not.toContain('阶段小结');
+      expect(prompt).not.toContain('「收到」');
+      expect(prompt).not.toContain('「在看」');
+      expect(prompt).not.toContain("<<'EOF'");
+      expect(prompt).not.toContain('--images');
       expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
       expect(prompt).toContain('botmux history');
     }
@@ -642,42 +642,48 @@ describe('claude-code buildArgs', () => {
     expect(buildBotmuxShellHints('en', true, 'send', 'cursor')).toEqual(buildBotmuxShellHints('en', true));
   });
 
-  it('transcript identity keeps every routing rule incl. mention_must; solo drops routing_rules; noTransport still wins', () => {
+  it('transcript identity keeps every routing rule incl. mention_must (--mention / --mention-back); solo drops routing_rules; noTransport still wins', () => {
     const solo = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
     expect(solo).toContain('<name>Bot</name>');
     expect(solo).toContain('<open_id>ou_x</open_id>');
     expect(solo).not.toContain('<routing_rules>');
-    expect(solo).not.toContain('you MUST `botmux send --mention');
+    expect(solo).not.toContain('botmux send');
     const group = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: false });
     expect(group).toContain('<routing_rules>');
     expect(group).toContain('Route by @name and open_id');
     expect(group).toContain('Do only your part');
     expect(group).toContain('stay silent');
     expect(group).toContain('Do not pull other bots in');
-    // The transcript final card never @-s the bot that triggered the turn, so
-    // collaborating with / reporting back to a bot still needs `--mention`.
+    // The auto-forwarded final card never @-s the bot that triggered the turn, so
+    // replying to or @-mentioning another bot still needs `--mention` / `--mention-back`.
     expect(group).toContain('you MUST `botmux send --mention');
+    expect(group).toContain('--mention-back');
     // noTransport 优先级最高：transcript 标志不改变 no-transport 的折叠输出。
     const noTransport = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true });
     expect(buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true, replyDelivery: 'transcript', solo: true })).toBe(noTransport);
     expect(buildBotmuxShellHints('en', true, 'transcript')).toEqual(buildBotmuxShellHints('en', true));
   });
 
-  it('forwards replyDelivery/solo into --append-system-prompt (claude-code daemon default = transcript, no botmux send), but v3 goal-mode pins send wording', () => {
+  it('forwards replyDelivery/solo into --append-system-prompt (no extra send prompt in routing, bot collaboration kept in identity), and v3 goal-mode pins send wording', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
     const prompt = args[args.indexOf('--append-system-prompt') + 1];
     expect(prompt).toContain('自动转发回飞书');
-    expect(prompt).toContain('只用于最终回复带不了的事');
-    expect(prompt).not.toContain('必须用 `botmux send` 发送回复');
+    expect(prompt).not.toContain('botmux send');
+    expect(prompt).not.toContain('进度播报');
     expect(prompt).not.toContain('<routing_rules>');
     expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
     expect(prompt).toContain('botmux history');
-    // 非 solo：identity 保留全部归属规则，含「跟别的 bot 协作必须 --mention」。
+    // 非 solo：identity 保留全部归属规则，含回复 / @ 别的 bot 协作必须 --mention / --mention-back；
+    // routing 块本身仍不加额外的 botmux send 或禁止发进度提示。
     const groupArgs = adapter.buildArgs({ sessionId: 's', resume: false, botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: false });
     const groupPrompt = groupArgs[groupArgs.indexOf('--append-system-prompt') + 1];
+    const routingBlock = groupPrompt.match(/<botmux_routing>[\s\S]*?<\/botmux_routing>/)?.[0] ?? '';
+    expect(routingBlock).not.toContain('botmux send');
+    expect(routingBlock).not.toContain('进度播报');
     expect(groupPrompt).toContain('<routing_rules>');
     expect(groupPrompt).toContain('只做分给自己的部分');
-    expect(groupPrompt).toContain('跟别的 bot 协作必须 `botmux send --mention');
+    expect(groupPrompt).toContain('botmux send --mention');
+    expect(groupPrompt).toContain('--mention-back');
     const previous = process.env[GOAL_ENV.V3_MARKER];
     process.env[GOAL_ENV.V3_MARKER] = '1';
     try {

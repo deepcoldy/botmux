@@ -28,6 +28,8 @@ import {
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
   writeScheduleBotGrantConfig,
+  writeGlobalTaskRoutingConfig,
+  patchGlobalTaskRoutingConfig,
   type ScheduleBotGrant,
   SESSION_CLEANUP_HOUR_OPTIONS,
   SESSION_CLEANUP_MIN_INTERVAL_MINUTES,
@@ -159,6 +161,17 @@ export interface ResolvedDashboardSettingsView {
   /** Machine-wide multi-topic orchestration switch. Default ON. The nested
    *  task-tree card switch is default OFF and optional. */
   multiTopic: { enabled: boolean; taskTreeCard?: boolean };
+  /** Machine-wide task-routing config; enabled defaults false. */
+  taskRouting: import('../core/task-routing/model.js').TaskRoutingGlobalConfig & {
+    enabled: boolean;
+    botOptions?: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      online: boolean;
+      oneShotAllowed: boolean;
+    }>;
+  };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
   /** Proxy for binary self-update downloads, null/absent = unset. */
@@ -206,6 +219,10 @@ export interface SettingsWriteApplierDeps {
   writeHostOverloadAlertConfig: (config: import('../global-config.js').HostOverloadAlertGlobalConfig) => void;
   /** Write the bot-grant entry; defaults are removed, other scheduleDelegation keys kept. */
   writeScheduleBotGrantConfig: (patch: Parameters<typeof writeScheduleBotGrantConfig>[0]) => void;
+  /** Validate and write the machine-wide task-routing block (null clears it). */
+  writeGlobalTaskRoutingConfig: (raw: unknown) => ReturnType<typeof writeGlobalTaskRoutingConfig>;
+  /** Atomically patch explicit fields against the latest on-disk taskRouting block. */
+  patchGlobalTaskRoutingConfig: (raw: unknown) => ReturnType<typeof patchGlobalTaskRoutingConfig>;
   /** Atomic write of maintenance-level fields (autoUpdate / autoRestart). */
   mergeMaintenanceConfig: (patch: MaintenanceConfig) => MaintenanceConfig;
   /** Set global UI locale (null = clear). Fans out to daemons via IPC. */
@@ -255,6 +272,8 @@ export function defaultSettingsWriteApplierDeps(
     writeCodexNotifierConfig,
     writeHostOverloadAlertConfig,
     writeScheduleBotGrantConfig,
+    writeGlobalTaskRoutingConfig,
+    patchGlobalTaskRoutingConfig,
     mergeMaintenanceConfig,
     setGlobalLocale,
     parseMaintenancePatch,
@@ -964,6 +983,24 @@ export async function applySettingsWrite(
       },
     });
     touched = true;
+  }
+
+  if ('taskRouting' in obj) {
+    const raw = obj.taskRouting;
+    if (raw === null) {
+      const result = deps.writeGlobalTaskRoutingConfig(null);
+      if (!result.ok) return { ok: false, error: `invalid_taskRouting: ${result.reason}` };
+      touched = true;
+    } else {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).length === 0) {
+        return { ok: false, error: 'invalid_taskRouting' };
+      }
+      // Merge explicit fields against the latest disk generation inside the
+      // shared config lock; a pre-read Dashboard snapshot must not win a race.
+      const result = deps.patchGlobalTaskRoutingConfig(raw);
+      if (!result.ok) return { ok: false, error: `invalid_taskRouting: ${result.reason}` };
+      touched = true;
+    }
   }
 
   if ('vcMeetingAgent' in obj) {

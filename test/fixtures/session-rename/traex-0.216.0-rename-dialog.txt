@@ -1,0 +1,24 @@
+
+  ▄▄▄▄▄▄▄
+  █ ◆ ◆ █  TRAE CLI (v0.216.0)
+   ▀▀▀▀▀▀
+  /tmp/repo
+  permissions: YOLO mode
+
+  Tip: Use /rewind to revisit an earlier turn and restore its workspace state.
+
+
+▍ hello first turn
+
+
+◆ ok
+
+  Worked for <1s • Nov 23 at 16:31
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  Rename thread
+
+❯ ok
+
+  enter submit  |  esc back

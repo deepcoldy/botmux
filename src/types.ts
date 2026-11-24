@@ -298,6 +298,8 @@ export interface FailedTurnRecord {
   userPrompt: string;
   cliInput: string;
   codexAppInput?: CodexAppTurnInput;
+  /** Daemon-retained attachments paired with the exact CLI input, for replay and quota handoff. */
+  attachments?: LarkAttachment[];
   failedAt: string;        // ISO
   errorCode?: string;
   status: 'failed' | 'ambiguous';
@@ -845,6 +847,11 @@ export interface Session {
   /** Exact final worker input retained for retry. This may include a triggering
    * group reply in addition to the original dashboard backlog prompt. */
   queuedActivationInput?: CliTurnPayload;
+  /** Literal raw opening retained while its activation has no submission ACK.
+   * Unlike pendingRawInput, this survives daemon restart and immediate raw starts
+   * that never had a pendingRepoSetup. Cleared with the activation journal. */
+  queuedActivationRawInput?: string;
+  queuedActivationRawTurnId?: string;
   queuedActivationTurnId?: string;
   queuedActivationDispatchAttempt?: number;
   /** Frozen resume mode for the exact journal head. Backlog activations are
@@ -1187,6 +1194,8 @@ export interface Session {
   /** Structured companion for lastCliInput so retry_last_task can preserve a
    * clean Codex App turn. The legacy string remains authoritative fallback. */
   lastCodexAppInput?: CodexAppTurnInput;
+  /** Attachments paired with lastCliInputTurnId; retained for exact failure recovery and quota handoff. */
+  lastAttachments?: LarkAttachment[];
   /** 最近一个失败或被中断的 turn 的记录，供 /retry 命令重注入。
    *  在 onTurnTerminal 回调中记录（failed/ambiguous），不随新 turn 注入清除——
    *  只被更新的失败 turn 覆盖。 */
@@ -1325,6 +1334,9 @@ export interface Session {
   modelPin?: import('./core/model-pin.js').ModelPin;
   /** Retained Auto-model selection for the exact native conversation. */
   traexAutoModelRuntime?: import('./services/traex-auto-model.js').TraexAutoModelRuntimeState;
+  /** Step of the bot's quota fallback chain this session moved to. Its model
+   * outranks every other launch-model source while its CLI is the session's. */
+  quotaFallback?: import('./services/quota-fallback-chain.js').QuotaFallbackSessionState;
   /** Group defaults at topic creation; absent on legacy sessions. */
   groupDefaultModels?: import('./core/group-default-models.js').GroupDefaultModels;
   /** Optional reasoning effort frozen at creation (per-turn API override).
@@ -2183,6 +2195,8 @@ export interface CliTurnPayload {
   /** Daemon-frozen LinkRef mode plus admission-only source material. */
   linkRefs?: LinkRefTurnEnvelope;
   codexAppInput?: CodexAppTurnInput;
+  /** Daemon-side replay metadata paired with this exact input. Workers do not consume it directly. */
+  attachments?: LarkAttachment[];
   nativeSessionTitle?: string;
   nativeSessionTitlePrompt?: string;
   trustedCaller?: TrustedCaller;
@@ -2288,6 +2302,7 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
+  | { type: 'request_next_step'; turnId: string; dispatchAttempt?: number; userPrompt?: string; answer: string }
   | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig | null; replyDelivery?: 'send' | 'transcript'; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true; failedTurnRewind?: FailedTurnRewindDirective }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
@@ -2297,6 +2312,7 @@ type DaemonToWorkerBase =
    *  a separate `message` IPC could write into the PTY first. */
   | { type: 'terminal_effort_writeback_ack'; nonce: string; preference: string }
   | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch; turnCallerOpenId?: string; requireSafeComposer?: true }
+  | { type: 'antigravity_btw'; question: string; messageId: string; nativeSessionId: string }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
@@ -2351,7 +2367,7 @@ type DaemonToWorkerBase =
   // onExit so transient auto-restarted exits don't park-then-tear-down.
   // `terminal: false` (backend-outage give-up): only stop and wait for the next
   // message; do not create the bmx-diag shell on a tmux server that just failed.
-  | { type: 'park_diagnostic'; terminal?: boolean }
+  | { type: 'park_diagnostic'; terminal?: boolean; failPending?: boolean }
   | {
       type: 'tui_keys';
       keys: string[];
@@ -2808,6 +2824,8 @@ export type WorkerToDaemonBase =
     canParkDiagnostic?: boolean;
     /** Presentation-only evidence that this TraeX generation never reached a prompt. */
     traexStartupFailure?: boolean;
+    /** Fresh local CLI exited before readiness / opening argv turn evidence. */
+    startupFailure?: boolean;
     /** A Codex App thread is still owned by another app-server writer. */
     codexAppActiveWriter?: boolean;
     /** Linux bwrap sandbox could not create this namespace on this host. */
@@ -2900,7 +2918,7 @@ export type WorkerToDaemonBase =
   /** The CLI's own next-input suggestion on an idle screen (Claude Code's
    *  greyed-out prompt suggestion), sent when it appears or changes. turnId is
    *  the turn that just ended; the daemon shows it on that turn's last card. */
-  | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number; editable?: true }
   /** The CLI's own recap of the session (Claude Code's transcript away
    *  summary), written while idle after a turn; turnId is that turn. */
   | { type: 'cli_recap'; text: string; turnId?: string; dispatchAttempt?: number }
@@ -3020,6 +3038,10 @@ export type WorkerToDaemonBase =
     source: 'clipboard' | 'screen';
     turnId?: string;
   }
+  | { type: 'antigravity_btw_result'; messageId: string; question: string } & (
+    | { answer: string }
+    | { reason: 'busy' | 'unavailable' | 'unconfirmed' }
+  )
   /** Adopt: the reply to a Lark message Claude Code folded into the running
    *  turn (a mid-turn system reminder). Sent as soon as the model moved on
    *  from it, or when the host turn ends if it never did. `turnId` is the
@@ -3030,8 +3052,11 @@ export type WorkerToDaemonBase =
    *  summary. `turnReply` marks the reply as the turn's final: a Claude
    *  folded turn has no other output, and under transcript delivery no
    *  completion receipt needs a carrier it can be written into. A Codex
-   *  steered turn still ends with its own final, so it never sets this. */
-  | { type: 'absorbed_reply'; turnId: string; dispatchAttempt?: number; answer: string; replyUuid: string; source: 'text' | 'thinking'; turnReply?: true }
+   *  steered turn still ends with its own final, so it never sets this.
+   *  `progress` (Codex): not an answer to a folded message but what the model
+   *  said to this turn mid-work before going back to it; the turn's own
+   *  final still follows. */
+  | { type: 'absorbed_reply'; turnId: string; dispatchAttempt?: number; answer: string; replyUuid: string; source: 'text' | 'thinking'; turnReply?: true; progress?: true }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
   /** Runtime lease recovery ACK. Emitted only after the exact durable attempt
    * was either removed from the worker queue or its owned CLI was fenced. */
@@ -3042,7 +3067,7 @@ export type WorkerToDaemonBase =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; speakers?: TurnSpeaker[]; linkRefMode?: 'observe' | 'enabled' }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; speakers?: TurnSpeaker[]; provenanceIncomplete?: true; linkRefMode?: 'observe' | 'enabled' }
   /** Worker→daemon single-source identity storage decision, sent right after
    *  the worker resolved the actual spawn (or RPC engine): the effective model
    *  plus the spawn facts it was derived from. The daemon publishes identity

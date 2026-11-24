@@ -45,6 +45,7 @@ import {
   backgroundTaskLaunches,
   parseTaskNotification,
   isTranscriptRateLimitEvent,
+  isSyntheticAssistantRecord,
   isSyntheticNoModelReplyEvent,
   classifyClaudeTerminalEvent,
   apiErrorMessageText,
@@ -560,8 +561,8 @@ export class BridgeTurnQueue {
    *  Survives clearPending for the same reason as durationMarkerSeen. */
   private durationMarkerWaitExpired = false;
   /** Transcript time of the newest real model reply read (any main-thread
-   *  assistant record that is not an API error or a no-model placeholder,
-   *  tool_use blocks included). Survives clearPending like the markers above:
+   *  assistant record that is neither an API error nor a synthetic local record,
+   *  real-model tool_use blocks included). Survives clearPending like the markers above:
    *  it describes the provider session, not one generation's turns. */
   private lastProviderReplyAtMs: number | undefined;
 
@@ -1045,7 +1046,9 @@ export class BridgeTurnQueue {
         }
         // A real model reply: the provider answered this request.
         const replyAtMs = eventTimeMs(ev);
-        if (replyAtMs !== undefined
+        // Synthetic local tool calls still follow ordinary attribution below,
+        // but no provider answered, so they must not move recovery's clock.
+        if (!isSyntheticAssistantRecord(ev) && replyAtMs !== undefined
           && (this.lastProviderReplyAtMs === undefined || replyAtMs > this.lastProviderReplyAtMs)) {
           this.lastProviderReplyAtMs = replyAtMs;
         }

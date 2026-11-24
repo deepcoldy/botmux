@@ -108,6 +108,54 @@ describe.skipIf(!linux || !realTmux)('private test process reaping', () => {
     expect(env.BOTMUX_TMUX_SERVER_LOG).toContain(fence.root);
   });
 
+  it('rechecks a pending socket after its announcing client exits in a single sweep', async () => {
+    for (let round = 0; round < 8; round++) {
+      const dir = root('/tmp/bmx-reaper-client-exit-');
+      const socket = join(dir, 'socket');
+      const serverLog = join(dir, TMUX_SERVER_LOG_BASENAME);
+      writeFileSync(serverLog, '');
+      const delayedReal = join(dir, 'delayed-real-tmux');
+      writeFileSync(delayedReal, `#!/bin/sh\nsleep 1\nexec ${JSON.stringify(realTmux!)} "$@"\n`, { mode: 0o755 });
+      const shim = join(dir, 'tmux');
+      writeFileSync(shim, tmuxFenceShimScript(delayedReal, [], join(dir, 'denied.log'), serverLog), { mode: 0o755 });
+      chmodSync(shim, 0o755);
+      const env = { ...process.env, TMUX: undefined, TMUX_PANE: undefined };
+      const client = spawn(shim, ['-S', socket, 'new-session', '-d', '-s', 'late', 'sleep 60'], {
+        stdio: 'ignore', detached: true, env,
+      });
+      children.add(client);
+      const exited = once(client, 'exit');
+      try {
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if (readFileSync(serverLog, 'utf8').includes(`pending\t${socket}\t${client.pid}\n`)) break;
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
+        expect(readFileSync(serverLog, 'utf8')).toContain(`pending\t${socket}\t${client.pid}\n`);
+        const result = reapRegisteredTestProcesses(dir);
+        await exited;
+        expect(result.tmuxFailed).toEqual([]);
+        const query = spawnSync(realTmux!, ['-S', socket, 'display-message', '-p', '#{pid}'], {
+          encoding: 'utf8', env, timeout: 3_000,
+        });
+        expect(query.status, `round ${round}: ${query.stdout}\n${query.stderr}`).not.toBe(0);
+      } finally {
+        if (client.exitCode === null && client.signalCode === null) {
+          client.kill('SIGKILL');
+          await exited;
+        }
+        const query = spawnSync(realTmux!, ['-S', socket, 'display-message', '-p', '#{pid}'], {
+          encoding: 'utf8', env, timeout: 3_000,
+        });
+        if (query.status === 0) {
+          const pid = Number(query.stdout.trim());
+          serverIdentities.set(pid, testProcessIdentity(pid));
+          try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        }
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  }, 120_000);
+
   it('refuses to signal a pid whose recorded start identity does not match', () => {
     const dir = root('/tmp/bmx-reaper-identity-');
     const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });

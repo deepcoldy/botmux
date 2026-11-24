@@ -344,6 +344,7 @@ import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-ap
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
+import { cliSelectionSnapshot } from '../src/core/cli-selection-snapshot.js';
 
 // 上面那些钩子和配置都按 homedir() 落盘：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
 if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
@@ -12479,6 +12480,87 @@ describe('folded-turn reply relay', () => {
     expect(sessionReply).toHaveBeenCalledTimes(3);
   });
 
+  it('titles a Codex progress reply as progress, not as an answer to a follow-up, and posts it under that message', async () => {
+    const { sessionReply, worker } = forkWithReply();
+    worker.emit('message', reply('om_steer', 'same body'));
+    worker.emit('message', { ...reply('om_task', 'same body'), progress: true });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    expect(sessionReply.mock.calls.map(call => [call[2], call[4]])).toEqual([['interactive', 'om_steer'], ['interactive', 'om_task']]);
+    const [followUpCard, progressCard] = sessionReply.mock.calls.map(call => String(call[1]));
+    expect(progressCard).toContain('same body');
+    expect(progressCard).not.toBe(followUpCard);
+    vi.mocked(getBot).mockImplementation(() => defaultBot());
+    worker.emit('message', { ...reply('om_task', 'later', 'text', 'om_task-a2'), progress: true });
+    await settle();
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+  });
+
+  it('posts a reply under the turn\'s own inbound message, not the session\'s current target', async () => {
+    const { sessionReply, ds, worker } = forkWithReply();
+    const ownTarget = { mode: 'thread' as const, rootMessageId: 'om_task' };
+    ds.session.turnReplyContexts = { om_task: { target: ownTarget }, om_steer: { target: { mode: 'thread', rootMessageId: 'om_steer' } } };
+    worker.emit('message', { ...reply('om_task', 'progress'), progress: true });
+    worker.emit('message', reply('om_steer', 'answer'));
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    expect(sessionReply.mock.calls.map(call => (call[5] as { replyTarget?: unknown }).replyTarget)).toEqual([
+      ownTarget, { mode: 'thread', rootMessageId: 'om_steer' },
+    ]);
+  });
+
+  it('delivers progress without holding the turn\'s final or a shutdown, and stops retrying once the option is off', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply')
+      .mockRejectedValueOnce(new Error('lark 5xx (transient)'));
+    const { ds, worker } = forkWithReply({}, sessionReply);
+    worker.emit('message', { ...reply('om_task', 'progress'), progress: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.finalOutputDeliveriesInFlight?.size ?? 0).toBe(0);
+    expect(ds.finalOutputDeliveriesByTurn?.get('om_task')?.size ?? 0).toBe(0);
+    vi.mocked(getBot).mockImplementation(() => defaultBot());
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops an older progress retry once a newer progress supersedes it', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply')
+      .mockRejectedValueOnce(new Error('lark 5xx (transient)'));
+    const { worker } = forkWithReply({}, sessionReply);
+    worker.emit('message', { ...reply('om_task', 'P1 stale', 'text', 'om_task-p1'), progress: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    worker.emit('message', { ...reply('om_task', 'P2 newer', 'text', 'om_task-p2'), progress: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(String(sessionReply.mock.calls[1][1])).toContain('P2 newer');
+  });
+
+  it('cancels a progress retry at turn terminal and keeps its tombstone through active-state churn', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply')
+      .mockRejectedValueOnce(new Error('lark 5xx (transient)'));
+    const { ds, worker } = forkWithReply({}, sessionReply);
+    worker.emit('message', { ...reply('om_task', 'P1 stale', 'text', 'om_task-p1'), progress: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_task', status: 'completed' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 256; i++) {
+      worker.emit('message', {
+        ...reply(`om_other_${i}`, `progress ${i}`, 'text', `om_other_${i}-a1`), progress: true,
+      });
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(257);
+    worker.emit('message', { ...reply('om_task', 'late progress', 'text', 'om_task-late'), progress: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(257);
+  });
+
   it('drops an empty answer and one for a session without a Lark transport', async () => {
     const live = forkWithReply(adopted);
     live.worker.emit('message', reply('om_blank', '  \n '));
@@ -12759,5 +12841,54 @@ describe('a suspend queued while a re-forked worker takes its opening input', ()
     expect(next.send.mock.calls.filter(([message]: [any]) => message?.type === 'message' && message.turnId === 'om_more')).toHaveLength(2);
     expect(ds.worker).toBe(next);
     expect(ds.pendingSuspendReason).toBe('manual_suspend');
+  });
+});
+
+describe('quota fallback chain step launch', () => {
+  const relayBot = () => defaultBot({
+    cliId: 'claude-code',
+    wrapperCli: undefined,
+    model: 'claude-opus-5-5',
+    env: { ANTHROPIC_BASE_URL: 'https://relay.example' },
+  });
+
+  function stepDs(onChain: boolean): DaemonSession {
+    const ds = makeDs();
+    ds.session.cliId = 'claude-code';
+    ds.session.agentFrozen = true;
+    ds.session.cliLaunchSnapshot = { ...cliSelectionSnapshot('traex'), model: 'GPT-6.1-Sol' };
+    if (onChain) ds.session.quotaFallback = { step: 1, cliId: 'traex', model: 'GPT-6.1-Sol' };
+    return ds;
+  }
+
+  async function initMessage(): Promise<any> {
+    for (let i = 0; i < 10; i++) await new Promise(resolve => setTimeout(resolve, 0));
+    const worker = forkMock.mock.results.at(-1)?.value;
+    return worker && vi.mocked(worker.send).mock.calls.map((call: any[]) => call[0]).find((m: any) => m?.type === 'init');
+  }
+
+  it('launches the step CLI and model as a fresh conversation without the bot env', async () => {
+    vi.mocked(getBot).mockImplementation(relayBot);
+    const ds = stepDs(true);
+
+    expect(forkWorker(ds, { content: 'handoff' }, { resume: false, turnId: 'bmx-quota-fallback-1' })).toBe(true);
+    const init = await initMessage();
+
+    expect(init).toMatchObject({ cliId: 'traex', model: 'GPT-6.1-Sol', resume: false, turnId: 'bmx-quota-fallback-1' });
+    expect(JSON.stringify(init.env ?? {})).not.toContain('relay.example');
+    expect(ds.session.cliId).toBe('traex');
+    expect(ds.session.cliLaunchSnapshot?.state).toBe('resolved');
+  });
+
+  it('keeps refusing a /cli selection on a bot with env', async () => {
+    vi.mocked(getBot).mockImplementation(relayBot);
+    const ds = stepDs(false);
+
+    let refused: unknown;
+    try { forkWorker(ds, { content: 'x' }, { resume: false, turnId: 'om_cli' }); } catch (error) { refused = error; }
+    const init = await initMessage();
+
+    expect(String(refused ?? '')).toMatch(/bot env/);
+    expect(init).toBeUndefined();
   });
 });

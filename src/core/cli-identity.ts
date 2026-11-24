@@ -47,7 +47,7 @@ import { isUsableOpenId } from '../utils/user-token.js';
 import { logger } from '../utils/logger.js';
 import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
 import { ensureBackgroundJobHome, ensureMeegoStore, MEEGO_ENV_CREDENTIALS, MEEGO_STORE_DIR } from '../services/bytedcli-home.js';
-import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
+import { isRunAsTurnId, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import { NOT_AUTHORIZED_REASONS, PLATFORM_NOT_AUTHORIZED_REASONS, reasonTag } from './refusal-reasons.js';
 import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 
@@ -404,8 +404,10 @@ export function sessionActiveTurnIdentityPath(sessionDataDir: string, sessionId:
  * queued input to the CLI, which is later than the daemon's acceptance of that
  * message and possibly much later.
  *
- * Best-effort: a failure here can only cost a refused command, never a wrong
- * identity, because the wrapper treats an unreadable turn file as a mismatch.
+ * Best-effort for ordinary turns. A runAs turn is different: before its marker
+ * changes, synchronously invalidate the previous single-model snapshots. If that
+ * invalidation or the marker write fails, throw so the worker cannot hand the
+ * turn to the CLI with the previous person's file still executable.
  */
 export function publishActiveTurn(
   sessionDataDir: string,
@@ -416,6 +418,21 @@ export function publishActiveTurn(
   identityTurnId: string | undefined = turnId,
 ): void {
   const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  const runAsTurn = isRunAsTurnId(turnId);
+  if (runAsTurn) {
+    let sameActiveTurn = false;
+    try {
+      const current = readFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), 'utf8').split('\n');
+      sameActiveTurn = current[0] === turnId && current[1] === (callerOpenId ?? '')
+        && current[3] === (identityTurnId ?? turnId ?? '');
+    } catch { /* no readable old marker means this is a new runAs activation */ }
+    if (!sameActiveTurn) {
+      // Deliberately strict: a failure must escape before the live marker changes.
+      for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
+        rmSync(join(dir, `${tool}.env`), { force: true });
+      }
+    }
+  }
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     // turn, caller, identity key and identity turn live in ONE file so readers
@@ -428,7 +445,10 @@ export function publishActiveTurn(
       `${turnId ?? ''}\n${callerOpenId ?? ''}\n${identityTurnId ? identityTurnKey(identityTurnId) : ''}\n${identityTurnId ?? ''}\n`,
       { mode: 0o600 },
     );
-  } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
+  } catch (error) {
+    if (runAsTurn) throw error;
+    // Ordinary turns keep the legacy best-effort marker behavior.
+  }
   try {
     atomicWriteFileSync(
       sessionActiveTurnIdentityPath(sessionDataDir, sessionId),
@@ -1589,9 +1609,10 @@ export interface NativeBytedcliCapabilities {
 }
 
 const AS_UNAVAILABLE_MSG = 'botmux: 这次调用无法使用 BOTMUX_AS（命令使用本机原生登录，或本会话按单快照模式运行，不逐次向 daemon 取身份），命令未执行；去掉 BOTMUX_AS 重试。';
+const GIT_COMMIT_AS_UNAVAILABLE_MSG = 'botmux: gitCommitIdentity 暂不支持 BOTMUX_AS，命令未执行；去掉 BOTMUX_AS 后重试。';
 /** Shell line refusing a call that names `BOTMUX_AS` where the wrapper cannot honour it. */
-const refuseBotmuxAs = (leave: string): string =>
-  `[ -z "\${BOTMUX_AS:-}" ] || { printf '%s\\n' ${shellSingleQuote(AS_UNAVAILABLE_MSG)} >&2; ${leave} ${IDENTITY_DENIED_EXIT_CODE}; }`;
+const refuseBotmuxAs = (leave: string, message = AS_UNAVAILABLE_MSG): string =>
+  `[ -z "\${BOTMUX_AS:-}" ] || { printf '%s\\n' ${shellSingleQuote(message)} >&2; ${leave} ${IDENTITY_DENIED_EXIT_CODE}; }`;
 
 function bytedcliNativePassthrough(realBinaryPath: string, native: NativeBytedcliCapabilities): string[] {
   if (!native.meego && !native.bytecloud) return [];
@@ -1646,11 +1667,22 @@ export function renderIdentityWrapper(
     '  fi',
     '  unset __botmux_d __botmux_cred',
     'fi',
-    // Only enforced when both sides state a turn. An identity published without
-    // one predates turn binding; a session with no live turn file has nothing to
-    // contradict. Neither is evidence of a mismatch, so neither refuses here.
-    `if [ -n "$${TURN_VAR}" ] && [ -n "$__botmux_live" ] \\`,
-    `   && [ "$${TURN_VAR}" != "$__botmux_live" ]; then`,
+    // Ordinary legacy snapshots retain the historical both-sides-present check.
+    // If either side names runAs, however, a missing turn/marker is itself a
+    // refusal: there is no safe legacy identity to fall back to for that turn.
+    '  __botmux_turn_mismatch=',
+    `  if [ -n "$${TURN_VAR}" ] && [ -n "$__botmux_live" ] \\`,
+    `     && [ "$${TURN_VAR}" != "$__botmux_live" ]; then`,
+    '    __botmux_turn_mismatch=1',
+    '  fi',
+    `  case "$__botmux_live:$${TURN_VAR}" in`,
+    '    trg_runas_*:*|*:trg_runas_*)',
+    `      if [ -z "$${TURN_VAR}" ] || [ -z "$__botmux_live" ]; then`,
+    '        __botmux_turn_mismatch=1',
+    '      fi',
+    '      ;;',
+    '  esac',
+    '  if [ -n "$__botmux_turn_mismatch" ]; then',
     `  __botmux_published_mode=$${MODE_VAR}`,
     `  ${MODE_VAR}=turn-mismatch`,
     // Same human across consecutive turns (their follow-up was accepted while
@@ -1658,12 +1690,12 @@ export function renderIdentityWrapper(
     // person the worker is now executing, so keep it. Only a NAMED match on both
     // sides relaxes; anything missing stays a refusal. Restore the published
     // mode (user/user-home/bot) so the case dispatch below runs normally.
-    `  if [ -n "$${OPEN_ID_VAR}" ] && [ -n "$__botmux_live_caller" ] \\`,
+    `  if [ -n "$${TURN_VAR}" ] && [ -n "$${OPEN_ID_VAR}" ] && [ -n "$__botmux_live_caller" ] \\`,
     `     && [ "$${OPEN_ID_VAR}" = "$__botmux_live_caller" ]; then`,
     `    ${MODE_VAR}=$__botmux_published_mode`,
     '  fi',
     'fi',
-    'unset __botmux_live __botmux_live_caller __botmux_published_mode',
+    'unset __botmux_live __botmux_live_caller __botmux_published_mode __botmux_turn_mismatch',
   ];
   return [
     '#!/bin/sh',
@@ -2167,6 +2199,73 @@ export function renderGitAskpassScript(bytedcliPath: string, exchangeUrl?: strin
   ].join('\n');
 }
 
+const GIT_COMMIT_WRAPPER_MARKER = '# botmux trigger-user git commit identity';
+
+/** Parse global options in a function so exec receives the original argv. */
+export function renderGitCommitWrapper(realGit: string, resolver: readonly string[]): string {
+  return [
+    '#!/bin/sh',
+    GIT_COMMIT_WRAPPER_MARKER,
+    `real_git=${shellSingleQuote(realGit)}`,
+    // Role-specific config outranks user.* even across config scopes. Capture
+    // explicit user.* options before overriding the host's four role defaults.
+    'capture_user_config() {',
+    '  case "$1" in -c) pair=$2 ;; *) pair=${1#--config-env=} ;; esac',
+    '  case "${pair%%=*}" in',
+    '    [uU][sS][eE][rR].[eE][mM][aA][iI][lL]) override_email=$("$real_git" "$@" config --get user.email) || exit 1 ;;',
+    '    [uU][sS][eE][rR].[nN][aA][mM][eE]) override_name=$("$real_git" "$@" config --get user.name) || exit 1 ;;',
+    '  esac',
+    '}',
+    'unset override_name override_email',
+    'needs_actor() {',
+    '  while [ "$#" -gt 0 ]; do',
+    '    case "$1" in',
+    // These global forms terminate in version/path/help output (or their own
+    // usage error); Git never executes a later subcommand. Do not demand an
+    // actor for read-only informational invocations such as `git --help commit`.
+    '      -h|--help|--version|--exec-path|--html-path|--man-path|--info-path|--list-cmds|--list-cmds=*) return 1 ;;',
+    '      -c) [ "$#" -ge 2 ] || return 1; capture_user_config -c "$2"; shift 2 ;;',
+    '      --config-env=*) capture_user_config "$1"; shift ;;',
+    '      --config-env) [ "$#" -ge 2 ] || return 1; capture_user_config "--config-env=$2"; shift 2 ;;',
+    // Every value-taking global option must list its separate argv form: a
+    // missing entry lets the value hit the `*) return 1` passthrough and the
+    // commit-family subcommand below it runs unwrapped. --shallow-file is
+    // accepted by git 2.39; --replace-git-ref / --attr-source arrive with newer
+    // git and the equals forms already stop at the generic `-*)` branch.
+    '      -C|--git-dir|--work-tree|--namespace|--super-prefix|--attr-source|--shallow-file|--replace-git-ref)',
+    '        [ "$#" -ge 2 ] || return 1; shift 2 ;;',
+    '      -*) shift ;;',
+    '      commit|commit-tree|merge|cherry-pick|revert|rebase|am|pull)',
+    '        case "$#:${2-}" in 2:--abort|2:--quit|2:-h|2:--help) return 1 ;; esac',
+    '        return 0 ;;',
+    '      *) return 1 ;;',
+    '    esac',
+    '  done',
+    '  return 1',
+    '}',
+    'if ! needs_actor "$@"; then exec "$real_git" "$@"; fi',
+    // The current-actor route attests the turn principal, not a speaker selected
+    // for one command. Until it has speaker-aware semantics, never silently
+    // attribute a requested BOTMUX_AS call to the principal. Read-only and push
+    // paths never reach this guard; the existing askpass flow keeps its own AS handling.
+    refuseBotmuxAs('exit', GIT_COMMIT_AS_UNAVAILABLE_MSG),
+    `email="$(${resolver.map(shellSingleQuote).join(' ')})" || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    // Ambient identity env vars outrank every -c config key (git gives them
+    // precedence over all config scopes). A shell profile or an export inside
+    // the session would otherwise let a PATH-wrapped commit land with the
+    // machine's identity, exactly the mis-attribution this wrapper exists to
+    // stop. The IDENT combined forms are cleared too: ignored by some git
+    // versions, but the same channel wherever they are honored. Explicit argv
+    // overrides (-c user.*, --author) still win via the capture above.
+    'unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_IDENT',
+    'unset GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_IDENT',
+    'name=${override_name-${email%@*}}',
+    'email=${override_email-$email}',
+    'exec "$real_git" -c "user.name=$name" -c "user.email=$email" -c "author.name=$name" -c "author.email=$email" -c "committer.name=$name" -c "committer.email=$email" "$@"',
+    '',
+  ].join('\n');
+}
+
 /** Filename of the git askpass helper inside a session's wrapper dir. */
 export const GIT_ASKPASS_BASENAME = 'botmux-git-askpass';
 
@@ -2283,6 +2382,18 @@ export function applyTurnGitConfigEnv(
   if (pairs.length) Object.assign(env, encodeGitConfigPairs(pairs));
 }
 
+export interface TriggerUserCliEnvOptions {
+  /** The session runs in a fresh bwrap root that only mounts CANONICAL paths.
+   *  A symlinked home / data root (`/home/u` -> `/data00/home/u`) has no alias
+   *  there, so every path written into the session env or a generated script
+   *  must be the realpath. Left off, nothing changes for unsandboxed sessions. */
+  canonicalPaths?: boolean;
+  /** Actual spawn-network fact, not a value re-derived from frozen config.
+   *  False means the engaged sandbox cuts the daemon loopback (--unshare-net or
+   *  slirp); undefined preserves the legacy callers that have no network fact. */
+  loopbackShared?: boolean;
+}
+
 /**
  * The single wiring seam every CLI/engine spawn site must call to install the
  * trigger-user identity: it prepares the wrapper env (PATH shim, askpass,
@@ -2305,7 +2416,7 @@ export function prepareTurnGitConfigEnv(
   log: (message: string) => void,
   model: IdentityStorageModel,
   execution?: { appId: string; ipcPort?: number },
-  options?: { canonicalPaths?: boolean },
+  options?: TriggerUserCliEnvOptions,
 ): Array<[string, string]> {
   const pairs = prepareTriggerUserCliEnv(env, sessionDataDir, sessionId, policy, log, model, execution, options);
   applyTurnGitConfigEnv(env, pairs);
@@ -2376,13 +2487,14 @@ export function prepareTriggerUserCliEnv(
   policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
   model: IdentityStorageModel,
   execution?: { appId: string; ipcPort?: number },
-  /** `canonicalPaths`: the session runs in a fresh bwrap root that only mounts
-   *  CANONICAL paths. A symlinked home / data root (`/home/u` -> `/data00/home/u`)
-   *  has no alias there, so every path written into the session env or into a
-   *  generated script must be the realpath or it is `not found` inside. Left
-   *  off, nothing changes for unsandboxed sessions. */
-  options?: { canonicalPaths?: boolean },
+  options?: TriggerUserCliEnvOptions,
 ): Array<[string, string]> {
+  if (policy?.enabled && policy.gitCommitIdentity && options?.loopbackShared === false) {
+    throw new Error('triggerUserAuth.gitCommitIdentity 需要会话内可访问 daemon loopback；'
+      + '当前沙盒通过 --unshare-net 或 slirp 隔离了 loopback，无法核验当前回合触发人。'
+      + '请关闭 gitCommitIdentity，或调整沙盒网络后重启会话');
+  }
+  const gitCommitIdentity = policy?.enabled === true && policy.gitCommitIdentity === true;
   // Before anything else, including the early return below: a policy that is
   // off now may have been on when this session last spawned.
   if (sessionDataDir) {
@@ -2393,7 +2505,25 @@ export function prepareTriggerUserCliEnv(
       log(`[trigger-user-auth] WARN could not remove ungoverned wrappers: ${(e as Error).message}`);
     }
   }
-  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return [];
+  if (sessionDataDir && !gitCommitIdentity) {
+    const git = join(sessionIdentityBinDir(sessionDataDir, sessionId), 'git');
+    try {
+      const stat = lstatSync(git);
+      if (stat.isFile() && stat.size <= 64 * 1024
+        && readFileSync(git, 'utf8').split('\n', 2)[1] === GIT_COMMIT_WRAPPER_MARKER) {
+        rmSync(git, { force: true });
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log(`[trigger-user-auth] WARN could not remove git commit wrapper: ${(error as Error).message}`);
+      }
+    }
+  }
+  // The worker may legitimately filter every ordinary tool out (the dedicated
+  // Lark binding owns lark-cli). Git attribution is an independent opt-in and
+  // must still be installed; otherwise an explicit request silently falls back
+  // to the host's author/committer.
+  if (!policy?.enabled || (!policy.tools.length && !gitCommitIdentity) || !sessionDataDir) return [];
   const canonicalPaths = options?.canonicalPaths === true;
   sessionDataDir = sessionVisiblePath(sessionDataDir, canonicalPaths);
   childEnv.SESSION_DATA_DIR = sessionDataDir;
@@ -2402,16 +2532,20 @@ export function prepareTriggerUserCliEnv(
   // Turn-authored git -c pairs; returned to the caller for the pane carrier.
   let gitConfigPairs: Array<[string, string]> = [];
   let identityResolver: string[] | undefined;
-  if (model === 'proven' && process.platform === 'linux' && execution) {
+  let gitResolver: string[] | undefined;
+  if (gitCommitIdentity || (model === 'proven' && process.platform === 'linux' && execution)) {
     const moduleDir = dirname(fileURLToPath(import.meta.url));
     const sourceExecArgs = process.execArgv.map((arg, index, args) =>
       args[index - 1] === '--import' && arg === 'tsx' ? createRequire(import.meta.url).resolve('tsx') : arg);
     const runner = moduleDir.endsWith('/src/core')
       ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../cli-identity-runner.ts')] }
       : resolveEntrySpawn('cli-identity-runner', resolve(moduleDir, '..'));
-    identityResolver = [...[runner.command, ...runner.args].map(p => sessionVisiblePath(p, canonicalPaths)),
-      '--data-dir', sessionDataDir, '--session-id', sessionId, '--app-id', execution.appId,
-      '--ipc-port', String(execution.ipcPort), '--tool'];
+    const launcher = [runner.command, ...runner.args].map(p => sessionVisiblePath(p, canonicalPaths));
+    if (gitCommitIdentity) gitResolver = [...launcher, '--git-actor-email'];
+    if (model === 'proven' && process.platform === 'linux' && execution) {
+      identityResolver = [...launcher, '--data-dir', sessionDataDir, '--session-id', sessionId,
+        '--app-id', execution.appId, '--ipc-port', String(execution.ipcPort), '--tool'];
+    }
   }
   // Initialize the directory for THIS model before sandbox spawn so its bound
   // directory survives the existence-filter and leftovers from the other model
@@ -2431,6 +2565,21 @@ export function prepareTriggerUserCliEnv(
     log(`[trigger-user-auth] WARN could not initialize identity storage: ${(e as Error).message}`);
   }
   let installedAny = false;
+  if (gitResolver) {
+    if (process.platform !== 'linux') {
+      // The resolver proves lineage through /proc and the daemon's loopback
+      // peer scan, neither of which exists off Linux. The wrapper still fails
+      // closed (every governed subcommand exits 77); say why in the log so the
+      // refusal is not mistaken for an authorization problem.
+      log('[trigger-user-auth] WARN gitCommitIdentity is supported only on Linux; '
+        + 'on this platform git commit-family commands will be refused until it is turned off');
+    }
+    const realGit = findRealToolBinary('git', childEnv.PATH, [wrapperDir]);
+    if (!realGit) throw new Error('gitCommitIdentity requires git on PATH');
+    mkdirSync(wrapperDir, { recursive: true });
+    atomicWriteFileSync(join(wrapperDir, 'git'),
+      renderGitCommitWrapper(sessionVisiblePath(realGit, canonicalPaths), gitResolver), { mode: 0o755 });
+  }
   for (const [tool, commandName] of identityTools.flatMap(tool =>
     [tool, ...(IDENTITY_WRAPPER_ALIASES[tool] ?? [])].map(name => [tool, name] as const))) {
     try {
@@ -2455,11 +2604,11 @@ export function prepareTriggerUserCliEnv(
   // the failure mode observed in production, where the agent cheerfully
   // reported `identity: user` (the machine account) as "normal". Absence of a
   // wrapper is invisible by nature, so it has to be said out loud.
-  if (!installedAny) {
+  if (!installedAny && identityTools.length) {
     log('[trigger-user-auth] WARN no tool wrapper installed — this session is NOT running under '
       + 'trigger-user identity; calls will use whatever credentials the machine has');
   }
-  if (installedAny) {
+  if (installedAny || gitResolver) {
     childEnv.PATH = [wrapperDir, ...(childEnv.PATH ?? '').split(delimiter).filter(p => p !== wrapperDir)].join(delimiter);
     // A prepend alone loses to path_helper in the login shell the agent's
     // tool calls run through — see installLoginShellPathShim. These three

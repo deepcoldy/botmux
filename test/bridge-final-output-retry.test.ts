@@ -1992,8 +1992,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(ds.completedIdleTurnId).toBeUndefined();
     });
 
-    it('unconfigured replyDelivery on claude-code = transcript by default → marks the turn', async () => {
-      // 缺省按 CLI 能力：claude-code 未配置即 transcript，最终回复卡投递成功后打「已完成」。
+    it('unconfigured replyDelivery on claude-code = send by default → does NOT mark the turn', async () => {
+      // 缺省不随 CLI 翻转：没显式配 transcript 就是 send，走不到 completedIdleTurnId。
       vi.mocked(resolveReplyDelivery).mockReturnValue(undefined);
       const sessionReply = vi.fn(async () => 'om_reply');
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -2002,7 +2002,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
       await vi.advanceTimersByTimeAsync(10);
       expect(sessionReply).toHaveBeenCalledTimes(1);
-      expect(ds.completedIdleTurnId).toBe('turn-1');
+      expect(ds.completedIdleTurnId).toBeUndefined();
     });
 
     it('explicit send mode never sets completedIdleTurnId', async () => {
@@ -2124,6 +2124,38 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       'ca_dispatch-2',
     ]);
     expect(sessionReply.mock.calls[0][5]).not.toHaveProperty('suppressHook');
+  });
+
+  it('posts an Antigravity side answer below its command with a valid, stable Lark dedupe key', async () => {
+    const sessionReply = vi.fn(async () => 'om_side_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.cliId = 'antigravity';
+    __testOnly_setupWorkerHandlers(ds, ds.worker!);
+    const messageId = 'om_0123456789abcdef0123456789abcdef';
+    const result = { type: 'antigravity_btw_result', messageId, question: 'Read the inherited value', answer: 'QA-42' } as const;
+    ds.worker!.emit('message', { type: result.type, messageId, question: result.question, reason: 'busy' });
+    ds.worker!.emit('message', result);
+    ds.worker!.emit('message', result);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(3));
+    const [status, ...replies] = sessionReply.mock.calls as unknown as [string, string, string, string, string, { replyTarget: unknown; uuid: string }][];
+    expect(status[2]).toBe('text');
+    expect(status[5].uuid).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+    expect(status[5].uuid).not.toBe(replies[0][5].uuid);
+    for (const call of replies) {
+      expect(call[1]).toContain('QA-42');
+      expect(call[5].replyTarget).toEqual({ mode: 'thread', rootMessageId: messageId });
+      expect(call[5].uuid).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+    }
+    expect(replies[1][5].uuid).toBe(replies[0][5].uuid);
   });
 
   it('routes sequential Codex App settlements through each ledger-frozen shared-chat root', async () => {

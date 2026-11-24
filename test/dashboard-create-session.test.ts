@@ -160,6 +160,7 @@ import { getBot } from '../src/bot-registry.js';
 import { getAllBots } from '../src/bot-registry.js';
 import type { ScheduledTask } from '../src/types.js';
 import { setActiveSessionSafe, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { retainQueuedActivationRawInput } from '../src/core/pending-repo-journal.js';
 import {
   applyQueuedCodexAppLegacyFallback,
   mergeQueuedCodexAppTurn,
@@ -239,7 +240,7 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
       const refused = await spawnDashboardSession(empty, undefined, {
         larkAppId: APP, chatId: CHAT, content: 'task', column: 'backlog', role: 'solo',
       });
-      expect(refused).toEqual({ ok: false, error: 'assistant_unclaimed' });
+      expect(refused).toEqual({ ok: false, error: 'assistant_unclaimed', accepted: false });
       expect(empty.size).toBe(0);
     } finally {
       assistant.spawn = { kind: 'off' };
@@ -936,10 +937,23 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
 
     await expect(spawnDashboardSession(active, undefined, {
       larkAppId: APP, chatId: CHAT, content: 'opening task', column: 'in_progress', role: 'solo',
-    })).resolves.toEqual({ ok: false, error: 'spawn preaccept failed' });
+    })).resolves.toEqual({ ok: false, error: 'spawn preaccept failed', accepted: false });
 
     expect(active.has(sessionKey(CHAT, APP))).toBe(false);
     expect(sessionStore.closeSession).toHaveBeenCalledWith('sess-1');
+  });
+
+  it('does not emit accepted:false when the unaccepted session cannot be closed', async () => {
+    const active = new Map<string, DaemonSession>();
+    forkWorkerMock.mockImplementationOnce(() => { throw new Error('spawn preaccept failed'); });
+    vi.mocked(sessionStore.closeSession).mockImplementationOnce(() => { throw new Error('close failed'); });
+
+    const result = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: 'opening task', column: 'in_progress', role: 'solo',
+    });
+
+    expect(result).toEqual({ ok: false, error: 'spawn preaccept failed' });
+    expect(result).not.toHaveProperty('accepted');
   });
 
   it('unpublishes and closes only the new row when auto-worktree staging fails', async () => {
@@ -958,7 +972,7 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
 
     await expect(spawnDashboardSession(active, undefined, {
       larkAppId: APP, chatId: CHAT, content: 'opening worktree task', column: 'in_progress', role: 'solo',
-    })).resolves.toEqual({ ok: false, error: 'stage setup unavailable' });
+    })).resolves.toEqual({ ok: false, error: 'stage setup unavailable', accepted: false });
 
     expect(active.has(sessionKey(CHAT, APP))).toBe(false);
     expect(sessionStore.closeSession).toHaveBeenCalledWith('sess-1');
@@ -1014,6 +1028,7 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
     });
 
     expect(result).toEqual({ ok: false, error: 'fallback fork unavailable' });
+    expect(result).not.toHaveProperty('accepted');
     const ds = active.get(sessionKey(CHAT, APP))!;
     expect(ds).toBeDefined();
     expect(ds.pendingRepo).toBe(true);
@@ -1248,6 +1263,72 @@ describe('activateQueuedSession', () => {
     // exact replay source after adapter submission.
     expect(ds.session.queuedPrompt).toContain('排队的任务');
     expect(ds.session.kanbanColumn).toBe('in_progress');
+  });
+
+  it('restores a retained immediate raw opening before exact activation', async () => {
+    const raw = '/goal IMMEDIATE_RAW_MUST_SURVIVE_RESTART';
+    const turnId = 'om_immediate_raw_circuit';
+    const session: Session = {
+      sessionId: 'sess-immediate-raw-circuit', chatId: CHAT, rootMessageId: turnId,
+      larkAppId: APP,
+      title: 'immediate raw circuit', status: 'active', createdAt: new Date().toISOString(),
+      queued: true,
+      queuedActivationInput: { content: '' },
+      queuedActivationTurnId: turnId,
+      queuedActivationResume: false,
+      lastCliInput: raw,
+      lastCliInputTurnId: turnId,
+    };
+    retainQueuedActivationRawInput(session, raw, turnId);
+    store.set(session.sessionId, session);
+    const active = new Map<string, DaemonSession>();
+    await restoreActiveSessions(active);
+    const restored = [...active.values()][0]!;
+    expect(restored.pendingRawInput).toBe(raw);
+    expect(restored.pendingRawTurnId).toBe(turnId);
+
+    forkWorkerMock.mockImplementationOnce((owned: DaemonSession) => {
+      owned.worker = { killed: false, send: vi.fn() } as any;
+      owned.session.queuedActivationPending = true;
+      owned.session.queuedActivationToken = 'replacement-activation';
+    });
+    await expect(activateQueuedSession(restored)).resolves.toEqual({ ok: true });
+    expect(forkWorkerMock).toHaveBeenCalledOnce();
+    const [owner, input, opts] = forkWorkerMock.mock.calls[0]!;
+    expect(owner.pendingRawInput).toBe(raw);
+    expect(owner.pendingRawTurnId).toBe(turnId);
+    expect(input).toEqual({ content: '' });
+    expect(opts).toMatchObject({ turnId, resume: false });
+  });
+
+  it('restores the first tokened raw activation before eager pre-ACK recovery', async () => {
+    const raw = '/goal E315_RAW_MUST_SURVIVE_PRE_ACK_RESTART';
+    const turnId = 'om_first_pre_ack_raw';
+    const session: Session = {
+      sessionId: 'sess-first-pre-ack-raw', chatId: CHAT, rootMessageId: turnId,
+      larkAppId: APP,
+      title: 'first pre-ACK raw', status: 'active', createdAt: new Date().toISOString(),
+      cliId: 'claude-code', backendType: 'tmux',
+      queued: false,
+      queuedActivationPending: true,
+      queuedActivationToken: 'first-activation-token',
+      queuedActivationInput: { content: '' },
+      queuedActivationTurnId: turnId,
+      queuedActivationResume: false,
+      lastCliInput: raw,
+      lastCliInputTurnId: turnId,
+    };
+    retainQueuedActivationRawInput(session, raw, turnId);
+    store.set(session.sessionId, session);
+    const active = new Map<string, DaemonSession>();
+    await restoreActiveSessions(active);
+    const restored = [...active.values()][0]!;
+    expect(restored.initialStartPending).toBe(true);
+    expect(restored.pendingRawInput).toBe(raw);
+    expect(restored.pendingRawTurnId).toBe(turnId);
+    expect(forkWorkerMock).toHaveBeenCalled();
+    const [, input] = forkWorkerMock.mock.calls[0]!;
+    expect(input).toEqual({ content: '' });
   });
 
   it('is a no-op error for a session that was never queued', async () => {

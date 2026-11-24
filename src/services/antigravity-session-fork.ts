@@ -6,6 +6,7 @@ import { delay } from '../utils/timing.js';
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const STREAM = new RegExp(`\\bStreaming conversation (${UUID})\\s*$`, 'i');
 const FORK = new RegExp(`\\bForked conversation (${UUID}) -> (${UUID})\\s*$`, 'i');
+const SIDE_QUESTION = new RegExp(`(?:^|\\] )btw side question (${UUID}) ended after [^:]+: (.+?)\\s*$`, 'i');
 
 /** Each managed agy gets its own native log. A global cli.log mixes sibling
  * processes, and agy keeps BOTH parent and child DBs open after /fork. */
@@ -14,7 +15,11 @@ export class AntigravitySessionLog {
   private offset = 0;
   private inode: string | undefined;
   private tail = '';
-  private state: { currentId?: string; fork?: { parentId: string; childId: string } } = {};
+  private state: {
+    currentId?: string;
+    fork?: { parentId: string; childId: string };
+    sideQuestion?: { conversationId: string; outcome: string };
+  } = {};
 
   constructor(sessionId: string, root = join(homedir(), '.gemini', 'antigravity-cli')) {
     this.path = join(root, 'botmux', `${encodeURIComponent(sessionId)}.log`);
@@ -53,6 +58,8 @@ export class AntigravitySessionLog {
           if (stream) this.state.currentId = stream[1]!;
           const fork = FORK.exec(line);
           if (fork) this.state.fork = { parentId: fork[1]!, childId: fork[2]! };
+          const side = SIDE_QUESTION.exec(line);
+          if (side) this.state.sideQuestion = { conversationId: side[1]!, outcome: side[2]! };
         }
       } finally { closeSync(fd); }
     } catch { /* Startup may not have created the native log yet. */ }

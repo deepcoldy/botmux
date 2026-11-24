@@ -7,15 +7,12 @@ import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import { t } from '../src/i18n/index.js';
 
 // The real `botmux send` reads the spawn-time REPLY_DELIVERY_ENV snapshot of its
-// pane to word the guidance printed after a successful send: a transcript
-// session is pointed back at its forwarded final reply, a send session (or a
-// pane started before the snapshot existed) at `--response-kind final`.
+// pane to decide post-send output: in a send session (or a pane without the
+// snapshot) it prints the standard `--response-kind final` guidance; in an
+// auto-forward final reply (`transcript`) session it prints only the factual
+// delivery receipt without any extra persuasion.
 describe('botmux send post-send guidance follows the pane reply delivery', () => {
-  it.each([
-    ['transcript', 'ai.send.after_success_progress_transcript', 'ai.send.after_success_progress'],
-    ['send', 'ai.send.after_success_progress', 'ai.send.after_success_progress_transcript'],
-    [undefined, 'ai.send.after_success_progress', 'ai.send.after_success_progress_transcript'],
-  ] as const)('BOTMUX_REPLY_DELIVERY=%s', (snapshot, expected, other) => {
+  function runSend(snapshot: 'transcript' | 'send' | undefined) {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-send-delivery-hint-'));
     try {
       const result = spawnSyncTsScript(fileURLToPath(new URL('./fixtures/send-image-mode-capture.ts', import.meta.url)), [
@@ -30,11 +27,25 @@ describe('botmux send post-send guidance follows the pane reply delivery', () =>
         encoding: 'utf8', timeout: 30_000,
       });
       expect(result.status, String(result.stderr)).toBe(0);
-      const stderr = String(result.stderr);
-      expect(stderr).toContain(t(expected, undefined, 'zh'));
-      expect(stderr).not.toContain(t(other, undefined, 'zh'));
+      return String(result.stderr);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+
+  it('BOTMUX_REPLY_DELIVERY=transcript emits only the factual receipt with no extra persuasion', () => {
+    const stderr = runSend('transcript');
+    expect(stderr).toContain('✓ 已发送');
+    expect(stderr).not.toContain(t('ai.send.after_success_progress', undefined, 'zh'));
+    expect(stderr).not.toContain('--response-kind final');
+    expect(stderr).not.toContain('不必 send');
+    expect(stderr).not.toContain('阶段小结');
+    expect(stderr).not.toContain('自动发回飞书');
+  });
+
+  it.each(['send', undefined] as const)('BOTMUX_REPLY_DELIVERY=%s keeps the standard send-mode guidance', snapshot => {
+    const stderr = runSend(snapshot);
+    expect(stderr).toContain('✓ 已发送');
+    expect(stderr).toContain(t('ai.send.after_success_progress', undefined, 'zh'));
   });
 });

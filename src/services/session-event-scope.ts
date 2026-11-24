@@ -355,6 +355,33 @@ export class WorkerSessionEventScope {
     const binding = [...this.bindings.values()].find(value => value.operationId === operationId);
     return binding ? this.snapshot(binding) : undefined;
   }
+  /**
+   * Origin for a statement about THIS RESTART ATTEMPT rather than about a
+   * runtime observation: the attempt the daemon minted reached a prompt.
+   *
+   * The program-status relay rebinds in process — spawnCli's binding proves the
+   * launcher pid, then a second binding proves the real CLI behind it — while
+   * every callback armed during spawn (the first-prompt timeout among them)
+   * keeps the launcher's binding. Judged under that retired runtime the host
+   * never hands the receipt to the restart coordinator, so the status card sat
+   * at 重启超时 for forty seconds while the CLI was already at its prompt
+   * (measured 2026-11-23); nothing retries, because a receipt is sent once.
+   *
+   * Within ONE physical CLI the live binding outranks the one a callback
+   * captured — the same rule `origin()` applies to a turn's submission binding.
+   * A callback from a REPLACED process (different physicalId) keeps its stale
+   * fence and still reports under its own binding.
+   *
+   * Readiness deliberately does NOT use this: a pre-replacement callback must
+   * not publish the successor's readiness (session-contract-gateway.test.ts).
+   */
+  liveProcessOrigin(): CapturedSessionOrigin | undefined {
+    const current = this.current;
+    if (!current) return undefined;
+    const captured = this.storage.getStore()?.binding;
+    if (captured && captured.physicalId !== current.physicalId) return undefined;
+    return this.snapshot(current);
+  }
   /** Screen observations describe the live process, not the historical
    * execution a timer inherited. Only an in-process rebind may advance it;
    * callbacks from a replaced process retain their stale runtime fence. */

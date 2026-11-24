@@ -26,6 +26,8 @@ import { ProviderRecoveryEditor } from './provider-recovery-editor.js';
 import { readProviderRecoveryConfig, type ProviderRecoveryConfig } from '../../services/provider-recovery-policy.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
+import { TASK_ROUTING_LIMITS, type TaskRoutingMatcherMode } from '../../core/task-routing/model.js';
+import { dispatchTaskRoutingChanged } from './task-routing-model.js';
 import {
   AUTO_CLEANUP_HOUR_OPTIONS as IDLE_CLEANUP_HOUR_OPTIONS,
   idleCleanupHoursLabel,
@@ -126,6 +128,16 @@ interface DashboardSettings {
   promptCache: PromptCacheConfig | null;
   providerRecovery: ProviderRecoveryConfig | null;
   multiTopic: { enabled: boolean; taskTreeCard: boolean };
+  taskRouting: import('../../core/task-routing/model.js').TaskRoutingGlobalConfig & {
+    enabled: boolean;
+    botOptions?: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      online: boolean;
+      oneShotAllowed: boolean;
+    }>;
+  };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
@@ -171,6 +183,9 @@ interface UpdateStatus {
   localDevUpdatable?: boolean;
   updateSupported: boolean;
   releaseInstallRequired?: boolean;
+  sourceReleaseAvailable?: boolean;
+  sourceReleasePending?: boolean;
+  sourceReleaseBackup?: string;
   // 'binary' = 编译版独立二进制（install.sh 形态），不归任何包管理器所有，
   // 自己下载 release 资产替换自身。
   updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'binary' | 'unknown';
@@ -322,6 +337,11 @@ export function parseSettings(s: any): DashboardSettings {
     promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
     providerRecovery: readProviderRecoveryConfig(s?.providerRecovery) ?? null,
     multiTopic: { enabled: s?.multiTopic?.enabled !== false, taskTreeCard: s?.multiTopic?.taskTreeCard === true },
+    taskRouting: {
+      ...s?.taskRouting,
+      enabled: s?.taskRouting?.enabled === true,
+      botOptions: Array.isArray(s?.taskRouting?.botOptions) ? s.taskRouting.botOptions : [],
+    },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     httpProxy: typeof s?.httpProxy === 'string' ? s.httpProxy : '',
@@ -350,7 +370,7 @@ function installKindLabel(kind: string, tr: ReturnType<typeof useT>): string {
   return tr('update.kindUnknown');
 }
 
-function SettingsPage() {
+export function SettingsPage() {
   const tr = useT();
   const mountedRef = useRef(false);
   const timersRef = useRef<Set<number>>(new Set());
@@ -549,6 +569,9 @@ function SettingsPage() {
       setSettings(saved);
       ui.publicReadOnly = saved.publicReadOnly;
       store.setScheduleTimeZone(saved.effectiveScheduleTimeZone);
+      if (key === 'taskRouting') {
+        dispatchTaskRoutingChanged(saved.taskRouting.enabled);
+      }
       // If this write triggered a live TraeX plugin install, surface its result
       // instead of the generic "saved" toast.
       const traexMsg = traexInstallMessage(body.herdrTraexInstall, tr);
@@ -571,6 +594,9 @@ function SettingsPage() {
           setSettings(confirmed);
           ui.publicReadOnly = confirmed.publicReadOnly;
           store.setScheduleTimeZone(confirmed.effectiveScheduleTimeZone);
+          if (key === 'taskRouting') {
+            dispatchTaskRoutingChanged(confirmed.taskRouting.enabled);
+          }
           reconciled = true;
         }
       } catch { /* still offline: fall back to the pre-save snapshot */ }
@@ -670,15 +696,17 @@ function SettingsPage() {
     pollReconnect();
   }
 
-  async function doUpdate(forceLocal = false): Promise<void> {
+  async function doUpdate(forceLocal = false, installRelease = false): Promise<void> {
     const s = upStatus;
     if (!s) return;
-    if (!s.node.ok) {
+    if (!installRelease && !s.node.ok) {
       toast(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }), { kind: 'warning' });
       return;
     }
     const localDev = s.localDevInstall === true;
-    if (localDev) {
+    if (installRelease) {
+      if (!localDev || !s.sourceReleaseAvailable || !s.latest) return;
+    } else if (localDev) {
       if (!s.localDevUpdatable) { toast(tr('update.localDev'), { kind: 'warning' }); return; }
     } else if (!s.updateSupported || !s.updateCommand) {
       toast(tr('update.unsupportedInstall'), { kind: 'warning' });
@@ -700,14 +728,16 @@ function SettingsPage() {
       } finally { if (mountedRef.current) setUpBusy(false); }
       if (!forceToken || !mountedRef.current) return;
     }
-    const confirmMsg = localDev
+    const confirmMsg = installRelease
+      ? tr('update.confirmSourceRelease', { version: `v${s.latest}` })
+      : localDev
       ? tr('update.confirmUpdateLocalDev')
       : s.latest
         ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand! })
         : tr('update.confirmUpdateNoVer', { command: s.updateCommand! });
     if (!forceLocal && !await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
-    setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
+    setUpMsg({ text: installRelease ? tr('update.binaryDownloading', { version: `v${s.latest}` }) : localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
     const stopUpdatePoll = (): void => {
       updatePollStopRef.current?.();
       updatePollStopRef.current = null;
@@ -720,7 +750,10 @@ function SettingsPage() {
       }
     }, 1000);
     try {
-      const r = await fetch('/api/update/run', forceToken ? {
+      const r = await fetch('/api/update/run', installRelease ? {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ installRelease: true, version: s.latest }),
+      } : forceToken ? {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ forceLocal: true, previewToken: forceToken }),
       } : { method: 'POST' });
@@ -777,11 +810,16 @@ function SettingsPage() {
         return;
       }
       stopUpdatePoll();
+      if (body.sourceReleaseInstalled) {
+        await fetchStatus();
+        if (!mountedRef.current) return;
+      }
       // A restart is needed when the server says so (local-dev build always
       // regenerates dist/, even when HEAD didn't move) or when the version
       // changed (generic npm/pnpm/bun path, which sets no restartRequired).
       const needsRestart = updateResponseNeedsRestart(body);
-      const backupNotice = body.backupRef ? '\n' + tr('update.forceBackup', { ref: String(body.backupRef) }) : '';
+      const backupNotice = (body.backupRef ? '\n' + tr('update.forceBackup', { ref: String(body.backupRef) }) : '')
+        + (body.backupLauncher ? '\n' + tr('update.sourceReleaseBackup', { path: String(body.backupLauncher) }) : '');
       if (needsRestart) {
         setUpBusy(false);
         // `changed` reflects whether the source actually advanced; a build-only
@@ -850,6 +888,7 @@ function SettingsPage() {
       }}
       onUpdate={() => void doUpdate()}
       onForceUpdate={() => void doUpdate(true)}
+      onInstallRelease={() => void doUpdate(false, true)}
       onRestart={() => { void (async () => { if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmPlainRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnCancel') })) void doRestart(null); })(); }}
     />
   );
@@ -1270,6 +1309,18 @@ export function SettingsBody(props: {
             onChange={value => {
               void props.onSave('multiTopicTaskTreeCard', { multiTopic: { enabled: settings.multiTopic.enabled, taskTreeCard: value } }, s => ({ ...s, multiTopic: { ...s.multiTopic, taskTreeCard: value } }));
             }}
+          />
+        </SettingsBlock>
+        <SettingsBlock id="settings-task-routing" title={tr('settings.sectionTaskRouting')}>
+          <TaskRoutingSettingsEditor
+            value={settings.taskRouting}
+            disabled={dis}
+            saving={savingKey === 'taskRouting'}
+            onSave={(patch, optimistic) => props.onSave(
+              'taskRouting',
+              { taskRouting: patch },
+              s => ({ ...s, taskRouting: optimistic(s.taskRouting) }),
+            )}
           />
         </SettingsBlock>
         <SettingsBlock id="settings-repo-picker" title={tr('settings.sectionRepoPicker')}>
@@ -1759,6 +1810,231 @@ export function CodexNotifierSettingsEditor(props: {
           ) : null}
         </div>
       ) : null}
+    </>
+  );
+}
+
+export function TaskRoutingSettingsEditor(props: {
+  value: DashboardSettings['taskRouting'];
+  disabled: boolean;
+  saving: boolean;
+  onSave(
+    patch: Record<string, unknown>,
+    optimistic: (current: DashboardSettings['taskRouting']) => DashboardSettings['taskRouting'],
+  ): Promise<void> | void;
+}) {
+  const tr = useT();
+  const controlsDisabled = props.disabled || props.saving;
+  const savedPolicy = props.value.policy ?? '';
+  const savedMode: TaskRoutingMatcherMode = props.value.matcher?.mode === 'bot' ? 'bot' : 'rule';
+  const savedBotAppId = props.value.matcher?.botAppId ?? '';
+  const savedTimeoutSec = Math.round(
+    (props.value.matcher?.timeoutMs ?? TASK_ROUTING_LIMITS.defaultMatcherTimeoutMs) / 1_000,
+  );
+
+  const [policyDraft, setPolicyDraft] = useState(savedPolicy);
+  const [matcherModeDraft, setMatcherModeDraft] = useState<TaskRoutingMatcherMode>(savedMode);
+  const [botDraft, setBotDraft] = useState(savedBotAppId);
+  const [timeoutSecDraft, setTimeoutSecDraft] = useState(String(savedTimeoutSec));
+
+  useEffect(() => { setPolicyDraft(savedPolicy); }, [savedPolicy]);
+  useEffect(() => { setMatcherModeDraft(savedMode); }, [savedMode]);
+  useEffect(() => { setBotDraft(savedBotAppId); }, [savedBotAppId]);
+  useEffect(() => { setTimeoutSecDraft(String(savedTimeoutSec)); }, [savedTimeoutSec]);
+
+  const rawBotOptions = props.value.botOptions ?? [];
+  const botMenuOptions = useMemo(() => {
+    const items = rawBotOptions.map(bot => ({
+      value: bot.larkAppId,
+      label: [bot.botName || bot.larkAppId, bot.cliId, !bot.online ? tr('taskRouting.pillOffline') : '']
+        .filter(Boolean)
+        .join(' · '),
+    }));
+    if (botDraft && !items.some(item => item.value === botDraft)) {
+      items.push({ value: botDraft, label: botDraft });
+    }
+    return [
+      { value: '', label: tr('settings.taskRoutingMatcherBotPlaceholder') },
+      ...items,
+    ];
+  }, [botDraft, rawBotOptions, tr]);
+
+  const modeOptions = useMemo(() => [
+    { value: 'rule' as const, label: tr('settings.taskRoutingMatcherModeRule') },
+    { value: 'bot' as const, label: tr('settings.taskRoutingMatcherModeBot') },
+  ], [tr]);
+
+  const selectedBotMeta = rawBotOptions.find(bot => bot.larkAppId === botDraft);
+  const policyDirty = policyDraft.trim() !== savedPolicy.trim();
+  const policyCharCount = Array.from(policyDraft).length;
+
+  function resolveTimeoutMs(rawSec: string): number {
+    const sec = Math.round(Number(rawSec));
+    if (!Number.isFinite(sec)) return savedTimeoutSec * 1_000;
+    const minSec = Math.ceil(TASK_ROUTING_LIMITS.minMatcherTimeoutMs / 1_000);
+    const maxSec = Math.floor(TASK_ROUTING_LIMITS.maxMatcherTimeoutMs / 1_000);
+    return Math.max(minSec, Math.min(maxSec, sec)) * 1_000;
+  }
+
+  function savePolicy(): void {
+    const trimmed = policyDraft.trim();
+    void props.onSave(
+      { policy: trimmed },
+      current => ({ ...current, ...(trimmed ? { policy: trimmed } : { policy: undefined }) }),
+    );
+  }
+
+  function changeMatcherMode(nextMode: TaskRoutingMatcherMode): void {
+    setMatcherModeDraft(nextMode);
+    if (nextMode === 'rule') {
+      void props.onSave(
+        { matcher: { mode: 'rule' } },
+        current => ({ ...current, matcher: { mode: 'rule' } }),
+      );
+      return;
+    }
+    if (botDraft) {
+      const timeoutMs = resolveTimeoutMs(timeoutSecDraft);
+      void props.onSave(
+        { matcher: { mode: 'bot', botAppId: botDraft, timeoutMs } },
+        current => ({ ...current, matcher: { mode: 'bot', botAppId: botDraft, timeoutMs } }),
+      );
+    }
+  }
+
+  function changeMatcherBot(nextBotAppId: string): void {
+    setBotDraft(nextBotAppId);
+    if (!nextBotAppId) {
+      setMatcherModeDraft('rule');
+      void props.onSave(
+        { matcher: { mode: 'rule' } },
+        current => ({ ...current, matcher: { mode: 'rule' } }),
+      );
+      return;
+    }
+    const timeoutMs = resolveTimeoutMs(timeoutSecDraft);
+    void props.onSave(
+      { matcher: { mode: 'bot', botAppId: nextBotAppId, timeoutMs } },
+      current => ({ ...current, matcher: { mode: 'bot', botAppId: nextBotAppId, timeoutMs } }),
+    );
+  }
+
+  function commitTimeoutSec(): void {
+    const sec = Math.round(Number(timeoutSecDraft));
+    const minSec = Math.ceil(TASK_ROUTING_LIMITS.minMatcherTimeoutMs / 1_000);
+    const maxSec = Math.floor(TASK_ROUTING_LIMITS.maxMatcherTimeoutMs / 1_000);
+    if (!Number.isFinite(sec) || sec < minSec || sec > maxSec) {
+      setTimeoutSecDraft(String(savedTimeoutSec));
+      return;
+    }
+    setTimeoutSecDraft(String(sec));
+    const timeoutMs = sec * 1_000;
+    if (matcherModeDraft !== 'bot' || !botDraft) return;
+    if (timeoutMs === (props.value.matcher?.timeoutMs ?? TASK_ROUTING_LIMITS.defaultMatcherTimeoutMs)) return;
+    void props.onSave(
+      { matcher: { mode: 'bot', botAppId: botDraft, timeoutMs } },
+      current => ({ ...current, matcher: { mode: 'bot', botAppId: botDraft, timeoutMs } }),
+    );
+  }
+
+  return (
+    <>
+      <ToggleRow
+        title={tr('settings.taskRoutingEnable')}
+        help={tr('settings.taskRoutingEnableHelp')}
+        checked={props.value.enabled}
+        disabled={controlsDisabled}
+        dataAction="toggle-task-routing"
+        onChange={value => {
+          void props.onSave({ enabled: value }, current => ({ ...current, enabled: value }));
+        }}
+      />
+      <div className="settings-tr-details">
+        <div className="settings-subfield settings-tr-policy-field">
+          <div className="settings-tr-label-row">
+            <FieldTitle help={tr('settings.taskRoutingPolicyHelp')}>{tr('settings.taskRoutingPolicy')}</FieldTitle>
+            <span className="settings-tr-counter">{policyCharCount}/{TASK_ROUTING_LIMITS.maxPolicyChars}</span>
+          </div>
+          <textarea
+            className="settings-tr-textarea"
+            data-input="task-routing-policy"
+            rows={3}
+            maxLength={TASK_ROUTING_LIMITS.maxPolicyChars}
+            disabled={controlsDisabled}
+            value={policyDraft}
+            placeholder={tr('settings.taskRoutingPolicyPlaceholder')}
+            onChange={e => setPolicyDraft(e.currentTarget.value)}
+          />
+          <div className="settings-tr-actions">
+            <button
+              type="button"
+              className="primary"
+              data-action="save-task-routing-policy"
+              disabled={controlsDisabled || !policyDirty}
+              onClick={savePolicy}
+            >
+              {tr('settings.taskRoutingPolicySave')}
+            </button>
+            {props.value.enabled ? (
+              <a className="settings-tr-open-link" href="#/assign">{tr('settings.taskRoutingOpenPage')} →</a>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="settings-field-row">
+          <FieldTitle help={tr('settings.taskRoutingMatcherModeHelp')}>{tr('settings.taskRoutingMatcherMode')}</FieldTitle>
+          <DropdownMenu
+            className="settings-field-menu"
+            ariaLabel={tr('settings.taskRoutingMatcherMode')}
+            disabled={controlsDisabled}
+            value={matcherModeDraft}
+            label={dropdownLabel(modeOptions, matcherModeDraft)}
+            options={modeOptions}
+            onChange={value => changeMatcherMode(value)}
+          />
+        </div>
+
+        {matcherModeDraft === 'bot' ? (
+          <>
+            <div className="settings-field-row">
+              <FieldTitle help={tr('settings.taskRoutingMatcherBotHelp')}>{tr('settings.taskRoutingMatcherBot')}</FieldTitle>
+              <DropdownMenu
+                className="settings-field-menu"
+                ariaLabel={tr('settings.taskRoutingMatcherBot')}
+                disabled={controlsDisabled}
+                searchable
+                value={botDraft}
+                label={dropdownLabel(botMenuOptions, botDraft)}
+                options={botMenuOptions}
+                onChange={value => changeMatcherBot(value)}
+              />
+            </div>
+            <div className="settings-field-row">
+              <FieldTitle help={tr('settings.taskRoutingMatcherTimeoutHelp')}>{tr('settings.taskRoutingMatcherTimeout')}</FieldTitle>
+              <input
+                type="number"
+                min={Math.ceil(TASK_ROUTING_LIMITS.minMatcherTimeoutMs / 1_000)}
+                max={Math.floor(TASK_ROUTING_LIMITS.maxMatcherTimeoutMs / 1_000)}
+                step={1}
+                className="settings-text-input"
+                data-input="task-routing-timeout"
+                value={timeoutSecDraft}
+                disabled={controlsDisabled}
+                onChange={e => setTimeoutSecDraft(e.currentTarget.value)}
+                onBlur={commitTimeoutSec}
+                onKeyDown={e => { if (e.key === 'Enter') commitTimeoutSec(); }}
+              />
+            </div>
+            {!botDraft ? (
+              <p className="hint-warn-inline">{tr('settings.taskRoutingMatcherBotRequired')}</p>
+            ) : selectedBotMeta && !selectedBotMeta.oneShotAllowed ? (
+              <p className="hint-warn-inline">{tr('settings.taskRoutingMatcherBotOneShotUnsupported')}</p>
+            ) : selectedBotMeta && !selectedBotMeta.online ? (
+              <p className="settings-subfield-hint">{tr('settings.taskRoutingMatcherBotOffline')}</p>
+            ) : null}
+          </>
+        ) : null}
+      </div>
     </>
   );
 }
@@ -2399,6 +2675,7 @@ export function UpdateCard(props: {
   onToggleChangelog(): void;
   onUpdate(): void;
   onForceUpdate?(): void;
+  onInstallRelease?(): void;
   onRestart(): void;
 }) {
   const tr = useT();
@@ -2429,6 +2706,8 @@ export function UpdateCard(props: {
           <UpdateBadge status={s} />
         </p>
         {s.runningDaemonRestartHint ? <p className="hint-warn">{s.runningDaemonRestartHint}</p> : null}
+        {s.sourceReleasePending ? <p className="hint-warn" data-source-release-pending>{tr('update.source_release_restart_required')}</p> : null}
+        {s.sourceReleaseBackup && !props.message ? <p className="hint">{tr('update.sourceReleaseBackup', { path: s.sourceReleaseBackup })}</p> : null}
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}
         {!s.localDevInstall && !s.updateSupported ? <p className="hint-warn">{tr('update.unsupportedInstall')}</p> : null}
         {s.releaseInstallRequired ? <p className="hint">{tr('update.installReleaseHint')}</p> : null}
@@ -2441,9 +2720,11 @@ export function UpdateCard(props: {
           </button>
           <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{updateLabel}</button>
           {s.localDevInstall && props.onForceUpdate ? <button type="button" data-up="force-update" disabled={updateDisabled} onClick={props.onForceUpdate}>{tr('update.forceButton')}</button> : null}
+          {s.sourceReleaseAvailable && props.onInstallRelease ? <button type="button" data-up="install-release" disabled={props.busy || !s.latest} onClick={props.onInstallRelease}>{tr('update.sourceReleaseButton')}</button> : null}
           <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
         </div>
         {s.localDevInstall && props.onForceUpdate ? <p className="hint-warn">{tr('update.forceHint')}</p> : null}
+        {s.sourceReleaseAvailable ? <p className="hint">{tr('update.sourceReleaseHint')}</p> : null}
         {s.cliUpdates?.length ? <CliRuntimeUpdates entries={s.cliUpdates} /> : null}
         {props.changelogOpen ? (
           <ChangelogPanel

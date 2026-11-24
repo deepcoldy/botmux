@@ -510,7 +510,9 @@ export function buildSeatbeltProfile(
 // 19 adds whole-directory read/write masks for project attachment, source-grant
 // and import-outbox authority below dataDir. A credential-only pane launched
 // before those mounts must not warm-reattach and retain access to the new WAL.
-export const ISOLATION_PANE_MARKER_VERSION = 19;
+// 20 adds the host send relay to macOS Seatbelt oncall panes. A persistent pane
+// launched without that environment cannot acquire it during warm reattach.
+export const ISOLATION_PANE_MARKER_VERSION = 20;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

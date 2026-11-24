@@ -1254,8 +1254,6 @@ describe('independent turn terminal receipt', () => {
     ['card-off', { disableStreamingCard: true }],
     ['private-card', { privateCard: true }],
     ['transcript delivery', { replyDelivery: 'transcript' }],
-    // Unconfigured traex follows its CLI default (transcript) — same contract.
-    ['default delivery on a transcript-capable CLI', { replyDelivery: undefined }],
   ])('keeps %s sessions on their existing UI contract', async (_label, override) => {
     Object.assign(botConfig, override);
     const ds = makeDs();

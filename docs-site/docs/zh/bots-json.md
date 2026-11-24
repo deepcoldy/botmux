@@ -78,6 +78,7 @@
 | 不 @ 也自动开工 | `autoStartOnNewTopic`、`autoStartOnGroupJoin` |
 | 机器人首次上线后私聊主人一句欢迎语 | `welcomeMessage`（见[上线欢迎语](#welcome-message)） |
 | 盯住告警群，有告警就自动处理 | 群消息监听（见[群消息监听](#message-listener)） |
+| 额度用完换一个 CLI / 模型接着做 | `quotaFallbackChain` |
 | 额度用完自动交给另一个 bot | `quotaFallbackBot` |
 | 不让 botmux 往 prompt 里塞任何东西 | `promptInjection: "none"` |
 | 控制会话占用的内存 | `maxLiveWorkers`、`idleSuspendMinutes` |
@@ -119,6 +120,7 @@
 | `customPassthroughCommands` | 额外允许透传给 CLI 的斜杠命令，例如 `["/export"]`。会和 botmux 自己命令重名的项会被丢掉。用 `/list-slash-command` 看完整放行清单。见[斜杠命令](/slash-commands) |
 | `bareRenamePassthrough` | 默认关闭。设 `true` 后，不带标题的 `/rename` 会原样交给 CLI，由 CLI 根据对话给会话起名（目前只有 Claude Code 支持，接管的会话也算）。见[斜杠命令](/slash-commands#rename-cli) |
 | `startupCommands` | 会话启动后、第一条消息之前自动发给 CLI 的命令，例如 `["/effort ultracode"]`。每次新启动或恢复都会重发 |
+| `quotaFallbackChain` | CLI 额度用完后，同一个 bot 换到下一个 CLI / 模型继续当前会话。默认关闭。见下方[额度用完切换 CLI / 模型](#quota-fallback-chain) |
 | `quotaFallbackBot` | CLI 额度用完后自动交接给另一个 bot。默认关闭。见下方[额度用完自动交接](#quota-fallback) |
 | `codexCapacityRecovery` | 仅 Codex / Codex App：遇到明确的模型容量错误时自动续跑。默认关闭；每个任务最多追加两条续跑输入。普通限流和额度用完不算 |
 | `suppressDeliveredFinalFailureNotice` | 实验性，默认关闭。同一轮已经送达最终答复后，再遇到模型服务错误时不再补发「模型连接失败」通知 |
@@ -155,6 +157,39 @@
 - 两项都不写：直接删掉整个字段。`inherit` 不是有效模式。
 
 切换到其它 CLI 时会自动删除这个字段。
+
+### 额度用完切换 CLI / 模型 {#quota-fallback-chain}
+
+`quotaFallbackChain` 让同一个 Bot 在当前会话撞上额度限制时，原地换到下一步的 CLI 和模型，接着做被打断的那条请求。起点是本 Bot 自己的 `cliId` 和 `model`，`steps` 按顺序往后走。
+
+```json
+{
+  "cliId": "claude-code",
+  "model": "claude-opus-5-5",
+  "quotaFallbackChain": {
+    "enabled": true,
+    "kinds": ["usage", "rate"],
+    "steps": [
+      { "cliId": "traex", "model": "GPT-6.1-Sol" },
+      { "cliId": "traex", "model": "DeepSeek-V4.1-Flash" }
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `enabled` | 只有 `true` 才开启 |
+| `kinds` | `usage`（用量上限）、`rate`（速率限制），不填两种都处理。Claude Code 的额度耗尽只会识别为 `rate`，只填 `usage` 时 Claude 不会切换 |
+| `steps` | 按顺序的切换步骤，每步一个 `cliId`；`model` 不填表示该 CLI 的默认模型。留在同一个 CLI 的一步必须写明模型 |
+
+几点要知道：
+
+- 没带恢复时间的临时限流（比如单纯的 429）先在原 CLI 上自动重试 5 次，间隔从 30 秒起逐次翻倍，都失败再切；带恢复时间或额度错误码的直接切。
+- 同一个 CLI 只换模型时，续接原来的原生会话；换 CLI 时重开原生会话，第一条消息是交接说明：先读上一个 CLI 的会话记录，再用 `botmux history` 看话题历史、检查工作目录，然后从它停下的地方继续被打断的原请求。
+- 续跑的请求按原发起人身份执行，回复落在原话题；切换完成后话题里会发一条通知。切换没能开始（例如切换前又来了新消息、找不到原发起人）时，照旧提示负责人并交接备用 Bot。
+- 切到其他 CLI 时按该 CLI 本机原生登录启动，不带本 Bot 的 `env`。一个 CLI 离开后不能再回到它。
+- 会话只往后走，不会自动切回；daemon 重启后仍停在当前这一步。新会话从本 Bot 自己的配置开始。
 
 ### 额度用完自动交接 {#quota-fallback}
 
@@ -505,6 +540,7 @@ MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allo
 - 没授权过的人调用时，命令会被拒绝，拒绝信息里附带授权链接。AI 也会自己用 `botmux auth request` 把链接发给这个人（见 [Agent 自助发起授权](/cli-commands#agent-auth-request)），或者让他在话题里发 `/login`。授权完成后重试即可。
 - 绝不会退回到 Bot 或其他人的身份代跑，也没有「退回机器登录态」的选项。旧配置里的 `fallback` 字段会被忽略。`bytedcli` 没有 Bot 身份，没授权就是失败。
 - 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用[中心化平台](/platform) / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`allowSpeakerSwitch`（默认 `false`：设为 `true` 后，多人话题里才能在某一条命令前加 `BOTMUX_AS=<open_id>` 用本轮另一位发言人的身份执行；默认关闭时 `BOTMUX_AS` 一律被拒）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
+- 共享 Linux 开发机可设置 `triggerUserAuth.gitCommitIdentity: true`。会话 PATH 中的 Git 包装器会在每次执行 `commit`、`commit-tree`、`merge`、`cherry-pick`、`revert`、`rebase`、`am` 和 `pull` 时核验本轮触发人，用其邮箱作为默认作者与提交者。核验失败会拒绝这些操作（包括快进 pull）。Git 保留重放提交的原作者，显式指定身份仍按 Git 规则生效；受管路径上会清理环境中的 `GIT_AUTHOR_*` / `GIT_COMMITTER_*` 身份变量，shell 配置里的导出不能覆盖已核验的触发人。绝对路径与 Git 别名不在覆盖范围内。受管命令暂不支持 `BOTMUX_AS`，会拒绝执行；oncall 禁网或 slirp 隔离 daemon loopback 时，该组合会在会话启动时被拒绝。此项默认关闭，启动会话时生效，也可在 Dashboard 该 Bot 设置的「安全」区开关。
 
 #### 升级注意：旧格式授权要重新 `/login` {#legacy-user-token}
 
@@ -587,7 +623,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 
 | 字段 | 说明 |
 |------|------|
-| `replyDelivery` | 最终答复怎么送到飞书。`transcript`（支持读取会话记录的 CLI 的默认）：botmux 从 CLI 的会话记录里自动取本轮最后的回答发出去；`send`（其余 CLI 的默认，也可显式写回去）：模型自己执行 `botmux send`。见下方说明 |
+| `replyDelivery` | 最终答复怎么送到飞书。`send`（除 Doubao 外所有 CLI 的默认）：模型自己执行 `botmux send`；`transcript`（自动转发最终回复，默认关闭，按需显式开启；Doubao 默认开启）：botmux 从 CLI 的会话记录里自动取本轮最后的回答发出去。见下方说明 |
 | `senderTag` | 默认开启：每条转给 CLI 的消息都带一个 `<sender ... />` 标签，告诉模型是谁在说话。只有写 `false` 才关闭 |
 | `senderTagHideEmail` | 默认关闭。开启后 `<sender>` 标签里不带邮箱，姓名和 ID 保留 |
 | `hideLocalAddresses` | 默认关闭：模型回复原样发到飞书。开启后把开发机路径和本机服务地址挡在回复外。见下方[隐藏开发机地址](#hide-local-addresses) |
@@ -596,40 +632,43 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 | `topicUnavailablePolicy` | 原话题被删除或不可用时怎么办。见[原话题不可用策略](/topic-unavailable-policy) |
 | `turnResults` | 提供每一轮的结构化结果，供外部系统读取。见[单轮结果](/turn-results) |
 
-### 转写回复（`replyDelivery: "transcript"`）
+### 自动转发最终回复（`replyDelivery: "transcript"`）
 
-支持读取会话记录的 CLI 默认就是 `transcript`：botmux 自动从 CLI 的会话记录里取本轮最后一段回答发到飞书，模型直接作答就行，不用自己执行 `botmux send`。这样模型不会再把进度、阶段结论、最终答复都 `botmux send` 一遍，群里少很多打扰。
+除 Doubao 外，所有 CLI 默认都是 `send`（模型自己执行 `botmux send` 把答复发到飞书）；Doubao 默认是 `transcript`（它的工具命令跑在账号级常驻进程里，模型自己 `botmux send` 容易发错话题，详见[多 CLI 适配器](/adapters)）。
 
-和 `send` 相比有四个变化：
+对支持读取会话记录的 CLI，你可以按需显式开启「自动转发最终回复」（`replyDelivery: "transcript"`）：开启后，botmux 自动从 CLI 的会话记录里取本轮最后一段回答发到飞书，模型直接作答即可，不用自己执行 `botmux send`。
 
-1. 系统提示改成「最终答复直接写在回复里」，`botmux send` 只留给最终回复带不了的事：@ 别的 bot 协作或把结果交还给派活的 bot、发附件或卡片、发到别的群或话题，以及本轮说明明确要求用它的回合（比如静默定时任务）。提示也要求不要用它发进度播报。
+开启后有三个变化：
+
+1. 系统提示改成由 botmux 自动转发最终回复，不再把 `botmux send` 当作必填回复通道，也不禁止发进度更新或确认消息。仅在多 bot 协作提示里保留如何用 `botmux send --mention` / `--mention-back` 回复和 @ 别的 bot；附件、卡片、跨群等用法留在内置 `botmux-send` skill 按需查阅。
 2. 每轮不再附带 `<botmux_reminder>` 提醒。
 3. 私聊，或只有管理员和这个 bot 的 1 对 1 群里，消息不再包 `<user_message>` 壳和 `<sender/>` 标签，模型看到的就是原文。
-4. 模型执行 `botmux send` 后看到的回显会提醒它：最终答复写在回复里就行，进度不必发。
 
-支持的 CLI：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao。其余 CLI（如 Antigravity、OpenCode、Relay、codex-app）默认仍是 `send`；Antigravity 只在零注入模式下采集回答，显式设置会被拒绝。如果写好 `transcript` 后又把 CLI 换成不支持的，运行时自动回到 `send`，不会丢答复。`sandbox: "scratch"` 下只有 Claude Code、Codex、TraeX 的会话记录在宿主侧读得到，其余 CLI 在 scratch 下运行时回到 `send`（Cursor、Doubao 显式设置 `transcript` 会被拒）；`oncall` 沙盒下 Hermes 例外：它的适配器没有把 `~/.hermes/state.db` 挂载到宿主，运行时同样回落 `send`；其它 CLI 的 oncall 沙盒不受影响。
+支持的 CLI：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao。其余 CLI（如 Antigravity、OpenCode、Relay、codex-app）不支持开启；Antigravity 只在零注入模式下采集回答，显式设置会被拒绝。如果写好 `transcript` 后又把 CLI 换成不支持的，运行时自动回到 `send`，不会丢答复。`sandbox: "scratch"` 下只有 Claude Code、Codex、TraeX 的会话记录在宿主侧读得到，其余 CLI 在 scratch 下运行时回到 `send`（Cursor、Doubao 显式设置 `transcript` 会被拒）；`oncall` 沙盒下 Hermes 例外：它的适配器没有把 `~/.hermes/state.db` 挂载到宿主，运行时同样回落 `send`；其它 CLI 的 oncall 沙盒不受影响。
 
-想用回旧行为（模型自己 `botmux send`），显式写 `send`：
+**开启方式**：
+
+- **Dashboard**：进入「Bot 配置 → 高级 → 回复投递」，打开「自动转发最终回复」开关（开启会写入 `replyDelivery: "transcript"`，关闭会写入 `replyDelivery: "send"`；当前 CLI 或沙盒不支持时开关是灰的）。
+- **`bots.json`**：在对应 bot 配置项里显式写：
 
 ```json
-{ "replyDelivery": "send" }
+{ "replyDelivery": "transcript" }
 ```
+
+- **飞书命令**：
 
 ```text
-/botconfig set replyDelivery send         # 用回 botmux send（Doubao 不推荐）
-/botconfig set replyDelivery transcript   # 显式固定为 transcript
-/botconfig unset replyDelivery            # 回到该 CLI 的默认
+/botconfig set replyDelivery transcript   # 开启自动转发最终回复
+/botconfig set replyDelivery send         # 显式使用 botmux send（Doubao 不推荐）
+/botconfig unset replyDelivery            # 回到该 CLI 的默认（除 Doubao 外为 send）
 ```
 
-显式写了 `send` 的 bot 保持 `send`，不受默认值影响。
-
 - 改了 `replyDelivery` 后，每轮的提醒和外壳从下一轮起变化；系统提示和最终回复的转发方式跟着 CLI 进程走，`/restart` 或会话重新拉起 CLI 后才换。daemon 重启后接回仍在运行的 CLI（tmux 等持久后端）时，沿用这个 CLI 启动时的方式。
-- 升级到这个版本后，没写 `replyDelivery` 的 bot 也一样：已在跑、没有重新拉起的 CLI 继续按 `send` 工作（模型自己 `botmux send`，botmux 只在它没发时兜底转发），`/restart` 后换成新默认。
+- 从 v3.59.25–v3.59.29 升级到默认改回 `send` 的版本后：未显式配置 `replyDelivery` 的 bot，新建会话或 `/restart` 后回到 `send`；已在跑、未重新拉起的持久终端继续沿用启动时的模式，不丢回复。显式写了 `"transcript"` 的 bot 照常保持开启。
 - 旧版 pane 没有启动快照时，首次重连推断出的兼容值会冻结到会话记录；后续 daemon 重连不再跟随 live 配置变化，切换 CLI 时才重算。若在首次升级重连**之前**就已编辑 `replyDelivery`、但还没重启 CLI，历史配置没有证据可精确还原，请主动 `/restart` 一次，让提示与转发门控统一到新配置。
-- bot 之间协作不变：要找别的 bot、或把结果交还给派活给你的 bot，仍然要 `botmux send --mention`（或 `--mention-back`），最终回复卡不会自动 @ 对方 bot。
+- bot 之间协作不变：要回复或 @ 别的 bot 协作、派活、回报，仍然用 `botmux send --mention`（或 `--mention-back`），最终回复卡不会自动 @ 对方 bot。
 - 静默定时任务不变：它的最终回复从来不发到群里，满足通知条件时仍由模型 `botmux send`。
 - 代价：1 对 1 会话没有了 `<user_message>` / `<sender>` 结构，`/adopt` 不再按内容把它认作 botmux 自己的会话（按会话 ID 排除仍然生效）。
-- Dashboard 里「转写回复模式」开关改的就是这个字段，开关两个方向都会写进 bots.json；当前 CLI 不支持时开关是灰的。
 
 ### 关掉发言人标签（`senderTag: false`）
 
