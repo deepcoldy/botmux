@@ -380,6 +380,21 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 - Codex App 不用配就默认开启；Codex CLI 要写 `{"cliEnabled": true}`。其它 CLI 不受影响。
 - `timeoutMs` 从下一个 worker 进程起生效。会话在等人回复（问答卡、终端选项、agent 请求处理）时，Codex CLI 的提醒会暂停计时。
 
+### 群会话督办 {#group-session-supervisor}
+
+`groupSessionSupervisor` 默认关闭。设置项里的 `botAppId` 必须是同一 Botmux fleet 内支持纯模型调用的专用 Bot。可以用 `botmux session invoke capabilities --bot <ID>` 检查 `supported`，再选择该 Bot 可用的模型。
+
+```text
+/botconfig set groupSessionSupervisor {"botAppId":"local_reviewer","model":"<模型名>"}
+/botconfig unset groupSessionSupervisor
+```
+
+在已有的本机飞书群会话中，任务发起人用 `/supervise on <验收条件>` 开启督办。可以每行写一条验收条件。Botmux 每 30 秒巡检一次，在重启后沿用已保存的任务和验收条件。执行停下但没有结果时，会在空闲的原会话尝试推进一次。判断结果可以验收后，任务进入待验收状态，由另一次模型调用逐项复核执行方提供的证据。可自行处理的缺项最多自动返工两轮，返工指令会列出相应条款。
+
+遇到 CI 等外部依赖时，Botmux 保存等待原因和证据，在原会话从 5 分钟起退避复查，最长间隔一小时。执行停滞、需要人工决定、返工预算用完或验收通过时，会在原话题提醒。
+
+任务发起人可用 `/supervise` 查看状态和验收证据。需要人决定时，Botmux 会暂停推进。有决策选项时，发起人用通知里的 `/supervise decide <编号> <选项序号>` 确认。发起人也可以给执行会话发下一步指示，再用 `/supervise resume` 继续跟踪原验收条件。`/stop` 暂停执行和督办，`/supervise off` 结束督办。
+
 ## 权限与授权
 
 完整的权限模型见[权限与授权](/permissions)。

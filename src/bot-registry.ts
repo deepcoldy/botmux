@@ -1,4 +1,5 @@
 import { normalizeOwnerGroupFollowConfig, type OwnerGroupFollowConfig } from './services/owner-group-follow-policy.js';
+import { groupSessionSupervisorConfig } from './core/group-session-supervisor-config.js';
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
 import { normalizeMessageListenerReplyMode } from './services/message-listener-reply-policy.js';
 import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
@@ -2430,6 +2431,8 @@ export interface BotConfig {
    * worker process starts; the daemon side is read live.
    */
   goalStatusCard?: boolean;
+  /** Optional dedicated model-only reviewer for /supervise in group sessions. */
+  groupSessionSupervisor?: import('./core/group-session-supervisor-config.js').GroupSessionSupervisorConfig;
   /**
    * Opt-in (default off): answer a Lark message the CLI folded into the turn
    * already running — Claude Code's mid-turn system reminder in adopt
@@ -4757,6 +4760,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       goalStatusCard: entry.goalStatusCard === true || undefined,
+      groupSessionSupervisor: groupSessionSupervisorConfig.safeParse(entry.groupSessionSupervisor).data,
       followUpReply: entry.followUpReply === true || undefined,
       privateCard: entry.privateCard === true || undefined,
       replyCardActions: entry.replyCardActions === true || undefined,

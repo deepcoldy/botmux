@@ -62,6 +62,7 @@ const terminalStatuses = new WeakMap<DaemonSession, Map<string, TurnOutcomeTermi
 const turnStarts = new WeakMap<DaemonSession, Map<string, number>>();
 const excludedActivityAt = new WeakMap<DaemonSession, Map<string, number>>();
 const outcomeSeq = new WeakMap<DaemonSession, number>();
+const drainingOutcomes = new WeakMap<DaemonSession, Map<string, number>>();
 /** 没写盘的「无最终输出」：它的最终回复晚到时仍可补登成已交付。 */
 const heldBackNoOutput = new WeakMap<DaemonSession, { turnId: string; at: number }>();
 
@@ -225,6 +226,15 @@ function commitLastTurn(ds: DaemonSession, lastTurn: SessionLastTurn): boolean {
   return true;
 }
 
+/** Recheck under turn admission before treating an observed turn as lacking output. */
+export function turnOutcomePendingOrChanged(
+  ds: DaemonSession, turnId: string, observed: SessionLastTurn | undefined,
+): boolean {
+  if (drainingOutcomes.get(ds)?.has(turnId)) return true;
+  const latest = ds.session.lastTurn;
+  return latest?.turnId === turnId && (latest.at !== observed?.at || latest.outcome !== observed?.outcome);
+}
+
 /**
  * 轮次终态时调用。completed 先等本轮 daemon 兜底最终回复投递落地（它的送达回执在
  * 飞书往返之后才记，可能晚于终态），再看有没有最终回复。只有最后一个终态能写，
@@ -249,11 +259,19 @@ export async function recordTurnOutcome(
   outcomeSeq.set(ds, seq);
   remember(terminalStatuses, ds, terminal.turnId, terminal.status);
   if (terminal.status === 'completed') {
-    await waitAllWithin(
-      [waitForTurnFinalOutputDeliveryDrain(ds, terminal.turnId)],
-      now() + (opts.drainTimeoutMs ?? TURN_OUTCOME_DRAIN_TIMEOUT_MS),
-      now,
-    );
+    const draining = drainingOutcomes.get(ds) ?? new Map<string, number>();
+    drainingOutcomes.set(ds, draining);
+    draining.set(terminal.turnId, seq);
+    try {
+      await waitAllWithin(
+        [waitForTurnFinalOutputDeliveryDrain(ds, terminal.turnId)],
+        now() + (opts.drainTimeoutMs ?? TURN_OUTCOME_DRAIN_TIMEOUT_MS),
+        now,
+      );
+    } finally {
+      if (draining.get(terminal.turnId) === seq) draining.delete(terminal.turnId);
+      if (draining.size === 0) drainingOutcomes.delete(ds);
+    }
   }
   const outcome = classifyTurnOutcome(terminal, {
     recoveryHandled: opts.recoveryHandled,

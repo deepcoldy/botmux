@@ -89,6 +89,9 @@ function normalizeNext(d: SlashRouteDecision): unknown {
 
 /** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
 const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boolean> = [
+  (input, legacy, next) => /^\s*\/supervise(?:\s|$)/i.test(input.text)
+    && legacy.kind === 'forward' && ['unknown_slash', 'discussion'].includes(legacy.reason)
+    && next.kind === 'daemon' && next.cmd === '/supervise' && next.sessionPolicy === 'existing_only',
   // #3469: explicitly opted-in remote-runner commands use authenticated structured turns.
   (input, legacy, next) => next.kind === 'delegated_turn'
     && legacy.kind === 'daemon'

@@ -91,6 +91,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     name: '/idlecompact', sessionPolicy: 'existingOnly', help: ['help.idlecompact'],
     notes: '可选 `on` / `off` / `<分钟 1–59>`，不带参数看状态；只改本会话的闲置自动压缩设置，只对 Claude Code / tmux 后端 Codex 生效',
   },
+  { name: '/supervise', sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['help.supervise'] },
   { name: '/queue', sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['help.queue'],
     notes: 'Codex App 活会话中的文字消息按原生 FIFO 新轮次执行；其它 CLI 明确拒绝，不创建会话' },
   { name: '/help', sessionPolicy: 'default', help: ['help.help'] },

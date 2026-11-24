@@ -37,6 +37,7 @@ import { pluginCommandGateway, renderPluginCommandHelp } from './plugins/command
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import { markReportReplyInput } from './report-source-reply.js';
+import { stopGroupSessionSupervision } from './group-session-supervision.js';
 import { findEffortTaskConfirmation, recordEffortTaskConfirmation } from '../services/codex-effort-task-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -683,6 +684,7 @@ export interface CommandHandlerDeps {
    * Missing policy wiring fails closed rather than reviving a revoked fork. */
   canRunQueuedFork?: (source: DaemonSession, message: LarkMessage) => boolean;
   prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
+  superviseSession?: (ds: DaemonSession, message: LarkMessage, reply: GuardReply) => Promise<void>;
   submitQueuedMessage?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
   /** Task text attached to a successful native effort change uses normal input delivery. */
   submitEffortTask?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
@@ -3304,6 +3306,8 @@ export async function handleCommand(
           await replyTransferInProgress(replyHere, loc);
           break;
         }
+        try { stopGroupSessionSupervision(ds.session, () => sessionStore.updateSession(ds.session)); }
+        catch { logger.warn(`[${logTag}] could not save stopped supervision`); }
         const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
         if (ds.session.pendingForkSession && effectiveCliId === 'antigravity') {
           await sessionReply(rootId, t('cmd.stop.fork_pending', undefined, loc));
@@ -4199,6 +4203,17 @@ export async function handleCommand(
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
         await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
+        break;
+      }
+
+      case '/supervise': {
+        if (!ds) { await replyNoSession(replyHere, loc); break; }
+        if (message.senderType !== 'user' || !canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
+          await replyHere(t('daemon.cmd_allowed_users_only', { cmd }, loc));
+          break;
+        }
+        if (deps.superviseSession) await deps.superviseSession(ds, message, replyHere);
+        else await replyHere(t('cmd.supervise.unavailable', undefined, loc));
         break;
       }
 
@@ -7639,6 +7654,7 @@ export async function handleCommand(
           t('help.retry', undefined, loc),
           t('help.rewind', undefined, loc),
           t('help.idlecompact', undefined, loc),
+          t('help.supervise', undefined, loc),
           t('help.queue', undefined, loc),
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),

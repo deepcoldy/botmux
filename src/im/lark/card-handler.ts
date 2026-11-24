@@ -132,6 +132,7 @@ import { repinSessionWorkingDir } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
 import { configWriteFailureText, handleCommand } from '../../core/command-handler.js';
+import { stopGroupSessionSupervision } from '../../core/group-session-supervision.js';
 import {
   DISMISS_CLEANUP_WT_ACTION,
   DISMISS_CONFIRM_ACTION,
@@ -5305,6 +5306,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         typeof value.reply_card_attempt === 'number' ? value.reply_card_attempt : undefined) : undefined;
       const record = replyKey && new TurnReplyCardStore(config.session.dataDir).read(replyKey);
       const staleTurn = () => ({ toast: { type: 'warning', content: t('cmd.stop.app_stale_turn', undefined, locDs) } });
+      const stopSupervision = () => {
+        try { stopGroupSessionSupervision(ds.session, () => sessionStore.updateSession(ds.session)); }
+        catch { logger.warn(`[${tag(ds)}] could not save stopped supervision`); }
+      };
       if (replyKey && (!record || record.messageId !== cardMessageId || replyCardIsTerminal(record) || record.finalDelivered)) {
         return staleTurn();
       }
@@ -5315,6 +5320,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           ? target.replyTurnId !== replyKey.turnId || target.dispatchAttempt !== replyKey.dispatchAttempt
           : !cardMessageId || cardMessageId !== ds.streamCardId || value.card_nonce !== ds.streamCardNonce
             || !streamTarget || value.codex_app_stop_target !== streamTarget)) return staleTurn();
+        stopSupervision();
         const status = await interruptCodexAppTurn(ds, target);
         const content = t(`cmd.stop.app_${status}`, undefined, locDs);
         return {
@@ -5327,12 +5333,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (replyKey) {
         const key = replyKey;
         if (ds.replyCardRunningTurnId !== key.turnId) return staleTurn();
+        stopSupervision();
         sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
         void updateTurnReplyCard(ds, key.turnId, { kind: 'phase', phase: 'stopping' },
           (body, type, uuid, beforeWrite) => deps.sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, key.turnId, { uuid, beforeWrite }),
           { dispatchAttempt: key.dispatchAttempt }).catch(error => logger.warn(`[reply-card] stop display: ${error.message}`));
         return { toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
       }
+      stopSupervision();
       sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
       logger.info(`[${tag(ds)}] stop_turn: ^C sent (session kept alive)`);
       // 重渲染为 'interrupted' transient 状态——与 term_action 重渲染完全同款模式，

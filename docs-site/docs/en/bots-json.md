@@ -369,6 +369,21 @@ Disabled by default. Both windows default to 10 minutes and accept integers from
 - Codex App has it on without any config; Codex CLI needs `{"cliEnabled": true}`. Other CLIs are unaffected.
 - `timeoutMs` applies from the next worker process. While the session waits on a person (ask card, terminal choice, agent attention request), the Codex CLI timer pauses.
 
+### Group session supervision {#group-session-supervisor}
+
+`groupSessionSupervisor` is off by default. Set `botAppId` to a dedicated bot in the same fleet that supports model-only calls. Check `supported` with `botmux session invoke capabilities --bot <ID>` and choose a model available to that bot.
+
+```text
+/botconfig set groupSessionSupervisor {"botAppId":"local_reviewer","model":"<model>"}
+/botconfig unset groupSessionSupervisor
+```
+
+In an existing local Feishu group session, the requester can use `/supervise on <acceptance criteria>` to track their latest task. Put each criterion on its own line. Botmux checks every 30 seconds and restores tracked tasks after a restart. If the execution stops without a result, it can make one attempt to move the original session forward. A result judged complete enters pending review. A separate model call then checks the reported evidence against each criterion. Botmux sends up to two rework turns, each listing the unmet criteria.
+
+Botmux records the reason and evidence for observable waits such as CI, then rechecks in the original session, backing off from five minutes to an hour. It posts in the original topic when execution stalls, needs human input, exhausts its rework budget, or passes review.
+
+Use `/supervise` for status and evidence. Human decisions pause automatic work. The requester can choose from the notice with `/supervise decide <reference> <option number>`, or give the session further instructions and use `/supervise resume` to keep tracking the original criteria. `/stop` pauses execution and supervision. `/supervise off` ends supervision.
+
 ## Permissions and authorization
 
 For the full permission model see [Permissions](/en/permissions).
