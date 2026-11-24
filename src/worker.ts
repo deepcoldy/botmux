@@ -16913,6 +16913,18 @@ function notifyMissingFinalTurn(turnId: string): void {
   });
 }
 
+function missingFinalTurnDeliveredBySend(turn: CodexPendingTurn): boolean {
+  const target = bridgeGateInputForTurn(sessionId, turn, {
+    // Unlike submit confirmation, a restarted worker has no in-memory write
+    // timestamp. The queue's persisted mark is the stable lower bound; an exact
+    // turn/attempt marker remains stronger than either timestamp.
+    markTimeMs: turn.markTimeMs,
+    isLocal: turn.isLocal,
+  }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
+  return attributableBridgeReplyMarkers(target, undefined, readSendMarkers())
+    .some(marker => finalBridgeSendMarkerCoversOwnThread(target, marker));
+}
+
 interface StructuredMissingFinalTarget {
   key: string;
   turn: CodexPendingTurn;
@@ -16928,6 +16940,15 @@ function structuredMissingFinalTarget(): StructuredMissingFinalTarget | undefine
   if (replyDeliveryMode() !== 'transcript' && !zeroPromptTerminalSync()) return undefined;
   const turn = codexBridgeQueue.peek()[0];
   if (!turn?.started || turn.finalText !== undefined || turn.isLocal) return undefined;
+  // RPC execution can be legitimately silent for a long time, and activation
+  // hand-off deliberately freezes ingest. No RPC lifecycle owner may use this
+  // screen/quiet watchdog, including an owner behind a predecessor queue head.
+  if (turn.rpcActive === true
+    || rpcTurnsAwaitingActivation.size > 0
+    || rpcLifecycleFailClosedOwners.size > 0
+    || rpcTerminalHydrationOwners.size > 0
+    || rpcActiveOwners.size > 0
+    || settlingRpcTerminalOwners.size > 0) return undefined;
   // The authoritative replacement transcript is not bound yet. Ingest and the
   // existing Antigravity quiet flush both bail here, so a timeout cannot prove
   // that the final is absent from the unbound file either.
@@ -16977,14 +16998,10 @@ function maybeSettleMissingStructuredFinal(): void {
   if (turn.dispatchAttempt !== undefined) {
     emitTurnTerminal(turn.turnId, 'ambiguous', 'structured_final_not_collected', turn.dispatchAttempt);
   }
-  retireStructuredTurnAttribution([dropped]);
+  retireStructuredTurnAttribution([...(dropped.supersededTurns ?? []), dropped]);
   if (turn.dispatchAttempt === undefined) {
     const hasSubmitNotice = structuredTurnsWithSubmitNotice.delete(turn.turnId);
-    const deliveredBySend = submitActivityEvidenceSince(inputDeliveryEvidence.writeStartedAtMs({
-      turnId: turn.turnId,
-      dispatchAttempt: turn.dispatchAttempt,
-      cliGeneration: cliSpawnGeneration,
-    }) ?? Date.now(), turn) === 'botmux-send';
+    const deliveredBySend = missingFinalTurnDeliveredBySend(turn);
     if (hasSubmitNotice || deliveredBySend) {
       // This exact input already got its own notice or a user-visible botmux
       // send. Do not post a contradictory warning; still close the working card.

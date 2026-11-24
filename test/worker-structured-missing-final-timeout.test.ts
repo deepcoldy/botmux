@@ -1,16 +1,26 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { CodexBridgeQueue, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import { StructuredMissingFinalWatchdog } from '../src/services/structured-missing-final.js';
 import { PtyOutputGeneration } from '../src/utils/runtime-screen-status.js';
+import {
+  attributableBridgeReplyMarkers,
+  bridgeGateInputForTurn,
+  finalBridgeSendMarkerCoversOwnThread,
+  type BridgeSendMarker,
+} from '../src/services/bridge-fallback-gate.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
-function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' | 'transcript'; zeroPrompt?: boolean } = {}) {
+function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' | 'transcript'; zeroPrompt?: boolean; nativeIdentity?: boolean } = {}) {
   let now = 0;
   const queue = new CodexBridgeQueue(() => now);
   queue.mark('om_turn', 'question', now, opts.attempt);
-  queue.ingest([{ uuid: 'native-user-1', timestampMs: now, kind: 'user', text: 'question' }]);
+  queue.ingest([{ uuid: 'native-user-1', timestampMs: now, kind: 'user', text: 'question',
+    ...(opts.nativeIdentity ? {
+      sourceSessionId: 'provider', sourceTurnId: 'native-turn', sourceMessageId: 'message-old',
+    } : {}),
+  }]);
   const scope: Record<string, any> = {
-    lastInitConfig: { cliId, replyDelivery: opts.delivery ?? 'transcript', adoptMode: false },
+    lastInitConfig: { cliId, replyDelivery: opts.delivery ?? 'transcript', adoptMode: false, chatId: 'oc_own', rootMessageId: 'om_root' },
     replyDeliveryMode: () => opts.delivery ?? 'transcript',
     zeroPromptTerminalSync: () => opts.zeroPrompt === true,
     codexBridgeQueue: queue,
@@ -26,6 +36,11 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     ptyOutputGeneration: new PtyOutputGeneration(),
     lastStructuredBridgeActivityAtMs: 0,
     cliSpawnGeneration: 1,
+    rpcTurnsAwaitingActivation: new Map(),
+    rpcLifecycleFailClosedOwners: new Map(),
+    rpcTerminalHydrationOwners: new Map(),
+    rpcActiveOwners: new Map(),
+    settlingRpcTerminalOwners: new Map(),
     structuredTurnsWithSubmitNotice: new Set<string>(),
     structuredMissingFinalWatchdog: new StructuredMissingFinalWatchdog(),
     codexBridgeIngest: vi.fn(),
@@ -38,11 +53,15 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     cliName: () => cliId,
     emitReadyCodexTurns: vi.fn(),
     redriveRejectedStructuredReady: vi.fn(),
-    inputDeliveryEvidence: { writeStartedAtMs: () => 0 },
-    submitActivityEvidenceSince: vi.fn(() => undefined),
+    sessionId: 'sid-own',
+    readSendMarkers: vi.fn((): BridgeSendMarker[] => []),
+    attributableBridgeReplyMarkers,
+    bridgeGateInputForTurn,
+    finalBridgeSendMarkerCoversOwnThread,
   };
   scope.structuredMissingFinalTarget = loadWorkerFunction('structuredMissingFinalTarget', scope);
   scope.notifyMissingFinalTurn = loadWorkerFunction('notifyMissingFinalTurn', scope);
+  scope.missingFinalTurnDeliveredBySend = loadWorkerFunction('missingFinalTurnDeliveredBySend', scope);
   const settle = loadWorkerFunction<() => void>('maybeSettleMissingStructuredFinal', scope);
   return { scope, queue, settle, advance: (ms: number) => { now += ms; } };
 }
@@ -172,17 +191,106 @@ describe('worker: missing structured final timeout', () => {
   it('suppresses the warning when this exact turn already has botmux-send evidence', () => {
     const r = workerRig('doubao');
     const clock = vi.spyOn(Date, 'now');
-    r.scope.submitActivityEvidenceSince.mockReturnValue('botmux-send');
+    r.scope.readSendMarkers.mockReturnValue([{
+      sentAtMs: 1, sessionId: 'sid-own', turnId: 'om_turn', responseKind: 'final',
+      deliveryKind: 'current_session_send', targetChatId: 'oc_own', targetRootMessageId: 'om_root',
+    }]);
     clock.mockReturnValue(0);
     r.settle();
     clock.mockReturnValue(20_000);
     r.settle();
     expect(r.queue.peek()).toEqual([]);
-    expect(r.scope.submitActivityEvidenceSince).toHaveBeenCalledWith(0,
-      expect.objectContaining({ turnId: 'om_turn' }));
+    expect(r.scope.readSendMarkers).toHaveBeenCalled();
     expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([{
       type: 'turn_display_retired', turnId: 'om_turn', message: 'worker.structured_final_not_collected',
     }]);
+  });
+
+  it.each([
+    ['progress', { responseKind: 'progress' }],
+    ['auxiliary', { responseKind: 'auxiliary' }],
+    ['a legacy marker with no response kind', { responseKind: undefined }],
+    ['a terminal-independent send', { terminalIndependent: true as const }],
+    ['another turn', { turnId: 'om_other' }],
+    ['another attempt', { dispatchAttempt: 1 }],
+    ['another chat', { targetChatId: 'oc_other' }],
+    ['another topic', { deliveryKind: 'detoured_send' as const, targetRootMessageId: 'om_other_topic' }],
+    ['an auxiliary reply card', { replyCardResponseKind: 'auxiliary' as const }],
+  ] as const)('does not suppress the missing-final warning for %s', (_label, override) => {
+    const r = workerRig('doubao');
+    const clock = vi.spyOn(Date, 'now');
+    r.scope.readSendMarkers.mockReturnValue([{
+      sentAtMs: 1, sessionId: 'sid-own', turnId: 'om_turn', responseKind: 'final',
+      deliveryKind: 'current_session_send', targetChatId: 'oc_own', targetRootMessageId: 'om_root',
+      ...override,
+    }]);
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([expect.objectContaining({
+      type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn',
+    })]);
+  });
+
+  it('uses the restored turn\'s persisted mark time instead of an absent in-memory write timestamp', () => {
+    const r = workerRig('doubao');
+    const clock = vi.spyOn(Date, 'now');
+    const restored = r.queue.peek()[0]!;
+    restored.restoredFromJournal = true;
+    restored.markTimeMs = 100;
+    // Legacy marker without a turn id: only the persisted window admits it.
+    // The old Date.now() fallback would discard this pre-restart final at 20s.
+    r.scope.readSendMarkers.mockReturnValue([{
+      sentAtMs: 100, sessionId: 'sid-own', responseKind: 'final',
+      deliveryKind: 'current_session_send', targetChatId: 'oc_own', targetRootMessageId: 'om_root',
+    }]);
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([expect.objectContaining({
+      type: 'turn_display_retired', turnId: 'om_turn',
+    })]);
+  });
+
+  it('does not admit a legacy final older than the restored turn\'s persisted mark', () => {
+    const r = workerRig('doubao');
+    const clock = vi.spyOn(Date, 'now');
+    const restored = r.queue.peek()[0]!;
+    restored.restoredFromJournal = true;
+    restored.markTimeMs = 100;
+    r.scope.readSendMarkers.mockReturnValue([{
+      sentAtMs: 99, sessionId: 'sid-own', responseKind: 'final',
+      deliveryKind: 'current_session_send', targetChatId: 'oc_own', targetRootMessageId: 'om_root',
+    }]);
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([expect.objectContaining({
+      type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn',
+    })]);
+  });
+
+  it('retires a merged predecessor together with the timed-out head after a real queue merge', () => {
+    const r = workerRig('codex', { nativeIdentity: true });
+    const clock = vi.spyOn(Date, 'now');
+    r.queue.mark('om_merged', 'follow-up', 10);
+    r.queue.ingest([{
+      uuid: 'native-user-merged', timestampMs: 10, kind: 'user', text: 'follow-up',
+      sourceSessionId: 'provider', sourceTurnId: 'native-turn', sourceMessageId: 'message-new',
+    }]);
+    const merged = r.queue.peek()[0]!;
+    expect(merged.turnId).toBe('om_merged');
+    expect(merged.supersededTurns).toEqual([{ turnId: 'om_turn', dispatchAttempt: undefined }]);
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.scope.retireStructuredTurnAttribution.mock.calls[0]![0].map(
+      (turn: CodexPendingTurn) => turn.turnId,
+    )).toEqual(['om_turn', 'om_merged']);
   });
 
   it.each([
@@ -231,6 +339,46 @@ describe('worker: missing structured final timeout', () => {
     expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([expect.objectContaining({
       type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn',
     })]);
+  });
+
+  it.each([
+    ['rpcActive', 'rpcActive'],
+    ['awaiting activation', 'rpcTurnsAwaitingActivation'],
+    ['fail-closed owner', 'rpcLifecycleFailClosedOwners'],
+    ['terminal hydration', 'rpcTerminalHydrationOwners'],
+    ['active owner', 'rpcActiveOwners'],
+    ['terminal settlement', 'settlingRpcTerminalOwners'],
+  ] as const)('does not retire while RPC %s is still owned', (_label, guard) => {
+    const r = workerRig('codex');
+    const clock = vi.spyOn(Date, 'now');
+    if (guard === 'rpcActive') r.queue.peek()[0]!.rpcActive = true;
+    else r.scope[guard].set('rpc-owner', { generation: 1 });
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(100_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    expect(r.scope.codexBridgeIngest).not.toHaveBeenCalled();
+    expect(r.scope.send).not.toHaveBeenCalled();
+  });
+
+  it('starts a fresh full wait only after the RPC activation owner is released', () => {
+    const r = workerRig('codex');
+    const clock = vi.spyOn(Date, 'now');
+    r.scope.rpcTurnsAwaitingActivation.set('rpc-owner', { generation: 1 });
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(100_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    r.scope.rpcTurnsAwaitingActivation.clear();
+    r.settle();
+    clock.mockReturnValue(119_999);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    clock.mockReturnValue(120_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
   });
 
   it('resets the wait on output and supports a lifecycle-blocked rejected idle edge', () => {

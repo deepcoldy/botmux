@@ -154,6 +154,21 @@ describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('structured tran
     expect(s.notices('om_turn_1')).toEqual([]);
   }, 50_000);
 
+  it('still reports a missing final after a progress-only botmux send', async () => {
+    const s = startScenario();
+    await startFirstTurn(s);
+    recordBridgeReplyMarker({
+      dataDir: s.dataDir, sessionId: s.sessionId, turnId: 'om_turn_1', sentAtMs: Date.now(),
+      responseKind: 'progress', deliveryKind: 'current_session_send', messageId: 'om_progress_only',
+      content: 'PROGRESS_IS_NOT_A_FINAL',
+    });
+    await s.waitUntil(() => s.notices('om_turn_1').length === 1, 'warning after progress-only send', 45_000);
+    expect(s.notices('om_turn_1')[0]).toMatchObject({
+      type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn_1',
+    });
+    expect(s.finals('om_turn_1')).toEqual([]);
+  }, 60_000);
+
   it('does not post a missing-final warning after this turn was visibly delivered by botmux send', async () => {
     const s = startScenario();
     await startFirstTurn(s);
