@@ -5,6 +5,7 @@ import { hcTerminalName } from './cli-ops.js';
 
 const DOCUMENT = 'herdr-app';
 const TIMEOUT = { timeoutMs: 2_000 };
+const RPC_INTERNAL_ERROR = -32603;
 const RETRY_INITIAL_MS = 50;
 const RETRY_MAX_MS = 2_000;
 
@@ -106,7 +107,8 @@ export async function publishHcHerdrTab(
       await client.call('doc.set', { name: DOCUMENT, version: current.version, value: document }, TIMEOUT);
       return;
     } catch (error) {
-      if (!isHcError(error, 'timeout') && !(isHcError(error, 'rpc') && error.kind === 'conflict')) throw error;
+      const retryableRpc = isHcError(error, 'rpc') && (error.kind === 'conflict' || error.rpcCode === RPC_INTERNAL_ERROR);
+      if (!isHcError(error, 'timeout') && !retryableRpc) throw error;
       if (!isCurrent()) return;
       // Restoring many workers can race on one document. Spread retries and
       // re-read every time, including after a write whose reply was lost.

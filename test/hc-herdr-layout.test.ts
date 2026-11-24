@@ -57,13 +57,18 @@ describe('publishHcHerdrTab', () => {
     expect(tab().name).toBe('My Herdr title');
   });
 
-  it('rides out contention without duplicating a tab whose write reply timed out', async () => {
+  it('recovers from a failed save and contention without duplicating a tab whose reply timed out', async () => {
     let version = 0;
     let value: { spaces: { tabs: unknown[] }[] } | null = null;
     let conflictingWrites = 6;
+    let saveFailed = false;
     const call = vi.fn(async (method: string, params: { version?: number; value?: typeof value }) => {
       if (method === 'doc.get') return { version, value: structuredClone(value) };
       expect(params.version).toBe(version);
+      if (!saveFailed) {
+        saveFailed = true;
+        throw new HcError('rpc', 'cannot save document', { rpcCode: -32603 });
+      }
       version++;
       if (conflictingWrites-- > 0) throw new HcError('rpc', 'layout changed', { kind: 'conflict' });
       value = structuredClone(params.value!);
@@ -73,7 +78,7 @@ describe('publishHcHerdrTab', () => {
     vi.useFakeTimers();
     try {
       const publishing = publishHcHerdrTab({ call: call as HcClient['call'] }, 'session-a', terminal, 'Title', () => true);
-      await flushFakeTimers(15_000, 100);
+      await flushFakeTimers(20_000, 100);
       await publishing;
       expect(conflictingWrites).toBe(-1);
       expect(value!.spaces[0]!.tabs).toMatchObject([{ name: 'Title' }]);
