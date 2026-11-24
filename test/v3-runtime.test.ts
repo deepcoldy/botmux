@@ -183,6 +183,44 @@ describe('runWorkflow — research→summarize 最小闭环', () => {
     }
   });
 
+  it('a goal the CLI aborted after an invalid manifest appeared names the abort in the block', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-abort-invalid-'));
+    const dag = validateDag({ runId: 'abort-invalid-manifest', nodes: [TWO_NODE.nodes[0]] });
+    try {
+      const runNode: RunNode = async (req) => {
+        writeFileSync(req.env[GOAL_ENV.MANIFEST_PATH]!, '{"schemaVersion":1,"status":"ok"');
+        return { status: 'ok', manifestPath: req.env[GOAL_ENV.MANIFEST_PATH]!,
+          failureDetail: 'Goal cleared after an unrecoverable error (authentication failed)' };
+      };
+      const deps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot };
+      expect(await runWorkflow(dag, deps, { baseDir: base })).toMatchObject({ runStatus: 'blocked' });
+      const blocked = readJournal(join(base, dag.runId, 'journal.ndjson')).find((e) => e.type === 'nodeBlocked') as any;
+      expect(blocked.errorClass).toBe('manifestInvalid');
+      expect(blocked.message).toMatch(/^Goal cleared after an unrecoverable error \(authentication failed\); ./);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('process failure with a valid ok manifest still leads with the root cause', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-detail-ok-'));
+    const dag = validateDag({ runId: 'detail-ok-manifest', nodes: [TWO_NODE.nodes[0]] });
+    try {
+      const runNode: RunNode = async (req) => ({
+        status: 'fail',
+        manifestPath: writeManifest(req, { schemaVersion: 1, status: 'ok', summary: 'done',
+          files: [product(req.outputDir, 'report.md', '# Report')] }),
+        failureDetail: 'CLI exited code=1 signal=null',
+      });
+      const deps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot };
+      await runWorkflow(dag, deps, { baseDir: base });
+      const failed = readJournal(join(base, dag.runId, 'journal.ndjson')).find((e) => e.type === 'nodeFailed') as any;
+      expect(failed.message).toBe('CLI exited code=1 signal=null; runNode reported process failure');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('retryable pool error (CLI startup dialog) blocks for a manual retry, never replays on its own', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-startup-recovery-'));
     const dag = validateDag({ runId: 'startup-recovery', nodes: [TWO_NODE.nodes[0]] });

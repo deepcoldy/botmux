@@ -30,7 +30,7 @@ describe('workflow worker on a cleared Claude goal', () => {
     const { messages, ingest } = harness({ workflow: true });
     ingest([cleared]);
     ingest([cleared]);
-    expect(messages).toEqual([{ type: 'error', message: (cleared as any).content }]);
+    expect(messages).toEqual([{ type: 'error', message: (cleared as any).content, goalAborted: true }]);
   });
 
   it('leaves ordinary chat sessions alone', () => {

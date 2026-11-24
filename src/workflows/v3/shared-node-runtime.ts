@@ -3571,8 +3571,9 @@ export async function runWorkflow(
           errorClass = result.status === 'ok' ? 'manifestInvalid' : 'workerError';
           message = (verdict.problems ?? ['manifest missing or invalid']).join('; ');
           // Lead with the process root cause: "manifest not readable" alone
-          // hides e.g. a CLI that aborted its goal on an unavailable model.
-          if (result.status === 'fail' && result.failureDetail) message = `${result.failureDetail}; ${message}`;
+          // hides e.g. a CLI that aborted its goal on an unavailable model
+          // (set with status ok too when the abort came after the manifest).
+          if (result.failureDetail) message = `${result.failureDetail}; ${message}`;
         } else {
           // Manifest is structurally valid but declares failure (or the
           // process failed despite an ok manifest) — surface the node's own
@@ -3591,7 +3592,9 @@ export async function runWorkflow(
               retryable = m.error.retryable;
             }
           } else {
-            message = 'runNode reported process failure';
+            message = result.failureDetail
+              ? `${result.failureDetail}; runNode reported process failure`
+              : 'runNode reported process failure';
           }
         }
         // A pool error marked retryable (e.g. a CLI startup dialog) needs a

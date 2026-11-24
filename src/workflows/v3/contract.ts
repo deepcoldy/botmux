@@ -337,7 +337,9 @@ export interface RunNodeResult {
     retryable?: boolean;
   };
   /** Root cause of a process failure (CLI error, timeout, exit code), used to
-   *  lead the node's message when no valid manifest was written. */
+   *  lead the node's failure message. Also set with status `ok` when the CLI
+   *  aborted its goal after the manifest appeared: the runtime then names it
+   *  only if that manifest turns out invalid. */
   failureDetail?: string;
 }
 

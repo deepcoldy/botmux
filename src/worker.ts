@@ -4434,7 +4434,7 @@ function probeStartupBlocker(source: string): CliStartupBlocker | null {
     // node deadline, so it is always sent there.
     if (!alreadyExplained || isWorkflowWorker()) {
       send({ type: 'user_notify', kind: 'cli_startup_blocked',
-        startupBlocker: { kind: blocker.kind, rule: blocker.rule },
+        startupBlocker: { kind: blocker.kind, rule: blocker.rule, ...(blocker.folder ? { folder: blocker.folder } : {}) },
         message: startupBlockerNotice(blocker), turnId: currentBotmuxTurnId });
     }
   }
@@ -13400,7 +13400,7 @@ function maybeFailWorkflowOnGoalAbort(events: readonly TranscriptEvent[]): void 
   const message = workflowGoalAbortWatch.observe(events);
   if (!message) return;
   log(`Workflow goal cleared by the CLI; failing the node: ${message}`);
-  send({ type: 'error', message });
+  send({ type: 'error', message, goalAborted: true });
 }
 
 /** Scan newly-drained Claude transcript events for a structured rate-limit

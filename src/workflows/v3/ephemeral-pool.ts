@@ -183,7 +183,7 @@ async function runNodeImpl(
   }
   if (!secret) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'secret_missing');
-    return { status: 'fail', manifestPath };
+    return { status: 'fail', manifestPath, failureDetail: `no Lark app secret available for ${req.botSnapshot.larkAppId}` };
   }
 
   try {
@@ -402,6 +402,8 @@ async function runNodeImpl(
     let cancelRequested = false;
     let initSent = false;
     let goalSent = false;
+    /** The CLI cleared its goal after the manifest appeared (see 'error'). */
+    let goalAbortedAfterManifest: string | undefined;
     let sessionReadyNotified = false;
     let cancelReason: unknown;
     let observedRuntime: Extract<WorkerEvent, { type: 'active_runtime' }> | undefined;
@@ -568,6 +570,11 @@ async function runNodeImpl(
       const poll = () => {
         manifestTimer = undefined;
         if (settled || cancelRequested) return;
+        if (goalAbortedAfterManifest && !isRegularFile(manifestPath)) {
+          // The manifest we deferred to is gone and nothing will write it again.
+          finish('fail', 'worker-error', { detail: goalAbortedAfterManifest });
+          return;
+        }
         const stable = manifestIsStable(manifestPath, manifestCandidate, deps.manifestSettleMs);
         manifestCandidate = stable.candidate;
         if (stable.done) {
@@ -646,11 +653,12 @@ async function runNodeImpl(
           // answer the dialog from a workflow, so waiting would only burn the
           // node deadline and end in a bare "manifest missing".
           if (event.kind === 'cli_startup_blocked' && event.startupBlocker && !goalSent) {
-            const { kind, rule } = event.startupBlocker;
+            const { kind, rule, folder } = event.startupBlocker;
+            const profile = req.botSnapshot.cliConfigDir ? ` (${req.botSnapshot.cliConfigDir})` : '';
             const error = {
               code: `CLI_STARTUP_${kind.toUpperCase()}`,
-              message: `${req.botSnapshot.cliId} startup is blocked on ${kind} (${rule}) before the goal was sent; `
-                + 'complete that step with this bot\'s CLI profile, then retry the node',
+              message: `${req.botSnapshot.cliId} startup is blocked on ${kind} (${rule})${folder ? ` for ${folder}` : ''} `
+                + `before the goal was sent; complete that step with this bot's CLI profile${profile}, then retry the node`,
               retryable: true,
             };
             void appendLine(stderrPath(req), `[v3] ${error.code}: ${event.message}`);
@@ -659,6 +667,15 @@ async function runNodeImpl(
           break;
         case 'error':
           void appendLine(stderrPath(req), `[worker] ${event.message}`);
+          if (event.goalAborted && goalSent && isRegularFile(manifestPath)) {
+            // Claude gave up on a call AFTER the goal wrote its manifest (e.g.
+            // the context ran out on the closing turn). The work may be on
+            // disk: let the manifest watch settle it and the runtime judge it,
+            // keeping the cause in case that manifest is not valid.
+            goalAbortedAfterManifest = event.message;
+            void appendLine(stderrPath(req), '[v3] goal cleared after the manifest was written; settling on the manifest');
+            break;
+          }
           finish('fail', 'worker-error', { detail: event.message });
           break;
         case 'claude_exit':
@@ -716,9 +733,16 @@ async function runNodeImpl(
         void appendLine(stderrPath(req), `[v3] ${runtimeError.code}: ${runtimeError.message}`);
       }
       void appendLine(stderrPath(req), `[v3] worker closed status=${status} reason=${reason} code=${code ?? 'null'}`);
-      const failureDetail = workerStatus === 'fail'
-        ? pendingResult?.detail ?? `worker exited code=${code ?? 'null'}`
-        : undefined;
+      const processDetail = workerStatus !== 'fail' ? undefined
+        : pendingResult
+          // The pool itself closed the worker (send failure, …): its exit code says nothing.
+          ? pendingResult.detail ?? `node ended by the pool (${pendingResult.reason})`
+          : `worker exited code=${code ?? 'null'}`;
+      // A goal the CLI cleared after its manifest appeared is the root cause of
+      // whatever ended the node next (deadline, CLI exit, a vanished manifest).
+      const failureDetail = goalAbortedAfterManifest && !processDetail?.startsWith(goalAbortedAfterManifest)
+        ? (processDetail ? `${goalAbortedAfterManifest}; ${processDetail}` : goalAbortedAfterManifest)
+        : processDetail;
       resolve({
         status,
         manifestPath,
@@ -846,6 +870,10 @@ function stdoutPath(req: RunNodeRequest): string {
 
 function stderrPath(req: RunNodeRequest): string {
   return req.stderrPath ?? join(req.attemptDir, 'stderr.log');
+}
+
+function isRegularFile(path: string): boolean {
+  try { return statSync(path).isFile(); } catch { return false; }
 }
 
 function manifestIsStable(

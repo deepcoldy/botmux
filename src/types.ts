@@ -2925,7 +2925,7 @@ export type WorkerToDaemonBase =
   /** Executor-observed Codex tier, bound to this worker + rollout generation.
    * `null` explicitly clears any previous generation's snapshot. */
   | { type: 'codex_service_tier'; snapshot: CodexServiceTierSnapshot | null }
-  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number; sandboxNamespace?: 'pid' | 'user' }
+  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number; sandboxNamespace?: 'pid' | 'user'; /** Workflow worker only: Claude cleared the node's `/goal` (claude-transcript ClaudeGoalAbortWatch). */ goalAborted?: true }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   /** Worker observed a successful explicit `botmux send` for this turn, so
    * the daemon should treat listener-preview runs as visibly replied even
@@ -2999,7 +2999,7 @@ export type WorkerToDaemonBase =
          *  unkinded notice; the v3 workflow pool fails the node on it. */
         | 'cli_startup_blocked';
       /** `kind='cli_startup_blocked'`: which dialog matched (core/cli-startup-blocker). */
-      startupBlocker?: Pick<import('./core/cli-startup-blocker.js').CliStartupBlocker, 'kind' | 'rule'>;
+      startupBlocker?: Pick<import('./core/cli-startup-blocker.js').CliStartupBlocker, 'kind' | 'rule' | 'folder'>;
       /** Permission prompt persisted across fresh worker captures; no daemon-side grace needed. */
       permissionPromptStable?: boolean;
       /** Bounded plain-text bottom of the screen for an input_not_submitted

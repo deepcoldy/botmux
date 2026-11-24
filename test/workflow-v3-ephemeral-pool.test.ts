@@ -840,6 +840,7 @@ describe('v3 ephemeral pool', () => {
     await expect(pool.runNode(req)).resolves.toEqual({
       status: 'fail',
       manifestPath: join(req.attemptDir, 'manifest.json'),
+      failureDetail: 'no Lark app secret available for cli_app',
     });
     expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({
       phase: 'closed_no_spawn',
@@ -1413,6 +1414,23 @@ describe('workflow node startup: folder trust and startup blockers', () => {
     },
   );
 
+  it('names the folder and the bot\'s CLI profile the person has to fix', async () => {
+    const req = request();
+    req.botSnapshot.cliConfigDir = join(dir, 'claude-profile');
+    const worker = new ScriptedWorker();
+    const running = createEphemeralPool({
+      factory: factoryFor(worker), workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret',
+    }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'user_notify', kind: 'cli_startup_blocked', message: 'trust?',
+      startupBlocker: { kind: 'folder_trust', rule: 'claude-folder-trust', folder: '/work/repo' } });
+    await waitFor(() => worker.closeRequests === 1);
+    worker.emitExit(0);
+    const result = await running;
+    expect(result.error?.message).toContain('/work/repo');
+    expect(result.error?.message).toContain(join(dir, 'claude-profile'));
+  });
+
   it('keeps ordinary notices informational', async () => {
     const req = request();
     req.botSnapshot.cliId = 'codex';
@@ -1531,6 +1549,125 @@ describe('workflow node failure detail', () => {
     await waitFor(() => worker.closeRequests === 1);
     worker.emitExit(0);
     await expect(running).resolves.toMatchObject({ status: 'fail', failureDetail: 'node timed out after 0s' });
+  });
+
+  it('fails at once when Claude clears its goal before any manifest exists', async () => {
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode({ ...request(), timeoutMs: 1_800_000 });
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'error', message: 'Goal cleared after an unrecoverable error (authentication failed)', goalAborted: true });
+    await waitFor(() => worker.closeRequests === 1);
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({
+      status: 'fail', failureDetail: 'Goal cleared after an unrecoverable error (authentication failed)',
+    });
+  });
+
+  it('settles on a manifest the goal already wrote when Claude clears the goal afterwards', async () => {
+    const worker = new ScriptedWorker();
+    const req = { ...request(), timeoutMs: 1_800_000 };
+    const running = createEphemeralPool({
+      factory: factoryFor(worker), workerPath: '/tmp/worker.js', manifestPollMs: 5, manifestSettleMs: 40,
+      resolveLarkAppSecret: () => 'secret',
+    }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    mkdirSync(dirname(req.env[GOAL_ENV.MANIFEST_PATH]!), { recursive: true });
+    writeFileSync(req.env[GOAL_ENV.MANIFEST_PATH]!, '{"schemaVersion":1,"status":"ok"}');
+    // Inside the manifest settle window: the closing turn's API call failed.
+    worker.emitMessage({ type: 'error', message: 'Goal cleared after an unrecoverable error (context limit reached)', goalAborted: true });
+    expect(worker.closeRequests).toBe(0);
+    await waitFor(() => worker.closeRequests === 1);
+    worker.emitExit(0);
+    // Settled on the manifest; the cause stays with it in case the runtime
+    // finds that manifest invalid.
+    await expect(running).resolves.toMatchObject({
+      status: 'ok', failureDetail: 'Goal cleared after an unrecoverable error (context limit reached)',
+    });
+  });
+
+  it('fails at once with the abort cause when the deferred-to manifest disappears', async () => {
+    const worker = new ScriptedWorker();
+    const req = { ...request(), timeoutMs: 1_800_000 };
+    const running = createEphemeralPool({
+      factory: factoryFor(worker), workerPath: '/tmp/worker.js', manifestPollMs: 5, manifestSettleMs: 10_000,
+      resolveLarkAppSecret: () => 'secret',
+    }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH]!;
+    mkdirSync(dirname(manifestPath), { recursive: true });
+    writeFileSync(manifestPath, '{"schemaVersion":1');
+    worker.emitMessage({ type: 'error', message: 'Goal cleared after an unrecoverable error (authentication failed)', goalAborted: true });
+    rmSync(manifestPath);
+    await waitFor(() => worker.closeRequests === 1);
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({
+      status: 'fail', failureDetail: 'Goal cleared after an unrecoverable error (authentication failed)',
+    });
+  });
+
+  it('keeps the abort cause when the node deadline ends a deferred settle', async () => {
+    const worker = new ScriptedWorker();
+    const req = { ...request(), timeoutMs: 150 };
+    const running = createEphemeralPool({
+      factory: factoryFor(worker), workerPath: '/tmp/worker.js', manifestPollMs: 5, manifestSettleMs: 60_000,
+      resolveLarkAppSecret: () => 'secret',
+    }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH]!;
+    mkdirSync(dirname(manifestPath), { recursive: true });
+    writeFileSync(manifestPath, '{"schemaVersion":1}');
+    worker.emitMessage({ type: 'error', message: 'Goal cleared after an unrecoverable error (billing)', goalAborted: true });
+    await waitFor(() => worker.closeRequests === 1);
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({
+      status: 'fail', failureDetail: 'Goal cleared after an unrecoverable error (billing); node timed out after 0s',
+    });
+  });
+
+  it('keeps the abort cause when the CLI exits non-zero during a deferred settle', async () => {
+    const worker = new ScriptedWorker();
+    const req = { ...request(), timeoutMs: 1_800_000 };
+    const running = createEphemeralPool({
+      factory: factoryFor(worker), workerPath: '/tmp/worker.js', manifestPollMs: 5, manifestSettleMs: 60_000,
+      resolveLarkAppSecret: () => 'secret',
+    }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH]!;
+    mkdirSync(dirname(manifestPath), { recursive: true });
+    writeFileSync(manifestPath, '{"schemaVersion":1}');
+    worker.emitMessage({ type: 'error', message: 'Goal cleared after an unrecoverable error (billing)', goalAborted: true });
+    worker.emitMessage({ type: 'claude_exit', code: 1, signal: null });
+    await waitFor(() => worker.closeRequests === 1);
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({
+      status: 'fail', failureDetail: 'Goal cleared after an unrecoverable error (billing); CLI exited code=1 signal=null',
+    });
+  });
+
+  it('names the pool\'s own reason when it closed the worker itself', async () => {
+    const worker = new ScriptedWorker();
+    const send = worker.send.bind(worker);
+    worker.send = (msg: unknown) => {
+      if ((msg as any)?.type === 'raw_input') throw new Error('ipc closed');
+      send(msg);
+    };
+    const running = pool(worker).runNode(request());
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    await waitFor(() => worker.closeRequests === 1);
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'fail', failureDetail: 'node ended by the pool (goal-send-failed)' });
   });
 
   it('carries no failure detail on success', async () => {

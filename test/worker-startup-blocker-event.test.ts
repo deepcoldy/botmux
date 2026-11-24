@@ -33,14 +33,15 @@ describe('worker startup blocker IPC', () => {
     probe('first-prompt');
     probe('ready-fallback');
     expect(messages).toEqual([expect.objectContaining({ type: 'user_notify', kind: 'cli_startup_blocked',
-      message: 'workspace needs trust', startupBlocker: { kind: 'folder_trust', rule: 'grok-folder-trust' } })]);
+      message: 'workspace needs trust',
+      startupBlocker: { kind: 'folder_trust', rule: 'grok-folder-trust', folder: '/root/ec-apply-access' } })]);
   });
 
   it('still tells a workflow pool when the chat notice was already explained at spawn', () => {
     const { probe, messages } = harness({ workflow: true, alreadyExplained: true });
     probe('first-prompt');
     expect(messages).toEqual([expect.objectContaining({ kind: 'cli_startup_blocked',
-      startupBlocker: { kind: 'folder_trust', rule: 'grok-folder-trust' } })]);
+      startupBlocker: { kind: 'folder_trust', rule: 'grok-folder-trust', folder: '/root/ec-apply-access' } })]);
   });
 
   it('keeps an already-explained chat notice deduplicated', () => {
