@@ -5306,10 +5306,18 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         typeof value.reply_card_attempt === 'number' ? value.reply_card_attempt : undefined) : undefined;
       const record = replyKey && new TurnReplyCardStore(config.session.dataDir).read(replyKey);
       const staleTurn = () => ({ toast: { type: 'warning', content: t('cmd.stop.app_stale_turn', undefined, locDs) } });
+      let supervisionStopSaveFailed = false;
       const stopSupervision = () => {
         try { stopGroupSessionSupervision(ds.session, () => sessionStore.updateSession(ds.session)); }
-        catch { logger.warn(`[${tag(ds)}] could not save stopped supervision`); }
+        catch {
+          supervisionStopSaveFailed = true;
+          logger.warn(`[${tag(ds)}] could not save stopped supervision`);
+        }
       };
+      const stopToast = (type: 'success' | 'warning', content: string) => ({
+        type: supervisionStopSaveFailed ? 'warning' : type,
+        content: supervisionStopSaveFailed ? `${content}\n${t('cmd.supervise.stop_save_failed', undefined, locDs)}` : content,
+      });
       if (replyKey && (!record || record.messageId !== cardMessageId || replyCardIsTerminal(record) || record.finalDelivered)) {
         return staleTurn();
       }
@@ -5322,11 +5330,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
             || !streamTarget || value.codex_app_stop_target !== streamTarget)) return staleTurn();
         stopSupervision();
         const status = await interruptCodexAppTurn(ds, target);
-        const content = t(`cmd.stop.app_${status}`, undefined, locDs);
+        const toast = stopToast(status === 'delivered' ? 'success' : 'warning', t(`cmd.stop.app_${status}`, undefined, locDs));
         return {
-          toast: { type: status === 'delivered' ? 'success' : 'warning', content },
+          toast,
           afterAck: async (timedOut?: boolean) => {
-            if (timedOut && operatorOpenId) await sendUserMessage(ds.larkAppId, operatorOpenId, content, 'text');
+            if (timedOut && operatorOpenId) await sendUserMessage(ds.larkAppId, operatorOpenId, toast.content, 'text');
           },
         };
       }
@@ -5338,7 +5346,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         void updateTurnReplyCard(ds, key.turnId, { kind: 'phase', phase: 'stopping' },
           (body, type, uuid, beforeWrite) => deps.sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, key.turnId, { uuid, beforeWrite }),
           { dispatchAttempt: key.dispatchAttempt }).catch(error => logger.warn(`[reply-card] stop display: ${error.message}`));
-        return { toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
+        return { toast: stopToast('success', t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs)) };
       }
       stopSupervision();
       sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
@@ -5379,11 +5387,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         return {
-          toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
+          toast: stopToast('success', t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs)),
           card: { type: 'raw' as const, data: JSON.parse(cardJson) },
         };
       }
-      return { toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
+      return { toast: stopToast('success', t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs)) };
     }
 
     // 「🗜️ 压缩」：等价于用户在话题里发 /compact——通过 deps.deliverPassthroughCommand

@@ -1160,7 +1160,7 @@ import {
   markPassthroughActivity,
   stampHumanActivity,
 } from './core/session-activity.js';
-import { noteTurnStarted, turnFinalText, turnOutcomePendingOrChanged } from './core/turn-outcome.js';
+import { noteTurnStarted, turnOutcomePendingOrChanged, turnSupervisionFinalReply } from './core/turn-outcome.js';
 import { inheritTurnReplyRouting } from './core/reply-target.js';
 import {
   chooseGroupSupervisionDecision, groupSupervisionNotice, groupSupervisionTracking, MAX_SUPERVISION_CRITERIA_CHARS, newGroupSessionSupervision,
@@ -7790,7 +7790,7 @@ function runGroupSessionSupervision(ds: DaemonSession, terminal?: SessionLastTur
   }, {
     allowed: task => ds.session === session && groupSupervisionAuthorized(ds, task),
     current: currentTurn,
-    finalText: turnId => turnFinalText(ds, turnId, config.session.dataDir),
+    finalText: turnId => turnSupervisionFinalReply(ds, turnId, config.session.dataDir),
     deriveCriteria: async (task, signal) => {
       const sourceId = task.originTurnId ?? task.turnId;
       // Use the authored message, before the executor prompt gained routing
@@ -7822,7 +7822,7 @@ function runGroupSessionSupervision(ds: DaemonSession, terminal?: SessionLastTur
     canDispatch: () => canDispatch() === true,
     stillMissingOutput: (turnId, observed) => !isRunning()
       && !turnOutcomePendingOrChanged(ds, turnId, observed)
-      && (observed?.outcome !== 'delivered' || !turnFinalText(ds, turnId, config.session.dataDir)),
+      && (observed?.outcome !== 'delivered' || !turnSupervisionFinalReply(ds, turnId, config.session.dataDir)),
     wake: () => {
       if ((ds.worker && !ds.worker.killed) || !ds.hasHistory || !ds.session.cliSessionId
         || ds.pendingRepo || ds.session.queued || blocked()
@@ -7897,7 +7897,7 @@ const commandDeps: CommandHandlerDeps = {
     if (!args || args === 'status') {
       if (!existing) await show('cmd.supervise.off');
       else if (existing.state === 'accepted' || existing.state === 'needs_user') {
-        const key = existing.state === 'accepted' ? 'accepted' : existing.reason ?? 'needs_user';
+        const key = existing.state === 'accepted' ? 'accepted' : groupSupervisionNotice(existing) ?? existing.reason ?? 'needs_user';
         await reply([tr(`cmd.supervise.${key}`, undefined, loc), ...groupSupervisionDetails(existing, loc)].join('\n'));
       }
       else if ((ds.lastCliInputTurnId ?? ds.session.lastCliInputTurnId) !== existing.turnId

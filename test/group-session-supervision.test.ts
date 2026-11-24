@@ -18,12 +18,16 @@ import {
 } from '../src/core/group-session-supervision.js';
 import { parseSupervisionAssessment, type SupervisionAssessment } from '../src/core/group-session-supervision-assessment.js';
 import { groupSessionSupervisorConfig, sameGroupSessionSupervisor } from '../src/core/group-session-supervisor-config.js';
-import { deriveGroupSupervisionCriteria, reviewGroupSessionTask } from '../src/core/group-session-supervision-review.js';
+import { buildGroupSupervisionReviewPrompt, deriveGroupSupervisionCriteria, reviewGroupSessionTask } from '../src/core/group-session-supervision-review.js';
 import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
 import type { SessionLastTurn } from '../src/core/session-task-status.js';
-import { noteFinalReplyText, recordTurnOutcome, turnFinalText, turnOutcomePendingOrChanged } from '../src/core/turn-outcome.js';
+import { noteFinalReplyText, recordTurnOutcome, turnFinalText, turnOutcomePendingOrChanged, turnSupervisionFinalReply } from '../src/core/turn-outcome.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { isForkSourceBusy } from '../src/core/worker-pool.js';
+import { invocationRequest } from '../src/services/constrained-invocation/contract.js';
+import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
+import { recordSessionTurnReply, stageSessionTurnInbound } from '../src/services/session-turns.js';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { appendMessage, findQueuedMessage } from '../src/services/message-queue.js';
 import type { LarkMessage, Session } from '../src/types.js';
@@ -47,7 +51,7 @@ function fixture(session = {} as Session, criteria = 'The build and affected tes
   const io = {
     allowed: vi.fn(() => true),
     current: vi.fn(() => true),
-    finalText: vi.fn<GroupSessionSupervisionIo['finalText']>(() => 'Test evidence'),
+    finalText: vi.fn<GroupSessionSupervisionIo['finalText']>(() => ({ text: 'Test evidence', complete: true })),
     deriveCriteria: vi.fn<GroupSessionSupervisionIo['deriveCriteria']>(async task => ({
       task: task.task, criteria: 'The build passes',
     })),
@@ -234,9 +238,11 @@ describe('group session supervision', () => {
     expect(io.dispatch).not.toHaveBeenCalled();
     await observeGroupSessionSupervision(saved, { now: checkAt, running: true }, io);
     expect(io.dispatch).not.toHaveBeenCalled();
+    expect(saved.groupSessionSupervision?.waitBusySince).toBe(checkAt);
     io.canDispatch.mockReturnValue(false);
     await observeGroupSessionSupervision(saved, { now: checkAt }, io);
     expect(io.wake).toHaveBeenCalledOnce();
+    expect(saved.groupSessionSupervision?.waitBusySince).toBeUndefined();
     expect(saved.groupSessionSupervision?.state).toBe('waiting');
     io.canDispatch.mockReturnValue(true);
     await observeGroupSessionSupervision(saved, { now: checkAt }, io);
@@ -249,6 +255,31 @@ describe('group session supervision', () => {
     await observeGroupSessionSupervision(saved, signal, io);
     await observeGroupSessionSupervision(saved, signal, io);
     expect(saved.groupSessionSupervision?.state).toBe('accepted');
+  });
+
+  it('escalates a continuously busy parked dependency after a bounded grace', async () => {
+    const { session, io, outcome } = fixture();
+    io.review.mockResolvedValue(WAIT);
+    await outcome();
+    const task = session.groupSessionSupervision!;
+    const checkAt = task.checkAt!;
+    const previousNoticeKey = `${task.id}:${task.turnId}:stalled`;
+    task.notifiedKey = previousNoticeKey;
+    task.waitChecks = 2;
+    await observeGroupSessionSupervision(session, { now: checkAt, running: true }, io);
+    expect(session.groupSessionSupervision).toMatchObject({ state: 'waiting', waitBusySince: checkAt, waitChecks: 2 });
+
+    // The durable busy deadline, not a fresh scan timestamp, controls escalation.
+    const restored = JSON.parse(JSON.stringify(session)) as Session;
+    await observeGroupSessionSupervision(restored, { now: checkAt + 60_000, running: true }, io);
+    expect(restored.groupSessionSupervision).toMatchObject({ state: 'waiting', waitBusySince: checkAt, waitChecks: 2 });
+    await observeGroupSessionSupervision(restored, { now: checkAt + 86_400_000, running: true }, io);
+    expect(restored.groupSessionSupervision).toMatchObject({
+      state: 'needs_user', reason: 'stalled', waitChecks: 2, notifiedKey: previousNoticeKey,
+    });
+    expect(restored.groupSessionSupervision?.waitBusySince).toBeUndefined();
+    expect(groupSupervisionNotice(restored.groupSessionSupervision!)).toBe('wait_stalled');
+    expect(io.dispatch).not.toHaveBeenCalled();
   });
 
   it('keeps monitoring a live stall and accepts eventual completion without another command', async () => {
@@ -299,6 +330,15 @@ describe('group session supervision', () => {
     });
   });
 
+  it('retries a failed stop before reporting it while keeping this process stopped', () => {
+    const { session, io } = fixture();
+    let attempts = 0;
+    io.persist.mockImplementation(() => { attempts++; throw new Error('storage unavailable'); });
+    expect(() => stopGroupSessionSupervision(session, io.persist)).toThrow('storage unavailable');
+    expect(attempts).toBeGreaterThan(1);
+    expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'stopped' });
+  });
+
   it('waits for a delayed final output without losing the watched task', async () => {
     const { session, io, outcome } = fixture();
     await outcome(undefined, 'no_output');
@@ -308,6 +348,94 @@ describe('group session supervision', () => {
     await outcome(undefined, 'delivered', 30_000);
     await outcome(undefined, 'delivered', 30_000);
     expect(session.groupSessionSupervision?.state).toBe('accepted');
+  });
+
+  it('reviews and anchors evidence beyond the short next-step prefix', async () => {
+    const { task, session, io, outcome } = fixture();
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    const tail = 'TAIL_EVIDENCE: 47 affected tests passed';
+    const answer = `${'x'.repeat(2_100)}\n${tail}`;
+    noteFinalReplyText(ds, task.turnId, answer);
+    io.finalText.mockImplementation(() => turnSupervisionFinalReply(ds, task.turnId, config.session.dataDir));
+    const seen: string[] = [];
+    io.review.mockImplementation(async (_task, reviewAnswer, _signal, stage) => {
+      seen.push(reviewAnswer);
+      return stage === 'completion' ? { verdict: 'ready' } : parseSupervisionAssessment(
+        { verdict: 'accepted', evidence: [tail] }, stage, task.criteria, reviewAnswer,
+      );
+    });
+    await outcome();
+    await outcome();
+    expect(seen).toEqual([answer, answer]);
+    expect(session.groupSessionSupervision?.state).toBe('accepted');
+    // The existing next-step context intentionally keeps its independent bound.
+    expect(turnFinalText(ds, task.turnId, config.session.dataDir)).not.toContain(tail);
+  });
+
+  it('keeps a failure qualifier at the long-reply tail visible to acceptance', async () => {
+    const { task, session, io, outcome } = fixture();
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    const failure = 'TAIL_FAILURE: the deployment was rolled back';
+    const answer = `${'All checks initially passed.\n'}${'x'.repeat(2_100)}\n${failure}`;
+    noteFinalReplyText(ds, task.turnId, answer);
+    io.finalText.mockImplementation(() => turnSupervisionFinalReply(ds, task.turnId, config.session.dataDir));
+    io.review.mockImplementation(async (_task, reviewAnswer, _signal, stage) => {
+      if (stage === 'completion') return { verdict: 'ready' };
+      return reviewAnswer.includes(failure)
+        ? { verdict: 'needs_user', reason: 'The tail reports a rollback' }
+        : { verdict: 'accepted', evidence: ['All checks initially passed.'] };
+    });
+    await outcome();
+    await outcome();
+    expect(io.review.mock.calls[1]?.[1]).toContain(failure);
+    expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'needs_user' });
+  });
+
+  it('keeps the largest captured supervision reply within the invocation prompt contract', () => {
+    const { task, session } = fixture();
+    task.task = 't'.repeat(8_000);
+    task.criteria = 'c'.repeat(1_600);
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    noteFinalReplyText(ds, task.turnId, 'x'.repeat(600_000));
+    const captured = turnSupervisionFinalReply(ds, task.turnId, config.session.dataDir)!;
+    expect(captured.complete).toBe(false);
+    const rendered = buildGroupSupervisionReviewPrompt(task, captured.text, 'acceptance');
+    expect(rendered.complete).toBe(true);
+    expect(invocationRequest.safeParse({
+      requestId: 'supervision-prompt-bound', prompt: rendered.prompt, model: 'test-model', deadlineMs: 45_000,
+      outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
+    }).success).toBe(true);
+  });
+
+  it('refuses acceptance when the in-memory reply crossed the capture boundary', async () => {
+    const { task, session, io, outcome } = fixture();
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    noteFinalReplyText(ds, task.turnId, `${'x'.repeat(256_100)}\nTAIL_FAILURE: rolled back`);
+    const captured = turnSupervisionFinalReply(ds, task.turnId, config.session.dataDir)!;
+    expect(captured.complete).toBe(false);
+    expect(captured.text).not.toContain('TAIL_FAILURE');
+    io.finalText.mockReturnValue(captured);
+    await outcome();
+    expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'review_incomplete' });
+    expect(io.review).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: 'backslashes', raw: '\\'.repeat(600_000) },
+    { name: 'control characters', raw: '\u0001'.repeat(200_000) },
+  ])('fits $name into the prompt contract and refuses an incomplete review', async ({ raw }) => {
+    const { task, session } = fixture();
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    noteFinalReplyText(ds, task.turnId, raw);
+    const captured = turnSupervisionFinalReply(ds, task.turnId, config.session.dataDir)!;
+    const rendered = buildGroupSupervisionReviewPrompt(task, captured.text, 'acceptance');
+    expect(rendered.complete).toBe(false);
+    expect(invocationRequest.safeParse({
+      requestId: 'supervision-prompt-bound', prompt: rendered.prompt, model: 'test-model', deadlineMs: 45_000,
+      outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
+    }).success).toBe(true);
+    await expect(reviewGroupSessionTask(task.reviewer, task, captured.text, new AbortController().signal, 'acceptance'))
+      .resolves.toMatchObject({ verdict: 'needs_user' });
   });
 
   it('restores pending acceptance and rejects evidence that the executor never reported', async () => {
@@ -460,6 +588,154 @@ describe('group session supervision with the session store', () => {
     }
   });
 
+  function recordExplicitFinal(session: Session, turnId: string, text: string) {
+    stageSessionTurnInbound(dataDir, session.sessionId, turnId, {
+      messageId: turnId, text: 'Fix the build', via: 'lark', placement: { kind: 'thread', rootMessageId: 'om_root' },
+    });
+    recordSessionTurnReply(dataDir, session.sessionId, turnId, {
+      messageId: 'om_final', responseKind: 'final', at: 10, text,
+    });
+    recordBridgeReplyMarker({
+      dataDir, sessionId: session.sessionId, sentAtMs: 10, messageId: 'om_final',
+      deliveryKind: 'current_session_send', content: text, responseKind: 'final', turnId,
+    });
+  }
+
+  it('uses the complete structured explicit final after a restart, not its 4k preview', async () => {
+    const { session, io } = storedFixture();
+    const turnId = session.groupSessionSupervision!.turnId;
+    const failure = 'TAIL_FAILURE: deployment rolled back';
+    const answer = `Deployment is live.\n${'x'.repeat(5_000)}\n${failure}`;
+    recordExplicitFinal(session, turnId, answer);
+    const restored = JSON.parse(JSON.stringify(session)) as Session;
+    const ds = { session: restored, chatType: 'group' } as DaemonSession;
+    io.persist.mockImplementation(() => sessionStore.updateSession(restored));
+    io.finalText.mockImplementation(() => turnSupervisionFinalReply(ds, turnId, dataDir));
+    const seen: number[] = [];
+    io.review.mockImplementation(async (_task, reviewAnswer, _signal, stage) => {
+      seen.push(reviewAnswer.length);
+      if (stage === 'completion') return { verdict: 'ready' };
+      return reviewAnswer.includes(failure)
+        ? { verdict: 'needs_user', reason: 'Rollback found' }
+        : { verdict: 'accepted', evidence: ['Deployment is live.'] };
+    });
+    const outcome = { turnId, at: 10, outcome: 'delivered' as const };
+    await observeGroupSessionSupervision(restored, { now: 10, outcome }, io);
+    await observeGroupSessionSupervision(restored, { now: 11, outcome }, io);
+    expect(seen).toEqual([answer.length, answer.length]);
+    expect(restored.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'needs_user' });
+  });
+
+  it('refuses acceptance from a preview-only final whose tail cannot be proven complete', async () => {
+    const { session, io } = storedFixture();
+    const turnId = session.groupSessionSupervision!.turnId;
+    const answer = `Deployment is live.\n${'x'.repeat(5_000)}\nTAIL_FAILURE: deployment rolled back`;
+    recordBridgeReplyMarker({
+      dataDir, sessionId: session.sessionId, sentAtMs: 10, messageId: 'om_final',
+      deliveryKind: 'current_session_send', content: answer, responseKind: 'final', turnId,
+    });
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    io.finalText.mockImplementation(() => turnSupervisionFinalReply(ds, turnId, dataDir));
+    await observeGroupSessionSupervision(session, {
+      now: 10, outcome: { turnId, at: 10, outcome: 'delivered' },
+    }, io);
+    expect(session.groupSessionSupervision).toMatchObject({
+      state: 'needs_user', reason: 'review_incomplete', reviewEvidenceComplete: false,
+    });
+    expect(io.review).not.toHaveBeenCalled();
+    expect(sessionStore.getSessionFresh(session.sessionId)?.groupSessionSupervision).toMatchObject({
+      state: 'needs_user', reason: 'review_incomplete', reviewEvidenceComplete: false,
+    });
+  });
+
+  it('persists and honors the structured receipt truncation marker', async () => {
+    const { session, io } = storedFixture();
+    const turnId = session.groupSessionSupervision!.turnId;
+    recordExplicitFinal(session, turnId, `${'x'.repeat(256 * 1024)}\nTAIL_FAILURE: deployment rolled back`);
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    const captured = turnSupervisionFinalReply(ds, turnId, dataDir)!;
+    expect(captured.complete).toBe(false);
+    expect(captured.text).not.toContain('TAIL_FAILURE');
+    io.finalText.mockReturnValue(captured);
+    await observeGroupSessionSupervision(session, {
+      now: 10, outcome: { turnId, at: 10, outcome: 'delivered' },
+    }, io);
+    expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'review_incomplete' });
+    expect(io.review).not.toHaveBeenCalled();
+  });
+
+  it('treats legacy structured replies without an explicit completeness marker as incomplete', async () => {
+    const { session, io } = storedFixture();
+    const turnId = session.groupSessionSupervision!.turnId;
+    recordExplicitFinal(session, turnId, `Deployment is live.\n/home/${'a'.repeat(300_000)}\nTAIL_FAILURE: deployment rolled back`);
+    const db = openDatabaseSyncOrThrow(join(dataDir, 'session-turns', 'turns.sqlite'));
+    try {
+      db.prepare("UPDATE events SET payload=json_remove(payload, '$.reply.textTruncated') WHERE session_id=? AND turn_id=?")
+        .run(session.sessionId, turnId);
+    } finally { db.close(); }
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    const captured = turnSupervisionFinalReply(ds, turnId, dataDir)!;
+    // Redaction after truncation can remove both the length signal and ellipsis.
+    expect(captured.text.endsWith('…')).toBe(false);
+    expect(captured.text).not.toContain('TAIL_FAILURE');
+    expect(captured.complete).toBe(false);
+    io.finalText.mockReturnValue(captured);
+    await observeGroupSessionSupervision(session, {
+      now: 10, outcome: { turnId, at: 10, outcome: 'delivered' },
+    }, io);
+    expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'review_incomplete' });
+    expect(io.review).not.toHaveBeenCalled();
+  });
+
+  it('keeps the latest text-bearing final after an attachment-only final', async () => {
+    const { session, io } = storedFixture();
+    const turnId = session.groupSessionSupervision!.turnId;
+    const failure = 'TAIL_FAILURE: deployment rolled back';
+    const answer = `Deployment is live.\n${'x'.repeat(5_000)}\n${failure}`;
+    recordExplicitFinal(session, turnId, answer);
+    recordSessionTurnReply(dataDir, session.sessionId, turnId, {
+      messageId: 'om_attachment_final', responseKind: 'final', at: 11,
+    });
+    recordBridgeReplyMarker({
+      dataDir, sessionId: session.sessionId, sentAtMs: 11, messageId: 'om_attachment_final',
+      deliveryKind: 'current_session_send', content: '', responseKind: 'final', turnId,
+    });
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    const captured = turnSupervisionFinalReply(ds, turnId, dataDir)!;
+    expect(captured).toEqual({ text: answer, complete: true });
+    io.finalText.mockReturnValue(captured);
+    io.review.mockImplementation(async (_task, reviewAnswer, _signal, stage) => {
+      if (stage === 'completion') return { verdict: 'ready' };
+      return reviewAnswer.includes(failure)
+        ? { verdict: 'needs_user', reason: 'Rollback found' }
+        : { verdict: 'accepted', evidence: ['Deployment is live.'] };
+    });
+    const outcome = { turnId, at: 10, outcome: 'delivered' as const };
+    await observeGroupSessionSupervision(session, { now: 10, outcome }, io);
+    await observeGroupSessionSupervision(session, { now: 11, outcome }, io);
+    expect(io.review.mock.calls.map(call => call[1])).toEqual([answer, answer]);
+    expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'needs_user' });
+  });
+
+  it('persists a stop through transient write failures before any restart', async () => {
+    const { session, io } = storedFixture();
+    const update = io.persist.getMockImplementation()!;
+    let failures = 2;
+    io.persist.mockImplementation(() => {
+      if (failures > 0) { failures--; throw new Error('injected SQLite write failure'); }
+      update();
+    });
+    stopGroupSessionSupervision(session, io.persist);
+    expect(failures).toBe(0);
+    const restored = sessionStore.getSessionFresh(session.sessionId)!;
+    expect(restored.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'stopped' });
+    await observeGroupSessionSupervision(restored, {
+      now: 20,
+      outcome: { turnId: restored.groupSessionSupervision!.turnId, at: 20, outcome: 'delivered' },
+    }, io);
+    expect(io.dispatch).not.toHaveBeenCalled();
+  });
+
   it.each(['draining', 'committed'] as const)('preserves the watched turn if its result is %s at probe admission', async phase => {
     const { task, session, io } = storedFixture();
     const now = 12 * 60_000;
@@ -470,7 +746,7 @@ describe('group session supervision with the session store', () => {
     noteFinalReplyText(ds, task.turnId, 'Build and tests passed');
     const finish = beginFinalOutputDelivery(ds, task.turnId);
     let pending = Promise.resolve<SessionLastTurn | undefined>(undefined);
-    io.finalText.mockImplementation(() => turnFinalText(ds, task.turnId, dataDir));
+    io.finalText.mockImplementation(() => turnSupervisionFinalReply(ds, task.turnId, dataDir));
     io.canDispatch.mockImplementation(() => !isForkSourceBusy(ds));
     io.stillMissingOutput.mockImplementation((turnId, observed) => !turnOutcomePendingOrChanged(ds, turnId, observed));
     usePassingReview(io.review);

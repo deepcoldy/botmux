@@ -186,6 +186,9 @@ import type { Session } from '../src/types.js';
 import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { codexAppStopCardTarget } from '../src/core/worker-pool.js';
+import { updateSession } from '../src/services/session-store.js';
+import { t } from '../src/i18n/index.js';
+import { sendUserMessage } from '../src/im/lark/client.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -259,6 +262,8 @@ beforeEach(() => {
   vi.mocked(codexAppStopCardTarget).mockReturnValue(undefined);
   vi.mocked(canOperate).mockReset();
   vi.mocked(canOperate).mockReturnValue(true);
+  vi.mocked(updateSession).mockReset();
+  vi.mocked(sendUserMessage).mockReset();
 });
 
 // ─── stop_turn ────────────────────────────────────────────────────────────
@@ -316,6 +321,21 @@ describe('stop_turn card action', () => {
     expect(result.card.data.header.title.content).toContain('已中断');
   });
 
+  it('returns a visible warning if the supervision stop cannot be saved, without rolling back ctrl-c', async () => {
+    const ds = makeDs();
+    ds.session.groupSessionSupervision = {
+      id: 'supervision-stop-save', requester: OWNER, reviewer: { botAppId: 'local_reviewer', model: 'm' },
+      chatId: ds.chatId, anchor: ROOT, task: 'Build', criteria: 'Tests pass', turnId: 'om_task', round: 0, state: 'watching',
+    };
+    vi.mocked(updateSession).mockImplementation(session => {
+      if (session.groupSessionSupervision?.reason === 'stopped') throw new Error('injected stop write failure');
+    });
+    const result = await handleCardAction(actionData('stop_turn'), depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerSessionInputMock).toHaveBeenCalledWith(ds, { type: 'term_action', key: 'ctrlc' });
+    expect(result.toast.type).toBe('warning');
+    expect(result.toast.content).toContain(t('cmd.supervise.stop_save_failed'));
+  });
+
   it('refuses with session_gone toast when the session is not active', async () => {
     const result = await handleCardAction(actionData('stop_turn'), depsWith(undefined), LARK_APP_ID);
     expect(result.toast.type).toBe('warning');
@@ -354,6 +374,32 @@ describe('stop_turn card action', () => {
     expect(result.toast.type).toBe('success');
     expect(interruptCodexAppTurnMock).toHaveBeenCalledWith(ds, ds.codexAppInterruptTarget);
     expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the supervision save warning in a timed-out Codex App acknowledgement', async () => {
+    interruptCodexAppTurnMock.mockResolvedValue('delivered');
+    const ds = makeDs({ sessionOverrides: { cliId: 'codex-app' } });
+    ds.session.groupSessionSupervision = {
+      id: 'supervision-stop-save', requester: OWNER, reviewer: { botAppId: 'local_reviewer', model: 'm' },
+      chatId: ds.chatId, anchor: ROOT, task: 'Build', criteria: 'Tests pass', turnId: 'om_task', round: 0, state: 'watching',
+    };
+    ds.codexAppInterruptTarget = { generation: 'gen', turnEpoch: 7, replyTurnId: 'om_running' };
+    ds.streamCardNonce = 'nonce-7';
+    vi.mocked(codexAppStopCardTarget).mockReturnValue('gen:7');
+    vi.mocked(updateSession).mockImplementation(session => {
+      if (session.groupSessionSupervision?.reason === 'stopped') throw new Error('injected stop write failure');
+    });
+    const data = actionData('stop_turn');
+    data.context.open_message_id = ds.streamCardId;
+    data.action.value.card_nonce = 'nonce-7';
+    data.action.value.codex_app_stop_target = 'gen:7';
+    const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    await result.afterAck?.(true);
+    expect(interruptCodexAppTurnMock).toHaveBeenCalledWith(ds, ds.codexAppInterruptTarget);
+    expect(sendUserMessage).toHaveBeenCalledWith(
+      LARK_APP_ID, OWNER, expect.stringContaining(t('cmd.supervise.stop_save_failed')), 'text',
+    );
   });
 
   it('refuses when the worker is dead', async () => {

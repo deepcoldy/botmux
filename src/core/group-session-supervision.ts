@@ -3,6 +3,7 @@ import type { Session } from '../types.js';
 import type { GroupSessionSupervisorConfig } from './group-session-supervisor-config.js';
 import { supervisionCriteria, type SupervisionAssessment, type SupervisionDecision, type SupervisionReviewStage } from './group-session-supervision-assessment.js';
 import type { SessionLastTurn } from './session-task-status.js';
+import type { SupervisionFinalReply } from './turn-outcome.js';
 
 export const MAX_SUPERVISION_REWORK = 2;
 export const MAX_SUPERVISION_CRITERIA_CHARS = 1_600;
@@ -11,8 +12,10 @@ const EXTERNAL_WAIT_MS = 5 * 60_000;
 const REVIEW_RETRY_MS = 2 * 60_000;
 const MISSING_REPLY_GRACE_MS = 2 * 60_000;
 const UNCONFIRMED_TURN_MS = 10 * 60_000;
+const WAIT_BUSY_GRACE_MS = 10 * 60_000;
+const STOP_PERSIST_ATTEMPTS = 3;
 
-export type SupervisionReason = 'no_output' | 'review_unavailable' | 'needs_user' | 'round_limit'
+export type SupervisionReason = 'no_output' | 'review_unavailable' | 'review_incomplete' | 'needs_user' | 'round_limit'
   | 'session_changed' | 'dispatch_failed' | 'stalled' | 'stopped' | 'interrupted';
 
 export interface GroupSessionSupervision {
@@ -32,8 +35,12 @@ export interface GroupSessionSupervision {
   reason?: SupervisionReason;
   observedAt?: number;
   checkAt?: number;
+  /** First observation at/after checkAt that stayed busy; persisted across restart. */
+  waitBusySince?: number;
   reviewAttempt?: number;
   reviewEvidence?: string;
+  /** Persisted beside reviewEvidence; missing means legacy evidence must be re-read. */
+  reviewEvidenceComplete?: boolean;
   reviewEpoch?: number;
   waitChecks?: number;
   notifiedKey?: string;
@@ -59,7 +66,7 @@ export interface SupervisionObservation {
 export interface GroupSessionSupervisionIo {
   allowed(task: GroupSessionSupervision): boolean;
   current(turnId: string): boolean;
-  finalText(turnId: string): string | undefined;
+  finalText(turnId: string): SupervisionFinalReply | undefined;
   deriveCriteria(task: GroupSessionSupervision, signal: AbortSignal): Promise<{ criteria: string; task: string } | undefined>;
   review(task: GroupSessionSupervision, answer: string, signal: AbortSignal, stage: SupervisionReviewStage): Promise<SupervisionAssessment | undefined>;
   serializeAdmission(action: () => void): Promise<void>;
@@ -108,17 +115,24 @@ export function stopGroupSessionSupervision(session: Session, persist: () => voi
   // Stop takes effect for the running daemon even when persistence is unavailable.
   reviews.get(session)?.abort();
   const stopped = { ...task, state: 'needs_user', reason: 'stopped' } as const;
-  try { replaceGroupSessionSupervision(session, stopped, persist); } catch (error) {
-    session.groupSessionSupervision = stopped;
-    throw error;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < STOP_PERSIST_ATTEMPTS; attempt++) {
+    try {
+      replaceGroupSessionSupervision(session, stopped, persist);
+      return;
+    } catch (error) { lastError = error; }
   }
+  // Never revive automatic work in this process, but make the caller tell the
+  // user that a restart can still recover the last durable watching row.
+  session.groupSessionSupervision = stopped;
+  throw lastError;
 }
 
 export function resumeGroupSessionSupervision(task: GroupSessionSupervision, turnId: string, now: number): GroupSessionSupervision {
   return {
-    ...task, turnId, state: task.criteria ? 'watching' : 'preparing', reason: undefined, observedAt: now, checkAt: undefined,
+    ...task, turnId, state: task.criteria ? 'watching' : 'preparing', reason: undefined, observedAt: now, checkAt: undefined, waitBusySince: undefined,
     reviewEpoch: (task.reviewEpoch ?? 0) + 1, reviewAttempt: 0, round: 0, waitChecks: 0, notifiedKey: undefined,
-    reviewEvidence: undefined, park: undefined, decision: undefined, ownerDecision: undefined, probes: 0,
+    reviewEvidence: undefined, reviewEvidenceComplete: undefined, park: undefined, decision: undefined, ownerDecision: undefined, probes: 0,
   };
 }
 
@@ -140,8 +154,9 @@ export function chooseGroupSupervisionDecision(
   };
 }
 
-export function groupSupervisionNotice(task: GroupSessionSupervision): 'accepted' | SupervisionReason | undefined {
+export function groupSupervisionNotice(task: GroupSessionSupervision): 'accepted' | SupervisionReason | 'wait_stalled' | undefined {
   if (task.state === 'accepted') return 'accepted';
+  if (task.state === 'needs_user' && task.reason === 'stalled') return 'wait_stalled';
   if (task.state === 'needs_user' && task.reason !== 'stopped') return task.reason;
   if ((task.state === 'preparing' || task.state === 'watching' || task.state === 'pending_review') && (task.reason === 'stalled'
     || (task.reason === 'review_unavailable' && (task.reviewAttempt ?? 0) >= 3))) return task.reason;
@@ -191,7 +206,7 @@ export async function observeGroupSessionSupervision(
     const next: GroupSessionSupervision = {
       ...task, turnId, round, waitChecks, dispatches, state: 'watching', observedAt: now, reason: undefined,
       probes: (task.probes ?? 0) + (action === 'probe' ? 1 : 0), assessments,
-      checkAt: undefined, reviewAttempt: 0, reviewEvidence: undefined, notifiedKey: undefined,
+      checkAt: undefined, waitBusySince: undefined, reviewAttempt: 0, reviewEvidence: undefined, reviewEvidenceComplete: undefined, notifiedKey: undefined,
       ownerDecision: undefined, decision: undefined, park: undefined,
     };
     replaceGroupSessionSupervision(session, next, io.persist);
@@ -241,13 +256,31 @@ export async function observeGroupSessionSupervision(
       return;
     }
     if (task.state === 'waiting') {
-      if (!outcome && !observation.running && now >= (task.checkAt ?? now)) {
-        await commit(() => {
-          if (io.canDispatch()) continueTask(task.ownerDecision ? 'decision' : 'check');
-          else if (now - (task.checkAt ?? now) >= UNCONFIRMED_TURN_MS) end('dispatch_failed');
-          else io.wake();
-        });
+      if (outcome) return;
+      const checkAt = task.checkAt ?? now;
+      if (now < checkAt) return;
+      if (observation.running) {
+        const busySince = task.waitBusySince ?? now;
+        if (now - busySince >= WAIT_BUSY_GRACE_MS) {
+          await commit(() => save({ state: 'needs_user', reason: 'stalled', waitBusySince: undefined }));
+        } else if (task.waitBusySince === undefined) {
+          // One durable timestamp bounds a continuous busy period. Later busy
+          // scans do not rewrite it, so they cannot postpone the deadline.
+          await commit(() => save({ waitBusySince: busySince }));
+        }
+        return;
       }
+      await commit(() => {
+        // An idle scan after a busy period is already due: never start another
+        // external-wait backoff, and do not inflate waitChecks before dispatch.
+        if (io.canDispatch()) continueTask(task.ownerDecision ? 'decision' : 'check');
+        else if (now - checkAt >= UNCONFIRMED_TURN_MS) {
+          save({ state: 'needs_user', reason: 'dispatch_failed', waitBusySince: undefined });
+        } else {
+          if (task.waitBusySince !== undefined) save({ waitBusySince: undefined });
+          io.wake();
+        }
+      });
       return;
     }
     if (task.checkAt !== undefined && now < task.checkAt) return;
@@ -271,19 +304,35 @@ export async function observeGroupSessionSupervision(
       return;
     }
 
-    const answer = outcome.outcome === 'delivered' ? task.reviewEvidence ?? io.finalText(task.turnId) : undefined;
+    const cached = task.reviewEvidence !== undefined && task.reviewEvidenceComplete !== undefined
+      ? { text: task.reviewEvidence, complete: task.reviewEvidenceComplete } : undefined;
+    const reply = outcome.outcome === 'delivered' ? cached ?? io.finalText(task.turnId) : undefined;
+    const answer = reply?.text;
     if (!answer) {
       if (now - outcome.at >= MISSING_REPLY_GRACE_MS) await commit(() => nudgeOrPause(outcome.at + MISSING_REPLY_GRACE_MS));
       return;
     }
-    if (!task.reviewEvidence) {
+    if (reply && (task.reviewEvidence === undefined || task.reviewEvidenceComplete === undefined)) {
       await commit(() => {
+        const previousEvidence = task.reviewEvidence;
+        const previousComplete = task.reviewEvidenceComplete;
         task.reviewEvidence = answer;
-        try { io.persist(); } catch (error) { delete task.reviewEvidence; throw error; }
+        task.reviewEvidenceComplete = reply.complete;
+        try { io.persist(); } catch (error) {
+          if (previousEvidence === undefined) delete task.reviewEvidence;
+          else task.reviewEvidence = previousEvidence;
+          if (previousComplete === undefined) delete task.reviewEvidenceComplete;
+          else task.reviewEvidenceComplete = previousComplete;
+          throw error;
+        }
       });
     }
     const reviewedTask = currentTask();
     if (!reviewedTask) return;
+    if (reviewedTask.reviewEvidenceComplete === false) {
+      await commit(() => end('review_incomplete'));
+      return;
+    }
     const stage = reviewedTask.state === 'pending_review' ? 'acceptance' : 'completion';
     const result = await io.review(reviewedTask, answer, review.signal, stage).catch(() => undefined);
     if (review.signal.aborted) return;

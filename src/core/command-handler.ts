@@ -3306,38 +3306,45 @@ export async function handleCommand(
           await replyTransferInProgress(replyHere, loc);
           break;
         }
+        let supervisionStopSaveFailed = false;
         try { stopGroupSessionSupervision(ds.session, () => sessionStore.updateSession(ds.session)); }
-        catch { logger.warn(`[${logTag}] could not save stopped supervision`); }
+        catch {
+          supervisionStopSaveFailed = true;
+          logger.warn(`[${logTag}] could not save stopped supervision`);
+        }
+        const withStopWarning = (content: string) => supervisionStopSaveFailed
+          ? `${content}\n${t('cmd.supervise.stop_save_failed', undefined, loc)}`
+          : content;
         const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
         if (ds.session.pendingForkSession && effectiveCliId === 'antigravity') {
-          await sessionReply(rootId, t('cmd.stop.fork_pending', undefined, loc));
+          await sessionReply(rootId, withStopWarning(t('cmd.stop.fork_pending', undefined, loc)));
           break;
         }
         if (effectiveCliId === 'codex-app' && !isRemoteBackendSession(ds)) {
           const status = await interruptCodexAppTurn(ds);
-          await sessionReply(rootId, t(`cmd.stop.app_${status}`, undefined, loc));
+          await sessionReply(rootId, withStopWarning(t(`cmd.stop.app_${status}`, undefined, loc)));
           break;
         }
         if (ds.initConfig?.codexRpcInput === true || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
-          await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
+          await sessionReply(rootId, withStopWarning(t('cmd.stop.unsupported', undefined, loc)));
           break;
         }
         const cancelledAgyReplay = cancelAntigravityRotationReplay(ds.antigravityRotation);
         if (!ds.worker || ds.worker.killed) {
           if (cancelledAgyReplay) {
-            await sessionReply(rootId, t('worker.agy_rotate.stop_cancelled', undefined, loc));
+            await sessionReply(rootId, withStopWarning(t('worker.agy_rotate.stop_cancelled', undefined, loc)));
             break;
           }
-          await sessionReply(rootId, t('cmd.stop.no_worker', undefined, loc));
+          await sessionReply(rootId, withStopWarning(t('cmd.stop.no_worker', undefined, loc)));
           break;
         }
         sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
         logger.info(`[${logTag}] /stop: ^C sent (session kept alive${cancelledAgyReplay ? ', cancelled in-flight agy rotation replay' : ''})`);
         await sessionReply(
           rootId,
-          cancelledAgyReplay
+          withStopWarning(cancelledAgyReplay
             ? `${t('cmd.stop.sent', { cliName: sessionCliDisplayName(ds) }, loc)}\n${t('worker.agy_rotate.stop_cancelled', undefined, loc)}`
-            : t('cmd.stop.sent', { cliName: sessionCliDisplayName(ds) }, loc),
+            : t('cmd.stop.sent', { cliName: sessionCliDisplayName(ds) }, loc)),
         );
         break;
       }
