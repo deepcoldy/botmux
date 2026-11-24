@@ -24,6 +24,8 @@ import { fileURLToPath } from 'node:url';
 import type { WorkerToDaemon } from '../../types.js';
 import type { BackendType } from '../../adapters/backend/types.js';
 import { config } from '../../config.js';
+import { createCliAdapterSync } from '../../adapters/cli/registry.js';
+import { ensureClaudeFolderTrust } from '../../core/claude-folder-trust.js';
 import { spawnWorker } from '../../core/self-spawn.js';
 import {
   expandWorkflowWorkingDir,
@@ -198,6 +200,18 @@ async function runNodeImpl(
   }
 
   const cwd = expandWorkflowWorkingDir(req.botSnapshot.workingDir) ?? process.cwd();
+  try {
+    // Same pre-acceptance as an ordinary chat spawn (worker-pool), against the
+    // frozen bot's own Claude-family state file (cliConfigDir profile, Seed
+    // runtime dir, …). Otherwise the node's first run in a new cwd stops on the
+    // trust dialog and the goal prompt never reaches the composer.
+    const adapter = createCliAdapterSync(req.botSnapshot.cliId, req.botSnapshot.cliPathOverride,
+      { configDir: req.botSnapshot.cliConfigDir });
+    if (adapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, adapter.claudeStateJsonPath);
+  } catch (err) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
+    throw err;
+  }
   const sessionId = syntheticSessionUuid(`v3-${req.runId}-${req.attemptId}`);
   const global = readGlobalConfig();
   const protectedEnvKeys = protectedMcpCurrentRedactedEnvKeys(global.protectedMcpCapabilities, configuredProtectedMcpEnvKeys());
@@ -376,7 +390,7 @@ async function runNodeImpl(
 
   return new Promise<RunNodeResult>((resolve) => {
     let settled = false;
-    let pendingResult: { status: 'ok' | 'fail'; reason: string } | undefined;
+    let pendingResult: { status: 'ok' | 'fail'; reason: string; error?: RunNodeResult['error'] } | undefined;
     let quiesceTimer: NodeJS.Timeout | undefined;
     let sigtermTimer: NodeJS.Timeout | undefined;
     let sigkillTimer: NodeJS.Timeout | undefined;
@@ -475,10 +489,10 @@ async function runNodeImpl(
       worker.send({ type: 'close', ...(controller ? { sessionCommand: { version: 2, runtime: controller.currentRuntime(), operationId: operation?.operationId } } : {}) });
     }
 
-    function finish(status: RunNodeResult['status'], reason: string): void {
+    function finish(status: RunNodeResult['status'], reason: string, error?: RunNodeResult['error']): void {
       if (settled || cancelRequested || pendingResult) return;
       if (status === 'cancelled') return;
-      pendingResult = { status, reason };
+      pendingResult = { status, reason, ...(error ? { error } : {}) };
       void appendLine(stderrPath(req), `[v3] worker outcome claimed status=${status} reason=${reason}; waiting for worker exit`);
       requestWorkerExit();
     }
@@ -615,6 +629,24 @@ async function runNodeImpl(
         case 'active_runtime':
           observedRuntime = event;
           break;
+        case 'user_notify':
+          // Only the worker's authoritative startup-dialog detection is fatal,
+          // and only before the goal went out; every other notice (permission
+          // prompts during a running goal, …) stays informational. Nobody can
+          // answer the dialog from a workflow, so waiting would only burn the
+          // node deadline and end in a bare "manifest missing".
+          if (event.kind === 'cli_startup_blocked' && event.startupBlocker && !goalSent) {
+            const { kind, rule } = event.startupBlocker;
+            const error = {
+              code: `CLI_STARTUP_${kind.toUpperCase()}`,
+              message: `${req.botSnapshot.cliId} startup is blocked on ${kind} (${rule}) before the goal was sent; `
+                + 'complete that step with this bot\'s CLI profile, then retry the node',
+              retryable: true,
+            };
+            void appendLine(stderrPath(req), `[v3] ${error.code}: ${event.message}`);
+            finish('fail', 'startup-blocked', error);
+          }
+          break;
         case 'error':
           void appendLine(stderrPath(req), `[worker] ${event.message}`);
           finish('fail', 'worker-error');
@@ -678,7 +710,7 @@ async function runNodeImpl(
         manifestPath,
         sessionInfo: sessionInfo(),
         ...(runtime ? { runtime } : {}),
-        ...(runtimeError ? { error: runtimeError } : {}),
+        ...((runtimeError ?? pendingResult?.error) ? { error: runtimeError ?? pendingResult?.error } : {}),
       });
     });
 

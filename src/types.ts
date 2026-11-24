@@ -2993,7 +2993,13 @@ export type WorkerToDaemonBase =
         /** A resumed CLI reported what the previous process left unfinished
          *  (restart-interruption.ts). During a backend outage the daemon folds
          *  it into the topic's single outage status card. */
-        | 'restart_interruption';
+        | 'restart_interruption'
+        /** A known startup dialog (folder trust, login, …) holds a CLI that was
+         *  never input-ready. Chat sessions deliver it as plain text like an
+         *  unkinded notice; the v3 workflow pool fails the node on it. */
+        | 'cli_startup_blocked';
+      /** `kind='cli_startup_blocked'`: which dialog matched (core/cli-startup-blocker). */
+      startupBlocker?: Pick<import('./core/cli-startup-blocker.js').CliStartupBlocker, 'kind' | 'rule'>;
       /** Permission prompt persisted across fresh worker captures; no daemon-side grace needed. */
       permissionPromptStable?: boolean;
       /** Bounded plain-text bottom of the screen for an input_not_submitted

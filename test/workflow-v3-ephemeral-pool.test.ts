@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -1352,6 +1352,141 @@ describe('v3 default worker factory (spawnWorkerFactory) across runtime shapes',
   });
 });
 
+describe('workflow node startup: folder trust and startup blockers', () => {
+  it('trusts the canonical cwd in the frozen Claude profile before spawning the worker', async () => {
+    const req = request();
+    const cwd = join(dir, 'repo');
+    const alias = join(dir, 'repo-link');
+    const profile = join(dir, 'claude-profile');
+    mkdirSync(cwd);
+    mkdirSync(profile);
+    symlinkSync(cwd, alias);
+    req.botSnapshot.workingDir = alias;
+    req.botSnapshot.cliConfigDir = profile;
+    const stateFile = join(profile, '.claude.json');
+    writeFileSync(stateFile, JSON.stringify({ account: 'preserved', projects: { other: { keep: true } } }));
+    const worker = new ScriptedWorker();
+    let stateAtSpawn: any;
+    const running = createEphemeralPool({
+      factory: { spawn: () => { stateAtSpawn = JSON.parse(readFileSync(stateFile, 'utf8')); return worker; } },
+      workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => 'secret',
+    }).runNode(req);
+    await worker.waitForInit();
+    worker.emitExit(1);
+    await running;
+    // Claude keys trust by realpath(cwd); other keys in its hot state file survive.
+    expect(stateAtSpawn).toEqual({ account: 'preserved', projects: {
+      other: { keep: true }, [realpathSync(cwd)]: { hasTrustDialogAccepted: true },
+    } });
+  });
+
+  it.each(['folder_trust', 'login', 'api_key', 'update', 'terms', 'permission_mode'] as const)(
+    'fails a node blocked on %s at once as retryable, waiting for the real worker close', async (kind) => {
+      const req = { ...request(), timeoutMs: 1_800_000 };
+      const worker = new ScriptedWorker();
+      const running = createEphemeralPool({
+        factory: factoryFor(worker), workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret',
+      }).runNode(req);
+      await worker.waitForInit();
+      worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+      let settled = false;
+      void running.then(() => { settled = true; });
+      worker.emitMessage({ type: 'user_notify', kind: 'cli_startup_blocked', message: 'startup requires intervention',
+        startupBlocker: { kind, rule: `known-${kind}` } });
+      // A readiness edge after the claimed failure must never submit the goal.
+      worker.emitMessage({ type: 'prompt_ready' });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const closeRequests = worker.closeRequests;
+      const settledBeforeClose = settled;
+      worker.emit('exit', 0);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const settledOnExit = settled;
+      worker.emit('close', 0);
+      const result = await running;
+      expect(closeRequests).toBe(1);
+      expect(worker.rawInputs).toEqual([]);
+      expect(settledBeforeClose).toBe(false);
+      expect(settledOnExit).toBe(false);
+      expect(result).toMatchObject({ status: 'fail',
+        error: { code: `CLI_STARTUP_${kind.toUpperCase()}`, retryable: true, message: expect.stringContaining(kind) } });
+    },
+  );
+
+  it('keeps ordinary notices informational', async () => {
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    const worker = new ScriptedWorker();
+    const running = createEphemeralPool({
+      factory: factoryFor(worker), workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret',
+    }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'user_notify', message: 'ordinary status', kind: 'input_not_submitted' });
+    worker.emitMessage({ type: 'user_notify', message: 'no kind at all' });
+    expect(worker.closeRequests).toBe(0);
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    expect(worker.rawInputs).toHaveLength(1);
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'ok' });
+  });
+
+  it('lets cancellation win over a claimed startup failure', async () => {
+    const worker = new ScriptedWorker();
+    const ac = new AbortController();
+    const running = createEphemeralPool({
+      factory: factoryFor(worker), workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret',
+    }).runNode({ ...request(), cancelSignal: ac.signal });
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'user_notify', kind: 'cli_startup_blocked', message: 'login required',
+      startupBlocker: { kind: 'login', rule: 'known-login' } });
+    ac.abort('manual-cancel');
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'cancelled', cancelReason: 'manual-cancel' });
+    expect(worker.rawInputs).toEqual([]);
+  });
+
+  it('does not reclassify a running goal from a late startup notice', async () => {
+    const worker = new ScriptedWorker();
+    const running = createEphemeralPool({
+      factory: factoryFor(worker), workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret',
+    }).runNode(request());
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'user_notify', kind: 'cli_startup_blocked', message: 'stale startup notice',
+      startupBlocker: { kind: 'login', rule: 'known-login' } });
+    const closeRequests = worker.closeRequests;
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'ok' });
+    expect(closeRequests).toBe(0);
+    expect(worker.rawInputs).toHaveLength(1);
+  });
+
+  it('keeps a goal-scoped Codex runtime mismatch authoritative over a startup failure', async () => {
+    const worker = new ScriptedWorker();
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.model = 'gpt-6.1-sol';
+    req.botSnapshot.reasoningEffort = 'high';
+    req.botSnapshot.cliInstanceBinding = {
+      version: 1, source: 'goal', instanceId: null, cliId: 'codex', codexHome: '/private/codex-repairer', authMode: 'shared',
+    };
+    const running = createEphemeralPool({
+      factory: factoryFor(worker), workerPath: '/tmp/worker.js', quiesceMs: 1, resolveLarkAppSecret: () => 'secret',
+    }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'active_runtime', model: 'gpt-5.6-sol', reasoningEffort: 'high' });
+    worker.emitMessage({ type: 'user_notify', kind: 'cli_startup_blocked', message: 'login required',
+      startupBlocker: { kind: 'login', rule: 'codex-sign-in' } });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'fail', error: { code: 'GOAL_RUNTIME_MISMATCH' } });
+  });
+});
+
 function request(): RunNodeRequest {
   const attemptDir = join(dir, 'research', 'attempts', '001');
   return {
@@ -1403,6 +1538,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   readonly kills: string[] = [];
   readonly rawInputs: string[] = [];
   readonly autoReadyAfterInit: boolean;
+  closeRequests = 0;
   init: any;
   private contractScope?: WorkerSessionEventScope;
   readyEmitted = false;
@@ -1415,6 +1551,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   }
 
   send(msg: unknown): void {
+    if ((msg as any)?.type === 'close') this.closeRequests++;
     if ((msg as any)?.type === 'init' && !this.init) {
       this.init = msg;
       const contract = (msg as any).sessionContract;

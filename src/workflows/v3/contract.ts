@@ -329,7 +329,13 @@ export interface RunNodeResult {
   runtime?: RuntimeAttestation;
   /** Precise infrastructure failure. A worker may still leave a valid
    * manifest behind, so this channel takes precedence when status=fail. */
-  error?: { code: string; message: string };
+  error?: {
+    code: string;
+    message: string;
+    /** A human can fix the cause and retry the node (it is blocked, not
+     *  failed). Never authorizes an automatic replay. */
+    retryable?: boolean;
+  };
 }
 
 export interface RuntimeAttestation {

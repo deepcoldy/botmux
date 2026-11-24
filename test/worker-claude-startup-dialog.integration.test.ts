@@ -173,6 +173,8 @@ it.skipIf(!tmuxAvailable)('never types the first prompt into a Claude startup qu
     while (Date.now() < askedAt + 55_000) await new Promise(r => setTimeout(r, 250));
     expect(dialogInput(), context()).toEqual([]);
     expect(notices(), context()).toHaveLength(1);
+    expect(notices()[0], context()).toMatchObject({ kind: 'cli_startup_blocked',
+      startupBlocker: { kind: 'api_key', rule: 'claude-custom-api-key' } });
 
     // 2. Someone answers in the Web terminal; Claude runs its hooks, then asks the next question.
     writeFileSync(answerApiKey, 'no');
@@ -182,6 +184,8 @@ it.skipIf(!tmuxAvailable)('never types the first prompt into a Claude startup qu
     while (Date.now() < secondAskedAt + 15_000) await new Promise(r => setTimeout(r, 250));
     expect(dialogInput(), context()).toEqual([]);
     expect(notices(), context()).toHaveLength(2);
+    expect(notices()[1], context()).toMatchObject({ kind: 'cli_startup_blocked',
+      startupBlocker: { kind: 'permission_mode', rule: 'claude-auto-mode-default-offer' } });
     expect(notices()[1]!.message).not.toBe(notices()[0]!.message);
 
     // 3. Answered too: the composer appears and the first prompt is submitted from it.

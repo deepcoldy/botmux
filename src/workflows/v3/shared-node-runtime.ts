@@ -3591,7 +3591,11 @@ export async function runWorkflow(
             message = 'runNode reported process failure';
           }
         }
-        const kind = classifyTerminal(errorClass, { selfReportedFail, retryable });
+        // A pool error marked retryable (e.g. a CLI startup dialog) needs a
+        // human step first: block for a manual retry, never fail outright.
+        const kind = result.status === 'fail' && result.error?.retryable === true
+          ? 'blocked'
+          : classifyTerminal(errorClass, { selfReportedFail, retryable });
         if (kind === 'blocked') {
           // Runtime human-ask: a self-reported block carrying ASK_HUMAN_ERROR_CODE
           // means the agent wrote a question to ask.json and stopped.  Surface

@@ -4429,8 +4429,13 @@ function probeStartupBlocker(source: string): CliStartupBlocker | null {
     // causes is the same story, so do not tell it twice.
     const alreadyExplained = blocker.kind === 'folder_trust'
       && reportedUntrustedWorkspaces.has(blocker.folder ?? lastInitConfig.workingDir);
-    if (!alreadyExplained) {
-      send({ type: 'user_notify', message: startupBlockerNotice(blocker), turnId: currentBotmuxTurnId });
+    // A workflow node has no thread reader for that earlier notice: its pool
+    // needs this structured event to fail the node instead of waiting out the
+    // node deadline, so it is always sent there.
+    if (!alreadyExplained || isWorkflowWorker()) {
+      send({ type: 'user_notify', kind: 'cli_startup_blocked',
+        startupBlocker: { kind: blocker.kind, rule: blocker.rule },
+        message: startupBlockerNotice(blocker), turnId: currentBotmuxTurnId });
     }
   }
   return blocker;
