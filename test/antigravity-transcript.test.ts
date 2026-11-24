@@ -933,6 +933,46 @@ describe('hasAntigravityTranscriptPendingTasks & multi-task/daemon tracking', ()
       .toEqual(['普通任务已完成，常驻任务继续运行。']);
   });
 
+  it('keeps an ambiguous mixed batch pending when RUNNING steps cannot be correlated to the launch batch', () => {
+    // Compact-log truncation or agy step drift can leave the GENERIC RUNNING
+    // records outside the planner batch's ordinal window, so no positive step
+    // correlation exists. With identical daemon/ordinary descriptions the
+    // daemon provenance is unresolved: the ordinary sibling must stay latched
+    // (fail-closed) rather than being released as a daemon.
+    const daemonId = `${convId}/task-daemon`;
+    const ordinaryId = `${convId}/task-ordinary`;
+    writeFileSync(path, [
+      line(userRecord('同批两个同名命令')),
+      line(plannerStep({
+        step: 1,
+        toolCalls: [
+          { name: 'run_command', args: { CommandLine: 'npm test', IsDaemon: true } },
+          { name: 'run_command', args: { CommandLine: 'npm test' } },
+        ],
+      })),
+      // Hints point at logical steps 2/3; these RUNNING records deliberately
+      // land far outside that window so stepHints cannot disambiguate them.
+      line(taskRunning(99, daemonId, 'npm test')),
+      line(taskRunning(100, ordinaryId, 'npm test')),
+      line(plannerStep({ step: 101, content: '等待普通后台任务完成。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toContain(ordinaryId);
+    expect(drained.state.pendingTaskIds).toContain(daemonId);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+
+    // Completing only the ordinary sibling leaves the conservatively latched
+    // daemon wait in place: an unresolved daemon may over-wait until the next
+    // turn, but must never release while an ordinary command might still run.
+    appendFileSync(path, [
+      line(taskDoneMsg(102, ordinaryId)),
+      line(plannerStep({ step: 103, content: '普通任务已完成。' })),
+    ].join(''));
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+  });
+
   it.each([
     'Task was canceled.',
     'The user request was canceled.',
