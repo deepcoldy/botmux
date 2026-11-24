@@ -13,6 +13,7 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { waitForWorkerMessage } from './helpers/worker-ipc-waiter.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 import { createBracketedPasteCollector } from './helpers/bracketed-paste-collector.js';
@@ -20,6 +21,8 @@ import { createBracketedPasteCollector } from './helpers/bracketed-paste-collect
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
 const tmuxSessions = new Set<string>();
+const GENERATION_READY_TIMEOUT_MS = 60_000;
+const TEST_TIMEOUT_MS = 90_000;
 
 async function stopChild(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
@@ -232,12 +235,11 @@ setInterval(() => {
       larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
 
-    await waitFor(
-      child,
-      () => messages.some(message => message.type === 'prompt_ready'),
-      logs,
-      'initial prompt readiness',
-      30_000,
+    // Auto catalog preflight and runtime admission run before a cold spawn.
+    // Give that startup its own budget; functional observations below keep
+    // their original short deadlines.
+    await waitForWorkerMessage(
+      child, messages, 'prompt_ready', logs, GENERATION_READY_TIMEOUT_MS,
     );
     const initialReadyCount = messages.filter(message => message.type === 'prompt_ready').length;
 
@@ -411,7 +413,10 @@ setInterval(() => {
       logs,
       'third submit is quarantined before the restart',
     );
-    const readyBeforeRestart = messages.filter(message => message.type === 'prompt_ready').length;
+    const readyMessagesBeforeRestart = new Set(
+      messages.filter(message => message.type === 'prompt_ready'),
+    );
+    const readyBeforeRestart = readyMessagesBeforeRestart.size;
     if (restartKind === 'CLI crash') {
       // Emulate the daemon's automatic recovery only after the real CLI exit
       // callback has reconciled inflight carry-over. An intentional restart
@@ -430,11 +435,15 @@ setInterval(() => {
     } else {
       child.send({ type: 'restart' } satisfies DaemonToWorker);
     }
-    await waitFor(
+    // Wait for a new IPC edge, not a prompt_ready collected before restart
+    // or a fixed delay after restart.
+    await waitForWorkerMessage(
       child,
-      () => messages.filter(message => message.type === 'prompt_ready').length > readyBeforeRestart,
+      messages,
+      'prompt_ready',
       logs,
-      'replacement generation readiness',
+      GENERATION_READY_TIMEOUT_MS,
+      message => !readyMessagesBeforeRestart.has(message),
     );
     expect(readSubmissions(submissionsPath)).toHaveLength(6);
     expect(readSubmissions(submissionsPath).filter(
@@ -450,5 +459,5 @@ setInterval(() => {
       ? 'fresh input after recovery'
       : firstSubmission.text.replace(/^first prompt/, 'fresh input after recovery'));
     expect(afterRestart[6]!.pid).not.toBe(recoveredSubmissions[5]!.pid);
-  }, 60_000);
+  }, TEST_TIMEOUT_MS);
 });
