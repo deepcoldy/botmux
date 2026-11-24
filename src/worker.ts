@@ -35474,9 +35474,9 @@ async function spawnCliBody(
   // Wait (bounded) for the transcript to close it; immediate when it already
   // has, and for every CLI without a Claude transcript bridge.
   idleTranscriptSettle?.cancel();
-  cancelAllIdleTranscriptSettles();
+  if (typeof cancelAllIdleTranscriptSettles === 'function') cancelAllIdleTranscriptSettles();
   registeredIdleTranscriptSettles.clear();
-  disarmClaudeOpenTurnWatchdog();
+  if (typeof disarmClaudeOpenTurnWatchdog === 'function') disarmClaudeOpenTurnWatchdog();
   const ptyIdleSettle = makeBridgeTranscriptSettle(
     () => backend === observedBackend && bridgeHeadTurnAwaitingTerminal({ startedOnly: true }),
     () => { if (backend === observedBackend) noteBridgeTurnCloseWaitExpired(); },
@@ -35626,7 +35626,7 @@ async function spawnCliBody(
           drainBridgesThenMarkReady(status === 'done' ? 'herdr-done' : 'herdr-idle');
         });
       } else if (status === 'working') {
-        cancelAllIdleTranscriptSettles();
+        if (typeof cancelAllIdleTranscriptSettles === 'function') cancelAllIdleTranscriptSettles();
         revokePromptReadiness();
         idleDetector?.reset();
       }
@@ -35984,10 +35984,10 @@ async function spawnCliBody(
       }
     }
     durableTurnInFlight = false;
-    cancelAllIdleTranscriptSettles();
-    disarmClaudeOpenTurnWatchdog();
-    clearSubmittedClaudeTurnIf(undefined);
-    bridgeQueue.clearRecentUnobservedTurn?.();
+    if (typeof cancelAllIdleTranscriptSettles === 'function') cancelAllIdleTranscriptSettles();
+    if (typeof disarmClaudeOpenTurnWatchdog === 'function') disarmClaudeOpenTurnWatchdog();
+    if (typeof clearSubmittedClaudeTurnIf === 'function') clearSubmittedClaudeTurnIf(undefined);
+    bridgeQueue?.clearRecentUnobservedTurn?.();
     // Hybrid RPC mode: the `codex --remote` viewer just died — tear down the
     // paired app-server so it can't outlive the pane. A fresh spawn re-engages
     // the engine from scratch (or falls back to paste mode).
