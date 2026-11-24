@@ -60,4 +60,45 @@ describe('collaboration 配置在 parse 处显式校验', () => {
     expect(cfg.sessionGroup?.collaboration).toBeUndefined();
     expect(cfg.sessionGroup?.collaborationDisabledReason).toBeUndefined();
   });
+
+  it('collaborationDisabledReason 不泄漏到 JSON.stringify（non-enumerable）', () => {
+    const [cfg] = parseBotConfigsFromText(JSON.stringify([entry({ collaboration: { enabled: true, agents: [], kickoff: [] } })]));
+    const sg = cfg.sessionGroup! as Record<string, unknown>;
+    expect(sg.collaborationDisabledReason).toBeTruthy(); // 可读
+    expect(JSON.stringify(sg)).not.toContain('collaborationDisabledReason'); // 不序列化
+  });
+});
+
+describe('R2：旧标记残留不误判', () => {
+  it('旧标记 + 改 enabled:false → 丢弃 collaboration 与旧标记（归一化关闭）', () => {
+    // 第一次 parse 得到带标记的坏配置，序列化后改 enabled:false 再 parse
+    const [first] = parseBotConfigsFromText(JSON.stringify([entry({ collaboration: { enabled: true, agents: [], kickoff: [] } })]));
+    const sg1 = first.sessionGroup! as Record<string, unknown>;
+    expect(sg1.collaborationDisabledReason).toBeTruthy();
+    // 序列化不会带上标记（non-enumerable），手动构造「旧标记 + enabled:false」输入
+    const [second] = parseBotConfigsFromText(JSON.stringify([entry({
+      collaboration: { enabled: false },
+      collaborationDisabledReason: '旧 agents 错误',
+    })]));
+    expect(second.sessionGroup?.collaboration).toBeUndefined();
+    expect(second.sessionGroup?.collaborationDisabledReason).toBeUndefined();
+  });
+
+  it('旧标记 + 删除 collaboration → 归一化关闭（无 collaboration 无标记）', () => {
+    const [cfg] = parseBotConfigsFromText(JSON.stringify([entry({
+      collaborationDisabledReason: '旧 agents 错误',
+    })]));
+    expect(cfg.sessionGroup?.collaboration).toBeUndefined();
+    expect(cfg.sessionGroup?.collaborationDisabledReason).toBeUndefined();
+  });
+
+  it('旧标记 + 修成合法 → 走正常校验（保留合法 config，无旧标记）', () => {
+    const [cfg] = parseBotConfigsFromText(JSON.stringify([entry({
+      collaboration: validCollab,
+      collaborationDisabledReason: '旧 agents 错误',
+    })]));
+    expect(cfg.sessionGroup?.collaboration?.enabled).toBe(true);
+    expect(cfg.sessionGroup?.collaboration?.agents).toHaveLength(1);
+    expect(cfg.sessionGroup?.collaborationDisabledReason).toBeUndefined();
+  });
 });

@@ -4790,6 +4790,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         const sg = entry.sessionGroup;
         if (!sg || typeof sg !== 'object' || Array.isArray(sg)) return undefined;
         const parsed = { ...(sg as Record<string, unknown>) };
+        // 丢弃输入携带的旧标记：collaborationDisabledReason 是解析期派生的，绝不能从
+        // 输入继承（否则「改 enabled:false / 删除 collaboration / 修合法」都会被旧标记
+        // 误判为坏配置）。只在「当前显式 enabled:true 且当前结构非法」时重新生成。
+        delete (parsed as Record<string, unknown>).collaborationDisabledReason;
         // 协作配置显式校验，绝不只靠 `as` 透传（§3 铁律 1）：
         //  - 非 {enabled:true}（缺省/`enabled:false`/非对象）→ 归一化关闭，走 legacy；
         //  - {enabled:true} 且结构合法 → 保留归一化后的 config；
@@ -4807,7 +4811,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
             parsed.collaboration = v.config;
           } else if (explicitlyEnabled) {
             // 保留原始 collaboration，仅标记解析期禁用原因；preflight 据此 fail-closed。
-            (parsed as Record<string, unknown>).collaborationDisabledReason = v.errors.join('；');
+            // non-enumerable：解析期派生标记，不参与 JSON.stringify / 任何序列化。
+            Object.defineProperty(parsed, 'collaborationDisabledReason', {
+              value: v.errors.join('；'),
+              enumerable: false,
+              configurable: true,
+              writable: true,
+            });
           } else {
             // 非 enabled:true → 归一化关闭（安全默认）。
             delete parsed.collaboration;

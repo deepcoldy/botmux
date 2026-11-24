@@ -70,6 +70,13 @@ export interface CollabPreflightDeps {
 /** PR-1 生产态：编排未实现前，显式 enabled 一律 fail-closed（见 CollabPreflightDeps 注释）。 */
 export const COLLAB_ORCHESTRATION_NOT_IMPLEMENTED = '协作初始化编排尚未实现（PR-2）';
 
+// 测试 seam：覆盖 defaultDeps 的 peerPreflight，让真实 daemon 入口测试能驱动 ready 分支
+// （PR-1 内 ready 只用于验证「扣费恰好 1 次」的契约；生产默认仍 fail-closed）。
+let __testOnlyPeerPreflight: CollabPreflightDeps['peerPreflight'] | undefined;
+export function __testOnly_setCollabPeerPreflight(fn: CollabPreflightDeps['peerPreflight'] | undefined): void {
+  __testOnlyPeerPreflight = fn;
+}
+
 function defaultDeps(dataDir: string, creatorAppId: string): CollabPreflightDeps {
   return {
     dataDir,
@@ -80,7 +87,7 @@ function defaultDeps(dataDir: string, creatorAppId: string): CollabPreflightDeps
       const found = loadBotConfigsCached().find(c => c.larkAppId === appId);
       return found ? { exists: true, apiOnly: found.apiOnly === true } : undefined;
     },
-    peerPreflight: async () => ({ ok: false, errors: [COLLAB_ORCHESTRATION_NOT_IMPLEMENTED] }),
+    peerPreflight: __testOnlyPeerPreflight ?? (async () => ({ ok: false, errors: [COLLAB_ORCHESTRATION_NOT_IMPLEMENTED] })),
   };
 }
 
@@ -102,12 +109,14 @@ export async function preflightCollabGroupBirth(
   const botCfg = getBot(creatorAppId).config;
   const sg = botCfg.sessionGroup;
   const collaboration = sg?.collaboration;
-  // 显式 enabled 但结构非法：parse 阶段保留原样并标记 disabledReason → fail-closed。
-  if (sg?.collaborationDisabledReason) {
-    return { kind: 'failed', reason: sg.collaborationDisabledReason, releasesDmChat: false };
-  }
+  // 未启用协作（缺省/非 enabled:true）一律 legacy；标记只在 enabled:true 时才有意义。
   if (!collaboration || collaboration.enabled !== true) {
     return { kind: 'legacy' };
+  }
+  // 显式 enabled 但结构非法：parse 阶段保留原样并标记 disabledReason → fail-closed。
+  // （双保险：仅当 collaboration 存在且 enabled===true 才认标记，旧标记残留不会误判。）
+  if (sg?.collaborationDisabledReason) {
+    return { kind: 'failed', reason: sg.collaborationDisabledReason, releasesDmChat: false };
   }
 
   const dataDir = depsOverride?.dataDir ?? config.session.dataDir;

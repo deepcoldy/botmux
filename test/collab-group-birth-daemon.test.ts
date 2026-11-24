@@ -119,8 +119,10 @@ vi.mock('../src/services/session-group-title.js', async () => {
 
 import { loadBotConfigs, registerBot, getBot } from '../src/bot-registry.js';
 import { __testOnly_handleNewTopic as handleNewTopic } from '../src/daemon.js';
-import { addChatGrant, chatQuotaKey } from '../src/services/grant-store.js';
-import { readCollabInitStore } from '../src/services/collab-init-store.js';
+import { addChatGrant, chatQuotaKey, consumeQuota } from '../src/services/grant-store.js';
+import { readCollabInitStore, placeCollabGroupInit } from '../src/services/collab-init-store.js';
+import { __testOnly_setCollabPeerPreflight } from '../src/core/collab-group-birth.js';
+import { collabCreatorAdmissionOperationId, collabInitId, collabSourceKey } from '../src/services/collab-group-config.js';
 import { initSessionGroups, isSessionGroup } from '../src/services/session-groups-store.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
@@ -297,8 +299,7 @@ describe('协作初始化入口：fail-closed 不扣费不建群', () => {
     expect(Object.keys(store.entries)).toHaveLength(0);
   });
 
-  it('failed / existing / busy 入口判定均 0 次扣费（防重复扣费被真实出生块钉住）', async () => {
-    // 结构非法 → failed
+  it('failed 入口判定 0 次扣费：结构非法 → preflight failed，不扣费不建群不开 CLI', async () => {
     writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([botConfig(invalidCollab)]));
     loadBotConfigs().forEach(cfg => registerBot(cfg));
     const bot = getBot(APP);
@@ -308,16 +309,124 @@ describe('协作初始化入口：fail-closed 不扣费不建群', () => {
     await addChatGrant(APP, DM_CHAT, GRANTEE, QUOTA_LIMIT);
     await handleNewTopic(dmEvent('非法配置', 'om_dedup_invalid'), dmCtx('om_dedup_invalid'));
     expect(chargedUnits()).toBe(0);
+    expect(mocks.createGroupWithBots).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
 
-    // 合法 enabled（编排未实现）→ failed，同样 0 次
+  it('existing 入口判定 0 次扣费：预置永久 sourceIndex entry 后同 source 重投 → existing，不扣费不建群', async () => {
+    // 预置：用真实 placeCollabGroupInit 留下 sourceIndex 永久 entry（模拟已有 running/done 请求）。
+    const sourceKey = collabSourceKey(APP, DM_CHAT, 'om_existing');
+    const initId = collabInitId(sourceKey);
+    await placeCollabGroupInit({
+      dataDir: mocks.dataDir,
+      creatorAppId: APP,
+      dmChatId: DM_CHAT,
+      sourceKey,
+      initId,
+      sourceMessageId: 'om_existing',
+      configVersion: 'cv',
+      configSnapshot: validCollab as any,
+      creatorAdmissionOperationId: collabCreatorAdmissionOperationId(initId),
+      createAttempt: 0,
+      now: Date.now(),
+    });
+    // 同 source 重投（合法 enabled 配置）→ 走 existing 分支，不再扣费
     writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([botConfig(validCollab)]));
     loadBotConfigs().forEach(cfg => registerBot(cfg));
-    const bot2 = getBot(APP);
-    bot2.resolvedAllowedUsers = [OWNER];
-    delete bot2.config.chatGrants;
-    delete bot2.config.quotaState;
+    const bot = getBot(APP);
+    bot.resolvedAllowedUsers = [OWNER];
+    delete bot.config.chatGrants;
+    delete bot.config.quotaState;
     await addChatGrant(APP, DM_CHAT, GRANTEE, QUOTA_LIMIT);
-    await handleNewTopic(dmEvent('未实现编排', 'om_dedup_unimpl'), dmCtx('om_dedup_unimpl'));
+
+    await handleNewTopic(dmEvent('同 source 重投', 'om_existing'), dmCtx('om_existing'));
+
     expect(chargedUnits()).toBe(0);
+    expect(mocks.createGroupWithBots).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    // 仍只有一个 entry（未建第二请求）
+    expect(Object.keys(readCollabInitStore(mocks.dataDir, APP).entries)).toHaveLength(1);
+  });
+
+  it('busy 入口判定 0 次扣费：预置 state=running 活动 entry 后不同 source → busy，不扣费不建群', async () => {
+    // 预置：活动 entry 占 activeByDmChat（state=running）
+    const sourceKey = collabSourceKey(APP, DM_CHAT, 'om_busy_first');
+    const initId = collabInitId(sourceKey);
+    await placeCollabGroupInit({
+      dataDir: mocks.dataDir,
+      creatorAppId: APP,
+      dmChatId: DM_CHAT,
+      sourceKey,
+      initId,
+      sourceMessageId: 'om_busy_first',
+      configVersion: 'cv',
+      configSnapshot: validCollab as any,
+      creatorAdmissionOperationId: collabCreatorAdmissionOperationId(initId),
+      createAttempt: 0,
+      now: Date.now(),
+    });
+    writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([botConfig(validCollab)]));
+    loadBotConfigs().forEach(cfg => registerBot(cfg));
+    const bot = getBot(APP);
+    bot.resolvedAllowedUsers = [OWNER];
+    delete bot.config.chatGrants;
+    delete bot.config.quotaState;
+    await addChatGrant(APP, DM_CHAT, GRANTEE, QUOTA_LIMIT);
+
+    // 不同 source 重投 → 走 busy 分支
+    await handleNewTopic(dmEvent('不同 source 新任务', 'om_busy_second'), dmCtx('om_busy_second'));
+
+    expect(chargedUnits()).toBe(0);
+    expect(mocks.createGroupWithBots).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('ready=1 次扣费：注入 peerPreflight {ok:true} 后合法 enabled 走 start 占位，扣费恰好 1 次', async () => {
+    __testOnly_setCollabPeerPreflight(async () => ({ ok: true }));
+    try {
+      writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([botConfig(validCollab)]));
+      loadBotConfigs().forEach(cfg => registerBot(cfg));
+      const bot = getBot(APP);
+      bot.resolvedAllowedUsers = [OWNER];
+      delete bot.config.chatGrants;
+      delete bot.config.quotaState;
+      await addChatGrant(APP, DM_CHAT, GRANTEE, QUOTA_LIMIT);
+
+      await handleNewTopic(dmEvent('ready 协作任务', 'om_ready'), dmCtx('om_ready'));
+
+      // ready 后走 startCollabGroupBirth 占位（collab-handled，不建群不递归），扣费恰好 1 次
+      expect(chargedUnits()).toBe(1);
+      expect(mocks.createGroupWithBots).not.toHaveBeenCalled();
+      // 残留 running 是 PR-1 占位语义（编排未实现前的测试 seam 场景，非生产路径）
+    } finally {
+      __testOnly_setCollabPeerPreflight(undefined);
+    }
+  });
+
+  it('准入拒绝后释放：扣费被拒路径调用 releaseCollabGroupBirth，同 DM 下一条不 busy', async () => {
+    __testOnly_setCollabPeerPreflight(async () => ({ ok: true }));
+    try {
+      writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([botConfig(validCollab)]));
+      loadBotConfigs().forEach(cfg => registerBot(cfg));
+      const bot = getBot(APP);
+      bot.resolvedAllowedUsers = [OWNER];
+      delete bot.config.chatGrants;
+      delete bot.config.quotaState;
+      // 配额 limit=1：真实 consumeQuota 用掉这一格，使下一条到达闸时已耗尽被拒。
+      await addChatGrant(APP, DM_CHAT, GRANTEE, 1);
+      await consumeQuota(APP, chatQuotaKey(DM_CHAT, GRANTEE));
+
+      await handleNewTopic(dmEvent('被拒任务', 'om_denied'), dmCtx('om_denied'));
+
+      // 被拒：不建群、不开 CLI（额度拒绝 → 零外部副作用）
+      expect(mocks.createGroupWithBots).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      // 占位已释放：无 running 残留，同 DM 不 busy
+      const store = readCollabInitStore(mocks.dataDir, APP);
+      expect(store.activeByDmChat[DM_CHAT]).toBeUndefined();
+      expect(Object.values(store.entries).some(e => e.state === 'running')).toBe(false);
+    } finally {
+      __testOnly_setCollabPeerPreflight(undefined);
+    }
   });
 });
