@@ -1442,6 +1442,9 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
   prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
+  /** Direct Web Terminal submission is human intervention for any pending
+   * failed-turn recovery. Injected by the daemon to avoid a recovery/pool import cycle. */
+  onTerminalInputSubmitted?: (ds: DaemonSession, at: number) => void;
   /** Same-bot quota fallback chain (core/quota-fallback-chain-switch.ts).
    *  True when the limit is handled by moving this session to the next
    *  CLI/model, so the owner pause notice and backup-bot handoff are skipped. */
@@ -5173,10 +5176,10 @@ function filterConsumedAntigravityQuotaFrame(frame: {
   directSubmit?: boolean;
 }, ds: DaemonSession, owns: () => boolean, afterRecovered: () => void): boolean {
   const limit = frame.usageLimit;
-  const key = limit?.nativeEpisodeKey;
-  if (!key || (limit?.source !== 'antigravity-error-composer' && limit?.source !== 'antigravity-native-log')
-    || !ds.session.consumedAntigravityQuotaKeys?.includes(key)) return true;
-  if (ds.usageLimit?.nativeEpisodeKey === key) {
+  const key = limit && (limit.source === 'antigravity-error-composer' || limit.source === 'antigravity-native-log')
+    ? cliUsageLimitEpisodeKey(limit) : undefined;
+  if (!key || !ds.session.consumedAntigravityQuotaKeys?.includes(key)) return true;
+  if (ds.usageLimit && cliUsageLimitEpisodeKey(ds.usageLimit) === key) {
     try {
       clearUsageLimitState(ds);
     } catch (error) {
@@ -21936,7 +21939,7 @@ function setupWorkerHandlers(
           ds.session.antigravityAccountId = accountId;
           dirty = true;
         }
-        const consumedKey = limit.nativeEpisodeKey;
+        const consumedKey = cliUsageLimitEpisodeKey(limit);
         if (consumedKey && !ds.session.consumedAntigravityQuotaKeys?.includes(consumedKey)) {
           ds.session.consumedAntigravityQuotaKeys = [
             ...(ds.session.consumedAntigravityQuotaKeys ?? []), consumedKey,
@@ -24570,6 +24573,7 @@ function setupWorkerHandlers(
 
       case 'terminal_input': {
         if (!ownsLifecycleMutation()) break;
+        if (msg.submitted) cb.onTerminalInputSubmitted?.(ds, msg.at);
         if (msg.submitted && ds.antigravityRotation) {
           if (ds.antigravityRotation.inFlightToken) {
             // Direct terminal input is human intervention just like a new IM

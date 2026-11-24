@@ -320,13 +320,19 @@ export function detectCliUsageLimit(
 }
 
 export function cliUsageLimitEpisodeKey(state: CliUsageLimitState): string | undefined {
-  return state.nativeEpisodeKey ?? state.relativeResetKey;
+  // A linked composer and its native log are one episode. Once that link is
+  // established, the log timestamp owns the effective identity everywhere
+  // (consumed filtering, notification edges, replacement and replay fences);
+  // the composer's reused Error ID must not hide a later log episode.
+  return state.nativeLogEpisodeKey ?? state.nativeEpisodeKey ?? state.relativeResetKey;
 }
 
-/** Stable semantic identity for worker frame dedup. A relative countdown owns
- * the episode, so its freshly recomputed deadline must not create a new frame
- * every tick. Without an episode, retain the deadline to avoid merging distinct
- * limits that have no stronger identity. */
+/** Stable semantic identity for worker frame dedup within one input generation.
+ * A relative countdown owns its same-turn/same-direct-input frame series, so its
+ * freshly recomputed deadline must not create a new frame every tick; the worker
+ * adds turn/attempt/direct-input generation to reopen that series. Without an
+ * episode, retain the deadline to avoid merging distinct limits that have no
+ * stronger identity. */
 export function usageLimitEvidenceKey(state: CliUsageLimitState): string {
   return JSON.stringify([
     state.kind,
@@ -363,8 +369,8 @@ export function reconcileUsageLimitState(
     ...incoming,
     retryAtMs: previous.retryAtMs,
     retryReady: previous.retryReady || nowMs >= previous.retryAtMs,
-    ...(previous.source ? { source: previous.source } : {}),
-    ...(previous.nativeEpisodeKey ? { nativeEpisodeKey: previous.nativeEpisodeKey } : {}),
+    // Keep the incoming native source/key: a linked composer may upgrade to
+    // its associated log (or vice versa) without changing the shared deadline.
   };
 }
 

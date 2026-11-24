@@ -186,6 +186,38 @@ describe('raw ANSI tmux quota classification', () => {
     expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('log:native-B-different-timestamp');
   });
 
+  it('switches a linked composer to the replacement native-log episode before any answer', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const refusal = '⚠ Individual quota reached. Resets in 1m.\nError ID: shared-error\n────\n>\n────\n';
+    let nativeKey = 'native-A';
+    const { classify } = classifier(() => refusal, 'antigravity', true, false, undefined,
+      () => ({ key: nativeKey, text: refusal }));
+    expect(classify('', 'idle').usageLimit).toMatchObject({
+      source: 'antigravity-error-composer', nativeEpisodeKey: 'composer:shared-error', nativeLogEpisodeKey: 'log:native-A',
+    });
+
+    nativeKey = 'native-B';
+    expect(classify('', 'idle').usageLimit).toMatchObject({
+      source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-B',
+    });
+    expect(classify('', 'idle').usageLimit?.nativeLogEpisodeKey).toBeUndefined();
+  });
+
+  it('does not leave a previously unlinked composer owning a newly arrived log episode', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const refusal = '⚠ Individual quota reached. Resets in 1m.\nError ID: shared-error\n────\n>\n────\n';
+    let nativeKey: string | undefined;
+    const { classify } = classifier(() => refusal, 'antigravity', true, false, undefined,
+      () => nativeKey ? { key: nativeKey, text: refusal } : undefined);
+    expect(classify('', 'idle').usageLimit?.nativeLogEpisodeKey).toBeUndefined();
+
+    nativeKey = 'native-A';
+    expect(classify('', 'idle').usageLimit).toMatchObject({
+      source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-A',
+    });
+    expect(classify('', 'idle').usageLimit?.nativeLogEpisodeKey).toBeUndefined();
+  });
+
   it('re-arms an answered turn for a different native-log episode on identical pixels', () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
     let nativeKey = 'native-answered-old';

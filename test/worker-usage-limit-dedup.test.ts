@@ -18,7 +18,7 @@ class FakePromptSuggestions {
 }
 
 describe('worker usage-limit frame identity', () => {
-  it('deduplicates a relative countdown while its deadline is recomputed each tick', async () => {
+  it('deduplicates a relative countdown within one input generation and reopens it for a new turn or direct input', async () => {
     vi.useFakeTimers();
     const usageLimitTracker = createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false });
     const messages: Array<Record<string, any>> = [];
@@ -36,7 +36,7 @@ describe('worker usage-limit frame identity', () => {
       promptSuggestionReportTurn: () => undefined, settleBackgroundTasksFromSiblings: () => {},
       refreshBackgroundWait: () => {}, backgroundWaitTasks: 0, startupInputHeld: () => false,
       backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
-      currentBotmuxTurnId: 'turn-1', currentBotmuxDispatchAttempt: 1,
+      currentBotmuxTurnId: 'turn-1', currentBotmuxDispatchAttempt: 1, webTerminalInputGeneration: 0,
       send: (message: Record<string, unknown>) => messages.push(message), log: () => {},
     };
     try {
@@ -45,6 +45,22 @@ describe('worker usage-limit frame identity', () => {
       await vi.advanceTimersByTimeAsync(115);
       expect(messages).toHaveLength(1);
       expect(messages[0]).toMatchObject({ type: 'screen_update', status: 'limited' });
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      scope.currentBotmuxTurnId = 'turn-2';
+      scope.currentBotmuxDispatchAttempt = 2;
+      usageLimitTracker.beginTurn(quota);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(messages).toHaveLength(2);
+      expect(messages[1]).toMatchObject({ type: 'screen_update', status: 'limited', turnId: 'turn-2', dispatchAttempt: 2 });
+      expect(messages[1].usageLimit.retryAtMs).toBeGreaterThan(messages[0].usageLimit.retryAtMs);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      scope.webTerminalInputGeneration += 1;
+      usageLimitTracker.beginTurn(quota);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(messages).toHaveLength(3);
+      expect(messages[2].usageLimit.retryAtMs).toBeGreaterThan(messages[1].usageLimit.retryAtMs);
     } finally {
       if (scope.screenUpdateTimer) clearInterval(scope.screenUpdateTimer);
       vi.useRealTimers();

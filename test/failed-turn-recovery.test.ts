@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { beforeEach, afterEach, describe, it, expect, vi } from 'vitest';
 import * as pool from '../src/core/worker-pool.js';
 import * as store from '../src/services/session-store.js';
@@ -384,6 +385,65 @@ describe('controlled failed-turn recovery', () => {
     if (mode === 'retry') expect(ds.activeInteractiveTurn).toBeUndefined();
     else expect(registry.size).toBe(0);
   });
+  it.each(['retry', 'fresh'] as const)('cancels recovery when Web Terminal submits during %s waits', async mode => {
+    const { registerBot } = await import('../src/bot-registry.js');
+    registerBot({ larkAppId: 'cli_app', larkAppSecret: 'fixture', cliId: 'codex', allowedUsers: ['ou_user_a'] } as never);
+    const worker = Object.assign(new EventEmitter(), {
+      killed: false, pid: process.pid, stdout: new EventEmitter(), stderr: new EventEmitter(), send: vi.fn(),
+    });
+    ds.worker = worker;
+    ds.workerGeneration = 1;
+    ds.session.workerGeneration = 1;
+    pool.initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/tmp/work', getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTerminalInputSubmitted: (target: any, at: number) => noteFailedTurnRecoveryInput(
+        target.larkAppId,
+        target.runtimeRoutingAnchor ?? (target.scope === 'chat' ? target.chatId : target.session.rootMessageId),
+        `web-terminal:${at}`,
+      ),
+    } as never);
+    pool.__testOnly_setupWorkerHandlers(ds, worker as never);
+    const submitTerminal = async () => {
+      await Promise.all(worker.listeners('message').map(listener => listener({
+        type: 'terminal_input', submitted: true, at: Date.parse(request.failedAt) + 1,
+      })));
+    };
+    if (mode === 'fresh') {
+      vi.mocked(pool.closeSessionForBackgroundCleanup).mockImplementation(async () => {
+        await submitTerminal();
+        ds.session.status = 'closed'; registry.clear();
+        return { ok: true, outcome: 'closed', alreadyClosed: false, known: true } as any;
+      });
+    } else {
+      vi.mocked(pool.prepareFailedTurnRecoveryIdentity).mockImplementation(submitTerminal);
+    }
+
+    expect(await recoverFailedTurn('old', { ...request, mode })).toMatchObject({ ok: true, state: 'cancelled' });
+    expect(pool.sendWorkerInput).not.toHaveBeenCalled();
+    expect(pool.forkWorker).not.toHaveBeenCalled();
+    worker.removeAllListeners();
+  });
+
+  it.each(['retry', 'fresh'] as const)('rechecks newer input ownership after %s waits even without an IM cancellation', async mode => {
+    if (mode === 'fresh') {
+      vi.mocked(pool.closeSessionForBackgroundCleanup).mockImplementation(async () => {
+        ds.lastCliInputTurnId = 'om_new';
+        ds.session.status = 'closed'; registry.clear();
+        return { ok: true, outcome: 'closed', alreadyClosed: false, known: true } as any;
+      });
+    } else {
+      vi.mocked(pool.prepareFailedTurnRecoveryIdentity).mockImplementation(async () => {
+        ds.lastCliInputTurnId = 'om_new';
+      });
+    }
+
+    expect(await recoverFailedTurn('old', { ...request, mode })).toMatchObject({ ok: true, state: 'cancelled' });
+    expect(pool.sendWorkerInput).not.toHaveBeenCalled();
+    expect(pool.forkWorker).not.toHaveBeenCalled();
+    if (mode === 'fresh') expect(store.createSession).not.toHaveBeenCalled();
+  });
+
   it('retains scheduled creator provenance and prepares the normal scheduled authority', async () => {
     ds.session.lastFailedTurn.trustedCaller = { ...caller, source: 'schedule_creator', taskId: 'abcdef12' };
     ds.session.lastFailedTurn.silent = true;

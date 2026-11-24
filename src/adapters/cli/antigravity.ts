@@ -204,8 +204,22 @@ export function isAntigravityWorkingScreen(screen: string): boolean {
 export function annotateAntigravityUsageLimit(
   screen: string,
   state: CliUsageLimitState,
-  native?: { text?: string; key?: string; previous?: CliUsageLimitState },
+  native?: { text?: string; key?: string; previous?: CliUsageLimitState; replaceComposer?: boolean },
 ): CliUsageLimitState {
+  const fromNativeLog = (current: CliUsageLimitState): CliUsageLimitState | undefined => {
+    if (!native?.text) return undefined;
+    const fromLog = detectCliUsageLimit(native.text);
+    if (!fromLog.limited || fromLog.kind !== 'usage' || current.kind !== 'usage'
+      || fromLog.retryLabel !== current.retryLabel) return undefined;
+    const result: CliUsageLimitState = {
+      ...current,
+      source: 'antigravity-native-log',
+      ...(native.key ? { nativeEpisodeKey: `log:${native.key}` } : {}),
+    };
+    // A native-log episode never carries a composer association of its own.
+    delete result.nativeLogEpisodeKey;
+    return result;
+  };
   const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
   if (/esc to cancel/i.test(plain)) return state;
   const match = ERROR_COMPOSER_PATTERN.exec(plain);
@@ -215,26 +229,25 @@ export function annotateAntigravityUsageLimit(
       const row = rows[i]!;
       if (/^⚠(?:️)?[ \t]*Individual quota reached\./.test(row)) {
         const errorId = /Error ID:[ \t]*([a-zA-Z0-9][a-zA-Z0-9-]*)/.exec(match[0])?.[1];
-        return {
+        const composer: CliUsageLimitState = {
           ...state,
           source: 'antigravity-error-composer',
           ...(errorId ? { nativeEpisodeKey: `composer:${errorId}` } : {}),
         };
+        // An old/unlinked or differently linked composer must not keep owning
+        // a new native timestamp. Only the classifier may request this explicit
+        // replacement; ordinary composer annotation remains unchanged.
+        if (native?.replaceComposer) {
+          const replacement = fromNativeLog(composer);
+          if (replacement) return replacement;
+        }
+        return composer;
       }
       if (/^[ \t]*(?:⚠|Error ID:|>|●)/.test(row)) return state;
     }
   }
   if (native?.previous?.source === 'antigravity-error-composer' || !native?.text) return state;
-  const fromLog = detectCliUsageLimit(native.text);
-  if (fromLog.limited && fromLog.kind === 'usage' && state.kind === 'usage'
-    && fromLog.retryLabel === state.retryLabel) {
-    return {
-      ...state,
-      source: 'antigravity-native-log',
-      ...(native.key ? { nativeEpisodeKey: `log:${native.key}` } : {}),
-    };
-  }
-  return state;
+  return fromNativeLog(state) ?? state;
 }
 
 export const ANTIGRAVITY_QUOTA_HISTORY_LIMIT = 32;

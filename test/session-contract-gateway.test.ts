@@ -101,7 +101,7 @@ describe('contract gateway and real worker boundaries', () => {
       turnTerminalEmitted: () => false,
       backend: {}, cliSpawnGeneration: 1, cliAdapter: {},
       lastInitConfig: { cliId: 'grok' }, SCREEN_UPDATE_INTERVAL_MS: 100,
-      currentBotmuxTurnId: 'display-only-turn', currentBotmuxDispatchAttempt: undefined,
+      currentBotmuxTurnId: 'display-only-turn', currentBotmuxDispatchAttempt: undefined, webTerminalInputGeneration: 0,
       projectedRuntimeScreenStatus: () => 'working',
       snapshotWithLatestRuntimeStatus: () => new Promise(resolve => reads.push(resolve)),
       hasCurrentSessionRuntime: () => workerScope.isCurrentContext(),
@@ -456,7 +456,7 @@ describe('contract gateway and real worker boundaries', () => {
     let starts = 0;
     const env: Record<string, unknown> = {
       workerSessionEventScope: scope, pendingRuntimeReservations: reservations,
-      currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined,
+      currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined, webTerminalInputGeneration: 0,
       currentBotmuxCallerOpenId: undefined, captureRevision: 0, captureIdentityAnnounced: false,
       activeRestartAttemptId: undefined, closeRequested: false,
       spawnCliBody: vi.fn(async () => {

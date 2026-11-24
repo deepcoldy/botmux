@@ -30,7 +30,7 @@ export function antigravityScreenProducer(send: (frame: WorkerToDaemon) => void)
     traexQuestionBridgeActive: () => false, observeTraexAutoModelCapacity() {}, publishNativeReasoningFooter() {},
     settleBackgroundTasksFromSiblings() {}, refreshBackgroundWait() {}, startupInputHeld: () => false,
     backgroundWaitTasks: 0, backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(), PromptSuggestionPublisher,
-    currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined, foldedTypeAheadTurn: undefined,
+    currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined, webTerminalInputGeneration: 0, foldedTypeAheadTurn: undefined,
     turnTerminalEmitted: false, promptSuggestionReportTurn: () => undefined,
     SCREEN_UPDATE_INTERVAL_MS: 100, backendScreenEvidenceIsAuthoritativeForMutation: () => true,
     captureBackendScreen: capture, stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen,

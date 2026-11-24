@@ -22,6 +22,8 @@ type CaptureHarness = {
   setLastHash(hash: string): void;
   /** Simulate setCaptureIdentity(): tuple change bumps the capture revision. */
   setTurn(turnId: string | undefined, attempt: number | undefined): void;
+  /** Simulate a direct Web Terminal input without manufacturing a Lark turn. */
+  setInputGeneration(generation: number): void;
   revision(): number;
   /** Simulate applyDisplayMode(): mode change + generation bump + hash reset. */
   applyDisplayMode(mode: 'hidden' | 'screenshot'): void;
@@ -52,6 +54,7 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
     } = deps;
     let currentBotmuxTurnId = deps.currentBotmuxTurnId;
     let currentBotmuxDispatchAttempt = deps.currentBotmuxDispatchAttempt;
+    let webTerminalInputGeneration = deps.webTerminalInputGeneration ?? 0;
     let screenshotDisplayGeneration = 0;
     let captureRevision = 0;
     let displayMode = 'screenshot';
@@ -76,6 +79,7 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
         currentBotmuxDispatchAttempt = attempt;
       },
       revision: () => captureRevision,
+      setInputGeneration: (generation) => { webTerminalInputGeneration = generation; },
       applyDisplayMode: (mode) => {
         // Mirrors production applyDisplayMode's state effects (loop control is
         // outside the capture function under test).
@@ -163,6 +167,47 @@ describe('worker screenshot upload hardening', () => {
     await harness.captureAndUpload();
     expect(send).toHaveBeenCalledTimes(4);
     expect(uploadImageBuffer).toHaveBeenCalledTimes(4);
+  });
+
+  it('reopens an unchanged no-ID quota frame for a new turn and direct-input generation', async () => {
+    let retryAtMs = 100_000;
+    const send = vi.fn();
+    const uploadImageBuffer = vi.fn(async () => `img_${uploadImageBuffer.mock.calls.length}`);
+    const harness = executeProductionCapture({
+      logScreenshotSkip: vi.fn(),
+      snapshotToPng: vi.fn(async () => ({ ansi: 'same-no-id-quota', png: Buffer.from('png'), content: 'same-no-id-quota' })),
+      backend: {}, renderCols: 80, renderRows: 24, renderer: null,
+      createHash: vi.fn(), clamp: vi.fn(), captureToPng: vi.fn(), uploadImageBuffer,
+      logError: vi.fn(), log: vi.fn(), projectedRuntimeScreenStatus: () => 'idle', send,
+      classifyScreenUsageLimit: () => ({
+        status: 'limited',
+        usageLimit: {
+          limited: true, kind: 'usage', retryAtMs, retryLabel: '1m', retryReady: false,
+          relativeResetKey: 'usage:60000:',
+        },
+      }),
+      currentBotmuxTurnId: 'turn_1', currentBotmuxDispatchAttempt: 1,
+      cliAdapter: { id: 'antigravity' },
+    });
+
+    await harness.captureAndUpload();
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledOnce();
+
+    retryAtMs = 200_000;
+    harness.setTurn('turn_2', 2);
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(2);
+
+    retryAtMs = 300_000;
+    harness.setInputGeneration(1);
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(send.mock.calls[2]?.[0].usageLimit.retryAtMs).toBe(300_000);
+
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(uploadImageBuffer).toHaveBeenCalledTimes(3);
   });
 
   it('keeps other CLIs on the original unchanged-pixel fast path without reclassifying', async () => {

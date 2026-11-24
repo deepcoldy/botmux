@@ -64,7 +64,7 @@ describe('Antigravity recovery delivery through the real screen sampler', () => 
       observeTraexAutoModelCapacity: () => {}, publishNativeReasoningFooter: () => {},
       promptSuggestionReportTurn: () => undefined, settleBackgroundTasksFromSiblings: () => {},
       refreshBackgroundWait: () => {}, backgroundWaitTasks: 0, startupInputHeld: () => false,
-      backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(), currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined,
+      backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(), currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined, webTerminalInputGeneration: 0,
       send: (message: Record<string, unknown>) => messages.push(message), log: () => {},
     });
 
@@ -111,7 +111,7 @@ describe('Antigravity recovery delivery through the real screen sampler', () => 
       promptSuggestionReportTurn: () => undefined, settleBackgroundTasksFromSiblings: () => {},
       refreshBackgroundWait: () => {}, backgroundWaitTasks: 0, startupInputHeld: () => false,
       backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
-      currentBotmuxTurnId: 'turn-proof', currentBotmuxDispatchAttempt: 1,
+      currentBotmuxTurnId: 'turn-proof', currentBotmuxDispatchAttempt: 1, webTerminalInputGeneration: 0,
       send: (message: Record<string, unknown>) => messages.push(message), log: () => {},
     });
 
@@ -163,7 +163,7 @@ describe('Antigravity recovery delivery through the real screen sampler', () => 
       promptSuggestionReportTurn: () => undefined, settleBackgroundTasksFromSiblings: () => {},
       refreshBackgroundWait: () => {}, backgroundWaitTasks: 0, startupInputHeld: () => false,
       backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
-      currentBotmuxTurnId: 'turn-generic', currentBotmuxDispatchAttempt: 1,
+      currentBotmuxTurnId: 'turn-generic', currentBotmuxDispatchAttempt: 1, webTerminalInputGeneration: 0,
       send: (message: Record<string, unknown>) => messages.push(message), log: () => {},
     });
 

@@ -28,7 +28,7 @@ function start(options: { cli?: string; authoritative?: boolean; busy?: boolean;
     inspectAidenCodexUpdateDialogOnScreen() {}, observeTraexAutoModelCapacity() {},
     spawnArgvNeedsWorkingSeed: options.argv ?? false,
     projectedRuntimeScreenStatus: () => 'working',
-    currentBotmuxTurnId: 'existing-turn', currentBotmuxDispatchAttempt: undefined,
+    currentBotmuxTurnId: 'existing-turn', currentBotmuxDispatchAttempt: undefined, webTerminalInputGeneration: 0,
     send: (message: Record<string, unknown>) => messages.push(message), log() {},
     SCREEN_UPDATE_INTERVAL_MS: 100, setInterval,
     PromptSuggestionPublisher,

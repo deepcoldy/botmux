@@ -35567,6 +35567,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
+    onTerminalInputSubmitted: (ds, at) => {
+      const anchor = ds.runtimeRoutingAnchor ?? (ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId);
+      noteFailedTurnRecoveryInput(ds.larkAppId, anchor, `web-terminal:${at}`);
+    },
     startQuotaFallbackChainSwitch,
     loadScheduledTaskForIdentity: (appId, taskId) =>
       readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),

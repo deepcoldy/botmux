@@ -261,12 +261,14 @@ function receipt(record: FailedTurnRecord): FailedTurnRecoveryResult {
     originalTurnId: record.originalTurnId ?? record.turnId };
 }
 
-function newerInput(ds: DaemonSession, record: FailedTurnRecord): boolean {
+function newerInput(ds: DaemonSession, record: FailedTurnRecord, allowRecoveryTurnId?: string): boolean {
   return ['backoff', 'dispatching'].includes(ds.session.ordinaryTurnRecovery?.status ?? '')
     || hasProtectedSessionMutationOwnership(ds)
     || !!ds.pendingPrompt || !!ds.pendingFollowUps?.length || !!ds.pendingFollowUpTurnIds?.length
     || !!ds.activeInteractiveTurn && ds.activeInteractiveTurn.turnId !== record.turnId
+      && ds.activeInteractiveTurn.turnId !== allowRecoveryTurnId
     || !!ds.lastCliInputTurnId && ds.lastCliInputTurnId !== record.turnId
+      && ds.lastCliInputTurnId !== allowRecoveryTurnId
     || ds.lastMessageAt > Date.parse(record.failedAt)
     || ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing';
 }
@@ -362,7 +364,7 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
         if (request.mode === 'fresh') {
           const closed = await closeSessionForBackgroundCleanup(sessionId, 'failed-turn recovery');
           if (!closed.ok || closed.outcome !== 'closed') return setState('dispatch_unknown');
-          if (transaction.cancelled) return setState('cancelled');
+          if (transaction.cancelled || newerInput(ds, record)) return setState('cancelled');
           const created = store.createSession(ds.chatId, ds.session.rootMessageId, ds.session.title,
             ds.chatType, ds.scope, { source: 'other', inherit: ds.session });
           created.larkAppId = ds.larkAppId;
@@ -424,7 +426,10 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
         await prepareFailedTurnRecoveryIdentity(target, turnId);
         if (record.silent) armSilentScheduledTurn(target, turnId);
         // Synchronous final check + worker admission is the linearization edge.
-        if (transaction.cancelled) { abandonUndispatched(); return setState('cancelled'); }
+        // IM cancellation is not the only input channel: re-read all ownership
+        // markers after the last await, while exempting only this recovery's own
+        // freshly assigned turn from the comparison.
+        if (transaction.cancelled || newerInput(ds, record, turnId)) { abandonUndispatched(); return setState('cancelled'); }
         let rejected = false;
         ipcAttempted = true;
         const accepted = target.worker && !target.worker.killed

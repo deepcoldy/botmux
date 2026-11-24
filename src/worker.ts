@@ -10110,26 +10110,38 @@ function classifyUsageLimitWithNativeEvidence(
     const result = usageLimitTracker.classify(evidence, status, state => {
       const key = state.relativeResetKey;
       const composerObserved = annotateAntigravityUsageLimit(evidence, state);
-      if (composerObserved.source === 'antigravity-error-composer' && nativeQuota?.key && key) {
+      let replaceComposerWithNativeLog = false;
+      let existingComposer: CliUsageLimitState | undefined;
+      if (composerObserved.source === 'antigravity-error-composer') {
+        existingComposer = antigravityQuotaHistory?.find(entry =>
+          entry.source === 'antigravity-error-composer'
+          && entry.nativeEpisodeKey === composerObserved.nativeEpisodeKey
+          && (!key || entry.relativeResetKey === key));
+      }
+      if (composerObserved.source === 'antigravity-error-composer' && nativeQuota?.key) {
         const linkedKey = `log:${nativeQuota.key}`;
-        const existingComposer = antigravityQuotaHistory?.find(entry =>
-          entry.source === 'antigravity-error-composer' && entry.relativeResetKey === key);
         // Only a first simultaneous observation (or the same established link)
-        // creates an association. An older unlinked composer is never rebound
-        // to a different native-log timestamp.
+        // creates an association. An older unlinked composer or a composer
+        // linked to another log becomes the new native-log episode instead of
+        // retaining its reused composer identity or vetoing the fresh refusal.
         if (!existingComposer || existingComposer.nativeLogEpisodeKey === linkedKey) {
           composerLogLink = { ...composerObserved, nativeLogEpisodeKey: linkedKey };
+        } else {
+          replaceComposerWithNativeLog = true;
         }
       }
-      const previous = previousFor(composerObserved, nativeQuota?.key);
-      const annotated = annotateAntigravityUsageLimit(evidence, composerObserved, {
-        text: nativeQuota?.text, key: nativeQuota?.key, previous,
+      // A temporary log-reader gap must not erase an already established link.
+      // A different current key is handled above as a replacement, never as a
+      // rebind of the old composer.
+      const composerWithEstablishedLink = !nativeQuota?.key && existingComposer?.nativeLogEpisodeKey
+        ? { ...composerObserved, nativeLogEpisodeKey: existingComposer.nativeLogEpisodeKey }
+        : composerObserved;
+      const composerForAnnotation = composerLogLink ?? composerWithEstablishedLink;
+      const previous = previousFor(composerForAnnotation, nativeQuota?.key);
+      const annotated = annotateAntigravityUsageLimit(evidence, composerForAnnotation, {
+        text: nativeQuota?.text, key: nativeQuota?.key, previous, replaceComposer: replaceComposerWithNativeLog,
       });
-      const observed = withAntigravityDirectFailureProof(
-        composerObserved.source === 'antigravity-error-composer' && nativeQuota?.key
-          ? { ...annotated, nativeLogEpisodeKey: `log:${nativeQuota.key}` }
-          : annotated,
-      );
+      const observed = withAntigravityDirectFailureProof(annotated);
       if (!key) return observed;
 
       const now = Date.now();
@@ -19501,6 +19513,7 @@ async function captureAndUpload(): Promise<void> {
   const capturedRevision = captureRevision;
   const capturedTurnId = currentBotmuxTurnId;
   const capturedAttempt = currentBotmuxDispatchAttempt;
+  const capturedInputGeneration = webTerminalInputGeneration;
   const capturedDisplayGeneration = screenshotDisplayGeneration;
   const frameIsStale = (): boolean => displayMode !== 'screenshot'
     || capturedRevision !== captureRevision
@@ -19518,7 +19531,7 @@ async function captureAndUpload(): Promise<void> {
     const recovery = usageAware?.usageLimitRecovery;
     const base = `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}${recovery ? `:recovery=${recovery}` : ''}`;
     if (!usageAware?.usageLimit && !usageAware?.expiredAntigravityQuota) return base;
-    return `${base}:usage=${JSON.stringify([
+    return `${base}:input=${JSON.stringify([capturedTurnId, capturedAttempt, capturedInputGeneration])}:usage=${JSON.stringify([
       usageAware.status, limitIdentity(usageAware.usageLimit), limitIdentity(usageAware.expiredAntigravityQuota),
     ])}`;
   };
@@ -27511,6 +27524,7 @@ function startScreenUpdates(): void {
   let lastSentStatus: string | undefined;
   let lastSentExpiredQuotaKey: string | undefined;
   let lastSentUsageLimitEvidence: string | undefined;
+  let lastSentUsageLimitTurnIdentity: string | undefined;
   let lastSentRecovery: UsageAwareScreen['usageLimitRecovery'];
   let lastSentBackgroundWait = 0;
   let lastSentModelRequestAt: number | undefined;
@@ -27544,10 +27558,12 @@ function startScreenUpdates(): void {
     const capacityLifetime = cliLifetimeNonce;
     const sampleTurn = currentBotmuxTurnId;
     const sampleAttempt = currentBotmuxDispatchAttempt;
+    const sampleInputGeneration = webTerminalInputGeneration;
     const screenTurn = { turnId: sampleTurn, dispatchAttempt: sampleAttempt };
     const ownsSample = () => backend === capacityBackend && cliSpawnGeneration === capacityGeneration
       && cliLifetimeNonce === capacityLifetime
       && currentBotmuxTurnId === sampleTurn && currentBotmuxDispatchAttempt === sampleAttempt
+      && webTerminalInputGeneration === sampleInputGeneration
       && (!workerSessionEventScope || hasCurrentSessionRuntime());
     if (awaitingFirstPrompt) {
       inspectAidenCodexUpdateDialogOnScreen();
@@ -27797,8 +27813,14 @@ function startScreenUpdates(): void {
       const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
       const usageLimit = usageAware.usageLimit;
       const usageLimitEvidence = usageLimit ? usageLimitEvidenceKey(usageLimit) : undefined;
+      // A no-Error-ID relative countdown is only a same-input dedup identity.
+      // A new turn or direct Web Terminal input must get a fresh frame even
+      // when pixels, duration and all other evidence are unchanged.
+      const usageLimitTurnIdentity = usageLimit || usageAware.expiredAntigravityQuota
+        ? JSON.stringify([screenTurn.turnId, screenTurn.dispatchAttempt, sampleInputGeneration]) : undefined;
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
         || usageLimitEvidence !== lastSentUsageLimitEvidence
+        || usageLimitTurnIdentity !== lastSentUsageLimitTurnIdentity
         || usageAware.usageLimitRecovery !== lastSentRecovery
         || backgroundWaitTasks !== lastSentBackgroundWait
         || modelRequestClock.lastServedAt() !== lastSentModelRequestAt
@@ -27808,6 +27830,7 @@ function startScreenUpdates(): void {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
         lastSentUsageLimitEvidence = usageLimitEvidence;
+        lastSentUsageLimitTurnIdentity = usageLimitTurnIdentity;
         lastSentRecovery = usageAware.usageLimitRecovery;
         lastSentBackgroundWait = backgroundWaitTasks;
         lastSentModelRequestAt = modelRequestClock.lastServedAt();

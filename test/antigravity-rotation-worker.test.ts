@@ -158,6 +158,15 @@ function nativeUsageLimit(screen: string, key: string, nowMs: number): CliUsageL
   return annotateAntigravityUsageLimit(screen, detected, { text: screen, key });
 }
 
+function linkedComposerUsageLimit(key: string, nowMs: number): CliUsageLimitState {
+  return {
+    ...nativeUsageLimit(INCIDENT_QUOTA_SCREEN, key, nowMs),
+    source: 'antigravity-error-composer',
+    nativeEpisodeKey: 'composer:shared-error',
+    nativeLogEpisodeKey: `log:${key}`,
+  };
+}
+
 async function emitQuotaAndStart(
   h: Awaited<ReturnType<typeof setupRotationScenario>>,
   turnId: string | null = 'turn-1',
@@ -166,6 +175,7 @@ async function emitQuotaAndStart(
   nativeScreen?: string,
   nativeEpisodeKey = 'native-episode-1',
   limitDirectFailure = false,
+  usageLimitOverride?: CliUsageLimitState,
 ) {
   const previousRestartCount = h.sent.filter(msg => msg.type === 'restart').length;
   const frameTurnId = turnId ?? undefined;
@@ -176,7 +186,10 @@ async function emitQuotaAndStart(
     retryLabel: '1m', retryReady: false, source: 'antigravity-error-composer',
   };
   let content = 'quota exceeded';
-  if (nativeScreen) {
+  if (usageLimitOverride) {
+    usageLimit = usageLimitOverride;
+    content = INCIDENT_QUOTA_SCREEN;
+  } else if (nativeScreen) {
     usageLimit = nativeUsageLimit(nativeScreen, nativeEpisodeKey, h.nowMs);
     content = nativeScreen;
   }
@@ -686,6 +699,54 @@ describe('Antigravity worker-pool replay safety', () => {
     h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
     await h.flush();
     expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(0);
+  });
+
+  it('invalidates a cached replay when a linked composer changes its native log episode', async () => {
+    const h = await setupRotationScenario({ directFailure: false, limitedDirectFailure: true, recordStatus: true });
+    const restart = await emitQuotaAndStart(h, 'turn-1', 60_000, true, INCIDENT_QUOTA_SCREEN, 'native-episode-a', true,
+      linkedComposerUsageLimit('native-episode-a', h.nowMs));
+
+    const replacement = { ...linkedComposerUsageLimit('native-episode-b', h.nowMs), directFailure: true as const };
+    await Promise.all(h.worker.listeners('message').map(listener => listener({
+      type: 'screen_update', content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1', usageLimit: replacement,
+    })));
+    await h.flush();
+    expect(h.ds.usageLimit?.nativeLogEpisodeKey).toBe('log:native-episode-b');
+
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(0);
+  });
+
+  it('does not let a consumed linked composer swallow its replacement native log episode', async () => {
+    const h = await setupRotationScenario({ directFailure: false, limitedDirectFailure: true, accountCount: 3 });
+    const first = await emitQuotaAndStart(h, 'turn-1', 60_000, true, INCIDENT_QUOTA_SCREEN, 'native-episode-a', true,
+      linkedComposerUsageLimit('native-episode-a', h.nowMs));
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: first!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: first!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    const replay = h.sent.find(msg => msg.type === 'message');
+    expect(replay).toBeDefined();
+    const replayTurnId = (replay as any).turnId as string;
+    h.ds.session.lastFailedTurn = {
+      turnId: replayTurnId, cliInput: 'do work', userPrompt: 'do work',
+      failedAt: new Date().toISOString(), status: 'failed', retryCount: 1,
+      limitedSnapshot: true, directFailure: true,
+    };
+    h.ds.session.lastCliInputTurnId = replayTurnId;
+    h.ds.lastCliInputTurnId = replayTurnId;
+    h.sessionStore.updateSession(h.ds.session);
+
+    const second = await emitQuotaAndStart(h, replayTurnId, 60_000, true, INCIDENT_QUOTA_SCREEN, 'native-episode-b', true,
+      linkedComposerUsageLimit('native-episode-b', h.nowMs));
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc3', attemptId: second!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: second!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+
+    expect(h.sent.filter(msg => msg.type === 'restart')).toHaveLength(2);
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(2);
+    expect(h.ds.session.consumedAntigravityQuotaKeys).toEqual(['log:native-episode-a', 'log:native-episode-b']);
   });
 
   it('fails closed when revoking proof loses its failed-turn SQLite write before settlement', async () => {
