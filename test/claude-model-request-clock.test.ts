@@ -105,6 +105,26 @@ describe('ClaudeModelRequestClock', () => {
     expect(clock.lastServedAt()).toBe(ms('08:00:00'));
   });
 
+  it('never credits a <synthetic> local tool call, even when its record carries non-zero usage', () => {
+    // Claude Code writes local tool calls (virtual Read/project-doc replays,
+    // PushNotification) as assistant records with model "<synthetic>". No model
+    // request was served, so the clock must ignore them regardless of content
+    // shape or usage values — the synthetic-message factory accepts a usage
+    // argument, so zero usage cannot be assumed.
+    const clock = clockOf([request('08:00:00'), served('08:00:30')]);
+    clock.observe({
+      type: 'assistant', uuid: 'syn-tool', timestamp: at('08:01:00'),
+      isApiErrorMessage: false,
+      message: {
+        role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence',
+        usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        content: [{ type: 'tool_use', id: 'call-1', name: 'Read', input: { file_path: '/a' } }],
+      },
+    } as TranscriptEvent);
+    expect(clock.lastServedAt()).toBe(ms('08:00:00'));
+    expect(clock.lastActivityAt()).toBe(ms('08:00:30'));
+  });
+
   it('builds without api-request records credit the response time; a re-read older pair never moves it back', () => {
     const clock = clockOf([served('11:00:10')]);
     expect(clock.lastServedAt()).toBe(ms('11:00:10'));
