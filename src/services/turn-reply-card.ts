@@ -225,23 +225,6 @@ export class TurnReplyCardStore {
     }, { maxWaitMs: 8_000 });
   }
 
-  /** Persist a DISPLAY-only close for a prepared record that was never shown.
-   *  No provider I/O, final delivery or native completion timestamp is invented;
-   *  recovery must not create a fresh card for this retired display later. */
-  async retireUnpublishedDisplay(key: TurnReplyCardKey): Promise<boolean> {
-    if (!this.read(key)) return false;
-    return withFileLock(this.path(key), async () => {
-      const record = this.read(key);
-      if (!record || record.messageId || record.withdrawn) return false;
-      record.displayRetired = true;
-      record.phase = 'completed';
-      delete record.pendingPatch;
-      delete record.publishPending;
-      this.write(key, record);
-      return true;
-    });
-  }
-
   async update(key: TurnReplyCardKey, inputEvent: TurnReplyCardEvent | (() => TurnReplyCardEvent), io: TurnReplyCardTransport): Promise<{
     messageId?: string; delivered: boolean; card?: string; record: TurnReplyCardRecord;
   }> {
@@ -268,6 +251,20 @@ export class TurnReplyCardStore {
         event = !hideUndeliveredFinal
           ? { kind: 'refresh' }
           : { kind: 'terminal', phase: 'ambiguous', disconnected: true, orphanAskIds: event.orphanAskIds };
+      }
+      if (event.kind === 'display_retired' && event.silent) {
+        // A genuinely unshown display needs no provider write. This fast path
+        // deliberately shares update()'s lock and beforeEffect/owns barrier:
+        // an uncertain first POST, any final payload or an existing terminal
+        // outcome must instead use the full publication/recovery protocol below.
+        if (!replyCardIsTerminal(record) && !record.messageId && !record.pendingCreate && !record.finalCard) {
+          record.displayRetired = true;
+          record.phase = 'completed';
+          delete record.pendingPatch;
+          delete record.publishPending;
+          this.write(key, record);
+          return { delivered: false, record };
+        }
       }
       const displayRetirement = event.kind === 'display_retired';
       if (event.kind === 'display_retired') {

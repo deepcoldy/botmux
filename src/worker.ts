@@ -14478,12 +14478,15 @@ function codexBridgeUsesSplitLiveAttach(): boolean {
  *  may let a transcript-started turn override the screen-ready heuristic. */
 function hasStructuredLifecycleBlock(): boolean {
   if (traexQuotaPending) return true;
+  if (rpcTurnsAwaitingActivation.size > 0) return true;
+  if (rpcLifecycleFailClosedOwners.size > 0) return true;
+  if (rpcTerminalHydrationOwners.size > 0) return true;
   // rpcActive is an explicit native app-server ownership proof and is valid for
   // every RPC-capable Codex-family adapter (currently codex + traex), including
   // drivers intentionally excluded from transcript-only lifecycle blocking.
-  if (structuredRpcLifecycleOwnerActive(codexBridgeQueue.peek().find(turn =>
+  if (codexBridgeQueue.peek().some(turn =>
     turn.rpcActive === true && turn.finalText === undefined,
-  ))) return true;
+  )) return true;
   return isStructuredBridgeLifecycleBlockingCli(lastInitConfig?.cliId)
     && codexBridgeQueue.hasBlockingTurn();
 }

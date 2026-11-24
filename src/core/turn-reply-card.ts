@@ -424,37 +424,40 @@ export async function retireReplyCardDisplay(
   ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; message?: string; silent?: boolean },
   send: ReplyCardSender, owns: () => boolean,
 ): Promise<boolean> {
+  if (!owns()) return false;
   if (replyCardModeFor(ds, msg.turnId) === 'legacy') {
     finalizeCotMessage(ds, msg.turnId, msg.silent ? 'completed' : 'ambiguous', msg.dispatchAttempt);
     return false;
   }
   try {
-    if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
-    if (msg.silent) {
-      const store = new TurnReplyCardStore(config.session.dataDir);
-      const key = replyCardKey(ds, msg.turnId, msg.dispatchAttempt);
-      const record = store.read(key);
-      if (!record) return true;
-      if (!record.messageId && await store.retireUnpublishedDisplay(key)) return true;
-      // The first POST may have completed while we waited for its lock. In that
-      // case the helper returns false and this existing card continues through
-      // the ordinary silent-PATCH path below.
+    const existing = msg.silent
+      ? new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt))
+      : undefined;
+    // Match supersede: buffered activity must not create an otherwise empty
+    // card for a silent, never-shown display. An existing/uncertain POST still
+    // needs its last activity flushed before the display-only close.
+    if (!msg.silent || existing?.messageId || existing?.pendingCreate) {
+      await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
+        // A failed cosmetic PATCH must not prevent persisting the terminal notice.
+        logger.warn(`[reply-card] retirement tool flush: ${error.message}`);
+      });
     }
-    await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
-      // A failed cosmetic PATCH must not prevent persisting the terminal notice.
-      logger.warn(`[reply-card] retirement tool flush: ${error.message}`);
-    });
+    // Silent retirement uses the ordinary publisher: its lock, beforeEffect/
+    // owns gate and pendingCreate UUID replay also cover this display-only edge.
     const retired = await updateTurnReplyCard(ds, msg.turnId, {
       kind: 'display_retired', ...(msg.message ? { notice: msg.message } : {}), silent: msg.silent === true,
     }, send, { dispatchAttempt: msg.dispatchAttempt, owns });
+    if (retired && owns() && ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
     return retired !== undefined;
   } finally {
-    const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt));
-    // Silent retirement is a DISPLAY-only close after delivery/an earlier
-    // notice; it must not turn that evidence into a native failure assertion.
-    finalizeCotMessage(ds, msg.turnId,
-      msg.silent ? 'completed' : record?.finalDelivered && record.phase === 'completed' ? 'completed' : 'ambiguous',
-      msg.dispatchAttempt);
+    if (owns()) {
+      const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt));
+      // Silent retirement is a DISPLAY-only close after delivery/an earlier
+      // notice; it must not turn that evidence into a native failure assertion.
+      finalizeCotMessage(ds, msg.turnId,
+        msg.silent ? 'completed' : record?.finalDelivered && record.phase === 'completed' ? 'completed' : 'ambiguous',
+        msg.dispatchAttempt);
+    }
   }
 }
 

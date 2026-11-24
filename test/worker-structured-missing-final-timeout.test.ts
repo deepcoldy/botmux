@@ -407,6 +407,30 @@ describe('worker: missing structured final timeout', () => {
     expect(r.scope.send).not.toHaveBeenCalled();
   });
 
+  it('arms on isSessionBusy alone and waits for its actual busy-to-idle edge', () => {
+    const r = workerRig('codex');
+    const clock = vi.spyOn(Date, 'now');
+    let busy = true;
+    r.scope.cliAdapter = { isSessionBusy: () => busy };
+    r.scope.isPromptReady = false;
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    expect(r.scope.send).not.toHaveBeenCalled();
+
+    busy = false;
+    r.scope.isPromptReady = true;
+    r.settle();
+    clock.mockReturnValue(39_999);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    clock.mockReturnValue(40_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
+  });
+
   it('keeps an OSC-only CLI eligible without a screen busy pattern', () => {
     const r = workerRig('codex');
     const clock = vi.spyOn(Date, 'now');
@@ -419,12 +443,13 @@ describe('worker: missing structured final timeout', () => {
     expect(r.queue.peek()).toEqual([]);
   });
 
-  it.each(['tui-prompt', 'hook-review', 'osc-blocked', 'traex-question'] as const)('does not retire an active %s wait', guard => {
+  it.each(['tui-prompt', 'hook-review', 'osc-blocked', 'stuck-page', 'traex-question'] as const)('does not retire an active %s wait', guard => {
     const r = workerRig(guard === 'traex-question' ? 'traex' : 'codex');
     const clock = vi.spyOn(Date, 'now');
     if (guard === 'tui-prompt') r.scope.tuiPromptBlocking = true;
     if (guard === 'hook-review') r.scope.hookReviewInputHold = true;
     if (guard === 'osc-blocked') r.scope.idleDetector.programStatusBlock = () => ({ kind: 'question' });
+    if (guard === 'stuck-page') r.scope.heldStuckPage = () => ({ kind: 'permission' });
     if (guard === 'traex-question') r.scope.traexQuestionHoldsHeldInput = () => true;
     clock.mockReturnValue(0);
     r.settle();
@@ -434,20 +459,48 @@ describe('worker: missing structured final timeout', () => {
     expect(r.scope.send).not.toHaveBeenCalled();
   });
 
-  it('resolves the unified RPC predicate through the shared worker harness and a real lifecycle branch', () => {
+  it.each(['rpcTurnsAwaitingActivation', 'rpcLifecycleFailClosedOwners', 'rpcTerminalHydrationOwners'] as const)(
+    'keeps the generic lifecycle gate blocked by its original %s barrier', guard => {
+      const scope = {
+        traexQuotaPending: undefined,
+        rpcTurnsAwaitingActivation: new Map(),
+        rpcLifecycleFailClosedOwners: new Map(),
+        rpcTerminalHydrationOwners: new Map(),
+        codexBridgeQueue: { peek: () => [], hasBlockingTurn: () => false },
+        isStructuredBridgeLifecycleBlockingCli: () => false,
+      };
+      const blocked = loadWorkerFunction<() => boolean>('hasStructuredLifecycleBlock', scope);
+      expect(blocked()).toBe(false);
+      scope[guard].set('rpc-owner', { generation: 1 });
+      expect(blocked()).toBe(true);
+      scope[guard].clear();
+      expect(blocked()).toBe(false);
+    },
+  );
+
+  it('keeps active/settling owners out of the generic gate and releases a queued RPC owner at final', () => {
+    const turns: Array<{ rpcActive?: boolean; finalText?: string }> = [];
     const scope = {
       traexQuotaPending: undefined,
       rpcTurnsAwaitingActivation: new Map(),
       rpcLifecycleFailClosedOwners: new Map(),
       rpcTerminalHydrationOwners: new Map(),
-      rpcActiveOwners: new Map([['rpc-owner', { generation: 1 }]]),
-      settlingRpcTerminalOwners: new Map(),
-      codexBridgeQueue: { peek: () => [] },
+      // These two extra watchdog-only protections must not expand the shared gate.
+      rpcActiveOwners: new Map([['active-owner', { generation: 1 }]]),
+      settlingRpcTerminalOwners: new Map([['settling-owner', { generation: 1 }]]),
+      codexBridgeQueue: { peek: () => turns, hasBlockingTurn: () => false },
       isStructuredBridgeLifecycleBlockingCli: () => false,
     };
     const blocked = loadWorkerFunction<() => boolean>('hasStructuredLifecycleBlock', scope);
+    expect(blocked()).toBe(false);
+
+    turns.push({ finalText: undefined }, { rpcActive: true, finalText: undefined });
+    expect(blocked()).toBe(true); // an unfinished predecessor does not hide the RPC owner
+    turns[1]!.finalText = 'ready';
+    expect(blocked()).toBe(false);
+    turns[1]!.finalText = undefined;
     expect(blocked()).toBe(true);
-    scope.rpcActiveOwners.clear();
+    turns.length = 0;
     expect(blocked()).toBe(false);
   });
 

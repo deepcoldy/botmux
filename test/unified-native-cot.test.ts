@@ -422,6 +422,81 @@ describe('unified replies with an independent native CoT channel', () => {
     });
   }, 10_000);
 
+  it('does not flush buffered activity into a new card for a silent never-shown display', async () => {
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' };
+    new TurnReplyCardStore(dir).prepareSync(key, { mode: 'unified', chatId: ds.chatId, rootId: ds.session.rootMessageId });
+    queueTurnReplyTools(ds, { turnId: 'om_turn', entries: [{ kind: 'thinking', text: 'buffered before retirement' }] }, send, () => true);
+    await expect(retireReplyCardDisplay(ds, { turnId: 'om_turn', message: '', silent: true }, send, () => true)).resolves.toBe(true);
+    await __testOnlyDrainTurnReplyTools();
+    expect(send).not.toHaveBeenCalled();
+    expect(new TurnReplyCardStore(dir).read(key)).toMatchObject({ phase: 'completed', displayRetired: true });
+  });
+
+  it('replays the pending first POST through silent retirement and then patches the same card', async () => {
+    const healthySend = send.getMockImplementation()!;
+    send.mockRejectedValue(new Error('answer ACK lost'));
+    await expect(updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send)).rejects.toThrow('answer ACK lost');
+    const first = send.mock.calls[0];
+    const failedSends = send.mock.calls.length;
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' };
+    expect(new TurnReplyCardStore(dir).read(key)?.pendingCreate).toBeDefined();
+
+    send.mockImplementation(healthySend);
+    await expect(retireReplyCardDisplay(ds, { turnId: 'om_turn', message: '', silent: true }, send, () => true)).resolves.toBe(true);
+    expect(send).toHaveBeenCalledTimes(failedSends + 1);
+    expect(send.mock.calls.at(-1)!.slice(0, 3)).toEqual(first.slice(0, 3));
+    expect(vi.mocked(updateMessage)).toHaveBeenCalledOnce();
+    const retired = new TurnReplyCardStore(dir).read(key)!;
+    expect(retired).toMatchObject({ messageId: 'om_answer', phase: 'completed', displayRetired: true });
+    expect(retired.pendingCreate).toBeUndefined();
+    expect(retired.pendingPatch).toBeUndefined();
+    expect(retired.publishPending).toBeUndefined();
+  }, 10_000);
+
+  it('does not touch runtime or persistent display state when retirement does not own the turn', async () => {
+    ds.replyCardRunningTurnId = 'om_turn';
+    await expect(retireReplyCardDisplay(ds, { turnId: 'om_turn', message: '', silent: true }, send, () => false)).resolves.toBe(false);
+    expect(ds.replyCardRunningTurnId).toBe('om_turn');
+    expect(send).not.toHaveBeenCalled();
+    expect(new TurnReplyCardStore(dir).read({
+      larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+    })).toBeUndefined();
+  });
+
+  it('leaves the running-turn marker and record intact when ownership is lost at the publication barrier', async () => {
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' };
+    new TurnReplyCardStore(dir).prepareSync(key, { mode: 'unified', chatId: ds.chatId, rootId: ds.session.rootMessageId });
+    const before = new TurnReplyCardStore(dir).read(key);
+    ds.replyCardRunningTurnId = 'om_turn';
+    let checks = 0;
+    const owns = () => ++checks === 1;
+    await expect(retireReplyCardDisplay(ds, { turnId: 'om_turn', message: '', silent: true }, send, owns))
+      .rejects.toThrow('no longer owns delivery');
+    expect(ds.replyCardRunningTurnId).toBe('om_turn');
+    expect(new TurnReplyCardStore(dir).read(key)).toEqual(before);
+    expect(send).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each(['legacy', 'unified'] as const)('finishes an active native CoT bubble as done on silent %s retirement', async mode => {
+    if (mode === 'legacy') {
+      bot.config.replyCardMode = 'legacy';
+      bot.config.cotEnabled = true;
+    } else {
+      bot.config.replyCardNativeCot = true;
+    }
+    worker()(update('still thinking'));
+    await settle();
+    expect(request.mock.calls.some(([req]) => req.method === 'POST' && String(req.url).endsWith('/message_cot'))).toBe(true);
+    await retireReplyCardDisplay(ds, { turnId: 'om_turn', message: '', silent: true }, send, () => true);
+    await settle();
+    expect(events().filter(event => event.type === 'RUN_FINISHED')).toEqual([
+      { type: 'RUN_FINISHED', content: expect.objectContaining({ status: 'done' }) },
+    ]);
+    expect(request.mock.calls.filter(([req]) => req.url.includes('/complete/'))).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it('does not fall back to a warning when silent retirement PATCH fails after a delivered final', async () => {
     await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
     await updateTurnReplyCard(ds, 'om_turn', finalAnswer('Already delivered'), send);

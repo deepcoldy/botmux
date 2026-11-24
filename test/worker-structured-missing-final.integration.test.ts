@@ -182,6 +182,8 @@ describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('structured tran
     });
     await s.waitUntil(() => s.messages.some(msg => msg.type === 'turn_display_retired'
       && msg.turnId === 'om_turn_1'), 'display retirement after the quiet timeout', 45_000);
+    expect(s.messages.find(msg => msg.type === 'turn_display_retired' && msg.turnId === 'om_turn_1'))
+      .toMatchObject({ type: 'turn_display_retired', turnId: 'om_turn_1', silent: true, message: '' });
     await pause(1_000);
     expect(s.notices('om_turn_1')).toEqual([]);
     expect(s.finals('om_turn_1')).toEqual([]);
