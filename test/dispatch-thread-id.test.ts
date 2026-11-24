@@ -9,6 +9,7 @@ import { parseDispatchArgs } from '../src/cli/dispatch-args.js';
 import { readMessageWithinContext } from '../src/im/lark/message-read-context.js';
 import { buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
   buildRepoPrimeText, parseDispatchBotSpec, resolveSendTarget } from '../src/core/dispatch.js';
+import { createDispatchReportBinding, hasVerifiedDispatchReportBindingForCaller } from '../src/core/dispatch-report-binding.js';
 
 function extract(path: string, names: string[]): string {
   const source = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
@@ -40,6 +41,13 @@ function harness(mode: Mode, options: {
   consentPending?: boolean;
   consentDenied?: boolean;
   taskTreeCardEnabled?: boolean;
+  sourceRootMessageId?: string;
+  sourceScope?: 'thread' | 'chat';
+  sourceCurrentReplyTarget?: { rootMessageId?: string; turnId?: string };
+  sourceReplyTargets?: Record<string, { rootMessageId?: string; turnId?: string }>;
+  envTurnId?: string;
+  dispatchRegistry?: Record<string, unknown>;
+  bindingSecret?: string;
   resolveBotApps?: (receiver: string, chatId: string, appIds: string[]) => Promise<unknown>;
 } = {}) {
   const root = mode === 'into' ? 'om_existing' : 'om_seed';
@@ -102,7 +110,7 @@ function harness(mode: Mode, options: {
     buildRepoPrimeText, parseDispatchBotSpec, resolveSendTarget, pickTurnReplyTarget,
     isSilentMessageListenerSession, messageListenerSendBlocked,
     resolveSessionContext: () => undefined,
-    process: { env: { SESSION_DATA_DIR: '/isolated/data' }, exitCode: 0,
+    process: { env: { SESSION_DATA_DIR: '/isolated/data', ...(options.envTurnId ? { BOTMUX_TURN_ID: options.envTurnId } : {}) }, exitCode: 0,
       exit: (code: number) => { throw new Error('exit:' + code + '\n' + stderr.join('\n')); } },
     console: { log: (text: string) => stdout.push(text), error: (text: string) => stderr.push(text) },
     AbortSignal: { timeout },
@@ -119,9 +127,19 @@ function harness(mode: Mode, options: {
     // Extracted cmdDispatch checks for a group-secretary patrol turn; these
     // harness turns are ordinary bot turns, so no patrol root applies.
     parseSecretaryPatrolRoot: () => undefined,
-    loadSessions: () => new Map([['source', { sessionId: 'source', chatId: 'oc_chat', larkAppId: 'cli_source' }]]),
+    loadSessions: () => new Map([['source', {
+      sessionId: 'source', chatId: 'oc_chat', larkAppId: 'cli_source',
+      ...(options.sourceScope ? { scope: options.sourceScope } : {}),
+      ...(options.sourceRootMessageId ? { rootMessageId: options.sourceRootMessageId } : {}),
+      ...(options.sourceCurrentReplyTarget ? { currentReplyTarget: options.sourceCurrentReplyTarget } : {}),
+      ...(options.sourceReplyTargets ? { replyTargets: options.sourceReplyTargets } : {}),
+    }]]),
     requireSessionById: async (sid: string) => ({
       sessionId: sid, chatId: 'oc_chat', larkAppId: 'cli_source',
+      ...(options.sourceScope ? { scope: options.sourceScope } : {}),
+      ...(options.sourceRootMessageId ? { rootMessageId: options.sourceRootMessageId } : {}),
+      ...(options.sourceCurrentReplyTarget ? { currentReplyTarget: options.sourceCurrentReplyTarget } : {}),
+      ...(options.sourceReplyTargets ? { replyTargets: options.sourceReplyTargets } : {}),
     }),
     envPinnedRiffBot: undefined,
     assertProjectDispatchPolicy: vi.fn(async () => {}),
@@ -129,7 +147,11 @@ function harness(mode: Mode, options: {
     resolveDataDir: () => '/isolated/data', join: (...parts: string[]) => parts.join('/'),
     // Host-shaped caller: no isolation channel/relay, so no origin claim to freeze.
     readManagedOriginCapability: () => null,
-    readFileSync: () => '[]',
+    readDispatchReportBindingSecret: () => options.bindingSecret,
+    hasVerifiedDispatchReportBindingForCaller,
+    readFileSync: (path: string) => path.endsWith('orchestrate-dispatch.json')
+      ? JSON.stringify(options.dispatchRegistry ?? {})
+      : '[]',
     waitForExactDispatchAcceptance: vi.fn(async () => ({
       acceptedBotAppIds: options.acceptance === 'accepted' ? ['cli_target'] : [],
       missingBotAppIds: options.acceptance === 'accepted' ? [] : ['cli_target'],
@@ -341,5 +363,125 @@ describe('dispatch --bot-app live membership failures', () => {
     const stderr = h.stderr.join('\n');
     expect(stderr).toContain(String(body.code));
     expect(stderr).not.toContain('BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS');
+  });
+});
+
+describe('dispatch --into completion protocol gating', () => {
+  const SECRET = 'test-into-binding-secret';
+  const kickoffText = (h: ReturnType<typeof harness>): string => {
+    const content = h.replyMessage.mock.calls[0]?.[2] as string;
+    const parsed = JSON.parse(content) as { zh_cn: { content: Array<Array<{ tag: string; text?: string }>> } };
+    return parsed.zh_cn.content.flat().filter(node => node.tag === 'text').map(node => node.text).join('\n');
+  };
+
+  it('omits botmux report --dispatch-root when --into targets an unregistered topic', async () => {
+    const h = harness('into', { acceptance: 'accepted', bindingSecret: SECRET, dispatchRegistry: {} });
+    await h.run();
+    const text = kickoffText(h);
+    expect(text).toContain('完成任务');
+    expect(text).not.toContain('botmux report --dispatch-root');
+    expect(text).not.toContain('不要在本话题 @ 来源 bot');
+  });
+
+  it('omits botmux report --dispatch-root when --into targets a topic bound to another orchestrator', async () => {
+    const foreignBinding = createDispatchReportBinding(SECRET, {
+      dispatchRoot: 'om_existing',
+      targetLarkAppId: 'cli_other_lead',
+      targetSessionId: 'other-session',
+      targetChatId: 'oc_chat',
+      targetScope: 'thread',
+      sourceName: '其他编排',
+      issuedAt: '2026-11-24T00:00:00.000Z',
+    });
+    const h = harness('into', {
+      acceptance: 'accepted',
+      bindingSecret: SECRET,
+      dispatchRegistry: { om_existing: { reportBinding: foreignBinding } },
+    });
+    await h.run();
+    expect(kickoffText(h)).not.toContain('botmux report --dispatch-root');
+  });
+
+  it('keeps botmux report --dispatch-root when --into targets a verified dispatch bound to this caller', async () => {
+    const ownBinding = createDispatchReportBinding(SECRET, {
+      dispatchRoot: 'om_existing',
+      targetLarkAppId: 'cli_source',
+      targetSessionId: 'source',
+      targetChatId: 'oc_chat',
+      targetScope: 'thread',
+      sourceName: '子任务',
+      issuedAt: '2026-11-24T00:00:00.000Z',
+    });
+    const h = harness('into', {
+      acceptance: 'accepted',
+      bindingSecret: SECRET,
+      dispatchRegistry: { om_existing: { reportBinding: ownBinding } },
+    });
+    await h.run();
+    expect(kickoffText(h)).toContain('botmux report --dispatch-root om_existing');
+  });
+
+  it('omits legacy report protocol when --into --bot stays in the caller own topic', async () => {
+    const h = harness('into', { sourceRootMessageId: 'om_existing' });
+    await h.run();
+    const text = kickoffText(h);
+    expect(text).toContain('完成任务');
+    expect(text).not.toContain('botmux report');
+    expect(text).not.toContain('不要在本话题 @ 主bot');
+  });
+
+  it('keeps botmux report --dispatch-root in chat-scope even when currentReplyTarget or active turn points to the bound topic', async () => {
+    const chatBinding = createDispatchReportBinding(SECRET, {
+      dispatchRoot: 'om_existing',
+      targetLarkAppId: 'cli_source',
+      targetSessionId: 'source',
+      targetChatId: 'oc_chat',
+      targetScope: 'chat',
+      sourceName: '群编排子任务',
+      issuedAt: '2026-11-24T00:00:00.000Z',
+    });
+    const hQueuedOverwrite = harness('into', {
+      acceptance: 'accepted',
+      sourceScope: 'chat',
+      envTurnId: 'turn-a',
+      sourceReplyTargets: { 'turn-a': { rootMessageId: 'om_topic_a', turnId: 'turn-a' } },
+      sourceCurrentReplyTarget: { rootMessageId: 'om_existing', turnId: 'turn-b' },
+      bindingSecret: SECRET,
+      dispatchRegistry: { om_existing: { reportBinding: chatBinding } },
+    });
+    await hQueuedOverwrite.run();
+    expect(kickoffText(hQueuedOverwrite)).toContain('botmux report --dispatch-root om_existing');
+
+    const hSameTopicActive = harness('into', {
+      acceptance: 'accepted',
+      sourceScope: 'chat',
+      envTurnId: 'turn-b',
+      sourceReplyTargets: { 'turn-b': { rootMessageId: 'om_existing', turnId: 'turn-b' } },
+      sourceCurrentReplyTarget: { rootMessageId: 'om_existing', turnId: 'turn-b' },
+      bindingSecret: SECRET,
+      dispatchRegistry: { om_existing: { reportBinding: chatBinding } },
+    });
+    await hSameTopicActive.run();
+    expect(kickoffText(hSameTopicActive)).toContain('botmux report --dispatch-root om_existing');
+  });
+
+  it('uses BOTMUX_TURN_ID rather than a later queued currentReplyTarget for chat-scope legacy --into', async () => {
+    const hSameTurn = harness('into', {
+      sourceScope: 'chat',
+      envTurnId: 'turn-a',
+      sourceReplyTargets: { 'turn-a': { rootMessageId: 'om_existing', turnId: 'turn-a' } },
+      sourceCurrentReplyTarget: { rootMessageId: 'om_other', turnId: 'turn-b' },
+    });
+    await hSameTurn.run();
+    expect(kickoffText(hSameTurn)).not.toContain('botmux report');
+
+    const hCrossTurn = harness('into', {
+      sourceScope: 'chat',
+      envTurnId: 'turn-a',
+      sourceReplyTargets: { 'turn-a': { rootMessageId: 'om_topic_a', turnId: 'turn-a' } },
+      sourceCurrentReplyTarget: { rootMessageId: 'om_existing', turnId: 'turn-b' },
+    });
+    await hCrossTurn.run();
+    expect(kickoffText(hCrossTurn)).toContain('--legacy-dispatch');
   });
 });

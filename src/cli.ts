@@ -338,7 +338,12 @@ import {
 import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
 import { scheduleIpcErrorMessage } from './core/schedule-ipc-errors.js';
-import { DISPATCH_REPORT_REGISTER_ROUTE, readDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './core/dispatch-report-binding.js';
+import {
+  DISPATCH_REPORT_REGISTER_ROUTE,
+  hasVerifiedDispatchReportBindingForCaller,
+  readDispatchReportBindingSecret,
+  resolveVerifiedDispatchReportTarget,
+} from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus, type CliPermissionOutcome } from './core/ask-types.js';
 import { PERMISSION_ALLOW_KEY, type PermissionOutcomeWatcher } from './core/ask-hook/types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
@@ -16818,6 +16823,30 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('reply 仅支持从真人话题新建单个项目 Bot 的委托；已有派单继续使用原投递方式。');
     process.exit(1);
   }
+  const hasVerifiedIntoBinding = (() => {
+    if (!intoRoot || standby) return false;
+    try {
+      const secret = readDispatchReportBindingSecret(resolveDataDir()) ?? '';
+      if (!secret) return false;
+      const parsed: unknown = JSON.parse(readFileSync(join(resolveDataDir(), 'orchestrate-dispatch.json'), 'utf-8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+      return hasVerifiedDispatchReportBindingForCaller({
+        registry: parsed as Record<string, unknown>,
+        secret,
+        dispatchRoot: intoRoot,
+        callerAppId: appId,
+        callerSessionId: sid,
+        callerChatId: s.chatId,
+        callerScope: s.scope ?? 'thread',
+      });
+    } catch {
+      return false;
+    }
+  })();
+  if (intoRoot && !standby && resultDelivery !== 'relay' && !hasVerifiedIntoBinding) {
+    console.error(`--result-delivery ${resultDelivery} 仅适用于当前会话已注册的派单话题；${intoRoot} 没有指向本会话的有效派单绑定。`);
+    process.exit(1);
+  }
 
   let requestedLaunch: { model?: string; reasoningEffort?: CodexReasoningEffort } | undefined;
   let effectiveRuntime: { model: string; reasoningEffort?: CodexReasoningEffort } | undefined;
@@ -16896,11 +16925,25 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     sameTopicSendEnabled,
     resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay' | 'reply',
   });
+  // `--into` 验签先行：命中指向本调用方的已签名绑定时保留精确回报协议；
+  // 未绑定时，仅跨话题 legacy `--bot` 保留兼容协议，同话题或 `--bot-app` 不再追加无效的 `--dispatch-root`。
+  // chat-scope 仅按本轮精确 turnId（优先祖先上下文，缺失时回退宿主注入的 BOTMUX_TURN_ID）判定同话题，
+  // 不借用可能已被后续入队消息覆盖的 currentReplyTarget。
+  const exactChatTurnId = dispatchOrigin.sessionId === s.sessionId
+    ? (dispatchTurnId ?? (process.env.BOTMUX_TURN_ID?.trim() || undefined))
+    : undefined;
+  const currentTopicRoot = (s.scope ?? 'thread') === 'chat'
+    ? (exactChatTurnId ? pickTurnReplyTarget(s, exactChatTurnId)?.rootMessageId : undefined)
+    : s.rootMessageId;
+  const isSameTopicInto = !!intoRoot && currentTopicRoot === intoRoot;
+  const appendIntoCompletionProtocol = !!intoRoot && !standby && (
+    hasVerifiedIntoBinding || (!exactReportRootEnabled && resultDelivery === 'relay' && !isSameTopicInto)
+  );
   let built;
   try {
     built = buildDispatchMessages({
       title: title.trim() || '子项目',
-      brief: intoRoot && !standby ? briefWithCompletionProtocol(intoRoot) : brief,
+      brief: appendIntoCompletionProtocol ? briefWithCompletionProtocol(intoRoot!) : brief,
       bots,
     });
   } catch (err: any) {
