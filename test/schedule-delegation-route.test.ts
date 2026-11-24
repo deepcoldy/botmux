@@ -16,7 +16,7 @@ import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-co
 import { capabilityOn, parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { capabilityOfTool } from '../src/core/identity-policy.js';
 import { validateScheduleChildOneShot } from '../src/core/schedule-child-one-shot.js';
-import { countLiveTalkerTasks, talkerSchedulePolicy, talkerScheduleScopeError } from '../src/core/schedule-talker.js';
+import { countLiveTalkerTasks, effectiveTalkerSchedulePolicy, talkerSchedulePolicy, talkerScheduleScopeError } from '../src/core/schedule-talker.js';
 import {
   assertScheduledAuthorityCurrent,
   authorizeScheduledTurn,
@@ -129,6 +129,11 @@ function harness(overrides: Record<string, unknown> = {}) {
     scheduler: { parseSchedule, commitDelegatedTask, addTask: vi.fn((task: unknown) => task) },
     assistantScheduleCreatorAllowed: vi.fn((): boolean => true),
   };
+  // Personal-assistant ownership of a chat: nobody owns one unless a test says so.
+  scope.isAssistantOwnerOfChat = vi.fn((_app: string, _chat: string, _type: string, _openId?: string): boolean => false);
+  scope.talkerSchedulePolicyFor = (appId: string, target: { chatId: string; chatType: string; openId?: string }) =>
+    effectiveTalkerSchedulePolicy(talkerSchedulePolicy(scope.getBot(appId).config),
+      scope.isAssistantOwnerOfChat(appId, target.chatId, target.chatType, target.openId));
   // The real shared admission rule, over the harness's replaceable lookups.
   scope.resolveRunAs = (appId: string, chatId: string, runAs: unknown) => resolveRunAs(appId, chatId, runAs, {
     resolveAllowedUsersWithMap: (...args) => scope.resolveAllowedUsersWithMap(...args),
@@ -746,18 +751,24 @@ function directHumanHarness() {
 }
 
 describe('assistant-mode schedule creation', () => {
-  it('lets the assistant owner create a task under the ordinary admission rules', async () => {
+  it('lets the assistant owner who is also an administrator create on the ordinary path', async () => {
     const owner = directHumanHarness();
     owner.ds.session.assistantOwnerOpenId = 'ou_user_target';
     expect(await owner.run()).toMatchObject({ status: 201 });
-    expect(owner.scope.scheduler.addTask).toHaveBeenCalledTimes(1);
-    // Narrowing only: an owner who is neither an administrator nor admitted by
-    // the talker policy is still refused, so fire-time and management checks
-    // never meet a task they cannot authorize.
-    const plain = directHumanHarness();
-    plain.ds.session.assistantOwnerOpenId = 'ou_user_target';
-    plain.scope.getDashboardAdminOpenIds = () => [];
-    expect(await plain.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_operator_denied' } });
+    expect(owner.scope.scheduler.addTask).toHaveBeenCalledWith(expect.not.objectContaining({ ownerAccess: 'talk' }), expect.anything());
+  });
+
+  it('admits a non-administrator owner on talker terms without the bot-level switch', async () => {
+    const h = directHumanHarness();
+    h.ds.session.assistantOwnerOpenId = 'ou_user_target';
+    h.scope.getDashboardAdminOpenIds = () => [];
+    h.body.task.executionPosition = 'top-level';
+    delete h.body.task.rootMessageId;
+    h.scope.isAssistantOwnerOfChat = vi.fn((_app: string, _chat: string, _type: string, openId?: string) =>
+      openId === 'ou_user_target');
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerAccess: 'talk' } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ ownerAccess: 'talk' }), TALKER_TURN);
+    expect(h.scope.isAssistantOwnerOfChat).toHaveBeenCalledWith('cli_target', 'oc_chat', 'group', 'ou_user_target');
   });
 
   it('refuses a non-owner who is not a bot administrator, and leaves administrators alone', async () => {

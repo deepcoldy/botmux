@@ -718,7 +718,7 @@ import {
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { matchingScheduleBotGrant, botScheduleAuthority, assertScheduleBotGrantActive } from './core/schedule-bot-grant.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
-import { authorizeTalkerScheduleRun, countLiveTalkerTasks, isTalkerScheduledTask, talkerScheduleChatType, talkerSchedulePolicy, talkerScheduleScopeError } from './core/schedule-talker.js';
+import { authorizeTalkerScheduleRun, countLiveTalkerTasks, effectiveTalkerSchedulePolicy, isTalkerScheduledTask, talkerScheduleChatType, talkerSchedulePolicy, talkerScheduleScopeError } from './core/schedule-talker.js';
 import { assertScheduledAuthorityCurrent, authorizeScheduledTurn, isManualScheduleRun, isManualScheduledTurn, parseScheduledTurnId, readScheduledTaskFromAuthority } from './core/scheduled-turn-provenance.js';
 import { validateScheduleChildOneShot } from './core/schedule-child-one-shot.js';
 import {
@@ -1226,7 +1226,7 @@ import { addBotToChat, isInChat, listChatMemberDisplays, addUsersToChatByOpenId 
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
 import { isValidAssistantOpenId, resolveAssistantOwnerOpenId, setAssistantOwnerChangedListener } from './core/assistant-mode.js';
 import { getAssistantOwner, markAssistantOwnerLeft, setAssistantOwner } from './services/assistant-owner-store.js';
-import { assistantScheduleCreatorAllowed, assistantSessionStillOwned, resolveAssistantSpawn } from './core/assistant-spawn.js';
+import { assistantScheduleCreatorAllowed, assistantSessionStillOwned, isAssistantOwnerOfChat, resolveAssistantSpawn } from './core/assistant-spawn.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
 import { scheduleSessionGroupTitle, subscribeSessionGroupTitles } from './services/session-group-title.js';
 import { hasPendingGroupAutoTitle, scheduleGroupAutoTitle } from './services/group-auto-title.js';
@@ -4919,12 +4919,27 @@ function delegatedScheduleRuntimeDeps(appId: string) {
   };
 }
 
+/** The talker policy as it applies to one person in one chat: the bot-level
+ *  switch, or — in personal-assistant mode — being that chat's current owner,
+ *  which admits the owner on the same narrow talker terms without the switch.
+ *  Read live, so a reclaimed chat or a mode change stops the next fire. */
+function talkerSchedulePolicyFor(
+  appId: string,
+  target: { chatId: string; chatType: 'group' | 'p2p'; openId: string | undefined },
+) {
+  return effectiveTalkerSchedulePolicy(talkerSchedulePolicy(getBot(appId).config),
+    isAssistantOwnerOfChat(appId, target.chatId, target.chatType, target.openId));
+}
+
 /** Live re-admission inputs for a talker-created task (core/schedule-talker):
  *  the bot switch and talk evaluation are read fresh on every call, so turning
  *  the switch off or revoking the person's access stops the next fire. */
-function talkerScheduleRuntimeDeps(appId: string) {
+function talkerScheduleRuntimeDeps(
+  appId: string,
+  target: { chatId: string; chatType: 'group' | 'p2p'; openId: string | undefined },
+) {
   return {
-    policy: () => talkerSchedulePolicy(getBot(appId).config),
+    policy: () => talkerSchedulePolicyFor(appId, target),
     canTalk: (chatId: string, openId: string, unionId: string, chatType: 'group' | 'p2p') =>
       evaluateTalk(appId, chatId, openId, undefined, unionId, chatType).allowed,
     resolveTargetOpenId: async (unionId: string) => {
@@ -5101,9 +5116,10 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
   // refuses the turn outright rather than offering the task to a claimant.
   let identity: ScheduledRunIdentity;
   if (isTalkerScheduledTask(task)) {
+    const talkerTarget = { chatId: ds.chatId, chatType: ds.chatType === 'p2p' ? 'p2p' as const : 'group' as const };
     const admitted = await authorizeTalkerScheduleRun(task, authority,
-      talkerScheduleRuntimeDeps(ds.larkAppId),
-      { chatId: ds.chatId, chatType: ds.chatType === 'p2p' ? 'p2p' : 'group' });
+      talkerScheduleRuntimeDeps(ds.larkAppId, { ...talkerTarget, openId: authority.controlOpenId }),
+      talkerTarget);
     if (reauthorizeTalkerOnly) {
       assertScheduledAuthorityCurrent(authority, scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId),
         { turnId, allowCompleted: true });
@@ -5136,9 +5152,10 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     // Credential minting/publication can wait on external providers. Re-admit
     // after the last publication await too; assertScheduledAuthorityCurrent
     // only detects task edits, not a policy/talk revocation during that wait.
+    const talkerTarget = { chatId: ds.chatId, chatType: ds.chatType === 'p2p' ? 'p2p' as const : 'group' as const };
     await authorizeTalkerScheduleRun(task, authority,
-      talkerScheduleRuntimeDeps(ds.larkAppId),
-      { chatId: ds.chatId, chatType: ds.chatType === 'p2p' ? 'p2p' : 'group' });
+      talkerScheduleRuntimeDeps(ds.larkAppId, { ...talkerTarget, openId: authority.controlOpenId }),
+      talkerTarget);
   }
   assertScheduledAuthorityCurrent(authority, scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId),
     { turnId, allowCompleted: true });
@@ -10726,8 +10743,10 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       controlUnionId = caller!.requestUserUnionId
         ?? (controlOpenId ? await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined : undefined);
       grantId = `direct:${sessionId}:${turnId}`;
+      const talkerPolicy = talkerSchedulePolicyFor(ds.larkAppId,
+        { chatId: ds.chatId, chatType: ds.chatType === 'p2p' ? 'p2p' : 'group', openId: controlOpenId });
       if (controlOpenId && !getDashboardAdminOpenIds(ds.larkAppId).includes(controlOpenId)
-        && talkerSchedulePolicy(getBot(ds.larkAppId).config).enabled) {
+        && talkerPolicy.enabled) {
         if (!controlUnionId) {
           return jsonRes(res, 403, { ok: false, error: 'schedule_talker_identity_unresolved' });
         }
@@ -10748,7 +10767,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         // retry look like a new over-quota request.
         const existing = task.id ? scheduleAuthorityStore.getRecord(ds.larkAppId, task.id) : undefined;
         if (!existing && countLiveTalkerTasks(scheduleAuthorityStore.listRecords(ds.larkAppId), controlOpenId)
-          >= talkerSchedulePolicy(getBot(ds.larkAppId).config).maxTasksPerUser) {
+          >= talkerPolicy.maxTasksPerUser) {
           return jsonRes(res, 403, { ok: false, error: 'schedule_talker_task_limit' });
         }
         talkerOwner = true;
@@ -10888,9 +10907,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       sourceSessionId = delegation.sourceSessionId;
     }
     // 个人助理模式：会话归主人一人，非管理员里只有主人能在里面创建定时任务；bot
-    // 管理员不受此限（与 Dashboard 一样视为宿主管理面）。这只收窄不放宽：主人仍须过
-    // 下面的常规准入（管理员，或开了 scheduleCreateByTalkers 的对话用户），任务的
-    // 执行期复核与管理权限沿用原规则。闸放在 daemon 侧、对每条创建路径（真人直发、
+    // 管理员不受此限（与 Dashboard 一样视为宿主管理面）。非管理员的主人不需要
+    // scheduleCreateByTalkers 开关，按对话用户任务（ownerAccess:'talk'）的规则准入、
+    // 执行期复核与管理（见 talkerSchedulePolicyFor）。闸放在 daemon 侧、对每条创建路径（真人直发、
     // Remote Runner、bot 转授、定时子任务）的最终控制人生效，且来源会话与目标 chat
     // 两头都要是这个人的——否则 --chat-id 能把任务投进别人的助理群、在对方目录里
     // 执行。沙盒里的 CLI 检查可被会话内进程绕过，不能作数。
@@ -10912,7 +10931,8 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     }
     // Re-read after the identity/membership lookups: a switch or talk grant
     // revoked meanwhile commits nothing.
-    if (talkerOwner && !talkerSchedulePolicy(getBot(ds.larkAppId).config).enabled) {
+    if (talkerOwner && !talkerSchedulePolicyFor(ds.larkAppId,
+      { chatId: ds.chatId, chatType: ds.chatType === 'p2p' ? 'p2p' : 'group', openId: controlOpenId }).enabled) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_talker_create_disabled' });
     }
     if (talkerOwner && !evaluateTalk(ds.larkAppId, ds.chatId, controlOpenId, undefined, controlUnionId, ds.chatType).allowed) {
@@ -11205,7 +11225,8 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     && !!authority.controlUnionId
     && (caller!.requestUserUnionId === undefined || caller!.requestUserUnionId === authority.controlUnionId)
     && authority.task.chatId === ds!.chatId
-    && talkerSchedulePolicy(getBot(ds!.larkAppId).config).enabled;
+    && talkerSchedulePolicyFor(ds!.larkAppId,
+      { chatId: ds!.chatId, chatType: ds!.chatType === 'p2p' ? 'p2p' : 'group', openId: caller!.requestUserOpenId }).enabled;
   let providerActorAdmin = false;
   if (providerActor) {
     const providerTurnId = ds!.managedTurnOrigin?.turnId;
@@ -37770,8 +37791,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     } else if (authority.kind === 'direct' && isTalkerScheduledTask(authority.task)) {
       // A talk-only creator's task: the bot switch, the person's talk access
       // and group membership are re-checked before the run may enter a queue.
-      await authorizeTalkerScheduleRun(task, authority, talkerScheduleRuntimeDeps(effectiveAppId),
-        { chatId: task.chatId, chatType: talkerScheduleChatType(task) });
+      const talkerTarget = { chatId: task.chatId, chatType: talkerScheduleChatType(task) };
+      await authorizeTalkerScheduleRun(task, authority,
+        talkerScheduleRuntimeDeps(effectiveAppId, { ...talkerTarget, openId: authority.controlOpenId }),
+        talkerTarget);
     }
     let targetResults: ScheduleRunTargetResult[] | undefined;
     let precondition: ScheduledTaskPreconditionObservation = {

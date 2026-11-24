@@ -54,6 +54,19 @@ export function assistantScheduleCreatorAllowed(
   return spawn.kind === 'owner' && !!openId && spawn.openId === openId;
 }
 
+/** 助理模式开着、且 `openId` 正是该 chat 当前的主人。主人在自己的 chat 里建定时任务不需要
+ *  bot 级 scheduleCreateByTalkers 开关——按对话用户任务的规则（ownerAccess:'talk'）收着。 */
+export function isAssistantOwnerOfChat(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p',
+  openId: string | undefined,
+): boolean {
+  if (!openId) return false;
+  const spawn = resolveAssistantSpawn(larkAppId, chatId, chatType, openId);
+  return spawn.kind === 'owner' && spawn.openId === openId;
+}
+
 /** 一个已存在的会话还能不能按当前归属继续用（恢复 / 话题延续）：模式关着不管；模式开着时
  *  会话的 owner 必须正是当前解析出的 owner。 */
 export function assistantSessionStillOwned(

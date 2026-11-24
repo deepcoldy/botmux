@@ -6,8 +6,7 @@ import {
   isTalkerScheduledTask,
   talkerScheduleChatType,
   talkerSchedulePolicy,
-  talkerScheduleScopeError,
-} from '../src/core/schedule-talker.js';
+  talkerScheduleScopeError, effectiveTalkerSchedulePolicy } from '../src/core/schedule-talker.js';
 import type { ScheduleAuthorityRecord } from '../src/services/schedule-authority-store.js';
 import type { ScheduledTask } from '../src/types.js';
 
@@ -233,5 +232,15 @@ describe('authorizeTalkerScheduleRun', () => {
     });
     await expect(authorizeTalkerScheduleRun(task, record(task), d)).rejects.toThrow(/can no longer talk/);
     expect(checks).toBe(2);
+  });
+});
+
+describe('effectiveTalkerSchedulePolicy', () => {
+  it('turns the policy on for an assistant owner only, keeping the quota', () => {
+    const off = { enabled: false, maxTasksPerUser: 3 };
+    expect(effectiveTalkerSchedulePolicy(off, false)).toEqual(off);
+    expect(effectiveTalkerSchedulePolicy(off, true)).toEqual({ enabled: true, maxTasksPerUser: 3 });
+    const on = { enabled: true, maxTasksPerUser: 5 };
+    expect(effectiveTalkerSchedulePolicy(on, false)).toEqual(on);
   });
 });
