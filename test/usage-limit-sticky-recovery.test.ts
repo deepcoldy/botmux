@@ -781,10 +781,13 @@ describe('usage-limit sticky state self-heal', () => {
     const ds = makeDs({ worker, workerPort: 9999 });
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    worker.emit('message', { type: 'screen_update', content: '429 Too Many Requests', status: 'limited', usageLimit: rateLimitState() });
+    // Generic fresh-verdict coverage: the synthetic 5-10 min cooldown has its
+    // own first-deadline pinning rule, covered separately in worker-usage-limit-dedup.
+    worker.emit('message', { type: 'screen_update', content: '429 Too Many Requests', status: 'limited',
+      usageLimit: { ...rateLimitState(), retryLabel: '1m' } });
     await flush();
 
-    const fresh = rateLimitState();
+    const fresh = { ...rateLimitState(), retryLabel: '1m' };
     worker.emit('message', { type: 'screen_update', content: '429 Too Many Requests', status: 'working', usageLimit: fresh });
     await flush();
 
