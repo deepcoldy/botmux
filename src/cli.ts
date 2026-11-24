@@ -1096,11 +1096,18 @@ async function finishRegisteredAppSetup(
   appSecret: string,
   brand: Brand,
   web: typeof import('./setup/open-platform-automation.js').automateOpenPlatformSetup,
-  options: { quiet?: boolean; scopeManifest?: import('./setup/open-platform-automation.js').ScopeManifest },
+  options: {
+    quiet?: boolean;
+    scopeManifest?: import('./setup/open-platform-automation.js').ScopeManifest;
+    excludeScopes?: import('./setup/approval-scope-resolver.js').ApprovalDeferredScopeBuckets;
+    autoAvoidApproval?: boolean;
+  },
 ) {
   const { completeRegisteredApp, createRegistrationOptions } = await import('./setup/registration-manifest.js');
   return completeRegisteredApp({ appId, appSecret, brand }, createRegistrationOptions(undefined, options.scopeManifest).addons!, web, {
     disableQrLogin: options.quiet,
+    ...(options.excludeScopes ? { excludeScopes: options.excludeScopes } : {}),
+    autoAvoidApproval: options.autoAvoidApproval ?? true,
     onStatus: message => { process.stderr.write(`${message}\n`); },
   });
 }

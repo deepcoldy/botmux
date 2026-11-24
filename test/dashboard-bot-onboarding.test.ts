@@ -3052,4 +3052,31 @@ describe('BotOnboardingManager', () => {
 
     rmSync(dir, { recursive: true, force: true });
   });
+
+  it('forwards autoAvoidApproval=false through ordinary SDK registration completion', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-sdk-optout-'));
+    const completeRegisteredApp = vi.fn(async (..._args: any[]) => autoOk());
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_sdk_optout',
+        appSecret: 's',
+        brand: 'feishu',
+        userOpenId: 'ou_sdk_optout',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      completeRegisteredApp,
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({ registrationMode: 'sdk', autoAvoidApproval: false });
+    await job.done;
+
+    expect(completeRegisteredApp).toHaveBeenCalledOnce();
+    expect(completeRegisteredApp.mock.calls[0]?.[3]).toEqual(expect.objectContaining({
+      autoAvoidApproval: false,
+    }));
+    rmSync(dir, { recursive: true, force: true });
+  });
 });

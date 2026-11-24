@@ -375,9 +375,12 @@ export async function resolveAutoApprovedScopes(
   const canToggleRefreshToken =
     opts.initialAllowRefreshToken === true && typeof opts.setAllowRefreshToken === 'function';
 
-  // Exact live draft state tracker (updated only after each API call succeeds).
+  // Live draft tracker, updated only after acknowledged API calls. A rejected write may
+  // still have reached Feishu, so the restore path separately tracks uncertain mutations.
   const currentlyApplied = new Set<string>(allCandidates.map(candidateScopeKey));
   let currentRefreshToken = opts.initialAllowRefreshToken;
+  let draftMutationUncertain = false;
+  let refreshTokenMutationUncertain = false;
   let probeCount = 0;
   let lastHumanApprovers = initialApprovers;
   let probeUnavailableHit = false;
@@ -399,11 +402,22 @@ export async function resolveAutoApprovedScopes(
       }
     }
     if (toRemove.length > 0) {
-      await opts.removeScopes(toRemove);
+      try {
+        await opts.removeScopes(toRemove);
+      } catch (err) {
+        // The server may have applied the deletion before the response was lost.
+        draftMutationUncertain = true;
+        throw err;
+      }
       for (const s of toRemove) currentlyApplied.delete(candidateScopeKey(s));
     }
     if (toAdd.length > 0) {
-      await opts.addScopes(toAdd);
+      try {
+        await opts.addScopes(toAdd);
+      } catch (err) {
+        draftMutationUncertain = true;
+        throw err;
+      }
       for (const s of toAdd) currentlyApplied.add(candidateScopeKey(s));
       if (opts.onScopesAdded) await opts.onScopesAdded(toAdd);
     }
@@ -411,21 +425,43 @@ export async function resolveAutoApprovedScopes(
 
   const setRefreshToken = async (enabled: boolean): Promise<void> => {
     if (!opts.setAllowRefreshToken || currentRefreshToken === enabled) return;
-    await opts.setAllowRefreshToken(enabled);
+    try {
+      await opts.setAllowRefreshToken(enabled);
+    } catch (err) {
+      refreshTokenMutationUncertain = true;
+      throw err;
+    }
     currentRefreshToken = enabled;
   };
 
   const restoreOriginalBestEffort = async (): Promise<boolean> => {
     let restored = true;
-    if (opts.initialAllowRefreshToken === true && currentRefreshToken === false) {
+    if (
+      opts.setAllowRefreshToken
+      && opts.initialAllowRefreshToken !== undefined
+      && (refreshTokenMutationUncertain || currentRefreshToken !== opts.initialAllowRefreshToken)
+    ) {
       try {
-        await setRefreshToken(true);
+        // Do not use the tracked value as a precondition after an ambiguous write:
+        // the live setting may already differ from the last acknowledged snapshot.
+        await opts.setAllowRefreshToken(opts.initialAllowRefreshToken);
+        currentRefreshToken = opts.initialAllowRefreshToken;
+        refreshTokenMutationUncertain = false;
       } catch {
         restored = false;
       }
     }
     try {
-      await syncDraft(new Set(allCandidates.map(candidateScopeKey)));
+      if (draftMutationUncertain) {
+        // scope/update add is idempotent. Re-add every original candidate rather than
+        // trusting a local diff after a delete may have succeeded without a response.
+        await opts.addScopes(allCandidates);
+        for (const scope of allCandidates) currentlyApplied.add(candidateScopeKey(scope));
+        if (opts.onScopesAdded) await opts.onScopesAdded(allCandidates);
+        draftMutationUncertain = false;
+      } else {
+        await syncDraft(new Set(allCandidates.map(candidateScopeKey)));
+      }
     } catch {
       restored = false;
     }

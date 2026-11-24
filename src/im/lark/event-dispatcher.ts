@@ -56,7 +56,8 @@ import {
   buildScopeDeepLink,
   type RequiredScope,
 } from '../../setup/verify-permissions.js';
-import type { ApprovalDeferredScopeBuckets } from '../../setup/approval-scope-resolver.js';
+import { buildApprovalConsoleUrl, type ApprovalDeferredScopeBuckets, type DeferredApprovalScope } from '../../setup/approval-scope-resolver.js';
+import { approvalAutomationOptionsForBot, mergeApprovalDeferredScopeBuckets, persistNewApprovalDeferredScopes } from '../../services/approval-deferred-scopes-store.js';
 import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, CHAT_DISBANDED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
 import { tryRegisterApp } from '../../setup/register-app.js';
 import { describeMissingScopes, diffScopeBuckets, readRegistrationScopes, registrationScopeBuckets, scopeBucketCount } from '../../setup/registration-manifest.js';
@@ -354,6 +355,8 @@ async function dmAdmin(
 /**
  * `kind`：
  *   • `'fixed'` = 已处理完，调用方停止
+ *   • `'deferred'` = 版本已处理，但至少一项权限因需人工审批被暂缓、仍未开通；
+ *     已给出独立提示，调用方停止，不得再经自动确认链接把同一权限加回去。
  *   • `'under_review'` = 应用正在飞书审核中、配置被写锁。调用方**不该**再让管理员去点
  *     权限链接（审核期间连 scope/update 都被拒，点了也写不进去），也不该说「等审批通过
  *     就好」——触发审批通常意味着有配置不合规，那一版不会自己通过，得人工修配置。
@@ -364,7 +367,28 @@ async function dmAdmin(
  * 节流**（那意味着模型与飞书实际状态不一致，每次都值得说；万一是我们判据有 bug，
  * 节流会掐掉唯一的信号）。
  */
-type AutoFixOutcome = { kind: 'fixed' | 'under_review' | 'failed'; inReviewVersionId?: string };
+type AutoFixOutcome = { kind: 'fixed' | 'deferred' | 'under_review' | 'failed'; inReviewVersionId?: string };
+
+/** Partial-manifest automation may only union discoveries; full configure owns clearing. */
+async function persistDiscoveredApprovalDeferrals(
+  larkAppId: string,
+  bot: BotState,
+  deferred: readonly DeferredApprovalScope[] | undefined,
+): Promise<string | undefined> {
+  if (!deferred?.length) return undefined;
+  const persisted = await persistNewApprovalDeferredScopes(larkAppId, deferred, {
+    onCommitted: buckets => {
+      bot.config.approvalDeferredScopes = mergeApprovalDeferredScopeBuckets(
+        bot.config.approvalDeferredScopes,
+        buckets,
+      );
+    },
+  });
+  if (persisted.ok) return undefined;
+  const warning = `未能把本次 ${deferred.length} 项审批暂缓权限写入 bots.json（${persisted.reason}）；下次启动仍会重试，且这些权限当前未开通`;
+  logger.warn(`[${larkAppId}] ${warning}`);
+  return warning;
+}
 
 async function tryWebAutoFixScopes(
   larkAppId: string,
@@ -391,8 +415,7 @@ async function tryWebAutoFixScopes(
       maxWaitMs: 60_000,
       disableQrLogin: opts?.disableQrLogin,
       scopeManifest,
-      excludeScopes: bot.config.approvalDeferredScopes,
-      autoAvoidApproval: bot.config.autoAvoidApproval !== false,
+      ...approvalAutomationOptionsForBot(bot.config),
       grantedScopeNames: opts?.grantedScopeNames,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
@@ -405,18 +428,25 @@ async function tryWebAutoFixScopes(
     });
 
     if (result.ok) {
-      // ⚠️ `scopeCount === 0` 有三种**互相矛盾**的成因，不能共用一句话。自从申请集合
+      const deferredScopes = result.approvalDeferredScopes ?? [];
+      const hasDeferred = deferredScopes.length > 0;
+      const deferredPersistWarning = await persistDiscoveredApprovalDeferrals(larkAppId, bot, deferredScopes);
+      const deferredNames = deferredScopes.map(scope => `${scope.name}(${scope.bucket})`).join('、');
+      // ⚠️ `scopeCount === 0` 有四种**互相矛盾**的成因，不能共用一句话。自从申请集合
       // 被裁成「缺失项」后（见上方 filterScopeManifest），它的语义从「整份清单导入了
       // 多少」变成「**缺失的那几项里成功了多少**」，于是 0 不再等于「本来就齐」，
       // 反而最可能是「一项都没补上」——照旧说「所有必需权限已在应用清单中」就成了
-      // 恰在全部失败时谎报齐全。三种成因按可诊断性分开：
+      // 恰在全部失败时谎报齐全。按可诊断性分开：
+      //   ⓪ approvalDeferredScopes 有值 → 至少一项被明确暂缓，绝不能报已修复
       //   ① scopeWarning 有值 → scope/update 被租户整批拒了（开放平台明确报错）
       //   ② skippedScopeCount > 0 → 这些名字不在该租户的开放平台目录里，不可授予
       //      （automation 自己 warn 过「not present in the Open Platform catalog」）
       //   ③ 都没有 → 申请集合本就是空的（缺失项已在清单中），才是真的「已齐全」
       // 这句同时进 daemon 日志**和**下面的管理员 DM，DM 开头写着「✅ 已自动修复了
       // 缺失的权限」，一旦这里说反就自相矛盾，管理员会以为不用管。
-      const scopeDetail = result.scopeCount > 0
+      const scopeDetail = hasDeferred
+        ? `${result.scopeCount} 项权限已导入，${deferredScopes.length} 项权限因需人工审批已暂缓且尚未开通`
+        : result.scopeCount > 0
         ? `${result.scopeCount} 项权限已导入${result.skippedScopeCount > 0 ? `（${result.skippedScopeCount} 项跳过）` : ''}`
         : result.scopeWarning
           ? `0 项权限已导入——开放平台拒绝了本次权限申请（${result.scopeWarning}），需到「权限管理」手动开通`
@@ -424,7 +454,7 @@ async function tryWebAutoFixScopes(
             ? `0 项权限已导入——这 ${result.skippedScopeCount} 项不在当前租户的开放平台权限目录中，无法自动申请，需到「权限管理」手动开通`
             : '所有必需权限已在应用清单中';
       // 一项都没申请上时，这次自愈**没有**修好任何东西，日志级别也不该是「succeeded」。
-      const autoFixEffective = result.scopeCount > 0 || (!result.scopeWarning && result.skippedScopeCount === 0);
+      const autoFixEffective = !hasDeferred && (result.scopeCount > 0 || (!result.scopeWarning && result.skippedScopeCount === 0));
       // 数据范围只在**真做了事**或**真出错**时才进日志：常态是「没有待配的」，
       // 那句话对读日志的人零信息量，还会淹没上面真正的 scope 结论。
       const privilegeRangeDetail = result.privilegeRangeCount > 0
@@ -451,20 +481,44 @@ async function tryWebAutoFixScopes(
       const approvalDetail = result.versionPendingReview
         ? '（等待企业管理员审核，审核通过前新权限不生效）'
         : result.approvalAutoPassed === true
-        ? '（审批流自动通过，已即时生效）'
+        ? hasDeferred ? '（版本审批流自动通过；暂缓权限未包含在内）' : '（审批流自动通过，已即时生效）'
         : result.approvalHumanApprovers?.length
           ? `（需人工审批：${result.approvalHumanApprovers.join('、')}）`
           : '';
       const summary =
-        `[${larkAppId}] auto-fix ${autoFixEffective ? 'succeeded' : 'could NOT apply the missing scopes'}: ${scopeDetail}${privilegeRangeDetail}, ` +
-        `${versionDetail}${approvalDetail}, ` +
-        `${result.subscribedEventCount} events subscribed`;
+        `[${larkAppId}] auto-fix ${hasDeferred ? 'deferred some scopes' : autoFixEffective ? 'succeeded' : 'could NOT apply the missing scopes'}: ${scopeDetail}${privilegeRangeDetail}, ` +
+        `${versionDetail}${approvalDetail}, ${result.subscribedEventCount} events subscribed` +
+        `${hasDeferred ? `; deferred: ${deferredNames}` : ''}${deferredPersistWarning ? `; ${deferredPersistWarning}` : ''}`;
       if (autoFixEffective && !result.versionWarning) logger.info(summary);
       else logger.warn(summary);
       // opt-in / optional-only path: succeeded silently, no admin DM (a bot that
       // never enabled the feature must not be pinged just because a non-critical
       // scope was topped up in the background). The log line above is the record.
-      if (opts?.silent) return { kind: 'fixed' };
+      if (opts?.silent) return { kind: hasDeferred ? 'deferred' : 'fixed' };
+      if (hasDeferred) {
+        const adminOpenId = getAdminOpenId(bot);
+        if (adminOpenId) {
+          const deferredList = deferredScopes.map(scope =>
+            `• ${scope.desc ? `${scope.desc} ` : ''}(\`${scope.name}\`, ${scope.bucket})`,
+          ).join('\n');
+          const deferredVersionAdvice = result.versionWarning
+            ? `⚠️ 本次版本未确认提交（${result.versionWarning}）；暂缓权限仍未开通。`
+            : result.versionPendingReview
+              ? `本次版本 ${result.pendingReviewAppVersion ?? result.versionId ?? ''} 仍在等待审核；上述暂缓权限未纳入该版本。`
+              : '其余保留权限已随本次版本提交；上述暂缓权限未纳入版本，不会因本次发布而生效。';
+          await dmAdmin(
+            larkAppId,
+            adminOpenId,
+            `⏸️ botmux 为机器人 "${bot.botName ?? larkAppId}" 避开了需人工审批的权限，以下能力仍处于**暂缓、未开通**状态：\n\n`
+            + `${deferredList}\n\n${scopeDetail}。${deferredVersionAdvice}\n`
+            + `如确需这些能力，请到开放平台「权限管理」手动勾选并提交审批：${buildApprovalConsoleUrl(larkAppId, brand)}\n`
+            + `后续无需重复自动补齐；若已手动开通，可运行 \`botmux setup configure ${larkAppId}\` 刷新记录。`
+            + (deferredPersistWarning ? `\n\n⚠️ ${deferredPersistWarning}。` : ''),
+            `approval-deferred ${deferredScopes.length} scopes`,
+          );
+        }
+        return { kind: 'deferred' };
+      }
       // Notify admin that auto-fix worked — even if im:message was missing before,
       // the newly published version should now have it.
       const adminOpenId = getAdminOpenId(bot);
@@ -948,7 +1002,7 @@ async function checkRequiredScopesOnce(larkAppId: string, isCurrent: () => boole
       if (brand === 'feishu') {
         const fixed = await tryWebAutoFixScopes(larkAppId, bot, brand, missingCritical, wholeMissingOptional,
           { disableQrLogin: true, grantedScopeNames: grantedScopeBuckets });
-        if (fixed.kind === 'fixed' || !isCurrent()) return;
+        if (fixed.kind === 'fixed' || fixed.kind === 'deferred' || !isCurrent()) return;
         if (fixed.kind === 'under_review') {
           underReview = true;
           inReviewVersionId = fixed.inReviewVersionId;
@@ -968,6 +1022,10 @@ async function checkRequiredScopesOnce(larkAppId: string, isCurrent: () => boole
             { disableQrLogin: true, silent: true, grantedScopeNames: grantedScopeBuckets });
           if (toppedUp.kind === 'fixed') {
             logger.info(`[${larkAppId}] auto-topped-up ${wholeMissingOptional.length} optional scope(s): ${wholeMissingOptional.map(s => s.name).join('、')}`);
+            return;
+          }
+          if (toppedUp.kind === 'deferred') {
+            logger.info(`[${larkAppId}] optional scope top-up completed with approval deferrals; see the deferred-scope log above`);
             return;
           }
           if (toppedUp.kind === 'under_review' || !isCurrent()) return;
@@ -1087,17 +1145,9 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
       logger.info(`[${larkAppId}] VC meeting events already subscribed (long-connection mode)`);
       return;
     }
-    const deferredVcScopes = VC_MEETING_FEATURE_SCOPES.filter(
-      s =>
-        bot.config.approvalDeferredScopes?.tenant?.includes(s.name)
-        || bot.config.approvalDeferredScopes?.user?.includes(s.name),
-    );
-    if (deferredVcScopes.length > 0) {
-      logger.info(
-        `[${larkAppId}] VC events missing, but required VC scope(s) (${deferredVcScopes.map(s => s.name).join(', ')}) are in approvalDeferredScopes; skipping auto-subscribe to avoid repeated version publishes.`,
-      );
-      return;
-    }
+    // Historical deferrals remain excluded below, but must not block event repair:
+    // manually granted scopes can start working after restart only when subscriptions
+    // and long-connection mode are also restored.
     logger.info(
       `[${larkAppId}] VC events missing (${probe.missingVcEvents.join('、') || '事件模式非长连接'}); auto-subscribing via Open Platform...`,
     );
@@ -1111,20 +1161,32 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
       maxWaitMs: 60_000,
       disableQrLogin: true,
       scopeManifest: vcScopeManifest,
-      excludeScopes: bot.config.approvalDeferredScopes,
+      ...approvalAutomationOptionsForBot(bot.config),
       onStatus: (msg) => logger.info(`[${larkAppId}] vc-event-autoconfig: ${msg}`),
       onQrCode: () => {
         logger.warn(`[${larkAppId}] vc-event-autoconfig: cached Feishu web session expired; run \`botmux setup\` to refresh, then restart.`);
       },
     });
     if (result.ok) {
+      const deferredPersistWarning = await persistDiscoveredApprovalDeferrals(
+        larkAppId,
+        bot,
+        result.approvalDeferredScopes,
+      );
+      const knownDeferredVcScopes = VC_MEETING_FEATURE_SCOPES.filter(scope =>
+        bot.config.approvalDeferredScopes?.tenant?.includes(scope.name)
+        || bot.config.approvalDeferredScopes?.user?.includes(scope.name),
+      );
       const versionState = result.versionWarning
         ? `NOT published (${result.versionWarning})`
         : result.versionPendingReview
           ? 'submitted, awaiting enterprise review (events take effect after approval)'
           : 'published';
-      const line = `[${larkAppId}] VC events auto-subscribed: ${result.subscribedEventCount} events, version ${result.pendingReviewAppVersion ?? result.versionId ?? 'n/a'} ${versionState}`;
-      if (result.versionWarning) logger.warn(line);
+      const deferralDetail = knownDeferredVcScopes.length > 0
+        ? `; ${knownDeferredVcScopes.length} 项 VC 权限仍记录为审批暂缓（本次未重新申请：${knownDeferredVcScopes.map(s => s.name).join(', ')}；手动开通后请运行 configure 清理记录）`
+        : '';
+      const line = `[${larkAppId}] VC events auto-subscribed: ${result.subscribedEventCount} events, version ${result.pendingReviewAppVersion ?? result.versionId ?? 'n/a'} ${versionState}${deferralDetail}${deferredPersistWarning ? `; ${deferredPersistWarning}` : ''}`;
+      if (result.versionWarning || result.approvalDeferredScopes?.length || deferredPersistWarning) logger.warn(line);
       else logger.info(line);
       return;
     }

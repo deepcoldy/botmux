@@ -24,6 +24,8 @@ interface DraftHarnessOptions {
   approvers?: string[];
   onAdd?: (scopes: readonly ApprovalCandidateScope[]) => void;
   failOnRemoveCall?: number;
+  loseResponseOnRemoveCall?: number;
+  loseResponseOnSetRefreshTokenCall?: number;
 }
 
 /**
@@ -39,6 +41,7 @@ function createDraftHarness(opts: DraftHarnessOptions) {
   let removeCalls = 0;
   let addCalls = 0;
   let probeCalls = 0;
+  let setRefreshTokenCalls = 0;
   const onScopesAddedCalls: ApprovalCandidateScope[][] = [];
 
   const predict = (): ApprovalFlowPrediction => {
@@ -70,6 +73,9 @@ function createDraftHarness(opts: DraftHarnessOptions) {
         throw new Error('simulated scope/update del failure');
       }
       for (const s of scopes) staged.delete(candidateScopeKey(s));
+      if (opts.loseResponseOnRemoveCall !== undefined && removeCalls === opts.loseResponseOnRemoveCall) {
+        throw new Error('simulated response loss after scope/update del was applied');
+      }
     },
     addScopes: async (scopes: readonly ApprovalCandidateScope[]) => {
       addCalls += 1;
@@ -80,7 +86,11 @@ function createDraftHarness(opts: DraftHarnessOptions) {
       onScopesAddedCalls.push([...scopes]);
     },
     setAllowRefreshToken: async (enabled: boolean) => {
+      setRefreshTokenCalls += 1;
       allowRefreshToken = enabled;
+      if (setRefreshTokenCalls === opts.loseResponseOnSetRefreshTokenCall) {
+        throw new Error('simulated response loss after safe_setting/update was applied');
+      }
     },
     probeApproval: async (): Promise<ApprovalFlowPrediction> => {
       probeCalls += 1;
@@ -502,6 +512,53 @@ describe('resolveAutoApprovedScopes', () => {
     expect(outcome.stopReason).toBe('mutation_failed');
     expect(outcome.restored).toBe(true);
     expect(h.staged.size).toBe(candidates.length);
+  });
+
+  it('re-adds the full original draft when a successful scope deletion loses its response', async () => {
+    const candidates = makeTemplateLikeCandidates();
+    const h = createDraftHarness({
+      candidates,
+      blockingKeys: ['user:17'],
+      loseResponseOnRemoveCall: 1,
+    });
+
+    const outcome = await resolveAutoApprovedScopes({
+      initialPrediction: h.initialPrediction,
+      candidates,
+      removeScopes: h.removeScopes,
+      addScopes: h.addScopes,
+      probeApproval: h.probeApproval,
+    });
+
+    expect(outcome.stopReason).toBe('mutation_failed');
+    expect(outcome.restored).toBe(true);
+    expect(h.staged).toEqual(new Set(candidates.map(candidateScopeKey)));
+  });
+
+  it('restores the original refresh-token setting when a successful toggle loses its response', async () => {
+    const candidates = makeTemplateLikeCandidates();
+    const h = createDraftHarness({
+      candidates,
+      blockingKeys: [],
+      blockRefreshToken: true,
+      initialAllowRefreshToken: true,
+      loseResponseOnSetRefreshTokenCall: 1,
+    });
+
+    const outcome = await resolveAutoApprovedScopes({
+      initialPrediction: h.initialPrediction,
+      candidates,
+      initialAllowRefreshToken: true,
+      removeScopes: h.removeScopes,
+      addScopes: h.addScopes,
+      setAllowRefreshToken: h.setAllowRefreshToken,
+      probeApproval: h.probeApproval,
+    });
+
+    expect(outcome.stopReason).toBe('mutation_failed');
+    expect(outcome.restored).toBe(true);
+    expect(h.allowRefreshToken).toBe(true);
+    expect(h.staged).toEqual(new Set(candidates.map(candidateScopeKey)));
   });
 
   it('reports restored=false and still restores scopes when setAllowRefreshToken(true) fails during restore', async () => {

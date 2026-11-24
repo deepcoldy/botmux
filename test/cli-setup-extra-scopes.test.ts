@@ -341,7 +341,7 @@ describe('setup add --extra-scopes-file', () => {
       expect(registration.addons.scopes.tenant).toContain('im:message');
       expect(mocks.completeRegisteredApp).toHaveBeenCalledWith(
         expect.objectContaining({ appId: 'cli_registered' }), registration.addons,
-        expect.any(Function), expect.objectContaining({ disableQrLogin: true }),
+        expect.any(Function), expect.objectContaining({ disableQrLogin: true, autoAvoidApproval: true }),
       );
       expect(lastJson().openPlatform).toMatchObject({ status: 'ready', scopeCount: 42 });
     }

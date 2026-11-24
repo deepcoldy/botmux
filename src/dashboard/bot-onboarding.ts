@@ -2205,6 +2205,8 @@ export class BotOnboardingManager {
             ...callbacks,
             sessionFilePath,
             disableBytedcliFallback: true,
+            ...(meta.excludeScopes ? { excludeScopes: meta.excludeScopes } : {}),
+            ...(meta.autoAvoidApproval !== undefined ? { autoAvoidApproval: meta.autoAvoidApproval } : {}),
           });
         } finally {
           rmSync(sessionFilePath, { force: true });
