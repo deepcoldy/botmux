@@ -10773,6 +10773,22 @@ let thinkingEntries: CotEntry[] = [];
 let thinkingTotalChars = 0;
 let thinkingCapNoted = false;
 
+/** Whether an entry has the fields its kind promises. Entries are parsed from
+ *  CLI transcripts, so the type is not a guarantee: a missing string would throw
+ *  in `cotEntryChars`, and an unknown kind would make the running total NaN and
+ *  switch off the accumulated cap. */
+function cotEntryWellFormed(entry: CotEntry): boolean {
+  const e = entry as Partial<Record<string, unknown>> | null;
+  switch (e?.kind) {
+    case 'thinking':
+    case 'text': return typeof e.text === 'string';
+    case 'tool_call': return typeof e.name === 'string' && typeof e.args === 'string'
+      && (e.subject === undefined || typeof e.subject === 'string');
+    case 'tool_result': return typeof e.result === 'string';
+    default: return false;
+  }
+}
+
 function cotEntryChars(e: CotEntry): number {
   switch (e.kind) {
     case 'thinking': return e.text.length;
@@ -10833,12 +10849,13 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   // exists, so `bridge-fallback-gate` deliberately does NOT strip it there and
   // the reply card shows it verbatim. Stripping it from the bubble alone would
   // make the two messages of one turn contradict each other.
-  // Both paths drop a text entry without text: counting it would throw out of
-  // the transcript drain and lose the rest of the turn's activity.
+  // Both paths drop a malformed entry: counting it would throw out of the
+  // transcript drain and lose the rest of the turn's activity.
   const adoptMode = lastInitConfig?.adoptMode === true;
+  const wellFormed = entries.filter(cotEntryWellFormed);
   const kept = adoptMode
-    ? entries.filter(entry => entry.kind !== 'text' || typeof entry.text === 'string')
-    : entries.flatMap(entry => {
+    ? wellFormed
+    : wellFormed.flatMap(entry => {
       const withoutSentinel = cotEntryWithoutSentinel(entry);
       return withoutSentinel ? [withoutSentinel] : [];
     });
