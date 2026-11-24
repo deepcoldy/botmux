@@ -10,6 +10,9 @@ import type { CaptureAttachment } from '../../core/plugins/input-capture/attachm
 export function captureInboundText(data: any, runtime: InputCaptureRuntime,
   knownBot: (openId: string) => boolean,
   p2pReplyFoldsToChat: (chatId: string, rootId: string) => boolean = () => false): boolean {
+  // The marker is non-sensitive and survives Inbox persistence. Check it before
+  // even parsing: an already-redacted copy is just as ineligible as the raw event.
+  if (data?.__protectedResultRedacted === true) return false;
   const message = data?.message;
   if (data?.sender?.sender_type !== 'user' || !message || !['text', 'post', 'image', 'file', 'audio', 'media', 'merge_forward'].includes(message.message_type)
     || (message.root_id && !/^om_[A-Za-z0-9_-]+$/.test(message.root_id))

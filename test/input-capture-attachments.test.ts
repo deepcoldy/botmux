@@ -6,6 +6,7 @@ import { createInputCaptureRuntime } from '../src/core/plugins/input-capture/run
 import { createInputCaptureStore, type CapturedInput } from '../src/core/plugins/input-capture/store.js';
 import { parseInputCaptureCommand } from '../src/cli/input-capture.js';
 import { captureInboundText } from '../src/im/lark/input-capture.js';
+import { redactProtectedLarkEvent } from '../src/im/lark/protected-event.js';
 import { ProtectedResultStore } from '../src/services/protected-result-store.js';
 
 const cleanups: (() => void | Promise<void>)[] = [];
@@ -97,6 +98,11 @@ it('rejects protected rich text before authored content or media keys enter the 
   ]] } });
 
   expect(f.capture(event)).toBe(false);
+  const redacted = redactProtectedLarkEvent(event);
+  expect(redacted.__protectedResultRedacted).toBe(true);
+  // Simulate the JSON round-trip through Inbox: even though the copy message ID
+  // itself is not protected, the durable non-sensitive marker must still refuse it.
+  expect(f.capture(JSON.parse(JSON.stringify(redacted)))).toBe(false);
   await f.runtime.drain();
   expect(f.store.read().inputs).toEqual([]);
   expect(JSON.stringify(f.store.read())).not.toContain(secret);

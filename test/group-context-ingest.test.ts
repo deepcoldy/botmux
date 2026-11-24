@@ -35,6 +35,7 @@ import {
 } from '../src/services/group-context-store.js';
 import { logger } from '../src/utils/logger.js';
 import { markGroupContextCardPurpose } from '../src/im/lark/group-context-card.js';
+import * as protectedEvent from '../src/im/lark/protected-event.js';
 
 const APP = 'cli_app_a';
 const CHAT = 'oc_chat_1';
@@ -302,5 +303,19 @@ describe('protected-result context ingestion', () => {
       file_key: 'file_v3_SYNTHETIC_SECRET', file_name: 'SYNTHETIC_PRIVATE.xlsx' }) }));
     expect(result).not.toBe('stored');
     expect(listGroupContextMessages(APP, CHAT).messages).toHaveLength(0);
+  });
+  it('rethrows a second-stage protection failure instead of falling back to raw content', () => {
+    setGroupContextSettingsResolver(() => ({ enabled: true }));
+    const actual = protectedEvent.redactProtectedLarkEvent;
+    const spy = vi.spyOn(protectedEvent, 'redactProtectedLarkEvent')
+      .mockImplementationOnce(actual)
+      .mockImplementationOnce(() => { throw new protectedEvent.ProtectedResultReadError(); });
+    try {
+      const compromised = event({ msgType: 'file', content: JSON.stringify({
+        file_key: 'file_v3_SECOND_STAGE_SECRET', file_name: 'SECOND_STAGE_SECRET.xlsx' }) });
+      expect(ingestGroupContextEvent(APP, compromised)).toBe('error');
+      expect(listGroupContextMessages(APP, CHAT).messages).toHaveLength(0);
+      expect(spy).toHaveBeenCalledTimes(2);
+    } finally { spy.mockRestore(); }
   });
 });
