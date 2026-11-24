@@ -8,6 +8,7 @@ import {
   requestCollabKickoff,
 } from '../src/core/collab-kickoff-ipc.js';
 import { collabKickoffId } from '../src/services/collab-group-config.js';
+import { signDispatchLaunchIpcResponse, DISPATCH_LAUNCH_IPC_HEADERS } from '../src/core/dispatch-launch-ipc-auth.js';
 
 function validPrepare() {
   return {
@@ -77,5 +78,35 @@ describe('requestCollabKickoff fail-closed', () => {
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.errorCode).toBe('PEER_OFFLINE');
+  });
+
+  it('F3：签名有效的 started 但 sessionId 空 → BAD_RESPONSE', async () => {
+    const secret = 's'.repeat(32);
+    const initId = 'i'.repeat(64);
+    const kickoffId = 'k'.repeat(64);
+    const target = { larkAppId: 'cli_peer', ipcPort: 12345, bootInstanceId: 'x'.repeat(43) };
+    const nonce = 'n'.repeat(43);
+    const pathWithQuery = collabKickoffPath(initId, kickoffId); // query = 无 action
+    const body = JSON.stringify({
+      ok: true,
+      operation: {
+        schemaVersion: 1, kickoffId, initId, sourceLarkAppId: 's', targetLarkAppId: 'cli_peer', appId: 'cli_peer',
+        chatId: 'oc', configVersion: 'cv', payloadHash: 'h', state: 'started', sessionId: '', turnId: 't', acceptedAt: '2026-01-01T00:00:00Z',
+        createdAt: 'x', updatedAt: 'x',
+      },
+    });
+    const signature = signDispatchLaunchIpcResponse({ secret, requestNonce: nonce, method: 'GET', pathWithQuery, status: 200, body, target });
+    const fakeFetch = (async () => ({
+      status: 200,
+      headers: { get: (k: string) => (k === DISPATCH_LAUNCH_IPC_HEADERS.responseSignature ? signature : null) },
+      text: async () => body,
+    })) as any;
+    const r = await requestCollabKickoff(
+      { larkAppId: 'cli_peer', ipcPort: 12345, bootInstanceId: 'x'.repeat(43), dispatchLaunchIpcProtocol: 'v1' } as any,
+      initId, kickoffId, undefined, undefined,
+      { secret, nonce, fetchImpl: fakeFetch },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errorCode).toBe('BAD_RESPONSE');
   });
 });

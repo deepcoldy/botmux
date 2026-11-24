@@ -42,16 +42,47 @@ function opPath(dataDir: string, targetLarkAppId: string, kickoffId: string): st
   return join(kickoffDir(dataDir, targetLarkAppId), `${kickoffId}.json`);
 }
 
-export function readCollabKickoffOperation(dataDir: string, targetLarkAppId: string, kickoffId: string): CollabKickoffOperationV1 | undefined {
+export type CollabKickoffReadResult =
+  | { kind: 'missing' }
+  | { kind: 'corrupted'; message: string }
+  | { kind: 'ok'; operation: CollabKickoffOperationV1 };
+
+function parseOperation(raw: string, kickoffId: string): { ok: true; operation: CollabKickoffOperationV1 } | { ok: false; message: string } {
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch (err) { return { ok: false, message: `JSON 损坏: ${err instanceof Error ? err.message : String(err)}` }; }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, message: 'operation 非对象' };
+  const op = parsed as CollabKickoffOperationV1;
+  if (op.schemaVersion !== 1) return { ok: false, message: 'schemaVersion 不符' };
+  if (op.kickoffId !== kickoffId) return { ok: false, message: 'operation kickoffId 不匹配' };
+  if (typeof op.initId !== 'string' || !/^[0-9a-f]{64}$/.test(op.initId)) return { ok: false, message: 'initId 非法' };
+  if (!op.payloadHash || !op.configVersion) return { ok: false, message: 'operation 缺 payloadHash/configVersion' };
+  return { ok: true, operation: op };
+}
+
+/**
+ * F4：只有 ENOENT 判 missing；读错 / JSON 错 / schema 或身份不符返回 corrupted，
+ * 调用方不得覆盖旧文件重新 prepare。
+ */
+export function readCollabKickoffOperation(dataDir: string, targetLarkAppId: string, kickoffId: string): CollabKickoffOperationV1 | undefined;
+export function readCollabKickoffOperation(dataDir: string, targetLarkAppId: string, kickoffId: string, strict: true): CollabKickoffReadResult;
+export function readCollabKickoffOperation(dataDir: string, targetLarkAppId: string, kickoffId: string, strict?: true): CollabKickoffOperationV1 | undefined | CollabKickoffReadResult {
   const fp = opPath(dataDir, targetLarkAppId, kickoffId);
-  if (!existsSync(fp)) return undefined;
+  let exists: boolean;
+  try { exists = existsSync(fp); } catch { exists = false; }
+  if (!exists) return strict ? { kind: 'missing' } : undefined;
+  let raw: string;
   try {
-    const parsed: unknown = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
-    return parsed as CollabKickoffOperationV1;
-  } catch {
+    raw = readFileSync(fp, 'utf-8');
+  } catch (err) {
+    if (strict) return { kind: 'corrupted', message: err instanceof Error ? err.message : String(err) };
     return undefined;
   }
+  const parsed = parseOperation(raw, kickoffId);
+  if (!parsed.ok) {
+    if (strict) return { kind: 'corrupted', message: parsed.message };
+    return undefined;
+  }
+  return strict ? { kind: 'ok', operation: parsed.operation } : parsed.operation;
 }
 
 function writeOperation(dataDir: string, targetLarkAppId: string, op: CollabKickoffOperationV1): void {
@@ -62,11 +93,12 @@ function writeOperation(dataDir: string, targetLarkAppId: string, op: CollabKick
 
 export type CollabKickoffPrepareResult =
   | { ok: true; operation: CollabKickoffOperationV1 }
-  | { ok: false; errorCode: 'OPERATION_CONFLICT'; message: string };
+  | { ok: false; errorCode: 'OPERATION_CONFLICT' | 'OPERATION_CORRUPTED'; message: string };
 
 /**
  * prepare：幂等。重复 kickoffId + 同 payloadHash → 返回已有 operation；同 key 不同
- * payloadHash → OPERATION_CONFLICT。首次 → 建 operation(state=prepared)。
+ * payloadHash → OPERATION_CONFLICT；已有 operation 损坏 → OPERATION_CORRUPTED（不覆盖）。
+ * 首次 → 建 operation(state=prepared)。
  */
 export function prepareCollabKickoff(opts: {
   dataDir: string;
@@ -80,12 +112,16 @@ export function prepareCollabKickoff(opts: {
   payloadHash: string;
   now: string;
 }): CollabKickoffPrepareResult {
-  const existing = readCollabKickoffOperation(opts.dataDir, opts.targetLarkAppId, opts.kickoffId);
-  if (existing) {
-    if (existing.payloadHash !== opts.payloadHash) {
+  const read = readCollabKickoffOperation(opts.dataDir, opts.targetLarkAppId, opts.kickoffId, true);
+  if (read.kind === 'corrupted') {
+    // F4：损坏的旧记录不得被覆盖，保留原文件 fail-closed。
+    return { ok: false, errorCode: 'OPERATION_CORRUPTED', message: read.message };
+  }
+  if (read.kind === 'ok') {
+    if (read.operation.payloadHash !== opts.payloadHash) {
       return { ok: false, errorCode: 'OPERATION_CONFLICT', message: 'payloadHash mismatch for same kickoffId' };
     }
-    return { ok: true, operation: existing };
+    return { ok: true, operation: read.operation };
   }
   const op: CollabKickoffOperationV1 = {
     schemaVersion: 1,
@@ -105,7 +141,7 @@ export function prepareCollabKickoff(opts: {
   return { ok: true, operation: op };
 }
 
-/** start：仅在持久化 {sessionId,turnId,acceptedAt} 后置 state='started' 并返回。 */
+/** start：仅在持久化**有效非空** {sessionId,turnId,acceptedAt} 后置 state='started' 并返回。 */
 export function startCollabKickoff(opts: {
   dataDir: string;
   targetLarkAppId: string;
@@ -115,8 +151,14 @@ export function startCollabKickoff(opts: {
   acceptedAt: string;
   now: string;
 }): { ok: true; operation: CollabKickoffOperationV1 } | { ok: false; errorCode: string; message: string } {
-  const existing = readCollabKickoffOperation(opts.dataDir, opts.targetLarkAppId, opts.kickoffId);
-  if (!existing) return { ok: false, errorCode: 'OPERATION_NOT_FOUND', message: 'no prepared operation' };
+  // F1：三元组任一空 → 拒绝置 started（fail-closed），保持 prepared。
+  if (!opts.sessionId || !opts.turnId || !opts.acceptedAt) {
+    return { ok: false, errorCode: 'NOT_READY', message: 'sessionId/turnId/acceptedAt must be non-empty before started' };
+  }
+  const read = readCollabKickoffOperation(opts.dataDir, opts.targetLarkAppId, opts.kickoffId, true);
+  if (read.kind === 'corrupted') return { ok: false, errorCode: 'OPERATION_CORRUPTED', message: read.message };
+  if (read.kind === 'missing') return { ok: false, errorCode: 'OPERATION_NOT_FOUND', message: 'no prepared operation' };
+  const existing = read.operation;
   if (existing.state === 'started') return { ok: true, operation: existing };
   if (existing.state !== 'prepared' && existing.state !== 'starting') {
     return { ok: false, errorCode: 'INVALID_STATE', message: `cannot start from ${existing.state}` };
@@ -140,8 +182,10 @@ export function cancelCollabKickoff(opts: {
   kickoffId: string;
   now: string;
 }): { ok: true; operation: CollabKickoffOperationV1 } | { ok: false; errorCode: string; message: string } {
-  const existing = readCollabKickoffOperation(opts.dataDir, opts.targetLarkAppId, opts.kickoffId);
-  if (!existing) return { ok: false, errorCode: 'OPERATION_NOT_FOUND', message: 'no operation' };
+  const read = readCollabKickoffOperation(opts.dataDir, opts.targetLarkAppId, opts.kickoffId, true);
+  if (read.kind === 'corrupted') return { ok: false, errorCode: 'OPERATION_CORRUPTED', message: read.message };
+  if (read.kind === 'missing') return { ok: false, errorCode: 'OPERATION_NOT_FOUND', message: 'no operation' };
+  const existing = read.operation;
   if (existing.state === 'started') return { ok: false, errorCode: 'INVALID_STATE', message: 'already started, cannot cancel' };
   const op: CollabKickoffOperationV1 = { ...existing, state: 'cancelled', updatedAt: opts.now };
   writeOperation(opts.dataDir, opts.targetLarkAppId, op);

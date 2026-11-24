@@ -2,8 +2,8 @@
  * collab.kickoff target-owned durable operation store（PR-3a §7.1）。
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   prepareCollabKickoff,
@@ -98,5 +98,32 @@ describe('collab-kickoff-store', () => {
     expect(readCollabKickoffOperation(dataDir, TARGET, KICKOFF)).toBeUndefined();
     prepareCollabKickoff(prepOpts());
     expect(readCollabKickoffOperation(dataDir, TARGET, KICKOFF)!.state).toBe('prepared');
+  });
+
+  it('F1：start 空三元组 → NOT_READY，保持 prepared 不置 started', () => {
+    expect(prepareCollabKickoff(prepOpts()).ok).toBe(true);
+    const r = startCollabKickoff({
+      dataDir, targetLarkAppId: TARGET, kickoffId: KICKOFF,
+      sessionId: '', turnId: 't', acceptedAt: new Date().toISOString(), now: new Date().toISOString(),
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errorCode).toBe('NOT_READY');
+    expect(readCollabKickoffOperation(dataDir, TARGET, KICKOFF)!.state).toBe('prepared');
+  });
+
+  it('F4：损坏的持久记录 → prepare 返回 OPERATION_CORRUPTED 不覆盖', async () => {
+    // 先写一个合法 operation
+    prepareCollabKickoff(prepOpts());
+    // 直接写损坏内容到 op 文件
+    const { readdirSync } = await import('node:fs');
+    const opDir = join(dataDir, 'collab-kickoff', 'operations', TARGET);
+    const file = readdirSync(opDir)[0];
+    writeFileSync(join(opDir, file), '{broken json', 'utf-8');
+    // prepare 同 key 不同 payloadHash：应返回 CORRUPTED 而非覆盖
+    const r = prepareCollabKickoff(prepOpts({ payloadHash: 'h2' }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errorCode).toBe('OPERATION_CORRUPTED');
+    // 原文件未被覆盖
+    expect(readFileSync(join(opDir, file), 'utf-8')).toBe('{broken json');
   });
 });

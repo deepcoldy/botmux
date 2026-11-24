@@ -782,7 +782,7 @@ import {
   parseCollabPreflightRequest,
 } from './core/collab-preflight-ipc.js';
 import { parseCollabKickoffRequest, type CollabKickoffMutation, type CollabKickoffPrepareRequestV1 } from './core/collab-kickoff-ipc.js';
-import { prepareCollabKickoff, startCollabKickoff, cancelCollabKickoff, readCollabKickoffOperation } from './core/collab-kickoff-store.js';
+import { prepareCollabKickoff, cancelCollabKickoff, readCollabKickoffOperation } from './core/collab-kickoff-store.js';
 import { collabPayloadHash } from './services/collab-group-config.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isHumanInboundTurnId, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
@@ -9361,53 +9361,68 @@ async function collabKickoffRoute(req: IncomingMessage, res: ServerResponse, par
   const dataDir = config.session.dataDir;
   try {
     if (!action) {
-      // GET query
-      const op = readCollabKickoffOperation(dataDir, selfV3LarkAppId, params.kickoffId);
-      return op ? reply(200, { ok: true, operation: op }) : reply(404, { ok: false, errorCode: 'OPERATION_NOT_FOUND' });
+      // GET query：绑定原 initId（query 换 initId 不返回其他 initId 的 operation）。
+      const read = readCollabKickoffOperation(dataDir, selfV3LarkAppId, params.kickoffId, true);
+      if (read.kind === 'corrupted') return reply(409, { ok: false, errorCode: 'OPERATION_CORRUPTED', message: read.message });
+      if (read.kind === 'missing') return reply(404, { ok: false, errorCode: 'OPERATION_NOT_FOUND' });
+      if (read.operation.initId !== params.initId) return reply(404, { ok: false, errorCode: 'OPERATION_NOT_FOUND' });
+      return reply(200, { ok: true, operation: read.operation });
     }
     const parsed = parseCollabKickoffRequest(verified.bodyRaw);
-    if (!parsed.ok || (parsed.req as any).initId !== params.initId || (parsed.req as any).kickoffId !== params.kickoffId) {
+    if (!parsed.ok) return reply(400, { ok: false, errorCode: 'BAD_REQUEST' });
+    const body = parsed.req as unknown as Record<string, unknown>;
+    if (body.initId !== params.initId || body.kickoffId !== params.kickoffId) {
       return reply(400, { ok: false, errorCode: 'BAD_REQUEST' });
     }
-    const reqBody = parsed.req as CollabKickoffPrepareRequestV1;
-    if (reqBody.targetLarkAppId !== undefined && reqBody.targetLarkAppId !== selfV3LarkAppId) {
-      return reply(400, { ok: false, errorCode: 'TARGET_MISMATCH' });
-    }
+
     if (action === 'prepare') {
+      // F2：prepare 必填 target/appId/sourceMessageId/prompt，且 appId 与目标匹配。
+      const reqBody = parsed.req as CollabKickoffPrepareRequestV1;
+      if (!reqBody.targetLarkAppId || !reqBody.appId || !reqBody.sourceMessageId || reqBody.prompt === undefined) {
+        return reply(400, { ok: false, errorCode: 'BAD_REQUEST', message: 'prepare missing required fields' });
+      }
+      if (reqBody.targetLarkAppId !== selfV3LarkAppId) {
+        return reply(400, { ok: false, errorCode: 'TARGET_MISMATCH' });
+      }
+      if (reqBody.appId !== selfV3LarkAppId) {
+        return reply(400, { ok: false, errorCode: 'APP_MISMATCH' });
+      }
       const payloadHash = collabPayloadHash(reqBody);
       const result = prepareCollabKickoff({
         dataDir,
-        sourceLarkAppId: selfV3LarkAppId, // 注意：source 是请求发起方；这里以 target 视角记录
+        sourceLarkAppId: selfV3LarkAppId,
         targetLarkAppId: selfV3LarkAppId,
         kickoffId: params.kickoffId,
         initId: params.initId,
         appId: reqBody.appId,
-        chatId: '', // chatId 由后续 S3/编排补齐；本单 prepare 先落身份与 payload
+        chatId: '',
         configVersion: reqBody.configVersion,
         payloadHash,
         now: new Date().toISOString(),
       });
       return result.ok
         ? reply(200, { ok: true, operation: result.operation })
-        : reply(409, { ok: false, errorCode: result.errorCode, message: result.message });
+        : reply(result.errorCode === 'OPERATION_CORRUPTED' ? 409 : 409, { ok: false, errorCode: result.errorCode, message: result.message });
     }
     if (action === 'start') {
-      const existing = readCollabKickoffOperation(dataDir, selfV3LarkAppId, params.kickoffId);
-      if (!existing) return reply(404, { ok: false, errorCode: 'OPERATION_NOT_FOUND' });
-      // start 需目标持久 {sessionId,turnId,acceptedAt} 后才返回 started。本单 target 侧
-      // 没有真实会话激活，仅做状态机占位（会话激活由 PR-3b 接 queued session）。
-      const result = startCollabKickoff({
-        dataDir,
-        targetLarkAppId: selfV3LarkAppId,
-        kickoffId: params.kickoffId,
-        sessionId: '', turnId: '', acceptedAt: new Date().toISOString(),
-        now: new Date().toISOString(),
-      });
-      return result.ok
-        ? reply(200, { ok: true, operation: result.operation })
-        : reply(result.errorCode === 'OPERATION_NOT_FOUND' ? 404 : 409, { ok: false, errorCode: result.errorCode, message: result.message });
+      // F1/F2：PR-3b 未实现真实会话激活前，start 明确 NOT_IMPLEMENTED；且 start 需核对原
+      // operation 的 initId/configVersion/payloadHash。
+      const read = readCollabKickoffOperation(dataDir, selfV3LarkAppId, params.kickoffId, true);
+      if (read.kind === 'corrupted') return reply(409, { ok: false, errorCode: 'OPERATION_CORRUPTED', message: read.message });
+      if (read.kind === 'missing') return reply(404, { ok: false, errorCode: 'OPERATION_NOT_FOUND' });
+      if (read.operation.initId !== params.initId) return reply(404, { ok: false, errorCode: 'OPERATION_NOT_FOUND' });
+      const startBody = body as unknown as { configVersion?: string; payloadHash?: string };
+      if (startBody.configVersion !== read.operation.configVersion || startBody.payloadHash !== read.operation.payloadHash) {
+        return reply(409, { ok: false, errorCode: 'OPERATION_CONFLICT', message: 'start configVersion/payloadHash mismatch' });
+      }
+      // 真实会话激活未实现（PR-3b），保持 prepared，返回 NOT_IMPLEMENTED。
+      return reply(501, { ok: false, errorCode: 'NOT_IMPLEMENTED', message: 'target session activation not implemented (PR-3b)' });
     }
-    // cancel
+    // cancel：绑定原 initId。
+    const read = readCollabKickoffOperation(dataDir, selfV3LarkAppId, params.kickoffId, true);
+    if (read.kind === 'corrupted') return reply(409, { ok: false, errorCode: 'OPERATION_CORRUPTED', message: read.message });
+    if (read.kind === 'missing') return reply(404, { ok: false, errorCode: 'OPERATION_NOT_FOUND' });
+    if (read.operation.initId !== params.initId) return reply(404, { ok: false, errorCode: 'OPERATION_NOT_FOUND' });
     const result = cancelCollabKickoff({
       dataDir,
       targetLarkAppId: selfV3LarkAppId,

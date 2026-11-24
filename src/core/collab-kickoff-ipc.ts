@@ -112,6 +112,10 @@ export async function requestCollabKickoff(
   }
   let respBody: string;
   try { respBody = await response.text(); } catch { return { ok: false, errorCode: 'RESPONSE_READ_FAILED', message: 'failed to read response body' }; }
+  // F3：严格验证 HTTP 200。HTTP500 等错误状态即便签名有效也判失败。
+  if (response.status !== 200) {
+    return { ok: false, errorCode: 'HTTP_ERROR', message: `kickoff http ${response.status}` };
+  }
   const respSignature = response.headers.get(DISPATCH_LAUNCH_IPC_HEADERS.responseSignature);
   const signatureValid = verifyDispatchLaunchIpcResponseSignature({
     secret, requestNonce: nonce, method, pathWithQuery, status: response.status, body: respBody, target, signature: respSignature ?? undefined,
@@ -124,6 +128,19 @@ export async function requestCollabKickoff(
   if (r.ok !== true) {
     return { ok: false, errorCode: typeof r.errorCode === 'string' ? r.errorCode : 'PEER_REJECTED', message: typeof r.message === 'string' ? r.message : 'peer rejected' };
   }
-  if (r.operation === null || typeof r.operation !== 'object') return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation missing' };
-  return { ok: true, operation: r.operation as CollabKickoffOperationV1 };
+  // operation 必须是非数组对象，schemaVersion=1，kickoffId/initId 与请求匹配。
+  if (r.operation === null || typeof r.operation !== 'object' || Array.isArray(r.operation)) {
+    return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation malformed' };
+  }
+  const op = r.operation as Record<string, unknown>;
+  if (op.schemaVersion !== 1) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation schemaVersion mismatch' };
+  if (op.kickoffId !== kickoffId) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation kickoffId mismatch' };
+  if (op.initId !== initId) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation initId mismatch' };
+  const validStates = new Set(['preparing', 'prepared', 'starting', 'started', 'failed', 'cancelled']);
+  if (typeof op.state !== 'string' || !validStates.has(op.state)) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation state invalid' };
+  // started 时三元组必须非空（F3）。
+  if (op.state === 'started' && (!op.sessionId || !op.turnId || !op.acceptedAt)) {
+    return { ok: false, errorCode: 'BAD_RESPONSE', message: 'started operation missing session/turn/acceptedAt' };
+  }
+  return { ok: true, operation: op as unknown as CollabKickoffOperationV1 };
 }
