@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { BotConfig } from '../src/bot-registry.js';
 import type { TaskRoutingGlobalConfig, TaskRoutingRecord } from '../src/core/task-routing/model.js';
 import { TaskRoutingStore, taskRoutingDbPath } from '../src/services/task-routing-store.js';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { handleTaskRoutingApi, type TaskRoutingApiDeps } from '../src/dashboard/task-routing-api.js';
 import { botDefaultsPayload, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
 
@@ -344,6 +345,55 @@ describe('handleTaskRoutingApi', () => {
     await handleTaskRoutingApi(attemptReq.req, attemptRes.res, attemptReq.url, deps);
     expect(attemptRes.status()).toBe(200);
     expect(attemptRes.json().records.map((r: TaskRoutingRecord) => r.id)).toEqual(['rec_2']);
+  });
+
+  it('keeps valid selection and fallback matches when another attempts_json is malformed', async () => {
+    const dataDir = makeTempDir();
+    const deps = makeDeps({ dataDir, readGlobalTaskRouting: () => ({ enabled: true }) });
+    const store = new TaskRoutingStore(dataDir);
+    seedRecord(store, {
+      id: 'selected_match',
+      createdAt: 100,
+      selectedAppId: 'cli_econ',
+      selectedName: 'EconomyWorker',
+      outcome: 'dispatched',
+      attempts: [],
+    });
+    seedRecord(store, {
+      id: 'attempt_match',
+      createdAt: 200,
+      selectedAppId: 'cli_flagship',
+      selectedName: 'FlagshipWorker',
+      outcome: 'fallback_dispatched',
+      attempts: [{ appId: 'cli_econ', name: 'EconomyWorker', outcome: 'skipped', reason: 'unavailable', at: 201 }],
+    });
+    seedRecord(store, {
+      id: 'damaged_newest',
+      createdAt: 300,
+      selectedAppId: 'cli_other',
+      selectedName: 'OtherWorker',
+      outcome: 'dispatched',
+      attempts: [],
+    });
+    const db = openDatabaseSyncOrThrow(taskRoutingDbPath(dataDir));
+    try {
+      db.prepare(`UPDATE routing_records SET attempts_json = '[' WHERE id = 'damaged_newest'`).run();
+    } finally {
+      db.close();
+    }
+
+    // The damaged row is really present and readable without the Bot predicate.
+    expect(store.listRecords({ limit: 10 }).map(record => record.id)).toEqual([
+      'damaged_newest', 'attempt_match', 'selected_match',
+    ]);
+
+    const { req, url } = makeReq('GET', '/api/task-routing/history?bot=cli_econ&limit=10');
+    const res = makeRes();
+    await handleTaskRoutingApi(req, res.res, url, deps);
+    expect(res.status()).toBe(200);
+    expect(res.json().records.map((r: TaskRoutingRecord) => r.id)).toEqual([
+      'attempt_match', 'selected_match',
+    ]);
   });
 
   it('performs dry-run recommend with zero SQLite side effects and rejects malformed bodies', async () => {

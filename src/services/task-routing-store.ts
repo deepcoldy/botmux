@@ -355,7 +355,12 @@ export class TaskRoutingStore {
         // could silently drop older matching records.
         where.push(`(
           selected_app_id = ? OR EXISTS (
-            SELECT 1 FROM json_each(routing_records.attempts_json)
+            SELECT 1 FROM json_each(
+              CASE WHEN json_valid(routing_records.attempts_json)
+                THEN routing_records.attempts_json
+                ELSE '[]'
+              END
+            )
             WHERE json_extract(value, '$.appId') = ?
           )
         )`);
