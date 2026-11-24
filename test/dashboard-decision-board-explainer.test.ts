@@ -115,9 +115,42 @@ describe('事项页的图文说明', () => {
 
     expect(groups[1]!.findAll(n => n.type === 'details')).toHaveLength(0);
     const history = groups[0]!.findByType('details');
-    expect(history.props.open).toBeFalsy();
+    expect(history.props.open).toBe(false);
     expect(textOf(history.findByType('summary'))).toBe(zh('decisionBoard.explainerHistory', { n: 2 }));
-    expect(history.findAll(n => n.type === 'figure').map(f => f.props['data-file-id'])).toEqual(['html0001', 'htmlold']);
+    // 折叠态不挂载历史内容（卸载而非常驻隐藏，见下一条视频用例）。
+    expect(history.findAll(n => n.type === 'figure')).toHaveLength(0);
+
+    act(() => history.props.onToggle({ currentTarget: { open: true } }));
+    const opened = groups[0]!.findByType('details');
+    expect(opened.props.open).toBe(true);
+    expect(opened.findAll(n => n.type === 'figure').map(f => f.props['data-file-id'])).toEqual(['html0001', 'htmlold']);
+
+    act(() => opened.props.onToggle({ currentTarget: { open: false } }));
+    expect(groups[0]!.findByType('details').findAll(n => n.type === 'figure')).toHaveLength(0);
+  });
+
+  it('折叠历史版本会卸载其中的视频和 iframe，重新展开再挂载', async () => {
+    const vOld = file('vold', 'video/mp4', 'demo.mp4', 90);
+    const vNew = file('vnew', 'video/mp4', 'demo.mp4', 300);
+    await openDetail({ files: [vOld, vNew] });
+    const panel = renderer!.root.find(n => n.type === 'section' && String(n.props.className).includes('dboard-explainers'));
+    // 最新版视频始终挂载；历史版折叠时不存在于组件树（浏览器对断开文档的媒体元素停止播放）。
+    expect(all('video').map(v => v.props.src)).toEqual(['/api/decision-board/cli_a/files/vnew']);
+    const history = panel.findByType('details');
+    expect(history.props.open).toBe(false);
+    expect(history.findAll(n => n.type === 'video')).toHaveLength(0);
+
+    act(() => history.props.onToggle({ currentTarget: { open: true } }));
+    const opened = panel.findByType('details');
+    expect(opened.props.open).toBe(true);
+    expect(all('video')).toHaveLength(2);
+    expect(opened.findByType('video').props.src).toBe('/api/decision-board/cli_a/files/vold');
+
+    act(() => opened.props.onToggle({ currentTarget: { open: false } }));
+    const closed = panel.findByType('details');
+    expect(closed.props.open).toBe(false);
+    expect(closed.findAll(n => n.type === 'video')).toHaveLength(0);
+    expect(all('video').map(v => v.props.src)).toEqual(['/api/decision-board/cli_a/files/vnew']);
   });
 
   it('全屏查看打开的也是同样限制的 sandbox iframe，关闭后移除', async () => {

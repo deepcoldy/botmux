@@ -102,6 +102,7 @@ import {
   type BoardDraft,
   type BoardEvent,
   type BoardExplainer,
+  type BoardExplainerGroup,
   type BoardFile,
   type BoardHint,
   type BoardItem,
@@ -1429,8 +1430,30 @@ function ExplainerFigure(props: { appId: string; explainer: BoardExplainer; onFu
 }
 
 /**
+ * 同名说明的历史版本。折叠时不挂载内容：常驻 <details> 折叠只隐藏元素，播放中的 <video> 不会暂停
+ * （音频继续），断开文档连接的媒体元素才会停止；同时收起的 iframe 也一并释放。每组一份独立 open 状态。
+ */
+function ExplainerHistory(props: { appId: string; group: BoardExplainerGroup; onFullscreen(explainer: BoardExplainer): void }) {
+  const tr = useT();
+  const [open, setOpen] = useState(false);
+  if (!props.group.history.length) return null;
+  return (
+    <details className="dboard-explainer-history" open={open} onToggle={event => setOpen(event.currentTarget.open)}>
+      <summary>{tr('decisionBoard.explainerHistory', { n: props.group.history.length })}</summary>
+      {open ? (
+        <div className="dboard-explainer-history-list">
+          {props.group.history.map(x => (
+            <ExplainerFigure key={x.id} appId={props.appId} explainer={x} onFullscreen={props.onFullscreen} />
+          ))}
+        </div>
+      ) : null}
+    </details>
+  );
+}
+
+/**
  * 管家附的说明页和视频。说明页嵌在 sandbox iframe 里（完全限制，响应头另有 CSP sandbox），视频用页内播放器；
- * 飞书侧栏里新标签页不一定带得上登录态，所以页内就能看完。同名附件只展开最新版，旧版仍可展开查看。
+ * 飞书侧栏里新标签页不一定带得上登录态，所以页内就能看完。同名附件只展开最新版，旧版收进可折叠的历史版本。
  */
 function ExplainerPanel(props: { appId: string; files: readonly BoardFile[] }) {
   const tr = useT();
@@ -1446,14 +1469,7 @@ function ExplainerPanel(props: { appId: string; files: readonly BoardFile[] }) {
       {groups.map(group => (
         <div className="dboard-explainer-group" key={group.latest.id}>
           <ExplainerFigure appId={props.appId} explainer={group.latest} onFullscreen={setFullscreen} />
-          {group.history.length ? (
-            <details className="dboard-explainer-history">
-              <summary>{tr('decisionBoard.explainerHistory', { n: group.history.length })}</summary>
-              <div className="dboard-explainer-history-list">
-                {group.history.map(x => <ExplainerFigure key={x.id} appId={props.appId} explainer={x} onFullscreen={setFullscreen} />)}
-              </div>
-            </details>
-          ) : null}
+          <ExplainerHistory appId={props.appId} group={group} onFullscreen={setFullscreen} />
         </div>
       ))}
       <ExplainerDialog appId={props.appId} explainer={fullscreen} onClose={() => setFullscreen(null)} />
