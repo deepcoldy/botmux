@@ -568,6 +568,7 @@ describe('reasoning selector card callback', () => {
 
   beforeEach(async () => {
     const pool = await import('../src/core/worker-pool.js');
+    vi.mocked(pool.sessionReasoningControl).mockReset().mockReturnValue({ choices: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], pending: false });
     vi.mocked(pool.updateCodexCliEffort).mockReset();
     vi.mocked(pool.updateCodexCliEffort).mockResolvedValue({ status: 'future_only', reason: 'cli_next_turn' });
     vi.mocked(pool.setSessionReasoningEffort).mockClear();
@@ -627,6 +628,84 @@ describe('reasoning selector card callback', () => {
     await Promise.resolve();
     expect(pool.deliverEphemeralOrReply).not.toHaveBeenCalled();
     expect(pool.scheduleCardPatch).not.toHaveBeenCalled();
+  });
+
+  function setupClaude() {
+    const { ds, data } = setup();
+    ds.session.cliId = 'claude-code';
+    data.action.value.expected_effort = 'high';
+    data.action.value.expected_model = 'opus';
+    data.action.option = 'medium';
+    return { ds, data };
+  }
+
+  it('saves a Claude card preference for restart without starting a Codex operation', async () => {
+    const pool = await import('../src/core/worker-pool.js');
+    vi.mocked(pool.sessionReasoningControl).mockReturnValueOnce({
+      choices: ['high', 'medium'], selected: 'high', pending: false, claude: { model: 'opus' },
+    });
+    const { ds, data } = setupClaude();
+    const deliver = vi.fn();
+    const result = await handleCardAction(data, depsWith(ds, deliver), LARK_APP_ID);
+    expect(result).toMatchObject({ toast: { type: 'success' }, card: { type: 'raw' } });
+    expect(pool.setSessionReasoningEffort).toHaveBeenCalledWith(ds, 'medium', expect.objectContaining({ source: 'card' }));
+    expect(pool.updateCodexCliEffort).not.toHaveBeenCalled();
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
+  it.each(['model', 'nonce', 'override', 'permission'])('rejects Claude changes after a %s change', async change => {
+    const pool = await import('../src/core/worker-pool.js');
+    vi.mocked(pool.sessionReasoningControl).mockReturnValueOnce({
+      choices: ['high', 'medium'], selected: 'high', pending: false,
+      claude: { model: change === 'model' ? 'sonnet' : 'opus', disabledBy: change === 'override' ? 'env' : undefined },
+    });
+    const { ds, data } = setupClaude();
+    if (change === 'nonce') data.action.value.card_nonce = 'old';
+    if (change === 'permission') vi.mocked(canOperate).mockReturnValue(false);
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(pool.setSessionReasoningEffort).not.toHaveBeenCalled();
+    expect(pool.updateCodexCliEffort).not.toHaveBeenCalled();
+  });
+
+  it('repairs the clicked Claude card when the preference write fails', async () => {
+    const pool = await import('../src/core/worker-pool.js');
+    vi.mocked(pool.sessionReasoningControl).mockReturnValueOnce({
+      choices: ['high', 'medium'], selected: 'high', pending: false, claude: { model: 'opus' },
+    });
+    vi.mocked(pool.setSessionReasoningEffort).mockImplementationOnce(() => { throw new Error('storage unavailable'); });
+    const { ds, data } = setupClaude();
+    expect(await handleCardAction(data, depsWith(ds), LARK_APP_ID))
+      .toMatchObject({ toast: { type: 'warning' }, card: { type: 'raw' } });
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(pool.updateCodexCliEffort).not.toHaveBeenCalled();
+  });
+
+  it('rechecks Claude card authority after waiting for a bot admission to drain', async () => {
+    const pool = await import('../src/core/worker-pool.js');
+    const { withBotTurnAdmission } = await import('../src/core/bot-turn-mutation-gate.js');
+    const { ds, data } = setupClaude();
+    vi.mocked(pool.sessionReasoningControl).mockReturnValueOnce({
+      choices: ['high', 'medium'], selected: 'high', pending: false, claude: { model: 'opus' },
+    });
+    const admitted = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const admission = withBotTurnAdmission(LARK_APP_ID, () => {
+      admitted.resolve();
+      return release.promise;
+    });
+    await admitted.promise;
+    const authorityChecked = Promise.withResolvers<void>();
+    vi.mocked(canOperate).mockImplementation(() => {
+      authorityChecked.resolve();
+      return true;
+    });
+    const action = handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    await authorityChecked.promise;
+    vi.mocked(canOperate).mockReturnValue(false);
+    release.resolve();
+    await admission;
+    expect(await action).toMatchObject({ toast: { type: 'warning' } });
+    expect(pool.setSessionReasoningEffort).not.toHaveBeenCalled();
   });
 
   it.each(['nonce', 'session', 'message', 'selection', 'operator'])('rejects stale or unauthorized %s without mutation', async field => {

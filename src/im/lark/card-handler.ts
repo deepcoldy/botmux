@@ -3807,12 +3807,25 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         const current = getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType);
         if (current !== ds || value.session_id !== ds.session.sessionId
           || !cardMessageId || cardMessageId !== ds.streamCardId
-          || value.card_nonce !== ds.streamCardNonce
-          || value.expected_effort !== (ds.session.reasoningEffort ?? '')) return 'stale' as const;
+          || value.card_nonce !== ds.streamCardNonce) return 'stale' as const;
         const control = sessionReasoningControl(ds);
         if (!control) return 'unsupported' as const;
+        if (control.claude && (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)
+          || !validatePrincipalLaneCardActionAuthority(ds, cardMessageId, activeSessions))) return 'unavailable' as const;
+        if (control.claude?.disabledBy) return `claude_${control.claude.disabledBy}_override` as const;
+        if (value.expected_effort !== (control.claude ? control.selected ?? '' : ds.session.reasoningEffort ?? '')
+          || (control.claude && value.expected_model !== control.claude.model)) return 'stale' as const;
         const effort = control.choices.find(choice => choice === data.action?.option);
         if (!effort) return 'invalid' as const;
+        if (control.claude) {
+          try {
+            const result = setSessionReasoningEffort(ds, effort, { source: 'card', setBy: operatorOpenId });
+            return result === 'saved' ? 'claude_saved' as const : result;
+          } catch (error) {
+            logger.warn(`[${tag(ds)}] Claude session effort save failed: ${String(error)}`);
+            return 'claude_save_failed' as const;
+          }
+        }
         // Keep the verified cold-start path for suspended sessions and wrappers.
         // A live Codex uses the same native, receipt-confirmed menu as /effort.
         const worker = ds.worker;
@@ -3846,9 +3859,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (mutation.value === 'updating') return {
         toast: { type: 'info', content: t('card.effort.updating', undefined, loc) },
       };
-      if (mutation.value !== 'saved') return warning(`card.effort.${mutation.value}`);
+      if (mutation.value !== 'saved' && mutation.value !== 'claude_saved') return warning(`card.effort.${mutation.value}`);
       return {
-        toast: { type: 'success', content: t('card.effort.saved', undefined, loc) },
+        toast: { type: 'success', content: t(`card.effort.${mutation.value}`, undefined, loc) },
         card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
       };
     }

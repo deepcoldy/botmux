@@ -6,7 +6,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import * as registry from '../src/bot-registry.js';
 import * as store from '../src/services/session-store.js';
-import { setSessionReasoningEffort, setTopicReasoningEffort, updateCodexCliEffort, updateCodexAppEffort, writeSessionModelPin,
+import { sessionReasoningControl, setSessionReasoningEffort, setTopicReasoningEffort, updateCodexCliEffort, updateCodexAppEffort, writeSessionModelPin,
   requestSessionRestart, __testOnly_resetRestartCoordinator, __testOnly_sessionAgentConfig, latestPinEffortForRespawn } from '../src/core/worker-pool.js';
 import { clearModelPins } from '../src/core/model-pin-store.js';
 import { ModelPinBusyError } from '../src/core/model-pin.js';
@@ -22,7 +22,7 @@ beforeEach(() => {
   vi.spyOn(registry, 'getBot').mockImplementation(() => ({ config: bot }) as any);
 });
 afterEach(() => {
-  store.__testOnly_setBeforeRowPersist(undefined); __testOnly_resetRestartCoordinator(); vi.useRealTimers(); vi.restoreAllMocks();
+  store.__testOnly_setBeforeRowPersist(undefined); __testOnly_resetRestartCoordinator(); vi.useRealTimers(); vi.unstubAllEnvs(); vi.restoreAllMocks();
   config.session.dataDir = previous; store.init(app); rmSync(dir, { recursive: true, force: true });
 });
 function fixture(cliId = 'codex') {
@@ -50,6 +50,125 @@ it('the real suspended-session effort entry commits the later selection and pin 
   expect(__testOnly_sessionAgentConfig({ ...ds, session: row }, bot).reasoningEffort).toBe('low');
   expect(latestPinEffortForRespawn({ ...ds, session: row })).toEqual({ reasoningEffort: 'low' });
 });
+it.each([true, false])('Claude card saves an idle session preference for restart (pin=%s)', pinned => {
+  const { ds, worker } = fixture('claude-code');
+  if (!pinned) {
+    delete ds.session.modelPin;
+    store.updateSession(ds.session, { modelPinWrite: true });
+  }
+  expect(setSessionReasoningEffort(ds, 'medium', { source: 'card', setBy: 'owner' })).toBe('saved');
+  expect(ds.activeReasoningEffort).toBe('high');
+  expect(sessionReasoningControl(ds)).toMatchObject({ selected: 'medium', pending: true });
+  expect(worker.send).not.toHaveBeenCalled();
+
+  requestSessionRestart(ds, { source: 'slash', notify: async () => {} });
+  expect(worker.send.mock.calls.at(-1)?.[0]).toMatchObject({ type: 'restart', reasoningEffort: 'medium' });
+  store.init(app);
+  const row = store.getOwnedSession(ds.session.sessionId)!;
+  expect(row.reasoningEffort).toBe('medium');
+  expect(row.modelPin?.effort).toBe(pinned ? 'medium' : undefined);
+  expect(__testOnly_sessionAgentConfig({ ...ds, worker: null, session: row }, bot).reasoningEffort).toBe('medium');
+});
+
+it('Claude card saves while suspended and refuses busy or environment-shadowed sessions', () => {
+  const { ds, worker } = fixture('claude-code');
+  ds.lastScreenStatus = 'working';
+  expect(setSessionReasoningEffort(ds, 'xhigh')).toBe('busy');
+  expect(ds.session.reasoningEffort).toBe('high');
+
+  ds.lastScreenStatus = 'idle';
+  bot.env = { CLAUDE_CODE_EFFORT_LEVEL: 'auto' };
+  expect(sessionReasoningControl(ds)?.claude?.disabledBy).toBe('env');
+  expect(setSessionReasoningEffort(ds, 'xhigh')).toBe('unsupported');
+  expect(ds.session.reasoningEffort).toBe('high');
+
+  delete bot.env;
+  ds.worker = null;
+  ds.session.suspendedColdResume = true;
+  expect(setSessionReasoningEffort(ds, 'xhigh')).toBe('saved');
+  expect(worker.send).not.toHaveBeenCalled();
+  expect(sessionReasoningControl(ds)).toMatchObject({ selected: 'xhigh', pending: true });
+  store.init(app);
+  const row = store.getOwnedSession(ds.session.sessionId)!;
+  expect(__testOnly_sessionAgentConfig({ ...ds, session: row }, bot).reasoningEffort).toBe('xhigh');
+});
+
+it('Claude effort preserves concurrent metadata and refuses to overwrite a newer preference', () => {
+  const { ds } = fixture('claude-code');
+  delete ds.session.modelPin;
+  store.updateSession(ds.session, { modelPinWrite: true });
+  const detached = { ...ds, session: structuredClone(ds.session) };
+  const stale = { ...ds, session: structuredClone(ds.session) };
+  store.updateSession({ ...ds.session, title: 'Updated title' });
+  expect(setSessionReasoningEffort(detached, 'medium')).toBe('saved');
+  expect(() => setSessionReasoningEffort(stale, 'xhigh')).toThrow();
+  expect(store.getOwnedSession(ds.session.sessionId)).toMatchObject({ title: 'Updated title', reasoningEffort: 'medium' });
+});
+
+it('Claude effort rejects startup overrides and read isolation in suspended sessions', () => {
+  const { ds } = fixture('claude-code');
+  ds.initConfig = undefined;
+  ds.worker = null;
+  ds.session.suspendedColdResume = true;
+  bot.startupCommands = ['/effort low'];
+  expect(sessionReasoningControl(ds)?.claude?.disabledBy).toBe('startup');
+  expect(setSessionReasoningEffort(ds, 'max')).toBe('unsupported');
+  expect(ds.session.reasoningEffort).toBe('high');
+  bot.startupCommands = ['/effort status'];
+  expect(sessionReasoningControl(ds)?.claude?.disabledBy).toBeUndefined();
+  bot.readIsolation = true;
+  expect(sessionReasoningControl(ds)).toBeUndefined();
+});
+
+it('Claude does not treat a warm reattach init preference as proof of live effort', () => {
+  const { ds } = fixture('claude-code');
+  ds.activeReasoningEffort = undefined;
+  expect(sessionReasoningControl(ds)).toMatchObject({ selected: 'high', pending: true });
+  ds.activeReasoningEffort = 'high';
+  expect(sessionReasoningControl(ds)).toMatchObject({ selected: 'high', pending: false });
+});
+
+it('Claude card uses the live worker policy on restart and the bot policy on cold resume', () => {
+  const { ds } = fixture('claude-code');
+  const key = 'CLAUDE_CODE_EFFORT_LEVEL';
+  vi.stubEnv(key, 'auto');
+  expect(sessionReasoningControl(ds)?.claude?.disabledBy).toBe('env');
+  bot.envPolicy = { mode: 'strict' };
+  expect(sessionReasoningControl(ds)?.claude?.disabledBy).toBe('env');
+  ds.worker = null;
+  ds.session.suspendedColdResume = true;
+  expect(sessionReasoningControl(ds)?.claude?.disabledBy).toBeUndefined();
+  bot.envPolicy = { mode: 'strict', inherit: [key] };
+  expect(sessionReasoningControl(ds)?.claude?.disabledBy).toBe('env');
+  bot.envUnset = [key];
+  expect(sessionReasoningControl(ds)?.claude?.disabledBy).toBeUndefined();
+});
+
+it.each([true, false])('Claude omits incompatible launch effort while keeping the saved choice (/cli=%s)', viaCli => {
+  const { ds } = fixture('claude-code');
+  delete ds.session.modelPin;
+  if (viaCli) ds.session.cliLaunchSnapshot = { state: 'resolved', cliId: 'claude-code', reasoningEffort: 'high', startupCommands: [] };
+  store.updateSession(ds.session, { modelPinWrite: true });
+  expect(setSessionReasoningEffort(ds, 'max')).toBe('saved');
+  bot.model = 'haiku';
+  expect(latestPinEffortForRespawn(ds)).toEqual({ reasoningEffort: null });
+  const launch = __testOnly_sessionAgentConfig({ ...ds, worker: null }, bot);
+  expect(launch).toMatchObject({ model: 'haiku', reasoningEffort: undefined });
+  expect(store.getOwnedSession(ds.session.sessionId)?.reasoningEffort).toBe('max');
+  bot.model = 'opus';
+  expect(__testOnly_sessionAgentConfig({ ...ds, worker: null }, bot).reasoningEffort).toBe('max');
+});
+
+it('Claude card does not offer reasoning changes for Haiku, wrappers, sandbox, adopt or remote sessions', () => {
+  const { ds } = fixture('claude-code');
+  expect(sessionReasoningControl(ds)?.choices).toContain('xhigh');
+  expect(sessionReasoningControl({ ...ds, activeModel: 'claude-haiku-4-5-20251001' })).toBeUndefined();
+  for (const blocked of [{ wrapperCli: 'wrapper claude' }, { sandbox: true }, { adoptMode: true },
+    { readIsolation: true }, { backendType: 'riff' }]) {
+    expect(sessionReasoningControl({ ...ds, initConfig: { ...ds.initConfig, ...blocked } })).toBeUndefined();
+  }
+});
+
 it('receipt-confirmed Codex /effort persists pin and restart/cold restore use the newer effort', async () => {
   const { ds, worker } = fixture();
   const result = updateCodexCliEffort(ds, 'low', 1000, () => true, { source: 'command', setBy: 'owner' }); receipt(worker);

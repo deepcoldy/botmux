@@ -201,7 +201,11 @@ export function resolveSessionLaunchEffort(
   fallback: CodexReasoningEffort | undefined,
 ): CodexReasoningEffort | undefined {
   const cliId = ds.session.cliId ?? botCfg?.cliId ?? '';
-  const prior = resolveTopicReasoningEffort(ds.session, cliId, model, fallback);
+  // A saved Claude preference survives an incompatible launch model. Cold
+  // resume and in-worker restart both omit it until the model supports it.
+  const compatible = cliId === 'claude-code' && fallback && !cliModelMayKeepReasoningEffort(cliId, model, fallback)
+    ? undefined : fallback;
+  const prior = resolveTopicReasoningEffort(ds.session, cliId, model, compatible);
   const pin = ds.session.modelPin;
   if (pin && ds.session.dispatchLaunchSpec) return ds.session.dispatchLaunchSpec.effective.reasoningEffort;
   if (!pin || !cliMatchesBot(ds.session, botCfg) || isPinSuspendedForAdopt(ds) || pin.model.toLowerCase() !== model?.toLowerCase() || !pin.effort) return prior;

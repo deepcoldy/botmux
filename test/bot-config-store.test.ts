@@ -58,6 +58,31 @@ async function freshModules() {
   return { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation };
 }
 
+it('loads safe gateway model IDs and preserves the configured order', async () => {
+  const { registry } = await freshModules();
+  const [config] = registry.parseBotConfigsFromText(JSON.stringify([{
+    larkAppId: 'app_custom_models', larkAppSecret: 'secret', cliId: 'claude-code',
+    customModels: [' gateway/model_v2:1.0 ', 'gateway/model_v2:1.0', 'two-2', '', 'two words',
+      'newline\n', 'command;separator', '../relative', 'x'.repeat(65), 1],
+  }]));
+  expect(config.customModels).toEqual(['gateway/model_v2:1.0', 'two-2']);
+});
+
+it('keeps the configured model inside the /botconfig dropdown cap', async () => {
+  const { registry, store } = await freshModules();
+  const { buildConfigCard } = await import('../src/im/lark/card-builder.js');
+  const models = Array.from({ length: 75 }, (_, i) => `gateway/model-${i}`);
+  const appId = 'app_custom_model_dropdown';
+  registry.registerBot({ larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code',
+    model: 'gateway/current', customModels: models });
+  const data = store.getConfigCardData(appId, ['sonnet']);
+  const card = JSON.parse(buildConfigCard(data!));
+  const select = card.elements.flatMap((e: any) => e.actions ?? [])
+    .find((action: any) => action.value?.field === 'model');
+  expect(select.initial_option).toBe('gateway/current');
+  expect(select.options.map((option: any) => option.value)).toEqual(['__unset__', ...models.slice(0, 48), 'gateway/current']);
+});
+
 describe('bot-config store', () => {
   let configPath: string;
 

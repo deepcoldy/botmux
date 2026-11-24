@@ -59,7 +59,7 @@ Frequently used buttons sit on the card's main row. The low-frequency buttons ma
 | ⏹ Stop | Interrupt the current turn (same as ^C); the session stays. Only shown while the turn is still running |
 | ❌ Close Session | Close the session; adopted sessions show "⏏ Disconnect" here |
 | 🔁 Retry Last Task | Appears when the quota recovers and the status becomes "Ready to retry" |
-| Reasoning effort dropdown | Codex sessions (tmux backend, no sandbox, not using RPC input) can change reasoning effort while running; it applies from the next turn |
+| Reasoning effort dropdown | Codex sessions (tmux backend, no sandbox, not using RPC input) can change reasoning effort while running; it applies from the next turn. For managed local Claude Code sessions, saves made while idle or suspended apply after the next restart or cold resume. `CLAUDE_CODE_EFFORT_LEVEL` and startup commands that set `/effort` take precedence |
 
 You can hide buttons you don't need in the Dashboard (see "Hiding card buttons" below).
 

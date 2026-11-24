@@ -1,3 +1,4 @@
+import { DEFAULT_MODEL_VALUE_PATTERN, limitModelOptions } from '../core/model-value-pattern.js';
 import { normalizeOwnerGroupFollowConfig, notifyOwnerGroupFollowChanged } from './owner-group-follow-policy.js';
 import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
@@ -1421,12 +1422,15 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
   const q = cfg.messageQuota?.defaultLimit;
   let selectedModel = cfg.model ?? null;
   const zcodeEnv = { ...process.env, ...cfg.env };
-  const modelChoiceLabels = cfg.cliId === 'zcode'
-    // Same model name behind two gateways must stay distinguishable in the card.
-    ? Object.fromEntries(modelChoices.map(m => [m, formatZcodeModelChoice(m, zcodeEnv, zcodeAmbiguousModelIds(zcodeEnv))])) : undefined;
   if (cfg.cliId === 'zcode' && selectedModel) {
     try { const ref = resolveZcodeModelReference(selectedModel, { ...process.env, ...cfg.env }); selectedModel = `${ref.providerId}/${ref.modelId}`; } catch { /* stale selections remain visible */ }
   }
+  const configured = selectedModel && !modelChoices.includes(selectedModel)
+    && DEFAULT_MODEL_VALUE_PATTERN.test(selectedModel) ? [selectedModel] : [];
+  const options = limitModelOptions([...(cfg.customModels ?? []), ...configured, ...modelChoices], selectedModel ?? undefined, true);
+  const modelChoiceLabels = cfg.cliId === 'zcode'
+    // Same model name behind two gateways must stay distinguishable in the card.
+    ? Object.fromEntries(options.map(m => [m, formatZcodeModelChoice(m, zcodeEnv, zcodeAmbiguousModelIds(zcodeEnv))])) : undefined;
   return {
     larkAppId,
     botName: cfg.displayName ?? bot.botName ?? cfg.cliId,
@@ -1434,7 +1438,7 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
     cliOptions: CLI_SELECT_OPTIONS.map(o => ({ id: o.key, label: o.label })),
     model: selectedModel,
     ...(modelChoiceLabels ? { modelChoiceLabels } : {}),
-    modelChoices: [...modelChoices],
+    modelChoices: options,
     ...(isConfigurableReasoningCliId(cfg.cliId)
       ? {
         reasoningEfforts: [...reasoningEffortsForCliModel(cfg.cliId, cfg.model)],

@@ -449,6 +449,41 @@ describe('reply_model_pick action', () => {
     expect(requestSessionRestartMock).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
   });
 
+  it('renders a configured gateway model once and accepts that same model on callback', async () => {
+    enableMenu();
+    const bot = getBot(LARK_APP_ID);
+    const gateway = 'gateway/gemini-4_neon:2026.1';
+    bot.config.customModels = [gateway, 'opus'];
+    bot.config.model = 'gateway/default-model';
+    detectModelsMock.mockResolvedValue(['opus', gateway, 'other-model']);
+    const ds = makeDs({ activeModel: 'gateway/current-model' });
+    const deliver = vi.fn();
+    const opened = await handleCardAction(menuData('model'), depsWith(ds), LARK_APP_ID);
+    await opened.afterAck();
+    const select = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2])
+      .elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options.map((option: any) => option.value)).toEqual([
+      gateway, 'opus', 'gateway/default-model', 'gateway/current-model', 'other-model',
+    ]);
+    expect(select.initial_option).toBe('gateway/current-model');
+    await handleCardAction(pickData(gateway), depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver.mock.calls[0]?.[1]).toBe('/model ' + gateway);
+  });
+
+  it('rejects a custom model removed before discovery finishes', async () => {
+    enableMenu();
+    const bot = getBot(LARK_APP_ID);
+    bot.config.customModels = ['gateway/removed-model'];
+    detectModelsMock.mockImplementationOnce(async () => {
+      delete bot.config.customModels;
+      return null;
+    });
+    const deliver = vi.fn();
+    const result = await handleCardAction(pickData('gateway/removed-model'), depsWith(makeDs(), deliver), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
   it('refuses a slug missing from the catalogue even if character-legal', async () => {
     enableMenu();
     const ds = makeDs();
@@ -1139,6 +1174,19 @@ describe('model option precheck', () => {
 });
 
 describe('model picker option sanitisation', () => {
+  it('keeps the active session option when configured models fill the dropdown', async () => {
+    enableMenu();
+    const models = Array.from({ length: 75 }, (_, i) => `gateway/model-${i}`);
+    getBot(LARK_APP_ID).config.customModels = models;
+    const ds = makeDs({ activeModel: 'gateway/active' });
+    const result = await handleCardAction(menuData('model'), depsWith(ds), LARK_APP_ID);
+    await result.afterAck();
+    const select = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2])
+      .elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options.map((o: any) => o.value)).toEqual([...models.slice(0, 49), 'gateway/active']);
+    expect(select.initial_option).toBe('gateway/active');
+  });
+
   it('drops live-detected slugs that fail the inject pattern', async () => {
     enableMenu();
     detectModelsMock.mockResolvedValue(['good-model', 'has space', '../evil', 'x'.repeat(130)]);
@@ -1158,6 +1206,26 @@ describe('model picker option sanitisation', () => {
 // ─── P2-b: model catalogue key must carry wrapper/launch mode ─────────────
 
 describe('model catalogue selection key', () => {
+  it('does not expose current bot choices to a session frozen on a different gateway wrapper', async () => {
+    enableMenu();
+    const bot = getBot(LARK_APP_ID);
+    bot.config.wrapperCli = 'new-gateway claude';
+    bot.config.customModels = ['new-gateway/custom'];
+    bot.config.model = 'new-gateway/default';
+    const ds = makeDs({ activeModel: 'old-gateway/active', sessionOverrides: { wrapperCli: 'old-gateway claude' } });
+    const opened = await handleCardAction(menuData('model'), depsWith(ds), LARK_APP_ID);
+    await opened.afterAck();
+    const select = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2])
+      .elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options.map((option: any) => option.value)).toContain('old-gateway/active');
+    const deliver = vi.fn();
+    for (const model of ['new-gateway/custom', 'new-gateway/default']) {
+      expect(select.options.map((option: any) => option.value)).not.toContain(model);
+      expect(await handleCardAction(pickData(model), depsWith(ds, deliver), LARK_APP_ID)).toMatchObject({ toast: { type: 'warning' } });
+    }
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
   it('probes with the wrapper-composed key, not the bare frozen cliId', async () => {
     enableMenu();
     const seenKeys: string[] = [];

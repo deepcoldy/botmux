@@ -16,7 +16,7 @@ import { canOperate } from './event-dispatcher.js';
 import { deliverEphemeralOrReply, isSessionTransferring, topicReasoningControl } from '../../core/worker-pool.js';
 import { readTraexModelLoads } from '../../services/traex-model-load.js';
 import { isRemoteBackendId } from '../../core/remote-cli-ids.js';
-import { DEFAULT_MODEL_VALUE_PATTERN } from '../../core/model-value-pattern.js';
+import { DEFAULT_MODEL_VALUE_PATTERN, MODEL_SLUG_PATTERN, limitModelOptions } from '../../core/model-value-pattern.js';
 
 export interface ModelPickerLoad {
   /** Missing entries and an unavailable query both mean unknown, never idle. */
@@ -68,9 +68,12 @@ function sessionCliId(ds: DaemonSession) {
   return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
 }
 
-export const MODEL_SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+function sessionModelSelectionKey(ds: DaemonSession): string {
+  const launch = ds.session.cliLaunchSnapshot ?? ds.session;
+  return selectionKeyForBot(sessionCliId(ds), launch.wrapperCli ?? undefined, launch.cliLaunchMode ?? undefined);
+}
 
-export { DEFAULT_MODEL_VALUE_PATTERN };
+export { DEFAULT_MODEL_VALUE_PATTERN, MODEL_SLUG_PATTERN };
 
 /**
  * Resolve the model-catalogue selection for THIS session's frozen CLI shape.
@@ -102,22 +105,39 @@ function resolveModelCatalogue(key: string, botConfig: BotConfig): {
   };
 }
 
-/** One accept rule shared by the picker render and the submission whitelist:
- * live non-empty wins, otherwise the curated static list. Building both from
- * this keeps the offered options and the inject whitelist on identical terms. */
-export async function sessionModelChoices(ds: DaemonSession): Promise<readonly string[]> {
-  const key = selectionKeyForBot(sessionCliId(ds), ds.session.wrapperCli, ds.session.cliLaunchMode);
-  const catalogue = resolveModelCatalogue(key, getBot(ds.larkAppId).config);
-  const live = await catalogue.detect().catch(() => null);
-  return mergeModelChoices(catalogue.staticChoices, live).models;
+async function resolvedPickerModels(
+  key: string, appId: string, session?: DaemonSession,
+): Promise<readonly string[]> {
+  let models = staticModelChoices(key);
+  try {
+    const catalogue = resolveModelCatalogue(key, getBot(appId).config);
+    models = mergeModelChoices(catalogue.staticChoices, await catalogue.detect()).models;
+  } catch { /* Keep configured options and the static fallback if discovery fails. */ }
+  const cfg = getBot(appId).config;
+  const botKey = selectionKeyForBot(cfg.cliId, cfg.wrapperCli, cfg.cliLaunchMode);
+  const launch = session?.session.cliLaunchSnapshot ?? session?.session;
+  const matchesBot = key === botKey && (!launch
+    || ((launch.wrapperCli?.trim() || '') === (cfg.wrapperCli?.trim() || '')
+      && (launch.cliLaunchMode ?? undefined) === cfg.cliLaunchMode));
+  const custom = matchesBot ? cfg.customModels ?? [] : [];
+  const activeModel = session?.activeModel?.trim() || session?.session.model?.trim();
+  const fallback = [matchesBot ? cfg.model : undefined, activeModel]
+    .filter((model): model is string => !!model && !models.includes(model));
+  const pattern = session ? MODEL_SLUG_PATTERN : DEFAULT_MODEL_VALUE_PATTERN;
+  return [...new Set([...custom, ...fallback, ...models].filter(model => pattern.test(model)))];
 }
 
-/** Display metadata is separate from the command whitelist: a failed load
- * query must never make a selectable model disappear or change its slug. */
+/** The picker and callback resolve the same session-specific catalogue. */
+export async function sessionModelChoices(ds: DaemonSession): Promise<readonly string[]> {
+  const key = sessionModelSelectionKey(ds);
+  return resolvedPickerModels(key, ds.larkAppId, ds);
+}
+
+/** Display metadata must never change which slugs are selectable. */
 export async function sessionModelPickerData(ds: DaemonSession) {
-  const key = selectionKeyForBot(sessionCliId(ds), ds.session.wrapperCli, ds.session.cliLaunchMode);
+  const key = sessionModelSelectionKey(ds);
   const [models, load] = await Promise.all([
-    sessionModelChoices(ds).catch(() => staticModelChoices(key)), pickerLoad(key, getBot(ds.larkAppId).config, ds),
+    sessionModelChoices(ds), pickerLoad(key, getBot(ds.larkAppId).config, ds),
   ]);
   return { models, load };
 }
@@ -133,7 +153,7 @@ export function buildSessionModelPickerCard(
 ): string {
   // Only render slugs the inject path would accept: a live-detected catalogue
   // entry with exotic characters must not render into a dead option.
-  const safeModels = models.filter(model => MODEL_SLUG_PATTERN.test(model));
+  const safeModels = limitModelOptions(models.filter(model => MODEL_SLUG_PATTERN.test(model)), currentModel);
   const effort = action === 'session_model_pick' ? topicReasoningControl(ds) : undefined;
   const effortBinding = {
     session_id: ds.session.sessionId, root_id: rootId, lark_app_id: ds.larkAppId, chat_id: ds.chatId,
@@ -172,7 +192,7 @@ export function buildSessionModelPickerCard(
           tag: 'select_static',
           placeholder: { tag: 'plain_text', content: currentModel || t('card.reply_actions.model', undefined, loc) },
           ...(currentModel && safeModels.includes(currentModel) ? { initial_option: currentModel } : {}),
-          options: safeModels.slice(0, 50).map(model => ({
+          options: safeModels.map(model => ({
             text: {
               tag: 'plain_text',
               content: modelOptionLabel(model, load, loc)
@@ -241,16 +261,14 @@ export function defaultModelSelectionKey(appId: string): string {
 export async function defaultModelChoices(appId: string): Promise<readonly string[]> {
   const cfg = getBot(appId).config;
   const key = selectionKeyForBot(cfg.cliId, cfg.wrapperCli, cfg.cliLaunchMode);
-  const catalogue = resolveModelCatalogue(key, cfg);
-  const live = await catalogue.detect().catch(() => null);
-  return mergeModelChoices(catalogue.staticChoices, live).models;
+  return resolvedPickerModels(key, appId);
 }
 
 export async function defaultModelPickerData(appId: string) {
   const cfg = getBot(appId).config;
   const key = defaultModelSelectionKey(appId);
   const [models, load] = await Promise.all([
-    defaultModelChoices(appId).catch(() => staticModelChoices(key)), pickerLoad(key, cfg),
+    defaultModelChoices(appId), pickerLoad(key, cfg),
   ]);
   return { models, load };
 }
@@ -264,14 +282,10 @@ export function buildDefaultModelPickerCard(
   reasoning?: { cliId: string; effort?: string },
   load?: ModelPickerLoad,
 ): string {
-  const safe = [...new Set(models)].filter(model => DEFAULT_MODEL_VALUE_PATTERN.test(model));
-  if (currentModel && DEFAULT_MODEL_VALUE_PATTERN.test(currentModel)) {
-    const existing = safe.indexOf(currentModel);
-    if (existing >= 0) safe.splice(existing, 1);
-    safe.unshift(currentModel);
-  }
+  const safe = [...models].filter(model => DEFAULT_MODEL_VALUE_PATTERN.test(model));
+  if (currentModel && DEFAULT_MODEL_VALUE_PATTERN.test(currentModel) && !safe.includes(currentModel)) safe.unshift(currentModel);
   const choices = [{ text: t('card.models.cli_default', undefined, loc), value: CONFIG_UNSET },
-    ...safe.slice(0, 49).map(model => ({ text: modelOptionLabel(model, load, loc), value: model }))];
+    ...limitModelOptions(safe, currentModel, true).map(model => ({ text: modelOptionLabel(model, load, loc), value: model }))];
   const initial = currentModel && choices.some(c => c.value === currentModel) ? currentModel : CONFIG_UNSET;
   const efforts = reasoning ? reasoningEffortsForCliModel(reasoning.cliId, currentModel) : [];
   const effortControls = reasoning && isConfigurableReasoningCliId(reasoning.cliId) ? [

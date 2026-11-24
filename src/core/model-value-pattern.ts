@@ -1,6 +1,28 @@
-/** Bot-default model values are written to bots.json and handed to the CLI as a
- * launch argument, never typed into a terminal, so they may also carry a
- * `#variant` suffix (e.g. MiniMax's `MiniMax-M3.1-Flash#thinking`). Without it
- * a stored variant renders as "CLI default" and cannot be re-selected. Session
- * pickers inject `/model <slug>` into the PTY and keep the strict pattern. */
-export const DEFAULT_MODEL_VALUE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}(?:#[A-Za-z0-9._-]{1,32})?$/;
+/** Model IDs safe to pass as a single argument to the interactive /model command. */
+export const MODEL_SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/;
+
+/** Bot defaults are launch arguments, so they may also carry a #variant suffix. */
+export const DEFAULT_MODEL_VALUE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}(?:#[A-Za-z0-9._-]{1,32})?$/;
+
+export function normalizeCustomModels(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const models = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== 'string' || /[\u0000-\u001f\u007f]/.test(entry)) continue;
+    const model = entry.trim();
+    // Session pins accept model IDs up to 64 characters.
+    if (MODEL_SLUG_PATTERN.test(model)) models.add(model);
+  }
+  return models.size ? [...models] : undefined;
+}
+
+/** Feishu accepts 50 options per dropdown, including any default sentinel. */
+export function limitModelOptions(models: readonly string[], current: string | undefined, hasDefault = false): string[] {
+  const limit = hasDefault ? 49 : 50;
+  const unique = [...new Set(models)];
+  const choices = unique.slice(0, limit);
+  if (current && !choices.includes(current) && unique.includes(current)) {
+    return [...choices.slice(0, limit - 1), current];
+  }
+  return choices;
+}
