@@ -416,7 +416,6 @@ setInterval(() => {
     const readyMessagesBeforeRestart = new Set(
       messages.filter(message => message.type === 'prompt_ready'),
     );
-    const readyBeforeRestart = readyMessagesBeforeRestart.size;
     if (restartKind === 'CLI crash') {
       // Emulate the daemon's automatic recovery only after the real CLI exit
       // callback has reconciled inflight carry-over. An intentional restart
