@@ -434,6 +434,23 @@ describe('worker: missing structured final timeout', () => {
     expect(r.scope.send).not.toHaveBeenCalled();
   });
 
+  it('resolves the unified RPC predicate through the shared worker harness and a real lifecycle branch', () => {
+    const scope = {
+      traexQuotaPending: undefined,
+      rpcTurnsAwaitingActivation: new Map(),
+      rpcLifecycleFailClosedOwners: new Map(),
+      rpcTerminalHydrationOwners: new Map(),
+      rpcActiveOwners: new Map([['rpc-owner', { generation: 1 }]]),
+      settlingRpcTerminalOwners: new Map(),
+      codexBridgeQueue: { peek: () => [] },
+      isStructuredBridgeLifecycleBlockingCli: () => false,
+    };
+    const blocked = loadWorkerFunction<() => boolean>('hasStructuredLifecycleBlock', scope);
+    expect(blocked()).toBe(true);
+    scope.rpcActiveOwners.clear();
+    expect(blocked()).toBe(false);
+  });
+
   it.each([
     ['rpcActive', 'rpcActive'],
     ['awaiting activation', 'rpcTurnsAwaitingActivation'],
