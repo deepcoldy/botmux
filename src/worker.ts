@@ -516,13 +516,18 @@ import {
 } from './services/antigravity-accounts.js';
 import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
+  countAntigravityUserInputMatches,
+  hashAntigravitySubmittedText,
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
   hasAntigravityPendingTasks,
   hasAntigravityTranscriptPendingTasks,
   drainAntigravityTranscript,
+  findCompletedAntigravityTurnIds,
   readAntigravitySideAnswer,
+  resolveAntigravityCandidateMinByteOffset,
   resolveAntigravityTranscriptPath,
+  type AntigravityCompletedTurnCandidate,
   type AntigravityTranscriptState,
 } from './services/antigravity-transcript.js';
 import {
@@ -6878,6 +6883,12 @@ function setCaptureIdentity(
 }
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let currentTurnSteerPromoted = false;
+interface AntigravityReconcileHint {
+  textSha256: string;
+  sampledTranscriptPath?: string;
+  minByteOffset?: number;
+  skipPriorMatches?: number;
+}
 interface QueuedTypeAheadTurnRecord {
   turnId: string;
   inputConsumed?: true;
@@ -6888,6 +6899,7 @@ interface QueuedTypeAheadTurnRecord {
   trustedController?: TrustedCaller;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   turnCallerOpenId?: string;
+  antigravityReconcileHint?: AntigravityReconcileHint;
 }
 let queuedTypeAheadTurns: QueuedTypeAheadTurnRecord[] = [];
 /** Newest type-ahead turn retired at its terminal while folded into the turn
@@ -6918,6 +6930,117 @@ function markTurnRetired(turnId?: string): void {
     const oldest = retiredTurnIds.values().next().value;
     if (oldest) retiredTurnIds.delete(oldest);
   }
+}
+/** 仅保留最近写入 PTY 的非 durable 回合正文及其写入前 transcript 采样证据，
+ *  用于 Antigravity 折叠回合在 prompt_ready 时核对原生 transcript 消费与完成证据。 */
+const recentSubmittedTurnTexts = new Map<string, {
+  text: string;
+  textSha256?: string;
+  sampledTranscriptPath?: string;
+  minByteOffset?: number;
+  skipPriorMatches?: number;
+}>();
+function rememberSubmittedTurnText(
+  turnId: string | undefined,
+  content: string | undefined,
+  dispatchAttempt: number | undefined,
+  opts?: { isTypeAhead?: boolean },
+): AntigravityReconcileHint | undefined {
+  if (!turnId || !content || dispatchAttempt !== undefined) return undefined;
+  const textSha256 = typeof hashAntigravitySubmittedText === 'function'
+    ? hashAntigravitySubmittedText(content)
+    : undefined;
+  let sampledTranscriptPath: string | undefined;
+  let minByteOffset: number | undefined;
+  let skipPriorMatches = 0;
+  if (lastInitConfig?.cliId === 'antigravity' && !isRemoteBackendType(effectiveBackendType)) {
+    const cid = inputDeliveryObservedCliSessionId ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+    const transcriptPath = cid ? resolveAntigravityTranscriptPath(cid) : null;
+    if (transcriptPath) {
+      sampledTranscriptPath = transcriptPath;
+      try {
+        minByteOffset = statSync(transcriptPath).size;
+      } catch {
+        minByteOffset = 0;
+      }
+    } else {
+      minByteOffset = 0;
+    }
+
+    const isUnflushedSameTextHint = (prev: {
+      textSha256?: string;
+      sampledTranscriptPath?: string;
+      minByteOffset?: number;
+      skipPriorMatches?: number;
+    }): boolean => {
+      if (!textSha256 || prev.textSha256 !== textSha256) return false;
+      if (!sampledTranscriptPath || minByteOffset === undefined || minByteOffset === 0) return true;
+      const prevOffset = typeof resolveAntigravityCandidateMinByteOffset === 'function'
+        ? resolveAntigravityCandidateMinByteOffset(prev, sampledTranscriptPath)
+        : prev.minByteOffset;
+      if (prevOffset === null || prevOffset === undefined || prevOffset >= minByteOffset) return true;
+      const flushed = typeof countAntigravityUserInputMatches === 'function'
+        ? countAntigravityUserInputMatches(sampledTranscriptPath, textSha256, prevOffset, minByteOffset)
+        : 0;
+      return flushed < (prev.skipPriorMatches ?? 0) + 1;
+    };
+
+    const countedPriorIds = new Set<string>();
+    for (const [otherId, other] of recentSubmittedTurnTexts) {
+      if (otherId === turnId || retiredTurnIds.has(otherId)) continue;
+      if (isUnflushedSameTextHint(other)) {
+        skipPriorMatches += 1;
+        countedPriorIds.add(otherId);
+      }
+    }
+    const priorLiveTurnIds: string[] = [];
+    if (currentBotmuxTurnId && currentBotmuxTurnId !== turnId && !retiredTurnIds.has(currentBotmuxTurnId)) {
+      priorLiveTurnIds.push(currentBotmuxTurnId);
+    }
+    for (const q of queuedTypeAheadTurns) {
+      if (q.turnId === turnId) break;
+      if (!retiredTurnIds.has(q.turnId) && !priorLiveTurnIds.includes(q.turnId)) {
+        priorLiveTurnIds.push(q.turnId);
+      }
+    }
+    for (const prevId of priorLiveTurnIds) {
+      if (countedPriorIds.has(prevId)) continue;
+      const qHint = queuedTypeAheadTurns.find(q => q.turnId === prevId)?.antigravityReconcileHint;
+      if (qHint) {
+        if (isUnflushedSameTextHint(qHint)) {
+          skipPriorMatches += 1;
+          countedPriorIds.add(prevId);
+        }
+      } else if (!recentSubmittedTurnTexts.has(prevId) && (!sampledTranscriptPath || minByteOffset === 0)) {
+        skipPriorMatches += 1;
+        countedPriorIds.add(prevId);
+      }
+    }
+    if (opts?.isTypeAhead === true && countedPriorIds.size === 0 && (!sampledTranscriptPath || minByteOffset === 0)) {
+      skipPriorMatches += 1;
+    }
+  }
+  const record = {
+    text: content,
+    ...(textSha256 ? { textSha256 } : {}),
+    ...(sampledTranscriptPath ? { sampledTranscriptPath } : {}),
+    minByteOffset,
+    ...(skipPriorMatches > 0 ? { skipPriorMatches } : {}),
+  };
+  recentSubmittedTurnTexts.delete(turnId);
+  recentSubmittedTurnTexts.set(turnId, record);
+  if (recentSubmittedTurnTexts.size > 64) {
+    const oldest = recentSubmittedTurnTexts.keys().next().value;
+    if (oldest) recentSubmittedTurnTexts.delete(oldest);
+  }
+  return textSha256
+    ? {
+        textSha256,
+        ...(sampledTranscriptPath ? { sampledTranscriptPath } : {}),
+        ...(minByteOffset !== undefined ? { minByteOffset } : {}),
+        ...(skipPriorMatches > 0 ? { skipPriorMatches } : {}),
+      }
+    : undefined;
 }
 let durableTurnInFlight = false;
 /** A remote provider declared one already-submitted turn during resume. This is
@@ -8517,6 +8640,9 @@ function writeCliPidMarker(): void {
                     ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
                     ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
                     ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
+                    ...(qt.antigravityReconcileHint && typeof qt.antigravityReconcileHint.textSha256 === 'string'
+                      ? { antigravityReconcileHint: qt.antigravityReconcileHint }
+                      : {}),
                   });
                 }
               }
@@ -8529,20 +8655,37 @@ function writeCliPidMarker(): void {
         const procStart = Number.isInteger(markerPid) && markerPid > 0
           ? readProcessStartIdentity(markerPid)
           : undefined;
-        const queuedTurns = queuedTypeAheadTurns.map(t => ({
-          turnId: t.turnId,
-          ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
-          ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
-          ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
-          ...(t.linkRefMode ? { linkRefMode: t.linkRefMode } : {}),
-          ...(t.trustedCaller ? { trustedCaller: t.trustedCaller } : {}),
-          ...(t.trustedController ? { trustedController: t.trustedController } : {}),
-          ...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {}),
-        }));
+        const hintForTurn = (tid: string | undefined, inlineHint?: AntigravityReconcileHint): AntigravityReconcileHint | undefined => {
+          if (inlineHint && typeof inlineHint.textSha256 === 'string') return inlineHint;
+          if (!tid || typeof recentSubmittedTurnTexts === 'undefined') return undefined;
+          const rec = recentSubmittedTurnTexts.get(tid);
+          if (!rec || typeof rec !== 'object' || typeof rec.textSha256 !== 'string') return undefined;
+          return {
+            textSha256: rec.textSha256,
+            ...(rec.sampledTranscriptPath ? { sampledTranscriptPath: rec.sampledTranscriptPath } : {}),
+            ...(rec.minByteOffset !== undefined ? { minByteOffset: rec.minByteOffset } : {}),
+            ...(rec.skipPriorMatches !== undefined && rec.skipPriorMatches > 0 ? { skipPriorMatches: rec.skipPriorMatches } : {}),
+          };
+        };
+        const queuedTurns = queuedTypeAheadTurns.map(t => {
+          const reconcileHint = hintForTurn(t.turnId, t.antigravityReconcileHint);
+          return {
+            turnId: t.turnId,
+            ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
+            ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
+            ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
+            ...(t.linkRefMode ? { linkRefMode: t.linkRefMode } : {}),
+            ...(t.trustedCaller ? { trustedCaller: t.trustedCaller } : {}),
+            ...(t.trustedController ? { trustedController: t.trustedController } : {}),
+            ...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {}),
+            ...(reconcileHint ? { antigravityReconcileHint: reconcileHint } : {}),
+          };
+        });
         const queuedTurnId = queuedTurns[0]?.turnId;
         const authority = activeTurnAuthority.snapshot();
         const effectiveCaller = authority?.caller;
         const effectiveController = authority?.controller;
+        const activeReconcileHint = hintForTurn(currentBotmuxTurnId);
         atomicWriteFileSync(markerPath, JSON.stringify({
           sessionId,
           turnId: currentBotmuxTurnId ?? null,
@@ -8552,6 +8695,7 @@ function writeCliPidMarker(): void {
           ...(authority?.identityTurnId ? { identityTurnId: authority.identityTurnId } : {}),
           ...(effectiveCaller ? { trustedCaller: effectiveCaller } : {}),
           ...(effectiveController ? { trustedController: effectiveController } : {}),
+          ...(activeReconcileHint ? { antigravityReconcileHint: activeReconcileHint } : {}),
           ...(queuedTurnId ? { queuedTurnId } : {}),
           ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
           ...(procStart ? { procStart } : {}),
@@ -8775,6 +8919,143 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   publishSandboxRelayCapability();
   log(`Advanced active turn (${reason}): ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
   return true;
+}
+
+/** Antigravity 常规模式不经 transcript bridge 逐轮发 turn_terminal；多条 type-ahead 消息会被折叠进同一次运行。
+ *  在 prompt_ready 结算前，凭原生 transcript 中“已消费且后接完成态无工具 PLANNER_RESPONSE、且当前非忙碌”的精确证据，
+ *  回收已结束的非 durable 候选回合，避免迟读磁盘 marker 或队列推进重新占用已空闲 CLI 的 activeTurnAuthority。 */
+function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
+  if (lastInitConfig?.cliId !== 'antigravity' || isRemoteBackendType(effectiveBackendType)) return false;
+  const cliSessionId = inputDeliveryObservedCliSessionId ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  if (!cliSessionId) return false;
+
+  const diskTurnHeads: Array<{ turnId: string; dispatchAttempt?: number }> = [];
+  const diskQueuedTurns: Array<{ turnId: string; dispatchAttempt?: number }> = [];
+  const diskReconcileHints = new Map<string, AntigravityReconcileHint>();
+  for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
+    if (!markerPath || !existsSync(markerPath)) continue;
+    try {
+      withPidMarkerLock(markerPath, () => {
+        const parsed = JSON.parse(readFileSync(markerPath, 'utf-8'));
+        if (parsed && typeof parsed.turnId === 'string' && parsed.turnId) {
+          diskTurnHeads.push({
+            turnId: parsed.turnId,
+            ...(typeof parsed.dispatchAttempt === 'number' ? { dispatchAttempt: parsed.dispatchAttempt } : {}),
+          });
+          if (parsed.antigravityReconcileHint && typeof parsed.antigravityReconcileHint.textSha256 === 'string') {
+            diskReconcileHints.set(parsed.turnId, parsed.antigravityReconcileHint);
+          }
+        }
+        if (parsed && Array.isArray(parsed.queuedTurns)) {
+          for (const qt of parsed.queuedTurns) {
+            if (qt && typeof qt.turnId === 'string' && qt.turnId) {
+              diskQueuedTurns.push({
+                turnId: qt.turnId,
+                ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
+              });
+              if (qt.antigravityReconcileHint && typeof qt.antigravityReconcileHint.textSha256 === 'string') {
+                diskReconcileHints.set(qt.turnId, qt.antigravityReconcileHint);
+              }
+            }
+          }
+        }
+      });
+    } catch {
+      // ignore unreadable marker
+    }
+  }
+
+  const hasDiskDiff = diskTurnHeads.some(head => head.turnId !== currentBotmuxTurnId);
+  if (
+    queuedTypeAheadTurns.length === 0
+    && !queuedTurnAdvanceConsumedForPrompt
+    && !hasDiskDiff
+    && diskQueuedTurns.length === 0
+  ) {
+    return false;
+  }
+
+  const transcriptPath = resolveAntigravityTranscriptPath(cliSessionId);
+  if (!transcriptPath) return false;
+
+  const candidateIds = new Set<string>();
+  for (const queued of queuedTypeAheadTurns) {
+    if (queued.dispatchAttempt === undefined) candidateIds.add(queued.turnId);
+  }
+  const promotedCandidateId = queuedTurnAdvanceConsumedForPrompt?.promotedTurnId ?? currentBotmuxTurnId;
+  if (queuedTurnAdvanceConsumedForPrompt && promotedCandidateId && currentBotmuxDispatchAttempt === undefined) {
+    candidateIds.add(promotedCandidateId);
+  }
+  for (const head of diskTurnHeads) {
+    if (head.dispatchAttempt === undefined && head.turnId !== currentBotmuxTurnId) {
+      candidateIds.add(head.turnId);
+    }
+  }
+  for (const qt of diskQueuedTurns) {
+    if (qt.dispatchAttempt === undefined) candidateIds.add(qt.turnId);
+  }
+  if (candidateIds.size === 0) return false;
+
+  const candidates: AntigravityCompletedTurnCandidate[] = [...candidateIds].map(turnId => {
+    const remembered = recentSubmittedTurnTexts.get(turnId);
+    const queuedHint = queuedTypeAheadTurns.find(q => q.turnId === turnId)?.antigravityReconcileHint;
+    const diskHint = diskReconcileHints.get(turnId);
+    const hint = remembered ?? queuedHint ?? diskHint;
+    return {
+      turnId,
+      ...(remembered?.text ? { submittedText: remembered.text } : {}),
+      ...(hint?.textSha256 ? { submittedTextSha256: hint.textSha256 } : {}),
+      ...(hint?.sampledTranscriptPath ? { sampledTranscriptPath: hint.sampledTranscriptPath } : {}),
+      ...(hint?.minByteOffset !== undefined ? { minByteOffset: hint.minByteOffset } : {}),
+      ...(hint?.skipPriorMatches !== undefined && hint.skipPriorMatches > 0 ? { skipPriorMatches: hint.skipPriorMatches } : {}),
+    };
+  });
+  const completed = findCompletedAntigravityTurnIds(transcriptPath, candidates);
+  if (completed.size === 0) return false;
+
+  const hasLiveDurableSibling = (turnId: string): boolean => (
+    (currentBotmuxTurnId === turnId && currentBotmuxDispatchAttempt !== undefined)
+    || queuedTypeAheadTurns.some(t => t.turnId === turnId && t.dispatchAttempt !== undefined)
+    || diskTurnHeads.some(h => h.turnId === turnId && h.dispatchAttempt !== undefined)
+    || diskQueuedTurns.some(q => q.turnId === turnId && q.dispatchAttempt !== undefined)
+  );
+
+  const reconciled: string[] = [];
+  let needsMarkerRewrite = false;
+  for (const turnId of completed) {
+    const dropped = dropQueuedTurnRecord(turnId, undefined, { tombstone: false });
+    if (dropped) {
+      needsMarkerRewrite = true;
+      reconciled.push(turnId);
+    }
+    const durableSibling = hasLiveDurableSibling(turnId);
+    if (!durableSibling && turnId !== currentBotmuxTurnId) {
+      const alreadyRetired = retiredTurnIds.has(turnId);
+      markTurnRetired(turnId);
+      if (!alreadyRetired && !reconciled.includes(turnId)) reconciled.push(turnId);
+      if (diskTurnHeads.some(h => h.turnId === turnId) || diskQueuedTurns.some(q => q.turnId === turnId)) {
+        needsMarkerRewrite = true;
+      }
+    }
+  }
+
+  if (
+    queuedTurnAdvanceConsumedForPrompt
+    && promotedCandidateId
+    && currentBotmuxTurnId === promotedCandidateId
+    && currentBotmuxDispatchAttempt === undefined
+    && completed.has(promotedCandidateId)
+  ) {
+    queuedTurnAdvanceConsumedForPrompt = undefined;
+    if (!reconciled.includes(promotedCandidateId)) reconciled.push(promotedCandidateId);
+  }
+
+  if (reconciled.length > 0) {
+    log(`Reconciled completed Antigravity folded turn(s) at prompt_ready: ${reconciled.map(id => id.slice(0, 12)).join(', ')}`);
+    if (needsMarkerRewrite) writeCliPidMarker();
+    return true;
+  }
+  return false;
 }
 let lastStructuredBridgeActivityAtMs = 0;
 const codexAppTurnLiveness = new CodexAppTurnLiveness();
@@ -23982,6 +24263,9 @@ function markPromptReady(): void {
   // already-promoted authority only while the PTY generation still identifies
   // this same A edge; later B output makes the observation stale. The matching
   // observation also prevents this same A edge from advancing twice to C.
+  if (typeof reconcileCompletedAntigravityTurnsAtPromptReady === 'function') {
+    reconcileCompletedAntigravityTurnsAtPromptReady();
+  }
   const observedQueuedAdvanceGeneration = queuedTurnAdvanceConsumedForPrompt?.outputGeneration;
   const readyTransition = (syncedFromDisk: boolean) => decideQueuedReadyTransition({
     observedOutputGeneration: observedQueuedAdvanceGeneration,
@@ -26085,6 +26369,9 @@ async function flushPending(): Promise<void> {
           }
         }
 
+        const reconcileHint = typeof rememberSubmittedTurnText === 'function'
+          ? rememberSubmittedTurnText(item.turnId, item.content, item.dispatchAttempt, { isTypeAhead })
+          : undefined;
         if (isTypeAhead && item.turnId) {
           log(`Queuing type-ahead turn attribution: active=${currentBotmuxTurnId?.slice(0, 12)}, queued=${item.turnId.slice(0, 12)}`);
           if (!queuedTypeAheadTurns.some(t => t.turnId === item.turnId)) {
@@ -26096,6 +26383,7 @@ async function flushPending(): Promise<void> {
               trustedController: item.trustedController,
               vcMeetingImTurnOrigin: item.vcMeetingImTurnOrigin,
               turnCallerOpenId: item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId,
+              ...(reconcileHint ? { antigravityReconcileHint: reconcileHint } : {}),
             });
           }
         } else {
@@ -27144,7 +27432,13 @@ function sendToPty(
     startupComplete: idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   })) {
-    if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);
+    if (!mergedQueued) {
+      if (activeTurnBlocks(next)) {
+        log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — waiting for active turn ${activeTurnAuthority.snapshot()?.turnId?.slice(0, 12) ?? '-'}`);
+      } else {
+        log(`Writing to PTY: "${content.substring(0, 80)}"`);
+      }
+    }
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
     if (!mergedQueued) log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
