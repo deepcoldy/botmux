@@ -445,6 +445,16 @@ describe('antigravity-cot', () => {
       expect(isAntigravityTranscriptBusy(checkpointFile)).toBe(false);
     });
 
+    it('distinguishes a task cancellation callback from a turn interruption', () => {
+      const file = join(tmpDir, 'task-canceled.jsonl');
+      const append = (record: object) => appendFileSync(file, JSON.stringify(record) + '\n');
+      append({ type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'run_command' }] });
+      append({ type: 'SYSTEM_MESSAGE', content: '[Message] sender=conv/task-1 priority=LOW content=Task id "conv/task-1" was canceled with result:\nTool execution was canceled' });
+      expect(isAntigravityTranscriptBusy(file)).toBe(true);
+      append({ type: 'SYSTEM_MESSAGE', content: '<SYSTEM_MESSAGE>\nThe user canceled the task.\n</SYSTEM_MESSAGE>' });
+      expect(isAntigravityTranscriptBusy(file)).toBe(false);
+    });
+
     it('returns false on ERROR_MESSAGE after user prompt', () => {
       const file = join(tmpDir, 'error.jsonl');
       writeFileSync(

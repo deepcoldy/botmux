@@ -575,6 +575,49 @@ describe('getDaemonSessionUsageSnapshot × Claude statusline quota', () => {
       ...base, quota: { fiveHourPercent: 10, sevenDayPercent: 3 },
     });
   });
+
+  it('strips 5h/7d rate limits while preserving contextPercent and token stats when showUsageQuota is false', async () => {
+    const { cardUsageFooterSegment, contextOverCompactThreshold } = await import('../src/im/lark/md-card.js');
+    const claudeBase = { context: { usedTokens: 159_861 }, tokens: { in: 1_400_000, out: 7_800 } };
+    vi.spyOn(costCalculator, 'getSessionUsageSnapshot').mockReturnValue(claudeBase as any);
+    const now = Date.now();
+    writeStatuslineSnapshot(dataDir, 's-hide-claude', {
+      ts: now, contextPercent: 91, contextWindowTokens: 1_000_000, fiveHourPercent: 18, sevenDayPercent: 5,
+    });
+    const showSpy = vi.spyOn(botRegistry, 'resolveShowUsageQuota').mockReturnValue(false);
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({
+      config: { cliId: 'claude-code', name: 'claude' },
+    } as any);
+    const claudeDs = { larkAppId: 'cli_hide_claude', session: { sessionId: 's-hide-claude' }, workingDir: '/repo' } as any;
+
+    const hiddenClaude = getDaemonSessionUsageSnapshot(claudeDs, 'claude-code');
+    expect(hiddenClaude).toEqual({
+      ...claudeBase,
+      quota: { contextPercent: 91, contextWindowTokens: 1_000_000 },
+    });
+    expect(cardUsageFooterSegment(hiddenClaude, 'zh', 'streaming', { compactHintThreshold: 90 }))
+      .toBe('ctx 91% · 建议压缩 · 累计 ↑1.4M ↓7.8K');
+    expect(cardUsageFooterSegment(hiddenClaude, 'zh', 'footer')).toBe('ctx 91%');
+    expect(contextOverCompactThreshold(hiddenClaude, 90)).toBe(true);
+
+    // Antigravity resumed snapshot with only 5h/7d (no contextPercent) drops quota key and falls back to DB context
+    const agyBase = { context: { usedTokens: 230_000, windowTokens: 1_000_000, percentUsed: 23 }, tokens: { in: 300_000, out: 12_000 } };
+    vi.mocked(costCalculator.getSessionUsageSnapshot).mockReturnValue(agyBase as any);
+    writeStatuslineSnapshot(dataDir, 's-hide-agy', { ts: now, fiveHourPercent: 21, sevenDayPercent: 7 });
+    const agyDs = { larkAppId: 'cli_hide_agy', session: { sessionId: 's-hide-agy' }, workingDir: '/repo' } as any;
+    const hiddenAgy = getDaemonSessionUsageSnapshot(agyDs, 'antigravity');
+    expect(hiddenAgy).toBe(agyBase);
+    expect('quota' in hiddenAgy).toBe(false);
+    expect(cardUsageFooterSegment(hiddenAgy, 'zh', 'streaming'))
+      .toBe('上下文 230K/1M (23%) · 累计 ↑300K ↓12K');
+
+    // Re-enabling immediately restores 5h/7d on the next snapshot read
+    showSpy.mockReturnValue(true);
+    expect(getDaemonSessionUsageSnapshot(agyDs, 'antigravity')).toEqual({
+      ...agyBase,
+      quota: { fiveHourPercent: 21, sevenDayPercent: 7 },
+    });
+  });
 });
 
 describe('getDaemonSessionUsageSnapshot × cardFooterExtension', () => {

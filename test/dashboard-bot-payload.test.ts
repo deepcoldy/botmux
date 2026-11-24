@@ -77,7 +77,7 @@ describe('dashboard bot payload helpers', () => {
       'defaultOncall', 'defaultWorkingDir', 'defaultWorkingDirAutoWorktree',
       'autoboundChatCount', 'brandLabel',
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType', 'defaultBackendType',
-      'usageDisplay', 'usageSupported',
+      'usageDisplay', 'showUsageQuota', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
       'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'goalStatusCard', 'followUpReply', 'privateCard',
       'cotEnabled', 'replyCardShowTools', 'senderTag', 'senderTagHideEmail', 'overloadAlert', 'botToBotSameDir', 'autoInviteOwnerOnGroupAdd', 'quotaFallbackBot',
@@ -468,6 +468,9 @@ describe('dashboard bot payload helpers', () => {
     // Legacy boolean projects to 'off'.
     expect(botDefaultsPayload(daemon, { showUsageInCardFooter: false }))
       .toMatchObject({ usageDisplay: 'off' });
+    // showUsageQuota defaults to true; only explicit false disables.
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ showUsageQuota: true });
+    expect(botDefaultsPayload(daemon, { showUsageQuota: false })).toMatchObject({ showUsageQuota: false });
   });
 
   it('projects sandboxPaths three tiers, defaulting to null when absent or malformed', () => {

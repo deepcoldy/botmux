@@ -1,6 +1,6 @@
 import { type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -70,7 +70,7 @@ async function waitFor(check: () => boolean, logs: string[], timeout = 10_000): 
   throw new Error(`Worker condition timed out\n${logs.join('')}`);
 }
 
-function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error' | 'quota' | 'quota-with-footer' | 'expired-quota' | 'running', cliId: 'antigravity' | 'traex' = 'antigravity') {
+function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error' | 'quota' | 'quota-with-footer' | 'expired-quota' | 'running' | 'foreground-tool', cliId: 'antigravity' | 'traex' = 'antigravity') {
   // Closing a worker also stops its OS session scope. A fixed session ID would
   // let parallel runtime/test invocations terminate each other's fake CLI.
   const sessionId = `agy-delivery-${randomUUID()}`;
@@ -82,6 +82,7 @@ function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error'
   const transcriptDir = join(cliHome, 'brain', nativeId, '.system_generated', 'logs');
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(transcriptDir, { recursive: true });
+  const transcript = join(transcriptDir, 'transcript.jsonl');
   const inputLog = join(root, 'input.log');
   const cliPidFile = join(root, 'fake-cli.pid');
   cliPidFiles.add(cliPidFile);
@@ -95,10 +96,10 @@ function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error'
       'I1123 13:39:07.000000 100 input_loop.go:104] HandleUserInput called with text: "passive task"\n'
       + 'E1123 13:39:10.000000 200 errorreport.go:282] agent executor error: generating and executing: transport error (ResourceExhausted, HTTP 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.\n');
   }
-  const passive = isQuota || ['interrupted', 'native-error', 'running'].includes(mode);
+  const passive = isQuota || ['interrupted', 'native-error', 'running', 'foreground-tool'].includes(mode);
   if (passive) {
-    writeFileSync(join(transcriptDir, 'transcript.jsonl'), JSON.stringify({
-      type: 'GENERIC', status: mode === 'running' ? 'RUNNING' : 'DONE', content: 'tool result',
+    writeFileSync(transcript, JSON.stringify({
+      type: mode === 'foreground-tool' ? 'PLANNER_RESPONSE' : 'GENERIC', status: mode === 'running' ? 'RUNNING' : 'DONE', content: 'tool result',
     }) + '\n');
   }
   const ready = cliId === 'antigravity' ? '? for shortcuts' : '›';
@@ -110,6 +111,8 @@ function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error'
       ? `⚠ ${isQuota ? 'Individual quota reached. Resets in 124h24m15s.' : 'Request failed. Please retry.'}\nError ID: native-error-fixture\n────────\n>\n────────\n`
     : mode === 'running'
       ? '● Bash(sleep 30)\n⣻ Running command...\n────────\n>\n────────\nesc to cancel · 1 task(s)\n'
+    : mode === 'foreground-tool'
+      ? '────────\n>\n────────\n? for shortcuts\n'
     : ready + '\n';
   const antigravityQuotaHistory = mode === 'expired-quota' ? [screen, screen.replace('native-error-fixture', 'newer-quota-fixture')]
     .map((banner, index) => {
@@ -129,6 +132,7 @@ const ready = ${JSON.stringify(ready)};
 const screen = ${JSON.stringify(screen)};
 const delayed = ${mode === 'delayed'};
 const manual = ${mode === 'manual'};
+const foregroundTool = ${mode === 'foreground-tool'};
 const initialScreenGate = ${JSON.stringify(initialScreenGate)};
 process.stdin.setRawMode?.(true);
 const drawInitialScreen = () => process.stdout.write('\\x1b[2J\\x1b[H' + screen);
@@ -149,12 +153,21 @@ process.stdin.on('data', chunk => {
   fs.appendFileSync(inputLog, text);
   for (const marker of ['ACTIVATION_UNIQUE_MARKER', 'FOLLOWUP_UNIQUE_MARKER']) {
     if (!text.includes(marker)) continue;
+    if (foregroundTool) {
+      const steps = [
+        { type: 'USER_INPUT', source: 'USER_EXPLICIT', content: marker },
+        { type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'run_command' }] },
+      ];
+      fs.appendFileSync(${JSON.stringify(transcript)}, steps.map(step => JSON.stringify(step)).join('\\n') + '\\n');
+      drawInitialScreen();
+    }
     if (!manual) setTimeout(() => {
       const row = ${JSON.stringify(cliId)} === 'antigravity'
         ? { display: marker, workspace: ${JSON.stringify(dataDir)}, timestamp: Date.now() }
         : { text: marker, session_id: ${JSON.stringify(nativeId)}, ts: Date.now() };
       fs.appendFileSync(history, JSON.stringify(row) + '\\n');
     }, delayed ? 9_000 : 0);
+    if (foregroundTool) continue; // Keep the same composer on screen while the tool runs.
     // Force several idle edges before the delayed receipt appears. Re-enqueueing
     // the activation on a false submit result used to paste the whole input again.
     for (const ms of [1_000, 4_000, 7_000]) {
@@ -200,7 +213,7 @@ setInterval(() => {}, 1_000);
     larkAppId: 'app_test', larkAppSecret: 'secret',
   } satisfies DaemonToWorker);
   return {
-    child, messages, logs, root, cliPidFile, sessionId,
+    child, messages, logs, root, cliPidFile, sessionId, transcript,
     recordReceipt: () => writeFileSync(history, JSON.stringify({
       display: 'ACTIVATION_UNIQUE_MARKER', workspace: dataDir, timestamp: Date.now(),
     }) + '\n'),
@@ -249,6 +262,23 @@ describe('worker delayed activation and interrupted Antigravity delivery', () =>
     expect(worker.messages.some(m => m.type === 'prompt_ready')).toBe(false);
     expect(worker.input()).toBe('');
   }, 60_000);
+
+  it('holds a submitted tool call across the post-submit idle probe until the transcript final', async () => {
+    const worker = startWorker('foreground-tool');
+    await waitFor(() => worker.messages.some(m => m.type === 'screen_update'
+      && m.status === 'idle' && m.content.includes('? for shortcuts')), worker.logs, 30_000);
+    const start = worker.messages.length;
+    worker.child.send({ type: 'message', content: 'FOLLOWUP_UNIQUE_MARKER', turnId: 'om_tool' } satisfies DaemonToWorker);
+    const frames = () => worker.messages.slice(start);
+    await waitFor(() => frames().some(m => m.type === 'turn_input_committed' && m.turnId === 'om_tool'), worker.logs, 15_000);
+    // Hold the fake CLI at the type-ahead composer through two 3.5s probe intervals.
+    await new Promise(resolve => setTimeout(resolve, 7_500));
+    expect(frames().some(m => m.type === 'prompt_ready')).toBe(false);
+
+    appendFileSync(worker.transcript, JSON.stringify({ type: 'PLANNER_RESPONSE', content: 'Finished.' }) + '\n');
+    await waitFor(() => frames().some(m => m.type === 'prompt_ready'), worker.logs, 15_000);
+  }, 60_000);
+
   it.each(['antigravity', 'traex'] as const)('%s writes a slow activation once and acknowledges its deferred receipt', async cliId => {
     const worker = startWorker('delayed', cliId);
     await waitFor(() => worker.input().includes('ACTIVATION_UNIQUE_MARKER'), worker.logs, 30_000);

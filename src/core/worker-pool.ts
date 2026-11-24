@@ -238,7 +238,7 @@ import { doubaoWorkspaceForSession } from '../services/doubao-transcript.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
-import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
+import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, cotMessageFinishStatus, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
 import { retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
@@ -291,7 +291,7 @@ import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, 
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
-import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay, resolveShowUsageQuota } from '../bot-registry.js';
 import { assistantInitFields } from './assistant-mode.js';
 import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from '../im/lark/streaming-card-buttons.js';
 import { resolveSubstituteCardControl, type SubstituteCardControl } from '../im/lark/substitute-card-control.js';
@@ -697,6 +697,8 @@ function readDaemonSessionUsageSnapshot(
       ?? ds.adoptedFrom?.cliId
       ?? getBot(ds.larkAppId).config.cliId
     ) as CliId;
+    const larkAppId = ds.larkAppId ?? ds.session.larkAppId;
+    const showUsageQuota = larkAppId ? resolveShowUsageQuota(larkAppId) : true;
     const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
     if (backendType === 'remote-runner') {
       const usage = normalizeRemoteRunnerUsageReport(ds.session.remoteRunnerUsage);
@@ -726,13 +728,13 @@ function readDaemonSessionUsageSnapshot(
       // sandboxed bots (same as the ledger and dashboard-row readers). Without
       // it a read-isolated bot's transcript is invisible and the card shows no
       // usage even though it exists under BOT_HOME.
-      larkAppId: ds.larkAppId ?? ds.session.larkAppId,
+      larkAppId,
       // Reply cards read at the exact turn boundary (fresh); the live streaming
       // card refreshes on every status tick and rides the reader's reparse
       // throttle instead (fresh:false) to stay off the disk.
       fresh: opts?.fresh ?? true,
       // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
-      pricing: resolvePricingForBot(ds.larkAppId ?? ds.session.larkAppId),
+      pricing: resolvePricingForBot(larkAppId),
     });
     // Claude Code / Antigravity statusline 快照（`botmux statusline` 落盘的 ctx / 5h / 7d 百分比）：
     // 回复卡页脚、流式卡用量行、IPC /usage 三个读取点都经本函数，只在这里合并一次。
@@ -747,7 +749,7 @@ function readDaemonSessionUsageSnapshot(
         });
         const expectedModel = resolveExpectedStatuslineModel(ds);
         if (snap && isStatuslineModelCompatible(resolvedCliId, snap.model, expectedModel)) {
-          const quota = toCardQuota(snap);
+          const quota = toCardQuota(snap, { includeRateLimits: showUsageQuota });
           if (quota) return { ...snapshot, quota };
         }
       } catch { /* best-effort */ }
@@ -8918,6 +8920,8 @@ export function killWorker(
     destroyOrphanedBackingSession(ds, {
       ...(opts.mojoCancelAlreadyProven ? { skipRemoteCancel: true } : {}),
     });
+    // Orphan destroy is best-effort and cannot prove the backing CLI is gone.
+    // Leave background state untouched here rather than interrupting live work.
     if (opts.remoteCloseCommitRequestId
         && ds.remoteCloseState?.requestId === opts.remoteCloseCommitRequestId) {
       ds.remoteCloseState = undefined;
@@ -8956,6 +8960,9 @@ export function killWorker(
   ds.workerToken = null;
   ds.workerViewToken = null;
   ds.workerCardViewToken = null;
+  // Late claude_exit/exit events are intentionally stale after the worker slot
+  // is cleared. Retire their background projection now, while success is known.
+  settleRetiredWorkerBackgroundState(ds);
 }
 
 /**
@@ -12881,6 +12888,63 @@ export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_
   const result = suspendWorker(ds, reason, stillOwned, managedSuspendAttemptId(ds, expectedOperationId));
   return primarySuspendInFlight.get(ds) ?? result;
 }
+
+type CotTerminal = Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'turnId' | 'status' | 'dispatchAttempt' | 'backgroundTasks'>;
+
+/** Closing the turn's CoT message renders 「任务已完成」. A completed turn that
+ *  ended with background tasks still running leaves it open; the message is
+ *  closed when the session's background task count reaches 0, the worker is
+ *  suspended, or a later terminal arrives. */
+function finalizeOrHoldCotMessage(ds: DaemonSession, msg: CotTerminal): void {
+  if (isReplayOfHeldCotTerminal(ds, msg)) return;
+  releaseHeldCotMessage(ds);
+  // A replay of an already finalized turn must not create a fresh hold. In
+  // particular, an interrupted CLI exit is terminal, not a new background wait.
+  if (cotMessageFinishStatus(ds, msg)) return;
+  if (msg.status === 'completed' && msg.backgroundTasks) {
+    ds.cotHeldForBackground = { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
+    return;
+  }
+  finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+}
+
+function isReplayOfHeldCotTerminal(ds: DaemonSession, msg: CotTerminal): boolean {
+  const held = ds.cotHeldForBackground;
+  return msg.status === 'completed' && !!held
+    && held.turnId === msg.turnId && held.dispatchAttempt === msg.dispatchAttempt;
+}
+
+function releaseHeldCotMessage(ds: DaemonSession): void {
+  const held = ds.cotHeldForBackground;
+  if (!held) return;
+  ds.cotHeldForBackground = undefined;
+  finalizeCotMessage(ds, held.turnId, 'completed', held.dispatchAttempt);
+}
+
+/** Background tasks and their held CoT belong to the concrete CLI lifetime.
+ *  Returns whether a dashboard count needs clearing. */
+function settleBackgroundStateOnCliLoss(ds: DaemonSession): boolean {
+  const hadBackgroundTaskCount = ds.backgroundTaskCount !== undefined;
+  ds.backgroundTaskCount = undefined;
+  const held = ds.cotHeldForBackground;
+  if (held) {
+    ds.cotHeldForBackground = undefined;
+    finalizeCotMessage(ds, held.turnId, 'failed', held.dispatchAttempt);
+  }
+  return hadBackgroundTaskCount;
+}
+
+function publishBackgroundTaskCountCleared(ds: DaemonSession): void {
+  dashboardEventBus.publish({ type: 'session.update', body: {
+    sessionId: ds.session.sessionId,
+    patch: { backgroundTaskCount: null },
+  } });
+}
+
+function settleRetiredWorkerBackgroundState(ds: DaemonSession): void {
+  if (settleBackgroundStateOnCliLoss(ds)) publishBackgroundTaskCountCleared(ds);
+}
+
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean, expectedOperationId?: string): boolean {
   const continuingController = primarySuspendApplying.has(ds) || expectedOperationId ? controllerForSession(ds) : undefined;
   const continuingOperationId = expectedOperationId ?? continuingController?.operation()?.operationId;
@@ -12981,6 +13045,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   // the dashboard hydrate this process-less logical session as idle/working.
   ds.lastScreenStatus = undefined;
   ds.backgroundTaskCount = undefined;
+  releaseHeldCotMessage(ds);
   ds.awaySummaryPending = undefined;
   // Drop the TTL clock with it: a cold-resumed worker starts from a fresh idle
   // edge, otherwise a stale stamp could get the new worker TTL-suspended almost
@@ -24579,6 +24644,13 @@ function setupWorkerHandlers(
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
           : undefined;
+        // Only the worker's raw working/idle frame uses omission as the same
+        // tracker's explicit zero. A stalled/limited frame (including sticky
+        // usage-limit projection) cannot turn a positive count into zero.
+        if ((msg.status === 'working' || msg.status === 'idle')
+          && !(typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0)) {
+          releaseHeldCotMessage(ds);
+        }
         // Non-turn-terminal PTY CLIs (e.g. Antigravity terminal mode, Kimi,
         // Copilot, OpenCode) never emit `turn_terminal` on normal completion.
         // An idle screen with no pending background tasks is their turn-end
@@ -25572,11 +25644,18 @@ function setupWorkerHandlers(
           // A clean exit after an already idle/completed turn is not a failed
           // task. It still must not inherit a stale working projection.
           const exitStatus = msg.code === 0 && idleAtExit ? 'idle' : 'interrupted';
+          const hadBackgroundTaskCount = settleBackgroundStateOnCliLoss(ds);
           ds.lastScreenStatus = exitStatus;
           bumpStreamCardStatusRevision(ds);
           clearUsageRefreshTimer(ds);
           dashboardEventBus.publish({ type: 'session.update', body: {
-            sessionId: ds.session.sessionId, patch: { status: exitStatus },
+            sessionId: ds.session.sessionId,
+            patch: {
+              status: exitStatus,
+              // Background work dies with this CLI. Clear it with the physical
+              // loss publication; a stopped sampler cannot provide a zero frame.
+              ...(hadBackgroundTaskCount ? { backgroundTaskCount: null } : {}),
+            },
           } });
         }
         // The live-send capability dies with this backend. Preserve the
@@ -26818,7 +26897,7 @@ function setupWorkerHandlers(
             })
             .catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
         }
-        finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+        finalizeOrHoldCotMessage(ds, msg);
         ds.cotForced = undefined;
         ds.lastThinkingUpdate = undefined;
         // 「执行失败」只在下一条 IM 消息入轮时清（beginNewTurn / 输入提交）。在
@@ -27410,7 +27489,7 @@ function setupWorkerHandlers(
         // An explicit progress/auxiliary send is positive proof that the
         // visible card is non-final. The CLI already persists responseKind;
         // never overwrite that contract with a mechanical completion footer.
-        if (msg.status === 'completed' && !interimCarrierOnly) {
+        if (msg.status === 'completed' && !interimCarrierOnly && !msg.backgroundTasks) {
           // A successful explicit send is visible output even though the
           // model's final assistant block is the required suppression sentinel.
           // Only a genuinely bodyless turn may claim "AI determined no reply".
@@ -27458,7 +27537,7 @@ function setupWorkerHandlers(
         // still receive its footer; without one the interim card stays
         // footerless by design (and no claim is left behind).
         const awaitInterimFinalCarrier = interimCarrierOnly
-          && terminalReceiptRouteEligible;
+          && terminalReceiptRouteEligible && !msg.backgroundTasks;
         // Deliberate-silence closure (positive evidence only — the same
         // 'nothing_to_send' contract as the async settle above):
         //   ① mark the session so every idle-card rebuild renders
@@ -27736,7 +27815,15 @@ function setupWorkerHandlers(
             })();
           }
         }
-        if (replyCardRoute === 'transcript_rows' && replyCardRowsWanted) {
+        // A receipt-route turn whose completion footer and strip are suppressed
+        // because background tasks still run still owes its opt-in next-step
+        // row and recap panel to its final reply card. This branch only places
+        // those rows: it writes no footer and posts no receipt strip, so the
+        // backgroundTasks gating above stays intact.
+        const placeReplyCardRows = replyCardRowsWanted
+          && (replyCardRoute === 'transcript_rows'
+            || (replyCardRoute === 'receipt' && !!msg.backgroundTasks));
+        if (placeReplyCardRows) {
           // The daemon sends a transcript-delivered final itself; the worker
           // queues final_output before turn_terminal, so that send is in flight
           // (or done) here. Its card has settled once it has landed.
@@ -28562,7 +28649,9 @@ function setupWorkerHandlers(
     if (admission.kind === 'historical' && msg.type === 'turn_terminal' && !msg.continuationFailure) {
       const ownsDisplay = () => ownsWorkerSession() && !isSessionTransferring(ds);
       const turnId = msg.turnId;
-      if (ownsDisplay()) finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+      if (ownsDisplay() && !isReplayOfHeldCotTerminal(ds, msg)) {
+        finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+      }
       if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
         await settleTurnReplyCardTerminal(ds, msg,
           (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsDisplay)

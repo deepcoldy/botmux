@@ -11,7 +11,7 @@ import type {
   AskResult,
   PendingAsk,
 } from '../../core/ask-types.js';
-import { AskDispatchError } from '../../core/ask-types.js';
+import { AskDispatchError, isNativeAsyncAskOrigin } from '../../core/ask-types.js';
 import { applyAskForm, getAskSnapshot, submitAsk, submitAskForm, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
@@ -594,7 +594,7 @@ function renderAskCardWithCap(
         }, locale) }] : []),
         buildAskCustomForm(ask, locale, confirmEmptyArmed, text => escapeQuestion(capPrompt(text, promptCap, locale)),
           { mention, descriptionCap }),
-        ...(ask.deliveryTarget || ask.originKind === 'native-user-input-async' ? [{ tag: 'markdown', text_size: 'notation', content:
+        ...(ask.deliveryTarget || isNativeAsyncAskOrigin(ask.originKind) ? [{ tag: 'markdown', text_size: 'notation', content:
           t(ask.deliveryTarget ? 'card.ask.document_reply_hint' : 'card.ask.async_reply_hint', undefined, locale) }] : []),
       ] },
     });
@@ -695,7 +695,7 @@ function renderAskCardWithCap(
       tag: 'note',
       elements: [
         { tag: 'plain_text', content: t(ask.deliveryTarget ? 'card.ask.document_reply_hint'
-          : ask.originKind === 'native-user-input-async' ? 'card.ask.async_reply_hint'
+          : isNativeAsyncAskOrigin(ask.originKind) ? 'card.ask.async_reply_hint'
             : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
       ],
     });
