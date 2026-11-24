@@ -8,7 +8,7 @@ import { buildTurnReplyAskElements } from '../src/im/lark/turn-reply-ask-element
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 import type { TurnReplyCardRecord } from '../src/services/turn-reply-card.js';
-import { t } from '../src/i18n/index.js';
+import { setDefaultLocale, t, type Locale } from '../src/i18n/index.js';
 import { logger } from '../src/utils/logger.js';
 
 // Element limit Feishu documents for one Card JSON 2.0 card (text objects included).
@@ -317,6 +317,49 @@ describe('已结束的卡', () => {
     expect(card.header).toMatchObject({ template: 'grey', title: { content: t(title) } });
     expect(all(card).filter(n => n.text_size === 'heading')).toHaveLength(2);
     expect(answerLines(card)).toEqual([]);
+  });
+});
+
+describe('Claude 权限确认卡', () => {
+  const permissionQuestions = () => claude.parsePermissionRequest!({
+    hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'rm -rf build' },
+  })!.questions;
+  const permissionAsk = (settled: boolean): PendingAsk => ({ askId: 'ask-p', nonce: 'n', larkAppId: 'cli_redesign', chatId: 'oc_chat',
+    rootMessageId: 'om_root', sessionId: 'sess', originKind: 'hook', questions: permissionQuestions(), createdAt: 1_000, deadlineAt: 61_000, settled });
+  const inLocale = <T,>(locale: Locale, fn: () => T): T => { setDefaultLocale(locale); try { return fn(); } finally { setDefaultLocale('zh'); } };
+  const answered = (keys: string[], comment: string | null = null): AskResult => ({ kind: 'answered', answers: [keys], by: 'ou_owner', comment, timedOut: false });
+
+  it.each([
+    ['zh', ['allow'], null, 'green', 'card.ask.header.permission_allowed'],
+    ['en', ['allow'], null, 'green', 'card.ask.header.permission_allowed'],
+    ['zh', ['deny'], null, 'grey', 'card.ask.header.permission_denied'],
+    ['en', ['deny'], null, 'grey', 'card.ask.header.permission_denied'],
+    // A thread reply settles with no option and a comment: the hook denies and forwards the text.
+    ['zh', [], '先别删，换个目录', 'grey', 'card.ask.header.permission_denied'],
+  ] as Array<[Locale, string[], string | null, string, string]>)('%s：选 %j / 回复 %j → %s 标题 %s', (locale, keys, comment, template, title) => {
+    const card = inLocale(locale, () => JSON.parse(buildAskCard(permissionAsk(true), answered(keys, comment))));
+    expect(card.header).toMatchObject({ template, title: { content: t(title, undefined, locale) } });
+  });
+
+  it('允许与拒绝的标题不同，也都不是普通提问的「已提交」；普通提问作答后仍是绿色已提交', () => {
+    const titles = new Set([t('card.ask.header.permission_allowed'), t('card.ask.header.permission_denied'), t('card.ask.header.answered')]);
+    expect(titles.size).toBe(3);
+    const plain: PendingAsk = { ...permissionAsk(true), questions: [single()] };
+    const card = JSON.parse(buildAskCard(plain, answered(['one'])));
+    expect(card.header).toMatchObject({ template: 'green', title: { content: t('card.ask.header.answered') } });
+  });
+
+  it.each(['zh', 'en'] as Locale[])('未答的权限卡（%s）底部给权限专用的话题回复说明；普通一键卡保持原提示', locale => {
+    const footer = (ask: PendingAsk) => inLocale(locale, () => JSON.parse(buildAskCard(ask))).body.elements.at(-1).content as string;
+    const permissionHint = t('card.ask.permission_reply_hint', undefined, locale);
+    const genericHint = t('card.ask.custom_reply_hint', undefined, locale);
+    expect(permissionHint).not.toBe(genericHint);
+    const permission = footer(permissionAsk(false));
+    expect(permission).toContain(permissionHint);
+    expect(permission).not.toContain(genericHint);
+    const quick = footer({ ...permissionAsk(false), questions: [single({ allowCustom: false })] });
+    expect(quick).toContain(genericHint);
+    expect(quick).not.toContain(permissionHint);
   });
 });
 

@@ -1,6 +1,7 @@
 import type { AskOption, AskQuestion, AskResult, PendingAsk } from '../../core/ask-types.js';
 import { ASK_CUSTOM_MAX_LENGTH, supportsAskCustomInput } from '../../core/ask-custom-input.js';
 import { hasAskForm } from '../../core/ask-form.js';
+import { isHookPermissionAsk, permissionAnswerAllows } from '../../core/ask-hook/types.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { parseLinkDestination } from 'markdown-it/lib/helpers/index.mjs';
 import { capChars, escapeOptionText } from './ask-option-descriptions.js';
@@ -232,6 +233,10 @@ export function deadlineText(ask: Pick<PendingAsk, 'deadlineAt' | 'createdAt'>, 
 }
 
 export function settledHeader(ask: PendingAsk, result: AskResult, locale: Locale, permissionHeadline?: string): El {
+  if (result.kind === 'answered' && isHookPermissionAsk(ask)) {
+    return permissionAnswerAllows(result) ? askHeader(t('card.ask.header.permission_allowed', undefined, locale), 'green')
+      : askHeader(t('card.ask.header.permission_denied', undefined, locale), 'grey');
+  }
   const title = result.kind === 'answered' ? t('card.ask.header.answered', undefined, locale)
     : permissionHeadline ?? t(result.kind === 'timedOut' ? 'card.ask.header.timed_out' : 'card.ask.header.invalidated', undefined, locale);
   return askHeader(title, result.kind === 'answered' ? 'green' : 'grey');
@@ -332,6 +337,7 @@ export function askReplyHint(ask: PendingAsk, locale: Locale): string | undefine
   if (ask.originKind === 'native-user-input-async') return t('card.ask.async_reply_hint', undefined, locale);
   const presentation = askPresentation(ask);
   if (presentation === 'text_reply') return t('card.ask.text_reply_hint', undefined, locale);
+  if (presentation === 'quick' && isHookPermissionAsk(ask)) return t('card.ask.permission_reply_hint', undefined, locale);
   if (presentation === 'quick' || (presentation === 'form' && !supportsAskCustomInput(ask))) {
     return t('card.ask.custom_reply_hint', undefined, locale);
   }

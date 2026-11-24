@@ -1,4 +1,4 @@
-import type { AskQuestion, CliPermissionOutcome } from '../ask-types.js';
+import type { AskQuestion, AskResult, CliPermissionOutcome } from '../ask-types.js';
 import type { Locale } from '../../i18n/types.js';
 
 /** adapter 解析一个 hook payload 后得到的问题列表和原始上下文。 */
@@ -85,4 +85,9 @@ export const PERMISSION_DENY_KEY = 'deny';
 export function isHookPermissionAsk(ask: { originKind?: string; questions: ReadonlyArray<AskQuestion> }): boolean {
   return ask.originKind === 'hook' && ask.questions.length === 1 && ask.questions[0]!.allowCustom === false
     && ask.questions[0]!.options.map(o => o.key).join('\n') === `${PERMISSION_ALLOW_KEY}\n${PERMISSION_DENY_KEY}`;
+}
+
+/** 一次作答是否放行权限请求：点了「允许」且没有附话。在话题里回复（附话）一律算拒绝，并把话转给 CLI。 */
+export function permissionAnswerAllows(result: Extract<AskResult, { kind: 'answered' }>): boolean {
+  return (result.answers[0] ?? []).includes(PERMISSION_ALLOW_KEY) && !(result.comment ?? '').trim();
 }
