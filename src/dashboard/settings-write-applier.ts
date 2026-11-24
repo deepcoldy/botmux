@@ -162,7 +162,16 @@ export interface ResolvedDashboardSettingsView {
    *  task-tree card switch is default OFF and optional. */
   multiTopic: { enabled: boolean; taskTreeCard?: boolean };
   /** Machine-wide task-routing config; enabled defaults false. */
-  taskRouting: import('../core/task-routing/model.js').TaskRoutingGlobalConfig & { enabled: boolean };
+  taskRouting: import('../core/task-routing/model.js').TaskRoutingGlobalConfig & {
+    enabled: boolean;
+    botOptions?: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      online: boolean;
+      oneShotAllowed: boolean;
+    }>;
+  };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
   /** Proxy for binary self-update downloads, null/absent = unset. */

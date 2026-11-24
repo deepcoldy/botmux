@@ -298,6 +298,8 @@ export interface FailedTurnRecord {
   userPrompt: string;
   cliInput: string;
   codexAppInput?: CodexAppTurnInput;
+  /** Daemon-retained attachments paired with the exact CLI input, for replay and quota handoff. */
+  attachments?: LarkAttachment[];
   failedAt: string;        // ISO
   errorCode?: string;
   status: 'failed' | 'ambiguous';
@@ -845,6 +847,11 @@ export interface Session {
   /** Exact final worker input retained for retry. This may include a triggering
    * group reply in addition to the original dashboard backlog prompt. */
   queuedActivationInput?: CliTurnPayload;
+  /** Literal raw opening retained while its activation has no submission ACK.
+   * Unlike pendingRawInput, this survives daemon restart and immediate raw starts
+   * that never had a pendingRepoSetup. Cleared with the activation journal. */
+  queuedActivationRawInput?: string;
+  queuedActivationRawTurnId?: string;
   queuedActivationTurnId?: string;
   queuedActivationDispatchAttempt?: number;
   /** Frozen resume mode for the exact journal head. Backlog activations are
@@ -1187,6 +1194,8 @@ export interface Session {
   /** Structured companion for lastCliInput so retry_last_task can preserve a
    * clean Codex App turn. The legacy string remains authoritative fallback. */
   lastCodexAppInput?: CodexAppTurnInput;
+  /** Attachments paired with lastCliInputTurnId; retained for exact failure recovery and quota handoff. */
+  lastAttachments?: LarkAttachment[];
   /** 最近一个失败或被中断的 turn 的记录，供 /retry 命令重注入。
    *  在 onTurnTerminal 回调中记录（failed/ambiguous），不随新 turn 注入清除——
    *  只被更新的失败 turn 覆盖。 */
@@ -1325,6 +1334,9 @@ export interface Session {
   modelPin?: import('./core/model-pin.js').ModelPin;
   /** Retained Auto-model selection for the exact native conversation. */
   traexAutoModelRuntime?: import('./services/traex-auto-model.js').TraexAutoModelRuntimeState;
+  /** Step of the bot's quota fallback chain this session moved to. Its model
+   * outranks every other launch-model source while its CLI is the session's. */
+  quotaFallback?: import('./services/quota-fallback-chain.js').QuotaFallbackSessionState;
   /** Group defaults at topic creation; absent on legacy sessions. */
   groupDefaultModels?: import('./core/group-default-models.js').GroupDefaultModels;
   /** Optional reasoning effort frozen at creation (per-turn API override).
@@ -2282,6 +2294,8 @@ export interface CliTurnPayload {
   /** Daemon-frozen LinkRef mode plus admission-only source material. */
   linkRefs?: LinkRefTurnEnvelope;
   codexAppInput?: CodexAppTurnInput;
+  /** Daemon-side replay metadata paired with this exact input. Workers do not consume it directly. */
+  attachments?: LarkAttachment[];
   nativeSessionTitle?: string;
   nativeSessionTitlePrompt?: string;
   trustedCaller?: TrustedCaller;
@@ -2457,7 +2471,7 @@ type DaemonToWorkerBase =
   // onExit so transient auto-restarted exits don't park-then-tear-down.
   // `terminal: false` (backend-outage give-up): only stop and wait for the next
   // message; do not create the bmx-diag shell on a tmux server that just failed.
-  | { type: 'park_diagnostic'; terminal?: boolean }
+  | { type: 'park_diagnostic'; terminal?: boolean; failPending?: boolean }
   | {
       type: 'tui_keys';
       keys: string[];
@@ -2794,6 +2808,16 @@ export type WorkerToDaemonBase =
    * with, the text this worker wrote for this turn. Read before the model
    * starts on it; no stand-in for `native_input_consumed`. */
   | { type: 'prompt_submitted_input'; turnId: string; dispatchAttempt?: number }
+  /** The worker is about to type this turn into the CLI behind the running
+   * turn (type-ahead). Its UserPromptSubmit hook fires while the running turn
+   * is still the managed origin, so the daemon accepts this turn's prompt
+   * context sidecar at claim time as well. */
+  | { type: 'type_ahead_queued'; turnId: string }
+  /** A queued turn was dropped, folded or terminated before its hook claimed. */
+  | { type: 'type_ahead_turn_dropped'; turnId: string }
+  /** Complete live queue after binding a local CLI PID marker; includes records
+   * restored by a replacement worker and reconciles daemon-side stale entries. */
+  | { type: 'type_ahead_queue_snapshot'; turnIds: string[] }
   /** Provenance-only signal for a Web Terminal / sandbox hook direct-submit.
    *  Sent unconditionally when the submit hook fires, even when the worker has
    *  no prompt_ready (the exact stuck-after-terminal case this card fix
@@ -2923,6 +2947,8 @@ export type WorkerToDaemonBase =
     canParkDiagnostic?: boolean;
     /** Presentation-only evidence that this TraeX generation never reached a prompt. */
     traexStartupFailure?: boolean;
+    /** Fresh local CLI exited before readiness / opening argv turn evidence. */
+    startupFailure?: boolean;
     /** A Codex App thread is still owned by another app-server writer. */
     codexAppActiveWriter?: boolean;
     /** Linux bwrap sandbox could not create this namespace on this host. */
@@ -3229,6 +3255,9 @@ export type WorkerToDaemonBase =
        *  reached a final assistant turn; it does not imply any Lark fallback
        *  message was posted (silent/suppressed turns also complete). */
       status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
+      /** Background tasks (agents, workflows, shells, monitors) still running
+       *  when a `completed` turn ended. Absent means none. */
+      backgroundTasks?: number;
       errorCode?: string;
       /** With `errorCode: 'safe_composer_required'` only: why the worker
        *  refused the unattended maintenance write. Absent from older workers;

@@ -48,7 +48,7 @@ import {
   BOARD_EMPTY_VIEW_KEYS,
   BOARD_EVENT_KIND_KEYS,
   BOARD_EXPLAINER_SANDBOX,
-  boardExplainers,
+  boardExplainerGroups,
   eventFileKind,
   formatBoardBytes,
   BOARD_FILES_PER_DRAFT,
@@ -102,6 +102,7 @@ import {
   type BoardDraft,
   type BoardEvent,
   type BoardExplainer,
+  type BoardExplainerGroup,
   type BoardFile,
   type BoardHint,
   type BoardItem,
@@ -1403,42 +1404,74 @@ function ExplainerDialog(props: { appId: string; explainer: BoardExplainer | nul
   );
 }
 
+function ExplainerFigure(props: { appId: string; explainer: BoardExplainer; onFullscreen(explainer: BoardExplainer): void }) {
+  const tr = useT();
+  const x = props.explainer;
+  const url = boardFileUrl(props.appId, x.id);
+  return (
+    <figure className={`dboard-explainer is-${x.kind}`} data-file-id={x.id}>
+      <figcaption className="dboard-explainer-head">
+        <span className="dboard-explainer-name">{x.kind === 'video' ? '🎬' : '📄'} {x.name}</span>
+        <time className="dboard-explainer-time" dateTime={new Date(x.createdAt).toISOString()}>{boardClock(x.createdAt)}</time>
+        <span className="dboard-explainer-size">{formatBoardBytes(x.bytes)}</span>
+        <span className="dboard-explainer-actions">
+          {x.kind === 'html' ? (
+            <button type="button" className="dboard-text-btn" onClick={() => props.onFullscreen(x)}>{tr('decisionBoard.explainerFullscreen')}</button>
+          ) : null}
+          <a href={url} target="_blank" rel="noopener noreferrer">{tr('decisionBoard.explainerNewTab')}</a>
+        </span>
+      </figcaption>
+      {x.kind === 'html' ? (
+        <iframe className="dboard-explainer-frame" src={url} sandbox={BOARD_EXPLAINER_SANDBOX} referrerPolicy="no-referrer"
+          loading="lazy" title={x.name} />
+      ) : <ExplainerVideo url={url} name={x.name} />}
+    </figure>
+  );
+}
+
+/**
+ * 同名说明的历史版本。折叠时不挂载内容：常驻 <details> 折叠只隐藏元素，播放中的 <video> 不会暂停
+ * （音频继续），断开文档连接的媒体元素才会停止；同时收起的 iframe 也一并释放。每组一份独立 open 状态。
+ */
+function ExplainerHistory(props: { appId: string; group: BoardExplainerGroup; onFullscreen(explainer: BoardExplainer): void }) {
+  const tr = useT();
+  const [open, setOpen] = useState(false);
+  if (!props.group.history.length) return null;
+  return (
+    <details className="dboard-explainer-history" open={open} onToggle={event => setOpen(event.currentTarget.open)}>
+      <summary>{tr('decisionBoard.explainerHistory', { n: props.group.history.length })}</summary>
+      {open ? (
+        <div className="dboard-explainer-history-list">
+          {props.group.history.map(x => (
+            <ExplainerFigure key={x.id} appId={props.appId} explainer={x} onFullscreen={props.onFullscreen} />
+          ))}
+        </div>
+      ) : null}
+    </details>
+  );
+}
+
 /**
  * 管家附的说明页和视频。说明页嵌在 sandbox iframe 里（完全限制，响应头另有 CSP sandbox），视频用页内播放器；
- * 飞书侧栏里新标签页不一定带得上登录态，所以页内就能看完。
+ * 飞书侧栏里新标签页不一定带得上登录态，所以页内就能看完。同名附件只展开最新版，旧版收进可折叠的历史版本。
  */
 function ExplainerPanel(props: { appId: string; files: readonly BoardFile[] }) {
   const tr = useT();
   const [fullscreen, setFullscreen] = useState<BoardExplainer | null>(null);
-  const explainers = boardExplainers(props.files);
-  if (!explainers.length) return null;
+  const groups = boardExplainerGroups(props.files);
+  if (!groups.length) return null;
   return (
     <section className="dboard-block dboard-explainers">
       <h2 className="dboard-block-title">
         {tr('decisionBoard.explainerTitle')}
         <small>{tr('decisionBoard.explainerHint')}</small>
       </h2>
-      {explainers.map(x => {
-        const url = boardFileUrl(props.appId, x.id);
-        return (
-          <figure key={x.id} className={`dboard-explainer is-${x.kind}`} data-file-id={x.id}>
-            <figcaption className="dboard-explainer-head">
-              <span className="dboard-explainer-name">{x.kind === 'video' ? '🎬' : '📄'} {x.name}</span>
-              <span className="dboard-explainer-size">{formatBoardBytes(x.bytes)}</span>
-              <span className="dboard-explainer-actions">
-                {x.kind === 'html' ? (
-                  <button type="button" className="dboard-text-btn" onClick={() => setFullscreen(x)}>{tr('decisionBoard.explainerFullscreen')}</button>
-                ) : null}
-                <a href={url} target="_blank" rel="noopener noreferrer">{tr('decisionBoard.explainerNewTab')}</a>
-              </span>
-            </figcaption>
-            {x.kind === 'html' ? (
-              <iframe className="dboard-explainer-frame" src={url} sandbox={BOARD_EXPLAINER_SANDBOX} referrerPolicy="no-referrer"
-                loading="lazy" title={x.name} />
-            ) : <ExplainerVideo url={url} name={x.name} />}
-          </figure>
-        );
-      })}
+      {groups.map(group => (
+        <div className="dboard-explainer-group" key={group.latest.id}>
+          <ExplainerFigure appId={props.appId} explainer={group.latest} onFullscreen={setFullscreen} />
+          <ExplainerHistory appId={props.appId} group={group} onFullscreen={setFullscreen} />
+        </div>
+      ))}
       <ExplainerDialog appId={props.appId} explainer={fullscreen} onClose={() => setFullscreen(null)} />
     </section>
   );

@@ -628,6 +628,29 @@ export function boardExplainers(files: readonly BoardFile[]): BoardExplainer[] {
   return out.sort((a, b) => b.createdAt - a.createdAt);
 }
 
+export interface BoardExplainerGroup {
+  latest: BoardExplainer;
+  /** 同名旧版本，新到旧；只影响展示，不删除附件或历史。 */
+  history: BoardExplainer[];
+}
+
+/** 同名说明是一份说明的不同版本：最新版直接展示，旧版折叠；不同组按各自最新版倒序。 */
+export function boardExplainerGroups(files: readonly BoardFile[]): BoardExplainerGroup[] {
+  const groups: BoardExplainerGroup[] = [];
+  const byName = new Map<string, BoardExplainerGroup>();
+  for (const explainer of boardExplainers(files)) {
+    const existing = byName.get(explainer.name);
+    if (existing) {
+      existing.history.push(explainer);
+    } else {
+      const group = { latest: explainer, history: [] };
+      byName.set(explainer.name, group);
+      groups.push(group);
+    }
+  }
+  return groups;
+}
+
 /** 历史里一个附件怎么显示：不在文件列表里的按截图处理（和以前一样）。 */
 export function eventFileKind(id: string, files: ReadonlyMap<string, BoardFile>): BoardFileKind {
   const file = files.get(id);

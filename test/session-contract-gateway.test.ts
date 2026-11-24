@@ -15,6 +15,7 @@ import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { dropTypeAheadPromptTurn, noteTypeAheadPromptTurn, promoteTypeAheadPromptTurn, reconcileTypeAheadPromptTurns } from '../src/core/type-ahead-prompt-queue.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import type { RuntimeEventBinding } from '../src/services/session-event-scope.js';
 import { sameWorker, sameRuntime } from '../src/services/session-contract.js';
@@ -50,6 +51,7 @@ function nativeSessionHandler(s: ReturnType<typeof fixture>, cliId = 'codex-app'
   const worker: any = { send: vi.fn() }; s.ds.worker = worker;
   const persisted: unknown[] = [];
   const env: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+    workerGeneration: 1, noteTypeAheadPromptTurn, dropTypeAheadPromptTurn, promoteTypeAheadPromptTurn, reconcileTypeAheadPromptTurns,
     logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => cliId,
     isLocalCliOpenReady: () => false, managedAuxUiSuppressed: () => true,
     syncAntigravityGroupTitle: vi.fn(),
@@ -750,6 +752,55 @@ describe('contract gateway and real worker boundaries', () => {
       expect(controller.allowsInput()).toBe(false);
     } finally { scope.restartCoordinator.reset(); }
   });
+  it('admits startup exit with an argv opening turn not yet bound by a transcript start', async () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('argv-opening-turn');
+    const legacy = vi.fn(); const worker = { send: vi.fn() }; s.ds.worker = worker as any;
+    const env: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'startup-exit', handleLegacyWorkerMessage: legacy };
+    const handle = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', env);
+    await handle({ type: 'claude_exit', code: 1, turnId: execution.turnId,
+      sessionContract: s.context(1, { runtime: s.runtime, execution }) });
+    expect(legacy).toHaveBeenCalledWith(expect.objectContaining({ type: 'claude_exit', code: 1 }));
+    expect(s.store.runtime(s.ref)?.phase).toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)?.runtime).toBeUndefined();
+  });
+
+  it('admits a current physical exit carrying an older runtime execution without granting a forged producer', () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('old-turn');
+    s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    const before = s.store.execution(s.ref, execution.executionId);
+    const next = s.controller.reserveBinding('fresh-physical', s.worker);
+    s.controller.bindRuntime('fresh-physical', s.worker, {
+      backend: 'tmux', physicalId: '222:new-start', nativeSessionId: 'new-native', proof: 'process_start',
+    });
+    const workerScope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = workerScope.beginRuntime();
+    workerScope.assign(binding.bindingId, next);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', {
+      workerSessionEventScope: workerScope,
+    });
+    // The worker removes execution from physical exits; the controller enriches
+    // the turnId back to the old execution. Exercise that real producer chain.
+    const wire = workerScope.run(binding, () => metadata({ type: 'claude_exit', code: 1, turnId: execution.turnId }));
+    expect(wire.sessionContract.scope.execution).toBeUndefined();
+    expect(s.controller.ingest(wire, s.worker).kind).toBe('current');
+    expect(s.store.runtime(s.ref, next.runtimeId)?.phase).toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)).toEqual(before);
+
+    // Same channel, but a runtime only a different worker has proven. Merely
+    // knowing its reference (and a valid old execution) must not authorize it.
+    const foreign = s.controller.bindWorker(2).worker;
+    const foreignRuntime = s.controller.reserveBinding('foreign-runtime', foreign);
+    s.controller.bindRuntime('foreign-runtime', foreign, { backend: 'tmux', physicalId: '333:foreign', proof: 'process_start' });
+    expect(s.controller.ingest({ type: 'claude_exit', code: 1,
+      sessionContract: s.context(50, { runtime: foreignRuntime, execution }) }, s.worker))
+      .toMatchObject({ kind: 'reject', reason: 'runtime_producer_unproven' });
+    expect(s.store.runtime(s.ref, foreignRuntime.runtimeId)?.phase).not.toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)).toEqual(before);
+  });
+
   it('records predecessor loss as history in the reserve-only window and still handles the later current crash', async () => {
     const s = fixture(); const execution = s.controller.admitInput('old-turn'); s.store.bindQueuedExecution(s.ref, execution, s.runtime);
     s.controller.ingest({ type: 'ready', sessionContract: s.context(1, {}) }, s.worker);
@@ -1171,6 +1222,36 @@ describe('contract gateway and real worker boundaries', () => {
     expect(s.store.executions(s.ref)).toHaveLength(0);
     expect(s.store.read(s.ref)?.revision).toBe(revision);
   });
+  it('admits type-ahead queue observations through the full contract handler before execution starts', async () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('om_queued');
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime(); scope.assign(binding.bindingId, s.runtime);
+    scope.noteAdmission({ ref: execution, phase: 'queued' });
+    s.ds.workerGeneration = 1; s.ds.session.workerGeneration = 1;
+    const { env, wires } = nativeSessionWorker(scope);
+    const { handle } = nativeSessionHandler(s, 'claude-code');
+
+    // flushPending enters the queued turn before its queue notification; the
+    // literal write and recordSubmission have not happened yet.
+    scope.enterTurn('om_queued');
+    env.send({ type: 'type_ahead_queued', turnId: 'om_queued' });
+    const queued = wires.shift() as any;
+    expect(queued.sessionContract.scope).toEqual({});
+    await handle(queued);
+    expect(s.ds.typeAheadPromptTurnIds).toEqual(['om_queued']);
+    expect(s.store.execution(s.ref, execution.executionId)?.phase).toBe('queued');
+    expect(s.store.execution(s.ref, execution.executionId)?.runtime).toBeUndefined();
+
+    env.send({ type: 'type_ahead_queue_snapshot', turnIds: ['om_queued', 'om_restored'] });
+    await handle(wires.shift());
+    expect(s.ds.typeAheadPromptTurnIds).toEqual(['om_queued', 'om_restored']);
+
+    env.send({ type: 'type_ahead_turn_dropped', turnId: 'om_queued' });
+    await handle(wires.shift());
+    expect(s.ds.typeAheadPromptTurnIds).toEqual(['om_restored']);
+  });
+
   it('publishes process attestation while the opening attempt is still unbound', async () => {
     const s = fixture(); const execution = s.controller.admitInput('opening-turn', 1);
     const scope = new WorkerSessionEventScope(s.ref, s.worker);

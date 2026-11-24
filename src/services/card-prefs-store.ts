@@ -10,6 +10,9 @@ import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } 
  *                                  'streaming' (default) = live streaming card
  *                                  body, 'footer' = ordinary reply-card footer,
  *                                  'off' = nowhere
+ *   • showUsageQuota            — whether to show 5h / 7d rolling account quota
+ *                                  segments in the card usage line (default on;
+ *                                  only explicit false persists)
  *   • disableStreamingCard      — suppress the live streaming session card
  *   • hiddenStreamingCardButtons — omit selected controls from live cards
  *   • silentTurnReactions       — drop the ✋→✅ lightweight status reactions on
@@ -70,6 +73,9 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
    *  'streaming' (default) = live streaming card body, 'footer' = ordinary
    *  reply-card footer, 'off' = nowhere. */
   usageDisplay: UsageDisplayMode;
+  /** Whether to show 5h / 7d rolling account quota percentages in the card
+   *  usage line. Default TRUE (absent = on; only explicit false persists). */
+  showUsageQuota: boolean;
   disableStreamingCard: boolean;
   replyCardMode: ReplyCardMode;
   hiddenStreamingCardButtons: StreamingCardButtonId[];
@@ -172,6 +178,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       ...Object.fromEntries(REPLY_FOOTER_KEYS.map(key => [key, c[key] !== false])),
       showReplyTiming: c.showReplyTiming === true,
       usageDisplay: normalizeUsageDisplay(c),
+      showUsageQuota: c.showUsageQuota !== false,
       disableStreamingCard: c.disableStreamingCard === true,
       replyCardMode: normalizeReplyCardMode(c.replyCardMode),
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(c.hiddenStreamingCardButtons) ?? [],
@@ -220,6 +227,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       ...Object.fromEntries(REPLY_FOOTER_KEYS.map(key => [key, true])),
       showReplyTiming: false,
       usageDisplay: DEFAULT_USAGE_DISPLAY,
+      showUsageQuota: true,
       disableStreamingCard: false,
       replyCardMode: 'legacy',
       hiddenStreamingCardButtons: [],
@@ -353,6 +361,7 @@ async function updateBotCardPrefsInternal(
     for (const key of REPLY_FOOTER_KEYS) applyDefaultTrue(entry, key, patch[key]);
     apply(entry, 'showReplyTiming', patch.showReplyTiming);
     applyUsageDisplay(entry, 'usageDisplay', patch.usageDisplay);
+    applyDefaultTrue(entry, 'showUsageQuota', patch.showUsageQuota);
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
     if (patch.replyCardMode !== undefined) {
       if (patch.replyCardMode === 'legacy') delete entry.replyCardMode;
@@ -417,6 +426,7 @@ async function updateBotCardPrefsInternal(
         ...normalizeReplyFooter(entry),
         showReplyTiming: entry.showReplyTiming === true,
         usageDisplay: normalizeUsageDisplay(entry),
+        showUsageQuota: entry.showUsageQuota !== false,
         disableStreamingCard: entry.disableStreamingCard === true,
         replyCardMode: normalizeReplyCardMode(entry.replyCardMode),
         hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons) ?? [],
@@ -481,6 +491,10 @@ async function updateBotCardPrefsInternal(
     bot.config.usageDisplay = (patch.usageDisplay && patch.usageDisplay !== DEFAULT_USAGE_DISPLAY)
       ? patch.usageDisplay
       : undefined;
+  }
+  if (patch.showUsageQuota !== undefined) {
+    // Default true: store false explicitly, clear (→ default on) when true.
+    bot.config.showUsageQuota = patch.showUsageQuota === false ? false : undefined;
   }
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
@@ -620,6 +634,7 @@ async function updateBotCardPrefsInternal(
   }
   logger.info(
     `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
+    `showUsageQuota=${r.result.showUsageQuota} ` +
     `disableStreamingCard=${r.result.disableStreamingCard} ` +
     `hiddenStreamingCardButtons=${r.result.hiddenStreamingCardButtons.join(',') || '-'} ` +
     `pinStreamingCard=${r.result.pinStreamingCard} ` +

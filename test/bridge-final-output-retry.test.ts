@@ -96,6 +96,9 @@ vi.mock('../src/bot-registry.js', () => ({
   // per case. Default 'footer' keeps the positive usage-render tests below green.
   resolveUsageDisplay: vi.fn(() => 'footer'),
   normalizeUsageDisplay: vi.fn(() => 'footer'),
+  // Sibling per-bot display gate read by the same reply-card usage reader;
+  // default ON keeps 5h/7d quota segments in the synthesized snapshot.
+  resolveShowUsageQuota: vi.fn(() => true),
   // Per-bot replyDelivery 的显式配置值。缺省给显式 'send'（绝大多数用例的前提）；
   // transcript 用例逐个翻转。undefined = 未配置，交由 effectiveReplyDelivery 按缺省
   // 解析（见 completedIdleTurnId 用例）。

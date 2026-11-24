@@ -350,8 +350,26 @@ export class TaskRoutingStore {
       const where: string[] = [];
       const params: Array<string | number> = [];
       if (options.botAppId) {
-        where.push('selected_app_id = ?');
-        params.push(options.botAppId);
+        // Match both the final selection and every fallback attempt. Filtering in
+        // SQL keeps ORDER BY + LIMIT correct; post-filtering the limited page
+        // could silently drop older matching records.
+        where.push(`(
+          selected_app_id = ? OR EXISTS (
+            SELECT 1 FROM json_each(
+              CASE WHEN json_valid(routing_records.attempts_json)
+                THEN CASE WHEN json_type(routing_records.attempts_json) = 'array'
+                  THEN routing_records.attempts_json
+                  ELSE '[]'
+                END
+                ELSE '[]'
+              END
+            ) AS attempt
+            WHERE CASE WHEN attempt.type = 'object'
+              THEN json_extract(attempt.value, '$.appId')
+            END = ?
+          )
+        )`);
+        params.push(options.botAppId, options.botAppId);
       }
       if (options.outcome) {
         where.push('outcome = ?');

@@ -1,10 +1,18 @@
-import { mkdtempSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { OWNER_GROUP_FOLLOW_PRESETS } from '../src/dashboard/web/owner-group-follow-rules.js';
 import { createOwnerGroupFollower, OwnerGroupFollowError, type OwnerGroupFollowContext, type OwnerGroupFollowIssue } from '../src/services/owner-group-follow.js';
 import { OwnerGroupFollowStore } from '../src/services/owner-group-follow-store.js';
-import { normalizeOwnerGroupFollowConfig, notifyOwnerGroupFollowChanged } from '../src/services/owner-group-follow-policy.js';
+import {
+  evaluateOwnerGroupFollowFilter, matchesOwnerGroupFollowRule, normalizeOwnerGroupFollowConfig,
+  notifyOwnerGroupFollowChanged, validateOwnerGroupFollowRule, type OwnerGroupFollowRule,
+} from '../src/services/owner-group-follow-policy.js';
+import type { OwnerFollowChatItem } from '../src/services/owner-group-follow-runtime.js';
+
+const includeAlert = { field: 'name', op: 'contains', pattern: 'alert' } satisfies OwnerGroupFollowRule;
+const excludeClosed = { field: 'any', op: 'contains', pattern: '[已关单]' } satisfies OwnerGroupFollowRule;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -25,7 +33,8 @@ describe('owner group follow', () => {
   });
   function harness() {
     let context: OwnerGroupFollowContext = { ownerOpenId: 'ou_owner', brand: 'feishu', config: { enabled: true } };
-    let chats = ['oc_old'], botChats: string[] = [];
+    let chats: (string | OwnerFollowChatItem)[] = ['oc_old'];
+    let botChats: string[] = [];
     const token = vi.fn(async (owner: string, _signal: AbortSignal): Promise<string | null> => `token:${owner}`);
     const listChats = vi.fn(async (_token: string, _signal: AbortSignal) => [...chats]);
     const listBotChats = vi.fn(async (_signal: AbortSignal) => [...botChats]);
@@ -40,7 +49,7 @@ describe('owner group follow', () => {
       follower, store, deps, token, listChats, listBotChats, invite, notify,
       context: () => context,
       setContext(value: OwnerGroupFollowContext, notifyChange = false) { context = value; if (notifyChange) notifyOwnerGroupFollowChanged(deps.appId); },
-      chats(value: string[]) { chats = value; }, bots(value: string[]) { botChats = value; },
+      chats(value: (string | OwnerFollowChatItem)[]) { chats = value; }, bots(value: string[]) { botChats = value; },
       async scan(seconds = 60) { vi.setSystemTime(Date.now() + seconds * 1000); await follower.tick(); },
     };
   }
@@ -112,6 +121,94 @@ describe('owner group follow', () => {
     expect(h.invite.mock.calls.map(call => call[0])).toEqual(['oc_new']);
     h.setContext({ ...h.context(), config: { enabled: true } }, true);
     await h.scan(); expect(h.invite).toHaveBeenCalledTimes(1);
+  });
+  it('keeps all observed IDs without persisting metadata or backfilling after rules are relaxed', async () => {
+    const h = harness();
+    h.setContext({ ...h.context(), config: { enabled: true, includeRules: [includeAlert], excludeRules: [excludeClosed] } });
+    await h.scan();
+    h.chats([
+      'oc_old',
+      { chatId: 'oc_skipped', name: 'Private regular group', description: 'Private description' },
+      { chatId: 'oc_closed', name: 'Private ALERT from yesterday', description: 'Private [已关单] note' },
+      { chatId: 'oc_followed', name: 'Private ALERT of today', description: 'Private incident details' },
+    ]);
+    await h.scan();
+    expect(h.invite.mock.calls.map(call => call[0])).toEqual(['oc_followed']);
+    expect(h.store.read()?.knownChatIds).toEqual(['oc_old', 'oc_skipped', 'oc_closed', 'oc_followed']);
+    expect(Object.keys(h.store.read()!.entries)).toEqual(['oc_followed']);
+    expect(readFileSync(h.store.path, 'utf8')).not.toMatch(/Private|"name"|"description"/);
+    h.setContext({ ...h.context(), config: { enabled: true } }, true);
+    await h.scan();
+    expect(h.invite).toHaveBeenCalledTimes(1);
+  });
+  it('uses only the first occurrence for filtering, invitation rechecks and the snapshot', async () => {
+    const h = harness();
+    h.setContext({ ...h.context(), config: { enabled: true, includeRules: [includeAlert] } });
+    await h.scan();
+    h.chats([
+      'oc_old',
+      { chatId: 'oc_first_match', name: 'Service alert' },
+      { chatId: 'oc_first_skip', name: 'Daily chat' },
+      { chatId: 'oc_first_match', name: 'Daily chat' },
+      { chatId: 'oc_first_skip', name: 'Service alert' },
+    ]);
+    await h.scan();
+    expect(h.invite.mock.calls.map(([chatId]) => chatId)).toEqual(['oc_first_match']);
+    expect(h.store.read()?.knownChatIds).toEqual(['oc_old', 'oc_first_match', 'oc_first_skip']);
+    expect(h.store.read()?.entries.oc_first_match?.status).toBe('joined');
+    expect(h.store.read()?.entries.oc_first_skip).toBeUndefined();
+  });
+  it.each([
+    ['pending', new OwnerGroupFollowError(true)],
+    ['inviting', new TypeError('connection closed')],
+  ] as const)('cancels a %s invitation when a rule tightens, even after its retry window', async (status, error) => {
+    const h = harness();
+    await h.scan();
+    h.chats(['oc_old', { chatId: 'oc_new', name: 'Unrelated group' }]);
+    h.invite.mockRejectedValueOnce(error);
+    await h.scan();
+    expect(h.store.read()?.entries.oc_new.status).toBe(status);
+    h.setContext({ ...h.context(), config: { enabled: true, includeRules: [includeAlert] } }, true);
+    await h.scan(300);
+    expect(h.store.read()?.entries.oc_new).toBeUndefined();
+    expect(h.store.read()?.knownChatIds).toContain('oc_new');
+    h.setContext({ ...h.context(), config: { enabled: true } }, true);
+    await h.scan();
+    expect(h.invite).toHaveBeenCalledTimes(1);
+  });
+  it('records actual membership even when an uncertain invitation becomes ineligible, then detects removal', async () => {
+    const h = harness();
+    await h.scan();
+    h.chats(['oc_old', { chatId: 'oc_new', name: 'Unrelated group' }]);
+    h.invite.mockRejectedValueOnce(new TypeError('connection closed'));
+    await h.scan();
+    expect(h.store.read()?.entries.oc_new.status).toBe('inviting');
+    h.bots(['oc_new']);
+    h.setContext({ ...h.context(), config: { enabled: true, includeRules: [includeAlert] } }, true);
+    await h.scan();
+    expect(h.store.read()?.entries.oc_new).toEqual({ status: 'joined', attempts: 1 });
+    h.bots([]);
+    await h.scan();
+    expect(h.store.read()?.entries.oc_new.status).toBe('removed');
+    expect(h.invite).toHaveBeenCalledTimes(1);
+  });
+  it('reads current rules again after the fresh token resolves and before claiming an invitation', async () => {
+    const h = harness();
+    await h.scan();
+    h.chats(['oc_old', { chatId: 'oc_new', name: 'Alert [已关单]' }]);
+    const fresh = deferred<string>(), started = deferred<void>();
+    h.token.mockResolvedValueOnce('scan-token')
+      .mockImplementationOnce(async () => { started.resolve(); return fresh.promise; });
+    const scan = h.scan();
+    await started.promise;
+    expect(h.store.read()?.entries.oc_new).toEqual({ status: 'pending', attempts: 0 });
+    h.setContext({ ...h.context(), config: { enabled: true, excludeRules: [excludeClosed] } });
+    fresh.resolve('fresh-token');
+    await scan;
+    expect(h.invite).not.toHaveBeenCalled();
+    expect(h.store.read()?.entries.oc_new).toEqual({ status: 'pending', attempts: 0 });
+    await h.scan();
+    expect(h.store.read()?.entries.oc_new).toBeUndefined();
   });
   it('records a removal during an invitation and never overwrites it with the late success', async () => {
     const h = harness(); await h.scan(); h.chats(['oc_old', 'oc_new']);
@@ -332,4 +429,143 @@ describe('owner follow policy validation', () => {
     ('rejects invalid settings rather than accidentally enabling: $value', ({ value }) => {
       expect(() => normalizeOwnerGroupFollowConfig(value)).toThrow();
     });
+  it('normalizes include and exclude rules independently in input order, preserving pattern whitespace', () => {
+    const exactCase = { ...includeAlert, caseSensitive: true };
+    const literalWithSpaces = { ...excludeClosed, pattern: ' [已关单] ' };
+    expect(normalizeOwnerGroupFollowConfig({
+      enabled: true,
+      includeRules: [{ ...includeAlert, caseSensitive: false }, exactCase, includeAlert],
+      excludeRules: [literalWithSpaces, { ...literalWithSpaces, caseSensitive: false }, includeAlert],
+    })).toEqual({ enabled: true, includeRules: [includeAlert, exactCase], excludeRules: [literalWithSpaces, includeAlert] });
+    expect(normalizeOwnerGroupFollowConfig({ includeRules: [], excludeRules: [] })).toBeUndefined();
+    expect(normalizeOwnerGroupFollowConfig({ includeRules: Array(50).fill(includeAlert) })).toEqual({ includeRules: [includeAlert] });
+  });
+  it.each([
+    ['not a plain object', new (class { field = 'name'; op = 'contains'; pattern = 'alert'; })(), 'shape'],
+    ['unknown attribute', { ...includeAlert, negate: true }, 'unknownField'],
+    ['unknown field', { ...includeAlert, field: 'subject' }, 'field'],
+    ['unknown op', { ...includeAlert, op: 'equals' }, 'op'],
+    ['non-string pattern', { ...includeAlert, pattern: 5 }, 'empty'],
+    ['empty pattern', { ...includeAlert, pattern: '' }, 'empty'],
+    ['whitespace pattern', { ...includeAlert, pattern: '  \t ' }, 'empty'],
+    ['long pattern', { ...includeAlert, pattern: 'a'.repeat(201) }, 'tooLong'],
+    ['non-boolean case', { ...includeAlert, caseSensitive: 'yes' }, 'caseSensitive'],
+    ['invalid regex', { ...includeAlert, op: 'regex', pattern: '[' }, 'invalidRegex'],
+  ])('rejects %s in both rule lists', (_name, rule, error) => {
+    expect(validateOwnerGroupFollowRule(rule)).toBe(error);
+    for (const list of ['includeRules', 'excludeRules']) {
+      expect(() => normalizeOwnerGroupFollowConfig({ [list]: [rule] })).toThrow(`${list}[0]`);
+    }
+  });
+  it.each(['includeRules', 'excludeRules'])('rejects a non-list or oversized %s before deduplication', list => {
+    expect(() => normalizeOwnerGroupFollowConfig({ [list]: includeAlert })).toThrow(list);
+    expect(() => normalizeOwnerGroupFollowConfig({ [list]: Array(51).fill(includeAlert) })).toThrow(list);
+  });
+  it.each(['(\\w+)+', '(a|aa)+', '(.*a){10}', '(?:(\\w{1,3})){2,}', '(a)\\1', '(?<a>.)\\k<a>',
+    '^.*Service[\\s\\S]*Alert[^]*Closed$', '^a?a?a?a?$',
+    String.raw`\w+\d+\w+\d+\w+\d+\w+\d+!`,
+    '(?:a)+(?:a)+(?:a)+(?:a)+(?:a)+(?:a)+b',
+    String.raw`[^\n]*a[^\n]*a[^\n]*a[^\n]*a[^\n]*a[^\n]*ab`,
+    '(?:a)?'.repeat(24) + 'a'.repeat(24),
+    'a?[a]?'.repeat(12) + 'a'.repeat(24),
+    String.raw`[\S]+x\D+y[\x00-\xff]+z`,
+    'a?b'.repeat(9),
+    '(a*a*)(a*a*)f',
+    '(a*a*)(a*a*)(a*a*)(a*a*)f',
+    'a*(a*b*)',
+    'a*a*(a*b)',
+    '(a*b*)?',
+    '(a*b*){2}',
+    '(a*b*){1}a*',
+    'a*(a*|b)c*',
+    // Zero-width tokens do not separate adjacent variable-width segments.
+    Array(8).fill('a*').join('(?:){0}') + 'f',
+    Array(8).fill('a*').join('(?:){0,0}') + 'f',
+    Array(8).fill('a*').join('a{0}') + 'f',
+    Array(8).fill('a*').join('(a){0}') + 'f',
+    Array(8).fill('a*').join(String.raw`\B`) + 'f',
+    Array(8).fill('a*').join('(?<!x)') + 'f',
+  ])
+    ('rejects high-risk regex %s and skips evaluation if it was not normalized', pattern => {
+      const rule = { ...includeAlert, op: 'regex', pattern } as const;
+      expect(validateOwnerGroupFollowRule(rule)).toBe('unsafeRegex');
+      expect(() => normalizeOwnerGroupFollowConfig({ includeRules: [rule] })).toThrow(/unsafe regular expression/);
+      expect(matchesOwnerGroupFollowRule(rule, { name: 'aaaaa' })).toBe(false);
+    });
+  it.each([
+    '\\(.*\\)', '[(|+?)]{2}', '\\\\1', '(?:bug){2}', '(?:bug|issue)$', '^(?:arg\\w+)?$', '.*outage.*|.*oncall.*',
+    String.raw`(?:\d{2}:){2}\d{2}`, '(?:[0-9a-f]{4}-){3}', '(?:[A-Z]{2}-)+', '(?i:alert){2}',
+    String.raw`\d+-\d+-\d+`, String.raw`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}`,
+    '[0-9]+-[0-9]+-[0-9]+', 'a?b'.repeat(8) + '|' + 'c?d'.repeat(8), '(?:a??b){1}',
+    '(a*b*){1}', 'a*(a*b){1}', '(a*|b)c*',
+    'a*(?:){0}a*', 'a*(?:){0,0}a*', 'a*a{0}a*', 'a*(a){0}a*',
+    String.raw`a*\ba*`, String.raw`a*\Ba*`, 'a*(?<=a)a*', 'a*(?<!x)a*',
+  ])
+    ('accepts safe regex %s', pattern => {
+      expect(validateOwnerGroupFollowRule({ ...includeAlert, op: 'regex', pattern })).toBeUndefined();
+    });
+  it('accepts every built-in preset and matches a scoped case-insensitive group', () => {
+    for (const { rules } of OWNER_GROUP_FOLLOW_PRESETS) {
+      for (const rule of rules) expect(validateOwnerGroupFollowRule(rule)).toBeUndefined();
+    }
+    expect(matchesOwnerGroupFollowRule({ ...includeAlert, op: 'regex', pattern: '(?i:alert){2}' }, { name: 'AlertALERT' })).toBe(true);
+  });
+});
+
+describe('owner follow matching', () => {
+  const operations = [
+    ['contains', 'ALERT'], ['startsWith', 'ACTIVE'], ['endsWith', 'CHAT'], ['regex', '^ACTIVE.+CHAT$'],
+  ] as const;
+  const fields = ['name', 'description', 'any'] as const;
+  it.each(fields.flatMap(field => operations.flatMap(([op, pattern]) => [false, true].map(caseSensitive => ({
+    field, op, pattern, caseSensitive,
+  })))))('matches $field with $op and caseSensitive=$caseSensitive', rule => {
+    const match = (value: string) => {
+      if (rule.field !== 'description') {
+        expect(matchesOwnerGroupFollowRule(rule, { name: value, description: 'unrelated' })).toBe(!rule.caseSensitive || value.startsWith('ACTIVE'));
+      }
+      if (rule.field !== 'name') {
+        expect(matchesOwnerGroupFollowRule(rule, { name: 'unrelated', description: value })).toBe(!rule.caseSensitive || value.startsWith('ACTIVE'));
+      }
+    };
+    match('ACTIVE ALERT CHAT');
+    match('active alert chat');
+    expect(matchesOwnerGroupFollowRule(rule, { name: 'unrelated', description: 'unrelated' })).toBe(false);
+  });
+  it('uses only the selected field, handles missing metadata and safely skips invalid regex', () => {
+    expect(matchesOwnerGroupFollowRule(includeAlert, { description: 'alert' })).toBe(false);
+    expect(matchesOwnerGroupFollowRule({ ...includeAlert, field: 'description' }, { name: 'alert' })).toBe(false);
+    expect(matchesOwnerGroupFollowRule({ ...includeAlert, field: 'any', pattern: 'ab' }, { name: 'a', description: 'b' })).toBe(false);
+    expect(matchesOwnerGroupFollowRule({ ...includeAlert, op: 'regex', pattern: '^$' }, {})).toBe(true);
+    expect(matchesOwnerGroupFollowRule({ ...includeAlert, op: 'regex', pattern: '[' }, {})).toBe(false);
+  });
+  it('does not match empty or whitespace-only patterns from unnormalized rules', () => {
+    for (const [op] of operations) {
+      for (const pattern of ['', ' \t ']) {
+        expect(matchesOwnerGroupFollowRule({ field: 'any', op, pattern }, { name: pattern, description: pattern })).toBe(false);
+      }
+    }
+  });
+  it('rechecks a cached regex when its pattern or case setting changes', () => {
+    const rule: OwnerGroupFollowRule = { ...includeAlert, op: 'regex' };
+    expect(matchesOwnerGroupFollowRule(rule, { name: 'ALERT' })).toBe(true);
+    rule.caseSensitive = true;
+    expect(matchesOwnerGroupFollowRule(rule, { name: 'ALERT' })).toBe(false);
+    rule.pattern = '[';
+    expect(matchesOwnerGroupFollowRule(rule, { name: 'alert' })).toBe(false);
+  });
+  it('reports the first matching rule with chat ID and exclusion precedence', () => {
+    const config = { excludeChatIds: ['oc_banned'], includeRules: [includeAlert, includeAlert], excludeRules: [includeAlert, excludeClosed] };
+    expect(evaluateOwnerGroupFollowFilter(config, { chatId: 'oc_banned', name: 'alert [已关单]' }))
+      .toEqual({ matched: false, reason: 'excluded_chat_id' });
+    expect(evaluateOwnerGroupFollowFilter(config, { name: 'alert [已关单]' }))
+      .toEqual({ matched: false, reason: 'excluded_rule', ruleIndex: 0, rule: includeAlert });
+    expect(evaluateOwnerGroupFollowFilter(config, { description: '[已关单]' }))
+      .toEqual({ matched: false, reason: 'excluded_rule', ruleIndex: 1, rule: excludeClosed });
+    expect(evaluateOwnerGroupFollowFilter({ includeRules: [excludeClosed, includeAlert, includeAlert] }, { name: 'alert' }))
+      .toEqual({ matched: true, reason: 'included_rule', ruleIndex: 1, rule: includeAlert });
+    expect(evaluateOwnerGroupFollowFilter(config, { name: 'general' })).toEqual({ matched: false, reason: 'not_included' });
+    expect(evaluateOwnerGroupFollowFilter({ includeRules: [], excludeRules: [excludeClosed] }, {})).toEqual({ matched: true, reason: 'all' });
+    expect(evaluateOwnerGroupFollowFilter(undefined, {})).toEqual({ matched: true, reason: 'all' });
+  });
 });

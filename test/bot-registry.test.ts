@@ -1888,6 +1888,7 @@ describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () =>
     app: process.env.BOTMUX_LARK_APP_ID,
     brand: process.env.BOTMUX_BRAND_LABEL,
     usageDisplay: process.env.BOTMUX_USAGE_DISPLAY,
+    showUsageQuota: process.env.BOTMUX_SHOW_USAGE_QUOTA,
     replyStyle: process.env.BOTMUX_REPLY_STYLE,
   };
   beforeEach(async () => { mod = await freshImport(); });
@@ -1898,6 +1899,8 @@ describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () =>
     if (saved.brand === undefined) delete process.env.BOTMUX_BRAND_LABEL; else process.env.BOTMUX_BRAND_LABEL = saved.brand;
     if (saved.usageDisplay === undefined) delete process.env.BOTMUX_USAGE_DISPLAY;
     else process.env.BOTMUX_USAGE_DISPLAY = saved.usageDisplay;
+    if (saved.showUsageQuota === undefined) delete process.env.BOTMUX_SHOW_USAGE_QUOTA;
+    else process.env.BOTMUX_SHOW_USAGE_QUOTA = saved.showUsageQuota;
     if (saved.replyStyle === undefined) delete process.env.BOTMUX_REPLY_STYLE;
     else process.env.BOTMUX_REPLY_STYLE = saved.replyStyle;
   });
@@ -1963,6 +1966,25 @@ describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () =>
     process.env.BOTMUX_USAGE_DISPLAY = 'off';
     mod.registerBot(makeCfg({ larkAppId: 'app_hot' }));
     expect(mod.resolveUsageDisplay('app_hot')).toBe('streaming');
+  });
+
+  it('resolves showUsageQuota from registry or own-bot sandbox env (default true)', () => {
+    expect(mod.resolveShowUsageQuota('app_default')).toBe(true);
+
+    mod.registerBot(makeCfg({ larkAppId: 'app_quota_off', showUsageQuota: false }));
+    expect(mod.resolveShowUsageQuota('app_quota_off')).toBe(false);
+
+    mod.registerBot(makeCfg({ larkAppId: 'app_quota_on' }));
+    expect(mod.resolveShowUsageQuota('app_quota_on')).toBe(true);
+
+    process.env.BOTMUX_LARK_APP_ID = 'app_sbx_quota';
+    process.env.BOTMUX_SHOW_USAGE_QUOTA = 'false';
+    expect(mod.resolveShowUsageQuota('app_sbx_quota')).toBe(false);
+    expect(mod.resolveShowUsageQuota('app_other_quota')).toBe(true);
+
+    // Live registry overrides a stale spawn env for the same app.
+    mod.registerBot(makeCfg({ larkAppId: 'app_sbx_quota' }));
+    expect(mod.resolveShowUsageQuota('app_sbx_quota')).toBe(true);
   });
 
   it('prefers the frozen replyStyle env for its own app but never leaks it across apps', () => {

@@ -1360,6 +1360,21 @@ export function abortCotMessage(ds: DaemonSession): void {
   }
 }
 
+/** Terminal status already recorded for this exact turn/attempt, if any.
+ *  Callers holding UI open for background work must not re-open a turn whose
+ *  terminal was already finalized (especially after an interrupted CLI exit). */
+export function cotMessageFinishStatus(
+  ds: DaemonSession,
+  binding: { turnId: string; dispatchAttempt?: number },
+): 'done' | 'interrupted' | undefined {
+  const key = turnKeyOf(binding);
+  const early = earlyTerminals.get(ds)?.get(key);
+  if (early) return early;
+  let state = states.get(ds);
+  if (state?.turnKey !== key) state = recentStates.get(ds)?.get(key);
+  return state?.finishStatus;
+}
+
 /**
  * Settle the turn's CoT message, if this module owns it. Returns true when
  * owned. Idempotent.
