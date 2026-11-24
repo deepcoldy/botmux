@@ -1,13 +1,14 @@
 import type { AskQuestion, AskResult } from '../core/ask-types.js';
+import { NATIVE_ASYNC_ASK_ORIGIN, NATIVE_ASYNC_RESTORE_ASK_ORIGIN } from '../core/ask-types.js';
 import { codexUserInputAnswer } from './codex-user-input.js';
 import type { CodexAppTurnInput } from '../types.js';
 
-export const CODEX_ASYNC_ASK_ORIGIN = 'native-user-input-async';
+export const CODEX_ASYNC_ASK_ORIGIN = NATIVE_ASYNC_ASK_ORIGIN;
 /** A card restored after a worker restart is a NEW broker identity. The dead
  *  worker's ask may still be retained as an invalidated terminal under the
  *  original key; re-registering that key would return the stale result and
  *  never post a card. */
-export const CODEX_ASYNC_RESTORE_ASK_ORIGIN = 'native-user-input-async-restore';
+export const CODEX_ASYNC_RESTORE_ASK_ORIGIN = NATIVE_ASYNC_RESTORE_ASK_ORIGIN;
 
 export function isCodexAsyncAskOrigin(originKind: string | undefined): boolean {
   return originKind === CODEX_ASYNC_ASK_ORIGIN || originKind === CODEX_ASYNC_RESTORE_ASK_ORIGIN;

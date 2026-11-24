@@ -4,6 +4,7 @@ import { TraexQuestionBridge } from '../src/core/traex-question-bridge.js';
 import {
   parseTraexQuestionPage, traexPendingAsyncQuestionVisible, traexQuestionAskQuestion,
   nextTraexQuestionStep, traexQuestionStepAllowed, traexQuestionSignature, traexQuestionState,
+  traexQuestionFlowVisible,
 } from '../src/utils/traex-question-page.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { AskQuestion, AskResult } from '../src/core/ask-types.js';
@@ -44,6 +45,16 @@ describe('recorded TRAE 0.216 asynchronous question layouts', () => {
     expect(traexPendingAsyncQuestionVisible(CHOICE)).toBe(false);
     expect(parseTraexQuestionPage(`${CHOICE}\n❯ real composer`)).toBeUndefined();
   });
+
+  it('reads a middle-question footer wrapped at 80 columns', () => {
+    const unwrapped = CHOICE.replace('1 of 2', '2 of 3').replace('main prompt', 'prev question').trimEnd();
+    const rows = unwrapped.split('\n');
+    const footer = rows.at(-1)!;
+    expect([...footer]).toHaveLength(82);
+    const wrapped = [...rows.slice(0, -1), [...footer].slice(0, 80).join(''), [...footer].slice(80).join('')].join('\n');
+    expect(parseTraexQuestionPage(wrapped)).toMatchObject({ delivery: 'async', index: 2, total: 3 });
+    expect(traexQuestionFlowVisible(wrapped)).toBe(true);
+  });
 });
 
 beforeEach(() => vi.useFakeTimers());
@@ -54,7 +65,8 @@ afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks();
 function harness() {
   const questions = [{ title: 'Pick probe label', options: ['Alpha', 'Beta'], selected: 1, text: '' },
     { title: 'Type probe text', options: [] as string[], selected: 1, text: '' }];
-  const state = { lifetime: 1, enabled: true, shown: false, index: 0, refuseEnter: false, captures: 0 };
+  const state = { lifetime: 1, enabled: true, shown: false, index: 0, refuseEnter: false, captures: 0,
+    openFailures: 0, refuseOpen: false };
   const inputs: string[] = [];
   const delivered: string[][] = [];
   const asks: Array<{ question: AskQuestion; pageDelivery?: string; signal: AbortSignal; answer(result: AskResult): void }> = [];
@@ -72,7 +84,15 @@ function harness() {
     now: () => Date.now(), setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: h => clearTimeout(h as ReturnType<typeof setTimeout>),
     enabled: () => state.enabled, lifetime: () => state.lifetime, mayOpenPending: () => !!questions.length,
     capture: async () => { state.captures++; return screen(); },
-    openPending: async () => { inputs.push('M-Up'); state.shown = true; return true; },
+    openPending: async () => {
+      inputs.push('M-Up');
+      if (state.refuseOpen || state.openFailures > 0) {
+        if (state.openFailures > 0) state.openFailures--;
+        return false;
+      }
+      state.shown = true;
+      return true;
+    },
     ask: (question, signal, page) => new Promise(resolve => { asks.push({ question, pageDelivery: page?.delivery, signal, answer: resolve }); }),
     writeKey: async key => {
       inputs.push(key);
@@ -126,7 +146,8 @@ describe('asynchronous question cards and physical delivery', () => {
     const h = harness(); h.questions.pop(); h.bridge.kick();
     await vi.advanceTimersByTimeAsync(1200);
     h.state.shown = false;
-    await vi.advanceTimersByTimeAsync(1200);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.bridge.hasOpenCard()).toBe(true);
     expect(h.inputs).toEqual(['M-Up']);
     h.questions[0]!.title = 'a different question';
     h.asks[0]!.answer(result(['1']));
@@ -156,6 +177,87 @@ describe('asynchronous question cards and physical delivery', () => {
     h.asks[0]!.answer(result(['2'])); await vi.advanceTimersByTimeAsync(1000);
     expect(h.delivered).toEqual([]);
     expect(h.inputs).toEqual(['M-Up']);
+    h.bridge.dispose();
+  });
+
+  it('reopens when the panel collapses before the first card becomes stable', async () => {
+    const h = harness(); h.bridge.kick();
+    await vi.advanceTimersByTimeAsync(600);
+    expect(h.asks).toHaveLength(0);
+    h.state.shown = false;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(h.inputs.filter(x => x === 'M-Up')).toHaveLength(2);
+    expect(h.asks).toHaveLength(1);
+    expect(h.bridge.hasOpenCard()).toBe(true);
+    h.bridge.dispose();
+  });
+
+  it('retries a transient opening failure until the card is raised', async () => {
+    const h = harness(); h.state.openFailures = 1; h.bridge.kick();
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(h.inputs.filter(x => x === 'M-Up')).toHaveLength(2);
+    expect(h.asks).toHaveLength(1);
+    expect(h.notices).toEqual([]);
+    h.bridge.dispose();
+  });
+
+  it('bounds persistent opening failures and reports them once', async () => {
+    const h = harness(); h.state.refuseOpen = true; h.bridge.kick();
+    await vi.advanceTimersByTimeAsync(10_000);
+    const attempts = h.inputs.filter(x => x === 'M-Up').length;
+    expect(attempts).toBeGreaterThan(1);
+    expect(h.asks).toHaveLength(0);
+    expect(h.notices).toEqual(['worker.traex_question.unreadable']);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.inputs.filter(x => x === 'M-Up')).toHaveLength(attempts);
+    expect(h.notices).toHaveLength(1);
+    h.bridge.dispose();
+  });
+
+  it('replaces a stale card when the terminal answers it and a smaller pending batch remains', async () => {
+    const h = harness(); h.bridge.kick();
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(h.asks).toHaveLength(1);
+    h.questions.shift();
+    h.state.shown = false;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(h.asks[0]!.signal.aborted).toBe(true);
+    expect(h.asks).toHaveLength(2);
+    expect(h.asks[1]!.question.inputMode).toBe('text');
+    h.bridge.dispose();
+  });
+
+  it.each([
+    { text: 'Type your answer', replacement: 'A literal answer', choice: false },
+    { text: 'Other', replacement: 'A different answer', choice: true },
+  ])('rejects the native placeholder before writing and accepts a rephrased answer: $text', async ({ text, replacement, choice }) => {
+    const h = harness();
+    if (choice) h.questions.pop(); else h.questions.shift();
+    h.bridge.kick();
+    await vi.advanceTimersByTimeAsync(1200);
+    h.asks[0]!.answer(result([], text));
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(h.delivered).toEqual([]);
+    expect(h.inputs.some(x => x.startsWith('paste:') || x === 'Enter')).toBe(false);
+    expect(h.notices).toEqual(['worker.traex_question.write_failed']);
+    expect(h.asks).toHaveLength(2);
+
+    h.asks[1]!.answer(result([], replacement));
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(h.delivered).toEqual([[replacement]]);
+    expect(h.notices).toHaveLength(1);
+    h.bridge.dispose();
+  });
+
+  it('submits the seventeenth async option without exhausting the input budget', async () => {
+    const h = harness(); h.questions.pop();
+    h.questions[0]!.options = Array.from({ length: 17 }, (_, i) => `Option ${i + 1}`);
+    h.bridge.kick();
+    await vi.advanceTimersByTimeAsync(1200);
+    h.asks[0]!.answer(result(['17']));
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(h.delivered).toEqual([['Option 17']]);
+    expect(h.inputs.filter(x => x === 'Enter')).toHaveLength(1);
     h.bridge.dispose();
   });
 });
@@ -206,7 +308,8 @@ describe('worker serialization guards for native question controls', () => {
       nativeSessionForkPending: () => false, traexQuestionBridgeActive: () => true,
       traexQuestionCapture: async () => screen, parseTraexQuestionPage, traexQuestionSignature, traexQuestionState,
       runAfterAmbiguousSubmissionWrites: (_: any, fn: any) => new Promise<void>(r => { release = r; }).then(fn),
-      log: vi.fn(), invalidatePromptReadinessEvidence: vi.fn() };
+      log: vi.fn(), adapterInputHandle: () => backend, readinessTrackedInput: (v: any) => v,
+      invalidatePromptReadinessEvidence: vi.fn() };
     const send = loadWorkerFunction<(write: any, page: any) => Promise<boolean>>('traexQuestionWrite', scope);
     const running = send(write, expected); screen = TEXT.replace('Type probe text', 'new question'); release();
     expect(await running).toBe(false);

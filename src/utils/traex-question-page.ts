@@ -124,20 +124,29 @@ export function traexPendingAsyncQuestionCount(screen: string): number | undefin
   return Number.isSafeInteger(count) ? count : undefined;
 }
 
-function isTraexAsyncQuestionFooter(row: string): boolean {
-  return /^enter submit  \|  ctrl\+\] skip  \|  alt\/⌥\+↓ (?:main prompt|prev question)(?:  \|  shift\+← next question)?$/.test(row.trim());
+/** Async footers wrap at arbitrary cells on narrow panes. Compare their
+ * non-whitespace payload so one- and two-row forms retain the same strict hints. */
+function readTraexAsyncQuestionFooter(rows: string[]): { start: number; nextQuestion: boolean } | undefined {
+  for (const count of [1, 2]) {
+    if (rows.length < count) continue;
+    const compact = rows.slice(rows.length - count).join('').replace(/\s+/g, '');
+    const match = /^entersubmit\|ctrl\+\]skip\|alt\/⌥\+↓(mainprompt|prevquestion)(\|shift\+←nextquestion)?$/.exec(compact);
+    if (match) return { start: rows.length - count, nextQuestion: match[2] !== undefined };
+  }
+  return undefined;
 }
 
 /** 来自 0.216.0 真机截图：异步页没有 Question i/n 标头，Other 自身就是输入框。 */
 function parseTraexAsyncQuestionPage(screen: string): TraexQuestionPage | undefined {
   const rows = visibleRows(screen);
-  if (!rows.at(-1) || !isTraexAsyncQuestionFooter(rows.at(-1)!)) return undefined;
+  const footer = readTraexAsyncQuestionFooter(rows);
+  if (!footer) return undefined;
   let rule = -1;
-  for (let i = rows.length - 2; i >= 0; i--) {
+  for (let i = footer.start - 1; i >= 0; i--) {
     if (/^─{3,}$/.test(rows[i]!)) { rule = i; break; }
   }
   if (rule < 0) return undefined;
-  const body = rows.slice(rule + 1, -1);
+  const body = rows.slice(rule + 1, footer.start);
   const optionRow = /^ {2}([›❯ ]) ([1-9]\d?)\. (.*)$/;
   const groups: string[][] = [];
   for (const row of body) {
@@ -154,7 +163,7 @@ function parseTraexAsyncQuestionPage(screen: string): TraexQuestionPage | undefi
   const total = indexRow ? Number(indexRow[2]) : 1;
   if (indexRow) promptRows.shift();
   if (!Number.isSafeInteger(index) || !Number.isSafeInteger(total) || index > total) return undefined;
-  if (rows.at(-1)!.includes('next question') && !indexRow) return undefined;
+  if (footer.nextQuestion && !indexRow) return undefined;
   if (!promptRows.length || promptRows.some(row => !/^ {2}\S/.test(row))) return undefined;
   if (!widget.some(row => optionRow.test(row))) {
     if (widget.some(row => !/^ {2}\S/.test(row))) return undefined;
@@ -405,7 +414,7 @@ export function isTraexQuestionConfirmPage(screen: string): boolean {
 export function traexQuestionFlowVisible(screen: string): boolean {
   if (!screen) return false;
   if (parseTraexAsyncQuestionPage(screen)) return true;
-  if (isTraexAsyncQuestionFooter(visibleRows(screen).at(-1) ?? '')) return true;
+  if (readTraexAsyncQuestionFooter(visibleRows(screen))) return true;
   const rows = normalizedRows(screen);
   return looseQuestionPageVisible(rows) || looseConfirmPageVisible(rows);
 }
@@ -475,7 +484,9 @@ export function traexQuestionAnswerFromAsk(page: TraexQuestionPage, result: AskR
     || '';
   if (custom) {
     const text = sanitizeTraexQuestionNote(custom);
-    return text ? { kind: 'custom', text } : 'empty custom answer';
+    if (!text) return 'empty custom answer';
+    if (text === asyncQuestionPlaceholder(page)) return 'answer is indistinguishable from the native placeholder';
+    return { kind: 'custom', text };
   }
   const real = page.options.filter(option => !option.other);
   const numbers: number[] = [];
@@ -507,6 +518,14 @@ function moveTowards(page: TraexQuestionPage, target: number): TraexQuestionStep
   const down = (target - page.highlighted + count) % count;
   const up = (page.highlighted - target + count) % count;
   return { kind: 'key', key: down <= up ? 'Down' : 'Up', final: false };
+}
+
+/** Plain captures cannot distinguish these native placeholders from the same
+ * typed text, including immediately before Enter. Callers must fail closed. */
+function asyncQuestionPlaceholder(page: TraexQuestionPage): string | undefined {
+  if (page.delivery !== 'async') return undefined;
+  if (page.options.every(option => option.other)) return 'Type your answer';
+  return page.options.at(-1)?.other ? 'Other' : undefined;
 }
 
 /**

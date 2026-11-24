@@ -53,8 +53,9 @@ export const TRAEX_QUESTION_GONE_MS = 1_500;
 /** How long one input may take to show on screen. */
 export const TRAEX_QUESTION_STEP_TIMEOUT_MS = 2_500;
 const STEP_POLL_MS = 100;
-/** Longest input sequence an answer may need (4 options + Other). */
-const MAX_STEPS = 16;
+/** Minimum input budget; async batches derive a larger bound from their options. */
+const MIN_ANSWER_STEPS = 16;
+const MAX_OPEN_PENDING_ATTEMPTS = 3;
 /** While a question that gets no further card is still on screen, look this
  *  often whether it has left (then it may be carded again). */
 const SETTLED_WATCH_MS = 5_000;
@@ -129,7 +130,7 @@ export class TraexQuestionBridge {
   /** The question flow is on screen but its options cannot be read (e.g. a
    *  narrow pane wraps the labels): since when, and whether it was said. */
   private unreadable: { since: number; notified: boolean } | undefined;
-  private openingPending: { lifetime: number; count: number; since: number; seenPage: boolean; notified: boolean } | undefined;
+  private openingPending: { lifetime: number; count: number; attempts: number; nextAttemptAt: number; seenPage: boolean; notified: boolean } | undefined;
 
   constructor(private readonly deps: TraexQuestionBridgeDeps) {}
 
@@ -196,6 +197,8 @@ export class TraexQuestionBridge {
       this.kick();
     } else if (this.candidate) {
       this.kick(TRAEX_QUESTION_STABLE_MS);
+    } else if (this.openingPending && !this.openingPending.seenPage && !this.openingPending.notified) {
+      this.kick(Math.max(0, this.openingPending.nextAttemptAt - this.deps.now()));
     } else if ((this.card && !this.card.answering) || (this.unreadable && !this.unreadable.notified)) {
       this.kick(TRAEX_QUESTION_POLL_MS);
     } else if (this.settled.size > 0) {
@@ -221,25 +224,40 @@ export class TraexQuestionBridge {
     const now = this.deps.now();
     if (!page) {
       const pendingCount = traexPendingAsyncQuestionCount(screen);
-      // 操作者回到主输入框不等于取消异步问题；卡片仍可回答，届时再打开并核对原题。
+      // 操作者回到主输入框不等于取消异步问题；但剩余题数变化证明当前卡
+      // 已不属于这个批次，必须撤掉旧卡并允许新题重新展开。
       if (pendingCount !== undefined && this.card?.page.delivery === 'async') {
-        this.card.missingSince = undefined;
-        return;
+        const remaining = this.card.page.total - this.card.page.index + 1;
+        if (pendingCount === remaining) {
+          this.card.missingSince = undefined;
+          return;
+        }
+        this.withdraw('the pending question batch changed');
+        this.openingPending = undefined;
       }
       if (this.deps.mayOpenPending?.() === false) this.openingPending = undefined;
       if (pendingCount !== undefined && this.deps.openPending && this.deps.mayOpenPending?.() !== false) {
-        const opening = this.openingPending;
+        let opening = this.openingPending;
         if (!opening || opening.lifetime !== lifetime || opening.count !== pendingCount) {
-          const attempt = { lifetime, count: pendingCount, since: now, seenPage: false, notified: false };
-          this.openingPending = attempt;
-          const opened = await this.deps.openPending();
-          if (this.disposed || this.deps.lifetime() !== lifetime || this.openingPending !== attempt) return;
-          if (opened) this.kick(TRAEX_QUESTION_STABLE_MS);
-        } else if (!opening.seenPage && now - opening.since < TRAEX_QUESTION_STEP_TIMEOUT_MS) {
-          this.kick(TRAEX_QUESTION_POLL_MS);
-        } else if (!opening.seenPage && !opening.notified) {
-          opening.notified = true;
-          this.deps.notify('worker.traex_question.unreadable');
+          opening = { lifetime, count: pendingCount, attempts: 0, nextAttemptAt: now, seenPage: false, notified: false };
+          this.openingPending = opening;
+        }
+        // A page seen before its card became stable is not a delivered card.
+        // If it collapsed again, retry the same bounded opening sequence.
+        if (opening.seenPage && !this.card) {
+          opening.seenPage = false;
+          opening.nextAttemptAt = now;
+        }
+        if (!opening.seenPage && !opening.notified) {
+          if (opening.attempts < MAX_OPEN_PENDING_ATTEMPTS && now >= opening.nextAttemptAt) {
+            opening.attempts++;
+            const opened = await this.deps.openPending();
+            if (this.disposed || this.deps.lifetime() !== lifetime || this.openingPending !== opening) return;
+            opening.nextAttemptAt = this.deps.now() + (opened ? TRAEX_QUESTION_STABLE_MS : TRAEX_QUESTION_POLL_MS * opening.attempts);
+          } else if (opening.attempts >= MAX_OPEN_PENDING_ATTEMPTS && now >= opening.nextAttemptAt) {
+            opening.notified = true;
+            this.deps.notify('worker.traex_question.unreadable');
+          }
         }
       }
       this.candidate = undefined;
@@ -388,7 +406,10 @@ export class TraexQuestionBridge {
       if (notesOpenedHere) await this.closeOwnNotes(card, answer);
       this.notWritten(card, reason, kind);
     };
-    for (let count = 0; count < MAX_STEPS; count++) {
+    const maxSteps = card.page.delivery === 'async'
+      ? Math.max(MIN_ANSWER_STEPS, card.page.options.length + 2)
+      : MIN_ANSWER_STEPS;
+    for (let count = 0; count < maxSteps; count++) {
       const page = await this.freshPage(card);
       if (!('index' in page)) return stop(page.reason, page.kind);
       const step = nextTraexQuestionStep(page, answer);
