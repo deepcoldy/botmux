@@ -263,6 +263,7 @@ export class HcBackend implements SessionBackend {
   private readonly env: NodeJS.ProcessEnv;
   private readonly _isReattach: boolean;
   private readonly herdrTabTitle?: string;
+  private herdrTabRegistered = false;
   private cols = 0;
   private rows = 0;
   private address: string | null = null;
@@ -695,8 +696,14 @@ export class HcBackend implements SessionBackend {
         return;
       }
       this.adopt(client, sub, stream, size);
-      if (this.herdrTabTitle !== undefined) {
-        void publishHcHerdrTab(client, this.sessionId, listed, this.herdrTabTitle, () => !stale() && this.client === client)
+      if (this.herdrTabTitle !== undefined && !this.herdrTabRegistered && listed.cwd) {
+        const current = (): boolean => !stale() && this.client === client;
+        void publishHcHerdrTab(client, this.sessionId, listed, this.herdrTabTitle, current)
+          .then(() => {
+            // A verified attach with this worker already registered the tab.
+            // A reconnect must leave a pane the user later parked alone.
+            if (current()) this.herdrTabRegistered = true;
+          })
           .catch(error => process.stderr.write(`[hc-backend] ${this.target.sessionName}: Herdr 布局更新失败：${describeError(error)}\n`));
       }
     } catch (err) {

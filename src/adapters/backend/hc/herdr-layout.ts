@@ -5,7 +5,8 @@ import { hcTerminalName } from './cli-ops.js';
 
 const DOCUMENT = 'herdr-app';
 const TIMEOUT = { timeoutMs: 2_000 };
-const MAX_WRITES = 5;
+const RETRY_INITIAL_MS = 50;
+const RETRY_MAX_MS = 2_000;
 
 interface HerdrPane {
   id?: string;
@@ -47,22 +48,17 @@ function placeTerminal(document: HerdrLayout, sessionId: string, address: string
   const paneId = layoutId('pane', sessionId);
   const tabId = layoutId('tab', sessionId);
   const spaces = document.spaces ??= [];
-  let existing: { content: NonNullable<HerdrPane['content']>; tab: HerdrTab } | undefined;
+  let existing: HerdrPane['content'];
   for (const space of spaces) {
     for (const tab of space.tabs ?? []) {
       for (const pane of panes(tab.root)) {
-        if (pane.content?.terminal === address) {
-          if (tab.id !== tabId || pane.id !== paneId || tab.name) return false;
-          tab.name = title;
-          return true;
-        }
-        if (pane.id === paneId && typeof pane.content?.terminal === 'string') existing = { content: pane.content, tab };
+        if (pane.content?.terminal === address) return false;
+        if (pane.id === paneId && typeof pane.content?.terminal === 'string') existing = pane.content;
       }
     }
   }
   if (existing) {
-    existing.content.terminal = address;
-    if (existing.tab.id === tabId && !existing.tab.name) existing.tab.name = title;
+    existing.terminal = address;
     return true;
   }
 
@@ -99,18 +95,23 @@ export async function publishHcHerdrTab(
 ): Promise<void> {
   if (!terminal.cwd) return;
   const title = sessionTitle.trim() || hcTerminalName(sessionId);
-  for (let attempt = 0; attempt < MAX_WRITES && isCurrent(); attempt++) {
-    const current = await client.call<{ version: number; value: HerdrLayout | null }>('doc.get', { name: DOCUMENT }, TIMEOUT);
-    const document = current.value ?? {};
-    if (typeof document !== 'object' || Array.isArray(document) || (document.spaces != null && !Array.isArray(document.spaces))) {
-      throw new Error('无法识别现有 Herdr 布局');
-    }
-    if (!placeTerminal(document, sessionId, terminal.address, terminal.cwd, title) || !isCurrent()) return;
+  for (let retryMs = RETRY_INITIAL_MS; isCurrent(); retryMs = Math.min(retryMs * 2, RETRY_MAX_MS)) {
     try {
+      const current = await client.call<{ version: number; value: HerdrLayout | null }>('doc.get', { name: DOCUMENT }, TIMEOUT);
+      const document = current.value ?? {};
+      if (typeof document !== 'object' || Array.isArray(document) || (document.spaces != null && !Array.isArray(document.spaces))) {
+        throw new Error('无法识别现有 Herdr 布局');
+      }
+      if (!isCurrent() || !placeTerminal(document, sessionId, terminal.address, terminal.cwd, title)) return;
       await client.call('doc.set', { name: DOCUMENT, version: current.version, value: document }, TIMEOUT);
       return;
     } catch (error) {
-      if (!isHcError(error, 'rpc') || error.kind !== 'conflict' || attempt === MAX_WRITES - 1) throw error;
+      if (!isHcError(error, 'timeout') && !(isHcError(error, 'rpc') && error.kind === 'conflict')) throw error;
+      if (!isCurrent()) return;
+      // Restoring many workers can race on one document. Spread retries and
+      // re-read every time, including after a write whose reply was lost.
+      const delay = retryMs + Math.floor(Math.random() * retryMs);
+      await new Promise<void>(resolve => { setTimeout(resolve, delay).unref(); });
     }
   }
 }

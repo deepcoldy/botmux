@@ -126,6 +126,7 @@ class FakeClient {
       return this.terminal;
     }
     if (method === 'terminal.read') return { text: this.readText, complete: true, how: 'history' };
+    if (method === 'doc.get') return { version: 0, value: null };
     return {};
   }
   async subscribe(params: Record<string, unknown>): Promise<FakeSub> {
@@ -921,6 +922,17 @@ describe('reconnect', () => {
     current.drop();
     return { client, stream: await attached(client) };
   }
+
+  it('leaves a parked Herdr tab alone when the same worker reconnects', async () => {
+    const first = queueClient();
+    const backend = backendFor({ sessionId: SID, herdrTabTitle: 'Topic title' });
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    await vi.waitFor(() => expect(first.methods()).toContain('doc.set'));
+
+    // The new connection answers with an empty layout, as after parking the pane.
+    const second = await reconnected(first);
+    expect(second.client.methods()).toEqual(['server.status', 'terminal.get']);
+  });
 
   it('does not replay a status the worker already heard, painted or live', async () => {
     const first = queueClient();
