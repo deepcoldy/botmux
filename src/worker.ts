@@ -3377,6 +3377,9 @@ let pendingLaunchConvergence: { attemptId?: string; requested: RestartLaunchSett
 let replacementSpawnInProgress = false;
 let structuredStartGraceRecheckTimer: ReturnType<typeof setTimeout> | null = null;
 let structuredRejectedReadyEvidenceGeneration: number | undefined;
+// Meaningful only while the generation above is set. A rejected pre-start
+// prompt has no started native user proof and must not become post-start idle.
+let structuredRejectedReadyEvidenceStartUuid: string | undefined;
 const ptyOutputGeneration = new PtyOutputGeneration();
 const adoptWriteQueue = new AsyncSerialQueue();
 /** The effectiveResume flag used by the most recent spawnCli call. Written
@@ -17152,7 +17155,7 @@ function notifyMissingFinalTurn(turnId: string): void {
   });
 }
 
-function missingFinalTurnDeliveredBySend(turn: CodexPendingTurn): boolean {
+function missingFinalTurnDeliveredBySend(turn: CodexPendingTurn, nextBoundaryMs: number | undefined): boolean {
   const target = bridgeGateInputForTurn(sessionId, turn, {
     // Unlike submit confirmation, a restarted worker has no in-memory write
     // timestamp. The queue's persisted mark is the stable lower bound; an exact
@@ -17160,7 +17163,7 @@ function missingFinalTurnDeliveredBySend(turn: CodexPendingTurn): boolean {
     markTimeMs: turn.markTimeMs,
     isLocal: turn.isLocal,
   }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
-  return attributableBridgeReplyMarkers(target, undefined, readSendMarkers())
+  return attributableBridgeReplyMarkers(target, nextBoundaryMs, readSendMarkers())
     .some(marker => finalBridgeSendMarkerCoversOwnThread(target, marker));
 }
 
@@ -17226,8 +17229,10 @@ function structuredMissingFinalTarget(): StructuredMissingFinalTarget | undefine
   if (structuredBridgeIs('antigravity') && hasAntigravityPendingTasks(antigravityBridgeState())) return undefined;
   if (idleDetector?.programStatusHeldBusy()) return undefined;
   const rejectedGeneration = structuredRejectedReadyEvidenceGeneration;
+  const rejectedStartUuid = structuredRejectedReadyEvidenceStartUuid;
   const idle = isPromptReady || (hasStructuredLifecycleBlock()
-    && rejectedGeneration !== undefined && ptyOutputGeneration.isCurrent(rejectedGeneration));
+    && rejectedGeneration !== undefined && ptyOutputGeneration.isCurrent(rejectedGeneration)
+    && rejectedStartUuid !== undefined && rejectedStartUuid === turn.nativeUserProof?.uuid);
   if (!idle) return undefined;
   const outputGeneration = ptyOutputGeneration.snapshot();
   return {
@@ -17260,9 +17265,18 @@ function maybeSettleMissingStructuredFinal(): void {
     return;
   }
   const { turn } = current;
+  // Legacy send markers have no exact turn id: bound their attribution before
+  // the drop can advance/replay the next started successor.
+  const nextBoundaryMs = codexBridgeQueue.peek().slice(1)
+    .find(candidate => candidate.started)?.markTimeMs;
   const dropped = codexBridgeQueue.dropPendingTurn(turn.turnId, turn.dispatchAttempt, true);
   structuredMissingFinalWatchdog.observe(undefined);
   if (!dropped) return;
+  // Universal output handoff can make emitReadyCodexTurns return before its
+  // legacy checkpoint. Persist the exact drop before any terminal/notice so a
+  // restart cannot resurrect and notify this same owner a second time.
+  checkpointCodexAdoptRecovery();
+  checkpointStructuredBridgeRecovery();
   log(`Structured transcript stayed idle without a final for turn ${turn.turnId}; ending the wait and directing the user to the Web terminal`);
   if (turn.dispatchAttempt !== undefined) {
     emitTurnTerminal(turn.turnId, 'ambiguous', 'structured_final_not_collected', turn.dispatchAttempt);
@@ -17270,7 +17284,7 @@ function maybeSettleMissingStructuredFinal(): void {
   retireStructuredTurnAttribution([...(dropped.supersededTurns ?? []), dropped]);
   if (turn.dispatchAttempt === undefined) {
     const hasSubmitNotice = structuredTurnsWithSubmitNotice.delete(turn.turnId);
-    const deliveredBySend = missingFinalTurnDeliveredBySend(turn);
+    const deliveredBySend = missingFinalTurnDeliveredBySend(turn, nextBoundaryMs);
     if (hasSubmitNotice || deliveredBySend) {
       // This exact input already got its own notice or a user-visible botmux
       // send. Do not post a contradictory warning; still close the working card.
@@ -24182,6 +24196,9 @@ function markPromptReady(): void {
     }
     cliSubmissionInFlight.readyDeferred = true;
     structuredRejectedReadyEvidenceGeneration = ptyOutputGeneration.snapshot();
+    const rejectedReadyOwner = codexBridgeQueue.peek()[0];
+    structuredRejectedReadyEvidenceStartUuid = rejectedReadyOwner?.started && rejectedReadyOwner.finalText === undefined
+      ? rejectedReadyOwner.nativeUserProof?.uuid : undefined;
     idleDetector?.reset();
     return;
   }
@@ -24298,6 +24315,9 @@ function markPromptReady(): void {
     // blocked until turn_completed so they cannot publish idle mid-turn.
     const remainingMs = codexBridgeQueue.preStartLeaseRemainingMs();
     structuredRejectedReadyEvidenceGeneration = ptyOutputGeneration.snapshot();
+    const rejectedReadyOwner = codexBridgeQueue.peek()[0];
+    structuredRejectedReadyEvidenceStartUuid = rejectedReadyOwner?.started && rejectedReadyOwner.finalText === undefined
+      ? rejectedReadyOwner.nativeUserProof?.uuid : undefined;
     // Keep the historical phrase (integration fixtures match it) and append
     // the machine-readable reason the skip happened.
     const skipReason = remainingMs !== undefined ? 'submit-verification-pending' : 'structured-turn-unfinished';

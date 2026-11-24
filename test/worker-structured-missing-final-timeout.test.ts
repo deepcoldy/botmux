@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CodexBridgeQueue, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
+import { appendBridgeTurnJournalEntry, readBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
+import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from '../src/services/codex-adopt-recovery.js';
 import { StructuredMissingFinalWatchdog } from '../src/services/structured-missing-final.js';
 import { PtyOutputGeneration } from '../src/utils/runtime-screen-status.js';
 import {
@@ -10,7 +15,7 @@ import {
 } from '../src/services/bridge-fallback-gate.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
-function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' | 'transcript'; zeroPrompt?: boolean; nativeIdentity?: boolean; provisionalStart?: boolean } = {}) {
+function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' | 'transcript'; zeroPrompt?: boolean; nativeIdentity?: boolean; provisionalStart?: boolean; deferStart?: boolean } = {}) {
   let now = 0;
   const queue = new CodexBridgeQueue(() => now);
   queue.mark('om_turn', 'question', now, opts.attempt);
@@ -18,7 +23,7 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     queue.ingest([{ uuid: 'native-task-started', timestampMs: now, kind: 'turn_started', text: '',
       sourceSessionId: 'provider', sourceTurnId: 'native-provisional',
     }]);
-  } else {
+  } else if (!opts.deferStart) {
     queue.ingest([{ uuid: 'native-user-1', timestampMs: now, kind: 'user', text: 'question',
       ...(opts.nativeIdentity ? {
         sourceSessionId: 'provider', sourceTurnId: 'native-turn', sourceMessageId: 'message-old',
@@ -50,6 +55,7 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     isPromptReady: true,
     hasStructuredLifecycleBlock: () => false,
     structuredRejectedReadyEvidenceGeneration: undefined,
+    structuredRejectedReadyEvidenceStartUuid: undefined,
     ptyOutputGeneration: new PtyOutputGeneration(),
     lastStructuredBridgeActivityAtMs: 0,
     cliSpawnGeneration: 1,
@@ -61,6 +67,8 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     structuredTurnsWithSubmitNotice: new Set<string>(),
     structuredMissingFinalWatchdog: new StructuredMissingFinalWatchdog(),
     codexBridgeIngest: vi.fn(),
+    checkpointCodexAdoptRecovery: vi.fn(),
+    checkpointStructuredBridgeRecovery: vi.fn(),
     dropPendingTurn: undefined,
     log: vi.fn(),
     emitTurnTerminal: vi.fn(),
@@ -181,6 +189,63 @@ describe('worker: missing structured final timeout', () => {
     expect(r.scope.emitTurnTerminal.mock.calls).toEqual([['om_turn', 'ambiguous', 'structured_final_not_collected', 2]]);
   });
 
+  it('checkpoints the exact timeout before notification even when universal handoff makes ready emission return early', () => {
+    const root = mkdtempSync(join(tmpdir(), 'missing-final-journal-'));
+    try {
+      const rolloutPath = join(root, 'rollout.jsonl');
+      const journalPath = join(root, 'turns.structured');
+      writeFileSync(rolloutPath, '');
+      const r = workerRig('codex');
+      const marked = r.queue.peek()[0]!;
+      appendBridgeTurnJournalEntry(journalPath, {
+        turnId: 'om_turn', markTimeMs: 0, fingerprint: marked.contentFingerprint,
+        wholeInputHash: marked.wholeInputHash, jsonlPath: rolloutPath, offsetAtMark: 0,
+      });
+      Object.assign(r.scope, {
+        workerSessionEventScope: undefined,
+        universalOutputHandoff: { present: true },
+        checkpointCodexAdoptRecovery: vi.fn(),
+        traexQuotaPending: undefined,
+        structuredBridgeJournalPath: () => journalPath,
+        codexBridgeRolloutPath: rolloutPath,
+        structuredBridgeRecoveryAttempted: true,
+        codexBridgeOffset: 0,
+        checkpointCodexAdoptTurns,
+      });
+      r.scope.checkpointStructuredBridgeRecovery = loadWorkerFunction('checkpointStructuredBridgeRecovery', r.scope);
+      // Real ready emission sees no ready rows and returns early under handoff.
+      r.scope.emitReadyCodexTurns = loadWorkerFunction('emitReadyCodexTurns', r.scope);
+      const persistedAtNotice: number[] = [];
+      r.scope.send.mockImplementation((msg: any) => {
+        if (msg.kind === 'structured_turn_not_collected') persistedAtNotice.push(readBridgeTurnJournal(journalPath).length);
+      });
+      const clock = vi.spyOn(Date, 'now');
+      clock.mockReturnValue(0);
+      r.settle();
+      clock.mockReturnValue(20_000);
+      r.settle();
+      expect(persistedAtNotice).toEqual([0]);
+      expect(readBridgeTurnJournal(journalPath)).toEqual([]);
+
+      // Real restart recovery cannot resurrect the notified owner or notify again.
+      const restoredQueue = new CodexBridgeQueue(() => Date.now());
+      const recovered = restoreCodexAdoptTurns(journalPath, rolloutPath, restoredQueue, [{
+        uuid: 'native-user-1', timestampMs: 0, kind: 'user', text: 'question',
+      }], -5_000, 20_000);
+      restoredQueue.absorb(recovered.history);
+      restoredQueue.ingest(recovered.live);
+      expect(recovered.restored).toBe(0);
+      expect(restoredQueue.peek()).toEqual([]);
+      r.scope.codexBridgeQueue = restoredQueue;
+      r.scope.structuredMissingFinalWatchdog = new StructuredMissingFinalWatchdog();
+      clock.mockReturnValue(40_000);
+      r.settle();
+      expect(r.scope.send.mock.calls.filter(([msg]) => msg.kind === 'structured_turn_not_collected')).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('does not time out while an authoritative Antigravity rebind is pending', () => {
     const r = workerRig('antigravity');
     const clock = vi.spyOn(Date, 'now');
@@ -295,6 +360,37 @@ describe('worker: missing structured final timeout', () => {
     r.settle();
     expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([expect.objectContaining({
       type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn',
+    })]);
+  });
+
+  it.each([
+    ['legacy successor marker', undefined, 'user_notify'],
+    ['exact successor marker', 'om_successor', 'user_notify'],
+    ['exact current-turn marker after the successor boundary', 'om_turn', 'turn_display_retired'],
+  ] as const)('bounds send evidence correctly for a %s', (_label, markerTurnId, expectedType) => {
+    const r = workerRig('doubao', { nativeIdentity: true });
+    r.queue.mark('om_successor', 'successor question', 10_000);
+    r.queue.ingest([
+      { uuid: 'native-user-successor', timestampMs: 10_000, kind: 'user', text: 'successor question',
+        sourceSessionId: 'provider', sourceTurnId: 'native-successor', sourceMessageId: 'message-new' },
+      { uuid: 'native-final-successor', timestampMs: 15_000, kind: 'assistant_final', text: 'successor answer',
+        sourceSessionId: 'provider', sourceTurnId: 'native-successor' },
+    ]);
+    expect(r.queue.peek()).toHaveLength(2);
+    expect(r.queue.peek()[1]).toMatchObject({ started: true, finalText: 'successor answer', markTimeMs: 10_000 });
+    r.scope.readSendMarkers.mockReturnValue([{
+      sentAtMs: 15_000, sessionId: 'sid-own', responseKind: 'final',
+      ...(markerTurnId ? { turnId: markerTurnId } : {}),
+      deliveryKind: 'current_session_send', targetChatId: 'oc_own', targetRootMessageId: 'om_root',
+    }]);
+    const clock = vi.spyOn(Date, 'now');
+    clock.mockReturnValue(16_000);
+    r.settle();
+    clock.mockReturnValue(36_000);
+    r.settle();
+    expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([expect.objectContaining({
+      type: expectedType, turnId: 'om_turn',
+      ...(expectedType === 'user_notify' ? { kind: 'structured_turn_not_collected' } : { silent: true }),
     })]);
   });
 
@@ -544,11 +640,44 @@ describe('worker: missing structured final timeout', () => {
     expect(r.queue.peek()).toEqual([]);
   });
 
+  it('does not inherit a pre-start rejected ready edge as post-start idle evidence', () => {
+    const r = workerRig('codex', { deferStart: true });
+    const clock = vi.spyOn(Date, 'now');
+    r.scope.isPromptReady = false;
+    r.scope.hasStructuredLifecycleBlock = () => true;
+    clock.mockReturnValue(0);
+    // The composer/submit gate rejected idle before any transcript user record.
+    r.scope.structuredRejectedReadyEvidenceGeneration = r.scope.ptyOutputGeneration.snapshot();
+    r.scope.structuredRejectedReadyEvidenceStartUuid = undefined;
+    r.settle();
+    expect(r.queue.peek()[0]?.started).toBe(false);
+
+    r.queue.ingest([{ uuid: 'native-user-after-rejected-ready', timestampMs: 0, kind: 'user', text: 'question' }]);
+    expect(r.queue.peek()[0]?.started).toBe(true);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    expect(r.scope.send).not.toHaveBeenCalled();
+
+    // A fresh rejection that observed this exact started owner is valid evidence.
+    r.scope.structuredRejectedReadyEvidenceGeneration = r.scope.ptyOutputGeneration.snapshot();
+    r.scope.structuredRejectedReadyEvidenceStartUuid = r.queue.peek()[0]!.nativeUserProof!.uuid;
+    r.settle();
+    clock.mockReturnValue(39_999);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    clock.mockReturnValue(40_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
+  });
+
   it('resets the wait on output and supports a lifecycle-blocked rejected idle edge', () => {
     const r = workerRig('codex');
     r.scope.isPromptReady = false;
     r.scope.hasStructuredLifecycleBlock = () => true;
     r.scope.structuredRejectedReadyEvidenceGeneration = r.scope.ptyOutputGeneration.snapshot();
+    r.scope.structuredRejectedReadyEvidenceStartUuid = r.queue.peek()[0]!.nativeUserProof!.uuid;
     vi.spyOn(Date, 'now').mockReturnValue(0);
     r.settle();
     expect(r.scope.structuredMissingFinalTarget()).toBeDefined();
@@ -562,6 +691,7 @@ describe('worker: missing structured final timeout', () => {
 
     // A fresh idle edge for the same started owner gets its own full window.
     r.scope.structuredRejectedReadyEvidenceGeneration = r.scope.ptyOutputGeneration.snapshot();
+    r.scope.structuredRejectedReadyEvidenceStartUuid = r.queue.peek()[0]!.nativeUserProof!.uuid;
     r.settle();
     vi.spyOn(Date, 'now').mockReturnValue(119_999);
     r.settle();
