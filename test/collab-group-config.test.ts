@@ -252,6 +252,110 @@ describe('validateSessionGroupCollaborationConfig（结构校验）', () => {
     expect(v.referencedTeamRoles['cli_builder']).toBe('team-role');
   });
 
+  it('省略 roleMode（默认 profile）保留 profileId override，且与显式 roleMode:profile 等价（P1#2）', () => {
+    const resolveProfile = (_pid: string, appId: string) => (appId === 'cli_builder' ? 'builder-override-role' : 'creator-default-role');
+    const base = {
+      enabled: true,
+      roleProfileId: 'group_default',
+      kickoff: [
+        { appId: 'cli_creator', trigger: 'immediate' },
+        { appId: 'cli_builder', trigger: 'afterAgentTurn', afterAppId: 'cli_creator', artifact: { type: 'marked-url', hosts: ['x.com'] } },
+      ],
+    };
+    // 省略 roleMode（默认 profile）带 profileId override
+    const omitted = validateSessionGroupCollaborationConfig({
+      ...base,
+      agents: [{ appId: 'cli_creator' }, { appId: 'cli_builder', profileId: 'builder_override' }],
+    }, { dataDir: '/tmp/x', resolveProfile, resolveTeamRole: () => null });
+    expect(omitted.ok).toBe(true);
+    if (!omitted.ok) return;
+    // profileId 被保留在 config.agents 里
+    expect(omitted.config.agents.find(a => a.appId === 'cli_builder')?.profileId).toBe('builder_override');
+    // resolvedProfileEntries 用 override 的 profile 内容
+    expect(omitted.resolvedProfileEntries['cli_builder']).toBe('builder-override-role');
+    expect(omitted.resolvedProfileEntries['cli_creator']).toBe('creator-default-role');
+
+    // 显式 roleMode:'profile' 等价
+    const explicit = validateSessionGroupCollaborationConfig({
+      ...base,
+      agents: [{ appId: 'cli_creator', roleMode: 'profile' }, { appId: 'cli_builder', roleMode: 'profile', profileId: 'builder_override' }],
+    }, { dataDir: '/tmp/x', resolveProfile, resolveTeamRole: () => null });
+    expect(explicit.ok).toBe(true);
+    if (!explicit.ok) return;
+    expect(explicit.config.agents.find(a => a.appId === 'cli_builder')?.profileId).toBe('builder_override');
+    expect(explicit.resolvedProfileEntries).toEqual(omitted.resolvedProfileEntries);
+  });
+
+  it('身份校验：creator 恰好一行 / 存在性 / 非 apiOnly（P2#4）', () => {
+    const resolveAgent = (appId: string) => {
+      if (appId === 'cli_creator') return { exists: true, apiOnly: false };
+      if (appId === 'cli_builder') return { exists: true, apiOnly: false };
+      return undefined;
+    };
+    const baseCfg = {
+      enabled: true,
+      agents: [
+        { appId: 'cli_creator', roleMode: 'no-chat-role' },
+        { appId: 'cli_builder', roleMode: 'no-chat-role' },
+      ],
+      kickoff: [
+        { appId: 'cli_creator', trigger: 'immediate' },
+        { appId: 'cli_builder', trigger: 'afterAgentTurn', afterAppId: 'cli_creator', artifact: { type: 'marked-url', hosts: ['x.com'] } },
+      ],
+    };
+    const deps = { dataDir: '/tmp/x', resolveProfile: () => 'r', resolveTeamRole: () => null, creatorAppId: 'cli_creator', resolveAgent };
+
+    // creator 恰好一行 → ok
+    const ok = validateSessionGroupCollaborationConfig(baseCfg, deps);
+    expect(ok.ok).toBe(true);
+
+    // 缺 creator
+    const noCreator = validateSessionGroupCollaborationConfig({
+      ...baseCfg,
+      agents: [
+        { appId: 'cli_other', roleMode: 'no-chat-role' },
+        { appId: 'cli_builder', roleMode: 'no-chat-role' },
+      ],
+      kickoff: [
+        { appId: 'cli_other', trigger: 'immediate' },
+        { appId: 'cli_builder', trigger: 'afterAgentTurn', afterAppId: 'cli_other', artifact: { type: 'marked-url', hosts: ['x.com'] } },
+      ],
+    }, deps);
+    expect(noCreator.ok).toBe(false);
+    if (noCreator.ok) return;
+    expect(noCreator.errors.some(e => e.includes('恰好出现一次'))).toBe(true);
+
+    // 未知 appId
+    const unknown = validateSessionGroupCollaborationConfig({
+      ...baseCfg,
+      agents: [
+        { appId: 'cli_creator', roleMode: 'no-chat-role' },
+        { appId: 'cli_unknown', roleMode: 'no-chat-role' },
+      ],
+      kickoff: [
+        { appId: 'cli_creator', trigger: 'immediate' },
+        { appId: 'cli_unknown', trigger: 'afterAgentTurn', afterAppId: 'cli_creator', artifact: { type: 'marked-url', hosts: ['x.com'] } },
+      ],
+    }, deps);
+    expect(unknown.ok).toBe(false);
+    if (unknown.ok) return;
+    expect(unknown.errors.some(e => e.includes('不存在'))).toBe(true);
+
+    // apiOnly
+    const apiOnlyDeps = {
+      ...deps,
+      resolveAgent: (appId: string) => {
+        if (appId === 'cli_creator') return { exists: true, apiOnly: false };
+        if (appId === 'cli_builder') return { exists: true, apiOnly: true };
+        return undefined;
+      },
+    };
+    const apiOnly = validateSessionGroupCollaborationConfig(baseCfg, apiOnlyDeps);
+    expect(apiOnly.ok).toBe(false);
+    if (apiOnly.ok) return;
+    expect(apiOnly.errors.some(e => e.includes('apiOnly'))).toBe(true);
+  });
+
   it('workingDir / gatePolicy 非法值失败', () => {
     expect(validateSessionGroupCollaborationConfig(validConfig({ workingDir: '  ' }), noDeps).ok).toBe(false);
     expect(validateSessionGroupCollaborationConfig(validConfig({ gatePolicy: 'banana' }), noDeps).ok).toBe(false);

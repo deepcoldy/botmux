@@ -107,6 +107,11 @@ export interface CollabValidationDeps {
   resolveProfile: (profileId: string, appId: string) => string | null;
   /** 解析某 appId 显式沿用的 team role 内容；无则 null。 */
   resolveTeamRole: (appId: string) => string | null;
+  /** 可选：creator 身份（完整校验时提供）。用于「creator 恰好一行」判定。 */
+  creatorAppId?: string;
+  /** 可选：participant 存在性 + 非 apiOnly 判定（完整校验时提供）。
+   *  返回 undefined = 该 appId 不存在；返回 {apiOnly:true} = core-only bot，不可参与协作。 */
+  resolveAgent?: (appId: string) => { exists: true; apiOnly: boolean } | undefined;
 }
 
 export type CollabValidationResult =
@@ -239,8 +244,9 @@ export function validateSessionGroupCollaborationConfig(
       }
       agents.push({
         appId: a.appId,
-        ...(a.roleMode === 'no-chat-role' ? { roleMode: 'no-chat-role' as const } : {}),
-        ...(a.roleMode === 'profile' && typeof a.profileId === 'string' && a.profileId ? { profileId: a.profileId } : {}),
+        ...(roleMode === 'no-chat-role' ? { roleMode: 'no-chat-role' as const } : {}),
+        // 用归一化后的 roleMode 判：省略 roleMode（默认 profile）也必须保留 profileId。
+        ...(roleMode === 'profile' && typeof a.profileId === 'string' && a.profileId ? { profileId: a.profileId } : {}),
       });
     });
   }
@@ -311,6 +317,26 @@ export function validateSessionGroupCollaborationConfig(
   // ── DAG 校验（在覆盖关系无缺漏基础上）──
   if (!errors.some(e => e.includes('覆盖') || e.includes('不在 agents'))) {
     validateCollabDag(kickoff, errors);
+  }
+
+  // ── 身份校验（完整校验时，creator 恰好一行 + 存在性 + 非 apiOnly）──
+  if (deps && Array.isArray(raw.agents)) {
+    if (deps.creatorAppId !== undefined) {
+      const creatorCount = agents.filter(a => a.appId === deps.creatorAppId).length;
+      if (creatorCount !== 1) {
+        errors.push(`creator（${deps.creatorAppId}）必须在 agents 中恰好出现一次（当前 ${creatorCount} 次）`);
+      }
+    }
+    if (deps.resolveAgent) {
+      for (const agent of agents) {
+        const found = deps.resolveAgent(agent.appId);
+        if (!found) {
+          errors.push(`agent ${agent.appId} 不存在（未知 appId）`);
+        } else if (found.apiOnly) {
+          errors.push(`agent ${agent.appId} 是 apiOnly（core-only）bot，不可参与协作`);
+        }
+      }
+    }
   }
 
   // ── Profile / team role 解析（内容快照，供 configVersion）──

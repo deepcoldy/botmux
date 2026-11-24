@@ -96,7 +96,7 @@ describe('CollabInitStore：稳定 source store', () => {
     expect(again.kind).toBe('existing');
   });
 
-  it('activeByDmChat 临时：done/failed/cancelled 释放后同 DM 新 source 可建新请求', async () => {
+  it('activeByDmChat 临时：done 释放后同 DM 新 source 可建新请求', async () => {
     const opts = placeOpts(SRC_MSG_1);
     await placeCollabGroupInit(opts);
     // 释放前 busy
@@ -108,7 +108,28 @@ describe('CollabInitStore：稳定 source store', () => {
     expect(next.kind).toBe('created');
   });
 
-  it('原子写 tmp+rename+0600 + fsync（durable）', async () => {
+  it('activeByDmChat 临时：failed 释放后同 DM 新 source 可建新请求', async () => {
+    const opts = placeOpts(SRC_MSG_1);
+    await placeCollabGroupInit(opts);
+    await markCollabInitTerminal({ dataDir: tempDir, creatorAppId: APP, initId: opts.initId, dmChatId: DM, state: 'failed', now: now() });
+    const next = await placeCollabGroupInit(placeOpts(SRC_MSG_2));
+    expect(next.kind).toBe('created');
+  });
+
+  it('activeByDmChat 临时：cancelled 释放后同 DM 新 source 可建新请求（并留 cancelReason）', async () => {
+    const opts = placeOpts(SRC_MSG_1);
+    await placeCollabGroupInit(opts);
+    await markCollabInitTerminal({ dataDir: tempDir, creatorAppId: APP, initId: opts.initId, dmChatId: DM, state: 'cancelled', now: now(), cancelReason: 'user cancelled' });
+    // 释放后新 source 可建
+    const next = await placeCollabGroupInit(placeOpts(SRC_MSG_2));
+    expect(next.kind).toBe('created');
+    // entry 留证 cancelled + cancelReason
+    const entry = readCollabInitStore(tempDir, APP).entries[opts.initId];
+    expect(entry.state).toBe('cancelled');
+    expect(entry.cancelReason).toBe('user cancelled');
+  });
+
+  it('原子写 tmp+rename+0600（无残留 tmp，内容完整含三份结构）', async () => {
     const opts = placeOpts(SRC_MSG_1);
     await placeCollabGroupInit(opts);
     const fp = collabInitFilePath(tempDir, APP);

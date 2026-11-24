@@ -24,6 +24,7 @@ import {
   type CollabValidationDeps,
   type SessionGroupCollaborationConfig,
 } from '../services/collab-group-config.js';
+import { loadBotConfigsCached } from '../bot-registry.js';
 import {
   markCollabInitTerminal,
   placeCollabGroupInit,
@@ -50,25 +51,36 @@ export type SessionGroupBirthResult =
 /**
  * 阶段 1 的可注入依赖（测试用假时钟 + 临时 dataDir + 假 peer preflight）。
  *
- * `peerPreflight` 是 §4.2 peer preflight 的 seam：PR-1 默认 no-op 成功（真实
- * daemon 发现 / 协议版本 / `durable-turn-output-receipt-v1` 能力核对在 PR-2 落地）；
- * 测试注入失败实现以验证 fail-closed 铁律（peer 失败 → failed，不回退 legacy）。
+ * `peerPreflight` 是 §4.2 peer preflight 的 seam。**PR-1 生产默认返回「未就绪」**：
+ * 真实编排（S1–S5）尚未实现，显式 enabled 的合法配置必须 fail-closed 于 preflight
+ * 阶段（返回 failed、不扣费、不占位），**不得**走到 ready → 扣费 → startCollabGroupBirth
+ * 占位返回 collab-handled(running) 而永久锁死同 DM。等 PR-2 接入真实 peer preflight
+ * + S1–S5 编排后，生产才返回 ok；测试通过注入 `{ok:true}` 验证 ready 分支本身。
  */
 export interface CollabPreflightDeps {
   dataDir: string;
   now: () => number;
   resolveProfile?: CollabValidationDeps['resolveProfile'];
   resolveTeamRole?: CollabValidationDeps['resolveTeamRole'];
+  /** 可选：participant 存在性 + 非 apiOnly 判定（默认用 registry 缓存）。 */
+  resolveAgent?: CollabValidationDeps['resolveAgent'];
   peerPreflight?: (config: SessionGroupCollaborationConfig) => Promise<{ ok: true } | { ok: false; errors: string[] }>;
 }
 
-function defaultDeps(dataDir: string): CollabPreflightDeps {
+/** PR-1 生产态：编排未实现前，显式 enabled 一律 fail-closed（见 CollabPreflightDeps 注释）。 */
+export const COLLAB_ORCHESTRATION_NOT_IMPLEMENTED = '协作初始化编排尚未实现（PR-2）';
+
+function defaultDeps(dataDir: string, creatorAppId: string): CollabPreflightDeps {
   return {
     dataDir,
     now: () => Date.now(),
     resolveProfile: (profileId: string, appId: string) => readRoleProfileEntry(dataDir, profileId, appId),
     resolveTeamRole: (appId: string) => resolveTeamRoleFile(appId),
-    peerPreflight: async () => ({ ok: true }),
+    resolveAgent: (appId: string) => {
+      const found = loadBotConfigsCached().find(c => c.larkAppId === appId);
+      return found ? { exists: true, apiOnly: found.apiOnly === true } : undefined;
+    },
+    peerPreflight: async () => ({ ok: false, errors: [COLLAB_ORCHESTRATION_NOT_IMPLEMENTED] }),
   };
 }
 
@@ -88,19 +100,26 @@ export async function preflightCollabGroupBirth(
 ): Promise<CollabPreflightResult> {
   const { larkAppId: creatorAppId, chatId: dmChatId, messageId } = ctx;
   const botCfg = getBot(creatorAppId).config;
-  const collaboration = botCfg.sessionGroup?.collaboration;
+  const sg = botCfg.sessionGroup;
+  const collaboration = sg?.collaboration;
+  // 显式 enabled 但结构非法：parse 阶段保留原样并标记 disabledReason → fail-closed。
+  if (sg?.collaborationDisabledReason) {
+    return { kind: 'failed', reason: sg.collaborationDisabledReason, releasesDmChat: false };
+  }
   if (!collaboration || collaboration.enabled !== true) {
     return { kind: 'legacy' };
   }
 
   const dataDir = depsOverride?.dataDir ?? config.session.dataDir;
-  const deps = { ...defaultDeps(dataDir), ...depsOverride };
+  const deps = { ...defaultDeps(dataDir, creatorAppId), ...depsOverride };
 
-  // 结构校验（含 Profile 内容解析），全程无副作用。
+  // 结构 + 身份校验（含 Profile 内容解析 + creator 恰好一行 + 存在性 + 非 apiOnly），全程无副作用。
   const validation = validateSessionGroupCollaborationConfig(collaboration, {
     dataDir,
     resolveProfile: deps.resolveProfile!,
     resolveTeamRole: deps.resolveTeamRole!,
+    creatorAppId,
+    resolveAgent: deps.resolveAgent,
   });
   if (!validation.ok) {
     return { kind: 'failed', reason: validation.errors.join('；'), releasesDmChat: false };
@@ -132,8 +151,13 @@ export async function preflightCollabGroupBirth(
   if (placed.kind === 'existing') return { kind: 'existing', initId: placed.initId, status: placed.status };
   if (placed.kind === 'busy') return { kind: 'busy', initId: placed.initId };
 
-  // peer preflight（占位后）。失败 → 释放 activeByDmChat 并 failed（fail-closed）。
-  const peer = await (deps.peerPreflight ?? (async () => ({ ok: true as const })))(validation.config);
+  // peer preflight（占位后）。reject / 失败一律转 failed 并释放占位，绝不残留 running。
+  let peer: { ok: true } | { ok: false; errors: string[] };
+  try {
+    peer = await (deps.peerPreflight ?? (async () => ({ ok: false as const, errors: [COLLAB_ORCHESTRATION_NOT_IMPLEMENTED] })))(validation.config);
+  } catch (err) {
+    peer = { ok: false, errors: [`peer preflight 异常：${String((err as any)?.message ?? err)}`] };
+  }
   if (!peer.ok) {
     await markCollabInitTerminal({
       dataDir,

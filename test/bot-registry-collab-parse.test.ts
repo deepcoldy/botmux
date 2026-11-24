@@ -38,22 +38,26 @@ describe('collaboration 配置在 parse 处显式校验', () => {
     expect(parseBotConfigsFromText(JSON.stringify([entry({ collaboration: 'x' })]))[0].sessionGroup?.collaboration).toBeUndefined();
   });
 
-  it('结构非法（agents 空）丢弃 collaboration', () => {
+  it('结构非法（agents 空）但显式 enabled:true → 保留 collaboration + 标记 disabledReason（fail-closed）', () => {
     const [cfg] = parseBotConfigsFromText(JSON.stringify([entry({ collaboration: { enabled: true, agents: [], kickoff: [] } })]));
-    expect(cfg.sessionGroup?.collaboration).toBeUndefined();
+    // 不擦除：preflight 要能认出「坏配置」返回 failed，而不是当未启用走 legacy。
+    expect(cfg.sessionGroup?.collaboration?.enabled).toBe(true);
+    expect(cfg.sessionGroup?.collaborationDisabledReason).toBeTruthy();
   });
 
-  it('结构合法但非 enabled 字面量（boolean true 但 agents 非法）也丢弃', () => {
+  it('显式 enabled:true 但结构非法（agents 非数组）→ 保留 + disabledReason', () => {
     const [cfg] = parseBotConfigsFromText(JSON.stringify([entry({ collaboration: { enabled: true, agents: 'nope', kickoff: 'nope' } })]));
-    expect(cfg.sessionGroup?.collaboration).toBeUndefined();
+    expect(cfg.sessionGroup?.collaboration?.enabled).toBe(true);
+    expect(cfg.sessionGroup?.collaborationDisabledReason).toBeTruthy();
   });
 
-  it('sessionGroup 其它字段（naming 等）在 collaboration 被丢弃时仍保留', () => {
+  it('sessionGroup 其它字段（naming 等）在 collaboration 非 enabled:true 归一化关闭时仍保留', () => {
     const [cfg] = parseBotConfigsFromText(JSON.stringify([entry({
       naming: { mode: 'truncate' },
       collaboration: { enabled: false },
     })]));
     expect(cfg.sessionGroup?.naming?.mode).toBe('truncate');
     expect(cfg.sessionGroup?.collaboration).toBeUndefined();
+    expect(cfg.sessionGroup?.collaborationDisabledReason).toBeUndefined();
   });
 });

@@ -1410,6 +1410,12 @@ export interface SessionGroupConfig {
    * 且结构合法才保留，否则丢弃（安全默认关闭，不被类型断言绕过）。
    */
   collaboration?: SessionGroupCollaborationConfig;
+  /**
+   * 解析期标记：显式 `{enabled:true}` 但结构非法的协作配置被保留原样时写入该原因，
+   * 供 preflight 认出「应 fail-closed 而非走 legacy」的坏配置（§3 铁律 1）。
+   * 运行时不落盘、不参与任何序列化。仅显式 enabled 且非法时非空。
+   */
+  collaborationDisabledReason?: string;
   /** Group-name generation. */
   naming?: {
     /**
@@ -4784,11 +4790,28 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         const sg = entry.sessionGroup;
         if (!sg || typeof sg !== 'object' || Array.isArray(sg)) return undefined;
         const parsed = { ...(sg as Record<string, unknown>) };
-        // 协作配置显式校验：非 {enabled:true} 或结构非法都按关闭丢弃，绝不只靠 `as` 透传。
+        // 协作配置显式校验，绝不只靠 `as` 透传（§3 铁律 1）：
+        //  - 非 {enabled:true}（缺省/`enabled:false`/非对象）→ 归一化关闭，走 legacy；
+        //  - {enabled:true} 且结构合法 → 保留归一化后的 config；
+        //  - {enabled:true} 但结构非法 → **不得擦除**：保留原始 collaboration 并写入
+        //    collaborationDisabledReason，让 preflight 认出来返回 failed（不扣费、不走
+        //    legacy）。擦除会让运行时把「坏配置」当「未启用」，绕过 fail-closed。
         if (parsed.collaboration !== undefined) {
+          const collabRaw = parsed.collaboration;
+          const collabObj = (typeof collabRaw === 'object' && collabRaw !== null && !Array.isArray(collabRaw))
+            ? (collabRaw as Record<string, unknown>)
+            : undefined;
+          const explicitlyEnabled = collabObj?.enabled === true;
           const v = validateSessionGroupCollaborationConfig(parsed.collaboration);
-          if (v.ok) parsed.collaboration = v.config;
-          else delete parsed.collaboration;
+          if (v.ok) {
+            parsed.collaboration = v.config;
+          } else if (explicitlyEnabled) {
+            // 保留原始 collaboration，仅标记解析期禁用原因；preflight 据此 fail-closed。
+            (parsed as Record<string, unknown>).collaborationDisabledReason = v.errors.join('；');
+          } else {
+            // 非 enabled:true → 归一化关闭（安全默认）。
+            delete parsed.collaboration;
+          }
         }
         return parsed as SessionGroupConfig;
       })(),
