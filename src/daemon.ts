@@ -646,6 +646,7 @@ import {
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, cancelQueuedForks, drainQueuedForks, isPendingForkTopic, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
+import { collabGateAdmissionDecision } from './core/collab-gate-admission.js';
 import { commandSpec } from './core/command-schema.js';
 import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
 import { groupTaskSenderIsBot } from './core/group-task-start.js';
@@ -28780,6 +28781,33 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // a double charge.
   const sessionGroupAlreadyCharged = !!ctx.sessionGroupQuotaConsumed
     || quotaConsumedBeforeSessionGroupBirth;
+  // PR-3b-2 gate 接入（普通消息路径）：enforceMessageQuotaForCliInput 之前调
+  // checkCollabGateAdmission。queue → 回显排队位置 return；reject/awaiting-input/cancelled →
+  // 回执 return；open/not-collab → 继续正常准入。
+  if (!sessionGroupAlreadyCharged) {
+    const gateTalk = isBotSenderType
+      ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId, teamTrustAppId)
+      : evaluateTalk(larkAppId, chatId, senderOpenId, teamTrustUnionId, senderUnionId, chatType);
+    const gateDecision = collabGateAdmissionDecision({
+      dataDir: config.session.dataDir,
+      chatId,
+      botAppId: larkAppId,
+      talk: gateTalk,
+      sourceMessageId: messageId,
+      routingEvent: { content, resources: resources.map(r => ({ type: r.type, name: r.name })) },
+      config: getBot(larkAppId).config.sessionGroup?.collaboration,
+    });
+    if (gateDecision.block) {
+      if (gateDecision.reason === 'queued') {
+        await sessionReply(anchor, tr('sg.collab_queued', { position: String(gateDecision.position ?? 1) }, localeForBot(larkAppId)), 'text', larkAppId).catch(() => {});
+      } else if (gateDecision.reason === 'not_allowed') {
+        // 不泄露排队信息给未授权者
+      } else {
+        await sessionReply(anchor, tr('sg.collab_gate_blocked', { reason: gateDecision.reason }, localeForBot(larkAppId)), 'text', larkAppId).catch(() => {});
+      }
+      return;
+    }
+  }
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, isBotSenderType, {
     senderAppId: teamTrustAppId,
     listenerAuthorized: !!messageListener,
@@ -29397,6 +29425,32 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
     multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent, parsed.mentions),
   });
+  // PR-3b-2 gate 接入（命令路径）：classifySlash 之后、plugin 特判之前。只拦「会注入 CLI」的
+  // 非豁免命令；豁免白名单（special / daemon(sessionless) 无副作用 / forward(bot_gated)）放行。
+  // forward(unknown_slash) 会落到普通 spawn 注入 CLI，不豁免。
+  {
+    const gateTalk = senderIsBotForSlashGate
+      ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId, teamTrustAppId)
+      : evaluateTalk(larkAppId, chatId, senderOpenId, teamTrustUnionId, senderUnionId, chatType);
+    const gateDecision = collabGateAdmissionDecision({
+      dataDir: config.session.dataDir,
+      chatId,
+      botAppId: larkAppId,
+      talk: gateTalk,
+      slashDecision,
+      sourceMessageId: messageId,
+      routingEvent: { content: cmdContent, resources: resources.map(r => ({ type: r.type, name: r.name })) },
+      config: botCfg.sessionGroup?.collaboration,
+    });
+    if (gateDecision.block) {
+      if (gateDecision.reason === 'queued') {
+        await sessionReply(anchor, tr('sg.collab_queued', { position: String(gateDecision.position ?? 1) }, localeForBot(larkAppId)), 'text', larkAppId).catch(() => {});
+      } else if (gateDecision.reason !== 'not_allowed') {
+        await sessionReply(anchor, tr('sg.collab_gate_blocked', { reason: gateDecision.reason }, localeForBot(larkAppId)), 'text', larkAppId).catch(() => {});
+      }
+      return true;
+    }
+  }
   if (slashDecision.kind === 'plugin') {
     await executePluginSlashCommand({
       ctx,
@@ -31641,6 +31695,30 @@ async function handleThreadReplyAdmitted(
   // a stale lifecycle cannot be charged or admitted after the anchor was queued.
   if (!crossChatFollowUpIsCurrent(ctx)) return;
   const quotaSenderOpenId = threadSenderOpenId;
+  // PR-3b-2 gate 接入（thread-reply 普通消息路径）：enforceMessageQuotaForCliInput 之前。
+  if (!prepared?.quotaChecked) {
+    const gateChatId = ctxChatId ?? data?.message?.chat_id;
+    const gateTalk = (isBotSenderType || isForeignBot)
+      ? evaluateBotTalk(larkAppId, gateChatId, quotaSenderOpenId, threadSenderUnionId, threadTeamTrustAppId)
+      : evaluateTalk(larkAppId, gateChatId, quotaSenderOpenId, threadTeamTrustUnionId, threadSenderUnionId, ctxChatType);
+    const gateDecision = collabGateAdmissionDecision({
+      dataDir: config.session.dataDir,
+      chatId: gateChatId,
+      botAppId: larkAppId,
+      talk: gateTalk,
+      sourceMessageId: parsed.messageId,
+      routingEvent: { content: parsed.content, resources: resources.map(r => ({ type: r.type, name: r.name })) },
+      config: getBot(larkAppId).config.sessionGroup?.collaboration,
+    });
+    if (gateDecision.block) {
+      if (gateDecision.reason === 'queued') {
+        await sessionReply(anchor, tr('sg.collab_queued', { position: String(gateDecision.position ?? 1) }, localeForBot(larkAppId)), 'text', larkAppId).catch(() => {});
+      } else if (gateDecision.reason !== 'not_allowed') {
+        await sessionReply(anchor, tr('sg.collab_gate_blocked', { reason: gateDecision.reason }, localeForBot(larkAppId)), 'text', larkAppId).catch(() => {});
+      }
+      return;
+    }
+  }
   if (!prepared?.quotaChecked && !await enforceMessageQuotaForCliInput(
     larkAppId,
     ctxChatId ?? data?.message?.chat_id,
@@ -33503,6 +33581,32 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
       multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent, parsed.mentions),
     });
+  // PR-3b-2 gate 接入（命令路径，thread）：classifySlash 之后、首个 return 之前。只拦「会注入
+  // CLI」的非豁免命令；豁免白名单（special / daemon(sessionless) 无副作用 / forward(bot_gated)）放行。
+  if (slashDecision) {
+    const gateChatId = chatId ?? routingChatId ?? data?.message?.chat_id;
+    const gateTalk = (isBotSenderType || isForeignBotSender)
+      ? evaluateBotTalk(larkAppId, gateChatId, senderOpenId, senderUnionId, teamTrustAppId)
+      : evaluateTalk(larkAppId, gateChatId, senderOpenId, teamTrustUnionId, senderUnionId, chatType);
+    const gateDecision = collabGateAdmissionDecision({
+      dataDir: config.session.dataDir,
+      chatId: gateChatId,
+      botAppId: larkAppId,
+      talk: gateTalk,
+      slashDecision,
+      sourceMessageId: parsed.messageId,
+      routingEvent: { content: cmdContent, resources: resources.map(r => ({ type: r.type, name: r.name })) },
+      config: getBot(larkAppId).config.sessionGroup?.collaboration,
+    });
+    if (gateDecision.block) {
+      if (gateDecision.reason === 'queued') {
+        await sessionReply(anchor, tr('sg.collab_queued', { position: String(gateDecision.position ?? 1) }, localeForBot(larkAppId)), 'text', larkAppId).catch(() => {});
+      } else if (gateDecision.reason !== 'not_allowed') {
+        await sessionReply(anchor, tr('sg.collab_gate_blocked', { reason: gateDecision.reason }, localeForBot(larkAppId)), 'text', larkAppId).catch(() => {});
+      }
+      return true;
+    }
+  }
   // 级联在飞：第二条级联 fail closed；普通正文与单条透传排在定序器之后重入（保序）；
   // botmux 自己的命令（/close /status …）照常放行。正文项的重入自带 cascadeBodyReentry 标记。
   // messageListener 已在上面跳过分类，不会进这里。

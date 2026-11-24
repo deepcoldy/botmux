@@ -2869,6 +2869,8 @@ export const messages: Record<string, string> = {
   'sg.collab_failed': '⚠️ 协作群启动失败（{reason}），本次会话未开工。',
   'sg.collab_existing': '协作初始化已在进行中（状态 {status}）。',
   'sg.collab_busy': '当前私聊已有进行中的协作初始化，请等它结束（done/failed/cancelled）后再发新任务。',
+  'sg.collab_queued': '⏳ 协作群尚未就绪，消息已排队（位置 {position}）。就绪后将按顺序处理。',
+  'sg.collab_gate_blocked': '⚠️ 协作群未就绪（{reason}），消息未被处理。',
   'sg.cmd_unsupported': '⚠️ 会话群不支持 {cmd}：会话群由 bot 自动创建和管理，固定为连续会话模式。',
   // 回跳地址按本次链接实际用的 redirect_uri 填（{redirect}），不写死 127.0.0.1：
   // 配了 oauthRedirectBase / 平台绑定 / 反代的机器压根不会跳 loopback。

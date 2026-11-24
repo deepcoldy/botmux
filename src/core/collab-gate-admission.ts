@@ -141,3 +141,31 @@ function readQueuePosition(dataDir: string, chatId: string, targetAppId: string,
 export function gateCommandExempt(decision: SlashRouteDecision | undefined): boolean {
   return collabCommandExempt(decision);
 }
+
+/**
+ * daemon 接入辅助：返回一个「是否阻塞」决策 + 供回执用的消息。
+ *
+ * 返回 discriminated union：
+ *   - `{ block: false }` → open / not-collab，继续 enforceMessageQuotaForCliInput；
+ *   - `{ block: true; reason; position? }` → queue/reject/awaiting-input/cancelled，调用方回执后 return。
+ *
+ * 不在本函数里做飞书回执（回执锚点/通道因入口而异），只返回决策，调用方负责 reply。
+ */
+export function collabGateAdmissionDecision(opts: CollabGateAdmissionOpts):
+  | { block: false }
+  | { block: true; reason: string; position?: number } {
+  const r = checkCollabGateAdmission(opts);
+  switch (r.kind) {
+    case 'open':
+    case 'not-collab':
+      return { block: false };
+    case 'queue':
+      return { block: true, reason: 'queued', position: r.position };
+    case 'reject':
+      return { block: true, reason: r.reason };
+    case 'awaiting-input':
+      return { block: true, reason: r.reason };
+    case 'cancelled':
+      return { block: true, reason: 'cancelled' };
+  }
+}
