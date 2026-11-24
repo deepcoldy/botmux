@@ -4684,6 +4684,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const credentialSource = policy?.credentialSource ?? 'auto';
   const delegateOnMention = policy?.delegateOnMention !== false;
   const allowSpeakerSwitch = policy?.allowSpeakerSwitch === true;
+  const gitCommitIdentity = policy?.gitCommitIdentity === true;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
@@ -4724,13 +4725,14 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
-  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean }) {
+  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean; gitCommitIdentity?: boolean }) {
     return {
       enabled: true,
       capabilities: next.capabilities ?? capabilities,
       credentialSource: next.credentialSource ?? credentialSource,
       delegateOnMention: next.delegateOnMention ?? delegateOnMention,
       allowSpeakerSwitch: next.allowSpeakerSwitch ?? allowSpeakerSwitch,
+      gitCommitIdentity: next.gitCommitIdentity ?? gitCommitIdentity,
       ...(policy?.legacyCapabilities && !next.capabilities ? { legacyCapabilities: true } : {}),
     };
   }
@@ -4820,6 +4822,14 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
           {info?.crossPrincipalIsolation === true ? (
             <p className="bd-section-note" data-action="trigger-user-auth-speaker-switch-xpi-note">{tr('botDefaults.triggerUserAuthAllowSpeakerSwitchXpi')}</p>
           ) : null}
+          <ToggleRow
+            checked={gitCommitIdentity}
+            disabled={busy}
+            dataAction="toggle-trigger-user-auth-git-commit-identity"
+            title={tr('botDefaults.triggerUserAuthGitCommitIdentity')}
+            help={tr('botDefaults.triggerUserAuthGitCommitIdentityHelp')}
+            onChange={checked => saveWith({ gitCommitIdentity: checked })}
+          />
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthCapabilityNote')}</p>
           {capabilities.includes('bytecloud') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
