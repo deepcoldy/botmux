@@ -17,6 +17,7 @@ import { normalizeEnvPolicy, type EnvPolicy } from '../core/env-policy.js';
 import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { readGlobalConfig } from '../global-config.js';
 import { resolveBotCodexRpcInput } from '../services/codex-rpc-input-policy.js';
+import { normalizeBotTaskRoutingConfig } from '../core/task-routing/model.js';
 
 /** Shared parser so a malformed payload can't reach the selector half-shaped;
  *  anything invalid degrades to the registry default (`inherit`). */
@@ -285,6 +286,10 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
     oncallGroup: j?.oncallGroup && typeof j.oncallGroup === 'object' ? j.oncallGroup : null,
     steward: j?.steward && typeof j.steward === 'object' ? j.steward : null,
+    taskRouting: (() => {
+      const parsed = normalizeBotTaskRoutingConfig(j?.taskRouting);
+      return parsed.ok ? parsed.value : null;
+    })(),
     ownerGroupFollow: j?.ownerGroupFollow && typeof j.ownerGroupFollow === 'object' ? j.ownerGroupFollow : null,
     noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
     promptCache: j?.promptCache && typeof j.promptCache === 'object' ? j.promptCache : null,

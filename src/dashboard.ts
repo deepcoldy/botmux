@@ -1383,6 +1383,8 @@ interface ResolvedDashboardSettings {
   /** Machine-wide multi-topic orchestration switch. Default ON; the nested
    *  dispatch task-tree card switch is default OFF. */
   multiTopic: { enabled: boolean; taskTreeCard: boolean };
+  /** Machine-wide task-routing config, including advanced fields for round-trip preservation. */
+  taskRouting: import('./core/task-routing/model.js').TaskRoutingGlobalConfig & { enabled: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -2045,6 +2047,10 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     multiTopic: {
       enabled: global.multiTopic?.enabled !== false, // default ON
       taskTreeCard: global.multiTopic?.taskTreeCard === true, // default OFF
+    },
+    taskRouting: {
+      ...global.taskRouting,
+      enabled: global.taskRouting?.enabled === true, // default OFF
     },
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
