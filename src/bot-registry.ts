@@ -134,6 +134,7 @@ import {
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import { cliConfigDirEnvKey, cliSupportsConfigDir, normalizeCliConfigDir } from './core/cli-config-dir.js';
 import { normalizeStewardConfig, type StewardConfig } from './core/decision-board/model.js';
+import { normalizeBotTaskRoutingConfig, type BotTaskRoutingConfig } from './core/task-routing/model.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -2583,6 +2584,12 @@ export interface BotConfig {
    * 校验与「等于默认不写盘」见 core/decision-board/model.ts 的 normalizeStewardConfig。
    */
   steward?: StewardConfig;
+  /**
+   * 任务分配（`botmux assign`）画像配置。默认关闭（未配置或不设 `enabled: true`
+   * 不参与自动分配池）；管家与 apiOnly bot 始终排除。
+   * 校验与稀疏存储见 core/task-routing/model.ts 的 normalizeBotTaskRoutingConfig。
+   */
+  taskRouting?: BotTaskRoutingConfig;
   /** Chat IDs excluded from group-join and new-topic auto-start (explicit requests still work). */
   autoStartExcludedChats?: string[];
   /** Bot-wide default listener. It applies to every joined group without an override. */
@@ -4767,6 +4774,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 非法的 steward 配置按关处理（不阻断 bot 启动）；Dashboard / /config 写入时已校验。
       steward: (() => {
         const parsed = normalizeStewardConfig(entry.steward);
+        return parsed.ok ? parsed.value ?? undefined : undefined;
+      })(),
+      // 非法的 taskRouting 配置按关处理（不阻断 bot 启动）；写入路径已校验。
+      taskRouting: (() => {
+        const parsed = normalizeBotTaskRoutingConfig(entry.taskRouting);
         return parsed.ok ? parsed.value ?? undefined : undefined;
       })(),
       autoStartExcludedChats: Array.isArray(entry.autoStartExcludedChats) ? entry.autoStartExcludedChats.filter((id: unknown): id is string => typeof id === 'string') : undefined,

@@ -9,6 +9,24 @@ import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexPr
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import { resumeSuccessMessage } from './resume-result-message.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
+import { hasPendingSessionTurns } from './session-turn-queue.js';
+import { authorizeTaskRoutingSessionAction, type TaskRoutingSessionAction } from './task-routing/authority.js';
+import {
+  truncateTaskSummary,
+  type TaskRoutingAttempt,
+  type TaskRoutingOutcome,
+  type TaskRoutingRecord,
+} from './task-routing/model.js';
+import {
+  TaskRoutingError,
+  getTaskRoutingStatus,
+  listTaskRoutingHistory,
+  preflightTaskRoutingCandidate,
+  recommendBotForTask,
+  runTaskRouting,
+  settleTaskRoutingRecord,
+} from './task-routing/service.js';
+import { TaskRoutingStore } from '../services/task-routing-store.js';
 import { parseOwnerBoardStates } from './decision-board/owner-api.js';
 import { BOARD_STATES } from './decision-board/model.js';
 import {
@@ -50,7 +68,7 @@ import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
 import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createReadStream, existsSync, readFileSync, statSync, unlinkSync } from 'node:fs';
@@ -1339,7 +1357,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-send-lease|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|task-routing|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-send-lease|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -5797,6 +5815,360 @@ ipcRoute('POST', '/api/dispatch-tree/refresh', async (req, res) => {
 const DECISION_BOARD_BODY_MAX_BYTES = 16 * 1024 * 1024;
 const DECISION_BOARD_AUTHOR_RE = /^(?:owner|local|u:[A-Za-z0-9_-]{1,128})$/;
 
+/** `botmux assign …`：会话内 CLI，复用本会话轮换 capability 鉴权与 dispatch 同口径的 owner/管家权限判定。 */
+const TASK_ROUTING_BODY_MAX_BYTES = 64 * 1024;
+const TOPIC_SETTLEMENT_TOKEN_TTL_MS = 15 * 60_000;
+const TOPIC_SETTLEMENT_TOKEN_MAX = 512;
+const topicSettlementTokens = new Map<string, { sessionId: string; token: string; createdAt: number }>();
+
+function pruneTopicSettlementTokens(now: number): void {
+  for (const [k, entry] of topicSettlementTokens) {
+    if (now - entry.createdAt > TOPIC_SETTLEMENT_TOKEN_TTL_MS) {
+      topicSettlementTokens.delete(k);
+    }
+  }
+  while (topicSettlementTokens.size > TOPIC_SETTLEMENT_TOKEN_MAX) {
+    const oldest = topicSettlementTokens.keys().next().value;
+    if (!oldest) break;
+    topicSettlementTokens.delete(oldest);
+  }
+}
+
+function issueTopicSettlementToken(recordId: string, sessionId: string): string {
+  const now = Date.now();
+  pruneTopicSettlementTokens(now);
+  const token = randomBytes(16).toString('hex');
+  topicSettlementTokens.set(recordId, { sessionId, token, createdAt: now });
+  return token;
+}
+
+function verifyTopicSettlementToken(recordId: string, sessionId: string, supplied: string): boolean {
+  const entry = topicSettlementTokens.get(recordId);
+  if (!entry) return false;
+  if (Date.now() - entry.createdAt > TOPIC_SETTLEMENT_TOKEN_TTL_MS) {
+    topicSettlementTokens.delete(recordId);
+    return false;
+  }
+  if (entry.sessionId !== sessionId) return false;
+  const a = Buffer.from(entry.token, 'utf8');
+  const b = Buffer.from(supplied, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+ipcRoute('POST', '/api/sessions/:sessionId/task-routing', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req, TASK_ROUTING_BODY_MAX_BYTES).catch(() => undefined);
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'session_bot_mismatch' });
+
+  const action = body?.action;
+  if (
+    action !== 'status'
+    && action !== 'recommend'
+    && action !== 'history'
+    && action !== 'run'
+    && action !== 'preflight-topic-candidate'
+    && action !== 'record-topic-attempt'
+  ) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_task_routing_action' });
+  }
+
+  // For topic continuation actions (`preflight-topic-candidate`, `record-topic-attempt`),
+  // a one-time `settlementToken` issued when `run --mode topic` passed owner/steward auth
+  // allows the in-flight CLI to finish preflight/settlement even if a later turn arrived.
+  const isTopicContinuation = action === 'preflight-topic-candidate' || action === 'record-topic-attempt';
+  const rawSettlementToken = typeof body?.settlementToken === 'string' && body.settlementToken.trim()
+    ? body.settlementToken.trim()
+    : undefined;
+  const continuationRecordId = typeof body?.recordId === 'string' ? body.recordId.trim() : '';
+  let verifiedBySettlementToken = false;
+
+  if (isTopicContinuation && rawSettlementToken !== undefined) {
+    if (!continuationRecordId || !verifyTopicSettlementToken(continuationRecordId, ds.session.sessionId, rawSettlementToken)) {
+      return jsonRes(res, 403, { ok: false, error: 'invalid_settlement_token' });
+    }
+    if (ds.session.vcMeetingReceiver) {
+      return jsonRes(res, 403, { ok: false, error: 'assign_forbidden_receiver' });
+    }
+    if (ds.session.assistantOwnerOpenId) {
+      return jsonRes(res, 403, { ok: false, error: 'assign_forbidden_assistant' });
+    }
+    if (sessionTransportDisabled(ds)) {
+      return jsonRes(res, 403, { ok: false, error: 'assign_forbidden_no_transport' });
+    }
+    verifiedBySettlementToken = true;
+  }
+
+  const botCfg = getBot(cachedLarkAppId).config;
+  const authDecision = verifiedBySettlementToken
+    ? { ok: true as const, callerKind: 'owner_turn' as const, turnId: ds.managedTurnOrigin?.turnId }
+    : authorizeTaskRoutingSessionAction({
+        action: action as TaskRoutingSessionAction,
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        chatType: ds.chatType,
+        scope: ds.scope,
+        session: ds.session,
+        steward: botCfg.steward,
+        transportDisabled: sessionTransportDisabled(ds),
+        turnId: ds.managedTurnOrigin?.turnId,
+        liveTrustedCaller: ds.managedTurnOrigin?.trustedCaller ?? undefined,
+        activeInteractiveTurn: ds.activeInteractiveTurn,
+        adminOpenIds: getDashboardAdminOpenIds(ds.larkAppId),
+        canOperate: (openId, unionId) => canOperate(ds.larkAppId, ds.chatId, openId, unionId),
+      });
+  if (!authDecision.ok) {
+    return jsonRes(res, authDecision.status, {
+      ok: false,
+      error: authDecision.error,
+      detail: authDecision.detail,
+    });
+  }
+
+  const dataDir = config.session.dataDir;
+  const constraints = {
+    ...(typeof body?.prefer === 'string' && body.prefer.trim() ? { prefer: body.prefer.trim() } : {}),
+    ...(Array.isArray(body?.only)
+      ? { only: body.only.filter((v): v is string => typeof v === 'string' && v.trim().length > 0) }
+      : {}),
+    ...(Array.isArray(body?.exclude)
+      ? { exclude: body.exclude.filter((v): v is string => typeof v === 'string' && v.trim().length > 0) }
+      : {}),
+    ...(typeof body?.workingDir === 'string' && body.workingDir.trim() ? { workingDir: body.workingDir.trim() } : {}),
+  };
+
+  try {
+    if (action === 'status') {
+      const status = await getTaskRoutingStatus({ dataDir });
+      return jsonRes(res, 200, { ok: true, ...status });
+    }
+    if (action === 'history') {
+      const limit = typeof body?.limit === 'number' && Number.isInteger(body.limit) ? body.limit : 20;
+      const botRef = typeof body?.botRef === 'string' && body.botRef.trim() ? body.botRef.trim() : undefined;
+      const records = await listTaskRoutingHistory({ limit, botRef }, { dataDir });
+      return jsonRes(res, 200, { ok: true, records });
+    }
+    if (action === 'recommend') {
+      const task = typeof body?.task === 'string' ? body.task : '';
+      const result = await recommendBotForTask(
+        {
+          task,
+          constraints,
+          noLlm: body?.noLlm === true,
+          callerReason: typeof body?.reason === 'string' ? body.reason : undefined,
+        },
+        { dataDir },
+      );
+      return jsonRes(res, 200, { ok: true, ...result });
+    }
+    if (action === 'run') {
+      if (!isTrustedHostIpcRequest(req) && !isolatedDispatchOutputSinkAllowed(ds)) {
+        return jsonRes(res, 409, { ok: false, error: 'origin_not_sendable' });
+      }
+      const mode = body?.mode === 'topic' ? 'topic' : 'group';
+      const task = typeof body?.task === 'string' ? body.task : '';
+      const title = typeof body?.title === 'string' ? body.title : undefined;
+      const workingDir = typeof body?.workingDir === 'string' ? body.workingDir : undefined;
+      const chatId = typeof body?.chatId === 'string' ? body.chatId : undefined;
+      const callerReason = typeof body?.reason === 'string' ? body.reason : undefined;
+
+      if (mode === 'topic') {
+        const planned = await recommendBotForTask(
+          { task, constraints, noLlm: body?.noLlm === true, callerReason },
+          { dataDir },
+        );
+        const now = Date.now();
+        const id = `tr_${randomBytes(8).toString('hex')}`;
+        const hasCandidates = planned.decision.fallbackOrder.length > 0;
+        const record: TaskRoutingRecord = {
+          id,
+          createdAt: now,
+          updatedAt: now,
+          mode: 'topic',
+          taskSummary: truncateTaskSummary(task),
+          callerKind: authDecision.callerKind,
+          callerAppId: ds.larkAppId,
+          callerSessionId: ds.session.sessionId,
+          ...(authDecision.turnId ? { callerTurnId: authDecision.turnId } : {}),
+          constraints: planned.constraints,
+          selectedAppId: planned.decision.selectedAppId,
+          selectedName: planned.decision.selectedName,
+          matcherKind: planned.decision.matcherKind,
+          confidence: planned.decision.confidence,
+          reason: planned.decision.reason,
+          ...(planned.decision.fallbackFromMatcher ? { fallbackFromMatcher: planned.decision.fallbackFromMatcher } : {}),
+          candidates: planned.decision.candidates,
+          excluded: planned.decision.excluded,
+          attempts: [],
+          outcome: hasCandidates ? 'pending' : 'failed',
+          ...(!hasCandidates ? { error: planned.decision.reason } : {}),
+        };
+        new TaskRoutingStore(dataDir).insertRecord(record);
+        const settlementToken = hasCandidates
+          ? issueTopicSettlementToken(id, ds.session.sessionId)
+          : undefined;
+        return jsonRes(res, 200, {
+          ok: true,
+          planned: true,
+          record,
+          decision: planned.decision,
+          constraints: planned.constraints,
+          ...(settlementToken ? { settlementToken } : {}),
+        });
+      }
+
+      const outcome = await runTaskRouting(
+        {
+          mode: 'group',
+          task,
+          title,
+          workingDir,
+          chatId,
+          constraints,
+          noLlm: body?.noLlm === true,
+          callerReason,
+          callerKind: authDecision.callerKind,
+          callerAppId: ds.larkAppId,
+          callerSessionId: ds.session.sessionId,
+          callerTurnId: authDecision.turnId,
+        },
+        { dataDir },
+      );
+      return jsonRes(res, 200, outcome);
+    }
+
+    if (action === 'preflight-topic-candidate') {
+      if (!continuationRecordId) return jsonRes(res, 400, { ok: false, error: 'record_id_required' });
+      const candidateAppId = typeof body?.candidateAppId === 'string' ? body.candidateAppId.trim() : '';
+      if (!candidateAppId) return jsonRes(res, 400, { ok: false, error: 'candidate_app_id_required' });
+      const store = new TaskRoutingStore(dataDir);
+      const existing = store.getRecord(continuationRecordId);
+      if (!existing || existing.mode !== 'topic' || existing.callerSessionId !== ds.session.sessionId) {
+        return jsonRes(res, 404, { ok: false, error: 'routing_record_not_found' });
+      }
+      if (existing.outcome !== 'pending') {
+        return jsonRes(res, 409, { ok: false, error: 'routing_record_already_settled' });
+      }
+      if (!verifiedBySettlementToken && existing.callerTurnId && existing.callerTurnId !== authDecision.turnId) {
+        return jsonRes(res, 409, { ok: false, error: 'routing_record_turn_mismatch' });
+      }
+      if (!existing.candidates.some(c => c.larkAppId === candidateAppId)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_selected_bot' });
+      }
+      const check = await preflightTaskRoutingCandidate(
+        { appId: candidateAppId, constraints: existing.constraints },
+        { dataDir },
+      );
+      return jsonRes(res, 200, { ok: true, ...check });
+    }
+
+    // action === 'record-topic-attempt': atomically settle a pending topic record to a terminal outcome.
+    if (!continuationRecordId) return jsonRes(res, 400, { ok: false, error: 'record_id_required' });
+    const store = new TaskRoutingStore(dataDir);
+    const existing = store.getRecord(continuationRecordId);
+    if (!existing || existing.mode !== 'topic' || existing.callerSessionId !== ds.session.sessionId) {
+      return jsonRes(res, 404, { ok: false, error: 'routing_record_not_found' });
+    }
+    if (existing.outcome !== 'pending') {
+      return jsonRes(res, 409, { ok: false, error: 'routing_record_already_settled' });
+    }
+    if (!verifiedBySettlementToken && existing.callerTurnId && existing.callerTurnId !== authDecision.turnId) {
+      return jsonRes(res, 409, { ok: false, error: 'routing_record_turn_mismatch' });
+    }
+
+    // Strictly require a terminal outcome (never accept 'pending' or garbage).
+    const terminalOutcomes: ReadonlySet<string> = new Set(['dispatched', 'fallback_dispatched', 'failed']);
+    if (typeof body?.outcome !== 'string' || !terminalOutcomes.has(body.outcome)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_settlement_outcome' });
+    }
+    const terminalOutcome = body.outcome as Exclude<TaskRoutingOutcome, 'pending'>;
+
+    const candidateById = new Map(existing.candidates.map(c => [c.larkAppId, c]));
+    let selectedAppIdPatch: string | null | undefined;
+    let selectedNamePatch: string | null | undefined;
+    if (terminalOutcome === 'dispatched' || terminalOutcome === 'fallback_dispatched') {
+      if (typeof body?.selectedAppId !== 'string' || !candidateById.has(body.selectedAppId)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_selected_bot' });
+      }
+      selectedAppIdPatch = body.selectedAppId;
+      // Authoritatively derive display name from planned candidates; never trust client-forged name.
+      selectedNamePatch = candidateById.get(body.selectedAppId)!.name;
+    } else if (typeof body?.selectedAppId === 'string') {
+      if (!candidateById.has(body.selectedAppId)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_selected_bot' });
+      }
+      selectedAppIdPatch = body.selectedAppId;
+      selectedNamePatch = candidateById.get(body.selectedAppId)!.name;
+    } else if (body?.selectedAppId === null) {
+      selectedAppIdPatch = null;
+      selectedNamePatch = null;
+    }
+
+    const allowedAttemptOutcomes: ReadonlySet<string> = new Set(['dispatched', 'failed', 'skipped']);
+    const attempts = Array.isArray(body?.attempts)
+      ? body.attempts
+        .filter((item): item is Record<string, unknown> => (
+          !!item
+          && typeof item === 'object'
+          && !Array.isArray(item)
+          && typeof (item as Record<string, unknown>).appId === 'string'
+          && candidateById.has((item as Record<string, unknown>).appId as string)
+          && typeof (item as Record<string, unknown>).outcome === 'string'
+          && allowedAttemptOutcomes.has((item as Record<string, unknown>).outcome as string)
+        ))
+        .slice(0, 32)
+        .map((item): TaskRoutingAttempt => {
+          const appId = item.appId as string;
+          const cand = candidateById.get(appId)!;
+          return {
+            appId,
+            name: cand.name,
+            outcome: item.outcome as TaskRoutingAttempt['outcome'],
+            reason: typeof item.reason === 'string' ? item.reason.slice(0, 500) : '',
+            at: typeof item.at === 'number' && Number.isFinite(item.at) ? item.at : Date.now(),
+            ...(typeof item.chatId === 'string' ? { chatId: item.chatId } : {}),
+            ...(typeof item.sessionId === 'string' ? { sessionId: item.sessionId } : {}),
+            ...(typeof item.rootMessageId === 'string' ? { rootMessageId: item.rootMessageId } : {}),
+          };
+        })
+      : undefined;
+
+    const settledRes = settleTaskRoutingRecord(
+      continuationRecordId,
+      {
+        ...(selectedAppIdPatch !== undefined ? { selectedAppId: selectedAppIdPatch } : {}),
+        ...(selectedNamePatch !== undefined ? { selectedName: selectedNamePatch } : {}),
+        ...(attempts ? { attempts } : {}),
+        outcome: terminalOutcome,
+        ...(typeof body?.targetChatId === 'string' || body?.targetChatId === null
+          ? { targetChatId: body.targetChatId }
+          : {}),
+        ...(typeof body?.targetRootMessageId === 'string' || body?.targetRootMessageId === null
+          ? { targetRootMessageId: body.targetRootMessageId }
+          : {}),
+        ...(typeof body?.error === 'string' || body?.error === null ? { error: body.error } : {}),
+      },
+      { store },
+    );
+    if (!settledRes.settled) {
+      return jsonRes(res, 409, { ok: false, error: 'routing_record_already_settled' });
+    }
+    topicSettlementTokens.delete(continuationRecordId);
+    return jsonRes(res, 200, { ok: true, record: settledRes.record });
+  } catch (error) {
+    if (error instanceof TaskRoutingError) {
+      return jsonRes(res, error.status, { ok: false, error: error.code, detail: error.message });
+    }
+    return jsonRes(res, 500, {
+      ok: false,
+      error: 'task_routing_failed',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
 /** `botmux board …`：会话内 CLI，用本会话轮换的 capability 鉴权（同 /project）。 */
 ipcRoute('POST', '/api/sessions/:sessionId/decision-board', async (req, res, params) => {
   const body = await readJsonBody<Record<string, unknown>>(req, DECISION_BOARD_BODY_MAX_BYTES).catch(() => undefined);
@@ -6823,11 +7195,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/start', async (_req, res, params) => 
 // 会话。aggregator 建完群后按模式(一起开工/lead 分配)对每个目标 bot 的 daemon 调一次。
 ipcRoute('POST', '/api/sessions/spawn', requireBoundBot(async (req, res) => {
   const activeSessions = getActiveSessionsRegistry();
-  if (!activeSessions) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
+  if (!activeSessions) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable', accepted: false });
   let body: unknown;
-  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json', accepted: false }); }
   const parsed = parseSpawnRequest(body);
-  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error, accepted: false });
   const postBanner = !!(body as any).postBanner;
   return withBotTurnAdmission(cachedLarkAppId, async () => {
   let attachments;
@@ -6835,7 +7207,7 @@ ipcRoute('POST', '/api/sessions/spawn', requireBoundBot(async (req, res) => {
     attachments = materializeDashboardImages(cachedLarkAppId, parsed.value.images);
   } catch (err: any) {
     logger.error(`[createSession] failed to persist Dashboard images: ${err?.message ?? err}`);
-    return jsonRes(res, 500, { ok: false, error: 'image_store_failed' });
+    return jsonRes(res, 500, { ok: false, error: 'image_store_failed', accepted: false });
   }
   const r = await spawnDashboardSession(activeSessions, undefined, {
     larkAppId: cachedLarkAppId,
@@ -10869,12 +11241,33 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   let logicalSessionCount = 0;
   let residentSessionCount = 0;
   let dormantSessionCount = 0;
+  let pendingTurnCount = 0;
+  let activeUsageLimit: { kind: 'usage' | 'rate'; retryAtMs: number; retryLabel?: string } | null = null;
+  const nowLimitCheckMs = Date.now();
   const registry = getActiveSessionsRegistry();
   if (registry) {
     logicalSessionCount = registry.size;
     for (const ds of registry.values()) {
       if (ds.worker && !ds.worker.killed) residentSessionCount++;
       else if (!ds.session.queued) dormantSessionCount++;
+      if (hasPendingSessionTurns(ds.session.sessionId) || ds.pendingTurnId !== undefined) {
+        pendingTurnCount++;
+      }
+      const lim = ds.usageLimit;
+      if (lim?.limited && !lim.retryReady && lim.retryAtMs > nowLimitCheckMs) {
+        // Prefer account-wide 'usage' limits over transient 'rate' limits; among same kind pick latest reset.
+        if (
+          !activeUsageLimit
+          || (lim.kind === 'usage' && activeUsageLimit.kind !== 'usage')
+          || (lim.kind === activeUsageLimit.kind && lim.retryAtMs > activeUsageLimit.retryAtMs)
+        ) {
+          activeUsageLimit = {
+            kind: lim.kind,
+            retryAtMs: lim.retryAtMs,
+            ...(lim.retryLabel ? { retryLabel: lim.retryLabel } : {}),
+          };
+        }
+      }
     }
   }
   // startupCommands → newline-joined for the dashboard textarea (one per line).
@@ -11113,6 +11506,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     oncallGroup: (() => { try { return getBot(cachedLarkAppId).config.oncallGroup ?? null; } catch { return null; } })(),
     steward: (() => { try { return getBot(cachedLarkAppId).config.steward ?? null; } catch { return null; } })(),
+    taskRouting: (() => { try { return getBot(cachedLarkAppId).config.taskRouting ?? null; } catch { return null; } })(),
+    resolvedAllowedUsers: (() => { try { return [...getBot(cachedLarkAppId).resolvedAllowedUsers]; } catch { return []; } })(),
     ownerGroupFollow: (() => { try { return getBot(cachedLarkAppId).config.ownerGroupFollow ?? null; } catch { return null; } })(),
     noProgressNotify: (() => { try { return getBot(cachedLarkAppId).config.noProgressNotify ?? null; } catch { return null; } })(),
     promptCache: (() => { try { return getBot(cachedLarkAppId).config.promptCache ?? null; } catch { return null; } })(),
@@ -11151,6 +11546,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     logicalSessionCount,
     residentSessionCount,
     dormantSessionCount,
+    pendingTurnCount,
+    activeUsageLimit,
     startupCommands,
     defaultPassthroughCommands: [...resolvePassthroughCommands(cachedLarkAppId, undefined, false)],
     customPassthroughCommands,
@@ -12773,6 +13170,14 @@ botConfigPutRoute<{ steward?: unknown }>('/api/bot-steward', 'steward', {
   respond: value => ({ ok: true, steward: value ?? null }),
 });
 
+botConfigPutRoute<{ taskRouting?: unknown }>('/api/bot-task-routing', 'taskRouting', {
+  normalize: (body, spec) => {
+    const parsed = coerceConfigValue(spec, JSON.stringify(body.taskRouting ?? null));
+    return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
+  },
+  respond: value => ({ ok: true, taskRouting: value ?? null }),
+});
+
 async function oncallTargetPresentation() {
   const deployment = readOncallDeploymentEnv();
   const settings = readOncallGroupSettings(config.session.dataDir, cachedLarkAppId);
@@ -13861,11 +14266,11 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
       roleProfileId?: string;
     }>(req);
   } catch {
-    return jsonRes(res, 400, { error: 'bad_json' });
+    return jsonRes(res, 400, { error: 'bad_json', accepted: false });
   }
   const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
   if (!Array.isArray(body.larkAppIds) || !body.larkAppIds.every(x => typeof x === 'string')) {
-    return jsonRes(res, 400, { error: 'larkAppIds_required' });
+    return jsonRes(res, 400, { error: 'larkAppIds_required', accepted: false });
   }
   // userOpenIds, transferOwnerTo, notifyOwnerOpenId are optional; pre-validated
   // upstream by the dashboard route. All open_ids MUST be in the calling bot's
@@ -13883,7 +14288,7 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     : null;
   if (body.transferOwnerUnionId !== undefined
     && (!transferOwnerUnionId || !transferOwnerUnionId.startsWith('on_') || !ownerUnionIds.includes(transferOwnerUnionId))) {
-    return jsonRes(res, 400, { ok: false, error: 'invalid_transfer_owner_union_id' });
+    return jsonRes(res, 400, { ok: false, error: 'invalid_transfer_owner_union_id', accepted: false });
   }
   const transferTo = typeof body.transferOwnerTo === 'string' && body.transferOwnerTo.trim()
     ? body.transferOwnerTo.trim()
@@ -13895,20 +14300,21 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     ? body.roleProfileId.trim()
     : null;
   if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
-    return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+    return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id', accepted: false });
   }
   // Optional (design 2026-11-03 workflow-dashboard-orchestration §8): a topic
   // group, and the talk-only grant matrix between the bots that joined (what
   // CLI create-group writes). Absent → today's behaviour, byte for byte.
   const groupCreationExtras = parseGroupCreateExtras(body);
-  if (!groupCreationExtras.ok) return jsonRes(res, 400, { ok: false, error: groupCreationExtras.error });
+  if (!groupCreationExtras.ok) return jsonRes(res, 400, { ok: false, error: groupCreationExtras.error, accepted: false });
   const bindWorkingDir = typeof body.bindWorkingDir === 'string' ? body.bindWorkingDir.trim() : '';
   let bindResolvedPath: string | undefined;
   if (bindWorkingDir) {
     const v = validateWorkingDir(bindWorkingDir);
-    if (!v.ok) return jsonRes(res, 400, { ok: false, error: v.error });
+    if (!v.ok) return jsonRes(res, 400, { ok: false, error: v.error, accepted: false });
     bindResolvedPath = v.resolvedPath;
   }
+  let createdChatId: string | undefined;
   try {
     const r = await createGroupWithBots({
       creatorLarkAppId: cachedLarkAppId,
@@ -13921,6 +14327,7 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
       notifyOwnerOpenId: notifyTo ?? undefined,
       bindWorkingDir: bindWorkingDir || undefined,
       roleProfileId: roleProfileId ?? undefined,
+      onChatCreated: chatId => { createdChatId = chatId; },
       ...(groupCreationExtras.chatMode ? { chatMode: groupCreationExtras.chatMode } : {}),
       ...(groupCreationExtras.botCollaboration
         ? { ensureBotCollaboration: async (chatId: string, joined: string[]) => { await ensureLocalBotChatGrantMatrix(chatId, joined); } }
@@ -13928,7 +14335,13 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     });
     jsonRes(res, 200, bindResolvedPath ? { ...r, bindResolvedPath } : r);
   } catch (e) {
-    jsonRes(res, 502, { ok: false, error: String((e as Error).message ?? e) });
+    // No `accepted:false` here: createChat may already have committed. Preserve
+    // the id when the service reached its post-create checkpoint for recovery.
+    jsonRes(res, 502, {
+      ok: false,
+      error: String((e as Error).message ?? e),
+      ...(createdChatId ? { chatId: createdChatId } : {}),
+    });
   }
 }));
 

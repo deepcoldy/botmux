@@ -45,6 +45,7 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-sandbox-network-policy', LEGACY],
   ['/api/bot-lark-tool-binding', LEGACY],
   ['/api/bot-lark-user-owner-fallback', LEGACY],
+  ['/api/bot-task-routing', LEGACY],
 ];
 
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
@@ -166,6 +167,15 @@ const CASES: readonly Case[] = [
   ['/api/bot-lark-user-owner-fallback', '{"enabled":true,"larkUserOwnerFallback":false}', 400, { ok: false, error: 'no_valid_fields' }],
   ['/api/bot-lark-user-owner-fallback', '{"enabled":"off"}', 400, { ok: false, error: 'no_valid_fields' }],
   ['/api/bot-lark-user-owner-fallback', 'null', 400, { ok: false, error: 'no_valid_fields' }],
+  ['/api/bot-task-routing', '{"taskRouting":{"enabled":true,"costTier":"low","strengths":"小修和文案","limitations":"不做大重构"}}', 200, {
+    ok: true,
+    taskRouting: { enabled: true, costTier: 'low', strengths: '小修和文案', limitations: '不做大重构' },
+  }, {
+    taskRouting: { enabled: true, costTier: 'low', strengths: '小修和文案', limitations: '不做大重构' },
+  }],
+  ['/api/bot-task-routing', '{"taskRouting":{"enabled":false}}', 200, { ok: true, taskRouting: null }, { taskRouting: undefined }],
+  ['/api/bot-task-routing', '{"taskRouting":null}', 200, { ok: true, taskRouting: null }, { taskRouting: undefined }],
+  ['/api/bot-task-routing', '{"taskRouting":{"enabled":true,"costTier":"ultra"}}', 400, { ok: false }],
 ];
 
 describe('config-field PUT routes (botConfigPutRoute)', () => {

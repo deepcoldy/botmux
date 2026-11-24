@@ -12406,12 +12406,38 @@ describe('POST /api/groups/create', () => {
       body: JSON.stringify({ larkAppIds: ['test-app'], bindWorkingDir: '/definitely/not/a/real/botmux/path' }),
     });
     expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ accepted: false });
     expect(createSpy).not.toHaveBeenCalled();
     expect(addSpy).not.toHaveBeenCalled();
     expect(bindSpy).not.toHaveBeenCalled();
     bindSpy.mockRestore();
     addSpy.mockRestore();
     createSpy.mockRestore();
+  });
+
+  it('returns the created chat id without accepted:false when a later step fails', async () => {
+    setLarkAppId('test-app');
+    const createSpy = vi.spyOn(groupsStore, 'createChat').mockResolvedValue({
+      chatId: 'oc_created_before_failure',
+      invalidBotIds: [],
+      invalidUserIds: [],
+    });
+    const linkSpy = vi.spyOn(groupsStore, 'getChatShareLink').mockRejectedValue(new Error('share link unavailable'));
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/create`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ larkAppIds: ['test-app'] }),
+      });
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body).toMatchObject({ ok: false, chatId: 'oc_created_before_failure' });
+      expect(body).not.toHaveProperty('accepted');
+    } finally {
+      linkSpy.mockRestore();
+      createSpy.mockRestore();
+    }
   });
 });
 

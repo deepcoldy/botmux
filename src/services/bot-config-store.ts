@@ -3,6 +3,7 @@ import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { parseInviteConfig } from './invite-config.js';
 import { normalizeStewardConfig } from '../core/decision-board/model.js';
+import { normalizeBotTaskRoutingConfig } from '../core/task-routing/model.js';
 import { normalizeIdleSpinSuspendConfig } from '../core/idle-spin-config.js';
 import { formatZcodeModelChoice, resolveZcodeModelReference, zcodeAmbiguousModelIds } from './zcode-models.js';
 import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
@@ -184,6 +185,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'autoStartOnNewTopic', configKey: 'autoStartOnNewTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '话题群每个新话题自动开工 on|off' },
   { key: 'ownerGroupFollow', configKey: 'ownerGroupFollow', kind: 'json', effect: 'immediate', clearable: true, hint: '主人进新群时自动邀请本机器人，默认关闭；JSON {"enabled":true,"excludeChatIds":["oc_…"],"pollIntervalSeconds":60}。仅使用主人本人的用户授权，首次扫描只建立基线；被移出后不再补拉；unset 关闭' },
   { key: 'steward', configKey: 'steward', kind: 'json', effect: 'immediate', clearable: true, hint: '管家（决策看板）JSON：{"enabled":true,"chatId":"oc_…","guideMode":"append|replace","guideText":"自定义规则","autoJoinNewGroups":false,"autoJoinSoloGroups":true,"closeHints":true,"decisionCards":false,"taskHints":true}；默认关闭；autoJoinNewGroups=拉新群时带上管家，默认开，只在关掉时写 false；autoJoinSoloGroups=只有你和一个 bot 的新群也带，默认关；closeHints=后台巡检提示可以关 / 可以推进 / 过了复查时间的事项（只提示不改状态），默认关；decisionCards=待拍板时往管家群发拍板卡片，默认开，只在关掉时写 false；taskHints=关联群里一轮交付、举手或中断时提醒管家（只提示不改状态），默认关，只在打开时写 true；unset 关闭（看板数据保留）' },
+  { key: 'taskRouting', configKey: 'taskRouting', kind: 'json', effect: 'immediate', clearable: true, hint: '任务分配画像 JSON：{"enabled":true,"costTier":"low|medium|high","strengths":"擅长说明","limitations":"不擅长与限制"}；默认不参与分配（enabled 须显式为 true），管家与 apiOnly Bot 默认排除；unset 清除' },
   { key: 'chatManagerEnabled', configKey: 'chatManagerEnabled', kind: 'boolean', effect: 'immediate', clearable: false, hint: '允许本 bot 被设为普通群负责人（默认接待者）on|off（默认 off）：开启后才提供会话内群负责人工具并允许 set，关闭后不免 @ 接话；clear/status 不受影响' },
   { key: 'chatManagerSharedTopic', configKey: 'chatManagerSharedTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '群负责人免 @ 接的顶层消息也开话题 on|off（默认 off）：仅在共享回复模式（/reply-mode shared）的普通群生效，回复挂到那条消息下面、和 @ 本 bot 一样，仍是群级同一个会话；需同时开 chatManagerEnabled' },
   { key: 'groupSecretaryEnabled', configKey: 'groupSecretaryEnabled', kind: 'boolean', effect: 'immediate', clearable: false, hint: '允许本 bot 在群里用 /secretary on 当群秘书 on|off（默认 off）：关闭时 /secretary on|takeover 提示未开放、后台不旁听不巡检；off/status 不受影响' },
@@ -1141,7 +1143,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_provider_recovery: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` | 'invalid_idle_spin_suspend' };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_provider_recovery: ${string}` | `invalid_steward: ${string}` | `invalid_task_routing: ${string}` | `invalid_feedback_presentation: ${string}` | 'invalid_idle_spin_suspend' };
 
 /** herdr 块全部可写字段；与 normalizeHerdrBackendConfig 接受的键必须一致（有 parity 测试）。 */
 export const HERDR_FIELD_NAMES = ['sessionName', 'placement', 'workspace', 'tab', 'splitDirection', 'chatTypes'] as const;
@@ -1263,6 +1265,10 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'steward') {
           const steward = normalizeStewardConfig(parsed);
           return steward.ok ? { ok: true, value: steward.value } : { ok: false, reason: `invalid_steward: ${steward.reason}` };
+        }
+        if (spec.configKey === 'taskRouting') {
+          const routing = normalizeBotTaskRoutingConfig(parsed);
+          return routing.ok ? { ok: true, value: routing.value } : { ok: false, reason: `invalid_task_routing: ${routing.reason}` };
         }
         if (spec.configKey === 'botActorOwnerBindings') {
           try {

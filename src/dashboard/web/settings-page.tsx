@@ -126,6 +126,7 @@ interface DashboardSettings {
   promptCache: PromptCacheConfig | null;
   providerRecovery: ProviderRecoveryConfig | null;
   multiTopic: { enabled: boolean; taskTreeCard: boolean };
+  taskRouting: import('../../core/task-routing/model.js').TaskRoutingGlobalConfig & { enabled: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
@@ -325,6 +326,7 @@ export function parseSettings(s: any): DashboardSettings {
     promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
     providerRecovery: readProviderRecoveryConfig(s?.providerRecovery) ?? null,
     multiTopic: { enabled: s?.multiTopic?.enabled !== false, taskTreeCard: s?.multiTopic?.taskTreeCard === true },
+    taskRouting: { ...s?.taskRouting, enabled: s?.taskRouting?.enabled === true },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     httpProxy: typeof s?.httpProxy === 'string' ? s.httpProxy : '',
@@ -1285,6 +1287,21 @@ export function SettingsBody(props: {
             disabled={dis || !settings.multiTopic.enabled || savingKey === 'multiTopicTaskTreeCard'}
             onChange={value => {
               void props.onSave('multiTopicTaskTreeCard', { multiTopic: { enabled: settings.multiTopic.enabled, taskTreeCard: value } }, s => ({ ...s, multiTopic: { ...s.multiTopic, taskTreeCard: value } }));
+            }}
+          />
+        </SettingsBlock>
+        <SettingsBlock id="settings-task-routing" title={tr('settings.sectionTaskRouting')}>
+          <ToggleRow
+            title={tr('settings.taskRoutingEnable')}
+            help={tr('settings.taskRoutingEnableHelp')}
+            checked={settings.taskRouting.enabled}
+            disabled={dis || savingKey === 'taskRouting'}
+            dataAction="toggle-task-routing"
+            onChange={value => {
+              void props.onSave('taskRouting', { taskRouting: { enabled: value } }, s => ({
+                ...s,
+                taskRouting: { ...s.taskRouting, enabled: value },
+              }));
             }}
           />
         </SettingsBlock>
