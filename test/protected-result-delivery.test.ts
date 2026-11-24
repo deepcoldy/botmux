@@ -1,3 +1,4 @@
+import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -48,7 +49,7 @@ describe('protected plugin result delivery', () => {
       f.writes.push(type);
       return type === 'file' ? 'om_attachment' : 'om_primary';
     });
-    expect(await deliverProtectedResult(f.input)).toEqual(['om_primary', 'om_attachment']);
+    expect((await deliverProtectedResult(f.input)).messageIds).toEqual(['om_primary', 'om_attachment']);
     expect(f.writes).toEqual(['file', 'interactive']);
     expect(f.store.redactMessage(raw()).body.content).toContain(PROTECTED_RESULT_PLACEHOLDER);
     expect(JSON.stringify(f.store.redactMessage(raw()))).not.toContain(secret);
@@ -64,9 +65,9 @@ describe('protected plugin result delivery', () => {
     expect(f.store.status({ ...context, ownerUnionId: 'on_other' }, f.input.deliveryId).status).toBe('not_found');
     expect(f.store.status({ ...context, appId: 'cli_other' }, f.input.deliveryId).status).toBe('not_found');
     expect(f.store.status({ ...context, sessionId: 'session_other' }, f.input.deliveryId).status).toBe('not_found');
-    expect(await deliverProtectedResult(f.input)).toEqual(['om_primary', 'om_attachment']);
+    expect((await deliverProtectedResult(f.input)).messageIds).toEqual(['om_primary', 'om_attachment']);
     expect(f.input.send).toHaveBeenCalledTimes(2);
-    expect(await deliverProtectedResult({ ...f.input, context: { ...context, turnId: 'om_retry_turn' } })).toEqual(['om_primary', 'om_attachment']);
+    expect((await deliverProtectedResult({ ...f.input, context: { ...context, turnId: 'om_retry_turn' } })).messageIds).toEqual(['om_primary', 'om_attachment']);
     expect(f.input.send).toHaveBeenCalledTimes(2);
     expect(f.store.statusForCaller(context, context.pluginId, f.input.deliveryId).status).toBe('delivered');
     expect(f.store.completedFinal(context.appId, context.sessionId, 'om_retry_turn')).toEqual(['om_primary', 'om_attachment']);
@@ -89,14 +90,14 @@ describe('protected plugin result delivery', () => {
     f.input.upload.mockImplementation(async () => { allowed = false; return 'file_sensitive'; });
     await expect(deliverProtectedResult(f.input)).rejects.toThrow(/uncertain/);
     expect(f.input.send).not.toHaveBeenCalled();
-    expect(f.store.status(context, f.input.deliveryId).status).toBe('aborted');
-    expect(f.store.redactMessage({ message_id: 'om_safe', chat_id: context.chatId, msg_type: 'text', body: { content: 'safe' } }).body.content).toBe('safe');
+    expect(f.store.status(context, f.input.deliveryId).status).toBe('unknown');
+    expect(() => f.store.assertResourceReadable('om_copy', 'file_sensitive', 'oc_other')).toThrow(/read_denied/);
   });
   it('retains the read fence when the provider succeeds but committing provenance fails', async () => {
     let writes = 0;
     const f = fixture({ persist(path, content) {
       writes += 1;
-      if (writes >= 3) throw new Error('disk unavailable');
+      if (writes >= 4) throw new Error('disk unavailable');
       atomicWriteFileSync(path, content, { mode: 0o600, durable: true, followTargetSymlink: false });
     } });
     await expect(deliverProtectedResult(f.input)).rejects.toThrow(/uncertain/);
@@ -128,4 +129,81 @@ describe('protected plugin result delivery', () => {
     expect(restarted.status(context, 'receipt_abcdefgh').status).toBe('delivered');
     expect(() => restarted.update(context, 'receipt_abcdefgh', { message: { messageId: 'om_late', kind: 'attachment' } })).toThrow(/already_complete/);
   });
+  it('rejects NUL boundary collisions instead of replaying another file layout', async () => {
+    const f = fixture();
+    await deliverProtectedResult({ ...f.input, files: [{ name: 'a', data: Buffer.from('x') }, { name: 'b', data: Buffer.from('y') }] });
+    await expect(deliverProtectedResult({ ...f.input, files: [{ name: 'a', data: Buffer.from('x\0b\0y') }] })).rejects.toThrow(/conflict/);
+    expect(f.input.send).toHaveBeenCalledTimes(3);
+  });
+  it('keeps accepted uploads fenced when resource registration fails once and error persistence recovers', async () => {
+    let writes = 0;
+    const f = fixture({ persist(path, content) {
+      if (++writes === 3) throw new Error('transient registration failure');
+      atomicWriteFileSync(path, content, { mode: 0o600, durable: true, followTargetSymlink: false });
+    } });
+    await expect(deliverProtectedResult(f.input)).rejects.toThrow(/uncertain/);
+    expect(f.input.upload).toHaveBeenCalledTimes(1);
+    expect(f.input.send).not.toHaveBeenCalled();
+    const restarted = new ProtectedResultStore(f.root);
+    expect(restarted.status(context, f.input.deliveryId).status).toBe('unknown');
+    expect(() => restarted.assertResourceReadable('om_copy', 'file_sensitive', 'oc_other')).toThrow(/read_denied/);
+    expect(restarted.redactMessage(raw('om_copy', 'oc_other', 'file')).body.content).toContain(PROTECTED_RESULT_PLACEHOLDER);
+    await expect(deliverProtectedResult({ ...f.input, store: restarted })).rejects.toThrow(/uncertain/);
+    expect(f.input.upload).toHaveBeenCalledTimes(1);
+  });
+  it('rearms a pre-provider abort once, while an ambiguous upload is never retried', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    f.input.assertAuthority.mockImplementationOnce(() => {}).mockImplementationOnce(() => { throw new Error('cancelled'); });
+    await expect(deliverProtectedResult(f.input)).rejects.toThrow(/uncertain/);
+    expect(f.input.upload).not.toHaveBeenCalled();
+    expect(f.store.status(context, f.input.deliveryId).status).toBe('aborted');
+    vi.advanceTimersByTime(60_000);
+    const restarted = new ProtectedResultStore(f.root);
+    const result = await deliverProtectedResult({ ...f.input, store: restarted });
+    expect(result.messages).toEqual([{ messageId: 'om_primary', kind: 'primary' }, { messageId: 'om_attachment', kind: 'attachment' }]);
+    expect(f.input.upload).toHaveBeenCalledTimes(1);
+    const other = fixture(); other.input.upload.mockRejectedValue(new Error('lost upload ACK'));
+    await expect(deliverProtectedResult(other.input)).rejects.toThrow(/uncertain/);
+    other.input.upload.mockResolvedValue('file_sensitive');
+    await expect(deliverProtectedResult(other.input)).rejects.toThrow(/uncertain/);
+    expect(other.input.upload).toHaveBeenCalledTimes(1);
+  });
+  it('records attachment-only partial receipts without labelling them primary', async () => {
+    const f = fixture();
+    f.input.send.mockImplementation(async (_body, type) => { if (type === 'interactive') throw new Error('lost ACK'); return 'om_attachment'; });
+    const failure = await deliverProtectedResult(f.input).catch(error => error);
+    expect(failure.messages).toEqual([{ messageId: 'om_attachment', kind: 'attachment' }]);
+    expect(f.store.completedFinal(context.appId, context.sessionId, context.turnId)).toBeUndefined();
+  });
+
+  it('registers images from the real final card before publishing and protects copied keys', async () => {
+    const f = fixture();
+    const markdown = 'summary\n\n![](img_v3_sensitive_chart)';
+    const input = { ...f.input, files: [], markdown, render: (text: string) => buildCanonicalFinalReplyCard({ markdown: text }) };
+    f.input.send.mockImplementation(async body => {
+      expect(body).toContain('img_v3_sensitive_chart');
+      expect(() => f.store.assertResourceReadable('om_copy', 'img_v3_sensitive_chart', 'oc_other')).toThrow(/read_denied/);
+      return 'om_primary';
+    });
+    await deliverProtectedResult(input);
+    const restarted = new ProtectedResultStore(f.root);
+    expect(() => restarted.assertResourceReadable('om_copy', 'img_v3_sensitive_chart', 'oc_other')).toThrow(/read_denied/);
+    expect(JSON.stringify(restarted.redactMessage({ message_id: 'om_copy', chat_id: 'oc_other', msg_type: 'image',
+      body: { content: JSON.stringify({ image_key: 'img_v3_sensitive_chart' }) } }))).not.toContain('img_v3_sensitive_chart');
+  });
+  it('never publishes a card whose image registration failed', async () => {
+    let writes = 0;
+    const f = fixture({ persist(path, content) {
+      if (++writes === 3) throw new Error('resource registration failed');
+      atomicWriteFileSync(path, content, { mode: 0o600, durable: true, followTargetSymlink: false });
+    } });
+    await expect(deliverProtectedResult({ ...f.input, files: [], markdown: '![](img_v3_sensitive_chart)',
+      render: text => buildCanonicalFinalReplyCard({ markdown: text }) })).rejects.toThrow(/uncertain/);
+    expect(f.input.send).not.toHaveBeenCalled();
+    const restarted = new ProtectedResultStore(f.root);
+    expect(restarted.status(context, f.input.deliveryId).status).toBe('unknown');
+    expect(() => restarted.assertResourceReadable('om_copy', 'img_v3_sensitive_chart', 'oc_other')).toThrow(/read_denied/);
+  });
+
 });

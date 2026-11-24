@@ -21,6 +21,7 @@ export interface ProtectedResultRecord {
   status: 'pending' | 'delivered' | 'unknown' | 'aborted';
   messages: Array<{ messageId: string; kind: 'primary' | 'attachment' }>;
   resources: string[];
+  resourceRegistrationPending?: boolean;
   acknowledgedTurns: string[];
   updatedAt: number;
 }
@@ -97,7 +98,8 @@ export class ProtectedResultStore {
         || !Number.isFinite(record.updatedAt) || !Array.isArray(record.messages) || record.messages.length > 9
         || record.messages.some(message => !MESSAGE_ID.test(message.messageId)
           || !['primary', 'attachment'].includes(message.kind))
-        || !Array.isArray(record.resources) || record.resources.length > 8
+        || (record.resourceRegistrationPending !== undefined && typeof record.resourceRegistrationPending !== 'boolean')
+        || !Array.isArray(record.resources) || record.resources.length > 128
         || !Array.isArray(record.acknowledgedTurns) || record.acknowledgedTurns.length > 256
         || record.acknowledgedTurns.some(turn => !MESSAGE_ID.test(turn))
         || record.resources.some(resource => typeof resource !== 'string' || !/^[A-Za-z0-9_-]{1,300}$/.test(resource))) {
@@ -136,6 +138,15 @@ export class ProtectedResultStore {
           if (previous.acknowledgedTurns.length >= 256) throw new Error('protected_result_delivery_full');
           previous.acknowledgedTurns.push(context.turnId);
         }
+        // Only a pre-provider failure can enter aborted. Rearm it under the
+        // same lock; pending/unknown attempts are never automatically retried.
+        if (previous.status === 'aborted' && !previous.messages.length && !previous.resourceRegistrationPending) {
+          previous.status = 'pending';
+          previous.context = { ...context };
+          previous.acknowledgedTurns = [context.turnId];
+          previous.updatedAt = this.options.now?.() ?? Date.now();
+          return { created: true, record: structuredClone(previous) };
+        }
         return { created: false, record: structuredClone(previous) };
       }
       if (Object.keys(index.deliveries).length >= MAX_DELIVERIES) throw new Error('protected_result_index_full');
@@ -146,7 +157,7 @@ export class ProtectedResultStore {
     });
   }
   update(context: ProtectedResultContext, deliveryId: string, change: {
-    message?: ProtectedResultRecord['messages'][number]; resource?: string; status?: ProtectedResultRecord['status'];
+    message?: ProtectedResultRecord['messages'][number]; resource?: string; resourceRegistrationPending?: boolean; status?: ProtectedResultRecord['status'];
   }): void {
     const key = deliveryKey(context, deliveryId);
     this.mutate(context.chatId, index => {
@@ -169,7 +180,13 @@ export class ProtectedResultStore {
         if (!/^[A-Za-z0-9_-]{1,300}$/.test(change.resource)) throw new Error('protected_result_invalid_resource');
         record.resources.push(change.resource);
       }
-      if (record.messages.length > 9 || record.resources.length > 8) throw new Error('protected_result_delivery_full');
+      if (change.resourceRegistrationPending !== undefined) {
+        if (record.status === 'delivered' && change.resourceRegistrationPending !== !!record.resourceRegistrationPending) throw new Error('protected_result_already_complete');
+        record.resourceRegistrationPending = change.resourceRegistrationPending;
+      }
+      if (change.status === 'delivered' && record.resourceRegistrationPending) throw new Error('protected_result_resources_pending');
+      if (change.status === 'aborted' && (record.messages.length || record.resourceRegistrationPending)) throw new Error('protected_result_abort_after_effect');
+      if (record.messages.length > 9 || record.resources.length > 128) throw new Error('protected_result_delivery_full');
       // A late failure cannot downgrade a confirmed completion.
       if (change.status && record.status !== 'delivered') record.status = change.status;
       if (change.status === 'delivered' && !record.messages.some(message => message.kind === 'primary')) {
@@ -211,7 +228,7 @@ export class ProtectedResultStore {
   }
   assertResourceReadable(messageId: string, resource: string, chatId?: string): void {
     if (this.isProtected(messageId, chatId) || this.indices().some(index =>
-      Object.values(index.deliveries).some(record => record.resources.includes(resource)))) {
+      Object.values(index.deliveries).some(record => record.resourceRegistrationPending || record.resources.includes(resource)))) {
       throw new Error('protected_result_resource_read_denied');
     }
   }
@@ -222,7 +239,9 @@ export class ProtectedResultStore {
     const opaqueForward = raw?.msg_type === 'merge_forward' && this.hasProtection();
     const body = typeof raw?.body?.content === 'string' ? raw.body.content : '';
     const protectedResource = this.indices().some(index => Object.values(index.deliveries)
-      .some(record => record.resources.some(resource => body.includes(resource))));
+      .some(record => record.resources.some(resource => body.includes(resource))
+        || record.resourceRegistrationPending && (['file', 'image', 'interactive', 'post'].includes(raw?.msg_type)
+          || /(?:img|file)_v\d+_/.test(body))));
     if (!opaqueForward && !protectedResource && !this.isProtected(messageId, chatId)) return raw;
     return {
       message_id: messageId, ...(chatId ? { chat_id: chatId } : {}),

@@ -37224,6 +37224,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableBridgeFinalOutputHandler(request => deliverDurablePrimaryMessage({
       ...request,
       hookContext: {
+        protectedFinal: true,
         sessionId: request.daemonSession.session.sessionId,
         turnId: request.turnId,
         ...(request.replyFileDigest ? { replyFileDigest: request.replyFileDigest } : {}),

@@ -26082,6 +26082,7 @@ function setupWorkerHandlers(
           status: TurnDeliveryReceipt['status'],
           messageIds: string[],
           reason?: string,
+          messages = resultMessages(messageIds),
         ) => observeTurnResultDelivery(
           resultBinding,
           { status: 'unavailable', reason: 'trusted_plugin_delivery' },
@@ -26091,7 +26092,7 @@ function setupWorkerHandlers(
             platform: 'lark',
             chatId: ds.chatId,
             ...(frozen.target.mode !== 'plain' ? { parentMessageId: frozen.target.rootMessageId } : {}),
-            messages: resultMessages(messageIds),
+            messages,
             ...(reason ? { reason } : {}),
           },
         );
@@ -26126,7 +26127,7 @@ function setupWorkerHandlers(
               throw new Error('protected_result_artifact_mismatch');
             }
             const files = manifest.files.map((_file, index) => artifacts.readFile(manifest, index));
-            const messageIds = await deliverProtectedResult({
+            const delivery = await deliverProtectedResult({
               store: new ProtectedResultStore(config.session.dataDir),
               context: { appId: ds.larkAppId, pluginId: msg.pluginId, sessionId: msg.sessionId,
                 turnId: msg.turnId, ownerUnionId: msg.callerUnionId, chatId: ds.chatId,
@@ -26145,7 +26146,8 @@ function setupWorkerHandlers(
                 locale: localeForBot(ds.larkAppId), workingDir: ds.workingDir, localHomeLinkMode: 'disabled',
               }),
             });
-            observeDelivery('delivered', messageIds);
+            const { messageIds } = delivery;
+            observeDelivery('delivered', messageIds, undefined, delivery.messages);
             reply({ type: 'plugin_result_delivery_result', requestId: msg.requestId, ok: true, messageIds });
             break;
           }
@@ -26177,6 +26179,7 @@ function setupWorkerHandlers(
             messageIds.length ? 'partial' : 'failed',
             messageIds,
             'trusted_plugin_delivery_failed',
+            error instanceof ProtectedResultDeliveryError ? error.messages : [],
           );
           logger.error(
             `[${t}] Plugin result delivery failed plugin=${msg.pluginId}`,
@@ -29287,6 +29290,21 @@ function deliverFinalOutput(
     onComplete?.(false);
     return;
   }
+  const assertProtectedFinalOpen = (): void => {
+    if (new ProtectedResultStore(config.session.dataDir).completedFinal(ds.larkAppId, ds.session.sessionId, msg.turnId)?.length) {
+      throw new Error('protected_final_already_delivered');
+    }
+  };
+  const acknowledgeProtectedFinal = (): boolean => {
+    const completed = new ProtectedResultStore(config.session.dataDir)
+      .completedFinal(ds.larkAppId, ds.session.sessionId, msg.turnId);
+    if (!completed?.length) return false;
+    ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+    onComplete?.(true, completed[0]);
+    return true;
+  };
+  try { if (acknowledgeProtectedFinal()) return; }
+  catch { logger.error(`[${t}] Protected final receipt unavailable; withholding automatic final`); onComplete?.(false); return; }
   const unresolvedMsg = msg;
   const linkRefKey = {
     appId: ds.larkAppId,
@@ -29547,7 +29565,7 @@ function deliverFinalOutput(
       return ledger.execute({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: msg.turnId }, 'final',
         JSON.stringify([handoff.record.target, transport.msgType, transport.content]),
         uuid => replayVettedBody(transport.content, transport.msgType, () => withAuditRedaction(transport.content, transport.msgType, body => cb.sessionReply(sessionAnchorId(ds), body, transport.msgType, ds.larkAppId, msg.turnId,
-          { ...opts, uuid, beforeWrite: handoff.control.beforeEffect, replyTarget: handoff.record.target, sourceSessionId: ds.session.sessionId }))),
+          { ...opts, uuid, beforeWrite: async () => { await handoff.control.beforeEffect(); assertProtectedFinalOpen(); }, replyTarget: handoff.record.target, sourceSessionId: ds.session.sessionId }))),
         { fenced: true, providerUuid: transport.providerUuid, reuseExistingFinal: true, beforeDispatch: handoff.control.beforeEffect,
           noSideEffect: error => error instanceof LocalAddressOutboundError || isLarkContentAuditError(error)
             || [LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG].includes(larkErrorCode(error) ?? -1) },
@@ -29574,13 +29592,14 @@ function deliverFinalOutput(
         ...(topicMessageLookup ? { topicMessageLookup } : {}),
         beforeWrite: async () => {
           if (opts?.beforeWrite) await opts.beforeWrite();
+          assertProtectedFinalOpen();
           if (!isStillOwned() || ds.session.status === 'closed') throw new Error('Final output no longer owns delivery');
         },
         ...(groupContextAuthorOrigin ? { groupContextAuthorOrigin } : {}) },
     ));
     return frozen ? replayVettedBody(frozen.content, frozen.msgType, reply) : reply();
   };
-  const ownsOpenSession = () => isStillOwned() && ds.session.status !== 'closed';
+  const ownsOpenSession = () => { assertProtectedFinalOpen(); return isStillOwned() && ds.session.status !== 'closed'; };
   setTimeout(async () => {
     if (!isStillOwned()) {
       logger.info(`[${t}] Bridge final_output abandoned — worker/session ownership changed`);
@@ -29597,6 +29616,7 @@ function deliverFinalOutput(
     }
     let sendReplyFile = false;
     try {
+      if (acknowledgeProtectedFinal()) return;
       // 文档评论入口分流：本轮若来自飞书文档评论（/watch-comment / /subscribe-lark-doc），把正文
       // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
       const docTurn = managedReceiver ? undefined : resolveDocCommentTarget(ds, msg.turnId);
@@ -30117,6 +30137,7 @@ function deliverFinalOutput(
             target: durableTarget,
           })
         : undefined;
+      if (acknowledgeProtectedFinal()) return;
       if (durableDelivery?.kind === 'ambiguous') {
         if (raiseDaemonAttention(ds, 'blocked', `Durable final output is ambiguous: ${durableDelivery.error}`, msg.turnId)) publishAttentionPatch(ds);
         logger.error(`[${t}] Durable final_output ambiguous: ${durableDelivery.error}`);
@@ -30131,7 +30152,7 @@ function deliverFinalOutput(
               ...(feedbackPolicy && feedback ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}),
             }, (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.replyTurnId ?? msg.turnId,
               frozenReplyTarget ? { uuid, beforeWrite, replyTarget: frozenReplyTarget } : { uuid, beforeWrite }),
-            { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned,
+            { dispatchAttempt: msg.dispatchAttempt, owns: () => { assertProtectedFinalOpen(); return isStillOwned(); },
               ...(resultBinding ? { onPublication: publication => { finalPublication = publication; } } : {}) })
           : undefined;
       const sendFinal = (content: string) => scopedReply(
@@ -30241,6 +30262,8 @@ function deliverFinalOutput(
       confirmLinkRefDraft();
       onComplete?.(true, messageId);
     } catch (err: any) {
+      try { if (acknowledgeProtectedFinal()) return; }
+      catch { logger.error(`[${t}] Protected final receipt unavailable; withholding automatic final`); onComplete?.(false); return; }
       if (outputControl && resolveDocCommentTarget(ds, msg.turnId)) { onComplete?.(false); return; }
       if (!isStillOwned()) { onComplete?.(false); return; }
       if (err instanceof ReplyCardWithdrawnError) {

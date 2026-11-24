@@ -362,6 +362,15 @@ function dedupeUuid(uuid?: string): string {
   return uuid || randomUUID();
 }
 
+/** Durable automatic finals carry this host-owned marker across outbox waits.
+ * Reuse the completed receipt before touching the provider or publication hooks. */
+function protectedFinalReceipt(larkAppId: string, hookContext?: Record<string, unknown>): string | undefined {
+  if (hookContext?.protectedFinal !== true || typeof hookContext.sessionId !== 'string'
+    || typeof hookContext.turnId !== 'string') return undefined;
+  return new ProtectedResultStore(config.session.dataDir)
+    .completedFinal(larkAppId, hookContext.sessionId, hookContext.turnId)?.[0];
+}
+
 export async function sendMessage(
   larkAppId: string,
   chatId: string,
@@ -379,6 +388,8 @@ export async function sendMessage(
     // available result. Destination and source checks may share this lookup.
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     if (options?.beforeWrite) await options.beforeWrite(topicLookup.lookup);
+    const completed = protectedFinalReceipt(larkAppId, hookContext);
+    if (completed) return completed;
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
       ? JSON.stringify({ text: content })
@@ -450,6 +461,8 @@ export async function replyMessage(
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
     // The source/authority fence follows the awaited destination lookup.
     if (options?.beforeWrite) await options.beforeWrite(topicLookup.lookup);
+    const completed = protectedFinalReceipt(larkAppId, hookContext);
+    if (completed) return completed;
     const c = getBotClient(larkAppId);
     const body = msgType === 'text'
       ? JSON.stringify({ text: content })

@@ -1,3 +1,4 @@
+import { redactProtectedLarkEvent } from './protected-event.js';
 import { OwnerGroupFollowStore } from '../../services/owner-group-follow-store.js';
 import { canInviterTalkToMeeting } from '../../services/vc-meeting-inviter-access.js';
 /**
@@ -5772,6 +5773,7 @@ export function createLarkEventDispatcherRuntime(
     primary?: PrimaryProcessContext,
   ): Promise<DurableLarkCanonicalHandlerResult | void> {
     try {
+      data = redactProtectedLarkEvent(data, config.session.dataDir);
       let message = data.message;
       const sender = data.sender;
       if (!message) return;
@@ -5798,6 +5800,8 @@ export function createLarkEventDispatcherRuntime(
       // before enqueue, so a later content lookup failure cannot erase the task.
       if (data.__durableRecovery?.source === 'lark-history') {
         await resolveNonsupportMessage(data, larkAppId);
+        data = redactProtectedLarkEvent(data, config.session.dataDir);
+        message = data.message;
       }
 
       // Learn other bots' open_ids from @mentions in this event.
