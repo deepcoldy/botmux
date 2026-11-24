@@ -15,6 +15,7 @@ import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { dropTypeAheadPromptTurn, noteTypeAheadPromptTurn, promoteTypeAheadPromptTurn, reconcileTypeAheadPromptTurns } from '../src/core/type-ahead-prompt-queue.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import type { RuntimeEventBinding } from '../src/services/session-event-scope.js';
 import { sameWorker, sameRuntime } from '../src/services/session-contract.js';
@@ -50,6 +51,7 @@ function nativeSessionHandler(s: ReturnType<typeof fixture>, cliId = 'codex-app'
   const worker: any = { send: vi.fn() }; s.ds.worker = worker;
   const persisted: unknown[] = [];
   const env: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+    workerGeneration: 1, noteTypeAheadPromptTurn, dropTypeAheadPromptTurn, promoteTypeAheadPromptTurn, reconcileTypeAheadPromptTurns,
     logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => cliId,
     isLocalCliOpenReady: () => false, managedAuxUiSuppressed: () => true,
     syncAntigravityGroupTitle: vi.fn(),
@@ -1220,6 +1222,36 @@ describe('contract gateway and real worker boundaries', () => {
     expect(s.store.executions(s.ref)).toHaveLength(0);
     expect(s.store.read(s.ref)?.revision).toBe(revision);
   });
+  it('admits type-ahead queue observations through the full contract handler before execution starts', async () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('om_queued');
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime(); scope.assign(binding.bindingId, s.runtime);
+    scope.noteAdmission({ ref: execution, phase: 'queued' });
+    s.ds.workerGeneration = 1; s.ds.session.workerGeneration = 1;
+    const { env, wires } = nativeSessionWorker(scope);
+    const { handle } = nativeSessionHandler(s, 'claude-code');
+
+    // flushPending enters the queued turn before its queue notification; the
+    // literal write and recordSubmission have not happened yet.
+    scope.enterTurn('om_queued');
+    env.send({ type: 'type_ahead_queued', turnId: 'om_queued' });
+    const queued = wires.shift() as any;
+    expect(queued.sessionContract.scope).toEqual({});
+    await handle(queued);
+    expect(s.ds.typeAheadPromptTurnIds).toEqual(['om_queued']);
+    expect(s.store.execution(s.ref, execution.executionId)?.phase).toBe('queued');
+    expect(s.store.execution(s.ref, execution.executionId)?.runtime).toBeUndefined();
+
+    env.send({ type: 'type_ahead_queue_snapshot', turnIds: ['om_queued', 'om_restored'] });
+    await handle(wires.shift());
+    expect(s.ds.typeAheadPromptTurnIds).toEqual(['om_queued', 'om_restored']);
+
+    env.send({ type: 'type_ahead_turn_dropped', turnId: 'om_queued' });
+    await handle(wires.shift());
+    expect(s.ds.typeAheadPromptTurnIds).toEqual(['om_restored']);
+  });
+
   it('publishes process attestation while the opening attempt is still unbound', async () => {
     const s = fixture(); const execution = s.controller.admitInput('opening-turn', 1);
     const scope = new WorkerSessionEventScope(s.ref, s.worker);
