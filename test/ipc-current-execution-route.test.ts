@@ -747,4 +747,19 @@ describe('POST /api/current-execution', () => {
     expect((await request({ sessionId: 'x'.repeat(1200) })).status).toBe(413);
     expect(lookup).not.toHaveBeenCalled();
   });
+
+  it('rejects an unknown or non-overseas region on the identity route before session work', async () => {
+    const lookup = vi.spyOn(workerPool, 'findActiveBySessionId');
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const postIdentity = (body: unknown) => fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    for (const body of [
+      { sessionId: 's-execution', tool: 'bytedcli', region: 'cn' },
+      { sessionId: 's-execution', tool: 'bytedcli', region: 'bogus' },
+      { sessionId: 's-execution', tool: 'bytedcli', region: 42 },
+      { sessionId: 's-execution', tool: 'lark-cli', region: 'i18n' },
+    ]) expect((await postIdentity(body)).status).toBe(400);
+    expect(lookup).not.toHaveBeenCalled();
+  });
 });
