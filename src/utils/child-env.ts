@@ -461,9 +461,11 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_READ_ISOLATION',
   'BOTMUX_API_ONLY',
   // Per-bot display preference for Context / Token usage
-  // ('streaming' | 'footer' | 'off'). Injected explicitly so sandboxed offline
-  // fallback cannot drift to the default when bots.json is unreadable.
+  // ('streaming' | 'footer' | 'off') and 5h/7d quota visibility ('true' | 'false').
+  // Injected explicitly so sandboxed offline fallback cannot drift to defaults
+  // when bots.json is unreadable.
   'BOTMUX_USAGE_DISPLAY',
+  'BOTMUX_SHOW_USAGE_QUOTA',
   'BOTMUX_REPLY_FOOTER',
   // Per-bot local-address policy snapshot for a sandboxed `botmux send`.
   'BOTMUX_HIDE_LOCAL_ADDRESSES',
@@ -634,9 +636,10 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'IS_SANDBOX',
   // Per-session display footer resolved from bots.json (never env-configured).
   'BOTMUX_BRAND_LABEL',
-  // Per-bot usage display, resolved via resolveUsageDisplay(cfg) per session;
-  // env is never a config input for it.
+  // Per-bot usage display & quota visibility, resolved per session;
+  // env is never a config input for them.
   'BOTMUX_USAGE_DISPLAY',
+  'BOTMUX_SHOW_USAGE_QUOTA',
   'BOTMUX_REPLY_FOOTER',
   // Per-bot local-address policy, from the worker's init snapshot per session.
   'BOTMUX_HIDE_LOCAL_ADDRESSES',

@@ -373,6 +373,7 @@ import {
   loadBotConfigs,
   resolveBrandLabel,
   resolveUsageDisplay,
+  resolveShowUsageQuota,
   resolveReplyFooterPreferences,
   type BotConfig,
 } from './bot-registry.js';
@@ -11848,6 +11849,7 @@ async function deliverRemoteRunnerOutboundMessage(
     BOTMUX_ROOT_MESSAGE_ID: lastInitConfig.rootMessageId,
     BOTMUX_REPLY_STYLE: JSON.stringify(lastInitConfig.replyStyle ?? {}),
     BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(lastInitConfig.larkAppId)),
+    BOTMUX_SHOW_USAGE_QUOTA: resolveShowUsageQuota(lastInitConfig.larkAppId) ? 'true' : 'false',
   };
   const pinnedConfig = resolveChildBotsConfig(
     lastInitConfig.loadedBotsConfigPath,
@@ -11899,6 +11901,7 @@ async function deliverRemoteRunnerSessionTool(
     BOTMUX_ROOT_MESSAGE_ID: lastInitConfig.rootMessageId,
     BOTMUX_REPLY_STYLE: JSON.stringify(lastInitConfig.replyStyle ?? {}),
     BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(lastInitConfig.larkAppId)),
+    BOTMUX_SHOW_USAGE_QUOTA: resolveShowUsageQuota(lastInitConfig.larkAppId) ? 'true' : 'false',
   };
   const pinnedConfig = resolveChildBotsConfig(
     lastInitConfig.loadedBotsConfigPath,
@@ -29075,6 +29078,7 @@ async function spawnCliBody(
       ...((riffBackendConfig as EffectiveMojoConfig).env ?? {}),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
       BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId)),
+      BOTMUX_SHOW_USAGE_QUOTA: resolveShowUsageQuota(cfg.larkAppId) ? 'true' : 'false',
       [HIDE_LOCAL_ADDRESSES_ENV]: hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true),
       [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
@@ -29110,6 +29114,7 @@ async function spawnCliBody(
       BOTMUX_CHAT_ID: cfg.chatId,
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
       BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
+      BOTMUX_SHOW_USAGE_QUOTA: resolveShowUsageQuota(cfg.larkAppId) ? 'true' : 'false',
       BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId)),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
       [HIDE_LOCAL_ADDRESSES_ENV]: hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true),
@@ -29176,6 +29181,7 @@ async function spawnCliBody(
     // the guide and the actual card renderer.
     mergedEnv.BOTMUX_REPLY_STYLE = JSON.stringify(cfg.replyStyle ?? {});
     mergedEnv.BOTMUX_REPLY_FOOTER = JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId));
+    mergedEnv.BOTMUX_SHOW_USAGE_QUOTA = resolveShowUsageQuota(cfg.larkAppId) ? 'true' : 'false';
     // The local-address snapshot is likewise host-resolved: a remote `botmux
     // send` reads it when bots.json is out of reach. Re-freeze after the raw
     // riff env merge so a stale/forged backendConfig.env cannot turn the bot's
@@ -31455,6 +31461,7 @@ async function spawnCliBody(
   // for this bot; anything else is 'true' (absent config = default ON).
   childEnv.BOTMUX_CARD_BRAND_ENABLED = readGlobalConfig().dashboard?.cardBrandLabel === false ? 'false' : 'true';
   childEnv.BOTMUX_USAGE_DISPLAY = resolveUsageDisplay(cfg.larkAppId);
+  childEnv.BOTMUX_SHOW_USAGE_QUOTA = resolveShowUsageQuota(cfg.larkAppId) ? 'true' : 'false';
   childEnv.BOTMUX_REPLY_FOOTER = JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId));
   // A sandboxed `botmux send` cannot read bots.json; it keeps this bot's
   // local-address policy from the snapshot taken when the worker was forked.

@@ -151,6 +151,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'replyFooterRecipients', configKey: 'replyFooterRecipients', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '回复页脚收件人及其 @ 通知 on|off（默认 on）；总开关关闭时保留各信息块配置' },
   { key: 'replyFooterVoice', configKey: 'replyFooterVoice', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '回复页脚语音总结按钮 on|off（默认 on）；总开关关闭时保留各信息块配置' },
   { key: 'usageDisplay', configKey: 'usageDisplay', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['streaming', 'footer', 'off'], hint: '用量显示位置:streaming=流式卡正文(默认)｜footer=回复卡页脚｜off=不显示' },
+  { key: 'showUsageQuota', configKey: 'showUsageQuota', kind: 'boolean', effect: 'immediate', clearable: true, defaultOn: true, hint: '卡片用量行是否显示 5h / 7d 账号额度 on|off（默认 on）；仅影响卡片展示，关闭后保留上下文占用与 token 统计，不影响后台额度检测' },
   { key: 'showReplyTiming', configKey: 'showReplyTiming', kind: 'boolean', effect: 'immediate', clearable: false, hint: '最终回复页脚分别显示等待和执行耗时 on|off（默认 off）；普通发送显示执行至回复，结束后显示最终耗时；等待含排队/准备，缺失计时则不显示' },
   { key: 'autoStartPrompt', configKey: 'autoStartOnGroupJoinPrompt', kind: 'string', effect: 'immediate', clearable: true, hint: '被拉进新群主动开工的首轮 prompt（配合 autoStartOnGroupJoin）' },
   { key: 'allowedUsers', configKey: 'allowedUsers', kind: 'allowedUsers', effect: 'immediate', clearable: false, hint: '管理员名单（邮箱/on_/ou_，逗号或空格分隔）；改后需加 确认' },

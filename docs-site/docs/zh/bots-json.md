@@ -560,6 +560,7 @@ v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」�
 | `pinStreamingCard` | `true` 时自动置顶当前的实时状态卡，默认关闭。置顶失败不影响其它功能。单个群可以用 `/card pin off` 关掉 |
 | `cotEnabled` | 默认开启：用飞书原生「思考过程」消息实时展示模型的思考和工具调用。单个群可用 `/cot off` 关掉 |
 | `usageDisplay` | Context / Token 用量显示在哪：`streaming`（默认，实时卡正文）、`footer`（答复卡页脚）、`off`（不显示）。只影响显示，不影响用量统计。旧字段 `showUsageInCardFooter: false` 等同 `off` |
+| `showUsageQuota` | 是否在卡片用量行中显示 `5h` / `7d` 账号周期额度，默认开启；设 `false` 仅隐藏 `5h` / `7d`，仍保留上下文占用、token 统计、自定义扩展段与模型名。只影响显示，不影响后台额度检测 |
 | `cardFooterExtension` | 在用量后面追加几段自定义文字，内容来自你配置的命令：`{"command": "<命令>", "refreshSeconds": 60}`。命令交给 `/bin/sh -c` 执行，每个 bot 跑一份；`refreshSeconds` 默认 60，范围 10–3600。输出按行（或 `{"segments": [...]}`）取最多 4 段，每段最多 40 字。命令超过 3 秒算失败，失败时沿用上次结果，连续 10 分钟没成功就不显示。见[实时流式卡片](/cards) |
 | `brandLabel` | 卡片底部签名。不填显示默认的 `botmux` 链接；`""` 隐藏；其它文字原样显示（支持 markdown）。Dashboard「全局设置 → 飞书卡片」里的总开关关掉时，所有 bot 都不显示签名 |
 | `replyCardActions` | 普通答复卡上显示一个紧凑的操作菜单（打开终端 / 切换模型 / 关闭会话）。默认关闭 |
