@@ -540,6 +540,7 @@ MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allo
 - 没授权过的人调用时，命令会被拒绝，拒绝信息里附带授权链接。AI 也会自己用 `botmux auth request` 把链接发给这个人（见 [Agent 自助发起授权](/cli-commands#agent-auth-request)），或者让他在话题里发 `/login`。授权完成后重试即可。
 - 绝不会退回到 Bot 或其他人的身份代跑，也没有「退回机器登录态」的选项。旧配置里的 `fallback` 字段会被忽略。`bytedcli` 没有 Bot 身份，没授权就是失败。
 - 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用[中心化平台](/platform) / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`allowSpeakerSwitch`（默认 `false`：设为 `true` 后，多人话题里才能在某一条命令前加 `BOTMUX_AS=<open_id>` 用本轮另一位发言人的身份执行；默认关闭时 `BOTMUX_AS` 一律被拒）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
+- 共享 Linux 开发机可设置 `triggerUserAuth.gitCommitIdentity: true`。会话 PATH 中的 Git 包装器会在每次执行 `commit`、`commit-tree`、`merge`、`cherry-pick`、`revert`、`rebase`、`am` 和 `pull` 时核验本轮触发人，用其邮箱作为默认作者与提交者。核验失败会拒绝这些操作（包括快进 pull）。Git 保留重放提交的原作者，显式指定身份仍按 Git 规则生效；受管路径上会清理环境中的 `GIT_AUTHOR_*` / `GIT_COMMITTER_*` 身份变量，shell 配置里的导出不能覆盖已核验的触发人。绝对路径与 Git 别名不在覆盖范围内。受管命令暂不支持 `BOTMUX_AS`，会拒绝执行；oncall 禁网或 slirp 隔离 daemon loopback 时，该组合会在会话启动时被拒绝。此项默认关闭，启动会话时生效，也可在 Dashboard 该 Bot 设置的「安全」区开关。
 
 #### 升级注意：旧格式授权要重新 `/login` {#legacy-user-token}
 
