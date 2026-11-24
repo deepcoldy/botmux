@@ -22,7 +22,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {
 } }));
 import {
   initWorkerPool, setActiveSessionsRegistry, getActiveSessionsRegistry, streamCardLabel,
-  usageRefreshShouldRun, syncUsageRefreshTimer, USAGE_REFRESH_INTERVAL_MS, sendWorkerInput,
+  usageRefreshShouldRun, syncUsageRefreshTimer, USAGE_REFRESH_INTERVAL_MS, sendWorkerInput, retireWorkerProcessOnly,
   __testOnly_setupWorkerHandlers as setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { registerBot } from '../src/bot-registry.js';
@@ -915,6 +915,33 @@ describe('activeTurnSilentSchedule projection and SSE updates', () => {
         workerPid: null,
         backgroundTaskCount: null,
         activeTurnSilentSchedule: false,
+      });
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('clears stale projections during process-only retirement instead of waiting for the later exit event', async () => {
+    const patches: Array<Record<string, unknown>> = [];
+    const unsubscribe = dashboardEventBus.subscribe(ev => {
+      if (ev.type === 'session.update' && ev.body.sessionId === ds.session.sessionId) {
+        patches.push(ev.body.patch);
+      }
+    });
+    try {
+      armSilentScheduledTurn(ds, 'schedule:poll:process-retire');
+      await screenUpdate('working', 2, { turnId: 'schedule:poll:process-retire' });
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBe(true);
+      expect(ds.backgroundTaskCount).toBe(2);
+      patches.length = 0;
+
+      // The mocked worker never emits `exit`, matching the race where the
+      // synchronous ds.worker=null would otherwise suppress all exit cleanup.
+      retireWorkerProcessOnly(ds, 'process-retire-regression');
+
+      expect(composeRowFromActive(ds, { includeTokenUsage: false }).backgroundTaskCount).toBeUndefined();
+      expect(patches.at(-1)).toEqual({
+        status: 'dormant', activeTurnSilentSchedule: false, backgroundTaskCount: null,
       });
     } finally {
       unsubscribe();

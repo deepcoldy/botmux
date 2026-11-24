@@ -8954,6 +8954,16 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
   const w = ds.worker;
+  // This function nulls ds.worker synchronously, so the later process `exit`
+  // event fails the current-worker check and cannot perform this cleanup.
+  const wasSilentSchedule = ds.lastPublishedActiveTurnSilentSchedule === true
+    || isActiveTurnSilentSchedule(ds, effectiveActiveSilentScheduleStatus(ds));
+  const hadBackgroundTasks = ds.backgroundTaskCount !== undefined;
+  ds.lastScreenTurnId = undefined;
+  ds.lastScreenTurnGeneration = undefined;
+  ds.latestSilentScheduledTurn = undefined;
+  ds.lastPublishedActiveTurnSilentSchedule = false;
+  ds.backgroundTaskCount = undefined;
   if (w && !w.killed) {
     trackLifecycleRetirement(ds, w);
     try { w.kill('SIGTERM'); } catch { /* already gone */ }
@@ -8964,6 +8974,19 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   ds.workerToken = null;
   ds.workerViewToken = null;
   ds.workerCardViewToken = null;
+  if (wasSilentSchedule || hadBackgroundTasks) {
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: {
+          status: 'dormant',
+          ...(wasSilentSchedule ? { activeTurnSilentSchedule: false } : {}),
+          ...(hadBackgroundTasks ? { backgroundTaskCount: null } : {}),
+        },
+      },
+    });
+  }
 }
 
 function clearTransferWorkerState(
