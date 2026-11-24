@@ -56,11 +56,17 @@ function failedTurnCrossChatOrigin(session: Session, turnId: string): FailedTurn
 }
 
 /** Snapshot only daemon-authenticated current-turn facts, never the owner. */
-export function failedTurnCaller(ds: DaemonSession, turnId: string): TrustedCaller | undefined {
-  if (failedTurnCrossChatOrigin(ds.session, turnId)) return;
+export function failedTurnCaller(
+  ds: DaemonSession,
+  turnId: string,
+  opts?: { includeRecordedCaller?: boolean },
+): TrustedCaller | undefined {
+  const failed = opts?.includeRecordedCaller && ds.session.lastFailedTurn?.turnId === turnId
+    ? ds.session.lastFailedTurn : undefined;
+  if (failedTurnCrossChatOrigin(ds.session, turnId) || failed?.crossChatOrigin) return;
   const caller = ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
     : ds.activeInteractiveTurn?.turnId === turnId ? ds.activeInteractiveTurn.caller
-      : ds.scheduledTurnCallers?.get(turnId);
+      : ds.scheduledTurnCallers?.get(turnId) ?? failed?.trustedCaller;
   if (caller) {
     if ((caller.senderType === 'user' || caller.source === 'schedule_creator') && caller.requestLarkAppId === ds.larkAppId
         && caller.requestUserOpenId?.startsWith('ou_')) return { ...caller, senderType: 'user' };
@@ -111,7 +117,7 @@ export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | unde
   if (!caller) return;
   const record = buildFailedTurnRecord({ turnId, status: 'failed', errorCode: `${ds.usageLimit.kind}_limited` }, {
     userPrompt: ds.lastUserPrompt, cliInput: ds.lastCliInput, codexAppInput: ds.lastCodexAppInput,
-    trustedCaller: caller, silent: isSilentScheduledTurn(ds, turnId),
+    attachments: ds.session.lastAttachments, trustedCaller: caller, silent: isSilentScheduledTurn(ds, turnId),
     originalTurnId: ds.session.failedTurnRecovery?.turnId === turnId
       ? ds.session.failedTurnRecovery.originalTurnId : turnId,
   });
@@ -161,7 +167,7 @@ export function recordFailedTurnTerminal(
     ?? (originalTurnId ? failedTurnCrossChatOrigin(ds.session, originalTurnId) : undefined);
   const record = buildFailedTurnRecord({ ...terminal, status: terminal.status }, {
     userPrompt: ds.lastUserPrompt, cliInput: ds.lastCliInput, codexAppInput: ds.lastCodexAppInput,
-    trustedCaller: context.caller, silent: context.silent,
+    attachments: ds.session.lastAttachments, trustedCaller: context.caller, silent: context.silent,
     originalTurnId,
   });
   // Where its answer was to go is known only now (HTTP and suppression state
@@ -328,8 +334,13 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
           ? buildFollowUpCliInput(record.userPrompt, target.session.sessionId, {
             larkAppId: target.larkAppId, chatId: target.chatId, cliId: target.session.cliId,
             locale: localeForBot(target.larkAppId), turnId, codexAppText: codexAppInput?.text,
+            attachments: record.attachments,
           })
-          : { content: record.cliInput, ...(codexAppInput ? { codexAppInput } : {}) };
+          : {
+            content: record.cliInput,
+            ...(codexAppInput ? { codexAppInput } : {}),
+            ...(record.attachments?.length ? { attachments: structuredClone(record.attachments) } : {}),
+          };
         if (request.mode === 'fresh' && codexAppInput) {
           input.codexAppInput = { ...(input.codexAppInput ?? { text: codexAppInput.text }),
             ...(codexAppInput.localImages ? { localImages: structuredClone(codexAppInput.localImages) } : {}) };

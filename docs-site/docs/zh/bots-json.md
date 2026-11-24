@@ -78,6 +78,7 @@
 | 不 @ 也自动开工 | `autoStartOnNewTopic`、`autoStartOnGroupJoin` |
 | 机器人首次上线后私聊主人一句欢迎语 | `welcomeMessage`（见[上线欢迎语](#welcome-message)） |
 | 盯住告警群，有告警就自动处理 | 群消息监听（见[群消息监听](#message-listener)） |
+| 额度用完换一个 CLI / 模型接着做 | `quotaFallbackChain` |
 | 额度用完自动交给另一个 bot | `quotaFallbackBot` |
 | 不让 botmux 往 prompt 里塞任何东西 | `promptInjection: "none"` |
 | 控制会话占用的内存 | `maxLiveWorkers`、`idleSuspendMinutes` |
@@ -119,6 +120,7 @@
 | `customPassthroughCommands` | 额外允许透传给 CLI 的斜杠命令，例如 `["/export"]`。会和 botmux 自己命令重名的项会被丢掉。用 `/list-slash-command` 看完整放行清单。见[斜杠命令](/slash-commands) |
 | `bareRenamePassthrough` | 默认关闭。设 `true` 后，不带标题的 `/rename` 会原样交给 CLI，由 CLI 根据对话给会话起名（目前只有 Claude Code 支持，接管的会话也算）。见[斜杠命令](/slash-commands#rename-cli) |
 | `startupCommands` | 会话启动后、第一条消息之前自动发给 CLI 的命令，例如 `["/effort ultracode"]`。每次新启动或恢复都会重发 |
+| `quotaFallbackChain` | CLI 额度用完后，同一个 bot 换到下一个 CLI / 模型继续当前会话。默认关闭。见下方[额度用完切换 CLI / 模型](#quota-fallback-chain) |
 | `quotaFallbackBot` | CLI 额度用完后自动交接给另一个 bot。默认关闭。见下方[额度用完自动交接](#quota-fallback) |
 | `codexCapacityRecovery` | 仅 Codex / Codex App：遇到明确的模型容量错误时自动续跑。默认关闭；每个任务最多追加两条续跑输入。普通限流和额度用完不算 |
 | `suppressDeliveredFinalFailureNotice` | 实验性，默认关闭。同一轮已经送达最终答复后，再遇到模型服务错误时不再补发「模型连接失败」通知 |
@@ -155,6 +157,39 @@
 - 两项都不写：直接删掉整个字段。`inherit` 不是有效模式。
 
 切换到其它 CLI 时会自动删除这个字段。
+
+### 额度用完切换 CLI / 模型 {#quota-fallback-chain}
+
+`quotaFallbackChain` 让同一个 Bot 在当前会话撞上额度限制时，原地换到下一步的 CLI 和模型，接着做被打断的那条请求。起点是本 Bot 自己的 `cliId` 和 `model`，`steps` 按顺序往后走。
+
+```json
+{
+  "cliId": "claude-code",
+  "model": "claude-opus-5-5",
+  "quotaFallbackChain": {
+    "enabled": true,
+    "kinds": ["usage", "rate"],
+    "steps": [
+      { "cliId": "traex", "model": "GPT-6.1-Sol" },
+      { "cliId": "traex", "model": "DeepSeek-V4.1-Flash" }
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `enabled` | 只有 `true` 才开启 |
+| `kinds` | `usage`（用量上限）、`rate`（速率限制），不填两种都处理。Claude Code 的额度耗尽只会识别为 `rate`，只填 `usage` 时 Claude 不会切换 |
+| `steps` | 按顺序的切换步骤，每步一个 `cliId`；`model` 不填表示该 CLI 的默认模型。留在同一个 CLI 的一步必须写明模型 |
+
+几点要知道：
+
+- 没带恢复时间的临时限流（比如单纯的 429）先在原 CLI 上自动重试 5 次，间隔从 30 秒起逐次翻倍，都失败再切；带恢复时间或额度错误码的直接切。
+- 同一个 CLI 只换模型时，续接原来的原生会话；换 CLI 时重开原生会话，第一条消息是交接说明：先读上一个 CLI 的会话记录，再用 `botmux history` 看话题历史、检查工作目录，然后从它停下的地方继续被打断的原请求。
+- 续跑的请求按原发起人身份执行，回复落在原话题；切换完成后话题里会发一条通知。切换没能开始（例如切换前又来了新消息、找不到原发起人）时，照旧提示负责人并交接备用 Bot。
+- 切到其他 CLI 时按该 CLI 本机原生登录启动，不带本 Bot 的 `env`。一个 CLI 离开后不能再回到它。
+- 会话只往后走，不会自动切回；daemon 重启后仍停在当前这一步。新会话从本 Bot 自己的配置开始。
 
 ### 额度用完自动交接 {#quota-fallback}
 

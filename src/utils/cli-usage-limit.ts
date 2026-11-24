@@ -122,6 +122,14 @@ function parseRelativeReset(text: string, now: Date): {
 }
 
 /** Stable fixed cooldown pinned to wall-clock buckets for hard 429 fallbacks. */
+const HARD_RATE_LIMIT_FALLBACK_LABEL = '5-10 min';
+
+/** A rate limit that carried no provider reset time, so botmux applied its own
+ * cooldown: usually transient, unlike a quota with a stated reset clock. */
+export function isTransientRateLimit(state: CliUsageLimitState): boolean {
+  return state.kind === 'rate' && state.retryLabel === HARD_RATE_LIMIT_FALLBACK_LABEL;
+}
+
 function hardRateLimitFallbackTime(now: Date): { retryAtMs: number; retryLabel: string } {
   const nowMs = now.getTime();
   const bucketStart = Math.floor(nowMs / HARD_RATE_LIMIT_COOLDOWN_MS) * HARD_RATE_LIMIT_COOLDOWN_MS;
@@ -132,7 +140,7 @@ function hardRateLimitFallbackTime(now: Date): { retryAtMs: number; retryLabel: 
     retryAtMs,
     // Label reflects the real (5min, 10min] window, not an optimistic "~5 min":
     // the card's countdown text must not undersell how long the wait can be.
-    retryLabel: '5-10 min',
+    retryLabel: HARD_RATE_LIMIT_FALLBACK_LABEL,
   };
 }
 

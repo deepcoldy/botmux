@@ -204,6 +204,7 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0 },                                                 // event/switch
       { code: 0, data: { privileges: [], scopeBiz: [] } },         // privilege/all（数据范围收窄，无待收窄项）
       { code: 0, data: { versionId: 'v-init' } },                  // app_version/create（启用发布）
+      { code: 0, data: { nodes: [] } },                            // approval_nodes/get（预判自动通过）
       { code: 0 },                                                 // publish/commit
       { code: 0, data: { secret: 'new-secret' } },                 // secret
     ]);
@@ -222,6 +223,7 @@ describe('createOpenPlatformAppWithClient', () => {
       // 收窄，否则第一个版本仍带「全部」进审批。
       '/developers/v1/privilege/all/cli_new',
       '/developers/v1/app_version/create/cli_new',
+      '/developers/v1/approval_nodes/get/cli_new',
       '/developers/v1/publish/commit/cli_new/v-init',
       '/developers/v1/secret/cli_new',
     ]);
@@ -270,6 +272,7 @@ describe('createOpenPlatformAppWithClient', () => {
         { code: 0 },
         { code: 0, data: { privileges: [], scopeBiz: [] } },
         { code: 0, data: { versionId: 'v-init' } },
+        { code: 0, data: { nodes: [] } },
         { code: 0 },
         { code: 0, data: { secret: 'new-secret' } },
       ]);
@@ -293,6 +296,7 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0 },
       { code: 0, data: { privileges: [], scopeBiz: [] } }, // privilege/all（数据范围收窄）
       { code: 0, data: { versionId: 'v-init' } }, // 版本创建成功
+      { code: 0, data: { nodes: [] } }, // approval_nodes/get（预判自动通过）
       { code: 1, msg: 'publish commit rejected' }, // commit 失败 → 抛
     ]);
     await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-cf', creatorUserId: 'u_creator' }))
@@ -305,6 +309,7 @@ describe('createOpenPlatformAppWithClient', () => {
       '/developers/v1/event/switch/cli_commit_fail',
       '/developers/v1/privilege/all/cli_commit_fail',
       '/developers/v1/app_version/create/cli_commit_fail',
+      '/developers/v1/approval_nodes/get/cli_commit_fail',
       '/developers/v1/publish/commit/cli_commit_fail/v-init',
     ]);
   });
@@ -333,6 +338,7 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0 },
       { code: 0, data: { privileges: [], scopeBiz: [] } }, // privilege/all（数据范围收窄）
       { code: 0, data: { versionId: 'v-init' } },
+      { code: 0, data: { nodes: [] } }, // approval_nodes/get
       { code: 0 },
       { code: 0, data: {} }, // secret 缺失
     ]);

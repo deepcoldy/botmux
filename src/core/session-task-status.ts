@@ -157,13 +157,14 @@ export function deriveSessionTaskStatus(input: FactsInput, now: number = Date.no
   if (facts.pendingRepo) return needsYou('pending_repo');
   if (status === 'limited') return needsYou('limited');
   if (status === 'stalled') return needsYou('stalled');
+  const turn = currentLastTurn(facts);
+  if (status === 'interrupted' && turn?.outcome !== 'delivered') return needsYou('interrupted', attention?.reason ?? turn?.errorCode, attention?.at);
   // daemon 自己举的手（失败卡、最终回复投递失败、续跑失败、审核拦截等）都是这一轮没走完。
   if (attention) return needsYou('interrupted', attention.reason, attention.at);
   if (busy) {
     const since = finiteMs(facts.busySinceAt);
     return since !== undefined ? { kind: 'working', since } : { kind: 'working' };
   }
-  const turn = currentLastTurn(facts);
   // 休眠多日的旧中断没人接手也不会再动，留在「需要你」里只会越积越多。
   const staleDormant = status === 'dormant' && turn !== undefined && now - turn.at >= RECENT_TURN_WINDOW_MS;
   if (turn?.outcome === 'interrupted' && !staleDormant) return needsYou('interrupted', turn.errorCode, turn.at);

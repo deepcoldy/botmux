@@ -98,7 +98,7 @@ import {
   larkTransportEnabled,
 } from './types.js';
 import type { DaemonSession, GroupJoinContext } from './types.js';
-import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
+import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime, restoreQueuedActivationRawInput } from './pending-repo-journal.js';
 import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
 import { noteTurnStarted } from './turn-outcome.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
@@ -2380,6 +2380,12 @@ function finalizeCliTurnInput(
       ...(opts.acceptedInput.trustedCaller ? { trustedCaller: opts.acceptedInput.trustedCaller } : {}) };
     userText = opts.acceptedInput.content;
   }
+  // Keep the structured attachments beside the exact input for daemon-side
+  // failure recovery. The legacy/structured model input was already built above;
+  // this metadata is not sent as a new worker control field.
+  if (opts?.attachments?.length) {
+    payload = { ...payload, attachments: opts.attachments.map(attachment => ({ ...attachment })) };
+  }
   // Builders only describe explicitly model-visible sources. They do not read
   // mutable rollout configuration: the real fork/send boundary freezes that
   // decision after every await/defer. Keep callers without a daemon app scope
@@ -2760,6 +2766,8 @@ export function rememberLastCliInput(
   ds.session.lastCliInputTurnId = inputTurnId;
   if (replayCodexAppInput) ds.session.lastCodexAppInput = replayCodexAppInput;
   else delete ds.session.lastCodexAppInput;
+  if (normalized.attachments?.length) ds.session.lastAttachments = structuredClone(normalized.attachments);
+  else delete ds.session.lastAttachments;
   ds.session.replyThreadAliases = ds.replyThreadAliases;
   ds.session.currentReplyTarget = ds.currentReplyTarget;
   sessionStore.updateSession(ds.session);
@@ -3413,6 +3421,8 @@ export async function restoreActiveSessions(
             queuedActivationPending: session.queuedActivationPending,
             queuedActivationToken: session.queuedActivationToken,
             queuedActivationInput: session.queuedActivationInput,
+            queuedActivationRawInput: session.queuedActivationRawInput,
+            queuedActivationRawTurnId: session.queuedActivationRawTurnId,
             queuedActivationTurnId: session.queuedActivationTurnId,
             queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
             queuedActivationResume: session.queuedActivationResume,
@@ -3424,6 +3434,8 @@ export async function restoreActiveSessions(
           session.queuedActivationPending = undefined;
           session.queuedActivationToken = undefined;
           session.queuedActivationInput = undefined;
+          session.queuedActivationRawInput = undefined;
+          session.queuedActivationRawTurnId = undefined;
           session.queuedActivationTurnId = undefined;
           session.queuedActivationDispatchAttempt = undefined;
           session.queuedActivationResume = undefined;
@@ -3471,6 +3483,7 @@ export async function restoreActiveSessions(
         pendingAttachments: session.queuedAttachments,
         currentTurnTitle: session.currentTurnTitle ?? session.title,
       };
+      restoreQueuedActivationRawInput(ds);
       const restoredPendingRepo = restorePendingRepoRuntime(ds);
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
@@ -3624,8 +3637,10 @@ export async function restoreActiveSessions(
     // Literal pending-repo passthroughs have an empty init prompt and therefore
     // no Codex ledger entry. Their setup journal is the exact replay owner; the
     // recovered worker sends it at prompt_ready with the retained token.
-    if (session.queuedActivationPending && session.pendingRepoSetup?.rawInput) {
+    restoreQueuedActivationRawInput(ds);
+    if (ds.pendingRawInput === undefined && session.queuedActivationPending && session.pendingRepoSetup?.rawInput) {
       ds.pendingRawInput = session.pendingRepoSetup.rawInput;
+      ds.pendingRawTurnId = session.pendingRepoSetup.turnId ?? session.queuedActivationTurnId;
     }
     try {
       const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
@@ -6483,6 +6498,8 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     ds.session.queuedActivationPending = undefined;
     ds.session.queuedActivationToken = undefined;
     ds.session.queuedActivationInput = undefined;
+    ds.session.queuedActivationRawInput = undefined;
+    ds.session.queuedActivationRawTurnId = undefined;
     ds.session.queuedActivationTurnId = undefined;
     ds.session.queuedActivationDispatchAttempt = undefined;
     ds.session.queuedActivationResume = undefined;
@@ -6510,6 +6527,7 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     try {
       const exactRetry = ds.session.queuedActivationInput;
       if (exactRetry) {
+        restoreQueuedActivationRawInput(ds);
         forkWorker(ds, exactRetry, {
           resume: ds.session.queuedActivationResume ?? ds.hasHistory,
           turnId: ds.session.queuedActivationTurnId,

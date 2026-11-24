@@ -5,6 +5,11 @@ import type { OncallGroupBusinessTarget } from '../../services/oncall-group-clie
 import type { OncallGroupPolicy } from '../../services/oncall-group-policy.js';
 import { SessionGroupNamingRow } from './session-group-naming-row.js';
 import { DEFAULT_LONG_TASK_REMINDER, normalizeLongTaskReminderConfig } from '../../services/long-task-reminder-policy.js';
+import {
+  evaluateOwnerGroupFollowFilter, MAX_OWNER_GROUP_FOLLOW_RULES, validateOwnerGroupFollowRule,
+  type OwnerGroupFollowConfig, type OwnerGroupFollowMatchResult, type OwnerGroupFollowRule,
+} from '../../services/owner-group-follow-policy.js';
+import { OWNER_GROUP_FOLLOW_PRESETS, missingOwnerGroupFollowRules } from './owner-group-follow-rules.js';
 import { FeedbackExtensionPanel } from './feedback-extension-panel.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
 import { afterNextPaint } from './deferred-task.js';
@@ -1199,6 +1204,9 @@ function BotDefaultsCard(props: {
             ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('trigger-user-auth')}><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('lark-tool-binding')}><LarkToolBindingSection bot={bot} patchBot={patchBot} /></section>
+            {!bot.apiOnly && bot.brand !== 'lark' ? (
+              <section className="bd-tile" id={botDefaultsSectionDomId('approval-compat')}><AutoAvoidApprovalSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('grant')}><GrantSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('blocked-users')}><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('slash-commands')}><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
@@ -1246,7 +1254,10 @@ function BotDefaultsCard(props: {
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('sender-tag')}><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
-            <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}>
+              <QuotaFallbackChainSection bot={bot} cliState={cliState} startCli={cli} patchBot={patchBot} />
+              <QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} />
+            </section>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} refreshBot={props.refreshBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('owner-reminder')}><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -1903,6 +1914,192 @@ function QuotaFallbackSection(props: { bot: BotDefaultsRow; bots: BotDefaultsRow
       <div className="actions">
         <button type="button" className="primary" data-action="save-quota-fallback" disabled={busy} onClick={() => void save()}>{tr('botDefaults.quotaFallbackSave')}</button>
         <StatusSpan status={status} attr={{ 'data-quota-fallback-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+type QuotaFallbackChainStepDraft = { cliId: string; model: string };
+
+function quotaFallbackChainDraft(config: BotDefaultsRow['quotaFallbackChain']): QuotaFallbackChainStepDraft[] {
+  const steps = config?.steps.map(step => ({ cliId: step.cliId, model: step.model ?? '' })) ?? [];
+  return steps.length ? steps : [{ cliId: '', model: '' }];
+}
+
+export function QuotaFallbackChainSection(props: { bot: BotDefaultsRow; cliState: CliOptionsState; startCli: string; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = props.bot.quotaFallbackChain ?? null;
+  const [enabled, setEnabled] = useState(initial?.enabled === true);
+  const [kinds, setKinds] = useState<QuotaFallbackKind[]>(initial?.kinds ?? ['usage', 'rate']);
+  const [steps, setSteps] = useState<QuotaFallbackChainStepDraft[]>(() => quotaFallbackChainDraft(initial));
+  const [detected, setDetected] = useState<Record<string, readonly string[]>>({});
+  const requestedModels = useRef(new Set<string>());
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const next = props.bot.quotaFallbackChain ?? null;
+    setEnabled(next?.enabled === true);
+    setKinds(next?.kinds ?? ['usage', 'rate']);
+    setSteps(quotaFallbackChainDraft(next));
+  }, [props.bot.quotaFallbackChain]);
+
+  // A step launches the stock CLI, so its catalogue is probed without this bot's runtime.
+  useEffect(() => {
+    for (const { cliId } of steps) {
+      if (!cliId || requestedModels.current.has(cliId)) continue;
+      requestedModels.current.add(cliId);
+      void fetchDetectedModels(cliId).then(result => {
+        setDetected(current => ({ ...current, [cliId]: result?.models ?? [] }));
+      });
+    }
+  }, [steps]);
+
+  const cliOptions = useMemo<DropdownFieldOption<string>[]>(() => [
+    { value: '', label: tr('botDefaults.quotaFallbackChainStepCliPlaceholder') },
+    ...props.cliState.options
+      .filter(option => !option.gateway && !option.cliLaunchMode)
+      .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
+      .map(option => ({ value: option.id, label: `${option.label}（${option.id}）` })),
+  ], [props.cliState.options, tr]);
+
+  const startCliLabel = selectedCliOption(props.cliState.options, props.startCli)?.label ?? props.startCli;
+  const startAgent = props.bot.model ? `${startCliLabel} · ${props.bot.model}` : startCliLabel;
+
+  function modelOptions(cliId: string): string[] {
+    const option = selectedCliOption(props.cliState.options, cliId);
+    return mergeModelCandidates(option?.modelChoices ?? [], detected[cliId]);
+  }
+
+  function updateStep(index: number, patch: Partial<QuotaFallbackChainStepDraft>): void {
+    setSteps(current => current.map((step, i) => i === index ? { ...step, ...patch } : step));
+  }
+
+  function toggleKind(kind: QuotaFallbackKind, checked: boolean): void {
+    setKinds(current => checked
+      ? (current.includes(kind) ? current : [...current, kind])
+      : current.filter(item => item !== kind));
+  }
+
+  async function save(): Promise<void> {
+    if (enabled && (steps.length === 0 || steps.some(step => !step.cliId))) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackChainStepsRequired')}` });
+      return;
+    }
+    if (enabled && kinds.length === 0) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackKindsRequired')}` });
+      return;
+    }
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/quota-fallback-chain`,
+        {
+          enabled,
+          kinds,
+          steps: steps.map(step => ({ cliId: step.cliId, ...(step.model.trim() ? { model: step.model.trim() } : {}) })),
+        },
+      );
+      if (res.ok && res.body.ok) {
+        props.patchBot(props.bot.larkAppId, { quotaFallbackChain: res.body.quotaFallbackChain ?? null });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else if (res.body?.error === 'invalid_quota_fallback_chain') {
+        setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackChainInvalid', { reason: String(res.body?.reason ?? '') })}` });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section bd-quota-fallback-chain" data-quota-fallback-chain>
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.quotaFallbackChainHelp')}>{tr('botDefaults.quotaFallbackChainTitle')}</FieldTitle></h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-quota-fallback-chain"
+        title={tr('botDefaults.quotaFallbackChainEnabled')}
+        help={tr('botDefaults.quotaFallbackChainEnabledHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <FieldTitle help={tr('botDefaults.quotaFallbackChainStepsHelp')}>{tr('botDefaults.quotaFallbackChainSteps')}</FieldTitle>
+        <small className="bd-section-note">{tr('botDefaults.quotaFallbackChainStart', { agent: startAgent })}</small>
+        <div className="bd-quota-chain-list" data-input="quotaFallbackChainSteps">
+          <div className="bd-quota-chain-row bd-quota-chain-head" aria-hidden="true">
+            <span />
+            <span>{tr('botDefaults.quotaFallbackChainStepCli')}</span>
+            <span>{tr('botDefaults.quotaFallbackChainStepModel')}</span>
+            <span />
+          </div>
+          {steps.map((step, index) => (
+            <div className="bd-quota-chain-row" key={index} data-quota-fallback-chain-step={index}>
+              <span className="bd-quota-chain-index">{index + 1}</span>
+              <DropdownField<string>
+                dataInput={`quotaFallbackChainCli${index}`}
+                ariaLabel={`${index + 1}. ${tr('botDefaults.quotaFallbackChainStepCli')}`}
+                value={step.cliId}
+                disabled={busy || !enabled}
+                options={cliOptions}
+                searchable
+                onChange={cliId => updateStep(index, { cliId, model: '' })}
+              />
+              <ModelPickerField
+                key={step.cliId}
+                value={step.model}
+                onChange={model => updateStep(index, { model })}
+                options={modelOptions(step.cliId)}
+                disabled={busy || !enabled || !step.cliId}
+                dataInput={`quotaFallbackChainModel${index}`}
+                ariaLabel={`${index + 1}. ${tr('botDefaults.quotaFallbackChainStepModel')}`}
+                defaultLabel={tr('botDefaults.modelPickerDefault')}
+                customLabel={tr('botDefaults.modelPickerCustom')}
+                includeDefault
+                menuClassName="bd-field-menu"
+              />
+              <button
+                type="button"
+                data-action="remove-quota-fallback-chain-step"
+                disabled={busy || !enabled || steps.length === 1}
+                onClick={() => setSteps(current => current.filter((_, i) => i !== index))}
+              >
+                {tr('botDefaults.quotaFallbackChainRemove')}
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="actions">
+          <button
+            type="button"
+            data-action="add-quota-fallback-chain-step"
+            disabled={busy || !enabled}
+            onClick={() => setSteps(current => [...current, { cliId: '', model: '' }])}
+          >
+            {tr('botDefaults.quotaFallbackChainAdd')}
+          </button>
+        </div>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title">{tr('botDefaults.quotaFallbackKinds')}</h4>
+        <div className="bd-owner-reminder-states">
+          {(['usage', 'rate'] as const).map(kind => (
+            <label key={kind}>
+              <input type="checkbox" checked={kinds.includes(kind)} disabled={busy || !enabled} onChange={event => toggleKind(kind, event.currentTarget.checked)} />
+              <span>{tr(kind === 'usage' ? 'botDefaults.quotaFallbackKindUsage' : 'botDefaults.quotaFallbackKindRate')}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <small className="bd-section-note">{tr('botDefaults.quotaFallbackChainNote')}</small>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-quota-fallback-chain" disabled={busy} onClick={() => void save()}>{tr('botDefaults.quotaFallbackChainSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-quota-fallback-chain-status': '' }} />
       </div>
     </section>
   );
@@ -4445,24 +4642,63 @@ function workingDirState(bot: BotDefaultsRow): { mode: 'off' | 'default' | 'onca
 export function OwnerGroupFollowControls(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot } = props;
-  const savedExcluded = (bot.ownerGroupFollow?.excludeChatIds ?? []).join('\n');
-  const [excluded, setExcluded] = useState(savedExcluded);
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState<StatusMessage>(null);
-  useEffect(() => {
-    setExcluded(savedExcluded);
-  }, [bot.larkAppId, savedExcluded]);
   if (bot.apiOnly === true) {
     return <div className="bd-subsection" data-owner-group-follow-unavailable>
       <h4 className="bd-subsection-title">{tr('botDefaults.ownerGroupFollow')}</h4>
       <p className="bd-section-note">{tr('botDefaults.ownerGroupFollowApiOnly')}</p>
     </div>;
   }
-  const save = (value: BotDefaultsRow['ownerGroupFollow']) => saveBotField({
+  return <OwnerGroupFollowEditor key={bot.larkAppId} {...props} />;
+}
+
+function ownerGroupFollowDraft(config: OwnerGroupFollowConfig | null | undefined) {
+  return {
+    filtered: Boolean(config?.includeRules?.length),
+    includeRules: config?.includeRules ?? [],
+    excludeRules: config?.excludeRules ?? [],
+    excluded: (config?.excludeChatIds ?? []).join('\n'),
+  };
+}
+
+function OwnerGroupFollowEditor(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot } = props;
+  // Bot refreshes can replace equal arrays. Preserve drafts until the saved
+  // filters change, including when the enable toggle changes on its own.
+  const savedDraft = JSON.stringify(ownerGroupFollowDraft(bot.ownerGroupFollow));
+  const [draft, setDraft] = useState(() => ownerGroupFollowDraft(bot.ownerGroupFollow));
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  useEffect(() => {
+    setDraft(JSON.parse(savedDraft));
+  }, [savedDraft]);
+  const save = (value: OwnerGroupFollowConfig, resetDraft = false) => saveBotField({
     request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/owner-group-follow`, { ownerGroupFollow: value }),
     setStatus, setBusy, saved: tr('botDefaults.cardPrefSaved'),
-    onSaved: body => props.patchBot(bot.larkAppId, { ownerGroupFollow: body.ownerGroupFollow ?? null }),
+    onSaved: body => {
+      props.patchBot(bot.larkAppId, { ownerGroupFollow: body.ownerGroupFollow ?? null });
+      if (resetDraft) setDraft(ownerGroupFollowDraft(body.ownerGroupFollow));
+    },
   });
+  const includeRules = draft.filtered ? draft.includeRules : undefined;
+  const invalidDraft = draft.filtered && !draft.includeRules.some(rule => !validateOwnerGroupFollowRule(rule))
+    ? 'botDefaults.ownerGroupFollowIncludeRequired'
+    : [...(includeRules ?? []), ...draft.excludeRules].some(rule => validateOwnerGroupFollowRule(rule))
+      ? 'botDefaults.ownerGroupFollowInvalidRules' : undefined;
+  const draftConfig = {
+    ...bot.ownerGroupFollow,
+    excludeChatIds: draft.excluded.split(/\s+/).filter(Boolean),
+    includeRules,
+    excludeRules: draft.excludeRules.length ? draft.excludeRules : undefined,
+  };
+  const updateRules = (list: 'includeRules' | 'excludeRules', rules: OwnerGroupFollowRule[]) => {
+    setDraft(current => ({ ...current, [list]: rules }));
+    setStatus(null);
+  };
+  const setScope = (filtered: boolean) => {
+    setDraft(current => ({ ...current, filtered }));
+    setStatus(null);
+  };
   return <div className="bd-subsection" data-owner-group-follow>
     <h4 className="bd-subsection-title">{tr('botDefaults.ownerGroupFollow')}</h4>
     <ToggleRow
@@ -4474,19 +4710,159 @@ export function OwnerGroupFollowControls(props: { bot: BotDefaultsRow; patchBot:
       onChange={enabled => { void save({ ...bot.ownerGroupFollow, enabled }); }}
     />
     <p className="bd-section-note">{tr('botDefaults.ownerGroupFollowAuth')}</p>
+    <div className="ogf-editor">
+      <FieldTitle>{tr('botDefaults.ownerGroupFollowScope')}</FieldTitle>
+      <div className="ogf-scope" data-owner-group-follow-scope role="group" aria-label={tr('botDefaults.ownerGroupFollowScope')}>
+        <button type="button" data-action="owner-group-follow-scope-all" aria-pressed={!draft.filtered} disabled={busy}
+          onClick={() => setScope(false)}>{tr('botDefaults.ownerGroupFollowAll')}</button>
+        <button type="button" data-action="owner-group-follow-scope-filtered" aria-pressed={draft.filtered} disabled={busy}
+          onClick={() => setScope(true)}>{tr('botDefaults.ownerGroupFollowFiltered')}</button>
+      </div>
+      <div className="ogf-preset-strip">
+        {OWNER_GROUP_FOLLOW_PRESETS.map(preset => {
+          const additions = missingOwnerGroupFollowRules(draft[preset.list], preset.rules);
+          const applied = additions.length === 0 && (preset.list === 'excludeRules' || draft.filtered);
+          return <button key={preset.id} type="button" className={applied ? 'is-applied' : undefined}
+            data-owner-group-follow-preset={preset.id} aria-pressed={applied}
+            disabled={busy || draft[preset.list].length + additions.length > MAX_OWNER_GROUP_FOLLOW_RULES}
+            onClick={() => {
+              setDraft(current => ({
+                ...current,
+                filtered: current.filtered || preset.list === 'includeRules',
+                [preset.list]: [...current[preset.list], ...missingOwnerGroupFollowRules(current[preset.list], preset.rules)],
+              }));
+              setStatus(null);
+            }}>
+            {applied && <span aria-hidden="true">✓ </span>}{tr(preset.labelKey)}
+          </button>;
+        })}
+      </div>
+      {draft.filtered && <OwnerGroupFollowRuleList list="includeRules" rules={draft.includeRules} disabled={busy}
+        onChange={rules => updateRules('includeRules', rules)} />}
+      <OwnerGroupFollowRuleList list="excludeRules" rules={draft.excludeRules} disabled={busy}
+        onChange={rules => updateRules('excludeRules', rules)} />
+    </div>
     <div className="bd-row"><label>
       <FieldTitle help={tr('botDefaults.ownerGroupFollowExcludedHelp')}>{tr('botDefaults.ownerGroupFollowExcluded')}</FieldTitle>
-      <textarea data-input="ownerGroupFollowExcluded" rows={2} value={excluded} disabled={busy}
-        placeholder={'oc_xxx\noc_yyy'} onChange={event => setExcluded(event.currentTarget.value)} />
+      <textarea data-input="ownerGroupFollowExcluded" rows={2} value={draft.excluded} disabled={busy}
+        placeholder={'oc_xxx\noc_yyy'} onChange={event => {
+          const excluded = event.currentTarget.value;
+          setDraft(current => ({ ...current, excluded }));
+          setStatus(null);
+        }} />
     </label></div>
+    <OwnerGroupFollowTester config={draftConfig} invalidDraft={invalidDraft} />
     <div className="actions">
       <button type="button" data-action="save-owner-group-follow-exclusions" disabled={busy}
-        onClick={() => { void save({ ...bot.ownerGroupFollow, excludeChatIds: excluded.split(/\s+/).filter(Boolean) }); }}>
+        onClick={() => {
+          if (invalidDraft) { setStatus({ text: tr(invalidDraft) }); return; }
+          void save(draftConfig, true);
+        }}>
         {tr('botDefaults.save')}
       </button>
-      <StatusSpan status={status} />
+      <StatusSpan status={status} attr={{ 'data-owner-group-follow-status': '' }} />
     </div>
   </div>;
+}
+
+function OwnerGroupFollowRuleList(props: {
+  list: 'includeRules' | 'excludeRules'; rules: OwnerGroupFollowRule[]; disabled: boolean;
+  onChange(rules: OwnerGroupFollowRule[]): void;
+}) {
+  const tr = useT();
+  const { list, rules, disabled, onChange } = props;
+  const include = list === 'includeRules';
+  const [collapsed, setCollapsed] = useState(false);
+  const title = <FieldTitle>{tr(include ? 'botDefaults.ownerGroupFollowInclude' : 'botDefaults.ownerGroupFollowExclude')}</FieldTitle>;
+  return <div className="ogf-rule-list" data-owner-group-follow-rules={list}>
+    <div className="ogf-list-header">
+      {!include && rules.length > 0 ? <button type="button" className="ogf-list-toggle" aria-expanded={!collapsed}
+        data-action="owner-group-follow-toggle-exclude-rules" onClick={() => setCollapsed(value => !value)}>
+        <span aria-hidden="true">{collapsed ? '▸' : '▾'}</span> {title}
+      </button> : title}
+      <button type="button" className="ogf-add-rule" data-action={`owner-group-follow-add-${list}`}
+        disabled={disabled || rules.length >= MAX_OWNER_GROUP_FOLLOW_RULES}
+        onClick={() => {
+          setCollapsed(false);
+          onChange([...rules, { field: 'name', op: 'contains', pattern: '' }]);
+        }}>
+        {tr(include ? 'botDefaults.ownerGroupFollowAddInclude' : 'botDefaults.ownerGroupFollowAddExclude')}
+      </button>
+    </div>
+    {!collapsed && rules.map((rule, index) => <OwnerGroupFollowRuleRow key={index} rule={rule} disabled={disabled}
+      onChange={patch => onChange(rules.map((entry, i) => i === index ? { ...entry, ...patch } : entry))}
+      onRemove={() => onChange(rules.filter((_, i) => i !== index))} />)}
+  </div>;
+}
+
+function OwnerGroupFollowRuleRow(props: {
+  rule: OwnerGroupFollowRule; disabled: boolean;
+  onChange(patch: Partial<OwnerGroupFollowRule>): void; onRemove(): void;
+}) {
+  const tr = useT();
+  const errorId = useId();
+  const { rule, disabled, onChange, onRemove } = props;
+  const error = validateOwnerGroupFollowRule(rule);
+  return <div className="ogf-rule">
+    <div className="ogf-rule-row">
+      <select aria-label={tr('botDefaults.ownerGroupFollowField')} data-input="ownerGroupFollowRuleField"
+        value={rule.field} disabled={disabled}
+        onChange={event => onChange({ field: event.currentTarget.value as OwnerGroupFollowRule['field'] })}>
+        <option value="name">{tr('botDefaults.ownerGroupFollowName')}</option>
+        <option value="description">{tr('botDefaults.ownerGroupFollowDescription')}</option>
+        <option value="any">{tr('botDefaults.ownerGroupFollowAny')}</option>
+      </select>
+      <select aria-label={tr('botDefaults.ownerGroupFollowOp')} data-input="ownerGroupFollowRuleOp"
+        value={rule.op} disabled={disabled}
+        onChange={event => onChange({ op: event.currentTarget.value as OwnerGroupFollowRule['op'] })}>
+        <option value="contains">{tr('botDefaults.ownerGroupFollowContains')}</option>
+        <option value="startsWith">{tr('botDefaults.ownerGroupFollowStartsWith')}</option>
+        <option value="endsWith">{tr('botDefaults.ownerGroupFollowEndsWith')}</option>
+        <option value="regex">{tr('botDefaults.ownerGroupFollowRegex')}</option>
+      </select>
+      <input type="text" className={rule.op === 'regex' ? 'is-mono' : undefined} data-input="ownerGroupFollowRulePattern"
+        aria-label={tr('botDefaults.ownerGroupFollowPattern')} placeholder={tr('botDefaults.ownerGroupFollowPattern')}
+        aria-invalid={Boolean(error)} aria-describedby={error ? errorId : undefined}
+        value={rule.pattern} disabled={disabled} onChange={event => onChange({ pattern: event.currentTarget.value })} />
+      <button type="button" className="ogf-case-btn" aria-pressed={Boolean(rule.caseSensitive)} disabled={disabled}
+        aria-label={tr('botDefaults.ownerGroupFollowCase')} title={tr('botDefaults.ownerGroupFollowCase')}
+        onClick={() => onChange({ caseSensitive: !rule.caseSensitive })}>Aa</button>
+      <button type="button" className="ogf-remove-btn" disabled={disabled}
+        aria-label={tr('botDefaults.ownerGroupFollowRemoveRule')} title={tr('botDefaults.ownerGroupFollowRemoveRule')}
+        onClick={onRemove}>×</button>
+    </div>
+    {error && <small className="ogf-rule-error" id={errorId}>{tr(`botDefaults.ownerGroupFollowRuleError.${error}`)}</small>}
+  </div>;
+}
+
+const OWNER_GROUP_FOLLOW_RESULT_KEYS: Record<OwnerGroupFollowMatchResult['reason'], string> = {
+  all: 'botDefaults.ownerGroupFollowTestAll',
+  included_rule: 'botDefaults.ownerGroupFollowTestIncluded',
+  not_included: 'botDefaults.ownerGroupFollowTestNotIncluded',
+  excluded_rule: 'botDefaults.ownerGroupFollowTestExcluded',
+  excluded_chat_id: 'botDefaults.ownerGroupFollowTestExcludedId',
+};
+
+function OwnerGroupFollowTester(props: { config: OwnerGroupFollowConfig; invalidDraft?: string }) {
+  const tr = useT();
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const result = props.invalidDraft ? undefined : evaluateOwnerGroupFollowFilter(props.config, { name, description });
+  return <details className="ogf-tester">
+    <summary>{tr('botDefaults.ownerGroupFollowTester')}</summary>
+    <div className="ogf-test-inputs">
+      <label>{tr('botDefaults.ownerGroupFollowTestName')}
+        <input type="text" data-input="ownerGroupFollowTestName" value={name} onChange={event => setName(event.currentTarget.value)} />
+      </label>
+      <label>{tr('botDefaults.ownerGroupFollowTestDescription')}
+        <input type="text" data-input="ownerGroupFollowTestDescription" value={description}
+          onChange={event => setDescription(event.currentTarget.value)} />
+      </label>
+    </div>
+    <output className={`ogf-test-result ${result?.matched ? 'is-match' : 'is-skip'}`}>
+      {result ? tr(OWNER_GROUP_FOLLOW_RESULT_KEYS[result.reason], { index: (result.ruleIndex ?? 0) + 1 }) : tr(props.invalidDraft!)}
+    </output>
+  </details>;
 }
 
 export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
@@ -4918,6 +5294,45 @@ export function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: P
       ) : null}
       <div className="actions">
         <StatusSpan status={fallbackStatus} attr={{ 'data-lark-user-owner-fallback-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+function AutoAvoidApprovalSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const enabled = bot.autoAvoidApproval !== false;
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = enabled;
+    patchBot(bot.larkAppId, { autoAvoidApproval: next });
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/auto-avoid-approval`, {
+        enabled: next,
+      }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.autoAvoidApprovalSaved'),
+      rollback: () => patchBot(bot.larkAppId, { autoAvoidApproval: previous }),
+    });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionApprovalCompat')}</h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-auto-avoid-approval"
+        title={tr('botDefaults.autoAvoidApprovalToggle')}
+        help={tr('botDefaults.autoAvoidApprovalHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-auto-avoid-approval-status': '' }} />
       </div>
     </section>
   );

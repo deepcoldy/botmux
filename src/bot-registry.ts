@@ -41,6 +41,10 @@ import {
 } from './core/cli-launch-mode.js';
 import { logger } from './utils/logger.js';
 import { isLocalBotId } from './setup/local-bot.js';
+import {
+  normalizeApprovalDeferredScopes,
+  type ApprovalDeferredScopeBuckets,
+} from './setup/approval-scope-resolver.js';
 import { createLarkUploadHttpPool } from './utils/lark-http-pool.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import { HIDE_LOCAL_ADDRESSES_ENV, setHideLocalAddressesResolver } from './im/lark/local-address-switch.js';
@@ -126,6 +130,10 @@ import {
   normalizeQuotaFallbackBotConfig,
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
+import {
+  normalizeQuotaFallbackChainConfig,
+  type QuotaFallbackChainConfig,
+} from './services/quota-fallback-chain.js';
 import {
   normalizeTraexAutoModelConfig,
   TRAEX_AUTO_MODEL_ID,
@@ -1525,6 +1533,12 @@ export interface BotConfig {
    */
   extraScopesFile?: string;
   /**
+   * 建 bot / 开放平台配置阶段因命中飞书企业管理员审批而自动跳过、留待用户按需手动开通的权限。
+   * daemon 启动权限自愈跳过这些项，以免重启时又把它们补进草稿触发审批把应用锁死；
+   * 一旦用户在开放平台手动开通，线上已授权集合包含该权限，自愈不再将其视作缺失。
+   */
+  approvalDeferredScopes?: ApprovalDeferredScopeBuckets;
+  /**
    * Bot-level synchronous card-action ACK cutoff in milliseconds. When a card
    * handler is still running at this point, Botmux ACKs with a background-work
    * toast and applies a later card result via message.patch. Valid range is
@@ -1972,6 +1986,12 @@ export interface BotConfig {
    * Missing/invalid/disabled means no automatic handoff.
    */
   quotaFallbackBot?: QuotaFallbackBotConfig;
+  /**
+   * Optional same-bot CLI/model chain used before `quotaFallbackBot`: on a
+   * usage or rate limit the session restarts in place on the next step.
+   * Missing/invalid/disabled means sessions stay on the bot's own CLI.
+   */
+  quotaFallbackChain?: QuotaFallbackChainConfig;
   /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
@@ -2645,6 +2665,11 @@ export interface BotConfig {
   regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
   /** Allow the single-human/single-bot group exception to the @ policy (default true). */
   soloGroupMentionBypass?: boolean;
+  /**
+   * 飞书开放平台版本提交前预判会进入企业管理员人工审批时，草稿态自动二分跳过需审权限（默认 true）。
+   * 设为 false 关闭该自动兼容逻辑，按原权限清单直接提交审批。
+   */
+  autoAvoidApproval?: boolean;
   /**
    * 允许 `botmux send --mention` @ 群内任意成员（用完整邮箱 / 手机号 / union_id /
    * open_id 指定），而不仅是本轮触发者（--mention-back）。默认 false：关闭时
@@ -4364,6 +4389,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ? (traexAutoModel ? TRAEX_AUTO_MODEL_ID : undefined)
       : requestedModel;
 
+    const normalizedQuotaFallbackChain = normalizeQuotaFallbackChainConfig(entry.quotaFallbackChain, {
+      cliId: entryCliId,
+      model,
+      backendType: typeof entry.backendType === 'string' ? entry.backendType : undefined,
+      codexRpcInput: entry.codexRpcInput === true,
+    });
+    if (normalizedQuotaFallbackChain.error) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] quotaFallbackChain ignored: ${normalizedQuotaFallbackChain.error}`,
+      );
+    }
+
     // Shared effort applies only where a model has no independent entry.
     const sharedEffortModels = traexAutoModel
       ? traexAutoModel.models.filter(id => !Object.prototype.hasOwnProperty.call(traexAutoModel.modelSettings ?? {}, id))
@@ -4484,6 +4521,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
+      approvalDeferredScopes: normalizeApprovalDeferredScopes(entry.approvalDeferredScopes),
       cardActionAckTimeoutMs: normalizeCardActionAckTimeoutMs(entry.cardActionAckTimeoutMs),
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
@@ -4600,6 +4638,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       longTaskReminder: normalizeLongTaskReminderConfig(entry.longTaskReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,
+      quotaFallbackChain: normalizedQuotaFallbackChain.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
@@ -4816,6 +4855,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.regularGroupMentionMode
         : undefined,
       soloGroupMentionBypass: entry.soloGroupMentionBypass === false ? false : undefined,
+      autoAvoidApproval: entry.autoAvoidApproval === false ? false : undefined,
       substituteMode,
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
       // undefined 让 bots.json 保持干净。

@@ -396,6 +396,35 @@ describe('controlled failed-turn recovery', () => {
     expect(isSilentScheduledTurn(ds, result.turnId)).toBe(true);
     expect(pool.sendWorkerInput).toHaveBeenCalledWith(ds, expect.anything(), expect.anything(), expect.objectContaining({ trustedCaller: { ...caller, source: 'schedule_creator', taskId: 'abcdef12' } }));
   });
+  it('uses the exact persisted caller after scheduled live state is released', () => {
+    const scheduled = { ...caller, source: 'schedule_creator' as const, taskId: 'abcdef12' };
+    ds.session.lastFailedTurn.trustedCaller = scheduled;
+    ds.session.replyTargets = {};
+    ds.activeInteractiveTurn = undefined;
+    ds.scheduledTurnCallers = undefined;
+    expect(failedTurnCaller(ds, request.turnId, { includeRecordedCaller: true })).toEqual(scheduled);
+    expect(failedTurnCaller(ds, 'om_other', { includeRecordedCaller: true })).toBeUndefined();
+  });
+  it('does not revive a persisted caller for a cross-chat failure', () => {
+    ds.session.replyTargets = {};
+    ds.session.turnReplyContexts = {};
+    ds.activeInteractiveTurn = undefined;
+    ds.session.lastFailedTurn.crossChatOrigin = {
+      sourceChatId: 'oc_origin', followedChatId: 'oc_followed', followedRootMessageId: 'om_followed',
+    };
+    expect(failedTurnCaller(ds, request.turnId, { includeRecordedCaller: true })).toBeUndefined();
+  });
+  it.each(['retry', 'fresh'] as const)('preserves exact-input attachments through %s recovery', async mode => {
+    const attachments = [{ type: 'image' as const, name: 'evidence.png', path: '/tmp/evidence.png' }];
+    ds.session.lastFailedTurn.attachments = attachments;
+    const result = await recoverFailedTurn('old', { ...request, mode });
+    expect(result).toMatchObject({ ok: true, state: 'accepted' });
+    if (mode === 'retry') {
+      expect(pool.sendWorkerInput).toHaveBeenCalledWith(ds, expect.objectContaining({ attachments }), expect.anything(), expect.anything());
+    } else {
+      expect(manager.buildFollowUpCliInput).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ attachments }));
+    }
+  });
   it('preserves clean Codex App task text and local image references on fresh recovery', async () => {
     ds.session.lastFailedTurn.codexAppInput = { text: 'original image task', clientUserMessageId: 'old-client-id', localImages: [{ path: '/tmp/image.png' }] };
     await recoverFailedTurn('old', { ...request, mode: 'fresh' });

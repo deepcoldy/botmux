@@ -149,6 +149,8 @@ import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { markRetryAttempt, refundRetryAttempt } from '../services/failed-turn-retry.js';
 import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
+import type { QuotaFallbackChainTrigger } from './quota-fallback-chain-switch.js';
+import { TRAEX_QUOTA_ERROR_CODE } from '../services/traex-quota.js';
 import { takePurgeClickRollback } from '../services/image-purge-recovery.js';
 import { hashUrlForLog, type RiffBackendConfig } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
@@ -1087,6 +1089,7 @@ import {
   type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { retainQueuedActivationRawInput } from './pending-repo-journal.js';
 import { failedTurnRewindInFlight, mergeFailedTurnInput, planFailedTurnRewind, turnAnswersInChat } from './failed-turn-rewind.js';
 import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
 import { BackendOutageCoordinator, recoveryEligibility, type BackendOutageDeps, type BackendOutageTimings } from './backend-outage-coordinator.js';
@@ -1103,7 +1106,7 @@ import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { sameTrustedPrincipal } from './active-turn-authority.js';
-import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, cliUsageLimitEpisodeKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, isTransientRateLimit, cliUsageLimitEpisodeKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, isAntigravityWorkingScreen, rememberAntigravityQuota } from '../adapters/cli/antigravity.js';
 import {
   inspectAntigravityAccounts,
@@ -1220,7 +1223,7 @@ type WorkerStartupState = {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WORKER_SIGTERM_BACKSTOP_MS = 2_000;
-const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
+export const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
 const CLOSE_FENCE_WARN_MS = 8_000;
 // Peer relay waits 5s for the whole transfer request. Tmux observer detach has
 // its own 3s command timeout, so this fence leaves headroom for routing/fork.
@@ -1435,6 +1438,10 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
   prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
+  /** Same-bot quota fallback chain (core/quota-fallback-chain-switch.ts).
+   *  True when the limit is handled by moving this session to the next
+   *  CLI/model, so the owner pause notice and backup-bot handoff are skipped. */
+  startQuotaFallbackChainSwitch?: (ds: DaemonSession, trigger: QuotaFallbackChainTrigger) => boolean;
   /** A scheduled task as the host authority store holds it, for deciding who a
    *  scheduled turn runs as. Never backed by schedules.json (agent-writable
    *  inside a sandbox). Absent or undefined → the turn carries no identity. */
@@ -4345,7 +4352,11 @@ function sessionAgentConfig(
   if (selected) {
     if (ds.session.codexProfile) throw new Error('Codex profile does not support per-session CLI selection');
     if (selected.cliId.toLowerCase() === 'riff') throw new Error('CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session');
-    if (botCfg.env && Object.keys(botCfg.env).length > 0) throw new Error('CLI selection rejected: bot env is configured');
+    // A quota fallback step deliberately launches the stock CLI without the
+    // bot's env, which belongs to the bot's own CLI (resolveSessionEnvForSession).
+    if (botCfg.env && Object.keys(botCfg.env).length > 0 && ds.session.quotaFallback?.cliId !== selected.cliId) {
+      throw new Error('CLI selection rejected: bot env is configured');
+    }
     if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) throw new Error('CLI selection rejected: Riff is configured');
     if (botCfg.codexRpcInput === true && !RPC_CAPABLE_CLIS.has(selected.cliId)) {
       throw new Error(`CLI selection rejected: ${selected.cliId} cannot use codexRpcInput`);
@@ -8453,9 +8464,11 @@ export function scheduleCardPatch(
   if (opts?.onSettled) pendingStreamingCardPatchSettlement.set(ds, opts.onSettled);
   const cardFence = captureStreamingCardPatchFence(ds, cardId, turnId);
   pendingStreamingCardPatchFence.set(ds, () => cardFence() && (!opts?.owns || opts.owns()));
-  const renderJson = startingCardHealthStalledStatus(ds, turnId)
-    ? buildStreamingCardJson(ds, 'stalled')
-    : cardJson;
+  const renderJson = ds.cliStartupFailureReason
+    ? buildStreamingCardJson(ds, 'interrupted')
+    : startingCardHealthStalledStatus(ds, turnId)
+      ? buildStreamingCardJson(ds, 'stalled')
+      : cardJson;
   ds.pendingCardJson = renderJson;
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
   // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
@@ -9151,7 +9164,7 @@ export function shouldDestroyPaneBeforeRestart(
  * remote task must survive a restart to preserve follow-up lineage). Adopt
  * sessions are skipped: botmux never owned the user's pane.
  */
-function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
+export function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
   if (!shouldDestroyPaneBeforeRestart(ds)) return;
   const target = persistentBackendTargetForSession(ds);
   if (!target) return;
@@ -9671,6 +9684,7 @@ export function requestSessionRestart(
               replyDelivery: latestReplyDeliveryForRespawn(ds),
               ...latestLaunchCommandsForRespawn(ds),
               ...(nextStatuslineLaunchGen ? { statuslineLaunchGen: nextStatuslineLaunchGen } : {}) }) } as DaemonToWorker);
+          ds.cliStartupFailureReason = undefined;
         } catch (sendError) {
           // IPC send failed before the worker was told to respawn: roll back
           // the pre-persisted launch model so the still-running CLI keeps its
@@ -9744,7 +9758,7 @@ export function __testOnly_resetRestartCoordinator(): void {
  * showing the last startup output and respawns the CLI itself on the next
  * message. Shared by the crash-loop give-up and the backend-outage give-up.
  */
-function parkCrashDiagnosticWorker(ds: DaemonSession, opts: { terminal?: boolean } = {}): void {
+function parkCrashDiagnosticWorker(ds: DaemonSession, opts: { terminal?: boolean; failPending?: boolean } = {}): void {
   // Ask the worker to park a lightweight tmux diagnostic shell under
   // bmx-diag-<sid> NOW (deferred from its exit so transient restarts
   // don't pay for it). Keep its web server alive so the existing
@@ -9756,7 +9770,7 @@ function parkCrashDiagnosticWorker(ds: DaemonSession, opts: { terminal?: boolean
   // next message must carry the current launch model. Cleared once a
   // worker generation reports ready again.
   ds.crashDiagnosticParked = true;
-  ds.worker!.send({ type: 'park_diagnostic', ...(opts.terminal === false ? { terminal: false } : {}) } as DaemonToWorker);
+  ds.worker!.send({ type: 'park_diagnostic', ...(opts.terminal === false ? { terminal: false } : {}), ...(opts.failPending ? { failPending: true } : {}) } as DaemonToWorker);
   restartCounts.delete(ds.session.sessionId);
   const crashPrevScreenStatus = ds.lastScreenStatus;
   ds.lastScreenStatus = 'idle';
@@ -11372,7 +11386,7 @@ const RIFF_RECONCILE_MAX_QUIET_WAIT_MS = 20_000;
  * SIGKILL at WORKER_SIGKILL_BACKSTOP_MS), so a hung worker is gone in time. */
 const RIFF_RECONCILE_WORKER_EXIT_TIMEOUT_MS = WORKER_SIGKILL_BACKSTOP_MS + 3_000;
 
-function waitForWorkerExit(worker: ChildProcess, timeoutMs: number): Promise<boolean> {
+export function waitForWorkerExit(worker: ChildProcess, timeoutMs: number): Promise<boolean> {
   if (worker.exitCode !== null || worker.signalCode !== null) return Promise.resolve(true);
   return new Promise<boolean>(resolve => {
     const onExit = (): void => {
@@ -13740,6 +13754,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     ds.keysPanelOpen === true,
     codexAppStopCardTarget(ds),
     resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
+    ds.cliStartupFailureReason,
   );
 }
 
@@ -15632,6 +15647,9 @@ export function sendWorkerSessionInput(
   // type (inject_command, set_display_mode, …) must reach worker.send without
   // this registry lookup at all. Only a Ctrl+C/ESC needs the recovery cancel.
   if (message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc')) {
+    // A stopped turn must not be re-sent by a waiting quota-chain retry.
+    if (ds.quotaFallbackChainRetries?.timer) clearTimeout(ds.quotaFallbackChainRetries.timer);
+    ds.quotaFallbackChainRetries = undefined;
     const stopCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
     if (codexCapacityRecoveryCli(stopCliId)) {
       cancelOrdinaryRecoveryForUserInput(ds.session, ds.session.ordinaryTurnRecovery?.currentTurnId ?? 'stop');
@@ -17363,6 +17381,8 @@ type QueuedWorkerForkSnapshot = {
   queuedActivationPending: Session['queuedActivationPending'];
   queuedActivationToken: Session['queuedActivationToken'];
   queuedActivationInput: Session['queuedActivationInput'];
+  queuedActivationRawInput: Session['queuedActivationRawInput'];
+  queuedActivationRawTurnId: Session['queuedActivationRawTurnId'];
   queuedActivationTurnId: Session['queuedActivationTurnId'];
   queuedActivationDispatchAttempt: Session['queuedActivationDispatchAttempt'];
   queuedActivationResume: Session['queuedActivationResume'];
@@ -17374,6 +17394,8 @@ type QueuedActivationJournalSnapshot = Pick<
   | 'queuedActivationPending'
   | 'queuedActivationToken'
   | 'queuedActivationInput'
+  | 'queuedActivationRawInput'
+  | 'queuedActivationRawTurnId'
   | 'queuedActivationTurnId'
   | 'queuedActivationDispatchAttempt'
   | 'queuedActivationResume'
@@ -17388,6 +17410,8 @@ function snapshotQueuedActivationJournal(session: Session): QueuedActivationJour
     queuedActivationPending: session.queuedActivationPending,
     queuedActivationToken: session.queuedActivationToken,
     queuedActivationInput: session.queuedActivationInput,
+    queuedActivationRawInput: session.queuedActivationRawInput,
+    queuedActivationRawTurnId: session.queuedActivationRawTurnId,
     queuedActivationTurnId: session.queuedActivationTurnId,
     queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
     queuedActivationResume: session.queuedActivationResume,
@@ -17411,6 +17435,8 @@ function clearQueuedActivationJournal(session: Session): void {
   session.queuedActivationPending = undefined;
   session.queuedActivationToken = undefined;
   session.queuedActivationInput = undefined;
+  session.queuedActivationRawInput = undefined;
+  session.queuedActivationRawTurnId = undefined;
   session.queuedActivationTurnId = undefined;
   session.queuedActivationDispatchAttempt = undefined;
   session.queuedActivationResume = undefined;
@@ -18073,6 +18099,7 @@ export function sendWorkerInput(
       rollbackIdleRetry();
       return false;
     }
+    if (ds.crashDiagnosticParked) ds.cliStartupFailureReason = undefined;
   } catch {
     rollbackAcceptedCodexAppDispatch(
       ds,
@@ -18733,6 +18760,21 @@ export function admitQueuedActivationTail(
   } catch (err) {
     ds.session.queuedActivationTail = priorTail;
     throw err;
+  }
+  // A stopped CLI cannot produce the opening ACK by itself. New input now
+  // owns a durable FIFO position, so it may wake the parked process WITHOUT
+  // releasing that ACK gate or sending N+1 ahead of the retained opening.
+  // The coordinator coalesces concurrent arrivals and clears the failure
+  // marker only after restart IPC was sent; persistence/send failures retain
+  // both the journal and a retryable stopped state.
+  if (ds.cliStartupFailureReason && ds.crashDiagnosticParked
+    && ds.session.status === 'active' && ds.worker && !ds.worker.killed
+    && !lifecycleRetiringWorkers.has(ds)) {
+    try {
+      requestSessionRestart(ds, { source: 'cli_crash', notify: () => {} });
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] Startup circuit recovery waits for new input: ${String(err)}`);
+    }
   }
   return admitted;
 }
@@ -20020,6 +20062,8 @@ function forkWorkerPrepared(
         queuedActivationPending: ds.session.queuedActivationPending,
         queuedActivationToken: ds.session.queuedActivationToken,
         queuedActivationInput: ds.session.queuedActivationInput,
+        queuedActivationRawInput: ds.session.queuedActivationRawInput,
+        queuedActivationRawTurnId: ds.session.queuedActivationRawTurnId,
         queuedActivationTurnId: ds.session.queuedActivationTurnId,
         queuedActivationDispatchAttempt: ds.session.queuedActivationDispatchAttempt,
         queuedActivationResume: ds.session.queuedActivationResume,
@@ -20283,6 +20327,12 @@ function forkWorkerPrepared(
       migrated = true;
     }
     if (migrated) sessionStore.updateSession(ds.session);
+  }
+  if (queuedActivationToken && ds.pendingRawInput) {
+    // Runtime-only pendingRawInput is cleared at prompt_ready. Persist the exact
+    // literal command with the activation journal so immediate raw starts can
+    // also rebuild it after a daemon restart; the ACK clears this copy.
+    retainQueuedActivationRawInput(ds.session, ds.pendingRawInput, ds.pendingRawTurnId ?? ds.session.queuedActivationTurnId);
   }
 
   // Snapshot the prior durable FIFO before accepting this fork's new prompt.
@@ -21204,6 +21254,7 @@ function setupWorkerHandlers(
   // （127/77）就会被直接熔断，连自己唯一的一次重启机会都拿不到。in-worker 的
   // CLI 崩溃自动重启不换 worker、不经过这里，#2551 的快速退出循环熔断照常。
   restartCounts.delete(ds.session.sessionId);
+  ds.cliStartupFailureReason = undefined;
   // Tier authority belongs to this exact worker generation. Start unknown and
   // wait for the new worker's rollout-bound observation; this also clears a
   // Codex badge before a role switch starts a non-Codex worker.
@@ -21558,6 +21609,94 @@ function setupWorkerHandlers(
       && sessionController.store.execution(sessionController.ref, openingExecution.executionId)?.phase === 'queued') return turnId;
     return undefined;
   };
+  /** Shared owner notice + backup-bot handoff for screen and terminal quota
+   * episodes. The caller supplies terminal ownership when no limited screen
+   * state exists; asynchronous identity resolution rechecks it before posting. */
+  const notifyQuotaLimitEpisode = (
+    limit: CliUsageLimitState,
+    turnId: string | undefined,
+    ownsEpisode?: () => boolean,
+  ): void => {
+    const limitKey = usageLimitStateKey(limit);
+    const ownsLimitEpisode = ownsEpisode ?? ((): boolean =>
+      ds.lastScreenStatus === 'limited'
+      && !!ds.usageLimit
+      && usageLimitStateKey(ds.usageLimit) === limitKey);
+    if (ds.rateLimitNotifiedKey !== limitKey) {
+      ds.rateLimitNotifiedKey = limitKey;
+      const notifyBody = tr(
+        limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
+        { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
+        loc,
+      );
+      const ownerOpenId = ds.session.ownerOpenId;
+      const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
+      scopedReply(notifyText, 'text', turnId).catch((err: any) => {
+        logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
+      });
+    }
+
+    // 先认领五分钟去重窗口，再异步解析接手 Bot 的身份
+    const quotaFallback = botCfg.quotaFallbackBot;
+    if (!quotaFallback?.enabled || !quotaFallback.kinds.includes(limit.kind)) return;
+    const fallbackTurn = fallbackTurnId(ds, turnId);
+    if (!claimQuotaFallbackEvent(ds.larkAppId, limit.kind)) {
+      logger.info(
+        `[${t}] Quota fallback deduplicated within five minutes `
+        + `(kind=${limit.kind}, target=${quotaFallback.targetAppId})`,
+      );
+      return;
+    }
+    const attemptToken = randomUUID();
+    ds.quotaFallbackAttemptToken = attemptToken;
+    const ownsFallbackAttempt = (): boolean =>
+      ownsLifecycleMutation()
+      && ds.quotaFallbackAttemptToken === attemptToken
+      && ownsLimitEpisode();
+    void resolveQuotaFallbackForSession(ds, quotaFallback.targetAppId)
+      .then(async resolved => {
+        // Identity resolution is asynchronous. Never let a lookup from
+        // a cleared/replaced worker episode post into a later turn —
+        // even when that later episode happens to have the same limit
+        // key (the token distinguishes the two claims).
+        if (!ownsFallbackAttempt()) {
+          logger.info(
+            `[${t}] Dropped stale quota fallback resolution for ${quotaFallback.targetAppId}`,
+          );
+          return;
+        }
+        if (!resolved.ok) {
+          logger.warn(
+            `[${t}] Quota fallback target rejected: target=${quotaFallback.targetAppId} `
+            + `reason=${resolved.reason}${resolved.detail ? ` detail=${resolved.detail}` : ''}`,
+          );
+          return;
+        }
+        const handoff = `<at id=${resolved.openId}></at> ${quotaFallback.message}`;
+        try {
+          if (!ownsFallbackAttempt()) return;
+          await scopedReply(handoff, 'text', fallbackTurn);
+          logger.info(
+            `[${t}] Quota fallback handed off to ${quotaFallback.targetAppId} `
+            + `(${resolved.source}) for episode=${limitKey}`,
+          );
+        } catch (err: any) {
+          // Keep the daemon-wide five-minute claim. A later frame/session
+          // must not retry and spam the same peer; owner notice and manual
+          // retry controls remain available.
+          logger.warn(
+            `[${t}] Failed to deliver quota fallback to ${quotaFallback.targetAppId}: `
+            + `${err?.message ?? err}`,
+          );
+        }
+      })
+      .catch((err: any) => {
+        logger.warn(
+          `[${t}] Quota fallback resolution failed for ${quotaFallback.targetAppId}: `
+          + `${err?.message ?? err}`,
+        );
+      });
+  };
   /** 文本帧和截图帧共享限额切换边沿，各自在通过来源和静默检查后调用 */
   const notifyUsageLimitEdge = (
     previousStatus: DaemonSession['lastScreenStatus'],
@@ -21614,6 +21753,8 @@ function setupWorkerHandlers(
             sourceTurnId: capturedFailedTurn.turnId,
             cliInput: capturedFailedTurn.cliInput,
             userPrompt: capturedFailedTurn.userPrompt,
+            ...(capturedFailedTurn.attachments?.length
+              ? { attachments: structuredClone(capturedFailedTurn.attachments) } : {}),
           }
         : undefined;
     };
@@ -21696,7 +21837,10 @@ function setupWorkerHandlers(
         let accepted = false;
         try {
           rollbackReplyRouting = inheritTurnReplyRouting(ds, payload.sourceTurnId, retryTurnId);
-          accepted = sendWorkerInput(ds, { content: payload.cliInput }, retryTurnId);
+          accepted = sendWorkerInput(ds, {
+            content: payload.cliInput,
+            ...(payload.attachments?.length ? { attachments: payload.attachments } : {}),
+          }, retryTurnId);
         } catch (err: any) {
           logger.warn(`[${t}] Antigravity rotation auto-replay failed before acceptance: ${err?.message ?? err}`);
         }
@@ -21709,7 +21853,10 @@ function setupWorkerHandlers(
           if (payload.sourceTurnId && ds.session.lastFailedTurn?.turnId === payload.sourceTurnId) {
             markRetryAttempt(ds.session);
           }
-          rememberLastCliInput(ds, payload.userPrompt, { content: payload.cliInput }, retryTurnId);
+          rememberLastCliInput(ds, payload.userPrompt, {
+            content: payload.cliInput,
+            ...(payload.attachments?.length ? { attachments: payload.attachments } : {}),
+          }, retryTurnId);
           noteReplyCardTurnStarted(ds, retryTurnId);
           // Do NOT forge `ds.lastScreenStatus = 'working'` here: a prompt-ready
           // idle frame arriving before agy enters busy mode would otherwise create
@@ -21822,82 +21969,19 @@ function setupWorkerHandlers(
       logger.warn(`[${t}] Antigravity quota rotation refused: session account identity is unknown`);
     }
 
-    if (ds.rateLimitNotifiedKey !== limitKey) {
-      ds.rateLimitNotifiedKey = limitKey;
-      const notifyBody = tr(
-        limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
-        { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
-        loc,
-      );
-      const ownerOpenId = ds.session.ownerOpenId;
-      const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
-      scopedReply(notifyText, 'text', turnId).catch((err: any) => {
-        logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
-      });
-    }
-
-    // 先认领五分钟去重窗口，再异步解析接手 Bot 的身份
-    const quotaFallback = botCfg.quotaFallbackBot;
-    if (!quotaFallback?.enabled || !quotaFallback.kinds.includes(limit.kind)) return;
-    const fallbackTurn = fallbackTurnId(ds, turnId);
-    if (!claimQuotaFallbackEvent(ds.larkAppId, limit.kind)) {
-      logger.info(
-        `[${t}] Quota fallback deduplicated within five minutes `
-        + `(kind=${limit.kind}, target=${quotaFallback.targetAppId})`,
-      );
-    } else {
-      const attemptToken = randomUUID();
-      ds.quotaFallbackAttemptToken = attemptToken;
-      const ownsFallbackAttempt = (): boolean =>
-        ownsLifecycleMutation()
-        && ds.quotaFallbackAttemptToken === attemptToken
-        && ds.lastScreenStatus === 'limited'
-        && !!ds.usageLimit
-        && usageLimitStateKey(ds.usageLimit) === limitKey;
-      void resolveQuotaFallbackForSession(ds, quotaFallback.targetAppId)
-        .then(async resolved => {
-          // Identity resolution is asynchronous. Never let a lookup from
-          // a cleared/replaced worker episode post into a later turn —
-          // even when that later episode happens to have the same limit
-          // key (the token distinguishes the two claims).
-          if (!ownsFallbackAttempt()) {
-            logger.info(
-              `[${t}] Dropped stale quota fallback resolution for ${quotaFallback.targetAppId}`,
-            );
-            return;
-          }
-          if (!resolved.ok) {
-            logger.warn(
-              `[${t}] Quota fallback target rejected: target=${quotaFallback.targetAppId} `
-              + `reason=${resolved.reason}${resolved.detail ? ` detail=${resolved.detail}` : ''}`,
-            );
-            return;
-          }
-          const handoff = `<at id=${resolved.openId}></at> ${quotaFallback.message}`;
-          try {
-            if (!ownsFallbackAttempt()) return;
-            await scopedReply(handoff, 'text', fallbackTurn);
-            logger.info(
-              `[${t}] Quota fallback handed off to ${quotaFallback.targetAppId} `
-              + `(${resolved.source}) for episode=${limitKey}`,
-            );
-          } catch (err: any) {
-            // Keep the daemon-wide five-minute claim. A later frame/session
-            // must not retry and spam the same peer; owner notice and manual
-            // retry controls remain available.
-            logger.warn(
-              `[${t}] Failed to deliver quota fallback to ${quotaFallback.targetAppId}: `
-              + `${err?.message ?? err}`,
-            );
-          }
-        })
-        .catch((err: any) => {
-          logger.warn(
-            `[${t}] Quota fallback resolution failed for ${quotaFallback.targetAppId}: `
-            + `${err?.message ?? err}`,
-          );
-        });
-    }
+    const notifyOwnerAndHandOff = (): void => notifyQuotaLimitEpisode(limit, turnId);
+    const chainOwnsLimit = callbacks?.startQuotaFallbackChainSwitch?.(ds, {
+      kind: limit.kind,
+      transient: isTransientRateLimit(limit),
+      sourceTurnId: turnId,
+      worker,
+      reply: text => scopedReply(text, 'text', turnId),
+      fallThrough: () => {
+        if (ownsLifecycleMutation() && ds.lastScreenStatus === 'limited' && ds.usageLimit
+          && usageLimitStateKey(ds.usageLimit) === limitKey) notifyOwnerAndHandOff();
+      },
+    });
+    if (!chainOwnsLimit) notifyOwnerAndHandOff();
   };
   const traexCatalogContextKey = traexCatalogConfigKey(botCfg);
   ensureOrdinaryTurnRecoveryAttached(ds, botCfg);
@@ -21931,6 +22015,15 @@ function setupWorkerHandlers(
       return;
     }
     startupState.failureNotified = true;
+    // A pane may die inside backend.spawn(), before any claude_exit observer
+    // exists. That fatal startup path must settle the SAME starting card too.
+    ds.cliStartupFailureReason ??= startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, loc);
+    ds.lastScreenStatus = 'interrupted';
+    resetStartingCardHealth(ds);
+    bumpStreamCardStatusRevision(ds);
+    clearUsageRefreshTimer(ds);
+    raiseDaemonAttention(ds, 'blocked', ds.cliStartupFailureReason, turnId);
+    publishAttentionPatch(ds);
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
       reason: 'worker_start_failed',
       message: reason,
@@ -21946,6 +22039,9 @@ function setupWorkerHandlers(
         + `turn=${turnId?.slice(0, 12) ?? '-'} attempt=${dispatchAttempt}: ${reason}`,
       );
       return;
+    }
+    if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
+      scheduleCardPatch(ds, buildStreamingCardJson(ds, 'interrupted'));
     }
     const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, loc);
     try {
@@ -23715,6 +23811,10 @@ function setupWorkerHandlers(
         // and wait for the NEXT set instead of trusting a stale `true`.
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
+        if (ds.lastScreenStatus === 'interrupted' && !ds.cliStartupFailureReason) {
+          ds.lastScreenStatus = 'idle';
+          bumpStreamCardStatusRevision(ds);
+        }
         const recoveringParkedDiagnostic = ds.crashDiagnosticParked === true;
         if (recoveringParkedDiagnostic) {
           // The next-message retry respawns INSIDE the existing worker, so no
@@ -23909,6 +24009,12 @@ function setupWorkerHandlers(
         // blocked as `worker_busy`.
         if (restartSettled && validSettingReceipt && msg.status === 'succeeded') {
           ds.workerReady = true;
+          // A correlated ready receipt proves the replacement exists. Do not
+          // keep its predecessor's physical-exit status fencing fork/relay.
+          if (ds.lastScreenStatus === 'interrupted' && !ds.cliStartupFailureReason) {
+            ds.lastScreenStatus = 'idle';
+            bumpStreamCardStatusRevision(ds);
+          }
         }
         if (restartSettled && currentSettingsAttempt) {
           if (msg.untouched) {
@@ -25342,12 +25448,15 @@ function setupWorkerHandlers(
         // pair that issued it. A delayed message from a replaced Node worker
         // must neither clear nor restart the replacement generation.
         const workerSession = ds.session;
+        const exitedRuntime = controllerForSession(ds)?.currentRuntime();
+        const restartAtExit = restartCoordinator.activeAttemptId(ds.session.sessionId);
         if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
         }
         // Read before any later step can move the screen state.
         const turnRunningAtExit = ds.lastScreenStatus === 'working';
+        const idleAtExit = ds.lastScreenStatus === 'idle';
         // The original opted-in turn has no dispatchAttempt, so worker.ts's
         // durable-delivery terminal path cannot report its CLI exit. Bind the
         // exit here to the exact live turn + worker generation. Synthetic
@@ -25372,6 +25481,19 @@ function setupWorkerHandlers(
         // exit) is covered — a later prompt_ready can only come from the next
         // generation. The monotonic counter is deliberately left untouched.
         ds.cliReady = false;
+        // A living Node worker is not evidence of a living CLI. Publish the
+        // physical loss before any async reconciliation / restart decision.
+        if (!isRemoteBackendSession(ds) && !isSharedAdoptSession(ds)) {
+          // A clean exit after an already idle/completed turn is not a failed
+          // task. It still must not inherit a stale working projection.
+          const exitStatus = msg.code === 0 && idleAtExit ? 'idle' : 'interrupted';
+          ds.lastScreenStatus = exitStatus;
+          bumpStreamCardStatusRevision(ds);
+          clearUsageRefreshTimer(ds);
+          dashboardEventBus.publish({ type: 'session.update', body: {
+            sessionId: ds.session.sessionId, patch: { status: exitStatus },
+          } });
+        }
         // The live-send capability dies with this backend. Preserve the
         // worker-generation policy capability only while this local worker is
         // still eligible for same-worker crash recovery. Branches that cannot
@@ -25416,6 +25538,8 @@ function setupWorkerHandlers(
           ds.worker !== worker
           || ds.workerGeneration !== workerGeneration
           || ds.session !== workerSession
+          || (exitedRuntime && !sameRuntime(exitedRuntime, controllerForSession(ds)?.currentRuntime()))
+          || (exitedRuntime && restartAtExit !== restartCoordinator.activeAttemptId(ds.session.sessionId))
           || isSessionTransferring(ds)
         ) {
           logger.warn(`[${t}] Suppressed stale claude_exit lifecycle continuation`);
@@ -25662,10 +25786,35 @@ function setupWorkerHandlers(
           prev: restartCounts.get(key),
           now: Date.now(),
           code: msg.code,
+          startupFailure: msg.startupFailure,
         });
         if (decision.shouldRestart) {
           restartCounts.set(key, decision.next);
         } else {
+          if (decision.reason === 'startup_failure') {
+            // Only safe numeric exit evidence leaves the host. CLI stderr may
+            // contain tokens, command-line prompts or provider credentials.
+            const reason = tr('worker.startup_circuit_stopped', {
+              cliName: sessionCliDisplayName(ds, botCfg), code: msg.code ?? '?',
+            }, loc);
+            ds.cliStartupFailureReason = reason;
+            ds.managedTurnOrigin = undefined;
+            resetStartingCardHealth(ds);
+            restartCoordinator.failSession(key);
+            parkCrashDiagnosticWorker(ds, { terminal: false, failPending: true });
+            ds.lastScreenStatus = 'interrupted';
+            bumpStreamCardStatusRevision(ds);
+            raiseDaemonAttention(ds, 'blocked', reason, msg.turnId);
+            publishAttentionPatch(ds);
+            if (!suppressExitUi && !ds.suppressRecoveryCard) {
+              scheduleCardPatch(ds, buildStreamingCardJson(ds, 'interrupted'));
+              // Each explicit next-message retry owns a new bounded batch,
+              // even though it reuses this Node worker's startupState.
+              startupState.failureNotified = false;
+              await notifyStartupFailure(reason, msg.turnId, msg.dispatchAttempt);
+            }
+            break;
+          }
           const rc = decision.next;
           restartCounts.set(key, rc);
           ds.managedTurnOrigin = undefined;
@@ -26697,6 +26846,37 @@ function setupWorkerHandlers(
             + `${msg.turnId.substring(0, 8)}: `
             + `${err instanceof Error ? err.message : String(err)}`,
           );
+        }
+        // TraeX reports exhausted quota only as this terminal, never as a limited screen.
+        if (msg.status === 'failed' && msg.errorCode === TRAEX_QUOTA_ERROR_CODE && ownsLifecycleMutation()
+          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          const providerRetryAtMs = msg.providerRetryAtMs !== undefined && Number.isFinite(msg.providerRetryAtMs)
+            ? msg.providerRetryAtMs : undefined;
+          const observedAtMs = msg.completedAtMs !== undefined && Number.isFinite(msg.completedAtMs)
+            ? msg.completedAtMs : Date.now();
+          const terminalLimit: CliUsageLimitState = {
+            limited: true,
+            kind: 'usage',
+            retryAtMs: providerRetryAtMs ?? observedAtMs,
+            retryLabel: providerRetryAtMs !== undefined
+              ? formatClockTime(providerRetryAtMs, loc)
+              : tr('worker.quota_chain.reset_unknown', undefined, loc),
+            retryReady: providerRetryAtMs !== undefined && providerRetryAtMs <= Date.now(),
+          };
+          const ownsTerminalEpisode = (): boolean => ownsLifecycleMutation()
+            && ds.lastCliInputTurnId === msg.turnId
+            && ds.session.lastFailedTurn?.turnId === msg.turnId;
+          const fallThrough = (): void => {
+            if (ownsTerminalEpisode()) notifyQuotaLimitEpisode(terminalLimit, msg.turnId, ownsTerminalEpisode);
+          };
+          const chainOwnsLimit = callbacks?.startQuotaFallbackChainSwitch?.(ds, {
+            kind: 'usage',
+            sourceTurnId: msg.turnId,
+            worker,
+            reply: text => scopedReply(text, 'text', msg.turnId),
+            fallThrough,
+          });
+          if (!chainOwnsLimit) fallThrough();
         }
         let nonLarkFailureHandled = false;
         if ((isClaudeProviderFailure || msg.status === 'failed' || msg.status === 'ambiguous' || msg.status === 'cancelled')

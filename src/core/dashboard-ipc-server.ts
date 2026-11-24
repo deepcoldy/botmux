@@ -275,6 +275,7 @@ import {
   normalizeQuotaFallbackBotConfig,
   type QuotaFallbackBotConfig,
 } from '../services/quota-fallback.js';
+import { normalizeQuotaFallbackChainConfig } from '../services/quota-fallback-chain.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode, repoPickerScanOptions } from '../global-config.js';
@@ -11521,6 +11522,10 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
       try { return getBot(cachedLarkAppId).config.quotaFallbackBot ?? null; }
       catch { return null; }
     })(),
+    quotaFallbackChain: (() => {
+      try { return getBot(cachedLarkAppId).config.quotaFallbackChain ?? null; }
+      catch { return null; }
+    })(),
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     oncallGroup: (() => { try { return getBot(cachedLarkAppId).config.oncallGroup ?? null; } catch { return null; } })(),
@@ -11548,6 +11553,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     triggerUserAuth,
     larkToolBinding: getBot(cachedLarkAppId).config.larkToolBinding !== false,
     larkUserOwnerFallback: getBot(cachedLarkAppId).config.larkUserOwnerFallback !== false,
+    autoAvoidApproval: getBot(cachedLarkAppId).config.autoAvoidApproval !== false,
     topicUnavailablePolicy: getBot(cachedLarkAppId).config.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery,
     replyDeliveryDefault,
@@ -11646,6 +11652,42 @@ ipcRoute('PUT', '/api/bot-quota-fallback', requireBoundBot(async (req, res) => {
     jsonRes(res, 200, { ok: true, quotaFallbackBot: result.result.config });
   } catch (error: any) {
     jsonRes(res, 500, { ok: false, error: 'quota_fallback_save_failed', reason: ipcErrorText(error) });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
+// Per-bot same-bot CLI/model chain. Validated against the bot's own CLI, which
+// is step 0 of the chain.
+ipcRoute('PUT', '/api/bot-quota-fallback-chain', requireBoundBot(async (req, res) => {
+  let body: Record<string, unknown>;
+  try {
+    const raw = await readJsonBody(req);
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_quota_fallback_chain' });
+    }
+    body = raw as Record<string, unknown>;
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const bot = getBot(cachedLarkAppId).config;
+  const normalized = body.enabled === true
+    ? normalizeQuotaFallbackChainConfig(body, {
+      cliId: bot.cliId, model: bot.model, backendType: bot.backendType, codexRpcInput: bot.codexRpcInput,
+    })
+    : {};
+  if (body.enabled === true && !normalized.config) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_quota_fallback_chain', reason: normalized.error });
+  }
+  const config = normalized.config ?? null;
+  try {
+    const result = await rmwBotEntry(cachedLarkAppId, entry => {
+      if (config) entry.quotaFallbackChain = config;
+      else delete entry.quotaFallbackChain;
+    });
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+    bot.quotaFallbackChain = config ?? undefined;
+    jsonRes(res, 200, { ok: true, quotaFallbackChain: config });
+  } catch (error: any) {
+    jsonRes(res, 500, { ok: false, error: 'quota_fallback_chain_save_failed', reason: ipcErrorText(error) });
   }
 }, NOT_BOUND_BODY.okFalse));
 
@@ -13633,6 +13675,17 @@ botConfigPutRoute<{ enabled?: unknown; larkUserOwnerFallback?: unknown }>('/api/
   respond: value => ({ ok: true, larkUserOwnerFallback: value !== false }),
 });
 
+// PUT /api/bot-auto-avoid-approval — 飞书开放平台卡审批草稿态自动避开开关。Body `{ enabled?: boolean; autoAvoidApproval?: boolean }`
+botConfigPutRoute<{ enabled?: unknown; autoAvoidApproval?: unknown }>('/api/bot-auto-avoid-approval', 'autoAvoidApproval', {
+  normalize: body => {
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) return fieldInvalid('no_valid_fields');
+    const on = body.enabled === true || body.autoAvoidApproval === true;
+    const off = body.enabled === false || body.autoAvoidApproval === false;
+    if (on === off) return fieldInvalid('no_valid_fields');
+    return fieldOk(on);
+  },
+  respond: value => ({ ok: true, autoAvoidApproval: value !== false }),
+});
 /**
  * The sandbox mode the worker will spawn this bot's CLI under
  * (resolveLocalSandboxMode: global BOTMUX_SANDBOX and the legacy readIsolation

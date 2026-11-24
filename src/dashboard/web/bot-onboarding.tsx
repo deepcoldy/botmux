@@ -31,6 +31,14 @@ type OnboardingStatus =
   | 'completed'
   | 'failed';
 
+type DeferredApprovalScopeView = {
+  bucket: 'tenant' | 'user';
+  name: string;
+  desc?: string;
+  isolation: 'exact' | 'group' | 'all_level4';
+  group: string;
+};
+
 type OnboardingPermission = {
   ok: boolean;
   scopeCount?: number;
@@ -46,6 +54,10 @@ type OnboardingPermission = {
   versionPendingReview?: boolean;
   pendingReviewAppVersion?: string;
   approvalHumanApprovers?: string[];
+  approvalDeferredScopes?: DeferredApprovalScopeView[];
+  approvalDisabledRefreshToken?: boolean;
+  approvalInitialApprovers?: string[];
+  approvalConsoleUrl?: string;
   reason?: string;
   message?: string;
 };
@@ -117,6 +129,7 @@ type OnboardingFormState = {
   dirMode: 'fixed' | 'card';
   workingDir: string;
   model: string;
+  autoAvoidApproval: boolean;
 };
 
 type ViewState =
@@ -144,6 +157,7 @@ function defaultFormState(): OnboardingFormState {
     dirMode: 'fixed',
     workingDir: '~',
     model: '',
+    autoAvoidApproval: true,
   };
 }
 
@@ -392,6 +406,56 @@ function reviewPendingText(permission: OnboardingPermission): string {
     : t('botOnboarding.permissionReviewPendingNoVersion', { approvers, stuckHint });
 }
 
+function ApprovalDeferredNotice(props: { permission: OnboardingPermission }): React.JSX.Element | null {
+  const { permission } = props;
+  const deferred = permission.approvalDeferredScopes ?? [];
+  const disabledRefresh = permission.approvalDisabledRefreshToken === true;
+  if (deferred.length === 0 && !disabledRefresh) return null;
+  const approvers = permission.approvalInitialApprovers?.length
+    ? t('botOnboarding.approvalDeferredApprovers', { approvers: permission.approvalInitialApprovers.join('、') })
+    : '';
+  const inlineLimit = 8;
+  const previewItems = deferred.slice(0, inlineLimit);
+  const hasMore = deferred.length > inlineLimit;
+  const renderItem = (scope: DeferredApprovalScopeView) => (
+    <li key={`${scope.bucket}:${scope.name}`}>
+      <code>{scope.name}</code>
+      {' '}
+      <small>({scope.bucket === 'tenant' ? t('botOnboarding.scopeBucketTenant') : t('botOnboarding.scopeBucketUser')})</small>
+      {scope.desc ? <> — {scope.desc}</> : null}
+    </li>
+  );
+  return (
+    <div className="onboarding-approval-deferred" data-onboarding-approval-deferred="">
+      {deferred.length > 0 ? (
+        <p className="hint-warn">
+          {t('botOnboarding.approvalDeferredSummary', { count: deferred.length, approvers })}
+        </p>
+      ) : null}
+      {disabledRefresh ? (
+        <p className="hint-warn">{t('botOnboarding.approvalDisabledRefreshToken')}</p>
+      ) : null}
+      {deferred.length > 0 ? (
+        hasMore ? (
+          <details className="onboarding-technical">
+            <summary>{t('botOnboarding.approvalDeferredExpand', { count: deferred.length })}</summary>
+            <ul className="onboarding-steps">{deferred.map(renderItem)}</ul>
+          </details>
+        ) : (
+          <ul className="onboarding-steps">{previewItems.map(renderItem)}</ul>
+        )
+      ) : null}
+      {permission.approvalConsoleUrl ? (
+        <p className="hint-warn">
+          <a href={permission.approvalConsoleUrl} target="_blank" rel="noopener">
+            {t('botOnboarding.approvalDeferredOpenConsole')}
+          </a>
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 export function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | null {
   const { job } = props;
   if ((job.status !== 'completed' && job.status !== 'needs_owner') || !job.permission) return null;
@@ -415,6 +479,7 @@ export function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Elem
           <p className="hint-warn" data-onboarding-version-warning="">{permission.versionWarning}</p>
         ) : null}
         {permission.scopeWarning ? <p className="hint-warn">{permission.scopeWarning}</p> : null}
+        <ApprovalDeferredNotice permission={permission} />
         <RedirectWarning permission={permission} />
       </>
     );
@@ -793,6 +858,20 @@ function OnboardingForm(props: {
           />
         </div>
       ) : null}
+      {!local ? (
+        <label className="onboarding-field onboarding-checkbox">
+          <span className="onboarding-checkbox-row">
+            <input
+              id="ob-auto-avoid-approval"
+              type="checkbox"
+              checked={props.form.autoAvoidApproval}
+              onChange={event => props.onFormChange({ ...props.form, autoAvoidApproval: event.currentTarget.checked })}
+            />
+            <span>{t('botOnboarding.autoAvoidApprovalLabel')}</span>
+          </span>
+          <small className="onboarding-field-hint">{t('botOnboarding.autoAvoidApprovalHint')}</small>
+        </label>
+      ) : null}
       {props.error ? <p className="form-error">{props.error}</p> : null}
       <div className="actions onboarding-actions">
         <button type="button" id="ob-cancel" disabled={props.submitting} onClick={props.onClose}>{t('botOnboarding.cancel')}</button>
@@ -942,7 +1021,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
           workingDir: form.workingDir.trim(),
           dirMode: form.dirMode,
           model: form.model.trim() || undefined,
-          ...(registrationMode === 'local' ? {} : { cloneSourceAppId }),
+          ...(registrationMode === 'local' ? {} : { cloneSourceAppId, autoAvoidApproval: form.autoAvoidApproval }),
         }),
       });
       const body = await res.json();

@@ -376,6 +376,51 @@ describe('dashboard IPC server', () => {
     }
   });
 
+  it('persists a quota fallback chain, hot-applies it and rejects an invalid chain', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-quota-chain-'));
+    const configPath = join(dir, 'bots.json');
+    const source = 'cli_quotachain';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([
+        { larkAppId: source, larkAppSecret: 'source-secret', cliId: 'claude-code', model: 'claude-opus-5-5' },
+      ], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(source);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const put = (body: unknown) => fetch(`${base}/api/bot-quota-fallback-chain`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const chain = { enabled: true, kinds: ['usage', 'rate'], steps: [{ cliId: 'traex', model: 'GPT-6.1-Sol' }, { cliId: 'traex', model: 'DeepSeek-V4.1-Flash' }] };
+      const saved = await put(chain);
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toEqual({ ok: true, quotaFallbackChain: chain });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].quotaFallbackChain).toEqual(chain);
+      expect(getBot(source).config.quotaFallbackChain).toEqual(chain);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).quotaFallbackChain).toEqual(chain);
+
+      const before = readFileSync(configPath, 'utf8');
+      const rejected = await put({ enabled: true, steps: [{ cliId: 'traex' }, { cliId: 'claude-code' }] });
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ ok: false, error: 'invalid_quota_fallback_chain' });
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+
+      const disabled = await put({ enabled: false });
+      expect(await disabled.json()).toEqual({ ok: true, quotaFallbackChain: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).not.toHaveProperty('quotaFallbackChain');
+      expect(getBot(source).config.quotaFallbackChain).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('writes bot-scoped chat feedback and returns an effective trace', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-feedback-'));
     const configPath = join(dir, 'bots.json');
@@ -4344,6 +4389,54 @@ describe('lark-cli binding setting survives dashboard refresh', () => {
         const refreshed = await readDefaults();
         expect(refreshed).toHaveProperty('larkToolBinding', enabled);
         expect(botDefaultsPayload({ larkAppId: appId }, refreshed).larkToolBinding).toBe(enabled);
+      }
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (previousConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previousConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT + GET /api/bot-auto-avoid-approval — 卡审批自动避开开关刷新回显', () => {
+  it.each([undefined, false, true] as const)('persists and echoes autoAvoidApproval (initial=%s)', async initial => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-auto-avoid-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'cli_auto_avoid_refresh';
+    const previousConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'fixture-secret', cliId: 'claude-code',
+        ...(initial === undefined ? {} : { autoAvoidApproval: initial }),
+      }]));
+      loadBotConfigs().forEach((entry: any) => registerBot(entry));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const readDefaults = async () => {
+        const response = await fetch(`${base}/api/bot-default-oncall`);
+        expect(response.status).toBe(200);
+        return response.json();
+      };
+      expect(await readDefaults()).toHaveProperty('autoAvoidApproval', initial !== false);
+
+      for (const enabled of [false, true]) {
+        const saved = await fetch(`${base}/api/bot-auto-avoid-approval`, {
+          method: 'PUT', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        });
+        expect(saved.status).toBe(200);
+        expect(await saved.json()).toMatchObject({ ok: true, autoAvoidApproval: enabled });
+        const persisted = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+        if (enabled) expect(persisted.autoAvoidApproval).toBeUndefined();
+        else expect(persisted.autoAvoidApproval).toBe(false);
+        expect(getBot(appId).config.autoAvoidApproval !== false).toBe(enabled);
+        const refreshed = await readDefaults();
+        expect(refreshed).toHaveProperty('autoAvoidApproval', enabled);
+        expect(botDefaultsPayload({ larkAppId: appId }, refreshed).autoAvoidApproval).toBe(enabled);
       }
     } finally {
       if (handle) await handle.close();
