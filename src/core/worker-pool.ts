@@ -149,6 +149,8 @@ import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { markRetryAttempt, refundRetryAttempt } from '../services/failed-turn-retry.js';
 import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
+import type { QuotaFallbackChainTrigger } from './quota-fallback-chain-switch.js';
+import { TRAEX_QUOTA_ERROR_CODE } from '../services/traex-quota.js';
 import { takePurgeClickRollback } from '../services/image-purge-recovery.js';
 import { hashUrlForLog, type RiffBackendConfig } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
@@ -1104,7 +1106,7 @@ import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { sameTrustedPrincipal } from './active-turn-authority.js';
-import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, isTransientRateLimit, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import { isAntigravityWorkingScreen, rememberAntigravityQuota } from '../adapters/cli/antigravity.js';
 import {
   inspectAntigravityAccounts,
@@ -1221,7 +1223,7 @@ type WorkerStartupState = {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WORKER_SIGTERM_BACKSTOP_MS = 2_000;
-const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
+export const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
 const CLOSE_FENCE_WARN_MS = 8_000;
 // Peer relay waits 5s for the whole transfer request. Tmux observer detach has
 // its own 3s command timeout, so this fence leaves headroom for routing/fork.
@@ -1436,6 +1438,10 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
   prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
+  /** Same-bot quota fallback chain (core/quota-fallback-chain-switch.ts).
+   *  True when the limit is handled by moving this session to the next
+   *  CLI/model, so the owner pause notice and backup-bot handoff are skipped. */
+  startQuotaFallbackChainSwitch?: (ds: DaemonSession, trigger: QuotaFallbackChainTrigger) => boolean;
   /** A scheduled task as the host authority store holds it, for deciding who a
    *  scheduled turn runs as. Never backed by schedules.json (agent-writable
    *  inside a sandbox). Absent or undefined → the turn carries no identity. */
@@ -4346,7 +4352,11 @@ function sessionAgentConfig(
   if (selected) {
     if (ds.session.codexProfile) throw new Error('Codex profile does not support per-session CLI selection');
     if (selected.cliId.toLowerCase() === 'riff') throw new Error('CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session');
-    if (botCfg.env && Object.keys(botCfg.env).length > 0) throw new Error('CLI selection rejected: bot env is configured');
+    // A quota fallback step deliberately launches the stock CLI without the
+    // bot's env, which belongs to the bot's own CLI (resolveSessionEnvForSession).
+    if (botCfg.env && Object.keys(botCfg.env).length > 0 && ds.session.quotaFallback?.cliId !== selected.cliId) {
+      throw new Error('CLI selection rejected: bot env is configured');
+    }
     if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) throw new Error('CLI selection rejected: Riff is configured');
     if (botCfg.codexRpcInput === true && !RPC_CAPABLE_CLIS.has(selected.cliId)) {
       throw new Error(`CLI selection rejected: ${selected.cliId} cannot use codexRpcInput`);
@@ -9128,7 +9138,7 @@ export function shouldDestroyPaneBeforeRestart(
  * remote task must survive a restart to preserve follow-up lineage). Adopt
  * sessions are skipped: botmux never owned the user's pane.
  */
-function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
+export function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
   if (!shouldDestroyPaneBeforeRestart(ds)) return;
   const target = persistentBackendTargetForSession(ds);
   if (!target) return;
@@ -11350,7 +11360,7 @@ const RIFF_RECONCILE_MAX_QUIET_WAIT_MS = 20_000;
  * SIGKILL at WORKER_SIGKILL_BACKSTOP_MS), so a hung worker is gone in time. */
 const RIFF_RECONCILE_WORKER_EXIT_TIMEOUT_MS = WORKER_SIGKILL_BACKSTOP_MS + 3_000;
 
-function waitForWorkerExit(worker: ChildProcess, timeoutMs: number): Promise<boolean> {
+export function waitForWorkerExit(worker: ChildProcess, timeoutMs: number): Promise<boolean> {
   if (worker.exitCode !== null || worker.signalCode !== null) return Promise.resolve(true);
   return new Promise<boolean>(resolve => {
     const onExit = (): void => {
@@ -15611,6 +15621,9 @@ export function sendWorkerSessionInput(
   // type (inject_command, set_display_mode, …) must reach worker.send without
   // this registry lookup at all. Only a Ctrl+C/ESC needs the recovery cancel.
   if (message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc')) {
+    // A stopped turn must not be re-sent by a waiting quota-chain retry.
+    if (ds.quotaFallbackChainRetries?.timer) clearTimeout(ds.quotaFallbackChainRetries.timer);
+    ds.quotaFallbackChainRetries = undefined;
     const stopCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
     if (codexCapacityRecoveryCli(stopCliId)) {
       cancelOrdinaryRecoveryForUserInput(ds.session, ds.session.ordinaryTurnRecovery?.currentTurnId ?? 'stop');
@@ -21570,6 +21583,94 @@ function setupWorkerHandlers(
       && sessionController.store.execution(sessionController.ref, openingExecution.executionId)?.phase === 'queued') return turnId;
     return undefined;
   };
+  /** Shared owner notice + backup-bot handoff for screen and terminal quota
+   * episodes. The caller supplies terminal ownership when no limited screen
+   * state exists; asynchronous identity resolution rechecks it before posting. */
+  const notifyQuotaLimitEpisode = (
+    limit: CliUsageLimitState,
+    turnId: string | undefined,
+    ownsEpisode?: () => boolean,
+  ): void => {
+    const limitKey = usageLimitStateKey(limit);
+    const ownsLimitEpisode = ownsEpisode ?? ((): boolean =>
+      ds.lastScreenStatus === 'limited'
+      && !!ds.usageLimit
+      && usageLimitStateKey(ds.usageLimit) === limitKey);
+    if (ds.rateLimitNotifiedKey !== limitKey) {
+      ds.rateLimitNotifiedKey = limitKey;
+      const notifyBody = tr(
+        limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
+        { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
+        loc,
+      );
+      const ownerOpenId = ds.session.ownerOpenId;
+      const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
+      scopedReply(notifyText, 'text', turnId).catch((err: any) => {
+        logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
+      });
+    }
+
+    // 先认领五分钟去重窗口，再异步解析接手 Bot 的身份
+    const quotaFallback = botCfg.quotaFallbackBot;
+    if (!quotaFallback?.enabled || !quotaFallback.kinds.includes(limit.kind)) return;
+    const fallbackTurn = fallbackTurnId(ds, turnId);
+    if (!claimQuotaFallbackEvent(ds.larkAppId, limit.kind)) {
+      logger.info(
+        `[${t}] Quota fallback deduplicated within five minutes `
+        + `(kind=${limit.kind}, target=${quotaFallback.targetAppId})`,
+      );
+      return;
+    }
+    const attemptToken = randomUUID();
+    ds.quotaFallbackAttemptToken = attemptToken;
+    const ownsFallbackAttempt = (): boolean =>
+      ownsLifecycleMutation()
+      && ds.quotaFallbackAttemptToken === attemptToken
+      && ownsLimitEpisode();
+    void resolveQuotaFallbackForSession(ds, quotaFallback.targetAppId)
+      .then(async resolved => {
+        // Identity resolution is asynchronous. Never let a lookup from
+        // a cleared/replaced worker episode post into a later turn —
+        // even when that later episode happens to have the same limit
+        // key (the token distinguishes the two claims).
+        if (!ownsFallbackAttempt()) {
+          logger.info(
+            `[${t}] Dropped stale quota fallback resolution for ${quotaFallback.targetAppId}`,
+          );
+          return;
+        }
+        if (!resolved.ok) {
+          logger.warn(
+            `[${t}] Quota fallback target rejected: target=${quotaFallback.targetAppId} `
+            + `reason=${resolved.reason}${resolved.detail ? ` detail=${resolved.detail}` : ''}`,
+          );
+          return;
+        }
+        const handoff = `<at id=${resolved.openId}></at> ${quotaFallback.message}`;
+        try {
+          if (!ownsFallbackAttempt()) return;
+          await scopedReply(handoff, 'text', fallbackTurn);
+          logger.info(
+            `[${t}] Quota fallback handed off to ${quotaFallback.targetAppId} `
+            + `(${resolved.source}) for episode=${limitKey}`,
+          );
+        } catch (err: any) {
+          // Keep the daemon-wide five-minute claim. A later frame/session
+          // must not retry and spam the same peer; owner notice and manual
+          // retry controls remain available.
+          logger.warn(
+            `[${t}] Failed to deliver quota fallback to ${quotaFallback.targetAppId}: `
+            + `${err?.message ?? err}`,
+          );
+        }
+      })
+      .catch((err: any) => {
+        logger.warn(
+          `[${t}] Quota fallback resolution failed for ${quotaFallback.targetAppId}: `
+          + `${err?.message ?? err}`,
+        );
+      });
+  };
   /** 文本帧和截图帧共享限额切换边沿，各自在通过来源和静默检查后调用 */
   const notifyUsageLimitEdge = (
     previousStatus: DaemonSession['lastScreenStatus'],
@@ -21627,6 +21728,8 @@ function setupWorkerHandlers(
           sourceTurnId: capturedFailedTurn.turnId,
           cliInput: capturedFailedTurn.cliInput,
           userPrompt: capturedFailedTurn.userPrompt,
+          ...(capturedFailedTurn.attachments?.length
+            ? { attachments: structuredClone(capturedFailedTurn.attachments) } : {}),
         }
       : undefined;
     const formatAccountLabel = (id?: string, email?: string): string => {
@@ -21697,7 +21800,10 @@ function setupWorkerHandlers(
         let accepted = false;
         try {
           rollbackReplyRouting = inheritTurnReplyRouting(ds, payload.sourceTurnId, retryTurnId);
-          accepted = sendWorkerInput(ds, { content: payload.cliInput }, retryTurnId);
+          accepted = sendWorkerInput(ds, {
+            content: payload.cliInput,
+            ...(payload.attachments?.length ? { attachments: payload.attachments } : {}),
+          }, retryTurnId);
         } catch (err: any) {
           logger.warn(`[${t}] Antigravity rotation auto-replay failed before acceptance: ${err?.message ?? err}`);
         }
@@ -21710,7 +21816,10 @@ function setupWorkerHandlers(
           if (payload.sourceTurnId && ds.session.lastFailedTurn?.turnId === payload.sourceTurnId) {
             markRetryAttempt(ds.session);
           }
-          rememberLastCliInput(ds, payload.userPrompt, { content: payload.cliInput }, retryTurnId);
+          rememberLastCliInput(ds, payload.userPrompt, {
+            content: payload.cliInput,
+            ...(payload.attachments?.length ? { attachments: payload.attachments } : {}),
+          }, retryTurnId);
           noteReplyCardTurnStarted(ds, retryTurnId);
           // Do NOT forge `ds.lastScreenStatus = 'working'` here: a prompt-ready
           // idle frame arriving before agy enters busy mode would otherwise create
@@ -21823,82 +21932,19 @@ function setupWorkerHandlers(
       logger.warn(`[${t}] Antigravity quota rotation refused: session account identity is unknown`);
     }
 
-    if (ds.rateLimitNotifiedKey !== limitKey) {
-      ds.rateLimitNotifiedKey = limitKey;
-      const notifyBody = tr(
-        limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
-        { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
-        loc,
-      );
-      const ownerOpenId = ds.session.ownerOpenId;
-      const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
-      scopedReply(notifyText, 'text', turnId).catch((err: any) => {
-        logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
-      });
-    }
-
-    // 先认领五分钟去重窗口，再异步解析接手 Bot 的身份
-    const quotaFallback = botCfg.quotaFallbackBot;
-    if (!quotaFallback?.enabled || !quotaFallback.kinds.includes(limit.kind)) return;
-    const fallbackTurn = fallbackTurnId(ds, turnId);
-    if (!claimQuotaFallbackEvent(ds.larkAppId, limit.kind)) {
-      logger.info(
-        `[${t}] Quota fallback deduplicated within five minutes `
-        + `(kind=${limit.kind}, target=${quotaFallback.targetAppId})`,
-      );
-    } else {
-      const attemptToken = randomUUID();
-      ds.quotaFallbackAttemptToken = attemptToken;
-      const ownsFallbackAttempt = (): boolean =>
-        ownsLifecycleMutation()
-        && ds.quotaFallbackAttemptToken === attemptToken
-        && ds.lastScreenStatus === 'limited'
-        && !!ds.usageLimit
-        && usageLimitStateKey(ds.usageLimit) === limitKey;
-      void resolveQuotaFallbackForSession(ds, quotaFallback.targetAppId)
-        .then(async resolved => {
-          // Identity resolution is asynchronous. Never let a lookup from
-          // a cleared/replaced worker episode post into a later turn —
-          // even when that later episode happens to have the same limit
-          // key (the token distinguishes the two claims).
-          if (!ownsFallbackAttempt()) {
-            logger.info(
-              `[${t}] Dropped stale quota fallback resolution for ${quotaFallback.targetAppId}`,
-            );
-            return;
-          }
-          if (!resolved.ok) {
-            logger.warn(
-              `[${t}] Quota fallback target rejected: target=${quotaFallback.targetAppId} `
-              + `reason=${resolved.reason}${resolved.detail ? ` detail=${resolved.detail}` : ''}`,
-            );
-            return;
-          }
-          const handoff = `<at id=${resolved.openId}></at> ${quotaFallback.message}`;
-          try {
-            if (!ownsFallbackAttempt()) return;
-            await scopedReply(handoff, 'text', fallbackTurn);
-            logger.info(
-              `[${t}] Quota fallback handed off to ${quotaFallback.targetAppId} `
-              + `(${resolved.source}) for episode=${limitKey}`,
-            );
-          } catch (err: any) {
-            // Keep the daemon-wide five-minute claim. A later frame/session
-            // must not retry and spam the same peer; owner notice and manual
-            // retry controls remain available.
-            logger.warn(
-              `[${t}] Failed to deliver quota fallback to ${quotaFallback.targetAppId}: `
-              + `${err?.message ?? err}`,
-            );
-          }
-        })
-        .catch((err: any) => {
-          logger.warn(
-            `[${t}] Quota fallback resolution failed for ${quotaFallback.targetAppId}: `
-            + `${err?.message ?? err}`,
-          );
-        });
-    }
+    const notifyOwnerAndHandOff = (): void => notifyQuotaLimitEpisode(limit, turnId);
+    const chainOwnsLimit = callbacks?.startQuotaFallbackChainSwitch?.(ds, {
+      kind: limit.kind,
+      transient: isTransientRateLimit(limit),
+      sourceTurnId: turnId,
+      worker,
+      reply: text => scopedReply(text, 'text', turnId),
+      fallThrough: () => {
+        if (ownsLifecycleMutation() && ds.lastScreenStatus === 'limited' && ds.usageLimit
+          && usageLimitStateKey(ds.usageLimit) === limitKey) notifyOwnerAndHandOff();
+      },
+    });
+    if (!chainOwnsLimit) notifyOwnerAndHandOff();
   };
   const traexCatalogContextKey = traexCatalogConfigKey(botCfg);
   ensureOrdinaryTurnRecoveryAttached(ds, botCfg);
@@ -26696,6 +26742,37 @@ function setupWorkerHandlers(
             + `${msg.turnId.substring(0, 8)}: `
             + `${err instanceof Error ? err.message : String(err)}`,
           );
+        }
+        // TraeX reports exhausted quota only as this terminal, never as a limited screen.
+        if (msg.status === 'failed' && msg.errorCode === TRAEX_QUOTA_ERROR_CODE && ownsLifecycleMutation()
+          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          const providerRetryAtMs = msg.providerRetryAtMs !== undefined && Number.isFinite(msg.providerRetryAtMs)
+            ? msg.providerRetryAtMs : undefined;
+          const observedAtMs = msg.completedAtMs !== undefined && Number.isFinite(msg.completedAtMs)
+            ? msg.completedAtMs : Date.now();
+          const terminalLimit: CliUsageLimitState = {
+            limited: true,
+            kind: 'usage',
+            retryAtMs: providerRetryAtMs ?? observedAtMs,
+            retryLabel: providerRetryAtMs !== undefined
+              ? formatClockTime(providerRetryAtMs, loc)
+              : tr('worker.quota_chain.reset_unknown', undefined, loc),
+            retryReady: providerRetryAtMs !== undefined && providerRetryAtMs <= Date.now(),
+          };
+          const ownsTerminalEpisode = (): boolean => ownsLifecycleMutation()
+            && ds.lastCliInputTurnId === msg.turnId
+            && ds.session.lastFailedTurn?.turnId === msg.turnId;
+          const fallThrough = (): void => {
+            if (ownsTerminalEpisode()) notifyQuotaLimitEpisode(terminalLimit, msg.turnId, ownsTerminalEpisode);
+          };
+          const chainOwnsLimit = callbacks?.startQuotaFallbackChainSwitch?.(ds, {
+            kind: 'usage',
+            sourceTurnId: msg.turnId,
+            worker,
+            reply: text => scopedReply(text, 'text', msg.turnId),
+            fallThrough,
+          });
+          if (!chainOwnsLimit) fallThrough();
         }
         let nonLarkFailureHandled = false;
         if ((isClaudeProviderFailure || msg.status === 'failed' || msg.status === 'ambiguous' || msg.status === 'cancelled')

@@ -298,6 +298,8 @@ export interface FailedTurnRecord {
   userPrompt: string;
   cliInput: string;
   codexAppInput?: CodexAppTurnInput;
+  /** Daemon-retained attachments paired with the exact CLI input, for replay and quota handoff. */
+  attachments?: LarkAttachment[];
   failedAt: string;        // ISO
   errorCode?: string;
   status: 'failed' | 'ambiguous';
@@ -1192,6 +1194,8 @@ export interface Session {
   /** Structured companion for lastCliInput so retry_last_task can preserve a
    * clean Codex App turn. The legacy string remains authoritative fallback. */
   lastCodexAppInput?: CodexAppTurnInput;
+  /** Attachments paired with lastCliInputTurnId; retained for exact failure recovery and quota handoff. */
+  lastAttachments?: LarkAttachment[];
   /** 最近一个失败或被中断的 turn 的记录，供 /retry 命令重注入。
    *  在 onTurnTerminal 回调中记录（failed/ambiguous），不随新 turn 注入清除——
    *  只被更新的失败 turn 覆盖。 */
@@ -1330,6 +1334,9 @@ export interface Session {
   modelPin?: import('./core/model-pin.js').ModelPin;
   /** Retained Auto-model selection for the exact native conversation. */
   traexAutoModelRuntime?: import('./services/traex-auto-model.js').TraexAutoModelRuntimeState;
+  /** Step of the bot's quota fallback chain this session moved to. Its model
+   * outranks every other launch-model source while its CLI is the session's. */
+  quotaFallback?: import('./services/quota-fallback-chain.js').QuotaFallbackSessionState;
   /** Group defaults at topic creation; absent on legacy sessions. */
   groupDefaultModels?: import('./core/group-default-models.js').GroupDefaultModels;
   /** Optional reasoning effort frozen at creation (per-turn API override).
@@ -2188,6 +2195,8 @@ export interface CliTurnPayload {
   /** Daemon-frozen LinkRef mode plus admission-only source material. */
   linkRefs?: LinkRefTurnEnvelope;
   codexAppInput?: CodexAppTurnInput;
+  /** Daemon-side replay metadata paired with this exact input. Workers do not consume it directly. */
+  attachments?: LarkAttachment[];
   nativeSessionTitle?: string;
   nativeSessionTitlePrompt?: string;
   trustedCaller?: TrustedCaller;
