@@ -154,6 +154,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
   { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention', 'botDefaults.triggerUserAuthAllowSpeakerSwitch'] },
   { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle', 'botDefaults.larkUserOwnerFallbackToggle'] },
+  { id: 'approval-compat', tab: 'security', titleKey: 'botDefaults.sectionApprovalCompat', fieldKeys: ['botDefaults.autoAvoidApprovalToggle'] },
   {
     id: 'grant',
     tab: 'security',
@@ -467,6 +468,8 @@ export type BotDefaultsRow = {
   larkToolBinding?: boolean;
   /** 没有发起人时 lark-cli --as user 用主人的飞书身份（默认开启）；false 回到只认发起人的严格行为。 */
   larkUserOwnerFallback?: boolean;
+  /** 飞书开放平台预判卡审批时草稿态自动二分跳过需审权限（默认开启；设为 false 关闭）。 */
+  autoAvoidApproval?: boolean;
   /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
   sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
   sandboxNetworkPolicyPlatform?: string | null;

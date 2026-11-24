@@ -328,6 +328,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     triggerUserAuth: normalizeTriggerUserAuthForClient(j?.triggerUserAuth),
     larkToolBinding: j?.larkToolBinding !== false,
     larkUserOwnerFallback: j?.larkUserOwnerFallback !== false,
+    autoAvoidApproval: j?.autoAvoidApproval !== false,
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',
@@ -377,6 +378,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   apiOnly: boolean;
   larkToolBinding: boolean | undefined;
   larkUserOwnerFallback: boolean | undefined;
+  autoAvoidApproval: boolean | undefined;
   streamingCardFoldedLayout: boolean | undefined;
   askOptionLayout: any;
   trustSameOwnerBots: boolean | undefined;
@@ -391,6 +393,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
     larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding : undefined,
     // 默认开：显式 false 必须从这里带回，否则离线行会把已关闭的主人回退显示成开启。
     larkUserOwnerFallback: typeof rawEntry?.larkUserOwnerFallback === 'boolean' ? rawEntry.larkUserOwnerFallback : undefined,
+    autoAvoidApproval: typeof rawEntry?.autoAvoidApproval === 'boolean' ? rawEntry.autoAvoidApproval : undefined,
     streamingCardFoldedLayout: typeof rawEntry?.streamingCardFoldedLayout === 'boolean'
       ? rawEntry.streamingCardFoldedLayout : undefined,
     askOptionLayout: rawEntry?.askOptionLayout,

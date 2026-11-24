@@ -1204,6 +1204,9 @@ function BotDefaultsCard(props: {
             ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('trigger-user-auth')}><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('lark-tool-binding')}><LarkToolBindingSection bot={bot} patchBot={patchBot} /></section>
+            {!bot.apiOnly && bot.brand !== 'lark' ? (
+              <section className="bd-tile" id={botDefaultsSectionDomId('approval-compat')}><AutoAvoidApprovalSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('grant')}><GrantSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('blocked-users')}><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('slash-commands')}><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
@@ -4923,6 +4926,45 @@ export function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: P
       ) : null}
       <div className="actions">
         <StatusSpan status={fallbackStatus} attr={{ 'data-lark-user-owner-fallback-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+function AutoAvoidApprovalSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const enabled = bot.autoAvoidApproval !== false;
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = enabled;
+    patchBot(bot.larkAppId, { autoAvoidApproval: next });
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/auto-avoid-approval`, {
+        enabled: next,
+      }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.autoAvoidApprovalSaved'),
+      rollback: () => patchBot(bot.larkAppId, { autoAvoidApproval: previous }),
+    });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionApprovalCompat')}</h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-auto-avoid-approval"
+        title={tr('botDefaults.autoAvoidApprovalToggle')}
+        help={tr('botDefaults.autoAvoidApprovalHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-auto-avoid-approval-status': '' }} />
       </div>
     </section>
   );

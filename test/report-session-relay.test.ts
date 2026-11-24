@@ -543,6 +543,33 @@ describe('report session relay fallback target', () => {
     });
   });
 
+  it.each([undefined, 'chat'] as const)('rejects a closed thread-scope original row when signed scope is %s', scope => {
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget: {
+        larkAppId: 'cli_orchestrator', sessionId: 'session-orchestrator', chatId: 'oc_original',
+        ...(scope ? { scope } : {}),
+      },
+      originalSession: {
+        larkAppId: 'cli_orchestrator', sessionId: 'session-orchestrator', chatId: 'oc_original',
+        scope: 'thread', status: 'closed',
+      },
+      sessions: [successor],
+    })).toMatchObject({ ok: false, error: 'fallback_scope_unsupported' });
+  });
+
+  it('rejects a moved original row instead of overriding the signed target chat', () => {
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget,
+      originalSession: { ...originalClosed, chatId: 'oc_moved' },
+      sessions: [{ ...successor, chatId: 'oc_moved' }],
+    })).toEqual({
+      ok: false,
+      error: 'fallback_target_unavailable',
+      originalChatId: 'oc_original',
+      candidateCount: 0,
+    });
+  });
+
   it('can use the signed original chat when the original session row is missing', () => {
     expect(resolveReportRelayFallbackTarget({
       originalTarget,

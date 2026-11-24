@@ -417,7 +417,9 @@ import {
 } from './dashboard/compat.js';
 import { serveMissingDashboardChunk } from './dashboard/stale-chunk-http.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
-import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, withOpenPlatformAppLock, vcListenerEventGateError } from './setup/open-platform-automation.js';
+import { approvalAutomationOptionsForBot, mergeApprovalDeferredScopeBuckets, persistNewApprovalDeferredScopes } from './services/approval-deferred-scopes-store.js';
+import { buildApprovalConsoleUrl } from './setup/approval-scope-resolver.js';
 import { repairOpenPlatformRedirects } from './setup/open-platform-redirect-repair.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
@@ -1854,14 +1856,34 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
     }
   } else {
     try {
-      const result = await automateOpenPlatformSetup({
-        appId: targetAppId,
-        brand,
-        maxWaitMs: 5_000,
-        onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
+      const { result, deferredPersistWarning } = await withOpenPlatformAppLock(targetAppId, async () => {
+        const result = await automateOpenPlatformSetup({
+          appId: targetAppId,
+          brand,
+          maxWaitMs: 5_000,
+          ...approvalAutomationOptionsForBot(bot),
+          onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
+        });
+        let deferredPersistWarning = '';
+        if (result.approvalDeferredScopes?.length) {
+          const persisted = await persistNewApprovalDeferredScopes(targetAppId, result.approvalDeferredScopes, {
+            onCommitted: buckets => {
+              bot.approvalDeferredScopes = mergeApprovalDeferredScopeBuckets(bot.approvalDeferredScopes, buckets);
+            },
+          });
+          if (!persisted.ok) {
+            deferredPersistWarning = `；暂缓记录写入 bots.json 失败（${persisted.reason}），下次运行仍会重试`;
+            logger.warn(`[vc-agent] failed to persist approval-deferred scopes for ${targetAppId}: ${persisted.reason}`);
+          }
+        }
+        return { result, deferredPersistWarning };
       });
       if (result.ok) {
+        const deferredNotice = result.approvalDeferredScopes?.length
+          ? `本次有 ${result.approvalDeferredScopes.length} 项权限因需人工审批被暂缓，尚未开通；请到 ${buildApprovalConsoleUrl(targetAppId, brand)} 手动申请${deferredPersistWarning}`
+          : '';
         logger.info(`[vc-agent] auto-imported ${result.scopeCount} scopes, subscribed ${result.subscribedEventCount} events for bot ${targetAppId}`);
+        if (deferredNotice) logger.warn(`[vc-agent] ${deferredNotice}`);
         if (result.scopeWarning) logger.warn(`[vc-agent] scope import warning: ${result.scopeWarning}`);
         if (result.eventWarning) logger.warn(`[vc-agent] event subscription warning: ${result.eventWarning}`);
         // 自动化「成功」不等于权限真开了：internal scope/update 可能静默跳过本租户
@@ -1874,7 +1896,7 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
               // 版本停在企业审核时权限还没生效，此时「手动开通」既做不到也不必要。
               ? `新版本 ${result.pendingReviewAppVersion ?? result.versionId ?? ''} 已提交，正在等待企业管理员审核，`
                 + '审核通过后权限才生效，届时再重试（审批进度可在飞书「审批」里查看）。'
-              : '请到开放平台手动开通 VC 会议权限后重试。'}`,
+              : '请到开放平台手动开通 VC 会议权限后重试。'}${deferredNotice ? `。${deferredNotice}` : ''}`,
           };
         }
         // 事件订阅同样关键：缺任一 VC 事件都收不到会议邀请(用 missingVcEvents 判定,
@@ -6484,6 +6506,7 @@ const server = createServer(async (req, res) => {
         workingDir?: unknown;
         dirMode?: unknown;
         model?: unknown;
+        autoAvoidApproval?: unknown;
         requireCriticalScopesBeforeActivation?: unknown;
       };
       try {
@@ -6592,6 +6615,7 @@ const server = createServer(async (req, res) => {
         workingDir,
         dirMode,
         model,
+        ...(typeof parsed.autoAvoidApproval === 'boolean' ? { autoAvoidApproval: parsed.autoAvoidApproval } : {}),
         ...(parsed.requireCriticalScopesBeforeActivation === true
           ? { requireCriticalScopesBeforeActivation: true }
           : {}),

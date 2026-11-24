@@ -584,7 +584,7 @@ describe('target daemon consumes signed message authority', () => {
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } = await import('../src/core/reply-target.js');
     const { resolveScheduledRunIdentity } = await import('../src/core/schedule-identity-claim.js');
-    const { isTalkerScheduledTask, authorizeTalkerScheduleRun, talkerSchedulePolicy, talkerScheduleChatType } = await import('../src/core/schedule-talker.js');
+    const { isTalkerScheduledTask, authorizeTalkerScheduleRun, talkerSchedulePolicy, talkerScheduleChatType, effectiveTalkerSchedulePolicy } = await import('../src/core/schedule-talker.js');
     const { buildUntilDoneRunPrompt, isAutoCompletedSchedule } = await import('../src/services/schedule-until-done.js');
     const { scheduleTimeZone } = await import('../src/utils/timezone.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
@@ -594,7 +594,7 @@ describe('target daemon consumes signed message authority', () => {
     const { TRIGGER_USER_AUTH_TOOLS } = await import('../src/services/trigger-user-auth.js');
     const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity', 'prepareNativeScheduledControlIdentity',
       'dispatchUserForTurn', 'targetUserForDelegation', 'checkDelegationRecipient', 'delegatedScheduleRuntimeDeps',
-      'talkerScheduleRuntimeDeps',
+      'talkerScheduleRuntimeDeps', 'talkerSchedulePolicyFor',
       'delegatedScheduleCliIdentity', 'prepareScheduledTurnCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
       'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication',
       'handleIdentityDecisionFlip', 'noteTurnReceived'].map(name => {
@@ -677,6 +677,9 @@ describe('target daemon consumes signed message authority', () => {
       // The production runtime-deps helper is extracted above and assigned back
       // below, so neither entry point can fall back to a test-side mirror.
       isTalkerScheduledTask, authorizeTalkerScheduleRun, talkerScheduleChatType, talkerSchedulePolicy,
+      effectiveTalkerSchedulePolicy,
+      // Personal-assistant ownership of a chat: nobody owns one unless a test says so.
+      isAssistantOwnerOfChat: vi.fn((_app: string, _chat: string, _type: string, _openId?: string): boolean => false),
       talkerScheduleRuntimeDeps: undefined as any,
       noteScheduledIdentityGap: vi.fn(),
       noteScheduledIdentityRestored: vi.fn(),
@@ -1596,6 +1599,20 @@ describe('target daemon consumes signed message authority', () => {
     bytedcliJwts.set('ou_alice_target', { cloudJwt: 'team-member-cloud' });
     await h.run(firstScheduledTurn);
     expect(identityBody('bytedcli', firstScheduledTurn)).toContain('team-member-cloud');
+  });
+
+  it('runs an assistant owner\'s task without the talker switch, and stops once the chat has another owner', async () => {
+    const h = await targetHarness();
+    talkerSchedule(h);
+    let owner: string | undefined = 'ou_alice_target';
+    h.scopeValues.isAssistantOwnerOfChat = vi.fn((_app: string, _chat: string, _type: string, openId?: string) =>
+      !!openId && openId === owner);
+    bytedcliJwts.set('ou_alice_target', { cloudJwt: 'assistant-owner-cloud' });
+    await h.run(firstScheduledTurn);
+    expect(identityBody('bytedcli', firstScheduledTurn)).toContain('assistant-owner-cloud');
+    expect(h.scopeValues.isAssistantOwnerOfChat).toHaveBeenCalledWith(APP, 'oc_chat', 'group', 'ou_alice_target');
+    owner = 'ou_someone_else';
+    await expect(h.run(firstScheduledTurn)).rejects.toThrow(/disabled/);
   });
 
   it('refuses a talker task when the switch changes during credential publication', async () => {

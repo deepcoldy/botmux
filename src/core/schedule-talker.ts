@@ -41,6 +41,16 @@ export function talkerSchedulePolicy(
   return { enabled: config?.scheduleCreateByTalkers === true, maxTasksPerUser };
 }
 
+/** The policy as it applies to one person in one chat. In personal-assistant
+ *  mode the chat's current owner is admitted on the same narrow talker terms
+ *  without the bot-level switch; nothing else changes. */
+export function effectiveTalkerSchedulePolicy(
+  policy: TalkerSchedulePolicy,
+  isAssistantOwnerOfChat: boolean,
+): TalkerSchedulePolicy {
+  return policy.enabled || !isAssistantOwnerOfChat ? policy : { ...policy, enabled: true };
+}
+
 /** A task created under the talker policy. Read from the host authority
  *  record's task, never from the CLI-writable schedules.json projection. */
 export function isTalkerScheduledTask(task: Pick<ScheduledTask, 'ownerAccess'> | undefined): boolean {

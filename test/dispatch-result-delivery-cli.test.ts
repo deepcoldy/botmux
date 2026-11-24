@@ -57,4 +57,10 @@ describe('dispatch result delivery CLI guards', () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(error);
   });
+
+  it.each(['publish', 'publish-and-relay'])('rejects %s when --into has no verified dispatch binding', delivery => {
+    const result = run(['--bot-app', 'cli_worker', '--into', 'om_unregistered', '--result-delivery', delivery]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('没有指向本会话的有效派单绑定');
+  });
 });

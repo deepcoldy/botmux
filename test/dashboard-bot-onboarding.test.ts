@@ -1081,7 +1081,7 @@ describe('BotOnboardingManager', () => {
     });
     expect(started.ok).toBe(true);
     if (!started.ok) throw new Error(started.error);
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
 
     expect(createApp).not.toHaveBeenCalled();
     expect(registerApp).not.toHaveBeenCalled();
@@ -1239,7 +1239,7 @@ describe('BotOnboardingManager', () => {
     });
     expect(first.ok).toBe(true);
     if (!first.ok) throw new Error(first.error);
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(firstManager.get(first.job.id)?.status).toBe('waiting_for_platform_scan'));
     expect(firstManager.get(first.job.id)).toMatchObject({
       status: 'waiting_for_platform_scan',
       criticalScopeActivationRequired: true,
@@ -1275,6 +1275,10 @@ describe('BotOnboardingManager', () => {
       activationPending: true,
     });
     expect(existsSync(interruptedSessionPath)).toBe(false);
+    // Let the interrupted attempt release the per-app lock before starting its
+    // durable successor; production recovery cannot overtake an active predecessor.
+    firstGate.resolve();
+    await first.job.done;
     const second = secondManager.startPermissionRecovery({
       workingDir,
       predecessorJobId: 'bot_original',
@@ -1293,8 +1297,6 @@ describe('BotOnboardingManager', () => {
       liveStarted: true,
     });
 
-    firstGate.resolve();
-    await first.job.done;
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -2811,6 +2813,410 @@ describe('BotOnboardingManager', () => {
     expect(status?.liveStarted).toBe(false);
     expect(status?.liveStartMessage).toBe('pm2 down');
 
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('merges 1.0.0 and 1.0.1 approvalDeferredScopes, forwards excludeScopes, surfaces permission notice, and persists to bots.json', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-approval-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const seenAutoOpts: any[] = [];
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ email: 'owner@corp.com', user_id: 'ou_owner_web' }] },
+    });
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      createApp: async () => ({
+        ok: true,
+        appId: 'cli_web_compat',
+        appSecret: 'sec_web_compat',
+        brand: 'feishu',
+        sessionSource: 'botmux_cache',
+        sessionIdentity: { userId: 'u1', userName: 'Tester', email: 'owner@corp.com', tenantId: 't1', tenantName: 'Corp' },
+        approvalDeferredScopes: [
+          { bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' },
+        ],
+        approvalDisabledRefreshToken: true,
+        approvalCompatibility: {
+          triggered: true,
+          resolvedAutoApproved: true,
+          deferredScopes: [{ bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' }],
+          disabledRefreshToken: true,
+          initialHumanApprovers: ['张审核'],
+          remainingHumanApprovers: [],
+          probeCount: 3,
+          stopReason: 'resolved_exact',
+        },
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async opts => {
+        seenAutoOpts.push(opts);
+        return {
+          ...autoOk(),
+          approvalAutoPassed: true,
+          approvalDeferredScopes: [
+            { bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' },
+          ],
+          approvalCompatibility: {
+            triggered: true,
+            resolvedAutoApproved: true,
+            deferredScopes: [{ bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' }],
+            disabledRefreshToken: false,
+            initialHumanApprovers: ['李审核'],
+            remainingHumanApprovers: [],
+            probeCount: 5,
+            stopReason: 'resolved_exact',
+          },
+        };
+      },
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({ registrationMode: 'web' });
+    await job.done;
+
+    const status = manager.get(job.id);
+    expect(status?.status).toBe('completed');
+    // 1.0.0 暂缓的 offline_access 被透传给 1.0.1 的 excludeScopes，避免重复试探
+    expect(seenAutoOpts[0]?.excludeScopes).toEqual({ user: ['offline_access'] });
+    expect(status?.permission).toMatchObject({
+      ok: true,
+      approvalDisabledRefreshToken: true,
+      approvalInitialApprovers: ['李审核'],
+      approvalConsoleUrl: 'https://open.feishu.cn/app/cli_web_compat/auth',
+      approvalDeferredScopes: expect.arrayContaining([
+        expect.objectContaining({ bucket: 'user', name: 'offline_access' }),
+        expect.objectContaining({ bucket: 'tenant', name: 'im:message.group_msg' }),
+      ]),
+    });
+    const persisted = JSON.parse(readFileSync(botsJsonPath, 'utf8'));
+    expect(persisted[0]?.approvalDeferredScopes).toEqual({
+      tenant: ['im:message.group_msg'],
+      user: ['offline_access'],
+    });
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('preserves 1.0.0 approval diagnostics in the create-failure snapshot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-create-deferred-failure-'));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp: async () => ({
+        ok: false,
+        reason: 'api_error',
+        message: 'commit response lost',
+        appId: 'cli_create_failure',
+        approvalDeferredScopes: [{ bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' }],
+        approvalDisabledRefreshToken: true,
+        approvalCompatibility: {
+          triggered: true,
+          resolvedAutoApproved: true,
+          deferredScopes: [{ bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' }],
+          disabledRefreshToken: true,
+          initialHumanApprovers: ['审批人'],
+          remainingHumanApprovers: [],
+          probeCount: 2,
+          stopReason: 'resolved_exact',
+        },
+      }),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({ registrationMode: 'web' });
+    await job.done;
+
+    expect(manager.get(job.id)).toMatchObject({ status: 'failed', appId: 'cli_create_failure' });
+    expect(manager.get(job.id)?.permission).toMatchObject({
+      ok: false,
+      approvalDisabledRefreshToken: true,
+      approvalInitialApprovers: ['审批人'],
+      approvalConsoleUrl: 'https://open.feishu.cn/app/cli_create_failure/auth',
+      approvalDeferredScopes: [expect.objectContaining({ bucket: 'user', name: 'offline_access' })],
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('surfaces the approval console link when only refresh-token was disabled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-refresh-only-'));
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ email: 'owner@corp.com', user_id: 'ou_refresh_only' }] },
+    });
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp: async () => ({
+        ok: true,
+        appId: 'cli_refresh_only',
+        appSecret: 'sec',
+        brand: 'feishu',
+        sessionSource: 'botmux_cache',
+        sessionIdentity: { userId: 'u1', userName: 'Tester', email: 'owner@corp.com', tenantId: 't1', tenantName: 'Corp' },
+        approvalDisabledRefreshToken: true,
+        approvalCompatibility: {
+          triggered: true,
+          resolvedAutoApproved: true,
+          deferredScopes: [],
+          disabledRefreshToken: true,
+          initialHumanApprovers: ['审批人'],
+          remainingHumanApprovers: [],
+          probeCount: 1,
+          stopReason: 'resolved_exact',
+        },
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({ registrationMode: 'web' });
+    await job.done;
+
+    expect(manager.get(job.id)?.permission).toMatchObject({
+      ok: true,
+      approvalDisabledRefreshToken: true,
+      approvalConsoleUrl: 'https://open.feishu.cn/app/cli_refresh_only/auth',
+    });
+    expect(manager.get(job.id)?.permission?.approvalDeferredScopes).toBeUndefined();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('persists approvalDeferredScopes across the needs_owner -> submitOwner path', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-approval-owner-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      registerApp: async () => ({ ok: true, appId: 'cli_needs_owner_compat', appSecret: 'sec', brand: 'feishu', userOpenId: 'ou_bad' }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => ({
+        ...autoOk(),
+        approvalDeferredScopes: [
+          { bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' },
+        ],
+      }),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({ registrationMode: 'sdk' });
+    await job.done;
+    expect(manager.get(job.id)?.status).toBe('needs_owner');
+
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ email: 'owner@corp.com', user_id: 'ou_real' }] },
+    });
+    const submitted = await manager.submitOwner(job.id, ['owner@corp.com']);
+    expect(submitted.ok).toBe(true);
+
+    const persisted = JSON.parse(readFileSync(botsJsonPath, 'utf8'));
+    expect(persisted[0]?.approvalDeferredScopes).toEqual({
+      tenant: ['im:message.group_msg'],
+    });
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('permission recovery enables autoAvoidApproval and syncs updated approvalDeferredScopes to bots.json', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-recovery-approval-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_rec_compat',
+      larkAppSecret: 'sec_rec',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@corp.com'],
+      approvalDeferredScopes: { user: ['offline_access'] },
+    }]));
+    const seenOpts: any[] = [];
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      criticalScopeStableReads: 1,
+      criticalScopeMaxAttempts: 1,
+      criticalScopePollIntervalMs: 0,
+      automateOpenPlatform: async opts => {
+        seenOpts.push(opts);
+        return {
+          ...autoOk(),
+          approvalAutoPassed: true,
+          approvalDeferredScopes: [
+            { bucket: 'tenant', name: 'contact:user.base:readonly', isolation: 'exact', group: 'core_im' },
+          ],
+        };
+      },
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+      stopBotLive: async () => ({ ok: true, message: 'stopped' }),
+      startBotLive: async () => ({ ok: true, message: 'started' }),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'prev-job-1',
+      expectedAppId: 'cli_rec_compat',
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error('expected recovery job to start');
+    await started.job.done;
+
+    expect(seenOpts[0]?.autoAvoidApproval).toBe(true);
+    const persisted = JSON.parse(readFileSync(botsJsonPath, 'utf8'));
+    expect(persisted[0]?.approvalDeferredScopes).toEqual({
+      tenant: ['contact:user.base:readonly'],
+    });
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('persists and displays deferrals even when recovery commit outcome is failed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-recovery-deferred-failure-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_recover_failure',
+      larkAppSecret: 'secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+      approvalDeferredScopes: { user: ['offline_access'] },
+    }]));
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      automateOpenPlatform: async () => ({
+        ok: false,
+        reason: 'api_error',
+        message: 'commit response lost',
+        approvalAutoPassed: true,
+        approvalDeferredScopes: [{ bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' }],
+        approvalCompatibility: {
+          triggered: true,
+          resolvedAutoApproved: true,
+          deferredScopes: [{ bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' }],
+          disabledRefreshToken: false,
+          initialHumanApprovers: ['审批人'],
+          remainingHumanApprovers: [],
+          probeCount: 2,
+          stopReason: 'resolved_exact',
+        },
+      }),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_recover_failure',
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0].approvalDeferredScopes).toEqual({
+      tenant: ['im:message.group_msg'],
+      user: ['offline_access'],
+    });
+    expect(manager.get(started.job.id)?.permission).toMatchObject({
+      ok: false,
+      approvalConsoleUrl: 'https://open.feishu.cn/app/cli_recover_failure/auth',
+      approvalDeferredScopes: [expect.objectContaining({ name: 'im:message.group_msg' })],
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('respects autoAvoidApproval=false in Dashboard onboarding (1.0.0, 1.0.1, persisted bots.json) and permission recovery', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-optout-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-optout');
+    const seenCreateOpts: any[] = [];
+    const seenAutoOpts: any[] = [];
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ email: 'owner@corp.com', user_id: 'ou_optout' }] },
+    });
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      criticalScopeStableReads: 1,
+      criticalScopeMaxAttempts: 1,
+      criticalScopePollIntervalMs: 0,
+      createApp: async opts => {
+        seenCreateOpts.push(opts);
+        return {
+          ok: true,
+          appId: 'cli_optout',
+          appSecret: 'sec_optout',
+          brand: 'feishu',
+          sessionSource: 'botmux_cache',
+          sessionIdentity: { userId: 'u1', userName: 'Tester', email: 'owner@corp.com', tenantId: 't1', tenantName: 'Corp' },
+        };
+      },
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async opts => {
+        seenAutoOpts.push(opts);
+        return autoOk();
+      },
+      verifyCriticalScopes: async () => ({ ok: true, granted: [], missingCritical: [], missingOptional: [] }),
+      stopBotLive: async () => ({ ok: true, message: 'stopped' }),
+      startBotLive: async () => ({ ok: true, message: 'started' }),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({
+      registrationMode: 'web',
+      cliId: 'traex',
+      workingDir,
+      dirMode: 'fixed',
+      autoAvoidApproval: false,
+    });
+    await job.done;
+
+    expect(seenCreateOpts[0]?.autoAvoidApproval).toBe(false);
+    expect(seenAutoOpts[0]?.autoAvoidApproval).toBe(false);
+    const persisted = JSON.parse(readFileSync(botsJsonPath, 'utf8'));
+    expect(persisted[0]?.autoAvoidApproval).toBe(false);
+
+    // Permission recovery on the same bot also honors persisted autoAvoidApproval=false
+    const recovery = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: job.id,
+      expectedAppId: 'cli_optout',
+    });
+    expect(recovery.ok).toBe(true);
+    if (!recovery.ok) throw new Error('expected recovery job');
+    await recovery.job.done;
+    expect(seenAutoOpts[1]?.autoAvoidApproval).toBe(false);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('forwards autoAvoidApproval=false through ordinary SDK registration completion', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-sdk-optout-'));
+    const completeRegisteredApp = vi.fn(async (..._args: any[]) => autoOk());
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_sdk_optout',
+        appSecret: 's',
+        brand: 'feishu',
+        userOpenId: 'ou_sdk_optout',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      completeRegisteredApp,
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({ registrationMode: 'sdk', autoAvoidApproval: false });
+    await job.done;
+
+    expect(completeRegisteredApp).toHaveBeenCalledOnce();
+    expect(completeRegisteredApp.mock.calls[0]?.[3]).toEqual(expect.objectContaining({
+      autoAvoidApproval: false,
+    }));
     rmSync(dir, { recursive: true, force: true });
   });
 });

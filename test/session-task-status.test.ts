@@ -101,6 +101,20 @@ describe('deriveSessionTaskStatus', () => {
     expect(deriveSessionTaskStatus({ status: 'dormant', lastTurn: delivered(T0) })).toEqual({ kind: 'delivered', at: T0 });
   });
 
+  it('keeps a delivered result after a nonzero idle CLI exit, until new input invalidates it', () => {
+    const facts = { status: 'interrupted', lastMessageAt: T0 - 10, lastTurn: delivered(T0, 'done') };
+    expect(deriveSessionTaskStatus(facts)).toEqual({ kind: 'delivered', at: T0, summary: 'done' });
+    expect(deriveSessionTaskStatus({ ...facts, lastMessageAt: T0 + 1 }))
+      .toEqual({ kind: 'needs_you', reason: 'interrupted' });
+  });
+
+  it.each([undefined, 'agent'])('keeps blocking attention above a delivered result after CLI exit: %s', source => {
+    expect(deriveSessionTaskStatus({ status: 'interrupted', lastTurn: delivered(T0),
+      agentAttention: { reason: 'needs decision', at: T0, source },
+    })).toEqual({ kind: 'needs_you', reason: source === 'agent' ? 'attention' : 'interrupted',
+      detail: 'needs decision', at: T0 });
+  });
+
   it('never reports delivered when the result cannot be read', () => {
     const unreadable: unknown[] = [
       undefined,

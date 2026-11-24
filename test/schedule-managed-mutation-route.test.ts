@@ -11,7 +11,7 @@ import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/co
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 import { isUntilDoneClosed, UNTIL_DONE_NOTE_MAX_CHARS } from '../src/services/schedule-until-done.js';
 import { readManagedScheduleUpdate } from '../src/core/schedule-managed-update.js';
-import { isTalkerScheduledTask, talkerSchedulePolicy } from '../src/core/schedule-talker.js';
+import { effectiveTalkerSchedulePolicy, isTalkerScheduledTask, talkerSchedulePolicy } from '../src/core/schedule-talker.js';
 
 // A real directory: capabilityScheduleWorkingDir realpaths both sides.
 const REPO = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-repo-')));
@@ -82,6 +82,11 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     }),
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
   };
+  // Personal-assistant ownership of a chat: nobody owns one unless a test says so.
+  scope.isAssistantOwnerOfChat = vi.fn((_app: string, _chat: string, _type: string, _openId?: string): boolean => false);
+  scope.talkerSchedulePolicyFor = (appId: string, target: { chatId: string; chatType: string; openId?: string }) =>
+    effectiveTalkerSchedulePolicy(talkerSchedulePolicy(scope.getBot(appId).config),
+      scope.isAssistantOwnerOfChat(appId, target.chatId, target.chatType, target.openId));
   const run = new Function('scope', `with (scope) { ${code}; return handler; }`)(scope);
   return { ds, record, scheduler, authorizeScheduleSelfManage, scope, run: () => run({}, {}) };
 }
@@ -770,6 +775,16 @@ describe('talker-owned schedule management', () => {
     arrange(h);
     expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
     expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it('lets an assistant owner manage their own task without the talker switch', async () => {
+    const h = talkerOwnerHarness('remove');
+    h.scope.getBot = () => ({ config: {} });
+    h.scope.isAssistantOwnerOfChat = vi.fn((_app: string, _chat: string, _type: string, openId?: string) =>
+      openId === 'ou_talker');
+    expect((await h.run()).status).toBe(200);
+    expect(h.scheduler.removeTask).toHaveBeenCalledOnce();
+    expect(h.scope.isAssistantOwnerOfChat).toHaveBeenCalledWith('cli_target', 'oc_chat', 'group', 'ou_talker');
   });
 
   it('keeps an administrator able to manage a talker task even with the switch off', async () => {
