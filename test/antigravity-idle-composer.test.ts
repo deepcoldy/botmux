@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -162,6 +162,12 @@ describe('Antigravity adapter isSessionBusy screen reconciliation', () => {
   let previousHome: string | undefined;
   const cliSessionId = 'a164f906-bf70-4b02-92c8-28f4dc8d7306';
 
+  function resume(reattach = false) {
+    const adapter = createAntigravityAdapter();
+    adapter.buildArgs({ sessionId: 'test-resume', resume: true, resumeSessionId: cliSessionId, reattach });
+    return adapter;
+  }
+
   beforeEach(() => {
     tmpHome = mkdtempSync(join(tmpdir(), 'bmx-agy-home-'));
     previousHome = process.env.HOME;
@@ -174,6 +180,7 @@ describe('Antigravity adapter isSessionBusy screen reconciliation', () => {
       JSON.stringify({ source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'do work' }),
       JSON.stringify({
         source: 'MODEL',
+        step_index: 2,
         type: 'PLANNER_RESPONSE',
         status: 'DONE',
         tool_calls: [{ name: 'run_command', args: { CommandLine: '"git status"' } }],
@@ -197,7 +204,7 @@ describe('Antigravity adapter isSessionBusy screen reconciliation', () => {
   });
 
   it('releases when the live TUI shows an empty composer at the ready footer', () => {
-    const adapter = createAntigravityAdapter();
+    const adapter = resume();
     expect(adapter.isSessionBusy!({
       cliSessionId,
       getCurrentScreen: () => RESUMED_IDLE_SCREEN,
@@ -205,7 +212,7 @@ describe('Antigravity adapter isSessionBusy screen reconciliation', () => {
   });
 
   it('releases when only a bare empty composer is visible (interruption notice scrolled away)', () => {
-    const adapter = createAntigravityAdapter();
+    const adapter = resume();
     expect(adapter.isSessionBusy!({
       cliSessionId,
       getCurrentScreen: () => PLAIN_IDLE_SCREEN,
@@ -218,6 +225,29 @@ describe('Antigravity adapter isSessionBusy screen reconciliation', () => {
       cliSessionId,
       getCurrentScreen: () => RESUMED_IDLE_SCREEN.replace('Accept-edits mode', 'esc to cancel'),
     })).toBe(true);
+  });
+
+  it('protects a live tool call behind the type-ahead composer, including after reattachment', () => {
+    for (const adapter of [createAntigravityAdapter(), resume(true)]) {
+      expect(adapter.isSessionBusy!({ cliSessionId, getCurrentScreen: () => PLAIN_IDLE_SCREEN })).toBe(true);
+      expect(adapter.isSessionBusy!({ cliSessionId, isCliProcessAlive: () => false })).toBe(false);
+    }
+  });
+
+  it('stops treating the cold-resume transcript as stale as soon as agy appends work', () => {
+    const adapter = resume();
+    const probe = () => adapter.isSessionBusy!({ cliSessionId, getCurrentScreen: () => PLAIN_IDLE_SCREEN });
+    expect(probe()).toBe(false);
+    const path = join(tmpHome, '.gemini', 'antigravity-cli', 'brain', cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
+    appendFileSync(path, JSON.stringify({ type: 'CHECKPOINT' }) + '\n');
+    expect(probe()).toBe(false);
+    const full = join(path, '..', 'transcript_full.jsonl');
+    writeFileSync(full, JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 2, status: 'DONE', tool_calls: [{ name: 'run_command' }] }) + '\n');
+    expect(probe()).toBe(false);
+    appendFileSync(full, JSON.stringify({ type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'run_command' }] }) + '\n');
+    expect(probe()).toBe(true);
+    appendFileSync(full, JSON.stringify({ type: 'PLANNER_RESPONSE', content: 'done' }) + '\n');
+    expect(probe()).toBe(false);
   });
 
   it('homedir() points at the sandboxed HOME so the transcript is actually read', () => {

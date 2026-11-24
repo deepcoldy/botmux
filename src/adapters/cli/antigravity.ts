@@ -286,21 +286,23 @@ export function isAntigravityInterruptedScreen(screen: string): boolean {
  *  /close) can be parked at a fresh prompt while its transcript.jsonl still
  *  ends in a dangling USER_INPUT / PLANNER_RESPONSE(tool_calls) record from
  *  the killed turn; the transcript-only heuristic would then read "busy"
- *  forever and never release queued input. The live TUI is the authority: an
- *  empty composer means input can be delivered. */
+ *  forever and never release queued input. A ready composer alone cannot distinguish
+ *  that stale tail from a live turn accepting type-ahead. */
 export function isAntigravityIdleComposerScreen(screen: string): boolean {
   const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
   if (/esc to cancel/i.test(plain)) return false;
   return readyComposerRowAbove(plain) !== undefined || ERROR_COMPOSER_PATTERN.test(plain);
 }
 
-export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
-  if (!existsSync(transcriptPath)) return false;
+/** Identifies the latest unfinished lifecycle step. The compact and full
+ * transcripts of an agy conversation share step indices and timestamps. */
+function antigravityBusyStep(transcriptPath: string): string | undefined {
+  if (!existsSync(transcriptPath)) return undefined;
   try {
     const fd = openSync(transcriptPath, 'r');
     try {
       const stats = fstatSync(fd);
-      if (stats.size === 0) return false;
+      if (stats.size === 0) return undefined;
 
       // Expand until a lifecycle record is found. A complete checkpoint or
       // notification is not enough: the preceding tool call may be truncated
@@ -313,7 +315,9 @@ export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
         const text = buf.toString('utf-8');
         const rawLines = text.split('\n');
         const candidateLines = stats.size > chunkSize ? rawLines.slice(1) : rawLines;
+        let lineStart = stats.size;
         for (let i = candidateLines.length - 1; i >= 0; i--) {
+          lineStart -= Buffer.byteLength(candidateLines[i]) + (i < candidateLines.length - 1 ? 1 : 0);
           const line = candidateLines[i].trim();
           if (!line) continue;
           let rec: any;
@@ -325,12 +329,16 @@ export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
 
           const type = rec?.type;
           if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
-            return false;
+            return undefined;
           }
           if (type === 'SYSTEM_MESSAGE') {
             const content = String(rec?.content ?? '');
-            if (/cancell?ed|interrupted|aborted/i.test(content)) {
-              return false;
+            // A task callback may quote "Tool execution was canceled" while
+            // sibling tools still run. Only a turn-level notice ends the turn.
+            const payload = (content.match(/(?:^|\n)<SYSTEM_MESSAGE>\r?\n([^\n]*)/)?.[1] ?? content).trim();
+            if (/^(?:(?:the )?user |(?:the )?(?:turn|request) (?:was )?)?(?:cancell?ed|interrupted|aborted)\b/i.test(payload)
+              || /^\[Notice\] All your subagents and background tasks have been stopped due to server restart\./.test(payload)) {
+              return undefined;
             }
             // Non-cancel notifications do not dictate lifecycle state.
             continue;
@@ -338,11 +346,11 @@ export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
           if (type === 'CHECKPOINT' || type === 'TASK_NOTIFICATION') {
             continue;
           }
-          if (type === 'PLANNER_RESPONSE') {
-            return Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0;
-          }
-          if (type === 'GENERIC' || type === 'USER_INPUT') {
-            return true;
+          if (type === 'PLANNER_RESPONSE' && !(Array.isArray(rec.tool_calls) && rec.tool_calls.length)) return undefined;
+          if (type === 'PLANNER_RESPONSE' || type === 'GENERIC' || type === 'USER_INPUT') {
+            return Number.isSafeInteger(rec.step_index)
+              ? JSON.stringify([rec.step_index, type, rec.status, rec.created_at])
+              : JSON.stringify([transcriptPath, stats.ino, lineStart, type, rec.status]);
           }
         }
         if (chunkSize >= stats.size || chunkSize >= 1024 * 1024) break;
@@ -352,9 +360,13 @@ export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
       closeSync(fd);
     }
   } catch {
-    return false;
+    return undefined;
   }
-  return false;
+  return undefined;
+}
+
+export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
+  return antigravityBusyStep(transcriptPath) !== undefined;
 }
 
 /** Whether the transcript (read from its start, up to 1 MiB) records a
@@ -475,6 +487,9 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // The submitted conversation had no transcript yet, so everything agy later
   // writes there is post-submit (see transcriptCreatedAfterSubmit in writeInput).
   let submitTranscriptCreatedAfter = false;
+  // Only a newly launched --conversation process can inherit unfinished work
+  // from a dead predecessor. A reattached process can still be doing that work.
+  let coldResumeTail: { conversationId: string; step: string } | undefined;
   const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined => {
     const fromLog = sessionLog?.read().currentId;
     if (fromLog) return fromLog;
@@ -536,7 +551,11 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // strictly looks up an existing one. Without a stored cliSessionId,
       // start fresh; do NOT use `-c/--continue` because "most recent" is
       // racy when multiple botmux sessions run in parallel.
+      coldResumeTail = undefined;
       if (resume && resumeSessionId) {
+        const path = !reattach && resolveAntigravityTranscriptPath(resumeSessionId);
+        const step = path ? antigravityBusyStep(path) : undefined;
+        if (step !== undefined) coldResumeTail = { conversationId: resumeSessionId, step };
         knownCliSessionId = resumeSessionId;
         args.push('--conversation', resumeSessionId);
       } else {
@@ -718,11 +737,12 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     // passthrough commands (/effort, /compact, /model, …) off them.
     supportsTypeAhead: true,
     stuckPageFamily: 'antigravity',
-    isSessionBusy({ cliSessionId, getCurrentScreen }) {
+    isSessionBusy({ cliSessionId, getCurrentScreen, isCliProcessAlive }) {
+      if (isCliProcessAlive?.() === false) return false;
       if (cliSessionId) knownCliSessionId = cliSessionId;
+      const effectiveCid = cliSessionId ?? knownCliSessionId;
       if (lastConfirmedSubmitAtMs > 0) {
         const elapsed = Date.now() - lastConfirmedSubmitAtMs;
-        const effectiveCid = cliSessionId ?? knownCliSessionId;
         const graceTranscriptPath = effectiveCid ? resolveAntigravityTranscriptPath(effectiveCid) : null;
         if (graceTranscriptPath && preSubmitTranscriptSize === null) {
           // A transcript created after the submit holds only this input's
@@ -756,22 +776,18 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
           }
         }
       }
-      if (!cliSessionId) return false;
-      const transcriptPath = resolveAntigravityTranscriptPath(cliSessionId);
-      if (!transcriptPath || !isAntigravityTranscriptBusy(transcriptPath)) return false;
+      if (!effectiveCid) return false;
+      const transcriptPath = resolveAntigravityTranscriptPath(effectiveCid);
+      const step = transcriptPath ? antigravityBusyStep(transcriptPath) : undefined;
+      if (step === undefined) return false;
       try {
-        // The transcript lags reality when a turn was killed (e.g. /close
-        // mid tool call, worker crash) and the conversation is later resumed:
-        // its dangling last record reads "busy" forever while the live TUI is
-        // parked at an empty composer. Trust the viewport when it proves the
-        // CLI is waiting for input; stay conservative when no authoritative
-        // screen is available (no getter → non-authoritative backend).
         const screen = getCurrentScreen?.();
-        if (screen
-          && (isAntigravityIdleComposerScreen(screen)
-            || isAntigravityInterruptedScreen(screen))) {
-          return false;
-        }
+        if (screen && (isAntigravityInterruptedScreen(screen)
+          || ERROR_COMPOSER_PATTERN.test(stripAnsiScreenText(screen).replace(/\r\n/g, '\n')))) return false;
+        // The composer also accepts type-ahead between live tool calls. Only
+        // use it to dismiss work already present before a cold resume.
+        if (screen && coldResumeTail?.conversationId === effectiveCid && coldResumeTail.step === step
+          && isAntigravityIdleComposerScreen(screen)) return false;
       } catch { /* Missing viewport is not evidence of cancellation. */ }
       return true;
     },
