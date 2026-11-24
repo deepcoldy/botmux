@@ -100,6 +100,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   { method: 'POST', path: botPath('oncall-target/check'), upstream: '/api/bot-oncall-target/check', body: NO_BODY },
   // steward：`{ steward: {...} | null }`（管家开关、管家群、提示词追加/替换）。
   putBotConfig('steward', { kind: 'json', maxBytes: 64 * 1024 }),
+  // task-routing：`{ taskRouting: {...} | null }`（参与开关及画像配置）。
+  putBotConfig('task-routing', { kind: 'json', maxBytes: 64 * 1024 }),
   putBotConfig('owner-group-follow', { kind: 'json', maxBytes: 64 * 1024 }),
   // actor-owner-bindings：完整替换 target Bot 的 source Bot 双 ID → Owner 策略。
   putBotConfig('actor-owner-bindings'),

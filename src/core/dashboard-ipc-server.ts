@@ -7195,11 +7195,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/start', async (_req, res, params) => 
 // 会话。aggregator 建完群后按模式(一起开工/lead 分配)对每个目标 bot 的 daemon 调一次。
 ipcRoute('POST', '/api/sessions/spawn', requireBoundBot(async (req, res) => {
   const activeSessions = getActiveSessionsRegistry();
-  if (!activeSessions) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
+  if (!activeSessions) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable', accepted: false });
   let body: unknown;
-  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json', accepted: false }); }
   const parsed = parseSpawnRequest(body);
-  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error, accepted: false });
   const postBanner = !!(body as any).postBanner;
   return withBotTurnAdmission(cachedLarkAppId, async () => {
   let attachments;
@@ -7207,7 +7207,7 @@ ipcRoute('POST', '/api/sessions/spawn', requireBoundBot(async (req, res) => {
     attachments = materializeDashboardImages(cachedLarkAppId, parsed.value.images);
   } catch (err: any) {
     logger.error(`[createSession] failed to persist Dashboard images: ${err?.message ?? err}`);
-    return jsonRes(res, 500, { ok: false, error: 'image_store_failed' });
+    return jsonRes(res, 500, { ok: false, error: 'image_store_failed', accepted: false });
   }
   const r = await spawnDashboardSession(activeSessions, undefined, {
     larkAppId: cachedLarkAppId,
@@ -14266,11 +14266,11 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
       roleProfileId?: string;
     }>(req);
   } catch {
-    return jsonRes(res, 400, { error: 'bad_json' });
+    return jsonRes(res, 400, { error: 'bad_json', accepted: false });
   }
   const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
   if (!Array.isArray(body.larkAppIds) || !body.larkAppIds.every(x => typeof x === 'string')) {
-    return jsonRes(res, 400, { error: 'larkAppIds_required' });
+    return jsonRes(res, 400, { error: 'larkAppIds_required', accepted: false });
   }
   // userOpenIds, transferOwnerTo, notifyOwnerOpenId are optional; pre-validated
   // upstream by the dashboard route. All open_ids MUST be in the calling bot's
@@ -14288,7 +14288,7 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     : null;
   if (body.transferOwnerUnionId !== undefined
     && (!transferOwnerUnionId || !transferOwnerUnionId.startsWith('on_') || !ownerUnionIds.includes(transferOwnerUnionId))) {
-    return jsonRes(res, 400, { ok: false, error: 'invalid_transfer_owner_union_id' });
+    return jsonRes(res, 400, { ok: false, error: 'invalid_transfer_owner_union_id', accepted: false });
   }
   const transferTo = typeof body.transferOwnerTo === 'string' && body.transferOwnerTo.trim()
     ? body.transferOwnerTo.trim()
@@ -14300,20 +14300,21 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     ? body.roleProfileId.trim()
     : null;
   if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
-    return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
+    return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id', accepted: false });
   }
   // Optional (design 2026-11-03 workflow-dashboard-orchestration §8): a topic
   // group, and the talk-only grant matrix between the bots that joined (what
   // CLI create-group writes). Absent → today's behaviour, byte for byte.
   const groupCreationExtras = parseGroupCreateExtras(body);
-  if (!groupCreationExtras.ok) return jsonRes(res, 400, { ok: false, error: groupCreationExtras.error });
+  if (!groupCreationExtras.ok) return jsonRes(res, 400, { ok: false, error: groupCreationExtras.error, accepted: false });
   const bindWorkingDir = typeof body.bindWorkingDir === 'string' ? body.bindWorkingDir.trim() : '';
   let bindResolvedPath: string | undefined;
   if (bindWorkingDir) {
     const v = validateWorkingDir(bindWorkingDir);
-    if (!v.ok) return jsonRes(res, 400, { ok: false, error: v.error });
+    if (!v.ok) return jsonRes(res, 400, { ok: false, error: v.error, accepted: false });
     bindResolvedPath = v.resolvedPath;
   }
+  let createdChatId: string | undefined;
   try {
     const r = await createGroupWithBots({
       creatorLarkAppId: cachedLarkAppId,
@@ -14326,6 +14327,7 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
       notifyOwnerOpenId: notifyTo ?? undefined,
       bindWorkingDir: bindWorkingDir || undefined,
       roleProfileId: roleProfileId ?? undefined,
+      onChatCreated: chatId => { createdChatId = chatId; },
       ...(groupCreationExtras.chatMode ? { chatMode: groupCreationExtras.chatMode } : {}),
       ...(groupCreationExtras.botCollaboration
         ? { ensureBotCollaboration: async (chatId: string, joined: string[]) => { await ensureLocalBotChatGrantMatrix(chatId, joined); } }
@@ -14333,7 +14335,13 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     });
     jsonRes(res, 200, bindResolvedPath ? { ...r, bindResolvedPath } : r);
   } catch (e) {
-    jsonRes(res, 502, { ok: false, error: String((e as Error).message ?? e) });
+    // No `accepted:false` here: createChat may already have committed. Preserve
+    // the id when the service reached its post-create checkpoint for recovery.
+    jsonRes(res, 502, {
+      ok: false,
+      error: String((e as Error).message ?? e),
+      ...(createdChatId ? { chatId: createdChatId } : {}),
+    });
   }
 }));
 

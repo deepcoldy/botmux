@@ -237,7 +237,7 @@ function defaultRunOneShot(options: BotOneShotExecOptions): Promise<
     });
 
     child.once('error', err => {
-      if (reapTimer) clearTimeout(reapTimer);
+      if (!timedOut && reapTimer) clearTimeout(reapTimer);
       finish({
         ok: false,
         errorCode: 'matcher_exec_failed',
@@ -246,8 +246,10 @@ function defaultRunOneShot(options: BotOneShotExecOptions): Promise<
     });
 
     child.once('close', (code, signal) => {
-      if (reapTimer) clearTimeout(reapTimer);
+      // A wrapper can close its pipes after SIGTERM while a stdio-detached
+      // grandchild is still alive. Keep the SIGKILL escalation armed in that case.
       if (timedOut) return;
+      if (reapTimer) clearTimeout(reapTimer);
       const stdout = Buffer.concat(stdoutChunks).toString('utf8');
       const stderr = Buffer.concat(stderrChunks).toString('utf8');
       // Fail-closed: never accept stdout from a crashed or signal-terminated CLI process.

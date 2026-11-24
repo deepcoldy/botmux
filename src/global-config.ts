@@ -23,6 +23,7 @@ import { parseVolcengineConfig } from './services/voice/volcengine-config.js';
 import type { VcMeetingConsumerProfileConfig } from './types.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { assertDurableConfigMutationAllowed } from './services/durable-config-mutation.js';
+import { withFileLockSync } from './utils/file-lock.js';
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, type EnvLayer, type EnvOp } from './core/session-env.js';
@@ -1642,12 +1643,39 @@ export function readGlobalTaskRoutingConfig(): TaskRoutingGlobalConfig | undefin
   return readGlobalTaskRoutingConfigLive();
 }
 
-/** Validate and persist global `taskRouting` configuration (null clears the block). */
-export function writeGlobalTaskRoutingConfig(
-  raw: unknown,
-): { ok: true; value: TaskRoutingGlobalConfig | undefined } | { ok: false; reason: string } {
+type TaskRoutingConfigWriteResult =
+  | { ok: true; value: TaskRoutingGlobalConfig | undefined }
+  | { ok: false; reason: string };
+
+function withTaskRoutingConfigLock<T>(fn: () => T): T {
+  const path = globalConfigPath();
+  mkdirSync(dirname(path), { recursive: true });
+  return withFileLockSync(path, fn);
+}
+
+function writeGlobalTaskRoutingConfigUnlocked(raw: unknown): TaskRoutingConfigWriteResult {
   const validated = validateGlobalTaskRoutingConfig(raw);
   if (!validated.ok) return validated;
   mergeGlobalConfig({ taskRouting: validated.value });
   return { ok: true, value: readGlobalConfig().taskRouting };
+}
+
+/** Validate and persist global `taskRouting` configuration (null clears the block).
+ *  Full writes and PATCHes share the same cross-process config.json lock. */
+export function writeGlobalTaskRoutingConfig(raw: unknown): TaskRoutingConfigWriteResult {
+  return withTaskRoutingConfigLock(() => writeGlobalTaskRoutingConfigUnlocked(raw));
+}
+
+/** Apply only explicitly supplied fields to the latest on-disk taskRouting block.
+ *  Reading a Dashboard snapshot before this call cannot overwrite a concurrent
+ *  advanced edit: the sibling merge happens after acquiring the shared lock. */
+export function patchGlobalTaskRoutingConfig(raw: unknown): TaskRoutingConfigWriteResult {
+  if (raw === null) return writeGlobalTaskRoutingConfig(null);
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).length === 0) {
+    return { ok: false, reason: 'taskRouting patch must be a non-empty object or null' };
+  }
+  return withTaskRoutingConfigLock(() => {
+    const latest = readGlobalTaskRoutingConfigFromRaw(readRawConfig().taskRouting) ?? {};
+    return writeGlobalTaskRoutingConfigUnlocked({ ...latest, ...raw as Record<string, unknown> });
+  });
 }

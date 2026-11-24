@@ -488,6 +488,34 @@ describe('bot one-shot matcher parsing and ref resolution', () => {
         let alive = false;
         try { process.kill(gpid, 0); alive = true; } catch { alive = false; }
         expect(alive).toBe(false);
+
+        // 3. Wrapper exits on SIGTERM while a stdio-detached grandchild ignores it:
+        // early close must not cancel the pending SIGKILL escalation.
+        const detachedPidFile = join(dir, 'detached-grandchild.pid');
+        const earlyCloseScript = join(dir, 'early-close-wrapper.sh');
+        writeFileSync(
+          earlyCloseScript,
+          `#!/bin/sh\ntrap 'exit 0' TERM\nsh -c 'trap "" TERM; echo $$ > "${detachedPidFile}"; exec sleep 30' </dev/null >/dev/null 2>&1 &\nwait $!\n`,
+          { mode: 0o755 },
+        );
+        let detachedGpid = 0;
+        try {
+          const detachedRes = await runBotOneShotMatcher(req, {
+            botConfig: { larkAppId: 'cli_j', larkAppSecret: 's', cliId: 'claude-code', cliPathOverride: earlyCloseScript } as BotConfig,
+            timeoutMs: 1_000,
+            allowOneShot: () => true,
+          });
+          expect(detachedRes.ok).toBe(false);
+          await new Promise(r => setTimeout(r, 1_300));
+          detachedGpid = Number(readFileSync(detachedPidFile, 'utf8').trim());
+          let detachedAlive = false;
+          try { process.kill(detachedGpid, 0); detachedAlive = true; } catch { detachedAlive = false; }
+          expect(detachedAlive).toBe(false);
+        } finally {
+          if (detachedGpid > 1) {
+            try { process.kill(detachedGpid, 'SIGKILL'); } catch { /* already reaped */ }
+          }
+        }
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });

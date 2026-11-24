@@ -1162,6 +1162,7 @@ function BotDefaultsCard(props: {
           <BdTabGrid>
             <section className="bd-tile" id={botDefaultsSectionDomId('session-mode')}><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('steward')}><StewardSection bot={bot} patchBot={patchBot} active={props.activeTab === 'sessions'} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('task-routing')}><TaskRoutingSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('substitute')}><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('command-trigger')}><CommandTriggerSection bot={bot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('cross-bot')}>
@@ -7500,6 +7501,44 @@ function SessionModeSection(props: {
         </div>
         <div className="actions"><StatusSpan status={docStatus} attr={{ 'data-doc-subscribe-mode-status': '' }} /></div>
       </div>
+    </section>
+  );
+}
+
+/** Per-bot participation switch. Advanced cost/profile fields round-trip unchanged. */
+export function TaskRoutingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const current = props.bot.taskRouting ?? null;
+  const ineligible = props.bot.apiOnly === true || props.bot.steward?.enabled === true;
+
+  async function save(enabled: boolean): Promise<void> {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/task-routing`, {
+        taskRouting: { ...current, enabled },
+      }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.taskRoutingSaved'),
+      onSaved: body => {
+        props.patchBot(props.bot.larkAppId, { taskRouting: body.taskRouting ?? null });
+      },
+    });
+  }
+
+  return (
+    <section className="bd-section" data-task-routing-section>
+      <ToggleRow
+        checked={current?.enabled === true}
+        disabled={busy || ineligible}
+        dataAction="toggle-task-routing"
+        title={tr('botDefaults.taskRoutingEnabled')}
+        help={tr('botDefaults.taskRoutingEnabledHelp')}
+        description={ineligible ? tr('botDefaults.taskRoutingIneligible') : undefined}
+        onChange={checked => { void save(checked); }}
+      />
+      <div className="bd-mode-group-side"><StatusSpan status={status} attr={{ 'data-task-routing-status': '' }} /></div>
     </section>
   );
 }

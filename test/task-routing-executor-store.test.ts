@@ -560,6 +560,270 @@ describe('TaskRoutingStore lazy creation & executeTaskRoutingRun fallback', () =
     }
   });
 
+  it('fails closed on group-create reset/missing chatId and retained spawn openings', async () => {
+    const dataDir = makeDataDir();
+    const store = new TaskRoutingStore(dataDir);
+    const events: string[] = [];
+    let mode: 'create_reset' | 'create_missing_chat_id' | 'spawn_retained_opening' = 'create_reset';
+
+    const srv = createServer(async (req, res) => {
+      try {
+        if (req.url === '/api/bot-default-oncall') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ resolvedAllowedUsers: ['ou_owner'] }));
+          return;
+        }
+        if (req.url === '/api/groups/create') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(chunk as Buffer);
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          events.push(`BODY:create:${body.larkAppIds[0]}`);
+          if (mode === 'create_reset') {
+            req.socket.destroy();
+            return;
+          }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(mode === 'create_missing_chat_id'
+            ? { ok: true }
+            : { ok: true, chatId: 'oc_created_1' }));
+          return;
+        }
+        if (req.url === '/api/sessions/spawn') {
+          events.push('POST:spawn');
+          res.writeHead(500, { 'content-type': 'application/json' });
+          // Same shape as the real retained-opening path in spawnDashboardSession.
+          res.end(JSON.stringify({ ok: false, error: 'fallback fork unavailable' }));
+          return;
+        }
+        res.writeHead(404).end();
+      } catch { /* the reset case has no response channel left */ }
+    });
+    await new Promise<void>(resolve => srv.listen(0, '127.0.0.1', () => resolve()));
+    const port = (srv.address() as AddressInfo).port;
+
+    try {
+      const dispatcher = createHostGroupDispatcher({
+        secret: 'test-secret',
+        discoverDaemons: () => [
+          { larkAppId: 'cli_first', ipcPort: port },
+          { larkAppId: 'cli_second', ipcPort: port },
+        ],
+        fetchIpc: fetchDaemonIpc,
+        groupCreateTimeoutMs: 500,
+        spawnTimeoutMs: 500,
+      });
+      const { eligible } = evaluateCandidates([
+        makeSnapshot('cli_first', 'First', 'low'),
+        makeSnapshot('cli_second', 'Second', 'high'),
+      ], {}, NOW);
+
+      for (const scenario of ['create_reset', 'create_missing_chat_id', 'spawn_retained_opening'] as const) {
+        mode = scenario;
+        events.length = 0;
+        const out = await executeTaskRoutingRun({
+          mode: 'group',
+          task: `at-most-once ${scenario}`,
+          callerKind: 'host_cli',
+          constraints: {},
+          decision: {
+            selectedAppId: 'cli_first',
+            selectedName: 'First',
+            fallbackOrder: ['cli_first', 'cli_second'],
+            matcherKind: 'rule',
+            confidence: 'medium',
+            reason: 'rule',
+            candidates: eligible,
+            excluded: [],
+          },
+        }, { store, now: () => NOW, dispatchCandidate: dispatcher });
+
+        expect(out.ok).toBe(false);
+        expect(out.record.attempts).toHaveLength(1);
+        expect(out.record.attempts[0]?.appId).toBe('cli_first');
+        expect(events.filter(e => e.startsWith('BODY:create:'))).toEqual(['BODY:create:cli_first']);
+        expect(events.filter(e => e === 'BODY:create:cli_second')).toHaveLength(0);
+        if (scenario === 'spawn_retained_opening') {
+          expect(out.record.error).toContain('spawn_delivery_unknown');
+          expect(out.chatId).toBe('oc_created_1');
+        }
+      }
+    } finally {
+      srv.closeAllConnections?.();
+      await new Promise<void>(resolve => srv.close(() => resolve()));
+    }
+  });
+
+  it('falls back only when the target explicitly proves pre-acceptance refusal', async () => {
+    const dataDir = makeDataDir();
+    const store = new TaskRoutingStore(dataDir);
+    const events: string[] = [];
+    let mode: 'group_refusal' | 'spawn_refusal' = 'group_refusal';
+    const srv = createServer(async (req, res) => {
+      if (req.url === '/api/bot-default-oncall') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ resolvedAllowedUsers: ['ou_owner'] }));
+        return;
+      }
+      if (req.url === '/api/groups/create') {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const appId = body.larkAppIds[0] as string;
+        events.push(`create:${appId}`);
+        if (mode === 'group_refusal' && appId === 'cli_first') {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid working dir', accepted: false }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, chatId: `oc_${appId}` }));
+        return;
+      }
+      if (req.url === '/api/sessions/spawn') {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        events.push(`spawn:${body.chatId}`);
+        if (mode === 'spawn_refusal' && body.chatId === 'oc_cli_first') {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'rolled back before accept', accepted: false }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, sessionId: 'sess_second' }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>(resolve => srv.listen(0, '127.0.0.1', () => resolve()));
+    const port = (srv.address() as AddressInfo).port;
+
+    try {
+      const dispatcher = createHostGroupDispatcher({
+        secret: 'test-secret',
+        discoverDaemons: () => [
+          { larkAppId: 'cli_first', ipcPort: port },
+          { larkAppId: 'cli_second', ipcPort: port },
+        ],
+        fetchIpc: fetchDaemonIpc,
+      });
+      const { eligible } = evaluateCandidates([
+        makeSnapshot('cli_first', 'First', 'low'),
+        makeSnapshot('cli_second', 'Second', 'high'),
+      ], {}, NOW);
+      for (const scenario of ['group_refusal', 'spawn_refusal'] as const) {
+        mode = scenario;
+        events.length = 0;
+        const out = await executeTaskRoutingRun({
+          mode: 'group', task: `safe refusal ${scenario}`, callerKind: 'host_cli', constraints: {},
+          decision: {
+            selectedAppId: 'cli_first', selectedName: 'First', fallbackOrder: ['cli_first', 'cli_second'],
+            matcherKind: 'rule', confidence: 'medium', reason: 'rule', candidates: eligible, excluded: [],
+          },
+        }, { store, now: () => NOW, dispatchCandidate: dispatcher });
+        expect(out.ok).toBe(true);
+        expect(out.record.outcome).toBe('fallback_dispatched');
+        expect(events).toContain('create:cli_first');
+        expect(events).toContain('create:cli_second');
+        expect(events).toContain('spawn:oc_cli_second');
+      }
+    } finally {
+      srv.closeAllConnections?.();
+      await new Promise<void>(resolve => srv.close(() => resolve()));
+    }
+  });
+
+  it('surfaces a settlement warning instead of hiding a pending terminal write', async () => {
+    const dataDir = makeDataDir();
+    const store = new TaskRoutingStore(dataDir);
+    store.settlePendingRecord = () => false;
+    const { eligible } = evaluateCandidates([makeSnapshot('cli_first', 'First', 'low')], {}, NOW);
+    const out = await executeTaskRoutingRun({
+      mode: 'group', task: 'terminal write warning', callerKind: 'host_cli', constraints: {},
+      decision: {
+        selectedAppId: 'cli_first', selectedName: 'First', fallbackOrder: ['cli_first'],
+        matcherKind: 'rule', confidence: 'medium', reason: 'rule', candidates: eligible, excluded: [],
+      },
+    }, {
+      store,
+      now: () => NOW,
+      dispatchCandidate: async () => ({ ok: true, chatId: 'oc_created_1', sessionId: 'sess_1' }),
+    });
+
+    expect(out.ok).toBe(true);
+    expect(out.settlementWarning).toContain('任务已派发');
+    expect(out.settlementWarning).toContain('pending');
+    expect(store.getRecord(out.record.id)?.outcome).toBe('pending');
+  });
+
+  it('warns and returns the real record when a competing terminal has the same outcome but different content', async () => {
+    const dataDir = makeDataDir();
+    const store = new TaskRoutingStore(dataDir);
+    const competitor = new TaskRoutingStore(dataDir);
+    const { eligible } = evaluateCandidates([makeSnapshot('cli_first', 'First', 'low')], {}, NOW);
+    const out = await executeTaskRoutingRun({
+      mode: 'group', task: 'competing terminal payload', callerKind: 'host_cli', constraints: {},
+      decision: {
+        selectedAppId: 'cli_first', selectedName: 'First', fallbackOrder: ['cli_first'],
+        matcherKind: 'rule', confidence: 'medium', reason: 'rule', candidates: eligible, excluded: [],
+      },
+    }, {
+      store,
+      now: () => NOW,
+      createRecordId: () => 'tr_competing_terminal',
+      dispatchCandidate: async () => {
+        expect(competitor.settlePendingRecord('tr_competing_terminal', {
+          selectedAppId: 'cli_first', selectedName: 'First',
+          attempts: [{ appId: 'cli_first', name: 'First', outcome: 'dispatched', reason: 'competitor', at: NOW }],
+          outcome: 'dispatched', targetChatId: 'oc_competitor', targetSessionId: 'sess_competitor',
+          targetRootMessageId: null, error: null, updatedAt: NOW,
+        })).toBe(true);
+        return { ok: true, chatId: 'oc_actual', sessionId: 'sess_actual' };
+      },
+    });
+
+    expect(out.ok).toBe(true);
+    expect(out.settlementWarning).toContain('终态回写失败');
+    expect(out.chatId).toBe('oc_actual');
+    expect(out.record.targetChatId).toBe('oc_competitor');
+    expect(out.record.targetSessionId).toBe('sess_competitor');
+    expect(store.getRecord(out.record.id)?.targetChatId).toBe('oc_competitor');
+  });
+
+  it('accepts an idempotent duplicate only when the complete terminal payload matches', async () => {
+    const dataDir = makeDataDir();
+    const store = new TaskRoutingStore(dataDir);
+    const competitor = new TaskRoutingStore(dataDir);
+    const { eligible } = evaluateCandidates([makeSnapshot('cli_first', 'First', 'low')], {}, NOW);
+    const out = await executeTaskRoutingRun({
+      mode: 'group', task: 'idempotent terminal payload', callerKind: 'host_cli', constraints: {},
+      decision: {
+        selectedAppId: 'cli_first', selectedName: 'First', fallbackOrder: ['cli_first'],
+        matcherKind: 'rule', confidence: 'medium', reason: 'rule', candidates: eligible, excluded: [],
+      },
+    }, {
+      store,
+      now: () => NOW,
+      createRecordId: () => 'tr_idempotent_terminal',
+      dispatchCandidate: async () => {
+        expect(competitor.settlePendingRecord('tr_idempotent_terminal', {
+          selectedAppId: 'cli_first', selectedName: 'First',
+          attempts: [{
+            appId: 'cli_first', name: 'First', outcome: 'dispatched', reason: '首选命中并成功派发',
+            at: NOW, chatId: 'oc_actual', sessionId: 'sess_actual',
+          }],
+          outcome: 'dispatched', targetChatId: 'oc_actual', targetSessionId: 'sess_actual',
+          targetRootMessageId: null, error: null, updatedAt: NOW,
+        })).toBe(true);
+        return { ok: true, chatId: 'oc_actual', sessionId: 'sess_actual' };
+      },
+    });
+
+    expect(out.ok).toBe(true);
+    expect(out.settlementWarning).toBeUndefined();
+    expect(out.record.targetChatId).toBe('oc_actual');
+  });
+
   it('preserves in-flight pending records across retention pruning, survives onChatCreated store errors, and handles 0-byte db files', async () => {
     const dataDir = makeDataDir();
     const store = new TaskRoutingStore(dataDir, { maxRecords: 10 });
@@ -618,6 +882,7 @@ describe('TaskRoutingStore lazy creation & executeTaskRoutingRun fallback', () =
         return store.updateRecord(id, patch);
       },
       getRecord: (id: string) => store.getRecord(id),
+      settlePendingRecord: (id: string, patch: any) => store.settlePendingRecord(id, patch),
     }) as TaskRoutingStore;
     const snaps = [makeSnapshot('cli_a', 'A', 'low')];
     const { eligible } = evaluateCandidates(snaps, {}, NOW);

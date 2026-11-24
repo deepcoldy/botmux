@@ -68,8 +68,8 @@ export const ASSIGN_HELP_TEXT = `botmux assign — 智能任务分配（结合�
       查看最近的分配记录、排除原因与兜底链路
 
 说明:
-  - 默认关闭：需先在 ~/.botmux/config.json 开启 taskRouting.enabled=true，
-    并在目标 Bot 配置中开启 taskRouting.enabled=true（管家与 apiOnly 默认排除）。
+  - 默认关闭：需先在 Dashboard 设置开启全局「Bot 任务分配」，并在目标 Bot 配置中开启「参与自动任务分配」
+    （也可在配置文件中设置 taskRouting.enabled=true；管家与 apiOnly 默认排除）。
   - --mode group（默认）：在目标 Bot 上新建任务群并直接开工（复用 Bot 的 autoWorktree）。
   - --mode topic：在已有群内委派给 botmux dispatch 开子话题派发。
   - <bot> 引用支持 larkAppId、显示名或唯一 CLI 名；重名时请用 larkAppId。
@@ -306,6 +306,7 @@ export function formatAssignRun(result: {
   rootMessageId?: string;
   shareLink?: string | null;
   error?: string;
+  settlementWarning?: string;
 }): string {
   const r = result.record;
   const lines: string[] = [
@@ -316,6 +317,7 @@ export function formatAssignRun(result: {
     `理由：${r.reason}`,
   ];
   if (result.chatId) lines.push(`目标群：${result.chatId}${result.shareLink ? ` (${result.shareLink})` : ''}`);
+  if (result.settlementWarning) lines.push(`⚠️ ${result.settlementWarning}`);
   if (result.sessionId) lines.push(`目标会话：${result.sessionId}`);
   if (result.rootMessageId) lines.push(`目标话题根：${result.rootMessageId}`);
   if (r.attempts.length > 0) {

@@ -10,7 +10,7 @@
 
 import type { BotConfig } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
-import { readGlobalTaskRoutingConfigLive } from '../../global-config.js';
+import { isTaskRoutingEnabled, readGlobalTaskRoutingConfig } from '../../global-config.js';
 import { resolveBotmuxDataDir } from '../data-dir.js';
 import { TaskRoutingStore } from '../../services/task-routing-store.js';
 import { runBotOneShotMatcher, type BotOneShotRunner } from './bot-matcher.js';
@@ -74,7 +74,13 @@ export class TaskRoutingError extends Error {
 }
 
 function getGlobalConfig(deps: TaskRoutingServiceDeps): TaskRoutingGlobalConfig | undefined {
-  return (deps.readGlobalTaskRouting ?? readGlobalTaskRoutingConfigLive)();
+  return (deps.readGlobalTaskRouting ?? readGlobalTaskRoutingConfig)();
+}
+
+function isEnabled(deps: TaskRoutingServiceDeps): boolean {
+  return deps.readGlobalTaskRouting
+    ? deps.readGlobalTaskRouting()?.enabled === true
+    : isTaskRoutingEnabled();
 }
 
 export function assertTaskRoutingEnabled(deps: TaskRoutingServiceDeps): TaskRoutingGlobalConfig {
@@ -82,7 +88,7 @@ export function assertTaskRoutingEnabled(deps: TaskRoutingServiceDeps): TaskRout
   if (cfg?.enabled !== true) {
     throw new TaskRoutingError(
       'task_routing_disabled',
-      '任务分配功能默认关闭。请在 ~/.botmux/config.json 中设置 {"taskRouting":{"enabled":true}} 后再使用。',
+      '任务分配功能默认关闭。请在 Dashboard 设置中开启「Bot 任务分配」，或在 ~/.botmux/config.json 中设置 {"taskRouting":{"enabled":true}} 后再使用。',
       403,
     );
   }
@@ -292,7 +298,7 @@ export async function runTaskRouting(
     {
       store,
       now: deps.now,
-      isRoutingStillEnabled: () => getGlobalConfig(deps)?.enabled === true,
+      isRoutingStillEnabled: () => isEnabled(deps),
       preflightCandidate,
       dispatchCandidate,
     },
@@ -342,8 +348,7 @@ export async function preflightTaskRoutingCandidate(
   },
   deps: TaskRoutingServiceDeps = {},
 ): Promise<{ allowed: true } | { allowed: false; abortAll: boolean; reason: string }> {
-  const cfg = getGlobalConfig(deps);
-  if (cfg?.enabled !== true) {
+  if (!isEnabled(deps)) {
     return {
       allowed: false,
       abortAll: true,

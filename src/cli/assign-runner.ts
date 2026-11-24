@@ -62,6 +62,7 @@ export interface TopicDispatchExecutor {
     title: string;
     task: string;
     chatId?: string;
+    workingDir?: string;
     sessionId: string;
   }): Promise<CandidateDispatchResult>;
 }
@@ -97,6 +98,7 @@ export function createCliTopicDispatcher(cliEntryPath = process.argv[1] ?? ''): 
       '--bot-app', input.targetAppId,
       '--brief', input.task,
       '--session-id', input.sessionId,
+      ...(input.workingDir ? ['--repo', input.workingDir] : []),
       ...(input.chatId ? ['--chat-id', input.chatId] : []),
     ];
     const { command, args } = resolveCliSpawn(cliEntryPath, subArgs);
@@ -288,11 +290,16 @@ export async function runAssignCommand(argv: readonly string[], deps: AssignComm
       // Group run returns HTTP 200 with ok:false when all candidates failed cleanly.
       if (args.subcommand === 'run' && resp.body.record) {
         const record = resp.body.record as TaskRoutingRecord;
+        const settlementWarning = typeof resp.body.settlementWarning === 'string'
+          ? resp.body.settlementWarning
+          : undefined;
+        if (settlementWarning) errOut(`botmux assign: 警告：${settlementWarning}`);
         const result = {
           ok: false,
           record,
           chatId: typeof resp.body.chatId === 'string' ? resp.body.chatId : undefined,
           error: typeof resp.body.error === 'string' ? resp.body.error : record.error,
+          ...(settlementWarning ? { settlementWarning } : {}),
         };
         out(args.json ? JSON.stringify(result, null, 2) : formatAssignRun(result));
         return 1;
@@ -398,6 +405,7 @@ export async function runAssignCommand(argv: readonly string[], deps: AssignComm
             title,
             task: taskText,
             chatId: args.chatId,
+            workingDir: args.workingDir,
             sessionId: detectedSessionId,
           });
         } catch (err) {
@@ -527,6 +535,9 @@ export async function runAssignCommand(argv: readonly string[], deps: AssignComm
       return finalOk && !settlementWarning ? 0 : 1;
     }
 
+    const settlementWarning = typeof resp.body.settlementWarning === 'string'
+      ? resp.body.settlementWarning
+      : undefined;
     const groupResult = {
       ok: resp.body.ok === true,
       record: resp.body.record as TaskRoutingRecord,
@@ -534,9 +545,11 @@ export async function runAssignCommand(argv: readonly string[], deps: AssignComm
       sessionId: typeof resp.body.sessionId === 'string' ? resp.body.sessionId : undefined,
       shareLink: typeof resp.body.shareLink === 'string' ? resp.body.shareLink : null,
       error: typeof resp.body.error === 'string' ? resp.body.error : undefined,
+      ...(settlementWarning ? { settlementWarning } : {}),
     };
     out(args.json ? JSON.stringify(groupResult, null, 2) : formatAssignRun(groupResult));
-    return groupResult.ok ? 0 : 1;
+    if (settlementWarning) errOut(`botmux assign: 警告：${settlementWarning}`);
+    return groupResult.ok && !settlementWarning ? 0 : 1;
   }
 
   // ── Path B: Direct Host CLI execution ──
@@ -600,7 +613,8 @@ export async function runAssignCommand(argv: readonly string[], deps: AssignComm
       { dataDir: deps.dataDir },
     );
     out(args.json ? JSON.stringify(result, null, 2) : formatAssignRun(result));
-    return result.ok ? 0 : 1;
+    if (result.settlementWarning) errOut(`botmux assign: 警告：${result.settlementWarning}`);
+    return result.ok && !result.settlementWarning ? 0 : 1;
   } catch (err) {
     if (err instanceof TaskRoutingError) {
       errOut(`botmux assign ${args.subcommand} 失败：${err.message}`);

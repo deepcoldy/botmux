@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -109,10 +109,10 @@ describe('botmux assign CLI parser and runner', () => {
     const { dataDir } = makeEnv();
     const outs: string[] = [];
     const settledBodies: Record<string, unknown>[] = [];
-    const dispatchCalls: string[] = [];
+    const dispatchCalls: Array<{ targetAppId: string; workingDir?: string }> = [];
 
     const code = await runAssignCommand(
-      ['run', '--task', '补齐单测', '--mode', 'topic', '--json'],
+      ['run', '--task', '补齐单测', '--mode', 'topic', '--working-dir', '/tmp', '--json'],
       {
         dataDir,
         stdout: line => outs.push(line),
@@ -199,7 +199,7 @@ describe('botmux assign CLI parser and runner', () => {
           },
         },
         dispatchTopic: async input => {
-          dispatchCalls.push(input.targetAppId);
+          dispatchCalls.push({ targetAppId: input.targetAppId, workingDir: input.workingDir });
           if (input.targetAppId === 'cli_first') {
             return { ok: false, retryable: true, error: 'target_not_in_chat' };
           }
@@ -209,7 +209,10 @@ describe('botmux assign CLI parser and runner', () => {
     );
 
     expect(code).toBe(0);
-    expect(dispatchCalls).toEqual(['cli_first', 'cli_second']);
+    expect(dispatchCalls).toEqual([
+      { targetAppId: 'cli_first', workingDir: '/tmp' },
+      { targetAppId: 'cli_second', workingDir: '/tmp' },
+    ]);
     expect(settledBodies).toHaveLength(1);
     expect(settledBodies[0]).toMatchObject({
       action: 'record-topic-attempt',
@@ -223,6 +226,44 @@ describe('botmux assign CLI parser and runner', () => {
     const outJson = JSON.parse(outs.join('\n'));
     expect(outJson.ok).toBe(true);
     expect(outJson.rootMessageId).toBe('om_seed_2');
+  });
+
+  it('returns a visible warning and nonzero status for a dispatched but unsettled group run', async () => {
+    const { dataDir } = makeEnv();
+    const outs: string[] = [];
+    const errs: string[] = [];
+    const code = await runAssignCommand(['run', '--task', '已派发待结算', '--json'], {
+      dataDir,
+      stdout: line => outs.push(line),
+      stderr: line => errs.push(line),
+      detectSandbox: () => ({ inSandbox: false }),
+      detectLinuxAncestorSession: () => null,
+      sessionTransport: {
+        detectSessionId: () => 'sess_owner_1',
+        resolveSessionAppId: async () => 'cli_orch',
+        postSessionTaskRouting: async () => ({
+          status: 200,
+          body: {
+            ok: true,
+            chatId: 'oc_1',
+            sessionId: 'sess_1',
+            settlementWarning: '任务已派发，但分配记录 tr_1 终态回写失败（账本状态：pending）',
+            record: {
+              id: 'tr_1', createdAt: 1000, updatedAt: 1000, mode: 'group', taskSummary: '已派发待结算',
+              callerKind: 'owner_turn', constraints: {}, selectedAppId: 'cli_a', selectedName: 'A',
+              matcherKind: 'rule', confidence: 'medium', reason: 'rule', candidates: [], excluded: [],
+              attempts: [], outcome: 'dispatched', targetChatId: 'oc_1', targetSessionId: 'sess_1',
+            },
+          },
+        }),
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(errs.join('\n')).toContain('终态回写失败');
+    const payload = JSON.parse(outs.join('\n'));
+    expect(payload.ok).toBe(true);
+    expect(payload.settlementWarning).toContain('pending');
   });
 
   it('blocks --session-id spoofing and prioritizes kernel ancestor session over tampered env', async () => {
@@ -334,6 +375,28 @@ describe('botmux assign CLI parser and runner', () => {
       sessionId: 'sess_1',
     });
     expect(failedRes).toMatchObject({ ok: false, retryable: true });
+
+    // 5. --working-dir reaches the real dispatch argv as --repo.
+    const successEntry = join(dataDir, 'fake-cli-success-argv.mjs');
+    const argvFile = join(dataDir, 'dispatch-argv.json');
+    writeFileSync(
+      successEntry,
+      `import { writeFileSync } from 'node:fs';\n`
+      + `writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\n`
+      + 'process.stdout.write(JSON.stringify({ success: true, chatId: "oc_1", threadRootId: "om_1" }) + "\\n");\n',
+    );
+    const successRes = await createCliTopicDispatcher(successEntry)({
+      targetAppId: 'cli_first',
+      title: 'T',
+      task: 'task',
+      workingDir: '/tmp/repo-a',
+      sessionId: 'sess_1',
+    });
+    expect(successRes.ok).toBe(true);
+    const dispatchArgv = JSON.parse(readFileSync(argvFile, 'utf8')) as string[];
+    const repoIndex = dispatchArgv.indexOf('--repo');
+    expect(repoIndex).toBeGreaterThanOrEqual(0);
+    expect(dispatchArgv.slice(repoIndex, repoIndex + 2)).toEqual(['--repo', '/tmp/repo-a']);
   });
 
   it('aborts topic fallback on mid-flight preflight kill-switch and surfaces settlement failures instead of exit 0', async () => {

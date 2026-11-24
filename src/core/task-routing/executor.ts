@@ -10,12 +10,13 @@
  * 持久状态与兜底不变量：
  * - 派发前先往 `task-routing.sqlite` 写 `outcome='pending'`，包含完整候选与排除快照；
  * - 每个候选派发前再做一次轻量 preflight，若刚离线/满载/冷却立即跳过并记录原因；
- * - 显式未受理错误（建群前失败、或 spawn 返回明确 `{ ok: false }` 错误）按 `fallbackOrder` 顺延下一位；
- * - 建群成功立即持久化 `targetChatId`；若 `spawn` 发生**结果未知的传输超时**，遵守 at-most-once
- *   不盲目重派第二位，标为 `failed`（`spawn_delivery_unknown`）供调用方用 `botmux observe` 核对。
+ * - 显式未受理错误（建群前失败、或 spawn 返回明确 `accepted:false`）按 `fallbackOrder` 顺延下一位；
+ * - 建群成功立即持久化 `targetChatId`；建群 / spawn 出现任何结果未知的传输或服务端结果，
+ *   遵守 at-most-once 不盲目重派第二位，标为 `failed` 供调用方核对。
  */
 
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from '../daemon-ipc-auth.js';
 import { listOnlineDaemons, type OnlineDaemonInfo } from '../../utils/daemon-discovery.js';
 import { TaskRoutingStore } from '../../services/task-routing-store.js';
@@ -97,6 +98,8 @@ export interface ExecuteTaskRoutingOutput {
   threadId?: string | null;
   shareLink?: string | null;
   error?: string;
+  /** The side effect succeeded, but the durable terminal outcome could not be confirmed. */
+  settlementWarning?: string;
 }
 
 export function deriveTaskGroupTitle(explicitTitle: string | undefined, task: string): string {
@@ -105,6 +108,23 @@ export function deriveTaskGroupTitle(explicitTitle: string | undefined, task: st
   const firstLine = task.split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? task.trim();
   const compact = firstLine.replace(/\s+/g, ' ');
   return Array.from(compact).slice(0, 40).join('') || '新任务';
+}
+
+const TERMINAL_CONTENT_KEYS = [
+  'selectedAppId', 'selectedName', 'attempts', 'outcome',
+  'targetChatId', 'targetSessionId', 'targetRootMessageId', 'error',
+] as const;
+
+/** Check the semantic terminal payload, excluding the writer-specific updatedAt. */
+function terminalContentMatches(
+  record: TaskRoutingRecord,
+  patch: Parameters<TaskRoutingStore['settlePendingRecord']>[1],
+): boolean {
+  for (const key of TERMINAL_CONTENT_KEYS) {
+    if (patch[key] === undefined) continue;
+    if (!isDeepStrictEqual(patch[key] ?? null, record[key] ?? null)) return false;
+  }
+  return true;
 }
 
 /**
@@ -164,6 +184,30 @@ export async function executeTaskRoutingRun(
       return false;
     }
   };
+  const settleTerminalRecord = (
+    patch: Parameters<TaskRoutingStore['settlePendingRecord']>[1],
+  ): { settled: boolean; persisted: TaskRoutingRecord | null } => {
+    let settled = false;
+    try { settled = deps.store.settlePendingRecord(id, patch); } catch { /* read back below */ }
+    let persisted: TaskRoutingRecord | null = null;
+    try { persisted = deps.store.getRecord(id); } catch { /* warning below */ }
+    // CAS failure is idempotent only when the persisted terminal payload is
+    // exactly the one this executor intended; the same outcome is not enough.
+    return {
+      settled: settled || (persisted !== null && terminalContentMatches(persisted, patch)),
+      persisted,
+    };
+  };
+  const terminalWriteWarning = (
+    outcome: Exclude<TaskRoutingOutcome, 'pending'>,
+    persisted: TaskRoutingRecord | null,
+    taskDispatched: boolean,
+  ): string => {
+    const state = persisted?.outcome ?? '不可读';
+    return taskDispatched
+      ? `任务已派发，但分配记录 ${id} 的 ${outcome} 终态回写失败（账本状态：${state}），请人工核对`
+      : `分配记录 ${id} 的 ${outcome} 终态回写失败（账本状态：${state}）`;
+  };
 
   for (let i = 0; i < input.decision.fallbackOrder.length; i++) {
     const appId = input.decision.fallbackOrder[i]!;
@@ -180,7 +224,7 @@ export async function executeTaskRoutingRun(
         reason: abortReason,
         at: abortedAt,
       });
-      tryStoreUpdate({
+      const settlement = settleTerminalRecord({
         attempts,
         outcome: 'failed',
         targetChatId: null,
@@ -197,8 +241,11 @@ export async function executeTaskRoutingRun(
       };
       return {
         ok: false,
-        record: recordState,
+        record: settlement.persisted ?? recordState,
         error: abortReason,
+        ...(settlement.settled
+          ? {}
+          : { settlementWarning: terminalWriteWarning('failed', settlement.persisted, false) }),
       };
     }
 
@@ -298,7 +345,7 @@ export async function executeTaskRoutingRun(
       };
       attempts.push(attempt);
       const outcome: TaskRoutingOutcome = i === 0 ? 'dispatched' : 'fallback_dispatched';
-      tryStoreUpdate({
+      const settlement = settleTerminalRecord({
         selectedAppId: appId,
         selectedName: name,
         attempts,
@@ -322,12 +369,15 @@ export async function executeTaskRoutingRun(
       };
       return {
         ok: true,
-        record: recordState,
+        record: settlement.persisted ?? recordState,
         chatId: dispatched.chatId ?? createdChatIdForAttempt,
         sessionId: dispatched.sessionId,
         rootMessageId: dispatched.rootMessageId,
         threadId: dispatched.threadId,
         shareLink: dispatched.shareLink,
+        ...(settlement.settled
+          ? {}
+          : { settlementWarning: terminalWriteWarning(outcome, settlement.persisted, true) }),
       };
     }
 
@@ -347,7 +397,7 @@ export async function executeTaskRoutingRun(
 
     if (!dispatched.retryable) {
       // Non-retryable (e.g. ambiguous post-create spawn timeout): stop immediately, never double-dispatch.
-      tryStoreUpdate({
+      const settlement = settleTerminalRecord({
         selectedAppId: appId,
         selectedName: name,
         attempts,
@@ -370,10 +420,13 @@ export async function executeTaskRoutingRun(
       };
       return {
         ok: false,
-        record: recordState,
+        record: settlement.persisted ?? recordState,
         ...(attemptChatId ? { chatId: attemptChatId } : {}),
         ...(attemptRootId ? { rootMessageId: attemptRootId } : {}),
         error: dispatched.error,
+        ...(settlement.settled
+          ? {}
+          : { settlementWarning: terminalWriteWarning('failed', settlement.persisted, false) }),
       };
     }
 
@@ -383,7 +436,7 @@ export async function executeTaskRoutingRun(
   }
 
   const settledAt = nowFn();
-  tryStoreUpdate({
+  const settlement = settleTerminalRecord({
     attempts,
     outcome: 'failed',
     targetChatId: null,
@@ -400,8 +453,11 @@ export async function executeTaskRoutingRun(
   };
   return {
     ok: false,
-    record: recordState,
+    record: settlement.persisted ?? recordState,
     error: lastError,
+    ...(settlement.settled
+      ? {}
+      : { settlementWarning: terminalWriteWarning('failed', settlement.persisted, false) }),
   };
 }
 
@@ -529,27 +585,27 @@ export function createHostGroupDispatcher(
       createTimeout,
     );
     if (!groupRes.ok) {
-      // Group creation timeout is ambiguous (group may already exist on Feishu);
-      // however no session was spawned yet. For network refusal (non-timeout) safe to retry next bot.
-      return {
-        ok: false,
-        retryable: !groupRes.timedOut,
-        error: groupRes.timedOut
-          ? `建群请求超时，状态未知（请先检查飞书是否已建群）：${groupRes.error}`
-          : `建群失败：${groupRes.error}`,
-      };
-    }
-    const chatId = typeof groupRes.body?.chatId === 'string' ? groupRes.body.chatId : undefined;
-    if (groupRes.status >= 200 && groupRes.status < 300 && (groupRes.malformedJson || !groupRes.body)) {
+      // A reset can happen after chat.create committed. Connection refusal and
+      // post-connect failure are indistinguishable at this layer, so never fall
+      // back on transport errors alone.
       return {
         ok: false,
         retryable: false,
-        error: `建群响应体异常（HTTP ${groupRes.status}，状态未知，请先检查飞书是否已建群）`,
+        error: `建群请求结果未知（请先检查飞书是否已建群）：${groupRes.error}`,
       };
     }
+    const chatId = typeof groupRes.body?.chatId === 'string' ? groupRes.body.chatId : undefined;
     if (groupRes.status < 200 || groupRes.status >= 300 || groupRes.body?.ok !== true || !chatId) {
       const errText = typeof groupRes.body?.error === 'string' ? groupRes.body.error : `group_create_http_${groupRes.status}`;
-      return { ok: false, retryable: true, error: `建群失败：${errText}` };
+      const explicitRefusal = groupRes.body?.accepted === false && !chatId;
+      return {
+        ok: false,
+        retryable: explicitRefusal,
+        ...(chatId ? { chatId } : {}),
+        error: explicitRefusal
+          ? `建群前拒绝：${errText}`
+          : `建群结果未知（HTTP ${groupRes.status}，请先检查飞书是否已建群）：${errText}`,
+      };
     }
 
     context.onChatCreated?.(chatId);
@@ -588,24 +644,24 @@ export function createHostGroupDispatcher(
     }
     const sessionId = typeof spawnRes.body?.sessionId === 'string' ? spawnRes.body.sessionId : undefined;
     if (spawnRes.status < 200 || spawnRes.status >= 300 || spawnRes.body?.ok !== true || !sessionId) {
-      const explicitRefusal = spawnRes.body?.ok === false
-        || (spawnRes.status >= 400 && !spawnRes.malformedJson);
+      // Only a daemon-side pre-acceptance refusal is safe to fall back from.
+      // `ok:false` alone is not proof: spawnDashboardSession may deliberately
+      // retain a durable opening or a live worker after returning an error.
+      const explicitRefusal = spawnRes.body?.accepted === false && !sessionId;
+      const errText = typeof spawnRes.body?.error === 'string' ? spawnRes.body.error : `session_spawn_http_${spawnRes.status}`;
       if (!explicitRefusal) {
-        // HTTP 2xx with truncated/malformed/missing body is ambiguous: fail-closed (never double-dispatch).
         return {
           ok: false,
           retryable: false,
           chatId,
-          error: `spawn_delivery_unknown：群 ${chatId} 已建，启动会话响应异常（HTTP ${spawnRes.status}），请用 botmux observe 确认是否已开工`,
+          error: `spawn_delivery_unknown：群 ${chatId} 已建，启动会话结果未知（HTTP ${spawnRes.status}：${errText}），请用 botmux observe 确认是否已开工`,
         };
       }
-      const errText = typeof spawnRes.body?.error === 'string' ? spawnRes.body.error : `session_spawn_http_${spawnRes.status}`;
-      // Target daemon explicitly refused to start the session -> safe to fall back to next candidate.
       return {
         ok: false,
         retryable: true,
         chatId,
-        error: `启动会话失败（群 ${chatId}）：${errText}`,
+        error: `启动会话前拒绝（群 ${chatId}）：${errText}`,
       };
     }
 
