@@ -135,7 +135,7 @@ export interface CollabGateAdmissionOpts {
   config?: SessionGroupCollaborationConfig | undefined;
   now?: () => number;
   /** 规范化路由事件（持久化进队列，供重放）。 */
-  routingEvent?: NormalizedCollabRoutingEvent | unknown;
+  routingEvent?: NormalizedCollabRoutingEvent;
   /** 本轮消息 id（同 (targetAppId, sourceMessageId) 去重）。 */
   sourceMessageId?: string;
   enqueueImpl?: (dataDir: string, chatId: string, item: { sourceMessageId: string; targetAppId: string; routingEvent: unknown; deliveryStatus: 'pending'; enqueuedAt: number }) => boolean;

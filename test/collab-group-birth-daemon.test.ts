@@ -118,11 +118,12 @@ vi.mock('../src/services/session-group-title.js', async () => {
 });
 
 import { loadBotConfigs, registerBot, getBot } from '../src/bot-registry.js';
-import { __testOnly_handleNewTopic as handleNewTopic } from '../src/daemon.js';
+import { __testOnly_handleNewTopic as handleNewTopic, __testOnly_executeThreadSlash, type ThreadSlashContext } from '../src/daemon.js';
 import { addChatGrant, addGlobalGrant, chatQuotaKey, consumeQuota, globalQuotaKey } from '../src/services/grant-store.js';
 import { readCollabInitStore, placeCollabGroupInit } from '../src/services/collab-init-store.js';
 import { __testOnly_setCollabPeerPreflight } from '../src/core/collab-group-birth.js';
 import { collabCreatorAdmissionOperationId, collabInitId, collabSourceKey } from '../src/services/collab-group-config.js';
+import { buildInitialCollabGate, writeCollabGate } from '../src/services/collab-gate-store.js';
 import { initSessionGroups, isSessionGroup } from '../src/services/session-groups-store.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
@@ -488,5 +489,52 @@ describe('协作初始化入口：fail-closed 不扣费不建群', () => {
     } finally {
       __testOnly_setCollabPeerPreflight(undefined);
     }
+  });
+});
+
+describe('真实 executeThreadSlash 命令 gate（thread /compact 被拦，CLI 零投递）', () => {
+  it('closed gate（initializing）+ talk allowed + /compact passthrough → forkWorker 零调用', async () => {
+    writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([botConfig(undefined)]));
+    loadBotConfigs().forEach(cfg => registerBot(cfg));
+    const bot = getBot(APP);
+    bot.resolvedAllowedUsers = [OWNER, GRANTEE];
+    // 写 closed gate（phase=initializing，APP 是 participant，acceptingUserTasks=false）。
+    writeCollabGate(mocks.dataDir, buildInitialCollabGate({
+      initId: 'i'.repeat(64), configVersion: 'cv', creatorAppId: 'cli_creator_other', chatId: 'oc_gate_chat', participantAppIds: [APP],
+    }));
+
+    const slash: ThreadSlashContext = {
+      ctx: { chatId: 'oc_gate_chat', messageId: 'om_compact', chatType: 'group', scope: 'chat', anchor: 'om_compact', larkAppId: APP },
+      data: { sender: { sender_id: { open_id: GRANTEE }, sender_type: 'user' }, message: { message_id: 'om_compact', chat_id: 'oc_gate_chat', chat_type: 'group', message_type: 'text', content: JSON.stringify({ text: '/compact' }) } },
+      larkAppId: APP,
+      scope: 'chat',
+      anchor: 'om_compact',
+      replyRootId: undefined,
+      parsed: { messageId: 'om_compact', content: '/compact', senderId: GRANTEE, mentions: [] } as any,
+      resources: [],
+      cmdContent: '/compact',
+      routingChatId: 'oc_gate_chat',
+      chatType: 'group',
+      chatId: 'oc_gate_chat',
+      senderOpenId: GRANTEE,
+      senderUnionId: undefined,
+      teamTrustUnionId: undefined,
+      teamTrustAppId: undefined,
+      isBotSenderType: false,
+      isForeignBotSender: false,
+      substituteTrigger: undefined,
+      getThreadSender: async () => ({ openId: GRANTEE, type: 'user' as const }),
+    };
+
+    mocks.forkWorker.mockClear();
+    mocks.replyMessage.mockClear();
+    const handled = await __testOnly_executeThreadSlash(slash);
+
+    // /compact 是 passthrough（注入 CLI），closed gate 下被拦：回执「未就绪/排队」，不投递 CLI。
+    expect(handled).toBe(true); // 命令被 gate 处理（return true 表示已拦截）
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    // 回执是 gate 拦截文案（排队/未就绪），不是 passthrough 的「需要活跃 CLI」回落。
+    const replyCalls = mocks.replyMessage.mock.calls.map(c => String(c[2]));
+    expect(replyCalls.some(t => t.includes('排队') || t.includes('未就绪') || t.includes('not ready') || t.includes('queued'))).toBe(true);
   });
 });

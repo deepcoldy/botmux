@@ -23542,6 +23542,7 @@ export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
 // which unit tests calling handleCommand directly can never catch.
 export const __testOnly_handleNewTopic = (data: any, ctx: RoutingContext): Promise<void> => handleNewTopic(data, ctx);
 export const __testOnly_handleThreadReply = (data: any, ctx: RoutingContext): Promise<void> => handleThreadReply(data, ctx);
+export const __testOnly_executeThreadSlash = (slash: import('./daemon.js').ThreadSlashContext): Promise<boolean> => executeThreadSlash(slash);
 export const __testOnly_computeCodexAppSteerable = computeCodexAppSteerable;
 
 type NewDaemonSessionClaim =
@@ -33566,7 +33567,7 @@ async function handleThreadReplyAdmitted(
  * 搬出，零行为变化）。比新话题入口多了三样：按 existingDs 推导相位、runtime 级联的派发与在飞
  * 推迟、透传送进已有会话。返回 true 表示已处理，入口应直接 return。
  */
-interface ThreadSlashContext {
+export interface ThreadSlashContext {
   trustedCaller?: TrustedCaller;
   ctx: RoutingContext;
   data: any;
