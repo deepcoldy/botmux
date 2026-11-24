@@ -18,6 +18,7 @@ import { readCollabGate } from '../services/collab-gate-store.js';
 import { enqueueCollabChatItem, readCollabChatQueue } from '../services/collab-chat-queue-store.js';
 import { readCollabInitEntry } from '../services/collab-init-store.js';
 import type { TalkEvaluation } from '../im/lark/event-dispatcher.js';
+import type { MentionIdentity } from '../im/lark/message-parser.js';
 import type { SlashRouteDecision } from './command-router.js';
 import type { CollabGateFile, SessionGroupCollaborationConfig } from '../services/collab-group-config.js';
 
@@ -35,7 +36,7 @@ export interface NormalizedCollabRoutingEvent {
   /** 源应用身份（evaluateBotTalk 判定用）。 */
   teamTrustAppId?: string;
   teamTrustUnionId?: string;
-  /** bot 归属（isBotSenderType / isForeignBotSender）。 */
+  /** bot 归属（两个旗标独立保存，不合并）。 */
   isBotSenderType?: boolean;
   isForeignBotSender?: boolean;
   chatType?: string;
@@ -45,8 +46,54 @@ export interface NormalizedCollabRoutingEvent {
   threadId?: string;
   parentId?: string;
   content: string;
-  mentions?: unknown;
+  mentions?: MentionIdentity[];
   resources: Array<{ type: string; key?: string; name: string; messageId?: string; fallbackMessageIds?: string[] }>;
+}
+
+/**
+ * shared typed builder：四个 daemon 构造点统一调用，确保 routingEvent 完整、类型被兜住。
+ * 返回 NormalizedCollabRoutingEvent（不再退化 unknown）。
+ */
+export function buildCollabRoutingEvent(input: {
+  chatId: string;
+  messageId: string;
+  senderType?: string;
+  senderOpenId?: string;
+  senderUnionId?: string;
+  teamTrustAppId?: string;
+  teamTrustUnionId?: string;
+  isBotSenderType?: boolean;
+  isForeignBotSender?: boolean;
+  chatType?: string;
+  scope?: string;
+  anchor?: string;
+  replyRootId?: string;
+  threadId?: string;
+  parentId?: string;
+  content: string;
+  mentions?: MentionIdentity[];
+  resources: Array<{ type: string; key?: string; name: string; messageId?: string; fallbackMessageIds?: string[] }>;
+}): NormalizedCollabRoutingEvent {
+  return {
+    chatId: input.chatId,
+    messageId: input.messageId,
+    ...(input.senderType !== undefined ? { senderType: input.senderType } : {}),
+    ...(input.senderOpenId !== undefined ? { senderOpenId: input.senderOpenId } : {}),
+    ...(input.senderUnionId !== undefined ? { senderUnionId: input.senderUnionId } : {}),
+    ...(input.teamTrustAppId !== undefined ? { teamTrustAppId: input.teamTrustAppId } : {}),
+    ...(input.teamTrustUnionId !== undefined ? { teamTrustUnionId: input.teamTrustUnionId } : {}),
+    ...(input.isBotSenderType !== undefined ? { isBotSenderType: input.isBotSenderType } : {}),
+    ...(input.isForeignBotSender !== undefined ? { isForeignBotSender: input.isForeignBotSender } : {}),
+    ...(input.chatType !== undefined ? { chatType: input.chatType } : {}),
+    ...(input.scope !== undefined ? { scope: input.scope } : {}),
+    ...(input.anchor !== undefined ? { anchor: input.anchor } : {}),
+    ...(input.replyRootId !== undefined ? { replyRootId: input.replyRootId } : {}),
+    ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
+    ...(input.parentId !== undefined ? { parentId: input.parentId } : {}),
+    content: input.content,
+    ...(input.mentions !== undefined ? { mentions: input.mentions } : {}),
+    resources: input.resources,
+  };
 }
 
 export type CollabGateAdmissionResult =

@@ -646,7 +646,7 @@ import {
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, cancelQueuedForks, drainQueuedForks, isPendingForkTopic, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
-import { collabGateAdmissionDecision } from './core/collab-gate-admission.js';
+import { collabGateAdmissionDecision, buildCollabRoutingEvent } from './core/collab-gate-admission.js';
 import { commandSpec } from './core/command-schema.js';
 import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
 import { groupTaskSenderIsBot } from './core/group-task-start.js';
@@ -28794,7 +28794,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       botAppId: larkAppId,
       talk: gateTalk,
       sourceMessageId: messageId,
-      routingEvent: {
+      routingEvent: buildCollabRoutingEvent({
         chatId,
         messageId,
         senderType: data?.sender?.sender_type,
@@ -28813,7 +28813,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         content,
         mentions: parsed.mentions,
         resources: resources.map(r => ({ type: r.type, key: r.key, name: r.name, messageId: r.messageId, fallbackMessageIds: r.fallbackMessageIds })),
-      },
+      }),
     });
     if (gateDecision.block) {
       if (gateDecision.reason === 'queued') {
@@ -29444,7 +29444,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent, parsed.mentions),
   });
   // PR-3b-2 gate 接入（命令路径）：classifySlash 之后、plugin 特判之前。只拦「会注入 CLI」的
-  // 非豁免命令；豁免白名单（special / daemon(sessionless) 无副作用 / forward(bot_gated)）放行。
+  // 非豁免命令；豁免白名单（special / daemon(sessionless) 无副作用）放行；所有 forward（含 bot_gated）不豁免。
   // forward(unknown_slash) 会落到普通 spawn 注入 CLI，不豁免。
   {
     const gateTalk = senderIsBotForSlashGate
@@ -29457,7 +29457,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       talk: gateTalk,
       slashDecision,
       sourceMessageId: messageId,
-      routingEvent: {
+      routingEvent: buildCollabRoutingEvent({
         chatId,
         messageId,
         senderType: data?.sender?.sender_type,
@@ -29476,7 +29476,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
         content: cmdContent,
         mentions: parsed.mentions,
         resources: resources.map(r => ({ type: r.type, key: r.key, name: r.name, messageId: r.messageId, fallbackMessageIds: r.fallbackMessageIds })),
-      },
+      }),
     });
     if (gateDecision.block) {
       if (gateDecision.reason === 'queued') {
@@ -31743,7 +31743,7 @@ async function handleThreadReplyAdmitted(
       botAppId: larkAppId,
       talk: gateTalk,
       sourceMessageId: parsed.messageId,
-      routingEvent: {
+      routingEvent: buildCollabRoutingEvent({
         chatId: gateChatId,
         messageId: parsed.messageId,
         senderType: data?.sender?.sender_type,
@@ -31751,7 +31751,8 @@ async function handleThreadReplyAdmitted(
         senderUnionId: threadSenderUnionId,
         teamTrustAppId: threadTeamTrustAppId,
         teamTrustUnionId: threadTeamTrustUnionId,
-        isBotSenderType: isBotSenderType || isForeignBot,
+        isBotSenderType,
+        isForeignBotSender: isForeignBot,
         chatType: ctxChatType,
         scope,
         anchor,
@@ -31761,7 +31762,7 @@ async function handleThreadReplyAdmitted(
         content: parsed.content,
         mentions: parsed.mentions,
         resources: resources.map(r => ({ type: r.type, key: r.key, name: r.name, messageId: r.messageId, fallbackMessageIds: r.fallbackMessageIds })),
-      },
+      }),
     });
     if (gateDecision.block) {
       if (gateDecision.reason === 'queued') {
@@ -33635,7 +33636,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent, parsed.mentions),
     });
   // PR-3b-2 gate 接入（命令路径，thread）：classifySlash 之后、首个 return 之前。只拦「会注入
-  // CLI」的非豁免命令；豁免白名单（special / daemon(sessionless) 无副作用 / forward(bot_gated)）放行。
+  // CLI」的非豁免命令；豁免白名单（special / daemon(sessionless) 无副作用）放行；所有 forward（含 bot_gated）不豁免。
   if (slashDecision) {
     const gateChatId = chatId ?? routingChatId ?? data?.message?.chat_id;
     const gateTalk = (isBotSenderType || isForeignBotSender)
@@ -33648,7 +33649,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       talk: gateTalk,
       slashDecision,
       sourceMessageId: parsed.messageId,
-      routingEvent: {
+      routingEvent: buildCollabRoutingEvent({
         chatId: gateChatId,
         messageId: parsed.messageId,
         senderType: data?.sender?.sender_type,
@@ -33667,7 +33668,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         content: cmdContent,
         mentions: parsed.mentions,
         resources: resources.map(r => ({ type: r.type, key: r.key, name: r.name, messageId: r.messageId, fallbackMessageIds: r.fallbackMessageIds })),
-      },
+      }),
     });
     if (gateDecision.block) {
       if (gateDecision.reason === 'queued') {
