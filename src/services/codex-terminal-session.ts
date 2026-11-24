@@ -57,7 +57,11 @@ export function codexEmptyComposerFooter(
   opts: CodexNativeComposerOptions = {},
 ): string | undefined {
   if (!state) return undefined;
-  const lines = stripAnsiScreenText(state.viewport).split(/\r?\n/);
+  const viewport = stripAnsiScreenText(state.viewport);
+  // A centered confirmation or the native rename dialog can leave a perfectly
+  // plausible composer/backdrop behind. Never mistake that backdrop for input.
+  if (codexRenameDialogVisible(viewport) || detectCodexChoiceModal(viewport)) return undefined;
+  const lines = viewport.split(/\r?\n/);
   if (detectCodexComposerState({ ...state, viewport: lines.join('\n') }) !== 'empty') return undefined;
   const line = lines[state.cursor.y];
   if (line === undefined) return undefined;
@@ -110,6 +114,7 @@ function emptyComposerFooter(terminal: PtyHandle): string | undefined {
 /** Validate the native one/two-row footer after the caller bounds its location. */
 export function codexNativeFooterRows(footer: string[]): string | undefined {
   if (footer.length < 1 || footer.length > 2) return undefined;
+  if (footer.some(row => /^\s*enter\s+submit\s*\|\s*esc\s+back\s*$/i.test(row))) return undefined;
   // The second footer row is the native hints/warning row. A warning-only row
   // is native too: when hints are hidden the warning is the only thing left in
   // that row. Codex degrades the notice by width: `\u26a0 N warnings \u00b7 f2
@@ -132,16 +137,17 @@ function codexRenameDialogVisible(viewport: string): boolean {
 /**
  * Where a native Codex `/rename <title>` stands after its Enter.
  * `settled` only describes an empty composer; the worker separately requires
- * this thread's durable receipt. Known busy/dialog/draft surfaces are
- * `occupied` and outrank that receipt; an unrecognised footer stays `unknown`
- * so a matching receipt can still settle a future native layout.
+ * this thread's durable receipt. Known busy turns are `occupied`; dialogs,
+ * pickers and non-empty drafts are `blocked` and never time out into delivery.
+ * An unrecognised footer stays `unknown` so a matching receipt can still settle
+ * a future native layout.
  */
 export function codexSessionRenameSurface(
   evidence: { viewport: string; cursor?: { x: number; y: number } },
   command: string,
 ): SessionRenameSurface {
   const viewport = stripAnsiScreenText(evidence.viewport);
-  if (detectCodexChoiceModal(viewport) || codexRenameDialogVisible(viewport)) return 'occupied';
+  if (detectCodexChoiceModal(viewport) || codexRenameDialogVisible(viewport)) return 'blocked';
   const rows = viewport.split(/\r?\n/);
   let composer = rows.length - 1;
   while (composer >= 0 && !/^\s*[›»](?:\s|$)/.test(rows[composer]!)) composer--;
@@ -152,15 +158,15 @@ export function codexSessionRenameSurface(
   if (CODEX_ACTIVE_BUSY_PATTERN.test(neighborhood)) return 'occupied';
   const cursor = evidence.cursor
     ?? { x: (/^\s*/.exec(rows[composer]!)?.[0].length ?? 0) + 2, y: composer };
-  const nativeState = codexNativeComposerState({ viewport, cursor });
+  const nativeState = codexNativeComposerState({ viewport, cursor }, { allowCodex0146Hints: true });
   if (nativeState === 'empty') return 'settled';
   const wanted = composerTextKey(command);
   for (let end = composer + 1; end < rows.length; end++) {
     if (codexNativeFooterRows(rows.slice(end).filter(row => row.trim())) === undefined) continue;
     const body = [rows[composer]!.replace(/^\s*[›»]/, ''), ...rows.slice(composer + 1, end)].join('');
-    return composerTextKey(body) === wanted ? 'unsubmitted' : 'occupied';
+    return composerTextKey(body) === wanted ? 'unsubmitted' : 'blocked';
   }
-  return nativeState === 'draft' ? 'occupied' : 'unknown';
+  return nativeState === 'draft' ? 'blocked' : 'unknown';
 }
 
 // A complete Codex thread UUID (the `thread-id` / legacy `session-id` item).

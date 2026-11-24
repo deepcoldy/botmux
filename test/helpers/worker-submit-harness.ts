@@ -2,7 +2,7 @@ import { vi } from 'vitest';
 import { CodexBridgeQueue } from '../../src/services/codex-bridge-queue.js';
 import { InputDeliveryEvidenceTracker } from '../../src/services/input-delivery-evidence.js';
 import { createSubmitFailureChainController } from '../../src/services/submit-failure-chain.js';
-import { combineSubmitCurrentFences, settleDeferredSubmitConfirmation } from '../../src/services/submit-confirmation.js';
+import { combineSubmitCurrentFences, decideSubmitConfirmationAction, settleDeferredSubmitConfirmation } from '../../src/services/submit-confirmation.js';
 import { screenMayShowCredential } from '../../src/core/cli-startup-blocker.js';
 import { buildSubmitMessagePreview } from '../../src/services/submit-notification.js';
 import { diagnoseSubmitFailure } from '../../src/services/submit-failure-diagnosis.js';
@@ -77,6 +77,7 @@ export function workerSubmitHarness() {
     screenMayShowCredential, diagnoseSubmitFailure,
     SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS: 2, unscopedSubmitFailureChainSequence: 0,
     combineSubmitCurrentFences,
+    decideSubmitConfirmationAction,
     settleDeferredSubmitConfirmation: async (...args: Parameters<typeof settleDeferredSubmitConfirmation>) => {
       const settlement = await settleDeferredSubmitConfirmation(...args);
       settlements.push(settlement);

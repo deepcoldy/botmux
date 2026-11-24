@@ -6266,13 +6266,12 @@ function forceClearSessionRenameInFlight(): void {
   sessionRenameSentAtMs = 0;
 }
 
-/** The adapter's verdict on the rename in flight, read from the backend's own
- *  viewport (and cursor where reported). Undefined — the historical fail-open —
- *  when the adapter cannot judge or this backend's screen may not drive input.
- *  Missing evidence on a judging adapter is `unknown`, never `settled`. */
-function sessionRenameSurfaceNow(): SessionRenameSurface | undefined {
+/** The adapter's verdict on an input surface, read from the backend's own
+ * viewport (and cursor where reported). Undefined — the historical fail-open —
+ * when the adapter cannot judge or this backend's screen may not drive input.
+ * Missing evidence on a judging adapter is `unknown`, never `settled`. */
+function sessionInputSurfaceNow(command: string): SessionRenameSurface | undefined {
   const adapter = cliAdapter;
-  const command = sessionRenameCommand;
   const target = backend;
   if (!adapter?.sessionRenameSurface || !command || !target
     || !backendScreenEvidenceIsAuthoritativeForMutation()) return undefined;
@@ -6282,6 +6281,22 @@ function sessionRenameSurfaceNow(): SessionRenameSurface | undefined {
   } catch { evidence = undefined; }
   if (!evidence?.viewport.trim()) return 'unknown';
   try { return adapter.sessionRenameSurface(evidence, command); } catch { return 'unknown'; }
+}
+
+function sessionRenameSurfaceNow(): SessionRenameSurface | undefined {
+  return sessionRenameCommand ? sessionInputSurfaceNow(sessionRenameCommand) : undefined;
+}
+
+/** Hard input-focus evidence shared by ordinary, adopt, raw and injection
+ * writes. Busy/unknown surfaces are NOT blocked here: their real readiness and
+ * approval gates decide. Only a dialog, draft, paste chip or visible rename
+ * command can prevent every input class from being pasted into the wrong owner. */
+function sessionInputBlocksDeliveryNow(): boolean {
+  const adapter = cliAdapter;
+  if (!adapter?.sessionRenameSurface) return false;
+  const command = adapter.buildSessionRenameCommand?.(lastInitConfig?.nativeSessionTitle ?? '') ?? '/rename ';
+  const surface = sessionInputSurfaceNow(command);
+  return surface === 'blocked' || surface === 'unsubmitted';
 }
 
 /** Resolve native identity at every receipt poll. Persistent reattach clears
@@ -6321,11 +6336,23 @@ function sessionRenameNativeSessionIdNow(): string | undefined {
     }
   } else {
     const owned = findCodexRolloutSetByPid(pid);
-    if (!owned) return undefined;
+    const bridgeSid = codexBridgeRolloutPath ? codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
+    if (!owned || owned.size === 0) {
+      // A shared app-server owns no local rollout fd, and Linux sandboxing may
+      // hide /proc entirely. Only an exact terminal-session binding can replace
+      // that missing ownership evidence; never fall back to a bare bridge/cache.
+      if (backend && bridgeSid && codexTerminalSessionIsBound(adapterInputHandle(backend), bridgeSid)) {
+        observed = bridgeSid;
+      } else if (backend && inputDeliveryObservedCliSessionId
+        && codexTerminalSessionIsBound(adapterInputHandle(backend), inputDeliveryObservedCliSessionId)) {
+        observed = inputDeliveryObservedCliSessionId;
+      }
+      if (observed) inputDeliveryObservedCliSessionId = observed;
+      return observed;
+    }
     const owns = (sid: string): boolean => codexHistorySidIsOwned(sid, owned);
     const liveSid = readCodexLiveSessionId(pid);
     if (liveSid && owns(liveSid)) observed = liveSid;
-    const bridgeSid = codexBridgeRolloutPath ? codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
     // A live thread id outranks ambiguity. Without one, multiple rollouts make
     // bridge/cache ownership-only evidence, never proof of the current thread.
     if (!observed && owned.size === 1 && bridgeSid && owns(bridgeSid)) observed = bridgeSid;
@@ -6420,11 +6447,13 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
         : `Native session rename confirmed (${evidence}); releasing queued input`);
       return;
     }
-    // The timer means prompt redraw detection failed. Restore the gate
-    // explicitly; otherwise a deferred raw_input is the only queued work and
-    // flushPending would keep waiting for the very signal this timer replaces.
-    isPromptReady = true;
-    reattachOpenTurnGate = false;
+    // Only a proven empty composer (or the historical unjudged fail-open) may
+    // restore readiness here. Busy/unknown screens keep their REAL readiness:
+    // otherwise this timer would bypass OSC-7501 approval and busy-turn fences.
+    if (surface === undefined || surface === 'settled') {
+      isPromptReady = true;
+      reattachOpenTurnGate = false;
+    }
     log(timedOut
       ? `WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; releasing queued input without a receipt (${surface}); normal delivery gates remain in force`
       : surface === undefined
@@ -6485,9 +6514,9 @@ function settleFailedSessionRenameWrite(): void {
  * redraw output for IdleDetector to rediscover the prompt. Without an adapter
  * verdict this fails open, so one administrative command cannot wedge all
  * later Lark messages; with one, queued input waits for this thread's durable
- * rename receipt and a writable input surface. The hard cap restores fail-open
- * delivery for every surface except an exact unsubmitted command; normal busy,
- * dialog and delivery guards still run after this rename-only gate is cleared. */
+ * rename receipt and a writable input surface. The hard cap returns ordinary
+ * busy/unknown evidence to the REAL readiness gates; explicit dialogs/drafts
+ * and an exact unsubmitted command stay held beyond the cap. */
 function armSessionRenameIdleTimeout(delayMs = SESSION_RENAME_IDLE_TIMEOUT_MS): void {
   if (sessionRenamePhase !== 'sent') return;
   if (sessionRenameIdleTimer) clearTimeout(sessionRenameIdleTimer);
@@ -6551,6 +6580,16 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
   const surface = sessionRenameSurfaceNow();
   if (surface === 'unknown') {
     sessionRenameCommand = undefined;
+    if (sessionRenameRecorded?.() === true) {
+      if (sessionRenameReattachRetryTimer) {
+        clearTimeout(sessionRenameReattachRetryTimer);
+        sessionRenameReattachRetryTimer = null;
+      }
+      log('Native session rename confirmed by the CLI record after persistent reattach; releasing restored input');
+      forceClearSessionRenameInFlight();
+      sessionRenameReattachRecoveryGeneration = generation;
+      return false;
+    }
     if (!sessionRenameHoldLogged) {
       sessionRenameHoldLogged = true;
       log('Native session rename recovery cannot classify the surviving terminal; holding restored input and retrying');
@@ -6559,8 +6598,6 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
       notifySessionRenameInputTimeout('released');
       forceClearSessionRenameInFlight();
       sessionRenameReattachRecoveryGeneration = generation;
-      isPromptReady = true;
-      reattachOpenTurnGate = false;
       log(`WARN Native session rename recovery remained unknown after ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; releasing restored input to the normal delivery gates`);
       return false;
     }
@@ -6595,6 +6632,11 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
  * Commands received while /rename owns the TUI are deferred by the IPC handler
  * and come through this same function after the prompt returns. */
 async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' }>): Promise<void> {
+  if (sessionInputBlocksDeliveryNow()) {
+    freshnessInputQueue.enqueueRaw(msg);
+    log(`Native dialog or unsubmitted draft owns the CLI input; deferred passthrough: ${msg.content}`);
+    return;
+  }
   // Daemon/card readiness can lag behind a committed ordinary input. MiniMax
   // queues native turns, so changing capture ownership while it is busy would
   // discard that ordinary turn's final. Keep ownership until the real prompt.
@@ -19903,6 +19945,10 @@ async function flushPendingInjections(): Promise<void> {
   //   （commandLineWritesPending）：raw-write 围栏，注入同为 raw 命令行写入方。
   // 被挡下的注入不丢：队列留存，竞争写入方结束后的下一次 markPromptReady 再踢。
   if (recoverSessionRenameAfterPersistentReattach()) return;
+  if (sessionInputBlocksDeliveryNow()) {
+    log('Native dialog or unsubmitted draft owns the CLI input; keeping every queued input class held');
+    return;
+  }
   if (!canStartInjectionFlush({
     injectionFlushing,
     userFlushing: isFlushing,
@@ -25242,6 +25288,11 @@ async function flushPending(): Promise<void> {
   if (recoverSessionRenameAfterPersistentReattach()) return;
   if (resetTraexAutoModelBeforePendingTurn()) return;
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
+  if ((lastInitConfig?.cliId !== 'codex' || !backend.captureInputState) && sessionInputBlocksDeliveryNow()) {
+    log('Native dialog or unsubmitted draft owns the CLI input; keeping ordinary/adopt/raw input queued');
+    holdOpeningInput('A native dialog or unsubmitted draft owns the CLI input');
+    return;
+  }
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
   // 注入进行中不得并发写 PTY（用户消息留在 pendingMessages，注入完成后的下一次
   // markPromptReady 自然排空）——防止 type-ahead 插进注入的 text→Enter 窗口。
@@ -26587,6 +26638,27 @@ async function flushPending(): Promise<void> {
         }
         const codexAppSafeNonSubmission = result.submissionDisposition === 'untouched'
           || result.submissionDisposition === 'flushed_invalid';
+        if (lastInitConfig?.cliId === 'codex' && typedIntoComposer && !recoveryFailureReason
+          && result.submissionDisposition === 'untouched') {
+          // prepareCodexTranscriptInput refused before any paste. Turn 2+ used
+          // to fail this item and then hard-fail every queued successor. Restore
+          // the FIFO head and reuse the opening-input hold instead; no failure
+          // notice, no dropped tail, and no write until the real composer returns.
+          if (item.queuedActivationToken) {
+            // Definitively untouched queued activations keep their established
+            // ACK semantics: the daemon may release dependent follow-ups, but
+            // the refused activation itself is never replayed into the dialog.
+            acknowledgeQueuedActivation(item);
+          } else {
+            pendingMessages.unshift(item);
+            requeueUnsubmittedQueuedActivation(item);
+          }
+          openingInputBoxSettled = false;
+          keepPromptReadyAfterHold();
+          holdOpeningInput(result.failureReason ?? 'Codex input is not ready');
+          log(`Retained untouched Codex input and its queued tail: ${result.failureReason ?? 'composer not ready'}`);
+          break;
+        }
         if (tracksCodexAppLiveness && !codexAppSafeNonSubmission) {
           // final-Enter exhaustion, cleanup failure, and thrown/unknown writes
           // can leave a complete valid frame buffered. Retain an ordinary

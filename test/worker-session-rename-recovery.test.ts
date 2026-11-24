@@ -113,6 +113,7 @@ describe('native rename recovery after persistent worker reattach', () => {
       writeFileSync(path, '');
       let arms = 0;
       const h = recoveryHarness('unknown');
+      h.scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', h.scope);
       h.scope.cliAdapter.watchSessionRename = (_command: string, opts: {
         getCliSessionId: () => string | undefined; fromByte?: number;
       }) => {
@@ -123,9 +124,10 @@ describe('native rename recovery after persistent worker reattach', () => {
       expect(arms).toBe(1);
 
       appendFileSync(path, `${JSON.stringify({ id: 'native-id', thread_name: TITLE })}\n`);
-      expect(h.recover()).toBe(true);
+      expect(h.recover()).toBe(false);
       expect(arms).toBe(1);
-      expect(h.scope.sessionRenameRecorded?.()).toBe(true);
+      expect(h.scope.sessionRenameRecorded).toBeUndefined();
+      expect(h.scope.sessionRenamePhase).toBe('idle');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -144,8 +146,8 @@ describe('native rename recovery after persistent worker reattach', () => {
     expect(h.recover()).toBe(false);
     expect(h.scope.notifySessionRenameInputTimeout).toHaveBeenCalledWith('released');
     expect(h.scope.armSessionRenameReattachRecoveryRetry).not.toHaveBeenCalled();
-    expect(h.scope.isPromptReady).toBe(true);
-    expect(h.scope.reattachOpenTurnGate).toBe(false);
+    expect(h.scope.isPromptReady).toBe(false);
+    expect(h.scope.reattachOpenTurnGate).toBe(true);
     expect(h.scope.sessionRenameReattachRecoveryGeneration).toBe(h.scope.cliSpawnGeneration);
   });
 
@@ -226,6 +228,40 @@ describe('sessionRenameNativeSessionIdNow', () => {
     const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
     expect(resolve()).toBe('native-id');
     expect(scope.inputDeliveryObservedCliSessionId).toBe('native-id');
+  });
+
+  it('uses an exact terminal binding for a shared Codex daemon with no owned rollout fd', () => {
+    const backend = {};
+    const scope: Record<string, any> = {
+      inputDeliveryObservedCliSessionId: undefined,
+      lastInitConfig: { cliId: 'codex' }, backend,
+      adapterInputHandle: (value: unknown) => value,
+      codexTerminalSessionIsBound: (_terminal: unknown, sid: string) => sid === 'thread-a',
+      codexRpcEngine: undefined, codexBridgeRolloutPath: '/tmp/rollout-thread-a.jsonl',
+      currentCodexObservedPid: () => 123,
+      findCodexRolloutSetByPid: () => new Set(),
+      codexGenerationSessionIdFromRolloutPath: () => 'thread-a',
+    };
+    const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
+    expect(resolve()).toBe('thread-a');
+    expect(scope.inputDeliveryObservedCliSessionId).toBe('thread-a');
+  });
+
+  it('uses an exact terminal binding when Linux sandboxing hides rollout ownership', () => {
+    const backend = {};
+    const scope: Record<string, any> = {
+      inputDeliveryObservedCliSessionId: 'thread-b',
+      lastInitConfig: { cliId: 'codex' }, backend,
+      adapterInputHandle: (value: unknown) => value,
+      codexTerminalSessionIsBound: (_terminal: unknown, sid: string) => sid === 'thread-b',
+      codexRpcEngine: undefined, codexBridgeRolloutPath: '/tmp/rollout-thread-a.jsonl',
+      currentCodexObservedPid: () => 123,
+      findCodexRolloutSetByPid: () => undefined,
+      codexGenerationSessionIdFromRolloutPath: () => 'thread-a',
+    };
+    const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
+    expect(resolve()).toBe('thread-b');
+    expect(scope.inputDeliveryObservedCliSessionId).toBe('thread-b');
   });
 
   it('follows the live Codex thread instead of polling a previously cached thread id', () => {

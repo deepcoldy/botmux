@@ -499,7 +499,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
 
     async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
       const blocked = await prepareCodexTranscriptInput(pty);
-      if (blocked) return { submitted: false, failureReason: blocked };
+      if (blocked) return { submitted: false, submissionDisposition: 'untouched', failureReason: blocked };
       const terminalSession = await refreshCodexTerminalSession(pty);
       // Paste frame and Enter go out back to back: no timer window in which a
       // human can submit/replace the draft or open backtrack before a delayed
@@ -602,7 +602,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // 0.166+ first paints a provisional `›` with no footer and only later the
     // initialized composer; writeInput refuses anything but the latter, or a
     // transcript pager it closes first.
-    inputBoxReady: state => codexNativeComposerState(state) === 'empty'
+    inputBoxReady: state => codexNativeComposerState(state, { allowCodex0146Hints: true }) === 'empty'
       || codexTranscriptCloseable(state.viewport),
     settleInputBox: settleCodexInputBox,
     startupResume: {

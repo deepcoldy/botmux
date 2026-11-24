@@ -14,15 +14,17 @@ import type { SessionRenameSurface } from '../adapters/cli/types.js';
  * - `unsubmitted`: our exact command is still in the composer. One Enter
  *   submits it. Only from the bounded wait, never from a prompt edge that can
  *   race the CLI's own redraw; after that one Enter, keep holding.
- * - `occupied`: a dialog, busy turn or user draft owns the terminal. A rename
- *   receipt says nothing about this CURRENT input owner, so keep holding during
- *   the bounded confirmation window.
+ * - `occupied`: an ordinary busy turn owns the terminal. A rename receipt says
+ *   nothing about this CURRENT input owner, so keep holding during the bounded
+ *   confirmation window.
+ * - `blocked`: a dialog, confirmation, non-empty draft or paste chip explicitly
+ *   owns the input focus. It never fails open, even at the hard cap.
  * - A durable record for this exact native thread and title proves this rename
  *   left the composer. It may release an empty (`settled`) or unrecognised
  *   (`unknown`) surface — the latter keeps working across footer redesigns.
- * - At the worker's hard cap, every surface except `unsubmitted` fails open to
- *   the normal delivery pipeline. Only the exact rename command still visible
- *   in the composer stays held; it never receives a second automatic Enter.
+ * - At the worker's hard cap, `occupied` and `unknown` may return to the normal
+ *   delivery pipeline without forging readiness. `unsubmitted` and `blocked`
+ *   stay held and never receive another automatic Enter.
  * - An empty composer alone proves nothing: it is also the pre-rename screen
  *   while a stalled TUI has not read the command. Arbitrary terminal output
  *   cannot fill that gap; nor can an ambiguous write failure.
@@ -56,10 +58,13 @@ export function decideSessionRenameSettlement(state: {
     if (state.holdExpired) return 'hold';
     return state.resubmitted || state.fromPrompt ? 'hold' : 'resubmit';
   }
-  if (state.surface === 'occupied') return state.holdExpired ? 'release_unconfirmed' : 'hold';
+  if (state.surface === 'blocked') return 'hold';
+  if (state.surface === 'occupied') {
+    if (!state.holdExpired) return 'hold';
+    return state.recorded ? 'release' : 'release_unconfirmed';
+  }
   if (state.recorded) return 'release';
-  // The cap restores the pre-receipt fail-open behaviour for settled, occupied
-  // and unknown screens. Only the exact command still visibly sitting in the
-  // composer remains unsafe to follow.
+  // Only an ordinary busy/unknown screen may time out without a receipt. A
+  // recorded one is a normal release, never a false "missing receipt" warning.
   return state.holdExpired ? 'release_unconfirmed' : 'hold';
 }

@@ -161,19 +161,19 @@ function traexRenameDialogVisible(screen: string): boolean {
 /**
  * Where a native `/rename <title>` stands after its Enter (0.216.0, recorded).
  * `settled` only describes an empty composer; the worker still requires this
- * thread's durable rename receipt. `occupied` means a known busy turn, dialog
- * or user draft owns input and must outrank that receipt. `unknown` preserves
+ * thread's durable rename receipt. `occupied` means an ordinary busy turn.
+ * `blocked` means a dialog, picker, non-empty draft or paste chip explicitly
+ * owns the input focus and must never time out into delivery. `unknown` preserves
  * the receipt-based fallback for future native footer layouts.
  */
 export function traexSessionRenameSurface(screen: string, command: string): SessionRenameSurface {
-  if (traexViewportFooterBusy(screen) || traexModelPickerPage(screen) || traexRenameDialogVisible(screen)) {
-    return 'occupied';
-  }
+  if (traexViewportFooterBusy(screen)) return 'occupied';
+  if (traexModelPickerPage(screen) || traexRenameDialogVisible(screen)) return 'blocked';
   if (traexRestoredComposerReady(screen)) return 'settled';
   const draft = traexComposerDraft(screen);
   if (!draft) return 'unknown';
-  if (draft.collapsedChars !== undefined) return 'occupied';
-  return composerTextKey(draft.body) === composerTextKey(command) ? 'unsubmitted' : 'occupied';
+  if (draft.collapsedChars !== undefined) return 'blocked';
+  return composerTextKey(draft.body) === composerTextKey(command) ? 'unsubmitted' : 'blocked';
 }
 
 /**

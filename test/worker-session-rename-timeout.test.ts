@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { decideSessionRenameSettlement } from '../src/core/session-rename-settlement.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
-function renameTimerHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'unknown') {
+function renameTimerHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'blocked' | 'unknown') {
   const scope: Record<string, any> = {
     sessionRenamePhase: 'sent',
     sessionRenameIdleTimer: null,
@@ -61,8 +61,8 @@ describe('native rename confirmation hold cap', () => {
     await vi.advanceTimersByTimeAsync(2_000);
     expect(h.scope.flushPending).toHaveBeenCalledOnce();
     expect(h.scope.sessionRenamePhase).toBe('idle');
-    expect(h.scope.isPromptReady).toBe(true);
-    expect(h.scope.reattachOpenTurnGate).toBe(false);
+    expect(h.scope.isPromptReady).toBe(surface === 'settled');
+    expect(h.scope.reattachOpenTurnGate).toBe(surface !== 'settled');
     expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'user_notify', turnId: 'turn', message: 'worker.session_rename_release_timeout',
     }));
@@ -83,5 +83,21 @@ describe('native rename confirmation hold cap', () => {
     expect(timeoutNotices[0]![0]).toEqual(expect.objectContaining({
       type: 'user_notify', turnId: 'turn',
     }));
+  });
+
+  it('keeps an explicit dialog or draft blocked after the cap without manufacturing readiness', async () => {
+    vi.useFakeTimers();
+    const h = renameTimerHarness('blocked');
+    h.arm();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+    expect(h.scope.resubmitSessionRename).not.toHaveBeenCalled();
+    expect(h.scope.sessionRenamePhase).toBe('sent');
+    expect(h.scope.isPromptReady).toBe(false);
+    expect(h.scope.reattachOpenTurnGate).toBe(true);
+    const timeoutNotices = h.scope.send.mock.calls.filter(([event]: [any]) =>
+      event.message === 'worker.session_rename_hold_timeout');
+    expect(timeoutNotices).toHaveLength(1);
   });
 });
