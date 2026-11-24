@@ -421,25 +421,40 @@ export async function settleTurnReplyCardTerminal(
 
 /** UI retirement never asserts native task failure or changes task settlement. */
 export async function retireReplyCardDisplay(
-  ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; message: string },
+  ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; message?: string; silent?: boolean },
   send: ReplyCardSender, owns: () => boolean,
 ): Promise<boolean> {
   if (replyCardModeFor(ds, msg.turnId) === 'legacy') {
-    finalizeCotMessage(ds, msg.turnId, 'ambiguous', msg.dispatchAttempt);
+    finalizeCotMessage(ds, msg.turnId, msg.silent ? 'completed' : 'ambiguous', msg.dispatchAttempt);
     return false;
   }
   try {
     if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
+    if (msg.silent) {
+      const store = new TurnReplyCardStore(config.session.dataDir);
+      const key = replyCardKey(ds, msg.turnId, msg.dispatchAttempt);
+      const record = store.read(key);
+      if (!record) return true;
+      if (!record.messageId && await store.retireUnpublishedDisplay(key)) return true;
+      // The first POST may have completed while we waited for its lock. In that
+      // case the helper returns false and this existing card continues through
+      // the ordinary silent-PATCH path below.
+    }
     await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
       // A failed cosmetic PATCH must not prevent persisting the terminal notice.
       logger.warn(`[reply-card] retirement tool flush: ${error.message}`);
     });
-    const retired = await updateTurnReplyCard(ds, msg.turnId, { kind: 'display_retired', notice: msg.message }, send,
-      { dispatchAttempt: msg.dispatchAttempt, owns });
+    const retired = await updateTurnReplyCard(ds, msg.turnId, {
+      kind: 'display_retired', ...(msg.message ? { notice: msg.message } : {}), silent: msg.silent === true,
+    }, send, { dispatchAttempt: msg.dispatchAttempt, owns });
     return retired !== undefined;
   } finally {
     const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt));
-    finalizeCotMessage(ds, msg.turnId, record?.finalDelivered && record.phase === 'completed' ? 'completed' : 'ambiguous', msg.dispatchAttempt);
+    // Silent retirement is a DISPLAY-only close after delivery/an earlier
+    // notice; it must not turn that evidence into a native failure assertion.
+    finalizeCotMessage(ds, msg.turnId,
+      msg.silent ? 'completed' : record?.finalDelivered && record.phase === 'completed' ? 'completed' : 'ambiguous',
+      msg.dispatchAttempt);
   }
 }
 

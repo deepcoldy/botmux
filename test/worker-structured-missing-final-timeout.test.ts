@@ -10,15 +10,21 @@ import {
 } from '../src/services/bridge-fallback-gate.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
-function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' | 'transcript'; zeroPrompt?: boolean; nativeIdentity?: boolean } = {}) {
+function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' | 'transcript'; zeroPrompt?: boolean; nativeIdentity?: boolean; provisionalStart?: boolean } = {}) {
   let now = 0;
   const queue = new CodexBridgeQueue(() => now);
   queue.mark('om_turn', 'question', now, opts.attempt);
-  queue.ingest([{ uuid: 'native-user-1', timestampMs: now, kind: 'user', text: 'question',
-    ...(opts.nativeIdentity ? {
-      sourceSessionId: 'provider', sourceTurnId: 'native-turn', sourceMessageId: 'message-old',
-    } : {}),
-  }]);
+  if (opts.provisionalStart) {
+    queue.ingest([{ uuid: 'native-task-started', timestampMs: now, kind: 'turn_started', text: '',
+      sourceSessionId: 'provider', sourceTurnId: 'native-provisional',
+    }]);
+  } else {
+    queue.ingest([{ uuid: 'native-user-1', timestampMs: now, kind: 'user', text: 'question',
+      ...(opts.nativeIdentity ? {
+        sourceSessionId: 'provider', sourceTurnId: 'native-turn', sourceMessageId: 'message-old',
+      } : {}),
+    }]);
+  }
   const scope: Record<string, any> = {
     lastInitConfig: { cliId, replyDelivery: opts.delivery ?? 'transcript', adoptMode: false, chatId: 'oc_own', rootMessageId: 'om_root' },
     replyDeliveryMode: () => opts.delivery ?? 'transcript',
@@ -29,7 +35,18 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     antigravityPendingRebind: false,
     antigravityBridgeState: () => ({}),
     hasAntigravityPendingTasks: () => false,
-    idleDetector: { programStatusHeldBusy: () => false },
+    idleDetector: {
+      programStatusHeldBusy: () => false,
+      programStatusActive: () => false,
+      programStatusBlock: () => null,
+    },
+    cliAdapter: { busyPattern: /busy/ },
+    tuiPromptBlocking: false,
+    hookReviewInputHold: false,
+    heldStuckPage: () => undefined,
+    traexQuestionHoldsHeldInput: () => false,
+    codexBridgePendingTail: '',
+    ompBridgeState: () => ({}),
     isPromptReady: true,
     hasStructuredLifecycleBlock: () => false,
     structuredRejectedReadyEvidenceGeneration: undefined,
@@ -59,6 +76,9 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     bridgeGateInputForTurn,
     finalBridgeSendMarkerCoversOwnThread,
   };
+  scope.structuredRpcLifecycleOwnerActive = loadWorkerFunction('structuredRpcLifecycleOwnerActive', scope);
+  scope.structuredMissingFinalHasLifecycleSignals = loadWorkerFunction('structuredMissingFinalHasLifecycleSignals', scope);
+  scope.structuredMissingFinalBlockedByPage = loadWorkerFunction('structuredMissingFinalBlockedByPage', scope);
   scope.structuredMissingFinalTarget = loadWorkerFunction('structuredMissingFinalTarget', scope);
   scope.notifyMissingFinalTurn = loadWorkerFunction('notifyMissingFinalTurn', scope);
   scope.missingFinalTurnDeliveredBySend = loadWorkerFunction('missingFinalTurnDeliveredBySend', scope);
@@ -66,10 +86,19 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
   return { scope, queue, settle, advance: (ms: number) => { now += ms; } };
 }
 
+function restoreStartedTurn(r: ReturnType<typeof workerRig>, markTimeMs: number): CodexPendingTurn {
+  r.queue.clearPending();
+  r.queue.restorePendingTurns([{ turnId: 'om_turn', fingerprint: 'question', markTimeMs }]);
+  r.queue.ingest([{ uuid: 'restored-native-user', timestampMs: markTimeMs, kind: 'user', text: 'question' }]);
+  const restored = r.queue.peek()[0]!;
+  expect(restored).toMatchObject({ turnId: 'om_turn', started: true, restoredFromJournal: true, markTimeMs });
+  return restored;
+}
+
 afterEach(() => vi.restoreAllMocks());
 
 describe('worker: missing structured final timeout', () => {
-  it.each(['codex', 'doubao', 'coco'])('retires the same idle started head for %s with a Web-terminal notice', cliId => {
+  it.each(['codex', 'doubao', 'grok'])('retires the same idle started head for %s with a Web-terminal notice', cliId => {
     const r = workerRig(cliId);
     vi.spyOn(Date, 'now').mockImplementation(() => 0);
     r.settle();
@@ -183,7 +212,7 @@ describe('worker: missing structured final timeout', () => {
     r.settle();
     expect(r.queue.peek()).toEqual([]);
     expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([{
-      type: 'turn_display_retired', turnId: 'om_turn', message: 'worker.structured_final_not_collected',
+      type: 'turn_display_retired', turnId: 'om_turn', message: '', silent: true,
     }]);
     expect(r.scope.structuredTurnsWithSubmitNotice.size).toBe(0);
   });
@@ -202,7 +231,7 @@ describe('worker: missing structured final timeout', () => {
     expect(r.queue.peek()).toEqual([]);
     expect(r.scope.readSendMarkers).toHaveBeenCalled();
     expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([{
-      type: 'turn_display_retired', turnId: 'om_turn', message: 'worker.structured_final_not_collected',
+      type: 'turn_display_retired', turnId: 'om_turn', message: '', silent: true,
     }]);
   });
 
@@ -236,9 +265,7 @@ describe('worker: missing structured final timeout', () => {
   it('uses the restored turn\'s persisted mark time instead of an absent in-memory write timestamp', () => {
     const r = workerRig('doubao');
     const clock = vi.spyOn(Date, 'now');
-    const restored = r.queue.peek()[0]!;
-    restored.restoredFromJournal = true;
-    restored.markTimeMs = 100;
+    restoreStartedTurn(r, 100);
     // Legacy marker without a turn id: only the persisted window admits it.
     // The old Date.now() fallback would discard this pre-restart final at 20s.
     r.scope.readSendMarkers.mockReturnValue([{
@@ -257,9 +284,7 @@ describe('worker: missing structured final timeout', () => {
   it('does not admit a legacy final older than the restored turn\'s persisted mark', () => {
     const r = workerRig('doubao');
     const clock = vi.spyOn(Date, 'now');
-    const restored = r.queue.peek()[0]!;
-    restored.restoredFromJournal = true;
-    restored.markTimeMs = 100;
+    restoreStartedTurn(r, 100);
     r.scope.readSendMarkers.mockReturnValue([{
       sentAtMs: 99, sessionId: 'sid-own', responseKind: 'final',
       deliveryKind: 'current_session_send', targetChatId: 'oc_own', targetRootMessageId: 'om_root',
@@ -339,6 +364,74 @@ describe('worker: missing structured final timeout', () => {
     expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([expect.objectContaining({
       type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn',
     })]);
+  });
+
+  it('keeps a real task_started-only claim on its original corroboration lease', () => {
+    const r = workerRig('codex', { provisionalStart: true });
+    const clock = vi.spyOn(Date, 'now');
+    expect(r.queue.peek()[0]).toMatchObject({ started: true, provisionalTaskStartedAtMs: 0 });
+    expect(r.queue.peek()[0]?.transcriptStartTimeMs).toBeUndefined();
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(100_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    expect(r.scope.send).not.toHaveBeenCalled();
+  });
+
+  it.each(['omp-provisional', 'antigravity-provisional', 'pending-tail'] as const)('keeps a collectible terminal behind %s', guard => {
+    const r = workerRig(guard === 'omp-provisional' ? 'oh-my-pi'
+      : guard === 'antigravity-provisional' ? 'antigravity' : 'codex');
+    const clock = vi.spyOn(Date, 'now');
+    if (guard === 'omp-provisional') r.scope.ompBridgeState = () => ({ provisionalFinal: { uuid: 'omp-final' } });
+    if (guard === 'antigravity-provisional') r.scope.antigravityBridgeState = () => ({ provisionalFinal: { uuid: 'agy-final' } });
+    if (guard === 'pending-tail') r.scope.codexBridgePendingTail = '{"role":"assistant","content":"partial';
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(100_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    expect(r.scope.codexBridgeIngest).not.toHaveBeenCalled();
+    expect(r.scope.send).not.toHaveBeenCalled();
+  });
+
+  it.each(['cursor', 'mtr', 'coco', 'hermes'])('does not arm the destructive timeout for %s without busy/OSC evidence', cliId => {
+    const r = workerRig(cliId);
+    const clock = vi.spyOn(Date, 'now');
+    r.scope.cliAdapter = {};
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(100_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    expect(r.scope.send).not.toHaveBeenCalled();
+  });
+
+  it('keeps an OSC-only CLI eligible without a screen busy pattern', () => {
+    const r = workerRig('codex');
+    const clock = vi.spyOn(Date, 'now');
+    r.scope.cliAdapter = {};
+    r.scope.idleDetector.programStatusActive = () => true;
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
+  });
+
+  it.each(['tui-prompt', 'hook-review', 'osc-blocked', 'traex-question'] as const)('does not retire an active %s wait', guard => {
+    const r = workerRig(guard === 'traex-question' ? 'traex' : 'codex');
+    const clock = vi.spyOn(Date, 'now');
+    if (guard === 'tui-prompt') r.scope.tuiPromptBlocking = true;
+    if (guard === 'hook-review') r.scope.hookReviewInputHold = true;
+    if (guard === 'osc-blocked') r.scope.idleDetector.programStatusBlock = () => ({ kind: 'question' });
+    if (guard === 'traex-question') r.scope.traexQuestionHoldsHeldInput = () => true;
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(100_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    expect(r.scope.send).not.toHaveBeenCalled();
   });
 
   it.each([

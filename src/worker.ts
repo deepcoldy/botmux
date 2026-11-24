@@ -14304,15 +14304,12 @@ function codexBridgeUsesSplitLiveAttach(): boolean {
  *  may let a transcript-started turn override the screen-ready heuristic. */
 function hasStructuredLifecycleBlock(): boolean {
   if (traexQuotaPending) return true;
-  if (rpcTurnsAwaitingActivation.size > 0) return true;
-  if (rpcLifecycleFailClosedOwners.size > 0) return true;
-  if (rpcTerminalHydrationOwners.size > 0) return true;
   // rpcActive is an explicit native app-server ownership proof and is valid for
   // every RPC-capable Codex-family adapter (currently codex + traex), including
   // drivers intentionally excluded from transcript-only lifecycle blocking.
-  if (codexBridgeQueue.peek().some(turn =>
+  if (structuredRpcLifecycleOwnerActive(codexBridgeQueue.peek().find(turn =>
     turn.rpcActive === true && turn.finalText === undefined,
-  )) return true;
+  ))) return true;
   return isStructuredBridgeLifecycleBlockingCli(lastInitConfig?.cliId)
     && codexBridgeQueue.hasBlockingTurn();
 }
@@ -16925,6 +16922,32 @@ function missingFinalTurnDeliveredBySend(turn: CodexPendingTurn): boolean {
     .some(marker => finalBridgeSendMarkerCoversOwnThread(target, marker));
 }
 
+function structuredRpcLifecycleOwnerActive(turn?: CodexPendingTurn): boolean {
+  return turn?.rpcActive === true
+    || rpcTurnsAwaitingActivation.size > 0
+    || rpcLifecycleFailClosedOwners.size > 0
+    || rpcTerminalHydrationOwners.size > 0
+    || rpcActiveOwners.size > 0
+    || settlingRpcTerminalOwners.size > 0;
+}
+
+function structuredMissingFinalHasLifecycleSignals(): boolean {
+  return !!cliAdapter?.busyPattern
+    || typeof cliAdapter?.isSessionBusy === 'function'
+    || idleDetector?.programStatusActive() === true;
+}
+
+function structuredMissingFinalBlockedByPage(): boolean {
+  // A quiet Ask/permission/review page is a LIVE wait, not a completed turn.
+  // Reuse the existing terminal/page evidence instead of inventing a second
+  // idle detector for those surfaces.
+  return tuiPromptBlocking
+    || hookReviewInputHold
+    || !!idleDetector?.programStatusBlock()
+    || !!heldStuckPage()
+    || traexQuestionHoldsHeldInput();
+}
+
 interface StructuredMissingFinalTarget {
   key: string;
   turn: CodexPendingTurn;
@@ -16940,15 +16963,19 @@ function structuredMissingFinalTarget(): StructuredMissingFinalTarget | undefine
   if (replyDeliveryMode() !== 'transcript' && !zeroPromptTerminalSync()) return undefined;
   const turn = codexBridgeQueue.peek()[0];
   if (!turn?.started || turn.finalText !== undefined || turn.isLocal) return undefined;
+  if (!structuredMissingFinalHasLifecycleSignals() || structuredMissingFinalBlockedByPage()) return undefined;
+  // task_started-only claims retain their original, much longer corroboration
+  // lease. A 20s screen wait must not turn that provisional start into a drop.
+  if (turn.provisionalTaskStartedAtMs !== undefined) return undefined;
+  // A driver-held terminal or a torn trailing line is still collectible input
+  // to the existing quiet flush/read path, never evidence of a missing final.
+  if (codexBridgePendingTail) return undefined;
+  if (structuredBridgeIs('oh-my-pi') && ompBridgeState().provisionalFinal) return undefined;
+  if (structuredBridgeIs('antigravity') && antigravityBridgeState().provisionalFinal) return undefined;
   // RPC execution can be legitimately silent for a long time, and activation
   // hand-off deliberately freezes ingest. No RPC lifecycle owner may use this
   // screen/quiet watchdog, including an owner behind a predecessor queue head.
-  if (turn.rpcActive === true
-    || rpcTurnsAwaitingActivation.size > 0
-    || rpcLifecycleFailClosedOwners.size > 0
-    || rpcTerminalHydrationOwners.size > 0
-    || rpcActiveOwners.size > 0
-    || settlingRpcTerminalOwners.size > 0) return undefined;
+  if (structuredRpcLifecycleOwnerActive(turn)) return undefined;
   // The authoritative replacement transcript is not bound yet. Ingest and the
   // existing Antigravity quiet flush both bail here, so a timeout cannot prove
   // that the final is absent from the unbound file either.
@@ -17008,7 +17035,8 @@ function maybeSettleMissingStructuredFinal(): void {
       send({
         type: 'turn_display_retired',
         turnId: turn.turnId,
-        message: t('worker.structured_final_not_collected', { cliName: cliName() }),
+        message: '',
+        silent: true,
       });
     } else {
       notifyMissingFinalTurn(turn.turnId);

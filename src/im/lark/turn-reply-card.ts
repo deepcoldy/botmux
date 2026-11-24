@@ -229,10 +229,14 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     // can turn escaped fences into real ones and thereby hand back image syntax
     // that was inert when we scanned. Run the same normalization first so the
     // strip sees exactly the text the renderer will parse.
-    const content = latest
-      ? stripCardMarkdownImages(prepareCardMarkdown(bounded(latest, 6000), presentation.workingDir, 'disabled'))
-      : terminal ? (en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
-        : (en ? 'Working on your request…' : '正在处理你的请求…');
+    const content = record.displayRetired && record.progress.length === 0
+      // Silent display retirement after external delivery/an earlier notice has
+      // no warning body to add. Do not synthesise the generic "no final" prose.
+      ? ''
+      : latest
+        ? stripCardMarkdownImages(prepareCardMarkdown(bounded(latest, 6000), presentation.workingDir, 'disabled'))
+        : terminal ? (en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
+          : (en ? 'Working on your request…' : '正在处理你的请求…');
     card.body.elements.push(...buildCardBodyElements(content, presentation.workingDir, 'disabled')
       .map((element, index) => ({ ...element, element_id: element.element_id ?? `botmux_turn_progress_${index}` })));
   }

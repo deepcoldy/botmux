@@ -24263,7 +24263,10 @@ function setupWorkerHandlers(
             (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }), ownsLifecycleMutation);
         } catch (error) {
           if (!ownsLifecycleMutation()) break;
-          logger.warn(`[${t}] reply-card retirement failed; delivering the warning through the existing notice path`);
+          logger.warn(msg.silent
+            ? `[${t}] silent reply-card retirement failed; no notice fallback`
+            : `[${t}] reply-card retirement failed; delivering the warning through the existing notice path`);
+          if (msg.silent) break;
           await sendTurnNotice(ds, { kind: 'user_notify', turnId: msg.turnId, msgType: 'text', content: msg.message }, ownsLifecycleMutation);
         }
         break;

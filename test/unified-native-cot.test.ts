@@ -348,6 +348,119 @@ describe('unified replies with an independent native CoT channel', () => {
     }
   });
 
+  it('silently retires an external-final display without adding a contradictory warning', async () => {
+    bot.config.replyCardNativeCot = true;
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' };
+    // Prepare a real record without ever displaying a card or native bubble.
+    new TurnReplyCardStore(dir).prepareSync(key, { mode: 'unified', chatId: ds.chatId, rootId: ds.session.rootMessageId });
+    expect(await new TurnReplyCardStore(dir).noteExternalFinal(key, ds.chatId)).toBe(true);
+    const fallback = vi.fn(async () => {});
+    const handle = loadWorkerPoolMessageHandlers(['turn_display_retired'], {
+      ds, t: 'fixture', logger: { warn: vi.fn(), error: vi.fn() }, emitSessionLifecycleHook: vi.fn(),
+      sendTurnNotice: fallback, fallbackTurnId: (_ds: unknown, turn: string) => turn,
+      managedAuxUiSuppressed: () => false, ownsLifecycleMutation: () => true,
+      finalizeCotMessage, replyCardModeFor, flushTurnReplyTools, retireReplyCardDisplay,
+      scopedReply: (body: string, type: string, _turn: string, opts: any) => send(body, type, opts.uuid, opts.beforeWrite),
+    }, true);
+    ds.replyCardRunningTurnId = 'om_turn';
+    await handle({ type: 'turn_display_retired', turnId: 'om_turn', message: '', silent: true });
+    await settle();
+    expect(ds.replyCardRunningTurnId).toBeUndefined();
+    expect(fallback).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(new TurnReplyCardStore(dir).read(key)).toMatchObject({
+      externalFinal: true, phase: 'completed', displayRetired: true, progress: [],
+    });
+    // A later recovery pass sees the persisted display retirement and still
+    // does not create a card for the already externally delivered turn.
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'recover' }, send);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('retires a visible external-final card to a silent completed display', async () => {
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' };
+    expect(await new TurnReplyCardStore(dir).noteExternalFinal(key, ds.chatId)).toBe(true);
+    const fallback = vi.fn(async () => {});
+    const handle = loadWorkerPoolMessageHandlers(['turn_display_retired'], {
+      ds, t: 'fixture', logger: { warn: vi.fn(), error: vi.fn() }, emitSessionLifecycleHook: vi.fn(),
+      sendTurnNotice: fallback, fallbackTurnId: (_ds: unknown, turn: string) => turn,
+      managedAuxUiSuppressed: () => false, ownsLifecycleMutation: () => true,
+      finalizeCotMessage, replyCardModeFor, flushTurnReplyTools, retireReplyCardDisplay,
+      scopedReply: (body: string, type: string, _turn: string, opts: any) => send(body, type, opts.uuid, opts.beforeWrite),
+    }, true);
+    await handle({ type: 'turn_display_retired', turnId: 'om_turn', message: '', silent: true });
+    await settle();
+    expect(fallback).not.toHaveBeenCalled();
+    expect(new TurnReplyCardStore(dir).read(key)).toMatchObject({
+      phase: 'completed', externalFinal: true, displayRetired: true, progress: [],
+    });
+    expect(new TurnReplyCardStore(dir).read(key)?.lastCard).not.toContain('botmux_turn_progress_');
+  });
+
+  it('continues silent retirement when the first card POST completes while retirement waits for its lock', async () => {
+    let createStarted!: () => void;
+    let releaseCreate!: () => void;
+    const started = new Promise<void>(resolve => { createStarted = resolve; });
+    const gate = new Promise<void>(resolve => { releaseCreate = resolve; });
+    send.mockImplementationOnce(async (_body, _type, _uuid, beforeWrite) => {
+      await beforeWrite();
+      createStarted();
+      await gate;
+      return 'om_answer';
+    });
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' };
+    new TurnReplyCardStore(dir).prepareSync(key, { mode: 'unified', chatId: ds.chatId, rootId: ds.session.rootMessageId });
+    expect(await new TurnReplyCardStore(dir).noteExternalFinal(key, ds.chatId)).toBe(true);
+    const creating = updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    await started;
+    const retiring = retireReplyCardDisplay(ds, { turnId: 'om_turn', message: '', silent: true }, send, () => true);
+    releaseCreate();
+    await Promise.all([creating, retiring]);
+    expect(new TurnReplyCardStore(dir).read(key)).toMatchObject({
+      messageId: 'om_answer', phase: 'completed', displayRetired: true, externalFinal: true,
+    });
+  }, 10_000);
+
+  it('does not fall back to a warning when silent retirement PATCH fails after a delivered final', async () => {
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_turn', finalAnswer('Already delivered'), send);
+    vi.mocked(updateMessage)
+      .mockRejectedValueOnce(new Error('PATCH unavailable'))
+      .mockRejectedValueOnce(new Error('PATCH unavailable'))
+      .mockRejectedValueOnce(new Error('PATCH unavailable'));
+    const fallback = vi.fn(async () => {});
+    const handle = loadWorkerPoolMessageHandlers(['turn_display_retired'], {
+      ds, t: 'fixture', logger: { warn: vi.fn(), error: vi.fn() }, emitSessionLifecycleHook: vi.fn(),
+      sendTurnNotice: fallback, fallbackTurnId: (_ds: unknown, turn: string) => turn,
+      managedAuxUiSuppressed: () => false, ownsLifecycleMutation: () => true,
+      finalizeCotMessage, replyCardModeFor, flushTurnReplyTools, retireReplyCardDisplay,
+      scopedReply: (body: string, type: string, _turn: string, opts: any) => send(body, type, opts.uuid, opts.beforeWrite),
+    }, true);
+    await handle({ type: 'turn_display_retired', turnId: 'om_turn', message: '', silent: true });
+    await settle();
+    expect(fallback).not.toHaveBeenCalled();
+    expect(new TurnReplyCardStore(dir).read({
+      larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+    })).toMatchObject({ finalDelivered: true, displayRetired: true, progress: [] });
+  });
+
+  it('keeps silent legacy retirement off the user-visible warning path', async () => {
+    bot.config.replyCardMode = 'legacy';
+    const fallback = vi.fn(async () => {});
+    const handle = loadWorkerPoolMessageHandlers(['turn_display_retired'], {
+      ds, t: 'fixture', logger: { warn: vi.fn(), error: vi.fn() }, emitSessionLifecycleHook: vi.fn(),
+      sendTurnNotice: fallback, fallbackTurnId: (_ds: unknown, turn: string) => turn,
+      managedAuxUiSuppressed: () => false, ownsLifecycleMutation: () => true,
+      finalizeCotMessage, replyCardModeFor, flushTurnReplyTools, retireReplyCardDisplay,
+      scopedReply: send,
+    }, true);
+    await handle({ type: 'turn_display_retired', turnId: 'om_turn', message: '', silent: true });
+    await settle();
+    expect(fallback).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it('coalesces overlapping display retirement and user notification into the existing topic reply card', async () => {
     bot.config.replyCardNativeCot = true;
     await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);

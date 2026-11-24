@@ -101,7 +101,7 @@ export type TurnReplyCardEvent =
   | { kind: 'final'; text: string; card: string; source: 'explicit' | 'bridge'; feedback?: TurnReplyCardRecord['feedback'] }
   | { kind: 'phase'; phase: 'working' | 'waiting' | 'stopping' }
   | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
-  | { kind: 'display_retired'; notice: string }
+  | { kind: 'display_retired'; notice?: string; silent?: boolean }
   | { kind: 'refresh' }
   /** Set or clear the next-step row; valid after the terminal edge too. */
   | { kind: 'next_step'; nextStep?: import('../im/lark/next-step-card.js').NextStepButton }
@@ -225,6 +225,23 @@ export class TurnReplyCardStore {
     }, { maxWaitMs: 8_000 });
   }
 
+  /** Persist a DISPLAY-only close for a prepared record that was never shown.
+   *  No provider I/O, final delivery or native completion timestamp is invented;
+   *  recovery must not create a fresh card for this retired display later. */
+  async retireUnpublishedDisplay(key: TurnReplyCardKey): Promise<boolean> {
+    if (!this.read(key)) return false;
+    return withFileLock(this.path(key), async () => {
+      const record = this.read(key);
+      if (!record || record.messageId || record.withdrawn) return false;
+      record.displayRetired = true;
+      record.phase = 'completed';
+      delete record.pendingPatch;
+      delete record.publishPending;
+      this.write(key, record);
+      return true;
+    });
+  }
+
   async update(key: TurnReplyCardKey, inputEvent: TurnReplyCardEvent | (() => TurnReplyCardEvent), io: TurnReplyCardTransport): Promise<{
     messageId?: string; delivered: boolean; card?: string; record: TurnReplyCardRecord;
   }> {
@@ -255,8 +272,8 @@ export class TurnReplyCardStore {
       const displayRetirement = event.kind === 'display_retired';
       if (event.kind === 'display_retired') {
         if (!replyCardIsTerminal(record) || record.displayRetired) record.displayRetired = true;
-        event = { kind: 'terminal', phase: record.finalDelivered ? 'completed' : 'ambiguous',
-          ...(record.finalDelivered ? {} : { notice: event.notice }) };
+        event = { kind: 'terminal', phase: record.finalDelivered || event.silent ? 'completed' : 'ambiguous',
+          ...(record.finalDelivered || event.silent ? {} : { notice: event.notice }) };
       }
       const terminal = replyCardIsTerminal(record) && !record.disconnected;
       record.updatedAtMs = Date.now();

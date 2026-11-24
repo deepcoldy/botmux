@@ -2924,7 +2924,7 @@ export type WorkerToDaemonBase =
    * bridges. Cosmetic channel: it must never influence turn
    * settlement, final_output attribution, or durable receipts. */
   /** Cosmetic closure when a structured attribution lease retires without a task terminal. */
-  | { type: 'turn_display_retired'; turnId: string; dispatchAttempt?: number; message: string }
+  | { type: 'turn_display_retired'; turnId: string; dispatchAttempt?: number; message: string; silent?: boolean }
   | { type: 'thinking_update'; sessionId?: string; entries: CotEntry[]; turnId: string; dispatchAttempt?: number }
   /** A confirmed steer retired this exact timeline. Cosmetic only: this is
    * not a turn_terminal or a successful durable-delivery receipt. */

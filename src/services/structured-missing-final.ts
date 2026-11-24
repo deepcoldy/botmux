@@ -8,6 +8,10 @@ export class StructuredMissingFinalWatchdog {
   private candidate: { key: string; sinceMs: number } | undefined;
 
   constructor(private readonly timeoutMs: number = 20_000) {
+    // 20s is a UI collection bound, deliberately much longer than the 2s PTY
+    // quiescence edge and aligned with the existing 20s structured submit
+    // hand-off. It is NOT a provider deadline: the worker arms it only after
+    // lifecycle-capable idle evidence, and resets it on output/activity.
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error('Invalid missing-final timeout');
   }
 
