@@ -11,6 +11,7 @@ export const QUOTED_READ_USAGE = 'botmux quoted <message_id> [<id> ...] [--raw] 
 export { parseHistoryReadOptions } from '../core/history-read-options.js';
 export type { HistoryReadOptions } from '../core/history-read-options.js';
 import type { HistoryReadOptions } from '../core/history-read-options.js';
+import { rejectDuplicateReadFlags } from '../core/history-read-options.js';
 
 export async function mapHistoryReads<T, U>(items: readonly T[], work: (item: T) => Promise<U>, concurrency = 4): Promise<U[]> {
   if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error('Invalid message read concurrency');
@@ -109,6 +110,9 @@ export async function readHistoryMessages(
 }
 
 export function parseQuotedReadOptions(args: string[]) {
+  rejectDuplicateReadFlags(args, {
+    valueFlags: ['--session-id'], boolFlags: ['--raw', '--no-download', '--remote-runner-session-tool'],
+  });
   const messageIds: string[] = [];
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];

@@ -16,6 +16,24 @@ export interface HistoryReadFilterOptions {
   withCardJson?: boolean;
 }
 
+/** Reject repeated options before a relay can collapse them into a Map. Direct
+ * argv parsing and every structured boundary therefore share one fail-closed
+ * contract instead of choosing different first/last values across trust zones. */
+export function rejectDuplicateReadFlags(args: readonly string[], known: {
+  valueFlags: readonly string[]; boolFlags: readonly string[];
+}): void {
+  const knownFlags = new Set([...known.valueFlags, ...known.boolFlags]);
+  const seen = new Set<string>();
+  for (const arg of args) {
+    if (!arg.startsWith('--')) continue;
+    const eq = arg.indexOf('=');
+    const flag = eq > 0 ? arg.slice(0, eq) : arg;
+    if (!knownFlags.has(flag)) continue;
+    if (seen.has(flag)) throw new Error(`${flag} must not be repeated`);
+    seen.add(flag);
+  }
+}
+
 /** Values remain single argv entries, including queries beginning with --. */
 export function historyReadFilterArgs(options: HistoryReadFilterOptions): string[] {
   return [
@@ -51,6 +69,10 @@ export function normalizeHistoryReadFilters(raw: Record<string, unknown>): Histo
 }
 
 export function parseHistoryReadOptions(args: string[]): HistoryReadOptions {
+  rejectDuplicateReadFlags(args, {
+    valueFlags: ['--limit', '--scope', '--session-id', '--view', '--query', '--type', '--since', '--until'],
+    boolFlags: ['--with-card-json'],
+  });
   // Same two spellings unknownFlags() admits: `--flag value` and `--flag=value`.
   // An admitted spelling that is not read here would silently fall back to the
   // unfiltered full view.

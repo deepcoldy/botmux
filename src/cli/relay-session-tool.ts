@@ -12,7 +12,7 @@
  */
 import { constants as fsConstants, closeSync, mkdirSync, openSync, writeSync } from 'node:fs';
 import { basename, join } from 'node:path';
-import { normalizeHistoryReadFilters } from '../core/history-read-options.js';
+import { normalizeHistoryReadFilters, rejectDuplicateReadFlags } from '../core/history-read-options.js';
 import type {
   RemoteRunnerSessionToolAttachment,
   RemoteRunnerSessionToolRequest,
@@ -50,6 +50,11 @@ export function buildRelaySessionToolRequest(
   const valueFlags = new Set(tool === 'history'
     ? ['--limit', '--scope', '--session-id', '--view', '--query', '--type', '--since', '--until'] : ['--session-id']);
   const boolFlags = new Set(tool === 'history' ? ['--with-card-json'] : ['--raw', '--no-download']);
+  try {
+    rejectDuplicateReadFlags(args, {
+      valueFlags: [...valueFlags], boolFlags: [...boolFlags],
+    });
+  } catch (error) { return { ok: false, error: (error as Error).message }; }
   const values = new Map<string, string>();
   const bools = new Set<string>();
   const positionals: string[] = [];

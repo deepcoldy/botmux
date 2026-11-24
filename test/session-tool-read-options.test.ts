@@ -57,6 +57,31 @@ describe('session read options across the sandbox and host boundary', () => {
   });
 
   it.each([
+    { name: 'query', args: ['--query', 'first', '--query', 'second'] },
+    { name: 'type', args: ['--type', 'text', '--type', 'post'] },
+    { name: 'since', args: ['--since', '2026-11-24', '--since', '2026-11-23'] },
+    { name: 'until', args: ['--until', '2026-11-24', '--until', '2026-11-23'] },
+    { name: 'view', args: ['--view', 'full', '--view', 'index'] },
+    { name: 'limit', args: ['--limit', '10', '--limit', '20'] },
+    { name: 'scope', args: ['--scope', 'chat', '--scope', 'thread'] },
+    { name: 'session-id', args: ['--session-id', 'session-current', '--session-id', 'other'] },
+    { name: 'with-card-json', args: ['--with-card-json', '--with-card-json'] },
+  ])('rejects duplicate history option $name on both direct and relay boundaries', ({ args }) => {
+    expect(() => parseHistoryReadOptions(args)).toThrow(/must not be repeated/);
+    expect(buildRelaySessionToolRequest('history', args, 'session-current').ok).toBe(false);
+  });
+
+  it.each([
+    ['--raw', '--raw'],
+    ['--no-download', '--no-download'],
+    ['--session-id', 'session-current', '--session-id', 'other'],
+  ])('rejects duplicate quoted option %s on both direct and relay boundaries', (...args) => {
+    const argv = ['om_probe', ...args];
+    expect(() => parseQuotedReadOptions(argv)).toThrow(/must not be repeated/);
+    expect(buildRelaySessionToolRequest('quoted', argv, 'session-current').ok).toBe(false);
+  });
+
+  it.each([
     { view: 'index', withCardJson: true },
     { query: { text: 'not a string' } },
     { types: ['text', '--session-id'] },

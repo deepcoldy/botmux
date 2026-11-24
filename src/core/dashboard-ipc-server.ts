@@ -4789,14 +4789,28 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   let userTargetStillValid = false;
   try {
     const liveBot = getBot(targetLarkAppId!).config;
+    const targetMatches = (candidate: Pick<DaemonSession, 'session' | 'larkAppId' | 'chatId'>): boolean =>
+      candidate.larkAppId === targetLarkAppId && candidate.chatId === targetChatId
+      && candidate.session.sessionId === params.sessionId
+      && (targetSessionChatId !== undefined
+        ? candidate.session.chatId === targetSessionChatId
+        // Older active sessions can lack the stored chat field. Its absence is
+        // not contradictory evidence; a present, different chat still refuses.
+        : candidate.session.chatId === undefined || candidate.session.chatId === targetChatId);
+    const liveDs = detachedForUser ? undefined : findActiveBySessionId(params.sessionId);
+    const liveDetached = detachedForUser && backgroundInput
+      ? resolveRegisteredBackgroundContext(backgroundInput) : null;
     userTargetStillValid = liveBot.larkAppId === targetLarkAppId && liveBot.apiOnly !== true
       && boundLarkToolRequest(req, params.sessionId, targetLarkAppId, liveBot)
-      && (ds
-        ? ds.larkAppId === targetLarkAppId && ds.chatId === targetChatId
-          && ds.session.sessionId === params.sessionId && ds.session.chatId === targetSessionChatId
-          && !ds.session.headless && !sessionTransportDisabled(ds)
-        : !!detachedForUser && detachedForUser.larkAppId === targetLarkAppId
-          && detachedForUser.chatId === targetChatId && !sessionTransportDisabled(detachedForUser));
+      && (detachedForUser
+        ? !!liveDetached && liveDetached.job.id === detachedForUser.job.id
+          && targetMatches(liveDetached) && !liveDetached.session.headless
+          // A detached stored identity can remain valid while the active registry
+          // is replaced. Check that live replacement too, not only the old snapshot.
+          && (!liveDetached.ds || (targetMatches(liveDetached.ds) && !liveDetached.ds.session.headless))
+          && !sessionTransportDisabled(liveDetached)
+        : !!liveDs && liveDs.session.status === 'active' && targetMatches(liveDs)
+          && !liveDs.session.headless && !sessionTransportDisabled(liveDs));
   } catch { /* Unknown live configuration cannot authorize credential export. */ }
   if (!userTargetStillValid
     || !stableAfterAwait
