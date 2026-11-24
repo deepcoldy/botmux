@@ -18,14 +18,15 @@ import {
 } from '../src/core/group-session-supervision.js';
 import { parseSupervisionAssessment, type SupervisionAssessment } from '../src/core/group-session-supervision-assessment.js';
 import { groupSessionSupervisorConfig, sameGroupSessionSupervisor } from '../src/core/group-session-supervisor-config.js';
-import { reviewGroupSessionTask } from '../src/core/group-session-supervision-review.js';
+import { deriveGroupSupervisionCriteria, reviewGroupSessionTask } from '../src/core/group-session-supervision-review.js';
 import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
 import type { SessionLastTurn } from '../src/core/session-task-status.js';
 import { noteFinalReplyText, recordTurnOutcome, turnFinalText, turnOutcomePendingOrChanged } from '../src/core/turn-outcome.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { isForkSourceBusy } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
-import type { Session } from '../src/types.js';
+import { appendMessage, findQueuedMessage } from '../src/services/message-queue.js';
+import type { LarkMessage, Session } from '../src/types.js';
 
 const REWORK = { verdict: 'rework', missing: [1], reason: 'Affected tests still fail' } as const;
 const WAIT = { verdict: 'wait', evidence: 'Test evidence', reason: 'CI still running', minutes: 5 } as const;
@@ -36,17 +37,20 @@ function usePassingReview(review: ReturnType<typeof fixture>['io']['review']) {
     : { verdict: 'accepted', evidence: [answer] });
 }
 
-function fixture(session = {} as Session) {
+function fixture(session = {} as Session, criteria = 'The build and affected tests are green') {
   const task = newGroupSessionSupervision({
     requester: 'ou_requester', chatId: 'oc_group', anchor: 'om_root',
     reviewer: { botAppId: 'local_reviewer', model: 'test-model' },
-    task: 'Fix the build', criteria: 'The build and affected tests are green', turnId: 'om_task',
+    task: 'Fix the build', criteria, turnId: 'om_task',
   }, 1);
   session.groupSessionSupervision = task;
   const io = {
     allowed: vi.fn(() => true),
     current: vi.fn(() => true),
     finalText: vi.fn<GroupSessionSupervisionIo['finalText']>(() => 'Test evidence'),
+    deriveCriteria: vi.fn<GroupSessionSupervisionIo['deriveCriteria']>(async task => ({
+      task: task.task, criteria: 'The build passes',
+    })),
     review: vi.fn<GroupSessionSupervisionIo['review']>(async () => ({ ...REWORK, missing: [...REWORK.missing] })),
     serializeAdmission: vi.fn<GroupSessionSupervisionIo['serializeAdmission']>(async action => action()),
     canDispatch: vi.fn(() => true),
@@ -90,6 +94,40 @@ describe('group session supervision', () => {
     expect(io.review.mock.calls.map(call => call[3])).toEqual(['completion', 'acceptance']);
     expect(session.groupSessionSupervision?.state).toBe('accepted');
     expect(io.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('retries criteria preparation after restart and saves criteria before reviewing the finished turn', async () => {
+    const { session, task, io, outcome } = fixture(undefined, '');
+    expect(task.state).toBe('preparing');
+    io.deriveCriteria.mockResolvedValueOnce(undefined);
+    await outcome();
+    const saved = JSON.parse(JSON.stringify(session)) as Session;
+    const checkAt = saved.groupSessionSupervision!.checkAt!;
+    const delivered = { turnId: task.turnId, at: 10, outcome: 'delivered' as const };
+    await observeGroupSessionSupervision(saved, { now: checkAt - 1, outcome: delivered }, io);
+    expect(io.deriveCriteria).toHaveBeenCalledOnce();
+    await observeGroupSessionSupervision(saved, { now: checkAt, outcome: delivered }, io);
+    expect(saved.groupSessionSupervision).toMatchObject({ criteria: 'The build passes', state: 'watching' });
+    expect(io.review).not.toHaveBeenCalled();
+    usePassingReview(io.review);
+    await observeGroupSessionSupervision(saved, { now: checkAt, outcome: delivered }, io);
+    await observeGroupSessionSupervision(saved, { now: checkAt, outcome: delivered }, io);
+    expect(saved.groupSessionSupervision?.state).toBe('accepted');
+    expect(io.deriveCriteria).toHaveBeenCalledTimes(2);
+    expect(io.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('discards derived criteria if supervision switches to explicit criteria while preparing', async () => {
+    const { task, session, io, outcome } = fixture(undefined, '');
+    io.deriveCriteria.mockImplementation(async () => {
+      replaceGroupSessionSupervision(session, newGroupSessionSupervision({
+        ...task, criteria: 'User supplied criteria',
+      }), io.persist);
+      return { task: task.task, criteria: 'Outdated generated criteria' };
+    });
+    await outcome();
+    expect(session.groupSessionSupervision).toMatchObject({ criteria: 'User supplied criteria', state: 'watching' });
+    expect(io.review).not.toHaveBeenCalled();
   });
 
   it('persists each rework identity before dispatch and does not exceed the round limit', async () => {
@@ -370,6 +408,16 @@ describe('group session supervision with the session store', () => {
     return f;
   }
 
+  it('loads the whole authored turn by message and sender from the local queue', () => {
+    const message = {
+      messageId: 'om_task', senderId: 'ou_requester', content: `${'a'.repeat(8_000)} 不要部署`,
+    } as LarkMessage;
+    appendMessage('oc_group', message);
+    appendMessage('oc_group', { ...message, senderId: 'ou_other', content: 'Other bot view' });
+    expect(findQueuedMessage('oc_group', 'om_task', 'ou_requester')?.content).toBe(message.content);
+    expect(findQueuedMessage('oc_group', 'om_task', 'ou_missing')).toBeUndefined();
+  });
+
   it('uses Magpie only on loopback and checks its verdicts and evidence', async () => {
     const reviewer = { provider: 'magpie', model: 'claude/sonnet' } as const;
     const task = { ...storedFixture().task, reviewer };
@@ -400,6 +448,13 @@ describe('group session supervision with the session store', () => {
       expect(await reviewGroupSessionTask(reviewer, task, 'Build and tests passed', signal, 'acceptance')).toEqual({
         verdict: 'needs_user', reason: '',
       });
+      transport.mockResolvedValueOnce(Response.json({ choices: [{
+        finish_reason: 'stop', message: { content: JSON.stringify({ criteria: ['The build passes', 'Provide the build result'] }) },
+      }] }));
+      expect(await deriveGroupSupervisionCriteria(task, signal)).toBe('The build passes\nProvide the build result');
+      expect(transport).toHaveBeenLastCalledWith('http://127.0.0.1:3425/v1/chat/completions', expect.objectContaining({
+        body: expect.stringContaining('original_task'),
+      }));
     } finally {
       __setLoopbackTransportForTests(restore);
     }

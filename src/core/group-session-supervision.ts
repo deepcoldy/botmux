@@ -28,7 +28,7 @@ export interface GroupSessionSupervision {
   /** Original human turn for notices, even after an unattended continuation. */
   originTurnId?: string;
   round: number;
-  state: 'watching' | 'pending_review' | 'waiting' | 'accepted' | 'needs_user';
+  state: 'preparing' | 'watching' | 'pending_review' | 'waiting' | 'accepted' | 'needs_user';
   reason?: SupervisionReason;
   observedAt?: number;
   checkAt?: number;
@@ -60,6 +60,7 @@ export interface GroupSessionSupervisionIo {
   allowed(task: GroupSessionSupervision): boolean;
   current(turnId: string): boolean;
   finalText(turnId: string): string | undefined;
+  deriveCriteria(task: GroupSessionSupervision, signal: AbortSignal): Promise<{ criteria: string; task: string } | undefined>;
   review(task: GroupSessionSupervision, answer: string, signal: AbortSignal, stage: SupervisionReviewStage): Promise<SupervisionAssessment | undefined>;
   serializeAdmission(action: () => void): Promise<void>;
   persist(): void;
@@ -72,7 +73,8 @@ export interface GroupSessionSupervisionIo {
 const reviews = new WeakMap<Session, AbortController>();
 
 export function groupSupervisionTracking(task?: GroupSessionSupervision): task is GroupSessionSupervision {
-  return task?.state === 'watching' || task?.state === 'waiting' || task?.state === 'pending_review';
+  return task?.state === 'preparing' || task?.state === 'watching'
+    || task?.state === 'waiting' || task?.state === 'pending_review';
 }
 
 export function replaceGroupSessionSupervision(
@@ -94,7 +96,10 @@ export function newGroupSessionSupervision(
   input: Pick<GroupSessionSupervision, 'requester' | 'requesterUnionId' | 'reviewer' | 'chatId' | 'anchor' | 'task' | 'criteria' | 'turnId'>,
   now = Date.now(),
 ): GroupSessionSupervision {
-  return { ...input, id: randomUUID(), originTurnId: input.turnId, round: 0, state: 'watching', observedAt: now };
+  return {
+    ...input, id: randomUUID(), originTurnId: input.turnId, round: 0,
+    state: input.criteria ? 'watching' : 'preparing', observedAt: now,
+  };
 }
 
 export function stopGroupSessionSupervision(session: Session, persist: () => void): void {
@@ -111,7 +116,7 @@ export function stopGroupSessionSupervision(session: Session, persist: () => voi
 
 export function resumeGroupSessionSupervision(task: GroupSessionSupervision, turnId: string, now: number): GroupSessionSupervision {
   return {
-    ...task, turnId, state: 'watching', reason: undefined, observedAt: now, checkAt: undefined,
+    ...task, turnId, state: task.criteria ? 'watching' : 'preparing', reason: undefined, observedAt: now, checkAt: undefined,
     reviewEpoch: (task.reviewEpoch ?? 0) + 1, reviewAttempt: 0, round: 0, waitChecks: 0, notifiedKey: undefined,
     reviewEvidence: undefined, park: undefined, decision: undefined, ownerDecision: undefined, probes: 0,
   };
@@ -138,7 +143,7 @@ export function chooseGroupSupervisionDecision(
 export function groupSupervisionNotice(task: GroupSessionSupervision): 'accepted' | SupervisionReason | undefined {
   if (task.state === 'accepted') return 'accepted';
   if (task.state === 'needs_user' && task.reason !== 'stopped') return task.reason;
-  if ((task.state === 'watching' || task.state === 'pending_review') && (task.reason === 'stalled'
+  if ((task.state === 'preparing' || task.state === 'watching' || task.state === 'pending_review') && (task.reason === 'stalled'
     || (task.reason === 'review_unavailable' && (task.reviewAttempt ?? 0) >= 3))) return task.reason;
   return undefined;
 }
@@ -223,6 +228,18 @@ export async function observeGroupSessionSupervision(
       await commit(() => end(outcome?.outcome === 'interrupted' ? 'interrupted' : 'needs_user'));
       return;
     }
+    const retryReview = () => save({
+      reason: 'review_unavailable', checkAt: now + REVIEW_RETRY_MS, reviewAttempt: (task.reviewAttempt ?? 0) + 1,
+    });
+    if (task.state === 'preparing') {
+      if (task.checkAt !== undefined && now < task.checkAt) return;
+      const prepared = await io.deriveCriteria(task, review.signal).catch(() => undefined);
+      await commit(() => {
+        if (!prepared) retryReview();
+        else save({ ...prepared, state: 'watching', reason: undefined, checkAt: undefined, reviewAttempt: 0 });
+      });
+      return;
+    }
     if (task.state === 'waiting') {
       if (!outcome && !observation.running && now >= (task.checkAt ?? now)) {
         await commit(() => {
@@ -272,7 +289,7 @@ export async function observeGroupSessionSupervision(
     if (review.signal.aborted) return;
     await commit(() => {
       if (!result) {
-        save({ reason: 'review_unavailable', checkAt: now + REVIEW_RETRY_MS, reviewAttempt: (task.reviewAttempt ?? 0) + 1 });
+        retryReview();
         return;
       }
       const assessments: NonNullable<GroupSessionSupervision['assessments']> =

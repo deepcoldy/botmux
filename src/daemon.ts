@@ -1168,7 +1168,7 @@ import {
   supervisionDecisionRef, SUPERVISION_POLL_MS, type GroupSessionSupervision,
 } from './core/group-session-supervision.js';
 import { supervisionCriteria } from './core/group-session-supervision-assessment.js';
-import { reviewGroupSessionTask } from './core/group-session-supervision-review.js';
+import { deriveGroupSupervisionCriteria, reviewGroupSessionTask } from './core/group-session-supervision-review.js';
 import { sameGroupSessionSupervisor } from './core/group-session-supervisor-config.js';
 import type { SessionLastTurn } from './core/session-task-status.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
@@ -7693,9 +7693,13 @@ function groupSupervisionAuthorized(ds: DaemonSession, task: GroupSessionSupervi
 const groupSupervisionNotices = new WeakSet<DaemonSession>();
 const groupSupervisionWakeAt = new WeakMap<DaemonSession, number>();
 
+// Feishu interprets raw at-tags in text messages. Review data must stay text.
+function plainGroupSupervisionText(value: string): string {
+  return value.replace(/</g, '＜').replace(/>/g, '＞');
+}
+
 function groupSupervisionDetails(task: GroupSessionSupervision, loc: ReturnType<typeof localeForBot>): string[] {
-  // Feishu interprets raw at-tags in text messages. Review data must stay text.
-  const plain = (value: string) => value.replace(/</g, '＜').replace(/>/g, '＞');
+  const plain = plainGroupSupervisionText;
   if (task.state === 'waiting' && task.park) return [task.park.reason, task.park.evidence].map(plain);
   const last = task.assessments?.at(-1)?.result;
   if (last?.verdict === 'accepted' && task.state === 'accepted') {
@@ -7759,6 +7763,8 @@ function runGroupSessionSupervision(ds: DaemonSession, terminal?: SessionLastTur
   const lastMessageAt = ds.lastMessageAt;
   const now = Date.now();
   const lastInputId = () => ds.lastCliInputTurnId ?? ds.session.lastCliInputTurnId;
+  const currentTurn = (turnId: string) => lastInputId() === turnId && (!ds.currentTurnId || ds.currentTurnId === turnId)
+    && ds.lastMessageAt === lastMessageAt;
   const persist = () => sessionStore.updateSession(ds.session);
   const blocked = () => ds.lastScreenStatus === 'limited' || !!ds.agentAttention || !!ds.tuiPromptCardId
     || listPendingAsksByAnchor({ larkAppId: ds.larkAppId, chatId: ds.chatId, anchor: sessionAnchorId(ds) }).length > 0;
@@ -7780,12 +7786,31 @@ function runGroupSessionSupervision(ds: DaemonSession, terminal?: SessionLastTur
     || (running && progressAt > 0 && now - progressAt >= 20 * 60_000);
   void observeGroupSessionSupervision(session, {
     now, lastActivityAt: Math.max(lastMessageAt, progressAt, terminalAt), running, stalled, blocked: blocked(),
-    outcome: terminal ?? (task.state === 'watching' || task.state === 'pending_review' ? latest : undefined),
+    outcome: terminal ?? (task.state === 'waiting' ? undefined : latest),
   }, {
     allowed: task => ds.session === session && groupSupervisionAuthorized(ds, task),
-    current: turnId => lastInputId() === turnId && (!ds.currentTurnId || ds.currentTurnId === turnId)
-      && ds.lastMessageAt === lastMessageAt,
+    current: currentTurn,
     finalText: turnId => turnFinalText(ds, turnId, config.session.dataDir),
+    deriveCriteria: async (task, signal) => {
+      const sourceId = task.originTurnId ?? task.turnId;
+      // Use the authored message, before the executor prompt gained routing
+      // hints, tool instructions, or background context.
+      let message = messageQueue.findQueuedMessage(task.anchor, sourceId, task.requester);
+      if (!message) {
+        const detail = await getMessageDetail(ds.larkAppId, sourceId, {
+          userCardContent: false, userIdType: 'open_id', timeoutMs: 8_000, signal,
+        });
+        const item = detail?.items?.[0];
+        if (item?.message_id !== sourceId || item.chat_id !== task.chatId || item.deleted
+          || item.sender?.sender_type !== 'user' || item.sender.id !== task.requester) return undefined;
+        message = parseApiMessage(item, undefined, { resolveMentions: true });
+      }
+      const original = message.content.trim();
+      if (!original || signal.aborted || ds.session !== session
+        || !currentTurn(task.turnId) || !groupSupervisionAuthorized(ds, task)) return undefined;
+      const criteria = await deriveGroupSupervisionCriteria({ ...task, task: original }, signal);
+      return criteria ? { criteria, task: original } : undefined;
+    },
     review: (task, answer, signal, stage) => reviewGroupSessionTask(task.reviewer, task, answer, signal, stage),
     // Let pending Feishu input finish admission before a verdict can continue the session.
     serializeAdmission: action => withActiveSessionKeyLock(
@@ -7878,13 +7903,17 @@ const commandDeps: CommandHandlerDeps = {
       else if ((ds.lastCliInputTurnId ?? ds.session.lastCliInputTurnId) !== existing.turnId
         || !sameGroupSessionSupervisor(reviewer, existing.reviewer)) {
         await show('cmd.supervise.session_changed');
-      } else if (existing.state === 'waiting') {
-        await reply([tr('cmd.supervise.waiting', undefined, loc), ...groupSupervisionDetails(existing, loc)].join('\n'));
+      } else {
+        const key = existing.state === 'waiting' ? 'waiting'
+          : existing.reason === 'stalled' || existing.reason === 'review_unavailable' ? existing.reason
+          : existing.state;
+        const criteria = supervisionCriteria(existing.criteria).map(line => `- ${plainGroupSupervisionText(line)}`);
+        await reply([
+          tr(`cmd.supervise.${key}`, { round: existing.round }, loc),
+          ...groupSupervisionDetails(existing, loc),
+          ...(criteria.length ? [tr('cmd.supervise.criteria', undefined, loc), ...criteria] : []),
+        ].join('\n'));
       }
-      else if (existing.reason === 'stalled' || existing.reason === 'review_unavailable') {
-        await show(`cmd.supervise.${existing.reason}`);
-      } else if (existing.state === 'pending_review') await show('cmd.supervise.pending_review');
-      else await show('cmd.supervise.watching', { round: existing.round });
       return;
     }
     const decision = /^decide\s+(\S+)\s+([1-4])$/i.exec(args);
@@ -7906,8 +7935,9 @@ const commandDeps: CommandHandlerDeps = {
       return;
     }
     if (resume && existing?.state === 'accepted') { await show('cmd.supervise.accepted'); return; }
-    const criteria = /^on\s+([\s\S]+)$/i.exec(args)?.[1]?.trim();
-    if (!resume && (!criteria || criteria.length > MAX_SUPERVISION_CRITERIA_CHARS)) {
+    const start = /^on(?:\s+([\s\S]+))?$/i.exec(args);
+    const criteria = start?.[1]?.trim() ?? '';
+    if (!resume && (!start || criteria.length > MAX_SUPERVISION_CRITERIA_CHARS)) {
       await show('help.supervise');
       return;
     }
@@ -7927,25 +7957,28 @@ const commandDeps: CommandHandlerDeps = {
       const next = resumeGroupSessionSupervision({ ...existing, reviewer: { ...reviewer } }, turnId, Date.now());
       replaceGroupSessionSupervision(ds.session, next, persist);
       runGroupSessionSupervision(ds);
-      await show('cmd.supervise.watching', { round: next.round });
+      if (next.state === 'preparing') await show('cmd.supervise.preparing');
+      else await show('cmd.supervise.watching', { round: next.round });
       return;
     }
-    if (groupSupervisionTracking(existing) && existing.turnId === turnId && existing.criteria === criteria
+    if (groupSupervisionTracking(existing) && existing.turnId === turnId && (!criteria || existing.criteria === criteria)
       && sameGroupSessionSupervisor(reviewer, existing.reviewer)) {
       runGroupSessionSupervision(ds);
       if (existing.state === 'waiting') await show('cmd.supervise.waiting');
       else if (existing.state === 'pending_review') await show('cmd.supervise.pending_review');
+      else if (existing.state === 'preparing') await show('cmd.supervise.preparing');
       else await show('cmd.supervise.watching', { round: existing.round });
       return;
     }
-    if (!task || !criteria) return;
+    if (!task) return;
     replaceGroupSessionSupervision(ds.session, newGroupSessionSupervision({
-      turnId, task: task.slice(0, 8_000), criteria, requester,
+      turnId, task: criteria ? task.slice(0, 8_000) : '', criteria, requester,
       requesterUnionId: message.senderUnionId, reviewer: { ...reviewer },
       chatId: ds.chatId, anchor: sessionAnchorId(ds),
     }), persist);
     runGroupSessionSupervision(ds);
-    await show('cmd.supervise.watching', { round: 0 });
+    if (criteria) await show('cmd.supervise.watching', { round: 0 });
+    else await show('cmd.supervise.preparing');
   },
   prewarmDocCommentSession,
   submitQueuedMessage,

@@ -379,7 +379,7 @@ Disabled by default. Both windows default to 10 minutes and accept integers from
 /botconfig unset groupSessionSupervisor
 ```
 
-In an existing local Feishu group session, the requester can use `/supervise on <acceptance criteria>` to track their latest task. Put each criterion on its own line. Botmux checks every 30 seconds and restores tracked tasks after a restart. If the execution stops without a result, it can make one attempt to move the original session forward. A result judged complete enters pending review. A separate model call then checks the reported evidence against each criterion. Botmux sends up to two rework turns, each listing the unmet criteria.
+In an existing local Feishu group session, the requester can use `/supervise on` to track their latest task. Botmux derives acceptance criteria from the original request and shows them with `/supervise`. To supply criteria explicitly, use `/supervise on <acceptance criteria>`, with one criterion per line. Botmux checks every 30 seconds and restores tracked tasks after a restart. If the execution stops without a result, it can make one attempt to move the original session forward. A result judged complete enters pending review. A separate model call then checks the reported evidence against each criterion. Botmux sends up to two rework turns, each listing the unmet criteria.
 
 Botmux records the reason and evidence for observable waits such as CI, then rechecks in the original session, backing off from five minutes to an hour. It posts in the original topic when execution stalls, needs human input, exhausts its rework budget, or passes review.
 
