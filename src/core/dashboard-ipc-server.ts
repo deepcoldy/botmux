@@ -4802,6 +4802,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
       ? resolveRegisteredBackgroundContext(backgroundInput) : null;
     userTargetStillValid = liveBot.larkAppId === targetLarkAppId && liveBot.apiOnly !== true
       && boundLarkToolRequest(req, params.sessionId, targetLarkAppId, liveBot)
+      // A request admitted as managed must not finish under a newly native or
+      // capability-revoked policy. Re-evaluate both against the LIVE bot too.
+      && !larkUserNative(liveBot.triggerUserAuth)
+      && (!delegated || triggerUserAuthApplies(liveBot.triggerUserAuth, 'lark-cli'))
       && (detachedForUser
         ? !!liveDetached && liveDetached.job.id === detachedForUser.job.id
           && targetMatches(liveDetached) && !liveDetached.session.headless

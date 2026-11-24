@@ -64,7 +64,7 @@ describe('session read options across the sandbox and host boundary', () => {
     { name: 'view', args: ['--view', 'full', '--view', 'index'] },
     { name: 'limit', args: ['--limit', '10', '--limit', '20'] },
     { name: 'scope', args: ['--scope', 'chat', '--scope', 'thread'] },
-    { name: 'session-id', args: ['--session-id', 'session-current', '--session-id', 'other'] },
+    { name: 'session-id', args: ['--session-id=session-current', '--session-id', 'session-current'] },
     { name: 'with-card-json', args: ['--with-card-json', '--with-card-json'] },
   ])('rejects duplicate history option $name on both direct and relay boundaries', ({ args }) => {
     expect(() => parseHistoryReadOptions(args)).toThrow(/must not be repeated/);
@@ -74,7 +74,7 @@ describe('session read options across the sandbox and host boundary', () => {
   it.each([
     ['--raw', '--raw'],
     ['--no-download', '--no-download'],
-    ['--session-id', 'session-current', '--session-id', 'other'],
+    ['--session-id=session-current', '--session-id', 'session-current'],
   ])('rejects duplicate quoted option %s on both direct and relay boundaries', (...args) => {
     const argv = ['om_probe', ...args];
     expect(() => parseQuotedReadOptions(argv)).toThrow(/must not be repeated/);

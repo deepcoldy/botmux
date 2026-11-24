@@ -681,6 +681,39 @@ describe('session application identity route', () => {
     expect(body).not.toHaveProperty('credential');
     expect(JSON.stringify(body)).not.toContain('late-user-token');
   });
+  it('rejects a managed credential when policy switches to native during resolution', async () => {
+    const managed = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: true,
+      triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'] }) } as any;
+    vi.mocked(bots.getBot).mockReturnValue({ config: managed } as any);
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      vi.mocked(bots.getBot).mockReturnValue({ config: { ...managed,
+        triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities: ['bytecloud'] }),
+      } } as any);
+      return 'late-native-transition-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    expect(JSON.stringify(await response.json())).not.toContain('late-native-transition-token');
+    const native = await request('user');
+    expect(native.status).toBe(200);
+    expect(await native.json()).toMatchObject({ native: true });
+    expect(JSON.stringify(native)).not.toContain('late-native-transition-token');
+  });
+  it('rejects a delegated credential when lark-cli capability is revoked during resolution', async () => {
+    await delegate();
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
+        larkToolBinding: true, triggerUserAuth: { enabled: false, tools: [] },
+      } } as any);
+      return 'late-delegated-policy-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    expect(JSON.stringify(await response.json())).not.toContain('late-delegated-policy-token');
+    const next = await request('user');
+    expect(next.status).not.toBe(200);
+    expect(JSON.stringify(next)).not.toContain('late-delegated-policy-token');
+  });
   it.skipIf(process.platform !== 'linux')('allows a callerless scheduled execution with a scoped delegated user', async () => {
     await delegate();
     delete session.managedTurnOrigin.callerOpenId;
