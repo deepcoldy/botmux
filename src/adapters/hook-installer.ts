@@ -463,7 +463,7 @@ function installClaudeSettings(
   }
 
   // UserPromptSubmit per-turn 上下文 hook（#794，幂等替换旧的 botmux 条目）。
-  // timeout 10s：hook 本身是纯文件读，10s 足够；防任何意外挂起。
+  // timeout 10s：本地 IPC + 有界的 type-ahead 注册等待远低于该预算；同时防意外挂起。
   if (userPromptSubmitCommand) {
     removeBotmuxPromptHookGroups(existingHooks, 'UserPromptSubmit');
     existingHooks['UserPromptSubmit'] = [

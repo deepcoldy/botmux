@@ -2,6 +2,7 @@ import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecuti
 import { isLeadOnlySession } from './lead-only.js';
 import { decideAssistantAdmission, decideAssistantLiveInputAdmission } from './assistant-spawn.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
+import { dropTypeAheadPromptTurn, noteTypeAheadPromptTurn, promoteTypeAheadPromptTurn, reconcileTypeAheadPromptTurns } from './type-ahead-prompt-queue.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { runtimeStartRefusal } from '../services/runtime-reservation.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
@@ -22913,6 +22914,10 @@ function setupWorkerHandlers(
             + `(current rev=${String(currentCaptureIdentity(ds, workerGeneration)?.revision ?? '-')})`,
           );
         } else {
+          // Advancing a queued turn promotes it to the current candidate. Remove
+          // only its queue entry; its sidecar remains available for a delayed
+          // current-turn hook claim. Rejected/out-of-order identities do neither.
+          if (msg.turnId) promoteTypeAheadPromptTurn(ds, msg.turnId);
           if (msg.turnId) activateStartingCardHealth(ds, msg.turnId);
           if (cardWasWaiting && !streamingCardTurnQueued(ds)) {
             // The waiting turn has become the terminal producer. Repaint even
@@ -23093,6 +23098,22 @@ function setupWorkerHandlers(
         } catch (err) {
           logger.warn(`[${t}] prompt submission handler failed: ${err instanceof Error ? err.message : String(err)}`);
         }
+        break;
+      }
+      case 'type_ahead_queued':
+      case 'type_ahead_turn_dropped':
+      case 'type_ahead_queue_snapshot': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored ${msg.type} from stale worker generation`);
+          break;
+        }
+        if (msg.type === 'type_ahead_queued') noteTypeAheadPromptTurn(ds, msg.turnId);
+        else if (msg.type === 'type_ahead_turn_dropped') dropTypeAheadPromptTurn(ds, msg.turnId);
+        else reconcileTypeAheadPromptTurns(ds, msg.turnIds);
         break;
       }
       case 'direct_submit_started': {
