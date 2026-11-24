@@ -1182,7 +1182,7 @@ import {
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { handleCliResolvedRequest, parseAskBody, registerAskForResponse, verifiedAskMention } from './core/ask-api.js';
-import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
+import { CODEX_ASYNC_ASK_ORIGIN, CODEX_ASYNC_RESTORE_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerNeedsRawInput, codexAsyncAskOriginEligible, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
 import { submitDocumentAskReply } from './core/ask-broker.js';
@@ -12036,6 +12036,18 @@ function asyncAskAudience(ds: DaemonSession, originTurnId: string | undefined):
     ? { kind: 'shared' } : { kind: 'unavailable' };
 }
 
+/** A restored async question lost its originating botmux turn with the
+ *  worker. Freeze it to the last human caller instead of widening a human
+ *  conversation to every member who can talk in the chat. */
+function restoredAsyncAskAudience(ds: DaemonSession): ReturnType<typeof asyncAskAudience> {
+  const last = ds.session.lastCallerOpenId;
+  if (last && !isKnownPeerBot(config.session.dataDir, ds.larkAppId, last)
+    && evaluateAskAnswerTalk(ds.larkAppId, ds.chatId, last, ds.chatType)) {
+    return { kind: 'human', answererOpenId: last };
+  }
+  return asyncAskAudience(ds, undefined);
+}
+
 async function notifyAsyncAsk(ds: DaemonSession, root: string | null, turnId: string | undefined, text: string): Promise<void> {
   try {
     await sessionReply(sessionAnchorId(ds), [...text].slice(0, 6000).join(''), 'text', ds.larkAppId, turnId, {
@@ -12158,9 +12170,17 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     ? askSession?.session.docCommentTargets?.[body.originTurnId] : undefined;
   const asyncDocumentTarget = documentSource ? { ...documentSource } : undefined;
   const asyncInput = boundAsk.asyncUserInput;
+  const asyncCliId = askSession
+    ? askSession.session.cliLaunchSnapshot?.cliId
+      ?? askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId
+    : undefined;
+  // A TUI Codex session has no app-server input channel, but it still writes
+  // the question to its rollout and consumes the native reply envelope as a
+  // normal user message. The hybrid RPC mode keeps the existing app-server
+  // path, so only the non-RPC codex launch is admitted here.
+  const asyncTuiCodex = codexAsyncAnswerNeedsRawInput(asyncCliId, askSession?.initConfig?.codexRpcInput);
   const asyncAskOriginIsCurrent = asyncInput && askSession
-    && isCodexAppCliId(askSession.session.cliLaunchSnapshot?.cliId
-      ?? askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId)
+    && codexAsyncAskOriginEligible(asyncCliId, askSession.initConfig?.codexRpcInput)
     ? captureCodexAsyncAskOrigin(askSession, asyncInput.threadId) : undefined;
   const isAsyncAskCurrent = () => !res.destroyed && findActiveBySessionId(boundAsk.sessionId) === askSession
     && asyncAskOriginIsCurrent?.() === true;
@@ -12189,7 +12209,9 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   const asyncOriginTurn = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
   const audience = asyncInput && askSession
     ? documentDelivery ? { kind: 'human' as const, answererOpenId: documentDelivery.openId }
-      : asyncAskAudience(askSession, asyncOriginTurn)
+      : boundAsk.originKind === CODEX_ASYNC_RESTORE_ASK_ORIGIN
+        ? restoredAsyncAskAudience(askSession)
+        : asyncAskAudience(askSession, asyncOriginTurn)
     : undefined;
   const asyncCaller = audience?.kind === 'human' ? audience.answererOpenId : undefined;
   const asyncOriginMessageId = typeof body.originTurnId === 'string' && body.originTurnId.startsWith('om_')
@@ -12305,13 +12327,18 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         beginReplyTargetTurn(askSession, boundAsk.rootMessageId ?? undefined, turnId, new Date().toISOString(), {
           senderOpenId: by, participants: [{ openId: by, isBot: byIsBot }], inThread: !!boundAsk.rootMessageId,
         });
-        const input = buildFollowUpCliInput(text, boundAsk.sessionId, {
-          cliId: 'codex-app', sender, codexAppText: text,
-          larkAppId: boundAsk.larkAppId, chatId: boundAsk.chatId,
-          selfMention: { name: bot.botName, openId: bot.botOpenId },
-          sessionBackendType: askSession.session.backendType,
-          promptInjection: sessionPromptInjection(askSession), turnId,
-        });
+        // A TUI Codex session has no app-server input channel: the native
+        // reply envelope must reach the composer verbatim. Botmux's role and
+        // formatting blocks would wrap it and break the question correlation.
+        const input: CliTurnPayload = asyncTuiCodex
+          ? { content: text }
+          : buildFollowUpCliInput(text, boundAsk.sessionId, {
+            cliId: 'codex-app', sender, codexAppText: text,
+            larkAppId: boundAsk.larkAppId, chatId: boundAsk.chatId,
+            selfMention: { name: bot.botName, openId: bot.botOpenId },
+            sessionBackendType: askSession.session.backendType,
+            promptInjection: sessionPromptInjection(askSession), turnId,
+          });
         if (documentDelivery && asyncDocumentTarget) {
           // The originating turn can finish and consume its comment route while
           // this card is pending. The answer's new turn must retain that route,

@@ -13,7 +13,7 @@ import type { CreateAskInput, AskResult, AskOption, AskQuestion, CliPermissionOu
 import { isCliPermissionOutcome, shouldReturnAskStartupNotReady, NATIVE_STANDALONE_ASK_ORIGIN } from './ask-types.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import type { VcMeetingLiveManagedOrigin } from '../services/vc-meeting-send-policy.js';
-import { CODEX_ASYNC_ASK_ORIGIN, parseCodexAsyncUserInput, type CodexAsyncUserInput } from '../services/codex-async-user-input.js';
+import { isCodexAsyncAskOrigin, parseCodexAsyncUserInput, type CodexAsyncUserInput } from '../services/codex-async-user-input.js';
 
 export interface AskApiBody {
   sessionId: string;
@@ -135,12 +135,12 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
 
   if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
 
-  if (r.asyncFailure !== undefined && (originKind !== CODEX_ASYNC_ASK_ORIGIN
+  if (r.asyncFailure !== undefined && (!isCodexAsyncAskOrigin(originKind)
     || (r.asyncFailure !== 'limit' && r.asyncFailure !== 'invalid_questions'))) return { error: 'bad_asyncUserInput' };
   let questions: AskQuestion[];
   const asyncUserInput = r.asyncUserInput === undefined ? undefined : parseCodexAsyncUserInput(r.asyncUserInput);
   if ((r.asyncUserInput !== undefined && !asyncUserInput)
-    || (originKind === CODEX_ASYNC_ASK_ORIGIN) !== (asyncUserInput !== undefined)
+    || isCodexAsyncAskOrigin(originKind) !== (asyncUserInput !== undefined)
     || (asyncUserInput && requestId !== asyncUserInput.itemId)) return { error: 'bad_asyncUserInput' };
 
   if (Array.isArray(r.questions)) {

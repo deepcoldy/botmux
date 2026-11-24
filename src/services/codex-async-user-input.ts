@@ -3,6 +3,15 @@ import { codexUserInputAnswer } from './codex-user-input.js';
 import type { CodexAppTurnInput } from '../types.js';
 
 export const CODEX_ASYNC_ASK_ORIGIN = 'native-user-input-async';
+/** A card restored after a worker restart is a NEW broker identity. The dead
+ *  worker's ask may still be retained as an invalidated terminal under the
+ *  original key; re-registering that key would return the stale result and
+ *  never post a card. */
+export const CODEX_ASYNC_RESTORE_ASK_ORIGIN = 'native-user-input-async-restore';
+
+export function isCodexAsyncAskOrigin(originKind: string | undefined): boolean {
+  return originKind === CODEX_ASYNC_ASK_ORIGIN || originKind === CODEX_ASYNC_RESTORE_ASK_ORIGIN;
+}
 export interface CodexAsyncUserInput { threadId: string; itemId: string; nativeTurnId?: string }
 
 export function parseCodexAsyncUserInput(value: unknown): CodexAsyncUserInput | undefined {
@@ -33,6 +42,25 @@ export function codexAsyncAnswerSteerable(facts: CodexAsyncAnswerSteerFacts): bo
 /** In-turn answer delivery additionally requires its original native target. */
 export function codexAsyncAnswerSteerTarget(input: CodexAsyncUserInput, facts: CodexAsyncAnswerSteerFacts): string | undefined {
   return codexAsyncAnswerSteerable(facts) ? input.nativeTurnId : undefined;
+}
+
+/** A TUI Codex launch has no app-server input channel: the native question
+ *  reply envelope must reach its composer verbatim. Botmux's role and
+ *  formatting blocks would wrap it and break the correlation. codex-app and
+ *  the hybrid RPC mode keep the structured input. */
+export function codexAsyncAnswerNeedsRawInput(
+  cliId: string | null | undefined, codexRpcInput: boolean | undefined,
+): boolean {
+  return cliId === 'codex' && codexRpcInput !== true;
+}
+
+/** Which Codex launches may register an async question card. codex-app and a
+ *  TUI codex launch both have a reply path; the hybrid RPC mode is excluded
+ *  because its app-server handler owns the same item. */
+export function codexAsyncAskOriginEligible(
+  cliId: string | null | undefined, codexRpcInput: boolean | undefined,
+): boolean {
+  return cliId === 'codex-app' || codexAsyncAnswerNeedsRawInput(cliId, codexRpcInput);
 }
 
 /** This only narrows an existing daemon steer grant. A synthetic async answer

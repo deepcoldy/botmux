@@ -6,6 +6,7 @@ import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';
 import { loopbackFetch } from '../core/loopback-fetch.js';
 import { readManagedOriginCapability } from '../core/managed-origin-capability.js';
 import { findOnlineDaemon, resolveDaemonIpcPort } from '../utils/daemon-discovery.js';
+import { CODEX_ASYNC_ASK_ORIGIN, CODEX_ASYNC_RESTORE_ASK_ORIGIN } from './codex-async-user-input.js';
 
 export type CodexUserInputAnswer = { answers: Record<string, { answers: string[] }> };
 export interface CodexUserInputContext {
@@ -111,6 +112,7 @@ export async function postCodexAsk(
   signal?: AbortSignal,
   asyncUserInput?: { threadId: string; itemId: string; nativeTurnId?: string },
   asyncFailure?: 'limit' | 'invalid_questions',
+  asyncRestore?: boolean,
 ): Promise<AskResult> {
   const env = context.env ?? process.env;
   if (env.BOTMUX_WORKFLOW === '1') {
@@ -145,7 +147,8 @@ export async function postCodexAsk(
       // A server request belongs to this process/turn. Do not reattach a card
       // from an older runner merely because its JSON-RPC id was reused.
       requestId: asyncUserInput?.itemId ?? randomUUID(),
-      originKind: asyncUserInput ? 'native-user-input-async'
+      originKind: asyncUserInput
+        ? (asyncRestore ? CODEX_ASYNC_RESTORE_ASK_ORIGIN : CODEX_ASYNC_ASK_ORIGIN)
         : context.standalone ? NATIVE_STANDALONE_ASK_ORIGIN : 'native-user-input',
       ...(asyncUserInput ? { asyncUserInput } : {}),
       ...(asyncFailure ? { asyncFailure } : {}),
