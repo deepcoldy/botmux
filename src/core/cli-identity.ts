@@ -2222,7 +2222,13 @@ export function renderGitCommitWrapper(realGit: string, resolver: readonly strin
     '      -c) [ "$#" -ge 2 ] || return 1; capture_user_config -c "$2"; shift 2 ;;',
     '      --config-env=*) capture_user_config "$1"; shift ;;',
     '      --config-env) [ "$#" -ge 2 ] || return 1; capture_user_config "--config-env=$2"; shift 2 ;;',
-    '      -C|--git-dir|--work-tree|--namespace|--super-prefix|--attr-source) [ "$#" -ge 2 ] || return 1; shift 2 ;;',
+    // Every value-taking global option must list its separate argv form: a
+    // missing entry lets the value hit the `*) return 1` passthrough and the
+    // commit-family subcommand below it runs unwrapped. --shallow-file is
+    // accepted by git 2.39; --replace-git-ref / --attr-source arrive with newer
+    // git and the equals forms already stop at the generic `-*)` branch.
+    '      -C|--git-dir|--work-tree|--namespace|--super-prefix|--attr-source|--shallow-file|--replace-git-ref)',
+    '        [ "$#" -ge 2 ] || return 1; shift 2 ;;',
     '      -*) shift ;;',
     '      commit|commit-tree|merge|cherry-pick|revert|rebase|am|pull)',
     '        case "$#:${2-}" in 2:--abort|2:--quit|2:-h|2:--help) return 1 ;; esac',
@@ -2234,6 +2240,15 @@ export function renderGitCommitWrapper(realGit: string, resolver: readonly strin
     '}',
     'if ! needs_actor "$@"; then exec "$real_git" "$@"; fi',
     `email="$(${resolver.map(shellSingleQuote).join(' ')})" || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    // Ambient identity env vars outrank every -c config key (git gives them
+    // precedence over all config scopes). A shell profile or an export inside
+    // the session would otherwise let a PATH-wrapped commit land with the
+    // machine's identity, exactly the mis-attribution this wrapper exists to
+    // stop. The IDENT combined forms are cleared too: ignored by some git
+    // versions, but the same channel wherever they are honored. Explicit argv
+    // overrides (-c user.*, --author) still win via the capture above.
+    'unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_IDENT',
+    'unset GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_IDENT',
     'name=${override_name-${email%@*}}',
     'email=${override_email-$email}',
     'exec "$real_git" -c "user.name=$name" -c "user.email=$email" -c "author.name=$name" -c "author.email=$email" -c "committer.name=$name" -c "committer.email=$email" "$@"',
@@ -2524,6 +2539,14 @@ export function prepareTriggerUserCliEnv(
   }
   let installedAny = false;
   if (gitResolver) {
+    if (process.platform !== 'linux') {
+      // The resolver proves lineage through /proc and the daemon's loopback
+      // peer scan, neither of which exists off Linux. The wrapper still fails
+      // closed (every governed subcommand exits 77); say why in the log so the
+      // refusal is not mistaken for an authorization problem.
+      log('[trigger-user-auth] WARN gitCommitIdentity is supported only on Linux; '
+        + 'on this platform git commit-family commands will be refused until it is turned off');
+    }
     const realGit = findRealToolBinary('git', childEnv.PATH, [wrapperDir]);
     if (!realGit) throw new Error('gitCommitIdentity requires git on PATH');
     mkdirSync(wrapperDir, { recursive: true });

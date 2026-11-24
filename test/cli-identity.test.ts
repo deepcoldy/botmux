@@ -90,6 +90,53 @@ describe('per-turn git commit identity', () => {
     expect(git('rev-parse', 'HEAD')).toBe(head);
   });
 
+  it('governs value-taking global options and ambient identity env vars', () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const repo = join(dir, 'bypass-repo');
+    const actor = join(dir, 'bypass-actor');
+    const wrapper = join(dir, 'git');
+    writeFileSync(wrapper, renderGitCommitWrapper(realGit, ['cat', actor]), { mode: 0o755 });
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1' };
+    const git = (...args: string[]) => execFileSync(wrapper, ['-C', repo, ...args],
+      { env, encoding: 'utf8' }).trim();
+    const identity = () => git('log', '-1', '--format=%ae | %ce');
+    execFileSync(realGit, ['init', '-q', '-b', 'main', repo], { env });
+    git('config', 'user.name', 'Host');
+    git('config', 'user.email', 'host@example.org');
+    git('config', 'author.email', 'host-author@example.org');
+    git('config', 'committer.email', 'host-committer@example.org');
+    writeFileSync(actor, 'actor@example.org');
+
+    // A separate-argv global option used to terminate option parsing in the
+    // wrapper, so the commit subcommand passed through unwrapped and landed
+    // with the host's author/committer.
+    git('--shallow-file', join(dir, 'shallow'), 'commit', '--allow-empty', '-m', 'via-shallow-file');
+    expect(identity()).toBe('actor@example.org | actor@example.org');
+
+    // GIT_AUTHOR_*/GIT_COMMITTER_* outrank every -c config key in git; the
+    // wrapper must clear them so ambient shell exports cannot override the
+    // attested actor. Explicit argv overrides stay honored (covered above).
+    execFileSync(wrapper, ['-C', repo, 'commit', '--allow-empty', '-m', 'via-env'], {
+      env: {
+        ...env,
+        GIT_AUTHOR_NAME: 'Env Author', GIT_AUTHOR_EMAIL: 'env-author@example.org',
+        GIT_COMMITTER_NAME: 'Env Committer', GIT_COMMITTER_EMAIL: 'env-committer@example.org',
+      },
+      encoding: 'utf8',
+    });
+    expect(identity()).toBe('actor@example.org | actor@example.org');
+
+    // Parser-level guard for a value-taking global that this git version may
+    // not itself accept: with no resolvable actor the wrapper must refuse (77)
+    // before git runs, proving the option consumed its value instead of
+    // falling through to passthrough (which would surface git's own error).
+    rmSync(actor);
+    const unknownGlobal = spawnSync(wrapper,
+      ['-C', repo, '--replace-git-ref', 'refs/replace/x', 'commit', '--allow-empty', '-m', 'x'],
+      { env, encoding: 'utf8' });
+    expect(unknownGlobal.status).toBe(77);
+  });
+
   it('installs the wrapper only for opted-in sessions and removes it on respawn', () => {
     const env: NodeJS.ProcessEnv = { PATH: process.env.PATH };
     const policy = { enabled: true, tools: ['bytedcli' as const], gitCommitIdentity: true };
