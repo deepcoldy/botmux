@@ -236,7 +236,7 @@ import { doubaoWorkspaceForSession } from '../services/doubao-transcript.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
-import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
+import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, cotMessageFinishStatus, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
 import { retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
@@ -12836,6 +12836,9 @@ type CotTerminal = Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'tur
 function finalizeOrHoldCotMessage(ds: DaemonSession, msg: CotTerminal): void {
   if (isReplayOfHeldCotTerminal(ds, msg)) return;
   releaseHeldCotMessage(ds);
+  // A replay of an already finalized turn must not create a fresh hold. In
+  // particular, an interrupted CLI exit is terminal, not a new background wait.
+  if (cotMessageFinishStatus(ds, msg)) return;
   if (msg.status === 'completed' && msg.backgroundTasks) {
     ds.cotHeldForBackground = { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
     return;
@@ -25375,11 +25378,26 @@ function setupWorkerHandlers(
           // A clean exit after an already idle/completed turn is not a failed
           // task. It still must not inherit a stale working projection.
           const exitStatus = msg.code === 0 && idleAtExit ? 'idle' : 'interrupted';
+          const backgroundTaskCountAtExit = ds.backgroundTaskCount;
+          ds.backgroundTaskCount = undefined;
+          const heldCot = ds.cotHeldForBackground;
+          if (heldCot) {
+            // Background work dies with this CLI. Settle the held turn here with
+            // the physical loss, before any restart can publish a zero frame.
+            ds.cotHeldForBackground = undefined;
+            finalizeCotMessage(ds, heldCot.turnId, 'failed', heldCot.dispatchAttempt);
+          }
           ds.lastScreenStatus = exitStatus;
           bumpStreamCardStatusRevision(ds);
           clearUsageRefreshTimer(ds);
           dashboardEventBus.publish({ type: 'session.update', body: {
-            sessionId: ds.session.sessionId, patch: { status: exitStatus },
+            sessionId: ds.session.sessionId,
+            patch: {
+              status: exitStatus,
+              // Background work dies with this CLI. Clear it with the physical
+              // loss publication; a stopped sampler cannot provide a zero frame.
+              ...(backgroundTaskCountAtExit !== undefined ? { backgroundTaskCount: null } : {}),
+            },
           } });
         }
         // The live-send capability dies with this backend. Preserve the

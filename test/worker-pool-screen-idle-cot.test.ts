@@ -14,6 +14,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
   handleCotThinkingUpdate: vi.fn(),
   handleCotThinkingSuperseded: vi.fn(),
   finalizeCotMessage: (...args: unknown[]) => finalizeCotMessageMock(...args),
+  cotMessageFinishStatus: vi.fn(() => undefined),
   abortCotMessage: vi.fn(),
   resumeCotMessage: vi.fn(),
   cotMessageCarriesTurn: vi.fn(() => false),

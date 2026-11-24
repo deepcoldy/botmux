@@ -1,19 +1,28 @@
 import { EventEmitter } from 'node:events';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { finalizeCotMessageMock, botState } = vi.hoisted(() => ({
-  finalizeCotMessageMock: vi.fn(),
-  botState: {
-    cliId: 'antigravity' as string,
-    env: undefined as Record<string, string> | undefined,
-    dshRuntime: undefined as 'official' | 'tui' | undefined,
-  },
-}));
+const { finalizeCotMessageMock, cotFinishStatuses, botState } = vi.hoisted(() => {
+  const statuses = new Map<string, 'done' | 'interrupted'>();
+  return {
+    cotFinishStatuses: statuses,
+    finalizeCotMessageMock: vi.fn((_ds: unknown, turnId: string, status: string, dispatchAttempt?: number) => {
+      const key = `${turnId}|${dispatchAttempt ?? ''}`;
+      if (!statuses.has(key)) statuses.set(key, status === 'completed' ? 'done' : 'interrupted');
+    }),
+    botState: {
+      cliId: 'antigravity' as string,
+      env: undefined as Record<string, string> | undefined,
+      dshRuntime: undefined as 'official' | 'tui' | undefined,
+    },
+  };
+});
 
 vi.mock('../src/im/lark/cot-message.js', () => ({
   handleCotThinkingUpdate: vi.fn(),
   handleCotThinkingSuperseded: vi.fn(),
   finalizeCotMessage: (...args: unknown[]) => finalizeCotMessageMock(...args),
+  cotMessageFinishStatus: (_ds: unknown, binding: { turnId: string; dispatchAttempt?: number }) =>
+    cotFinishStatuses.get(`${binding.turnId}|${binding.dispatchAttempt ?? ''}`),
   abortCotMessage: vi.fn(),
   resumeCotMessage: vi.fn(),
   cotMessageCarriesTurn: vi.fn(() => false),
@@ -104,6 +113,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 import { __testOnly_setSuspendBackingVerifier, __testOnly_setupWorkerHandlers, initWorkerPool, suspendWorker } from '../src/core/worker-pool.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 interface SetupOptions {
@@ -181,8 +191,17 @@ function screen(worker: EventEmitter, backgroundTasks?: number): void {
   });
 }
 
+async function startupCircuit(worker: EventEmitter): Promise<void> {
+  for (let i = 0; i < 2; i++) {
+    await Promise.all(worker.listeners('message').map(listener => listener.call(worker, {
+      type: 'claude_exit', code: 1, startupFailure: true, turnId: 'om_turn', dispatchAttempt: 1,
+    })));
+  }
+}
+
 describe('CoT message of a turn that ended with background tasks running', () => {
   beforeEach(() => {
+    cotFinishStatuses.clear();
     vi.clearAllMocks();
   });
 
@@ -235,6 +254,50 @@ describe('CoT message of a turn that ended with background tasks running', () =>
     terminal(worker, { backgroundTasks: 1 });
     screen(worker);
     expect(ds.lastScreenStatus).toBe('limited');
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears and publishes the background count when the startup circuit stops the CLI', async () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    screen(worker, 1);
+    expect(ds.backgroundTaskCount).toBe(1);
+    await startupCircuit(worker);
+    expect(ds.cliStartupFailureReason).toBeTruthy();
+    expect(ds.backgroundTaskCount).toBeUndefined();
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith({
+      type: 'session.update',
+      body: { sessionId: ds.session.sessionId, patch: { status: 'interrupted', backgroundTaskCount: null } },
+    });
+  });
+
+  it('settles the held CoT as interrupted when the startup circuit stops the CLI', async () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    await startupCircuit(worker);
+    expect(ds.cliStartupFailureReason).toBeTruthy();
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'failed', 1);
+    expect(ds.cotHeldForBackground).toBeUndefined();
+  });
+
+  it('settles the held CoT once on an ordinary CLI restart, not again on a later zero frame', async () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    await Promise.all(worker.listeners('message').map(listener => listener.call(worker, {
+      type: 'claude_exit', code: 1, startupFailure: false, turnId: 'om_turn', dispatchAttempt: 1,
+    })));
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'failed', 1);
+    screen(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.cotHeldForBackground).toBeUndefined();
+  });
+
+  it('does not recreate a hold when a completed terminal replays after the circuit', async () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    await startupCircuit(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+    terminal(worker, { backgroundTasks: 1 });
+    expect(ds.cotHeldForBackground).toBeUndefined();
     expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
   });
 

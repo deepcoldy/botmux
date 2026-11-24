@@ -752,6 +752,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
   handleCotThinkingUpdate: vi.fn(() => true),
   prepareCotMessageBeforeReply: vi.fn(async () => {}),
   hasCotMessageForTurn: vi.fn(() => true),
+  cotMessageFinishStatus: vi.fn(() => undefined),
 }));
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────

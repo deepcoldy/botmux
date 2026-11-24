@@ -11,6 +11,7 @@ import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '
 import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
 import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
+import { cotMessageFinishStatus } from '../../src/im/lark/cot-message.js';
 import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
 import {
   cancelAntigravityRotationReplay,
@@ -33,6 +34,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
+  if (key === 'cotMessageFinishStatus') return cotMessageFinishStatus;
   if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
   if (key === 'cancelAntigravityRotationReplay') return cancelAntigravityRotationReplay;
   if (key === 'clearInFlightAntigravityRotation') return clearInFlightAntigravityRotation;
