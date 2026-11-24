@@ -100,26 +100,31 @@ export async function runS2Invites(opts: {
   // R1：await 之后重读 state。
   if (!recheckState(opts.dataDir, opts.creatorAppId, opts.initId).ok) return;
   for (const peer of opts.peers) {
+    // N1：每轮循环开头检查活动状态，非活动立即终止整个 S2。
+    if (!recheckState(opts.dataDir, opts.creatorAppId, opts.initId).ok) return;
     const opKey = `invite:${peer.appId}`;
     const payloadHash = collabPayloadHash({ chatId: opts.chatId, appId: peer.appId });
     const cur = readCollabInitEntry(opts.dataDir, opts.creatorAppId, opts.initId)!;
     const existing = cur.operations[opKey];
     if (existing?.status === 'done') {
       // R4：done 分支校验 hash，冲突不重写成功事实（保留原 receipt）。
-      if (!checkPayloadHash(existing, payloadHash).ok) continue;
+      if (!checkPayloadHash(existing, payloadHash).ok) return;
       continue;
     }
-    if (!checkPayloadHash(existing, payloadHash).ok) continue;
+    if (!checkPayloadHash(existing, payloadHash).ok) return;
     await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'invite', status: 'attempting', payloadHash, firstAttemptAt: existing?.firstAttemptAt ?? now } });
     if (!members.includes(peer.appId)) {
       try {
         await opts.deps.addBotToChat(opts.creatorAppId, opts.chatId, peer.appId);
-        // R1：await 之后重读 state（取消后迟到成功只留证）。
+        // N1/R1：await 之后重读 state，非活动立即终止整个 S2（不继续下一 peer）。
         const rc = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
-        if (!rc.ok) { await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'invite', status: 'unknown', payloadHash, error: `cancelled after invite: ${rc.reason}` } }); continue; }
+        if (!rc.ok) {
+          await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'invite', status: 'unknown', payloadHash, firstAttemptAt: existing?.firstAttemptAt ?? now, error: `cancelled after invite: ${rc.reason}` } });
+          return;
+        }
         await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'invite', status: 'done', payloadHash, receipt: { chatId: opts.chatId } } });
       } catch (err) {
-        await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'invite', status: 'unknown', payloadHash, error: String((err as any)?.message ?? err) } });
+        await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'invite', status: 'unknown', payloadHash, firstAttemptAt: existing?.firstAttemptAt ?? now, error: String((err as any)?.message ?? err) } });
       }
     } else {
       await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'invite', status: 'done', payloadHash, receipt: { already_member: true } } });
@@ -256,10 +261,13 @@ async function runS5Critical(opts: {
     // R4：done 分支先校验 hash；冲突拒绝不重写成功事实。
     if (curOp?.status === 'done') {
       if (!checkPayloadHash(curOp, payloadHash).ok) return { done: false, awaitingInput: `kickoff payloadHash conflict: ${appId}` };
-      // R5：done 分支重建缺失的 kickoffPending 投影。
+      // N3/R5：done 分支从 durable operation 的 receipt 重建 kickoffPending（含 satisfiedBy）。
       const curEntry = readCollabInitEntry(opts.dataDir, opts.creatorAppId, opts.initId)!;
-      if (!curEntry.kickoffPending?.[appId]) {
-        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.kickoffPending = { ...(e.kickoffPending ?? {}), [appId]: { appId } }; e.updatedAt = now; return true; } });
+      const receipt = curOp.receipt as { sessionId?: string; turnId?: string; acceptedAt?: string; satisfiedBy?: CollabArtifactSatisfiedBy } | undefined;
+      if (!curEntry.kickoffPending?.[appId] || !curEntry.kickoffPending[appId].satisfiedBy) {
+        const pending: { appId: string; satisfiedBy?: CollabArtifactSatisfiedBy } = { appId };
+        if (receipt?.satisfiedBy) pending.satisfiedBy = receipt.satisfiedBy;
+        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.kickoffPending = { ...(e.kickoffPending ?? {}), [appId]: pending }; e.updatedAt = now; return true; } });
       }
       continue;
     }
@@ -273,19 +281,29 @@ async function runS5Critical(opts: {
       // R1：await 之后重读 state。
       const rc = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
       if (!rc.ok) return { done: false, awaitingInput: rc.reason };
-      // terminal 非 succeeded 先返回（不依赖 proof 完整）。
-      if (facts.terminalStatus !== 'succeeded') {
-        return { done: false, awaitingInput: 'artifact not ready: NOT_SUCCEEDED' };
-      }
-      // R2：完整证明才启动——缺三元组/hash 返回未就绪。
-      if (!facts.sessionId || !facts.turnId || !facts.messageId || !facts.contentHash) {
-        return { done: false, awaitingInput: 'artifact proof incomplete (missing session/turn/message/hash)' };
-      }
-      // R3：超窗 → 原子推进 awaiting-input + 保留 since。
-      const since = reEntry.entry.awaiting?.since ?? now;
-      if (kickoffTimedOut(since, now, KICKOFF_TIMEOUT_MS)) {
-        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'KICKOFF_TIMEOUT', since }; e.updatedAt = now; return true; } });
+      // N2：先统一建立持久 since（pending），再用当前时钟检查超窗。
+      const curEntry = readCollabInitEntry(opts.dataDir, opts.creatorAppId, opts.initId)!;
+      const since = curEntry.awaiting?.since ?? now;
+      if (kickoffTimedOut(since, opts.deps.now(), KICKOFF_TIMEOUT_MS)) {
+        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'KICKOFF_TIMEOUT', since }; e.updatedAt = opts.deps.now(); return true; } });
         return { done: false, awaitingInput: 'KICKOFF_TIMEOUT' };
+      }
+      // terminal 明确 failed/cancelled → 直接 awaiting-input + 具体原因（N2）。
+      if (facts.terminalStatus === 'failed' || facts.terminalStatus === 'cancelled') {
+        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: `ARTIFACT_${facts.terminalStatus.toUpperCase()}`, since }; e.updatedAt = opts.deps.now(); return true; } });
+        return { done: false, awaitingInput: `artifact not ready: ${facts.terminalStatus}` };
+      }
+      if (facts.terminalStatus !== 'succeeded') {
+        // waiting_input/blocked/reconciling：pending 保持，不启动。
+        if (!curEntry.awaiting) {
+          await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.awaiting = { reason: 'KICKOFF_PENDING', since }; e.updatedAt = opts.deps.now(); return true; } });
+        }
+        return { done: false, awaitingInput: `artifact not ready: ${facts.terminalStatus}` };
+      }
+      // R2：完整证明才启动——缺三元组/hash → awaiting-input（N2）。
+      if (!facts.sessionId || !facts.turnId || !facts.messageId || !facts.contentHash) {
+        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'ARTIFACT_PROOF_INCOMPLETE', since }; e.updatedAt = opts.deps.now(); return true; } });
+        return { done: false, awaitingInput: 'artifact proof incomplete (missing session/turn/message/hash)' };
       }
       const artifact = (k.artifact ?? { type: 'marked-url', hosts: [] }) as CollabArtifactSpec;
       // satisfiedBy 用上游 afterAppId 的 kickoffId/receiptId（R2）。
@@ -300,9 +318,8 @@ async function runS5Critical(opts: {
         contentHash: facts.contentHash,
       });
       if (!evalResult.ready) {
-        // R3：首次等待持久 since（区别于超窗终结态）。
-        if (!reEntry.entry.awaiting) {
-          await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.awaiting = { reason: 'KICKOFF_PENDING', since: now }; e.updatedAt = now; return true; } });
+        if (!curEntry.awaiting) {
+          await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.awaiting = { reason: 'KICKOFF_PENDING', since }; e.updatedAt = opts.deps.now(); return true; } });
         }
         return { done: false, awaitingInput: `artifact not ready: ${evalResult.reason}` };
       }
@@ -318,15 +335,22 @@ async function runS5Critical(opts: {
     const started = await opts.deps.kickoffStart(appId);
     // R1：await 之后重读 state。
     const rcStart = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
-    if (!rcStart.ok) { await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'kickoff', status: 'unknown', payloadHash, error: `cancelled after start: ${rcStart.reason}` } }); return { done: false, awaitingInput: rcStart.reason }; }
+    if (!rcStart.ok) {
+      // N4：取消后的已知 start 成功保留有效三元组（审计），不降成无凭据 unknown。
+      const lateReceipt = (started.ok && started.sessionId && started.turnId && started.acceptedAt)
+        ? { sessionId: started.sessionId, turnId: started.turnId, acceptedAt: started.acceptedAt }
+        : undefined;
+      await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'kickoff', status: 'unknown', uuid: kickoffId, firstAttemptAt: curOp?.firstAttemptAt ?? now, payloadHash, error: `cancelled after start: ${rcStart.reason}`, ...(lateReceipt ? { receipt: lateReceipt } : {}) } });
+      return { done: false, awaitingInput: rcStart.reason };
+    }
     if (!started.ok || !started.sessionId || !started.turnId || !started.acceptedAt) {
       return { done: false, awaitingInput: 'kickoff start not ready (missing session/turn/acceptedAt)' };
     }
-    // R5：三元组 + done + kickoffPending 投影在同次 entry 原子写提交。
+    // N3/R5：三元组 + satisfiedBy + done + kickoffPending 投影在同次 entry 原子写提交。
     await patchCollabInitEntry({
       dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId,
       mutate: (e) => {
-        e.operations[opKey] = { kind: 'kickoff', status: 'done', uuid: kickoffId, payloadHash, receipt: { sessionId: started.sessionId, turnId: started.turnId, acceptedAt: started.acceptedAt } };
+        e.operations[opKey] = { kind: 'kickoff', status: 'done', uuid: kickoffId, firstAttemptAt: curOp?.firstAttemptAt ?? now, payloadHash, receipt: { sessionId: started.sessionId, turnId: started.turnId, acceptedAt: started.acceptedAt, ...(satisfiedBy ? { satisfiedBy } : {}) } };
         e.kickoffPending = { ...(e.kickoffPending ?? {}), [appId]: { appId, ...(satisfiedBy ? { satisfiedBy } : {}) } };
         e.updatedAt = now;
         return true;

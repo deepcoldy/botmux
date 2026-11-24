@@ -96,6 +96,23 @@ describe('S2 invite', () => {
     const entry = readCollabInitEntry(dataDir, CREATOR, initId)!;
     expect(entry.operations[`invite:${PEER}`].status).toBe('done');
   });
+
+  it('N1：首 peer 邀请中取消 → 第二 peer 不调用 addBotToChat', async () => {
+    const initId = await seedEntry();
+    const calls: string[] = [];
+    const d = deps({
+      listMembers: async () => [CREATOR], // 两个 peer 都缺员
+      addBotToChat: async (_a, _c, bot) => {
+        calls.push(bot);
+        if (bot === 'cli_b') {
+          // B 邀请中写 cancelled
+          await patchCollabInitEntry({ dataDir, creatorAppId: CREATOR, initId, mutate: (e) => { e.state = 'cancelled'; return true; } });
+        }
+      },
+    });
+    await runS2Invites({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, peers: [{ appId: 'cli_b' }, { appId: 'cli_c' }], deps: d });
+    expect(calls).toEqual(['cli_b']); // C 不再调用
+  });
 });
 
 describe('S3 grants', () => {
