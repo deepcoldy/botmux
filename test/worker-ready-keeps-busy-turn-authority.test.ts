@@ -1,8 +1,17 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
 import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
-import { hasAntigravityPendingTasks, type AntigravityTranscriptState } from '../src/services/antigravity-transcript.js';
+import { isAntigravityInterruptedScreen } from '../src/adapters/cli/antigravity.js';
+import {
+  hasAntigravityPendingTasks,
+  hasAntigravityTranscriptPendingTasks,
+  resolveAntigravityTranscriptPath,
+  type AntigravityTranscriptState,
+} from '../src/services/antigravity-transcript.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 /**
@@ -161,6 +170,140 @@ describe('a prompt-ready edge that is not the turn boundary keeps the turn autho
     loadWorkerFunction('markPromptReady', h)();
     expect(h.isPromptReady).toBe(true);
     expect(h.publishScreenStatus).toHaveBeenCalledWith('idle');
+    expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
+    expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+  });
+});
+
+describe('hasLiveAntigravityPendingTasks in default replyDelivery=send mode (structured bridge inactive)', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function sendModeHarness(opts: {
+    records: any[];
+    awaitingFirstPrompt?: boolean;
+    turnStarted?: boolean;
+    screen?: string;
+    bridgeActive?: boolean;
+    bridgeAttached?: boolean;
+  }) {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'bmx-agy-send-authority-'));
+    dirs.push(fakeHome);
+    const cid = '22222222-2222-2222-2222-222222222222';
+    const logsDir = join(fakeHome, '.gemini', 'antigravity-cli', 'brain', cid, '.system_generated', 'logs');
+    mkdirSync(logsDir, { recursive: true });
+    const transcriptPath = join(logsDir, 'transcript.jsonl');
+    writeFileSync(transcriptPath, opts.records.map(r => JSON.stringify(r)).join('\n') + '\n');
+
+    const h = harness({ cliId: 'antigravity' });
+    if (opts.turnStarted === false) {
+      h.activeTurnAuthority.clear();
+    }
+    h.lastInitConfig = { cliId: 'antigravity', workingDir: fakeHome, env: { HOME: fakeHome } };
+    h.lastSpawnEffectiveCliSessionId = cid;
+    h.awaitingFirstPrompt = opts.awaitingFirstPrompt ?? false;
+    h.clearPostHookEvidenceFallback = vi.fn();
+    h.deliverRestartInterruptionNote = vi.fn();
+    h.requeuedInflightAtSpawn = 0;
+    h.renderer = { snapshot: () => ({ content: '' }), markNewTurn: vi.fn() };
+    h.inflightInputs = { onTurnComplete: vi.fn(), takeStartedCarryOver: () => [] };
+    h.cliAdapter = {
+      id: 'antigravity',
+      runnerFramedInput: false,
+      resolveActiveSessionId: () => cid,
+    };
+    h.backend = opts.screen !== undefined ? {} : undefined;
+    h.backendScreenEvidenceIsAuthoritativeForMutation = () => opts.screen !== undefined;
+    h.captureBackendScreen = () => opts.screen ?? '';
+    h.isAntigravityInterruptedScreen = isAntigravityInterruptedScreen;
+    h.codexBridgeFallbackActive = () => opts.bridgeActive === true;
+    h.codexBridgeRolloutPath = opts.bridgeAttached ? transcriptPath : undefined;
+    h.codexBridgeBaselineDone = opts.bridgeAttached === true;
+    h.currentAntigravityObservedPid = () => undefined;
+    h.findAntigravityConversationIdByPid = () => undefined;
+    h.resolveAntigravityTranscriptPath = resolveAntigravityTranscriptPath;
+    h.resolveFileBridgePath = () => undefined;
+    h.hasAntigravityTranscriptPendingTasks = hasAntigravityTranscriptPendingTasks;
+    h.join = join;
+    h.resolveLiveAntigravityTranscriptPath = loadWorkerFunction('resolveLiveAntigravityTranscriptPath', h);
+    h.hasLiveAntigravityPendingTasks = loadWorkerFunction('hasLiveAntigravityPendingTasks', h);
+    return { h, cid, transcriptPath };
+  }
+
+  it('keeps active turn authority when a background run_command is still running even though the structured bridge is inactive', () => {
+    const cid = '22222222-2222-2222-2222-222222222222';
+    const { h, transcriptPath } = sendModeHarness({
+      records: [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\n升级环境\n</USER_REQUEST>' },
+        { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', args: { CommandLine: '"bytedcli env service upgrade-tce"' } }] },
+        { step_index: 2, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: `Created At: 2026-11-23T03:15:07Z\nTool is running as a background task with task id: ${cid}/task-178\n` },
+        { step_index: 3, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '等待 BOE 与 PPE 升级工单下发返回结果。' },
+      ],
+    });
+
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.codexBridgeDrainAndMaybeEmit).not.toHaveBeenCalled();
+    expect(h.isPromptReady).toBe(false);
+    expect(h.publishScreenStatus).toHaveBeenCalledWith('working');
+    expect(h.releaseActiveTurnAuthority).not.toHaveBeenCalled();
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('turn-a');
+
+    // Once the background task completes and the planner finishes, the next prompt-ready releases authority.
+    appendFileSync(transcriptPath, [
+      JSON.stringify({
+        step_index: 4, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', status: 'DONE',
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T03:15:50Z sender=${cid}/task-178 priority=MESSAGE_PRIORITY_HIGH content=Task id "${cid}/task-178" finished with result: code 0\n</SYSTEM_MESSAGE>`,
+      }),
+      JSON.stringify({ step_index: 5, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '升级全部完成。' }),
+    ].join('\n') + '\n');
+
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.isPromptReady).toBe(true);
+    expect(h.publishScreenStatus).toHaveBeenCalledWith('idle');
+    expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
+    expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+  });
+
+  it('does not hold a cold/resumed idle startup with no started turn even if the old transcript has a dangling RUNNING task', () => {
+    const cid = '22222222-2222-2222-2222-222222222222';
+    const { h } = sendModeHarness({
+      awaitingFirstPrompt: true,
+      turnStarted: false,
+      records: [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\n旧会话任务\n</USER_REQUEST>' },
+        { step_index: 1, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: `Tool is running as a background task with task id: ${cid}/task-old\n` },
+      ],
+    });
+
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.isPromptReady).toBe(true);
+    expect(h.publishScreenStatus).toHaveBeenCalledWith('idle');
+  });
+
+  it('releases authority when the authoritative viewport explicitly shows an interrupted turn', () => {
+    const cid = '22222222-2222-2222-2222-222222222222';
+    const interruptedScreen = [
+      '● Bash(bytedcli env service upgrade-tce)',
+      '  ⎿  Interrupted · What should Antigravity CLI do instead?',
+      '────────',
+      '>',
+      '────────',
+      '? for shortcuts',
+      '',
+    ].join('\n');
+    const { h } = sendModeHarness({
+      screen: interruptedScreen,
+      records: [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\n升级环境\n</USER_REQUEST>' },
+        { step_index: 1, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: `Tool is running as a background task with task id: ${cid}/task-178\n` },
+        { step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '等待中' },
+      ],
+    });
+
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.isPromptReady).toBe(true);
     expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
     expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
   });
