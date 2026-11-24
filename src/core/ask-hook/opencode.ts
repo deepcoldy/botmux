@@ -34,7 +34,8 @@
  * `POST /question/{id}/reply`、body `{ answers }`）。
  */
 
-import { noteEntry } from '../ask-notes.js';
+import { answerWithNote, noteEntry } from '../ask-notes.js';
+import type { Locale } from '../../i18n/types.js';
 import type { AskQuestion } from '../ask-types.js';
 import type { HookAskAdapter, ParsedAsk } from './types.js';
 
@@ -99,9 +100,16 @@ const openCodeAdapter: HookAskAdapter = {
     comment?: string | null,
     customAnswers?: ReadonlyArray<string | null>,
     notes?: ReadonlyArray<string | null>,
+    locale?: Locale,
   ): string {
-    // A note written next to the options is one more entry after the option labels.
-    const withNote = (values: string[], i: number) => notes?.[i] ? [...values, noteEntry(notes[i]!)] : values;
+    // A note written next to the options: on a single-choice question it rides on the one answer
+    // string (as for Claude Code); on a multi-choice one it is one more entry after the labels.
+    const withNote = (values: string[], i: number) => {
+      const note = notes?.[i];
+      if (!note) return values;
+      return parsed.questions[i]?.multiSelect || values.length !== 1
+        ? [...values, noteEntry(note, locale)] : [answerWithNote(values[0]!, note, locale)];
+    };
     const p = parsed.raw as Record<string, unknown> | undefined;
     const toolInput = (p?.tool_input as { questions?: unknown[] } | undefined);
     const hasStructured = Array.isArray(toolInput?.questions) && (toolInput!.questions!.length > 0);

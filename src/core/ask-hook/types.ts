@@ -1,4 +1,5 @@
 import type { AskQuestion, CliPermissionOutcome } from '../ask-types.js';
+import type { Locale } from '../../i18n/types.js';
 
 /** adapter 解析一个 hook payload 后得到的问题列表和原始上下文。 */
 export interface ParsedAsk {
@@ -32,6 +33,8 @@ export interface HookAskAdapter {
     comment?: string | null,
     customAnswers?: ReadonlyArray<string | null>,
     notes?: ReadonlyArray<string | null>,
+    /** 提问机器人的界面语言（daemon 随答案带回）：备注标记等措辞跟着它走。 */
+    locale?: Locale,
   ): string;
 
   /** hook 接管失败时的"放行/无操作" directive（让 CLI 回退原生终端提问）。 */

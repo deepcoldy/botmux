@@ -1185,7 +1185,7 @@ import {
 } from './core/completion-proposal.js';
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
-import { handleCliResolvedRequest, parseAskBody, registerAskForResponse, verifiedAskMention } from './core/ask-api.js';
+import { askResponseBody, handleCliResolvedRequest, parseAskBody, registerAskForResponse, verifiedAskMention } from './core/ask-api.js';
 import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
@@ -12458,7 +12458,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     }
   }
 
-  return jsonRes(res, 200, result);
+  return jsonRes(res, 200, askResponseBody(result, boundAsk.originKind, localeForBot(boundAsk.larkAppId)));
 };
 ipcRoute('POST', '/api/asks', handleAskRequest);
 ipcRoute('POST', '/api/asks/form-v1', handleAskRequest);

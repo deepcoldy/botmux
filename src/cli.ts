@@ -19672,7 +19672,7 @@ export async function runHook(
   }
 
   if (result.kind === 'answered') {
-    return { stdout: adapter.formatAnswer(result.answers, parsed, result.comment, result.customAnswers, result.notes) };
+    return { stdout: adapter.formatAnswer(result.answers, parsed, result.comment, result.customAnswers, result.notes, result.locale) };
   }
 
   // timedOut / invalidated → passthrough 放行（实现了 formatUnanswered 的 CLI 带原因结束）

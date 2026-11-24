@@ -7,6 +7,7 @@
  */
 
 import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
+import type { Locale } from '../i18n/types.js';
 
 /** A single selectable option on an ask card. `key` is the stable identifier
  *  returned via stdout; `label` is the human-facing button text. When the user
@@ -100,6 +101,10 @@ export type AskResult =
        *  this text goes with them. Absent on results from older versions; a consumer that
        *  ignores it still gets the right options. */
       notes?: ReadonlyArray<string | null>;
+      /** The asking bot's language, so a hook words what it writes around the answer (the note
+       *  marker) like the bot does. Added by the daemon to the HTTP response only, never stored;
+       *  absent from older daemons, where the hook keeps its process default. */
+      locale?: Locale;
       by: string;
       /** 自定义回复原文（用户在话题里直接打字作答）；按钮选择时为 null。 */
       comment: string | null;

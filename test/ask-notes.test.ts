@@ -12,6 +12,7 @@ import antigravity from '../src/core/ask-hook/antigravity.js';
 import dsh from '../src/core/ask-hook/dsh.js';
 import opencode from '../src/core/ask-hook/opencode.js';
 import { getDefaultLocale, setDefaultLocale } from '../src/i18n/index.js';
+import { askResponseBody } from '../src/core/ask-api.js';
 import { buildAskCard, handleAskCardAction } from '../src/im/lark/ask-card.js';
 import { turnReplyAskSummary } from '../src/im/lark/turn-reply-ask-elements.js';
 import { codexAsyncAnswerText } from '../src/services/codex-async-user-input.js';
@@ -51,10 +52,34 @@ describe('勾了选项又写的备注，交给各个提问方', () => {
     expect(await claudeAnswers(own)).toEqual({ '谁一起去？': '自驾去', '玩什么？': '爬山' });
   });
 
-  it('OpenCode：备注是选项标签之后多出的一项', () => {
+  it.each([
+    ['英文机器人跑在中文默认的 daemon 上', 'zh', 'en', '家人 (推荐); note: 带一只狗'],
+    ['中文机器人跑在英文默认的 daemon 上', 'en', 'zh', '家人 (推荐)；备注：带一只狗'],
+  ] as const)('Claude Code：备注标记跟着提问机器人的语言走（%s）', async (_case, processDefault, botLocale, expected) => {
+    setDefaultLocale(processDefault);
+    // What the daemon answers the waiting hook with for this bot.
+    const response = askResponseBody(withNote, 'hook', botLocale);
+    expect((await claudeAnswers(response))['谁一起去？']).toBe(expected);
+  });
+
+  it('daemon 只给 hook 的答案带上机器人语言，不改别的结果', () => {
+    expect(askResponseBody(withNote, 'hook', 'en')).toMatchObject({ locale: 'en' });
+    expect(askResponseBody(withNote, 'explicit', 'en')).not.toHaveProperty('locale');
+    const timedOut: AskResult = { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true };
+    expect(askResponseBody(timedOut, 'hook', 'en')).toEqual(timedOut);
+  });
+
+  it('OpenCode：单选的备注接在同一条答案后面，多选的备注是标签之后多出的一项', () => {
     const parsed = { questions, raw: { tool_input: { questions: [{}, {}] } } } as any;
+    const multiNote = [null, '带上相机'];
     expect(JSON.parse(opencode.formatAnswer(withNote.answers, parsed, null, undefined, withNote.notes)).answers)
-      .toEqual([['家人 (推荐)', '备注：带一只狗'], ['爬山', '看海']]);
+      .toEqual([['家人 (推荐)；备注：带一只狗'], ['爬山', '看海']]);
+    expect(JSON.parse(opencode.formatAnswer(withNote.answers, parsed, null, undefined, multiNote)).answers)
+      .toEqual([['家人 (推荐)'], ['爬山', '看海', '备注：带上相机']]);
+    expect(JSON.parse(opencode.formatAnswer([['朋友'], ['爬山']], parsed, null, undefined, multiNote)).answers)
+      .toEqual([['朋友'], ['爬山', '备注：带上相机']]);
+    expect(JSON.parse(opencode.formatAnswer(withNote.answers, parsed, null, undefined, ['带一只狗', '带上相机'], 'en')).answers)
+      .toEqual([['家人 (推荐); note: 带一只狗'], ['爬山', '看海', 'note: 带上相机']]);
   });
 
   it('dsh：备注放进 custom，与 selected 一起交回', () => {
