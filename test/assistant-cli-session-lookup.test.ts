@@ -31,10 +31,21 @@ async function assistantPane(customize?: (proof: ManagedOriginAttestation) => vo
   const requests: Array<{ url?: string; body: Record<string, unknown> }> = [];
   const server = createServer(async (req, res) => {
     const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true }) ?? {};
-    requests.push({ url: req.url, body });
     if (req.url === authPath) {
+      requests.push({ url: req.url, body });
       return res.end(JSON.stringify({ ok: true, status: 'sent', delivery: 'dm' }));
     }
+    // Reject scanner probes / malformed requests before touching the proof
+    // writer or the request log: an invalid nonce makes
+    // writeManagedOriginAttestationProof throw (unhandled rejection), and
+    // counting the probe here would flip the "no requests" assertion below.
+    // The host runs a loopback scanner that GETs every listening port; mirrors
+    // the schedule CLI fixture's bad-request handling.
+    if (typeof body.nonce !== 'string' || !/^[a-f0-9]{64}$/.test(body.nonce)) {
+      res.statusCode = 400;
+      return res.end(JSON.stringify({ ok: false, error: 'bad_nonce' }));
+    }
+    requests.push({ url: req.url, body });
     const proof: ManagedOriginAttestation = { sessionId: sid, turnId: 'om_live', callerOpenId: 'ou_owner',
       larkAppId: app, requiresCodexAppLedger: false,
       session: { status: 'active', chatId: 'oc_p2p', rootMessageId: 'om_root', scope: 'chat', chatType: 'p2p',
