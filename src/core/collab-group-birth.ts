@@ -36,6 +36,7 @@ import { forwardMessage } from '../im/lark/client.js';
 import { runCollabGroupBirthS1, type CollabS1Deps } from './collab-orchestrator.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { preflightCollabPeer, COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT, declaresDurableTurnOutputReceipt } from './collab-preflight-ipc.js';
+import { resolvePairedBackendId } from './remote-cli-ids.js';
 import type { RoutingContext } from '../im/lark/event-dispatcher.js';
 
 export type CollabPreflightResult =
@@ -123,13 +124,15 @@ export async function realCollabPeerPreflight(ctx: CollabPeerPreflightContext): 
       .filter(k => k.trigger === 'afterAgentTurn')
       .map(k => k.afterAppId as string),
   );
-  // R4：creator 若被依赖（peer 的 afterAgentTurn 依赖 creator），也要按本地能力判定
-  // durable-turn-output-receipt-v1，不能只靠 backendType 字段、不能因 peers 排除 creator 而漏检。
+  // R4/P2：creator 若被依赖（peer 的 afterAgentTurn 依赖 creator），也要按**实际运行 backend**
+  // 判定 durable-turn-output-receipt-v1——不能只看 creatorCfg.backendType 原始值。用
+  // resolvePairedBackendId(cliId, backendType, daemon default) 解析实际配对（本地缺省 + 远程配对）。
   if (requiresDurableReceipt.has(ctx.creatorAppId)) {
     const creatorCfg = getBot(ctx.creatorAppId).config;
-    const creatorCapable = declaresDurableTurnOutputReceipt(creatorCfg.backendType);
+    const actualBackend = resolvePairedBackendId(creatorCfg.cliId, creatorCfg.backendType, config.daemon.backendType);
+    const creatorCapable = declaresDurableTurnOutputReceipt(actualBackend);
     if (!creatorCapable) {
-      errors.push(`creator ${ctx.creatorAppId} 被 afterAgentTurn 依赖但未声明 durable-turn-output-receipt-v1`);
+      errors.push(`creator ${ctx.creatorAppId} 被 afterAgentTurn 依赖但未声明 durable-turn-output-receipt-v1（backend=${actualBackend ?? 'unknown'}）`);
     }
   }
   // 只 preflight 非 creator participant（creator 走本地）。

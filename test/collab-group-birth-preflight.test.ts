@@ -21,7 +21,7 @@ const now = () => ++clock;
 
 // config.js 会拉入 zod / voice 等大依赖图，直接 mock 掉，避免无关模块加载。
 vi.mock('../src/config.js', () => ({
-  config: { session: { get dataDir() { return tempDir; } } },
+  config: { session: { get dataDir() { return tempDir; } }, daemon: { backendType: 'pty' } },
 }));
 
 vi.mock('../src/bot-registry.js', () => {
@@ -263,5 +263,27 @@ describe('preflightCollabGroupBirth', () => {
     });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.errors.some(e => e.includes('creator') && e.includes('durable-turn-output-receipt'))).toBe(true);
+  });
+
+  it('P2：creator cliId=mojo + 未显式 backendType → resolvePairedBackendId 解析为 mojo，未就绪', async () => {
+    // cliId=mojo 是远程 backend id，resolvePairedBackendId 返回 'mojo'，不在 durable-turn-output-receipt-v1 组合。
+    __testOnly_setBotConfig(APP, { cliId: 'mojo', backendType: undefined, sessionGroup: undefined });
+    const r = await realCollabPeerPreflight({
+      config: {
+        enabled: true,
+        agents: [{ appId: APP, roleMode: 'no-chat-role' }, { appId: 'cli_peer', roleMode: 'no-chat-role' }],
+        kickoff: [
+          { appId: APP, trigger: 'immediate' },
+          { appId: 'cli_peer', trigger: 'afterAgentTurn', afterAppId: APP, artifact: { type: 'marked-url', hosts: ['x.com'] } },
+        ],
+      } as any,
+      initId: 'a'.repeat(64),
+      sourceMessageId: 'om_src',
+      configVersion: 'cv',
+      creatorAppId: APP,
+      dataDir: tempDir,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errors.some(e => e.includes('creator') && e.includes('mojo'))).toBe(true);
   });
 });

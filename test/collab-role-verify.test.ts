@@ -97,6 +97,18 @@ describe('runCollabRoleVerification', () => {
     expect(writes).toBe(0); // 不代写
     expect(r.conflict).toContain('read-error');
   });
+
+  it('P1：空 Profile + 不可读旧文件 → 清空前 read-error fail-closed，不删除旧文件', () => {
+    let deletes = 0;
+    const r = runCollabRoleVerification(APP, CHAT, config([{ appId: APP, profileId: 'p1' }]), deps({
+      readProfile: () => '', // 空 Profile → 显式清空
+      deleteRole: () => { deletes++; },
+      readRole: () => ({ kind: 'read-error', error: 'EACCES' }),
+    }));
+    expect(r.ready).toBe(false);
+    expect(deletes).toBe(0); // 清空前 read-error 被拦，不删除旧文件
+    expect(r.conflict).toContain('read-error');
+  });
 });
 
 describe('gate roleReady + 队列骨架', () => {

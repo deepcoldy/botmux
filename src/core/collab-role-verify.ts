@@ -101,7 +101,13 @@ export function runCollabRoleVerification(
       return { ready: false, records, conflict: `agent ${agent.appId} 的 Profile 条目缺失（profile=${profileId}）` };
     }
     if (entryContent === '') {
-      // profile + ''：显式清空本群覆盖，回读核对 team/none。
+      // profile + ''：显式清空本群覆盖。严格回读须在**任何角色修改（含删除）之前**：
+      // read-error 立即 fail-closed 并保留旧文件，不因不可读旧文件而被 deleteRole 绕过。
+      const strictBefore = deps.readRole(larkAppId, chatId);
+      if (strictBefore.kind === 'read-error') {
+        records.push({ appId: agent.appId, expectedSource: 'team', verified: false, conflict: true });
+        return { ready: false, records, conflict: `agent ${agent.appId} 角色回读失败（read-error），不清空` };
+      }
       deps.deleteRole(larkAppId, chatId);
       const strictAfter = deps.readRole(larkAppId, chatId);
       if (strictAfter.kind === 'read-error') {
