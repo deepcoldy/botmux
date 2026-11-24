@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import type { DaemonToWorker } from '../src/types.js';
-import { codexEmptyComposerFooter, codexNativeFooterRows } from '../src/services/codex-terminal-session.js';
+import { codexEmptyComposerFooter, codexNativeComposerState, codexNativeFooterRows } from '../src/services/codex-terminal-session.js';
+import { detectCodexChoiceModal } from '../src/utils/codex-choice-modal.js';
 import { promptCacheKeepaliveRefusal } from '../src/core/prompt-cache-keepalive-gate.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -150,6 +151,31 @@ describe('native hard input-focus blocks across real delivery paths', () => {
       expect(codexEmptyComposerFooter({ viewport, cursor: { x: 2, y: 0 } })).toBeUndefined();
     }
     expect(codexNativeFooterRows(['enter submit  |  esc back'])).toBeUndefined();
+  });
+
+  it('never reads a live backdrop composer as empty while a choice modal owns the screen', () => {
+    // A centered overlay can leave a perfectly formed empty composer and a
+    // valid native footer behind it. The modal/backdrop guard inside
+    // codexEmptyComposerFooter is the only layer that rejects this shape:
+    // cursor geometry and the footer band both pass on their own.
+    const backdropModal = [
+      'Previous conversation lines',
+      '',
+      '  A command needs permission to run',
+      '',
+      '› 1. Yes, proceed (y)',
+      '  2. No, tell Codex what to do differently',
+      '',
+      '  Press enter to confirm or esc to cancel',
+      '',
+      '› ',
+      '',
+      '  gpt-5.6-sol default · ~/data',
+    ].join('\n');
+    expect(detectCodexChoiceModal(backdropModal)).toBeTruthy();
+    const state = { viewport: backdropModal, cursor: { x: 2, y: 9 } };
+    expect(codexEmptyComposerFooter(state, { allowCodex0146Hints: true })).toBeUndefined();
+    expect(codexNativeComposerState(state, { allowCodex0146Hints: true })).not.toBe('empty');
   });
 
   it('keeps OSC-7501 approval blocks authoritative after the rename-only gate', async () => {
