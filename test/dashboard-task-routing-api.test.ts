@@ -321,12 +321,29 @@ describe('handleTaskRoutingApi', () => {
       selectedName: 'FlagshipWorker',
       outcome: 'fallback_dispatched',
     });
+    // A newer unrelated row must not consume LIMIT before the attempts match.
+    seedRecord(store, {
+      id: 'rec_3',
+      createdAt: 1_760_000_020_000,
+      selectedAppId: 'cli_other',
+      selectedName: 'OtherWorker',
+      outcome: 'dispatched',
+      attempts: [{ appId: 'cli_other', name: 'OtherWorker', outcome: 'dispatched', reason: 'ok', at: 1_760_000_020_001 }],
+    });
 
     const filteredReq = makeReq('GET', '/api/task-routing/history?outcome=fallback_dispatched&bot=cli_flagship&limit=10');
     const filteredRes = makeRes();
     await handleTaskRoutingApi(filteredReq.req, filteredRes.res, filteredReq.url, deps);
     expect(filteredRes.status()).toBe(200);
     expect(filteredRes.json().records.map((r: TaskRoutingRecord) => r.id)).toEqual(['rec_2']);
+
+    // Bot A participated in rec_2's fallback chain even though Bot B was selected.
+    // The latest matching row is rec_2; rec_3 must be excluded before LIMIT 1.
+    const attemptReq = makeReq('GET', '/api/task-routing/history?bot=cli_econ&limit=1');
+    const attemptRes = makeRes();
+    await handleTaskRoutingApi(attemptReq.req, attemptRes.res, attemptReq.url, deps);
+    expect(attemptRes.status()).toBe(200);
+    expect(attemptRes.json().records.map((r: TaskRoutingRecord) => r.id)).toEqual(['rec_2']);
   });
 
   it('performs dry-run recommend with zero SQLite side effects and rejects malformed bodies', async () => {

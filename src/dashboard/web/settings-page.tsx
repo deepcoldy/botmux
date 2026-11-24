@@ -370,7 +370,7 @@ function installKindLabel(kind: string, tr: ReturnType<typeof useT>): string {
   return tr('update.kindUnknown');
 }
 
-function SettingsPage() {
+export function SettingsPage() {
   const tr = useT();
   const mountedRef = useRef(false);
   const timersRef = useRef<Set<number>>(new Set());
@@ -594,6 +594,9 @@ function SettingsPage() {
           setSettings(confirmed);
           ui.publicReadOnly = confirmed.publicReadOnly;
           store.setScheduleTimeZone(confirmed.effectiveScheduleTimeZone);
+          if (key === 'taskRouting') {
+            dispatchTaskRoutingChanged(confirmed.taskRouting.enabled);
+          }
           reconciled = true;
         }
       } catch { /* still offline: fall back to the pre-save snapshot */ }
@@ -1901,7 +1904,14 @@ export function TaskRoutingSettingsEditor(props: {
 
   function changeMatcherBot(nextBotAppId: string): void {
     setBotDraft(nextBotAppId);
-    if (!nextBotAppId) return;
+    if (!nextBotAppId) {
+      setMatcherModeDraft('rule');
+      void props.onSave(
+        { matcher: { mode: 'rule' } },
+        current => ({ ...current, matcher: { mode: 'rule' } }),
+      );
+      return;
+    }
     const timeoutMs = resolveTimeoutMs(timeoutSecDraft);
     void props.onSave(
       { matcher: { mode: 'bot', botAppId: nextBotAppId, timeoutMs } },

@@ -234,6 +234,23 @@ describe('TaskRoutingSettingsEditor', () => {
       expect.any(Function),
     );
 
+    // Clearing the bot is a real rule-mode save, not a draft-only fake fallback.
+    act(() => { botMenu.props.onChange(''); });
+    expect(onSave).toHaveBeenLastCalledWith(
+      { matcher: { mode: 'rule' } },
+      expect.any(Function),
+    );
+    const [, optimisticClear] = onSave.mock.calls.at(-1)! as unknown as [
+      unknown,
+      (current: { enabled: boolean; matcher: unknown }) => { enabled: boolean; matcher: unknown },
+    ];
+    expect(optimisticClear({
+      enabled: true,
+      matcher: { mode: 'bot', botAppId: 'cli_judge', timeoutMs: 25_000 },
+    }).matcher).toEqual({ mode: 'rule' });
+    expect(modeMenu.props.value).toBe('rule');
+    expect(view.root.findAllByProps({ ariaLabel: zh('settings.taskRoutingMatcherBot') })).toHaveLength(0);
+
     act(() => view.unmount());
   });
 });
