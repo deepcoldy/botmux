@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
+import { readProcessStartIdentity } from '../utils/process-identity.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CONVERSATION_DB_RE = /^([0-9a-f-]{36})\.db(?:-wal|-shm)?(?: \(deleted\))?$/i;
@@ -142,6 +143,22 @@ export function inspectAntigravityConversationIdByPid(
     found ??= id;
   }
   return found ? { kind: 'unique', conversationId: found } : { kind: 'missing' };
+}
+
+export function findAttestedAntigravityConversationId(
+  attestation: { cliPid?: number; cliProcStart?: string } | undefined,
+  deps: {
+    readProcessStartIdentity: (pid: number) => string | undefined;
+    inspectAntigravityConversationIdByPid: (pid: number) => AntigravityConversationIdInspection;
+  } = { readProcessStartIdentity, inspectAntigravityConversationIdByPid },
+): string | undefined {
+  const pid = attestation?.cliPid;
+  const birth = attestation?.cliProcStart;
+  if (!pid || !birth || deps.readProcessStartIdentity(pid) !== birth) return undefined;
+  const live = deps.inspectAntigravityConversationIdByPid(pid);
+  // The PID may be reused during the fd/presence discovery window itself.
+  if (live.kind !== 'unique' || deps.readProcessStartIdentity(pid) !== birth) return undefined;
+  return live.conversationId;
 }
 
 export function findAntigravityConversationIdByPid(

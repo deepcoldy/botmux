@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { annotateAntigravityUsageLimit } from '../src/adapters/cli/antigravity.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { detectCliUsageLimit, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 
 const INCIDENT_QUOTA_SCREEN = '⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.\n'
@@ -103,7 +104,7 @@ async function setupRotationScenario(input: {
     lastUserPrompt: 'do work',
     lastCliInputTurnId: 'turn-1',
     antigravityAccountId: 'acc1',
-    localProcessAttestation: { cliPid: process.pid },
+    localProcessAttestation: { cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid)! },
   };
   setActiveSessionsRegistry(new Map([[activeSessionKey(ds as never), ds]]));
   const nowMs = Date.now();
@@ -583,7 +584,7 @@ describe('Antigravity worker-pool replay safety', () => {
     expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(1);
   });
 
-  it.each(['no-attestation', 'missing', 'ambiguous', 'stored-conflict'] as const)('rejects settlement without a unique attested current identity (%s)', async mode => {
+  it.each(['no-attestation', 'missing', 'ambiguous', 'stored-conflict', 'birth-mismatch', 'birth-missing'] as const)('rejects settlement without a unique attested current identity (%s)', async mode => {
     const h = await setupRotationScenario({ directFailure: true });
     const restart = await emitQuotaAndStart(h);
     if (mode === 'no-attestation') delete h.ds.localProcessAttestation;
@@ -597,6 +598,8 @@ describe('Antigravity worker-pool replay safety', () => {
       cleanups.push(() => closeSync(otherFd));
     }
     if (mode === 'stored-conflict') h.ds.session.cliSessionId = '61fc8ef7-1886-40af-9bac-c6ee8f8d172e';
+    if (mode === 'birth-mismatch') h.ds.localProcessAttestation.cliProcStart = '0';
+    if (mode === 'birth-missing') delete h.ds.localProcessAttestation.cliProcStart;
 
     h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
     h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });

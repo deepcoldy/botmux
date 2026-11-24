@@ -6,6 +6,7 @@ import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import {
   findAntigravityConversationId,
   findAntigravityConversationIdByPid,
+  findAttestedAntigravityConversationId,
   inspectAntigravityConversationIdByPid,
   findAntigravityConversationIdByWorkspace,
   readAntigravityConversationTitle,
@@ -78,6 +79,24 @@ describe('antigravity-discovery', () => {
     symlinkSync(join(cliHome, 'presence', `${second}.lock`), join(fd, '4'));
     expect(inspectAntigravityConversationIdByPid(4300, convDir, procRoot)).toEqual({ kind: 'ambiguous' });
     expect(findAntigravityConversationIdByPid(4300, convDir, procRoot)).toBeNull();
+  });
+
+  it('rejects a PID whose birth changes during attested discovery', () => {
+    const births = ['birth-before-discovery', 'birth-after-reuse'];
+    const reads: number[] = [];
+    let inspections = 0;
+    const result = findAttestedAntigravityConversationId({
+      cliPid: 4400, cliProcStart: 'birth-before-discovery',
+    }, {
+      readProcessStartIdentity: pid => { reads.push(pid); return births.shift(); },
+      inspectAntigravityConversationIdByPid: () => {
+        inspections += 1;
+        return { kind: 'unique', conversationId: 'a4331552-f261-4f1f-a460-e15e7f2fe0ea' };
+      },
+    });
+    expect(result).toBeUndefined();
+    expect(reads).toEqual([4400, 4400]);
+    expect(inspections).toBe(1);
   });
 
   it('matches kernel-canonicalized fds when the CLI home is reached through a symlink', () => {

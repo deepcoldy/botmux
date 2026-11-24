@@ -511,7 +511,7 @@ describe('controlled failed-turn recovery', () => {
     recordLimitedFailedTurn(ds, request.turnId);
     expect(ds.session.lastFailedTurn.directFailure).toBeUndefined();
   });
-  it.each(['clone', 'new-turn', 'new-failed-at', 'recovery-claim', 'ownership-lost', 'generation-change', 'current-turn'] as const)('owns cleanup retry across %s', async mode => {
+  it.each(['clone', 'new-turn', 'new-failed-at', 'recovery-claim', 'ownership-lost', 'generation-change', 'current-turn', 'new-limit'] as const)('owns cleanup retry across %s', async mode => {
     vi.useFakeTimers();
     try {
       const original = { ...ds.session.lastFailedTurn, limitedSnapshot: true };
@@ -540,6 +540,9 @@ describe('controlled failed-turn recovery', () => {
         ds.session.workerGeneration = 1;
       }
       if (mode === 'current-turn') ds.lastCliInputTurnId = 'om_current_new';
+      if (mode === 'new-limit') ds.usageLimit = {
+        limited: true, kind: 'usage', source: 'antigravity-native-log', nativeEpisodeKey: 'log:new-limit',
+      };
       fail = false;
       await vi.advanceTimersByTimeAsync(500);
       if (mode === 'clone') expect(ds.session.lastFailedTurn).toBeUndefined();

@@ -169,7 +169,8 @@ function retryLimitedFailedTurnClear(
       if (findActiveBySessionId(ds.session.sessionId) !== ds || ds.session.status !== 'active'
         || ds.workerGeneration !== fence.workerGeneration
         || ds.session.workerGeneration !== fence.sessionWorkerGeneration
-        || ds.lastCliInputTurnId !== fence.inputTurnId) return;
+        || ds.lastCliInputTurnId !== fence.inputTurnId
+        || ds.usageLimit?.limited) return;
       if (!current?.limitedSnapshot || current.recovery
         || current.turnId !== record.turnId || current.failedAt !== record.failedAt) return;
       try {

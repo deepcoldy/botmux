@@ -1097,7 +1097,7 @@ import { buildBackendOutageCard, formatBackendOutageSummary } from './backend-ou
 import { probeTmuxServerUp } from '../adapters/backend/tmux-pipe-backend.js';
 import { getSessionGroup, isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
-import { readAntigravityConversationTitle, inspectAntigravityConversationIdByPid } from '../services/antigravity-discovery.js';
+import { readAntigravityConversationTitle, findAttestedAntigravityConversationId } from '../services/antigravity-discovery.js';
 import { antigravityTurnFailedWithoutOutput, resolveAntigravityTranscriptPath } from '../services/antigravity-transcript.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
@@ -21773,13 +21773,13 @@ function setupWorkerHandlers(
       // ds.worker.pid belongs to the worker wrapper, not agy. Only the trusted
       // worker's attested CLI PID can identify the live conversation; absent or
       // ambiguous presence must never fall back to a stored transcript.
-      const cliPid = ds.localProcessAttestation?.cliPid;
-      if (!cliPid) return false;
-      const live = inspectAntigravityConversationIdByPid(cliPid);
-      if (live.kind !== 'unique') return false;
+      // The attestation's PID+birth pair is validated on both sides of native
+      // discovery, so PID reuse cannot inherit an old turn's replay authority.
+      const liveId = findAttestedAntigravityConversationId(ds.localProcessAttestation);
+      if (!liveId) return false;
       const storedId = ds.session.cliSessionId;
-      if (storedId && storedId.toLowerCase() !== live.conversationId.toLowerCase()) return false;
-      const path = resolveAntigravityTranscriptPath(live.conversationId) ?? undefined;
+      if (storedId && storedId.toLowerCase() !== liveId.toLowerCase()) return false;
+      const path = resolveAntigravityTranscriptPath(liveId) ?? undefined;
       // Frame-time proof is only a latch. Re-read the exact current transcript
       // at the settlement edge so late assistant/tool progress revokes replay.
       return antigravityTurnFailedWithoutOutput(path, cliInput);
