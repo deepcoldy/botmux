@@ -16,6 +16,7 @@
  */
 import { readCollabGate } from '../services/collab-gate-store.js';
 import { enqueueCollabChatItem, readCollabChatQueue } from '../services/collab-chat-queue-store.js';
+import { readCollabInitEntry } from '../services/collab-init-store.js';
 import type { TalkEvaluation } from '../im/lark/event-dispatcher.js';
 import type { SlashRouteDecision } from './command-router.js';
 import type { CollabGateFile, SessionGroupCollaborationConfig } from '../services/collab-group-config.js';
@@ -72,6 +73,11 @@ export function checkCollabGateAdmission(opts: CollabGateAdmissionOpts): CollabG
   if (!gate) return { kind: 'not-collab' };
   const participant = gate.participants[opts.botAppId];
   if (!participant) return { kind: 'not-collab' };
+  // F1：gatePolicy 从该群**已冻结的 configSnapshot** 读（creator 的 collab-group-init entry），
+  // 不读目标 daemon 自己的 p2p 创建默认配置。opts.config 显式注入优先（测试），否则从
+  // gate.creatorAppId + gate.initId 解析冻结快照。
+  const frozenConfig = opts.config
+    ?? readCollabInitEntry(opts.dataDir, gate.creatorAppId, gate.initId)?.configSnapshot;
 
   // F4：先拒绝未授权 talk，再判豁免/gate——未授权不触碰队列/策略。
   if (!opts.talk.allowed) return { kind: 'reject', reason: 'not_allowed' };
@@ -100,7 +106,7 @@ export function checkCollabGateAdmission(opts: CollabGateAdmissionOpts): CollabG
     case 'initializing':
     case 'active':
     default: {
-      const policy = opts.config?.gatePolicy ?? 'queue';
+      const policy = frozenConfig?.gatePolicy ?? 'queue';
       if (policy === 'reject') return { kind: 'reject', reason: 'gate_not_open' };
       // F3：queue 要求有效 sourceMessageId，否则不宣称 queue。
       const sourceMessageId = opts.sourceMessageId ?? '';

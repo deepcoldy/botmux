@@ -9,6 +9,8 @@ import { checkCollabGateAdmission, collabCommandExempt } from '../src/core/colla
 import { classifySlash } from '../src/core/command-router.js';
 import { buildInitialCollabGate, writeCollabGate, patchCollabGate } from '../src/services/collab-gate-store.js';
 import { readCollabChatQueue } from '../src/services/collab-chat-queue-store.js';
+import { placeCollabGroupInit, __testOnly_resetCollabInitMutexes } from '../src/services/collab-init-store.js';
+import { collabInitId, collabSourceKey, collabCreatorAdmissionOperationId, type SessionGroupCollaborationConfig } from '../src/services/collab-group-config.js';
 import type { CollabGateFile } from '../src/services/collab-group-config.js';
 import type { TalkEvaluation } from '../src/im/lark/event-dispatcher.js';
 import type { SlashRouteDecision } from '../src/core/command-router.js';
@@ -28,8 +30,8 @@ function gate(overrides: Partial<CollabGateFile> = {}): CollabGateFile {
   };
 }
 
-beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'collab-gate-admission-')); });
-afterEach(() => { rmSync(dataDir, { recursive: true, force: true }); });
+beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'collab-gate-admission-')); __testOnly_resetCollabInitMutexes(); });
+afterEach(() => { rmSync(dataDir, { recursive: true, force: true }); __testOnly_resetCollabInitMutexes(); });
 
 describe('checkCollabGateAdmission', () => {
   it('无 gate → not-collab', () => {
@@ -152,6 +154,12 @@ describe('F1：真实 classifySlash → gate 用例', () => {
     if (d.kind === 'daemon') expect(d.sessionPolicy).toBe('sessionless');
     expect(collabCommandExempt(d)).toBe(true);
   });
+
+  it('/compact 是 passthrough（会注入 CLI）→ 不豁免，thread 命令 gate 会拦', () => {
+    const d = classifySlash({ ...input, text: '/compact', passthrough: new Set(['/compact']) });
+    expect(d.kind).toBe('passthrough');
+    expect(collabCommandExempt(d)).toBe(false);
+  });
 });
 
 describe('F2/F4：授权顺序与阶段优先级', () => {
@@ -175,6 +183,22 @@ describe('F2/F4：授权顺序与阶段优先级', () => {
     });
     expect(r.kind).toBe('reject');
     if (r.kind === 'reject') expect(r.reason).toBe('not_allowed');
+  });
+
+  it('F1：gatePolicy 从冻结 configSnapshot 读（creator reject + peer 无 config）', async () => {
+    const initId = collabInitId(collabSourceKey(CREATOR, 'oc_dm', 'om_src'));
+    // seed creator 的 collab-group-init entry，configSnapshot 里 gatePolicy=reject
+    const rejectConfig: SessionGroupCollaborationConfig = { enabled: true, agents: [{ appId: APP, roleMode: 'no-chat-role' }], kickoff: [{ appId: APP, trigger: 'immediate' }], gatePolicy: 'reject' };
+    await placeCollabGroupInit({
+      dataDir, creatorAppId: CREATOR, dmChatId: 'oc_dm', sourceKey: collabSourceKey(CREATOR, 'oc_dm', 'om_src'), initId,
+      sourceMessageId: 'om_src', configVersion: 'cv', configSnapshot: rejectConfig,
+      creatorAdmissionOperationId: collabCreatorAdmissionOperationId(initId), createAttempt: 0, now: Date.now(),
+    });
+    const g = gate({ phase: 'initializing', creatorAppId: CREATOR, initId });
+    // 不传 config（peer 无 collaboration 配置），应从冻结快照读 gatePolicy=reject。
+    const r = checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk, gate: g, sourceMessageId: 'om_1', routingEvent: { content: 'hi' } });
+    expect(r.kind).toBe('reject');
+    if (r.kind === 'reject') expect(r.reason).toBe('gate_not_open');
   });
 });
 

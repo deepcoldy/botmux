@@ -28794,8 +28794,17 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       botAppId: larkAppId,
       talk: gateTalk,
       sourceMessageId: messageId,
-      routingEvent: { content, resources: resources.map(r => ({ type: r.type, name: r.name })) },
-      config: getBot(larkAppId).config.sessionGroup?.collaboration,
+      routingEvent: {
+        chatId,
+        senderOpenId,
+        senderUnionId,
+        teamTrustUnionId,
+        chatType,
+        scope,
+        anchor,
+        content,
+        resources: resources.map(r => ({ type: r.type, key: r.key, name: r.name, messageId: r.messageId, fallbackMessageIds: r.fallbackMessageIds })),
+      },
     });
     if (gateDecision.block) {
       if (gateDecision.reason === 'queued') {
@@ -29439,8 +29448,17 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       talk: gateTalk,
       slashDecision,
       sourceMessageId: messageId,
-      routingEvent: { content: cmdContent, resources: resources.map(r => ({ type: r.type, name: r.name })) },
-      config: botCfg.sessionGroup?.collaboration,
+      routingEvent: {
+        chatId,
+        senderOpenId,
+        senderUnionId,
+        teamTrustUnionId,
+        chatType,
+        scope,
+        anchor,
+        content: cmdContent,
+        resources: resources.map(r => ({ type: r.type, key: r.key, name: r.name, messageId: r.messageId, fallbackMessageIds: r.fallbackMessageIds })),
+      },
     });
     if (gateDecision.block) {
       if (gateDecision.reason === 'queued') {
@@ -31707,8 +31725,17 @@ async function handleThreadReplyAdmitted(
       botAppId: larkAppId,
       talk: gateTalk,
       sourceMessageId: parsed.messageId,
-      routingEvent: { content: parsed.content, resources: resources.map(r => ({ type: r.type, name: r.name })) },
-      config: getBot(larkAppId).config.sessionGroup?.collaboration,
+      routingEvent: {
+        chatId: gateChatId,
+        senderOpenId: quotaSenderOpenId,
+        senderUnionId: threadSenderUnionId,
+        teamTrustUnionId: threadTeamTrustUnionId,
+        chatType: ctxChatType,
+        scope,
+        anchor,
+        content: parsed.content,
+        resources: resources.map(r => ({ type: r.type, key: r.key, name: r.name, messageId: r.messageId, fallbackMessageIds: r.fallbackMessageIds })),
+      },
     });
     if (gateDecision.block) {
       if (gateDecision.reason === 'queued') {
@@ -33595,8 +33622,17 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       talk: gateTalk,
       slashDecision,
       sourceMessageId: parsed.messageId,
-      routingEvent: { content: cmdContent, resources: resources.map(r => ({ type: r.type, name: r.name })) },
-      config: getBot(larkAppId).config.sessionGroup?.collaboration,
+      routingEvent: {
+        chatId: gateChatId,
+        senderOpenId,
+        senderUnionId,
+        teamTrustUnionId,
+        chatType,
+        scope,
+        anchor,
+        content: cmdContent,
+        resources: resources.map(r => ({ type: r.type, key: r.key, name: r.name, messageId: r.messageId, fallbackMessageIds: r.fallbackMessageIds })),
+      },
     });
     if (gateDecision.block) {
       if (gateDecision.reason === 'queued') {
