@@ -132,8 +132,8 @@ export function checkCollabGateAdmission(opts: CollabGateAdmissionOpts): CollabG
 }
 
 function readQueuePosition(dataDir: string, chatId: string, targetAppId: string, sourceMessageId: string): number {
-  const q = readCollabChatQueue(dataDir, chatId);
-  const idx = q.items.findIndex(i => i.targetAppId === targetAppId && i.sourceMessageId === sourceMessageId);
+  const q = readCollabChatQueue(dataDir, chatId, targetAppId);
+  const idx = q.items.findIndex(i => i.sourceMessageId === sourceMessageId);
   return idx < 0 ? 0 : idx + 1;
 }
 

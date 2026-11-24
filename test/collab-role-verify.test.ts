@@ -120,10 +120,10 @@ describe('gate roleReady + 队列骨架', () => {
     expect(readCollabGate(dataDir, CHAT)!.participants[APP].roleReady).toBe(true);
   });
 
-  it('队列同 sourceMessageId 去重', () => {
+  it('队列同 (target, sourceMessageId) 去重', () => {
     enqueueCollabChatItem(dataDir, CHAT, { sourceMessageId: 'om_1', targetAppId: APP, routingEvent: {}, deliveryStatus: 'pending', enqueuedAt: 1 });
     const added = enqueueCollabChatItem(dataDir, CHAT, { sourceMessageId: 'om_1', targetAppId: APP, routingEvent: {}, deliveryStatus: 'pending', enqueuedAt: 2 });
     expect(added).toBe(false);
-    expect(readCollabChatQueue(dataDir, CHAT).items).toHaveLength(1);
+    expect(readCollabChatQueue(dataDir, CHAT, APP).items).toHaveLength(1);
   });
 });

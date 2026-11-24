@@ -235,25 +235,33 @@ describe('R1/R2：真实 store 持久化契约', () => {
       routingEvent: { text: 'hello', sender: 'ou_u' },
     });
     expect(r.kind).toBe('queue');
-    const q = readCollabChatQueue(dataDir, CHAT);
+    const q = readCollabChatQueue(dataDir, CHAT, APP);
     expect(q.items).toHaveLength(1);
     expect(q.items[0].routingEvent).toEqual({ text: 'hello', sender: 'ou_u' }); // 可序列化回读
   });
 
-  it('R2：同 chat/source 双 target 各留一条记录，各自幂等', () => {
+  it('N1：两个 target 各自独立队列文件，各留一条记录互不影响', () => {
     const g = gate({ phase: 'initializing', participants: { cli_a: { roleReady: false, kickoffState: 'pending', acceptingUserTasks: false }, cli_b: { roleReady: false, kickoffState: 'pending', acceptingUserTasks: false } } });
-    // 用真实 store（不注入 spy）
     const rA = checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: 'cli_a', talk: allowedTalk, gate: g, sourceMessageId: 'om_shared', routingEvent: { text: 'a' } });
     const rB = checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: 'cli_b', talk: allowedTalk, gate: g, sourceMessageId: 'om_shared', routingEvent: { text: 'b' } });
     expect(rA.kind).toBe('queue');
     expect(rB.kind).toBe('queue');
-    const q = readCollabChatQueue(dataDir, CHAT);
-    // 两条记录，各自 target
-    expect(q.items).toHaveLength(2);
-    expect(q.items.some(i => i.targetAppId === 'cli_a')).toBe(true);
-    expect(q.items.some(i => i.targetAppId === 'cli_b')).toBe(true);
-    // 各自重投幂等（不新增第三条）
-    checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: 'cli_a', talk: allowedTalk, gate: g, sourceMessageId: 'om_shared', routingEvent: { text: 'a' } });
-    expect(readCollabChatQueue(dataDir, CHAT).items).toHaveLength(2);
+    // 各自独立文件
+    const qa = readCollabChatQueue(dataDir, CHAT, 'cli_a');
+    const qb = readCollabChatQueue(dataDir, CHAT, 'cli_b');
+    expect(qa.items).toHaveLength(1);
+    expect(qb.items).toHaveLength(1);
+    expect(qa.items[0].targetAppId).toBe('cli_a');
+    expect(qb.items[0].targetAppId).toBe('cli_b');
+  });
+
+  it('N1：同 target 同 source 幂等，不同 target 同 source 各自保留', () => {
+    const g = gate({ phase: 'initializing', participants: { cli_a: { roleReady: false, kickoffState: 'pending', acceptingUserTasks: false }, cli_b: { roleReady: false, kickoffState: 'pending', acceptingUserTasks: false } } });
+    checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: 'cli_a', talk: allowedTalk, gate: g, sourceMessageId: 'om_1', routingEvent: { text: 'a' } });
+    checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: 'cli_b', talk: allowedTalk, gate: g, sourceMessageId: 'om_1', routingEvent: { text: 'b' } });
+    // 同 target 同 source 重投幂等（不新增）
+    checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: 'cli_a', talk: allowedTalk, gate: g, sourceMessageId: 'om_1', routingEvent: { text: 'a' } });
+    expect(readCollabChatQueue(dataDir, CHAT, 'cli_a').items).toHaveLength(1);
+    expect(readCollabChatQueue(dataDir, CHAT, 'cli_b').items).toHaveLength(1);
   });
 });
