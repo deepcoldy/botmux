@@ -7,7 +7,7 @@ import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BoardSummaryView, ItemDetailView, resetBoardNavMemory } from '../src/dashboard/web/decision-board-page.js';
 import {
-  BOARD_EXPLAINER_SANDBOX, boardExplainers, eventFileKind, formatBoardBytes,
+  BOARD_EXPLAINER_SANDBOX, boardExplainerGroups, boardExplainers, eventFileKind, formatBoardBytes,
   type BoardDetailResponse, type BoardFile, type BoardItem,
 } from '../src/dashboard/web/decision-board-model.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
@@ -105,6 +105,21 @@ describe('事项页的图文说明', () => {
     expect(textOf(panel)).not.toContain('shot.png');
   });
 
+  it('同名说明只展开最新版，旧版收进默认折叠的历史；不同名按最新时间排序', async () => {
+    const oldest = file('htmlold', 'text/html', HTML.name, 50);
+    const latest = file('htmlnew', 'text/html', HTML.name, 300);
+    await openDetail({ files: [HTML, oldest, VIDEO, latest] });
+    const panel = renderer!.root.find(n => n.type === 'section' && String(n.props.className).includes('dboard-explainers'));
+    const groups = panel.findAll(n => n.props.className === 'dboard-explainer-group');
+    expect(groups.map(group => group.findAll(n => n.type === 'figure')[0]!.props['data-file-id'])).toEqual(['htmlnew', 'video001']);
+
+    expect(groups[1]!.findAll(n => n.type === 'details')).toHaveLength(0);
+    const history = groups[0]!.findByType('details');
+    expect(history.props.open).toBeFalsy();
+    expect(textOf(history.findByType('summary'))).toBe(zh('decisionBoard.explainerHistory', { n: 2 }));
+    expect(history.findAll(n => n.type === 'figure').map(f => f.props['data-file-id'])).toEqual(['html0001', 'htmlold']);
+  });
+
   it('全屏查看打开的也是同样限制的 sandbox iframe，关闭后移除', async () => {
     await openDetail({ files: [HTML] });
     const button = renderer!.root.find(n => n.type === 'button' && textOf(n) === zh('decisionBoard.explainerFullscreen'));
@@ -194,6 +209,19 @@ describe('模型', () => {
     expect(eventFileKind('html0001', map)).toBe('html');
     expect(eventFileKind('image001', map)).toBe('image');
     expect(eventFileKind('missing1', map)).toBe('image');
+  });
+
+  it('boardExplainerGroups 同名只留最新版，历史与不同名分组都按时间倒序', () => {
+    const oldest = file('htmlold', 'text/html', HTML.name, 50);
+    const latest = file('htmlnew', 'text/html', HTML.name, 300);
+    const groups = boardExplainerGroups([HTML, oldest, SHOT, VIDEO, latest]);
+    expect(groups.map(group => ({
+      latest: group.latest.id,
+      history: group.history.map(version => version.id),
+    }))).toEqual([
+      { latest: 'htmlnew', history: ['html0001', 'htmlold'] },
+      { latest: 'video001', history: [] },
+    ]);
   });
 
   it('formatBoardBytes', () => {
