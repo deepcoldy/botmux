@@ -366,6 +366,27 @@ describe.each(['bots-json', 'sqlite'] as const)('grant-store message quota [%s]'
     expect(r2.quotaKey).toBe(quotaKey);
   });
 
+  it('PR-3a: consumeCollabKickoffOnce kick_<64hex> 幂等不二扣', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    const receiptId = `kick_${'a'.repeat(64)}`;
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_g'] },
+      quotaState: { [quotaKey]: { limit: 3, used: 0 } },
+    });
+    const { store } = await freshModules();
+    const input = { larkAppId: 'a1', receiptId, quotaKey, sourceOpenId: 'ou_g', reason: 'chatGrant' };
+    const r1 = await store.consumeCollabKickoffOnce(input);
+    expect(r1.allow).toBe(true);
+    expect(r1.used).toBe(1);
+    // 重复 prepare/query：同 receiptId 不二扣
+    const r2 = await store.consumeCollabKickoffOnce(input);
+    expect(r2.allow).toBe(true);
+    expect(r2.used).toBe(1);
+    expect(readGrants().quotaState[quotaKey]).toEqual({ limit: 3, used: 1 });
+    expect(readGrants().dispatchLaunchQuotaReceipts[receiptId]).toMatchObject({ allow: true, used: 1, reason: 'chatGrant' });
+  });
+
   it('persists expiry and re-granting as permanent clears only the expiry record', async () => {
     writeConfig({ allowedUsers: ['ou_owner'] });
     const { registry, store } = await freshModules();

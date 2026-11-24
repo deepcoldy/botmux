@@ -35,8 +35,8 @@ export interface GrantStateFields {
 }
 
 const GRANT_KEY_RE = /^(chat:.+:.+|global:.+)$/;
-// 两类 receipt id：派发扣费 `quota_<32hex>`、协作 creator 准入 `adm_<64hex>`。
-const RECEIPT_ID_RE = /^(quota_[0-9a-f]{32}|adm_[0-9a-f]{64})$/;
+// 三类 receipt id：派发扣费 `quota_<32hex>`、协作 creator 准入 `adm_<64hex>`、协作 kickoff `kick_<64hex>`。
+const RECEIPT_ID_RE = /^(quota_[0-9a-f]{32}|adm_[0-9a-f]{64}|kick_[0-9a-f]{64})$/;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);

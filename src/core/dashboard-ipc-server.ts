@@ -1330,6 +1330,11 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   }
   // collab.preflight 与 dispatch-launch 同源：自带全 envelope HMAC，handler 认证。
   if (method === 'POST' && pathname.match(new RegExp(`^${COLLAB_IPC_ROUTE_PREFIX}/[0-9a-f]{64}/preflight$`))) return true;
+  // collab.kickoff：prepare/start/cancel（POST）+ query（GET）。
+  if (pathname.match(new RegExp(`^${COLLAB_IPC_ROUTE_PREFIX}/[0-9a-f]{64}/kickoff/[0-9a-f]{64}(?:/(prepare|start|cancel))?$`))) {
+    const action = pathname.match(/[0-9a-f]{64}\/(prepare|start|cancel)$/)?.[1];
+    if ((method === 'GET' && action === undefined) || (method === 'POST' && action !== undefined)) return true;
+  }
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/lark-tool-identity$/.test(pathname)) return true;
   // The receiver action endpoint performs its own rotating worker-capability
   // verification and then enters the durable action ledger. Keeping this one

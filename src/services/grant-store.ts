@@ -381,6 +381,64 @@ export async function consumeCollabAdmissionOnce(
 }
 
 /**
+ * 协作 kickoff 目标扣费（PR-3a）：扣费与回执同事务原子落盘。
+ *
+ * 幂等键 = kickoffId（`kick_<64hex>`）。talk/quotaKey 由**目标 daemon 自己** evaluateBotTalk
+ * 产出后传入（不接收 creator 传的 app-scoped open_id 当事实）。重复 prepare/query 返回同一
+ * receipt 不二扣；取消按 commit/release 语义由调用方结算。回执带 used/reason/quotaKey/chargedAt。
+ */
+export async function consumeCollabKickoffOnce(
+  input: { larkAppId: string; receiptId: string; quotaKey?: string; sourceOpenId: string; reason: string },
+): Promise<{ allow: boolean; used: number; quotaKey?: string; chargedAt: string; reason?: string }> {
+  const { larkAppId, receiptId, quotaKey, sourceOpenId, reason } = input;
+  getBot(larkAppId); // throw → 调用方 fail-closed
+  const chargedAt = new Date().toISOString();
+  const r = await mutateGrantState<{ allow: boolean; used: number; chargedAt: string; reason?: string; quotaKey?: string }>(larkAppId, (tx) => {
+    const existing = tx.receiptGet(receiptId);
+    if (existing && typeof existing.allow === 'boolean') {
+      return {
+        write: false,
+        result: { allow: existing.allow, used: existing.used ?? 0, chargedAt: existing.chargedAt, reason: existing.reason, quotaKey: existing.quotaKey },
+      };
+    }
+    // 免额度：无 quotaKey → 直接放行，写 used=0 回执。
+    if (!quotaKey) {
+      tx.receiptSet(receiptId, { allow: true, chargedAt, used: 0, reason, quotaKey: undefined });
+      return { write: true, result: { allow: true, used: 0, chargedAt, reason, quotaKey: undefined } };
+    }
+    // 来源 scope 由 quotaKey 决定（chat/global），与 consumeCollabAdmissionOnce 一致。
+    const scope = parseGrantKey(quotaKey);
+    const chatGrantMatches = scope?.scope === 'chat'
+      && scope.openId === sourceOpenId
+      && tx.chatHas(scope.chatId, sourceOpenId);
+    const globalGrantMatches = scope?.scope === 'global'
+      && scope.openId === sourceOpenId
+      && tx.globalHas(sourceOpenId);
+    const rec = tx.quotaGet(quotaKey);
+    const allow = (chatGrantMatches || globalGrantMatches) && (!rec || rec.used < rec.limit);
+    let used = rec?.used ?? 0;
+    if (allow && rec) {
+      const quota = { limit: rec.limit, used: rec.used + 1 };
+      tx.quotaSet(quotaKey, quota);
+      used = quota.used;
+      if (quota.used >= quota.limit) {
+        if (scope?.scope === 'chat') {
+          tx.chatRemove(scope.chatId, sourceOpenId);
+        } else if (scope?.scope === 'global') {
+          tx.globalRemove(sourceOpenId);
+        }
+        tx.quotaSet(quotaKey, null);
+        tx.expirySet(quotaKey, null);
+      }
+    }
+    tx.receiptSet(receiptId, { allow, chargedAt, used, reason, quotaKey });
+    return { write: true, result: { allow, used, chargedAt, reason, quotaKey } };
+  });
+  if (!r.ok) throw new Error(`collab kickoff quota RMW failed: ${r.reason}`);
+  return { allow: r.result.allow, used: r.result.used, chargedAt: r.result.chargedAt, reason: r.result.reason, quotaKey: r.result.quotaKey };
+}
+
+/**
  * 读取协作 creator 准入回执（durable）。用于恢复路径：投影写失败时从 grant-state
  * 重建 provenance，不二扣也不丢已扣额度。
  */

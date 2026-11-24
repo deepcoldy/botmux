@@ -86,6 +86,16 @@ export function collabForwardUuid(initId: string): string {
   return sha256Hex(canonicalJson([initId, 'forward'])).slice(0, 32);
 }
 
+/** kickoffId = sha256Hex(canonicalJson([initId, appId, configVersion]))（§7.1）。 */
+export function collabKickoffId(initId: string, appId: string, configVersion: string): string {
+  return sha256Hex(canonicalJson([initId, appId, configVersion]));
+}
+
+/** grant-state 持久回执 id = `kick_` + kickoffId（64 hex）。 */
+export function collabKickoffReceiptId(kickoffId: string): string {
+  return `kick_${kickoffId}`;
+}
+
 /** payloadHash = sha256(canonicalJson(payload))，逐 operation 落账用（§10.1）。 */
 export function collabPayloadHash(payload: unknown): string {
   return sha256Hex(canonicalJson(payload));

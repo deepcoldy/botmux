@@ -781,6 +781,9 @@ import {
   declaresDurableTurnOutputReceipt,
   parseCollabPreflightRequest,
 } from './core/collab-preflight-ipc.js';
+import { parseCollabKickoffRequest, type CollabKickoffMutation, type CollabKickoffPrepareRequestV1 } from './core/collab-kickoff-ipc.js';
+import { prepareCollabKickoff, startCollabKickoff, cancelCollabKickoff, readCollabKickoffOperation } from './core/collab-kickoff-store.js';
+import { collabPayloadHash } from './services/collab-group-config.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isHumanInboundTurnId, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
 import { isSerialGroupInput, trustedSessionController } from './core/trusted-session-controller.js';
@@ -9330,6 +9333,99 @@ async function collabPreflightRoute(req: IncomingMessage, res: ServerResponse, p
   });
 }
 ipcRoute('POST', `${COLLAB_IPC_ROUTE_PREFIX}/:initId/preflight`, collabPreflightRoute);
+
+// ─── collab.kickoff（PR-3a）────────────────────────────────────────────────
+async function collabKickoffRoute(req: IncomingMessage, res: ServerResponse, params: Record<string, string>, action?: CollabKickoffMutation): Promise<void> {
+  if (!selfV3LarkAppId || !selfV3BootInstanceId) {
+    return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  }
+  let secret: string;
+  try { secret = loadDispatchLaunchIpcSecret(); }
+  catch { return jsonRes(res, 503, { ok: false, error: 'dispatch_launch_ipc_auth_unavailable' }); }
+  const verified = await verifyDispatchLaunchIpcRequest(req, {
+    secret,
+    target: { larkAppId: selfV3LarkAppId, bootInstanceId: selfV3BootInstanceId },
+    nonceStore: dispatchLaunchIpcNonces,
+  });
+  if (!verified.ok) {
+    logger.warn(`[collab-kickoff] rejected ${action ?? 'query'}: ${verified.reason}`);
+    return jsonRes(res, verified.httpStatus, { ok: false, error: 'collab_kickoff_unauthorized' });
+  }
+  const reply = (status: number, payload: unknown): void =>
+    dispatchLaunchReply(req, res, status, payload, secret, verified.nonce, verified.target);
+
+  if (params.initId === undefined || !/^[0-9a-f]{64}$/.test(params.initId)
+      || params.kickoffId === undefined || !/^[0-9a-f]{64}$/.test(params.kickoffId)) {
+    return reply(400, { ok: false, errorCode: 'BAD_REQUEST' });
+  }
+  const dataDir = config.session.dataDir;
+  try {
+    if (!action) {
+      // GET query
+      const op = readCollabKickoffOperation(dataDir, selfV3LarkAppId, params.kickoffId);
+      return op ? reply(200, { ok: true, operation: op }) : reply(404, { ok: false, errorCode: 'OPERATION_NOT_FOUND' });
+    }
+    const parsed = parseCollabKickoffRequest(verified.bodyRaw);
+    if (!parsed.ok || (parsed.req as any).initId !== params.initId || (parsed.req as any).kickoffId !== params.kickoffId) {
+      return reply(400, { ok: false, errorCode: 'BAD_REQUEST' });
+    }
+    const reqBody = parsed.req as CollabKickoffPrepareRequestV1;
+    if (reqBody.targetLarkAppId !== undefined && reqBody.targetLarkAppId !== selfV3LarkAppId) {
+      return reply(400, { ok: false, errorCode: 'TARGET_MISMATCH' });
+    }
+    if (action === 'prepare') {
+      const payloadHash = collabPayloadHash(reqBody);
+      const result = prepareCollabKickoff({
+        dataDir,
+        sourceLarkAppId: selfV3LarkAppId, // 注意：source 是请求发起方；这里以 target 视角记录
+        targetLarkAppId: selfV3LarkAppId,
+        kickoffId: params.kickoffId,
+        initId: params.initId,
+        appId: reqBody.appId,
+        chatId: '', // chatId 由后续 S3/编排补齐；本单 prepare 先落身份与 payload
+        configVersion: reqBody.configVersion,
+        payloadHash,
+        now: new Date().toISOString(),
+      });
+      return result.ok
+        ? reply(200, { ok: true, operation: result.operation })
+        : reply(409, { ok: false, errorCode: result.errorCode, message: result.message });
+    }
+    if (action === 'start') {
+      const existing = readCollabKickoffOperation(dataDir, selfV3LarkAppId, params.kickoffId);
+      if (!existing) return reply(404, { ok: false, errorCode: 'OPERATION_NOT_FOUND' });
+      // start 需目标持久 {sessionId,turnId,acceptedAt} 后才返回 started。本单 target 侧
+      // 没有真实会话激活，仅做状态机占位（会话激活由 PR-3b 接 queued session）。
+      const result = startCollabKickoff({
+        dataDir,
+        targetLarkAppId: selfV3LarkAppId,
+        kickoffId: params.kickoffId,
+        sessionId: '', turnId: '', acceptedAt: new Date().toISOString(),
+        now: new Date().toISOString(),
+      });
+      return result.ok
+        ? reply(200, { ok: true, operation: result.operation })
+        : reply(result.errorCode === 'OPERATION_NOT_FOUND' ? 404 : 409, { ok: false, errorCode: result.errorCode, message: result.message });
+    }
+    // cancel
+    const result = cancelCollabKickoff({
+      dataDir,
+      targetLarkAppId: selfV3LarkAppId,
+      kickoffId: params.kickoffId,
+      now: new Date().toISOString(),
+    });
+    return result.ok
+      ? reply(200, { ok: true, operation: result.operation })
+      : reply(result.errorCode === 'OPERATION_NOT_FOUND' ? 404 : 409, { ok: false, errorCode: result.errorCode, message: result.message });
+  } catch (error) {
+    logger.error(`[collab-kickoff] ${action ?? 'query'} failed: ${error instanceof Error ? error.message : String(error)}`);
+    return reply(500, { ok: false, errorCode: 'INTERNAL_ERROR' });
+  }
+}
+ipcRoute('POST', `${COLLAB_IPC_ROUTE_PREFIX}/:initId/kickoff/:kickoffId/prepare`, (req, res, params) => collabKickoffRoute(req, res, params, 'prepare'));
+ipcRoute('POST', `${COLLAB_IPC_ROUTE_PREFIX}/:initId/kickoff/:kickoffId/start`, (req, res, params) => collabKickoffRoute(req, res, params, 'start'));
+ipcRoute('POST', `${COLLAB_IPC_ROUTE_PREFIX}/:initId/kickoff/:kickoffId/cancel`, (req, res, params) => collabKickoffRoute(req, res, params, 'cancel'));
+ipcRoute('GET', `${COLLAB_IPC_ROUTE_PREFIX}/:initId/kickoff/:kickoffId`, (req, res, params) => collabKickoffRoute(req, res, params));
 
 // Thin zero-I/O tombstones for old dashboard/cards/automation clients. Keeping
 // these explicit routes prevents stale callers from mistaking a generic 404 or
