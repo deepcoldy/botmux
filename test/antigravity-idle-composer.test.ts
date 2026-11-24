@@ -312,6 +312,23 @@ describe('Antigravity adapter isSessionBusy screen reconciliation', () => {
     expect(probe()).toBe(true);
   });
 
+  it('a newer closed compact final overtakes an older busy full tail', () => {
+    const path = transcriptPath();
+    const full = transcriptPath('transcript_full.jsonl');
+    writeFileSync(full, JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 2, status: 'DONE', tool_calls: [{ name: 'run_command' }] }) + '\n');
+    const old = new Date('2026-11-24T00:00:00Z');
+    utimesSync(full, old, old);
+    writeFileSync(path, JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 3, status: 'DONE', content: 'all done' }) + '\n');
+    const newer = new Date('2026-11-25T00:00:00Z');
+    utimesSync(path, newer, newer);
+    const adapter = createAntigravityAdapter();
+    expect(adapter.isSessionBusy!({
+      cliSessionId,
+      getCurrentScreen: () => PLAIN_IDLE_SCREEN,
+      isCliProcessAlive: () => true,
+    })).toBe(false);
+  });
+
   it('treats a non-empty malformed compact tail as unknown work, not an older final', () => {
     const path = transcriptPath();
     writeFileSync(path, JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 2, status: 'DONE', content: 'done' }) + '\n');
