@@ -1,5 +1,14 @@
 import { basename } from 'node:path';
 
+/** Carries machine evidence separately from the local, potentially secret
+ * terminal tail of a CLI that died before backend exit observers were wired. */
+export class CliStartupExitError extends Error {
+  constructor(message: string, readonly exitCode: number | null) {
+    super(message);
+    this.name = 'CliStartupExitError';
+  }
+}
+
 const EXEC_FAILURE_PREFIX = 'Command failed: ';
 const MAX_STDERR_LINES = 5;
 const MAX_STDERR_CHARS = 600;
@@ -15,6 +24,9 @@ const MAX_STDERR_CHARS = 600;
  * through unchanged; the caller logs the original locally.
  */
 export function chatSafeFatalErrorMessage(err: unknown): string {
+  if (err instanceof CliStartupExitError) {
+    return `CLI 启动后立即退出（退出码 ${err.exitCode ?? 'unknown'}），完整诊断只写入本机日志`;
+  }
   const message = err instanceof Error ? err.message : String(err);
   if (!message.startsWith(EXEC_FAILURE_PREFIX)) return message;
   const program = basename(message.slice(EXEC_FAILURE_PREFIX.length).split(/\s/, 1)[0] ?? '') || 'command';

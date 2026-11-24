@@ -21900,6 +21900,15 @@ function setupWorkerHandlers(
       return;
     }
     startupState.failureNotified = true;
+    // A pane may die inside backend.spawn(), before any claude_exit observer
+    // exists. That fatal startup path must settle the SAME starting card too.
+    ds.cliStartupFailureReason ??= startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, loc);
+    ds.lastScreenStatus = 'interrupted';
+    resetStartingCardHealth(ds);
+    bumpStreamCardStatusRevision(ds);
+    clearUsageRefreshTimer(ds);
+    raiseDaemonAttention(ds, 'blocked', ds.cliStartupFailureReason, turnId);
+    publishAttentionPatch(ds);
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
       reason: 'worker_start_failed',
       message: reason,
@@ -21915,6 +21924,9 @@ function setupWorkerHandlers(
         + `turn=${turnId?.slice(0, 12) ?? '-'} attempt=${dispatchAttempt}: ${reason}`,
       );
       return;
+    }
+    if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
+      scheduleCardPatch(ds, buildStreamingCardJson(ds, 'interrupted'));
     }
     const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, loc);
     try {
@@ -25262,6 +25274,7 @@ function setupWorkerHandlers(
         }
         // Read before any later step can move the screen state.
         const turnRunningAtExit = ds.lastScreenStatus === 'working';
+        const idleAtExit = ds.lastScreenStatus === 'idle';
         // The original opted-in turn has no dispatchAttempt, so worker.ts's
         // durable-delivery terminal path cannot report its CLI exit. Bind the
         // exit here to the exact live turn + worker generation. Synthetic
@@ -25289,11 +25302,14 @@ function setupWorkerHandlers(
         // A living Node worker is not evidence of a living CLI. Publish the
         // physical loss before any async reconciliation / restart decision.
         if (!isRemoteBackendSession(ds) && !isSharedAdoptSession(ds)) {
-          ds.lastScreenStatus = 'interrupted';
+          // A clean exit after an already idle/completed turn is not a failed
+          // task. It still must not inherit a stale working projection.
+          const exitStatus = msg.code === 0 && idleAtExit ? 'idle' : 'interrupted';
+          ds.lastScreenStatus = exitStatus;
           bumpStreamCardStatusRevision(ds);
           clearUsageRefreshTimer(ds);
           dashboardEventBus.publish({ type: 'session.update', body: {
-            sessionId: ds.session.sessionId, patch: { status: 'interrupted' },
+            sessionId: ds.session.sessionId, patch: { status: exitStatus },
           } });
         }
         // The live-send capability dies with this backend. Preserve the
