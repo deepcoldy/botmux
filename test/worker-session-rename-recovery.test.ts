@@ -84,16 +84,22 @@ describe('native rename recovery after persistent worker reattach', () => {
     }
   });
 
-  it('notifies on the hard cap even when surviving evidence stays unknown', () => {
+  it('releases restored input at the hard cap when surviving evidence stays unknown', () => {
     const h = recoveryHarness('unknown');
     Object.assign(h.scope, {
       sessionRenameSentAtMs: Date.now() - 45_000,
       SESSION_RENAME_HOLD_TIMEOUT_MS: 45_000,
       notifySessionRenameInputTimeout: vi.fn(),
+      isPromptReady: false,
+      reattachOpenTurnGate: true,
     });
-    expect(h.recover()).toBe(true);
-    expect(h.scope.notifySessionRenameInputTimeout).toHaveBeenCalledWith('held');
-    expect(h.scope.armSessionRenameReattachRecoveryRetry).toHaveBeenCalledOnce();
+    h.scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', h.scope);
+    expect(h.recover()).toBe(false);
+    expect(h.scope.notifySessionRenameInputTimeout).toHaveBeenCalledWith('released');
+    expect(h.scope.armSessionRenameReattachRecoveryRetry).not.toHaveBeenCalled();
+    expect(h.scope.isPromptReady).toBe(true);
+    expect(h.scope.reattachOpenTurnGate).toBe(false);
+    expect(h.scope.sessionRenameReattachRecoveryGeneration).toBe(h.scope.cliSpawnGeneration);
   });
 
   it('keeps one recovery clock when an unknown surface becomes an exact surviving draft', () => {

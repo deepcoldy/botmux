@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { decideSessionRenameSettlement, sessionRenameWriteFailureAction } from '../src/core/session-rename-settlement.js';
 import { traexSessionRenameSurface } from '../src/adapters/cli/traex-footer.js';
-import { codexSessionRenameSurface } from '../src/services/codex-terminal-session.js';
+import { codexNativeComposerState, codexSessionRenameSurface } from '../src/services/codex-terminal-session.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { watchNativeSessionIndex } from '../src/services/native-session-index.js';
@@ -56,11 +56,11 @@ describe('decideSessionRenameSettlement', () => {
     expect(decide({ surface: 'unsubmitted', recorded: true, resubmitted: true })).toBe('hold');
   });
 
-  it('fails open after the hold cap only on a positively writable idle composer', () => {
+  it('fails open after the hold cap on every surface except a visible rename command', () => {
     expect(decide({ surface: 'settled', holdExpired: true })).toBe('release_unconfirmed');
     expect(decide({ surface: 'settled', recorded: true, holdExpired: true })).toBe('release');
-    expect(decide({ surface: 'unknown', holdExpired: true })).toBe('hold');
-    expect(decide({ surface: 'occupied', holdExpired: true })).toBe('hold');
+    expect(decide({ surface: 'unknown', holdExpired: true })).toBe('release_unconfirmed');
+    expect(decide({ surface: 'occupied', holdExpired: true })).toBe('release_unconfirmed');
   });
 
   it('never turns the hold cap into a late automatic Enter or release of a visible rename command', () => {
@@ -163,6 +163,16 @@ describe('Codex native rename surface (0.167.0)', () => {
     const dialog = ['>_ OpenAI Codex', '', '  Rename thread', '', '› title', '', 'enter submit  |  esc back'].join('\n');
     expect(codexSessionRenameSurface({ viewport: busy }, COMMAND)).toBe('occupied');
     expect(codexSessionRenameSurface({ viewport: dialog }, COMMAND)).toBe('occupied');
+  });
+
+  it('keeps 0.146.1 hints conservative for rename while normal delivery may recognise them', () => {
+    const state = {
+      viewport: 'Previous conversation\n› Implement {feature}\n\n  gpt-5.6-sol default · ~/data',
+      cursor: { x: 2, y: 1 },
+    };
+    expect(codexNativeComposerState(state)).toBe('unknown');
+    expect(codexNativeComposerState(state, { allowCodex0146Hints: true })).toBe('empty');
+    expect(codexSessionRenameSurface(state, COMMAND)).toBe('occupied');
   });
 
   it('is the judge the Codex adapter declares', () => {

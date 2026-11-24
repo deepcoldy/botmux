@@ -33,8 +33,28 @@ export function codexTerminalSessionIsBound(terminal: PtyHandle, sessionId: stri
     && binding.sessionId === sessionId.toLowerCase();
 }
 
+/** Display-only composer hints embedded in codex-cli 0.146.1. Keep this exact
+ * inventory out of startup/rename classification; only the normal delivery
+ * guard opts in after its other dialog and draft checks. */
+const CODEX_0146_COMPOSER_HINTS: ReadonlySet<string> = new Set([
+  'Explain this codebase',
+  'Summarize recent commits',
+  'Implement {feature}',
+  'Find and fix a bug in @filename',
+  'Write tests for @filename',
+  'Improve documentation in @filename',
+  'Run /review on my current changes',
+  'Use /skills to list available skills',
+  'Check recently modified functions for compatibility',
+  'How many files have been modified?',
+  'Will this algorithm scale well?',
+]);
+
+type CodexNativeComposerOptions = { allowCodex0146Hints?: boolean };
+
 export function codexEmptyComposerFooter(
   state: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined,
+  opts: CodexNativeComposerOptions = {},
 ): string | undefined {
   if (!state) return undefined;
   const lines = stripAnsiScreenText(state.viewport).split(/\r?\n/);
@@ -44,8 +64,12 @@ export function codexEmptyComposerFooter(
   // Cursor position alone cannot distinguish a draft whose cursor is at Home.
   // Accept only an empty row or the known native placeholder, plus a live
   // initialized footer below it. Unknown placeholders fail closed.
-  const prompt = /^(\s*)[›»] (?:Ask Codex to do anything)?\s*$/.exec(line);
-  if (!prompt || state.cursor.x !== (prompt[1]?.length ?? 0) + 2) return undefined;
+  const prompt = /^(\s*)[›»] (.*)$/.exec(line);
+  if (!prompt) return undefined;
+  const ghostText = prompt[2]!.trimEnd();
+  const nativeGhostText = ghostText === '' || ghostText === 'Ask Codex to do anything'
+    || (opts.allowCodex0146Hints === true && CODEX_0146_COMPOSER_HINTS.has(ghostText));
+  if (!nativeGhostText || state.cursor.x !== (prompt[1]?.length ?? 0) + 2) return undefined;
   // Match native state rows, not words inside transcript prose or tool output.
   const below = lines.slice(state.cursor.y + 1);
   // Both layouts are native: an inline status/hints row, or a separate status
@@ -72,10 +96,11 @@ export function codexEmptyComposerFooter(
  */
 export function codexNativeComposerState(
   state: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined,
+  opts: CodexNativeComposerOptions = {},
 ): 'empty' | 'draft' | 'unknown' {
   const coarse = detectCodexComposerState(state);
   if (coarse !== 'empty') return coarse;
-  return codexEmptyComposerFooter(state) !== undefined ? 'empty' : 'unknown';
+  return codexEmptyComposerFooter(state, opts) !== undefined ? 'empty' : 'unknown';
 }
 
 function emptyComposerFooter(terminal: PtyHandle): string | undefined {

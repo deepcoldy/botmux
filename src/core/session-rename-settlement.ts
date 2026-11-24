@@ -15,13 +15,14 @@ import type { SessionRenameSurface } from '../adapters/cli/types.js';
  *   submits it. Only from the bounded wait, never from a prompt edge that can
  *   race the CLI's own redraw; after that one Enter, keep holding.
  * - `occupied`: a dialog, busy turn or user draft owns the terminal. A rename
- *   receipt says nothing about this CURRENT input owner, so keep holding.
+ *   receipt says nothing about this CURRENT input owner, so keep holding during
+ *   the bounded confirmation window.
  * - A durable record for this exact native thread and title proves this rename
  *   left the composer. It may release an empty (`settled`) or unrecognised
  *   (`unknown`) surface — the latter keeps working across footer redesigns.
- * - At the worker's hard cap, only a positively `settled` surface may fail open
- *   without that record. `unknown` / `occupied` / `unsubmitted` stay held and
- *   the worker reports the timeout instead of waiting silently forever.
+ * - At the worker's hard cap, every surface except `unsubmitted` fails open to
+ *   the normal delivery pipeline. Only the exact rename command still visible
+ *   in the composer stays held; it never receives a second automatic Enter.
  * - An empty composer alone proves nothing: it is also the pre-rename screen
  *   while a stalled TUI has not read the command. Arbitrary terminal output
  *   cannot fill that gap; nor can an ambiguous write failure.
@@ -55,10 +56,10 @@ export function decideSessionRenameSettlement(state: {
     if (state.holdExpired) return 'hold';
     return state.resubmitted || state.fromPrompt ? 'hold' : 'resubmit';
   }
-  if (state.surface === 'occupied') return 'hold';
+  if (state.surface === 'occupied') return state.holdExpired ? 'release_unconfirmed' : 'hold';
   if (state.recorded) return 'release';
-  // A missing receipt must not wedge a positively idle, writable composer
-  // forever. Unknown evidence stays held: a future footer, picker or draft is
-  // not proof that input can safely follow the rename.
-  return state.surface === 'settled' && state.holdExpired ? 'release_unconfirmed' : 'hold';
+  // The cap restores the pre-receipt fail-open behaviour for settled, occupied
+  // and unknown screens. Only the exact command still visibly sitting in the
+  // composer remains unsafe to follow.
+  return state.holdExpired ? 'release_unconfirmed' : 'hold';
 }

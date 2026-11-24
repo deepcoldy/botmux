@@ -6411,7 +6411,7 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
     const evidence = surface === undefined ? 'unjudged' : 'recorded by the CLI';
     if (source === 'prompt') {
       if (held || timedOut) log(timedOut
-        ? `WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; the ${cliName()} composer is writable, releasing queued input without a receipt`
+        ? `WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; releasing queued input without a receipt (${surface}); normal delivery gates remain in force`
         : `Native session rename confirmed (${evidence}); releasing queued input`);
       return;
     }
@@ -6421,7 +6421,7 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
     isPromptReady = true;
     reattachOpenTurnGate = false;
     log(timedOut
-      ? `WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; the ${cliName()} composer is writable, releasing queued input without a receipt`
+      ? `WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; releasing queued input without a receipt (${surface}); normal delivery gates remain in force`
       : surface === undefined
         ? `Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`
         : `Native session rename confirmed (${evidence}); releasing queued input`);
@@ -6480,9 +6480,9 @@ function settleFailedSessionRenameWrite(): void {
  * redraw output for IdleDetector to rediscover the prompt. Without an adapter
  * verdict this fails open, so one administrative command cannot wedge all
  * later Lark messages; with one, queued input waits for this thread's durable
- * rename receipt and a writable input surface. The hard cap releases only a
- * positively settled surface without a receipt; every other surface produces
- * an explicit timeout notice and keeps the anti-title-corruption hold. */
+ * rename receipt and a writable input surface. The hard cap restores fail-open
+ * delivery for every surface except an exact unsubmitted command; normal busy,
+ * dialog and delivery guards still run after this rename-only gate is cleared. */
 function armSessionRenameIdleTimeout(delayMs = SESSION_RENAME_IDLE_TIMEOUT_MS): void {
   if (sessionRenamePhase !== 'sent') return;
   if (sessionRenameIdleTimer) clearTimeout(sessionRenameIdleTimer);
@@ -6515,8 +6515,9 @@ function armSessionRenameReattachRecoveryRetry(): void {
  * any restored input is written, recover a visible native rename operation
  * left by the predecessor. An exact draft gets the normal one-Enter recovery;
  * an occupied surface stays held even if this thread/title already has a
- * receipt. Unknown evidence BLOCKS this flush and schedules another read; only
- * positively settled/unjudged evidence may fall through to restored input. */
+ * receipt. Unknown evidence blocks and schedules another read during the bounded
+ * window; at the cap it fails open to the normal delivery gates. Only an exact
+ * unsubmitted rename command remains held beyond the cap. */
 function recoverSessionRenameAfterPersistentReattach(): boolean {
   const generation = cliSpawnGeneration;
   if (sessionRenameReattachRecoveryGeneration === generation || sessionRenamePhase !== 'idle') return false;
@@ -6538,14 +6539,15 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
       log('Native session rename recovery cannot classify the surviving terminal; holding restored input and retrying');
     }
     if (Date.now() - sessionRenameSentAtMs >= SESSION_RENAME_HOLD_TIMEOUT_MS) {
-      if (!sessionRenameHoldTimeoutLogged) {
-        sessionRenameHoldTimeoutLogged = true;
-        log(`WARN Native session rename recovery remains unknown after ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; restored input stays held`);
-      }
-      notifySessionRenameInputTimeout('held');
-    } else {
-      notifySessionRenameInputHeld();
+      notifySessionRenameInputTimeout('released');
+      forceClearSessionRenameInFlight();
+      sessionRenameReattachRecoveryGeneration = generation;
+      isPromptReady = true;
+      reattachOpenTurnGate = false;
+      log(`WARN Native session rename recovery remained unknown after ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; releasing restored input to the normal delivery gates`);
+      return false;
     }
+    notifySessionRenameInputHeld();
     armSessionRenameReattachRecoveryRetry();
     return true;
   }

@@ -49,9 +49,9 @@ afterEach(() => {
 });
 
 describe('native rename confirmation hold cap', () => {
-  it('releases queued input after the cap when the composer is writable but no receipt ever arrives', async () => {
+  it.each(['settled', 'occupied', 'unknown'] as const)('releases queued %s input after the cap when no receipt settles the rename', async (surface) => {
     vi.useFakeTimers();
-    const h = renameTimerHarness('settled');
+    const h = renameTimerHarness(surface);
     h.arm();
 
     await vi.advanceTimersByTimeAsync(44_000);
