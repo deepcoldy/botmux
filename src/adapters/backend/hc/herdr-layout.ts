@@ -1,0 +1,108 @@
+import { createHash } from 'node:crypto';
+import { basename } from 'node:path';
+import { isHcError, type HcClient } from './client.js';
+
+const DOCUMENT = 'herdr-app';
+const TIMEOUT = { timeoutMs: 2_000 };
+const MAX_WRITES = 5;
+
+interface HerdrPane {
+  id?: string;
+  type?: string;
+  content?: { terminal?: string };
+  children?: HerdrPane[];
+  floating?: HerdrPane[];
+}
+
+interface HerdrTab {
+  id: string;
+  name?: string;
+  root: HerdrPane;
+}
+
+interface HerdrSpace {
+  id: string;
+  name?: string;
+  folder?: string;
+  tabs?: HerdrTab[];
+}
+
+interface HerdrLayout {
+  spaces?: HerdrSpace[];
+}
+
+function* panes(node: HerdrPane | undefined): Generator<HerdrPane> {
+  if (!node) return;
+  yield node;
+  for (const child of node.children ?? []) yield* panes(child);
+  for (const child of node.floating ?? []) yield* panes(child);
+}
+
+function layoutId(kind: string, seed: string): string {
+  return `botmux-${kind}-${createHash('sha256').update(seed).digest('hex').slice(0, 24)}`;
+}
+
+function placeTerminal(document: HerdrLayout, sessionId: string, address: string, cwd: string): boolean {
+  const paneId = layoutId('pane', sessionId);
+  const spaces = document.spaces ??= [];
+  let existing: HerdrPane['content'];
+  for (const space of spaces) {
+    for (const tab of space.tabs ?? []) {
+      for (const pane of panes(tab.root)) {
+        if (pane.content?.terminal === address) return false;
+        if (pane.id === paneId && typeof pane.content?.terminal === 'string') existing = pane.content;
+      }
+    }
+  }
+  if (existing) {
+    existing.terminal = address;
+    return true;
+  }
+
+  const spaceId = layoutId('space', cwd);
+  let space = spaces.find(candidate => candidate.id === spaceId);
+  if (!space) {
+    space = { id: spaceId, name: basename(cwd) || cwd, folder: cwd, tabs: [] };
+    spaces.push(space);
+  }
+  const tabId = layoutId('tab', sessionId);
+  const tabs = space.tabs ??= [];
+  // A tab that already has this id may contain a user-edited layout. Leave it alone.
+  if (tabs.some(tab => tab.id === tabId)) return false;
+  tabs.push({
+    id: tabId,
+    name: '',
+    root: {
+      id: tabId,
+      type: 'row',
+      children: [{ id: paneId, type: 'block', content: { terminal: address } }],
+    },
+  });
+  return true;
+}
+
+/** Place a terminal in the current core's native Herdr layout. The app's
+ * label-based adoption would enable keep and restore a shell in place of a lost
+ * agent. A document pane references the running terminal without that policy. */
+export async function publishHcHerdrTab(
+  client: Pick<HcClient, 'call'>,
+  sessionId: string,
+  terminal: { address: string; cwd: string },
+  isCurrent: () => boolean,
+): Promise<void> {
+  if (!terminal.cwd) return;
+  for (let attempt = 0; attempt < MAX_WRITES && isCurrent(); attempt++) {
+    const current = await client.call<{ version: number; value: HerdrLayout | null }>('doc.get', { name: DOCUMENT }, TIMEOUT);
+    const document = current.value ?? {};
+    if (typeof document !== 'object' || Array.isArray(document) || (document.spaces != null && !Array.isArray(document.spaces))) {
+      throw new Error('无法识别现有 Herdr 布局');
+    }
+    if (!placeTerminal(document, sessionId, terminal.address, terminal.cwd) || !isCurrent()) return;
+    try {
+      await client.call('doc.set', { name: DOCUMENT, version: current.version, value: document }, TIMEOUT);
+      return;
+    } catch (error) {
+      if (!isHcError(error, 'rpc') || error.kind !== 'conflict' || attempt === MAX_WRITES - 1) throw error;
+    }
+  }
+}

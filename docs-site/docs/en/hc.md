@@ -112,6 +112,8 @@ Before attaching, botmux asks the core directly whether the terminal is still li
 
 On macOS, the **💻 Open …** button on Feishu cards uses the same ownership check when attaching to an hc session.
 
+If Herdr App already has the private botmux core configured as a Machine, add `BOTMUX_HC_HERDR_TABS=1` to `~/.botmux/.env` and run `botmux restart`. New and reattached sessions appear in native Spaces on that Machine, grouped by working directory with one Tab per topic. Botmux manages their recovery.
+
 ## 5. Session lifecycle
 
 Each session maps to an hc terminal with a fixed name, `bmx-<first 8 characters of the session ID>`, labelled with the full session ID.

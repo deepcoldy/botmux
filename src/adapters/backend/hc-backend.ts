@@ -26,6 +26,7 @@ import { SERVER_OUTAGE_ESCALATE_MS, writeManagedPaneLaunch } from './tmux-pipe-b
 import { HcClient, isHcError, type HcChannelClose, type HcChunkInfo, type HcStream, type HcSubscription } from './hc/client.js';
 import { hcOwnerLabels, isHcTerminalOwnedBy, killHcTerminal, type HcKillOutcome, type HcTarget } from './hc/cli-ops.js';
 import { ensureHcCore, hcPaneXdgRestore } from './hc/core.js';
+import { publishHcHerdrTab } from './hc/herdr-layout.js';
 import { bracketedPasteFrame, encodeTmuxKey, encodeTmuxKeys, pasteBufferBytes, type KeyEncodingModes } from './hc/keys.js';
 import { HC_MIRROR_SCROLLBACK_LINES, ScreenMirror } from './hc/screen-mirror.js';
 import {
@@ -690,6 +691,10 @@ export class HcBackend implements SessionBackend {
         return;
       }
       this.adopt(client, sub, stream, size);
+      if (this.env.BOTMUX_HC_HERDR_TABS === '1') {
+        void publishHcHerdrTab(client, this.sessionId, listed, () => !stale() && this.client === client)
+          .catch(error => process.stderr.write(`[hc-backend] ${this.target.sessionName}: Herdr 布局更新失败：${describeError(error)}\n`));
+      }
     } catch (err) {
       if (stale()) {
         client?.close();

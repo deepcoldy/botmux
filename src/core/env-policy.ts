@@ -99,7 +99,7 @@ export function buildBotWorkerEnv(
       'BOTMUX_DATA_DIR', 'BOTMUX_NO_CLAIM', 'BOTMUX_BOT_INDEX',
       'BOTMUX_WORKFLOW_ENABLED', 'BOTMUX_REQUIRE_MENTION_DECISION', 'BOTMUX_LANG',
       'BOTMUX_WORKER_HTTP_HOST', 'BOTMUX_WORKER_HOST', 'LARK_APP_ID', 'LARK_APP_SECRET',
-      'BOTMUX_PROGRAM_STATUS_RELAY',
+      'BOTMUX_PROGRAM_STATUS_RELAY', 'BOTMUX_HC_HERDR_TABS',
     ]) {
       if (isReservedPerBotEnvKey(key) && base[key] !== undefined) env[key] = base[key];
     }

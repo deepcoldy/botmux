@@ -112,6 +112,8 @@ botmux list
 
 macOS 上，飞书卡片的「💻 打开 …」可用时，也会通过同样的所有权核对接入 hc 会话。
 
+如果 Herdr App 已把 botmux 的私有 core 添加为一个 Machine，可在 `~/.botmux/.env` 中设置 `BOTMUX_HC_HERDR_TABS=1`，再运行 `botmux restart`。新建和重新接入的会话会按工作目录出现在这个 Machine 的原生 Space 中，每个话题一个 Tab。终端恢复由 botmux 管理。
+
 ## 5. 会话的生命周期
 
 每个会话对应一个固定名字的 hc 终端：`bmx-<会话 ID 前 8 位>`，标签里记着完整的会话 ID。

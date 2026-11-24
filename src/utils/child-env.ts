@@ -226,6 +226,7 @@ export function stripCompanionStartupEnv(env: NodeJS.ProcessEnv): void {
 }
 
 export const REDACTED_CHILD_ENV_KEYS = [
+  'BOTMUX_HC_HERDR_TABS',
   'LARK_APP_ID',
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',

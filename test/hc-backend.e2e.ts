@@ -15,6 +15,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, 
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { HcBackend } from '../src/adapters/backend/hc-backend.js';
+import { HcClient } from '../src/adapters/backend/hc/client.js';
 import { hcTerminalName, probeHcTerminal, type HcTarget } from '../src/adapters/backend/hc/cli-ops.js';
 import { hcControlEnv, hcCoreAddress, hcCorePaths, hcRuntimeDirError } from '../src/adapters/backend/hc/core.js';
 import { resolveHcBackendGate, selectSessionBackend } from '../src/adapters/backend/session-backend-selector.js';
@@ -249,6 +250,29 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
     killPersistentBackendTarget(active.target, active.sessionId);
     killPersistentBackendTarget(foreign.target, foreign.sessionId);
   }, 120_000);
+
+  it('registers fresh botmux terminals as native Herdr tabs on the private core without enabling keep', async () => {
+    vi.stubEnv('BOTMUX_HC_HERDR_TABS', '1');
+    let client: HcClient | undefined;
+    try {
+      const sessions = await Promise.all([startSession(), startSession()]);
+      client = await HcClient.connect(sessions[0].target.socket);
+      const terminals = await Promise.all(sessions.map(({ target }) =>
+        client!.call<{ address: string; keep: boolean }>('terminal.get', { terminal: target.sessionName })));
+      expect(terminals.map(record => record.keep)).toEqual([false, false]);
+
+      const ownerCore = client;
+      await vi.waitFor(async () => {
+        const doc = await ownerCore.call<{ value: { spaces: Array<{ folder: string; tabs: unknown[] }> } }>('doc.get', { name: 'herdr-app' });
+        expect(doc.value?.spaces).toMatchObject([{ folder: root, tabs: [expect.anything(), expect.anything()] }]);
+        expect(doc.value.spaces[0]!.tabs).toEqual(expect.arrayContaining(terminals.map(({ address }) =>
+          expect.objectContaining({ root: expect.objectContaining({ children: [expect.objectContaining({ content: { terminal: address } })] }) }))));
+      });
+    } finally {
+      client?.close();
+      vi.unstubAllEnvs();
+    }
+  }, 60_000);
 
   it('leaves the host hc runtime dir as it was', () => {
     expect(hostEntries().filter(entry => !hostBefore.includes(entry))).toEqual([]);
