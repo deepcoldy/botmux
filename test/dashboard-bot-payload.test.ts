@@ -95,7 +95,7 @@ describe('dashboard bot payload helpers', () => {
       'nativeSubagentRuntime',
       'sessionOwnerReminder',
       'startupCommands', 'customPassthroughCommands', 'canTalkDaemonCommands', 'launchShell', 'env', 'envKeys', 'envPolicy',
-      'riff', 'skills', 'herdr',
+      'riff', 'skills', 'herdr', 'taskRouting',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
   });
@@ -143,6 +143,13 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, {})).toMatchObject({ herdr: null });
     expect(botDefaultsPayload({ larkAppId: 'app' }, { herdr: null })).toMatchObject({ herdr: null });
     expect(botDefaultsPayload({ larkAppId: 'app' }, { herdr: ['split'] })).toMatchObject({ herdr: null });
+  });
+
+  it('round-trips the task-routing profile for the participation switch and drops malformed edits', () => {
+    const taskRouting = { enabled: true, costTier: 'low', strengths: '小修', limitations: '不做迁移' };
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { taskRouting }).taskRouting).toEqual(taskRouting);
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}).taskRouting).toBeNull();
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { taskRouting: { enabled: true, costTier: 'ultra' } }).taskRouting).toBeNull();
   });
 
   it('keeps stored env names and env policy across a page refresh (values stay write-only)', () => {

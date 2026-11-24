@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   createDispatchReportBinding,
   dispatchReportBindingSecretPath,
+  hasVerifiedDispatchReportBindingForCaller,
   loadOrCreateDispatchReportBindingSecret,
   resolveVerifiedDispatchReportTarget,
   verifyDispatchReportBinding,
@@ -157,6 +158,122 @@ describe('dispatch report binding', () => {
       sourceName: '支付页修复',
       issuedAt: '2026-08-10T00:00:00.000Z',
     })).toThrow('invalid dispatch report target scope');
+  });
+
+  it('matches verified bindings only for the owning caller or same-chat chat-scope successor', () => {
+    const chatBinding = binding('om_chat_seed');
+    const threadBinding = createDispatchReportBinding(SECRET, {
+      dispatchRoot: 'om_thread_seed',
+      targetLarkAppId: 'cli_orchestrator',
+      targetSessionId: 'session-thread-1',
+      targetChatId: 'oc_orchestrator',
+      targetScope: 'thread',
+      sourceName: '子任务',
+      issuedAt: '2026-08-10T00:00:00.000Z',
+    });
+    const registry = {
+      om_chat_seed: { reportBinding: chatBinding },
+      om_thread_seed: { reportBinding: threadBinding },
+    };
+
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      registry, secret: SECRET, dispatchRoot: 'om_thread_seed',
+      callerAppId: 'cli_orchestrator', callerSessionId: 'session-thread-1',
+      callerChatId: 'oc_orchestrator', callerScope: 'thread',
+    })).toBe(true);
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      registry, secret: SECRET, dispatchRoot: 'om_chat_seed',
+      callerAppId: 'cli_orchestrator', callerSessionId: 'session-chat-successor',
+      callerChatId: 'oc_orchestrator', callerScope: 'chat',
+    })).toBe(true);
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      registry, secret: SECRET, dispatchRoot: 'om_unregistered',
+      callerAppId: 'cli_orchestrator', callerSessionId: 'session-thread-1',
+      callerChatId: 'oc_orchestrator', callerScope: 'thread',
+    })).toBe(false);
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      registry, secret: SECRET, dispatchRoot: 'om_thread_seed',
+      callerAppId: 'cli_other_bot', callerSessionId: 'session-thread-1',
+      callerChatId: 'oc_orchestrator', callerScope: 'thread',
+    })).toBe(false);
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      registry, secret: SECRET, dispatchRoot: 'om_thread_seed',
+      callerAppId: 'cli_orchestrator', callerSessionId: 'session-thread-2',
+      callerChatId: 'oc_orchestrator', callerScope: 'thread',
+    })).toBe(false);
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      registry, secret: 'wrong-secret', dispatchRoot: 'om_thread_seed',
+      callerAppId: 'cli_orchestrator', callerSessionId: 'session-thread-1',
+      callerChatId: 'oc_orchestrator', callerScope: 'thread',
+    })).toBe(false);
+  });
+
+  it('rejects chat-scope successor lookalikes that miss the app/chat/scope identity conditions', () => {
+    const chatBinding = binding('om_chat_seed');
+    const threadBinding = createDispatchReportBinding(SECRET, {
+      dispatchRoot: 'om_thread_seed',
+      targetLarkAppId: 'cli_orchestrator',
+      targetSessionId: 'session-thread-1',
+      targetChatId: 'oc_orchestrator',
+      targetScope: 'thread',
+      sourceName: '子任务',
+      issuedAt: '2026-08-10T00:00:00.000Z',
+    });
+    const registry = {
+      om_chat_seed: { reportBinding: chatBinding },
+      om_thread_seed: { reportBinding: threadBinding },
+    };
+    const base = { registry, secret: SECRET, dispatchRoot: 'om_chat_seed' };
+
+    // Positive control: the legitimate same-app, same-chat, chat-scope successor matches.
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      ...base,
+      callerAppId: 'cli_orchestrator', callerSessionId: 'session-chat-successor',
+      callerChatId: 'oc_orchestrator', callerScope: 'chat',
+    })).toBe(true);
+    // Same app, but the caller lives in a different group chat.
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      ...base,
+      callerAppId: 'cli_orchestrator', callerSessionId: 'session-chat-elsewhere',
+      callerChatId: 'oc_elsewhere', callerScope: 'chat',
+    })).toBe(false);
+    // Same app and chat, but the caller is thread-scope with another session id.
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      ...base,
+      callerAppId: 'cli_orchestrator', callerSessionId: 'session-thread-2',
+      callerChatId: 'oc_orchestrator', callerScope: 'thread',
+    })).toBe(false);
+    // Chat-scope caller without a chat id cannot prove same-chat continuation.
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      ...base,
+      callerAppId: 'cli_orchestrator', callerSessionId: 'session-chat-successor',
+      callerScope: 'chat',
+    })).toBe(false);
+    // A thread-scope binding never extends through the chat-scope successor branch.
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      registry, secret: SECRET, dispatchRoot: 'om_thread_seed',
+      callerAppId: 'cli_orchestrator', callerSessionId: 'session-chat-successor',
+      callerChatId: 'oc_orchestrator', callerScope: 'chat',
+    })).toBe(false);
+  });
+
+  it('rejects a chat-scope successor when the signed binding has no target chat id', () => {
+    const reportBinding = createDispatchReportBinding(SECRET, {
+      dispatchRoot: 'om_chat_without_id',
+      targetLarkAppId: 'cli_orchestrator',
+      targetSessionId: 'session-chat-original',
+      targetScope: 'chat',
+      sourceName: '子任务',
+      issuedAt: '2026-11-24T00:00:00.000Z',
+    });
+    expect(hasVerifiedDispatchReportBindingForCaller({
+      registry: { om_chat_without_id: { reportBinding } },
+      secret: SECRET,
+      dispatchRoot: 'om_chat_without_id',
+      callerAppId: 'cli_orchestrator',
+      callerSessionId: 'session-chat-successor',
+      callerScope: 'chat',
+    })).toBe(false);
   });
 
 });

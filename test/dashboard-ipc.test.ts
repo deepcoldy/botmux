@@ -1637,6 +1637,35 @@ describe('POST /api/session-origin/attest', () => {
     }
   });
 
+  it('carries only the caller session location, and drops a row that does not fit', async () => {
+    const fixture = installManagedOriginFixture();
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const attest = async () => {
+        const nonce = randomBytes(32).toString('hex');
+        const response = await postAttestation(handle!.port, {
+          sessionId: fixture.sessionId, channelId: CHANNEL, originCapability: CAPABILITY, nonce,
+        });
+        expect(response.status).toBe(200);
+        return JSON.parse(readFileSync(fixture.proofPath(nonce), 'utf8'));
+      };
+      // The fixture row has no chat location (a legacy/synthetic shape).
+      expect(await attest()).not.toHaveProperty('session');
+      Object.assign(fixture.active.session, {
+        status: 'active', chatId: 'oc_chat', rootMessageId: 'om_first', scope: 'chat', chatType: 'group',
+        workingDir: '/srv/work', ownerOpenId: 'ou_starter', ownerUnionId: 'on_starter',
+        assistantOwnerOpenId: 'ou_assistant_owner', lastMessage: 'someone else said this',
+        replyTargets: { [TURN_ID]: { rootMessageId: 'om_this_turn_topic' } },
+      });
+      expect((await attest()).session).toEqual({
+        status: 'active', chatId: 'oc_chat', rootMessageId: 'om_first', turnRootMessageId: 'om_this_turn_topic',
+        workingDir: '/srv/work', chatType: 'group', scope: 'chat',
+        ownerOpenId: 'ou_starter', ownerUnionId: 'on_starter',
+      });
+    } finally { fixture.cleanup(); }
+  });
+
   it('attests ownerless schedule permission from the live bot, ignoring requested identity', async () => {
     const fixture = installManagedOriginFixture();
     try {
@@ -4315,6 +4344,54 @@ describe('lark-cli binding setting survives dashboard refresh', () => {
         const refreshed = await readDefaults();
         expect(refreshed).toHaveProperty('larkToolBinding', enabled);
         expect(botDefaultsPayload({ larkAppId: appId }, refreshed).larkToolBinding).toBe(enabled);
+      }
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (previousConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previousConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT + GET /api/bot-auto-avoid-approval — 卡审批自动避开开关刷新回显', () => {
+  it.each([undefined, false, true] as const)('persists and echoes autoAvoidApproval (initial=%s)', async initial => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-auto-avoid-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'cli_auto_avoid_refresh';
+    const previousConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'fixture-secret', cliId: 'claude-code',
+        ...(initial === undefined ? {} : { autoAvoidApproval: initial }),
+      }]));
+      loadBotConfigs().forEach((entry: any) => registerBot(entry));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const readDefaults = async () => {
+        const response = await fetch(`${base}/api/bot-default-oncall`);
+        expect(response.status).toBe(200);
+        return response.json();
+      };
+      expect(await readDefaults()).toHaveProperty('autoAvoidApproval', initial !== false);
+
+      for (const enabled of [false, true]) {
+        const saved = await fetch(`${base}/api/bot-auto-avoid-approval`, {
+          method: 'PUT', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        });
+        expect(saved.status).toBe(200);
+        expect(await saved.json()).toMatchObject({ ok: true, autoAvoidApproval: enabled });
+        const persisted = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+        if (enabled) expect(persisted.autoAvoidApproval).toBeUndefined();
+        else expect(persisted.autoAvoidApproval).toBe(false);
+        expect(getBot(appId).config.autoAvoidApproval !== false).toBe(enabled);
+        const refreshed = await readDefaults();
+        expect(refreshed).toHaveProperty('autoAvoidApproval', enabled);
+        expect(botDefaultsPayload({ larkAppId: appId }, refreshed).autoAvoidApproval).toBe(enabled);
       }
     } finally {
       if (handle) await handle.close();
@@ -12406,12 +12483,38 @@ describe('POST /api/groups/create', () => {
       body: JSON.stringify({ larkAppIds: ['test-app'], bindWorkingDir: '/definitely/not/a/real/botmux/path' }),
     });
     expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ accepted: false });
     expect(createSpy).not.toHaveBeenCalled();
     expect(addSpy).not.toHaveBeenCalled();
     expect(bindSpy).not.toHaveBeenCalled();
     bindSpy.mockRestore();
     addSpy.mockRestore();
     createSpy.mockRestore();
+  });
+
+  it('returns the created chat id without accepted:false when a later step fails', async () => {
+    setLarkAppId('test-app');
+    const createSpy = vi.spyOn(groupsStore, 'createChat').mockResolvedValue({
+      chatId: 'oc_created_before_failure',
+      invalidBotIds: [],
+      invalidUserIds: [],
+    });
+    const linkSpy = vi.spyOn(groupsStore, 'getChatShareLink').mockRejectedValue(new Error('share link unavailable'));
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/create`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ larkAppIds: ['test-app'] }),
+      });
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body).toMatchObject({ ok: false, chatId: 'oc_created_before_failure' });
+      expect(body).not.toHaveProperty('accepted');
+    } finally {
+      linkSpy.mockRestore();
+      createSpy.mockRestore();
+    }
   });
 });
 

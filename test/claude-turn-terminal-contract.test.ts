@@ -134,6 +134,28 @@ describe('Claude durable turn terminal contract', () => {
     } as TranscriptEvent)).toBe(false);
   });
 
+  it('keeps the IM turn open across a synthetic local tool call', () => {
+    const h = new ContractHarness();
+    h.mark('tool-turn', 'run the command', 1);
+    const localToolCall: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'local-bash',
+      isApiErrorMessage: false,
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'tool_use', id: 'tool-1', name: 'Bash' }],
+      },
+    };
+    h.ingest([user('u-tool', 'run the command'), assistant('repl', undefined, 'tool_use'), localToolCall]);
+    expect(h.emitted).toEqual([]);
+    expect(isClaudeTurnTerminalEvent(localToolCall)).toBe(false);
+
+    h.ingest([assistant('answer', 'command completed', 'end_turn'), turnDuration('duration-tool')]);
+    expect(h.emitted).toEqual([{ turnId: 'tool-turn', dispatchAttempt: 1, status: 'completed' }]);
+  });
+
   it('maps two consecutive/type-ahead transcript turns to one terminal each', () => {
     const h = new ContractHarness();
     h.mark('delivery-1', 'first durable prompt', 1);

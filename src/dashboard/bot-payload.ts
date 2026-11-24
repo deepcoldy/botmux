@@ -17,6 +17,7 @@ import { normalizeEnvPolicy, type EnvPolicy } from '../core/env-policy.js';
 import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { readGlobalConfig } from '../global-config.js';
 import { resolveBotCodexRpcInput } from '../services/codex-rpc-input-policy.js';
+import { normalizeBotTaskRoutingConfig } from '../core/task-routing/model.js';
 
 /** Shared parser so a malformed payload can't reach the selector half-shaped;
  *  anything invalid degrades to the registry default (`inherit`). */
@@ -285,6 +286,10 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
     oncallGroup: j?.oncallGroup && typeof j.oncallGroup === 'object' ? j.oncallGroup : null,
     steward: j?.steward && typeof j.steward === 'object' ? j.steward : null,
+    taskRouting: (() => {
+      const parsed = normalizeBotTaskRoutingConfig(j?.taskRouting);
+      return parsed.ok ? parsed.value : null;
+    })(),
     ownerGroupFollow: j?.ownerGroupFollow && typeof j.ownerGroupFollow === 'object' ? j.ownerGroupFollow : null,
     noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
     promptCache: j?.promptCache && typeof j.promptCache === 'object' ? j.promptCache : null,
@@ -323,6 +328,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     triggerUserAuth: normalizeTriggerUserAuthForClient(j?.triggerUserAuth),
     larkToolBinding: j?.larkToolBinding !== false,
     larkUserOwnerFallback: j?.larkUserOwnerFallback !== false,
+    autoAvoidApproval: j?.autoAvoidApproval !== false,
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',
@@ -372,6 +378,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   apiOnly: boolean;
   larkToolBinding: boolean | undefined;
   larkUserOwnerFallback: boolean | undefined;
+  autoAvoidApproval: boolean | undefined;
   streamingCardFoldedLayout: boolean | undefined;
   askOptionLayout: any;
   trustSameOwnerBots: boolean | undefined;
@@ -385,6 +392,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
     larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding : undefined,
     // 默认开：显式 false 必须从这里带回，否则离线行会把已关闭的主人回退显示成开启。
     larkUserOwnerFallback: typeof rawEntry?.larkUserOwnerFallback === 'boolean' ? rawEntry.larkUserOwnerFallback : undefined,
+    autoAvoidApproval: typeof rawEntry?.autoAvoidApproval === 'boolean' ? rawEntry.autoAvoidApproval : undefined,
     streamingCardFoldedLayout: typeof rawEntry?.streamingCardFoldedLayout === 'boolean'
       ? rawEntry.streamingCardFoldedLayout : undefined,
     askOptionLayout: rawEntry?.askOptionLayout,

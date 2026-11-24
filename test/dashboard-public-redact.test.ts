@@ -721,6 +721,21 @@ describe('redactSettingsForPublic', () => {
     expect(settings.codexNotifier.lastError).not.toBeNull();
   });
 
+  it('hides task-routing policy and matcher configuration from tokenless settings', () => {
+    const settings = {
+      publicReadOnly: true,
+      taskRouting: {
+        enabled: true,
+        policy: 'private routing policy',
+        matcher: { mode: 'bot', botAppId: 'cli_private_judge' },
+      },
+    };
+    const out = redactSettingsForPublic(settings) as any;
+    expect(out).toEqual({ publicReadOnly: true });
+    expect(JSON.stringify(out)).not.toMatch(/private routing policy|cli_private_judge/);
+    expect(settings.taskRouting.policy).toBe('private routing policy');
+  });
+
   it('tolerates missing or malformed settings shapes', () => {
     expect(redactSettingsForPublic(null)).toBeNull();
     expect(redactSettingsForPublic({ publicReadOnly: true })).toEqual({ publicReadOnly: true });

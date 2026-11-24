@@ -80,6 +80,17 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.groupWorkingDir', 'botDefaults.autoWorktree', 'botDefaults.autoStartJoin',
       'botDefaults.autoStartJoinSeed', 'botDefaults.autoStartTopic', 'botDefaults.autoInviteOwnerOnGroupAdd',
       'botDefaults.ownerGroupFollow', 'botDefaults.ownerGroupFollowEnabled', 'botDefaults.ownerGroupFollowExcluded',
+      'botDefaults.ownerGroupFollowScope', 'botDefaults.ownerGroupFollowAll', 'botDefaults.ownerGroupFollowFiltered',
+      'botDefaults.ownerGroupFollowPresetDefect', 'botDefaults.ownerGroupFollowPresetAlertDesc',
+      'botDefaults.ownerGroupFollowPresetAlert', 'botDefaults.ownerGroupFollowPresetClosed',
+      'botDefaults.ownerGroupFollowInclude', 'botDefaults.ownerGroupFollowExclude',
+      'botDefaults.ownerGroupFollowAddInclude', 'botDefaults.ownerGroupFollowAddExclude',
+      'botDefaults.ownerGroupFollowField', 'botDefaults.ownerGroupFollowOp', 'botDefaults.ownerGroupFollowPattern',
+      'botDefaults.ownerGroupFollowName', 'botDefaults.ownerGroupFollowDescription', 'botDefaults.ownerGroupFollowAny',
+      'botDefaults.ownerGroupFollowContains', 'botDefaults.ownerGroupFollowStartsWith',
+      'botDefaults.ownerGroupFollowEndsWith', 'botDefaults.ownerGroupFollowRegex',
+      'botDefaults.ownerGroupFollowCase', 'botDefaults.ownerGroupFollowRemoveRule',
+      'botDefaults.ownerGroupFollowTester', 'botDefaults.ownerGroupFollowTestName', 'botDefaults.ownerGroupFollowTestDescription',
       'botDefaults.groupJoinCommand', 'botDefaults.groupJoinCommandField',
       'botDefaults.workingDirField', 'botDefaults.autoStartJoinPrompt',
     ],
@@ -101,6 +112,12 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     tab: 'sessions',
     titleKey: 'botDefaults.sectionSteward',
     fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardTaskHints', 'botDefaults.stewardGuide'],
+  },
+  {
+    id: 'task-routing',
+    tab: 'sessions',
+    titleKey: 'botDefaults.sectionTaskRouting',
+    fieldKeys: ['botDefaults.taskRoutingEnabled'],
   },
   {
     id: 'substitute',
@@ -143,6 +160,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
   { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention', 'botDefaults.triggerUserAuthAllowSpeakerSwitch'] },
   { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle', 'botDefaults.larkUserOwnerFallbackToggle'] },
+  { id: 'approval-compat', tab: 'security', titleKey: 'botDefaults.sectionApprovalCompat', fieldKeys: ['botDefaults.autoAvoidApprovalToggle'] },
   {
     id: 'grant',
     tab: 'security',
@@ -456,6 +474,8 @@ export type BotDefaultsRow = {
   larkToolBinding?: boolean;
   /** 没有发起人时 lark-cli --as user 用主人的飞书身份（默认开启）；false 回到只认发起人的严格行为。 */
   larkUserOwnerFallback?: boolean;
+  /** 飞书开放平台预判卡审批时草稿态自动二分跳过需审权限（默认开启；设为 false 关闭）。 */
+  autoAvoidApproval?: boolean;
   /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
   sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
   sandboxNetworkPolicyPlatform?: string | null;
@@ -557,6 +577,8 @@ export type BotDefaultsRow = {
   oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
   /** 管家（决策看板）配置；null / 缺省 = 未开启。 */
   steward?: import('../../core/decision-board/model.js').StewardConfig | null;
+  /** Per-bot task-routing profile; null/absent = not participating. */
+  taskRouting?: import('../../core/task-routing/model.js').BotTaskRoutingConfig | null;
   /** Codex App 无进展提醒（#1162）。null = 默认（开启，90s）。 */
   noProgressNotify?: import('../../services/no-progress-notify-policy.js').NoProgressNotifyPolicy | null;
   /** Per-bot prompt-cache override; null/absent = inherit the global default. */

@@ -23,8 +23,11 @@ import {
   invalidateGlobalConfigCache,
   mergeGlobalConfig as realMergeGlobalConfig,
   readGlobalConfig as realReadGlobalConfig,
+  writeGlobalTaskRoutingConfig as realWriteGlobalTaskRoutingConfig,
+  patchGlobalTaskRoutingConfig as realPatchGlobalTaskRoutingConfig,
 } from '../src/global-config.js';
 import { config } from '../src/config.js';
+import { validateGlobalTaskRoutingConfig } from '../src/core/task-routing/model.js';
 import {
   applySettingsWrite,
   resolveGroupCreationSettings,
@@ -70,6 +73,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     promptCache: null,
     providerRecovery: null,
     multiTopic: { enabled: true },
+    taskRouting: { enabled: false },
     maintenance: {},
     localDevInstall: false,
   };
@@ -89,6 +93,21 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
       storedGlobal.hostOverloadAlert = config;
     }),
     writeScheduleBotGrantConfig: vi.fn(),
+    patchGlobalTaskRoutingConfig: vi.fn((raw: unknown) => {
+      const merged = raw && typeof raw === 'object' && !Array.isArray(raw)
+        ? { ...storedGlobal.taskRouting, ...raw as Record<string, unknown> }
+        : raw;
+      const validated = validateGlobalTaskRoutingConfig(merged);
+      if (!validated.ok) return validated;
+      storedGlobal.taskRouting = validated.value ?? undefined;
+      return { ok: true as const, value: storedGlobal.taskRouting };
+    }),
+    writeGlobalTaskRoutingConfig: vi.fn((raw: unknown) => {
+      const validated = validateGlobalTaskRoutingConfig(raw);
+      if (!validated.ok) return validated;
+      storedGlobal.taskRouting = validated.value ?? undefined;
+      return { ok: true as const, value: storedGlobal.taskRouting };
+    }),
     mergeMaintenanceConfig: vi.fn((patch) => {
       Object.assign(storedMaintenance, patch);
       return storedMaintenance;
@@ -454,6 +473,35 @@ describe('applySettingsWrite happy paths', () => {
       .toEqual({ ok: false, error: 'invalid_multiTopic' });
     expect(await applySettingsWrite({ multiTopic: { enabled: 'no' } }, deps))
       .toEqual({ ok: false, error: 'invalid_multiTopic_enabled' });
+  });
+
+  it('sends taskRouting.enabled as an atomic patch rather than a stale whole-block snapshot', async () => {
+    const current = {
+      enabled: true,
+      policy: '优先低成本且空闲的 Bot',
+      matcher: { mode: 'bot' as const, botAppId: 'cli_judge', timeoutMs: 5_000 },
+    };
+    const deps = makeDeps({ readGlobalConfig: vi.fn(() => ({ taskRouting: current })) });
+    const r = await applySettingsWrite({ taskRouting: { enabled: false } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.patchGlobalTaskRoutingConfig).toHaveBeenCalledWith({ enabled: false });
+    expect(deps.writeGlobalTaskRoutingConfig).not.toHaveBeenCalled();
+  });
+
+  it('clears taskRouting only on an explicit null and rejects invalid matcher patches', async () => {
+    const deps = makeDeps();
+    expect((await applySettingsWrite({ taskRouting: null }, deps)).ok).toBe(true);
+    expect(deps.writeGlobalTaskRoutingConfig).toHaveBeenCalledWith(null);
+
+    const invalid = await applySettingsWrite({ taskRouting: { matcher: { mode: 'http' } } }, deps);
+    expect(invalid).toMatchObject({ ok: false, error: expect.stringContaining('invalid_taskRouting') });
+  });
+
+  it('rejects an empty taskRouting object instead of clearing saved configuration', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ taskRouting: {} }, deps)).toEqual({ ok: false, error: 'invalid_taskRouting' });
+    expect(deps.writeGlobalTaskRoutingConfig).not.toHaveBeenCalled();
+    expect(deps.patchGlobalTaskRoutingConfig).not.toHaveBeenCalled();
   });
 
   it('writes vcMeetingAgent.enabled toggle via mergeGlobalConfig', async () => {
@@ -1543,6 +1591,53 @@ describe('Codex idle cleanup setting', () => {
     const deps = makeDeps();
     expect(await applySettingsWrite({ sessionCleanup: { archiveCodex: 'true' } }, deps)).toEqual({ ok: false, error: 'invalid_sessionCleanup_archiveCodex' });
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe('applySettingsWrite — atomic taskRouting patch', () => {
+  it('preserves a concurrent advanced edit instead of writing back an older Dashboard snapshot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-task-routing-settings-'));
+    const configFile = join(dir, 'config.json');
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', configFile);
+    invalidateGlobalConfigCache();
+    try {
+      expect(realWriteGlobalTaskRoutingConfig({
+        enabled: true,
+        policy: 'OLD_POLICY',
+        matcher: { mode: 'bot', botAppId: 'cli_old', timeoutMs: 5_000 },
+      }).ok).toBe(true);
+      invalidateGlobalConfigCache();
+
+      let interleaved = false;
+      const deps = makeDeps({
+        readGlobalConfig: realReadGlobalConfig,
+        writeGlobalTaskRoutingConfig: realWriteGlobalTaskRoutingConfig,
+        patchGlobalTaskRoutingConfig: (raw: unknown) => {
+          if (!interleaved) {
+            interleaved = true;
+            // A different entry point commits before the switch's atomic PATCH.
+            expect(realWriteGlobalTaskRoutingConfig({
+              enabled: true,
+              policy: 'NEW_POLICY',
+              matcher: { mode: 'bot', botAppId: 'cli_new', timeoutMs: 9_000 },
+            }).ok).toBe(true);
+          }
+          return realPatchGlobalTaskRoutingConfig(raw);
+        },
+      });
+      expect((await applySettingsWrite({ taskRouting: { enabled: false } }, deps)).ok).toBe(true);
+      invalidateGlobalConfigCache();
+      expect(realReadGlobalConfig().taskRouting).toEqual({
+        enabled: false,
+        policy: 'NEW_POLICY',
+        matcher: { mode: 'bot', botAppId: 'cli_new', timeoutMs: 9_000 },
+      });
+      expect(JSON.parse(readFileSync(configFile, 'utf-8')).taskRouting.policy).toBe('NEW_POLICY');
+    } finally {
+      vi.unstubAllEnvs();
+      invalidateGlobalConfigCache();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

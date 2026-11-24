@@ -98,7 +98,7 @@ import {
   larkTransportEnabled,
 } from './types.js';
 import type { DaemonSession, GroupJoinContext } from './types.js';
-import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
+import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime, restoreQueuedActivationRawInput } from './pending-repo-journal.js';
 import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
 import { noteTurnStarted } from './turn-outcome.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
@@ -3412,6 +3412,8 @@ export async function restoreActiveSessions(
             queuedActivationPending: session.queuedActivationPending,
             queuedActivationToken: session.queuedActivationToken,
             queuedActivationInput: session.queuedActivationInput,
+            queuedActivationRawInput: session.queuedActivationRawInput,
+            queuedActivationRawTurnId: session.queuedActivationRawTurnId,
             queuedActivationTurnId: session.queuedActivationTurnId,
             queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
             queuedActivationResume: session.queuedActivationResume,
@@ -3423,6 +3425,8 @@ export async function restoreActiveSessions(
           session.queuedActivationPending = undefined;
           session.queuedActivationToken = undefined;
           session.queuedActivationInput = undefined;
+          session.queuedActivationRawInput = undefined;
+          session.queuedActivationRawTurnId = undefined;
           session.queuedActivationTurnId = undefined;
           session.queuedActivationDispatchAttempt = undefined;
           session.queuedActivationResume = undefined;
@@ -3470,6 +3474,7 @@ export async function restoreActiveSessions(
         pendingAttachments: session.queuedAttachments,
         currentTurnTitle: session.currentTurnTitle ?? session.title,
       };
+      restoreQueuedActivationRawInput(ds);
       const restoredPendingRepo = restorePendingRepoRuntime(ds);
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
@@ -3623,8 +3628,10 @@ export async function restoreActiveSessions(
     // Literal pending-repo passthroughs have an empty init prompt and therefore
     // no Codex ledger entry. Their setup journal is the exact replay owner; the
     // recovered worker sends it at prompt_ready with the retained token.
-    if (session.queuedActivationPending && session.pendingRepoSetup?.rawInput) {
+    restoreQueuedActivationRawInput(ds);
+    if (ds.pendingRawInput === undefined && session.queuedActivationPending && session.pendingRepoSetup?.rawInput) {
       ds.pendingRawInput = session.pendingRepoSetup.rawInput;
+      ds.pendingRawTurnId = session.pendingRepoSetup.turnId ?? session.queuedActivationTurnId;
     }
     try {
       const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
@@ -6152,14 +6159,14 @@ export async function spawnDashboardSession(
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion | undefined,
   args: SpawnDashboardSessionArgs,
-): Promise<{ ok: true; sessionId: string } | { ok: false; error: string }> {
+): Promise<{ ok: true; sessionId: string } | { ok: false; error: string; accepted?: false }> {
   const { larkAppId, chatId, content, column, role } = args;
   let bot: ReturnType<typeof getBot>;
-  try { bot = getBot(larkAppId); } catch { return { ok: false, error: 'bot_not_found' }; }
+  try { bot = getBot(larkAppId); } catch { return { ok: false, error: 'bot_not_found', accepted: false }; }
   const locale = localeForBot(larkAppId);
   // 个人助理模式：看板任务也归该群的主人、cwd 在主人 work/；群未认领就不建。
   const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, 'group', args.ownerOpenId ?? undefined);
-  if (assistantSpawn.kind === 'unclaimed') return { ok: false, error: 'assistant_unclaimed' };
+  if (assistantSpawn.kind === 'unclaimed') return { ok: false, error: 'assistant_unclaimed', accepted: false };
 
   // chat-scope：锚点就是 chatId。先挡掉「同群同 bot 已有真会话」的撞键（会被
   // Map.set 覆盖而泄漏 worker）。queued 占位 / 纯 scratch 不算冲突。
@@ -6213,7 +6220,11 @@ export async function spawnDashboardSession(
   const userContent = composeSpawnUserContent({ content, role, coworkers: args.coworkers, locale });
   const codexAppMessageContext = composeSpawnCodexAppContext({ role, coworkers: args.coworkers, locale });
 
-  const registered = await withActiveSessionKeyLock(activeSessions, key, async () => {
+  const registered = await withActiveSessionKeyLock<
+    | { ds: DaemonSession; session: Session }
+    | { error: string; accepted?: false }
+    | undefined
+  >(activeSessions, key, async () => {
     // Re-check under the key lock: the scan above runs before the banner /
     // attachment awaits, so a restore can quarantine this anchor in between.
     // Every other creation path performs this check at registration time.
@@ -6318,10 +6329,15 @@ export async function spawnDashboardSession(
         }
         // No durable or live owner accepted the opening. Roll back only our
         // exact runtime claim and close only our row; a concurrently published
-        // successor must survive.
-        if (activeSessions.get(key) === ds) activeSessions.delete(key);
-        try { sessionStore.closeSession(session.sessionId); }
-        catch (closeErr) {
+        // successor must survive. `accepted:false` is emitted only after both
+        // steps succeed, so task-routing can safely choose another bot.
+        const removedExactOwner = activeSessions.get(key) === ds;
+        if (removedExactOwner) activeSessions.delete(key);
+        let closedExactOwner = false;
+        try {
+          sessionStore.closeSession(session.sessionId);
+          closedExactOwner = true;
+        } catch (closeErr) {
           logger.error(
             `[createSession] failed to close unaccepted session ${session.sessionId}: `
             + `${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
@@ -6329,14 +6345,19 @@ export async function spawnDashboardSession(
         }
         return {
           error: err instanceof Error ? err.message : String(err),
+          ...(removedExactOwner && closedExactOwner ? { accepted: false as const } : {}),
         };
       }
     }
     return { ds, session };
   });
   if (!registered) return { ok: false, error: 'session_exists' };
-  if ('error' in registered && typeof registered.error === 'string') {
-    return { ok: false, error: registered.error };
+  if (!('ds' in registered)) {
+    return {
+      ok: false,
+      error: registered.error,
+      ...(registered.accepted === false ? { accepted: false as const } : {}),
+    };
   }
   // PR #597 builds `ds`, registers it, and runs forkOrShowRepoCard INSIDE the
   // key lock above (returning { ds, session }); master's post-lock ds
@@ -6468,6 +6489,8 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     ds.session.queuedActivationPending = undefined;
     ds.session.queuedActivationToken = undefined;
     ds.session.queuedActivationInput = undefined;
+    ds.session.queuedActivationRawInput = undefined;
+    ds.session.queuedActivationRawTurnId = undefined;
     ds.session.queuedActivationTurnId = undefined;
     ds.session.queuedActivationDispatchAttempt = undefined;
     ds.session.queuedActivationResume = undefined;
@@ -6495,6 +6518,7 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     try {
       const exactRetry = ds.session.queuedActivationInput;
       if (exactRetry) {
+        restoreQueuedActivationRawInput(ds);
         forkWorker(ds, exactRetry, {
           resume: ds.session.queuedActivationResume ?? ds.hasHistory,
           turnId: ds.session.queuedActivationTurnId,

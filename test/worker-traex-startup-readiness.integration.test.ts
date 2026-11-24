@@ -27,12 +27,12 @@ function redraw(rows: string[]): string {
 
 // per-bot-home: TRAE_HOME comes only from the bot's env (the worker's own env
 // has none), so the submit receipt is only visible if the worker follows it.
-type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer' | 'bare-hint-two-row-footer' | 'truncated-cwd-footer' | 'warning-hint-footer' | 'initialized-single-hint-fresh' | 'initialized-single-hint-resume' | 'provisional-thread-start' | 'provisional-thread-resume' | 'web-protocol-replies' | 'web-protocol-missing-resume';
+type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer' | 'bare-hint-two-row-footer' | 'truncated-cwd-footer' | 'warning-hint-footer' | 'initialized-single-hint-fresh' | 'initialized-single-hint-resume' | 'provisional-thread-start' | 'provisional-thread-resume' | 'web-protocol-replies' | 'web-protocol-missing-resume' | 'web-color-query-heartbeat';
 
 useWorkerTestModulesCleanup();
 const tmuxAvailable = probeTmuxFunctional().ok;
 for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as const : ['pty', 'tmux'] as const) {
-  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer', 'initialized-single-hint-fresh', 'initialized-single-hint-resume', 'provisional-thread-start', 'provisional-thread-resume', 'web-protocol-replies', 'web-protocol-missing-resume'] as const) {
+  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer', 'initialized-single-hint-fresh', 'initialized-single-hint-resume', 'provisional-thread-start', 'provisional-thread-resume', 'web-protocol-replies', 'web-protocol-missing-resume', 'web-color-query-heartbeat'] as const) {
     if (mode.startsWith('native-viewport') && backendType !== 'tmux') continue;
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
       `TraeX ${backendType} ${mode}: admits a quiet cursor-painted composer and submits the first input once`,
@@ -76,7 +76,7 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
   const idleReported = join(root, 'idle-reported');
   const recordedFrame = (name: string) => readFileSync(
     resolve(`test/fixtures/traex-cold-resume/0.216.0-resume-${name}.txt`), 'utf8').trimEnd().split('\n');
-  const webProtocol = mode.startsWith('web-protocol');
+  const webProtocol = mode.startsWith('web-');
   let web: WebSocket | undefined;
   let replyTimer: ReturnType<typeof setInterval> | undefined;
   let nextFrame = 0;
@@ -182,6 +182,12 @@ paint();
 // tmux pipe-pane may subscribe after the first draw. Repaint during boot;
 // after 900ms the fixture stays silent, so later redraws cannot rescue readySeen.
 for (const delay of [200, 500, 900]) setTimeout(() => { lastFrame = 0; paint(); }, delay);
+// Real TRAE with an attached xterm viewer emits this non-rendering query
+// every second. Input-only response fixtures do not exercise the output-side
+// quiescence starvation: keep queries active across the resolved composer.
+if (${JSON.stringify(mode === 'web-color-query-heartbeat')}) {
+  setInterval(() => process.stdout.write('\\x1b]11;?\\x1b\\\\'), 250);
+}
 // A standalone worker cannot import the source observer below. Its fixture
 // instead completes a native initialization stage after the quiescence window;
 // the parent observes that event or early bytes, then releases thread readiness.

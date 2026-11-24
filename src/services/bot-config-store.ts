@@ -3,6 +3,7 @@ import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { parseInviteConfig } from './invite-config.js';
 import { normalizeStewardConfig } from '../core/decision-board/model.js';
+import { normalizeBotTaskRoutingConfig } from '../core/task-routing/model.js';
 import { normalizeIdleSpinSuspendConfig } from '../core/idle-spin-config.js';
 import { formatZcodeModelChoice, resolveZcodeModelReference, zcodeAmbiguousModelIds } from './zcode-models.js';
 import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
@@ -182,8 +183,9 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },
   { key: 'autoInviteOwnerOnGroupAdd', configKey: 'autoInviteOwnerOnGroupAdd', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: 'bot 被拉进新群时自动把 owner 拉进群 on|off（默认 on）；off 适用于告警/oncall 批量事件群' },
   { key: 'autoStartOnNewTopic', configKey: 'autoStartOnNewTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '话题群每个新话题自动开工 on|off' },
-  { key: 'ownerGroupFollow', configKey: 'ownerGroupFollow', kind: 'json', effect: 'immediate', clearable: true, hint: '主人进新群时自动邀请本机器人，默认关闭；JSON {"enabled":true,"excludeChatIds":["oc_…"],"pollIntervalSeconds":60}。仅使用主人本人的用户授权，首次扫描只建立基线；被移出后不再补拉；unset 关闭' },
+  { key: 'ownerGroupFollow', configKey: 'ownerGroupFollow', kind: 'json', effect: 'immediate', clearable: true, hint: '主人进新群时自动邀请本机器人，默认关闭；JSON 支持 enabled、excludeChatIds、按群名或描述匹配的 includeRules / excludeRules、pollIntervalSeconds。仅使用主人本人的用户授权，首次扫描只建立基线；被移出后不再补拉；unset 关闭' },
   { key: 'steward', configKey: 'steward', kind: 'json', effect: 'immediate', clearable: true, hint: '管家（决策看板）JSON：{"enabled":true,"chatId":"oc_…","guideMode":"append|replace","guideText":"自定义规则","autoJoinNewGroups":false,"autoJoinSoloGroups":true,"closeHints":true,"decisionCards":false,"taskHints":true}；默认关闭；autoJoinNewGroups=拉新群时带上管家，默认开，只在关掉时写 false；autoJoinSoloGroups=只有你和一个 bot 的新群也带，默认关；closeHints=后台巡检提示可以关 / 可以推进 / 过了复查时间的事项（只提示不改状态），默认关；decisionCards=待拍板时往管家群发拍板卡片，默认开，只在关掉时写 false；taskHints=关联群里一轮交付、举手或中断时提醒管家（只提示不改状态），默认关，只在打开时写 true；unset 关闭（看板数据保留）' },
+  { key: 'taskRouting', configKey: 'taskRouting', kind: 'json', effect: 'immediate', clearable: true, hint: '任务分配画像 JSON：{"enabled":true,"costTier":"low|medium|high","strengths":"擅长说明","limitations":"不擅长与限制"}；默认不参与分配（enabled 须显式为 true），管家与 apiOnly Bot 默认排除；unset 清除' },
   { key: 'chatManagerEnabled', configKey: 'chatManagerEnabled', kind: 'boolean', effect: 'immediate', clearable: false, hint: '允许本 bot 被设为普通群负责人（默认接待者）on|off（默认 off）：开启后才提供会话内群负责人工具并允许 set，关闭后不免 @ 接话；clear/status 不受影响' },
   { key: 'chatManagerSharedTopic', configKey: 'chatManagerSharedTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '群负责人免 @ 接的顶层消息也开话题 on|off（默认 off）：仅在共享回复模式（/reply-mode shared）的普通群生效，回复挂到那条消息下面、和 @ 本 bot 一样，仍是群级同一个会话；需同时开 chatManagerEnabled' },
   { key: 'groupSecretaryEnabled', configKey: 'groupSecretaryEnabled', kind: 'boolean', effect: 'immediate', clearable: false, hint: '允许本 bot 在群里用 /secretary on 当群秘书 on|off（默认 off）：关闭时 /secretary on|takeover 提示未开放、后台不旁听不巡检；off/status 不受影响' },
@@ -228,6 +230,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后，勾选的能力用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"capabilities":["lark-user","bytecloud","meego"]}：lark-user=飞书用户身份（lark-cli --as user），bytecloud=ByteCloud（bytedcli、codebase、git push、bitscli / bits-cli，同一个开关），meego=Meego（仅 bytedcli meego，独立的 meegle 命令不受管）；bytecloud / meego 未列出时对应命令保持原生，直接用本机登录态；非法取值会被拒绝保存。省略 capabilities 时按 tools 推导（lark-cli→lark-user，bytedcli→bytecloud+meego；tools 也省略=全部）。未授权时命令一律拒绝（拒绝消息里会附授权入口，授权一次后重试即可），不会用 bot 或任何人的身份代跑；旧配置里的 fallback 字段会被忽略。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 delegateOnMention（默认 true）：本 bot 在真人直接发起的一轮里用 botmux send --mention 交接给同机 bot 时，对方以这位发起人的身份调用工具；设为 false 关闭。可选 allowSpeakerSwitch（默认 false）：设为 true 后，多人话题里可在某一条命令前加 BOTMUX_AS=<open_id> 让这一条命令用本轮另一位发言人的账号。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
   { key: 'larkUserOwnerFallback', configKey: 'larkUserOwnerFallback', kind: 'boolean', defaultOn: true, effect: 'immediate', clearable: true, hint: '没有发起人时用主人的飞书身份 on|off（默认 on）：脚本、Webhook、平台、没有创建人的定时任务等没有真人发起的回合（以及签名派发里发起人是主人的 bot 消息）里，lark-cli --as user 使用 bot 主人对本应用的授权（主人没授权时私聊主人授权链接）；有真人发起的回合仍只用发起人自己的授权，不借主人的。off = 这类回合的 --as user 直接拒绝（原来的严格行为）。按触发人鉴权开启且勾了「飞书用户身份」时不生效。即时生效' },
   { key: 'larkToolBinding', configKey: 'larkToolBinding', kind: 'boolean', defaultOn: true, effect: 'next-session', clearable: true, hint: 'lark-cli 绑定当前机器人应用身份 on|off（默认 on）：会话内 lark-cli 默认使用当前 bot 凭证并允许 --profile 切换宿主 profile；设为 off 则完全不注入当前 bot 凭据；需 /restart 重启或新建会话生效' },
+  { key: 'autoAvoidApproval', configKey: 'autoAvoidApproval', kind: 'boolean', defaultOn: true, effect: 'immediate', clearable: true, hint: '飞书开放平台卡审批自动避开 on|off（默认 on）：仅在提交版本前审批预判会命中企业管理员人工审批时介入，草稿态自动二分跳过需审权限并提示手动申请链接；免审账号零改动；off 则直接按原清单提交审批' },
   { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'hc', 'riff', 'mojo', 'remote-runner'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜hc=herdr-core 持久会话（显式选用，需 herdr-core >=0.1.19，仅 Linux，botmux 不自动安装）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）｜remote-runner=外置 provider；选 riff 时需配置 riff 字段，mojo/remoteRunner 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；多用户共享主机上，用 jwtHome 指向该 bot 归属用户的 home（绝对路径）以读到他自己的 ByteCloud 登录态；unset 清除' },
   { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON，仅 backendType=mojo 时生效，全部可选：cloud/localDaemon/baseUrl/ppeEnv/workspaceId/agentId/idleTimeoutSec/busyWaitSec/stream/systemPrompt/jwt/jwtEnv/env；model 与二进制路径请用顶层 model / cliPathOverride（写在此处会被拒绝）；unset 清除' },
@@ -1141,7 +1144,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_provider_recovery: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` | 'invalid_idle_spin_suspend' };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_provider_recovery: ${string}` | `invalid_steward: ${string}` | `invalid_task_routing: ${string}` | `invalid_feedback_presentation: ${string}` | 'invalid_idle_spin_suspend' };
 
 /** herdr 块全部可写字段；与 normalizeHerdrBackendConfig 接受的键必须一致（有 parity 测试）。 */
 export const HERDR_FIELD_NAMES = ['sessionName', 'placement', 'workspace', 'tab', 'splitDirection', 'chatTypes'] as const;
@@ -1263,6 +1266,10 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'steward') {
           const steward = normalizeStewardConfig(parsed);
           return steward.ok ? { ok: true, value: steward.value } : { ok: false, reason: `invalid_steward: ${steward.reason}` };
+        }
+        if (spec.configKey === 'taskRouting') {
+          const routing = normalizeBotTaskRoutingConfig(parsed);
+          return routing.ok ? { ok: true, value: routing.value } : { ok: false, reason: `invalid_task_routing: ${routing.reason}` };
         }
         if (spec.configKey === 'botActorOwnerBindings') {
           try {
