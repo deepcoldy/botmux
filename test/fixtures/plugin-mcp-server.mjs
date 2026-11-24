@@ -99,7 +99,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
       },
     };
   }
-  if (serverName === 'delivery') {
+  if (serverName === 'delivery' || serverName === 'delivery-protected') {
     const outbound = join(process.env.BOTMUX_PLUGIN_HOME, 'outbound');
     mkdirSync(outbound, { recursive: true });
     const attachment = join(outbound, 'result.txt');
@@ -109,6 +109,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
       _meta: {
         botmuxHostDelivery: {
           schemaVersion: 1,
+          ...(serverName === 'delivery-protected' ? { readPolicy: 'receipt-only' } : {}),
           deliveryId: 'delivery_fixture_001',
           markdown: '分析摘要',
           files: [{ path: attachment }],

@@ -94,6 +94,18 @@ function useRunAsTurn(allowedUsers: string[]) {
   return botConfig;
 }
 describe('session application identity route', () => {
+  it.each(['bot', 'user'])('revokes credential export if protection is enabled during %s resolution', async mode => {
+    const resolve = async () => {
+      session.session.protectedResults = true;
+      return 'late-protected-token';
+    };
+    if (mode === 'bot') botToken.mockImplementation(resolve);
+    else vi.mocked(tokens.resolveUserToken).mockImplementation(resolve);
+    const response = await request(mode);
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ ok: false, error: 'protected_result_credential_export_denied' });
+  });
+
   it.skipIf(process.platform !== 'linux')('accepts a signed original peer through the trusted loopback proxy and binds it to the live turn', async () => {
     const cliRoot: ChildProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
       stdio: 'ignore',
@@ -720,6 +732,18 @@ describe('session application identity route', () => {
     }
     const passthrough = await run(['docs', '+fetch', '--profile=cli_other']); expect(passthrough.code, passthrough.err).toBe(0);
     expect(passthrough.out).toBe('cli_wrong|||wrong-user|docs +fetch --profile=cli_other');
+    // A protected session cannot export either managed or profile credentials.
+    session.session.protectedResults = true;
+    const grants = botToken.mock.calls.length;
+    const userGrants = vi.mocked(tokens.resolveUserToken).mock.calls.length;
+    for (const args of [['docs', '+fetch'], ['docs', '+fetch', '--as=user'], ['docs', '+fetch', '--profile=cli_other']]) {
+      const denied = await run(args);
+      expect(denied.code, denied.err).toBe(77);
+      expect(denied.out).toBe('');
+      expect(denied.err).toContain('protected_result_credential_export_denied');
+    }
+    expect(botToken.mock.calls.length).toBe(grants);
+    expect(vi.mocked(tokens.resolveUserToken).mock.calls.length).toBe(userGrants);
   });
   it('BOTMUX_AS picks one speaker of a multi-speaker turn; the default stays the turn principal after a merge', async () => {
     session.managedTurnOrigin.speakers = [{ openId: 'ou_sender', turnId: 'om_a' }, { openId: 'ou_other', turnId: 'om_turn' }];

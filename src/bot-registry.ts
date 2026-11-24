@@ -1891,6 +1891,8 @@ export interface BotConfig {
    * agent mint the tenant token itself.
    */
   sandboxWithholdBotSecret?: boolean;
+  /** Opt-in opaque plugin results. Requires a sandbox and withholds all CLI Lark credentials. */
+  protectedResults?: boolean;
   /**
    * LEGACY read-isolation flag (pre fs-policy). The unified sandbox is
    * deny-by-default, so cross-bot read isolation is inherent — this flag is
@@ -4006,6 +4008,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (entry.sandboxWithholdBotSecret != null && typeof entry.sandboxWithholdBotSecret !== 'boolean') {
       throw new Error(`Bot config [${i}]: sandboxWithholdBotSecret must be true or false, got ${JSON.stringify(entry.sandboxWithholdBotSecret)}`);
     }
+    if (entry.protectedResults != null && typeof entry.protectedResults !== 'boolean') {
+      throw new Error(`Bot config [${i}]: protectedResults must be true or false`);
+    }
+    if (entry.protectedResults === true && (!(entry.sandbox === true || entry.sandbox === 'oncall')
+      || entry.larkToolBinding === false)) {
+      throw new Error(`Bot config [${i}]: protectedResults requires an explicit oncall sandbox and managed lark-tool binding`);
+    }
     validateCliLaunchModeConfig({
       cliId: entryCliId,
       cliLaunchMode,
@@ -4563,7 +4572,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
       // assistantMode implies it (see sandboxWithholdsBotSecret)
-      ...(entry.sandboxWithholdBotSecret === true || entry.assistantMode === true ? { sandboxWithholdBotSecret: true } : {}),
+      ...(entry.sandboxWithholdBotSecret === true || entry.assistantMode === true || entry.protectedResults === true ? { sandboxWithholdBotSecret: true } : {}),
+      ...(entry.protectedResults === true ? { protectedResults: true } : {}),
       ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),

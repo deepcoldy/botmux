@@ -15,6 +15,8 @@ import { NEXT_STEP_ELEMENT_ID } from './next-step-card.js';
 import { TURN_RECAP_ELEMENT_ID } from './turn-recap-card.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
 import { stripTrailingGroupContextCardPurposeMarker, hasTrailingGroupContextMediaPurposeMarker } from './group-context-card.js';
+import { ProtectedResultStore } from '../../services/protected-result-store.js';
+import { resolveBotmuxDataDir } from '../../core/data-dir.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -552,7 +554,14 @@ export function parseEventMessage(
   data: RawEventData,
   numberer: ImgNumberer = createImgNumberer(),
 ): { parsed: LarkMessage; resources: MessageResource[] } {
-  const { sender, message } = data;
+  const sender = data.sender;
+  let message = data.message;
+  const redacted = new ProtectedResultStore(resolveBotmuxDataDir()).redactMessage({
+    ...message, msg_type: message.message_type, body: { content: message.content },
+  });
+  if (redacted.body?.content !== message.content || redacted.msg_type !== message.message_type) {
+    message = { ...message, message_type: redacted.msg_type, content: redacted.body.content };
+  }
 
   // Trace non-text messages at debug only (DEBUG=1 gated). The raw card/post
   // content can be many KB and may include attachment metadata that's

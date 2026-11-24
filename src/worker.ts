@@ -75,6 +75,8 @@ import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrap
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { workerCliExecutionReport } from './core/cli-execution-mode.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
+import { ProtectedResultStore } from './services/protected-result-store.js';
+import { protectedResultProfileAvailable } from './services/protected-result-delivery.js';
 import { tokenStoreProtection, capabilityOn, larkUserNative } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
@@ -2776,6 +2778,7 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     delivered: true as const,
     deliveryId: resolvedDelivery.deliveryId,
     fileCount: resolvedDelivery.files?.length ?? 0,
+    messageIds: response.messageIds,
   };
 };
 /** Counts consecutive in-worker restart cycles (see case 'restart'). Used by
@@ -3091,6 +3094,23 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     dataDir: config.session.dataDir,
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
     trustedResultDelivery: deliverPluginResultThroughHost,
+    ...(lastInitConfig?.protectedResults === true ? {
+      protectedResultDeliveryAvailable: () => protectedResultProfileAvailable({
+        enabled: lastInitConfig?.protectedResults === true,
+        withholdCredentials: lastInitConfig?.sandboxWithholdBotSecret === true,
+        sandboxMode: lastResolvedSandboxMode,
+        managedBinding: !!lastInitConfig && usesLarkToolBinding(lastInitConfig, config.session.dataDir, isWorkflowWorker()),
+        platform: process.platform,
+      }),
+      trustedResultStatus: async ({ identity, pluginId, deliveryId }) => {
+        const cfg = lastInitConfig;
+        if (!cfg || identity.caller?.senderType !== 'user' || !identity.caller.requestUserUnionId
+          || identity.caller.requestLarkAppId !== cfg.larkAppId) throw new Error('protected_result_status_identity_required');
+        return new ProtectedResultStore(config.session.dataDir).statusForCaller({
+          appId: cfg.larkAppId, sessionId, ownerUnionId: identity.caller.requestUserUnionId, chatId: cfg.chatId,
+        }, pluginId, deliveryId);
+      },
+    } : {}),
     linkRefRegistration: registerMcpLinkRefsThroughHost,
     requestProtectedSecretChannel: requestProtectedSecretChannel,
     protectedMcpPolicy: lastInitConfig?.protectedMcpPolicy,

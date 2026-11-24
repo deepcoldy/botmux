@@ -647,6 +647,7 @@ import {
 } from './detached-scheduled-identity.js';
 import { noteSenderUnionId } from './platform-credential-source.js';
 import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
+import { ProtectedResultStore } from '../services/protected-result-store.js';
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { chooseTurnSpeaker, governedSpeakers } from './turn-speakers.js';
 import { resolveUserToken } from '../utils/user-token.js';
@@ -4490,7 +4491,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     || !boundLarkToolRequest(req, params.sessionId, targetLarkAppId, botConfig)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
   }
-  if (!body || Object.keys(body).some(key => key !== 'mode' && key !== 'as') || !['bot', 'user'].includes(String(body.mode))
+  if (!body || Object.keys(body).some(key => !['mode', 'as', 'policyOnly'].includes(key)) || !['bot', 'user'].includes(String(body.mode))
+    || body.policyOnly !== undefined && typeof body.policyOnly !== 'boolean'
     || (body.as !== undefined && (body.mode !== 'user' || typeof body.as !== 'string'))) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' });
   }
@@ -4498,6 +4500,25 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   let bot: ReturnType<typeof getBot>['config'];
   try { bot = getBot(targetLarkAppId!).config; }
   catch { return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' }); }
+  // Re-evaluate after credential resolution too: operator edits and protected
+  // deliveries may land while a grant/token request is awaiting a provider.
+  const protectedCredentialRefusal = (): string | undefined => {
+    try {
+      const live = getBot(targetLarkAppId!).config;
+      return live.protectedResults === true || ds?.session.protectedResults === true
+        || detachedScheduled?.session.protectedResults === true
+        || new ProtectedResultStore(config.session.dataDir).sessionHasProtection(live.larkAppId, params.sessionId)
+        ? 'protected_result_credential_export_denied' : undefined;
+    } catch { return 'protected_result_policy_unavailable'; }
+  };
+  const refuseProtectedCredential = (): boolean => {
+    const error = protectedCredentialRefusal();
+    if (!error) return false;
+    jsonRes(res, error === 'protected_result_policy_unavailable' ? 503 : 403, { ok: false, error });
+    return true;
+  };
+  if (refuseProtectedCredential()) return;
+  if (body.policyOnly === true) return jsonRes(res, 200, { ok: true, policyOnly: true });
   // Per-person auth is on but lark-user is not among its capabilities: the machine's own lark-cli login serves `--as user`.
   if (body.mode === 'user' && larkUserNative(bot.triggerUserAuth)) {
     if (body.as !== undefined) return jsonRes(res, 403, { ok: false, error: AS_UNAVAILABLE_NATIVE });
@@ -4550,6 +4571,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     if (!stillValidSession || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)) {
       return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
     }
+    if (refuseProtectedCredential()) return;
     return jsonRes(res, 200, {
       ok: true, appId: bot.larkAppId, mode: 'bot', credentialType: 'tenant_access_token', credential: token,
     });
@@ -4778,6 +4800,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   if (!resolved.ok) return jsonRes(res, 403, { ok: false, error: delegated
     ? `The original user's authorization for ${bot.larkAppId} is missing. Run botmux auth request --scope "<required scopes>" --json and send the link to that human, then retry with --as user. Do not ask the dispatch bot to authorize.`
     : `Application ${bot.larkAppId} needs this user's authorization. Run ${asPrefix}botmux auth request --scope "<required scopes>" --json${asPrefix ? ` and ${asPrefix}botmux auth wait` : ', or send /login in this conversation'}, then retry with --as user.` });
+  if (refuseProtectedCredential()) return;
   auditOwnerFallback('granted');
   return jsonRes(res, 200, {
     ok: true, appId: resolved.appId, mode: 'user', credentialType: 'user_access_token', credential: resolved.credential,

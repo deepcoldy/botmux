@@ -27,6 +27,7 @@ import { prepareLocalAddressContent, sanitizeLocalAddressNode } from './local-ad
 import { linkFieldContext } from './local-address-context.js';
 import { executeWithLarkGate } from './api-gate.js';
 import { readMessageWithinContext } from './message-read-context.js';
+import { ProtectedResultStore } from '../../services/protected-result-store.js';
 import {
   LARK_CODE_APP_SCOPE_MISSING,
   LARK_CODE_CONTACT_INVALID_PARAM,
@@ -1816,7 +1817,12 @@ export async function getMessageDetail(
     if (res.code !== 0) {
       throw larkApiError('get message', res);
     }
-    return res.data;
+    const protection = new ProtectedResultStore(config.session.dataDir);
+    return {
+      items: (res.data?.items ?? []).map((item: unknown) => protection.redactMessage(item)),
+      ...(res.data?.has_more !== undefined ? { has_more: res.data.has_more } : {}),
+      ...(res.data?.page_token !== undefined ? { page_token: res.data.page_token } : {}),
+    };
   });
 
 }
@@ -1948,6 +1954,11 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   // raw user-token fetch — bypassing the boundary. A core-only bot has no
   // Feishu resource to download; refuse up front.
   assertLarkTransport(larkAppId, 'downloadMessageResource');
+  const protection = new ProtectedResultStore(config.session.dataDir);
+  if (protection.hasProtection()) {
+    const chatId = await lookupMessageChatId(larkAppId, messageId);
+    protection.assertResourceReadable(messageId, fileKey, chatId ?? undefined);
+  }
   // Feishu downloads video bodies through the file endpoint.
   const apiType = type === 'video' ? 'file' : type;
   const dir = dirname(savePath);
@@ -2293,7 +2304,7 @@ export async function uploadImage(larkAppId: string, imagePath: string | Buffer)
   });
 }
 
-export async function uploadFile(larkAppId: string, source: string | { name: string; bytes: Buffer }, opts?: { duration?: number }): Promise<string> {
+export async function uploadFile(larkAppId: string, source: string | { name: string; bytes: Buffer }, opts?: { duration?: number; sensitive?: boolean }): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadFile');
   const fileName = basename(typeof source === 'string' ? source : source.name);
   const ext = extname(fileName).toLowerCase();
@@ -2340,10 +2351,11 @@ export async function uploadFile(larkAppId: string, source: string | { name: str
         });
         const fileKey = res?.file_key;
         if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
-        logger.info(`Uploaded file ${fileName} (${size} bytes) → ${fileKey}`);
+        if (!opts?.sensitive) logger.info(`Uploaded file ${fileName} (${size} bytes) → ${fileKey}`);
         return fileKey;
       } catch (err) {
-        logger.warn(`Upload file ${fileName} failed (size=${size} bytes, file_type=${fileType}): ${formatLarkError(err) ?? (err instanceof Error ? err.message : String(err))}`);
+        if (opts?.sensitive) logger.warn('Protected result upload failed');
+        else logger.warn(`Upload file ${fileName} failed (size=${size} bytes, file_type=${fileType}): ${formatLarkError(err) ?? (err instanceof Error ? err.message : String(err))}`);
         throw err;
       } finally {
         if (!file.closed) {
@@ -2983,7 +2995,10 @@ async function* iterateMessagePages(c: any, scan: MessagePageScan): AsyncGenerat
     }
 
     pageToken = res.data?.page_token;
-    yield res.data?.items ?? [];
+    const protection = new ProtectedResultStore(config.session.dataDir);
+    yield (res.data?.items ?? []).map((item: unknown) => protection.redactMessage(
+      item, scan.containerType === 'chat' ? scan.containerId : undefined,
+    ));
   } while (pageToken);
 }
 
