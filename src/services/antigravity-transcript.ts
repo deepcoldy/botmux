@@ -287,11 +287,7 @@ export function unwrapAntigravityUserInput(content: string): string {
  * The exact submitted USER_INPUT must be the last native turn, followed only by
  * non-output bookkeeping. Any assistant, tool, error, system or later-user
  * record fails closed. The quota refusal itself is not recorded by agy. */
-export function antigravityTurnFailedWithoutOutput(
-  path: string | undefined,
-  writtenInput: string | undefined,
-): boolean {
-  if (!path || !writtenInput) return false;
+function antigravitySingleTranscriptTurnFailedWithoutOutput(path: string, writtenInput: string): boolean {
   let fd: number;
   let offset: number;
   let size: number;
@@ -333,6 +329,32 @@ export function antigravityTurnFailedWithoutOutput(
   } finally {
     closeSync(fd);
   }
+}
+
+/** Durable no-progress proof across both sibling views of one agy conversation.
+ * A full log never authorizes replay alone: agy writes compact first, so full
+ * without a readable compact sibling is not a complete proof. Compact-only is
+ * valid for older builds without full. Any output, corruption or partial tail
+ * in either present sibling fails closed. */
+export function antigravityTurnFailedWithoutOutput(
+  path: string | undefined,
+  writtenInput: string | undefined,
+  proofDeps: { existsSync: (path: string) => boolean } = { existsSync },
+): boolean {
+  if (!path || !writtenInput) return false;
+  const isFull = basename(path) === FULL_TRANSCRIPT_NAME;
+  const isCompact = basename(path) === COMPACT_TRANSCRIPT_NAME;
+  if (!isFull && !isCompact) return antigravitySingleTranscriptTurnFailedWithoutOutput(path, writtenInput);
+  const sibling = isFull ? antigravityCompactSiblingPath(path) : antigravityFullSiblingPath(path);
+  if (!sibling) return false;
+  // An old agy build may only have compact. Once full exists, both views must
+  // independently retain the exact no-progress proof; full has no single-log
+  // fallback even if compact disappears between inspection and reading.
+  if (!proofDeps.existsSync(sibling)) {
+    return isFull ? false : antigravitySingleTranscriptTurnFailedWithoutOutput(path, writtenInput);
+  }
+  return antigravitySingleTranscriptTurnFailedWithoutOutput(path, writtenInput)
+    && antigravitySingleTranscriptTurnFailedWithoutOutput(sibling, writtenInput);
 }
 
 /** A content-only PLANNER_RESPONSE held as the turn's candidate final until a

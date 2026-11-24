@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -218,6 +218,7 @@ describe('antigravityTurnFailedWithoutOutput', () => {
     mkdirSync(logs, { recursive: true });
     const fullPath = join(logs, 'transcript_full.jsonl');
     writeFileSync(fullPath, line(userRecord(USER_REQUEST)));
+    writeFileSync(join(logs, 'transcript.jsonl'), line(userRecord(USER_REQUEST)));
     const prove = loadWorkerFunction<(limit: CliUsageLimitState) => CliUsageLimitState>(
       'withAntigravityDirectFailureProof', {
         codexBridgeRolloutPath: undefined,
@@ -236,6 +237,56 @@ describe('antigravityTurnFailedWithoutOutput', () => {
     expect(prove(limit).directFailure).toBe(true);
     appendFileSync(fullPath, line(plannerStep({ toolCalls: [toolCall('create_the_file')] })));
     expect(prove(limit).directFailure).toBeUndefined();
+  });
+
+  it('rejects progress present in either the full or compact sibling', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const user = line(userRecord(USER_REQUEST));
+    const tool = line(plannerStep({ toolCalls: [toolCall('create_the_file')] }));
+    writeFileSync(fullPath, user);
+    writeFileSync(path, user + tool);
+    expect(antigravityTurnFailedWithoutOutput(fullPath, USER_REQUEST)).toBe(false);
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(false);
+  });
+
+  it('accepts a consistent full/compact pair with no output after the last input', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const content = line(userRecord(USER_REQUEST)) + line({ type: 'CHECKPOINT', content: 'checkpoint' });
+    writeFileSync(fullPath, content);
+    writeFileSync(path, content);
+    expect(antigravityTurnFailedWithoutOutput(fullPath, USER_REQUEST)).toBe(true);
+  });
+
+  it('fails closed when full has no readable compact sibling', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    writeFileSync(fullPath, line(userRecord(USER_REQUEST)));
+    expect(antigravityTurnFailedWithoutOutput(fullPath, USER_REQUEST)).toBe(false);
+  });
+
+  it('fails closed if the compact sibling disappears during inspection', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const user = line(userRecord(USER_REQUEST));
+    writeFileSync(fullPath, user);
+    writeFileSync(path, user);
+    let inspected = false;
+    expect(antigravityTurnFailedWithoutOutput(fullPath, USER_REQUEST, {
+      existsSync: candidate => {
+        if (!inspected && candidate === path) {
+          inspected = true;
+          rmSync(path);
+          return true;
+        }
+        return existsSync(candidate);
+      },
+    })).toBe(false);
+    expect(inspected).toBe(true);
+  });
+
+  it('fails closed on a partial record in the compact sibling', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    writeFileSync(fullPath, line(userRecord(USER_REQUEST)));
+    writeFileSync(path, line(userRecord(USER_REQUEST)) + '{"type":"PLANNER_RESPONSE"');
+    expect(antigravityTurnFailedWithoutOutput(fullPath, USER_REQUEST)).toBe(false);
   });
 
   it('fails closed on a different input or a missing transcript', () => {

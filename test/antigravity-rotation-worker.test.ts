@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -129,10 +129,13 @@ async function setupRotationScenario(input: {
   const transcriptPath = join(home, '.gemini', 'antigravity-cli', 'brain',
     session.cliSessionId, '.system_generated', 'logs', 'transcript_full.jsonl');
   mkdirSync(dirname(transcriptPath), { recursive: true });
-  writeFileSync(transcriptPath, JSON.stringify({
+  const userTranscriptRecord = JSON.stringify({
     step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE',
     content: '<USER_REQUEST>\ndo work\n</USER_REQUEST>',
-  }) + '\n');
+  }) + '\n';
+  writeFileSync(transcriptPath, userTranscriptRecord);
+  const compactTranscriptPath = join(dirname(transcriptPath), 'transcript.jsonl');
+  writeFileSync(compactTranscriptPath, userTranscriptRecord);
   const transcriptFd = openSync(transcriptPath, 'r');
   cleanups.push(() => closeSync(transcriptFd));
   const flush = async () => {
@@ -146,7 +149,7 @@ async function setupRotationScenario(input: {
     else process.env.SESSION_DATA_DIR = previousDataDir;
     rmSync(root, { recursive: true, force: true });
   });
-  return { ds, worker, sent, replies, flush, nowMs, sessionStore, transcriptPath };
+  return { ds, worker, sent, replies, flush, nowMs, sessionStore, transcriptPath, compactTranscriptPath };
 }
 
 function nativeUsageLimit(screen: string, key: string, nowMs: number): CliUsageLimitState {
@@ -416,6 +419,86 @@ describe('Antigravity worker-pool replay safety', () => {
     expect(statuses).toContain('idle');
   });
 
+  it('merges consumed recovery completion into a compatible pending retry', async () => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    vi.useFakeTimers();
+    const usageLimit = {
+      limited: true as const, kind: 'usage' as const,
+      retryAtMs: Date.now() + 60_000, retryLabel: '1m', retryReady: false,
+      source: 'antigravity-native-log' as const, nativeEpisodeKey: 'log:A', directFailure: true as const,
+    };
+    h.ds.usageLimit = usageLimit;
+    h.ds.lastScreenStatus = 'limited';
+    h.ds.suppressRecoveryCard = true;
+    h.ds.session.usageLimit = usageLimit;
+    h.ds.session.lastFailedTurn = {
+      turnId: 'turn-1', cliInput: 'do work', userPrompt: 'do work',
+      failedAt: new Date().toISOString(), status: 'failed', retryCount: 0,
+      limitedSnapshot: true, directFailure: true,
+    };
+    h.sessionStore.updateSession(h.ds.session);
+    const { dashboardEventBus } = await import('../src/core/dashboard-events.js');
+    const statuses: unknown[] = [];
+    const off = dashboardEventBus.subscribe((event: any) => {
+      if (event.type === 'session.update' && event.body.sessionId === h.ds.session.sessionId) {
+        statuses.push(event.body.patch.status);
+      }
+    });
+    cleanups.push(off);
+    cleanups.push(() => h.sessionStore.__testOnly_setBeforeRowPersist(undefined));
+    const dispatch = async (msg: any) => {
+      for (const listener of h.worker.listeners('message')) await listener(msg);
+      await vi.advanceTimersByTimeAsync(0);
+    };
+    try {
+      // A normal ready-composer clear owns a pending retry with no completion hook.
+      h.sessionStore.__testOnly_setBeforeRowPersist(() => {
+        h.sessionStore.__testOnly_setBeforeRowPersist(undefined);
+        throw new Error('first clear failed');
+      });
+      await dispatch({ type: 'screen_update', content: 'ready', status: 'idle', turnId: 'turn-1', usageLimitRecovery: 'antigravity-ready-composer' });
+      expect(h.ds.usageLimit?.nativeEpisodeKey).toBe('log:A');
+
+      // Settlement records consumption but cannot clear the sticky state. The
+      // original no-hook retry deliberately remains pending.
+      h.ds.session.consumedAntigravityQuotaKeys = ['log:A'];
+      h.sessionStore.updateSession(h.ds.session);
+      const pool = await import('../src/core/worker-pool.js');
+      h.sessionStore.__testOnly_setBeforeRowPersist(() => {
+        h.sessionStore.__testOnly_setBeforeRowPersist(undefined);
+        throw new Error('settlement clear failed');
+      });
+      expect(() => pool.clearUsageLimitState(h.ds)).toThrow('settlement clear failed');
+
+      // A consumed frame supplies the completion hook while its clear also fails.
+      h.sessionStore.__testOnly_setBeforeRowPersist(() => {
+        h.sessionStore.__testOnly_setBeforeRowPersist(undefined);
+        throw new Error('consumed clear failed');
+      });
+      await dispatch({ type: 'screenshot_uploaded', imageKey: 'img-consumed-hook', status: 'limited', turnId: 'turn-1', usageLimit });
+      // The merged timer itself fails once too: the hook must survive backoff.
+      h.sessionStore.__testOnly_setBeforeRowPersist(() => {
+        h.sessionStore.__testOnly_setBeforeRowPersist(undefined);
+        throw new Error('merged retry clear failed');
+      });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(h.ds.usageLimit?.nativeEpisodeKey).toBe('log:A');
+      expect(statuses).not.toContain('idle');
+      await vi.advanceTimersByTimeAsync(1000);
+
+      const stored = h.sessionStore.getSessionFresh(h.ds.session.sessionId);
+      expect(h.ds.lastScreenStatus).toBe('idle');
+      expect(h.ds.usageLimit).toBeUndefined();
+      expect(h.ds.session.lastFailedTurn).toBeUndefined();
+      expect(stored?.lastFailedTurn).toBeUndefined();
+      expect(statuses).toContain('idle');
+      expect(statuses.filter(status => status === 'idle')).toHaveLength(1);
+    } finally {
+      h.sessionStore.__testOnly_setBeforeRowPersist(undefined);
+      vi.useRealTimers();
+    }
+  });
+
   it('retries provisional failed-turn cleanup after recovery when its SQLite write fails', async () => {
     const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
     const usageLimit = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-1', h.nowMs);
@@ -613,6 +696,20 @@ describe('Antigravity worker-pool replay safety', () => {
     appendFileSync(h.transcriptPath, JSON.stringify({
       step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE',
       tool_calls: [{ id: 'late-tool', name: 'create_the_file', args: {} }],
+    }) + '\n');
+
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(0);
+  });
+
+  it('rejects settlement when the compact sibling proves progress missing from full', async () => {
+    const h = await setupRotationScenario({ directFailure: true });
+    const restart = await emitQuotaAndStart(h);
+    appendFileSync(h.compactTranscriptPath, JSON.stringify({
+      step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE',
+      tool_calls: [{ id: 'compact-only-tool', name: 'create_the_file', args: {} }],
     }) + '\n');
 
     h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });

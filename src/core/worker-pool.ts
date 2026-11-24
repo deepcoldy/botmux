@@ -5260,13 +5260,19 @@ function retryComposerRecovery(
   const { status } = frame;
   cancelUsageLimitPersistRetry(ds);
   const pending = composerRecoveryRetries.get(ds);
-  if (pending?.owns()) return;
+  if (pending?.owns()) {
+    // The original timer still owns the write. A later consumed-recovery call
+    // may add its completion hook; a hook-less call never erases an existing one.
+    if (afterRecovered) pending.afterRecovered = afterRecovered;
+    return;
+  }
   cancelComposerRecoveryRetry(ds);
   const key = ds.usageLimit && usageLimitStateKey(ds.usageLimit);
   let delayMs = 500;
-  const schedule = (): void => {
+  const schedule = (completion = afterRecovered): void => {
     const timer = setTimeout(() => {
-      if (composerRecoveryRetries.get(ds)?.timer !== timer) return;
+      const scheduled = composerRecoveryRetries.get(ds);
+      if (scheduled?.timer !== timer) return;
       composerRecoveryRetries.delete(ds);
       // Losing live ownership invalidates the proof, except for an already
       // committed close: its second-stage clear still owes the SAME key's
@@ -5278,7 +5284,7 @@ function retryComposerRecovery(
       } catch (error) {
         logger.warn(`[${tag(ds)}] composer recovery persistence retry: ${String(error)}`);
         delayMs = Math.min(delayMs * 2, 30_000);
-        schedule();
+        schedule(scheduled.afterRecovered);
         return;
       }
       if (ds.lastScreenStatus === 'limited') ds.lastScreenStatus = status;
@@ -5287,11 +5293,11 @@ function retryComposerRecovery(
         && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
         scheduleCardPatch(ds, buildStreamingCardJson(ds), frame.turnId, { owns });
       }
-      try { afterRecovered?.(); }
+      try { scheduled.afterRecovered?.(); }
       catch (error) { logger.warn(`[${tag(ds)}] composer recovery completion hook failed: ${String(error)}`); }
     }, delayMs);
     timer.unref();
-    composerRecoveryRetries.set(ds, { timer, owns, ...(afterRecovered ? { afterRecovered } : {}) });
+    composerRecoveryRetries.set(ds, { timer, owns, ...(completion ? { afterRecovered: completion } : {}) });
   };
   schedule();
 }
