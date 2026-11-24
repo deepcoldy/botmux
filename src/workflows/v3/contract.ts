@@ -336,6 +336,9 @@ export interface RunNodeResult {
      *  failed). Never authorizes an automatic replay. */
     retryable?: boolean;
   };
+  /** Root cause of a process failure (CLI error, timeout, exit code), used to
+   *  lead the node's message when no valid manifest was written. */
+  failureDetail?: string;
 }
 
 export interface RuntimeAttestation {

@@ -180,6 +180,43 @@ export function apiErrorMessageText(ev: TranscriptEvent): string {
   return '';
 }
 
+/** Claude Code's `/goal` clears itself after an API failure it will not retry
+ *  (its own backoff for transient errors runs before this) and records it as
+ *  `{type:"system", subtype:"informational", content:"Goal cleared after an
+ *  unrecoverable error (<label>): …"}`. Returns that notice, else undefined. */
+export function claudeGoalAbortNotice(ev: TranscriptEvent | null | undefined): string | undefined {
+  if (!ev || typeof ev !== 'object' || ev.type !== 'system' || ev.isSidechain === true) return undefined;
+  const content = (ev as { content?: unknown }).content;
+  if (typeof content !== 'string') return undefined;
+  return /^Goal cleared after an unrecoverable error\b/.test(content) ? content : undefined;
+}
+
+/** Follows one main transcript for a goal abort. Remembers the latest API-error
+ *  text (the record Claude writes right before clearing the goal, e.g.
+ *  "Please run /login · API Error: 403") and yields a single failure message
+ *  naming both once the goal is cleared; nothing after that. */
+export class ClaudeGoalAbortWatch {
+  private lastApiError: string | undefined;
+  private reported = false;
+
+  observe(events: readonly TranscriptEvent[]): string | undefined {
+    if (this.reported) return undefined;
+    for (const ev of events) {
+      if (!ev || typeof ev !== 'object' || ev.isSidechain === true) continue;
+      if (ev.type === 'assistant') {
+        // A real reply after an error means that error was recovered from.
+        this.lastApiError = ev.isApiErrorMessage === true ? apiErrorMessageText(ev).trim() || this.lastApiError : undefined;
+        continue;
+      }
+      const notice = claudeGoalAbortNotice(ev);
+      if (!notice) continue;
+      this.reported = true;
+      return this.lastApiError ? `${notice} Cause: ${this.lastApiError}` : notice;
+    }
+    return undefined;
+  }
+}
+
 /** Kind of automatic model switch Claude Code recorded, mapped from the raw
  *  `type:"system"` subtype so the card copy can branch on one stable value. */
 export type ClaudeModelFallbackKind = 'refusal' | 'unavailable' | 'consent';

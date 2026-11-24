@@ -1487,6 +1487,63 @@ describe('workflow node startup: folder trust and startup blockers', () => {
   });
 });
 
+describe('workflow node failure detail', () => {
+  const pool = (worker: ScriptedWorker) => createEphemeralPool({
+    factory: factoryFor(worker), workerPath: '/tmp/worker.js', quiesceMs: 1, resolveLarkAppSecret: () => 'secret',
+  });
+
+  it('fails at once on a worker error and keeps its message as the root cause', async () => {
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode({ ...request(), timeoutMs: 1_800_000 });
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'error', message: 'Goal cleared after an unrecoverable error (model unavailable)' });
+    await waitFor(() => worker.closeRequests === 1);
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({
+      status: 'fail', failureDetail: 'Goal cleared after an unrecoverable error (model unavailable)',
+    });
+  });
+
+  it('names a non-zero CLI exit', async () => {
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode(request());
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'claude_exit', code: 2, signal: null });
+    await waitFor(() => worker.closeRequests === 1);
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'fail', failureDetail: 'CLI exited code=2 signal=null' });
+  });
+
+  it('names the exit code of a worker that died without a claimed outcome', async () => {
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode(request());
+    await worker.waitForInit();
+    worker.emitExit(9);
+    await expect(running).resolves.toMatchObject({ status: 'fail', failureDetail: 'worker exited code=9' });
+  });
+
+  it('names the node deadline when it expires', async () => {
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode({ ...request(), timeoutMs: 20 });
+    await worker.waitForInit();
+    await waitFor(() => worker.closeRequests === 1);
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'fail', failureDetail: 'node timed out after 0s' });
+  });
+
+  it('carries no failure detail on success', async () => {
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode(request());
+    await worker.waitForInit();
+    worker.emitExit(0);
+    const result = await running;
+    expect(result.status).toBe('ok');
+    expect(result.failureDetail).toBeUndefined();
+  });
+});
+
 function request(): RunNodeRequest {
   const attemptDir = join(dir, 'research', 'attempts', '001');
   return {

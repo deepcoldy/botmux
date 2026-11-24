@@ -3570,6 +3570,9 @@ export async function runWorkflow(
           // the worker crash is the root cause; otherwise it's a bad manifest.
           errorClass = result.status === 'ok' ? 'manifestInvalid' : 'workerError';
           message = (verdict.problems ?? ['manifest missing or invalid']).join('; ');
+          // Lead with the process root cause: "manifest not readable" alone
+          // hides e.g. a CLI that aborted its goal on an unavailable model.
+          if (result.status === 'fail' && result.failureDetail) message = `${result.failureDetail}; ${message}`;
         } else {
           // Manifest is structurally valid but declares failure (or the
           // process failed despite an ok manifest) — surface the node's own

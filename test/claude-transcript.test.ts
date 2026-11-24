@@ -35,6 +35,8 @@ import {
   classifyClaudeTerminalEvent,
   isSyntheticNoModelReplyEvent,
   apiErrorMessageText,
+  claudeGoalAbortNotice,
+  ClaudeGoalAbortWatch,
   transcriptShowsTurnDurationMarker,
   transcriptHoldsConversation,
   absorbedInputReplyText,
@@ -2417,5 +2419,39 @@ describe('AbsorbedReplyCollector (live feed)', () => {
     expect(c.feed(ev('a3', { type: 'tool_use', id: 't2', name: 'Bash', input: {} }))).toBe(true);
     expect(c.feed(ev('a4', { type: 'text', text: 'later narration' }))).toBe(true);
     expect(c.reply()).toEqual({ text: 'it is gpt-6-astra', lastUuid: 'a2', source: 'thinking' });
+  });
+});
+
+describe('Claude /goal abort record', () => {
+  // Shape of the records Claude Code writes when it gives up a goal: the API
+  // error reply, then the system notice that clears the goal.
+  const apiError = {
+    type: 'assistant', isApiErrorMessage: true, error: 'authentication_failed', apiErrorStatus: 403, isSidechain: false,
+    message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: 'Please run /login · API Error: 403 Forbidden' }] },
+  } as TranscriptEvent;
+  const cleared = {
+    type: 'system', subtype: 'informational', level: 'warning', isMeta: false, isSidechain: false,
+    content: 'Goal cleared after an unrecoverable error (authentication failed): "Read $BOTMUX_GOAL_PATH…". Run /goal again to continue.',
+  } as TranscriptEvent;
+
+  it('recognizes only the main-thread system notice', () => {
+    expect(claudeGoalAbortNotice(cleared)).toBe((cleared as any).content);
+    expect(claudeGoalAbortNotice({ ...cleared, content: 'Goal set: write the report' } as TranscriptEvent)).toBeUndefined();
+    expect(claudeGoalAbortNotice({ ...cleared, isSidechain: true } as TranscriptEvent)).toBeUndefined();
+    expect(claudeGoalAbortNotice({ type: 'user', message: { content: (cleared as any).content } } as TranscriptEvent)).toBeUndefined();
+    expect(claudeGoalAbortNotice(undefined)).toBeUndefined();
+  });
+
+  it('reports the abort once, naming the API error that caused it', () => {
+    const watch = new ClaudeGoalAbortWatch();
+    expect(watch.observe([apiError])).toBeUndefined();
+    expect(watch.observe([cleared])).toBe(`${(cleared as any).content} Cause: Please run /login · API Error: 403 Forbidden`);
+    expect(watch.observe([apiError, cleared])).toBeUndefined();
+  });
+
+  it('does not blame an API error the CLI already recovered from', () => {
+    const watch = new ClaudeGoalAbortWatch();
+    const reply = { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'working' }] } } as TranscriptEvent;
+    expect(watch.observe([apiError, reply, cleared])).toBe((cleared as any).content);
   });
 });

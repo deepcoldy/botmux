@@ -164,6 +164,25 @@ describe('runWorkflow — research→summarize 最小闭环', () => {
     }
   });
 
+  it('process failure without a manifest leads the nodeFailed message with its root cause', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-detail-'));
+    try {
+      const runNode: RunNode = async (req) => ({
+        status: 'fail',
+        manifestPath: join(req.attemptDir, 'manifest.json'),
+        failureDetail: 'Goal cleared after an unrecoverable error (model unavailable)',
+      });
+      const deps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot };
+      const outcome = await runWorkflow(validateDag(TWO_NODE), deps, { baseDir: base });
+      if (outcome.reason !== 'terminal') throw new Error('expected terminal outcome');
+      const failed = readJournal(join(outcome.runDir, 'journal.ndjson')).find((e) => e.type === 'nodeFailed') as any;
+      expect(failed.errorClass).toBe('workerError');
+      expect(failed.message).toMatch(/^Goal cleared after an unrecoverable error \(model unavailable\); ./);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('retryable pool error (CLI startup dialog) blocks for a manual retry, never replays on its own', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-startup-recovery-'));
     const dag = validateDag({ runId: 'startup-recovery', nodes: [TWO_NODE.nodes[0]] });

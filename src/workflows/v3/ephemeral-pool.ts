@@ -390,7 +390,7 @@ async function runNodeImpl(
 
   return new Promise<RunNodeResult>((resolve) => {
     let settled = false;
-    let pendingResult: { status: 'ok' | 'fail'; reason: string; error?: RunNodeResult['error'] } | undefined;
+    let pendingResult: { status: 'ok' | 'fail'; reason: string; detail?: string; error?: RunNodeResult['error'] } | undefined;
     let quiesceTimer: NodeJS.Timeout | undefined;
     let sigtermTimer: NodeJS.Timeout | undefined;
     let sigkillTimer: NodeJS.Timeout | undefined;
@@ -442,7 +442,7 @@ async function runNodeImpl(
     }
 
     const hardDeadline = setTimeout(() => {
-      finish('fail', 'timeout');
+      finish('fail', 'timeout', { detail: `node timed out after ${Math.round(req.timeoutMs / 1000)}s` });
     }, req.timeoutMs);
 
     function sessionInfo(): WorkerSessionInfo {
@@ -489,10 +489,20 @@ async function runNodeImpl(
       worker.send({ type: 'close', ...(controller ? { sessionCommand: { version: 2, runtime: controller.currentRuntime(), operationId: operation?.operationId } } : {}) });
     }
 
-    function finish(status: RunNodeResult['status'], reason: string, error?: RunNodeResult['error']): void {
+    /** `detail` is the human-readable root cause kept for a failure that
+     *  leaves no manifest; `error` is a precise pool error (wins over both). */
+    function finish(
+      status: RunNodeResult['status'],
+      reason: string,
+      outcome: { detail?: string; error?: RunNodeResult['error'] } = {},
+    ): void {
       if (settled || cancelRequested || pendingResult) return;
       if (status === 'cancelled') return;
-      pendingResult = { status, reason, ...(error ? { error } : {}) };
+      pendingResult = {
+        status, reason,
+        ...(outcome.detail ? { detail: outcome.detail } : {}),
+        ...(outcome.error ? { error: outcome.error } : {}),
+      };
       void appendLine(stderrPath(req), `[v3] worker outcome claimed status=${status} reason=${reason}; waiting for worker exit`);
       requestWorkerExit();
     }
@@ -644,16 +654,17 @@ async function runNodeImpl(
               retryable: true,
             };
             void appendLine(stderrPath(req), `[v3] ${error.code}: ${event.message}`);
-            finish('fail', 'startup-blocked', error);
+            finish('fail', 'startup-blocked', { error });
           }
           break;
         case 'error':
           void appendLine(stderrPath(req), `[worker] ${event.message}`);
-          finish('fail', 'worker-error');
+          finish('fail', 'worker-error', { detail: event.message });
           break;
         case 'claude_exit':
           void appendLine(stderrPath(req), `[worker] cli exit code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}`);
-          finish(event.code === 0 ? 'ok' : 'fail', 'cli-exit');
+          finish(event.code === 0 ? 'ok' : 'fail', 'cli-exit',
+            { detail: `CLI exited code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}` });
           break;
       }
     };
@@ -661,7 +672,7 @@ async function runNodeImpl(
 
     forwardWorkerError = (err) => {
       if (cancelRequested) return;
-      finish('fail', 'worker-process-error');
+      finish('fail', 'worker-process-error', { detail: `worker process error: ${err.message}` });
     };
     if (deferredWorkerError) {
       const err = deferredWorkerError;
@@ -705,10 +716,14 @@ async function runNodeImpl(
         void appendLine(stderrPath(req), `[v3] ${runtimeError.code}: ${runtimeError.message}`);
       }
       void appendLine(stderrPath(req), `[v3] worker closed status=${status} reason=${reason} code=${code ?? 'null'}`);
+      const failureDetail = workerStatus === 'fail'
+        ? pendingResult?.detail ?? `worker exited code=${code ?? 'null'}`
+        : undefined;
       resolve({
         status,
         manifestPath,
         sessionInfo: sessionInfo(),
+        ...(failureDetail ? { failureDetail } : {}),
         ...(runtime ? { runtime } : {}),
         ...((runtimeError ?? pendingResult?.error) ? { error: runtimeError ?? pendingResult?.error } : {}),
       });
