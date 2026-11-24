@@ -60,10 +60,9 @@ describe('checkCollabGateAdmission', () => {
     const g = gate({ phase: 'initializing' });
     const enqueued: string[] = [];
     const enqueueImpl = (_d: string, _c: string, item: any) => { enqueued.push(item.sourceMessageId); return true; };
-    const opts = { dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk, gate: g, sourceMessageId: 'om_1', enqueueImpl };
+    const opts = { dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk, gate: g, sourceMessageId: 'om_1', routingEvent: { text: 'hi' }, enqueueImpl, queuePositionImpl: () => 0 };
     const r1 = checkCollabGateAdmission(opts);
     expect(r1.kind).toBe('queue');
-    // 同 sourceMessageId 再入队不重复（由 enqueueCollabChatItem 去重，此处 seam 只记录调用）
     expect(enqueued).toEqual(['om_1']);
   });
 
@@ -191,7 +190,7 @@ describe('F3：queue 位置/去重/缺失 sourceMessageId', () => {
     const enqueued: string[] = [];
     const enqueueImpl = (_d: string, _c: string, item: any) => { enqueued.push(item.sourceMessageId); return true; };
     const queuePositionImpl = (_d: string, _c: string, _target: string, smid: string) => (enqueued.indexOf(smid) + 1) || 0;
-    const opts = { dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk, gate: g, sourceMessageId: 'om_1', enqueueImpl, queuePositionImpl };
+    const opts = { dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk, gate: g, sourceMessageId: 'om_1', routingEvent: { text: 'hi' }, enqueueImpl, queuePositionImpl };
     const r1 = checkCollabGateAdmission(opts);
     expect(r1.kind).toBe('queue');
     // 已入队后 positionImpl 返回 1，重复投递返回原位置
@@ -206,9 +205,55 @@ describe('F3：queue 位置/去重/缺失 sourceMessageId', () => {
     const r = checkCollabGateAdmission({
       dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk, gate: g,
       sourceMessageId: 'om_1',
+      routingEvent: { text: 'hi' },
       enqueueImpl: () => false,
       queuePositionImpl: () => 0,
     });
     expect(r.kind).toBe('reject');
+  });
+
+  it('R1：缺 routingEvent → reject（不返回 queue）', () => {
+    const g = gate({ phase: 'initializing' });
+    const r = checkCollabGateAdmission({
+      dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk, gate: g,
+      sourceMessageId: 'om_1',
+      enqueueImpl: () => true,
+      queuePositionImpl: () => 0,
+      // 不传 routingEvent
+    });
+    expect(r.kind).toBe('reject');
+  });
+});
+
+describe('R1/R2：真实 store 持久化契约', () => {
+  it('R1：真实 enqueueCollabChatItem 持久化 routingEvent 可回读', () => {
+    const g = gate({ phase: 'initializing' });
+    // 用真实 store（不注入 enqueueImpl/queuePositionImpl）
+    const r = checkCollabGateAdmission({
+      dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk, gate: g,
+      sourceMessageId: 'om_1',
+      routingEvent: { text: 'hello', sender: 'ou_u' },
+    });
+    expect(r.kind).toBe('queue');
+    const q = readCollabChatQueue(dataDir, CHAT);
+    expect(q.items).toHaveLength(1);
+    expect(q.items[0].routingEvent).toEqual({ text: 'hello', sender: 'ou_u' }); // 可序列化回读
+  });
+
+  it('R2：同 chat/source 双 target 各留一条记录，各自幂等', () => {
+    const g = gate({ phase: 'initializing', participants: { cli_a: { roleReady: false, kickoffState: 'pending', acceptingUserTasks: false }, cli_b: { roleReady: false, kickoffState: 'pending', acceptingUserTasks: false } } });
+    // 用真实 store（不注入 spy）
+    const rA = checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: 'cli_a', talk: allowedTalk, gate: g, sourceMessageId: 'om_shared', routingEvent: { text: 'a' } });
+    const rB = checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: 'cli_b', talk: allowedTalk, gate: g, sourceMessageId: 'om_shared', routingEvent: { text: 'b' } });
+    expect(rA.kind).toBe('queue');
+    expect(rB.kind).toBe('queue');
+    const q = readCollabChatQueue(dataDir, CHAT);
+    // 两条记录，各自 target
+    expect(q.items).toHaveLength(2);
+    expect(q.items.some(i => i.targetAppId === 'cli_a')).toBe(true);
+    expect(q.items.some(i => i.targetAppId === 'cli_b')).toBe(true);
+    // 各自重投幂等（不新增第三条）
+    checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: 'cli_a', talk: allowedTalk, gate: g, sourceMessageId: 'om_shared', routingEvent: { text: 'a' } });
+    expect(readCollabChatQueue(dataDir, CHAT).items).toHaveLength(2);
   });
 });

@@ -105,6 +105,10 @@ export function checkCollabGateAdmission(opts: CollabGateAdmissionOpts): CollabG
       // F3：queue 要求有效 sourceMessageId，否则不宣称 queue。
       const sourceMessageId = opts.sourceMessageId ?? '';
       if (!sourceMessageId) return { kind: 'reject', reason: 'gate_not_open_no_source' };
+      // R1：queue 新增项必须有可序列化的规范化 routingEvent，缺失 → reject（不返回 queue）。
+      if (opts.routingEvent === undefined || opts.routingEvent === null) {
+        return { kind: 'reject', reason: 'gate_queue_missing_event' };
+      }
       const now = (opts.now ?? Date.now)();
       const enqueue = opts.enqueueImpl ?? ((d, c, item) => enqueueCollabChatItem(d, c, item));
       const positionImpl = opts.queuePositionImpl ?? ((d, c, targetAppId, smid) =>

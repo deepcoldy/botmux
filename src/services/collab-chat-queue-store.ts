@@ -47,10 +47,14 @@ export function readCollabChatQueue(dataDir: string, chatId: string): CollabChat
   }
 }
 
-/** 入队（同 sourceMessageId 去重，返回是否新增）。 */
+/**
+ * 入队（按 (targetAppId, sourceMessageId) 复合键去重，返回是否新增）。
+ * R2：不同 participant（targetAppId）共享 dataDir/chatId 收同一 sourceMessageId 时，
+ * 必须各留一条记录，不能只按 sourceMessageId 去重。
+ */
 export function enqueueCollabChatItem(dataDir: string, chatId: string, item: CollabChatQueueItem): boolean {
   const q = readCollabChatQueue(dataDir, chatId);
-  if (q.items.some(i => i.sourceMessageId === item.sourceMessageId)) return false;
+  if (q.items.some(i => i.targetAppId === item.targetAppId && i.sourceMessageId === item.sourceMessageId)) return false;
   q.items.push(item);
   const fp = collabChatQueuePath(dataDir, chatId);
   mkdirSync(dirname(fp), { recursive: true });
@@ -58,10 +62,10 @@ export function enqueueCollabChatItem(dataDir: string, chatId: string, item: Col
   return true;
 }
 
-/** 标记投递状态（同 sourceMessageId 去重）。 */
-export function markCollabChatItemDelivered(dataDir: string, chatId: string, sourceMessageId: string, status: CollabQueueDeliveryStatus): void {
+/** 标记投递状态（按 (targetAppId, sourceMessageId) 复合键去重）。 */
+export function markCollabChatItemDelivered(dataDir: string, chatId: string, targetAppId: string, sourceMessageId: string, status: CollabQueueDeliveryStatus): void {
   const q = readCollabChatQueue(dataDir, chatId);
-  const item = q.items.find(i => i.sourceMessageId === sourceMessageId);
+  const item = q.items.find(i => i.targetAppId === targetAppId && i.sourceMessageId === sourceMessageId);
   if (!item) return;
   item.deliveryStatus = status;
   const fp = collabChatQueuePath(dataDir, chatId);
