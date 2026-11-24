@@ -84,7 +84,13 @@ export class SessionEventGateway {
             && !['succeeded', 'failed', 'cancelled'].includes(execution.phase)
             && !!sourceRuntime
             && this.store.runtimeContinues(this.session, sourceRuntime.ref, runtime, sourceRuntime.worker)));
-      if (!sameRuntime(execution.runtime, runtime) && !sameContinuedExecutionRuntime
+      // A physical exit belongs to the proven runtime/producer, not to an
+      // input admission. An argv opening prompt can still be queued here when
+      // the CLI exits before its first transcript start. Refusing that exit
+      // leaves the worker alive with backend=null and no daemon restart owner.
+      // Keep validating the execution reference above; never grant it runtime
+      // ownership merely because its process died.
+      if (type !== 'claude_exit' && !sameRuntime(execution.runtime, runtime) && !sameContinuedExecutionRuntime
         && !(!execution.runtime && (recovery || workerEvents.has(type) || unboundCurrent))) {
         return { kind: 'reject', reason: 'execution_scope_unproven' };
       }

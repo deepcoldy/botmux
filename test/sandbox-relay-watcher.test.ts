@@ -138,6 +138,43 @@ describe('sandbox relay watcher host handoff', () => {
     }
   });
 
+  it('supplies only the host-authorized live turn to a dispatch re-exec', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-turn-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'dispatch-turn-echo.mjs');
+    writeFileSync(fixture, `
+      process.stdout.write(JSON.stringify({
+        authorized: process.env.BOTMUX_HOST_RELAY_AUTHORIZED ?? null,
+        turnId: process.env.BOTMUX_TURN_ID ?? null,
+      }));
+    `);
+    const id = 'dispatch-turn';
+    writeFileSync(join(outbox, `${id}.content`), 'task');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      command: 'dispatch', contentFile: `${id}.content`,
+      flags: ['--bot-app', 'cli_target', '--into', 'om_existing'],
+    }));
+    const stop = startOutboxWatcher(outbox, {
+      ...process.env,
+      BOTMUX_HOST_RELAY_AUTHORIZED: '',
+      BOTMUX_TURN_ID: 'stale-inherited-turn',
+    }, 'forced-source', {
+      cliPath: fixture,
+      authorize: () => ({ ok: true as const, origin: { turnId: 'om_active_turn' } }),
+    });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code, response.stderr).toBe(0);
+      expect(JSON.parse(response.stdout)).toEqual({ authorized: '1', turnId: 'om_active_turn' });
+    } finally {
+      stop();
+    }
+  });
+
   it('rejects forged or legacy dispatch targets before spawning the host child', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-reject-'));
     roots.push(root);

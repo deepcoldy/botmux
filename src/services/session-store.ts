@@ -2987,6 +2987,8 @@ export function reactivateClosedSession(
   next.queuedActivationPending = undefined;
   next.queuedActivationToken = undefined;
   next.queuedActivationInput = undefined;
+  next.queuedActivationRawInput = undefined;
+  next.queuedActivationRawTurnId = undefined;
   next.queuedActivationTurnId = undefined;
   next.queuedActivationDispatchAttempt = undefined;
   next.queuedActivationResume = undefined;

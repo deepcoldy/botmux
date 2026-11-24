@@ -49,6 +49,8 @@ export function classifySetupOpenPlatformOutcome(
     || result.versionPendingReview
     || !result.redirectConfigured
     || result.redirectWarning
+    || Boolean(result.approvalDeferredScopes?.length)
+    || result.approvalDisabledRefreshToken === true
   );
   return { status: hasWarnings ? 'ready_with_warnings' : 'ready', result };
 }
@@ -72,6 +74,9 @@ export function setupOpenPlatformRetryCommand(
   appId: string,
   outcome: SetupOpenPlatformOutcome,
 ): string | undefined {
+  if (outcome.status !== 'skipped' && outcome.result.approvalDeferredPersistWarning) {
+    return `botmux setup configure ${appId}`;
+  }
   if (outcome.status !== 'failed') return undefined;
   const switchAccount = SESSION_RETRY_REASONS.has(outcome.result.reason) ? ' --switch-account' : '';
   return `botmux setup configure ${appId}${switchAccount}`;

@@ -25,7 +25,7 @@ vi.mock('../src/services/assistant-owner-store.js', () => ({
 vi.mock('../src/services/session-groups-store.js', () => ({ getSessionGroup: () => undefined }));
 vi.mock('../src/config.js', () => ({ config: { session: { get dataDir() { return state.dataDir; } } } }));
 
-import { assistantSessionStillOwned, decideAssistantAdmission, resolveAssistantSpawn } from '../src/core/assistant-spawn.js';
+import { assistantScheduleCreatorAllowed, assistantSessionStillOwned, isAssistantOwnerOfChat, decideAssistantAdmission, resolveAssistantSpawn } from '../src/core/assistant-spawn.js';
 import { inheritSessionLaunchConfiguration } from '../src/core/session-launch-inheritance.js';
 import { botToSnapshot } from '../src/workflows/v3/bot-resolve.js';
 import { assertNotAssistantModeBot } from '../src/workflows/v3/ephemeral-pool.js';
@@ -56,6 +56,29 @@ describe('resolveAssistantSpawn', () => {
   it('mode off → off', () => {
     state.assistantMode = false;
     expect(resolveAssistantSpawn('cli_app', 'oc_dm', 'p2p', A)).toEqual({ kind: 'off' });
+  });
+});
+
+describe('assistantScheduleCreatorAllowed (target-chat owner)', () => {
+  it('admits only the target chat owner; an unclaimed group admits nobody; mode off admits everyone', () => {
+    expect(assistantScheduleCreatorAllowed('cli_app', 'oc_g', 'group', A)).toBe(false);
+    state.stored = A;
+    expect(assistantScheduleCreatorAllowed('cli_app', 'oc_g', 'group', A)).toBe(true);
+    expect(assistantScheduleCreatorAllowed('cli_app', 'oc_g', 'group', B)).toBe(false);
+    expect(assistantScheduleCreatorAllowed('cli_app', 'oc_g', 'group', undefined)).toBe(false);
+    expect(assistantScheduleCreatorAllowed('cli_app', 'oc_dm', 'p2p', B)).toBe(true);
+    state.assistantMode = false;
+    expect(assistantScheduleCreatorAllowed('cli_app', 'oc_g', 'group', B)).toBe(true);
+  });
+  it('isAssistantOwnerOfChat is true only for the current owner while the mode is on', () => {
+    expect(isAssistantOwnerOfChat('cli_app', 'oc_g', 'group', A)).toBe(false);
+    state.stored = A;
+    expect(isAssistantOwnerOfChat('cli_app', 'oc_g', 'group', A)).toBe(true);
+    expect(isAssistantOwnerOfChat('cli_app', 'oc_g', 'group', B)).toBe(false);
+    expect(isAssistantOwnerOfChat('cli_app', 'oc_g', 'group', undefined)).toBe(false);
+    expect(isAssistantOwnerOfChat('cli_app', 'oc_dm', 'p2p', B)).toBe(true);
+    state.assistantMode = false;
+    expect(isAssistantOwnerOfChat('cli_app', 'oc_g', 'group', A)).toBe(false);
   });
 });
 

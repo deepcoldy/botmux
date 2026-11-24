@@ -67,8 +67,8 @@ export interface TranscriptEvent {
     stop_reason?: string | null;
     /** Model that actually served this reply (e.g. `claude-opus-4-8`). Claude
      *  Code writes the placeholder `<synthetic>` on records no model produced:
-     *  API-error records (`isApiErrorMessage:true`) and the bridge-resume
-     *  placeholder (`isApiErrorMessage:false`, text "No response requested.",
+     *  API-error records (`isApiErrorMessage:true`), local tool calls, and the
+     *  bridge-resume placeholder (`isApiErrorMessage:false`, text "No response requested.",
      *  usage all zero, no `requestId`) — see {@link isSyntheticNoModelReplyEvent}. */
     model?: string;
     /** API usage of the request this assistant record answers. */
@@ -586,6 +586,15 @@ function withProviderRetryHint(
 /** Model placeholder Claude Code writes on assistant records no model produced. */
 export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
 
+/** Any non-API-error assistant record Claude Code wrote locally, regardless of
+ *  its content shape. Provider-success accounting must exclude all of these;
+ *  turn-terminal classification narrows this further for local tool calls. */
+export function isSyntheticAssistantRecord(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object' || ev.isApiErrorMessage === true) return false;
+  const role = ev.message?.role ?? ev.type;
+  return role === 'assistant' && ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
+}
+
 /**
  * A `type:"assistant"` record that Claude Code wrote WITHOUT calling the model
  * and WITHOUT flagging it as an API error. Observed shape (Claude Code 2.1.263,
@@ -604,14 +613,12 @@ export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
  * the user's message was never answered. Treating it as `completed` closes the
  * Lark turn silently (measured: 53 such records across 26 local sessions, 39 of
  * them directly after a Lark-delivered user message, none surfaced anywhere).
- * Only `message.model` distinguishes it from a real reply.
+ * Claude also uses `<synthetic>` for local tool calls. Their `tool_use` blocks
+ * keep the logical turn open even when stamped with `stop_sequence`.
  */
 export function isSyntheticNoModelReplyEvent(ev: TranscriptEvent | null | undefined): boolean {
-  if (!ev || typeof ev !== 'object') return false;
-  if (ev.isApiErrorMessage === true) return false;
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'assistant') return false;
-  return ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
+  if (!ev || !isSyntheticAssistantRecord(ev)) return false;
+  return !hasToolUseBlock(ev);
 }
 
 export function classifyClaudeTerminalEvent(
@@ -670,12 +677,7 @@ export function classifyClaudeTerminalEvent(
   if (isSyntheticNoModelReplyEvent(ev)) {
     return { status: 'failed', errorCode: 'provider_no_model_reply', retryable: true };
   }
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'assistant') return undefined;
-  const reason = ev.message?.stop_reason;
-  if (typeof reason !== 'string' || reason.length === 0
-    || reason === 'tool_use' || reason === 'pause_turn') return undefined;
-  return { status: 'completed' };
+  return isClaudeTurnTerminalEvent(ev) ? { status: 'completed' } : undefined;
 }
 
 /**
@@ -700,6 +702,8 @@ export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
   if (isClaudeTurnDurationEvent(ev)) return true;
   const role = ev.message?.role ?? ev.type;
   if (role !== 'assistant') return false;
+  if (ev.isApiErrorMessage !== true && ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER
+    && hasToolUseBlock(ev)) return false;
   const reason = ev.message?.stop_reason;
   return typeof reason === 'string'
     && reason.length > 0
@@ -1277,7 +1281,7 @@ export class ClaudeModelRequestClock {
   /** Start and completion of a main-thread assistant record that proves a
    *  served request; undefined for any other record. */
   private servedRequest(ev: TranscriptEvent): { startedAt: number; completedAt: number } | undefined {
-    if (ev.type !== 'assistant' || ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) return undefined;
+    if (ev.type !== 'assistant' || ev.isApiErrorMessage === true || isSyntheticAssistantRecord(ev)) return undefined;
     const usage = ev.message?.usage;
     const tokens = (usage?.input_tokens ?? 0) + (usage?.cache_read_input_tokens ?? 0) + (usage?.cache_creation_input_tokens ?? 0);
     if (!(tokens > 0)) return undefined;

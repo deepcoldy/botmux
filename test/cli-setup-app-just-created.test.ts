@@ -151,4 +151,49 @@ describe('obtainCredentials 的 appJustCreated 信号', () => {
       expect(creds.appJustCreated).toBeFalsy();
     }
   });
+
+  it('网页创建 1.0.0 尊重显式 autoAvoidApproval=false，不被 appJustCreated 默认值覆盖', async () => {
+    mocks.createFeishuOpenPlatformApp.mockResolvedValue({ ok: true, appId: 'cli_web_optout', appSecret: 'web-secret' });
+
+    const creds = await obtainCredentials(fakeRl(['', '']), { autoAvoidApproval: false });
+
+    expect(mocks.createFeishuOpenPlatformApp).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      autoAvoidApproval: false,
+    }));
+    expect(creds.ok).toBe(true);
+  });
+
+  it('网页创建 1.0.0 触发审批兼容时透传 approvalDeferredScopes 与审批人信息给后续 1.0.1', async () => {
+    mocks.createFeishuOpenPlatformApp.mockResolvedValue({
+      ok: true,
+      appId: 'cli_web_compat',
+      appSecret: 'web-secret',
+      approvalDeferredScopes: [
+        { bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' },
+      ],
+      approvalDisabledRefreshToken: true,
+      approvalCompatibility: {
+        triggered: true,
+        resolvedAutoApproved: true,
+        deferredScopes: [{ bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' }],
+        disabledRefreshToken: true,
+        initialHumanApprovers: ['张审核'],
+        remainingHumanApprovers: [],
+        probeCount: 2,
+        stopReason: 'resolved_exact',
+      },
+    });
+
+    const creds = await obtainCredentials(fakeRl(['', '']));
+    expect(creds).toMatchObject({
+      ok: true,
+      appId: 'cli_web_compat',
+      appJustCreated: true,
+      approvalDeferredScopes: [
+        { bucket: 'user', name: 'offline_access', isolation: 'exact', group: 'offline_access' },
+      ],
+      approvalDisabledRefreshToken: true,
+      approvalInitialApprovers: ['张审核'],
+    });
+  });
 });

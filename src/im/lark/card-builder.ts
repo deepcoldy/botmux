@@ -1213,6 +1213,8 @@ export function buildStreamingCard(
   codexAppStopTarget?: string,
   /** Default true preserves the current card; false restores the pre-folding layout. */
   foldedLayout = true,
+  /** Safe daemon-owned startup diagnosis (never raw terminal output). */
+  startupFailureReason?: string,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1228,6 +1230,8 @@ export function buildStreamingCard(
   const recoveryWait = recoveryWaitLabel(status, silentIdle) !== undefined;
 
   const elements: any[] = [];
+
+  if (startupFailureReason) elements.push({ tag: 'markdown', content: startupFailureReason });
 
   // ── Output body (shared with the private snapshot card) ──────────────────
   pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable, activity: silentIdle });

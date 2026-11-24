@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isCliStartupFailure } from './core/cli-startup-failure.js';
 import { fingerprintPromptText } from './services/prompt-context-store.js';
 import { readLatestNativeGoal, readNativeGoalForRollout } from './services/native-goal-state.js';
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
@@ -442,6 +443,7 @@ import {
 } from './services/claude-bridge-blind-turn.js';
 import { terminalInputSubmits, wrapBracketedPaste } from './adapters/cli/tui-input.js';
 import { WebTerminalInputController, WebTerminalInputWireState } from './core/web-terminal-input-controller.js';
+import { isTerminalColorQueryOnly } from './core/terminal-color-query.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
@@ -3530,6 +3532,8 @@ let spawnArgvNeedsWorkingSeed = false;
  * markPromptReady holds ready + re-arms instead of seeding working→idle.
  */
 let spawnArgvTurnStartEvidenceSeen = false;
+/** Real native input evidence, not a quiescence/timeout-derived ready edge. */
+let startupNativeInputSeen = false;
 /** Rolling ANSI-stripped PTY tail scanned for busyPattern while the argv
  *  first-turn evidence gate is armed; dropped once evidence latches. */
 let spawnArgvTurnStartBusyScanTail = '';
@@ -3975,6 +3979,9 @@ let initialInputOwnershipPending = false;
  * cancellation; this gate prevents new input or an old idle callback from
  * crossing that teardown fence. */
 let cliRestartInProgress = false;
+/** Invalidates delayed respawns when the daemon opens the startup circuit. */
+let cliRestartEpoch = 0;
+let cancelPendingCliRestart: (() => void) | undefined;
 /** Raw slash commands require a real prompt and cannot use the ordinary
  * type-ahead fallback. Keep them fenced across an owned restart until the
  * replacement generation reaches its prompt. */
@@ -10744,6 +10751,22 @@ let thinkingEntries: CotEntry[] = [];
 let thinkingTotalChars = 0;
 let thinkingCapNoted = false;
 
+/** Whether an entry has the fields its kind promises. Entries are parsed from
+ *  CLI transcripts, so the type is not a guarantee: a missing string would throw
+ *  in `cotEntryChars`, and an unknown kind would make the running total NaN and
+ *  switch off the accumulated cap. */
+function cotEntryWellFormed(entry: CotEntry): boolean {
+  const e = entry as Partial<Record<string, unknown>> | null;
+  switch (e?.kind) {
+    case 'thinking':
+    case 'text': return typeof e.text === 'string';
+    case 'tool_call': return typeof e.name === 'string' && typeof e.args === 'string'
+      && (e.subject === undefined || typeof e.subject === 'string');
+    case 'tool_result': return typeof e.result === 'string';
+    default: return false;
+  }
+}
+
 function cotEntryChars(e: CotEntry): number {
   switch (e.kind) {
     case 'thinking': return e.text.length;
@@ -10804,12 +10827,13 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   // exists, so `bridge-fallback-gate` deliberately does NOT strip it there and
   // the reply card shows it verbatim. Stripping it from the bubble alone would
   // make the two messages of one turn contradict each other.
-  // Both paths drop a text entry without text: counting it would throw out of
-  // the transcript drain and lose the rest of the turn's activity.
+  // Both paths drop a malformed entry: counting it would throw out of the
+  // transcript drain and lose the rest of the turn's activity.
   const adoptMode = lastInitConfig?.adoptMode === true;
+  const wellFormed = entries.filter(cotEntryWellFormed);
   const kept = adoptMode
-    ? entries.filter(entry => entry.kind !== 'text' || typeof entry.text === 'string')
-    : entries.flatMap(entry => {
+    ? wellFormed
+    : wellFormed.flatMap(entry => {
       const withoutSentinel = cotEntryWithoutSentinel(entry);
       return withoutSentinel ? [withoutSentinel] : [];
     });
@@ -11014,6 +11038,7 @@ codexBridgeQueue.setCotObserver((entries, turn) => {
 // Same evidence for the structured bridges (Pi, TraeX, Grok, …): the turn's
 // own user record is in the CLI's transcript.
 codexBridgeQueue.setTurnStartObserver((turn) => {
+  startupNativeInputSeen = true;
   if (!turn.isLocal) inflightInputs.onTurnStarted(turn.turnId);
 });
 // Codex mid-turn replies: whenever the model says something to a Lark turn and
@@ -18244,6 +18269,54 @@ function armFirstPromptTimeoutPromptSeed(
   postHookEvidenceFallbackTimer.unref?.();
 }
 
+/** Stop only after a confirmed exit. Pending ordinary inputs have no other
+ * replay owner; terminalize them before a later message starts a fresh batch.
+ * Durable attempts were handed to the daemon at onExit and are not replayed. */
+function stopStartupFailedInputs(): void {
+  if (backend) return;
+  ++cliRestartEpoch;
+  const cancelRestart = cancelPendingCliRestart;
+  cancelPendingCliRestart = undefined;
+  cancelRestart?.();
+  if (tmuxRestartTimer) { clearTimeout(tmuxRestartTimer); tmuxRestartTimer = null; }
+  cliRestartInProgress = false;
+  replacementSpawnInProgress = false;
+  stopScreenUpdates();
+  stopStuckDetector();
+  stopSpawnArgvTurnStartFailOpen();
+  crashDiagnosticStopped = true;
+  const queued = pendingMessages.splice(0);
+  // Tokened activations still belong to the daemon's durable journal. These
+  // queues contain unwritten inputs only: retain their exact payload/token
+  // for the next authorized restart, never fabricate a submission ACK or let
+  // a newer ordinary message overtake the opening.
+  pendingMessages.push(...queued.filter(item => item.queuedActivationToken));
+  const carried = [...inflightInputs.takeCarryOver(), ...inflightInputs.takeStartedCarryOver()];
+  const activationNeedsReconciliation = carried.some(item => item.queuedActivationToken);
+  const failed = [...queued.filter(item => !item.queuedActivationToken), ...carried];
+  const rawActivations = pendingRawInputs.filter(item => item.queuedActivationToken);
+  pendingRawInputs.splice(0, pendingRawInputs.length, ...rawActivations);
+  let terminalSendFailed = false;
+  for (const item of failed) {
+    if (item.turnId && item.dispatchAttempt === undefined && !item.queuedActivationToken) {
+      try {
+        emitTurnTerminal(item.turnId, 'failed', 'cli_startup_failed', undefined, undefined, false);
+      } catch { terminalSendFailed = true; }
+    }
+  }
+  log(`Startup circuit stopped ${failed.length} pending/in-flight input(s)`);
+  if (terminalSendFailed || activationNeedsReconciliation) {
+    // A tokened carry-over may still be awaiting its adapter's submission
+    // result. Neither drop its owner nor blindly replay a possibly committed
+    // write in this live worker. Exit so the existing worker-loss / exact
+    // activation journal recovery owns the next attempt. The same boundary
+    // reconciles commit-unknown ordinary terminal publication.
+    void sendFatalWorkerErrorAndExit(new Error(activationNeedsReconciliation
+      ? 'Startup circuit activation submission requires reconciliation'
+      : 'Startup circuit terminal publication failed'));
+  }
+}
+
 function crashDiagnosticPath(): string | undefined {
   const dataDir = process.env.SESSION_DATA_DIR;
   if (!dataDir || !sessionId) return undefined;
@@ -22814,7 +22887,8 @@ function onPtyData(data: string, isLiveStream = true): void {
 function handlePtyDataChunk(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
-  backendScreenRevision += 1;
+  const colorQueryOnly = lastInitConfig?.cliId === 'traex' && isTerminalColorQueryOnly(data);
+  if (!colorQueryOnly) backendScreenRevision += 1;
   lastPtyActivityAtMs = Date.now();
   maybeReportDeferredTopicMaterialization(data);
   maybeCaptureKiroSessionId(data);
@@ -22876,6 +22950,11 @@ function handlePtyDataChunk(data: string): void {
       if (ws.readyState === WebSocket.OPEN) ws.send(data);
     }
   }
+
+  // A query is still relayed unchanged (xterm must answer it), and counts as
+  // process activity, but not as a redraw or new idle-detection evidence.
+  // Otherwise the 1s OSC 11 poll starves the 2s first-prompt quiet window.
+  if (colorQueryOnly) return;
 
   if (handleVisibleStartupInteraction(data)) return;
 
@@ -23238,6 +23317,7 @@ function argvSubmissionRecorded(evidence: NonNullable<typeof spawnArgvSubmission
  *  re-kick immediately. (The PTY busyPattern latch needs no re-kick: busy
  *  output implies a later quiescence edge that re-drives markPromptReady.) */
 function noteSpawnArgvTurnStartTranscriptEvidence(events: readonly { kind: string }[]): void {
+  if (events.some(ev => ev.kind === 'user' || ev.kind === 'assistant_final')) startupNativeInputSeen = true;
   // The whole evidence mechanism is Pi-scoped (matching the onPtyData busy
   // scan and spawnArgvTurnStartGateHolds); this generic ingest path also
   // serves Grok — another argv-baked + structured-bridge + type-ahead CLI —
@@ -28302,6 +28382,7 @@ async function spawnCliBody(
   const spawnGeneration = ++cliSpawnGeneration;
   localProtectedMcpContainmentActiveCapabilityIds = [];
   const spawnStartedAtMs = Date.now();
+  startupNativeInputSeen = false;
   claudeEffortNotBeforeMs = spawnStartedAtMs;
   claudeEffortObserver.reset();
   terminalEffortTracker.reset();
@@ -35173,6 +35254,16 @@ async function spawnCliBody(
     // server (or hc core) joins ONE backend outage instead of counting as a
     // CLI crash.
     const serverLoss = intentionalRestart ? undefined : observedBackend.exitedBecauseServerLost?.();
+    const startupFailure = isCliStartupFailure({
+      code,
+      fresh: !intentionalRestart && !actuallyReattachedPersistent && !lastInitConfig?.adoptMode,
+      ready: !freshCliNeverReady(),
+      argvTurnUnstarted: spawnArgvNeedsWorkingSeed && !spawnArgvTurnStartEvidenceSeen,
+      elapsedMs: Date.now() - spawnStartedAtMs,
+      nativeInputSeen: startupNativeInputSeen,
+      structuredInputWaiting: isStructuredBridgeLifecycleBlockingCli(lastInitConfig?.cliId)
+        && (pendingMessages.length > 0 || inflightInputs.hasUnacked()),
+    });
     if (codexAutoUpgrade) {
       backend = null;
       revokePromptReadiness();
@@ -35348,6 +35439,9 @@ async function spawnCliBody(
       settleFailedTurnRewindOffQueue('dropped on a CLI exit', true);
     }
     backend = null;
+    stopScreenUpdates();
+    stopStuckDetector();
+    stopSpawnArgvTurnStartFailOpen();
     revokePromptReadiness();
     setCaptureIdentity(undefined, undefined);
     currentBotmuxLinkRefMode = undefined;
@@ -35370,7 +35464,7 @@ async function spawnCliBody(
       log('Suppressed claude_exit for intentional in-worker restart');
     } else {
       const sandboxNamespace = code !== 0 ? sandboxNamespaceDiagnosis(logTail) : undefined;
-      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt,
+      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, startupFailure, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt,
         ...(serverLoss ? { backendLost: { ...serverLoss, backend: serverLoss.backend ?? 'tmux' } } : {}),
         ...(lastInitConfig?.cliId === 'traex' ? { traexStartupFailure: freshCliNeverReady() } : {}),
         ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}), ...(sandboxNamespace ? { sandboxNamespace } : {}) });
@@ -35902,12 +35996,14 @@ async function restartCliProcess(
     onRespawnSettled?: (result: 'spawned' | 'failed' | 'superseded') => void;
   } = {},
 ): Promise<void> {
+  let restartEpoch: number | undefined;
   let respawnSettled = false;
   const settleRespawn = (result: 'spawned' | 'failed' | 'superseded'): void => {
-    if (respawnSettled || !opts.onRespawnSettled) return;
+    if (respawnSettled) return;
     respawnSettled = true;
+    if (restartEpoch === cliRestartEpoch) cancelPendingCliRestart = undefined;
     try {
-      opts.onRespawnSettled(result);
+      opts.onRespawnSettled?.(result);
     } catch (err) {
       log(`onRespawnSettled failed (${reason}): ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -35927,6 +36023,8 @@ async function restartCliProcess(
     settleRespawn('failed');
     return;
   }
+  restartEpoch = ++cliRestartEpoch;
+  cancelPendingCliRestart = () => settleRespawn('superseded');
   // Invalidate queued/deferred callbacks before async teardown begins. Waiting
   // until killCli/spawnCli would leave a window where an old timer can mutate
   // the next durable attempt while destroySession is still awaiting.
@@ -35967,6 +36065,7 @@ async function restartCliProcess(
   }
   const restart = async (): Promise<void> => {
     try {
+      if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
       tmuxRestartTimer = null;
       // Capture the RPC thread id before destroySession()/killCli() tears down
       // the engine and clears remoteThreadId. The replacement app-server must
@@ -36007,6 +36106,7 @@ async function restartCliProcess(
             setTimeout(() => resolve({ kind: 'timeout' }), 22_000)),
         ]);
       }
+      if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
       const teardownVerdict = classifyRestartTeardown(teardownOutcome, {
         remote: isRemoteBackendType(effectiveBackendType),
       });
@@ -36054,8 +36154,10 @@ async function restartCliProcess(
       // A normal restart cannot observe activity from the retired process.
       // Only capacity-model rotation carries that waiting latch forward.
       traexAutoModelController?.noteProcessExited(opts.restartCause === 'traex-auto-model');
+      if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
       awaitingFirstPrompt = true;
       setTimeout(async () => {
+        if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
         let spawnedWorkingDir: string | undefined;
         let spawnedLaunch: RestartLaunchSettings | undefined;
         if (lastInitConfig) {
@@ -36077,9 +36179,11 @@ async function restartCliProcess(
             if (codexRpcEligible(restartCfg, { sandboxForced: sandboxEnabled() })) {
               const adapter = createCliAdapterSync(restartCfg.cliId as CliId, restartCfg.cliPathOverride);
               await prepareCliPluginGenerationAndGateway(restartCfg, adapter);
+              if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
               rpcPluginGenerationPrepared = true;
               await engageCodexRpc(restartCfg);
             }
+            if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
             replacementSpawnInProgress = true;
             await spawnCli(restartCfg, {
               pluginGenerationPrepared: rpcPluginGenerationPrepared,
@@ -36087,12 +36191,15 @@ async function restartCliProcess(
               restartCause: opts.restartCause,
               reuseExistingScratchTree: opts.preserveScratchTreeForRespawn,
             });
+            if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
             if (traexAutoModelRuntimeEligible()) publishActiveRuntime({ model: restartCfg.model, reasoningEffort: restartCfg.reasoningEffort });
             await prepareCodexNativeTitleGeneration(restartCfg, codexRpcEngine);
+            if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
             replacementSpawnInProgress = false;
             if (codexRpcEngine) armRpcStartupDialogDismiss();
             settleRespawn('spawned');
           } catch (err) {
+            if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
             replacementSpawnInProgress = false;
             cliRestartInProgress = false;
             settleRespawn(err instanceof CliSpawnSupersededError ? 'superseded' : 'failed');
@@ -36103,6 +36210,7 @@ async function restartCliProcess(
         } else {
           settleRespawn('failed');
         }
+        if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
         cliRestartInProgress = false;
         replacementSpawnInProgress = false;
         // Release at the replacement boundary, independently of screen output.
@@ -36171,6 +36279,7 @@ async function restartCliProcess(
         if (isPromptReady) void flushPending();
       }, 500);
     } catch (err) {
+      if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
       replacementSpawnInProgress = false;
       cliRestartInProgress = false;
       settleRespawn('failed');
@@ -39940,6 +40049,7 @@ function acknowledgeNativeInputConsumed(
       log('Failed to record structured native input anchor');
     }
   }
+  startupNativeInputSeen = true;
   markReplyInputConsumed(turnId);
   // The CLI has the input in its own history: a crash no longer re-delivers
   // it to a resumed CLI (see InflightInputTracker.onTurnStarted).
@@ -42024,6 +42134,9 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // onExit so transient (auto-restarted) exits never pay for it. Mark the
       // stopped state even if the tmux park fails, so the next message still
       // retries the CLI (no hang) rather than writing into a dead pane.
+      // A late circuit decision must not park a replacement already alive.
+      if (msg.failPending && backend) break;
+      if (msg.failPending) stopStartupFailedInputs();
       if (msg.terminal !== false) parkCrashDiagnosticTerminal(lastCliExitCode, lastCliExitSignal);
       crashDiagnosticStopped = true;
       break;
@@ -43329,6 +43442,14 @@ function shutdownWorkerForParentExit(reason: string, exitCode = 0): void {
 }
 
 async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Promise<void> {
+  // Retirement starts before the first await. A title/plugin/teardown continuation
+  // may otherwise respawn a replacement while RPC shutdown is still waiting,
+  // reviving the generation this process is supposed to retire.
+  ++cliRestartEpoch;
+  const cancelRestart = cancelPendingCliRestart;
+  cancelPendingCliRestart = undefined;
+  cancelRestart?.();
+  if (tmuxRestartTimer) { clearTimeout(tmuxRestartTimer); tmuxRestartTimer = null; }
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);

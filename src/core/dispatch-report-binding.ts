@@ -304,3 +304,28 @@ export function resolveVerifiedDispatchReportTarget(input: {
   }
   return { ok: true, binding };
 }
+
+/** 校验派单根是否持有指向当前调用方的有效回报绑定（含同 app 同群的 chat-scope 会话续接） */
+export function hasVerifiedDispatchReportBindingForCaller(input: {
+  registry: Record<string, unknown>;
+  secret: string;
+  dispatchRoot: string;
+  callerAppId: string;
+  callerSessionId: string;
+  callerChatId?: string;
+  callerScope?: 'thread' | 'chat';
+}): boolean {
+  const resolved = resolveVerifiedDispatchReportTarget({
+    registry: input.registry,
+    dispatchRoot: input.dispatchRoot,
+    secret: input.secret,
+  });
+  if (!resolved.ok) return false;
+  const { binding } = resolved;
+  if (binding.targetLarkAppId !== input.callerAppId) return false;
+  if (binding.targetSessionId === input.callerSessionId) return true;
+  return binding.targetScope === 'chat'
+    && input.callerScope === 'chat'
+    && !!binding.targetChatId
+    && binding.targetChatId === input.callerChatId;
+}
