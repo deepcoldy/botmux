@@ -2,6 +2,7 @@ import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecuti
 import { isLeadOnlySession } from './lead-only.js';
 import { decideAssistantAdmission, decideAssistantLiveInputAdmission } from './assistant-spawn.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
+import { dropTypeAheadPromptTurn, noteTypeAheadPromptTurn, promoteTypeAheadPromptTurn, reconcileTypeAheadPromptTurns } from './type-ahead-prompt-queue.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { runtimeStartRefusal } from '../services/runtime-reservation.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
@@ -142,7 +143,7 @@ import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotC
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
-import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
+import { isFableModelId, normalizeClaudeModelId, ABSORBED_REPLY_MAX_CHARS } from '../services/claude-transcript.js';
 import { cliModelMayKeepReasoningEffort, cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
@@ -22925,6 +22926,10 @@ function setupWorkerHandlers(
             + `(current rev=${String(currentCaptureIdentity(ds, workerGeneration)?.revision ?? '-')})`,
           );
         } else {
+          // Advancing a queued turn promotes it to the current candidate. Remove
+          // only its queue entry; its sidecar remains available for a delayed
+          // current-turn hook claim. Rejected/out-of-order identities do neither.
+          if (msg.turnId) promoteTypeAheadPromptTurn(ds, msg.turnId);
           if (msg.turnId) activateStartingCardHealth(ds, msg.turnId);
           if (cardWasWaiting && !streamingCardTurnQueued(ds)) {
             // The waiting turn has become the terminal producer. Repaint even
@@ -23105,6 +23110,22 @@ function setupWorkerHandlers(
         } catch (err) {
           logger.warn(`[${t}] prompt submission handler failed: ${err instanceof Error ? err.message : String(err)}`);
         }
+        break;
+      }
+      case 'type_ahead_queued':
+      case 'type_ahead_turn_dropped':
+      case 'type_ahead_queue_snapshot': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored ${msg.type} from stale worker generation`);
+          break;
+        }
+        if (msg.type === 'type_ahead_queued') noteTypeAheadPromptTurn(ds, msg.turnId);
+        else if (msg.type === 'type_ahead_turn_dropped') dropTypeAheadPromptTurn(ds, msg.turnId);
+        else reconcileTypeAheadPromptTurns(ds, msg.turnIds);
         break;
       }
       case 'direct_submit_started': {
@@ -28355,8 +28376,10 @@ function setupWorkerHandlers(
           break;
         }
         const loc = localeForBot(ds.larkAppId);
-        const answer = msg.answer.length > BTW_ANSWER_MAX_CHARS
-          ? `${truncateUtf16WellFormed(msg.answer, BTW_ANSWER_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
+        // Cut at the cap the worker uses to decide what it may leave out of the
+        // host turn's final: only a reply posted whole is.
+        const answer = msg.answer.length > ABSORBED_REPLY_MAX_CHARS
+          ? `${truncateUtf16WellFormed(msg.answer, ABSORBED_REPLY_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
           : msg.answer;
         const cardJson = buildContextualReplyCard({
           title: tr(msg.progress ? 'card.mid_turn_progress'
@@ -28418,6 +28441,18 @@ function setupWorkerHandlers(
           if (ownsLifecycleMutation() && msg.turnReply && typeof result.value === 'string' && result.value) {
             recordTurnTerminalCarrier(ds, msg.turnId, { messageId: result.value, kind: 'non_patchable', responseKind: 'final' });
             noteFinalOutputReceipt(ds, msg.turnId, { text: msg.answer });
+          }
+          // IPC arrival is not delivery. Only the successful POST lets the
+          // producer exclude this text from its host final. Address the exact
+          // producer, not a replacement that may now own ds.worker.
+          try {
+            if (!worker.killed) worker.send({
+              type: 'absorbed_reply_delivered', turnId: msg.turnId,
+              ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+              replyUuid: msg.replyUuid,
+            });
+          } catch (error) {
+            logger.debug(`[${t}] Follow-up reply delivery receipt not sent: ${error instanceof Error ? error.message : String(error)}`);
           }
         } finally {
           finishDelivery();

@@ -80,6 +80,8 @@ export interface TraexQuestionOption {
 }
 
 export interface TraexQuestionPage {
+  /** 0.216+ 的异步问题使用独立面板，按键与同步 Questions 页不同。 */
+  delivery?: 'async';
   /** 1-based position in the batch (`Question 2/3`). */
   index: number;
   total: number;
@@ -106,6 +108,95 @@ function visibleRows(screen: string): string[] {
   let end = rows.length;
   while (end > 0 && rows[end - 1] === '') end--;
   return rows.slice(Math.max(0, end - VIEWPORT_LINES), end);
+}
+
+/** 异步问题收起后只留下快捷键提示；要求其下仍有真正的主输入框。 */
+export function traexPendingAsyncQuestionVisible(screen: string): boolean {
+  return traexPendingAsyncQuestionCount(screen) !== undefined;
+}
+
+export function traexPendingAsyncQuestionCount(screen: string): number | undefined {
+  const rows = visibleRows(screen).map(row => row.trim());
+  const at = rows.findIndex((row, i) => /^\? [1-9]\d* questions?$/.test(row)
+    && (rows[i + 1] === 'alt/⌥+↑ to answer' || rows[i + 1] === 'shift+← to answer'));
+  if (at < 0 || !rows.slice(at + 2).some(row => /^[›❯](?!\s*\d+\.)/.test(row))) return undefined;
+  const count = Number(/^\? ([1-9]\d*)/.exec(rows[at]!)![1]);
+  return Number.isSafeInteger(count) ? count : undefined;
+}
+
+/** Async footers wrap at arbitrary cells on narrow panes. Compare their
+ * non-whitespace payload so one- and two-row forms retain the same strict hints. */
+function readTraexAsyncQuestionFooter(rows: string[]): { start: number; nextQuestion: boolean } | undefined {
+  for (const count of [1, 2]) {
+    if (rows.length < count) continue;
+    const compact = rows.slice(rows.length - count).join('').replace(/\s+/g, '');
+    const match = /^entersubmit\|ctrl\+\]skip\|alt\/⌥\+↓(mainprompt|prevquestion)(\|shift\+←nextquestion)?$/.exec(compact);
+    if (match) return { start: rows.length - count, nextQuestion: match[2] !== undefined };
+  }
+  return undefined;
+}
+
+/** 来自 0.216.0 真机截图：异步页没有 Question i/n 标头，Other 自身就是输入框。 */
+function parseTraexAsyncQuestionPage(screen: string): TraexQuestionPage | undefined {
+  const rows = visibleRows(screen);
+  const footer = readTraexAsyncQuestionFooter(rows);
+  if (!footer) return undefined;
+  let rule = -1;
+  for (let i = footer.start - 1; i >= 0; i--) {
+    if (/^─{3,}$/.test(rows[i]!)) { rule = i; break; }
+  }
+  if (rule < 0) return undefined;
+  const body = rows.slice(rule + 1, footer.start);
+  const optionRow = /^ {2}([›❯ ]) ([1-9]\d?)\. (.*)$/;
+  const groups: string[][] = [];
+  for (const row of body) {
+    if (!row.trim()) { if (groups.at(-1)?.length) groups.push([]); continue; }
+    if (!groups.length) groups.push([]);
+    groups.at(-1)!.push(row);
+  }
+  if (!groups.at(-1)?.length) groups.pop();
+  if (groups.length < 2) return undefined;
+  const widget = groups.pop()!;
+  const promptRows = groups.flat();
+  const indexRow = /^ {2}([1-9]\d*) of ([1-9]\d*)$/.exec(promptRows[0] ?? '');
+  const index = indexRow ? Number(indexRow[1]) : 1;
+  const total = indexRow ? Number(indexRow[2]) : 1;
+  if (indexRow) promptRows.shift();
+  if (!Number.isSafeInteger(index) || !Number.isSafeInteger(total) || index > total) return undefined;
+  if (footer.nextQuestion && !indexRow) return undefined;
+  if (!promptRows.length || promptRows.some(row => !/^ {2}\S/.test(row))) return undefined;
+  if (!widget.some(row => optionRow.test(row))) {
+    if (widget.some(row => !/^ {2}\S/.test(row))) return undefined;
+    const text = widget.map(row => row.trim()).join(' ');
+    return { delivery: 'async', index, total, prompt: promptRows.map(row => row.trim()).join(' '),
+      multiSelect: false, options: [{ number: 1, label: 'Other', description: '', other: true }],
+      highlighted: 1, notesOpen: true, notesText: text === 'Type your answer' ? '' : text, submitAll: false };
+  }
+  const options: TraexQuestionOption[] = [];
+  let highlighted = 0;
+  for (const row of widget) {
+    if (!row.trim()) continue;
+    const match = optionRow.exec(row);
+    if (!match) {
+      if (options.length && /^ {7,}\S/.test(row)) { options.at(-1)!.label += ` ${row.trim()}`; continue; }
+      return undefined;
+    }
+    if (Number(match[2]) !== options.length + 1) return undefined;
+    if (match[1] !== ' ') {
+      if (highlighted) return undefined;
+      highlighted = Number(match[2]);
+    }
+    options.push({ number: Number(match[2]), label: match[3]!, description: '', other: false });
+  }
+  if (!options.length || !highlighted) return undefined;
+  const other = options.at(-1)!;
+  const notesText = other.label === 'Other' ? '' : other.label;
+  if (notesText && highlighted !== other.number) return undefined;
+  other.label = 'Other';
+  other.other = true;
+  return { delivery: 'async', index, total,
+    prompt: promptRows.map(row => row.trim()).join(' '), multiSelect: false, options, highlighted,
+    notesOpen: highlighted === other.number, notesText, submitAll: false };
 }
 
 /** A footer row's hints, or undefined when the row is not made of known
@@ -136,6 +227,8 @@ function readFooter(rows: string[]): { start: number; hints: Set<string> } | und
  *  screen does not end with one. */
 export function parseTraexQuestionPage(screen: string): TraexQuestionPage | undefined {
   if (!screen) return undefined;
+  const asyncPage = parseTraexAsyncQuestionPage(screen);
+  if (asyncPage) return asyncPage;
   const rows = visibleRows(screen);
   const footer = readFooter(rows);
   if (!footer) return undefined;
@@ -320,6 +413,8 @@ export function isTraexQuestionConfirmPage(screen: string): boolean {
  *  display snapshot: typed or pasted text must not reach it. */
 export function traexQuestionFlowVisible(screen: string): boolean {
   if (!screen) return false;
+  if (parseTraexAsyncQuestionPage(screen)) return true;
+  if (readTraexAsyncQuestionFooter(visibleRows(screen))) return true;
   const rows = normalizedRows(screen);
   return looseQuestionPageVisible(rows) || looseConfirmPageVisible(rows);
 }
@@ -328,6 +423,7 @@ export function traexQuestionFlowVisible(screen: string): boolean {
  *  belongs to exactly this question of this batch. */
 export function traexQuestionSignature(page: TraexQuestionPage): string {
   return JSON.stringify([
+    page.delivery ?? 'sync',
     page.index, page.total, page.multiSelect, page.prompt,
     page.options.map(option => [option.label, option.description]),
   ]);
@@ -348,6 +444,7 @@ export function traexQuestionAskQuestion(page: TraexQuestionPage): AskQuestion {
   return {
     prompt,
     multiSelect: page.multiSelect,
+    ...(page.options.every(option => option.other) ? { inputMode: 'text' as const } : {}),
     options: page.options.filter(option => !option.other).map(option => ({
       key: String(option.number),
       label: option.label,
@@ -387,7 +484,9 @@ export function traexQuestionAnswerFromAsk(page: TraexQuestionPage, result: AskR
     || '';
   if (custom) {
     const text = sanitizeTraexQuestionNote(custom);
-    return text ? { kind: 'custom', text } : 'empty custom answer';
+    if (!text) return 'empty custom answer';
+    if (text === asyncQuestionPlaceholder(page)) return 'answer is indistinguishable from the native placeholder';
+    return { kind: 'custom', text };
   }
   const real = page.options.filter(option => !option.other);
   const numbers: number[] = [];
@@ -414,10 +513,19 @@ function notesHold(notes: string, text: string): boolean {
 
 /** Up/Down towards `target` on the shortest way round (the list wraps). */
 function moveTowards(page: TraexQuestionPage, target: number): TraexQuestionStep {
+  if (page.delivery === 'async') return { kind: 'key', key: page.highlighted < target ? 'Down' : 'Up', final: false };
   const count = page.options.length;
   const down = (target - page.highlighted + count) % count;
   const up = (page.highlighted - target + count) % count;
   return { kind: 'key', key: down <= up ? 'Down' : 'Up', final: false };
+}
+
+/** Plain captures cannot distinguish these native placeholders from the same
+ * typed text, including immediately before Enter. Callers must fail closed. */
+function asyncQuestionPlaceholder(page: TraexQuestionPage): string | undefined {
+  if (page.delivery !== 'async') return undefined;
+  if (page.options.every(option => option.other)) return 'Type your answer';
+  return page.options.at(-1)?.other ? 'Other' : undefined;
 }
 
 /**
@@ -427,6 +535,17 @@ function moveTowards(page: TraexQuestionPage, target: number): TraexQuestionStep
  */
 export function nextTraexQuestionStep(page: TraexQuestionPage, answer: TraexQuestionAnswer): TraexQuestionStep {
   const other = page.options[page.options.length - 1]!.number;
+  if (page.delivery === 'async') {
+    if (answer.kind === 'options') {
+      const [number] = answer.numbers;
+      if (answer.numbers.length !== 1 || !number || number >= other) return { kind: 'fail', reason: 'invalid option' };
+      if (page.notesText) return { kind: 'fail', reason: 'the notes field contains other text' };
+      return page.highlighted === number ? { kind: 'key', key: 'Enter', final: true } : moveTowards(page, number);
+    }
+    if (page.highlighted !== other) return moveTowards(page, other);
+    if (page.notesText && !notesHold(page.notesText, answer.text)) return { kind: 'fail', reason: 'the notes field contains other text' };
+    return page.notesText ? { kind: 'key', key: 'Enter', final: true } : { kind: 'paste', text: answer.text };
+  }
   if (answer.kind === 'options') {
     if (page.notesOpen) return { kind: 'fail', reason: 'the notes field is open' };
     if (!page.multiSelect) {
@@ -472,6 +591,10 @@ export function traexQuestionStepAllowed(page: TraexQuestionPage, step: TraexQue
   if (step.kind === 'paste') return page.notesOpen && page.notesText === '' && step.text.length > 0
     && step.text === sanitizeTraexQuestionNote(step.text);
   const { key } = step;
+  if (page.delivery === 'async') {
+    if (key === 'Enter') return page.highlighted < page.options.length || !!page.notesText;
+    return (key === 'Up' || key === 'Down') && !page.notesText;
+  }
   if (key === 'Enter') return true;
   if (page.notesOpen) return false;
   if (key === 'Up' || key === 'Down' || key === 'Tab') return true;
