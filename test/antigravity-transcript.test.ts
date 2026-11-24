@@ -220,6 +220,7 @@ describe('antigravityTurnFailedWithoutOutput', () => {
     const prove = loadWorkerFunction<(limit: CliUsageLimitState) => CliUsageLimitState>(
       'withAntigravityDirectFailureProof', {
         codexBridgeRolloutPath: undefined,
+        cliAdapter: { id: 'antigravity' }, backend: null,
         lastSpawnEffectiveCliSessionId: conversationId,
         lastInitConfig: { cliSessionId: conversationId },
         resolveAntigravityTranscriptPath: (id: string | undefined) => resolveAntigravityTranscriptPath(id, { brainDir }),

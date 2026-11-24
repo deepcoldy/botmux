@@ -180,9 +180,32 @@ describe('raw ANSI tmux quota classification', () => {
 
     expect(classify('', 'idle')).toEqual({ status: 'idle' });
     expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+    expect(classify('', 'idle')).toEqual({ status: 'idle' });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
 
     nativeKey = 'native-after-late-new';
     expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('log:native-after-late-new');
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(true);
+  });
+
+  it('binds a late key for raw B independently of historical raw A, then rejects C', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    let screen = currentQuotaScreen;
+    let nativeKey = 'native-history-a';
+    const { classify, usageLimitTracker } = classifier(() => screen, 'antigravity', true, false, undefined,
+      () => ({ key: nativeKey, text: screen }));
+    expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('log:native-history-a');
+
+    screen = currentQuotaScreen.replace('2h39m35s', '1h2m3s');
+    const turn = usageLimitTracker.beginTurn(screen);
+    nativeKey = 'native-late-b';
+    usageLimitTracker.noteTurnCompleted('answered');
+    expect(classify('', 'idle')).toEqual({ status: 'idle' });
+    expect(classify('', 'idle')).toEqual({ status: 'idle' });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+
+    nativeKey = 'native-replacement-c';
+    expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('log:native-replacement-c');
     expect(usageLimitTracker.detectedThisTurn(turn)).toBe(true);
   });
 
