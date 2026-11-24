@@ -529,6 +529,7 @@ export function selectSessionBackend(opts: {
   backendType: BackendType;
   backendConfig?: RiffBackendConfig | EffectiveMojoConfig | RemoteRunnerConfig | HerdrBackendConfig;
   herdrConfig?: HerdrBackendConfig;
+  hcHerdrTabTitle?: string;
   remoteBackendState?: RemoteRunnerBackendState;
   /** Canonical local ownership boundary used to keep machine-wide Herdr agent
    * names distinct across independent Botmux data roots/checkouts. */
@@ -814,7 +815,11 @@ export function selectSessionBackend(opts: {
     };
     const reattach = opts.hasExistingSession ?? probeHcTerminal(target) === 'exists';
     return {
-      backend: new HcBackend(target, { sessionId: opts.sessionId, isReattach: reattach }),
+      backend: new HcBackend(target, {
+        sessionId: opts.sessionId,
+        isReattach: reattach,
+        herdrTabTitle: opts.hcHerdrTabTitle,
+      }),
       isTmuxMode: false,
       // Observed through its own attach stream and driven by AUTOMATIC_INPUT
       // frames: the shared relay, never per-client `tmux attach`.

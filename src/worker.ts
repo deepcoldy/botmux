@@ -29418,6 +29418,7 @@ async function spawnCliBody(
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    hcHerdrTabTitle: cfg.hcHerdrTabTitle,
     herdrConfig: effectiveHerdrConfig,
     remoteBackendState: cfg.remoteBackendState,
     herdrOwnershipScope: isolationRuntimeDataDir,

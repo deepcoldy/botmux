@@ -99,6 +99,8 @@ export interface HcBackendOptions {
   sessionId: string;
   /** Attach to the live terminal named target.sessionName instead of creating one. */
   isReattach?: boolean;
+  /** Display title for the private core's native Herdr tab. Undefined opts out. */
+  herdrTabTitle?: string;
   /** The worker's own env (never a CLI child env): hc's control env is derived from it. */
   env?: NodeJS.ProcessEnv;
 }
@@ -260,6 +262,7 @@ export class HcBackend implements SessionBackend {
   private readonly sessionId: string;
   private readonly env: NodeJS.ProcessEnv;
   private readonly _isReattach: boolean;
+  private readonly herdrTabTitle?: string;
   private cols = 0;
   private rows = 0;
   private address: string | null = null;
@@ -333,6 +336,7 @@ export class HcBackend implements SessionBackend {
     this.sessionId = opts.sessionId;
     this.env = opts.env ?? process.env;
     this._isReattach = opts.isReattach ?? false;
+    this.herdrTabTitle = opts.herdrTabTitle;
   }
 
   get isReattach(): boolean {
@@ -691,8 +695,8 @@ export class HcBackend implements SessionBackend {
         return;
       }
       this.adopt(client, sub, stream, size);
-      if (this.env.BOTMUX_HC_HERDR_TABS === '1') {
-        void publishHcHerdrTab(client, this.sessionId, listed, () => !stale() && this.client === client)
+      if (this.herdrTabTitle !== undefined) {
+        void publishHcHerdrTab(client, this.sessionId, listed, this.herdrTabTitle, () => !stale() && this.client === client)
           .catch(error => process.stderr.write(`[hc-backend] ${this.target.sessionName}: Herdr 布局更新失败：${describeError(error)}\n`));
       }
     } catch (err) {

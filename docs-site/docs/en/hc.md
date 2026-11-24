@@ -112,7 +112,9 @@ Before attaching, botmux asks the core directly whether the terminal is still li
 
 On macOS, the **💻 Open …** button on Feishu cards uses the same ownership check when attaching to an hc session.
 
-If Herdr App already has the private botmux core configured as a Machine, add `BOTMUX_HC_HERDR_TABS=1` to `~/.botmux/.env` and run `botmux restart`. New and reattached sessions appear in native Spaces on that Machine, grouped by working directory with one Tab per topic. Botmux manages their recovery.
+In the Dashboard, enable **Automatically create Herdr tabs** under **Bot Config → Advanced → Session backend**, or set `"hcHerdrTabs": true` on that bot in `bots.json`. The setting defaults to off and applies to hc sessions. When a session starts or a new worker reattaches, botmux registers one Tab per topic in a native Space grouped by working directory on its private core.
+
+Tab names use the Botmux session title, falling back to the hc session name (`bmx-<first eight characters of the session ID>`). Registration works before Herdr App connects. Add the private core as a Machine in Herdr App to see the registered tabs. Turning off registration leaves existing tabs available to manage in Herdr App. Botmux manages terminal recovery.
 
 ## 5. Session lifecycle
 

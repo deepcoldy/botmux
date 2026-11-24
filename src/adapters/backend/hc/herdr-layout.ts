@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
 import { isHcError, type HcClient } from './client.js';
+import { hcTerminalName } from './cli-ops.js';
 
 const DOCUMENT = 'herdr-app';
 const TIMEOUT = { timeoutMs: 2_000 };
@@ -42,20 +43,26 @@ function layoutId(kind: string, seed: string): string {
   return `botmux-${kind}-${createHash('sha256').update(seed).digest('hex').slice(0, 24)}`;
 }
 
-function placeTerminal(document: HerdrLayout, sessionId: string, address: string, cwd: string): boolean {
+function placeTerminal(document: HerdrLayout, sessionId: string, address: string, cwd: string, title: string): boolean {
   const paneId = layoutId('pane', sessionId);
+  const tabId = layoutId('tab', sessionId);
   const spaces = document.spaces ??= [];
-  let existing: HerdrPane['content'];
+  let existing: { content: NonNullable<HerdrPane['content']>; tab: HerdrTab } | undefined;
   for (const space of spaces) {
     for (const tab of space.tabs ?? []) {
       for (const pane of panes(tab.root)) {
-        if (pane.content?.terminal === address) return false;
-        if (pane.id === paneId && typeof pane.content?.terminal === 'string') existing = pane.content;
+        if (pane.content?.terminal === address) {
+          if (tab.id !== tabId || pane.id !== paneId || tab.name) return false;
+          tab.name = title;
+          return true;
+        }
+        if (pane.id === paneId && typeof pane.content?.terminal === 'string') existing = { content: pane.content, tab };
       }
     }
   }
   if (existing) {
-    existing.terminal = address;
+    existing.content.terminal = address;
+    if (existing.tab.id === tabId && !existing.tab.name) existing.tab.name = title;
     return true;
   }
 
@@ -65,13 +72,12 @@ function placeTerminal(document: HerdrLayout, sessionId: string, address: string
     space = { id: spaceId, name: basename(cwd) || cwd, folder: cwd, tabs: [] };
     spaces.push(space);
   }
-  const tabId = layoutId('tab', sessionId);
   const tabs = space.tabs ??= [];
   // A tab that already has this id may contain a user-edited layout. Leave it alone.
   if (tabs.some(tab => tab.id === tabId)) return false;
   tabs.push({
     id: tabId,
-    name: '',
+    name: title,
     root: {
       id: tabId,
       type: 'row',
@@ -88,16 +94,18 @@ export async function publishHcHerdrTab(
   client: Pick<HcClient, 'call'>,
   sessionId: string,
   terminal: { address: string; cwd: string },
+  sessionTitle: string,
   isCurrent: () => boolean,
 ): Promise<void> {
   if (!terminal.cwd) return;
+  const title = sessionTitle.trim() || hcTerminalName(sessionId);
   for (let attempt = 0; attempt < MAX_WRITES && isCurrent(); attempt++) {
     const current = await client.call<{ version: number; value: HerdrLayout | null }>('doc.get', { name: DOCUMENT }, TIMEOUT);
     const document = current.value ?? {};
     if (typeof document !== 'object' || Array.isArray(document) || (document.spaces != null && !Array.isArray(document.spaces))) {
       throw new Error('无法识别现有 Herdr 布局');
     }
-    if (!placeTerminal(document, sessionId, terminal.address, terminal.cwd) || !isCurrent()) return;
+    if (!placeTerminal(document, sessionId, terminal.address, terminal.cwd, title) || !isCurrent()) return;
     try {
       await client.call('doc.set', { name: DOCUMENT, version: current.version, value: document }, TIMEOUT);
       return;

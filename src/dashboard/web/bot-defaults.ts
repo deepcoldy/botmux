@@ -201,7 +201,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'ask-option-layout', tab: 'cards', titleKey: 'botDefaults.sectionAskOptionLayout' },
   { id: 'brand', tab: 'cards', titleKey: 'botDefaults.sectionBrand', fieldKeys: ['botDefaults.brandLabel'] },
   { id: 'oncall', tab: 'cards', titleKey: 'botDefaults.sectionOncall' },
-  { id: 'backend', tab: 'advanced', titleKey: 'botDefaults.sectionBackend', fieldKeys: ['botDefaults.backendLabel'] },
+  { id: 'backend', tab: 'advanced', titleKey: 'botDefaults.sectionBackend', fieldKeys: ['botDefaults.backendLabel', 'botDefaults.hcHerdrTabs'] },
   {
     id: 'herdr',
     tab: 'advanced',
@@ -482,6 +482,7 @@ export type BotDefaultsRow = {
   readIsolation?: boolean;
   readIsolationSupported?: boolean;
   backendType?: string | null;
+  hcHerdrTabs?: boolean;
   /** daemon 的默认后端：`backendType` 没有覆盖时会话实际用它（见 effectiveBackendType）。 */
   defaultBackendType?: string | null;
   usageDisplay?: 'streaming' | 'footer' | 'off';

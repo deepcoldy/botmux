@@ -112,7 +112,9 @@ botmux list
 
 macOS 上，飞书卡片的「💻 打开 …」可用时，也会通过同样的所有权核对接入 hc 会话。
 
-如果 Herdr App 已把 botmux 的私有 core 添加为一个 Machine，可在 `~/.botmux/.env` 中设置 `BOTMUX_HC_HERDR_TABS=1`，再运行 `botmux restart`。新建和重新接入的会话会按工作目录出现在这个 Machine 的原生 Space 中，每个话题一个 Tab。终端恢复由 botmux 管理。
+在 Dashboard 的 **Bot 配置 → 高级 → 会话后端** 开启 **自动创建 Herdr 标签页**，或在对应的 `bots.json` 条目中设置 `"hcHerdrTabs": true`。该开关按 bot 设置，默认关闭，仅对 hc 会话生效。下次启动会话或由新 worker 重新接入时，botmux 会在私有 core 上按工作目录登记原生 Space，每个话题一个 Tab。
+
+标签页使用 Botmux 的会话标题。没有标题时显示 hc 会话名（`bmx-<会话 ID 前 8 位>`）。登记时 Herdr App 可以尚未连接。把私有 core 添加为 Herdr App 的 Machine 后即可查看已登记的标签页。关闭开关会停止后续登记，现有标签页可在 Herdr App 中管理。终端恢复由 botmux 管理。
 
 ## 5. 会话的生命周期
 

@@ -1902,6 +1902,8 @@ export interface BotConfig {
   /** LEGACY: extra read-deny paths — auto-migrated into sandboxPaths.deny. */
   readDenyExtraPaths?: string[];
   backendType?: BackendType;
+  /** Register this bot's hc sessions as tabs on the private core's Herdr layout. */
+  hcHerdrTabs?: boolean;
   /**
    * Configuration for the riff backend (agent-services platform). Required
    * when `backendType` is `'riff'`. Contains base URL, template ID, agent/model
@@ -4575,6 +4577,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
+      hcHerdrTabs: entry.hcHerdrTabs === true ? true : undefined,
       riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
       herdr: normalizeHerdrBackendConfig(entry.herdr),
       mojo: entry.mojo && typeof entry.mojo === 'object' ? entry.mojo : undefined,

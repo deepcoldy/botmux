@@ -138,10 +138,11 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
   }
 
   /** What a worker does with a fresh session: gate, select, spawn the CLI, wait for it. */
-  async function startSession(sessionId = randomUUID()): Promise<{ sessionId: string; target: HcTarget; session: Watched }> {
+  async function startSession(sessionId = randomUUID(), hcHerdrTabTitle?: string): Promise<{ sessionId: string; target: HcTarget; session: Watched }> {
     const gate = workerGate(sessionId);
     const selected = selectSessionBackend({
       backendType: 'hc', sessionId, persistentBackendTarget: gate.target, hasExistingSession: gate.hasExistingSession,
+      hcHerdrTabTitle,
     });
     const backend = selected.backend as HcBackend;
     opened.push(backend);
@@ -251,11 +252,13 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
     killPersistentBackendTarget(foreign.target, foreign.sessionId);
   }, 120_000);
 
-  it('registers fresh botmux terminals as native Herdr tabs on the private core without enabling keep', async () => {
-    vi.stubEnv('BOTMUX_HC_HERDR_TABS', '1');
+  it('registers only opted-in sessions as native Herdr tabs on the private core without enabling keep', async () => {
     let client: HcClient | undefined;
     try {
-      const sessions = await Promise.all([startSession(), startSession()]);
+      const unregistered = await startSession();
+      const title = 'Inspect the wallet flow';
+      const sessions = await Promise.all([startSession(randomUUID(), title), startSession(randomUUID(), '')]);
+      const names = [title, sessions[1].target.sessionName];
       client = await HcClient.connect(sessions[0].target.socket);
       const terminals = await Promise.all(sessions.map(({ target }) =>
         client!.call<{ address: string; keep: boolean }>('terminal.get', { terminal: target.sessionName })));
@@ -265,12 +268,15 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
       await vi.waitFor(async () => {
         const doc = await ownerCore.call<{ value: { spaces: Array<{ folder: string; tabs: unknown[] }> } }>('doc.get', { name: 'herdr-app' });
         expect(doc.value?.spaces).toMatchObject([{ folder: root, tabs: [expect.anything(), expect.anything()] }]);
-        expect(doc.value.spaces[0]!.tabs).toEqual(expect.arrayContaining(terminals.map(({ address }) =>
-          expect.objectContaining({ root: expect.objectContaining({ children: [expect.objectContaining({ content: { terminal: address } })] }) }))));
+        expect(doc.value.spaces[0]!.tabs).toEqual(expect.arrayContaining(terminals.map(({ address }, index) =>
+          expect.objectContaining({
+            name: names[index],
+            root: expect.objectContaining({ children: [expect.objectContaining({ content: { terminal: address } })] }),
+          }))));
       });
+      expect(probePersistentBackendTarget(unregistered.target)).toBe('exists');
     } finally {
       client?.close();
-      vi.unstubAllEnvs();
     }
   }, 60_000);
 
