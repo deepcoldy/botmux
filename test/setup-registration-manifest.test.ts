@@ -210,6 +210,16 @@ describe('注册后补配', () => {
     }));
   });
 
+  it('forwards an explicit approval-avoidance opt-out to unpublished-app Web fallback', async () => {
+    stubOpenApi([scopeResponse(grantedRows)], { unpublished: true });
+    const web = vi.fn().mockResolvedValue({ ok: false, reason: 'invalid_session' });
+    await completeRegisteredApp(identity, addons, web, { autoAvoidApproval: false });
+    expect(web).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      appJustCreated: true,
+      autoAvoidApproval: false,
+    }));
+  });
+
   it('网页补事件失败时保留已确认的 redirect 状态', async () => {
     const fetcher = stubOpenApi([scopeResponse(grantedRows)]);
     const original = fetcher.getMockImplementation()!;

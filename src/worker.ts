@@ -448,6 +448,7 @@ import {
 } from './services/claude-bridge-blind-turn.js';
 import { terminalInputSubmits, wrapBracketedPaste } from './adapters/cli/tui-input.js';
 import { WebTerminalInputController, WebTerminalInputWireState } from './core/web-terminal-input-controller.js';
+import { isTerminalColorQueryOnly } from './core/terminal-color-query.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
@@ -10864,6 +10865,22 @@ let thinkingEntries: CotEntry[] = [];
 let thinkingTotalChars = 0;
 let thinkingCapNoted = false;
 
+/** Whether an entry has the fields its kind promises. Entries are parsed from
+ *  CLI transcripts, so the type is not a guarantee: a missing string would throw
+ *  in `cotEntryChars`, and an unknown kind would make the running total NaN and
+ *  switch off the accumulated cap. */
+function cotEntryWellFormed(entry: CotEntry): boolean {
+  const e = entry as Partial<Record<string, unknown>> | null;
+  switch (e?.kind) {
+    case 'thinking':
+    case 'text': return typeof e.text === 'string';
+    case 'tool_call': return typeof e.name === 'string' && typeof e.args === 'string'
+      && (e.subject === undefined || typeof e.subject === 'string');
+    case 'tool_result': return typeof e.result === 'string';
+    default: return false;
+  }
+}
+
 function cotEntryChars(e: CotEntry): number {
   switch (e.kind) {
     case 'thinking': return e.text.length;
@@ -10924,12 +10941,13 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   // exists, so `bridge-fallback-gate` deliberately does NOT strip it there and
   // the reply card shows it verbatim. Stripping it from the bubble alone would
   // make the two messages of one turn contradict each other.
-  // Both paths drop a text entry without text: counting it would throw out of
-  // the transcript drain and lose the rest of the turn's activity.
+  // Both paths drop a malformed entry: counting it would throw out of the
+  // transcript drain and lose the rest of the turn's activity.
   const adoptMode = lastInitConfig?.adoptMode === true;
+  const wellFormed = entries.filter(cotEntryWellFormed);
   const kept = adoptMode
-    ? entries.filter(entry => entry.kind !== 'text' || typeof entry.text === 'string')
-    : entries.flatMap(entry => {
+    ? wellFormed
+    : wellFormed.flatMap(entry => {
       const withoutSentinel = cotEntryWithoutSentinel(entry);
       return withoutSentinel ? [withoutSentinel] : [];
     });
@@ -22886,7 +22904,8 @@ function onPtyData(data: string, isLiveStream = true): void {
 function handlePtyDataChunk(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
-  backendScreenRevision += 1;
+  const colorQueryOnly = lastInitConfig?.cliId === 'traex' && isTerminalColorQueryOnly(data);
+  if (!colorQueryOnly) backendScreenRevision += 1;
   lastPtyActivityAtMs = Date.now();
   maybeReportDeferredTopicMaterialization(data);
   maybeCaptureKiroSessionId(data);
@@ -22948,6 +22967,11 @@ function handlePtyDataChunk(data: string): void {
       if (ws.readyState === WebSocket.OPEN) ws.send(data);
     }
   }
+
+  // A query is still relayed unchanged (xterm must answer it), and counts as
+  // process activity, but not as a redraw or new idle-detection evidence.
+  // Otherwise the 1s OSC 11 poll starves the 2s first-prompt quiet window.
+  if (colorQueryOnly) return;
 
   if (handleVisibleStartupInteraction(data)) return;
 
