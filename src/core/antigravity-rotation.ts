@@ -126,8 +126,11 @@ export interface AntigravityQuotaAutoRotateDeps {
   lastCliInputTurnId?: string;
   /** Current session lastMessageAt (epoch ms). */
   lastMessageAt: number;
-  /** Exact failed input to replay after restart, if available. */
+  /** Exact failed input to replay after restart, if available at the edge. */
   replayPayload?: AntigravityReplayPayload;
+  /** Re-read proof at settlement: a pending transcript tail may gain or lose
+   * no-progress evidence while the account restart is still in flight. */
+  getReplayPayload?: () => AntigravityReplayPayload | undefined;
   /** Hard per-turn rotation cap (defaults to MAX_ANTIGRAVITY_ROTATIONS_PER_TURN). */
   maxRotationsPerTurn?: number;
   createToken?: () => string;
@@ -361,6 +364,10 @@ export function tryAntigravityQuotaAutoRotate(
     };
     deps.setRotationState(settledState);
 
+    // Resolve and cross-check replay proof BEFORE clearUsageLimit() drops the
+    // runtime half of the evidence. The callbacks below are synchronous, so a
+    // validated payload cannot change again before replayTurn().
+    const replayPayload = deps.getReplayPayload ? deps.getReplayPayload() : deps.replayPayload;
     try {
       deps.updateSessionAccount(effectiveAccountId);
       deps.clearUsageLimit();
@@ -379,14 +386,14 @@ export function tryAntigravityQuotaAutoRotate(
       return;
     }
 
-    if (!deps.replayPayload || !deps.replayPayload.cliInput.trim()) {
+    if (!replayPayload || !replayPayload.cliInput.trim()) {
       deps.notifyManualReplayNeeded({ toId: effectiveAccountId, toEmail: effectiveEmail });
       return;
     }
 
     let replay: ReturnType<AntigravityQuotaAutoRotateDeps['replayTurn']>;
     try {
-      replay = deps.replayTurn(deps.replayPayload);
+      replay = deps.replayTurn(replayPayload);
     } catch (err) {
       // The callback contract cannot prove whether IPC accepted the input when
       // it throws. Block this logical turn from another automatic attempt.

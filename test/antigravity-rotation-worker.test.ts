@@ -150,6 +150,7 @@ async function emitQuotaAndStart(
   requireRestart = true,
   nativeScreen?: string,
   nativeEpisodeKey = 'native-episode-1',
+  limitDirectFailure = false,
 ) {
   const previousRestartCount = h.sent.filter(msg => msg.type === 'restart').length;
   const frameTurnId = turnId ?? undefined;
@@ -163,6 +164,10 @@ async function emitQuotaAndStart(
   if (nativeScreen) {
     usageLimit = nativeUsageLimit(nativeScreen, nativeEpisodeKey, h.nowMs);
     content = nativeScreen;
+  }
+  if ((limitDirectFailure || h.ds.session.lastFailedTurn?.directFailure === true)
+    && h.ds.session.lastFailedTurn?.turnId === frameTurnId) {
+    usageLimit = { ...usageLimit, directFailure: true };
   }
   h.worker.emit('message', {
     type: 'screen_update', content, status: 'limited', ...(frameTurnId ? { turnId: frameTurnId } : {}),
@@ -376,6 +381,102 @@ describe('Antigravity worker-pool replay safety', () => {
     h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
     await h.flush();
     expect(h.sent.find(msg => msg.type === 'message')).toMatchObject({ content: 'do work' });
+  });
+
+  it.each(['screen_update', 'screenshot_uploaded'] as const)('accepts late no-progress proof before an active rotation replays (%s)', async frameType => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    const restart = await emitQuotaAndStart(h, 'turn-1', 60_000, true, INCIDENT_QUOTA_SCREEN);
+    expect(restart?.attemptId).toBeDefined();
+    expect(h.ds.session.lastFailedTurn?.directFailure).toBeUndefined();
+
+    const usageLimit = {
+      ...nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-1', h.nowMs),
+      directFailure: true as const,
+    };
+    const frame = frameType === 'screen_update'
+      ? { type: frameType, content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1', usageLimit }
+      : { type: frameType, imageKey: 'img-late-proof', status: 'limited', turnId: 'turn-1', usageLimit };
+    for (const listener of h.worker.listeners('message')) await listener(frame);
+    await h.flush();
+
+    expect(h.ds.usageLimit?.directFailure).toBe(true);
+    expect(h.ds.session.lastFailedTurn).toMatchObject({ limitedSnapshot: true, directFailure: true });
+    expect(h.sessionStore.getSessionFresh(h.ds.session.sessionId)?.lastFailedTurn?.directFailure).toBe(true);
+
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(1);
+    expect(h.sent.find(msg => msg.type === 'message')).toMatchObject({ content: 'do work' });
+  });
+
+  it('revokes a cached replay when no-progress proof disappears before restart settles', async () => {
+    const h = await setupRotationScenario({ directFailure: false, limitedDirectFailure: true, recordStatus: true });
+    const restart = await emitQuotaAndStart(h, 'turn-1', 60_000, true, INCIDENT_QUOTA_SCREEN, 'native-episode-1', true);
+    expect(h.ds.usageLimit?.directFailure).toBe(true);
+
+    const usageLimit = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-1', h.nowMs);
+    const frame = { type: 'screen_update', content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1', usageLimit };
+    for (const listener of h.worker.listeners('message')) await listener(frame);
+    await h.flush();
+    expect(h.ds.usageLimit?.directFailure).toBeUndefined();
+    expect(h.ds.session.lastFailedTurn?.directFailure).toBeUndefined();
+    expect(h.sessionStore.getSessionFresh(h.ds.session.sessionId)?.lastFailedTurn?.directFailure).toBeUndefined();
+
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(0);
+  });
+
+  it.each([false, true])('invalidates a cached replay for a pre-ready replacement native episode (proof=%s)', async directFailure => {
+    const h = await setupRotationScenario({ directFailure: false, limitedDirectFailure: true, recordStatus: true });
+    const restart = await emitQuotaAndStart(h, 'turn-1', 60_000, true, INCIDENT_QUOTA_SCREEN, 'native-episode-a', true);
+    expect(h.ds.usageLimit?.nativeEpisodeKey).toBe('log:native-episode-a');
+
+    const replacement = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-b', h.nowMs);
+    const usageLimit = directFailure ? { ...replacement, directFailure: true as const } : replacement;
+    const frame = { type: 'screen_update', content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1', usageLimit };
+    await Promise.all(h.worker.listeners('message').map(listener => listener(frame)));
+    await h.flush();
+    expect(h.ds.usageLimit?.nativeEpisodeKey).toBe('log:native-episode-b');
+    expect(h.ds.usageLimit?.directFailure).toBe(directFailure ? true : undefined);
+    expect(h.sessionStore.getSessionFresh(h.ds.session.sessionId)?.usageLimit?.nativeEpisodeKey).toBe('log:native-episode-b');
+
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(0);
+  });
+
+  it('fails closed when revoking proof loses its failed-turn SQLite write before settlement', async () => {
+    const h = await setupRotationScenario({ directFailure: false, limitedDirectFailure: true, recordStatus: true });
+    const restart = await emitQuotaAndStart(h, 'turn-1', 60_000, true, INCIDENT_QUOTA_SCREEN, 'native-episode-1', true);
+    expect(h.ds.usageLimit?.directFailure).toBe(true);
+
+    let writes = 0;
+    h.sessionStore.__testOnly_setBeforeRowPersist(() => {
+      writes += 1;
+      if (writes === 2) throw new Error('injected proof-revocation write failure');
+    });
+    cleanups.push(() => h.sessionStore.__testOnly_setBeforeRowPersist(undefined));
+    const usageLimit = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-1', h.nowMs);
+    const frame = { type: 'screen_update', content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1', usageLimit };
+    await Promise.all(h.worker.listeners('message').map(listener => listener(frame)));
+    h.sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    await h.flush();
+
+    expect(writes).toBe(2);
+    expect(h.ds.usageLimit?.directFailure).toBeUndefined();
+    expect(h.ds.session.lastFailedTurn?.directFailure).toBe(true);
+    const stored = h.sessionStore.getSessionFresh(h.ds.session.sessionId);
+    expect(stored?.usageLimit?.directFailure).toBeUndefined();
+    expect(stored?.lastFailedTurn?.directFailure).toBe(true);
+
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(0);
   });
 
   it('reports pool exhaustion and the observed reset duration instead of leaving a working card', async () => {

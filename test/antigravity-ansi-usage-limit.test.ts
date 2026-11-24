@@ -136,6 +136,39 @@ describe('raw ANSI tmux quota classification', () => {
     expect(usageLimitTracker.detectedThisTurn(retryTurn)).toBe(true);
   });
 
+  it('suppresses an answered turn\'s old annotated banner without merging a fresh Error ID', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const refusal = (errorId: string) => `⚠ Individual quota reached. Resets in 1m.\nError ID: ${errorId}` + composer;
+    let screen = refusal('answered-old');
+    const { classify, usageLimitTracker } = classifier(() => screen);
+    const turn = usageLimitTracker.beginTurn(screen);
+    usageLimitTracker.noteTurnCompleted('answered');
+
+    expect(classify('', 'idle')).toEqual({ status: 'idle' });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+
+    screen = refusal('answered-fresh');
+    expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('composer:answered-fresh');
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(true);
+  });
+
+  it('re-arms an answered turn for a different native-log episode on identical pixels', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    let nativeKey = 'native-answered-old';
+    const { classify, usageLimitTracker } = classifier(() => currentQuotaScreen, 'antigravity', true, false, undefined,
+      () => ({ key: nativeKey, text: currentQuotaScreen }));
+    expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('log:native-answered-old');
+
+    const turn = usageLimitTracker.beginTurn(currentQuotaScreen);
+    usageLimitTracker.noteTurnCompleted('answered');
+    expect(classify('', 'idle')).toEqual({ status: 'idle' });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+
+    nativeKey = 'native-answered-new';
+    expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('log:native-answered-new');
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(true);
+  });
+
   it('uses the first published deadline when a partial refusal gains its native composer', () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
     const partialScreen = '⚠ Individual quota reached. Resets in 1m.\nError ID: partial-first';
@@ -218,10 +251,12 @@ describe('raw ANSI tmux quota classification', () => {
     const recovered = quota + `\nError ID: ${id}` + composer
       + '\n> continue\n\nBOTMUX_NOTHING_TO_SEND\n────\n'
       + '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\n────\n? for shortcuts';
-    const { classify } = classifier(() => recovered);
+    const { classify, usageLimitTracker } = classifier(() => recovered);
+    const turn = usageLimitTracker.beginTurn(recovered);
     expect(classify('display snapshot retains old quota', status)).toEqual({
       status, usageLimitRecovery: 'antigravity-ready-composer',
     });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
   });
 
   it('detects a new native refusal after a recovered composer', () => {

@@ -25,6 +25,9 @@ export interface UsageLimitTracker<S extends string = string> {
     refineDetection?: (state: CliUsageLimitState) => CliUsageLimitState | undefined,
   ): { status: S | 'limited'; usageLimit?: CliUsageLimitState };
   detectedThisTurn(seq: number): boolean;
+  /** Positive native recovery withdraws this turn's screen-only detection.
+   * Structured evidence, if any, remains authoritative. */
+  noteScreenRecovery(): void;
   noteStructuredLimit(state: CliUsageLimitState): void;
   /**
    * A turn reached its terminal.
@@ -111,6 +114,11 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
    * lapse — re-pinning the card at 00:01 with no new input at all.
    */
   let preExistingBannerKey: string | undefined;
+  /** A raw native-log banner can represent many log episodes with identical
+   * pixels. Only the episode actually confirmed for this raw text may use the
+   * answered-turn compatibility fallback; a later log key is fresh evidence. */
+  let preExistingNativeLogEpisodeKey: string | undefined;
+  let lastNativeLogEpisode: { rawIdentity: string; episodeKey: string } | undefined;
   /**
    * This turn produced a harvested answer (noteTurnCompleted).
    *
@@ -167,6 +175,9 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       activeStructured = undefined;
       const current = detectCliUsageLimit(snapshot, undefined, { suppressRateKind: opts.isRateKindSuppressed() });
       preExistingBannerKey = current.limited ? bannerTextIdentity(current) : undefined;
+      preExistingNativeLogEpisodeKey = preExistingBannerKey
+        && lastNativeLogEpisode?.rawIdentity === preExistingBannerKey
+        ? lastNativeLogEpisode.episodeKey : undefined;
       staleBannerKey = current.limited && current.retryReady
         ? usageLimitStateKey(current)
         : undefined;
@@ -194,6 +205,8 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
         suppressRateKind: opts.isRateKindSuppressed(),
         ...(outputActive !== undefined ? { outputActive } : {}),
       });
+      const rawKey = detected.limited ? usageLimitStateKey(detected) : undefined;
+      const rawIdentity = detected.limited ? bannerTextIdentity(detected) : undefined;
       const limit = detected.limited ? (refineDetection ? refineDetection(detected) : detected) : undefined;
       if (!limit) {
         // Re-emit an authoritative structured limit recorded this turn so a
@@ -205,6 +218,11 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       }
 
       const key = usageLimitStateKey(limit);
+      if (limit.source === 'antigravity-native-log' && limit.nativeEpisodeKey && rawIdentity) {
+        lastNativeLogEpisode = { rawIdentity, episodeKey: limit.nativeEpisodeKey };
+      }
+      const rawIdentityMatchesConfirmedEpisode = limit.source !== 'antigravity-native-log'
+        || (limit.nativeEpisodeKey !== undefined && limit.nativeEpisodeKey === preExistingNativeLogEpisodeKey);
       // (a) master's rule: a banner already on screen whose reset time has
       //     already passed is definitionally leftover.
       // (b) the new rule: a banner that was ALREADY on screen when this turn
@@ -212,8 +230,9 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       //     The answer is positive proof the limit is not blocking, so the
       //     text is leftover no matter what its clock says. Without an
       //     answer we never suppress — a genuine re-refusal still reports.
-      if (key === staleBannerKey
-        || (turnProducedAnswer && bannerTextIdentity(limit) === preExistingBannerKey)) {
+      if (key === staleBannerKey || rawKey === staleBannerKey
+        || (turnProducedAnswer && (bannerTextIdentity(limit) === preExistingBannerKey
+          || (rawIdentity === preExistingBannerKey && rawIdentityMatchesConfirmedEpisode)))) {
         return { status };
       }
 
@@ -223,6 +242,10 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
     },
     detectedThisTurn(seq: number): boolean {
       return detectedTurn === seq;
+    },
+    noteScreenRecovery(): void {
+      if (activeStructured?.seq === turnSeq) return;
+      detectedTurn = undefined;
     },
     // Record a limit that came from a STRUCTURED signal (transcript error
     // record) rather than screen text. Mirrors classify()'s state writes so

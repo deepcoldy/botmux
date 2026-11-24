@@ -367,7 +367,8 @@ function quarantineUnregisteredRestoreSession(session: Session, reason: string):
 function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageLimit']): boolean {
   if (!a && !b) return true;
   if (!a || !b) return false;
-  return usageLimitStateKey(a) === usageLimitStateKey(b) && a.retryReady === b.retryReady && a.source === b.source;
+  return usageLimitStateKey(a) === usageLimitStateKey(b)
+    && a.retryReady === b.retryReady && a.source === b.source && a.directFailure === b.directFailure;
 }
 
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {

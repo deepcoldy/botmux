@@ -1,5 +1,6 @@
 /** Deterministic quota evidence from agy's own `--log-file` stream. */
 import { closeSync, openSync, readSync, statSync } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 
 export interface AntigravityNativeQuota {
   /** Stable native timestamp, unique across repeated quota episodes. */
@@ -49,6 +50,7 @@ export class AntigravityNativeQuotaLog {
   private offset = 0;
   private inode: string | undefined;
   private tail = '';
+  private decoder = new StringDecoder('utf8');
   private state: AntigravityNativeQuotaLogState = { inputSequence: 0 };
 
   constructor(readonly path: string) {}
@@ -61,6 +63,7 @@ export class AntigravityNativeQuotaLog {
         this.inode = inode;
         this.offset = 0;
         this.tail = '';
+        this.decoder = new StringDecoder('utf8');
         this.state = { inputSequence: 0 };
       }
       if (stat.size === this.offset) return this.state;
@@ -74,7 +77,7 @@ export class AntigravityNativeQuotaLog {
           const count = readSync(fd, buf, 0, buf.length, this.offset);
           if (count <= 0) break;
           this.offset += count;
-          const lines = (this.tail + buf.subarray(0, count).toString('utf8')).split('\n');
+          const lines = (this.tail + this.decoder.write(buf.subarray(0, count))).split('\n');
           this.tail = lines.pop() ?? '';
           for (const line of lines) {
             const input = parseNativeInput(line);

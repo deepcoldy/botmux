@@ -83,4 +83,54 @@ describe('Antigravity recovery delivery through the real screen sampler', () => 
     await vi.advanceTimersByTimeAsync(400);
     expect(messages).toHaveLength(3);
   });
+
+  it('sends late and revoked direct-failure proof through unchanged text frames', async () => {
+    vi.useFakeTimers();
+    const usageLimit: CliUsageLimitState = {
+      limited: true, kind: 'usage', retryAtMs: Date.now() + 60_000, retryLabel: '1m', retryReady: false,
+      relativeResetKey: 'usage:60000:proof', nativeEpisodeKey: 'log:proof', source: 'antigravity-native-log',
+    };
+    let usageAware: Record<string, unknown> = { status: 'limited', usageLimit };
+    class FakeRenderer {
+      snapshot() { return { content: 'same-native-text', changed: false }; }
+      rawSnapshot() { return 'same-native-text'; }
+      dispose() {}
+    }
+    class FakePromptSuggestions { observe() {} take() { return undefined; } }
+    const messages: Array<Record<string, any>> = [];
+    const startScreenUpdates = loadWorkerFunction<() => void>('startScreenUpdates', {
+      TerminalRenderer: FakeRenderer, PromptSuggestionPublisher: FakePromptSuggestions,
+      renderCols: 80, renderRows: 24, screenUpdateTimer: undefined, SCREEN_UPDATE_INTERVAL_MS: 100,
+      backend: {}, cliSpawnGeneration: 1, awaitingFirstPrompt: false, observedPaneGridRevision: 0,
+      lastPtyActivityAtMs: 0, shouldCaptureScreen: () => true, isScreenSelfDriven: () => false,
+      snapshotToText: async () => null, snapshotWithLatestRuntimeStatus, projectedRuntimeScreenStatus: () => 'idle',
+      classifyUsageLimitWithNativeEvidence: () => usageAware, cliAdapter: { id: 'antigravity' },
+      lastInitConfig: { cliId: 'antigravity' }, lastAnalyzerSnapshot: '',
+      traexQuestionBridgeActive: () => false, traexQuestionFlowVisible: () => false,
+      observeTraexAutoModelCapacity: () => {}, publishNativeReasoningFooter: () => {},
+      promptSuggestionReportTurn: () => undefined, settleBackgroundTasksFromSiblings: () => {},
+      refreshBackgroundWait: () => {}, backgroundWaitTasks: 0, startupInputHeld: () => false,
+      backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
+      currentBotmuxTurnId: 'turn-proof', currentBotmuxDispatchAttempt: 1,
+      send: (message: Record<string, unknown>) => messages.push(message), log: () => {},
+    });
+
+    startScreenUpdates();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(messages).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(messages).toHaveLength(1);
+
+    usageAware = { status: 'limited', usageLimit: { ...usageLimit, directFailure: true as const } };
+    await vi.advanceTimersByTimeAsync(100);
+    expect(messages).toHaveLength(2);
+    expect(messages[1]?.usageLimit.directFailure).toBe(true);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(messages).toHaveLength(2);
+
+    usageAware = { status: 'limited', usageLimit };
+    await vi.advanceTimersByTimeAsync(100);
+    expect(messages).toHaveLength(3);
+    expect(messages[2]?.usageLimit.directFailure).toBeUndefined();
+  });
 });

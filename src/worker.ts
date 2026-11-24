@@ -10084,6 +10084,7 @@ function classifyUsageLimitWithNativeEvidence(
     // 当前错误可以合法地保留同一页脚，不能用页脚本身区分这两种形态。
     if (!expiredAntigravityQuota && !nativeLogQuotaObserved
       && nativeViewportCaptured && isAntigravityReadyComposerScreen(evidence)) {
+      usageLimitTracker.noteScreenRecovery();
       return { status, usageLimitRecovery: 'antigravity-ready-composer' };
     }
     return expiredAntigravityQuota ? { ...result, expiredAntigravityQuota } : result;
@@ -19155,9 +19156,24 @@ async function captureAndUpload(): Promise<void> {
     || capturedTurnId !== currentBotmuxTurnId
     || capturedAttempt !== currentBotmuxDispatchAttempt;
   // Dedup is bound to the full identity: the same pixels under a new capture
-  // identity or display cycle are a NEW first frame, never a duplicate.
-  const dedupKey = (pixelHash: string, recovery?: UsageAwareScreen['usageLimitRecovery']): string =>
-    `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}${recovery ? `:recovery=${recovery}` : ''}`;
+  // identity or display cycle are a NEW first frame, never a duplicate. Native
+  // quota evidence can change while pixels stay fixed (late no-progress proof,
+  // a new log episode, or countdown expiry), so that semantic edge also owns a
+  // fresh key and is delivered once.
+  const limitIdentity = (limit: CliUsageLimitState | undefined): string | undefined => limit
+    ? JSON.stringify([
+      limit.kind, limit.retryAtMs, limit.retryLabel, limit.retryReady,
+      limit.nativeEpisodeKey, limit.relativeResetKey, limit.source, limit.directFailure === true,
+    ])
+    : undefined;
+  const dedupKey = (pixelHash: string, usageAware?: UsageAwareScreen): string => {
+    const recovery = usageAware?.usageLimitRecovery;
+    const base = `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}${recovery ? `:recovery=${recovery}` : ''}`;
+    if (!usageAware?.usageLimit && !usageAware?.expiredAntigravityQuota) return base;
+    return `${base}:usage=${JSON.stringify([
+      usageAware.status, limitIdentity(usageAware.usageLimit), limitIdentity(usageAware.expiredAntigravityQuota),
+    ])}`;
+  };
   let recaptureAfterStaleFrame = false;
   let ownedKey: string | null = null;
   let previousShotHash = lastShotHash;
@@ -19192,7 +19208,7 @@ async function captureAndUpload(): Promise<void> {
         // zero-classification fast path for unchanged pixels.
         if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
         usageAware = classifyScreenUsageLimit(pipeResult.content, projectedRuntimeScreenStatus());
-        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
+        const key = dedupKey(pixelHash, usageAware);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
@@ -19209,7 +19225,7 @@ async function captureAndUpload(): Promise<void> {
         pixelHash = createHash('md5').update(snap).digest('hex');
         if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
         usageAware = classifyScreenUsageLimit(snap, projectedRuntimeScreenStatus());
-        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
+        const key = dedupKey(pixelHash, usageAware);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
@@ -19247,7 +19263,7 @@ async function captureAndUpload(): Promise<void> {
     // Commit the evidence actually sent, not the pre-upload classification.
     // A capture failure during upload must leave a later ready edge deliverable.
     if (lastShotHash === ownedKey) {
-      ownedKey = dedupKey(pixelHash, currentUsageAware.usageLimitRecovery);
+      ownedKey = dedupKey(pixelHash, currentUsageAware);
       lastShotHash = ownedKey;
     }
     // Success is otherwise completely silent (skips and failures log above), which
@@ -26966,6 +26982,7 @@ function startScreenUpdates(): void {
   renderer = new TerminalRenderer(renderCols, renderRows);
   let lastSentStatus: string | undefined;
   let lastSentExpiredQuotaKey: string | undefined;
+  let lastSentUsageLimitEvidence: string | undefined;
   let lastSentRecovery: UsageAwareScreen['usageLimitRecovery'];
   let lastSentBackgroundWait = 0;
   let lastSentModelRequestAt: number | undefined;
@@ -27250,7 +27267,13 @@ function startScreenUpdates(): void {
       // leave the card at its starting state until the first write happens.
       if (startupInputHeld()) return;
       const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
+      const usageLimit = usageAware.usageLimit;
+      const usageLimitEvidence = usageLimit ? JSON.stringify([
+        usageLimit.kind, usageLimit.retryAtMs, usageLimit.retryLabel, usageLimit.retryReady,
+        usageLimit.nativeEpisodeKey, usageLimit.relativeResetKey, usageLimit.source, usageLimit.directFailure === true,
+      ]) : undefined;
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
+        || usageLimitEvidence !== lastSentUsageLimitEvidence
         || usageAware.usageLimitRecovery !== lastSentRecovery
         || backgroundWaitTasks !== lastSentBackgroundWait
         || modelRequestClock.lastServedAt() !== lastSentModelRequestAt
@@ -27259,6 +27282,7 @@ function startScreenUpdates(): void {
         || awaySummaryFocus.isActive !== lastSentAwaySummaryPending) {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
+        lastSentUsageLimitEvidence = usageLimitEvidence;
         lastSentRecovery = usageAware.usageLimitRecovery;
         lastSentBackgroundWait = backgroundWaitTasks;
         lastSentModelRequestAt = modelRequestClock.lastServedAt();

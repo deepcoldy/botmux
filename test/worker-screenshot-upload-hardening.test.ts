@@ -122,6 +122,48 @@ describe('worker screenshot upload hardening', () => {
     expect(uploadImageBuffer).toHaveBeenCalledTimes(2);
   });
 
+  it('delivers unchanged-pixel native proof, episode and expiry edges, then deduplicates them', async () => {
+    const nativeLimit = {
+      limited: true as const, kind: 'usage' as const, retryAtMs: 100_000, retryLabel: '1m', retryReady: false,
+      relativeResetKey: 'usage:60000:native', nativeEpisodeKey: 'log:native-old', source: 'antigravity-native-log' as const,
+    };
+    let usageAware: any = { status: 'limited', usageLimit: nativeLimit };
+    const send = vi.fn();
+    const uploadImageBuffer = vi.fn(async () => `img_${uploadImageBuffer.mock.calls.length}`);
+    const harness = executeProductionCapture({
+      logScreenshotSkip: vi.fn(),
+      snapshotToPng: vi.fn(async () => ({ ansi: 'same-native-pixels', png: Buffer.from('png'), content: 'same-native-pixels' })),
+      backend: {}, renderCols: 80, renderRows: 24, renderer: null,
+      createHash: vi.fn(), clamp: vi.fn(), captureToPng: vi.fn(), uploadImageBuffer,
+      logError: vi.fn(), log: vi.fn(), projectedRuntimeScreenStatus: () => 'idle', send,
+      classifyScreenUsageLimit: () => usageAware,
+      currentBotmuxTurnId: 'turn_1', currentBotmuxDispatchAttempt: 1,
+      cliAdapter: { id: 'antigravity' },
+    });
+
+    await harness.captureAndUpload();
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledOnce();
+
+    usageAware = { status: 'limited', usageLimit: { ...nativeLimit, directFailure: true as const } };
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1]?.[0].usageLimit.directFailure).toBe(true);
+
+    usageAware = { status: 'limited', usageLimit: { ...nativeLimit, nativeEpisodeKey: 'log:native-new', directFailure: true as const } };
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(3);
+
+    usageAware = { status: 'idle', expiredAntigravityQuota: usageAware.usageLimit };
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(4);
+    expect(send.mock.calls[3]?.[0].expiredAntigravityQuota.nativeEpisodeKey).toBe('log:native-new');
+
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(4);
+    expect(uploadImageBuffer).toHaveBeenCalledTimes(4);
+  });
+
   it('keeps other CLIs on the original unchanged-pixel fast path without reclassifying', async () => {
     const classifyScreenUsageLimit = vi.fn(() => ({ status: 'idle' }));
     const harness = executeProductionCapture({

@@ -5118,7 +5118,8 @@ function updateUsageLimitState(
     !ds.usageLimitPersistPending &&
     usageLimitStateKey(previous) === usageLimitStateKey(usageLimit) &&
     previous.retryReady === usageLimit.retryReady &&
-    previous.source === usageLimit.source
+    previous.source === usageLimit.source &&
+    previous.directFailure === usageLimit.directFailure
   ) return;
 
   ds.usageLimit = usageLimit;
@@ -21595,26 +21596,28 @@ function setupWorkerHandlers(
     // matching the exact recorded turn. Without `provenTurn` (e.g. a
     // direct Web Terminal prompt), rotate + restart cleanly and ask the
     // user to resend rather than replaying an older completed Lark turn.
-    const capturedFailedTurn = ds.session.lastFailedTurn;
-    const matchesFailedTurn = Boolean(
-      provenTurn && capturedFailedTurn && capturedFailedTurn.turnId === provenTurn,
-    );
-    // Replay only a failure with durable no-progress proof. agy attaches that
-    // proof to its limitedSnapshot only when the exact native USER_INPUT has no
-    // subsequent assistant/tool records; a turn that already performed work is
-    // rotated + resumed but never repeated from its original side effects.
-    const replayPayload = matchesFailedTurn
-      && capturedFailedTurn?.directFailure === true
-      && capturedFailedTurn.status === 'failed'
-      && !capturedFailedTurn.recovery
-      && capturedFailedTurn.retryable !== false
-      && capturedFailedTurn.cliInput.trim()
-      ? {
-          sourceTurnId: capturedFailedTurn.turnId,
-          cliInput: capturedFailedTurn.cliInput,
-          userPrompt: capturedFailedTurn.userPrompt,
-        }
-      : undefined;
+    const replayPayloadForCurrentProof = () => {
+      const capturedFailedTurn = ds.session.lastFailedTurn;
+      const currentLimit = ds.usageLimit;
+      const matchesFailedTurn = Boolean(
+        provenTurn && capturedFailedTurn && capturedFailedTurn.turnId === provenTurn,
+      );
+      return matchesFailedTurn
+        && currentLimit?.directFailure === true
+        && cliUsageLimitEpisodeKey(currentLimit) === cliUsageLimitEpisodeKey(limit)
+        && capturedFailedTurn?.directFailure === true
+        && capturedFailedTurn.status === 'failed'
+        && !capturedFailedTurn.recovery
+        && capturedFailedTurn.retryable !== false
+        && capturedFailedTurn.cliInput.trim()
+        ? {
+            sourceTurnId: capturedFailedTurn.turnId,
+            cliInput: capturedFailedTurn.cliInput,
+            userPrompt: capturedFailedTurn.userPrompt,
+          }
+        : undefined;
+    };
+    const replayPayload = replayPayloadForCurrentProof();
     const formatAccountLabel = (id?: string, email?: string): string => {
       const masked = maskAntigravityEmail(email);
       if (id && masked) return `\`${id}\` (${masked})`;
@@ -21636,6 +21639,7 @@ function setupWorkerHandlers(
       lastCliInputTurnId: provenTurn ? ds.lastCliInputTurnId : undefined,
       lastMessageAt: ds.lastMessageAt,
       replayPayload,
+      getReplayPayload: replayPayloadForCurrentProof,
       getRotationState: () => ds.antigravityRotation,
       setRotationState: state => { ds.antigravityRotation = state; },
       rotateAccount: params => rotateAntigravityAccountOnQuotaLimit(params),
@@ -24328,11 +24332,38 @@ function setupWorkerHandlers(
           directSubmit: msg.directSubmit,
         });
         if (!stalePostTerminalBusy) cancelPostTerminalStatusSettle(ds);
-        // Wait for worker init, independently of Web Terminal availability.
-        // ZMX intentionally reports ready with port=0, but its plain-history
-        // screenshots and idle/status transitions must keep flowing.
-        if (!startupState.ready && !workerHasInitialized(ds)) break;
         const screenTurnId = provenScreenTurnId(msg.turnId, msg.dispatchAttempt);
+        // A rotation restart resets readiness before the old worker's final
+        // transcript sample can arrive. For the active rotation's exact turn,
+        // admit native limited evidence when its episode or proof changes: a
+        // replacement episode must invalidate the cached replay just like a
+        // revoked proof. Other pre-ready frames keep the initialization gate.
+        if (!startupState.ready && !workerHasInitialized(ds)) {
+          const rotation = ds.antigravityRotation;
+          const ownsReplayTurn = rotation?.inFlightToken !== undefined && screenTurnId !== undefined
+            && (rotation.logicalTurnId === screenTurnId || rotation.lastReplayTurnId === screenTurnId);
+          const nativeSource = (source: CliUsageLimitState['source']): boolean =>
+            source === 'antigravity-error-composer' || source === 'antigravity-native-log';
+          const lateNativeEvidence = previousLimit && msg.usageLimit && ownsReplayTurn
+            && nativeSource(previousLimit.source) && nativeSource(msg.usageLimit.source)
+            && ds.lastScreenStatus === 'limited' && projectedScreenStatus === 'limited'
+            && (previousLimit.directFailure !== msg.usageLimit.directFailure
+              || cliUsageLimitEpisodeKey(previousLimit) !== cliUsageLimitEpisodeKey(msg.usageLimit));
+          if (lateNativeEvidence) {
+            updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation);
+            try {
+              const published = cb.onScreenStatus?.(ds, {
+                prevStatus: 'limited', status: 'limited', turnId: screenTurnId,
+              });
+              void Promise.resolve(published).catch((err: any) => {
+                logger.debug(`[${t}] late usage-proof bridge failed: ${err?.message ?? err}`);
+              });
+            } catch (err: any) {
+              logger.debug(`[${t}] late usage-proof bridge threw: ${err?.message ?? err}`);
+            }
+          }
+          break;
+        }
         const startingCardRecovered = !stalePostTerminalBusy && (!msg.turnId || screenTurnId)
           && noteStartingCardHealthFrame(ds, msg.turnId, projectedScreenStatus);
         const prevStatus = ds.lastScreenStatus;
@@ -24838,9 +24869,15 @@ function setupWorkerHandlers(
         // screen_update. Reuse the same status bridge for BOTH entering and
         // leaving limited so lastFailedTurn is recorded before rotation and a
         // consumed sticky episode is cleared after recovery.
+        const limitedFailedTurn = ds.session.lastFailedTurn;
+        const limitedProofChanged = ds.lastScreenStatus === 'limited'
+          && (previousLimit?.directFailure !== ds.usageLimit?.directFailure
+            || limitedFailedTurn !== undefined && limitedFailedTurn.turnId === frameVerdict.source.turnId
+              && limitedFailedTurn.limitedSnapshot === true
+              && limitedFailedTurn.directFailure !== ds.usageLimit?.directFailure);
         if (!stalePostTerminalShot && ownsLifecycleMutation()
-          && prevStatus !== ds.lastScreenStatus
-          && (prevStatus === 'limited' || ds.lastScreenStatus === 'limited')) {
+          && (prevStatus !== ds.lastScreenStatus
+            && (prevStatus === 'limited' || ds.lastScreenStatus === 'limited') || limitedProofChanged)) {
           try {
             const published = cb.onScreenStatus?.(ds, {
               prevStatus,

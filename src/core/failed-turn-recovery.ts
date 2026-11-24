@@ -78,7 +78,7 @@ export function failedTurnCaller(ds: DaemonSession, turnId: string): TrustedCall
 /** Some structured quota failures have no turn_terminal. Record their input
  * once at the native limited edge, while the authenticated turn still exists. */
 export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | undefined): void {
-  if (!turnId || ds.lastCliInputTurnId !== turnId || !ds.usageLimit?.limited || ds.session.lastFailedTurn?.turnId === turnId) return;
+  if (!turnId || ds.lastCliInputTurnId !== turnId || !ds.usageLimit?.limited) return;
   // This snapshot exists for limits that never reach turn_terminal. Once the
   // turn has an observed terminal, recordFailedTurnTerminal owns its outcome; a
   // later `limited` frame is the sticky ds.usageLimit carried past the turn, not
@@ -86,6 +86,27 @@ export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | unde
   // the terminal, so without this an answered recovery is recorded as
   // rate_limited and offered for replay.
   if (ds.terminalIdentityTurnIds?.has(turnId)) return;
+  const previous = ds.session.lastFailedTurn;
+  if (previous?.turnId === turnId) {
+    // Only an unclaimed provisional observation can absorb late transcript
+    // evidence. Real terminal records and durable recovery claims are frozen.
+    if (!previous.limitedSnapshot || previous.recovery) return;
+    const directFailure = ds.usageLimit.directFailure === true;
+    if ((previous.directFailure === true) === directFailure) return;
+    const updated = { ...previous };
+    if (directFailure) updated.directFailure = true;
+    else delete updated.directFailure;
+    ds.session.lastFailedTurn = updated;
+    try {
+      store.updateSession(ds.session);
+    } catch (error) {
+      // Keep the old in-memory proof so an identical later frame retries the
+      // write instead of treating the failed mutation as already durable.
+      ds.session.lastFailedTurn = previous;
+      throw error;
+    }
+    return;
+  }
   const caller = failedTurnCaller(ds, turnId);
   if (!caller) return;
   const record = buildFailedTurnRecord({ turnId, status: 'failed', errorCode: `${ds.usageLimit.kind}_limited` }, {
@@ -98,7 +119,12 @@ export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | unde
     record.limitedSnapshot = true;
     if (ds.usageLimit.directFailure) record.directFailure = true;
     ds.session.lastFailedTurn = record;
-    store.updateSession(ds.session);
+    try {
+      store.updateSession(ds.session);
+    } catch (error) {
+      ds.session.lastFailedTurn = previous;
+      throw error;
+    }
   }
 }
 

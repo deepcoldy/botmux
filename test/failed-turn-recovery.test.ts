@@ -455,6 +455,53 @@ describe('controlled failed-turn recovery', () => {
     recordLimitedFailedTurn(ds, request.turnId);
     expect(ds.session.lastFailedTurn).toMatchObject({ limitedSnapshot: true, directFailure: true });
   });
+  it('updates and revokes no-progress proof only on the same provisional limited snapshot', () => {
+    delete ds.session.lastFailedTurn;
+    ds.activeInteractiveTurn = { turnId: request.turnId, caller };
+    ds.lastUserPrompt = 'task'; ds.lastCliInput = 'wrapped';
+    ds.usageLimit = { limited: true, kind: 'usage' };
+    recordLimitedFailedTurn(ds, request.turnId);
+    const original = ds.session.lastFailedTurn;
+    expect(original).toMatchObject({ limitedSnapshot: true });
+    expect(original.directFailure).toBeUndefined();
+
+    ds.usageLimit = { limited: true, kind: 'usage', directFailure: true };
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn).toMatchObject({ limitedSnapshot: true, directFailure: true });
+    expect(ds.session.lastFailedTurn.failedAt).toBe(original.failedAt);
+
+    ds.usageLimit = { limited: true, kind: 'usage' };
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn.directFailure).toBeUndefined();
+    expect(ds.session.lastFailedTurn.failedAt).toBe(original.failedAt);
+
+    ds.session.lastFailedTurn.recovery = {
+      requestId: request.requestId, mode: 'retry', turnId: 'bmx-recovery', sessionId: 'old', state: 'attempting',
+    };
+    ds.usageLimit = { limited: true, kind: 'usage', directFailure: true };
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn.directFailure).toBeUndefined();
+  });
+  it('never rewrites a real terminal record when quota proof changes', () => {
+    ds.activeInteractiveTurn = { turnId: request.turnId, caller };
+    ds.lastUserPrompt = 'task'; ds.lastCliInput = 'wrapped';
+    const terminal = {
+      turnId: request.turnId, cliInput: 'wrapped', userPrompt: 'task',
+      failedAt: request.failedAt, status: 'failed' as const, retryCount: 0,
+    };
+    ds.session.lastFailedTurn = terminal;
+    ds.usageLimit = { limited: true, kind: 'usage', directFailure: true };
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn).toBe(terminal);
+    expect(ds.session.lastFailedTurn.directFailure).toBeUndefined();
+
+    const provenTerminal = { ...terminal, directFailure: true as const };
+    ds.session.lastFailedTurn = provenTerminal;
+    ds.usageLimit = { limited: true, kind: 'usage' };
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn).toBe(provenTerminal);
+    expect(ds.session.lastFailedTurn.directFailure).toBe(true);
+  });
   it('does not record a carried-over limit for a turn that already completed', () => {
     // Observed on a recovery turn: the earlier 429 left ds.usageLimit set, the
     // recovery turn answered and settled `completed`, and the next idle frame

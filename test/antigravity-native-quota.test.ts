@@ -99,6 +99,26 @@ describe('Antigravity native quota log evidence', () => {
     });
   });
 
+  it.each(['first-read', 'incremental-append'] as const)('preserves UTF-8 input split inside a code point (%s)', mode => {
+    const { path, log } = setup();
+    const linePrefix = 'I1123 20:52:20.000000 100 input_loop.go:104] HandleUserInput called with text: "';
+    const padding = 256 * 1024 - 1 - Buffer.byteLength(linePrefix);
+    const text = `${'x'.repeat(padding)}中文任务🙂`;
+    const encoded = Buffer.from(`${linePrefix}${text}"\n`);
+    const firstCodePointByte = 256 * 1024 - 1;
+    expect(encoded[firstCodePointByte]).toBe(Buffer.from('中')[0]);
+    if (mode === 'first-read') {
+      writeFileSync(path, Buffer.concat([encoded, Buffer.from(quota())]));
+    } else {
+      writeFileSync(path, encoded.subarray(0, firstCodePointByte + 1));
+      expect(log.read().quota).toBeUndefined();
+      appendFileSync(path, Buffer.concat([encoded.subarray(firstCodePointByte + 1), Buffer.from(quota())]));
+    }
+    expect(currentAntigravityNativeQuota(log.read(), text)).toMatchObject({
+      key: 'E1123 20:52:28.722278', inputSequence: 1,
+    });
+  });
+
   it('normalizes CRLF before comparing the native input', () => {
     const { path, log } = setup();
     writeFileSync(path, input('first line\nsecond line') + quota());
