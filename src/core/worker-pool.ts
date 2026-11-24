@@ -22982,11 +22982,28 @@ function setupWorkerHandlers(
         const legacyTerminalAt = ds.replyExecutionTerminals?.get(JSON.stringify([workerGeneration, msg.turnId, null]));
         /** A new attempt beginning after a legacy terminal is a fresh execution. */
         const predatesLegacyTerminal = legacyTerminalAt !== undefined && msg.startedAtMs < legacyTerminalAt;
-        if (exactTerminal || predatesLegacyTerminal
-          || (previousExecution?.completed && previousExecution.workerGeneration === workerGeneration)) {
+        // Authoritative terminals/supersedes (`completedByTerminal`) permanently
+        // block revival of that exact attempt. Heuristic idle retirement on
+        // non-turn-terminal CLIs still blocks duplicate/older starts, while
+        // allowing a strictly newer start timestamp (e.g. in-worker CLI restart
+        // replay or post-init literal write) to re-open the execution clock.
+        const retiredSameAttempt = previousExecution?.completed === true
+          && previousExecution.workerGeneration === workerGeneration
+          && (previousExecution.completedByTerminal === true || msg.startedAtMs <= previousExecution.startedAtMs);
+        if (exactTerminal || predatesLegacyTerminal || retiredSameAttempt) {
           break;
         }
         beginCliNotice(msg.turnId, msg.dispatchAttempt);
+        if (!sessionUsesTurnTerminal(ds, botCfg)) {
+          // Single-turn non-turn-terminal PTY CLIs never emit `turn_terminal` on
+          // normal completion. Supersede any older open entry on this worker so a
+          // missed idle frame (e.g. queued/interrupted follow-up) cannot leak
+          // overlapping long-task reminders for historical turns.
+          retireReplyExecutionStarts(ds, workerGeneration, {
+            predicate: (executionKey, _executionTurnId, _executionAttempt, execution) =>
+              executionKey !== key && execution.startedAtMs <= msg.startedAtMs,
+          });
+        }
         starts.delete(key);
         // No lastProgressAtMs yet: "last activity" only ever comes from a real
         // turn_progress event, never from the write itself.
@@ -24293,6 +24310,11 @@ function setupWorkerHandlers(
         // of its own: this edge is its settlement. Tombstone it so a re-sent
         // commit ACK for the same attempt cannot revive the obligation.
         settleAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, true);
+        retireReplyExecutionStarts(ds, workerGeneration, {
+          turnId: msg.turnId,
+          dispatchAttempt: msg.dispatchAttempt,
+          recordTombstone: true,
+        });
         handleCotThinkingSuperseded(ds, msg);
         if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
           void supersedeTurnReplyCard(ds, msg,
@@ -24442,6 +24464,18 @@ function setupWorkerHandlers(
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
           : undefined;
+        // Non-turn-terminal PTY CLIs (e.g. Antigravity terminal mode, Kimi,
+        // Copilot, OpenCode) never emit `turn_terminal` on normal completion.
+        // An idle screen with no pending background tasks is their turn-end
+        // boundary; retire open execution clocks before publishing Dashboard
+        // patches so reminders and execution-activity telemetry stop cleanly.
+        if (ds.lastScreenStatus === 'idle' && !ds.backgroundTaskCount && !sessionUsesTurnTerminal(ds, botCfg)) {
+          settleNonTerminalReplyExecutionsOnIdle(ds, workerGeneration, {
+            prevStatus,
+            turnId: msg.turnId,
+            dispatchAttempt: msg.dispatchAttempt,
+          });
+        }
         ds.awaySummaryPending = msg.awaySummaryPending === true;
         // Worker observations, so stale frames carry facts as truly as live ones.
         noteIdleAutoCompactTranscriptClock(ds, msg);
@@ -26531,29 +26565,11 @@ function setupWorkerHandlers(
         terminalSet.add(msg.turnId);
         trimOldest(terminalSet, TERMINAL_RECEIPT_DEDUPE_MAX);
         /** Retirement is independent of whether this exact start was observed yet. */
-        const executionTerminals = ds.replyExecutionTerminals ??= new Map();
-        /** Receipt time supplies an upper bound for attempt-less compatibility terminals. */
-        const executionTerminalAt = Date.now();
-        executionTerminals.set(JSON.stringify([workerGeneration, msg.turnId, msg.dispatchAttempt ?? null]), executionTerminalAt);
-        // Legacy terminals may omit dispatchAttempt. Retire this turn's observed
-        // clocks in the current worker, while keeping their original render timing.
-        for (const [executionKey, execution] of ds.replyExecutionStarts ?? []) {
-          /** Native start keys carry the exact logical turn and optional retry attempt. */
-          const [executionTurnId, executionAttempt] = JSON.parse(executionKey) as [string, number | null];
-          if (execution.workerGeneration === workerGeneration && executionTurnId === msg.turnId
-            && (msg.dispatchAttempt === undefined || executionAttempt === msg.dispatchAttempt)) {
-            execution.completed = true;
-            executionTerminals.set(JSON.stringify([workerGeneration, executionTurnId, executionAttempt]), executionTerminalAt);
-          }
-        }
-        // Keep the same bound as native start observations; generations never share a key.
-        while (executionTerminals.size > 512) {
-          /** Retire the oldest dedupe fact once it leaves the bounded observation window. */
-          const oldestTerminalKey = executionTerminals.keys().next().value;
-          if (oldestTerminalKey !== undefined) {
-            executionTerminals.delete(oldestTerminalKey);
-          }
-        }
+        retireReplyExecutionStarts(ds, workerGeneration, {
+          turnId: msg.turnId,
+          dispatchAttempt: msg.dispatchAttempt,
+          recordTombstone: true,
+        });
         // Read before the code below settles the auto-compact and HTTP-wait markers.
         const outcomeExcluded = isTurnOutcomeExcluded(ds, msg.turnId);
         // Excluded rounds deliberately keep the previous visible turn result.
@@ -29217,15 +29233,143 @@ function shouldDropMismatchedHermesFinalOutput(
   return true;
 }
 
+type ReplyExecutionStartEntry = NonNullable<DaemonSession['replyExecutionStarts']> extends Map<string, infer V> ? V : never;
+
+function recordReplyExecutionTerminal(
+  ds: DaemonSession,
+  workerGeneration: number,
+  turnId: string,
+  dispatchAttempt: number | null,
+  terminalAt: number,
+): void {
+  const executionTerminals = ds.replyExecutionTerminals ??= new Map();
+  executionTerminals.set(JSON.stringify([workerGeneration, turnId, dispatchAttempt]), terminalAt);
+  // Keep the same bound as native start observations; generations never share a key.
+  while (executionTerminals.size > 512) {
+    /** Retire the oldest dedupe fact once it leaves the bounded observation window. */
+    const oldestTerminalKey = executionTerminals.keys().next().value;
+    if (oldestTerminalKey !== undefined) {
+      executionTerminals.delete(oldestTerminalKey);
+    }
+  }
+}
+
+/** Mark matching execution clocks completed on `workerGeneration` while keeping
+ *  their original start timestamps for reply-timing rendering. When
+ *  `recordTombstone` is true (authoritative terminal/supersede/final), also
+ *  record bounded tombstones so late or out-of-order starts cannot revive them. */
+function retireReplyExecutionStarts(
+  ds: DaemonSession,
+  workerGeneration: number,
+  opts: {
+    turnId?: string;
+    dispatchAttempt?: number;
+    recordTombstone?: boolean;
+    predicate?: (
+      executionKey: string,
+      executionTurnId: string,
+      executionAttempt: number | null,
+      execution: ReplyExecutionStartEntry,
+    ) => boolean;
+  } = {},
+): boolean {
+  const terminalAt = Date.now();
+  if (opts.recordTombstone && opts.turnId) {
+    recordReplyExecutionTerminal(ds, workerGeneration, opts.turnId, opts.dispatchAttempt ?? null, terminalAt);
+  }
+  let changed = false;
+  for (const [executionKey, execution] of ds.replyExecutionStarts ?? []) {
+    if (execution.workerGeneration !== workerGeneration) continue;
+    /** Native start keys carry the exact logical turn and optional retry attempt. */
+    const [executionTurnId, executionAttempt] = JSON.parse(executionKey) as [string, number | null];
+    if (opts.turnId !== undefined) {
+      if (executionTurnId !== opts.turnId) continue;
+      if (opts.dispatchAttempt !== undefined && executionAttempt !== opts.dispatchAttempt) continue;
+    }
+    if (opts.predicate && !opts.predicate(executionKey, executionTurnId, executionAttempt, execution)) continue;
+    if (!execution.completed) {
+      execution.completed = true;
+      changed = true;
+    }
+    if (opts.recordTombstone) {
+      execution.completedByTerminal = true;
+      recordReplyExecutionTerminal(ds, workerGeneration, executionTurnId, executionAttempt, terminalAt);
+    }
+  }
+  return changed;
+}
+
+/** Settle open execution clocks on an idle screen frame for CLIs that do not
+ *  emit `turn_terminal`. When `turnId` identifies a tracked execution, retire
+ *  only that execution and older starts so an asynchronous idle snapshot from
+ *  a previous turn cannot retire a newer turn that already started; otherwise
+ *  require a real busy→idle edge before retiring all open clocks. */
+function settleNonTerminalReplyExecutionsOnIdle(
+  ds: DaemonSession,
+  workerGeneration: number,
+  opts: {
+    prevStatus: DaemonSession['lastScreenStatus'];
+    turnId?: string;
+    dispatchAttempt?: number;
+  },
+): boolean {
+  const starts = ds.replyExecutionStarts;
+  if (!starts || starts.size === 0) return false;
+  if (opts.turnId) {
+    let targetStartedAt: number | undefined;
+    for (const [executionKey, execution] of starts) {
+      if (execution.workerGeneration !== workerGeneration) continue;
+      const [executionTurnId, executionAttempt] = JSON.parse(executionKey) as [string, number | null];
+      if (executionTurnId === opts.turnId
+        && (opts.dispatchAttempt === undefined || executionAttempt === opts.dispatchAttempt)) {
+        targetStartedAt = targetStartedAt === undefined
+          ? execution.startedAtMs
+          : Math.max(targetStartedAt, execution.startedAtMs);
+      }
+    }
+    if (targetStartedAt !== undefined) {
+      return retireReplyExecutionStarts(ds, workerGeneration, {
+        predicate: (_key, executionTurnId, executionAttempt, execution) =>
+          (executionTurnId === opts.turnId
+            && (opts.dispatchAttempt === undefined || executionAttempt === opts.dispatchAttempt))
+          || execution.startedAtMs <= targetStartedAt!,
+      });
+    }
+  }
+  if (opts.prevStatus === 'working' || opts.prevStatus === 'analyzing') {
+    return retireReplyExecutionStarts(ds, workerGeneration);
+  }
+  return false;
+}
+
 /** Screen-only CLIs retain their legacy idle signal. For drivers with an
  * authoritative terminal, a quiet screen is not evidence of answer delivery.
  * Adopt/workflow/meeting lanes retain their existing dedicated UI contracts. */
-function sessionUsesTurnTerminal(ds: DaemonSession, botCfg: BotConfig): boolean {
-  const cliId = sessionCliId(ds, botCfg);
+export function sessionUsesTurnTerminal(ds: DaemonSession, botCfg?: BotConfig): boolean {
+  const resolvedBotCfg = botCfg ?? (() => {
+    try { return getBot(ds.larkAppId).config; }
+    catch { return undefined; }
+  })();
+  if (!resolvedBotCfg) {
+    const fallbackCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.initConfig?.cliId ?? ds.session.cliId;
+    if (!fallbackCliId) return true;
+    let fallbackAdapter: ReturnType<typeof createCliAdapterSync> | undefined;
+    try { fallbackAdapter = createCliAdapterSync(fallbackCliId as CliId); } catch { /* unknown cliId */ }
+    return hasTurnTerminalCapability({
+      cliId: fallbackCliId,
+      adapter: fallbackAdapter,
+      adoptMode: isSharedAdoptSession(ds),
+      zeroPrompt: sessionPromptInjection(ds) === 'none',
+      backendType: ds.initConfig?.backendType ?? ds.session.backendType,
+      dshRuntime: dshRuntimeForSession(ds),
+      scratch: sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged) === 'scratch',
+    });
+  }
+  const cliId = sessionCliId(ds, resolvedBotCfg);
   const dshRuntime = dshRuntimeForSession(ds);
-  const agyTransport = cliId === 'antigravity' ? antigravityTransport(botCfg.env) : undefined;
-  const adapter = createCliAdapterSync(cliId, botCfg.cliPathOverride, {
-    configDir: botCfg.cliConfigDir,
+  const agyTransport = cliId === 'antigravity' ? antigravityTransport(resolvedBotCfg.env) : undefined;
+  const adapter = createCliAdapterSync(cliId, resolvedBotCfg.cliPathOverride, {
+    configDir: resolvedBotCfg.cliConfigDir,
     ...(agyTransport ? { antigravityTransport: agyTransport } : {}),
   });
   return hasTurnTerminalCapability({
@@ -29233,7 +29377,7 @@ function sessionUsesTurnTerminal(ds: DaemonSession, botCfg: BotConfig): boolean 
     adapter,
     adoptMode: isSharedAdoptSession(ds),
     zeroPrompt: sessionPromptInjection(ds) === 'none',
-    backendType: ds.initConfig?.backendType ?? ds.session.backendType ?? botCfg.backendType,
+    backendType: ds.initConfig?.backendType ?? ds.session.backendType ?? resolvedBotCfg.backendType,
     dshRuntime,
     scratch: sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged) === 'scratch',
   });
