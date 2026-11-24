@@ -34,6 +34,8 @@ import { createChatWithUuid } from '../services/groups-store.js';
 import { registerSessionGroup } from '../services/session-groups-store.js';
 import { forwardMessage } from '../im/lark/client.js';
 import { runCollabGroupBirthS1, type CollabS1Deps } from './collab-orchestrator.js';
+import { findOnlineDaemon } from '../utils/daemon-discovery.js';
+import { preflightCollabPeer, COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT } from './collab-preflight-ipc.js';
 import type { RoutingContext } from '../im/lark/event-dispatcher.js';
 
 export type CollabPreflightResult =
@@ -62,6 +64,15 @@ export type SessionGroupBirthResult =
  * 占位返回 collab-handled(running) 而永久锁死同 DM。等 PR-2 接入真实 peer preflight
  * + S1–S5 编排后，生产才返回 ok；测试通过注入 `{ok:true}` 验证 ready 分支本身。
  */
+export interface CollabPeerPreflightContext {
+  config: SessionGroupCollaborationConfig;
+  initId: string;
+  sourceMessageId: string;
+  configVersion: string;
+  creatorAppId: string;
+  dataDir: string;
+}
+
 export interface CollabPreflightDeps {
   dataDir: string;
   now: () => number;
@@ -69,14 +80,14 @@ export interface CollabPreflightDeps {
   resolveTeamRole?: CollabValidationDeps['resolveTeamRole'];
   /** 可选：participant 存在性 + 非 apiOnly 判定（默认用 registry 缓存）。 */
   resolveAgent?: CollabValidationDeps['resolveAgent'];
-  peerPreflight?: (config: SessionGroupCollaborationConfig) => Promise<{ ok: true } | { ok: false; errors: string[] }>;
+  peerPreflight?: (ctx: CollabPeerPreflightContext) => Promise<{ ok: true } | { ok: false; errors: string[] }>;
 }
 
 /** PR-1 生产态：编排未实现前，显式 enabled 一律 fail-closed（见 CollabPreflightDeps 注释）。 */
 export const COLLAB_ORCHESTRATION_NOT_IMPLEMENTED = '协作初始化编排尚未实现（PR-2）';
 
 // 测试 seam：覆盖 defaultDeps 的 peerPreflight，让真实 daemon 入口测试能驱动 ready 分支
-// （PR-1 内 ready 只用于验证「扣费恰好 1 次」的契约；生产默认仍 fail-closed）。
+// （PR-1 内 ready 只用于验证「扣费恰好 1 次」的契约）。
 let __testOnlyPeerPreflight: CollabPreflightDeps['peerPreflight'] | undefined;
 export function __testOnly_setCollabPeerPreflight(fn: CollabPreflightDeps['peerPreflight'] | undefined): void {
   __testOnlyPeerPreflight = fn;
@@ -92,8 +103,51 @@ function defaultDeps(dataDir: string, creatorAppId: string): CollabPreflightDeps
       const found = loadBotConfigsCached().find(c => c.larkAppId === appId);
       return found ? { exists: true, apiOnly: found.apiOnly === true } : undefined;
     },
-    peerPreflight: __testOnlyPeerPreflight ?? (async () => ({ ok: false, errors: [COLLAB_ORCHESTRATION_NOT_IMPLEMENTED] })),
+    peerPreflight: __testOnlyPeerPreflight,
   };
+}
+
+/**
+ * 真实 peer preflight（PR-2b）：对每个非 creator participant 找在线 daemon，发
+ * collab.preflight。peer 离线 / 协议不匹配 / 目标 appId 不匹配 / 未声明必需能力 →
+ * 未就绪（fail-closed）。含 afterAgentTurn 依赖的 kickoff 目标必须声明
+ * durable-turn-output-receipt-v1。
+ */
+async function realCollabPeerPreflight(ctx: CollabPeerPreflightContext): Promise<{ ok: true } | { ok: false; errors: string[] }> {
+  const errors: string[] = [];
+  const requiresDurableReceipt = new Set(
+    ctx.config.kickoff
+      .filter(k => k.trigger === 'afterAgentTurn')
+      .map(k => k.afterAppId as string),
+  );
+  // 只 preflight 非 creator participant（creator 走本地）。
+  const peers = ctx.config.agents.filter(a => a.appId !== ctx.creatorAppId);
+  for (const agent of peers) {
+    const daemon = findOnlineDaemon(agent.appId, ctx.dataDir);
+    if (!daemon) {
+      errors.push(`peer ${agent.appId} 离线（未就绪）`);
+      continue;
+    }
+    if (daemon.dispatchLaunchIpcProtocol !== 'v1' || !daemon.bootInstanceId) {
+      errors.push(`peer ${agent.appId} 未声明 dispatch-launch IPC v1`);
+      continue;
+    }
+    const resp = await preflightCollabPeer(daemon, {
+      schemaVersion: 1,
+      initId: ctx.initId,
+      sourceMessageId: ctx.sourceMessageId,
+      configVersion: ctx.configVersion,
+      targetLarkAppId: agent.appId,
+    });
+    if (!resp.ok) {
+      errors.push(`peer ${agent.appId} preflight 未就绪：${resp.errorCode} ${resp.message}`);
+      continue;
+    }
+    if (requiresDurableReceipt.has(agent.appId) && !resp.capabilities.includes(COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT)) {
+      errors.push(`peer ${agent.appId} 配 afterAgentTurn 但未声明 durable-turn-output-receipt-v1`);
+    }
+  }
+  return errors.length ? { ok: false, errors } : { ok: true };
 }
 
 /**
@@ -168,7 +222,17 @@ export async function preflightCollabGroupBirth(
   // peer preflight（占位后）。reject / 失败一律转 failed 并释放占位，绝不残留 running。
   let peer: { ok: true } | { ok: false; errors: string[] };
   try {
-    peer = await (deps.peerPreflight ?? (async () => ({ ok: false as const, errors: [COLLAB_ORCHESTRATION_NOT_IMPLEMENTED] })))(validation.config);
+    const peerCtx: CollabPeerPreflightContext = {
+      config: validation.config,
+      initId,
+      sourceMessageId: messageId,
+      configVersion,
+      creatorAppId,
+      dataDir,
+    };
+    peer = deps.peerPreflight
+      ? await deps.peerPreflight(peerCtx)
+      : await realCollabPeerPreflight(peerCtx);
   } catch (err) {
     peer = { ok: false, errors: [`peer preflight 异常：${String((err as any)?.message ?? err)}`] };
   }

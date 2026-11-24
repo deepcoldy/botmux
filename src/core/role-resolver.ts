@@ -18,6 +18,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { sha256Hex } from '../utils/canonical-input-hash.js';
 
 // Upper bound on a role definition. Raised from the original 4 KB to give room
 // for richer personas; kept as a (generous) safety cap rather than removed
@@ -76,6 +77,53 @@ function truncateToByteLimit(content: string): string {
   let end = MAX_ROLE_BYTES;
   while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
   return buf.subarray(0, end).toString('utf-8');
+}
+
+/**
+ * 与 writeRoleFile 同源的规范化函数（§6.1）：trim + UTF-8 32KB 截断。
+ * 期望哈希按规范化后的**落盘字节**计算，不按原始输入 / JS 字符数 / 未截断内容。
+ */
+export function normalizeRoleContent(content: string): string {
+  return truncateToByteLimit(content.trim());
+}
+
+/** roleContentHash = sha256(utf8Bytes(normalizeRoleContent(content)))。 */
+export function roleContentHash(content: string): string {
+  return sha256Hex(Buffer.from(normalizeRoleContent(content), 'utf-8').toString('hex'));
+}
+
+export type StrictRoleRead =
+  | { kind: 'missing' }                          // 文件不存在
+  | { kind: 'empty' }                            // 存在但 normalize 后为空（等价 write '' 的显式清空）
+  | { kind: 'readable'; content: string }        // 读取成功，content 已 normalize
+  | { kind: 'read-error'; error: string };       // existsSync/statSync/readFileSync 抛错
+
+/**
+ * 严格读取（§6.1）：区分 missing / empty / readable / read-error。直接用
+ * existsSync + readFileSync 读，**不**走带负缓存/吞异常的 readRoleFile——缺失≠读错，
+ * read-error 不被归一成 missing。
+ */
+export function readRoleFileStrict(larkAppId: string, chatId: string): StrictRoleRead {
+  if (!larkAppId || !chatId || !isValidRoleChatId(chatId)) {
+    return { kind: 'read-error', error: 'invalid role chat id' };
+  }
+  const filePath = roleFilePath(larkAppId, chatId);
+  let exists: boolean;
+  try {
+    exists = existsSync(filePath);
+  } catch (err: any) {
+    return { kind: 'read-error', error: err?.message ?? String(err) };
+  }
+  if (!exists) return { kind: 'missing' };
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, 'utf-8');
+  } catch (err: any) {
+    return { kind: 'read-error', error: err?.message ?? String(err) };
+  }
+  const content = normalizeRoleContent(raw);
+  if (!content) return { kind: 'empty' };
+  return { kind: 'readable', content };
 }
 
 /** Shared stat + cache + read + truncate logic for chat and team role files. */

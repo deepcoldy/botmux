@@ -81,6 +81,7 @@ import { cliAuthBind, loadDashboardSecret, verifyHmac } from '../dashboard/auth.
 import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
 import { DISPATCH_LAUNCH_IPC_ROUTE_PREFIX } from './dispatch-launch-ipc-auth.js';
+import { COLLAB_IPC_ROUTE_PREFIX } from './collab-preflight-ipc.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
 import { WORKFLOW_NODE_REPORT_ROUTE } from './workflow-node-report.js';
@@ -1327,6 +1328,8 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
     if ((method === 'GET' && action === undefined)
         || (method === 'POST' && action !== undefined)) return true;
   }
+  // collab.preflight 与 dispatch-launch 同源：自带全 envelope HMAC，handler 认证。
+  if (method === 'POST' && pathname.match(new RegExp(`^${COLLAB_IPC_ROUTE_PREFIX}/[0-9a-f]{64}/preflight$`))) return true;
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/lark-tool-identity$/.test(pathname)) return true;
   // The receiver action endpoint performs its own rotating worker-capability
   // verification and then enters the durable action ledger. Keeping this one

@@ -233,21 +233,26 @@ beforeEach(async () => {
 });
 
 describe('协作初始化入口：fail-closed 不扣费不建群', () => {
-  it('合法 enabled 配置（编排未实现）→ preflight failed：0 次扣费、不建群、不开 CLI、无 running 残留', async () => {
-    await handleNewTopic(dmEvent('帮我协作做个任务', 'om_collab_1'), dmCtx('om_collab_1'));
+  it('peer preflight 失败 → preflight failed：0 次扣费、不建群、不开 CLI、无 running 残留', async () => {
+    __testOnly_setCollabPeerPreflight(async () => ({ ok: false, errors: ['peer offline'] }));
+    try {
+      await handleNewTopic(dmEvent('帮我协作做个任务', 'om_collab_1'), dmCtx('om_collab_1'));
 
-    // 0 次额度扣费
-    expect(chargedUnits()).toBe(0);
-    // 不建群（不落 legacy）
-    expect(mocks.createGroupWithBots).not.toHaveBeenCalled();
-    // 不开 CLI
-    expect(mocks.forkWorker).not.toHaveBeenCalled();
-    // DM 明示失败（回执）
-    expect(mocks.replyMessage).toHaveBeenCalled();
-    // 无 running 残留（占位已释放）
-    const store = readCollabInitStore(mocks.dataDir, APP);
-    expect(Object.values(store.entries).some(e => e.state === 'running')).toBe(false);
-    expect(store.activeByDmChat[DM_CHAT]).toBeUndefined();
+      // 0 次额度扣费
+      expect(chargedUnits()).toBe(0);
+      // 不建群（不落 legacy）
+      expect(mocks.createGroupWithBots).not.toHaveBeenCalled();
+      // 不开 CLI
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      // DM 明示失败（回执）
+      expect(mocks.replyMessage).toHaveBeenCalled();
+      // 无 running 残留（占位已释放）
+      const store = readCollabInitStore(mocks.dataDir, APP);
+      expect(Object.values(store.entries).some(e => e.state === 'running')).toBe(false);
+      expect(store.activeByDmChat[DM_CHAT]).toBeUndefined();
+    } finally {
+      __testOnly_setCollabPeerPreflight(undefined);
+    }
   });
 
   it('结构非法（enabled:true 但 agents 空）→ failed：0 次扣费、不建群、不落 legacy', async () => {
@@ -267,16 +272,21 @@ describe('协作初始化入口：fail-closed 不扣费不建群', () => {
     expect(mocks.replyMessage).toHaveBeenCalled();
   });
 
-  it('同 DM 下一条（不同 source）不是 busy（上次 failed 已释放占位）', async () => {
-    await handleNewTopic(dmEvent('第一个协作任务', 'om_collab_a'), dmCtx('om_collab_a'));
-    // 第二条仍是 failed（编排未实现），而非 busy
-    mocks.replyMessage.mockClear();
-    await handleNewTopic(dmEvent('第二个协作任务', 'om_collab_b'), dmCtx('om_collab_b'));
-    expect(chargedUnits()).toBe(0);
-    expect(mocks.replyMessage).toHaveBeenCalled();
-    // 第二条的失败回执不是因为 busy（busy 文案不同，这里只验证 store 无 running 且未 busy 卡死）
-    const store = readCollabInitStore(mocks.dataDir, APP);
-    expect(store.activeByDmChat[DM_CHAT]).toBeUndefined();
+  it('同 DM 下一条（不同 source）不是 busy（上次 peer preflight 失败已释放占位）', async () => {
+    __testOnly_setCollabPeerPreflight(async () => ({ ok: false, errors: ['peer offline'] }));
+    try {
+      await handleNewTopic(dmEvent('第一个协作任务', 'om_collab_a'), dmCtx('om_collab_a'));
+      // 第二条仍是 failed（peer 离线），而非 busy
+      mocks.replyMessage.mockClear();
+      await handleNewTopic(dmEvent('第二个协作任务', 'om_collab_b'), dmCtx('om_collab_b'));
+      expect(chargedUnits()).toBe(0);
+      expect(mocks.replyMessage).toHaveBeenCalled();
+      // 第二条的失败回执不是因为 busy，store 无 running 且未 busy 卡死
+      const store = readCollabInitStore(mocks.dataDir, APP);
+      expect(store.activeByDmChat[DM_CHAT]).toBeUndefined();
+    } finally {
+      __testOnly_setCollabPeerPreflight(undefined);
+    }
   });
 
   it('未启用协作 → 走 legacy 建群（行为与 master 一致，正常扣费 1 次）', async () => {

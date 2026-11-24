@@ -774,6 +774,13 @@ import {
   signDispatchLaunchIpcResponse,
   verifyDispatchLaunchIpcRequest,
 } from './core/dispatch-launch-ipc-auth.js';
+import {
+  COLLAB_IPC_ROUTE_PREFIX,
+  COLLAB_IPC_PROTOCOL_VERSION,
+  COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT,
+  declaresDurableTurnOutputReceipt,
+  parseCollabPreflightRequest,
+} from './core/collab-preflight-ipc.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isHumanInboundTurnId, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
 import { isSerialGroupInput, trustedSessionController } from './core/trusted-session-controller.js';
@@ -9275,6 +9282,54 @@ ipcRoute('POST', `${DISPATCH_LAUNCH_IPC_ROUTE_PREFIX}/:dispatchId/cancel`,
   (req, res, params) => dispatchLaunchIpcRoute(req, res, params, 'cancel'));
 ipcRoute('GET', `${DISPATCH_LAUNCH_IPC_ROUTE_PREFIX}/:dispatchId`,
   (req, res, params) => dispatchLaunchIpcRoute(req, res, params));
+
+// ─── collab.preflight（只读预检，PR-2b）────────────────────────────────────
+async function collabPreflightRoute(req: IncomingMessage, res: ServerResponse, params: Record<string, string>): Promise<void> {
+  if (!selfV3LarkAppId || !selfV3BootInstanceId) {
+    return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  }
+  let secret: string;
+  try { secret = loadDispatchLaunchIpcSecret(); }
+  catch { return jsonRes(res, 503, { ok: false, error: 'dispatch_launch_ipc_auth_unavailable' }); }
+  const verified = await verifyDispatchLaunchIpcRequest(req, {
+    secret,
+    target: { larkAppId: selfV3LarkAppId, bootInstanceId: selfV3BootInstanceId },
+    nonceStore: dispatchLaunchIpcNonces,
+  });
+  if (!verified.ok) {
+    logger.warn(`[collab-preflight] rejected: ${verified.reason}`);
+    return jsonRes(res, verified.httpStatus, { ok: false, error: 'collab_preflight_unauthorized' });
+  }
+  const reply = (status: number, payload: unknown): void =>
+    dispatchLaunchReply(req, res, status, payload, secret, verified.nonce, verified.target);
+  const parsed = parseCollabPreflightRequest(verified.bodyRaw);
+  if (!parsed.ok) {
+    return reply(400, { ok: false, errorCode: 'BAD_REQUEST' });
+  }
+  const { initId, targetLarkAppId } = parsed.req;
+  if (params.initId !== initId) {
+    return reply(400, { ok: false, errorCode: 'BAD_REQUEST' });
+  }
+  // target 校验：请求的目标 appId 必须等于本 daemon 自己。
+  if (targetLarkAppId !== selfV3LarkAppId) {
+    return reply(400, { ok: false, errorCode: 'TARGET_MISMATCH' });
+  }
+  let backendType: string | undefined;
+  try { backendType = getBot(selfV3LarkAppId).config.backendType; }
+  catch { return reply(404, { ok: false, errorCode: 'TARGET_NOT_FOUND', message: 'target bot not registered' }); }
+  const capabilities = declaresDurableTurnOutputReceipt(backendType)
+    ? [COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT]
+    : [];
+  // workingDir 可接受性：PR-2b 只做「可接受」的静态判定（bot 已注册即视为可接受），
+  // 真实目录/授权校验由后续 S3/S4 编排做。此处保守返回 true（不因目录问题在预检拦）。
+  return reply(200, {
+    ok: true,
+    protocolVersion: COLLAB_IPC_PROTOCOL_VERSION,
+    capabilities,
+    workingDirAccepted: true,
+  });
+}
+ipcRoute('POST', `${COLLAB_IPC_ROUTE_PREFIX}/:initId/preflight`, collabPreflightRoute);
 
 // Thin zero-I/O tombstones for old dashboard/cards/automation clients. Keeping
 // these explicit routes prevents stale callers from mistaking a generic 404 or

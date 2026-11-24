@@ -229,22 +229,16 @@ describe('preflightCollabGroupBirth', () => {
     expect(next.kind).toBe('ready');
   });
 
-  it('生产默认 peerPreflight 未实现 → 合法 enabled 配置返回 failed（PR-1 不走到扣费）', async () => {
+  it('生产默认：无 peer（creator-only 配置）时真实 peer preflight 返回 ready（PR-2b 切换真实 preflight）', async () => {
     __testOnly_setBotConfig(APP, collabEnabledConfig());
-    // 不注入 depsOverride 的 peerPreflight：用生产 defaultDeps（未实现 → failed）。
-    // 但 defaultDeps 的 resolveAgent 走 registry mock（返回 []），会先因「creator 不存在」失败；
-    // 这里注入 resolveAgent 让它通过身份校验，仅验证「未实现」分支。
+    // 不注入 peerPreflight：走 realCollabPeerPreflight。creator-only 配置无 peer → 直接 ready。
     const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), {
       dataDir: tempDir,
       now,
       resolveProfile: () => 'r',
       resolveTeamRole: () => null,
       resolveAgent: (appId) => (appId === APP ? { exists: true, apiOnly: false } : undefined),
-      // 不传 peerPreflight → defaultDeps 里的未实现分支
     });
-    expect(r.kind).toBe('failed');
-    if (r.kind === 'failed') expect(r.reason).toContain('尚未实现');
-    // 未实现分支在占位后失败并释放，无 running 残留
-    expect(Object.values(readCollabInitStore(tempDir, APP).entries).some(e => e.state === 'running')).toBe(false);
+    expect(r.kind).toBe('ready');
   });
 });
