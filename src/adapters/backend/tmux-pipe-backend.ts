@@ -24,6 +24,7 @@
  * grouped — fully zero-touch from tmux's perspective beyond the pipe-pane
  * subscription, which is automatically detached when we kill the backend.
  */
+import { CliStartupExitError } from '../../core/startup-failure-reason.js';
 import * as fs from 'node:fs';
 import { execSync, execFile, execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -568,7 +569,9 @@ export function buildPipePaneStartupError(rawErr: unknown, evidence: PipePaneDea
   ];
   if (evidence.lastScreen) lines.push(`最后一屏摘要：\n${evidence.lastScreen}`);
   if (rawFirstLine) lines.push(`原始 pipe-pane 错误：${rawFirstLine}`);
-  return new Error(lines.join('\n'));
+  const code = typeof evidence.paneDeadStatus === 'string' && /^\d+$/.test(evidence.paneDeadStatus)
+    ? Number(evidence.paneDeadStatus) : null;
+  return new CliStartupExitError(lines.join('\n'), code);
 }
 
 /** Best-effort post-mortem after a terminal pipe-pane failure. Runs one

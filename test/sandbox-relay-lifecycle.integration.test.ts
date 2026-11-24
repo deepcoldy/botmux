@@ -630,19 +630,20 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
 
   // #3470: the CLI chain in the fresh pane exits before pipe-pane attaches, so
   // tmux answers `target pane has exited`. The dead pane is retired and the
-  // tree rolled back as for any post-pane failure — and the worker's own log
-  // must say WHY (exit status, last screen). That reason used to travel only
-  // in the IPC error, so a CI flake of this shape showed nothing but
-  // "retired the tmux session it had created".
+  // tree rolled back as for any post-pane failure. The worker's local log must
+  // retain WHY (exit status, last screen); fatal IPC publishes only the safe
+  // numeric exit reason, never the terminal text.
   it.skipIf(!realTmux || !runtime)('tmux × fresh launch whose CLI exits before pipe-pane attaches: retires the dead pane, rolls the tree back, logs the pane\'s exit reason', async () => {
     const lab = createLab({ flavour, backend: 'tmux' });
     try {
       lab.cliDiesBeforePipePane();
       const first = lab.start('boot-1');
       await workerExit(first);
-      expect(first.errors().join('\n'), first.logs()).toContain('fake-cli: injected startup failure');
+      const fatal = first.errors().join('\n');
+      expect(fatal, first.logs()).toContain('退出码 3');
+      expect(fatal).not.toContain('fake-cli: injected startup failure');
       expect(first.logs()).toContain('retired the tmux session it had created');
-      expect(first.logs(), first.errors().join('\n')).toContain('fake-cli: injected startup failure');
+      expect(first.logs(), fatal).toContain('fake-cli: injected startup failure');
       expect(lab.paneAlive()).toBe(false);
       expect(lab.starts()).toEqual([]);
       expect(existsSync(lab.sessionRoot), first.logs()).toBe(false);
@@ -890,7 +891,7 @@ describe('unsandboxed session across a real worker lifecycle', () => {
     }
   }, 120_000);
 
-  it.skipIf(!realTmux)('tmux × dead adopted pane: keeps off-screen history out of the fatal IPC error', async () => {
+  it.skipIf(!realTmux)('tmux × dead adopted pane: keeps terminal evidence in local logs and out of fatal IPC', async () => {
     const lab = createLab({ flavour: 'off', backend: 'tmux' });
     const marker = `offscreen-${randomUUID()}`;
     const adoptSession = 'adopted-dead';
@@ -923,9 +924,12 @@ exit 3
       await workerExit(first);
       await vi.waitFor(() => expect(first.errors().length, first.logs()).toBeGreaterThan(0), { timeout: 20_000 });
       const fatal = first.errors().join('\n');
-      expect(fatal, first.logs()).toContain('tmux pane');
-      expect(fatal).toContain('f-29'); // viewport evidence is still reported
+      expect(fatal, first.logs()).toContain('退出码 3');
+      expect(fatal).not.toContain('tmux pane');
+      expect(fatal).not.toContain('f-29');
       expect(fatal).not.toContain(marker);
+      expect(first.logs()).toContain('tmux pane');
+      expect(first.logs()).toContain('f-29'); // viewport evidence remains local
     } finally {
       await lab.dispose();
     }

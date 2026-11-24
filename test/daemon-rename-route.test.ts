@@ -3069,6 +3069,43 @@ describe('/rename production routing — must not pre-create a session (review P
     }));
   });
 
+  it('wakes a startup-circuited raw activation on new input without releasing its ACK gate', async () => {
+    const anchor = 'om_raw_circuit_recovery';
+    const raw = '/goal OPENING_RAW_N';
+    const token = 'raw-circuit-token';
+    const send = vi.fn();
+    mocks.forkWorker.mockImplementationOnce((owner: any) => {
+      Object.assign(owner.session, { queued: false, queuedActivationPending: true,
+        queuedActivationToken: token, queuedActivationInput: { content: '' },
+        queuedActivationTurnId: anchor, queuedActivationResume: false });
+      owner.worker = { killed: false, send };
+    });
+    await handleNewTopic(makeEventData(anchor, raw), makeCtx(anchor, anchor));
+    const owner = activeSessions.get(sessionKey(anchor, APP))!;
+    expect(owner.pendingRawInput).toBe(raw);
+    expect(owner.initialStartPending).toBe(true);
+    // Production stop state: the worker survives, but cannot produce another
+    // prompt_ready until a coordinated restart actually reaches it.
+    owner.crashDiagnosticParked = true;
+    owner.cliStartupFailureReason = 'startup failed';
+    owner.workerReady = false;
+    await handleThreadReply(makeEventData('om_raw_recovery_1', 'RECOVER_ONE', anchor), makeCtx(anchor, 'om_raw_recovery_1'));
+    expect(send.mock.calls.map(c => c[0]).filter(m => m.type === 'restart')).toHaveLength(1);
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'message' }));
+    expect(owner.pendingRawInput).toBe(raw);
+    expect(owner.session.queuedActivationToken).toBe(token);
+    expect(owner.session.queuedActivationPending).toBe(true);
+    await handleThreadReply(makeEventData('om_raw_recovery_2', 'RECOVER_TWO', anchor), makeCtx(anchor, 'om_raw_recovery_2'));
+    expect(send.mock.calls.map(c => c[0]).filter(m => m.type === 'restart')).toHaveLength(1);
+    expect(owner.session.queuedActivationTail?.map(t => t.turnId)).toEqual(['om_raw_recovery_1', 'om_raw_recovery_2']);
+    // Only the real submission ACK may let N+1 cross the adapter boundary.
+    Object.assign(owner.session, { queuedActivationPending: undefined, queuedActivationToken: undefined,
+      queuedActivationInput: undefined, queuedActivationTurnId: undefined, queuedActivationResume: undefined,
+      pendingRepoSetup: undefined });
+    await expect(onQueuedActivationSubmitted(owner, token)).resolves.toBe(true);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', turnId: 'om_raw_recovery_1' }));
+  });
+
   it('refuses an existing raw CLI passthrough while activation admission owns the route', async () => {
     const anchor = 'om_passthrough_activation';
     const owner = seedThreadSession(anchor, 'activation owner');

@@ -845,6 +845,11 @@ export interface Session {
   /** Exact final worker input retained for retry. This may include a triggering
    * group reply in addition to the original dashboard backlog prompt. */
   queuedActivationInput?: CliTurnPayload;
+  /** Literal raw opening retained while its activation has no submission ACK.
+   * Unlike pendingRawInput, this survives daemon restart and immediate raw starts
+   * that never had a pendingRepoSetup. Cleared with the activation journal. */
+  queuedActivationRawInput?: string;
+  queuedActivationRawTurnId?: string;
   queuedActivationTurnId?: string;
   queuedActivationDispatchAttempt?: number;
   /** Frozen resume mode for the exact journal head. Backlog activations are
@@ -2353,7 +2358,7 @@ type DaemonToWorkerBase =
   // onExit so transient auto-restarted exits don't park-then-tear-down.
   // `terminal: false` (backend-outage give-up): only stop and wait for the next
   // message; do not create the bmx-diag shell on a tmux server that just failed.
-  | { type: 'park_diagnostic'; terminal?: boolean }
+  | { type: 'park_diagnostic'; terminal?: boolean; failPending?: boolean }
   | {
       type: 'tui_keys';
       keys: string[];
@@ -2810,6 +2815,8 @@ export type WorkerToDaemonBase =
     canParkDiagnostic?: boolean;
     /** Presentation-only evidence that this TraeX generation never reached a prompt. */
     traexStartupFailure?: boolean;
+    /** Fresh local CLI exited before readiness / opening argv turn evidence. */
+    startupFailure?: boolean;
     /** A Codex App thread is still owned by another app-server writer. */
     codexAppActiveWriter?: boolean;
     /** Linux bwrap sandbox could not create this namespace on this host. */
