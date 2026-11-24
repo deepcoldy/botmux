@@ -30,7 +30,7 @@ import { createHash } from 'node:crypto';
 import { readJsonlWindow } from './jsonl-cursor.js';
 import { logger } from '../utils/logger.js';
 import type { CodexBridgeEvent, CodexCotEntry } from './codex-transcript.js';
-import { doubaoSessionRoots } from '../adapters/cli/doubao.js';
+import { doubaoSessionRoots, doubaoContentWithCaptureId } from '../adapters/cli/doubao.js';
 import { boundSubjectForTransport, subjectFromArgsString } from './cot-subject.js';
 import { wholeInputHash, type CodexPendingTurn } from './codex-bridge-queue.js';
 
@@ -339,9 +339,18 @@ export function doubaoExportFrontier(path: string, turn: CodexPendingTurn): Doub
     if (sections.length === 0 || sections.some(section => section.incomplete || !section.event)) return;
     const index = sections.findIndex(section => section.event!.uuid === proof.uuid);
     const user = sections[index]?.event;
+    // The first write appends the adapter's capture block AFTER the queue mark.
+    // Keep raw native proof/query equality; tolerate only an exact round-trip
+    // through that same adapter, never arbitrary suffixes or prefix matching.
+    const capture = user && /\n\n<botmux_routing>\nbotmux_input_id: ([a-f0-9]{32})\n<\/botmux_routing>$/.exec(user.text);
+    const markedInput = capture ? user!.text.slice(0, capture.index) : undefined;
+    const matchesMark = user && (wholeInputHash(user.text) === turn.wholeInputHash
+      || capture && markedInput !== undefined
+      && doubaoContentWithCaptureId(markedInput, capture[1]!) === user.text
+      && wholeInputHash(markedInput) === turn.wholeInputHash);
     if (!user || user.timestampMs !== proof.timestampMs
       || createHash('sha256').update(user.text).digest('hex') !== proof.hash
-      || wholeInputHash(user.text) !== turn.wholeInputHash) return;
+      || !matchesMark) return;
     return {
       sessionId, index, queries: sections.map(section => section.event!.text),
       assignmentHash: createHash('sha256').update(bytes).digest('hex')

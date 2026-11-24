@@ -26,7 +26,7 @@ import {
   doubaoExportFrontier,
 } from '../src/services/doubao-transcript.js';
 import { commitDoubaoExportMode, doubaoExportOwnsTerminals, DoubaoExportRecovery } from '../src/services/doubao-export-recovery.js';
-import { doubaoBridgeSpec } from '../src/adapters/cli/doubao.js';
+import { doubaoBridgeSpec, doubaoContentWithCaptureId } from '../src/adapters/cli/doubao.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
@@ -62,10 +62,10 @@ describe('Doubao export recovery authority', () => {
         answer: turn.finalText, status: turn.terminalStatus
       });
     };
-    const request = (id: string, text: string) => {
+    const request = (id: string, text: string, nativeText = text) => {
       q.mark(id, text, now);
-      appendFileSync(assignment, `## [${new Date(now).toISOString()}] 需求\n${text}\n\n`);
-      exported.push({ query: text, response: '' });
+      appendFileSync(assignment, `## [${new Date(now).toISOString()}] 需求\n${nativeText}\n\n`);
+      exported.push({ query: nativeText, response: '' });
       drain();
       return q.peek().find(turn => turn.turnId === id)!;
     };
@@ -106,6 +106,46 @@ describe('Doubao export recovery authority', () => {
     expect(doubaoExportFrontier(r.trajectory, { ...second, nativeUserProof: undefined })).toBeUndefined();
     expect(doubaoExportFrontier(r.trajectory, { ...second, nativeUserProof: { ...first.nativeUserProof!, hash: 'wrong' } })).toBeUndefined();
     expect(doubaoExportFrontier(r.trajectory, { ...second, wholeInputHash: 'wrong' })).toBeUndefined();
+  });
+
+  it('collects a first-turn envelope prepared by the actual Doubao capture adapter', async () => {
+    const r = rig();
+    const input = '<session_id>fixture-session</session_id>\n<user_message>hello</user_message>';
+    const native = doubaoContentWithCaptureId(input, 'a'.repeat(32));
+    const turn = r.request('om_first', input, native);
+    r.exported[0]!.response = 'HELLO';
+    expect(doubaoExportFrontier(r.trajectory, turn)).toBeDefined();
+    await r.eligible(); await r.recovery.tick();
+    expect(r.emitted).toEqual([{ turnId: 'om_first', answer: 'HELLO', status: undefined }]);
+    // Export must still equal the persisted native input, including its id.
+    expect(doubaoExportAnswer(doubaoExportFrontier(r.trajectory, turn)!,
+      [{ query: input, response: 'WRONG_QUERY' }])).toBeUndefined();
+  });
+
+  it.each(['changed-request', 'malformed-id', 'trailing-text', 'capture-without-envelope'] as const)(
+    'does not turn capture suffix normalization into prefix attribution: %s', shape => {
+      const r = rig();
+      const input = shape === 'capture-without-envelope' ? 'bare hello'
+        : '<session_id>fixture-session</session_id>\n<user_message>hello</user_message>';
+      let native = doubaoContentWithCaptureId(input, 'a'.repeat(32));
+      if (shape === 'changed-request') native = native.replace('hello', 'different request');
+      if (shape === 'malformed-id') native = native.replace('a'.repeat(32), 'a'.repeat(31));
+      if (shape === 'trailing-text') native += '\nadditional payload';
+      if (shape === 'capture-without-envelope') native += `\n\n<botmux_routing>\nbotmux_input_id: ${'a'.repeat(32)}\n</botmux_routing>`;
+      const turn = r.request('om_first', input, native);
+      expect(doubaoExportFrontier(r.trajectory, turn)).toBeUndefined();
+    });
+
+  it('preserves a user-authored capture example while removing only the adapter-appended block for mark matching', () => {
+    const r = rig();
+    const input = '<session_id>fixture-session</session_id>\n<user_message>capture example</user_message>'
+      + `\n\n<botmux_routing>\nbotmux_input_id: ${'a'.repeat(32)}\n</botmux_routing>`;
+    const native = doubaoContentWithCaptureId(input, 'b'.repeat(32));
+    const turn = r.request('om_first', input, native);
+    const frontier = doubaoExportFrontier(r.trajectory, turn)!;
+    expect(frontier).toBeDefined();
+    expect(frontier.queries).toEqual([native]);
+    expect(doubaoExportAnswer(frontier, [{ query: native, response: 'EXAMPLE_PRESERVED' }])).toBe('EXAMPLE_PRESERVED');
   });
 
   it('rejects truncated, reordered and prefix-only exported history and torn assignment input', async () => {

@@ -103,7 +103,9 @@ function startScenario(opts: { submitDelayMs?: number; fresh?: boolean; exportOn
     rootMessageId: 'om_root', workingDir: dataDir, cliId: 'doubao', cliPathOverride: fakeCli,
     ...(opts.fresh ? {} : { cliSessionId: nativeId, resume: true }),
     backendType: opts.backend ?? 'tmux', launchShell: '/bin/bash', replyDelivery: 'transcript',
-    prompt: 'first task: inspect the build', turnId: 'om_turn_1',
+    prompt: opts.fresh
+      ? `<session_id>${sessionId}</session_id>\n<user_message>first task: inspect the build</user_message>`
+      : 'first task: inspect the build', turnId: 'om_turn_1',
     larkAppId: 'app_doubao', larkAppSecret: 'test-only', apiOnly: true,
     ...(opts.handoff ? { finalOutputHandoff: { version: 2, token: 'fixture-token', admitNew: true } } : {}),
   } satisfies DaemonToWorker);
