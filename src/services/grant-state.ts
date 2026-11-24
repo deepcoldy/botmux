@@ -19,7 +19,12 @@ export const GRANT_STATE_KEYS = [
 export type GrantStateKey = typeof GRANT_STATE_KEYS[number];
 
 export type QuotaRec = { limit: number; used: number };
-export type DispatchReceipt = { allow: boolean; chargedAt: string };
+/**
+ * 派发/准入扣费回执。`allow` + `chargedAt` 是派发扣费（dispatch-launch）的最小字段；
+ * 协作 creator 准入回执（`adm_` 前缀 id）额外带 `used`/`reason`/`quotaKey`，使恢复路径
+ * 能从 durable receipt 重建 provenance，不二扣也不丢已扣额度（PR-2a F1/F2/R3）。
+ */
+export type DispatchReceipt = { allow: boolean; chargedAt: string; used?: number; reason?: string; quotaKey?: string };
 
 export interface GrantStateFields {
   chatGrants?: { [chatId: string]: string[] };
@@ -30,7 +35,8 @@ export interface GrantStateFields {
 }
 
 const GRANT_KEY_RE = /^(chat:.+:.+|global:.+)$/;
-const RECEIPT_ID_RE = /^quota_[0-9a-f]{32}$/;
+// 两类 receipt id：派发扣费 `quota_<32hex>`、协作 creator 准入 `adm_<64hex>`。
+const RECEIPT_ID_RE = /^(quota_[0-9a-f]{32}|adm_[0-9a-f]{64})$/;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
@@ -78,9 +84,15 @@ export function parseGrantStateFields(entry: any): GrantStateFields {
     const map: { [k: string]: DispatchReceipt } = {};
     for (const [k, v] of Object.entries(entry.dispatchLaunchQuotaReceipts)) {
       if (!RECEIPT_ID_RE.test(k) || !isPlainObject(v)) continue;
-      const { allow, chargedAt } = v as { allow?: unknown; chargedAt?: unknown };
+      const { allow, chargedAt, used, reason, quotaKey } = v as { allow?: unknown; chargedAt?: unknown; used?: unknown; reason?: unknown; quotaKey?: unknown };
       if (typeof allow !== 'boolean' || typeof chargedAt !== 'string' || !Number.isFinite(Date.parse(chargedAt))) continue;
-      map[k] = { allow, chargedAt };
+      map[k] = {
+        allow,
+        chargedAt,
+        ...(typeof used === 'number' && Number.isInteger(used) && used >= 0 ? { used } : {}),
+        ...(typeof reason === 'string' && reason ? { reason } : {}),
+        ...(typeof quotaKey === 'string' && quotaKey ? { quotaKey } : {}),
+      };
     }
     if (Object.keys(map).length > 0) out.dispatchLaunchQuotaReceipts = map;
   }

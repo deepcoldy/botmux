@@ -181,12 +181,14 @@ async function runS1Critical(
 
   let chatId = entry.chatId;
 
+  // 任何进入 done/补账/retry/query 分支前统一核对 existingCreate.payloadHash（F4/R5）。
+  if (existingCreate && existingCreate.payloadHash !== createPayloadHash) {
+    await failInit(deps, creatorAppId, initId, entry.dmChatId, 'create operation payloadHash conflict', now);
+    return { kind: 'collab-handled', initId, status: 'failed' };
+  }
+
   if (existingCreate?.status === 'done') {
     // 已 done：跳过外部 create（R2/R5）。若 chatId 尚未落，从 receipt 补齐。
-    if (existingCreate.payloadHash !== createPayloadHash) {
-      await failInit(deps, creatorAppId, initId, entry.dmChatId, 'create operation payloadHash conflict', now);
-      return { kind: 'collab-handled', initId, status: 'failed' };
-    }
     if (!chatId) {
       chatId = (existingCreate.receipt as { chatId?: string } | undefined)?.chatId;
       if (chatId) {
@@ -206,21 +208,20 @@ async function runS1Critical(
     await advanceCollabStep({ dataDir: deps.dataDir, creatorAppId, initId, step: 'create', status: 'done', now });
   } else {
     // 无 chatId 且 op 未 done：需要真正 create。
-    if (existingCreate && existingCreate.payloadHash !== createPayloadHash) {
-      await failInit(deps, creatorAppId, initId, entry.dmChatId, 'create operation payloadHash conflict', now);
-      return { kind: 'collab-handled', initId, status: 'failed' };
-    }
     const firstAttemptAt = existingCreate?.firstAttemptAt ?? now;
-    if (existingCreate?.status === 'unknown' && firstAttemptAt !== undefined) {
-      // unknown 超窗禁止自动重建（R2）：进 awaiting-input('CREATE_UNKNOWN_EXPIRED')。
-      if (now - firstAttemptAt > COLLAB_CREATE_UUID_WINDOW_MS) {
-        await patchCollabInitEntry({
-          dataDir: deps.dataDir, creatorAppId, initId,
-          mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'CREATE_UNKNOWN_EXPIRED', since: now }; e.updatedAt = now; return true; },
-        });
-        return { kind: 'collab-handled', initId, status: 'awaiting_input' };
-      }
-      // 窗口内：用同 uuid 重试（Lark 返回原 chatId）。
+    // F3：所有带 firstAttemptAt、尚未得到确定结果的 attempting/unknown 都按未知外部结果处理，
+    // 超窗统一进 awaiting-input('CREATE_UNKNOWN_EXPIRED')，禁止自动重建。只有无 firstAttemptAt
+    // 的 planned 才首次发送。
+    if (
+      firstAttemptAt !== undefined
+      && (existingCreate?.status === 'unknown' || existingCreate?.status === 'attempting')
+      && now - firstAttemptAt > COLLAB_CREATE_UUID_WINDOW_MS
+    ) {
+      await patchCollabInitEntry({
+        dataDir: deps.dataDir, creatorAppId, initId,
+        mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'CREATE_UNKNOWN_EXPIRED', since: now }; e.updatedAt = now; return true; },
+      });
+      return { kind: 'collab-handled', initId, status: 'awaiting_input' };
     }
     await writeCollabOperation({
       dataDir: deps.dataDir, creatorAppId, initId, opKey: createOpKey, now,

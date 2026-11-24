@@ -76,6 +76,11 @@ export function collabCreatorAdmissionOperationId(initId: string): string {
   return sha256Hex(canonicalJson([initId, 'creator-admission']));
 }
 
+/** grant-state 持久回执 id = `adm_` + creatorAdmissionOperationId（64 hex）。 */
+export function collabCreatorAdmissionReceiptId(initId: string): string {
+  return `adm_${collabCreatorAdmissionOperationId(initId)}`;
+}
+
 /** forward operation 的稳定 uuid = sha256(canonicalJson([initId, 'forward'])).slice(0,32)。 */
 export function collabForwardUuid(initId: string): string {
   return sha256Hex(canonicalJson([initId, 'forward'])).slice(0, 32);

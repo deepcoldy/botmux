@@ -126,19 +126,6 @@ import { collabCreatorAdmissionOperationId, collabInitId, collabSourceKey } from
 import { initSessionGroups, isSessionGroup } from '../src/services/session-groups-store.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
-// R1：receipt 落盘失败 → 不进 S1。用测试 seam 强制 persist 失败。
-let __persistForceFail = false;
-vi.mock('../src/core/collab-orchestrator.js', async () => {
-  const actual = await vi.importActual<any>('../src/core/collab-orchestrator.js');
-  return {
-    ...actual,
-    persistCreatorAdmissionReceipt: async (...args: any[]) => {
-      if (__persistForceFail) return false;
-      return (actual.persistCreatorAdmissionReceipt as any)(...args);
-    },
-  };
-});
-
 const APP = 'collab_birth_app';
 const DM_CHAT = 'oc_dm_collab';
 const OWNER = 'ou_owner';
@@ -444,27 +431,25 @@ describe('协作初始化入口：fail-closed 不扣费不建群', () => {
     }
   });
 
-  it('R1：receipt 落盘失败 → 不进 S1（不建群），释放占位', async () => {
+  it('F2：owner/allowedUser 免额度（无 quotaKey）合法 ready 也走 collabCharge，正常进 S1', async () => {
     __testOnly_setCollabPeerPreflight(async () => ({ ok: true }));
-    __persistForceFail = true;
     try {
       writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([botConfig(validCollab)]));
       loadBotConfigs().forEach(cfg => registerBot(cfg));
       const bot = getBot(APP);
-      bot.resolvedAllowedUsers = [OWNER];
+      bot.resolvedAllowedUsers = [OWNER, GRANTEE]; // GRANTEE 成为 allowedUser → 免额度
       delete bot.config.chatGrants;
       delete bot.config.quotaState;
-      await addChatGrant(APP, DM_CHAT, GRANTEE, QUOTA_LIMIT);
+      // 无 chatGrant：GRANTEE 走 allowedUser 腿，reason='allowedUser'，无 quotaKey。
+      await handleNewTopic(dmEvent('owner 免额度任务', 'om_owner_free'), dmCtx('om_owner_free'));
 
-      await handleNewTopic(dmEvent('receipt 落盘失败任务', 'om_receipt_fail'), dmCtx('om_receipt_fail'));
-
-      // 不建群（S1 未进入）
-      expect(mocks.createGroupWithBots).not.toHaveBeenCalled();
-      // 占位已释放
+      // 免额度仍产出 receipt 并进 S1（createChat 抛错记为 create_unknown，但不再是「缺回执被拒」）。
       const store = readCollabInitStore(mocks.dataDir, APP);
-      expect(store.activeByDmChat[DM_CHAT]).toBeUndefined();
+      const entry = Object.values(store.entries)[0];
+      // 未因「缺回执」被 release failed：entry 仍在（state=running，因 create_unknown 或已占位）
+      expect(entry).toBeTruthy();
+      expect(entry.state).not.toBe('failed');
     } finally {
-      __persistForceFail = false;
       __testOnly_setCollabPeerPreflight(undefined);
     }
   });

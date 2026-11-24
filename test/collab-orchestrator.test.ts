@@ -346,6 +346,43 @@ describe('R2：chatId 已落但 create op 未 done → 补齐不二次 create', 
     expect(entry.state).toBe('awaiting-input');
     expect(entry.awaiting?.reason).toBe('CREATE_UNKNOWN_EXPIRED');
   });
+
+  it('F3：create op=attempting 崩溃超窗 → awaiting-input，不自动重建', async () => {
+    const { initId } = await seedEntry();
+    const createUuid = collabCreateUuid(initId, 0);
+    // attempting 已落盘、firstAttemptAt 存在、无 chatId
+    await patchCollabInitEntryForTest(tempDir, APP, initId, (e) => {
+      e.operations[createUuid] = { kind: 'create', status: 'attempting', uuid: createUuid, firstAttemptAt: 1, payloadHash: collabPayloadHash({ initId, createAttempt: 0, name: '' }) };
+      return true;
+    });
+    clock = 10 * 60 * 60 * 1000 + 60 * 1000;
+    const beforeCalls = chatCreateCalls.length;
+    const r = await runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), deps());
+    expect(r.kind).toBe('collab-handled');
+    if (r.kind === 'collab-handled') expect(r.status).toBe('awaiting_input');
+    expect(chatCreateCalls.length).toBe(beforeCalls); // 不自动重建
+    const entry = readCollabInitEntry(tempDir, APP, initId)!;
+    expect(entry.state).toBe('awaiting-input');
+    expect(entry.awaiting?.reason).toBe('CREATE_UNKNOWN_EXPIRED');
+  });
+
+  it('F4：已有 chatId 但 op 未 done 且 hash 冲突 → failed（补账前核对 payloadHash）', async () => {
+    const { initId } = await seedEntry();
+    const createUuid = collabCreateUuid(initId, 0);
+    // 预置 chatId + create op=attempting 但 payloadHash 故意写错（冲突）
+    await patchCollabInitEntryForTest(tempDir, APP, initId, (e) => {
+      e.chatId = 'oc_preset';
+      e.operations[createUuid] = { kind: 'create', status: 'attempting', uuid: createUuid, firstAttemptAt: 1, payloadHash: 'WRONG_HASH' };
+      return true;
+    });
+    const r = await runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), deps());
+    expect(r.kind).toBe('collab-handled');
+    if (r.kind === 'collab-handled') expect(r.status).toBe('failed');
+    const entry = readCollabInitEntry(tempDir, APP, initId)!;
+    expect(entry.state).toBe('failed');
+    // 不补账成 done（hash 冲突拒绝）
+    expect(entry.operations[createUuid].status).toBe('attempting');
+  });
 });
 
 describe('R5：payloadHash 判重完整（含 origin*，done 也拒绝冲突）', () => {

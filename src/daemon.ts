@@ -660,7 +660,7 @@ import { AutoCompactCoordinator, autoCompactBlockers, isAutoCompactEligible, rec
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
-import { consumeDispatchLaunchQuotaOnce, consumeQuota, removeChatGrant, removeGlobalGrant, sweepExpiredGrants } from './services/grant-store.js';
+import { consumeDispatchLaunchQuotaOnce, consumeQuota, consumeCollabAdmissionOnce, getCollabAdmissionReceipt, removeChatGrant, removeGlobalGrant, sweepExpiredGrants } from './services/grant-store.js';
 import { initGrantStateForDaemon } from './services/grant-state-store.js';
 import { abortCharge, commitCharge, beginCharge } from './services/quota-dedup.js';
 import {
@@ -1232,7 +1232,7 @@ import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from 
 import { preflightCollabGroupBirth, startCollabGroupBirth, releaseCollabGroupBirth } from './core/collab-group-birth.js';
 import { buildCreatorAdmissionReceipt, persistCreatorAdmissionReceipt } from './core/collab-orchestrator.js';
 import { readCollabInitEntry } from './services/collab-init-store.js';
-import type { CreatorAdmissionReceipt } from './services/collab-group-config.js';
+import { collabCreatorAdmissionOperationId, collabCreatorAdmissionReceiptId, type CreatorAdmissionReceipt } from './services/collab-group-config.js';
 import { scheduleSessionGroupTitle, subscribeSessionGroupTitles } from './services/session-group-title.js';
 import { hasPendingGroupAutoTitle, scheduleGroupAutoTitle } from './services/group-auto-title.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
@@ -6049,6 +6049,10 @@ export async function enforceMessageQuotaForCliInput(
      *  consumed used。仅在本次扣费真正成功（含无限额 tracked=false 放行）时调用一次。
      *  提供的是**本次判定的事实快照**，不是事后重新 evaluateTalk。 */
     onChargeCommitted?: (charge: { reason: string; quotaKey?: string; used: number; chargedAt: number }) => void;
+    /** 协作 creator 准入：扣费与回执同事务原子落盘（PR-2a F1/F2）。传入 receiptId 时，
+     *  本闸改用 consumeCollabAdmissionOnce（原子扣费+回执）替代普通 consumeQuota，免额度
+     *  授权也会写 used=0 回执；成功时经 onChargeCommitted 产出当次 facts。 */
+    collabCharge?: { receiptId: string; sourceOpenId: string; grantChatId?: string };
   },
 ): Promise<boolean> {
   if (opts?.crossChatFollowedThreadAuthorized) {
@@ -6232,6 +6236,43 @@ export async function enforceMessageQuotaForCliInput(
       logger.warn(`[hooks:${larkAppId}] prompt gate denial notify failed: ${err}`);
     }
     return false;
+  }
+
+  // 协作 creator 准入：原子扣费+回执（同事务），免额度授权也写 used=0 回执。
+  // 放在普通 `if (!ev.quotaKey) return true` 之前，因为免额度（无 quotaKey）也要落回执。
+  if (opts?.collabCharge) {
+    const charge = beginCharge(larkAppId, messageId);
+    if (charge === 'done') {
+      // 已扣费：从 durable 回执重建 facts（不二扣）。
+      const existing = getCollabAdmissionReceipt(larkAppId, opts.collabCharge.receiptId);
+      if (existing && existing.allow) {
+        opts.onChargeCommitted?.({ reason: existing.reason ?? ev.reason, quotaKey: existing.quotaKey, used: existing.used, chargedAt: Date.parse(existing.chargedAt) || Date.now() });
+        return true;
+      }
+      return false;
+    }
+    if (charge === 'pending') return false;
+    try {
+      const r = await consumeCollabAdmissionOnce({
+        larkAppId,
+        receiptId: opts.collabCharge.receiptId,
+        quotaKey: ev.quotaKey,
+        sourceOpenId: opts.collabCharge.sourceOpenId,
+        grantChatId: opts.collabCharge.grantChatId,
+        reason: ev.reason,
+      });
+      if (!r.allow) {
+        abortCharge(larkAppId, messageId);
+        return false;
+      }
+      commitCharge(larkAppId, messageId);
+      opts.onChargeCommitted?.({ reason: ev.reason, quotaKey: r.quotaKey, used: r.used, chargedAt: Date.parse(r.chargedAt) || Date.now() });
+      return true;
+    } catch (err) {
+      logger.warn(`[quota:${larkAppId}] collab admission consume failed; dropping message ${messageId.substring(0, 12)}: ${err}`);
+      abortCharge(larkAppId, messageId);
+      return false;
+    }
   }
 
   if (!ev.quotaKey) return true;
@@ -28101,10 +28142,21 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     }
     if (collabPreflight.kind === 'existing') {
       // R4：paid-but-not-created 重投可继续 S1 且 quota 不变。preflight 已确认同 source；
-      // 若 entry 已有 durable creatorAdmissionReceipt 但尚无 chatId（崩溃于扣费后、S1 前），
-      // 直接续跑 S1（不二次扣费），否则退回进度回执。
+      // 若 durable 准入回执已存在（grant-state，非仅 entry 投影）但 entry 尚无 chatId，
+      // 重建 receipt 续跑 S1（不二次扣费），否则退回进度回执。
       const existingEntry = readCollabInitEntry(config.session.dataDir, larkAppId, collabPreflight.initId);
-      const receipt = existingEntry?.creatorAdmissionReceipt as CreatorAdmissionReceipt | undefined;
+      const durable = getCollabAdmissionReceipt(larkAppId, collabCreatorAdmissionReceiptId(collabPreflight.initId));
+      const receipt: CreatorAdmissionReceipt | undefined = existingEntry?.creatorAdmissionReceipt as CreatorAdmissionReceipt | undefined
+        ?? (durable?.allow ? {
+          operationId: collabCreatorAdmissionOperationId(collabPreflight.initId),
+          quotaKey: durable.quotaKey,
+          used: durable.used,
+          chargedAt: Date.parse(durable.chargedAt) || Date.now(),
+          allow: true,
+          originReason: durable.reason,
+          originQuotaKey: durable.quotaKey,
+          originChatId: chatId,
+        } : undefined);
       if (receipt && !existingEntry?.chatId && existingEntry?.state === 'running') {
         const resumeResult = await startCollabGroupBirth(data, ctx, collabPreflight.initId, receipt);
         if (resumeResult.kind === 'collab-handled') return;
@@ -28147,6 +28199,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 本次扣费的不可变事实快照（R3）：由 enforceMessageQuotaForCliInput 的
     // onChargeCommitted 产出当次 reason/quotaKey/used，不事后重新 evaluateTalk。
     let chargeFact: { reason: string; quotaKey?: string; used: number; chargedAt: number } | undefined;
+    // 协作 ready：扣费与回执同事务原子落盘（F1/F2）。legacy 路径 collabCharge=undefined。
+    const collabCharge = collabPreflight.kind === 'ready'
+      ? { receiptId: collabCreatorAdmissionReceiptId(collabPreflight.initId), sourceOpenId: quotaSenderOpenId ?? '', grantChatId: chatId }
+      : undefined;
     if (!await enforceMessageQuotaForCliInput(
       larkAppId,
       chatId,
@@ -28157,7 +28213,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       quotaSenderUnionId,
       chatType,
       undefined,
-      { promptContent: birthPromptContent, promptAttachments: birthPromptAttachments, onChargeCommitted: (c) => { chargeFact = c; } },
+      { promptContent: birthPromptContent, promptAttachments: birthPromptAttachments, onChargeCommitted: (c) => { chargeFact = c; }, collabCharge },
     )) {
       // 扣费被拒（或闸未通过）：preflight 若已占位，释放 DM 占位，避免同 DM 永久 busy。
       if (collabPreflight.kind === 'ready') {
@@ -28174,9 +28230,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     quotaConsumedBeforeSessionGroupBirth = true;
     // 协作 ready 走 startCollabGroupBirth（S1 create 编排）；legacy 走原 maybeBirthSessionGroup。
     if (collabPreflight.kind === 'ready') {
-      // 阶段 2：用本次扣费事实快照构建并持久化 receipt（防崩溃重投二次扣费）。
-      // R1：receipt 未确认 durable 前不得进 S1；落盘失败显式失败并释放占位。
+      // 阶段 2：扣费已与回执同事务落盘（consumeCollabAdmissionOnce）；chargeFact 是当次事实。
+      // entry.creatorAdmissionReceipt 只是可重建投影：投影写失败不阻断 S1（durable receipt
+      // 在 grant-state 里，恢复路径据此重建 provenance，不二扣也不丢已扣额度，F1）。
       if (!chargeFact) {
+        // 理论上 collabCharge 路径必产出 chargeFact；此处 fail-closed 兜底。
         await releaseCollabGroupBirth({
           dataDir: config.session.dataDir, creatorAppId: larkAppId, initId: collabPreflight.initId,
           dmChatId: chatId, now: () => Date.now(),
@@ -28191,22 +28249,14 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         chargedAt: chargeFact.chargedAt,
         originChatId: chatId,
       });
-      const persisted = await persistCreatorAdmissionReceipt({
+      // 投影 best-effort：失败仅记日志，不阻断 S1（durable receipt 是权威）。
+      await persistCreatorAdmissionReceipt({
         dataDir: config.session.dataDir,
         creatorAppId: larkAppId,
         initId: collabPreflight.initId,
         receipt,
         now: Date.now(),
-      });
-      if (!persisted) {
-        // receipt 未 durable → 不进 S1（R1）。
-        await releaseCollabGroupBirth({
-          dataDir: config.session.dataDir, creatorAppId: larkAppId, initId: collabPreflight.initId,
-          dmChatId: chatId, now: () => Date.now(),
-        }).catch(() => { /* best-effort */ });
-        await replyMessage(larkAppId, messageId, tr('sg.collab_failed', { reason: 'admission receipt persist failed' }, localeForBot(larkAppId)), 'text').catch(() => {});
-        return;
-      }
+      }).catch(() => { logger.warn(`[collab:${larkAppId}] admission receipt projection persist failed; durable receipt still authoritative`); });
 
       const result = await startCollabGroupBirth(data, ctx, collabPreflight.initId, receipt);
       // 收到 collab-handled 后不递归 handleNewTopic、不落 DM thread（铁律 1）。
