@@ -431,6 +431,7 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue, CodexMidTurnReplyCollector, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
+import { StructuredMissingFinalWatchdog } from './services/structured-missing-final.js';
 import {
   BridgeBlindTurnWatch,
   blindTurnNeedsNotice,
@@ -14791,6 +14792,13 @@ function codexBridgeStartTimer(): void {
       } catch (err: any) {
         log(`Codex bridge tick expiry error: ${err.message}`);
       }
+      try {
+        // Worker-function harnesses for older ticker branches provide only the
+        // dependencies of that branch; the full worker always supplies this.
+        if (typeof maybeSettleMissingStructuredFinal === 'function') maybeSettleMissingStructuredFinal();
+      } catch (err: any) {
+        log(`Missing-final turn settlement error: ${err.message}`);
+      }
     }
   }, 1000);
 }
@@ -16869,6 +16877,84 @@ function retireRpcLifecycleFromStructuredTerminal(
   }
   clearRpcLifecycleFailClosedOwner(identity, generation);
   codexBridgeQueue.stopRpcActive(identity.turnId, identity.dispatchAttempt);
+}
+
+function notifyMissingFinalTurn(turnId: string): void {
+  send({
+    type: 'user_notify',
+    message: t('worker.structured_final_not_collected', { cliName: cliName() }),
+    kind: 'structured_turn_not_collected',
+    turnId,
+  });
+}
+
+interface StructuredMissingFinalTarget {
+  key: string;
+  turn: CodexPendingTurn;
+}
+
+const structuredMissingFinalWatchdog = new StructuredMissingFinalWatchdog();
+
+/** A started turn can outlive every native terminal source. Only sustained
+ *  CLI-idle + output-quiet evidence starts the COMMON missing-final wait:
+ *  non-blocking drivers use prompt-ready; lifecycle-blocking drivers use the
+ *  idle edge they rejected while the structured owner stayed open. */
+function structuredMissingFinalTarget(): StructuredMissingFinalTarget | undefined {
+  if (replyDeliveryMode() !== 'transcript' && !zeroPromptTerminalSync()) return undefined;
+  const turn = codexBridgeQueue.peek()[0];
+  if (!turn?.started || turn.finalText !== undefined || turn.isLocal) return undefined;
+  if (backgroundTaskTracker.pendingTurnAgents() > 0) return undefined;
+  if (structuredBridgeIs('antigravity') && hasAntigravityPendingTasks(antigravityBridgeState())) return undefined;
+  if (idleDetector?.programStatusHeldBusy()) return undefined;
+  const rejectedGeneration = structuredRejectedReadyEvidenceGeneration;
+  const idle = isPromptReady || (hasStructuredLifecycleBlock()
+    && rejectedGeneration !== undefined && ptyOutputGeneration.isCurrent(rejectedGeneration));
+  if (!idle) return undefined;
+  const outputGeneration = ptyOutputGeneration.snapshot();
+  return {
+    turn,
+    key: JSON.stringify([
+      turn.turnId, turn.dispatchAttempt, cliSpawnGeneration,
+      turn.sourceTurnId, turn.nativeUserProof?.uuid, turn.transcriptStartTimeMs,
+      lastStructuredBridgeActivityAtMs, outputGeneration,
+    ]),
+  };
+}
+
+/** Give late transcript bytes the first chance, then retire ONLY the exact
+ *  still-idle owner whose wait expired. No CLI-specific recovery is attempted:
+ *  the user is told to read the native terminal instead of guessing a reply. */
+function maybeSettleMissingStructuredFinal(): void {
+  const target = structuredMissingFinalTarget();
+  if (!structuredMissingFinalWatchdog.observe(target?.key)) return;
+  try { codexBridgeIngest(); } catch (err: any) {
+    // A read error is not evidence that the final is absent. Keep the owner and
+    // start a fresh bounded wait; a later tick may successfully read a final
+    // that was already on disk at this deadline.
+    log(`Missing-final drain before turn retirement failed: ${err.message}`);
+    structuredMissingFinalWatchdog.observe(undefined);
+    return;
+  }
+  const current = structuredMissingFinalTarget();
+  if (!current || current.key !== target!.key) {
+    structuredMissingFinalWatchdog.observe(current?.key);
+    return;
+  }
+  const { turn } = current;
+  const dropped = codexBridgeQueue.dropPendingTurn(turn.turnId, turn.dispatchAttempt, true);
+  structuredMissingFinalWatchdog.observe(undefined);
+  if (!dropped) return;
+  log(`Structured transcript stayed idle without a final for turn ${turn.turnId}; ending the wait and directing the user to the Web terminal`);
+  if (turn.dispatchAttempt !== undefined) {
+    emitTurnTerminal(turn.turnId, 'ambiguous', 'structured_final_not_collected', turn.dispatchAttempt);
+  }
+  retireStructuredTurnAttribution([dropped]);
+  if (turn.dispatchAttempt === undefined) {
+    notifyMissingFinalTurn(turn.turnId);
+  }
+  // Dropping the dead head can replay a buffered successor user/final pair.
+  emitReadyCodexTurns();
+  redriveRejectedStructuredReady();
 }
 
 /** An ordinary Lark turn whose transcript start never arrived is a reply the
