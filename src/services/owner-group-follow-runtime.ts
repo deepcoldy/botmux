@@ -37,28 +37,44 @@ function normalizeTransportError(error: unknown): unknown {
   return error;
 }
 
+export interface OwnerFollowChatItem {
+  chatId: string;
+  name?: string;
+  description?: string;
+}
+
 /** Bound pagination: never return a partial snapshot to the diff engine. */
-export async function listOwnerFollowChats(
+export async function listOwnerFollowChatItems(
   page: (cursor?: string) => Promise<any>,
-): Promise<string[]> {
-  const chats = new Set<string>(), cursors = new Set<string>();
+): Promise<OwnerFollowChatItem[]> {
+  const chats = new Map<string, OwnerFollowChatItem>();
+  const cursors = new Set<string>();
   let cursor: string | undefined;
   for (let i = 0; i < 100; i++) {
     const data = apiData(await page(cursor));
     if (!data || !Array.isArray(data.items)) throw new OwnerGroupFollowError(true);
     for (const item of data.items) {
-      if (typeof item.chat_id !== 'string' || !/^oc_[A-Za-z0-9_-]+$/.test(item.chat_id)) throw new OwnerGroupFollowError(true);
+      if (typeof item?.chat_id !== 'string' || !/^oc_[A-Za-z0-9_-]+$/.test(item.chat_id)) throw new OwnerGroupFollowError(true);
       // The listing retains dissolved groups for chat history; member APIs
       // reject them, so they must never become invitation candidates.
-      if (item.chat_type !== 'p2p' && item.chat_status !== 'dissolved' && item.chat_status !== 'dissolved_save') chats.add(item.chat_id);
+      if (item.chat_type === 'p2p' || item.chat_status === 'dissolved' || item.chat_status === 'dissolved_save' || chats.has(item.chat_id)) continue;
+      chats.set(item.chat_id, {
+        chatId: item.chat_id,
+        name: typeof item.name === 'string' ? item.name : undefined,
+        description: typeof item.description === 'string' ? item.description : undefined,
+      });
     }
-    if (data.has_more === false) return [...chats];
+    if (data.has_more === false) return [...chats.values()];
     if (data.has_more !== true || typeof data.page_token !== 'string'
         || !data.page_token || cursors.has(data.page_token)) throw new OwnerGroupFollowError(true);
     cursor = data.page_token;
     cursors.add(data.page_token);
   }
   throw new OwnerGroupFollowError(true);
+}
+
+export async function listOwnerFollowChats(page: (cursor?: string) => Promise<any>): Promise<string[]> {
+  return (await listOwnerFollowChatItems(page)).map(chat => chat.chatId);
 }
 
 export async function callOwnerFollowApi(
@@ -129,7 +145,7 @@ export function startOwnerGroupFollow(appId: string, dataDir: string): { stop():
     },
     listChats: (token, signal) => {
       const host = larkHosts(normalizeBrand(getBot(appId).config.brand)).openApi;
-      return listOwnerFollowChats(cursor => {
+      return listOwnerFollowChatItems(cursor => {
         const params = new URLSearchParams({ page_size: '100', ...(cursor ? { page_token: cursor } : {}) });
         return userApi(host, token, `/open-apis/im/v1/chats?${params}`, signal);
       });

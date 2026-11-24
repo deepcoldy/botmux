@@ -102,7 +102,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('steward', { kind: 'json', maxBytes: 64 * 1024 }),
   // task-routing：`{ taskRouting: {...} | null }`（参与开关及画像配置）。
   putBotConfig('task-routing', { kind: 'json', maxBytes: 64 * 1024 }),
-  putBotConfig('owner-group-follow', { kind: 'json', maxBytes: 64 * 1024 }),
+  // Both rule lists can contain 50 patterns of 200 characters plus per-rule JSON and excluded IDs.
+  putBotConfig('owner-group-follow', { kind: 'json', maxBytes: 256 * 1024 }),
   // actor-owner-bindings：完整替换 target Bot 的 source Bot 双 ID → Owner 策略。
   putBotConfig('actor-owner-bindings'),
   putBotConfig('feedback'),

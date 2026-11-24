@@ -5,6 +5,11 @@ import type { OncallGroupBusinessTarget } from '../../services/oncall-group-clie
 import type { OncallGroupPolicy } from '../../services/oncall-group-policy.js';
 import { SessionGroupNamingRow } from './session-group-naming-row.js';
 import { DEFAULT_LONG_TASK_REMINDER, normalizeLongTaskReminderConfig } from '../../services/long-task-reminder-policy.js';
+import {
+  evaluateOwnerGroupFollowFilter, MAX_OWNER_GROUP_FOLLOW_RULES, validateOwnerGroupFollowRule,
+  type OwnerGroupFollowConfig, type OwnerGroupFollowMatchResult, type OwnerGroupFollowRule,
+} from '../../services/owner-group-follow-policy.js';
+import { OWNER_GROUP_FOLLOW_PRESETS, missingOwnerGroupFollowRules } from './owner-group-follow-rules.js';
 import { FeedbackExtensionPanel } from './feedback-extension-panel.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
 import { afterNextPaint } from './deferred-task.js';
@@ -4448,24 +4453,63 @@ function workingDirState(bot: BotDefaultsRow): { mode: 'off' | 'default' | 'onca
 export function OwnerGroupFollowControls(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot } = props;
-  const savedExcluded = (bot.ownerGroupFollow?.excludeChatIds ?? []).join('\n');
-  const [excluded, setExcluded] = useState(savedExcluded);
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState<StatusMessage>(null);
-  useEffect(() => {
-    setExcluded(savedExcluded);
-  }, [bot.larkAppId, savedExcluded]);
   if (bot.apiOnly === true) {
     return <div className="bd-subsection" data-owner-group-follow-unavailable>
       <h4 className="bd-subsection-title">{tr('botDefaults.ownerGroupFollow')}</h4>
       <p className="bd-section-note">{tr('botDefaults.ownerGroupFollowApiOnly')}</p>
     </div>;
   }
-  const save = (value: BotDefaultsRow['ownerGroupFollow']) => saveBotField({
+  return <OwnerGroupFollowEditor key={bot.larkAppId} {...props} />;
+}
+
+function ownerGroupFollowDraft(config: OwnerGroupFollowConfig | null | undefined) {
+  return {
+    filtered: Boolean(config?.includeRules?.length),
+    includeRules: config?.includeRules ?? [],
+    excludeRules: config?.excludeRules ?? [],
+    excluded: (config?.excludeChatIds ?? []).join('\n'),
+  };
+}
+
+function OwnerGroupFollowEditor(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot } = props;
+  // Bot refreshes can replace equal arrays. Preserve drafts until the saved
+  // filters change, including when the enable toggle changes on its own.
+  const savedDraft = JSON.stringify(ownerGroupFollowDraft(bot.ownerGroupFollow));
+  const [draft, setDraft] = useState(() => ownerGroupFollowDraft(bot.ownerGroupFollow));
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  useEffect(() => {
+    setDraft(JSON.parse(savedDraft));
+  }, [savedDraft]);
+  const save = (value: OwnerGroupFollowConfig, resetDraft = false) => saveBotField({
     request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/owner-group-follow`, { ownerGroupFollow: value }),
     setStatus, setBusy, saved: tr('botDefaults.cardPrefSaved'),
-    onSaved: body => props.patchBot(bot.larkAppId, { ownerGroupFollow: body.ownerGroupFollow ?? null }),
+    onSaved: body => {
+      props.patchBot(bot.larkAppId, { ownerGroupFollow: body.ownerGroupFollow ?? null });
+      if (resetDraft) setDraft(ownerGroupFollowDraft(body.ownerGroupFollow));
+    },
   });
+  const includeRules = draft.filtered ? draft.includeRules : undefined;
+  const invalidDraft = draft.filtered && !draft.includeRules.some(rule => !validateOwnerGroupFollowRule(rule))
+    ? 'botDefaults.ownerGroupFollowIncludeRequired'
+    : [...(includeRules ?? []), ...draft.excludeRules].some(rule => validateOwnerGroupFollowRule(rule))
+      ? 'botDefaults.ownerGroupFollowInvalidRules' : undefined;
+  const draftConfig = {
+    ...bot.ownerGroupFollow,
+    excludeChatIds: draft.excluded.split(/\s+/).filter(Boolean),
+    includeRules,
+    excludeRules: draft.excludeRules.length ? draft.excludeRules : undefined,
+  };
+  const updateRules = (list: 'includeRules' | 'excludeRules', rules: OwnerGroupFollowRule[]) => {
+    setDraft(current => ({ ...current, [list]: rules }));
+    setStatus(null);
+  };
+  const setScope = (filtered: boolean) => {
+    setDraft(current => ({ ...current, filtered }));
+    setStatus(null);
+  };
   return <div className="bd-subsection" data-owner-group-follow>
     <h4 className="bd-subsection-title">{tr('botDefaults.ownerGroupFollow')}</h4>
     <ToggleRow
@@ -4477,19 +4521,159 @@ export function OwnerGroupFollowControls(props: { bot: BotDefaultsRow; patchBot:
       onChange={enabled => { void save({ ...bot.ownerGroupFollow, enabled }); }}
     />
     <p className="bd-section-note">{tr('botDefaults.ownerGroupFollowAuth')}</p>
+    <div className="ogf-editor">
+      <FieldTitle>{tr('botDefaults.ownerGroupFollowScope')}</FieldTitle>
+      <div className="ogf-scope" data-owner-group-follow-scope role="group" aria-label={tr('botDefaults.ownerGroupFollowScope')}>
+        <button type="button" data-action="owner-group-follow-scope-all" aria-pressed={!draft.filtered} disabled={busy}
+          onClick={() => setScope(false)}>{tr('botDefaults.ownerGroupFollowAll')}</button>
+        <button type="button" data-action="owner-group-follow-scope-filtered" aria-pressed={draft.filtered} disabled={busy}
+          onClick={() => setScope(true)}>{tr('botDefaults.ownerGroupFollowFiltered')}</button>
+      </div>
+      <div className="ogf-preset-strip">
+        {OWNER_GROUP_FOLLOW_PRESETS.map(preset => {
+          const additions = missingOwnerGroupFollowRules(draft[preset.list], preset.rules);
+          const applied = additions.length === 0 && (preset.list === 'excludeRules' || draft.filtered);
+          return <button key={preset.id} type="button" className={applied ? 'is-applied' : undefined}
+            data-owner-group-follow-preset={preset.id} aria-pressed={applied}
+            disabled={busy || draft[preset.list].length + additions.length > MAX_OWNER_GROUP_FOLLOW_RULES}
+            onClick={() => {
+              setDraft(current => ({
+                ...current,
+                filtered: current.filtered || preset.list === 'includeRules',
+                [preset.list]: [...current[preset.list], ...missingOwnerGroupFollowRules(current[preset.list], preset.rules)],
+              }));
+              setStatus(null);
+            }}>
+            {applied && <span aria-hidden="true">✓ </span>}{tr(preset.labelKey)}
+          </button>;
+        })}
+      </div>
+      {draft.filtered && <OwnerGroupFollowRuleList list="includeRules" rules={draft.includeRules} disabled={busy}
+        onChange={rules => updateRules('includeRules', rules)} />}
+      <OwnerGroupFollowRuleList list="excludeRules" rules={draft.excludeRules} disabled={busy}
+        onChange={rules => updateRules('excludeRules', rules)} />
+    </div>
     <div className="bd-row"><label>
       <FieldTitle help={tr('botDefaults.ownerGroupFollowExcludedHelp')}>{tr('botDefaults.ownerGroupFollowExcluded')}</FieldTitle>
-      <textarea data-input="ownerGroupFollowExcluded" rows={2} value={excluded} disabled={busy}
-        placeholder={'oc_xxx\noc_yyy'} onChange={event => setExcluded(event.currentTarget.value)} />
+      <textarea data-input="ownerGroupFollowExcluded" rows={2} value={draft.excluded} disabled={busy}
+        placeholder={'oc_xxx\noc_yyy'} onChange={event => {
+          const excluded = event.currentTarget.value;
+          setDraft(current => ({ ...current, excluded }));
+          setStatus(null);
+        }} />
     </label></div>
+    <OwnerGroupFollowTester config={draftConfig} invalidDraft={invalidDraft} />
     <div className="actions">
       <button type="button" data-action="save-owner-group-follow-exclusions" disabled={busy}
-        onClick={() => { void save({ ...bot.ownerGroupFollow, excludeChatIds: excluded.split(/\s+/).filter(Boolean) }); }}>
+        onClick={() => {
+          if (invalidDraft) { setStatus({ text: tr(invalidDraft) }); return; }
+          void save(draftConfig, true);
+        }}>
         {tr('botDefaults.save')}
       </button>
-      <StatusSpan status={status} />
+      <StatusSpan status={status} attr={{ 'data-owner-group-follow-status': '' }} />
     </div>
   </div>;
+}
+
+function OwnerGroupFollowRuleList(props: {
+  list: 'includeRules' | 'excludeRules'; rules: OwnerGroupFollowRule[]; disabled: boolean;
+  onChange(rules: OwnerGroupFollowRule[]): void;
+}) {
+  const tr = useT();
+  const { list, rules, disabled, onChange } = props;
+  const include = list === 'includeRules';
+  const [collapsed, setCollapsed] = useState(false);
+  const title = <FieldTitle>{tr(include ? 'botDefaults.ownerGroupFollowInclude' : 'botDefaults.ownerGroupFollowExclude')}</FieldTitle>;
+  return <div className="ogf-rule-list" data-owner-group-follow-rules={list}>
+    <div className="ogf-list-header">
+      {!include && rules.length > 0 ? <button type="button" className="ogf-list-toggle" aria-expanded={!collapsed}
+        data-action="owner-group-follow-toggle-exclude-rules" onClick={() => setCollapsed(value => !value)}>
+        <span aria-hidden="true">{collapsed ? '▸' : '▾'}</span> {title}
+      </button> : title}
+      <button type="button" className="ogf-add-rule" data-action={`owner-group-follow-add-${list}`}
+        disabled={disabled || rules.length >= MAX_OWNER_GROUP_FOLLOW_RULES}
+        onClick={() => {
+          setCollapsed(false);
+          onChange([...rules, { field: 'name', op: 'contains', pattern: '' }]);
+        }}>
+        {tr(include ? 'botDefaults.ownerGroupFollowAddInclude' : 'botDefaults.ownerGroupFollowAddExclude')}
+      </button>
+    </div>
+    {!collapsed && rules.map((rule, index) => <OwnerGroupFollowRuleRow key={index} rule={rule} disabled={disabled}
+      onChange={patch => onChange(rules.map((entry, i) => i === index ? { ...entry, ...patch } : entry))}
+      onRemove={() => onChange(rules.filter((_, i) => i !== index))} />)}
+  </div>;
+}
+
+function OwnerGroupFollowRuleRow(props: {
+  rule: OwnerGroupFollowRule; disabled: boolean;
+  onChange(patch: Partial<OwnerGroupFollowRule>): void; onRemove(): void;
+}) {
+  const tr = useT();
+  const errorId = useId();
+  const { rule, disabled, onChange, onRemove } = props;
+  const error = validateOwnerGroupFollowRule(rule);
+  return <div className="ogf-rule">
+    <div className="ogf-rule-row">
+      <select aria-label={tr('botDefaults.ownerGroupFollowField')} data-input="ownerGroupFollowRuleField"
+        value={rule.field} disabled={disabled}
+        onChange={event => onChange({ field: event.currentTarget.value as OwnerGroupFollowRule['field'] })}>
+        <option value="name">{tr('botDefaults.ownerGroupFollowName')}</option>
+        <option value="description">{tr('botDefaults.ownerGroupFollowDescription')}</option>
+        <option value="any">{tr('botDefaults.ownerGroupFollowAny')}</option>
+      </select>
+      <select aria-label={tr('botDefaults.ownerGroupFollowOp')} data-input="ownerGroupFollowRuleOp"
+        value={rule.op} disabled={disabled}
+        onChange={event => onChange({ op: event.currentTarget.value as OwnerGroupFollowRule['op'] })}>
+        <option value="contains">{tr('botDefaults.ownerGroupFollowContains')}</option>
+        <option value="startsWith">{tr('botDefaults.ownerGroupFollowStartsWith')}</option>
+        <option value="endsWith">{tr('botDefaults.ownerGroupFollowEndsWith')}</option>
+        <option value="regex">{tr('botDefaults.ownerGroupFollowRegex')}</option>
+      </select>
+      <input type="text" className={rule.op === 'regex' ? 'is-mono' : undefined} data-input="ownerGroupFollowRulePattern"
+        aria-label={tr('botDefaults.ownerGroupFollowPattern')} placeholder={tr('botDefaults.ownerGroupFollowPattern')}
+        aria-invalid={Boolean(error)} aria-describedby={error ? errorId : undefined}
+        value={rule.pattern} disabled={disabled} onChange={event => onChange({ pattern: event.currentTarget.value })} />
+      <button type="button" className="ogf-case-btn" aria-pressed={Boolean(rule.caseSensitive)} disabled={disabled}
+        aria-label={tr('botDefaults.ownerGroupFollowCase')} title={tr('botDefaults.ownerGroupFollowCase')}
+        onClick={() => onChange({ caseSensitive: !rule.caseSensitive })}>Aa</button>
+      <button type="button" className="ogf-remove-btn" disabled={disabled}
+        aria-label={tr('botDefaults.ownerGroupFollowRemoveRule')} title={tr('botDefaults.ownerGroupFollowRemoveRule')}
+        onClick={onRemove}>×</button>
+    </div>
+    {error && <small className="ogf-rule-error" id={errorId}>{tr(`botDefaults.ownerGroupFollowRuleError.${error}`)}</small>}
+  </div>;
+}
+
+const OWNER_GROUP_FOLLOW_RESULT_KEYS: Record<OwnerGroupFollowMatchResult['reason'], string> = {
+  all: 'botDefaults.ownerGroupFollowTestAll',
+  included_rule: 'botDefaults.ownerGroupFollowTestIncluded',
+  not_included: 'botDefaults.ownerGroupFollowTestNotIncluded',
+  excluded_rule: 'botDefaults.ownerGroupFollowTestExcluded',
+  excluded_chat_id: 'botDefaults.ownerGroupFollowTestExcludedId',
+};
+
+function OwnerGroupFollowTester(props: { config: OwnerGroupFollowConfig; invalidDraft?: string }) {
+  const tr = useT();
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const result = props.invalidDraft ? undefined : evaluateOwnerGroupFollowFilter(props.config, { name, description });
+  return <details className="ogf-tester">
+    <summary>{tr('botDefaults.ownerGroupFollowTester')}</summary>
+    <div className="ogf-test-inputs">
+      <label>{tr('botDefaults.ownerGroupFollowTestName')}
+        <input type="text" data-input="ownerGroupFollowTestName" value={name} onChange={event => setName(event.currentTarget.value)} />
+      </label>
+      <label>{tr('botDefaults.ownerGroupFollowTestDescription')}
+        <input type="text" data-input="ownerGroupFollowTestDescription" value={description}
+          onChange={event => setDescription(event.currentTarget.value)} />
+      </label>
+    </div>
+    <output className={`ogf-test-result ${result?.matched ? 'is-match' : 'is-skip'}`}>
+      {result ? tr(OWNER_GROUP_FOLLOW_RESULT_KEYS[result.reason], { index: (result.ruleIndex ?? 0) + 1 }) : tr(props.invalidDraft!)}
+    </output>
+  </details>;
 }
 
 export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
