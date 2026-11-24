@@ -63,7 +63,7 @@ describe('Dashboard bot onboarding HTTP route', () => {
           const response = await loopbackFetch(origin + '/api/bot-onboarding/start', {
             method: 'POST',
             headers: { 'content-type': 'application/json', cookie: 'botmux_dashboard_token=' + token, origin },
-            body: JSON.stringify({ workingDir: homedir(), registrationMode: 'web', cloneSourceAppId: 'cli_source', autoAvoidApproval }),
+            body: JSON.stringify({ cliId: 'mira', workingDir: homedir(), registrationMode: 'web', cloneSourceAppId: 'cli_source', autoAvoidApproval }),
             signal: AbortSignal.timeout(3_000),
           });
           responses.push({ status: response.status, body: await response.json() });
