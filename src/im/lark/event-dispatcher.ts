@@ -7941,11 +7941,14 @@ export function createLarkEventDispatcherRuntime(
     // botmux 不消费表情事件，注册显式 no-op 把这条噪声静默掉。
     'im.message.reaction.created_v1': () => {},
     'im.message.reaction.deleted_v1': () => {},
-    'im.message.receive_v1': (data: any) => {
+    'im.message.receive_v1': (rawData: any) => {
+      // Redact at the earliest synchronous boundary, before pre-ACK capture or
+      // the durable Inbox can persist an alternate raw representation.
+      const data = redactProtectedLarkEvent(rawData, config.session.dataDir);
       // The SDK acknowledges when this callback returns. Capture before the
       // ordinary ACK-safe async scheduler, or a crash could lose accepted input.
       // Durable primary is the exception: its callback must first persist the
-      // complete event in Inbox. The claimed consumer performs capture below,
+      // redacted event in Inbox. The claimed consumer performs capture below,
       // so a crash before ACK cannot lose accepted input and a crash after ACK
       // cannot bypass the provider-neutral retry/fencing path.
       if (!runtimeOptions.enqueuePrimary && handlers.captureHumanInput?.(data)) {
@@ -8345,6 +8348,11 @@ export function createLarkEventDispatcherRuntime(
     processDurableMessage: async (message, context) => {
       if (message.larkAppId !== larkAppId) {
         throw new Error('durable primary message belongs to another Lark application');
+      }
+      // Inbox rows written before this guard may still be raw. Sanitize again
+      // at claim time because capture runs before the canonical routing step.
+      if (message.eventType === 'lark.im.message.receive_v1') {
+        message = { ...message, data: redactProtectedLarkEvent(message.data as any, config.session.dataDir) };
       }
       const primary = { message, context };
       const result = await serializeByAnchor(

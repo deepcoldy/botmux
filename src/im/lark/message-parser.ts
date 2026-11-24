@@ -552,7 +552,7 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
 export function parseEventMessage(
   data: RawEventData,
   numberer: ImgNumberer = createImgNumberer(),
-): { parsed: LarkMessage; resources: MessageResource[] } {
+): { parsed: LarkMessage; resources: MessageResource[]; data: RawEventData } {
   data = redactProtectedLarkEvent(data);
   const sender = data.sender;
   const message = data.message;
@@ -600,7 +600,7 @@ export function parseEventMessage(
     createTime: message.create_time,
     mentions,
   };
-  return { parsed, resources };
+  return { parsed, resources, data };
 }
 
 /** `resolveMentions`: render `@_user_N` placeholders with the message's own

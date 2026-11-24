@@ -15,7 +15,11 @@ export function captureInboundText(data: any, runtime: InputCaptureRuntime,
     || (message.root_id && !/^om_[A-Za-z0-9_-]+$/.test(message.root_id))
     || (message.thread_id && !/^omt_[A-Za-z0-9_-]{1,196}$/.test(message.thread_id))
     || message.root_id && message.root_id === message.message_id) return false;
-  const { parsed, resources } = parseEventMessage(data);
+  const { parsed, resources, data: redactedData } = parseEventMessage(data);
+  // Capture is a persistence/delivery boundary, not a reader that may fall back
+  // to the raw event. A redacted input is intentionally ineligible: its original
+  // post/audio/media content and resource keys must never enter the journal.
+  if (redactedData !== data) return false;
   if (parsed.senderType === 'app' || parsed.senderType === 'bot'
     || !parsed.senderId || knownBot(parsed.senderId)) return false;
   const attachments: CaptureAttachment[] = resources.map(resource => ({

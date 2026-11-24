@@ -134,6 +134,13 @@ describe('protected plugin result delivery', () => {
     await deliverProtectedResult({ ...f.input, files: [{ name: 'a', data: Buffer.from('x') }, { name: 'b', data: Buffer.from('y') }] });
     await expect(deliverProtectedResult({ ...f.input, files: [{ name: 'a', data: Buffer.from('x\0b\0y') }] })).rejects.toThrow(/conflict/);
     expect(f.input.send).toHaveBeenCalledTimes(3);
+    const equalCount = fixture();
+    await deliverProtectedResult({ ...equalCount.input,
+      files: [{ name: 'a', data: Buffer.from('x') }, { name: 'b', data: Buffer.from('y\0c\0z') }] });
+    await expect(deliverProtectedResult({ ...equalCount.input,
+      files: [{ name: 'a', data: Buffer.from('x\0b\0y') }, { name: 'c', data: Buffer.from('z') }],
+    })).rejects.toThrow(/conflict/);
+    expect(equalCount.input.send).toHaveBeenCalledTimes(3);
   });
   it('keeps accepted uploads fenced when resource registration fails once and error persistence recovers', async () => {
     let writes = 0;
@@ -191,6 +198,25 @@ describe('protected plugin result delivery', () => {
     expect(() => restarted.assertResourceReadable('om_copy', 'img_v3_sensitive_chart', 'oc_other')).toThrow(/read_denied/);
     expect(JSON.stringify(restarted.redactMessage({ message_id: 'om_copy', chat_id: 'oc_other', msg_type: 'image',
       body: { content: JSON.stringify({ image_key: 'img_v3_sensitive_chart' }) } }))).not.toContain('img_v3_sensitive_chart');
+  });
+  it('delivers the eight-attachment protocol maximum together with an inline image', async () => {
+    const f = fixture();
+    f.input.markdown = '![](img_v3_sensitive)';
+    f.input.files = Array.from({ length: 8 }, (_, index) => ({ name: `f${index}.txt`, data: Buffer.from(`bytes-${index}`) }));
+    f.input.render = () => JSON.stringify({ body: { elements: [{ tag: 'img', img_key: 'img_v3_sensitive' }] } });
+    let uploads = 0;
+    f.input.upload.mockImplementation(async () => `file_${++uploads}`);
+    let sends = 0;
+    f.input.send.mockImplementation(async (_body, type) => type === 'file' ? `om_file_${++sends}` : 'om_primary');
+    const result = await deliverProtectedResult(f.input);
+    expect(result.messageIds).toEqual(['om_primary', ...Array.from({ length: 8 }, (_, index) => `om_file_${index + 1}`)]);
+    expect(result.messages.map(message => message.kind)).toEqual(['primary', ...Array.from({ length: 8 }, () => 'attachment')]);
+    expect(f.store.status(context, f.input.deliveryId)).toMatchObject({ status: 'delivered', attachmentCount: 8 });
+    expect(f.input.upload).toHaveBeenCalledTimes(8);
+    expect(f.input.send).toHaveBeenCalledTimes(9);
+    await expect(deliverProtectedResult(f.input)).resolves.toEqual(result);
+    expect(f.input.upload).toHaveBeenCalledTimes(8);
+    expect(f.input.send).toHaveBeenCalledTimes(9);
   });
   it('never publishes a card whose image registration failed', async () => {
     let writes = 0;

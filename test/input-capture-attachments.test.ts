@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,9 +6,10 @@ import { createInputCaptureRuntime } from '../src/core/plugins/input-capture/run
 import { createInputCaptureStore, type CapturedInput } from '../src/core/plugins/input-capture/store.js';
 import { parseInputCaptureCommand } from '../src/cli/input-capture.js';
 import { captureInboundText } from '../src/im/lark/input-capture.js';
+import { ProtectedResultStore } from '../src/services/protected-result-store.js';
 
 const cleanups: (() => void | Promise<void>)[] = [];
-afterEach(async () => { for (const fn of cleanups.splice(0).reverse()) await fn(); });
+afterEach(async () => { for (const fn of cleanups.splice(0).reverse()) await fn(); vi.unstubAllEnvs(); });
 function fixture(captureAttachments = true) {
   const directory = mkdtempSync(join(tmpdir(), 'capture-attachments-'));
   cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -78,6 +79,28 @@ it('keeps authored rich text and all resource references while excluding resourc
   const imageOnly = { en_us: { content: [[{ tag: 'img', image_key: 'img_only' }]] } };
   expect(f.capture(f.raw('om_only', 'post', imageOnly))).toBe(true);
   expect(f.store.read().inputs[1].text).toBe('');
+});
+
+it('rejects protected rich text before authored content or media keys enter the capture journal', async () => {
+  const f = fixture();
+  vi.stubEnv('SESSION_DATA_DIR', f.directory);
+  const protection = new ProtectedResultStore(f.directory);
+  const context = { appId: 'cli_writer', pluginId: 'synthetic', sessionId: 'session_one',
+    turnId: 'om_turn', ownerUnionId: 'on_owner', chatId: 'oc_chat' };
+  protection.begin(context, 'delivery_capture', 'c'.repeat(64));
+  protection.update(context, 'delivery_capture', { resource: 'file_sensitive' });
+  protection.update(context, 'delivery_capture', { message: { messageId: 'om_protected_source', kind: 'primary' } });
+  protection.update(context, 'delivery_capture', { status: 'delivered' });
+  const secret = 'SYNTHETIC_CAPTURE_SECRET_9381';
+  const event = f.raw('om_capture_protected', 'post', { zh_cn: { title: secret, content: [[
+    { tag: 'text', text: secret }, { tag: 'media', file_key: 'file_sensitive', file_name: 'secret.mp4' },
+  ]] } });
+
+  expect(f.capture(event)).toBe(false);
+  await f.runtime.drain();
+  expect(f.store.read().inputs).toEqual([]);
+  expect(JSON.stringify(f.store.read())).not.toContain(secret);
+  expect(JSON.stringify(f.store.read())).not.toContain('file_sensitive');
 });
 
 it('rejects changed resources on replay and delivers original pending evidence after revocation and restart', async () => {
