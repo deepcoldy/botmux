@@ -26,6 +26,8 @@ import { ProviderRecoveryEditor } from './provider-recovery-editor.js';
 import { readProviderRecoveryConfig, type ProviderRecoveryConfig } from '../../services/provider-recovery-policy.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
+import { TASK_ROUTING_LIMITS, type TaskRoutingMatcherMode } from '../../core/task-routing/model.js';
+import { dispatchTaskRoutingChanged } from './task-routing-model.js';
 import {
   AUTO_CLEANUP_HOUR_OPTIONS as IDLE_CLEANUP_HOUR_OPTIONS,
   idleCleanupHoursLabel,
@@ -126,7 +128,16 @@ interface DashboardSettings {
   promptCache: PromptCacheConfig | null;
   providerRecovery: ProviderRecoveryConfig | null;
   multiTopic: { enabled: boolean; taskTreeCard: boolean };
-  taskRouting: import('../../core/task-routing/model.js').TaskRoutingGlobalConfig & { enabled: boolean };
+  taskRouting: import('../../core/task-routing/model.js').TaskRoutingGlobalConfig & {
+    enabled: boolean;
+    botOptions?: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      online: boolean;
+      oneShotAllowed: boolean;
+    }>;
+  };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
@@ -326,7 +337,11 @@ export function parseSettings(s: any): DashboardSettings {
     promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
     providerRecovery: readProviderRecoveryConfig(s?.providerRecovery) ?? null,
     multiTopic: { enabled: s?.multiTopic?.enabled !== false, taskTreeCard: s?.multiTopic?.taskTreeCard === true },
-    taskRouting: { ...s?.taskRouting, enabled: s?.taskRouting?.enabled === true },
+    taskRouting: {
+      ...s?.taskRouting,
+      enabled: s?.taskRouting?.enabled === true,
+      botOptions: Array.isArray(s?.taskRouting?.botOptions) ? s.taskRouting.botOptions : [],
+    },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     httpProxy: typeof s?.httpProxy === 'string' ? s.httpProxy : '',
@@ -554,6 +569,9 @@ function SettingsPage() {
       setSettings(saved);
       ui.publicReadOnly = saved.publicReadOnly;
       store.setScheduleTimeZone(saved.effectiveScheduleTimeZone);
+      if (key === 'taskRouting') {
+        dispatchTaskRoutingChanged(saved.taskRouting.enabled);
+      }
       // If this write triggered a live TraeX plugin install, surface its result
       // instead of the generic "saved" toast.
       const traexMsg = traexInstallMessage(body.herdrTraexInstall, tr);
@@ -1291,18 +1309,15 @@ export function SettingsBody(props: {
           />
         </SettingsBlock>
         <SettingsBlock id="settings-task-routing" title={tr('settings.sectionTaskRouting')}>
-          <ToggleRow
-            title={tr('settings.taskRoutingEnable')}
-            help={tr('settings.taskRoutingEnableHelp')}
-            checked={settings.taskRouting.enabled}
-            disabled={dis || savingKey === 'taskRouting'}
-            dataAction="toggle-task-routing"
-            onChange={value => {
-              void props.onSave('taskRouting', { taskRouting: { enabled: value } }, s => ({
-                ...s,
-                taskRouting: { ...s.taskRouting, enabled: value },
-              }));
-            }}
+          <TaskRoutingSettingsEditor
+            value={settings.taskRouting}
+            disabled={dis}
+            saving={savingKey === 'taskRouting'}
+            onSave={(patch, optimistic) => props.onSave(
+              'taskRouting',
+              { taskRouting: patch },
+              s => ({ ...s, taskRouting: optimistic(s.taskRouting) }),
+            )}
           />
         </SettingsBlock>
         <SettingsBlock id="settings-repo-picker" title={tr('settings.sectionRepoPicker')}>
@@ -1792,6 +1807,224 @@ export function CodexNotifierSettingsEditor(props: {
           ) : null}
         </div>
       ) : null}
+    </>
+  );
+}
+
+export function TaskRoutingSettingsEditor(props: {
+  value: DashboardSettings['taskRouting'];
+  disabled: boolean;
+  saving: boolean;
+  onSave(
+    patch: Record<string, unknown>,
+    optimistic: (current: DashboardSettings['taskRouting']) => DashboardSettings['taskRouting'],
+  ): Promise<void> | void;
+}) {
+  const tr = useT();
+  const controlsDisabled = props.disabled || props.saving;
+  const savedPolicy = props.value.policy ?? '';
+  const savedMode: TaskRoutingMatcherMode = props.value.matcher?.mode === 'bot' ? 'bot' : 'rule';
+  const savedBotAppId = props.value.matcher?.botAppId ?? '';
+  const savedTimeoutSec = Math.round(
+    (props.value.matcher?.timeoutMs ?? TASK_ROUTING_LIMITS.defaultMatcherTimeoutMs) / 1_000,
+  );
+
+  const [policyDraft, setPolicyDraft] = useState(savedPolicy);
+  const [matcherModeDraft, setMatcherModeDraft] = useState<TaskRoutingMatcherMode>(savedMode);
+  const [botDraft, setBotDraft] = useState(savedBotAppId);
+  const [timeoutSecDraft, setTimeoutSecDraft] = useState(String(savedTimeoutSec));
+
+  useEffect(() => { setPolicyDraft(savedPolicy); }, [savedPolicy]);
+  useEffect(() => { setMatcherModeDraft(savedMode); }, [savedMode]);
+  useEffect(() => { setBotDraft(savedBotAppId); }, [savedBotAppId]);
+  useEffect(() => { setTimeoutSecDraft(String(savedTimeoutSec)); }, [savedTimeoutSec]);
+
+  const rawBotOptions = props.value.botOptions ?? [];
+  const botMenuOptions = useMemo(() => {
+    const items = rawBotOptions.map(bot => ({
+      value: bot.larkAppId,
+      label: [bot.botName || bot.larkAppId, bot.cliId, !bot.online ? tr('taskRouting.pillOffline') : '']
+        .filter(Boolean)
+        .join(' · '),
+    }));
+    if (botDraft && !items.some(item => item.value === botDraft)) {
+      items.push({ value: botDraft, label: botDraft });
+    }
+    return [
+      { value: '', label: tr('settings.taskRoutingMatcherBotPlaceholder') },
+      ...items,
+    ];
+  }, [botDraft, rawBotOptions, tr]);
+
+  const modeOptions = useMemo(() => [
+    { value: 'rule' as const, label: tr('settings.taskRoutingMatcherModeRule') },
+    { value: 'bot' as const, label: tr('settings.taskRoutingMatcherModeBot') },
+  ], [tr]);
+
+  const selectedBotMeta = rawBotOptions.find(bot => bot.larkAppId === botDraft);
+  const policyDirty = policyDraft.trim() !== savedPolicy.trim();
+  const policyCharCount = Array.from(policyDraft).length;
+
+  function resolveTimeoutMs(rawSec: string): number {
+    const sec = Math.round(Number(rawSec));
+    if (!Number.isFinite(sec)) return savedTimeoutSec * 1_000;
+    const minSec = Math.ceil(TASK_ROUTING_LIMITS.minMatcherTimeoutMs / 1_000);
+    const maxSec = Math.floor(TASK_ROUTING_LIMITS.maxMatcherTimeoutMs / 1_000);
+    return Math.max(minSec, Math.min(maxSec, sec)) * 1_000;
+  }
+
+  function savePolicy(): void {
+    const trimmed = policyDraft.trim();
+    void props.onSave(
+      { policy: trimmed },
+      current => ({ ...current, ...(trimmed ? { policy: trimmed } : { policy: undefined }) }),
+    );
+  }
+
+  function changeMatcherMode(nextMode: TaskRoutingMatcherMode): void {
+    setMatcherModeDraft(nextMode);
+    if (nextMode === 'rule') {
+      void props.onSave(
+        { matcher: { mode: 'rule' } },
+        current => ({ ...current, matcher: { mode: 'rule' } }),
+      );
+      return;
+    }
+    if (botDraft) {
+      const timeoutMs = resolveTimeoutMs(timeoutSecDraft);
+      void props.onSave(
+        { matcher: { mode: 'bot', botAppId: botDraft, timeoutMs } },
+        current => ({ ...current, matcher: { mode: 'bot', botAppId: botDraft, timeoutMs } }),
+      );
+    }
+  }
+
+  function changeMatcherBot(nextBotAppId: string): void {
+    setBotDraft(nextBotAppId);
+    if (!nextBotAppId) return;
+    const timeoutMs = resolveTimeoutMs(timeoutSecDraft);
+    void props.onSave(
+      { matcher: { mode: 'bot', botAppId: nextBotAppId, timeoutMs } },
+      current => ({ ...current, matcher: { mode: 'bot', botAppId: nextBotAppId, timeoutMs } }),
+    );
+  }
+
+  function commitTimeoutSec(): void {
+    const sec = Math.round(Number(timeoutSecDraft));
+    const minSec = Math.ceil(TASK_ROUTING_LIMITS.minMatcherTimeoutMs / 1_000);
+    const maxSec = Math.floor(TASK_ROUTING_LIMITS.maxMatcherTimeoutMs / 1_000);
+    if (!Number.isFinite(sec) || sec < minSec || sec > maxSec) {
+      setTimeoutSecDraft(String(savedTimeoutSec));
+      return;
+    }
+    setTimeoutSecDraft(String(sec));
+    const timeoutMs = sec * 1_000;
+    if (matcherModeDraft !== 'bot' || !botDraft) return;
+    if (timeoutMs === (props.value.matcher?.timeoutMs ?? TASK_ROUTING_LIMITS.defaultMatcherTimeoutMs)) return;
+    void props.onSave(
+      { matcher: { mode: 'bot', botAppId: botDraft, timeoutMs } },
+      current => ({ ...current, matcher: { mode: 'bot', botAppId: botDraft, timeoutMs } }),
+    );
+  }
+
+  return (
+    <>
+      <ToggleRow
+        title={tr('settings.taskRoutingEnable')}
+        help={tr('settings.taskRoutingEnableHelp')}
+        checked={props.value.enabled}
+        disabled={controlsDisabled}
+        dataAction="toggle-task-routing"
+        onChange={value => {
+          void props.onSave({ enabled: value }, current => ({ ...current, enabled: value }));
+        }}
+      />
+      <div className="settings-tr-details">
+        <div className="settings-subfield settings-tr-policy-field">
+          <div className="settings-tr-label-row">
+            <FieldTitle help={tr('settings.taskRoutingPolicyHelp')}>{tr('settings.taskRoutingPolicy')}</FieldTitle>
+            <span className="settings-tr-counter">{policyCharCount}/{TASK_ROUTING_LIMITS.maxPolicyChars}</span>
+          </div>
+          <textarea
+            className="settings-tr-textarea"
+            data-input="task-routing-policy"
+            rows={3}
+            maxLength={TASK_ROUTING_LIMITS.maxPolicyChars}
+            disabled={controlsDisabled}
+            value={policyDraft}
+            placeholder={tr('settings.taskRoutingPolicyPlaceholder')}
+            onChange={e => setPolicyDraft(e.currentTarget.value)}
+          />
+          <div className="settings-tr-actions">
+            <button
+              type="button"
+              className="primary"
+              data-action="save-task-routing-policy"
+              disabled={controlsDisabled || !policyDirty}
+              onClick={savePolicy}
+            >
+              {tr('settings.taskRoutingPolicySave')}
+            </button>
+            {props.value.enabled ? (
+              <a className="settings-tr-open-link" href="#/assign">{tr('settings.taskRoutingOpenPage')} →</a>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="settings-field-row">
+          <FieldTitle help={tr('settings.taskRoutingMatcherModeHelp')}>{tr('settings.taskRoutingMatcherMode')}</FieldTitle>
+          <DropdownMenu
+            className="settings-field-menu"
+            ariaLabel={tr('settings.taskRoutingMatcherMode')}
+            disabled={controlsDisabled}
+            value={matcherModeDraft}
+            label={dropdownLabel(modeOptions, matcherModeDraft)}
+            options={modeOptions}
+            onChange={value => changeMatcherMode(value)}
+          />
+        </div>
+
+        {matcherModeDraft === 'bot' ? (
+          <>
+            <div className="settings-field-row">
+              <FieldTitle help={tr('settings.taskRoutingMatcherBotHelp')}>{tr('settings.taskRoutingMatcherBot')}</FieldTitle>
+              <DropdownMenu
+                className="settings-field-menu"
+                ariaLabel={tr('settings.taskRoutingMatcherBot')}
+                disabled={controlsDisabled}
+                searchable
+                value={botDraft}
+                label={dropdownLabel(botMenuOptions, botDraft)}
+                options={botMenuOptions}
+                onChange={value => changeMatcherBot(value)}
+              />
+            </div>
+            <div className="settings-field-row">
+              <FieldTitle help={tr('settings.taskRoutingMatcherTimeoutHelp')}>{tr('settings.taskRoutingMatcherTimeout')}</FieldTitle>
+              <input
+                type="number"
+                min={Math.ceil(TASK_ROUTING_LIMITS.minMatcherTimeoutMs / 1_000)}
+                max={Math.floor(TASK_ROUTING_LIMITS.maxMatcherTimeoutMs / 1_000)}
+                step={1}
+                className="settings-text-input"
+                data-input="task-routing-timeout"
+                value={timeoutSecDraft}
+                disabled={controlsDisabled}
+                onChange={e => setTimeoutSecDraft(e.currentTarget.value)}
+                onBlur={commitTimeoutSec}
+                onKeyDown={e => { if (e.key === 'Enter') commitTimeoutSec(); }}
+              />
+            </div>
+            {!botDraft ? (
+              <p className="hint-warn-inline">{tr('settings.taskRoutingMatcherBotRequired')}</p>
+            ) : selectedBotMeta && !selectedBotMeta.oneShotAllowed ? (
+              <p className="hint-warn-inline">{tr('settings.taskRoutingMatcherBotOneShotUnsupported')}</p>
+            ) : selectedBotMeta && !selectedBotMeta.online ? (
+              <p className="settings-subfield-hint">{tr('settings.taskRoutingMatcherBotOffline')}</p>
+            ) : null}
+          </>
+        ) : null}
+      </div>
     </>
   );
 }

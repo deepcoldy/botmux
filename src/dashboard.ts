@@ -128,6 +128,8 @@ import { handleSessionEnvRoute } from './dashboard/session-env-api.js';
 import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import { decisionBoardAccess, decisionBoardEntryRedirect, handleDecisionBoardApi } from './dashboard/decision-board-api.js';
+import { handleTaskRoutingApi } from './dashboard/task-routing-api.js';
+import { oneShotTitleAllowed } from './services/session-group-title.js';
 import { handleAgentProfilesApi } from './dashboard/agent-profiles-api.js';
 import {
   projectSessionEventForAudience,
@@ -1384,7 +1386,16 @@ interface ResolvedDashboardSettings {
    *  dispatch task-tree card switch is default OFF. */
   multiTopic: { enabled: boolean; taskTreeCard: boolean };
   /** Machine-wide task-routing config, including advanced fields for round-trip preservation. */
-  taskRouting: import('./core/task-routing/model.js').TaskRoutingGlobalConfig & { enabled: boolean };
+  taskRouting: import('./core/task-routing/model.js').TaskRoutingGlobalConfig & {
+    enabled: boolean;
+    botOptions: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      online: boolean;
+      oneShotAllowed: boolean;
+    }>;
+  };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1517,6 +1528,24 @@ function scheduleBotGrantBotOptions(): ResolvedDashboardSettings['scheduleBotGra
         larkAppId: bot.larkAppId,
         botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
       }));
+  } catch {
+    return [];
+  }
+}
+
+/** Local host bots selectable as the task-routing CLI one-shot semantic matcher. */
+function taskRoutingMatcherBotOptions(): ResolvedDashboardSettings['taskRouting']['botOptions'] {
+  try {
+    const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+    const configs = loadBotConfigs();
+    const nameOf = dashboardBotNameLookup(configs);
+    return configs.map(bot => ({
+      larkAppId: bot.larkAppId,
+      botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
+      cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
+      online: onlineByAppId.has(bot.larkAppId),
+      oneShotAllowed: oneShotTitleAllowed(bot),
+    }));
   } catch {
     return [];
   }
@@ -2051,6 +2080,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     taskRouting: {
       ...global.taskRouting,
       enabled: global.taskRouting?.enabled === true, // default OFF
+      botOptions: taskRoutingMatcherBotOptions(),
     },
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
@@ -6281,6 +6311,19 @@ const server = createServer(async (req, res) => {
           ...(cfg.steward ? { steward: cfg.steward } : {}),
           online: online.has(cfg.larkAppId),
         }));
+      },
+    })) {
+      return;
+    }
+
+    // ─── Bot 任务分配（实时状态 / 分配记录 / 无副作用试算推荐）──────────────────
+    // 不在 PUBLIC_READ_PATHS ⟹ 未认证已被 401；handler 内另要求 canManageHost。
+    if (await handleTaskRoutingApi(req, res, url, {
+      canManageHost: authed,
+      dataDir: config.session.dataDir,
+      readJsonBody,
+      serviceDeps: {
+        loadConfigs: monitorBotConfigs,
       },
     })) {
       return;

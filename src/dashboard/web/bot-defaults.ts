@@ -106,7 +106,12 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'task-routing',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionTaskRouting',
-    fieldKeys: ['botDefaults.taskRoutingEnabled'],
+    fieldKeys: [
+      'botDefaults.taskRoutingEnabled',
+      'botDefaults.taskRoutingCostTier',
+      'botDefaults.taskRoutingStrengths',
+      'botDefaults.taskRoutingLimitations',
+    ],
   },
   {
     id: 'substitute',
