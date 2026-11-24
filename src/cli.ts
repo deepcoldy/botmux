@@ -7815,7 +7815,9 @@ async function readCardUsageSnapshotForSend(
         const observedModel = snapshot.tokens?.model?.trim();
         const expectedModel = observedModel || configuredRuntime.model || session.model;
         if (snap && isStatuslineModelCompatible(resolvedCliId, snap.model, expectedModel)) {
-          const quota = toCardQuota(snap);
+          const quota = toCardQuota(snap, {
+            includeRateLimits: larkAppId ? resolveShowUsageQuota(larkAppId) : true,
+          });
           if (quota) return { ...configuredRuntime, ...snapshot, quota };
         }
       }
@@ -10947,6 +10949,7 @@ import {
   resolveBrandLabel,
   resolveReplyStyleConfig,
   resolveUsageDisplay,
+  resolveShowUsageQuota,
   resolveReplyFooterPreferences,
 } from './bot-registry.js';
 import type { ReplyCardPresentation, ReplyCardRenderSnapshot } from './services/reply-card-render.js';
@@ -11665,6 +11668,7 @@ async function registerSelfFromCredFile(): Promise<void> {
   // setting); only an isolated sandbox falls back to the worker's snapshot.
   // The cred file outlives the sandboxed session that wrote it.
   const hideLocalAddresses = resolveHideLocalAddresses(appId);
+  const showUsageQuota = resolveShowUsageQuota(appId);
   registerBot({
     larkAppId: appId,
     larkAppSecret: cred.larkAppSecret ?? '',
@@ -11680,6 +11684,7 @@ async function registerSelfFromCredFile(): Promise<void> {
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    showUsageQuota: showUsageQuota ? undefined : false,
     hideLocalAddresses: hideLocalAddresses || undefined,
   } as import('./bot-registry.js').BotConfig);
 }
@@ -11769,6 +11774,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    showUsageQuota: process.env.BOTMUX_SHOW_USAGE_QUOTA === 'false' ? false : undefined,
     hideLocalAddresses: process.env.BOTMUX_HIDE_LOCAL_ADDRESSES === '1' || undefined,
   } as unknown as import('./bot-registry.js').BotConfig;
 

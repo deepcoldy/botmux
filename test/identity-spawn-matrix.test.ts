@@ -15,7 +15,9 @@
  *     config guess;
  *  3. the wrapper rendered by prepareTriggerUserCliEnv for the cell's model
  *     matches (proven invokes cli-identity-runner; single reads the root
- *     snapshot), and the on-disk layout carries no token of the other model;
+ *     snapshot), the on-disk layout carries no token of the other model, and
+ *     the Git commit resolver either installs on shared loopback or rejects
+ *     the isolated configuration before writing a wrapper;
  *  4. the daemon-side accessor returns the SAME model when fed the cell's
  *     worker report — a frozen config that disagrees with the report never
  *     flips the daemon answer (the F3 split-brain).
@@ -243,6 +245,29 @@ d('F3 seven-cell identity model matrix', () => {
         // Proven never carries token files; a single cell has only placeholders.
         if (model === 'proven') {
           expect(tree.some(p => p.endsWith('.env'))).toBe(false);
+        }
+
+        // Git attribution has no single-snapshot actor channel: opting it on
+        // must reject a loopback-isolated spawn up front, never install a
+        // resolver that can only fail later inside the sandbox. Shared cells
+        // still install it. Ordinary single-model tool wrappers above remain
+        // available in the isolated cells.
+        const gitEnv: NodeJS.ProcessEnv = { PATH: `${join(root, 'fakebin')}:/usr/bin:/bin` };
+        const gitSession = `matrix-git-session-${cell.n}`;
+        const prepareGit = () => prepareTriggerUserCliEnv(
+          gitEnv, dataDir, gitSession,
+          { enabled: true, tools: ['bytedcli'], gitCommitIdentity: true },
+          () => {}, model,
+          model === 'proven' ? { appId: 'cli_matrix', ipcPort: 1 } : undefined,
+          { loopbackShared: shape.loopbackShared },
+        );
+        const gitWrapper = join(sessionIdentityBinDir(dataDir, gitSession), 'git');
+        if (cell.shared) {
+          prepareGit();
+          expect(readFileSync(gitWrapper, 'utf8')).toContain('--git-actor-email');
+        } else {
+          expect(prepareGit).toThrow(/gitCommitIdentity.*loopback/);
+          expect(existsSync(gitWrapper)).toBe(false);
         }
 
         // ── 4. daemon consumes the worker report as the single source ──

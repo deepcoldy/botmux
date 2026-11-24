@@ -82,6 +82,20 @@ describe('HTTP recovery with real SQLite persistence', () => {
     expect(store.getSessionFresh(row.sessionId)?.lastCliInputTurnId).toBeUndefined();
     expect(store.getSessionFresh(row.sessionId)?.lastFailedTurn?.cliInput).toBe('wrapped C');
   });
+  it('persists attachments with the exact input and clears them on the next plain input', () => {
+    registerBot({ larkAppId: 'cli_fixture', larkAppSecret: 'fixture', cliId: 'codex', apiOnly: true });
+    vi.mocked(manager.rememberLastCliInput).mockRestore();
+    const attachments = [{ type: 'image' as const, name: 'evidence.png', path: '/tmp/evidence.png' }];
+    manager.rememberLastCliInput(ds, 'with attachment', { content: 'wrapped attachment', attachments }, 'om_with_attachment');
+    expect(store.getSessionFresh(ds.session.sessionId)?.lastAttachments).toEqual(attachments);
+
+    recordFailedTurnTerminal(ds, { turnId: 'om_with_attachment', status: 'failed' },
+      { workerGeneration: 1, caller, silent: false });
+    expect(store.getSessionFresh(ds.session.sessionId)?.lastFailedTurn?.attachments).toEqual(attachments);
+
+    manager.rememberLastCliInput(ds, 'plain next input', 'wrapped plain', 'om_plain');
+    expect(store.getSessionFresh(ds.session.sessionId)?.lastAttachments).toBeUndefined();
+  });
   it('persists the clean session app, routing and frozen sandbox/profile through reload', async () => {
     Object.assign(ds.session, { cliConfigDir: '/tmp/frozen-cli', modelBackendVariant: 'max',
       larkThreadId: 'omt_original', creatorOpenId: 'ou_creator', lastCallerOpenId: 'ou_last',

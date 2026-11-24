@@ -17,7 +17,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, existsSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import {
   prepareTriggerUserCliEnv,
   renderIdentityEnv,
@@ -36,6 +36,7 @@ import {
   installIdentityWrapper,
   identityWrapperInstalled,
   renderGitAskpassScript,
+  renderGitCommitWrapper,
   installGitAskpass,
   gitIdentityConfigEnv,
   gitIdentityConfigPairs,
@@ -49,6 +50,219 @@ beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'botmux-cli-identity-')); })
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 const SESSION = 'sess-abc123';
+
+describe('per-turn git commit identity', () => {
+  it('looks up each commit, preserves authors on replay and refuses an unverified writer', () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const repo = join(dir, 'repository');
+    const actor = join(dir, 'current actor');
+    const wrapper = join(dir, 'git');
+    writeFileSync(wrapper, renderGitCommitWrapper(realGit, ['cat', actor]), { mode: 0o755 });
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1' };
+    const git = (...args: string[]) => execFileSync(wrapper, ['-C', repo, ...args],
+      { env, encoding: 'utf8' }).trim();
+    const identity = () => git('log', '-1', '--format=%an <%ae> | %cn <%ce>');
+    execFileSync(realGit, ['init', '-q', '-b', 'main', repo], { env });
+    git('config', 'user.name', 'Host');
+    git('config', 'user.email', 'host@example.org');
+    git('config', 'author.email', 'host-author@example.org');
+    git('config', 'committer.email', 'host-committer@example.org');
+    writeFileSync(actor, 'one@example.org');
+    git('commit', '--allow-empty', '-m', 'one');
+    expect(identity()).toBe('one <one@example.org> | one <one@example.org>');
+    git('checkout', '-qb', 'topic');
+    writeFileSync(actor, 'two@example.org');
+    writeFileSync(join(repo, 'change'), 'two');
+    git('add', 'change');
+    git('commit', '-m', 'two');
+    expect(identity()).toBe('two <two@example.org> | two <two@example.org>');
+    git('checkout', '-q', 'main');
+    writeFileSync(actor, 'one@example.org');
+    git('cherry-pick', 'topic');
+    expect(identity()).toBe('two <two@example.org> | one <one@example.org>');
+    git('-c', 'user.email=explicit@example.org', 'commit', '--allow-empty',
+      '--author=Guest <guest@example.org>', '-m', 'override');
+    expect(identity()).toBe('Guest <guest@example.org> | one <explicit@example.org>');
+    const head = git('rev-parse', 'HEAD');
+    rmSync(actor);
+    expect(spawnSync(wrapper, ['-C', repo, 'commit', '--allow-empty', '-m', 'refused'], { env }).status).toBe(77);
+    expect(git('status', '--porcelain')).toBe('');
+    expect(git('rev-parse', 'HEAD')).toBe(head);
+  });
+
+  it('governs value-taking global options and ambient identity env vars', () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const repo = join(dir, 'bypass-repo');
+    const actor = join(dir, 'bypass-actor');
+    const wrapper = join(dir, 'git');
+    writeFileSync(wrapper, renderGitCommitWrapper(realGit, ['cat', actor]), { mode: 0o755 });
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1' };
+    const git = (...args: string[]) => execFileSync(wrapper, ['-C', repo, ...args],
+      { env, encoding: 'utf8' }).trim();
+    const identity = () => git('log', '-1', '--format=%ae | %ce');
+    execFileSync(realGit, ['init', '-q', '-b', 'main', repo], { env });
+    git('config', 'user.name', 'Host');
+    git('config', 'user.email', 'host@example.org');
+    git('config', 'author.email', 'host-author@example.org');
+    git('config', 'committer.email', 'host-committer@example.org');
+    writeFileSync(actor, 'actor@example.org');
+
+    // A separate-argv global option used to terminate option parsing in the
+    // wrapper, so the commit subcommand passed through unwrapped and landed
+    // with the host's author/committer.
+    git('--shallow-file', join(dir, 'shallow'), 'commit', '--allow-empty', '-m', 'via-shallow-file');
+    expect(identity()).toBe('actor@example.org | actor@example.org');
+
+    // GIT_AUTHOR_*/GIT_COMMITTER_* outrank every -c config key in git; the
+    // wrapper must clear them so ambient shell exports cannot override the
+    // attested actor. Explicit argv overrides stay honored (covered above).
+    execFileSync(wrapper, ['-C', repo, 'commit', '--allow-empty', '-m', 'via-env'], {
+      env: {
+        ...env,
+        GIT_AUTHOR_NAME: 'Env Author', GIT_AUTHOR_EMAIL: 'env-author@example.org',
+        GIT_COMMITTER_NAME: 'Env Committer', GIT_COMMITTER_EMAIL: 'env-committer@example.org',
+      },
+      encoding: 'utf8',
+    });
+    expect(identity()).toBe('actor@example.org | actor@example.org');
+
+    // Parser-level guard for a value-taking global that this git version may
+    // not itself accept: with no resolvable actor the wrapper must refuse (77)
+    // before git runs, proving the option consumed its value instead of
+    // falling through to passthrough (which would surface git's own error).
+    rmSync(actor);
+    const unknownGlobal = spawnSync(wrapper,
+      ['-C', repo, '--replace-git-ref', 'refs/replace/x', 'commit', '--allow-empty', '-m', 'x'],
+      { env, encoding: 'utf8' });
+    expect(unknownGlobal.status).toBe(77);
+  });
+
+  it('keeps Git attribution enabled when worker filtering leaves no ordinary tools', () => {
+    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH };
+    prepareTriggerUserCliEnv(env, dir, SESSION, {
+      enabled: true, tools: ['bytedcli'], gitCommitIdentity: true,
+    }, () => {}, 'single');
+    const wrapper = join(env.BOTMUX_IDENTITY_BIN!, 'git');
+    expect(existsSync(wrapper)).toBe(true);
+
+    // This is the exact shape after bound-Lark worker filtering hands lark-cli
+    // to its dedicated binding. The Git opt-in must survive both cleanup and
+    // the installation early return, independently of ordinary tools.
+    const filtered = { enabled: true, tools: [], gitCommitIdentity: true };
+    prepareTriggerUserCliEnv(env, dir, SESSION, filtered, () => {}, 'single');
+    expect(existsSync(wrapper)).toBe(true);
+
+    // A failed re-install must not expose the cleanup half of the write: the
+    // previously working wrapper stays until the replacement can be rendered.
+    const path = env.PATH;
+    try {
+      env.PATH = join(dir, 'no-git-on-path');
+      expect(() => prepareTriggerUserCliEnv(env, dir, SESSION, filtered, () => {}, 'single'))
+        .toThrow(/requires git on PATH/);
+      expect(existsSync(wrapper)).toBe(true);
+    } finally {
+      env.PATH = path;
+    }
+
+    prepareTriggerUserCliEnv(env, dir, SESSION, { ...filtered, gitCommitIdentity: false }, () => {}, 'single');
+    expect(existsSync(wrapper)).toBe(false);
+
+    const freshEnv: NodeJS.ProcessEnv = { PATH: process.env.PATH };
+    prepareTriggerUserCliEnv(freshEnv, dir, SESSION, filtered, () => {}, 'single');
+    expect(existsSync(wrapper)).toBe(true);
+    expect(freshEnv.PATH?.split(delimiter)).toContain(freshEnv.BOTMUX_IDENTITY_BIN);
+  });
+
+  it('refuses BOTMUX_AS on managed writes without changing other Git commands', () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const repo = join(dir, 'speaker-repo');
+    const actor = join(dir, 'speaker-actor');
+    const wrapper = join(dir, 'git');
+    writeFileSync(wrapper, renderGitCommitWrapper(realGit, ['cat', actor]), { mode: 0o755 });
+    writeFileSync(actor, 'actor@example.org');
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1' };
+    const git = (...args: string[]) => execFileSync(realGit, ['-C', repo, ...args], { env, encoding: 'utf8' }).trim();
+    execFileSync(realGit, ['init', '-q', repo], { env });
+    git('config', 'user.name', 'Host');
+    git('config', 'user.email', 'host@example.org');
+    git('commit', '--allow-empty', '-m', 'base');
+    const head = git('rev-parse', 'HEAD');
+
+    const asEnv = { ...env, BOTMUX_AS: 'ou_other' };
+    const denied = spawnSync(wrapper, ['-C', repo, 'commit', '--allow-empty', '-m', 'wrong-speaker'], {
+      env: asEnv, encoding: 'utf8',
+    });
+    expect(denied.status).toBe(77);
+    expect(git('rev-parse', 'HEAD')).toBe(head);
+
+    // The guard belongs only to commit-family writes. In particular it must
+    // not disable ordinary reads or the separate speaker-aware push flow.
+    expect(spawnSync(wrapper, ['-C', repo, 'status', '--porcelain'], { env: asEnv }).status).toBe(0);
+    expect(spawnSync(wrapper, ['-C', repo, 'commit', '--allow-empty', '-m', 'empty-as'], {
+      env: { ...env, BOTMUX_AS: '' },
+    }).status).toBe(0);
+    expect(git('log', '-1', '--format=%ae | %ce')).toBe('actor@example.org | actor@example.org');
+  });
+
+  it('keeps governing the subcommand after --exec-path=<path>', () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const execPath = execFileSync(realGit, ['--exec-path'], { encoding: 'utf8' }).trim();
+    const repo = join(dir, 'exec-path-repo');
+    const actor = join(dir, 'exec-path-actor');
+    const wrapper = join(dir, 'git');
+    writeFileSync(wrapper, renderGitCommitWrapper(realGit, ['cat', actor]), { mode: 0o755 });
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1' };
+    const git = (...args: string[]) => execFileSync(realGit, ['-C', repo, ...args], { env, encoding: 'utf8' }).trim();
+    execFileSync(realGit, ['init', '-q', repo], { env });
+    git('config', 'user.name', 'Host');
+    git('config', 'user.email', 'host@example.org');
+    git('commit', '--allow-empty', '-m', 'base');
+    const head = git('rev-parse', 'HEAD');
+    const args = [`--exec-path=${execPath}`, '-C', repo, 'commit', '--allow-empty', '-m', 'via-exec-path'];
+
+    // Unlike bare --exec-path, the equals form selects Git's core directory and
+    // then RUNS the subcommand. It must never become an actor/BOTMUX_AS bypass.
+    const denied = spawnSync(wrapper, args, { env, encoding: 'utf8' });
+    expect(denied.status).toBe(77);
+    expect(git('rev-parse', 'HEAD')).toBe(head);
+
+    writeFileSync(actor, 'actor@example.org');
+    const allowed = spawnSync(wrapper, args, { env, encoding: 'utf8' });
+    expect(allowed.status).toBe(0);
+    expect(git('log', '-1', '--format=%ae | %ce')).toBe('actor@example.org | actor@example.org');
+  });
+
+  it('passes through terminal global information options without an actor', () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const wrapper = join(dir, 'git');
+    writeFileSync(wrapper, renderGitCommitWrapper(realGit, ['cat', join(dir, 'missing-actor')]), { mode: 0o755 });
+    const env = {
+      PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1',
+      GIT_PAGER: 'cat', PAGER: 'cat', MANPAGER: 'cat',
+    };
+    for (const args of [
+      ['--help', 'commit'], ['-h', 'commit'], ['--version', 'commit'],
+      ['--exec-path', 'commit'], ['--html-path', 'commit'],
+      ['--man-path', 'commit'], ['--info-path', 'commit'], ['--list-cmds=main', 'commit'],
+    ]) {
+      const expected = spawnSync(realGit, args, { env, encoding: 'utf8' });
+      expect(expected.status, args.join(' ')).toBe(0);
+      const actual = spawnSync(wrapper, args, { env, encoding: 'utf8' });
+      expect(actual.status, args.join(' ')).toBe(0);
+      expect(actual.stdout).toBe(expected.stdout);
+    }
+  });
+
+  it('installs the wrapper only for opted-in sessions and removes it on respawn', () => {
+    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH };
+    const policy = { enabled: true, tools: ['bytedcli' as const], gitCommitIdentity: true };
+    prepareTriggerUserCliEnv(env, dir, SESSION, policy, () => {}, 'single');
+    const wrapper = join(env.BOTMUX_IDENTITY_BIN!, 'git');
+    expect(readFileSync(wrapper, 'utf8')).toContain('--git-actor-email');
+    prepareTriggerUserCliEnv(env, dir, SESSION, { ...policy, gitCommitIdentity: false }, () => {}, 'single');
+    expect(existsSync(wrapper)).toBe(false);
+  });
+});
 
 describe('renderIdentityEnv', () => {
   it('emits the pair lark-cli needs — token alone makes it refuse outright', () => {

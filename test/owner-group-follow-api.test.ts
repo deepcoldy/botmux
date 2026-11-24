@@ -1,14 +1,21 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { callOwnerFollowApi, listOwnerFollowChats } from '../src/services/owner-group-follow-runtime.js';
+import { callOwnerFollowApi, listOwnerFollowChatItems, listOwnerFollowChats } from '../src/services/owner-group-follow-runtime.js';
 import { OwnerGroupFollowError } from '../src/services/owner-group-follow.js';
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe('owner follow OpenAPI', () => {
-  it('reads every page and excludes p2p and dissolved entries', async () => {
+  it('preserves metadata across pages and only returns unique group chats', async () => {
     const page = vi.fn(async (cursor?: string) => ({ code: 0, data: cursor
-      ? { items: [{ chat_id: 'oc_new' }, { chat_id: 'oc_private', chat_type: 'p2p' }, { chat_id: 'oc_dissolved', chat_status: 'dissolved' }], has_more: false }
-      : { items: [{ chat_id: 'oc_old' }, { chat_id: 'oc_retained', chat_status: 'dissolved_save' }], has_more: true, page_token: 'next' } }));
+      ? { items: [{ chat_id: 'oc_new', name: 42, description: 'for alerts' }, { chat_id: 'oc_old' },
+        { chat_id: 'oc_private', chat_type: 'p2p' }, { chat_id: 'oc_dissolved', chat_status: 'dissolved' }], has_more: false }
+      : { items: [{ chat_id: 'oc_old', name: 'Old chat', description: 'Existing' }, { chat_id: 'oc_retained', chat_status: 'dissolved_save' }], has_more: true, page_token: 'next' } }));
+    expect(await listOwnerFollowChatItems(page)).toEqual([
+      { chatId: 'oc_old', name: 'Old chat', description: 'Existing' },
+      { chatId: 'oc_new', name: undefined, description: 'for alerts' },
+    ]);
+    expect(page.mock.calls).toEqual([[undefined], ['next']]);
+    page.mockClear();
     expect(await listOwnerFollowChats(page)).toEqual(['oc_old', 'oc_new']);
     expect(page.mock.calls).toEqual([[undefined], ['next']]);
   });
