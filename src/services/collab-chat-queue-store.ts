@@ -75,3 +75,28 @@ export function markCollabChatItemDelivered(dataDir: string, chatId: string, tar
   mkdirSync(dirname(fp), { recursive: true });
   atomicWriteFileSync(fp, `${JSON.stringify(q, null, 2)}\n`, { mode: 0o600, durable: true });
 }
+
+/**
+ * 队列重放：gate open 后按 sourceMessageId 顺序返回仍 pending 的规范化路由事件（供调用方
+ * 复用原 turn/admission 幂等键重放进正常准入）。不重发飞书消息——重放的是路由事件，不是
+ * 用户可见消息。
+ */
+export function listPendingCollabChatItems(dataDir: string, chatId: string, targetAppId: string): CollabChatQueueItem[] {
+  const q = readCollabChatQueue(dataDir, chatId, targetAppId);
+  return q.items.filter(i => i.deliveryStatus === 'pending').sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+}
+
+/**
+ * 目标重启对账：以 gate 文件为准——open（acceptingUserTasks）→ 保留 pending 待重放；
+ * closed（gate 不存在 / 本 bot 非 participant / acceptingUserTasks=false 且 phase 非 open）
+ * → 保留原队列不变（不自动释放）。返回仍需重放的 pending 项。
+ */
+export function reconcileCollabChatQueue(opts: {
+  dataDir: string;
+  chatId: string;
+  targetAppId: string;
+  gateOpen: boolean;
+}): CollabChatQueueItem[] {
+  if (!opts.gateOpen) return [];
+  return listPendingCollabChatItems(opts.dataDir, opts.chatId, opts.targetAppId);
+}
