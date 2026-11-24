@@ -3350,3 +3350,496 @@ describe('Claude background-task wake turns', () => {
     expect(later?.isBackgroundWake).toBeFalsy();
   });
 });
+
+describe('BridgeTurnQueue open-turn evidence, interrupts, and Scenario 3 unobserved-close recovery (#3702)', () => {
+  const mkUser = (uuid: string, content: unknown, extra: Partial<TranscriptEvent> = {}): TranscriptEvent => ({
+    type: 'user',
+    uuid,
+    parentUuid: null,
+    timestamp: new Date().toISOString(),
+    message: { role: 'user', content },
+    ...extra,
+  });
+
+  const mkAssistant = (
+    uuid: string,
+    parentUuid: string | null | undefined,
+    content: unknown[],
+    stopReason: string | null = null,
+    extra: Partial<TranscriptEvent> = {},
+  ): TranscriptEvent => ({
+    type: 'assistant',
+    uuid,
+    ...(parentUuid !== undefined ? { parentUuid } : {}),
+    timestamp: new Date().toISOString(),
+    message: { role: 'assistant', model: 'claude-opus-4-8', content, stop_reason: stopReason },
+    ...extra,
+  });
+
+  const mkToolResult = (uuid: string, parentUuid: string | null | undefined, toolUseId: string): TranscriptEvent => ({
+    type: 'user',
+    uuid,
+    ...(parentUuid !== undefined ? { parentUuid } : {}),
+    timestamp: new Date().toISOString(),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'ok' }] },
+  });
+
+  const mkDuration = (uuid: string, parentUuid: string | null | undefined): TranscriptEvent => ({
+    type: 'system',
+    subtype: 'turn_duration',
+    uuid,
+    ...(parentUuid !== undefined ? { parentUuid } : {}),
+    timestamp: new Date().toISOString(),
+  });
+
+  it('tracks api-request, unmatched tool_use (including <synthetic>), tool_result, attachment, progress, and sidechain activity', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_1', makeFingerprint('run full check'), Date.now(), 'run full check');
+    q.ingest([
+      mkUser('u1', 'run full check'),
+      { type: 'api-request', id: 'req_1', querySource: 'repl_main_thread', timestamp: new Date().toISOString() },
+      { type: 'api-request', id: 'req_side', querySource: 'side_question', timestamp: new Date().toISOString() },
+    ], '/t/s.jsonl');
+
+    const head = q.openLiveNonLocalTurn();
+    expect(head?.turnId).toBe('om_1');
+    const ev1 = q.getOpenTurnEvidence(head!);
+    expect(ev1.apiRequestInFlight).toBe(true);
+    expect(ev1.apiRequestObservedInGeneration).toBe(true);
+    expect(ev1.unmatchedToolUseCount).toBe(0);
+    expect(ev1.activitySeq).toBe(1);
+
+    // Parallel tool_use + synthetic local tool_use keep unmatchedToolUseCount > 0.
+    q.ingest([
+      mkAssistant('a1', 'u1', [{ type: 'text', text: 'Checking files...' }]),
+      mkAssistant('a2', 'a1', [{ type: 'tool_use', id: 't_bash', name: 'Bash', input: {} }], 'tool_use'),
+      mkAssistant('a3', 'a2', [{ type: 'tool_use', id: 't_synth', name: 'ToolSearch', input: {} }], 'stop_sequence', {
+        message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'tool_use', id: 't_synth', name: 'ToolSearch', input: {} }] },
+      }),
+    ], '/t/s.jsonl');
+    const ev2 = q.getOpenTurnEvidence(head!);
+    expect(ev2.apiRequestInFlight).toBe(false);
+    expect(ev2.unmatchedToolUseCount).toBe(2);
+    expect(ev2.activitySeq).toBeGreaterThan(ev1.activitySeq);
+
+    // Sidechain & progress bump activitySeq while tools are pending.
+    const seqBeforeSub = ev2.activitySeq;
+    q.ingest([
+      { type: 'progress', uuid: 'p1', parentUuid: 'a3', timestamp: new Date().toISOString() },
+      { type: 'assistant', uuid: 'sub1', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: 'sub' }] } },
+    ], '/t/s.jsonl');
+    expect(q.getOpenTurnEvidence(head!).activitySeq).toBe(seqBeforeSub + 2);
+
+    // tool_result clears pending tool ids and marks awaitingPostToolAssistant; attachment reminder keeps it armed.
+    q.ingest([
+      mkToolResult('tr1', 'p1', 't_bash'),
+      mkToolResult('tr2', 'tr1', 't_synth'),
+      { type: 'attachment', uuid: 'att1', parentUuid: 'tr2', attachment: { type: 'inactivity_reminder' }, timestamp: new Date().toISOString() },
+    ], '/t/s.jsonl');
+    const ev3 = q.getOpenTurnEvidence(head!);
+    expect(ev3.unmatchedToolUseCount).toBe(0);
+    expect(ev3.awaitingPostToolAssistant).toBe(true);
+
+    // Final end_turn + turn_duration closes openLiveNonLocalTurn().
+    q.ingest([
+      mkAssistant('a4', 'att1', [{ type: 'text', text: 'All green.' }], 'end_turn'),
+      mkDuration('d1', 'a4'),
+    ], '/t/s.jsonl');
+    expect(q.openLiveNonLocalTurn()).toBeUndefined();
+  });
+
+  it('closes collecting turn as cancelled/user_interrupted on Esc/Ctrl-C markers without synthesising local-*', () => {
+    for (const interruptEv of [
+      mkUser('int1', [{ type: 'text', text: '[Request interrupted by user]' }], { parentUuid: 'a1' }),
+      mkUser('int2', [{ type: 'text', text: '[Request interrupted by user for tool use]' }], { parentUuid: 'a1' }),
+      mkUser('int3', [{ type: 'text', text: 'custom interrupted' }], { parentUuid: 'a1', interruptedMessageId: 'msg_9' }),
+    ]) {
+      const q = new BridgeTurnQueue();
+      q.mark('om_int', makeFingerprint('long work'), Date.now(), 'long work');
+      q.ingest([
+        mkUser('u1', 'long work'),
+        mkAssistant('a1', 'u1', [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: {} }], 'tool_use'),
+        interruptEv,
+      ], '/t/s.jsonl');
+      expect(q.openLiveNonLocalTurn()).toBeUndefined();
+      const drained = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(drained).toHaveLength(1);
+      expect(drained[0].turnId).toBe('om_int');
+      expect(drained[0].terminalOutcome).toEqual({
+        status: 'cancelled',
+        errorCode: 'user_interrupted',
+        retryable: false,
+      });
+      // Must NOT leave a bogus `local-*` turn behind in the queue.
+      expect(q.peek()).toEqual([]);
+    }
+
+    // Human prose merely quoting the interrupt marker is still a real prompt.
+    const q2 = new BridgeTurnQueue();
+    q2.mark('om_quote', makeFingerprint('Explain [Request interrupted by user] in logs'), Date.now(), 'Explain [Request interrupted by user] in logs');
+    q2.ingest([mkUser('u_quote', 'Explain [Request interrupted by user] in logs')], '/t/s.jsonl');
+    expect(q2.openLiveNonLocalTurn()?.turnId).toBe('om_quote');
+  });
+
+  it('Scenario 3A (no assistant rows & interim-text+tool_use): re-attaches late final to original om_A instead of local-headless-*', () => {
+    for (const withInterimNarration of [false, true]) {
+      const q = new BridgeTurnQueue();
+      const markTs = Date.now() - 10_000;
+      q.mark('om_A', makeFingerprint('investigate bug'), markTs, 'investigate bug');
+      const beforePop: TranscriptEvent[] = [mkUser('u1', 'investigate bug')];
+      let tailParent = 'u1';
+      if (withInterimNarration) {
+        beforePop.push(mkAssistant('a_nar', 'u1', [{ type: 'text', text: 'Let me check...' }]));
+        beforePop.push(mkAssistant('a_tool', 'a_nar', [{ type: 'tool_use', id: 'tu1', name: 'Read', input: {} }], 'tool_use'));
+        tailParent = 'a_tool';
+      }
+      q.ingest(beforePop, '/t/s.jsonl');
+
+      // Bounded fallback pops om_A unobserved.
+      const popped = q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true });
+      expect(popped.map(t => t.turnId)).toEqual(['om_A']);
+      expect(popped[0].terminalObserved).toBeFalsy();
+
+      // Late records arrive along the same parentUuid chain (tool_result -> attachment -> thinking -> final text -> turn_duration).
+      q.ingest([
+        mkToolResult('tr1', tailParent, 'tu1'),
+        { type: 'attachment', uuid: 'att1', parentUuid: 'tr1', attachment: { type: 'inactivity_reminder' }, timestamp: new Date().toISOString() },
+        mkAssistant('a_think', 'att1', [{ type: 'thinking', thinking: 'reasoning' }], 'end_turn'),
+        mkAssistant('a_final', 'a_think', [{ type: 'text', text: 'Root cause fixed.' }], 'end_turn'),
+        mkDuration('d1', 'a_final'),
+      ], '/t/s.jsonl');
+
+      const recovered = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(recovered).toHaveLength(1);
+      expect(recovered[0].turnId).toBe('om_A');
+      expect(recovered[0].isLocal).toBe(false);
+      expect(recovered[0].assistantUuids).toEqual(['a_final']);
+      expect(q.isLateUnobservedRecovery(recovered[0])).toBe(true);
+      // One-shot: a later unrelated headless text must NOT attach to om_A again.
+      q.ingest([mkAssistant('a_extra', 'd1', [{ type: 'text', text: 'stray' }], 'end_turn'), mkDuration('d2', 'a_extra')], '/t/s.jsonl');
+      const extra = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(extra[0].turnId).toBe('local-headless-a_extra');
+      expect(extra[0].isLocal).toBe(true);
+    }
+  });
+
+  it('Scenario 3B (trailing text already emitted at unobserved pop): mints late-recovery-* anchored to om_A, unless covered by explicit send', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_B', makeFingerprint('check status'), Date.now() - 5_000, 'check status');
+    q.ingest([
+      mkUser('u1', 'check status'),
+      mkAssistant('a_partial', 'u1', [{ type: 'text', text: 'Starting check...' }], null),
+    ], '/t/s.jsonl');
+    const popped = q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true });
+    expect(popped.map(t => t.turnId)).toEqual(['om_B']);
+
+    q.ingest([
+      mkAssistant('a_tool', 'a_partial', [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: {} }], 'tool_use'),
+      mkToolResult('tr1', 'a_tool', 'tu1'),
+      mkAssistant('a_final', 'tr1', [{ type: 'text', text: 'Final verified status.' }], 'end_turn'),
+      mkDuration('d1', 'a_final'),
+    ], '/t/s.jsonl');
+
+    const recovered = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0].turnId).toBe('late-recovery-a_final');
+    expect(recovered[0].replyAnchorTurnId).toBe('om_B');
+    expect(recovered[0].isLocal).toBe(false);
+    expect(q.isLateUnobservedRecovery(recovered[0])).toBe(true);
+
+    // When explicit final `botmux send` already covered om_B, stay on Sub-case 3A
+    // (original turnId) so shouldSuppressBridgeEmit deduplicates against the send marker.
+    const q2 = new BridgeTurnQueue();
+    q2.mark('om_C', makeFingerprint('send reply'), Date.now() - 5_000, 'send reply');
+    q2.ingest([mkUser('u2', 'send reply'), mkAssistant('a2_p', 'u2', [{ type: 'text', text: 'partial' }], null)], '/t/s.jsonl');
+    q2.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true });
+    q2.noteUnobservedTurnDeliveredBySend('om_C');
+    q2.ingest([mkAssistant('a2_f', 'a2_p', [{ type: 'text', text: 'done' }], 'end_turn'), mkDuration('d2', 'a2_f')], '/t/s.jsonl');
+    const rec2 = q2.drainEmittable({ explicitTerminalOnly: true });
+    expect(rec2[0].turnId).toBe('om_C');
+  });
+
+  it('Four-wall leak proof: true local turns, slash commands, wakes, interrupts, parentUuid mismatches, file/generation switches NEVER attach to om_A', () => {
+    const setupUnobserved = () => {
+      const q = new BridgeTurnQueue();
+      q.mark('om_A', makeFingerprint('im prompt'), Date.now() - 5_000, 'im prompt');
+      q.ingest([mkUser('u1', 'im prompt')], '/t/s1.jsonl');
+      q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true });
+      return q;
+    };
+
+    // 1. Local human prompt
+    {
+      const q = setupUnobserved();
+      q.ingest([
+        mkUser('u_local', 'local terminal cmd', { parentUuid: 'u1' }),
+        mkAssistant('a_loc', 'u_local', [{ type: 'text', text: 'local answer' }], 'end_turn'),
+        mkDuration('d_loc', 'a_loc'),
+      ], '/t/s1.jsonl');
+      const out = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(out[0].turnId).toBe('local-u_local');
+      expect(out[0].isLocal).toBe(true);
+    }
+
+    // 2. Local slash command (`<command-name>/review</command-name>`) -> Wall 1 invalidates
+    //    (test both parented off u_cmd AND directly parented off u1 so Wall 1 is verified independently of Wall 2)
+    for (const parentOfReply of ['u_cmd', 'u1']) {
+      const q = setupUnobserved();
+      q.ingest([
+        mkUser('u_cmd', '<command-name>/review</command-name>', { parentUuid: 'u1' }),
+        mkAssistant('a_cmd', parentOfReply, [{ type: 'text', text: 'slash reply' }], 'end_turn'),
+        mkDuration('d_cmd', 'a_cmd'),
+      ], '/t/s1.jsonl');
+      const out = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(out[0].turnId).toBe('local-headless-a_cmd');
+      expect(out[0].isLocal).toBe(true);
+    }
+
+    // 3. `parentUuid: null` or foreign ancestor -> Wall 2 rejects
+    for (const badParent of [null, 'unrelated-uuid']) {
+      const q = setupUnobserved();
+      q.ingest([
+        mkAssistant('a_bad', badParent, [{ type: 'text', text: 'foreign reply' }], 'end_turn'),
+        mkDuration('d_bad', 'a_bad'),
+      ], '/t/s1.jsonl');
+      const out = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(out[0].turnId).toBe('local-headless-a_bad');
+      expect(out[0].isLocal).toBe(true);
+    }
+
+    // 4. Different transcript file -> Wall 3 rejects
+    {
+      const q = setupUnobserved();
+      q.ingest([
+        mkAssistant('a_other_file', 'u1', [{ type: 'text', text: 'other file reply' }], 'end_turn'),
+        mkDuration('d_other', 'a_other_file'),
+      ], '/t/s2.jsonl');
+      const out = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(out[0].turnId).toBe('local-headless-a_other_file');
+      expect(out[0].isLocal).toBe(true);
+    }
+
+    // 5. Generation reset / clearPending -> Wall 3 rejects
+    for (const resetFn of [
+      (q: BridgeTurnQueue) => q.clearPending(),
+      (q: BridgeTurnQueue) => q.resetDurationMarkerVerdicts(),
+      (q: BridgeTurnQueue) => q.markPendingTurnsCarriedAcrossGeneration(),
+    ]) {
+      const q = setupUnobserved();
+      resetFn(q);
+      q.ingest([
+        mkAssistant('a_gen', 'u1', [{ type: 'text', text: 'post-reset reply' }], 'end_turn'),
+        mkDuration('d_gen', 'a_gen'),
+      ], '/t/s1.jsonl');
+      const out = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(out[0].turnId).toBe('local-headless-a_gen');
+      expect(out[0].isLocal).toBe(true);
+    }
+
+    // 6. `<task-notification>` background wake -> Wall 1 invalidates
+    {
+      const q = setupUnobserved();
+      q.ingest([
+        mkUser('u_wake', '<task-notification><task-id>bg1</task-id><status>completed</status></task-notification>', {
+          parentUuid: 'u1', promptSource: 'system', turnOrigin: 'task_notification',
+        }),
+        mkAssistant('a_wake', 'u_wake', [{ type: 'text', text: 'wake reply' }], 'end_turn'),
+        mkDuration('d_wake', 'a_wake'),
+      ], '/t/s1.jsonl');
+      const out = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(out[0].turnId).toBe('local-headless-a_wake');
+      expect(out[0].isLocal).toBe(true);
+    }
+
+    // 7. User interrupt -> Wall 1 invalidates
+    {
+      const q = setupUnobserved();
+      q.ingest([
+        mkUser('u_int', [{ type: 'text', text: '[Request interrupted by user]' }], { parentUuid: 'u1' }),
+        mkAssistant('a_after_int', 'u1', [{ type: 'text', text: 'stray' }], 'end_turn'),
+        mkDuration('d_after_int', 'a_after_int'),
+      ], '/t/s1.jsonl');
+      const out = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(out[0].turnId).toBe('local-headless-a_after_int');
+      expect(out[0].isLocal).toBe(true);
+    }
+  });
+
+  it('adversarial regressions: combined [text,tool_use], streaming null blocks, restoreDrained, >512 progress, manual compact, Skill meta, combined [tool_result,interrupt], Scenario 3 mid-tool hold, hasActiveOrQueuedHead', () => {
+    // 1. Combined [text, tool_use] assistant record does NOT set hadTrailingVisibleText (keeps Scenario 3A)
+    {
+      const q = new BridgeTurnQueue();
+      q.mark('om_comb', makeFingerprint('check comb'), Date.now() - 5_000, 'check comb');
+      q.ingest([
+        mkUser('u1', 'check comb'),
+        mkAssistant('a1', 'u1', [
+          { type: 'text', text: 'Checking...' },
+          { type: 'tool_use', id: 'tu1', name: 'Read', input: {} },
+        ], 'tool_use'),
+      ], '/t/s.jsonl');
+      q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true });
+      q.ingest([
+        mkToolResult('tr1', 'a1', 'tu1'),
+        mkAssistant('a2', 'tr1', [{ type: 'text', text: 'Final combined' }], 'end_turn'),
+        mkDuration('d1', 'a2'),
+      ], '/t/s.jsonl');
+      const out = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(out[0].turnId).toBe('om_comb');
+      expect(q.isLateUnobservedRecovery(out[0])).toBe(true);
+    }
+
+    // 2. Streaming thinking-only & narration-only stop_reason:null preserve apiRequestInFlight
+    {
+      const q = new BridgeTurnQueue();
+      q.noteDurationMarkerObserved();
+      q.mark('om_stream', makeFingerprint('stream check'), Date.now(), 'stream check');
+      q.ingest([
+        mkUser('u1', 'stream check'),
+        { type: 'api-request', id: 'req_s1', querySource: 'repl_main_thread', timestamp: new Date().toISOString() },
+        mkAssistant('a_think', 'u1', [{ type: 'thinking', thinking: 'hmm' }], null),
+        mkAssistant('a_nar', 'a_think', [{ type: 'text', text: 'Writing file...' }], null),
+      ], '/t/s.jsonl');
+      expect(q.getOpenTurnEvidence(q.openLiveNonLocalTurn()!).apiRequestInFlight).toBe(true);
+      // tool_use clears apiRequestInFlight and activates unmatchedToolUseCount
+      q.ingest([mkAssistant('a_tu', 'a_nar', [{ type: 'tool_use', id: 'tu_w', name: 'Write', input: {} }], 'tool_use')], '/t/s.jsonl');
+      const ev = q.getOpenTurnEvidence(q.openLiveNonLocalTurn()!);
+      expect(ev.apiRequestInFlight).toBe(false);
+      expect(ev.unmatchedToolUseCount).toBe(1);
+    }
+
+    // 3. restoreDrained clears recentUnobservedTurn and restores collecting (no duplicate / HOL deadlock)
+    {
+      const q = new BridgeTurnQueue();
+      q.mark('om_rest', makeFingerprint('restore me'), Date.now() - 5_000, 'restore me');
+      q.ingest([mkUser('u1', 'restore me')], '/t/s.jsonl');
+      const popped = q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true });
+      q.restoreDrained(popped);
+      expect(q.openLiveNonLocalTurn()?.turnId).toBe('om_rest');
+      q.ingest([
+        mkAssistant('a_ok', 'u1', [{ type: 'text', text: 'Recovered after restore' }], 'end_turn'),
+        mkDuration('d_ok', 'a_ok'),
+      ], '/t/s.jsonl');
+      const drained = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(drained.map(t => t.turnId)).toEqual(['om_rest']);
+      expect(drained[0].assistantUuids).toEqual(['a_ok']);
+    }
+
+    // 4. >512 progress records do not evict tool_use UUID from chainUuids
+    {
+      const q = new BridgeTurnQueue();
+      q.mark('om_prog', makeFingerprint('long bash'), Date.now() - 5_000, 'long bash');
+      const batch: TranscriptEvent[] = [
+        mkUser('u1', 'long bash'),
+        mkAssistant('a_tool', 'u1', [{ type: 'tool_use', id: 'tu_p', name: 'Bash', input: {} }], 'tool_use'),
+      ];
+      for (let i = 0; i < 600; i++) {
+        batch.push({ type: 'progress', uuid: `p_${i}`, parentUuid: 'a_tool', timestamp: new Date().toISOString() });
+      }
+      q.ingest(batch, '/t/s.jsonl');
+      q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true });
+      q.ingest([
+        mkToolResult('tr_p', 'a_tool', 'tu_p'),
+        mkAssistant('a_fin', 'tr_p', [{ type: 'text', text: 'Survived 600 progress rows' }], 'end_turn'),
+        mkDuration('d_p', 'a_fin'),
+      ], '/t/s.jsonl');
+      const out = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(out[0].turnId).toBe('om_prog');
+      expect(q.isLateUnobservedRecovery(out[0])).toBe(true);
+    }
+
+    // 5. Manual /compact does not upgrade awaitingPostToolAssistant; mid-turn Skill isMeta preserves parentUuid
+    {
+      const q = new BridgeTurnQueue();
+      q.mark('om_mc', makeFingerprint('manual compact'), Date.now() - 5_000, 'manual compact');
+      q.ingest([
+        mkUser('u1', 'manual compact'),
+        { type: 'system', subtype: 'compact_boundary', uuid: 'cb1', parentUuid: null, compactMetadata: { trigger: 'manual' }, timestamp: new Date().toISOString() },
+        { type: 'user', uuid: 'cs1', parentUuid: 'cb1', isCompactSummary: true, message: { role: 'user', content: 'summary' }, timestamp: new Date().toISOString() },
+        { type: 'user', uuid: 'sk1', parentUuid: 'cs1', isMeta: true, message: { role: 'user', content: 'Skill instructions...' }, timestamp: new Date().toISOString() },
+      ], '/t/s.jsonl');
+      expect(q.getOpenTurnEvidence(q.openLiveNonLocalTurn()!).awaitingPostToolAssistant).toBe(false);
+      q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true });
+      q.ingest([
+        mkAssistant('a_sk', 'sk1', [{ type: 'text', text: 'Skill final' }], 'end_turn'),
+        mkDuration('d_sk', 'a_sk'),
+      ], '/t/s.jsonl');
+      expect(q.drainEmittable({ explicitTerminalOnly: true })[0].turnId).toBe('om_mc');
+    }
+
+    // 6. Combined [tool_result, text: "[Request interrupted by user for tool use]"] closes as cancelled
+    {
+      const q = new BridgeTurnQueue();
+      q.mark('om_ci', makeFingerprint('cancel combo'), Date.now(), 'cancel combo');
+      q.ingest([
+        mkUser('u1', 'cancel combo'),
+        mkAssistant('a1', 'u1', [{ type: 'tool_use', id: 'tu_c', name: 'Bash', input: {} }], 'tool_use'),
+        mkUser('u_ci', [
+          { type: 'tool_result', tool_use_id: 'tu_c', content: 'partial', is_error: true },
+          { type: 'text', text: '[Request interrupted by user for tool use]' },
+        ], { parentUuid: 'a1' }),
+      ], '/t/s.jsonl');
+      const out = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(out).toHaveLength(1);
+      expect(out[0].turnId).toBe('om_ci');
+      expect(out[0].terminalOutcome).toEqual({ status: 'cancelled', errorCode: 'user_interrupted', retryable: false });
+      expect(q.peek()).toEqual([]);
+    }
+
+    // 7. Scenario 3 re-attached turn with narration + tool_use is NOT popped mid-tool at terminalBoundary
+    {
+      const q = new BridgeTurnQueue();
+      q.mark('om_s3t', makeFingerprint('reattach tool'), Date.now() - 5_000, 'reattach tool');
+      q.ingest([mkUser('u1', 'reattach tool')], '/t/s.jsonl');
+      q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true });
+      q.ingest([
+        mkAssistant('a_nar', 'u1', [{ type: 'text', text: 'Inspecting...' }], null),
+        mkAssistant('a_tu', 'a_nar', [{ type: 'tool_use', id: 'tu_r', name: 'Read', input: {} }], 'tool_use'),
+      ], '/t/s.jsonl');
+      // Subsequent screen idle must NOT pop mid-tool!
+      expect(q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true })).toEqual([]);
+      q.ingest([
+        mkToolResult('tr_r', 'a_tu', 'tu_r'),
+        mkAssistant('a_real', 'tr_r', [{ type: 'text', text: 'Real late answer' }], 'end_turn'),
+        mkDuration('d_r', 'a_real'),
+      ], '/t/s.jsonl');
+      const out = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(out[0].turnId).toBe('om_s3t');
+      expect(out[0].assistantUuids).toContain('a_real');
+    }
+
+    // 8. hasActiveOrQueuedHead detects active local/scheduled/queued heads (Finding 1)
+    {
+      const q = new BridgeTurnQueue();
+      q.ingest([{
+        type: 'user', uuid: 'sf1', isMeta: true, turnOrigin: 'scheduled', scheduledFireId: 'fire_1',
+        timestamp: new Date().toISOString(), message: { role: 'user', content: 'cron prompt' },
+      }], '/t/s.jsonl');
+      expect(q.openLiveNonLocalTurn()).toBeUndefined();
+      expect(q.hasActiveOrQueuedHead()).toBe(true);
+    }
+
+    // 9. Unkeyed api-request does not double-count on replay, and same-ms id-less api-requests separated by a uuid do not collide
+    {
+      const q = new BridgeTurnQueue();
+      const sameTs = '2026-11-24T12:00:00.000Z';
+      q.mark('om_api', makeFingerprint('api key test'), Date.now(), 'api key test');
+      q.ingest([
+        mkUser('u1', 'api key test'),
+        { type: 'api-request', querySource: 'repl_main_thread' }, // unkeyed -> skipped
+        { type: 'api-request', querySource: 'repl_main_thread', timestamp: sameTs },
+      ], '/t/s.jsonl');
+      expect(q.getOpenTurnEvidence(q.openLiveNonLocalTurn()!).activitySeq).toBe(1);
+      // Replay same batch -> idempotent
+      q.ingest([{ type: 'api-request', querySource: 'repl_main_thread' }], '/t/s.jsonl');
+      expect(q.getOpenTurnEvidence(q.openLiveNonLocalTurn()!).activitySeq).toBe(1);
+      // After a tool_use + tool_result with a new uuid in the same ms, second id-less api-request is NOT dropped
+      q.ingest([
+        mkAssistant('a1', 'u1', [{ type: 'tool_use', id: 'tu1', name: 'Read', input: {} }], 'tool_use'),
+        mkToolResult('tr1', 'a1', 'tu1'),
+        { type: 'api-request', querySource: 'repl_main_thread', timestamp: sameTs },
+      ], '/t/s.jsonl');
+      expect(q.getOpenTurnEvidence(q.openLiveNonLocalTurn()!).apiRequestInFlight).toBe(true);
+    }
+  });
+});
+

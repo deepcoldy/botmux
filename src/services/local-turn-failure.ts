@@ -38,7 +38,7 @@ export function localTurnFailureNotice(
   },
 ): LocalTurnFailureNotice | undefined {
   const outcome = turn.terminalOutcome;
-  if (!outcome || outcome.status === 'completed') return undefined;
+  if (!outcome || outcome.status === 'completed' || outcome.status === 'cancelled') return undefined;
   // No timestamp means no proof the failure is live: keep the replay-safe
   // silence rather than risk resurfacing history.
   if (turn.terminalOutcomeAtMs === undefined || turn.terminalOutcomeAtMs < opts.liveSinceMs) return undefined;

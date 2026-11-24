@@ -196,6 +196,13 @@ import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJo
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
+import {
+  ClaudeOpenTurnWatchdog,
+  CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS,
+  CLAUDE_OPEN_TURN_POLL_MS,
+  parsePositiveMsEnv,
+  type ClaudeOpenTurnObservation,
+} from './services/claude-open-turn-watchdog.js';
 import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, finalBridgeSendMarkerCoversOwnThread, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
@@ -12425,9 +12432,13 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
   // Switched files: re-arm marker verdicts for the new transcript; absorb
   // re-proves `seen` if the new file carries a marker.
+  const wasHoldingWatchdog = typeof claudeOpenTurnWatchdog !== 'undefined' && claudeOpenTurnWatchdog.isActive();
   beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
   ingestClaudeSwitchLiveAndSettleUnreadTurn(live, matched);
+  if (wasHoldingWatchdog && !bridgeQueue.hasActiveOrQueuedHead?.({ ignoreCarried: true })) {
+    if (typeof fireClaudeRedriveEdge === 'function') fireClaudeRedriveEdge();
+  }
   // The switch moved us onto another Claude session: rebind the fallback
   // tracker to it (seed always publishes, so the daemon drops whatever the
   // previous session left behind) before folding this file's own events in.
@@ -12715,9 +12726,13 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   const { history, live } = splitTranscriptEventsByCutoff(result.events, cutoffMs);
   // New file = new writer generation: verdicts from the old transcript must
   // not carry over; absorb re-proves `seen` from the new file.
+  const wasHoldingWatchdog = typeof claudeOpenTurnWatchdog !== 'undefined' && claudeOpenTurnWatchdog.isActive();
   beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
   ingestClaudeSwitchLiveAndSettleUnreadTurn(live, newPath);
+  if (wasHoldingWatchdog && !bridgeQueue.hasActiveOrQueuedHead?.({ ignoreCarried: true })) {
+    if (typeof fireClaudeRedriveEdge === 'function') fireClaudeRedriveEdge();
+  }
   // Same as the fingerprint switch: rebind the fallback tracker to the Claude
   // session we just rotated onto, then fold this file's own events in.
   seedModelFallbackFromTranscript();
@@ -13230,7 +13245,9 @@ function bridgeHeadTurnAwaitingTerminal(opts: { startedOnly?: boolean } = {}): b
   try { bridgeIngest(); } catch { /* best effort */ }
   const head = bridgeQueue.peek()[0];
   if (!head || head.isLocal) return false;
-  return head.started ? bridgeQueue.isTurnOpenAtIdle(head) : !opts.startedOnly;
+  if (head.started) return bridgeQueue.isTurnOpenAtIdle(head);
+  return !opts.startedOnly
+    || (typeof hasSubmittedUnstartedClaudeHead === 'function' && hasSubmittedUnstartedClaudeHead(head));
 }
 
 /** An idle-edge settle gave up. Only a turn whose stop_reason was read and
@@ -13258,6 +13275,12 @@ let idleTranscriptSettle: TranscriptTerminalSettle | null = null;
  *  provisional-exit watchdog must not be armed: the idle edge owns the wait
  *  for the head turn's closing records. */
 let idleTranscriptSettleInFlight = false;
+const activeIdleTranscriptSettles = new Set<TranscriptTerminalSettle>();
+const registeredIdleTranscriptSettles = new Set<TranscriptTerminalSettle>();
+
+function cancelAllIdleTranscriptSettles(): void {
+  for (const settle of [...registeredIdleTranscriptSettles]) settle.cancel();
+}
 /** Watchdog counterpart for turns whose idle edge never fires (a background
  *  task can keep program-status `working`, and stale status keeps waiting).
  *  It is armed only while no idle settle is in flight and disarmed the moment
@@ -13284,20 +13307,31 @@ function makeBridgeTranscriptSettle(
   onTimeout?: () => void,
 ): TranscriptTerminalSettle {
   const inner = createTranscriptTerminalSettle({ awaitingTerminal, onTimeout });
-  return {
+  const handle: TranscriptTerminalSettle = {
     request: (proceed: () => void): void => {
       disarmProvisionalExitWatch();
-      idleTranscriptSettleInFlight = true;
+      if (typeof activeIdleTranscriptSettles !== 'undefined') activeIdleTranscriptSettles.add(handle);
+      idleTranscriptSettleInFlight = typeof activeIdleTranscriptSettles !== 'undefined'
+        ? activeIdleTranscriptSettles.size > 0
+        : true;
       inner.request(() => {
-        idleTranscriptSettleInFlight = false;
+        if (typeof activeIdleTranscriptSettles !== 'undefined') activeIdleTranscriptSettles.delete(handle);
+        idleTranscriptSettleInFlight = typeof activeIdleTranscriptSettles !== 'undefined'
+          ? activeIdleTranscriptSettles.size > 0
+          : false;
         proceed();
       });
     },
     cancel: (): void => {
-      idleTranscriptSettleInFlight = false;
+      if (typeof activeIdleTranscriptSettles !== 'undefined') activeIdleTranscriptSettles.delete(handle);
+      idleTranscriptSettleInFlight = typeof activeIdleTranscriptSettles !== 'undefined'
+        ? activeIdleTranscriptSettles.size > 0
+        : false;
       inner.cancel();
     },
   };
+  if (typeof registeredIdleTranscriptSettles !== 'undefined') registeredIdleTranscriptSettles.add(handle);
+  return handle;
 }
 
 /** Begin a new writer/transcript generation: void the old watchdog deadline,
@@ -13311,6 +13345,9 @@ function beginNewBridgeTranscriptGeneration(): void {
   bridgeQueue.markPendingTurnsCarriedAcrossGeneration();
   bridgeTranscriptGeneration++;
   bridgeQueue.resetDurationMarkerVerdicts();
+  if (typeof disarmClaudeOpenTurnWatchdog === 'function') disarmClaudeOpenTurnWatchdog();
+  if (typeof clearSubmittedClaudeTurnIf === 'function') clearSubmittedClaudeTurnIf(undefined);
+  bridgeQueue.clearRecentUnobservedTurn?.();
 }
 
 /** Void the armed deadline and its turn binding. */
@@ -13320,6 +13357,351 @@ function disarmProvisionalExitWatch(): void {
     provisionalExitTimer = null;
   }
   provisionalExitBoundTurn = null;
+}
+
+/** Two-clock bounded open-turn watchdog for live non-local Claude turns (#3702).
+ *  Holds premature screen-idle / Herdr-done edges while the transcript proves
+ *  the turn has not observed any terminal record, yet guarantees bounded
+ *  settlement if the CLI genuinely stops without writing a closing marker. */
+const claudeOpenTurnWatchdog = new ClaudeOpenTurnWatchdog({
+  bareQuietMs: parsePositiveMsEnv(process.env.BOTMUX_TEST_CLAUDE_OPEN_TURN_QUIET_MS),
+  inflightQuietMs: parsePositiveMsEnv(process.env.BOTMUX_TEST_CLAUDE_OPEN_TURN_INFLIGHT_MS),
+  userStopQuietMs: parsePositiveMsEnv(process.env.BOTMUX_TEST_CLAUDE_OPEN_TURN_STOP_MS),
+});
+let claudeOpenTurnWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+let claudeAwaitingMarkerSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+let claudeUserPromptSubmittedTurnId: string | undefined;
+
+function clearSubmittedClaudeTurnIf(turnId: string | undefined): void {
+  if (turnId === undefined || claudeUserPromptSubmittedTurnId === turnId) {
+    claudeUserPromptSubmittedTurnId = undefined;
+  }
+}
+
+/** Narrow pre-start hold: true ONLY when Claude Code's `UserPromptSubmit` hook
+ *  already confirmed delivery of the unstarted non-local head turn, protecting
+ *  its authority if screen quiescence fires before Claude flushes the `user`
+ *  record to JSONL (dropped Enters never fire `UserPromptSubmit`). */
+function hasSubmittedUnstartedClaudeHead(head: BridgePendingTurn | undefined): boolean {
+  return !!head
+    && !head.isLocal
+    && !head.started
+    && !head.restoredFromJournal
+    && !head.carriedAcrossGeneration
+    && !!claudeUserPromptSubmittedTurnId
+    && claudeUserPromptSubmittedTurnId === head.turnId;
+}
+
+function openClaudeLifecycleTurn(): BridgePendingTurn | undefined {
+  if (!bridgeJsonlPath || lastInitConfig?.adoptMode) return undefined;
+  const open = bridgeQueue.openLiveNonLocalTurn();
+  if (open) return open;
+  const head = bridgeQueue.peek()[0];
+  return hasSubmittedUnstartedClaudeHead(head) ? head : undefined;
+}
+
+function claudeOpenTurnKey(turn: BridgePendingTurn | undefined): string | undefined {
+  if (!turn) return undefined;
+  return `${bridgeTranscriptGeneration}:${turn.turnId}:${turn.dispatchAttempt ?? ''}`;
+}
+
+function stopClaudeOpenTurnWatchdogTimers(): void {
+  if (claudeOpenTurnWatchdogTimer) {
+    clearInterval(claudeOpenTurnWatchdogTimer);
+    claudeOpenTurnWatchdogTimer = null;
+  }
+  if (claudeAwaitingMarkerSafetyTimer) {
+    clearTimeout(claudeAwaitingMarkerSafetyTimer);
+    claudeAwaitingMarkerSafetyTimer = null;
+  }
+}
+
+function disarmClaudeOpenTurnWatchdog(): void {
+  stopClaudeOpenTurnWatchdogTimers();
+  claudeOpenTurnWatchdog.reset();
+}
+
+function noteClaudeOpenTurnUserStop(turnId?: string, dispatchAttempt?: number): void {
+  if (bridgeJsonlPath) {
+    try { bridgeIngest(); } catch { /* best effort */ }
+  }
+  const nowMs = Date.now();
+  const openTurn = openClaudeLifecycleTurn();
+  if (openTurn) {
+    claudeOpenTurnWatchdog.noteUserStop(claudeOpenTurnKey(openTurn), nowMs);
+    return;
+  }
+  const targetTurnId = turnId ?? currentBotmuxTurnId;
+  const targetAttempt = dispatchAttempt ?? currentBotmuxDispatchAttempt;
+  const head = bridgeQueue.peek()[0];
+  if (head && !head.isLocal
+    && (!targetTurnId || (head.turnId === targetTurnId && head.dispatchAttempt === targetAttempt))) {
+    claudeOpenTurnWatchdog.noteUserStop(claudeOpenTurnKey(head), nowMs);
+  }
+}
+
+function captureClaudeOpenTurnObservation(
+  turn: BridgePendingTurn | undefined,
+  be: SessionBackend | null,
+): ClaudeOpenTurnObservation {
+  const turnKey = claudeOpenTurnKey(turn);
+  const evidence = turn
+    ? bridgeQueue.getOpenTurnEvidence(turn)
+    : {
+        activitySeq: 0,
+        unmatchedToolUseCount: 0,
+        apiRequestInFlight: false,
+        awaitingPostToolAssistant: false,
+        hasVisibleAssistantText: false,
+        apiRequestObservedInGeneration: false,
+      };
+  let readyPatternVisible = true;
+  let busyPatternVisible = false;
+  if (be && backendScreenEvidenceIsAuthoritativeForMutation()) {
+    try {
+      const content = captureBackendScreen(be);
+      if (content) {
+        if (cliAdapter?.readyPattern) {
+          readyPatternVisible = cliAdapter.readyPattern.test(stripAnsiScreenText(content));
+        }
+        if (cliAdapter?.busyPattern) {
+          busyPatternVisible = cliAdapter.busyPattern.test(busyProbeRegion(content));
+        }
+      }
+    } catch { /* unreadable viewport falls back to readyPatternVisible=true */ }
+  }
+  return {
+    turnKey,
+    durable: turn?.dispatchAttempt !== undefined,
+    ...evidence,
+    userPromptSubmitObserved: !!turn && claudeUserPromptSubmittedTurnId === turn.turnId,
+    userStopRequested: claudeOpenTurnWatchdog.isUserStopRequestedFor(turnKey),
+    ptyOutputGeneration: ptyOutputGeneration.snapshot(),
+    screenRevision: backendScreenRevision,
+    readyPatternVisible,
+    busyPatternVisible,
+    programStatusHeldBusy: idleDetector?.programStatusHeldBusy() === true,
+    pendingBackgroundAgents: backgroundTaskTracker.pendingTurnAgents() > 0,
+    idleSettleInFlight: idleTranscriptSettleInFlight,
+    cliAlive: be ? cliProcessAliveFromBackend(be) : undefined,
+    nowMs: Date.now(),
+  };
+}
+
+function openClaudeTurnHasExplicitFinalSend(turn: BridgePendingTurn): boolean {
+  const markers = readSendMarkers();
+  if (markers.length === 0) return false;
+  const carrierGateInput = {
+    markTimeMs: turn.markTimeMs,
+    isLocal: turn.isLocal,
+    isScheduled: turn.isScheduled,
+    forwardLocalFinal: zeroPromptTerminalSync(),
+  };
+  const explicitReplyMarkers = attributableExplicitReplyMarkersForTurnWindow(
+    turn.turnId, carrierGateInput, undefined, markers, false,
+  );
+  const ownThread = {
+    sessionId,
+    chatId: lastInitConfig?.chatId,
+    rootMessageId: lastInitConfig?.rootMessageId,
+  };
+  return explicitReplyMarkers.some(marker =>
+    (!marker.sessionId || marker.sessionId === sessionId)
+    && marker.dispatchAttempt === turn.dispatchAttempt
+    && finalBridgeSendMarkerCoversOwnThread(ownThread, marker),
+  );
+}
+
+/** Re-drive prompt readiness after a held Claude open turn finally closes on
+ *  its transcript terminal (or enters fresh awaitingDurationMarker). */
+function fireClaudeRedriveEdge(): void {
+  if (!backend || isPromptReady || hasStructuredLifecycleBlock()) return;
+  if (idleDetector?.programStatusHeldBusy()) return;
+  if (idleDetector) {
+    // On Herdr (or after a quiet screen) the detector may already believe the
+    // terminal is idle; reset first so fireIdle() is guaranteed to emit a fresh
+    // `'external'` edge.
+    if (idleDetector.isIdleNow()) idleDetector.reset();
+    idleDetector.fireIdle();
+    return;
+  }
+  markPromptReady();
+}
+
+/** Decide whether to hold an idle/Herdr-done boundary for an open Claude IM
+ *  turn, arming the two-clock bounded watchdog. Returns `true` when held. */
+function maybeHoldOpenClaudeTurn(
+  evidenceSource: string,
+  observedBackend: SessionBackend,
+  onBoundedRelease: (boundTurn: BridgePendingTurn, savedSource: string) => void,
+): boolean {
+  const openTurn = openClaudeLifecycleTurn();
+  if (!openTurn) return false;
+  if (cliProcessAliveFromBackend(observedBackend) === false) return false;
+  const evidence = bridgeQueue.getOpenTurnEvidence(openTurn);
+  const hasStrongInFlightProof = evidence.unmatchedToolUseCount > 0
+    || evidence.apiRequestInFlight
+    || evidence.awaitingPostToolAssistant;
+  // Authoritative OSC 7501 `idle` wins over a bare open turn that shows no
+  // active tool/API continuation in the transcript.
+  if (evidenceSource === 'program-status' && !hasStrongInFlightProof) return false;
+  // An explicit final `botmux send` with no active tool/API continuation
+  // settles immediately so explicit_final_delivered stays fast and accurate.
+  if (!hasStrongInFlightProof && openClaudeTurnHasExplicitFinalSend(openTurn)) return false;
+
+  const obs = captureClaudeOpenTurnObservation(openTurn, observedBackend);
+  const alreadyHolding = claudeOpenTurnWatchdog.isHoldingFor(obs.turnKey);
+  if (!alreadyHolding) stopClaudeOpenTurnWatchdogTimers();
+  claudeOpenTurnWatchdog.hold(obs, evidenceSource);
+  if (!alreadyHolding && busyReadyLogThrottle.shouldLog('claude-open-turn', openTurn.turnId)) {
+    log(`Holding ${evidenceSource} idle for open Claude turn ${openTurn.turnId.substring(0, 8)} `
+      + `(tools=${evidence.unmatchedToolUseCount}, apiInFlight=${evidence.apiRequestInFlight}, `
+      + `postTool=${evidence.awaitingPostToolAssistant}, durable=${openTurn.dispatchAttempt !== undefined})`);
+  }
+  idleDetector?.reset();
+
+  if (openTurn.dispatchAttempt === undefined && !claudeOpenTurnWatchdogTimer) {
+    const boundTurn = openTurn;
+    const boundGeneration = bridgeTranscriptGeneration;
+    const boundCliGeneration = cliSpawnGeneration;
+    let releaseIngestFailures = 0;
+    const tick = (): void => {
+      if (boundGeneration !== bridgeTranscriptGeneration
+        || boundCliGeneration !== cliSpawnGeneration
+        || backend !== observedBackend) {
+        disarmClaudeOpenTurnWatchdog();
+        return;
+      }
+      const action = claudeOpenTurnWatchdog.evaluate(
+        captureClaudeOpenTurnObservation(openClaudeLifecycleTurn(), observedBackend),
+      );
+      if (action === 'disarm') {
+        disarmClaudeOpenTurnWatchdog();
+        return;
+      }
+      if (action === 'wait') return;
+      if (idleTranscriptSettleInFlight) return;
+      // Mandatory pre-settlement drain: a real terminal or fresh activity may
+      // have landed since the previous poll tick. Retry up to 2 consecutive
+      // transient read errors before proceeding with bounded settlement so a
+      // deleted/unreadable transcript cannot spin the watchdog forever.
+      try {
+        bridgeIngest();
+        releaseIngestFailures = 0;
+      } catch (err: any) {
+        releaseIngestFailures++;
+        log(`Claude open-turn watchdog ingest failed (${releaseIngestFailures}/3): ${err.message}`);
+        if (releaseIngestFailures < 3) return;
+      }
+      if (boundGeneration !== bridgeTranscriptGeneration
+        || boundCliGeneration !== cliSpawnGeneration
+        || backend !== observedBackend) {
+        disarmClaudeOpenTurnWatchdog();
+        return;
+      }
+      const current = bridgeQueue.peek()[0];
+      if (current !== boundTurn
+        || current.turnId !== boundTurn.turnId
+        || current.dispatchAttempt !== boundTurn.dispatchAttempt) {
+        // Closed during bridgeIngest(); reconcileClaudeOpenTurnWatchdogAfterIngest
+        // already handled the redrive.
+        disarmClaudeOpenTurnWatchdog();
+        return;
+      }
+      if (current.terminalObserved) {
+        // Closing record (`end_turn`/error/interrupt) just arrived — let the
+        // marker/reconcile path finish it cleanly instead of popping unobserved.
+        return;
+      }
+      const recheck = claudeOpenTurnWatchdog.evaluate(
+        captureClaudeOpenTurnObservation(current, observedBackend),
+      );
+      if (recheck === 'wait') return;
+      const savedSource = claudeOpenTurnWatchdog.savedEvidenceSource();
+      disarmClaudeOpenTurnWatchdog();
+      log(`Claude open-turn bounded fallback releasing turn ${boundTurn.turnId.substring(0, 8)} `
+        + `(${recheck}, source=${savedSource})`);
+      onBoundedRelease(boundTurn, savedSource);
+    };
+    claudeOpenTurnWatchdogTimer = setInterval(tick, CLAUDE_OPEN_TURN_POLL_MS);
+    claudeOpenTurnWatchdogTimer.unref?.();
+  }
+  return true;
+}
+
+/** Reconcile the Claude open-turn watchdog immediately after `bridgeIngest()`
+ *  or `updateProvisionalExitWatch()` advances transcript state. */
+function reconcileClaudeOpenTurnWatchdogAfterIngest(): void {
+  if (!claudeOpenTurnWatchdog.isActive()) return;
+  const boundKey = claudeOpenTurnWatchdog.boundTurnKey();
+  const openTurn = openClaudeLifecycleTurn();
+  if (openTurn && claudeOpenTurnKey(openTurn) === boundKey) {
+    claudeOpenTurnWatchdog.noteIngestProgress(captureClaudeOpenTurnObservation(openTurn, backend));
+    return;
+  }
+  const head = bridgeQueue.peek()[0];
+  if (boundKey && head && claudeOpenTurnKey(head) === boundKey && bridgeQueue.isAwaitingDurationMarker(head)) {
+    if (claudeOpenTurnWatchdog.getPhase() !== 'awaiting-marker-redrive') {
+      const savedSource = claudeOpenTurnWatchdog.savedEvidenceSource();
+      stopClaudeOpenTurnWatchdogTimers();
+      claudeOpenTurnWatchdog.enterAwaitingMarkerRedrive(boundKey, savedSource);
+      if (bridgeQueue.isFreshHeadAwaitingMarker(head)) {
+        // Undecided/older CLI without proven `turn_duration`: re-drive now so
+        // the 2s settle learns durationMarkerWaitExpired if no marker comes.
+        fireClaudeRedriveEdge();
+      } else if (head.dispatchAttempt === undefined) {
+        // Non-durable turn on a `durationMarkerSeen` session: wait for the
+        // `turn_duration` marker, with a bounded safety release that settles
+        // this exact turn BEFORE redriving `prompt_ready` (no split-brain).
+        // Durable turns (`dispatchAttempt !== undefined`) stay held for their
+        // explicit `turn_duration` / next-turn / CLI-exit contract.
+        const boundTurn = head;
+        const expectedGeneration = bridgeTranscriptGeneration;
+        claudeAwaitingMarkerSafetyTimer = setTimeout(() => {
+          claudeAwaitingMarkerSafetyTimer = null;
+          if (expectedGeneration !== bridgeTranscriptGeneration) {
+            disarmClaudeOpenTurnWatchdog();
+            return;
+          }
+          try { bridgeIngest(); } catch { /* best effort */ }
+          if (expectedGeneration !== bridgeTranscriptGeneration
+            || !claudeOpenTurnWatchdog.isAwaitingMarkerRedriveFor(boundKey)) {
+            return;
+          }
+          const current = bridgeQueue.peek()[0];
+          if (current !== boundTurn
+            || current.turnId !== boundTurn.turnId
+            || current.dispatchAttempt !== boundTurn.dispatchAttempt) {
+            disarmClaudeOpenTurnWatchdog();
+            return;
+          }
+          if (idleDetector?.programStatusHeldBusy()) return;
+          if (bridgeQueue.isAwaitingDurationMarker(current)) {
+            try {
+              emitReadyTurns({
+                releaseHeldTerminals: true,
+                onlyTurn: { turnId: current.turnId, dispatchAttempt: current.dispatchAttempt },
+              });
+            } catch (err: any) {
+              log(`Claude awaiting-marker safety release error: ${err.message}`);
+            }
+          }
+          disarmClaudeOpenTurnWatchdog();
+          if (openClaudeLifecycleTurn() !== undefined || bridgeQueue.hasActiveOrQueuedHead?.()) return;
+          fireClaudeRedriveEdge();
+        }, CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS);
+        claudeAwaitingMarkerSafetyTimer.unref?.();
+      }
+    }
+    return;
+  }
+  // Bound turn left the head (settled by turn_duration, API error, interrupt,
+  // or next turn start). Disarm and re-drive prompt_ready ONLY if no successor
+  // turn (local, scheduled, background wake, non-local, or CLI-queued) is now
+  // active at the queue head.
+  disarmClaudeOpenTurnWatchdog();
+  if (openClaudeLifecycleTurn() !== undefined || bridgeQueue.hasActiveOrQueuedHead?.()) return;
+  fireClaudeRedriveEdge();
 }
 
 /** Re-evaluate the watchdog after transcript ingest. When a fresh turn's head
@@ -13407,9 +13789,10 @@ function updateProvisionalExitWatch(): void {
     // prompt and the fallback structurally never fires for them — they keep
     // relying on the idle edge, by design.
     const heldWorking = idleDetector?.programStatusHeldWorking() === true;
-    const idleImminent = idleDetector?.isIdleNow()
+    const isLateRecoveryHead = bridgeQueue.isLateUnobservedRecovery?.(current) === true;
+    const idleImminent = !isLateRecoveryHead && (idleDetector?.isIdleNow()
       || idleTranscriptSettleInFlight
-      || (!heldWorking && idleDetector?.screenShowsPrompt() === true);
+      || (!heldWorking && idleDetector?.screenShowsPrompt() === true));
     if (idleImminent) { reArm(); return; }
     // Emit ONLY the bound turn:
     //  - still awaiting its marker after the bound: apply the same wait-expired
@@ -13440,6 +13823,9 @@ function updateProvisionalExitWatch(): void {
     // instead of waiting for this one to misfire and skew its bound.
     disarmProvisionalExitWatch();
     updateProvisionalExitWatch();
+    if (typeof reconcileClaudeOpenTurnWatchdogAfterIngest === 'function') {
+      reconcileClaudeOpenTurnWatchdogAfterIngest();
+    }
   }, PROVISIONAL_EXIT_WATCH_MS);
   provisionalExitTimer.unref?.();
 }
@@ -13573,7 +13959,13 @@ function bridgeIngest(): void {
   // Transcript terminal markers are authoritative and may settle a durable
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
-  emitReadyTurns({ explicitTerminalOnly: true });
+  try {
+    emitReadyTurns({ explicitTerminalOnly: true });
+  } finally {
+    if (typeof reconcileClaudeOpenTurnWatchdogAfterIngest === 'function') {
+      reconcileClaudeOpenTurnWatchdogAfterIngest();
+    }
+  }
 }
 
 /** Scan newly-drained Claude transcript events for a structured rate-limit
@@ -14042,6 +14434,8 @@ function emitReadyTurns(opts: {
   const finalMarkerTurns = new Set<(typeof ready)[number]>();
   // Turns that actually emitted a final_output IPC in loop 1.
   const emittedFinalOutputTurns = new Set<(typeof ready)[number]>();
+  // Turns whose final_output was durably offered to V1 handoff in loop 1.
+  const handoffOfferedTurns = new Set<(typeof ready)[number]>();
   let emitIndex = 0;
   try {
   for (let i = 0; i < ready.length; i++) {
@@ -14086,6 +14480,8 @@ function emitReadyTurns(opts: {
     // explicit `botmux send` can be followed by an empty assistant-final block;
     // still publish its marker before turn_terminal so daemon auto mode can
     // PATCH the actual visible reply instead of mistaking the turn for bodyless.
+    const isLateRecovery = bridgeQueue.isLateUnobservedRecovery?.(turn) === true;
+    const sendDedupTurnId = isLateRecovery && turn.replyAnchorTurnId ? turn.replyAnchorTurnId : turn.turnId;
     const carrierGateInput = {
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
@@ -14093,7 +14489,7 @@ function emitReadyTurns(opts: {
       forwardLocalFinal: zeroPromptTerminalSync(),
     };
     const explicitReplyMarkers = attributableExplicitReplyMarkersForTurnWindow(
-      turn.turnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
+      sendDedupTurnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
     );
     if (explicitReplyMarkers.some(isFinalBridgeSendMarker)) {
       observedOutputTurns.add(turn);
@@ -14152,7 +14548,8 @@ function emitReadyTurns(opts: {
     if (assistantText.length === 0) continue;
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
-    const gateInput = bridgeGateInputForTurn(sessionId, turn, {
+    const gateTurn = sendDedupTurnId === turn.turnId ? turn : { ...turn, turnId: sendDedupTurnId };
+    const gateInput = bridgeGateInputForTurn(sessionId, gateTurn, {
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
       isScheduled: turn.isScheduled,
@@ -14247,6 +14644,7 @@ function emitReadyTurns(opts: {
     usageLimitTracker.noteTurnCompleted('answered');
     const handoffOutput = { sessionId: sessionId!, content: deliveredText, lastUuid: lastUuid!, turnId: turn.turnId };
     if (workerFinalOutputHandoff && handoffTurnIds.has(turn.turnId) && !turn.isLocal && turn.dispatchAttempt === undefined
+      && !isLateRecovery
       && canHandoffFinalOutput(handoffOutput)) {
       try { workerFinalOutputHandoff.offer(handoffOutput); }
       catch (error) {
@@ -14256,6 +14654,7 @@ function emitReadyTurns(opts: {
         log(`Final output snapshot was not committed; retaining queue/journal: ${String(error)}`);
         break;
       }
+      handoffOfferedTurns.add(turn);
       continue;
     }
     observedOutputTurns.add(turn);
@@ -14272,7 +14671,7 @@ function emitReadyTurns(opts: {
       // terminalLocal owns routing there.
       // A forwarded background wake anchors to the Lark turn that launched
       // its task (the queue only flags a wake when that anchor is known).
-      ...((turn.isScheduled || forwardBackgroundWake) && !zeroPromptTerminalSync() && turn.replyAnchorTurnId
+      ...((turn.isScheduled || forwardBackgroundWake || isLateRecovery) && !zeroPromptTerminalSync() && turn.replyAnchorTurnId
         ? { replyTurnId: turn.replyAnchorTurnId }
         : {}),
       ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
@@ -14284,6 +14683,20 @@ function emitReadyTurns(opts: {
     bridgeQueue.restoreDrained(ready.slice(emitIndex));
     throw error;
   }
+  // Reconcile Scenario 3A vs 3B against whether Loop 1 actually emitted or
+  // offered a `final_output`, and clear any submit-hook pre-start tracking for
+  // turns that just settled.
+  for (const turn of ready) {
+    if (unsubmitted.has(turn.turnId)) continue;
+    if (typeof clearSubmittedClaudeTurnIf === 'function') clearSubmittedClaudeTurnIf(turn.turnId);
+    if (!turn.isLocal && !turn.terminalObserved) {
+      bridgeQueue.noteUnobservedTurnEmittedFinalOutput?.(
+        turn.turnId,
+        turn.dispatchAttempt,
+        emittedFinalOutputTurns.has(turn) || handoffOfferedTurns.has(turn),
+      );
+    }
+  }
   // A visible fallback is optional: it may be empty or deliberately suppressed
   // after the model used `botmux send`. Completion is not optional. Emit it
   // only after all corresponding final_output IPC messages have been queued so
@@ -14292,6 +14705,9 @@ function emitReadyTurns(opts: {
     if (unsubmitted.has(turn.turnId) || workerFinalOutputHandoff?.hasTurn(turn.turnId)) continue;
     if (universalOutputHandoff || handoffTurnIds.has(turn.turnId)) journalBridgeTurnClear(turn.turnId, turn.dispatchAttempt);
     if (turn.rateLimited) continue;
+    // Scenario 3 late recovery: the originating turn already emitted its
+    // turn_terminal when popped at the bounded unobserved boundary.
+    if (bridgeQueue.isLateUnobservedRecovery?.(turn)) continue;
     const outcome = turn.terminalOutcome;
     // A SYNTHESISED local turn has no Lark turn behind it: `local-*` /
     // `local-headless-*` / `scheduled-*` ids are minted by the queue for
@@ -14475,6 +14891,7 @@ function codexBridgeUsesSplitLiveAttach(): boolean {
  *  may let a transcript-started turn override the screen-ready heuristic. */
 function hasStructuredLifecycleBlock(): boolean {
   if (traexQuotaPending) return true;
+  if (typeof openClaudeLifecycleTurn === 'function' && openClaudeLifecycleTurn() !== undefined) return true;
   if (rpcTurnsAwaitingActivation.size > 0) return true;
   if (rpcLifecycleFailClosedOwners.size > 0) return true;
   if (rpcTerminalHydrationOwners.size > 0) return true;
@@ -18619,6 +19036,7 @@ function beginCliWriteCycle(): void {
   // the previous turn, and the CLI is about to work again. Its transcript
   // terminal still settles it from the per-read drain.
   idleTranscriptSettle?.cancel();
+  if (typeof cancelAllIdleTranscriptSettles === 'function') cancelAllIdleTranscriptSettles();
   beginRuntimeWriteCycle({
     setPromptReady: ready => { if (ready) isPromptReady = true; else revokePromptReadiness(); },
     resetIdleDetector: () => { idleDetector?.reset({ inputCycle: true }); },
@@ -19789,6 +20207,9 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   // /model), and retiring there would swallow the still-running turn.
   if (criticalInterrupt && requestedKey === 'ctrlc') {
     retireDoubaoBridgeTurnOnInterrupt(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
+    if (typeof noteClaudeOpenTurnUserStop === 'function') {
+      noteClaudeOpenTurnUserStop(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
+    }
     if (cliAdapter?.id === 'cursor') submitCursorParkedFollowUpAfterStop(targetBackend, lifetime);
   }
   // ESC/Ctrl-C/Enter likely ends an active TUI prompt. Un-wedge the blocking
@@ -19877,6 +20298,9 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
       if (pendingMessages[i]!.turnId === turnId) pendingMessages.splice(i, 1);
     }
     retireDoubaoBridgeTurnOnInterrupt(turnId, currentBotmuxDispatchAttempt);
+    if (typeof noteClaudeOpenTurnUserStop === 'function') {
+      noteClaudeOpenTurnUserStop(turnId, currentBotmuxDispatchAttempt);
+    }
     if (cliAdapter?.id === 'cursor') submitCursorParkedFollowUpAfterStop(targetBackend, lifetime);
   }
   send({ type: 'turn_interrupt_result', requestId, turnId, delivered, ...(delivered ? {} : { reason: 'delivery_failed' as const }) });
@@ -27728,6 +28152,7 @@ function wireIdleDetectorBusyTransition(detector: IdleDetector, label: string): 
   detector.onBusy(bindSessionObservation(() => {
     // The CLI went back to work while an idle edge was still settling.
     idleTranscriptSettle?.cancel();
+    if (typeof cancelAllIdleTranscriptSettles === 'function') cancelAllIdleTranscriptSettles();
     const wasPromptReady = isPromptReady;
     revokePromptReadiness();
     if (!wasPromptReady) return;
@@ -28120,6 +28545,7 @@ function probeBusyPatternIdle(
         return false;
       }
       if (reattachedTurnStillOpen(source)) return false;
+      if (typeof openClaudeLifecycleTurn === 'function' && openClaudeLifecycleTurn() !== undefined) return false;
       if (!be.settleCurrentScreen) {
         log(`${source} idle probe: busy marker absent, marking prompt ready`);
         markPromptReadyFromBusyProbe(be);
@@ -35014,6 +35440,29 @@ async function spawnCliBody(
     else markPromptReady();
   };
   const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
+    if (bridgeJsonlPath) {
+      try { bridgeIngest(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
+    }
+    const source = evidenceSource ?? 'screen';
+    if (maybeHoldOpenClaudeTurn(source, observedBackend, (boundTurn, savedSource) => {
+      if (backend !== observedBackend) return;
+      clearSubmittedClaudeTurnIf(boundTurn.turnId);
+      if (boundTurn.dispatchAttempt === undefined) {
+        try {
+          emitReadyTurns({
+            onlyTurn: { turnId: boundTurn.turnId, dispatchAttempt: boundTurn.dispatchAttempt },
+          });
+        } catch (err: any) { log(`Bridge bounded-release emit error: ${err.message}`); }
+      }
+      if (codexBridgeFallbackActive()) {
+        try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
+      }
+      if (openClaudeLifecycleTurn() === undefined && !bridgeQueue.hasActiveOrQueuedHead?.()) {
+        markReadyFromEvidence(savedSource);
+      }
+    })) {
+      return;
+    }
     drainBridges();
     markReadyFromEvidence(evidenceSource);
   };
@@ -35025,9 +35474,12 @@ async function spawnCliBody(
   // Wait (bounded) for the transcript to close it; immediate when it already
   // has, and for every CLI without a Claude transcript bridge.
   idleTranscriptSettle?.cancel();
+  cancelAllIdleTranscriptSettles();
+  registeredIdleTranscriptSettles.clear();
+  disarmClaudeOpenTurnWatchdog();
   const ptyIdleSettle = makeBridgeTranscriptSettle(
-    () => bridgeHeadTurnAwaitingTerminal({ startedOnly: true }),
-    noteBridgeTurnCloseWaitExpired,
+    () => backend === observedBackend && bridgeHeadTurnAwaitingTerminal({ startedOnly: true }),
+    () => { if (backend === observedBackend) noteBridgeTurnCloseWaitExpired(); },
   );
   idleTranscriptSettle = ptyIdleSettle;
 
@@ -35107,6 +35559,23 @@ async function spawnCliBody(
             || structuredBridgeIs('doubao')));
       if (busyGuardedIdle && idleBackend
         && deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)) return;
+      // Fast-path: already holding this exact open Claude turn in the bounded
+      // watchdog — ingest once to catch any terminal that just landed instead
+      // of churning through another 2s settle poll on every quiescence tick.
+      // Always return afterwards: `reconcileClaudeOpenTurnWatchdogAfterIngest()`
+      // inside `bridgeIngest()` owns the transition/redrive for that held turn,
+      // so falling through into `ptyIdleSettle` would re-enter on a newly
+      // flushed successor turn or split-brain an `awaiting-marker-redrive` head.
+      const heldKeyBeforeSettle = claudeOpenTurnKey(openClaudeLifecycleTurn());
+      if (evidenceSource === 'screen' && claudeOpenTurnWatchdog.isHoldingFor(heldKeyBeforeSettle)) {
+        if (bridgeJsonlPath) {
+          try { bridgeIngest(); } catch { /* best effort */ }
+        }
+        if (claudeOpenTurnWatchdog.isHoldingFor(heldKeyBeforeSettle)) {
+          idleDetector?.reset();
+        }
+        return;
+      }
       ptyIdleSettle.request(() => {
         if (backend !== observedBackend) return;
         drainBridgesThenMarkReady(evidenceSource);
@@ -35120,8 +35589,8 @@ async function spawnCliBody(
   }, true));
   if (observedBackend instanceof HerdrBackend) {
     const transcriptSettle = makeBridgeTranscriptSettle(
-      () => bridgeHeadTurnAwaitingTerminal(),
-      noteBridgeTurnCloseWaitExpired,
+      () => backend === observedBackend && bridgeHeadTurnAwaitingTerminal(),
+      () => { if (backend === observedBackend) noteBridgeTurnCloseWaitExpired(); },
     );
     const promptReadyEdgesAtSpawn = promptReadyEdges;
     observedBackend.onAgentStatus(bindSessionRuntimeCallback((status) => {
@@ -35134,15 +35603,30 @@ async function spawnCliBody(
           log(`Herdr agent ${status} before this CLI's first confirmed prompt — leaving startup readiness to screen evidence`);
           return;
         }
+        const heldHerdrKey = claudeOpenTurnKey(openClaudeLifecycleTurn());
+        if (claudeOpenTurnWatchdog.isHoldingFor(heldHerdrKey)) {
+          if (bridgeJsonlPath) {
+            try { bridgeIngest(); } catch { /* best effort */ }
+          }
+          const stillOpen = openClaudeLifecycleTurn();
+          if (stillOpen && claudeOpenTurnWatchdog.isHoldingFor(heldHerdrKey)) {
+            if (busyReadyLogThrottle.shouldLog('claude-open-turn', stillOpen.turnId)) {
+              log(`Ignoring repeated Herdr agent ${status} while Claude turn ${stillOpen.turnId.substring(0, 8)} remains open in transcript`);
+            }
+          }
+          // `reconcileClaudeOpenTurnWatchdogAfterIngest()` owns the transition
+          // / redrive for the held turn; never fall through into `transcriptSettle`.
+          return;
+        }
         log(`Herdr agent ${status} — draining bridges before marking prompt ready`);
         // The stop hook behind this status can beat the transcript write of the
         // turn's final assistant line; settle (bounded) so that answer is not lost.
         transcriptSettle.request(() => {
           if (backend !== observedBackend) return;
-          drainBridgesThenMarkReady('structured');
+          drainBridgesThenMarkReady(status === 'done' ? 'herdr-done' : 'herdr-idle');
         });
       } else if (status === 'working') {
-        transcriptSettle.cancel();
+        cancelAllIdleTranscriptSettles();
         revokePromptReadiness();
         idleDetector?.reset();
       }
@@ -35500,6 +35984,10 @@ async function spawnCliBody(
       }
     }
     durableTurnInFlight = false;
+    cancelAllIdleTranscriptSettles();
+    disarmClaudeOpenTurnWatchdog();
+    clearSubmittedClaudeTurnIf(undefined);
+    bridgeQueue.clearRecentUnobservedTurn?.();
     // Hybrid RPC mode: the `codex --remote` viewer just died — tear down the
     // paired app-server so it can't outlive the pane. A fresh spawn re-engages
     // the engine from scratch (or falls back to paste mode).
@@ -42939,7 +43427,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         });
       }
       const submittedTurnId = writtenInputs.takeSubmitted(msg);
-      if (submittedTurnId) send({ type: 'prompt_submitted_input', turnId: submittedTurnId });
+      if (submittedTurnId) {
+        claudeUserPromptSubmittedTurnId = submittedTurnId;
+        send({ type: 'prompt_submitted_input', turnId: submittedTurnId });
+      }
       break;
     }
 

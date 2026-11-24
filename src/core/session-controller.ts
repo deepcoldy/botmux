@@ -470,7 +470,15 @@ export class SessionController {
     // input is still queued. Do not reconstruct execution authority from the
     // notification's display-only turnId (or create an input admission for it).
     if (message.type !== 'cli_session_id' && !context.scope.execution && typeof message.turnId === 'string' && context.scope.runtime && this.store.authorizedProducer(this.ref, context.scope.runtime, channel)) {
-      const existing = this.store.executions(this.ref, message.turnId, message.dispatchAttempt);
+      // Scenario 3B late-recovery final_output carries a synthetic `late-recovery-*`
+      // turnId anchored to `replyTurnId`. Attach `execution_output` to the
+      // originating execution instead of minting an unclosed synthetic contract.
+      const lookupTurnId = message.type === 'final_output'
+        && message.turnId.startsWith('late-recovery-')
+        && typeof message.replyTurnId === 'string'
+        ? message.replyTurnId
+        : message.turnId;
+      const existing = this.store.executions(this.ref, lookupTurnId, message.dispatchAttempt);
       const current = this.currentRuntime();
       // A turn the CLI starts itself is reported under the binding it was
       // spawned with; an in-process continuation moved that CLI to `current`.
