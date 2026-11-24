@@ -54,6 +54,7 @@ function isWideRegexAtom(token: string): boolean {
 interface RegexGroup {
   choices: boolean;
   wide: boolean;
+  zeroWidth: boolean;
   adjacentVariableWidths: number;
   initialAdjacentVariableWidths: number;
   alternateAdjacentVariableWidths: number;
@@ -62,13 +63,14 @@ interface RegexGroup {
 interface RegexAtom {
   choices: boolean;
   wide: boolean;
+  zeroWidth: boolean;
   variableTail: boolean;
   initialAdjacentVariableWidths?: number;
 }
 
-function regexGroup(adjacentVariableWidths: number): RegexGroup {
+function regexGroup(adjacentVariableWidths: number, zeroWidth = false): RegexGroup {
   return {
-    choices: false, wide: false, adjacentVariableWidths,
+    choices: false, wide: false, zeroWidth, adjacentVariableWidths,
     initialAdjacentVariableWidths: adjacentVariableWidths,
     alternateAdjacentVariableWidths: 0,
   };
@@ -100,30 +102,36 @@ function isSafeRegex(pattern: string): boolean {
         group.choices = true;
         if (++group.adjacentVariableWidths >= 3 || ++totalVariableWidths > 8) return false;
         if (atom.wide && ++wideVariableWidths >= 3) return false;
-      } else if (!atom.variableTail || max === 0) {
-        // An identity quantifier does not turn a group's variable tail into a
-        // fixed-width separator. Other fixed repetitions do separate segments.
+      } else if (max === 0) {
+        // Zero repetitions consume nothing; restore a prefix hidden by a group.
+        if (atom.initialAdjacentVariableWidths !== undefined) {
+          group.adjacentVariableWidths = Math.max(group.adjacentVariableWidths, atom.initialAdjacentVariableWidths);
+        }
+      } else if (!atom.variableTail && !atom.zeroWidth) {
+        // Only positive-width fixed atoms separate segments. An identity
+        // quantifier does not turn a group's variable tail into a separator.
         group.adjacentVariableWidths = 0;
       }
       atom = undefined;
       continue;
     }
-    // Only a fixed tail separates adjacent variable-width segments. Group
-    // boundaries themselves are transparent to the adjacency scan.
-    if (atom && !atom.variableTail) group.adjacentVariableWidths = 0;
+    // Only a consuming fixed tail separates adjacent variable-width segments.
+    // Group boundaries and zero-width assertions are transparent to the scan.
+    if (atom && !atom.variableTail && !atom.zeroWidth) group.adjacentVariableWidths = 0;
     atom = undefined;
     if (token.startsWith('(')) {
-      groups.push(regexGroup(group.adjacentVariableWidths));
+      const zeroWidth = token === '(?=' || token === '(?!' || token === '(?<=' || token === '(?<!';
+      groups.push(regexGroup(group.adjacentVariableWidths, zeroWidth));
     } else if (token === ')' && groups.length > 1) {
       const inner = groups.pop()!;
       const outer = groups[groups.length - 1]!;
-      const tail = Math.max(inner.adjacentVariableWidths, inner.alternateAdjacentVariableWidths);
+      const tail = inner.zeroWidth ? inner.initialAdjacentVariableWidths
+        : Math.max(inner.adjacentVariableWidths, inner.alternateAdjacentVariableWidths);
       outer.adjacentVariableWidths = tail;
-      if (tail >= 3) return false;
       outer.choices ||= inner.choices;
       outer.wide ||= inner.wide;
       atom = {
-        choices: inner.choices, wide: inner.wide, variableTail: tail > 0,
+        choices: inner.choices, wide: inner.wide, zeroWidth: inner.zeroWidth, variableTail: tail > 0,
         initialAdjacentVariableWidths: inner.initialAdjacentVariableWidths,
       };
     } else if (token === '|') {
@@ -135,7 +143,8 @@ function isSafeRegex(pattern: string): boolean {
         totalVariableWidths = 0;
       }
     } else {
-      atom = { wide: isWideRegexAtom(token), choices: false, variableTail: false };
+      const zeroWidth = token === '^' || token === '$' || token === '\\b' || token === '\\B';
+      atom = { wide: isWideRegexAtom(token), choices: false, zeroWidth, variableTail: false };
       group.wide ||= atom.wide;
     }
   }

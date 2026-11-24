@@ -478,6 +478,13 @@ describe('owner follow policy validation', () => {
     '(a*b*){2}',
     '(a*b*){1}a*',
     'a*(a*|b)c*',
+    // Zero-width tokens do not separate adjacent variable-width segments.
+    Array(8).fill('a*').join('(?:){0}') + 'f',
+    Array(8).fill('a*').join('(?:){0,0}') + 'f',
+    Array(8).fill('a*').join('a{0}') + 'f',
+    Array(8).fill('a*').join('(a){0}') + 'f',
+    Array(8).fill('a*').join(String.raw`\B`) + 'f',
+    Array(8).fill('a*').join('(?<!x)') + 'f',
   ])
     ('rejects high-risk regex %s and skips evaluation if it was not normalized', pattern => {
       const rule = { ...includeAlert, op: 'regex', pattern } as const;
@@ -491,6 +498,8 @@ describe('owner follow policy validation', () => {
     String.raw`\d+-\d+-\d+`, String.raw`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}`,
     '[0-9]+-[0-9]+-[0-9]+', 'a?b'.repeat(8) + '|' + 'c?d'.repeat(8), '(?:a??b){1}',
     '(a*b*){1}', 'a*(a*b){1}', '(a*|b)c*',
+    'a*(?:){0}a*', 'a*(?:){0,0}a*', 'a*a{0}a*', 'a*(a){0}a*',
+    String.raw`a*\ba*`, String.raw`a*\Ba*`, 'a*(?<=a)a*', 'a*(?<!x)a*',
   ])
     ('accepts safe regex %s', pattern => {
       expect(validateOwnerGroupFollowRule({ ...includeAlert, op: 'regex', pattern })).toBeUndefined();
