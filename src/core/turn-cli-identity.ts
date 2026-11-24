@@ -466,7 +466,7 @@ async function publishOne(
   const outcome = refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, refusal, retryable);
   if (retryable) {
     rememberTransientRefusal({
-      botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId: turnId!,
+      botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId: turnId!, validateBeforeWrite,
       ...refusalKindOf(refusal as Extract<PlatformIdentityResolution, { state: 'unavailable' | 'not_authorized' }>),
     });
   }
@@ -567,6 +567,9 @@ interface TransientRefusal {
   senderOpenId: string;
   locale: Locale | undefined;
   turnId: string;
+  /** The write fence of the publication that left this refusal; checked again
+   *  right before a retry writes a granted credential. */
+  validateBeforeWrite?: () => boolean;
   /** The refusal body this module published; the CAS token. */
   body: string;
   /** The person's local credential epoch when the refusal was published; a
@@ -727,6 +730,12 @@ async function runTransientRetry(
       return;
     }
     if (platform.state === 'granted') {
+      // The publication fence of the original publication decides again: a person
+      // turn whose person lost access meanwhile gets no credential, only the refusal.
+      if (!publicationValid(entry.validateBeforeWrite)) {
+        drop();
+        return;
+      }
       writeSessionIdentity(entry.sessionDataDir, entry.sessionId, withMeegoStore(
         { ...platform.identity, turnId: entry.turnId, openId: entry.senderOpenId },
         wanted), 'proven');
@@ -752,8 +761,8 @@ async function runTransientRetry(
       entry.locale, entry.turnId, 'proven', platform);
     drop();
     if (platform.state === 'not_authorized' && !isUnattendedIdentityTurnId(entry.turnId)) {
-      const { botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId } = entry;
-      rememberTransientRefusal({ botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId, ...refusalKindOf(platform) });
+      const { botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId, validateBeforeWrite } = entry;
+      rememberTransientRefusal({ botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId, validateBeforeWrite, ...refusalKindOf(platform) });
     }
   } catch (e) {
     logger.warn(`[trigger-user-auth] retry of ${entry.tool} identity failed for session ${entry.sessionId}: `

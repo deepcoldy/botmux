@@ -587,7 +587,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 
 | 字段 | 说明 |
 |------|------|
-| `replyDelivery` | 最终答复怎么送到飞书。`transcript`（支持读取会话记录的 CLI 的默认）：botmux 从 CLI 的会话记录里自动取本轮最后的回答发出去；`send`（其余 CLI 的默认，也可显式写回去）：模型自己执行 `botmux send`。见下方说明 |
+| `replyDelivery` | 最终答复怎么送到飞书。`send`（除 Doubao 外所有 CLI 的默认）：模型自己执行 `botmux send`；`transcript`（自动转发最终回复，默认关闭，按需显式开启；Doubao 默认开启）：botmux 从 CLI 的会话记录里自动取本轮最后的回答发出去。见下方说明 |
 | `senderTag` | 默认开启：每条转给 CLI 的消息都带一个 `<sender ... />` 标签，告诉模型是谁在说话。只有写 `false` 才关闭 |
 | `senderTagHideEmail` | 默认关闭。开启后 `<sender>` 标签里不带邮箱，姓名和 ID 保留 |
 | `hideLocalAddresses` | 默认关闭：模型回复原样发到飞书。开启后把开发机路径和本机服务地址挡在回复外。见下方[隐藏开发机地址](#hide-local-addresses) |
@@ -596,40 +596,43 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 | `topicUnavailablePolicy` | 原话题被删除或不可用时怎么办。见[原话题不可用策略](/topic-unavailable-policy) |
 | `turnResults` | 提供每一轮的结构化结果，供外部系统读取。见[单轮结果](/turn-results) |
 
-### 转写回复（`replyDelivery: "transcript"`）
+### 自动转发最终回复（`replyDelivery: "transcript"`）
 
-支持读取会话记录的 CLI 默认就是 `transcript`：botmux 自动从 CLI 的会话记录里取本轮最后一段回答发到飞书，模型直接作答就行，不用自己执行 `botmux send`。这样模型不会再把进度、阶段结论、最终答复都 `botmux send` 一遍，群里少很多打扰。
+除 Doubao 外，所有 CLI 默认都是 `send`（模型自己执行 `botmux send` 把答复发到飞书）；Doubao 默认是 `transcript`（它的工具命令跑在账号级常驻进程里，模型自己 `botmux send` 容易发错话题，详见[多 CLI 适配器](/adapters)）。
 
-和 `send` 相比有四个变化：
+对支持读取会话记录的 CLI，你可以按需显式开启「自动转发最终回复」（`replyDelivery: "transcript"`）：开启后，botmux 自动从 CLI 的会话记录里取本轮最后一段回答发到飞书，模型直接作答即可，不用自己执行 `botmux send`。
 
-1. 系统提示改成「最终答复直接写在回复里」，`botmux send` 只留给最终回复带不了的事：@ 别的 bot 协作或把结果交还给派活的 bot、发附件或卡片、发到别的群或话题，以及本轮说明明确要求用它的回合（比如静默定时任务）。提示也要求不要用它发进度播报。
+开启后有三个变化：
+
+1. 系统提示改成由 botmux 自动转发最终回复，不再把 `botmux send` 当作必填回复通道，也不禁止发进度更新或确认消息。仅在多 bot 协作提示里保留如何用 `botmux send --mention` / `--mention-back` 回复和 @ 别的 bot；附件、卡片、跨群等用法留在内置 `botmux-send` skill 按需查阅。
 2. 每轮不再附带 `<botmux_reminder>` 提醒。
 3. 私聊，或只有管理员和这个 bot 的 1 对 1 群里，消息不再包 `<user_message>` 壳和 `<sender/>` 标签，模型看到的就是原文。
-4. 模型执行 `botmux send` 后看到的回显会提醒它：最终答复写在回复里就行，进度不必发。
 
-支持的 CLI：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao。其余 CLI（如 Antigravity、OpenCode、Relay、codex-app）默认仍是 `send`；Antigravity 只在零注入模式下采集回答，显式设置会被拒绝。如果写好 `transcript` 后又把 CLI 换成不支持的，运行时自动回到 `send`，不会丢答复。`sandbox: "scratch"` 下只有 Claude Code、Codex、TraeX 的会话记录在宿主侧读得到，其余 CLI 在 scratch 下运行时回到 `send`（Cursor、Doubao 显式设置 `transcript` 会被拒）；`oncall` 沙盒下 Hermes 例外：它的适配器没有把 `~/.hermes/state.db` 挂载到宿主，运行时同样回落 `send`；其它 CLI 的 oncall 沙盒不受影响。
+支持的 CLI：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao。其余 CLI（如 Antigravity、OpenCode、Relay、codex-app）不支持开启；Antigravity 只在零注入模式下采集回答，显式设置会被拒绝。如果写好 `transcript` 后又把 CLI 换成不支持的，运行时自动回到 `send`，不会丢答复。`sandbox: "scratch"` 下只有 Claude Code、Codex、TraeX 的会话记录在宿主侧读得到，其余 CLI 在 scratch 下运行时回到 `send`（Cursor、Doubao 显式设置 `transcript` 会被拒）；`oncall` 沙盒下 Hermes 例外：它的适配器没有把 `~/.hermes/state.db` 挂载到宿主，运行时同样回落 `send`；其它 CLI 的 oncall 沙盒不受影响。
 
-想用回旧行为（模型自己 `botmux send`），显式写 `send`：
+**开启方式**：
+
+- **Dashboard**：进入「Bot 配置 → 高级 → 回复投递」，打开「自动转发最终回复」开关（开启会写入 `replyDelivery: "transcript"`，关闭会写入 `replyDelivery: "send"`；当前 CLI 或沙盒不支持时开关是灰的）。
+- **`bots.json`**：在对应 bot 配置项里显式写：
 
 ```json
-{ "replyDelivery": "send" }
+{ "replyDelivery": "transcript" }
 ```
+
+- **飞书命令**：
 
 ```text
-/botconfig set replyDelivery send         # 用回 botmux send（Doubao 不推荐）
-/botconfig set replyDelivery transcript   # 显式固定为 transcript
-/botconfig unset replyDelivery            # 回到该 CLI 的默认
+/botconfig set replyDelivery transcript   # 开启自动转发最终回复
+/botconfig set replyDelivery send         # 显式使用 botmux send（Doubao 不推荐）
+/botconfig unset replyDelivery            # 回到该 CLI 的默认（除 Doubao 外为 send）
 ```
 
-显式写了 `send` 的 bot 保持 `send`，不受默认值影响。
-
 - 改了 `replyDelivery` 后，每轮的提醒和外壳从下一轮起变化；系统提示和最终回复的转发方式跟着 CLI 进程走，`/restart` 或会话重新拉起 CLI 后才换。daemon 重启后接回仍在运行的 CLI（tmux 等持久后端）时，沿用这个 CLI 启动时的方式。
-- 升级到这个版本后，没写 `replyDelivery` 的 bot 也一样：已在跑、没有重新拉起的 CLI 继续按 `send` 工作（模型自己 `botmux send`，botmux 只在它没发时兜底转发），`/restart` 后换成新默认。
+- 从 v3.59.25–v3.59.29 升级到默认改回 `send` 的版本后：未显式配置 `replyDelivery` 的 bot，新建会话或 `/restart` 后回到 `send`；已在跑、未重新拉起的持久终端继续沿用启动时的模式，不丢回复。显式写了 `"transcript"` 的 bot 照常保持开启。
 - 旧版 pane 没有启动快照时，首次重连推断出的兼容值会冻结到会话记录；后续 daemon 重连不再跟随 live 配置变化，切换 CLI 时才重算。若在首次升级重连**之前**就已编辑 `replyDelivery`、但还没重启 CLI，历史配置没有证据可精确还原，请主动 `/restart` 一次，让提示与转发门控统一到新配置。
-- bot 之间协作不变：要找别的 bot、或把结果交还给派活给你的 bot，仍然要 `botmux send --mention`（或 `--mention-back`），最终回复卡不会自动 @ 对方 bot。
+- bot 之间协作不变：要回复或 @ 别的 bot 协作、派活、回报，仍然用 `botmux send --mention`（或 `--mention-back`），最终回复卡不会自动 @ 对方 bot。
 - 静默定时任务不变：它的最终回复从来不发到群里，满足通知条件时仍由模型 `botmux send`。
 - 代价：1 对 1 会话没有了 `<user_message>` / `<sender>` 结构，`/adopt` 不再按内容把它认作 botmux 自己的会话（按会话 ID 排除仍然生效）。
-- Dashboard 里「转写回复模式」开关改的就是这个字段，开关两个方向都会写进 bots.json；当前 CLI 不支持时开关是灰的。
 
 ### 关掉发言人标签（`senderTag: false`）
 

@@ -165,6 +165,26 @@ function matchesWorkspaceUri(rawUris: unknown, cleanCwd: string): boolean {
   return uriToPath(rawUris) === cleanCwd;
 }
 
+/** agy stores the same conversation title exposed by ACP session/list here. */
+export function readAntigravityConversationTitle(
+  conversationId: string,
+  dbPath = join(homedir(), '.gemini', 'antigravity-cli', 'conversation_summaries.db'),
+): string | undefined {
+  if (!UUID_RE.test(conversationId) || !existsSync(dbPath)) return;
+  const db = openDatabaseSyncNow(dbPath, { readOnly: true });
+  if (!db) return;
+  try {
+    const row = db.prepare('SELECT title FROM conversation_summaries WHERE conversation_id = ?')
+      .get(conversationId) as { title?: unknown } | undefined;
+    const title = typeof row?.title === 'string' ? row.title.replace(/\s+/g, ' ').trim() : '';
+    return title || undefined;
+  } catch {
+    return undefined;
+  } finally {
+    try { db.close(); } catch { /* Best-effort metadata lookup. */ }
+  }
+}
+
 /**
  * Look up the most recently modified conversation in conversation_summaries.db
  * whose workspace_uris array matches the specified cwd.

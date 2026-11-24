@@ -129,6 +129,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   // Trigger-user CLI auth：开关（PUT）+ 状态（GET），校验路径由 daemon 统一持有。
   putBotConfig('trigger-user-auth'),
   putBotConfig('lark-tool-binding'),
+  // lark-user-owner-fallback：`{ enabled: boolean }`（没有发起人时 --as user 用主人的飞书身份）。
+  putBotConfig('lark-user-owner-fallback'),
   {
     method: 'GET',
     path: botPath('trigger-user-auth-status'),

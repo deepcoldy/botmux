@@ -300,6 +300,26 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('BOTMUX_OWNER_OPEN_ID='))).toBe(false);
   });
 
+  it('forwards BOTMUX_RUNTIME_BINDING_ID so a restarted CLI can prove its runtime scope (2026-11-23)', () => {
+    // spawnCli sets this per launch on childEnv, which only the pty backend
+    // inherits wholesale. On tmux it reaches the CLI solely through this
+    // allowlist, and the session-scoped hooks (`botmux session-ready`,
+    // `botmux __turn-idle-v2`) carry it back as the proof of WHICH runtime is
+    // signalling. Missing here, the daemon took nativeSignal()'s unbound path,
+    // which refuses an unsettled runtime: every `/restart` lost its SessionStart
+    // readiness signal, waited out the worker's 45s ready-gate fallback, and
+    // reported a restart timeout for a CLI that was already at its prompt.
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_RUNTIME_BINDING_ID: '7b1d2f64-0c2a-4d7e-9a11-5c0e2f8b3a44',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_RUNTIME_BINDING_ID=7b1d2f64-0c2a-4d7e-9a11-5c0e2f8b3a44');
+    // A launch with no binding (contract-less worker) must not forward a key at
+    // all: an empty or stale id would be a FALSE scope claim, worse than none.
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('BOTMUX_RUNTIME_BINDING_ID='))).toBe(false);
+  });
+
   it('forwards the host-resolved dispatch task-tree card switch into panes', () => {
     // The file-sandboxed CLI cannot read ~/.botmux/config.json; the daemon
     // projects the resolved value and it reaches the pane only because it is on

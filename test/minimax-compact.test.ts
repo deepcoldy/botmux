@@ -165,6 +165,28 @@ it.each([true, false])('reannounces ready after a proven unsubmitted compact, in
   expect(drainStates).toEqual([false]);
 });
 
+it('does not reopen the compact gate after an untouched failure while another compact remains queued', async () => {
+  const backend = { write: vi.fn(() => true), sendText: vi.fn(() => true), sendSpecialKeys: vi.fn(() => true) };
+  const worker = rawWorker(createMinimaxAdapter('/not-executed'), backend);
+  const drain = vi.fn(async () => {});
+  worker.scope.flushPending = drain;
+  const second = { type: 'raw_input' as const, content: '/compact', turnId: 'compact-second' };
+  // The first command is already dequeued and being written when the next one
+  // arrives; its rejected write must not make readiness overtake that queue.
+  backend.sendSpecialKeys.mockImplementation(() => {
+    if (!worker.scope.pendingRawInputs.includes(second)) worker.scope.pendingRawInputs.push(second);
+    return false;
+  });
+
+  await worker.deliver({ type: 'raw_input', content: '/compact', turnId: 'compact-first' });
+
+  expect(worker.events).toContainEqual({ type: 'turn_terminal', turnId: 'compact-first', status: 'ambiguous' });
+  expect(worker.events.filter(event => event.type === 'prompt_ready')).toHaveLength(0);
+  expect(worker.scope.pendingRawInputs).toEqual([second]);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(drain).toHaveBeenCalledOnce();
+});
+
 it.each(['replaced', 'restarting'] as const)('does not reannounce a rejected compact when the backend is %s', async transition => {
   const backend = { write: vi.fn(() => true), sendText: vi.fn(() => true), sendSpecialKeys: vi.fn(() => false) };
   const replacement = { write: vi.fn(() => true) };

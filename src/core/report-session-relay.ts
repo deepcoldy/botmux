@@ -1,3 +1,4 @@
+import { REPORT_RELAY_CONNECTOR_ID } from '../services/trigger-types.js';
 import { createHash } from 'node:crypto';
 import type { VcMeetingLiveManagedOrigin } from '../services/vc-meeting-send-policy.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
@@ -547,7 +548,7 @@ export function buildOrchestratorReportTrigger(
     options,
     source: {
       type: 'ui',
-      connectorId: 'botmux-report',
+      connectorId: REPORT_RELAY_CONNECTOR_ID,
       requestId: meta.requestId,
       receivedAt: meta.receivedAt,
     },

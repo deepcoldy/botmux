@@ -76,6 +76,9 @@ export type SubmitRecheckResult = boolean | {
   unprovenCliSessionId?: string;
 };
 
+/** See {@link CliAdapter.sessionRenameSurface}. */
+export type SessionRenameSurface = 'settled' | 'unsubmitted' | 'occupied' | 'unknown';
+
 /** What the adapter can prove about a failed runner-protocol write.
  *
  * Runner adapters write a framed line and then a newline.  `submitted:false`
@@ -1270,6 +1273,37 @@ export interface CliAdapter {
    *  by the daemon. Undefined means this adapter has no proven native rename
    *  command and must never receive a best-guess slash command. */
   buildSessionRenameCommand?(title: string): string;
+
+  /** Where the native rename typed by `buildSessionRenameCommand` stands, read
+   *  from the backend's current viewport (and cursor when the backend reports
+   *  it) after its Enter: `settled` — the composer is an empty native input
+   *  again; `unsubmitted` — the composer still holds exactly `command` (the
+   *  Enter became a newline or never arrived), so one more Enter submits it;
+   *  `occupied` — a recognised dialog, busy turn or user draft owns the input;
+   *  `unknown` — the viewport cannot be classified. Undefined keeps the
+   *  historical bounded fail-open for CLIs/backends without this capability. */
+  sessionRenameSurface?(
+    evidence: { viewport: string; cursor?: { x: number; y: number } },
+    command: string,
+  ): SessionRenameSurface;
+
+  /** Armed right before `command` is typed; the probe turns true once the CLI
+   *  durably recorded that exact title for `cliSessionId` (Codex/TRAE
+   *  `session_index.jsonl`). Missing native identity must disable the probe:
+   *  a same-title record from another thread is not evidence. A matching
+   *  receipt can settle an empty or unrecognised composer, never an occupied
+   *  one or an exact command still waiting in the composer. */
+  watchSessionRename?(
+    command: string,
+    context: {
+      /** Resolve at every poll: persistent reattach may prove native identity
+       * only after the rename was typed. The original byte baseline is kept. */
+      getCliSessionId: () => string | undefined;
+      /** Recovery after worker replacement may accept an existing receipt for
+       * this exact thread/title; normal writes arm at the current file size. */
+      fromByte?: number;
+    },
+  ): () => boolean;
 
   /** CLI-native command that makes the CLI name the current interactive
    *  session itself (Claude Code: a bare `/rename` derives a name from the

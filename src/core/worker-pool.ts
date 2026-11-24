@@ -1092,8 +1092,9 @@ import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
 import { BackendOutageCoordinator, recoveryEligibility, type BackendOutageDeps, type BackendOutageTimings } from './backend-outage-coordinator.js';
 import { buildBackendOutageCard, formatBackendOutageSummary } from './backend-outage-card.js';
 import { probeTmuxServerUp } from '../adapters/backend/tmux-pipe-backend.js';
-import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
+import { getSessionGroup, isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
+import { readAntigravityConversationTitle } from '../services/antigravity-discovery.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
@@ -1229,7 +1230,7 @@ const CLOSE_FENCE_WARN_MS = 8_000;
 // the leader already reported failure (split-brain; see the busy-refuse comment
 // in transferSession). In-process callers have no such ceiling.
 const TRANSFER_DETACH_FENCE_MS = 3_500;
-// Claude Code `/btw` answers are capped before rendering (see 'btw_answer').
+// Side answers are capped before rendering to fit the Lark card limit.
 const BTW_ANSWER_MAX_CHARS = 6_000;
 // In-process picker relay (card-handler relay_confirm) runs with no HTTP abort
 // above it — its card ACK already degrades to a background "处理中" toast at 2.5s
@@ -1546,6 +1547,10 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     context: { sessionId: string; workerGeneration: number; code: number | null; signal: NodeJS.Signals | null },
   ) => void | Promise<void>;
+  /** The exact old daemon-session object has left the active registry and is
+   * marked closed. Its in-memory queued work must be retired before any same-key
+   * replacement can become ready. Notifications remain the callback's job. */
+  onSessionRetired?: (ds: DaemonSession) => void;
   /** Runs only after closeSession has durably closed the row and the exact
    * worker-exit fence has proved that generation can no longer write. Narrow
    * XPI shared-cwd coordinator migration is performed here, never by a hot
@@ -14143,6 +14148,8 @@ async function closeSessionBody(
     // those continuations from re-forking the closed session after its await.
     ds.session.status = 'closed';
     ds.session.closedAt ??= new Date().toISOString();
+    try { callbacks?.onSessionRetired?.(ds); }
+    catch (error) { logger.warn(`[${tag(ds)}] retired-session callback failed: ${String(error)}`); }
     ds.session.crossPrincipalInterruptions = undefined;
     clearTimeout(ds.crossPrincipalWaitTimer);
     ds.crossPrincipalWaitTimer = undefined;
@@ -14847,6 +14854,7 @@ type TransferBufferedInput = Extract<
     type:
       | 'message'
       | 'raw_input'
+      | 'antigravity_btw'
       | 'inject_command'
       | 'coco_drive_picker'
       | 'set_display_mode'
@@ -15586,8 +15594,10 @@ function assistantTransferInputDeliveryAllowed(
   message: TransferBufferedInput,
   context: string,
 ): boolean {
-  if (message.type !== 'message' && message.type !== 'raw_input' && message.type !== 'inject_command') return true;
-  return assistantLiveInputAdmission(ds, 'turnId' in message ? message.turnId : undefined, { context });
+  if (message.type !== 'message' && message.type !== 'raw_input'
+    && message.type !== 'inject_command' && message.type !== 'antigravity_btw') return true;
+  return assistantLiveInputAdmission(ds,
+    message.type === 'antigravity_btw' ? message.messageId : 'turnId' in message ? message.turnId : undefined, { context });
 }
 
 /** Route user/automation input through the transfer fence. Messages accepted
@@ -16651,6 +16661,8 @@ type ForkSessionOptions = {
   turnId?: string;
   senderOpenId?: string;
   senderIsBot?: boolean;
+  expectedSourceCliSessionId?: string;
+  checkSourceMessage?: () => Promise<'source_withdrawn' | 'source_check_failed' | undefined>;
   /** Owner to stamp on the CHILD session. Defaults to the source's owner
    *  (the common case: forker === source owner, so this is a no-op).
    *  Set it when an admin forks someone else's session — otherwise the child
@@ -16660,6 +16672,22 @@ type ForkSessionOptions = {
    *  someone who can't see it. */
   childOwnerOpenId?: string;
 };
+
+/** A fork must see a settled native source, even if its last render still shows idle. */
+export function isForkSourceBusy(ds: DaemonSession): boolean {
+  if (isSessionLifecycleInFlight(ds) || isSessionTransferring(ds)) return true;
+  if (!ds.worker || ds.worker.killed) return false;
+  if (hasPendingOrdinaryImInput(ds)) return true;
+  if (cliReportsTurnTerminals(ds) && hasUnsettledAcceptedInput(ds)) return true;
+  if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') return false;
+  // A stale-working terminal exception still requires quiescent background
+  // work. Keep the established idle/limited behavior above unchanged.
+  if ((ds.backgroundTaskCount ?? 0) > 0) return true;
+  // A completed terminal settles the exact source turn even when no later idle
+  // frame arrives. Never fake screen idleness: newer turns/retries and direct
+  // submit live-work remain busy through the shared post-terminal predicate.
+  return ds.lastTurnTerminalStatus !== 'completed' || sessionHasLiveWorkAfterTerminal(ds);
+}
 
 /**
  * Fork a session: create a SECOND, independent botmux session that inherits the
@@ -16690,19 +16718,13 @@ export async function forkSession(
   const ds = findActiveBySessionId(sessionId);
   if (!ds) return { ok: false, error: 'session_not_active' };
   // A live source must sit at a clean node: not mid-lifecycle, not mid-turn.
-  if (isSessionLifecycleInFlight(ds)) return { ok: false, error: 'worker_busy' };
-  const st = ds.lastScreenStatus;
-  if (ds.worker && !ds.worker.killed && st !== 'idle' && st !== 'limited') {
-    return { ok: false, error: 'worker_busy' };
-  }
+  if (isForkSourceBusy(ds)) return { ok: false, error: 'worker_busy' };
   // The source may start a turn, close, or be replaced while this fork waits
   // behind the target-key lock; repeat the live-source guards right before minting.
   const revalidate = (): string | undefined => {
     if (findActiveBySessionId(sessionId) !== ds || ds.session.status !== 'active') return 'session_not_active';
-    if (isSessionLifecycleInFlight(ds)) return 'worker_busy';
-    const latestStatus = ds.lastScreenStatus;
-    if (ds.worker && !ds.worker.killed && latestStatus !== 'idle' && latestStatus !== 'limited') return 'worker_busy';
-    return undefined;
+    if (opts?.expectedSourceCliSessionId && ds.session.cliSessionId !== opts.expectedSourceCliSessionId) return 'source_changed';
+    return isForkSourceBusy(ds) ? 'worker_busy' : undefined;
   };
   return forkFromSource(ds, targetChatId, targetRootMessageId, targetChatType, targetScope, opts, revalidate);
 }
@@ -16816,6 +16838,13 @@ async function forkFromSource(
   }
 
   const mintAndSpawnChild = async (): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> => {
+    // A queued Feishu command can be withdrawn while a topic is being prepared.
+    // Run the last provider lookup before checking the synchronous ownership and
+    // native identity gates, under the same lock that commits the child.
+    if (opts?.checkSourceMessage) {
+      const unavailable = await opts.checkSourceMessage();
+      if (unavailable) return { ok: false, error: unavailable };
+    }
     // Re-check under the target-key lock: the guard above ran before any await,
     // so two copies aimed at one empty anchor could both have passed it.
     const lockedOccupant = activeSessionsRegistry?.get(targetKey);
@@ -21219,6 +21248,48 @@ function setupWorkerHandlers(
     );
   const ownsLifecycleMutation = (): boolean =>
     ownsWorkerSession() && !isSessionTransferring(ds) && (!sessionController || sessionController.currentAuthority());
+  const applyNativeTitle = (title: string): boolean => {
+    if (ds.worker !== worker || hasManualSessionTitle(ds.session)) return false;
+    const committed = commitAcceptedInputTitle(ds, {
+      title, source: 'cli', canonical: hasAutomaticSessionTitle(ds.session), awaitingContent: false, nativeTitle: title,
+      expectedTitle: ds.session.title, expectedSource: ds.session.titleSource,
+      expectedAwaiting: ds.session.nativeSessionTitleAwaitingContent,
+    });
+    if (committed && ds.scope === 'chat' && ds.chatType === 'group') {
+      acceptSessionGroupTitle(ds.larkAppId, ds.session, title);
+    }
+    return committed;
+  };
+  let antigravityTitleLookup: string | undefined;
+  const syncAntigravityGroupTitle = (): void => {
+    const nativeId = ds.session.cliSessionId;
+    if (sessionCliId(ds, botCfg) !== 'antigravity' || !nativeId || antigravityTitleLookup === nativeId
+      || ds.scope !== 'chat' || ds.chatType !== 'group' || isRemoteBackendSession(ds)) return;
+    const stillEligible = () => {
+      if (!ownsLifecycleMutation() || ds.session.cliSessionId !== nativeId || hasManualSessionTitle(ds.session)) return false;
+      try {
+        if (getBot(ds.larkAppId).config.sessionGroup?.naming?.mode !== 'session-title') return false;
+        const group = getSessionGroup(ds.chatId);
+        return group?.lastSessionId === ds.session.sessionId && !group.titled;
+      } catch { return false; }
+    };
+    if (!stillEligible()) return;
+    antigravityTitleLookup = nativeId;
+    let attempt = 0;
+    const poll = () => {
+      if (!stillEligible()) {
+        if (antigravityTitleLookup === nativeId) antigravityTitleLookup = undefined;
+        return;
+      }
+      const title = readAntigravityConversationTitle(nativeId);
+      if (title && applyNativeTitle(title)) return;
+      // Titles are generated asynchronously by agy. An exhausted lookup can
+      // be retried at the next prompt-ready edge, without starting another CLI.
+      if (++attempt < 6) setTimeout(poll, 1000 * 2 ** (attempt - 1)).unref?.();
+      else if (antigravityTitleLookup === nativeId) antigravityTitleLookup = undefined;
+    };
+    poll();
+  };
   // The live worker produced an answer the contract will not post. Without the
   // notice the card stays "working" and the user never learns the reply is gone.
   const undeliveredFinalNotices = new Set<string>();
@@ -23627,6 +23698,7 @@ function setupWorkerHandlers(
       }
       case 'prompt_ready': {
         if (ds.worker !== worker) break;
+        syncAntigravityGroupTitle();
         // Readiness over IPC is not a rendered screen frame. Keep the starting
         // watchdog armed so a capture outage cannot be hidden by prompt_ready.
         // The ONLY set point for the in-memory readiness flag (design
@@ -23808,11 +23880,18 @@ function setupWorkerHandlers(
         const validSettingReceipt = !currentSettingsAttempt || msg.status !== 'succeeded'
           || (!!msg.topicEffort && msg.topicEffort.model === savedReadiness.requested.model
             && msg.topicEffort.effort === savedReadiness.requested.effort);
+        const effectiveStatus = validSettingReceipt ? msg.status : 'failed';
         const restartSettled = restartCoordinator.resolve(
           ds.session.sessionId,
           msg.attemptId,
-          validSettingReceipt ? msg.status : 'failed',
+          effectiveStatus,
         );
+        // `settled=false` means the coordinator had no attempt under this id —
+        // its status card keeps whatever it last showed (a 40s 重启超时) even
+        // though the CLI reported success. Say which side lost the correlation:
+        // without this the only symptom is a card that never leaves 重启超时
+        // (2026-11-23).
+        logger.info(`[${t}] restart_result ${effectiveStatus} attempt=${msg.attemptId.slice(0, 8)} settled=${restartSettled}`);
         // requestSessionRestart() fences the live generation by clearing
         // workerReady before asking the worker to respawn its CLI in place. An
         // in-worker respawn does not emit the process-level `ready` message
@@ -23880,6 +23959,7 @@ function setupWorkerHandlers(
         // is known, so consumers exclude this session from native parsers
         // before its first positive-delta record exists.
         recordOwnershipForDaemonSession(ds);
+        syncAntigravityGroupTitle();
         if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
           && !wasLocalCliOpenReady
           && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
@@ -23889,17 +23969,8 @@ function setupWorkerHandlers(
       }
 
       case 'native_session_title_generated': {
-        if (ds.worker !== worker || hasManualSessionTitle(ds.session)) break;
         const title = msg.title.trim();
-        if (!title) break;
-        const committed = commitAcceptedInputTitle(ds, {
-          title, source: 'cli', canonical: hasAutomaticSessionTitle(ds.session), awaitingContent: false, nativeTitle: title,
-          expectedTitle: ds.session.title, expectedSource: ds.session.titleSource,
-          expectedAwaiting: ds.session.nativeSessionTitleAwaitingContent,
-        });
-        if (committed && ds.scope === 'chat' && ds.chatType === 'group') {
-          acceptSessionGroupTitle(ds.larkAppId, ds.session, title);
-        }
+        if (title) applyNativeTitle(title);
         break;
       }
 
@@ -27542,6 +27613,8 @@ function setupWorkerHandlers(
               : {}),
           ...(msg.linkRefMode ? { linkRefMode: msg.linkRefMode } : {}),
           ...(msg.speakers?.length ? { speakers: msg.speakers } : {}),
+          ...(msg.provenanceIncomplete || (sameExecution && previousOrigin?.provenanceIncomplete)
+            ? { provenanceIncomplete: true } : {}),
           ...(callerOpenId ? { callerOpenId } : {}),
           ...(preexistingProcessIdentities
             ? { preexistingProcessIdentities }
@@ -27761,23 +27834,44 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'antigravity_btw_result':
       case 'btw_answer': {
-        // Claude Code `/btw` side answer captured from its overlay. Rendered
-        // like the adopt preamble (question + Markdown answer) and replied
-        // under the `/btw` turn.
-        if (managedAuxUiSuppressed(msg.turnId)) break;
-        if (!msg.answer.trim()) break;
+        // Claude captures its overlay. Antigravity reads a native side
+        // transcript and replies at the exact command message.
+        const side = msg.type === 'antigravity_btw_result' ? msg : undefined;
+        const turnId = msg.type === 'btw_answer' ? msg.turnId : msg.messageId;
+        if (managedAuxUiSuppressed(turnId)) break;
+        if (side && (effectiveCliId !== 'antigravity' || !ownsLifecycleMutation()
+          || privateReplyEnabled(ds.session) || !side.messageId.startsWith('om_'))) break;
         const loc = localeForBot(ds.larkAppId);
+        const sideReplyOptions: Omit<WorkerSessionReplyOptions, 'sourceSessionId'> | undefined = side ? {
+          replyTarget: { mode: 'thread', rootMessageId: side.messageId },
+          uuid: createHash('sha256')
+            .update(`agy-btw:${ds.larkAppId}:${side.messageId}:${'reason' in side ? side.reason : 'answer'}`)
+            .digest('hex').slice(0, 40),
+          beforeWrite: () => {
+            if (!ownsLifecycleMutation() || privateReplyEnabled(ds.session)) throw new Error('Antigravity side reply lost its source session');
+          },
+        } : undefined;
+        if ('reason' in msg) {
+          scopedReply(tr(`daemon.antigravity_btw_${msg.reason}`, undefined, loc), 'text', turnId, sideReplyOptions)
+            .catch((err: unknown) => logger.error(`[${t}] Failed to deliver /btw status: ${String(err)}`));
+          break;
+        }
+        if (!msg.answer.trim()) break;
         // Feishu cards cap at ~30KB; a side answer is short, so a plain
         // character cap (CJK is 3 bytes) is enough instead of a file fallback.
         let btwAnswer = msg.answer.length > BTW_ANSWER_MAX_CHARS
           ? `${truncateUtf16WellFormed(msg.answer, BTW_ANSWER_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
           : msg.answer;
-        if (msg.source === 'screen') btwAnswer += `\n\n${tr('card.btw_answer_from_screen', undefined, loc)}`;
+        if (msg.type === 'btw_answer' && msg.source === 'screen') btwAnswer += `\n\n${tr('card.btw_answer_from_screen', undefined, loc)}`;
         const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
         const cardJson = buildContextualReplyCard({
           title: tr('card.btw_answer', undefined, loc),
-          userText: msg.question,
+          // The complete question is already visible as the topic root.
+          userText: side && msg.question.length > 2_000
+            ? `${truncateUtf16WellFormed(msg.question, 2_000)}…`
+            : msg.question,
           assistantText: repairReplyMarkdown(btwAnswer),
           assistantLabel: sessionCliDisplayName(ds, botCfg),
           recipientOpenId,
@@ -27786,7 +27880,7 @@ function setupWorkerHandlers(
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
         });
-        scopedReply(cardJson, 'interactive', msg.turnId).catch((err: unknown) => {
+        scopedReply(cardJson, 'interactive', turnId, sideReplyOptions).catch((err: unknown) => {
           logger.error(`[${t}] Failed to deliver /btw answer: ${err instanceof Error ? err.message : String(err)}`);
         });
         break;
@@ -28082,11 +28176,19 @@ function setupWorkerHandlers(
     // current without a requesting user, and losing its identity decision
     // leaves every proven identity wrapper refused (exit 77), so both must be
     // visible in production. So must losing a terminal-local turn's start: a
-    // zero-prompt session then has nowhere to send that turn's final.
+    // zero-prompt session then has nowhere to send that turn's final. And so
+    // must a dropped restart receipt: it is the only edge that closes the
+    // restart status card and lifts the workerReady fence, so a scope rejection
+    // here leaves the card stuck at 重启超时 and fork/relay at worker_busy for a
+    // CLI that is plainly back at its prompt — diagnosable at debug level only,
+    // which production never has on (2026-11-23).
     const logRejected = (reason: string) => {
       if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked' || msg.type === 'session_identity_decision'
-        || msg.type === 'terminal_turn_started') && ds.worker === worker) {
-        logger.warn(`[${t}] Dropped ${msg.type} from current worker turn=${msg.turnId ?? '-'} reason=${reason}`);
+        || msg.type === 'terminal_turn_started' || msg.type === 'restart_result') && ds.worker === worker) {
+        const detail = msg.type === 'restart_result'
+          ? `attempt=${msg.attemptId.slice(0, 8)} status=${msg.status}`
+          : `turn=${msg.turnId ?? '-'}`;
+        logger.warn(`[${t}] Dropped ${msg.type} from current worker ${detail} reason=${reason}`);
       } else if (msg.type === 'final_output' && ds.worker === worker) {
         reportUndeliveredFinal(msg, reason);
       } else {
@@ -28099,11 +28201,24 @@ function setupWorkerHandlers(
       if (metadata) sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId, msg);
       return;
     }
-    if (admission.kind === 'defer') return;
+    // A deferral parks the event until its binding proves an identity, and says
+    // nothing — which is wrong for the two messages whose loss is user-visible:
+    // a parked `prompt_ready` leaves the session looking busy, and a parked
+    // restart receipt leaves the status card at 重启超时 for a CLI that is at its
+    // prompt. Both are sent once, so a parked one is simply lost. Until this
+    // line a lost receipt was indistinguishable from one the worker never sent
+    // (2026-11-23).
+    const logDeferred = (stage: string) => {
+      if (msg.type === 'prompt_ready' || msg.type === 'restart_result') {
+        logger.warn(`[${t}] Deferred ${msg.type} from current worker at ${stage}`
+          + ` binding=${metadata?.bindingId?.slice(0, 8) ?? '-'} — waiting for that binding to bind an identity`);
+      }
+    };
+    if (admission.kind === 'defer') { logDeferred('ingest'); return; }
     await sessionController.flushPrimary();
     admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin);
     if (admission.kind === 'reject') { logRejected(admission.reason); return; }
-    if (admission.kind === 'defer') return;
+    if (admission.kind === 'defer') { logDeferred('gateway'); return; }
     // A verified native success is stronger than a lost input commit ACK.
     // Ambiguous/failed/cancelled boundaries do not prove queue admission.
     if ((admission.kind === 'current' || admission.kind === 'historical')
@@ -29382,7 +29497,7 @@ function deliverFinalOutput(
   const partialResultMessages = (): TurnDeliveryReceipt['messages'] => {
     return finalPublication?.receipt.messages ?? [];
   };
-  // 内容安全审计拒收（230028 等）→ 打码发送副本后重发一次。零注入 / 转写回复
+  // 内容安全审计拒收（230028 等）→ 打码发送副本后重发一次。零注入 / 自动转发最终回复
   // 模式下模型看不到发送失败，只能由这里兜住；transcript 与终端原文不受影响。
   const withAuditRedaction = (content: string, msgType: string | undefined, send: (body: string) => Promise<string>) =>
     sendWithContentAuditRedaction({

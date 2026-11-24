@@ -198,7 +198,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'promptInjection', configKey: 'promptInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'none'], enumDefault: 'default', hint: '零 botmux 注入：none=仅传任务与附件，自动回传最终回复；default=恢复原有提示/技能配置。支持可自动获取最终回复的本地 CLI；新会话完整生效，已有历史不清除' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
   { key: 'topicUnavailablePolicy', configKey: 'topicUnavailablePolicy', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'stop'], enumDefault: () => 'legacy', hint: '原话题不可用时：legacy=保持原有发送和兜底行为（默认）｜stop=停止发送，查询异常暂停且不改发；unset 回 legacy' },
-  { key: 'replyDelivery', configKey: 'replyDelivery', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['send', 'transcript'], enumDefault: cfg => defaultReplyDeliveryFor(cfg.cliId), hint: '最终回复投递方式：transcript=从 CLI 转写自动取本轮最后的回答发卡，botmux send 只留给 @ 别的 bot 协作、附件/卡片、发到别的群或话题｜send=模型必须自己 botmux send（旧行为）；缺省按 CLI：能采集转写的 claude-code 及 codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok/cursor/doubao 缺省 transcript，其余 CLI 缺省 send，当前沙盒采集不到时运行时回落 send（scratch 下只有 claude-code/codex/traex 可用，oncall 下 hermes 也因 state.db 无宿主挂载而回落）；想用回旧行为显式 set send；系统提示与转发方式在 /restart 或 CLI 重新拉起后换新值，逐轮信封立即生效；unset 回该 CLI 缺省' },
+  { key: 'replyDelivery', configKey: 'replyDelivery', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['send', 'transcript'], enumDefault: cfg => defaultReplyDeliveryFor(cfg.cliId), hint: '最终回复投递方式：send=模型自己执行 botmux send（除 doubao 外所有 CLI 的默认）｜transcript=自动转发最终回复，由 botmux 从 CLI 会话记录自动取本轮最后一段回答发回飞书（默认关闭，需显式 set transcript 开启；仅 doubao 缺省 transcript）；支持 claude-code、codex、traex、coco、hermes、mtr、pi、oh-my-pi、ebsd、grok、cursor、doubao，当前沙盒读不到会话记录时运行时回落 send（scratch 下仅 claude-code/codex/traex 可用，oncall 下 hermes 回落 send）；系统提示与转发方式在 /restart 或 CLI 重新拉起后换新值，逐轮信封立即生效；unset 回该 CLI 默认' },
   { key: 'senderTagHideEmail', configKey: 'senderTagHideEmail', kind: 'boolean', effect: 'immediate', clearable: false, hint: '隐藏 <sender> 邮箱 on|off（默认 off）：开启后只省略 email，保留姓名和 ID；不影响鉴权与 --mention-back。下一次新构造的输入生效，不清理历史或用户正文中的邮箱' },
   { key: 'hideLocalAddresses', configKey: 'hideLocalAddresses', kind: 'boolean', effect: 'immediate', clearable: false, hint: '隐藏开发机地址 on|off（默认 off）：开启后模型回复发到飞书前，开发机文件路径和本机服务地址换成仓库相对引用或「【内部文件】」，提示里加上不放这类地址的规则，卡片按钮指向本机的整条拒发（宿主自己的终端/Dashboard 链接除外）；适合给别人用的 bot，只给自己用、要在回复里看到排障路径的保持 off。回复处理与每轮提示立即生效，系统提示里的完整规则从下个会话生效' },
   { key: 'senderTag', configKey: 'senderTag', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '每轮注入 <sender> 发言人标签 on|off（默认 on）：标注本轮是谁在说话（open_id/姓名/邮箱）。关掉后模型看不到发言人身份，多人会话里无法区分谁说的；--mention-back 不受影响（走 daemon 侧独立记录）。代价：/adopt 少一条识别本 bot 自产会话的指纹，dashboard 洞察无法从标签判断发言人类型与 A2A 对方名字' },
@@ -226,6 +226,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'credentialsSourceDir', configKey: 'credentialsSourceDir', kind: 'dir', effect: 'next-session', clearable: true, hint: 'CLI 凭证来源目录（如 ~/accounts/acct-b，内按 CLI 分子目录：claude/.credentials.json）：bot 每次冷启动从这里复制凭证，而不是用本机共享登录；来源不可用即拒绝启动、绝不回退共享登录；目前仅支持 claude-code；未开沙箱的 bot 会因此改用 per-bot 数据目录（旧会话转写/记忆不迁移，全局 settings 只继承 env，CLAUDE.md/skills/plugins 等不带过去），无法重定向数据目录（wrapperCli / adapter 不支持 / 缺 SESSION_DATA_DIR）则拒绝启动；token 刷新由外部负责；unset 回共享登录' },
   { key: 'codexInstancePool', configKey: 'codexInstancePool', kind: 'json', effect: 'next-session', clearable: true, hint: '会话级 Codex 实例：显式 defaultInstanceId 与 instances[{id,codexHome,weight}]，weight默认1；scope=ordinary-feishu，strategy=random。仅新会话分配，已有会话保持绑定。使用 botmux codex-instances check 检查本机目录。' },
   { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后，勾选的能力用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"capabilities":["lark-user","bytecloud","meego"]}：lark-user=飞书用户身份（lark-cli --as user），bytecloud=ByteCloud（bytedcli、codebase、git push、bitscli / bits-cli，同一个开关），meego=Meego（仅 bytedcli meego，独立的 meegle 命令不受管）；bytecloud / meego 未列出时对应命令保持原生，直接用本机登录态；非法取值会被拒绝保存。省略 capabilities 时按 tools 推导（lark-cli→lark-user，bytedcli→bytecloud+meego；tools 也省略=全部）。未授权时命令一律拒绝（拒绝消息里会附授权入口，授权一次后重试即可），不会用 bot 或任何人的身份代跑；旧配置里的 fallback 字段会被忽略。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 delegateOnMention（默认 true）：本 bot 在真人直接发起的一轮里用 botmux send --mention 交接给同机 bot 时，对方以这位发起人的身份调用工具；设为 false 关闭。可选 allowSpeakerSwitch（默认 false）：设为 true 后，多人话题里可在某一条命令前加 BOTMUX_AS=<open_id> 让这一条命令用本轮另一位发言人的账号。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
+  { key: 'larkUserOwnerFallback', configKey: 'larkUserOwnerFallback', kind: 'boolean', defaultOn: true, effect: 'immediate', clearable: true, hint: '没有发起人时用主人的飞书身份 on|off（默认 on）：脚本、Webhook、平台、没有创建人的定时任务等没有真人发起的回合（以及签名派发里发起人是主人的 bot 消息）里，lark-cli --as user 使用 bot 主人对本应用的授权（主人没授权时私聊主人授权链接）；有真人发起的回合仍只用发起人自己的授权，不借主人的。off = 这类回合的 --as user 直接拒绝（原来的严格行为）。按触发人鉴权开启且勾了「飞书用户身份」时不生效。即时生效' },
   { key: 'larkToolBinding', configKey: 'larkToolBinding', kind: 'boolean', defaultOn: true, effect: 'next-session', clearable: true, hint: 'lark-cli 绑定当前机器人应用身份 on|off（默认 on）：会话内 lark-cli 默认使用当前 bot 凭证并允许 --profile 切换宿主 profile；设为 off 则完全不注入当前 bot 凭据；需 /restart 重启或新建会话生效' },
   { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'hc', 'riff', 'mojo', 'remote-runner'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜hc=herdr-core 持久会话（显式选用，需 herdr-core >=0.1.19，仅 Linux，botmux 不自动安装）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）｜remote-runner=外置 provider；选 riff 时需配置 riff 字段，mojo/remoteRunner 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；多用户共享主机上，用 jwtHome 指向该 bot 归属用户的 home（绝对路径）以读到他自己的 ByteCloud 登录态；unset 清除' },
@@ -256,10 +257,16 @@ export function parseBooleanValue(raw: string): boolean | undefined {
   return undefined;
 }
 
+/** 布尔字段的当前生效值：默认 ON（defaultOn）的字段只有显式 false 才算关（内存里存的是
+ *  false / undefined，见 applyConfigField），其余字段只有显式 true 才算开。 */
+export function configBooleanOn(spec: Pick<ConfigFieldSpec, 'defaultOn'>, value: unknown): boolean {
+  return spec.defaultOn ? value !== false : value === true;
+}
+
 /** 展示某字段当前值的人类可读文本。`cfg` 供 enumDefault 为函数的字段求缺省值。 */
 function formatFieldValue(spec: ConfigFieldSpec, value: unknown, cfg: BotConfig): string {
   if ((spec.configKey === 'codexRpcInput' || spec.configKey === 'archiveCodex') && typeof value !== 'boolean') return 'inherit';
-  if (spec.kind === 'boolean') return (spec.defaultOn ? value !== false : value === true) ? 'on' : 'off';
+  if (spec.kind === 'boolean') return configBooleanOn(spec, value) ? 'on' : 'off';
   if (spec.kind === 'allowedUsers' || spec.kind === 'stringList') {
     const arr = Array.isArray(value) ? value : [];
     return arr.length ? arr.join(', ') : '∅';
@@ -1439,7 +1446,7 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
     quota: typeof q === 'number' && Number.isInteger(q) && q > 0 ? q : null,
     admins: bot.resolvedAllowedUsers.length,
     booleans: CONFIG_FIELDS.filter(f => f.kind === 'boolean').map(f => ({
-      key: f.key, on: (cfg as any)[f.configKey] === true,
+      key: f.key, on: configBooleanOn(f, (cfg as any)[f.configKey]),
     })),
     ...(() => {
       // p2pMode='group' session groups carry an oncall binding that only pins

@@ -221,7 +221,7 @@ import {
   shouldHoldCodexRunnerInput,
   type CodexRunnerFreshnessState,
 } from './services/codex-runner-freshness.js';
-import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
+import { canStartInjectionFlush, minimaxCompactQueueSuppressesPromptReady, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
 import { applyRespawnConfigPatch, respawnConfigPatchFromMessage } from './core/respawn-config-patch.js';
 import { classifyMergedRestart, decideRestartFollowup, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings, settleDurableTurnForRestart, type RestartLaunchSettings } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
@@ -495,6 +495,7 @@ import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './service
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from './services/antigravity-cot.js';
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
+import { AntigravitySessionLog } from './services/antigravity-session-fork.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
 import {
   inspectAntigravityAccounts,
@@ -503,7 +504,7 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, hasAntigravitySideQuestionComposer, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
 import { antigravitySessionLogPath } from './services/antigravity-session-fork.js';
 import { AntigravityNativeQuotaLog, currentAntigravityNativeQuota } from './services/antigravity-native-quota.js';
 import {
@@ -512,6 +513,7 @@ import {
   hasAntigravityPendingTasks,
   drainAntigravityTranscript,
   antigravityTurnFailedWithoutOutput,
+  readAntigravitySideAnswer,
   type AntigravityTranscriptState,
 } from './services/antigravity-transcript.js';
 import {
@@ -639,7 +641,8 @@ import {
 } from './core/failed-turn-rewind.js';
 import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from './core/rewind-backup-retention.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
-import type { CliAdapter, CliLaunchNotice, PtyHandle, SubmitGuard, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
+import type { CliAdapter, CliLaunchNotice, PtyHandle, SessionRenameSurface, SubmitGuard, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
+import { decideSessionRenameSettlement, sessionRenameWriteFailureAction } from './core/session-rename-settlement.js';
 import { detectCliStartupBlocker, screenMayShowCredential, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
 import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
@@ -2276,9 +2279,22 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   const explicitOrigin = origin ?? (msg.type === 'managed_turn_origin' && typeof pendingManagedTurnOriginScope !== 'undefined'
     ? pendingManagedTurnOriginScope
     : undefined);
+  // The restart receipt is a statement about THIS ATTEMPT, not a runtime
+  // observation: it says the attempt the daemon minted reached a prompt. The
+  // relay rebinds in process (launcher pid → the real CLI behind it) while the
+  // callbacks armed during spawn keep the launcher's binding, and the host then
+  // judges the receipt against a retired runtime and never hands it to the
+  // restart coordinator — `/restart` reported 等待就绪超时 forty seconds after a
+  // CLI that was already at its prompt (2026-11-23). So name the live binding of
+  // the same physical CLI. Readiness keeps the captured binding on purpose: a
+  // pre-replacement callback must not publish the successor's readiness
+  // (session-contract-gateway.test.ts).
+  const liveProcessOrigin = msg.type === 'restart_result'
+    ? workerSessionEventScope.liveProcessOrigin()
+    : undefined;
   // Runtime identity follows the physical observer's binding. A submitted
   // turn may still name the previous runtime after an in-process rebind.
-  const captured = explicitOrigin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()
+  const captured = explicitOrigin ?? liveProcessOrigin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()
     : workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined)) ?? operationOrigin;
   const context = workerSessionEventScope.envelope(captured);
   if (!context.scope.execution && 'turnId' in msg) {
@@ -3355,6 +3371,9 @@ const adoptWriteQueue = new AsyncSerialQueue();
  *  setup so even the tick that fires between spawnCli-start and the
  *  adapter's hermesBridgeAttach reads the correct mode. */
 let lastSpawnEffectiveResume = false;
+/** This spawn attached to a surviving persistent pane rather than launching a
+ * fresh CLI. Native rename drafts may have survived the previous worker too. */
+let lastSpawnPersistentReattach = false;
 let lastSpawnEffectiveCliSessionId: string | undefined;
 /** Current native identity used by input-delivery recovery. Seeded from the
  * spawn's ACTUAL effective target (undefined after fresh demotion or while a
@@ -6201,7 +6220,22 @@ function stopNativeSessionTitleSync(): void {
 type SessionRenamePhase = 'idle' | 'reserved' | 'writing' | 'sent';
 let sessionRenamePhase: SessionRenamePhase = 'idle';
 const SESSION_RENAME_IDLE_TIMEOUT_MS = 5_000;
+/** Re-read cadence while a rename the adapter can judge is not yet settled;
+ *  each read is a terminal capture, so a long hold backs off. A redraw from
+ *  the user finishing the rename still re-judges at once via prompt-ready. */
+const SESSION_RENAME_RECHECK_MS = 2_000;
+const SESSION_RENAME_SLOW_RECHECK_MS = 10_000;
+const SESSION_RENAME_FAST_RECHECK_WINDOW_MS = 30_000;
 let sessionRenameIdleTimer: ReturnType<typeof setTimeout> | null = null;
+let sessionRenameReattachRetryTimer: ReturnType<typeof setTimeout> | null = null;
+/** The rename in flight: the exact command typed, the adapter's durable-record
+ *  probe armed just before it, and its one-shot recovery/notice latches. */
+let sessionRenameCommand: string | undefined;
+let sessionRenameRecorded: (() => boolean) | undefined;
+let sessionRenameResubmitted = false;
+let sessionRenameHoldLogged = false;
+let sessionRenameHoldNoticeSent = false;
+let sessionRenameSentAtMs = 0;
 
 function sessionRenameInFlight(): boolean {
   // Both native menu operations own the composer until their picker is closed.
@@ -6213,42 +6247,272 @@ function forceClearSessionRenameInFlight(): void {
     clearTimeout(sessionRenameIdleTimer);
     sessionRenameIdleTimer = null;
   }
+  if (sessionRenameReattachRetryTimer) {
+    clearTimeout(sessionRenameReattachRetryTimer);
+    sessionRenameReattachRetryTimer = null;
+  }
   sessionRenamePhase = 'idle';
+  sessionRenameCommand = undefined;
+  sessionRenameRecorded = undefined;
+  sessionRenameResubmitted = false;
+  sessionRenameHoldLogged = false;
+  sessionRenameHoldNoticeSent = false;
+  sessionRenameSentAtMs = 0;
+}
+
+/** The adapter's verdict on the rename in flight, read from the backend's own
+ *  viewport (and cursor where reported). Undefined — the historical fail-open —
+ *  when the adapter cannot judge or this backend's screen may not drive input.
+ *  Missing evidence on a judging adapter is `unknown`, never `settled`. */
+function sessionRenameSurfaceNow(): SessionRenameSurface | undefined {
+  const adapter = cliAdapter;
+  const command = sessionRenameCommand;
+  const target = backend;
+  if (!adapter?.sessionRenameSurface || !command || !target
+    || !backendScreenEvidenceIsAuthoritativeForMutation()) return undefined;
+  let evidence: { viewport: string; cursor?: { x: number; y: number } } | undefined;
+  try {
+    evidence = target.captureInputState?.() ?? { viewport: captureBackendScreen(target) };
+  } catch { evidence = undefined; }
+  if (!evidence?.viewport.trim()) return 'unknown';
+  try { return adapter.sessionRenameSurface(evidence, command); } catch { return 'unknown'; }
+}
+
+/** Resolve native identity at every receipt poll. Persistent reattach clears
+ * the init-time resume target as evidence, then proves the live conversation
+ * from an explicitly bound remote thread or a rollout held by the CLI pid.
+ * Never fall back to lastInitConfig.cliSessionId: configuration alone cannot
+ * prove which native thread a surviving pane owns. */
+function sessionRenameNativeSessionIdNow(): string | undefined {
+  if (inputDeliveryObservedCliSessionId) return inputDeliveryObservedCliSessionId;
+  const cliId = lastInitConfig?.cliId;
+  if (cliId !== 'codex' && cliId !== 'traex') return undefined;
+  if (cliId === 'codex') {
+    const explicitRemote = (backend as { expectedCodexSessionId?: string } | null)?.expectedCodexSessionId;
+    const rpcThread = codexRpcEngine?.activeThreadId;
+    const bound = explicitRemote ?? rpcThread;
+    if (bound) {
+      inputDeliveryObservedCliSessionId = bound;
+      return bound;
+    }
+  }
+  const pid = cliId === 'codex' ? currentCodexObservedPid() : currentTraexObservedPid();
+  if (!pid) return undefined;
+  let observed: string | undefined;
+  if (cliId === 'traex') {
+    const owned = findTraexRolloutSetByPid(pid);
+    if (!owned) return undefined;
+    const owns = (sid: string): boolean => owned.has(sid) || owned.has(sid.toLowerCase());
+    const bridgeSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
+    if (bridgeSid && owns(bridgeSid)) observed = bridgeSid;
+    if (!observed && owned.size === 1) {
+      const rollout = findTraexRolloutByPid(pid);
+      if (rollout && owns(rollout.cliSessionId)) observed = rollout.cliSessionId;
+    }
+  } else {
+    const owned = findCodexRolloutSetByPid(pid);
+    if (!owned) return undefined;
+    const owns = (sid: string): boolean => codexHistorySidIsOwned(sid, owned);
+    const liveSid = readCodexLiveSessionId(pid);
+    if (liveSid && owns(liveSid)) observed = liveSid;
+    const bridgeSid = codexBridgeRolloutPath ? codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
+    if (!observed && bridgeSid && owns(bridgeSid)) observed = bridgeSid;
+    if (!observed && owned.size === 1) {
+      const rollout = findCodexRolloutByPid(pid);
+      if (rollout && owns(rollout.cliSessionId)) observed = rollout.cliSessionId;
+    }
+  }
+  if (observed) inputDeliveryObservedCliSessionId = observed;
+  return observed;
+}
+
+/** One Enter for a rename whose command provably stayed in the composer. Only
+ *  when nothing else may be mid-write into the same terminal. Should the CLI
+ *  merely have been slow to read the original Enter, this one reaches an empty
+ *  composer, where TRAE 0.216.0 and Codex 0.167.0 do nothing. */
+function resubmitSessionRename(): boolean {
+  const target = backend;
+  if (!target || cliRestartInProgress || rawInputRestartGate || webTerminalInputWireDirty()
+    || commandLineWritesPending > 0 || isFlushing || injectionFlushing) return false;
+  try {
+    const sent: unknown = 'sendSpecialKeys' in target
+      ? (target as { sendSpecialKeys(...keys: string[]): unknown }).sendSpecialKeys('Enter')
+      : target.write('\r');
+    if (sent === false) return false;
+  } catch { return false; }
+  // Like the rename's own Enter: only the prompt this key produces may settle.
+  beginCliWriteCycle();
+  return true;
+}
+
+function notifySessionRenameInputHeld(): void {
+  const head = pendingMessages[0] ?? pendingAdoptMessages[0];
+  const rawHead = pendingRawInputs[0];
+  if (sessionRenameHoldNoticeSent || (!head && !rawHead)) return;
+  sessionRenameHoldNoticeSent = true;
+  send({
+    type: 'user_notify',
+    turnId: head?.turnId ?? rawHead?.turnId ?? currentBotmuxTurnId,
+    dispatchAttempt: head?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+    message: t('worker.session_rename_input_held', { cliName: cliName() }),
+  });
+}
+
+/** Judge the rename in flight and act on it: release queued input, press the
+ *  one recovery Enter, or keep holding and re-read. `prompt` is a screen-idle
+ *  edge (markPromptReady already restores readiness and flushes); `timer` is
+ *  the bounded wait for a CLI that redraws too little to produce one. */
+function settleSessionRename(source: 'prompt' | 'timer'): void {
+  if (sessionRenamePhase !== 'sent') return;
+  const surface = sessionRenameSurfaceNow();
+  const recorded = surface !== undefined && surface !== 'unsubmitted' && sessionRenameRecorded?.() === true;
+  const step = decideSessionRenameSettlement({
+    surface,
+    recorded,
+    resubmitted: sessionRenameResubmitted,
+    fromPrompt: source === 'prompt',
+  });
+  if (step === 'release') {
+    const held = sessionRenameHoldLogged;
+    forceClearSessionRenameInFlight();
+    const evidence = surface === undefined ? 'unjudged' : 'recorded by the CLI';
+    if (source === 'prompt') {
+      if (held) log(`Native session rename confirmed (${evidence}); releasing queued input`);
+      return;
+    }
+    // The timer means prompt redraw detection failed. Restore the gate
+    // explicitly; otherwise a deferred raw_input is the only queued work and
+    // flushPending would keep waiting for the very signal this timer replaces.
+    isPromptReady = true;
+    reattachOpenTurnGate = false;
+    log(surface === undefined
+      ? `Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`
+      : `Native session rename confirmed (${evidence}); releasing queued input`);
+    void flushPending();
+    return;
+  }
+  if (step === 'resubmit') {
+    if (resubmitSessionRename()) {
+      sessionRenameResubmitted = true;
+      log(`Native session rename command is still in the ${cliName()} composer; pressed Enter once to submit it`);
+    }
+    armSessionRenameIdleTimeout(SESSION_RENAME_RECHECK_MS);
+    return;
+  }
+  if (source === 'prompt') return;  // the armed timer re-reads and owns notice/recovery
+  if (!sessionRenameHoldLogged) {
+    sessionRenameHoldLogged = true;
+    log(`Native session rename not confirmed (${surface}${sessionRenameResubmitted ? ' after one resubmit' : ''}); holding queued input until this rename is recorded and the ${cliName()} input surface is writable`);
+  }
+  notifySessionRenameInputHeld();
+  armSessionRenameIdleTimeout(Date.now() - sessionRenameSentAtMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
+    ? SESSION_RENAME_RECHECK_MS : SESSION_RENAME_SLOW_RECHECK_MS);
 }
 
 /** A prompt can release rename only after the command Enter was actually sent.
  * A fast final from an older adopt write may arrive while rename is merely
  * reserved behind the queue; keep that reservation and let the queued helper
- * consume the newly-ready prompt. */
+ * consume the newly-ready prompt. A quiet screen still holding the command
+ * is a prompt too, so an adapter that judges its composer must agree. */
 function settleSessionRenameOnPrompt(): void {
-  if (sessionRenamePhase === 'sent') forceClearSessionRenameInFlight();
+  settleSessionRename('prompt');
 }
 
 function settleFailedSessionRenameWrite(): void {
-  if (sessionRenamePhase === 'writing') sessionRenamePhase = 'sent';
+  if (sessionRenamePhase !== 'writing') return;
+  sessionRenamePhase = 'sent';
+  sessionRenameSentAtMs = Date.now();
+  // Text or Enter delivery is ambiguous here. The normal settlement path now
+  // requires this thread's receipt and a writable surface; no global output
+  // shortcut is disabled or bypassed on this failure path.
 }
 
-/** Fail open if a CLI executes /rename without emitting enough redraw output
- * for IdleDetector to rediscover the prompt. The verified Codex/Claude paths
- * normally settle immediately; this cap prevents one administrative command
- * from wedging all later Lark messages forever. */
-function armSessionRenameIdleTimeout(): void {
+/** Bound the wait for a CLI that executes /rename without emitting enough
+ * redraw output for IdleDetector to rediscover the prompt. Without an adapter
+ * verdict this fails open, so one administrative command cannot wedge all
+ * later Lark messages; with one, queued input waits for this thread's durable
+ * rename receipt and a writable input surface. */
+function armSessionRenameIdleTimeout(delayMs = SESSION_RENAME_IDLE_TIMEOUT_MS): void {
   if (sessionRenamePhase !== 'sent') return;
   if (sessionRenameIdleTimer) clearTimeout(sessionRenameIdleTimer);
   sessionRenameIdleTimer = setTimeout(() => {
     sessionRenameIdleTimer = null;
-    if (sessionRenamePhase !== 'sent') return;
-    sessionRenamePhase = 'idle';
-    // The timeout specifically means prompt redraw detection failed. Fail open
-    // by restoring the gate explicitly; otherwise a deferred raw_input is the
-    // only queued work and flushPending would keep waiting for the very signal
-    // this timer exists to replace.
-    isPromptReady = true;
-    reattachOpenTurnGate = false;
-    log(`Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`);
-    void flushPending();
-  }, SESSION_RENAME_IDLE_TIMEOUT_MS);
+    settleSessionRename('timer');
+  }, delayMs);
   sessionRenameIdleTimer.unref?.();
+}
+
+let sessionRenameReattachRecoveryGeneration = -1;
+
+function armSessionRenameReattachRecoveryRetry(): void {
+  if (sessionRenameReattachRetryTimer) return;
+  if (!sessionRenameSentAtMs) sessionRenameSentAtMs = Date.now();
+  const generation = cliSpawnGeneration;
+  const delayMs = Date.now() - sessionRenameSentAtMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
+    ? SESSION_RENAME_RECHECK_MS : SESSION_RENAME_SLOW_RECHECK_MS;
+  sessionRenameReattachRetryTimer = setTimeout(() => {
+    sessionRenameReattachRetryTimer = null;
+    if (generation === cliSpawnGeneration) void flushPending();
+  }, delayMs);
+  sessionRenameReattachRetryTimer.unref?.();
+}
+
+/** A worker replacement does not clear the surviving pane's composer. Before
+ * any restored input is written, recover a visible native rename operation
+ * left by the predecessor. An exact draft gets the normal one-Enter recovery;
+ * an occupied surface stays held even if this thread/title already has a
+ * receipt. Unknown evidence BLOCKS this flush and schedules another read; only
+ * positively settled/unjudged evidence may fall through to restored input. */
+function recoverSessionRenameAfterPersistentReattach(): boolean {
+  const generation = cliSpawnGeneration;
+  if (sessionRenameReattachRecoveryGeneration === generation || sessionRenamePhase !== 'idle') return false;
+  const adapter = cliAdapter;
+  const title = lastInitConfig?.nativeSessionTitle?.trim();
+  if (!lastSpawnPersistentReattach || !title || !backend || !adapter?.buildSessionRenameCommand
+    || !adapter.sessionRenameSurface || !backendScreenEvidenceIsAuthoritativeForMutation()) {
+    sessionRenameReattachRecoveryGeneration = generation;
+    return false;
+  }
+  const command = adapter.buildSessionRenameCommand(title);
+  sessionRenameCommand = command;
+  const surface = sessionRenameSurfaceNow();
+  if (surface === 'unknown') {
+    sessionRenameCommand = undefined;
+    if (!sessionRenameHoldLogged) {
+      sessionRenameHoldLogged = true;
+      log('Native session rename recovery cannot classify the surviving terminal; holding restored input and retrying');
+    }
+    notifySessionRenameInputHeld();
+    armSessionRenameReattachRecoveryRetry();
+    return true;
+  }
+  if (sessionRenameReattachRetryTimer) {
+    clearTimeout(sessionRenameReattachRetryTimer);
+    sessionRenameReattachRetryTimer = null;
+  }
+  sessionRenameReattachRecoveryGeneration = generation;
+  sessionRenameSentAtMs = 0;
+  if (surface === undefined || surface === 'settled') {
+    sessionRenameCommand = undefined;
+    sessionRenameHoldLogged = false;
+    sessionRenameHoldNoticeSent = false;
+    return false;
+  }
+  sessionRenamePhase = 'sent';
+  sessionRenameSentAtMs = Date.now();
+  sessionRenameResubmitted = false;
+  try {
+    sessionRenameRecorded = adapter.watchSessionRename?.(command, {
+      getCliSessionId: sessionRenameNativeSessionIdNow,
+      // The predecessor may have completed the rename before it died. That
+      // existing exact receipt releases only AFTER the current surface stops
+      // being occupied/unsubmitted; it never hides the surviving draft.
+      fromByte: 0,
+    });
+  } catch { sessionRenameRecorded = undefined; }
+  log(`Recovered native session rename state after persistent reattach (${surface}); restored input stays held`);
+  armSessionRenameIdleTimeout();
+  return true;
 }
 
 /** Deliver passthrough exactly as before: it may be injected while the CLI is
@@ -6383,7 +6647,11 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         }),
       });
       if (untouchedCompact) {
-        send({ type: 'prompt_ready' });
+        // Recovery still has to drain a following queued compact. Reopen the
+        // daemon's compact-button fence only when no such command remains.
+        if (!minimaxCompactQueueSuppressesPromptReady(lastInitConfig?.cliId, pendingRawInputs)) {
+          send({ type: 'prompt_ready' });
+        }
         // A queued command owns isFlushing until its caller's finally runs.
         // With no native idle edge after rejection, admitted follower messages
         // need one fresh drain after that mutex is released (never a replay of
@@ -7842,6 +8110,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             trustedCaller: activeIdentity.caller ?? null,
             identityTurnId: activeIdentity.identityTurnId ?? activeIdentity.turnId,
             ...(activeIdentity.speakers?.length ? { speakers: [...activeIdentity.speakers] } : {}),
+            ...(activeIdentity.provenanceIncomplete ? { provenanceIncomplete: true } : {}),
           } : {}),
           ...(readIsolationOriginChannelId
             ? { originChannelId: readIsolationOriginChannelId }
@@ -8054,7 +8323,7 @@ function adoptInitialActiveTurn(parsed: {
   trustedController?: TrustedCaller;
   steerPromotedTurn?: boolean;
   callerOpenId?: string;
-}): void {
+}, fromPidMarker = false): void {
   setCaptureIdentity(
     parsed.turnId,
     typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
@@ -8072,6 +8341,9 @@ function adoptInitialActiveTurn(parsed: {
     dispatchAttempt: currentBotmuxDispatchAttempt,
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
+    // The CLI-writable marker cannot prove the complete speaker/input history.
+    // Never let a restored turn regain owner fallback by omitting that history.
+    ...(fromPidMarker ? { provenanceIncomplete: true } : {}),
   });
   activeTurnAuthority.markStarted({
     turnId: parsed.turnId,
@@ -8123,6 +8395,7 @@ function adoptDisplacedActiveTurn(parsed: {
     dispatchAttempt: currentBotmuxDispatchAttempt,
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
+    provenanceIncomplete: true,
   });
   activeTurnAuthority.markStarted({
     turnId: parsed.turnId,
@@ -8130,6 +8403,18 @@ function adoptDisplacedActiveTurn(parsed: {
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
   });
+}
+
+/** Same-turn marker recovery is for a persistent CLI reattach, never a fresh
+ * spawn (which simply has not built its first authority yet). A duplicate bind
+ * is harmless only when the exact authority is already in memory (reserved or
+ * started). Callers separately exempt the exact last release, which must
+ * advance its queue rather than resurrect the released turn. */
+function activeAuthorityMatchesMarker(parsed: { turnId: string; dispatchAttempt?: unknown }): boolean {
+  const active = activeTurnAuthority.snapshot();
+  const dispatchAttempt = typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined;
+  return !!active && active.turnId === parsed.turnId
+    && active.dispatchAttempt === dispatchAttempt;
 }
 
 // PID marker 文件锁（withFileLockSync）不可重入：writeCliPidMarker / restoreQueuedTurns /
@@ -8160,7 +8445,7 @@ function writeCliPidMarker(): void {
           try {
             const raw = readFileSync(markerPath, 'utf-8');
             const parsed = JSON.parse(raw);
-            if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+            if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
               if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
                 // Disk holds an older turn that worker memory has already retired/advanced past.
                 // Do not adopt it back; allow write to overwrite disk with currentBotmuxTurnId.
@@ -8182,8 +8467,8 @@ function writeCliPidMarker(): void {
                   publishSandboxRelayCapability();
                   rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
                   log(`Adopted active turn advance from PID marker before write: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)}`);
-                } else if (!currentBotmuxTurnId) {
-                  adoptInitialActiveTurn(parsed);
+                } else if (!currentBotmuxTurnId || parsed.turnId === currentBotmuxTurnId) {
+                  adoptInitialActiveTurn(parsed, true);
                   rememberQueuedTurnAdvanceForPendingReady();
                 } else {
                   const prevTurnId = currentBotmuxTurnId;
@@ -8276,11 +8561,11 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
     withPidMarkerLock(markerPath, () => {
       const raw = readFileSync(markerPath, 'utf-8');
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
         if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
           // Disk holds an older turn that has already terminated; do not re-adopt it.
-        } else if (!currentBotmuxTurnId) {
-          adoptInitialActiveTurn(parsed);
+        } else if (!currentBotmuxTurnId || parsed.turnId === currentBotmuxTurnId) {
+          adoptInitialActiveTurn(parsed, true);
         } else {
           adoptDisplacedActiveTurn(parsed);
         }
@@ -8378,7 +8663,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
       withPidMarkerLock(markerPath, () => {
         const raw = readFileSync(markerPath, 'utf-8');
         const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+        if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
           if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
             // Disk holds an older turn that worker memory has already retired/advanced past.
           } else {
@@ -8403,8 +8688,8 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
               anySynced = true;
               rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
               log(`Synced active turn advance from PID marker: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
-            } else if (!currentBotmuxTurnId) {
-              adoptInitialActiveTurn(parsed);
+            } else if (!currentBotmuxTurnId || parsed.turnId === currentBotmuxTurnId) {
+              adoptInitialActiveTurn(parsed, true);
               anySynced = true;
               rememberQueuedTurnAdvanceForPendingReady();
             } else {
@@ -19600,6 +19885,7 @@ async function flushPendingInjections(): Promise<void> {
   // - /rename 原生同步在飞（sessionRenameInFlight）与字面命令行写入窗口
   //   （commandLineWritesPending）：raw-write 围栏，注入同为 raw 命令行写入方。
   // 被挡下的注入不丢：队列留存，竞争写入方结束后的下一次 markPromptReady 再踢。
+  if (recoverSessionRenameAfterPersistentReattach()) return;
   if (!canStartInjectionFlush({
     injectionFlushing,
     userFlushing: isFlushing,
@@ -20306,6 +20592,75 @@ function finishBtwCaptureFromScreen(): void {
   }
   log('/btw answer finished but neither the clipboard nor the screen yielded it');
   giveUpBtwCapture();
+}
+
+let antigravitySideQuestionPending = false;
+
+async function handleAntigravitySideQuestion(
+  msg: Extract<DaemonToWorker, { type: 'antigravity_btw' }>,
+): Promise<void> {
+  const target = backend;
+  const lifetime = cliLifetimeNonce;
+  const cfg = lastInitConfig;
+  const result = { type: 'antigravity_btw_result' as const, messageId: msg.messageId, question: msg.question };
+  const current = () => backend === target && cliLifetimeNonce === lifetime
+    && lastInitConfig === cfg && !cliRestartInProgress && !nativeSessionForkPending()
+    && inputDeliveryObservedCliSessionId === msg.nativeSessionId;
+  if (!target || cfg?.cliId !== 'antigravity' || cfg.adoptMode || cliAdapter?.runnerFramedInput
+    || isRemoteBackendType(effectiveBackendType) || cfg.sandbox === 'scratch'
+    || !current() || !msg.question || /[\u0000-\u001f\u007f-\u009f]/u.test(msg.question)) {
+    send({ ...result, reason: 'unavailable' });
+    return;
+  }
+  if (antigravitySideQuestionPending || commandLineWritesPending || isFlushing || injectionFlushing
+    || sessionRenameInFlight() || rawInputRestartGate || startupCommandsInProgress || startupCommandAckHold
+    || (!hasRunStartupCommands && cfg.startupCommands?.length)
+    || (!firstWriteLivenessConfirmed && hasPendingInputForFlush())) {
+    send({ ...result, reason: 'busy' });
+    return;
+  }
+  antigravitySideQuestionPending = true;
+  try {
+    const logReader = new AntigravitySessionLog(sessionId);
+    const loggedNativeId = logReader.read().currentId;
+    // A fresh reader scans only the log's last 256 KiB. Missing history is not
+    // a conflict: current() already proves the observed native identity. Refuse
+    // only an explicit different id; receipt + transcript checks stay intact.
+    if (loggedNativeId && loggedNativeId !== msg.nativeSessionId) {
+      send({ ...result, reason: 'unavailable' });
+      return;
+    }
+    const previous = logReader.read().sideQuestion;
+    await sendRawCommandLineWithRecoveryFence(target, `/btw ${msg.question}`, () => {
+      const screen = btwOverlayScreen();
+      if (!current() || heldStuckPage(screen) || !hasAntigravitySideQuestionComposer(screen) || !firstWriteMayProceed()) {
+        throw new SubmissionWriteError('Antigravity /btw requires an empty native composer', undefined, false);
+      }
+    });
+    // The terminal command launches a different native conversation. A
+    // receipt and matching input are required before any output can cross
+    // into Lark. The main turn retains its capture identity throughout.
+    const deadline = Date.now() + BTW_ANSWER_WINDOW_MS;
+    while (current() && Date.now() < deadline) {
+      const state = logReader.read();
+      if (state.currentId && state.currentId !== msg.nativeSessionId) break;
+      const receipt = state.sideQuestion;
+      if (receipt && receipt !== previous && receipt.conversationId !== msg.nativeSessionId) {
+        if (receipt.outcome !== 'answered') break;
+        const answer = readAntigravitySideAnswer(receipt.conversationId, msg.question);
+        if (answer) {
+          send({ ...result, answer });
+          return;
+        }
+      }
+      await delay(500);
+    }
+    send({ ...result, reason: 'unconfirmed' });
+  } catch (err) {
+    send({ ...result, reason: err instanceof SubmissionWriteError && !err.submissionStarted ? 'busy' : 'unconfirmed' });
+  } finally {
+    antigravitySideQuestionPending = false;
+  }
 }
 
 /**
@@ -23077,7 +23432,23 @@ function settleRestartAttemptOnReady(
       pendingTopicEffortRestart = undefined;
     }
 
-    if (opts.republishPromptReady) send({ type: 'prompt_ready' });
+    // Readiness this same callback published a moment ago was judged under the
+    // binding it captured and refused — a pre-replacement callback may not
+    // declare the successor ready. Only the receipt below was re-scoped, so the
+    // daemon kept `cliReady` false: the card said 已重启 while the next
+    // passthrough cascade sat out its whole 120s idle budget (cli-idle-wait)
+    // against an idle screen, because nothing published readiness again
+    // (2026-11-23 review of #3734). The receipt proves THIS attempt reached a
+    // prompt in the live CLI of the same process, so publish readiness under
+    // that same proven origin. A callback of a REPLACED process gets no live
+    // origin and still cannot announce the new process ready.
+    const liveProcess = isPromptReady ? workerSessionEventScope?.liveProcessOrigin() : undefined;
+    const observer = workerSessionEventScope?.contextBinding();
+    const supersededInProcess = !!liveProcess && !!observer && observer.bindingId !== liveProcess.bindingId;
+    if ((opts.republishPromptReady || supersededInProcess)
+      && !minimaxCompactQueueSuppressesPromptReady(lastInitConfig?.cliId, pendingRawInputs)) {
+      send({ type: 'prompt_ready' }, liveProcess);
+    }
     send({
       type: 'restart_result',
       attemptId: activeRestartAttemptId,
@@ -23085,6 +23456,12 @@ function settleRestartAttemptOnReady(
       category: 'prompt_ready',
       ...(topicEffort ? { topicEffort } : {}),
     });
+    // The success receipt is the ONLY edge that closes the restart's status card
+    // and lifts the daemon's workerReady fence, and until now nothing on either
+    // side said whether it was sent. A `/restart` card that sat at 重启超时 while
+    // the CLI was plainly back at its prompt could not be told apart from a
+    // receipt that never left the worker (2026-11-23). One line per restart.
+    log(`${trigger}: restart receipt sent (attempt=${activeRestartAttemptId.slice(0, 8)}, status=succeeded)`);
     activeRestartAttemptId = undefined;
     return;
   }
@@ -23464,8 +23841,7 @@ function markPromptReady(): void {
   // A compact click already owns the daemon's readiness fence. The prompt
   // between the preceding business turn and this queued command must drain
   // the command without making the button accept another click.
-  if (!(lastInitConfig?.cliId === 'minimax'
-    && pendingRawInputs.some(input => input.content.trim() === '/compact'))) {
+  if (!minimaxCompactQueueSuppressesPromptReady(lastInitConfig?.cliId, pendingRawInputs)) {
     send({ type: 'prompt_ready' });
   }
   if (codexAutoUpgrade?.stage === 'restoring') codexAutoUpgrade.ready?.();
@@ -24840,6 +25216,7 @@ async function flushPending(): Promise<void> {
     if (isFlushing || backend !== target || cliRestartInProgress || webTerminalInputWireDirty()) return;
   }
   if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
+  if (recoverSessionRenameAfterPersistentReattach()) return;
   if (resetTraexAutoModelBeforePendingTurn()) return;
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
@@ -25087,11 +25464,25 @@ async function flushPending(): Promise<void> {
           // the preceding turn in that window must not release the rename gate.
           beginCliWriteCycle();
           sessionRenamePhase = 'writing';
-          await sendRawCommandLineWithRecoveryFence(renameBackend, buildRename(title));
+          const renameCommand = buildRename(title);
+          sessionRenameCommand = renameCommand;
+          sessionRenameResubmitted = false;
+          sessionRenameHoldLogged = false;
+          sessionRenameHoldNoticeSent = false;
+          try {
+            // This is the live, observed native identity, not a possibly stale
+            // init-time resume target. An adopt/reattach that has not proven its
+            // id yet gets no shared-index receipt fallback at all.
+            sessionRenameRecorded = cliAdapter?.watchSessionRename?.(renameCommand, {
+              getCliSessionId: sessionRenameNativeSessionIdNow,
+            });
+          } catch { sessionRenameRecorded = undefined; }
+          await sendRawCommandLineWithRecoveryFence(renameBackend, renameCommand);
           if (cliSpawnGeneration !== renameGeneration || backend !== renameBackend || cliRestartInProgress) {
             throw new Error('rename backend generation changed before Enter settlement');
           }
           sessionRenamePhase = 'sent';
+          sessionRenameSentAtMs = Date.now();
           // A previous turn's terminal may have raised ready while the rename
           // was still writing. Re-arm after Enter so only rename's own prompt
           // can settle `sent` (with the bounded timeout as fail-open fallback).
@@ -25123,17 +25514,32 @@ async function flushPending(): Promise<void> {
         log(`Native session rename command sent (${cliName()}): ${title}`);
       } catch (err: any) {
         // Local title persistence is authoritative; native sync is best-effort.
-        // Do not blindly replay a partially typed command after a backend error.
-        // Keep the rename gate for the same bounded fail-open window: the write
-        // may have stopped after typing only part of the command, so immediately
-        // appending a deferred raw_input could corrupt both commands.
-        if (cliSpawnGeneration === renameGeneration && backend === renameBackend && !cliRestartInProgress) {
+        // Replay only a structurally proven pre-write refusal. A normal text /
+        // Enter error is ambiguous and keeps the exact-receipt gate instead.
+        const failureAction = sessionRenameWriteFailureAction(err);
+        const current = cliSpawnGeneration === renameGeneration && backend === renameBackend && !cliRestartInProgress;
+        if (current && failureAction === 'retry') {
+          if (pendingSessionRename === null) pendingSessionRename = title;
+          forceClearSessionRenameInFlight();
+          isPromptReady = true;
+          reattachOpenTurnGate = false;
+          // The outer flush still owns isFlushing. Re-drive only after its
+          // finally releases the mutex; web-dirty/backend gates may refuse the
+          // retry before writing again without spinning this call stack.
+          setImmediate(() => {
+            if (cliSpawnGeneration === renameGeneration && backend === renameBackend && !cliRestartInProgress) {
+              void flushPending();
+            }
+          });
+        } else if (current) {
           settleFailedSessionRenameWrite();
           armSessionRenameIdleTimeout();
         } else {
           forceClearSessionRenameInFlight();
         }
-        log(`Native session rename command failed (${cliName()}): ${err?.message ?? err}; waiting for prompt or fail-open timeout`);
+        log(failureAction === 'retry' && current
+          ? `Native session rename refused before any input (${cliName()}): ${err?.message ?? err}; requeued`
+          : `Native session rename command failed (${cliName()}): ${err?.message ?? err}; waiting for rename confirmation`);
       }
       // Wait for the command to finish and the TUI to become idle again before
       // sending queued user prompts; otherwise they can land in its picker.
@@ -26483,7 +26889,7 @@ function sendToPty(
   // TUI has booted. First-ready or positive initialization evidence proves
   // this; keep that evidence available to messages arriving after the startup
   // observer's one-time queue flush, even if resyncs prevent ordinary idle.
-  if (!sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
+  if (!recoverSessionRenameAfterPersistentReattach() && !sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
     isPromptReady,
     isFlushing,
     supportsTypeAhead,
@@ -30238,6 +30644,7 @@ async function spawnCliBody(
   // `lastInitConfig.resume` (= true) and baseline an empty store, swallowing
   // the fresh session's first turn.
   lastSpawnEffectiveResume = effectiveResume;
+  lastSpawnPersistentReattach = willReattachPersistent;
   lastSpawnEffectiveCliSessionId = effectiveCliSessionId;
   inputDeliveryObservedCliSessionId = inputDeliveryObservedSessionIdAtSpawn(willReattachPersistent, effectiveCliSessionId);
   lastSpawnEffectiveAdapterSessionId = effectiveAdapterSessionId;
@@ -41090,6 +41497,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       const observerDecided = msg.observerDecision === true && (!scope || scope.currentBinding()?.bindingId === msg.bindingId)
         && restoredObserverGrantWait.decide(msg.bindingId);
       if (msg.mayExecute && (msg.observedExecutions?.length || observerDecided)) codexBridgeDrainAndMaybeEmit();
+      if (msg.mayExecute) replayDeferredSessionReady();
       break;
     }
 
@@ -41255,7 +41663,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // process.on('message') does not serialize async listeners. Hold the
         // per-worker queue across transcript mark + complete adapter write so
         // two CoCo/Codex paste→wait→Enter/history cycles cannot overlap.
-        if (cliRestartInProgress || rawInputRestartGate || !backend || sessionRenameInFlight()) {
+        if (cliRestartInProgress || rawInputRestartGate || !backend || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()) {
           pendingAdoptMessages.push(item);
           log(`Deferred adopt message until the CLI generation/input gate settles (${content.length} chars)`);
         } else {
@@ -41332,7 +41740,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         || !['pty', 'tmux', 'hc'].includes(lastInitConfig.backendType) || lastInitConfig.wrapperCli
         || codexRpcEngine || lastInitConfig.adoptMode || sandboxBoolValue(lastInitConfig.sandbox)
         || sandboxEnabled() || lastInitConfig.readIsolation
-        || sessionRenameInFlight() || isFlushing || injectionFlushing || commandLineWritesPending
+        || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight() || isFlushing || injectionFlushing || commandLineWritesPending
         || cliRestartInProgress || pendingMessages.length || pendingRawInputs.length
         || bareShellCheckInProgress || bareShellLaunchBlocked || tuiPromptBlocking
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)) {
@@ -41484,6 +41892,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       break;
     }
 
+    case 'antigravity_btw': {
+      await handleAntigravitySideQuestion(msg);
+      break;
+    }
+
     case 'raw_input': {
       const unattendedRefusal = unattendedRawInputRefusal(msg);
       if (unattendedRefusal) {
@@ -41537,7 +41950,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       const startupInputGateHolds = !firstWriteLivenessConfirmed
         || (!openingInputBoxSettled && pendingMessages.length > 0)
         || startupCommandsInProgress || startupCommandAckHold !== null || nativeSessionForkPending();
-      if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()
+      if (cliRestartInProgress || rawInputRestartGate || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked
@@ -42740,13 +43153,71 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
   }
 }
-process.on('message', (raw: unknown, handle: unknown) => {
+type DeferredSessionReady = {
+  msg: Extract<DaemonToWorker, { type: 'session_ready' }>;
+  handle: unknown;
+  timer: ReturnType<typeof setTimeout>;
+};
+const deferredSessionReady: DeferredSessionReady[] = [];
+
+function takeDeferredSessionReady(entry: DeferredSessionReady): boolean {
+  const index = deferredSessionReady.indexOf(entry);
+  if (index < 0) return false;
+  deferredSessionReady.splice(index, 1);
+  clearTimeout(entry.timer);
+  return true;
+}
+
+/** A new native session's hook may overtake the host's runtime_binding. Hold it
+ * briefly so runtime_contract_assigned can prove the pending runtime instead of
+ * losing this one-shot boundary to stale_runtime_target. */
+function deferSessionReadyUntilRuntimeAssigned(msg: DeferredSessionReady['msg'], handle: unknown): void {
+  const key = msg.requestId ?? msg.source;
+  if (key && deferredSessionReady.some(entry => (entry.msg.requestId ?? entry.msg.source) === key)) return;
+  if (deferredSessionReady.length >= 8) {
+    log('Dropped session_ready deferral: too many pending runtime assignments');
+    return;
+  }
+  const entry: DeferredSessionReady = { msg, handle, timer: setTimeout(() => {
+    if (takeDeferredSessionReady(entry)) log('Dropped deferred session_ready: runtime contract assignment timed out');
+  }, 5_000) };
+  entry.timer.unref?.();
+  deferredSessionReady.push(entry);
+  log(`Deferred session_ready until runtime contract assignment (runtime=${msg.sessionCommand?.runtime?.runtimeId.slice(0, 8) ?? '?'})`);
+}
+
+/** Re-evaluate a deferred hook only against the LIVE binding. The host judged
+ * the old runtime; the assignment now proves its successor in the SAME physical
+ * process. A different process never inherits the signal and it expires. */
+function replayDeferredSessionReady(): void {
+  const scope = workerSessionEventScope;
+  const current = scope?.currentBinding();
+  if (!scope || !current?.runtime) return;
+  for (const entry of [...deferredSessionReady]) {
+    const context = entry.msg.sessionCommand;
+    const previous = context?.runtime ? scope.bindingForRuntime(context.runtime) : undefined;
+    if (!context?.runtime || !previous || previous.physicalId !== current.physicalId) continue;
+    const sessionCommand = { ...context, runtime: current.runtime };
+    if (!admitSessionCommand('session_ready', sessionCommand, current.runtime).allowed) continue;
+    if (takeDeferredSessionReady(entry)) dispatchDaemonMessage({ ...entry.msg, sessionCommand }, entry.handle);
+  }
+}
+
+function clearDeferredSessionReady(): void {
+  for (const entry of deferredSessionReady.splice(0)) clearTimeout(entry.timer);
+}
+
+function dispatchDaemonMessage(raw: unknown, handle: unknown): unknown {
   const msg = raw as DaemonToWorker;
   if (!msg || typeof msg !== 'object') return;
   const binding = workerSessionEventScope?.currentBinding();
   if (workerSessionEventScope && msg.type !== 'init') {
     const admission = admitSessionCommand(msg.type, msg.sessionCommand, binding?.runtime ?? binding?.proposedRuntime, msg.type === 'restart' ? msg.attemptId : undefined);
     if (!admission.allowed) {
+      if (msg.type === 'session_ready' && admission.reason === 'stale_runtime_target' && msg.sessionCommand?.runtime) {
+        deferSessionReadyUntilRuntimeAssigned(msg, handle);
+        return;
+      }
       log(`Rejected ${msg.type}: ${admission.reason}`);
       const target = msg.sessionCommand?.runtime ? workerSessionEventScope.bindingForRuntime(msg.sessionCommand.runtime) : binding;
       const reject = () => {
@@ -42765,7 +43236,8 @@ process.on('message', (raw: unknown, handle: unknown) => {
   if (execution) workerSessionEventScope?.rememberExecution(execution);
   if (binding && workerSessionEventScope && msg.type !== 'init') return workerSessionEventScope.run(binding, () => handleContractDaemonMessage(msg, handle), execution, msg.sessionCommand?.operationId);
   return handleContractDaemonMessage(msg, handle);
-});
+}
+process.on('message', dispatchDaemonMessage);
 
 // The daemon starts every worker with an empty backlog.
 publishedCliInputBacklog = cliInputBacklogKey({ pending: false });
@@ -42781,6 +43253,7 @@ grokRuntimePollTimer.unref?.();
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  clearDeferredSessionReady();
   clearInterval(claudeEffortPollTimer);
   clearInterval(grokRuntimePollTimer);
   workerFinalOutputHandoff?.stop();

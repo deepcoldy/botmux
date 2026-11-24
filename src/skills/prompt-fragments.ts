@@ -158,18 +158,8 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   },
   {
     key: 'ai.routing.intro_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
-    label: '开场说明（transcript 自动转发模式）',
-    gateLabel: '仅 replyDelivery=transcript（daemon 自动转发最终回复）时替代上面的标准版',
-  },
-  {
-    key: 'ai.routing.usage_send_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
-    label: 'botmux send 的使用场景（transcript 模式）',
-    gateLabel: '仅 replyDelivery=transcript 时替代「发送用法」与「@ 决策规则」',
-  },
-  {
-    key: 'ai.routing.no_progress_send_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
-    label: '不用 send 发进度 / 重复最终答复（transcript 模式）',
-    gateLabel: '仅 replyDelivery=transcript 时注入',
+    label: '开场说明（自动转发最终回复模式）',
+    gateLabel: '仅 replyDelivery=transcript（自动转发最终回复）时替代上面的标准版',
   },
   { key: 'ai.routing.usage_send', block: 'routing_system', stage: 'new', label: '发送用法', kind: 'editable' },
   { key: 'ai.routing.usage_mention_gate', block: 'routing_system', stage: 'new', label: '@ 决策规则', kind: 'editable' },
@@ -199,15 +189,10 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   { key: 'ai.shell.intro', block: 'routing_shell', stage: 'new', label: 'Shell：开场说明（标准模式）', kind: 'editable' },
   {
     key: 'ai.shell.intro_transcript', block: 'routing_shell', stage: 'new', kind: 'editable',
-    label: 'Shell：开场说明（transcript 模式）',
-    gateLabel: '仅 replyDelivery=transcript 时替代标准版',
+    label: 'Shell：开场说明（自动转发最终回复模式）',
+    gateLabel: '仅 replyDelivery=transcript（自动转发最终回复）时替代标准版',
   },
   { key: 'ai.shell.commands_are_shell', block: 'routing_shell', stage: 'new', label: 'Shell：命令是 shell 程序、不是 MCP 工具', kind: 'editable' },
-  {
-    key: 'ai.shell.send_scope_transcript', block: 'routing_shell', stage: 'new', kind: 'editable',
-    label: 'Shell：botmux send 的使用场景（transcript 模式）',
-    gateLabel: '仅 replyDelivery=transcript 时替代「如何发送」与「@ 决策」',
-  },
   { key: 'ai.shell.how_to_send', block: 'routing_shell', stage: 'new', label: 'Shell：如何发送', kind: 'editable' },
   { key: 'ai.shell.multiline_heredoc', block: 'routing_shell', stage: 'new', label: 'Shell：多行正文规则（heredoc）', kind: 'editable' },
   { key: 'ai.shell.heredoc_example', block: 'routing_shell', stage: 'new', label: 'Shell：多行正确示例', kind: 'editable' },
@@ -215,8 +200,13 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   { key: 'ai.shell.when_to_send', block: 'routing_shell', stage: 'new', label: 'Shell：何时发送（标准模式）', kind: 'editable' },
   {
     key: 'ai.shell.when_to_send_transcript', block: 'routing_shell', stage: 'new', kind: 'editable',
-    label: 'Shell：何时发送（transcript 模式）',
-    gateLabel: '仅 replyDelivery=transcript 时替代标准版',
+    label: 'Shell：何时发送（自动转发最终回复模式）',
+    gateLabel: '仅 replyDelivery=transcript（自动转发最终回复）时替代标准版',
+  },
+  {
+    key: 'ai.shell.send_without_skill_transcript', block: 'routing_shell', stage: 'new', kind: 'editable',
+    label: 'Shell：无原生 skill 通道时的最小发送操作说明',
+    gateLabel: '仅 replyDelivery=transcript 且适配器没有 skillsDir/pluginDir（当前为 Hermes）时注入；doubao 不教 send',
   },
   {
     key: 'ai.shell.no_visible_output_ok', block: 'routing_shell', stage: 'new', kind: 'editable',
@@ -240,7 +230,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   { key: 'ai.identity.mention_must', block: 'identity', stage: 'new', label: '规则：协作必须 @', kind: 'editable' },
   {
     key: 'ai.identity.short_routing', block: 'identity', stage: 'new', label: '身份规则（内联提示路径精简版）', kind: 'editable',
-    gateLabel: '仅非系统提示路径 CLI 的首轮身份块；transcript / no-transport 会话不注入',
+    gateLabel: '仅非系统提示路径 CLI 的首轮身份块；no-transport、solo 或 doubao 自动转发会话不注入',
   },
   { key: 'ai.identity.unknown', block: 'identity', stage: 'new', label: '名称 / open_id 缺失时的兜底文本', kind: 'editable' },
 
@@ -449,21 +439,6 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     key: 'ai.send.after_success_unified', block: 'send_feedback', stage: 'send', kind: 'editable',
     label: '统一回复卡片：进度已更新回显',
     gateLabel: '仅本轮发送走统一回复卡片、且发送类型为 progress 时',
-  },
-  {
-    key: 'ai.send.after_success_progress_transcript', block: 'send_feedback', stage: 'send', kind: 'editable',
-    label: '进度发送成功回显（transcript 模式）',
-    gateLabel: '仅 replyDelivery=transcript 的会话替代上面的标准版',
-  },
-  {
-    key: 'ai.send.after_success_unified_transcript', block: 'send_feedback', stage: 'send', kind: 'editable',
-    label: '统一回复卡片：进度已更新回显（transcript 模式）',
-    gateLabel: '仅 replyDelivery=transcript 的会话、本轮走统一回复卡片且发送类型为 progress 时',
-  },
-  {
-    key: 'ai.send.after_success_auxiliary_transcript', block: 'send_feedback', stage: 'send', kind: 'editable',
-    label: '补充消息发送成功回显（transcript 模式）',
-    gateLabel: '仅 replyDelivery=transcript 的会话替代上面的标准版',
   },
 ];
 

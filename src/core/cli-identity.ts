@@ -47,7 +47,7 @@ import { isUsableOpenId } from '../utils/user-token.js';
 import { logger } from '../utils/logger.js';
 import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
 import { ensureBackgroundJobHome, ensureMeegoStore, MEEGO_ENV_CREDENTIALS, MEEGO_STORE_DIR } from '../services/bytedcli-home.js';
-import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
+import { isRunAsTurnId, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import { NOT_AUTHORIZED_REASONS, PLATFORM_NOT_AUTHORIZED_REASONS, reasonTag } from './refusal-reasons.js';
 import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 
@@ -404,8 +404,10 @@ export function sessionActiveTurnIdentityPath(sessionDataDir: string, sessionId:
  * queued input to the CLI, which is later than the daemon's acceptance of that
  * message and possibly much later.
  *
- * Best-effort: a failure here can only cost a refused command, never a wrong
- * identity, because the wrapper treats an unreadable turn file as a mismatch.
+ * Best-effort for ordinary turns. A runAs turn is different: before its marker
+ * changes, synchronously invalidate the previous single-model snapshots. If that
+ * invalidation or the marker write fails, throw so the worker cannot hand the
+ * turn to the CLI with the previous person's file still executable.
  */
 export function publishActiveTurn(
   sessionDataDir: string,
@@ -416,6 +418,21 @@ export function publishActiveTurn(
   identityTurnId: string | undefined = turnId,
 ): void {
   const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  const runAsTurn = isRunAsTurnId(turnId);
+  if (runAsTurn) {
+    let sameActiveTurn = false;
+    try {
+      const current = readFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), 'utf8').split('\n');
+      sameActiveTurn = current[0] === turnId && current[1] === (callerOpenId ?? '')
+        && current[3] === (identityTurnId ?? turnId ?? '');
+    } catch { /* no readable old marker means this is a new runAs activation */ }
+    if (!sameActiveTurn) {
+      // Deliberately strict: a failure must escape before the live marker changes.
+      for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
+        rmSync(join(dir, `${tool}.env`), { force: true });
+      }
+    }
+  }
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     // turn, caller, identity key and identity turn live in ONE file so readers
@@ -428,7 +445,10 @@ export function publishActiveTurn(
       `${turnId ?? ''}\n${callerOpenId ?? ''}\n${identityTurnId ? identityTurnKey(identityTurnId) : ''}\n${identityTurnId ?? ''}\n`,
       { mode: 0o600 },
     );
-  } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
+  } catch (error) {
+    if (runAsTurn) throw error;
+    // Ordinary turns keep the legacy best-effort marker behavior.
+  }
   try {
     atomicWriteFileSync(
       sessionActiveTurnIdentityPath(sessionDataDir, sessionId),
@@ -1646,11 +1666,22 @@ export function renderIdentityWrapper(
     '  fi',
     '  unset __botmux_d __botmux_cred',
     'fi',
-    // Only enforced when both sides state a turn. An identity published without
-    // one predates turn binding; a session with no live turn file has nothing to
-    // contradict. Neither is evidence of a mismatch, so neither refuses here.
-    `if [ -n "$${TURN_VAR}" ] && [ -n "$__botmux_live" ] \\`,
-    `   && [ "$${TURN_VAR}" != "$__botmux_live" ]; then`,
+    // Ordinary legacy snapshots retain the historical both-sides-present check.
+    // If either side names runAs, however, a missing turn/marker is itself a
+    // refusal: there is no safe legacy identity to fall back to for that turn.
+    '  __botmux_turn_mismatch=',
+    `  if [ -n "$${TURN_VAR}" ] && [ -n "$__botmux_live" ] \\`,
+    `     && [ "$${TURN_VAR}" != "$__botmux_live" ]; then`,
+    '    __botmux_turn_mismatch=1',
+    '  fi',
+    `  case "$__botmux_live:$${TURN_VAR}" in`,
+    '    trg_runas_*:*|*:trg_runas_*)',
+    `      if [ -z "$${TURN_VAR}" ] || [ -z "$__botmux_live" ]; then`,
+    '        __botmux_turn_mismatch=1',
+    '      fi',
+    '      ;;',
+    '  esac',
+    '  if [ -n "$__botmux_turn_mismatch" ]; then',
     `  __botmux_published_mode=$${MODE_VAR}`,
     `  ${MODE_VAR}=turn-mismatch`,
     // Same human across consecutive turns (their follow-up was accepted while
@@ -1658,12 +1689,12 @@ export function renderIdentityWrapper(
     // person the worker is now executing, so keep it. Only a NAMED match on both
     // sides relaxes; anything missing stays a refusal. Restore the published
     // mode (user/user-home/bot) so the case dispatch below runs normally.
-    `  if [ -n "$${OPEN_ID_VAR}" ] && [ -n "$__botmux_live_caller" ] \\`,
+    `  if [ -n "$${TURN_VAR}" ] && [ -n "$${OPEN_ID_VAR}" ] && [ -n "$__botmux_live_caller" ] \\`,
     `     && [ "$${OPEN_ID_VAR}" = "$__botmux_live_caller" ]; then`,
     `    ${MODE_VAR}=$__botmux_published_mode`,
     '  fi',
     'fi',
-    'unset __botmux_live __botmux_live_caller __botmux_published_mode',
+    'unset __botmux_live __botmux_live_caller __botmux_published_mode __botmux_turn_mismatch',
   ];
   return [
     '#!/bin/sh',

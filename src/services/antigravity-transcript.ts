@@ -738,3 +738,14 @@ export function drainAntigravityTranscript(
   }
   return { events, newOffset, pendingTail, state };
 }
+
+/** Read a completed native side turn by its receipt's conversation ID. Refuse
+ * unrelated transcripts, including another side question typed in the TUI. */
+export function readAntigravitySideAnswer(conversationId: string, question: string, brainDir?: string): string | undefined {
+  const path = resolveAntigravityTranscriptPath(conversationId, { brainDir });
+  if (!path) return;
+  const { events } = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+  const input = events.filter(event => event.kind === 'user');
+  if (input.length !== 1 || input[0]!.text.trim() !== question) return;
+  return events.reverse().find(event => event.kind === 'assistant_final')?.text.trim() || undefined;
+}

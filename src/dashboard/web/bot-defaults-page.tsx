@@ -1236,7 +1236,7 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('envelope-injection')}><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
-            {/* 转写回复模式对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
+            {/* 自动转发最终回复开关对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
                 避免用户在别的 tab 找不到这个开关却在 /botconfig 里能设。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('prompt-injection')}>
               <PromptInjectionSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} />
@@ -4844,7 +4844,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   );
 }
 
-function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot, patchBot } = props;
   const bound = bot.larkToolBinding !== false;
@@ -4865,6 +4865,29 @@ function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
+  // 没有发起人时 --as user 用主人的飞书身份。按触发人鉴权覆盖飞书用户身份时只认发起人本人，
+  // 应用绑定关闭时 lark-cli 走本机原生环境：两种情况下这个开关都不起作用。
+  const ownerFallback = bot.larkUserOwnerFallback !== false;
+  const tua = bot.triggerUserAuth;
+  const perPersonLark = tua?.enabled === true
+    && (tua.capabilities ? tua.capabilities.includes('lark-user') : (tua.tools ?? []).includes('lark-cli'));
+  const [fallbackBusy, setFallbackBusy] = useState(false);
+  const [fallbackStatus, setFallbackStatus] = useState<StatusMessage>(null);
+
+  async function saveOwnerFallback(next: boolean): Promise<void> {
+    const previous = ownerFallback;
+    patchBot(bot.larkAppId, { larkUserOwnerFallback: next });
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/lark-user-owner-fallback`, {
+        enabled: next,
+      }),
+      setStatus: setFallbackStatus,
+      setBusy: setFallbackBusy,
+      saved: tr('botDefaults.larkUserOwnerFallbackSaved'),
+      rollback: () => patchBot(bot.larkAppId, { larkUserOwnerFallback: previous }),
+    });
+  }
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionLarkToolBinding')}</h3>
@@ -4878,6 +4901,22 @@ function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
       />
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-lark-tool-binding-status': '' }} />
+      </div>
+      <ToggleRow
+        checked={ownerFallback}
+        disabled={fallbackBusy || !bound || perPersonLark}
+        dataAction="toggle-lark-user-owner-fallback"
+        title={tr('botDefaults.larkUserOwnerFallbackToggle')}
+        help={tr('botDefaults.larkUserOwnerFallbackHelp')}
+        onChange={checked => void saveOwnerFallback(checked)}
+      />
+      {perPersonLark ? (
+        <p className="bd-section-note" data-lark-user-owner-fallback-note="per-person">{tr('botDefaults.larkUserOwnerFallbackPerPerson')}</p>
+      ) : !bound ? (
+        <p className="bd-section-note" data-lark-user-owner-fallback-note="unbound">{tr('botDefaults.larkUserOwnerFallbackUnbound')}</p>
+      ) : null}
+      <div className="actions">
+        <StatusSpan status={fallbackStatus} attr={{ 'data-lark-user-owner-fallback-status': '' }} />
       </div>
     </section>
   );

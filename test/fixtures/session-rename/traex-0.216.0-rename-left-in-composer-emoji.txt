@@ -1,0 +1,23 @@
+
+  ▄▄▄▄▄▄▄
+  █ ◆ ◆ █  TRAE CLI (v0.216.0)
+   ▀▀▀▀▀▀
+  /tmp/repo
+  permissions: YOLO mode
+
+  Tip: Use /compact when the conversation gets long to summarize history and free up context.
+
+
+▍ hello first turn
+
+
+◆ ok
+
+  Worked for <1s • Nov 23 at 18:03
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ok ─
+❯ /rename [BotMux·Lark]    线上告警 👨‍💻 处理
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-model · /tmp/repo · Context 100% left
+  ☢ Full Access (shift+tab to cycle) · ← for agents                                                                                   ⚠ 1 warning · f2 to view

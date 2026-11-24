@@ -15540,11 +15540,13 @@ async function cmdSend(
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
     const sendLocale = localeForBot(appId);
     // REPLY_DELIVERY_ENV is the spawn snapshot of how this pane's final reply
-    // reaches Lark. Under transcript the hint points the model back at its
-    // final reply instead of another `botmux send` (no hard limit on sends:
-    // collaboration and attachments legitimately need several per turn).
-    console.error(t(sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId,
-      replyDeliveryFromEnv(process.env)), undefined, sendLocale));
+    // reaches Lark. Under transcript (auto-forward final reply), normal sends
+    // return null so the receipt stays purely factual with no extra persuasion.
+    const completionHintKey = sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId,
+      replyDeliveryFromEnv(process.env));
+    if (completionHintKey) {
+      console.error(t(completionHintKey, undefined, sendLocale));
+    }
     if (asChoice) {
       console.error(t(
         asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
