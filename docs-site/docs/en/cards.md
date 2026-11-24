@@ -151,9 +151,9 @@ Want only one card? Choose dynamic single card and turn off "**Show a separate s
 
 ### Questions (Ask) live in the card too
 
-`botmux ask` in the same turn, and Claude Code / Codex questions, open right inside the reply card with a "Waiting for your response" title. Once answered, timed out or expired, they fold into the process; multiple questions show one after another without overwriting each other. Multi-select, text answers and answering from the Dashboard all work as usual.
+`botmux ask` in the same turn, and Claude Code / Codex questions, open right inside the reply card with a "Waiting for your response" title when one click answers them (a single single-choice question with no default pick and no box for your own answer, such as a permission confirmation) or when they are answered by a chat reply. Once answered, timed out or expired, they fold into the process; multiple questions show one after another without overwriting each other.
 
-Large forms with more than 16 options or question content over 3000 bytes are still sent as separate cards. Approval / authorization cards are also sent separately.
+Questions you tick or fill in and then Submit (multi-select, default picks, a note or your own answer, several questions at once, input forms) are sent as separate cards: the reply card is redrawn as the turn runs, and inside it your unsubmitted ticks and notes would be wiped. Large forms with more than 16 options or question content over 3000 bytes are also sent as separate cards. Approval / authorization cards are also sent separately.
 
 ### Working with `botmux send`
 
