@@ -16,6 +16,7 @@ import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 import { writeFakeDoubaoTui } from './helpers/fake-doubao-tui.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 let child: ChildProcess | undefined;
@@ -112,7 +113,7 @@ function startScenario() {
   const sendMessage = (turnId: string, content: string) => child!.send({
     type: 'message', turnId, content,
   } satisfies DaemonToWorker);
-  return { messages, logs, assignment, trajectory, waitUntil, control, clear, finals, notices, sendMessage };
+  return { messages, logs, assignment, trajectory, waitUntil, control, clear, finals, notices, sendMessage, dataDir, sessionId };
 }
 
 async function startFirstTurn(s: ReturnType<typeof startScenario>) {
@@ -126,8 +127,10 @@ describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('structured tran
     const s = startScenario();
     await startFirstTurn(s);
     await s.waitUntil(() => s.notices('om_turn_1').length === 1, 'bounded missing-final notice', 45_000);
-    expect(s.notices('om_turn_1')[0]?.message).toContain('没拿到最终回答');
-    expect(s.notices('om_turn_1')[0]?.message).toContain('Web 终端');
+    expect(s.notices('om_turn_1')[0]).toMatchObject({
+      type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn_1',
+    });
+    expect(typeof s.notices('om_turn_1')[0]?.message).toBe('string');
     expect(s.finals('om_turn_1')).toEqual([]);
 
     s.clear('no-trajectory');
@@ -151,6 +154,24 @@ describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('structured tran
     expect(s.notices('om_turn_1')).toEqual([]);
   }, 50_000);
 
+  it('does not post a missing-final warning after this turn was visibly delivered by botmux send', async () => {
+    const s = startScenario();
+    await startFirstTurn(s);
+    // A provider-acknowledged send writes the production per-session marker.
+    // No trajectory final ever appears, so only this exact-turn evidence can
+    // suppress the watchdog's warning at its deadline.
+    recordBridgeReplyMarker({
+      dataDir: s.dataDir, sessionId: s.sessionId, turnId: 'om_turn_1', sentAtMs: Date.now(),
+      responseKind: 'final', deliveryKind: 'current_session_send', messageId: 'om_already_delivered',
+      content: 'ALREADY_DELIVERED_BY_SEND',
+    });
+    await s.waitUntil(() => s.messages.some(msg => msg.type === 'turn_display_retired'
+      && msg.turnId === 'om_turn_1'), 'display retirement after the quiet timeout', 45_000);
+    await pause(1_000);
+    expect(s.notices('om_turn_1')).toEqual([]);
+    expect(s.finals('om_turn_1')).toEqual([]);
+  }, 60_000);
+
   it('does not warn for a stopped turn, and the following turn still delivers', async () => {
     const s = startScenario();
     await startFirstTurn(s);
@@ -158,6 +179,11 @@ describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('structured tran
     child!.send({ type: 'interrupt_turn', requestId: 'stop-missing-final', turnId: 'om_turn_1' } satisfies DaemonToWorker);
     await s.waitUntil(() => s.messages.some(msg => msg.type === 'turn_interrupt_result'
       && msg.requestId === 'stop-missing-final' && msg.delivered), 'exact stop acknowledged');
+    // Cross the whole watchdog deadline while no new owner exists: the stopped
+    // turn must not produce a delayed warning after its display was retired.
+    await pause(22_000);
+    expect(s.notices('om_turn_1')).toEqual([]);
+    expect(s.finals('om_turn_1')).toEqual([]);
 
     s.clear('no-trajectory');
     s.sendMessage('om_turn_2', 'after the stop');

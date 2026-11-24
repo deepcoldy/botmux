@@ -4,7 +4,7 @@ import { StructuredMissingFinalWatchdog } from '../src/services/structured-missi
 import { PtyOutputGeneration } from '../src/utils/runtime-screen-status.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
-function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' | 'transcript' } = {}) {
+function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' | 'transcript'; zeroPrompt?: boolean } = {}) {
   let now = 0;
   const queue = new CodexBridgeQueue(() => now);
   queue.mark('om_turn', 'question', now, opts.attempt);
@@ -12,7 +12,7 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
   const scope: Record<string, any> = {
     lastInitConfig: { cliId, replyDelivery: opts.delivery ?? 'transcript', adoptMode: false },
     replyDeliveryMode: () => opts.delivery ?? 'transcript',
-    zeroPromptTerminalSync: () => false,
+    zeroPromptTerminalSync: () => opts.zeroPrompt === true,
     codexBridgeQueue: queue,
     backgroundTaskTracker: { pendingTurnAgents: () => 0 },
     structuredBridgeIs: (id: string) => id === cliId,
@@ -38,6 +38,8 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     cliName: () => cliId,
     emitReadyCodexTurns: vi.fn(),
     redriveRejectedStructuredReady: vi.fn(),
+    inputDeliveryEvidence: { writeStartedAtMs: () => 0 },
+    submitActivityEvidenceSince: vi.fn(() => undefined),
   };
   scope.structuredMissingFinalTarget = loadWorkerFunction('structuredMissingFinalTarget', scope);
   scope.notifyMissingFinalTurn = loadWorkerFunction('notifyMissingFinalTurn', scope);
@@ -165,6 +167,70 @@ describe('worker: missing structured final timeout', () => {
       type: 'turn_display_retired', turnId: 'om_turn', message: 'worker.structured_final_not_collected',
     }]);
     expect(r.scope.structuredTurnsWithSubmitNotice.size).toBe(0);
+  });
+
+  it('suppresses the warning when this exact turn already has botmux-send evidence', () => {
+    const r = workerRig('doubao');
+    const clock = vi.spyOn(Date, 'now');
+    r.scope.submitActivityEvidenceSince.mockReturnValue('botmux-send');
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
+    expect(r.scope.submitActivityEvidenceSince).toHaveBeenCalledWith(0,
+      expect.objectContaining({ turnId: 'om_turn' }));
+    expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([{
+      type: 'turn_display_retired', turnId: 'om_turn', message: 'worker.structured_final_not_collected',
+    }]);
+  });
+
+  it.each([
+    'background-tasks', 'program-busy', 'antigravity-tasks', 'local-turn', 'not-started',
+  ] as const)('does not retire while the %s guard rejects the target', guard => {
+    const r = workerRig(guard === 'antigravity-tasks' ? 'antigravity' : 'codex');
+    const clock = vi.spyOn(Date, 'now');
+    if (guard === 'background-tasks') r.scope.backgroundTaskTracker.pendingTurnAgents = () => 1;
+    if (guard === 'program-busy') r.scope.idleDetector.programStatusHeldBusy = () => true;
+    if (guard === 'antigravity-tasks') r.scope.hasAntigravityPendingTasks = () => true;
+    if (guard === 'local-turn') r.queue.peek()[0]!.isLocal = true;
+    if (guard === 'not-started') r.queue.peek()[0]!.started = false;
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(100_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    expect(r.scope.codexBridgeIngest).not.toHaveBeenCalled();
+    expect(r.scope.send).not.toHaveBeenCalled();
+  });
+
+  it('revalidates after the deadline drain and keeps a final that really arrived', () => {
+    const r = workerRig('codex');
+    const clock = vi.spyOn(Date, 'now');
+    r.scope.codexBridgeIngest.mockImplementation(() => {
+      r.queue.ingest([{ uuid: 'late-final', timestampMs: 20_000, kind: 'assistant_final', text: 'arrived during drain' }]);
+    });
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.queue.peek()[0]?.finalText).toBe('arrived during drain');
+    expect(r.scope.send).not.toHaveBeenCalled();
+    expect(r.scope.emitTurnTerminal).not.toHaveBeenCalled();
+    expect(r.scope.retireStructuredTurnAttribution).not.toHaveBeenCalled();
+  });
+
+  it('keeps zero-prompt terminal sync eligible even when delivery mode is send', () => {
+    const r = workerRig('codex', { delivery: 'send', zeroPrompt: true });
+    const clock = vi.spyOn(Date, 'now');
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
+    expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([expect.objectContaining({
+      type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn',
+    })]);
   });
 
   it('resets the wait on output and supports a lifecycle-blocked rejected idle edge', () => {

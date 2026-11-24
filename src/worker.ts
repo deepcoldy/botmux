@@ -16979,9 +16979,15 @@ function maybeSettleMissingStructuredFinal(): void {
   }
   retireStructuredTurnAttribution([dropped]);
   if (turn.dispatchAttempt === undefined) {
-    if (structuredTurnsWithSubmitNotice.delete(turn.turnId)) {
-      // This exact input already got its own submit notice. Do not post a second
-      // warning card, but still close any eagerly published working display.
+    const hasSubmitNotice = structuredTurnsWithSubmitNotice.delete(turn.turnId);
+    const deliveredBySend = submitActivityEvidenceSince(inputDeliveryEvidence.writeStartedAtMs({
+      turnId: turn.turnId,
+      dispatchAttempt: turn.dispatchAttempt,
+      cliGeneration: cliSpawnGeneration,
+    }) ?? Date.now(), turn) === 'botmux-send';
+    if (hasSubmitNotice || deliveredBySend) {
+      // This exact input already got its own notice or a user-visible botmux
+      // send. Do not post a contradictory warning; still close the working card.
       send({
         type: 'turn_display_retired',
         turnId: turn.turnId,
