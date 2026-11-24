@@ -152,6 +152,17 @@ describe('obtainCredentials 的 appJustCreated 信号', () => {
     }
   });
 
+  it('网页创建 1.0.0 尊重显式 autoAvoidApproval=false，不被 appJustCreated 默认值覆盖', async () => {
+    mocks.createFeishuOpenPlatformApp.mockResolvedValue({ ok: true, appId: 'cli_web_optout', appSecret: 'web-secret' });
+
+    const creds = await obtainCredentials(fakeRl(['', '']), { autoAvoidApproval: false });
+
+    expect(mocks.createFeishuOpenPlatformApp).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      autoAvoidApproval: false,
+    }));
+    expect(creds.ok).toBe(true);
+  });
+
   it('网页创建 1.0.0 触发审批兼容时透传 approvalDeferredScopes 与审批人信息给后续 1.0.1', async () => {
     mocks.createFeishuOpenPlatformApp.mockResolvedValue({
       ok: true,

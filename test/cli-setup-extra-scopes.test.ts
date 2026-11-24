@@ -20,7 +20,9 @@ const mocks = vi.hoisted(() => ({
   onReadDefaultScopeManifest: vi.fn(),
   startBotViaSupervisor: vi.fn(),
   validateCredentials: vi.fn(),
+  rmwBotEntry: vi.fn(),
 }));
+const configStoreActual = vi.hoisted(() => ({ rmwBotEntry: undefined as any }));
 
 vi.mock('../src/setup/open-platform-automation.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/setup/open-platform-automation.js')>();
@@ -45,6 +47,12 @@ vi.mock('../src/setup/registration-manifest.js', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   completeRegisteredApp: mocks.completeRegisteredApp,
 }));
+
+vi.mock('../src/services/config-store.js', async importOriginal => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  configStoreActual.rmwBotEntry = actual.rmwBotEntry;
+  return { ...actual, rmwBotEntry: mocks.rmwBotEntry };
+});
 
 vi.mock('../src/core/fleet-runtime.js', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -114,6 +122,7 @@ function manifestPassedToAutomation(): any {
 
 beforeEach(() => {
   for (const fn of Object.values(mocks)) fn.mockReset();
+  mocks.rmwBotEntry.mockImplementation((...args) => configStoreActual.rmwBotEntry(...args));
   mocks.automateOpenPlatformSetup.mockResolvedValue({
     ok: true,
     sessionSource: 'botmux_cache',
@@ -527,6 +536,123 @@ describe('setup add --extra-scopes-file', () => {
     expect(out.ok).toBe(true);
     expect(out.bot.approvalDeferredScopes).toBeUndefined();
     expect(readBots()[0]?.approvalDeferredScopes).toBeUndefined();
+  });
+
+  it('commit 失败结果中的新暂缓权限仍与历史记录并集落盘', async () => {
+    writeBots([botEntry('cli_commit_unknown', {
+      approvalDeferredScopes: { user: ['offline_access'] },
+    })]);
+    mocks.automateOpenPlatformSetup.mockResolvedValue({
+      ok: false,
+      reason: 'api_error',
+      message: 'commit response lost',
+      approvalAutoPassed: true,
+      approvalDeferredScopes: [{ bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' }],
+      approvalCompatibility: {
+        triggered: true,
+        resolvedAutoApproved: true,
+        deferredScopes: [{ bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' }],
+        disabledRefreshToken: false,
+        initialHumanApprovers: ['审批人'],
+        remainingHumanApprovers: [],
+        probeCount: 2,
+        stopReason: 'resolved_exact',
+      },
+    });
+
+    await cmdSetupScripted(['configure', 'cli_commit_unknown', '--json']);
+
+    expect(readBots()[0].approvalDeferredScopes).toEqual({
+      tenant: ['im:message.group_msg'],
+      user: ['offline_access'],
+    });
+    expect(lastJson()).toMatchObject({ ok: false, partial: true });
+  });
+
+  it('configure --json 将暂缓记录落盘失败返回为结构化 partial failure', async () => {
+    writeBots([botEntry('cli_json_persist_failure')]);
+    mocks.automateOpenPlatformSetup.mockResolvedValue({
+      ok: true,
+      sessionSource: 'botmux_cache',
+      scopeCount: 0,
+      skippedScopeCount: 0,
+      privilegeRangeCount: 0,
+      subscribedEventCount: 5,
+      missingVcEvents: [],
+      eventModeReady: true,
+      redirectConfigured: true,
+      versionId: 'v-deferred',
+      approvalAutoPassed: true,
+      approvalDeferredScopes: [{ bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' }],
+    });
+    mocks.rmwBotEntry.mockResolvedValue({ ok: false, reason: 'forced_disk_full' });
+
+    await cmdSetupScripted(['configure', 'cli_json_persist_failure', '--json']);
+
+    const out = lastJson();
+    expect(out).toMatchObject({
+      ok: false,
+      partial: true,
+      action: 'configure',
+      next: 'botmux setup configure cli_json_persist_failure',
+    });
+    expect(out.openPlatform.approvalDeferredPersistWarning).toContain('forced_disk_full');
+    expect(mocks.startBotViaSupervisor).not.toHaveBeenCalled();
+  });
+
+  it('add --json 将暂缓记录落盘失败返回为结构化 partial failure 且不重复创建应用', async () => {
+    writeBots([]);
+    mocks.automateOpenPlatformSetup.mockResolvedValue({
+      ok: true,
+      sessionSource: 'botmux_cache',
+      scopeCount: 0,
+      skippedScopeCount: 0,
+      privilegeRangeCount: 0,
+      subscribedEventCount: 5,
+      missingVcEvents: [],
+      eventModeReady: true,
+      redirectConfigured: true,
+      versionId: 'v-deferred',
+      approvalAutoPassed: true,
+      approvalDeferredScopes: [{ bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' }],
+    });
+    mocks.rmwBotEntry.mockResolvedValue({ ok: false, reason: 'forced_disk_full' });
+
+    await cmdSetupScripted([
+      'add', '--app-id', 'cli_add_persist_failure', '--app-secret', 'secret',
+      '--allowed-users', 'a@b.com', '--working-dir', scratch, '--open-platform-auto', '--json',
+    ]);
+
+    const out = lastJson();
+    expect(out).toMatchObject({
+      ok: false,
+      partial: true,
+      action: 'add',
+      appId: 'cli_add_persist_failure',
+      next: 'botmux setup configure cli_add_persist_failure',
+    });
+    expect(out.openPlatform.approvalDeferredPersistWarning).toContain('forced_disk_full');
+    expect(mocks.startBotViaSupervisor).not.toHaveBeenCalled();
+    expect(mocks.createFeishuOpenPlatformApp).not.toHaveBeenCalled();
+  });
+
+  it('clone 源显式关闭避审时，创建 1.0.0 前就透传 autoAvoidApproval=false', async () => {
+    writeBots([botEntry('cli_clone_optout', { autoAvoidApproval: false })]);
+    mocks.inspectCachedFeishuOpenPlatformSession.mockResolvedValue({
+      ok: true,
+      identity: { userId: 'u_clone', userName: 'Clone Owner', tenantId: 't_clone', tenantName: 'Clone Corp' },
+    });
+    mocks.createFeishuOpenPlatformApp.mockResolvedValue({
+      ok: true, appId: 'cli_clone_target', appSecret: 'secret-clone', brand: 'feishu',
+    });
+
+    await cmdSetupScripted([
+      'add', '--create-app', '--allowed-users', 'a@b.com', '--working-dir', scratch, '--json',
+    ], readBots()[0]);
+
+    expect(mocks.createFeishuOpenPlatformApp).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      autoAvoidApproval: false,
+    }));
   });
 
   it('setup configure 尊重 bots.json 中 autoAvoidApproval: false 开关', async () => {

@@ -1951,10 +1951,11 @@ export class BotOnboardingManager {
     });
     const mergedDeferredScopes = mergeDeferredApprovalScopes(
       initialApprovalDeferredScopes,
-      rawAuto.ok ? rawAuto.approvalDeferredScopes : undefined,
+      rawAuto.approvalDeferredScopes,
     );
-    const mergedDisabledRefreshToken =
-      initialApprovalDisabledRefreshToken || (rawAuto.ok && rawAuto.approvalDisabledRefreshToken === true);
+    const mergedDisabledRefreshToken = Boolean(
+      initialApprovalDisabledRefreshToken || rawAuto.approvalDisabledRefreshToken,
+    );
     const auto: OpenPlatformAutomationResult = rawAuto.ok
       ? {
           ...rawAuto,
@@ -1975,7 +1976,11 @@ export class BotOnboardingManager {
               }
             : {}),
         }
-      : rawAuto;
+      : {
+          ...rawAuto,
+          ...(mergedDeferredScopes.length > 0 ? { approvalDeferredScopes: mergedDeferredScopes } : {}),
+          ...(mergedDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+        };
     const deferredBuckets = deferredScopesToBuckets(mergedDeferredScopes);
     if (deferredBuckets) {
       // 落盘到 bots.json（含 needs_owner → submitOwner 路径），避免 daemon 启动权限自愈
@@ -2295,7 +2300,9 @@ export class BotOnboardingManager {
         },
         onStatus: (msg: string) => this.patch(id, { permissionStatusMsg: msg }),
       }, sessionFilePath, requireCriticalScopesBeforeActivation, false, undefined, targetAutoAvoidApproval);
-      if (result.ok) await this.syncBotApprovalDeferredScopes(appId, addedBotIndex, result);
+      if (result.ok || result.approvalDeferredScopes?.length) {
+        await this.syncBotApprovalDeferredScopes(appId, addedBotIndex, result);
+      }
       return result;
     });
     if (!auto.ok) {
@@ -2346,7 +2353,7 @@ export class BotOnboardingManager {
   private async syncBotApprovalDeferredScopes(
     appId: string,
     addedBotIndex: number,
-    auto: Extract<OpenPlatformAutomationResult, { ok: true }>,
+    auto: OpenPlatformAutomationResult,
   ): Promise<void> {
     // 快路径：新旧都没有任何 approvalDeferredScopes 时不触发额外的持久化写事务。
     const preRead = readBotsJsonOrEmpty(this.opts.botsJsonPath);
@@ -2447,10 +2454,10 @@ export class BotOnboardingManager {
               }
             : {}),
           ...(auto.approvalDeferredScopes?.length
-            ? {
-                approvalDeferredScopes: auto.approvalDeferredScopes,
-                approvalConsoleUrl: buildApprovalConsoleUrl(appId, brand),
-              }
+            ? { approvalDeferredScopes: auto.approvalDeferredScopes }
+            : {}),
+          ...(auto.approvalDeferredScopes?.length || auto.approvalDisabledRefreshToken
+            ? { approvalConsoleUrl: buildApprovalConsoleUrl(appId, brand) }
             : {}),
           ...(auto.approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
           ...(auto.approvalCompatibility?.initialHumanApprovers.length
@@ -2466,6 +2473,16 @@ export class BotOnboardingManager {
           versionId: auto.versionId,
           redirectConfigured: auto.redirectConfigured,
           redirectWarning: auto.redirectWarning,
+          ...(auto.approvalDeferredScopes?.length
+            ? { approvalDeferredScopes: auto.approvalDeferredScopes }
+            : {}),
+          ...(auto.approvalDeferredScopes?.length || auto.approvalDisabledRefreshToken
+            ? { approvalConsoleUrl: buildApprovalConsoleUrl(appId, brand) }
+            : {}),
+          ...(auto.approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+          ...(auto.approvalCompatibility?.initialHumanApprovers.length
+            ? { approvalInitialApprovers: auto.approvalCompatibility.initialHumanApprovers }
+            : {}),
         };
     // 「卡在企业审核」要落日志：Dashboard 弹窗一关就看不到了，排查时日志是唯一记录。
     if (auto.ok && auto.versionPendingReview) {

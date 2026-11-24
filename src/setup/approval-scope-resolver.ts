@@ -238,10 +238,11 @@ export type PersistedDeferredScopesDecision =
  * Decide how to update persisted `bot.approvalDeferredScopes` after a successful
  * `automateOpenPlatformSetup` call.
  *
- * Only clear an existing deferral list when the run cleanly proves the full target
- * manifest passed without warning (`!scopeWarning && !versionWarning && (approvalAutoPassed || publishSkipped)`).
- * On inconclusive runs (`approvalAutoPassed === undefined` / `known: false`), human-review
- * runs (`approvalAutoPassed === false`), `scopeWarning`, or `versionWarning`, never wipe
+ * Only clear an existing deferral list when a successful run cleanly proves the full target
+ * manifest passed without warning (`ok !== false`, zero skipped scopes, no scope/version warning,
+ * and confirmed auto-pass or a no-op publish skip).
+ * On inconclusive/failed runs (`ok: false`, `approvalAutoPassed === undefined` / `known: false`),
+ * human-review runs, skipped catalog scopes, `scopeWarning`, or `versionWarning`, never wipe
  * previously recorded deferrals — only union any newly discovered deferrals onto them.
  */
 export function resolveNextPersistedApprovalDeferredScopes(
@@ -252,13 +253,17 @@ export function resolveNextPersistedApprovalDeferredScopes(
     versionPendingReview?: boolean;
     approvalAutoPassed?: boolean;
     publishSkipped?: boolean;
+    skippedScopeCount?: number;
+    ok?: boolean;
   },
   mergedDeferred: readonly DeferredApprovalScope[],
 ): PersistedDeferredScopesDecision {
   const nextBuckets = deferredScopesToBuckets(mergedDeferred);
-  const cleanVerified = !result.scopeWarning
+  const cleanVerified = result.ok !== false
+    && !result.scopeWarning
     && !result.versionWarning
     && !result.versionPendingReview
+    && (result.skippedScopeCount ?? 0) === 0
     && (result.approvalAutoPassed === true || result.publishSkipped === true);
 
   if (cleanVerified) {

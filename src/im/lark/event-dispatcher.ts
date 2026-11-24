@@ -427,7 +427,7 @@ async function tryWebAutoFixScopes(
           );
         },
       });
-      const deferredPersistWarning = result.ok
+      const deferredPersistWarning = result.approvalDeferredScopes?.length
         ? await persistDiscoveredApprovalDeferrals(larkAppId, bot, result.approvalDeferredScopes)
         : undefined;
       return { result, deferredPersistWarning };
@@ -1250,7 +1250,7 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
           logger.warn(`[${larkAppId}] vc-event-autoconfig: cached Feishu web session expired; run \`botmux setup\` to refresh, then restart.`);
         },
       });
-      const deferredPersistWarning = result.ok
+      const deferredPersistWarning = result.approvalDeferredScopes?.length
         ? await persistDiscoveredApprovalDeferrals(larkAppId, bot, result.approvalDeferredScopes)
         : undefined;
       return { result, deferredPersistWarning };

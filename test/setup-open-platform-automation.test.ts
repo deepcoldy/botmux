@@ -4966,6 +4966,62 @@ describe('draft-time approval compatibility (1.0.0 & 1.0.1)', () => {
     expect(result.scopeCount).toBe(2);
   });
 
+  it('keeps resolved approval deferrals when publish/commit fails after the draft was reduced', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-approval-commit-failure-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_commit_failure');
+    const staged = new Set<string>();
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_commit_failure/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/safe_setting/cli_commit_failure') {
+        return Response.json({ code: 0, data: { allowRefreshToken: false, redirectURL: [BOTMUX_REDIRECT_URL], ipWhiteList: [], safeServerDomain: [] } });
+      }
+      if (path === '/developers/v1/scope/all/cli_commit_failure') {
+        return Response.json({ code: 0, data: { scopes: [
+          { id: '100', name: 'im:message', scopeType2ScopeLevel: { '2': 3 }, scopeType2ScopeStatus: { '2': 0 } },
+          { id: '202', name: 'im:message.group_msg', scopeType2ScopeLevel: { '2': 4 }, scopeType2ScopeStatus: { '2': 0 } },
+        ] } });
+      }
+      if (path === '/developers/v1/scope/update/cli_commit_failure') {
+        const body = JSON.parse(String(init?.body));
+        for (const id of body.appScopeIDs ?? []) {
+          if (body.operation === 'del') staged.delete(`tenant:${id}`);
+          else staged.add(`tenant:${id}`);
+        }
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/privilege/all/cli_commit_failure') return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      if (path === '/developers/v1/app_version/list/cli_commit_failure') return Response.json({ code: 0, data: { versions: [{ appVersion: '1.0.0', versionId: 'v-100', versionStatus: 2 }] } });
+      if (path === '/developers/v1/app_version/create/cli_commit_failure') return Response.json({ code: 0, data: { versionId: 'v-101' } });
+      if (path === '/developers/v1/approval_nodes/get/cli_commit_failure') {
+        return Response.json(staged.has('tenant:202') ? humanApprovalFlow : autoPassFlow);
+      }
+      if (path.includes('/publish/commit/')) return Response.json({ code: 500, msg: 'response lost after commit' }, { status: 500 });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_commit_failure',
+      brand: 'feishu',
+      sessionFilePath: sessionFile,
+      disableBytedcliFallback: true,
+      autoAvoidApproval: true,
+      scopeManifest: { scopes: { tenant: ['im:message', 'im:message.group_msg'], user: [] } },
+      fetchImpl,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.approvalCompatibility).toMatchObject({ resolvedAutoApproved: true });
+    expect(result.approvalDeferredScopes).toEqual([
+      expect.objectContaining({ bucket: 'tenant', name: 'im:message.group_msg' }),
+    ]);
+    expect(staged.has('tenant:202')).toBe(false);
+  });
+
   it('🔴 mutation_failed 且还原未完成时，1.0.1 与 1.0.0 均 fail-closed 中止 publish/commit，绝不发布残缺草稿', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-approval-failclosed-'));
     const sessionFile = join(dir, 'feishu-session.json');
@@ -5031,6 +5087,12 @@ describe('draft-time approval compatibility (1.0.0 & 1.0.1)', () => {
     });
     expect(r101.ok).toBe(false);
     expect(commit101Called).toBe(false);
+    expect(r101.approvalCompatibility).toMatchObject({
+      stopReason: 'mutation_failed',
+      restored: false,
+    });
+    // 失败发生在任何权限被精确定位之前，不虚构 deferral；诊断本身仍必须保留。
+    expect(r101.approvalDeferredScopes).toBeUndefined();
 
     // 1.0.0 场景：同样在 mutation_failed 且 !restored 时中止 commit（并保留 appId 避免重复建应用）
     let commit100Called = false;

@@ -291,6 +291,8 @@ export type OpenPlatformAutomationResult =
       approvalDisabledRefreshToken?: boolean;
       /** 审批兼容自动排查的结构化诊断结果（仅在初始预判需人工审批时有值）。 */
       approvalCompatibility?: ApprovalCompatibilityOutcome;
+      /** 平台处理完成，但本地 approvalDeferredScopes 持久化失败；--json 必须显式暴露。 */
+      approvalDeferredPersistWarning?: string;
     }
   | {
       ok: false;
@@ -335,6 +337,15 @@ export type OpenPlatformAutomationResult =
       verifiedEventCount?: number;
       /** Exact published version ACK, preserved across later scope propagation failure. */
       versionId?: string;
+      /** 提交结果未知/失败时仍需保留的审批兼容结果，供调用方防止回灌已删减权限。 */
+      approvalDeferredScopes?: DeferredApprovalScope[];
+      approvalDisabledRefreshToken?: boolean;
+      approvalCompatibility?: ApprovalCompatibilityOutcome;
+      /** 审批预判状态（成功解析并已见证时可能为 true；失败不等于 false）。 */
+      approvalAutoPassed?: boolean;
+      approvalHumanApprovers?: string[];
+      /** 平台处理完成或结果未知时，本地暂缓记录仍落盘失败。 */
+      approvalDeferredPersistWarning?: string;
       /**
        * `app_under_review` 专用：当前那个**待审版本**的 id（读不到时 undefined）。
        * 只用于上层「同一个待审版本别重复打扰管理员」的节流 key —— undefined 时上层
@@ -1836,6 +1847,10 @@ export async function automateOpenPlatformSetup(
   let csrfToken: string | null = null;
   let apiOrigin = defaultOrigin;
   let appHome = defaultAppHome;
+  // Approval diagnostics must survive every later commit/readback failure path.
+  let approvalDeferredScopes: DeferredApprovalScope[] | undefined;
+  let approvalDisabledRefreshToken: boolean | undefined;
+  let approvalCompatibility: ApprovalCompatibilityOutcome | undefined;
   try {
     const authPage = await session.fetchTextWithUrl(fetcher, `${defaultAppHome}/auth`);
     apiOrigin = new URL(authPage.finalUrl).origin;
@@ -2464,9 +2479,6 @@ export async function automateOpenPlatformSetup(
     let approvalHumanApprovers: string[] | undefined;
     let versionPendingReview: boolean | undefined;
     let pendingReviewAppVersion: string | undefined;
-    let approvalDeferredScopes: DeferredApprovalScope[] | undefined;
-    let approvalDisabledRefreshToken: boolean | undefined;
-    let approvalCompatibility: ApprovalCompatibilityOutcome | undefined;
     if (versionId) {
       // 提交前先问一句「这一版提交后会不会秒过」。判据见 {@link predictApprovalFlow}：
       // 全自动通过 + 零真人审批人 ⟹ 提交不打扰任何人、立即生效，尽管提。
@@ -2522,6 +2534,7 @@ export async function automateOpenPlatformSetup(
           onStatus: options.onStatus,
         });
         approvalCompatibility = compat;
+        if (compat.deferredScopes.length > 0) approvalDeferredScopes = compat.deferredScopes;
         if (!compat.resolvedAutoApproved && compat.restored === false) {
           return {
             ok: false,
@@ -2534,13 +2547,15 @@ export async function automateOpenPlatformSetup(
             eventModeReady,
             redirectConfigured,
             redirectWarning,
+            approvalCompatibility,
+            ...(approvalDeferredScopes?.length ? { approvalDeferredScopes } : {}),
+            ...(approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
           };
         }
         if (compat.resolvedAutoApproved) {
           approvalAutoPassed = true;
           approvalHumanApprovers = undefined;
           if (compat.deferredScopes.length > 0) {
-            approvalDeferredScopes = compat.deferredScopes;
             importedScopeCount = Math.max(0, importedScopeCount - compat.deferredScopes.length);
           }
           if (compat.disabledRefreshToken) {
@@ -2635,6 +2650,9 @@ export async function automateOpenPlatformSetup(
       eventModeReady,
       redirectConfigured,
       redirectWarning,
+      ...(approvalCompatibility ? { approvalCompatibility } : {}),
+      ...(approvalDeferredScopes?.length ? { approvalDeferredScopes } : {}),
+      ...(approvalDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
     };
   }
   });

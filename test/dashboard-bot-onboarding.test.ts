@@ -2898,6 +2898,50 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('surfaces the approval console link when only refresh-token was disabled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-refresh-only-'));
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ email: 'owner@corp.com', user_id: 'ou_refresh_only' }] },
+    });
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      createApp: async () => ({
+        ok: true,
+        appId: 'cli_refresh_only',
+        appSecret: 'sec',
+        brand: 'feishu',
+        sessionSource: 'botmux_cache',
+        sessionIdentity: { userId: 'u1', userName: 'Tester', email: 'owner@corp.com', tenantId: 't1', tenantName: 'Corp' },
+        approvalDisabledRefreshToken: true,
+        approvalCompatibility: {
+          triggered: true,
+          resolvedAutoApproved: true,
+          deferredScopes: [],
+          disabledRefreshToken: true,
+          initialHumanApprovers: ['审批人'],
+          remainingHumanApprovers: [],
+          probeCount: 1,
+          stopReason: 'resolved_exact',
+        },
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({ registrationMode: 'web' });
+    await job.done;
+
+    expect(manager.get(job.id)?.permission).toMatchObject({
+      ok: true,
+      approvalDisabledRefreshToken: true,
+      approvalConsoleUrl: 'https://open.feishu.cn/app/cli_refresh_only/auth',
+    });
+    expect(manager.get(job.id)?.permission?.approvalDeferredScopes).toBeUndefined();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('persists approvalDeferredScopes across the needs_owner -> submitOwner path', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-approval-owner-'));
     const botsJsonPath = join(dir, 'bots.json');
@@ -2987,6 +3031,61 @@ describe('BotOnboardingManager', () => {
       tenant: ['contact:user.base:readonly'],
     });
 
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('persists and displays deferrals even when recovery commit outcome is failed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-recovery-deferred-failure-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_recover_failure',
+      larkAppSecret: 'secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+      approvalDeferredScopes: { user: ['offline_access'] },
+    }]));
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      automateOpenPlatform: async () => ({
+        ok: false,
+        reason: 'api_error',
+        message: 'commit response lost',
+        approvalAutoPassed: true,
+        approvalDeferredScopes: [{ bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' }],
+        approvalCompatibility: {
+          triggered: true,
+          resolvedAutoApproved: true,
+          deferredScopes: [{ bucket: 'tenant', name: 'im:message.group_msg', isolation: 'exact', group: 'core_im' }],
+          disabledRefreshToken: false,
+          initialHumanApprovers: ['审批人'],
+          remainingHumanApprovers: [],
+          probeCount: 2,
+          stopReason: 'resolved_exact',
+        },
+      }),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_recover_failure',
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0].approvalDeferredScopes).toEqual({
+      tenant: ['im:message.group_msg'],
+      user: ['offline_access'],
+    });
+    expect(manager.get(started.job.id)?.permission).toMatchObject({
+      ok: false,
+      approvalConsoleUrl: 'https://open.feishu.cn/app/cli_recover_failure/auth',
+      approvalDeferredScopes: [expect.objectContaining({ name: 'im:message.group_msg' })],
+    });
     rmSync(dir, { recursive: true, force: true });
   });
 

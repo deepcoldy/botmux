@@ -594,6 +594,27 @@ describe('checkRequiredScopes — approvalDeferredScopes 保护', () => {
     expect(sentBuckets.user).not.toContain('im:chat:read');
   });
 
+  it('persists deferrals from a failed commit outcome before falling back', async () => {
+    const deferredScope = 'im:message.group_msg';
+    h.automate.mockResolvedValue({
+      ok: false,
+      reason: 'api_error',
+      message: 'commit response lost',
+      approvalDeferredScopes: [{ bucket: 'tenant', name: deferredScope, isolation: 'exact', group: 'core_im' }],
+    });
+    stubLark({ granted: [...critical, ...optional].filter(name => name !== deferredScope) });
+
+    await checkRequiredScopes(APP);
+
+    expect(h.persistDeferred).toHaveBeenCalledWith(
+      APP,
+      [expect.objectContaining({ name: deferredScope })],
+      expect.objectContaining({ onCommitted: expect.any(Function) }),
+    );
+    expect(h.bot.config.approvalDeferredScopes).toEqual({ tenant: [deferredScope] });
+    expect(h.register).not.toHaveBeenCalled();
+  });
+
   it('persists a newly deferred critical scope, reports it as pending, and does not request it again', async () => {
     const deferredScope = 'im:message.group_msg';
     h.bot = makeBot({ approvalDeferredScopes: { user: ['offline_access'] } });

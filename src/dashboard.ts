@@ -1834,7 +1834,7 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
           onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
         });
         let deferredPersistWarning = '';
-        if (result.ok && result.approvalDeferredScopes?.length) {
+        if (result.approvalDeferredScopes?.length) {
           const persisted = await persistNewApprovalDeferredScopes(targetAppId, result.approvalDeferredScopes, {
             onCommitted: buckets => {
               bot.approvalDeferredScopes = mergeApprovalDeferredScopeBuckets(bot.approvalDeferredScopes, buckets);
@@ -6566,7 +6566,7 @@ const server = createServer(async (req, res) => {
         workingDir,
         dirMode,
         model,
-        ...(parsed.autoAvoidApproval === false ? { autoAvoidApproval: false } : {}),
+        ...(typeof parsed.autoAvoidApproval === 'boolean' ? { autoAvoidApproval: parsed.autoAvoidApproval } : {}),
         ...(parsed.requireCriticalScopesBeforeActivation === true
           ? { requireCriticalScopesBeforeActivation: true }
           : {}),

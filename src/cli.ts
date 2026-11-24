@@ -980,44 +980,48 @@ async function finishOpenPlatformSetup(
           autoAvoidApproval: options.autoAvoidApproval ?? true,
         });
 
-    const mergedDeferredScopes = rawResult.ok
-      ? mergeDeferredApprovalScopes(options.initialApprovalDeferredScopes, rawResult.approvalDeferredScopes)
-      : [];
-    const mergedDisabledRefreshToken = rawResult.ok
-      ? Boolean(options.initialApprovalDisabledRefreshToken || rawResult.approvalDisabledRefreshToken)
-      : false;
-    const mergedInitialApprovers = rawResult.ok
-      ? (rawResult.approvalCompatibility?.initialHumanApprovers.length
-          ? rawResult.approvalCompatibility.initialHumanApprovers
-          : (options.initialApprovalApprovers ?? []))
-      : [];
-    const result: import('./setup/open-platform-automation.js').OpenPlatformAutomationResult = rawResult.ok
-      ? {
-          ...rawResult,
-          ...(mergedDeferredScopes.length > 0 ? { approvalDeferredScopes: mergedDeferredScopes } : {}),
-          ...(mergedDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
-          ...(mergedInitialApprovers.length > 0 && !rawResult.approvalCompatibility
-            ? {
-                approvalCompatibility: {
-                  triggered: true,
-                  resolvedAutoApproved: true,
-                  deferredScopes: mergedDeferredScopes,
-                  disabledRefreshToken: mergedDisabledRefreshToken,
-                  initialHumanApprovers: mergedInitialApprovers,
-                  remainingHumanApprovers: [],
-                  probeCount: 0,
-                  stopReason: 'resolved_exact' as const,
-                },
-              }
-            : {}),
-        }
-      : rawResult;
+    const mergedDeferredScopes = mergeDeferredApprovalScopes(
+      options.initialApprovalDeferredScopes,
+      rawResult.approvalDeferredScopes,
+    );
+    const mergedDisabledRefreshToken = Boolean(
+      options.initialApprovalDisabledRefreshToken || rawResult.approvalDisabledRefreshToken,
+    );
+    const mergedInitialApprovers = rawResult.approvalCompatibility?.initialHumanApprovers.length
+      ? rawResult.approvalCompatibility.initialHumanApprovers
+      : (options.initialApprovalApprovers ?? []);
+    const result = {
+      ...rawResult,
+      ...(mergedDeferredScopes.length > 0 ? { approvalDeferredScopes: mergedDeferredScopes } : {}),
+      ...(mergedDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+      ...(rawResult.ok && mergedInitialApprovers.length > 0 && !rawResult.approvalCompatibility
+        ? {
+            approvalCompatibility: {
+              triggered: true,
+              resolvedAutoApproved: true,
+              deferredScopes: mergedDeferredScopes,
+              disabledRefreshToken: mergedDisabledRefreshToken,
+              initialHumanApprovers: mergedInitialApprovers,
+              remainingHumanApprovers: [],
+              probeCount: 0,
+              stopReason: 'resolved_exact' as const,
+            },
+          }
+        : {}),
+    } as import('./setup/open-platform-automation.js').OpenPlatformAutomationResult;
 
     let deferredPersistWarning: string | undefined;
-    if (result.ok) {
+    const canCleanExistingDeferrals = result.ok
+      && !result.scopeWarning
+      && !result.versionWarning
+      && !result.versionPendingReview
+      && (result.skippedScopeCount ?? 0) === 0
+      && (result.approvalAutoPassed === true || result.publishSkipped === true);
+    if (mergedDeferredScopes.length > 0 || canCleanExistingDeferrals) {
       const persisted = await persistBotApprovalDeferredScopes(appId, result, mergedDeferredScopes);
       if (!persisted.ok && persisted.reason !== 'bot_not_in_config') {
         deferredPersistWarning = `未能把审批暂缓权限记录写入 bots.json（${persisted.reason}）`;
+        result.approvalDeferredPersistWarning = deferredPersistWarning;
       }
     }
     return { result, mergedDeferredScopes, mergedDisabledRefreshToken, mergedInitialApprovers, deferredPersistWarning };
@@ -1295,7 +1299,7 @@ async function pickExistingAppCredentials(
  */
 export async function obtainCredentials(
   rl: ReturnType<typeof createInterface>,
-  options: { isFirstStep?: boolean } = {},
+  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean } = {},
 ): Promise<
   | {
       ok: true;
@@ -1386,6 +1390,7 @@ export async function obtainCredentials(
           ? { disableQrLogin: true, expectedIdentity }
           : { forceQrLogin: true }),
         disableBytedcliFallback: true,
+        autoAvoidApproval: options.autoAvoidApproval !== false,
         onSessionReady: ({ identity, source }) => {
           process.stderr.write(`已确认飞书账号：${identity.userName} · ${identity.tenantName}${source === 'botmux_cache' ? '（免扫码）' : ''}\n`);
         },
@@ -1541,7 +1546,7 @@ async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Prom
  */
 async function promptBotConfig(
   rl: ReturnType<typeof createInterface>,
-  options: { isFirstStep?: boolean } = {},
+  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean } = {},
 ): Promise<Record<string, any> | null> {
   const creds = await obtainCredentials(rl, options);
   if (!creds.ok) return null;
@@ -1976,7 +1981,7 @@ function parseDotEnvToBotConfig(): Record<string, any> {
  */
 async function writeSingleBotConfig(
   botsSnapshot: readonly any[],
-  options: { isFirstStep?: boolean } = {},
+  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean } = {},
 ): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const bot = await promptBotConfig(rl, options);
@@ -2056,7 +2061,7 @@ async function persistBotExtraScopesFile(larkAppId: string, value: string | null
  */
 async function persistBotApprovalDeferredScopes(
   larkAppId: string,
-  result: Extract<import('./setup/open-platform-automation.js').OpenPlatformAutomationResult, { ok: true }>,
+  result: import('./setup/open-platform-automation.js').OpenPlatformAutomationResult,
   mergedDeferred: readonly import('./setup/approval-scope-resolver.js').DeferredApprovalScope[],
 ): Promise<
   | { ok: true; buckets: import('./setup/approval-scope-resolver.js').ApprovalDeferredScopeBuckets | undefined }
@@ -2225,6 +2230,24 @@ export async function cmdSetupScripted(
       const onDisk = loadBotsJson().find(b => b?.larkAppId === bot.larkAppId);
       if (onDisk?.approvalDeferredScopes) bot.approvalDeferredScopes = onDisk.approvalDeferredScopes;
       else delete bot.approvalDeferredScopes;
+    }
+    if (openPlatform.status !== 'skipped' && openPlatform.result.approvalDeferredPersistWarning) {
+      const continueCommand = setupOpenPlatformRetryCommand(bot.larkAppId, openPlatform)!;
+      failSetupScripted(
+        cmd.json,
+        `开放平台处理完成，但审批暂缓记录未能写入 bots.json（${openPlatform.result.approvalDeferredPersistWarning}）。机器人配置保留，未自动上线；请重试 ${continueCommand}。`,
+        {
+          partial: true,
+          action: 'configure',
+          bot: botJsonView(bot, index),
+          appId: bot.larkAppId,
+          openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+          ...extraScopesJson,
+          continueCommand,
+          next: continueCommand,
+        },
+      );
+      return;
     }
     if (openPlatform.status === 'failed' || openPlatform.status === 'manual') {
       const continueCommand = setupOpenPlatformRetryCommand(bot.larkAppId, openPlatform);
@@ -2528,6 +2551,7 @@ export async function cmdSetupScripted(
             ...(cmd.flags.appIcon?.trim() ? { iconFilePath: resolve(cmd.flags.appIcon.trim()) } : {}),
             ...sessionOptions,
             disableBytedcliFallback: true,
+            autoAvoidApproval: cloneSource?.autoAvoidApproval !== false,
             onSessionReady: ({ identity, source }) => {
               process.stderr.write(`已确认飞书账号：${identity.userName} · ${identity.tenantName}${source === 'botmux_cache' ? '（免扫码）' : ''}\n`);
             },
@@ -2713,6 +2737,29 @@ export async function cmdSetupScripted(
         if (onDisk?.approvalDeferredScopes) bot.approvalDeferredScopes = onDisk.approvalDeferredScopes;
         else delete bot.approvalDeferredScopes;
       }
+    }
+
+    if (openPlatform.status !== 'skipped' && openPlatform.result.approvalDeferredPersistWarning) {
+      const continueCommand = setupOpenPlatformRetryCommand(bot.larkAppId, openPlatform)!;
+      const index = existing.length;
+      failSetupScripted(
+        cmd.json,
+        `机器人配置已写入，但审批暂缓记录未能写入 bots.json（${openPlatform.result.approvalDeferredPersistWarning}），未自动上线；请重试 ${continueCommand}，不会重复创建应用。`,
+        {
+          partial: true,
+          action: 'add',
+          bot: botJsonView(bot, index),
+          appId: bot.larkAppId,
+          ...(createdAppName ? { appName: createdAppName } : {}),
+          botsFile: BOTS_JSON_FILE,
+          envMigrated: migratedEnv || undefined,
+          openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+          ...extraScopesJson,
+          continueCommand,
+          next: continueCommand,
+        },
+      );
+      return;
     }
 
     const index = existing.length;

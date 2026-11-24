@@ -771,6 +771,24 @@ describe('approval deferred scope helpers & persistence boundaries', () => {
     expect(
       resolveNextPersistedApprovalDeferredScopes(existing, { approvalAutoPassed: true, versionPendingReview: true }, []),
     ).toEqual({ action: 'keep' });
+    // Skipped catalog scopes make the full target unverified -> never clear.
+    expect(
+      resolveNextPersistedApprovalDeferredScopes(existing, { approvalAutoPassed: true, skippedScopeCount: 1 }, []),
+    ).toEqual({ action: 'keep' });
+    // Commit outcome unknown/failed: even a resolved auto-pass prediction only unions discoveries.
+    expect(
+      resolveNextPersistedApprovalDeferredScopes(
+        existing,
+        { ok: false, approvalAutoPassed: true },
+        [{ bucket: 'tenant', name: 'contact:user.base:readonly', isolation: 'exact', group: 'core_im' }],
+      ),
+    ).toEqual({
+      action: 'set',
+      buckets: {
+        tenant: ['contact:user.base:readonly', 'im:message.group_msg'],
+        user: ['offline_access'],
+      },
+    });
     // Non-clean run with newly discovered deferred scope -> union with existing
     expect(
       resolveNextPersistedApprovalDeferredScopes(

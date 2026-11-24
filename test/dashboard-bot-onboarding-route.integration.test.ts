@@ -25,9 +25,9 @@ describe('Dashboard bot onboarding HTTP route', () => {
         import { BotOnboardingManager } from './src/dashboard/bot-onboarding.js';
 
         // Stop at the HTTP-to-manager boundary so no test sends a registration request.
-        const startedModes = [];
+        const startedInputs = [];
         BotOnboardingManager.prototype.start = function (input) {
-          startedModes.push(input.registrationMode);
+          startedInputs.push(input);
           return { id: 'test-job', done: Promise.resolve() };
         };
         BotOnboardingManager.prototype.get = id => ({ id, status: 'starting' });
@@ -59,7 +59,20 @@ describe('Dashboard bot onboarding HTTP route', () => {
           });
           responses.push({ status: response.status, body: await response.json() });
         }
-        console.log('ONBOARDING_RESULTS=' + JSON.stringify({ startedModes, responses }));
+        for (const autoAvoidApproval of [true, false]) {
+          const response = await loopbackFetch(origin + '/api/bot-onboarding/start', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', cookie: 'botmux_dashboard_token=' + token, origin },
+            body: JSON.stringify({ workingDir: homedir(), registrationMode: 'web', cloneSourceAppId: 'cli_source', autoAvoidApproval }),
+            signal: AbortSignal.timeout(3_000),
+          });
+          responses.push({ status: response.status, body: await response.json() });
+        }
+        console.log('ONBOARDING_RESULTS=' + JSON.stringify({
+          startedModes: startedInputs.map(input => input.registrationMode),
+          startedAutoAvoidApproval: startedInputs.map(input => input.autoAvoidApproval),
+          responses,
+        }));
         process.exit(0);
       `, {
         cwd: process.cwd(),
@@ -84,10 +97,12 @@ describe('Dashboard bot onboarding HTTP route', () => {
       expect(line, String(child.stdout)).toBeDefined();
       const accepted = { status: 202, body: { job: { id: 'test-job' } } };
       expect(JSON.parse(line!.slice(prefix.length))).toMatchObject({
-        startedModes: ['web', 'sdk', 'web', 'compat'],
+        startedModes: ['web', 'sdk', 'web', 'compat', 'web', 'web'],
+        startedAutoAvoidApproval: [null, null, null, null, true, false],
         responses: [
           accepted, accepted, accepted, accepted,
           { status: 400, body: { ok: false, error: 'invalid_registration_mode' } },
+          accepted, accepted,
         ],
       });
     } finally {
