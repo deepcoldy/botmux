@@ -347,7 +347,7 @@ describe('handleTaskRoutingApi', () => {
     expect(attemptRes.json().records.map((r: TaskRoutingRecord) => r.id)).toEqual(['rec_2']);
   });
 
-  it('keeps valid selection and fallback matches when another attempts_json is malformed', async () => {
+  it('keeps valid selection and fallback matches when another attempts_json is malformed or wrong-shaped', async () => {
     const dataDir = makeTempDir();
     const deps = makeDeps({ dataDir, readGlobalTaskRouting: () => ({ enabled: true }) });
     const store = new TaskRoutingStore(dataDir);
@@ -377,23 +377,36 @@ describe('handleTaskRoutingApi', () => {
     });
     const db = openDatabaseSyncOrThrow(taskRoutingDbPath(dataDir));
     try {
-      db.prepare(`UPDATE routing_records SET attempts_json = '[' WHERE id = 'damaged_newest'`).run();
+      const damage = db.prepare(`UPDATE routing_records SET attempts_json = ? WHERE id = 'damaged_newest'`);
+      for (const raw of [
+        '[',
+        '["x"]',
+        '"x"',
+        '{"appId":"cli_econ"}',
+        '{"appId":{"appId":"cli_econ"}}',
+        '{}',
+        'null',
+        '[null]',
+        '[1]',
+        '[{}]',
+      ]) {
+        damage.run(raw);
+        // The damaged row is present and readable without the Bot predicate.
+        expect(store.listRecords({ limit: 10 }).map(record => record.id), raw).toEqual([
+          'damaged_newest', 'attempt_match', 'selected_match',
+        ]);
+
+        const { req, url } = makeReq('GET', '/api/task-routing/history?bot=cli_econ&limit=10');
+        const res = makeRes();
+        await handleTaskRoutingApi(req, res.res, url, deps);
+        expect(res.status(), raw).toBe(200);
+        expect(res.json().records.map((r: TaskRoutingRecord) => r.id), raw).toEqual([
+          'attempt_match', 'selected_match',
+        ]);
+      }
     } finally {
       db.close();
     }
-
-    // The damaged row is really present and readable without the Bot predicate.
-    expect(store.listRecords({ limit: 10 }).map(record => record.id)).toEqual([
-      'damaged_newest', 'attempt_match', 'selected_match',
-    ]);
-
-    const { req, url } = makeReq('GET', '/api/task-routing/history?bot=cli_econ&limit=10');
-    const res = makeRes();
-    await handleTaskRoutingApi(req, res.res, url, deps);
-    expect(res.status()).toBe(200);
-    expect(res.json().records.map((r: TaskRoutingRecord) => r.id)).toEqual([
-      'attempt_match', 'selected_match',
-    ]);
   });
 
   it('performs dry-run recommend with zero SQLite side effects and rejects malformed bodies', async () => {

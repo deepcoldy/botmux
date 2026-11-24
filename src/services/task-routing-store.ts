@@ -357,11 +357,16 @@ export class TaskRoutingStore {
           selected_app_id = ? OR EXISTS (
             SELECT 1 FROM json_each(
               CASE WHEN json_valid(routing_records.attempts_json)
-                THEN routing_records.attempts_json
+                THEN CASE WHEN json_type(routing_records.attempts_json) = 'array'
+                  THEN routing_records.attempts_json
+                  ELSE '[]'
+                END
                 ELSE '[]'
               END
-            )
-            WHERE json_extract(value, '$.appId') = ?
+            ) AS attempt
+            WHERE CASE WHEN attempt.type = 'object'
+              THEN json_extract(attempt.value, '$.appId')
+            END = ?
           )
         )`);
         params.push(options.botAppId, options.botAppId);
