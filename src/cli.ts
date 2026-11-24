@@ -941,6 +941,7 @@ async function finishOpenPlatformSetup(
   const {
     parseSetupOpenPlatformAutoFlag,
     automateOpenPlatformSetup,
+    withOpenPlatformAppLock,
     collectBotmuxRedirectUrls,
     mergeDeferredApprovalScopes,
     describeDeferredScopeGroup,
@@ -958,60 +959,69 @@ async function finishOpenPlatformSetup(
     say(options.reuseOnly ? '将复用 Feishu Web session 补充配置。' : '将获取或复用 Feishu Web session 补充配置。');
   }
 
-  const rawResult = options.registeredAppSecret
-    ? await finishRegisteredAppSetup(appId, options.registeredAppSecret, brand, automateOpenPlatformSetup, options)
-    : await automateOpenPlatformSetup({
-        appId,
-        brand,
-        forceQrLogin: options.forceQrLogin,
-        disableQrLogin: options.reuseOnly,
-        disableBytedcliFallback: options.reuseOnly || options.forceQrLogin,
-        appJustCreated: options.appJustCreated,
-        scopeManifest: options.scopeManifest,
-        excludeScopes: options.excludeScopes,
-        autoAvoidApproval: options.autoAvoidApproval ?? true,
-      });
+  const {
+    result,
+    mergedDeferredScopes,
+    mergedDisabledRefreshToken,
+    mergedInitialApprovers,
+    deferredPersistWarning,
+  } = await withOpenPlatformAppLock(appId, async () => {
+    const rawResult = options.registeredAppSecret
+      ? await finishRegisteredAppSetup(appId, options.registeredAppSecret, brand, automateOpenPlatformSetup, options)
+      : await automateOpenPlatformSetup({
+          appId,
+          brand,
+          forceQrLogin: options.forceQrLogin,
+          disableQrLogin: options.reuseOnly,
+          disableBytedcliFallback: options.reuseOnly || options.forceQrLogin,
+          appJustCreated: options.appJustCreated,
+          scopeManifest: options.scopeManifest,
+          excludeScopes: options.excludeScopes,
+          autoAvoidApproval: options.autoAvoidApproval ?? true,
+        });
 
-  const mergedDeferredScopes = rawResult.ok
-    ? mergeDeferredApprovalScopes(options.initialApprovalDeferredScopes, rawResult.approvalDeferredScopes)
-    : [];
-  const mergedDisabledRefreshToken = rawResult.ok
-    ? Boolean(options.initialApprovalDisabledRefreshToken || rawResult.approvalDisabledRefreshToken)
-    : false;
-  const mergedInitialApprovers = rawResult.ok
-    ? (rawResult.approvalCompatibility?.initialHumanApprovers.length
-        ? rawResult.approvalCompatibility.initialHumanApprovers
-        : (options.initialApprovalApprovers ?? []))
-    : [];
-  const result: import('./setup/open-platform-automation.js').OpenPlatformAutomationResult = rawResult.ok
-    ? {
-        ...rawResult,
-        ...(mergedDeferredScopes.length > 0 ? { approvalDeferredScopes: mergedDeferredScopes } : {}),
-        ...(mergedDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
-        ...(mergedInitialApprovers.length > 0 && !rawResult.approvalCompatibility
-          ? {
-              approvalCompatibility: {
-                triggered: true,
-                resolvedAutoApproved: true,
-                deferredScopes: mergedDeferredScopes,
-                disabledRefreshToken: mergedDisabledRefreshToken,
-                initialHumanApprovers: mergedInitialApprovers,
-                remainingHumanApprovers: [],
-                probeCount: 0,
-                stopReason: 'resolved_exact' as const,
-              },
-            }
-          : {}),
+    const mergedDeferredScopes = rawResult.ok
+      ? mergeDeferredApprovalScopes(options.initialApprovalDeferredScopes, rawResult.approvalDeferredScopes)
+      : [];
+    const mergedDisabledRefreshToken = rawResult.ok
+      ? Boolean(options.initialApprovalDisabledRefreshToken || rawResult.approvalDisabledRefreshToken)
+      : false;
+    const mergedInitialApprovers = rawResult.ok
+      ? (rawResult.approvalCompatibility?.initialHumanApprovers.length
+          ? rawResult.approvalCompatibility.initialHumanApprovers
+          : (options.initialApprovalApprovers ?? []))
+      : [];
+    const result: import('./setup/open-platform-automation.js').OpenPlatformAutomationResult = rawResult.ok
+      ? {
+          ...rawResult,
+          ...(mergedDeferredScopes.length > 0 ? { approvalDeferredScopes: mergedDeferredScopes } : {}),
+          ...(mergedDisabledRefreshToken ? { approvalDisabledRefreshToken: true } : {}),
+          ...(mergedInitialApprovers.length > 0 && !rawResult.approvalCompatibility
+            ? {
+                approvalCompatibility: {
+                  triggered: true,
+                  resolvedAutoApproved: true,
+                  deferredScopes: mergedDeferredScopes,
+                  disabledRefreshToken: mergedDisabledRefreshToken,
+                  initialHumanApprovers: mergedInitialApprovers,
+                  remainingHumanApprovers: [],
+                  probeCount: 0,
+                  stopReason: 'resolved_exact' as const,
+                },
+              }
+            : {}),
+        }
+      : rawResult;
+
+    let deferredPersistWarning: string | undefined;
+    if (result.ok) {
+      const persisted = await persistBotApprovalDeferredScopes(appId, result, mergedDeferredScopes);
+      if (!persisted.ok && persisted.reason !== 'bot_not_in_config') {
+        deferredPersistWarning = `未能把审批暂缓权限记录写入 bots.json（${persisted.reason}）`;
       }
-    : rawResult;
-
-  let deferredPersistWarning: string | undefined;
-  if (result.ok) {
-    const persisted = await persistBotApprovalDeferredScopes(appId, result, mergedDeferredScopes);
-    if (!persisted.ok && persisted.reason !== 'bot_not_in_config') {
-      deferredPersistWarning = `未能把审批暂缓权限记录写入 bots.json（${persisted.reason}）`;
     }
-  }
+    return { result, mergedDeferredScopes, mergedDisabledRefreshToken, mergedInitialApprovers, deferredPersistWarning };
+  });
 
   const outcome = classifySetupOpenPlatformOutcome(result);
   if (result.ok) {

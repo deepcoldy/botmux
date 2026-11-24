@@ -34,7 +34,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => ({
 import { checkRequiredScopes, ensureVcMeetingEventsSubscribed } from '../src/im/lark/event-dispatcher.js';
 import { readDefaultScopeManifest } from '../src/setup/open-platform-automation.js';
 import type { RegisterAppOptions } from '../src/setup/register-app.js';
-import { BOTMUX_REQUIRED_SCOPES } from '../src/setup/verify-permissions.js';
+import { BOTMUX_REQUIRED_SCOPES, VC_MEETING_FEATURE_SCOPES } from '../src/setup/verify-permissions.js';
 import { logger } from '../src/utils/logger.js';
 
 const APP = 'cli_scope_selfcheck';
@@ -354,6 +354,17 @@ describe('checkRequiredScopes — app stuck in review', () => {
   });
 });
 
+function stubVcGrants(missing: readonly string[] = []): void {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (String(url).includes('tenant_access_token')) return Response.json({ code: 0, tenant_access_token: 't' });
+    return Response.json({ code: 0, data: { app: {
+      scopes: VC_MEETING_FEATURE_SCOPES.map(scope => scope.name)
+        .filter(name => !missing.includes(name))
+        .map(scope => ({ scope, token_types: ['tenant', 'user'] })),
+    } } });
+  }));
+}
+
 describe('ensureVcMeetingEventsSubscribed', () => {
   const vcBot = (config: Record<string, unknown> = {}) => makeBot({ vcMeetingAgent: undefined, ...config });
 
@@ -440,6 +451,7 @@ describe('ensureVcMeetingEventsSubscribed', () => {
   it('honors autoAvoidApproval=false when auto-subscribing VC events', async () => {
     const deferred = { tenant: ['vc:meeting.bot.join:write'] };
     h.bot = vcBot({ approvalDeferredScopes: deferred, autoAvoidApproval: false });
+    stubVcGrants();
     h.probe.mockResolvedValue({ ok: true, missingVcEvents: ['vc.bot.meeting_invited_v1'], eventModeReady: true });
     h.automate.mockResolvedValue({ ok: true, subscribedEventCount: 3, versionId: 'v1' });
     await ensureVcMeetingEventsSubscribed(APP);
@@ -453,14 +465,30 @@ describe('ensureVcMeetingEventsSubscribed', () => {
     h.bot = vcBot({
       approvalDeferredScopes: { tenant: ['vc:meeting.bot.join:write'] },
     });
+    stubVcGrants();
     h.probe.mockResolvedValue({ ok: true, missingVcEvents: ['vc.bot.meeting_invited_v1'], eventModeReady: true });
     h.automate.mockResolvedValue({ ok: true, subscribedEventCount: 3, versionId: 'v1' });
     await ensureVcMeetingEventsSubscribed(APP);
     expect(h.automate).toHaveBeenCalledWith(expect.objectContaining({
       excludeScopes: { tenant: ['vc:meeting.bot.join:write'] },
       autoAvoidApproval: true,
+      grantedScopeNames: expect.objectContaining({ tenant: expect.arrayContaining(['vc:meeting.bot.join:write']) }),
     }));
     expect(h.dm).not.toHaveBeenCalled();
+  });
+
+  it('skips repeated publishes while a historical deferred VC scope is still ungranted', async () => {
+    const deferredScope = 'vc:meeting.bot.join:write';
+    h.bot = vcBot({ approvalDeferredScopes: { tenant: [deferredScope] } });
+    stubVcGrants([deferredScope]);
+    h.probe.mockResolvedValue({ ok: true, missingVcEvents: ['vc.bot.meeting_invited_v1'], eventModeReady: true });
+
+    await ensureVcMeetingEventsSubscribed(APP);
+    await ensureVcMeetingEventsSubscribed(APP);
+
+    expect(h.automate).not.toHaveBeenCalled();
+    expect(h.dm).not.toHaveBeenCalled();
+    expect(h.persistDeferred).not.toHaveBeenCalled();
   });
 
   it('persists newly deferred VC scopes and reports them as not granted', async () => {

@@ -1081,7 +1081,7 @@ describe('BotOnboardingManager', () => {
     });
     expect(started.ok).toBe(true);
     if (!started.ok) throw new Error(started.error);
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
 
     expect(createApp).not.toHaveBeenCalled();
     expect(registerApp).not.toHaveBeenCalled();
@@ -1239,7 +1239,7 @@ describe('BotOnboardingManager', () => {
     });
     expect(first.ok).toBe(true);
     if (!first.ok) throw new Error(first.error);
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(firstManager.get(first.job.id)?.status).toBe('waiting_for_platform_scan'));
     expect(firstManager.get(first.job.id)).toMatchObject({
       status: 'waiting_for_platform_scan',
       criticalScopeActivationRequired: true,
@@ -1275,6 +1275,10 @@ describe('BotOnboardingManager', () => {
       activationPending: true,
     });
     expect(existsSync(interruptedSessionPath)).toBe(false);
+    // Let the interrupted attempt release the per-app lock before starting its
+    // durable successor; production recovery cannot overtake an active predecessor.
+    firstGate.resolve();
+    await first.job.done;
     const second = secondManager.startPermissionRecovery({
       workingDir,
       predecessorJobId: 'bot_original',
@@ -1293,8 +1297,6 @@ describe('BotOnboardingManager', () => {
       liveStarted: true,
     });
 
-    firstGate.resolve();
-    await first.job.done;
     rmSync(dir, { recursive: true, force: true });
   });
 

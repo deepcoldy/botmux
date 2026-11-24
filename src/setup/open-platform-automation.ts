@@ -1,5 +1,6 @@
 /** Developer-console fallback for setup, platform configuration and permission recovery. */
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -989,8 +990,15 @@ function mergeApprovalCandidates(
  * uncommitted Feishu console draft mid-bisection before `publish/commit`.
  */
 const openPlatformAppQueues = new Map<string, Promise<void>>();
+const openPlatformAppLockContext = new AsyncLocalStorage<string>();
 
-async function withOpenPlatformAppLock<T>(appId: string, fn: () => Promise<T>): Promise<T> {
+/**
+ * Serialize one app's draft mutation AND its approvalDeferredScopes persistence.
+ * The async-context reentrant fast path lets callers wrap `automateOpenPlatformSetup`
+ * together with result persistence without deadlocking on the lock it takes internally.
+ */
+export async function withOpenPlatformAppLock<T>(appId: string, fn: () => Promise<T>): Promise<T> {
+  if (openPlatformAppLockContext.getStore() === appId) return fn();
   const prev = openPlatformAppQueues.get(appId) ?? Promise.resolve();
   let release!: () => void;
   const next = new Promise<void>(resolve => { release = resolve; });
@@ -998,17 +1006,19 @@ async function withOpenPlatformAppLock<T>(appId: string, fn: () => Promise<T>): 
   openPlatformAppQueues.set(appId, tail);
   await prev;
   try {
-    const safeId = appId.replace(/[^A-Za-z0-9_-]/g, '_');
-    const lockDir = join(homedir(), '.botmux', 'data', 'locks');
-    let canFileLock = false;
-    try {
-      mkdirSync(lockDir, { recursive: true });
-      canFileLock = true;
-    } catch {
-      // Read-only / restricted filesystem: retain in-process FIFO exclusion.
-    }
-    if (!canFileLock) return await fn();
-    return await withFileLock(join(lockDir, `open-platform-${safeId}`), fn, { maxWaitMs: 120_000 });
+    return await openPlatformAppLockContext.run(appId, async () => {
+      const safeId = appId.replace(/[^A-Za-z0-9_-]/g, '_');
+      const lockDir = join(homedir(), '.botmux', 'data', 'locks');
+      let canFileLock = false;
+      try {
+        mkdirSync(lockDir, { recursive: true });
+        canFileLock = true;
+      } catch {
+        // Read-only / restricted filesystem: retain in-process FIFO exclusion.
+      }
+      if (!canFileLock) return await fn();
+      return await withFileLock(join(lockDir, `open-platform-${safeId}`), fn, { maxWaitMs: 120_000 });
+    });
   } finally {
     release();
     if (openPlatformAppQueues.get(appId) === tail) {

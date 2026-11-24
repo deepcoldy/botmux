@@ -58,7 +58,7 @@ import {
 } from '../../setup/verify-permissions.js';
 import { buildApprovalConsoleUrl, type ApprovalDeferredScopeBuckets, type DeferredApprovalScope } from '../../setup/approval-scope-resolver.js';
 import { approvalAutomationOptionsForBot, mergeApprovalDeferredScopeBuckets, persistNewApprovalDeferredScopes } from '../../services/approval-deferred-scopes-store.js';
-import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, CHAT_DISBANDED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, withOpenPlatformAppLock, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, CHAT_DISBANDED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
 import { tryRegisterApp } from '../../setup/register-app.js';
 import { describeMissingScopes, diffScopeBuckets, readRegistrationScopes, registrationScopeBuckets, scopeBucketCount } from '../../setup/registration-manifest.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
@@ -409,28 +409,33 @@ async function tryWebAutoFixScopes(
     // 分桶归属仍以默认 manifest 为准（见 filterScopeManifest）。
     const wantedScopeNames = [...missingCritical, ...missingOptional].map(s => s.name);
     const scopeManifest = filterScopeManifest(readDefaultScopeManifest(), wantedScopeNames);
-    const result = await automateOpenPlatformSetup({
-      appId: bot.config.larkAppId,
-      brand,
-      maxWaitMs: 60_000,
-      disableQrLogin: opts?.disableQrLogin,
-      scopeManifest,
-      ...approvalAutomationOptionsForBot(bot.config),
-      grantedScopeNames: opts?.grantedScopeNames,
-      onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
-      onQrCode: (info) => {
-        logger.warn(
-          `[${larkAppId}] auto-fix: cached Feishu web session expired, QR login needed. ` +
-          `Run \`botmux setup\` to refresh session, or manually apply scopes from deep links below. ` +
-          `QR text (first 80 chars): ${info.qrText.substring(0, 80)}...`,
-        );
-      },
+    const { result, deferredPersistWarning } = await withOpenPlatformAppLock(larkAppId, async () => {
+      const result = await automateOpenPlatformSetup({
+        appId: bot.config.larkAppId,
+        brand,
+        maxWaitMs: 60_000,
+        disableQrLogin: opts?.disableQrLogin,
+        scopeManifest,
+        ...approvalAutomationOptionsForBot(bot.config),
+        grantedScopeNames: opts?.grantedScopeNames,
+        onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
+        onQrCode: (info) => {
+          logger.warn(
+            `[${larkAppId}] auto-fix: cached Feishu web session expired, QR login needed. ` +
+            `Run \`botmux setup\` to refresh session, or manually apply scopes from deep links below. ` +
+            `QR text (first 80 chars): ${info.qrText.substring(0, 80)}...`,
+          );
+        },
+      });
+      const deferredPersistWarning = result.ok
+        ? await persistDiscoveredApprovalDeferrals(larkAppId, bot, result.approvalDeferredScopes)
+        : undefined;
+      return { result, deferredPersistWarning };
     });
 
     if (result.ok) {
       const deferredScopes = result.approvalDeferredScopes ?? [];
       const hasDeferred = deferredScopes.length > 0;
-      const deferredPersistWarning = await persistDiscoveredApprovalDeferrals(larkAppId, bot, deferredScopes);
       const deferredNames = deferredScopes.map(scope => `${scope.name}(${scope.bucket})`).join('、');
       // ⚠️ `scopeCount === 0` 有四种**互相矛盾**的成因，不能共用一句话。自从申请集合
       // 被裁成「缺失项」后（见上方 filterScopeManifest），它的语义从「整份清单导入了
@@ -1111,6 +1116,69 @@ async function checkRequiredScopesOnce(larkAppId: string, isCurrent: () => boole
   }
 }
 
+type VcDeferredGrantState =
+  | { required: false }
+  | { required: true; ok: false; reason: string }
+  | { required: true; ok: true; deferredMissing: string[]; granted: { tenant: string[]; user: string[] } };
+
+/** Only historical VC deferrals need a grant readback before deciding whether publishing is worthwhile. */
+async function readVcDeferredGrantState(
+  larkAppId: string,
+  bot: BotState,
+  brand: Brand,
+): Promise<VcDeferredGrantState> {
+  const deferred = bot.config.approvalDeferredScopes;
+  const vcNames = new Set(VC_MEETING_FEATURE_SCOPES.map(scope => scope.name));
+  const hasDeferredVc = [...(deferred?.tenant ?? []), ...(deferred?.user ?? [])].some(name => vcNames.has(name));
+  if (!hasDeferredVc) return { required: false };
+  try {
+    const openApi = larkHosts(brand).openApi;
+    const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(10_000),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: bot.config.larkAppId, app_secret: bot.config.larkAppSecret }),
+    });
+    const tokenData = await tokenRes.json() as any;
+    if (tokenData.code !== 0) return { required: true, ok: false, reason: `tenant_access_token failed (${tokenData.msg ?? tokenData.code})` };
+    const infoRes = await fetch(`${openApi}/open-apis/application/v6/applications/${bot.config.larkAppId}?lang=zh_cn`, {
+      headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const infoData = await infoRes.json() as any;
+    if (infoData.code !== 0) return { required: true, ok: false, reason: `app info failed (code=${infoData.code} ${infoData.msg ?? ''})` };
+    const scopesRaw: any[] = infoData.data?.app?.scopes ?? infoData.data?.application?.scopes ?? infoData.data?.scopes;
+    if (!Array.isArray(scopesRaw) || scopesRaw.length === 0) {
+      return { required: true, ok: false, reason: 'granted scope list unavailable' };
+    }
+    const granted = { tenant: [] as string[], user: [] as string[] };
+    for (const scope of scopesRaw) {
+      const name = typeof scope === 'string' ? scope : scope?.scope;
+      if (!name) continue;
+      const tokenTypes = typeof scope === 'string' ? undefined : scope?.token_types;
+      if (Array.isArray(tokenTypes)) {
+        if (tokenTypes.includes('tenant')) granted.tenant.push(name);
+        if (tokenTypes.includes('user')) granted.user.push(name);
+      } else {
+        granted.tenant.push(name);
+        granted.user.push(name);
+      }
+    }
+    const required = registrationScopeBuckets(filterScopeManifest(
+      readDefaultScopeManifest(),
+      VC_MEETING_FEATURE_SCOPES.map(scope => scope.name),
+    ));
+    const missing = diffScopeBuckets(required, granted);
+    const deferredMissing = [
+      ...missing.tenant.filter(name => deferred?.tenant?.includes(name)),
+      ...missing.user.filter(name => deferred?.user?.includes(name)),
+    ];
+    return { required: true, ok: true, deferredMissing, granted };
+  } catch (err: any) {
+    return { required: true, ok: false, reason: err?.message ?? String(err) };
+  }
+}
+
 /**
  * Startup: ensure this bot is subscribed to the VC meeting events
  * (`vc.bot.meeting_*` + participant_meeting_joined) so ANY invited bot can
@@ -1145,9 +1213,22 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
       logger.info(`[${larkAppId}] VC meeting events already subscribed (long-connection mode)`);
       return;
     }
-    // Historical deferrals remain excluded below, but must not block event repair:
-    // manually granted scopes can start working after restart only when subscriptions
-    // and long-connection mode are also restored.
+    // Historical deferrals remain excluded. Repair events only after their recorded
+    // scopes are actually granted; otherwise a persistent scope gap would republish
+    // the same still-missing events on every daemon restart.
+    const deferredGrantState = await readVcDeferredGrantState(larkAppId, bot, brand);
+    if (deferredGrantState.required && !deferredGrantState.ok) {
+      logger.info(
+        `[${larkAppId}] VC events missing, but current grants for historical deferred scopes are inconclusive (${deferredGrantState.reason}); skipping auto-subscribe to avoid repeated version publishes.`,
+      );
+      return;
+    }
+    if (deferredGrantState.required && deferredGrantState.ok && deferredGrantState.deferredMissing.length > 0) {
+      logger.info(
+        `[${larkAppId}] VC events missing, but deferred VC scope(s) are still ungranted (${deferredGrantState.deferredMissing.join(', ')}); skipping auto-subscribe to avoid repeated version publishes.`,
+      );
+      return;
+    }
     logger.info(
       `[${larkAppId}] VC events missing (${probe.missingVcEvents.join('、') || '事件模式非长连接'}); auto-subscribing via Open Platform...`,
     );
@@ -1155,24 +1236,26 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
       readDefaultScopeManifest(),
       VC_MEETING_FEATURE_SCOPES.map(s => s.name),
     );
-    const result = await automateOpenPlatformSetup({
-      appId: bot.config.larkAppId,
-      brand,
-      maxWaitMs: 60_000,
-      disableQrLogin: true,
-      scopeManifest: vcScopeManifest,
-      ...approvalAutomationOptionsForBot(bot.config),
-      onStatus: (msg) => logger.info(`[${larkAppId}] vc-event-autoconfig: ${msg}`),
-      onQrCode: () => {
-        logger.warn(`[${larkAppId}] vc-event-autoconfig: cached Feishu web session expired; run \`botmux setup\` to refresh, then restart.`);
-      },
+    const { result, deferredPersistWarning } = await withOpenPlatformAppLock(larkAppId, async () => {
+      const result = await automateOpenPlatformSetup({
+        appId: bot.config.larkAppId,
+        brand,
+        maxWaitMs: 60_000,
+        disableQrLogin: true,
+        scopeManifest: vcScopeManifest,
+        ...approvalAutomationOptionsForBot(bot.config),
+        grantedScopeNames: deferredGrantState.required && deferredGrantState.ok ? deferredGrantState.granted : undefined,
+        onStatus: (msg) => logger.info(`[${larkAppId}] vc-event-autoconfig: ${msg}`),
+        onQrCode: () => {
+          logger.warn(`[${larkAppId}] vc-event-autoconfig: cached Feishu web session expired; run \`botmux setup\` to refresh, then restart.`);
+        },
+      });
+      const deferredPersistWarning = result.ok
+        ? await persistDiscoveredApprovalDeferrals(larkAppId, bot, result.approvalDeferredScopes)
+        : undefined;
+      return { result, deferredPersistWarning };
     });
     if (result.ok) {
-      const deferredPersistWarning = await persistDiscoveredApprovalDeferrals(
-        larkAppId,
-        bot,
-        result.approvalDeferredScopes,
-      );
       const knownDeferredVcScopes = VC_MEETING_FEATURE_SCOPES.filter(scope =>
         bot.config.approvalDeferredScopes?.tenant?.includes(scope.name)
         || bot.config.approvalDeferredScopes?.user?.includes(scope.name),

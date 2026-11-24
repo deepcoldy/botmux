@@ -415,7 +415,7 @@ import {
 } from './dashboard/compat.js';
 import { serveMissingDashboardChunk } from './dashboard/stale-chunk-http.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
-import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, withOpenPlatformAppLock, vcListenerEventGateError } from './setup/open-platform-automation.js';
 import { approvalAutomationOptionsForBot, mergeApprovalDeferredScopeBuckets, persistNewApprovalDeferredScopes } from './services/approval-deferred-scopes-store.js';
 import { buildApprovalConsoleUrl } from './setup/approval-scope-resolver.js';
 import { repairOpenPlatformRedirects } from './setup/open-platform-redirect-repair.js';
@@ -1825,16 +1825,16 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
     }
   } else {
     try {
-      const result = await automateOpenPlatformSetup({
-        appId: targetAppId,
-        brand,
-        maxWaitMs: 5_000,
-        ...approvalAutomationOptionsForBot(bot),
-        onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
-      });
-      if (result.ok) {
+      const { result, deferredPersistWarning } = await withOpenPlatformAppLock(targetAppId, async () => {
+        const result = await automateOpenPlatformSetup({
+          appId: targetAppId,
+          brand,
+          maxWaitMs: 5_000,
+          ...approvalAutomationOptionsForBot(bot),
+          onStatus: (msg) => logger.info(`[vc-agent] scope auto-import: ${msg}`),
+        });
         let deferredPersistWarning = '';
-        if (result.approvalDeferredScopes?.length) {
+        if (result.ok && result.approvalDeferredScopes?.length) {
           const persisted = await persistNewApprovalDeferredScopes(targetAppId, result.approvalDeferredScopes, {
             onCommitted: buckets => {
               bot.approvalDeferredScopes = mergeApprovalDeferredScopeBuckets(bot.approvalDeferredScopes, buckets);
@@ -1845,6 +1845,9 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
             logger.warn(`[vc-agent] failed to persist approval-deferred scopes for ${targetAppId}: ${persisted.reason}`);
           }
         }
+        return { result, deferredPersistWarning };
+      });
+      if (result.ok) {
         const deferredNotice = result.approvalDeferredScopes?.length
           ? `本次有 ${result.approvalDeferredScopes.length} 项权限因需人工审批被暂缓，尚未开通；请到 ${buildApprovalConsoleUrl(targetAppId, brand)} 手动申请${deferredPersistWarning}`
           : '';

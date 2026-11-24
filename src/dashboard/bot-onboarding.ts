@@ -28,6 +28,7 @@ import {
   createFeishuOpenPlatformApp,
   deferredScopesToBuckets,
   inspectCachedFeishuOpenPlatformSession,
+  withOpenPlatformAppLock,
   mergeDeferredApprovalScopes,
   resolveNextPersistedApprovalDeferredScopes,
   type ApprovalDeferredScopeBuckets,
@@ -2281,23 +2282,26 @@ export class BotOnboardingManager {
       ? configuredBots[addedBotIndex]
       : configuredBots.find(b => b?.larkAppId === appId);
     const targetAutoAvoidApproval = targetBot?.autoAvoidApproval !== false;
-    const auto = await this.runOwnerPermissionAutomation(id, appId, brand, {
-      onQrCode: (info: { qrText: string; qrPayload: string }) => {
-        this.patch(id, {
-          status: 'waiting_for_platform_scan',
-          platformQrDataUrl: this.renderQrDataUrl(info.qrPayload),
-        });
-      },
-      onQrScanConfirmed: (info: { confirmedAt: number }) => {
-        this.confirmPlatformQrScan(id, info.confirmedAt);
-      },
-      onStatus: (msg: string) => this.patch(id, { permissionStatusMsg: msg }),
-    }, sessionFilePath, requireCriticalScopesBeforeActivation, false, undefined, targetAutoAvoidApproval);
+    const auto = await withOpenPlatformAppLock(appId, async () => {
+      const result = await this.runOwnerPermissionAutomation(id, appId, brand, {
+        onQrCode: (info: { qrText: string; qrPayload: string }) => {
+          this.patch(id, {
+            status: 'waiting_for_platform_scan',
+            platformQrDataUrl: this.renderQrDataUrl(info.qrPayload),
+          });
+        },
+        onQrScanConfirmed: (info: { confirmedAt: number }) => {
+          this.confirmPlatformQrScan(id, info.confirmedAt);
+        },
+        onStatus: (msg: string) => this.patch(id, { permissionStatusMsg: msg }),
+      }, sessionFilePath, requireCriticalScopesBeforeActivation, false, undefined, targetAutoAvoidApproval);
+      if (result.ok) await this.syncBotApprovalDeferredScopes(appId, addedBotIndex, result);
+      return result;
+    });
     if (!auto.ok) {
       this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'failed', 'permission_recovery_failed');
       return;
     }
-    await this.syncBotApprovalDeferredScopes(appId, addedBotIndex, auto);
     if (requireCriticalScopesBeforeActivation && !hasExactManagedAutomationAck(auto)) {
       this.finalizePermissions(id, appId, brand, addedBotIndex, {
         ok: false,
