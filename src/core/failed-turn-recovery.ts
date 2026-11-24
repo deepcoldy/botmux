@@ -155,6 +155,7 @@ function retryLimitedFailedTurnClear(
     workerGeneration?: number;
     sessionWorkerGeneration?: number;
     inputTurnId?: string;
+    currentGenerationCompleted?: boolean;
   },
 ): void {
   let delayMs = 500;
@@ -170,7 +171,7 @@ function retryLimitedFailedTurnClear(
         || ds.workerGeneration !== fence.workerGeneration
         || ds.session.workerGeneration !== fence.sessionWorkerGeneration
         || ds.lastCliInputTurnId !== fence.inputTurnId
-        || ds.usageLimit?.limited) return;
+        || (ds.usageLimit?.limited && !fence.currentGenerationCompleted)) return;
       if (!current?.limitedSnapshot || current.recovery
         || current.turnId !== record.turnId || current.failedAt !== record.failedAt) return;
       try {
@@ -191,7 +192,11 @@ function retryLimitedFailedTurnClear(
 
 /** Invalidate only unclaimed provisional observations. Durable recovery
  * receipts and real failed terminals must survive status/terminal updates. */
-export function clearLimitedFailedTurn(ds: DaemonSession, turnId?: string): void {
+export function clearLimitedFailedTurn(
+  ds: DaemonSession,
+  turnId?: string,
+  authorization: { currentGenerationCompleted?: boolean } = {},
+): void {
   const record = ds.session.lastFailedTurn;
   cancelLimitedFailedTurnClearRetry(ds);
   if (!record?.limitedSnapshot || record.recovery || turnId !== undefined && record.turnId !== turnId) return;
@@ -204,6 +209,7 @@ export function clearLimitedFailedTurn(ds: DaemonSession, turnId?: string): void
       workerGeneration: ds.workerGeneration,
       sessionWorkerGeneration: ds.session.workerGeneration,
       inputTurnId: ds.lastCliInputTurnId,
+      currentGenerationCompleted: authorization.currentGenerationCompleted,
     });
     throw error;
   }
@@ -218,7 +224,9 @@ export function recordFailedTurnTerminal(
   context: { workerGeneration: number; caller: TrustedCaller | undefined; silent: boolean },
 ): void {
   if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
-    clearLimitedFailedTurn(ds, terminal.turnId);
+    // A current-generation answer owns cleanup even when its old limit remains
+    // sticky. Other clears must still stop when a new active limit appears.
+    clearLimitedFailedTurn(ds, terminal.turnId, { currentGenerationCompleted: true });
   }
   if (terminal.status !== 'failed' && terminal.status !== 'ambiguous') return;
   // A fail-closed refusal of synthetic maintenance is expected operational

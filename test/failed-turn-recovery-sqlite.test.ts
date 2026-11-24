@@ -9,7 +9,7 @@ import * as permissions from '../src/im/lark/event-dispatcher.js';
 import * as manager from '../src/core/session-manager.js';
 import { startIpcServer, setIpcAuthSecret, setLarkAppId, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { registerBot } from '../src/bot-registry.js';
-import { recordFailedTurnTerminal, recordLimitedFailedTurn } from '../src/core/failed-turn-recovery.js';
+import { recordFailedTurnTerminal, recordLimitedFailedTurn, clearLimitedFailedTurn } from '../src/core/failed-turn-recovery.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 
 let directory: string;
@@ -58,6 +58,87 @@ async function post(mode: 'retry' | 'fresh') {
   expect(response.status).toBe(200); return response.json();
 }
 describe('HTTP recovery with real SQLite persistence', () => {
+  it('keeps an unchanged failed-turn record when the same input turn gains a new limit during cleanup retry', async () => {
+    vi.useFakeTimers();
+    try {
+      ds.lastCliInputTurnId = 'om_failed';
+      Object.assign(ds.session.lastFailedTurn, { limitedSnapshot: true, directFailure: true });
+      store.updateSession(ds.session);
+      const unchangedRecord = structuredClone(ds.session.lastFailedTurn);
+      store.__testOnly_setBeforeRowPersist(() => {
+        store.__testOnly_setBeforeRowPersist(undefined);
+        throw new Error('injected cleanup failure');
+      });
+      expect(() => clearLimitedFailedTurn(ds, 'om_failed')).toThrow('injected cleanup failure');
+
+      const nextLimit = {
+        limited: true as const, kind: 'usage' as const,
+        retryAtMs: Date.now() + 120_000, retryLabel: '2m', retryReady: false,
+        source: 'antigravity-native-log' as const, nativeEpisodeKey: 'log:new-episode', directFailure: true as const,
+      };
+      ds.usageLimit = nextLimit;
+      ds.session.usageLimit = nextLimit;
+      ds.lastScreenStatus = 'limited';
+      store.updateSession(ds.session);
+      recordLimitedFailedTurn(ds, 'om_failed');
+      // The new limit needs exactly the same proof: no record identity or
+      // directFailure bit changes to save it from the old cleanup timer.
+      expect(ds.session.lastFailedTurn).toEqual(unchangedRecord);
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(ds.usageLimit?.nativeEpisodeKey).toBe('log:new-episode');
+      expect(store.getSessionFresh(ds.session.sessionId)?.lastFailedTurn).toEqual(unchangedRecord);
+      expect(ds.session.lastFailedTurn).toEqual(unchangedRecord);
+    } finally {
+      store.__testOnly_setBeforeRowPersist(undefined);
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { generation: 'current', cleared: true },
+    { generation: 'stale', cleared: false },
+  ] as const)('allows only a $generation generation completed terminal to clear through a sticky limit', async ({ generation, cleared }) => {
+    vi.useFakeTimers();
+    try {
+      ds.lastCliInputTurnId = 'om_failed';
+      ds.workerGeneration = 2;
+      ds.session.workerGeneration = 2;
+      Object.assign(ds.session.lastFailedTurn, { limitedSnapshot: true, directFailure: true });
+      const stickyLimit = {
+        limited: true as const, kind: 'usage' as const,
+        retryAtMs: Date.now() + 120_000, retryLabel: '2m', retryReady: false,
+        source: 'antigravity-native-log' as const, nativeEpisodeKey: 'log:sticky-episode', directFailure: true as const,
+      };
+      ds.usageLimit = stickyLimit;
+      ds.session.usageLimit = stickyLimit;
+      ds.lastScreenStatus = 'limited';
+      store.updateSession(ds.session);
+      const unchangedRecord = structuredClone(ds.session.lastFailedTurn);
+      store.__testOnly_setBeforeRowPersist(() => {
+        store.__testOnly_setBeforeRowPersist(undefined);
+        throw new Error('injected cleanup failure');
+      });
+      const completed = () => recordFailedTurnTerminal(ds,
+        { turnId: 'om_failed', status: 'completed' },
+        { workerGeneration: generation === 'current' ? 2 : 1, caller, silent: false });
+      if (generation === 'current') expect(completed).toThrow('injected cleanup failure');
+      else {
+        expect(() => clearLimitedFailedTurn(ds, 'om_failed')).toThrow('injected cleanup failure');
+        expect(completed).not.toThrow();
+      }
+
+      await vi.advanceTimersByTimeAsync(500);
+      const expected = cleared ? undefined : unchangedRecord;
+      expect(store.getSessionFresh(ds.session.sessionId)?.lastFailedTurn).toEqual(expected);
+      expect(ds.session.lastFailedTurn).toEqual(expected);
+      expect(ds.usageLimit?.nativeEpisodeKey).toBe('log:sticky-episode');
+    } finally {
+      store.__testOnly_setBeforeRowPersist(undefined);
+      vi.useRealTimers();
+    }
+  });
+
   it('reloads one input owner and refuses late or uncorrelated failures', () => {
     registerBot({ larkAppId: 'cli_fixture', larkAppSecret: 'fixture', cliId: 'codex', apiOnly: true });
     vi.mocked(manager.rememberLastCliInput).mockRestore();
