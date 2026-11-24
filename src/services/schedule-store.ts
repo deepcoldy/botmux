@@ -1199,6 +1199,10 @@ export function markRun(
     if (runId !== undefined && task.lastRunId !== runId) {
       return { result: undefined, changed: false };
     }
+    if (runId !== undefined && task.lastRunId === runId
+      && (task.lastStatus === 'ok' || task.lastStatus === 'error' || task.lastStatus === 'skipped')) {
+      return { result: undefined, changed: false };
+    }
     if (!success && !options.settleParked && deferredRunStillOwesTargets(task, runId)) {
       // A failed retry attempt must not settle a run that still owes targets
       // (waiting / dispatching / ambiguous): keep the parked identity, record

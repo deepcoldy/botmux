@@ -142,4 +142,18 @@ describe('legacy schedule-store deferred run', () => {
     mod.markSkipped(task.id, undefined, 'run-2');
     expect(mod.getTask(task.id)!.deferredRun).toBeUndefined();
   });
+
+  it('uses settleParked to write a terminal failure instead of re-parking the legacy run', async () => {
+    const mod = await freshImport();
+    const task = mod.createTask(TASK_PARAMS);
+    mod.updateTask(task.id, {
+      deferredRun: deferred('run-terminal'), lastRunId: 'run-terminal', lastStatus: 'deferred',
+    });
+    mod.markRun(task.id, false, 'terminal failure', undefined, 'run-terminal', { settleParked: true });
+    const settled = mod.getTask(task.id)!;
+    expect(settled.deferredRun).toBeUndefined();
+    expect(settled.lastStatus).toBe('error');
+    expect(settled.lastError).toBe('terminal failure');
+    expect(settled.runStats?.consecutiveFailures).toBe(1);
+  });
 });

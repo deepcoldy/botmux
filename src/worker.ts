@@ -470,16 +470,13 @@ import { pinWorkerTraeHome, resolveTraexChildHome } from './services/traex-paths
 import {
   acquireTraexRuntimeLease,
   acquireTraexRuntimeOccupancy,
+  captureTraexRunningContentIdentity,
   daemonBirthIdentity,
   traexLaunchUsesSharedRuntimeGate,
   type TraexRuntimeBlocker,
   type TraexRuntimeLease,
 } from './services/traex-runtime-gate.js';
-import {
-  captureTraexExecutableIdentity,
-  readTraexSnapshotProvenance,
-  releaseDirForExecutable,
-} from './services/traex-runtime-snapshot.js';
+import { releaseDirForExecutable } from './services/traex-runtime-snapshot.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
@@ -28635,6 +28632,13 @@ async function spawnCliBody(
   } else if (cliAdapter.supportsProgramStatus && !programStatusStream) {
     programStatusStream = new ProgramStatusFramingStream();
   }
+  traexNativeStartupInputPending = shouldFenceTraexStartupInput({
+    cliId: cfg.cliId,
+    programStatusEnabled: programStatusStream !== null,
+    adoptMode: cfg.adoptMode,
+    remoteViewer: !!remoteWsUrl,
+  });
+  traexFirstInputAdmissionPending = traexNativeStartupInputPending;
   const cardActionCapabilities = pluginCardActionCapabilitiesEnv(cfg);
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
   // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
@@ -30342,16 +30346,8 @@ async function spawnCliBody(
   ): Promise<{ comboKey: string; installSignature?: string } | undefined> => {
     const running = readRunningExeIdentity(pid, cliStart);
     if (!running) return undefined;
-    const provenance = readTraexSnapshotProvenance(running.path);
-    if (provenance) {
-      return {
-        comboKey: provenance.manifest.comboKey,
-        ...(provenance.sourceSignature ? { installSignature: provenance.sourceSignature } : {}),
-      };
-    }
     try {
-      const comboKey = (await captureTraexExecutableIdentity(running.path)).comboKey;
-      return comboKey ? { comboKey } : undefined;
+      return await captureTraexRunningContentIdentity(running);
     } catch (err) {
       log(`[traex-runtime] could not capture content identity for pid ${pid}: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;

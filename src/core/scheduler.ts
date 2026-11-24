@@ -461,15 +461,22 @@ function recordRuntimeCalendarCheck(
   mutateRuntimeTask(id, task => ({ ...task, lastCalendarCheck: check }));
 }
 
+/** A late callback for a terminal occurrence is only a duplicate transport
+ * event. It must never revive deferred state or account the same run twice. */
+function runHasTerminalOutcome(task: ScheduledTask | undefined, runId: string): boolean {
+  return task?.lastRunId === runId
+    && (task.lastStatus === 'ok' || task.lastStatus === 'error' || task.lastStatus === 'skipped');
+}
+
 function markRuntimeRun(
   id: string,
   success: boolean,
   error?: string,
   deliveryError?: string,
   runId?: string,
-  options: { settleParked?: boolean } = {},
+  options: { settleParked?: boolean; appId?: string } = {},
 ): { crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
-  const before = runtimeTask(id);
+  const before = runtimeTask(id, options.appId);
   if (!authorityStore) {
     const result = scheduleStore.markRun(id, success, error, deliveryError, runId, options) ?? {};
     notifyAfterSettle(before, id);
@@ -479,6 +486,7 @@ function markRuntimeRun(
   let result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number } = {};
   mutateRuntimeTask(id, task => {
     if (runId !== undefined && task.lastRunId !== runId) return;
+    if (runId !== undefined && runHasTerminalOutcome(task, runId)) return;
     const deferred = task.deferredRun;
     if (!success && !options.settleParked && runId !== undefined && deferred?.runId === runId && deferredRunHasUnsettledTargets(deferred)) {
       // The run is still owed targets (waiting / dispatching / ambiguous). A
@@ -538,7 +546,7 @@ function markRuntimeRun(
     // Until-done tasks are not consumed by a run (one-shot or failed): they
     // stay until marked done or their deadline's closing run is dispatched.
     return settleUntilDoneRun(settled, { success, runId, nowMs: Date.now() });
-  });
+  }, options.appId);
   notifyAfterSettle(before, id);
   return result;
 }
@@ -558,7 +566,8 @@ function recordDispatchOutcome(
   // the run and will re-claim it once the runtime handoff clears. Never record
   // success, a run-log terminal state, or repeat/once completion here.
   if (outcome === 'deferred') return;
-  if (current?.lastRunId === context.runId && current.deliveryFailureRunId === context.runId) {
+  if (current?.lastRunId === context.runId && current.deliveryFailureRunId === context.runId
+    && !runHasTerminalOutcome(current, context.runId)) {
     // A very short model turn can fail its send before dispatch returns.
     // Keep that failure; only account for the dispatch that just completed.
     mutateRuntimeTask(task.id, value => {
@@ -584,6 +593,7 @@ function recordDispatchOutcome(
       id: task.id, runAt: Date.now(), status: 'error', error: current.lastDeliveryError } });
     return;
   }
+  if (runHasTerminalOutcome(current, context.runId)) return;
   // A success callback is not an acceptance fact: fork return only means the
   // worker process was started. Settle only once every target's exact turn has
   // been proven accepted by the worker; otherwise keep the run parked so no
@@ -703,6 +713,7 @@ export function parkDeferredRun(
   let parked = false;
   mutateRuntimeTask(id, task => {
     if (task.lastRunId !== context.runId) return;
+    if (runHasTerminalOutcome(task, context.runId)) return;
     const existing = task.deferredRun?.runId === context.runId ? task.deferredRun : undefined;
     parked = true;
     // A retry reports the current state of every target, but a turn id is a
@@ -803,7 +814,7 @@ export function settleParkedRunOnce(
   // Clear the parked identity and record the terminal outcome in ONE task
   // write. A crash between two separate writes would otherwise leave
   // `lastStatus=deferred` without a deferredRun, which no restart exit owns.
-  const result = markRuntimeRun(id, false, reason, undefined, runId, { settleParked: true });
+  const result = markRuntimeRun(id, false, reason, undefined, runId, { settleParked: true, appId });
   const settled = runtimeTask(id, appId);
   // A concurrent newer run (or a failed conditional mutation) owns no external
   // settlement effects here. The exact-run check above and markRuntimeRun's
@@ -1783,6 +1794,7 @@ function runClaimedExecution(
     executeCallback(claimedTask, executionContext)
       .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
       .catch(err => {
+        if (runHasTerminalOutcome(runtimeTask(taskId), executionContext.runId)) return;
         logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
         const runResult = markRuntimeRun(taskId, false, err.message, undefined, executionContext.runId);
         const freshTask = runtimeTask(taskId) ?? claimedTask;
@@ -2514,6 +2526,7 @@ function dispatchClaimedRun(
   void Promise.resolve().then(() => executeCallback!(claimedTask, executionContext)).then(
     outcome => recordDispatchOutcome(claimedTask, executionContext, outcome),
     err => {
+      if (runHasTerminalOutcome(runtimeTask(claimedTask.id), executionContext.runId)) return;
       const msg = err instanceof Error ? err.message : String(err);
       const runResult = markRuntimeRun(claimedTask.id, false, msg, undefined, executionContext.runId);
       emitFailureAlertIfNeeded(runtimeTask(claimedTask.id) ?? claimedTask, runResult);

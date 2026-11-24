@@ -7,7 +7,7 @@ import { runtimeStartRefusal } from '../services/runtime-reservation.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
 import { handleResumeFallbackReport } from '../services/resume-fallback-notice.js';
 import {
-  compareLaunchedInstall,
+  compareRunningToInstall,
   readRunningExeIdentity,
   resolveInstallIdentity,
   sameExecutableObject,
@@ -1545,7 +1545,7 @@ export interface WorkerPoolCallbacks {
    *  worker generation ambiguous; the receiver decides retry policy. */
   onWorkerExit?: (
     ds: DaemonSession,
-    context: { sessionId: string; workerGeneration: number; code: number | null; signal: NodeJS.Signals | null },
+    context: { sessionId: string; workerGeneration: number; currentWorker: boolean; code: number | null; signal: NodeJS.Signals | null },
   ) => void | Promise<void>;
   /** The exact old daemon-session object has left the active registry and is
    * marked closed. Its in-memory queued work must be retired before any same-key
@@ -13074,7 +13074,8 @@ function revalidateInstallChangeClaim(
   }
   const install = resolveInstallIdentity(claim.entry);
   if (!install) return 'unknown';
-  const comparison = compareLaunchedInstall(claim.running, claim.installAtSpawn, install);
+  if (!sameExecutableObject(claim.running, claim.launchTargetIdentity ?? claim.installAtSpawn)) return 'unknown';
+  const comparison = compareRunningToInstall(claim.installAtSpawn, install);
   if (comparison === 'current') return 'reverted';
   if (comparison === 'unknown') return 'unknown';
   return 'stale';
@@ -13327,13 +13328,15 @@ export function requestInstallChangeSuspend(
     entry: string;
     running: ExecutableIdentity;
     installAtSpawn: ExecutableIdentity;
+    launchTargetIdentity?: ExecutableIdentity;
     install: ExecutableIdentity;
   },
   opts: { tryNow?: boolean } = {},
 ): boolean {
   // An unproven launch can never re-validate as stale; queuing it would only
   // park the session behind a claim that never resolves.
-  if (!sameExecutableObject(detail.running, detail.installAtSpawn)) return false;
+  const launchTarget = detail.launchTargetIdentity ?? detail.installAtSpawn;
+  if (!sameExecutableObject(detail.running, launchTarget)) return false;
   if (ds.pendingSuspendReason && ds.pendingSuspendReason !== CLI_INSTALL_CHANGED_SUSPEND) return false;
   const firstRequest = ds.pendingSuspendReason !== CLI_INSTALL_CHANGED_SUSPEND;
   if (firstRequest) {
@@ -13346,6 +13349,7 @@ export function requestInstallChangeSuspend(
       entry: detail.entry,
       running: detail.running,
       installAtSpawn: detail.installAtSpawn,
+      ...(detail.launchTargetIdentity ? { launchTargetIdentity: detail.launchTargetIdentity } : {}),
       workerGeneration: ds.workerGeneration ?? 0,
       ...(att?.cliSpawnGeneration !== undefined ? { cliSpawnGeneration: att.cliSpawnGeneration } : {}),
       ...(att?.cliPid !== undefined ? { cliPid: att.cliPid } : {}),
@@ -28412,7 +28416,8 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
-    if (ds.worker === worker) ds.codexAppInterruptTarget = undefined;
+    const currentWorker = ds.worker === worker;
+    if (currentWorker) ds.codexAppInterruptTarget = undefined;
     if (sessionController && contractWorker) { try { sessionController.workerLost(contractWorker); } catch (error) { logger.warn(`[${t}] Worker loss contract not persisted: ${String(error)}`); } }
     clearInterval(cliNoticeTimer);
     if (ownsLifecycleMutation()) {
@@ -28638,6 +28643,7 @@ function setupWorkerHandlers(
         workerExitReconciled = cb.onWorkerExit?.(ds, {
           sessionId: ds.session.sessionId,
           workerGeneration,
+          currentWorker,
           code,
           signal,
         });

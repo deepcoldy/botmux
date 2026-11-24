@@ -2258,4 +2258,39 @@ describe('retained TRAE scheduling uses the actual session launch', () => {
       rmSync(isolated, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    ['wrapperCli', (session: Session) => { session.cliLaunchSnapshot!.wrapperCli = 'gateway traex'; }],
+    ['forge-traex', (session: Session) => { session.cliLaunchSnapshot!.cliLaunchMode = 'forge-traex'; }],
+    ['scratch', (session: Session) => { session.sandbox = 'scratch'; }],
+    ['riff', (session: Session) => { session.backendType = 'riff'; }],
+    ['mojo', (session: Session) => { session.backendType = 'mojo'; }],
+  ] as const)('skips an unreadable shared-domain precheck for %s', async (_label, mutate) => {
+    const isolated = mkdtempSync(join(tmpdir(), 'pr2-precheck-excluded-'));
+    const home = join(isolated, 'home');
+    const release = join(isolated, 'release');
+    mkdirSync(join(home, 'skills'), { recursive: true });
+    mkdirSync(release, { recursive: true });
+    writeFileSync(join(home, 'skills', '.botmux-traex-runtime.json'), '{broken');
+    writeFileSync(join(release, 'traex'), 'release-a');
+    const prior = { cliId: BOT.config.cliId, cliPathOverride: BOT.config.cliPathOverride, env: (BOT.config as any).env };
+    try {
+      BOT.config.cliId = 'traex';
+      (BOT.config as any).cliPathOverride = join(release, 'traex');
+      (BOT.config as any).env = { TRAE_HOME: home };
+      expect(realRuntimePrecheck({ traeHome: home, releaseDir: release }).state).toBe('unknown');
+      const existing = retainedSession(join(release, 'traex'), false);
+      mutate(existing.session);
+      const active = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), existing]]);
+      const outcome = await executeScheduledTask(
+        baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+        active, refreshCliVersion,
+      );
+      expect(outcome).toBe('dispatched');
+      expect(forkWorkerMock).toHaveBeenCalledOnce();
+    } finally {
+      Object.assign(BOT.config, prior);
+      rmSync(isolated, { recursive: true, force: true });
+    }
+  });
 });

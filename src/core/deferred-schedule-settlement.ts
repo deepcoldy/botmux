@@ -38,13 +38,18 @@ export function noteDeferredScheduleRunFailure(
  * sessions do not take this exit. The scheduler settlement is idempotent, so
  * duplicate session run indexes and repeated exit edges remain single-shot. */
 export function settleHeldScheduleRunsOnWorkerExit(
-  session: Pick<DaemonSession['session'], 'scheduledRun' | 'scheduledRuns'>,
+  session: Pick<DaemonSession['session'], 'scheduledRun' | 'scheduledRuns' | 'queuedActivationTail'>,
   larkAppId: string,
   deps: {
     getDeferredRun: (taskId: string, appId: string) => ScheduledTask['deferredRun'] | undefined;
     settle: (taskId: string, runId: string, reason: string, appId?: string) => boolean;
   },
+  exit: { currentWorker: boolean },
 ): number {
+  // Late exit events from an old generation say nothing about a replacement
+  // that now owns the turn. Only the worker still bound to the session at the
+  // moment it exited may settle scheduled work.
+  if (!exit.currentWorker) return 0;
   const scheduledRuns = [
     ...(session.scheduledRun ? [session.scheduledRun] : []),
     ...Object.values(session.scheduledRuns ?? {}),
@@ -53,6 +58,10 @@ export function settleHeldScheduleRunsOnWorkerExit(
   for (const run of scheduledRuns) {
     const parked = deps.getDeferredRun(run.taskId, larkAppId);
     if (!parked || parked.runId !== run.runId) continue;
+    // The old runtime has explicitly transferred this exact turn to its
+    // replacement. Its exit must not fail work that is waiting in that queue.
+    if (session.queuedActivationTail?.some(entry =>
+      entry.turnId === run.turnId && entry.ownerRuntime === 'new')) continue;
     if (Object.values(parked.acceptedTargets ?? {}).includes(run.turnId)) continue;
     if (!Object.values(parked.heldTargets ?? {}).includes(run.turnId)) continue;
     if (deps.settle(

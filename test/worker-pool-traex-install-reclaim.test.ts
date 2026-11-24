@@ -114,6 +114,7 @@ import { observeTraexInstall, __testOnly_resetTraexInstallWatch } from '../src/s
 import { isTraexProcess } from '../src/core/traex-leaf-pid.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { standaloneSleep } from './helpers/standalone-sleep.js';
+import { materializeTraexSnapshot } from '../src/services/traex-runtime-snapshot.js';
 
 const dirs: string[] = [];
 const children: ChildProcess[] = [];
@@ -685,6 +686,109 @@ describe('independent review regressions', () => {
 });
 
 describe('launch provenance', () => {
+  async function snapshotUpgrade() {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-traex-snapshot-reclaim-'));
+    dirs.push(root);
+    const releaseA = join(root, 'release-a');
+    const releaseB = join(root, 'release-b');
+    for (const [dir, value] of [[releaseA, 'a'], [releaseB, 'b']] as const) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'traex'), `traex-${value}`);
+      writeFileSync(join(dir, 'traex-code-mode-host'), `helper-${value}`);
+      writeFileSync(join(dir, 'trae-installation.json'), JSON.stringify({ version: value }));
+    }
+    const entry = join(root, 'current-traex');
+    const select = (target: string) => {
+      try { unlinkSync(entry); } catch { /* first publication */ }
+      symlinkSync(target, entry);
+    };
+    select(join(releaseA, 'traex'));
+    const snapshot = await materializeTraexSnapshot({
+      releaseDir: releaseA,
+      executablePath: join(releaseA, 'traex'),
+      snapshotsRoot: join(root, 'snapshots'),
+    });
+    const installAtSpawn = resolveInstallIdentity(entry)!;
+    const launchTargetIdentity = resolveInstallIdentity(snapshot.traexPath)!;
+    select(join(releaseB, 'traex'));
+    return {
+      entry,
+      select,
+      releaseA,
+      running: launchTargetIdentity,
+      launchTargetIdentity,
+      installAtSpawn,
+      install: resolveInstallIdentity(entry)!,
+    };
+  }
+
+  function snapshotClaim(
+    fixture: Awaited<ReturnType<typeof snapshotUpgrade>>,
+  ): NonNullable<DaemonSession['pendingSuspendInstallClaim']> {
+    return {
+      entry: fixture.entry,
+      running: fixture.running,
+      installAtSpawn: fixture.installAtSpawn,
+      launchTargetIdentity: fixture.launchTargetIdentity,
+      workerGeneration: 7,
+      cliSpawnGeneration: 1,
+    };
+  }
+
+  function snapshotAttestation(fixture: Awaited<ReturnType<typeof snapshotUpgrade>>) {
+    return {
+      backendType: 'tmux' as const,
+      credentialIsolated: false,
+      cliExe: fixture.running,
+      cliInstallEntry: fixture.entry,
+      cliInstallAtSpawn: fixture.installAtSpawn,
+      cliLaunchTargetIdentity: fixture.launchTargetIdentity,
+      cliSpawnGeneration: 1,
+    };
+  }
+
+  it('queues a real snapshot runtime for reclaim when the source install changes', async () => {
+    const fixture = await snapshotUpgrade();
+    expect(fixture.running.ino).not.toBe(fixture.installAtSpawn.ino);
+    const ds = makeDs({
+      lastScreenStatus: 'working',
+      localProcessAttestation: snapshotAttestation(fixture),
+    });
+    expect(observeTraexInstall(ds, 'traex')).toMatchObject({ state: 'stale' });
+    expect(sweepTraexInstallChanges([ds], { cliId: 'traex' })).toBe(1);
+    expect(ds.pendingSuspendInstallClaim?.launchTargetIdentity).toEqual(fixture.launchTargetIdentity);
+  });
+
+  it('revalidates and reclaims a queued snapshot claim against its launch target', async () => {
+    const fixture = await snapshotUpgrade();
+    const ds = makeDs({
+      lastScreenStatus: 'idle',
+      localProcessAttestation: snapshotAttestation(fixture),
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: snapshotClaim(fixture),
+    });
+    const worker = ds.worker as any;
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+  });
+
+  it('cancels a snapshot claim when the source entry reverts before idle', async () => {
+    const fixture = await snapshotUpgrade();
+    const ds = makeDs({
+      lastScreenStatus: 'working',
+      localProcessAttestation: snapshotAttestation(fixture),
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: snapshotClaim(fixture),
+    });
+    fixture.select(join(fixture.releaseA, 'traex'));
+    ds.lastScreenStatus = 'idle';
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect((ds.worker as any).send).not.toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+
   it('never queues a claim for a running image the entry did not name at spawn', () => {
     const { entry, identity } = tempEntry('wrapper-script');
     const real = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'linux-proc-exe' as const };

@@ -35960,7 +35960,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       settleHeldScheduleRunsOnWorkerExit(ds.session, ds.larkAppId, {
         getDeferredRun: (taskId, appId) => scheduler.getRuntimeTask(taskId, appId)?.deferredRun,
         settle: scheduler.settleParkedRunOnce,
-      });
+      }, { currentWorker: context.currentWorker });
       // A Node worker exit (including the SIGKILL backstop) proves this exact
       // generation can no longer write. Unlike onCliExit, this is safe for
       // persistent-pane backends and therefore owns crash-path release.

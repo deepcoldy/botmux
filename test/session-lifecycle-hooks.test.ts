@@ -872,6 +872,30 @@ describe('worker-pool lifecycle hook integration', () => {
       expect.objectContaining({ sessionId: 'sid-lifecycle-test', reason: 'exit_code_1' }),
     );
   });
+
+  it('marks a late exit from a superseded worker as not current', () => {
+    const onWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
+    const oldWorker = makeFakeWorker();
+    const ds = makeDs({ worker: oldWorker });
+    __testOnly_setupWorkerHandlers(ds, oldWorker);
+    ds.worker = makeFakeWorker();
+    ds.workerGeneration = 2;
+
+    oldWorker.emit('exit', 0, null);
+
+    expect(onWorkerExit).toHaveBeenCalledWith(ds, expect.objectContaining({
+      sessionId: 'sid-lifecycle-test',
+      workerGeneration: 1,
+      currentWorker: false,
+    }));
+  });
 });
 
 describe('Codex App effort IPC', () => {

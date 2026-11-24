@@ -521,6 +521,7 @@ export async function markTraexRuntimeRunning(
     ...(detail.snapshotDir ? { snapshotDir: detail.snapshotDir } : {}),
     ...(detail.comboKey && occupant.comboKey === '' ? { comboKey: detail.comboKey } : {}),
     ...(detail.comboKey && detail.installSignature && occupant.installSignature === undefined
+      && (occupant.comboKey === '' || occupant.comboKey === detail.comboKey)
       ? { installSignature: detail.installSignature } : {}),
     heartbeatAt: now,
     leaseUntil: now + TRAEX_RUNTIME_LEASE_MS,

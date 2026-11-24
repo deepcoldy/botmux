@@ -11,6 +11,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,16 +33,17 @@ import {
   type TraexRuntimeOccupant,
 } from '../src/services/traex-runtime-registry.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
+import { resolveInstallIdentity } from '../src/services/cli-install-identity.js';
 import {
   captureTraexReleaseIdentity,
   comboKeyFromHashes,
   materializeTraexSnapshot,
-  readTraexSnapshotProvenance,
   __testOnly_resetTraexSnapshotCache,
 } from '../src/services/traex-runtime-snapshot.js';
 import {
   acquireTraexRuntimeLease,
   acquireTraexRuntimeOccupancy,
+  captureTraexRunningContentIdentity,
   computeTraexInstallSignature,
   precheckTraexRuntime,
   traexLaunchUsesSharedRuntimeGate,
@@ -222,18 +224,21 @@ describe('traex runtime registry', () => {
       occupantId: 'opaque', comboKey: '', force: true, occupancyOnly: true,
       workerPid: process.ppid, daemonPid: process.ppid,
     });
-    await markTraexRuntimeRunning(domain, 'opaque', { cliPid: process.pid, comboKey: 'content-a' });
-    expect(readTraexRuntimeOccupants(domain)?.find(o => o.occupantId === 'opaque')?.comboKey)
-      .toBe('content-a');
+    await markTraexRuntimeRunning(domain, 'opaque', { cliPid: process.pid, comboKey: 'content-a', installSignature: 'signature-a' });
+    expect(readTraexRuntimeOccupants(domain)?.find(o => o.occupantId === 'opaque'))
+      .toMatchObject({ comboKey: 'content-a', installSignature: 'signature-a' });
 
     // A proven identity is authoritative: a later observation never rewrites it.
     const provenDomain = domainFor(traeHome());
     await acquireTraexRuntimeStart(provenDomain, {
       occupantId: 'proven', comboKey: 'content-b', workerPid: 2_000_000_000, daemonPid: 2_000_000_000,
     });
-    await markTraexRuntimeRunning(provenDomain, 'proven', { cliPid: process.pid, comboKey: 'content-c' });
-    expect(readTraexRuntimeOccupants(provenDomain)?.find(o => o.occupantId === 'proven')?.comboKey)
-      .toBe('content-b');
+    await markTraexRuntimeRunning(provenDomain, 'proven', {
+      cliPid: process.pid, comboKey: 'content-c', installSignature: 'signature-c',
+    });
+    const proven = readTraexRuntimeOccupants(provenDomain)?.find(o => o.occupantId === 'proven');
+    expect(proven?.comboKey).toBe('content-b');
+    expect(proven?.installSignature).toBeUndefined();
   });
 
   it('inherits the proven content key when the same live CLI is re-registered', async () => {
@@ -260,8 +265,8 @@ describe('traex runtime registry', () => {
       releaseDir: dir,
       snapshotsRoot: tempDir('botmux-traex-snapshots-'),
     });
-    const provenance = readTraexSnapshotProvenance(snapshot.traexPath);
-    expect(provenance?.sourceSignature).toBe(computeTraexInstallSignature(dir));
+    const identity = await captureTraexRunningContentIdentity(resolveInstallIdentity(snapshot.traexPath)!);
+    expect(identity?.installSignature).toBe(computeTraexInstallSignature(dir));
     const cliStart = readProcessStartIdentity(process.pid);
     const attached = await acquireTraexRuntimeOccupancy({
       traeHome: home,
@@ -277,11 +282,38 @@ describe('traex runtime registry', () => {
 
     // This is the worker's leaf-backfill contract: the content key and the
     // source signature come from the same verified snapshot manifest.
-    await attached.lease.markRunning(process.pid, cliStart, {
-      comboKey: provenance!.manifest.comboKey,
-      ...(provenance!.sourceSignature ? { installSignature: provenance!.sourceSignature } : {}),
-    });
+    await attached.lease.markRunning(process.pid, cliStart, identity);
     expect(precheckTraexRuntime({ traeHome: home, releaseDir: dir }).state).toBe('compatible');
+  });
+
+  it('restores a non-snapshot legacy runtime with its verified install signature', async () => {
+    const home = traeHome();
+    const dir = release('legacy');
+    const identity = await captureTraexRunningContentIdentity(resolveInstallIdentity(join(dir, 'traex'))!);
+    expect(identity?.installSignature).toBe(computeTraexInstallSignature(dir));
+    const cliStart = readProcessStartIdentity(process.pid);
+    const attached = await acquireTraexRuntimeOccupancy({
+      traeHome: home,
+      releaseDir: dir,
+      existingRuntime: true,
+      cliPid: process.pid,
+      ...(cliStart ? { cliStart } : {}),
+      workerPid: process.ppid,
+      daemonPid: process.ppid,
+    });
+    expect(attached.kind).toBe('granted');
+    if (attached.kind !== 'granted') return;
+    await attached.lease.markRunning(process.pid, cliStart, identity);
+    expect(precheckTraexRuntime({ traeHome: home, releaseDir: dir }).state).toBe('compatible');
+  });
+
+  it('keeps an unlinked and replaced running object unknown instead of hashing new bytes', async () => {
+    const dir = release('old');
+    const executable = join(dir, 'traex');
+    const running = resolveInstallIdentity(executable)!;
+    unlinkSync(executable);
+    writeFileSync(executable, 'new-version');
+    expect(await captureTraexRunningContentIdentity(running)).toBeUndefined();
   });
 
   it('lets a same-content start overlap an opaque runtime after its identity is backfilled', async () => {

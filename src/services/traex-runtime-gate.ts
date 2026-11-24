@@ -22,6 +22,11 @@ import { join } from 'node:path';
 
 import { readProcessStartIdentity } from '../utils/process-identity.js';
 import {
+  resolveInstallIdentity,
+  sameExecutableObject,
+  type ExecutableIdentity,
+} from './cli-install-identity.js';
+import {
   resolveTraexRuntimeDomain,
   traexHomeForDomain,
   type TraexDomainResolution,
@@ -44,6 +49,7 @@ import {
   captureTraexExecutableIdentity,
   defaultTraexSnapshotRoot,
   materializeTraexSnapshot,
+  readTraexSnapshotProvenance,
   releaseDirForExecutable,
   type TraexRuntimeContent,
 } from './traex-runtime-snapshot.js';
@@ -653,6 +659,30 @@ export function precheckTraexRuntime(input: {
     return { state: 'blocked', blockers, detail: describeTraexRuntimeBlockers(blockers) };
   }
   return { state: 'compatible', occupants: alive.map((occupant) => occupant.occupantId) };
+}
+
+/** Recover both content and cheap scheduling identity for an already-running
+ * executable. The display path is only a hint: prove it still names the same
+ * object the kernel reported before hashing it. An unlink+in-place replacement
+ * therefore stays unknown instead of relabelling old process bytes as new. */
+export async function captureTraexRunningContentIdentity(
+  running: ExecutableIdentity,
+): Promise<{ comboKey: string; installSignature?: string } | undefined> {
+  if (!sameExecutableObject(running, resolveInstallIdentity(running.path))) return undefined;
+  const provenance = readTraexSnapshotProvenance(running.path);
+  if (provenance) {
+    return {
+      comboKey: provenance.manifest.comboKey,
+      ...(provenance.sourceSignature ? { installSignature: provenance.sourceSignature } : {}),
+    };
+  }
+  const comboKey = (await captureTraexExecutableIdentity(running.path)).comboKey;
+  if (!comboKey) return undefined;
+  const installSignature = computeTraexInstallSignature(releaseDirForExecutable(running.path));
+  return {
+    comboKey,
+    ...(installSignature ? { installSignature } : {}),
+  };
 }
 
 /** Birth token for the worker's own daemon parent (used when reserving). */

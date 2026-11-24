@@ -51,6 +51,7 @@ export type TraexInstallObservation =
       entry: string;
       running: ExecutableIdentity;
       installAtSpawn: ExecutableIdentity;
+      launchTargetIdentity?: ExecutableIdentity;
       install: ExecutableIdentity;
     };
 
@@ -103,7 +104,7 @@ export function observeTraexInstall(
     if (!install) return { state: 'unknown', reason: 'install-entry-missing', entry };
     const comparison = compareRunningToInstall(installAtSpawn, install);
     if (comparison === 'unknown') return { state: 'unknown', reason: 'identity-unprovable', entry };
-    return { state: comparison, entry, running, installAtSpawn, install };
+    return { state: comparison, entry, running, installAtSpawn, launchTargetIdentity, install };
   }
 
   // Legacy attestation: the entry may already point at the snapshot the
@@ -121,7 +122,7 @@ export function observeTraexInstall(
     const currentSignature = traexReleaseSignature(provenance.sourceReleaseDir);
     if (!currentSignature) return { state: 'unknown', reason: 'install-entry-missing', entry };
     if (currentSignature === provenance.sourceSignature) {
-      return { state: 'current', entry, running, installAtSpawn: snapshotInstall, install: snapshotInstall };
+      return { state: 'current', entry, running, installAtSpawn: snapshotInstall, launchTargetIdentity: snapshotInstall, install: snapshotInstall };
     }
     // The source changed. We can prove staleness without an identity object
     // for the new content, but the return shape requires one; resolve the
@@ -129,7 +130,7 @@ export function observeTraexInstall(
     const install = resolveInstallIdentity(provenance.sourceReleaseDir)
       ?? cachedInstallIdentity(entry, now);
     if (!install) return { state: 'unknown', reason: 'install-entry-missing', entry };
-    return { state: 'stale', entry, running, installAtSpawn: snapshotInstall, install };
+    return { state: 'stale', entry, running, installAtSpawn: snapshotInstall, launchTargetIdentity: snapshotInstall, install };
   }
 
   // Direct (non-snapshot) launch: the process must run the very object the

@@ -56,6 +56,7 @@ import {
   probePersistentBackendTargets,
   persistentBackendTargetKey,
   killPersistentBackendTarget,
+  isRemoteBackendType,
   type PersistentBackendType,
 } from './persistent-backend.js';
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
@@ -5618,7 +5619,7 @@ function scheduledTraexRuntimeBlocker(
   bot: {
     config: Pick<
       BotConfig,
-      'cliId' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'env' | 'envUnset' | 'envPolicy'
+      'cliId' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'sandbox' | 'backendType' | 'env' | 'envUnset' | 'envPolicy'
     >;
   },
   task: ScheduledTask,
@@ -5650,6 +5651,12 @@ function scheduledTraexRuntimeBlocker(
   // The worker does not acquire a shared-domain lease for these launch modes;
   // the scheduler must not invent a blocker the actual dispatch will ignore.
   if (!traexLaunchUsesSharedRuntimeGate({ wrapperCli, cliLaunchMode })) return undefined;
+  const sandbox = selected?.initConfig?.sandbox ?? selected?.session.sandbox ?? bot.config.sandbox;
+  const backendType = selected?.initConfig?.backendType ?? selected?.session.backendType
+    ?? bot.config.backendType ?? config.daemon.backendType;
+  // Scratch owns a session-private cache and remote backends do not exec in
+  // this daemon's local registry domain, exactly as in the worker gate.
+  if (sandbox === 'scratch' || isRemoteBackendType(backendType)) return undefined;
   try {
     const configuredPath = launchSnapshot
       ? launchSnapshot.cliPathOverride
