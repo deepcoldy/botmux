@@ -133,6 +133,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('lark-tool-binding'),
   // lark-user-owner-fallback：`{ enabled: boolean }`（没有发起人时 --as user 用主人的飞书身份）。
   putBotConfig('lark-user-owner-fallback'),
+  putBotConfig('auto-avoid-approval'),
   {
     method: 'GET',
     path: botPath('trigger-user-auth-status'),
