@@ -586,6 +586,15 @@ function withProviderRetryHint(
 /** Model placeholder Claude Code writes on assistant records no model produced. */
 export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
 
+/** Any non-API-error assistant record Claude Code wrote locally, regardless of
+ *  its content shape. Provider-success accounting must exclude all of these;
+ *  turn-terminal classification narrows this further for local tool calls. */
+export function isSyntheticAssistantRecord(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object' || ev.isApiErrorMessage === true) return false;
+  const role = ev.message?.role ?? ev.type;
+  return role === 'assistant' && ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
+}
+
 /**
  * A `type:"assistant"` record that Claude Code wrote WITHOUT calling the model
  * and WITHOUT flagging it as an API error. Observed shape (Claude Code 2.1.263,
@@ -608,11 +617,8 @@ export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
  * keep the logical turn open even when stamped with `stop_sequence`.
  */
 export function isSyntheticNoModelReplyEvent(ev: TranscriptEvent | null | undefined): boolean {
-  if (!ev || typeof ev !== 'object') return false;
-  if (ev.isApiErrorMessage === true) return false;
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'assistant') return false;
-  return ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER && !hasToolUseBlock(ev);
+  if (!ev || !isSyntheticAssistantRecord(ev)) return false;
+  return !hasToolUseBlock(ev);
 }
 
 export function classifyClaudeTerminalEvent(
@@ -1275,8 +1281,7 @@ export class ClaudeModelRequestClock {
   /** Start and completion of a main-thread assistant record that proves a
    *  served request; undefined for any other record. */
   private servedRequest(ev: TranscriptEvent): { startedAt: number; completedAt: number } | undefined {
-    if (ev.type !== 'assistant' || ev.isApiErrorMessage === true
-      || ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER) return undefined;
+    if (ev.type !== 'assistant' || ev.isApiErrorMessage === true || isSyntheticAssistantRecord(ev)) return undefined;
     const usage = ev.message?.usage;
     const tokens = (usage?.input_tokens ?? 0) + (usage?.cache_read_input_tokens ?? 0) + (usage?.cache_creation_input_tokens ?? 0);
     if (!(tokens > 0)) return undefined;

@@ -79,6 +79,17 @@ describe('ClaudeModelRequestClock', () => {
         isApiErrorMessage: true, error: 'server_error',
         message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: 'API Error: 529 overloaded' }], usage: { input_tokens: 0 } },
       } as Partial<TranscriptEvent>),
+      // The API-error exclusion is independent of the model placeholder: even
+      // a real model field and non-zero usage must not turn a failure into a
+      // served request.
+      served('10:00:05', {
+        isApiErrorMessage: true, error: 'server_error',
+        message: {
+          role: 'assistant', model: 'claude-opus-5-5', stop_reason: 'stop_sequence',
+          content: [{ type: 'text', text: 'API Error: 500 internal server error' }],
+          usage: { input_tokens: 100, output_tokens: 20 },
+        },
+      } as Partial<TranscriptEvent>),
     ]);
     expect(clock.lastServedAt()).toBeUndefined();
     clock.observe(request('10:02:00'));
