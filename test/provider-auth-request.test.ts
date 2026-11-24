@@ -27,7 +27,7 @@ beforeEach(() => {
   deps = {
     requestMeegoLogin: vi.fn(async () => meego),
     bytedcliAuthorized: vi.fn(async () => false as boolean | 'unknown'),
-    adoptBytedcliForTurn: vi.fn(async () => 'none' as 'adopted' | 'already' | 'none'),
+    adoptBytedcliForTurn: vi.fn(async () => 'none' as 'adopted' | 'already' | 'none' | 'unavailable'),
     startBytedcliLogin: vi.fn(async () => ({ state: 'challenge', challenge: { authUrl: BYTED_URL, completeToken: 'tok-b' } }) as BytedcliLoginStart),
     deliver: vi.fn(async () => delivery),
     now: () => clock,
@@ -203,7 +203,9 @@ describe('requestProviderAuth — ByteCloud already authorized mid-turn', () => 
   it('keeps the next-turn wording when the turn cannot adopt it', async () => {
     deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
     deps.adoptBytedcliForTurn = vi.fn(async () => 'none' as const);
-    expect((await ask('bytedcli')).message).toContain('下一轮');
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('ready');
+    expect(r.message).toContain('下一轮');
   });
 
   it('says no login is needed when the turn already holds the person\'s identity', async () => {
@@ -212,5 +214,29 @@ describe('requestProviderAuth — ByteCloud already authorized mid-turn', () => 
     const r = await ask('bytedcli');
     expect(r.status).toBe('ready');
     expect(r.message).toContain('不需要再登录');
+  });
+
+  it('returns unavailable instead of ready when adopting the login fails transiently', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => 'unavailable' as const);
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('unavailable');
+    expect(deps.deliver).not.toHaveBeenCalled();
+  });
+
+  it('catches unexpected errors thrown by adoptBytedcliForTurn and returns unavailable', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => { throw new Error('bytedcli authorization service unavailable'); });
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('unavailable');
+    expect(deps.deliver).not.toHaveBeenCalled();
+  });
+
+  it('returns unavailable when adoption is superseded by a live policy or generation change', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => 'superseded' as const);
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('unavailable');
+    expect(deps.deliver).not.toHaveBeenCalled();
   });
 });
