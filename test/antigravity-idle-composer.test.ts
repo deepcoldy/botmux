@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { appendFileSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, mkdirSync, writeFileSync, renameSync, statSync, utimesSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -168,6 +168,10 @@ describe('Antigravity adapter isSessionBusy screen reconciliation', () => {
     return adapter;
   }
 
+  function transcriptPath(name = 'transcript.jsonl') {
+    return join(tmpHome, '.gemini', 'antigravity-cli', 'brain', cliSessionId, '.system_generated', 'logs', name);
+  }
+
   beforeEach(() => {
     tmpHome = mkdtempSync(join(tmpdir(), 'bmx-agy-home-'));
     previousHome = process.env.HOME;
@@ -234,6 +238,95 @@ describe('Antigravity adapter isSessionBusy screen reconciliation', () => {
     }
   });
 
+  it('keeps a timestamped no-index cold tail stable across full and replacement, but not new work', () => {
+    const path = transcriptPath();
+    const tail = {
+      source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE',
+      created_at: '2026-11-24T00:00:00Z', content: 'old work',
+    };
+    writeFileSync(path, JSON.stringify(tail) + '\n');
+    const adapter = resume();
+    const probe = () => adapter.isSessionBusy!({ cliSessionId, getCurrentScreen: () => PLAIN_IDLE_SCREEN });
+    expect(probe()).toBe(false);
+
+    const full = transcriptPath('transcript_full.jsonl');
+    writeFileSync(full, JSON.stringify(tail) + '\n');
+    expect(probe()).toBe(false);
+
+    rmSync(full);
+    const replacement = transcriptPath('replacement.jsonl');
+    writeFileSync(replacement, JSON.stringify(tail) + '\n');
+    rmSync(path);
+    renameSync(replacement, path);
+    expect(probe()).toBe(false);
+
+    appendFileSync(path, JSON.stringify({ ...tail, created_at: '2026-11-24T00:01:00Z', content: 'new work' }) + '\n');
+    expect(probe()).toBe(true);
+  });
+
+  it('distinguishes different no-index inputs even when their timestamps collide', () => {
+    const path = transcriptPath();
+    const tail = {
+      source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE',
+      created_at: '2026-11-24T00:00:00Z', content: 'old work',
+    };
+    writeFileSync(path, JSON.stringify(tail) + '\n');
+    const adapter = resume();
+    const probe = () => adapter.isSessionBusy!({ cliSessionId, getCurrentScreen: () => PLAIN_IDLE_SCREEN });
+    expect(probe()).toBe(false);
+    appendFileSync(path, JSON.stringify({ ...tail, content: 'new work at the same timestamp' }) + '\n');
+    expect(probe()).toBe(true);
+  });
+
+  it('observes compact-first progress while full is stale or half-written', () => {
+    const path = transcriptPath();
+    const tail = {
+      source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE',
+      created_at: '2026-11-24T00:00:00Z', content: 'old work',
+    };
+    writeFileSync(path, JSON.stringify(tail) + '\n');
+    const full = transcriptPath('transcript_full.jsonl');
+    writeFileSync(full, JSON.stringify(tail) + '\n');
+    const adapter = resume();
+    const probe = () => adapter.isSessionBusy!({ cliSessionId, getCurrentScreen: () => PLAIN_IDLE_SCREEN });
+    expect(probe()).toBe(false);
+
+    appendFileSync(path, JSON.stringify({ type: 'GENERIC', step_index: 3, status: 'DONE', content: 'new tool result' }) + '\n');
+    writeFileSync(full, JSON.stringify(tail) + '\n{"step_index":');
+    expect(probe()).toBe(true);
+  });
+
+  it('does not release an equal-freshness busy/final disagreement', () => {
+    const path = transcriptPath();
+    const full = transcriptPath('transcript_full.jsonl');
+    writeFileSync(full, JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 2, status: 'DONE', tool_calls: [{ name: 'run_command' }] }) + '\n');
+    const adapter = resume();
+    const probe = () => adapter.isSessionBusy!({ cliSessionId, getCurrentScreen: () => PLAIN_IDLE_SCREEN });
+    expect(probe()).toBe(false);
+
+    appendFileSync(path, JSON.stringify({ type: 'GENERIC', step_index: 3, status: 'DONE', content: 'new tool result' }) + '\n');
+    writeFileSync(full, JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 2, status: 'DONE', content: 'old final' }) + '\n');
+    const sameTime = new Date('2026-11-24T00:00:00Z');
+    utimesSync(path, sameTime, sameTime);
+    utimesSync(full, sameTime, sameTime);
+    expect(probe()).toBe(true);
+  });
+
+  it('treats a non-empty malformed compact tail as unknown work, not an older final', () => {
+    const path = transcriptPath();
+    writeFileSync(path, JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 2, status: 'DONE', content: 'done' }) + '\n');
+    const adapter = createAntigravityAdapter();
+    const probe = () => adapter.isSessionBusy!({ cliSessionId, getCurrentScreen: () => PLAIN_IDLE_SCREEN });
+    expect(probe()).toBe(false);
+
+    appendFileSync(path, '{"type":"USER_INPUT"');
+    expect(probe()).toBe(true);
+    appendFileSync(path, ',"content":"new work"}\n');
+    expect(probe()).toBe(true);
+    appendFileSync(path, JSON.stringify({ type: 'PLANNER_RESPONSE', step_index: 3, status: 'DONE', content: 'new final' }) + '\n');
+    expect(probe()).toBe(false);
+  });
+
   it('stops treating the cold-resume transcript as stale as soon as agy appends work', () => {
     const adapter = resume();
     const probe = () => adapter.isSessionBusy!({ cliSessionId, getCurrentScreen: () => PLAIN_IDLE_SCREEN });
@@ -247,6 +340,9 @@ describe('Antigravity adapter isSessionBusy screen reconciliation', () => {
     appendFileSync(full, JSON.stringify({ type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'run_command' }] }) + '\n');
     expect(probe()).toBe(true);
     appendFileSync(full, JSON.stringify({ type: 'PLANNER_RESPONSE', content: 'done' }) + '\n');
+    // A full-only final in a later write generation closes the preceding work.
+    const later = new Date(statSync(full).mtimeMs + 1_000);
+    utimesSync(full, later, later);
     expect(probe()).toBe(false);
   });
 
