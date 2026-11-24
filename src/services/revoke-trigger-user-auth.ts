@@ -72,6 +72,9 @@ export async function revokeTriggerUserAuth(args: {
   const meego = clearMeegoAuth(args.openId);
   const userToken = clearUserToken(args.appId, args.brand, args.openId);
   const identitiesDropped = dropPublishedIdentitiesForOpenId(args.sessionDataDir, args.openId);
+  // Close the whole asynchronous revocation window: offers that started while
+  // remote logout was in flight must not survive the deletion of their login.
+  clearAuthorizationNoticesForUser(args.openId);
 
   return {
     ok: true,

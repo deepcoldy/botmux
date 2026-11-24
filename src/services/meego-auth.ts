@@ -28,6 +28,7 @@
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
 import { parseEnvelope, runBytedcliInHome } from './bytedcli-auth.js';
 import { ensureMeegoStore, meegoHomeFor, meegoPersonRoot, MEEGO_STORE_DIR, MEEGO_TENANTS, type MeegoTenant } from './bytedcli-home.js';
@@ -71,20 +72,52 @@ function readChallenge(ctx: Ctx, now: number): SavedChallenge | null {
   } catch { return null; }
 }
 
-function writeChallenge(ctx: Ctx, challenge: SavedChallenge): void {
-  atomicWriteFileSync(challengePath(ctx), JSON.stringify(challenge), { mode: 0o600 });
+/** Serialize every botmux challenge mutation across daemons. Provider calls stay
+ * outside the lock; only the local read/compare/write/delete sections enter it. */
+function withChallengeLock<T>(ctx: Ctx, fn: () => T): T {
+  return withFileLockSync(challengePath(ctx), fn);
 }
 
-function clearChallenge(ctx: Ctx): void {
+function removeChallengeUnlocked(ctx: Ctx): void {
   try { rmSync(challengePath(ctx), { force: true }); } catch { /* already gone */ }
 }
 
-/** Remove the challenge file only when it still belongs to `token`, so a stale
- *  background poller cannot erase a newer challenge written by another daemon. */
-function clearChallengeIfMatches(ctx: Ctx, token: string): void {
+/** Publish a newly minted challenge only if no other daemon has already
+ * installed a live one while our provider call was in flight. */
+function writeChallengeIfAbsent(ctx: Ctx, challenge: SavedChallenge, now: number): SavedChallenge {
+  return withChallengeLock(ctx, () => {
+    const existing = readChallenge(ctx, now);
+    if (existing) return existing;
+    atomicWriteFileSync(challengePath(ctx), JSON.stringify(challenge), { mode: 0o600 });
+    return challenge;
+  });
+}
+
+/** Remove the challenge only when it still belongs to `token`. The comparison
+ * and unlink share the writer lock, so another daemon cannot install a new
+ * token between them. Returns false when a different live challenge remains. */
+function clearChallengeIfMatches(ctx: Ctx, token: string): boolean {
   try {
-    const raw = JSON.parse(readFileSync(challengePath(ctx), 'utf8')) as Partial<SavedChallenge>;
-    if (raw.token === token) clearChallenge(ctx);
+    return withChallengeLock(ctx, () => {
+      try {
+        const raw = JSON.parse(readFileSync(challengePath(ctx), 'utf8')) as Partial<SavedChallenge>;
+        if (raw.token !== token) return false;
+        removeChallengeUnlocked(ctx);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'ENOENT';
+      }
+    });
+  } catch { return false; }
+}
+
+/** Re-check under the writer lock: an expired/invalid observation must not
+ * authorize deleting a fresh challenge installed by another daemon. */
+function clearChallengeIfInvalid(ctx: Ctx, now: number): void {
+  try {
+    withChallengeLock(ctx, () => {
+      if (!readChallenge(ctx, now)) removeChallengeUnlocked(ctx);
+    });
   } catch { /* already gone or unreadable */ }
 }
 
@@ -147,24 +180,36 @@ async function begin(ctx: Ctx, now: number): Promise<AttemptOutcome> {
     return { result: { state: 'unavailable', detail: 'Meego login could not be started.' } };
   }
   const challenge: SavedChallenge = { token, authUrl, createdAt: now };
-  writeChallenge(ctx, challenge);
-  return { result: { state: 'link', authUrl }, challenge };
+  const stored = writeChallengeIfAbsent(ctx, challenge, Date.now());
+  return { result: { state: 'link', authUrl: stored.authUrl }, challenge: stored };
 }
 
-async function attempt(ctx: Ctx, now: number): Promise<AttemptOutcome> {
+async function attempt(openId: string, ctx: Ctx, now: number): Promise<AttemptOutcome> {
   const pending = readChallenge(ctx, now);
   if (pending) {
     const outcome = await completeOnce(ctx, pending.token);
     if (outcome === 'success') {
-      clearChallenge(ctx);
+      clearChallengeIfMatches(ctx, pending.token);
       if (await loginStatus(ctx) === 'authorized') return { result: { state: 'ready' } };
       return { result: { state: 'unavailable', detail: 'Meego login completed but is not usable yet; retry shortly.' } };
     }
     if (outcome === 'pending') return { result: { state: 'link', authUrl: pending.authUrl }, challenge: pending };
     // A network error does not invalidate the link the person may be opening.
-    if (outcome === 'error') return { result: { state: 'unavailable', detail: 'Meego authorization service unavailable; retry shortly.' } };
+    // Keep returning the challenge even for `unavailable`, so a restored login
+    // still gets a background poller after this transient foreground failure.
+    if (outcome === 'error') return {
+      result: { state: 'unavailable', detail: 'Meego authorization service unavailable; retry shortly.' },
+      challenge: pending,
+    };
+    // Provider-side expiry only retires the token we actually polled.
+    if (clearChallengeIfMatches(ctx, pending.token)) {
+      notifyListeners(challengeGoneListeners, openId, ctx.tenant);
+    }
+  } else {
+    // The first read was missing, malformed or expired; re-check under lock so
+    // a fresh cross-daemon challenge cannot be removed on this stale evidence.
+    clearChallengeIfInvalid(ctx, now);
   }
-  clearChallenge(ctx);
   const status = await loginStatus(ctx);
   if (status === 'authorized') return { result: { state: 'ready' } };
   if (status === 'unavailable') return { result: { state: 'unavailable', detail: 'Meego status could not be read; retry shortly.' } };
@@ -180,15 +225,30 @@ interface PollerHandle {
 }
 
 const activePollers = new Map<string, PollerHandle>();
-const backgroundCompletionListeners = new Set<(openId: string) => void>();
+type MeegoUserTenantListener = (openId: string, tenant: MeegoTenant | undefined) => void;
+const completionListeners = new Set<MeegoUserTenantListener>();
+const challengeGoneListeners = new Set<MeegoUserTenantListener>();
 let globalPollerGeneration = 0;
 const userPollerGeneration = new Map<string, number>();
 
-/** Subscribe to successful background Meego login completions (e.g. to clear
- *  stale unattended-lapse / creation-offer dedup entries). */
-export function onMeegoBackgroundLoginCompleted(listener: (openId: string) => void): () => void {
-  backgroundCompletionListeners.add(listener);
-  return () => { backgroundCompletionListeners.delete(listener); };
+function notifyListeners(listeners: Set<MeegoUserTenantListener>, openId: string, tenant: MeegoTenant | undefined): void {
+  for (const listener of [...listeners]) {
+    try { listener(openId, tenant); } catch { /* listener errors must not affect auth cleanup */ }
+  }
+}
+
+/** Subscribe to every confirmed Meego login (foreground or background), scoped
+ *  to the tenant whose credentials became usable. */
+export function onMeegoLoginCompleted(listener: MeegoUserTenantListener): () => void {
+  completionListeners.add(listener);
+  return () => { completionListeners.delete(listener); };
+}
+
+/** Subscribe when the provider retires a still-pending challenge before its
+ *  local TTL. Creation-offer cooldowns must not hide the replacement login. */
+export function onMeegoChallengeGone(listener: MeegoUserTenantListener): () => void {
+  challengeGoneListeners.add(listener);
+  return () => { challengeGoneListeners.delete(listener); };
 }
 
 function pollerKey(openId: string, tenant: MeegoTenant | undefined): string {
@@ -295,15 +355,15 @@ function ensureChallengePoller(
             return 'stop' as const;
           }
           logger.info(`[meego-auth] background login completed for ${openId}${tenant ? ` (tenant=${tenant})` : ''} (status=${status})`);
-          if (status === 'authorized') {
-            for (const listener of [...backgroundCompletionListeners]) {
-              try { listener(openId); } catch { /* listener errors must not affect auth cleanup */ }
-            }
-          }
+          if (status === 'authorized') notifyListeners(completionListeners, openId, tenant);
           return 'stop' as const;
         }
         if (outcome === 'gone') {
-          clearChallengeIfMatches(ctx, challenge.token);
+          // A newer cross-daemon challenge suppresses the event: the old token's
+          // expiry must not invalidate the replacement's creation-offer dedup.
+          if (clearChallengeIfMatches(ctx, challenge.token)) {
+            notifyListeners(challengeGoneListeners, openId, tenant);
+          }
           return 'stop' as const;
         }
         if (outcome === 'error') {
@@ -342,12 +402,24 @@ export function stopAllMeegoPollers(): void {
   for (const handle of [...activePollers.values()]) handle.stop();
 }
 
-async function request(openId: string, tenant: MeegoTenant | undefined, now: number): Promise<MeegoLoginRequest> {
-  const epoch = readCliAuthEpoch(openId);
-  const startGlobalGen = globalPollerGeneration;
-  const startUserGen = userPollerGeneration.get(openId) ?? 0;
+interface RequestFence {
+  epoch: number;
+  startGlobalGen: number;
+  startUserGen: number;
+}
+
+async function request(openId: string, tenant: MeegoTenant | undefined, now: number, fence: RequestFence): Promise<MeegoLoginRequest> {
+  const { epoch, startGlobalGen, startUserGen } = fence;
+  // The fence is captured when requestMeegoLogin is called, not when a queued
+  // request finally runs. A pre-revoke operation must not recreate a HOME after
+  // the revocation has already completed.
+  if (readCliAuthEpoch(openId) !== epoch
+    || globalPollerGeneration !== startGlobalGen
+    || (userPollerGeneration.get(openId) ?? 0) !== startUserGen) {
+    return { state: 'unavailable', detail: 'Meego authorization was revoked meanwhile.' };
+  }
   const ctx: Ctx = { home: ensureMeegoStore(openId, epoch), tenant };
-  const { result, challenge } = await attempt(ctx, now);
+  const { result, challenge } = await attempt(openId, ctx, now);
   if (readCliAuthEpoch(openId) !== epoch) {
     // Revoked meanwhile. Revoking removed the person's directory, but a provider
     // call already running here can write a login back into it afterwards. That
@@ -356,13 +428,16 @@ async function request(openId: string, tenant: MeegoTenant | undefined, now: num
     stopPoller(pollerKey(openId, tenant));
     return { state: 'unavailable', detail: 'Meego authorization was revoked meanwhile.' };
   }
-  if (result.state === 'link' && challenge) {
-    // Do not arm a background poller if shutdown or per-user stop ran while attempt() was in flight.
+  if (challenge) {
+    // `unavailable` can still carry a live pending challenge after a transient
+    // foreground error; it needs the same background completion opportunity.
     if (globalPollerGeneration === startGlobalGen && (userPollerGeneration.get(openId) ?? 0) === startUserGen) {
       ensureChallengePoller(openId, tenant, challenge, epoch);
     }
-  } else if (result.state === 'ready') {
+  }
+  if (result.state === 'ready') {
     stopPoller(pollerKey(openId, tenant));
+    notifyListeners(completionListeners, openId, tenant);
   }
   return result;
 }
@@ -394,7 +469,12 @@ async function runSerialized<T>(openId: string, fn: () => Promise<T>): Promise<T
 export async function requestMeegoLogin(openId: string, tenant?: MeegoTenant): Promise<MeegoLoginRequest> {
   meegoPersonRoot(openId);
   if (tenant !== undefined && !MEEGO_TENANTS.includes(tenant)) throw new Error(`[meego-auth] unknown tenant: ${JSON.stringify(tenant)}`);
-  return await runSerialized(openId, () => request(openId, tenant, Date.now()));
+  const fence: RequestFence = {
+    epoch: readCliAuthEpoch(openId),
+    startGlobalGen: globalPollerGeneration,
+    startUserGen: userPollerGeneration.get(openId) ?? 0,
+  };
+  return await runSerialized(openId, () => request(openId, tenant, Date.now(), fence));
 }
 
 /** Forget this person's Meego login on this host, every epoch included.

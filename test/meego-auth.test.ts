@@ -22,7 +22,7 @@ const loadedModules: Array<{ stopAllMeegoPollers: () => void }> = [];
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-meego-auth-'));
-  for (const key of ['HOME', 'PATH', 'STUB_DIR', 'STUB_FAIL', 'STUB_COMPLETE_FAIL', 'STUB_EXPIRED', 'STUB_SWAP_TOKEN', 'BYTEDCLI_MEEGO_TENANT']) saved[key] = process.env[key];
+  for (const key of ['HOME', 'PATH', 'STUB_DIR', 'STUB_FAIL', 'STUB_COMPLETE_FAIL', 'STUB_EXPIRED', 'STUB_SWAP_TOKEN', 'STUB_RACE_BEGIN', 'BYTEDCLI_MEEGO_TENANT']) saved[key] = process.env[key];
   process.env.HOME = join(dir, 'home');
   mkdirSync(process.env.HOME);
   const bin = join(dir, 'bin');
@@ -35,7 +35,7 @@ beforeEach(() => {
     '[ "$1" = -j ] && shift; shift',
     // Lets a test act while a login call is in flight.
     'if [ "$1" = login ] && [ -f "$STUB_DIR/hold" ]; then',
-    '  : > "$STUB_DIR/held"; i=0',
+    '  printf "x\\n" >> "$STUB_DIR/held"; i=0',
     '  while [ ! -f "$STUB_DIR/go" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i + 1)); done',
     'fi',
     'case "$1 $2" in',
@@ -45,8 +45,13 @@ beforeEach(() => {
     '  "login --begin")',
     '    [ -z "$STUB_FAIL" ] || { echo \'{"status":"error","error":{"code":"NETWORK"}}\'; exit 1; }',
     '    n=$(( $(cat "$STUB_DIR/begins" 2>/dev/null || echo 0) + 1 )); echo $n > "$STUB_DIR/begins"',
+    '    if [ -n "$STUB_RACE_BEGIN" ]; then',
+    '      printf "x\\n" >> "$STUB_DIR/held"; i=0',
+    '      while [ ! -f "$STUB_DIR/go" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i + 1)); done',
+    '    fi',
+    '    code="$who-$n"; [ -z "$STUB_RACE_BEGIN" ] || code="race-$$"',
     '    mkdir -p "$store" "$TMPDIR/bytedcli/meego-login-$n"; : > "$TMPDIR/bytedcli/meego-login-$n/qr.png"',
-    `    printf '{"status":"success","data":{"verification_uri_complete":"https://meego.example/device?code=%s-%s","complete_token":"${COMPLETE_TOKEN}","qr_image_path":"%s"}}\\n' "$who" "$n" "$TMPDIR/bytedcli/meego-login-$n/qr.png" ;;`,
+    `    printf '{"status":"success","data":{"verification_uri_complete":"https://meego.example/device?code=%s","complete_token":"${COMPLETE_TOKEN}","qr_image_path":"%s"}}\\n' "$code" "$TMPDIR/bytedcli/meego-login-$n/qr.png" ;;`,
     '  "login --complete")',
     '    [ -z "$STUB_COMPLETE_FAIL" ] || { echo \'{"status":"error","error":{"code":"NETWORK"}}\'; exit 1; }',
     '    if [ -n "$STUB_SWAP_TOKEN" ]; then cp "$STUB_DIR/c2-challenge" "$HOME/.botmux-meego-challenge"; fi',
@@ -67,6 +72,7 @@ beforeEach(() => {
   delete process.env.STUB_COMPLETE_FAIL;
   delete process.env.STUB_EXPIRED;
   delete process.env.STUB_SWAP_TOKEN;
+  delete process.env.STUB_RACE_BEGIN;
 });
 afterEach(() => {
   for (const mod of loadedModules.splice(0)) mod.stopAllMeegoPollers();
@@ -130,6 +136,24 @@ describe('requestMeegoLogin', () => {
     const [a, b] = await Promise.all([m.requestMeegoLogin(ALICE), m.requestMeegoLogin(ALICE)]);
     expect(a).toEqual(b);
     expect(begins()).toBe(1);
+  });
+
+  it('two independent daemon modules racing --begin share the first live challenge instead of overwriting it', async () => {
+    const a = await load();
+    const b = await load();
+    process.env.STUB_RACE_BEGIN = '1';
+    const requestA = a.requestMeegoLogin(ALICE);
+    const requestB = b.requestMeegoLogin(ALICE);
+    await waitUntil(() => existsSync(join(dir, 'held'))
+      && readFileSync(join(dir, 'held'), 'utf8').trim().split('\n').length === 2);
+    writeFileSync(join(dir, 'go'), '');
+
+    const [resultA, resultB] = await Promise.all([requestA, requestB]);
+    expect(resultA).toEqual(resultB);
+    if (resultA.state !== 'link') throw new Error('expected a live challenge link');
+    expect(cliCalls().filter(c => c.args === '-j meego login --begin')).toHaveLength(2);
+    const onDisk = JSON.parse(readFileSync(join(a.meegoHomeFor(ALICE), '.botmux-meego-challenge'), 'utf8'));
+    expect(onDisk.authUrl).toBe(resultA.authUrl);
   });
 
   it('after approval the next request, from any session, completes it into the store', async () => {
@@ -227,6 +251,25 @@ describe('revocation', () => {
     expect(result.state).toBe('unavailable');
     expect(existsSync(revokedHome)).toBe(false);
   });
+  it('does not recreate a HOME for a request that was queued before revocation', async () => {
+    const m = await load();
+    writeFileSync(join(dir, 'hold'), '');
+    const first = m.requestMeegoLogin(ALICE);
+    await waitUntil(() => existsSync(join(dir, 'held')));
+    const queuedBeforeRevoke = m.requestMeegoLogin(ALICE);
+
+    m.bumpCliAuthEpoch(ALICE);
+    m.clearMeegoAuth(ALICE);
+    writeFileSync(join(dir, 'go'), '');
+    const [firstResult, queuedResult] = await Promise.all([first, queuedBeforeRevoke]);
+
+    expect(firstResult.state).toBe('unavailable');
+    expect(queuedResult.state).toBe('unavailable');
+    expect(begins()).toBe(1);
+    // The first in-flight request may leave an empty person-root after removing
+    // its old epoch; the queued request must not create the current epoch HOME.
+    expect(existsSync(m.meegoHomeFor(ALICE))).toBe(false);
+  });
 });
 
 describe('tenant', () => {
@@ -279,7 +322,7 @@ describe('background completion poller', () => {
     const m = await load();
 
     const completedUsers: string[] = [];
-    const unsubscribe = m.onMeegoBackgroundLoginCompleted(openId => completedUsers.push(openId));
+    const unsubscribe = m.onMeegoLoginCompleted(openId => completedUsers.push(openId));
     try {
       expect((await m.requestMeegoLogin(ALICE)).state).toBe('link');
       const home = m.meegoHomeFor(ALICE);
@@ -320,6 +363,24 @@ describe('background completion poller', () => {
     }
   });
 
+  it('emits a tenant-scoped completion when a foreground /login finishes the challenge', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    const events: Array<[string, string | undefined]> = [];
+    const unsubscribe = m.onMeegoLoginCompleted((openId, tenant) => events.push([openId, tenant]));
+    try {
+      expect((await m.requestMeegoLogin(ALICE, 'dcar')).state).toBe('link');
+      approve(ALICE, 'alice-foreground-login');
+      expect(await m.requestMeegoLogin(ALICE, 'dcar')).toEqual({ state: 'ready' });
+      expect(events).toEqual([[ALICE, 'dcar']]);
+      expect(readFileSync(join(m.meegoHomeFor(ALICE), '.meegle', 'credentials-bytedcli.enc'), 'utf8')).toBe('alice-foreground-login');
+    } finally {
+      unsubscribe();
+    }
+  });
+
   it('deduplicates pollers for repeated requests sharing the same challenge', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
@@ -355,6 +416,46 @@ describe('background completion poller', () => {
     vi.advanceTimersByTime(60_000);
     await settleRealIo();
     expect(completeCalls('').length).toBe(afterExpired);
+  });
+
+  it('reports provider-side expiry with the tenant so creation cooldowns can be invalidated', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    const events: Array<[string, string | undefined]> = [];
+    const unsubscribe = m.onMeegoChallengeGone((openId, tenant) => events.push([openId, tenant]));
+    try {
+      await m.requestMeegoLogin(ALICE);
+      process.env.STUB_EXPIRED = '1';
+      vi.advanceTimersByTime(3_000);
+      await waitUntil(() => events.length === 1);
+      expect(events).toEqual([[ALICE, undefined]]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('reports provider-side expiry discovered by a foreground request before minting its replacement', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    const events: Array<[string, string | undefined]> = [];
+    const unsubscribe = m.onMeegoChallengeGone((openId, tenant) => events.push([openId, tenant]));
+    try {
+      await m.requestMeegoLogin(ALICE);
+      m.stopAllMeegoPollers();
+      process.env.STUB_EXPIRED = '1';
+      const replacement = await m.requestMeegoLogin(ALICE);
+      expect(replacement).toEqual({ state: 'link', authUrl: 'https://meego.example/device?code=ou_alice-2' });
+      if (replacement.state !== 'link') throw new Error('expected a replacement link');
+      expect(events).toEqual([[ALICE, undefined]]);
+      const onDisk = JSON.parse(readFileSync(join(m.meegoHomeFor(ALICE), '.botmux-meego-challenge'), 'utf8'));
+      expect(onDisk.authUrl).toBe(replacement.authUrl);
+    } finally {
+      unsubscribe();
+    }
   });
 
   it('never erases a newer challenge another daemon minted while a background poll was in flight', async () => {
@@ -496,6 +597,26 @@ describe('background completion poller', () => {
     vi.advanceTimersByTime(60_000);
     await settleRealIo();
     expect(completeCalls('').length).toBe(0);
+  });
+
+  it('rearms a restored challenge when its first foreground completion hits a transient error', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    await m.requestMeegoLogin(ALICE);
+    m.stopAllMeegoPollers(); // persisted challenge after restart, no in-memory poller
+    process.env.STUB_COMPLETE_FAIL = '1';
+    expect((await m.requestMeegoLogin(ALICE)).state).toBe('unavailable');
+    delete process.env.STUB_COMPLETE_FAIL;
+    const callsAfterError = completeCalls('').length;
+
+    approve(ALICE, 'alice-restored-login');
+    vi.advanceTimersByTime(60_000);
+    await waitUntil(() => completeCalls('').length > callsAfterError
+      && existsSync(join(m.meegoHomeFor(ALICE), '.meegle', 'credentials-bytedcli.enc')));
+
+    expect(readFileSync(join(m.meegoHomeFor(ALICE), '.meegle', 'credentials-bytedcli.enc'), 'utf8')).toBe('alice-restored-login');
   });
 
   it('applies exponential error backoff and stops after consecutive provider errors while keeping the challenge', async () => {

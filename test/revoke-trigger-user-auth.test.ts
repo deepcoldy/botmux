@@ -140,8 +140,9 @@ describe('revokeTriggerUserAuth', () => {
     await revoke.revokeTriggerUserAuth({
       openId: ALICE, appId: APP, brand: 'feishu', sessionDataDir: join(homeDir, 'sessions'),
     });
-    expect(capMock.clearNotices).toHaveBeenCalledTimes(1);
-    expect(capMock.clearNotices).toHaveBeenCalledWith(ALICE);
+    expect(capMock.clearNotices).toHaveBeenCalledTimes(2);
+    expect(capMock.clearNotices).toHaveBeenNthCalledWith(1, ALICE);
+    expect(capMock.clearNotices).toHaveBeenNthCalledWith(2, ALICE);
   });
 
   it('logs out then deletes only that person, and a second call is a no-op success', async () => {

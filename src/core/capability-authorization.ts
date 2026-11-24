@@ -12,7 +12,7 @@ import { t, type Locale } from '../i18n/index.js';
 import type { BotConfig } from '../bot-registry.js';
 import { beginBytedcliLogin, describeBytedcliAuth } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, describeLarkCliAuth } from '../services/lark-cli-auth.js';
-import { onMeegoBackgroundLoginCompleted, requestMeegoLogin } from '../services/meego-auth.js';
+import { onMeegoChallengeGone, onMeegoLoginCompleted, requestMeegoLogin } from '../services/meego-auth.js';
 import type { MeegoTenant } from '../services/bytedcli-home.js';
 import { capabilityOn, TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import type { ToolIdentityOutcome } from './turn-cli-identity.js';
@@ -126,7 +126,11 @@ export async function missingAuthorizationEntries(botConfig: BotConfig, openId: 
     if (known?.provider === 'meego') entries.push({ provider: 'meego', url: known.url ?? undefined });
     else {
       const login = await requestMeegoLogin(openId, opts.tenant).catch(() => undefined);
-      if (login?.state === 'link') entries.push({ provider: 'meego', url: login.authUrl });
+      if (login?.state === 'link') {
+        const entry: AuthorizationEntry = { provider: 'meego', url: login.authUrl };
+        entryGenerations.set(entry, snapshotNoticeGeneration(openId));
+        entries.push(entry);
+      }
     }
   }
   return entries;
@@ -157,18 +161,93 @@ async function deliverPlatformEntries(args: {
   return { rest, platform: 'failed' };
 }
 
+type NoticeTenantKey = MeegoTenant | '';
+const noticeTenantKey = (provider: UnattendedProvider, tenant?: MeegoTenant): NoticeTenantKey =>
+  provider === 'meego' ? tenant ?? '' : '';
+
+/** Hierarchical invalidation: revocation bumps `all`, a provider-wide clear
+ *  bumps `providers`, and a tenant-scoped Meego event bumps only `tenants`.
+ *  Snapshots let an in-flight asynchronous notice prove it is still current
+ *  before claiming dedup state or sending a stale link. */
+interface NoticeGenerationState {
+  all: number;
+  providers: Map<UnattendedProvider, number>;
+  tenants: Map<string, number>;
+}
+interface NoticeGenerationSnapshot {
+  openId: string;
+  all: number;
+  providers: Map<UnattendedProvider, number>;
+  tenants: Map<string, number>;
+}
+const noticeGenerations = new Map<string, NoticeGenerationState>();
+/** Entries produced by a fresh Meego provider response carry the generation at
+ *  that response, so a replacement challenge is not mistaken for the stale one
+ *  that was invalidated earlier in the same assembly. */
+const entryGenerations = new WeakMap<AuthorizationEntry, NoticeGenerationSnapshot>();
+const tenantGenerationKey = (provider: UnattendedProvider, tenant: NoticeTenantKey) => JSON.stringify([provider, tenant]);
+
+function snapshotNoticeGeneration(openId: string): NoticeGenerationSnapshot {
+  const state = noticeGenerations.get(openId);
+  return {
+    openId,
+    all: state?.all ?? 0,
+    providers: new Map(state?.providers),
+    tenants: new Map(state?.tenants),
+  };
+}
+
+function noticeGenerationCurrent(snapshot: NoticeGenerationSnapshot, provider: UnattendedProvider, tenant: NoticeTenantKey): boolean {
+  const state = noticeGenerations.get(snapshot.openId);
+  const tenantKey = tenantGenerationKey(provider, tenant);
+  return (state?.all ?? 0) === snapshot.all
+    && (state?.providers.get(provider) ?? 0) === (snapshot.providers.get(provider) ?? 0)
+    && (state?.tenants.get(tenantKey) ?? 0) === (snapshot.tenants.get(tenantKey) ?? 0);
+}
+
+function bumpNoticeGeneration(openId: string, provider?: UnattendedProvider, tenant?: NoticeTenantKey): void {
+  let state = noticeGenerations.get(openId);
+  if (!state) {
+    state = { all: 0, providers: new Map(), tenants: new Map() };
+    noticeGenerations.set(openId, state);
+  }
+  if (!provider) {
+    state.all += 1;
+  } else if (tenant === undefined) {
+    state.providers.set(provider, (state.providers.get(provider) ?? 0) + 1);
+  } else {
+    const key = tenantGenerationKey(provider, tenant);
+    state.tenants.set(key, (state.tenants.get(key) ?? 0) + 1);
+  }
+}
+
 interface OfferRecord {
   at: number;
   url?: string;
   openId: string;
   provider: UnattendedProvider;
+  tenant: NoticeTenantKey;
+}
+interface LastSentRecord {
+  marker: string;
+  at: number;
+  openId: string;
+  provider: UnattendedProvider;
+  tenant: NoticeTenantKey;
 }
 
 const ALL_UNATTENDED_PROVIDERS: readonly UnattendedProvider[] = [...TRIGGER_USER_AUTH_TOOLS, 'meego'];
-/** Creation offers already made per app, person and provider, so several tasks created together give one message
- *  and the same live challenge link is never sent twice. */
+/** Creation offers already made per app, person, provider and Meego tenant. */
 const offeredAt = new Map<string, OfferRecord>();
-const CREATION_OFFER_COOLDOWN_MS = 25 * 60_000;
+/** Last lapse notice per task, person, provider and Meego tenant. */
+const lastSent = new Map<string, LastSentRecord>();
+/** A creation cooldown must never outlive the link it suppresses. Longer-lived
+ *  challenges are further deduplicated by their exact live URL below. */
+const CREATION_OFFER_COOLDOWN_MS: Readonly<Record<UnattendedProvider, number>> = {
+  'lark-cli': 9 * 60_000,
+  meego: 25 * 60_000,
+  bytedcli: 50 * 60_000,
+};
 /** Longer than any device-login challenge TTL (lark-cli 9m, Meego 25m, ByteCloud 50m)
  *  so live-URL dedup holds for the full challenge lifetime while bounding memory. */
 const CREATION_OFFER_RETENTION_MS = 60 * 60_000;
@@ -187,7 +266,8 @@ export async function offerAuthorizationAtCreation(args: {
   published?: (tool: TriggerUserAuthTool) => string | undefined;
 }): Promise<void> {
   const { botConfig, openId, locale } = args;
-  const keyFor = (provider: UnattendedProvider) => JSON.stringify([botConfig.larkAppId, openId, provider]);
+  const generation = snapshotNoticeGeneration(openId);
+  const keyFor = (provider: UnattendedProvider) => JSON.stringify([botConfig.larkAppId, openId, provider, noticeTenantKey(provider)]);
   const keyOf = (e: AuthorizationEntry) => keyFor(e.provider);
   try {
     // Check cooldown BEFORE probing or minting new device-login challenges so
@@ -196,7 +276,7 @@ export async function offerAuthorizationAtCreation(args: {
     const skipProviders = new Set<UnattendedProvider>();
     for (const provider of ALL_UNATTENDED_PROVIDERS) {
       const last = offeredAt.get(keyFor(provider));
-      if (last && preNow - last.at < CREATION_OFFER_COOLDOWN_MS) skipProviders.add(provider);
+      if (last && preNow - last.at < CREATION_OFFER_COOLDOWN_MS[provider]) skipProviders.add(provider);
     }
     if (skipProviders.size === ALL_UNATTENDED_PROVIDERS.length) return;
 
@@ -208,17 +288,22 @@ export async function offerAuthorizationAtCreation(args: {
       if (now - rec.at >= CREATION_OFFER_RETENTION_MS) offeredAt.delete(key);
     }
     const due = missing.filter(e => {
+      const tenant = noticeTenantKey(e.provider);
+      if (!noticeGenerationCurrent(entryGenerations.get(e) ?? generation, e.provider, tenant)) return false;
       if (!e.platform && !e.url) return false;
       const last = offeredAt.get(keyOf(e));
       if (!last) return true;
       if (e.url !== undefined && last.url === e.url) return false;
-      return now - last.at >= CREATION_OFFER_COOLDOWN_MS;
+      return now - last.at >= CREATION_OFFER_COOLDOWN_MS[e.provider];
     });
     if (!due.length) return;
     const claimed = new Map<string, OfferRecord>();
     for (const e of due) {
       const key = keyOf(e);
-      const record: OfferRecord = { at: now, openId, provider: e.provider, ...(e.url !== undefined ? { url: e.url } : {}) };
+      const record: OfferRecord = {
+        at: now, openId, provider: e.provider, tenant: noticeTenantKey(e.provider),
+        ...(e.url !== undefined ? { url: e.url } : {}),
+      };
       claimed.set(key, record);
       offeredAt.set(key, record);
     }
@@ -234,13 +319,17 @@ export async function offerAuthorizationAtCreation(args: {
       for (const key of claimed.keys()) rollback(key);
       throw e;
     }
+    for (const e of due) {
+      if (!noticeGenerationCurrent(entryGenerations.get(e) ?? generation, e.provider, noticeTenantKey(e.provider))) rollback(keyOf(e));
+    }
     if (platform === 'ready' || platform === 'failed') {
       for (const e of due.filter(entry => entry.platform)) rollback(keyOf(e));
     }
     for (const e of entries) {
       if (!e.url) rollback(keyOf(e));
     }
-    const directEntries = entries.filter(e => !!e.url);
+    const directEntries = entries.filter(e => !!e.url
+      && noticeGenerationCurrent(entryGenerations.get(e) ?? generation, e.provider, noticeTenantKey(e.provider)));
     if (directEntries.length) {
       const lines = directEntries.map(({ provider, url }) =>
         t('unattended.lapse_entry', { capability: capabilityOfProvider(provider), where: url! }, locale));
@@ -261,32 +350,60 @@ export async function offerAuthorizationAtCreation(args: {
 
 const capabilityOfProvider = (provider: UnattendedProvider) => provider === 'meego' ? 'meego' : capabilityOfTool(provider);
 
-/** Last notice per task, person and provider: what it carried (a link, or the platform card's day and scopes) and when. */
-const lastSent = new Map<string, { marker: string; at: number; openId: string; provider: UnattendedProvider }>();
 const DAY_MS = 86_400_000;
 const LINK_NOTICE_INTERVAL_MS = 60 * 60_000;
 
-/**
- * Forget creation-offer and unattended-lapse dedup records for `openId`
- * (optionally limited to a single `provider`). Called on revocation and when
- * background Meego completion finishes so a later auth lapse is never silently
- * suppressed by pre-revoke or pre-completion cooldowns.
- */
-export function clearAuthorizationNoticesForUser(openId: string, provider?: UnattendedProvider): void {
-  for (const [key, rec] of offeredAt) {
-    if (rec.openId === openId && (!provider || rec.provider === provider)) offeredAt.delete(key);
-  }
-  for (const [key, rec] of lastSent) {
-    if (rec.openId === openId && (!provider || rec.provider === provider)) lastSent.delete(key);
-  }
+/** Invalidate first, then delete matching durable-in-this-process dedup records.
+ *  Invalidation also stops an older asynchronous assembly from writing a record
+ *  back after this clear. Omitting tenant means every tenant of the provider. */
+function clearAuthorizationNoticeRecords(
+  openId: string,
+  provider: UnattendedProvider | undefined,
+  tenant: NoticeTenantKey | undefined,
+  includeLapseRecords: boolean,
+): void {
+  bumpNoticeGeneration(openId, provider, tenant);
+  const matches = (rec: OfferRecord | LastSentRecord) => rec.openId === openId
+    && (!provider || rec.provider === provider)
+    && (tenant === undefined || rec.tenant === tenant);
+  for (const [key, rec] of offeredAt) if (matches(rec)) offeredAt.delete(key);
+  if (includeLapseRecords) for (const [key, rec] of lastSent) if (matches(rec)) lastSent.delete(key);
 }
 
-onMeegoBackgroundLoginCompleted(openId => clearAuthorizationNoticesForUser(openId, 'meego'));
+/** Forget creation-offer and unattended-lapse dedup records for `openId`.
+ *  A provider without a tenant clears every tenant; Meego events pass an
+ *  explicit tenant key (`''` is the default tenant) to clear only that tenant. */
+export function clearAuthorizationNoticesForUser(
+  openId: string,
+  provider?: UnattendedProvider,
+  tenant?: NoticeTenantKey,
+): void {
+  clearAuthorizationNoticeRecords(openId, provider, tenant, true);
+}
 
-/** Forgets the lapse notices and creation offers (tests). */
-export function __resetUnattendedNoticesForTest(): void { lastSent.clear(); offeredAt.clear(); }
+onMeegoLoginCompleted((openId, tenant) => {
+  clearAuthorizationNoticesForUser(openId, 'meego', noticeTenantKey('meego', tenant));
+});
+onMeegoChallengeGone((openId, tenant) => {
+  // Existing lapse rate limits stay intact, but a creation offer must not hide
+  // the replacement for a challenge the provider retired before its local TTL.
+  clearAuthorizationNoticeRecords(openId, 'meego', noticeTenantKey('meego', tenant), false);
+});
 
-const lapseKey = (appId: string, taskId: string, openId: string, provider: string) => JSON.stringify([appId, taskId, openId, provider]);
+/** Forgets the lapse notices, creation offers and invalidation state (tests). */
+export function __resetUnattendedNoticesForTest(): void {
+  lastSent.clear();
+  offeredAt.clear();
+  noticeGenerations.clear();
+}
+
+const lapseKey = (
+  appId: string,
+  taskId: string,
+  openId: string,
+  provider: UnattendedProvider,
+  tenant: NoticeTenantKey,
+) => JSON.stringify([appId, taskId, openId, provider, tenant]);
 
 /**
  * The task an unattended turn belongs to, for the lapse key and text: a
@@ -333,43 +450,82 @@ export async function deliverUnattendedLapse(args: {
   appId: string; taskId: string; taskName: string; openId: string; locale: Locale | undefined;
   botConfig: BotConfig; scopes?: readonly string[]; tenant?: MeegoTenant;
   entries: readonly AuthorizationEntry[]; sendDirect: SendDirect;
+  /** Captured by noticeUnattendedLapse before its asynchronous entry assembly. */
+  noticeGeneration?: NoticeGenerationSnapshot;
 }): Promise<UnattendedNoticeOutcome> {
   const { appId, taskId, openId, locale, entries } = args;
+  const generation = args.noticeGeneration ?? snapshotNoticeGeneration(openId);
   const now = Date.now();
   const scopesMarker = [...(args.scopes ?? [])].sort().join(',');
   const marker = (e: AuthorizationEntry) => e.platform ? `platform:${Math.floor(now / DAY_MS)}:${scopesMarker}` : e.url ?? '';
-  const keyOf = (e: AuthorizationEntry) => lapseKey(appId, taskId, openId, e.provider);
+  const tenantOf = (e: AuthorizationEntry) => noticeTenantKey(e.provider, args.tenant);
+  const keyOf = (e: AuthorizationEntry) => lapseKey(appId, taskId, openId, e.provider, tenantOf(e));
   const due = entries.filter(e => {
+    if (!noticeGenerationCurrent(entryGenerations.get(e) ?? generation, e.provider, tenantOf(e))) return false;
     const last = lastSent.get(keyOf(e));
     return !last || (last.marker !== marker(e) && (e.platform || now - last.at >= LINK_NOTICE_INTERVAL_MS));
   });
   if (!due.length) return 'delivered';
-  for (const e of due) lastSent.set(keyOf(e), { marker: marker(e), at: now, openId, provider: e.provider });
-  const { rest, platform } = await deliverPlatformEntries({
-    botConfig: args.botConfig, openId, entries: due, ...(args.scopes ? { scopes: args.scopes } : {}),
-  });
-  if (platform === 'ready' || platform === 'failed') for (const e of due.filter(e => e.platform)) lastSent.delete(keyOf(e));
+
+  const claimed = new Map<string, LastSentRecord>();
+  for (const e of due) {
+    const key = keyOf(e);
+    const record: LastSentRecord = { marker: marker(e), at: now, openId, provider: e.provider, tenant: tenantOf(e) };
+    claimed.set(key, record);
+    lastSent.set(key, record);
+  }
+  const rollback = (e: AuthorizationEntry) => {
+    const key = keyOf(e);
+    const rec = claimed.get(key);
+    if (rec && lastSent.get(key) === rec) lastSent.delete(key);
+  };
+
+  let rest: AuthorizationEntry[];
+  let platform: 'none' | 'sent' | 'ready' | 'failed';
+  try {
+    ({ rest, platform } = await deliverPlatformEntries({
+      botConfig: args.botConfig, openId, entries: due, ...(args.scopes ? { scopes: args.scopes } : {}),
+    }));
+  } catch (error) {
+    for (const e of due) rollback(e);
+    throw error;
+  }
+  for (const e of due) {
+    if (!noticeGenerationCurrent(entryGenerations.get(e) ?? generation, e.provider, tenantOf(e))) rollback(e);
+  }
+  if (platform === 'ready' || platform === 'failed') for (const e of due.filter(e => e.platform)) rollback(e);
   const outcome = platform === 'failed' ? 'platform_undelivered' : 'delivered';
-  if (!rest.length) return outcome;
-  const lines = rest.map(e => t('unattended.lapse_entry', {
+  const currentRest: AuthorizationEntry[] = [];
+  for (const e of rest) {
+    if (noticeGenerationCurrent(entryGenerations.get(e) ?? generation, e.provider, tenantOf(e))) currentRest.push(e);
+    else rollback(e);
+  }
+  if (!currentRest.length) return outcome;
+  const lines = currentRest.map(e => t('unattended.lapse_entry', {
     capability: capabilityOfProvider(e.provider),
     where: e.url ?? t(e.provider === 'meego' ? 'unattended.how_meego' : e.provider === 'bytedcli' ? 'unattended.how_bytecloud' : 'unattended.how_lark', undefined, locale),
   }, locale));
-  if (rest.some(e => e.provider === 'meego' && !!e.url)) {
+  if (currentRest.some(e => e.provider === 'meego' && !!e.url)) {
     lines.push(t('unattended.meego_completion_hint', { command: meegoLoginCommand(args.tenant) }, locale));
   }
-  const text = [t('unattended.lapse_notice', { task: args.taskName, capabilities: rest.map(e => capabilityOfProvider(e.provider)).join(', ') }, locale), ...lines].join('\n');
+  const text = [t('unattended.lapse_notice', { task: args.taskName, capabilities: currentRest.map(e => capabilityOfProvider(e.provider)).join(', ') }, locale), ...lines].join('\n');
   try { await args.sendDirect(openId, text); return outcome; }
   catch (error) {
-    for (const e of rest) lastSent.delete(keyOf(e));
+    for (const e of currentRest) rollback(e);
     logger.warn(`[unattended-auth] lapse notice not delivered: ${error instanceof Error ? error.message : String(error)}`);
     return 'undelivered';
   }
 }
 
 /** Credentials are back for this person: the next lapse is a new one. */
-export function clearUnattendedLapse(appId: string, taskId: string, openId: string, provider: UnattendedProvider): void {
-  lastSent.delete(lapseKey(appId, taskId, openId, provider));
+export function clearUnattendedLapse(
+  appId: string,
+  taskId: string,
+  openId: string,
+  provider: UnattendedProvider,
+  tenant?: MeegoTenant,
+): void {
+  lastSent.delete(lapseKey(appId, taskId, openId, provider, noticeTenantKey(provider, tenant)));
 }
 
 /** Called after an unattended run's identity was published: tools whose credentials are in force end their lapse. */
@@ -394,7 +550,7 @@ export async function requestUnattendedAuthorization(args: {
   if (provider === 'meego') {
     const login = await requestMeegoLogin(openId, args.tenant);
     if (login.state === 'unavailable') return 'unavailable';
-    if (login.state === 'ready') { clearUnattendedLapse(args.appId, args.taskId, openId, provider); return 'ready'; }
+    if (login.state === 'ready') { clearUnattendedLapse(args.appId, args.taskId, openId, provider, args.tenant); return 'ready'; }
     url = login.authUrl;
   } else if (policyFromConfig(botConfig.triggerUserAuth).credentialSource !== 'platform'
     && !platformBacked(botConfig, provider)
@@ -416,8 +572,9 @@ export async function noticeUnattendedLapse(args: {
   appId: string; taskId: string; taskName: string; openId: string; locale: Locale | undefined; botConfig: BotConfig;
   provider: UnattendedProvider; url?: string | null; tenant?: MeegoTenant; scopes?: readonly string[]; sendDirect: SendDirect;
 }): Promise<UnattendedNoticeOutcome> {
+  const noticeGeneration = snapshotNoticeGeneration(args.openId);
   const entries = await missingAuthorizationEntries(args.botConfig, args.openId, {
     known: { provider: args.provider, url: args.url }, tenant: args.tenant,
   });
-  return await deliverUnattendedLapse({ ...args, entries });
+  return await deliverUnattendedLapse({ ...args, entries, noticeGeneration });
 }
