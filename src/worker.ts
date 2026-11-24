@@ -28339,6 +28339,9 @@ function probeBusyPatternIdle(
         if (settle.degraded) {
           log(`${source} idle probe: screen settle degraded; finalizing from the last successful snapshot`);
         }
+        // Agy may append a tool call during an async ZMX capture without
+        // changing the composer or its screen revision.
+        if (cliAdapter?.id === 'antigravity' && deferPromptReadyWhileBusy(source, be)) return;
         markPromptReadyFromBusyProbe(be);
         if (!isPromptReady && busyReadyDeferral.active) scheduleBusyPatternIdleProbe(source);
       });

@@ -226,9 +226,10 @@ describe('automatic reclaim of a session whose last answer may still be on its w
     vi.restoreAllMocks();
   });
 
-  it('is held while idle and its turn has no terminal yet, then reclaimed once the terminal comes', async () => {
-    claudeReportsTerminals();
-    const { worker, answering, sessions } = overCapWithOneSessionAnswering();
+  it.each(['claude-code', 'antigravity'])('holds an idle %s turn until its terminal comes', async cliId => {
+    const previous = overCapWithOneSessionAnswering(cliId);
+    turnTerminal(previous.worker, previous.answering);
+    const { worker, answering, sessions } = overCapWithOneSessionAnswering(cliId);
     screenIdle(worker);
     await flush();
 
