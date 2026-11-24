@@ -2,6 +2,7 @@ import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecuti
 import { isLeadOnlySession } from './lead-only.js';
 import { decideAssistantAdmission, decideAssistantLiveInputAdmission } from './assistant-spawn.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
+import { WorkerOutputJournal } from '../services/worker-output-journal.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { runtimeStartRefusal } from '../services/runtime-reservation.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
@@ -319,12 +320,13 @@ import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from '../im/lark
 import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
 import { beginFinalOutputDelivery, onFinalOutputDeliverySettled, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import { BUSY_RUNTIME_STATUSES } from './session-task-status.js';
-import { holdLastTurnThroughExcludedTerminal, isTurnOutcomeExcluded, noteFinalOutputReceipt, noteLateFinalReply, recordTurnOutcome } from './turn-outcome.js';
+import { hasCompletedTurn, holdLastTurnThroughExcludedTerminal, isTurnOutcomeExcluded, noteFinalOutputReceipt, noteLateFinalReply, recordTurnOutcome } from './turn-outcome.js';
 import { validateFinalOutputSnapshot, type FinalOutputOffer } from '../services/final-output-handoff.js';
 import { FinalOutputHandoffStore, type StoredFinalOutput } from '../services/final-output-handoff-store.js';
 import { FinalOutputHandoffHost, FinalOutputRejectedError, type FinalOutputDeliveryControl } from '../services/final-output-handoff-host.js';
 import { readBridgeTurnJournal } from '../services/bridge-turn-journal.js';
-import { setFinalOutputOriginRecorder } from './reply-target.js';
+import { isHumanInboundTurnId, setFinalOutputOriginRecorder } from './reply-target.js';
+import { durableImRepliesEnabled } from '../bot-registry.js';
 import { outputSnapshot } from '../services/universal-output-handoff.js';
 import { outputDeliveryJournal, type OutputDeliveryRecord, type OutputReceipt, type OutputSink } from '../services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator, OutputDeliveryTerminalError, type OutputDeliveryControl } from '../services/output-delivery-coordinator.js';
@@ -1607,14 +1609,22 @@ let callbacks: WorkerPoolCallbacks | undefined;
 export function initWorkerPool(cb: WorkerPoolCallbacks): void {
   callbacks = cb;
   setFinalOutputOriginRecorder((ds, turnId, context) => {
-    if (context.requesterOpenId && finalOutputHandoffAdmitNew(ds)) {
-      const journal = outputDeliveryJournal(config.session.dataDir, ds.larkAppId);
-      if (!ds.pendingWaitPromises?.has(turnId) && !ds.asyncTriggerResults?.has(turnId) && !resolveDocCommentTarget(ds, turnId)
-        && !ds.session.vcMeetingReceiver && !isMeetingDrivenTurn(ds, turnId)) journal.rememberSink(ds.session.sessionId, turnId,
-          { kind: 'im', context, chatId: ds.chatId, chatType: ds.chatType, privateReply: privateReplyEnabled(ds.session) });
-      new TurnSendLedger(config.session.dataDir).enableHandoffFence({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId });
-      if (turnId.startsWith('om_')) finalOutputHandoffHost(ds.larkAppId).store.rememberOrigin(ds.session.sessionId, turnId, context.target, context.requesterOpenId, Date.now(), { chatId: ds.chatId, chatType: ds.chatType });
+    if (!context.requesterOpenId || !finalOutputHandoffAdmitNew(ds)) return;
+    const global = globalFinalOutputHandoffEnabled();
+    const ordinaryIm = !ds.pendingWaitPromises?.has(turnId) && !ds.asyncTriggerResults?.has(turnId)
+      && !resolveDocCommentTarget(ds, turnId) && !ds.session.vcMeetingReceiver && !isMeetingDrivenTurn(ds, turnId);
+    const answerRequired = durableImRepliesEnabled(ds.larkAppId) && ordinaryIm
+      && isHumanInboundTurnId(turnId) && !!context.sourceMessageId && context.requesterIsBot === false && !context.crossChatOrigin
+      && !ds.session.workflowNode && !isSharedAdoptSession(ds) && !isSilentMessageListenerSession(ds.session)
+      && isStructuredBridgeLifecycleBlockingCli(sessionCliId(ds, getBot(ds.larkAppId).config));
+    if (!global && !answerRequired) return;
+    if (ordinaryIm) {
+      outputDeliveryJournal(config.session.dataDir, ds.larkAppId).rememberSink(ds.session.sessionId, turnId,
+        { kind: 'im', context, chatId: ds.chatId, chatType: ds.chatType, privateReply: privateReplyEnabled(ds.session),
+          ...(answerRequired ? { answerRequired: true } : {}) });
     }
+    new TurnSendLedger(config.session.dataDir).enableHandoffFence({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId }, answerRequired);
+    if (global && turnId.startsWith('om_')) finalOutputHandoffHost(ds.larkAppId).store.rememberOrigin(ds.session.sessionId, turnId, context.target, context.requesterOpenId, Date.now(), { chatId: ds.chatId, chatType: ds.chatType });
   });
   setTurnResultRuntime(createTurnResultRuntime({
     store: new PersistentTurnResultStore(config.session.dataDir),
@@ -1719,8 +1729,11 @@ export const FINAL_HANDOFF_WAIT_REASON = '最终答复等待交接：原请求�
 export const FINAL_HANDOFF_DELIVERY_REASON = '最终答复交接或投递未完成，请核对输出记录';
 
 function finalOutputHandoffSupported(_ds: DaemonSession): boolean { return true; }
-function finalOutputHandoffAdmitNew(_ds: DaemonSession): boolean {
+function globalFinalOutputHandoffEnabled(): boolean {
   return process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1';
+}
+function finalOutputHandoffAdmitNew(ds: DaemonSession): boolean {
+  return globalFinalOutputHandoffEnabled() || durableImRepliesEnabled(ds.larkAppId);
 }
 
 const universalOutputProcessors = new Map<string, { worker: ChildProcess; run(record: OutputDeliveryRecord): Promise<void> }>();
@@ -1808,10 +1821,138 @@ async function pumpFinalOutputHandoffs(): Promise<void> {
   }
   for (const ds of listActiveSessions()) {
     const processor = universalOutputProcessors.get(outputProcessorKey(ds));
-    if (!processor || processor.worker !== ds.worker) continue;
-    try { for (const record of outputDeliveryJournal(config.session.dataDir, ds.larkAppId).pending(ds.session.sessionId)) await processor.run(record); }
+    try {
+      if (!ds.worker) {
+        await recoverColdImReplies(ds);
+      } else if (processor?.worker === ds.worker) {
+        for (const record of outputDeliveryJournal(config.session.dataDir, ds.larkAppId).pending(ds.session.sessionId)) await processor.run(record);
+      }
+    }
     catch (error) { logger.warn(`[${tag(ds)}] Universal output recovery waiting: ${String(error)}`); }
   }
+}
+
+/** Recover only durable ordinary IM replies while the restored session has no
+ * CLI worker. Never accept an old producer's bytes without execution proof. */
+async function recoverColdImReplies(ds: DaemonSession): Promise<void> {
+  const session = ds.session;
+  const dataDir = config.session.dataDir;
+  const appId = ds.larkAppId;
+  const owns = () => !ds.worker && ds.session === session && ds.larkAppId === appId
+    && session.status === 'active' && !isSessionTransferring(ds);
+  if (!owns() || !WorkerOutputJournal.exists(dataDir, appId, session.sessionId)) return;
+  const producer = new WorkerOutputJournal(dataDir, appId, session.sessionId);
+  const journal = outputDeliveryJournal(dataDir, appId);
+  const fileCopy = new Map(producer.readPending().map(snapshot => [snapshot.id, snapshot]));
+  if (fileCopy.size === 0 && !journal.hasUnsettled(session.sessionId)) return;
+  const controller = controllerForSession(ds);
+  const showFailure = (turnId: string, sink: Extract<OutputSink, { kind: 'im' }>, reason: unknown, terminal = false) => {
+    if (owns() && raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, turnId)) {
+      publishAttentionPatch(ds);
+      publishScopedImDeliveryStatus(ds, turnId, sink, owns, terminal);
+      logger.warn(`[${tag(ds)}] Cold IM reply remains in the delivery journal: ${String(reason)}`);
+    }
+  };
+  for (const snapshot of fileCopy.values()) {
+    const output = snapshot.output;
+    if (output.sessionId !== session.sessionId || output.codexAppSettlement) continue;
+    const sink = journal.sink(session.sessionId, output.turnId);
+    if (sink?.kind !== 'im' || !sink.answerRequired) continue;
+    const recorded = journal.read(snapshot.id);
+    if (recorded) {
+      if (recorded.state === 'settled' && recorded.fingerprint === snapshot.fingerprint) producer.remove(snapshot);
+      continue;
+    }
+    const origin = snapshot.origin && controller?.outputOrigin(snapshot.origin);
+    const execution = origin?.scope.execution;
+    if (!execution || execution.turnId !== output.turnId || execution.dispatchAttempt !== output.dispatchAttempt) {
+      showFailure(output.turnId, sink, 'execution_scope_unproven', true);
+      continue;
+    }
+    journal.accept({ ...snapshot, origin }, sink);
+  }
+  const coordinator = new OutputDeliveryCoordinator(journal);
+  for (const record of journal.pending(session.sessionId)) {
+    if (!owns()) break;
+    const { sink, output } = record;
+    if (sink.kind !== 'im' || !sink.answerRequired || output.codexAppSettlement) continue;
+    await coordinator.deliver(record, {
+      owns,
+      process: async (_stored, control) => {
+        assertFrozenImDeliveryAllowed(ds, sink);
+        const ref = record.origin?.scope.execution;
+        const execution = ref && controller?.store.execution(controller.ref, ref.executionId);
+        if (execution?.cancelRequested || execution?.phase === 'cancelled') {
+          throw new OutputDeliveryTerminalError('output_execution_cancelled');
+        }
+        const hasNewerAttempt = controller?.store.executions(controller.ref).some(candidate =>
+          candidate.ref.turnId === output.turnId
+          && (candidate.ref.dispatchAttempt ?? 0) > (output.dispatchAttempt ?? 0));
+        if (hasNewerAttempt) throw new OutputDeliveryTerminalError('output_execution_superseded');
+        if (output.suppressDelivery || output.disposition === 'steer_superseded') return { status: 'suppressed' };
+        if (shouldDropMismatchedFinalOutput(ds, output, tag(ds)) || shouldDropMismatchedHermesFinalOutput(ds, output, tag(ds))) {
+          throw new OutputDeliveryTerminalError('output_dropped_without_receipt');
+        }
+        try {
+          return await deliverFinalOutputWithOutputControl(ds, output, tag(ds), control, sink.context.target);
+        } catch (error) { throw classifyFinalPublicationError(error); }
+      },
+      settled: settled => {
+        const copy = fileCopy.get(settled.id);
+        if (copy) {
+          try { producer.remove(copy); }
+          catch (error) { logger.warn(`[${tag(ds)}] Settled IM reply cleanup deferred: ${String(error)}`); }
+        }
+        if (!journal.hasUnsettled(session.sessionId) && !journal.hasTerminalRejection(session.sessionId)
+          && ds.agentAttention?.reason === FINAL_HANDOFF_DELIVERY_REASON) {
+          ds.agentAttention = undefined;
+          publishAttentionPatch(ds);
+        }
+      },
+      error: (error, terminal) => {
+        if (!(error instanceof OutputDeliveryTerminalError && error.message === 'output_execution_cancelled')) {
+          showFailure(output.turnId, sink, error, terminal);
+        }
+      },
+    });
+  }
+}
+
+function assertFrozenImDeliveryAllowed(ds: DaemonSession, sink: Extract<OutputSink, { kind: 'im' }>): void {
+  if (ds.chatId !== sink.chatId || ds.chatType !== sink.chatType || privateReplyEnabled(ds.session) !== !!sink.privateReply) {
+    throw new OutputDeliveryTerminalError('output_original_channel_changed');
+  }
+  const actor = sink.context.requesterOpenId ?? sink.context.replyTargetSenderOpenId;
+  if (!actor) return;
+  const talk = evaluateTalk(ds.larkAppId, sink.chatId, actor, undefined, undefined, sink.chatType);
+  if (talk.allowed) return;
+  if (talk.reason === 'blocked') throw new OutputDeliveryTerminalError('output_permission_revoked');
+  throw new Error('output_permission_pending');
+}
+
+function classifyFinalPublicationError(error: unknown): unknown {
+  const message = error instanceof Error ? error.message : String(error);
+  return error instanceof FinalPublicationUnknownError || message.includes('final_publication_ambiguous')
+    ? new OutputDeliveryTerminalError(message)
+    : error;
+}
+
+/** A status notice never writes the final ledger or substitutes for an answer. */
+function publishScopedImDeliveryStatus(
+  ds: DaemonSession, turnId: string, sink: Extract<OutputSink, { kind: 'im' }>, owns: () => boolean, terminal = false,
+): void {
+  if (!owns() || !callbacks) return;
+  try { assertFrozenImDeliveryAllowed(ds, sink); }
+  catch { return; }
+  const sourceSessionId = ds.session.sessionId;
+  const uuid = `rs_${createHash('sha256').update(JSON.stringify([ds.larkAppId, sourceSessionId, turnId, terminal])).digest('hex').slice(0, 47)}`;
+  const content = tr(terminal ? 'worker.required_reply_rejected' : 'worker.required_reply_pending', undefined, localeForBot(ds.larkAppId));
+  void callbacks.sessionReply(sessionAnchorId(ds), content, 'text', ds.larkAppId, turnId, {
+    sourceSessionId, uuid, replyTarget: sink.context.target, beforeWrite: () => {
+      if (!owns()) throw new Error('output_status_authority_changed');
+      assertFrozenImDeliveryAllowed(ds, sink);
+    },
+  }).catch(error => logger.warn(`[${tag(ds)}] IM delivery status not confirmed: ${String(error)}`));
 }
 
 function acceptFinalOutputOffer(ds: DaemonSession, offer: FinalOutputOffer): void {
@@ -20501,7 +20642,8 @@ function forkWorkerPrepared(
     type: 'init',
     sessionId: ds.session.sessionId,
     ...(initStatuslineLaunchGen ? { statuslineLaunchGen: initStatuslineLaunchGen } : {}),
-    ...(finalOutputHandoffSupported(ds) ? { finalOutputHandoff: { version: 2 as const, token: randomUUID(), admitNew: finalOutputHandoffAdmitNew(ds) } } : {}),
+    ...(finalOutputHandoffSupported(ds) ? { finalOutputHandoff: { version: 2 as const, token: randomUUID(), admitNew: finalOutputHandoffAdmitNew(ds),
+      ...(!globalFinalOutputHandoffEnabled() ? { frozenImOnly: true as const } : {}) } } : {}),
     chatId: ds.chatId,
     chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
@@ -22383,20 +22525,7 @@ function setupWorkerHandlers(
       owns: authority,
       process: async (record, control) => {
         const sink = record.sink;
-        if (sink.kind === 'im') {
-          if (ds.chatId !== sink.chatId || ds.chatType !== sink.chatType || privateReplyEnabled(ds.session) !== !!sink.privateReply) throw new OutputDeliveryTerminalError('output_original_channel_changed');
-          const actor = sink.context.requesterOpenId ?? sink.context.replyTargetSenderOpenId;
-          if (actor) {
-            // Distinguish a governance blocklist decision (irrecoverable) from
-            // a not-yet-resolved allowlist (reason 'none': sidecar/grant still
-            // loading during the startup window, API hiccup) which self-heals.
-            const talk = evaluateTalk(ds.larkAppId, sink.chatId, actor, undefined, undefined, sink.chatType);
-            if (!talk.allowed) {
-              if (talk.reason === 'blocked') throw new OutputDeliveryTerminalError('output_permission_revoked');
-              throw new Error('output_permission_pending');
-            }
-          }
-        }
+        if (sink.kind === 'im') assertFrozenImDeliveryAllowed(ds, sink);
         if (sink.kind === 'http') {
           if (sink.mode === 'wait' && !ds.pendingWaitPromises?.has(record.output.turnId) && !record.output.codexAppSettlement) return { status: 'captured', owner: 'expired_http_wait' };
           if (sink.mode === 'async' && !ds.asyncTriggerResults?.has(record.output.turnId)) {
@@ -22416,11 +22545,7 @@ function setupWorkerHandlers(
         } catch (error) {
           // Past the provider UUID dedupe window the ledger forbids any retry:
           // the answer is permanently human-to-verify, not a transient block.
-          if (error instanceof FinalPublicationUnknownError
-            || String((error as Error)?.message).includes('final_publication_ambiguous')) {
-            throw new OutputDeliveryTerminalError(String((error as Error)?.message ?? 'final_publication_ambiguous'));
-          }
-          throw error;
+          throw classifyFinalPublicationError(error);
         }
         if (record.output.codexAppSettlement) {
           // Native FIFO ACK still pending: genuinely in flight, never terminal.
@@ -22448,6 +22573,16 @@ function setupWorkerHandlers(
         }
         await sessionController?.flushPrimary();
         const claim = { type: 'final_output_settled' as const, id: record.id, fingerprint: record.fingerprint, token: ds.initConfig?.finalOutputHandoff?.token ?? '' };
+        if (authority() && record.sink.kind === 'im' && record.sink.answerRequired
+          && record.receipt?.status === 'delivered' && record.receipt.messageId
+          && !record.output.turnFailed && !record.output.emptyCompletedNotice) {
+          const { turnId, dispatchAttempt, content } = record.output;
+          noteFinalOutputReceipt(ds, turnId, { text: content }, { exactAttempt: { dispatchAttempt } });
+          if (hasCompletedTurn(ds, turnId, dispatchAttempt)) {
+            finalizeCotMessage(ds, turnId, 'completed', dispatchAttempt);
+            void finishTurnReactions(ds, { turnId, delivered: true, owns: authority });
+          }
+        }
         if (authority()) { try {
           if (record.output.codexAppSettlement && record.receipt?.owner === 'codex_app_dispatch_persisted') worker.send({ type: 'codex_app_dispatch_persisted', requestId: record.output.codexAppSettlement.requestId, ok: true });
           worker.send(claim);
@@ -22476,7 +22611,12 @@ function setupWorkerHandlers(
         }
       },
       error: (error, terminal) => {
-        if (raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, record.output.turnId)) publishAttentionPatch(ds);
+        if (raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, record.output.turnId)) {
+          publishAttentionPatch(ds);
+          if (record.sink.kind === 'im' && record.sink.answerRequired) {
+            publishScopedImDeliveryStatus(ds, record.output.turnId, record.sink, authority, terminal);
+          }
+        }
         logger.warn(`[${t}] Universal output ${terminal ? 'terminally rejected' : 'remains durable'}: ${String(error)}`);
       },
     });
@@ -26318,6 +26458,15 @@ function setupWorkerHandlers(
         // The「本轮回顾」panel goes on the turn's last card once it settles —
         // and only if the CLI recaps the turn (core/turn-recap-state.ts).
         const recapWanted = msg.status === 'completed' && turnRecapIo.enabled(ds);
+        const frozenSink = journal?.sink(msg.sessionId, msg.turnId);
+        const requiresReply = frozenSink?.kind === 'im' && frozenSink.answerRequired === true;
+        const answered = () => requiresReply
+          ? !!new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
+            larkAppId: ds.larkAppId, sessionId: msg.sessionId, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+          })?.messageId
+          : isFinalTurnTerminalCarrier(ds.turnTerminalCarriers?.get(msg.turnId));
+        const emptyRequiredReply = requiresReply && msg.status === 'completed'
+          && (msg.outputDisposition === 'nothing_to_send' || msg.outputDisposition === 'empty_answer');
         // The exact turn is over. This is the only boundary that releases the
         // accepted-input guard for it, and only for the exact attempt it names:
         // a late terminal from an older attempt must not release a newer one.
@@ -26473,9 +26622,15 @@ function setupWorkerHandlers(
           if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
           const replyCardSend: Parameters<typeof settleTurnReplyCardTerminal>[2] =
             (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite });
-          void settleTurnReplyCardTerminal(ds, msg, replyCardSend, ownsLifecycleMutation)
+          const waitingForReply = requiresReply && msg.status === 'completed' && !answered() && !emptyRequiredReply;
+          const cardTerminal = emptyRequiredReply && !answered() ? { ...msg, status: 'failed' as const } : msg;
+          const settleCard = waitingForReply
+            ? retireReplyCardDisplay(ds, { ...msg, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
+              replyCardSend, ownsLifecycleMutation)
+            : settleTurnReplyCardTerminal(ds, cardTerminal, replyCardSend, ownsLifecycleMutation);
+          void settleCard
             .then(async () => {
-              if (msg.status !== 'completed') return;
+              if (cardTerminal.status !== 'completed' || waitingForReply) return;
               if (nextStepIo.enabled(ds) && isCodexFamilyCliId(terminalCliId)) {
                 await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
                 if (!ownsLifecycleMutation()) return;
@@ -26498,7 +26653,9 @@ function setupWorkerHandlers(
             })
             .catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
         }
-        finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+        if (!requiresReply || msg.status !== 'completed' || answered() || emptyRequiredReply) {
+          finalizeCotMessage(ds, msg.turnId, emptyRequiredReply && !answered() ? 'failed' : msg.status, msg.dispatchAttempt);
+        }
         ds.cotForced = undefined;
         ds.lastThinkingUpdate = undefined;
         // 「执行失败」只在下一条 IM 消息入轮时清（beginNewTurn / 输入提交）。在
@@ -26985,9 +27142,12 @@ function setupWorkerHandlers(
           void recordTurnOutcome(ds, msg, {
             recoveryHandled,
             onClassified: outcome => { delivered = outcome === 'delivered'; },
-            isFinalDelivered: () => isFinalTurnTerminalCarrier(ds.turnTerminalCarriers?.get(msg.turnId)),
+            isFinalDelivered: answered,
           }).then(async () => {
             if (!usesOutcomeBasedTurnReactions(ds)) return;
+            // The persistent delivery owner may still be reconciling a provider
+            // effect. Keep the original ack until it can report an actual result.
+            if (requiresReply && msg.status === 'completed' && !delivered && !emptyRequiredReply) return;
             await finishTurnReactions(ds, {
               turnId: msg.turnId,
               delivered,
@@ -27059,7 +27219,7 @@ function setupWorkerHandlers(
         // An explicit progress/auxiliary send is positive proof that the
         // visible card is non-final. The CLI already persists responseKind;
         // never overwrite that contract with a mechanical completion footer.
-        if (msg.status === 'completed' && !interimCarrierOnly) {
+        if (!requiresReply && msg.status === 'completed' && !interimCarrierOnly) {
           // A successful explicit send is visible output even though the
           // model's final assistant block is the required suppression sentinel.
           // Only a genuinely bodyless turn may claim "AI determined no reply".
@@ -27106,7 +27266,7 @@ function setupWorkerHandlers(
         // landing in that window is the authoritative completion card and must
         // still receive its footer; without one the interim card stays
         // footerless by design (and no claim is left behind).
-        const awaitInterimFinalCarrier = interimCarrierOnly
+        const awaitInterimFinalCarrier = !requiresReply && interimCarrierOnly
           && terminalReceiptRouteEligible;
         // Deliberate-silence closure (positive evidence only — the same
         // 'nothing_to_send' contract as the async settle above):
@@ -27133,22 +27293,27 @@ function setupWorkerHandlers(
           // release on failure so a later replay can still close the loop.
           posted.add(msg.turnId);
           trimOldest(posted, SILENT_RECEIPT_DEDUPE_MAX);
+          const finish = beginFinalOutputDelivery(ds, msg.turnId);
           void scopedReply(
-            tr('worker.silent_turn_receipt', undefined, localeForBot(ds.larkAppId)),
+            tr(requiresReply ? 'worker.required_reply_missing' : 'worker.silent_turn_receipt', undefined, localeForBot(ds.larkAppId)),
             'text',
             msg.turnId,
-            { uuid: silentTurnReceiptUuid(ds.session.sessionId, msg.turnId) },
+            { uuid: silentTurnReceiptUuid(ds.session.sessionId, msg.turnId),
+              ...(requiresReply ? { replyTarget: frozenSink.context.target } : {}) },
           ).catch(err => {
             // Nothing reached the thread: drop the claim AND restore the
             // (already consumed) origin record, so a dispatchAttempt replay
             // retries instead of losing the closure for good.
             posted.delete(msg.turnId);
             if (fromReceiptRoute) ds.terminalReceiptTurnIds?.delete(msg.turnId);
-            recordTurnExplicitMention(ds, msg.turnId, true);
+            if (!requiresReply) recordTurnExplicitMention(ds, msg.turnId, true);
             logger.warn(`[${t}] Failed to post silent-turn receipt for ${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
-          });
+          }).finally(finish);
         };
-        if (msg.status === 'completed'
+        if (emptyRequiredReply && !answered() && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          postSilentTextReceipt();
+        }
+        if (!requiresReply && msg.status === 'completed'
           && msg.outputDisposition === 'nothing_to_send'
           && !visibleCarrier
           && !ds.session.vcMeetingReceiver) {
@@ -27799,7 +27964,10 @@ function setupWorkerHandlers(
           const snapshot = outputSnapshot(ds.larkAppId, msg);
           if (snapshot.id !== msg.handoff.id || snapshot.fingerprint !== msg.handoff.fingerprint) throw new Error('output_handoff_conflict');
           const existing = journal.read(snapshot.id);
-          const record = journal.accept(snapshot, existing?.sink ?? freezeOutputSink(ds, msg));
+          const frozen = journal.sink(msg.sessionId, msg.turnId);
+          const requiredIm = frozen?.kind === 'im' && frozen.answerRequired ? frozen : undefined;
+          if (!existing && ds.initConfig?.finalOutputHandoff?.frozenImOnly && !requiredIm) throw new Error('output_im_origin_unproven');
+          const record = journal.accept(snapshot, existing?.sink ?? requiredIm ?? freezeOutputSink(ds, msg));
           await runOutput(record);
         } catch (error) { logger.warn(`[${t}] Universal output not acknowledged: ${String(error)}`); }
         break;
@@ -28132,7 +28300,11 @@ function setupWorkerHandlers(
         if (!metadata && !snapshot.origin) { await handleLegacyWorkerMessage(msg); return; }
         if (snapshot.origin && !sameWorker(snapshot.origin.producer, contractWorker)) {
           recoveredOrigin = sessionController.outputOrigin(snapshot.origin);
-          if (!recoveredOrigin) return;
+          if (!recoveredOrigin) {
+            const sink = msg.sessionId === ds.session.sessionId ? journal.sink(msg.sessionId, msg.turnId) : undefined;
+            if (sink?.kind === 'im' && sink.answerRequired) reportUndeliveredFinal(msg, 'execution_scope_unproven');
+            return;
+          }
           if (!recoveredOrigin.scope.execution) {
             await sessionController.run({ kind: 'historical', context: recoveredOrigin }, () => handleLegacyWorkerMessage(msg));
             return;
@@ -30125,11 +30297,13 @@ function deliverFinalOutput(
       recordPrimaryOutput(messageId);
       const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
       if (messageId && !managedReceiver) {
-        noteFinalOutputReceipt(ds, msg.turnId, {
-          turnFailed: msg.turnFailed,
-          emptyCompletedNotice: msg.emptyCompletedNotice,
-          text: explicit?.finalText ?? safeAssistantText,
-        });
+        if (outputControl?.record.sink.kind !== 'im' || !outputControl.record.sink.answerRequired) {
+          noteFinalOutputReceipt(ds, msg.turnId, {
+            turnFailed: msg.turnFailed,
+            emptyCompletedNotice: msg.emptyCompletedNotice,
+            text: explicit?.finalText ?? safeAssistantText,
+          });
+        }
         if (!sendReplyFile) placeReplyCardRowsOnLateFinal(ds, msg.turnId, messageId);
       }
       if (!managedReceiver && !sendReplyFile) {

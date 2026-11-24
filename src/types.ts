@@ -2450,7 +2450,7 @@ type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
         /** Explicit, off-by-default ordinary bridge handoff negotiation. */
         sessionContract?: import('./services/session-contract.js').SessionContractBootstrap;
         settledTurnTerminals?: Array<{ turnId: string; status: 'completed' }>;
-        finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean };
+        finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean; frozenImOnly?: true };
       }
     : Message
   : never;
@@ -3133,6 +3133,8 @@ export type WorkerToDaemonBase =
        *    must settle this fail-closed — no output was ever observed; the
        *    claude bridge guarantees `final_output` precedes this terminal, so
        *    no answer can still arrive.
+       *  - 'empty_answer': a structured, observed terminal had no answer on a
+       *    turn admitted with a required IM reply. It is neither delivery nor silence.
        *  - 'explicit_final_delivered': the claude transcript bridge popped a
        *    real (non-local) turn without transcript terminal evidence, but an
        *    explicit final `botmux send` marker proves the answer was delivered
@@ -3145,7 +3147,7 @@ export type WorkerToDaemonBase =
        *  RPC-hydration timeout path, which emits `completed` with no
        *  final_output after fs-lag and must NOT be read as silence or as a dead
        *  turn (that would mask a real, still-arriving answer). */
-      outputDisposition?: 'nothing_to_send' | 'boundary_unobserved' | 'explicit_final_delivered';
+      outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered';
       /** Wall-clock epoch ms at which the CLI turn actually reached its native
        *  terminal. Absent when the emitter cannot vouch for a real instant, in
        *  which case the recorder falls back to its own write time (which is NOT

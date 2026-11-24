@@ -13767,6 +13767,13 @@ async function cmdSend(
       effectiveResponseKind = 'final';
     }
   }
+  if (turnSendKey && effectiveResponseKind === 'final'
+    && (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined
+      || !frozenTurnReplyTarget || turnSendKey.larkAppId !== appId || turnSendKey.sessionId !== sid)
+    && turnSendLedger.requiresOriginalImReply(turnSendKey)) {
+    console.error('botmux send: final delivery is bound to the original conversation; use --response-kind auxiliary for a separate destination');
+    process.exit(2);
+  }
   const persistOffBeforeProvider = (): void => {
     if (effectiveFollowThreadMode !== 'off' || !sendInto) return;
     persistCrossChatFollowThreadOffBeforeProvider({

@@ -1729,6 +1729,8 @@ export interface BotConfig {
    * 逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
+  /** Persist and recover final replies to this bot's ordinary human IM turns. */
+  durableImReplies?: boolean;
   turnResults?: { enabled: boolean };
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
@@ -3138,6 +3140,10 @@ export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
  *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（doubao 缺省
  *  transcript，其余缺省 send）。只读内存
  *  registry：worker 通过 init IPC 拿冻结值，不需要磁盘 mtime 缓存。 */
+export function durableImRepliesEnabled(larkAppId: string): boolean {
+  return bots.get(larkAppId)?.config.durableImReplies === true;
+}
+
 export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' | undefined {
   const v = bots.get(larkAppId)?.config.replyDelivery;
   return v === 'transcript' || v === 'send' ? v : undefined;
@@ -4551,6 +4557,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
       topicUnavailablePolicy: entry.topicUnavailablePolicy === 'stop' ? 'stop' : undefined,
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
+      durableImReplies: entry.durableImReplies === true || undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       // Only the non-default hook mode is persisted; absent, 'off', and invalid
       // values all retain the historical inline behavior.

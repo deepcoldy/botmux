@@ -25,6 +25,12 @@ function database(dir = directory()) { const journal = new OutputDeliveryJournal
 function receipt(sent: WorkerFinalOutput): OutputHandoffReceipt { return { type: 'final_output_settled', ...sent.handoff! }; }
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); for (const db of dbs.splice(0)) try { db.close(); } catch {} for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
+function deliveryScope(scope: Record<string, any>) {
+  scope.assertFrozenImDeliveryAllowed = loadWorkerPoolFunction('assertFrozenImDeliveryAllowed', scope);
+  scope.classifyFinalPublicationError = loadWorkerPoolFunction('classifyFinalPublicationError', scope);
+  return scope;
+}
+
 describe('journal app identity', () => {
   it('accepts any safe-basename app id but rejects path-shaped ids', () => {
     const dir = directory();
@@ -54,7 +60,7 @@ it('preserves the first reply model without changing the final output identity',
 
 describe('attention lifecycle', () => {
   const loadRunOutput = (scope: Record<string, any>) =>
-    loadWorkerPoolClosure<(record: OutputDeliveryRecord) => Promise<void>>('runOutput', scope);
+    loadWorkerPoolClosure<(record: OutputDeliveryRecord) => Promise<void>>('runOutput', deliveryScope(scope));
   const scopeFor = (
     db: OutputDeliveryJournal,
     record: OutputDeliveryRecord,
@@ -427,18 +433,93 @@ describe('worker production IPC boundary', () => {
 });
 
 describe('native and generic settlement contracts', () => {
+  it.each(['before send', 'after Feishu accepted', 'after worker-only persistence', 'without original execution proof'] as const)(
+    'reopens a scoped final %s without rerunning the model or inventing a receipt', async crash => {
+      vi.useFakeTimers();
+      const dir = directory();
+      let db = database(dir);
+      const target = { mode: 'thread', rootMessageId: 'om_original' } as const;
+      const sink = { kind: 'im', answerRequired: true, context: { target }, chatId: 'oc_original', chatType: 'group' } as const;
+      db.rememberSink(output.sessionId!, output.turnId, sink);
+      db.rememberSink(output.sessionId!, output.turnId, { kind: 'http', mode: 'async' });
+      db.rememberSink(output.sessionId!, output.turnId, { ...sink, context: { target: { mode: 'thread', rootMessageId: 'om_wrong' } } });
+      const snapshot = outputSnapshot(app, { ...output, content: '完整方案\n\n1. 检查\n2. 回读', dispatchAttempt: 2 });
+      const ref = { executionId: 'native-turn', turnId: output.turnId, dispatchAttempt: 2 };
+      const origin = { scope: { execution: ref } };
+      const producer = new WorkerOutputJournal(dir, app, output.sessionId!);
+      producer.save({ ...snapshot, origin } as Parameters<typeof producer.save>[0]);
+      const hasProof = crash !== 'without original execution proof';
+      if (crash === 'before send' || crash === 'after Feishu accepted') db.accept(snapshot, sink);
+      const received = new Map<string, { content: string; target: unknown }>();
+      let loseResponse = crash === 'after Feishu accepted';
+      const deliverFinalOutput = vi.fn((_ds, msg, _tag, _attempt, done, _owns, route, _unused, _initiator, _legacy, _effect, control) => {
+        received.set(control.publicationUuid, { content: msg.content, target: route });
+        if (loseResponse) { loseResponse = false; done(false); return; }
+        done(true, 'om_original_answer');
+      });
+      const helper = loadWorkerPoolFunction<(ds: any, msg: WorkerFinalOutput, t: string, control: any, target: unknown) => Promise<any>>(
+        'deliverFinalOutputWithOutputControl', {
+          TurnSendLedger, config: { session: { dataDir: dir } }, deliverFinalOutput,
+          bridgeFinalOutputUuid: () => 'stable_original_delivery', beginFinalOutputDelivery: () => () => {},
+          sessionPromptInjection: () => 'default',
+        });
+      const ds = { larkAppId: app, chatId: sink.chatId, chatType: sink.chatType, worker: null,
+        session: { sessionId: output.sessionId, status: 'active' } };
+      const attempt = (journal: OutputDeliveryJournal, pending: OutputDeliveryRecord) =>
+        new OutputDeliveryCoordinator(journal).deliver(pending, {
+          owns: () => true,
+          process: (stored, control) => helper(ds, stored.output, 'trial', control,
+            stored.sink.kind === 'im' ? stored.sink.context.target : undefined),
+          settled: vi.fn(), error: vi.fn(),
+        });
+
+      if (crash === 'after Feishu accepted') {
+        await attempt(db, db.read(snapshot.id)!);
+        expect(db.read(snapshot.id)?.receipt).toBeUndefined();
+        expect(received.size).toBe(1);
+        await vi.advanceTimersByTimeAsync(5_001);
+      }
+      db.close();
+      db = database(dir);
+      expect(db.sink(output.sessionId!, output.turnId)).toEqual(sink);
+      const recover = loadWorkerPoolFunction<(ds: unknown) => Promise<void>>('recoverColdImReplies', deliveryScope({
+        config: { session: { dataDir: dir } }, WorkerOutputJournal, OutputDeliveryCoordinator,
+        outputDeliveryJournal: () => db, isSessionTransferring: () => false,
+        controllerForSession: () => ({ outputOrigin: () => hasProof ? origin : undefined,
+          store: { execution: () => ({ phase: 'succeeded' }), executions: () => [] } }),
+        raiseDaemonAttention, publishAttentionPatch: vi.fn(), publishScopedImDeliveryStatus: vi.fn(), logger: { warn: vi.fn() },
+        tag: () => 'trial', shouldDropMismatchedFinalOutput: () => false, shouldDropMismatchedHermesFinalOutput: () => false,
+        deliverFinalOutputWithOutputControl: helper, privateReplyEnabled: () => false,
+        FinalPublicationUnknownError, OutputDeliveryTerminalError, FINAL_HANDOFF_DELIVERY_REASON,
+      }));
+      await recover(ds);
+      if (!hasProof) {
+        expect(db.read(snapshot.id)).toBeUndefined();
+        expect(deliverFinalOutput).not.toHaveBeenCalled();
+        expect(producer.readPending()[0].output.content).toBe(snapshot.output.content);
+        expect(ds).toMatchObject({ agentAttention: { kind: 'blocked' } });
+        return;
+      }
+      expect(db.read(snapshot.id)?.receipt).toMatchObject({ status: 'delivered', messageId: 'om_original_answer' });
+      expect([...received.values()]).toEqual([{ content: snapshot.output.content, target }]);
+      expect(deliverFinalOutput).toHaveBeenCalledTimes(crash === 'after Feishu accepted' ? 2 : 1);
+      expect(producer.readPending()).toEqual([]);
+      expect(db.pending(output.sessionId!)).toEqual([]);
+    },
+  );
+
   it.each(['recovery receipt write', 'signed sequence rejection', 'unauthorized steer'])('retains both owners after %s failure', async (failure) => {
     const db = database(); const worker = { send: vi.fn() };
     const native: WorkerFinalOutput = { ...output, codexAppSettlement: { requestId: 'current', generation: 'native-1', seq: 1, dispatchId: 'dispatch' }, ...(failure === 'unauthorized steer' ? { disposition: 'steer_superseded' as const } : {}) };
     const record = db.accept(outputSnapshot(app, native), { kind: 'managed' });
     const ds: any = { worker, larkAppId: app, initConfig: { finalOutputHandoff: { token: 'token' } }, session: { sessionId: output.sessionId, status: 'active', codexAppDispatchLedger: [], codexAppGenerationCommits: failure === 'recovery receipt write' ? [{ generation: 'native-1', committedThrough: 1 }] : [] } };
-    const scope: any = { ds, worker, t: 'probe', workerGeneration: 1, cb: {}, journal: db, coordinator: new OutputDeliveryCoordinator(db),
+    const scope: any = deliveryScope({ ds, worker, t: 'probe', workerGeneration: 1, cb: {}, journal: db, coordinator: new OutputDeliveryCoordinator(db),
       ownsLifecycleMutation: () => true, ownsWorkerSession: () => true, isSessionTransferring: () => false, sessionController: undefined, logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
       committedCodexAppSequence, hasUnsettledCodexAppDispatch,
       reconcileOrdinaryTurnRecoveryTerminalReceipt: () => { throw new Error('EIO'); },
       settleCodexAppDispatch: () => failure === 'unauthorized steer' ? { ok: true, ledger: [], settledEntry: { codexAppSteerable: false, deliverySink: 'suppressed' } } : { ok: false, error: 'signed_sequence_rejected' },
-      FINAL_HANDOFF_DELIVERY_REASON: 'pending',
-    };
+      FinalPublicationUnknownError, OutputDeliveryTerminalError, FINAL_HANDOFF_DELIVERY_REASON: 'pending',
+    });
     scope.processFinalOutput = loadWorkerPoolClosure('processFinalOutput', scope);
     const run = loadWorkerPoolClosure<(record: OutputDeliveryRecord) => Promise<void>>('runOutput', scope);
     await run(record);

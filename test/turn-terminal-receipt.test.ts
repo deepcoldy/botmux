@@ -121,6 +121,8 @@ import { nextStepIo } from '../src/core/next-step-io.js';
 import { recapIdle } from '../src/core/turn-recap-state.js';
 import { notifyAwaySummaryFocusRevoked } from '../src/services/away-summary-focus-revocation.js';
 import { claudeAwaySummaryText } from '../src/services/turn-recap.js';
+import { outputDeliveryJournal } from '../src/services/output-delivery-journal.js';
+import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
@@ -261,6 +263,39 @@ describe('independent turn terminal receipt', () => {
     expect(call[4]).toBe('om_turn_done');
     expect(call[5]?.replyTarget).toEqual({ mode: 'thread', rootMessageId: 'om_exact_root' });
     expect(call[5]?.uuid).toMatch(/^tr_[0-9a-f]{47}$/);
+  });
+
+  it.each([
+    ['empty_answer', 'progress'],
+    ['nothing_to_send', 'older-attempt'],
+    ['nothing_to_send', 'exact-final'],
+  ] as const)('settles a required %s only with the exact final receipt (%s)', async (outputDisposition, prior) => {
+    const ds = makeDs();
+    const turnId = `om_required_${prior}`;
+    bindLarkTurn(ds, turnId, 'om_newer_route');
+    const appId = ds.larkAppId;
+    const sessionId = ds.session.sessionId;
+    ds.initConfig = { finalOutputHandoff: { version: 2, token: 'trial', frozenImOnly: true } } as DaemonSession['initConfig'];
+    const target = { mode: 'thread', rootMessageId: 'om_original_topic' } as const;
+    outputDeliveryJournal(dataDir, appId).rememberSink(sessionId, turnId,
+      { kind: 'im', context: { target }, chatId: ds.chatId, chatType: ds.chatType, answerRequired: true });
+    const ledger = new TurnSendLedger(dataDir);
+    await ledger.execute({ larkAppId: appId, sessionId, turnId, dispatchAttempt: prior === 'older-attempt' ? 1 : 2 },
+      prior === 'progress' ? 'progress' : 'final', prior, async () => 'om_already_visible');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const terminal = terminalMsg(turnId, { dispatchAttempt: 2, outputDisposition });
+
+    await deliver(ds, terminal, terminal);
+    await settle(ds);
+
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    if (prior === 'exact-final') {
+      expect(sessionReplyMock).not.toHaveBeenCalled();
+    } else {
+      expect(sessionReplyMock).toHaveBeenCalledExactlyOnceWith(expect.anything(),
+        expect.stringMatching(/未生成可交付答复|without an answer to deliver/), 'text', appId, turnId,
+        expect.objectContaining({ replyTarget: target, sourceSessionId: sessionId }));
+    }
   });
 
   it('still posts the strip when a suspend is queued for the turn, then carries the suspend out', async () => {

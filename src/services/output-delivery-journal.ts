@@ -6,7 +6,7 @@ import { mergeOutputReplay, validateOutputSnapshot, isOutputJournalAppId, type O
 import type { FrozenSessionReplyContext } from '../types.js';
 
 export type OutputSink =
-  | { kind: 'im'; context: FrozenSessionReplyContext; chatId: string; chatType: 'group' | 'p2p'; privateReply?: boolean }
+  | { kind: 'im'; context: FrozenSessionReplyContext; chatId: string; chatType: 'group' | 'p2p'; privateReply?: boolean; answerRequired?: true }
   | { kind: 'http'; mode: 'wait' | 'async' }
   | { kind: 'doc'; context: Record<string, unknown> }
   | { kind: 'managed' }
@@ -160,8 +160,10 @@ export class OutputDeliveryJournal {
   }
   rememberSink(sessionId: string, turnId: string, sink: OutputSink): void {
     this.transaction(() => {
-    if (sink.kind !== 'im' && this.sink(sessionId, turnId)?.kind === 'im') this.db.prepare("DELETE FROM output_sinks WHERE session_id=? AND turn_id=? AND NOT EXISTS(SELECT 1 FROM outputs WHERE session_id=? AND turn_id=?)").run(sessionId, turnId, sessionId, turnId);
-    this.db.prepare('INSERT OR IGNORE INTO output_sinks(session_id,turn_id,value) VALUES(?,?,?)').run(sessionId, turnId, JSON.stringify(sink));
+      const existing = this.sink(sessionId, turnId);
+      if (existing?.kind === 'im' && existing.answerRequired) return;
+      if (sink.kind !== 'im' && existing?.kind === 'im') this.db.prepare("DELETE FROM output_sinks WHERE session_id=? AND turn_id=? AND NOT EXISTS(SELECT 1 FROM outputs WHERE session_id=? AND turn_id=?)").run(sessionId, turnId, sessionId, turnId);
+      this.db.prepare('INSERT OR IGNORE INTO output_sinks(session_id,turn_id,value) VALUES(?,?,?)').run(sessionId, turnId, JSON.stringify(sink));
     });
   }
   sink(sessionId: string, turnId: string): OutputSink | undefined {
