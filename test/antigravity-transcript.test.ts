@@ -282,6 +282,24 @@ describe('antigravityTurnFailedWithoutOutput', () => {
     expect(inspected).toBe(true);
   });
 
+  it('fails closed when a full sibling with output appears after the missing check', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const user = line(userRecord(USER_REQUEST));
+    writeFileSync(path, user);
+    let created = false;
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST, {
+      existsSync: candidate => {
+        if (!created && candidate === fullPath) {
+          created = true;
+          writeFileSync(fullPath, user + line(plannerStep({ toolCalls: [toolCall('create_the_file')] })));
+          return false;
+        }
+        return existsSync(candidate);
+      },
+    })).toBe(false);
+    expect(created).toBe(true);
+  });
+
   it('fails closed on a partial record in the compact sibling', () => {
     const fullPath = join(dir, 'transcript_full.jsonl');
     writeFileSync(fullPath, line(userRecord(USER_REQUEST)));

@@ -351,7 +351,12 @@ export function antigravityTurnFailedWithoutOutput(
   // independently retain the exact no-progress proof; full has no single-log
   // fallback even if compact disappears between inspection and reading.
   if (!proofDeps.existsSync(sibling)) {
-    return isFull ? false : antigravitySingleTranscriptTurnFailedWithoutOutput(path, writtenInput);
+    if (isFull) return false;
+    if (!antigravitySingleTranscriptTurnFailedWithoutOutput(path, writtenInput)) return false;
+    // A full log may be created while compact is being read. If it exists now,
+    // the old compact-only branch is no longer a complete proof; fail closed
+    // rather than racing a sibling that may already contain tool progress.
+    return !proofDeps.existsSync(sibling);
   }
   return antigravitySingleTranscriptTurnFailedWithoutOutput(path, writtenInput)
     && antigravitySingleTranscriptTurnFailedWithoutOutput(sibling, writtenInput);
