@@ -506,13 +506,14 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, hasAntigravitySideQuestionComposer, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
 import { antigravitySessionLogPath } from './services/antigravity-session-fork.js';
 import { AntigravityNativeQuotaLog, currentAntigravityNativeQuota } from './services/antigravity-native-quota.js';
 import {
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
   hasAntigravityPendingTasks,
+  hasAntigravityTranscriptPendingTasks,
   drainAntigravityTranscript,
   resolveAntigravityTranscriptPath,
   antigravityTurnFailedWithoutOutput,
@@ -14517,6 +14518,58 @@ function antigravityBridgeState(): AntigravityTranscriptState {
   return (structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {};
 }
 
+/** Resolve the live Antigravity transcript path even when the structured bridge
+ *  is inactive (ordinary `replyDelivery: 'send'` mode) or has not yet bound. */
+function resolveLiveAntigravityTranscriptPath(): string | undefined {
+  if (cliAdapter?.runnerFramedInput || lastInitConfig?.cliId !== 'antigravity') return undefined;
+  const effectivePid = typeof currentAntigravityObservedPid === 'function'
+    ? currentAntigravityObservedPid()
+    : undefined;
+  const discoveredCid = cliAdapter?.resolveActiveSessionId
+    ? cliAdapter.resolveActiveSessionId({ cliPid: effectivePid, cliCwd: lastInitConfig.workingDir })
+    : (effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined);
+  const cid = discoveredCid ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig.cliSessionId;
+  const relocatedHome = lastInitConfig.env?.HOME;
+  if (cid && relocatedHome) {
+    const relocated = resolveAntigravityTranscriptPath(cid, {
+      brainDir: join(relocatedHome, '.gemini', 'antigravity-cli', 'brain'),
+    });
+    if (relocated) return relocated;
+  }
+  return resolveFileBridgePath('antigravity', { sessionId: cid, pid: effectivePid });
+}
+
+/** Whether the live Antigravity turn has pending background command task(s) or
+ *  subagent(s). Works both when the structured bridge is active (zero-prompt /
+ *  adopt) and in ordinary `replyDelivery: 'send'` mode where the bridge does
+ *  not attach. Never holds a cold/resumed idle startup with no started turn or
+ *  a viewport that explicitly shows an interrupted turn. */
+function hasLiveAntigravityPendingTasks(): boolean {
+  if (!structuredBridgeIs('antigravity') || cliAdapter?.runnerFramedInput) return false;
+  const activeTurnStarted = activeTurnAuthority.snapshot()?.started === true;
+  // In ordinary send mode disk pending state is meaningful only while this
+  // worker owns a started turn. Otherwise a stale/abandoned RUNNING can flip a
+  // later idle edge back to working after the first ready exemption has passed.
+  if (!activeTurnStarted && !codexBridgeFallbackActive()) return false;
+  if (awaitingFirstPrompt && !activeTurnStarted) return false;
+  if (backend && backendScreenEvidenceIsAuthoritativeForMutation()) {
+    try {
+      const screen = captureBackendScreen(backend);
+      if (screen && isAntigravityInterruptedScreen(screen)) return false;
+    } catch { /* Missing viewport is not interruption evidence. */ }
+  }
+  if (codexBridgeFallbackActive()) {
+    codexBridgeDrainAndMaybeEmit({ signalIdle: false });
+    if (hasAntigravityPendingTasks(antigravityBridgeState())) return true;
+    // When the bridge is attached and baselined, its drained state is
+    // authoritative (including adopt/retired turn boundaries). Only fall back
+    // to a direct disk scan while the bridge has not yet attached/baselined.
+    if (codexBridgeRolloutPath && codexBridgeBaselineDone) return false;
+  }
+  const transcriptPath = resolveLiveAntigravityTranscriptPath();
+  return !!transcriptPath && hasAntigravityTranscriptPendingTasks(transcriptPath);
+}
+
 function currentHermesBridgeDbPath(): string {
   return hermesBridgeDbPath ?? resolveHermesStateDbPath();
 }
@@ -23874,18 +23927,21 @@ function markPromptReady(): void {
     hasQueuedTurn: queuedTypeAheadTurns.length > 0,
   });
   const beforeMarkerSync = readyTransition(false);
-  // Drain Antigravity's transcript before evaluating readyContinuesTurn so a
-  // just-written background task or subagent launch is reflected before this
-  // ready edge can revoke turn authority.
-  if (typeof structuredBridgeIs === 'function' && structuredBridgeIs('antigravity')
-    && typeof codexBridgeDrainAndMaybeEmit === 'function') {
-    codexBridgeDrainAndMaybeEmit({ signalIdle: false });
+  // Check Antigravity's transcript before evaluating readyContinuesTurn so a
+  // running background command or subagent is reflected before this ready edge
+  // can revoke turn authority — in both zero-prompt/adopt mode (via bridge
+  // drain) and ordinary `replyDelivery: 'send'` mode (via direct tail scan).
+  let antigravityPendingTasks = false;
+  if (typeof hasLiveAntigravityPendingTasks === 'function') {
+    antigravityPendingTasks = hasLiveAntigravityPendingTasks();
+  } else if (typeof structuredBridgeIs === 'function' && structuredBridgeIs('antigravity')) {
+    if (typeof codexBridgeDrainAndMaybeEmit === 'function') {
+      codexBridgeDrainAndMaybeEmit({ signalIdle: false });
+    }
+    antigravityPendingTasks = typeof hasAntigravityPendingTasks === 'function'
+      && typeof antigravityBridgeState === 'function'
+      && hasAntigravityPendingTasks(antigravityBridgeState());
   }
-  const antigravityPendingTasks = typeof structuredBridgeIs === 'function'
-    && structuredBridgeIs('antigravity')
-    && typeof hasAntigravityPendingTasks === 'function'
-    && typeof antigravityBridgeState === 'function'
-    && hasAntigravityPendingTasks(antigravityBridgeState());
   // A ready reported as working below (the argv-baked first prompt still runs,
   // or the turn only waits on its background agents/tasks) is not the turn's
   // end: that work still reports under this turn's authority.

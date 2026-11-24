@@ -110,6 +110,8 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('whiteboards', '#/whiteboards', () => import('./whiteboards-page.js'), 'renderWhiteboardsPage'),
   // 决策看板：`#/board`（汇总）、`#/board/<app>`、`#/board/<app>/<seq>`（详情）。没有别的路由以 `#/board` 开头。
   pageRoute('decision-board', '#/board', () => import('./decision-board-page.js'), 'renderDecisionBoardPage'),
+  // 任务分配总览（实时状态、画像卡片、分配记录与兜底换人链路）。
+  pageRoute('task-routing', '#/assign', () => import('./task-routing-page.js'), 'renderTaskRoutingPage'),
   pageRoute('doc-watches', '#/doc-watches', () => import('./doc-watches-page.js'), 'renderDocWatchesPage'),
   pageRoute('monitoring', '#/monitoring', () => import('./monitoring-page.js'), 'renderMonitoringPage'),
   pageRoute('sessions', '#/sessions', () => import('./sessions-page.js'), 'renderSessionsPage'),

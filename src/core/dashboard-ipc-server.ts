@@ -5008,6 +5008,7 @@ async function handleProviderAuthRequest(
     adoptBytedcliForTurn: person => adoptLocalBytedcliAuthorization({
       sessionDataDir: config.session.dataDir, sessionId, turnId: publishedTurnId,
       botConfig: cfg, senderOpenId: person,
+      currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
     }),
     deliver: authLinkDeliverer(ds, cfg, openId, provider as AuthProvider, published),
   });

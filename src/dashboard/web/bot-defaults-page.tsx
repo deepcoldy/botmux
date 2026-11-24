@@ -1,3 +1,8 @@
+import {
+  TASK_ROUTING_COST_TIERS,
+  TASK_ROUTING_LIMITS,
+  type TaskRoutingCostTier,
+} from '../../core/task-routing/model.js';
 import { DEFAULT_OWNER_REMINDER_QUIET_HOURS, normalizeOwnerReminderQuietHours } from '../../core/session-owner-reminder-quiet-hours.js';
 import type { OncallPresetOptions } from '../../services/oncall-preset-options.js';
 import { normalizePassthroughCommand, parseCustomPassthroughInput } from '../../core/passthrough-commands.js';
@@ -7920,30 +7925,77 @@ function SessionModeSection(props: {
   );
 }
 
-/** Per-bot participation switch. Advanced cost/profile fields round-trip unchanged. */
+const TASK_ROUTING_TIER_KEYS: Readonly<Record<TaskRoutingCostTier, string>> = {
+  low: 'botDefaults.taskRoutingTierLow',
+  medium: 'botDefaults.taskRoutingTierMedium',
+  high: 'botDefaults.taskRoutingTierHigh',
+};
+
+/** Per-bot task-routing opt-in switch + natural-language capability profile editor. */
 export function TaskRoutingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState<StatusMessage>(null);
+  const appId = props.bot.larkAppId;
   const current = props.bot.taskRouting ?? null;
   const ineligible = props.bot.apiOnly === true || props.bot.steward?.enabled === true;
 
-  async function save(enabled: boolean): Promise<void> {
+  const savedTier: TaskRoutingCostTier = current?.costTier ?? 'medium';
+  const savedStrengths = current?.strengths ?? '';
+  const savedLimitations = current?.limitations ?? '';
+
+  const [costTier, setCostTier] = useState<TaskRoutingCostTier>(savedTier);
+  const [strengths, setStrengths] = useState(savedStrengths);
+  const [limitations, setLimitations] = useState(savedLimitations);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [profileStatus, setProfileStatus] = useState<StatusMessage>(null);
+
+  useEffect(() => { setCostTier(savedTier); }, [appId, savedTier]);
+  useEffect(() => { setStrengths(savedStrengths); }, [appId, savedStrengths]);
+  useEffect(() => { setLimitations(savedLimitations); }, [appId, savedLimitations]);
+  useEffect(() => { setStatus(null); setProfileStatus(null); }, [appId]);
+
+  const profileDirty = costTier !== savedTier
+    || strengths.trim() !== savedStrengths.trim()
+    || limitations.trim() !== savedLimitations.trim();
+
+  async function saveEnabled(enabled: boolean): Promise<void> {
     await saveBotField({
-      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/task-routing`, {
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(appId)}/task-routing`, {
         taskRouting: { ...current, enabled },
       }),
       setStatus,
       setBusy,
       saved: tr('botDefaults.taskRoutingSaved'),
       onSaved: body => {
-        props.patchBot(props.bot.larkAppId, { taskRouting: body.taskRouting ?? null });
+        props.patchBot(appId, { taskRouting: body.taskRouting ?? null });
+      },
+    });
+  }
+
+  async function saveProfile(): Promise<void> {
+    const trimmedStrengths = strengths.trim();
+    const trimmedLimitations = limitations.trim();
+    const payload = {
+      enabled: current?.enabled === true,
+      costTier,
+      ...(trimmedStrengths ? { strengths: trimmedStrengths } : {}),
+      ...(trimmedLimitations ? { limitations: trimmedLimitations } : {}),
+    };
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(appId)}/task-routing`, {
+        taskRouting: payload,
+      }),
+      setStatus: setProfileStatus,
+      setBusy,
+      saved: tr('botDefaults.taskRoutingProfileSaved'),
+      onSaved: body => {
+        props.patchBot(appId, { taskRouting: body.taskRouting ?? null });
       },
     });
   }
 
   return (
-    <section className="bd-section" data-task-routing-section>
+    <section className="bd-section bd-tr-section" aria-busy={busy} data-task-routing-section>
       <h3 className="bd-section-title">{tr('botDefaults.sectionTaskRouting')}</h3>
       <ToggleRow
         checked={current?.enabled === true}
@@ -7952,9 +8004,83 @@ export function TaskRoutingSection(props: { bot: BotDefaultsRow; patchBot: Patch
         title={tr('botDefaults.taskRoutingEnabled')}
         help={tr('botDefaults.taskRoutingEnabledHelp')}
         description={ineligible ? tr('botDefaults.taskRoutingIneligible') : undefined}
-        onChange={checked => { void save(checked); }}
+        onChange={checked => { void saveEnabled(checked); }}
       />
       <div className="bd-mode-group-side"><StatusSpan status={status} attr={{ 'data-task-routing-status': '' }} /></div>
+
+      {!ineligible ? (
+        <div className="bd-tr-profile-fields">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.taskRoutingCostTierHelp')}>{tr('botDefaults.taskRoutingCostTier')}</FieldTitle>
+            <div className="bd-tr-tier-group" role="radiogroup" aria-label={tr('botDefaults.taskRoutingCostTier')}>
+              {TASK_ROUTING_COST_TIERS.map(tier => (
+                <button
+                  key={tier}
+                  type="button"
+                  role="radio"
+                  aria-checked={costTier === tier}
+                  data-tier={tier}
+                  className={`bd-tr-tier-btn${costTier === tier ? ' is-active' : ''}`}
+                  disabled={busy}
+                  onClick={() => setCostTier(tier)}
+                >
+                  {tr(TASK_ROUTING_TIER_KEYS[tier])}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="bd-field">
+            <div className="bd-tr-field-head">
+              <FieldTitle help={tr('botDefaults.taskRoutingStrengthsHelp')}>{tr('botDefaults.taskRoutingStrengths')}</FieldTitle>
+              <span className="bd-tr-counter">{Array.from(strengths).length}/{TASK_ROUTING_LIMITS.maxStrengthsChars}</span>
+            </div>
+            <textarea
+              className="bd-tr-textarea"
+              data-input="task-routing-strengths"
+              rows={3}
+              maxLength={TASK_ROUTING_LIMITS.maxStrengthsChars}
+              disabled={busy}
+              value={strengths}
+              placeholder={tr('botDefaults.taskRoutingStrengthsPlaceholder')}
+              onChange={event => setStrengths(event.currentTarget.value)}
+            />
+          </div>
+
+          <div className="bd-field">
+            <div className="bd-tr-field-head">
+              <FieldTitle help={tr('botDefaults.taskRoutingLimitationsHelp')}>{tr('botDefaults.taskRoutingLimitations')}</FieldTitle>
+              <span className="bd-tr-counter">{Array.from(limitations).length}/{TASK_ROUTING_LIMITS.maxLimitationsChars}</span>
+            </div>
+            <textarea
+              className="bd-tr-textarea"
+              data-input="task-routing-limitations"
+              rows={3}
+              maxLength={TASK_ROUTING_LIMITS.maxLimitationsChars}
+              disabled={busy}
+              value={limitations}
+              placeholder={tr('botDefaults.taskRoutingLimitationsPlaceholder')}
+              onChange={event => setLimitations(event.currentTarget.value)}
+            />
+          </div>
+
+          <div className="actions bd-tr-actions">
+            <button
+              type="button"
+              className="primary"
+              data-action="save-task-routing-profile"
+              disabled={busy || !profileDirty}
+              onClick={() => { void saveProfile(); }}
+            >
+              {tr('botDefaults.taskRoutingSaveProfile')}
+            </button>
+            <StatusSpan status={profileStatus} attr={{ 'data-task-routing-profile-status': '' }} />
+          </div>
+          {current?.enabled === true ? (
+            <a className="bd-steward-open" href="#/assign">{tr('botDefaults.taskRoutingOpenPage')} →</a>
+          ) : null}
+        </div>
+      ) : null}
     </section>
   );
 }
