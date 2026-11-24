@@ -781,7 +781,7 @@ import {
   declaresDurableTurnOutputReceipt,
   parseCollabPreflightRequest,
 } from './core/collab-preflight-ipc.js';
-import { parseCollabKickoffRequest, type CollabKickoffMutation, type CollabKickoffPrepareRequestV1 } from './core/collab-kickoff-ipc.js';
+import { parseCollabKickoffRequest, validateCollabKickoffPrepare, type CollabKickoffMutation } from './core/collab-kickoff-ipc.js';
 import { prepareCollabKickoff, cancelCollabKickoff, readCollabKickoffOperation } from './core/collab-kickoff-store.js';
 import { collabPayloadHash } from './services/collab-group-config.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isHumanInboundTurnId, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
@@ -9376,11 +9376,12 @@ async function collabKickoffRoute(req: IncomingMessage, res: ServerResponse, par
     }
 
     if (action === 'prepare') {
-      // F2：prepare 必填 target/appId/sourceMessageId/prompt，且 appId 与目标匹配。
-      const reqBody = parsed.req as CollabKickoffPrepareRequestV1;
-      if (!reqBody.targetLarkAppId || !reqBody.appId || !reqBody.sourceMessageId || reqBody.prompt === undefined) {
-        return reply(400, { ok: false, errorCode: 'BAD_REQUEST', message: 'prepare missing required fields' });
+      // R1：动作层运行时结构校验（sourceMessageId/prompt 必须是正确类型）。
+      const v = validateCollabKickoffPrepare(body);
+      if (!v.ok) {
+        return reply(400, { ok: false, errorCode: 'BAD_REQUEST', message: v.message });
       }
+      const reqBody = v.req;
       if (reqBody.targetLarkAppId !== selfV3LarkAppId) {
         return reply(400, { ok: false, errorCode: 'TARGET_MISMATCH' });
       }

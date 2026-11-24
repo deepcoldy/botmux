@@ -6,7 +6,7 @@
  * cancelled。幂等：重复 kickoffId + 同 payloadHash 返回原 operation；同 key 不同 payloadHash
  * → OPERATION_CONFLICT。
  */
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
@@ -67,13 +67,14 @@ export function readCollabKickoffOperation(dataDir: string, targetLarkAppId: str
 export function readCollabKickoffOperation(dataDir: string, targetLarkAppId: string, kickoffId: string, strict: true): CollabKickoffReadResult;
 export function readCollabKickoffOperation(dataDir: string, targetLarkAppId: string, kickoffId: string, strict?: true): CollabKickoffOperationV1 | undefined | CollabKickoffReadResult {
   const fp = opPath(dataDir, targetLarkAppId, kickoffId);
-  let exists: boolean;
-  try { exists = existsSync(fp); } catch { exists = false; }
-  if (!exists) return strict ? { kind: 'missing' } : undefined;
+  // R3：不用 existsSync 前置判定（父目录不可遍历时 existsSync 抛错被吞成 missing）；
+  // 直接 readFileSync，仅 err.code==='ENOENT' 判 missing，其余 read-error 判 corrupted。
   let raw: string;
   try {
     raw = readFileSync(fp, 'utf-8');
   } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') return strict ? { kind: 'missing' } : undefined;
     if (strict) return { kind: 'corrupted', message: err instanceof Error ? err.message : String(err) };
     return undefined;
   }

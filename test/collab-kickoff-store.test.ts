@@ -126,4 +126,19 @@ describe('collab-kickoff-store', () => {
     // 原文件未被覆盖
     expect(readFileSync(join(opDir, file), 'utf-8')).toBe('{broken json');
   });
+
+  it('R3：父目录不可遍历 → strict 读判 corrupted 不判 missing', async () => {
+    const { chmodSync } = await import('node:fs');
+    // 建 op 目录并把父目录 chmod 000
+    const opDir = join(dataDir, 'collab-kickoff', 'operations', TARGET);
+    mkdirSync(opDir, { recursive: true });
+    const parent = join(dataDir, 'collab-kickoff', 'operations');
+    chmodSync(parent, 0o000);
+    try {
+      const read = readCollabKickoffOperation(dataDir, TARGET, KICKOFF, true);
+      expect(read.kind).toBe('corrupted'); // 非 missing
+    } finally {
+      chmodSync(parent, 0o755);
+    }
+  });
 });

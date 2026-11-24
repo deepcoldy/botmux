@@ -4,6 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   parseCollabKickoffRequest,
+  validateCollabKickoffPrepare,
   collabKickoffPath,
   requestCollabKickoff,
 } from '../src/core/collab-kickoff-ipc.js';
@@ -37,6 +38,19 @@ describe('parseCollabKickoffRequest', () => {
   it('"null" 不抛 TypeError，返回 bad_body', () => {
     expect(parseCollabKickoffRequest('null').ok).toBe(false);
     expect(parseCollabKickoffRequest('[]').ok).toBe(false);
+  });
+});
+
+describe('R1：validateCollabKickoffPrepare 类型校验', () => {
+  const base = { schemaVersion: 1, initId: 'i'.repeat(64), kickoffId: 'k'.repeat(64), configVersion: 'cv', targetLarkAppId: 'cli_peer', appId: 'cli_peer', sourceMessageId: 'om_src', prompt: 'hello' };
+  it('sourceMessageId 非 string → 拒绝', () => {
+    expect(validateCollabKickoffPrepare({ ...base, sourceMessageId: 42 }).ok).toBe(false);
+  });
+  it('prompt 非 string → 拒绝', () => {
+    expect(validateCollabKickoffPrepare({ ...base, prompt: null }).ok).toBe(false);
+  });
+  it('合法通过', () => {
+    expect(validateCollabKickoffPrepare(base).ok).toBe(true);
   });
 });
 
@@ -92,6 +106,66 @@ describe('requestCollabKickoff fail-closed', () => {
       operation: {
         schemaVersion: 1, kickoffId, initId, sourceLarkAppId: 's', targetLarkAppId: 'cli_peer', appId: 'cli_peer',
         chatId: 'oc', configVersion: 'cv', payloadHash: 'h', state: 'started', sessionId: '', turnId: 't', acceptedAt: '2026-01-01T00:00:00Z',
+        createdAt: 'x', updatedAt: 'x',
+      },
+    });
+    const signature = signDispatchLaunchIpcResponse({ secret, requestNonce: nonce, method: 'GET', pathWithQuery, status: 200, body, target });
+    const fakeFetch = (async () => ({
+      status: 200,
+      headers: { get: (k: string) => (k === DISPATCH_LAUNCH_IPC_HEADERS.responseSignature ? signature : null) },
+      text: async () => body,
+    })) as any;
+    const r = await requestCollabKickoff(
+      { larkAppId: 'cli_peer', ipcPort: 12345, bootInstanceId: 'x'.repeat(43), dispatchLaunchIpcProtocol: 'v1' } as any,
+      initId, kickoffId, undefined, undefined,
+      { secret, nonce, fetchImpl: fakeFetch },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errorCode).toBe('BAD_RESPONSE');
+  });
+
+  it('R2：签名有效但 targetLarkAppId/appId 改成不同 peer → BAD_RESPONSE', async () => {
+    const secret = 's'.repeat(32);
+    const initId = 'i'.repeat(64);
+    const kickoffId = 'k'.repeat(64);
+    const target = { larkAppId: 'cli_peer', ipcPort: 12345, bootInstanceId: 'x'.repeat(43) };
+    const nonce = 'n'.repeat(43);
+    const pathWithQuery = collabKickoffPath(initId, kickoffId);
+    const body = JSON.stringify({
+      ok: true,
+      operation: {
+        schemaVersion: 1, kickoffId, initId, sourceLarkAppId: 's', targetLarkAppId: 'cli_different_peer', appId: 'cli_different_peer',
+        chatId: 'oc', configVersion: 'cv', payloadHash: 'h', state: 'prepared',
+        createdAt: 'x', updatedAt: 'x',
+      },
+    });
+    const signature = signDispatchLaunchIpcResponse({ secret, requestNonce: nonce, method: 'GET', pathWithQuery, status: 200, body, target });
+    const fakeFetch = (async () => ({
+      status: 200,
+      headers: { get: (k: string) => (k === DISPATCH_LAUNCH_IPC_HEADERS.responseSignature ? signature : null) },
+      text: async () => body,
+    })) as any;
+    const r = await requestCollabKickoff(
+      { larkAppId: 'cli_peer', ipcPort: 12345, bootInstanceId: 'x'.repeat(43), dispatchLaunchIpcProtocol: 'v1' } as any,
+      initId, kickoffId, undefined, undefined,
+      { secret, nonce, fetchImpl: fakeFetch },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errorCode).toBe('BAD_RESPONSE');
+  });
+
+  it('R2：签名有效但三元组类型错（sessionId=42/turnId=对象/acceptedAt=bool）→ BAD_RESPONSE', async () => {
+    const secret = 's'.repeat(32);
+    const initId = 'i'.repeat(64);
+    const kickoffId = 'k'.repeat(64);
+    const target = { larkAppId: 'cli_peer', ipcPort: 12345, bootInstanceId: 'x'.repeat(43) };
+    const nonce = 'n'.repeat(43);
+    const pathWithQuery = collabKickoffPath(initId, kickoffId);
+    const body = JSON.stringify({
+      ok: true,
+      operation: {
+        schemaVersion: 1, kickoffId, initId, sourceLarkAppId: 's', targetLarkAppId: 'cli_peer', appId: 'cli_peer',
+        chatId: 'oc', configVersion: 'cv', payloadHash: 'h', state: 'started', sessionId: 42, turnId: { x: 1 }, acceptedAt: true,
         createdAt: 'x', updatedAt: 'x',
       },
     });

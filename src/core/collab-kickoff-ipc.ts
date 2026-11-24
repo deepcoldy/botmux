@@ -75,6 +75,30 @@ export function parseCollabKickoffRequest(bodyRaw: string):
   return { ok: true, req: r as unknown as CollabKickoffPrepareRequestV1 };
 }
 
+/** 动作层运行时结构校验（R1）：prepare 必填字段类型。 */
+export function validateCollabKickoffPrepare(body: Record<string, unknown>):
+  | { ok: true; req: CollabKickoffPrepareRequestV1 }
+  | { ok: false; message: string } {
+  if (typeof body.targetLarkAppId !== 'string' || !body.targetLarkAppId) return { ok: false, message: 'targetLarkAppId 必须是非空 string' };
+  if (typeof body.appId !== 'string' || !body.appId) return { ok: false, message: 'appId 必须是非空 string' };
+  if (typeof body.sourceMessageId !== 'string' || !body.sourceMessageId) return { ok: false, message: 'sourceMessageId 必须是非空 string' };
+  if (typeof body.prompt !== 'string') return { ok: false, message: 'prompt 必须是 string' };
+  return {
+    ok: true,
+    req: {
+      schemaVersion: 1,
+      initId: body.initId as string,
+      kickoffId: body.kickoffId as string,
+      sourceMessageId: body.sourceMessageId,
+      configVersion: body.configVersion as string,
+      targetLarkAppId: body.targetLarkAppId,
+      appId: body.appId,
+      prompt: body.prompt,
+      ...(body.dependencyProof !== undefined ? { dependencyProof: body.dependencyProof as CollabKickoffPrepareRequestV1['dependencyProof'] } : {}),
+    },
+  };
+}
+
 /** 客户端：向 peer daemon 发 collab.kickoff（prepare/start/cancel/query）。网络/认证失败 → 未就绪。 */
 export async function requestCollabKickoff(
   daemon: Pick<OnlineDaemonInfo, 'larkAppId' | 'ipcPort' | 'bootInstanceId' | 'dispatchLaunchIpcProtocol'>,
@@ -136,11 +160,18 @@ export async function requestCollabKickoff(
   if (op.schemaVersion !== 1) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation schemaVersion mismatch' };
   if (op.kickoffId !== kickoffId) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation kickoffId mismatch' };
   if (op.initId !== initId) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation initId mismatch' };
+  // R2：targetLarkAppId/appId 必须与调用目标一致。
+  if (op.targetLarkAppId !== target.larkAppId) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation target mismatch' };
+  if (op.appId !== target.larkAppId) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation appId mismatch' };
   const validStates = new Set(['preparing', 'prepared', 'starting', 'started', 'failed', 'cancelled']);
   if (typeof op.state !== 'string' || !validStates.has(op.state)) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'operation state invalid' };
-  // started 时三元组必须非空（F3）。
-  if (op.state === 'started' && (!op.sessionId || !op.turnId || !op.acceptedAt)) {
-    return { ok: false, errorCode: 'BAD_RESPONSE', message: 'started operation missing session/turn/acceptedAt' };
+  // R2：started 时三元组必须是非空 string，acceptedAt 校验时间格式。
+  if (op.state === 'started') {
+    if (typeof op.sessionId !== 'string' || !op.sessionId) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'started sessionId must be non-empty string' };
+    if (typeof op.turnId !== 'string' || !op.turnId) return { ok: false, errorCode: 'BAD_RESPONSE', message: 'started turnId must be non-empty string' };
+    if (typeof op.acceptedAt !== 'string' || !Number.isFinite(Date.parse(op.acceptedAt))) {
+      return { ok: false, errorCode: 'BAD_RESPONSE', message: 'started acceptedAt must be valid timestamp' };
+    }
   }
   return { ok: true, operation: op as unknown as CollabKickoffOperationV1 };
 }
