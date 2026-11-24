@@ -31201,7 +31201,7 @@ async function spawnCliBody(
     childIdentityModel === 'proven'
       ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
       : undefined,
-    { canonicalPaths: sandboxRequested });
+    { canonicalPaths: sandboxRequested, loopbackShared: spawnNetworkShape.loopbackShared });
   if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
     sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, canonicalPaths: sandboxRequested, userNative: larkUserNative(cfg.triggerUserAuth) });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {

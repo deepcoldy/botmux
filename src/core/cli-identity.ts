@@ -1609,9 +1609,10 @@ export interface NativeBytedcliCapabilities {
 }
 
 const AS_UNAVAILABLE_MSG = 'botmux: 这次调用无法使用 BOTMUX_AS（命令使用本机原生登录，或本会话按单快照模式运行，不逐次向 daemon 取身份），命令未执行；去掉 BOTMUX_AS 重试。';
+const GIT_COMMIT_AS_UNAVAILABLE_MSG = 'botmux: gitCommitIdentity 暂不支持 BOTMUX_AS，命令未执行；去掉 BOTMUX_AS 后重试。';
 /** Shell line refusing a call that names `BOTMUX_AS` where the wrapper cannot honour it. */
-const refuseBotmuxAs = (leave: string): string =>
-  `[ -z "\${BOTMUX_AS:-}" ] || { printf '%s\\n' ${shellSingleQuote(AS_UNAVAILABLE_MSG)} >&2; ${leave} ${IDENTITY_DENIED_EXIT_CODE}; }`;
+const refuseBotmuxAs = (leave: string, message = AS_UNAVAILABLE_MSG): string =>
+  `[ -z "\${BOTMUX_AS:-}" ] || { printf '%s\\n' ${shellSingleQuote(message)} >&2; ${leave} ${IDENTITY_DENIED_EXIT_CODE}; }`;
 
 function bytedcliNativePassthrough(realBinaryPath: string, native: NativeBytedcliCapabilities): string[] {
   if (!native.meego && !native.bytecloud) return [];
@@ -2219,6 +2220,10 @@ export function renderGitCommitWrapper(realGit: string, resolver: readonly strin
     'needs_actor() {',
     '  while [ "$#" -gt 0 ]; do',
     '    case "$1" in',
+    // These global forms terminate in version/path/help output (or their own
+    // usage error); Git never executes a later subcommand. Do not demand an
+    // actor for read-only informational invocations such as `git --help commit`.
+    '      -h|--help|--version|--exec-path|--html-path|--man-path|--info-path|--list-cmds|--list-cmds=*) return 1 ;;',
     '      -c) [ "$#" -ge 2 ] || return 1; capture_user_config -c "$2"; shift 2 ;;',
     '      --config-env=*) capture_user_config "$1"; shift ;;',
     '      --config-env) [ "$#" -ge 2 ] || return 1; capture_user_config "--config-env=$2"; shift 2 ;;',
@@ -2239,6 +2244,11 @@ export function renderGitCommitWrapper(realGit: string, resolver: readonly strin
     '  return 1',
     '}',
     'if ! needs_actor "$@"; then exec "$real_git" "$@"; fi',
+    // The current-actor route attests the turn principal, not a speaker selected
+    // for one command. Until it has speaker-aware semantics, never silently
+    // attribute a requested BOTMUX_AS call to the principal. Read-only and push
+    // paths never reach this guard; the existing askpass flow keeps its own AS handling.
+    refuseBotmuxAs('exit', GIT_COMMIT_AS_UNAVAILABLE_MSG),
     `email="$(${resolver.map(shellSingleQuote).join(' ')})" || exit ${IDENTITY_DENIED_EXIT_CODE}`,
     // Ambient identity env vars outrank every -c config key (git gives them
     // precedence over all config scopes). A shell profile or an export inside
@@ -2372,6 +2382,18 @@ export function applyTurnGitConfigEnv(
   if (pairs.length) Object.assign(env, encodeGitConfigPairs(pairs));
 }
 
+export interface TriggerUserCliEnvOptions {
+  /** The session runs in a fresh bwrap root that only mounts CANONICAL paths.
+   *  A symlinked home / data root (`/home/u` -> `/data00/home/u`) has no alias
+   *  there, so every path written into the session env or a generated script
+   *  must be the realpath. Left off, nothing changes for unsandboxed sessions. */
+  canonicalPaths?: boolean;
+  /** Actual spawn-network fact, not a value re-derived from frozen config.
+   *  False means the engaged sandbox cuts the daemon loopback (--unshare-net or
+   *  slirp); undefined preserves the legacy callers that have no network fact. */
+  loopbackShared?: boolean;
+}
+
 /**
  * The single wiring seam every CLI/engine spawn site must call to install the
  * trigger-user identity: it prepares the wrapper env (PATH shim, askpass,
@@ -2394,7 +2416,7 @@ export function prepareTurnGitConfigEnv(
   log: (message: string) => void,
   model: IdentityStorageModel,
   execution?: { appId: string; ipcPort?: number },
-  options?: { canonicalPaths?: boolean },
+  options?: TriggerUserCliEnvOptions,
 ): Array<[string, string]> {
   const pairs = prepareTriggerUserCliEnv(env, sessionDataDir, sessionId, policy, log, model, execution, options);
   applyTurnGitConfigEnv(env, pairs);
@@ -2465,13 +2487,14 @@ export function prepareTriggerUserCliEnv(
   policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
   model: IdentityStorageModel,
   execution?: { appId: string; ipcPort?: number },
-  /** `canonicalPaths`: the session runs in a fresh bwrap root that only mounts
-   *  CANONICAL paths. A symlinked home / data root (`/home/u` -> `/data00/home/u`)
-   *  has no alias there, so every path written into the session env or into a
-   *  generated script must be the realpath or it is `not found` inside. Left
-   *  off, nothing changes for unsandboxed sessions. */
-  options?: { canonicalPaths?: boolean },
+  options?: TriggerUserCliEnvOptions,
 ): Array<[string, string]> {
+  if (policy?.enabled && policy.gitCommitIdentity && options?.loopbackShared === false) {
+    throw new Error('triggerUserAuth.gitCommitIdentity 需要会话内可访问 daemon loopback；'
+      + '当前沙盒通过 --unshare-net 或 slirp 隔离了 loopback，无法核验当前回合触发人。'
+      + '请关闭 gitCommitIdentity，或调整沙盒网络后重启会话');
+  }
+  const gitCommitIdentity = policy?.enabled === true && policy.gitCommitIdentity === true;
   // Before anything else, including the early return below: a policy that is
   // off now may have been on when this session last spawned.
   if (sessionDataDir) {
@@ -2482,7 +2505,7 @@ export function prepareTriggerUserCliEnv(
       log(`[trigger-user-auth] WARN could not remove ungoverned wrappers: ${(e as Error).message}`);
     }
   }
-  if (sessionDataDir && !(policy?.enabled && policy.tools.length && policy.gitCommitIdentity)) {
+  if (sessionDataDir && !gitCommitIdentity) {
     const git = join(sessionIdentityBinDir(sessionDataDir, sessionId), 'git');
     try {
       const stat = lstatSync(git);
@@ -2496,7 +2519,11 @@ export function prepareTriggerUserCliEnv(
       }
     }
   }
-  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return [];
+  // The worker may legitimately filter every ordinary tool out (the dedicated
+  // Lark binding owns lark-cli). Git attribution is an independent opt-in and
+  // must still be installed; otherwise an explicit request silently falls back
+  // to the host's author/committer.
+  if (!policy?.enabled || (!policy.tools.length && !gitCommitIdentity) || !sessionDataDir) return [];
   const canonicalPaths = options?.canonicalPaths === true;
   sessionDataDir = sessionVisiblePath(sessionDataDir, canonicalPaths);
   childEnv.SESSION_DATA_DIR = sessionDataDir;
@@ -2506,7 +2533,7 @@ export function prepareTriggerUserCliEnv(
   let gitConfigPairs: Array<[string, string]> = [];
   let identityResolver: string[] | undefined;
   let gitResolver: string[] | undefined;
-  if (policy.gitCommitIdentity || (model === 'proven' && process.platform === 'linux' && execution)) {
+  if (gitCommitIdentity || (model === 'proven' && process.platform === 'linux' && execution)) {
     const moduleDir = dirname(fileURLToPath(import.meta.url));
     const sourceExecArgs = process.execArgv.map((arg, index, args) =>
       args[index - 1] === '--import' && arg === 'tsx' ? createRequire(import.meta.url).resolve('tsx') : arg);
@@ -2514,7 +2541,7 @@ export function prepareTriggerUserCliEnv(
       ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../cli-identity-runner.ts')] }
       : resolveEntrySpawn('cli-identity-runner', resolve(moduleDir, '..'));
     const launcher = [runner.command, ...runner.args].map(p => sessionVisiblePath(p, canonicalPaths));
-    if (policy.gitCommitIdentity) gitResolver = [...launcher, '--git-actor-email'];
+    if (gitCommitIdentity) gitResolver = [...launcher, '--git-actor-email'];
     if (model === 'proven' && process.platform === 'linux' && execution) {
       identityResolver = [...launcher, '--data-dir', sessionDataDir, '--session-id', sessionId,
         '--app-id', execution.appId, '--ipc-port', String(execution.ipcPort), '--tool'];
@@ -2577,7 +2604,7 @@ export function prepareTriggerUserCliEnv(
   // the failure mode observed in production, where the agent cheerfully
   // reported `identity: user` (the machine account) as "normal". Absence of a
   // wrapper is invisible by nature, so it has to be said out loud.
-  if (!installedAny) {
+  if (!installedAny && identityTools.length) {
     log('[trigger-user-auth] WARN no tool wrapper installed — this session is NOT running under '
       + 'trigger-user identity; calls will use whatever credentials the machine has');
   }

@@ -17,7 +17,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, existsSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import {
   prepareTriggerUserCliEnv,
   renderIdentityEnv,
@@ -135,6 +135,122 @@ describe('per-turn git commit identity', () => {
       ['-C', repo, '--replace-git-ref', 'refs/replace/x', 'commit', '--allow-empty', '-m', 'x'],
       { env, encoding: 'utf8' });
     expect(unknownGlobal.status).toBe(77);
+  });
+
+  it('keeps Git attribution enabled when worker filtering leaves no ordinary tools', () => {
+    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH };
+    prepareTriggerUserCliEnv(env, dir, SESSION, {
+      enabled: true, tools: ['bytedcli'], gitCommitIdentity: true,
+    }, () => {}, 'single');
+    const wrapper = join(env.BOTMUX_IDENTITY_BIN!, 'git');
+    expect(existsSync(wrapper)).toBe(true);
+
+    // This is the exact shape after bound-Lark worker filtering hands lark-cli
+    // to its dedicated binding. The Git opt-in must survive both cleanup and
+    // the installation early return, independently of ordinary tools.
+    const filtered = { enabled: true, tools: [], gitCommitIdentity: true };
+    prepareTriggerUserCliEnv(env, dir, SESSION, filtered, () => {}, 'single');
+    expect(existsSync(wrapper)).toBe(true);
+
+    // A failed re-install must not expose the cleanup half of the write: the
+    // previously working wrapper stays until the replacement can be rendered.
+    const path = env.PATH;
+    try {
+      env.PATH = join(dir, 'no-git-on-path');
+      expect(() => prepareTriggerUserCliEnv(env, dir, SESSION, filtered, () => {}, 'single'))
+        .toThrow(/requires git on PATH/);
+      expect(existsSync(wrapper)).toBe(true);
+    } finally {
+      env.PATH = path;
+    }
+
+    prepareTriggerUserCliEnv(env, dir, SESSION, { ...filtered, gitCommitIdentity: false }, () => {}, 'single');
+    expect(existsSync(wrapper)).toBe(false);
+
+    const freshEnv: NodeJS.ProcessEnv = { PATH: process.env.PATH };
+    prepareTriggerUserCliEnv(freshEnv, dir, SESSION, filtered, () => {}, 'single');
+    expect(existsSync(wrapper)).toBe(true);
+    expect(freshEnv.PATH?.split(delimiter)).toContain(freshEnv.BOTMUX_IDENTITY_BIN);
+  });
+
+  it('refuses BOTMUX_AS on managed writes without changing other Git commands', () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const repo = join(dir, 'speaker-repo');
+    const actor = join(dir, 'speaker-actor');
+    const wrapper = join(dir, 'git');
+    writeFileSync(wrapper, renderGitCommitWrapper(realGit, ['cat', actor]), { mode: 0o755 });
+    writeFileSync(actor, 'actor@example.org');
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1' };
+    const git = (...args: string[]) => execFileSync(realGit, ['-C', repo, ...args], { env, encoding: 'utf8' }).trim();
+    execFileSync(realGit, ['init', '-q', repo], { env });
+    git('config', 'user.name', 'Host');
+    git('config', 'user.email', 'host@example.org');
+    git('commit', '--allow-empty', '-m', 'base');
+    const head = git('rev-parse', 'HEAD');
+
+    const asEnv = { ...env, BOTMUX_AS: 'ou_other' };
+    const denied = spawnSync(wrapper, ['-C', repo, 'commit', '--allow-empty', '-m', 'wrong-speaker'], {
+      env: asEnv, encoding: 'utf8',
+    });
+    expect(denied.status).toBe(77);
+    expect(git('rev-parse', 'HEAD')).toBe(head);
+
+    // The guard belongs only to commit-family writes. In particular it must
+    // not disable ordinary reads or the separate speaker-aware push flow.
+    expect(spawnSync(wrapper, ['-C', repo, 'status', '--porcelain'], { env: asEnv }).status).toBe(0);
+    expect(spawnSync(wrapper, ['-C', repo, 'commit', '--allow-empty', '-m', 'empty-as'], {
+      env: { ...env, BOTMUX_AS: '' },
+    }).status).toBe(0);
+    expect(git('log', '-1', '--format=%ae | %ce')).toBe('actor@example.org | actor@example.org');
+  });
+
+  it('keeps governing the subcommand after --exec-path=<path>', () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const execPath = execFileSync(realGit, ['--exec-path'], { encoding: 'utf8' }).trim();
+    const repo = join(dir, 'exec-path-repo');
+    const actor = join(dir, 'exec-path-actor');
+    const wrapper = join(dir, 'git');
+    writeFileSync(wrapper, renderGitCommitWrapper(realGit, ['cat', actor]), { mode: 0o755 });
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1' };
+    const git = (...args: string[]) => execFileSync(realGit, ['-C', repo, ...args], { env, encoding: 'utf8' }).trim();
+    execFileSync(realGit, ['init', '-q', repo], { env });
+    git('config', 'user.name', 'Host');
+    git('config', 'user.email', 'host@example.org');
+    git('commit', '--allow-empty', '-m', 'base');
+    const head = git('rev-parse', 'HEAD');
+    const args = [`--exec-path=${execPath}`, '-C', repo, 'commit', '--allow-empty', '-m', 'via-exec-path'];
+
+    // Unlike bare --exec-path, the equals form selects Git's core directory and
+    // then RUNS the subcommand. It must never become an actor/BOTMUX_AS bypass.
+    const denied = spawnSync(wrapper, args, { env, encoding: 'utf8' });
+    expect(denied.status).toBe(77);
+    expect(git('rev-parse', 'HEAD')).toBe(head);
+
+    writeFileSync(actor, 'actor@example.org');
+    const allowed = spawnSync(wrapper, args, { env, encoding: 'utf8' });
+    expect(allowed.status).toBe(0);
+    expect(git('log', '-1', '--format=%ae | %ce')).toBe('actor@example.org | actor@example.org');
+  });
+
+  it('passes through terminal global information options without an actor', () => {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const wrapper = join(dir, 'git');
+    writeFileSync(wrapper, renderGitCommitWrapper(realGit, ['cat', join(dir, 'missing-actor')]), { mode: 0o755 });
+    const env = {
+      PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1',
+      GIT_PAGER: 'cat', PAGER: 'cat', MANPAGER: 'cat',
+    };
+    for (const args of [
+      ['--help', 'commit'], ['-h', 'commit'], ['--version', 'commit'],
+      ['--exec-path', 'commit'], ['--html-path', 'commit'],
+      ['--man-path', 'commit'], ['--info-path', 'commit'], ['--list-cmds=main', 'commit'],
+    ]) {
+      const expected = spawnSync(realGit, args, { env, encoding: 'utf8' });
+      expect(expected.status, args.join(' ')).toBe(0);
+      const actual = spawnSync(wrapper, args, { env, encoding: 'utf8' });
+      expect(actual.status, args.join(' ')).toBe(0);
+      expect(actual.stdout).toBe(expected.stdout);
+    }
   });
 
   it('installs the wrapper only for opted-in sessions and removes it on respawn', () => {
