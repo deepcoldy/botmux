@@ -409,10 +409,11 @@ In `codex-app` sessions (and `codex` sessions with app-server RPC enabled), when
 - Waiting is cancelled when the turn ends, the process exits or the session closes; late answers are not delivered.
 - After a daemon restart these requests are not retried or restored.
 
-**Async questions (`request_user_input_async`, `codex-app` only):**
+**Async questions (`request_user_input_async`, `codex-app` and Codex TUI):**
 
 - The model can keep working after asking; the card can still be answered after the original turn ends normally. Answers keep the original call ID and question indexes.
 - With `codexAppCleanInput` on, the original turn still running and steered input supported, the asker's answer joins the original turn directly; otherwise a new turn starts in the same thread. Late answers never join a different task.
+- Codex TUI discovers async questions from its rollout and delivers the native `<send_user_message_question_reply>` envelope as a new turn; it does not use the `codexAppCleanInput` steering path.
 - A card showing "Ended" means the answers were collected, not that the model has read them.
 - Reply permissions: for human-started turns, the single answerer is locked when the card is registered; scheduled / autonomous turns let members with talk permission (canTalk) answer, while the schedule creator still needs operate permission (canOperate), and silent schedules don't show a card; for doc-comment turns only the original commenter can answer, in a private chat.
 - With several pending cards, a text answer must **quote the target card**; unquoted messages are treated as normal input and you get a hint to disambiguate.

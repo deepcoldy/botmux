@@ -1,3 +1,4 @@
+import { resolveBotmuxAncestorContext, resolveCurrentActor } from './cli/current-actor.js';
 import { parseArgs } from 'node:util';
 import { CurrentExecutionIdentityError, resolveCurrentExecutionIdentity } from './cli/current-execution.js';
 import { IDENTITY_ROUTE_TOOLS } from './services/trigger-user-auth.js';
@@ -13,6 +14,12 @@ let requestedTool = 'tool';
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args[0] === '__cli-identity-runner') args.shift();
+  if (args.length === 1 && args[0] === '--git-actor-email') {
+    const { ipcPort, sessionId } = resolveBotmuxAncestorContext();
+    const { actor } = await resolveCurrentActor({ ipcPort, sessionId });
+    process.stdout.write(actor.email);
+    return;
+  }
   const { values } = parseArgs({ args, options: {
     'data-dir': { type: 'string' }, 'session-id': { type: 'string' },
     'app-id': { type: 'string' }, 'ipc-port': { type: 'string' }, tool: { type: 'string' },

@@ -33,7 +33,7 @@ import {
   parseBotDefaultsTab,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults.js';
-import { BotAgentSection, BotDefaultsTabs, readBotDefaultsDeepLink, resolveBotDefaultsTarget } from '../src/dashboard/web/bot-defaults-page.js';
+import { BotAgentSection, BotDefaultsTabs, OwnerGroupFollowControls, readBotDefaultsDeepLink, resolveBotDefaultsTarget } from '../src/dashboard/web/bot-defaults-page.js';
 import { dashboardRoutes, findDashboardRoute } from '../src/dashboard/web/dashboard-routes.js';
 import { INSIGHT_TABS } from '../src/dashboard/web/insight-tabs.js';
 import { NAV_ITEMS, NAV_SUBPAGES, PALETTE_UNINDEXED_ROUTES, type NavItem } from '../src/dashboard/web/nav-items.js';
@@ -259,6 +259,21 @@ function renderedBotConfigLabelKeys(sources: string): Set<string> {
   return keys;
 }
 
+function renderedOwnerGroupFollowLabels(): Set<string> {
+  let renderer!: TestRenderer.ReactTestRenderer;
+  act(() => {
+    renderer = TestRenderer.create(createElement(OwnerGroupFollowControls, {
+      bot: { larkAppId: 'cli_palette', ownerGroupFollow: { includeRules: [{ field: 'name', op: 'contains', pattern: 'sample' }] } },
+      patchBot: () => {},
+    }));
+  });
+  const labels = new Set(renderer.root.findAll(node => typeof node.type === 'string').flatMap(node => [
+    ...node.children.filter(child => typeof child === 'string'), node.props['aria-label'], node.props.placeholder,
+  ].filter((label): label is string => typeof label === 'string')));
+  act(() => renderer.unmount());
+  return labels;
+}
+
 // 反向扫描会读到、但不是配置项的标签。逐条写明理由；不在这里的键一律要登记进 BOT_DEFAULTS_SECTIONS。
 const NOT_CONFIG_LABELS: ReadonlyMap<string, string> = new Map([
   ['botDefaults.stewardModeAppend', '「管家指引」单选组的选项；组本身只有 aria-label，搜索落到已登记的 botDefaults.stewardGuide 那一行'],
@@ -375,13 +390,17 @@ describe('⌘K index coverage', () => {
   // 守的是「登记的配置项键拼错 / 已删 / 不是看得见的标签」——那样落地时按文字找不到那一行。
   it('every indexed Bot config title and option exists in both locales and is rendered as a label', () => {
     const rendered = renderedBotConfigLabelKeys(readBotConfigSources());
+    const followLabels = renderedOwnerGroupFollowLabels();
     for (const section of BOT_DEFAULTS_SECTIONS) {
       for (const key of [section.titleKey, ...(section.fieldKeys ?? [])]) {
         expect(zh(key), key).not.toBe(key);
         expect(en(key), key).not.toBe(key);
       }
       // 落地时按文字找这一行，所以它得是看得见的标签（写法见 renderedBotConfigLabelKeys）。
-      for (const key of section.fieldKeys ?? []) expect(rendered.has(key), key).toBe(true);
+      for (const key of section.fieldKeys ?? []) {
+        const renderedInFollowEditor = key.startsWith('botDefaults.ownerGroupFollow') && followLabels.has(t(key));
+        expect(rendered.has(key) || renderedInFollowEditor, key).toBe(true);
+      }
     }
   });
 

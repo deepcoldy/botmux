@@ -300,6 +300,20 @@ describe('structured background task records', () => {
     expect(backgroundTaskLaunches({ ...structuredLaunch('u', 't6', { backgroundTaskId: 'b2' }), isSidechain: true } as TranscriptEvent)).toEqual([]);
   });
 
+  it('reads a Workflow launch as background work that its completion notification ends', () => {
+    const launch = structuredLaunch('u1', 't1', {
+      status: 'async_launched', taskId: 'w1', taskType: 'local_workflow', runId: 'wf_1',
+    });
+    expect(backgroundTaskLaunches(launch)).toEqual([{ taskId: 'w1', kind: 'agent' }]);
+    const t = new BackgroundTaskTracker();
+    t.observe(launch);
+    t.observe(assistant('a1', 'started', 'end_turn'));
+    expect(t.pending()).toBe(1);
+    expect(t.backgroundWait()).toBe(1);
+    t.observe(queueOperation('enqueue', notificationText(['w1'], 'completed')));
+    expect(t.pending()).toBe(0);
+  });
+
   it('settles on a terminal notification in any shape, every listed id, and a TaskStop result', () => {
     // queue-operation enqueue — the only record of a stop made in the TUI's task dialog.
     expect(backgroundTaskSettledIds(queueOperation('enqueue', notificationText(['b1'], 'killed')))).toEqual(['b1']);
