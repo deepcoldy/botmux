@@ -318,6 +318,12 @@ async function runS5Critical(opts: {
         contentHash: facts.contentHash,
       });
       if (!evalResult.ready) {
+        // F2：NO_MARKER/HOST_NOT_ALLOWED/MISSING_URL 是终态失败 → awaiting-input（人工推进）；
+        // NOT_DELIVERED 是真正等投递 → KICKOFF_PENDING。
+        if (evalResult.reason === 'NO_MARKER' || evalResult.reason === 'HOST_NOT_ALLOWED' || evalResult.reason === 'MISSING_URL') {
+          await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: `ARTIFACT_${evalResult.reason}`, since }; e.updatedAt = opts.deps.now(); return true; } });
+          return { done: false, awaitingInput: `artifact not ready: ${evalResult.reason}` };
+        }
         if (!curEntry.awaiting) {
           await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.awaiting = { reason: 'KICKOFF_PENDING', since }; e.updatedAt = opts.deps.now(); return true; } });
         }
@@ -346,12 +352,14 @@ async function runS5Critical(opts: {
     if (!started.ok || !started.sessionId || !started.turnId || !started.acceptedAt) {
       return { done: false, awaitingInput: 'kickoff start not ready (missing session/turn/acceptedAt)' };
     }
-    // N3/R5：三元组 + satisfiedBy + done + kickoffPending 投影在同次 entry 原子写提交。
+    // N3/R5/F1：三元组 + satisfiedBy + done + kickoffPending 投影在同次 entry 原子写提交；
+    // 成功提交后清理旧 pending 计时，下一跳建立新 since。
     await patchCollabInitEntry({
       dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId,
       mutate: (e) => {
         e.operations[opKey] = { kind: 'kickoff', status: 'done', uuid: kickoffId, firstAttemptAt: curOp?.firstAttemptAt ?? now, payloadHash, receipt: { sessionId: started.sessionId, turnId: started.turnId, acceptedAt: started.acceptedAt, ...(satisfiedBy ? { satisfiedBy } : {}) } };
         e.kickoffPending = { ...(e.kickoffPending ?? {}), [appId]: { appId, ...(satisfiedBy ? { satisfiedBy } : {}) } };
+        delete e.awaiting; // 清理旧 pending 计时，避免下一跳被错误超窗
         e.updatedAt = now;
         return true;
       },

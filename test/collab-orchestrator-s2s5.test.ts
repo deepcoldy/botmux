@@ -194,6 +194,41 @@ describe('S5 kickoff 依赖启动', () => {
     expect(r.done).toBe(false);
     expect(starts).toEqual([]); // 取消后不 start
   });
+
+  it('F2：NO_MARKER（成功但无 marker）→ awaiting-input（人工推进）', async () => {
+    const initId = await seedEntry();
+    const cfg = config([
+      { appId: CREATOR, trigger: 'immediate' },
+      { appId: PEER, trigger: 'afterAgentTurn', afterAppId: CREATOR, artifact: { type: 'marked-url', hosts: ['example.com'] } },
+    ]);
+    const starts: string[] = [];
+    const d = deps({
+      kickoffStart: async (appId) => { starts.push(appId); return { ok: true, sessionId: 's', turnId: 't', acceptedAt: '2026-01-01T00:00:00Z' }; },
+      artifactFacts: async () => ({ terminalStatus: 'succeeded', delivered: true, messageId: 'om', content: 'no marker here', sessionId: 's', turnId: 't', contentHash: 'h' }),
+    });
+    const r = await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    expect(r.done).toBe(false);
+    expect(r.awaitingInput).toContain('NO_MARKER');
+    const entry = readCollabInitEntry(dataDir, CREATOR, initId)!;
+    expect(entry.state).toBe('awaiting-input');
+    // 常规重入仍被 guard 阻止（不自动继续）
+    const r2 = await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    expect(r2.done).toBe(false);
+    expect(starts).not.toContain(PEER);
+  });
+
+  it('N2 回归：terminal failed 写 awaiting-input（不保持 running）', async () => {
+    const initId = await seedEntry();
+    const cfg = config([
+      { appId: CREATOR, trigger: 'immediate' },
+      { appId: PEER, trigger: 'afterAgentTurn', afterAppId: CREATOR, artifact: { type: 'marked-url', hosts: ['example.com'] } },
+    ]);
+    const d = deps({ artifactFacts: async () => ({ terminalStatus: 'failed', delivered: false, messageId: '', content: '', sessionId: 's', turnId: 't', contentHash: 'h' }) });
+    await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    const entry = readCollabInitEntry(dataDir, CREATOR, initId)!;
+    expect(entry.state).toBe('awaiting-input');
+    expect(entry.awaiting?.reason).toBe('ARTIFACT_FAILED');
+  });
 });
 
 describe('reverifyCollabRoleAndConfig', () => {
