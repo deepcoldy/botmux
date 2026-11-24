@@ -148,7 +148,15 @@ function cancelLimitedFailedTurnClearRetry(ds: DaemonSession): void {
 
 /** The usage-limit clear and failed-turn clear are separate SQLite writes. Own
  * the second write independently so recovery does not depend on another frame. */
-function retryLimitedFailedTurnClear(ds: DaemonSession, record: FailedTurnRecord): void {
+function retryLimitedFailedTurnClear(
+  ds: DaemonSession,
+  record: FailedTurnRecord,
+  fence: {
+    workerGeneration?: number;
+    sessionWorkerGeneration?: number;
+    inputTurnId?: string;
+  },
+): void {
   let delayMs = 500;
   const schedule = (): void => {
     const timer = setTimeout(() => {
@@ -158,6 +166,10 @@ function retryLimitedFailedTurnClear(ds: DaemonSession, record: FailedTurnRecord
       // Compare stable record identity, not object identity: a session reload
       // may legitimately clone the same provisional observation.
       const current = ds.session.lastFailedTurn;
+      if (findActiveBySessionId(ds.session.sessionId) !== ds || ds.session.status !== 'active'
+        || ds.workerGeneration !== fence.workerGeneration
+        || ds.session.workerGeneration !== fence.sessionWorkerGeneration
+        || ds.lastCliInputTurnId !== fence.inputTurnId) return;
       if (!current?.limitedSnapshot || current.recovery
         || current.turnId !== record.turnId || current.failedAt !== record.failedAt) return;
       try {
@@ -187,7 +199,11 @@ export function clearLimitedFailedTurn(ds: DaemonSession, turnId?: string): void
     store.updateSession(ds.session);
   } catch (error) {
     ds.session.lastFailedTurn = record;
-    retryLimitedFailedTurnClear(ds, record);
+    retryLimitedFailedTurnClear(ds, record, {
+      workerGeneration: ds.workerGeneration,
+      sessionWorkerGeneration: ds.session.workerGeneration,
+      inputTurnId: ds.lastCliInputTurnId,
+    });
     throw error;
   }
 }

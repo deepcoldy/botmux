@@ -21770,11 +21770,16 @@ function setupWorkerHandlers(
     // direct Web Terminal prompt), rotate + restart cleanly and ask the
     // user to resend rather than replaying an older completed Lark turn.
     const currentTranscriptProvesDirectFailure = (cliInput: string): boolean => {
-      const pid = ds.worker?.pid;
-      const live = pid ? inspectAntigravityConversationIdByPid(pid) : undefined;
-      if (live?.kind === 'ambiguous') return false;
-      const nativeSessionId = live?.kind === 'unique' ? live.conversationId : ds.session.cliSessionId;
-      const path = resolveAntigravityTranscriptPath(nativeSessionId) ?? undefined;
+      // ds.worker.pid belongs to the worker wrapper, not agy. Only the trusted
+      // worker's attested CLI PID can identify the live conversation; absent or
+      // ambiguous presence must never fall back to a stored transcript.
+      const cliPid = ds.localProcessAttestation?.cliPid;
+      if (!cliPid) return false;
+      const live = inspectAntigravityConversationIdByPid(cliPid);
+      if (live.kind !== 'unique') return false;
+      const storedId = ds.session.cliSessionId;
+      if (storedId && storedId.toLowerCase() !== live.conversationId.toLowerCase()) return false;
+      const path = resolveAntigravityTranscriptPath(live.conversationId) ?? undefined;
       // Frame-time proof is only a latch. Re-read the exact current transcript
       // at the settlement edge so late assistant/tool progress revokes replay.
       return antigravityTurnFailedWithoutOutput(path, cliInput);
