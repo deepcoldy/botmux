@@ -154,4 +154,67 @@ describe('reverifyCollabRoleAndConfig', () => {
     expect(r.ok).toBe(false);
     expect(r.reason).toBe('config_version_changed');
   });
+
+  it('F1：awaiting-input / cancelled state → 拒绝', async () => {
+    const initId = await seedEntry();
+    const { patchCollabInitEntry } = await import('../src/services/collab-init-store.js');
+    await patchCollabInitEntry({ dataDir, creatorAppId: CREATOR, initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'ROLE_CONFLICT', since: now() }; return true; } });
+    const r = reverifyCollabRoleAndConfig({ dataDir, larkAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: config(), roleVerify: roleDeps() });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('awaiting_input');
+  });
+});
+
+describe('F3：S5 幂等 + mutex', () => {
+  it('重入 query 不重复 start（done 短路）', async () => {
+    const initId = await seedEntry();
+    const starts: string[] = [];
+    const d = deps({ kickoffStart: async (appId) => { starts.push(appId); return { ok: true, sessionId: 's', turnId: 't', acceptedAt: '2026-01-01T00:00:00Z' }; } });
+    const cfg = config([{ appId: CREATOR, trigger: 'immediate' }]);
+    await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    expect(starts).toEqual([CREATOR]); // 不重复 start
+    const entry = readCollabInitEntry(dataDir, CREATOR, initId)!;
+    expect(entry.operations[`kickoff:${CREATOR}`].status).toBe('done');
+    expect(entry.steps.kickoff.status).toBe('done');
+  });
+
+  it('并发两执行者 → start 只一次（mutex 串行）', async () => {
+    const initId = await seedEntry();
+    const starts: string[] = [];
+    // slow kickoffStart 制造并发窗口
+    const slowStart = async (appId: string) => { await new Promise(r => setTimeout(r, 10)); starts.push(appId); return { ok: true, sessionId: 's', turnId: 't', acceptedAt: '2026-01-01T00:00:00Z' }; };
+    const d = deps({ kickoffStart: slowStart });
+    const cfg = config([{ appId: CREATOR, trigger: 'immediate' }]);
+    const [r1, r2] = await Promise.all([
+      runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d }),
+      runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d }),
+    ]);
+    expect(r1.done).toBe(true);
+    expect(r2.done).toBe(true);
+    expect(starts).toEqual([CREATOR]); // start 只一次
+  });
+});
+
+describe('F4：真拓扑序', () => {
+  it('A→B→C 配置数组乱序（A immediate, C after B, B after A）仍按 A,B,C 启动', async () => {
+    const initId = await seedEntry();
+    const starts: string[] = [];
+    const d = deps({ kickoffStart: async (appId) => { starts.push(appId); return { ok: true, sessionId: 's', turnId: 't', acceptedAt: '2026-01-01T00:00:00Z' }; } });
+    // creator=CREATOR 是 A（immediate）；B=cli_b after A；C=cli_c after B。kickoff 数组故意乱序 [A, C, B]。
+    const cfg: SessionGroupCollaborationConfig = {
+      enabled: true,
+      agents: [{ appId: CREATOR, roleMode: 'no-chat-role' }, { appId: 'cli_b', roleMode: 'no-chat-role' }, { appId: 'cli_c', roleMode: 'no-chat-role' }],
+      kickoff: [
+        { appId: CREATOR, trigger: 'immediate' },
+        { appId: 'cli_c', trigger: 'afterAgentTurn', afterAppId: 'cli_b', artifact: { type: 'marked-url', hosts: ['example.com'] } },
+        { appId: 'cli_b', trigger: 'afterAgentTurn', afterAppId: CREATOR, artifact: { type: 'marked-url', hosts: ['example.com'] } },
+      ],
+    };
+    const r = await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    expect(r.done).toBe(true);
+    // 拓扑序：CREATOR(A) → cli_b(B) → cli_c(C)，即便数组是 [A,C,B]
+    expect(starts.indexOf(CREATOR)).toBeLessThan(starts.indexOf('cli_b'));
+    expect(starts.indexOf('cli_b')).toBeLessThan(starts.indexOf('cli_c'));
+  });
 });
