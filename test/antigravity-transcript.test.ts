@@ -1072,6 +1072,23 @@ describe('hasAntigravityTranscriptPendingTasks & multi-task/daemon tracking', ()
     expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
   });
 
+  it('fails closed when the transcript contains no explicit USER_INPUT boundary at all', () => {
+    // A partial/malformed transcript can hold a live RUNNING with no user
+    // boundary anywhere: neither the capped tail scan nor an exhaustive scan
+    // can establish the current turn, so the result must stay pending rather
+    // than reading the partial window as proof the turn ended.
+    const orphanId = `${convId}/task-orphan`;
+    writeFileSync(path, [
+      line(taskRunning(0, orphanId, 'orphan-command')),
+      line(plannerStep({ step: 1, content: '等待中。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toContain(orphanId);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
   it('finds a completed long-turn boundary beyond the capped tail window', () => {
     writeFileSync(path, [
       line(userRecord('超过尾部窗口但已完成的回合')),
