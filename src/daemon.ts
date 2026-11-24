@@ -734,6 +734,7 @@ import {
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
 import { backfillOwnerUnionId, claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { offerAuthorizationAtCreation, clearRestoredLapses, privateNoticeSender, unattendedTask } from './core/capability-authorization.js';
+import { stopAllMeegoPollers } from './services/meego-auth.js';
 import { allowsPersonalIdentityForTurn, isPersonActorTurnId, isRunAsTurnId, isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
 import { resolveRunAs } from './core/run-as.js';
 import { capabilityOn, delegatesOnMention, dispatchOnlyToolsForTurn, TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
@@ -38614,6 +38615,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
+    stopAllMeegoPollers();
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     // Keep the occupancy lease for the whole teardown: workers still settle
     // rows into this cache and persist them below. Extend it once here (the
@@ -38886,6 +38888,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
+    stopAllMeegoPollers();
     ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
     oncallHandoffStopped = true;

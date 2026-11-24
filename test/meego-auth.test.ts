@@ -15,12 +15,14 @@ const ALICE = 'ou_alice';
 const BOB = 'ou_bob';
 const COMPLETE_TOKEN = 'stub-complete-token-secret';
 
+const realSetTimeout = globalThis.setTimeout;
 let dir: string;
 const saved: Record<string, string | undefined> = {};
+const loadedModules: Array<{ stopAllMeegoPollers: () => void }> = [];
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-meego-auth-'));
-  for (const key of ['HOME', 'PATH', 'STUB_DIR', 'STUB_FAIL', 'BYTEDCLI_MEEGO_TENANT']) saved[key] = process.env[key];
+  for (const key of ['HOME', 'PATH', 'STUB_DIR', 'STUB_FAIL', 'STUB_COMPLETE_FAIL', 'STUB_EXPIRED', 'BYTEDCLI_MEEGO_TENANT']) saved[key] = process.env[key];
   process.env.HOME = join(dir, 'home');
   mkdirSync(process.env.HOME);
   const bin = join(dir, 'bin');
@@ -46,10 +48,13 @@ beforeEach(() => {
     '    mkdir -p "$store" "$TMPDIR/bytedcli/meego-login-$n"; : > "$TMPDIR/bytedcli/meego-login-$n/qr.png"',
     `    printf '{"status":"success","data":{"verification_uri_complete":"https://meego.example/device?code=%s-%s","complete_token":"${COMPLETE_TOKEN}","qr_image_path":"%s"}}\\n' "$who" "$n" "$TMPDIR/bytedcli/meego-login-$n/qr.png" ;;`,
     '  "login --complete")',
+    '    [ -z "$STUB_COMPLETE_FAIL" ] || { echo \'{"status":"error","error":{"code":"NETWORK"}}\'; exit 1; }',
+    '    [ -z "$STUB_EXPIRED" ] || { echo \'{"status":"success","data":{"login_status":"expired"}}\'; exit 0; }',
     `    [ "$3" = ${COMPLETE_TOKEN} ] || { echo '{"status":"error","error":{"code":"MEEGO_LOGIN_CHALLENGE_INVALID"}}'; exit 1; }`,
     '    if [ -f "$STUB_DIR/approved-$who" ]; then',
     '      mkdir -p "$store" && cp "$STUB_DIR/approved-$who" "$store/credentials-bytedcli.enc"',
     '      echo \'{"status":"success","data":{"login_status":"success"}}\'',
+    '      : > "$STUB_DIR/complete-finished"',
     '    else echo \'{"status":"error","error":{"code":"MEEGO_LOGIN_TIMEOUT"}}\'; exit 1; fi ;;',
     'esac',
     '',
@@ -58,8 +63,12 @@ beforeEach(() => {
   process.env.PATH = `${bin}:${saved.PATH}`;
   process.env.STUB_DIR = dir;
   delete process.env.STUB_FAIL;
+  delete process.env.STUB_COMPLETE_FAIL;
+  delete process.env.STUB_EXPIRED;
 });
 afterEach(() => {
+  for (const mod of loadedModules.splice(0)) mod.stopAllMeegoPollers();
+  vi.useRealTimers();
   for (const [key, value] of Object.entries(saved)) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   }
@@ -72,12 +81,13 @@ async function load() {
   const auth = await import('../src/services/meego-auth.js');
   const home = await import('../src/services/bytedcli-home.js');
   const epoch = await import('../src/services/cli-auth-epoch.js');
+  loadedModules.push(auth);
   return { ...auth, ...home, ...epoch };
 }
 
 const approve = (openId: string, credential: string) => writeFileSync(join(dir, `approved-${openId}`), credential);
 const begins = () => existsSync(join(dir, 'begins')) ? Number(readFileSync(join(dir, 'begins'), 'utf8')) : 0;
-const cliCalls = () => readFileSync(join(dir, 'cli.log'), 'utf8').trim().split('\n').map(l => {
+const cliCalls = () => readFileSync(join(dir, 'cli.log'), 'utf8').replace(/\n+$/, '').split('\n').filter(Boolean).map(l => {
   const [home, args, tenant] = l.split('\t');
   return { home, args, tenant };
 });
@@ -241,5 +251,274 @@ describe('tenant', () => {
   it('refuses a tenant bytedcli does not know', async () => {
     const m = await load();
     await expect(m.requestMeegoLogin(ALICE, 'other' as never)).rejects.toThrow(/tenant/);
+  });
+});
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (!predicate()) {
+    if (performance.now() > deadline) throw new Error('waitUntil timed out');
+    await new Promise<void>(resolve => realSetTimeout(resolve, 15));
+  }
+}
+
+async function settleRealIo(ms = 60): Promise<void> {
+  await new Promise<void>(resolve => realSetTimeout(resolve, ms));
+}
+
+const completeCalls = (tenant?: string) => existsSync(join(dir, 'cli.log'))
+  ? cliCalls().filter(c => c.args.startsWith('-j meego login --complete') && (tenant === undefined || c.tenant === tenant))
+  : [];
+
+describe('background completion poller', () => {
+  it('completes an approved challenge in the background without a second requestMeegoLogin call', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    const completedUsers: string[] = [];
+    const unsubscribe = m.onMeegoBackgroundLoginCompleted(openId => completedUsers.push(openId));
+    try {
+      expect((await m.requestMeegoLogin(ALICE)).state).toBe('link');
+      const home = m.meegoHomeFor(ALICE);
+      expect(existsSync(join(home, '.botmux-meego-challenge'))).toBe(true);
+
+      // First two background polls see MEEGO_LOGIN_TIMEOUT (pending).
+      vi.advanceTimersByTime(3_000);
+      await waitUntil(() => completeCalls('').length === 1);
+      await settleRealIo();
+      vi.advanceTimersByTime(3_000);
+      await waitUntil(() => completeCalls('').length === 2);
+      await settleRealIo();
+      expect(existsSync(join(home, '.botmux-meego-challenge'))).toBe(true);
+      expect(completedUsers).toEqual([]);
+
+      // User approves in browser; next poll persists credentials, clears the challenge, and notifies listeners.
+      approve(ALICE, 'alice-bg-login');
+      vi.advanceTimersByTime(3_000);
+      await waitUntil(() => completedUsers.length === 1
+        && existsSync(join(home, '.meegle', 'credentials-bytedcli.enc'))
+        && !existsSync(join(home, '.botmux-meego-challenge')));
+      await settleRealIo();
+      expect(completedUsers).toEqual([ALICE]);
+      expect(readFileSync(join(home, '.meegle', 'credentials-bytedcli.enc'), 'utf8')).toBe('alice-bg-login');
+
+      // Poller has stopped: advancing further fires zero additional --complete calls.
+      const callsAfterComplete = completeCalls('').length;
+      vi.advanceTimersByTime(60_000);
+      await settleRealIo();
+      expect(completeCalls('').length).toBe(callsAfterComplete);
+
+      // Even after the original 25m challenge TTL has elapsed, the login is ready with no second --begin.
+      vi.setSystemTime(Date.now() + 45 * 60_000);
+      expect(await m.requestMeegoLogin(ALICE)).toEqual({ state: 'ready' });
+      expect(begins()).toBe(1);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('deduplicates pollers for repeated requests sharing the same challenge', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    const first = await m.requestMeegoLogin(ALICE);
+    expect(await m.requestMeegoLogin(ALICE)).toEqual(first);
+    // Second requestMeegoLogin did one direct --complete probe.
+    const baseline = completeCalls('').length;
+    expect(baseline).toBe(1);
+
+    // One timer tick triggers exactly one background poll, not two.
+    vi.advanceTimersByTime(3_000);
+    await waitUntil(() => completeCalls('').length === baseline + 1);
+    await settleRealIo();
+    expect(completeCalls('').length).toBe(baseline + 1);
+  });
+
+  it('removes the challenge and stops polling when the provider reports it expired', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    await m.requestMeegoLogin(ALICE);
+    const challenge = join(m.meegoHomeFor(ALICE), '.botmux-meego-challenge');
+    expect(existsSync(challenge)).toBe(true);
+
+    process.env.STUB_EXPIRED = '1';
+    vi.advanceTimersByTime(3_000);
+    await waitUntil(() => !existsSync(challenge));
+    await settleRealIo();
+    const afterExpired = completeCalls('').length;
+    vi.advanceTimersByTime(60_000);
+    await settleRealIo();
+    expect(completeCalls('').length).toBe(afterExpired);
+  });
+
+  it('backs off polling cadence across 2m / 5m windows and stops before the 25m TTL boundary', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const t0 = new Date('2026-11-24T01:00:00Z').getTime();
+    vi.setSystemTime(t0);
+    const m = await load();
+
+    await m.requestMeegoLogin(ALICE);
+
+    // Move past 2m and fire the pending initial timer so scheduleNext computes the 6s cadence.
+    vi.setSystemTime(t0 + 2 * 60_000);
+    vi.advanceTimersByTime(3_000);
+    await waitUntil(() => completeCalls('').length === 1);
+    await settleRealIo();
+
+    // Inside 2m..5m window: 3s is too early, 6s triggers poll #2.
+    vi.advanceTimersByTime(3_000);
+    await settleRealIo();
+    expect(completeCalls('').length).toBe(1);
+    vi.advanceTimersByTime(3_000);
+    await waitUntil(() => completeCalls('').length === 2);
+    await settleRealIo();
+
+    // Move past 5m and trigger the armed 6s timer so scheduleNext switches to 15s cadence.
+    vi.setSystemTime(t0 + 5 * 60_000);
+    vi.advanceTimersByTime(6_000);
+    await waitUntil(() => completeCalls('').length === 3);
+    await settleRealIo();
+
+    // Inside >=5m window: 6s is too early, +9s (15s total) triggers poll #4.
+    vi.advanceTimersByTime(6_000);
+    await settleRealIo();
+    expect(completeCalls('').length).toBe(3);
+    vi.advanceTimersByTime(9_000);
+    await waitUntil(() => completeCalls('').length === 4);
+    await settleRealIo();
+
+    // At 24m50s (remaining = 10s < 15s next delay), firing the armed timer completes poll #5
+    // and scheduleNext stops cleanly without arming a doomed post-TTL timer.
+    vi.setSystemTime(t0 + 24 * 60_000 + 35_000);
+    vi.advanceTimersByTime(15_000);
+    await waitUntil(() => completeCalls('').length === 5);
+    await settleRealIo();
+
+    vi.advanceTimersByTime(60_000);
+    await settleRealIo();
+    expect(completeCalls('').length).toBe(5);
+  });
+
+  it('cancels polling on cross-daemon epoch revocation even while the old challenge file still exists on disk', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    await m.requestMeegoLogin(ALICE);
+    const oldHome = m.meegoHomeFor(ALICE);
+    // Bump durable epoch WITHOUT deleting oldHome yet (mirrors the window while remote logout runs).
+    m.bumpCliAuthEpoch(ALICE);
+    expect(existsSync(join(oldHome, '.botmux-meego-challenge'))).toBe(true);
+
+    vi.advanceTimersByTime(3_000);
+    await settleRealIo();
+    expect(completeCalls('').length).toBe(0);
+
+    // Also verify deleting oldHome afterwards never gets recreated on further timer ticks.
+    rmSync(oldHome, { recursive: true, force: true });
+    vi.advanceTimersByTime(60_000);
+    await settleRealIo();
+    expect(existsSync(oldHome)).toBe(false);
+  });
+
+  it('cleans up the revoked HOME if revocation happens while a background poll is in flight', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    await m.requestMeegoLogin(ALICE);
+    const revokedHome = m.meegoHomeFor(ALICE);
+    approve(ALICE, 'alice-race-login');
+    writeFileSync(join(dir, 'hold'), '');
+
+    // Trigger the background poll and wait until the stub CLI is blocked inside --complete.
+    vi.advanceTimersByTime(3_000);
+    await waitUntil(() => existsSync(join(dir, 'held')));
+
+    // Revoke while the child process is mid-flight, then release it.
+    m.bumpCliAuthEpoch(ALICE);
+    m.clearMeegoAuth(ALICE);
+    writeFileSync(join(dir, 'go'), '');
+
+    // Wait until the stub CLI actually wrote credentials into revokedHome and exited,
+    // THEN verify the post-completeOnce epoch guard deleted the recreated directory.
+    await waitUntil(() => existsSync(join(dir, 'complete-finished')));
+    await waitUntil(() => !existsSync(revokedHome));
+    await settleRealIo(80);
+    expect(existsSync(revokedHome)).toBe(false);
+  });
+
+  it('fences an in-flight requestMeegoLogin from arming a poller after stopAllMeegoPollers()', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    writeFileSync(join(dir, 'hold'), '');
+    const pendingLogin = m.requestMeegoLogin(ALICE);
+    await waitUntil(() => existsSync(join(dir, 'held')));
+
+    // Daemon shuts down while --begin is still in flight.
+    m.stopAllMeegoPollers();
+    writeFileSync(join(dir, 'go'), '');
+    expect((await pendingLogin).state).toBe('link');
+
+    vi.advanceTimersByTime(60_000);
+    await settleRealIo();
+    expect(completeCalls('').length).toBe(0);
+  });
+
+  it('applies exponential error backoff and stops after consecutive provider errors while keeping the challenge', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    await m.requestMeegoLogin(ALICE);
+    const challenge = join(m.meegoHomeFor(ALICE), '.botmux-meego-challenge');
+    process.env.STUB_COMPLETE_FAIL = '1';
+
+    // Poll #1 fails at 3s; next poll backs off to 6s (3s is too early).
+    vi.advanceTimersByTime(3_000);
+    await waitUntil(() => completeCalls('').length === 1);
+    await settleRealIo();
+    vi.advanceTimersByTime(3_000);
+    await settleRealIo();
+    expect(completeCalls('').length).toBe(1);
+    vi.advanceTimersByTime(3_000);
+    await waitUntil(() => completeCalls('').length === 2);
+    await settleRealIo();
+
+    // Remaining 8 errors (up to cap of 10) with backoff intervals.
+    for (let i = 3; i <= 10; i++) {
+      vi.advanceTimersByTime(60_000);
+      await waitUntil(() => completeCalls('').length === i);
+      await settleRealIo();
+    }
+    // Further advances trigger no more calls, and the challenge file remains intact.
+    vi.advanceTimersByTime(120_000);
+    await settleRealIo();
+    expect(completeCalls('').length).toBe(10);
+    expect(existsSync(challenge)).toBe(true);
+  });
+
+  it('isolates pollers by tenant and clears all timers on stopAllMeegoPollers', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    await m.requestMeegoLogin(ALICE);
+    await m.requestMeegoLogin(ALICE, 'dcar');
+    vi.advanceTimersByTime(3_000);
+    await waitUntil(() => completeCalls('').length === 1 && completeCalls('dcar').length === 1);
+    await settleRealIo();
+
+    m.stopAllMeegoPollers();
+    vi.advanceTimersByTime(60_000);
+    await settleRealIo();
+    expect(completeCalls('').length).toBe(1);
+    expect(completeCalls('dcar').length).toBe(1);
   });
 });

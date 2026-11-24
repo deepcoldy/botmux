@@ -41,7 +41,7 @@ const { recallProvenIdentityContent, forgetProvenIdentityContent } = await impor
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { beginBytedcliLogin } = await import('../src/services/bytedcli-auth.js');
 const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
-const { requestUnattendedAuthorization, noticeUnattendedLapse, clearRestoredLapses, offerAuthorizationAtCreation, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
+const { requestUnattendedAuthorization, noticeUnattendedLapse, clearRestoredLapses, offerAuthorizationAtCreation, clearAuthorizationNoticesForUser, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
 const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
 const { __resetPlatformAuthorizationRequestForTest } = await import('../src/core/platform-authorization-request.js');
 const credentialRequestClient = await import('../src/platform/credential-request-client.js');
@@ -436,9 +436,33 @@ describe('unattended turns (scheduled and background)', () => {
       await asked('meego', { caps: ['meego'] }); await asked('meego', { caps: ['meego'] });
       expect(send).toHaveBeenCalledTimes(1);
       expect(send.mock.calls[0][1]).toContain('https://meego.example.test/device');
+      expect(send.mock.calls[0][1]).toContain('/login meego');
       meegoLoggedIn.add(ALICE);
       expect(await asked('meego', { caps: ['meego'] })).toBe('ready');
       expect(send).toHaveBeenCalledTimes(1);
+    });
+
+    it('Meego lapse with a non-default tenant carries the tenant login command in its fallback hint', async () => {
+      await requestUnattendedAuthorization({
+        appId: 'cli_bot', taskId: 't-dcar', taskName: 'dcar-sync', openId: ALICE, locale: 'zh', provider: 'meego', tenant: 'dcar', sendDirect: send,
+        botConfig: { larkAppId: 'cli_bot', larkToolBinding: true, triggerUserAuth: parseTriggerUserAuthConfig({
+          enabled: true, capabilities: ['meego'], credentialSource: 'local' }) } as any,
+      });
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0][1]).toContain('/login meego dcar');
+    });
+
+    it('clearing a user\'s notices (on revoke or background completion) lets a post-revoke lapse deliver a fresh DM immediately', async () => {
+      await asked('meego', { caps: ['meego'] });
+      expect(send).toHaveBeenCalledTimes(1);
+
+      // Simulate background completion / revocation clearing Alice's Meego notice state within the 1h window.
+      later(5 * 60_000);
+      clearAuthorizationNoticesForUser(ALICE);
+      vi.mocked(requestMeegoLogin).mockResolvedValueOnce({ state: 'link', authUrl: 'https://meego.example.test/device-post-revoke' } as any);
+      expect(await asked('meego', { caps: ['meego'] })).toBe('delivered');
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(send.mock.calls[1][1]).toContain('https://meego.example.test/device-post-revoke');
     });
 
     it('lark-user lapses use the same notice', async () => {
@@ -530,8 +554,105 @@ describe('unattended turns (scheduled and background)', () => {
       expect(text).toContain('https://meego.example.test/device');
       expect(text).toContain('你本人的身份');
       expect(text).not.toContain('你创建');
-      // One lead sentence, then one line per capability link.
-      expect(text.split('\n')).toEqual([expect.stringContaining('下列能力'), expect.stringContaining('https://cloud.example.test/auth'), expect.stringContaining('https://meego.example.test/device')]);
+      // One lead sentence, one line per capability link, plus the Meego fallback hint.
+      expect(text.split('\n')).toEqual([
+        expect.stringContaining('下列能力'),
+        expect.stringContaining('https://cloud.example.test/auth'),
+        expect.stringContaining('https://meego.example.test/device'),
+        expect.stringContaining('/login meego'),
+      ]);
+    });
+
+    it('bytecloud-only creation offer omits the Meego fallback hint', async () => {
+      bytedcliJwts.clear();
+      await offer(['bytecloud']);
+      expect(send).toHaveBeenCalledTimes(1);
+      const text = (send.mock.calls[0] as unknown as [string, string])[1];
+      expect(text).toContain('https://cloud.example.test/auth');
+      expect(text).not.toContain('/login meego');
+    });
+
+    it('legacy tools-only config does not proactively DM Meego links at schedule creation', async () => {
+      vi.mocked(requestMeegoLogin).mockClear();
+      await offerAuthorizationAtCreation({
+        botConfig: { larkAppId: 'cli_bot', larkAppSecret: 's', brand: 'feishu', larkToolBinding: true,
+          triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, credentialSource: 'local', tools: ['lark-cli', 'bytedcli'] }) } as any,
+        openId: ALICE, locale: 'zh', sendDirect: send,
+      });
+      expect(requestMeegoLogin).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+
+      // ByteCloud is still offered when its credentials are missing, without pulling in Meego.
+      bytedcliJwts.clear();
+      await offerAuthorizationAtCreation({
+        botConfig: { larkAppId: 'cli_bot', larkAppSecret: 's', brand: 'feishu', larkToolBinding: true,
+          triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, credentialSource: 'local', tools: ['lark-cli', 'bytedcli'] }) } as any,
+        openId: ALICE, locale: 'zh', sendDirect: send,
+      });
+      expect(requestMeegoLogin).not.toHaveBeenCalled();
+      expect(send).toHaveBeenCalledTimes(1);
+      expect((send.mock.calls[0] as unknown as [string, string])[1]).toContain('https://cloud.example.test/auth');
+      expect((send.mock.calls[0] as unknown as [string, string])[1]).not.toContain('meego');
+    });
+
+    it('deduplicates repeated creation offers for the same live link, avoids minting challenges during cooldown, and resets on user clear', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+      vi.mocked(requestMeegoLogin).mockClear();
+      try {
+        await offer(['bytecloud', 'meego']);
+        expect(send).toHaveBeenCalledTimes(1);
+        expect(requestMeegoLogin).toHaveBeenCalledTimes(1);
+
+        // 15m later (inside 25m cooldown): skipped BEFORE calling requestMeegoLogin (no orphan challenges/pollers).
+        vi.setSystemTime(Date.now() + 15 * 60_000);
+        await offer(['bytecloud', 'meego']);
+        expect(send).toHaveBeenCalledTimes(1);
+        expect(requestMeegoLogin).toHaveBeenCalledTimes(1);
+
+        // 30m later (past 25m cooldown), identical live link: probed once, still deduped by URL.
+        vi.setSystemTime(Date.now() + 15 * 60_000);
+        await offer(['bytecloud', 'meego']);
+        expect(send).toHaveBeenCalledTimes(1);
+        expect(requestMeegoLogin).toHaveBeenCalledTimes(2);
+
+        // A freshly rotated link past cooldown is sent once.
+        vi.mocked(requestMeegoLogin).mockResolvedValueOnce({ state: 'link', authUrl: 'https://meego.example.test/device-2' } as any);
+        await offer(['bytecloud', 'meego']);
+        expect(send).toHaveBeenCalledTimes(2);
+        expect((send.mock.calls[1] as unknown as [string, string])[1]).toContain('https://meego.example.test/device-2');
+
+        // 10m later (inside 25m cooldown): skipped BEFORE probing even if provider would rotate links.
+        vi.setSystemTime(Date.now() + 10 * 60_000);
+        const callsBeforeCooldown = vi.mocked(requestMeegoLogin).mock.calls.length;
+        await offer(['bytecloud', 'meego']);
+        expect(send).toHaveBeenCalledTimes(2);
+        expect(vi.mocked(requestMeegoLogin).mock.calls.length).toBe(callsBeforeCooldown);
+
+        // Clearing notices for the user (e.g. /logout revoke) immediately lets the next schedule creation deliver a fresh DM.
+        clearAuthorizationNoticesForUser(ALICE);
+        vi.mocked(requestMeegoLogin).mockResolvedValueOnce({ state: 'link', authUrl: 'https://meego.example.test/device-3' } as any);
+        await offer(['bytecloud', 'meego']);
+        expect(send).toHaveBeenCalledTimes(3);
+        expect((send.mock.calls[2] as unknown as [string, string])[1]).toContain('https://meego.example.test/device-3');
+
+        // Once authorized (e.g. via background completion), later creations (>25m) send nothing.
+        meegoLoggedIn.add(ALICE);
+        vi.setSystemTime(Date.now() + 30 * 60_000);
+        await offer(['bytecloud', 'meego']);
+        expect(send).toHaveBeenCalledTimes(3);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('retries creation offer on next schedule creation when sendDirect fails', async () => {
+      send.mockRejectedValueOnce(new Error('network blip'));
+      await offer(['bytecloud', 'meego']);
+      expect(send).toHaveBeenCalledTimes(1);
+
+      await offer(['bytecloud', 'meego']);
+      expect(send).toHaveBeenCalledTimes(2);
     });
 
     it('lark-user without the tool binding: a stored bot-app user token counts as a login, an unreadable store is not a lapse, its absence is, and no token is ever refreshed', async () => {

@@ -852,6 +852,7 @@ export const messages: Record<string, string> = {
   'unattended.how_bytecloud': 'Send /login bytedcli in a private chat with me. ',
   'unattended.how_lark': 'Send /login in a private chat with me. ',
   'unattended.how_meego': 'Send /login meego in a private chat with me. ',
+  'unattended.meego_completion_hint': 'Approval usually takes effect automatically within a few seconds; if not, send {command} in a direct message with me to finish.',
   'creation.auth_entry': 'botmux: a scheduled task will use your identity for the capabilities below while running unattended, but you have not authorized them yet. Please authorize now, or the commands will be refused when the task runs:',
   'unattended.run_label': 'an unattended run',
   'auth_link.also_needed': 'You have not authorized {capability} yet. Authorize here:\n{url}',

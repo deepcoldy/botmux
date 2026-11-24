@@ -12,7 +12,7 @@ import { t, type Locale } from '../i18n/index.js';
 import type { BotConfig } from '../bot-registry.js';
 import { beginBytedcliLogin, describeBytedcliAuth } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, describeLarkCliAuth } from '../services/lark-cli-auth.js';
-import { requestMeegoLogin } from '../services/meego-auth.js';
+import { onMeegoBackgroundLoginCompleted, requestMeegoLogin } from '../services/meego-auth.js';
 import type { MeegoTenant } from '../services/bytedcli-home.js';
 import { capabilityOn, TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import type { ToolIdentityOutcome } from './turn-cli-identity.js';
@@ -25,6 +25,7 @@ import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { sendEphemeralCard, sendUserMessage } from '../im/lark/client.js';
 import { directOrEphemeral } from './auth-link-delivery.js';
+import { meegoLoginCommand } from './provider-auth-request.js';
 import { hasReason, NOT_AUTHORIZED_REASONS } from './refusal-reasons.js';
 
 type SendDirect = (openId: string, text: string) => Promise<unknown>;
@@ -97,12 +98,17 @@ export async function missingAuthorizationEntries(botConfig: BotConfig, openId: 
   known?: { provider: UnattendedProvider; url?: string | null }; except?: UnattendedProvider; tenant?: MeegoTenant;
   /** The identity this person's current turn already published, per tool; when given it replaces the local login check. */
   published?: (tool: TriggerUserAuthTool) => string | undefined;
+  /** Only include Meego when explicitly opted in via `triggerUserAuth.capabilities` (or when `known.provider === 'meego'`),
+   *  avoiding unsolicited Meego pre-auth prompts for legacy `tools: ['bytedcli']` configs. */
+  explicitMeegoOnly?: boolean;
+  /** Providers to omit before probing or minting login challenges (e.g. still inside creation cooldown). */
+  skipProviders?: ReadonlySet<UnattendedProvider>;
 } = {}): Promise<AuthorizationEntry[]> {
-  const { known, except, published } = opts;
+  const { known, except, published, explicitMeegoOnly, skipProviders } = opts;
   const policy = policyFromConfig(botConfig.triggerUserAuth);
   const entries: AuthorizationEntry[] = [];
   for (const tool of TRIGGER_USER_AUTH_TOOLS) {
-    if (tool === except || !policy.capabilities.has(capabilityOfTool(tool))) continue;
+    if (tool === except || skipProviders?.has(tool) || !policy.capabilities.has(capabilityOfTool(tool))) continue;
     if (known?.provider !== tool) {
       // A session bound to the lark tool resolves lark-cli itself.
       if (tool === 'lark-cli' && botConfig.larkToolBinding !== false) continue;
@@ -112,7 +118,11 @@ export async function missingAuthorizationEntries(botConfig: BotConfig, openId: 
       : { provider: tool, url: known?.provider === tool && known.url !== undefined
         ? known.url ?? undefined : await authorizationLink(tool, botConfig, openId).catch(() => undefined) });
   }
-  if (except !== 'meego' && capabilityOn(botConfig.triggerUserAuth, 'meego')) {
+  const includeMeego = except !== 'meego'
+    && !skipProviders?.has('meego')
+    && capabilityOn(botConfig.triggerUserAuth, 'meego')
+    && (!explicitMeegoOnly || known?.provider === 'meego' || botConfig.triggerUserAuth?.capabilities?.includes('meego') === true);
+  if (includeMeego) {
     if (known?.provider === 'meego') entries.push({ provider: 'meego', url: known.url ?? undefined });
     else {
       const login = await requestMeegoLogin(openId, opts.tenant).catch(() => undefined);
@@ -147,15 +157,28 @@ async function deliverPlatformEntries(args: {
   return { rest, platform: 'failed' };
 }
 
-/** Creation offers already made per app, person and provider, so several tasks created together give one message. */
-const offeredAt = new Map<string, number>();
-const CREATION_OFFER_COOLDOWN_MS = 10 * 60_000;
+interface OfferRecord {
+  at: number;
+  url?: string;
+  openId: string;
+  provider: UnattendedProvider;
+}
+
+const ALL_UNATTENDED_PROVIDERS: readonly UnattendedProvider[] = [...TRIGGER_USER_AUTH_TOOLS, 'meego'];
+/** Creation offers already made per app, person and provider, so several tasks created together give one message
+ *  and the same live challenge link is never sent twice. */
+const offeredAt = new Map<string, OfferRecord>();
+const CREATION_OFFER_COOLDOWN_MS = 25 * 60_000;
+/** Longer than any device-login challenge TTL (lark-cli 9m, Meego 25m, ByteCloud 50m)
+ *  so live-URL dedup holds for the full challenge lifetime while bounding memory. */
+const CREATION_OFFER_RETENTION_MS = 60 * 60_000;
 
 /**
  * Sends `openId` ONE private message with an authorization entry for every
  * capability the bot will run as them that they definitely have no credentials
  * for (platform-backed ones arrive as the platform's own card). A capability
- * offered to the person within the last ten minutes is left out. Never blocks
+ * offered to the person within the cooldown window — or with the exact same
+ * live challenge link — is left out before minting new challenges. Never blocks
  * or fails the creation: problems are logged.
  */
 export async function offerAuthorizationAtCreation(args: {
@@ -164,20 +187,72 @@ export async function offerAuthorizationAtCreation(args: {
   published?: (tool: TriggerUserAuthTool) => string | undefined;
 }): Promise<void> {
   const { botConfig, openId, locale } = args;
-  const keyOf = (e: AuthorizationEntry) => JSON.stringify([botConfig.larkAppId, openId, e.provider]);
+  const keyFor = (provider: UnattendedProvider) => JSON.stringify([botConfig.larkAppId, openId, provider]);
+  const keyOf = (e: AuthorizationEntry) => keyFor(e.provider);
   try {
-    const missing = await missingAuthorizationEntries(botConfig, openId, { published: args.published });
-    const now = Date.now();
-    const due = missing.filter(e => {
-      const last = offeredAt.get(keyOf(e));
-      return last === undefined || now - last >= CREATION_OFFER_COOLDOWN_MS;
+    // Check cooldown BEFORE probing or minting new device-login challenges so
+    // cooled-down providers never spawn orphan challenges or background pollers.
+    const preNow = Date.now();
+    const skipProviders = new Set<UnattendedProvider>();
+    for (const provider of ALL_UNATTENDED_PROVIDERS) {
+      const last = offeredAt.get(keyFor(provider));
+      if (last && preNow - last.at < CREATION_OFFER_COOLDOWN_MS) skipProviders.add(provider);
+    }
+    if (skipProviders.size === ALL_UNATTENDED_PROVIDERS.length) return;
+
+    const missing = await missingAuthorizationEntries(botConfig, openId, {
+      published: args.published, explicitMeegoOnly: true, skipProviders,
     });
-    for (const e of due) offeredAt.set(keyOf(e), now);
-    const { rest: entries } = await deliverPlatformEntries({ botConfig, openId, entries: due });
-    if (entries.some(e => e.url)) {
-      const lines = entries.flatMap(({ provider, url }) =>
-        url ? [t('unattended.lapse_entry', { capability: capabilityOfProvider(provider), where: url }, locale)] : []);
-      await args.sendDirect(openId, [t('creation.auth_entry', undefined, locale), ...lines].join('\n'));
+    const now = Date.now();
+    for (const [key, rec] of offeredAt) {
+      if (now - rec.at >= CREATION_OFFER_RETENTION_MS) offeredAt.delete(key);
+    }
+    const due = missing.filter(e => {
+      if (!e.platform && !e.url) return false;
+      const last = offeredAt.get(keyOf(e));
+      if (!last) return true;
+      if (e.url !== undefined && last.url === e.url) return false;
+      return now - last.at >= CREATION_OFFER_COOLDOWN_MS;
+    });
+    if (!due.length) return;
+    const claimed = new Map<string, OfferRecord>();
+    for (const e of due) {
+      const key = keyOf(e);
+      const record: OfferRecord = { at: now, openId, provider: e.provider, ...(e.url !== undefined ? { url: e.url } : {}) };
+      claimed.set(key, record);
+      offeredAt.set(key, record);
+    }
+    const rollback = (key: string) => {
+      const rec = claimed.get(key);
+      if (rec && offeredAt.get(key) === rec) offeredAt.delete(key);
+    };
+    let entries: AuthorizationEntry[];
+    let platform: 'none' | 'sent' | 'ready' | 'failed';
+    try {
+      ({ rest: entries, platform } = await deliverPlatformEntries({ botConfig, openId, entries: due }));
+    } catch (e) {
+      for (const key of claimed.keys()) rollback(key);
+      throw e;
+    }
+    if (platform === 'ready' || platform === 'failed') {
+      for (const e of due.filter(entry => entry.platform)) rollback(keyOf(e));
+    }
+    for (const e of entries) {
+      if (!e.url) rollback(keyOf(e));
+    }
+    const directEntries = entries.filter(e => !!e.url);
+    if (directEntries.length) {
+      const lines = directEntries.map(({ provider, url }) =>
+        t('unattended.lapse_entry', { capability: capabilityOfProvider(provider), where: url! }, locale));
+      if (directEntries.some(e => e.provider === 'meego')) {
+        lines.push(t('unattended.meego_completion_hint', { command: meegoLoginCommand() }, locale));
+      }
+      try {
+        await args.sendDirect(openId, [t('creation.auth_entry', undefined, locale), ...lines].join('\n'));
+      } catch (e) {
+        for (const entry of directEntries) rollback(keyOf(entry));
+        throw e;
+      }
     }
   } catch (e) {
     logger.warn(`[unattended-auth] could not offer authorization at creation: ${e instanceof Error ? e.message : String(e)}`);
@@ -187,9 +262,26 @@ export async function offerAuthorizationAtCreation(args: {
 const capabilityOfProvider = (provider: UnattendedProvider) => provider === 'meego' ? 'meego' : capabilityOfTool(provider);
 
 /** Last notice per task, person and provider: what it carried (a link, or the platform card's day and scopes) and when. */
-const lastSent = new Map<string, { marker: string; at: number }>();
+const lastSent = new Map<string, { marker: string; at: number; openId: string; provider: UnattendedProvider }>();
 const DAY_MS = 86_400_000;
 const LINK_NOTICE_INTERVAL_MS = 60 * 60_000;
+
+/**
+ * Forget creation-offer and unattended-lapse dedup records for `openId`
+ * (optionally limited to a single `provider`). Called on revocation and when
+ * background Meego completion finishes so a later auth lapse is never silently
+ * suppressed by pre-revoke or pre-completion cooldowns.
+ */
+export function clearAuthorizationNoticesForUser(openId: string, provider?: UnattendedProvider): void {
+  for (const [key, rec] of offeredAt) {
+    if (rec.openId === openId && (!provider || rec.provider === provider)) offeredAt.delete(key);
+  }
+  for (const [key, rec] of lastSent) {
+    if (rec.openId === openId && (!provider || rec.provider === provider)) lastSent.delete(key);
+  }
+}
+
+onMeegoBackgroundLoginCompleted(openId => clearAuthorizationNoticesForUser(openId, 'meego'));
 
 /** Forgets the lapse notices and creation offers (tests). */
 export function __resetUnattendedNoticesForTest(): void { lastSent.clear(); offeredAt.clear(); }
@@ -239,7 +331,7 @@ export function unattendedRefusalText(outcome: UnattendedNoticeOutcome | undefin
  */
 export async function deliverUnattendedLapse(args: {
   appId: string; taskId: string; taskName: string; openId: string; locale: Locale | undefined;
-  botConfig: BotConfig; scopes?: readonly string[];
+  botConfig: BotConfig; scopes?: readonly string[]; tenant?: MeegoTenant;
   entries: readonly AuthorizationEntry[]; sendDirect: SendDirect;
 }): Promise<UnattendedNoticeOutcome> {
   const { appId, taskId, openId, locale, entries } = args;
@@ -252,7 +344,7 @@ export async function deliverUnattendedLapse(args: {
     return !last || (last.marker !== marker(e) && (e.platform || now - last.at >= LINK_NOTICE_INTERVAL_MS));
   });
   if (!due.length) return 'delivered';
-  for (const e of due) lastSent.set(keyOf(e), { marker: marker(e), at: now });
+  for (const e of due) lastSent.set(keyOf(e), { marker: marker(e), at: now, openId, provider: e.provider });
   const { rest, platform } = await deliverPlatformEntries({
     botConfig: args.botConfig, openId, entries: due, ...(args.scopes ? { scopes: args.scopes } : {}),
   });
@@ -263,6 +355,9 @@ export async function deliverUnattendedLapse(args: {
     capability: capabilityOfProvider(e.provider),
     where: e.url ?? t(e.provider === 'meego' ? 'unattended.how_meego' : e.provider === 'bytedcli' ? 'unattended.how_bytecloud' : 'unattended.how_lark', undefined, locale),
   }, locale));
+  if (rest.some(e => e.provider === 'meego' && !!e.url)) {
+    lines.push(t('unattended.meego_completion_hint', { command: meegoLoginCommand(args.tenant) }, locale));
+  }
   const text = [t('unattended.lapse_notice', { task: args.taskName, capabilities: rest.map(e => capabilityOfProvider(e.provider)).join(', ') }, locale), ...lines].join('\n');
   try { await args.sendDirect(openId, text); return outcome; }
   catch (error) {
