@@ -1846,6 +1846,15 @@ async function recoverColdImReplies(ds: DaemonSession): Promise<void> {
   const fileCopy = new Map(producer.readPending().map(snapshot => [snapshot.id, snapshot]));
   if (fileCopy.size === 0 && !journal.hasUnsettled(session.sessionId)) return;
   const controller = controllerForSession(ds);
+  const proveExecution = (snapshot: Pick<OutputDeliveryRecord, 'origin' | 'output'>) => {
+    const origin = snapshot.origin && controller?.outputOrigin(snapshot.origin);
+    const ref = origin?.scope.execution;
+    if (!controller || !ref || ref.turnId !== snapshot.output.turnId
+      || ref.dispatchAttempt !== snapshot.output.dispatchAttempt) return undefined;
+    const execution = controller.store.execution(controller.ref, ref.executionId);
+    if (!execution || !sameExecution(execution.ref, ref)) return undefined;
+    return { origin, execution };
+  };
   const showFailure = (turnId: string, sink: Extract<OutputSink, { kind: 'im' }>, reason: unknown, terminal = false) => {
     if (owns() && raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, turnId)) {
       publishAttentionPatch(ds);
@@ -1863,13 +1872,12 @@ async function recoverColdImReplies(ds: DaemonSession): Promise<void> {
       if (recorded.state === 'settled' && recorded.fingerprint === snapshot.fingerprint) producer.remove(snapshot);
       continue;
     }
-    const origin = snapshot.origin && controller?.outputOrigin(snapshot.origin);
-    const execution = origin?.scope.execution;
-    if (!execution || execution.turnId !== output.turnId || execution.dispatchAttempt !== output.dispatchAttempt) {
+    const proof = proveExecution(snapshot);
+    if (!proof) {
       showFailure(output.turnId, sink, 'execution_scope_unproven', true);
       continue;
     }
-    journal.accept({ ...snapshot, origin }, sink);
+    journal.accept({ ...snapshot, origin: proof.origin }, sink);
   }
   const coordinator = new OutputDeliveryCoordinator(journal);
   for (const record of journal.pending(session.sessionId)) {
@@ -1878,11 +1886,11 @@ async function recoverColdImReplies(ds: DaemonSession): Promise<void> {
     if (sink.kind !== 'im' || !sink.answerRequired || output.codexAppSettlement) continue;
     await coordinator.deliver(record, {
       owns,
-      process: async (_stored, control) => {
+      process: async (stored, control) => {
+        const proof = proveExecution(stored);
+        if (!proof) throw new OutputDeliveryTerminalError('execution_scope_unproven');
         assertFrozenImDeliveryAllowed(ds, sink);
-        const ref = record.origin?.scope.execution;
-        const execution = ref && controller?.store.execution(controller.ref, ref.executionId);
-        if (execution?.cancelRequested || execution?.phase === 'cancelled') {
+        if (proof.execution.cancelRequested || proof.execution.phase === 'cancelled') {
           throw new OutputDeliveryTerminalError('output_execution_cancelled');
         }
         const hasNewerAttempt = controller?.store.executions(controller.ref).some(candidate =>

@@ -1,3 +1,4 @@
+import { sameExecution } from '../src/services/session-contract.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -433,7 +434,8 @@ describe('worker production IPC boundary', () => {
 });
 
 describe('native and generic settlement contracts', () => {
-  it.each(['before send', 'after Feishu accepted', 'after worker-only persistence', 'without original execution proof'] as const)(
+  it.each(['before send', 'after Feishu accepted', 'after worker-only persistence', 'without original execution proof',
+    'wrong turn', 'wrong attempt', 'originless journal', 'transient store fault'] as const)(
     'reopens a scoped final %s without rerunning the model or inventing a receipt', async crash => {
       vi.useFakeTimers();
       const dir = directory();
@@ -445,11 +447,20 @@ describe('native and generic settlement contracts', () => {
       db.rememberSink(output.sessionId!, output.turnId, { ...sink, context: { target: { mode: 'thread', rootMessageId: 'om_wrong' } } });
       const snapshot = outputSnapshot(app, { ...output, content: '完整方案\n\n1. 检查\n2. 回读', dispatchAttempt: 2 });
       const ref = { executionId: 'native-turn', turnId: output.turnId, dispatchAttempt: 2 };
-      const origin = { scope: { execution: ref } };
+      const origin = { scope: { execution: ref } } as NonNullable<OutputDeliveryRecord['origin']>;
+      const storedRef = {
+        ...ref,
+        turnId: crash === 'wrong turn' ? 'om_different_turn' : ref.turnId,
+        dispatchAttempt: crash === 'wrong attempt' ? 1 : ref.dispatchAttempt,
+      };
+      let storeUnavailable = crash === 'transient store fault';
       const producer = new WorkerOutputJournal(dir, app, output.sessionId!);
       producer.save({ ...snapshot, origin } as Parameters<typeof producer.save>[0]);
       const hasProof = crash !== 'without original execution proof';
-      if (crash === 'before send' || crash === 'after Feishu accepted') db.accept(snapshot, sink);
+      if (crash === 'before send' || crash === 'after Feishu accepted' || storeUnavailable) {
+        db.accept({ ...snapshot, origin }, sink);
+      }
+      if (crash === 'originless journal') db.accept(snapshot, sink);
       const received = new Map<string, { content: string; target: unknown }>();
       let loseResponse = crash === 'after Feishu accepted';
       const deliverFinalOutput = vi.fn((_ds, msg, _tag, _attempt, done, _owns, route, _unused, _initiator, _legacy, _effect, control) => {
@@ -486,14 +497,39 @@ describe('native and generic settlement contracts', () => {
         config: { session: { dataDir: dir } }, WorkerOutputJournal, OutputDeliveryCoordinator,
         outputDeliveryJournal: () => db, isSessionTransferring: () => false,
         controllerForSession: () => ({ outputOrigin: () => hasProof ? origin : undefined,
-          store: { execution: () => ({ phase: 'succeeded' }), executions: () => [] } }),
+          store: { execution: () => {
+            if (storeUnavailable) throw new Error('temporary store read failure');
+            return { phase: 'succeeded', ref: storedRef };
+          }, executions: () => [] } }),
+        sameExecution,
         raiseDaemonAttention, publishAttentionPatch: vi.fn(), publishScopedImDeliveryStatus: vi.fn(), logger: { warn: vi.fn() },
         tag: () => 'trial', shouldDropMismatchedFinalOutput: () => false, shouldDropMismatchedHermesFinalOutput: () => false,
         deliverFinalOutputWithOutputControl: helper, privateReplyEnabled: () => false,
         FinalPublicationUnknownError, OutputDeliveryTerminalError, FINAL_HANDOFF_DELIVERY_REASON,
       }));
       await recover(ds);
-      if (!hasProof) {
+      if (storeUnavailable) {
+        expect(db.read(snapshot.id)?.state).toBe('blocked');
+        expect(db.read(snapshot.id)?.receipt).toBeUndefined();
+        expect(deliverFinalOutput).not.toHaveBeenCalled();
+        storeUnavailable = false;
+        await vi.advanceTimersByTimeAsync(5_001);
+        await recover(ds);
+      }
+      if (crash === 'originless journal') {
+        expect(db.read(snapshot.id)).toMatchObject({
+          state: 'rejected', reason: 'execution_scope_unproven', output: { content: snapshot.output.content },
+        });
+        expect(db.read(snapshot.id)?.receipt).toBeUndefined();
+        expect(db.hasTerminalRejection(output.sessionId!)).toBe(true);
+        expect(db.hasUnsettled(output.sessionId!)).toBe(false);
+        expect(ds).toMatchObject({ agentAttention: { kind: 'blocked' } });
+        await recover(ds);
+        expect(deliverFinalOutput).not.toHaveBeenCalled();
+        expect(producer.readPending()[0].output.content).toBe(snapshot.output.content);
+        return;
+      }
+      if (!hasProof || crash === 'wrong turn' || crash === 'wrong attempt') {
         expect(db.read(snapshot.id)).toBeUndefined();
         expect(deliverFinalOutput).not.toHaveBeenCalled();
         expect(producer.readPending()[0].output.content).toBe(snapshot.output.content);
