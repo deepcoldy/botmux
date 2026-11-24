@@ -26102,9 +26102,15 @@ function setupWorkerHandlers(
             || msg.fileCount < 0) {
             throw new Error('invalid_plugin_result_entry');
           }
-          const artifacts = new PluginResultArtifactStore({ dataDir: config.session.dataDir });
-          const manifest = artifacts.redeem(msg.viewToken, msg.callerUnionId);
-          if (manifest.readPolicy === 'receipt-only') {
+          if (msg.readPolicy !== undefined && msg.readPolicy !== 'receipt-only') {
+            throw new Error('invalid_plugin_result_read_policy');
+          }
+          // Legacy entry-card delivery does not read artifact contents. Only the
+          // explicit protected IPC arm redeems and verifies a host snapshot.
+          if (msg.readPolicy === 'receipt-only') {
+            const artifacts = new PluginResultArtifactStore({ dataDir: config.session.dataDir });
+            const manifest = artifacts.redeem(msg.viewToken, msg.callerUnionId);
+            if (manifest.readPolicy !== 'receipt-only') throw new Error('protected_result_artifact_policy_mismatch');
             const assertAuthority = () => {
               if (ds.session.protectedResults !== true || !ownsWorkerSession() || msg.sessionId !== ds.session.sessionId
                 || managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)

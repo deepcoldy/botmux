@@ -2733,6 +2733,7 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     expiresAt: artifact.expiresAt,
     fileCount: artifact.fileCount,
     responseKind: resolvedDelivery.responseKind ?? 'final',
+    ...(resolvedDelivery.readPolicy ? { readPolicy: resolvedDelivery.readPolicy } : {}),
   };
   const scopedPayload = sessionEventMetadata(payload, sessionOrigin);
   try {

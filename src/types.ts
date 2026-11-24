@@ -2647,6 +2647,7 @@ export type WorkerToDaemonBase =
       expiresAt: string;
       fileCount: number;
       responseKind: 'final' | 'auxiliary';
+      readPolicy?: 'receipt-only';
     }
   | {
       type: 'ready';

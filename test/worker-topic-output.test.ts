@@ -29,6 +29,9 @@ import { observeTurnResultTerminal } from '../src/core/turn-result-session.js';
 import { TopicSendError } from '../src/cli/topic-send-guard.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { PluginResultArtifactStore } from '../src/core/plugins/mcp/result-artifact-store.js';
+import { ProtectedResultStore } from '../src/services/protected-result-store.js';
+import { parseTrustedResultDelivery } from '../src/core/plugins/mcp/trusted-result-delivery.js';
 
 const APP = 'cli_worker_topic_output';
 const oldDataDir = config.session.dataDir;
@@ -150,6 +153,41 @@ describe('worker final-output topic transport', () => {
     expect(mocks.create).not.toHaveBeenCalled();
     expect(mocks.reply).not.toHaveBeenCalled();
     expect(mocks.upload).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('requires matching stored policy for protected IPC delivery (matching=%s)', async matching => {
+    ds.session.protectedResults = true;
+    ds.workingDir = home;
+    ds.session.turnReplyContexts!.om_turn_old.senderOpenId = 'ou_requester';
+    ds.session.replyTargets = { om_turn_old: {
+      rootMessageId: 'om_source', senderOpenId: 'ou_requester', updatedAt: new Date().toISOString(),
+    } };
+    const store = new PluginResultArtifactStore({ dataDir: config.session.dataDir });
+    mkdirSync(join(home, 'outbound'));
+    const delivery = parseTrustedResultDelivery({ schemaVersion: 1, deliveryId: 'protected_fixture_001',
+      markdown: 'SYNTHETIC_PRIVATE_BODY', ...(matching ? { readPolicy: 'receipt-only' } : {}) }, home);
+    const artifact = store.create({ pluginId: 'reference-reporter', delivery, ownerUnionId: 'on_requester',
+      ownerOpenId: 'ou_requester', larkAppId: APP, sessionId: ds.session.sessionId, turnId: 'om_turn_old' });
+    const sent: any[] = [];
+    const worker = Object.assign(new EventEmitter(), { pid: process.pid, connected: true,
+      send: (message: unknown) => { sent.push(message); return true; },
+      stdout: new EventEmitter(), stderr: new EventEmitter(), killed: false, kill: () => true });
+    ds.worker = worker as never;
+    __testOnly_setupWorkerHandlers(ds, ds.worker!, undefined, 1);
+    worker.emit('message', { type: 'plugin_result_delivery', requestId: 'protected_req', sessionId: ds.session.sessionId,
+      pluginId: 'reference-reporter', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
+      deliveryId: delivery.deliveryId, viewToken: artifact.viewToken, expiresAt: artifact.expiresAt,
+      fileCount: 0, responseKind: 'final', readPolicy: 'receipt-only' });
+    await waitFor(() => sent.some(message => message.type === 'plugin_result_delivery_result'));
+    expect(sent.find(message => message.type === 'plugin_result_delivery_result').ok).toBe(matching);
+    expect(JSON.stringify(sent)).not.toContain('SYNTHETIC_PRIVATE_BODY');
+    expect(mocks.reply).toHaveBeenCalledTimes(matching ? 1 : 0);
+    if (matching) {
+      const body = mocks.reply.mock.calls[0][0].data.content;
+      expect(body).toContain('SYNTHETIC_PRIVATE_BODY');
+      expect(body).not.toContain('/plugin-result-access/');
+      expect(new ProtectedResultStore(config.session.dataDir).isProtected('om_sent')).toBe(true);
+    }
   });
 
   it.each([

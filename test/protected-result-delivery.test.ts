@@ -52,6 +52,10 @@ describe('protected plugin result delivery', () => {
     expect(f.writes).toEqual(['file', 'interactive']);
     expect(f.store.redactMessage(raw()).body.content).toContain(PROTECTED_RESULT_PLACEHOLDER);
     expect(JSON.stringify(f.store.redactMessage(raw()))).not.toContain(secret);
+    for (const deleted of [true, false]) {
+      expect(f.store.redactMessage({ ...raw(), deleted }).deleted).toBe(deleted);
+    }
+    expect(f.store.redactMessage(raw()).deleted).toBeUndefined();
     const ordinary = { message_id: 'om_ordinary', chat_id: context.chatId, msg_type: 'text', body: { content: '{"text":"ordinary"}' } };
     expect(f.store.redactMessage(ordinary)).toBe(ordinary);
     expect(f.store.redactMessage({ ...ordinary, chat_id: 'oc_other' })).toEqual({ ...ordinary, chat_id: 'oc_other' });

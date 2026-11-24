@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { pickTurnReplyTarget } from '../src/core/reply-target.js';
+import { ProtectedResultStore } from '../src/services/protected-result-store.js';
 import { isSilentMessageListenerSession, messageListenerSendBlocked } from '../src/core/message-listener-silence.js';
 import { parseDispatchArgs } from '../src/cli/dispatch-args.js';
 import { readMessageWithinContext } from '../src/im/lark/message-read-context.js';
@@ -60,6 +61,7 @@ function harness(mode: Mode, options: {
       thread_id: Object.hasOwn(options, 'threadId') ? options.threadId : currentThreadId }] } };
   });
   const lookupScope = {
+    ProtectedResultStore, config: { session: { dataDir: process.env.SESSION_DATA_DIR! } },
     readMessageWithinContext,
     getBotClient: () => ({ request }),
     logger: { debug: vi.fn() },

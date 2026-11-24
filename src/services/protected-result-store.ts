@@ -229,6 +229,7 @@ export class ProtectedResultStore {
       ...(raw.root_id ? { root_id: raw.root_id } : {}),
       ...(raw.parent_id ? { parent_id: raw.parent_id } : {}),
       ...(raw.thread_id ? { thread_id: raw.thread_id } : {}),
+      ...(typeof raw.deleted === 'boolean' ? { deleted: raw.deleted } : {}),
       create_time: raw.create_time, sender: raw.sender, msg_type: 'text',
       body: { content: JSON.stringify({ text: PROTECTED_RESULT_PLACEHOLDER }) },
     };
