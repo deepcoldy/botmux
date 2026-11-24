@@ -16,6 +16,7 @@ import { canOperate } from './event-dispatcher.js';
 import { deliverEphemeralOrReply, isSessionTransferring, topicReasoningControl } from '../../core/worker-pool.js';
 import { readTraexModelLoads } from '../../services/traex-model-load.js';
 import { isRemoteBackendId } from '../../core/remote-cli-ids.js';
+import { DEFAULT_MODEL_VALUE_PATTERN } from '../../core/model-value-pattern.js';
 
 export interface ModelPickerLoad {
   /** Missing entries and an unavailable query both mean unknown, never idle. */
@@ -69,12 +70,7 @@ function sessionCliId(ds: DaemonSession) {
 
 export const MODEL_SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 
-/** Bot-default model values are written to bots.json and handed to the CLI as a
- * launch argument, never typed into a terminal, so they may also carry a
- * `#variant` suffix (e.g. MiniMax's `MiniMax-M3.1-Flash#thinking`). Without it
- * a stored variant renders as "CLI default" and cannot be re-selected. Session
- * pickers inject `/model <slug>` into the PTY and keep the strict pattern. */
-export const DEFAULT_MODEL_VALUE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}(?:#[A-Za-z0-9._-]{1,32})?$/;
+export { DEFAULT_MODEL_VALUE_PATTERN };
 
 /**
  * Resolve the model-catalogue selection for THIS session's frozen CLI shape.

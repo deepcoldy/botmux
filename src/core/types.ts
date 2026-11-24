@@ -513,8 +513,12 @@ export interface DaemonSession {
   /** Native write observations, scoped to the worker generation and exact attempt. */
   replyExecutionStarts?: Map<string, {
     startedAtMs: number; workerGeneration: number;
-    /** Exact terminal observed; retain timing for reply rendering, suppress reminders. */
+    /** Execution retired (terminal, superseded, or screen-idle on non-terminal CLI);
+     *  retain timing for reply rendering, suppress reminders. */
     completed?: boolean;
+    /** True only when retired by an authoritative terminal/supersede edge (not
+     *  heuristic screen-idle), permanently preventing same-attempt revival. */
+    completedByTerminal?: boolean;
     stage?: 'model_output' | 'tool_started' | 'tool_returned';
     lastProgressAtMs?: number;
     /** Ephemeral Dashboard publication throttle, scoped to this exact turn. */
@@ -944,6 +948,24 @@ export interface DaemonSession {
    * target lookup from posting after this episode cleared and a same-key later
    * episode started. Cross-session duplicate events use a daemon-wide TTL. */
   quotaFallbackAttemptToken?: string;
+  /** A same-bot quota fallback chain switch is in flight. In-memory only. */
+  quotaFallbackChainSwitching?: boolean;
+  /** Latest swallowed limit episode's guarded fallback, settled if the switch declines. */
+  quotaFallbackChainSwitchFallThrough?: () => void;
+  /** Same-CLI retries spent on one logical turn's transient rate limits before
+   * the chain switches. Source turn and worker prevent stale timers from owning
+   * a manual recovery or a replacement generation. In-memory only. */
+  quotaFallbackChainRetries?: {
+    logicalTurnId: string;
+    sourceTurnId: string;
+    worker: ChildProcess;
+    attempts: number;
+    timer?: NodeJS.Timeout;
+    /** Timer fire does not end ownership; the recovery Promise may still be in flight. */
+    inFlight?: boolean;
+    /** Latest duplicate edge's guarded fallback while this attempt is waiting or in flight. */
+    fallThrough?: () => void;
+  };
   /** Host-managed Antigravity account alias active when this session's CLI spawned. */
   antigravityAccountId?: string;
   /** In-flight and per-turn state for Antigravity quota-limit auto-rotation. */

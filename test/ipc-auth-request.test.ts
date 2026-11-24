@@ -1172,6 +1172,51 @@ esac
     expect(replies).toEqual([]);
   });
 
+  it('adopts a recovered local ByteCloud login when the turn started with [reason=provider_unavailable]', async () => {
+    session.reportedIdentityModel.model = 'proven';
+    cliIdentity.writeSessionIdentity(config.session.dataDir, 'auth-session', {
+      tool: 'bytedcli', mode: 'denied', turnId: 'om_turn', openId: 'ou_sender',
+      message: 'botmux: bytedcli 授权服务暂时不可用。\n[reason=provider_unavailable]',
+    }, 'proven');
+    onTestFinished(() => cliIdentity.forgetProvenIdentityContent(config.session.dataDir, 'auth-session'));
+    vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'authorized' });
+    vi.spyOn(bytedcliAuth, 'mintBytedcliJwts').mockResolvedValue({ cloudJwt: 'recovered-cloud-jwt' });
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const response = await ask({ provider: 'bytedcli' });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { message: string };
+    expect(body).toMatchObject({
+      ok: true, provider: 'bytedcli', status: 'ready',
+      message: t('provider_auth.ready_bytedcli_now', undefined, 'zh'),
+    });
+    expect(cliIdentity.recallProvenIdentityContent(config.session.dataDir, 'auth-session', 'om_turn', 'bytedcli'))
+      .toContain("BYTEDCLI_USER_CLOUD_JWT='recovered-cloud-jwt'");
+    expect(dm).not.toHaveBeenCalled();
+    expect(replies).toEqual([]);
+  });
+
+  it('returns status unavailable (HTTP 200) instead of 500 or ready when adopting local ByteCloud hits a second transient failure', async () => {
+    session.reportedIdentityModel.model = 'proven';
+    cliIdentity.writeSessionIdentity(config.session.dataDir, 'auth-session', {
+      tool: 'bytedcli', mode: 'denied', turnId: 'om_turn', openId: 'ou_sender',
+      message: 'botmux: bytedcli 授权服务暂时不可用。\n[reason=provider_unavailable]',
+    }, 'proven');
+    onTestFinished(() => cliIdentity.forgetProvenIdentityContent(config.session.dataDir, 'auth-session'));
+    vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'authorized' });
+    vi.spyOn(bytedcliAuth, 'mintBytedcliJwts').mockRejectedValue(
+      new Error('bytedcli authorization service unavailable (mint personal JWT)'),
+    );
+    const response = await ask({ provider: 'bytedcli' });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { message: string };
+    expect(body).toMatchObject({
+      ok: true, provider: 'bytedcli', status: 'unavailable',
+      message: t('provider_auth.ready_bytedcli_unavailable', undefined, 'zh'),
+    });
+    expect(cliIdentity.recallProvenIdentityContent(config.session.dataDir, 'auth-session', 'om_turn', 'bytedcli'))
+      .toContain('[reason=provider_unavailable]');
+  });
+
   it('an attended ByteCloud refusal also carries the Meego link when that login is missing too: one DM', async () => {
     vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockResolvedValue({ state: 'needs-login' });
     vi.spyOn(bytedcliAuth, 'startBytedcliLogin')

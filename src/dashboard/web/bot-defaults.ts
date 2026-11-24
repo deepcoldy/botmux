@@ -80,6 +80,17 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.groupWorkingDir', 'botDefaults.autoWorktree', 'botDefaults.autoStartJoin',
       'botDefaults.autoStartJoinSeed', 'botDefaults.autoStartTopic', 'botDefaults.autoInviteOwnerOnGroupAdd',
       'botDefaults.ownerGroupFollow', 'botDefaults.ownerGroupFollowEnabled', 'botDefaults.ownerGroupFollowExcluded',
+      'botDefaults.ownerGroupFollowScope', 'botDefaults.ownerGroupFollowAll', 'botDefaults.ownerGroupFollowFiltered',
+      'botDefaults.ownerGroupFollowPresetDefect', 'botDefaults.ownerGroupFollowPresetAlertDesc',
+      'botDefaults.ownerGroupFollowPresetAlert', 'botDefaults.ownerGroupFollowPresetClosed',
+      'botDefaults.ownerGroupFollowInclude', 'botDefaults.ownerGroupFollowExclude',
+      'botDefaults.ownerGroupFollowAddInclude', 'botDefaults.ownerGroupFollowAddExclude',
+      'botDefaults.ownerGroupFollowField', 'botDefaults.ownerGroupFollowOp', 'botDefaults.ownerGroupFollowPattern',
+      'botDefaults.ownerGroupFollowName', 'botDefaults.ownerGroupFollowDescription', 'botDefaults.ownerGroupFollowAny',
+      'botDefaults.ownerGroupFollowContains', 'botDefaults.ownerGroupFollowStartsWith',
+      'botDefaults.ownerGroupFollowEndsWith', 'botDefaults.ownerGroupFollowRegex',
+      'botDefaults.ownerGroupFollowCase', 'botDefaults.ownerGroupFollowRemoveRule',
+      'botDefaults.ownerGroupFollowTester', 'botDefaults.ownerGroupFollowTestName', 'botDefaults.ownerGroupFollowTestDescription',
       'botDefaults.groupJoinCommand', 'botDefaults.groupJoinCommandField',
       'botDefaults.workingDirField', 'botDefaults.autoStartJoinPrompt',
     ],
@@ -106,7 +117,12 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'task-routing',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionTaskRouting',
-    fieldKeys: ['botDefaults.taskRoutingEnabled'],
+    fieldKeys: [
+      'botDefaults.taskRoutingEnabled',
+      'botDefaults.taskRoutingCostTier',
+      'botDefaults.taskRoutingStrengths',
+      'botDefaults.taskRoutingLimitations',
+    ],
   },
   {
     id: 'substitute',
@@ -237,6 +253,15 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.quotaFallbackEnabled', 'botDefaults.quotaFallbackTarget', 'botDefaults.quotaFallbackMessage',
       'botDefaults.quotaFallbackKindUsage', 'botDefaults.quotaFallbackKindRate',
+    ],
+  },
+  {
+    id: 'quota-fallback-chain',
+    tab: 'advanced',
+    titleKey: 'botDefaults.quotaFallbackChainTitle',
+    tile: 'quota-fallback',
+    fieldKeys: [
+      'botDefaults.quotaFallbackChainEnabled', 'botDefaults.quotaFallbackChainSteps',
     ],
   },
   {
@@ -533,6 +558,11 @@ export type BotDefaultsRow = {
     targetAppId: string;
     kinds: Array<'usage' | 'rate'>;
     message: string;
+  } | null;
+  quotaFallbackChain?: {
+    enabled: true;
+    kinds: Array<'usage' | 'rate'>;
+    steps: Array<{ cliId: string; model?: string }>;
   } | null;
   online?: boolean;
   startupBlocked?: {
