@@ -396,6 +396,67 @@ describe('Ask inside the running reply card', () => {
     expect(replyCardAskTarget(group, { ...input, rootMessageId: 'om_other_thread' }, origin)).toBeUndefined();
   });
 
+  // The reply card is re-rendered from server state on every progress/phase/tool PATCH, and
+  // Feishu replaces the whole card: anything that lives only in the client until Submit is lost.
+  const runningDs = () => ({ larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
+    session: { sessionId: 'sid', rootMessageId: 'om_root' } } as DaemonSession);
+  const xyz = [{ key: 'x', label: 'X' }, { key: 'y', label: 'Y' }, { key: 'z', label: 'Z' }];
+
+  it.each([
+    ['带默认勾选的单选', { questions: [{ prompt: 'Which?', allowCustom: false, multiSelect: false, defaultSelectedKeys: ['x'], options: xyz }] }],
+    ['多选', { questions: [{ prompt: 'Which?', allowCustom: false, multiSelect: true, options: xyz }] }],
+    ['可写备注的单选', { originKind: 'hook', questions: [{ prompt: 'Which?', multiSelect: false, options: xyz }] }],
+    ['两道单选', { questions: [input.questions[0], { ...input.questions[0], prompt: '再确认一次？' }] }],
+  ] as Array<[string, Partial<CreateAskInput>]>)('表单式提问（%s）不嵌进会被刷新的回复卡', (_shape, overrides) => {
+    expect(replyCardAskTarget(runningDs(), { ...input, ...overrides }, { originTurnId: 'om_turn' })).toBeUndefined();
+  });
+
+  it('回复卡刷新进度时，用户在表单上还没提交的勾选和备注不受影响', async () => {
+    const formAsk: CreateAskInput = { ...input, originKind: 'hook',
+      questions: [{ prompt: 'Which?', multiSelect: true, defaultSelectedKeys: ['x'], options: xyz }] };
+    const replyCardTarget = replyCardAskTarget(runningDs(), formAsk, { originTurnId: 'om_turn' });
+    let askCard = '';
+    vi.mocked(replyMessage).mockImplementation(async (_app, _root, content) => { askCard = content; return 'om_ask'; });
+    const patched: string[] = [];
+    vi.mocked(updateMessage).mockImplementation(async (_app, id, content) => { patched.push(id); body = content; });
+    const answer = registerAsk({ ...formAsk, replyCardTarget });
+    const id = _allAskIds().at(-1)!;
+    await vi.waitFor(() => expect(getAskSnapshot(id)?.cardMessageId).toBe('om_ask'));
+    await Promise.allSettled([...publishing]);
+
+    // While the user unticks X, ticks Y and Z and writes a note on the client, the turn reports progress.
+    await store.update(key, { kind: 'progress', text: 'background step done' }, io);
+    await store.update(key, { kind: 'progress', text: 'another step' }, io);
+    expect(patched.length).toBeGreaterThan(0);
+    expect(patched.every(messageId => messageId === 'om_reply')).toBe(true);
+    expect(store.read(key)?.asks).toBeUndefined();
+
+    // The form the user is editing was never re-rendered, so Submit carries their draft.
+    const nodes = cardNodes(JSON.parse(askCard));
+    const submit = nodes.find((n: any) => n.tag === 'button' && n.form_action_type === 'submit');
+    const value = submit.value ?? submit.behaviors?.find((b: any) => b.type === 'callback')?.value;
+    const checkerNames = nodes.filter((n: any) => n.tag === 'checker').map((n: any) => n.name);
+    const noteName = nodes.find((n: any) => n.tag === 'input')?.name;
+    const response = await handleAskCardAction({ operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_ask' },
+      action: { value, form_value: { [checkerNames[0]]: false, [checkerNames[1]]: true, [checkerNames[2]]: true, [noteName]: '下午再做' } } },
+    { larkAppId: 'app', requestGrant: () => 'unavailable' });
+    await (response as { afterAck?: () => Promise<void> })?.afterAck?.();
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [['y', 'z']], notes: ['下午再做'] });
+  });
+
+  it.each([
+    ['一键单选', input],
+    ['权限确认', { ...input, originKind: 'hook', questions: [{ prompt: '允许执行 rm -rf build 吗？', allowCustom: false, multiSelect: false,
+      options: [{ key: 'allow', label: '允许' }, { key: 'deny', label: '拒绝' }] }] }],
+  ] as Array<[string, CreateAskInput]>)('点一下就答完的提问（%s）仍嵌在回复卡里', async (_shape, oneClick) => {
+    const replyCardTarget = replyCardAskTarget(runningDs(), oneClick, { originTurnId: 'om_turn' });
+    expect(replyCardTarget).toEqual({ turnId: 'om_turn' });
+    const { snapshot, answer } = await ask({ ...oneClick, replyCardTarget });
+    expect(store.read(key)?.asks?.map(entry => entry.ask.askId)).toEqual([snapshot.askId]);
+    await click(snapshot, { action: 'ask_select', key: oneClick.questions[0]!.options[0]!.key });
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [[oneClick.questions[0]!.options[0]!.key]] });
+  });
+
   it('keeps sandbox Ask standalone even when the daemon can read an old unified card', async () => {
     const ds = { larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
       session: { sessionId: 'sid', rootMessageId: 'om_root', sandbox: true } } as DaemonSession;

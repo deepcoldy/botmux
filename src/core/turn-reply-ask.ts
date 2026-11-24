@@ -9,17 +9,24 @@ import type { DaemonSession } from './types.js';
 import { patchReplyCardWithAuditRedaction, replyCardSandboxBlocked } from './turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal, type TurnReplyCardTransport } from '../services/turn-reply-card.js';
 import { buildTurnReplyCard, replyCardPresentation } from '../im/lark/turn-reply-card.js';
+import { askPresentation, type AskPresentation } from '../im/lark/ask-card-look.js';
 import { MessageWithdrawnError, replyMessage, sendMessage, uploadFile } from '../im/lark/client.js';
 import { patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
 import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
 
+/** Ask presentations that hold nothing on the client between clicks: one click answers
+ * (`quick`), or the answer is a chat reply (`text_reply`). */
+const DRAFTLESS_PRESENTATIONS: ReadonlySet<AskPresentation> = new Set(['quick', 'text_reply']);
+
 /** Only the authenticated, currently running turn can admit an inline Ask.
- * Input forms stay standalone: streaming progress patches would erase client drafts.
+ * Only draftless asks are embedded: the reply card is re-PATCHed from server state on every
+ * progress/phase/tool update, and Feishu replaces the whole card, so unsubmitted ticks and notes
+ * of a form (choice or input) would be reset. Forms are sent as their own card instead.
  * Large choice sets retain standalone presentation without truncation.
  * A mention needs a new message: an inline Ask arrives by PATCH, which never notifies. */
 export function replyCardAskTarget(
   ds: DaemonSession | undefined,
-  input: Pick<CreateAskInput, 'sessionId' | 'larkAppId' | 'chatId' | 'rootMessageId' | 'questions' | 'mentionedOpenId'>,
+  input: Pick<CreateAskInput, 'sessionId' | 'larkAppId' | 'chatId' | 'rootMessageId' | 'questions' | 'mentionedOpenId' | 'originKind'>,
   origin: { originTurnId?: unknown; originDispatchAttempt?: unknown },
 ): CreateAskInput['replyCardTarget'] {
   const sameAnchor = ds && ((ds.scope ?? ds.session.scope) === 'chat'
@@ -29,7 +36,7 @@ export function replyCardAskTarget(
     || input.sessionId !== ds.session.sessionId || input.larkAppId !== ds.larkAppId || input.chatId !== ds.chatId
     || !sameAnchor
     || input.mentionedOpenId
-    || input.questions.some(q => q.input)
+    || !DRAFTLESS_PRESENTATIONS.has(askPresentation(input))
     || input.questions.reduce((sum, q) => sum + q.options.length, 0) > 16
     || Buffer.byteLength(JSON.stringify(input.questions), 'utf8') > 3000) return undefined;
   if (replyCardSandboxBlocked(ds)) return undefined;
