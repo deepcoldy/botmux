@@ -38,7 +38,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
-import type { BytedcliGrantRegion, BytedcliRegionState, BytedcliRegionStates } from '../platform/bytedcli-grant-regions.js';
+import type { BytedcliGrantRegion, BytedcliPublishedRegionState, BytedcliPublishedRegionStates } from '../platform/bytedcli-grant-regions.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import { GIT_CONFIG_PAIR_ENV_KEY, isCliIdentityPath } from '../utils/child-env.js';
 import { resolveEntrySpawn } from './self-spawn.js';
@@ -592,7 +592,7 @@ export interface BytedCliIdentity extends TurnBound {
   /** Who was asked for {@link regionalCloudJwts}; only shapes the refusal
    *  text for a missing region. See {@link BytedcliRegionalJwtSource}. */
   regionalCloudJwtSource?: BytedcliRegionalJwtSource;
-  regionalCloudJwtStates?: BytedcliRegionStates;
+  regionalCloudJwtStates?: BytedcliPublishedRegionStates;
   /** This proven publication can ask the platform again within the turn. */
   retryRegionalCloudJwts?: true;
   /** See {@link LarkCliIdentity.openId}. */
@@ -755,11 +755,12 @@ const BYTEDCLI_REGIONAL_STATE_VARS: Record<BytedcliRegion, string> = {
   cn: 'BOTMUX_IDENTITY_REGIONAL_STATE_CN',
 };
 const BYTEDCLI_REGIONAL_RETRY_VAR = 'BOTMUX_IDENTITY_REGIONAL_RETRY';
-const BYTEDCLI_REGION_STATE_HINTS: Partial<Record<BytedcliRegionState, string>> = {
+const BYTEDCLI_REGION_STATE_HINTS: Partial<Record<BytedcliPublishedRegionState, string>> = {
   not_authorized: '发起人尚未授权这个站点，请前往平台凭据页授权后发一条新消息再试。',
   reauth_required: '发起人在这个站点的授权已失效，请前往平台凭据页重新授权后发一条新消息再试。',
   pending: '平台仍在签发这个分区的凭据。',
   failed: '平台本次未能签发这个分区的凭据。',
+  retry_exhausted: '本轮这个分区的补票已达上限，请发一条新消息再试；若仍缺票，请检查平台凭据页的站点授权。',
 };
 const BYTEDCLI_REGIONAL_MISSING_HINTS: Record<BytedcliRegionalJwtSource, string> = {
   local: '本机为发起人签票时没有签到这个分区的票：bytedcli 的登录按站点分开保存，本机的按人授权只登录了默认站点，发起人没在该站点另外登录过就签不出；也可能发起人没有该分区权限，或这次签票失败。可让 bot 改用平台授权（平台凭据页可为海外站点单独授权）。本轮内重试拿不到新票，处理后发一条新消息再试。',
@@ -895,7 +896,7 @@ function bytedcliRegionalSelection(): string[] {
     ...stateHints,
     '    esac',
     '    case "$__botmux_state" in',
-    '      not_authorized|reauth_required) ;;',
+    '      not_authorized|reauth_required|retry_exhausted) ;;',
     `      pending|failed) if [ -n "$${BYTEDCLI_REGIONAL_RETRY_VAR}" ] && [ "$__botmux_region" != cn ]; then`,
     `        __botmux_hint="$__botmux_hint"${shellSingleQuote(retryHint)}`,
     '      else',

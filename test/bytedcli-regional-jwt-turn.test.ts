@@ -42,7 +42,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
   beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.test/local-lark-device' })),
 }));
 
-const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+const { publishTurnCliIdentity, retryMissingRegionalGrant } = await import('../src/core/turn-cli-identity.js');
 const {
   renderIdentityWrapper, IDENTITY_DENIED_EXIT_CODE, recallProvenIdentityContent, forgetProvenIdentityContent,
 } = await import('../src/core/cli-identity.js');
@@ -77,6 +77,8 @@ const REGIONAL_VARIABLES: Record<string, string> = {
 let platform: {
   upToDate: boolean; partitions: Record<string, string[]>;
   defaultRegion?: string;
+  /** Optional per-partition states returned alongside the grant. */
+  regionalStates?: Record<string, string>;
   /** Issue tickets claiming the wrong partition / already expired. */
   wrongClaim?: boolean; expired?: boolean;
   /** This partition's ticket arrives unusable (a value with a line break). */
@@ -120,6 +122,7 @@ beforeEach(() => {
             json: {
               ok: true, tool: b.tool, unionId: who, expiresAt: Date.now() + 3_600_000, variables,
               ...(asked ? { cloudJwtRegions: asked } : {}),
+              ...(asked && platform.regionalStates ? { cloudJwtRegionStates: platform.regionalStates } : {}),
             },
           };
         },
@@ -332,6 +335,124 @@ it('passes only the active global overseas partition to the proven identity reso
   }
   expect(bytedcli('bytecloud', 'list-legacy-vregions', '--site', 'eu-ttp').status).toBe(0);
   expect(resolverArgs()).toBe('bytedcli');
+});
+
+it.each([
+  ['external trigger', 'trg_external'],
+  ['workflow event', 'workflow-event:run-1:1'],
+  ['scheduled fire', 'schedule:abcd1234:12345678-1234-1234-1234-123456789abc'],
+  ['registered background job', 'background:12345678-1234-1234-1234-123456789abc'],
+] as const)('does not offer same-turn regional retries for an unattended %s', async (_label, turnId) => {
+  storageModel = 'proven';
+  platform.regionalStates = { i18n: 'failed' };
+  await publishFor('platform', ALICE, turnId);
+  const body = recallProvenIdentityContent(dir, SESSION, turnId, 'bytedcli')!;
+  expect(body).not.toContain('BOTMUX_IDENTITY_REGIONAL_RETRY');
+  const refused = bytedcli('--site', 'i18n-tt', 'aa', 'query');
+  expectRefused(refused, 'i18n', '平台本次未能签发');
+  expect(refused.stderr).not.toContain('可稍等后重试本命令');
+  await retryMissingRegionalGrant({
+    sessionDataDir: dir, sessionId: SESSION, turnId, region: 'i18n', speakerOpenId: ALICE,
+    currentPolicy: () => botConfig('platform').triggerUserAuth, executionStillCurrent: () => true, waitMs: 1000,
+  });
+  expect(grantBodies).toHaveLength(1);
+});
+
+it('paces regional retries and exhausts only the region that reached its limit', async () => {
+  storageModel = 'proven';
+  platform.regionalStates = { i18n: 'failed', tx: 'failed' };
+  await publishFor('platform', ALICE);
+  let now = Date.now();
+  const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  const retry = (region: 'i18n' | 'tx' = 'i18n') => retryMissingRegionalGrant({
+    sessionDataDir: dir, sessionId: SESSION, turnId: 'om_turn_1', region, speakerOpenId: ALICE,
+    currentPolicy: () => botConfig('platform').triggerUserAuth, executionStillCurrent: () => true, waitMs: 1000,
+  });
+  try {
+    await retry();
+    expect(grantBodies).toHaveLength(2);
+    await retry();
+    expect(grantBodies).toHaveLength(2);
+    now += 9_999;
+    await retry();
+    expect(grantBodies).toHaveLength(2);
+    now += 1;
+    await retry();
+    expect(grantBodies).toHaveLength(3);
+    expect(recallProvenIdentityContent(dir, SESSION, 'om_turn_1', 'bytedcli'))
+      .toContain("BOTMUX_IDENTITY_REGIONAL_STATE_I18N='retry_exhausted'");
+    now += 10_000;
+    await retry();
+    expect(grantBodies).toHaveLength(3);
+
+    // Exhaustion is per region: tx still has its own retry budget and hint.
+    await retry('tx');
+    expect(grantBodies).toHaveLength(4);
+    expectRefused(bytedcli('--site', 'us-ttp', 'aa', 'query'), 'tx', '可稍等后重试本命令');
+    const refused = bytedcli('--site', 'i18n-tt', 'aa', 'query');
+    expectRefused(refused, 'i18n', '补票已达上限');
+    expect(refused.stderr).not.toContain('可稍等后重试本命令');
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+it('finishes regional exhaustion after a policy change suppressed the second response', async () => {
+  storageModel = 'proven';
+  platform.regionalStates = { i18n: 'failed' };
+  await publishFor('platform', ALICE);
+  let livePolicy = botConfig('platform').triggerUserAuth;
+  let now = Date.now();
+  const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  const retry = () => retryMissingRegionalGrant({
+    sessionDataDir: dir, sessionId: SESSION, turnId: 'om_turn_1', region: 'i18n', speakerOpenId: ALICE,
+    currentPolicy: () => livePolicy, executionStillCurrent: () => true, waitMs: 1000,
+  });
+  let release: () => void = () => {};
+  try {
+    await retry();
+    expect(grantBodies).toHaveLength(2);
+    now += 10_000;
+
+    let started!: () => void;
+    const didStart = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let secondGrantCalls = 0;
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => BINDING,
+      resolveUnionId: async (_app, openId) => UNION_IDS[openId] ?? null,
+      requestGrant: async () => {
+        secondGrantCalls++;
+        started();
+        await gate;
+        return { ok: true, value: {
+          tool: 'bytedcli', unionId: 'on_alice', expiresAt: Date.now() + 3_600_000,
+          cloudJwtRegions: ['i18n'], cloudJwtRegionStates: { i18n: 'failed' },
+          variables: { BYTEDCLI_USER_CLOUD_JWT: jwt('cn', 'on_alice') },
+        } };
+      },
+    });
+    const pending = retry();
+    await didStart;
+    livePolicy = botConfig('local').triggerUserAuth;
+    release();
+    await pending;
+    expect(recallProvenIdentityContent(dir, SESSION, 'om_turn_1', 'bytedcli'))
+      .toContain("BOTMUX_IDENTITY_REGIONAL_STATE_I18N='failed'");
+
+    livePolicy = botConfig('platform').triggerUserAuth;
+    now += 10_000;
+    await retry();
+    expect(secondGrantCalls).toBe(1);
+    expect(recallProvenIdentityContent(dir, SESSION, 'om_turn_1', 'bytedcli'))
+      .toContain("BOTMUX_IDENTITY_REGIONAL_STATE_I18N='retry_exhausted'");
+    const refused = bytedcli('--site', 'i18n-tt', 'aa', 'query');
+    expectRefused(refused, 'i18n', '补票已达上限');
+    expect(refused.stderr).not.toContain('可稍等后重试本命令');
+  } finally {
+    release();
+    clock.mockRestore();
+  }
 });
 
 // Only a locally minted identity held by the daemon (proven) is renewed mid-turn.

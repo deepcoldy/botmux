@@ -558,6 +558,7 @@ function writeProvenPlatformIdentity(
   const { sessionDataDir, sessionId, turnId, senderOpenId } = context;
   if (identity.tool !== 'bytedcli' || 'mode' in identity
     || identity.regionalCloudJwtSource !== 'platform'
+    || isUnattendedIdentityTurnId(turnId)
     || BYTEDCLI_OVERSEAS_REGIONS.every(region => identity.regionalCloudJwts?.[region])) {
     writeSessionIdentity(sessionDataDir, sessionId, identity, 'proven');
     return;
@@ -593,7 +594,7 @@ export async function retryMissingRegionalGrant(args: {
   if (!entry || entry.identity.regionalCloudJwts?.[region]
     || (args.speakerOpenId !== undefined && args.speakerOpenId !== entry.senderOpenId)) return;
   const state = entry.identity.regionalCloudJwtStates?.[region];
-  if (state === 'not_authorized' || state === 'reauth_required') return;
+  if (state === 'not_authorized' || state === 'reauth_required' || state === 'retry_exhausted') return;
 
   const stillAllowed = () => {
     if (current() !== entry.snapshot || readCliAuthEpoch(entry.senderOpenId) !== entry.authEpoch
@@ -610,11 +611,38 @@ export async function retryMissingRegionalGrant(args: {
     attempt = { count: 0, retryAfter: 0 };
     entry.attempts.set(region, attempt);
   }
-  if (!attempt.inFlight) {
-    if (attempt.count >= REGIONAL_GRANT_MAX_ATTEMPTS || Date.now() < attempt.retryAfter) return;
-    attempt.count++;
-    const active = attempt;
-    attempt.inFlight = (async () => {
+  const active = attempt;
+  const commit = (identity: BytedCliIdentity) => {
+    writeSessionIdentity(sessionDataDir, sessionId, identity, 'proven');
+    const replacement = current()!;
+    regionalGrantPublications.delete(entry.snapshot);
+    entry.snapshot = replacement;
+    entry.identity = identity;
+    regionalGrantPublications.set(replacement, entry);
+  };
+  const commitExhausted = () => {
+    if (active.count < REGIONAL_GRANT_MAX_ATTEMPTS || entry.identity.regionalCloudJwts?.[region]) return;
+    const state = entry.identity.regionalCloudJwtStates?.[region];
+    if (state === 'retry_exhausted' || state === 'not_authorized' || state === 'reauth_required') return;
+    if (!publicationValid(stillAllowed)) return;
+    // The retry flag is shared by all regions. Keep it for their remaining
+    // attempts and mark only this exhausted region terminal. This local cleanup
+    // is retryable: a policy change may have suppressed the request's finally.
+    try {
+      commit({
+        ...entry.identity,
+        regionalCloudJwtStates: { ...entry.identity.regionalCloudJwtStates, [region]: 'retry_exhausted' },
+      });
+    } catch { /* keep the old identity; a later capped call can retry this cleanup */ }
+  };
+  if (!active.inFlight) {
+    if (active.count >= REGIONAL_GRANT_MAX_ATTEMPTS) {
+      commitExhausted();
+      return;
+    }
+    if (Date.now() < active.retryAfter) return;
+    active.count++;
+    active.inFlight = (async () => {
       const grant = await resolvePlatformIdentity({
         botConfig: entry.botConfig, tool: 'bytedcli', unionId: entry.unionId,
         sessionId, turnId, cloudJwtRegions: [region],
@@ -622,31 +650,30 @@ export async function retryMissingRegionalGrant(args: {
       if (grant.state !== 'granted' || grant.identity.tool !== 'bytedcli' || !stillAllowed()) return;
       const jwt = grant.identity.regionalCloudJwts?.[region];
       const reportedState = grant.identity.regionalCloudJwtStates?.[region];
-      const nextState = jwt ? 'minted' : reportedState === 'minted' ? 'failed' : reportedState;
+      const nextState = jwt ? 'minted'
+        : reportedState === 'not_authorized' || reportedState === 'reauth_required' ? reportedState
+          : active.count >= REGIONAL_GRANT_MAX_ATTEMPTS ? 'retry_exhausted'
+            : reportedState === 'minted' ? 'failed' : reportedState;
       if (!jwt && !nextState) return;
       // Read the latest identity at commit: another partition may have
       // finished while this request was in flight.
-      const merged = {
+      const merged: BytedCliIdentity = {
         ...entry.identity,
         ...(jwt ? { regionalCloudJwts: { ...entry.identity.regionalCloudJwts, [region]: jwt } } : {}),
         regionalCloudJwtStates: { ...entry.identity.regionalCloudJwtStates, [region]: nextState },
       };
-      writeSessionIdentity(sessionDataDir, sessionId, merged, 'proven');
-      const replacement = current()!;
-      regionalGrantPublications.delete(entry.snapshot);
-      entry.snapshot = replacement;
-      entry.identity = merged;
-      regionalGrantPublications.set(replacement, entry);
+      commit(merged);
     })().catch(() => {
       logger.warn(`[trigger-user-auth] bytedcli regional grant retry failed for partition ${region}`);
     }).finally(() => {
+      commitExhausted();
       active.retryAfter = Date.now() + REGIONAL_GRANT_RETRY_INTERVAL_MS;
       active.inFlight = undefined;
     });
   }
   if (args.waitMs <= 0) return;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  await Promise.race([attempt.inFlight, new Promise<void>(resolve => { timer = setTimeout(resolve, args.waitMs); })]);
+  await Promise.race([active.inFlight, new Promise<void>(resolve => { timer = setTimeout(resolve, args.waitMs); })]);
   clearTimeout(timer);
 }
 

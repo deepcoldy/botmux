@@ -67,7 +67,7 @@ describe('requestCredentialGrant', () => {
       ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(),
       variables: { BYTEDCLI_USER_CLOUD_JWT: 'default-jwt' },
       cloudJwtRegions: ['i18n'],
-      cloudJwtRegionStates: { i18n: 'pending', tx: 'unknown-state', misspelled: 'failed' },
+      cloudJwtRegionStates: { i18n: 'pending', i18nbd: 'retry_exhausted', tx: 'unknown-state', misspelled: 'failed' },
     } }]);
     const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli', cloudJwtRegions: ['i18n'] }, { binding: BINDING, http });
     expect(calls[0]!.body).toMatchObject({ cloudJwtRegions: ['i18n'] });
