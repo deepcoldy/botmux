@@ -58,6 +58,13 @@ vi.mock('node:os', async (importOriginal) => {
   return { ...orig, homedir: () => homeDir };
 });
 
+const capMock = vi.hoisted(() => ({ clearNotices: null as null | ReturnType<typeof vi.fn> }));
+vi.mock('../src/core/capability-authorization.js', () => {
+  const clearNotices = vi.fn();
+  capMock.clearNotices = clearNotices;
+  return { clearAuthorizationNoticesForUser: clearNotices };
+});
+
 const APP = 'cli_revokeapp0001';
 const ALICE = 'ou_aliceauth000000000001';
 const BOB = 'ou_bobauth000000000002';
@@ -127,6 +134,16 @@ function plantStores() {
 }
 
 describe('revokeTriggerUserAuth', () => {
+  it('clears creation-offer and lapse dedup records for the revoked user so the next auth prompt is not suppressed', async () => {
+    plantStores();
+    const { revoke } = await loadRevoke();
+    await revoke.revokeTriggerUserAuth({
+      openId: ALICE, appId: APP, brand: 'feishu', sessionDataDir: join(homeDir, 'sessions'),
+    });
+    expect(capMock.clearNotices).toHaveBeenCalledTimes(1);
+    expect(capMock.clearNotices).toHaveBeenCalledWith(ALICE);
+  });
+
   it('logs out then deletes only that person, and a second call is a no-op success', async () => {
     plantStores();
     const { revoke } = await loadRevoke();

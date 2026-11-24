@@ -24,10 +24,23 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
   describeBytedcliAuth: vi.fn(async (openId: string) => ({ state: bytedcliJwts.has(openId) ? 'authorized' : 'needs-login' })),
 }));
 const meegoLoggedIn = new Set<string>();
+// Explicit event bus for the mocked module: vi.mock's importOriginal spread does not preserve
+// the real module's listener-set closure, so the cap-side subscription wiring needs its own bus.
+const meegoCompletionBus = vi.hoisted(() => {
+  const listeners = new Set<(openId: string) => void>();
+  return {
+    listeners,
+    emit: (openId: string) => { for (const listener of [...listeners]) listener(openId); },
+  };
+});
 vi.mock('../src/services/meego-auth.js', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   requestMeegoLogin: vi.fn(async (openId: string) => meegoLoggedIn.has(openId)
     ? { state: 'ready' } : { state: 'link', authUrl: 'https://meego.example.test/device' }),
+  onMeegoBackgroundLoginCompleted: (listener: (openId: string) => void) => {
+    meegoCompletionBus.listeners.add(listener);
+    return () => { meegoCompletionBus.listeners.delete(listener); };
+  },
 }));
 vi.mock('../src/services/lark-cli-auth.js', () => ({
   resolveLarkCliHomeForTurn: vi.fn(async () => null),
@@ -463,6 +476,20 @@ describe('unattended turns (scheduled and background)', () => {
       expect(await asked('meego', { caps: ['meego'] })).toBe('delivered');
       expect(send).toHaveBeenCalledTimes(2);
       expect(send.mock.calls[1][1]).toContain('https://meego.example.test/device-post-revoke');
+    });
+
+    it('a background Meego completion event clears lapse dedup, so a fast re-lapse is notified again within the 1h window', async () => {
+      await asked('meego', { caps: ['meego'] });
+      expect(send).toHaveBeenCalledTimes(1);
+
+      // The real poller fires this event when the browser approval lands; the module-level
+      // subscription in capability-authorization must drop the Meego lapse/offer records.
+      later(5 * 60_000);
+      meegoCompletionBus.emit(ALICE);
+      vi.mocked(requestMeegoLogin).mockResolvedValueOnce({ state: 'link', authUrl: 'https://meego.example.test/device-relapse' } as any);
+      expect(await asked('meego', { caps: ['meego'] })).toBe('delivered');
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(send.mock.calls[1][1]).toContain('https://meego.example.test/device-relapse');
     });
 
     it('lark-user lapses use the same notice', async () => {

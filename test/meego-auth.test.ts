@@ -22,7 +22,7 @@ const loadedModules: Array<{ stopAllMeegoPollers: () => void }> = [];
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-meego-auth-'));
-  for (const key of ['HOME', 'PATH', 'STUB_DIR', 'STUB_FAIL', 'STUB_COMPLETE_FAIL', 'STUB_EXPIRED', 'BYTEDCLI_MEEGO_TENANT']) saved[key] = process.env[key];
+  for (const key of ['HOME', 'PATH', 'STUB_DIR', 'STUB_FAIL', 'STUB_COMPLETE_FAIL', 'STUB_EXPIRED', 'STUB_SWAP_TOKEN', 'BYTEDCLI_MEEGO_TENANT']) saved[key] = process.env[key];
   process.env.HOME = join(dir, 'home');
   mkdirSync(process.env.HOME);
   const bin = join(dir, 'bin');
@@ -49,6 +49,7 @@ beforeEach(() => {
     `    printf '{"status":"success","data":{"verification_uri_complete":"https://meego.example/device?code=%s-%s","complete_token":"${COMPLETE_TOKEN}","qr_image_path":"%s"}}\\n' "$who" "$n" "$TMPDIR/bytedcli/meego-login-$n/qr.png" ;;`,
     '  "login --complete")',
     '    [ -z "$STUB_COMPLETE_FAIL" ] || { echo \'{"status":"error","error":{"code":"NETWORK"}}\'; exit 1; }',
+    '    if [ -n "$STUB_SWAP_TOKEN" ]; then cp "$STUB_DIR/c2-challenge" "$HOME/.botmux-meego-challenge"; fi',
     '    [ -z "$STUB_EXPIRED" ] || { echo \'{"status":"success","data":{"login_status":"expired"}}\'; exit 0; }',
     `    [ "$3" = ${COMPLETE_TOKEN} ] || { echo '{"status":"error","error":{"code":"MEEGO_LOGIN_CHALLENGE_INVALID"}}'; exit 1; }`,
     '    if [ -f "$STUB_DIR/approved-$who" ]; then',
@@ -65,6 +66,7 @@ beforeEach(() => {
   delete process.env.STUB_FAIL;
   delete process.env.STUB_COMPLETE_FAIL;
   delete process.env.STUB_EXPIRED;
+  delete process.env.STUB_SWAP_TOKEN;
 });
 afterEach(() => {
   for (const mod of loadedModules.splice(0)) mod.stopAllMeegoPollers();
@@ -353,6 +355,31 @@ describe('background completion poller', () => {
     vi.advanceTimersByTime(60_000);
     await settleRealIo();
     expect(completeCalls('').length).toBe(afterExpired);
+  });
+
+  it('never erases a newer challenge another daemon minted while a background poll was in flight', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(new Date('2026-11-24T01:00:00Z'));
+    const m = await load();
+
+    await m.requestMeegoLogin(ALICE);
+    const home = m.meegoHomeFor(ALICE);
+    const challengePath = join(home, '.botmux-meego-challenge');
+    const first = JSON.parse(readFileSync(challengePath, 'utf8'));
+
+    // Another daemon mints a second challenge into the same per-user home while
+    // our --complete is in flight; the stub swaps the file before reporting expiry.
+    writeFileSync(join(dir, 'c2-challenge'), JSON.stringify({
+      token: 'c2-token', authUrl: 'https://meego.example/device-c2', createdAt: Date.now(),
+    }), { mode: 0o600 });
+    process.env.STUB_SWAP_TOKEN = '1';
+    process.env.STUB_EXPIRED = '1';
+    vi.advanceTimersByTime(3_000);
+    await settleRealIo(120);
+
+    const onDisk = JSON.parse(readFileSync(challengePath, 'utf8'));
+    expect(onDisk.token).toBe('c2-token');
+    expect(onDisk.token).not.toBe(first.token);
   });
 
   it('backs off polling cadence across 2m / 5m windows and stops before the 25m TTL boundary', async () => {
