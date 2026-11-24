@@ -7529,6 +7529,7 @@ export function TaskRoutingSection(props: { bot: BotDefaultsRow; patchBot: Patch
 
   return (
     <section className="bd-section" data-task-routing-section>
+      <h3 className="bd-section-title">{tr('botDefaults.sectionTaskRouting')}</h3>
       <ToggleRow
         checked={current?.enabled === true}
         disabled={busy || ineligible}
