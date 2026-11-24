@@ -18181,21 +18181,35 @@ function stopStartupFailedInputs(): void {
   stopStuckDetector();
   stopSpawnArgvTurnStartFailOpen();
   crashDiagnosticStopped = true;
-  const failed = [...pendingMessages.splice(0), ...inflightInputs.takeCarryOver(), ...inflightInputs.takeStartedCarryOver()];
-  pendingRawInputs.length = 0;
+  const queued = pendingMessages.splice(0);
+  // Tokened activations still belong to the daemon's durable journal. These
+  // queues contain unwritten inputs only: retain their exact payload/token
+  // for the next authorized restart, never fabricate a submission ACK or let
+  // a newer ordinary message overtake the opening.
+  pendingMessages.push(...queued.filter(item => item.queuedActivationToken));
+  const carried = [...inflightInputs.takeCarryOver(), ...inflightInputs.takeStartedCarryOver()];
+  const activationNeedsReconciliation = carried.some(item => item.queuedActivationToken);
+  const failed = [...queued.filter(item => !item.queuedActivationToken), ...carried];
+  const rawActivations = pendingRawInputs.filter(item => item.queuedActivationToken);
+  pendingRawInputs.splice(0, pendingRawInputs.length, ...rawActivations);
   let terminalSendFailed = false;
   for (const item of failed) {
-    if (item.turnId && item.dispatchAttempt === undefined) {
+    if (item.turnId && item.dispatchAttempt === undefined && !item.queuedActivationToken) {
       try {
         emitTurnTerminal(item.turnId, 'failed', 'cli_startup_failed', undefined, undefined, false);
       } catch { terminalSendFailed = true; }
     }
   }
   log(`Startup circuit stopped ${failed.length} pending/in-flight input(s)`);
-  if (terminalSendFailed) {
-    // Do not retry a commit-unknown terminal or revive its input. Hand the
-    // unacknowledged outcomes to the daemon's worker-exit reconciliation.
-    void sendFatalWorkerErrorAndExit(new Error('Startup circuit terminal publication failed'));
+  if (terminalSendFailed || activationNeedsReconciliation) {
+    // A tokened carry-over may still be awaiting its adapter's submission
+    // result. Neither drop its owner nor blindly replay a possibly committed
+    // write in this live worker. Exit so the existing worker-loss / exact
+    // activation journal recovery owns the next attempt. The same boundary
+    // reconciles commit-unknown ordinary terminal publication.
+    void sendFatalWorkerErrorAndExit(new Error(activationNeedsReconciliation
+      ? 'Startup circuit activation submission requires reconciliation'
+      : 'Startup circuit terminal publication failed'));
   }
 }
 

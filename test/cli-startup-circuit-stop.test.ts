@@ -117,6 +117,24 @@ describe('startup circuit stops the exact failed input batch', () => {
     expect(h.scope.crashDiagnosticStopped).toBe(true);
   });
 
+  it('retains unsubmitted tokened activation inputs across the circuit and the next coordinated restart', async () => {
+    const h = harness();
+    const raw = { content: '/goal original', turnId: 'opening', queuedActivationToken: 'raw-token' };
+    const opening = { ...item('text-opening'), queuedActivationToken: 'text-token' };
+    h.scope.pendingRawInputs.push(raw, { content: '/help', turnId: 'ordinary-raw' });
+    h.scope.pendingMessages.push(opening, item('ordinary'));
+    await h.stop();
+    expect(h.scope.pendingRawInputs).toEqual([raw]);
+    expect(h.scope.pendingMessages).toEqual([opening]);
+    expect(h.terminals.map(t => t.turnId)).toEqual(['ordinary']);
+    expect(h.scope.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'queued_activation_submitted' }));
+    await h.restart();
+    await vi.runAllTimersAsync();
+    expect(h.scope.spawnCli).toHaveBeenCalledOnce();
+    expect(h.scope.pendingRawInputs).toEqual([raw]);
+    expect(h.scope.pendingMessages).toEqual([opening]);
+  });
+
   it('keeps an acknowledged manual cancellation terminal, without replaying or failing that turn again', async () => {
     const h = harness();
     h.scope.inflightInputs.onWrite(item('cancelled'));

@@ -53,6 +53,23 @@ worker，交 daemon 的既有 worker-exit 路径继续对账。
 也不能覆盖这次失败状态。修复安装或配置后，同话题的新消息开启新的有界尝试，不再暗中重放
 已失败的队列；显式 `/restart` 仍按既有语义工作。
 
+### 未提交开场任务的恢复
+
+带 `queuedActivationToken` 的未写入 raw/普通开场输入仍由持久 activation journal
+持有；熔断不能把它们当成 ordinary 输入清空，也不能伪造 `queued_activation_submitted`。
+worker 保留原 payload/token，daemon 保留 `pendingRawInput` 和 ACK gate。
+后续新消息先持久追加到 activation tail，再通过已有 restart coordinator 唤醒已停 CLI。
+并发到达由同一 attempt 合并；落盘失败不得发送重启，重启发送失败保留 journal 和失败标记。
+新一轮只有真正的 adapter submission ACK 才能释放后继，不能让恢复消息越过原开场输入。
+若 tokened 开场输入已经进入 in-flight/carry-over、但 adapter 的结果尚未返回，
+熔断不在原 worker 盲目重放：退出该 worker，交既有 worker-exit 与 exact activation journal
+处理下一次输入触发的恢复，避免既没有 ACK 又没有可执行恢复所有者。
+关闭/暂停及转移中的会话不能由这条入口重新拉起。
+
+CLI 物理退出不撤销已经送达的任务结果：没有新输入时仍保留 `delivered`；
+后来的输入使旧结果失效时才投影为中断。既有 attention 仍优先于已交付结果。
+跨 runtime 的物理退出仍要求可信 producer/channel；本次只补这条已有边界的回归。
+
 `observe` 继续使用 schema v1 已有字段：`turn=interrupted`、
 `task.kind=needs_you`、`task.reason=interrupted`，原因通过 attention/detail 给出。
 `liveness=alive` 仍只表示桥接 worker 存活，不表示 CLI 正在工作。

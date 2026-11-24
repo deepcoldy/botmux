@@ -396,6 +396,16 @@ describe('session-observe task block', () => {
     })).toEqual({ kind: 'idle' });
   });
 
+  it('keeps delivered after a physical CLI exit, but reports interrupted for a new undelivered input', () => {
+    const row: Partial<RawSessionRow> = { status: 'interrupted', lastMessageAt: OBSERVED_AT - 60_000,
+      lastTurn: { turnId: 't1', outcome: 'delivered', at: OBSERVED_AT - 30_000 } };
+    expect(task(row)).toEqual({ kind: 'delivered', at: OBSERVED_AT - 30_000 });
+    expect(task({ ...row, lastMessageAt: OBSERVED_AT - 10_000 }))
+      .toEqual({ kind: 'needs_you', reason: 'interrupted' });
+    expect(task({ ...row, agentAttention: { kind: 'blocked', reason: 'delivery needs intervention', at: OBSERVED_AT } }))
+      .toMatchObject({ kind: 'needs_you', reason: 'interrupted', detail: 'delivery needs intervention' });
+  });
+
   it('never infers delivered for a session without a recorded turn', () => {
     expect(task({ status: 'idle' })).toEqual({ kind: 'idle' });
     expect(task({ status: 'dormant', workerPid: undefined })).toEqual({ kind: 'idle' });

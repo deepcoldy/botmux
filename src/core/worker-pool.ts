@@ -18713,6 +18713,21 @@ export function admitQueuedActivationTail(
     ds.session.queuedActivationTail = priorTail;
     throw err;
   }
+  // A stopped CLI cannot produce the opening ACK by itself. New input now
+  // owns a durable FIFO position, so it may wake the parked process WITHOUT
+  // releasing that ACK gate or sending N+1 ahead of the retained opening.
+  // The coordinator coalesces concurrent arrivals and clears the failure
+  // marker only after restart IPC was sent; persistence/send failures retain
+  // both the journal and a retryable stopped state.
+  if (ds.cliStartupFailureReason && ds.crashDiagnosticParked
+    && ds.session.status === 'active' && ds.worker && !ds.worker.killed
+    && !lifecycleRetiringWorkers.has(ds)) {
+    try {
+      requestSessionRestart(ds, { source: 'cli_crash', notify: () => {} });
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] Startup circuit recovery waits for new input: ${String(err)}`);
+    }
+  }
   return admitted;
 }
 
