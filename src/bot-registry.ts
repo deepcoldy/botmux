@@ -1,4 +1,5 @@
 import { normalizeOwnerGroupFollowConfig, type OwnerGroupFollowConfig } from './services/owner-group-follow-policy.js';
+import { validateSessionGroupCollaborationConfig, type SessionGroupCollaborationConfig } from './services/collab-group-config.js';
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
 import { normalizeMessageListenerReplyMode } from './services/message-listener-reply-policy.js';
 import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
@@ -1402,6 +1403,13 @@ export interface VcMeetingRealtimeVoiceConfig {
  * Everything is optional; effective defaults in parentheses.
  */
 export interface SessionGroupConfig {
+  /**
+   * 私聊专属群可视化协作配置（design 2026-11-20-dm-collab-group-design §4）。
+   * 缺省、不存在或非 `{enabled:true}` 都完全关闭（走 legacy 建群）。
+   * parse 时经 `validateSessionGroupCollaborationConfig` 结构校验，仅 `{enabled:true}`
+   * 且结构合法才保留，否则丢弃（安全默认关闭，不被类型断言绕过）。
+   */
+  collaboration?: SessionGroupCollaborationConfig;
   /** Group-name generation. */
   naming?: {
     /**
@@ -4772,9 +4780,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 'group' are meaningful and persist; 'chat' (and anything else)
       // normalizes to undefined so bots.json stays clean.
       p2pMode: entry.p2pMode === 'thread' ? 'thread' : entry.p2pMode === 'group' ? 'group' : undefined,
-      sessionGroup: entry.sessionGroup && typeof entry.sessionGroup === 'object'
-        ? entry.sessionGroup as SessionGroupConfig
-        : undefined,
+      sessionGroup: (() => {
+        const sg = entry.sessionGroup;
+        if (!sg || typeof sg !== 'object' || Array.isArray(sg)) return undefined;
+        const parsed = { ...(sg as Record<string, unknown>) };
+        // 协作配置显式校验：非 {enabled:true} 或结构非法都按关闭丢弃，绝不只靠 `as` 透传。
+        if (parsed.collaboration !== undefined) {
+          const v = validateSessionGroupCollaborationConfig(parsed.collaboration);
+          if (v.ok) parsed.collaboration = v.config;
+          else delete parsed.collaboration;
+        }
+        return parsed as SessionGroupConfig;
+      })(),
       noCardChats: Array.isArray(entry.noCardChats)
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,

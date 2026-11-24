@@ -1229,6 +1229,7 @@ import { isValidAssistantOpenId, resolveAssistantOwnerOpenId, setAssistantOwnerC
 import { getAssistantOwner, markAssistantOwnerLeft, setAssistantOwner } from './services/assistant-owner-store.js';
 import { assistantScheduleCreatorAllowed, assistantSessionStillOwned, isAssistantOwnerOfChat, resolveAssistantSpawn } from './core/assistant-spawn.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
+import { preflightCollabGroupBirth, startCollabGroupBirth, releaseCollabGroupBirth } from './core/collab-group-birth.js';
 import { scheduleSessionGroupTitle, subscribeSessionGroupTitles } from './services/session-group-title.js';
 import { hasPendingGroupAutoTitle, scheduleGroupAutoTitle } from './services/group-auto-title.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
@@ -28079,6 +28080,26 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 是同一个判断——窄于它会退回本 bug，宽于它则会让本该建群的消息不再建群。
     && !declinesSessionGroupBirthAsSlashCommand(data)
   ) {
+    // 协作初始化入口拆分（design §5.2）：preflight 在 creator 扣费**之前**，全程无副作用
+    // 校验 + 原子占位。关闭协作 → legacy（继续下面 maybeBirthSessionGroup 原路径）；
+    // 结构/peer 失败 → DM 明示失败并 return，不扣费、不建群、不开 CLI（fail-closed）；
+    // existing/busy → DM 回执并 return；ready → 记录 admission operation id 后照常扣一次费。
+    const collabPreflight = await preflightCollabGroupBirth(data, ctx);
+    if (collabPreflight.kind === 'failed') {
+      await replyMessage(larkAppId, messageId, tr('sg.collab_failed', { reason: collabPreflight.reason }, localeForBot(larkAppId)), 'text')
+        .catch(() => { /* best-effort notice */ });
+      return;
+    }
+    if (collabPreflight.kind === 'existing') {
+      await replyMessage(larkAppId, messageId, tr('sg.collab_existing', { status: collabPreflight.status }, localeForBot(larkAppId)), 'text')
+        .catch(() => { /* best-effort notice */ });
+      return;
+    }
+    if (collabPreflight.kind === 'busy') {
+      await replyMessage(larkAppId, messageId, tr('sg.collab_busy', {}, localeForBot(larkAppId)), 'text')
+        .catch(() => { /* best-effort notice */ });
+      return;
+    }
     // A quota denial must have zero external side effects. Charge the original
     // DM before creating the real Feishu chat, then mark the rewritten turn so
     // the ordinary pre-worker gate below does not charge it a second time.
@@ -28116,8 +28137,30 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       chatType,
       undefined,
       { promptContent: birthPromptContent, promptAttachments: birthPromptAttachments },
-    )) return;
+    )) {
+      // 扣费被拒（或闸未通过）：preflight 若已占位，释放 DM 占位，避免同 DM 永久 busy。
+      if (collabPreflight.kind === 'ready') {
+        await releaseCollabGroupBirth({
+          dataDir: config.session.dataDir,
+          creatorAppId: larkAppId,
+          initId: collabPreflight.initId,
+          dmChatId: chatId,
+          now: () => Date.now(),
+        }).catch(() => { /* best-effort */ });
+      }
+      return;
+    }
     quotaConsumedBeforeSessionGroupBirth = true;
+    // 协作 ready 走 startCollabGroupBirth（阶段 3 占位，S1–S5 编排 PR-2）；legacy 走原 maybeBirthSessionGroup。
+    if (collabPreflight.kind === 'ready') {
+      const result = await startCollabGroupBirth(data, ctx, collabPreflight.initId, /* creatorAdmissionReceipt */ undefined);
+      // 收到 collab-handled 后不递归 handleNewTopic、不落 DM thread（铁律 1）。
+      if (result.kind === 'collab-handled') return;
+      if (result.kind === 'legacy' && result.ctx) {
+        return handleNewTopic(data, { ...result.ctx, sessionGroupQuotaConsumed: true });
+      }
+      return;
+    }
     const reborn = await maybeBirthSessionGroup(data, ctx);
     if (reborn) return handleNewTopic(data, { ...reborn, sessionGroupQuotaConsumed: true });
   }

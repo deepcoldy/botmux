@@ -1,0 +1,220 @@
+/**
+ * 私聊专属群协作初始化的稳定 source store + CollabInitStore（design §10.1）。
+ *
+ * 文件：`{dataDir}/collab-group-init-{creatorAppId}.json`。同一文件、同次原子写承载
+ * 三份结构：
+ *   - `entries`        initId → entry（永久）
+ *   - `sourceIndex`    sourceKey → initId（**永久**唯一索引）
+ *   - `activeByDmChat` dmChatId → active initId（**临时**在途索引；done/failed/cancelled 释放）
+ *
+ * 所有「读 entry → 判重 → 写 entry」都由 per-app 异步 mutex 串行化；每次写走
+ * tmp + rename + 0600 + fsync（复用 atomic-write.ts 的 durable 模式）。不同 initId
+ * 也不能并发覆盖同一文件。
+ *
+ * 本模块不读 config；`dataDir` 由调用方显式传入（preflight 从 daemon 接缝带入），
+ * 便于测试用临时目录 + 假时钟直接驱动。
+ */
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { AsyncSerialQueue } from '../utils/async-serial-queue.js';
+import type { SessionGroupCollaborationConfig } from './collab-group-config.js';
+
+export const COLLAB_INIT_SCHEMA_VERSION = 1;
+
+export interface CollabInitStore {
+  schemaVersion: number;
+  entries: Record<string, CollabGroupInitEntry>;
+  sourceIndex: Record<string, string>;
+  activeByDmChat: Record<string, string>;
+}
+
+export type CollabInitState = 'running' | 'awaiting-input' | 'done' | 'failed' | 'cancelled';
+export type CollabStepKey = 'create' | 'invite' | 'grants' | 'roles' | 'kickoff';
+export type CollabStepStatus = 'pending' | 'running' | 'done' | 'failed';
+export type CollabOperationKind = 'admission' | 'create' | 'forward' | 'invite' | 'grant' | 'role' | 'kickoff' | 'notice';
+export type CollabOperationStatus = 'planned' | 'attempting' | 'done' | 'unknown' | 'failed';
+
+export interface CollabGroupInitEntry {
+  initId: string;
+  dmChatId: string;
+  sourceMessageId: string;
+  configVersion: string;
+  configSnapshot: SessionGroupCollaborationConfig;
+  creatorAdmissionOperationId: string;
+  creatorAdmissionReceipt?: unknown;
+  chatId?: string;
+  createAttempt: number;
+  state: CollabInitState;
+  awaiting?: { reason: string; operationId?: string; since: number; detail?: unknown };
+  steps: Record<CollabStepKey, { status: CollabStepStatus; at: number; error?: string }>;
+  operations: Record<string, {
+    kind: CollabOperationKind;
+    status: CollabOperationStatus;
+    uuid?: string;
+    firstAttemptAt?: number;
+    payloadHash: string;
+    receipt?: unknown;
+    error?: string;
+  }>;
+  kickoffPending?: Record<string, { appId: string; satisfiedBy?: unknown }>;
+  createdAt: number;
+  updatedAt: number;
+  cancelReason?: string;
+}
+
+/** `{dataDir}/collab-group-init-{creatorAppId}.json`。 */
+export function collabInitFilePath(dataDir: string, creatorAppId: string): string {
+  return join(dataDir, `collab-group-init-${creatorAppId}.json`);
+}
+
+// ─── per-app 异步 mutex（进程内）───────────────────────────────────────────
+
+const queues = new Map<string, AsyncSerialQueue>();
+
+function queueFor(appId: string): AsyncSerialQueue {
+  let q = queues.get(appId);
+  if (!q) {
+    q = new AsyncSerialQueue();
+    queues.set(appId, q);
+  }
+  return q;
+}
+
+/** 仅测试用：清空进程内 mutex（避免跨用例串扰）。 */
+export function __testOnly_resetCollabInitMutexes(): void {
+  queues.clear();
+}
+
+// ─── 读写（数据目录显式传入，不做内存缓存）───────────────────────────────
+
+function emptyStore(): CollabInitStore {
+  return { schemaVersion: COLLAB_INIT_SCHEMA_VERSION, entries: {}, sourceIndex: {}, activeByDmChat: {} };
+}
+
+/** 读盘（不存在/损坏返回空 store，不抛）。 */
+export function readCollabInitStore(dataDir: string, creatorAppId: string): CollabInitStore {
+  const fp = collabInitFilePath(dataDir, creatorAppId);
+  if (!existsSync(fp)) return emptyStore();
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(fp, 'utf-8'));
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return emptyStore();
+    const raw = parsed as Record<string, unknown>;
+    const entries = (raw.entries && typeof raw.entries === 'object' && !Array.isArray(raw.entries)
+      ? raw.entries : {}) as Record<string, CollabGroupInitEntry>;
+    const sourceIndex = (raw.sourceIndex && typeof raw.sourceIndex === 'object' && !Array.isArray(raw.sourceIndex)
+      ? raw.sourceIndex : {}) as Record<string, string>;
+    const activeByDmChat = (raw.activeByDmChat && typeof raw.activeByDmChat === 'object' && !Array.isArray(raw.activeByDmChat)
+      ? raw.activeByDmChat : {}) as Record<string, string>;
+    return {
+      schemaVersion: typeof raw.schemaVersion === 'number' ? raw.schemaVersion : COLLAB_INIT_SCHEMA_VERSION,
+      entries,
+      sourceIndex,
+      activeByDmChat,
+    };
+  } catch {
+    return emptyStore();
+  }
+}
+
+function writeStore(dataDir: string, creatorAppId: string, store: CollabInitStore): void {
+  const fp = collabInitFilePath(dataDir, creatorAppId);
+  mkdirSync(dirname(fp), { recursive: true });
+  atomicWriteFileSync(fp, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600, durable: true });
+}
+
+// ─── 原子占位 / 判重 / 释放 ────────────────────────────────────────────────
+
+export type CollabPlaceResult =
+  | { kind: 'existing'; initId: string; status: string }
+  | { kind: 'busy'; initId: string }
+  | { kind: 'created'; initId: string };
+
+/**
+ * 在 per-app mutex 内完成「读 entry → source/DM 判重 → 写 entry」并原子占位：
+ *   - sourceIndex 命中 → existing（同 sourceKey 重投，永不建第二请求）；
+ *   - activeByDmChat 命中 → busy（同 DM 不同 source 且上一请求活动）；
+ *   - 否则新建 entry（state='running'，永久占 sourceIndex，临时占 activeByDmChat）。
+ *
+ * `now` 由调用方注入（假时钟），不内部调 Date.now()。
+ */
+export function placeCollabGroupInit(opts: {
+  dataDir: string;
+  creatorAppId: string;
+  dmChatId: string;
+  sourceKey: string;
+  initId: string;
+  sourceMessageId: string;
+  configVersion: string;
+  configSnapshot: SessionGroupCollaborationConfig;
+  creatorAdmissionOperationId: string;
+  createAttempt: number;
+  now: number;
+}): Promise<CollabPlaceResult> {
+  return queueFor(opts.creatorAppId).run(async () => {
+    const store = readCollabInitStore(opts.dataDir, opts.creatorAppId);
+
+    if (store.sourceIndex[opts.sourceKey]) {
+      const existingInitId = store.sourceIndex[opts.sourceKey];
+      const entry = store.entries[existingInitId];
+      return { kind: 'existing', initId: existingInitId, status: entry?.state ?? 'running' };
+    }
+
+    const activeInitId = store.activeByDmChat[opts.dmChatId];
+    if (activeInitId && store.entries[activeInitId]) {
+      return { kind: 'busy', initId: activeInitId };
+    }
+
+    store.sourceIndex[opts.sourceKey] = opts.initId;
+    store.activeByDmChat[opts.dmChatId] = opts.initId;
+    store.entries[opts.initId] = {
+      initId: opts.initId,
+      dmChatId: opts.dmChatId,
+      sourceMessageId: opts.sourceMessageId,
+      configVersion: opts.configVersion,
+      configSnapshot: opts.configSnapshot,
+      creatorAdmissionOperationId: opts.creatorAdmissionOperationId,
+      createAttempt: opts.createAttempt,
+      state: 'running',
+      steps: {
+        create: { status: 'pending', at: opts.now },
+        invite: { status: 'pending', at: opts.now },
+        grants: { status: 'pending', at: opts.now },
+        roles: { status: 'pending', at: opts.now },
+        kickoff: { status: 'pending', at: opts.now },
+      },
+      operations: {},
+      createdAt: opts.now,
+      updatedAt: opts.now,
+    };
+    writeStore(opts.dataDir, opts.creatorAppId, store);
+    return { kind: 'created', initId: opts.initId };
+  });
+}
+
+/**
+ * 将某 entry 置为终态（done/failed/cancelled），并释放它占用的 activeByDmChat
+ * 在途索引（仅当该 dmChatId 仍指向此 initId 时）。sourceIndex 永久保留。
+ */
+export function markCollabInitTerminal(opts: {
+  dataDir: string;
+  creatorAppId: string;
+  initId: string;
+  dmChatId: string;
+  state: 'done' | 'failed' | 'cancelled';
+  now: number;
+  cancelReason?: string;
+}): Promise<void> {
+  return queueFor(opts.creatorAppId).run(async () => {
+    const store = readCollabInitStore(opts.dataDir, opts.creatorAppId);
+    const entry = store.entries[opts.initId];
+    if (!entry) return;
+    entry.state = opts.state;
+    entry.updatedAt = opts.now;
+    if (opts.cancelReason !== undefined) entry.cancelReason = opts.cancelReason;
+    if (store.activeByDmChat[opts.dmChatId] === opts.initId) {
+      delete store.activeByDmChat[opts.dmChatId];
+    }
+    writeStore(opts.dataDir, opts.creatorAppId, store);
+  });
+}
