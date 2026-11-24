@@ -2704,6 +2704,11 @@ export type WorkerToDaemonBase =
    * with, the text this worker wrote for this turn. Read before the model
    * starts on it; no stand-in for `native_input_consumed`. */
   | { type: 'prompt_submitted_input'; turnId: string; dispatchAttempt?: number }
+  /** The worker is about to type this turn into the CLI behind the running
+   * turn (type-ahead). Its UserPromptSubmit hook fires while the running turn
+   * is still the managed origin, so the daemon accepts this turn's prompt
+   * context sidecar at claim time as well. */
+  | { type: 'type_ahead_queued'; turnId: string }
   /** Provenance-only signal for a Web Terminal / sandbox hook direct-submit.
    *  Sent unconditionally when the submit hook fires, even when the worker has
    *  no prompt_ready (the exact stuck-after-terminal case this card fix

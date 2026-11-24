@@ -1235,6 +1235,9 @@ const CLOSE_FENCE_WARN_MS = 8_000;
 const TRANSFER_DETACH_FENCE_MS = 3_500;
 // Side answers are capped before rendering to fit the Lark card limit.
 const BTW_ANSWER_MAX_CHARS = 6_000;
+// Claimed type-ahead turns leave the claim list; the cap bounds turns whose
+// hook never claims.
+const TYPE_AHEAD_PROMPT_TURNS_MAX = 32;
 // In-process picker relay (card-handler relay_confirm) runs with no HTTP abort
 // above it — its card ACK already degrades to a background "处理中" toast at 2.5s
 // and the real result is delivered as a visible message. So it can afford a
@@ -22928,6 +22931,21 @@ function setupWorkerHandlers(
           cb.onPromptSubmittedInput?.(ds, msg.turnId, { workerGeneration });
         } catch (err) {
           logger.warn(`[${t}] prompt submission handler failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        break;
+      }
+      case 'type_ahead_queued': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored type_ahead_queued from stale worker generation`);
+          break;
+        }
+        const turnIds = ds.typeAheadPromptTurnIds ?? [];
+        if (!turnIds.includes(msg.turnId)) {
+          ds.typeAheadPromptTurnIds = [...turnIds, msg.turnId].slice(-TYPE_AHEAD_PROMPT_TURNS_MAX);
         }
         break;
       }

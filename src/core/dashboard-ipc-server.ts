@@ -2905,7 +2905,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/prompt-ctx/claim', async (req, res, p
   // hook 不需要、也不应自己提供 turnId——daemon 只认自己的权威值，避免 FIFO 串轮。
   const turnId = ds?.managedTurnOrigin?.turnId;
   if (!turnId) return jsonRes(res, 404, { ok: false, error: 'no_active_turn' });
-  const envelope = claimPromptContext(params.sessionId, turnId, fingerprint, prefix);
+  let envelope = claimPromptContext(params.sessionId, turnId, fingerprint, prefix);
+  // 插话（type-ahead）在排进 CLI 时就触发 hook，此时权威 turnId 仍是正在跑的那一轮；
+  // 再按 worker 报告的排队轮次逐个精确领取。
+  if (!envelope && ds?.typeAheadPromptTurnIds) {
+    for (const queuedTurnId of ds.typeAheadPromptTurnIds) {
+      envelope = claimPromptContext(params.sessionId, queuedTurnId, fingerprint, prefix);
+      if (envelope) {
+        ds.typeAheadPromptTurnIds = ds.typeAheadPromptTurnIds.filter(id => id !== queuedTurnId);
+        break;
+      }
+    }
+  }
   if (!envelope) return jsonRes(res, 404, { ok: false, error: 'not_found' });
   jsonRes(res, 200, { ok: true, envelope });
 });

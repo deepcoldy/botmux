@@ -25926,6 +25926,7 @@ async function flushPending(): Promise<void> {
 
         if (isTypeAhead && item.turnId) {
           log(`Queuing type-ahead turn attribution: active=${currentBotmuxTurnId?.slice(0, 12)}, queued=${item.turnId.slice(0, 12)}`);
+          send({ type: 'type_ahead_queued', turnId: item.turnId });
           if (!queuedTypeAheadTurns.some(t => t.turnId === item.turnId)) {
             queuedTypeAheadTurns.push({
               turnId: item.turnId,

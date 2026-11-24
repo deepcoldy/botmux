@@ -242,6 +242,27 @@ describe('prompt_submitted_input fencing', () => {
   });
 });
 
+describe('type_ahead_queued tracking', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('records the live worker\'s type-ahead turns once each, oldest first', async () => {
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'type_ahead_queued', turnId: 'om_turn_2' });
+    worker.emit('message', { type: 'type_ahead_queued', turnId: 'om_turn_3' });
+    worker.emit('message', { type: 'type_ahead_queued', turnId: 'om_turn_2' });
+    await flush();
+    expect(ds.typeAheadPromptTurnIds).toEqual(['om_turn_2', 'om_turn_3']);
+
+    ds.worker = makeFakeWorker();
+    worker.emit('message', { type: 'type_ahead_queued', turnId: 'om_turn_4' });
+    await flush();
+    expect(ds.typeAheadPromptTurnIds).toEqual(['om_turn_2', 'om_turn_3']);
+  });
+});
+
 describe('native_input_consumed fencing', () => {
   beforeEach(() => { vi.clearAllMocks(); });
 

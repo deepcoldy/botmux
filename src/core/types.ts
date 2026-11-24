@@ -1105,6 +1105,10 @@ export interface DaemonSession {
      * these old descendants; the long-lived CLI root itself is the exception. */
     preexistingProcessIdentities?: string[];
   };
+  /** Turns the worker typed behind the running turn (type-ahead), oldest
+   *  first. The prompt-context claim accepts these turns after the managed
+   *  origin's own turn. */
+  typeAheadPromptTurnIds?: string[];
   /** Worker-reported identity storage decision for the CURRENT worker
    *  generation. Only the worker knows the effective spawn shape (the
    *  BOTMUX_SANDBOX override, remote-backend bypass, whether bwrap/Seatbelt
