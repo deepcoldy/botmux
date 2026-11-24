@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
+import { usageLimitEvidenceKey as defaultUsageLimitEvidenceKey } from '../src/utils/cli-usage-limit.js';
 
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
@@ -38,7 +39,7 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
     const {
       logScreenshotSkip, backend, renderCols, renderRows,
       renderer, createHash, clamp, captureToPng, uploadImageBuffer, logError,
-      projectedRuntimeScreenStatus, send, classifyScreenUsageLimit, log, cliAdapter,
+      projectedRuntimeScreenStatus, send, classifyScreenUsageLimit, log, cliAdapter, usageLimitEvidenceKey,
     } = deps;
     // Production snapshotToPng reports the canvas grid it rendered; mocks that
     // omit it default to the render grid.
@@ -84,7 +85,7 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
       },
     };
   `);
-  return factory(deps) as CaptureHarness;
+  return factory({ usageLimitEvidenceKey: defaultUsageLimitEvidenceKey, ...deps }) as CaptureHarness;
 }
 
 afterEach(() => vi.useRealTimers());

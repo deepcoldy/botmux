@@ -333,15 +333,17 @@ function antigravitySingleTranscriptTurnFailedWithoutOutput(path: string, writte
 
 /** Durable no-progress proof across both sibling views of one agy conversation.
  * A full log never authorizes replay alone: agy writes compact first, so full
- * without a readable compact sibling is not a complete proof. Compact-only is
- * valid for older builds without full. Any output, corruption or partial tail
- * in either present sibling fails closed. */
+ * without a readable compact sibling is not a complete proof. Native compact
+ * paths have no compact-only authorization: every supported agy build writes
+ * both views, so a missing sibling means unknown evidence and fails closed.
+ * Any output, corruption or partial tail in either present sibling fails closed. */
 export function antigravityTurnFailedWithoutOutput(
   path: string | undefined,
   writtenInput: string | undefined,
-  proofDeps: { existsSync: (path: string) => boolean } = { existsSync },
+  proofDeps: { existsSync?: (path: string) => boolean } = {},
 ): boolean {
   if (!path || !writtenInput) return false;
+  const exists = proofDeps.existsSync ?? existsSync;
   const isFull = basename(path) === FULL_TRANSCRIPT_NAME;
   const isCompact = basename(path) === COMPACT_TRANSCRIPT_NAME;
   if (!isFull && !isCompact) return antigravitySingleTranscriptTurnFailedWithoutOutput(path, writtenInput);
@@ -350,14 +352,7 @@ export function antigravityTurnFailedWithoutOutput(
   // An old agy build may only have compact. Once full exists, both views must
   // independently retain the exact no-progress proof; full has no single-log
   // fallback even if compact disappears between inspection and reading.
-  if (!proofDeps.existsSync(sibling)) {
-    if (isFull) return false;
-    if (!antigravitySingleTranscriptTurnFailedWithoutOutput(path, writtenInput)) return false;
-    // A full log may be created while compact is being read. If it exists now,
-    // the old compact-only branch is no longer a complete proof; fail closed
-    // rather than racing a sibling that may already contain tool progress.
-    return !proofDeps.existsSync(sibling);
-  }
+  if (!exists(sibling)) return false;
   return antigravitySingleTranscriptTurnFailedWithoutOutput(path, writtenInput)
     && antigravitySingleTranscriptTurnFailedWithoutOutput(sibling, writtenInput);
 }

@@ -73,7 +73,7 @@ const BG_SYSTEM_RECORD = {
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'antigravity-transcript-'));
-  path = join(dir, 'transcript.jsonl');
+  path = join(dir, 'proof.jsonl');
 });
 
 afterEach(() => {
@@ -206,6 +206,7 @@ describe('antigravityTurnFailedWithoutOutput', () => {
       source: 'antigravity-native-log',
     };
     writeFileSync(path, line(userRecord(USER_REQUEST)));
+    writeFileSync(join(dir, 'transcript_full.jsonl'), line(userRecord(USER_REQUEST)));
     expect(prove(limit).directFailure).toBe(true);
     appendFileSync(path, line(plannerStep({ toolCalls: [toolCall('create_the_file')] })));
     expect(prove(limit).directFailure).toBeUndefined();
@@ -240,6 +241,7 @@ describe('antigravityTurnFailedWithoutOutput', () => {
   });
 
   it('rejects progress present in either the full or compact sibling', () => {
+    path = join(dir, 'transcript.jsonl');
     const fullPath = join(dir, 'transcript_full.jsonl');
     const user = line(userRecord(USER_REQUEST));
     const tool = line(plannerStep({ toolCalls: [toolCall('create_the_file')] }));
@@ -249,7 +251,32 @@ describe('antigravityTurnFailedWithoutOutput', () => {
     expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(false);
   });
 
+  it('fails closed by default even if a full sibling existed only transiently', () => {
+    path = join(dir, 'transcript.jsonl');
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    writeFileSync(path, line(userRecord(USER_REQUEST)));
+    let checks = 0;
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST, {
+      existsSync: candidate => {
+        if (candidate === fullPath && checks++ === 0) {
+          writeFileSync(fullPath, line(userRecord(USER_REQUEST))
+            + line(plannerStep({ toolCalls: [toolCall('create_the_file')] })));
+          rmSync(fullPath);
+        }
+        return existsSync(candidate);
+      },
+    })).toBe(false);
+    expect(checks).toBeGreaterThan(0);
+  });
+
+  it('requires a complete sibling pair for native transcript paths', () => {
+    path = join(dir, 'transcript.jsonl');
+    writeFileSync(path, line(userRecord(USER_REQUEST)));
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(false);
+  });
+
   it('accepts a consistent full/compact pair with no output after the last input', () => {
+    path = join(dir, 'transcript.jsonl');
     const fullPath = join(dir, 'transcript_full.jsonl');
     const content = line(userRecord(USER_REQUEST)) + line({ type: 'CHECKPOINT', content: 'checkpoint' });
     writeFileSync(fullPath, content);
@@ -264,6 +291,7 @@ describe('antigravityTurnFailedWithoutOutput', () => {
   });
 
   it('fails closed if the compact sibling disappears during inspection', () => {
+    path = join(dir, 'transcript.jsonl');
     const fullPath = join(dir, 'transcript_full.jsonl');
     const user = line(userRecord(USER_REQUEST));
     writeFileSync(fullPath, user);
@@ -283,6 +311,7 @@ describe('antigravityTurnFailedWithoutOutput', () => {
   });
 
   it('fails closed when a full sibling with output appears after the missing check', () => {
+    path = join(dir, 'transcript.jsonl');
     const fullPath = join(dir, 'transcript_full.jsonl');
     const user = line(userRecord(USER_REQUEST));
     writeFileSync(path, user);
@@ -301,6 +330,7 @@ describe('antigravityTurnFailedWithoutOutput', () => {
   });
 
   it('fails closed on a partial record in the compact sibling', () => {
+    path = join(dir, 'transcript.jsonl');
     const fullPath = join(dir, 'transcript_full.jsonl');
     writeFileSync(fullPath, line(userRecord(USER_REQUEST)));
     writeFileSync(path, line(userRecord(USER_REQUEST)) + '{"type":"PLANNER_RESPONSE"');

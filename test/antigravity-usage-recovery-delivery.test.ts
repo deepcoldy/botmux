@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
-import { reconcileUsageLimitState, detectCliUsageLimit, cliUsageLimitEpisodeKey, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
+import { reconcileUsageLimitState, detectCliUsageLimit, cliUsageLimitEpisodeKey, usageLimitEvidenceKey, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { snapshotWithLatestRuntimeStatus } from '../src/utils/runtime-screen-status.js';
 import {
@@ -58,7 +58,7 @@ describe('Antigravity recovery delivery through the real screen sampler', () => 
       backend: {}, cliSpawnGeneration: 1, awaitingFirstPrompt: false, observedPaneGridRevision: 0,
       lastPtyActivityAtMs: 0, shouldCaptureScreen: () => true, isScreenSelfDriven: () => false,
       snapshotToText: async () => null, snapshotWithLatestRuntimeStatus, projectedRuntimeScreenStatus: () => 'idle',
-      classifyUsageLimitWithNativeEvidence: classify, cliAdapter: { id: 'antigravity' },
+      classifyUsageLimitWithNativeEvidence: classify, cliAdapter: { id: 'antigravity' }, usageLimitEvidenceKey,
       lastInitConfig: { cliId: 'antigravity' }, lastAnalyzerSnapshot: '',
       traexQuestionBridgeActive: () => false, traexQuestionFlowVisible: () => false,
       observeTraexAutoModelCapacity: () => {}, publishNativeReasoningFooter: () => {},
@@ -104,7 +104,7 @@ describe('Antigravity recovery delivery through the real screen sampler', () => 
       backend: {}, cliSpawnGeneration: 1, awaitingFirstPrompt: false, observedPaneGridRevision: 0,
       lastPtyActivityAtMs: 0, shouldCaptureScreen: () => true, isScreenSelfDriven: () => false,
       snapshotToText: async () => null, snapshotWithLatestRuntimeStatus, projectedRuntimeScreenStatus: () => 'idle',
-      classifyUsageLimitWithNativeEvidence: () => usageAware, cliAdapter: { id: 'antigravity' },
+      classifyUsageLimitWithNativeEvidence: () => usageAware, cliAdapter: { id: 'antigravity' }, usageLimitEvidenceKey,
       lastInitConfig: { cliId: 'antigravity' }, lastAnalyzerSnapshot: '',
       traexQuestionBridgeActive: () => false, traexQuestionFlowVisible: () => false,
       observeTraexAutoModelCapacity: () => {}, publishNativeReasoningFooter: () => {},

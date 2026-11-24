@@ -368,7 +368,8 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
   if (!a && !b) return true;
   if (!a || !b) return false;
   return usageLimitStateKey(a) === usageLimitStateKey(b)
-    && a.retryReady === b.retryReady && a.source === b.source && a.directFailure === b.directFailure;
+    && a.retryReady === b.retryReady && a.source === b.source && a.directFailure === b.directFailure
+    && a.nativeLogEpisodeKey === b.nativeLogEpisodeKey;
 }
 
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
