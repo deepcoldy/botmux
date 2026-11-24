@@ -371,9 +371,10 @@ Disabled by default. Both windows default to 10 minutes and accept integers from
 
 ### Group session supervision {#group-session-supervisor}
 
-`groupSessionSupervisor` is off by default. Set `botAppId` to a dedicated bot in the same fleet that supports model-only calls. Check `supported` with `botmux session invoke capabilities --bot <ID>` and choose a model available to that bot.
+`groupSessionSupervisor` is off by default. Set `provider: "magpie"` to reach Magpie at `127.0.0.1:3425` and use a model ID from its `/v1/models` catalog. Store the existing gateway key in `magpie-reviewer.key` in the Botmux data directory with mode `0600`. A `botAppId` in the same fleet can also act as the reviewer. Use `botmux session invoke capabilities --bot <ID>` to check for model-only support.
 
 ```text
+/botconfig set groupSessionSupervisor {"provider":"magpie","model":"<Magpie model ID>"}
 /botconfig set groupSessionSupervisor {"botAppId":"local_reviewer","model":"<model>"}
 /botconfig unset groupSessionSupervisor
 ```

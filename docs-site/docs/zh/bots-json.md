@@ -382,9 +382,10 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 
 ### 群会话督办 {#group-session-supervisor}
 
-`groupSessionSupervisor` 默认关闭。设置项里的 `botAppId` 必须是同一 Botmux fleet 内支持纯模型调用的专用 Bot。可以用 `botmux session invoke capabilities --bot <ID>` 检查 `supported`，再选择该 Bot 可用的模型。
+`groupSessionSupervisor` 默认关闭。`provider: "magpie"` 使用同机 `127.0.0.1:3425` 的 Magpie，模型 ID 从该网关的 `/v1/models` 获取。把现有网关 key 存入本机 Botmux 数据目录的 `magpie-reviewer.key`，权限设为 `0600`。也可用同一 fleet 中支持纯模型调用的 `botAppId`，用 `botmux session invoke capabilities --bot <ID>` 检查 `supported`。
 
 ```text
+/botconfig set groupSessionSupervisor {"provider":"magpie","model":"<Magpie 模型 ID>"}
 /botconfig set groupSessionSupervisor {"botAppId":"local_reviewer","model":"<模型名>"}
 /botconfig unset groupSessionSupervisor
 ```

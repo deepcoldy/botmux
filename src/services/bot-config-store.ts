@@ -174,7 +174,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE reaction 和 Codex App 追加指令确认回执 on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'goalStatusCard', configKey: 'goalStatusCard', kind: 'boolean', effect: 'next-session', clearable: false, hint: '目标状态卡 on|off（默认 off）：Codex / TRAE 设定原生目标时，在会话里发一张状态卡并原地更新进行中、完成等状态和 CLI 累计时长；新会话或会话重启后开始读取目标，关闭后已有的卡立即停止更新' },
-  { key: 'groupSessionSupervisor', configKey: 'groupSessionSupervisor', kind: 'json', effect: 'immediate', clearable: true, hint: '群会话督办，配置 model-only Bot 的 {"botAppId":"cli_...","model":"..."}；unset 关闭' },
+  { key: 'groupSessionSupervisor', configKey: 'groupSessionSupervisor', kind: 'json', effect: 'immediate', clearable: true, hint: '群会话督办，填写 {"provider":"magpie","model":"..."} 或 {"botAppId":"local_reviewer","model":"..."}；unset 关闭' },
   { key: 'followUpReply', configKey: 'followUpReply', kind: 'boolean', effect: 'next-session', clearable: false, hint: '执行中途的即时回复 on|off（默认 off）：CLI 把执行中途收到的飞书消息并入当前一轮时（Claude Code adopt 会话、Codex 同轮转向），模型一答完就引用那条消息回复，不用等整轮结束；Codex 每轮执行中途说的进展（说完接着干活的那几句）也会回复到对应消息下；新会话或会话重启后生效，关闭立即停止发送' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
   { key: 'replyCardActions', configKey: 'replyCardActions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡右下角操作菜单（打开终端/切换模型/关闭会话）on|off，默认关闭' },

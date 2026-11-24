@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -17,7 +17,9 @@ import {
   type GroupSessionSupervisionIo,
 } from '../src/core/group-session-supervision.js';
 import { parseSupervisionAssessment, type SupervisionAssessment } from '../src/core/group-session-supervision-assessment.js';
-import { groupSessionSupervisorConfig } from '../src/core/group-session-supervisor-config.js';
+import { groupSessionSupervisorConfig, sameGroupSessionSupervisor } from '../src/core/group-session-supervisor-config.js';
+import { reviewGroupSessionTask } from '../src/core/group-session-supervision-review.js';
+import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
 import type { SessionLastTurn } from '../src/core/session-task-status.js';
 import { noteFinalReplyText, recordTurnOutcome, turnFinalText, turnOutcomePendingOrChanged } from '../src/core/turn-outcome.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -69,6 +71,10 @@ describe('group session supervision', () => {
       .toEqual({ botAppId: 'local_reviewer', model: 'model' });
     expect(groupSessionSupervisorConfig.safeParse({ botAppId: 'https://other-host', model: 'model' }).success)
       .toBe(false);
+    const reviewer = groupSessionSupervisorConfig.parse({ provider: 'magpie', model: ' model ' });
+    expect(reviewer).toEqual({ provider: 'magpie', model: 'model' });
+    expect(groupSessionSupervisorConfig.safeParse({ ...reviewer, url: 'http://example.org' }).success).toBe(false);
+    expect(sameGroupSessionSupervisor(reviewer, { botAppId: 'local_reviewer', model: 'model' })).toBe(false);
   });
 
   it('reviews the bound turn only and stops when the reviewer accepts it', async () => {
@@ -363,6 +369,41 @@ describe('group session supervision with the session store', () => {
     f.io.persist();
     return f;
   }
+
+  it('uses Magpie only on loopback and checks its verdicts and evidence', async () => {
+    const reviewer = { provider: 'magpie', model: 'claude/sonnet' } as const;
+    const task = { ...storedFixture().task, reviewer };
+    writeFileSync(join(dataDir, 'magpie-reviewer.key'), 'fixture-key', { mode: 0o600 });
+    const transport = vi.fn(async () => Response.json({ choices: [{
+      finish_reason: 'stop',
+      message: { content: JSON.stringify({
+        verdict: 'ready', evidence: [], reason: '', missing: [], minutes: 0, question: '', options: [], recommended: 0,
+      }) },
+    }] }));
+    const restore = __setLoopbackTransportForTests(transport);
+    try {
+      const signal = new AbortController().signal;
+      const review = () => reviewGroupSessionTask(reviewer, task, 'Build and tests passed', signal);
+      expect(await review()).toEqual({ verdict: 'ready' });
+      expect(await review()).toEqual({ verdict: 'ready' });
+      expect(transport).toHaveBeenCalledOnce();
+      expect(transport).toHaveBeenCalledWith('http://127.0.0.1:3425/v1/chat/completions', expect.objectContaining({
+        headers: { authorization: 'Bearer fixture-key', 'content-type': 'application/json' },
+        body: expect.stringContaining('"type":"json_schema"'),
+      }));
+      transport.mockResolvedValueOnce(Response.json({ choices: [{
+        finish_reason: 'stop',
+        message: { content: JSON.stringify({
+          verdict: 'accepted', evidence: ['Invented evidence'], reason: '', missing: [], minutes: 0, question: '', options: [], recommended: 0,
+        }) },
+      }] }));
+      expect(await reviewGroupSessionTask(reviewer, task, 'Build and tests passed', signal, 'acceptance')).toEqual({
+        verdict: 'needs_user', reason: '',
+      });
+    } finally {
+      __setLoopbackTransportForTests(restore);
+    }
+  });
 
   it.each(['draining', 'committed'] as const)('preserves the watched turn if its result is %s at probe admission', async phase => {
     const { task, session, io } = storedFixture();

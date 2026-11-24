@@ -1169,6 +1169,7 @@ import {
 } from './core/group-session-supervision.js';
 import { supervisionCriteria } from './core/group-session-supervision-assessment.js';
 import { reviewGroupSessionTask } from './core/group-session-supervision-review.js';
+import { sameGroupSessionSupervisor } from './core/group-session-supervisor-config.js';
 import type { SessionLastTurn } from './core/session-task-status.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
@@ -7682,7 +7683,7 @@ function groupSupervisionSupported(ds: DaemonSession): boolean {
 
 function groupSupervisionAuthorized(ds: DaemonSession, task: GroupSessionSupervision): boolean {
   const current = getBot(ds.larkAppId).config.groupSessionSupervisor;
-  return current?.botAppId === task.reviewer.botAppId && current.model === task.reviewer.model
+  return sameGroupSessionSupervisor(current, task.reviewer)
     && ds.chatId === task.chatId && sessionAnchorId(ds) === task.anchor
     && groupSupervisionSupported(ds) && findActiveBySessionId(ds.session.sessionId) === ds
     && humanCanRunDaemonCommand(ds.larkAppId, ds.chatId, task.requester, task.requesterUnionId, '/supervise', 'group')
@@ -7875,7 +7876,7 @@ const commandDeps: CommandHandlerDeps = {
         await reply([tr(`cmd.supervise.${key}`, undefined, loc), ...groupSupervisionDetails(existing, loc)].join('\n'));
       }
       else if ((ds.lastCliInputTurnId ?? ds.session.lastCliInputTurnId) !== existing.turnId
-        || existing.reviewer.botAppId !== reviewer.botAppId || existing.reviewer.model !== reviewer.model) {
+        || !sameGroupSessionSupervisor(reviewer, existing.reviewer)) {
         await show('cmd.supervise.session_changed');
       } else if (existing.state === 'waiting') {
         await reply([tr('cmd.supervise.waiting', undefined, loc), ...groupSupervisionDetails(existing, loc)].join('\n'));
@@ -7930,7 +7931,7 @@ const commandDeps: CommandHandlerDeps = {
       return;
     }
     if (groupSupervisionTracking(existing) && existing.turnId === turnId && existing.criteria === criteria
-      && existing.reviewer.botAppId === reviewer.botAppId && existing.reviewer.model === reviewer.model) {
+      && sameGroupSessionSupervisor(reviewer, existing.reviewer)) {
       runGroupSessionSupervision(ds);
       if (existing.state === 'waiting') await show('cmd.supervise.waiting');
       else if (existing.state === 'pending_review') await show('cmd.supervise.pending_review');

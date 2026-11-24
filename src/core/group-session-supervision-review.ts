@@ -1,20 +1,81 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import { join } from 'node:path';
 import { config } from '../config.js';
-import type { InvocationResult } from '../services/constrained-invocation/contract.js';
+import { matchesSchema, type InvocationRequest, type InvocationResult } from '../services/constrained-invocation/contract.js';
+import { InvocationService } from '../services/constrained-invocation/service.js';
+import type { NativeInvocationOutput } from '../services/constrained-invocation/runtime.js';
+import { readSecureHostFileSync } from '../platform/secure-host-file.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
+import { loopbackFetch } from './loopback-fetch.js';
 import type { GroupSessionSupervisorConfig } from './group-session-supervisor-config.js';
 import type { GroupSessionSupervision } from './group-session-supervision.js';
 import { parseSupervisionAssessment, supervisionAssessmentSchema, supervisionCriteria, type SupervisionAssessment, type SupervisionReviewStage } from './group-session-supervision-assessment.js';
 
 const REVIEW_DEADLINE_MS = 45_000;
 const BASE = '/api/headless/invocations';
+const magpieServices = new Map<string, InvocationService>();
+
+function magpieReviewService(dataDir: string): InvocationService {
+  const existing = magpieServices.get(dataDir);
+  if (existing) return existing;
+  const service = new InvocationService({
+    directory: join(dataDir, 'supervision-magpie-invocations'),
+    run: (request, signal) => invokeMagpieReview(dataDir, request, signal),
+  });
+  magpieServices.set(dataDir, service);
+  return service;
+}
+
+async function invokeMagpieReview(
+  dataDir: string, request: InvocationRequest, signal: AbortSignal,
+): Promise<NativeInvocationOutput> {
+  // Host-owned key and fixed loopback destination. Group config cannot select
+  // a credential path, redirect the request, or enable tools.
+  const key = readSecureHostFileSync(join(dataDir, 'magpie-reviewer.key'), 4096)?.trim();
+  if (!key || !/^[\x21-\x7e]+$/.test(key)) throw new Error('magpie_review_key_unavailable');
+  const response = await loopbackFetch('http://127.0.0.1:3425/v1/chat/completions', {
+    method: 'POST', signal,
+    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: request.model,
+      messages: [{ role: 'user', content: request.prompt }],
+      stream: false,
+      max_tokens: 4096,
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'botmux_supervision', strict: true, schema: request.outputSchema },
+      },
+    }),
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error('magpie_review_http_error');
+  }
+  const reply = await response.json() as {
+    model?: string;
+    choices?: { finish_reason?: string; message?: { content?: string; tool_calls?: unknown[] } }[];
+  };
+  const choice = reply.choices?.[0];
+  if (choice?.finish_reason !== 'stop' || choice.message?.tool_calls?.length
+    || typeof choice.message?.content !== 'string') throw new Error('magpie_review_incomplete');
+  let output: unknown;
+  try { output = JSON.parse(choice.message.content); } catch { throw new Error('magpie_review_invalid_json'); }
+  if (!matchesSchema(output, request.outputSchema)) throw new Error('magpie_review_schema_mismatch');
+  return {
+    output, configuredModel: request.model, actualModel: typeof reply.model === 'string' ? reply.model : null,
+    reasoningEffort: null, usage: null, usageSource: null, startupMs: null,
+  };
+}
+
 export async function reviewGroupSessionTask(
   reviewer: GroupSessionSupervisorConfig, task: GroupSessionSupervision, answer: string, signal: AbortSignal,
   stage: SupervisionReviewStage = 'completion',
 ): Promise<SupervisionAssessment | undefined> {
-  const daemon = findOnlineDaemon(reviewer.botAppId, config.session.dataDir);
-  if (!daemon) return undefined;
+  signal.throwIfAborted();
+  const daemon = 'botAppId' in reviewer ? findOnlineDaemon(reviewer.botAppId, config.session.dataDir) : undefined;
+  const magpie = 'provider' in reviewer ? magpieReviewService(config.session.dataDir) : undefined;
+  if (!daemon && !magpie) return undefined;
   const request = {
     requestId: `supervision-${task.id}-${task.reviewEpoch ?? 0}-${task.dispatches ?? 0}-${stage}-${task.reviewAttempt ?? 0}`,
     model: reviewer.model,
@@ -35,6 +96,8 @@ export async function reviewGroupSessionTask(
   const path = `${BASE}/${request.requestId}`;
   const bounded = AbortSignal.any([signal, AbortSignal.timeout(REVIEW_DEADLINE_MS + 5_000)]);
   const call = async (route: string, start = false): Promise<InvocationResult | undefined> => {
+    if (magpie) return start ? magpie.start(request) : magpie.get(request.requestId);
+    if (!daemon) return undefined;
     const response = await fetchDaemonIpc(daemon.ipcPort, route, {
       ...(start ? { method: 'POST', body: JSON.stringify(request), headers: { 'content-type': 'application/json' } } : {}),
       signal: bounded,
@@ -52,9 +115,12 @@ export async function reviewGroupSessionTask(
     return parseSupervisionAssessment(result.output, stage, task.criteria, answer);
   } finally {
     if (bounded.aborted) {
-      void fetchDaemonIpc(daemon.ipcPort, `${path}/cancel`, {
-        method: 'POST', signal: AbortSignal.timeout(3_000),
-      }).then(response => response.body?.cancel()).catch(() => {});
+      if (magpie) void magpie.cancel(request.requestId).catch(() => {});
+      else if (daemon) {
+        void fetchDaemonIpc(daemon.ipcPort, `${path}/cancel`, {
+          method: 'POST', signal: AbortSignal.timeout(3_000),
+        }).then(response => response.body?.cancel()).catch(() => {});
+      }
     }
   }
 }
