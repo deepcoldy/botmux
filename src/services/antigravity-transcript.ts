@@ -297,6 +297,9 @@ export interface AntigravityTranscriptState {
    *  a completion notification removes only its own ID instead of dropping the
    *  remaining waits. */
   pendingTaskIds?: string[];
+  /** A background RUNNING record without a task ID is a separate anonymous
+   *  wait. Removing the last known sibling ID must not clear it. */
+  hasPendingAnonymousTask?: boolean;
   /** The RUNNING record's logical step. Only its immediate DONE successor is
    *  accepted as callback-less command-result evidence; poll results can be
    *  physically written before their lower-step tool_call. */
@@ -310,10 +313,20 @@ export interface AntigravityTranscriptState {
    *  finish the work; send_message does not re-arm this wait because it does
    *  not promise a reply. An array keeps carried worker state serializable. */
   pendingSubagentIds?: string[];
-  /** Ephemeral launch hint for `IsDaemon: true` background calls in the latest
+  /** Ephemeral launch hints for `IsDaemon: true` background calls in the latest
    *  tool_calls batch so standing daemons (dev servers / standing crons) are
-   *  not latched as turn-blocking waits. Dropped once the turn moves on. */
-  pendingDaemonHints?: { allDaemon?: boolean; descriptions?: string[] };
+   *  not latched as turn-blocking waits. Mixed batches retain ordinary
+   *  descriptions and logical-step hints: only positive launch correlation may
+   *  exclude a RUNNING record; unresolved description collisions stay pending. */
+  pendingDaemonHints?: {
+    allDaemon?: boolean;
+    descriptions?: string[];
+    nonDaemonDescriptions?: string[];
+    /** GENERIC's logical step is the planner step plus the tool call's
+     *  one-based ordinal. A matching step + description can disambiguate a
+     *  mixed batch even when another candidate shares the description. */
+    stepHints?: { stepIndex: number; isDaemon: boolean; descriptions: string[] }[];
+  };
 }
 
 /** Every GENERIC record in observed logs with this phrase has status RUNNING;
@@ -322,8 +335,13 @@ export interface AntigravityTranscriptState {
  *  for foreground tool results in observed logs). */
 const BACKGROUND_TASK_PHRASE_RE = /running as a background task/i;
 const BACKGROUND_TASK_ID_RE = /(?:with\s+)?task\s+id:?\s*([A-Za-z0-9._/-]+)/i;
-const LEGACY_TASK_RESULT_RE = /^[Tt]ask(?: id)?\s+"?([A-Za-z0-9._/-]+)"?\s+(?:finished|completed|was cancel(?:l)?ed|failed|timed out)\b/;
-const SYSTEM_CANCEL_RE = /^(?:the\s+user\s+)?(?:cancell?ed|interrupted|aborted)\b|\b(?:user|request|turn|task)\s+(?:was\s+)?(?:cancell?ed|interrupted|aborted)\b/i;
+const LEGACY_TASK_RESULT_RE = /^[Tt]ask(?:\s+id)?\s*:?[ \t]*"?([A-Za-z0-9._/-]+)"?[ \t]+(?:finished|completed|was cancel(?:l)?ed|failed|timed out)\b/;
+// Unheaded cancellation is necessarily a coarse recovery signal. Restrict the
+// clear-all reset to an explicit user/request/turn cancellation (or a terse
+// leading "canceled/interrupted/aborted"); a notice about one background task
+// must not erase unrelated command/subagent waits that are still outstanding.
+const SYSTEM_CANCEL_RE = /^(?:(?:the\s+)?user\s+)?(?:cancell?ed|interrupted|aborted)\b|^(?:the\s+)?(?:(?:user\s+)?request|turn)\s+(?:was\s+)?(?:cancell?ed|interrupted|aborted)\b/i;
+const SYSTEM_SINGLE_TASK_CANCEL_RE = /^(?:the\s+)?(?:background\s+)?task\s+(?:was\s+)?(?:cancell?ed|interrupted|aborted)\b/i;
 
 function isBackgroundTaskRunningRecord(obj: any): boolean {
   if (obj?.type !== 'GENERIC') return false;
@@ -391,6 +409,7 @@ function commandState(state: AntigravityTranscriptState | undefined): Antigravit
   return hasPending ? {
     hasPendingTask: true,
     ...(state?.pendingTaskIds?.length ? { pendingTaskIds: [...state.pendingTaskIds] } : {}),
+    ...(state?.hasPendingAnonymousTask ? { hasPendingAnonymousTask: true } : {}),
     ...(state?.pendingTaskRunningStep !== undefined ? { pendingTaskRunningStep: state.pendingTaskRunningStep } : {}),
     ...(state?.hasPendingTaskResult ? { hasPendingTaskResult: true } : {}),
   } : {};
@@ -414,35 +433,57 @@ function daemonHintState(state: AntigravityTranscriptState | undefined): Antigra
     pendingDaemonHints: {
       ...(hints.allDaemon ? { allDaemon: true } : {}),
       ...(hints.descriptions?.length ? { descriptions: [...hints.descriptions] } : {}),
+      ...(hints.nonDaemonDescriptions?.length ? { nonDaemonDescriptions: [...hints.nonDaemonDescriptions] } : {}),
+      ...(hints.stepHints?.length ? {
+        stepHints: hints.stepHints.map(hint => ({ ...hint, descriptions: [...hint.descriptions] })),
+      } : {}),
     },
   };
 }
 
-function daemonHintsFromToolCalls(toolCalls: readonly any[]): AntigravityTranscriptState['pendingDaemonHints'] {
+function daemonHintsFromToolCalls(
+  toolCalls: readonly any[],
+  plannerStepIndex?: number,
+): AntigravityTranscriptState['pendingDaemonHints'] {
   let daemonCount = 0;
   let nonDaemonBgCapableCount = 0;
   const descriptions: string[] = [];
-  for (const call of toolCalls) {
+  const nonDaemonDescriptions: string[] = [];
+  const stepHints: { stepIndex: number; isDaemon: boolean; descriptions: string[] }[] = [];
+  for (const [callIndex, call] of toolCalls.entries()) {
     const name = call?.name ?? call?.function?.name;
     if (name !== 'run_command' && name !== 'schedule') continue;
     const args = toolCallArguments(call);
     const isDaemon = decodeArgumentValue(args?.IsDaemon) === true;
-    if (!isDaemon) {
-      nonDaemonBgCapableCount++;
-      continue;
-    }
-    daemonCount++;
+    if (isDaemon) daemonCount++;
+    else nonDaemonBgCapableCount++;
+
+    const callDescriptions: string[] = [];
     for (const rawField of [args?.CommandLine, args?.Prompt, args?.CronExpression]) {
       const decoded = decodeArgumentValue(rawField);
-      if (typeof decoded === 'string' && decoded.trim()) {
-        descriptions.push(decoded.trim());
-      }
+      if (typeof decoded === 'string' && decoded.trim()) callDescriptions.push(decoded.trim());
+    }
+    const cronExpression = decodeArgumentValue(args?.CronExpression);
+    if (typeof cronExpression === 'string' && cronExpression.trim()) {
+      // RUNNING records wrap schedule expressions as `Cron: <expression>`;
+      // retain the raw form too for builds that omit the wrapper.
+      callDescriptions.push(`Cron: ${cronExpression.trim()}`);
+    }
+    (isDaemon ? descriptions : nonDaemonDescriptions).push(...callDescriptions);
+    if (typeof plannerStepIndex === 'number' && Number.isInteger(plannerStepIndex)) {
+      stepHints.push({
+        stepIndex: plannerStepIndex + callIndex + 1,
+        isDaemon,
+        descriptions: callDescriptions,
+      });
     }
   }
   if (daemonCount === 0) return undefined;
   return {
     ...(nonDaemonBgCapableCount === 0 ? { allDaemon: true } : {}),
     ...(descriptions.length > 0 ? { descriptions } : {}),
+    ...(nonDaemonDescriptions.length > 0 ? { nonDaemonDescriptions } : {}),
+    ...(stepHints.length > 0 ? { stepHints } : {}),
   };
 }
 
@@ -453,9 +494,18 @@ function isDaemonBackgroundRecord(
   if (!hints) return false;
   if (hints.allDaemon) return true;
   const desc = backgroundTaskDescription(obj);
-  if (!desc || !hints.descriptions?.length) return false;
-  return hints.descriptions.some(candidate =>
-    candidate.startsWith(desc) || desc.startsWith(candidate));
+  if (!desc) return false;
+  const matches = (candidate: string) => candidate.startsWith(desc) || desc.startsWith(candidate);
+  const stepHint = hints.stepHints?.find(hint =>
+    hint.stepIndex === obj.step_index && hint.descriptions.some(matches));
+  if (stepHint) return stepHint.isDaemon;
+  if (!hints.descriptions?.length) return false;
+  if (!hints.descriptions.some(matches)) return false;
+  // A compact log may truncate either side of a description. If the same
+  // observation also matches an ordinary launch, its daemon provenance is
+  // ambiguous: keep the turn-blocking wait rather than releasing authority
+  // while an ordinary background command is still running.
+  return !hints.nonDaemonDescriptions?.some(matches);
 }
 
 function removePendingTaskId(
@@ -464,25 +514,27 @@ function removePendingTaskId(
 ): AntigravityTranscriptState {
   const ids = state.pendingTaskIds;
   if (ids && ids.length > 0) {
-    if (completedId && ids.includes(completedId)) {
-      const remaining = ids.filter(id => id !== completedId);
-      if (remaining.length > 0) {
-        return {
-          hasPendingTask: true,
-          pendingTaskIds: remaining,
-          ...(state.pendingTaskRunningStep !== undefined ? { pendingTaskRunningStep: state.pendingTaskRunningStep } : {}),
-          ...(state.hasPendingTaskResult ? { hasPendingTaskResult: true } : {}),
-        };
-      }
-      return {};
+    // Once concrete IDs are tracked, an absent or unrelated ID proves nothing
+    // about those waits. This applies to completion notifications and explicit
+    // manage_task kills alike, including a sole tracked task.
+    if (!completedId || !ids.includes(completedId)) return commandState(state);
+    const remaining = ids.filter(id => id !== completedId);
+    if (remaining.length > 0) {
+      // RUNNING-step/result evidence belongs to the command that produced it.
+      // The legacy fields do not record that owner, so never transfer them to
+      // a surviving sibling after another task completes.
+      return {
+        hasPendingTask: true,
+        pendingTaskIds: remaining,
+        ...(state.hasPendingAnonymousTask ? { hasPendingAnonymousTask: true } : {}),
+      };
     }
-    // Unmatched completion notification: when multiple tracked tasks exist, do
-    // not drop all remaining tasks on an unrelated ID; when at most one task is
-    // tracked (or the notification carries no ID), clear it like legacy mode.
-    if (completedId && ids.length > 1) {
-      return commandState(state);
-    }
+    return state.hasPendingAnonymousTask
+      ? { hasPendingTask: true, hasPendingAnonymousTask: true }
+      : {};
   }
+  // Legacy RUNNING records without an ID retain their historical clear-all
+  // completion behavior; there is no concrete wait identity to preserve.
   return {};
 }
 
@@ -553,6 +605,7 @@ function abandonCommandWaits(state: AntigravityTranscriptState, toolCalls: any[]
       provisionalFinal: _final,
       hasPendingTask: _pending,
       pendingTaskIds: _taskIds,
+      hasPendingAnonymousTask: _anonymous,
       pendingTaskRunningStep: _step,
       hasPendingTaskResult: _res,
       ...rest
@@ -646,13 +699,23 @@ function foldRecord(
       //    final instead of latching forever.
       state = abandonSubagentWaits(state, obj.tool_calls);
       state = abandonCommandWaits(state, obj.tool_calls);
-      const daemonHints = daemonHintsFromToolCalls(obj.tool_calls);
+      const daemonHints = daemonHintsFromToolCalls(obj.tool_calls, obj.step_index);
       if (obj.tool_calls.every(isTaskPollToolCall)) {
         const { pendingDaemonHints: _staleDaemon, ...rest } = state;
         return daemonHints ? { ...rest, pendingDaemonHints: daemonHints } : rest;
       }
       const hasOrdinaryForeground = obj.tool_calls.some((call: any) =>
         !isTaskPollToolCall(call) && !isSubagentLaunchToolCall(call));
+      // A physically late launch has its RUNNING logical step inside this
+      // planner batch's immediate tool-result range. It is provenance for that
+      // wait, not foreground recovery; genuinely separate foreground work
+      // (including older step numbers from observed real logs) may still clear.
+      const runningBelongsToPlannerBatch = state.pendingTaskRunningStep !== undefined
+        && typeof obj.step_index === 'number'
+        && Number.isInteger(obj.step_index)
+        && obj.step_index < state.pendingTaskRunningStep
+        && state.pendingTaskRunningStep <= obj.step_index + obj.tool_calls.length;
+      const foregroundRecovery = hasOrdinaryForeground && !runningBelongsToPlannerBatch;
       // Ordinary foreground work retains the legacy recovery heuristic. A
       // subagent launch is narrower: it recovers a missing callback only after
       // a command-result DONE, never while the command is still merely RUNNING.
@@ -660,7 +723,7 @@ function foldRecord(
         && obj.tool_calls.some(isSubagentLaunchToolCall);
       return {
         ...turn,
-        ...(!hasOrdinaryForeground && !launchRecovery ? commandState(state) : {}),
+        ...(!foregroundRecovery && !launchRecovery ? commandState(state) : {}),
         ...subagentState(state.pendingSubagentIds),
         ...(daemonHints ? { pendingDaemonHints: daemonHints } : {}),
       };
@@ -709,6 +772,7 @@ function foldRecord(
       ...rest,
       hasPendingTask: true,
       ...(nextTaskIds?.length ? { pendingTaskIds: nextTaskIds } : {}),
+      ...(!taskId ? { hasPendingAnonymousTask: true } : {}),
       ...(runningStep !== undefined ? { pendingTaskRunningStep: runningStep } : {}),
     };
   }
@@ -757,6 +821,15 @@ function foldRecord(
     if (!header && !legacyTaskResult) {
       const trimmedPayload = payload.trim();
       if (!/^Reminder:/i.test(trimmedPayload) && SYSTEM_CANCEL_RE.test(trimmedPayload)) {
+        return { ...turn };
+      }
+      const commandWaitCount = (state.pendingTaskIds?.length ?? 0)
+        + (state.hasPendingAnonymousTask ? 1 : 0)
+        || (state.hasPendingTask ? 1 : 0);
+      if (!/^Reminder:/i.test(trimmedPayload)
+        && commandWaitCount === 1
+        && !state.pendingSubagentIds?.length
+        && SYSTEM_SINGLE_TASK_CANCEL_RE.test(trimmedPayload)) {
         return { ...turn };
       }
       return state;

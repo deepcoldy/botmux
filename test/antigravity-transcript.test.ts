@@ -764,6 +764,92 @@ describe('hasAntigravityTranscriptPendingTasks & multi-task/daemon tracking', ()
     expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
   });
 
+  it('does not let a late lower-step launch clear a newer RUNNING wait', () => {
+    const taskId = `${convId}/task-out-of-order`;
+    writeFileSync(path, [
+      line(userRecord('乱序落盘')),
+      line(taskRunning(2, taskId, 'out-of-order-command')),
+      line(plannerStep({ step: 1, toolCalls: [{ name: 'run_command', args: { CommandLine: 'out-of-order-command' } }] })),
+      line(plannerStep({ step: 3, content: '仍在等待后台任务。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toEqual([taskId]);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
+  it('keeps an anonymous RUNNING wait after a known sibling task completes', () => {
+    const knownId = `${convId}/task-known`;
+    const anonymousCompletionId = `${convId}/task-anonymous`;
+    writeFileSync(path, [
+      line(userRecord('有 ID 与无 ID 任务并发')),
+      line(taskRunning(1, knownId, 'known-command')),
+      line({
+        step_index: 2,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task\nTask Description: anonymous-command\n',
+      }),
+      line(plannerStep({ step: 3, content: '等待两个任务。' })),
+      line(taskDoneMsg(4, knownId)),
+      line(plannerStep({ step: 5, content: '已知任务完成，继续等待匿名任务。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.hasPendingTask).toBe(true);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+
+    appendFileSync(path, [
+      line(taskDoneMsg(6, anonymousCompletionId)),
+      line(plannerStep({ step: 7, content: '匿名任务也已完成。' })),
+    ].join(''));
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
+  });
+
+  it('does not clear a tracked background task for an unmatched completion or kill ID', () => {
+    const tracked = `${convId}/task-tracked`;
+    writeFileSync(path, [
+      line(userRecord('run')),
+      line(taskRunning(1, tracked, 'long-running-command')),
+      line(plannerStep({ step: 2, content: '等待中。' })),
+      line(plannerStep({ step: 3, toolCalls: [{ name: 'manage_task', args: { Action: 'kill', TaskId: `${convId}/task-stale` } }] })),
+    ].join(''));
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+
+    appendFileSync(path, line(taskDoneMsg(4, `${convId}/task-unrelated`)));
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+
+    appendFileSync(path, line(plannerStep({
+      step: 5,
+      toolCalls: [{ name: 'manage_task', args: { Action: 'kill', TaskId: tracked } }],
+    })));
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
+  });
+
+  it('does not reuse a completed sibling command result to release the remaining task on subagent launch', () => {
+    const t1 = `${convId}/task-still-running`;
+    const t2 = `${convId}/task-completed`;
+    writeFileSync(path, [
+      line(userRecord('并发跑两个任务')),
+      line(taskRunning(1, t1, 'cmd-1')),
+      line(taskRunning(2, t2, 'cmd-2')),
+      // t2's immediate tool result is callback-less recovery evidence for t2
+      // only; it must not become evidence that t1 also finished.
+      line({ step_index: 3, source: 'MODEL', type: 'GENERIC', status: 'DONE', content: 'cmd-2 tool result' }),
+      line(taskDoneMsg(4, t2)),
+      line(plannerStep({ step: 5, toolCalls: [toolCall('invoke_subagent')] })),
+      line(plannerStep({ step: 6, content: '子代理已启动，继续等待 cmd-1。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toEqual([t1]);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
   it('does not block idle for IsDaemon: true dev servers or standing crons, while preserving normal sibling tasks', () => {
     writeFileSync(path, [
       line(userRecord('启动 dev server')),
@@ -808,6 +894,131 @@ describe('hasAntigravityTranscriptPendingTasks & multi-task/daemon tracking', ()
       line(taskDoneMsg(5, `${convId}/task-23`)),
       line(plannerStep({ step: 6, content: '部署完成。' })),
     ].join(''));
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
+  });
+
+  it.each([
+    { name: 'identical descriptions', daemonCommand: 'npm test', ordinaryCommand: 'npm test' },
+    { name: 'daemon description is a prefix', daemonCommand: 'npm test', ordinaryCommand: 'npm test -- --watch' },
+    { name: 'ordinary description is a prefix', daemonCommand: 'npm test -- --watch', ordinaryCommand: 'npm test' },
+  ])('keeps a mixed daemon/ordinary batch pending on $name', ({ daemonCommand, ordinaryCommand }) => {
+    const daemonId = `${convId}/task-daemon`;
+    const ordinaryId = `${convId}/task-ordinary`;
+    writeFileSync(path, [
+      line(userRecord('同批启动两个后台任务')),
+      line(plannerStep({
+        step: 1,
+        toolCalls: [
+          { name: 'run_command', args: { CommandLine: daemonCommand, IsDaemon: true } },
+          { name: 'run_command', args: { CommandLine: ordinaryCommand } },
+        ],
+      })),
+      line(taskRunning(2, daemonId, daemonCommand)),
+      line(taskRunning(3, ordinaryId, ordinaryCommand)),
+      line(plannerStep({ step: 4, content: '等待普通后台任务完成。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toContain(ordinaryId);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+
+    appendFileSync(path, [
+      line(taskDoneMsg(5, ordinaryId)),
+      line(plannerStep({ step: 6, content: '普通任务已完成，常驻任务继续运行。' })),
+    ].join(''));
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
+    const completed = drainAntigravityTranscript(path, drained.newOffset, drained.state, { flushTrailingFinal: true });
+    expect(completed.events.filter(event => event.kind === 'assistant_final').map(event => event.text))
+      .toEqual(['普通任务已完成，常驻任务继续运行。']);
+  });
+
+  it.each([
+    'Task was canceled.',
+    'The user request was canceled.',
+  ])('releases a sole command wait for an explicit cancellation: %s', (notice) => {
+    const taskId = `${convId}/task-cancelled`;
+    writeFileSync(path, [
+      line(userRecord('可取消任务')),
+      line(taskRunning(1, taskId, 'cancel-me')),
+      line(plannerStep({ step: 2, content: '等待任务。' })),
+      line({ step_index: 3, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', status: 'DONE', content: notice }),
+      line(plannerStep({ step: 4, content: '任务已取消。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.events.filter(event => event.kind === 'assistant_final').map(event => event.text))
+      .toEqual(['任务已取消。']);
+  });
+
+  it('does not clear unrelated waits for an unheaded subtask cancellation notice', () => {
+    const t1 = `${convId}/task-cancelled`;
+    const t2 = `${convId}/task-still-running`;
+    writeFileSync(path, [
+      line(userRecord('并发任务')),
+      line(taskRunning(1, t1, 'cmd-1')),
+      line(taskRunning(2, t2, 'cmd-2')),
+      line(plannerStep({ step: 3, content: '等待两个任务。' })),
+      line({
+        step_index: 4,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: 'Background task was canceled; the other work continues.',
+      }),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const drained = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(drained.state.pendingTaskIds).toEqual([t1, t2]);
+    expect(drained.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+  });
+
+  it('recognizes a standing cron in a mixed batch without hiding its ordinary sibling', () => {
+    const cronId = `${convId}/task-cron`;
+    const ordinaryId = `${convId}/task-ordinary`;
+    writeFileSync(path, [
+      line(userRecord('启动常驻巡检并跑部署')),
+      line(plannerStep({
+        step: 1,
+        toolCalls: [
+          { name: 'schedule', args: { CronExpression: '*/5 * * * *', IsDaemon: true, Prompt: '巡检状态' } },
+          { name: 'run_command', args: { CommandLine: 'bytedcli env deploy' } },
+        ],
+      })),
+      line(taskRunning(2, cronId, 'Cron: */5 * * * *')),
+      line(taskRunning(3, ordinaryId, 'bytedcli env deploy')),
+      line(plannerStep({ step: 4, content: '等待部署完成。' })),
+    ].join(''));
+
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(true);
+    const running = drainAntigravityTranscript(path, 0);
+    expect(running.state.pendingTaskIds).toEqual([ordinaryId]);
+
+    appendFileSync(path, [
+      line(taskDoneMsg(5, ordinaryId)),
+      line(plannerStep({ step: 6, content: '部署完成，巡检继续常驻。' })),
+    ].join(''));
+    expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
+  });
+
+  it('accepts a legacy sender-less completion with a colon after task id', () => {
+    const taskId = `${convId}/task-legacy`;
+    writeFileSync(path, [
+      line(userRecord('旧版后台任务')),
+      line(taskRunning(1, taskId, 'legacy-command')),
+      line(plannerStep({ step: 2, content: '等待旧版任务完成。' })),
+      line({
+        step_index: 3,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: `<SYSTEM_MESSAGE>\n[Message] Task id: ${taskId} finished with result: code 0\n</SYSTEM_MESSAGE>`,
+      }),
+      line(plannerStep({ step: 4, content: '旧版任务已完成。' })),
+    ].join(''));
+
     expect(hasAntigravityTranscriptPendingTasks(path)).toBe(false);
   });
 

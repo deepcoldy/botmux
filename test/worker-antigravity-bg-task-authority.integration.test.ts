@@ -74,6 +74,7 @@ describe('Antigravity worker background task turn authority (default send mode)'
     const historyPath = join(cliHome, 'history.jsonl');
     const cliPidFile = join(root, 'fake-cli.pid');
     const finishGate = join(root, 'finish-bg-task');
+    const mixedFinishGate = join(root, 'finish-mixed-bg-task');
     cliPidFiles.add(cliPidFile);
     mkdirSync(dataDir, { recursive: true });
     mkdirSync(transcriptDir, { recursive: true });
@@ -95,38 +96,70 @@ if (logIdx >= 0) {
 const historyPath = ${JSON.stringify(historyPath)};
 const transcriptPath = ${JSON.stringify(transcriptPath)};
 const finishGate = ${JSON.stringify(finishGate)};
+const mixedFinishGate = ${JSON.stringify(mixedFinishGate)};
 const nativeId = ${JSON.stringify(nativeId)};
 const taskId = nativeId + '/task-178';
 process.stdin.setRawMode?.(true);
 const drawIdle = (body) => process.stdout.write('\\x1b[2J\\x1b[H' + body + '\\r\\n────────\\r\\n>\\r\\n────────\\r\\n? for shortcuts\\r\\n');
 setTimeout(() => drawIdle('Antigravity ready'), 100);
 let handled = false;
+let mixedHandled = false;
 let buf = '';
 process.stdin.on('data', chunk => {
   buf += chunk.toString();
-  if (handled || !buf.includes('BG_TASK_TURN_MARKER')) return;
-  handled = true;
-  fs.appendFileSync(historyPath, JSON.stringify({
-    display: 'BG_TASK_TURN_MARKER', workspace: ${JSON.stringify(dataDir)}, timestamp: Date.now(),
-  }) + '\\n');
-  // Simulate a run_command moving to background + model emitting waiting narration,
-  // then TUI returning to an idle composer without "esc to cancel".
-  fs.writeFileSync(transcriptPath, [
-    JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\\nBG_TASK_TURN_MARKER\\n</USER_REQUEST>' }),
-    JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', args: { CommandLine: '"bytedcli env service upgrade-tce"' } }] }),
-    JSON.stringify({ step_index: 2, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Created At: 2026-11-24T03:15:07Z\\nTool is running as a background task with task id: ' + taskId + '\\nTask Description: bytedcli env service upgrade-tce\\n' }),
-    JSON.stringify({ step_index: 3, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '等待 BOE 与 PPE 升级工单下发返回结果。' }),
-  ].join('\\n') + '\\n');
-  drawIdle('等待 BOE 与 PPE 升级工单下发返回结果。');
-  const pollFinish = () => {
-    if (!fs.existsSync(finishGate)) { setTimeout(pollFinish, 30); return; }
-    fs.appendFileSync(transcriptPath, [
-      JSON.stringify({ step_index: 4, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>\\n[Message] timestamp=2026-11-24T03:15:50Z sender=' + taskId + ' priority=MESSAGE_PRIORITY_HIGH content=Task id "' + taskId + '" finished with result: code 0\\n</SYSTEM_MESSAGE>' }),
-      JSON.stringify({ step_index: 5, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'BOE 与 PPE 升级均已成功。' }),
+  if (!handled && buf.includes('BG_TASK_TURN_MARKER')) {
+    handled = true;
+    fs.appendFileSync(historyPath, JSON.stringify({
+      display: 'BG_TASK_TURN_MARKER', workspace: ${JSON.stringify(dataDir)}, timestamp: Date.now(),
+    }) + '\\n');
+    // Simulate a run_command moving to background + model emitting waiting narration,
+    // then TUI returning to an idle composer without "esc to cancel".
+    fs.writeFileSync(transcriptPath, [
+      JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\\nBG_TASK_TURN_MARKER\\n</USER_REQUEST>' }),
+      JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', args: { CommandLine: '"bytedcli env service upgrade-tce"' } }] }),
+      JSON.stringify({ step_index: 2, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Created At: 2026-11-24T03:15:07Z\\nTool is running as a background task with task id: ' + taskId + '\\nTask Description: bytedcli env service upgrade-tce\\n' }),
+      JSON.stringify({ step_index: 3, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '等待 BOE 与 PPE 升级工单下发返回结果。' }),
     ].join('\\n') + '\\n');
-    drawIdle('BOE 与 PPE 升级均已成功。');
-  };
-  pollFinish();
+    drawIdle('等待 BOE 与 PPE 升级工单下发返回结果。');
+    const pollFinish = () => {
+      if (!fs.existsSync(finishGate)) { setTimeout(pollFinish, 30); return; }
+      fs.appendFileSync(transcriptPath, [
+        JSON.stringify({ step_index: 4, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>\\n[Message] timestamp=2026-11-24T03:15:50Z sender=' + taskId + ' priority=MESSAGE_PRIORITY_HIGH content=Task id "' + taskId + '" finished with result: code 0\\n</SYSTEM_MESSAGE>' }),
+        JSON.stringify({ step_index: 5, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'BOE 与 PPE 升级均已成功。' }),
+      ].join('\\n') + '\\n');
+      drawIdle('BOE 与 PPE 升级均已成功。');
+    };
+    pollFinish();
+  }
+  if (!mixedHandled && buf.includes('MIXED_DAEMON_TURN_MARKER')) {
+    mixedHandled = true;
+    fs.appendFileSync(historyPath, JSON.stringify({
+      display: 'MIXED_DAEMON_TURN_MARKER', workspace: ${JSON.stringify(dataDir)}, timestamp: Date.now(),
+    }) + '\\n');
+    // A compact/truncated description must not make the ordinary sibling look
+    // like the daemon. Both RUNNING records are deliberately ambiguous.
+    fs.appendFileSync(transcriptPath, [
+      JSON.stringify({ step_index: 10, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\\nMIXED_DAEMON_TURN_MARKER\\n</USER_REQUEST>' }),
+      JSON.stringify({ step_index: 11, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [
+        { name: 'run_command', args: { CommandLine: 'npm test', IsDaemon: true } },
+        { name: 'run_command', args: { CommandLine: 'npm test -- --watch' } },
+      ] }),
+      JSON.stringify({ step_index: 12, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Created At: 2026-11-24T03:16:07Z\\nTool is running as a background task with task id: ' + nativeId + '/task-daemon\\nTask Description: npm test\\n' }),
+      JSON.stringify({ step_index: 13, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Created At: 2026-11-24T03:16:08Z\\nTool is running as a background task with task id: ' + nativeId + '/task-ordinary\\nTask Description: npm test -- --watch\\n' }),
+      JSON.stringify({ step_index: 14, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '等待普通后台任务完成。' }),
+    ].join('\\n') + '\\n');
+    drawIdle('等待普通后台任务完成。');
+    const pollMixedFinish = () => {
+      if (!fs.existsSync(mixedFinishGate)) { setTimeout(pollMixedFinish, 30); return; }
+      const ordinaryTaskId = nativeId + '/task-ordinary';
+      fs.appendFileSync(transcriptPath, [
+        JSON.stringify({ step_index: 15, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>\\n[Message] timestamp=2026-11-24T03:16:50Z sender=' + ordinaryTaskId + ' priority=MESSAGE_PRIORITY_HIGH content=Task id "' + ordinaryTaskId + '" finished with result: code 0\\n</SYSTEM_MESSAGE>' }),
+        JSON.stringify({ step_index: 16, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '普通任务已完成，常驻任务继续运行。' }),
+      ].join('\\n') + '\\n');
+      drawIdle('普通任务已完成，常驻任务继续运行。');
+    };
+    pollMixedFinish();
+  }
 });
 setInterval(() => {}, 1_000);
 `);
@@ -219,6 +252,50 @@ setInterval(() => {}, 1_000);
     );
     await waitFor(
       () => messages.slice(messageStartIndex).some(m => m.type === 'screen_update' && m.status === 'idle'),
+      logs,
+    );
+
+    // A second live turn exercises the mixed-batch collision in the same real
+    // worker. The ordinary sibling remains RUNNING: no authority release,
+    // origin revocation, or idle projection is allowed before its completion.
+    const mixedTurnId = 'om_bg_turn_mixed_daemon';
+    const mixedMessageStartIndex = messages.length;
+    const mixedLogStart = logs.join('').length;
+    child.send({
+      type: 'message',
+      content: 'MIXED_DAEMON_TURN_MARKER',
+      turnId: mixedTurnId,
+      caller: {
+        requestUserOpenId: 'ou_tester',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => logs.join('').slice(mixedLogStart).includes('Idle prompt while Antigravity background task(s)/subagent(s) pending')
+        && messages.slice(mixedMessageStartIndex).some(m => m.type === 'managed_turn_origin' && m.turnId === mixedTurnId),
+      logs,
+    );
+    const mixedLogs = logs.join('').slice(mixedLogStart);
+    expect(mixedLogs).not.toContain(`Released active turn authority ${mixedTurnId.slice(0, 12)}`);
+    const mixedMessages = messages.slice(mixedMessageStartIndex);
+    const mixedOriginIdx = mixedMessages.findIndex(m => m.type === 'managed_turn_origin' && m.turnId === mixedTurnId);
+    expect(mixedOriginIdx).toBeGreaterThanOrEqual(0);
+    expect(mixedMessages.filter(m => m.type === 'managed_turn_origin_revoked' && m.turnId === mixedTurnId)).toEqual([]);
+    expect(mixedMessages.slice(mixedOriginIdx + 1).filter(m => m.type === 'screen_update' && m.status === 'idle')).toEqual([]);
+
+    // Once the ordinary sibling completes, the standing daemon must not keep
+    // the finished turn latched: authority and origin are released and the
+    // final planner response projects idle.
+    writeFileSync(mixedFinishGate, 'done');
+    await waitFor(
+      () => logs.join('').slice(mixedLogStart).includes(`Released active turn authority ${mixedTurnId.slice(0, 12)} (prompt_ready)`),
+      logs,
+    );
+    await waitFor(
+      () => messages.slice(mixedMessageStartIndex).some(m => m.type === 'managed_turn_origin_revoked' && m.turnId === mixedTurnId)
+        && messages.slice(mixedMessageStartIndex).some(m => m.type === 'screen_update' && m.status === 'idle'),
       logs,
     );
   }, 45_000);
