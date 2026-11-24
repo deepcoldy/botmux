@@ -16,6 +16,7 @@ import {
 import {
   placeCollabGroupInit,
   readCollabInitEntry,
+  patchCollabInitEntry,
   __testOnly_resetCollabInitMutexes,
 } from '../src/services/collab-init-store.js';
 import { collabInitId, collabSourceKey, collabCreatorAdmissionOperationId, type SessionGroupCollaborationConfig } from '../src/services/collab-group-config.js';
@@ -63,7 +64,7 @@ function deps(overrides: Partial<S2S5Deps> = {}): S2S5Deps {
     roleVerify: roleDeps(),
     kickoffPrepare: async () => ({ ok: true }),
     kickoffStart: async () => ({ ok: true, sessionId: 's', turnId: 't', acceptedAt: '2026-01-01T00:00:00Z' }),
-    artifactFacts: async () => ({ terminalStatus: 'succeeded', delivered: true, messageId: 'om', content: `${DEFAULT_ARTIFACT_MARKER} https://example.com/x.zip` }),
+    artifactFacts: async () => ({ terminalStatus: 'succeeded', delivered: true, messageId: 'om', content: `${DEFAULT_ARTIFACT_MARKER} https://example.com/x.zip`, sessionId: 'sess_up', turnId: 'turn_up', contentHash: 'hash_up' }),
     ...overrides,
   };
 }
@@ -144,6 +145,37 @@ describe('S5 kickoff 依赖启动', () => {
     const r = await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
     expect(r.done).toBe(true);
     expect(starts).toContain(CREATOR);
+  });
+
+  it('R2：artifact 缺三元组/hash → 拒绝启动下一跳', async () => {
+    const initId = await seedEntry();
+    const cfg = config([
+      { appId: CREATOR, trigger: 'immediate' },
+      { appId: PEER, trigger: 'afterAgentTurn', afterAppId: CREATOR, artifact: { type: 'marked-url', hosts: ['example.com'] } },
+    ]);
+    const starts: string[] = [];
+    const d = deps({ kickoffStart: async (appId) => { starts.push(appId); return { ok: true, sessionId: 's', turnId: 't', acceptedAt: '2026-01-01T00:00:00Z' }; }, artifactFacts: async () => ({ terminalStatus: 'succeeded', delivered: true, messageId: 'om', content: `${DEFAULT_ARTIFACT_MARKER} https://example.com/x.zip` }) }); // 缺 sessionId/turnId/contentHash
+    const r = await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    expect(r.done).toBe(false);
+    expect(r.awaitingInput).toContain('proof incomplete');
+    expect(starts).not.toContain(PEER);
+  });
+
+  it('R1：await 之后取消（cancelled）不推进外部副作用', async () => {
+    const initId = await seedEntry();
+    const cfg = config([{ appId: CREATOR, trigger: 'immediate' }]);
+    const starts: string[] = [];
+    // prepare 等待中写 cancelled
+    const d = deps({
+      kickoffStart: async (appId) => { starts.push(appId); return { ok: true, sessionId: 's', turnId: 't', acceptedAt: '2026-01-01T00:00:00Z' }; },
+      kickoffPrepare: async () => {
+        await patchCollabInitEntry({ dataDir, creatorAppId: CREATOR, initId, mutate: (e) => { e.state = 'cancelled'; return true; } });
+        return { ok: true };
+      },
+    });
+    const r = await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    expect(r.done).toBe(false);
+    expect(starts).toEqual([]); // 取消后不 start
   });
 });
 
