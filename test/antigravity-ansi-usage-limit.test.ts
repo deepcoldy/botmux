@@ -169,6 +169,26 @@ describe('raw ANSI tmux quota classification', () => {
     expect(usageLimitTracker.detectedThisTurn(turn)).toBe(true);
   });
 
+  it('suppresses a pre-existing banner when native identity first arrives after turn start', () => {
+    let native: { key: string; text: string } | undefined;
+    const { classify, capture, usageLimitTracker } = classifier(
+      () => currentQuotaScreen, 'antigravity', true, false, undefined, () => native,
+    );
+    const turn = usageLimitTracker.beginTurn(currentQuotaScreen);
+    native = { key: 'arrived-after-begin', text: currentQuotaScreen };
+    capture.mockImplementation(() => { throw new Error('native capture unavailable'); });
+    usageLimitTracker.noteTurnCompleted('answered');
+    expect(classify(currentQuotaScreen, 'idle')).toEqual({ status: 'idle' });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+    expect(classify(currentQuotaScreen, 'idle')).toEqual({ status: 'idle' });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+
+    native = { key: 'genuinely-new-after-answer', text: currentQuotaScreen };
+    expect(classify(currentQuotaScreen, 'idle')).toMatchObject({
+      status: 'limited', usageLimit: { nativeEpisodeKey: 'log:genuinely-new-after-answer' },
+    });
+  });
+
   it('uses the first published deadline when a partial refusal gains its native composer', () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
     const partialScreen = '⚠ Individual quota reached. Resets in 1m.\nError ID: partial-first';

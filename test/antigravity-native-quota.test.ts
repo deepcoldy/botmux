@@ -119,6 +119,40 @@ describe('Antigravity native quota log evidence', () => {
     });
   });
 
+  it('discovers the no-progress transcript without enabling the reply bridge', () => {
+    const scope: Record<string, any> = {
+      cliAdapter: { id: 'antigravity' }, codexBridgeRolloutPath: undefined,
+      currentBotmuxTurnId: 'turn-1', lastWrittenCliInput: { turnId: 'turn-1', content: 'do work' },
+      lastSpawnEffectiveCliSessionId: 'native-agy-session',
+      resolveAntigravityTranscriptPath: (sessionId: string) =>
+        sessionId === 'native-agy-session' ? '/tmp/native-agy-transcript.jsonl' : null,
+      antigravityTurnFailedWithoutOutput: (path: string | undefined, written: string | undefined) =>
+        path === '/tmp/native-agy-transcript.jsonl' && written === 'do work',
+    };
+    const withProof = loadWorkerFunction<(limit: any) => any>('withAntigravityDirectFailureProof', scope);
+    expect(withProof({ limited: true, kind: 'usage', source: 'antigravity-native-log' }).directFailure).toBe(true);
+  });
+
+  it('does not use a stored transcript owned by a different live conversation', () => {
+    let pidCalls = 0;
+    const scope: Record<string, any> = {
+      cliAdapter: { id: 'antigravity' }, codexBridgeRolloutPath: undefined,
+      currentBotmuxTurnId: 'turn-1', lastWrittenCliInput: { turnId: 'turn-1', content: 'do work' },
+      lastSpawnEffectiveCliSessionId: 'conversation-a', lastInitConfig: { cliSessionId: 'conversation-b' },
+      backend: { cliPid: 4242 },
+      findAntigravityConversationIdByPid: (pid: number) => {
+        pidCalls++;
+        return pid === 4242 ? 'conversation-b' : undefined;
+      },
+      resolveAntigravityTranscriptPath: (sessionId: string) => sessionId === 'conversation-a'
+        ? '/tmp/conversation-a-no-output.jsonl' : '/tmp/conversation-b-has-output.jsonl',
+      antigravityTurnFailedWithoutOutput: (path: string | undefined) => path === '/tmp/conversation-a-no-output.jsonl',
+    };
+    const withProof = loadWorkerFunction<(limit: any) => any>('withAntigravityDirectFailureProof', scope);
+    expect(withProof({ limited: true, kind: 'usage', source: 'antigravity-native-log' }).directFailure).toBeUndefined();
+    expect(pidCalls).toBe(1);
+  });
+
   it('normalizes CRLF before comparing the native input', () => {
     const { path, log } = setup();
     writeFileSync(path, input('first line\nsecond line') + quota());

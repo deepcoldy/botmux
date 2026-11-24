@@ -356,6 +356,47 @@ describe('Antigravity worker-pool replay safety', () => {
     expect(statuses).toContain('idle');
   });
 
+  it('retries a consumed sticky clear after SQLite recovers without another frame', async () => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    const usageLimit = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'consumed-clear-retry', h.nowMs);
+    h.ds.usageLimit = usageLimit;
+    h.ds.lastScreenStatus = 'limited';
+    h.ds.suppressRecoveryCard = true;
+    h.ds.session.usageLimit = usageLimit;
+    h.ds.session.consumedAntigravityQuotaKeys = ['log:consumed-clear-retry'];
+    h.ds.session.lastFailedTurn = {
+      turnId: 'turn-1', cliInput: 'do work', userPrompt: 'do work',
+      failedAt: new Date().toISOString(), status: 'failed', retryCount: 0, limitedSnapshot: true,
+    };
+    h.sessionStore.updateSession(h.ds.session);
+    const { dashboardEventBus } = await import('../src/core/dashboard-events.js');
+    const statuses: unknown[] = [];
+    const off = dashboardEventBus.subscribe((event: any) => {
+      if (event.type === 'session.update' && event.body.sessionId === h.ds.session.sessionId) {
+        statuses.push(event.body.patch.status);
+      }
+    });
+    cleanups.push(off);
+
+    h.sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('injected consumed clear outage'); });
+    cleanups.push(() => h.sessionStore.__testOnly_setBeforeRowPersist(undefined));
+    h.worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-consumed-clear-retry', status: 'limited', turnId: 'turn-1', usageLimit,
+    });
+    await h.flush();
+    expect(h.ds.usageLimit).toBeDefined();
+    expect(h.ds.lastScreenStatus).toBe('limited');
+
+    h.sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    await new Promise(resolve => setTimeout(resolve, 550));
+    await h.flush();
+    expect(h.ds.usageLimit).toBeUndefined();
+    expect(h.ds.lastScreenStatus).toBe('idle');
+    expect(h.sessionStore.getSessionFresh(h.ds.session.sessionId)?.usageLimit).toBeUndefined();
+    expect(h.sessionStore.getSessionFresh(h.ds.session.sessionId)?.lastFailedTurn).toBeUndefined();
+    expect(statuses).toContain('idle');
+  });
+
   it('records a limited failed turn when the first native evidence is a screenshot', async () => {
     const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
     delete h.ds.session.lastFailedTurn;

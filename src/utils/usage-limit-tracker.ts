@@ -218,11 +218,19 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       }
 
       const key = usageLimitStateKey(limit);
+      const previousNativeLogEpisode = lastNativeLogEpisode;
       if (limit.source === 'antigravity-native-log' && limit.nativeEpisodeKey && rawIdentity) {
         lastNativeLogEpisode = { rawIdentity, episodeKey: limit.nativeEpisodeKey };
       }
       const rawIdentityMatchesConfirmedEpisode = limit.source !== 'antigravity-native-log'
-        || (limit.nativeEpisodeKey !== undefined && limit.nativeEpisodeKey === preExistingNativeLogEpisodeKey);
+        || (limit.nativeEpisodeKey !== undefined && (preExistingNativeLogEpisodeKey !== undefined
+          ? limit.nativeEpisodeKey === preExistingNativeLogEpisodeKey
+          // The first native key may only be metadata arriving after beginTurn.
+          // Once an episode exists, only that same raw-text/key pair remains
+          // compatible; a different key is genuinely new evidence.
+          : (previousNativeLogEpisode === undefined
+            || (previousNativeLogEpisode.rawIdentity === rawIdentity
+              && previousNativeLogEpisode.episodeKey === limit.nativeEpisodeKey))));
       // (a) master's rule: a banner already on screen whose reset time has
       //     already passed is definitionally leftover.
       // (b) the new rule: a banner that was ALREADY on screen when this turn

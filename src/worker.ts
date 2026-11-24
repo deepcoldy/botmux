@@ -514,6 +514,7 @@ import {
   mapAntigravityCompactOffsetToFull,
   hasAntigravityPendingTasks,
   drainAntigravityTranscript,
+  resolveAntigravityTranscriptPath,
   antigravityTurnFailedWithoutOutput,
   readAntigravitySideAnswer,
   type AntigravityTranscriptState,
@@ -9983,7 +9984,26 @@ function withAntigravityDirectFailureProof(limit: CliUsageLimitState): CliUsageL
   const lastWritten = lastWrittenCliInput;
   const written = lastWritten && lastWritten.turnId === currentBotmuxTurnId
     ? lastWritten.content : undefined;
-  return antigravityTurnFailedWithoutOutput(codexBridgeRolloutPath, written)
+  let transcriptPath = codexBridgeRolloutPath;
+  if (!transcriptPath && cliAdapter?.id === 'antigravity') {
+    // Reply harvesting and no-progress proof are independent readers. A normal
+    // prompt-injection session may not enable the fallback bridge, but agy's
+    // own transcript is still the only safe source of replay evidence.
+    const pid = (backend as { cliPid?: number } | null)?.cliPid;
+    const liveConversationId = pid ? findAntigravityConversationIdByPid(pid) : undefined;
+    if (liveConversationId) {
+      transcriptPath = resolveAntigravityTranscriptPath(liveConversationId) ?? undefined;
+    } else {
+      const spawnedId = lastSpawnEffectiveCliSessionId;
+      const configuredId = lastInitConfig?.cliSessionId;
+      // Conflicting stored identities cannot prove which conversation owns the
+      // live turn. Only an unambiguous stored id is usable without live proof.
+      const nativeSessionId = spawnedId && configuredId && spawnedId !== configuredId
+        ? undefined : configuredId ?? spawnedId;
+      transcriptPath = nativeSessionId ? resolveAntigravityTranscriptPath(nativeSessionId) ?? undefined : undefined;
+    }
+  }
+  return antigravityTurnFailedWithoutOutput(transcriptPath, written)
     ? { ...limit, directFailure: true }
     : limit;
 }

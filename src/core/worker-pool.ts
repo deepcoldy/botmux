@@ -5163,15 +5163,29 @@ function filterConsumedAntigravityQuotaFrame(frame: {
   status: ScreenStatus;
   usageLimit?: CliUsageLimitState;
   expiredAntigravityQuota?: CliUsageLimitState;
-}, ds: DaemonSession): void {
+  turnId?: string;
+  dispatchAttempt?: number;
+  directSubmit?: boolean;
+}, ds: DaemonSession, owns: () => boolean, afterRecovered: () => void): boolean {
   const limit = frame.usageLimit;
   const key = limit?.nativeEpisodeKey;
   if (!key || (limit?.source !== 'antigravity-error-composer' && limit?.source !== 'antigravity-native-log')
-    || !ds.session.consumedAntigravityQuotaKeys?.includes(key)) return;
-  if (ds.usageLimit?.nativeEpisodeKey === key) clearUsageLimitState(ds);
+    || !ds.session.consumedAntigravityQuotaKeys?.includes(key)) return true;
+  if (ds.usageLimit?.nativeEpisodeKey === key) {
+    try {
+      clearUsageLimitState(ds);
+    } catch (error) {
+      // Stop this frame before it can publish a half-cleared state. The retry
+      // owns the same episode and publishes recovery only after durable clear.
+      logger.warn(`[${tag(ds)}] consumed quota clear persistence failed: ${String(error)}`);
+      retryComposerRecovery(ds, { ...frame, status: 'idle' }, owns, afterRecovered);
+      return false;
+    }
+  }
   frame.status = ds.usageLimit ? 'limited' : frame.status === 'limited' ? 'idle' : frame.status;
   frame.usageLimit = undefined;
   frame.expiredAntigravityQuota = undefined;
+  return true;
 }
 
 const usageLimitPersistRetries = new WeakMap<DaemonSession, {
@@ -5222,6 +5236,7 @@ function retryUsageLimitPersistence(
 const composerRecoveryRetries = new WeakMap<DaemonSession, {
   timer: ReturnType<typeof setTimeout>;
   owns: () => boolean;
+  afterRecovered?: () => void;
 }>();
 
 function cancelComposerRecoveryRetry(ds: DaemonSession): void {
@@ -5237,6 +5252,7 @@ function retryComposerRecovery(
   ds: DaemonSession,
   frame: { status: ScreenStatus; turnId?: string; dispatchAttempt?: number; directSubmit?: boolean },
   owns: () => boolean,
+  afterRecovered?: () => void,
 ): void {
   const { status } = frame;
   cancelUsageLimitPersistRetry(ds);
@@ -5268,9 +5284,11 @@ function retryComposerRecovery(
         && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
         scheduleCardPatch(ds, buildStreamingCardJson(ds), frame.turnId, { owns });
       }
+      try { afterRecovered?.(); }
+      catch (error) { logger.warn(`[${tag(ds)}] composer recovery completion hook failed: ${String(error)}`); }
     }, delayMs);
     timer.unref();
-    composerRecoveryRetries.set(ds, { timer, owns });
+    composerRecoveryRetries.set(ds, { timer, owns, ...(afterRecovered ? { afterRecovered } : {}) });
   };
   schedule();
 }
@@ -21697,6 +21715,21 @@ function setupWorkerHandlers(
         );
       });
   };
+  const publishConsumedAntigravityRecovery = (): void => {
+    const status: ScreenStatus = 'idle';
+    try {
+      const published = cb.onScreenStatus?.(ds, { prevStatus: 'limited', status, turnId: undefined });
+      void Promise.resolve(published).catch((err: any) => {
+        logger.debug(`[${t}] consumed quota recovery bridge failed: ${err?.message ?? err}`);
+      });
+    } catch (err: any) {
+      logger.debug(`[${t}] consumed quota recovery bridge threw: ${err?.message ?? err}`);
+    }
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: { sessionId: ds.session.sessionId, patch: { status, lastMessageAt: ds.lastMessageAt } },
+    });
+  };
   /** 文本帧和截图帧共享限额切换边沿，各自在通过来源和静默检查后调用 */
   const notifyUsageLimitEdge = (
     previousStatus: DaemonSession['lastScreenStatus'],
@@ -24423,7 +24456,7 @@ function setupWorkerHandlers(
         // Any real screen frame supersedes the post-terminal fallback: the card
         // is once again driven by live worker evidence.
         if (!ownsLifecycleMutation()) break;
-        filterConsumedAntigravityQuotaFrame(msg, ds);
+        if (!filterConsumedAntigravityQuotaFrame(msg, ds, ownsLifecycleMutation, publishConsumedAntigravityRecovery)) break;
         // Project the frame's effective status once: reused for the in-memory
         // status assignment below and the stale-post-terminal gate.
         const previousLimit = ds.usageLimit;
@@ -24906,7 +24939,8 @@ function setupWorkerHandlers(
         // Drop uploads that arrived during a new-turn handoff — the image_key may
         // reflect previous turn's content. Next 10s cycle picks up fresh content.
         if (ds.streamCardPending) break;
-        if (ownsLifecycleMutation()) filterConsumedAntigravityQuotaFrame(msg, ds);
+        if (ownsLifecycleMutation()
+          && !filterConsumedAntigravityQuotaFrame(msg, ds, ownsLifecycleMutation, publishConsumedAntigravityRecovery)) break;
         // Source + target fence. The worker binds capture revision/tuple at
         // capture start and drops frames that outlive them; here the frame must
         // also match this generation's observed capture identity exactly, its
