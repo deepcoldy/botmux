@@ -515,6 +515,7 @@ import {
   hasAntigravityPendingTasks,
   drainAntigravityTranscript,
   antigravityTurnFailedWithoutOutput,
+  resolveAntigravityTranscriptPath,
   readAntigravitySideAnswer,
   type AntigravityTranscriptState,
 } from './services/antigravity-transcript.js';
@@ -9983,7 +9984,10 @@ function withAntigravityDirectFailureProof(limit: CliUsageLimitState): CliUsageL
   const lastWritten = lastWrittenCliInput;
   const written = lastWritten && lastWritten.turnId === currentBotmuxTurnId
     ? lastWritten.content : undefined;
-  return antigravityTurnFailedWithoutOutput(codexBridgeRolloutPath, written)
+  const transcriptPath = codexBridgeRolloutPath
+    ?? resolveAntigravityTranscriptPath(lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId)
+    ?? undefined;
+  return antigravityTurnFailedWithoutOutput(transcriptPath, written)
     ? { ...limit, directFailure: true }
     : limit;
 }

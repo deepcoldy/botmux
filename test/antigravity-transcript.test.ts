@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -207,6 +207,32 @@ describe('antigravityTurnFailedWithoutOutput', () => {
     writeFileSync(path, line(userRecord(USER_REQUEST)));
     expect(prove(limit).directFailure).toBe(true);
     appendFileSync(path, line(plannerStep({ toolCalls: [toolCall('create_the_file')] })));
+    expect(prove(limit).directFailure).toBeUndefined();
+  });
+
+  it('discovers the proof transcript by native session id without a reply bridge', () => {
+    const brainDir = join(dir, 'brain');
+    const conversationId = 'native-no-bridge';
+    const logs = join(brainDir, conversationId, '.system_generated', 'logs');
+    mkdirSync(logs, { recursive: true });
+    const fullPath = join(logs, 'transcript_full.jsonl');
+    writeFileSync(fullPath, line(userRecord(USER_REQUEST)));
+    const prove = loadWorkerFunction<(limit: CliUsageLimitState) => CliUsageLimitState>(
+      'withAntigravityDirectFailureProof', {
+        codexBridgeRolloutPath: undefined,
+        lastSpawnEffectiveCliSessionId: conversationId,
+        lastInitConfig: { cliSessionId: conversationId },
+        resolveAntigravityTranscriptPath: (id: string | undefined) => resolveAntigravityTranscriptPath(id, { brainDir }),
+        lastWrittenCliInput: { turnId: 'turn-1', content: USER_REQUEST },
+        currentBotmuxTurnId: 'turn-1', antigravityTurnFailedWithoutOutput,
+      },
+    );
+    const limit: CliUsageLimitState = {
+      limited: true, kind: 'usage', retryAtMs: 1, retryLabel: '1s', retryReady: false,
+      source: 'antigravity-native-log',
+    };
+    expect(prove(limit).directFailure).toBe(true);
+    appendFileSync(fullPath, line(plannerStep({ toolCalls: [toolCall('create_the_file')] })));
     expect(prove(limit).directFailure).toBeUndefined();
   });
 

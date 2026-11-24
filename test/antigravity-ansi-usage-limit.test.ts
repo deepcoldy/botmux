@@ -169,6 +169,23 @@ describe('raw ANSI tmux quota classification', () => {
     expect(usageLimitTracker.detectedThisTurn(turn)).toBe(true);
   });
 
+  it('accepts a native identity first learned after turn start, then rejects a replacement', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    let nativeKey: string | undefined;
+    const { classify, usageLimitTracker } = classifier(() => currentQuotaScreen, 'antigravity', true, false, undefined,
+      () => nativeKey ? { key: nativeKey, text: currentQuotaScreen } : undefined);
+    const turn = usageLimitTracker.beginTurn(currentQuotaScreen);
+    nativeKey = 'native-late-old';
+    usageLimitTracker.noteTurnCompleted('answered');
+
+    expect(classify('', 'idle')).toEqual({ status: 'idle' });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+
+    nativeKey = 'native-after-late-new';
+    expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('log:native-after-late-new');
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(true);
+  });
+
   it('uses the first published deadline when a partial refusal gains its native composer', () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
     const partialScreen = '⚠ Individual quota reached. Resets in 1m.\nError ID: partial-first';

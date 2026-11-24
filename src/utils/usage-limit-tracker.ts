@@ -222,7 +222,8 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
         lastNativeLogEpisode = { rawIdentity, episodeKey: limit.nativeEpisodeKey };
       }
       const rawIdentityMatchesConfirmedEpisode = limit.source !== 'antigravity-native-log'
-        || (limit.nativeEpisodeKey !== undefined && limit.nativeEpisodeKey === preExistingNativeLogEpisodeKey);
+        || (limit.nativeEpisodeKey !== undefined && (preExistingNativeLogEpisodeKey === undefined
+          || limit.nativeEpisodeKey === preExistingNativeLogEpisodeKey));
       // (a) master's rule: a banner already on screen whose reset time has
       //     already passed is definitionally leftover.
       // (b) the new rule: a banner that was ALREADY on screen when this turn
@@ -233,6 +234,13 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       if (key === staleBannerKey || rawKey === staleBannerKey
         || (turnProducedAnswer && (bannerTextIdentity(limit) === preExistingBannerKey
           || (rawIdentity === preExistingBannerKey && rawIdentityMatchesConfirmedEpisode)))) {
+        // The native key can arrive after turn start. Bind the FIRST confirmed
+        // log key to this answered raw banner once; a later replacement key is
+        // new evidence and must not inherit the suppression.
+        if (turnProducedAnswer && rawIdentity === preExistingBannerKey
+          && limit.source === 'antigravity-native-log' && limit.nativeEpisodeKey) {
+          preExistingNativeLogEpisodeKey ??= limit.nativeEpisodeKey;
+        }
         return { status };
       }
 
