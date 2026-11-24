@@ -78,7 +78,7 @@ describe('Antigravity native quota log evidence', () => {
     });
   });
 
-  it('recognizes a larger same-inode replacement after the process reader is reset', () => {
+  it('recognizes a larger same-inode replacement after the process reader is reset', async () => {
     const { path, log } = setup();
     writeFileSync(path, input('task-1') + noise(14 * 1024) + quota());
     expect(currentAntigravityNativeQuota(log.read(), 'task-1')).toBeDefined();
@@ -86,9 +86,12 @@ describe('Antigravity native quota log evidence', () => {
     writeFileSync(path, input('task-2') + noise(24 * 1024) + quota('20:53:28.722278'));
     expect(statSync(path).ino).toBe(inode);
 
-    const scope: Record<string, any> = { antigravityNativeQuotaLog: log };
-    const reset = loadWorkerFunction<() => void>('resetAntigravityNativeQuotaLog', scope);
-    reset();
+    const scope: Record<string, any> = {
+      antigravityNativeQuotaLog: log,
+      followBotTraeHome: () => { throw new Error('stop after reset'); },
+    };
+    const spawn = loadWorkerFunction<(...args: any[]) => Promise<void>>('spawnCliBody', scope);
+    await expect(spawn({})).rejects.toThrow('stop after reset');
     expect(scope.antigravityNativeQuotaLog).toBeUndefined();
     const replacement = new AntigravityNativeQuotaLog(path);
     expect(currentAntigravityNativeQuota(replacement.read(), 'task-2')).toMatchObject({

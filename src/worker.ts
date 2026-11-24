@@ -9951,10 +9951,6 @@ let antigravityQuotaHistory: readonly CliUsageLimitState[] | undefined;
 let unconfirmedAntigravityQuotas = new Map<string, CliUsageLimitState>();
 let antigravityNativeQuotaLog: AntigravityNativeQuotaLog | undefined;
 
-function resetAntigravityNativeQuotaLog(): void {
-  antigravityNativeQuotaLog = undefined;
-}
-
 function readAntigravityNativeQuota() {
   if (cliAdapter?.id !== 'antigravity' || cliAdapter.runnerFramedInput
     || !supportsAntigravityReadyFooterQuota(lastInitConfig?.cliVersion) || !sessionId) return undefined;
@@ -28230,7 +28226,7 @@ async function spawnCliBody(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   opts: Parameters<typeof spawnCli>[1] = {},
 ): Promise<void> {
-  resetAntigravityNativeQuotaLog();
+  antigravityNativeQuotaLog = undefined;
   doubaoRestoredRuntimeIdentity = undefined;
   followBotTraeHome(cfg);
   const protectedCliError = protectedHttpEgressCliSupportError(cfg.cliId, cfg.protectedHttpEgressPolicy);
@@ -35692,7 +35688,7 @@ function killCli(opts: {
    * record of the turn it is executing) for the worker that reattaches it. */
   preserveCliPidMarker?: boolean;
 } = {}): void {
-  resetAntigravityNativeQuotaLog();
+  antigravityNativeQuotaLog = undefined;
   if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   // Invalidate an in-flight async spawn before any other teardown hook runs. The
   // remaining cleanup is synchronous today, but generation ownership must not
