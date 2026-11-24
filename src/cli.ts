@@ -8709,6 +8709,53 @@ async function detectCurrentSession(): Promise<CurrentSession | null> {
   };
 }
 
+/** Exchange this turn's rotating managed-origin capability for the daemon's
+ *  host-written proof; undefined when the process holds no such capability. */
+async function attestCurrentManagedOrigin(dataDir: string): Promise<ManagedOriginAttestation | undefined> {
+  const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir, includeHostSession: true });
+  if (!isolated?.originChannelId) return undefined;
+  return attestManagedOrigin({
+    context: {
+      sessionId: isolated.sessionId,
+      channelId: isolated.originChannelId,
+      capability: isolated.capability,
+      dataDir,
+      larkAppId: isolated.larkAppId,
+      ipcPortFallback: isolated.ipcPortFallback,
+    },
+    resolveIpcPort: appId => {
+      try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
+      catch { return undefined; }
+    },
+  });
+}
+
+/** Routing-only lookup for a confined session that can read neither the
+ *  session store nor the daemon secret (assistant mode). The location comes
+ *  from the daemon's proof for the live turn, never from the environment, and
+ *  carries no caller authority: creation and mutations stay authorized by the
+ *  owning daemon. */
+async function detectConfinedCurrentSession(): Promise<CurrentSession | null> {
+  if (!process.env.BOTMUX_SESSION_ID) return null;
+  let proof: ManagedOriginAttestation | undefined;
+  try { proof = await attestCurrentManagedOrigin(resolveDataDir()); } catch { return null; }
+  const location = proof?.session;
+  if (!proof || !location || location.status !== 'active') return null;
+  return {
+    sessionId: proof.sessionId,
+    turnId: proof.turnId,
+    chatId: location.chatId,
+    rootMessageId: location.rootMessageId,
+    scheduleRootMessageId: location.scope === 'chat' ? location.turnRootMessageId : location.rootMessageId,
+    workingDir: location.workingDir,
+    larkAppId: proof.larkAppId,
+    chatType: location.chatType,
+    scope: location.scope,
+    ownerOpenId: location.ownerOpenId,
+    ownerUnionId: location.ownerUnionId,
+  };
+}
+
 /**
  * Resolve the session whose live CLI process is an authenticated ancestor.
  *
@@ -8721,24 +8768,7 @@ async function detectCurrentSession(): Promise<CurrentSession | null> {
 async function detectAuthenticatedCurrentSession(purpose: 'create' | 'operate' = 'create'): Promise<CurrentSession | null> {
   const dataDir = resolveDataDir();
   let attested: ManagedOriginAttestation | undefined;
-  const attestCurrentOrigin = async () => {
-    const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir, includeHostSession: true });
-    if (!isolated?.originChannelId) return undefined;
-    return attestManagedOrigin({
-      context: {
-        sessionId: isolated.sessionId,
-        channelId: isolated.originChannelId,
-        capability: isolated.capability,
-        dataDir,
-        larkAppId: isolated.larkAppId,
-        ipcPortFallback: isolated.ipcPortFallback,
-      },
-      resolveIpcPort: appId => {
-        try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
-        catch { return undefined; }
-      },
-    });
-  };
+  const attestCurrentOrigin = () => attestCurrentManagedOrigin(dataDir);
   let provenance: {
     sessionId: string;
     turnId: string;
@@ -8805,7 +8835,22 @@ async function detectAuthenticatedCurrentSession(purpose: 'create' | 'operate' =
     }
   }
   if (!provenance) return null;
-  const s = loadSessions().get(provenance.sessionId);
+  let stored: SessionData | undefined;
+  try { stored = loadSessions().get(provenance.sessionId); } catch { /* confined store: use the proof */ }
+  let s: Pick<SessionData, 'sessionId' | 'status' | 'larkAppId' | 'chatId' | 'rootMessageId'
+    | 'workingDir' | 'chatType' | 'scope' | 'ownerOpenId' | 'ownerUnionId'> | undefined = stored;
+  let attestedTurnRootMessageId: string | undefined;
+  if (!s) {
+    // Assistant mode denies the confined CLI the per-bot session store. The
+    // daemon's proof for this exact live turn carries the caller's own row.
+    attested ??= await attestCurrentOrigin();
+    const location = attested?.session;
+    if (location && attested!.sessionId === provenance.sessionId && attested!.turnId === provenance.turnId
+      && attested!.larkAppId === provenance.larkAppId && attested!.callerOpenId === provenance.callerOpenId) {
+      s = { sessionId: provenance.sessionId, larkAppId: provenance.larkAppId, ...location };
+      attestedTurnRootMessageId = location.turnRootMessageId;
+    }
+  }
   if (!s || s.status !== 'active') throw new Error('authenticated schedule session is no longer active');
   if (provenance.larkAppId !== s.larkAppId) throw new Error('schedule creator bot does not match the session');
   // The current-turn provenance authenticates the human who actually invoked
@@ -8858,7 +8903,7 @@ async function detectAuthenticatedCurrentSession(purpose: 'create' | 'operate' =
     chatId: s.chatId,
     rootMessageId: s.rootMessageId,
     scheduleRootMessageId: s.scope === 'chat'
-      ? pickTurnReplyTarget(s, provenance.turnId)?.rootMessageId
+      ? (stored ? pickTurnReplyTarget(stored, provenance.turnId)?.rootMessageId : attestedTurnRootMessageId)
       : s.rootMessageId,
     workingDir: s.workingDir,
     larkAppId: s.larkAppId,
@@ -9415,9 +9460,21 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     return;
   }
   if (!sub || sub === 'list' || sub === 'ls') {
-    const tasks = cliScopeAppId
-      ? scheduleStore.listTasks()
-      : scheduleStore.listTasksForBots(allBotAppIds());
+    let tasks: ReturnType<typeof scheduleStore.listTasksStrict>;
+    try {
+      tasks = cliScopeAppId
+        ? scheduleStore.listTasksStrict()
+        : scheduleStore.listTasksForBots(allBotAppIds());
+    } catch (error) {
+      // Never print "no tasks" for a store this process cannot read: inside a
+      // personal-assistant sandbox the bot-level store is withheld on purpose
+      // (it holds every owner's tasks), and an empty listing would send the
+      // agent looking for tasks that do exist.
+      const code = (error as NodeJS.ErrnoException)?.code;
+      console.error(`botmux schedule: 读不到定时任务列表（${code ?? (error as Error)?.message ?? 'unknown'}）。`
+        + '个人助理模式的沙盒里看不到任务列表；管理任务请用创建时返回的任务 id。');
+      process.exit(1);
+    }
     if (tasks.length === 0) {
       console.log('暂无定时任务。\n\n用法:\n  botmux schedule add "每日17:50" "帮我看AI新闻"\n  botmux schedule add "every 2h" "检查构建"\n  botmux schedule add "0 9 * * *" "每天早安"');
       return;
@@ -9472,7 +9529,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       process.exit(1);
     }
 
-    let cur = frozenRelaySession ?? await detectCurrentSession();
+    let cur = frozenRelaySession ?? await detectCurrentSession() ?? await detectConfinedCurrentSession();
     let creatorAuthError: unknown;
     if (!trustedRemoteRunnerRelay) {
       try { cur = await detectAuthenticatedCurrentSession() ?? cur; }
@@ -9577,6 +9634,12 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       ? reasoningEffortArg
       : undefined;
     if (!chatId) {
+      // A managed session whose creator check failed cannot locate itself;
+      // that refusal, not the missing flag, is what the caller must see.
+      if (creatorAuthError && process.env.BOTMUX_SESSION_ID) {
+        console.error(`botmux schedule: ${creatorAuthError instanceof Error ? creatorAuthError.message : String(creatorAuthError)}`);
+        process.exit(1);
+      }
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
       process.exit(1);
     }
@@ -9704,6 +9767,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         }
       }
       if (!cur && larkAppId) {
+        // Never retry a managed session's refused creator check as an
+        // ownerless host-terminal task.
+        if (creatorAuthError && process.env.BOTMUX_SESSION_ID) throw creatorAuthError;
         const hostTaskId = explicitTaskId ?? randomBytes(4).toString('hex');
         const runAs = argValue(rest, '--run-as');
         const response = await postCurrentSessionDaemonRoute({
@@ -9791,7 +9857,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   // actions need current-human proof here first. Host-terminal administration
   // authenticates to the owning daemon; neither path falls back to editing
   // schedules.json.
-  const mutationSession = await detectCurrentSession();
+  const mutationSession = await detectCurrentSession() ?? await detectConfinedCurrentSession();
   const pauseOrRemove = ['remove', 'rm', 'delete', 'del', 'pause', 'disable'].includes(sub);
   const scheduledSelfManageCandidate = !!mutationSession?.turnId
     && mutationSession.turnId.startsWith('schedule:')

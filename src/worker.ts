@@ -441,6 +441,7 @@ import {
 } from './services/claude-bridge-blind-turn.js';
 import { terminalInputSubmits, wrapBracketedPaste } from './adapters/cli/tui-input.js';
 import { WebTerminalInputController, WebTerminalInputWireState } from './core/web-terminal-input-controller.js';
+import { isTerminalColorQueryOnly } from './core/terminal-color-query.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
@@ -22796,7 +22797,8 @@ function onPtyData(data: string, isLiveStream = true): void {
 function handlePtyDataChunk(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
-  backendScreenRevision += 1;
+  const colorQueryOnly = lastInitConfig?.cliId === 'traex' && isTerminalColorQueryOnly(data);
+  if (!colorQueryOnly) backendScreenRevision += 1;
   lastPtyActivityAtMs = Date.now();
   maybeReportDeferredTopicMaterialization(data);
   maybeCaptureKiroSessionId(data);
@@ -22858,6 +22860,11 @@ function handlePtyDataChunk(data: string): void {
       if (ws.readyState === WebSocket.OPEN) ws.send(data);
     }
   }
+
+  // A query is still relayed unchanged (xterm must answer it), and counts as
+  // process activity, but not as a redraw or new idle-detection evidence.
+  // Otherwise the 1s OSC 11 poll starves the 2s first-prompt quiet window.
+  if (colorQueryOnly) return;
 
   if (handleVisibleStartupInteraction(data)) return;
 
