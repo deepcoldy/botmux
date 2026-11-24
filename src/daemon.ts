@@ -645,7 +645,7 @@ import {
 } from './services/subtopic-mentionless-handoff.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, cancelQueuedForks, drainQueuedForks, isPendingForkTopic, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
-import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
+import { classifySlash, isCommandDecision, parseSlashCommandInvocation, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { commandSpec } from './core/command-schema.js';
 import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
 import { groupTaskSenderIsBot } from './core/group-task-start.js';
@@ -31228,7 +31228,14 @@ async function handleThreadReplyAdmitted(
     const ds = activeSessions.get(runtimeSessionKey);
     if (ds) {
       if (ds.session.reportReplyInputId !== undefined && markReportReplyInput(ds.session, parsed.messageId)) {
-        sessionStore.updateSession(ds.session);
+        try { sessionStore.updateSession(ds.session); }
+        catch (error) {
+          // Let the authorized stop handler retry the combined write and
+          // interrupt the CLI even if this earlier metadata write failed.
+          if (!ds.session.groupSessionSupervision || ctx.messageListener
+            || parseSlashCommandInvocation(cmdContent)?.cmd !== '/stop') throw error;
+          logger.warn(`[${tag(ds)}] could not save report reply input before /stop`);
+        }
       }
       clearAgentAttention(ds);
     }

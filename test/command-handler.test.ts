@@ -5485,19 +5485,18 @@ describe('handleCommand', () => {
       );
     });
 
-    it('warns that supervision may revive after a durable-stop failure without rolling back ctrl-c', async () => {
+    it('interrupts and warns when storage rejects every write made by /stop', async () => {
       const ds = makeDaemonSession({ worker: { killed: false, send: vi.fn() } as any });
       ds.session.groupSessionSupervision = {
         id: 'supervision-stop-save', requester: 'ou_requester', reviewer: { botAppId: 'local_reviewer', model: 'm' },
         chatId: CHAT_ID, anchor: ROOT_ID, task: 'Build', criteria: 'Tests pass', turnId: 'om_task', round: 0, state: 'watching',
       };
       const update = vi.mocked(sessionStore.updateSession);
-      update.mockImplementation(session => {
-        if (session.groupSessionSupervision?.reason === 'stopped') throw new Error('injected stop write failure');
-      });
+      update.mockImplementation(() => { throw new Error('injected stop write failure'); });
       const deps = makeDeps(ds);
       try {
         await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+        expect(ds.session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'stopped' });
         expect(sendWorkerSessionInput).toHaveBeenCalledWith(ds, { type: 'term_action', key: 'ctrlc' });
         expect(deps.sessionReply).toHaveBeenCalledWith(
           ROOT_ID,

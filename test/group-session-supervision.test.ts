@@ -736,6 +736,45 @@ describe('group session supervision with the session store', () => {
     expect(io.dispatch).not.toHaveBeenCalled();
   });
 
+  it('saves a retried stop after SQLite recovers, so restart cannot resume supervision', async () => {
+    const { task, session, io } = storedFixture();
+    const observation = { now: 20, outcome: { turnId: task.turnId, at: 20, outcome: 'delivered' as const } };
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('injected SQLite write failure'); });
+    try {
+      expect(() => stopGroupSessionSupervision(session, io.persist)).toThrow('injected SQLite write failure');
+      expect(sessionStore.getSessionFresh(session.sessionId)?.groupSessionSupervision?.state).toBe('watching');
+      await observeGroupSessionSupervision(session, observation, io);
+      expect(io.dispatch).not.toHaveBeenCalled();
+    } finally {
+      sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    }
+
+    stopGroupSessionSupervision(session, io.persist);
+    const restored = sessionStore.getSessionFresh(session.sessionId)!;
+    expect(restored.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'stopped' });
+    await observeGroupSessionSupervision(restored, observation, io);
+    expect(io.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('does not revive a failed stop when a later failed session write reloads the durable row', async () => {
+    const { task, session, io } = storedFixture();
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('injected SQLite write failure'); });
+    try {
+      expect(() => stopGroupSessionSupervision(session, io.persist)).toThrow('injected SQLite write failure');
+      session.title = 'Changed title';
+      expect(() => sessionStore.updateSession(session)).toThrow('injected SQLite write failure');
+    } finally {
+      sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    }
+
+    await observeGroupSessionSupervision(session, {
+      now: 30_000, outcome: { turnId: task.turnId, at: 20, outcome: 'delivered' },
+    }, io);
+    expect(io.review).not.toHaveBeenCalled();
+    expect(io.dispatch).not.toHaveBeenCalled();
+    expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'stopped' });
+  });
+
   it.each(['draining', 'committed'] as const)('preserves the watched turn if its result is %s at probe admission', async phase => {
     const { task, session, io } = storedFixture();
     const now = 12 * 60_000;

@@ -78,6 +78,7 @@ export interface GroupSessionSupervisionIo {
 }
 
 const reviews = new WeakMap<Session, AbortController>();
+const unsavedStops = new WeakMap<Session, GroupSessionSupervision>();
 
 export function groupSupervisionTracking(task?: GroupSessionSupervision): task is GroupSessionSupervision {
   return task?.state === 'preparing' || task?.state === 'watching'
@@ -95,6 +96,7 @@ export function replaceGroupSessionSupervision(
     else delete session.groupSessionSupervision;
     throw error;
   }
+  unsavedStops.delete(session);
   reviews.get(session)?.abort();
   reviews.delete(session);
 }
@@ -109,21 +111,25 @@ export function newGroupSessionSupervision(
   };
 }
 
-export function stopGroupSessionSupervision(session: Session, persist: () => void): void {
+/** Returns whether this stop handled a supervision task. */
+export function stopGroupSessionSupervision(session: Session, persist: () => void): boolean {
   const task = session.groupSessionSupervision;
-  if (!groupSupervisionTracking(task)) return;
+  if (!task || (task.reason !== 'stopped' && !groupSupervisionTracking(task))) return false;
   // Stop takes effect for the running daemon even when persistence is unavailable.
   reviews.get(session)?.abort();
-  const stopped = { ...task, state: 'needs_user', reason: 'stopped' } as const;
+  // An earlier stop may have taken effect in memory only. Persist it again
+  // when the user retries, even though it no longer tracks the turn.
+  const stopped = task.reason === 'stopped' ? task : { ...task, state: 'needs_user', reason: 'stopped' } as const;
   let lastError: unknown;
   for (let attempt = 0; attempt < STOP_PERSIST_ATTEMPTS; attempt++) {
     try {
       replaceGroupSessionSupervision(session, stopped, persist);
-      return;
+      return true;
     } catch (error) { lastError = error; }
   }
   // Never revive automatic work in this process, but make the caller tell the
   // user that a restart can still recover the last durable watching row.
+  unsavedStops.set(session, stopped);
   session.groupSessionSupervision = stopped;
   throw lastError;
 }
@@ -169,6 +175,13 @@ export async function observeGroupSessionSupervision(
   session: Session, observation: SupervisionObservation, io: GroupSessionSupervisionIo,
 ): Promise<void> {
   const initial = session.groupSessionSupervision;
+  const unsavedStop = unsavedStops.get(session);
+  if (unsavedStop && initial?.id === unsavedStop.id && initial.turnId === unsavedStop.turnId
+    && initial.reviewEpoch === unsavedStop.reviewEpoch) {
+    // Another failed session write can reload the durable, pre-stop row.
+    session.groupSessionSupervision = unsavedStop;
+    return;
+  }
   if (!groupSupervisionTracking(initial) || reviews.has(session) || !io.allowed(initial)) return;
   const { now, outcome } = observation;
   if (outcome && initial.turnId !== outcome.turnId) return;

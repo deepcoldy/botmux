@@ -3301,17 +3301,28 @@ export async function handleCommand(
           await replyNoSession(replyHere, loc);
           break;
         }
-        if (markReportReplyInput(ds.session, message.messageId)) sessionStore.updateSession(ds.session);
+        const saveReportInput = () => {
+          if (markReportReplyInput(ds.session, message.messageId)) sessionStore.updateSession(ds.session);
+        };
         if (isSessionTransferring(ds)) {
+          saveReportInput();
           await replyTransferInProgress(replyHere, loc);
           break;
         }
         let supervisionStopSaveFailed = false;
-        try { stopGroupSessionSupervision(ds.session, () => sessionStore.updateSession(ds.session)); }
-        catch {
+        let supervisionStopped = false;
+        try {
+          supervisionStopped = stopGroupSessionSupervision(ds.session, () => {
+            // An unsuccessful update restores the durable row. Include the
+            // stop input in each attempt so a separate write cannot block it.
+            markReportReplyInput(ds.session, message.messageId);
+            sessionStore.updateSession(ds.session);
+          });
+        } catch {
           supervisionStopSaveFailed = true;
           logger.warn(`[${logTag}] could not save stopped supervision`);
         }
+        if (!supervisionStopped && !supervisionStopSaveFailed) saveReportInput();
         const withStopWarning = (content: string) => supervisionStopSaveFailed
           ? `${content}\n${t('cmd.supervise.stop_save_failed', undefined, loc)}`
           : content;
