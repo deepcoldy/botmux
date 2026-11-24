@@ -331,25 +331,16 @@ function antigravitySingleTranscriptTurnFailedWithoutOutput(path: string, writte
   }
 }
 
-function verifiedCompactOnlyProofVersion(version: string | undefined): boolean {
-  const match = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version?.trim() ?? '');
-  if (!match) return false;
-  const [major = 0, minor = 0, patch = 0] = match.slice(1, 4).map(Number);
-  // Full was observed on agy 1.4.7. Only a known older release may use the
-  // compact-only proof; new or unknown versions cannot infer capability from
-  // a file currently being absent (creation/deletion TOCTOU).
-  return major < 1 || (major === 1 && (minor < 4 || (minor === 4 && patch < 7)));
-}
-
 /** Durable no-progress proof across both sibling views of one agy conversation.
  * A full log never authorizes replay alone: agy writes compact first, so full
- * without a readable compact sibling is not a complete proof. Compact-only is
- * valid for older builds without full. Any output, corruption or partial tail
- * in either present sibling fails closed. */
+ * without a readable compact sibling is not a complete proof. Native compact
+ * paths have no compact-only authorization: every supported agy build writes
+ * both views, so a missing sibling means unknown evidence and fails closed.
+ * Any output, corruption or partial tail in either present sibling fails closed. */
 export function antigravityTurnFailedWithoutOutput(
   path: string | undefined,
   writtenInput: string | undefined,
-  proofDeps: { existsSync?: (path: string) => boolean; cliVersion?: string } = {},
+  proofDeps: { existsSync?: (path: string) => boolean } = {},
 ): boolean {
   if (!path || !writtenInput) return false;
   const exists = proofDeps.existsSync ?? existsSync;
@@ -361,14 +352,7 @@ export function antigravityTurnFailedWithoutOutput(
   // An old agy build may only have compact. Once full exists, both views must
   // independently retain the exact no-progress proof; full has no single-log
   // fallback even if compact disappears between inspection and reading.
-  if (!exists(sibling)) {
-    if (isFull || !verifiedCompactOnlyProofVersion(proofDeps.cliVersion)) return false;
-    if (!antigravitySingleTranscriptTurnFailedWithoutOutput(path, writtenInput)) return false;
-    // A full log may be created while compact is being read. If it exists now,
-    // the old compact-only branch is no longer a complete proof; fail closed
-    // rather than racing a sibling that may already contain tool progress.
-    return !exists(sibling);
-  }
+  if (!exists(sibling)) return false;
   return antigravitySingleTranscriptTurnFailedWithoutOutput(path, writtenInput)
     && antigravitySingleTranscriptTurnFailedWithoutOutput(sibling, writtenInput);
 }

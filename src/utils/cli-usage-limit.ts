@@ -13,8 +13,8 @@ export interface CliUsageLimitState {
   source?: 'antigravity-error-composer' | 'antigravity-native-log';
   /** Stable native failure identity, independent of the reset-time format. */
   nativeEpisodeKey?: string;
-  /** When a composer episode was observed together with agy's log, persist that
-   * exact log key. A different later log key must not inherit old recovery. */
+  /** Native log episode explicitly observed alongside this composer episode.
+   * A different log key must never inherit this composer's recovery evidence. */
   nativeLogEpisodeKey?: string;
   /** The exact failed input has durable proof of no assistant/tool progress. */
   directFailure?: true;
@@ -321,6 +321,19 @@ export function detectCliUsageLimit(
 
 export function cliUsageLimitEpisodeKey(state: CliUsageLimitState): string | undefined {
   return state.nativeEpisodeKey ?? state.relativeResetKey;
+}
+
+/** Stable semantic identity for worker frame dedup. A relative countdown owns
+ * the episode, so its freshly recomputed deadline must not create a new frame
+ * every tick. Without an episode, retain the deadline to avoid merging distinct
+ * limits that have no stronger identity. */
+export function usageLimitEvidenceKey(state: CliUsageLimitState): string {
+  return JSON.stringify([
+    state.kind,
+    ...(cliUsageLimitEpisodeKey(state) ? [] : [state.retryAtMs]),
+    state.retryLabel, state.retryReady, state.nativeEpisodeKey, state.nativeLogEpisodeKey, state.relativeResetKey,
+    state.source, state.directFailure === true,
+  ]);
 }
 
 export function usageLimitStateKey(state: CliUsageLimitState): string {

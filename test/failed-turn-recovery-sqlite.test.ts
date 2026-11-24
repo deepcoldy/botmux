@@ -139,6 +139,31 @@ describe('HTTP recovery with real SQLite persistence', () => {
     }
   });
 
+  it('does not cancel a pending cleanup retry for an unrelated completed turn', async () => {
+    vi.useFakeTimers();
+    try {
+      ds.lastCliInputTurnId = 'om_failed';
+      ds.workerGeneration = 2;
+      ds.session.workerGeneration = 2;
+      Object.assign(ds.session.lastFailedTurn, { limitedSnapshot: true, directFailure: true });
+      store.updateSession(ds.session);
+      store.__testOnly_setBeforeRowPersist(() => {
+        store.__testOnly_setBeforeRowPersist(undefined);
+        throw new Error('injected cleanup failure');
+      });
+      expect(() => clearLimitedFailedTurn(ds)).toThrow('injected cleanup failure');
+      recordFailedTurnTerminal(ds, { turnId: 'om_unrelated', status: 'completed' },
+        { workerGeneration: 2, caller, silent: false });
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(store.getSessionFresh(ds.session.sessionId)?.lastFailedTurn).toBeUndefined();
+      expect(ds.session.lastFailedTurn).toBeUndefined();
+    } finally {
+      store.__testOnly_setBeforeRowPersist(undefined);
+      vi.useRealTimers();
+    }
+  });
+
   it('reloads one input owner and refuses late or uncorrelated failures', () => {
     registerBot({ larkAppId: 'cli_fixture', larkAppSecret: 'fixture', cliId: 'codex', apiOnly: true });
     vi.mocked(manager.rememberLastCliInput).mockRestore();

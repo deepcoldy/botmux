@@ -5133,7 +5133,8 @@ function updateUsageLimitState(
     usageLimitStateKey(previous) === usageLimitStateKey(usageLimit) &&
     previous.retryReady === usageLimit.retryReady &&
     previous.source === usageLimit.source &&
-    previous.directFailure === usageLimit.directFailure
+    previous.directFailure === usageLimit.directFailure &&
+    previous.nativeLogEpisodeKey === usageLimit.nativeLogEpisodeKey
   ) return;
 
   ds.usageLimit = usageLimit;
@@ -21813,12 +21814,11 @@ function setupWorkerHandlers(
     if (ds.lastScreenStatus !== 'limited' || !limit || ds.suppressRecoveryCard) return;
     const replacedExpiredQuota = isExpiredNativeAntigravityQuota(previousLimit)
       && previousLimit && cliUsageLimitEpisodeKey(previousLimit) !== cliUsageLimitEpisodeKey(limit);
-    // Confirmed native identity replacement is itself a fresh limited edge,
-    // even if the old episode has not expired. Same-episode proof/provenance
-    // supplements remain deduplicated.
-    const replacedNativeEpisode = previousLimit?.nativeEpisodeKey !== undefined
-      && limit.nativeEpisodeKey !== undefined
-      && previousLimit.nativeEpisodeKey !== limit.nativeEpisodeKey;
+    const linkedSameEpisode = previousLimit?.nativeLogEpisodeKey !== undefined
+      && previousLimit.nativeLogEpisodeKey === limit.nativeEpisodeKey
+      || limit.nativeLogEpisodeKey !== undefined && limit.nativeLogEpisodeKey === previousLimit?.nativeEpisodeKey;
+    const replacedNativeEpisode = !linkedSameEpisode && previousLimit?.nativeEpisodeKey !== undefined
+      && limit.nativeEpisodeKey !== undefined && previousLimit.nativeEpisodeKey !== limit.nativeEpisodeKey;
     if (previousStatus === 'limited' && !replacedExpiredQuota && !replacedNativeEpisode) return;
 
     // 已通过截图来源校验的旧帧仍可能指向旧话题。两个入口都先核对当前执行。
@@ -21859,7 +21859,7 @@ function setupWorkerHandlers(
       const path = resolveAntigravityTranscriptPath(liveId) ?? undefined;
       // Frame-time proof is only a latch. Re-read the exact current transcript
       // at the settlement edge so late assistant/tool progress revokes replay.
-      return antigravityTurnFailedWithoutOutput(path, cliInput, { cliVersion: ds.cliVersion });
+      return antigravityTurnFailedWithoutOutput(path, cliInput);
     };
     const replayPayloadForCurrentProof = () => {
       const capturedFailedTurn = ds.session.lastFailedTurn;
@@ -25145,24 +25145,22 @@ function setupWorkerHandlers(
         // leaving limited so lastFailedTurn is recorded before rotation and a
         // consumed sticky episode is cleared after recovery.
         const limitedFailedTurn = ds.session.lastFailedTurn;
-        const screenshotTurn = provenScreenTurnId(frameVerdict.source.turnId, frameVerdict.source.dispatchAttempt);
+        const frameTurnId = provenScreenTurnId(frameVerdict.source.turnId, frameVerdict.source.dispatchAttempt);
         const limitedProofChanged = ds.lastScreenStatus === 'limited'
           && (previousLimit?.directFailure !== ds.usageLimit?.directFailure
-            || limitedFailedTurn !== undefined && limitedFailedTurn.turnId === screenshotTurn
+            || previousLimit?.nativeEpisodeKey !== ds.usageLimit?.nativeEpisodeKey
+            || frameTurnId !== undefined && limitedFailedTurn?.turnId !== frameTurnId
+            || limitedFailedTurn !== undefined && limitedFailedTurn.turnId === frameTurnId
               && limitedFailedTurn.limitedSnapshot === true
               && limitedFailedTurn.directFailure !== ds.usageLimit?.directFailure);
-        const limitedIdentityChanged = ds.lastScreenStatus === 'limited'
-          && (previousLimit?.nativeEpisodeKey !== ds.usageLimit?.nativeEpisodeKey
-            || limitedFailedTurn?.turnId !== screenshotTurn);
         if (!stalePostTerminalShot && ownsLifecycleMutation()
           && (prevStatus !== ds.lastScreenStatus
-            && (prevStatus === 'limited' || ds.lastScreenStatus === 'limited')
-            || limitedProofChanged || limitedIdentityChanged)) {
+            && (prevStatus === 'limited' || ds.lastScreenStatus === 'limited') || limitedProofChanged)) {
           try {
             const published = cb.onScreenStatus?.(ds, {
               prevStatus,
               status: ds.lastScreenStatus,
-              turnId: screenshotTurn,
+              turnId: frameTurnId,
             });
             void Promise.resolve(published).catch((err: any) => {
               logger.debug(`[${t}] screenshot status bridge failed: ${err?.message ?? err}`);

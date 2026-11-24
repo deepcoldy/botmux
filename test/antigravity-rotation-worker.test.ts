@@ -532,6 +532,69 @@ describe('Antigravity worker-pool replay safety', () => {
     expect(h.sessionStore.getSessionFresh(h.ds.session.sessionId)?.lastFailedTurn).toBeUndefined();
   });
 
+  it('deduplicates a composer-to-log upgrade within one linked episode', async () => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    h.ds.adoptedFrom = 'edge-without-rotation';
+    const linked = nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-a', h.nowMs);
+    const composer = {
+      ...linked, source: 'antigravity-error-composer' as const,
+      nativeEpisodeKey: 'composer:shared-error', nativeLogEpisodeKey: 'log:native-episode-a',
+    };
+    const dispatch = async (msg: any) => {
+      for (const listener of h.worker.listeners('message')) await listener(msg);
+      await h.flush();
+    };
+    await dispatch({ type: 'screen_update', content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1', usageLimit: composer });
+    const before = h.replies.length;
+    await dispatch({ type: 'screen_update', content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1', usageLimit: linked });
+    expect(h.replies.length).toBe(before);
+    expect(h.ds.usageLimit?.nativeEpisodeKey).toBe('log:native-episode-a');
+  });
+
+  it('emits a fresh limited edge when an unexpired native episode is replaced', async () => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    h.ds.adoptedFrom = 'edge-without-rotation';
+    const dispatch = async (msg: any) => {
+      for (const listener of h.worker.listeners('message')) await listener(msg);
+      await h.flush();
+    };
+    await dispatch({ type: 'screen_update', content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1',
+      usageLimit: nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-a', h.nowMs) });
+    const before = h.replies.length;
+    await dispatch({ type: 'screen_update', content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1',
+      usageLimit: nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-b', h.nowMs) });
+    expect(h.replies.length).toBe(before + 1);
+    expect(h.ds.usageLimit?.nativeEpisodeKey).toBe('log:native-episode-b');
+  });
+
+  it('records a screenshot-only new turn before evaluating its native episode', async () => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    h.ds.adoptedFrom = 'edge-without-rotation';
+    const previousLimit = {
+      ...nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-a', h.nowMs), directFailure: true as const,
+    };
+    h.ds.usageLimit = previousLimit;
+    h.ds.lastScreenStatus = 'limited';
+    h.ds.session.usageLimit = previousLimit;
+    h.ds.session.lastFailedTurn = {
+      turnId: 'turn-1', cliInput: 'task A', userPrompt: 'task A', failedAt: new Date().toISOString(),
+      status: 'failed', retryCount: 0, limitedSnapshot: true, directFailure: true,
+    };
+    Object.assign(h.ds, { lastCliInput: 'task B', lastUserPrompt: 'task B', lastCliInputTurnId: 'turn-2' });
+    Object.assign(h.ds.session, { lastCliInput: 'task B', lastUserPrompt: 'task B', lastCliInputTurnId: 'turn-2' });
+    h.ds.activeInteractiveTurn = { turnId: 'turn-2', caller: {
+      senderType: 'user', requestLarkAppId: h.ds.larkAppId, requestUserOpenId: 'ou_owner',
+    } };
+    h.sessionStore.updateSession(h.ds.session);
+
+    h.worker.emit('message', { type: 'screenshot_uploaded', imageKey: 'img-turn-b', status: 'limited', turnId: 'turn-2',
+      usageLimit: previousLimit });
+    await h.flush();
+
+    expect(h.ds.session.lastFailedTurn).toMatchObject({ turnId: 'turn-2', cliInput: 'task B', limitedSnapshot: true });
+    expect(h.sessionStore.getSessionFresh(h.ds.session.sessionId)?.lastFailedTurn).toMatchObject({ turnId: 'turn-2' });
+  });
+
   it('records a limited failed turn when the first native evidence is a screenshot', async () => {
     const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
     delete h.ds.session.lastFailedTurn;

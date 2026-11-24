@@ -152,23 +152,38 @@ describe('raw ANSI tmux quota classification', () => {
     expect(usageLimitTracker.detectedThisTurn(turn)).toBe(true);
   });
 
-  it('does not let an old composer veto a different native-log key', () => {
+  it('does not bind an unlinked old composer to the first log key seen after turn start', () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
-    const footerless = currentQuotaScreen.slice(0, currentQuotaScreen.indexOf('\n? for shortcuts'));
-    let screen = footerless;
-    let nativeKey = 'native-composer-a';
-    const { classify } = classifier(() => screen, 'antigravity', true, false, undefined,
-      () => ({ key: nativeKey, text: screen }));
-    expect(classify('', 'idle').usageLimit).toMatchObject({
-      source: 'antigravity-error-composer', nativeEpisodeKey: expect.stringMatching(/^composer:/),
-    });
+    const refusal = '⚠ Individual quota reached. Resets in 1m.\nError ID: shared-error\n────\n>\n────\n';
+    let nativeKey: string | undefined;
+    let screen = refusal;
+    const { classify, usageLimitTracker } = classifier(() => screen, 'antigravity', true, false, undefined,
+      () => nativeKey ? { key: nativeKey, text: refusal } : undefined);
+    expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('composer:shared-error');
 
-    screen = currentQuotaScreen;
-    nativeKey = 'native-log-b-different-timestamp';
-    expect(classify('', 'idle')).toMatchObject({
-      status: 'limited',
-      usageLimit: { source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-log-b-different-timestamp' },
-    });
+    screen = refusal + '? for shortcuts';
+    usageLimitTracker.beginTurn(screen);
+    usageLimitTracker.noteTurnCompleted('answered');
+    nativeKey = 'native-B-different-timestamp';
+    expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('log:native-B-different-timestamp');
+  });
+
+  it('allows only the associated log episode to inherit composer recovery evidence', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const refusal = '⚠ Individual quota reached. Resets in 1m.\nError ID: shared-error\n────\n>\n────\n';
+    let nativeKey = 'native-A';
+    let screen = refusal;
+    const { classify, usageLimitTracker } = classifier(() => screen, 'antigravity', true, false, undefined,
+      () => ({ key: nativeKey, text: refusal }));
+    expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('composer:shared-error');
+
+    screen = refusal + '? for shortcuts';
+    usageLimitTracker.beginTurn(screen);
+    usageLimitTracker.noteTurnCompleted('answered');
+    expect(classify('', 'idle')).toEqual({ status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+
+    nativeKey = 'native-B-different-timestamp';
+    expect(classify('', 'idle').usageLimit?.nativeEpisodeKey).toBe('log:native-B-different-timestamp');
   });
 
   it('re-arms an answered turn for a different native-log episode on identical pixels', () => {

@@ -118,6 +118,10 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
    * pixels. Only the episode actually confirmed for this raw text may use the
    * answered-turn compatibility fallback; a later log key is fresh evidence. */
   let preExistingNativeLogEpisodeKey: string | undefined;
+  /** The old banner was confirmed as composer, but no native log episode was
+   * associated with it. A later arbitrary log key cannot inherit its answer. */
+  let preExistingUnlinkedComposer = false;
+  let lastUnlinkedComposerIdentity: string | undefined;
   let lastNativeLogEpisode: { rawIdentity: string; episodeKey: string } | undefined;
   /**
    * This turn produced a harvested answer (noteTurnCompleted).
@@ -178,6 +182,9 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       preExistingNativeLogEpisodeKey = preExistingBannerKey
         && lastNativeLogEpisode?.rawIdentity === preExistingBannerKey
         ? lastNativeLogEpisode.episodeKey : undefined;
+      preExistingUnlinkedComposer = preExistingBannerKey !== undefined
+        && preExistingNativeLogEpisodeKey === undefined
+        && lastUnlinkedComposerIdentity === preExistingBannerKey;
       staleBannerKey = current.limited && current.retryReady
         ? usageLimitStateKey(current)
         : undefined;
@@ -218,12 +225,15 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       }
 
       const key = usageLimitStateKey(limit);
-      if (limit.source === 'antigravity-native-log' && limit.nativeEpisodeKey && rawIdentity) {
-        lastNativeLogEpisode = { rawIdentity, episodeKey: limit.nativeEpisodeKey };
+      const nativeLogKey = limit.source === 'antigravity-native-log' ? limit.nativeEpisodeKey : limit.nativeLogEpisodeKey;
+      if (nativeLogKey && rawIdentity) {
+        lastNativeLogEpisode = { rawIdentity, episodeKey: nativeLogKey };
       }
-      const rawIdentityMatchesConfirmedEpisode = limit.source !== 'antigravity-native-log'
-        || (limit.nativeEpisodeKey !== undefined && (preExistingNativeLogEpisodeKey === undefined
-          || limit.nativeEpisodeKey === preExistingNativeLogEpisodeKey));
+      const rawIdentityMatchesConfirmedEpisode = nativeLogKey === undefined
+        || (!preExistingUnlinkedComposer && (preExistingNativeLogEpisodeKey === undefined
+          || nativeLogKey === preExistingNativeLogEpisodeKey));
+      if (nativeLogKey) lastUnlinkedComposerIdentity = undefined;
+      else if (limit.source === 'antigravity-error-composer') lastUnlinkedComposerIdentity = rawIdentity;
       // (a) master's rule: a banner already on screen whose reset time has
       //     already passed is definitionally leftover.
       // (b) the new rule: a banner that was ALREADY on screen when this turn
@@ -237,9 +247,8 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
         // The native key can arrive after turn start. Bind the FIRST confirmed
         // log key to this answered raw banner once; a later replacement key is
         // new evidence and must not inherit the suppression.
-        if (turnProducedAnswer && rawIdentity === preExistingBannerKey
-          && limit.source === 'antigravity-native-log' && limit.nativeEpisodeKey) {
-          preExistingNativeLogEpisodeKey ??= limit.nativeEpisodeKey;
+        if (turnProducedAnswer && rawIdentity === preExistingBannerKey && nativeLogKey) {
+          preExistingNativeLogEpisodeKey ??= nativeLogKey;
         }
         return { status };
       }

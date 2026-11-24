@@ -836,7 +836,7 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, reconcileUsageLimitState, detectCliUsageLimit, cliUsageLimitEpisodeKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, reconcileUsageLimitState, detectCliUsageLimit, cliUsageLimitEpisodeKey, usageLimitEvidenceKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { CodexSubagentLimitTracker } from './services/codex-subagent-limit-tracker.js';
 import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
@@ -10017,7 +10017,7 @@ function withAntigravityDirectFailureProof(limit: CliUsageLimitState): CliUsageL
       transcriptPath = nativeSessionId ? resolveAntigravityTranscriptPath(nativeSessionId) ?? undefined : undefined;
     }
   }
-  return antigravityTurnFailedWithoutOutput(transcriptPath, written, { cliVersion: lastInitConfig?.cliVersion })
+  return antigravityTurnFailedWithoutOutput(transcriptPath, written)
     ? { ...limit, directFailure: true }
     : limit;
 }
@@ -10065,22 +10065,18 @@ function classifyUsageLimitWithNativeEvidence(
     evidence = stripAnsiScreenText(evidence);
     if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
     const nativeQuota = readAntigravityNativeQuota();
-    const linkComposerToNativeLog = (state: CliUsageLimitState): CliUsageLimitState => {
-      if (state.source !== 'antigravity-error-composer' || !state.nativeEpisodeKey || !nativeQuota) return state;
-      const logKey = `log:${nativeQuota.key}`;
-      return state.nativeLogEpisodeKey === logKey ? state : { ...state, nativeLogEpisodeKey: logKey };
-    };
     const previousFor = (state: CliUsageLimitState, nativeKey?: string): CliUsageLimitState | undefined => {
       const key = state.relativeResetKey;
       const episode = nativeKey ? `log:${nativeKey}` : cliUsageLimitEpisodeKey(state) ?? key;
       if (!episode) return undefined;
       const history = antigravityQuotaHistory;
       return history?.find(entry => cliUsageLimitEpisodeKey(entry) === episode)
-        // A log episode may be the old footerless composer after its footer
-        // returned. Only that composer source may share the relative key;
-        // another native-log episode with the same countdown is NOT a match.
+        // A composer may share a deadline only with the exact log episode it
+        // was explicitly observed alongside. An older composer with the same
+        // pixels or Error ID must not veto a fresh log timestamp.
         ?? (nativeKey && key
-          ? history?.find(entry => entry.relativeResetKey === key && entry.source === 'antigravity-error-composer'
+          ? history?.find(entry => entry.relativeResetKey === key
+            && entry.source === 'antigravity-error-composer'
             && entry.nativeLogEpisodeKey === `log:${nativeKey}`)
           : undefined)
         // Before an Error ID arrived, only an unconfirmed partial frame can
@@ -10094,7 +10090,7 @@ function classifyUsageLimitWithNativeEvidence(
     if (nativeQuota) {
       const candidate = detectCliUsageLimit(evidence);
       if (candidate.limited) {
-        const composerCandidate = linkComposerToNativeLog(annotateAntigravityUsageLimit(evidence, candidate));
+        const composerCandidate = annotateAntigravityUsageLimit(evidence, candidate);
         const annotated = annotateAntigravityUsageLimit(evidence, composerCandidate, {
           text: nativeQuota.text, key: nativeQuota.key, previous: previousFor(composerCandidate, nativeQuota.key),
         });
@@ -10102,14 +10098,30 @@ function classifyUsageLimitWithNativeEvidence(
       }
     }
     let expiredAntigravityQuota: CliUsageLimitState | undefined;
+    let composerLogLink: CliUsageLimitState | undefined;
     const result = usageLimitTracker.classify(evidence, status, state => {
       const key = state.relativeResetKey;
-      const composerObserved = linkComposerToNativeLog(annotateAntigravityUsageLimit(evidence, state));
+      const composerObserved = annotateAntigravityUsageLimit(evidence, state);
+      if (composerObserved.source === 'antigravity-error-composer' && nativeQuota?.key && key) {
+        const linkedKey = `log:${nativeQuota.key}`;
+        const existingComposer = antigravityQuotaHistory?.find(entry =>
+          entry.source === 'antigravity-error-composer' && entry.relativeResetKey === key);
+        // Only a first simultaneous observation (or the same established link)
+        // creates an association. An older unlinked composer is never rebound
+        // to a different native-log timestamp.
+        if (!existingComposer || existingComposer.nativeLogEpisodeKey === linkedKey) {
+          composerLogLink = { ...composerObserved, nativeLogEpisodeKey: linkedKey };
+        }
+      }
       const previous = previousFor(composerObserved, nativeQuota?.key);
       const annotated = annotateAntigravityUsageLimit(evidence, composerObserved, {
         text: nativeQuota?.text, key: nativeQuota?.key, previous,
       });
-      const observed = withAntigravityDirectFailureProof(annotated);
+      const observed = withAntigravityDirectFailureProof(
+        composerObserved.source === 'antigravity-error-composer' && nativeQuota?.key
+          ? { ...annotated, nativeLogEpisodeKey: `log:${nativeQuota.key}` }
+          : annotated,
+      );
       if (!key) return observed;
 
       const now = Date.now();
@@ -10125,6 +10137,7 @@ function classifyUsageLimitWithNativeEvidence(
     // 只用已上报且带 Error ID 的部分帧固定首次截止时间。看到原生证据后再把它计入历史。
     const limit = expiredAntigravityQuota ?? result.usageLimit;
     const key = limit?.relativeResetKey;
+    if (composerLogLink) antigravityQuotaHistory = rememberAntigravityQuota(antigravityQuotaHistory, composerLogLink);
     if (limit && key) {
       if (limit.source === 'antigravity-error-composer' || limit.source === 'antigravity-native-log') {
         antigravityQuotaHistory = rememberAntigravityQuota(antigravityQuotaHistory, limit);
@@ -19492,11 +19505,7 @@ async function captureAndUpload(): Promise<void> {
   // a new log episode, or countdown expiry), so that semantic edge also owns a
   // fresh key and is delivered once.
   const limitIdentity = (limit: CliUsageLimitState | undefined): string | undefined => limit
-    ? JSON.stringify([
-      limit.kind, limit.retryLabel, limit.retryReady,
-      limit.nativeEpisodeKey, limit.relativeResetKey, limit.source, limit.directFailure === true,
-    ])
-    : undefined;
+    ? usageLimitEvidenceKey(limit) : undefined;
   const dedupKey = (pixelHash: string, usageAware?: UsageAwareScreen): string => {
     const recovery = usageAware?.usageLimitRecovery;
     const base = `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}${recovery ? `:recovery=${recovery}` : ''}`;
@@ -27778,10 +27787,7 @@ function startScreenUpdates(): void {
       if (startupInputHeld()) return;
       const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
       const usageLimit = usageAware.usageLimit;
-      const usageLimitEvidence = usageLimit ? JSON.stringify([
-        usageLimit.kind, usageLimit.retryLabel, usageLimit.retryReady,
-        usageLimit.nativeEpisodeKey, usageLimit.relativeResetKey, usageLimit.source, usageLimit.directFailure === true,
-      ]) : undefined;
+      const usageLimitEvidence = usageLimit ? usageLimitEvidenceKey(usageLimit) : undefined;
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
         || usageLimitEvidence !== lastSentUsageLimitEvidence
         || usageAware.usageLimitRecovery !== lastSentRecovery
