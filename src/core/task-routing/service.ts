@@ -164,6 +164,7 @@ export async function getTaskRoutingStatus(deps: TaskRoutingServiceDeps = {}): P
   enabled: boolean;
   matcherMode: string;
   matcherBotAppId?: string;
+  matcherTimeoutMs?: number;
   policy?: string;
   eligible: CandidateEvaluation[];
   excluded: CandidateEvaluation[];
@@ -181,6 +182,7 @@ export async function getTaskRoutingStatus(deps: TaskRoutingServiceDeps = {}): P
     enabled: true,
     matcherMode: globalCfg.matcher?.mode ?? 'rule',
     ...(globalCfg.matcher?.botAppId ? { matcherBotAppId: globalCfg.matcher.botAppId } : {}),
+    ...(globalCfg.matcher?.timeoutMs !== undefined ? { matcherTimeoutMs: globalCfg.matcher.timeoutMs } : {}),
     ...(globalCfg.policy ? { policy: globalCfg.policy } : {}),
     eligible,
     excluded,
@@ -306,7 +308,7 @@ export async function runTaskRouting(
 }
 
 export async function listTaskRoutingHistory(
-  input: { limit?: number; botRef?: string } = {},
+  input: { limit?: number; botRef?: string; outcome?: TaskRoutingOutcome } = {},
   deps: TaskRoutingServiceDeps = {},
 ): Promise<TaskRoutingRecord[]> {
   assertTaskRoutingEnabled(deps);
@@ -334,6 +336,7 @@ export async function listTaskRoutingHistory(
   return store.listRecords({
     limit: input.limit ?? 20,
     ...(botAppId ? { botAppId } : {}),
+    ...(input.outcome ? { outcome: input.outcome } : {}),
   });
 }
 

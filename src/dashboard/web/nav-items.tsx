@@ -45,6 +45,22 @@ export const NAV_ITEMS: NavItem[] = [
     aliases: ['拍板', 'decisions'],
     icon: <><rect x="2.5" y="2" width="11" height="12" rx="1.8" /><path d="M5 5.6l1.1 1.1 2.1-2.1M5 10.4l1.1 1.1 2.1-2.1M9.9 5.7h1.6M9.9 10.5h1.6" /></>,
   },
+  // 任务分配：默认关闭，仅在全局设置开启「Bot 任务分配」后显示（见 app.tsx 的 sidebarNavItems）。
+  {
+    id: 'task-routing',
+    href: '#/assign',
+    labelKey: 'nav.taskRouting',
+    aliases: ['派活', '分配任务', 'assign', 'bot assign'],
+    manage: true,
+    icon: (
+      <>
+        <circle cx="3.2" cy="8" r="1.8" />
+        <circle cx="12.8" cy="3.6" r="1.8" />
+        <circle cx="12.8" cy="12.4" r="1.8" />
+        <path d="M5 7.2 11 4.4M5 8.8 11 11.6" />
+      </>
+    ),
+  },
   {
     // 驾驶舱（Agent Workbench）：桌面/移动壳内与带沉浸式标记的直达入口是无边框壳
     // （见 workbenchSurface），从侧边栏进入时走正常壳。不属于 manage 项。
@@ -116,7 +132,7 @@ export const NAV_ITEMS: NavItem[] = [
  */
 export const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
   { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
-  { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'decision-board', 'agent-workbench', 'groups', 'schedules', 'workflows'] },
+  { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'decision-board', 'task-routing', 'agent-workbench', 'groups', 'schedules', 'workflows'] },
   { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'message-listeners', 'doc-watches', 'bot-defaults', 'agents'] },
   { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
   { id: 'manage', labelKey: 'nav.group.manage', items: ['terminal', 'connectors', 'plugins', 'whiteboards', 'settings'] },
