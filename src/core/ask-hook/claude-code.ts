@@ -48,6 +48,7 @@
 import type { AskQuestion } from '../ask-types.js';
 import { PERMISSION_ALLOW_KEY, PERMISSION_DENY_KEY, type HookAskAdapter, type ParsedAsk } from './types.js';
 import { createClaudePermissionWatcher } from './claude-permission-watch.js';
+import { answerWithNote } from '../ask-notes.js';
 
 /** 从 payload 中提取原始 questions 数组（用于写回 updatedInput.questions）。 */
 function extractRawQuestions(payload: unknown): Array<Record<string, unknown>> {
@@ -98,6 +99,7 @@ const claudeCodeAdapter: HookAskAdapter = {
     parsed: ParsedAsk,
     comment?: string | null,
     customAnswers?: ReadonlyArray<string | null>,
+    notes?: ReadonlyArray<string | null>,
   ): string {
     const rawPayload = parsed.raw;
     const rawQuestions = extractRawQuestions(rawPayload);
@@ -115,7 +117,8 @@ const claudeCodeAdapter: HookAskAdapter = {
           const opt = q.options.find((o) => o.key === k);
           return opt ? opt.label : k;
         });
-        answers[q.prompt] = labels.join(', ');
+        // A note written next to the options rides on the same answer string.
+        answers[q.prompt] = answerWithNote(labels.join(', '), notes?.[i]);
       } else if (customText) {
         // 自定义回复（替代语义）：该问无选中项 → 回落到用户的自定义文字。
         // Claude Code 的 AskUserQuestion 原生支持任意文本答案（即"Other"路径）。

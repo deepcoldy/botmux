@@ -392,9 +392,14 @@ export class TraexQuestionBridge {
     }
     if (!('index' in page) || !page.notesOpen) return;
     const other = page.options[page.options.length - 1]!.number;
+    // A custom answer writes into the "None of the above"/"Other" notes; an option with a note
+    // into the notes of that option (single choice) or of the question (multi choice).
+    const text = answer.kind === 'custom' ? answer.text : answer.note;
+    const anchor = answer.kind === 'options' && answer.note
+      ? (page.multiSelect ? page.highlighted : answer.numbers[0]) : other;
     const ours = page.notesText === undefined || page.notesText === ''
-      || (answer.kind === 'custom' && page.notesText.replace(/\s+/g, '') === answer.text.replace(/\s+/g, ''));
-    if (page.highlighted !== other || !ours) return;
+      || (text !== undefined && page.notesText.replace(/\s+/g, '') === text.replace(/\s+/g, ''));
+    if (page.highlighted !== anchor || !ours) return;
     if (!this.deps.enabled() || this.deps.lifetime() !== card.lifetime) return;
     if (await this.deps.writeKey('Tab')) this.deps.log(`TraeX question ${page.index}/${page.total}: closed the notes field this answer opened`);
   }

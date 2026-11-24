@@ -374,6 +374,9 @@ export function buildAskSettledBody(ask: PendingAsk, result: AskResult, options:
         });
       }
       if (!lines.length && !result.comment) lines = [grey(t('card.ask.answer.none', undefined, locale))];
+      // A note written next to the ticked options follows them.
+      const note = result.notes?.[i];
+      if (note && !custom) lines.push(t('card.ask.note_line', { note: value(note) }, locale));
       if (lines.length) children.push({ tag: 'markdown', content: lines.join('\n') });
     }
     return children;
@@ -391,9 +394,20 @@ export function buildAskSettledBody(ask: PendingAsk, result: AskResult, options:
   return { elements, descriptionsTruncated };
 }
 
+/**
+ * 「由 <who> 提交 · 截止 …」. A Feishu user id is shown as the person's name through the
+ * display-only `<person>` tag (Feishu documents it as never notifying, unlike `<at>`, and an id it
+ * cannot resolve shows as an unknown user instead of failing the card); any other actor
+ * (Dashboard answers, …) as plain text.
+ */
 export function submittedByLine(by: string, ask: Pick<PendingAsk, 'deadlineAt' | 'createdAt'>, locale: Locale): string {
+  const deadline = deadlineText(ask, locale);
+  if (/^ou_[A-Za-z0-9_-]+$/.test(by)) {
+    const [before = '', after = ''] = t('card.ask.footer.submitted_by', { by: '\u0000' }, locale).split('\u0000');
+    return `${before ? grey(before) : ''}<person id='${by}' show_name=true show_avatar=false style='normal'></person>${grey(`${after} · ${deadline}`)}`;
+  }
   const who = escapeAnswerText(by.length > 28 ? `${by.slice(0, 28)}…` : by);
-  return grey(`${t('card.ask.footer.submitted_by', { by: who }, locale)} · ${deadlineText(ask, locale)}`);
+  return grey(`${t('card.ask.footer.submitted_by', { by: who }, locale)} · ${deadline}`);
 }
 
 /** Keep labelled web links usable without enabling arbitrary question markup. */

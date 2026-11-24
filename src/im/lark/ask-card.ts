@@ -241,8 +241,7 @@ function choiceProblemToast(
 ): { toast: { type: string; content: string } } | undefined {
   const problem = askChoiceProblem(questions, selections, texts);
   if (!problem) return undefined;
-  const key = problem.kind === 'too_many' ? 'card.ask.toast.too_many'
-    : problem.kind === 'option_and_text' ? 'card.ask.toast.option_and_text' : 'card.ask.toast.unanswered';
+  const key = problem.kind === 'too_many' ? 'card.ask.toast.too_many' : 'card.ask.toast.unanswered';
   return { toast: { type: 'warning', content: t(key, { n: problem.questionIndex + 1 }, locale) } };
 }
 

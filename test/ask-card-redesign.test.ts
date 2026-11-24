@@ -141,18 +141,28 @@ describe('一次提交：每题规则（toast 说明第几题，卡片与已勾�
   });
 
   it.each([
-    ['单选', 0, { opt_0_1: true, custom_0: '我自己的答案', opt_1_0: true, custom_1: '' }],
-    ['多选', 1, { opt_0_1: true, custom_0: '', opt_1_0: true, custom_1: '还想看海' }],
-  ])('%s题同时勾了选项又自己写了 → 提示只保留一种（存的语义里自写会顶掉勾选）', async (_kind, index, fields) => {
-    const { ask, card } = await open(twoQuestions);
-    expect(await submit(ask, submitOf(card), fields)).toEqual(toastFor('card.ask.toast.option_and_text', index + 1));
-    expect(getAskSnapshot(ask.askId)?.settled).toBe(false);
+    ['单选', { opt_0_1: true, custom_0: '  带一只狗  ', opt_1_0: true, custom_1: '' }, [['two'], ['hike']], ['带一只狗', null]],
+    ['多选', { opt_0_1: true, custom_0: '', opt_1_0: true, opt_1_2: true, custom_1: '还想看海' }, [['two'], ['hike', 'food']], [null, '还想看海']],
+  ])('%s题勾了选项又写了字 → 选项照常作答，写的字作为该题备注', async (_kind, fields, answers, notes) => {
+    const { ask, answer, card } = await open(twoQuestions);
+    const response = await submit(ask, submitOf(card), fields);
+    expect(response.header.template).toBe('green');
+    const result = await answer;
+    expect(result).toMatchObject({ kind: 'answered', answers, notes });
+    expect(result).not.toHaveProperty('customAnswers');
+  });
+
+  it('输入框的提示写明它既是备注、也是都不合适时的答案', async () => {
+    const { card } = await open([single()]);
+    expect(all(card).find(n => n.tag === 'input').placeholder.content).toBe(t('card.ask.custom_placeholder'));
   });
 
   it('只写不勾：自写内容作为该题答案，其它题照常', async () => {
     const { ask, answer, card } = await open(twoQuestions);
     await submit(ask, submitOf(card), { opt_0_2: true, custom_0: '', custom_1: '  还想看海  ' });
-    expect(await answer).toMatchObject({ kind: 'answered', answers: [['three'], []], customAnswers: [null, '还想看海'] });
+    const result = await answer;
+    expect(result).toMatchObject({ kind: 'answered', answers: [['three'], []], customAnswers: [null, '还想看海'] });
+    expect(result).not.toHaveProperty('notes');
   });
 
   it('多选可以多勾，答案按选项顺序', async () => {
@@ -276,6 +286,27 @@ describe('已结束的卡', () => {
     const custom = JSON.parse(buildAskCard(ask(), { ...answered, answers: [[], ['hike']], customAnswers: ['<b>周末</b>', null] }));
     expect(answerLines(custom)).toEqual(['✓ &lt;b&gt;周末&lt;/b&gt;', '✓ **徒步**']);
     expect(all(card).filter(n => n.behaviors || ['button', 'checker', 'input', 'form'].includes(n.tag))).toEqual([]);
+  });
+
+  it('勾了选项又写了备注：✓ 选项之后跟一行「备注：…」（备注按原文显示，不当标记）', () => {
+    const withNotes: AskResult = { kind: 'answered', answers: [['two'], ['hike', 'food']], notes: ['带一只*狗*', null],
+      by: 'ou_owner', comment: null, timedOut: false };
+    const lines = answerLines(JSON.parse(buildAskCard(ask(), withNotes)));
+    expect(lines[0]).toBe(`✓ **两天**\n${t('card.ask.note_line', { note: '带一只\\*狗\\*' })}`);
+    expect(lines[1]).toBe('✓ **徒步**\n✓ **美食**');
+  });
+
+  it('提交人显示成飞书里的名字（只展示、不 @ 人），不是一串 open_id；非飞书用户 id 照原文', () => {
+    const answered = (by: string): AskResult => ({ kind: 'answered', answers: [['one'], []], by, comment: null, timedOut: false });
+    const footer = (by: string) => JSON.parse(buildAskCard(ask(), answered(by))).body.elements.at(-1).content as string;
+    const human = footer('ou_75dd0123456789abcdef');
+    expect(human).toContain("<person id='ou_75dd0123456789abcdef' show_name=true show_avatar=false style='normal'></person>");
+    expect(human).not.toContain('<at');
+    expect(human.replace(/<person[^>]*><\/person>/, '')).not.toContain('ou_75dd');
+    expect(footer('desktop')).toContain('desktop');
+    expect(footer('desktop')).not.toContain('<person');
+    // Anything that is not a plain open_id never becomes markup.
+    expect(footer("ou_x' show_name=false")).not.toContain('<person');
   });
 
   it.each([

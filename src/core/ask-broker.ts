@@ -30,7 +30,7 @@ import type {
 } from './ask-types.js';
 import { AskDispatchError } from './ask-types.js';
 import { supportsAskCustomInput, parseAskCustomFields } from './ask-custom-input.js';
-import { askChoiceProblem } from './ask-choice.js';
+import { askChoiceProblem, splitAskTexts } from './ask-choice.js';
 import { isHookPermissionAsk } from './ask-hook/types.js';
 
 /** Origins for which restart-resume + durable handoff are enabled. Only a
@@ -859,7 +859,9 @@ export function applyAskForm(args: {
  * so the server draft never decides the answer. Order: decision gate (nonce, settled,
  * authorization) → shape (unknown option = stale) → text fields → per-question rules
  * (`invalid_choice`, nothing changes) → draft version for custom-input asks → empty-submit
- * confirmation → settle. A question's own text replaces its keys, exactly as on the v1 form.
+ * confirmation → settle. A question's text with nothing ticked is its own answer
+ * (`customAnswers[i]`, as on the v1 form); text next to ticked options is a note on them
+ * (`notes[i]`, options kept in `answers[i]`).
  *
  * On `needs_empty_confirm` the submitted (empty) ticks become the draft first, so the armed
  * re-render does not tick pre-selected defaults again and confirm them by accident.
@@ -909,8 +911,8 @@ export function submitAskChoices(args: {
   }
   settle(args.askId, {
     kind: 'answered',
-    answers: selections.map((keys, i) => custom[i] ? [] : keys),
-    ...(custom.some(Boolean) ? { customAnswers: custom } : {}),
+    answers: selections,
+    ...splitAskTexts(selections, custom),
     by: args.by, comment: null, timedOut: false,
   });
   return 'accepted';

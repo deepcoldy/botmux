@@ -265,6 +265,26 @@ describe('entering an answer one verified input at a time', () => {
     expect(nextTraexQuestionStep(page('traex-0.214.1-long-notes-hidden-80x24.txt'), answer).kind).toBe('fail');
   });
 
+  it('enters an option with a card note into TRAE\'s own notes for that option: move (never the digit), Tab, paste, Enter', () => {
+    // TRAE then answers ["SQLite", "user_note: …"] (traex-0.214.1-answered-composer).
+    const note = '用第二个方案吧，另外帮我看下日志';
+    const answer = { kind: 'options' as const, numbers: [3], note };
+    expect(traexQuestionAnswerFromAsk(page('traex-0.214.1-single-160x50.txt'), answered(['3'], { notes: [`  ${note}\n `] })))
+      .toEqual(answer);
+    // Pointer on 1: move to 3 (a digit would submit without the note).
+    expect(nextTraexQuestionStep(page('traex-0.214.1-single-160x50.txt'), answer)).toEqual({ kind: 'key', key: 'Down', final: false });
+    expect(nextTraexQuestionStep(page('traex-0.214.1-single-highlight3-160x50.txt'), answer)).toEqual({ kind: 'key', key: 'Tab', final: false });
+    expect(nextTraexQuestionStep(page('traex-0.214.1-single-notes-empty-160x50.txt'), answer)).toEqual({ kind: 'paste', text: note });
+    expect(nextTraexQuestionStep(page('traex-0.214.1-single-notes-typed-160x50.txt'), answer)).toEqual({ kind: 'key', key: 'Enter', final: true });
+    // Notes open on option 3 do not belong to an answer for option 2; other text is never overwritten.
+    expect(nextTraexQuestionStep(page('traex-0.214.1-single-notes-empty-160x50.txt'), { ...answer, numbers: [2] }).kind).toBe('fail');
+    expect(nextTraexQuestionStep(page('traex-0.214.1-single-notes-typed-160x50.txt'), { ...answer, note: '别的' }).kind).toBe('fail');
+    // Multi choice: tick exactly the chosen boxes first, then open the notes.
+    const q2 = page('traex-0.214.1-multi-q2-multiselect-160x50.txt'); // Caching ✓, Tracing ✓
+    expect(nextTraexQuestionStep(q2, { kind: 'options', numbers: [1, 3], note })).toEqual({ kind: 'key', key: 'Tab', final: false });
+    expect(nextTraexQuestionStep(q2, { kind: 'options', numbers: [2], note })).toEqual({ kind: 'key', key: '1', final: false });
+  });
+
   it('allows only page-local inputs, and digits/arrows only while the options have focus', () => {
     const single = page('traex-0.214.1-single-160x50.txt');
     const notes = page('traex-0.214.1-single-notes-empty-160x50.txt');

@@ -93,8 +93,13 @@ export type AskResult =
       answers: ReadonlyArray<ReadonlyArray<string>>;
       /** Form-only values, aligned with questions; choice/empty input slots are null. */
       inputs?: ReadonlyArray<string | null>;
-      /** Per-question free text; replaces only that question's selected keys. */
+      /** Per-question free text written with NO option ticked: it is that question's answer
+       *  (its `answers[i]` is empty). Results stored by older versions use it the same way. */
       customAnswers?: ReadonlyArray<string | null>;
+      /** Per-question note written next to ticked options: `answers[i]` holds the options and
+       *  this text goes with them. Absent on results from older versions; a consumer that
+       *  ignores it still gets the right options. */
+      notes?: ReadonlyArray<string | null>;
       by: string;
       /** 自定义回复原文（用户在话题里直接打字作答）；按钮选择时为 null。 */
       comment: string | null;
@@ -134,7 +139,10 @@ export interface AskJsonOutput {
   /** v0.1.8 新增：按问题分组的完整答案，answered 时非 null。 */
   answers: string[][] | null;
   inputs?: Array<string | null> | null;
+  /** Text a question was answered with instead of an option (that question's `answers[i]` is empty). */
   customAnswers?: ReadonlyArray<string | null>;
+  /** Note the user added next to the options ticked for that question (`answers[i]` non-empty). */
+  notes?: ReadonlyArray<string | null>;
   by: string | null;
   /** 自定义回复原文；按钮选择 / 超时 / 失效时为 null。 */
   comment: string | null;

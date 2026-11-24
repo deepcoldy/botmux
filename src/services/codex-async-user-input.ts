@@ -80,7 +80,7 @@ export function codexAsyncAnswerText(
     questionItemId: JSON.stringify(['request_user_input_async', input.itemId, index]),
     question: [...entry.question.prompt.replace(/[\r\n]/g, ' ')].slice(0, 512).join(''),
     answer: (result.kind === 'answered' && result.answers?.[index]?.length
-      ? answers[entry.id].answers.map(key => entry.question.options.find(o => o.key === key)!.label)
+      ? answers[entry.id].answers.map(value => entry.question.options.find(o => o.key === value)?.label ?? value)
       : answers[entry.id].answers).join('\n'),
   }));
   const json = JSON.stringify(replies).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');

@@ -22,6 +22,8 @@ export interface HookAskAdapter {
    * answersByQuestion[i] = questions[i] 选中的 key 数组。
    * `comment` 为用户自定义回复原文（话题里直接打字作答）；按钮选择时为 null/缺省。
    * 没有任何选中项的问题，若 comment 非空则回落到 comment（替代语义）。
+   * `customAnswers[i]`：该问没勾选项、只写了文字时的答案；`notes[i]`：勾了选项又写的备注，
+   * 随选项一起交给 CLI（各 CLI 的放法见各适配器）。
    * 返回写回 CLI 的 directive JSON 字符串。
    */
   formatAnswer(
@@ -29,6 +31,7 @@ export interface HookAskAdapter {
     parsed: ParsedAsk,
     comment?: string | null,
     customAnswers?: ReadonlyArray<string | null>,
+    notes?: ReadonlyArray<string | null>,
   ): string;
 
   /** hook 接管失败时的"放行/无操作" directive（让 CLI 回退原生终端提问）。 */

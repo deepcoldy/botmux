@@ -97,15 +97,15 @@ When the agent asks with `botmux ask`, or Claude Code / Codex asks a question on
 | What you see | What to do |
 |--------------|------------|
 | Single / multiple choice | Tick options (ticking stays in your client until you submit), then press "Submit" at the bottom once for the whole card. A single-choice question takes one tick; submitting a multi-choice card with nothing ticked needs a second "Confirm empty submit" |
-| A pop-up after "Submit" | Your ticks and text are still on the card: fix the question it names (more than one tick on a single choice, a required question left empty, or both ticks and your own answer on one question), then press "Submit" again |
+| A pop-up after "Submit" | Your ticks and text are still on the card: fix the question it names (more than one tick on a single choice, or a required question left empty), then press "Submit" again |
 | "Single choice · tap to submit" | With one single-choice question, no own-answer box and no preselection, tapping a row submits that option right away; there is no "Submit" button |
 | Green "Recommended" tag | The asker's recommended option (a trailing "(Recommended)" / 「（推荐）」 in its label becomes this tag); it is only a hint |
 | Options already ticked | These are the asker's defaults, only a draft. Nothing counts as an answer until you press "Submit", and you can change them |
-| "None fits? Write your own answer" | Most questions have this box under their options (unless the asker turned it off, or the card has text / number fields). Write your own answer when no option fits; it replaces only that question, so leave its options unticked. Up to 1000 characters per question, 2000 per card |
+| "Add a note, or write your own answer if none fits" | Most questions have this box under their options (unless the asker turned it off, or the card has text / number fields). With options ticked, what you write is a note on that question and goes to the asker with them; with nothing ticked, it is that question's answer. Up to 1000 characters per question, 2000 per card |
 | Text / number fields | Fill them in; required fields can't be blank, and numbers must stay within any given range |
 | The small line @-mentions one person | The asker named an answerer with `--answerer`, and only that person can submit (questions routed in from another app show "only the designated member may answer" instead). It only limits who can answer; it is not a business approval |
 
-After you submit, the card turns green ("Submitted") and lists what you chose or wrote under each question with ✓; a timed-out or invalidated card turns grey and still shows the questions. Without a designated answerer, anyone in the chat who can talk to the bot can answer. If no option fits, you can also just reply in the topic with text. When an ask has so many questions and options that checkboxes no longer fit on one card, the card only lists them; reply with your answer in the chat. See [CLI commands](/en/cli-commands) for the flags.
+After you submit, the card turns green ("Submitted") and lists what you chose or wrote under each question with ✓ (a note on its own "Note: …" line) and who submitted it; a timed-out or invalidated card turns grey and still shows the questions. Without a designated answerer, anyone in the chat who can talk to the bot can answer. If no option fits, you can also just reply in the topic with text. When an ask has so many questions and options that checkboxes no longer fit on one card, the card only lists them; reply with your answer in the chat. See [CLI commands](/en/cli-commands) for the flags.
 
 ### Terminal permission card (Claude Code)
 

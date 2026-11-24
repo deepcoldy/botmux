@@ -5,9 +5,10 @@ import type { AskQuestion } from '../../core/ask-types.js';
  * dropdown fallback of a very large Ask is `pick_<question>`. Every other field (own-answer
  * `custom_<i>`, input `q<i>`) is passed through for its own validator.
  *
- * Feishu does not document what a checker inside a form submits, so the value is read
- * defensively: booleans, boolean-like strings and numbers, or an object with `checked`; an absent
- * checker is unticked. Any other shape is `unreadable` (fail closed: never guess a tick).
+ * Feishu does not document what a checker inside a form submits; a live trial (2026-11) showed a
+ * JSON boolean per checker. The value is still read tolerantly: booleans, boolean-like strings and
+ * numbers, or an object with `checked`; an absent checker is unticked. Any other shape is
+ * `unreadable` (fail closed: never guess a tick).
  */
 export type AskChoiceFormValue =
   | { kind: 'ok'; selections: string[][]; fields: Record<string, unknown>; sawChoiceField: boolean }
