@@ -103,7 +103,7 @@
 | `displayName` | Dashboard 里显示的备注名。只影响 Dashboard 展示，不改飞书里的应用名 |
 | `cliId` | 用哪个 CLI，默认 `claude-code`。可选值见[多 CLI 适配器](/adapters)。`gemini` 已下线：还写着 `"gemini"` 的 bot 会拒绝启动，并提示改成 `"antigravity"` |
 | `model` | 启动 CLI 用的模型名（比如 `claude --model opus`）；不填就用 CLI 自己的默认值。同一种 CLI 的多个 bot 可以跑不同模型。每次启动或恢复会话时都按当前配置取值，所以改完后，没设群级模型的老会话下次恢复时也会用新模型 |
-| `customModels` | 飞书模型选择器中的额外候选，例如 `["gateway/model-v2:1"]`。按配置顺序置于目录前，适用于 `/models`、`/models default`、`/botconfig` 和普通回复卡中的「切换模型」。ID 最长 64 字符，以字母或数字开头，可包含 `.`、`_`、`:`、`/`、`-`。模型须受当前 CLI 或网关支持 |
+| `customModels` | 飞书模型选择器中的额外候选，最多 50 个，例如 `["gateway/model-v2:1"]`。按配置顺序置于目录前，适用于 `/models`、`/models default`、`/botconfig` 和普通回复卡中的模型菜单。ID 区分大小写，最长 64 字符，以 ASCII 字母或数字开头，可包含 `.`、`_`、`:`、`/`、`-`。模型须受当前 CLI 或网关支持 |
 | `reasoningEffort` | 新会话默认的思考强度，取值 `low` / `medium` / `high` / `xhigh` / `max` / `ultra`。支持的 CLI：Claude Code、Codex、Codex App、TraeX、Grok、Kimi、ZCode、Doubao、`remote-runner`。会按 CLI 和模型的能力校验，不支持的组合会被忽略。例如 Kimi 只在模型是 `kimi-code/k3` 或 `kimi-code/k3-256k` 时生效，且只有 `low` / `high` / `max` 三档；Claude 的 Haiku 模型不支持思考强度 |
 | `groupDefaultModels` | 按群设置新话题的默认模型，目前支持 Codex 和 Claude Code。见下方[群级新话题默认模型](#group-default-models) |
 | `serviceTier` | 仅 Codex：新会话的速度档位 `default` / `priority` / `ultrafast`；不填沿用 Codex 自己的配置 |

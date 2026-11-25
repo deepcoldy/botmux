@@ -208,6 +208,8 @@ Values: `output` (show output, export text, refresh), `terminal`, `writeLink`, `
 
 All of these can be changed in the Dashboard or with `/botconfig set <setting> on|off`.
 
+For managed local Claude Code sessions, the reply card’s **Switch model** menu item and the topic command `/models` open the same model and effort picker. The picker shows the observed runtime alongside the selections for the next launch. Changes apply on the next cold resume or after an explicit `/restart` while idle. Restarting stops background terminal tasks. Custom candidates come from the bot’s `customModels` setting. Available combinations depend on the CLI and gateway.
+
 ## Pinning the current status card
 
 With `pinStreamingCard` on, Botmux pins the **current public status card** to the top of the chat so the terminal and close buttons are always within reach.

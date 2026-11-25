@@ -37,7 +37,7 @@ import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from '../
 import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { detectUnusableOwnerEntries } from '../setup/owner-identity.js';
-import { CLI_SELECT_OPTIONS, resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
+import { CLI_SELECT_OPTIONS, isTtadkWrapper, resolveCliSelection, selectionKeyForBot, ttadkAcceptsModel } from '../setup/cli-selection.js';
 import { dropConfiguredCliRuntime } from '../adapters/cli/runtime.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
@@ -1431,9 +1431,13 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
   if (cfg.cliId === 'zcode' && selectedModel) {
     try { const ref = resolveZcodeModelReference(selectedModel, { ...process.env, ...cfg.env }); selectedModel = `${ref.providerId}/${ref.modelId}`; } catch { /* stale selections remain visible */ }
   }
-  const configured = selectedModel && !modelChoices.includes(selectedModel)
-    && DEFAULT_MODEL_VALUE_PATTERN.test(selectedModel) ? [selectedModel] : [];
-  const options = limitModelOptions([...(cfg.customModels ?? []), ...configured, ...modelChoices], selectedModel ?? undefined, true);
+  const supportsConfiguredModel = botAcceptsLaunchModel(cfg)
+    && (!isTtadkWrapper(cfg.wrapperCli) || ttadkAcceptsModel(cfg.wrapperCli));
+  const configured = supportsConfiguredModel && selectedModel && !modelChoices.includes(selectedModel)
+    && DEFAULT_MODEL_VALUE_PATTERN.test(selectedModel)
+    ? [selectedModel] : [];
+  const custom = supportsConfiguredModel ? cfg.customModels ?? [] : [];
+  const options = limitModelOptions([...custom, ...configured, ...modelChoices], selectedModel ?? undefined, true);
   const modelChoiceLabels = cfg.cliId === 'zcode'
     // Same model name behind two gateways must stay distinguishable in the card.
     ? Object.fromEntries(options.map(m => [m, formatZcodeModelChoice(m, zcodeEnv, zcodeAmbiguousModelIds(zcodeEnv))])) : undefined;

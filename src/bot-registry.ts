@@ -1629,7 +1629,7 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
-  /** Extra model IDs shown in this bot’s Feishu model pickers. */
+  /** Up to 50 extra model IDs for this bot’s configured CLI or gateway. */
   customModels?: string[];
   /** Experimental TraeX-only ordered model allowlist used when model=`auto`.
    * The first entry is the core model; later entries are capacity fallbacks.

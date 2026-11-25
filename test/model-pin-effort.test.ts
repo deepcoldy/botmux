@@ -6,7 +6,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import * as registry from '../src/bot-registry.js';
 import * as store from '../src/services/session-store.js';
-import { sessionReasoningControl, setSessionReasoningEffort, setTopicReasoningEffort, updateCodexCliEffort, updateCodexAppEffort, writeSessionModelPin,
+import { sessionReasoningControl, setSessionReasoningEffort, setTopicReasoningEffort, updateCodexCliEffort, updateCodexAppEffort, writeSessionModelPin, supportsClaudeSessionSettings,
   requestSessionRestart, __testOnly_resetRestartCoordinator, __testOnly_sessionAgentConfig, latestPinEffortForRespawn } from '../src/core/worker-pool.js';
 import { clearModelPins } from '../src/core/model-pin-store.js';
 import { ModelPinBusyError } from '../src/core/model-pin.js';
@@ -85,6 +85,7 @@ it('Claude card saves while suspended and refuses busy or environment-shadowed s
   delete bot.env;
   ds.worker = null;
   ds.session.suspendedColdResume = true;
+  store.updateSession(ds.session);
   expect(setSessionReasoningEffort(ds, 'xhigh')).toBe('saved');
   expect(worker.send).not.toHaveBeenCalled();
   expect(sessionReasoningControl(ds)).toMatchObject({ selected: 'xhigh', pending: true });
@@ -101,7 +102,8 @@ it('Claude effort preserves concurrent metadata and refuses to overwrite a newer
   const stale = { ...ds, session: structuredClone(ds.session) };
   store.updateSession({ ...ds.session, title: 'Updated title' });
   expect(setSessionReasoningEffort(detached, 'medium')).toBe('saved');
-  expect(() => setSessionReasoningEffort(stale, 'xhigh')).toThrow();
+  // The stale callback looks like a duplicate of its cached setting.
+  expect(() => setSessionReasoningEffort(stale, 'high')).toThrow('session_effort_changed');
   expect(store.getOwnedSession(ds.session.sessionId)).toMatchObject({ title: 'Updated title', reasoningEffort: 'medium' });
 });
 
@@ -126,6 +128,52 @@ it('Claude does not treat a warm reattach init preference as proof of live effor
   expect(sessionReasoningControl(ds)).toMatchObject({ selected: 'high', pending: true });
   ds.activeReasoningEffort = 'high';
   expect(sessionReasoningControl(ds)).toMatchObject({ selected: 'high', pending: false });
+});
+
+it('Claude keeps a replacement model effort pending until that model is launched', () => {
+  const { ds } = fixture('claude-code');
+  const pin = { model: 'sonnet', source: 'card' as const, setBy: 'owner', setAt: new Date().toISOString() };
+  writeSessionModelPin(ds, pin, { compareAndSet: true });
+  expect(sessionReasoningControl(ds)).toMatchObject({ claude: { model: 'sonnet' }, selected: 'high', pending: true });
+  ds.session.model = 'sonnet';
+  ds.statuslineActiveModelStale = true;
+  expect(sessionReasoningControl(ds)?.pending).toBe(true);
+  ds.statuslineActiveModelStale = false;
+  ds.activeModel = 'claude-sonnet-5';
+  expect(sessionReasoningControl(ds)?.pending).toBe(false);
+});
+
+it('Claude card model and effort writes reject a replaced worker or a newer pin', () => {
+  const { ds } = fixture('claude-code');
+  const pin = { model: 'sonnet', source: 'card' as const, setBy: 'owner', setAt: new Date().toISOString() };
+  const stale = { ...ds, session: structuredClone(ds.session) };
+  store.updateSession({ ...ds.session, workerGeneration: 2, cliSessionId: 'replacement' });
+  expect(() => writeSessionModelPin(stale, pin, { compareAndSet: true })).toThrow('session_model_changed');
+  expect(() => setSessionReasoningEffort(stale, 'medium')).toThrow('session_effort_changed');
+  const current = { ...ds, workerGeneration: 2, session: structuredClone(store.getOwnedSession(ds.session.sessionId)!) };
+  writeSessionModelPin(current, pin, { compareAndSet: true });
+  expect(() => writeSessionModelPin(stale, undefined, { compareAndSet: true })).toThrow('model_pin_changed');
+  expect(store.getOwnedSession(ds.session.sessionId)?.modelPin).toEqual(pin);
+});
+
+it('Claude restart and cold resume both use a resolved CLI snapshot effort', () => {
+  const { ds } = fixture('claude-code');
+  delete ds.session.modelPin;
+  delete ds.session.reasoningEffort;
+  ds.session.cliLaunchSnapshot = { state: 'resolved', cliId: 'claude-code', reasoningEffort: 'medium', startupCommands: [] };
+  store.updateSession(ds.session, { modelPinWrite: true });
+  expect(latestPinEffortForRespawn(ds)).toEqual({ reasoningEffort: 'medium' });
+  expect(__testOnly_sessionAgentConfig({ ...ds, worker: null }, bot).reasoningEffort).toBe('medium');
+});
+
+it('Claude does not copy a model pin effort onto a case-distinct gateway ID', () => {
+  const { ds } = fixture('claude-code');
+  const pin = { model: 'gateway/Alpha', effort: 'max' as const, source: 'card' as const, setBy: 'owner', setAt: new Date().toISOString() };
+  writeSessionModelPin(ds, pin, { compareAndSet: true });
+  expect(latestPinEffortForRespawn({ ...ds, spawnModelOverride: 'gateway/alpha' })).toEqual({ reasoningEffort: 'high' });
+  writeSessionModelPin(ds, { ...pin, model: 'gateway/alpha', effort: undefined }, { compareAndSet: true });
+  expect(ds.session.modelPin.effort).toBeUndefined();
+  expect(latestPinEffortForRespawn(ds)).toEqual({ reasoningEffort: 'high' });
 });
 
 it('Claude card uses the live worker policy on restart and the bot policy on cold resume', () => {
@@ -159,10 +207,13 @@ it.each([true, false])('Claude omits incompatible launch effort while keeping th
   expect(__testOnly_sessionAgentConfig({ ...ds, worker: null }, bot).reasoningEffort).toBe('max');
 });
 
-it('Claude card does not offer reasoning changes for Haiku, wrappers, sandbox, adopt or remote sessions', () => {
+it('Claude card offers effort for the next launch model and excludes unsupported managed runtimes', () => {
   const { ds } = fixture('claude-code');
   expect(sessionReasoningControl(ds)?.choices).toContain('xhigh');
-  expect(sessionReasoningControl({ ...ds, activeModel: 'claude-haiku-4-5-20251001' })).toBeUndefined();
+  expect(sessionReasoningControl({ ...ds, activeModel: 'claude-haiku-4-5-20251001' })?.pending).toBe(true);
+  const haiku = { ...ds, session: { ...ds.session, modelPin: { ...ds.session.modelPin, model: 'haiku' } } };
+  expect(supportsClaudeSessionSettings(haiku)).toBe(true);
+  expect(sessionReasoningControl(haiku)).toBeUndefined();
   for (const blocked of [{ wrapperCli: 'wrapper claude' }, { sandbox: true }, { adoptMode: true },
     { readIsolation: true }, { backendType: 'riff' }]) {
     expect(sessionReasoningControl({ ...ds, initConfig: { ...ds.initConfig, ...blocked } })).toBeUndefined();

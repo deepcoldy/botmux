@@ -208,7 +208,10 @@ export function resolveSessionLaunchEffort(
   const prior = resolveTopicReasoningEffort(ds.session, cliId, model, compatible);
   const pin = ds.session.modelPin;
   if (pin && ds.session.dispatchLaunchSpec) return ds.session.dispatchLaunchSpec.effective.reasoningEffort;
-  if (!pin || !cliMatchesBot(ds.session, botCfg) || isPinSuspendedForAdopt(ds) || pin.model.toLowerCase() !== model?.toLowerCase() || !pin.effort) return prior;
+  if (!pin?.effort || !cliMatchesBot(ds.session, botCfg) || isPinSuspendedForAdopt(ds)) return prior;
+  // Claude gateways can assign different capabilities to case-distinct IDs.
+  const sameModel = cliId === 'claude-code' ? pin.model === model : pin.model.toLowerCase() === model?.toLowerCase();
+  if (!sameModel) return prior;
   // Same keep-rule as config load: a pinned Codex level the table cannot refute
   // was catalogue-verified by /modelpin; the worker's launch check decides.
   return cliModelMayKeepReasoningEffort(cliId, model, pin.effort) ? pin.effort
@@ -222,8 +225,9 @@ export function resolveSessionModelPinView(
 ) {
   const model = resolveSessionLaunchModel(ds, botCfg);
   const effort = resolveSessionLaunchEffort(ds, botCfg, model, ds.session.reasoningEffort);
-  const currentEffort = resolveTopicReasoningEffort(ds.session, ds.session.cliId ?? botCfg?.cliId ?? '', ds.activeModel, undefined)
-    ?? ds.session.reasoningEffort ?? ds.activeReasoningEffort;
+  const cliId = ds.session.cliId ?? botCfg?.cliId ?? '';
+  const currentEffort = cliId === 'claude-code' ? ds.activeReasoningEffort
+    : resolveTopicReasoningEffort(ds.session, cliId, ds.activeModel, undefined) ?? ds.session.reasoningEffort ?? ds.activeReasoningEffort;
   return modelPinView(ds.session, botCfg, { spawnModelOverride: ds.spawnModelOverride, model, effort,
     currentModel: ds.activeModel, currentEffort, adopted: isPinSuspendedForAdopt(ds) });
 }

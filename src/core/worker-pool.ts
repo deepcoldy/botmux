@@ -9833,26 +9833,29 @@ export function latestModelForRespawn(
 
 export function latestPinEffortForRespawn(ds: DaemonSession): { reasoningEffort?: import('../services/codex-reasoning-effort.js').CodexReasoningEffort | null } {
   const claude = sessionUsesClaudeCode(ds);
-  if (!ds.session.modelPin && !ds.modelPinCleared && !(claude && ds.session.reasoningEffort)) return {};
+  const fallback = claude ? claudeLaunchEffortFallback(ds) : ds.session.reasoningEffort;
+  if (!ds.session.modelPin && !ds.modelPinCleared && !(claude && fallback)) return {};
   try {
     const cfg = getBot(ds.larkAppId).config;
     const model = resolveSessionLaunchModel(ds, cfg);
-    const effort = resolveSessionLaunchEffort(ds, cfg, model, ds.session.reasoningEffort);
+    const effort = resolveSessionLaunchEffort(ds, cfg, model, fallback);
     return { reasoningEffort: effort ?? null };
   } catch { return {}; } // deregistered bot: keep the worker's existing snapshot
 }
 
-/** Persist first; a failed runtime apply must never claim that the pin was lost. */
-/** `reasoningCatalog`: the bot runtime's live catalogue, when the writer loaded
- *  one, so a pinned Codex level is judged like a Dashboard-saved one. */
+/** Persist first so a failed runtime apply leaves the saved pin available.
+ * `reasoningCatalog` keeps Codex validation aligned with a live catalogue.
+ * Claude card callbacks use `compareAndSet` with the captured managed session. */
 export function writeSessionModelPin(
   ds: DaemonSession,
   pin: ModelPin | undefined,
-  opts: { reasoningCatalog?: import('../services/codex-reasoning-effort.js').ReasoningCatalog | null } = {},
+  opts: { reasoningCatalog?: import('../services/codex-reasoning-effort.js').ReasoningCatalog | null; compareAndSet?: true } = {},
 ): boolean {
   if (!pin && !ds.session.modelPin) return false;
   const explicitEffort = pin?.effort !== undefined;
-  if (pin) pin = retainPinEffort(pin, ds.session.modelPin);
+  if (pin && (!opts.compareAndSet || pin.model === ds.session.modelPin?.model)) {
+    pin = retainPinEffort(pin, ds.session.modelPin);
+  }
   if (isSessionTransferring(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)) throw new Error('会话正在迁移、重启或修改推理强度，请稍后重试');
   if (ds.session.dispatchLaunchSpec) throw new Error('dispatch 会话使用冻结的启动规格，不支持话题固定');
   // An adopted CLI is owned by the user outside BotMux: it is never respawned
@@ -9879,9 +9882,19 @@ export function writeSessionModelPin(
     if (error) throw new Error(error);
   }
   const before = ds.session.modelPin;
-  ds.session.modelPin = pin;
-  try { sessionStore.updateSession(ds.session, { modelPinWrite: true }); }
-  catch (error) { ds.session.modelPin = before; throw error; }
+  if (opts.compareAndSet) {
+    const { rows } = sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
+      const row = fresh.get(ds.session.sessionId)!;
+      if (JSON.stringify(row.modelPin) !== JSON.stringify(before)) throw new Error('model_pin_changed');
+      if (!sameClaudeSettingsTarget(ds, row)) throw new Error('session_model_changed');
+      row.modelPin = pin;
+    }, { modelPinWrite: true, nonblocking: true });
+    Object.assign(ds.session, rows.get(ds.session.sessionId)!);
+  } else {
+    ds.session.modelPin = pin;
+    try { sessionStore.updateSession(ds.session, { modelPinWrite: true }); }
+    catch (error) { ds.session.modelPin = before; throw error; }
+  }
   if (!pin) ds.modelPinCleared = true;
   else delete ds.modelPinCleared;
   dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId,
@@ -12762,18 +12775,24 @@ function persistEffortSelection(ds: DaemonSession, effort: NonNullable<Session['
   const beforeSnapshot = snapshot?.reasoningEffort ?? null;
   const beforePreferenceEdit = ds.session.terminalEffortPreferenceEdit;
   const preferenceEdit = config.terminalEffortWriteback ? { atMs: Date.now(), source: 'explicit' as const } : undefined;
-  const matched = !!beforePin && samePinModel(beforePin.model, model);
   const claude = !topic && sessionUsesClaudeCode(ds);
+  const matched = !!beforePin && (claude ? beforePin.model === model : samePinModel(beforePin.model, model));
   if (matched || claude) {
     // Compare inside the write transaction. A stale callback must not replace
     // a newer effort choice or write back an unrelated, older session field.
-    const { rows } = sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
+    const { rows, result: updated } = sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
       const row = fresh.get(ds.session.sessionId)!;
       if (JSON.stringify(row.modelPin) !== JSON.stringify(beforePin)) throw new Error('model_pin_changed');
-      if (claude && (row.status !== 'active' || row.reasoningEffort !== beforeEffort
-        || (row.cliLaunchSnapshot?.reasoningEffort ?? null) !== beforeSnapshot
-        || JSON.stringify(row.terminalEffortPreferenceEdit) !== JSON.stringify(beforePreferenceEdit))) {
-        throw new Error('session_effort_changed');
+      if (claude) {
+        if (!sameClaudeSettingsTarget(ds, row) || row.reasoningEffort !== beforeEffort
+          || JSON.stringify(row.terminalEffortPreferenceEdit) !== JSON.stringify(beforePreferenceEdit)
+          || resolveSessionLaunchModel({ ...ds, session: row }, getBot(ds.larkAppId).config) !== model) {
+          throw new Error('session_effort_changed');
+        }
+        // Verify an idempotent submit against the owned row too; a detached
+        // callback's cached value cannot acknowledge a superseded setting.
+        if (beforeEffort === effort && (!snapshot || beforeSnapshot === effort)
+          && (!matched || beforePin.effort === effort)) return false;
       }
       if (preferenceEdit) row.terminalEffortPreferenceEdit = preferenceEdit;
       if (matched) row.modelPin = { ...row.modelPin!, effort, ...actor, setAt: new Date().toISOString() };
@@ -12782,8 +12801,10 @@ function persistEffortSelection(ds: DaemonSession, effort: NonNullable<Session['
         row.reasoningEffort = effort;
         if (row.cliLaunchSnapshot) row.cliLaunchSnapshot.reasoningEffort = effort;
       }
+      return true;
     }, { ...(matched ? { modelPinWrite: true as const } : {}), nonblocking: claude });
     Object.assign(ds.session, rows.get(ds.session.sessionId)!);
+    if (!updated) return;
   } else {
     if (topic && model) ds.session.topicReasoningEffort = { model, effort };
     else {
@@ -12816,32 +12837,72 @@ function effortSelectionStamp(ds: DaemonSession): string {
   return JSON.stringify([ds.session.modelPin, ds.session.reasoningEffort, currentEffortModel(ds)]);
 }
 
-function sessionUsesClaudeCode(ds: DaemonSession): boolean {
+export function sessionUsesClaudeCode(ds: DaemonSession): boolean {
   return (ds.session.cliLaunchSnapshot?.cliId ?? ds.initConfig?.cliId ?? ds.session.cliId) === 'claude-code';
 }
 
-function claudeSessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['reasoningControl'] {
-  const cfg = ds.initConfig ?? ds.session;
-  const backend = cfg.backendType ?? ds.session.backendType;
-  if ((backend !== 'pty' && backend !== 'tmux' && backend !== 'hc')
-    || cfg.wrapperCli || ds.session.wrapperCli || ds.session.cliLaunchSnapshot?.wrapperCli
+/** Session settings apply only at a launch BotMux owns. */
+export function supportsClaudeSessionSettings(ds: DaemonSession): boolean {
+  const backend = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (!sessionUsesClaudeCode(ds) || (backend !== 'pty' && backend !== 'tmux' && backend !== 'hc')
+    || (ds.initConfig?.cliId && ds.initConfig.cliId !== 'claude-code') || ds.session.cliLaunchSnapshot?.state === 'pending'
+    || ds.initConfig?.wrapperCli || ds.session.wrapperCli || ds.session.cliLaunchSnapshot?.wrapperCli
     || isSharedAdoptSession(ds) || ds.initConfig?.workflowNodeSession || isWorkflowNodeSessionMarker(ds.session.workflowNode)
-    || ds.session.headless || ds.session.dispatchLaunchSpec || sandboxBoolValue(ds.session.sandbox) || sandboxBoolValue(ds.initConfig?.sandbox)
-    || ds.initConfig?.readIsolation || sandboxEnabled()) return;
+    || ds.session.headless || ds.session.vcMeetingReceiver || ds.session.dispatchLaunchSpec
+    || sandboxBoolValue(ds.session.sandbox) || sandboxBoolValue(ds.initConfig?.sandbox)
+    || ds.initConfig?.readIsolation || sandboxEnabled()) return false;
+  try { return !getBot(ds.larkAppId).config.readIsolation; } catch { return false; }
+}
 
-  let botCfg: BotConfig;
-  try { botCfg = getBot(ds.larkAppId).config; } catch { return; }
-  if (botCfg.readIsolation) return;
+/** Caller holds the bot mutation gate for the actual save. */
+export function canSaveClaudeSessionSettings(ds: DaemonSession): boolean {
+  const lifecycle = ds.session.sessionLifecycle;
+  if (lifecycle && lifecycle !== 'active' && lifecycle !== 'suspended') return false;
+  if (!sessionAcceptsDirectCommand(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)) return false;
+  return ds.worker && !ds.worker.killed
+    ? !!ds.cliReady && !hasUnsettledAcceptedInput(ds)
+      && (ds.session.workerGeneration === undefined || ds.session.workerGeneration === ds.workerGeneration)
+    : ds.session.suspendedColdResume === true;
+}
+
+/** The fresh row can outlive this callback's in-memory worker or launch. */
+function sameClaudeSettingsTarget(ds: DaemonSession, row: Session): boolean {
+  const prior = ds.session;
+  if (row.status !== 'active' || row.larkAppId !== prior.larkAppId || row.chatId !== prior.chatId
+    || row.rootMessageId !== prior.rootMessageId || row.cliId !== prior.cliId || row.workerGeneration !== prior.workerGeneration
+    || row.cliSessionId !== prior.cliSessionId || row.sessionLifecycle !== prior.sessionLifecycle
+    || row.model !== prior.model || !!row.suspendedColdResume !== !!prior.suspendedColdResume
+    || row.principalLane?.laneId !== prior.principalLane?.laneId || row.principalLane?.revision !== prior.principalLane?.revision
+    || JSON.stringify(row.cliLaunchSnapshot) !== JSON.stringify(prior.cliLaunchSnapshot)) return false;
+  // Runtime guards are keyed by the canonical DaemonSession, while durable
+  // ownership and launch capability must also hold for the row being changed.
+  return canSaveClaudeSessionSettings(ds) && !hasProtectedSessionMutationOwnership(row)
+    && supportsClaudeSessionSettings({ ...ds, session: row });
+}
+
+function claudeLaunchEffortFallback(ds: DaemonSession): Session['reasoningEffort'] {
+  const snapshot = ds.session.cliLaunchSnapshot;
+  return (snapshot ? snapshot.reasoningEffort : ds.session.reasoningEffort)
+    ?? resolveSessionGroupSettings(ds, snapshot?.cliId ?? ds.session.cliId).reasoningEffort;
+}
+
+function claudeSessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['reasoningControl'] {
+  if (!supportsClaudeSessionSettings(ds)) return;
+  const botCfg = getBot(ds.larkAppId).config;
   const model = resolveSessionLaunchModel(ds, botCfg);
-  const choices = reasoningEffortsForCliModel('claude-code', model);
-  if (!choices.length || !reasoningEffortsForCliModel('claude-code', currentEffortModel(ds)).length) return;
-  const desired = resolveSessionLaunchEffort(ds, botCfg, model, ds.session.reasoningEffort);
+  const choices = reasoningEffortsForCliModel('claude-code', model ?? currentEffortModel(ds));
+  if (!choices.length) return;
+  const desired = resolveSessionLaunchEffort(ds, botCfg, model, claudeLaunchEffortFallback(ds));
   // Reattaching a live pane rebuilds initConfig from the saved choice without
-  // restarting Claude. Only an observed effort can confirm what it is using.
-  const active = ds.activeReasoningEffort;
-  const selected = choices.find(choice => choice === (desired ?? active ?? ds.initConfig?.reasoningEffort));
+  // restarting Claude. The durable model records the last requested launch and
+  // avoids treating a replacement model's saved effort as already active.
+  const lastLaunch = ds.spawnModelOverride ? ds.initConfig?.model : ds.session.model;
+  const observedModelHasNoEffort = ds.activeModel && !reasoningEffortsForCliModel('claude-code', ds.activeModel).length;
+  const modelChanging = !!model && model !== ds.activeModel && (model !== lastLaunch || observedModelHasNoEffort);
+  const active = !modelChanging && !ds.statuslineActiveModelStale ? ds.activeReasoningEffort : undefined;
+  const selected = choices.find(choice => choice === (desired ?? active));
   const key = 'CLAUDE_CODE_EFFORT_LEVEL';
-  const launchEnv = resolveSessionEnvForSession(ds, botCfg, backend);
+  const launchEnv = resolveSessionEnvForSession(ds, botCfg);
   // In-place restart keeps the live worker's inherited-environment policy.
   const policy = ds.worker && !ds.worker.killed && ds.initConfig ? ds.initConfig.envPolicy : botCfg.envPolicy;
   const inherited = buildSessionChildEnv(process.env, policy, launchEnv.envUnset);
@@ -13122,25 +13183,20 @@ export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown, ac
   if (!control) return 'unsupported';
   const selected = control.choices.find(candidate => candidate === effort);
   if (!selected) return 'invalid';
+  if (control.claude) {
+    if (control.claude.disabledBy) return 'unsupported';
+    if (!canSaveClaudeSessionSettings(ds)) return 'busy';
+    // The native /effort command writes user defaults. Apply this session's
+    // own preference through --effort when BotMux next launches it.
+    persistEffortSelection(ds, selected, control.claude.model || undefined, actor);
+    return 'saved';
+  }
   if (ds.session.status !== 'active' || isSessionTransferring(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)
     || hasProtectedSessionMutationOwnership(ds) || ds.pendingRawInput || ds.pendingFollowUpInput
     || [...pendingOrdinaryImDeliveries.values()].some(delivery => delivery.ds === ds)) return 'busy';
   const live = ds.worker && !ds.worker.killed;
   if (live && (ds.lastScreenStatus !== 'idle' || !ds.workerReady)) return 'busy';
   if (!live && !ds.session.suspendedColdResume) return 'busy';
-  if (control.claude) {
-    if (control.claude.disabledBy) return 'unsupported';
-    if (live && (!ds.cliReady || hasUnsettledAcceptedInput(ds))) return 'busy';
-    const model = control.claude.model || undefined;
-    const pin = ds.session.modelPin;
-    if (ds.session.reasoningEffort === selected
-      && (!ds.session.cliLaunchSnapshot || ds.session.cliLaunchSnapshot.reasoningEffort === selected)
-      && (!pin || !samePinModel(pin.model, model) || pin.effort === selected)) return 'saved';
-    // Claude's /effort <level> also writes user settings. Save a session-only
-    // preference for --effort on the next BotMux launch instead.
-    persistEffortSelection(ds, selected, model, actor);
-    return 'saved';
-  }
   if (live && ds.session.cliSessionId) {
     // Reattach can briefly report an idle screen during a native tool call.
     // Require a real turn boundary before accepting an idle-only change. Bound the read;

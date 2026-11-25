@@ -7,7 +7,8 @@ import { forkManualTurn } from '../../core/manual-turn-dispatch.js';
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { randomUUID } from 'node:crypto';
-import { DEFAULT_MODEL_VALUE_PATTERN, MODEL_SLUG_PATTERN, sessionModelChoices, sessionModelPickerData, buildSessionModelPickerCard, buildDefaultModelPickerCard, defaultModelPickerData, defaultModelSelectionKey } from './session-model-picker.js';
+import { DEFAULT_MODEL_VALUE_PATTERN, MODEL_SLUG_PATTERN, sessionModelChoices, sessionModelPickerData, buildSessionModelPickerCard, buildDefaultModelPickerCard, claudeSettingsPickerVersion, deliverSessionModelPicker, defaultModelPickerData, defaultModelSelectionKey } from './session-model-picker.js';
+import { canSaveClaudeSessionSettings, sessionUsesClaudeCode, supportsClaudeSessionSettings } from '../../core/worker-pool.js';
 /**
  * Lark card action handler — processes button clicks and dropdown selections
  * from Feishu interactive cards.
@@ -33,7 +34,7 @@ import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
 import { handleTmuxUpgradeCardAction, isTmuxUpgradeAction } from '../../core/tmux-upgrade.js';
-import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, getChatModeStrict, getCachedChatModeStrict, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
+import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, deleteEphemeralCard, getMessageDetail, getChatModeStrict, getCachedChatModeStrict, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantRequesterNoticeCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel, STREAMING_CARD_PATCH_VERSION } from './card-builder.js';
 import type { GrantCardDelivery } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
@@ -3744,6 +3745,82 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       };
     }
 
+    if (ds && (actionType === 'session_effort_pick' || actionType === 'session_model_pick'
+      || actionType === 'reply_model_pick' || actionType === 'session_model_unpin')
+      && (value.claude_settings_version !== undefined || sessionUsesClaudeCode(ds))) {
+      const loc = localeForBot(ds.larkAppId);
+      const warning = (key: string) => ({ toast: { type: 'warning', content: t(key, undefined, loc) } });
+      const pickerAction = value.picker_action;
+      const privateRecipient = value.private_recipient;
+      if (!sessionUsesClaudeCode(ds) || !operatorOpenId || (pickerAction !== 'reply_model_pick' && pickerAction !== 'session_model_pick')
+        || (privateRecipient !== undefined && (privateRecipient !== operatorOpenId || ds.scope !== 'chat' || ds.chatType === 'p2p'))
+        || !cardMessageId || value.claude_settings_version !== claudeSettingsPickerVersion(ds)) {
+        return warning('card.session_settings.stale');
+      }
+      const changingModel = actionType === 'session_model_pick' || actionType === 'reply_model_pick';
+      if (changingModel && actionType !== pickerAction) return warning('card.session_settings.stale');
+      const selected = typeof action?.option === 'string' ? action.option : '';
+      const configured = JSON.stringify(getBot(ds.larkAppId).config.customModels);
+      const models = await sessionModelChoices(ds);
+      const mutation = await tryWithBotTurnMutation(ds.larkAppId, 1000, () => {
+        const current = getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType);
+        if (current !== ds || value.session_id !== ds.session.sessionId
+          || !sessionUsesClaudeCode(ds)
+          || value.lark_app_id !== ds.larkAppId || value.chat_id !== ds.chatId || rootId !== sessionAnchorId(ds)
+          || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId, data?.operator?.union_id)
+          || !validatePrincipalLaneCardActionAuthority(ds, cardMessageId, activeSessions)
+          || (pickerAction === 'reply_model_pick' && getBot(ds.larkAppId).config.replyCardActions !== true)
+          || (changingModel && configured !== JSON.stringify(getBot(ds.larkAppId).config.customModels))
+          || value.claude_settings_version !== claudeSettingsPickerVersion(ds)) return 'card.session_settings.stale';
+        if (!supportsClaudeSessionSettings(ds)) return 'card.session_settings.unsupported';
+        if (!canSaveClaudeSessionSettings(ds)) return 'card.session_settings.busy';
+        try {
+          if (actionType === 'session_effort_pick') {
+            const control = sessionReasoningControl(ds);
+            if (control?.claude?.disabledBy) return `card.effort.claude_${control.claude.disabledBy}_override`;
+            const result = setSessionReasoningEffort(ds, selected, { source: 'card', setBy: operatorOpenId });
+            return result === 'saved' ? undefined : `card.effort.${result}`;
+          }
+          if (changingModel && (!models.includes(selected) || !MODEL_SLUG_PATTERN.test(selected)
+            || validateModelPin({ model: selected }, { cliId: 'claude-code', backendType: ds.initConfig?.backendType ?? ds.session.backendType }))) {
+            return 'card.reply_actions.model_unsupported';
+          }
+          const pin = ds.session.modelPin;
+          if (!changingModel && (!pin || value.expected_pin_set_at !== pin.setAt)) return 'card.session_settings.stale';
+          // Claude's interactive commands can persist user-wide defaults. Use
+          // the managed launch path for both model and effort preferences.
+          writeSessionModelPin(ds, changingModel
+            ? { model: selected, source: 'card', setBy: operatorOpenId, setAt: new Date().toISOString() }
+            : undefined, { compareAndSet: true });
+        } catch (error) {
+          logger.warn(`[${tag(ds)}] Claude session settings save failed: ${String(error)}`);
+          return 'card.session_settings.save_failed';
+        }
+      });
+      if (!mutation.acquired) return warning('card.session_settings.busy');
+      if (mutation.value === 'card.session_settings.stale') return warning(mutation.value);
+      if (!mutation.value && actionType === 'session_effort_pick') {
+        scheduleCardPatch(ds, buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined), undefined, { userInitiated: true });
+      }
+      const pinView = changingModel ? resolveSessionModelPinView(ds, getBot(ds.larkAppId).config) : undefined;
+      const feedback = mutation.value ? warning(mutation.value) : pinView?.shadowedBy ? warning('card.session_settings.shadowed') : {
+        toast: { type: 'success', content: t('card.session_settings.saved', undefined, loc) },
+      };
+      const card = buildSessionModelPickerCard(ds, rootId, models, ds.activeModel ?? ds.session.model, loc, pickerAction,
+        undefined, privateRecipient);
+      if (!privateRecipient) return { ...feedback, card: { type: 'raw' as const, data: JSON.parse(card) } };
+      const refreshVersion = claudeSettingsPickerVersion(ds);
+      return { ...feedback, afterAck: async () => {
+        if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId, data?.operator?.union_id)
+          || getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType) !== ds
+          || claudeSettingsPickerVersion(ds) !== refreshVersion) return;
+        // The ephemeral delivery API only supports send and delete. Keep
+        // the old picker visible if the replacement could not be delivered.
+        await sendEphemeralCard(ds.larkAppId, ds.chatId, operatorOpenId, card);
+        await deleteEphemeralCard(ds.larkAppId, cardMessageId, { acceptWithdrawn: true });
+      } };
+    }
+
     if (actionType === 'session_effort_pick' || actionType === 'session_effort_apply') {
       const loc = localeForBot(ds?.larkAppId ?? larkAppId);
       const warning = (key: string) => ({ toast: { type: 'warning', content: t(key, undefined, loc) } });
@@ -5493,8 +5570,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // Same pre-check the submission does: CLIs without a raw passthrough
         // surface cannot switch via /model — say so instead of showing a picker
         // whose only outcome is a refusal.
-        if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
-          const cardJson = menuNoticeCard(t('card.reply_actions.model_unsupported', undefined, loc));
+        const claude = sessionUsesClaudeCode(ds);
+        if ((claude && (!supportsClaudeSessionSettings(ds) || ds.session.principalLane))
+          || cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
+          const cardJson = menuNoticeCard(t(claude ? 'card.session_settings.unsupported' : 'card.reply_actions.model_unsupported', undefined, loc));
           await deliverEphemeralOrReply(ds, operatorOpenId, cardJson, 'interactive',
             () => sessionReply(rootId, cardJson, 'interactive'));
           return {};
@@ -5506,10 +5585,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           toast: { type: 'info', content: t('card.reply_actions.model_loading', undefined, loc) },
           afterAck: async () => {
             const { models, load } = await sessionModelPickerData(pickerDs);
-            if (!canOperate(pickerDs.larkAppId, pickerDs.chatId, operatorOpenId)
+            if (!canOperate(pickerDs.larkAppId, pickerDs.chatId, operatorOpenId, data?.operator?.union_id)
               || pickerDs.worker !== pickerWorker || pickerDs.workerGeneration !== pickerGeneration
-              || pickerDs.worker?.killed || isSessionTransferring(pickerDs)) return;
-            const cardJson = models.length > 0
+              || (pickerDs.worker?.killed && !(claude && pickerDs.session.suspendedColdResume))
+              || (claude && !supportsClaudeSessionSettings(pickerDs)) || isSessionTransferring(pickerDs)) return;
+            const render = (recipient?: string) => models.length > 0
               ? buildSessionModelPickerCard(
                 pickerDs,
                 rootId,
@@ -5518,10 +5598,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
                 loc,
                 'reply_model_pick',
                 load,
+                recipient,
               )
               : menuNoticeCard(t('card.reply_actions.model_empty', undefined, loc));
-            await deliverEphemeralOrReply(pickerDs, operatorOpenId, cardJson, 'interactive',
-              () => sessionReply(rootId, cardJson, 'interactive'));
+            await deliverSessionModelPicker(pickerDs, operatorOpenId, render,
+              card => sessionReply(rootId, card, 'interactive'));
           },
         };
       }
