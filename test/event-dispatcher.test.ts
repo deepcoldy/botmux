@@ -10799,6 +10799,84 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
       expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
       expect(handlers.handleNewTopic).toHaveBeenCalledWith(s, expect.objectContaining({ anchor: 'msg-auto-fwd-seed' }));
     });
+
+    it('re-holds a persisted auto-start seed after restart and pairs its post-restart comment (#3784)', async () => {
+      const persistedSeed = seed();
+      const persistedPayload = {
+        data: persistedSeed,
+        ctx: {
+          chatId: 'chat-fwd-auto',
+          messageId: 'msg-auto-fwd-seed',
+          chatType: 'group',
+          scope: 'thread',
+          anchor: 'msg-auto-fwd-seed',
+          larkAppId: MY_APP_ID,
+        },
+        ownsSession: false,
+        autoTopicSeed: true,
+      };
+      mockReadFileSync.mockImplementation(path => String(path).includes('forward-followups-')
+        ? JSON.stringify([{ messageId: 'msg-auto-fwd-seed', dueAt: Date.now() + 10_000, payload: persistedPayload }])
+        : '[]');
+      handlers.handleNewTopic.mockClear();
+      capturedHandlers = {};
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      markForwardFollowupsSessionsReady(MY_APP_ID);
+      await flushEventWork();
+      // Re-held under topic mode: not flushed immediately.
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      const comment = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '重启后留言' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-post-restart-comment',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      await capturedHandlers['im.message.receive_v1'](comment);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(comment, expect.objectContaining({
+        anchor: 'msg-auto-fwd-post-restart-comment',
+        forwardSeedData: persistedSeed,
+      }));
+    });
+
+    it('pairs when the comment arrives while the seed routing is still resolving (#3784)', async () => {
+      let releaseMode!: (mode: 'topic') => void;
+      const delayedMode = new Promise<'topic'>(resolve => { releaseMode = resolve; });
+      mockGetChatMode.mockReset()
+        .mockImplementationOnce(async () => delayedMode)
+        .mockResolvedValue('topic');
+      capturedHandlers = {};
+      __resetAnchorQueues();
+      __resetEventClaimsForTest();
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      markForwardFollowupsSessionsReady(MY_APP_ID);
+
+      const s = seed();
+      const comment = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '路由未决时的留言' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-gate-comment',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      capturedHandlers['im.message.receive_v1'](s);
+      capturedHandlers['im.message.receive_v1'](comment);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      releaseMode('topic');
+      await flushEventWork();
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(comment, expect.objectContaining({
+        anchor: 'msg-auto-fwd-gate-comment',
+        forwardSeedData: s,
+      }));
+    });
   });
 
   it('话题群新话题（未 @）开关开 → 自动开工 (FR-6)', async () => {
