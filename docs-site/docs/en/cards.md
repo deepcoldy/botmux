@@ -57,7 +57,7 @@ Frequently used buttons sit on the card's main row. The low-frequency buttons ma
 | 🗜️ Compact | Send `/compact` to the CLI to compress context (shown only when the CLI supports it) |
 | ⏲️ Idle auto-compact: on/off | More Actions. Compact automatically after the session sits idle, same as [`/idlecompact`](/en/slash-commands) |
 | ⏹ Stop | Interrupt the current turn (same as ^C); the session stays. Only shown while the turn is still running |
-| ❌ Close Session | Close the session; adopted sessions show "⏏ Disconnect" here |
+| ❌ Close Session | Close the session; adopted sessions show "⏏ Disconnect" here. Admins can close any session; talk-only users can close the **topics they opened themselves** (per-topic direct messages included) |
 | 🔁 Retry Last Task | Appears when the quota recovers and the status becomes "Ready to retry" |
 | Reasoning effort dropdown | Codex sessions (tmux backend, no sandbox, not using RPC input) can change reasoning effort while running; it applies from the next turn. For managed local Claude Code sessions, saves made while idle or suspended apply after the next restart or cold resume. `CLAUDE_CODE_EFFORT_LEVEL` and startup commands that set `/effort` take precedence |
 

@@ -24,13 +24,14 @@ type TrustHandler = (data: string) => boolean;
 let trustHandledValue = false;
 let invalidateEvidence: ReturnType<typeof vi.fn>;
 
-function installGlobals(backend: unknown): void {
+function installGlobals(backend: unknown, workflow = false): void {
   const g = globalThis as Record<string, unknown>;
   Object.defineProperty(globalThis, 'trustHandled', {
     configurable: true,
     get: () => trustHandledValue,
     set: (v: boolean) => { trustHandledValue = v; },
   });
+  g.isWorkflowWorker = () => workflow;
   g.dismissAidenCodexUpdateDialog = () => false;
   g.noticeCodexModelMigrationDialog = () => {};
   g.lastInitConfig = {};
@@ -80,6 +81,17 @@ describe('trust dialog Enter deferral (Codex 0.149 key-handler race)', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it('leaves interactive trust decisions to the operator in a workflow', () => {
+    const sendSpecialKeys = vi.fn();
+    const write = vi.fn();
+    installGlobals({ sendSpecialKeys, write }, true);
+    expect(extractTrustHandler()('Do you trust this folder? Yes, I trust this folder')).toBe(false);
+    vi.runAllTimers();
+    expect(trustHandledValue).toBe(false);
+    expect(sendSpecialKeys).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
   });
 
   it('marks trustHandled immediately but defers Enter by 400ms', () => {

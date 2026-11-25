@@ -117,6 +117,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
+  durableImRepliesEnabled: vi.fn(() => false),
   getBot: vi.fn(() => ({
     config: {
       larkAppId: 'app_test',

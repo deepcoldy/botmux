@@ -1229,6 +1229,8 @@ describe('applySettingsWrite — oauthRedirectBase', () => {
 describe('applySettingsWrite — httpProxy', () => {
   for (const [label, value, stored] of [
     ['a plain http proxy', 'http://127.0.0.1:7890', 'http://127.0.0.1:7890'],
+    ['a bracketed IPv6 proxy', 'http://[2001:db8::1]:3128', 'http://[2001:db8::1]:3128'],
+    ['a bracketed IPv6 proxy with credentials', 'http://user:p%40ss@[::1]:3128/', 'http://user:p%40ss@[::1]:3128'],
     ['embedded credentials', 'http://user:p%40ss@proxy.example.com:8080', 'http://user:p%40ss@proxy.example.com:8080'],
     ['surrounding whitespace and trailing slashes', '  http://127.0.0.1:7890//  ', 'http://127.0.0.1:7890'],
   ] as Array<[string, string, string]>) {

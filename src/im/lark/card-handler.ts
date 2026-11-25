@@ -3034,8 +3034,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return await v3Route.run({ value, operatorOpenId, larkAppId, cardMessageId, formValue: action?.form_value, deps });
   }
 
-  // 过 canOperate 门的动作清单与两处例外（拒绝 toast / pendingRepo 发起人放行）
-  // 登记在 card-action-routes.ts 的 SENSITIVE_CARD_ACTIONS；漏登记 = 任何人都能点。
+  // 过 canOperate 门的动作清单与三处例外（拒绝 toast / pendingRepo 发起人放行 /
+  // 话题会话发起人关闭自己的会话）登记在 card-action-routes.ts 的 SENSITIVE_CARD_ACTIONS；
+  // 漏登记 = 任何人都能点。
   const sensitiveMeta = sensitiveCardActionMeta(value?.action);
   if (sensitiveMeta) {
     const rootId = value?.root_id;
@@ -3067,8 +3068,20 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     const pendingRepoOwnerException =
       sensitiveMeta.pendingRepoOwnerException === true && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
+    // 按话题划分的会话（含私聊）的发起人（含 chat-granted 用户）可以关闭自己发起的会话。
+    // 开启 sessionOwnerReminder 后，botmux 会定期 @ 发起人跟进，却没给 ta 收尾的入口，点
+    // 「关闭会话」被这道门静默丢弃，最后只能找管理员代关。open_id 是 app-scoped：ds 按收到
+    // 回调的 larkAppId 解析，两侧是同一个 bot 视角下的身份，不能拿别的应用下的 open_id 来比。
+    const sessionOwnerException = sensitiveMeta.sessionOwnerException === true
+      && !!ds && !!operatorOpenId
+      && operatorOpenId === ds.session.ownerOpenId
+      && (ds.scope ?? ds.session.scope) === 'thread'
+      && !isSharedAdoptSession(ds);
     if (effectiveAppId) {
-      if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
+      if (sessionOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
+        logger.info(`Card action "${value?.action}" allowed for session owner without operate permission: ${operatorOpenId} (chat=${chatId})`);
+      }
+      if (!pendingRepoOwnerException && !sessionOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
         logger.info(`Card action "${value?.action}" blocked for non-operator user: ${operatorOpenId} (chat=${chatId})`);
         // get_write_link 显式破例：其余敏感动作沿用「静默 block（仅日志）」的既有设计
         // （test/card-handler-repo-select.test.ts 把这点 pin 住了），但「获取操作链接」是

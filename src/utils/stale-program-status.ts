@@ -11,6 +11,7 @@
  * marker. The screen is only the last check.
  */
 import {
+  isClaudeApiRequestBlob,
   isClaudeTurnTerminalEvent,
   isClaudeUserInterruptEvent,
   isPureToolResultUserEvent,
@@ -42,8 +43,7 @@ function isMainThreadTurnClose(ev: TranscriptEvent): boolean {
  *  queue bookkeeping, sidechains, `api-request-blob`, slash-command wrappers,
  *  non-scheduled meta lines) neither opens nor closes the turn. */
 function isMainThreadActivity(ev: TranscriptEvent): boolean {
-  if (!ev || typeof ev !== 'object' || (ev as { isSidechain?: unknown }).isSidechain === true) return false;
-  if (ev.type === 'api-request-blob') return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || (ev as { isSidechain?: unknown }).isSidechain === true) return false;
   const role = ev.message?.role ?? ev.type;
   if (role === 'assistant') return true;
   if (role === 'user') {
