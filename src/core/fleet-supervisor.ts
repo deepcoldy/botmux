@@ -559,11 +559,14 @@ export class FleetSupervisor {
         pending.pid = 0;
         return cur;
       });
+      // Like crash backoff, this retry may be the supervisor's only pending
+      // handle in a single-member fleet. Keep it ref'd so the event loop cannot
+      // drain before admission is retried. stopAll/stopOneBot cancel it through
+      // restartTimers, so a requested shutdown still drains normally.
       const timer = setTimeout(() => {
         this.restartTimers.delete(spec.name);
         this.spawnBot(spec, isRestart);
       }, 1000);
-      timer.unref();
       this.restartTimers.set(spec.name, timer);
       return;
     }
