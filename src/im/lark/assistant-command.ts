@@ -41,8 +41,11 @@ export async function tryHandleAssistantMultiUserGroup(
 ): Promise<boolean> {
   const chatId: string | undefined = message?.chat_id;
   if (message?.chat_type === 'p2p' || !chatId || !assistantMultiUserGroupsOff(larkAppId)) return false;
-  if (!(await assistantGroupIsMultiUser(larkAppId, chatId))) return false;
-  if (senderIsBot || !isBotMentioned(larkAppId, message, senderOpenId)) return true;
+  // 真人 @ 本 bot 时不信缓存、现查：有人退群而退群事件没推到本 app（主动退群是另一种事件）时，
+  // 缓存会停在多人，@ 是让它立即恢复的唯一信号。被 @ 的消息少，多一次查询可以接受。
+  const mentioned = !senderIsBot && isBotMentioned(larkAppId, message, senderOpenId);
+  if (!(await assistantGroupIsMultiUser(larkAppId, chatId, { fresh: mentioned }))) return false;
+  if (!mentioned) return true;
   const key = `${larkAppId}:${chatId}`;
   if ((multiUserNoticeAt.get(key) ?? -Infinity) > now - MULTI_USER_NOTICE_MS) return true;
   multiUserNoticeAt.set(key, now);
@@ -58,9 +61,14 @@ export async function tryHandleAssistantMultiUserGroup(
 /**
  * 群里的真人数是否不是恰好 1 个（bot 不计；字段缺失、查不到都算多人）。缓存说是多人就照用；
  * 说是单人时强制重查一次：有人刚进群、而进群事件推给了别的副本时，缓存会停在 1 人。
+ * `fresh`：直接现查，不看缓存。
  */
-export async function assistantGroupIsMultiUser(larkAppId: string, chatId: string): Promise<boolean> {
-  if ((await getGroupStats(larkAppId, chatId)).userCount !== 1) return true;
+export async function assistantGroupIsMultiUser(
+  larkAppId: string,
+  chatId: string,
+  opts: { fresh?: boolean } = {},
+): Promise<boolean> {
+  if (!opts.fresh && (await getGroupStats(larkAppId, chatId)).userCount !== 1) return true;
   return (await getGroupStats(larkAppId, chatId, { requireFresh: true })).userCount !== 1;
 }
 

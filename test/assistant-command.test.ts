@@ -232,6 +232,14 @@ describe('assistantGroupChat off: multi-user group gate', () => {
     expect(await gate(msg('hi'))).toBe(true);
   });
 
+  it('an @ re-reads a cached multi-user count, so the bot recovers as soon as the second person leaves', async () => {
+    cachedUserCount = 2;
+    groupUserCount = 1;
+    expect(await gate(msg('ping'))).toBe(false);
+    expect(mockGetGroupStats).toHaveBeenCalledWith(APP, CHAT, { requireFresh: true });
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
   it('a cached multi-user count is trusted without another lookup', async () => {
     groupUserCount = 3;
     mockIsBotMentioned.mockReturnValue(false);
