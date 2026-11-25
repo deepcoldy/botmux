@@ -156,6 +156,111 @@ function makeTempDir(): string {
   return mkdtempSync(join(tmpdir(), 'session-store-test-'));
 }
 
+describe('shared new topic persistence', () => {
+  it('freezes creation policy only for ordinary Codex topics', () => {
+    init('shared-test');
+    registerCodexInstanceBot({ larkAppId: 'shared-test', larkAppSecret: 'test', cliId: 'codex',
+      existingAppServer: { endpoint: 'unix:///tmp/shared.sock', newTopics: 'create' } });
+    const ordinary = createSession('chat', 'root-shared', 'shared', 'group', 'thread', { source: 'ordinary-feishu' });
+    expect(ordinary.sharedThreadOpening).toEqual({ endpoint: 'unix:///tmp/shared.sock' });
+    const external = createSession('chat', 'root-external', 'adopt', 'group', 'thread', { source: 'external' });
+    expect(external.sharedThreadOpening).toBeUndefined();
+    const inherited = createSession('chat', 'root-fork', 'fork', 'group', 'thread', { inherit: ordinary });
+    expect(inherited.sharedThreadOpening).toBeUndefined();
+  });
+
+  it('resets the bot service tier when binding an auto-created shared thread', async () => {
+    init('shared-test');
+    registerCodexInstanceBot({ larkAppId: 'shared-test', larkAppSecret: 'test', cliId: 'codex',
+      serviceTier: 'priority',
+      existingAppServer: { endpoint: 'unix:///tmp/shared.sock', newTopics: 'create' } } as any);
+    const session = createSession('chat', 'root-tier', 'shared', 'group', 'thread',
+      { source: 'ordinary-feishu' });
+    // The fresh ordinary topic carries the bot tier; the remote attachment
+    // worker rejects any defined tier, so binding must normalize it to inherit.
+    expect(session.serviceTier).toBe('priority');
+    session.sharedThreadOpening = { endpoint: 'unix:///tmp/shared.sock', cwd: '/tmp/project', title: 'shared' };
+    updateSession(session);
+    const { openSharedThread } = await import('../src/core/shared-thread-opening.js');
+    const mutate = <T>(change: (row: import('../src/types.js').Session) => T) =>
+      mutateOwnedSessionsAtomically([session.sessionId], rows => change(rows.get(session.sessionId)!),
+        { sharedThreadOpeningWrite: true }).result;
+    await openSharedThread(mutate, { request: async (method: string) => {
+      if (method === 'thread/start') return { thread: { id: 'native-tier' } };
+      if (method === 'thread/read') return { thread: { id: 'native-tier', name: '' } };
+      return {};
+    } });
+    expect(getOwnedSession(session.sessionId)).toMatchObject({
+      cliSessionId: 'native-tier', serviceTier: 'inherit',
+      existingAppServerEndpoint: 'unix:///tmp/shared.sock',
+    });
+  });
+
+  it('keeps the received identity across reload and a stale metadata update', () => {
+    init('shared-test');
+    const session = createSession('chat', 'root-shared', 'shared');
+    const stale = structuredClone(session);
+    session.sharedThreadOpening = { endpoint: 'unix:///tmp/shared.sock', cwd: '/tmp/project',
+      title: 'shared', phase: 'created', threadId: 'native-thread' };
+    session.cliSessionId = 'native-thread';
+    session.existingAppServerEndpoint = 'unix:///tmp/shared.sock';
+    updateSession(session);
+    stale.title = 'later title';
+    updateSession(stale);
+    init('shared-test');
+    expect(getOwnedSession(session.sessionId)).toMatchObject({
+      cliSessionId: 'native-thread', existingAppServerEndpoint: 'unix:///tmp/shared.sock',
+      sharedThreadOpening: { phase: 'created', threadId: 'native-thread' },
+    });
+  });
+
+  it('does not rewind an uncertain creation through a stale metadata writer', () => {
+    init('shared-test');
+    const session = createSession('chat', 'root-creating', 'shared');
+    session.sharedThreadOpening = { endpoint: 'unix:///tmp/shared.sock', cwd: '/tmp/project', title: 'shared' };
+    updateSession(session);
+    const stale = structuredClone(session);
+    mutateOwnedSessionsAtomically([session.sessionId], rows => {
+      rows.get(session.sessionId)!.sharedThreadOpening!.phase = 'creating';
+    }, { sharedThreadOpeningWrite: true });
+    updateSession(stale);
+    init('shared-test');
+    expect(getOwnedSession(session.sessionId)?.sharedThreadOpening?.phase).toBe('creating');
+  });
+
+  it('recovers a received ID and its activation journal from SQLite without a second creation', async () => {
+    const { openSharedThread } = await import('../src/core/shared-thread-opening.js');
+    init('shared-test');
+    const session = createSession('chat', 'root-recovery', 'shared');
+    session.cliId = 'codex';
+    session.sharedThreadOpening = { endpoint: 'unix:///tmp/shared.sock', cwd: '/tmp/project', title: 'shared' };
+    session.queuedActivationPending = true;
+    session.queuedActivationToken = 'activation-first';
+    session.queuedActivationInput = { content: 'first' };
+    session.queuedActivationTurnId = 'om_first';
+    updateSession(session);
+    const mutate = <T>(change: (row: import('../src/types.js').Session) => T) => mutateOwnedSessionsAtomically(
+      [session.sessionId], rows => change(rows.get(session.sessionId)!),
+      { sharedThreadOpeningWrite: true },
+    ).result;
+    let starts = 0;
+    const remote = { request: async (method: string) => {
+      if (method === 'thread/start') { starts++; return { thread: { id: 'native-recovered' } }; }
+      throw new Error('server disconnected');
+    } };
+    await expect(openSharedThread(mutate, remote)).rejects.toThrow('server disconnected');
+    init('shared-test');
+    await openSharedThread(mutate, { request: async method => {
+      expect(method).not.toBe('thread/start');
+      return { thread: { id: 'native-recovered' } };
+    } });
+    expect(starts).toBe(1);
+    expect(getOwnedSession(session.sessionId)).toMatchObject({ cliSessionId: 'native-recovered',
+      queuedActivationPending: true, queuedActivationToken: 'activation-first',
+      queuedActivationInput: { content: 'first' }, queuedActivationTurnId: 'om_first' });
+  });
+});
+
 // db-else-json 读盘夹具：引擎替换后，daemon store 的持久化状态落在 sessions*.db
 // （既有 JSON 冻结不再更新）；混合窗口场景仍可能只有 .json。读断言统一走这里。
 import { DatabaseSync } from 'node:sqlite';

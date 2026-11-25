@@ -5,6 +5,13 @@ import {
 } from '../src/core/existing-app-server.js';
 
 describe('existing Codex App Server endpoint validation', () => {
+  it('enables new thread creation explicitly and preserves the attach-only default', () => {
+    const endpoint = 'unix:///tmp/shared.sock';
+    expect(normalizeExistingAppServerConfig({ endpoint })).toEqual({ endpoint });
+    expect(normalizeExistingAppServerConfig({ endpoint, newTopics: 'create' }))
+      .toEqual({ endpoint, newTopics: 'create' });
+    expect(() => normalizeExistingAppServerConfig({ endpoint, newTopics: true })).toThrow();
+  });
   it.each([
     'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
     'unix:///tmp/codex.sock',

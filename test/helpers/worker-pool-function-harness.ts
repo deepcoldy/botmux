@@ -65,6 +65,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   }
   if (key === 'randomUUID') return randomUUID;
   if (key === 'traexRuntimeDeferredNotice') return scope[key] ??= new Map();
+  if (key === 'getDaemonBootId') return scope[key] ??= () => 'worker-pool-test-boot';
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'parseScheduledTurnId') return parseScheduledTurnId;

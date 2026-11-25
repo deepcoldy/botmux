@@ -2449,9 +2449,13 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // the same physical CLI. Readiness keeps the captured binding on purpose: a
   // pre-replacement callback must not publish the successor's readiness
   // (session-contract-gateway.test.ts).
-  const liveProcessOrigin = msg.type === 'restart_result'
-    ? workerSessionEventScope.liveProcessOrigin()
-    : undefined;
+  // Backend exit is also a fact about the physical CLI, not the turn it last
+  // ran. Keeping the launcher's retired binding strands the live runtime and
+  // its crash recovery while the worker itself remains alive. The same-process
+  // proof still leaves delayed exits from a replaced backend in history.
+  const liveProcessOrigin = msg.type === 'claude_exit'
+    ? workerSessionEventScope.physicalExitOrigin()
+    : msg.type === 'restart_result' ? workerSessionEventScope.liveProcessOrigin() : undefined;
   // Runtime identity follows the physical observer's binding. A submitted
   // turn may still name the previous runtime after an in-process rebind.
   const captured = explicitOrigin ?? liveProcessOrigin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()
