@@ -31,7 +31,7 @@ import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import type { LarkCliIdentity, BytedCliIdentity, BytedcliRegion } from './cli-identity.js';
 
 export type PlatformIdentityResolution =
-  | { state: 'granted'; identity: LarkCliIdentity | BytedCliIdentity; expiresAt: number }
+  | { state: 'granted'; identity: LarkCliIdentity | BytedCliIdentity; expiresAt: number; unionId: string }
   /** This machine is not bound to a platform; nothing was asked. */
   | { state: 'unbound' }
   /** The platform knows the person but has no usable credential for this tool
@@ -47,6 +47,7 @@ export type ResolvePlatformIdentityArgs = {
   tool: TriggerUserAuthTool;
   sessionId: string;
   turnId?: string;
+  cloudJwtRegions?: CredentialGrantRequest['cloudJwtRegions'];
 } & (
   /** The turn's own sender, scoped to this bot's app; its union_id is looked up. */
   | { openId: string; unionId?: undefined }
@@ -199,7 +200,7 @@ async function lookupUnionId(larkAppId: string, openId: string, key: string, gen
  */
 function toIdentity(
   tool: TriggerUserAuthTool,
-  grant: Pick<CredentialGrant, 'variables' | 'cloudJwtRegions'>,
+  grant: Pick<CredentialGrant, 'variables' | 'cloudJwtRegions' | 'cloudJwtRegionStates'>,
   now: number,
 ): LarkCliIdentity | BytedCliIdentity | null {
   const { variables } = grant;
@@ -233,7 +234,8 @@ function toIdentity(
     cloudJwt,
     ...(nonEmpty(codeJwt) ? { codeJwt } : {}),
     ...(Object.keys(regionalCloudJwts).length ? { regionalCloudJwts } : {}),
-    regionalCloudJwtSource: grant.cloudJwtRegions || regionalIssued ? 'platform' : 'platform-legacy',
+    ...(grant.cloudJwtRegionStates ? { regionalCloudJwtStates: grant.cloudJwtRegionStates } : {}),
+    regionalCloudJwtSource: grant.cloudJwtRegions || grant.cloudJwtRegionStates || regionalIssued ? 'platform' : 'platform-legacy',
   };
 }
 
@@ -264,6 +266,7 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
     appId: args.botConfig.larkAppId,
     sessionId: args.sessionId,
     ...(args.turnId ? { turnId: args.turnId } : {}),
+    ...(args.cloudJwtRegions ? { cloudJwtRegions: args.cloudJwtRegions } : {}),
   }, { binding });
 
   if (result.ok) {
@@ -272,7 +275,7 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
       logger.warn(`[trigger-user-auth] platform ${args.tool} grant malformed: required variable missing`);
       return { state: 'unavailable', detail: 'malformed grant' };
     }
-    return { state: 'granted', identity, expiresAt: result.value.expiresAt };
+    return { state: 'granted', identity, expiresAt: result.value.expiresAt, unionId };
   }
   const detail = describeCredentialGrantFailure(result);
   const pageUrl = platformCredentialsUrl({ binding }) ?? undefined;

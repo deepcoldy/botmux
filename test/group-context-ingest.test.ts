@@ -1,3 +1,4 @@
+import { ProtectedResultStore } from '../src/services/protected-result-store.js';
 /**
  * group-context-ingest: 把 im.message.receive_v1 事件静默写进 group-context-store。
  *
@@ -11,7 +12,7 @@
  * Run: bun run vitest run test/group-context-ingest.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -34,6 +35,7 @@ import {
 } from '../src/services/group-context-store.js';
 import { logger } from '../src/utils/logger.js';
 import { markGroupContextCardPurpose } from '../src/im/lark/group-context-card.js';
+import * as protectedEvent from '../src/im/lark/protected-event.js';
 
 const APP = 'cli_app_a';
 const CHAT = 'oc_chat_1';
@@ -286,5 +288,34 @@ describe('错误隔离', () => {
   it('解析器异常（content 不是合法 JSON）仍记录：以原始 content 作兜底正文', () => {
     expect(ingestGroupContextEvent(APP, event({ msgType: 'text', content: 'not-json' }))).toBe('stored');
     expect(getGroupContextMessage(APP, CHAT, 'om_1')?.text).toBe('not-json');
+  });
+});
+
+describe('protected-result context ingestion', () => {
+  it('does not persist raw resource keys when protection storage is corrupt', () => {
+    setGroupContextSettingsResolver(() => ({ enabled: true }));
+    const store = new ProtectedResultStore(dataDir);
+    store.begin({ appId: APP, pluginId: 'reference-reporter', sessionId: 'session', turnId: 'om_turn',
+      ownerUnionId: 'on_owner', chatId: CHAT }, 'fixture_delivery', 'a'.repeat(64));
+    const root = join(dataDir, 'protected-results-v1');
+    writeFileSync(join(root, readdirSync(root).find(name => name.endsWith('.json'))!), '{broken', { mode: 0o600 });
+    const result = ingestGroupContextEvent(APP, event({ msgType: 'file', content: JSON.stringify({
+      file_key: 'file_v3_SYNTHETIC_SECRET', file_name: 'SYNTHETIC_PRIVATE.xlsx' }) }));
+    expect(result).not.toBe('stored');
+    expect(listGroupContextMessages(APP, CHAT).messages).toHaveLength(0);
+  });
+  it('rethrows a second-stage protection failure instead of falling back to raw content', () => {
+    setGroupContextSettingsResolver(() => ({ enabled: true }));
+    const actual = protectedEvent.redactProtectedLarkEvent;
+    const spy = vi.spyOn(protectedEvent, 'redactProtectedLarkEvent')
+      .mockImplementationOnce(actual)
+      .mockImplementationOnce(() => { throw new protectedEvent.ProtectedResultReadError(); });
+    try {
+      const compromised = event({ msgType: 'file', content: JSON.stringify({
+        file_key: 'file_v3_SECOND_STAGE_SECRET', file_name: 'SECOND_STAGE_SECRET.xlsx' }) });
+      expect(ingestGroupContextEvent(APP, compromised)).toBe('error');
+      expect(listGroupContextMessages(APP, CHAT).messages).toHaveLength(0);
+      expect(spy).toHaveBeenCalledTimes(2);
+    } finally { spy.mockRestore(); }
   });
 });

@@ -84,7 +84,7 @@ export class OwnerGroupFollowStore {
       return true;
     });
   }
-  observe(epoch: string, chats: readonly string[], botChats: ReadonlySet<string>, excluded: ReadonlySet<string>, snapshotRevision?: number): number | undefined {
+  observe(epoch: string, chats: readonly string[], botChats: ReadonlySet<string>, ineligible: ReadonlySet<string>, snapshotRevision?: number): number | undefined {
     let revision: number | undefined;
     const updated = this.update(epoch, state => {
       // A second daemon can settle an invitation while these snapshots await.
@@ -94,15 +94,19 @@ export class OwnerGroupFollowStore {
       for (const chatId of chats) {
         const entry = state.entries[chatId];
         if (entry?.status === 'removed') continue;
-        if (excluded.has(chatId) && (entry?.status === 'pending' || entry?.status === 'inviting')) {
-          delete state.entries[chatId];
-          continue;
-        }
         if (botChats.has(chatId)) {
           state.entries[chatId] = { status: 'joined', attempts: entry?.attempts ?? 0 };
-        } else if (entry?.status === 'joined') {
+          continue;
+        }
+        if (entry?.status === 'joined') {
           state.entries[chatId] = { ...entry, status: 'removed' };
-        } else if (state.initialized && !known.has(chatId) && !entry && !excluded.has(chatId)) {
+          continue;
+        }
+        if (ineligible.has(chatId)) {
+          if (entry?.status === 'pending' || entry?.status === 'inviting') delete state.entries[chatId];
+          continue;
+        }
+        if (state.initialized && !known.has(chatId) && !entry) {
           state.entries[chatId] = { status: 'pending', attempts: 0 };
         }
       }

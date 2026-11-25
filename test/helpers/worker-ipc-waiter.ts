@@ -10,6 +10,7 @@ export function waitForWorkerMessage<T extends WorkerToDaemon['type']>(
   type: T,
   logs: readonly string[],
   timeoutMs: number,
+  accept: (message: Extract<WorkerToDaemon, { type: T }>) => boolean = () => true,
 ): Promise<Extract<WorkerToDaemon, { type: T }>> {
   return new Promise((resolvePromise, rejectPromise) => {
     let settled = false;
@@ -29,7 +30,8 @@ export function waitForWorkerMessage<T extends WorkerToDaemon['type']>(
     const onMessage = (raw: unknown) => {
       const message = raw as WorkerToDaemon;
       if (message.type === type) {
-        finish(() => resolvePromise(message as Extract<WorkerToDaemon, { type: T }>));
+        const candidate = message as Extract<WorkerToDaemon, { type: T }>;
+        if (accept(candidate)) finish(() => resolvePromise(candidate));
       } else if (message.type === 'error' && type !== 'error') {
         finish(() => rejectPromise(new Error(
           `worker error before ${type}: ${message.message}\n${diagnostics()}`,

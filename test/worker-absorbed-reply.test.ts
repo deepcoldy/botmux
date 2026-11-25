@@ -6,7 +6,7 @@
  * transcript file the test appends to as Claude would. Plus the Codex
  * mid-turn reply observer (`observeCodexMidTurnReply`).
  */
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -59,10 +59,27 @@ const requestCopy = (prompt: string): TranscriptEvent => ({
   ] },
 }) as unknown as TranscriptEvent;
 
-function harness(opts: { adoptMode?: boolean; folds?: string[]; followUpReply?: boolean; replyDelivery?: 'send' | 'transcript' } = {}) {
+/** Cap on a terminal-typed turn's mirrored answer in this fixture (the worker's
+ *  LOCAL_TURN_ASSISTANT_MAX), small so a test can exceed it. */
+const LOCAL_CAP = 200;
+
+function harness(opts: {
+  adoptMode?: boolean; folds?: string[]; followUpReply?: boolean; replyDelivery?: 'send' | 'transcript';
+  /** Lark turn the host prompt binds to; null leaves it unmarked (a terminal-typed turn). */
+  host?: string | null;
+  /** Final outputs go through the worker's final-output handoff. */
+  handoff?: boolean;
+  /** Whether the daemon confirms each non-progress reply's actual delivery. */
+  autoAcknowledge?: boolean;
+} = {}) {
   const sent: Array<Record<string, unknown>> = [];
+  const acknowledgedReplies = new Set<Record<string, unknown>>();
+  const offers: Array<{ turnId: string; content: string }> = [];
+  let failLinkRefFor: string | undefined;
   const terminals: Array<{ turnId: string; status: string; disposition?: string }> = [];
   const reads: number[] = [];
+  let failReplySends = 0;
+  let acknowledgeAbsorbedReply: (msg: Record<string, unknown>) => void = () => {};
   const queue = new queueModule.BridgeTurnQueue();
   const path = join(dir, `${Math.random().toString(36).slice(2)}.jsonl`);
   writeFileSync(path, '');
@@ -71,7 +88,9 @@ function harness(opts: { adoptMode?: boolean; folds?: string[]; followUpReply?: 
     bridgeQueue: queue,
     bridgeFingerprintScanLastMs: new Map(),
     journalBridgeTurnClear: () => {},
-    rememberTurnLinkRefMode: () => {},
+    rememberTurnLinkRefMode: (turnId: string) => {
+      if (turnId === failLinkRefFor) { failLinkRefFor = undefined; throw new Error('journal write failed'); }
+    },
     readSendMarkers: () => [],
     lastInitConfig: {
       cliId: 'claude-code', chatId: 'oc_chat', rootMessageId: 'om_root', adoptMode: opts.adoptMode ?? true,
@@ -81,7 +100,11 @@ function harness(opts: { adoptMode?: boolean; folds?: string[]; followUpReply?: 
     cliName: () => 'Claude',
     zeroPromptTerminalSync: () => false,
     WORKER_STARTED_AT_MS: Date.now() - 1_000,
-    send: (msg: Record<string, unknown>) => { sent.push(msg); },
+    send: (msg: Record<string, unknown>) => {
+      if (msg.type === 'absorbed_reply' && failReplySends > 0) { failReplySends--; throw new Error('IPC channel closed'); }
+      sent.push(msg);
+      if (msg.type === 'absorbed_reply' && !msg.progress && (opts.autoAcknowledge ?? true)) acknowledgeAbsorbedReply(msg);
+    },
     emitTurnTerminal: (turnId: string, status: string, _code?: string, _attempt?: number, disposition?: string) => {
       terminals.push({ turnId, status, ...(disposition ? { disposition } : {}) });
     },
@@ -91,35 +114,81 @@ function harness(opts: { adoptMode?: boolean; folds?: string[]; followUpReply?: 
     replyDeliveryMode: () => opts.replyDelivery ?? 'transcript',
     sessionId: 'session-under-test',
     bridgeJsonlPath: path,
-    workerFinalOutputHandoff: undefined,
+    bridgeBaselineDone: true,
+    bridgeWatcher: null,
+    bridgeFallbackTimer: null,
+    bridgeKnownSessionIds: new Set(),
+    bridgeCliProvenSessionIds: new Set(),
+    bridgeSecondaryPaths: new Set(),
+    bridgeBlindTurnWatch: { reset: () => {} },
+    bridgeRestoreGate: { markGenerationRetired: () => {} },
+    clearHerdrAdoptBridgeQuietTimer: () => {},
+    settleUnreadClaudeTurnLookOnTeardown: () => {},
+    beginNewBridgeTranscriptGeneration: () => {},
+    resetThinkingChannel: () => {},
+    workerFinalOutputHandoff: opts.handoff
+      ? { offer: (out: { turnId: string; content: string }) => { offers.push(out); }, hasTurn: () => false }
+      : undefined,
+    bridgeTurnJournalFilePath: () => join(dir, 'journal.jsonl'),
+    readBridgeTurnJournal: () => [],
+    canAdmitFinalOutputHandoff: () => true,
+    canHandoffFinalOutput: () => true,
+    LOCAL_TURN_USER_MAX: 1_000,
+    LOCAL_TURN_ASSISTANT_MAX: LOCAL_CAP,
     universalOutputHandoff: false,
-    finalHandoffAdmissionEnabled: false,
+    finalHandoffAdmissionEnabled: opts.handoff === true,
     usageLimitTracker: { noteTurnCompleted: () => {} },
     notifyExplicitRepliesObserved: () => {},
     observeThinkingAttribution: () => {},
     absorbedReplyCollectors: new WeakMap(),
+    followUpReplyLive: undefined,
+    pendingAbsorbedReplyDeliveries: new Map(),
+    PENDING_ABSORBED_REPLY_DELIVERIES_MAX: 32,
+    deferredAbsorbedReplyFinals: new Map(),
+    ABSORBED_REPLY_DELIVERY_WAIT_MS: 100,
   };
   scope.attributableExplicitReplyMarkersForTurnWindow = loadWorkerFunction('attributableExplicitReplyMarkersForTurnWindow', scope);
   scope.followUpReplyEnabled = loadWorkerFunction('followUpReplyEnabled', scope);
+  scope.foldReplyEnabled = loadWorkerFunction('foldReplyEnabled', scope);
+  const setFollowUpReplyLive = loadWorkerFunction<(enabled: boolean) => void>('setFollowUpReplyLive', scope);
+  scope.absorbedReplyDeliveryKey = loadWorkerFunction('absorbedReplyDeliveryKey', scope);
+  scope.hostWithPendingAbsorbedReply = loadWorkerFunction('hostWithPendingAbsorbedReply', scope);
+  scope.deferredHostForAbsorbedReply = loadWorkerFunction('deferredHostForAbsorbedReply', scope);
+  scope.runDeferredAbsorbedReplyFinal = loadWorkerFunction('runDeferredAbsorbedReplyFinal', scope);
+  scope.timeOutDeferredAbsorbedReplyFinal = loadWorkerFunction('timeOutDeferredAbsorbedReplyFinal', scope);
+  scope.deferAbsorbedReplyFinal = loadWorkerFunction('deferAbsorbedReplyFinal', scope);
+  const noteAbsorbedReplyDelivered = loadWorkerFunction<(turnId: string, dispatchAttempt: number | undefined, replyUuid: string) => void>('noteAbsorbedReplyDelivered', scope);
+  acknowledgeAbsorbedReply = msg => {
+    acknowledgedReplies.add(msg);
+    noteAbsorbedReplyDelivered(String(msg.turnId), msg.dispatchAttempt as number | undefined, String(msg.replyUuid));
+  };
+  scope.truncatePreambleText = loadWorkerFunction('truncatePreambleText', scope);
+  scope.formatLocalTurnFields = loadWorkerFunction('formatLocalTurnFields', scope);
+  scope.formatHeadlessLocalTurnContent = loadWorkerFunction('formatHeadlessLocalTurnContent', scope);
   scope.sendAbsorbedReply = loadWorkerFunction('sendAbsorbedReply', scope);
   scope.readFoldReply = loadWorkerFunction('readFoldReply', scope);
   const noteFoldReadOffsets = loadWorkerFunction<(events: TranscriptEvent[], file: string, offset: number) => void>('noteFoldReadOffsets', scope);
   scope.observeAbsorbedReplies = loadWorkerFunction('observeAbsorbedReplies', scope);
   const observe = loadWorkerFunction<(ev: TranscriptEvent, turn: queueModule.BridgePendingTurn) => void>('observeBridgeAttribution', scope);
   const emitReadyTurns = loadWorkerFunction<(opts?: { explicitTerminalOnly?: boolean }) => void>('emitReadyTurns', scope);
+  scope.emitReadyTurns = emitReadyTurns;
+  const stopBridgeWatcher = loadWorkerFunction<() => void>('stopBridgeWatcher', scope);
   /** The polling read pops turns at a screen-idle edge too, without waiting for terminal records. */
   const emitAtIdle = () => emitReadyTurns({});
-  queue.mark('om_A', queueModule.makeFingerprint(PROMPT_A), clock - 500, queueModule.normaliseForFingerprint(PROMPT_A));
+  const host = opts.host === undefined ? 'om_A' : opts.host;
+  if (host) queue.mark(host, queueModule.makeFingerprint(PROMPT_A), clock - 500, queueModule.normaliseForFingerprint(PROMPT_A));
   for (const [i, prompt] of (opts.folds ?? [PROMPT_B]).entries()) {
     queue.mark(`om_${String.fromCharCode(66 + i)}`, queueModule.makeFingerprint(prompt), clock - 400 + i, queueModule.normaliseForFingerprint(prompt));
   }
   /** Claude writes these records; the worker's polling read ingests them. */
-  const live = (events: TranscriptEvent[]) => {
-    const batchOffset = statSync(path).size;
-    appendFileSync(path, events.map(ev => `${JSON.stringify(ev)}\n`).join(''));
-    noteFoldReadOffsets(events, path, batchOffset);
-    queue.ingest(events, path, observe);
+  const liveOn = (file: string, events: TranscriptEvent[]) => {
+    const batchOffset = statSync(file).size;
+    appendFileSync(file, events.map(ev => `${JSON.stringify(ev)}\n`).join(''));
+    scope.bridgeJsonlPath = file;
+    noteFoldReadOffsets(events, file, batchOffset);
+    queue.ingest(events, file, observe);
   };
+  const live = (events: TranscriptEvent[]) => liveOn(path, events);
   /** Records the live read ingested without the observer (another read path). */
   const unobserved = (events: TranscriptEvent[]) => {
     appendFileSync(path, events.map(ev => `${JSON.stringify(ev)}\n`).join(''));
@@ -131,7 +200,27 @@ function harness(opts: { adoptMode?: boolean; folds?: string[]; followUpReply?: 
   const finals = () => sent.filter(msg => msg.type === 'final_output').map(msg => [msg.turnId, msg.content] as const);
   /** The CLI rewrote the transcript (shorter) without the worker reading it. */
   const rewrite = (events: TranscriptEvent[]) => writeFileSync(path, events.map(ev => `${JSON.stringify(ev)}\n`).join(''));
-  return { live, unobserved, rewrite, emit, emitAtIdle, replies, finals, sent, terminals, reads, path };
+  /** The daemon pushed a change of the bot's followUpReply (set_follow_up_reply). */
+  const setFollowUpReply = (enabled: boolean) => setFollowUpReplyLive(enabled);
+  const markBackgroundWake = (replyAnchorTurnId: string) => {
+    const hostTurn = queue.peek().find(turn => turn.started && !turn.absorbedIntoTurnId);
+    if (!hostTurn) throw new Error('no running host');
+    hostTurn.isBackgroundWake = true;
+    hostTurn.replyAnchorTurnId = replyAnchorTurnId;
+  };
+  const failNextReplySend = () => { failReplySends = 1; };
+  const acknowledgeReplies = () => {
+    for (const msg of sent) {
+      if (msg.type === 'absorbed_reply' && !msg.progress && !acknowledgedReplies.has(msg)) acknowledgeAbsorbedReply(msg);
+    }
+  };
+  /** The next emit throws while it handles `turnId` (a journal write failing). */
+  const failEmitAt = (turnId: string) => { failLinkRefFor = turnId; };
+  const finalKinds = () => sent.filter(msg => msg.type === 'final_output').map(msg => [msg.turnId, msg.kind ?? 'turn'] as const);
+  return {
+    live, liveOn, unobserved, rewrite, emit, emitAtIdle, stopBridgeWatcher, replies, finals, finalKinds, offers, sent, terminals, reads, path,
+    setFollowUpReply, markBackgroundWake, acknowledgeReplies, failNextReplySend, failEmitAt,
+  };
 }
 
 describe('worker: replies to folded Lark messages (adopt)', () => {
@@ -185,13 +274,304 @@ describe('worker: replies to folded Lark messages (adopt)', () => {
     expect(h.replies()).toEqual([['om_B', '对，用的是 gpt-6-astra。', 'thinking']]);
   });
 
-  it('answers at the end of the host turn when the model never moved on before it ended', () => {
+  it('lets the host turn\'s final carry an answer written at its end, posted once', () => {
     const h = harness();
-    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('a-final', 'answer and summary', 'end_turn'), duration('dur')]);
+    h.live([user('uA', PROMPT_A), text('a0', '先跑单测。'), tool('t0'), result('r0'), fold('qB', PROMPT_B),
+      text('a-final', 'answer and summary', 'end_turn'), duration('dur')]);
     expect(h.replies()).toEqual([]);
     h.emit();
-    expect(h.replies()).toEqual([['om_B', 'answer and summary', 'text']]);
-    expect(h.finals().map(([turnId]) => turnId)).toEqual(['om_A']);
+    expect(h.replies()).toEqual([]);
+    expect(h.finals()).toEqual([['om_A', '先跑单测。\n\nanswer and summary']]);
+    expect(h.terminals).toEqual([{ turnId: 'om_A', status: 'completed' }, { turnId: 'om_B', status: 'completed' }]);
+  });
+
+  it('answers at the end of the host turn with what the host\'s final does not carry', () => {
+    const h = harness();
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), thinking('aB', '对，用的是 gpt-6-astra。'), duration('dur')]);
+    expect(h.replies()).toEqual([]);
+    h.emit();
+    expect(h.replies()).toEqual([['om_B', '对，用的是 gpt-6-astra。', 'thinking']]);
+    expect(h.finals()).toEqual([]);
+  });
+
+  it('keeps a live reply too long to post whole in the host turn\'s final', () => {
+    const long = '长'.repeat(transcriptModule.ABSORBED_REPLY_MAX_CHARS + 1);
+    const h = harness();
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', long), tool('t1'), result('r1')]);
+    h.live([text('a-final', 'done', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.replies()).toEqual([['om_B', long, 'text']]);
+    expect(h.finals()).toEqual([['om_A', `${long}\n\ndone`]]);
+  });
+
+  it('keeps an unconfirmed live reply in the host final when followUpReply is switched off', () => {
+    const h = harness({ autoAcknowledge: false });
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', '收到，开始做。'), tool('t1')]);
+    expect(h.replies()).toEqual([['om_B', '收到，开始做。', 'text']]);
+    // Without a delivery ACK the daemon may have dropped or failed the reply.
+    h.setFollowUpReply(false);
+    h.live([result('r1'), text('a-final', 'done', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.finals()).toEqual([['om_A', '收到，开始做。\n\ndone']]);
+    expect(h.terminals).toEqual([{ turnId: 'om_A', status: 'completed' }, { turnId: 'om_B', status: 'completed' }]);
+  });
+
+  it('does not repeat a confirmed live reply when followUpReply is switched off', () => {
+    const h = harness();
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', '收到，开始做。'), tool('t1')]);
+    // The daemon's successful POST is already a historical delivery fact.
+    h.setFollowUpReply(false);
+    h.live([result('r1'), text('a-final', 'done', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.finals()).toEqual([['om_A', 'done']]);
+    expect(h.terminals).toEqual([{ turnId: 'om_A', status: 'completed' }, { turnId: 'om_B', status: 'completed' }]);
+  });
+
+  it('starts answering folded messages once followUpReply is switched on', () => {
+    const h = harness({ followUpReply: false });
+    h.setFollowUpReply(true);
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', '收到，开始做。'), tool('t1')]);
+    expect(h.replies()).toEqual([['om_B', '收到，开始做。', 'text']]);
+  });
+
+  it('keeps a reply whose live send failed in the host turn\'s final, posted once', () => {
+    const h = harness();
+    h.failNextReplySend();
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', '收到，开始做。'), tool('t1')]);
+    expect(h.replies()).toEqual([]);
+    h.live([result('r1'), text('a-final', 'done', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.replies()).toEqual([]);
+    expect(h.finals()).toEqual([['om_A', '收到，开始做。\n\ndone']]);
+  });
+
+  it('does not settle a folded turn apart from its host when its live reply failed to send', () => {
+    const h = harness();
+    h.failNextReplySend();
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', 'answer'), tool('t1'), result('r1')]);
+    h.live([apiError('err'), duration('dur')]);
+    h.emit();
+    const status = (turnId: string) => h.terminals.find(term => term.turnId === turnId)?.status;
+    expect(status('om_A')).not.toBe('completed');
+    expect(status('om_B')).toBe(status('om_A'));
+  });
+
+  it('lets a terminal-typed host turn\'s mirrored final carry an answer written at its end', () => {
+    const h = harness({ host: null });
+    h.live([user('uL', 'terminal typed prompt'), tool('t0'), result('r0'), fold('qB', PROMPT_B),
+      text('a-final', 'THE_ANSWER', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.replies()).toEqual([]);
+    expect(h.finals()).toEqual([[expect.stringMatching(/^local-/), 'THE_ANSWER']]);
+    expect(h.finalKinds()).toEqual([[expect.stringMatching(/^local-/), 'local-turn']]);
+  });
+
+  it('still answers the folded message when a terminal-typed host\'s mirror is cut before the answer', () => {
+    const h = harness({ host: null });
+    h.live([user('uL', 'terminal typed prompt'), text('a0', 'x'.repeat(LOCAL_CAP + 50)), tool('t0'), result('r0'),
+      fold('qB', PROMPT_B), text('a-final', 'THE_ANSWER', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.finals()[0][1]).not.toContain('THE_ANSWER');
+    expect(h.replies()).toEqual([['om_B', 'THE_ANSWER', 'text']]);
+  });
+
+  it('does not route an adopt background wake final through another topic\'s anchor', () => {
+    const h = harness({ host: null });
+    h.live([user('uL', 'terminal typed prompt'), tool('t0')]);
+    h.markBackgroundWake('om_other_topic');
+    h.live([result('r0'), fold('qB', PROMPT_B), text('a-final', 'THE_ANSWER', 'end_turn'), duration('dur')]);
+    h.emit();
+    const final = h.sent.find(msg => msg.type === 'final_output');
+    expect(final).toMatchObject({ kind: 'local-turn' });
+    expect(final).not.toHaveProperty('replyTurnId');
+    expect(final?.content).toContain('THE_ANSWER');
+    expect(h.replies()).toEqual([]);
+  });
+
+  it('lets a headless continuation host\'s final carry an answer written at its end', () => {
+    const h = harness();
+    h.live([user('uA', PROMPT_A), text('a0', 'step one'), tool('t0')]);
+    h.emitAtIdle();
+    h.live([result('r0'), text('a1', 'step two'), tool('t1'), result('r1'),
+      fold('qB', PROMPT_B), text('a-final', 'THE_ANSWER', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.finalKinds().map(([, kind]) => kind)).toEqual(['turn', 'local-turn-headless']);
+    expect(h.finals()[1][1]).toContain('THE_ANSWER');
+    expect(h.replies()).toEqual([]);
+  });
+
+  it('still answers the folded message when the host is a headless continuation cut before the answer', () => {
+    const h = harness();
+    h.live([user('uA', PROMPT_A), text('a0', 'step one'), tool('t0')]);
+    h.emitAtIdle();
+    h.live([result('r0'), text('a1', 'x'.repeat(LOCAL_CAP + 50)), tool('t1'), result('r1'),
+      fold('qB', PROMPT_B), text('a-final', 'THE_ANSWER', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.finalKinds().map(([, kind]) => kind)).toEqual(['turn', 'local-turn-headless']);
+    expect(h.finals().some(([, content]) => content.includes('THE_ANSWER'))).toBe(false);
+    expect(h.replies()).toEqual([['om_B', 'THE_ANSWER', 'text']]);
+  });
+
+  it('lets a handed-off host final carry an answer written at its end', () => {
+    const h = harness({ handoff: true });
+    h.live([user('uA', PROMPT_A), text('a0', 'pre'), tool('t0'), result('r0'), fold('qB', PROMPT_B),
+      text('a-final', 'THE_ANSWER', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.offers.map(out => [out.turnId, out.content])).toEqual([['om_A', 'pre\n\nTHE_ANSWER']]);
+    expect(h.replies()).toEqual([]);
+  });
+
+  it('answers the folded message itself when the host\'s final does not go to the chat (an HTTP trigger)', () => {
+    const h = harness({ host: 'trg_A' });
+    h.live([user('uA', PROMPT_A), text('a0', 'pre'), tool('t0'), result('r0'), fold('qB', PROMPT_B),
+      text('a-final', 'THE_ANSWER', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.finals()).toEqual([['trg_A', 'pre\n\nTHE_ANSWER']]);
+    expect(h.replies()).toEqual([['om_B', 'THE_ANSWER', 'text']]);
+  });
+
+  it('posts an answer its host\'s final carried only once when the emit is retried after a throw', () => {
+    const h = harness();
+    h.live([user('uA', PROMPT_A), text('a0', 'pre'), tool('t0'), result('r0'), fold('qB', PROMPT_B),
+      text('a-final', 'THE_ANSWER', 'end_turn'), duration('dur')]);
+    h.failEmitAt('om_B');
+    expect(() => h.emit()).toThrow('journal write failed');
+    h.emit();
+    expect(h.finals()).toEqual([['om_A', 'pre\n\nTHE_ANSWER']]);
+    expect(h.replies()).toEqual([]);
+  });
+
+  it('leaves a reply it sent live out of the host turn\'s final', () => {
+    const h = harness();
+    h.live([user('uA', PROMPT_A), text('a0', '先跑单测。'), tool('t0'), result('r0'),
+      fold('qB', PROMPT_B), text('aB', '收到，开始做。'), tool('t1'), result('r1')]);
+    h.live([text('a-final', 'all green', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.replies()).toEqual([['om_B', '收到，开始做。', 'text']]);
+    expect(h.finals()).toEqual([['om_A', '先跑单测。\n\nall green']]);
+  });
+
+  it('keeps a live reply in the host final when delivery confirmation never arrives', () => {
+    // No absorbed_reply_delivered: this is the daemon retry-exhaustion shape.
+    // After a bounded wait the normal host final must retain the missing answer.
+    vi.useFakeTimers();
+    try {
+      const h = harness({ autoAcknowledge: false });
+      h.live([user('uA', PROMPT_A), tool('t0'), result('r0'),
+        fold('qB', PROMPT_B), text('aB', '收到，开始做。'), tool('t1'), result('r1')]);
+      h.live([text('a-final', 'done', 'end_turn'), duration('dur')]);
+      h.emit();
+      expect(h.finals()).toEqual([]);
+      expect(h.terminals).toEqual([]);
+      vi.advanceTimersByTime(100);
+      expect(h.replies()).toEqual([['om_B', '收到，开始做。', 'text']]);
+      expect(h.finals()).toEqual([['om_A', '收到，开始做。\n\ndone']]);
+      expect(h.terminals).toEqual([{ turnId: 'om_A', status: 'completed' }, { turnId: 'om_B', status: 'completed' }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('defers a same-batch host final until delivery is confirmed, then excludes the reply', () => {
+    const h = harness({ autoAcknowledge: false });
+    h.live([user('uA', PROMPT_A), text('a0', '先跑单测。'), tool('t0'), result('r0'),
+      fold('qB', PROMPT_B), text('aB', '收到，开始做。'), tool('t1'), result('r1')]);
+    h.live([text('a-final', 'all green', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.finals()).toEqual([]);
+    expect(h.terminals).toEqual([]);
+    h.acknowledgeReplies();
+    expect(h.finals()).toEqual([['om_A', '先跑单测。\n\nall green']]);
+    expect(h.terminals).toEqual([{ turnId: 'om_A', status: 'completed' }, { turnId: 'om_B', status: 'completed' }]);
+  });
+
+  it('settles a deferred host final before bridge watcher teardown clears the queue', () => {
+    const h = harness({ autoAcknowledge: false });
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'),
+      fold('qB', PROMPT_B), text('aB', '收到，开始做。'), tool('t1'), result('r1')]);
+    h.live([text('a-final', 'done', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.finals()).toEqual([]);
+    h.stopBridgeWatcher();
+    expect(h.finals()).toEqual([['om_A', '收到，开始做。\n\ndone']]);
+    expect(h.terminals).toEqual([{ turnId: 'om_A', status: 'completed' }, { turnId: 'om_B', status: 'completed' }]);
+    // A receipt arriving after teardown cannot retract the conservative final.
+    h.acknowledgeReplies();
+    expect(h.finals()).toHaveLength(1);
+  });
+
+  it('releases a duration-held host during teardown without starting a new ACK wait', () => {
+    const h = harness({ autoAcknowledge: false });
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'),
+      fold('qB', PROMPT_B), text('aB', '收到，开始做。'), tool('t1'), result('r1')]);
+    // stop_reason without turn_duration: the ordinary drain still holds the host,
+    // so no deferred host exists before stopBridgeWatcher's release-held pass.
+    h.live([text('a-final', 'done', 'end_turn')]);
+    h.emit();
+    expect(h.finals()).toEqual([]);
+    h.stopBridgeWatcher();
+    expect(h.finals()).toEqual([['om_A', '收到，开始做。\n\ndone']]);
+    expect(h.terminals).toEqual([{ turnId: 'om_A', status: 'completed' }, { turnId: 'om_B', status: 'completed' }]);
+    h.acknowledgeReplies();
+    expect(h.finals()).toHaveLength(1);
+  });
+
+  it('resets a stale live switch on the real accepted-init path', async () => {
+    const run = async (liveBeforeInit: boolean, configured: boolean) => {
+      const scope: Record<string, unknown> = {
+        lastInitConfig: undefined,
+        followUpReplyLive: liveBeforeInit,
+        pendingAbsorbedReplyDeliveries: new Map([['stale', { turn: {}, uuids: ['old'] }]]),
+        deferredAbsorbedReplyFinals: new Map(),
+        WORKFLOW_NODE_SESSION_ENV: 'BOTMUX_ABSORBED_INIT_TEST_UNUSED',
+        initializeWorkerSessionContract: () => {},
+        configureTraexAutoModel: () => {},
+        isCodexAppCliId: () => false,
+        isCodexFamilyCliId: () => false,
+        applyCodexInstanceEnv: () => {},
+        // Stop immediately after the init baseline; no CLI process is needed.
+        seedInitTurnTerminals: () => { throw new Error('stop-after-init-baseline'); },
+        log: () => {},
+      };
+      scope.resetFollowUpReplyStateForInit = loadWorkerFunction('resetFollowUpReplyStateForInit', scope);
+      scope.followUpReplyEnabled = loadWorkerFunction('followUpReplyEnabled', scope);
+      scope.foldReplyEnabled = loadWorkerFunction('foldReplyEnabled', scope);
+      const handle = loadWorkerFunction<(msg: unknown) => Promise<void>>('handleContractDaemonMessage', scope);
+      await expect(handle({
+        type: 'init', adoptMode: true, prompt: '', cliId: 'claude-code',
+        followUpReply: configured || undefined,
+      })).rejects.toThrow('stop-after-init-baseline');
+      expect((scope.pendingAbsorbedReplyDeliveries as Map<string, unknown>).size).toBe(0);
+      return (scope.foldReplyEnabled as () => boolean)();
+    };
+    expect(await run(true, false)).toBe(false);
+    expect(await run(false, true)).toBe(true);
+  });
+
+  it('posts a folded answer from a rotated jsonl that its host final cannot carry', () => {
+    const h = harness();
+    const rotated = join(dir, `${Math.random().toString(36).slice(2)}-rotated.jsonl`);
+    writeFileSync(rotated, '');
+    h.live([user('uA', PROMPT_A), text('a0', 'old file only'), tool('t0')]);
+    // The host stays bound to the first file; the fold and its answer are read
+    // after the sessionId rotation and therefore belong to the second file.
+    h.liveOn(rotated, [result('r0'), fold('qB', PROMPT_B), text('a-final', 'THE_ANSWER', 'end_turn'), duration('dur')]);
+    h.emit();
+    expect(h.finals()).toEqual([['om_A', 'old file only']]);
+    expect(h.replies()).toEqual([['om_B', 'THE_ANSWER', 'text']]);
+  });
+
+  it('posts no second copy of a live reply when an idle edge cuts the host while it still works', () => {
+    // The live reply is all the host has said when the screen looks idle mid-turn.
+    const h = harness();
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', '收到，开始做。'), tool('t1')]);
+    expect(h.replies()).toEqual([['om_B', '收到，开始做。', 'text']]);
+    h.live([result('r1'), tool('t2')]);
+    h.emitAtIdle();
+    expect(h.replies()).toHaveLength(1);
+    expect(h.finals()).toEqual([]);
+    // Its output went out as the reply: not a turn cut off without output.
+    expect(h.terminals).toEqual([{ turnId: 'om_A', status: 'completed' }, { turnId: 'om_B', status: 'completed' }]);
   });
 
   it('reads the reply from the transcript even when another read path ingested the fold', () => {
@@ -206,8 +586,10 @@ describe('worker: replies to folded Lark messages (adopt)', () => {
     const h = harness();
     h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', 'answer')]);
     h.emitAtIdle();
-    expect(h.replies()).toEqual([['om_B', 'answer', 'text']]);
-    expect(h.terminals.find(term => term.turnId === 'om_B')).toEqual({ turnId: 'om_B', status: 'completed' });
+    // Not yet answered live: the host's final carries the answer, once.
+    expect(h.replies()).toEqual([]);
+    expect(h.finals()).toEqual([['om_A', 'answer']]);
+    expect(h.terminals).toEqual([{ turnId: 'om_A', status: 'completed' }, { turnId: 'om_B', status: 'completed' }]);
   });
 
   it('reads past the request copy Claude Code writes before the answer, live and at the turn end', () => {
@@ -217,9 +599,9 @@ describe('worker: replies to folded Lark messages (adopt)', () => {
     expect(h.replies()).toEqual([['om_B', '用的是 gpt-6-astra。', 'text']]);
     const atEnd = harness();
     atEnd.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), requestCopy(PROMPT_B),
-      text('a-final', 'answer and summary', 'end_turn'), duration('dur')]);
+      thinking('aB', 'answer'), duration('dur')]);
     atEnd.emit();
-    expect(atEnd.replies()).toEqual([['om_B', 'answer and summary', 'text']]);
+    expect(atEnd.replies()).toEqual([['om_B', 'answer', 'thinking']]);
   });
 
   it('gives a later folded message its own answer and the earlier silent one none', () => {
@@ -229,6 +611,7 @@ describe('worker: replies to folded Lark messages (adopt)', () => {
     h.live([text('a-final', 'done', 'end_turn'), duration('dur')]);
     h.emit();
     expect(h.replies()).toEqual([['om_C', 'CI 全绿。', 'text']]);
+    expect(h.finals()).toEqual([['om_A', 'done']]);
   });
 
   it('suppresses ambiguous answers after consecutive folds without assistant activity, live and at turn end', () => {
@@ -239,12 +622,15 @@ describe('worker: replies to folded Lark messages (adopt)', () => {
     live.live([text('a-final', 'done', 'end_turn'), duration('dur')]);
     live.emit();
     expect(live.replies()).toEqual([]);
+    // Unposted as a reply, it stays in the host's final.
+    expect(live.finals()).toEqual([['om_A', '用的是 gpt-x。\n\ndone']]);
 
     const atEnd = harness({ folds: [PROMPT_B, PROMPT_C] });
     atEnd.live([user('uA', PROMPT_A), tool('t0'), result('r0'),
       fold('qB', PROMPT_B), fold('qC', PROMPT_C), text('a-final', '用的是 gpt-x。', 'end_turn'), duration('dur')]);
     atEnd.emit();
     expect(atEnd.replies()).toEqual([]);
+    expect(atEnd.finals()).toEqual([['om_A', '用的是 gpt-x。']]);
   });
 
   it('does not fail a folded turn it answered when the host turn then fails', () => {
@@ -257,13 +643,32 @@ describe('worker: replies to folded Lark messages (adopt)', () => {
     expect(status('om_B')).toBe('completed');
   });
 
+  it('gives an unconfirmed folded reply its own final when the host fails', () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness({ autoAcknowledge: false });
+      h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', 'answer'), tool('t1'), result('r1')]);
+      h.live([apiError('err'), duration('dur')]);
+      h.emit();
+      expect(h.finals()).toEqual([]);
+      expect(h.terminals).toEqual([]);
+      vi.advanceTimersByTime(100);
+      expect(h.finals()).toEqual([['om_B', 'answer']]);
+      const status = (turnId: string) => h.terminals.find(term => term.turnId === turnId)?.status;
+      expect(status('om_A')).not.toBe('completed');
+      expect(status('om_B')).toBe('completed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('handles a folded message exactly as before while followUpReply is off', () => {
     const answered = harness({ followUpReply: false });
     answered.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', 'answer'), tool('t1'), result('r1')]);
     answered.live([text('a-final', 'done', 'end_turn'), duration('dur')]);
     answered.emit();
     expect(answered.replies()).toEqual([]);
-    expect(answered.finals().map(([turnId]) => turnId)).toEqual(['om_A']);
+    expect(answered.finals()).toEqual([['om_A', 'answer\n\ndone']]);
     // An answered fold no longer settles apart from its host: it takes the host's failure.
     const failing = harness({ followUpReply: false });
     failing.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', 'answer'), tool('t1'), result('r1')]);
@@ -272,6 +677,51 @@ describe('worker: replies to folded Lark messages (adopt)', () => {
     const status = (turnId: string) => failing.terminals.find(term => term.turnId === turnId)?.status;
     expect(status('om_B')).toBe(status('om_A'));
     expect(status('om_A')).not.toBe('completed');
+  });
+
+  it('keeps /config and the worker on the same live followUpReply value', async () => {
+    const h = harness();
+    const configDir = mkdtempSync(join(tmpdir(), 'bmx-absorbed-config-sync-'));
+    const configPath = join(configDir, 'bots.json');
+    const appId = 'worker-absorbed-config-sync';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const workerPool = await import('../src/core/worker-pool.js');
+    const change = await import('../src/services/follow-up-reply-change.js');
+    const unregister = change.registerFollowUpReplyChangeHandler((larkAppId, enabled) => {
+      change.broadcastFollowUpReplyToWorkers(workerPool.getActiveSessionsRegistry()?.values() ?? [], larkAppId, enabled);
+    });
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code', followUpReply: true }]));
+      const registry = await import('../src/bot-registry.js');
+      registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+      const pushes: Array<{ type: string; enabled: boolean }> = [];
+      workerPool.setActiveSessionsRegistry(new Map([['config-sync', {
+        larkAppId: appId,
+        worker: { killed: false, send: (msg: { type: string; enabled: boolean }) => {
+          pushes.push(msg);
+          if (msg.type === 'set_follow_up_reply') h.setFollowUpReply(msg.enabled);
+          return true;
+        } },
+      }]]));
+      const configStore = await import('../src/services/bot-config-store.js');
+      const applied = await configStore.applyConfigField(appId, configStore.findConfigField('followUpReply')!, false);
+      expect(applied.ok).toBe(true);
+      expect(pushes).toEqual([{ type: 'set_follow_up_reply', enabled: false }]);
+
+      // The write precedes the model's answer, so this is not a toggle race.
+      h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', '收到，开始做。'), tool('t1'), result('r1')]);
+      h.live([text('a-final', 'done', 'end_turn'), duration('dur')]);
+      h.emit();
+      expect(h.replies()).toEqual([]);
+      expect(h.finals()).toEqual([['om_A', '收到，开始做。\n\ndone']]);
+    } finally {
+      unregister();
+      workerPool.setActiveSessionsRegistry(undefined);
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(configDir, { recursive: true, force: true });
+    }
   });
 
   it('leaves a session that is not adopted alone', () => {

@@ -42,10 +42,11 @@ describe('recommended answers stay drafts until submitted', () => {
     const standalone = JSON.parse(buildAskCard(ask));
     const nodes = (v: any): any[] => v && typeof v === 'object' ? [v, ...Object.values(v).flatMap(nodes)] : [];
     const buttons = nodes(standalone).filter((n: any) => n.tag === 'button');
-    expect(buttons.filter((b: any) => b.value.action === 'ask_submit')).toHaveLength(1);
-    expect(buttons.filter((b: any) => b.type === 'primary' && b.value.action === 'ask_toggle')).toHaveLength(3);
+    expect(buttons.filter((b: any) => b.behaviors[0].value.action === 'ask_choice_submit')).toHaveLength(1);
+    expect(nodes(standalone).filter((n: any) => n.tag === 'checker' && n.checked).map((n: any) => n.name))
+      .toEqual(['opt_0_0', 'opt_1_0', 'opt_1_1']);
     const inline = JSON.stringify(buildTurnReplyAskElements({ ask }));
-    expect(inline.match(/"action":"ask_submit"/g)).toHaveLength(1);
+    expect(inline.match(/"action":"ask_choice_submit"/g)).toHaveLength(1);
     expect(inline).not.toContain('ask_select');
     expect(submitAsk({ askId: ask.askId, nonce: ask.nonce, by: 'ou_user' })).toBe('accepted');
     expect(await result).toMatchObject({ answers: [['a'], ['a', 'b']], by: 'ou_user' });
@@ -55,9 +56,9 @@ describe('recommended answers stay drafts until submitted', () => {
   it('single question with defaults requires submit; toggling is not an answer', async () => {
     const result = registerAsk(input()); await flush();
     const ask = sent[0];
-    expect(buildAskCard(ask)).toContain('ask_submit');
+    expect(buildAskCard(ask)).toContain('"action":"ask_choice_submit"');
     expect(buildAskCard(ask)).not.toContain('ask_select');
-    expect(JSON.stringify(buildTurnReplyAskElements({ ask }))).toContain('ask_submit');
+    expect(JSON.stringify(buildTurnReplyAskElements({ ask }))).toContain('"action":"ask_choice_submit"');
     expect(toggleAsk({ askId: ask.askId, nonce: ask.nonce, questionIndex: 0, key: 'b', by: 'ou_user' })).toBe('toggled');
     expect(getAskSnapshot(ask.askId)).toMatchObject({ settled: false, selections: [['b']] });
     expect(submitAsk({ askId: ask.askId, nonce: ask.nonce, by: 'ou_wrong' })).toBe('unauthorized');

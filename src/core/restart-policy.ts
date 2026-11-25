@@ -51,12 +51,15 @@ export interface RestartCounter {
   permanentCount?: number;
   /** 上一次崩溃后 CLI 首次报告 ready 的时间；之后存活满一个窗口才算恢复健康。 */
   readyAt?: number;
+  /** Actual nonzero exits before startup readiness; never wall-clock timeouts. */
+  startupFailures?: number;
 }
 
 export interface RestartDecisionInput {
   prev: RestartCounter | undefined;
   now: number;
   code: number | null | undefined;
+  startupFailure?: boolean;
   windowMs?: number;
   defaultMax?: number;
   fatalMax?: number;
@@ -68,7 +71,7 @@ export interface RestartDecision {
   /** 这次是否还允许自动重启；false 表示应停止并进入诊断/人工处理。 */
   shouldRestart: boolean;
   /** 触发停止的原因，便于日志/卡片区分。 */
-  reason: 'ok' | 'window_budget' | 'permanent_exit';
+  reason: 'ok' | 'window_budget' | 'permanent_exit' | 'startup_failure';
 }
 
 export function decideAutoRestart(input: RestartDecisionInput): RestartDecision {
@@ -111,7 +114,16 @@ export function decideAutoRestart(input: RestartDecisionInput): RestartDecision 
     lastAt: input.now,
     lastCode: input.code ?? null,
     permanentCount,
+    startupFailures: (prev?.startupFailures ?? 0) + (input.startupFailure && input.code != null && input.code !== 0 ? 1 : 0),
   };
+
+  // One retry for a fresh CLI that never became usable. The existing backend
+  // jitter + 500ms respawn delay provides backoff. Count real exits across
+  // windows, so slow plugin initialization cannot grant an infinite budget;
+  // a still-running slow CLI is never failed by this policy.
+  if (next.startupFailures! >= 2) {
+    return { next, shouldRestart: false, reason: 'startup_failure' };
+  }
 
   // 永久通道用自己的累计值判闸：首次永久失败给一次重启，第二次（无论中间是否
   // 夹了普通崩溃）即停。不看 count，否则一笔陈年普通崩溃会吞掉这唯一的机会。

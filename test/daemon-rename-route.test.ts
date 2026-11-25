@@ -262,6 +262,7 @@ import { __testOnly_setScheduleAuthorityStore } from '../src/daemon.js';
 import type { PendingAsk } from '../src/core/ask-types.js';
 import { canOperate, evaluateAskAnswerTalk } from '../src/im/lark/event-dispatcher.js';
 import type { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+import { CODEX_ASYNC_RESTORE_ASK_ORIGIN } from '../src/services/codex-async-user-input.js';
 
 import { sessionIdentityPath } from '../src/core/cli-identity.js';
 import { _resetForTest as resetAsks, registerAsk } from '../src/core/ask-broker.js';
@@ -887,11 +888,14 @@ describe('/rename production routing — must not pre-create a session (review P
       setCardDispatcher({ send: async ask => { cards.push(ask); return { messageId: `om_async_card_${cards.length}` }; } });
       setIpcAuthSecret('async-review-fixture-secret');
       const server = await startIpcServer({ host: '127.0.0.1', port: 0, authRequired: true });
-      function post(itemId: string, originTurnId = 'om_async_origin', text = false, timeoutMs = 60_000) {
+      function post(itemId: string, originTurnId = 'om_async_origin', text = false, timeoutMs = 60_000,
+        origin: 'async' | 'standalone' = 'async') {
         return fetchDaemonIpc(server.port, '/api/asks', { method: 'POST',
           body: JSON.stringify({ sessionId: ds.session.sessionId, chatId: CHAT, larkAppId: APP,
-            rootMessageId: scope === 'thread' ? root : null, originKind: 'native-user-input-async',
-            requestId: itemId, asyncUserInput: { threadId: 'native-review-thread', itemId },
+            rootMessageId: scope === 'thread' ? root : null,
+            originKind: origin === 'standalone' ? 'native-user-input-standalone' : 'native-user-input-async',
+            requestId: itemId,
+            ...(origin === 'standalone' ? {} : { asyncUserInput: { threadId: 'native-review-thread', itemId } }),
             originTurnId, timeoutMs,
             questions: [{ prompt: 'Choose?', multiSelect: false, options: text ? [] : [{ key: 'o0', label: 'Only option' }],
               ...(text ? { inputMode: 'text' } : {}) }],
@@ -1087,6 +1091,47 @@ describe('/rename production routing — must not pre-create a session (review P
         expect(res.status).toBe(mode === 'expired' ? 200 : 409);
         expect(repliedText()).toMatch(/身份不可用|超时|未送达/);
         expect(h.send.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(0);
+      } finally { await h.close(); }
+    });
+
+    it('disambiguates standalone native cards from other pending asks before consuming text', async () => {
+      const h = await setup('thread');
+      let standaloneResponse: ReturnType<typeof h.post> | undefined;
+      try {
+        beginReplyTargetTurn(h.ds, h.root, 'om_async_origin', NOW, { senderOpenId: OWNER });
+        standaloneResponse = h.post('standalone_one', 'om_async_origin', true, 60_000, 'standalone');
+        await vi.waitFor(() => expect(h.cards).toHaveLength(1));
+        void registerAsk({ sessionId: h.ds.session.sessionId, larkAppId: APP, chatId: CHAT,
+          rootMessageId: h.root, originKind: 'hook', requestId: 'hook_two', timeoutMs: 60_000,
+          questions: [{ prompt: 'Hook choice?', multiSelect: false, options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }] }] });
+        await vi.waitFor(() => expect(h.cards).toHaveLength(2));
+        const ordinary = makeEventData('om_standalone_unquoted', 'ordinary input', h.root);
+        await handleThreadReply(ordinary, makeCtx(h.root, 'om_standalone_unquoted'));
+        expect(listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: h.root })).toHaveLength(2);
+        expect(repliedText()).toContain('多张待答卡片');
+
+        const quoted = makeEventData('om_standalone_quoted', 'answer standalone', h.root);
+        quoted.message.parent_id = h.cards[0]!.cardMessageId ?? 'om_async_card_1';
+        await handleThreadReply(quoted, makeCtx(h.root, 'om_standalone_quoted'));
+        expect((await standaloneResponse).status).toBe(200);
+        expect(listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: h.root })).toHaveLength(1);
+      } finally { await h.close(); }
+    });
+
+    it('disambiguates restored native text cards from other pending asks', async () => {
+      const h = await setup('thread');
+      try {
+        void registerAsk({ sessionId: h.ds.session.sessionId, larkAppId: APP, chatId: CHAT,
+          rootMessageId: h.root, originKind: CODEX_ASYNC_RESTORE_ASK_ORIGIN, requestId: 'restore_one', timeoutMs: 60_000,
+          questions: [{ prompt: 'Restored text?', inputMode: 'text', multiSelect: false, options: [] }] });
+        void registerAsk({ sessionId: h.ds.session.sessionId, larkAppId: APP, chatId: CHAT,
+          rootMessageId: h.root, originKind: 'hook', requestId: 'hook_two', timeoutMs: 60_000,
+          questions: [{ prompt: 'Hook choice?', multiSelect: false, options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }] }] });
+        await vi.waitFor(() => expect(h.cards).toHaveLength(2));
+        const ordinary = makeEventData('om_restore_unquoted', 'ordinary input', h.root);
+        await handleThreadReply(ordinary, makeCtx(h.root, 'om_restore_unquoted'));
+        expect(listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: h.root })).toHaveLength(2);
+        expect(repliedText()).toContain('多张待答卡片');
       } finally { await h.close(); }
     });
 
@@ -3067,6 +3112,43 @@ describe('/rename production routing — must not pre-create a session (review P
       content: expect.stringContaining('FOLLOWER_AFTER_RAW_N_PLUS_1'),
       queuedActivationToken: expect.any(String),
     }));
+  });
+
+  it('wakes a startup-circuited raw activation on new input without releasing its ACK gate', async () => {
+    const anchor = 'om_raw_circuit_recovery';
+    const raw = '/goal OPENING_RAW_N';
+    const token = 'raw-circuit-token';
+    const send = vi.fn();
+    mocks.forkWorker.mockImplementationOnce((owner: any) => {
+      Object.assign(owner.session, { queued: false, queuedActivationPending: true,
+        queuedActivationToken: token, queuedActivationInput: { content: '' },
+        queuedActivationTurnId: anchor, queuedActivationResume: false });
+      owner.worker = { killed: false, send };
+    });
+    await handleNewTopic(makeEventData(anchor, raw), makeCtx(anchor, anchor));
+    const owner = activeSessions.get(sessionKey(anchor, APP))!;
+    expect(owner.pendingRawInput).toBe(raw);
+    expect(owner.initialStartPending).toBe(true);
+    // Production stop state: the worker survives, but cannot produce another
+    // prompt_ready until a coordinated restart actually reaches it.
+    owner.crashDiagnosticParked = true;
+    owner.cliStartupFailureReason = 'startup failed';
+    owner.workerReady = false;
+    await handleThreadReply(makeEventData('om_raw_recovery_1', 'RECOVER_ONE', anchor), makeCtx(anchor, 'om_raw_recovery_1'));
+    expect(send.mock.calls.map(c => c[0]).filter(m => m.type === 'restart')).toHaveLength(1);
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'message' }));
+    expect(owner.pendingRawInput).toBe(raw);
+    expect(owner.session.queuedActivationToken).toBe(token);
+    expect(owner.session.queuedActivationPending).toBe(true);
+    await handleThreadReply(makeEventData('om_raw_recovery_2', 'RECOVER_TWO', anchor), makeCtx(anchor, 'om_raw_recovery_2'));
+    expect(send.mock.calls.map(c => c[0]).filter(m => m.type === 'restart')).toHaveLength(1);
+    expect(owner.session.queuedActivationTail?.map(t => t.turnId)).toEqual(['om_raw_recovery_1', 'om_raw_recovery_2']);
+    // Only the real submission ACK may let N+1 cross the adapter boundary.
+    Object.assign(owner.session, { queuedActivationPending: undefined, queuedActivationToken: undefined,
+      queuedActivationInput: undefined, queuedActivationTurnId: undefined, queuedActivationResume: undefined,
+      pendingRepoSetup: undefined });
+    await expect(onQueuedActivationSubmitted(owner, token)).resolves.toBe(true);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', turnId: 'om_raw_recovery_1' }));
   });
 
   it('refuses an existing raw CLI passthrough while activation admission owns the route', async () => {

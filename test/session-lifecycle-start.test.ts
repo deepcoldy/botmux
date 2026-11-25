@@ -345,6 +345,7 @@ import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-ap
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
+import { cliSelectionSnapshot } from '../src/core/cli-selection-snapshot.js';
 
 // 上面那些钩子和配置都按 homedir() 落盘：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
 if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
@@ -12841,5 +12842,54 @@ describe('a suspend queued while a re-forked worker takes its opening input', ()
     expect(next.send.mock.calls.filter(([message]: [any]) => message?.type === 'message' && message.turnId === 'om_more')).toHaveLength(2);
     expect(ds.worker).toBe(next);
     expect(ds.pendingSuspendReason).toBe('manual_suspend');
+  });
+});
+
+describe('quota fallback chain step launch', () => {
+  const relayBot = () => defaultBot({
+    cliId: 'claude-code',
+    wrapperCli: undefined,
+    model: 'claude-opus-5-5',
+    env: { ANTHROPIC_BASE_URL: 'https://relay.example' },
+  });
+
+  function stepDs(onChain: boolean): DaemonSession {
+    const ds = makeDs();
+    ds.session.cliId = 'claude-code';
+    ds.session.agentFrozen = true;
+    ds.session.cliLaunchSnapshot = { ...cliSelectionSnapshot('traex'), model: 'GPT-6.1-Sol' };
+    if (onChain) ds.session.quotaFallback = { step: 1, cliId: 'traex', model: 'GPT-6.1-Sol' };
+    return ds;
+  }
+
+  async function initMessage(): Promise<any> {
+    for (let i = 0; i < 10; i++) await new Promise(resolve => setTimeout(resolve, 0));
+    const worker = forkMock.mock.results.at(-1)?.value;
+    return worker && vi.mocked(worker.send).mock.calls.map((call: any[]) => call[0]).find((m: any) => m?.type === 'init');
+  }
+
+  it('launches the step CLI and model as a fresh conversation without the bot env', async () => {
+    vi.mocked(getBot).mockImplementation(relayBot);
+    const ds = stepDs(true);
+
+    expect(forkWorker(ds, { content: 'handoff' }, { resume: false, turnId: 'bmx-quota-fallback-1' })).toBe(true);
+    const init = await initMessage();
+
+    expect(init).toMatchObject({ cliId: 'traex', model: 'GPT-6.1-Sol', resume: false, turnId: 'bmx-quota-fallback-1' });
+    expect(JSON.stringify(init.env ?? {})).not.toContain('relay.example');
+    expect(ds.session.cliId).toBe('traex');
+    expect(ds.session.cliLaunchSnapshot?.state).toBe('resolved');
+  });
+
+  it('keeps refusing a /cli selection on a bot with env', async () => {
+    vi.mocked(getBot).mockImplementation(relayBot);
+    const ds = stepDs(false);
+
+    let refused: unknown;
+    try { forkWorker(ds, { content: 'x' }, { resume: false, turnId: 'om_cli' }); } catch (error) { refused = error; }
+    const init = await initMessage();
+
+    expect(String(refused ?? '')).toMatch(/bot env/);
+    expect(init).toBeUndefined();
   });
 });

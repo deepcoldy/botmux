@@ -29,6 +29,7 @@ import * as groupsStore from '../src/services/groups-store.js';
 import * as runAsModule from '../src/core/run-as.js';
 import { invalidateGlobalConfigCache, setGroupOwnerNoticeEnabled } from '../src/global-config.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
+import * as followUpReplyChange from '../src/services/follow-up-reply-change.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import { resolveScheduleModelOverride } from '../src/core/schedule-model-override.js';
 import {
@@ -369,6 +370,51 @@ describe('dashboard IPC server', () => {
         cycle: [source, target, source],
       });
       expect(readFileSync(configPath, 'utf8')).toBe(before);
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists a quota fallback chain, hot-applies it and rejects an invalid chain', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-quota-chain-'));
+    const configPath = join(dir, 'bots.json');
+    const source = 'cli_quotachain';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([
+        { larkAppId: source, larkAppSecret: 'source-secret', cliId: 'claude-code', model: 'claude-opus-5-5' },
+      ], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(source);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const put = (body: unknown) => fetch(`${base}/api/bot-quota-fallback-chain`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const chain = { enabled: true, kinds: ['usage', 'rate'], steps: [{ cliId: 'traex', model: 'GPT-6.1-Sol' }, { cliId: 'traex', model: 'DeepSeek-V4.1-Flash' }] };
+      const saved = await put(chain);
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toEqual({ ok: true, quotaFallbackChain: chain });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].quotaFallbackChain).toEqual(chain);
+      expect(getBot(source).config.quotaFallbackChain).toEqual(chain);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).quotaFallbackChain).toEqual(chain);
+
+      const before = readFileSync(configPath, 'utf8');
+      const rejected = await put({ enabled: true, steps: [{ cliId: 'traex' }, { cliId: 'claude-code' }] });
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ ok: false, error: 'invalid_quota_fallback_chain' });
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+
+      const disabled = await put({ enabled: false });
+      expect(await disabled.json()).toEqual({ ok: true, quotaFallbackChain: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).not.toHaveProperty('quotaFallbackChain');
+      expect(getBot(source).config.quotaFallbackChain).toBeUndefined();
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -2588,6 +2634,56 @@ describe('PUT /api/bot-card-prefs — mid-turn replies (followUpReply)', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('pushes each change to this bot\'s running workers, which gate their replies on it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-follow-up-push-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-follow-up-push-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const worker = () => {
+      const sent: unknown[] = [];
+      return { sent, killed: false, send: (msg: unknown) => { sent.push(msg); return true; } };
+    };
+    const own = worker();
+    const ownKilled = { ...worker(), killed: true };
+    const otherBot = worker();
+    const unregisterFollowUpReply = followUpReplyChange.registerFollowUpReplyChangeHandler((app, enabled) => {
+      followUpReplyChange.broadcastFollowUpReplyToWorkers(workerPool.getActiveSessionsRegistry()?.values() ?? [], app, enabled);
+    });
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      workerPool.setActiveSessionsRegistry(new Map<string, any>([
+        ['s-own', { larkAppId: appId, worker: own }],
+        ['s-own-killed', { larkAppId: appId, worker: ownKilled }],
+        ['s-other', { larkAppId: 'some-other-app', worker: otherBot }],
+      ]));
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const put = (body: unknown) => fetch(`http://127.0.0.1:${handle!.port}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+
+      expect((await put({ followUpReply: true })).status).toBe(200);
+      expect((await put({ followUpReply: false })).status).toBe(200);
+      expect((await put({ goalStatusCard: true })).status).toBe(200);
+      expect(own.sent).toEqual([
+        { type: 'set_follow_up_reply', enabled: true },
+        { type: 'set_follow_up_reply', enabled: false },
+      ]);
+      expect(ownKilled.sent).toEqual([]);
+      expect(otherBot.sent).toEqual([]);
+    } finally {
+      unregisterFollowUpReply();
+      workerPool.setActiveSessionsRegistry(undefined);
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('PUT /api/bot-card-prefs — goal status card', () => {
@@ -4299,6 +4395,36 @@ describe('PUT /api/bot-card-prefs — reply-card usage display mode', () => {
       expect(off.status).toBe(200);
       expect(await off.json()).toMatchObject({ ok: true, usageDisplay: 'off' });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBe('off');
+
+      // showUsageQuota defaults to true, persists explicit false, drops key on true, rejects non-boolean.
+      expect(initial.showUsageQuota).toBe(true);
+      const quotaOff = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ showUsageQuota: false }),
+      });
+      expect(quotaOff.status).toBe(200);
+      expect(await quotaOff.json()).toMatchObject({ ok: true, showUsageQuota: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].showUsageQuota).toBe(false);
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ showUsageQuota: false });
+
+      const quotaBad = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ showUsageQuota: 'off' }),
+      });
+      expect(quotaBad.status).toBe(400);
+      expect(await quotaBad.json()).toMatchObject({ ok: false, error: 'invalid_show_usage_quota' });
+
+      const quotaOn = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ showUsageQuota: true }),
+      });
+      expect(quotaOn.status).toBe(200);
+      expect(await quotaOn.json()).toMatchObject({ ok: true, showUsageQuota: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].showUsageQuota).toBeUndefined();
     } finally {
       if (handle) await handle.close();
       handle = null;

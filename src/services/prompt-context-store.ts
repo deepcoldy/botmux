@@ -115,64 +115,84 @@ export function rekeyPromptContext(sessionId: string, turnId: string, previousPt
   }
 }
 
-/**
- * 宿主侧（daemon）claim/pop：按权威 turnId + fingerprint 精确取该轮的 envelope，
- * **先删文件再返回内容**（原子消费）。沙箱内 hook 经 IPC 调这里，不在沙箱里 unlink。
- *
- * 匹配策略：
- * 1. 精确：`<fingerprint>.<turnId>.json` 直接定位。
- * 2. 前缀兜底（paste 污染）：全量 hash 失配时，扫描本 session 的 sidecar，按
- *    `turnId 相等 + prefix 相等` 过滤。每轮至多一条 sidecar，0 或 1 条，无碰撞。
- *
- * 未命中/损坏/不可读 → undefined。任何异常都不抛（fail-open）。
- */
+/** 单轮领取保留给普通调用方；多轮 type-ahead 必须使用候选集 API。 */
 export function claimPromptContext(
   sessionId: string,
   turnId: string,
   fingerprint: string,
   prefix?: string,
 ): string | undefined {
+  return claimPromptContextAmongTurns(sessionId, [turnId], fingerprint, prefix)?.envelope;
+}
+
+export interface ClaimedPromptContext {
+  turnId: string;
+  envelope: string;
+}
+
+/**
+ * 在「当前轮 + 全部排队轮」候选集里原子领取唯一匹配：
+ * 1. 全部 turnId 的精确 `<fingerprint>.<turnId>.json` 合计只能命中一条。
+ * 2. 精确为 0 时才做前缀兜底，全部候选文件合计也只能命中一条。
+ * 3. 任何歧义都 fail-open，且不消费任何 sidecar。扫描阶段绝不 pop，避免
+ *    前序漏 claim 的旧轮被后续同正文 hook 错领（HIGH-1）。
+ *
+ * 匹配成功仍由 popSidecar 先 unlink 再返回；未命中/损坏/不可读均不抛错。
+ */
+export function claimPromptContextAmongTurns(
+  sessionId: string,
+  turnIds: readonly string[],
+  fingerprint: string,
+  prefix?: string,
+): ClaimedPromptContext | undefined {
   try {
+    const candidates = [...new Set(turnIds.filter(turnId => typeof turnId === 'string' && turnId.length > 0))];
+    if (candidates.length === 0) return undefined;
     const dir = sessionDir(sessionId);
     if (!existsSync(dir)) return undefined;
 
-    // 1. 精确匹配 (fingerprint, turnId)。文件名用全量 hash 不碰撞，但仍回校验
-    //    payload 的 raw turnId + fingerprint（defense-in-depth：防文件名碰撞/伪造）。
-    const exactFile = join(dir, `${fingerprint}.${turnIdKey(turnId)}.json`);
-    if (existsSync(exactFile)) {
+    const exactMatches: Array<{ full: string; turnId: string; envelope: string }> = [];
+    for (const turnId of candidates) {
+      const full = join(dir, `${fingerprint}.${turnIdKey(turnId)}.json`);
+      if (!existsSync(full)) continue;
       try {
-        const parsed = JSON.parse(readFileSync(exactFile, 'utf8'));
+        const parsed = JSON.parse(readFileSync(full, 'utf8'));
         if (typeof parsed?.envelope === 'string'
           && parsed.turnId === turnId
           && parsed.fingerprint === fingerprint) {
-          return popSidecar(exactFile, parsed.envelope);
+          exactMatches.push({ full, turnId, envelope: parsed.envelope });
         }
-      } catch { /* 损坏/不符 → 落到前缀兜底或 miss */ }
+      } catch { /* 损坏/不符 → 与旧实现一样落到前缀兜底或 miss */ }
     }
-
-    // 2. 前缀兜底（paste 污染：尾部软换行变字面量，全量指纹失配）
-    //    按 turnId 定域：每轮至多一条，不存在多条碰撞。
-    if (prefix) {
-      const matches = readdirSync(dir)
-        .filter((f) => f.endsWith('.json'))
-        .map((f) => {
-          const full = join(dir, f);
-          try {
-            const parsed = JSON.parse(readFileSync(full, 'utf8'));
-            return typeof parsed?.envelope === 'string'
-              && typeof parsed?.turnId === 'string'
-              && parsed.turnId === turnId
-              && typeof parsed?.prefix === 'string'
-              && parsed.prefix === prefix
-              ? { full, envelope: parsed.envelope as string }
-              : undefined;
-          } catch { return undefined; }
-        })
-        .filter((m): m is { full: string; envelope: string } => !!m);
-      if (matches.length === 1) return popSidecar(matches[0].full, matches[0].envelope);
+    if (exactMatches.length > 1) return undefined;
+    if (exactMatches.length === 1) {
+      const match = exactMatches[0]!;
+      const envelope = popSidecar(match.full, match.envelope);
+      return envelope === undefined ? undefined : { turnId: match.turnId, envelope };
     }
+    if (!prefix) return undefined;
 
-    return undefined;
+    const candidateSet = new Set(candidates);
+    const matches = readdirSync(dir)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => {
+        const full = join(dir, f);
+        try {
+          const parsed = JSON.parse(readFileSync(full, 'utf8'));
+          return typeof parsed?.envelope === 'string'
+            && typeof parsed?.turnId === 'string'
+            && candidateSet.has(parsed.turnId)
+            && typeof parsed?.prefix === 'string'
+            && parsed.prefix === prefix
+            ? { full, turnId: parsed.turnId, envelope: parsed.envelope as string }
+            : undefined;
+        } catch { return undefined; }
+      })
+      .filter((m): m is { full: string; turnId: string; envelope: string } => !!m);
+    if (matches.length !== 1) return undefined;
+    const match = matches[0]!;
+    const envelope = popSidecar(match.full, match.envelope);
+    return envelope === undefined ? undefined : { turnId: match.turnId, envelope };
   } catch {
     return undefined;
   }
@@ -220,6 +240,19 @@ function pruneSidecars(dir: string, currentFile: string): void {
       } else {
         kept++;
       }
+    }
+  } catch { /* best-effort */ }
+}
+
+/** 删除一个已失效 queued turn 的全部 sidecar；不影响其它轮次。 */
+export function removePromptContextForTurn(sessionId: string, turnId: string): void {
+  try {
+    const dir = sessionDir(sessionId);
+    if (!existsSync(dir)) return;
+    const suffix = `.${turnIdKey(turnId)}.json`;
+    for (const file of readdirSync(dir)) {
+      if (!file.endsWith(suffix)) continue;
+      try { unlinkSync(join(dir, file)); } catch { /* best-effort */ }
     }
   } catch { /* best-effort */ }
 }

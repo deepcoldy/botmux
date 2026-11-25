@@ -30,6 +30,7 @@ import type {
 } from './ask-types.js';
 import { AskDispatchError } from './ask-types.js';
 import { supportsAskCustomInput, parseAskCustomFields } from './ask-custom-input.js';
+import { askChoiceProblem, splitAskTexts } from './ask-choice.js';
 import { isHookPermissionAsk } from './ask-hook/types.js';
 
 /** Origins for which restart-resume + durable handoff are enabled. Only a
@@ -851,6 +852,70 @@ export function applyAskForm(args: {
   // One durable projection holds both the option state and text drafts.
   saveDraft();
   return 'toggled';
+}
+
+/**
+ * One-shot submit of a checker form: every tick and every `custom_<i>` text arrives together,
+ * so the server draft never decides the answer. Order: decision gate (nonce, settled,
+ * authorization) → shape (unknown option = stale) → text fields → per-question rules
+ * (`invalid_choice`, nothing changes) → draft version for custom-input asks → empty-submit
+ * confirmation → settle. A question's text with nothing ticked is its own answer
+ * (`customAnswers[i]`, as on the v1 form); text next to ticked options is a note on them
+ * (`notes[i]`, options kept in `answers[i]`).
+ *
+ * On `needs_empty_confirm` the submitted (empty) ticks become the draft first, so the armed
+ * re-render does not tick pre-selected defaults again and confirm them by accident.
+ */
+export function submitAskChoices(args: {
+  askId: string; nonce: string; by: string;
+  /** Ticked option keys per question, aligned with the questions. */
+  selections: ReadonlyArray<ReadonlyArray<string>>;
+  /** `custom_<i>` text fields from the same form. */
+  fields: Record<string, unknown>;
+  /** Draft version the card was rendered at (custom-input asks only). */
+  revision?: number;
+  confirmEmpty?: boolean;
+  canRenderDraft?: (draft: PendingAsk) => boolean;
+}): AskClickOutcome {
+  gcSettled();
+  const ask = pending.get(args.askId);
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  if (gate !== 'ready') return gate;
+  if (!ask || hasAskForm(ask.questions) || args.selections.length !== ask.questions.length) return 'stale';
+  for (const [i, q] of ask.questions.entries()) {
+    const keys = args.selections[i]!;
+    if (new Set(keys).size !== keys.length || keys.some(key => !q.options.some(o => o.key === key))) return 'stale';
+  }
+  const customInput = supportsAskCustomInput(ask);
+  // The client form is the whole draft: an empty field means no text, whatever was stored.
+  const custom = customInput ? parseAskCustomFields(args.fields, ask.questions)
+    : Object.keys(args.fields).length ? null : ask.questions.map(() => null);
+  if (!custom) return 'invalid_custom';
+  if (askChoiceProblem(ask.questions, args.selections, custom)) return 'invalid_choice';
+  if (customInput && (!Number.isSafeInteger(args.revision) || args.revision !== (ask.customRevision ?? 0))) return 'draft_conflict';
+  const selections = args.selections.map(keys => [...keys]);
+  const revision = customInput ? (ask.customRevision ?? 0) + 1 : undefined;
+  const candidate = { ...snapshot(ask), selections, ...(customInput ? { customAnswers: custom, customRevision: revision } : {}) };
+  if (args.canRenderDraft && !args.canRenderDraft(candidate)) return 'invalid_custom';
+  if (!args.confirmEmpty && selections.every(keys => !keys.length) && custom.every(text => !text)) {
+    const nextSelections = new Map(selections.map((keys, i) => [i, new Set(keys)]));
+    if (customInput) {
+      persistFromInternal({ ...ask, selections: nextSelections, customAnswers: custom, customRevision: revision }, true);
+      ask.customAnswers = custom;
+      ask.customRevision = revision;
+    } else {
+      persistFromInternal({ ...ask, selections: nextSelections });
+    }
+    ask.selections = nextSelections;
+    return 'needs_empty_confirm';
+  }
+  settle(args.askId, {
+    kind: 'answered',
+    answers: selections,
+    ...splitAskTexts(selections, custom),
+    by: args.by, comment: null, timedOut: false,
+  });
+  return 'accepted';
 }
 
 /**

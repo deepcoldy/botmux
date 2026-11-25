@@ -1,4 +1,5 @@
 import { loopbackFetchImpl } from '../core/loopback-fetch.js';
+import { isBytedcliOverseasRegion, type BytedcliOverseasRegion } from '../platform/bytedcli-grant-regions.js';
 import { GRANT_ROUTE_CLIENT_TIMEOUT_MS } from '../platform/credential-grant-budget.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from '../utils/daemon-discovery.js';
 import { IDENTITY_ROUTE_TOOLS } from '../services/trigger-user-auth.js';
@@ -183,11 +184,13 @@ export async function resolveCurrentExecutionIdentity(options: {
   tool: string;
   /** `BOTMUX_AS`: the speaker of the current turn this call runs as. */
   as?: string;
+  region?: BytedcliOverseasRegion;
   fetchImpl?: typeof fetch;
 }): Promise<CurrentExecutionIdentityDocument> {
   if (!Number.isSafeInteger(options.ipcPort) || options.ipcPort <= 0 || options.ipcPort > 65535
     || !identifier(options.sessionId) || !identifier(options.larkAppId)
-    || !identityTool(options.tool)) {
+    || !identityTool(options.tool)
+    || (options.region !== undefined && (options.tool !== 'bytedcli' || !isBytedcliOverseasRegion(options.region)))) {
     throw new CurrentExecutionIdentityError('current_execution_route_unavailable', 'invalid_invocation');
   }
   let response: Response;
@@ -202,7 +205,11 @@ export async function resolveCurrentExecutionIdentity(options: {
     response = await (options.fetchImpl ?? loopbackFetchImpl)(
       `http://127.0.0.1:${ipcPort}${CURRENT_EXECUTION_IDENTITY_ROUTE}`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId: options.sessionId, tool: options.tool, ...(options.as ? { as: options.as } : {}) }),
+        body: JSON.stringify({
+          sessionId: options.sessionId, tool: options.tool,
+          ...(options.as ? { as: options.as } : {}),
+          ...(options.region ? { region: options.region } : {}),
+        }),
         redirect: 'error', signal: AbortSignal.timeout(GRANT_ROUTE_CLIENT_TIMEOUT_MS),
       },
     );
