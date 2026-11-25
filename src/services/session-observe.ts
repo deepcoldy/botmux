@@ -136,6 +136,13 @@ export interface ObserveSession {
   turn: ObserveTurn;
   phase: ObservePhase;
   queued: ObserveQueued;
+  /** True only while an active/dormant session holds an unsettled durable
+   *  queued-activation journal awaiting adapter submission ACK. Omitted when
+   *  inactive, closed, or probe failed. */
+  queuedActivationPending?: boolean;
+  /** Count of same-anchor turns currently buffered behind the queued-activation
+   *  gate. Omitted when 0, closed, or probe failed. */
+  queuedActivationTailCount?: number;
   pendingRepo?: boolean;
   tuiPromptActive?: boolean;
   attention?: { kind: string; reason: string; at: number };
@@ -344,6 +351,14 @@ export function normalizeSessionRow(
     closed,
   };
 
+  if (hasRuntimeFacts && closed !== true) {
+    if (row.queuedActivationPending === true) observe.queuedActivationPending = true;
+    if (typeof row.queuedActivationTailCount === 'number'
+      && Number.isInteger(row.queuedActivationTailCount)
+      && row.queuedActivationTailCount > 0) {
+      observe.queuedActivationTailCount = row.queuedActivationTailCount;
+    }
+  }
   if (hasRuntimeFacts && typeof row.pendingRepo === 'boolean') observe.pendingRepo = row.pendingRepo;
   if (hasRuntimeFacts && typeof row.tuiPromptActive === 'boolean') observe.tuiPromptActive = row.tuiPromptActive;
   if (hasRuntimeFacts && row.agentAttention && typeof row.agentAttention === 'object') {
@@ -413,6 +428,8 @@ export interface RawSessionRow {
   adoptCliPid?: unknown;
   adopt?: unknown;
   queued?: unknown;
+  queuedActivationPending?: unknown;
+  queuedActivationTailCount?: unknown;
   pendingRepo?: unknown;
   tuiPromptActive?: unknown;
   agentAttention?: unknown;

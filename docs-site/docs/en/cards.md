@@ -92,22 +92,24 @@ To open a new worktree from a repo, use the "🌿 Open a repo as a new worktree"
 
 ### AI question cards
 
-When the agent asks with `botmux ask`, or Claude Code / Codex asks a question on its own, a question card appears in the chat. Its "Can answer" field tells you who can answer.
+When the agent asks with `botmux ask`, or Claude Code / Codex asks a question on its own, a question card appears in the chat, titled "N questions need your answer". Each question has its own grey block with a small label for its kind ("Single choice · pick one" / "Multiple choice · pick any"), one row with a checkbox per option, and each option's description in grey under its label. The last small line shows the deadline and who can answer.
 
 | What you see | What to do |
 |--------------|------------|
-| Single / multiple choice | Press an option; for multi-select pick as many as you like, then press "Submit". Submitting with nothing selected needs a second "Confirm empty submit" |
-| Several questions on one card | Each is labeled "Question 1", "Question 2", ...; answer them all, then "Submit" once |
+| Single / multiple choice | Tick options (ticking stays in your client until you submit), then press "Submit" at the bottom once for the whole card. A single-choice question takes one tick; submitting a multi-choice card with nothing ticked needs a second "Confirm empty submit" |
+| A pop-up after "Submit" | Your ticks and text are still on the card: fix the question it names (more than one tick on a single choice, or a required question left empty), then press "Submit" again |
+| "Single choice · tap to submit" | With one single-choice question, no own-answer box and no preselection, tapping a row submits that option right away; there is no "Submit" button |
+| Green "Recommended" tag | The asker's recommended option (a trailing "(Recommended)" / 「（推荐）」 in its label becomes this tag); it is only a hint |
+| Options already ticked | These are the asker's defaults, only a draft. Nothing counts as an answer until you press "Submit", and you can change them |
+| "Add a note, or write your own answer if none fits" | Most questions have this box under their options (unless the asker turned it off, or the card has text / number fields). With options ticked, what you write is a note on that question and goes to the asker with them; with nothing ticked, it is that question's answer. Up to 1000 characters per question, 2000 per card |
 | Text / number fields | Fill them in; required fields can't be blank, and numbers must stay within any given range |
-| Options already selected | These are the asker's recommended defaults, only a draft. Nothing counts as an answer until you press "Submit", and you can change them |
-| "Other / custom answer" | Most questions have their own input box (unless the asker turned it off, or the card has text / number fields). Write your own answer when no option fits; it replaces only that question. Up to 1000 characters per question, 2000 per card |
-| "Can answer" @-mentions one person | The asker named an answerer with `--answerer`, and only that person can submit (questions routed in from another app show "designated member only" instead). It only limits who can answer; it is not a business approval |
+| The small line @-mentions one person | The asker named an answerer with `--answerer`, and only that person can submit (questions routed in from another app show "only the designated member may answer" instead). It only limits who can answer; it is not a business approval |
 
-Without a designated answerer, anyone in the chat who can talk to the bot can answer. If no option fits, you can also just reply in the topic with text. See [CLI commands](/en/cli-commands) for the flags.
+After you submit, the card turns green ("Submitted") and lists what you chose or wrote under each question with ✓ (a note on its own "Note: …" line) and who submitted it; a timed-out or invalidated card turns grey and still shows the questions. Without a designated answerer, anyone in the chat who can talk to the bot can answer. If no option fits, you can also just reply in the topic with text. When an ask has so many questions and options that checkboxes no longer fit on one card, the card only lists them; reply with your answer in the chat. See [CLI commands](/en/cli-commands) for the flags.
 
 ### Terminal permission card (Claude Code)
 
-Some Claude Code actions pop a confirmation dialog in the terminal, for example a risky `rm` caught by a built-in safety check, which appears even when permission prompts are skipped. Lark can't see that dialog, so the session would hang. Botmux turns it into a question card showing the tool name and the command or file path, with buttons labeled 「允许执行」 (allow) and 「拒绝」 (deny). The card text and buttons are currently Chinese only.
+Some Claude Code actions pop a confirmation dialog in the terminal, for example a risky `rm` caught by a built-in safety check, which appears even when permission prompts are skipped. Lark can't see that dialog, so the session would hang. Botmux turns it into a question card showing the tool name and the command or file path, with two options, 「允许执行」 (allow) and 「拒绝」 (deny); tapping a row submits it. The option labels are currently Chinese only.
 
 - Allow lets Claude run it; deny tells Claude no, and it continues another way.
 - It **waits 10 minutes by default**. If no one presses anything, it counts as denied and Claude is told it timed out.
@@ -149,9 +151,9 @@ Want only one card? Choose dynamic single card and turn off "**Show a separate s
 
 ### Questions (Ask) live in the card too
 
-`botmux ask` in the same turn, and Claude Code / Codex questions, open right inside the reply card with a "Waiting for your response" title. Once answered, timed out or expired, they fold into the process; multiple questions show one after another without overwriting each other. Multi-select, text answers and answering from the Dashboard all work as usual.
+`botmux ask` in the same turn, and Claude Code / Codex questions, open right inside the reply card with a "Waiting for your response" title when one click answers them (a single single-choice question with no default pick and no box for your own answer, such as a permission confirmation) or when they are answered by a chat reply. Once answered, timed out or expired, they fold into the process; multiple questions show one after another without overwriting each other.
 
-Large forms with more than 16 options or question content over 3000 bytes are still sent as separate cards. Approval / authorization cards are also sent separately.
+Questions you tick or fill in and then Submit (multi-select, default picks, a note or your own answer, several questions at once, input forms) are sent as separate cards: the reply card is redrawn as the turn runs, and inside it your unsubmitted ticks and notes would be wiped. Large forms with more than 16 options or question content over 3000 bytes are also sent as separate cards. Approval / authorization cards are also sent separately.
 
 ### Working with `botmux send`
 

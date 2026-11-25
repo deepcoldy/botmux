@@ -1,7 +1,9 @@
 /** Execute a production closure with explicit host dependencies, matching the
  * worker-function harness while the pool still has no importable host seam. */
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import ts from 'typescript';
 import { controllerForSession } from '../../src/core/session-controller.js';
 import { activeSessionKey } from '../../src/core/types.js';
@@ -13,6 +15,18 @@ import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoni
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
 import { cotMessageFinishStatus } from '../../src/im/lark/cot-message.js';
 import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
+import { ProtectedResultStore } from '../../src/services/protected-result-store.js';
+
+/** deliverFinalOutput's protected final gate reads `config.session.dataDir` and
+ * constructs ProtectedResultStore. Sliced closures do not load module imports,
+ * so give the harness a real empty data dir: with no protection index every
+ * protected lookup resolves to undefined, leaving existing fixtures unchanged.
+ * Created lazily — module import can run before the fenced tmp dir exists. */
+let harnessDataDir: string | undefined;
+function getHarnessDataDir(): string {
+  if (!harnessDataDir) harnessDataDir = mkdtempSync(join(tmpdir(), 'worker-pool-harness-protected-'));
+  return harnessDataDir;
+}
 import {
   cancelAntigravityRotationReplay,
   clearInFlightAntigravityRotation,
@@ -28,8 +42,24 @@ import {
 /** Untracked handler fixtures still have the daemon's empty delivery registry.
  * Resolve settlement through production functions so fixtures exercise its
  * identity checks rather than substituting a no-op completion callback. */
+
+/** Module-level weak-state containers owned by worker-pool.ts. Source-sliced
+ * closures cannot see the module scope, so each fixture scope gets fresh
+ * instances (mirroring the `workerCommittedTurnIds` seeding below). */
+const WORKER_POOL_WEAK_CONTAINERS: Record<string, () => WeakMap<object, any> | WeakSet<object>> = {
+  workersWithLiveWorkingStatus: () => new WeakMap(),
+  visibleStreamingCardStatus: () => new WeakMap(),
+  pendingStreamingCardPatchVisibleStatus: () => new WeakMap(),
+  inFlightStreamingCardPatchVisibleStatus: () => new WeakMap(),
+  completedTerminalTurns: () => new WeakMap(),
+  postTerminalDirectSubmitSessions: () => new WeakSet(),
+};
+
 function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
   if (key in scope) return scope[key as string];
+  if (typeof key === 'string' && key in WORKER_POOL_WEAK_CONTAINERS) {
+    return scope[key] ??= WORKER_POOL_WEAK_CONTAINERS[key]();
+  }
   if (key === 'randomUUID') return randomUUID;
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
@@ -51,13 +81,15 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'noteExplicitEffortPreferenceEdit') return noteExplicitEffortPreferenceEdit;
   if (key === 'assertSessionLaunchModelChoiceAllowed') return assertSessionLaunchModelChoiceAllowed;
   if (key === 'cliModelMayKeepReasoningEffort') return cliModelMayKeepReasoningEffort;
-  if (key === 'config') return { terminalEffortWriteback: false };
+  if (key === 'config') return { terminalEffortWriteback: false, session: { dataDir: getHarnessDataDir() } };
+  if (key === 'ProtectedResultStore') return ProtectedResultStore;
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
   if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
     'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
-    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage'].includes(key)) {
+    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage',
+    'clearWorkerRuntimeProvenance'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];

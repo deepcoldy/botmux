@@ -35,12 +35,15 @@ export interface TrustedResultDelivery {
   markdown?: string;
   files?: TrustedResultDeliveryFile[];
   responseKind?: 'final' | 'auxiliary';
+  /** Opt-in opaque result delivery. The host protects subsequent IM reads. */
+  readPolicy?: 'receipt-only';
 }
 
 export interface TrustedResultDeliveryReceipt {
   delivered: true;
   deliveryId: string;
   fileCount: number;
+  messageIds?: string[];
 }
 
 /** Resolve host-delivery Markdown before the callback that creates a durable
@@ -209,6 +212,9 @@ export function parseTrustedResultDelivery(
     throw new Error('invalid_host_delivery_markdown');
   }
   const responseKind = value.responseKind;
+  if (value.readPolicy !== undefined && value.readPolicy !== 'receipt-only') {
+    throw new Error('invalid_host_delivery_read_policy');
+  }
   if (responseKind !== undefined && responseKind !== 'final' && responseKind !== 'auxiliary') {
     throw new Error('invalid_host_delivery_response_kind');
   }
@@ -265,6 +271,7 @@ export function parseTrustedResultDelivery(
         }),
       } : {}),
       ...(responseKind ? { responseKind } : {}),
+      ...(value.readPolicy === 'receipt-only' ? { readPolicy: 'receipt-only' as const } : {}),
     };
   } finally {
     for (const file of opened) {

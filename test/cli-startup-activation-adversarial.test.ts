@@ -14,6 +14,7 @@ import { InflightInputTracker, type InflightItem } from '../src/core/inflight-in
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 import { TurnExecutionClock } from '../src/services/turn-execution-clock.js';
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
+import { createQueuedActivationReceiptObserver } from '../src/services/queued-activation-receipts.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { classifyRestartTeardown } from '../src/adapters/backend/destroy-result.js';
 import { isRemoteBackendType } from '../src/core/persistent-backend.js';
@@ -379,5 +380,26 @@ describe('tokened opening at the in-flight/circuit boundary', () => {
     expect(h.acks()).toEqual([]);
     expect({ retained: retained.map(item => item.queuedActivationToken),
       exits: h.scope.sendFatalWorkerErrorAndExit.mock.calls.length }).not.toEqual({ retained: [], exits: 0 });
+  });
+
+  it('fails closed instead of clearing an unsettled activation during an in-worker restart', async () => {
+    const h = worker('codex');
+    const receipts = createQueuedActivationReceiptObserver(20_000);
+    h.scope.queuedActivationReceipts = receipts;
+    expect(receipts.watch('token_unsettled_restart', { isCurrent: () => true })).toBe(true);
+    const onRespawnSettled = vi.fn();
+
+    await h.scope.restartCliProcess('restart with unsettled receipt', {
+      preservePending: true,
+      onRespawnSettled,
+    });
+
+    expect(onRespawnSettled).toHaveBeenCalledExactlyOnceWith('failed');
+    expect(h.scope.sendFatalWorkerErrorAndExit).toHaveBeenCalledOnce();
+    expect(h.scope.sendFatalWorkerErrorAndExit.mock.calls[0][0].message)
+      .toContain('requires daemon journal recovery');
+    expect(h.scope.spawnCli).not.toHaveBeenCalled();
+    expect(receipts.size()).toBe(0);
+    expect(h.acks()).toEqual([]);
   });
 });

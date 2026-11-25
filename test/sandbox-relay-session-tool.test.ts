@@ -577,13 +577,21 @@ describe('buildRelaySessionToolRequest', () => {
       .toEqual({ ok: true, request: { tool: 'history', limit: 100 } });
     expect(buildRelaySessionToolRequest('quoted', ['om_a', '--raw', '--session-id', 'sid'], 'sid'))
       .toEqual({ ok: true, request: { tool: 'quoted', messageId: 'om_a', raw: true } });
+    expect(buildRelaySessionToolRequest('quoted', ['om_a', '--raw', '--no-download'], 'sid'))
+      .toEqual({ ok: true, request: { tool: 'quoted', messageId: 'om_a', raw: true, download: false } });
+    expect(buildRelaySessionToolRequest('history', ['--view=index', '--query=--session-id', '--type', 'text,interactive',
+      '--since', '2026-11-24T00:00:00+08:00', '--until=2026-11-25T00:00:00+08:00'], 'sid'))
+      .toEqual({ ok: true, request: { tool: 'history', view: 'index', query: '--session-id', types: ['text', 'interactive'],
+        since: '2026-11-24T00:00:00+08:00', until: '2026-11-25T00:00:00+08:00' } });
   });
   it.each([
-    ['history', ['--query', 'x']],
+    ['history', ['--view', 'index', '--with-card-json']],
+    ['history', ['--since', '2026-11-25', '--until', '2026-11-24']],
+    ['history', ['--type', '../file']],
     ['history', ['--session-id', 'someone-else']],
     ['history', ['--limit', '0']],
     ['quoted', ['om_a', 'om_b']],
-    ['quoted', ['om_a', '--no-download']],
+    ['quoted', ['om_a', '--no-download=false']],
     ['quoted', []],
   ] as const)('refuses %s %j', (tool, args) => {
     expect(buildRelaySessionToolRequest(tool, [...args], 'sid').ok).toBe(false);

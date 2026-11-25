@@ -279,7 +279,10 @@ describe('hc wiring inside the worker spawn and web closures', () => {
     expect(resyncBody).toMatch(/if \(observedBackend !== backend\) return;[\s\S]*effectiveBackendType === 'hc'[\s\S]*relayHcWebSnapshot\(snapshot\)/);
     const size = workerSource.indexOf('hcBackend?.onPaneSizeChange(bindSessionRuntimeCallback(() => {');
     expect(size).toBeGreaterThan(resync);
+    // K2 护栏：尺寸回调必须先过后端代际围栏再广播。围栏与广播之间允许插入
+    // observedPaneGridRevision / 视口存证失效等同级语句；切片已收口到本回调体，
+    // 非贪婪匹配仍钉死「围栏在前、广播在后」的顺序不变量。
     expect(workerSource.slice(size, workerSource.indexOf('}, true));', size)))
-      .toMatch(/if \(observedBackend !== backend\) return;\s*broadcastOwnedPaneReadOnlyFollowerGrid\(\);/);
+      .toMatch(/if \(observedBackend !== backend\) return;[\s\S]*?broadcastOwnedPaneReadOnlyFollowerGrid\(\);/);
   });
 });

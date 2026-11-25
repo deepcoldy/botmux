@@ -76,6 +76,17 @@ export interface BridgePendingTurn {
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
   started: boolean;
+  /** True only when the transcript user/queued_command record's untouched
+   *  legacy-normalised text contained the entire normalised marked content
+   *  (never prefix-only, residue-only, truncation, or unfingerprinted binds). */
+  fullContentMatch?: boolean;
+  /** Strict whole-string equality against the normalised marked content (or its
+   *  sanitized/submitted exact variants). Unlike fullContentMatch (substring),
+   *  prevents short prompts like "ok" from matching unrelated longer inputs. */
+  exactContentMatch?: boolean;
+  /** Additional normalised exact-match targets (e.g. sanitized Claude input or
+   *  catalog-appended submitted text) checked with strict whole-string equality. */
+  extraExactContents?: readonly string[];
   assistantUuids: string[];
   /** An authoritative transcript boundary closed this turn. Durable turns may
    * never settle from screen-idle alone; worker terminal emission requires
@@ -235,10 +246,25 @@ export interface BridgePendingTurn {
   /** Multiple inputs share one uninterrupted output segment, so the next
    *  output cannot be attributed to this later input without guessing. */
   absorbedReplyAmbiguous?: boolean;
-  /** The worker already sent this folded turn's reply live, while its host
-   *  turn was still running: the end of the host turn must not post it again,
-   *  and a failure the host meets afterwards is not this turn's. */
+  /** The worker handed this folded turn's reply to the daemon. The host still
+   *  carries its text unless actual delivery is confirmed, and a failure the
+   *  host meets afterwards is not this turn's. */
   absorbedReplySent?: boolean;
+  /** The daemon confirmed the live card's actual POST. Distinct from IPC
+   *  handoff: a failed host may settle on a confirmed reply, but an unconfirmed
+   *  one still needs its own final fallback. */
+  absorbedReplyDelivered?: boolean;
+  /** Records whose text is known to have gone out whole as this folded turn's
+   *  live reply (empty for a thinking summary, a reply too long for one card,
+   *  or a delivery not confirmed by the daemon). They are the host turn's
+   *  records too, so the host's own final leaves them out — see
+   *  liveFoldedReplyUuids. */
+  absorbedReplyTextUuids?: string[];
+  /** Records the host turn's final carried whole into the chat this folded
+   *  message came from (noteHostFinalCarried). An answer among them is not
+   *  posted to this turn again. Kept on the turn, so an emit retried after a
+   *  throw still knows. */
+  absorbedHostFinalUuids?: ReadonlySet<string>;
   /** The live check for this folded turn's reply has run (see
    *  takeAbsorbedReplyCandidates); whatever it found, it does not run again. */
   absorbedLiveChecked?: boolean;
@@ -327,6 +353,39 @@ export function takeAbsorbedReplyCandidates(
   return due;
 }
 
+/** Records the host turn's own final leaves out: their text already went out,
+ *  live, as the reply to an input folded into it (absorbedReplyTextUuids).
+ *  Claude Code writes that reply inside the host turn, so a final joined from
+ *  all of the host's text would post it a second time — word for word when it
+ *  is all the host said before an idle edge cut it. A reply still unsent when
+ *  the host ends is not left out: the host's final carries it instead. */
+export function liveFoldedReplyUuids(host: BridgePendingTurn): Set<string> {
+  const uuids = new Set<string>();
+  for (const folded of host.absorbedTurns ?? []) {
+    if (!folded.absorbedReplySent) continue;
+    for (const uuid of folded.absorbedReplyTextUuids ?? []) uuids.add(uuid);
+  }
+  return uuids;
+}
+
+/** The host turn's final went out carrying `records`, `whole` or cut short.
+ *  Each input folded into it may then settle on that final instead of posting
+ *  its answer again (absorbedHostFinalUuids) — but only when the final went
+ *  out whole into the chat the folded message came from: a Lark message turn
+ *  (`om_…`) or a terminal-typed turn mirrored there. A trigger's or a
+ *  schedule's final may go elsewhere (an HTTP caller, a doc, nowhere). */
+export function noteHostFinalCarried(
+  host: BridgePendingTurn,
+  records: readonly TranscriptEvent[],
+  whole: boolean,
+): void {
+  if (!whole || !host.absorbedTurns?.length) return;
+  if (!host.turnId.startsWith('om_') && !(host.isLocal && !host.isScheduled)) return;
+  const uuids = new Set<string>();
+  for (const ev of records) if (ev.uuid) uuids.add(ev.uuid);
+  for (const folded of host.absorbedTurns) folded.absorbedHostFinalUuids = uuids;
+}
+
 /** Claude's own transcript proves this input is waiting in its queue. There is
  *  nothing to search other transcripts for, and no reason to expire the mark:
  *  the record that binds it arrives when Claude takes the input. */
@@ -392,6 +451,9 @@ interface TranscriptMarkMatch {
   truncationMatch: boolean;
   /** Only the untouched legacy candidate can prove native consumption. */
   legacyFullContentMatch: boolean;
+  /** Strict whole-string equality on the untouched legacy candidate against the
+   *  normalised mark (or its exact submitted/sanitized variants). */
+  legacyExactContentMatch: boolean;
   /** A bind that exists only because the residue candidate was considered. */
   residueOnlyMatch: boolean;
   /** A strong bind that exists only because the residue candidate was considered. */
@@ -407,6 +469,7 @@ function matchTranscriptAgainstMark(
   candidates: readonly string[],
   contentFingerprint?: string,
   contentNormalized?: string,
+  extraExactContents?: readonly string[],
 ): TranscriptMarkMatch {
   const legacy = candidates.slice(0, 1);
   const residue = candidates.slice(1);
@@ -414,9 +477,13 @@ function matchTranscriptAgainstMark(
     && texts.some(text => text.includes(contentFingerprint));
   const full = (texts: readonly string[]) => !!contentNormalized
     && texts.some(text => text.includes(contentNormalized));
+  const exact = (texts: readonly string[]) => (!!contentNormalized || (extraExactContents?.length ?? 0) > 0)
+    && texts.some(text => (!!contentNormalized && text === contentNormalized)
+      || (extraExactContents?.includes(text) ?? false));
   const truncated = (texts: readonly string[]) => texts.some(text => isTruncatedMatch(text, contentNormalized));
   const legacyFingerprintMatch = fingerprint(legacy);
   const legacyFull = full(legacy);
+  const legacyExact = exact(legacy);
   const legacyTruncationMatch = truncated(legacy);
   const residueFingerprintMatch = fingerprint(residue);
   const residueFull = full(residue);
@@ -428,6 +495,7 @@ function matchTranscriptAgainstMark(
     anyFullContentMatch: legacyFull || residueFull,
     truncationMatch: legacyTruncationMatch || residueTruncationMatch,
     legacyFullContentMatch: legacyFull,
+    legacyExactContentMatch: legacyExact,
     residueOnlyMatch: !legacyMatch && (residueFingerprintMatch || residueTruncationMatch),
     residueOnlyStrongMatch: !legacyStrongMatch && (residueFull || residueTruncationMatch),
   };
@@ -449,7 +517,12 @@ function evaluateMarksAgainstTranscript(
 ): MarkMatchEvaluation[] {
   return turns.map(turn => ({
     turn,
-    match: matchTranscriptAgainstMark(candidates, turn.contentFingerprint, turn.contentNormalized),
+    match: matchTranscriptAgainstMark(
+      candidates,
+      turn.contentFingerprint,
+      turn.contentNormalized,
+      turn.extraExactContents,
+    ),
   }));
 }
 
@@ -477,6 +550,7 @@ function residueAttributionConflictTurns(
  *  attribution heuristics, not consumption proof. */
 export interface BridgeTurnStartEvidence {
   fullContentMatch: boolean;
+  exactContentMatch?: boolean;
   sourceJsonlPath?: string;
 }
 
@@ -692,7 +766,11 @@ export class BridgeTurnQueue {
     markTimeMs: number = Date.now(),
     contentNormalized?: string,
     dispatchAttempt?: number,
-    opts?: { restoredFromJournal?: boolean; linkRefMode?: 'observe' | 'enabled' },
+    opts?: {
+      restoredFromJournal?: boolean;
+      linkRefMode?: 'observe' | 'enabled';
+      extraExactContents?: readonly string[];
+    },
   ): string {
     this.queue.push({
       turnId,
@@ -702,6 +780,7 @@ export class BridgeTurnQueue {
       assistantUuids: [],
       contentFingerprint,
       contentNormalized,
+      ...(opts?.extraExactContents?.length ? { extraExactContents: opts.extraExactContents } : {}),
       markTimeMs,
       ...(opts?.restoredFromJournal ? { restoredFromJournal: true } : {}),
     });
@@ -1421,7 +1500,10 @@ export class BridgeTurnQueue {
     if ((!evaluation.match.fingerprintMatch && !evaluation.match.truncationMatch)
       || conflict.length > 0) return;
     const fullContentMatch = evaluation.match.legacyFullContentMatch;
+    const exactContentMatch = evaluation.match.legacyExactContentMatch;
     next.started = true;
+    next.fullContentMatch = fullContentMatch;
+    next.exactContentMatch = exactContentMatch;
     this.resolveResidueConflictFor(next);
     if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
     next.markTimeMs = eventTimeMs;
@@ -1441,7 +1523,11 @@ export class BridgeTurnQueue {
     }
     this.lastLarkTurnId = next.turnId;
     this.lastLocalTurnId = undefined;
-    this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
+    this.onLarkTurnStarted?.(next, {
+      fullContentMatch,
+      exactContentMatch,
+      ...(sourceJsonlPath ? { sourceJsonlPath } : {}),
+    });
   }
 
   /** A head-of-line dropped turn takes the input it absorbed with it: left
@@ -1513,6 +1599,7 @@ export class BridgeTurnQueue {
     const next = this.queue.find(t => !t.started);
     let consumedNext = false;
     let fullContentMatch = false;
+    let exactContentMatch = false;
     if (next) {
       if (next.contentFingerprint) {
         // The mark keeps its legacy identity. Transcript text additionally
@@ -1528,6 +1615,7 @@ export class BridgeTurnQueue {
         if (conflict.length > 0) this.noteResidueConflict(conflict, eventTimeMs);
         const ambiguous = conflict.length > 0;
         fullContentMatch = match.legacyFullContentMatch;
+        exactContentMatch = match.legacyExactContentMatch;
         if (!ambiguous && match.fingerprintMatch) {
           next.started = true;
           if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
@@ -1564,8 +1652,14 @@ export class BridgeTurnQueue {
       }
     }
     if (consumedNext && next) {
+      next.fullContentMatch = fullContentMatch;
+      next.exactContentMatch = exactContentMatch;
       this.resolveResidueConflictFor(next);
-      this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
+      this.onLarkTurnStarted?.(next, {
+        fullContentMatch,
+        exactContentMatch,
+        ...(sourceJsonlPath ? { sourceJsonlPath } : {}),
+      });
     }
     if (!consumedNext) {
       // The user event neither fingerprint-matched nor proved a truncation of a

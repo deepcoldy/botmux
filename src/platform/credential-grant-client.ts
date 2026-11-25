@@ -16,8 +16,12 @@
  */
 import { postJson } from './platform-http.js';
 import { readPlatformBinding } from './binding.js';
-import { FIRST_ATTEMPT_TIMEOUT_MS, TOTAL_BUDGET_MS } from './credential-grant-budget.js';
+import { BYTEDCLI_FIRST_ATTEMPT_TIMEOUT_MS, FIRST_ATTEMPT_TIMEOUT_MS, TOTAL_BUDGET_MS } from './credential-grant-budget.js';
+import { BYTEDCLI_REGION_STATES, type BytedcliGrantRegion, type BytedcliRegionState,
+  type BytedcliRegionStates } from './bytedcli-grant-regions.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+
+export type { BytedcliGrantRegion } from './bytedcli-grant-regions.js';
 
 export interface CredentialGrantRequest {
   tool: TriggerUserAuthTool;
@@ -27,6 +31,8 @@ export interface CredentialGrantRequest {
   appId: string;
   sessionId: string;
   turnId?: string;
+  /** bytedcli only. Defaults to all supported partitions. */
+  cloudJwtRegions?: readonly BytedcliGrantRegion[];
 }
 
 export interface CredentialGrant {
@@ -44,6 +50,7 @@ export interface CredentialGrant {
    * {@link variables} can be told apart from one the platform could not mint.
    */
   cloudJwtRegions?: BytedcliGrantRegion[];
+  cloudJwtRegionStates?: BytedcliRegionStates;
 }
 
 export type CredentialGrantFailure =
@@ -87,8 +94,7 @@ export const BYTEDCLI_REGIONAL_GRANT_VARIABLES = {
   i18nbd: 'BYTEDCLI_USER_CLOUD_JWT_I18NBD',
   tx: 'BYTEDCLI_USER_CLOUD_JWT_TX',
   cn: 'BYTEDCLI_USER_CLOUD_JWT_CN',
-} as const;
-export type BytedcliGrantRegion = keyof typeof BYTEDCLI_REGIONAL_GRANT_VARIABLES;
+} as const satisfies Record<BytedcliGrantRegion, string>;
 const BYTEDCLI_GRANT_REGIONS = Object.keys(BYTEDCLI_REGIONAL_GRANT_VARIABLES) as BytedcliGrantRegion[];
 const REGIONAL_GRANT_VARIABLE_SET: ReadonlySet<string> = new Set(Object.values(BYTEDCLI_REGIONAL_GRANT_VARIABLES));
 /** Request field naming the partitions a bytedcli grant should cover, and the
@@ -278,8 +284,9 @@ async function requestCredentialGrantInner(
     machineConsent: true,
     // A platform that predates regional tokens ignores the field (it reads
     // only the fields it knows) and answers with the default token alone.
-    ...(req.tool === 'bytedcli' ? { [CLOUD_JWT_REGIONS_FIELD]: BYTEDCLI_GRANT_REGIONS } : {}),
+    ...(req.tool === 'bytedcli' ? { [CLOUD_JWT_REGIONS_FIELD]: req.cloudJwtRegions ?? BYTEDCLI_GRANT_REGIONS } : {}),
   };
+  const firstBudget = opts.timeoutMs ?? (req.tool === 'bytedcli' ? BYTEDCLI_FIRST_ATTEMPT_TIMEOUT_MS : FIRST_ATTEMPT_TIMEOUT_MS);
   const totalBudget = opts.totalBudgetMs ?? TOTAL_BUDGET_MS;
   const deadline = Date.now() + totalBudget;
   let status = 0;
@@ -290,7 +297,7 @@ async function requestCredentialGrantInner(
     // another instance, and capping it at another first attempt would leave
     // the total budget unreachable.
     const timeoutMs = Math.max(1, attempt === 0
-      ? Math.min(opts.timeoutMs ?? FIRST_ATTEMPT_TIMEOUT_MS, totalBudget)
+      ? Math.min(firstBudget, totalBudget)
       : remaining);
     try {
       // Always a connection of its own: grants are one per turn, so a pooled
@@ -326,9 +333,14 @@ async function requestCredentialGrantInner(
   const variables = pickVariables(req.tool, rec.variables);
   if (typeof variables === 'string') return { ok: false, reason: 'invalid_response', error: variables };
   const cloudJwtRegions = req.tool === 'bytedcli' ? pickRegions(rec[CLOUD_JWT_REGIONS_FIELD]) : undefined;
+  const cloudJwtRegionStates = req.tool === 'bytedcli' ? pickRegionStates(rec.cloudJwtRegionStates) : undefined;
   return {
     ok: true,
-    value: { tool: req.tool, unionId: req.unionId, variables, expiresAt, ...(cloudJwtRegions ? { cloudJwtRegions } : {}) },
+    value: {
+      tool: req.tool, unionId: req.unionId, variables, expiresAt,
+      ...(cloudJwtRegions ? { cloudJwtRegions } : {}),
+      ...(cloudJwtRegionStates ? { cloudJwtRegionStates } : {}),
+    },
   };
 }
 
@@ -337,6 +349,16 @@ async function requestCredentialGrantInner(
 function pickRegions(raw: unknown): BytedcliGrantRegion[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   return BYTEDCLI_GRANT_REGIONS.filter(region => raw.includes(region));
+}
+
+function pickRegionStates(raw: unknown): BytedcliRegionStates | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const states: BytedcliRegionStates = {};
+  for (const region of BYTEDCLI_GRANT_REGIONS) {
+    const state = (raw as Record<string, unknown>)[region];
+    if ((BYTEDCLI_REGION_STATES as readonly unknown[]).includes(state)) states[region] = state as BytedcliRegionState;
+  }
+  return Object.keys(states).length ? states : undefined;
 }
 
 /** One-line, secret-free description for logs. */

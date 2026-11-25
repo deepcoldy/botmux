@@ -38,23 +38,24 @@ async function main(): Promise<void> {
   }
   let identity: { mode: 'bot' | 'user'; credential: string; appId?: string } | undefined;
   let native = false;
-  if (!invocation.offline && !isPassthrough) {
+  if (!invocation.offline) {
     const port = parseDaemonIpcPort(findOnlineDaemon(binding.appId, binding.dataDir)?.ipcPort)
       ?? binding.ipcPort ?? Number(process.env.BOTMUX_DAEMON_IPC_PORT);
     if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) throw new Error('The bound bot daemon is unavailable');
-    const payload = JSON.stringify({ mode: invocation.mode, ...(invocation.mode === 'user' && process.env.BOTMUX_AS ? { as: process.env.BOTMUX_AS } : {}) });
+    const payload = JSON.stringify({ mode: invocation.mode, ...(isPassthrough ? { policyOnly: true } : {}), ...(invocation.mode === 'user' && process.env.BOTMUX_AS ? { as: process.env.BOTMUX_AS } : {}) });
     // `--as user` can run a platform credential grant inside this request.
     const response = await loopbackFetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(binding.sessionId)}/${LARK_TOOL_ROUTE}`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
       body: payload, signal: AbortSignal.timeout(GRANT_ROUTE_CLIENT_TIMEOUT_MS),
     });
     const raw = await response.text();
-    const result = JSON.parse(raw) as { ok?: boolean; appId?: string; mode?: string; credentialType?: string; credential?: string; native?: boolean; error?: string; code?: string; issuer?: string; actingAs?: string };
+    const result = JSON.parse(raw) as { ok?: boolean; policyOnly?: boolean; appId?: string; mode?: string; credentialType?: string; credential?: string; native?: boolean; error?: string; code?: string; issuer?: string; actingAs?: string };
     if (!response.ok || result.ok !== true) throw new Error(result.error ?? result.code ?? 'lark_tool_identity_unavailable');
     // The daemon says `native` when this bot leaves `--as user` to the machine's own lark-cli login.
     native = invocation.mode === 'user' && result.native === true;
     if (native) process.stderr.write(`botmux: --as user 使用本机 lark-cli 登录${machineUserSuffix(binding.realBinary)}\n`);
-    if (!native) {
+    if (isPassthrough && result.policyOnly !== true) throw new Error('The lark-cli policy check did not complete');
+    if (!native && !isPassthrough) {
       const credentialType = invocation.mode === 'bot' ? 'tenant_access_token' : 'user_access_token';
       // A user grant issued by the botmux platform belongs to the platform's own
       // application; the daemon says so explicitly. Bot calls and every other user

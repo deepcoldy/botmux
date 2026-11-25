@@ -145,6 +145,15 @@ export type GatewayTrustedResultDeliveryHandler = (input: {
   identity: GatewayTrustedTurnIdentity;
   delivery: TrustedResultDelivery;
 }) => Promise<TrustedResultDeliveryReceipt>;
+export const HOST_RESULT_STATUS_TOOL = 'botmux_result_delivery_status';
+export interface GatewayResultStatus {
+  status: 'not_found' | 'pending' | 'delivered' | 'unknown' | 'aborted';
+  deliveryId?: string; chatId?: string; rootMessageId?: string;
+  messageIds?: string[]; attachmentCount?: number;
+}
+export type GatewayTrustedResultStatusHandler = (input: {
+  identity: GatewayTrustedTurnIdentity; pluginId: string; deliveryId: string;
+}) => Promise<GatewayResultStatus>;
 export type GatewayLinkRefRegistrationHandler = (input: {
   pluginId: string;
   identity: GatewayTrustedTurnIdentity;
@@ -351,6 +360,8 @@ export class PluginMcpGateway {
   private readonly env: NodeJS.ProcessEnv;
   private readonly trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   private readonly trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+  private readonly trustedResultStatus?: GatewayTrustedResultStatusHandler;
+  private readonly protectedResultDeliveryAvailable?: () => boolean;
   private readonly linkRefRegistration?: GatewayLinkRefRegistrationHandler;
   private readonly requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
   private readonly protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
@@ -373,6 +384,8 @@ export class PluginMcpGateway {
     opts: {
       trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
       trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+      trustedResultStatus?: GatewayTrustedResultStatusHandler;
+      protectedResultDeliveryAvailable?: () => boolean;
       linkRefRegistration?: GatewayLinkRefRegistrationHandler;
       requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
       protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
@@ -382,6 +395,8 @@ export class PluginMcpGateway {
     this.env = env;
     this.trustedTurnIdentity = opts.trustedTurnIdentity;
     this.trustedResultDelivery = opts.trustedResultDelivery;
+    this.trustedResultStatus = opts.trustedResultStatus;
+    this.protectedResultDeliveryAvailable = opts.protectedResultDeliveryAvailable;
     this.linkRefRegistration = opts.linkRefRegistration;
     this.requestProtectedSecretChannel = opts.requestProtectedSecretChannel;
     this.protectedMcpPolicy = opts.protectedMcpPolicy;
@@ -625,7 +640,9 @@ export class PluginMcpGateway {
   private trustedTurnMeta(identity: GatewayTrustedTurnIdentity | undefined): Record<string, unknown> | undefined {
     const caller = identity?.caller;
     if (!caller && !identity?.turnId) return undefined;
-    const hostCapabilities = this.trustedResultDelivery ? ['result_delivery_v1'] : [];
+    const hostCapabilities = this.trustedResultDelivery
+      ? ['result_delivery_v1', ...(this.trustedResultStatus && this.protectedResultDeliveryAvailable?.()
+        ? ['result_delivery_receipt_only_v1'] : [])] : [];
     return {
       ...(caller?.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
       ...(caller?.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
@@ -763,7 +780,7 @@ export class PluginMcpGateway {
     }
     const counts = new Map<string, number>();
     for (const { tool } of entries) counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1);
-    const used = new Set<string>();
+    const used = new Set<string>(this.trustedResultStatus ? [HOST_RESULT_STATUS_TOOL] : []);
     this.toolRoutes.clear();
     const exposed = entries.map(({ connection, tool }) => {
       const candidate = counts.get(tool.name) === 1 ? tool.name : `${connection.routeName}__${tool.name}`;
@@ -772,6 +789,14 @@ export class PluginMcpGateway {
       return name === tool.name ? tool : { ...tool, name };
     });
     this.persistDiagnostics();
+    if (this.trustedResultStatus) exposed.push({
+      name: HOST_RESULT_STATUS_TOOL,
+      description: 'Read only delivery IDs/status/counts for the trusted human/application/session. Never returns bodies, resource keys, filenames or paths, and never resends or queries data.',
+      inputSchema: { type: 'object', properties: {
+        plugin_id: { type: 'string', minLength: 1, maxLength: 100 },
+        delivery_id: { type: 'string', minLength: 8, maxLength: 128 },
+      }, required: ['plugin_id', 'delivery_id'], additionalProperties: false },
+    });
     return exposed;
   }
 
@@ -874,6 +899,35 @@ export class PluginMcpGateway {
     this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const currentIdentity = this.trustedTurnIdentity?.();
       const identity = currentIdentity ? structuredClone(currentIdentity) : undefined;
+      if (request.params.name === HOST_RESULT_STATUS_TOOL && this.trustedResultStatus) {
+        const args = request.params.arguments;
+        if (!identity?.caller?.requestUserUnionId || identity.caller.senderType !== 'user'
+          || !isRecord(args) || Object.keys(args).some(key => !['plugin_id', 'delivery_id'].includes(key))
+          || typeof args.plugin_id !== 'string' || !this.pluginIds.includes(args.plugin_id)
+          || typeof args.delivery_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(args.delivery_id)) {
+          throw methodUnsupported('protected_result_status_identity_required');
+        }
+        const result = await this.trustedResultStatus({ identity, pluginId: args.plugin_id, deliveryId: args.delivery_id });
+        if (!['not_found', 'pending', 'delivered', 'unknown', 'aborted'].includes(result.status)
+          || (result.deliveryId !== undefined && result.deliveryId !== args.delivery_id)
+          || (result.chatId !== undefined && !/^oc_[A-Za-z0-9_-]+$/.test(result.chatId))
+          || (result.rootMessageId !== undefined && !/^om_[A-Za-z0-9_-]+$/.test(result.rootMessageId))
+          || (result.messageIds !== undefined && (!Array.isArray(result.messageIds)
+            || result.messageIds.length > 9 || result.messageIds.some(id => typeof id !== 'string' || !/^om_[A-Za-z0-9_-]+$/.test(id))))
+          || (result.attachmentCount !== undefined && (!Number.isInteger(result.attachmentCount)
+            || result.attachmentCount < 0 || result.attachmentCount > 8))) {
+          throw methodUnsupported('protected_result_status_invalid');
+        }
+        const safe = {
+          status: result.status,
+          ...(result.deliveryId ? { deliveryId: result.deliveryId } : {}),
+          ...(result.chatId ? { chatId: result.chatId } : {}),
+          ...(result.rootMessageId ? { rootMessageId: result.rootMessageId } : {}),
+          ...(result.messageIds ? { messageIds: result.messageIds } : {}),
+          ...(result.attachmentCount !== undefined ? { attachmentCount: result.attachmentCount } : {}),
+        };
+        return { content: [{ type: 'text', text: JSON.stringify(safe) }] };
+      }
       if (this.toolRoutes.size === 0) await this.refreshTools();
       const route = this.toolRoutes.get(request.params.name);
       if (!route) throw methodUnsupported(`tools/call:${request.params.name}`);
@@ -927,11 +981,19 @@ export class PluginMcpGateway {
           deliveryValue,
           pluginHome(route.connection.pluginId),
         );
+        if (delivery.readPolicy === 'receipt-only' && !this.protectedResultDeliveryAvailable?.()) {
+          throw new Error('protected_result_profile_required');
+        }
         const receipt: TrustedResultDeliveryReceipt = await this.trustedResultDelivery!({
           pluginId: route.connection.pluginId,
           identity,
           delivery,
         });
+        if (receipt.messageIds !== undefined && (!Array.isArray(receipt.messageIds)
+          || receipt.messageIds.length > 9
+          || receipt.messageIds.some(id => typeof id !== 'string' || !/^om_[A-Za-z0-9_-]{1,200}$/.test(id)))) {
+          throw new Error('invalid_host_delivery_receipt');
+        }
         // The downstream result may contain business rows. Replace it wholesale:
         // never merge/spread it into the response visible to the external CLI.
         return {
@@ -941,6 +1003,7 @@ export class PluginMcpGateway {
               delivered: receipt.delivered,
               deliveryId: receipt.deliveryId,
               fileCount: receipt.fileCount,
+              ...(receipt.messageIds ? { messageIds: receipt.messageIds } : {}),
             }),
           }],
           _meta: {
@@ -948,6 +1011,7 @@ export class PluginMcpGateway {
               delivered: receipt.delivered,
               deliveryId: receipt.deliveryId,
               fileCount: receipt.fileCount,
+              ...(receipt.messageIds ? { messageIds: receipt.messageIds } : {}),
             },
           },
         };

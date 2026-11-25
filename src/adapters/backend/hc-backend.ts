@@ -558,6 +558,10 @@ export class HcBackend implements SessionBackend {
     return this.mirror.size();
   }
 
+  getPaneSizeAsync(): Promise<{ cols: number; rows: number } | null> {
+    return Promise.resolve(this.getPaneSize());
+  }
+
   // ─── spawn ─────────────────────────────────────────────────────────────────────────
 
   private createTerminal(core: HcSyncCore, bin: string, args: string[], opts: SpawnOpts): HcTerminalRecord {

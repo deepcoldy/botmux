@@ -1,6 +1,8 @@
+import { durableLarkOutboxMessage, deliverDurableLarkOutbox } from '../src/services/durable-lark-outbox.js';
+import { sendMessage, replyMessage } from '../src/im/lark/client.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { FrozenSessionReplyTarget } from '../src/types.js';
@@ -29,6 +31,9 @@ import { observeTurnResultTerminal } from '../src/core/turn-result-session.js';
 import { TopicSendError } from '../src/cli/topic-send-guard.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { PluginResultArtifactStore } from '../src/core/plugins/mcp/result-artifact-store.js';
+import { ProtectedResultStore } from '../src/services/protected-result-store.js';
+import { parseTrustedResultDelivery } from '../src/core/plugins/mcp/trusted-result-delivery.js';
 
 const APP = 'cli_worker_topic_output';
 const oldDataDir = config.session.dataDir;
@@ -91,6 +96,57 @@ async function waitFor(check: () => boolean): Promise<void> {
 }
 
 describe('worker final-output topic transport', () => {
+  it.each(['send', 'reply'] as const)('durable automatic %s reuses a protected receipt at provider boundary', async method => {
+    const store = new ProtectedResultStore(config.session.dataDir);
+    const context = { appId: APP, pluginId: 'reference-reporter', sessionId: ds.session.sessionId,
+      turnId: 'om_turn_old', ownerUnionId: 'on_owner', chatId: ds.chatId };
+    store.begin(context, 'durable_fixture', 'a'.repeat(64));
+    const complete = () => {
+      store.update(context, 'durable_fixture', { message: { messageId: 'om_completed_durable', kind: 'primary' } });
+      store.update(context, 'durable_fixture', { status: 'delivered' });
+    };
+    const hookContext = { sessionId: ds.session.sessionId, turnId: 'om_turn_old', protectedFinal: true };
+    // Completion happens inside the last awaited authority hook, after the
+    // durable job was formed but before the provider effect.
+    const options = { beforeWrite: async () => { await Promise.resolve(); complete(); } };
+    const id = method === 'send'
+      ? await sendMessage(APP, ds.chatId, 'SYNTHETIC_DUPLICATE', 'text', 'durable_uuid', hookContext, options)
+      : await replyMessage(APP, 'om_source', 'SYNTHETIC_DUPLICATE', 'text', true, 'durable_uuid', hookContext, options);
+    expect(id).toBe('om_completed_durable');
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(mocks.reply).not.toHaveBeenCalled();
+  });
+
+  it('rechecks completion after a queued final waits, without replaying its body', async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = final(undefined, () => true, 'SYNTHETIC_LATE_DUPLICATE');
+      const store = new ProtectedResultStore(config.session.dataDir);
+      const context = { appId: APP, pluginId: 'reference-reporter', sessionId: ds.session.sessionId,
+        turnId: 'om_turn_old', ownerUnionId: 'on_owner', chatId: ds.chatId };
+      store.begin(context, 'late_fixture', 'a'.repeat(64));
+      store.update(context, 'late_fixture', { message: { messageId: 'om_protected_late', kind: 'primary' } });
+      store.update(context, 'late_fixture', { status: 'delivered' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await pending).toEqual({ owned: true, messageId: 'om_protected_late' });
+      expect(mocks.reply).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['delivered', 'unknown', 'auxiliary', 'other-turn'] as const)('automatic final checks exact protected completion (%s)', async mode => {
+    const store = new ProtectedResultStore(config.session.dataDir);
+    const context = { appId: APP, pluginId: 'reference-reporter', sessionId: ds.session.sessionId,
+      turnId: mode === 'other-turn' ? 'om_another' : 'om_turn_old', ownerUnionId: 'on_owner', chatId: ds.chatId,
+      ...(mode === 'auxiliary' ? { responseKind: 'auxiliary' as const } : {}) };
+    store.begin(context, 'automatic_fixture', 'a'.repeat(64));
+    store.update(context, 'automatic_fixture', { message: { messageId: 'om_protected_primary', kind: 'primary' } });
+    store.update(context, 'automatic_fixture', { status: mode === 'unknown' ? 'unknown' : 'delivered' });
+    const result = await final(undefined, () => true, 'SYNTHETIC_DUPLICATE_BODY');
+    expect(result.owned).toBe(true);
+    expect(mocks.reply).toHaveBeenCalledTimes(mode === 'delivered' ? 0 : 1);
+    if (mode === 'delivered') expect(result.messageId).toBe('om_protected_primary');
+  });
+
   it.each([
     ['turn_budget_exhausted', false], ['execution_failed', false],
     ['turn_budget_exhausted', true], ['execution_failed', true],
@@ -150,6 +206,57 @@ describe('worker final-output topic transport', () => {
     expect(mocks.create).not.toHaveBeenCalled();
     expect(mocks.reply).not.toHaveBeenCalled();
     expect(mocks.upload).not.toHaveBeenCalled();
+  });
+
+  it.each([[true, false], [false, false], [true, true]])('requires matching policy and retains partial message kinds (matching=%s, partial=%s)', async (matching, partial) => {
+    registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code',
+      turnResults: { enabled: true }, replyCardMode: 'legacy' });
+    ds.session.protectedResults = true;
+    ds.workingDir = home;
+    ds.session.turnReplyContexts!.om_turn_old.senderOpenId = 'ou_requester';
+    ds.session.replyTargets = { om_turn_old: {
+      rootMessageId: 'om_source', senderOpenId: 'ou_requester', updatedAt: new Date().toISOString(),
+    } };
+    const store = new PluginResultArtifactStore({ dataDir: config.session.dataDir });
+    mkdirSync(join(home, 'outbound'));
+    if (partial) {
+      writeFileSync(join(home, 'outbound', 'synthetic.xlsx'), 'synthetic');
+      mocks.upload.mockReset().mockResolvedValue({ file_key: 'file_trusted' });
+      mocks.reply.mockImplementation(async input => input.data.msg_type === 'file'
+        ? { code: 0, data: { message_id: 'om_attachment' } }
+        : { code: 230028, msg: 'content rejected' });
+    }
+    const delivery = parseTrustedResultDelivery({ schemaVersion: 1, deliveryId: 'protected_fixture_001',
+      markdown: 'SYNTHETIC_PRIVATE_BODY', ...(partial ? { files: [{ path: 'synthetic.xlsx', name: 'synthetic.xlsx' }] } : {}), ...(matching ? { readPolicy: 'receipt-only' } : {}) }, home);
+    const artifact = store.create({ pluginId: 'reference-reporter', delivery, ownerUnionId: 'on_requester',
+      ownerOpenId: 'ou_requester', larkAppId: APP, sessionId: ds.session.sessionId, turnId: 'om_turn_old' });
+    const sent: any[] = [];
+    const worker = Object.assign(new EventEmitter(), { pid: process.pid, connected: true,
+      send: (message: unknown) => { sent.push(message); return true; },
+      stdout: new EventEmitter(), stderr: new EventEmitter(), killed: false, kill: () => true });
+    ds.worker = worker as never;
+    __testOnly_setupWorkerHandlers(ds, ds.worker!, undefined, 1);
+    worker.emit('message', { type: 'plugin_result_delivery', requestId: 'protected_req', sessionId: ds.session.sessionId,
+      pluginId: 'reference-reporter', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
+      deliveryId: delivery.deliveryId, viewToken: artifact.viewToken, expiresAt: artifact.expiresAt,
+      fileCount: partial ? 1 : 0, responseKind: 'final', readPolicy: 'receipt-only' });
+    await waitFor(() => sent.some(message => message.type === 'plugin_result_delivery_result'));
+    expect(sent.find(message => message.type === 'plugin_result_delivery_result').ok).toBe(matching && !partial);
+    expect(JSON.stringify(sent)).not.toContain('SYNTHETIC_PRIVATE_BODY');
+    expect(mocks.reply).toHaveBeenCalledTimes(matching ? (partial ? 2 : 1) : 0);
+    if (partial) {
+      worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_turn_old', status: 'failed' });
+      await waitFor(() => getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old').status === 'ready');
+      const lookup = getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old');
+      if (lookup?.status !== 'ready') throw new Error('Missing partial receipt');
+      expect(lookup.result.deliveries[0]).toMatchObject({ status: 'partial', messages: [{ kind: 'attachment', messageId: 'om_attachment' }] });
+    }
+    if (matching && !partial) {
+      const body = mocks.reply.mock.calls[0][0].data.content;
+      expect(body).toContain('SYNTHETIC_PRIVATE_BODY');
+      expect(body).not.toContain('/plugin-result-access/');
+      expect(new ProtectedResultStore(config.session.dataDir).isProtected('om_sent')).toBe(true);
+    }
   });
 
   it.each([
@@ -673,3 +780,66 @@ describe('worker final-output topic transport', () => {
     expect(mocks.request.mock.calls.filter(([r]) => r.url.includes('/im/v1/messages/'))).toHaveLength(0);
   });
 });
+
+it.each([1, 2])('completion during topic lookup %s prevents an automatic duplicate', async lookupNumber => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  let entered!: () => void;
+  let release!: () => void;
+  const seen = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const previous = mocks.request.getMockImplementation()!;
+  let lookups = 0;
+  mocks.request.mockImplementation(async request => {
+    if (request.method === 'GET' && request.url.includes('/im/v1/messages/') && ++lookups === lookupNumber) {
+      entered(); await gate;
+    }
+    return previous(request);
+  });
+  try {
+    const pending = final(undefined, () => true, 'SYNTHETIC_RACE_DUPLICATE');
+    await seen;
+    vi.setSystemTime(new Date(Date.now() + 30_000));
+    const store = new ProtectedResultStore(config.session.dataDir);
+    const context = { appId: APP, pluginId: 'reference-reporter', sessionId: ds.session.sessionId,
+      turnId: 'om_turn_old', ownerUnionId: 'on_owner', chatId: ds.chatId };
+    store.begin(context, 'lookup_race', 'a'.repeat(64));
+    store.update(context, 'lookup_race', { message: { messageId: 'om_already_completed', kind: 'primary' } });
+    store.update(context, 'lookup_race', { status: 'delivered' });
+    release();
+    expect(await pending).toEqual({ owned: true, messageId: 'om_already_completed' });
+    expect(mocks.reply).not.toHaveBeenCalled();
+  } finally { release(); vi.useRealTimers(); }
+}, 15_000);
+
+it.each(['send', 'reply'] as const)('restored durable %s checks exact protected scope at provider boundary', async method => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  try {
+    for (const mode of ['completed', 'ordinary', 'auxiliary', 'unknown', 'other-session', 'other-turn'] as const) {
+      mocks.create.mockClear(); mocks.reply.mockClear();
+      const store = new ProtectedResultStore(config.session.dataDir);
+      const turn = `om_restore_${method}_${mode}`;
+      const context = { appId: APP, pluginId: 'reference-reporter', sessionId: ds.session.sessionId,
+        turnId: turn, ownerUnionId: 'on_owner', chatId: ds.chatId,
+        ...(mode === 'auxiliary' ? { responseKind: 'auxiliary' as const } : {}) };
+      store.begin(context, `restore_${mode}`, 'b'.repeat(64));
+      store.update(context, `restore_${mode}`, { message: { messageId: 'om_restored_protected', kind: 'primary' } });
+      const hookContext = { sessionId: mode === 'other-session' ? 'different_session' : ds.session.sessionId,
+        turnId: mode === 'other-turn' ? 'om_different_turn' : turn, ...(mode !== 'ordinary' ? { protectedFinal: true } : {}) };
+      const wire = durableLarkOutboxMessage({ messageId: `outbox_${method}_${mode}`, sessionKey: ds.session.sessionId,
+        larkAppId: APP, target: method === 'send' ? { kind: 'send', chatId: ds.chatId }
+          : { kind: 'reply', messageId: 'om_source', replyInThread: true }, content: 'SYNTHETIC_RESTORED_BODY',
+        providerUuid: `restore_${method}_${mode}`, hookContext });
+      const restored = { ...JSON.parse(JSON.stringify(wire)), state: 'attempting', originEpoch: 1, attempts: 2, updatedAt: Date.now() };
+      const attempt = { record: restored, workerId: 'fixture_worker', claimEpoch: 2, claimUntil: Date.now() + 60_000, attempt: 2 };
+      const result = await deliverDurableLarkOutbox(restored, { attempt, signal: new AbortController().signal },
+        { sendMessage, replyMessage }, { beforeEffect: async () => {
+          await Promise.resolve(); vi.setSystemTime(new Date(Date.now() + 1000));
+          store.update(context, `restore_${mode}`, { status: mode === 'unknown' ? 'unknown' : 'delivered' });
+        } });
+      expect(result.kind).toBe('delivered');
+      if (result.kind !== 'delivered') throw new Error('Expected durable receipt');
+      expect(result.receipt.providerMessageId).toBe(mode === 'completed' ? 'om_restored_protected' : 'om_sent');
+      expect(mocks.create.mock.calls.length + mocks.reply.mock.calls.length).toBe(mode === 'completed' ? 0 : 1);
+    }
+  } finally { vi.useRealTimers(); }
+}, 20_000);

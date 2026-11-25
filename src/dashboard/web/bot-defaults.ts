@@ -324,6 +324,8 @@ export type CliOption = {
   available?: boolean;
   availabilityStatus?: import('../../setup/cli-availability.js').CliAvailabilityStatus;
   command?: string;
+  /** Launch commands and short aliases from the CLI registry, used only for search. */
+  searchTerms?: readonly string[];
   availabilityReason?: string;
   cliLaunchMode?: 'forge-traex';
   /** 静态模型候选（后端精选列表；不支持模型的 CLI 为 []）。live 探测结果走 /api/cli-options/models。 */
@@ -335,6 +337,12 @@ export type CliOptionsState = {
   ttadkModelDefault: string;
   ttadkModelSuggestions: string[];
 };
+
+/** Empty alias lists still fall back to the launch command exposed by older servers. */
+export function cliSearchTerms(option: Pick<CliOption, 'command' | 'searchTerms'>): readonly string[] {
+  if (option.searchTerms?.length) return option.searchTerms;
+  return option.command ? [option.command] : [];
+}
 
 export type ModelCapabilities = {
   slug: string;
@@ -1016,6 +1024,10 @@ export async function fetchCliOptions(): Promise<CliOptionsState> {
       .filter((o: any) => o && typeof o.id === 'string' && typeof o.label === 'string')
       .map((o: any) => ({
         ...o,
+        // 容错：缺失/非数组 → []；空数组由 cliSearchTerms 回退到 command。
+        searchTerms: Array.isArray(o.searchTerms)
+          ? o.searchTerms.filter((term: unknown): term is string => typeof term === 'string')
+          : [],
         // 容错：缺失/非数组 → []，候选合并走 mergeModelCandidates。
         modelChoices: Array.isArray(o.modelChoices)
           ? o.modelChoices.filter((m: unknown): m is string => typeof m === 'string')
