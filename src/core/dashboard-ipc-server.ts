@@ -1596,6 +1596,8 @@ async function handleManagedOriginAttestation(
     claimedCapability: capability,
   });
   if (!verified.ok || !ds?.managedTurnOrigin || !liveTurnId || !workerLive) {
+    const reason = !ds ? 'no_session' : !workerLive ? 'worker_not_live' : !liveTurnId ? 'no_live_origin' : 'capability_mismatch';
+    if (typeof logOriginAuthRefusal === 'function') logOriginAuthRefusal(sessionId, 'managed_origin_attest', reason, ds);
     return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
   }
   const origin = ds.managedTurnOrigin;
@@ -1742,6 +1744,34 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
  *  is ever used as a key or printed; every request naming an unknown session
  *  shares one key, and the table drops its oldest entry rather than resetting
  *  the limit of every real session at once. */
+const ORIGIN_AUTH_REFUSAL_LOG_INTERVAL_MS = 60_000;
+const ORIGIN_AUTH_REFUSAL_LOG_KEYS_MAX = 1_000;
+const originAuthRefusalLoggedAt = new Map<string, number>();
+/** Bounded, rate-limited diagnostic logging for managed-origin / --as user 403
+ *  refusals. Never prints unknown caller-supplied sessionIds or capability
+ *  tokens, mirroring {@link logIdentityRouteRefusal}. */
+function logOriginAuthRefusal(
+  requestedSessionId: string,
+  route: string,
+  reason: string,
+  ds?: DaemonSession,
+): void {
+  const live = ds ?? findActiveBySessionId(requestedSessionId);
+  const liveSid = live?.session.sessionId;
+  const key = `${liveSid ?? ''}\0${route}\0${reason}`;
+  const now = Date.now();
+  if (now - (originAuthRefusalLoggedAt.get(key) ?? -Infinity) < ORIGIN_AUTH_REFUSAL_LOG_INTERVAL_MS) return;
+  originAuthRefusalLoggedAt.delete(key);
+  while (originAuthRefusalLoggedAt.size >= ORIGIN_AUTH_REFUSAL_LOG_KEYS_MAX) {
+    originAuthRefusalLoggedAt.delete(originAuthRefusalLoggedAt.keys().next().value!);
+  }
+  originAuthRefusalLoggedAt.set(key, now);
+  logger.warn(
+    `[origin-auth] refused ${route} for ${liveSid ? liveSid.slice(0, 8) : 'an unknown session'}: ${reason} `
+    + `(hasOrigin=${!!live?.managedTurnOrigin?.turnId} bgTasks=${live?.backgroundTaskCount ?? 0} screen=${live?.lastScreenStatus ?? '-'})`,
+  );
+}
+
 const IDENTITY_REFUSAL_LOG_INTERVAL_MS = 60_000;
 const IDENTITY_REFUSAL_LOG_KEYS_MAX = 1_000;
 const identityRefusalLoggedAt = new Map<string, number>();
@@ -3721,7 +3751,13 @@ function sessionCliIpcAuth(
     claimedTurnId: typeof body?.originTurnId === 'string' ? body.originTurnId : undefined,
     claimedDispatchAttempt: claimedAttempt,
   });
-  return decision.ok ? { ok: true } : { ok: false, error: decision.error };
+  if (!decision.ok) {
+    if (ds && typeof logOriginAuthRefusal === 'function') {
+      logOriginAuthRefusal(sessionId, 'session_cli_ipc', !ds.managedTurnOrigin?.turnId ? 'no_live_origin' : decision.error, ds);
+    }
+    return { ok: false, error: decision.error };
+  }
+  return { ok: true };
 }
 
 const activeProjectImportDeliveries = new Map<string, import('../services/project-import-notifications.js').ProjectImportSnapshot>();
@@ -4704,9 +4740,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     && scheduledToolActor !== undefined;
   const turnId = liveOrigin?.turnId ?? detachedForUser?.scheduledTurnId;
   if (!turnId) {
+    const peerUnverified = process.platform === 'linux' && !!ds?.managedTurnOrigin?.turnId && !execution;
+    if (typeof logOriginAuthRefusal === 'function') {
+      logOriginAuthRefusal(params.sessionId, 'lark_tool_user', peerUnverified ? 'peer_unverified' : 'no_live_origin', ds);
+    }
     return jsonRes(res, 403, {
       ok: false,
-      error: process.platform === 'linux' && ds?.managedTurnOrigin?.turnId && !execution
+      error: peerUnverified
         ? 'current_execution_unverified'
         : 'No current requesting user; --as user requires their authorization',
     });
@@ -4781,7 +4821,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   };
   const originSender = ownerFallback?.openId ?? turnPrincipal;
   const sender = delegated?.targetOpenId ?? originSender;
-  if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  if (!sender) {
+    if (typeof logOriginAuthRefusal === 'function') {
+      logOriginAuthRefusal(params.sessionId, 'lark_tool_user', 'no_sender', ds);
+    }
+    return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  }
   const cached = delegated ? undefined : getIdentity(bot.larkAppId, sender);
   const user = delegated ? { type: 'user' as const, openId: sender }
     : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
