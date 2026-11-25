@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 
 import { HcBackend } from './hc-backend.js';
 import { hcTerminalName, probeHcTerminal, type HcTarget } from './hc/cli-ops.js';
-import { hcCoreAddress, hcCorePaths, type HcCoreAddress } from './hc/core.js';
+import { hcCoreAbsent, hcCoreAddress, hcCorePaths, type HcCoreAddress } from './hc/core.js';
 import { HerdrBackend } from './herdr-backend.js';
 import { PtyBackend } from './pty-backend.js';
 import { MojoBackend } from './mojo-backend.js';
@@ -316,8 +316,8 @@ function recordedHcTarget(target: PersistentBackendTarget | undefined): HcTarget
  *     core, as {@link resolveManagedTmuxPlacement} does).
  *   - Otherwise the default core of this env: a new terminal goes there, and a
  *     live one there (a target whose report to the daemon was lost) is
- *     reattached. A recorded core whose runtime dir is gone counts as missing:
- *     its sockets lived there.
+ *     reattached. If the recorded socket path is unusable, migration requires
+ *     both the socket and its holders to be absent.
  */
 export function resolveHcBackendGate(deps: {
   sessionId: string;
@@ -325,7 +325,7 @@ export function resolveHcBackendGate(deps: {
   availability: () => { ok: true } | { ok: false; reason: string };
   /** Throws a readable reason when this env names no usable core. */
   defaultCore: () => HcCoreAddress;
-  /** Readable reason nothing can listen at this core (its runtime dir is gone), else null. */
+  /** Why the core cannot listen at its socket path, or null if the path is usable. */
   coreUnreachable: (core: HcCoreAddress) => string | null;
   probe: (target: HcTarget) => SessionProbe;
 }): HcGateResolution {
@@ -344,7 +344,9 @@ export function resolveHcBackendGate(deps: {
   if (!availability.ok) return refuse(availability.reason);
   const recorded = recordedHcTarget(deps.recorded);
   if (recorded) {
-    const probe = deps.coreUnreachable(recorded) ? 'missing' : deps.probe(recorded);
+    const unreachable = deps.coreUnreachable(recorded);
+    if (unreachable && !hcCoreAbsent(recorded.socket)) return refuse(unreachable);
+    const probe = unreachable ? 'missing' : deps.probe(recorded);
     if (probe !== 'missing') return frozen(recorded, probe);
   }
   let core: HcCoreAddress;
@@ -415,7 +417,7 @@ export function backendGateUserMessage(backend: BackendType, reason: string): st
       : backend === 'zmx'
         ? '需要 zmx >= 0.7.0（send 不再抢占 client leadership）｜macOS: brew install neurosnap/tap/zmx ｜ Linux: 装官方 release binary ｜ mise: mise use -g github:neurosnap/zmx@latest'
       : backend === 'hc'
-        ? `需要 herdr-core >= ${HC_MIN_VERSION.join('.')}，仅支持 Linux ｜ 放到 botmux 数据目录的 bin/herdr-core，或用 BOTMUX_HC_BIN 指定绝对路径，或让 herdr-core / hc 出现在 PATH 上 ｜ botmux 不会自动安装或升级 hc ｜ 也可把该 bot 的 backendType 改回 tmux`
+        ? `需要 herdr-core >= ${HC_MIN_VERSION.join('.')}，支持 Linux 和 macOS ｜ 放到 botmux 数据目录的 bin/herdr-core，或用 BOTMUX_HC_BIN 指定绝对路径，或让 herdr-core / hc 出现在 PATH 上 ｜ botmux 不会自动安装或升级 hc ｜ 也可把该 bot 的 backendType 改回 tmux`
       : `请确认 ${backend} 已正确安装并可用`;
   return [
     `⚠️ 本机 ${backend} 不可用，无法启动会话。`,
@@ -529,6 +531,7 @@ export function selectSessionBackend(opts: {
   backendType: BackendType;
   backendConfig?: RiffBackendConfig | EffectiveMojoConfig | RemoteRunnerConfig | HerdrBackendConfig;
   herdrConfig?: HerdrBackendConfig;
+  hcHerdrTabTitle?: string;
   remoteBackendState?: RemoteRunnerBackendState;
   /** Canonical local ownership boundary used to keep machine-wide Herdr agent
    * names distinct across independent Botmux data roots/checkouts. */
@@ -814,7 +817,11 @@ export function selectSessionBackend(opts: {
     };
     const reattach = opts.hasExistingSession ?? probeHcTerminal(target) === 'exists';
     return {
-      backend: new HcBackend(target, { sessionId: opts.sessionId, isReattach: reattach }),
+      backend: new HcBackend(target, {
+        sessionId: opts.sessionId,
+        isReattach: reattach,
+        herdrTabTitle: opts.hcHerdrTabTitle,
+      }),
       isTmuxMode: false,
       // Observed through its own attach stream and driven by AUTOMATIC_INPUT
       // frames: the shared relay, never per-client `tmux attach`.

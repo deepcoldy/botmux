@@ -102,7 +102,7 @@ describe('probeHcFunctional', () => {
     // Unix socket paths are capped at 107 bytes; keep them out of a long TMPDIR.
     const root = mkdtempSync('/tmp/bmhcv-');
     try {
-      const bin = join(root, 'herdr-core');
+      const bin = join(root, 'fake-hc');
       writeFileSync(bin, '#!/bin/sh\necho "hc 0.1.19"\n', { mode: 0o755 });
       resetHcAvailabilityCache();
       const env = { ...process.env, BOTMUX_HC_BIN: bin, XDG_RUNTIME_DIR: join(root, 'absent') };

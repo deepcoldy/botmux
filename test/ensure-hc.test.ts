@@ -133,10 +133,16 @@ describe('discoverHcBinary', () => {
     expect(result).toMatchObject({ ok: true, bin: strict });
   });
 
-  it('is unavailable off Linux even with a usable binary', () => {
+  it('discovers a usable binary on macOS', () => {
+    const bin = fakeBinary(pathA, 'herdr-core', `hc ${floor}`);
+
+    expect(discoverHcBinary({ env: env(), platform: 'darwin' })).toMatchObject({ ok: true, bin });
+  });
+
+  it('is unavailable on Windows even with a usable binary', () => {
     fakeBinary(pathA, 'herdr-core', `hc ${floor}`);
 
-    const result = discoverHcBinary({ env: env(), platform: 'darwin' });
+    const result = discoverHcBinary({ env: env(), platform: 'win32' });
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).not.toBe('');
