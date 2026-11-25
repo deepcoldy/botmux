@@ -49,6 +49,39 @@ readline.createInterface({input:process.stdin,crlfDelay:Infinity}).on('line',lin
     expect(states).not.toContain('late-uncommitted');
   });
 
+  it('sends bounded continuation to the real provider and recovers after rejecting invalid host context', async () => {
+    const provider = join(harness.root(), 'continuation-provider.mjs');
+    writeFileSync(provider, `import readline from 'node:readline';
+const emit=e=>process.stdout.write(JSON.stringify({protocol:'botmux.remote-runner',version:1,...e})+'\\n');
+const state={version:1,provider:'continuation',generation:1};
+readline.createInterface({input:process.stdin,crlfDelay:Infinity}).on('line',line=>{
+ const c=JSON.parse(line);
+ if(c.type==='hello')emit({type:'hello',requestId:c.requestId,provider:'continuation',capabilities:['start','resume','turn','cancel','detach','reattach','status']});
+ if(c.type==='start')emit({type:'ready',requestId:c.requestId,state});
+ if(c.type==='turn'){
+  emit({type:'status',requestId:c.requestId,status:'busy',state});
+  emit({type:'final',turnId:c.turnId,content:JSON.stringify(c.trustedCaller),state});
+ }
+});`);
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'continuation' }, 'wire-continuation');
+    await harness.spawn(backend, provider);
+    const taskContinuation = {
+      appId: 'cli_app', openId: 'ou_source', unionId: 'on_source',
+      sourceSessionId: 'source-session', sourceTurnId: 'om_source',
+    };
+    const caller = { requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'cli_app', senderType: 'bot' as const };
+    expect(await backend.submitTurn({
+      turnId: 'invalid', content: 'must not dispatch',
+      trustedCaller: { ...caller, taskContinuation: { ...taskContinuation, appId: 'cli_wrong' } },
+    })).toMatchObject({ submitted: false, submissionDisposition: 'untouched' });
+    const final = new Promise<string>(done => backend.onTurnFinal(done));
+    expect(await backend.submitTurn({
+      turnId: 'valid', content: 'source task result',
+      trustedCaller: { ...caller, taskContinuation: { ...taskContinuation, ...{ verifiedEmail: 'private@example.test' } } },
+    })).toEqual({ submitted: true });
+    expect(JSON.parse(await final)).toEqual({ ...caller, taskContinuation });
+  });
+
   it('preserves command bytes through queue restore, LinkRefs registration and the actual provider', async () => {
     registerBot({ larkAppId: 'cli_command_contract', larkAppSecret: 's', cliId: 'remote-runner',
       backendType: 'remote-runner', linkRefs: { mode: 'enabled' } });

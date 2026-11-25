@@ -658,6 +658,15 @@ export class PluginMcpGateway {
       // two fields above: a plugin that maps the caller onto real access needs
       // it, an unrelated HTTP-transport server does not.
       ...(caller?.senderType ? { senderType: caller.senderType } : {}),
+      // Project the public continuation fields even for persisted callers from
+      // older workers; verified email belongs only to protected grants.
+      ...(caller?.taskContinuation ? { taskContinuation: {
+        appId: caller.taskContinuation.appId,
+        openId: caller.taskContinuation.openId,
+        ...(caller.taskContinuation.unionId ? { unionId: caller.taskContinuation.unionId } : {}),
+        sourceSessionId: caller.taskContinuation.sourceSessionId,
+        sourceTurnId: caller.taskContinuation.sourceTurnId,
+      } } : {}),
       ...(identity?.turnId ? { turnId: identity.turnId } : {}),
       ...(this.env.BOTMUX_SESSION_ID ? { sessionId: this.env.BOTMUX_SESSION_ID } : {}),
       ...(identity?.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
@@ -713,7 +722,13 @@ export class PluginMcpGateway {
     identity: GatewayTrustedTurnIdentity | undefined,
     connection: GatewayConnection,
   ): T {
-    const trusted = this.trustedTurnMeta(identity);
+    // Host-attested caller metadata is local-only. In particular,
+    // taskContinuation carries the source human and exact source turn; putting
+    // it in a streamable-http JSON-RPC _meta would disclose that authority to an
+    // unrelated remote server even though the trusted HTTP headers are clean.
+    const trusted = connection.server.transport === 'stdio'
+      ? this.trustedTurnMeta(identity)
+      : undefined;
     const grant = this.protectedTurnGrant(connection, identity);
     const cleanedMeta = Object.fromEntries(
       Object.entries(params._meta ?? {})
