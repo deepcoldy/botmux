@@ -11,6 +11,7 @@ import {
   assertWebhookRoutesAvoidReservedEndpoints,
   collectReservedPluginCallbackEndpoints,
   detectPluginProxyRawTargetKind,
+  isLegacyPluginConnectorWebhookTarget,
   matchPluginWebhookRoute,
   parsePluginWebhooksContribution,
   parseRawPluginServiceProxyRequest,
@@ -382,5 +383,35 @@ describe('plugin webhooks contribution scanning, matching, and raw URL protocol 
     expect(validateRawHttpFraming(['Transfer-Encoding', 'gzip, chunked'])).toEqual({
       ok: false, status: 501, error: 'unsupported_transfer_encoding',
     });
+  });
+
+  it('classifies only the 1–2 segment reserved-id connector shape as legacy connector fall-through', () => {
+    const legacyTrue: Array<[string, string]> = [
+      ['/webhook/plugin', 'bare connector id'],
+      ['/webhook/plugin?token=abc', 'connector id with query token'],
+      ['/webhook/plugin/legacy-secret', 'token baked into path'],
+      ['/webhook/%70lugin/legacy-secret', 'percent-encoded lowercase p'],
+    ];
+    for (const [rawUrl, label] of legacyTrue) {
+      expect(isLegacyPluginConnectorWebhookTarget(rawUrl), label).toBe(true);
+    }
+    const legacyFalse: Array<[string, string]> = [
+      ['/webhook/plugin/', 'trailing slash never matched legacy segment regex'],
+      ['/webhook/plugin/demo/events', 'plugin route requires 3+ segments'],
+      ['/webhook/plugin/ghost/x', 'unknown plugin still has plugin shape, no fall-through'],
+      ['/webhook/other/token', 'different connector id'],
+      ['/webhook/PLUGIN/token', 'case-sensitive reserved id'],
+      ['/webhook/%50lugin/token', 'encoded capital P decodes to Plugin, not plugin'],
+      ['/webhook/plugin/a/b', 'three segments is plugin shape'],
+      ['//evil.example/webhook/plugin/token', 'protocol-relative target rejected'],
+      ['/webhook/plugin/a/../b', 'traversal-bearing 4+ segment path'],
+      ['/webhook', 'unrelated webhook prefix'],
+      ['/webhook/plugin?x=1#frag', 'fragment-bearing target rejected at origin-form parse'],
+      ['not a url', 'garbage input'],
+      [undefined as unknown as string, 'undefined input'],
+    ];
+    for (const [rawUrl, label] of legacyFalse) {
+      expect(isLegacyPluginConnectorWebhookTarget(rawUrl), label).toBe(false);
+    }
   });
 });

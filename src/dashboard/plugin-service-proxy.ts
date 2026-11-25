@@ -15,7 +15,6 @@ import {
   validateStrictPluginHttpPath,
 } from '../core/plugins/webhooks/protocol.js';
 import {
-  resolveRunningPluginServiceTarget,
   samePluginLoopbackTarget,
   type PluginLoopbackTargetResult,
 } from '../core/plugins/webhooks/service-target.js';
@@ -298,7 +297,8 @@ export interface PluginServiceProxyContext {
 export interface PluginServiceProxyDeps {
   csrfTokens: ControlCsrfTokens;
   getInstalledPlugin?: (pluginId: string) => InstalledPluginRecord | undefined;
-  resolveTarget?: (pluginId: string) => PluginLoopbackTargetResult;
+  /** Required: production wiring injects the forbidden-port-aware resolver. */
+  resolveTarget: (pluginId: string) => PluginLoopbackTargetResult;
   isAuthSessionLive?: (authSessionId: string) => boolean;
   bindStream?: (authSessionId: string, pluginId: string, close: () => void) => (() => void) | false;
   headerTimeoutMs?: number;
@@ -332,7 +332,7 @@ export function createPluginServiceProxyHandler(
     const { plugins } = readPluginRegistry();
     return Object.hasOwn(plugins, id) ? plugins[id] : undefined;
   });
-  const resolveTarget = deps.resolveTarget ?? ((id: string) => resolveRunningPluginServiceTarget(id));
+  const resolveTarget = deps.resolveTarget;
   const headerTimeoutMs = deps.headerTimeoutMs ?? DEFAULT_HEADER_TIMEOUT_MS;
   const uploadIdleTimeoutMs = deps.uploadIdleTimeoutMs ?? DEFAULT_UPLOAD_IDLE_TIMEOUT_MS;
   const uploadTotalTimeoutMs = deps.uploadTotalTimeoutMs ?? DEFAULT_UPLOAD_TOTAL_TIMEOUT_MS;

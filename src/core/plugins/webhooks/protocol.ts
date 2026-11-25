@@ -434,6 +434,34 @@ export type ParsedServiceProxyRequest =
   | { ok: false; status: 400 | 404; error: string };
 
 /**
+ * Legacy connector webhooks (`src/dashboard/webhook-routes.ts`) match at most
+ * `/webhook/<connectorId>` or `/webhook/<connectorId>/<token>` — one or two
+ * path segments — while a plugin webhook always requires three
+ * (`/webhook/plugin/<pluginId>/<subpath>`). A persisted connector whose id is
+ * the now-reserved literal `plugin` therefore owns the 1–2 segment shape: the
+ * plugin gateway must let such requests fall through instead of answering
+ * 404/400, or the connector's existing webhook URLs stop delivering on upgrade.
+ * The legacy router re-runs its own token/HMAC verification, so falling through
+ * never bypasses authentication.
+ */
+export function isLegacyPluginConnectorWebhookTarget(rawUrl: string | undefined): boolean {
+  const target = parseRawOriginFormTarget(rawUrl);
+  if (!target) return false;
+  const segments = target.rawPath.split('/');
+  // ['', 'webhook', '<connectorId>'] or ['', 'webhook', '<connectorId>', '<token>']
+  if (segments[1] !== 'webhook' || segments.length < 3 || segments.length > 4) return false;
+  // A trailing slash (`/webhook/plugin/`) never matched the legacy segment regex.
+  if (segments.length === 4 && segments[3] === '') return false;
+  let connectorId: string;
+  try {
+    connectorId = decodeURIComponent(segments[2]);
+  } catch {
+    return false;
+  }
+  return connectorId === 'plugin';
+}
+
+/**
  * Parse and strictly validate a raw request URL targeting `/api/plugins/:id/service/*`.
  */
 export function parseRawPluginServiceProxyRequest(rawUrl: string | undefined): ParsedServiceProxyRequest {

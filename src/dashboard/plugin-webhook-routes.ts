@@ -2,13 +2,13 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { requestLiteralLoopback } from '../core/loopback-target.js';
 import { readPluginRegistry } from '../services/plugin-registry-store.js';
 import type { InstalledPluginRecord } from '../core/plugins/types.js';
-import { readPluginWebhookToken } from '../core/plugins/card-actions/auth.js';
 import {
   collectConnectionNominatedHeaders,
   collectReservedPluginCallbackEndpoints,
   detectPluginProxyRawTargetKind,
   groupRawHeaders,
   HOP_BY_HOP_HEADERS,
+  isLegacyPluginConnectorWebhookTarget,
   matchPluginWebhookRoute,
   parsePluginWebhooksContribution,
   parseRawPluginServiceProxyRequest,
@@ -21,10 +21,7 @@ import {
   upstreamPathMatchesReservedEndpoint,
   validateRawHttpFraming,
 } from '../core/plugins/webhooks/protocol.js';
-import {
-  resolveRunningPluginServiceTarget,
-  type PluginLoopbackTargetResult,
-} from '../core/plugins/webhooks/service-target.js';
+import type { PluginLoopbackTargetResult } from '../core/plugins/webhooks/service-target.js';
 import { dashboardH5ClientIp } from './h5-auth.js';
 
 const DEFAULT_RATE_WINDOW_MS = 60_000;
@@ -218,6 +215,9 @@ export function earlyGuardPluginProxyRequest(req: IncomingMessage, res: ServerRe
   const kind = detectPluginProxyRawTargetKind(req.url);
   if (!kind) return false;
   if (kind === 'webhook') {
+    // A persisted connector using the reserved id `plugin` owns the 1–2 segment
+    // shape; leave it to the legacy connector router (which re-verifies its token).
+    if (isLegacyPluginConnectorWebhookTarget(req.url)) return false;
     const parsed = parseRawPluginWebhookRequest(req.url);
     if (!parsed.ok && parsed.status === 400) {
       return sendWebhookJson(req, res, 400, { ok: false, error: parsed.error }, { closeConnection: true });
@@ -427,7 +427,8 @@ function sanitizeWebhookResponseHeaders(
 
 export interface PluginWebhookRouteDeps {
   getInstalledPlugin?: (pluginId: string) => InstalledPluginRecord | undefined;
-  resolveTarget?: (pluginId: string) => PluginLoopbackTargetResult;
+  /** Required: production wiring injects the forbidden-port-aware resolver. */
+  resolveTarget: (pluginId: string) => PluginLoopbackTargetResult;
   trustedProxyHops?: number;
   rateLimiter?: PluginWebhookRateLimiter;
   timeoutMs?: number;
@@ -453,15 +454,13 @@ export interface PluginWebhookRouteHandler {
  * Dashboard auth gate in `src/dashboard.ts`.
  */
 export function createPluginWebhookRouteHandler(
-  deps: PluginWebhookRouteDeps = {},
+  deps: PluginWebhookRouteDeps,
 ): PluginWebhookRouteHandler {
   const getInstalledPlugin = deps.getInstalledPlugin ?? ((id: string) => {
     const { plugins } = readPluginRegistry();
     return Object.hasOwn(plugins, id) ? plugins[id] : undefined;
   });
-  const resolveTarget = deps.resolveTarget ?? ((id: string) => resolveRunningPluginServiceTarget(id, {
-    readToken: readPluginWebhookToken,
-  }));
+  const resolveTarget = deps.resolveTarget;
   const trustedProxyHops = deps.trustedProxyHops ?? 0;
   const rateLimiter = deps.rateLimiter ?? new PluginWebhookRateLimiter();
   const timeoutMs = deps.timeoutMs ?? PLUGIN_WEBHOOK_TIMEOUT_MS;
@@ -669,6 +668,13 @@ export function createPluginWebhookRouteHandler(
     if (rawKind !== 'webhook' && !normalizedMatch) return false;
 
     try {
+      // Legacy connector with reserved id `plugin` (1–2 segments, incl. GET
+      // async polling and percent-encoded connector ids): fall through before
+      // any plugin-shape rejection so the existing connector URL keeps
+      // delivering after upgrade. The legacy router re-verifies its token.
+      if (isLegacyPluginConnectorWebhookTarget(req.url)) {
+        return false;
+      }
       const parsed = parseRawPluginWebhookRequest(req.url);
       if (!parsed.ok && parsed.status === 400) {
         return sendWebhookJson(req, res, 400, { ok: false, error: parsed.error }, { closeConnection: true });

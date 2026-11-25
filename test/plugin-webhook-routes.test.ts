@@ -118,6 +118,8 @@ describe('plugin webhook route gateway (POST /webhook/plugin/:pluginId/*)', () =
     plugins: Record<string, InstalledPluginRecord>;
     resolveTarget?: (id: string) => PluginLoopbackTargetResult;
     upstreamHandler?: (req: IncomingMessage, rawBody: Buffer, res: ServerResponse) => void;
+    /** Simulates the legacy connector router mounted immediately after the plugin gateway. */
+    legacyRoute?: (req: IncomingMessage, res: ServerResponse, url: URL) => boolean;
     rateLimiter?: PluginWebhookRateLimiter;
     trustedProxyHops?: number;
     timeoutMs?: number;
@@ -189,6 +191,7 @@ describe('plugin webhook route gateway (POST /webhook/plugin/:pluginId/*)', () =
         return;
       }
       if (await handler.handle(req, res, url)) return;
+      if (opts.legacyRoute?.(req, res, url)) return;
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'fell_through' }));
     });
@@ -389,13 +392,19 @@ describe('plugin webhook route gateway (POST /webhook/plugin/:pluginId/*)', () =
       ['/webhook/plugin/demo/hooks-admin', 'webhook_route_not_found'],
       ['/webhook/plugin/demo/events/sub', 'webhook_route_not_found'],
       ['/webhook/plugin/demo/events/', 'webhook_route_not_found'],
-      ['/webhook/plugin/demo', 'webhook_route_not_found'],
       ['/webhook/plugin/demo/', 'webhook_route_not_found'],
-      ['/webhook/plugin', 'webhook_route_not_found'],
     ] as const) {
       const res = await sendHttp(frontPort, { method: 'POST', path, body: '{}' });
       expect(res.status).toBe(404);
       expect(JSON.parse(res.body.toString('utf8'))).toEqual({ ok: false, error: expectedError });
+    }
+    // The 1–2 segment shape is reserved for a legacy `plugin` connector: the
+    // plugin gateway declines to answer and falls through (the fixture has no
+    // legacy router, so the front returns its generic fell_through 404).
+    for (const path of ['/webhook/plugin', '/webhook/plugin/demo']) {
+      const res = await sendHttp(frontPort, { method: 'POST', path, body: '{}' });
+      expect(res.status).toBe(404);
+      expect(JSON.parse(res.body.toString('utf8'))).toEqual({ ok: false, error: 'fell_through' });
     }
     expect(recorded).toHaveLength(0);
   });
@@ -581,6 +590,51 @@ describe('plugin webhook route gateway (POST /webhook/plugin/:pluginId/*)', () =
       expect(rawRes).toMatch(/^HTTP\/1\.1 400 /);
     }
     expect(recorded).toHaveLength(0);
+  });
+
+  it('falls through 1–2 segment /webhook/plugin* URLs so a reserved-id legacy connector keeps delivering', async () => {
+    const legacyReached: string[] = [];
+    const { frontPort } = await startFixture({
+      plugins: {
+        demo: makePluginRecord('demo', { schemaVersion: 1, routes: [{ path: '/events' }] }),
+      },
+      legacyRoute: (req, res, url) => {
+        // Exact production connector regex from src/dashboard/webhook-routes.ts
+        const m = url.pathname.match(/^\/webhook\/([^/]+)(?:\/([^/]+))?$/);
+        if (m && decodeURIComponent(m[1]) === 'plugin') {
+          legacyReached.push(`${req.method} ${req.url}`);
+          res.writeHead(202, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ routed: 'legacy-connector' }));
+          return true;
+        }
+        return false;
+      },
+    });
+
+    const legacyCases: Array<[string, string]> = [
+      ['POST', '/webhook/plugin/legacy-secret'],
+      ['POST', '/webhook/plugin?token=legacy-secret'],
+      ['GET', '/webhook/plugin?token=legacy-secret'],
+      ['POST', '/webhook/%70lugin/legacy-secret'],
+    ];
+    for (const [method, path] of legacyCases) {
+      const res = await sendHttp(frontPort, { method, path, ...(method === 'GET' ? {} : { body: '' }) });
+      expect(res.status, `${method} ${path}`).toBe(202);
+      expect(JSON.parse(res.body.toString()).routed).toBe('legacy-connector');
+    }
+    expect(legacyReached).toHaveLength(4);
+
+    // Three-segment plugin shape stays owned by the gateway: unknown plugin is
+    // answered by the plugin handler, never leaked to the connector router.
+    const ghost = await sendHttp(frontPort, { method: 'POST', path: '/webhook/plugin/ghost/x', body: '' });
+    expect(ghost.status).toBe(404);
+    expect(JSON.parse(ghost.body.toString()).error).toBe('plugin_not_found');
+    expect(legacyReached).toHaveLength(4);
+
+    // Declared plugin routes still forward to the plugin upstream.
+    const ok = await sendHttp(frontPort, { method: 'POST', path: '/webhook/plugin/demo/events', body: '' });
+    expect(ok.status).toBe(202);
+    expect(legacyReached).toHaveLength(4);
   });
 
   it('partitions concurrency and in-flight buffer budgets across IPs and plugins and frees buffers after upstream write', async () => {
