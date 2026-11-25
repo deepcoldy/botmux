@@ -242,7 +242,7 @@ import { doubaoWorkspaceForSession } from '../services/doubao-transcript.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
-import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, cotMessageFinishStatus, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
+import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, hasCotMessageForTurn, cotMessageFinishStatus, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
 import { retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
@@ -12874,12 +12874,25 @@ export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_
 
 type CotTerminal = Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'turnId' | 'status' | 'dispatchAttempt' | 'backgroundTasks'>;
 
+function isSynthesizedBackgroundTurnId(turnId: string | undefined): boolean {
+  return typeof turnId === 'string' && (turnId.startsWith('local-headless-') || turnId.startsWith('scheduled-'));
+}
+
 /** Closing the turn's CoT message renders 「任务已完成」. A completed turn that
  *  ended with background tasks still running leaves it open; the message is
  *  closed when the session's background task count reaches 0, the worker is
  *  suspended, or a later terminal arrives. */
 function finalizeOrHoldCotMessage(ds: DaemonSession, msg: CotTerminal): void {
   if (isReplayOfHeldCotTerminal(ds, msg)) return;
+  // A synthesized local background-wake or scheduled turn never opens its own
+  // CoT bubble. While an earlier turn's CoT is still held for remaining
+  // background work (e.g. a sibling subagent finished while a bounded Monitor
+  // still runs), keep that existing hold open instead of finalizing it and
+  // replacing it with a bubble-less synthetic turn id.
+  if (ds.cotHeldForBackground && msg.status === 'completed' && msg.backgroundTasks
+    && isSynthesizedBackgroundTurnId(msg.turnId) && !hasCotMessageForTurn(ds, msg)) {
+    return;
+  }
   releaseHeldCotMessage(ds);
   // A replay of an already finalized turn must not create a fresh hold. In
   // particular, an interrupted CLI exit is terminal, not a new background wait.
@@ -15794,6 +15807,19 @@ export function sendKimiCacheExpiryAutoCompactSetting(ds: DaemonSession, enabled
   const worker = ds.worker;
   if (!worker || worker.killed) return false;
   const message: DaemonToWorker = { type: 'kimi_cache_expiry_auto_compact', enabled };
+  try {
+    return afterWorkerIpcBootstrap(worker, () => worker.send(message));
+  } catch {
+    return false;
+  }
+}
+
+/** Push a live foldBackgroundUpdates toggle through the worker IPC bootstrap
+ *  fence so it always arrives strictly AFTER the worker's initial `init`. */
+export function sendFoldBackgroundUpdatesSetting(ds: DaemonSession, enabled: boolean): boolean {
+  const worker = ds.worker;
+  if (!worker || worker.killed) return false;
+  const message: DaemonToWorker = { type: 'set_fold_background_updates', enabled };
   try {
     return afterWorkerIpcBootstrap(worker, () => worker.send(message));
   } catch {
@@ -20958,6 +20984,11 @@ function forkWorkerPrepared(
     // Opt-in replies to follow-ups the CLI folded into its running turn: read
     // at worker start; the daemon also checks the live value before posting.
     ...(botCfg.followUpReply === true ? { followUpReply: true as const } : {}),
+    // Opt-in (default off): fold intermediate waiting updates from bounded
+    // background Monitors into the thinking/progress fold instead of posting
+    // new chat messages. Adopt init intentionally omits it (adoptMode always
+    // delivers local turns).
+    ...(botCfg.foldBackgroundUpdates === true ? { foldBackgroundUpdates: true as const } : {}),
     // Per-session 缓存过期自动压缩 (core/kimi-cache-expiry.ts); later toggles
     // reach the live worker as `kimi_cache_expiry_auto_compact`.
     ...(isKimiCacheExpiryAutoCompactEnabled(ds.session) ? { kimiCacheExpiryAutoCompact: true as const } : {}),
@@ -24704,9 +24735,12 @@ function setupWorkerHandlers(
           : undefined;
         // Only the worker's raw working/idle frame uses omission as the same
         // tracker's explicit zero. A stalled/limited frame (including sticky
-        // usage-limit projection) cannot turn a positive count into zero.
+        // usage-limit projection) cannot turn a positive count into zero, and
+        // `cotHoldForBackground` holds the launching turn's CoT bubble across
+        // suppressed non-terminal Monitor micro-turns.
         if ((msg.status === 'working' || msg.status === 'idle')
-          && !(typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0)) {
+          && !(typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0)
+          && msg.cotHoldForBackground !== true) {
           releaseHeldCotMessage(ds);
         }
         // Non-turn-terminal PTY CLIs (e.g. Antigravity terminal mode, Kimi,

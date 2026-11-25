@@ -2323,12 +2323,18 @@ export async function cmdSetupScripted(
     });
     let bot = draft;
     try {
-      if (cmd.flags.cliRuntime?.trim()) {
+      if (cmd.flags.cliRuntime?.trim() || cmd.flags.foldBackgroundUpdates !== undefined) {
         // Shared editor semantics: validate the runtime against cliId/wrapper
-        // and persist its executable as the exact downgrade path shadow.
+        // and persist its executable as the exact downgrade path shadow, plus
+        // any opt-in boolean flags supported on local bots.
         bot = applyBotConfigEdits(draft, {
-          cliRuntime: parseCliRuntimeFlag(cmd.flags.cliRuntime),
-          cliPathOverride: cmd.flags.cliPath,
+          ...(cmd.flags.cliRuntime?.trim()
+            ? {
+              cliRuntime: parseCliRuntimeFlag(cmd.flags.cliRuntime),
+              cliPathOverride: cmd.flags.cliPath,
+            }
+            : {}),
+          foldBackgroundUpdates: cmd.flags.foldBackgroundUpdates,
         });
       }
       validateCliLaunchModeConfig({

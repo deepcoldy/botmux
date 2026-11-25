@@ -2461,6 +2461,15 @@ export interface BotConfig {
    */
   followUpReply?: boolean;
   /**
+   * Opt-in (default off): when the AI watches a long-running background task
+   * (CI, builds, logs), keep intermediate waiting updates inside the
+   * thinking/progress fold instead of posting new chat messages; the initial
+   * reply, user-actionable questions, and the final report when the task
+   * finishes/fails/times out are still sent normally. Persisted only when
+   * true; pushed live to running workers via `set_fold_background_updates`.
+   */
+  foldBackgroundUpdates?: boolean;
+  /**
    * When true, `/card` sends a **private** static snapshot card via the ephemeral
    * API, visible only to the bot's `allowedUsers` (owner / co-owners), instead of
    * the group-visible live streaming card. Talk-only grants (globalGrants /
@@ -4839,6 +4848,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       goalStatusCard: entry.goalStatusCard === true || undefined,
       followUpReply: entry.followUpReply === true || undefined,
+      foldBackgroundUpdates: entry.foldBackgroundUpdates === true || undefined,
       privateCard: entry.privateCard === true || undefined,
       replyCardActions: entry.replyCardActions === true || undefined,
       replyCardNextStep: entry.replyCardNextStep === true || undefined,

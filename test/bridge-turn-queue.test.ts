@@ -3350,3 +3350,797 @@ describe('Claude background-task wake turns', () => {
     expect(later?.isBackgroundWake).toBeFalsy();
   });
 });
+
+describe('BridgeTurnQueue non-terminal Monitor mid-stream wake tagging & leading CoT observer', () => {
+  function ts(baseMs: number, offsetMs: number): string {
+    return new Date(baseMs + offsetMs).toISOString();
+  }
+
+  function monitorAck(
+    uuid: string,
+    atMs: number,
+    taskId: string,
+    opts: { persistent: boolean; timeoutMs?: number } = { persistent: false, timeoutMs: 1_800_000 },
+  ): TranscriptEvent {
+    return {
+      type: 'user',
+      uuid,
+      timestamp: new Date(atMs).toISOString(),
+      isSidechain: false,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tu-${taskId}`, content: 'Monitor started' }] },
+      toolUseResult: { taskId, timeoutMs: opts.timeoutMs ?? 1_800_000, persistent: opts.persistent },
+    } as TranscriptEvent;
+  }
+
+  function bgAck(
+    uuid: string,
+    atMs: number,
+    result: Record<string, unknown>,
+  ): TranscriptEvent {
+    return {
+      type: 'user',
+      uuid,
+      timestamp: new Date(atMs).toISOString(),
+      isSidechain: false,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tu-${uuid}`, content: 'started' }] },
+      toolUseResult: result,
+    } as TranscriptEvent;
+  }
+
+  function noticeEv(
+    uuid: string,
+    atMs: number,
+    content: string,
+    extra: Record<string, unknown> = {},
+  ): TranscriptEvent {
+    return {
+      type: 'user',
+      uuid,
+      timestamp: new Date(atMs).toISOString(),
+      isSidechain: false,
+      promptSource: 'system',
+      turnOrigin: 'task_notification',
+      message: { role: 'user', content },
+      ...extra,
+    } as TranscriptEvent;
+  }
+
+  function attachedNoticeEv(uuid: string, atMs: number, content: string): TranscriptEvent {
+    return {
+      type: 'attachment',
+      uuid,
+      timestamp: new Date(atMs).toISOString(),
+      isSidechain: false,
+      attachment: { type: 'queued_command', commandMode: 'task-notification', prompt: content },
+    } as unknown as TranscriptEvent;
+  }
+
+  function textEv(uuid: string, atMs: number, text: string, stopReason = 'end_turn'): TranscriptEvent {
+    return {
+      type: 'assistant',
+      uuid,
+      timestamp: new Date(atMs).toISOString(),
+      isSidechain: false,
+      message: { role: 'assistant', stop_reason: stopReason, content: [{ type: 'text', text }] },
+    } as TranscriptEvent;
+  }
+
+  function durationEv(uuid: string, atMs: number): TranscriptEvent {
+    return {
+      type: 'system',
+      subtype: 'turn_duration',
+      uuid,
+      timestamp: new Date(atMs).toISOString(),
+    } as TranscriptEvent;
+  }
+
+  function larkUserEv(uuid: string, atMs: number, text: string): TranscriptEvent {
+    return {
+      type: 'user',
+      uuid,
+      timestamp: new Date(atMs).toISOString(),
+      isSidechain: false,
+      promptSource: 'user',
+      message: { role: 'user', content: text },
+    } as TranscriptEvent;
+  }
+
+  it('marks Lark-launched bounded Monitor mid-stream wake with wakeNonTerminalMonitor and preserves dispatchAttempt', () => {
+    const base = Date.now() + 1_000;
+    const q = new BridgeTurnQueue();
+    q.mark('om_main', '盯一下构建', base, '盯一下构建', 3);
+    q.ingest([
+      larkUserEv('u1', base + 100, '盯一下构建'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false, timeoutMs: 1_800_000 }),
+      textEv('a1', base + 300, '已开始后台盯构建'),
+      durationEv('d1', base + 400),
+      noticeEv('n1', base + 10_000, '<task-notification>\n<task-id>m1</task-id>\n<result>step 2 running</result>\n</task-notification>'),
+      textEv('a2', base + 10_500, '继续等待…'),
+      durationEv('d2', base + 10_600),
+    ]);
+    const ready = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(ready.map(t => t.turnId)).toEqual(['om_main', 'local-headless-a2']);
+    expect(ready[0].wakeNonTerminalMonitor).toBeUndefined();
+    expect(ready[1]).toMatchObject({
+      turnId: 'local-headless-a2',
+      isLocal: true,
+      isBackgroundWake: true,
+      replyAnchorTurnId: 'om_main',
+      replyAnchorDispatchAttempt: 3,
+      wakeNonTerminalMonitor: true,
+    });
+  });
+
+  it('fails open (never sets wakeNonTerminalMonitor) on terminal statuses, Monitor expiry, expiresAtMs boundary, persistent:true, non-Monitor, unknown taskId, spoofed promptSource, and id-less notifications', () => {
+    const base = Date.now() + 1_000;
+    const cases: Array<{ name: string; build: () => TranscriptEvent[] }> = [
+      ...(['completed', 'failed', 'killed', 'stopped', 'cancelled', 'error'] as const).map(status => ({
+        name: `terminal status=${status}`,
+        build: () => [
+          monitorAck('ack', base + 200, 'm1', { persistent: false, timeoutMs: 1_800_000 }),
+          textEv('a1', base + 300, 'watching'),
+          durationEv('d1', base + 400),
+          noticeEv('n1', base + 5_000, `<task-notification>\n<task-id>m1</task-id>\n<status>${status}</status>\n</task-notification>`),
+        ],
+      })),
+      {
+        name: 'Monitor 30m [Monitor expired...] notification without <status>',
+        build: () => [
+          monitorAck('ack', base + 200, 'm1', { persistent: false, timeoutMs: 1_800_000 }),
+          textEv('a1', base + 300, 'watching'),
+          durationEv('d1', base + 400),
+          noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>[Monitor expired after 30m]</result>\n</task-notification>'),
+        ],
+      },
+      {
+        name: 'atMs === expiresAtMs exact boundary',
+        build: () => [
+          monitorAck('ack', base + 200, 'm1', { persistent: false, timeoutMs: 60_000 }),
+          textEv('a1', base + 300, 'watching'),
+          durationEv('d1', base + 400),
+          noticeEv('n1', base + 200 + 60_000, '<task-notification>\n<task-id>m1</task-id>\n<result>late line</result>\n</task-notification>'),
+        ],
+      },
+      {
+        name: 'atMs > expiresAtMs past deadline',
+        build: () => [
+          monitorAck('ack', base + 200, 'm1', { persistent: false, timeoutMs: 60_000 }),
+          textEv('a1', base + 300, 'watching'),
+          durationEv('d1', base + 400),
+          noticeEv('n1', base + 200 + 60_001, '<task-notification>\n<task-id>m1</task-id>\n<result>late line</result>\n</task-notification>'),
+        ],
+      },
+      {
+        name: 'persistent: true alert Monitor',
+        build: () => [
+          monitorAck('ack', base + 200, 'm-alert', { persistent: true, timeoutMs: 0 }),
+          textEv('a1', base + 300, 'watching alerts'),
+          durationEv('d1', base + 400),
+          noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>m-alert</task-id>\n<result>ALERT: error spike</result>\n</task-notification>'),
+        ],
+      },
+      {
+        name: 'status-less subagent notification',
+        build: () => [
+          bgAck('ack', base + 200, { isAsync: true, status: 'async_launched', agentId: 'ag-1' }),
+          textEv('a1', base + 300, 'dispatched'),
+          durationEv('d1', base + 400),
+          noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>ag-1</task-id>\n<summary>subagent update</summary>\n</task-notification>'),
+        ],
+      },
+      {
+        name: 'status-less background shell notification',
+        build: () => [
+          bgAck('ack', base + 200, { backgroundTaskId: 'sh-1' }),
+          textEv('a1', base + 300, 'dispatched'),
+          durationEv('d1', base + 400),
+          noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>sh-1</task-id>\n<summary>shell update</summary>\n</task-notification>'),
+        ],
+      },
+      {
+        name: 'unknown taskId',
+        build: () => [
+          textEv('a1', base + 300, 'ok'),
+          durationEv('d1', base + 400),
+          noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>unknown-m</task-id>\n<result>line</result>\n</task-notification>'),
+        ],
+      },
+      {
+        name: 'human-typed <task-notification> (promptSource !== system)',
+        build: () => [
+          monitorAck('ack', base + 200, 'm1', { persistent: false, timeoutMs: 1_800_000 }),
+          textEv('a1', base + 300, 'watching'),
+          durationEv('d1', base + 400),
+          noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>line</result>\n</task-notification>', { promptSource: 'user' }),
+        ],
+      },
+      {
+        name: 'id-less <task-notification> after Monitor notice',
+        build: () => [
+          monitorAck('ack', base + 200, 'm1', { persistent: false, timeoutMs: 1_800_000 }),
+          textEv('a1', base + 300, 'watching'),
+          durationEv('d1', base + 400),
+          noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>line</result>\n</task-notification>'),
+          noticeEv('n2', base + 5_100, '<task-notification>\n<summary>no id</summary>\n</task-notification>'),
+        ],
+      },
+    ];
+
+    for (const tc of cases) {
+      const q = new BridgeTurnQueue();
+      q.mark('om_main', 'start task', base, 'start task', 1);
+      q.ingest([
+        larkUserEv('u1', base + 100, 'start task'),
+        ...tc.build(),
+        textEv('a-wake', base + 90_000, 'wake output'),
+        durationEv('d-wake', base + 90_100),
+      ]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      const wake = ready.find(t => t.turnId === 'local-headless-a-wake');
+      expect(wake, tc.name).toBeDefined();
+      expect(wake?.wakeNonTerminalMonitor, tc.name).toBeUndefined();
+    }
+  });
+
+  it('handles mixed-notice batches (both orderings), mid-turn folds, cross-attempt anchors, and mid-turn human prompts', () => {
+    const base = Date.now() + 1_000;
+    const runMixed = (order: 'mon-first' | 'agent-first') => {
+      const q = new BridgeTurnQueue();
+      q.mark('om_main', 'run both', base, 'run both', 1);
+      const monNotice = noticeEv('n-mon', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>');
+      const agentNotice = noticeEv('n-ag', base + 5_100, '<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n</task-notification>');
+      q.ingest([
+        larkUserEv('u1', base + 100, 'run both'),
+        monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+        bgAck('ack-ag1', base + 250, { isAsync: true, status: 'async_launched', agentId: 'ag1' }),
+        textEv('a1', base + 300, 'running'),
+        durationEv('d1', base + 400),
+        ...(order === 'mon-first' ? [monNotice, agentNotice] : [agentNotice, monNotice]),
+        textEv('a-wake', base + 5_500, 'subagent finished'),
+        durationEv('d-wake', base + 5_600),
+      ]);
+      const wake = q.drainEmittable({ explicitTerminalOnly: true }).find(t => t.turnId === 'local-headless-a-wake');
+      // Still routes back to om_main (same anchor), but MUST NOT be suppressed.
+      expect(wake).toMatchObject({ isBackgroundWake: true, replyAnchorTurnId: 'om_main', replyAnchorDispatchAttempt: 1 });
+      expect(wake?.wakeNonTerminalMonitor).toBeUndefined();
+    };
+    runMixed('mon-first');
+    runMixed('agent-first');
+
+    // Mid-turn attachment fold of terminal subagent AFTER first visible text disarms wakeNonTerminalMonitor.
+    const qFold = new BridgeTurnQueue();
+    qFold.mark('om_main', 'watch', base, 'watch', 1);
+    qFold.ingest([
+      larkUserEv('u1', base + 100, 'watch'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+      bgAck('ack-ag1', base + 250, { isAsync: true, status: 'async_launched', agentId: 'ag1' }),
+      textEv('a1', base + 300, 'ok'),
+      durationEv('d1', base + 400),
+      noticeEv('n-mon', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>'),
+      textEv('a-wake-1', base + 5_200, 'still waiting', 'tool_use'),
+      attachedNoticeEv('att-ag1', base + 5_300, '<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n</task-notification>'),
+      textEv('a-wake-2', base + 5_400, 'agent done!'),
+      durationEv('d-wake', base + 5_500),
+    ]);
+    const foldWake = qFold.drainEmittable({ explicitTerminalOnly: true }).find(t => t.turnId === 'local-headless-a-wake-1');
+    expect(foldWake?.wakeNonTerminalMonitor).toBeUndefined();
+
+    // Two non-terminal Monitors from different dispatchAttempts of the same turnId fail closed on anchor,
+    // while keeping wakeNonTerminalMonitor: true because BOTH notices are non-terminal Monitors.
+    const qCrossAttempt = new BridgeTurnQueue();
+    qCrossAttempt.mark('om_same', 'first try', base, 'first try', 1);
+    qCrossAttempt.ingest([
+      larkUserEv('u1', base + 100, 'first try'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+      textEv('a1', base + 300, 'try 1'),
+      durationEv('d1', base + 400),
+    ]);
+    qCrossAttempt.mark('om_same', 'second try', base + 500, 'second try', 2);
+    qCrossAttempt.ingest([
+      larkUserEv('u2', base + 600, 'second try'),
+      monitorAck('ack-m2', base + 700, 'm2', { persistent: false }),
+      textEv('a2', base + 800, 'try 2'),
+      durationEv('d2', base + 900),
+      noticeEv('n-m1', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick1</result>\n</task-notification>'),
+      noticeEv('n-m2', base + 5_100, '<task-notification>\n<task-id>m2</task-id>\n<result>tick2</result>\n</task-notification>'),
+      textEv('a-both', base + 5_200, 'waiting on both'),
+      durationEv('d-both', base + 5_300),
+    ]);
+    const crossWake = qCrossAttempt.drainEmittable({ explicitTerminalOnly: true }).find(t => t.turnId === 'local-headless-a-both');
+    expect(crossWake?.isBackgroundWake).toBeUndefined();
+    expect(crossWake?.backgroundWakeUnrouted).toBe(true);
+    expect(crossWake?.wakeNonTerminalMonitor).toBe(true);
+
+    // Mid-turn human prompt folded into a Monitor wake disarms wakeNonTerminalMonitor.
+    const qHumanFold = new BridgeTurnQueue();
+    qHumanFold.mark('om_main', 'watch', base, 'watch', 1);
+    qHumanFold.ingest([
+      larkUserEv('u1', base + 100, 'watch'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+      textEv('a1', base + 300, 'ok'),
+      durationEv('d1', base + 400),
+      noticeEv('n-mon', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>'),
+      textEv('a-wake-1', base + 5_200, 'checking', 'tool_use'),
+      {
+        type: 'attachment',
+        uuid: 'att-human',
+        timestamp: new Date(base + 5_300).toISOString(),
+        renderedRole: 'system',
+        attachment: { type: 'queued_command', commandMode: 'prompt', prompt: '顺便看下日志' },
+      } as unknown as TranscriptEvent,
+      textEv('a-wake-2', base + 5_400, '好的，日志如下'),
+      durationEv('d-wake', base + 5_500),
+    ]);
+    const humanFoldWake = qHumanFold.drainEmittable({ explicitTerminalOnly: true }).find(t => t.turnId === 'local-headless-a-wake-1');
+    expect(humanFoldWake?.wakeNonTerminalMonitor).toBeUndefined();
+  });
+
+  it('tracks Monitor metadata without Lark anchor (local launch, absorb with liveSinceMs, seedBackgroundTasks, resetBackgroundTasks)', () => {
+    const base = Date.now() + 1_000;
+    // 1. Local terminal turn launches Monitor (no Lark anchor) -> still marks wakeNonTerminalMonitor.
+    const qLocal = new BridgeTurnQueue();
+    qLocal.ingest([
+      larkUserEv('u-local', base + 100, 'terminal prompt'),
+      monitorAck('ack-m1', base + 200, 'm-local', { persistent: false }),
+      textEv('a1', base + 300, 'local watching'),
+      durationEv('d1', base + 400),
+      noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>m-local</task-id>\n<result>tick</result>\n</task-notification>'),
+      textEv('a2', base + 5_100, 'still waiting'),
+      durationEv('d2', base + 5_200),
+    ]);
+    const localReady = qLocal.drainEmittable({ explicitTerminalOnly: true });
+    expect(localReady[0].turnId).toBe('local-u-local');
+    expect(localReady[0].wakeNonTerminalMonitor).toBeUndefined();
+    expect(localReady[1]).toMatchObject({
+      turnId: 'local-headless-a2',
+      wakeNonTerminalMonitor: true,
+    });
+    expect(localReady[1].isBackgroundWake).toBeUndefined();
+
+    // 2. seedBackgroundTasks() after re-attach & resetBackgroundTasks() on CLI respawn.
+    const qSeed = new BridgeTurnQueue();
+    qSeed.seedBackgroundTasks([{ taskId: 'm-reattach', kind: 'monitor', persistent: false, expiresAtMs: base + 1_800_000 }]);
+    qSeed.ingest([
+      noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>m-reattach</task-id>\n<result>tick</result>\n</task-notification>'),
+      textEv('a1', base + 5_100, 'waiting'),
+      durationEv('d1', base + 5_200),
+    ]);
+    expect(qSeed.drainEmittable({ explicitTerminalOnly: true })[0]?.wakeNonTerminalMonitor).toBe(true);
+    qSeed.resetBackgroundTasks();
+    qSeed.ingest([
+      noticeEv('n2', base + 6_000, '<task-notification>\n<task-id>m-reattach</task-id>\n<result>tick2</result>\n</task-notification>'),
+      textEv('a2', base + 6_100, 'after respawn'),
+      durationEv('d2', base + 6_200),
+    ]);
+    expect(qSeed.drainEmittable({ explicitTerminalOnly: true })[0]?.wakeNonTerminalMonitor).toBeUndefined();
+
+    // 3. absorb() respects liveSinceMs floor so dead-CLI Monitors are not seeded on /resume.
+    const qAbsorb = new BridgeTurnQueue();
+    qAbsorb.absorb(
+      [
+        monitorAck('ack-dead', base - 60_000, 'm-dead', { persistent: false }),
+        monitorAck('ack-live', base + 100, 'm-live', { persistent: false }),
+      ],
+      { liveSinceMs: base },
+    );
+    qAbsorb.ingest([
+      noticeEv('n-dead', base + 5_000, '<task-notification>\n<task-id>m-dead</task-id>\n<result>tick</result>\n</task-notification>'),
+      textEv('a-dead', base + 5_100, 'dead'),
+      durationEv('d-dead', base + 5_200),
+      noticeEv('n-live', base + 6_000, '<task-notification>\n<task-id>m-live</task-id>\n<result>tick</result>\n</task-notification>'),
+      textEv('a-live', base + 6_100, 'live'),
+      durationEv('d-live', base + 6_200),
+    ]);
+    const absorbedReady = qAbsorb.drainEmittable({ explicitTerminalOnly: true });
+    expect(absorbedReady[0]?.wakeNonTerminalMonitor).toBeUndefined();
+    expect(absorbedReady[1]?.wakeNonTerminalMonitor).toBe(true);
+  });
+
+  it('streams leading thinking/tool_use/tool_result and text-less Monitor wakes to pendingWakeObserver with exact (turnId, dispatchAttempt) without early synthesis or duplicates', () => {
+    const base = Date.now() + 1_000;
+    const q = new BridgeTurnQueue();
+    q.mark('om_main', '盯一下 CI', base, '盯一下 CI', 2);
+    const activityEvents: Array<{ uuid?: string; anchor: { turnId: string; dispatchAttempt?: number } }> = [];
+    const attributedEvents: Array<{ uuid?: string; turnId: string }> = [];
+    const textlessFlushes: Array<{ turnId: string; dispatchAttempt?: number }> = [];
+
+    q.ingest(
+      [
+        larkUserEv('u1', base + 100, '盯一下 CI'),
+        monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+        textEv('a1', base + 300, '开始盯 CI'),
+        durationEv('d1', base + 400),
+      ],
+      undefined,
+      (ev, turn) => attributedEvents.push({ uuid: ev.uuid, turnId: turn.turnId }),
+    );
+    expect(q.drainEmittable({ explicitTerminalOnly: true }).map(t => t.turnId)).toEqual(['om_main']);
+
+    // Wake 1: leading thinking -> tool_use -> tool_result -> text -> duration.
+    // Also includes a stray pre-assistant tool_result (must be ignored) and a combined thinking+text record (must go ONLY to onAssistantAttributed, not duplicate).
+    q.ingest(
+      [
+        noticeEv('n1', base + 10_000, '<task-notification>\n<task-id>m1</task-id>\n<result>job 1/3 done</result>\n</task-notification>'),
+        {
+          type: 'user',
+          uuid: 'stray-tr',
+          timestamp: ts(base, 10_050),
+          isSidechain: false,
+          message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'old', content: 'stray' }] },
+        } as TranscriptEvent,
+        {
+          type: 'assistant',
+          uuid: 'w1-think',
+          timestamp: ts(base, 10_100),
+          isSidechain: false,
+          message: { role: 'assistant', content: [{ type: 'thinking', thinking: '检查构建状态' }] },
+        } as TranscriptEvent,
+        {
+          type: 'assistant',
+          uuid: 'w1-tool',
+          timestamp: ts(base, 10_200),
+          isSidechain: false,
+          message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'tu-check', name: 'Bash', input: { command: 'echo ok' } }] },
+        } as TranscriptEvent,
+        {
+          type: 'user',
+          uuid: 'w1-tr',
+          timestamp: ts(base, 10_300),
+          isSidechain: false,
+          message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-check', content: 'ok' }] },
+        } as TranscriptEvent,
+        {
+          type: 'assistant',
+          uuid: 'w1-text',
+          timestamp: ts(base, 10_400),
+          isSidechain: false,
+          message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: '继续等' }, { type: 'text', text: '继续等待…' }] },
+        } as TranscriptEvent,
+        durationEv('w1-dur', base + 10_500),
+      ],
+      undefined,
+      (ev, turn) => attributedEvents.push({ uuid: ev.uuid, turnId: turn.turnId }),
+      undefined,
+      {
+        onActivity: (ev, anchor) => activityEvents.push({ uuid: ev.uuid, anchor }),
+        onTextlessComplete: anchor => textlessFlushes.push(anchor),
+      },
+    );
+
+    expect(activityEvents).toEqual([
+      { uuid: 'w1-think', anchor: { turnId: 'om_main', dispatchAttempt: 2 } },
+      { uuid: 'w1-tool', anchor: { turnId: 'om_main', dispatchAttempt: 2 } },
+      { uuid: 'w1-tr', anchor: { turnId: 'om_main', dispatchAttempt: 2 } },
+    ]);
+    expect(attributedEvents.filter(e => e.turnId === 'local-headless-w1-text')).toEqual([
+      { uuid: 'w1-text', turnId: 'local-headless-w1-text' },
+    ]);
+    expect(textlessFlushes).toEqual([]);
+    const w1Ready = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(w1Ready.map(t => t.turnId)).toEqual(['local-headless-w1-text']);
+
+    // Wake 2: text-less Monitor micro-turn (thinking only, closed by turn_duration) -> NO headless turn, DOES flush onTextlessComplete!
+    activityEvents.length = 0;
+    q.ingest(
+      [
+        noticeEv('n2', base + 20_000, '<task-notification>\n<task-id>m1</task-id>\n<result>job 2/3 done</result>\n</task-notification>'),
+        {
+          type: 'assistant',
+          uuid: 'w2-think',
+          timestamp: ts(base, 20_100),
+          isSidechain: false,
+          message: { role: 'assistant', content: [{ type: 'thinking', thinking: '还在跑，无需说话' }] },
+        } as TranscriptEvent,
+        durationEv('w2-dur', base + 20_200),
+      ],
+      undefined,
+      undefined,
+      undefined,
+      {
+        onActivity: (ev, anchor) => activityEvents.push({ uuid: ev.uuid, anchor }),
+        onTextlessComplete: anchor => textlessFlushes.push(anchor),
+      },
+    );
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([]);
+    expect(activityEvents).toEqual([{ uuid: 'w2-think', anchor: { turnId: 'om_main', dispatchAttempt: 2 } }]);
+    expect(textlessFlushes).toEqual([{ turnId: 'om_main', dispatchAttempt: 2 }]);
+  });
+
+  it('ignores api-request-blob records even if they carry a uuid', () => {
+    const base = Date.now() + 1_000;
+    const q = new BridgeTurnQueue();
+    q.mark('om_1', 'hello', base, 'hello', 1);
+    q.ingest([
+      {
+        type: 'api-request-blob',
+        uuid: 'blob-u',
+        timestamp: ts(base, 50),
+        message: { role: 'user', content: 'hello' },
+      } as unknown as TranscriptEvent,
+      larkUserEv('u1', base + 100, 'hello'),
+      {
+        type: 'api-request-blob',
+        uuid: 'blob-a',
+        timestamp: ts(base, 150),
+        message: { role: 'assistant', content: [{ type: 'text', text: 'copied reply' }] },
+      } as unknown as TranscriptEvent,
+      textEv('a1', base + 200, 'real reply'),
+      durationEv('d1', base + 300),
+    ]);
+    const ready = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(ready).toHaveLength(1);
+    expect(ready[0].turnId).toBe('om_1');
+    expect(ready[0].assistantUuids).toEqual(['a1']);
+  });
+
+  it('disarms wakeNonTerminalMonitor on mid-wake TaskStop and TUI kill, and retires settled Monitors from metadata', () => {
+    const base = Date.now() + 1_000;
+    const q = new BridgeTurnQueue();
+    q.mark('om_main', 'watch CI', base, 'watch CI', 1);
+    q.ingest([
+      larkUserEv('u1', base + 100, 'watch CI'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false, timeoutMs: 1_800_000 }),
+      textEv('a1', base + 300, 'watching'),
+      durationEv('d1', base + 400),
+      // Non-terminal tick arrives -> model calls TaskStop(m1) -> writes final failure report!
+      noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>BUILD FAILED</result>\n</task-notification>'),
+      {
+        type: 'assistant', uuid: 'a-stop', timestamp: ts(base, 5_100), isSidechain: false,
+        message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'tu-stop', name: 'TaskStop', input: { task_id: 'm1' } }] },
+      } as TranscriptEvent,
+      {
+        type: 'user', uuid: 'u-stop', timestamp: ts(base, 5_200), isSidechain: false,
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-stop', content: 'stopped' }] },
+        toolUseResult: { task_id: 'm1', task_type: 'monitor' },
+      } as TranscriptEvent,
+      textEv('a-report', base + 5_300, 'CI 构建失败，已停止监控'),
+      durationEv('d-report', base + 5_400),
+      // Late buffered status-less notice after TaskStop must also fail open (metadata retired).
+      noticeEv('n-late', base + 6_000, '<task-notification>\n<task-id>m1</task-id>\n<result>trailing line</result>\n</task-notification>'),
+      textEv('a-late', base + 6_100, '补充一条日志'),
+      durationEv('d-late', base + 6_200),
+    ]);
+    const ready = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(ready.find(t => t.turnId === 'local-headless-a-report')?.wakeNonTerminalMonitor).toBeUndefined();
+    expect(ready.find(t => t.turnId === 'local-headless-a-late')?.wakeNonTerminalMonitor).toBeUndefined();
+
+    // TUI kill (queue-operation enqueue with killed) mid-wake disarms the active wake.
+    const qKill = new BridgeTurnQueue();
+    qKill.mark('om_main', 'watch CI', base, 'watch CI', 1);
+    qKill.ingest([
+      larkUserEv('u1', base + 100, 'watch CI'),
+      monitorAck('ack-m2', base + 200, 'm2', { persistent: false, timeoutMs: 1_800_000 }),
+      textEv('a1', base + 300, 'watching'),
+      durationEv('d1', base + 400),
+      noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>m2</task-id>\n<result>step 2</result>\n</task-notification>'),
+      textEv('a-mid', base + 5_100, '正在检查', 'tool_use'),
+      {
+        type: 'queue-operation', operation: 'enqueue', timestamp: ts(base, 5_150),
+        content: '<task-notification>\n<task-id>m2</task-id>\n<status>killed</status>\n</task-notification>',
+      } as TranscriptEvent,
+      textEv('a-end', base + 5_200, '监控已被手动停止'),
+      durationEv('d-end', base + 5_300),
+    ]);
+    expect(qKill.drainEmittable({ explicitTerminalOnly: true }).find(t => t.turnId === 'local-headless-a-mid')?.wakeNonTerminalMonitor).toBeUndefined();
+  });
+
+  it('promotes a mid-turn absorbed human Lark turn folded into a running Monitor wake instead of burying it', () => {
+    const base = Date.now() + 1_000;
+    const q = new BridgeTurnQueue();
+    q.mark('om_t1', '盯 CI', base, '盯 CI', 1);
+    q.ingest([
+      larkUserEv('u1', base + 100, '盯 CI'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+      textEv('a1', base + 300, '开始盯'),
+      durationEv('d1', base + 400),
+    ]);
+    q.drainEmittable({ explicitTerminalOnly: true });
+
+    // Monitor wake starts, then human sends om_t2 mid-wake (folded as system-rendered queued_command).
+    q.mark('om_t2', '帮我看下 package.json', base + 5_050, '帮我看下 package.json', 1);
+    q.ingest([
+      noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>'),
+      textEv('a-w1', base + 5_100, '检查中', 'tool_use'),
+      {
+        type: 'attachment',
+        uuid: 'att-t2',
+        timestamp: ts(base, 5_200),
+        renderedRole: 'system',
+        attachment: { type: 'queued_command', commandMode: 'prompt', prompt: '帮我看下 package.json' },
+      } as unknown as TranscriptEvent,
+      textEv('a-t2', base + 5_300, 'package.json 名称是 botmux'),
+      durationEv('d-end', base + 5_400),
+    ]);
+    const ready = q.drainEmittable({ explicitTerminalOnly: true });
+    const wakeTurn = ready.find(t => t.turnId === 'local-headless-a-w1');
+    const humanTurn = ready.find(t => t.turnId === 'om_t2');
+    expect(wakeTurn?.wakeNonTerminalMonitor).toBe(true);
+    expect(humanTurn).toMatchObject({
+      turnId: 'om_t2',
+      started: true,
+      assistantUuids: ['a-t2'],
+    });
+    expect(humanTurn?.absorbedIntoTurnId).toBeUndefined();
+    expect(humanTurn?.wakeNonTerminalMonitor).toBeUndefined();
+  });
+
+  it('keeps fail-open order-independent, respects closedByDurationMarker, handles omitted attachment commandMode, fails open on missing timestamps, and supports markerless turns + pre-text CoT flush', () => {
+    const base = Date.now() + 1_000;
+
+    // 1. [id-less, Monitor] order poisons pendingBackgroundWake even when initially undefined.
+    const qOrder1 = new BridgeTurnQueue();
+    qOrder1.mark('om_1', 'watch', base, 'watch', 1);
+    qOrder1.ingest([
+      larkUserEv('u1', base + 100, 'watch'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+      textEv('a1', base + 300, 'watching'),
+      durationEv('d1', base + 400),
+      noticeEv('n-idless', base + 5_000, '<task-notification>\n<status>completed</status>\n</task-notification>'),
+      noticeEv('n-mon', base + 5_050, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>'),
+      textEv('a-wake', base + 5_100, 'combined answer'),
+      durationEv('d-wake', base + 5_200),
+    ]);
+    expect(qOrder1.drainEmittable({ explicitTerminalOnly: true }).find(t => t.turnId === 'local-headless-a-wake')?.wakeNonTerminalMonitor).toBeUndefined();
+
+    // 2. [attachment(task-notification), Monitor] while idle also poisons pendingBackgroundWake.
+    const qOrder2 = new BridgeTurnQueue();
+    qOrder2.mark('om_1', 'watch', base, 'watch', 1);
+    qOrder2.ingest([
+      larkUserEv('u1', base + 100, 'watch'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+      bgAck('ack-ag1', base + 210, { isAsync: true, status: 'async_launched', agentId: 'ag1' }),
+      textEv('a1', base + 300, 'watching'),
+      durationEv('d1', base + 400),
+      attachedNoticeEv('att-ag', base + 5_000, '<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n</task-notification>'),
+      noticeEv('n-mon', base + 5_050, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>'),
+      textEv('a-wake', base + 5_100, 'combined answer'),
+      durationEv('d-wake', base + 5_200),
+    ]);
+    expect(qOrder2.drainEmittable({ explicitTerminalOnly: true }).find(t => t.turnId === 'local-headless-a-wake')?.wakeNonTerminalMonitor).toBeUndefined();
+
+    // 3. Same-batch trailing event after turn_duration does NOT retroactively disarm closed Wake 1.
+    const qClosed = new BridgeTurnQueue();
+    qClosed.mark('om_1', 'watch', base, 'watch', 1);
+    qClosed.ingest([
+      larkUserEv('u1', base + 100, 'watch'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+      textEv('a1', base + 300, 'watching'),
+      durationEv('d1', base + 400),
+      noticeEv('n-m1', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick 1</result>\n</task-notification>'),
+      textEv('a-w1', base + 5_100, 'routine waiting'),
+      durationEv('d-w1', base + 5_200),
+      // Trailing attachment with omitted commandMode after d-w1 must NOT mutate closed Wake 1.
+      {
+        type: 'attachment', uuid: 'att-after', timestamp: ts(base, 5_300), isSidechain: false,
+        attachment: { type: 'queued_command', prompt: '<task-notification>\n<task-id>ag-other</task-id>\n<status>completed</status>\n</task-notification>' },
+      } as unknown as TranscriptEvent,
+      noticeEv('n-m2', base + 5_350, '<task-notification>\n<task-id>m1</task-id>\n<result>tick 2</result>\n</task-notification>'),
+      textEv('a-w2', base + 5_400, 'wake 2 with ag-other'),
+      durationEv('d-w2', base + 5_500),
+    ]);
+    const closedReady = qClosed.drainEmittable({ explicitTerminalOnly: true });
+    expect(closedReady.find(t => t.turnId === 'local-headless-a-w1')).toMatchObject({ wakeNonTerminalMonitor: true, isBackgroundWake: true });
+    expect(closedReady.find(t => t.turnId === 'local-headless-a-w2')?.wakeNonTerminalMonitor).toBeUndefined();
+
+    // 3b. Same-batch trailing absorbed human prompt after turn_duration must NOT retroactively disarm closed Wake 1.
+    const qClosedHuman = new BridgeTurnQueue();
+    qClosedHuman.mark('om_1', 'watch', base, 'watch', 1);
+    qClosedHuman.ingest([
+      larkUserEv('u1', base + 100, 'watch'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+      textEv('a1', base + 300, 'watching'),
+      durationEv('d1', base + 400),
+      noticeEv('n-m1', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick 1</result>\n</task-notification>'),
+      textEv('a-w1', base + 5_100, 'routine waiting'),
+      durationEv('d-w1', base + 5_200),
+      {
+        type: 'attachment', uuid: 'att-human-after-dur', timestamp: ts(base, 5_300),
+        renderedRole: 'system',
+        attachment: { type: 'queued_command', commandMode: 'prompt', prompt: '顺便看下状态' },
+      } as unknown as TranscriptEvent,
+    ]);
+    expect(qClosedHuman.drainEmittable({ explicitTerminalOnly: true }).find(t => t.turnId === 'local-headless-a-w1')?.wakeNonTerminalMonitor).toBe(true);
+
+    // 4. Attachment with omitted commandMode folded mid-turn disarms collecting Monitor wake.
+    const qOmittedMode = new BridgeTurnQueue();
+    qOmittedMode.mark('om_1', 'watch', base, 'watch', 1);
+    qOmittedMode.ingest([
+      larkUserEv('u1', base + 100, 'watch'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+      textEv('a1', base + 300, 'watching'),
+      durationEv('d1', base + 400),
+      noticeEv('n-m1', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>'),
+      textEv('a-w1', base + 5_100, 'checking', 'tool_use'),
+      {
+        type: 'attachment', uuid: 'att-no-mode', timestamp: ts(base, 5_150), isSidechain: false,
+        attachment: { type: 'queued_command', prompt: '<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n</task-notification>' },
+      } as unknown as TranscriptEvent,
+      textEv('a-w2', base + 5_200, 'subagent finished'),
+      durationEv('d-w', base + 5_300),
+    ]);
+    expect(qOmittedMode.drainEmittable({ explicitTerminalOnly: true }).find(t => t.turnId === 'local-headless-a-w1')?.wakeNonTerminalMonitor).toBeUndefined();
+
+    // 5. Missing timestamp on Monitor notice fails open when Monitor has expiresAtMs;
+    // absorb({ liveSinceMs }) ignores untimestamped launches and retires settled tasks.
+    const qTs = new BridgeTurnQueue();
+    qTs.absorb([
+      { ...monitorAck('ack-notime', base + 100, 'm-notime', { persistent: false }), timestamp: undefined } as TranscriptEvent,
+      monitorAck('ack-settled', base + 100, 'm-settled', { persistent: false }),
+      {
+        type: 'user', uuid: 'stop-settled', timestamp: ts(base, 150), isSidechain: false,
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-s', content: 'stopped' }] },
+        toolUseResult: { task_id: 'm-settled', task_type: 'monitor' },
+      } as TranscriptEvent,
+      monitorAck('ack-bounded', base + 200, 'm-bounded', { persistent: false, timeoutMs: 60_000 }),
+    ], { liveSinceMs: base });
+    qTs.ingest([
+      noticeEv('n-nt', base + 5_000, '<task-notification>\n<task-id>m-notime</task-id>\n<result>t</result>\n</task-notification>'),
+      textEv('a-nt', base + 5_100, 'nt'), durationEv('d-nt', base + 5_200),
+      noticeEv('n-st', base + 6_000, '<task-notification>\n<task-id>m-settled</task-id>\n<result>t</result>\n</task-notification>'),
+      textEv('a-st', base + 6_100, 'st'), durationEv('d-st', base + 6_200),
+      { ...noticeEv('n-bm', base + 7_000, '<task-notification>\n<task-id>m-bounded</task-id>\n<result>t</result>\n</task-notification>'), timestamp: undefined } as TranscriptEvent,
+      textEv('a-bm', base + 7_100, 'bm'), durationEv('d-bm', base + 7_200),
+    ]);
+    const tsReady = qTs.drainEmittable({ explicitTerminalOnly: true });
+    expect(tsReady.every(t => t.wakeNonTerminalMonitor === undefined)).toBe(true);
+
+    // 6. Markerless transcript (durationMarkerWaitExpired) opens Monitor wake after end_turn before idle pop.
+    const qMarkerless = new BridgeTurnQueue();
+    qMarkerless.mark('om_1', 'watch', base, 'watch', 1);
+    qMarkerless.noteDurationMarkerWaitExpired();
+    qMarkerless.ingest([
+      larkUserEv('u1', base + 100, 'watch'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+      textEv('a1', base + 300, 'watching', 'end_turn'),
+      noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>'),
+      textEv('a-w1', base + 5_100, 'still waiting', 'end_turn'),
+    ]);
+    const mlReady = qMarkerless.drainEmittable({ explicitTerminalOnly: true });
+    expect(mlReady.find(t => t.turnId === 'local-headless-a-w1')?.wakeNonTerminalMonitor).toBe(true);
+
+    // 7. Pre-text Monitor wake that emitted leading CoT preserves sticky cotAnchor when unrouted,
+    // and flushes via onTextlessComplete on disarmed text-less turn_duration and pre-text API error.
+    const qCot = new BridgeTurnQueue();
+    qCot.mark('om_1', 'watch', base, 'watch', 4);
+    const flushes: Array<{ turnId: string; dispatchAttempt?: number }> = [];
+    const obs = {
+      onActivity: () => {},
+      onTextlessComplete: (anchor: { turnId: string; dispatchAttempt?: number }) => flushes.push(anchor),
+    };
+    qCot.ingest([
+      larkUserEv('u1', base + 100, 'watch'),
+      monitorAck('ack-m1', base + 200, 'm1', { persistent: false }),
+      textEv('a1', base + 300, 'watching'),
+      durationEv('d1', base + 400),
+    ], undefined, undefined, undefined, obs);
+    qCot.drainEmittable({ explicitTerminalOnly: true });
+    // Case 7a: leading thinking -> unknown terminal notice (unroutes anchor) -> text -> cotAnchor preserved!
+    qCot.ingest([
+      noticeEv('n1', base + 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>'),
+      { type: 'assistant', uuid: 'th1', timestamp: ts(base, 5_100), isSidechain: false, message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'leading' }] } } as TranscriptEvent,
+      attachedNoticeEv('att-unk', base + 5_150, '<task-notification>\n<task-id>unknown-x</task-id>\n<status>completed</status>\n</task-notification>'),
+      textEv('a-u1', base + 5_200, 'merged'),
+      durationEv('d-u1', base + 5_300),
+    ], undefined, undefined, undefined, obs);
+    const unroutedWake = qCot.drainEmittable({ explicitTerminalOnly: true })[0];
+    expect(unroutedWake?.replyAnchorTurnId).toBeUndefined();
+    expect(unroutedWake?.cotAnchor).toEqual({ turnId: 'om_1', dispatchAttempt: 4 });
+    // Case 7b: text-less disarmed wake -> flushes onTextlessComplete at turn_duration!
+    qCot.ingest([
+      noticeEv('n2', base + 6_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>'),
+      { type: 'assistant', uuid: 'th2', timestamp: ts(base, 6_100), isSidechain: false, message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'disarmed textless' }] } } as TranscriptEvent,
+      attachedNoticeEv('att-unk2', base + 6_150, '<task-notification>\n<task-id>unknown-y</task-id>\n<status>completed</status>\n</task-notification>'),
+      durationEv('d-u2', base + 6_200),
+    ], undefined, undefined, undefined, obs);
+    // Case 7c: pre-text API error -> flushes onTextlessComplete!
+    qCot.ingest([
+      noticeEv('n3', base + 7_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>'),
+      { type: 'assistant', uuid: 'th3', timestamp: ts(base, 7_100), isSidechain: false, message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'before error' }] } } as TranscriptEvent,
+      { type: 'assistant', uuid: 'err3', timestamp: ts(base, 7_150), isSidechain: false, isApiErrorMessage: true, message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'API Error: 500' }] } } as TranscriptEvent,
+    ], undefined, undefined, undefined, obs);
+    expect(flushes).toEqual([
+      { turnId: 'om_1', dispatchAttempt: 4 },
+      { turnId: 'om_1', dispatchAttempt: 4 },
+    ]);
+  });
+});

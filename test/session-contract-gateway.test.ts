@@ -1754,7 +1754,7 @@ describe('contract gateway and real worker boundaries', () => {
   it.each(['restart', 'interrupt_turn', 'suspend', 'close_commit', 'raw_input', 'term_action', 'inject_command', 'session_ready', 'turn_idle'])('requires a frozen RuntimeRef for %s', type => {
     const s = fixture(); expect(admitSessionCommand(type, { version: 2, operationId: 'op' }, s.runtime, 'op').allowed).toBe(false);
   });
-  it.each(['set_follow_up_reply', 'absorbed_reply_delivered'])('allows session-level receipt %s without a runtime command context', type => {
+  it.each(['set_follow_up_reply', 'set_fold_background_updates', 'absorbed_reply_delivered'])('allows session-level receipt %s without a runtime command context', type => {
     // These messages reconcile config/output state; they do not control an
     // executor and are sent directly over the producing worker's IPC channel.
     expect(admitSessionCommand(type, undefined)).toEqual({ allowed: true });

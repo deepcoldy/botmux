@@ -246,6 +246,8 @@ export interface BotConfigEditInput {
   showInTeam?: string;
   /** 飞书开放平台预判卡审批时草稿态自动二分避开需审权限（默认 ON；仅 false 落盘）。 */
   autoAvoidApproval?: string;
+  /** AI 在后台盯长任务时将等待进展收进折叠区（默认 OFF；仅 true 落盘）。 */
+  foldBackgroundUpdates?: string;
   /** UI 语言：zh 或 en；'-' 或 null 清空。 */
   lang?: string | null;
 }
@@ -735,6 +737,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   applyOptionalBoolean(out, 'showInTeam', input.showInTeam, true);
   // 开放平台卡审批自动避开默认 ON → 只把显式 false 落盘。
   applyOptionalBoolean(out, 'autoAvoidApproval', input.autoAvoidApproval, true);
+  // 折叠后台等待进展默认 OFF → 只把显式 true 落盘。
+  applyOptionalBoolean(out, 'foldBackgroundUpdates', input.foldBackgroundUpdates, false);
 
   if (input.lang !== undefined) {
     if (input.lang === null || input.lang.trim() === '-') {

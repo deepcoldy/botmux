@@ -246,6 +246,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     goalStatusCard: j?.goalStatusCard === true,
     followUpReply: j?.followUpReply === true,
+    foldBackgroundUpdates: j?.foldBackgroundUpdates === true,
     privateCard: j?.privateCard === true,
     replyCardActions: j?.replyCardActions === true,
     replyCardNextStep: j?.replyCardNextStep === true,
@@ -382,6 +383,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   larkUserOwnerFallback: boolean | undefined;
   autoAvoidApproval: boolean | undefined;
   streamingCardFoldedLayout: boolean | undefined;
+  foldBackgroundUpdates: boolean | undefined;
   askOptionLayout: any;
   trustSameOwnerBots: boolean | undefined;
   grantDelegateBots: string[] | undefined;
@@ -398,6 +400,8 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
     autoAvoidApproval: typeof rawEntry?.autoAvoidApproval === 'boolean' ? rawEntry.autoAvoidApproval : undefined,
     streamingCardFoldedLayout: typeof rawEntry?.streamingCardFoldedLayout === 'boolean'
       ? rawEntry.streamingCardFoldedLayout : undefined,
+    foldBackgroundUpdates: typeof rawEntry?.foldBackgroundUpdates === 'boolean'
+      ? rawEntry.foldBackgroundUpdates : undefined,
     askOptionLayout: rawEntry?.askOptionLayout,
     // 默认开：显式 false 必须从这里带回，否则离线行会把已关闭的同机信任显示成开启。
     trustSameOwnerBots: typeof rawEntry?.trustSameOwnerBots === 'boolean' ? rawEntry.trustSameOwnerBots : undefined,

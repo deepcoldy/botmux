@@ -390,9 +390,12 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   pending!.delete(key);
   const cfg = getBot(ds.larkAppId).config;
   const visible = ds.cotForced || replyCardPresentation(cfg, ds.chatId).showProcess;
+  const allowWhileTerminal = ds.cotHeldForBackground?.turnId === turnId
+    && ds.cotHeldForBackground.dispatchAttempt === dispatchAttempt;
   const work = updateTurnReplyCard(ds, turnId, {
     kind: 'tools', tools: visible ? publicReplyCardTools(next.msg.entries, cfg.thinkingCardToolResult !== false) : [],
     activity: visible ? publicReplyCardActivity(next.msg.entries) : [],
+    ...(allowWhileTerminal ? { allowWhileTerminal: true } : {}),
   }, next.send, { dispatchAttempt, owns: next.owns }).then(() => undefined);
   let running = toolFlushes.get(ds);
   if (!running) { running = new Map(); toolFlushes.set(ds, running); }

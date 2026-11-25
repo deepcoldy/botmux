@@ -68,13 +68,16 @@ afterEach(async () => {
 const sleep = (ms: number) => new Promise(done => setTimeout(done, ms));
 
 /** A zero-prompt Claude session in a group, and the daemon around it. */
-function zeroPromptSession() {
+function zeroPromptSession(opts: { foldBackgroundUpdates?: boolean } = {}) {
   const h = setupFakeClaude({ turnMs: 800, atomicPidState: true });
   previousDataDir = config.session.dataDir;
   config.session.dataDir = join(h.root, 'data');
   vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => undefined);
   vi.spyOn(bots, 'getBot').mockReturnValue({
-    config: { larkAppId: APP, larkAppSecret: 'secret', cliId: 'claude-code', promptInjection: 'none' },
+    config: {
+      larkAppId: APP, larkAppSecret: 'secret', cliId: 'claude-code', promptInjection: 'none',
+      ...(opts.foldBackgroundUpdates ? { foldBackgroundUpdates: true } : {}),
+    },
     resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'ZeroPromptBot',
   } as any);
   const sessionReply = vi.fn(async (...args: unknown[]) => {
@@ -109,6 +112,7 @@ function zeroPromptSession() {
     const init = {
       type: 'init' as const, sessionId: h.sessionId, cliId: 'claude-code', backendType: 'tmux' as const,
       promptInjection: 'none' as const, replyDelivery: 'transcript' as const,
+      ...(opts.foldBackgroundUpdates ? { foldBackgroundUpdates: true as const } : {}),
       ...(generation > 1 ? { resume: true } : {}), prompt: '',
       restartAttemptId: controller.prepareWorkerStart(), sessionContract: controller.bindWorker(generation),
     };
@@ -125,12 +129,12 @@ function zeroPromptSession() {
   const repliesWith = (text: string) => replies().filter(reply => reply.includes(text));
 
   /** The message that starts the review: answered, then the CLI is idle. */
-  const ask = async (g: Generation) => {
+  const ask = async (g: Generation, text = TEXT) => {
     await g.waitFor(() => g.messages.some(m => m.type === 'prompt_ready'), 'the worker to be ready', 60_000);
-    expect(workerPool.sendWorkerInput(ds1, TEXT, TURN, { trustedCaller: caller })).toBe(true);
-    await g.waitFor(() => repliesWith(`reply: ${TEXT}`).length > 0, 'the answer to the message', 60_000);
+    expect(workerPool.sendWorkerInput(ds1, text, TURN, { trustedCaller: caller })).toBe(true);
+    await g.waitFor(() => repliesWith(`reply: ${text}`).length > 0, 'the answer to the message', 60_000);
     await g.waitFor(() => {
-      const at = h.doneAt('turn', `reply: ${TEXT}`);
+      const at = h.doneAt('turn', `reply: ${text}`);
       return at !== undefined && g.readyAt.some(ready => ready > at);
     }, 'the CLI back at its prompt');
   };
@@ -164,7 +168,7 @@ function zeroPromptSession() {
     // A duplicate would follow within a bridge tick or two.
     await sleep(3_000);
   };
-  return { first, ask, clear, restartDaemon, wake, repliesWith };
+  return { h, first, ask, clear, restartDaemon, wake, replies, repliesWith };
 }
 
 describe.skipIf(!runnable)('a zero-prompt Claude session woken by its background task', () => {
@@ -188,6 +192,54 @@ describe.skipIf(!runnable)('a zero-prompt Claude session woken by its background
     await s.ask(s.first);
     const next = await s.restartDaemon(s.first);
     await s.wake(next);
+    expect(s.repliesWith(VERDICT), next.logs.join('')).toHaveLength(1);
+  }, 240_000);
+
+  it('with foldBackgroundUpdates on, mutes non-terminal Monitor mid-stream wakes (including after restart re-attach) while delivering the first turn and terminal verdict', async () => {
+    const s = zeroPromptSession({ foldBackgroundUpdates: true });
+    await s.ask(s.first, 'MONITOR:mon-ci-1');
+    expect(s.repliesWith('reply: MONITOR:mon-ci-1')).toHaveLength(1);
+
+    // 1. Mid-stream Monitor tick (no <status>): wakes Claude -> writes "继续等待…".
+    // Must produce 0 new group messages, 0 orphan terminal_turn_started, and forward CoT to om_review_request!
+    s.h.notifyEvent({
+      notice: '<task-notification>\n<task-id>mon-ci-1</task-id>\n<result>CI job 1/3 running</result>\n</task-notification>',
+      thinking: 'CI 仍在跑，先继续等',
+      reply: '继续等待… (tick 1)',
+    });
+    await s.first.waitFor(() => {
+      const at = s.h.doneAt('turn', '继续等待… (tick 1)');
+      return at !== undefined && s.first.readyAt.some(ready => ready > at);
+    }, 'first mid-stream monitor wake to settle', 60_000);
+    await sleep(2_000);
+    expect(s.repliesWith('继续等待'), s.first.logs.join('')).toHaveLength(0);
+    expect(s.first.messages.filter(m => m.type === 'terminal_turn_started')).toHaveLength(0);
+    expect(s.first.messages.some(m =>
+      m.type === 'thinking_update' && m.turnId === TURN
+      && m.entries.some(e => e.kind === 'thinking' && e.text === 'CI 仍在跑，先继续等'),
+    )).toBe(true);
+
+    // 2. Daemon restart re-attaches to surviving CLI: seeded Monitor metadata still mutes tick 2!
+    const next = await s.restartDaemon(s.first);
+    s.h.notifyEvent({
+      notice: '<task-notification>\n<task-id>mon-ci-1</task-id>\n<result>CI job 2/3 running</result>\n</task-notification>',
+      reply: '继续等待… (tick 2)',
+    });
+    await next.waitFor(() => {
+      const at = s.h.doneAt('turn', '继续等待… (tick 2)');
+      return at !== undefined && next.readyAt.some(ready => ready > at);
+    }, 'second mid-stream monitor wake after restart to settle', 60_000);
+    await sleep(2_000);
+    expect(s.repliesWith('继续等待'), next.logs.join('')).toHaveLength(0);
+    expect(next.messages.filter(m => m.type === 'terminal_turn_started')).toHaveLength(0);
+
+    // 3. Terminal Monitor notification (<status>completed</status>) delivers the final verdict once!
+    s.h.notifyEvent({
+      notice: '<task-notification>\n<task-id>mon-ci-1</task-id>\n<status>completed</status>\n<summary>CI passed</summary>\n</task-notification>',
+      reply: VERDICT,
+    });
+    await next.waitFor(() => s.repliesWith(VERDICT).length > 0, 'terminal Monitor verdict to reach group', 60_000);
+    await sleep(2_500);
     expect(s.repliesWith(VERDICT), next.logs.join('')).toHaveLength(1);
   }, 240_000);
 });

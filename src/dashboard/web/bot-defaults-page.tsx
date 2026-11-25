@@ -678,6 +678,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     goalStatusCard: body.goalStatusCard,
     followUpReply: body.followUpReply,
+    foldBackgroundUpdates: body.foldBackgroundUpdates,
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
     replyCardNextStep: body.replyCardNextStep,
@@ -6604,6 +6605,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [goalStatusCard, setGoalStatusCard] = useState(bot.goalStatusCard === true);
   const [followUpReply, setFollowUpReply] = useState(bot.followUpReply === true);
+  const [foldBackgroundUpdates, setFoldBackgroundUpdates] = useState(bot.foldBackgroundUpdates === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
   const [nextStep, setNextStep] = useState(bot.replyCardNextStep === true);
@@ -6626,6 +6628,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setGoalStatusCard(bot.goalStatusCard === true);
     setFollowUpReply(bot.followUpReply === true);
+    setFoldBackgroundUpdates(bot.foldBackgroundUpdates === true);
     setPrivateCard(bot.privateCard === true);
     setReplyActions(bot.replyCardActions === true);
     setNextStep(bot.replyCardNextStep === true);
@@ -6633,7 +6636,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.showUsageQuota, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.showUsageQuota, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply, bot.foldBackgroundUpdates]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6758,6 +6761,19 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
               const previous = followUpReply;
               setFollowUpReply(checked);
               void savePatch({ followUpReply: checked }, 'follow-up-reply', () => setFollowUpReply(previous));
+            }}
+          />
+          <ToggleRow
+            checked={foldBackgroundUpdates}
+            disabled={busy !== null}
+            dataAction="toggle-fold-background-updates"
+            title={tr('botDefaults.foldBackgroundUpdates')}
+            description={tr('botDefaults.foldBackgroundUpdatesDescription')}
+            help={tr('botDefaults.foldBackgroundUpdatesHelp')}
+            onChange={checked => {
+              const previous = foldBackgroundUpdates;
+              setFoldBackgroundUpdates(checked);
+              void savePatch({ foldBackgroundUpdates: checked }, 'fold-background-updates', () => setFoldBackgroundUpdates(previous));
             }}
           />
           <ToggleRow

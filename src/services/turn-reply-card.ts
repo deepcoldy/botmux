@@ -95,7 +95,7 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
 
 export type TurnReplyCardEvent =
   | { kind: 'start' }
-  | { kind: 'tools'; tools: ReplyCardTool[]; activity?: ReplyCardActivity[] }
+  | { kind: 'tools'; tools: ReplyCardTool[]; activity?: ReplyCardActivity[]; allowWhileTerminal?: boolean }
   | { kind: 'ask'; entry: ReplyCardAsk }
   | { kind: 'progress'; text: string }
   | { kind: 'final'; text: string; card: string; source: 'explicit' | 'bridge'; feedback?: TurnReplyCardRecord['feedback'] }
@@ -264,8 +264,12 @@ export class TurnReplyCardStore {
       if (event.kind === 'progress' && (terminal || record.finalDelivered)) {
         throw new Error('This turn has finished; progress was not delivered');
       }
+      const allowBackgroundTools = event.kind === 'tools'
+        && event.allowWhileTerminal === true
+        && record.phase === 'completed'
+        && !record.displayRetired;
       if ((event.kind === 'final' && record.finalDelivered)
-        || (terminal && ['tools', 'phase', 'start'].includes(event.kind))) {
+        || (terminal && !allowBackgroundTools && ['tools', 'phase', 'start'].includes(event.kind))) {
         if (event.kind === 'final' && event.source === 'explicit' && record.finalText !== event.text) {
           throw new Error('This turn already delivered a different final answer');
         }
@@ -334,7 +338,7 @@ export class TurnReplyCardStore {
           record.disconnected = event.disconnected;
           if (!displayRetirement && !recovering) delete record.displayRetired;
         }
-      } else if (!terminal) {
+      } else if (!terminal || allowBackgroundTools) {
         if (event.kind === 'tools') {
           record.tools = event.tools;
           const incoming = event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id }));
