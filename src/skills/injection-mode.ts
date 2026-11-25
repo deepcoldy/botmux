@@ -200,12 +200,12 @@ const COMPACT_CATALOG_DESCRIPTIONS: Record<string, { zh: string; en: string }> =
     en: 'Rename this chat when requested or its goal/stage changes.',
   },
   'botmux-session-rename': {
-    zh: '修改当前任务的 Dashboard 会话标题；不改群名或飞书话题名。',
-    en: 'Rename this task in Dashboard, not the Lark chat or topic.',
+    zh: '修改当前任务的 Dashboard 会话标题；用户要求，或任务进入新阶段/标题已不准确时主动规范命名；不改群名或飞书话题名。',
+    en: 'Rename this task in Dashboard when asked, or proactively at a new stage or when the title is stale; not the Lark chat or topic.',
   },
   'botmux-schedule': {
-    zh: '创建、查询、修改、暂停或取消飞书定时提醒；如每天、每周、每月、明天或 N 分钟后。',
-    en: 'Create/manage Lark reminders: daily, weekly, monthly, tomorrow, or in N minutes.',
+    zh: '创建、查询、修改、暂停或取消飞书持久定时提醒（每天/每周/每月/明天/N 分钟后，recurring/crontab/reminder）；云端 remote agent 用 superpowers:schedule，当前会话循环跑 prompt 用 /loop。',
+    en: 'Create/manage persistent Lark reminders (daily/weekly/monthly/tomorrow/in N minutes, recurring/crontab/reminder); cloud agents use superpowers:schedule, in-session prompt loops use /loop.',
   },
   'botmux-handoff': {
     zh: '将下一步或单个专项交给一个 bot；默认留在当前话题，不新建子项目。',

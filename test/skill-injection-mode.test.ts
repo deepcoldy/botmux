@@ -221,6 +221,25 @@ describe('built-in skill catalog', () => {
     }
   });
 
+  it('retains proactive rename and schedule routing triggers in compact catalogs', () => {
+    const entries = builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: false, excludeRoutingCovered: true });
+    for (const locale of [undefined, 'en'] as const) {
+      const block = buildBuiltinSkillCatalogBlock(entries, locale);
+      const renameLine = block.split('\n').find(line => line.startsWith('- botmux-session-rename:'));
+      const scheduleLine = block.split('\n').find(line => line.startsWith('- botmux-schedule:'));
+      expect(renameLine).toBeDefined();
+      expect(scheduleLine).toBeDefined();
+
+      // Discovery behavior: these catalog lines decide whether the model reads the full skill.
+      const renameTriggers = locale === 'en' ? ['stage', 'stale'] : ['新阶段', '标题已不准确'];
+      const scheduleTriggers = locale === 'en'
+        ? ['persistent', 'recurring', 'crontab', 'superpowers:schedule', '/loop']
+        : ['持久', 'recurring', 'crontab', 'superpowers:schedule', '/loop'];
+      for (const trigger of renameTriggers) expect(renameLine).toContain(trigger);
+      for (const trigger of scheduleTriggers) expect(scheduleLine).toContain(trigger);
+    }
+  });
+
   it('adds the persistent-schedule boundary only to Remote Runner catalogs', () => {
     const entries = builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: false });
     const remote = buildBuiltinSkillCatalogBlock(entries, 'en', { remoteRunner: true });
