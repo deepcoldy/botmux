@@ -253,6 +253,34 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
     }
   });
 
+  it('Finding 3b: transient marker-release emit failure retries the same bound turn', () => {
+    const h = createWatchdogWiring();
+    h.queue.noteDurationMarkerObserved();
+    h.queue.mark('om_retry_marker', makeFingerprint('retry marker'), 100, 'retry marker');
+    h.queue.ingest([mkUser('u1', 'retry marker')], '/t/s.jsonl');
+    expect(h.hold('screen')).toBe(true);
+    h.queue.ingest([mkAssistant('a1', 'u1', 'Answer', 'end_turn')], '/t/s.jsonl');
+    h.reconcile();
+
+    const originalEmit = h.scope.emitReadyTurns as (opts: unknown) => void;
+    let attempts = 0;
+    h.scope.emitReadyTurns = (opts: unknown) => {
+      attempts++;
+      if (attempts === 1) throw new Error('transient journal failure');
+      originalEmit(opts);
+    };
+    vi.advanceTimersByTime(CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS + 100);
+    expect(attempts).toBe(1);
+    expect(h.queue.peek()[0]?.turnId).toBe('om_retry_marker');
+    expect(h.watchdog.isActive()).toBe(true);
+    expect(h.redrives()).toBe(0);
+
+    vi.advanceTimersByTime(CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS + 100);
+    expect(attempts).toBe(2);
+    expect(h.queue.peek()).toEqual([]);
+    expect(h.redrives()).toBe(1);
+  });
+
   it('Finding 9: cliAlive=false preserves savedEvidenceSource and still redrives if closing records land during pre-settlement ingest', () => {
     let injectClosing = false;
     const h = createWatchdogWiring({

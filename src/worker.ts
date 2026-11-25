@@ -13662,7 +13662,11 @@ function reconcileClaudeOpenTurnWatchdogAfterIngest(): void {
         // explicit `turn_duration` / next-turn / CLI-exit contract.
         const boundTurn = head;
         const expectedGeneration = bridgeTranscriptGeneration;
-        claudeAwaitingMarkerSafetyTimer = setTimeout(() => {
+        function armMarkerSafety(): void {
+          claudeAwaitingMarkerSafetyTimer = setTimeout(markerSafetyRelease, CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS);
+          claudeAwaitingMarkerSafetyTimer.unref?.();
+        }
+        function markerSafetyRelease(): void {
           claudeAwaitingMarkerSafetyTimer = null;
           if (expectedGeneration !== bridgeTranscriptGeneration) {
             disarmClaudeOpenTurnWatchdog();
@@ -13689,13 +13693,22 @@ function reconcileClaudeOpenTurnWatchdogAfterIngest(): void {
               });
             } catch (err: any) {
               log(`Claude awaiting-marker safety release error: ${err.message}`);
+              // A transient read/journal failure must not strand the only
+              // bounded exit. Retry only while the exact same head still waits;
+              // a partially successful emit or a successor disarms below.
+              if (bridgeQueue.peek()[0] === current
+                && bridgeQueue.isAwaitingDurationMarker(current)
+                && claudeOpenTurnWatchdog.isAwaitingMarkerRedriveFor(boundKey)) {
+                armMarkerSafety();
+                return;
+              }
             }
           }
           disarmClaudeOpenTurnWatchdog();
           if (openClaudeLifecycleTurn() !== undefined || bridgeQueue.hasActiveOrQueuedHead?.()) return;
           fireClaudeRedriveEdge();
-        }, CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS);
-        claudeAwaitingMarkerSafetyTimer.unref?.();
+        }
+        armMarkerSafety();
       }
     }
     return;
