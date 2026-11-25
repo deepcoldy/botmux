@@ -1,7 +1,8 @@
-import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { doubaoExportAnswer, doubaoExportFrontier } from './doubao-transcript.js';
 import type { CodexPendingTurn } from './codex-bridge-queue.js';
@@ -28,10 +29,65 @@ export function exportDoubaoSession(bin: string, sessionId: string, options: {
   cwd?: string; env?: NodeJS.ProcessEnv;
 }): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    execFile(bin, ['--export', sessionId], { ...options, timeout: 8_000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
-      if (error) { reject(new Error('doubao_export_unavailable')); return; }
-      try { resolve(JSON.parse(stdout)); } catch { reject(new Error('doubao_export_invalid')); }
-    });
+    let directory: string | undefined;
+    let inputFd: number | undefined;
+    let child: ReturnType<typeof spawn> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const cleanup = () => {
+      if (directory) { try { rmSync(directory, { recursive: true, force: true }); } catch { } }
+    };
+    const finish = (error?: Error, value?: unknown) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      child?.stdout?.destroy(); child?.stderr?.destroy();
+      cleanup();
+      if (error) reject(error); else resolve(value);
+    };
+    const abort = () => {
+      if (settled) return;
+      if (child?.pid) {
+        try {
+          if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL');
+          else child.kill('SIGKILL');
+        } catch { try { child.kill('SIGKILL'); } catch { } }
+      }
+      // A descendant may keep the pipe open after its launcher exits. The
+      // deadline settles this read independently of stdio close.
+      finish(new Error('doubao_export_unavailable'));
+    };
+    try {
+      // Node's default child stdin is a socket, which the native CLI rejects
+      // even for --export. An empty regular file supplies no task input.
+      directory = mkdtempSync(join(tmpdir(), 'botmux-doubao-export-'));
+      inputFd = openSync(join(directory, 'stdin'), 'wx+', 0o600);
+      child = spawn(bin, ['--export', sessionId], {
+        ...options, detached: process.platform !== 'win32',
+        stdio: [inputFd, 'pipe', 'pipe'], windowsHide: true
+      });
+      closeSync(inputFd); inputFd = undefined;
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      child.stdout?.on('data', (chunk: Buffer) => {
+        if (settled) return;
+        bytes += chunk.length;
+        if (bytes > 4 * 1024 * 1024) abort();
+        else chunks.push(chunk);
+      });
+      child.stderr?.on('data', (chunk: Buffer) => { bytes += chunk.length; if (bytes > 4 * 1024 * 1024) abort(); });
+      child.once('error', abort);
+      child.once('close', (code, signal) => {
+        if (settled) return;
+        if (code !== 0 || signal || child?.killed) { finish(new Error('doubao_export_unavailable')); return; }
+        try { finish(undefined, JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+        catch { finish(new Error('doubao_export_invalid')); }
+      });
+      timer = setTimeout(abort, 8_000);
+    } catch {
+      if (inputFd !== undefined) { try { closeSync(inputFd); } catch { } }
+      abort();
+    }
   });
 }
 

@@ -14821,6 +14821,9 @@ const doubaoExportRecovery = new DoubaoExportRecovery({
   readExport: nativeId => exportDoubaoSession(cliAdapter!.resolvedBin, nativeId, {
     cwd: lastInitConfig?.workingDir,
     env: { ...redactChildEnv(process.env), ...lastInitConfig?.env, DOUBAO_CLI_NO_UPDATE_CHECK: '1' },
+  }).catch(error => {
+    log(`Doubao export failed: ${error.message}`);
+    throw error;
   }),
   commitMode: path => commitDoubaoExportMode(config.session.dataDir, path),
   settle: settleDoubaoExportTurn,

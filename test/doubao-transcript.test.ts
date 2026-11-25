@@ -10,8 +10,8 @@
  * the real logged-in account's session store.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import {
@@ -25,7 +25,8 @@ import {
   doubaoExportAnswer,
   doubaoExportFrontier,
 } from '../src/services/doubao-transcript.js';
-import { commitDoubaoExportMode, doubaoExportOwnsTerminals, DoubaoExportRecovery } from '../src/services/doubao-export-recovery.js';
+import { commitDoubaoExportMode, doubaoExportOwnsTerminals, DoubaoExportRecovery, exportDoubaoSession } from '../src/services/doubao-export-recovery.js';
+import { writeFakeDoubaoTui } from './helpers/fake-doubao-tui.js';
 import { doubaoBridgeSpec, doubaoContentWithCaptureId } from '../src/adapters/cli/doubao.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -34,6 +35,38 @@ const SID = '38459999999999999';
 const AGENT = 'm_agent1';
 
 describe('Doubao export recovery authority', () => {
+  it('exports through a native-compatible stdin instead of a child-process socket', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'doubao-export-stdin-'));
+    const { trajectory } = makeSession(root);
+    const ctlDir = join(root, 'ctl');
+    const fake = writeFakeDoubaoTui(root, { systemDir: dirname(trajectory), ctlDir, inputLog: join(root, 'inputs.jsonl') });
+    const expected = [{ query: 'native input', response: 'NATIVE_STDIN_OK' }];
+    writeFileSync(join(ctlDir, 'export.json'), JSON.stringify(expected));
+    await expect(exportDoubaoSession(fake, SID, { cwd: root })).resolves.toEqual(expected);
+  });
+
+  it.each(['export-hang', 'export-held-pipes'])('bounds export settlement despite %s', async mode => {
+    const root = mkdtempSync(join(tmpdir(), 'doubao-export-bounded-'));
+    const { trajectory } = makeSession(root);
+    const ctlDir = join(root, 'ctl');
+    const fake = writeFakeDoubaoTui(root, { systemDir: dirname(trajectory), ctlDir, inputLog: join(root, 'inputs.jsonl') });
+    writeFileSync(join(ctlDir, mode), '');
+    const stopFakeProcesses = () => {
+      for (const name of ['export-child.pid', 'export-process.pid']) {
+        const file = join(ctlDir, name);
+        if (existsSync(file)) { try { process.kill(Number(readFileSync(file, 'utf8')), 'SIGKILL'); } catch { } }
+      }
+    };
+    let forcedCleanup = false;
+    const watchdog = setTimeout(() => { forcedCleanup = true; stopFakeProcesses(); }, 15_000);
+    try {
+      await expect(exportDoubaoSession(fake, SID, { cwd: root })).rejects.toThrow('doubao_export_unavailable');
+      expect(forcedCleanup).toBe(false);
+    } finally {
+      clearTimeout(watchdog); stopFakeProcesses();
+    }
+  }, 20_000);
+
   function rig() {
     const root = mkdtempSync(join(tmpdir(), 'doubao-export-'));
     const { assignment, trajectory } = makeSession(root);

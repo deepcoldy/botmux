@@ -62,8 +62,21 @@ const has = name => fs.existsSync(ctl(name));
 const read = name => { try { return fs.readFileSync(ctl(name), 'utf8').trim(); } catch { return ''; } };
 const appendJson = row => fs.appendFileSync(TRAJECTORY, JSON.stringify(row) + '\\n');
 const EXPORT = ctl('export.json');
+if (process.argv.includes('--hold-export-pipes')) { setInterval(() => {}, 100); return; }
 if (process.argv.includes('--export')) {
+  const stdin = fs.fstatSync(0);
+  if (!process.stdin.isTTY && !stdin.isFIFO() && !stdin.isFile()) {
+    process.stderr.write('stdin must be a terminal, pipe or regular file\\n');
+    process.exit(2);
+  }
   fs.appendFileSync(ctl('exports.log'), 'export\\n');
+  fs.writeFileSync(ctl('export-process.pid'), String(process.pid));
+  if (has('export-hang')) { process.on('SIGTERM', () => {}); setInterval(() => {}, 100); return; }
+  if (has('export-held-pipes')) {
+    const child = require('node:child_process').spawn(process.execPath, [__filename, '--hold-export-pipes'], { stdio: ['ignore', 1, 2] });
+    fs.writeFileSync(ctl('export-child.pid'), String(child.pid));
+    process.stdout.write('[]'); process.exit(0);
+  }
   if (has('export-error')) process.exit(2);
   const snapshot = has('export-invalid') ? '{' : (has('export.json') ? fs.readFileSync(EXPORT, 'utf8') : '[]');
   setTimeout(() => { process.stdout.write(snapshot); process.exit(0); }, Number(read('export-delay')) || 0);
