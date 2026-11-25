@@ -1,5 +1,6 @@
 import type { OncallFormDraft } from '../../services/oncall-form-store.js';
 import { hostOncallSidebar } from '../../services/oncall-sidebar-link.js';
+import { ONCALL_FIELD_LIMIT, oncallFieldName } from '../../services/oncall-custom-form.js';
 import { buildOncallGroupColumn } from './oncall-card-actions.js';
 
 export function buildOncallFormCard(draft: OncallFormDraft, dashboardUrl?: string): string {
@@ -9,6 +10,29 @@ export function buildOncallFormCard(draft: OncallFormDraft, dashboardUrl?: strin
     const issued = draft.nativeSubmission?.attempts.find(item => item.sidebarLink?.href === link)?.sidebarLink;
     return issued ? hostOncallSidebar(link, dashboardUrl, draft, issued.token) : link;
   };
+  if (draft.botmuxFields?.length) {
+    const category = draft.choices.regions[draft.region]?.find(item => item.id === draft.typeId);
+    const plainText = (content: string) => ({ tag: 'plain_text', content });
+    return JSON.stringify({
+      config: { update_multi: draft.visibility === 'thread', wide_screen_mode: true },
+      header: { title: plainText('补充 Oncall 信息'), template: 'blue' },
+      elements: [
+        { tag: 'div', text: plainText([draft.region, category?.name, draft.priority].filter(Boolean).join(' · ')) },
+        { tag: 'form', name: 'botmux_oncall_custom_form', elements: [
+          ...draft.botmuxFields.map((field, index) => ({
+            tag: 'input', name: oncallFieldName(index), label: plainText(field.label), label_position: 'top',
+            required: field.required, max_length: ONCALL_FIELD_LIMIT,
+          })),
+          { tag: 'button', name: 'botmux_oncall_submit', type: 'primary', text: plainText('提交并创建人工 Oncall 群'),
+            action_type: 'form_submit', value: value('oncall_group_form_botmux_submit') },
+        ] },
+        { tag: 'action', actions: [
+          { tag: 'button', text: plainText('返回分类选择'), value: value('oncall_group_form_back') },
+          { tag: 'button', text: plainText('取消'), value: value('oncall_group_form_cancel') },
+        ] },
+      ],
+    });
+  }
   if (draft.nativeEntry) return JSON.stringify({ schema: '2.0', config: { update_multi: true, width_mode: 'fill' },
     header: { title: { tag: 'plain_text', content: '发起人工 Oncall' }, template: 'blue' }, body: { elements: [
       { tag: 'markdown', content: draft.description },

@@ -5,10 +5,11 @@ import { config } from '../../config.js';
 import { buildDashboardUrls } from '../../core/dashboard-url.js';
 import { logger } from '../../utils/logger.js';
 import { OncallGroupStore, oncallForwardingPending, pendingOncallMessageIds, type OncallGroupSource } from '../../services/oncall-group-store.js';
-import { oncallGroupEnabled, type OncallGroupPolicy, type OncallForwardMode } from '../../services/oncall-group-policy.js';
+import { nativeFormPolicyFingerprint, oncallGroupEnabled, type OncallGroupPolicy, type OncallForwardMode } from '../../services/oncall-group-policy.js';
 import { createOncallGroup, loadOncallGroupTarget, OncallGroupApiError, ONCALL_GROUP_CREATE_TIMEOUT_MS } from '../../services/oncall-group-client.js';
 import { getMessageDetail, replyMessage } from './client.js';
-import { createNativeOncallLink, readNativeOncallResult, readNativeOncallResultCandidates, readOncallChoices, readOncallGroupResult, requiresNativeOncallForm, validateOncallSelection } from '../../services/oncall-platform.js';
+import { createNativeOncallLink, readNativeOncallResult, readNativeOncallResultCandidates, readOncallChoices, readOncallGroupResult, readOncallWorkflow, validateOncallSelection } from '../../services/oncall-platform.js';
+import { botmuxOncallFields, serializeBotmuxOncallForm } from '../../services/oncall-custom-form.js';
 import { OncallFormStore, type OncallFormDraft, type OncallNativeSubmissionAttempt } from '../../services/oncall-form-store.js';
 import { buildOncallFormCard } from './oncall-form-card.js';
 import { createHash, randomBytes } from 'node:crypto';
@@ -349,7 +350,7 @@ async function openOncallForm(source: OncallGroupSource, operator: NonNullable<C
     if (JSON.stringify(getBot(source.appId).config.oncallGroup) !== policySnapshot) throw new Error('转人工配置已变更，请重新打开');
     if (current.targetFingerprint !== JSON.stringify(target)) throw new Error('业务目标已变更，请先取消旧表单后重新打开');
     if ((current.visibility ?? 'private') !== visibility) throw new Error('展示方式已变更，请先取消旧表单后重新打开');
-    if (!current.nativeEntry) await prepareSelectedNativeForm(current, username);
+    if (!current.nativeEntry && !current.botmuxFields) await prepareSelectedNativeForm(current, username);
     if (JSON.stringify(getBot(source.appId).config.oncallGroup) !== policySnapshot) throw new Error('转人工配置已变更，请重新打开');
     assertOncallFormCurrent(current);
     if (current.messageId) {
@@ -392,6 +393,10 @@ function nativeSelectionMarker(draft: OncallFormDraft, typeId: number, username:
   return `${draft.id}.${createHash('sha256').update(selection).digest('hex').slice(0, 24)}`;
 }
 
+function selectedBotmuxFields(policy: OncallGroupPolicy | undefined, draft: OncallFormDraft, workflow: unknown[] | undefined) {
+  if (policy?.customFormMode === 'botmux' && draft.priority !== 'P0') return botmuxOncallFields(workflow);
+}
+
 /** Prepare the selected form before rendering its confirmation button. */
 async function prepareSelectedNativeForm(draft: OncallFormDraft, username = draft.oncallUsername,
   loadUsername?: () => Promise<string>): Promise<void> {
@@ -400,14 +405,17 @@ async function prepareSelectedNativeForm(draft: OncallFormDraft, username = draf
   const deployment = readOncallDeploymentEnv();
   const target = loadOncallGroupTarget(config.session.dataDir, draft.appId, deployment);
   const secret = deployment.ONCALL_SERVICE_SECRET?.trim() ?? '';
-  const policySnapshot = JSON.stringify(getBot(draft.appId).config.oncallGroup);
+  const bot = getBot(draft.appId).config;
+  const policySnapshot = JSON.stringify(bot.oncallGroup);
+  const policyFingerprint = nativeFormPolicyFingerprint(bot.oncallGroup)!;
   let nativeFormLink: string | undefined;
-  const requiresNative = await requiresNativeOncallForm(target, secret, category);
+  const workflow = await readOncallWorkflow(target, secret, category);
+  const requiresNative = (workflow === undefined || workflow.length > 0) && !selectedBotmuxFields(bot.oncallGroup, draft, workflow);
   if (requiresNative) {
     username = username ?? await loadUsername?.();
     if (!username) throw new Error('无法确认 Oncall 提单人，请重新打开表单');
     nativeFormLink = await createNativeOncallLink(target, secret, '', draft.description, getBot(draft.appId).config.brand, fetch,
-      { region: draft.region, typeId: category.id, priority: draft.priority, formId: nativeSelectionMarker(draft, category.id, username, policySnapshot) });
+      { region: draft.region, typeId: category.id, priority: draft.priority, formId: nativeSelectionMarker(draft, category.id, username, policyFingerprint) });
   }
   if (JSON.stringify(getBot(draft.appId).config.oncallGroup) !== policySnapshot
     || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, draft.appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新打开表单');
@@ -415,7 +423,7 @@ async function prepareSelectedNativeForm(draft: OncallFormDraft, username = draf
   if (nativeFormLink && username) {
     draft.nativeFormLink = recordNativeSubmissionAttempt(draft, nativeFormLink, {
       sourceLocation: new URL(nativeFormLink).searchParams.get('url')!.slice(0, 200), username,
-      preparedAtMs: Date.now(), policyFingerprint: policySnapshot, forwardMode: getBot(draft.appId).config.oncallGroup?.forwardMode ?? 'individual',
+      preparedAtMs: Date.now(), policyFingerprint, forwardMode: bot.oncallGroup?.forwardMode ?? 'individual',
       typeId: category.id, region: draft.region,
     });
   } else delete draft.nativeFormLink;
@@ -478,7 +486,7 @@ function assertOncallFormCurrent(latest: OncallFormDraft): void {
   const currentRequest = groups.getRequest(latest.source);
   if (!classifiedCardPolicy(policy, latest)
     || (latest.targetFingerprint && latest.targetFingerprint !== JSON.stringify(loadOncallGroupTarget(config.session.dataDir, latest.appId)))
-    || (latest.nativeEntry && latest.nativeEntry.policyFingerprint !== JSON.stringify(policy))
+    || (latest.nativeEntry && latest.nativeEntry.policyFingerprint !== nativeFormPolicyFingerprint(policy))
     || (currentRequest && currentRequest.status !== 'failed')) {
     throw new Error('表单配置或请求状态已变更，请重新打开入口');
   }
@@ -546,7 +554,8 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
           ...(draft.visibility === 'thread' ? { afterAck: () => refreshOncallFormCard(appId, draft.id, owner) } : {}) };
       }
       if (value.version !== draft.version) {
-        if (draft.visibility === 'thread' && Number.isSafeInteger(value.version) && value.version < draft.version && draft.messageId) {
+        if ((draft.visibility === 'thread' || draft.botmuxFields) && Number.isSafeInteger(value.version)
+          && value.version < draft.version && draft.messageId) {
           return { toast: { type: 'info', content: '已恢复当前分类选择，请基于最新卡片继续' },
             afterAck: () => refreshOncallFormCard(appId, draft.id, owner) };
         }
@@ -564,19 +573,24 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
       if (draft.nativeEntry) return { toast: { type: 'info', content: '此分类已转由平台表单填写，请从当前卡片继续' },
         afterAck: () => refreshOncallFormCard(appId, draft.id, owner) };
       const previousDraft = { ...draft };
+      const action = value.action;
+      const botmuxSubmit = action === 'oncall_group_form_botmux_submit';
+      if (draft.botmuxFields && !botmuxSubmit && action !== 'oncall_group_form_back') throw new Error('请填写当前表单或返回分类选择');
       const option = typeof data.action?.option === 'string' ? data.action.option : undefined;
-      if (value.action === 'oncall_group_form_region') {
+      if (action === 'oncall_group_form_back' && draft.botmuxFields) {
+        delete draft.botmuxFields;
+      } else if (action === 'oncall_group_form_region') {
         if (typeof option !== 'string' || !Object.hasOwn(draft.choices.regions, option)) throw new Error('问题区域已失效，请重新加载');
         draft.region = option;
         draft.typeId = draft.choices.regions[option][0]?.id;
-      } else if (value.action === 'oncall_group_form_category') {
+      } else if (action === 'oncall_group_form_category') {
         const category = draft.choices.regions[draft.region]?.find(item => String(item.id) === option);
         if (!category || category.type_action !== 'create_chat') throw new Error('此分类不是人工提单渠道，请使用原生侧栏');
         draft.typeId = category.id;
-      } else if (value.action === 'oncall_group_form_priority') {
+      } else if (action === 'oncall_group_form_priority') {
         if (!['P2', 'P1', 'P0'].includes(option ?? '')) throw new Error('问题等级无效');
         draft.priority = option as OncallFormDraft['priority'];
-      } else if (value.action === 'oncall_group_form_submit') {
+      } else if (action === 'oncall_group_form_submit' || botmuxSubmit) {
         const deployment = readOncallDeploymentEnv();
         const target = loadOncallGroupTarget(config.session.dataDir, appId, deployment);
         const secret = deployment.ONCALL_SERVICE_SECRET?.trim() ?? '';
@@ -588,9 +602,28 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
         const currentPolicySnapshot = JSON.stringify(currentPolicy);
         if (!classifiedCardPolicy(currentPolicy, draft)
           || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新打开表单');
-        if (selection.requiresNativeForm) {
+        const fields = selectedBotmuxFields(currentPolicy, draft, selection.workflow);
+        let workflowConfig: string | undefined;
+        if (botmuxSubmit) {
+          if (!draft.botmuxFields || !fields || JSON.stringify(fields) !== JSON.stringify(draft.botmuxFields)) {
+            throw new Error('表单配置已变更，请返回分类选择后重试');
+          }
+          workflowConfig = serializeBotmuxOncallForm(fields, data.action?.form_value);
+        } else if (fields) {
+          const request = store.getRequest(source);
+          if (request && request.status !== 'failed') {
+            return { toast: { type: 'info', content: '此会话已有请求，请从结果卡继续' } };
+          }
+          draft.botmuxFields = fields;
+          delete draft.nativeFormLink;
+          draft.version++;
+          persist();
+          return { toast: { type: 'info', content: '请在当前卡片补充信息后提交' },
+            afterAck: () => refreshOncallFormCard(appId, draft.id, owner) };
+        } else if (selection.requiresNativeForm) {
+          const policyFingerprint = nativeFormPolicyFingerprint(currentPolicy)!;
           const nativeLink = await createNativeOncallLink(target, secret, '', draft.description, bot.brand, fetch,
-            { region: draft.region, typeId: selection.id, priority: draft.priority, formId: nativeSelectionMarker(draft, selection.id, username, currentPolicySnapshot) });
+            { region: draft.region, typeId: selection.id, priority: draft.priority, formId: nativeSelectionMarker(draft, selection.id, username, policyFingerprint) });
           if (JSON.stringify(getBot(appId).config.oncallGroup) !== currentPolicySnapshot
             || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新打开表单');
           const concurrentRequest = store.getRequest(source);
@@ -600,10 +633,10 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
           draft.oncallUsername = username;
           const href = recordNativeSubmissionAttempt(draft, nativeLink, {
             sourceLocation: new URL(nativeLink).searchParams.get('url')!.slice(0, 200), username,
-            preparedAtMs: Date.now(), policyFingerprint: currentPolicySnapshot, forwardMode: currentPolicy?.forwardMode ?? 'individual',
+            preparedAtMs: Date.now(), policyFingerprint, forwardMode: currentPolicy?.forwardMode ?? 'individual',
             typeId: selection.id, region: draft.region,
           });
-          draft.nativeEntry = { href, categoryName: selection.name, policyFingerprint: currentPolicySnapshot };
+          draft.nativeEntry = { href, categoryName: selection.name, policyFingerprint };
           draft.targetFingerprint = JSON.stringify(target);
           draft.version++;
           persist();
@@ -619,7 +652,7 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
         const attemptId = store.getRequest(source)?.attemptId;
         try {
           const result = await createOncallGroup(target, secret, username, draft.description, fetch,
-            { region: draft.region, typeId: draft.typeId, priority: draft.priority }, attemptId);
+            { region: draft.region, typeId: draft.typeId, priority: draft.priority, workflowConfig }, attemptId);
           store.finish(source, { status: 'succeeded', ...result, formClosePending: true }, attemptId);
           draft.closed = true;
           persist();
@@ -961,16 +994,16 @@ export async function reconcileNativeOncallSubmissions(appId: string, owns: () =
         if (!submission?.attempts.length || submission.completed) return;
         const target = loadOncallGroupTarget(config.session.dataDir, appId);
         const assertCurrent = (attempt?: OncallNativeSubmissionAttempt) => {
-          const policySnapshot = JSON.stringify(getBot(appId).config.oncallGroup);
-          if (!owns() || !classifiedCardPolicy(getBot(appId).config.oncallGroup, draft)
-            || (attempt && policySnapshot !== attempt.policyFingerprint)
+          const policy = getBot(appId).config.oncallGroup;
+          if (!owns() || !classifiedCardPolicy(policy, draft)
+            || (attempt && nativeFormPolicyFingerprint(policy) !== attempt.policyFingerprint)
             || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== draft.targetFingerprint) {
             throw new Error('原生提单配置已变化，暂不关联或转交');
           }
         };
         assertCurrent();
-        const policySnapshot = JSON.stringify(getBot(appId).config.oncallGroup);
-        const eligibleAttempts = submission.attempts.filter(item => item.policyFingerprint === policySnapshot);
+        const policyFingerprint = nativeFormPolicyFingerprint(getBot(appId).config.oncallGroup);
+        const eligibleAttempts = submission.attempts.filter(item => item.policyFingerprint === policyFingerprint);
         if (!eligibleAttempts.length) throw new Error('原生提单配置已变化，暂不关联或转交');
         const request = groups.getRequest(draft.source);
         let completionAttempt = eligibleAttempts.at(-1)!;

@@ -13,7 +13,7 @@ export interface OncallCategory {
 }
 export interface OncallChoices { regions: Record<string, OncallCategory[]> }
 export interface OncallNativeSelection { region: string; typeId: number; priority: 'P2' | 'P1' | 'P0'; formId?: string }
-export type OncallSelection = OncallCategory & { requiresNativeForm: boolean };
+export type OncallSelection = OncallCategory & { requiresNativeForm: boolean; workflow?: unknown[] };
 
 /** Reconcile an uncertain create by its opaque attempt marker, never by question text. */
 export async function readOncallGroupResult(creation: OncallGroupCreation, secret: string, attemptId: string,
@@ -95,30 +95,30 @@ export async function readOncallChoices(target: OncallGroupTarget, secret: strin
   return { regions };
 }
 
-/** Validate the current route before deciding whether the card or the platform
- * should collect the form. Custom fields are handled by the native form. */
+/** Validate the current route and load the current custom-field definition. */
 export async function validateOncallSelection(target: OncallGroupTarget, secret: string, username: string,
   region: string, typeId: number, fetcher: typeof fetch = fetch): Promise<OncallSelection> {
   const choices = await readOncallChoices(target, secret, username, fetcher);
   const category = choices.regions[region]?.find(item => item.id === typeId);
   if (!category || category.type_action !== 'create_chat') throw new Error('请选择可创建工单的有效分类');
-  return { ...category, requiresNativeForm: await requiresNativeOncallForm(target, secret, category, fetcher, username) };
+  const workflow = await readOncallWorkflow(target, secret, category, fetcher, username);
+  return { ...category, workflow, requiresNativeForm: workflow === undefined || workflow.length > 0 };
 }
 
 /** Workflow metadata is reusable when the authorized choices were just loaded. */
-export async function requiresNativeOncallForm(target: OncallGroupTarget, secret: string, category: OncallCategory,
-  fetcher: typeof fetch = fetch, username = ''): Promise<boolean> {
+export async function readOncallWorkflow(target: OncallGroupTarget, secret: string, category: OncallCategory,
+  fetcher: typeof fetch = fetch, username = ''): Promise<unknown[] | undefined> {
   if (category.tenant_id !== target.tenantId || category.type_action !== 'create_chat') throw new Error('请选择可创建工单的有效分类');
   // This is the explicit human-handoff path: recommended document search and
   // self-diagnosis stages do not add a second prerequisite after confirmation.
-  if (!category.workflow_id) return true;
+  if (!category.workflow_id) return undefined;
   const data = await get(target, secret, username, `workflow/${category.workflow_id}`, {}, fetcher);
   if (data.tenant_id !== target.tenantId || data.type_id !== category.id) throw new Error('表单与当前分类不匹配，请重选');
   let fields: unknown;
   try { fields = typeof data.config === 'string' ? JSON.parse(data.config) : data.config; }
   catch { throw new Error('平台表单配置无效'); }
   if (!Array.isArray(fields)) throw new Error('平台表单配置无效');
-  return fields.length > 0;
+  return fields;
 }
 
 export async function createNativeOncallLink(target: OncallGroupTarget, secret: string, username: string,

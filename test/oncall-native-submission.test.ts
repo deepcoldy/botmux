@@ -117,6 +117,14 @@ describe('native submission completion', () => {
     await retryPendingOncallHandoffs('app');
     expect(mocks.merge).toHaveBeenCalledOnce();
   });
+  it('still adopts a submitted native form if the default changes to Botmux before reconciliation', async () => {
+    const d = await open();
+    submitted(d);
+    mocks.bot.config.oncallGroup.customFormMode = 'botmux';
+    await retryPendingOncallHandoffs('app');
+    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', openChatId: 'oc_destination' });
+    expect((await current(d)).nativeSubmission?.completed).toBe(true);
+  });
   it.each(['originator_user', 'tenant_id', 'source_location', 'region'])('rejects a mismatched %s without adoption or forwarding', async key => {
     const d = await open(); submitted(d); rows[0][key] = typeof rows[0][key] === 'number' ? 99 : 'different';
     await retryPendingOncallHandoffs('app'); expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();

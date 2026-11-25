@@ -442,6 +442,117 @@ describe('preloaded custom-form confirmation', () => {
   });
 });
 
+describe('Botmux custom Oncall form', () => {
+  const input = (key: string, label: string, required = false) => ({
+    base: { key, label, type: 'input', disabled: { sourceType: 'value', value: false }, ignoreReadonly: false,
+      defaultValue: { sourceType: 'value', value: '' } },
+    custom: { valueTrigger: 'onChange' },
+    shown: { exist: { sourceType: 'value', value: true }, untouchable: { sourceType: 'value', value: false } },
+    helper: {},
+    ...(required ? { validate: { required: true } } : {}),
+  });
+  const fields = [input('biz_id1', '流程节点名称', true), input('biz_id2', '业务线')];
+  const creates = () => fetcher.mock.calls.filter(([, init]) => init?.method === 'POST');
+  async function open(workflow: unknown[] = fields, visibility: 'thread' | 'private' = 'thread') {
+    Object.assign(mocks.bot.config.oncallGroup, {
+      customFormMode: 'botmux', formDisplay: visibility === 'thread' ? 'thread_card' : 'private_card',
+    });
+    mocks.mode.mockResolvedValue(visibility === 'thread' ? 'topic' : 'group');
+    mocks.thread.mockResolvedValue({ verifiedThread: true, messages: [
+      { message_id: source.questionId, create_time: '100' },
+      { message_id: source.messageId, create_time: '200' },
+    ] });
+    fetcher.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return response({ oncall_flow_id: '123', open_chat_id: 'oc_created' });
+      if (url.includes('/workflow/')) return response({ tenant_id: 12, type_id: 34, config: JSON.stringify(workflow) });
+      if (url.includes('/tools/')) return response({ lark_dialog_url: `https://applink.feishu.cn/client/web_url/open?url=${encodeURIComponent('https://oncall.example.test/chat?tenant=12')}` });
+      return response({ region: { cn: [category] } });
+    });
+    expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('info');
+    return draftForCurrentSource();
+  }
+  function draftForCurrentSource() {
+    return new OncallFormStore(dir).open({ appId: 'app', ownerOpenId: 'ou_owner', source, choices: { regions: { cn: [category] } },
+      region: 'cn', typeId: 34, priority: 'P2', description: 'question' });
+  }
+  async function showFields(d: ReturnType<typeof draftForCurrentSource>) {
+    const confirmed = await handleOncallFormAction(event('oncall_group_form_submit', d), 'app');
+    expect(confirmed.toast.type).toBe('info');
+    expect(creates()).toHaveLength(0);
+    await confirmed.afterAck();
+    const updates = d.visibility === 'thread' ? mocks.update : mocks.ephemeral;
+    const card = JSON.parse(updates.mock.calls.at(-1)![d.visibility === 'thread' ? 2 : 3]);
+    return { draft: draftForCurrentSource(), card, form: card.elements.find((element: any) => element.tag === 'form') };
+  }
+  it('submits both configured fields once, then publishes the group link and forwards the conversation', async () => {
+    const shown = await showFields(await open());
+    expect(mocks.reply).toHaveBeenCalledOnce();
+    expect(mocks.update.mock.calls.at(-1)![1]).toBe(shown.draft.messageId);
+    expect(shown.form.elements).toMatchObject([
+      { tag: 'input', name: 'oncall_field_0', label: { content: '流程节点名称' }, required: true },
+      { tag: 'input', name: 'oncall_field_1', label: { content: '业务线' }, required: false },
+      { tag: 'button', action_type: 'form_submit', value: { action: 'oncall_group_form_botmux_submit', version: shown.draft.version } },
+    ]);
+    const submit = event('oncall_group_form_botmux_submit', shown.draft);
+    submit.action.value = shown.form.elements.at(-1).value;
+    submit.action.form_value = { oncall_field_0: '结账', oncall_field_1: '核算' };
+    const submitted = await handleOncallFormAction(submit, 'app');
+    expect(submitted.toast).toMatchObject({ type: 'success' });
+    await submitted.afterAck();
+    await handleOncallFormAction(submit, 'app');
+    expect(creates()).toHaveLength(1);
+    const body = JSON.parse(creates()[0][1].body);
+    expect(JSON.parse(body.workflow_config)).toEqual({
+      biz_id1: { value: '结账', name: 'biz_id1', type: 'input' },
+      biz_id2: { value: '核算', name: 'biz_id2', type: 'input' },
+    });
+    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', openChatId: 'oc_created' });
+    expect(mocks.update.mock.calls.some(call => call[1] === source.messageId && call[2].includes('link_token=invite-oc_created'))).toBe(true);
+    expect(mocks.forward.mock.calls.map(call => call[1])).toEqual([source.questionId, source.messageId]);
+  });
+  it('rejects other users and missing required text, and allows returning to classification', async () => {
+    const shown = await showFields(await open());
+    const submit = event('oncall_group_form_botmux_submit', shown.draft);
+    expect((await handleOncallFormAction({ ...submit, operator: { open_id: 'ou_other' } }, 'app')).toast.type).toBe('error');
+    expect((await handleOncallFormAction(submit, 'app')).toast.content).toContain('请填写「流程节点名称」');
+    const back = await handleOncallFormAction(event('oncall_group_form_back', shown.draft), 'app');
+    await back.afterAck();
+    expect(draftForCurrentSource().botmuxFields).toBeUndefined();
+    await handleOncallFormAction(submit, 'app');
+    expect(creates()).toHaveLength(0);
+  });
+  it('does not accept a rendered Botmux form after switching to native', async () => {
+    const shown = await showFields(await open());
+    mocks.bot.config.oncallGroup.customFormMode = 'native';
+    const submit = event('oncall_group_form_botmux_submit', shown.draft);
+    submit.action.form_value = { oncall_field_0: '结账' };
+    expect((await handleOncallFormAction(submit, 'app')).toast.content).toContain('表单配置已变更');
+    await (await handleOncallFormAction(event('oncall_group_form_back', shown.draft), 'app')).afterAck();
+    expect(draftForCurrentSource().nativeFormLink).toContain('/client/web_url/open');
+    expect(creates()).toHaveLength(0);
+  });
+  it('uses the native link for unsupported fields', async () => {
+    const d = await open([{ base: { key: 'owner', type: 'person', label: '负责人' } }]);
+    expect(d.nativeFormLink).toContain('/client/web_url/open');
+    expect(d.botmuxFields).toBeUndefined();
+  });
+  it('keeps a category with no custom fields on the ordinary group path', async () => {
+    const d = await open([]);
+    const submitted = await handleOncallFormAction(event('oncall_group_form_submit', d), 'app');
+    expect(submitted.toast).toMatchObject({ type: 'success' });
+    expect(creates()).toHaveLength(1);
+    expect(JSON.parse(creates()[0][1].body)).not.toHaveProperty('workflow_config');
+  });
+  it('replaces the private card without publishing the form to the group', async () => {
+    const d = await open(fields, 'private');
+    mocks.ephemeral.mockResolvedValueOnce('om_private_form');
+    const shown = await showFields(d);
+    expect(shown.draft.messageId).toBe('om_private_form');
+    expect(shown.form.elements).toHaveLength(3);
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(mocks.remove).toHaveBeenCalledWith('app', d.messageId);
+  });
+});
 
 describe('classified native Oncall form handoff', () => {
   const nativeAppLink = (tenant = 12) => `https://applink.feishu.cn/client/web_url/open?url=${encodeURIComponent(`https://oncall.example.test/chat?tenant=${tenant}&type=None&region=None`)}`;

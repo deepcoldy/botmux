@@ -6,7 +6,8 @@ import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
 import { OncallGroupStore, type OncallGroupSource } from './oncall-group-store.js';
 import { loadOncallGroupTarget } from './oncall-group-client.js';
 import type { NativeOncallResultQuery, OncallChoices } from './oncall-platform.js';
-import { oncallGroupEnabled, type OncallForwardMode, type OncallGroupPolicy } from './oncall-group-policy.js';
+import { nativeFormPolicyFingerprint, oncallGroupEnabled, type OncallForwardMode, type OncallGroupPolicy } from './oncall-group-policy.js';
+import type { OncallTextField } from './oncall-custom-form.js';
 
 const FORM_LIFETIME_MS = 24 * 60 * 60_000;
 
@@ -44,6 +45,8 @@ export interface OncallFormDraft {
   description: string;
   /** Prepared before publication, so custom-form confirmation opens the sidebar directly. */
   nativeFormLink?: string;
+  /** Published field definition, scoped to this draft and version. */
+  botmuxFields?: OncallTextField[];
   /** Every published selection is retained until the card is retired. */
   nativeSubmission?: OncallNativeSubmission;
   oncallUsername?: string;
@@ -100,7 +103,7 @@ export class OncallFormStore {
     if (!attempt?.sidebarLink) return;
     try {
       const policy = readPolicy(appId);
-      if (!oncallGroupEnabled(policy, draft.source.chatId) || JSON.stringify(policy) !== attempt.policyFingerprint
+      if (!oncallGroupEnabled(policy, draft.source.chatId) || nativeFormPolicyFingerprint(policy) !== attempt.policyFingerprint
         || JSON.stringify(loadOncallGroupTarget(this.dataDir, appId)) !== draft.targetFingerprint) return;
       const request = new OncallGroupStore(this.dataDir).getRequest(draft.source);
       if (request && request.status !== 'failed') return;
