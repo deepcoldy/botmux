@@ -183,13 +183,17 @@ const runTurn = (prompt, reply) => {
 // Error: Connection lost mid-response."): a thinking block, then the error
 // record and turn_duration. quietMs first parks the turn on a quiet, non-busy screen
 // mid-work, which the worker reads as the turn ending.
-const failTurn = (prompt, quietMs) => {
+const failTurn = (prompt, quietMs, quietAfterText) => {
   busy = true;
   record({ type: 'user', message: { role: 'user', content: prompt } });
   render();
   let spinner = setInterval(render, 300);
   setTimeout(() => {
-    record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'tool_use', id: 'toolu_fake', name: 'Bash', input: {} }], stop_reason: 'tool_use' } });
+    // The quiet stretch either sits between two tool calls (the transcript shows
+    // the tool cycle is still open) or after a plain text block (nothing in the
+    // transcript says the turn goes on).
+    if (quietAfterText) record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'text', text: 'looking into it' }], stop_reason: 'end_turn' } });
+    else record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'tool_use', id: 'toolu_fake', name: 'Bash', input: {} }], stop_reason: 'tool_use' } });
     clearInterval(spinner);
     busy = !quietMs;
     render();
@@ -264,6 +268,7 @@ const submit = () => {
   else if (text.startsWith('LONGTOOL')) { toolTurn(text, Number(text.split(/\\s+/)[1]) || 20000, 'done'); return; }
   else if (text.startsWith('HANG')) { toolTurn(text, 0, 'hang'); return; }
   else if (text.startsWith('INTERRUPTED')) { toolTurn(text, 500, 'interrupted'); return; }
+  else if (text.startsWith('FAIL_AFTER_TEXT_QUIET')) { failTurn(text, 4000, true); return; }
   else if (text.startsWith('FAIL_AFTER_QUIET')) { failTurn(text, 4000); return; }
   else if (text.startsWith('FAIL')) { failTurn(text, 0); return; }
   else { runTurn(text, 'reply: ' + text); return; }

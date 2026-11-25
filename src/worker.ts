@@ -69,7 +69,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { closeSync, fstatSync, openSync, readSync, accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -197,7 +197,7 @@ import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_M
 import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
-import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
+import { claudeTranscriptTailMidToolCycle, createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
 import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, finalBridgeSendMarkerCoversOwnThread, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
@@ -13791,11 +13791,43 @@ let bridgeTranscriptGeneration = 0;
  *  lifecycle: requesting an idle wait disarms the watchdog (the idle edge's
  *  own settle takes over); cancel/proceed lets bridgeIngest re-arm it if the
  *  head is still waiting afterwards. */
+/** True while the Claude transcript's tail shows the turn is still inside its
+ *  tool cycle: the last assistant record stopped for `tool_use`, or a
+ *  tool_result was written after it (the next model call is in flight). Herdr
+ *  reports `done` and the screen can go quiet in exactly that gap (the API
+ *  request before the next block can take seconds), and settling then pops the
+ *  Lark turn with no answer; the real final lands later as a local turn and is
+ *  suppressed (#3702). Only for the Claude transcript bridge; any read or parse
+ *  problem says "not mid cycle" so behaviour falls back to the bounded settle. */
+function claudeTranscriptMidToolCycle(): boolean {
+  if (!bridgeJsonlPath || lastInitConfig?.cliId !== 'claude-code') return false;
+  let fd: number | undefined;
+  try {
+    fd = openSync(bridgeJsonlPath, 'r');
+    const size = fstatSync(fd).size;
+    const len = Math.min(size, 256 * 1024);
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, size - len);
+    return claudeTranscriptTailMidToolCycle(buf.toString('utf8'));
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* ignore */ } }
+  }
+}
+
 function makeBridgeTranscriptSettle(
   awaitingTerminal: () => boolean,
   onTimeout?: () => void,
+  isCurrent: () => boolean = () => true,
 ): TranscriptTerminalSettle {
-  const inner = createTranscriptTerminalSettle({ awaitingTerminal, onTimeout });
+  // A settle whose backend was replaced or killed must not keep reading the
+  // new transcript, hold on it, or record a marker verdict for it.
+  const inner = createTranscriptTerminalSettle({
+    awaitingTerminal: () => isCurrent() && awaitingTerminal(),
+    onTimeout: onTimeout && (() => { if (isCurrent()) onTimeout(); }),
+    midToolCycle: () => isCurrent() && claudeTranscriptMidToolCycle(),
+  });
   return {
     request: (proceed: () => void): void => {
       disarmProvisionalExitWatch();
@@ -35816,6 +35848,7 @@ async function spawnCliBody(
   const ptyIdleSettle = makeBridgeTranscriptSettle(
     () => bridgeHeadTurnAwaitingTerminal({ startedOnly: true }),
     noteBridgeTurnCloseWaitExpired,
+    () => backend === observedBackend,
   );
   idleTranscriptSettle = ptyIdleSettle;
 
@@ -35910,6 +35943,7 @@ async function spawnCliBody(
     const transcriptSettle = makeBridgeTranscriptSettle(
       () => bridgeHeadTurnAwaitingTerminal(),
       noteBridgeTurnCloseWaitExpired,
+      () => backend === observedBackend,
     );
     const promptReadyEdgesAtSpawn = promptReadyEdges;
     observedBackend.onAgentStatus(bindSessionRuntimeCallback((status) => {
