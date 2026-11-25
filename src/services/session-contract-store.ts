@@ -683,6 +683,31 @@ export class SessionContractStore {
     }
     return chain;
   }
+  /** A physical exit stops the whole in-process lineage, even when reported
+   * under its newest binding. This is NOT execution/observation authority. */
+  runtimeExitLineage(ref: ContractSessionRef, origin: RuntimeRef, worker: WorkerRef): RuntimeRef[] {
+    const neighbors = new Map<string, RuntimeRef[]>();
+    const key = (runtime: RuntimeRef): string => JSON.stringify([runtime.runtimeId, runtime.epoch]);
+    const link = (from: RuntimeRef, to: RuntimeRef): void => {
+      const adjacent = neighbors.get(key(from)) ?? [];
+      adjacent.push(to); neighbors.set(key(from), adjacent);
+    };
+    const rows = this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='runtime_continuation'")
+      .all(sessionKey(ref)) as Array<{ value: string }>;
+    for (const row of rows) {
+      const edge = JSON.parse(row.value) as { from: RuntimeRef; to: RuntimeRef; worker: WorkerRef };
+      if (!sameWorker(edge.worker, worker)) continue;
+      link(edge.from, edge.to); link(edge.to, edge.from);
+    }
+    const lineage = [origin]; const visited = new Set([key(origin)]);
+    for (const runtime of lineage) {
+      for (const adjacent of neighbors.get(key(runtime)) ?? []) {
+        if (visited.has(key(adjacent))) continue;
+        visited.add(key(adjacent)); lineage.push(adjacent);
+      }
+    }
+    return lineage;
+  }
   /** `from` is `to`, or became it through `worker`'s in-process continuations. */
   runtimeContinues(ref: ContractSessionRef, from: RuntimeRef, to: RuntimeRef, worker: WorkerRef): boolean {
     return sameRuntime(from, to) || this.continuedRuntimes(ref, from, worker).some(runtime => sameRuntime(runtime, to));

@@ -356,8 +356,8 @@ export class WorkerSessionEventScope {
     return binding ? this.snapshot(binding) : undefined;
   }
   /**
-   * Origin for a statement about THIS RESTART ATTEMPT rather than about a
-   * runtime observation: the attempt the daemon minted reached a prompt.
+   * Origin for a physical CLI lifecycle fact: a restart attempt reached a
+   * prompt, or the backend exited. Neither belongs to its last turn's runtime.
    *
    * The program-status relay rebinds in process — spawnCli's binding proves the
    * launcher pid, then a second binding proves the real CLI behind it — while

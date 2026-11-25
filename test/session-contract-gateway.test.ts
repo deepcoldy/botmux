@@ -1087,6 +1087,106 @@ describe('contract gateway and real worker boundaries', () => {
     env.readProcessStartIdentity = vi.fn().mockReturnValueOnce('start1').mockReturnValueOnce('start2');
     expect(identity(scope.beginRuntime()).proof).toBe('opaque');
   });
+  it.each([
+    { inputState: 'queued', continuation: false }, { inputState: 'submitted', continuation: false },
+    { inputState: 'queued', continuation: true }, { inputState: 'submitted', continuation: true },
+  ])('delivers the live backend exit after a launcher rebind ($inputState, continuation=$continuation)', async ({ inputState, continuation }) => {
+    const s = fixture();
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const launcher = scope.beginRuntime(undefined, 'same-backend-lifetime');
+    s.controller.reserveBinding(launcher.bindingId, s.worker);
+    s.controller.bindRuntime(launcher.bindingId, s.worker, s.store.runtime(s.ref)!.identity!);
+    scope.assign(launcher.bindingId, s.runtime);
+    const execution = s.controller.admitInput('opening-input');
+    scope.rememberExecution(execution, launcher);
+    if (inputState === 'submitted') {
+      s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+      s.store.apply(s.ref, { type: 'execution_phase', execution, runtime: s.runtime, phase: 'running' });
+      scope.run(launcher, () => scope.recordSubmission(execution.turnId));
+    }
+    const worker = { send: vi.fn() }; s.ds.worker = worker as any;
+    const legacy = vi.fn();
+    const host = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', {
+      sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'rebound-exit', handleLegacyWorkerMessage: legacy,
+    });
+    const env: any = { backend: { write: vi.fn() }, workerSessionEventScope: scope,
+      intentionalRestartBackend: null, fenceContractBackendWrites: vi.fn() };
+    env.bindSessionRuntimeCallback = loadWorkerFunction('bindSessionRuntimeCallback', env);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
+    const bindExit = loadWorkerFunction<(callback: () => Promise<void>) => () => Promise<void>>('bindSessionBackendExit', env);
+    let wire: any;
+    const onExit = scope.run(launcher, () => bindExit(async () => {
+      wire = metadata({ type: 'claude_exit', code: 1, signal: null, turnId: execution.turnId });
+      await host(wire);
+    }));
+    // The backend object and its exit listener survive resolving the launcher's
+    // PID to the real CLI. Only the attested runtime changes.
+    const live = scope.beginRuntime(undefined, launcher.physicalId);
+    const runtime = s.controller.reserveBinding(live.bindingId, s.worker);
+    scope.assign(live.bindingId, runtime);
+    s.controller.bindRuntime(live.bindingId, s.worker, {
+      backend: 'tmux', physicalId: '222:real-cli', proof: 'process_start',
+    }, undefined, continuation ? launcher.bindingId : undefined);
+    await onExit();
+    expect(wire.sessionContract.scope.runtime).toEqual(runtime);
+    expect(wire.sessionContract.scope.execution).toBeUndefined();
+    expect(s.store.runtime(s.ref, runtime.runtimeId)?.phase).toBe('stopped');
+    expect(legacy).toHaveBeenCalledOnce();
+    expect(legacy).toHaveBeenCalledWith(expect.objectContaining({ type: 'claude_exit', code: 1 }));
+    if (inputState === 'queued') {
+      // Reporting the physical failure must not pretend the input ran or replay it.
+      expect(s.store.execution(s.ref, execution.executionId)).toMatchObject({ phase: 'queued' });
+      expect(s.store.execution(s.ref, execution.executionId)?.runtime).toBeUndefined();
+    } else {
+      expect(s.store.execution(s.ref, execution.executionId)?.phase).toBe(continuation ? 'reconciling' : 'running');
+    }
+    expect(s.store.runtime(s.ref, s.runtime.runtimeId)?.phase).toBe(continuation ? 'stopped' : 'retiring');
+  });
+
+  it.each(['none', 'unrelated', 'foreign_worker', 'foreign_generation'] as const)(
+    'settles a multi-hop physical exit without changing terminal, queued or replacement work (replacement=%s)', replacement => {
+    const s = fixture();
+    const running = (turnId: string, runtime: typeof s.runtime) => {
+      const execution = s.controller.admitInput(turnId);
+      s.store.bindQueuedExecution(s.ref, execution, runtime);
+      s.store.apply(s.ref, { type: 'execution_phase', execution, runtime, phase: 'running' });
+      return execution;
+    };
+    const opening = running('opening', s.runtime);
+    const middle = s.controller.reserveBinding('middle', s.worker);
+    s.controller.bindRuntime('middle', s.worker, { backend: 'tmux', physicalId: '222:middle', proof: 'process_start' }, undefined, 'binding-old');
+    const completed = running('completed', middle);
+    s.store.apply(s.ref, { type: 'execution_terminal', execution: completed, runtime: middle, status: 'succeeded', evidence: 'native_terminal' });
+    const terminal = s.store.execution(s.ref, completed.executionId);
+    const live = s.controller.reserveBinding('live', s.worker);
+    s.controller.bindRuntime('live', s.worker, { backend: 'tmux', physicalId: '333:live', proof: 'process_start' }, undefined, 'middle');
+    const latest = running('latest', live);
+    const queued = s.controller.admitInput('not-submitted');
+    const next = replacement !== 'none' ? s.controller.reserveBinding('replacement', s.worker) : undefined;
+    if (next) s.controller.bindRuntime('replacement', s.worker, { backend: 'tmux', physicalId: '444:replacement', proof: 'process_start' });
+    const nextExecution = next ? running('replacement-work', next) : undefined;
+    const nextBefore = next && s.store.runtime(s.ref, next.runtimeId);
+    if (next && replacement.startsWith('foreign_')) {
+      // A persisted edge from another producer must not join this physical
+      // exit, even if it names a runtime in the retiring lineage.
+      const foreign = replacement === 'foreign_worker' ? { ...s.worker, workerId: 'other-worker' }
+        : { ...s.worker, generation: s.worker.generation + 1 };
+      s.store.continueRuntime(s.ref, next, live, foreign);
+    }
+    const admission = s.controller.ingest({ type: 'claude_exit', code: 1, sessionContract: s.context(1, { runtime: live }) }, s.worker);
+    expect(admission.kind).toBe(next ? 'historical' : 'current');
+    for (const runtime of [s.runtime, middle, live]) expect(s.store.runtime(s.ref, runtime.runtimeId)?.phase).toBe('stopped');
+    for (const execution of [opening, latest]) expect(s.store.execution(s.ref, execution.executionId)?.phase).toBe('reconciling');
+    expect(s.store.execution(s.ref, completed.executionId)).toEqual(terminal);
+    expect(s.store.execution(s.ref, queued.executionId)).toMatchObject({ phase: 'queued' });
+    expect(s.store.execution(s.ref, queued.executionId)?.runtime).toBeUndefined();
+    if (next) {
+      expect(s.store.runtime(s.ref, next.runtimeId)).toEqual(nextBefore);
+      expect(s.store.execution(s.ref, nextExecution!.executionId)?.phase).toBe('running');
+    }
+  });
+
   it('keeps delayed predecessor exits out of legacy consumers while preserving scoped runtime evidence', () => {
     const s = fixture(); const original = { write: vi.fn() }; const replacement = { write: vi.fn() };
     const callback = vi.fn(); const wire: any[] = [];
