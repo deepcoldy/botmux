@@ -132,4 +132,54 @@ describe('HTTP recovery with real SQLite persistence', () => {
     expect(mode === 'retry' ? pool.sendWorkerInput : pool.forkWorker).toHaveBeenCalledTimes(1);
     if (mode === 'fresh') expect(store.getSessionFresh(id)?.status).toBe('closed');
   });
+
+  it('aborts cleanup retry on new same-turn ds.usageLimit while permitting only current-generation completed terminal through sticky limit', async () => {
+    const { clearLimitedFailedTurn, recordFailedTurnTerminal } = await import('../src/core/failed-turn-recovery.js');
+    vi.useFakeTimers();
+    try {
+      const id = ds.session.sessionId;
+      ds.workerGeneration = 3;
+      ds.session.workerGeneration = 3;
+      ds.lastCliInputTurnId = 'om_failed';
+      ds.session.lastFailedTurn = {
+        ...ds.session.lastFailedTurn,
+        limitedSnapshot: true,
+        directFailure: true,
+      };
+      store.updateSession(ds.session);
+
+      // first clear fails, then same turn enters a new active ds.usageLimit -> retry MUST abort!
+      store.__testOnly_setBeforeRowPersist(() => { throw new Error('sqlite busy'); });
+      clearLimitedFailedTurn(ds, 'om_failed');
+      store.__testOnly_setBeforeRowPersist(undefined);
+      ds.usageLimit = {
+        limited: true, kind: 'usage', retryAtMs: Date.now() + 60_000,
+        retryLabel: '1m', retryReady: false, source: 'antigravity-native-log',
+        nativeEpisodeKey: 'log:new-same-turn', directFailure: true,
+      };
+      vi.advanceTimersByTime(600);
+      expect(ds.session.lastFailedTurn?.turnId).toBe('om_failed');
+      expect(store.getSessionFresh(id)?.lastFailedTurn?.turnId).toBe('om_failed');
+
+      // regression case negative control: stale-generation completed terminal does NOT clear through sticky limit.
+      recordFailedTurnTerminal(ds, { turnId: 'om_failed', status: 'completed' }, {
+        workerGeneration: 2, caller, silent: false,
+      });
+      expect(ds.session.lastFailedTurn?.turnId).toBe('om_failed');
+
+      // regression case positive control: current-generation completed terminal gets currentGenerationCompleted=true and retries past sticky limit!
+      store.__testOnly_setBeforeRowPersist(() => { throw new Error('sqlite busy 2'); });
+      recordFailedTurnTerminal(ds, { turnId: 'om_failed', status: 'completed' }, {
+        workerGeneration: 3, caller, silent: false,
+      });
+      expect(ds.session.lastFailedTurn?.turnId).toBe('om_failed');
+      store.__testOnly_setBeforeRowPersist(undefined);
+      vi.advanceTimersByTime(600);
+      expect(ds.session.lastFailedTurn).toBeUndefined();
+      expect(store.getSessionFresh(id)?.lastFailedTurn).toBeUndefined();
+    } finally {
+      store.__testOnly_setBeforeRowPersist(undefined);
+      vi.useRealTimers();
+    }
+  });
 });

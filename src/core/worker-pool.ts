@@ -1109,7 +1109,11 @@ import { buildBackendOutageCard, formatBackendOutageSummary } from './backend-ou
 import { probeTmuxServerUp } from '../adapters/backend/tmux-pipe-backend.js';
 import { getSessionGroup, isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
-import { readAntigravityConversationTitle } from '../services/antigravity-discovery.js';
+import { isDeepStrictEqual } from 'node:util';
+import { failedTurnCaller } from './failed-turn-caller.js';
+import { readAntigravityConversationTitle, findAttestedAntigravityConversationId } from '../services/antigravity-discovery.js';
+import { antigravityTurnFailedWithoutOutput, resolveAntigravityTranscriptPath } from '../services/antigravity-transcript.js';
+import type { AntigravityQuotaRecoveryCursor } from '../services/antigravity-quota-state.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
@@ -1118,8 +1122,24 @@ import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { sameTrustedPrincipal } from './active-turn-authority.js';
-import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, isTransientRateLimit, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
-import { isAntigravityWorkingScreen, rememberAntigravityQuota } from '../adapters/cli/antigravity.js';
+import {
+  appendConsumedAntigravityQuotaKeys,
+  classifyUsageLimitTriggerEdge,
+  cliUsageLimitEpisodeKey,
+  computeUsageLimitTurnScope,
+  isActiveWorkRuntimeStatus,
+  isAntigravityEpisodeConsumed,
+  isAntigravityNativeLimit,
+  isExpiredNativeAntigravityQuota,
+  isSameUsageLimitEpisode,
+  isTransientRateLimit,
+  reconcileUsageLimitState,
+  sameUsageLimit,
+  usageLimitStateKey,
+  type CliUsageLimitState,
+  type UsageLimitTriggerEdge,
+} from '../utils/cli-usage-limit.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, isAntigravityWorkingScreen, rememberAntigravityQuota } from '../adapters/cli/antigravity.js';
 import {
   inspectAntigravityAccounts,
   maskAntigravityEmail,
@@ -1460,6 +1480,8 @@ export interface WorkerPoolCallbacks {
   loadScheduledTaskForIdentity?: (larkAppId: string, taskId: string) => ScheduledTask | undefined;
   /** Connector-owned live card for a handoff whose exact input has started. */
   onTriggerTurnStarted?: (ds: DaemonSession, title: string, turnId: string) => void;
+  /** Direct Web Terminal submission observed on this session (human intervention). */
+  onTerminalInputSubmitted?: (ds: DaemonSession, at: number) => void;
   /** Close a stale session (message withdrawn, etc.). `false` means the
    * authoritative close failed and the active owner must remain retryable.
    * `void` is retained for older embedders/tests that implement a synchronous
@@ -4974,14 +4996,23 @@ function rememberSessionAntigravityQuota(ds: DaemonSession, limit: CliUsageLimit
   ds.antigravityQuotaHistory = rememberAntigravityQuota(history, limit);
 }
 
-export function clearUsageLimitState(ds: DaemonSession): void {
+export function clearUsageLimitState(
+  ds: DaemonSession,
+  opts?: { clearUnclaimedProvisionalFailedTurn?: boolean },
+): void {
   const previous = ds.usageLimit;
   if (previous) rememberSessionAntigravityQuota(ds, previous);
+  const prevFailed = ds.session.lastFailedTurn;
+  const willClearFailed = Boolean(
+    opts?.clearUnclaimedProvisionalFailedTurn && prevFailed?.limitedSnapshot && !prevFailed.recovery,
+  );
   ds.usageLimit = undefined;
+  if (willClearFailed) delete ds.session.lastFailedTurn;
   try {
-    persistStreamCardState(ds);
+    persistStreamCardState(ds, { forceWrite: willClearFailed });
   } catch (error) {
     ds.usageLimit = previous;
+    if (willClearFailed) ds.session.lastFailedTurn = prevFailed;
     throw error;
   }
   cancelComposerRecoveryRetry(ds);
@@ -4994,9 +5025,40 @@ export function clearUsageLimitState(ds: DaemonSession): void {
   // Re-arm the proactive rate-limit notification latch: the next limit episode
   // (even one with the same usageLimitStateKey) must notify the owner again.
   ds.rateLimitNotifiedKey = undefined;
+  ds.antigravityExhaustedNotifiedKey = undefined;
   // Only the async ownership token is session-local. Cross-session duplicate
   // handoffs are suppressed by the source-bot five-minute event window.
   ds.quotaFallbackAttemptToken = undefined;
+  ds.usageLimitTurnScope = undefined;
+}
+
+/** Clear in-memory usage-limit timers, latches, and turn scope at a new-turn or
+ *  re-fork boundary before the caller invokes `persistStreamCardState(ds)`. */
+export function resetUsageLimitForNewTurn(ds: DaemonSession): void {
+  if (ds.usageLimit) rememberSessionAntigravityQuota(ds, ds.usageLimit);
+  cancelComposerRecoveryRetry(ds);
+  cancelUsageLimitPersistRetry(ds);
+  if (ds.usageLimitRetryTimer) {
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  }
+  ds.usageLimit = undefined;
+  ds.usageLimitPersistPending = false;
+  ds.rateLimitNotifiedKey = undefined;
+  ds.antigravityExhaustedNotifiedKey = undefined;
+  ds.quotaFallbackAttemptToken = undefined;
+  ds.usageLimitTurnScope = undefined;
+}
+
+/** Schedule a fenced background persistence retry after a caller-side
+ *  `persistStreamCardState(ds)` failure (e.g. right after `resetUsageLimitForNewTurn`). */
+export function scheduleUsageLimitPersistenceRetry(ds: DaemonSession): void {
+  const sessionId = ds.session.sessionId;
+  retryUsageLimitPersistence(
+    ds,
+    ds.usageLimit,
+    () => findActiveBySessionId(sessionId) === ds && ds.session.status === 'active',
+  );
 }
 
 /** 限额出现、解除、换代或可重试状态变化时重绘已有卡片 */
@@ -5120,42 +5182,117 @@ export function restoreUsageLimitRuntimeState(ds: DaemonSession): void {
   if (!ds.usageLimit) return;
   // 旧会话只存了当前限额，恢复时先保留它的身份，后续清除状态也能识别残留提示
   rememberSessionAntigravityQuota(ds, ds.usageLimit);
+  if (ds.usageLimitTurnScope === undefined) {
+    const restoredTurn = ds.lastCliInputTurnId;
+    const restoredAttempt = restoredTurn && ds.turnDispatchAttemptHighWater?.turnId === restoredTurn
+      ? ds.turnDispatchAttemptHighWater.dispatchAttempt
+      : undefined;
+    ds.usageLimitTurnScope = computeUsageLimitTurnScope(restoredTurn, restoredAttempt, ds.directInputEpoch);
+  }
   ds.lastScreenStatus = 'limited';
   armUsageLimitRetryTimer(ds);
+}
+
+function usageLimitPersistenceDigest(ds: DaemonSession): string {
+  return JSON.stringify([
+    ds.usageLimit ? usageLimitStateKey(ds.usageLimit) : null,
+    ds.usageLimit?.directFailure === true,
+    ds.usageLimit?.source ?? null,
+    ds.antigravityQuotaCursor ?? null,
+    ds.antigravityQuotaHistory?.length ?? 0,
+  ]);
 }
 
 function updateUsageLimitState(
   ds: DaemonSession,
   usageLimit: CliUsageLimitState | undefined,
   owns: () => boolean,
+  opts?: {
+    sameTransientTurn?: boolean;
+    turnScope?: string;
+    provenTurn?: string;
+    nowMs?: number;
+  },
 ): void {
-  if (!usageLimit) return;
+  const cursorDirty = ds.antigravityQuotaCursor !== undefined
+    && !isDeepStrictEqual(ds.session.antigravityQuotaCursor, ds.antigravityQuotaCursor);
+  const historyDirty = ds.antigravityQuotaHistory !== undefined
+    && !isDeepStrictEqual(ds.session.antigravityQuotaHistory, ds.antigravityQuotaHistory);
+  const usageLimitDirty = !sameUsageLimit(ds.session.usageLimit, ds.usageLimit);
+
+  if (!usageLimit) {
+    if (!cursorDirty && !historyDirty && !usageLimitDirty) return;
+    cancelUsageLimitPersistRetry(ds);
+    ds.usageLimitPersistPending = true;
+    try {
+      persistStreamCardState(ds);
+      if (ds.usageLimit && !ds.usageLimit.retryReady && !ds.usageLimitRetryTimer) {
+        armUsageLimitRetryTimer(ds, ds.usageLimit);
+      }
+    } catch (error) {
+      retryUsageLimitPersistence(ds, ds.usageLimit, owns);
+      logger.warn(`[${tag(ds)}] Usage-limit metadata persistence deferred: ${String(error)}`);
+      return;
+    }
+    ds.usageLimitPersistPending = false;
+    return;
+  }
   // Even a repeated refusal invalidates earlier recovery evidence.
   cancelComposerRecoveryRetry(ds);
   cancelUsageLimitPersistRetry(ds);
 
   const previous = ds.usageLimit;
-  usageLimit = reconcileUsageLimitState(previous, usageLimit);
+  const nowMs = opts?.nowMs ?? Date.now();
+  usageLimit = reconcileUsageLimitState(previous, usageLimit, {
+    nowMs,
+    sameTransientTurn: opts?.sameTransientTurn === true,
+  });
+
+  // Check if an unclaimed provisional `lastFailedTurn` on the same turn needs
+  // its `directFailure` proof synced atomically with `ds.usageLimit`.
+  const prevFailed = ds.session.lastFailedTurn;
+  const desiredDirectFailure = usageLimit.directFailure === true ? true : undefined;
+  const shouldSyncProvisionalProof = Boolean(
+    opts?.provenTurn
+    && prevFailed?.turnId === opts.provenTurn
+    && prevFailed.limitedSnapshot === true
+    && !prevFailed.recovery
+    && prevFailed.directFailure !== desiredDirectFailure,
+  );
+
   // Screen updates repeat the same limit every tick while a session sits
-  // blocked. Skip the persist + timer re-arm churn unless the limit changed.
+  // blocked. Skip the persist + timer re-arm churn unless something changed.
   if (
     previous &&
     !ds.usageLimitPersistPending &&
-    usageLimitStateKey(previous) === usageLimitStateKey(usageLimit) &&
-    previous.retryReady === usageLimit.retryReady &&
-    previous.source === usageLimit.source
-  ) return;
+    !cursorDirty &&
+    !historyDirty &&
+    !usageLimitDirty &&
+    !shouldSyncProvisionalProof &&
+    sameUsageLimit(previous, usageLimit)
+  ) {
+    if (opts?.turnScope !== undefined) ds.usageLimitTurnScope = opts.turnScope;
+    return;
+  }
 
   ds.usageLimit = usageLimit;
+  if (opts?.turnScope !== undefined) ds.usageLimitTurnScope = opts.turnScope;
   rememberSessionAntigravityQuota(ds, usageLimit);
+  if (shouldSyncProvisionalProof && prevFailed) {
+    const updatedFailed = { ...prevFailed };
+    if (desiredDirectFailure) updatedFailed.directFailure = true;
+    else delete updatedFailed.directFailure;
+    ds.session.lastFailedTurn = updatedFailed;
+  }
   ds.usageLimitPersistPending = true;
   try {
-    persistStreamCardState(ds);
+    persistStreamCardState(ds, { forceWrite: shouldSyncProvisionalProof });
   } catch (error) {
+    if (shouldSyncProvisionalProof) ds.session.lastFailedTurn = prevFailed;
     // The current frame is valid evidence even when its write fails. Keep the
     // runtime projection and give THIS refusal its own durable retry owner;
     // otherwise cancelling the old proof leaves no writer for the new key.
-    retryUsageLimitPersistence(ds, previous, owns);
+    retryUsageLimitPersistence(ds, previous, owns, { provenTurn: opts?.provenTurn });
     logger.warn(`[${tag(ds)}] Usage-limit persistence deferred: ${String(error)}`);
     return;
   }
@@ -5163,14 +5300,14 @@ function updateUsageLimitState(
   armUsageLimitRetryTimer(ds, previous);
 }
 
-function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
-  return limit?.source === 'antigravity-error-composer' && !!limit.relativeResetKey && limit.retryAtMs <= Date.now();
-}
-
-const usageLimitPersistRetries = new WeakMap<DaemonSession, {
+interface UsageLimitPersistRetryEntry {
   timer: ReturnType<typeof setTimeout>;
   owns: () => boolean;
-}>();
+  digest: string;
+  provenTurn?: string;
+}
+
+const usageLimitPersistRetries = new WeakMap<DaemonSession, UsageLimitPersistRetryEntry>();
 
 function cancelUsageLimitPersistRetry(ds: DaemonSession): void {
   const pending = usageLimitPersistRetries.get(ds);
@@ -5178,28 +5315,58 @@ function cancelUsageLimitPersistRetry(ds: DaemonSession): void {
   usageLimitPersistRetries.delete(ds);
 }
 
-/** Persist a newly accepted refusal without depending on another identical
- * frame. Success re-arms the deadline owner; stale workers and later episodes
- * lose the write, while a newer clear cancels it at the same choke point. */
+/** Persist a newly accepted refusal or recovery-cursor update without depending
+ *  on another identical frame. Success re-syncs provisional `directFailure`
+ *  proof atomically and re-arms the deadline owner when active. */
 function retryUsageLimitPersistence(
   ds: DaemonSession,
   previous: CliUsageLimitState | undefined,
   owns: () => boolean,
+  opts?: { provenTurn?: string },
 ): void {
-  if (usageLimitPersistRetries.get(ds)?.owns()) return;
+  const digest = usageLimitPersistenceDigest(ds);
+  const existing = usageLimitPersistRetries.get(ds);
+  if (existing && existing.digest === digest && existing.owns()) {
+    if (opts?.provenTurn) existing.provenTurn = opts.provenTurn;
+    return;
+  }
   cancelUsageLimitPersistRetry(ds);
-  const key = ds.usageLimit && usageLimitStateKey(ds.usageLimit);
+  const entry: UsageLimitPersistRetryEntry = {
+    timer: undefined as unknown as ReturnType<typeof setTimeout>,
+    owns,
+    digest,
+    provenTurn: opts?.provenTurn,
+  };
   let delayMs = 500;
   const schedule = (): void => {
     const timer = setTimeout(() => {
       if (usageLimitPersistRetries.get(ds)?.timer !== timer) return;
       usageLimitPersistRetries.delete(ds);
-      if (!owns() || !ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key) return;
+      if (!owns() || usageLimitPersistenceDigest(ds) !== digest) return;
+      const prevFailed = ds.session.lastFailedTurn;
+      const desiredDirectFailure = ds.usageLimit?.directFailure === true ? true : undefined;
+      const shouldSyncProvisionalProof = Boolean(
+        entry.provenTurn
+        && ds.usageLimit?.limited
+        && ds.lastCliInputTurnId === entry.provenTurn
+        && !ds.terminalIdentityTurnIds?.has(entry.provenTurn)
+        && prevFailed?.turnId === entry.provenTurn
+        && prevFailed.limitedSnapshot === true
+        && !prevFailed.recovery
+        && prevFailed.directFailure !== desiredDirectFailure,
+      );
+      if (shouldSyncProvisionalProof && prevFailed) {
+        const updatedFailed = { ...prevFailed };
+        if (desiredDirectFailure) updatedFailed.directFailure = true;
+        else delete updatedFailed.directFailure;
+        ds.session.lastFailedTurn = updatedFailed;
+      }
       try {
-        persistStreamCardState(ds);
-        armUsageLimitRetryTimer(ds, previous);
+        persistStreamCardState(ds, { forceWrite: shouldSyncProvisionalProof });
+        if (ds.usageLimit) armUsageLimitRetryTimer(ds, previous);
         ds.usageLimitPersistPending = false;
       } catch (error) {
+        if (shouldSyncProvisionalProof) ds.session.lastFailedTurn = prevFailed;
         ds.usageLimitPersistPending = true;
         delayMs = Math.min(delayMs * 2, 30_000);
         logger.warn(`[${tag(ds)}] Usage-limit persistence retry: ${String(error)}`);
@@ -5207,15 +5374,24 @@ function retryUsageLimitPersistence(
       }
     }, delayMs);
     timer.unref();
-    usageLimitPersistRetries.set(ds, { timer, owns });
+    entry.timer = timer;
+    usageLimitPersistRetries.set(ds, entry);
   };
   schedule();
 }
 
-const composerRecoveryRetries = new WeakMap<DaemonSession, {
+interface ComposerRecoveryRetryEntry {
   timer: ReturnType<typeof setTimeout>;
   owns: () => boolean;
-}>();
+  key: string | undefined;
+  frame: { status: ScreenStatus; turnId?: string; dispatchAttempt?: number; directSubmit?: boolean };
+  clearUnclaimedProvisionalFailedTurn: boolean;
+  antigravityQuotaCursor?: AntigravityQuotaRecoveryCursor;
+  afterRecovered: Map<string, () => void>;
+}
+
+const composerRecoveryRetries = new WeakMap<DaemonSession, ComposerRecoveryRetryEntry>();
+let composerRecoveryHookSeq = 0;
 
 function cancelComposerRecoveryRetry(ds: DaemonSession): void {
   const pending = composerRecoveryRetries.get(ds);
@@ -5223,20 +5399,48 @@ function cancelComposerRecoveryRetry(ds: DaemonSession): void {
   composerRecoveryRetries.delete(ds);
 }
 
-/** Retain an accepted proof locally until SQLite commits it. Worker screen
- * dedup deliberately sends an edge once, so persistence cannot depend on a
- * second identical frame. Ownership and fresh refusals invalidate this proof. */
+/** Retain an accepted recovery proof locally until SQLite commits it. Worker
+ *  screen dedup deliberately sends an edge once, so persistence cannot depend
+ *  on a second identical frame. Compatible pending retries merge completion
+ *  hooks, cursor updates, and latest frame across follow-ups and backoffs. */
 function retryComposerRecovery(
   ds: DaemonSession,
   frame: { status: ScreenStatus; turnId?: string; dispatchAttempt?: number; directSubmit?: boolean },
   owns: () => boolean,
+  opts?: {
+    afterRecovered?: () => void;
+    afterRecoveredKey?: string;
+    clearUnclaimedProvisionalFailedTurn?: boolean;
+    antigravityQuotaCursor?: AntigravityQuotaRecoveryCursor;
+  },
 ): void {
-  const { status } = frame;
   cancelUsageLimitPersistRetry(ds);
-  const pending = composerRecoveryRetries.get(ds);
-  if (pending?.owns()) return;
-  cancelComposerRecoveryRetry(ds);
   const key = ds.usageLimit && usageLimitStateKey(ds.usageLimit);
+  const pending = composerRecoveryRetries.get(ds);
+  if (pending && pending.key === key && pending.owns()) {
+    pending.frame = frame;
+    if (opts?.afterRecovered) {
+      const hookKey = opts.afterRecoveredKey ?? `hook-${++composerRecoveryHookSeq}`;
+      pending.afterRecovered.set(hookKey, opts.afterRecovered);
+    }
+    if (opts?.clearUnclaimedProvisionalFailedTurn) pending.clearUnclaimedProvisionalFailedTurn = true;
+    if (opts?.antigravityQuotaCursor !== undefined) pending.antigravityQuotaCursor = opts.antigravityQuotaCursor;
+    return;
+  }
+  cancelComposerRecoveryRetry(ds);
+  const hooks = new Map<string, () => void>();
+  if (opts?.afterRecovered) {
+    hooks.set(opts.afterRecoveredKey ?? `hook-${++composerRecoveryHookSeq}`, opts.afterRecovered);
+  }
+  const entry: ComposerRecoveryRetryEntry = {
+    timer: undefined as unknown as ReturnType<typeof setTimeout>,
+    owns,
+    key,
+    frame,
+    clearUnclaimedProvisionalFailedTurn: opts?.clearUnclaimedProvisionalFailedTurn === true,
+    ...(opts?.antigravityQuotaCursor !== undefined ? { antigravityQuotaCursor: opts.antigravityQuotaCursor } : {}),
+    afterRecovered: hooks,
+  };
   let delayMs = 500;
   const schedule = (): void => {
     const timer = setTimeout(() => {
@@ -5247,77 +5451,112 @@ function retryComposerRecovery(
       // durable cleanup, and dropping it would resurrect the limit on resume.
       const committedCloseCleanup = ds.session.status === 'closed';
       if ((!owns() && !committedCloseCleanup) || !ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key) return;
+      const prevCursor = ds.antigravityQuotaCursor;
+      if (entry.antigravityQuotaCursor !== undefined) {
+        ds.antigravityQuotaCursor = entry.antigravityQuotaCursor;
+      }
       try {
-        clearUsageLimitState(ds);
+        clearUsageLimitState(ds, {
+          clearUnclaimedProvisionalFailedTurn: entry.clearUnclaimedProvisionalFailedTurn,
+        });
       } catch (error) {
+        ds.antigravityQuotaCursor = prevCursor;
         logger.warn(`[${tag(ds)}] composer recovery persistence retry: ${String(error)}`);
         delayMs = Math.min(delayMs * 2, 30_000);
         schedule();
         return;
       }
-      if (ds.lastScreenStatus === 'limited') ds.lastScreenStatus = status;
+      if (committedCloseCleanup || !owns()) return;
+      const latestFrame = entry.frame;
+      if (ds.lastScreenStatus === 'limited') ds.lastScreenStatus = latestFrame.status;
       stampIdleSinceAt(ds, 'limited');
-      if (!isStalePostTerminalBusyFrame(ds, status, frame)
+      if (!isStalePostTerminalBusyFrame(ds, latestFrame.status, latestFrame)
         && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
-        scheduleCardPatch(ds, buildStreamingCardJson(ds), frame.turnId, { owns });
+        scheduleCardPatch(ds, buildStreamingCardJson(ds), latestFrame.turnId, { owns });
+      }
+      for (const hook of entry.afterRecovered.values()) {
+        try { hook(); } catch (err) {
+          logger.debug(`[${tag(ds)}] composer recovery post-hook failed: ${String(err)}`);
+        }
       }
     }, delayMs);
     timer.unref();
-    composerRecoveryRetries.set(ds, { timer, owns });
+    entry.timer = timer;
+    composerRecoveryRetries.set(ds, entry);
   };
   schedule();
 }
 
-/**
- * Resolve the daemon-side screen status in the presence of a usage limit.
- *
- * Limit state is intentionally sticky across ticks that carry no fresh verdict
- * (the worker re-emits only while the limit text stays on screen; screenshot
- * ticks arrive every 10s), so a recorded limit survives ordinary idle frames
- * and the cooldown card stays up until the user retries. But it must
- * self-heal on evidence of active work or after a native agy countdown
- * expires without a new refusal. A blocked CLI does not produce
- * `working`/`analyzing` frames, so a limit that survives such a frame was a
- * false positive (a flicker-frame screen scan, or a structured emit the CLI
- * recovered from). Without this the card keeps showing 「限额已达」 for the
- * rest of the turn even though the CLI is demonstrably still running — the
- * reported 误报. The worker-side status gate (detectScreenUsageLimit) prevents
- * the detection while active; this is the daemon-side net for limits recorded
- * during an idle flicker before work resumed.
- */
 function resolveUsageAwareScreenStatus(
   ds: DaemonSession,
-  frame: { status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; content?: string; usageLimitRecovery?: 'antigravity-ready-composer'; turnId?: string; dispatchAttempt?: number; directSubmit?: boolean },
+  frame: {
+    status: ScreenStatus;
+    usageLimit?: CliUsageLimitState;
+    expiredAntigravityQuota?: CliUsageLimitState;
+    antigravityQuotaCursor?: AntigravityQuotaRecoveryCursor;
+    content?: string;
+    usageLimitRecovery?: 'antigravity-ready-composer';
+    turnId?: string;
+    dispatchAttempt?: number;
+    directSubmit?: boolean;
+  },
   owns: () => boolean,
+  opts?: {
+    prevCursor?: AntigravityQuotaRecoveryCursor;
+    afterRecovered?: (recoveredStatus: ScreenStatus) => void;
+    onRecoveryDeferred?: () => void;
+  },
 ): ScreenStatus {
   const { status, usageLimit, expiredAntigravityQuota, content } = frame;
   const previous = ds.usageLimit;
-  const expired = expiredAntigravityQuota && isExpiredNativeAntigravityQuota(expiredAntigravityQuota)
+  const nowMs = Date.now();
+  const expired = expiredAntigravityQuota && isExpiredNativeAntigravityQuota(expiredAntigravityQuota, nowMs)
     ? expiredAntigravityQuota : undefined;
   if (expired) rememberSessionAntigravityQuota(ds, expired);
 
   if (previous && !usageLimit) {
-    const expiredSameEpisode = expired && expired.relativeResetKey === previous.relativeResetKey && expired.kind === previous.kind;
+    const expiredSameEpisode = Boolean(
+      expired && (
+        isSameUsageLimitEpisode(expired, previous)
+        || (!isAntigravityNativeLimit(previous)
+          && previous.kind === expired.kind
+          && Boolean(previous.relativeResetKey && previous.relativeResetKey === expired.relativeResetKey))
+      ),
+    );
     const working = isActiveWorkRuntimeStatus(status);
     // 原生拒绝在窗口内只接受原生工作提示，避免无关 PTY 输出清掉限额。
-    const workRecovered = working && (previous.source !== 'antigravity-error-composer'
-      || (content && isAntigravityWorkingScreen(content)));
+    const workRecovered = working && (!isAntigravityNativeLimit(previous)
+      || Boolean(content && isAntigravityWorkingScreen(content)));
     const composerRecovered = frame.usageLimitRecovery === 'antigravity-ready-composer'
       && sessionCliId(ds, getBot(ds.larkAppId).config) === 'antigravity';
-    if (expiredSameEpisode || isExpiredNativeAntigravityQuota(previous) || workRecovered || composerRecovered) {
+    if (expiredSameEpisode || isExpiredNativeAntigravityQuota(previous, nowMs) || workRecovered || composerRecovered) {
       try {
-        clearUsageLimitState(ds);
+        clearUsageLimitState(ds, { clearUnclaimedProvisionalFailedTurn: composerRecovered });
       } catch (error) {
-        if (!composerRecovered) throw error;
-        logger.warn(`[${tag(ds)}] composer recovery persistence failed: ${String(error)}`);
-        retryComposerRecovery(ds, frame, owns);
+        if (opts && 'prevCursor' in opts) ds.antigravityQuotaCursor = opts.prevCursor;
+        logger.warn(`[${tag(ds)}] usage-limit recovery persistence failed: ${String(error)}`);
+        retryComposerRecovery(ds, frame, owns, {
+          clearUnclaimedProvisionalFailedTurn: composerRecovered,
+          ...(frame.antigravityQuotaCursor !== undefined
+            ? { antigravityQuotaCursor: frame.antigravityQuotaCursor }
+            : {}),
+          ...(opts?.afterRecovered
+            ? {
+              afterRecoveredKey: 'usage-limit-recovery',
+              afterRecovered: () => opts.afterRecovered!(status),
+            }
+            : {}),
+        });
+        opts?.onRecoveryDeferred?.();
         return 'limited';
       }
       return status;
     }
   }
-  // 即使活动限额已被清掉，仍须保留这次确认的截止时间，供 worker 恢复时使用。
-  if (expired) persistStreamCardState(ds);
+  // 即使活动限额已被清掉（或未命中清除），仍须将已确认的历史与 cursor 落盘（失败时自动重试）。
+  if (!composerRecoveryRetries.has(ds)) {
+    updateUsageLimitState(ds, undefined, owns, { nowMs });
+  }
   return usageLimit || previous ? 'limited' : status;
 }
 
@@ -21459,6 +21698,9 @@ function forkWorkerPrepared(
     ...(agentCfg.cliId === 'antigravity' ? {
       antigravityQuotaHistory: ds.antigravityQuotaHistory ?? ds.session.antigravityQuotaHistory,
       antigravityActiveQuota: ds.usageLimit,
+      ...((ds.antigravityQuotaCursor ?? ds.session.antigravityQuotaCursor) !== undefined
+        ? { antigravityQuotaCursor: ds.antigravityQuotaCursor ?? ds.session.antigravityQuotaCursor }
+        : {}),
     } : {}),
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
@@ -22566,14 +22808,16 @@ function setupWorkerHandlers(
     limit: CliUsageLimitState,
     turnId: string | undefined,
     ownsEpisode?: () => boolean,
+    notificationKey?: string,
   ): void => {
     const limitKey = usageLimitStateKey(limit);
+    const notifyKey = notificationKey ?? limitKey;
     const ownsLimitEpisode = ownsEpisode ?? ((): boolean =>
       ds.lastScreenStatus === 'limited'
       && !!ds.usageLimit
       && usageLimitStateKey(ds.usageLimit) === limitKey);
-    if (ds.rateLimitNotifiedKey !== limitKey) {
-      ds.rateLimitNotifiedKey = limitKey;
+    if (ds.rateLimitNotifiedKey !== notifyKey) {
+      ds.rateLimitNotifiedKey = notifyKey;
       const notifyBody = tr(
         limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
         { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
@@ -22647,18 +22891,336 @@ function setupWorkerHandlers(
         );
       });
   };
-  /** 文本帧和截图帧共享限额切换边沿，各自在通过来源和静默检查后调用 */
+  const publishUsageLimitRecovery = (
+    recoveredStatus: ScreenStatus,
+    turnId?: string,
+  ): void => {
+    if (!ownsLifecycleMutation()) return;
+    try {
+      const published = cb.onScreenStatus?.(ds, {
+        prevStatus: 'limited',
+        status: recoveredStatus,
+        turnId,
+      });
+      void Promise.resolve(published).catch((err: any) => {
+        logger.debug(`[${t}] usage-limit recovery status bridge failed: ${err?.message ?? err}`);
+      });
+    } catch (err: any) {
+      logger.debug(`[${t}] usage-limit recovery status bridge threw: ${err?.message ?? err}`);
+    }
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: {
+          status: recoveredStatus,
+          lastMessageAt: ds.lastMessageAt,
+          busySinceAt: ds.busySinceAt ?? null,
+        },
+      },
+    });
+  };
+
+  interface UsageLimitFrameInput {
+    status: ScreenStatus;
+    usageLimit?: CliUsageLimitState;
+    expiredAntigravityQuota?: CliUsageLimitState;
+    antigravityQuotaCursor?: AntigravityQuotaRecoveryCursor;
+    content?: string;
+    usageLimitRecovery?: 'antigravity-ready-composer';
+    turnId?: string;
+    dispatchAttempt?: number;
+    directSubmit?: boolean;
+  }
+
+  interface AppliedUsageLimitFrame {
+    aborted: boolean;
+    prevStatus: DaemonSession['lastScreenStatus'];
+    previousLimit: CliUsageLimitState | undefined;
+    nextStatus: ScreenStatus;
+    triggerEdge: UsageLimitTriggerEdge | undefined;
+    limitSurfaceChanged: boolean;
+  }
+
+  /** True while the worker has not initialized OR an in-worker Antigravity
+   *  account-rotation restart is in progress (`ds.workerReady === false` even
+   *  though `startupState.ready` stayed `true` from initial boot). */
+  const isPreReadyOrInFlightRotation = (): boolean =>
+    (!startupState.ready && !workerHasInitialized(ds))
+    || (ds.workerReady === false && Boolean(ds.antigravityRotation?.inFlightToken));
+
+  /** Narrow pre-ready / in-flight-rotation admission gate: accepts ONLY
+   *  same-turn confirmed native proof/episode updates so late revocations and
+   *  replacement episodes land before settlement, while keeping all negative
+   *  controls blocked with zero writes. */
+  const shouldAdmitPreReadyAntigravityEvidence = (
+    frame: UsageLimitFrameInput,
+    provenTurn: string | undefined,
+  ): boolean => {
+    if (sessionCliId(ds, botCfg) !== 'antigravity') return false;
+    const rot = ds.antigravityRotation;
+    if (!rot?.inFlightToken) return false;
+    if (!isAntigravityNativeLimit(frame.usageLimit)) return false;
+    if (isAntigravityEpisodeConsumed(ds.session.consumedAntigravityQuotaKeys, frame.usageLimit)) return false;
+    const incomingTurn = provenTurn ?? frame.turnId;
+    const rotationTurn = rot.lastReplayTurnId ?? rot.logicalTurnId;
+    if (
+      incomingTurn !== undefined
+      && ds.lastCliInputTurnId !== undefined
+      && incomingTurn !== ds.lastCliInputTurnId
+      && incomingTurn !== rotationTurn
+    ) {
+      return false;
+    }
+    if (
+      incomingTurn !== undefined
+      && ds.lastCliInputTurnId === undefined
+      && incomingTurn !== rotationTurn
+    ) {
+      return false;
+    }
+    return !sameUsageLimit(ds.usageLimit, frame.usageLimit);
+  };
+
+  const handlePreReadyAntigravityFrame = (
+    frame: UsageLimitFrameInput,
+    provenTurn: string | undefined,
+  ): void => {
+    if (!ownsLifecycleMutation()) return;
+    if (!shouldAdmitPreReadyAntigravityEvidence(frame, provenTurn)) return;
+    const preReadyUl = applyUsageLimitFrame(frame, provenTurn);
+    if (!preReadyUl.aborted && preReadyUl.limitSurfaceChanged) {
+      try {
+        const published = cb.onScreenStatus?.(ds, {
+          prevStatus: preReadyUl.prevStatus,
+          status: preReadyUl.nextStatus,
+          turnId: provenTurn,
+        });
+        void Promise.resolve(published).catch((err: any) => {
+          logger.debug(`[${t}] pre-ready status bridge failed: ${err?.message ?? err}`);
+        });
+      } catch (err: any) {
+        logger.debug(`[${t}] pre-ready status bridge threw: ${err?.message ?? err}`);
+      }
+    }
+  };
+
+  /** Unified daemon-side usage-limit ingress & state transition shared by both
+   *  `screen_update` and `screenshot_uploaded`. Runs consumed-episode filtering
+   *  first (ignoring `suppressRecoveryCard`), guards cursor writes against
+   *  consumed-episode poisoning, scopes synthetic 429 cooldowns to the current
+   *  turn/input generation, persists state & cursor atomically, and computes
+   *  the single canonical `triggerEdge`. */
+  const applyUsageLimitFrame = (
+    frame: UsageLimitFrameInput,
+    provenTurn: string | undefined,
+  ): AppliedUsageLimitFrame => {
+    const prevStatus = ds.lastScreenStatus;
+    const previousLimit = ds.usageLimit;
+    const prevTurnScope = ds.usageLimitTurnScope;
+    const prevCursor = ds.antigravityQuotaCursor;
+    const nowMs = Date.now();
+
+    const consumedKeys = ds.session.consumedAntigravityQuotaKeys;
+    const incomingConsumed = isAntigravityEpisodeConsumed(consumedKeys, frame.usageLimit);
+    const expiredConsumed = isAntigravityEpisodeConsumed(consumedKeys, frame.expiredAntigravityQuota);
+
+    if (incomingConsumed) {
+      const recoveredStatus: ScreenStatus = frame.status === 'limited' ? 'idle' : frame.status;
+      const stickyIsConsumed = Boolean(
+        previousLimit
+        && (isAntigravityEpisodeConsumed(consumedKeys, previousLimit)
+          || isSameUsageLimitEpisode(previousLimit, frame.usageLimit)),
+      );
+      if (stickyIsConsumed) {
+        try {
+          clearUsageLimitState(ds, { clearUnclaimedProvisionalFailedTurn: true });
+        } catch (error) {
+          logger.warn(`[${t}] consumed antigravity quota clear persistence failed: ${String(error)}`);
+          retryComposerRecovery(
+            ds,
+            {
+              status: recoveredStatus,
+              turnId: frame.turnId,
+              dispatchAttempt: frame.dispatchAttempt,
+              directSubmit: frame.directSubmit,
+            },
+            ownsLifecycleMutation,
+            {
+              clearUnclaimedProvisionalFailedTurn: true,
+              afterRecoveredKey: 'usage-limit-recovery',
+              afterRecovered: () => publishUsageLimitRecovery(recoveredStatus, provenTurn),
+            },
+          );
+          return {
+            aborted: true,
+            prevStatus,
+            previousLimit,
+            nextStatus: 'limited',
+            triggerEdge: undefined,
+            limitSurfaceChanged: false,
+          };
+        }
+        return {
+          aborted: false,
+          prevStatus,
+          previousLimit,
+          nextStatus: recoveredStatus,
+          triggerEdge: undefined,
+          limitSurfaceChanged: true,
+        };
+      }
+      if (!previousLimit) {
+        updateUsageLimitState(ds, undefined, ownsLifecycleMutation, { nowMs });
+        return {
+          aborted: false,
+          prevStatus,
+          previousLimit,
+          nextStatus: recoveredStatus,
+          triggerEdge: undefined,
+          limitSurfaceChanged: prevStatus !== recoveredStatus,
+        };
+      }
+      // Sticky limit belongs to a different, unconsumed episode: leave both it
+      // and `ds.antigravityQuotaCursor` intact.
+      return {
+        aborted: false,
+        prevStatus,
+        previousLimit,
+        nextStatus: 'limited',
+        triggerEdge: undefined,
+        limitSurfaceChanged: false,
+      };
+    }
+
+    if (frame.antigravityQuotaCursor !== undefined) {
+      const incomingCursorConsumed = isAntigravityEpisodeConsumed(
+        consumedKeys,
+        frame.antigravityQuotaCursor.lastConfirmed ?? undefined,
+      );
+      const activeUnconsumed = Boolean(
+        previousLimit && !isAntigravityEpisodeConsumed(consumedKeys, previousLimit),
+      );
+      const prevCursorUnconsumed = Boolean(
+        prevCursor?.lastConfirmed
+        && !isAntigravityEpisodeConsumed(consumedKeys, prevCursor.lastConfirmed),
+      );
+      if (!incomingCursorConsumed || (!activeUnconsumed && !prevCursorUnconsumed)) {
+        ds.antigravityQuotaCursor = frame.antigravityQuotaCursor;
+      }
+    }
+
+    const effectiveFrame: UsageLimitFrameInput = expiredConsumed
+      ? { ...frame, expiredAntigravityQuota: undefined }
+      : frame;
+
+    const resolvedTurn = provenTurn ?? ds.lastCliInputTurnId;
+    const prevScopeParsed = (() => {
+      if (!prevTurnScope) return undefined;
+      try {
+        const arr = JSON.parse(prevTurnScope);
+        return Array.isArray(arr) && arr.length === 3
+          ? { turnId: arr[0] as string | null, attempt: arr[1] as number | null, epoch: arr[2] as number }
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    })();
+    const highWaterAttempt = resolvedTurn && ds.turnDispatchAttemptHighWater?.turnId === resolvedTurn
+      ? ds.turnDispatchAttemptHighWater.dispatchAttempt
+      : undefined;
+    let resolvedAttempt = effectiveFrame.dispatchAttempt ?? highWaterAttempt;
+    let effectivePrevTurnScope = prevTurnScope;
+    const sameTurnAndEpoch = prevScopeParsed !== undefined
+      && prevScopeParsed.turnId === (resolvedTurn ?? null)
+      && prevScopeParsed.epoch === (ds.directInputEpoch ?? 0);
+    if (sameTurnAndEpoch) {
+      if (resolvedAttempt === undefined && prevScopeParsed!.attempt !== null) {
+        resolvedAttempt = prevScopeParsed!.attempt;
+      } else if (resolvedAttempt !== undefined && prevScopeParsed!.attempt === null) {
+        effectivePrevTurnScope = computeUsageLimitTurnScope(resolvedTurn, resolvedAttempt, ds.directInputEpoch);
+      }
+    }
+    const incomingTurnScope = computeUsageLimitTurnScope(
+      resolvedTurn,
+      resolvedAttempt,
+      ds.directInputEpoch,
+    );
+    const sameTransientTurn = previousLimit !== undefined
+      && effectivePrevTurnScope !== undefined
+      && effectivePrevTurnScope === incomingTurnScope;
+
+    let nextStatus: ScreenStatus;
+    let recoveryDeferred = false;
+    if (effectiveFrame.usageLimit) {
+      if (ds.antigravityRotation?.inFlightToken && isAntigravityNativeLimit(effectiveFrame.usageLimit)) {
+        ds.antigravityRotation.preSettlementEpisodes ??= [];
+        if (!ds.antigravityRotation.preSettlementEpisodes.some(e => isSameUsageLimitEpisode(e, effectiveFrame.usageLimit))) {
+          ds.antigravityRotation.preSettlementEpisodes.push(effectiveFrame.usageLimit);
+        }
+      }
+      updateUsageLimitState(ds, effectiveFrame.usageLimit, ownsLifecycleMutation, {
+        sameTransientTurn,
+        turnScope: incomingTurnScope,
+        provenTurn,
+        nowMs,
+      });
+      nextStatus = 'limited';
+    } else {
+      nextStatus = resolveUsageAwareScreenStatus(ds, effectiveFrame, ownsLifecycleMutation, {
+        prevCursor,
+        afterRecovered: recoveredStatus => publishUsageLimitRecovery(recoveredStatus, provenTurn),
+        onRecoveryDeferred: () => { recoveryDeferred = true; },
+      });
+    }
+    if (recoveryDeferred) {
+      return {
+        aborted: true,
+        prevStatus,
+        previousLimit,
+        nextStatus: 'limited',
+        triggerEdge: undefined,
+        limitSurfaceChanged: false,
+      };
+    }
+
+    const nextLimit = ds.usageLimit;
+    const triggerEdge = nextStatus === 'limited' && nextLimit
+      ? classifyUsageLimitTriggerEdge({
+        prevStatus,
+        prevLimit: previousLimit,
+        prevTurnScope: effectivePrevTurnScope,
+        nextLimit,
+        nextTurnScope: ds.usageLimitTurnScope,
+        nowMs,
+      })
+      : undefined;
+
+    const limitSurfaceChanged = prevStatus !== nextStatus
+      || previousLimit?.directFailure !== nextLimit?.directFailure
+      || cliUsageLimitEpisodeKey(previousLimit) !== cliUsageLimitEpisodeKey(nextLimit)
+      || (nextStatus === 'limited'
+        && provenTurn !== undefined
+        && ds.session.lastFailedTurn?.turnId !== provenTurn);
+
+    return {
+      aborted: false,
+      prevStatus,
+      previousLimit,
+      nextStatus,
+      triggerEdge,
+      limitSurfaceChanged,
+    };
+  };
+
+  /** 文本帧和截图帧共享单一限额触发边沿，各自在通过来源和静默检查后调用 */
   const notifyUsageLimitEdge = (
-    previousStatus: DaemonSession['lastScreenStatus'],
-    previousLimit: CliUsageLimitState | undefined,
+    triggerEdge: UsageLimitTriggerEdge | undefined,
     frameTurnId?: string,
     dispatchAttempt?: number,
   ): void => {
     const limit = ds.usageLimit;
-    if (ds.lastScreenStatus !== 'limited' || !limit || ds.suppressRecoveryCard) return;
-    const replacedExpiredQuota = isExpiredNativeAntigravityQuota(previousLimit)
-      && previousLimit?.relativeResetKey !== limit.relativeResetKey;
-    if (previousStatus === 'limited' && !replacedExpiredQuota) return;
+    if (!triggerEdge || ds.lastScreenStatus !== 'limited' || !limit || ds.suppressRecoveryCard) return;
 
     // 已通过截图来源校验的旧帧仍可能指向旧话题。两个入口都先核对当前执行。
     const provenTurn = provenScreenTurnId(frameTurnId, dispatchAttempt);
@@ -22672,42 +23234,52 @@ function setupWorkerHandlers(
       if (managedAuxUiSuppressed(turnId, attempt)) return;
     }
     const limitKey = usageLimitStateKey(limit);
-    // Antigravity hosted-account auto-rotation: on genuine native quota
-    // exhaustion (`antigravity-error-composer`), rotate the host vault to
-    // the next healthy account, restart the worker in place (resuming
-    // `--conversation`), and automatically replay the interrupted turn.
-    // When rotation starts, suppress duplicate `@owner` limit spam and
-    // `quotaFallbackBot` handoff; when disabled or exhausted, fall through
-    // so existing notifications and backup-bot handoff run as before.
+    const notificationKey = triggerEdge.notificationKey;
     const effectiveCliId = sessionCliId(ds, botCfg);
-    // Only replay when the limited frame carries a proven `provenTurn`
-    // matching the exact recorded turn. Without `provenTurn` (e.g. a
-    // direct Web Terminal prompt), rotate + restart cleanly and ask the
-    // user to resend rather than replaying an older completed Lark turn.
-    const capturedFailedTurn = ds.session.lastFailedTurn;
-    const matchesFailedTurn = Boolean(
-      provenTurn && capturedFailedTurn && capturedFailedTurn.turnId === provenTurn,
-    );
-    // A matching turn ID proves ownership, NOT that replay is side-effect safe.
-    // Only a durable direct-failure observation (no assistant text/tool calls)
-    // may be re-sent unattended. agy does not currently expose that proof, so
-    // its native quota path rotates + resumes but asks for manual continuation
-    // instead of repeating a turn that may already have performed mutations.
-    const replayPayload = matchesFailedTurn
-      && capturedFailedTurn?.directFailure === true
-      && capturedFailedTurn.status === 'failed'
-      && !capturedFailedTurn.recovery
-      && !capturedFailedTurn.limitedSnapshot
-      && capturedFailedTurn.retryable !== false
-      && capturedFailedTurn.cliInput.trim()
-      ? {
-          sourceTurnId: capturedFailedTurn.turnId,
-          cliInput: capturedFailedTurn.cliInput,
-          userPrompt: capturedFailedTurn.userPrompt,
-          ...(capturedFailedTurn.attachments?.length
-            ? { attachments: structuredClone(capturedFailedTurn.attachments) } : {}),
-        }
-      : undefined;
+
+    const currentTranscriptProvesDirectFailure = (cliInput: string): boolean => {
+      // Strictly query the locally attested CLI PID + birth identity (never worker.pid,
+      // never falling back to stored cliSessionId on missing/ambiguous/reused PID).
+      const liveConversationId = findAttestedAntigravityConversationId(ds.localProcessAttestation);
+      if (!liveConversationId) return false;
+      const storedId = ds.session.cliSessionId;
+      if (storedId && storedId.toLowerCase() !== liveConversationId.toLowerCase()) return false;
+      const transcriptPath = resolveAntigravityTranscriptPath(liveConversationId);
+      if (!transcriptPath) return false;
+      return antigravityTurnFailedWithoutOutput(transcriptPath, cliInput);
+    };
+
+    // Re-evaluated synchronously both at rotation start (for switching notice)
+    // and at settlement BEFORE clearing `ds.usageLimit` (for actual replay).
+    const replayPayloadForCurrentProof = () => {
+      if (!provenTurn) return undefined;
+      const currentLimit = ds.usageLimit;
+      if (!currentLimit?.directFailure || !isSameUsageLimitEpisode(currentLimit, limit)) return undefined;
+      const capturedFailedTurn = ds.session.lastFailedTurn;
+      if (
+        !capturedFailedTurn
+        || capturedFailedTurn.turnId !== provenTurn
+        || capturedFailedTurn.directFailure !== true
+        || capturedFailedTurn.status !== 'failed'
+        || capturedFailedTurn.recovery
+        || capturedFailedTurn.retryable === false
+        || !capturedFailedTurn.cliInput.trim()
+      ) {
+        return undefined;
+      }
+      if (!currentTranscriptProvesDirectFailure(capturedFailedTurn.cliInput)) return undefined;
+      return {
+        sourceTurnId: capturedFailedTurn.turnId,
+        originalTurnId: capturedFailedTurn.originalTurnId ?? capturedFailedTurn.turnId,
+        cliInput: capturedFailedTurn.cliInput,
+        userPrompt: capturedFailedTurn.userPrompt,
+        ...(capturedFailedTurn.trustedCaller ? { trustedCaller: capturedFailedTurn.trustedCaller } : {}),
+        ...(capturedFailedTurn.silent ? { silent: true } : {}),
+        ...(capturedFailedTurn.attachments?.length
+          ? { attachments: structuredClone(capturedFailedTurn.attachments) } : {}),
+      };
+    };
+
     const formatAccountLabel = (id?: string, email?: string): string => {
       const masked = maskAntigravityEmail(email);
       if (id && masked) return `\`${id}\` (${masked})`;
@@ -22728,7 +23300,7 @@ function setupWorkerHandlers(
       screenTurnId: provenTurn,
       lastCliInputTurnId: provenTurn ? ds.lastCliInputTurnId : undefined,
       lastMessageAt: ds.lastMessageAt,
-      replayPayload,
+      getReplayPayload: replayPayloadForCurrentProof,
       getRotationState: () => ds.antigravityRotation,
       setRotationState: state => { ds.antigravityRotation = state; },
       rotateAccount: params => rotateAntigravityAccountOnQuotaLimit(params),
@@ -22749,42 +23321,143 @@ function setupWorkerHandlers(
         || (capturedTurnId !== undefined && ds.lastCliInputTurnId !== undefined && ds.lastCliInputTurnId !== capturedTurnId)
         || hasProtectedSessionMutationOwnership(ds)
       ),
-      updateSessionAccount: accountId => {
-        ds.antigravityAccountId = accountId;
-        if (ds.session.antigravityAccountId !== accountId) {
-          ds.session.antigravityAccountId = accountId;
-          sessionStore.updateSession(ds.session);
+      // Single atomic durable transition: commits the new account, marks every
+      // pre-settlement native episode consumed (even when human intervention
+      // occurred mid-restart), and clears active `ds.usageLimit` in ONE
+      // `sessionStore.updateSession` call.
+      settleAccountAndLimit: (accountId, { preSettlementEpisodes }) => {
+        const prevAccount = ds.antigravityAccountId;
+        const prevSessionAccount = ds.session.antigravityAccountId;
+        const prevConsumed = ds.session.consumedAntigravityQuotaKeys;
+        const prevHistory = ds.antigravityQuotaHistory;
+        const prevSessionHistory = ds.session.antigravityQuotaHistory;
+        const prevLimit = ds.usageLimit;
+        const prevSessionLimit = ds.session.usageLimit;
+
+        const episodesToConsume: (CliUsageLimitState | undefined)[] = [limit, ...preSettlementEpisodes];
+        const shouldClearActive = Boolean(prevLimit);
+        if (prevLimit && (isSameUsageLimitEpisode(prevLimit, limit) || isAntigravityNativeLimit(prevLimit))) {
+          episodesToConsume.push(prevLimit);
         }
-      },
-      clearUsageLimit: () => {
+
+        ds.antigravityAccountId = accountId;
+        ds.session.antigravityAccountId = accountId;
+        ds.session.consumedAntigravityQuotaKeys = appendConsumedAntigravityQuotaKeys(
+          prevConsumed,
+          episodesToConsume,
+          ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
+        );
+        for (const ep of episodesToConsume) {
+          if (ep) rememberSessionAntigravityQuota(ds, ep);
+        }
+        ds.session.antigravityQuotaHistory = ds.antigravityQuotaHistory ?? ds.session.antigravityQuotaHistory;
+        if (shouldClearActive) {
+          ds.usageLimit = undefined;
+          ds.session.usageLimit = undefined;
+        }
+
         try {
-          clearUsageLimitState(ds);
+          sessionStore.updateSession(ds.session);
+        } catch (err: any) {
+          ds.antigravityAccountId = prevAccount;
+          ds.session.antigravityAccountId = prevSessionAccount;
+          ds.session.consumedAntigravityQuotaKeys = prevConsumed;
+          ds.antigravityQuotaHistory = prevHistory;
+          ds.session.antigravityQuotaHistory = prevSessionHistory;
+          ds.usageLimit = prevLimit;
+          ds.session.usageLimit = prevSessionLimit;
+          logger.warn(`[${t}] Failed to settle account/usage limit after antigravity rotation: ${err?.message ?? err}`);
+          throw err;
+        }
+
+        if (shouldClearActive) {
+          cancelComposerRecoveryRetry(ds);
+          cancelUsageLimitPersistRetry(ds);
+          if (ds.usageLimitRetryTimer) {
+            clearTimeout(ds.usageLimitRetryTimer);
+            ds.usageLimitRetryTimer = undefined;
+          }
+          ds.usageLimitPersistPending = false;
+          ds.rateLimitNotifiedKey = undefined;
+          ds.antigravityExhaustedNotifiedKey = undefined;
+          ds.quotaFallbackAttemptToken = undefined;
+          ds.usageLimitTurnScope = undefined;
           if (ds.lastScreenStatus === 'limited') {
             ds.lastScreenStatus = 'idle';
           }
-        } catch (err: any) {
-          logger.warn(`[${t}] Failed to clear usage limit after antigravity rotation: ${err?.message ?? err}`);
-          // The outer state machine must stop before replay: a sticky limited
-          // frame would otherwise look like a fresh failure on the next edge.
-          throw err;
         }
       },
       replayTurn: payload => {
         if (!ds.worker || ds.worker.killed) return { accepted: false };
         const retryTurnId = `agy-rotate-${randomUUID()}`;
+        const caller = payload.sourceTurnId
+          ? failedTurnCaller(ds, payload.sourceTurnId, { includeRecordedCaller: true })
+          : undefined;
+        const recoveredCaller: TrustedCaller | undefined = caller
+          ? { ...caller, source: caller.source === 'schedule_creator' ? caller.source : 'failed_turn_recovery' }
+          : undefined;
+        const originalTurnId = payload.originalTurnId
+          ?? (ds.session.failedTurnRecovery?.turnId === payload.sourceTurnId
+            ? ds.session.failedTurnRecovery?.originalTurnId
+            : undefined)
+          ?? payload.sourceTurnId
+          ?? retryTurnId;
+        const previousFailedTurnRecovery = ds.session.failedTurnRecovery;
+        const previousActiveInteractiveTurn = ds.activeInteractiveTurn;
+        let armedSilent = false;
         let rollbackReplyRouting: (() => void) | undefined;
         let accepted = false;
         try {
           rollbackReplyRouting = inheritTurnReplyRouting(ds, payload.sourceTurnId, retryTurnId);
-          accepted = sendWorkerInput(ds, {
-            content: payload.cliInput,
-            ...(payload.attachments?.length ? { attachments: payload.attachments } : {}),
-          }, retryTurnId);
+          if (caller && recoveredCaller) {
+            const priorReply = payload.sourceTurnId
+              ? pickTurnReplyTarget(ds.session, payload.sourceTurnId)
+              : undefined;
+            ds.session.failedTurnRecovery = {
+              originalTurnId,
+              turnId: retryTurnId,
+              caller: { ...caller },
+            };
+            const existingTarget = ds.session.replyTargets?.[retryTurnId];
+            ds.session.replyTargets = {
+              ...ds.session.replyTargets,
+              [retryTurnId]: {
+                ...existingTarget,
+                rootMessageId: existingTarget?.rootMessageId ?? priorReply?.rootMessageId ?? ds.session.rootMessageId,
+                senderOpenId: caller.requestUserOpenId,
+                participants: priorReply?.participants ?? [{ openId: caller.requestUserOpenId, isBot: false }],
+                updatedAt: new Date().toISOString(),
+              },
+            };
+            const controller = trustedSessionController(ds);
+            ds.activeInteractiveTurn = {
+              turnId: retryTurnId,
+              caller: recoveredCaller,
+              userPrompt: payload.userPrompt,
+              ...(controller ? { controller } : {}),
+            };
+            if (payload.silent || (payload.sourceTurnId && isSilentScheduledTurn(ds, payload.sourceTurnId))) {
+              armSilentScheduledTurn(ds, retryTurnId);
+              armedSilent = true;
+            }
+          }
+          accepted = sendWorkerInput(
+            ds,
+            {
+              content: payload.cliInput,
+              ...(payload.attachments?.length ? { attachments: payload.attachments } : {}),
+            },
+            retryTurnId,
+            recoveredCaller ? { trustedCaller: recoveredCaller } : undefined,
+          );
         } catch (err: any) {
           logger.warn(`[${t}] Antigravity rotation auto-replay failed before acceptance: ${err?.message ?? err}`);
         }
         if (!accepted) {
           rollbackReplyRouting?.();
+          ds.session.failedTurnRecovery = previousFailedTurnRecovery;
+          ds.activeInteractiveTurn = previousActiveInteractiveTurn;
+          if (armedSilent) disarmSilentScheduledTurn(ds, retryTurnId);
           try { sessionStore.updateSession(ds.session); } catch { /* the replay was not accepted */ }
           return { accepted: false };
         }
@@ -22826,6 +23499,14 @@ function setupWorkerHandlers(
           logger.debug(`[${t}] Failed to deliver antigravity rotation notice: ${err?.message ?? err}`);
         });
       },
+      notifyAutoReplayStarted: ({ toId, toEmail }) => {
+        const text = tr('worker.agy_rotate.replay_started', {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity late auto-replay notice: ${err?.message ?? err}`);
+        });
+      },
       notifyRestartFailed: ({ toId, toEmail, status }) => {
         logger.warn(`[${t}] Antigravity rotation restart ${status} for target account ${toId}`);
         const body = tr('worker.agy_rotate.restart_failed', {
@@ -22845,9 +23526,9 @@ function setupWorkerHandlers(
           logger.debug(`[${t}] Failed to deliver antigravity manual-replay notice: ${err?.message ?? err}`);
         });
       },
-      notifyReplayFailed: ({ toId, toEmail }) => {
+      notifyReplayFailed: ({ toId, toEmail, sourceTurnId }) => {
         const canRetryCommand = Boolean(
-          replayPayload?.sourceTurnId && ds.session.lastFailedTurn?.turnId === replayPayload.sourceTurnId,
+          sourceTurnId && ds.session.lastFailedTurn?.turnId === sourceTurnId,
         );
         const key = canRetryCommand ? 'worker.agy_rotate.replay_failed' : 'worker.agy_rotate.replay_failed_resend';
         const text = tr(key, {
@@ -22877,10 +23558,15 @@ function setupWorkerHandlers(
       },
     });
 
-    if (rotationDecision.outcome === 'started') {
+    if (
+      rotationDecision.outcome === 'started'
+      || (effectiveCliId === 'antigravity' && Boolean(ds.antigravityRotation?.inFlightToken))
+    ) {
       return;
     }
-    if (rotationDecision.outcome === 'exhausted' && ds.rateLimitNotifiedKey !== limitKey) {
+    const exhaustedNotifiedKey = cliUsageLimitEpisodeKey(limit) ?? limitKey;
+    if (rotationDecision.outcome === 'exhausted' && ds.antigravityExhaustedNotifiedKey !== exhaustedNotifiedKey) {
+      ds.antigravityExhaustedNotifiedKey = exhaustedNotifiedKey;
       let exhaustText: string;
       if (rotationDecision.reason === 'turn_budget_exhausted') {
         exhaustText = tr('worker.agy_rotate.turn_budget_exhausted', {}, loc);
@@ -22908,7 +23594,7 @@ function setupWorkerHandlers(
       logger.warn(`[${t}] Antigravity quota rotation refused: session account identity is unknown`);
     }
 
-    const notifyOwnerAndHandOff = (): void => notifyQuotaLimitEpisode(limit, turnId);
+    const notifyOwnerAndHandOff = (): void => notifyQuotaLimitEpisode(limit, turnId, undefined, notificationKey);
     const chainOwnsLimit = callbacks?.startQuotaFallbackChainSwitch?.(ds, {
       kind: limit.kind,
       transient: isTransientRateLimit(limit),
@@ -25375,6 +26061,11 @@ function setupWorkerHandlers(
             });
           }
         }
+        if (msg.submitted) {
+          ds.directInputEpoch = (ds.directInputEpoch ?? 0) + 1;
+          ds.lastDirectTerminalInputAt = Math.max(ds.lastDirectTerminalInputAt ?? 0, msg.at);
+          callbacks?.onTerminalInputSubmitted?.(ds, msg.at);
+        }
         if (msg.submitted && ds.antigravityRotation) {
           if (ds.antigravityRotation.inFlightToken) {
             // Direct terminal input is human intervention just like a new IM
@@ -25398,10 +26089,21 @@ function setupWorkerHandlers(
         // Any real screen frame supersedes the post-terminal fallback: the card
         // is once again driven by live worker evidence.
         if (!ownsLifecycleMutation()) break;
-        // Project the frame's effective status once: reused for the in-memory
-        // status assignment below and the stale-post-terminal gate.
-        const previousLimit = ds.usageLimit;
-        const projectedScreenStatus = resolveUsageAwareScreenStatus(ds, msg, ownsLifecycleMutation);
+        let screenTurnId = provenScreenTurnId(msg.turnId, msg.dispatchAttempt);
+        // Wait for worker init, independently of Web Terminal availability.
+        // ZMX intentionally reports ready with port=0, but its plain-history
+        // screenshots and idle/status transitions must keep flowing.
+        if (isPreReadyOrInFlightRotation()) {
+          handlePreReadyAntigravityFrame(msg, screenTurnId);
+          break;
+        }
+        // Project the frame's effective usage-limit state once via the shared
+        // daemon SSOT pipeline (consumed filter, turn-scoped reconciliation,
+        // atomic persistence, and single trigger edge).
+        const ul = applyUsageLimitFrame(msg, screenTurnId);
+        if (ul.aborted) break;
+        const previousLimit = ul.previousLimit;
+        const projectedScreenStatus = ul.nextStatus;
         // A busy frame from a turn that already reported a completed terminal
         // (with no newer turn admitted) is stale viewport evidence. It must not
         // cancel the post-terminal correction or drive the card/revision; the
@@ -25414,26 +26116,21 @@ function setupWorkerHandlers(
           hasBackgroundTasks,
         });
         if (!stalePostTerminalBusy) cancelPostTerminalStatusSettle(ds);
-        // Wait for worker init, independently of Web Terminal availability.
-        // ZMX intentionally reports ready with port=0, but its plain-history
-        // screenshots and idle/status transitions must keep flowing.
-        if (!startupState.ready && !workerHasInitialized(ds)) break;
         // A non-starting frame from the current turn's newer attempt must advance
         // attempt identity before health matching. Restrict this to the current
         // turn so a late predecessor can never move the global high-water back.
         if (!stalePostTerminalBusy && msg.turnId === ds.currentTurnId) {
           noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
+          screenTurnId = provenScreenTurnId(msg.turnId, msg.dispatchAttempt);
         }
-        const screenTurnId = provenScreenTurnId(msg.turnId, msg.dispatchAttempt);
         const startingCardRecovered = !stalePostTerminalBusy
           && screenTurnAllowedForStartingCardHealth(msg.turnId, msg.dispatchAttempt, screenTurnId)
           && noteStartingCardHealthFrame(ds, msg.turnId, projectedScreenStatus, msg.dispatchAttempt);
-        const prevStatus = ds.lastScreenStatus;
+        const prevStatus = ul.prevStatus;
         const prevBackgroundTaskCount = ds.backgroundTaskCount;
         const prevActiveTurnSilentSchedule = ds.lastPublishedActiveTurnSilentSchedule === true;
         const prevLabel = streamCardLabel(ds);
         const prevActivity = typeof prevLabel === 'object' && 'activity' in prevLabel ? prevLabel.activity : undefined;
-        updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = projectedScreenStatus;
         const frameTargetsTerminatedTurn = !!screenTurnId
@@ -25697,7 +26394,7 @@ function setupWorkerHandlers(
             { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card status: ${error.message}`));
         }
 
-        notifyUsageLimitEdge(prevStatus, previousLimit, msg.turnId, msg.dispatchAttempt);
+        notifyUsageLimitEdge(ul.triggerEdge, msg.turnId, msg.dispatchAttempt);
 
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card. Turn-exact: a
@@ -25952,7 +26649,8 @@ function setupWorkerHandlers(
         if (!frameVerdict.ok) {
           let shownAsWaitingPreview = false;
           if (frameVerdict.reason === 'target-waiting'
-            && frameVerdict.source.turnId !== undefined) {
+            && frameVerdict.source.turnId !== undefined
+            && !isPreReadyOrInFlightRotation()) {
             const target = currentStreamCardDisplayTarget(ds);
             if (target?.mode === 'waiting-exact-turn') {
               // Keep predecessor pixels observable without laundering them into
@@ -26022,10 +26720,33 @@ function setupWorkerHandlers(
           );
           break;
         }
-        const prevStatus = ds.lastScreenStatus;
-        const previousLimit = ds.usageLimit;
-        updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation);
-        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg, ownsLifecycleMutation);
+        const shotProvenTurn = provenScreenTurnId(
+          frameVerdict.source.turnId,
+          frameVerdict.source.dispatchAttempt,
+        );
+        const shotFrame: UsageLimitFrameInput = {
+          ...msg,
+          turnId: frameVerdict.source.turnId,
+          dispatchAttempt: frameVerdict.source.dispatchAttempt,
+        };
+        if (isPreReadyOrInFlightRotation()) {
+          handlePreReadyAntigravityFrame(shotFrame, shotProvenTurn);
+          break;
+        }
+        const ul = ownsLifecycleMutation()
+          ? applyUsageLimitFrame(shotFrame, shotProvenTurn)
+          : {
+            aborted: false,
+            prevStatus: ds.lastScreenStatus,
+            previousLimit: ds.usageLimit,
+            nextStatus: msg.status,
+            triggerEdge: undefined,
+            limitSurfaceChanged: false,
+          };
+        if (ul.aborted) break;
+        const prevStatus = ul.prevStatus;
+        const previousLimit = ul.previousLimit;
+        ds.lastScreenStatus = ul.nextStatus;
         workersWithScreenStatus.add(worker);
         stampIdleSinceAt(ds, prevStatus);
         // Same per-frame stale gate as screen_update: a residual busy screenshot
@@ -26068,6 +26789,36 @@ function setupWorkerHandlers(
           closePostTerminalLiveWorkEpisode(ds);
         }
         if (!stalePostTerminalShot) bumpStreamCardStatusRevision(ds);
+        // Symmetric with screen_update: publish runtime status bridge (which
+        // updates provisional lastFailedTurn BEFORE rotation reads it) and
+        // Dashboard SSE on coarse status transitions.
+        if (!stalePostTerminalShot && ul.limitSurfaceChanged) {
+          try {
+            const published = cb.onScreenStatus?.(ds, {
+              prevStatus,
+              status: ds.lastScreenStatus as ScreenStatus,
+              turnId: shotProvenTurn,
+            });
+            void Promise.resolve(published).catch((err: any) => {
+              logger.debug(`[${t}] screenshot status bridge failed: ${err?.message ?? err}`);
+            });
+          } catch (err: any) {
+            logger.debug(`[${t}] screenshot status bridge threw: ${err?.message ?? err}`);
+          }
+        }
+        if (prevStatus !== ds.lastScreenStatus) {
+          dashboardEventBus.publish({
+            type: 'session.update',
+            body: {
+              sessionId: ds.session.sessionId,
+              patch: {
+                status: ds.lastScreenStatus,
+                lastMessageAt: ds.lastMessageAt,
+                busySinceAt: ds.busySinceAt ?? null,
+              },
+            },
+          });
+        }
         // Same deferred-suspend checkpoint as the screen_update branch, and
         // deferred for the same reason (see runPendingSuspendIfSettled).
         // The predicate is defense-in-depth here: the handler's fence already
@@ -26093,7 +26844,7 @@ function setupWorkerHandlers(
         }
         if (ownsLifecycleMutation()) {
           const source = frameVerdict.source;
-          notifyUsageLimitEdge(prevStatus, previousLimit, source.turnId, source.dispatchAttempt);
+          notifyUsageLimitEdge(ul.triggerEdge, source.turnId, source.dispatchAttempt);
         }
         // Store the image key only AFTER the managed gate: now that the ready
         // handler re-syncs display mode on every path, a worker can be
@@ -32353,6 +33104,9 @@ export function forkAdoptWorker(
     ...(adoptedCliId === 'antigravity' ? {
       antigravityQuotaHistory: ds.antigravityQuotaHistory ?? ds.session.antigravityQuotaHistory,
       antigravityActiveQuota: ds.usageLimit,
+      ...((ds.antigravityQuotaCursor ?? ds.session.antigravityQuotaCursor) !== undefined
+        ? { antigravityQuotaCursor: ds.antigravityQuotaCursor ?? ds.session.antigravityQuotaCursor }
+        : {}),
     } : {}),
     codexProfile: agentCfg.codexProfile,
     codexProfileHome: agentCfg.codexProfileHome,

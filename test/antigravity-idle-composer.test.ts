@@ -4,7 +4,7 @@ import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import {
   createAntigravityAdapter,
-  annotateAntigravityUsageLimit,
+  extractAntigravityErrorComposerKey,
   isAntigravityIdleComposerScreen,
 } from '../src/adapters/cli/antigravity.js';
 
@@ -98,11 +98,10 @@ describe('Antigravity idle-composer viewport classifier', () => {
   });
 
   it('retains native quota provenance only for the latest actual quota error composer', () => {
-    const state = { limited: true as const, kind: 'usage' as const, retryAtMs: 1_000, retryLabel: '1m', retryReady: false };
-    expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN, state).source).toBe('antigravity-error-composer');
-    expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN + 'esc to cancel', state)).toBe(state);
-    expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN + NATIVE_ERROR_SCREEN, state)).toBe(state);
-    expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN.replace('⚠ Individual', '  ⚠ Individual'), state)).toBe(state);
+    expect(extractAntigravityErrorComposerKey(QUOTA_ERROR_SCREEN)).toBe('composer:native-error-fixture');
+    expect(extractAntigravityErrorComposerKey(QUOTA_ERROR_SCREEN + 'esc to cancel')).toBeUndefined();
+    expect(extractAntigravityErrorComposerKey(QUOTA_ERROR_SCREEN + NATIVE_ERROR_SCREEN)).toBeUndefined();
+    expect(extractAntigravityErrorComposerKey(QUOTA_ERROR_SCREEN.replace('⚠ Individual', '  ⚠ Individual'))).toBeUndefined();
   });
   it.each([NATIVE_ERROR_SCREEN, QUOTA_ERROR_SCREEN])('recognizes a native error parked at the footerless composer', screen => {
     expect(isAntigravityIdleComposerScreen(screen)).toBe(true);

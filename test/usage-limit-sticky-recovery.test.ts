@@ -37,7 +37,7 @@ import * as sessionStore from '../src/services/session-store.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { detectCliUsageLimit, reconcileUsageLimitState, usageLimitStateKey } from '../src/utils/cli-usage-limit.js';
 import {
-  ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota,
+  ANTIGRAVITY_QUOTA_HISTORY_LIMIT, extractAntigravityErrorComposerKey, isAntigravityWorkingScreen, rememberAntigravityQuota,
 } from '../src/adapters/cli/antigravity.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
@@ -45,6 +45,11 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { antigravityScreenProducer } from './helpers/antigravity-screen-recovery.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
+
+function annotateComposerFixture(screen: string, state: CliUsageLimitState): CliUsageLimitState {
+  const key = extractAntigravityErrorComposerKey(screen);
+  return key ? { ...state, source: 'antigravity-error-composer', nativeEpisodeKey: key } : state;
+}
 
 const APP = 'limit_app';
 
@@ -166,7 +171,7 @@ describe('usage-limit sticky state self-heal', () => {
     const text = '⚠ Individual quota reached. Resets in 1m.\nError ID: native-episode\n────\n>\n────\n';
     const detected = detectCliUsageLimit(text);
     if (!detected.limited) throw new Error('Expected relative quota');
-    const initial = annotateAntigravityUsageLimit(text, detected);
+    const initial = annotateComposerFixture(text, detected);
     await dispatch(worker, { type: 'screen_update', content: text, status: 'limited', usageLimit: initial });
     await vi.advanceTimersByTimeAsync(20_000);
     await dispatch(worker, { type: 'screen_update', content: 'kernel: unrelated interface state changed', status: 'working' });
@@ -196,7 +201,7 @@ describe('usage-limit sticky state self-heal', () => {
     const text = '⚠ Individual quota reached. Resets in 1m.\nError ID: expired-native\n────\n>\n────\n';
     const detected = detectCliUsageLimit(text);
     if (!detected.limited) throw new Error('Expected relative quota');
-    const initial = annotateAntigravityUsageLimit(text, detected);
+    const initial = annotateComposerFixture(text, detected);
     await dispatch(worker, { type: 'screen_update', content: text, status: 'limited', usageLimit: initial });
 
     await vi.advanceTimersByTimeAsync(60_000);
@@ -205,11 +210,13 @@ describe('usage-limit sticky state self-heal', () => {
       : { type, imageKey: 'img_stale_quota', status: 'idle' } as const;
 
     sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('injected expired quota clear failure'); });
-    await expect(dispatch(worker, idleFrame)).rejects.toThrow('injected expired quota clear failure');
+    await dispatch(worker, idleFrame);
     expect(ds.usageLimit?.relativeResetKey).toBe(initial.relativeResetKey);
+    expect(ds.lastScreenStatus).toBe('limited');
     sessionStore.__testOnly_setBeforeRowPersist(undefined);
 
-    await dispatch(worker, idleFrame);
+    // Local fenced retry clears without needing a second worker frame.
+    await vi.advanceTimersByTimeAsync(600);
     expect(ds.lastScreenStatus).toBe('idle');
     expect(ds.usageLimit).toBeUndefined();
     const stored = sessionStore.getSessionFresh(session.sessionId);
@@ -230,7 +237,7 @@ describe('usage-limit sticky state self-heal', () => {
     const content = '⚠ Individual quota reached. Resets in 1m.\nError ID: old\n────\n>\n────\n';
     const detected = detectCliUsageLimit(content);
     if (!detected.limited) throw new Error('Expected relative quota');
-    const limit = annotateAntigravityUsageLimit(content, detected);
+    const limit = annotateComposerFixture(content, detected);
     const idle = { type: 'screen_update', content, status: 'idle' } as const;
     const failWrite = () => { throw new Error('injected SQLite write failure'); };
 
@@ -239,6 +246,7 @@ describe('usage-limit sticky state self-heal', () => {
       await dispatch(worker, { ...idle, status: 'limited', usageLimit: limit });
       sessionStore.__testOnly_setBeforeRowPersist(undefined);
       await vi.advanceTimersByTimeAsync(60_000);
+      await dispatch(worker, idle);
     } else {
       await vi.advanceTimersByTimeAsync(60_000);
       session.usageLimit = { ...limit, retryReady: true };
@@ -249,10 +257,11 @@ describe('usage-limit sticky state self-heal', () => {
         { relativeResetKey: limit.relativeResetKey, retryAtMs: limit.retryAtMs },
       ]);
       sessionStore.__testOnly_setBeforeRowPersist(failWrite);
-      await expect(dispatch(worker, idle)).rejects.toThrow('injected SQLite write failure');
+      await dispatch(worker, idle);
+      expect(ds.lastScreenStatus).toBe('limited');
       sessionStore.__testOnly_setBeforeRowPersist(undefined);
+      await vi.advanceTimersByTimeAsync(600);
     }
-    await dispatch(worker, idle);
     const stored = sessionStore.getSessionFresh(session.sessionId);
     expect(stored?.usageLimit).toBeUndefined();
     expect(stored?.antigravityQuotaHistory).toMatchObject([{ relativeResetKey: limit.relativeResetKey, retryAtMs: limit.retryAtMs }]);
@@ -270,7 +279,7 @@ describe('usage-limit sticky state self-heal', () => {
     const classify = loadWorkerFunction<(content: string, status: 'idle') => UsageFrame>(
       'classifyUsageLimitWithNativeEvidence', {
         cliAdapter: { id: 'antigravity' }, backendScreenEvidenceIsAuthoritativeForMutation: () => true,
-        stripAnsiScreenText, isAntigravityWorkingScreen, annotateAntigravityUsageLimit, usageLimitTracker,
+        stripAnsiScreenText, isAntigravityWorkingScreen, usageLimitTracker,
         reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
         unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
       },
@@ -294,10 +303,13 @@ describe('usage-limit sticky state self-heal', () => {
     expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
     if (path === 'cleared partial') {
       sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('injected history write failure'); });
-      await expect(report(composer, expired)).rejects.toThrow('injected history write failure');
+      await report(composer, expired);
       sessionStore.__testOnly_setBeforeRowPersist(undefined);
+      // Automatic local persistence retry commits history without needing a second worker frame.
+      await vi.advanceTimersByTimeAsync(600);
+    } else {
+      await report(composer, expired);
     }
-    await report(composer, classify(composer, 'idle'));
 
     const stored = sessionStore.getSessionFresh(session.sessionId);
     expect(stored?.usageLimit).toBeUndefined();
@@ -325,7 +337,7 @@ describe('usage-limit sticky state self-heal', () => {
     const emitQuota = async (content: string) => {
       const detected = detectCliUsageLimit(content);
       if (!detected.limited) throw new Error('Expected relative quota');
-      const usageLimit = annotateAntigravityUsageLimit(content, detected);
+      const usageLimit = annotateComposerFixture(content, detected);
       await dispatch(worker, { type: 'screen_update', content, status: 'limited', usageLimit });
       return usageLimit;
     };
@@ -357,7 +369,7 @@ describe('usage-limit sticky state self-heal', () => {
     const oldBanner = '⚠ Individual quota reached. Resets in 1m.\nError ID: initial\n────\n>\n────\n';
     const detected = detectCliUsageLimit(oldBanner);
     if (!detected.limited) throw new Error('Expected relative quota');
-    const initial = annotateAntigravityUsageLimit(oldBanner, detected);
+    const initial = annotateComposerFixture(oldBanner, detected);
     await dispatch(worker, { type: 'screen_update', content: oldBanner, status: 'limited', usageLimit: initial });
     expect(ds.rateLimitNotifiedKey).toBe(usageLimitStateKey(initial));
 
@@ -381,7 +393,7 @@ describe('usage-limit sticky state self-heal', () => {
     await dispatch(worker, { type: 'screen_update', content: partial, status: 'limited', usageLimit: initial });
     await vi.advanceTimersByTimeAsync(10_000);
     const complete = partial + '\n────\n>\n────\n';
-    const confirmed = annotateAntigravityUsageLimit(complete, initial);
+    const confirmed = annotateComposerFixture(complete, initial);
     await dispatch(worker, { type: 'screen_update', content: complete, status: 'limited', usageLimit: confirmed });
     expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit?.source).toBe('antigravity-error-composer');
     expect(ds.usageLimit?.retryAtMs).toBe(initial.retryAtMs);
@@ -823,5 +835,69 @@ describe('usage-limit sticky state self-heal', () => {
     await flush();
 
     expect(onScreenStatus.mock.calls.map(call => call[1].status)).toEqual(['working', 'working', 'stalled']);
+  });
+
+  it('persists cursor-only antigravityQuotaCursor metadata and retries on SQLite failure without active usageLimit', async () => {
+    vi.useFakeTimers();
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_cursor_retry', 'cursor retry', 'group', 'chat');
+    const ds = makeDs({ session, worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    const cursor = {
+      lastConfirmed: {
+        limited: true as const, kind: 'usage' as const, retryAtMs: Date.now() + 60_000,
+        retryLabel: '1m', retryReady: false, source: 'antigravity-native-log' as const,
+        nativeEpisodeKey: 'log:E1125 00:00:01.000000',
+      },
+      recoveredEpisodeKey: null,
+    };
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('injected cursor write failure'); });
+    await dispatch(worker, { type: 'screen_update', content: 'idle', status: 'idle', antigravityQuotaCursor: cursor });
+    expect(sessionStore.getSessionFresh(session.sessionId)?.antigravityQuotaCursor).toBeUndefined();
+
+    sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(sessionStore.getSessionFresh(session.sessionId)?.antigravityQuotaCursor).toEqual(cursor);
+  });
+
+  it('notifies replacement confirmed native episode log:A -> log:B while active limited is unexpired', async () => {
+    const replies: string[] = [];
+    initWorkerPool({
+      sessionReply: vi.fn(async (_root: string, text: string) => { replies.push(text); return 'om_reply'; }),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_replace_ep', 'replace episode', 'group', 'chat');
+    session.ownerOpenId = 'ou_owner';
+    sessionStore.updateSession(session);
+    const ds = makeDs({ session, worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    const nowMs = Date.now();
+    await dispatch(worker, {
+      type: 'screen_update',
+      content: 'quota A',
+      status: 'limited',
+      usageLimit: {
+        limited: true, kind: 'usage', retryAtMs: nowMs + 3_600_000, retryLabel: '1h', retryReady: false,
+        source: 'antigravity-native-log', nativeEpisodeKey: 'log:E1125 00:00:01.000000',
+      },
+    });
+    expect(replies).toHaveLength(1);
+
+    await dispatch(worker, {
+      type: 'screen_update',
+      content: 'quota B',
+      status: 'limited',
+      usageLimit: {
+        limited: true, kind: 'usage', retryAtMs: nowMs + 3_600_000, retryLabel: '1h', retryReady: false,
+        source: 'antigravity-native-log', nativeEpisodeKey: 'log:E1125 00:00:09.000000',
+      },
+    });
+    expect(replies).toHaveLength(2);
+    expect(ds.usageLimit?.nativeEpisodeKey).toBe('log:E1125 00:00:09.000000');
   });
 });

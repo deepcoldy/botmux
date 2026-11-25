@@ -7,7 +7,6 @@ import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { snapshotWithLatestRuntimeStatus } from '../src/utils/runtime-screen-status.js';
 import {
   ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
-  annotateAntigravityUsageLimit,
   isAntigravityReadyComposerScreen,
   isAntigravityWorkingScreen,
   rememberAntigravityQuota,
@@ -35,7 +34,7 @@ describe('Antigravity recovery delivery through the real screen sampler', () => 
     const classify = loadWorkerFunction<(content: string, status: 'idle') => any>('classifyUsageLimitWithNativeEvidence', {
       cliAdapter: { id: 'antigravity' }, backend: {}, captureBackendScreen,
       backendScreenEvidenceIsAuthoritativeForMutation: () => true,
-      stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, annotateAntigravityUsageLimit,
+      stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen,
       usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
       unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
     });
