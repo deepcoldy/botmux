@@ -455,6 +455,8 @@ import { WebTerminalInputController, WebTerminalInputWireState } from './core/we
 import { isTerminalColorQueryOnly } from './core/terminal-color-query.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
+import { refreshTraexTerminalSession, traexTerminalSessionIsBound, traexTerminalIdentityNeedsRefresh, traexTerminalInputBlocked } from './services/traex-terminal-session.js';
+import { splitTraexAdoptEvents } from './services/traex-transcript.js';
 import {
   generateCodexAppThreadTitle,
   generateCodexAppNextStep,
@@ -6773,6 +6775,15 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
     fence?: AdoptWriteFence,
     onFollowUp?: () => void,
   ): Promise<boolean> => {
+    if (lastInitConfig?.cliId === 'traex' && lastInitConfig.adoptMode
+      && traexTerminalInputBlocked(adapterInputHandle(targetBackend))) {
+      // Native passthrough and ordinary adapter writes share the same uncertain
+      // /status boundary. Hold the original message; the terminal-identity poll
+      // re-drives it only after a freshly closed panel proves a clean composer.
+      if (!pendingRawInputs.includes(msg)) pendingRawInputs.push(msg);
+      log(`Deferred TRAE passthrough until the native status query settles: ${msg.content}`);
+      return false;
+    }
     let sent = false;
     let recoveryFailureReason: string | undefined;
     try {
@@ -15990,9 +16001,17 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     const cutoff = antigravity ? Math.floor(adoptStart / 1_000) * 1_000 : adoptStart - 5_000;
     const journalPath = codexAdoptJournalPath() ?? structuredBridgeJournalPath();
     const recover = journalPath && !codexAdoptRecoveryAttempted;
-    const { history, live, restored } = recover
+    const traexSplit = structuredBridgeIs('traex') && lastInitConfig?.adoptMode
+      ? splitTraexAdoptEvents(result.events, cutoff) : undefined;
+    if (traexSplit) codexBridgeQueue.setLocalTurns(true, traexSplit.localSinceMs);
+    const baseline = recover
       ? restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff)
-      : { ...splitCodexEventsByCutoff(result.events, cutoff), restored: 0 };
+      : { ...(traexSplit ?? splitCodexEventsByCutoff(result.events, cutoff)), restored: 0 };
+    const promotedInputIds = new Set(traexSplit?.live.filter(event => event.timestampMs < cutoff && event.kind === 'user').map(event => event.uuid));
+    const promotedInputs = baseline.history.filter(event => promotedInputIds.has(event.uuid));
+    const history = baseline.history.filter(event => !promotedInputIds.has(event.uuid));
+    const live = [...promotedInputs, ...baseline.live];
+    const restored = baseline.restored;
     if (journalPath) {
       codexAdoptRecoveryAttempted = true;
       structuredBridgeRecoveryAttempted = true;
@@ -16002,6 +16021,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     }
     codexBridgeQueue.absorb(history);
     codexBridgeQueue.ingest(live);
+    if (traexSplit) codexBridgeQueue.setLocalTurns(true, codexAdoptStartMs ?? Date.now());
     if (antigravity && live.some(event => event.kind === 'user')) {
       // The submit and its provisional final can both precede late binding.
       structuredBridgeDriverState = result.state;
@@ -16826,6 +16846,7 @@ function currentTraexObservedPid(): number | undefined {
  *  codexHistorySidOwnedByCurrentPid; the pure decision lives in
  *  traexHistorySidIsOwned for unit testing without a live pid. */
 function traexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
+  if (backend && traexTerminalSessionIsBound(adapterInputHandle(backend), cliSessionId)) return true;
   const pid = currentTraexObservedPid();
   const ownedRollouts = pid ? findTraexRolloutSetByPid(pid) : undefined;
   const owned = traexHistorySidIsOwned(cliSessionId, ownedRollouts);
@@ -16869,7 +16890,7 @@ function noteTraexProcessFileSource(pid: number): void {
  *  remembers the sid so the 1s poller can keep retrying. */
 function codexBridgeNotifyCliSessionId(
   cliSessionId: string,
-  options: { preserveLiveTurn?: boolean } = {},
+  options: { preserveLiveTurn?: boolean; adoptRotationStartMs?: number } = {},
 ): void {
   if (!codexBridgeFallbackActive()) return;
   // A reported (proven) id supersedes any not-yet-owned history candidate.
@@ -16947,13 +16968,18 @@ function codexBridgeNotifyCliSessionId(
       } catch (err: any) {
         log(`TRAE pre-rotation bridge drain failed: ${err.message}`);
       }
+      if (lastInitConfig?.adoptMode && !sameSession) {
+        // Keep this watermark even when the new rollout is created lazily.
+        codexAdoptStartMs = options.adoptRotationStartMs ?? Date.now();
+        codexBridgeQueue.setLocalTurns(true, codexAdoptStartMs);
+      }
       if (next && next !== codexBridgeRolloutPath) {
         const reason = sameSession ? `rollout segment moved for ${cliSessionId}`
           : `session rotated ${currentSid ?? '?'} → ${cliSessionId}`;
         log(`TRAE ${reason}; re-attaching bridge to ${next}`);
         codexBridgeDetachFile();
         codexBridgePendingSessionId = undefined;
-        codexBridgeAttach(next, 'fresh-empty');
+        codexBridgeAttach(next, lastInitConfig?.adoptMode && !sameSession ? 'split-live' : 'fresh-empty');
       } else if (!next && !sameSession) {
         log(`TRAE session rotated ${currentSid ?? '?'} → ${cliSessionId}; waiting for rollout`);
         codexBridgeDetachFile();
@@ -17218,7 +17244,37 @@ function maybeFollowTraexSessionRotationViaPid(): void {
   const currentSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
   const observed = findTraexRolloutByPid(pid, currentSid);
   noteTraexProcessFileSource(pid);
-  if (!observed) return;
+  if (!observed) {
+    if (lastInitConfig?.adoptMode) {
+      const fence = captureAdoptWriteFence();
+      if (!fence) return;
+      if (!traexTerminalIdentityNeedsRefresh(adapterInputHandle(fence.backend))) return;
+      void adoptWriteQueue.run(async () => {
+        if (!adoptWriteFenceIsCurrent(fence)) return;
+        const terminal = adapterInputHandle(fence.backend);
+        const resolved = await refreshTraexTerminalSession(terminal, () => adoptWriteFenceIsCurrent(fence));
+        if (!adoptWriteFenceIsCurrent(fence)) return;
+        if (resolved.inputReleased) {
+          // Raw commands and native rename were held without writing. Release
+          // them only after this same query observed the restored composer. A
+          // recognised negative status result releases input too; only identity
+          // binding below depends on a shared-server session id.
+          queueMicrotask(() => {
+            if (adoptWriteFenceIsCurrent(fence)) void flushPending();
+          });
+        }
+        if (resolved.kind !== 'terminal') return;
+        const boundSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
+        if (boundSid !== resolved.sessionId) {
+          persistCliSessionId(resolved.sessionId);
+          codexBridgeNotifyCliSessionId(resolved.sessionId, { adoptRotationStartMs: resolved.liveSinceMs });
+        }
+        codexBridgeIngest();
+        if (isPromptReady) emitReadyCodexTurns();
+      }).catch(error => log(`TRAE native session discovery failed: ${error instanceof Error ? error.message : String(error)}`));
+    }
+    return;
+  }
   if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;
   persistCliSessionId(observed.cliSessionId);
   if (!codexBridgeRolloutPath && lastSpawnEffectiveResume && !lastInitConfig?.adoptMode) {
@@ -20129,7 +20185,8 @@ async function writeAdoptMessage(
         // so the transaction can cancel/poison the WAL. Passing the bare backend
         // would let a refused write look like success and clear the journal —
         // silent input loss (the exact failure the transaction guards against).
-        () => cliAdapter!.writeInput(adapterInputHandle(submissionBackend), content),
+        () => cliAdapter!.writeInput(adapterInputHandle(submissionBackend), content,
+          lastInitConfig?.cliId === 'traex' ? { correlateTranscript: true } : undefined),
         settleVerifiableSubmissionForJournal,
         prepareAdoptWrite,
       );
@@ -20140,7 +20197,13 @@ async function writeAdoptMessage(
       }
       if (result?.cliSessionId) {
         persistCliSessionId(result.cliSessionId);
-        codexBridgeNotifyCliSessionId(result.cliSessionId);
+        codexBridgeNotifyCliSessionId(result.cliSessionId, {
+          // Receipt polling can outlive the turn itself. Split the new rollout
+          // at the literal write, not when this late notification happened.
+          adoptRotationStartMs: inputDeliveryEvidence.writeStartedAtMs({
+            turnId, dispatchAttempt, cliGeneration: cliSpawnGeneration,
+          }),
+        });
       }
       if (result?.submitted === true && adoptStructuredBridgeTurnId) {
         codexBridgeQueue.confirmPendingTurn(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
@@ -26245,7 +26308,9 @@ function scheduleSubmitFailureNotify(
         queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle);
         if (cliSessionId) {
           persistCliSessionId(cliSessionId);
-          if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
+          if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId, {
+            adoptRotationStartMs: activityBaselineMs,
+          });
           void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
         } else if (settlement.unprovenCliSessionId) {
           // The confirmation above renewed this turn's lease, and the history
@@ -27237,8 +27302,11 @@ async function flushPending(): Promise<void> {
   // Native /rename is an administrative command, not a steer/queued model
   // message. It must wait for a real prompt even on type-ahead CLIs. Normal
   // pending messages can still drain while busy; the rename stays queued.
-  const sessionRenameReady = isPromptReady && pendingSessionRename !== null;
-  const rawInputReady = isPromptReady && pendingRawInputs.length > 0;
+  const traexNativeCommandBlocked = (pendingRawInputs.length > 0 || pendingSessionRename !== null)
+    && lastInitConfig?.cliId === 'traex' && lastInitConfig.adoptMode === true && !!backend
+    && traexTerminalInputBlocked(adapterInputHandle(backend));
+  const sessionRenameReady = isPromptReady && pendingSessionRename !== null && !traexNativeCommandBlocked;
+  const rawInputReady = isPromptReady && pendingRawInputs.length > 0 && !traexNativeCommandBlocked;
   const adoptInputReady = isPromptReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
   let supportedSessionRenameReady = sessionRenameReady;
   const renameOnRemoteBackend = effectiveBackendType === 'riff'
@@ -29533,6 +29601,7 @@ function attachStructuredBridgeAtSpawn(
 }
 
 async function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<void> {
+  const initialAdoptStartMs = Date.now();
   if (cfg.bridgeJsonlPath) {
     startBridgeWatcher(cfg.bridgeJsonlPath, {
       cliPid: cfg.adoptCliPid,
@@ -29616,7 +29685,20 @@ async function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 
     // CLI whose adapter declares an `adopt` policy: traex / cursor / pi / grok.
     // codex / coco / mtr keep the dedicated branches above (see StructuredBridgeSpec.adopt).
     const adopt = bridgeSpecFor(cfg.cliId)?.adopt;
-    if (adopt) setupAdoptFileBridge(cfg, adopt);
+    if (adopt) {
+      if (cfg.cliId === 'traex' && backend) {
+        const fence = captureAdoptWriteFence();
+        const resolved = fence && await adoptWriteQueue.run(() => refreshTraexTerminalSession(
+          adapterInputHandle(fence.backend), () => adoptWriteFenceIsCurrent(fence),
+        ));
+        if (resolved?.kind === 'terminal' && fence && adoptWriteFenceIsCurrent(fence)) {
+          persistCliSessionId(resolved.sessionId);
+          setupAdoptFileBridge({ ...cfg, cliSessionId: resolved.sessionId }, adopt, initialAdoptStartMs);
+          return;
+        }
+      }
+      setupAdoptFileBridge(cfg, adopt, initialAdoptStartMs);
+    }
   }
 }
 
@@ -29627,8 +29709,8 @@ async function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 
 function setupAdoptFileBridge(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   adopt: NonNullable<StructuredBridgeSpec['adopt']>,
+  adoptStartMs = Date.now(),
 ): void {
-  const adoptStartMs = Date.now();
   codexAdoptStartMs = adoptStartMs;
   // Direct terminal input must surface in Lark as a local-turn card. For
   // transcripts without per-event timestamps (cursor) the baseline/offset
