@@ -117,7 +117,7 @@ When an agent renames the group on its own because the task moved to a new phase
 - botmux commands need operate access by default. A few only need talk access, such as `/resume`.
 - To let people with talk access run specific commands, add those commands to `canTalkDaemonCommands` in `bots.json`.
 
-With these tiers you can safely add the bot to an on-call group: everyone can ask, but only admins can change session state, and a stray click from someone else won't break the session. Full rules (quotas, expiry, "joining a group ≠ being authorized", block list, grant request cards) are in [Permissions & Access](/en/permissions).
+With these tiers you can safely add the bot to an on-call group: everyone can ask, and by default only admins can change session state—a stray click from someone else won't break the session; the one exception is that the person who opened a topic can close their own topic (see the Operate row above; the `/close` command still needs operate access). Full rules (quotas, expiry, "joining a group ≠ being authorized", block list, grant request cards) are in [Permissions & Access](/en/permissions).
 
 ## Common confusions
 
