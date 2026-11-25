@@ -35475,7 +35475,7 @@ async function spawnCliBody(
   // has, and for every CLI without a Claude transcript bridge.
   idleTranscriptSettle?.cancel();
   if (typeof cancelAllIdleTranscriptSettles === 'function') cancelAllIdleTranscriptSettles();
-  registeredIdleTranscriptSettles.clear();
+  if (typeof registeredIdleTranscriptSettles !== 'undefined') registeredIdleTranscriptSettles.clear();
   if (typeof disarmClaudeOpenTurnWatchdog === 'function') disarmClaudeOpenTurnWatchdog();
   const ptyIdleSettle = makeBridgeTranscriptSettle(
     () => backend === observedBackend && bridgeHeadTurnAwaitingTerminal({ startedOnly: true }),
