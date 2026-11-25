@@ -352,6 +352,11 @@ describe('kanban off-board composition follows the active status filter', () => 
       expect(isOffBoardKanbanRow({ ...row, openTodos: { remaining } }, '')).toBe(true);
     }
     expect(isOffBoardKanbanRow(row, '')).toBe(true);
+    expect(isOffBoardKanbanRow({
+      ...row,
+      lastTurn: { turnId: 'silent', outcome: 'no_output', at },
+      openTodos: { remaining: 1 },
+    }, '')).toBe(false);
   });
   it('does not reintroduce a silent idle round as a todo when its worker is suspended', () => {
     const lastTurn = { turnId: 'silent', outcome: 'no_output', at: Date.now() - 60_000 };

@@ -2342,9 +2342,9 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // ran. Keeping the launcher's retired binding strands the live runtime and
   // its crash recovery while the worker itself remains alive. The same-process
   // proof still leaves delayed exits from a replaced backend in history.
-  const liveProcessOrigin = msg.type === 'restart_result' || msg.type === 'claude_exit'
-    ? workerSessionEventScope.liveProcessOrigin(msg.type === 'claude_exit')
-    : undefined;
+  const liveProcessOrigin = msg.type === 'claude_exit'
+    ? workerSessionEventScope.physicalExitOrigin()
+    : msg.type === 'restart_result' ? workerSessionEventScope.liveProcessOrigin() : undefined;
   // Runtime identity follows the physical observer's binding. A submitted
   // turn may still name the previous runtime after an in-process rebind.
   const captured = explicitOrigin ?? liveProcessOrigin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()

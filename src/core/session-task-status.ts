@@ -126,7 +126,7 @@ function blockingAttention(input: FactsInput, busy: boolean): ReturnType<typeof 
   return Math.max(busySince, turnStart) > attention.at ? undefined : attention;
 }
 
-export function remainingTodos(input: FactsInput): number {
+function remainingTodos(input: FactsInput): number {
   const facts = input as SessionTaskFacts;
   const todos = facts.openTodos;
   if (!todos || typeof todos !== 'object') return 0;

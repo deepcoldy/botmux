@@ -61,24 +61,24 @@ describe('liveProcessOrigin (restart receipts)', () => {
   });
 });
 
-describe('liveProcessOrigin (physical exit prefers assigned bindings)', () => {
+describe('physicalExitOrigin (assigned same-process predecessors)', () => {
   it('uses the newest assigned ancestor across multiple pending same-process rebinds', () => {
     const { scope, launcher, live } = scopeWithRelayRebind();
     scope.beginRuntime(RESTART_OP, live.physicalId);
     const pending = scope.beginRuntime(RESTART_OP, live.physicalId);
-    expect(scope.run(launcher, () => scope.liveProcessOrigin(true))?.runtime).toEqual(live.runtime);
+    expect(scope.run(launcher, () => scope.physicalExitOrigin())?.runtime).toEqual(live.runtime);
     expect(scope.run(launcher, () => scope.liveProcessOrigin())?.bindingId).toBe(pending.bindingId);
     scope.assign(pending.bindingId, { runtimeId: 'latest-runtime', epoch: 4 });
-    expect(scope.run(launcher, () => scope.liveProcessOrigin(true))?.runtime).toEqual(pending.runtime);
+    expect(scope.run(launcher, () => scope.physicalExitOrigin())?.runtime).toEqual(pending.runtime);
   });
 
   it('keeps an unassigned first process deferred without borrowing a replaced process', () => {
     const { scope, live } = scopeWithRelayRebind();
     scope.beginRuntime(undefined, 'replacement-process');
     const pending = scope.beginRuntime(undefined, 'replacement-process');
-    expect(scope.liveProcessOrigin(true)).toMatchObject({ bindingId: pending.bindingId });
-    expect(scope.liveProcessOrigin(true)?.runtime).toBeUndefined();
-    expect(scope.run(live, () => scope.liveProcessOrigin(true))).toBeUndefined();
+    expect(scope.physicalExitOrigin()).toMatchObject({ bindingId: pending.bindingId });
+    expect(scope.physicalExitOrigin()?.runtime).toBeUndefined();
+    expect(scope.run(live, () => scope.physicalExitOrigin())).toBeUndefined();
   });
 
   it('does not revive an abandoned ancestor if its assignment arrives late', () => {
@@ -87,6 +87,6 @@ describe('liveProcessOrigin (physical exit prefers assigned bindings)', () => {
     scope.beginRuntime(undefined, live.physicalId);
     scope.refuseBinding(refused.bindingId);
     scope.assign(refused.bindingId, { runtimeId: 'late-ack', epoch: 4 });
-    expect(scope.liveProcessOrigin(true)?.runtime).toEqual(live.runtime);
+    expect(scope.physicalExitOrigin()?.runtime).toEqual(live.runtime);
   });
 });
