@@ -453,4 +453,62 @@ describe('Claude Code open-turn hold, authority retention, and Scenario 3 recove
       errorCode: 'user_interrupted',
     })]);
   }, SOURCE_WORKER_LOAD_TIMEOUT_MS + 45_000);
+
+  it('Durable pre-terminal stall closes exact attempt ambiguous and restores prompt_ready', async () => {
+    const w = await startScriptedWorker({
+      workerEnv: { BOTMUX_TEST_CLAUDE_OPEN_TURN_QUIET_MS: '1000' },
+      script: [],
+    });
+    const from = w.messages.length;
+    child!.send({
+      type: 'message', content: 'durable stuck before terminal', turnId: 'om_durable_open', dispatchAttempt: 2,
+    } satisfies DaemonToWorker);
+
+    await waitUntil(
+      () => w.messages.slice(from).some(m => m.type === 'turn_terminal' && m.turnId === 'om_durable_open')
+        && w.messages.slice(from).some(m => m.type === 'prompt_ready'),
+      w.logs,
+    );
+    const after = w.messages.slice(from);
+    expect(after.filter(m => m.type === 'final_output' && m.turnId === 'om_durable_open')).toEqual([]);
+    expect(after.filter(m => m.type === 'turn_terminal' && m.turnId === 'om_durable_open')).toEqual([
+      expect.objectContaining({
+        turnId: 'om_durable_open', dispatchAttempt: 2,
+        status: 'ambiguous', errorCode: 'claude_open_turn_timeout',
+      }),
+    ]);
+  }, SOURCE_WORKER_LOAD_TIMEOUT_MS + 45_000);
+
+  it('Durable end_turn without turn_duration closes ambiguous instead of emitting a normal final', async () => {
+    const w = await startScriptedWorker({
+      workerEnv: { BOTMUX_TEST_CLAUDE_OPEN_TURN_QUIET_MS: '1000' },
+      script: [
+        {
+          delayMs: 200,
+          row: {
+            type: 'assistant', uuid: 'a_durable', parentUuid: 'u1',
+            message: { id: 'm_durable', role: 'assistant', model: 'claude-test', stop_reason: 'end_turn', usage: { ...zeroUsage, output_tokens: 20 }, content: [{ type: 'text', text: 'Durable answer missing duration.' }] },
+          },
+        },
+      ],
+    });
+    const from = w.messages.length;
+    child!.send({
+      type: 'message', content: 'durable missing duration', turnId: 'om_durable_duration', dispatchAttempt: 3,
+    } satisfies DaemonToWorker);
+
+    await waitUntil(
+      () => w.messages.slice(from).some(m => m.type === 'turn_terminal' && m.turnId === 'om_durable_duration')
+        && w.messages.slice(from).some(m => m.type === 'prompt_ready'),
+      w.logs,
+    );
+    const after = w.messages.slice(from);
+    expect(after.filter(m => m.type === 'final_output' && m.turnId === 'om_durable_duration')).toEqual([]);
+    expect(after.filter(m => m.type === 'turn_terminal' && m.turnId === 'om_durable_duration')).toEqual([
+      expect.objectContaining({
+        turnId: 'om_durable_duration', dispatchAttempt: 3,
+        status: 'ambiguous', errorCode: 'duration_marker_missing',
+      }),
+    ]);
+  }, SOURCE_WORKER_LOAD_TIMEOUT_MS + 45_000);
 });

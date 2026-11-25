@@ -85,7 +85,9 @@ function createWatchdogWiring(opts: {
   let programStatusHeldBusy = opts.programStatusHeldBusy ?? false;
   let redrives = 0;
   const released: Array<{ turnId: string; source: string }> = [];
+  const releaseActions: string[] = [];
   const emitted: Array<{ opts: unknown }> = [];
+  const drainedTurns: any[] = [];
   const backend = { id: 'be-1' };
 
   const scope: Record<string, unknown> = {
@@ -139,9 +141,9 @@ function createWatchdogWiring(opts: {
     },
     emitReadyTurns: (emitOpts: { explicitTerminalOnly?: boolean; releaseHeldTerminals?: boolean; onlyTurn?: { turnId: string; dispatchAttempt?: number } }) => {
       emitted.push({ opts: emitOpts });
-      queue.drainEmittable(emitOpts?.explicitTerminalOnly
+      drainedTurns.push(...queue.drainEmittable(emitOpts?.explicitTerminalOnly
         ? { explicitTerminalOnly: true, releaseHeldTerminals: emitOpts.releaseHeldTerminals, onlyTurn: emitOpts.onlyTurn }
-        : { terminalBoundary: true, requireExplicitTerminalForDurable: true, releaseHeldTerminals: emitOpts?.releaseHeldTerminals, onlyTurn: emitOpts?.onlyTurn });
+        : { terminalBoundary: true, requireExplicitTerminalForDurable: true, releaseHeldTerminals: emitOpts?.releaseHeldTerminals, onlyTurn: emitOpts?.onlyTurn }));
     },
   };
 
@@ -156,6 +158,7 @@ function createWatchdogWiring(opts: {
     'captureClaudeOpenTurnObservation',
     'openClaudeTurnHasExplicitFinalSend',
     'fireClaudeRedriveEdge',
+    'settleDurableClaudeTurnAmbiguous',
     'maybeHoldOpenClaudeTurn',
     'reconcileClaudeOpenTurnWatchdogAfterIngest',
     'bridgeHeadTurnAwaitingTerminal',
@@ -169,15 +172,20 @@ function createWatchdogWiring(opts: {
     watchdog,
     backend,
     released,
+    releaseActions,
     emitted,
+    drainedTurns,
     redrives: () => redrives,
     setCliAlive: (v: boolean) => { cliAlive = v; },
     setProgramStatusHeldBusy: (v: boolean) => { programStatusHeldBusy = v; },
     hold: (source = 'screen') =>
-      (scope.maybeHoldOpenClaudeTurn as (s: string, be: unknown, cb: (t: any, src: string) => void) => boolean)(
+      (scope.maybeHoldOpenClaudeTurn as (s: string, be: unknown, cb: (t: any, src: string, action?: string) => void) => boolean)(
         source,
         backend,
-        (t, src) => { released.push({ turnId: t.turnId, source: src }); },
+        (t, src, action) => {
+          released.push({ turnId: t.turnId, source: src });
+          if (action) releaseActions.push(action);
+        },
       ),
     reconcile: () => (scope.reconcileClaudeOpenTurnWatchdogAfterIngest as () => void)(),
     disarm: () => (scope.disarmClaudeOpenTurnWatchdog as () => void)(),
@@ -206,7 +214,7 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
     expect(h.queue.peek()[0]?.turnId).toBe('scheduled-fire_1');
   });
 
-  it('Finding 3: durationMarkerSeen=true + missing turn_duration settles non-durable turn BEFORE redriving (no split-brain), and never arms release timer for durable turns', () => {
+  it('Finding 3: durationMarkerSeen=true + missing turn_duration settles non-durable turn BEFORE redriving, and closes durable as ambiguous rather than waiting forever', () => {
     // Non-durable turn
     {
       const h = createWatchdogWiring();
@@ -236,7 +244,8 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
       expect(h.redrives()).toBe(1);
     }
 
-    // Durable turn: must NOT arm 6s release timer or redrive while awaiting turn_duration
+    // Durable turn: the final text is not emitted as a normal completion when
+    // its duration marker is lost. Settle exact attempt ambiguous and redrive.
     {
       const h = createWatchdogWiring();
       h.queue.noteDurationMarkerObserved();
@@ -245,10 +254,16 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
       expect(h.hold('screen')).toBe(true);
       h.queue.ingest([mkAssistant('a1', 'u1', 'Durable answer', 'end_turn')], '/t/s.jsonl');
       h.reconcile();
-      vi.advanceTimersByTime(CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS * 3);
-      expect(h.emitted).toEqual([]);
-      expect(h.redrives()).toBe(0);
-      expect(h.queue.peek()[0]?.turnId).toBe('om_dur');
+      vi.advanceTimersByTime(CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS + 100);
+      expect(h.drainedTurns).toHaveLength(1);
+      expect(h.drainedTurns[0]).toMatchObject({
+        turnId: 'om_dur',
+        dispatchAttempt: 1,
+        terminalObserved: true,
+        terminalOutcome: { status: 'ambiguous', errorCode: 'duration_marker_missing' },
+      });
+      expect(h.queue.peek()).toEqual([]);
+      expect(h.redrives()).toBe(1);
       h.disarm();
     }
   });
@@ -279,6 +294,67 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
     expect(attempts).toBe(2);
     expect(h.queue.peek()).toEqual([]);
     expect(h.redrives()).toBe(1);
+  });
+
+  it('Durable pre-terminal hold reaches the bounded release action', () => {
+    const h = createWatchdogWiring({ bareQuietMs: 1_000 });
+    h.queue.mark('om_durable_open', makeFingerprint('open durable'), 100, 'open durable', 3);
+    h.queue.ingest([mkUser('u1', 'open durable')], '/t/s.jsonl');
+    expect(h.hold('screen')).toBe(true);
+    vi.advanceTimersByTime(5_000);
+    expect(h.released).toEqual([{ turnId: 'om_durable_open', source: 'screen' }]);
+    expect(h.releaseActions).toEqual(['release-timeout']);
+    h.disarm();
+  });
+
+  it('Durable bounded settlement is ambiguous and does not anchor late output to the old attempt', () => {
+    const h = createWatchdogWiring();
+    h.queue.mark('om_durable_timeout', makeFingerprint('durable timeout'), 100, 'durable timeout', 4);
+    h.queue.ingest([mkUser('u1', 'durable timeout')], '/t/s.jsonl');
+    const turn = h.queue.peek()[0]!;
+    const settle = loadWorkerFunction<(turn: any, errorCode: string) => boolean>(
+      'settleDurableClaudeTurnAmbiguous', h.scope,
+    );
+
+    expect(settle(turn, 'claude_open_turn_timeout')).toBe(true);
+    expect(h.drainedTurns).toHaveLength(1);
+    expect(h.drainedTurns[0]).toMatchObject({
+      turnId: 'om_durable_timeout',
+      dispatchAttempt: 4,
+      terminalOutcome: { status: 'ambiguous', errorCode: 'claude_open_turn_timeout' },
+    });
+    expect(h.drainedTurns[0].terminalObserved).not.toBe(true);
+    h.queue.ingest([
+      mkAssistant('a_late', 'u1', 'late old-attempt output', 'end_turn'),
+      mkDuration('d_late', 'a_late'),
+    ], '/t/s.jsonl');
+    expect(h.queue.drainEmittable({ explicitTerminalOnly: true })[0]?.turnId)
+      .toBe('local-headless-a_late');
+  });
+
+  it('Late-recovered turn without an active watchdog still gets bounded marker-loss settlement', () => {
+    const h = createWatchdogWiring();
+    h.queue.noteDurationMarkerObserved();
+    h.queue.mark('om_late_marker', makeFingerprint('late marker'), 100, 'late marker');
+    h.queue.ingest([
+      mkUser('u1', 'late marker'),
+      mkAssistant('a_part', 'u1', 'Partial', null),
+    ], '/t/s.jsonl');
+    expect(h.hold('screen')).toBe(true);
+    h.disarm();
+    h.queue.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true });
+    h.queue.ingest([mkAssistant('a_final', 'a_part', 'Late final', 'end_turn')], '/t/s.jsonl');
+    h.reconcile();
+
+    vi.advanceTimersByTime(CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS + 100);
+    expect(h.drainedTurns).toHaveLength(1);
+    expect(h.drainedTurns[0]).toMatchObject({
+      turnId: 'late-recovery-a_final',
+      terminalOutcome: { status: 'completed' },
+    });
+    expect(h.queue.peek()).toEqual([]);
+    expect(h.redrives()).toBe(1);
+    h.disarm();
   });
 
   it('Finding 9: cliAlive=false preserves savedEvidenceSource and still redrives if closing records land during pre-settlement ingest', () => {

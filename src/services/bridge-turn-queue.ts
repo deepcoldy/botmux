@@ -86,7 +86,8 @@ export interface BridgePendingTurn {
   assistantUuids: string[];
   /** An authoritative transcript boundary closed this turn. Durable turns may
    * never settle from screen-idle alone; worker terminal emission requires
-   * this bit (or an explicit failure/exit path outside the queue). */
+   * this bit (or an explicit failure/exit/ambiguous outcome outside the
+   * transcript's completion evidence). */
   terminalObserved?: boolean;
   /** The latest terminal evidence is an assistant record's stop_reason that no
    * `system/turn_duration` has confirmed yet. Claude Code stamps EVERY content
@@ -743,6 +744,19 @@ export class BridgeTurnQueue {
     if (this.isAwaitingDurationMarker(head)) return true;
     if (isHeldInCliQueue(head)) return true;
     return false;
+  }
+
+  /** Record an explicit worker-side ambiguity for the exact durable head.
+   *  Unlike `terminalObserved`, this does not claim any transcript terminal:
+   *  the model may have run, but its precise completion contract is unknown.
+   *  The bounded worker release drains this outcome without normal final_output. */
+  markDurableTurnAmbiguous(turn: BridgePendingTurn, errorCode: string): boolean {
+    if (this.queue[0] !== turn || turn.dispatchAttempt === undefined
+      || turn.closedByDurationMarker || turn.rateLimited) return false;
+    turn.terminalOutcome = { status: 'ambiguous', errorCode, retryable: false };
+    turn.terminalOutcomeAtMs = Date.now();
+    turn.awaitingDurationMarker = false;
+    return true;
   }
 
   /** Head live non-local turn that has started collecting in the current
@@ -2092,7 +2106,7 @@ export class BridgeTurnQueue {
     /** Pop only turns carrying an authoritative transcript boundary. */
     explicitTerminalOnly?: boolean;
     /** Screen idle may release ordinary fallback turns, but never a durable
-     * receiver turn whose receipt depends on an exact terminal contract. */
+     * receiver turn without an exact terminal or an explicit ambiguous outcome. */
     requireExplicitTerminalForDurable?: boolean;
     /** The CLI generation is ending (exit, kill, teardown): a duration marker
      *  still due will never be written, so a turn held for it is final now. */
@@ -2115,7 +2129,8 @@ export class BridgeTurnQueue {
       if (opts.explicitTerminalOnly && !head.terminalObserved) break;
       if (opts.requireExplicitTerminalForDurable
         && head.dispatchAttempt !== undefined
-        && !head.terminalObserved) break;
+        && !head.terminalObserved
+        && !(opts.releaseHeldTerminals && head.terminalOutcome?.status === 'ambiguous')) break;
       // Neither the per-read drain nor the idle edge may settle a turn on a
       // block-level stop_reason when its duration marker is due: the reader can
       // stop between two records of one message (the idle edge, too, can beat
@@ -2177,6 +2192,7 @@ export class BridgeTurnQueue {
       // so late assistant records proving the same conversation-tree lineage
       // re-attach rather than becoming a suppressed `local-headless-*` turn.
       if (!head.isLocal
+        && head.dispatchAttempt === undefined
         && !head.terminalObserved
         && !head.rateLimited
         && !head.restoredFromJournal

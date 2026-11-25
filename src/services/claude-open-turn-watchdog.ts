@@ -51,7 +51,8 @@ export interface ClaudeOpenTurnQueueEvidence {
 export interface ClaudeOpenTurnObservation extends ClaudeOpenTurnQueueEvidence {
   /** `${bridgeTranscriptGeneration}:${turnId}:${dispatchAttempt ?? ''}`, or undefined when no open turn. */
   turnKey: string | undefined;
-  /** Durable turns (`dispatchAttempt !== undefined`) are never popped unobserved. */
+  /** Durable turns use the same bounded release edge, which the worker settles
+   *  as exact-attempt ambiguous rather than as normal transcript completion. */
   durable: boolean;
   /** `UserPromptSubmit` hook confirmed this turn was submitted (helps pre-2.1.304 builds without `api-request`). */
   userPromptSubmitObserved: boolean;
@@ -198,7 +199,6 @@ export function boundsForClaudeOpenTurn(
 
 interface HoldingEpisode {
   turnKey: string;
-  durable: boolean;
   evidenceSource: string;
   lastActivitySeq: number;
   lastPtyGen: number;
@@ -277,7 +277,6 @@ export class ClaudeOpenTurnWatchdog {
     if (!obs.turnKey) return;
     const stopFlag = obs.userStopRequested || this.stoppedTurnKey === obs.turnKey;
     if (this.phase === 'holding' && this.episode && this.episode.turnKey === obs.turnKey) {
-      this.episode.durable = obs.durable;
       this.episode.userStopRequested = this.episode.userStopRequested || stopFlag;
       if (obs.activitySeq !== this.episode.lastActivitySeq) {
         this.episode.lastActivitySeq = obs.activitySeq;
@@ -300,7 +299,6 @@ export class ClaudeOpenTurnWatchdog {
     this.awaitingMarkerEvidenceSource = undefined;
     this.episode = {
       turnKey: obs.turnKey,
-      durable: obs.durable,
       evidenceSource,
       lastActivitySeq: obs.activitySeq,
       lastPtyGen: obs.ptyOutputGeneration,
@@ -315,7 +313,6 @@ export class ClaudeOpenTurnWatchdog {
    *  advances both clocks if transcript `activitySeq` moved. */
   noteIngestProgress(obs: ClaudeOpenTurnObservation): void {
     if (this.phase !== 'holding' || !this.episode || obs.turnKey !== this.episode.turnKey) return;
-    this.episode.durable = obs.durable;
     if (obs.userStopRequested || this.stoppedTurnKey === obs.turnKey) {
       this.episode.userStopRequested = true;
     }
@@ -347,9 +344,6 @@ export class ClaudeOpenTurnWatchdog {
     }
     if (obs.cliAlive === false) {
       return 'release-dead';
-    }
-    if (obs.durable || this.episode.durable) {
-      return 'wait';
     }
     if ((obs.userStopRequested || this.stoppedTurnKey === obs.turnKey) && !this.episode.userStopRequested) {
       this.episode.userStopRequested = true;

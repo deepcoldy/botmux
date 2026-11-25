@@ -202,6 +202,7 @@ import {
   CLAUDE_OPEN_TURN_POLL_MS,
   parsePositiveMsEnv,
   type ClaudeOpenTurnObservation,
+  type ClaudeOpenTurnEvaluateAction,
 } from './services/claude-open-turn-watchdog.js';
 import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, finalBridgeSendMarkerCoversOwnThread, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -13533,12 +13534,25 @@ function fireClaudeRedriveEdge(): void {
   markPromptReady();
 }
 
+/** Close a durable turn without inventing transcript completion evidence.
+ *  The exact attempt becomes ambiguous so the receiver owns recovery; normal
+ *  final_output and Scenario 3 re-attachment stay disabled for this attempt. */
+function settleDurableClaudeTurnAmbiguous(turn: BridgePendingTurn, errorCode: string): boolean {
+  if (turn.dispatchAttempt === undefined) return false;
+  if (!bridgeQueue.markDurableTurnAmbiguous(turn, errorCode)) return false;
+  emitReadyTurns({
+    releaseHeldTerminals: true,
+    onlyTurn: { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt },
+  });
+  return true;
+}
+
 /** Decide whether to hold an idle/Herdr-done boundary for an open Claude IM
  *  turn, arming the two-clock bounded watchdog. Returns `true` when held. */
 function maybeHoldOpenClaudeTurn(
   evidenceSource: string,
   observedBackend: SessionBackend,
-  onBoundedRelease: (boundTurn: BridgePendingTurn, savedSource: string) => void,
+  onBoundedRelease: (boundTurn: BridgePendingTurn, savedSource: string, action: ClaudeOpenTurnEvaluateAction) => void,
 ): boolean {
   const openTurn = openClaudeLifecycleTurn();
   if (!openTurn) return false;
@@ -13565,7 +13579,7 @@ function maybeHoldOpenClaudeTurn(
   }
   idleDetector?.reset();
 
-  if (openTurn.dispatchAttempt === undefined && !claudeOpenTurnWatchdogTimer) {
+  if (!claudeOpenTurnWatchdogTimer) {
     const boundTurn = openTurn;
     const boundGeneration = bridgeTranscriptGeneration;
     const boundCliGeneration = cliSpawnGeneration;
@@ -13626,7 +13640,7 @@ function maybeHoldOpenClaudeTurn(
       disarmClaudeOpenTurnWatchdog();
       log(`Claude open-turn bounded fallback releasing turn ${boundTurn.turnId.substring(0, 8)} `
         + `(${recheck}, source=${savedSource})`);
-      onBoundedRelease(boundTurn, savedSource);
+      onBoundedRelease(boundTurn, savedSource, recheck);
     };
     claudeOpenTurnWatchdogTimer = setInterval(tick, CLAUDE_OPEN_TURN_POLL_MS);
     claudeOpenTurnWatchdogTimer.unref?.();
@@ -13637,7 +13651,22 @@ function maybeHoldOpenClaudeTurn(
 /** Reconcile the Claude open-turn watchdog immediately after `bridgeIngest()`
  *  or `updateProvisionalExitWatch()` advances transcript state. */
 function reconcileClaudeOpenTurnWatchdogAfterIngest(): void {
-  if (!claudeOpenTurnWatchdog.isActive()) return;
+  let bootstrapMarkerSafety = false;
+  if (!claudeOpenTurnWatchdog.isActive()) {
+    const candidate = bridgeQueue.peek()[0];
+    const candidateKey = candidate ? claudeOpenTurnKey(candidate) : undefined;
+    // `end_turn` can land before the first idle hold. Once this transcript is
+    // proven to write duration markers, every live non-local head awaiting one
+    // needs the bounded escape — not only turns with a previous hold or a
+    // Scenario 3 recovery. Fresh/unknown writers keep the 2s verdict path.
+    if (!candidateKey || !candidate || candidate.isLocal
+      || candidate.restoredFromJournal || candidate.carriedAcrossGeneration || candidate.rateLimited
+      || !bridgeQueue.isAwaitingDurationMarker(candidate)
+      || bridgeQueue.isFreshHeadAwaitingMarker(candidate)) return;
+    const evidenceSource = bridgeQueue.isLateUnobservedRecovery?.(candidate) ? 'late-recovery' : 'transcript';
+    claudeOpenTurnWatchdog.enterAwaitingMarkerRedrive(candidateKey, evidenceSource);
+    bootstrapMarkerSafety = true;
+  }
   const boundKey = claudeOpenTurnWatchdog.boundTurnKey();
   const openTurn = openClaudeLifecycleTurn();
   if (openTurn && claudeOpenTurnKey(openTurn) === boundKey) {
@@ -13646,7 +13675,7 @@ function reconcileClaudeOpenTurnWatchdogAfterIngest(): void {
   }
   const head = bridgeQueue.peek()[0];
   if (boundKey && head && claudeOpenTurnKey(head) === boundKey && bridgeQueue.isAwaitingDurationMarker(head)) {
-    if (claudeOpenTurnWatchdog.getPhase() !== 'awaiting-marker-redrive') {
+    if (bootstrapMarkerSafety || claudeOpenTurnWatchdog.getPhase() !== 'awaiting-marker-redrive') {
       const savedSource = claudeOpenTurnWatchdog.savedEvidenceSource();
       stopClaudeOpenTurnWatchdogTimers();
       claudeOpenTurnWatchdog.enterAwaitingMarkerRedrive(boundKey, savedSource);
@@ -13654,12 +13683,11 @@ function reconcileClaudeOpenTurnWatchdogAfterIngest(): void {
         // Undecided/older CLI without proven `turn_duration`: re-drive now so
         // the 2s settle learns durationMarkerWaitExpired if no marker comes.
         fireClaudeRedriveEdge();
-      } else if (head.dispatchAttempt === undefined) {
-        // Non-durable turn on a `durationMarkerSeen` session: wait for the
-        // `turn_duration` marker, with a bounded safety release that settles
-        // this exact turn BEFORE redriving `prompt_ready` (no split-brain).
-        // Durable turns (`dispatchAttempt !== undefined`) stay held for their
-        // explicit `turn_duration` / next-turn / CLI-exit contract.
+      } else {
+        // On a `durationMarkerSeen` session, wait for `turn_duration` with a
+        // bounded safety release. Ordinary turns settle before redriving;
+        // durable turns close exact-attempt ambiguous instead of claiming a
+        // normal completion or waiting forever when the marker is lost.
         const boundTurn = head;
         const expectedGeneration = bridgeTranscriptGeneration;
         function armMarkerSafety(): void {
@@ -13685,19 +13713,24 @@ function reconcileClaudeOpenTurnWatchdogAfterIngest(): void {
             return;
           }
           if (idleDetector?.programStatusHeldBusy()) return;
-          if (bridgeQueue.isAwaitingDurationMarker(current)) {
+          const pendingAmbiguousDrain = current.terminalOutcome?.status === 'ambiguous';
+          if (bridgeQueue.isAwaitingDurationMarker(current) || pendingAmbiguousDrain) {
             try {
-              emitReadyTurns({
-                releaseHeldTerminals: true,
-                onlyTurn: { turnId: current.turnId, dispatchAttempt: current.dispatchAttempt },
-              });
+              if (current.dispatchAttempt !== undefined) {
+                settleDurableClaudeTurnAmbiguous(current, 'duration_marker_missing');
+              } else {
+                emitReadyTurns({
+                  releaseHeldTerminals: true,
+                  onlyTurn: { turnId: current.turnId, dispatchAttempt: current.dispatchAttempt },
+                });
+              }
             } catch (err: any) {
               log(`Claude awaiting-marker safety release error: ${err.message}`);
               // A transient read/journal failure must not strand the only
               // bounded exit. Retry only while the exact same head still waits;
               // a partially successful emit or a successor disarms below.
               if (bridgeQueue.peek()[0] === current
-                && bridgeQueue.isAwaitingDurationMarker(current)
+                && (bridgeQueue.isAwaitingDurationMarker(current) || pendingAmbiguousDrain)
                 && claudeOpenTurnWatchdog.isAwaitingMarkerRedriveFor(boundKey)) {
                 armMarkerSafety();
                 return;
@@ -35462,10 +35495,17 @@ async function spawnCliBody(
       try { bridgeIngest(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
     }
     const source = evidenceSource ?? 'screen';
-    if (maybeHoldOpenClaudeTurn(source, observedBackend, (boundTurn, savedSource) => {
+    if (maybeHoldOpenClaudeTurn(source, observedBackend, (boundTurn, savedSource, action) => {
       if (backend !== observedBackend) return;
       clearSubmittedClaudeTurnIf(boundTurn.turnId);
-      if (boundTurn.dispatchAttempt === undefined) {
+      if (boundTurn.dispatchAttempt !== undefined) {
+        try {
+          settleDurableClaudeTurnAmbiguous(
+            boundTurn,
+            action === 'release-dead' ? 'cli_exit' : 'claude_open_turn_timeout',
+          );
+        } catch (err: any) { log(`Bridge durable bounded-release emit error: ${err.message}`); }
+      } else {
         try {
           emitReadyTurns({
             onlyTurn: { turnId: boundTurn.turnId, dispatchAttempt: boundTurn.dispatchAttempt },

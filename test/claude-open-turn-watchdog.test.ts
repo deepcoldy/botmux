@@ -149,10 +149,11 @@ describe('ClaudeOpenTurnWatchdog two-clock state machine', () => {
     expect(wd.evaluate(obs({ nowMs: 13_500, unmatchedToolUseCount: 1, pendingBackgroundAgents: true, programStatusHeldBusy: true }))).toBe('release-timeout');
   });
 
-  it('releases immediately when cliAlive === false (preserving state for caller drain/source read), disarms on turnKey change, and never pops durable turns', () => {
+  it('releases durable turns at the same bounded deadline for ambiguous settlement, while preserving cliAlive and turnKey fences', () => {
     const wd = new ClaudeOpenTurnWatchdog({ bareQuietMs: 5_000 });
     wd.hold(obs({ nowMs: 0, durable: true }), 'screen');
-    expect(wd.evaluate(obs({ nowMs: 999_999, durable: true }))).toBe('wait');
+    expect(wd.evaluate(obs({ nowMs: 1_000, durable: true }))).toBe('wait');
+    expect(wd.evaluate(obs({ nowMs: 999_999, durable: true }))).toBe('release-timeout');
 
     wd.reset();
     wd.hold(obs({ nowMs: 0 }), 'herdr-done');
