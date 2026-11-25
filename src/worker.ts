@@ -172,6 +172,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, ABSORBED_REPLY_MAX_CHARS, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, ClaudeGoalAbortWatch, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, liveFoldedReplyUuids, noteHostFinalCarried, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { updateClaudeStateFile } from './core/claude-folder-trust.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -3304,10 +3305,8 @@ function writeCredIfChanged(dst: string, raw: string): void {
   writeFileSync(dst, body, { mode: 0o600 });
 }
 
-/** Seed a fresh per-bot `.claude.json` from the global top-level flags (minus projects)
- *  so onboarding/promo dialogs are pre-dismissed and the account is recognized, then
- *  mark this bot's realpath(cwd) trusted. Merge-safe: only seeds when absent; always
- *  refreshes the cwd trust. */
+/** Seed an isolated profile's top-level onboarding state and the current
+ * project's trust decision. Other projects belong to the source profile. */
 function seedAndTrustClaudeState(
   statePath: string,
   workingDir: string,
@@ -3316,43 +3315,31 @@ function seedAndTrustClaudeState(
   seedFrom: string = join(homedir(), '.claude.json'),
 ): void {
   try {
-    let canonical = workingDir;
-    try { canonical = realpathSync(workingDir); } catch { /* cwd may not exist yet */ }
-    let data: Record<string, any> = {};
-    if (existsSync(statePath)) {
-      try { data = JSON.parse(readFileSync(statePath, 'utf-8')); } catch { data = {}; }
-    } else {
-      try {
-        const g = JSON.parse(readFileSync(seedFrom, 'utf-8')) as Record<string, any>;
-        const { projects: _drop, ...top } = g;
-        data = top;
-        // The isolated profile omits other projects, but must retain an
-        // existing negative decision for this specific working directory.
-        if (g.projects?.[canonical]?.hasTrustDialogAccepted === false) {
-          data.projects = { [canonical]: { hasTrustDialogAccepted: false } };
-        }
-      } catch { data = {}; }
-    }
-    if (!data.projects || typeof data.projects !== 'object') data.projects = {};
-    // Onboarding gate: Claude Code holds the FIRST launch on a one-time
-    // theme/onboarding selection until `hasCompletedOnboarding:true` is on the
-    // top level of .claude.json. The seed above copies it from the host's
-    // global ~/.claude.json — but a CLEAN environment (fresh sandbox, e.g.
-    // core-only in riff, or any box that never ran Claude globally) has no
-    // global file to copy it from, so the redirected CLAUDE_CONFIG_DIR session
-    // would stick on that first-frame selection until a human clears it once.
-    // Force it here (idempotent, top-level) so a headless/programmatic first
-    // launch never blocks on interactive onboarding — same intent as the
-    // per-cwd trust-dialog acceptance below. If the seed/global already set it,
-    // this is a no-op.
-    data.hasCompletedOnboarding = true;
-    const entry = data.projects[canonical] && typeof data.projects[canonical] === 'object'
-      ? data.projects[canonical]
-      : (data.projects[canonical] = {});
-    entry.hasTrustDialogAccepted ??= true;
-    writeFileSync(statePath, JSON.stringify(data, null, 2), { mode: 0o600 });
-  } catch (e) {
-    log(`[read-isolation] WARN seed .claude.json failed: ${(e as Error).message}`);
+    const canonical = realpathSync(workingDir);
+    updateClaudeStateFile(statePath, current => {
+      // The source can contribute top-level onboarding state and this one
+      // project's decision. Other projects remain private to the source.
+      let source: Record<string, any> = {};
+      if (current?.projects?.[canonical]?.hasTrustDialogAccepted !== false && existsSync(seedFrom)) {
+        source = JSON.parse(readFileSync(seedFrom, 'utf8'));
+      }
+      const { projects: sourceProjects, ...top } = source;
+      const data = current ?? top;
+      if (data.projects === undefined) data.projects = {};
+      if (!data.projects || typeof data.projects !== 'object' || Array.isArray(data.projects)) return;
+      const entry = data.projects[canonical] ?? {};
+      if (typeof entry !== 'object' || Array.isArray(entry)) return;
+      const sourceDecision = sourceProjects?.[canonical]?.hasTrustDialogAccepted;
+      const previous = entry.hasTrustDialogAccepted;
+      if (sourceDecision === false) entry.hasTrustDialogAccepted = false;
+      else if (previous === undefined && (sourceDecision === true || !isWorkflowWorker())) entry.hasTrustDialogAccepted = true;
+      if (current?.hasCompletedOnboarding === true && entry.hasTrustDialogAccepted === previous) return;
+      if (entry.hasTrustDialogAccepted !== undefined) data.projects[canonical] = entry;
+      data.hasCompletedOnboarding = true;
+      return data;
+    });
+  } catch (error) {
+    log(`[read-isolation] WARN seed .claude.json failed: ${(error as Error).message}`);
   }
 }
 
@@ -22145,7 +22132,9 @@ function handleVisibleStartupInteraction(data: string): boolean {
   // project/plugin hooks owned outside BotMux. The operator can safely choose
   // "Continue without trusting" through the Web Terminal when Codex presents
   // its Hooks review menu.
-  if (lastInitConfig?.existingAppServerEndpoint) return false;
+  // A workflow reports an interactive trust dialog to its owner as blocked.
+  // A scheduled Enter could accept it before the pool receives that notice.
+  if (lastInitConfig?.existingAppServerEndpoint || isWorkflowWorker()) return false;
 
   // Checked before the trust latch: the migration picker follows the trust
   // dialog on a first launch. Observation only — the chunk is not consumed.

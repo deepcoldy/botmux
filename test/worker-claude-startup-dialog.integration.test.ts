@@ -95,7 +95,7 @@ setInterval(() => {}, 1000);
 
 const fixture = (name: string) => resolve('test/fixtures/startup-blockers', name);
 
-it.skipIf(!tmuxAvailable)('never types the first prompt into a Claude startup question, and delivers it once both are answered', async () => {
+async function runStartupDialogCase(mode: 'chat' | 'workflow'): Promise<void> {
   const sessionId = randomUUID();
   const botmuxDir = join(homedir(), '.botmux');
   mkdirSync(botmuxDir, { recursive: true, mode: 0o700 });
@@ -113,9 +113,17 @@ it.skipIf(!tmuxAvailable)('never types the first prompt into a Claude startup qu
   const answerAutoMode = join(root, 'answer-auto-mode');
   const transcript = claudeJsonlPathForSession(sessionId, workingDir, claudeDir);
   const configFile = join(root, 'fake-claude.json');
+  let firstScreen = fixture('claude-2.1.310-custom-api-key.txt');
+  if (mode === 'workflow') {
+    firstScreen = join(root, 'folder-trust.txt');
+    writeFileSync(firstScreen, 'Quick safety check: Is this a project you created or one you trust?\n❯ 1. Yes, I trust this folder\n  2. No, exit');
+    writeFileSync(join(claudeDir, '.claude.json'), JSON.stringify({ projects: {
+      [workingDir]: { hasTrustDialogAccepted: false },
+    } }), { mode: 0o600 });
+  }
   writeFileSync(configFile, JSON.stringify({
     events: eventsFile, pidFile, transcript, answerApiKey, answerAutoMode,
-    apiKeyScreen: fixture('claude-2.1.310-custom-api-key.txt'),
+    apiKeyScreen: firstScreen,
     autoModeScreen: fixture('claude-2.1.310-auto-mode-offer.txt'),
   }));
   // The worker arms its ready gate only when botmux's SessionStart hook is installed.
@@ -149,6 +157,7 @@ it.skipIf(!tmuxAvailable)('never types the first prompt into a Claude startup qu
       cwd: resolve('.'),
       env: privateTmuxEnv(root, {
         SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId,
+        ...(mode === 'workflow' ? { BOTMUX_WORKFLOW: '1' } : {}),
         LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
       }),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -162,9 +171,17 @@ it.skipIf(!tmuxAvailable)('never types the first prompt into a Claude startup qu
     child.send({
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
       workingDir, cliId: 'claude-code', cliPathOverride: fakeCli, cliConfigDir: claudeDir,
-      backendType: 'tmux', prompt: FIRST_PROMPT, turnId: 'om_test', larkAppId: 'app_test', larkAppSecret: 'secret',
+      backendType: 'tmux', prompt: mode === 'workflow' ? '' : FIRST_PROMPT, turnId: 'om_test', larkAppId: 'app_test', larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
 
+    if (mode === 'workflow') {
+      await waitFor(() => notices().some(m => m.startupBlocker?.kind === 'folder_trust'), 30_000, 'workflow folder-trust blocker');
+      expect(notices(), context()).toContainEqual(expect.objectContaining({
+        kind: 'cli_startup_blocked', startupBlocker: { kind: 'folder_trust', rule: 'claude-folder-trust' },
+      }));
+      expect(dialogInput(), context()).toEqual([]);
+      return;
+    }
     await waitFor(() => logs.join('').includes('Ready gate armed'), 60_000, 'the ready gate');
     await waitFor(() => events().some(e => e.kind === 'question' && e.phase === 'api_key'), 30_000, 'the API key question');
     const askedAt = events().find(e => e.kind === 'question')!.t;
@@ -211,4 +228,9 @@ it.skipIf(!tmuxAvailable)('never types the first prompt into a Claude startup qu
     killPrivateTmuxServer('tmux', privateSocket, { env: privateTmuxEnv(root) });
     rmSync(root, { recursive: true, force: true });
   }
-}, 240_000);
+}
+
+it.skipIf(!tmuxAvailable)('never types the first prompt into a Claude startup question, and delivers it once both are answered',
+  () => runStartupDialogCase('chat'), 240_000);
+it.skipIf(!tmuxAvailable)('reports a workflow folder-trust dialog without entering an answer',
+  () => runStartupDialogCase('workflow'), 90_000);
