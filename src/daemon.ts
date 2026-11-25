@@ -61,7 +61,7 @@ import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-bindi
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskRetirementBound, explicitAskSessionBound } from './core/explicit-ask-continuation.js';
 import { createManagedAskControl, parseManagedAskControl } from './core/managed-ask-control.js';
-import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync } from './core/worker-pool.js';
+import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync, interruptExactWorkerTurn } from './core/worker-pool.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
@@ -24159,6 +24159,7 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
     // the late exact head in the durable journal, but release the runtime claim
     // so the next inbound turn can refork that head before accepting N+2.
     clearInitialStartClaim(ds);
+    if (head.ownerRuntime === 'new') startReplacementRuntimeAfterReclaim(ds, true);
   }
   return true;
 }
@@ -24221,6 +24222,11 @@ function startReplacementRuntimeAfterReclaim(ds: DaemonSession, promotedJournalR
       const needsPromotion = (ds.session.queuedActivationTail ?? []).some(entry => entry.ownerRuntime === 'new');
       if (!needsPromotion && !(promotedJournalRecovery && ds.session.queuedActivationPending)) return;
       if (needsPromotion && !promoteQueuedActivationTail(ds, { send: false })) {
+        if ((!ds.worker || ds.worker.killed) && (ds.session.queuedActivationTail?.length ?? 0) > 0) {
+          // Preserve FIFO ownership for the central quarantine recovery path;
+          // the next inbound must not bypass the retained tail.
+          ds.quarantinedActivationTailPromotion = true;
+        }
         logger.warn(`[${tag(ds)}] Replacement runtime start deferred: activation head promotion failed`);
         return;
       }
@@ -24254,7 +24260,9 @@ function startReplacementRuntimeAfterReclaim(ds: DaemonSession, promotedJournalR
       // A started fork keeps the claim until its adapter ACK releases it via
       // onQueuedActivationSubmitted. Every failure path releases the gate so the
       // next inbound/scheduler trigger can retry the parked head.
-      if (!started && ds.initialStartClaimToken === token) clearInitialStartClaim(ds, token);
+      if (!started && ds.initialStartClaimToken === token && !ds.quarantinedActivationTailPromotion) {
+        clearInitialStartClaim(ds, token);
+      }
     }
   });
 }
@@ -36528,7 +36536,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       settleHeldScheduleRunsOnWorkerExit(ds.session, ds.larkAppId, {
         getDeferredRun: (taskId, appId) => scheduler.getRuntimeTask(taskId, appId)?.deferredRun,
         settle: scheduler.settleParkedRunOnce,
-      }, { currentWorker: context.currentWorker });
+      }, { currentWorker: context.currentWorker, transferredTurnIds: context.replacementActivationTurnIds });
       // A Node worker exit (including the SIGKILL backstop) proves this exact
       // generation can no longer write. Unlike onCliExit, this is safe for
       // persistent-pane backends and therefore owns crash-path release.
@@ -38574,6 +38582,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         );
         const runPrompt = [additionalPrompt, untilDonePrompt].filter(Boolean).join('\n\n') || undefined;
         const turnIds = new Map<string, string>();
+        // Non-TRAE targets never create a deferred run on their own. If this
+        // same occurrence parks behind a TRAE target, their exact accepted turns
+        // must join that park's ledger or the mixed run can never fully settle.
+        const acceptedNonTraeTurns = new Map<string, string>();
         const pending: string[] = [];
         const heldTarget = (chatId: string, turnId: string | undefined): boolean =>
           parked?.targets[chatId] === 'held'
@@ -38673,7 +38685,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                           task.id, executionContext.runId, targetTask.chatId!, turnId, effectiveAppId,
                           { additionalPrompt, precondition: precondition.precondition === 'disabled' || precondition.precondition === 'passed'
                             ? precondition.precondition
-                            : 'none' },
+                            : 'none',
+                            acceptedTargets: Object.fromEntries(acceptedNonTraeTurns),
+                            targetTurnIds: Object.fromEntries(acceptedNonTraeTurns),
+                          },
                         );
                       },
                     },
@@ -38711,6 +38726,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                         );
                         return 'deferred' as const;
                       }
+                      acceptedNonTraeTurns.set(targetTask.chatId!, targetTurnId);
                       scheduler.markDeferredTargetAccepted(
                         task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
                       );
@@ -38734,6 +38750,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // re-sent on the retry).
         const currentDeferred = scheduler.getRuntimeTask(task.id, effectiveAppId)?.deferredRun;
         const acceptedNow = (chatId: string): boolean => {
+          const turnId = turnIds.get(chatId);
+          if (turnId !== undefined && acceptedNonTraeTurns.get(chatId) === turnId) return true;
           const accepted = currentDeferred?.acceptedTargets?.[chatId];
           return accepted !== undefined && accepted === turnIds.get(chatId);
         };
@@ -38769,6 +38787,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             ? precondition.precondition
             : 'none',
           targets: parkedTargets,
+          acceptedTargets: Object.fromEntries(acceptedNonTraeTurns),
           ...(parked?.heldTargets ? { heldTargets: parked.heldTargets } : {}),
           targetTurnIds: persistedTurnIds,
         });
@@ -38800,10 +38819,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const current = scheduler.getRuntimeTask(task.id, effectiveAppId);
       const terminal = current?.lastRunId === executionContext.runId
         && (current.lastStatus === 'ok' || current.lastStatus === 'error' || current.lastStatus === 'skipped');
+      const willRepark = current?.deferredRun
+        && scheduler.deferredRunHasUnsettledTargets(current.deferredRun);
       // A re-park or a terminal settlement from another edge owns the next
       // retry/outcome. Do not append a second terminal error log for this one.
       if (current && current.lastRunId === executionContext.runId
-        && current.lastStatus !== 'deferred' && !terminal) {
+        && current.lastStatus !== 'deferred' && !terminal && !willRepark) {
         appendExecutionLog(
           'error',
           resolveScheduleRunLogErrorDetails(precondition.precondition, error),
@@ -38813,9 +38834,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
-  scheduler.setParkedRunCancellationHandler((_task, runId) => {
+  scheduler.setParkedRunCancellationHandler((task, runId) => {
     cancelPreReadyScheduledWorkers(activeSessions.values(), runId, async ds => {
       await closeSessionForBackgroundCleanup(ds.session.sessionId, 'scheduled run cancelled');
+    }, {
+      acceptedTurnIds: new Set(Object.values(task.deferredRun?.acceptedTargets ?? {})),
+      cancelTurn: async (ds, turnId) => {
+        await interruptExactWorkerTurn(ds, turnId);
+      },
     });
   });
   scheduler.setScheduleFailureAlert((task, consecutiveFailures, lastError) => {

@@ -389,19 +389,26 @@ function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
   if (!runtimeTask(task.id, task.larkAppId)) cleanupRemovedTaskSidecars(task);
 }
 
-function markRuntimeSkipped(id: string, nextRunAt: string | undefined, runId: string, appId?: string): void {
+function markRuntimeSkipped(
+  id: string,
+  nextRunAt: string | undefined,
+  runId: string,
+  appId?: string,
+  operatorCancel = false,
+): void {
   const before = runtimeTask(id, appId);
   if (!authorityStore) {
-    scheduleStore.markSkipped(id, nextRunAt, runId);
+    scheduleStore.markSkipped(id, nextRunAt, runId, { operatorCancel });
   } else {
     mutateRuntimeTask(id, task => {
       if (task.lastRunId !== runId) return;
-      return settleUntilDoneSkip({ ...task, lastRunAt: new Date().toISOString(), lastStatus: 'skipped',
+      const skipped = { ...task, lastRunAt: new Date().toISOString(), lastStatus: 'skipped' as const,
         lastError: undefined, lastDeliveryError: undefined,
         // Terminal settlement: a parked run never survives a skip.
         deferredRun: undefined,
         runStats: recordRunOutcome(task.runStats, 'skipped'),
-        ...(task.parsed.kind === 'once' ? { nextRunAt } : {}) }, runId, Date.now());
+        ...(task.parsed.kind === 'once' ? { nextRunAt } : {}) };
+      return operatorCancel ? skipped : settleUntilDoneSkip(skipped, runId, Date.now());
     }, appId);
   }
   notifyAfterSettle(before, id);
@@ -615,6 +622,7 @@ function recordDispatchOutcome(
   outcome: ScheduledTaskPreconditionOutcome | void,
 ): void {
   const current = runtimeTask(task.id);
+  if (!current) return;
   // A late result from a superseded run must not settle (or announce) the run
   // that currently owns the task. The deferred retry path keeps the same runId,
   // so this only drops outcomes from genuinely older runs. A row without a
@@ -741,7 +749,7 @@ function overlayDeferredContext(task: ScheduledTask, context: ScheduledTaskDefer
 /** A parked run may only be settled once every target has actually been
  *  dispatched. Waiting/dispatching targets are still owed; an ambiguous target
  *  needs a human decision and must never be silently dropped with the run. */
-function deferredRunHasUnsettledTargets(deferred: NonNullable<ScheduledTask['deferredRun']> | undefined): boolean {
+export function deferredRunHasUnsettledTargets(deferred: NonNullable<ScheduledTask['deferredRun']> | undefined): boolean {
   if (!deferred) return false;
   return Object.values(deferred.targets).some(state => state !== 'dispatched');
 }
@@ -761,6 +769,17 @@ function deferredRunFullyAccepted(deferred: NonNullable<ScheduledTask['deferredR
   });
 }
 
+function skipDeferredRunForOperator(task: ScheduledTask): ScheduledTask {
+  return {
+    ...task,
+    lastStatus: 'skipped',
+    lastError: undefined,
+    lastDeliveryError: undefined,
+    deferredRun: undefined,
+    runStats: recordRunOutcome(task.runStats, 'skipped'),
+  };
+}
+
 /** Park the claimed run behind a runtime handoff. Reuses `since` when the same
  *  run defers again. Never touches nextRunAt: the occurrence was consumed by
  *  the original claim. */
@@ -773,6 +792,12 @@ export function parkDeferredRun(
   mutateRuntimeTask(id, task => {
     if (task.lastRunId !== context.runId) return;
     if (runHasTerminalOutcome(task, context.runId)) return;
+    const manualAdmission = task.manualRunRequested === true
+      || task.manualRunAuthorization?.runId === context.runId;
+    if ((!task.enabled && !manualAdmission)
+      || (!!task.untilDone && task.untilDone.status !== 'open')) {
+      return skipDeferredRunForOperator(task);
+    }
     const existing = task.deferredRun?.runId === context.runId ? task.deferredRun : undefined;
     parked = true;
     // A retry reports the current state of every target, but a turn id is a
@@ -931,6 +956,8 @@ export function settleParkedRunOnce(
  * when a projection write fails.
  */
 function cancelParkedRunForOperator(task: ScheduledTask, runId: string): void {
+  const acceptedBeforeCancellation = task.deferredRun?.runId === runId
+    && deferredRunFullyAccepted(task.deferredRun);
   try {
     const current = runtimeTask(task.id, task.larkAppId);
     const deferred = current?.deferredRun;
@@ -942,10 +969,10 @@ function cancelParkedRunForOperator(task: ScheduledTask, runId: string): void {
         startedAt: deferred.since,
       }, 'executed');
     } else {
-      markRuntimeSkipped(task.id, current.nextRunAt, runId, task.larkAppId);
+      markRuntimeSkipped(task.id, current.nextRunAt, runId, task.larkAppId, true);
     }
   } finally {
-    notifyParkedRunCancelled(task, runId);
+    if (!acceptedBeforeCancellation) notifyParkedRunCancelled(task, runId);
   }
 }
 
@@ -962,7 +989,14 @@ export function markDeferredTargetDispatching(
   chatId: string,
   turnId: string,
   appId?: string,
-  details: { additionalPrompt?: string; precondition?: 'none' | 'disabled' | 'passed' } = {},
+  details: {
+    additionalPrompt?: string;
+    precondition?: 'none' | 'disabled' | 'passed';
+    /** Non-TRAE targets already accepted earlier in this same run. Their exact
+     * turn ids must survive a later TRAE target's dispatch error/retry. */
+    acceptedTargets?: Record<string, string>;
+    targetTurnIds?: Record<string, string>;
+  } = {},
 ): boolean {
   let changed = false;
   try {
@@ -970,6 +1004,12 @@ export function markDeferredTargetDispatching(
       if (task.lastRunId !== runId) return;
       if ((task.lastStatus !== 'running' && task.lastStatus !== 'deferred')
         || runHasTerminalOutcome(task, runId)) return;
+      const manualAdmission = task.manualRunRequested === true
+        || task.manualRunAuthorization?.runId === runId;
+      if ((!task.enabled && !manualAdmission)
+        || (!!task.untilDone && task.untilDone.status !== 'open')) {
+        return skipDeferredRunForOperator(task);
+      }
       const existing = task.deferredRun?.runId === runId ? task.deferredRun : undefined;
       const targets: Record<string, ScheduleDeferredTargetState> = existing
         ? { ...existing.targets }
@@ -981,6 +1021,11 @@ export function markDeferredTargetDispatching(
       if (existing?.acceptedTargets?.[chatId] === turnId) return;
       targets[chatId] = 'dispatching';
       changed = true;
+      const targetTurnIds = { ...(details.targetTurnIds ?? {}), ...(existing?.targetTurnIds ?? {}), [chatId]: turnId };
+      const acceptedTargets = { ...(details.acceptedTargets ?? {}), ...(existing?.acceptedTargets ?? {}) };
+      for (const [cid, acceptedTurnId] of Object.entries(acceptedTargets)) {
+        if (targetTurnIds[cid] === acceptedTurnId) targets[cid] = 'dispatched';
+      }
       return {
         ...task,
         deferredRun: {
@@ -997,10 +1042,10 @@ export function markDeferredTargetDispatching(
           ...(existing?.heldTargets && Object.keys(existing.heldTargets).length > 0
             ? { heldTargets: existing.heldTargets }
             : {}),
-          ...(existing?.acceptedTargets && Object.keys(existing.acceptedTargets).length > 0
-            ? { acceptedTargets: existing.acceptedTargets }
+          ...(Object.keys(acceptedTargets).length > 0
+            ? { acceptedTargets }
             : {}),
-          targetTurnIds: { ...(existing?.targetTurnIds ?? {}), [chatId]: turnId },
+          targetTurnIds,
           context: existing?.context ?? freezeDeferredContext(task),
         },
       };
@@ -1097,13 +1142,16 @@ export function markDeferredTargetAccepted(
   appId?: string,
 ): boolean {
   return mutateDeferredTarget(id, runId, appId, deferred => {
-    if (deferred.targetTurnIds?.[chatId] !== turnId) return undefined;
+    const recordedTurnId = deferred.targetTurnIds?.[chatId];
+    if (recordedTurnId !== undefined && recordedTurnId !== turnId) return undefined;
+    if (deferred.targets[chatId] === 'ambiguous') return undefined;
     const { [chatId]: _held, ...restHeld } = deferred.heldTargets ?? {};
     void _held;
     return {
       ...deferred,
       targets: { ...deferred.targets, [chatId]: 'dispatched' as const },
       acceptedTargets: { ...(deferred.acceptedTargets ?? {}), [chatId]: turnId },
+      targetTurnIds: { ...(deferred.targetTurnIds ?? {}), [chatId]: turnId },
       ...(Object.keys(restHeld).length > 0 ? { heldTargets: restHeld } : { heldTargets: undefined }),
     };
   });
@@ -1269,7 +1317,8 @@ export function recordDeliveryFailure(id: string, runId: string, error: string, 
     const tracking = !prior && state.counted ? scheduleStore.nextFailureTracking(task.runStats, false) : undefined;
     if (tracking) result = tracking;
     changed = true;
-    return { ...task, lastStatus: task.lastStatus === 'running' ? 'running' : 'error',
+    return { ...task, lastStatus: task.lastStatus === 'running' ? 'running'
+      : task.lastStatus === 'deferred' ? 'deferred' : 'error',
       lastError: state.previousStatus === 'error' ? state.previousError : error, lastDeliveryError: error,
       lastDeliveryErrorCode: errorCode,
       deliveryFailureRunId: runId, runStats: tracking?.runStats ?? task.runStats,
@@ -1300,7 +1349,9 @@ export function recordDeliverySuccess(id: string, runId: string, appId: string, 
     if (Object.keys(targets).length) return { ...task, deliveryFailureState: { ...state, targets },
       lastDeliveryError: Object.values(targets)[0],
       lastError: state.previousStatus === 'error' ? state.previousError : Object.values(targets)[0] };
-    const status = task.lastStatus === 'running' ? 'running' : state.previousStatus === 'error' ? 'error' : 'ok';
+    const status = task.lastStatus === 'running' ? 'running'
+      : task.lastStatus === 'deferred' ? 'deferred'
+      : state.previousStatus === 'error' ? 'error' : 'ok';
     return { ...task, lastStatus: status, lastError: state.previousError,
       lastDeliveryError: undefined, lastDeliveryErrorCode: undefined,
       deliveryFailureRunId: undefined, deliveryFailureState: undefined,

@@ -860,6 +860,9 @@ export interface Session {
   /** Durable FIFO of exact turns accepted while an activation/setup gate owns
    * the route. Entries are removed only when promoted into the tokened journal. */
   queuedActivationTail?: QueuedActivationTailEntry[];
+  /** Exact scheduled turns cancelled before submission. Durable tombstones keep
+   * later promotion/restart from executing them after an operator pause/delete. */
+  cancelledActivationTurnIds?: string[];
   /** Monotonic per-session reservation cursor. Reserved synchronously before
    * async prompt materialization so completion order cannot reorder arrivals. */
   queuedActivationTailNextOrder?: number;

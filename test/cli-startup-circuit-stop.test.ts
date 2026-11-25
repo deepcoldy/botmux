@@ -86,7 +86,10 @@ function harness(cliId = 'pi', backendType = 'pty') {
     currentUsageLimitSnapshot: () => ({}),
     rememberTurnLinkRefMode: vi.fn(),
     traexRuntimeLeaseContext: undefined, traexSpawnLeaseContext: undefined,
+    traexLeaseSettlements: new Set(),
+    turnInputCommitDeferredForMaterialization: new WeakSet(),
     pendingTraexSpawnAbandon: undefined, stopTraexLeaseHeartbeat: vi.fn(),
+    settleTraexLeasesForShutdown: vi.fn(async () => {}),
   };
   scope.killCli = vi.fn(() => { scope.backend = null; scope.isPromptReady = false; });
   scope.ordinaryImTurnDedupe = new InputTurnDeduper(256);

@@ -2069,7 +2069,7 @@ describe('independent PR2 round2 schedule admission', () => {
           for (const [key, candidate] of active) if (candidate === ds) active.delete(key);
           ds.session.status = 'closed';
           closeSessionMock(ds.session.sessionId);
-        });
+        }, { updateSession: vi.fn() });
       });
       const task = realScheduler.addTask({
         id: 'task0001', name: 'admission intervention', schedule: 'every 30m',

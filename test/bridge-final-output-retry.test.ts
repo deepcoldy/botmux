@@ -6438,6 +6438,8 @@ describe('Worker turn_terminal routing', () => {
       sessionId: ds.session.sessionId,
       workerGeneration: 1,
       currentWorker: true,
+      replacementActivationPending: false,
+      replacementActivationTurnIds: new Set(),
       code: 17,
       signal: 'SIGTERM',
     });

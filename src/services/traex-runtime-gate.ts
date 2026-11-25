@@ -54,6 +54,7 @@ import {
   readTraexSnapshotProvenance,
   releaseDirForExecutable,
   type TraexRuntimeContent,
+  type TraexReleaseIdentity,
 } from './traex-runtime-snapshot.js';
 
 /** Wrapper and Forge launches do not expose a content identity BotMux can
@@ -96,6 +97,9 @@ export interface TraexRuntimeGateInput {
   fixedExecutablePath?: string;
   /** Override the default: snapshots are materialised unless fixedPath is set. */
   materialize?: boolean;
+  /** Test seam forwarded to materializeTraexSnapshot for deterministic source
+   *  mutation between capture and copy. Production callers omit it. */
+  __testOnly_onCaptured?: (identity: TraexReleaseIdentity, attempt: number) => Promise<void> | void;
   /** `false` materialises a frozen copy WITHOUT taking the cross-process
    *  domain lease. Used only for session-private caches (scratch COW), where
    *  this runtime cannot contend with another bot's process. */
@@ -135,6 +139,10 @@ export interface TraexRuntimeLease {
    *  Downgrade the occupant to unknown so it blocks instead of authorizing a
    *  parallel start with an unproven identity. */
   markUnknown(cliPid?: number, cliStart?: string): Promise<void>;
+  /** False for a session-private scratch runtime. Such processes receive a
+   *  distinct private ownership marker so coordinated domains can exclude them
+   *  without treating every sanitized descendant as unrelated. */
+  coordinate?: boolean;
   heartbeat(): Promise<void>;
   /** Only call once the CLI this lease started is provably gone. A CLI that
    *  cannot be proven gone is marked `draining` and keeps occupying. */
@@ -152,6 +160,11 @@ export function applyTraexRuntimeOwnershipEnv(
   delete env[TRAEX_OCCUPANT_ID_ENV_KEY];
   delete env[TRAEX_DOMAIN_KEY_ENV_KEY];
   if (!lease || lease.occupancyOnly === true || !lease.occupantId || !lease.domain.registryPath) return;
+  if (lease.coordinate === false) {
+    env[TRAEX_OCCUPANT_ID_ENV_KEY] = `private-${lease.occupantId}`;
+    env[TRAEX_DOMAIN_KEY_ENV_KEY] = 'private';
+    return;
+  }
   env[TRAEX_OCCUPANT_ID_ENV_KEY] = lease.occupantId;
   env[TRAEX_DOMAIN_KEY_ENV_KEY] = lease.domain.domainKey;
 }
@@ -225,6 +238,7 @@ function leaseFor(
   snapshot: TraexRuntimeContent,
   occupantId: string,
   occupancyOnly = false,
+  coordinated = true,
 ): TraexRuntimeLease {
   let releaseCalled = false;
   let abandonCalled = false;
@@ -232,6 +246,7 @@ function leaseFor(
     occupantId,
     domain,
     snapshot,
+    coordinate: coordinated,
     ...(occupancyOnly ? { occupancyOnly: true } : {}),
     async markRunning(
       cliPid: number,
@@ -334,6 +349,12 @@ export async function acquireTraexRuntimeLease(
     return { releaseDir: input.releaseDir };
   };
   const initialTarget = resolveLaunchTarget();
+  const occupantId = [
+    input.workerPid,
+    input.workerStart ?? 'nostart',
+    now(),
+    Math.random().toString(36).slice(2, 10),
+  ].join('-');
   if (!shouldMaterialize && !initialTarget.executablePath) {
     return {
       kind: 'error',
@@ -358,11 +379,12 @@ export async function acquireTraexRuntimeLease(
       return {
         kind: 'granted',
         lease: {
-          occupantId: '',
+          occupantId,
+          coordinate: false,
           domain: {
             domainKey: 'private',
             skillsDir: '',
-            registryPath: '',
+            registryPath: 'private',
             lockPath: '',
           },
           snapshot,
@@ -383,12 +405,6 @@ export async function acquireTraexRuntimeLease(
     return { kind: 'error', reason: 'uncoordinated', detail: 'domain was not resolved' };
   }
 
-  const occupantId = [
-    input.workerPid,
-    input.workerStart ?? 'nostart',
-    now(),
-    Math.random().toString(36).slice(2, 10),
-  ].join('-');
   const deadline = now() + Math.max(0, input.waitMs ?? 0);
   const pollMs = Math.max(50, input.pollMs ?? 500);
   let reportedSignature: string | undefined;
@@ -412,10 +428,13 @@ export async function acquireTraexRuntimeLease(
               releaseDir: target.releaseDir,
               ...(target.executablePath ? { executablePath: target.executablePath } : {}),
               snapshotsRoot: input.snapshotsRoot ?? defaultTraexSnapshotRoot(),
+              __testOnly_onCaptured: input.__testOnly_onCaptured,
             })
           : await captureTraexExecutableIdentity(target.executablePath!);
         snapshotSignature = currentSignature;
-        installSignature = currentSignature;
+        installSignature = snapshot.reused
+          ? currentSignature
+          : snapshot.manifest?.sourceSignature ?? currentSignature;
       } catch (err) {
         return { kind: 'error', reason: 'snapshot-failed', detail: errorText(err) };
       }
@@ -434,7 +453,7 @@ export async function acquireTraexRuntimeLease(
       now: now(),
     });
     if (decision.decision === 'start') {
-      return { kind: 'granted', lease: leaseFor(domain, snapshot, occupantId) };
+      return { kind: 'granted', lease: leaseFor(domain, snapshot, occupantId, false, input.coordinate !== false) };
     }
     if (decision.decision === 'blocked') {
       const signature = decision.blockers
@@ -578,7 +597,7 @@ export async function acquireTraexRuntimeOccupancy(
         reused: false,
         snapshot: false,
       };
-      return { kind: 'granted', lease: leaseFor(domain, snapshot, occupantId, true) };
+      return { kind: 'granted', lease: leaseFor(domain, snapshot, occupantId, true, input.coordinate !== false) };
     }
     if (decision.decision === 'blocked') {
       const signature = decision.blockers

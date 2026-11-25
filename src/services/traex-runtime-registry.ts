@@ -373,7 +373,9 @@ function supersedableSameOwner(
   if (occupant.workerPid !== request.workerPid) return false;
   if ((occupant.workerStart ?? undefined) !== (request.workerStart ?? undefined)) return false;
   if (occupant.phase !== 'starting') return false;
-  if (occupant.cliPid !== undefined) return traexCliLiveness(occupant) === 'dead';
+  // pruneDead already includes helper/writer scans. Never let same-owner
+  // supersession bypass a live snapshot helper after the leaf CLI exits.
+  if (occupant.cliPid !== undefined) return false;
   return true;
 }
 
@@ -452,7 +454,8 @@ export async function acquireTraexRuntimeStart(
     // already names the bytes it runs.
     const inheritedIdentity = request.comboKey === '' && request.cliPid !== undefined
       ? remaining.find((occupant) => occupant.cliPid === request.cliPid
-        && (occupant.cliStart ?? undefined) === (request.cliStart ?? undefined)
+        && occupant.cliStart !== undefined && request.cliStart !== undefined
+        && occupant.cliStart === request.cliStart
         && occupant.comboKey.length > 0)
       : undefined;
     const effectiveComboKey = inheritedIdentity?.comboKey ?? request.comboKey;
@@ -582,7 +585,7 @@ export async function markTraexRuntimeUnknown(
     return {
       ...rest,
       comboKey: '',
-      ...(detail.cliPid !== undefined ? { cliPid: detail.cliPid } : {}),
+      ...(detail.cliPid !== undefined ? { phase: 'running' as const, cliPid: detail.cliPid } : {}),
       ...(detail.cliStart ? { cliStart: detail.cliStart } : {}),
       ...(detail.snapshotDir ? { snapshotDir: detail.snapshotDir } : {}),
       heartbeatAt: now,

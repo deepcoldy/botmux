@@ -488,9 +488,12 @@ describe('TraeX lease lifecycle', () => {
     const scope: Record<string, any> = {
       traexRuntimeLeaseContext: undefined,
       traexSpawnLeaseContext: undefined,
+      traexLeaseSettlements: new Set(),
       pendingTraexSpawnAbandon: undefined,
     };
     scope.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+    scope.startTraexSpawnLeaseHeartbeat = loadWorkerFunction('startTraexSpawnLeaseHeartbeat', scope);
+    scope.retainTraexSpawnLease = loadWorkerFunction('retainTraexSpawnLease', scope);
     scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
     const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
     const context = create(lease);
@@ -507,6 +510,145 @@ describe('TraeX lease lifecycle', () => {
     expect(abandon).toHaveBeenCalledTimes(1);
     expect(scope.traexRuntimeLeaseContext).toBeUndefined();
     expect(scope.pendingTraexSpawnAbandon).toBeUndefined();
+  });
+
+  it('shares one frozen RPC lease with its viewer until the last detach', async () => {
+    const lease = {
+      snapshot: { snapshot: true, traexPath: '/snapshots/combo-a/traex', dir: '/snapshots/combo-a', comboKey: 'combo-a', helperPath: '/snapshots/combo-a/helper' },
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    };
+    const scope: Record<string, any> = {
+      traexRuntimeLeaseContext: undefined,
+      traexLeaseSettlements: new Set(),
+      pendingTraexSpawnAbandon: undefined,
+      resolveInstallIdentity: () => ({}),
+      log: vi.fn(),
+    };
+    scope.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+    scope.startTraexSpawnLeaseHeartbeat = loadWorkerFunction('startTraexSpawnLeaseHeartbeat', scope);
+    scope.retainTraexSpawnLease = loadWorkerFunction('retainTraexSpawnLease', scope);
+    scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    const prepare = loadWorkerFunction<(context: any) => any>('prepareTraexRpcViewerLease', scope);
+    const context = create(lease);
+    context.running = true;
+    context.configuredEntry = '/releases/a/traex';
+    const viewer = prepare(context);
+    expect(context.references).toBe(2);
+    expect(viewer.cliPathOverride).toBe('/snapshots/combo-a/traex');
+    expect(viewer.configuredEntry.entry).toBe('/releases/a/traex');
+    expect(viewer.launchTarget.snapshotDir).toBe('/snapshots/combo-a');
+
+    await scope.settleTraexSpawnLease(context);
+    expect(context.references).toBe(1);
+    expect(lease.release).not.toHaveBeenCalled();
+    await scope.settleTraexSpawnLease(context);
+    expect(context.references).toBe(1);
+    expect(lease.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('selects the shared viewer for an owned RPC engagement and settles each context once', async () => {
+    const lease = {
+      snapshot: { snapshot: true, traexPath: '/snapshots/combo-a/traex', dir: '/snapshots/combo-a', comboKey: 'combo-a' },
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    };
+    const scope: Record<string, any> = { traexRuntimeLeaseContext: undefined, pendingTraexSpawnAbandon: undefined, traexLeaseSettlements: new Set(), log: vi.fn() };
+    scope.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+    scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    const resolve = loadWorkerFunction<(cfg: any, engine: any, context: any) => any>('resolveTraexRpcViewerLease', scope);
+    const context = create(lease);
+    context.running = true;
+    context.references = 2;
+    expect(resolve({ existingAppServerEndpoint: undefined }, {}, context)).toBe(context);
+    expect(resolve({ existingAppServerEndpoint: undefined }, undefined, context)).toBeUndefined();
+
+    const first = scope.settleTraexSpawnLease(context);
+    const second = scope.settleTraexSpawnLease(context);
+    expect(second).not.toBe(first);
+    await Promise.all([first, second]);
+    expect(lease.release).toHaveBeenCalledTimes(1);
+    const repeated = scope.settleTraexSpawnLease(context);
+    expect(repeated).toBe(second);
+    await repeated;
+    expect(lease.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('deduplicates a shared viewer detach across inner and outer exits', async () => {
+    const lease = {
+      snapshot: { snapshot: true, traexPath: '/snapshots/combo-a/traex', dir: '/snapshots/combo-a', comboKey: 'combo-a' },
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    };
+    const scope: Record<string, any> = { traexRuntimeLeaseContext: undefined, pendingTraexSpawnAbandon: undefined, traexLeaseSettlements: new Set(), log: vi.fn() };
+    scope.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+    scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    const detachFactory = loadWorkerFunction<(context: any) => () => Promise<void>>('createTraexSpawnLeaseDetach', scope);
+    const context = create(lease);
+    context.running = true;
+    context.references = 2;
+    const detach = detachFactory(context);
+    await detach();
+    await detach();
+    expect(context.references).toBe(1);
+    expect(lease.release).not.toHaveBeenCalled();
+    expect(lease.abandon).not.toHaveBeenCalled();
+  });
+
+  it('waits for an already-started RPC release during shutdown', async () => {
+    let finish!: () => void;
+    const lease = { release: vi.fn(() => new Promise<void>(resolve => { finish = resolve; })), abandon: vi.fn(async () => {}) };
+    const scope: Record<string, any> = {
+      traexRuntimeLeaseContext: undefined, traexRpcLeaseContext: undefined,
+      traexLeaseSettlements: new Set(),
+      pendingTraexSpawnAbandon: undefined, log: vi.fn(),
+    };
+    scope.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+    scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+    scope.settleTraexRpcLease = loadWorkerFunction('settleTraexRpcLease', scope);
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    const context = create(lease);
+    context.running = true;
+    scope.traexRuntimeLeaseContext = context;
+    scope.traexRpcLeaseContext = context;
+    void scope.settleTraexSpawnLease(context);
+    const shutdown = loadWorkerFunction<() => Promise<void>>('settleTraexLeasesForShutdown', scope);
+    let finished = false;
+    const pending = shutdown().then(() => { finished = true; });
+    await Promise.resolve();
+    expect(finished).toBe(false);
+    finish();
+    await pending;
+    expect(finished).toBe(true);
+    expect(lease.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('settles both spawn and RPC leases on shutdown', async () => {
+    const spawnLease = { release: vi.fn(async () => {}), abandon: vi.fn(async () => {}) };
+    const rpcLease = { release: vi.fn(async () => {}), abandon: vi.fn(async () => {}) };
+    const scope: Record<string, any> = {
+      traexRuntimeLeaseContext: undefined,
+      traexRpcLeaseContext: undefined,
+      traexLeaseSettlements: new Set(),
+      pendingTraexSpawnAbandon: undefined,
+      log: vi.fn(),
+    };
+    scope.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+    scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+    scope.settleTraexRpcLease = loadWorkerFunction('settleTraexRpcLease', scope);
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    const spawn = create(spawnLease);
+    const rpc = create(rpcLease);
+    spawn.running = true;
+    rpc.running = true;
+    scope.traexRuntimeLeaseContext = spawn;
+    scope.traexRpcLeaseContext = rpc;
+    const shutdown = loadWorkerFunction<() => Promise<void>>('settleTraexLeasesForShutdown', scope);
+    await shutdown();
+    expect(spawnLease.release).toHaveBeenCalledTimes(1);
+    expect(rpcLease.release).toHaveBeenCalledTimes(1);
+    expect(spawnLease.abandon).not.toHaveBeenCalled();
+    expect(rpcLease.abandon).not.toHaveBeenCalled();
   });
 
   it('preserves snapshot identity on non-Linux and fails closed on Linux mismatch', async () => {

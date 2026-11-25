@@ -4858,7 +4858,7 @@ export async function executeScheduledTask(
       selectedSession?: DaemonSession,
     ) => boolean | void | Promise<boolean | void>;
   },
-): Promise<'dispatched' | 'deferred'> {
+): Promise<'dispatched' | 'deferred' | void> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
   const allBots = getAllBots();
@@ -4935,7 +4935,6 @@ export async function executeScheduledTask(
   let dispatchPersisted = false;
   /** A refused durable admission (the scheduler could not persist `dispatching`)
    *  must stop this fire before any fork/send. */
-  let dispatchRefused = false;
   /** Persist the target's `dispatching` state once, immediately before the
    *  first real dispatch attempt. A later fallback within the same turn reuses
    *  the same turn id and needs no second write. Returns false when the write
@@ -4955,7 +4954,6 @@ export async function executeScheduledTask(
         `[scheduler] Task "${task.name}" (${task.id}) dispatch refused: `
         + 'durable admission did not persist',
       );
-      dispatchRefused = true;
       return false;
     }
     if (runtime?.runId && runtime.onBeforeDispatch) {
@@ -4976,7 +4974,6 @@ export async function executeScheduledTask(
           `[scheduler] Task "${task.name}" (${task.id}) dispatch refused after admission wait: `
           + 'run or selected session changed before fork/send',
         );
-        dispatchRefused = true;
         return false;
       }
     }
@@ -5015,7 +5012,12 @@ export async function executeScheduledTask(
           throw err;
         }
         try {
-          if (!(await persistDispatch(staged))) return 'deferred';
+          if (!(await persistDispatch(staged))) {
+            if (activeSessions.get(stagedKey) === staged) activeSessions.delete(stagedKey);
+            if (silent) disarmSilentScheduledTurn(staged, scheduledTurnId);
+            await closeSession(staged.session.sessionId);
+            return 'deferred';
+          }
           // Re-send the ORIGINAL structured payload. A restart loses the
           // in-memory copy, so rebuild it from the frozen task identity instead
           // of degrading to the stored text (which drops trustedCaller).
@@ -5345,7 +5347,7 @@ export async function executeScheduledTask(
   }
 
   const key = sessionKey(anchor, larkAppId);
-  await withActiveSessionKeyLock(activeSessions, key, async () => {
+  return withActiveSessionKeyLock(activeSessions, key, async () => {
     // Reuse the canonical owner only when it is an actual conversation.  A
     // worker:null entry is also used for deliberately non-runnable states:
     // first-turn setup, repo selection (including an in-flight repo commit),
@@ -5484,7 +5486,7 @@ export async function executeScheduledTask(
             // creates the session, every later fire injects into it), so the
             // failure shape would be "worked once, silently identity-less after".
             // A refused durable admission must stop before the IPC send.
-            if (!(await persistDispatch(existing))) return;
+            if (!(await persistDispatch(existing))) return 'deferred';
             if (sendWorkerInput(
               existing,
               input,
@@ -5492,7 +5494,7 @@ export async function executeScheduledTask(
               scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {},
             )) {
               logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
-              return;
+              return 'dispatched';
             }
           } catch (err: any) {
             logger.warn(`[scheduler] Live injection threw (${err.message}); cold-resuming registered session`);
@@ -5503,14 +5505,14 @@ export async function executeScheduledTask(
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
         try {
-          if (!(await persistDispatch(existing))) return;
+          if (!(await persistDispatch(existing))) return 'deferred';
           forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
           throw err;
         }
         logger.info(`[scheduler] Task "${task.name}" cold-resumed session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
-        return;
+        return 'dispatched';
       }
 
       // Not a resumable conversation. A daemon-command scratch has no CLI
@@ -5659,10 +5661,8 @@ export async function executeScheduledTask(
     ds.pendingPrompt = undefined;
 
     logger.info(`[scheduler] Task "${task.name}" (${task.id}) spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
+    return 'dispatched';
   });
-  // A refused durable admission means nothing was sent; keep the run parked
-  // (with its original run/turn/prompt) instead of settling it as dispatched.
-  return dispatchRefused ? 'deferred' : 'dispatched';
 }
 
 /**

@@ -24,6 +24,7 @@ import {
   createReadStream,
   existsSync,
   promises as fsp,
+  lstatSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -507,8 +508,18 @@ export async function materializeTraexSnapshot(input: {
           // A corrupt/drifting finalDir must be quarantined, not deleted. Any
           // live writer (or an unreadable /proc) blocks this repair so a proc
           // path move cannot make an old runtime look gone.
-          const writers = findProcessesRunningUnder(finalDir);
-          if (writers === undefined || writers.length > 0) {
+          const finalDirPresent = (() => {
+            try {
+              lstatSync(finalDir);
+              return true;
+            } catch (err) {
+              const code = (err as NodeJS.ErrnoException).code;
+              if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+              throw err;
+            }
+          })();
+          const writers = finalDirPresent ? findProcessesRunningUnder(finalDir) : [];
+          if (finalDirPresent && (writers === undefined || writers.length > 0)) {
             throw new Error(`snapshot publish blocked by a live writer or unprovable process scan at ${finalDir}`);
           }
           const staleDir = join(root, `.stale-${identity.comboKey}-${randomUUID()}`);

@@ -325,6 +325,10 @@ export interface DaemonSession {
    * still fails — never leave a live worker beside an unpromoted tail. Cleared
    * once promotion succeeds. In-memory only. */
   quarantinedActivationTailPromotion?: boolean;
+  /** Cancellation tombstone could not be persisted. Promotion must stay blocked
+   * until a retry records it; unlike generic promotion quarantine, this is NOT
+   * cleared by an offline recovery attempt. In-memory only. */
+  activationCancellationPending?: boolean;
   /** Generation token for the handler that atomically reserved a worker:null
    * refork. Later same-anchor handlers may prepare concurrently, but only this
    * owner may cross the fork boundary; followers buffer behind its gate. */

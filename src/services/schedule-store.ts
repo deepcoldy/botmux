@@ -1160,7 +1160,7 @@ export function requestRunNow(
 }
 
 /** Record a skipped check without consuming a run or disabling a one-shot. */
-export function markSkipped(id: string, nextRunAt?: string, runId?: string): void {
+export function markSkipped(id: string, nextRunAt?: string, runId?: string, options: { operatorCancel?: boolean } = {}): void {
   mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
@@ -1175,7 +1175,7 @@ export function markSkipped(id: string, nextRunAt?: string, runId?: string): voi
     delete task.deferredRun;
     task.runStats = recordRunOutcome(task.runStats, 'skipped');
     if (task.parsed.kind === 'once') task.nextRunAt = nextRunAt;
-    working.set(id, settleUntilDoneSkip(task, runId, Date.now()));
+    working.set(id, options.operatorCancel ? task : settleUntilDoneSkip(task, runId, Date.now()));
     return { result: undefined, changed: true };
   });
 }

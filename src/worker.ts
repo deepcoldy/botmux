@@ -1263,20 +1263,31 @@ function notifyRpcTeardownBeforeActivation(
   });
 }
 
-interface TraexRpcLeaseContext {
-  readonly lease: TraexRuntimeLease;
-  running: boolean;
-  settled: boolean;
-}
-let traexRpcLeaseContext: TraexRpcLeaseContext | undefined;
-function settleTraexRpcLease(context = traexRpcLeaseContext): void {
-  if (!context) return;
+let traexRpcLeaseContext: TraexSpawnLeaseContext | undefined;
+function settleTraexRpcLease(context = traexRpcLeaseContext): Promise<void> {
+  if (!context) return Promise.resolve();
   if (traexRpcLeaseContext === context) traexRpcLeaseContext = undefined;
-  if (context.settled) return;
-  context.settled = true;
-  void (context.running ? context.lease.release() : context.lease.abandon()).catch(err => {
+  return settleTraexSpawnLease(context).catch(err => {
     log(`[traex-runtime] RPC lease settlement failed: ${err instanceof Error ? err.message : String(err)}`);
   });
+}
+
+async function settleTraexLeasesForShutdown(): Promise<void> {
+  stopTraexLeaseHeartbeat();
+  const settlements = new Set(traexLeaseSettlements);
+  const abandon = pendingTraexSpawnAbandon;
+  if (abandon) settlements.add(abandon());
+  else if (traexRuntimeLeaseContext) settlements.add(settleTraexSpawnLease(traexRuntimeLeaseContext));
+  if (traexRpcLeaseContext) settlements.add(settleTraexRpcLease());
+  if (settlements.size === 0) return;
+  const timeout = new Promise<void>(resolve => {
+    const timer = setTimeout(resolve, 3_000);
+    timer.unref?.();
+  });
+  await Promise.race([
+    Promise.allSettled(settlements).then(() => undefined),
+    timeout,
+  ]);
 }
 
 function stopCodexRpcEngine(): void {
@@ -1854,7 +1865,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
   stopCodexRpcEngine();
   const engagementLease = rpcEngagementFence.begin();
   let engine: CodexRpcEngine | undefined;
-  let rpcLeaseContext: TraexRpcLeaseContext | undefined;
+  let rpcLeaseContext: TraexSpawnLeaseContext | undefined;
   let enginePidMarker: string | null = null;
   let freshDeliveryOwned = false;
   const assertRpcEngagementCurrent = (): void => {
@@ -1879,6 +1890,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       const resolvedEntry = resolveCommandReal(configuredEntry);
       const gate = await acquireTraexRuntimeLease({
         workerPid: process.pid,
+        workerStart: readProcessStartIdentity(process.pid),
         ...daemonBirthIdentity(),
         traeHome: resolveTraexChildHome({
           baseEnv: process.env,
@@ -1908,12 +1920,17 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           });
         },
       });
+      if (gate.kind === 'aborted') throw new CliSpawnSupersededError();
       if (gate.kind !== 'granted') {
-        const detail = gate.kind === 'blocked' ? gate.detail : gate.kind === 'error' ? `${gate.reason}${gate.detail ? `: ${gate.detail}` : ''}` : 'spawn-superseded';
+        const detail = gate.kind === 'blocked' ? gate.detail : `${gate.reason}${gate.detail ? `: ${gate.detail}` : ''}`;
         throw new Error(`TRAE runtime gate refused the RPC start: ${detail}`);
       }
-      rpcLeaseContext = { lease: gate.lease, running: false, settled: false };
+      rpcLeaseContext = createTraexSpawnLeaseContext(gate.lease);
+      rpcLeaseContext.configuredEntry = configuredEntry;
+      rpcLeaseContext.sourceInstallIdentity = gate.lease.snapshot.sourceInstallIdentity
+        ?? resolveInstallIdentity(configuredEntry);
       traexRpcLeaseContext = rpcLeaseContext;
+      assertRpcEngagementCurrent();
       cliBin = gate.lease.snapshot.traexPath;
     }
     if (cfg.cliId === 'codex') {
@@ -2017,7 +2034,8 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         const context = rpcLeaseContext;
         if (!context || context.settled) return;
         context.running = true;
-        void context.lease.markRunning(pid).catch(err => {
+        startTraexSpawnLeaseHeartbeat(context);
+        void context.lease.markRunning(pid, readProcessStartIdentity(pid)).catch(err => {
           log(`[traex-runtime] failed to record RPC app-server identity: ${err instanceof Error ? err.message : String(err)}`);
         });
       },
@@ -2122,6 +2140,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         log('Codex RPC fresh first turn: frame not dispatched → falling back to paste (safe, single execution)');
         clearRpcEnginePidMarker();
         try { engine.stop(); } catch { /* best effort */ }
+        await settleTraexRpcLease(rpcLeaseContext);
         return 'not-engaged';
       }
       if (first.outcome === 'accepted') {
@@ -3793,6 +3812,13 @@ interface TraexSpawnLeaseContext {
   readonly lease: TraexRuntimeLease;
   running: boolean;
   settled: boolean;
+  /** app-server + viewer may share one reservation. Only the last detach may
+   *  release it; default 1 preserves ordinary single-owner spawns. */
+  references: number;
+  /** Exact detach operation shared by inner/outer exits and shutdown. */
+  settlement?: Promise<void>;
+  configuredEntry?: string;
+  sourceInstallIdentity?: ExecutableIdentity;
   heartbeat: ReturnType<typeof setInterval> | undefined;
   readonly abandon: () => Promise<void>;
 }
@@ -3804,21 +3830,101 @@ function stopTraexLeaseHeartbeat(context = traexRuntimeLeaseContext): void {
     context.heartbeat = undefined;
   }
 }
+const traexLeaseSettlements = new Set<Promise<void>>();
 function settleTraexSpawnLease(context: TraexSpawnLeaseContext): Promise<void> {
+  if (context.settled) return context.settlement ?? Promise.resolve();
+  if (context.references > 1) {
+    context.references -= 1;
+    return Promise.resolve();
+  }
   stopTraexLeaseHeartbeat(context);
   if (traexRuntimeLeaseContext === context) {
     traexRuntimeLeaseContext = undefined;
     if (pendingTraexSpawnAbandon === context.abandon) pendingTraexSpawnAbandon = undefined;
   }
-  if (context.settled) return Promise.resolve();
   context.settled = true;
-  return context.running ? context.lease.release() : context.lease.abandon();
+  const operation = (async () => {
+    await (context.running ? context.lease.release() : context.lease.abandon());
+  })();
+  context.settlement = operation;
+  traexLeaseSettlements.add(operation);
+  void operation.then(
+    () => { traexLeaseSettlements.delete(operation); },
+    () => { traexLeaseSettlements.delete(operation); },
+  );
+  return operation;
+}
+function retainTraexSpawnLease(context: TraexSpawnLeaseContext): void {
+  if (context.settled) throw new Error('cannot retain a settled TRAE runtime lease');
+  context.references += 1;
+}
+function startTraexSpawnLeaseHeartbeat(context: TraexSpawnLeaseContext): void {
+  if (context.heartbeat !== undefined || context.settled) return;
+  context.heartbeat = setInterval(() => {
+    if (context.settled) return;
+    void context.lease.heartbeat().catch((err) => {
+      log(`[traex-runtime] heartbeat failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }, 20_000);
+  context.heartbeat.unref?.();
+}
+function resolveTraexRpcViewerLease(
+  cfg: { existingAppServerEndpoint?: unknown },
+  engine: unknown,
+  context: TraexSpawnLeaseContext | undefined,
+): TraexSpawnLeaseContext | undefined {
+  // Owned RPC engagements have no existingAppServerEndpoint; that field belongs
+  // to external Codex attachment. The engaged local app-server is the proof that
+  // this viewer must share its already-frozen runtime lease.
+  if (!context || context.settled) return undefined;
+  if (cfg.existingAppServerEndpoint === undefined && !engine) return undefined;
+  return context;
+}
+function createTraexSpawnLeaseDetach(context: TraexSpawnLeaseContext): () => Promise<void> {
+  let detached = false;
+  return () => {
+    if (detached) return Promise.resolve();
+    detached = true;
+    return settleTraexSpawnLease(context);
+  };
+}
+function prepareTraexRpcViewerLease(context: TraexSpawnLeaseContext): {
+  context: TraexSpawnLeaseContext;
+  cliPathOverride: string;
+  configuredEntry: { entry: string; identity: ExecutableIdentity | undefined };
+  launchTarget: {
+    path: string;
+    identity: ExecutableIdentity | undefined;
+    comboKey: string;
+    snapshotDir?: string;
+    helperPath?: string;
+  };
+  helperPath?: string;
+} {
+  retainTraexSpawnLease(context);
+  return {
+    context,
+    cliPathOverride: context.lease.snapshot.traexPath,
+    configuredEntry: {
+      entry: context.configuredEntry ?? context.lease.snapshot.traexPath,
+      identity: context.sourceInstallIdentity,
+    },
+    launchTarget: {
+      path: context.lease.snapshot.traexPath,
+      identity: resolveInstallIdentity(context.lease.snapshot.traexPath),
+      comboKey: context.lease.snapshot.comboKey,
+      ...(context.lease.snapshot.snapshot ? { snapshotDir: context.lease.snapshot.dir } : {}),
+      ...(context.lease.snapshot.helperPath ? { helperPath: context.lease.snapshot.helperPath } : {}),
+    },
+    helperPath: context.lease.snapshot.helperPath,
+  };
 }
 function createTraexSpawnLeaseContext(lease: TraexRuntimeLease): TraexSpawnLeaseContext {
   const context: TraexSpawnLeaseContext = {
     lease,
     running: false,
     settled: false,
+    references: 1,
     heartbeat: undefined,
     abandon: () => {
       // Once exec has been attested, only the verified exit path may release.
@@ -6454,6 +6560,10 @@ const pendingMessages = freshnessInputQueue.normal;
 /** Async init must materialize its opening input before follow-ups may flush
  * or shutdown may fence the worker generation. */
 let initPromptMaterialized = false;
+/** Inputs whose daemon commit receipt was deliberately held while the opening
+ * prompt was not materialized. Object identity keeps the later ACK on the exact
+ * queued turn/attempt; cancelled or never-submitted items never receive it. */
+const turnInputCommitDeferredForMaterialization = new WeakSet<PendingCliInput>();
 /** Ordinary Lark IM turns may be retransmitted by the daemon when the exact
  * receipt ACK times out. Fence those retries before any renderer / adapter side
  * effects so one Lark message can enter the CLI input queue at most once per
@@ -29216,6 +29326,7 @@ function sendToPty(
     ...(opts.turnCallerOpenId ? { turnCallerOpenId: opts.turnCallerOpenId } : {}),
   };
   if (!initPromptMaterialized) {
+    turnInputCommitDeferredForMaterialization.add(next);
     pendingMessages.push(next);
     log(`Queued message behind async init materialization (${pendingMessages.length} pending)`);
     return true;
@@ -30576,7 +30687,18 @@ async function spawnCli(
   } = {},
 ): Promise<void> {
   if (closeRequested) throw new CliSpawnSupersededError();
-  if (!workerSessionEventScope) return spawnCliBody(cfg, opts);
+  if (!workerSessionEventScope) {
+    try {
+      return await spawnCliBody(cfg, opts);
+    } catch (error) {
+      const abandon = pendingTraexSpawnAbandon;
+      if (abandon) {
+        try { await abandon(); }
+        catch (err) { log(`[traex-runtime] lease abandonment failed after spawn error: ${err instanceof Error ? err.message : String(err)}`); }
+      }
+      throw error;
+    }
+  }
   const firstBinding = !workerSessionEventScope.currentBinding();
   if (cfg.prompt && !workerSessionEventScope.canSubmit(cfg.turnId, cfg.dispatchAttempt, cfg.sessionCommand?.execution)) {
     if (cfg.turnId) send({ type: 'turn_input_rejected', turnId: cfg.turnId, ...(cfg.dispatchAttempt !== undefined ? { dispatchAttempt: cfg.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
@@ -30631,6 +30753,11 @@ async function spawnCli(
       await spawnCliBody(cfg, opts);
     }
     catch (error) {
+      const abandon = pendingTraexSpawnAbandon;
+      if (abandon) {
+        try { await abandon(); }
+        catch (err) { log(`[traex-runtime] lease abandonment failed after spawn error: ${err instanceof Error ? err.message : String(err)}`); }
+      }
       // A replacement that never published an identity releases its
       // reservation; otherwise it would mask the surviving runtime's exit.
       if (!binding.identity) {
@@ -32863,13 +32990,7 @@ async function spawnCliBody(
     if (traexRuntimeLeaseContext === context && pendingTraexSpawnAbandon === context.abandon) {
       pendingTraexSpawnAbandon = undefined;
     }
-    context.heartbeat = setInterval(() => {
-      if (context.settled) return;
-      void context.lease.heartbeat().catch((err) => {
-        log(`[traex-runtime] heartbeat failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
-    }, 20_000);
-    context.heartbeat.unref?.();
+    startTraexSpawnLeaseHeartbeat(context);
   };
   const traexRuntimeRelevant = effectiveCliId === 'traex' && !isRemoteBackendType(effectiveBackendType);
   // Runtimes this worker does not exec itself: an adopted pane, a persistent
@@ -32889,7 +33010,30 @@ async function spawnCliBody(
   if (traexGateExcluded) {
     log('[traex-runtime] wrapperCli/forge-traex launch excluded from the shared-cache gate');
   }
-  if (traexRuntimeRelevant && !traexGateExcluded) {
+  const sharedRpcViewerLease = traexRuntimeRelevant
+    ? resolveTraexRpcViewerLease(cfg, codexRpcEngine, traexRpcLeaseContext)
+    : undefined;
+  if (sharedRpcViewerLease) {
+    // The app-server already admitted a frozen runtime. The --remote viewer is
+    // a second ATTACHMENT to that same reservation, never a new start against
+    // the mutable install entry (which may already name an incompatible B).
+    const viewer = prepareTraexRpcViewerLease(sharedRpcViewerLease);
+    traexSpawnLeaseContext = viewer.context;
+    traexRuntimeLeaseContext = viewer.context;
+    pendingTraexSpawnAbandon = createTraexSpawnLeaseDetach(viewer.context);
+    cfg = { ...cfg, cliPathOverride: viewer.cliPathOverride };
+    cliAdapter = createAdapter();
+    traexConfiguredEntryAtSpawn = {
+      generation: cliSpawnGeneration,
+      ...viewer.configuredEntry,
+    };
+    traexLaunchTargetAtSpawn = {
+      generation: cliSpawnGeneration,
+      ...viewer.launchTarget,
+    };
+    traexLaunchHelperPath = viewer.helperPath;
+    log('[traex-runtime] viewer shares the RPC app-server snapshot and lease');
+  } else if (traexRuntimeRelevant && !traexGateExcluded) {
     const fixedPath = typeof cfg.cliPathOverride === 'string' && cfg.cliPathOverride.trim().length > 0;
     // Two different facts:
     //   - configuredEntry: the UPDATABLE operator/PATH entry. It must keep its
@@ -32993,6 +33137,12 @@ async function spawnCliBody(
             onBlocked,
           });
       if (gate.kind === 'aborted') throw new CliSpawnSupersededError();
+      if (gate.kind === 'granted' && (closeRequested || spawnGeneration !== cliSpawnGeneration)) {
+        // killCli may have won between the gate's final read and this await's
+        // continuation, before pendingTraexSpawnAbandon could be installed.
+        await gate.lease.abandon();
+        throw new CliSpawnSupersededError();
+      }
       if (gate.kind === 'blocked') {
         throw new Error(`TRAE runtime gate stayed blocked: ${gate.detail}`);
       }
@@ -36261,7 +36411,7 @@ async function spawnCliBody(
     if (spawnGeneration !== cliSpawnGeneration) {
       // The reservation belongs to a superseded generation; drop it before it
       // can exec anything, then let the caller treat this as a normal abort.
-      if (traexSpawnLeaseContext) await traexSpawnLeaseContext.abandon();
+      await pendingTraexSpawnAbandon?.();
       throw new CliSpawnSupersededError();
     }
     let spawnedAntigravityAccountReport: { accountId: string } | undefined;
@@ -36391,7 +36541,7 @@ async function spawnCliBody(
     // it). Never abandon a pid that may be writing the shared cache.
     const spawnedPid = backend?.getChildPid?.();
     if (spawnedPid) attachTraexLeaseCli(spawnedPid);
-    else if (traexSpawnLeaseContext) await traexSpawnLeaseContext.abandon();
+    else await pendingTraexSpawnAbandon?.();
     cleanupCodexAppControlBootstrap();
     programStatusRelayPlanCleanup?.();
     if (!willReattachPersistent && sandboxTreeOutlivesPane) {
@@ -43568,13 +43718,7 @@ async function sendFatalWorkerErrorAndExit(
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
   log('Fatal worker error delivered; exiting process');
-  stopTraexLeaseHeartbeat();
-  const abandon = pendingTraexSpawnAbandon;
-  if (abandon) {
-    try { await abandon(); }
-    catch (err) { log(`[traex-runtime] lease abandonment failed on fatal exit: ${err instanceof Error ? err.message : String(err)}`); }
-  }
-  settleTraexRpcLease();
+  await settleTraexLeasesForShutdown();
   if (opts.hardExit) {
     // A fail-closed Codex App generation must produce a real OS-level worker
     // exit so the daemon can arm its worker-generation receipt fence. On some
@@ -44375,6 +44519,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           );
         }
         initPromptMaterialized = true;
+        for (const item of pendingMessages) {
+          if (turnInputCommitDeferredForMaterialization.delete(item)) {
+            acknowledgeTurnInputCommitted(item.turnId, item.dispatchAttempt, item.durablePrimaryInbox);
+          }
+        }
 
         // A backend may become prompt-ready before spawnCli() returns. The
         // initial prompt is queued only afterwards, so the earlier
@@ -44544,12 +44693,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         const closeUnderWay = closeRequested;
         if (!closeUnderWay) retiredRuntimeBackend = backend;
         closeRequested = true;
-        stopTraexLeaseHeartbeat();
-        const abandon = pendingTraexSpawnAbandon;
-        if (abandon) {
-          try { await abandon(); }
-          catch (err) { log(`[traex-runtime] lease abandonment failed on suspend: ${err instanceof Error ? err.message : String(err)}`); }
-        }
+        await settleTraexLeasesForShutdown();
         stopBridgeWatcher(); stopScreenshotLoop(); killCli();
         if (!closeUnderWay) armRetiredRuntimeExit(msg.bindingId);
       } else if (continuation) void flushPending();
@@ -44762,7 +44906,8 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ...(msg.turnCallerOpenId ? { turnCallerOpenId: msg.turnCallerOpenId } : {}),
           });
           if (inputCommitted) {
-            if (initPromptMaterialized && !deferTurnInputCommitUntilSubmission(
+            const commitDeferred = !initPromptMaterialized;
+            if (!commitDeferred && !deferTurnInputCommitUntilSubmission(
               msg.dispatchAttempt,
               msg.durablePrimaryInbox,
             )) {
@@ -45943,6 +46088,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // interrupted turn can be restored), but a real close tears down the
       // session — purge both so a future re-use of the same sessionId starts
       // clean.
+      await settleTraexLeasesForShutdown();
       clearSendMarkers();
       clearBridgeTurnJournalFile();
       cleanup();
@@ -45964,6 +46110,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // asking for this detach, so no in-flight turn is cut here. Relaxing that
       // gate would need preserveCliPidMarker here too.
       killCli({ preserveSandbox: true });
+      await settleTraexLeasesForShutdown();
       cleanup();
       await flushTransferDetachAck(msg.requestId);
       // NOTE: process.exit(0) can wedge in node-pty's native teardown when a
@@ -46240,6 +46387,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
       sandboxCleanup = null;           // drop the ref WITHOUT calling it (keep the tree)
       sandboxTeardownDone = true;      // make the process.on('exit') hook a no-op
+      await settleTraexLeasesForShutdown();
       cleanup();
       process.exit(0);
     }
@@ -46424,6 +46572,7 @@ async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Pr
       log(`Preserving the sandbox relay outbox for the surviving remote TUI during ${reason}`);
       sandboxCleanup = null;
     }
+    await settleTraexLeasesForShutdown();
     cleanup();
     process.exit(exitCode);
     return;
@@ -46456,6 +46605,7 @@ async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Pr
     log(`Leaving executing turn ${currentBotmuxTurnId.slice(0, 12)} in the CLI PID marker for the successor worker (${reason})`);
   }
   killCli({ preserveSandbox, preserveCliPidMarker });
+  await settleTraexLeasesForShutdown();
   cleanup();
   process.exit(exitCode);
 }

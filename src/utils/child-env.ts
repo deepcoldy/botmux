@@ -613,6 +613,7 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX',
   'BOTMUX_TRAEX_OCCUPANT_ID',
   'BOTMUX_TRAEX_DOMAIN_KEY',
+  'TRAEX_CODE_MODE_HOST_PATH',
   // Turn/session routing identity (worker-injected per pane/turn).
   'BOTMUX_SESSION_ID',
   'BOTMUX_CHAT_ID',

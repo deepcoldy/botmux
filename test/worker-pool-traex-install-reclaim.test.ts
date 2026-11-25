@@ -106,6 +106,8 @@ import {
   suspendWorker,
   sendWorkerInput,
   promoteQueuedActivationTail,
+  installReclaimPendingForCurrentGeneration,
+  transferQueuedActivationOwnershipToNew,
   hasPendingOrdinaryImInput,
   recordWorkerCliInputBacklog,
 } from '../src/core/worker-pool.js';
@@ -281,6 +283,61 @@ describe('canSafelyReclaimWorkerForInstallChange', () => {
     oldOwned.session.queuedActivationTail = [{ turnId: 'om_old_tail', ownerRuntime: 'old' } as any];
     expect(__testOnly_canSafelyReclaimWorkerForInstallChange(oldOwned)).toBe(false);
     expect(suspendWorker(oldOwned, 'cli_install_changed')).toBe(false);
+  });
+
+  it('transfers tail ownership atomically and restores it on persistence failure', () => {
+    const ds = makeDs();
+    ds.session.queuedActivationTail = [
+      { turnId: 'om_old', ownerRuntime: 'old' } as any,
+      { turnId: 'om_new', ownerRuntime: 'new' } as any,
+    ];
+    expect(transferQueuedActivationOwnershipToNew(ds)).toBe(true);
+    expect(ds.session.queuedActivationTail?.every(entry => entry.ownerRuntime === 'new')).toBe(true);
+
+    const failing = makeDs();
+    failing.session.queuedActivationTail = [{ turnId: 'om_old', ownerRuntime: 'old' } as any];
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => { throw new Error('controlled ownership write failure'); });
+    expect(transferQueuedActivationOwnershipToNew(failing)).toBe(false);
+    expect(failing.session.queuedActivationTail?.[0]?.ownerRuntime).toBe('old');
+  });
+
+  it('retires a PTY worker for install change and invokes the replacement callback', async () => {
+    const reclaimed = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_notice'), getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1, closeSession: vi.fn(), onInstallChangeReclaimed: reclaimed,
+    } as any);
+    const ds = makeDs({
+      initConfig: { backendType: 'pty', cliId: 'traex' },
+      pendingSuspendReason: 'cli_install_changed', pendingSuspendGeneration: 7,
+    });
+    ds.session.queuedActivationTail = [{ turnId: 'om_pty_tail', ownerRuntime: 'new' } as any];
+    const worker = ds.worker as any;
+    __testOnly_runPendingSuspendIfSettled(ds);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(reclaimed).toHaveBeenCalledWith(ds);
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'close' }));
+  });
+
+  it('dedupes runtime-deferred notices and suppresses them for silent scheduled turns', async () => {
+    const ds = makeDs();
+    const replies: unknown[][] = [];
+    initWorkerPool({
+      sessionReply: vi.fn(async (...args: unknown[]) => { replies.push(args); return 'om_notice'; }),
+      getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn(),
+    } as any);
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const message = { type: 'traex_runtime_deferred', detail: 'blocked A', blockers: [] };
+    worker.emit('message', message);
+    worker.emit('message', message);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(replies).toHaveLength(1);
+
+    ds.silentScheduledTurns = new Map([['om_silent', Date.now()]]);
+    worker.emit('message', { type: 'traex_runtime_deferred', turnId: 'om_silent', detail: 'blocked B', blockers: [] });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(replies).toHaveLength(1);
   });
 });
 
@@ -932,15 +989,15 @@ describe('launch provenance', () => {
   });
 });
 
-function loadReplacementStarter(scope: Record<string, unknown>): (ds: DaemonSession, recovery?: boolean) => void {
+function loadDaemonFunction(scope: Record<string, unknown>, name = 'startReplacementRuntimeAfterReclaim'): any {
   const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
   const declaration = source.statements.find(node => ts.isFunctionDeclaration(node)
-    && node.name?.text === 'startReplacementRuntimeAfterReclaim');
-  if (!declaration) throw new Error('missing production replacement starter');
+    && node.name?.text === name);
+  if (!declaration) throw new Error(`missing production daemon function ${name}`);
   const code = ts.transpileModule(declaration.getText(source), {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
-  return new Function('scope', `with (scope) { ${code}; return startReplacementRuntimeAfterReclaim; }`)(scope);
+  return new Function('scope', `with (scope) { ${code}; return ${name}; }`)(scope);
 }
 
 describe('activation tail claim cancellation', () => {
@@ -1001,6 +1058,7 @@ describe('activation tail claim cancellation', () => {
     __testOnly_runPendingSuspendIfSettled(ds);
 
     expect(ds.pendingSuspendReason).toBe('cli_install_changed');
+    expect(ds.initialStartPending).toBeFalsy();
     expect(ds.session.queuedActivationPending).toBeFalsy();
     expect(ds.session.queuedActivationTail).toHaveLength(1);
     expect(ds.session.queuedActivationTail?.[0]?.ownerRuntime).toBeUndefined();
@@ -1032,6 +1090,7 @@ describe('activation tail claim cancellation', () => {
     worker.emit('exit', 1, null);
 
     expect(ds.worker).toBeNull();
+    expect(ds.initialStartPending).toBeFalsy();
     expect(ds.session.queuedActivationPending).toBe(true);
     expect(ds.session.queuedActivationInput?.content).toBe('prompt-om_crash_tail');
   });
@@ -1053,7 +1112,7 @@ describe('activation tail claim cancellation', () => {
       ds.worker = makeFakeWorker();
       return true;
     });
-    const start = loadReplacementStarter({
+    const start = loadDaemonFunction({
       traexReplacementStartInFlight: new Set<string>(),
       findActiveBySessionId: () => ds,
       randomUUID: () => 'replacement-claim',
@@ -1085,6 +1144,88 @@ describe('activation tail claim cancellation', () => {
     expect(forkWorker.mock.calls[0][1]).toMatchObject({ content: 'prompt-om_accepted_tail' });
     expect(ds.worker).not.toBeNull();
     expect(ds.session.queuedActivationPending).toBe(true);
+  });
+
+  it('keeps a failed replacement promotion quarantined instead of clearing FIFO ownership', async () => {
+    const ds = makeDs({ worker: null, initialStartPending: false });
+    ds.session.queuedActivationTail = [tailFor('om_quarantine_tail')];
+    const forkWorker = vi.fn();
+    const start = loadDaemonFunction({
+      traexReplacementStartInFlight: new Set<string>(),
+      findActiveBySessionId: () => ds,
+      randomUUID: () => 'replacement-claim',
+      runSessionTurn: async (_id: string, action: () => Promise<void>) => action(),
+      promoteQueuedActivationTail: () => false,
+      isCodexAppCliId: () => false,
+      getBot: () => ({ config: { cliId: 'traex' } }),
+      forkWorker,
+      clearInitialStartClaim: vi.fn(),
+      logger: { warn: vi.fn() },
+      tag: () => 'traex-test',
+    });
+    start(ds);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.quarantinedActivationTailPromotion).toBe(true);
+    expect(ds.initialStartPending).toBe(true);
+    expect(ds.session.queuedActivationTail).toHaveLength(1);
+  });
+
+  it('starts a replacement when a late-built replacement tail lands after the old worker is gone', async () => {
+    const ds = makeDs({ worker: null, initialStartPending: false });
+    ds.session.queuedActivationTail = [tailFor('om_late_build_tail')];
+    const forkWorker = vi.fn(() => {
+      ds.worker = makeFakeWorker();
+      return true;
+    });
+    const start = loadDaemonFunction({
+      traexReplacementStartInFlight: new Set<string>(),
+      findActiveBySessionId: () => ds,
+      randomUUID: () => 'replacement-claim',
+      runSessionTurn: async (_id: string, action: () => Promise<void>) => action(),
+      promoteQueuedActivationTail,
+      isCodexAppCliId: () => false,
+      getBot: () => ({ config: { cliId: 'traex' } }),
+      forkWorker,
+      clearInitialStartClaim: vi.fn(),
+      logger: { warn: vi.fn() },
+      tag: () => 'traex-test',
+    });
+    const release = loadDaemonFunction({
+      startReplacementRuntimeAfterReclaim: start,
+      promoteQueuedActivationTail,
+      installReclaimPendingForCurrentGeneration,
+      clearInitialStartBuffers: vi.fn(),
+      clearInitialStartClaim: vi.fn(() => { ds.initialStartPending = false; }),
+      rememberLastCliInput: vi.fn(),
+    }, 'releaseQueuedActivationReservationNow');
+    expect(release(ds)).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.worker).not.toBeNull();
+    expect(ds.session.queuedActivationPending).toBe(true);
+  });
+
+  it('never promotes a cancelled turn, including while its tombstone is unwritable', () => {
+    const ds = makeDs();
+    ds.session.queuedActivationTail = [
+      { ...tailFor('om_cancelled'), order: 1 },
+      { ...tailFor('om_allowed'), order: 2 },
+    ];
+    ds.session.cancelledActivationTurnIds = ['om_cancelled'];
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+    expect((ds.worker as any).send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message', turnId: 'om_allowed',
+    }));
+    expect((ds.worker as any).send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message', turnId: 'om_cancelled',
+    }));
+
+    const blocked = makeDs();
+    blocked.session.queuedActivationTail = [tailFor('om_still_cancelled')];
+    blocked.activationCancellationPending = true;
+    expect(promoteQueuedActivationTail(blocked)).toBe(false);
+    expect((blocked.worker as any).send).not.toHaveBeenCalled();
   });
 });
 

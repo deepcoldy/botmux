@@ -16,6 +16,7 @@ import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
 import { cotMessageFinishStatus } from '../../src/im/lark/cot-message.js';
 import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
 import { ProtectedResultStore } from '../../src/services/protected-result-store.js';
+import { hasProtectedSessionMutationOwnership, protectedSessionMutationReasons } from '../../src/core/session-mutation-guard.js';
 
 /** deliverFinalOutput's protected final gate reads `config.session.dataDir` and
  * constructs ProtectedResultStore. Sliced closures do not load module imports,
@@ -61,11 +62,14 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
     return scope[key] ??= WORKER_POOL_WEAK_CONTAINERS[key]();
   }
   if (key === 'randomUUID') return randomUUID;
+  if (key === 'traexRuntimeDeferredNotice') return scope[key] ??= new Map();
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'cotMessageFinishStatus') return cotMessageFinishStatus;
   if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
+  if (key === 'hasProtectedSessionMutationOwnership') return hasProtectedSessionMutationOwnership;
+  if (key === 'protectedSessionMutationReasons') return protectedSessionMutationReasons;
   if (key === 'cancelAntigravityRotationReplay') return cancelAntigravityRotationReplay;
   if (key === 'clearInFlightAntigravityRotation') return clearInFlightAntigravityRotation;
   if (key === 'formatAntigravityCooldown') return formatAntigravityCooldown;
@@ -89,7 +93,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
     'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
     'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage',
-    'clearWorkerRuntimeProvenance'].includes(key)) {
+    'clearWorkerRuntimeProvenance', 'hasInstallChangeMutationOwnership', 'hasInstallChangeSuspendGuard'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];

@@ -313,12 +313,18 @@ function engageHarness(opts: {
     releaseDirForExecutable: (path: string) => `${path}/..`,
     resolveTraexChildHome: () => '/home/trae',
     daemonBirthIdentity: () => ({ daemonPid: 1, daemonStart: 'boot' }),
+    readProcessStartIdentity: (pid: number) => `start-${pid}`,
+    resolveInstallIdentity: () => ({}),
     applyTraexRuntimeOwnershipEnv: (env: NodeJS.ProcessEnv, lease: any) => {
       env.BOTMUX_TRAEX_OCCUPANT_ID = lease.occupantId;
       env.BOTMUX_TRAEX_DOMAIN_KEY = lease.domain.domainKey;
     },
     acquireTraexRuntimeLease: vi.fn(async () => ({ kind: 'granted', lease })),
     rpcEngagementFence: { begin: () => 1, isCurrent: () => true, isLive: () => true, markDead: noop },
+    traexRuntimeLeaseContext: undefined,
+    traexSpawnLeaseContext: undefined,
+    traexLeaseSettlements: new Set(),
+    pendingTraexSpawnAbandon: undefined,
     cliSpawnGeneration: 1,
     createCliAdapterSync: () => ({ resolvedBin: '/bin/traex' }),
     // RPC hook-trust gating (PR #3515): the engine reads the global toggle and
@@ -363,6 +369,11 @@ function engageHarness(opts: {
       throw new ReferenceError(`engage harness: unstubbed worker global ${String(key)}`);
     },
   });
+  base.createTraexSpawnLeaseContext = loadWorkerFunction('createTraexSpawnLeaseContext', scope);
+  base.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+  base.startTraexSpawnLeaseHeartbeat = loadWorkerFunction('startTraexSpawnLeaseHeartbeat', scope);
+  base.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+  base.settleTraexRpcLease = loadWorkerFunction('settleTraexRpcLease', scope);
   base.prepareFreshTraexFirstTurn = loadWorkerFunction('prepareFreshTraexFirstTurn', scope);
   base.publishTraexNativeContextReceipt = loadWorkerFunction('publishTraexNativeContextReceipt', scope);
   base.invalidateTraexNativeContextReceipt = loadWorkerFunction('invalidateTraexNativeContextReceipt', scope);
@@ -404,6 +415,7 @@ describe('actual worker TraeX RPC engagement', () => {
     expect(h.engines[0].sendFirstTurn.mock.calls[0][0]).toContain('catalog');
     expect(h.cfg.prompt).toBe(prompt('A', 'hello'));
     expect(h.base.deferredPluginSkillCatalog).toBe('<botmux_skills_refresh>catalog</botmux_skills_refresh>');
+    expect(h.lease.release).toHaveBeenCalledTimes(1);
   });
 
   it('consumes the catalog with an accepted fresh first turn and fingerprints the sent text', async () => {
@@ -435,7 +447,7 @@ describe('actual worker TraeX RPC engagement', () => {
       BOTMUX_TRAEX_OCCUPANT_ID: 'occupant-a',
       BOTMUX_TRAEX_DOMAIN_KEY: 'domain-a',
     });
-    expect(h.lease.markRunning).toHaveBeenCalledWith(4242);
+    expect(h.lease.markRunning).toHaveBeenCalledWith(4242, 'start-4242');
   });
 
   it('keeps overlapping engagements on their own lease contexts', async () => {
@@ -480,7 +492,7 @@ describe('actual worker TraeX RPC engagement', () => {
     openA();
     const a = await resultA;
     expect((a as any).error).toBeInstanceOf(h.base.CliSpawnSupersededError);
-    expect(h.lease.markRunning).toHaveBeenCalledWith(4242);
+    expect(h.lease.markRunning).toHaveBeenCalledWith(4242, 'start-4242');
     expect(h.lease.release).toHaveBeenCalledTimes(1);
     expect(leaseB.markRunning).not.toHaveBeenCalled();
     expect(leaseB.release).not.toHaveBeenCalled();
@@ -489,7 +501,7 @@ describe('actual worker TraeX RPC engagement', () => {
 
     openB();
     await expect(resultB).resolves.toBe('resumed');
-    expect(leaseB.markRunning).toHaveBeenCalledWith(4243);
+    expect(leaseB.markRunning).toHaveBeenCalledWith(4243, 'start-4243');
     expect(leaseB.release).not.toHaveBeenCalled();
     expect(leaseB.abandon).not.toHaveBeenCalled();
     expect(h.base.codexRpcEngine).toBe(h.engines[1]);

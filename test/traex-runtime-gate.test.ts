@@ -12,6 +12,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -21,7 +22,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   resolveTraexRuntimeDomain,
@@ -778,6 +779,74 @@ describe('runtime registry lifecycle regressions', () => {
     expect(precheckTraexRuntime({ traeHome: home, releaseDir: dir, executablePath }).state).toBe('blocked');
   });
 
+  it('refreshes the source signature when reusing a snapshot after an atomic same-content replacement', async () => {
+    const dir = release('a');
+    const home = traeHome();
+    const snapshotsRoot = tempDir('botmux-traex-snapshots-');
+    const first = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: dir, workerPid: process.pid, daemonPid: process.pid,
+      snapshotsRoot,
+    });
+    expect(first.kind).toBe('granted');
+    if (first.kind !== 'granted') return;
+    const oldSignature = readTraexRuntimeOccupants(first.lease.domain)?.[0]?.installSignature;
+    await first.lease.abandon();
+
+    renameSync(join(dir, 'traex'), join(dir, 'traex.previous'));
+    writeFileSync(join(dir, 'traex'), 'traex-a');
+    const second = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: dir, workerPid: process.ppid, daemonPid: process.pid,
+      snapshotsRoot,
+    });
+    expect(second.kind).toBe('granted');
+    if (second.kind !== 'granted') return;
+    expect(second.lease.snapshot.reused).toBe(true);
+    const currentSignature = computeTraexInstallSignature(dir, join(dir, 'traex'));
+    expect(currentSignature).not.toBe(oldSignature);
+    expect(readTraexRuntimeOccupants(second.lease.domain)?.[0]?.installSignature).toBe(currentSignature);
+    expect(precheckTraexRuntime({ traeHome: home, releaseDir: dir }).state).toBe('compatible');
+  });
+
+  it('does not supersede a running unknown occupant or inherit identity without birth proof', async () => {
+    const domain = testDomain(traeHome());
+    await acquireTraexRuntimeStart(domain, {
+      occupantId: 'old', comboKey: 'content-a', cliPid: process.pid, cliStart: 'birth-a',
+      workerPid: process.pid, workerStart: 'worker-birth', daemonPid: process.pid,
+    });
+    await markTraexRuntimeUnknown(domain, 'old', { cliPid: process.pid });
+    expect(readTraexRuntimeOccupants(domain)?.[0]?.phase).toBe('running');
+
+    const replacement = await acquireTraexRuntimeStart(domain, {
+      occupantId: 'replacement', comboKey: 'content-b',
+      workerPid: process.pid, workerStart: 'worker-birth', daemonPid: process.pid,
+    });
+    expect(replacement.decision).toBe('blocked');
+
+    const inherited = await acquireTraexRuntimeStart(domain, {
+      occupantId: 'inherit-without-birth', comboKey: '', cliPid: process.pid,
+      workerPid: process.pid, workerStart: 'worker-birth', daemonPid: process.pid,
+    });
+    expect(inherited.decision).toBe('blocked');
+  });
+
+  it('records the final source signature after an in-place upgrade during materialization', async () => {
+    const dir = release('a');
+    const home = traeHome();
+    const snapshotsRoot = tempDir('botmux-traex-snapshots-');
+    const result = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: dir, workerPid: process.pid, daemonPid: process.pid,
+      snapshotsRoot,
+      __testOnly_onCaptured: (_identity, attempt) => {
+        if (attempt === 1) writeFileSync(join(dir, 'traex'), 'traex-b-longer');
+      },
+    });
+    expect(result.kind).toBe('granted');
+    if (result.kind !== 'granted') return;
+    const expected = computeTraexInstallSignature(dir, join(dir, 'traex'));
+    expect(readTraexRuntimeOccupants(result.lease.domain)?.[0]?.installSignature).toBe(expected);
+    expect(result.lease.snapshot.manifest?.sourceSignature).toBe(expected);
+  });
+
   it('clears a stale cliStart whenever a new attach lacks a birth token, even for the same PID', async () => {
     const domain = testDomain(traeHome());
     await acquireTraexRuntimeStart(domain, {
@@ -802,6 +871,19 @@ describe('runtime registry lifecycle regressions', () => {
     occupant = readTraexRuntimeOccupants(domain)![0];
     expect(occupant.cliStart).toBeUndefined();
     expect(occupantLiveness(occupant)).toBe('alive');
+  });
+
+  it('publishes a first snapshot even when the platform has no /proc writer scan', async () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    try {
+      const snapshot = await materializeTraexSnapshot({
+        releaseDir: release('a'), snapshotsRoot: tempDir('botmux-traex-snapshots-'),
+      });
+      expect(snapshot.manifest.verified).toBe(true);
+      expect(readFileSync(snapshot.traexPath, 'utf8')).toBe('traex-a');
+    } finally {
+      platform.mockRestore();
+    }
   });
 
   it.each(['complete', 'manifest', 'drift', 'helper'] as const)('republishes a corrupted snapshot after %s', async mode => {
@@ -903,8 +985,8 @@ describe('runtime ownership and process identity', () => {
     expect(privateLease.kind).toBe('granted');
     if (privateLease.kind !== 'granted') return;
     applyTraexRuntimeOwnershipEnv(env, privateLease.lease);
-    expect(env.BOTMUX_TRAEX_OCCUPANT_ID).toBeUndefined();
-    expect(env.BOTMUX_TRAEX_DOMAIN_KEY).toBeUndefined();
+    expect(env.BOTMUX_TRAEX_OCCUPANT_ID).toBe(`private-${privateLease.lease.occupantId}`);
+    expect(env.BOTMUX_TRAEX_DOMAIN_KEY).toBe('private');
 
     const occupancy = await acquireTraexRuntimeOccupancy({
       traeHome: home, releaseDir: release('a'), existingRuntime: true,
@@ -955,6 +1037,49 @@ describe('runtime ownership and process identity', () => {
       snapshotsRoot,
     });
     expect(other.exitCode).toBeNull();
+    expect(admitted.kind).toBe('granted');
+  });
+
+  it.skipIf(!sleepBin.path)('excludes explicitly private scratch writers from a coordinated domain', async () => {
+    const home = traeHome();
+    const snapshotsRoot = tempDir('botmux-traex-snapshots-');
+    const first = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: realRelease(), workerPid: 2_000_000_000, daemonPid: process.pid,
+      snapshotsRoot,
+    });
+    expect(first.kind).toBe('granted');
+    if (first.kind !== 'granted') return;
+    const privateLease = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: realRelease(), coordinate: false,
+      workerPid: 2_000_000_001, daemonPid: process.pid,
+      snapshotsRoot,
+    });
+    expect(privateLease.kind).toBe('granted');
+    if (privateLease.kind !== 'granted') return;
+    const own = spawn(first.lease.snapshot.traexPath, ['60'], {
+      env: {
+        ...process.env,
+        BOTMUX_TRAEX_OCCUPANT_ID: first.lease.occupantId,
+        BOTMUX_TRAEX_DOMAIN_KEY: first.lease.domain.domainKey,
+      },
+    });
+    const scratch = spawn(privateLease.lease.snapshot.traexPath, ['60'], {
+      env: {
+        ...process.env,
+        BOTMUX_TRAEX_OCCUPANT_ID: `private-${privateLease.lease.occupantId}`,
+        BOTMUX_TRAEX_DOMAIN_KEY: 'private',
+      },
+    });
+    children.push(own, scratch);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await first.lease.markRunning(own.pid!, readProcessStartIdentity(own.pid!));
+
+    await exited(own);
+    const admitted = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: realRelease('b'), workerPid: process.pid, daemonPid: process.pid,
+      snapshotsRoot,
+    });
+    expect(scratch.exitCode).toBeNull();
     expect(admitted.kind).toBe('granted');
   });
 

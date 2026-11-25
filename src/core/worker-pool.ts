@@ -1565,7 +1565,7 @@ export interface WorkerPoolCallbacks {
    *  worker generation ambiguous; the receiver decides retry policy. */
   onWorkerExit?: (
     ds: DaemonSession,
-    context: { sessionId: string; workerGeneration: number; currentWorker: boolean; replacementActivationPending: boolean; code: number | null; signal: NodeJS.Signals | null },
+    context: { sessionId: string; workerGeneration: number; currentWorker: boolean; replacementActivationPending: boolean; replacementActivationTurnIds: ReadonlySet<string>; code: number | null; signal: NodeJS.Signals | null },
   ) => void | Promise<void>;
   /** The exact old daemon-session object has left the active registry and is
    * marked closed. Its in-memory queued work must be retired before any same-key
@@ -13509,6 +13509,12 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   // checkpoint (`/cd`, read-isolation switch, sweepIdleWorkers).
   clearPendingSuspendClaim(ds, `suspended (${reason})`);
   logger.info(`[${tag(ds)}] Worker + CLI suspended (${reason}); session stays active, cold-resumes from transcript on next message`);
+  if (reason === CLI_INSTALL_CHANGED_SUSPEND) {
+    // Central completion point for both direct and sessionContractPrimary's
+    // asynchronous recursive suspend. The caller's outer checkpoint must not
+    // emit a second callback after this one.
+    queueMicrotask(() => { void callbacks?.onInstallChangeReclaimed?.(ds); });
+  }
   return true;
 }
 
@@ -13739,11 +13745,6 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
     // here keeps the "fulfilled by the deferred path" signal distinguishable
     // from a suspend that came from anywhere else.
     logger.info(`[${tag(ds)}] Deferred suspend fulfilled (${reason}) after turn completed`);
-    if (reason === CLI_INSTALL_CHANGED_SUSPEND) {
-      // The old CLI is provably gone (suspendWorker verified the backing).
-      // Hand any input retagged for the replacement runtime to the daemon.
-      queueMicrotask(() => { void callbacks?.onInstallChangeReclaimed?.(ds); });
-    }
     return;
   }
   // A pty backend cannot go dormant, yet a CLI running from a replaced install
@@ -15673,6 +15674,7 @@ function clearWorkerRuntimeProvenance(ds: DaemonSession, worker?: ChildProcess |
   pendingStreamingCardPatchVisibleStatus.delete(ds);
   inFlightStreamingCardPatchVisibleStatus.delete(ds);
   completedTerminalTurns.delete(ds);
+  traexRuntimeDeferredNotice.delete(ds.session.sessionId);
   postTerminalDirectSubmitSessions.delete(ds);
   resetStartingCardHealth(ds, { clearHistory: true });
 }
@@ -19284,10 +19286,15 @@ export function promoteQueuedActivationTail(
   opts: { send?: boolean } = {},
 ): boolean {
   if (ds.session.status !== 'active') return false;
-  if (ds.session.queuedActivationPending) return true;
+  if (ds.activationCancellationPending) return false;
+  const cancelledTurnIds = new Set(ds.session.cancelledActivationTurnIds ?? []);
+  if (ds.session.queuedActivationPending) {
+    return !cancelledTurnIds.has(ds.session.queuedActivationTurnId ?? '');
+  }
   if (opts.send !== false
     && (!ds.worker || ds.worker.killed)) return false;
   const ordered = [...(ds.session.queuedActivationTail ?? [])]
+    .filter(entry => !cancelledTurnIds.has(entry.turnId))
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
   const head = ordered[0];
   if (!head) return false;
@@ -19311,6 +19318,8 @@ export function promoteQueuedActivationTail(
   }));
   const priorLedger = ds.session.codexAppDispatchLedger?.map(entry => ({ ...entry }));
   const priorPendingPrompt = ds.pendingPrompt;
+  const priorInitialStartPending = ds.initialStartPending;
+  const priorQueued = ds.session.queued;
   const token = randomUUID();
   const replyContext = frozenReplyContextForTurn(ds, head.turnId);
   // The tail entry crossed its admission boundary with the clean-input gate
@@ -19406,6 +19415,8 @@ export function promoteQueuedActivationTail(
     ds.session.queuedActivationTail = priorTail;
     ds.session.codexAppDispatchLedger = priorLedger;
     ds.pendingPrompt = priorPendingPrompt;
+    ds.initialStartPending = priorInitialStartPending;
+    ds.session.queued = priorQueued;
     logger.error(
       `[${tag(ds)}] Failed to atomically promote queued activation tail ${head.id}: `
       + `${err instanceof Error ? err.message : String(err)}`,
@@ -25132,6 +25143,10 @@ function setupWorkerHandlers(
           }
         }
         const noticeKey = `${ds.workerGeneration}:${msg.detail}`;
+        if (managedAuxUiSuppressed(msg.turnId) || ds.session.principalLane) {
+          traexRuntimeDeferredNotice.delete(ds.session.sessionId);
+          break;
+        }
         if (traexRuntimeDeferredNotice.get(ds.session.sessionId) === noticeKey) break;
         traexRuntimeDeferredNotice.set(ds.session.sessionId, noticeKey);
         // The worker still owns the input and is waiting inside the start gate;
@@ -30057,8 +30072,14 @@ function setupWorkerHandlers(
     // Capture this BEFORE promotion clears the tail. It tells the daemon that
     // the resulting journal belongs to replacement recovery, not an ordinary
     // historical activation from an unrelated CLI.
-    const replacementActivationPending = currentWorker
-      && (ds.session.queuedActivationTail ?? []).some(entry => entry.ownerRuntime === 'new');
+    const replacementActivationTurnIds = new Set(
+      currentWorker
+        ? (ds.session.queuedActivationTail ?? [])
+          .filter(entry => entry.ownerRuntime === 'new')
+          .map(entry => entry.turnId)
+        : [],
+    );
+    const replacementActivationPending = replacementActivationTurnIds.size > 0;
     // A stale takeover worker never clears the replacement — during takeover the
     // old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
@@ -30067,6 +30088,13 @@ function setupWorkerHandlers(
       if (!failedActiveRestart && ds.antigravityRotation?.inFlightToken) {
         ds.antigravityRotation = clearInFlightAntigravityRotation(ds.antigravityRotation);
       }
+      clearPendingSuspendClaim(ds, 'worker exited');
+      if (!restoreQueuedActivationOwnershipToCurrent(ds)) {
+        logger.warn(`[${tag(ds)}] Activation ownership restore failed before detach reconciliation`);
+      }
+      // #3814 owns the sole offline promotion/claim state machine. The turn ids
+      // captured above remain available to scheduler settlement even after the
+      // tail is promoted out of its ownerRuntime-tagged representation.
       reconcileQueuedActivationOnWorkerDetach(ds);
       ds.worker = null;
       ds.workerReady = false;
@@ -30091,11 +30119,6 @@ function setupWorkerHandlers(
       // about is gone. Leaving it set would suspend the replacement on its
       // first idle (the deferred checkpoint's own "worker gone" branch cannot
       // help: it only runs on a screen update that will never arrive).
-      clearPendingSuspendClaim(ds, 'worker exited');
-      if (restoreQueuedActivationOwnershipToCurrent(ds)
-        && !promoteQueuedActivationTail(ds, { send: false })) {
-        logger.warn(`[${tag(ds)}] Activation tail remains queued after worker exit`);
-      }
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.workerCardViewToken = null;
@@ -30215,6 +30238,7 @@ function setupWorkerHandlers(
           workerGeneration,
           currentWorker,
           replacementActivationPending,
+          replacementActivationTurnIds,
           code,
           signal,
         });
