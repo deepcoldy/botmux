@@ -155,7 +155,14 @@ it('/resume evicts a live codex-pool command placeholder at the anchor, restores
   expect(store.getOwnedSession(placeholder.sessionId)?.status).toBe('closed');
   expect(getSessionGroup(CHAT)?.lastSessionId).toBe(real.sessionId);
   await vi.waitFor(() => expect(publish).toHaveBeenCalledWith({
-    type: 'session.update', body: { sessionId: real.sessionId, patch: { status: 'active', closedAt: null } },
+    type: 'session.update',
+    body: {
+      sessionId: real.sessionId,
+      patch: {
+        status: 'active', closedAt: null,
+        queuedActivationPending: null, queuedActivationTailCount: null,
+      },
+    },
   }));
   publish.mockRestore();
 });

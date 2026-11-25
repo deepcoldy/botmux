@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
@@ -10,6 +11,7 @@ import { discoverRolloutSessions } from '../src/services/resumable-session-disco
 import { traexRolloutUserInputs, traexSessionIdFromRolloutPath } from '../src/services/traex-transcript.js';
 import { traeSessionsRoot } from '../src/services/traex-paths.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
+import { traexTerminalSessionIsBound, refreshTraexTerminalSession } from '../src/services/traex-terminal-session.js';
 
 // TRAE submit verification polls the global submit log history.jsonl (written
 // at SUBMIT time), NOT the per-session rollout. This mirrors the codex adapter
@@ -48,14 +50,17 @@ function seedHistory(sid: string, text: string): void {
 /** Create the rollout file for `sid` and hold it open in a real child process,
  *  returning that pid. findTraexRolloutSetByPid(pid) then sees the rollout via
  *  /proc/<pid>/fd, so the adapter's ownership gate admits the sid. */
-function spawnRolloutHolder(sid: string): number {
+async function spawnRolloutHolder(sid: string): Promise<number> {
   const dir = join(traeHome, 'cli', 'sessions', '2026', '08', '05');
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `rollout-2026-08-05T00-00-00-${sid}.jsonl`);
   writeFileSync(path, historyLine(sid, 'rollout seed'));
   // `tail -f` keeps an fd open on the file until we kill it.
-  const child = spawn('tail', ['-f', path], { stdio: 'ignore' });
+  const child = spawn('tail', ['-f', path], { stdio: ['ignore', 'pipe', 'ignore'] });
   holders.push(child);
+  // Its initial output proves the file is open; a fixed sleep can expire
+  // before the child runs when other regression files start concurrently.
+  await once(child.stdout!, 'data');
   return child.pid!;
 }
 
@@ -146,6 +151,65 @@ function ptyForeignNowOwnedLater(
 }
 
 describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
+  it('binds an adopted shared-daemon input from its unique receipt while rejecting a sibling with the same user text', async () => {
+    const pty = ptyThatCommits(SID_1, process.pid);
+    const send = pty.sendSpecialKeys.getMockImplementation()!;
+    pty.sendSpecialKeys.mockImplementation(key => {
+      if (key === 'Enter') seedHistory(SID_2, 'continue');
+      send(key);
+    });
+    const result = await createTraexAdapter().writeInput(pty, 'continue', { correlateTranscript: true });
+    expect(result).toMatchObject({ submitted: true, cliSessionId: SID_1, ownershipProven: true });
+    expect(traexTerminalSessionIsBound(pty, SID_1)).toBe(true);
+    expect(traexTerminalSessionIsBound(pty, SID_2)).toBe(false);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+  });
+
+  it('refuses to paste while a native status query is unconfirmed, then accepts input once the composer is clean', async () => {
+    const idleViewport = (input: string) => ({
+      viewport: `latest answer\n❯ ${input}\n▀▀▀▀▀\n  GPT-6 · ~/work · Context 79% left\n  ? for shortcuts`,
+      cursor: { x: 2, y: 1 },
+    });
+    let state = idleViewport('Implement {feature}');
+    const pty: PtyHandle & { pasteText: ReturnType<typeof vi.fn>; sendSpecialKeys: ReturnType<typeof vi.fn> } = {
+      cliPid: process.pid,
+      write: vi.fn(),
+      pasteText: vi.fn(),
+      sendText: vi.fn((text: string) => { state = idleViewport(text); }),
+      // A failed Enter leaves the /status draft in the composer and the query unconfirmed.
+      sendSpecialKeys: vi.fn(() => false),
+      captureInputState: () => state,
+    };
+    const resolution = await refreshTraexTerminalSession(pty);
+    expect(resolution).toEqual({ kind: 'unavailable' });
+
+    const blocked = await createTraexAdapter().writeInput(pty, 'queued task');
+    expect(blocked).toMatchObject({ submitted: false });
+    expect(blocked.failureReason).toContain('status');
+    expect(pty.pasteText).not.toHaveBeenCalled();
+    expect(pty.write).not.toHaveBeenCalled();
+
+    // A positively empty composer releases the gate; the next write is attempted normally.
+    state = idleViewport('Implement {feature}');
+    const released = await createTraexAdapter().writeInput(pty, 'queued task');
+    expect(released.submitted).toBe(false);
+    expect(pty.pasteText).toHaveBeenCalledOnce();
+  });
+
+  it('never presses Enter for a correlated write after the frontend PID generation changes', async () => {
+    const pty: PtyHandle & { pasteText: ReturnType<typeof vi.fn>; sendSpecialKeys: ReturnType<typeof vi.fn> } = {
+      cliPid: process.pid,
+      write: vi.fn(),
+      // The backend is replaced between paste and submit (cliRestart / rewired leaf).
+      pasteText: vi.fn(() => { pty.cliPid = process.pid + 1; }),
+      sendSpecialKeys: vi.fn(),
+    };
+    const result = await createTraexAdapter().writeInput(pty, 'generation guarded', { correlateTranscript: true });
+    expect(result.submitted).toBe(false);
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(pty.write).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     previousTraeHome = process.env.TRAE_HOME;
     previousScale = process.env.BOTMUX_TIME_SCALE;
@@ -236,7 +300,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
   });
 
   it.each(['launcher', 'missing'] as const)('late recheck follows a %s ownership PID rewired after the write', async initial => {
-    const ownedPid = spawnRolloutHolder(SID_1);
+    const ownedPid = await spawnRolloutHolder(SID_1);
     const launcher = initial === 'launcher' ? spawn('sleep', ['60'], { stdio: 'ignore' }) : undefined;
     if (launcher) holders.push(launcher);
     await new Promise(r => setTimeout(r, 150));
@@ -252,7 +316,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
   });
 
   it('late recovery distinguishes an owned receipt from foreign same-text history', async () => {
-    const ownedPid = spawnRolloutHolder(SID_1);
+    const ownedPid = await spawnRolloutHolder(SID_1);
     await new Promise(r => setTimeout(r, 150));
     const pty = ptyThatNeverCommits(ownedPid);
     const result = await createTraexAdapter('/bin/traex').writeInput(pty, 'late owned receipt');
@@ -318,7 +382,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
   // ── Session-id ownership (only RETURN a pid-owned id) ──
 
   it('returns the session id when THIS pid provably owns the rollout', async () => {
-    const ownedPid = spawnRolloutHolder(SID_1);
+    const ownedPid = await spawnRolloutHolder(SID_1);
     // Give tail a beat to open the fd.
     await new Promise(r => setTimeout(r, 150));
     const adapter = createTraexAdapter('/bin/traex');
@@ -334,7 +398,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     // wrote the SAME text first under SID_2. The history match may surface
     // SID_2; ownership gating must refuse to return it (would misbind resume /
     // bridge to a foreign session) while still confirming our submit.
-    const ownedPid = spawnRolloutHolder(SID_1);
+    const ownedPid = await spawnRolloutHolder(SID_1);
     await new Promise(r => setTimeout(r, 150));
     const adapter = createTraexAdapter('/bin/traex');
     // PTY commits the text under the FOREIGN SID_2 (sibling won the race).
@@ -351,7 +415,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     // so a foreign-first line would mask our owned line and drop the id even
     // though we own a later one. With an enumerable pid, the owned scan skips the
     // foreign line and keeps scanning to ours — returning SID_1, not undefined.
-    const ownedPid = spawnRolloutHolder(SID_1);
+    const ownedPid = await spawnRolloutHolder(SID_1);
     await new Promise(r => setTimeout(r, 150));
     const adapter = createTraexAdapter('/bin/traex');
     const pty = ptyForeignThenOwned(SID_2, SID_1, ownedPid);
@@ -370,7 +434,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     // owned line surfaces and return SID_1. Run at REAL time (no BOTMUX_TIME_SCALE)
     // so the 200ms+800ms cadence spans the 400ms owned-line timer.
     delete process.env.BOTMUX_TIME_SCALE;
-    const ownedPid = spawnRolloutHolder(SID_1);
+    const ownedPid = await spawnRolloutHolder(SID_1);
     await new Promise(r => setTimeout(r, 150));
     const adapter = createTraexAdapter('/bin/traex');
     const pty = ptyForeignNowOwnedLater(SID_2, SID_1, ownedPid, 400);

@@ -9,6 +9,10 @@ botmux permissions answer just two questions:
 
 Most ways of granting access **give talk only**. Operate rights belong to admins (`allowedUsers`) by default.
 
+There is one exception: **the person who opened a per-topic session can close it**, even with talk-only access, by tapping "❌ Close Session" on its card. Per-topic sessions are topics in topic groups, topics opened inside plain groups, and direct messages split per topic. It matches that person only: topics someone else opened, a session shared by a whole group or a whole direct-message conversation, adopted external CLIs and sessions without a human owner can still be closed by admins alone. Closing also stops whatever turn is running in that topic. The `/close` command itself is unchanged and still goes by operate rights.
+
+There is no such exception under multi-replica durable mode (`BOTMUX_COORDINATION_MODE=primary`); there the card's close button stays admin-only.
+
 ## Common operations
 
 Start with this table — it covers most needs:

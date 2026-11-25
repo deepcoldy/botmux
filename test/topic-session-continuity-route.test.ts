@@ -28,6 +28,7 @@ const mocks = vi.hoisted(() => {
     dataDir,
     replyMessage: vi.fn(async (..._args: any[]) => 'om_reply'),
     sendMessage: vi.fn(async (..._args: any[]) => 'om_sent'),
+    resolveMessageSenderUnionId: vi.fn(async () => null),
     getChatMode: vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p'),
     resolveSender: vi.fn(async (_appId: string, openId?: string, senderType?: string) => (
       openId ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const } : undefined
@@ -68,6 +69,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     sendMessage: mocks.sendMessage,
     getChatMode: mocks.getChatMode,
     getChatModeStrict: mocks.getChatMode,
+    resolveMessageSenderUnionId: mocks.resolveMessageSenderUnionId,
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'topic' as const })),
     getChatInfo: vi.fn(async () => ({ userCount: 1, botCount: 2 })),
     listChatBotMembers: vi.fn(async () => []),
@@ -116,12 +118,16 @@ vi.mock('../src/core/session-manager.js', async () => {
 
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
+import { ensureCrossChatFollowThreadAtBinding } from '../src/services/cross-chat-follow-thread-store.js';
+import { resolveCrossChatFollowedThread } from '../src/services/cross-chat-thread-binding.js';
 
 import { registerBot, getBot } from '../src/bot-registry.js';
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleThreadReply as handleThreadReply,
 } from '../src/daemon.js';
+import { beginReplyTargetTurn } from '../src/core/reply-target.js';
+import { setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
@@ -183,12 +189,35 @@ function resumeRegisters(): void {
 
 const replies = (): string[] => mocks.replyMessage.mock.calls.map(call => String(call[2] ?? ''));
 
-function writeFollowBinding(sessionId: string, followThreadEpoch?: string): void {
+function writeFollowBinding(sessionId: string, followThreadEpoch?: string, turnId?: string): void {
   recordBridgeReplyMarker({
     dataDir: mocks.dataDir, sessionId, sentAtMs: 1000, messageId: 'om_external_followed_root',
     deliveryKind: 'detoured_send', content: 'cross-chat', targetChatId: 'oc_external_followed',
-    crossChatFollowThread: 'at', followThreadEpoch,
+    crossChatFollowThread: 'at', followThreadEpoch, turnId,
   });
+}
+
+function primeContinuationSource(source: DaemonSession): void {
+  source.session.followThreadEpoch = 'epoch-current';
+  beginReplyTargetTurn(source, undefined, 'om_origin_human', new Date().toISOString(), {
+    senderOpenId: OWNER,
+    participants: [{ openId: OWNER, isBot: false }],
+    sourceMessageId: 'om_origin_human',
+  });
+  writeFollowBinding(source.session.sessionId, 'epoch-current', 'om_origin_human');
+}
+
+function attachContinuationContext(ctx: RoutingContext, sessionId: string): void {
+  ctx.crossChatThreadFollowUp = {
+    sourceSessionId: sessionId,
+    sourceTurnId: 'om_origin_human',
+    sourceChatId: CHAT,
+    followedChatId: 'oc_external_followed',
+    followedRootMessageId: 'om_external_followed_root',
+    scope: 'thread',
+    anchor: ROOT,
+    followThreadEpoch: 'epoch-current',
+  };
 }
 
 beforeEach(() => {
@@ -204,6 +233,7 @@ beforeEach(() => {
   bot.botOpenId = APP_OPEN_ID;
   bot.botName = 'Worker';
   activeSessions.clear();
+  setActiveSessionsRegistry(activeSessions);
   mocks.closedRows.length = 0;
   mocks.createdSessions.length = 0;
   mocks.getChatMode.mockResolvedValue('topic');
@@ -211,6 +241,7 @@ beforeEach(() => {
 });
 
 afterAll(() => {
+  setActiveSessionsRegistry(undefined);
   rmSync(mocks.ownRoot, { recursive: true, force: true });
 });
 
@@ -336,6 +367,99 @@ describe('a message in a topic whose session was closed (real route)', () => {
     expect(String(mocks.forkWorker.mock.calls[0]?.[1].content)).toContain('@session fresh');
   });
 
+  it('freezes the source-human continuation on a cross-chat durable follower behind an opening', async () => {
+    vi.useFakeTimers({ now: new Date('2026-11-25T00:00:00.000Z') });
+    try {
+      resumeRegisters();
+      await mocks.resumeSession('sess-live');
+      mocks.resumeSession.mockClear();
+      const source = activeSessions.get(sessionKey(ROOT, APP))!;
+      primeContinuationSource(source);
+      source.initialStartPending = true;
+      source.initialStartClaimToken = 'opening-owned-by-earlier-handler';
+      const { data, ctx } = event('长任务完成，请继续', 'bot');
+      attachContinuationContext(ctx, 'sess-live');
+
+      await handleThreadReply(data, ctx);
+
+      expect(source.session.queuedActivationTail).toHaveLength(1);
+      expect(source.session.queuedActivationTail?.[0]?.cliInput.trustedCaller).toMatchObject({
+        requestUserOpenId: LEAD_OPEN_ID,
+        senderType: 'bot',
+        taskContinuation: {
+          openId: OWNER,
+          sourceSessionId: 'sess-live',
+          sourceTurnId: 'om_origin_human',
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('freezes the source-human continuation when a cross-chat reply becomes a pending-repo opening', async () => {
+    vi.useFakeTimers({ now: new Date('2026-11-25T00:00:00.000Z') });
+    try {
+      resumeRegisters();
+      await mocks.resumeSession('sess-live');
+      mocks.resumeSession.mockClear();
+      const source = activeSessions.get(sessionKey(ROOT, APP))!;
+      primeContinuationSource(source);
+      source.pendingRepo = true;
+      source.pendingPrompt = undefined;
+      source.pendingRawInput = undefined;
+      source.pendingAttachments = undefined;
+      const { data, ctx } = event('选择仓库后继续', 'bot');
+      attachContinuationContext(ctx, 'sess-live');
+
+      await handleThreadReply(data, ctx);
+
+      expect(source.pendingTurnId).toBe(ctx.messageId);
+      expect(source.pendingTrustedCaller).toMatchObject({
+        requestUserOpenId: LEAD_OPEN_ID,
+        senderType: 'bot',
+        taskContinuation: {
+          openId: OWNER,
+          sourceSessionId: 'sess-live',
+          sourceTurnId: 'om_origin_human',
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('freezes the source-human continuation on a pending-repo follower tail', async () => {
+    vi.useFakeTimers({ now: new Date('2026-11-25T00:00:00.000Z') });
+    try {
+      resumeRegisters();
+      await mocks.resumeSession('sess-live');
+      mocks.resumeSession.mockClear();
+      const source = activeSessions.get(sessionKey(ROOT, APP))!;
+      primeContinuationSource(source);
+      source.pendingRepo = true;
+      source.pendingPrompt = '已有 opening';
+      source.pendingTurnId = 'om_existing_opening';
+      const { data, ctx } = event('跟在 opening 后继续', 'bot');
+      attachContinuationContext(ctx, 'sess-live');
+
+      await handleThreadReply(data, ctx);
+
+      expect(source.session.queuedActivationTail).toHaveLength(1);
+      expect(source.session.queuedActivationTail?.[0]?.cliInput.trustedCaller).toMatchObject({
+        requestUserOpenId: LEAD_OPEN_ID,
+        senderType: 'bot',
+        taskContinuation: {
+          openId: OWNER,
+          sourceSessionId: 'sess-live',
+          sourceTurnId: 'om_origin_human',
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('rejects a cross-chat follow-up when the source lifecycle changed before admission', async () => {
     resumeRegisters();
     await mocks.resumeSession('sess-live');
@@ -353,6 +477,81 @@ describe('a message in a topic whose session was closed (real route)', () => {
     expect(mocks.forkWorker).not.toHaveBeenCalled();
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(mocks.resumeSession).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unauthorized reply bot callerless without minting the source-human continuation', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    // The source chat being talk-open must not authorize a stranger in the
+    // followed chat. This also catches accidentally authorizing against CHAT.
+    getBot(APP).config.allowedChatGroups = [CHAT];
+    const { data, ctx } = event('陌生 Bot 回执', 'stranger-bot');
+    attachContinuationContext(ctx, 'sess-live');
+
+    await handleThreadReply(data, ctx);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[1]?.trustedCaller).toBeUndefined();
+  });
+
+  it('rejects a cross-chat continuation when the followed root was rebound to another source turn', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    source.session.followThreadEpoch = 'epoch-current';
+    writeFollowBinding('sess-live', 'epoch-current', 'om_new_source_turn');
+    const { data, ctx } = event('stale principal continuation', 'bot');
+    ctx.crossChatThreadFollowUp = {
+      sourceSessionId: 'sess-live', sourceTurnId: 'om_old_source_turn', sourceChatId: CHAT,
+      followedChatId: 'oc_external_followed', followedRootMessageId: 'om_external_followed_root',
+      scope: 'thread', anchor: ROOT, followThreadEpoch: 'epoch-current',
+    };
+    await handleThreadReply(data, ctx);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.resumeSession).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('keeps an in-flight legacy receipt only when enrichment is the same receipt (replace=%s)', async replace => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    source.session.followThreadEpoch = 'epoch-current';
+    writeFollowBinding('sess-live', 'epoch-current');
+    const expected = resolveCrossChatFollowedThread({
+      dataDir: mocks.dataDir, larkAppId: APP, chatId: 'oc_external_followed',
+      candidateRootIds: ['om_external_followed_root'], sessions: [source.session],
+    });
+    expect(expected).not.toBeNull();
+    expect(expected?.sourceTurnId).toBeUndefined();
+    const { data, ctx } = event('legacy receipt awaiting download', 'bot');
+    ctx.crossChatThreadFollowUp = expected!;
+    let finishDownload!: (value: { attachments: never[]; needLogin: boolean }) => void;
+    mocks.downloadResources.mockImplementationOnce(() => new Promise(resolve => { finishDownload = resolve; }));
+    const handling = handleThreadReply(data, ctx);
+    await vi.waitFor(() => expect(mocks.downloadResources).toHaveBeenCalled());
+    if (replace) {
+      recordBridgeReplyMarker({
+        dataDir: mocks.dataDir, sessionId: 'sess-live', sentAtMs: 2000,
+        messageId: 'om_different_receipt', targetRootMessageId: 'om_external_followed_root',
+        deliveryKind: 'detoured_send', content: 'new binding', targetChatId: 'oc_external_followed',
+        crossChatFollowThread: 'at', followThreadEpoch: 'epoch-current', turnId: 'om_new_source',
+      });
+    } else {
+      expect(ensureCrossChatFollowThreadAtBinding({
+        dataDir: mocks.dataDir, sessionId: 'sess-live', sentAtMs: 2000,
+        messageId: 'om_external_followed_root', targetChatId: 'oc_external_followed',
+        followThreadEpoch: 'epoch-current', sourceTurnId: 'om_enriched_source',
+      })).toBe(true);
+    }
+    finishDownload({ attachments: [], needLogin: false });
+    await handling;
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(replace ? 0 : 1);
+    if (!replace) expect(mocks.forkWorker.mock.calls[0]?.[1]?.trustedCaller).toBeUndefined();
   });
 
   it('rejects a cross-chat follow-up when the source closes during attachment download', async () => {
@@ -425,6 +624,188 @@ describe('a message in a topic whose session was closed (real route)', () => {
     expect(mocks.resumeSession).not.toHaveBeenCalled();
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(mocks.createdSessions[0].continuity).toBeUndefined();
+  });
+
+  it.each([
+    { liveWorker: true },
+    { liveWorker: false },
+  ])('keeps a continuation behind the principal-lane FIFO (live worker=$liveWorker)', async ({ liveWorker }) => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    source.session.principalLane = { laneId: 'lane-a' } as any;
+    source.worker = liveWorker ? { killed: false } as any : null;
+    source.workerGeneration = 7;
+    source.activeInteractiveTurn = {
+      turnId: 'om_lane_a',
+      caller: { requestUserOpenId: OWNER, requestLarkAppId: APP, senderType: 'user' },
+    };
+    source.principalLaneRunningTurn = { turnId: 'om_lane_a', workerGeneration: 7 };
+    source.session.principalLaneQueuedTurns = [{
+      version: 1, turnId: 'om_lane_b', caller: source.activeInteractiveTurn.caller,
+      userPrompt: 'queued B', title: 'queued B', cliInput: { content: 'queued B' },
+      createdAt: new Date().toISOString(), dispatchState: 'queued', resume: true,
+    }] as any;
+    const { data, ctx } = event('continuation C', 'bot');
+    attachContinuationContext(ctx, 'sess-live');
+
+    await handleThreadReply(data, ctx);
+
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(source.session.principalLaneQueuedTurns.map(turn => turn.turnId)).toEqual(['om_lane_b', ctx.messageId]);
+    expect(source.session.principalLaneQueuedTurns[1]?.caller).toMatchObject({
+      taskContinuation: { openId: OWNER, sourceSessionId: 'sess-live', sourceTurnId: 'om_origin_human' },
+    });
+    expect(source.principalLaneRunningTurn).toEqual({ turnId: 'om_lane_a', workerGeneration: 7 });
+  });
+
+  it.each([
+    { liveWorker: true },
+    { liveWorker: false },
+  ])('keeps a callerless cross-chat reply in the principal-lane FIFO (live worker=$liveWorker)', async ({ liveWorker }) => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    source.session.principalLane = { laneId: 'lane-a' } as any;
+    source.worker = liveWorker ? { killed: false } as any : null;
+    source.workerGeneration = 7;
+    const caller = { requestUserOpenId: OWNER, requestLarkAppId: APP, senderType: 'user' as const };
+    source.activeInteractiveTurn = liveWorker ? { turnId: 'om_lane_a', caller } : undefined;
+    source.principalLaneRunningTurn = liveWorker ? { turnId: 'om_lane_a', workerGeneration: 7 } : undefined;
+    source.session.principalLaneQueuedTurns = [{
+      version: 1, turnId: 'om_lane_b', ...(liveWorker ? { caller } : {}), userPrompt: 'durable B', title: 'durable B',
+      cliInput: { content: 'durable B' }, createdAt: new Date().toISOString(),
+      dispatchState: 'queued', resume: true,
+    }] as any;
+    if (!liveWorker) mocks.forkWorker.mockReturnValue(true);
+    const { data, ctx } = event('callerless C', 'stranger-bot');
+    attachContinuationContext(ctx, 'sess-live');
+
+    await handleThreadReply(data, ctx);
+
+    const queue = source.session.principalLaneQueuedTurns;
+    expect(queue.map(turn => turn.turnId)).toEqual(['om_lane_b', ctx.messageId]);
+    expect(queue[1]).not.toHaveProperty('caller');
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    if (liveWorker) {
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(source.principalLaneRunningTurn).toEqual({ turnId: 'om_lane_a', workerGeneration: 7 });
+    } else {
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      expect(mocks.forkWorker.mock.calls[0]?.[2]?.turnId).toBe('om_lane_b');
+      expect(mocks.forkWorker.mock.calls[0]?.[2]).not.toHaveProperty('trustedCaller');
+      expect(source.principalLaneRunningTurn).toEqual({ turnId: 'om_lane_b', workerGeneration: 7 });
+      expect(source.activeInteractiveTurn).toBeUndefined();
+      expect(queue.map(turn => turn.dispatchState)).toEqual(['attempting', 'queued']);
+    }
+  });
+
+  it('withholds continuation when receipt-bot authorization is revoked during source-principal resolution', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    source.worker = { killed: false } as any;
+    let finishUnion!: (value: string | null) => void;
+    mocks.resolveMessageSenderUnionId.mockImplementationOnce(() => new Promise(resolve => { finishUnion = resolve; }));
+    const { data, ctx } = event('revoke while constructing', 'bot');
+    attachContinuationContext(ctx, 'sess-live');
+    const { evaluateBotTalk } = await import('../src/im/lark/event-dispatcher.js');
+    expect(evaluateBotTalk(APP, 'oc_external_followed', LEAD_OPEN_ID).allowed).toBe(true);
+
+    const handling = handleThreadReply(data, ctx);
+    await vi.waitFor(() => expect(mocks.resolveMessageSenderUnionId).toHaveBeenCalledWith(APP, 'om_origin_human'));
+    getBot(APP).resolvedAllowedUsers = [OWNER];
+    (getBot(APP).config as any).allowedUsers = [OWNER];
+    expect(evaluateBotTalk(APP, 'oc_external_followed', LEAD_OPEN_ID).allowed).toBe(false);
+    finishUnion(null);
+    await handling;
+
+    expect(mocks.sendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(mocks.sendWorkerInput.mock.calls[0]?.[3]).not.toHaveProperty('trustedCaller');
+  });
+
+  it('rolls back a lane enqueue that could not be persisted so ingress retry can save it', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    source.session.principalLane = { laneId: 'lane-a' } as any;
+    source.worker = { killed: false } as any;
+    source.workerGeneration = 7;
+    const caller = { requestUserOpenId: OWNER, requestLarkAppId: APP, senderType: 'user' as const };
+    source.activeInteractiveTurn = { turnId: 'om_lane_a', caller };
+    source.principalLaneRunningTurn = { turnId: 'om_lane_a', workerGeneration: 7 };
+    source.session.principalLaneQueuedTurns = [{
+      version: 1, turnId: 'om_lane_b', caller, userPrompt: 'durable B', title: 'durable B',
+      cliInput: { content: 'durable B' }, createdAt: new Date().toISOString(),
+      dispatchState: 'queued', resume: true,
+    }] as any;
+    let injected = false;
+    mocks.updateSession.mockImplementation((session: any) => {
+      if (!injected && (session.principalLaneQueuedTurns?.length ?? 0) > 1) {
+        injected = true;
+        throw new Error('injected enqueue persistence failure');
+      }
+    });
+    const { data, ctx } = event('continuation C', 'bot');
+    attachContinuationContext(ctx, 'sess-live');
+
+    const firstError = await handleThreadReply(data, ctx).then(() => undefined, error => error);
+    expect(String(firstError)).toContain('injected enqueue persistence failure');
+    expect(source.session.principalLaneQueuedTurns.map(turn => turn.turnId)).toEqual(['om_lane_b']);
+
+    await handleThreadReply(data, ctx);
+
+    expect(source.session.principalLaneQueuedTurns.map(turn => turn.turnId)).toEqual(['om_lane_b', ctx.messageId]);
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+  });
+
+  it('requeues a pre-IPC attempting head when its marker cannot be persisted', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    source.session.principalLane = { laneId: 'lane-a' } as any;
+    source.worker = null;
+    source.workerGeneration = 7;
+    const caller = { requestUserOpenId: OWNER, requestLarkAppId: APP, senderType: 'user' as const };
+    source.session.principalLaneQueuedTurns = [{
+      version: 1, turnId: 'om_lane_b', caller, userPrompt: 'durable B', title: 'durable B',
+      cliInput: { content: 'durable B' }, createdAt: new Date().toISOString(),
+      dispatchState: 'queued', resume: true,
+    }] as any;
+    let injected = false;
+    mocks.updateSession.mockImplementation((session: any) => {
+      if (!injected && session.principalLaneQueuedTurns?.[0]?.dispatchState === 'attempting') {
+        injected = true;
+        throw new Error('injected attempting persistence failure');
+      }
+    });
+    const { data, ctx } = event('continuation behind B', 'bot');
+    attachContinuationContext(ctx, 'sess-live');
+
+    await handleThreadReply(data, ctx);
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(source.session.principalLaneQueuedTurns[0]).toMatchObject({ turnId: 'om_lane_b', dispatchState: 'queued' });
+    expect(source.principalLaneDispatchRetry?.turnId).toBe('om_lane_b');
+
+    const { __testOnly_driveNextPrincipalLaneTurn: drive } = await import('../src/daemon.js');
+    mocks.forkWorker.mockReturnValue(true);
+    expect(drive(source)).toBe(true);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[2]?.turnId).toBe('om_lane_b');
+    expect(source.principalLaneRunningTurn).toEqual({ turnId: 'om_lane_b', workerGeneration: 7 });
+    expect(source.principalLaneDispatchRetry).toBeUndefined();
   });
 });
 

@@ -1,4 +1,5 @@
 import { normalizeOwnerGroupFollowConfig, type OwnerGroupFollowConfig } from './services/owner-group-follow-policy.js';
+import { validateSessionGroupCollaborationConfig, type SessionGroupCollaborationConfig } from './services/collab-group-config.js';
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
 import { normalizeMessageListenerReplyMode } from './services/message-listener-reply-policy.js';
 import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
@@ -1401,6 +1402,19 @@ export interface VcMeetingRealtimeVoiceConfig {
  * Everything is optional; effective defaults in parentheses.
  */
 export interface SessionGroupConfig {
+  /**
+   * 私聊专属群可视化协作配置（design 2026-11-20-dm-collab-group-design §4）。
+   * 缺省、不存在或非 `{enabled:true}` 都完全关闭（走 legacy 建群）。
+   * parse 时经 `validateSessionGroupCollaborationConfig` 结构校验，仅 `{enabled:true}`
+   * 且结构合法才保留，否则丢弃（安全默认关闭，不被类型断言绕过）。
+   */
+  collaboration?: SessionGroupCollaborationConfig;
+  /**
+   * 解析期标记：显式 `{enabled:true}` 但结构非法的协作配置被保留原样时写入该原因，
+   * 供 preflight 认出「应 fail-closed 而非走 legacy」的坏配置（§3 铁律 1）。
+   * 运行时不落盘、不参与任何序列化。仅显式 enabled 且非法时非空。
+   */
+  collaborationDisabledReason?: string;
   /** Group-name generation. */
   naming?: {
     /**
@@ -1732,6 +1746,8 @@ export interface BotConfig {
    * 逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
+  /** Persist and recover final replies to this bot's ordinary human IM turns. */
+  durableImReplies?: boolean;
   turnResults?: { enabled: boolean };
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
@@ -1917,6 +1933,8 @@ export interface BotConfig {
   /** LEGACY: extra read-deny paths — auto-migrated into sandboxPaths.deny. */
   readDenyExtraPaths?: string[];
   backendType?: BackendType;
+  /** Register this bot's hc sessions as tabs on the private core's Herdr layout. */
+  hcHerdrTabs?: boolean;
   /**
    * Configuration for the riff backend (agent-services platform). Required
    * when `backendType` is `'riff'`. Contains base URL, template ID, agent/model
@@ -3154,6 +3172,10 @@ export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
  *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（doubao 缺省
  *  transcript，其余缺省 send）。只读内存
  *  registry：worker 通过 init IPC 拿冻结值，不需要磁盘 mtime 缓存。 */
+export function durableImRepliesEnabled(larkAppId: string): boolean {
+  return bots.get(larkAppId)?.config.durableImReplies === true;
+}
+
 export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' | undefined {
   const v = bots.get(larkAppId)?.config.replyDelivery;
   return v === 'transcript' || v === 'send' ? v : undefined;
@@ -4628,6 +4650,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
       topicUnavailablePolicy: entry.topicUnavailablePolicy === 'stop' ? 'stop' : undefined,
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
+      durableImReplies: entry.durableImReplies === true || undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       // Only the non-default hook mode is persisted; absent, 'off', and invalid
       // values all retain the historical inline behavior.
@@ -4669,6 +4692,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
+      hcHerdrTabs: entry.hcHerdrTabs === true ? true : undefined,
       riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
       herdr: normalizeHerdrBackendConfig(entry.herdr),
       mojo: entry.mojo && typeof entry.mojo === 'object' ? entry.mojo : undefined,
@@ -4830,9 +4854,45 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 'group' are meaningful and persist; 'chat' (and anything else)
       // normalizes to undefined so bots.json stays clean.
       p2pMode: entry.p2pMode === 'thread' ? 'thread' : entry.p2pMode === 'group' ? 'group' : undefined,
-      sessionGroup: entry.sessionGroup && typeof entry.sessionGroup === 'object'
-        ? entry.sessionGroup as SessionGroupConfig
-        : undefined,
+      sessionGroup: (() => {
+        const sg = entry.sessionGroup;
+        if (!sg || typeof sg !== 'object' || Array.isArray(sg)) return undefined;
+        const parsed = { ...(sg as Record<string, unknown>) };
+        // 丢弃输入携带的旧标记：collaborationDisabledReason 是解析期派生的，绝不能从
+        // 输入继承（否则「改 enabled:false / 删除 collaboration / 修合法」都会被旧标记
+        // 误判为坏配置）。只在「当前显式 enabled:true 且当前结构非法」时重新生成。
+        delete (parsed as Record<string, unknown>).collaborationDisabledReason;
+        // 协作配置显式校验，绝不只靠 `as` 透传（§3 铁律 1）：
+        //  - 非 {enabled:true}（缺省/`enabled:false`/非对象）→ 归一化关闭，走 legacy；
+        //  - {enabled:true} 且结构合法 → 保留归一化后的 config；
+        //  - {enabled:true} 但结构非法 → **不得擦除**：保留原始 collaboration 并写入
+        //    collaborationDisabledReason，让 preflight 认出来返回 failed（不扣费、不走
+        //    legacy）。擦除会让运行时把「坏配置」当「未启用」，绕过 fail-closed。
+        if (parsed.collaboration !== undefined) {
+          const collabRaw = parsed.collaboration;
+          const collabObj = (typeof collabRaw === 'object' && collabRaw !== null && !Array.isArray(collabRaw))
+            ? (collabRaw as Record<string, unknown>)
+            : undefined;
+          const explicitlyEnabled = collabObj?.enabled === true;
+          const v = validateSessionGroupCollaborationConfig(parsed.collaboration);
+          if (v.ok) {
+            parsed.collaboration = v.config;
+          } else if (explicitlyEnabled) {
+            // 保留原始 collaboration，仅标记解析期禁用原因；preflight 据此 fail-closed。
+            // non-enumerable：解析期派生标记，不参与 JSON.stringify / 任何序列化。
+            Object.defineProperty(parsed, 'collaborationDisabledReason', {
+              value: v.errors.join('；'),
+              enumerable: false,
+              configurable: true,
+              writable: true,
+            });
+          } else {
+            // 非 enabled:true → 归一化关闭（安全默认）。
+            delete parsed.collaboration;
+          }
+        }
+        return parsed as SessionGroupConfig;
+      })(),
       noCardChats: Array.isArray(entry.noCardChats)
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,

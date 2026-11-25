@@ -223,6 +223,10 @@ export interface BotSnapshot {
   /** Frozen per-bot Claude credential source. This is a directory path, not a
    *  secret, so replay can preserve account selection without persisting tokens. */
   credentialsSourceDir?: string;
+  /** Frozen Claude config profile (`CLAUDE_CONFIG_DIR`). Without it a workflow
+   *  worker launches on the default `~/.claude` and loses the bot's own
+   *  account/settings/model while ordinary sessions of the same bot keep them. */
+  cliConfigDir?: string;
   /** Frozen configured launch prefix.  Workflow workers must use
    *  the same gateway/runtime selection as ordinary bot sessions. */
   wrapperCli?: string;
@@ -230,6 +234,9 @@ export interface BotSnapshot {
   /** Frozen explicit reasoning override. Goal CLI uses this with model and
    *  the goal-scoped Codex home so the worker cannot fall back to Bot defaults. */
   reasoningEffort?: import('../../services/codex-reasoning-effort.js').CodexReasoningEffort;
+  /** Frozen per-bot backend model variant (TraeX family), mirroring the value an
+   *  ordinary session freezes at its first fork. */
+  modelBackendVariant?: 'standard' | 'max';
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
    *  these fields when spawning outside the main forkWorker path. Tri-state:
    *  'oncall' (fs-policy whitelist) or 'scratch' (full-root COW). */
@@ -322,7 +329,18 @@ export interface RunNodeResult {
   runtime?: RuntimeAttestation;
   /** Precise infrastructure failure. A worker may still leave a valid
    * manifest behind, so this channel takes precedence when status=fail. */
-  error?: { code: string; message: string };
+  error?: {
+    code: string;
+    message: string;
+    /** A human can fix the cause and retry the node (it is blocked, not
+     *  failed). Never authorizes an automatic replay. */
+    retryable?: boolean;
+  };
+  /** Root cause of a process failure (CLI error, timeout, exit code), used to
+   *  lead the node's failure message. Also set with status `ok` when the CLI
+   *  aborted its goal after the manifest appeared: the runtime then names it
+   *  only if that manifest turns out invalid. */
+  failureDetail?: string;
 }
 
 export interface RuntimeAttestation {

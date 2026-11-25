@@ -134,6 +134,21 @@ describe('prepared native confirmation review', () => {
     await reachedSDK(sdk); mocks.bot.config.oncallGroup.enabled = false; await vi.advanceTimersByTimeAsync(1500);
     expect((await running).toast.type).toBe('error'); expect(sdk).toHaveBeenCalledTimes(1); expect(await current(d)).toMatchObject({ priority: 'P2', version: d.version });
   });
+  it('retains the issued sidebar if a private replacement reaches Lark but its response is lost', async () => {
+    const d = draft('private');
+    const forms = new OncallFormStore(dir);
+    const policy = () => mocks.bot.config.oncallGroup;
+    let issued: { token: string; href: string } | undefined;
+    mocks.ephemeral.mockImplementationOnce(async () => {
+      issued = forms.pendingNativeSubmissions('app')[0]?.nativeSubmission?.attempts[0]?.sidebarLink;
+      expect(forms.readNativeSidebarLink('app', d.id, issued!.token, policy)).toBe(issued!.href);
+      throw new Error('response lost');
+    });
+    expect((await handleOncallFormAction(event('oncall_group_form_priority', d, 'P1'), 'app')).toast.type).toBe('error');
+    expect(await current(d)).toMatchObject({ priority: 'P2', version: d.version, messageId: d.messageId });
+    expect(forms.readNativeSidebarLink('app', d.id, issued!.token, policy)).toBe(issued!.href);
+    expect(innerPage(issued!.href).searchParams.get('level')).toBe('P1');
+  });
   it('a public selection ACK stops when another process claims the request during SDK retry', async () => {
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] }); vi.stubEnv('BOTMUX_LARK_GATE_RETRY_MAX_ATTEMPTS', '1');
     const d = draft(); const ready = await handleOncallFormAction(event('oncall_group_form_priority', d, 'P1'), 'app');

@@ -1881,7 +1881,7 @@ async function promptEditBotConfig(
 
   printInputHelp('会话后端 backendType', [
     '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；herdr 支持托管持久会话；zmx >= 0.7.0 提供纯文本持久会话 + 本机 attach（无 Web TUI）；zellij 为实验后端（需 zellij >= 0.44）。',
-    'hc 基于 herdr-core 运行持久会话，需显式选用，本机要有 herdr-core >= 0.1.19（仅 Linux，botmux 不自动安装）。',
+    'hc 基于 herdr-core 运行持久会话，需显式选用，本机要有 herdr-core >= 0.1.19（Linux / macOS，botmux 不自动安装）。',
     '选择 traex + herdr 时，可在 Dashboard Settings 中开启 TraeX herdr plugin opt-in 并填写可信插件 spec；默认不会自动安装第三方插件。',
     '留空保留当前值；输入 - 回到全局默认（未设置 BACKEND_TYPE 时为 tmux）；接受 pty / tmux / herdr / zellij / zmx / hc。',
   ]);
@@ -6230,7 +6230,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           }
           cleanup();
           console.error(`hc: ${target.sessionName}（Ctrl+\\ 断开）`);
-          const attached = runManagedHcAttach(plan);
+          const attached = await runManagedHcAttach(plan);
           if (!attached.ok) console.error(attached.message);
         } else {
           const target = selected.backendTarget;
@@ -6304,7 +6304,7 @@ async function cmdManagedHcAttach(args: string[]): Promise<void> {
     return;
   }
   console.error(`hc: ${name}（Ctrl+\\ 断开）`);
-  const attached = runManagedHcAttach(plan);
+  const attached = await runManagedHcAttach(plan);
   if (!attached.ok) {
     console.error(attached.message);
     process.exitCode = 1;
@@ -13030,7 +13030,13 @@ async function cmdSend(
     : undefined;
   const selectedReplyContext = replyMessageId !== currentTurnId || explicitReplyTo
     ? s.turnReplyContexts?.[replyMessageId ?? ''] : undefined;
-  const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget;
+  // Ordinary structured turns have no Codex App dispatch entry. Their own
+  // per-turn context is the daemon-frozen original destination used by both
+  // the actual send and the v1-im route guard.
+  const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget
+    ?? (replyMessageId === currentTurnId && originSessionId === sid
+      ? parseReplyMessageTarget(s.turnReplyContexts?.[currentTurnId ?? '']?.target)
+      : undefined);
   const isCrossChatOriginTurn = !!crossChatOriginForSend({
     replyContext: replyContextForQuote,
     replyTarget: s.replyTargets?.[replyMessageId ?? ''],
@@ -13814,6 +13820,13 @@ async function cmdSend(
       effectiveResponseKind = 'final';
     }
   }
+  if (turnSendKey && effectiveResponseKind === 'final'
+    && (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined
+      || !frozenTurnReplyTarget || turnSendKey.larkAppId !== appId || turnSendKey.sessionId !== sid)
+    && turnSendLedger.requiresOriginalImReply(turnSendKey)) {
+    console.error('botmux send: final delivery is bound to the original conversation; use --response-kind auxiliary for a separate destination');
+    process.exit(2);
+  }
   const persistOffBeforeProvider = (): void => {
     if (effectiveFollowThreadMode !== 'off' || !sendInto) return;
     persistCrossChatFollowThreadOffBeforeProvider({
@@ -13854,6 +13867,7 @@ async function cmdSend(
         messageId: existingTurnPrimary.messageId, targetChatId: followThreadTargetChatId,
         ...(sendInto ? { targetRootMessageId: sendInto } : {}),
         followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        sourceTurnId: originTurnId ?? currentTurnId,
       });
       if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
     }
@@ -14099,6 +14113,7 @@ async function cmdSend(
           targetChatId: voicePrimaryOutputChatId,
           ...(voiceFollowRoot ? { targetRootMessageId: voiceFollowRoot } : {}),
           followThreadEpoch: (originSession ?? s).followThreadEpoch,
+          sourceTurnId: originTurnId ?? currentTurnId,
         });
         if (!bound) console.error('botmux send: 已复用语音投递，但跨群话题绑定补建失败');
       }
@@ -15720,6 +15735,7 @@ async function cmdSend(
           targetChatId,
           ...(sendTarget.mode !== 'plain' ? { targetRootMessageId: sendTarget.rootMessageId } : {}),
           followThreadEpoch: (originSession ?? s).followThreadEpoch,
+          sourceTurnId: originTurnId ?? currentTurnId,
         });
         if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
       }

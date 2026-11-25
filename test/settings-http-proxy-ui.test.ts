@@ -28,6 +28,8 @@ describe('isValidHttpProxy', () => {
   it('agrees with the server-side normalizer', () => {
     for (const value of [
       'http://127.0.0.1:7890',
+      'http://[::1]:3128',
+      'http://user:p%40ss@[2001:db8::1]:3128/',
       'https://proxy.example.com:8443/',
       'http://user:p%40ss@proxy.example.com:8080',
       '127.0.0.1:7890',

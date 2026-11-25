@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import type { BackendType } from '../adapters/backend/types.js';
-import { hcCorePaths, hcRuntimeDirError } from '../adapters/backend/hc/core.js';
+import { hcCorePaths, hcRuntimeError } from '../adapters/backend/hc/core.js';
 import { detectPlatform } from '../setup/detect-platform.js';
 import { HC_MIN_VERSION, hcBotmuxRoot, probeHcAvailability } from '../setup/ensure-hc.js';
 import { ensureHerdr, type HerdrResult } from '../setup/ensure-herdr.js';
@@ -30,8 +30,8 @@ export function probeHcFunctional(env: NodeJS.ProcessEnv = process.env): HcFunct
   const availability = probeHcAvailability({ env });
   if (!availability.ok) return availability;
   try {
-    const noRuntimeDir = hcRuntimeDirError(hcCorePaths(env));
-    if (noRuntimeDir) return { ok: false, reason: noRuntimeDir };
+    const runtimeError = hcRuntimeError(hcCorePaths(env));
+    if (runtimeError) return { ok: false, reason: runtimeError };
   } catch (err) {
     return { ok: false, reason: err instanceof Error ? err.message : String(err) };
   }

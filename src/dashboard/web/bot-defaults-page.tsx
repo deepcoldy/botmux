@@ -1631,17 +1631,21 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
         options={[{ value: 'none', label: '无', hint: '仅创建人工群，不自动转发当前对话' }, { value: 'individual', label: '逐条消息', hint: '按原顺序发送' }, { value: 'merge', label: '聊天记录', hint: '合并展示' }]}
         onChange={forwardMode => updateDraft({ ...policy, forwardMode })} />
     </div>
-    {(policy.flowMode ?? 'direct') === 'classify' && <div className="bd-oncall-field">
-      <FieldTitle help="仅用于“先选分类再建群”，决定用户在哪里填写问题区域和分类。群内卡片：在原群聊或话题中展示，所有成员可见，仅发起人操作。仅本人可见卡片：仅支持普通群，话题群和私聊不可用。卡片中的分类包含自定义字段时，确认按钮直接打开侧栏，保留区域、分类、等级和问题描述；原发起人提交成功后，自动显示进群入口并按交接设置同步当前会话。单独选择“飞书侧栏”仍为有限支持。">分类填写方式</FieldTitle>
-      <DropdownField dataInput="oncallFormDisplay" ariaLabel="分类填写方式" disabled={busy || (policy.flowMode ?? 'direct') !== 'classify'} value={policy.formDisplay ?? 'thread_card'}
+    {policy.flowMode === 'classify' && <div className="bd-oncall-field">
+      <FieldTitle help="决定用户在哪里填写问题区域和分类。群内卡片在原群聊或话题中展示，所有成员可见，仅发起人操作。仅本人可见卡片支持普通群。分类选定后，如需补充自定义字段，按下方的附加表单方式填写。">分类填写方式</FieldTitle>
+      <DropdownField dataInput="oncallFormDisplay" ariaLabel="分类填写方式" disabled={busy} value={policy.formDisplay ?? 'native'}
         options={[{ value: 'thread_card', label: '群内卡片（推荐）', hint: '在原群聊或话题内填写；所有成员可见，仅发起人操作' }, { value: 'native', label: '飞书侧栏（有限支持）', hint: '在 Oncall 平台表单中填写；暂不自动关联人工群或转交对话' }, { value: 'private_card', label: '仅本人可见卡片', hint: '仅点击者可见；只支持普通群，不支持话题群和私聊' }]}
         onChange={formDisplay => updateDraft({ ...policy, formDisplay })} />
-      <small className={`bd-section-note${policy.flowMode === 'classify' && policy.formDisplay === 'native' ? ' bd-warn' : ''}`}>{(policy.flowMode ?? 'direct') !== 'classify'
-        ? '直接建群无需填写分类，此项不生效。'
-        : policy.formDisplay === 'native' ? '此方式暂不自动关联人工群，也不会自动转交当前对话。'
+      <small className={`bd-section-note${(policy.formDisplay ?? 'native') === 'native' ? ' bd-warn' : ''}`}>{(policy.formDisplay ?? 'native') === 'native' ? '此方式暂不自动关联人工群，也不会自动转交当前对话。'
         : policy.formDisplay === 'private_card' ? '仅支持普通群；话题群请使用群内卡片。'
         : policy.forwardMode === 'none' ? '普通群和话题群均可使用，提交成功后显示人工群入口，不自动转交对话。'
         : '普通群和话题群均可使用，提交成功后自动转交当前对话。'}</small>
+    </div>}
+    {policy.flowMode === 'classify' && (policy.formDisplay === 'thread_card' || policy.formDisplay === 'private_card') && <div className="bd-oncall-field">
+      <FieldTitle help="仅在分类要求补充信息时生效。Botmux 表单支持普通文本字段，可在当前分类卡填写并提交。遇到复杂字段或 P0 自定义表单时会打开 Oncall 原生侧栏。">附加表单填写方式</FieldTitle>
+      <DropdownField dataInput="oncallCustomFormMode" ariaLabel="附加表单填写方式" disabled={busy} value={policy.customFormMode ?? 'native'}
+        options={[{ value: 'native', label: 'Oncall 原生表单', hint: '在飞书侧栏填写' }, { value: 'botmux', label: 'Botmux 表单', hint: '在当前分类卡补充文本并提交' }]}
+        onChange={customFormMode => updateDraft({ ...policy, customFormMode })} />
     </div>}
     </div>
     <details className="bd-oncall-details"><summary>按钮显示<span className="bd-oncall-summary-meta">{policy.button?.timing === 'first' ? '开始处理时' : '回答完成后'} · 第 {policy.button?.minTurns ?? 1} 轮起</span></summary>
@@ -6168,7 +6172,39 @@ function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lo
         </div>
       </div>
       </AgentManagedLock>
+      {resolvePairedBackendId(bot.cliId, bot.backendType, bot.defaultBackendType) === 'hc' ? (
+        <HcHerdrTabsToggle bot={bot} patchBot={patchBot} />
+      ) : null}
     </section>
+  );
+}
+
+function HcHerdrTabsToggle({ bot, patchBot }: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  const save = (enabled: boolean) => saveBotField({
+    request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/hc-herdr-tabs`, { enabled }),
+    setStatus,
+    setBusy,
+    saved: tr('botDefaults.hcHerdrTabsSaved'),
+    errorText: res => configErrorText(res, tr),
+    onSaved: body => patchBot(bot.larkAppId, { hcHerdrTabs: body.hcHerdrTabs === true }),
+  });
+
+  return (
+    <>
+      <ToggleRow
+        checked={bot.hcHerdrTabs === true}
+        disabled={busy}
+        dataAction="toggle-hc-herdr-tabs"
+        title={tr('botDefaults.hcHerdrTabs')}
+        help={tr('botDefaults.hcHerdrTabsHelp')}
+        onChange={enabled => { void save(enabled); }}
+      />
+      <StatusSpan status={status} />
+    </>
   );
 }
 

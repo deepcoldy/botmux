@@ -13,6 +13,7 @@ import { sandboxWithholdsBotSecret } from '../../adapters/cli/sandbox-mode.js';
  * file is edited.)
  */
 
+import { cliSupportsConfigDir, normalizeCliConfigDir } from '../../core/cli-config-dir.js';
 import { normalizeEnvPolicy } from '../../core/env-policy.js';
 import { normalizeCredentialsSourceDir } from '../../services/cli-credential-source.js';
 import { effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
@@ -20,7 +21,7 @@ import {
   newSessionCodexInstanceState,
   type SessionCliInstanceBindingV1,
 } from '../../services/codex-instance-pool.js';
-import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
+import { isBackendVariantCliId, isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import {
   V3_SUPPORTED_CLIS,
@@ -92,8 +93,12 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     cliId: bot.cliId,
     ...((instance.cliPathOverride ?? bot.cliPathOverride) ? { cliPathOverride: instance.cliPathOverride ?? bot.cliPathOverride } : {}),
     ...(credentialsSourceDir ? { credentialsSourceDir } : {}),
+    // Same CLI gates as an ordinary session's first-fork freeze (worker-pool).
+    ...(bot.cliConfigDir && cliSupportsConfigDir(bot.cliId) ? { cliConfigDir: bot.cliConfigDir } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.modelBackendVariant && isBackendVariantCliId(bot.cliId)
+      ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.sandbox === true || bot.sandbox === 'oncall'
       ? { sandbox: true }
       : bot.sandbox === 'scratch' ? { sandbox: 'scratch' } : {}),
@@ -174,9 +179,11 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'cliId',
     'cliPathOverride',
     'credentialsSourceDir',
+    'cliConfigDir',
     'wrapperCli',
     'model',
     'reasoningEffort',
+    'modelBackendVariant',
     'envPolicy',
     'sandbox',
     'sandboxPaths',
@@ -223,6 +230,27 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     const credentialsSourceDir = normalizeCredentialsSourceDir(obj.credentialsSourceDir);
     if (obj.reasoningEffort !== undefined && !isCodexReasoningEffort(obj.reasoningEffort)) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].reasoningEffort is invalid`);
+    }
+    // botToSnapshot only freezes these for CLIs that honor them; a replayed
+    // artifact claiming otherwise was edited by hand and fails closed.
+    let cliConfigDir: string | undefined;
+    if (obj.cliConfigDir !== undefined) {
+      if (!cliSupportsConfigDir(obj.cliId as string)) {
+        throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].cliConfigDir is not supported for ${obj.cliId}`);
+      }
+      try {
+        cliConfigDir = normalizeCliConfigDir(obj.cliConfigDir);
+      } catch (error) {
+        throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (obj.modelBackendVariant !== undefined) {
+      if (obj.modelBackendVariant !== 'standard' && obj.modelBackendVariant !== 'max') {
+        throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].modelBackendVariant must be standard or max`);
+      }
+      if (!isBackendVariantCliId(obj.cliId as string)) {
+        throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].modelBackendVariant is not supported for ${obj.cliId}`);
+      }
     }
     for (const field of ['sandbox', 'sandboxNetwork'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'boolean') {
@@ -278,10 +306,14 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
       ...(credentialsSourceDir ? { credentialsSourceDir } : {}),
+      ...(cliConfigDir ? { cliConfigDir } : {}),
       ...(obj.wrapperCli !== undefined ? { wrapperCli: obj.wrapperCli as string } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
       ...(obj.reasoningEffort !== undefined
         ? { reasoningEffort: obj.reasoningEffort as BotSnapshot['reasoningEffort'] }
+        : {}),
+      ...(obj.modelBackendVariant !== undefined
+        ? { modelBackendVariant: obj.modelBackendVariant as BotSnapshot['modelBackendVariant'] }
         : {}),
       ...(obj.sandbox === 'scratch' ? { sandbox: 'scratch' as const }
         : obj.sandbox === true || obj.sandbox === 'oncall' ? { sandbox: true as const } : {}),

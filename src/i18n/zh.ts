@@ -2752,6 +2752,9 @@ export const messages: Record<string, string> = {
   'worker.interrupt_recovery_zmx': '请在本机运行 botmux list，进入该 ZMX 会话检查并手动中断；如果状态仍不确定，请用 /restart 重启会话。',
   'worker.interrupt_recovery_web': '请重试，或打开 Web 终端后手动中断。',
   'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
+  'worker.required_reply_missing': '本轮未生成可交付答复。',
+  'worker.required_reply_pending': '答复投递待确认。',
+  'worker.required_reply_rejected': '无法确认答复送达，原文已保留以便核对。',
   'worker.final_output_undelivered': '⚠️ 这一轮的回复没有发到群里：botmux 无法确认它出自本话题当前在运行的那个 CLI 进程（CLI 进程可能已经更换，比如 botmux 或会话重启前后；或者这个会话已被别的进程接管）。为免把不属于本话题的内容发进来，这段回复被拦下了。{recovery}',
   'worker.final_output_undelivered_archived': '回复原文已保存在 bot 所在机器的 {dir} 下，文件名以拦下的时间 {stamp} 开头（`find {dir} -name "{stamp}*"` 可找到）；也可以在网页终端查看完整输出，需要时请重新发送消息。',
   'worker.final_output_undelivered_unarchived': '请在网页终端查看完整输出，需要时请重新发送消息。',
@@ -2912,6 +2915,11 @@ export const messages: Record<string, string> = {
   'sg.intro_forwarded': '从私聊发起了本次会话，原消息已转发到本群（见上 ⬆️）。',
   'sg.receipt': '✅ 已为本次会话创建专属群，后续请在群里继续：{link}',
   'sg.birth_failed': '⚠️ 建群失败（{error}），本次会话回退为私聊话题。',
+  'sg.collab_failed': '⚠️ 协作群启动失败（{reason}），本次会话未开工。',
+  'sg.collab_existing': '协作初始化已在进行中（状态 {status}）。',
+  'sg.collab_busy': '当前私聊已有进行中的协作初始化，请等它结束（done/failed/cancelled）后再发新任务。',
+  'sg.collab_queued': '⏳ 协作群尚未就绪，消息已排队（位置 {position}）。就绪后将按顺序处理。',
+  'sg.collab_gate_blocked': '⚠️ 协作群未就绪（{reason}），消息未被处理。',
   'sg.cmd_unsupported': '⚠️ 会话群不支持 {cmd}：会话群由 bot 自动创建和管理，固定为连续会话模式。',
   // 回跳地址按本次链接实际用的 redirect_uri 填（{redirect}），不写死 127.0.0.1：
   // 配了 oauthRedirectBase / 平台绑定 / 反代的机器压根不会跳 loopback。

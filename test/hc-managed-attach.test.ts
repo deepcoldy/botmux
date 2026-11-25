@@ -8,7 +8,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { HcTarget } from '../src/adapters/backend/hc/cli-ops.js';
@@ -167,17 +167,21 @@ describe('prepareManagedHcAttach', () => {
 });
 
 describe('runManagedHcAttach', () => {
-  const plan = { ok: true as const, bin: '/opt/hc/herdr-core', address: 't7', env: { HC_SESSION: 'botmux' } };
+  const plan = {
+    ok: true as const, bin: '/opt/hc/herdr-core', address: 't7', env: { HC_SESSION: 'botmux' }, sessionId: SID,
+    target: { backendType: 'hc' as const, sessionName: NAME, hcSession: 'botmux', socket: '/run/hc/botmux.sock' },
+  };
+  const platform = 'linux' as const;
 
-  it('attaches to the planned address with the planned env', () => {
+  it('attaches to the planned address with the planned env', async () => {
     const attach = vi.fn(() => ({ status: 0 }));
-    expect(runManagedHcAttach(plan, { attach })).toEqual({ ok: true });
+    await expect(runManagedHcAttach(plan, { attach, platform })).resolves.toEqual({ ok: true });
     expect(attach).toHaveBeenCalledWith('/opt/hc/herdr-core', 't7', plan.env);
   });
 
-  it('reports a failed or unstartable attach', () => {
-    expect(runManagedHcAttach(plan, { attach: () => ({ status: 1 }) }).ok).toBe(false);
-    expect(runManagedHcAttach(plan, { attach: () => ({ status: null, error: new Error('EACCES') }) })).toMatchObject({
+  it('reports a failed or unstartable attach', async () => {
+    await expect(runManagedHcAttach(plan, { platform, attach: () => ({ status: 1 }) })).resolves.toMatchObject({ ok: false });
+    await expect(runManagedHcAttach(plan, { platform, attach: () => ({ status: null, error: new Error('EACCES') }) })).resolves.toMatchObject({
       ok: false,
       message: expect.stringContaining('EACCES'),
     });
@@ -211,8 +215,8 @@ describe.skipIf(!realHc)('prepareManagedHcAttach against the real binary', () =>
     return { status: result.status, stdout: result.stdout, stderr: result.stderr };
   }
 
-  function runTerminal(name: string, sessionId: string, argv: string[]): void {
-    const result = hc(home, [
+  function runTerminal(name: string, sessionId: string, argv: string[], core = home): void {
+    const result = hc(core, [
       '--json', 'run', '--bg', '--name', name,
       '--label', 'botmux=1', '--label', `botmux_sid=${sessionId}`,
       '--no-parent', '--no-notify', '--', ...argv,
@@ -220,8 +224,8 @@ describe.skipIf(!realHc)('prepareManagedHcAttach against the real binary', () =>
     expect(result.status, result.stderr).toBe(0);
   }
 
-  function get(name: string): { address: string; name: string; state: string } {
-    const result = hc(home, ['--json', 'get', name]);
+  function get(name: string, core = home): { address: string; name: string; state: string; pid: number } {
+    const result = hc(core, ['--json', 'get', name]);
     expect(result.status, result.stderr).toBe(0);
     return JSON.parse(result.stdout);
   }
@@ -241,6 +245,58 @@ describe.skipIf(!realHc)('prepareManagedHcAttach against the real binary', () =>
     expect(seen.status, seen.stderr).toBe(0);
     expect(JSON.parse(seen.stdout).name).toBe(name);
   });
+
+  it.runIf(process.platform === 'darwin')('checks the pinned socket and keeps it when the original path switches cores', async () => {
+    const origin = { hcSession: 'origin', socket: join(dirname(home.socket), 'origin.sock') };
+    const foreign = { hcSession: 'foreign', socket: join(dirname(home.socket), 'foreign.sock') };
+    const parked = join(dirname(home.socket), 'parked.sock');
+    try {
+      await ensureHcCore({ core: origin });
+      await ensureHcCore({ core: foreign });
+      runTerminal(NAME, SID, ['sleep', '600'], origin);
+      runTerminal(NAME, randomUUID(), ['sleep', '600'], foreign);
+      const original = get(NAME, origin);
+      expect(get(NAME, foreign)).toMatchObject({ address: original.address });
+      const plan = await prepareManagedHcAttach({ backendType: 'hc', sessionName: NAME, ...origin }, SID);
+      if (!plan.ok) throw new Error(plan.message);
+
+      function replaceSocket(): () => void {
+        renameSync(origin.socket, parked);
+        linkSync(foreign.socket, origin.socket);
+        return () => {
+          rmSync(origin.socket);
+          renameSync(parked, origin.socket);
+        };
+      }
+
+      let restore = replaceSocket();
+      const reject = vi.fn(() => ({ status: 0 }));
+      try {
+        await expect(runManagedHcAttach(plan, { attach: reject })).resolves.toMatchObject({ ok: false });
+        expect(reject).not.toHaveBeenCalled();
+      } finally {
+        restore();
+      }
+
+      const attach = vi.fn((_bin: string, address: string, env: NodeJS.ProcessEnv) => {
+        restore = replaceSocket();
+        try {
+          const reached = hc(origin, ['--json', 'get', address], env);
+          expect(reached.status, reached.stderr).toBe(0);
+          expect(JSON.parse(reached.stdout).pid).toBe(original.pid);
+          return { status: 0 };
+        } finally {
+          restore();
+        }
+      });
+      await expect(runManagedHcAttach(plan, { attach })).resolves.toEqual({ ok: true });
+      expect(attach).toHaveBeenCalledOnce();
+      expect(existsSync(attach.mock.calls[0]![2].HC_SOCKET!)).toBe(false);
+    } finally {
+      hc(origin, ['server', 'stop']);
+      hc(foreign, ['server', 'stop']);
+    }
+  }, 60_000);
 
   it('the planned env cannot start a core when the recorded one stops before hc connects', async () => {
     const sid = randomUUID();

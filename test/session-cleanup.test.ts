@@ -291,5 +291,18 @@ describe('dashboard idle session cleanup selection', () => {
       expect(result.failed).toBe(1);
       expect(result.results.map(r => r.sessionId)).toEqual(['old-idle', 'old-dormant', 'dormant-fails']);
     });
+
+    it('never sweeps idle or dormant rows with queuedActivationPending or buffered queuedActivationTailCount', () => {
+      const idlePending = row('idle-act-pending', { queuedActivationPending: true, lastMessageAt: NOW - 48 * hour });
+      const idleTail = row('idle-act-tail', { queuedActivationTailCount: 3, lastMessageAt: NOW - 48 * hour });
+      const dormantPending = dormant('dormant-act-pending', { queuedActivationPending: true });
+      const dormantTail = dormant('dormant-act-tail', { queuedActivationTailCount: 1 });
+      for (const hours of [0, 24] as const) {
+        expect(selectCleanupCandidates([idlePending, idleTail, dormantPending, dormantTail], hours, NOW))
+          .toEqual({ idle: [], dormant: [] });
+        expect(isDormantCleanupCandidate(dormantPending, hours, NOW)).toBe(false);
+        expect(isDormantCleanupCandidate(dormantTail, hours, NOW)).toBe(false);
+      }
+    });
   });
 });

@@ -106,6 +106,7 @@ import { jsonRes } from './dashboard/http.js';
 import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
 import { handleWorkflowSidebar } from './dashboard/workflow-sidebar-api.js';
+import { handleOncallSidebar } from './dashboard/oncall-sidebar.js';
 import { publishDashboardH5Presence } from './core/dashboard-h5-presence.js';
 import {
   WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
@@ -4388,6 +4389,10 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/__health') {
       return jsonRes(res, 200, { ok: true });
     }
+
+    // The random capability grants access only to its issued native form.
+    if (handleOncallSidebar(req, res, url, config.session.dataDir,
+      appId => loadBotConfigsCached().find(bot => bot.larkAppId === appId)?.oncallGroup)) return;
 
     // Pinned xterm 5.5.0 browser bundle (the #1940 set) for pages rendered at
     // the Dashboard root — the v3 terminal replay iframe — instead of a public
