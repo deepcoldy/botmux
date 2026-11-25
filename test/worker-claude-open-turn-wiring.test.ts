@@ -37,6 +37,7 @@ import {
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from '../src/services/transcript-terminal-settle.js';
 import { SessionController } from '../src/core/session-controller.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
+import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 import { WrittenInputLedger } from '../src/services/prompt-submission-match.js';
@@ -429,6 +430,7 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
           terminalAttempts.push(args);
           if (terminalAttempts.length === 1) throw new Error('terminal IPC unavailable');
         },
+        emittedTurnTerminals: new TurnTerminalDeduper(),
         log: () => {},
       };
       const emit = loadWorkerFunction<(opts: { releaseHeldTerminals?: boolean; onlyTurn?: { turnId: string; dispatchAttempt?: number } }) => void>('emitReadyTurns', scope);

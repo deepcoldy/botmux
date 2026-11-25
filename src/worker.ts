@@ -14832,18 +14832,29 @@ function emitReadyTurns(opts: {
         ...(turn.terminalProviderLastSuccessAtMs !== undefined
           ? { lastSuccessAtMs: turn.terminalProviderLastSuccessAtMs } : {}),
       };
-      emitTurnTerminal(
-        turn.turnId,
-        outcome.status,
-        outcome.errorCode,
-        turn.dispatchAttempt,
-        nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
-        outcome.retryable,
-        undefined,
-        turn.terminalErrorDetail,
-        undefined,
-        Object.keys(providerTiming).length > 0 ? providerTiming : undefined,
-      );
+      try {
+        emitTurnTerminal(
+          turn.turnId,
+          outcome.status,
+          outcome.errorCode,
+          turn.dispatchAttempt,
+          nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+          outcome.retryable,
+          undefined,
+          turn.terminalErrorDetail,
+          undefined,
+          Object.keys(providerTiming).length > 0 ? providerTiming : undefined,
+        );
+      } catch (error) {
+        // Only this bridge loop restores the queue, so only here is the claim
+        // rolled back for a same-turn retry. Direct commit-unknown terminal
+        // paths deliberately retain their claim for daemon reconciliation.
+        const contractOutcome = contractTerminalStatus(outcome.status, outcome.errorCode);
+        const dedupStatus = contractOutcome === 'reconciling' ? 'ambiguous'
+          : contractOutcome === 'succeeded' ? 'completed' : contractOutcome;
+        emittedTurnTerminals.release(sessionId!, turn.turnId, turn.dispatchAttempt, dedupStatus);
+        throw error;
+      }
       continue;
     }
     // Output disposition, positive no-output evidence only:
@@ -14880,14 +14891,19 @@ function emitReadyTurns(opts: {
           && !observedOutputTurns.has(turn)
           ? 'boundary_unobserved'
           : undefined;
-    emitTurnTerminal(
-      turn.turnId,
-      outcome?.status ?? 'completed',
-      undefined,
-      turn.dispatchAttempt,
-      outputDisposition,
-      undefined,
-    );
+    try {
+      emitTurnTerminal(
+        turn.turnId,
+        outcome?.status ?? 'completed',
+        undefined,
+        turn.dispatchAttempt,
+        outputDisposition,
+        undefined,
+      );
+    } catch (error) {
+      emittedTurnTerminals.release(sessionId!, turn.turnId, turn.dispatchAttempt, 'completed');
+      throw error;
+    }
   }
   } catch (error) {
     // Terminal-loop failures are just as recoverable as final_output failures:
@@ -40513,20 +40529,13 @@ function emitTurnTerminal(
     ...(composerRefusal && errorCode === 'safe_composer_required' ? { composerRefusal } : {}),
   };
   const scope = workerSessionEventScope;
-  try {
-    if (continuationFailure && scope) {
-      scope.reportContinuationFailure(continuationFailure, () => {
-        if (workerSessionEventScope !== scope) return false;
-        send(terminal);
-        return true;
-      });
-    } else send(terminal);
-  } catch (error) {
-    // The terminal was not accepted. Keep authority and queue state retryable;
-    // only the dedup claim needs an exact-status rollback at this boundary.
-    emittedTurnTerminals.release(sessionId, turnId, dispatchAttempt, dedupStatus);
-    throw error;
-  }
+  if (continuationFailure && scope) {
+    scope.reportContinuationFailure(continuationFailure, () => {
+      if (workerSessionEventScope !== scope) return false;
+      send(terminal);
+      return true;
+    });
+  } else send(terminal);
   // Publish authority retirement only after terminal acceptance. A stale
   // terminal from a superseded same-principal steer still cannot clear the
   // newer turn's authority, while an IPC failure leaves the exact turn held.
