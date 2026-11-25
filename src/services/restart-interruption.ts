@@ -20,6 +20,7 @@ import {
   backgroundTaskDispatchToolUseIds,
   backgroundTaskLaunches,
   backgroundTaskSettledIds,
+  isClaudeApiRequestBlob,
   isClaudeTurnTerminalEvent,
   isClaudeUserInterruptEvent,
   isMeaningfulQueuedCommand,
@@ -226,7 +227,7 @@ export function claudeInterruptedWork(
   };
 
   for (const ev of events) {
-    if (!ev || typeof ev !== 'object' || ev.isSidechain === true) continue;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) continue;
     const atMs = eventTimeMs(ev);
     // Untimestamped lines are Claude Code's own bookkeeping (titles, modes,
     // snapshots), not conversation; anything at/after the launch is the new

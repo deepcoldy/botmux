@@ -10688,6 +10688,197 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
     expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
   });
 
+  describe('forward + comment into an auto-start topic (#3784)', () => {
+    beforeEach(() => {
+      setupAutoTopicBot(true);
+      mockGetBot().resolvedAllowedUsers = [USER_OPEN_ID];
+      mockGetBot().config.allowedUsers = [USER_OPEN_ID];
+      mockGetBot().config.chatMentionModes = { 'chat-fwd-auto': 'topic' };
+      mockGetBot().config.soloGroupMentionBypass = false;  // 多人话题群（同发改委），不走 1人1bot 放行
+      mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 });
+      mockGetChatMode.mockResolvedValue('topic');
+      config.daemon.forwardFollowupWaitMs = 25;
+      // The hold buffer takes its wait at dispatcher start: restart with the wait on.
+      capturedHandlers = {};
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      markForwardFollowupsSessionsReady(MY_APP_ID);
+    });
+    afterEach(() => { config.daemon.forwardFollowupWaitMs = 0; });
+
+    const seed = () => makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '转发的聊天记录' }),
+      messageId: 'msg-auto-fwd-seed',
+      chatId: 'chat-fwd-auto',
+      chatType: 'group',
+    });
+
+    it('pairs the un-@ comment with the held auto-start seed instead of dropping it', async () => {
+      const s = seed();
+      const comment = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '调研学习一下' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-comment',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      await capturedHandlers['im.message.receive_v1'](s);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      await capturedHandlers['im.message.receive_v1'](comment);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(comment, expect.objectContaining({
+        scope: 'thread',
+        anchor: 'msg-auto-fwd-comment',
+        forwardSeedData: s,
+      }));
+      await new Promise(resolve => setTimeout(resolve, 40));
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    });
+
+    it('still auto-starts an unpaired seed after the wait', async () => {
+      const s = seed();
+      await capturedHandlers['im.message.receive_v1'](s);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(s, expect.objectContaining({
+        scope: 'thread',
+        anchor: 'msg-auto-fwd-seed',
+      }));
+    });
+
+    it('also pairs under the default always mode', async () => {
+      mockGetBot().config.chatMentionModes = {};
+      const s = seed();
+      const comment = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '借鉴一下' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-comment-always',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      await capturedHandlers['im.message.receive_v1'](s);
+      await capturedHandlers['im.message.receive_v1'](comment);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(comment, expect.objectContaining({ forwardSeedData: s }));
+    });
+
+    it('an excluded chat neither holds nor auto-starts the seed', async () => {
+      mockGetBot().config.autoStartExcludedChats = ['chat-fwd-auto'];
+      await capturedHandlers['im.message.receive_v1'](seed());
+      await flushEventWork();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    });
+
+    it('a comment from someone else does not pair', async () => {
+      mockGetBot().resolvedAllowedUsers = [USER_OPEN_ID, 'ou_bystander'];  // 允许的另一个人：挡住它的是发件人比对，不是权限
+      mockGetBot().config.allowedUsers = [USER_OPEN_ID, 'ou_bystander'];
+      const s = seed();
+      const other = makeUserMessageEvent({
+        senderOpenId: 'ou_bystander',
+        content: JSON.stringify({ text: '路过' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-other',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      await capturedHandlers['im.message.receive_v1'](s);
+      await capturedHandlers['im.message.receive_v1'](other);
+      await flushEventWork();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(s, expect.objectContaining({ anchor: 'msg-auto-fwd-seed' }));
+    });
+
+    it('re-holds a persisted auto-start seed after restart and pairs its post-restart comment (#3784)', async () => {
+      const persistedSeed = seed();
+      const persistedPayload = {
+        data: persistedSeed,
+        ctx: {
+          chatId: 'chat-fwd-auto',
+          messageId: 'msg-auto-fwd-seed',
+          chatType: 'group',
+          scope: 'thread',
+          anchor: 'msg-auto-fwd-seed',
+          larkAppId: MY_APP_ID,
+        },
+        ownsSession: false,
+        autoTopicSeed: true,
+      };
+      mockReadFileSync.mockImplementation(path => String(path).includes('forward-followups-')
+        ? JSON.stringify([{ messageId: 'msg-auto-fwd-seed', dueAt: Date.now() + 10_000, payload: persistedPayload }])
+        : '[]');
+      handlers.handleNewTopic.mockClear();
+      capturedHandlers = {};
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      markForwardFollowupsSessionsReady(MY_APP_ID);
+      await flushEventWork();
+      // Re-held under topic mode: not flushed immediately.
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      const comment = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '重启后留言' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-post-restart-comment',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      await capturedHandlers['im.message.receive_v1'](comment);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(comment, expect.objectContaining({
+        anchor: 'msg-auto-fwd-post-restart-comment',
+        forwardSeedData: persistedSeed,
+      }));
+    });
+
+    it('pairs when the comment arrives while the seed routing is still resolving (#3784)', async () => {
+      let releaseMode!: (mode: 'topic') => void;
+      const delayedMode = new Promise<'topic'>(resolve => { releaseMode = resolve; });
+      mockGetChatMode.mockReset()
+        .mockImplementationOnce(async () => delayedMode)
+        .mockResolvedValue('topic');
+      capturedHandlers = {};
+      __resetAnchorQueues();
+      __resetEventClaimsForTest();
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      markForwardFollowupsSessionsReady(MY_APP_ID);
+
+      const s = seed();
+      const comment = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '路由未决时的留言' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-gate-comment',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      capturedHandlers['im.message.receive_v1'](s);
+      capturedHandlers['im.message.receive_v1'](comment);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      releaseMode('topic');
+      await flushEventWork();
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(comment, expect.objectContaining({
+        anchor: 'msg-auto-fwd-gate-comment',
+        forwardSeedData: s,
+      }));
+    });
+  });
+
   it('话题群新话题（未 @）开关开 → 自动开工 (FR-6)', async () => {
     setupAutoTopicBot(true);
     mockGetChatMode.mockResolvedValue('topic');

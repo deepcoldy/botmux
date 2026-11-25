@@ -203,6 +203,9 @@ export interface HostReading {
   memTotalBytes: number;
   /** Free physical memory in bytes (os.freemem()). */
   memFreeBytes: number;
+  /** Free + reclaimable memory, using the resource monitor's platform metric.
+   * When supplied, both alert decisions and displayed usage use this value. */
+  memAvailableBytes?: number;
   /**
    * Swap total/used in bytes, if known. macOS/Node has no built-in swap read;
    * pass undefined to skip the swap dimension entirely.
@@ -248,7 +251,7 @@ export interface OverloadEvaluation {
 
 function memUsedFrac(reading: HostReading): number {
   if (reading.memTotalBytes <= 0) return 0;
-  const used = reading.memTotalBytes - reading.memFreeBytes;
+  const used = reading.memTotalBytes - (reading.memAvailableBytes ?? reading.memFreeBytes);
   return Math.max(0, Math.min(1, used / reading.memTotalBytes));
 }
 

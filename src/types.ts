@@ -1259,6 +1259,15 @@ export interface Session {
    * to this external server.
    */
   existingAppServerEndpoint?: string;
+  /** Frozen at ordinary-topic creation; input stays in the activation journal. */
+  sharedThreadOpening?: {
+    endpoint: string;
+    cwd?: string;
+    title?: string;
+    projectRouteRevision?: number;
+    phase?: 'creating' | 'created';
+    threadId?: string;
+  };
   /** Provenance: the botmux sessionId this session was forked from (`/fork`).
    *  Purely informational — surfaced in UI/pickers so a fork is distinguishable
    *  from its parent. Does not affect routing or lifecycle. */
@@ -3156,6 +3165,13 @@ export type WorkerToDaemonBase =
       /** Background tasks (agents, workflows, shells, monitors) still running
        *  when a `completed` turn ended. Absent means none. */
       backgroundTasks?: number;
+      /** Worker intentionally retains this turn's managed-origin authority past
+       *  foreground terminal while owned finite background task(s) or their wake-up
+       *  micro-turn remain active. Daemon skips its defense-in-depth wipe of
+       *  `ds.managedTurnOrigin` (and retains `ds.activeInteractiveTurn` under XPI=ON);
+       *  a later `managed_turn_origin_revoked` (or new origin / CLI exit / worker exit)
+       *  clears it. Older workers omit this field (fail closed). */
+      authorityHeldForBackground?: true;
       errorCode?: string;
       /** With `errorCode: 'safe_composer_required'` only: why the worker
        *  refused the unattended maintenance write. Absent from older workers;
