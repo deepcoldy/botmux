@@ -38,7 +38,9 @@ import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from '.
 import { SessionController } from '../src/core/session-controller.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
-import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
+import { WrittenInputLedger } from '../src/services/prompt-submission-match.js';
+import { fingerprintPromptText } from '../src/services/prompt-context-store.js';
 
 const mkUser = (uuid: string, content: string): TranscriptEvent => ({
   type: 'user',
@@ -315,6 +317,37 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
     expect((h.scope.openClaudeLifecycleTurn as () => { turnId: string } | undefined)()?.turnId).toBe('om_slow_u1');
     expect((h.scope.bridgeHeadTurnAwaitingTerminal as (o: { startedOnly: boolean }) => boolean)({ startedOnly: true })).toBe(true);
     expect(h.hold('screen')).toBe(true);
+    h.disarm();
+  });
+
+  it('Finding 14b: durable retry hooks prove only their own dispatchAttempt', async () => {
+    const h = createWatchdogWiring({ bareQuietMs: 3_000 });
+    const content = 'same durable payload';
+    const ledger = new WrittenInputLedger();
+    ledger.noteWritten('om_retry', content, 1);
+    ledger.noteWritten('om_retry', content, 2);
+    h.queue.mark('om_retry', makeFingerprint(content), 100, content, 2);
+    const sent: any[] = [];
+    Object.assign(h.scope, {
+      writtenInputs: ledger,
+      send: (msg: unknown) => { sent.push(msg); },
+      revokePromptReadiness: vi.fn(),
+      publishScreenStatus: vi.fn(),
+      inFlightKeepaliveFingerprints: new Map(),
+      isPromptReady: false,
+    });
+    const handler = loadWorkerMessageHandler('prompt_submitted', h.scope);
+
+    await handler({ type: 'prompt_submitted', fingerprint: fingerprintPromptText(content) });
+    expect((h.scope.openClaudeLifecycleTurn as () => unknown)()).toBeUndefined();
+
+    await handler({ type: 'prompt_submitted', fingerprint: fingerprintPromptText(content) });
+    expect((h.scope.openClaudeLifecycleTurn as () => { turnId: string; dispatchAttempt?: number } | undefined)())
+      .toMatchObject({ turnId: 'om_retry', dispatchAttempt: 2 });
+    expect(sent.filter(msg => msg.type === 'prompt_submitted_input')).toEqual([
+      { type: 'prompt_submitted_input', turnId: 'om_retry', dispatchAttempt: 1 },
+      { type: 'prompt_submitted_input', turnId: 'om_retry', dispatchAttempt: 2 },
+    ]);
     h.disarm();
   });
 

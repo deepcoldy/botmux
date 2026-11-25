@@ -46,7 +46,7 @@ import {ClaudePermissionNoticeTracker} from './services/claude-action-prompt.js'
 import { PromptSuggestionPublisher, promptSuggestionReportTurn, type FoldedTypeAheadTurn } from './utils/prompt-suggestion-publisher.js';
 import { CliRecapObserver } from './services/turn-recap.js';
 import { AwaySummaryFocus, awaySummaryFocusRefusal } from './services/away-summary-focus.js';
-import { WrittenInputLedger } from './services/prompt-submission-match.js';
+import { WrittenInputLedger, type WrittenInputIdentity } from './services/prompt-submission-match.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
@@ -11503,7 +11503,7 @@ function saveUnsentInputsForSuccessor(reason: string): void {
  *  continues, and a restored predecessor input is no longer outstanding. */
 function noteCliInputWritten(item: PendingCliInput): void {
   lastWrittenCliInput = item;
-  if (item.turnId) writtenInputs.noteWritten(item.turnId, item.content);
+  if (item.turnId) writtenInputs.noteWritten(item.turnId, item.content, item.dispatchAttempt);
   if (restoredUnsentInputs.delete(item) && restoredUnsentInputs.size === 0) {
     const unsentPath = unsentInputJournalPath();
     if (unsentPath) try { settleTakenUnsentInputs(unsentPath); } catch { /* next take reports it */ }
@@ -13371,10 +13371,12 @@ const claudeOpenTurnWatchdog = new ClaudeOpenTurnWatchdog({
 let claudeOpenTurnWatchdogTimer: ReturnType<typeof setInterval> | null = null;
 let claudeAwaitingMarkerSafetyTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeUserPromptSubmittedTurnId: string | undefined;
+let claudeUserPromptSubmittedDispatchAttempt: number | undefined;
 
 function clearSubmittedClaudeTurnIf(turnId: string | undefined): void {
   if (turnId === undefined || claudeUserPromptSubmittedTurnId === turnId) {
     claudeUserPromptSubmittedTurnId = undefined;
+    claudeUserPromptSubmittedDispatchAttempt = undefined;
   }
 }
 
@@ -13389,7 +13391,8 @@ function hasSubmittedUnstartedClaudeHead(head: BridgePendingTurn | undefined): b
     && !head.restoredFromJournal
     && !head.carriedAcrossGeneration
     && !!claudeUserPromptSubmittedTurnId
-    && claudeUserPromptSubmittedTurnId === head.turnId;
+    && claudeUserPromptSubmittedTurnId === head.turnId
+    && claudeUserPromptSubmittedDispatchAttempt === head.dispatchAttempt;
 }
 
 function openClaudeLifecycleTurn(): BridgePendingTurn | undefined {
@@ -13474,7 +13477,9 @@ function captureClaudeOpenTurnObservation(
     turnKey,
     durable: turn?.dispatchAttempt !== undefined,
     ...evidence,
-    userPromptSubmitObserved: !!turn && claudeUserPromptSubmittedTurnId === turn.turnId,
+    userPromptSubmitObserved: !!turn
+      && claudeUserPromptSubmittedTurnId === turn.turnId
+      && claudeUserPromptSubmittedDispatchAttempt === turn.dispatchAttempt,
     userStopRequested: claudeOpenTurnWatchdog.isUserStopRequestedFor(turnKey),
     ptyOutputGeneration: ptyOutputGeneration.snapshot(),
     screenRevision: backendScreenRevision,
@@ -43426,10 +43431,22 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           ...(fromKeepalive ? {} : { directSubmit: true }),
         });
       }
-      const submittedTurnId = writtenInputs.takeSubmitted(msg);
-      if (submittedTurnId) {
-        claudeUserPromptSubmittedTurnId = submittedTurnId;
-        send({ type: 'prompt_submitted_input', turnId: submittedTurnId });
+      const submitted: WrittenInputIdentity | undefined = typeof writtenInputs.takeSubmittedIdentity === 'function'
+        ? writtenInputs.takeSubmittedIdentity(msg)
+        : (() => {
+            // worker-function-harness fixtures written before attempt-aware
+            // receipts expose only the legacy string-returning method.
+            const turnId = writtenInputs.takeSubmitted(msg);
+            return turnId ? { turnId } : undefined;
+          })();
+      if (submitted) {
+        claudeUserPromptSubmittedTurnId = submitted.turnId;
+        claudeUserPromptSubmittedDispatchAttempt = submitted.dispatchAttempt;
+        send({
+          type: 'prompt_submitted_input',
+          turnId: submitted.turnId,
+          ...(submitted.dispatchAttempt !== undefined ? { dispatchAttempt: submitted.dispatchAttempt } : {}),
+        });
       }
       break;
     }
