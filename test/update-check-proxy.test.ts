@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { fetchConfiguredPackageArtifact, fetchLatestVersion } from '../src/core/update-check.js';
-import { getReleaseStream, proxyForUrl } from '../src/core/release-download.js';
+import { getReleaseStream, proxyForUrl, stripHostBrackets } from '../src/core/release-download.js';
 
 vi.mock('../src/global-config.js', () => ({ readGlobalConfig: () => ({}) }));
 const servers: Server[] = [];
@@ -42,6 +42,27 @@ async function listen(server: Server): Promise<string> {
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 }
+
+async function tryListenIpv6(server: Server): Promise<string | null> {
+  servers.push(server);
+  server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+  return await new Promise<string | null>(resolve => {
+    server.once('error', () => resolve(null));
+    server.listen(0, '::1', () => {
+      const addr = server.address();
+      resolve(addr && typeof addr === 'object' ? `http://[::1]:${addr.port}` : null);
+    });
+  });
+}
+
+const canBindIpv6 = await (async () => {
+  const probe = createServer();
+  const ok = await new Promise<boolean>(resolve => {
+    probe.once('error', () => resolve(false));
+    probe.listen(0, '::1', () => probe.close(() => resolve(true)));
+  });
+  return ok;
+})();
 
 describe('registry metadata proxy transport', () => {
   it.each(['NO_PROXY', 'no_proxy', 'config', 'env'])('routes metadata and tarball correctly with %s proxy settings', async (mode) => {
@@ -212,6 +233,57 @@ describe('registry metadata proxy transport', () => {
       signal: AbortSignal.timeout(200),
     })).rejects.toThrow();
     expect(connected).toBe(true);
+  });
+
+  it('strips WHATWG brackets from IPv6 proxy hostnames before dialing', () => {
+    expect(stripHostBrackets(new URL('http://[::1]:3128').hostname)).toBe('::1');
+    expect(stripHostBrackets(new URL('http://[2001:db8::1]:3128').hostname)).toBe('2001:db8::1');
+    expect(stripHostBrackets(new URL('http://proxy.invalid:3128').hostname)).toBe('proxy.invalid');
+    expect(stripHostBrackets(new URL('http://127.0.0.1:3128').hostname)).toBe('127.0.0.1');
+  });
+
+  it.skipIf(!canBindIpv6)('routes HTTP requests through a bracketed IPv6 proxy (with credentials)', async () => {
+    const seen: Array<{ url: string; auth?: string }> = [];
+    const proxy = await tryListenIpv6(createServer((req, res) => {
+      if (rejectStray(req, res, isAbsoluteHttpUrl)) return;
+      seen.push({ url: req.url!, auth: req.headers['proxy-authorization'] });
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ version: '3.59.32' }));
+    }));
+    expect(proxy).not.toBeNull();
+    const proxyWithAuth = proxy!.replace('http://', 'http://alice:s%40cret@');
+    vi.stubEnv('HTTPS_PROXY', proxyWithAuth);
+    await expect(fetchLatestVersion({ registry: 'http://registry.invalid/', timeoutMs: 2_000 }))
+      .resolves.toBe('3.59.32');
+    expect(seen).toEqual([{
+      url: 'http://registry.invalid/botmux/latest',
+      auth: `Basic ${Buffer.from('alice:s@cret').toString('base64')}`,
+    }]);
+  });
+
+  it.skipIf(!canBindIpv6)('opens HTTPS CONNECT tunnels through a bracketed IPv6 proxy', async () => {
+    const server = createServer();
+    const proxy = await tryListenIpv6(server);
+    expect(proxy).not.toBeNull();
+    const connects: Array<{ url?: string; host?: string; auth?: string }> = [];
+    server.on('connect', (req, socket) => {
+      connects.push({
+        url: req.url,
+        host: req.headers.host,
+        auth: req.headers['proxy-authorization'],
+      });
+      // Reject with 407/403 after proving the TCP dial and CONNECT request reached the IPv6 proxy.
+      socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
+    });
+    const proxyWithAuth = proxy!.replace('http://', 'http://bob:p%40ss@');
+    await expect(getReleaseStream('https://registry.invalid/botmux/latest', proxyWithAuth, 'botmux', 5, {
+      signal: AbortSignal.timeout(2_000),
+    })).rejects.toThrow('代理 CONNECT 失败: HTTP 403');
+    expect(connects).toEqual([{
+      url: 'registry.invalid:443',
+      host: 'registry.invalid:443',
+      auth: `Basic ${Buffer.from('bob:p@ss').toString('base64')}`,
+    }]);
   });
 });
 
