@@ -315,6 +315,11 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
     if (key === 'awaySummaryFocus') return INERT_AWAY_SUMMARY_FOCUS;
     if (key === 'backgroundTaskTracker') return INERT_BACKGROUND_TASK_TRACKER;
+    // Fold-background support added a thin observe wrapper called from several
+    // worker functions (fingerprint switch, rotation, drain paths). Tests that
+    // load those functions but do not exercise background-task bookkeeping get
+    // an inert no-op instead of an undefined call; a scope can still override it.
+    if (key === 'observeClaudeBackgroundTasks') return scope.observeClaudeBackgroundTasks ?? (() => {});
     if (key === 'awaySummaryFocusRefusal') return awaySummaryFocusRefusal;
     if (key === 'proofFromSubmitRecheckResult') return proofFromSubmitRecheckResult;
     if (key === 'recheckResultFromProof') return recheckResultFromProof;
