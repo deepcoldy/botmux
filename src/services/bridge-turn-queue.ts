@@ -31,6 +31,7 @@
 import {
   normaliseForFingerprint,
   normaliseTranscriptFingerprintCandidates,
+  isClaudeApiRequestBlob,
   isMeaningfulUserEvent,
   isMeaningfulQueuedCommand,
   isMidTurnAbsorbedQueuedCommand,
@@ -965,6 +966,7 @@ export class BridgeTurnQueue {
         this.observeCliQueueOperation(ev);
         continue;
       }
+      if (isClaudeApiRequestBlob(ev)) continue;
       const uuid = ev.uuid;
       if (!uuid || this.seen.has(uuid)) continue;
       this.seen.add(uuid);

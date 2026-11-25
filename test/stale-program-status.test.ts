@@ -211,4 +211,35 @@ describe('staleProgramStatusVerdict', () => {
     expect(staleProgramStatusVerdict(evidence({ heldWorking: false, backgroundTasksRunning: 2 }))).toBe('stop');
     expect(staleProgramStatusVerdict(evidence({ transcriptEndedForMs: undefined }))).toBe('stop');
   });
+
+  it('ignores api-request-blob records in ClaudeTranscriptTurnEnd and claudeTranscriptLatestTurnState', () => {
+    const tracker = new ClaudeTranscriptTurnEnd();
+    const base = 1_762_344_000_000;
+    tracker.observe([
+      { type: 'system', subtype: 'turn_duration', timestamp: new Date(base).toISOString() },
+    ], base);
+    expect(tracker.endedForMs(base + 5000)).toBe(5000);
+
+    // Trailing user/assistant api-request-blob must NOT reopen the closed turn
+    tracker.observe([
+      { type: 'api-request-blob', message: { role: 'user', content: 'copied prompt' } },
+      { type: 'api-request-blob', message: { role: 'assistant', content: [{ type: 'text', text: 'copied' }] } },
+    ], base + 6000);
+    expect(tracker.endedForMs(base + 10_000)).toBe(10_000);
+
+    // Same for file-tail inspection
+    const dir = mkdtempSync(join(tmpdir(), 'stale-blob-'));
+    try {
+      const file = join(dir, 'session.jsonl');
+      writeFileSync(file, [
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] } }),
+        JSON.stringify({ type: 'system', subtype: 'turn_duration' }),
+        JSON.stringify({ type: 'api-request-blob', message: { role: 'user', content: 'copied' } }),
+      ].join('\n') + '\n');
+      expect(claudeTranscriptLatestTurnState(file)).toBe('closed');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
+

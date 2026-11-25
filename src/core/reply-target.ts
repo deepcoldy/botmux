@@ -218,10 +218,13 @@ export function normalizeBackgroundTaskPins(turnIds: unknown): string[] | undefi
  *  task the current worker still reports as running. All three replyTargets
  *  writers prune through this set. */
 export function replyTargetPinnedTurnIds(
-  ds: Pick<DaemonSession, 'session' | 'backgroundTaskPinnedTurnIds'>,
+  ds: Pick<DaemonSession, 'session' | 'backgroundTaskPinnedTurnIds'> & {
+    managedTurnOrigin?: { turnId?: string };
+  },
 ): Set<string> {
   const pinned = cronPinnedTurnIds(ds.session.cronTaskReplyAnchors);
   for (const turnId of ds.backgroundTaskPinnedTurnIds ?? []) pinned.add(turnId);
+  if (ds.managedTurnOrigin?.turnId) pinned.add(ds.managedTurnOrigin.turnId);
   return pinned;
 }
 

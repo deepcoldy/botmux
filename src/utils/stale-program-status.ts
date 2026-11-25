@@ -10,7 +10,7 @@
  * itself has been silent, and the screen shows the idle prompt with no busy
  * marker. The screen is only the last check.
  */
-import { isClaudeTurnTerminalEvent, type TranscriptEvent } from '../services/claude-transcript.js';
+import { isClaudeApiRequestBlob, isClaudeTurnTerminalEvent, type TranscriptEvent } from '../services/claude-transcript.js';
 import { baselineJsonlCursor, scanJsonlBackward } from '../services/jsonl-cursor.js';
 
 /** How long the transcript must have been closed AND OSC silent. Claude writes
@@ -22,7 +22,7 @@ export const STALE_PROGRAM_STATUS_CHECK_MS = 15_000;
 /** Main-thread conversation records — anything else (metadata, snapshots,
  *  queue bookkeeping, sidechains) neither opens nor closes the turn. */
 function isMainThreadActivity(ev: TranscriptEvent): boolean {
-  if (!ev || (ev as { isSidechain?: unknown }).isSidechain === true) return false;
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as { isSidechain?: unknown }).isSidechain === true) return false;
   const role = ev.message?.role ?? ev.type;
   if (role === 'user' || role === 'assistant') return true;
   return ev.type === 'attachment' && ev.attachment?.type === 'queued_command';

@@ -35,7 +35,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import {
-  classifyClaudeTerminalEvent, eventTimeMs, type ClaudeTerminalOutcome, type TranscriptEvent,
+  classifyClaudeTerminalEvent, eventTimeMs, isClaudeApiRequestBlob, type ClaudeTerminalOutcome, type TranscriptEvent,
 } from './claude-transcript.js';
 
 /** How long the transcript path gets to settle the failed turn before the
@@ -252,7 +252,7 @@ export class ClaudeStopFailureTranscriptEvidence {
   /** Feed every batch of events the bridge read from `path`. */
   observe(events: readonly TranscriptEvent[], path: string): void {
     for (const ev of events) {
-      if (!ev || typeof ev !== 'object' || ev.isSidechain === true || ev.isApiErrorMessage !== true) continue;
+      if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isSidechain === true || ev.isApiErrorMessage !== true) continue;
       const role = ev.message?.role ?? ev.type;
       if (role !== 'assistant') continue;
       const atMs = eventTimeMs(ev);
