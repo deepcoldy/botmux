@@ -18,6 +18,9 @@ import { writeFakeDoubaoTui } from './helpers/fake-doubao-tui.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
 import { readBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
+import { SessionController } from '../src/core/session-controller.js';
+import { SessionContractStore } from '../src/services/session-contract-store.js';
+import type { DaemonSession } from '../src/core/types.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 let child: ChildProcess | undefined;
@@ -25,6 +28,7 @@ let root: string | undefined;
 let sessionName: string | undefined;
 let tmuxEnv: NodeJS.ProcessEnv | undefined;
 let tmuxRoot: string | undefined;
+let contractStore: SessionContractStore | undefined;
 const tmuxAvailable = (() => {
   try { execFileSync('tmux', ['-V'], { stdio: 'ignore' }); return true; } catch { return false; }
 })();
@@ -45,13 +49,15 @@ afterEach(async () => {
   tmuxEnv = undefined;
   if (tmuxRoot) rmSync(tmuxRoot, { recursive: true, force: true });
   tmuxRoot = undefined;
+  contractStore?.close();
+  contractStore = undefined;
   if (root) rmSync(root, { recursive: true, force: true });
   root = undefined;
 });
 
 const pause = (ms: number) => new Promise(done => setTimeout(done, ms));
 
-function startScenario() {
+function startScenario(options: { autoAck?: boolean } = {}) {
   root = mkdtempSync(join(tmpdir(), 'structured-missing-final-'));
   const dataDir = join(root, 'data');
   mkdirSync(dataDir);
@@ -76,6 +82,7 @@ function startScenario() {
     { env: tmuxEnv, timeout: 5_000 });
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
+  const runtime = { runtimeId: `runtime-${sessionId}`, epoch: 1 };
   child = spawnTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
@@ -85,23 +92,43 @@ function startScenario() {
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
+  const ackNotice = (msg: { turnId?: string; noticeId?: string }) => {
+    if (!msg.turnId || !msg.noticeId) throw new Error('notice ACK requires exact turn and notice IDs');
+    child?.send({ type: 'structured_turn_not_collected_ack', turnId: msg.turnId, noticeId: msg.noticeId });
+  };
   child.on('message', raw => {
     const msg = raw as WorkerToDaemon;
     messages.push(msg);
+    if (msg.type === 'runtime_binding_started') {
+      child?.send({ type: 'runtime_contract_reserved', bindingId: msg.bindingId, mayStart: true, runtime } satisfies DaemonToWorker);
+    } else if (msg.type === 'runtime_binding') {
+      child?.send({ type: 'runtime_contract_assigned', bindingId: msg.bindingId, runtime, mayExecute: true } satisfies DaemonToWorker);
+    }
+    if (options.autoAck === false) return;
     if (msg.type === 'user_notify' && msg.kind === 'structured_turn_not_collected' && msg.noticeId && msg.turnId) {
-      child?.send({ type: 'structured_turn_not_collected_ack', turnId: msg.turnId, noticeId: msg.noticeId });
+      ackNotice(msg);
     } else if (msg.type === 'turn_display_retired' && msg.noticeId) {
-      child?.send({ type: 'structured_turn_not_collected_ack', turnId: msg.turnId, noticeId: msg.noticeId });
+      ackNotice(msg);
     }
   });
   child.stdout?.on('data', data => logs.push(data.toString()));
   child.stderr?.on('data', data => logs.push(data.toString()));
   sessionName = TmuxBackend.sessionName(sessionId);
+  contractStore = new SessionContractStore(dataDir, 'app_doubao');
+  const daemon = {
+    larkAppId: 'app_doubao', chatId: 'oc_test',
+    session: { sessionId, status: 'active' },
+  } as DaemonSession;
+  const contractController = new SessionController(daemon, contractStore);
+  const sessionContract = contractController.bindWorker(1);
+  const restartAttemptId = contractController.prepareWorkerStart();
   child.send({
     type: 'init', sessionId, daemonBootId: 'structured-missing-final-boot', chatId: 'oc_test', chatType: 'group',
     rootMessageId: 'om_root', workingDir: dataDir, cliId: 'doubao', cliPathOverride: fakeCli,
     cliSessionId: nativeId, resume: true, backendType: 'tmux', launchShell: '/bin/bash',
     prompt: 'first pure-text question', turnId: 'om_turn_1', replyDelivery: 'transcript',
+    restartAttemptId, sessionContract,
+    sessionCommand: { version: 2, runtime, execution: contractController.admitInput('om_turn_1') },
     larkAppId: 'app_doubao', larkAppSecret: 'test-only', apiOnly: true, structuredNoticeAck: true,
   } satisfies DaemonToWorker);
 
@@ -121,30 +148,44 @@ function startScenario() {
     && msg.turnId === turnId && (msg as { kind?: string }).kind === 'structured_turn_not_collected');
   const sendMessage = (turnId: string, content: string) => child!.send({
     type: 'message', turnId, content,
+    sessionCommand: { version: 2, runtime, execution: contractController.admitInput(turnId) },
   } satisfies DaemonToWorker);
-  return { messages, logs, assignment, trajectory, waitUntil, control, clear, finals, notices, sendMessage, dataDir, sessionId };
+  return { messages, logs, assignment, trajectory, waitUntil, control, clear, finals, notices, sendMessage, ackNotice, dataDir, sessionId, runtime };
 }
 
 async function startFirstTurn(s: ReturnType<typeof startScenario>) {
   await s.waitUntil(() => s.messages.some(msg => msg.type === 'ready'), 'worker ready');
   await s.waitUntil(() => readFileSync(s.assignment, 'utf8').includes('first pure-text question'), 'first native input');
+  const readyBeforeFinish = s.messages.filter(msg => msg.type === 'prompt_ready').length;
   s.control('finish-1', 'VISIBLE_IN_THE_TERMINAL');
+  await s.waitUntil(() => s.messages.filter(msg => msg.type === 'prompt_ready').length > readyBeforeFinish,
+    'prompt_ready after the first native input');
 }
 
 describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('structured transcript missing final', () => {
-  it('ends an empty-trajectory wait with a Web-terminal notice, then delivers the next turn', async () => {
-    const s = startScenario();
+  it('retries an unacknowledged notice after 5s, clears it after ACK, then delivers the next turn', async () => {
+    const s = startScenario({ autoAck: false });
     await startFirstTurn(s);
     await s.waitUntil(() => s.notices('om_turn_1').length === 1, 'bounded missing-final notice', 45_000);
-    expect(s.notices('om_turn_1')[0]).toMatchObject({
+    const firstNotice = s.notices('om_turn_1')[0]!;
+    expect(firstNotice).toMatchObject({
       type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn_1',
     });
-    expect(typeof s.notices('om_turn_1')[0]?.message).toBe('string');
-    expect(s.notices('om_turn_1')[0]?.noticeId).toMatch(/^[a-f0-9]{32}$/);
+    expect(typeof firstNotice.message).toBe('string');
+    expect(firstNotice.noticeId).toMatch(/^[a-f0-9]{32}$/);
     const journal = join(s.dataDir, 'turn-marks', `${s.sessionId}.json.structured`);
+    await s.waitUntil(() => readBridgeTurnJournal(journal).some(entry =>
+      entry.pendingNotice?.noticeId === firstNotice.noticeId), 'durable notice awaits ACK');
+    await pause(1_000);
+    expect(s.notices('om_turn_1')).toHaveLength(1);
+    await s.waitUntil(() => s.notices('om_turn_1').length === 2, 'same notice retried after 5s without ACK', 10_000);
+    expect(s.notices('om_turn_1').map(msg => msg.noticeId)).toEqual([firstNotice.noticeId, firstNotice.noticeId]);
+    expect(readBridgeTurnJournal(journal)[0]?.pendingNotice?.noticeId).toBe(firstNotice.noticeId);
+
+    s.ackNotice(firstNotice);
     await s.waitUntil(() => !readBridgeTurnJournal(journal).some(entry => entry.pendingNotice), 'daemon ACK clears notice journal');
     await pause(5_500);
-    expect(s.notices('om_turn_1')).toHaveLength(1);
+    expect(s.notices('om_turn_1')).toHaveLength(2);
     expect(s.finals('om_turn_1')).toEqual([]);
 
     s.clear('no-trajectory');
@@ -159,7 +200,6 @@ describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('structured tran
   it('lets a late trajectory final win before the deadline without a warning or duplicate', async () => {
     const s = startScenario();
     await startFirstTurn(s);
-    await pause(3_000);
     s.clear('no-trajectory');
     appendFileSync(s.trajectory, JSON.stringify({ role: 'assistant', content: 'LATE_NATIVE_FINAL' }) + '\n');
     await s.waitUntil(() => s.finals('om_turn_1').length === 1, 'late native final');
@@ -206,8 +246,9 @@ describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('structured tran
   it('does not warn for a stopped turn, and the following turn still delivers', async () => {
     const s = startScenario();
     await startFirstTurn(s);
-    await pause(3_000);
-    child!.send({ type: 'interrupt_turn', requestId: 'stop-missing-final', turnId: 'om_turn_1' } satisfies DaemonToWorker);
+    child!.send({ type: 'interrupt_turn', requestId: 'stop-missing-final', turnId: 'om_turn_1',
+      sessionCommand: { version: 2, runtime: s.runtime },
+    } satisfies DaemonToWorker);
     await s.waitUntil(() => s.messages.some(msg => msg.type === 'turn_interrupt_result'
       && msg.requestId === 'stop-missing-final' && msg.delivered), 'exact stop acknowledged');
     // Cross the whole watchdog deadline while no new owner exists: the stopped

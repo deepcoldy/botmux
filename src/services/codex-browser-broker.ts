@@ -545,7 +545,12 @@ function defaultBundledPluginRoots(): string[] {
     '/Applications/ChatGPT.app/Contents/Resources',
     join(homedir(), 'Applications/Codex.app/Contents/Resources'),
     join(homedir(), 'Applications/ChatGPT.app/Contents/Resources'),
-  ].map(resources => join(resources, 'plugins', 'openai-bundled', 'plugins', 'chrome'));
+  ].flatMap(resources => {
+    const plugins = join(resources, 'plugins', 'openai-bundled', 'plugins');
+    // New desktop builds ship the service and its matching client in the
+    // shared browser bundle. The Chrome bundle may contain only a client.
+    return [join(plugins, 'chrome'), join(plugins, 'browser')];
+  });
 }
 
 function discoverPluginRoot(pluginCache: string, bundledRoots: readonly string[]): string {

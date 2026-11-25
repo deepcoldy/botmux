@@ -14,6 +14,8 @@ function fixture(overrides: Partial<StructuredNoticeDeliveryInput> = {}) {
     retireCard: vi.fn(async () => true),
     deliverPending: vi.fn(async () => {}),
     acknowledge: vi.fn(),
+    onEnqueued: vi.fn(),
+    onCardError: vi.fn(),
     ...overrides,
   };
   return { session, snapshots, input };
@@ -27,6 +29,7 @@ describe('durable structured notice delivery', () => {
     expect(input.retireCard).toHaveBeenCalledOnce();
     expect(input.deliverPending).not.toHaveBeenCalled();
     expect(input.acknowledge).toHaveBeenCalledOnce();
+    expect(input.onEnqueued).toHaveBeenCalledOnce();
     expect(session.turnNotices?.[0]).toMatchObject({
       turnId: 'om_turn', content: 'Open the Web terminal',
       delivery: { uuid: noticeId, state: 'delivered', attempts: 1 },
@@ -38,6 +41,7 @@ describe('durable structured notice delivery', () => {
     expect(input.retireCard).toHaveBeenCalledOnce();
     expect(input.deliverPending).not.toHaveBeenCalled();
     expect(input.acknowledge).toHaveBeenCalledTimes(2);
+    expect(input.onEnqueued).toHaveBeenCalledOnce();
     expect(session.turnNotices).toHaveLength(1);
   });
 
@@ -46,6 +50,7 @@ describe('durable structured notice delivery', () => {
     await deliverStructuredNotice(input);
     expect(input.deliverPending).toHaveBeenCalledWith(noticeId);
     expect(input.acknowledge).toHaveBeenCalledOnce();
+    expect(input.onEnqueued).toHaveBeenCalledOnce();
     expect(session.turnNotices?.[0]?.delivery.state).toBe('pending');
 
     const restarted = structuredClone(snapshots.at(-1)!);
@@ -60,7 +65,7 @@ describe('durable structured notice delivery', () => {
       }),
     });
     await deliverStructuredNotice(delivered.input);
-    expect(delivered.input.onEnqueued).toBeUndefined();
+    expect(delivered.input.onEnqueued).not.toHaveBeenCalled();
     expect(restarted.turnNotices).toHaveLength(1);
     expect(restarted.turnNotices?.[0]?.delivery).toMatchObject({ uuid: noticeId, state: 'delivered' });
     expect(delivered.input.acknowledge).toHaveBeenCalledOnce();
@@ -73,6 +78,7 @@ describe('durable structured notice delivery', () => {
     expect(input.retireCard).not.toHaveBeenCalled();
     expect(input.deliverPending).not.toHaveBeenCalled();
     expect(input.acknowledge).not.toHaveBeenCalled();
+    expect(input.onEnqueued).not.toHaveBeenCalled();
   });
 
   it('does not fall back to text when persisting a successful card result fails', async () => {
@@ -271,8 +277,26 @@ describe('durable structured notice delivery', () => {
     await deliverStructuredNotice(first.input);
     expect(first.input.deliverPending).not.toHaveBeenCalled();
     expect(first.input.acknowledge).not.toHaveBeenCalled();
+    expect(first.input.onCardError).not.toHaveBeenCalled();
     expect(first.session.turnNotices?.[0]).toMatchObject({ carrier: 'card' });
     expect(first.session.turnNotices?.[0]?.delivery.state).toBe('pending');
+  });
+
+  it.each(['silent', 'pending'] as const)('withholds error handling and settlement when ownership is lost during a %s card failure', async kind => {
+    let owned = true;
+    const error = kind === 'pending' ? new StructuredNoticeCardPendingError() : new Error('silent PATCH failed');
+    const first = fixture({
+      owns: () => owned,
+      allowTextFallback: kind === 'silent' ? false : undefined,
+      retireCard: vi.fn(async () => { owned = false; throw error; }),
+    });
+    await expect(deliverStructuredNotice(first.input)).resolves.toBeUndefined();
+    expect(first.input.onCardError).not.toHaveBeenCalled();
+    expect(first.input.deliverPending).not.toHaveBeenCalled();
+    expect(first.input.acknowledge).not.toHaveBeenCalled();
+    expect(first.session.turnNotices?.[0]).toMatchObject({
+      carrier: kind === 'silent' ? 'silent' : 'card', delivery: { state: 'pending' },
+    });
   });
 
   it('rolls back an in-memory carrier transition when its durable write fails', async () => {

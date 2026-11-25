@@ -81,6 +81,7 @@ import { cliAuthBind, loadDashboardSecret, verifyHmac } from '../dashboard/auth.
 import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
 import { DISPATCH_LAUNCH_IPC_ROUTE_PREFIX } from './dispatch-launch-ipc-auth.js';
+import { COLLAB_IPC_ROUTE_PREFIX } from './collab-preflight-ipc.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
 import { WORKFLOW_NODE_REPORT_ROUTE } from './workflow-node-report.js';
@@ -1329,6 +1330,13 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
     const action = dispatchMatch[2];
     if ((method === 'GET' && action === undefined)
         || (method === 'POST' && action !== undefined)) return true;
+  }
+  // collab.preflight 与 dispatch-launch 同源：自带全 envelope HMAC，handler 认证。
+  if (method === 'POST' && pathname.match(new RegExp(`^${COLLAB_IPC_ROUTE_PREFIX}/[0-9a-f]{64}/preflight$`))) return true;
+  // collab.kickoff：prepare/start/cancel（POST）+ query（GET）。
+  if (pathname.match(new RegExp(`^${COLLAB_IPC_ROUTE_PREFIX}/[0-9a-f]{64}/kickoff/[0-9a-f]{64}(?:/(prepare|start|cancel))?$`))) {
+    const action = pathname.match(/[0-9a-f]{64}\/(prepare|start|cancel)$/)?.[1];
+    if ((method === 'GET' && action === undefined) || (method === 'POST' && action !== undefined)) return true;
   }
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/lark-tool-identity$/.test(pathname)) return true;
   // The receiver action endpoint performs its own rotating worker-capability
@@ -11573,6 +11581,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     // disables the toggle wherever the worker would fail-close on it.
     readIsolationSupported: readIsolationEnforceable(cachedLarkAppId),
     backendType: backendTypeStore.getBotBackendType(cachedLarkAppId) ?? null,
+    hcHerdrTabs: getBot(cachedLarkAppId).config.hcHerdrTabs === true,
     // 没有覆盖时会话实际用的后端（BACKEND_TYPE / 自动探测）。Dashboard 判断零注入等
     // 依赖后端的能力时按「覆盖值，否则这个默认值」算生效后端。
     defaultBackendType: config.daemon.backendType,
@@ -13958,6 +13967,11 @@ botConfigPutRoute<{ herdr?: unknown }>('/api/bot-herdr', 'herdr', {
     return fieldOk(coerced.value);
   },
   respond: value => ({ ok: true, herdr: value ? JSON.stringify(value, null, 2) : '' }),
+});
+
+botConfigPutRoute<{ enabled?: unknown }>('/api/bot-hc-herdr-tabs', 'hcHerdrTabs', {
+  normalize: body => typeof body?.enabled === 'boolean' ? fieldOk(body.enabled) : fieldInvalid('invalid_boolean'),
+  respond: value => ({ ok: true, hcHerdrTabs: value === true }),
 });
 
 // Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:

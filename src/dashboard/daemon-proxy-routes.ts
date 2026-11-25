@@ -160,6 +160,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('read-isolation'),
   // backend-type：`{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'zmx'|'hc'|'' }`（''/'auto' 清除覆盖）。
   putBotConfig('backend-type'),
+  putBotConfig('hc-herdr-tabs'),
   // card-prefs：任意子集的 per-bot 行为布尔 / prompt 字符串。
   putBotConfig('card-prefs'),
   // quota-fallback-chain：`{ enabled, kinds, steps: [{ cliId, model? }] }`，同 Bot 额度耗尽切换 CLI / 模型。

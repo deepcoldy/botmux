@@ -34,7 +34,7 @@ import { logger } from '../utils/logger.js';
 
 export const grantStateDbPath = (dataDir: string): string => join(dataDir, 'grants.sqlite');
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 type Fail = { ok: false; reason: string };
 
@@ -92,6 +92,20 @@ export class SqliteGrantStateStore {
           PRIMARY KEY (app_id, receipt_id)
         ) WITHOUT ROWID;
       `);
+      // 协作 creator 准入回执（adm_ 前缀）额外携带 provenance 字段。旧库只有 4 列，
+      // 用 ALTER TABLE 补列（幂等，列已存在则忽略），不破坏既有派发回执行。
+      {
+        const cols = new Set(
+          (db.prepare('PRAGMA table_info(grant_dispatch_receipts)').all() as Array<{ name: string }>)
+            .map(r => r.name),
+        );
+        const addCol = (name: string, ddl: string) => {
+          if (!cols.has(name)) db.exec(`ALTER TABLE grant_dispatch_receipts ADD COLUMN ${ddl};`);
+        };
+        addCol('quota_used', 'quota_used INTEGER NOT NULL DEFAULT 0');
+        addCol('reason', 'reason TEXT');
+        addCol('quota_key', 'quota_key TEXT');
+      }
       if (version < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       db.exec('COMMIT;');
       return new SqliteGrantStateStore(db);
@@ -175,15 +189,24 @@ export class SqliteGrantStateStore {
         return true;
       },
       receiptGet: id => {
-        const row = this.stmt('SELECT allow, charged_at FROM grant_dispatch_receipts WHERE app_id = ? AND receipt_id = ?')
-          .get(appId, id) as { allow: unknown; charged_at: unknown } | null | undefined;
-        return row ? { allow: Number(row.allow) === 1, chargedAt: String(row.charged_at) } : undefined;
+        const row = this.stmt('SELECT allow, charged_at, quota_used, reason, quota_key FROM grant_dispatch_receipts WHERE app_id = ? AND receipt_id = ?')
+          .get(appId, id) as { allow: unknown; charged_at: unknown; quota_used: unknown; reason: unknown; quota_key: unknown } | null | undefined;
+        if (!row) return undefined;
+        return {
+          allow: Number(row.allow) === 1,
+          chargedAt: String(row.charged_at),
+          ...(Number(row.quota_used) > 0 ? { used: Number(row.quota_used) } : {}),
+          ...(typeof row.reason === 'string' && row.reason ? { reason: row.reason } : {}),
+          ...(typeof row.quota_key === 'string' && row.quota_key ? { quotaKey: row.quota_key } : {}),
+        };
       },
       receiptSet: (id, rec) => {
         this.run(
-          `INSERT INTO grant_dispatch_receipts (app_id, receipt_id, allow, charged_at) VALUES (?, ?, ?, ?)
-           ON CONFLICT (app_id, receipt_id) DO UPDATE SET allow = excluded.allow, charged_at = excluded.charged_at`,
-          appId, id, rec.allow ? 1 : 0, rec.chargedAt,
+          `INSERT INTO grant_dispatch_receipts (app_id, receipt_id, allow, charged_at, quota_used, reason, quota_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (app_id, receipt_id) DO UPDATE SET allow = excluded.allow, charged_at = excluded.charged_at,
+             quota_used = excluded.quota_used, reason = excluded.reason, quota_key = excluded.quota_key`,
+          appId, id, rec.allow ? 1 : 0, rec.chargedAt, rec.used ?? 0, rec.reason ?? null, rec.quotaKey ?? null,
         );
       },
     };
@@ -213,11 +236,19 @@ export class SqliteGrantStateStore {
     if (expiryRows.length > 0) {
       out.grantExpiryState = Object.fromEntries(expiryRows.map(row => [row.grant_key, { expiresAt: Number(row.expires_at) }]));
     }
-    const receiptRows = this.stmt('SELECT receipt_id, allow, charged_at FROM grant_dispatch_receipts WHERE app_id = ? ORDER BY 1')
-      .all(appId) as Array<{ receipt_id: string; allow: unknown; charged_at: unknown }>;
+    const receiptRows = this.stmt('SELECT receipt_id, allow, charged_at, quota_used, reason, quota_key FROM grant_dispatch_receipts WHERE app_id = ? ORDER BY 1')
+      .all(appId) as Array<{ receipt_id: string; allow: unknown; charged_at: unknown; quota_used: unknown; reason: unknown; quota_key: unknown }>;
     if (receiptRows.length > 0) {
-      out.dispatchLaunchQuotaReceipts = Object.fromEntries(receiptRows.map(row =>
-        [row.receipt_id, { allow: Number(row.allow) === 1, chargedAt: String(row.charged_at) } satisfies DispatchReceipt]));
+      out.dispatchLaunchQuotaReceipts = Object.fromEntries(receiptRows.map(row => [
+        row.receipt_id,
+        {
+          allow: Number(row.allow) === 1,
+          chargedAt: String(row.charged_at),
+          ...(Number(row.quota_used) > 0 ? { used: Number(row.quota_used) } : {}),
+          ...(typeof row.reason === 'string' && row.reason ? { reason: row.reason } : {}),
+          ...(typeof row.quota_key === 'string' && row.quota_key ? { quotaKey: row.quota_key } : {}),
+        } satisfies DispatchReceipt,
+      ]));
     }
     return out;
   }
@@ -249,8 +280,8 @@ export class SqliteGrantStateStore {
       }
       for (const [id, rec] of Object.entries(fields.dispatchLaunchQuotaReceipts ?? {})) {
         if (this.run(
-          'INSERT OR IGNORE INTO grant_dispatch_receipts (app_id, receipt_id, allow, charged_at) VALUES (?, ?, ?, ?)',
-          appId, id, rec.allow ? 1 : 0, rec.chargedAt,
+          'INSERT OR IGNORE INTO grant_dispatch_receipts (app_id, receipt_id, allow, charged_at, quota_used, reason, quota_key) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          appId, id, rec.allow ? 1 : 0, rec.chargedAt, rec.used ?? 0, rec.reason ?? null, rec.quotaKey ?? null,
         )) added++;
       }
       this.db.exec('COMMIT;');

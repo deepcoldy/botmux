@@ -414,6 +414,13 @@ describe('contract gateway and real worker boundaries', () => {
     const wire = scope.run(binding, () => metadata({ type: 'user_notify', kind: 'structured_turn_not_collected',
       turnId: 'om_turn', noticeId: 'a'.repeat(32), message: 'warning' }));
     expect(s.controller.ingest({ ...wire, noticeId: undefined }, s.worker)).toMatchObject({ kind: 'reject' });
+    for (const invalid of [
+      { kind: 'other_notice' }, { kind: '' }, { kind: undefined },
+      { turnId: undefined }, { turnId: '' },
+    ]) {
+      const lookalike = { ...wire, ...invalid };
+      expect(s.controller.ingest(lookalike, s.worker)).toMatchObject({ kind: 'reject' });
+    }
     const forged = structuredClone(wire);
     forged.sessionContract.scope.execution.executionId = 'missing-execution';
     expect(s.controller.ingest(forged, s.worker)).toMatchObject({ kind: 'reject', reason: 'execution_scope_unproven' });

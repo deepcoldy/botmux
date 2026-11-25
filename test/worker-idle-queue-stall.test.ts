@@ -285,3 +285,40 @@ describe('interactive selection preserves queue boundaries', () => {
     expect(h.pendingMessages).toEqual(before);
   });
 });
+
+
+describe('adopt refork initial continuation waits for the actual pane', () => {
+  it.each(['codex', 'claude-code'])('does not treat a reserved %s init turn as an idle pane', async cli => {
+    const h = harness(cli);
+    const trustedCaller = {
+      requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'app', senderType: 'bot' as const,
+      taskContinuation: {
+        appId: 'app', openId: 'ou_source', sourceSessionId: 'source', sourceTurnId: 'om_source',
+      },
+    };
+    // Adopt init reserves B in the replacement worker even while the external
+    // pane is still running A. Authority matches B, but is not readiness proof.
+    const item = { content: 'continuation B', turnId: 'om_reply_b', trustedCaller };
+    h.activeTurnAuthority.clear();
+    expect(h.activeTurnAuthority.reserve({ turnId: item.turnId, caller: trustedCaller })).toBe(true);
+    h.lastInitConfig = { cliId: cli, adoptMode: true };
+    h.pendingMessages = [item];
+    h.isPromptReady = false;
+    h.freshnessInputQueue = { takeNormal: vi.fn(() => {
+      h.pendingMessages.shift();
+      return undefined;
+    }) };
+    expect(h.activeTurnBlocks(item)).toBe(false);
+
+    await h.flushPending();
+    expect(h.freshnessInputQueue.takeNormal).not.toHaveBeenCalled();
+    expect(h.beginCliWriteCycle).not.toHaveBeenCalled();
+    expect(h.pendingMessages).toEqual([item]);
+
+    // The same item remains recoverable and drains once the real pane is idle.
+    h.isPromptReady = true;
+    await h.flushPending();
+    expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+    expect(h.pendingMessages).toEqual([]);
+  });
+});
