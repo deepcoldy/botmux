@@ -72,6 +72,27 @@ export async function assistantGroupIsMultiUser(
   return (await getGroupStats(larkAppId, chatId, { requireFresh: true })).userCount !== 1;
 }
 
+/**
+ * 单人群里发消息的真人不是登记的主人 ⇒ 主人已不在群里（多半是主动退群：那个事件不推给我们）。
+ * 返回该主人的 open_id，调用方按「主人退群」处理（标记离开、停会话、提示认领），之后这个群
+ * 不再用主人的目录服务别人。只在 tryHandleAssistantMultiUserGroup 放行（恰好 1 个真人）之后调用。
+ */
+export function assistantSoloGroupAbsentOwner(
+  larkAppId: string,
+  message: any,
+  senderOpenId: string | undefined,
+  senderIsBot: boolean,
+): string | undefined {
+  const chatId: string | undefined = message?.chat_id;
+  if (message?.chat_type === 'p2p' || !chatId || senderIsBot || !senderOpenId || !assistantMultiUserGroupsOff(larkAppId)) return undefined;
+  const owner = resolveAssistantOwnerOpenId({
+    chatType: 'group',
+    sessionGroupOwnerOpenId: getSessionGroup(chatId)?.ownerOpenId,
+    stored: getAssistantOwner(config.session.dataDir, larkAppId, chatId),
+  });
+  return owner && owner !== senderOpenId ? owner : undefined;
+}
+
 /** 测试用：清空限频记录。 */
 export function resetAssistantMultiUserNoticesForTest(): void {
   multiUserNoticeAt.clear();

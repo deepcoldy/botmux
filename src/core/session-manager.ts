@@ -4908,7 +4908,7 @@ export async function executeScheduledTask(
   const larkClient = await import('../im/lark/client.js');
   const { getChatMode, sendMessage, replyMessage } = larkClient;
 
-  // 个人助理模式不允许多人群：投到真人 ≥2 的群的任务在发任何东西之前就拒掉。任务上的 chatType
+  // 个人助理模式不允许多人群：投到真人 ≥2 的群、或唯一的人不是主人的群的任务，在发任何东西之前就拒掉。任务上的 chatType
   // 是建任务时来源会话的类型：投回建任务那个私聊的任务可信，其余现查；查不到按多人群拒。
   if (assistantMultiUserGroupsOff(larkAppId)
     && !(task.chatType === 'p2p' && (task.creatorChatId === undefined || task.creatorChatId === task.chatId))) {
@@ -4916,9 +4916,14 @@ export async function executeScheduledTask(
     try {
       const facts = await larkClient.getChatRoutingFacts(larkAppId, task.chatId);
       multiUser = facts.mode !== 'p2p' && (await larkClient.getChatInfo(larkAppId, task.chatId)).userCount !== 1;
+      // 单人群里那个人得是主人：主人不在群里（主动退群不推事件）时，不能用主人的目录给别人跑。
+      if (!multiUser && facts.mode !== 'p2p') {
+        const spawn = resolveAssistantSpawn(larkAppId, task.chatId, 'group', undefined);
+        if (spawn.kind === 'owner') multiUser = !(await larkClient.listChatMemberOpenIds(larkAppId, task.chatId)).includes(spawn.openId);
+      }
     } catch { /* 查不到 → 按多人群拒 */ }
     if (multiUser) {
-      logger.warn(`[scheduler] refusing to fire ${task.id}: assistant mode does not serve multi-user group ${task.chatId}`);
+      logger.warn(`[scheduler] refusing to fire ${task.id}: assistant mode serves only a group whose one person is its owner (${task.chatId})`);
       throw new Error(`assistant mode: multi-user groups are not allowed; scheduled run to ${task.chatId} refused`);
     }
   }

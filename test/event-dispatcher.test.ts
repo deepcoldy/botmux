@@ -303,6 +303,7 @@ vi.mock('../src/im/lark/transport/resilient-ws-client.js', () => ({
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
 import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetListenerCircuitsForTest, __setListenerClockForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, getGroupStats, isBotMentioned, learnSameOwnerSiblingCrossRef, maybeApplyForceTopicOverride, mentionsAnotherInChatMember, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, updateBotOpenIdCrossRef, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import { resetAssistantMultiUserNoticesForTest } from '../src/im/lark/assistant-command.js';
+import { setAssistantOwner } from '../src/services/assistant-owner-store.js';
 import { writeGroupCollaborationMode } from '../src/services/group-collaboration-mode-store.js';
 import { __resetSubtopicHandoffCacheForTest, findLiveMentionlessSubtopicOwner, ORCHESTRATE_DISPATCH_STORE_FILE, resolveManagedSubtopicMentionlessHandoff, type SubtopicMentionlessHandoff, type SubtopicSessionSnapshot } from '../src/services/subtopic-mentionless-handoff.js';
 import { PROJECT_GROUP_STORE_FILE } from '../src/services/project-group-store.js';
@@ -18218,11 +18219,11 @@ describe('in-chat @ membership check is only paid when its answer matters (comma
 
 describe('assistant mode without multi-user groups (assistantGroupChat off)', () => {
   let handlers: ReturnType<typeof makeHandlers>;
-  const groupMessage = (id: string) => makeUserMessageEvent({
-    senderOpenId: USER_OPEN_ID,
+  const groupMessage = (id: string, chatId = 'chat-assistant-multi', senderOpenId = USER_OPEN_ID) => makeUserMessageEvent({
+    senderOpenId,
     content: JSON.stringify({ text: '@Bot hello' }),
     messageId: id,
-    chatId: 'chat-assistant-multi',
+    chatId,
     chatType: 'group',
     mentions: [{ key: '@_bot', name: 'Bot', id: { open_id: MY_OPEN_ID } }],
   });
@@ -18263,6 +18264,32 @@ describe('assistant mode without multi-user groups (assistantGroupChat off)', ()
     await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-on-1'));
     await flushEventWork();
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('treats the owner as gone when someone else is the only person in the group', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX + 'assistant-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      const owner = 'ou_' + 'a'.repeat(32);
+      const other = 'ou_' + 'b'.repeat(32);
+      setAssistantOwner(dataDir, MY_APP_ID, 'oc_assistant_absent', owner, 'claimed');
+      const handleChatMemberUserDeleted = vi.fn(async () => {});
+      Object.assign(handlers, { handleChatMemberUserDeleted });
+      mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+      await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-absent-1', 'oc_assistant_absent', other));
+      await flushEventWork();
+      expect(handleChatMemberUserDeleted).toHaveBeenCalledWith('oc_assistant_absent', [owner], MY_APP_ID);
+
+      handleChatMemberUserDeleted.mockClear();
+      setAssistantOwner(dataDir, MY_APP_ID, 'oc_assistant_absent', other, 'claimed');
+      await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-absent-2', 'oc_assistant_absent', other));
+      await flushEventWork();
+      expect(handleChatMemberUserDeleted).not.toHaveBeenCalled();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it('does nothing when added to a group with two people, and joins a one-person group normally', async () => {

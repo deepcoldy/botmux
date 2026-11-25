@@ -73,6 +73,16 @@ const getChatModeMock = vi.fn(async () => 'group');
 const getMessageThreadIdMock = vi.fn(async () => 'omt_target_thread');
 const getChatRoutingFactsMock = vi.fn(async () => ({ external: false, mode: 'group' as 'group' | 'p2p' }));
 const getChatInfoMock = vi.fn(async () => ({ userCount: 2, botCount: 1 }));
+const listChatMemberOpenIdsMock = vi.fn(async (): Promise<string[]> => []);
+const spawnOverride: { value?: unknown } = {};
+vi.mock('../src/core/assistant-spawn.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/assistant-spawn.js')>();
+  return {
+    ...actual,
+    resolveAssistantSpawn: (...a: Parameters<typeof actual.resolveAssistantSpawn>) =>
+      (spawnOverride.value ?? actual.resolveAssistantSpawn(...a)),
+  };
+});
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: (...a: any[]) => sendMessageMock(...a),
   replyMessage: (...a: any[]) => replyMessageMock(...a),
@@ -80,6 +90,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   getMessageThreadId: (...a: any[]) => getMessageThreadIdMock(...a),
   getChatRoutingFacts: (...a: any[]) => getChatRoutingFactsMock(...a),
   getChatInfo: (...a: any[]) => getChatInfoMock(...a),
+  listChatMemberOpenIds: (...a: any[]) => listChatMemberOpenIdsMock(...a),
   downloadMessageResource: vi.fn(),
   listChatBotMembers: vi.fn(async () => []),
   listCurrentChatBotMembers: vi.fn(async () => []),
@@ -2013,7 +2024,7 @@ describe('assistant mode without multi-user groups (assistantGroupChat off)', ()
     getChatInfoMock.mockReset();
     getChatInfoMock.mockResolvedValue({ userCount: 2, botCount: 1 });
   });
-  afterEach(() => { delete cfg.assistantMode; delete cfg.assistantGroupChat; });
+  afterEach(() => { delete cfg.assistantMode; delete cfg.assistantGroupChat; delete spawnOverride.value; });
   const REFUSED = /multi-user groups are not allowed/;
 
   it('refuses a run into a group with two people before posting anything', async () => {
@@ -2039,6 +2050,18 @@ describe('assistant mode without multi-user groups (assistantGroupChat off)', ()
     getChatInfoMock.mockResolvedValue({ userCount: 1, botCount: 2 });
     await executeScheduledTask(baseTask({}), new Map(), refreshCliVersion).catch((e: Error) => expect(e.message).not.toMatch(REFUSED));
     expect(getChatInfoMock).toHaveBeenCalledOnce();
+  });
+
+  it('refuses a one-person group whose person is not the owner, and runs when the owner is that person', async () => {
+    getChatInfoMock.mockResolvedValue({ userCount: 1, botCount: 1 });
+    spawnOverride.value = { kind: 'owner', openId: 'ou_owner', workDir: '/tmp' };
+    listChatMemberOpenIdsMock.mockResolvedValue(['ou_someone_else']);
+    await expect(executeScheduledTask(baseTask({}), new Map(), refreshCliVersion)).rejects.toThrow(REFUSED);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    listChatMemberOpenIdsMock.mockResolvedValue(['ou_owner']);
+    await executeScheduledTask(baseTask({ id: 'task0003' }), new Map(), refreshCliVersion)
+      .catch((e: Error) => expect(e.message).not.toMatch(REFUSED));
+    expect(listChatMemberOpenIdsMock).toHaveBeenCalledTimes(2);
   });
 
   it('a cross-chat task labelled p2p is looked up: a real DM passes, without counting members', async () => {

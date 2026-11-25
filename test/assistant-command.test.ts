@@ -65,8 +65,8 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { resetAssistantMultiUserNoticesForTest, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from '../src/im/lark/assistant-command.js';
-import { getAssistantOwner } from '../src/services/assistant-owner-store.js';
+import { assistantSoloGroupAbsentOwner, resetAssistantMultiUserNoticesForTest, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from '../src/im/lark/assistant-command.js';
+import { getAssistantOwner, setAssistantOwner } from '../src/services/assistant-owner-store.js';
 
 const APP = 'cli_a1b2c3d4e5f60718';
 const ALICE = 'ou_' + 'a'.repeat(32);
@@ -288,5 +288,32 @@ describe('assistantGroupChat off: multi-user group gate', () => {
     expect(await gate(msg('hi'))).toBe(false);
     expect(mockGetGroupStats).not.toHaveBeenCalled();
     expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('assistantGroupChat off: a one-person group whose person is not the owner', () => {
+  const absent = (sender: string | undefined, opts: { bot?: boolean; chatType?: 'group' | 'p2p' } = {}) =>
+    assistantSoloGroupAbsentOwner(APP, msg('hi', { chatType: opts.chatType }), sender, opts.bot ?? false);
+  beforeEach(() => { assistantGroupChat = false; });
+
+  it('names the recorded owner when someone else is the only person left', () => {
+    setAssistantOwner(dataDir, APP, CHAT, ALICE, 'claimed');
+    expect(absent(BOB)).toBe(ALICE);
+  });
+
+  it('a session group owner counts as the recorded owner', () => {
+    sessionGroupOwner = ALICE;
+    expect(absent(BOB)).toBe(ALICE);
+  });
+
+  it('says nothing for the owner, unclaimed groups, bots, DMs or when multi-user groups are allowed', () => {
+    expect(absent(BOB)).toBeUndefined();
+    setAssistantOwner(dataDir, APP, CHAT, ALICE, 'claimed');
+    expect(absent(ALICE)).toBeUndefined();
+    expect(absent(BOB, { bot: true })).toBeUndefined();
+    expect(absent(undefined)).toBeUndefined();
+    expect(absent(BOB, { chatType: 'p2p' })).toBeUndefined();
+    assistantGroupChat = true;
+    expect(absent(BOB)).toBeUndefined();
   });
 });

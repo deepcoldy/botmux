@@ -72,7 +72,7 @@ import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSecretaryCommand } from './secretary-command.js';
 import { observeGroupSecretaryMessage } from '../../services/group-secretary-runtime.js';
-import { assistantGroupIsMultiUser, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from './assistant-command.js';
+import { assistantGroupIsMultiUser, assistantSoloGroupAbsentOwner, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from './assistant-command.js';
 import { assistantMultiUserGroupsOff } from '../../core/assistant-spawn.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { resolveSubstituteAppMentions, substituteMentionIdentities } from './substitute-app-mentions.js';
@@ -6085,8 +6085,14 @@ export function createLarkEventDispatcherRuntime(
       // 个人助理模式且不允许多人群：真人 ≥2 的群里什么都不做（不旁听、不路由、不认领），被真人 @ 时回一句。
       if (chatType === 'group') {
         const st = sender?.sender_type;
-        if (await tryHandleAssistantMultiUserGroup(larkAppId, message,
-          sender?.sender_id?.open_id, st === 'app' || st === 'bot')) return;
+        const senderIsBot = st === 'app' || st === 'bot';
+        if (await tryHandleAssistantMultiUserGroup(larkAppId, message, sender?.sender_id?.open_id, senderIsBot)) return;
+        // 单人群里说话的不是主人：主人已不在群里，按主人退群处理，之后这条消息按未认领的群走。
+        const absentOwner = assistantSoloGroupAbsentOwner(larkAppId, message, sender?.sender_id?.open_id, senderIsBot);
+        if (absentOwner) {
+          logger.info(`[assistant-mode:${larkAppId}] owner ${absentOwner.slice(0, 12)}… is not in solo group ${chatId.substring(0, 12)}; treating as left`);
+          await handlers.handleChatMemberUserDeleted?.(chatId, [absentOwner], larkAppId);
+        }
       }
 
       // 群聊上下文共享：静默旁听写入（group-context-ingest），放在任何 sender 分支 /
