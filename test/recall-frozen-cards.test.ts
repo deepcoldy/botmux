@@ -20,6 +20,7 @@ import { dirname, join } from 'node:path';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
 import { activeSessionKey, sessionAnchorId, sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
+import { config } from '../src/config.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
@@ -222,7 +223,11 @@ function activate(ds: DaemonSession): void {
   setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
 }
 
+let replyCardTestDir: string;
+
 beforeEach(() => {
+  replyCardTestDir = mkdtempSync(join(tmpdir(), 'recall-reply-cards-'));
+  config.session.dataDir = replyCardTestDir;
   deleteMessageMock.mockClear();
   updateMessageMock.mockReset();
   updateMessageMock.mockResolvedValue(undefined);
@@ -251,6 +256,7 @@ afterEach(() => {
   setActiveSessionsRegistry(undefined as any);
   vi.useRealTimers();
   vi.unstubAllEnvs();
+  rmSync(replyCardTestDir, { recursive: true, force: true });
 });
 
 function flush(): Promise<void> {
@@ -967,6 +973,35 @@ describe('postTurnStartingCard', () => {
     expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
     expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_first');
     expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'refresh' });
+  });
+
+  it.each(['doubao', 'claude-code'])('holds the cold %s native thinking placeholder until its exact capture identity arrives', async cliId => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({ config: {
+      larkAppId: APP_ID, cliId, disableStreamingCard: true,
+      replyCardMode: 'unified', replyCardNativeCot: true, apiOnly: false,
+    } } as any);
+    const ds = makeDs();
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_first';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_placeholder');
+
+    await postTurnStartingCard(ds, sessionReply, 'om_first');
+    expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
+
+    ds.workerGeneration = 1;
+    ds.captureIdentity = { workerGeneration: 1, revision: 1,
+      turnId: 'om_other', dispatchAttempt: 1 };
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
+    expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
+
+    ds.captureIdentity = { ...ds.captureIdentity, revision: 2, turnId: 'om_first' };
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(true);
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_first');
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
   });
 
   it('isolates frozen-card cleanup when one chat session moves A to B to A', async () => {

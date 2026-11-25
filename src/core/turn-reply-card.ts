@@ -134,6 +134,14 @@ export function replyCardDispatchAttempt(ds: DaemonSession, turnId: string): num
   return ds.lastThinkingUpdate?.turnId === turnId ? ds.lastThinkingUpdate.dispatchAttempt : undefined;
 }
 
+/** Frozen native admission still needs a publisher before its first POST. */
+export function replyCardAwaitsNativeThinking(ds: DaemonSession, turnId: string): boolean {
+  const store = new TurnReplyCardStore(config.session.dataDir);
+  const record = store.read(replyCardKey(ds, turnId, replyCardDispatchAttempt(ds, turnId)))
+    ?? store.read(replyCardKey(ds, turnId));
+  return record?.nativeCot === true && !record.nativeCotReady;
+}
+
 /** Resolves whether the native thinking display is live for this turn. Only a
  * live display may take over passive progress from the answer card. */
 export async function prepareReplyCardNativeThinking(ds: DaemonSession, turnId: string, dispatchAttempt?: number, owns?: () => boolean): Promise<boolean> {

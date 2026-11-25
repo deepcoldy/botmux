@@ -237,7 +237,7 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
-import { retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
+import { retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, replyCardAwaitsNativeThinking, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
@@ -5939,12 +5939,14 @@ export function streamingCardTurnQueued(ds: DaemonSession, turnId?: string): boo
 const deferredUnifiedReplyTurns = new WeakMap<DaemonSession, Set<string>>();
 
 /** Unified-reply placeholder waits while another turn still owns the terminal.
- * No capture identity (fresh session) and an identity that already names this
- * turn both post immediately. Do not reuse {@link streamingCardTurnQueued}:
+ * Native thinking also waits for a cold turn's first capture identity: an
+ * unbound publisher would retire its newly-created bubble during startup.
+ * Other fresh placeholders still post immediately. Do not reuse {@link streamingCardTurnQueued}:
  * its waiting-exact-turn clause stays true for every turn id. */
 export function unifiedReplyTurnNotCapturing(ds: DaemonSession, turnId: string): boolean {
   const identity = currentCaptureIdentity(ds);
-  return identity?.turnId !== undefined && identity.turnId !== turnId;
+  if (identity?.turnId === undefined) return replyCardAwaitsNativeThinking(ds, turnId);
+  return identity.turnId !== turnId;
 }
 
 function rememberDeferredUnifiedReply(ds: DaemonSession, turnId: string): void {

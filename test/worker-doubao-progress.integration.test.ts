@@ -7,6 +7,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
+import { writeFakeDoubaoTui } from './helpers/fake-doubao-tui.js';
+import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
+import { trackStartingCardPublication } from '../src/core/starting-card-publication.js';
+import { replyCardAwaitsNativeThinking, replyCardDispatchAttempt, replyCardModeFor, updateTurnReplyCard } from '../src/core/turn-reply-card.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { buildNewTopicPrompt } from '../src/core/session-manager.js';
 import { readBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
@@ -17,12 +21,18 @@ interface CotRequest {
   method: string;
   data?: { events?: Array<{ event_type: string; content: string }> };
 }
-const request = vi.fn(async (req: CotRequest) => req.method === 'POST'
+const defaultRequest = async (req: CotRequest) => req.method === 'POST'
   ? { code: 0, data: { cot_id: 'cot_doubao', message_id: 'om_doubao_progress' } }
-  : { code: 0, data: {} });
+  : { code: 0, data: {} };
+const request = vi.fn(defaultRequest);
 vi.mock('../src/bot-registry.js', () => ({
-  getBot: () => ({ config: { cotEnabled: true } }),
+  getBot: () => ({ config: { cotEnabled: true, cliId: 'doubao', replyCardMode: 'unified', replyCardNativeCot: true } }),
   getBotClient: () => ({ request }),
+  normalizeUsageDisplay: () => 'off',
+}));
+vi.mock('../src/im/lark/client.js', () => ({
+  updateMessage: vi.fn(async () => {}), uploadFile: vi.fn(), replyMessage: vi.fn(), sendMessage: vi.fn(),
+  MessageWithdrawnError: class extends Error {},
 }));
 import { finalizeCotMessage, handleCotThinkingUpdate } from '../src/im/lark/cot-message.js';
 
@@ -53,7 +63,8 @@ afterEach(async () => {
   tmuxRoot = undefined;
   if (root) rmSync(root, { recursive: true, force: true });
   root = undefined;
-  request.mockClear();
+  request.mockReset().mockImplementation(defaultRequest);
+  vi.unstubAllEnvs();
 });
 
 async function waitUntil(check: () => boolean, logs: string[]): Promise<void> {
@@ -67,6 +78,105 @@ async function waitUntil(check: () => boolean, logs: string[]): Promise<void> {
 }
 
 describe.skipIf(process.platform === 'win32')('Doubao worker execution progress', () => {
+  it.skipIf(!tmuxAvailable).each(['tmux', 'pty'] as const)('settles a cold export-only native progress bubble and its successor exactly once on %s', async backendType => {
+    root = mkdtempSync(join(tmpdir(), 'doubao-cold-cot-'));
+    const dataDir = join(root, 'data');
+    mkdirSync(dataDir);
+    vi.stubEnv('SESSION_DATA_DIR', dataDir);
+    const sessionId = randomUUID();
+    const systemDir = join(root, '.local', 'share', 'doubao_cli', 'agent_mode', '100', 'workspace',
+      '.sessions', '38451111111111111', 'agents', 'main', 'system');
+    mkdirSync(systemDir, { recursive: true });
+    const assignment = join(systemDir, 'assignment.md');
+    const trajectory = join(systemDir, 'trajectory.jsonl');
+    writeFileSync(assignment, ''); writeFileSync(trajectory, '');
+    const ctlDir = join(root, 'ctl');
+    const fakeCli = writeFakeDoubaoTui(root, { systemDir, ctlDir, inputLog: join(root, 'input.jsonl') });
+    writeFileSync(join(ctlDir, 'export-only'), '');
+    let cotSequence = 0;
+    request.mockImplementation(async (req: any) => req.method === 'POST' && req.url === '/open-apis/im/v1/message_cot'
+      ? { code: 0, data: { cot_id: `cot_${++cotSequence}`, message_id: `om_cot_${cotSequence}` } }
+      : { code: 0, data: {} });
+    const ds = { larkAppId: 'app_doubao', chatId: 'oc_test', workingDir: dataDir, scope: 'thread',
+      currentTurnId: 'om_first', worker: null, workerGeneration: 1,
+      streamCardPending: true, streamCardPendingTurnId: 'om_first',
+      session: { sessionId, rootMessageId: 'om_root', chatId: 'oc_test', status: 'active', cliId: 'doubao', backendType },
+    } as DaemonSession;
+    const cardSend = async (_body: string, _type: string, _uuid: string, beforeWrite: () => unknown) => {
+      await beforeWrite(); return `om_answer_${ds.currentTurnId}`;
+    };
+    const statusPost = vi.fn(async () => true);
+    const scope: Record<string, any> = {
+      replyCardModeFor, replyCardAwaitsNativeThinking, trackStartingCardPublication,
+      deferredUnifiedReplyTurns: new WeakMap(), remoteRetirementAdmissionPhase: () => undefined,
+      postTurnStartingStatusCard: statusPost,
+      postUnifiedReplyPlaceholder: (target: DaemonSession, _send: unknown, turnId: string) =>
+        updateTurnReplyCard(target, turnId, { kind: 'start' }, cardSend, { dispatchAttempt: replyCardDispatchAttempt(target, turnId) })
+          .then(Boolean),
+    };
+    for (const name of ['currentCaptureIdentity', 'unifiedReplyTurnNotCapturing', 'rememberDeferredUnifiedReply',
+      'forgetDeferredUnifiedReply', 'takeReadyUnifiedReply', 'postTurnStartingCard', 'releaseDeferredUnifiedReplyCard']) {
+      scope[name] = loadWorkerPoolFunction(name, scope);
+    }
+    await scope.postTurnStartingCard(ds, cardSend, 'om_first');
+    expect(request).not.toHaveBeenCalled();
+    expect(statusPost).toHaveBeenCalledTimes(1);
+
+    tmuxRoot = mkdtempSync('/tmp/bmx-cot-');
+    tmuxEnv = privateTmuxEnv(tmuxRoot);
+    delete tmuxEnv.BOTMUX_TMUX_SOCKET;
+    execFileSync('tmux', ['-L', 'botmux', 'new-session', '-d', '-s', 'anchor', 'sleep', '120'], { env: tmuxEnv, timeout: 5000 });
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const publications: Promise<unknown>[] = [];
+    child = spawnTsScript(resolve('src/worker.ts'), [], { cwd: resolve('.'),
+      env: { ...tmuxEnv, HOME: root, USERPROFILE: root, XDG_DATA_HOME: join(root, '.local', 'share'),
+        SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, BOTMUX_NO_CLAIM: '1',
+        LARK_APP_ID: 'app_doubao', LARK_APP_SECRET: 'test-only' },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    ds.worker = child;
+    child.on('message', raw => {
+      const msg = raw as WorkerToDaemon;
+      messages.push(msg);
+      if (msg.type === 'capture_identity') {
+        ds.captureIdentity = { workerGeneration: 1, revision: msg.revision, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
+        if (msg.turnId && msg.dispatchAttempt !== undefined) {
+          ds.turnDispatchAttemptHighWater = { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
+        }
+        publications.push(scope.releaseDeferredUnifiedReplyCard(ds, cardSend));
+      }
+      if (msg.type === 'turn_terminal') finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+    });
+    child.stdout?.on('data', data => logs.push(data.toString()));
+    child.stderr?.on('data', data => logs.push(data.toString()));
+    if (backendType === 'tmux') sessionName = TmuxBackend.sessionName(sessionId);
+    child.send({ type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root', workingDir: dataDir,
+      cliId: 'doubao', cliPathOverride: fakeCli, backendType, launchShell: '/bin/bash',
+      larkAppId: 'app_doubao', larkAppSecret: 'test-only', apiOnly: true, replyDelivery: 'transcript',
+    } satisfies DaemonToWorker);
+    await waitUntil(() => messages.some(msg => msg.type === 'ready'), logs);
+    const events = () => request.mock.calls.flatMap(([req]) => req.data?.events ?? []);
+    for (const [turnId, question, answer] of [['om_first', 'first greeting', 'FIRST_COLD_REPLY'],
+      ['om_second', 'second greeting', 'SECOND_COLD_REPLY']] as const) {
+      ds.currentTurnId = turnId;
+      ds.streamCardPending = true;
+      ds.streamCardPendingTurnId = turnId;
+      await scope.postTurnStartingCard(ds, cardSend, turnId);
+      child.send({ type: 'message', turnId, dispatchAttempt: 1,
+        content: `<session_id>${sessionId}</session_id>\n<user_message>${question}</user_message>` } satisfies DaemonToWorker);
+      await waitUntil(() => readFileSync(assignment, 'utf8').includes(question), logs);
+      await waitUntil(() => events().some(e => e.event_type === 'RUN_STARTED' && JSON.parse(e.content).runId === turnId), logs);
+      writeFileSync(join(ctlDir, turnId === 'om_first' ? 'finish-1' : 'finish-2'), answer);
+      await waitUntil(() => messages.some(msg => msg.type === 'final_output' && msg.turnId === turnId), logs);
+      await waitUntil(() => events().some(e => e.event_type === 'RUN_FINISHED' && JSON.parse(e.content).runId === turnId), logs);
+      expect(events().filter(e => e.event_type === 'RUN_FINISHED' && JSON.parse(e.content).runId === turnId)).toHaveLength(1);
+    }
+    await Promise.all(publications);
+    expect(cotSequence).toBe(2);
+    expect(readFileSync(trajectory, 'utf8')).toBe('');
+  }, 90_000);
+
   for (const { backendType, resumed, restart } of [
     { backendType: 'pty', resumed: false, restart: 'none' }, { backendType: 'tmux', resumed: false, restart: 'none' },
     { backendType: 'pty', resumed: true, restart: 'none' },
@@ -100,7 +210,8 @@ describe.skipIf(process.platform === 'win32')('Doubao worker execution progress'
 const fs = require('node:fs');
 let busy = false;
 let paintedReady = false;
-const ready = () => process.stdout.write('\\x1b[2J\\x1b[HAsk Doubao to do anything\\nEnter send · Ctrl+J newline\\n');
+if (process.stdin.isTTY) process.stdin.setRawMode(true);
+const ready = () => process.stdout.write('\\x1b[2J\\x1b[H' + '─'.repeat(60) + '\\r\\n❯ Ask Doubao to do anything\\r\\n' + '─'.repeat(60) + '\\r\\nEnter send · Ctrl+J newline\\r\\n');
 process.stdin.on('data', data => { busy = true; fs.appendFileSync(${JSON.stringify(inputFile)}, data); });
 setInterval(() => {
   if (fs.existsSync(${JSON.stringify(completeFlag)})) { busy = false; ready(); }
@@ -158,7 +269,9 @@ setInterval(() => {
       expect(logs.some(line => line.includes('Writing to PTY (flush)'))).toBe(false);
       writeFileSync(readyPaint, 'paint');
       await waitUntil(() => logs.some(line => line.includes('Writing to PTY (flush)')), logs);
-      writeFileSync(join(systemDir, 'assignment.md'), `## [${new Date().toISOString()}] 需求\n${prompt}\n`, { flag: 'a' });
+      await waitUntil(() => existsSync(inputFile) && readFileSync(inputFile, 'utf8').endsWith('\x13'), logs);
+      const nativePrompt = readFileSync(inputFile, 'utf8').replace(/\x13$/, '');
+      writeFileSync(join(systemDir, 'assignment.md'), `## [${new Date().toISOString()}] 需求\n${nativePrompt}\n`, { flag: 'a' });
       if (resumed) appendFileSync(trajectory, oldTool.slice(split) + '\n');
       appendFileSync(trajectory, JSON.stringify({ role: 'assistant', tool_calls: [{ id: 'read-1',
         function: { name: 'Read', arguments: JSON.stringify({ file_path: 'src/main.ts' }) } }] }) + '\n');
