@@ -9,7 +9,7 @@ import * as bots from '../src/bot-registry.js';
 import * as identities from '../src/im/lark/identity-cache.js';
 import * as tokens from '../src/utils/user-token.js';
 import * as larkClient from '../src/im/lark/client.js';
-import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
+import { parseTriggerUserAuthConfig, type TriggerUserAuthCredentialSourceConfig } from '../src/services/trigger-user-auth.js';
 import * as bytedcliAuth from '../src/services/bytedcli-auth.js';
 import { __resetUnattendedNoticesForTest } from '../src/core/capability-authorization.js';
 import { config } from '../src/config.js';
@@ -893,7 +893,7 @@ describe('platform-issued user credentials in a bound session', () => {
   // Nobody but the bot owner can grant the bot's own application (its
   // availability range excludes them), so their --as user comes from the platform.
   const PLATFORM = { platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' };
-  const platformBot = (credentialSource?: string) => ({ larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
+  const platformBot = (credentialSource?: TriggerUserAuthCredentialSourceConfig) => ({ larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
     triggerUserAuth: { enabled: true, tools: ['lark-cli'], ...(credentialSource ? { credentialSource } : {}) } });
   let grants: any[];
   let platformRequest: ReturnType<typeof vi.spyOn>;
@@ -969,6 +969,43 @@ describe('platform-issued user credentials in a bound session', () => {
     vi.mocked(bots.getBot).mockReturnValue({ config: platformBot('platform') } as any);
     expect(await (await request('user')).json()).toMatchObject({ appId: 'cli_platform', issuer: 'platform' });
     expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+  it('does not hand out a bot-app credential after a hot switch to platform-only Lark', async () => {
+    const source: Exclude<TriggerUserAuthCredentialSourceConfig, string> = { 'lark-user': 'local', bytecloud: 'platform' };
+    vi.mocked(bots.getBot).mockReturnValue({ config: platformBot(source) } as any);
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      source['lark-user'] = 'platform';
+      return 'obsolete-bot-app-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    expect(await response.text()).not.toContain('obsolete-bot-app-token');
+  });
+  it('does not hand out a platform credential after a hot switch to local Lark', async () => {
+    const source: Exclude<TriggerUserAuthCredentialSourceConfig, string> = { 'lark-user': 'platform', bytecloud: 'platform' };
+    vi.mocked(bots.getBot).mockReturnValue({ config: platformBot(source) } as any);
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => PLATFORM, resolveUnionId: async () => 'on_sender',
+      requestGrant: async () => {
+        source['lark-user'] = 'local';
+        return { ok: true, value: { tool: 'lark-cli', unionId: 'on_sender', expiresAt: Date.now() + 3_600_000,
+          variables: { LARKSUITE_CLI_APP_ID: 'cli_platform', LARKSUITE_CLI_USER_ACCESS_TOKEN: 'obsolete-platform-token' } } } as any;
+      },
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    expect(await response.text()).not.toContain('obsolete-platform-token');
+  });
+  it('finishes a Lark lookup when only ByteCloud changes source', async () => {
+    const source: Exclude<TriggerUserAuthCredentialSourceConfig, string> = { 'lark-user': 'local', bytecloud: 'platform' };
+    vi.mocked(bots.getBot).mockReturnValue({ config: platformBot(source) } as any);
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      source.bytecloud = 'local';
+      return 'still-local-lark-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ appId: 'cli_bound', credential: 'still-local-lark-token' });
   });
   it('a refused --as user asks the platform for a card: no link reaches the agent, a DM or the group', async () => {
     session.chatType = 'group';
@@ -1068,6 +1105,19 @@ describe('platform-issued user credentials in a bound session', () => {
     expect(response.status).toBe(403);
     expect(await response.json()).toEqual({ ok: false, error: 'current_actor_unverified' });
     expect(deviceFlow).not.toHaveBeenCalled();
+  });
+  it('auth request does not send a platform card for a turn that moved on during the platform check', async () => {
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      session.managedTurnOrigin.turnId = 'om_later';
+      return null;
+    });
+    const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ scopes: ['search:docs:read'] }),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(platformRequest).not.toHaveBeenCalled();
   });
   it('runs the real tool with the platform application for user calls and the bound one for bot calls', async () => {
     installFakeTool();

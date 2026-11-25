@@ -7,8 +7,8 @@
  * indication that one word in it was wrong. That has already happened here once
  * (commit 487e297d: a bare `docs:document.comment`, which is not a real scope).
  *
- * Names come from the same generated catalog `botmux setup` uses, so this stays
- * in step with the console rather than drifting as a hand-kept list.
+ * The generated `botmux setup` catalog supplies the default names. Additional
+ * names below are accepted at runtime without adding them to app setup.
  */
 // Import attribute rather than a runtime read: this is how cli.ts already
 // bundles the same file, so the catalog travels with the build (including the
@@ -46,6 +46,15 @@ const EXTRA_USER_SCOPES: ReadonlySet<string> = new Set([
   'im:chat:readonly',
   'docs:document.comment:update',
   'docx:document.block:convert',
+  'minutes:minutes.artifacts:read',
+  'minutes:minutes.basic:read',
+  'minutes:minutes.media:export',
+  'minutes:minutes.search:read',
+  'minutes:minutes.transcript:export',
+  'minutes:minutes:readonly',
+  'vc:meeting.search:read',
+  'vc:note:read',
+  'vc:record:readonly',
   ...ON_DEMAND_USER_SCOPES,
 ]);
 

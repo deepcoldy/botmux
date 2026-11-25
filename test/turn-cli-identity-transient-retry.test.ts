@@ -463,10 +463,13 @@ describe('transient platform refusal within a turn: concurrency and policy', () 
   const platformPolicy = () => parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' });
   const toolOffPolicy = () => parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' });
 
-  it('does not write a grant acquired while the bot was switched to local credentials', async () => {
+  it.each([
+    localPolicy,
+    () => parseTriggerUserAuthConfig({ enabled: true, credentialSource: { default: 'platform', bytecloud: 'local' } }),
+  ])('does not write a grant acquired while ByteCloud was switched to local credentials', async toLocal => {
     let policy = platformPolicy();
     const { release, pending } = await startHeldRetry({ currentPolicy: () => policy });
-    policy = localPolicy();     // operator switches the bot mid-flight
+    policy = toLocal();        // operator switches ByteCloud mid-flight
     const before = current();
     release(GRANTED);
     await pending;

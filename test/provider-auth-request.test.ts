@@ -161,6 +161,19 @@ describe('requestProviderAuth — ByteCloud', () => {
     expect(r.message).not.toContain(BYTED_URL);
   });
 
+  it('can deliver the same link after a policy change cancelled its previous delivery', async () => {
+    let current = true;
+    deps.isCurrent = () => current;
+    deps.deliver.mockImplementationOnce(async () => {
+      current = false;
+      return 'dm_failed';
+    });
+    expect((await ask('bytedcli')).status).toBe('undeliverable');
+    current = true;
+    expect((await ask('bytedcli')).status).toBe('delivered');
+    expect(deps.deliver).toHaveBeenCalledTimes(2);
+  });
+
   it('a login that cannot be started is unavailable, and the agent hears bytedcli\'s reason', async () => {
     deps.startBytedcliLogin = vi.fn(async () => ({ state: 'failed', detail: 'AUTH_REQUIRED: Not authenticated' }) as BytedcliLoginStart);
     const r = await ask('bytedcli');

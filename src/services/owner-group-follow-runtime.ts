@@ -1,5 +1,5 @@
 import { getBot, getBotClient, getOwnerOpenId } from '../bot-registry.js';
-import { platformIncrementalAuthorizeUrl, resolveBoundLarkUserCredential } from '../core/lark-tool-platform-credential.js';
+import { boundLarkPlatformPolicy, platformIncrementalAuthorizeUrl, resolveBoundLarkUserCredential } from '../core/lark-tool-platform-credential.js';
 import { platformAuthorizeUrl } from '../core/platform-credential-source.js';
 import { askPlatformToAuthorize } from '../core/platform-authorization-request.js';
 import { hasReason, NOT_AUTHORIZED_REASONS } from '../core/refusal-reasons.js';
@@ -124,6 +124,7 @@ export function startOwnerGroupFollow(appId: string, dataDir: string): { stop():
     },
     token: async (ownerOpenId, signal) => {
       const cfg = getBot(appId).config;
+      const policy = boundLarkPlatformPolicy(cfg);
       signal.throwIfAborted();
       const result = await resolveBoundLarkUserCredential({
         bot: cfg, openId: ownerOpenId, delegated: false,
@@ -133,6 +134,7 @@ export function startOwnerGroupFollow(appId: string, dataDir: string): { stop():
         botAppToken: id => resolveUserToken(appId, cfg.larkAppSecret, normalizeBrand(cfg.brand), id, signal),
       });
       signal.throwIfAborted();
+      if (policy !== boundLarkPlatformPolicy(getBot(appId).config)) throw new OwnerGroupFollowError(true);
       if (!result.ok && result.reason === 'platform') {
         throw new OwnerGroupFollowError(true, true, {
           authorizationSource: 'platform', authorizeUrl: result.authorizeUrl, guidance: result.error,
@@ -176,11 +178,13 @@ export function startOwnerGroupFollow(appId: string, dataDir: string): { stop():
       const cfg = getBot(appId).config;
       const currentOwner = () => !stopped && current() && getOwnerOpenId(appId) === ownerOpenId
         && getBot(appId).config.ownerGroupFollow?.enabled === true && !getBot(appId).config.apiOnly;
+      const platformAllowed = () => boundLarkPlatformPolicy(getBot(appId).config) !== 'off';
       if (!currentOwner()) return;
+      if (issue?.authorizationSource === 'platform' && !platformAllowed()) issue = undefined;
       let platformNotice: string | undefined;
       if (issue?.authorizationSource === 'platform' && issue.authorizationRequired) {
         const requested = await askPlatformToAuthorize({ botConfig: cfg, openId: ownerOpenId, scopes: FOLLOW_SCOPES });
-        if (!currentOwner()) return;
+        if (!currentOwner() || !platformAllowed()) return;
         switch (requested.kind) {
           case 'sent': platformNotice = '自动跟随需要你的群操作授权。平台已私聊发送授权卡片，请在卡片中完成授权，后台会在下一次检查时继续。'; break;
           case 'ready': platformNotice = '平台确认你的授权已可用，自动跟随会在下一次检查时继续。'; break;
@@ -209,7 +213,9 @@ export function startOwnerGroupFollow(appId: string, dataDir: string): { stop():
         // The gate can queue or retry after this notify() was validated.
         // Recheck immediately before every provider write as well.
         beforeWrite: () => {
-          if (!currentOwner()) throw new Error('owner group follow notification cancelled');
+          if (!currentOwner() || (issue?.authorizationSource === 'platform' && !platformAllowed())) {
+            throw new Error('owner group follow notification cancelled');
+          }
         },
       });
     },

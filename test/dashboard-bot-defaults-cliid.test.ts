@@ -10,6 +10,7 @@ import {
   patchCardPrefsFromBody,
   CodexAppDisplaySection,
   OwnerGroupFollowControls,
+  TriggerUserAuthSection,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled, onboardingRetryMode } from '../src/dashboard/web/bot-onboarding.js';
@@ -84,6 +85,50 @@ describe('bot defaults task tabs', () => {
     expect(onChange).toHaveBeenLastCalledWith('common');
     act(() => tabs[2]!.props.onKeyDown(event('End')));
     expect(onChange).toHaveBeenLastCalledWith('advanced');
+  });
+});
+
+describe('trigger-user credential sources', () => {
+  it('edits each override and keeps the policy when another setting changes', async () => {
+    const appId = 'cli_split_auth';
+    const request = vi.fn(async (_url: string, init?: RequestInit) => ({
+      ok: true,
+      json: async () => init?.method === 'PUT' ? { ok: true } : { ok: true, platformBound: true },
+    } as Response));
+    vi.stubGlobal('fetch', request);
+    function Harness() {
+      const [bot, setBot] = React.useState<BotDefaultsRow>({
+        larkAppId: appId,
+        triggerUserAuth: { enabled: true, credentialSource: 'platform' },
+      });
+      return React.createElement(TriggerUserAuthSection, {
+        bot, patchBot: (_appId, patch) => setBot(previous => typeof patch === 'function' ? patch(previous) : { ...previous, ...patch }),
+      });
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(Harness)); });
+    const control = (name: string) => renderer.root.findByProps({ 'data-action': name });
+    const change = async (name: string, value: string) => act(async () => {
+      control(name).props.onChange({ currentTarget: { value } });
+    });
+    const savedSource = () => JSON.parse(String(request.mock.lastCall?.[1]?.body)).triggerUserAuth.credentialSource;
+
+    expect(control('trigger-user-auth-source').props.value).toBe('platform');
+    await change('trigger-user-auth-source', 'split');
+    expect(savedSource()).toEqual({ default: 'platform' });
+    expect(control('trigger-user-auth-source-bytecloud').props.value).toBe('');
+    await change('trigger-user-auth-source-lark-user', 'local');
+    expect(savedSource()).toEqual({ default: 'platform', 'lark-user': 'local' });
+    await act(async () => {
+      control('trigger-user-auth-capability-meego').props.onChange({ currentTarget: { checked: false } });
+    });
+    expect(savedSource()).toEqual({ default: 'platform', 'lark-user': 'local' });
+    await change('trigger-user-auth-source-default', 'local');
+    await change('trigger-user-auth-source-lark-user', '');
+    expect(savedSource()).toEqual({ default: 'local' });
+    await change('trigger-user-auth-source', 'auto');
+    expect(savedSource()).toBe('auto');
+    await act(async () => { renderer.unmount(); });
   });
 });
 

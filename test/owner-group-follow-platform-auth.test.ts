@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { TriggerUserAuthCredentialSourceConfig } from '../src/services/trigger-user-auth.js';
 const mocks = vi.hoisted(() => ({
   config: { larkAppId: 'cli_follow_auth', larkAppSecret: 'secret', brand: 'feishu',
-    triggerUserAuth: { enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }, ownerGroupFollow: { enabled: true } },
+    triggerUserAuth: { enabled: true, tools: ['lark-cli'], credentialSource: 'platform' as TriggerUserAuthCredentialSourceConfig }, ownerGroupFollow: { enabled: true } },
   owner: 'ou_owner',
   notify: vi.fn(async (_app: string, _owner: string, _content: string) => {}),
   grant: vi.fn(), request: vi.fn(),
@@ -24,6 +25,7 @@ beforeEach(() => {
   vi.useFakeTimers(); vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
   dir = mkdtempSync(join(tmpdir(), 'owner-follow-platform-'));
   mocks.owner = 'ou_owner'; mocks.config.brand = 'feishu'; mocks.config.ownerGroupFollow.enabled = true;
+  mocks.config.triggerUserAuth.credentialSource = 'platform';
   mocks.notify.mockClear(); mocks.request.mockReset().mockResolvedValue({ ok: true, status: 'sent', deduped: false });
   mocks.grant.mockReset().mockResolvedValue({ ok: false, reason: 'not_authorized', error: 'grant missing', authorizeUrl: 'https://platform.example/credentials' });
   __resetPlatformAuthorizationRequestForTest();
@@ -69,6 +71,17 @@ describe('owner follow with the real platform resolver and authorization request
     mocks.grant.mockResolvedValue({ ok: false, reason: 'failed', detail: 'network unavailable' }); await start();
     expect(mocks.request).not.toHaveBeenCalled(); expect(mocks.notify).toHaveBeenCalledTimes(1);
     expect(mocks.notify.mock.calls[0][2]).not.toContain('https://');
+  });
+  it('drops a platform result started before Feishu switched to local', async () => {
+    let finish!: (value: unknown) => void;
+    mocks.grant.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    await start();
+    expect(mocks.grant).toHaveBeenCalledTimes(1);
+    mocks.config.triggerUserAuth.credentialSource = { 'lark-user': 'local', bytecloud: 'platform' };
+    finish({ ok: false, reason: 'not_authorized', error: 'grant missing' });
+    await settle();
+    expect(mocks.request).not.toHaveBeenCalled();
+    expect(mocks.notify).not.toHaveBeenCalled();
   });
   it('stops the notice when the feature is disabled while card delivery awaits', async () => {
     let finish!: (value: unknown) => void;

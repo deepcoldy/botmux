@@ -70,13 +70,13 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 }));
 
 const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
-const { clearRestoredLapses, unattendedTask, deliverUnattendedLapse, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
+const { clearRestoredLapses, unattendedTask, deliverUnattendedLapse, missingAuthorizationEntries, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
 const { allowsPersonalIdentityForTurn, isPersonActorTurnId, isRunAsTurnId, isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
 const { writeSessionIdentity, recallProvenIdentityContent, rememberProvenIdentityContent, renderIdentityWrapper, sessionIdentityPath } = await import('../src/core/cli-identity.js');
 const { renewExpiringBytedcliIdentities, trackedBytedcliRenewalCount, forgetBytedcliIdentityRenewals } = await import('../src/core/bytedcli-identity-renewal.js');
 const { renewBytedcliJwts } = await import('../src/services/bytedcli-auth.js');
 const { capabilityOn, parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
-const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
+const { __setPlatformCredentialDepsForTest, noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
 const { beginLarkCliLogin } = await import('../src/services/lark-cli-auth.js');
 const { prepareScheduledRecoveryRun } = await import('../src/core/scheduled-send.js');
 const { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn } = await import('../src/core/scheduled-turn-provenance.js');
@@ -186,6 +186,31 @@ describe('publishTurnCliIdentity — lark-cli per-person HOME (device flow)', ()
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(resolveLarkCliHomeForTurn).toHaveBeenCalledWith(BOB);
   });
+});
+
+it('builds separate platform and local entries when an unattended run needs both credentials', async () => {
+  __setPlatformCredentialDepsForTest({ readBinding: () => ({
+    platformUrl: 'https://platform.example.test', machineToken: 'fixture-token', machineId: 'fixture-machine',
+  }) });
+  try {
+    const cfg = {
+      ...botConfig({ enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'local', bytecloud: 'platform' } }),
+      larkToolBinding: false,
+    };
+    const startBytedcli = (await import('../src/services/bytedcli-auth.js')).beginBytedcliLogin;
+    vi.mocked(startBytedcli).mockClear();
+    const entries = await missingAuthorizationEntries(cfg, ALICE, {
+      known: { provider: 'bytedcli' }, published: () => '[reason=not_authorized]',
+    });
+    expect(entries).toEqual([
+      { provider: 'lark-cli', url: 'https://example.com/lark-device' },
+      { provider: 'bytedcli', platform: true },
+    ]);
+    expect(startBytedcli).not.toHaveBeenCalled();
+  } finally {
+    __setPlatformCredentialDepsForTest(null);
+  }
 });
 
 describe('publishTurnCliIdentity — the sender acts as themselves', () => {
