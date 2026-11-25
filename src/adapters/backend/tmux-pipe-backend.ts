@@ -3049,6 +3049,40 @@ export class TmuxPipeBackend implements SessionBackend {
     }
   }
 
+  /** Non-blocking tmux pane dimensions query for async native viewport
+   *  staging. Mirrors captureViewportAsync's bounded execFile contract so
+   *  periodic readiness sampling never blocks the Worker event loop. */
+  getPaneSizeAsync(): Promise<{ cols: number; rows: number } | null> {
+    if (this.exited || !Array.isArray(this.tmuxArgs) || !this.paneTarget) {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve, reject) => {
+      execFile('tmux', [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_width} #{pane_height}'], {
+        encoding: 'utf8',
+        timeout: 1_000,
+        killSignal: 'SIGKILL',
+        maxBuffer: 16 * 1024,
+        env: tmuxEnv(),
+      }, (error, stdout) => {
+        if (error) {
+          this.noteCaptureError(error);
+          reject(error);
+          return;
+        }
+        if (this.exited) {
+          resolve(null);
+          return;
+        }
+        const [cols, rows] = stdout.trim().split(/\s+/).map(s => Number(s));
+        if (Number.isInteger(cols) && Number.isInteger(rows) && cols > 0 && rows > 0) {
+          resolve({ cols, rows });
+        } else {
+          resolve(null);
+        }
+      });
+    });
+  }
+
   /** Cheap probe: is the adopted pane currently in the alternate screen
    *  buffer? Used by captureCurrentScreen to decide whether the snapshot
    *  needs an alt-buffer-enter prefix for correct rendering. */
