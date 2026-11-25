@@ -51,7 +51,9 @@ const ROOT_PATH = /^(?:\/(?:home|Users|root|tmp|private|var|run|mnt|media|Volume
 // /dev streams and the kernel's /proc and /sys views name no user file, so shell
 // text like `2>/dev/null` stays readable. A process's cwd and root under /proc
 // lead back into the filesystem and stay covered.
-const ADDRESS_TOKEN = /(?:\b(?:file|vscode(?:-insiders)?|vscode-remote|cursor|idea|jetbrains|subl|atom|skill):[^\s<>"'\x60，。、；！？]*|(?<![\w/])(?!\/dev\/(?:null|stdin|stdout|stderr|fd\/\d+)(?![\w.\/-])|\/(?:proc|sys)(?:\/|$)(?!(?:self|thread-self|\d+)\/(?:task\/\d+\/)?(?:cwd|root)(?:\/|$)))(?:\/(?:home|Users|root|tmp|private|var|run|mnt|media|Volumes|opt|srv|etc|usr|bin|sbin|dev|proc|sys|data\d*|workspace|workspaces)(?=\/|$)|~(?=\/|$)|\$(?:HOME|\{HOME\})(?=\/|$)|%USERPROFILE%(?=[\\/]|$)|[a-z]:[\\/]|\\\\)[^\s<>"'\x60，。、；！？()[\]]*)/giu;
+// Scheme-like prose needs a path marker so OAuth scopes and code keys stay
+// readable. File URLs also accept Windows drives and backslashes.
+const ADDRESS_TOKEN = /(?:\b(?:file:(?:[a-z][:|])?[\\/]|(?:vscode(?:-insiders)?|vscode-remote|cursor|idea|jetbrains|subl|atom|skill):\/)[^\s<>"'\x60，。、；！？]*|(?<![\w/])(?!\/dev\/(?:null|stdin|stdout|stderr|fd\/\d+)(?![\w.\/-])|\/(?:proc|sys)(?:\/|$)(?!(?:self|thread-self|\d+)\/(?:task\/\d+\/)?(?:cwd|root)(?:\/|$)))(?:\/(?:home|Users|root|tmp|private|var|run|mnt|media|Volumes|opt|srv|etc|usr|bin|sbin|dev|proc|sys|data\d*|workspace|workspaces)(?=\/|$)|~(?=\/|$)|\$(?:HOME|\{HOME\})(?=\/|$)|%USERPROFILE%(?=[\\/]|$)|[a-z]:[\\/]|\\\\)[^\s<>"'\x60，。、；！？()[\]]*)/giu;
 const LINK_KEYS = new Set(['href', 'url', 'pc_url', 'android_url', 'ios_url', 'default_url']);
 const STRUCTURAL_KEYS = new Set([
   'tag', 'element_id', 'name', 'data_type', 'img_key', 'image_key', 'file_key',

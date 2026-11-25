@@ -6,6 +6,37 @@ import { isHostCapabilityLink } from '../src/core/host-capability-link.js';
 
 describe('local address presentation policy', () => {
   it.each([
+    'drive:file:download drive:file:upload drive:file.like:readonly drive:file.meta.sec_label.read_only',
+    '/login --scope --allow-unknown minutes:minutes.basic:read drive:file:download drive:file:upload offline_access',
+    '```ts\n{ file: string; cursor: number; idea?: boolean; skill: string }\n```',
+    '```css\n.button { cursor: pointer; }\n```',
+    '```yaml\nfile: README.md\ncursor: 12\natom: 1\nskill: example\n```',
+    'idea: next step · 文件 file: README.md',
+    'foo:vscode:bar config.file:read my-cursor:status skill:deploy-runbook',
+    'https://example.com/api/file:download',
+  ])('keeps non-URI scheme-like text unchanged: %s', text => {
+    expect(sanitizeLocalAddressText(text)).toBe(text);
+  });
+
+  it.each([
+    'file:///Users/alice/project/a.ts', 'FILE://localhost/tmp/test.txt', 'file:/home/alice/a.ts',
+    'file:C:/Users/alice/a.ts', 'file:C|/Users/alice/a.ts', 'file:\\Users\\alice\\a.ts',
+    'vscode://file/home/alice/a.ts:10:2', 'vscode-insiders://file/Users/alice/a.ts',
+    'vscode-remote://ssh-remote+host/home/alice/a.ts', 'vscode:/project/a.ts',
+    'cursor://file/Users/alice/a.ts:1', 'idea://open?file=/Users/alice/a.ts',
+    'jetbrains://idea/navigate/reference?project=example', 'subl://open?url=/Users/alice/a.ts', 'atom://open/a.ts',
+    'skill://local/example', 'skill:/home/alice/.claude/skills/example',
+  ])('replaces the whole local URI after prose punctuation: %s', uri => {
+    expect(sanitizeLocalAddressText('路径:' + uri, { internalFileLabel: '[F]' })).toBe('路径:[F]');
+  });
+
+  it.each(['file:///tmp/a', 'vscode://file/tmp/a', 'file:download'])('blocks local link targets in Markdown and cards: %s', target => {
+    expect(sanitizeLocalAddressText(`[open](${target})`, { unavailableLinkLabel: ' [blocked]' })).toBe('open [blocked]');
+    expect(() => sanitizeLocalAddressNode({ pc_url: target }, { linkFieldsOnly: true }))
+      .toThrowError(expect.objectContaining({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' }));
+  });
+
+  it.each([
     '/home/alice/private.txt', '/Users/alice/private.txt', '/data00/home/alice/private.txt',
     '/tmp/result.txt', '/etc/botmux/private.json', '/usr/local/share/secret.txt', '/dev/shm/private.txt',
     '~/.agents/skills/a/SKILL.md', '$HOME/.config/a',
