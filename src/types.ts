@@ -1259,6 +1259,15 @@ export interface Session {
    * to this external server.
    */
   existingAppServerEndpoint?: string;
+  /** Frozen at ordinary-topic creation; input stays in the activation journal. */
+  sharedThreadOpening?: {
+    endpoint: string;
+    cwd?: string;
+    title?: string;
+    projectRouteRevision?: number;
+    phase?: 'creating' | 'created';
+    threadId?: string;
+  };
   /** Provenance: the botmux sessionId this session was forked from (`/fork`).
    *  Purely informational — surfaced in UI/pickers so a fork is distinguishable
    *  from its parent. Does not affect routing or lifecycle. */

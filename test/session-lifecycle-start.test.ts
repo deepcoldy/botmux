@@ -9,6 +9,14 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 import { WorkerOwnerDiagnostics } from '../src/core/worker-owner-diagnostic.js';
 import { acceptSessionGroupTitle } from '../src/services/session-group-title.js';
+const sharedOpenMock = vi.hoisted(() => vi.fn());
+vi.mock('../src/core/shared-thread-opening.js', () => ({
+  SharedThreadClient: class {
+    async initialize() {}
+    close() {}
+  },
+  openSharedThread: (...args: unknown[]) => sharedOpenMock(...args),
+}));
 
 vi.mock('../src/services/session-group-title.js', () => ({
   acceptSessionGroupTitle: vi.fn(),
@@ -179,6 +187,7 @@ vi.mock('../src/services/session-store.js', () => {
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   getSessionFresh: vi.fn(),
+  getOwnedSession: vi.fn(),
   updateSession,
   updateSessionPid: vi.fn(),
 }; });
@@ -415,10 +424,117 @@ function defaultBot(overrides: Record<string, unknown> = {}) {
   } as any;
 }
 
+describe('new topics on the existing shared server', () => {
+  function setup() {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ wrapperCli: undefined }));
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.session.sharedThreadOpening = { endpoint: 'unix:///tmp/shared-test.sock' };
+    vi.mocked(sessionStore.getOwnedSession).mockImplementation(() => ds.session);
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    vi.mocked(sessionStore.mutateOwnedSessionsAtomically).mockImplementation((ids, mutate) => {
+      const rows = new Map([[ds.session.sessionId, ds.session]]);
+      return { result: mutate(rows), rows };
+    });
+    return ds;
+  }
+
+  it('journals the first input before creation and retains a successor in the existing FIFO', async () => {
+    const ds = setup();
+    let release!: () => void;
+    sharedOpenMock.mockImplementation(async () => {
+      expect(ds.session.queuedActivationInput?.content).toBe('first');
+      expect(forkMock).not.toHaveBeenCalled();
+      await new Promise<void>(resolve => { release = resolve; });
+      ds.session.cliSessionId = 'native-test';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      return 'native-test';
+    });
+    forkWorker(ds, 'first', 'first-turn');
+    forkWorker(ds, 'first', 'first-turn');
+    forkWorker(ds, 'second', 'second-turn');
+    await vi.waitFor(() => expect(sharedOpenMock).toHaveBeenCalledOnce());
+    expect(ds.session.queuedActivationInput?.content).toBe('first');
+    expect(ds.session.queuedActivationTail).toHaveLength(1);
+    expect(ds.session.queuedActivationTail?.[0].cliInput.content).toBe('second');
+    release();
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledOnce());
+    expect(ds.initConfig).toMatchObject({ cliSessionId: 'native-test',
+      existingAppServerEndpoint: 'unix:///tmp/shared-test.sock', resume: true, prompt: 'first' });
+  });
+
+  it('preserves the opening input when remote creation fails', async () => {
+    const ds = setup();
+    sharedOpenMock.mockRejectedValue(new Error('connection lost'));
+    forkWorker(ds, 'first', 'first-turn');
+    await vi.waitFor(() => expect(loggerErrorMock).toHaveBeenCalled());
+    expect(ds.session.queuedActivationInput?.content).toBe('first');
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.initialStartPending).toBe(false);
+    expect(forkMock).not.toHaveBeenCalled();
+    sharedOpenMock.mockImplementation(async () => {
+      ds.session.cliSessionId = 'retried-native';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      return 'retried-native';
+    });
+    forkWorker(ds, '', { resume: true, turnId: 'first-turn' });
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledOnce());
+    expect(ds.initConfig?.prompt).toBe('first');
+  });
+
+  it('restores a queued opening even when hasHistory was set during daemon recovery', async () => {
+    const ds = setup();
+    ds.hasHistory = true;
+    sharedOpenMock.mockImplementation(async () => {
+      ds.session.cliSessionId = 'restored-native';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      return 'restored-native';
+    });
+    forkWorker(ds, 'first', 'first-turn');
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledOnce());
+    expect(ds.initConfig?.cliSessionId).toBe('restored-native');
+  });
+
+  it('does not create remotely if journaling fails', () => {
+    const ds = setup();
+    sharedOpenMock.mockReset();
+    vi.mocked(sessionStore.updateSession).mockImplementation(() => { throw new Error('disk full'); });
+    expect(() => forkWorker(ds, 'first', 'first-turn')).toThrow('disk full');
+    expect(sharedOpenMock).not.toHaveBeenCalled();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('does not launch a new activation from a stale creation callback', async () => {
+    const ds = setup();
+    sharedOpenMock.mockImplementation(async () => {
+      ds.session.cliSessionId = 'native-test';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      ds.session.backgroundExecutionEpoch = 1;
+      ds.session.queuedActivationToken = 'replacement-activation';
+      return 'native-test';
+    });
+    forkWorker(ds, 'first', 'first-turn');
+    await vi.waitFor(() => expect(sharedOpenMock).toHaveBeenCalledOnce());
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+});
+
 beforeEach(() => {
   __testOnly_setSuspendBackingVerifier(() => true);
   vi.useRealTimers();
   vi.clearAllMocks();
+  vi.mocked(sessionStore.getOwnedSession).mockReset();
+  vi.mocked(sessionStore.mutateOwnedSessionsAtomically).mockImplementation((ids, mutate) => {
+    const rows = new Map<string, any>();
+    for (const id of ids) {
+      const row = [...vi.mocked(sessionStore.updateSession).mock.calls].reverse()
+        .find(call => call[0]?.sessionId === id)?.[0];
+      if (!row) throw new Error('fixture session not persisted');
+      rows.set(id, structuredClone(row));
+    }
+    return { result: mutate(rows), rows };
+  });
   delete process.env.BOTMUX_TASK_CONTINUATION_ENABLED;
   delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
   vi.mocked(sessionStore.getSessionFresh).mockReturnValue(undefined);
