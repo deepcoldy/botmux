@@ -32,9 +32,12 @@ export function samePinModel(a: string | undefined, b: string | undefined): bool
   return !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
-/** Omitted effort keeps only an existing choice for this exact model. */
-export function retainPinEffort(pin: ModelPin, previous: ModelPin | undefined): ModelPin {
-  return pin.effort === undefined && previous?.effort && samePinModel(pin.model, previous.model)
+/** Omitted effort keeps only an existing choice for the same model. Claude
+ * gateway IDs are case-sensitive; other CLIs retain their legacy comparison. */
+export function retainPinEffort(pin: ModelPin, previous: ModelPin | undefined, cliId: CliId | undefined): ModelPin {
+  const sameModel = cliId === 'claude-code'
+    ? pin.model === previous?.model : samePinModel(pin.model, previous?.model);
+  return pin.effort === undefined && previous?.effort && sameModel
     ? { ...pin, effort: previous.effort } : pin;
 }
 

@@ -9853,9 +9853,6 @@ export function writeSessionModelPin(
 ): boolean {
   if (!pin && !ds.session.modelPin) return false;
   const explicitEffort = pin?.effort !== undefined;
-  if (pin && (!opts.compareAndSet || pin.model === ds.session.modelPin?.model)) {
-    pin = retainPinEffort(pin, ds.session.modelPin);
-  }
   if (isSessionTransferring(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)) throw new Error('会话正在迁移、重启或修改推理强度，请稍后重试');
   if (ds.session.dispatchLaunchSpec) throw new Error('dispatch 会话使用冻结的启动规格，不支持话题固定');
   // An adopted CLI is owned by the user outside BotMux: it is never respawned
@@ -9871,6 +9868,9 @@ export function writeSessionModelPin(
   const cfg = getBot(ds.larkAppId).config;
   if (pin) {
     const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId;
+    if (!opts.compareAndSet || pin.model === ds.session.modelPin?.model) {
+      pin = retainPinEffort(pin, ds.session.modelPin, cliId);
+    }
     if (cfg.cliId && cliId !== cfg.cliId) throw new Error('会话 CLI 与 bot CLI 不匹配，不能设置固定');
     // An effort carried over from the previous pin of this model was judged
     // when it was pinned (possibly against the catalogue); re-judge it by the

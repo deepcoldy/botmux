@@ -176,6 +176,19 @@ it('Claude does not copy a model pin effort onto a case-distinct gateway ID', ()
   expect(latestPinEffortForRespawn(ds)).toEqual({ reasoningEffort: 'high' });
 });
 
+it('Claude non-CAS modelpin retains effort only for the exact-case model ID', () => {
+  const { ds } = fixture('claude-code');
+  const pin = { model: 'gateway/Alpha', effort: 'max' as const, source: 'command' as const, setBy: 'owner', setAt: new Date().toISOString() };
+  writeSessionModelPin(ds, pin);
+  writeSessionModelPin(ds, { ...pin, effort: undefined });
+  expect(ds.session.modelPin.effort).toBe('max');
+
+  writeSessionModelPin(ds, { ...pin, model: 'gateway/alpha', effort: undefined });
+  expect(ds.session.modelPin.effort).toBeUndefined();
+  expect(store.getOwnedSession(ds.session.sessionId)?.modelPin?.effort).toBeUndefined();
+  expect(latestPinEffortForRespawn(ds)).toEqual({ reasoningEffort: 'high' });
+});
+
 it('Claude card uses the live worker policy on restart and the bot policy on cold resume', () => {
   const { ds } = fixture('claude-code');
   const key = 'CLAUDE_CODE_EFFORT_LEVEL';
