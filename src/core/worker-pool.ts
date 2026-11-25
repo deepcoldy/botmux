@@ -1745,22 +1745,29 @@ function finalOutputHandoffAdmitNew(_ds: DaemonSession): boolean {
 const universalOutputProcessors = new Map<string, { worker: ChildProcess; run(record: OutputDeliveryRecord): Promise<void> }>();
 function outputProcessorKey(ds: DaemonSession): string { return `${ds.larkAppId}:${ds.session.sessionId}`; }
 
+function finalOutputPolicyTurnId(msg: { turnId: string; replyTurnId?: string }): string {
+  return msg.turnId.startsWith('late-recovery-') && typeof msg.replyTurnId === 'string'
+    ? msg.replyTurnId
+    : msg.turnId;
+}
+
 function freezeOutputSink(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): OutputSink {
   if (isSilentMessageListenerSession(ds.session)) return { kind: 'suppressed', reason: 'silent_message_listener' };
+  const policyTurnId = finalOutputPolicyTurnId(msg);
   const journal = outputDeliveryJournal(config.session.dataDir, ds.larkAppId);
   const origin = journal.sink(ds.session.sessionId, msg.turnId);
   if (origin && origin.kind !== 'im') return origin;
-  if (ds.session.vcMeetingReceiver || isMeetingDrivenTurn(ds, msg.turnId, msg.dispatchAttempt)) return { kind: 'managed' };
+  if (ds.session.vcMeetingReceiver || isMeetingDrivenTurn(ds, policyTurnId, msg.dispatchAttempt)) return { kind: 'managed' };
   const native = ds.session.codexAppDispatchLedger?.find(entry => entry.dispatchId === msg.codexAppSettlement?.dispatchId);
-  if (native?.deliverySink === 'suppressed' || msg.suppressDelivery || isTriggerFinalSuppressed(ds, msg.turnId)
-    || isSilentScheduledTurn(ds, msg.turnId)) return { kind: 'suppressed', reason: 'admission_suppressed' };
-  const doc = resolveDocCommentTarget(ds, msg.turnId);
+  if (native?.deliverySink === 'suppressed' || msg.suppressDelivery || isTriggerFinalSuppressed(ds, policyTurnId)
+    || isSilentScheduledTurn(ds, policyTurnId)) return { kind: 'suppressed', reason: 'admission_suppressed' };
+  const doc = resolveDocCommentTarget(ds, policyTurnId);
   if (doc) return { kind: 'doc', context: { ...doc } };
   if (isDocNativeSession(ds) || native?.deliverySink === 'doc_comment') return { kind: 'suppressed', reason: 'doc_target_unavailable' };
-  if (ds.pendingWaitPromises?.has(msg.turnId) || native?.deliverySink === 'http_wait' || ds.chatId.startsWith('http_wait_')) return { kind: 'http', mode: 'wait' };
-  const asyncRecord = asyncTriggerStore.lookupStrict(ds.session.sessionId, msg.turnId);
+  if (ds.pendingWaitPromises?.has(policyTurnId) || native?.deliverySink === 'http_wait' || ds.chatId.startsWith('http_wait_')) return { kind: 'http', mode: 'wait' };
+  const asyncRecord = asyncTriggerStore.lookupStrict(ds.session.sessionId, policyTurnId);
   if (asyncRecord && asyncRecord.ownerLarkAppId !== ds.larkAppId) throw new Error('output_http_owner_mismatch');
-  if (asyncRecord || ds.asyncTriggerResults?.has(msg.turnId) || native?.deliverySink === 'http_async' || isHttpVirtualSession(ds.chatId)) return { kind: 'http', mode: 'async' };
+  if (asyncRecord || ds.asyncTriggerResults?.has(policyTurnId) || native?.deliverySink === 'http_async' || isHttpVirtualSession(ds.chatId)) return { kind: 'http', mode: 'async' };
   if (origin) return origin;
   return { kind: 'im', context: frozenReplyContextForTurn(ds, fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId)),
     chatId: ds.chatId, chatType: ds.chatType, privateReply: privateReplyEnabled(ds.session) };
@@ -23390,12 +23397,13 @@ function setupWorkerHandlers(
         if (!msg.content || !msg.content.trim()) return { status: 'suppressed' };
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) return undefined;
         if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) return undefined;
+        const policyTurnId = finalOutputPolicyTurnId(msg);
         const triggerFailureNotice = msg.turnFailed === true
-          && isTriggerFinalSuppressed(ds, msg.turnId)
+          && isTriggerFinalSuppressed(ds, policyTurnId)
           ? msg.turnFailureNotice?.trim()
           : undefined;
-        if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt, Boolean(triggerFailureNotice))
-          || (triggerFailureNotice && managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt))) {
+        if (managedFinalOutputSuppressed(policyTurnId, msg.dispatchAttempt, Boolean(triggerFailureNotice))
+          || (triggerFailureNotice && managedAuxUiSuppressed(policyTurnId, msg.dispatchAttempt))) {
           logger.debug(`[${t}] final_output captured/discarded for silent turn ${msg.turnId.substring(0, 8)}`);
           return { status: 'suppressed' };
         }

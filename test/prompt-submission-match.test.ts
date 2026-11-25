@@ -169,4 +169,16 @@ describe('WrittenInputLedger', () => {
     expect(ledger.takeSubmitted(submitted('text number 0'))).toBeUndefined();
     expect(ledger.takeSubmitted(submitted('text number 16'))).toBe('t-16');
   });
+
+  it('keeps durable retry attempts distinct and consumes same-content hooks in write order', () => {
+    const ledger = new WrittenInputLedger();
+    ledger.noteWritten('om_retry', 'same durable payload', 1);
+    ledger.noteWritten('om_retry', 'same durable payload', 2);
+    expect(ledger.takeSubmittedIdentity(submitted('same durable payload'))).toEqual({
+      turnId: 'om_retry', dispatchAttempt: 1,
+    });
+    expect(ledger.takeSubmittedIdentity(submitted('same durable payload'))).toEqual({
+      turnId: 'om_retry', dispatchAttempt: 2,
+    });
+  });
 });

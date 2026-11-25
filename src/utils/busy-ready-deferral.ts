@@ -19,7 +19,7 @@
  */
 
 /** Why prompt-ready is currently withheld. */
-export type BusyReadyDeferReason = 'busy-marker' | 'db-busy' | 'settle-aborted';
+export type BusyReadyDeferReason = 'busy-marker' | 'db-busy' | 'settle-aborted' | 'claude-open-turn';
 
 /** Reasons a prompt-ready publication attempt was skipped (observability). */
 export type PromptReadySkipReason =
@@ -28,7 +28,8 @@ export type PromptReadySkipReason =
   | 'native-session-fork-hold'
   | 'structured-turn-unfinished'
   | 'submit-verification-pending'
-  | 'settle-aborted';
+  | 'settle-aborted'
+  | 'claude-open-turn';
 
 export interface BusyReadyDeferInput {
   reason: BusyReadyDeferReason;
