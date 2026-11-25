@@ -23181,6 +23181,7 @@ function setupWorkerHandlers(
    * evidence side door. During an ordinary restore, recovery/expiry must enter
    * the normal transaction before its sole worker edge is deduplicated. */
   const shouldUsePreReadyAntigravitySideDoor = (frame: UsageLimitFrameInput): boolean => {
+    if (sessionCliId(ds, botCfg) !== 'antigravity') return false;
     if (!isPreReadyOrInFlightRotation()) return false;
     if (ds.antigravityRotation?.inFlightToken) return true;
     return !frame.usageLimitRecovery && !frame.expiredAntigravityQuota;
