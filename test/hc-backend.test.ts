@@ -15,6 +15,7 @@ import { HC_STARTUP_RETRY_DELAYS_MS, hcCallSync, sleepHcStartupRetry, startHcCor
 import type { HcEnd, HcEvent, HcSnapshot, HcTerminalRecord } from '../src/adapters/backend/hc/types.js';
 import { HcBackend } from '../src/adapters/backend/hc-backend.js';
 import type { SpawnOpts } from '../src/adapters/backend/types.js';
+import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 
 vi.mock('../src/adapters/backend/hc/sync-rpc.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/adapters/backend/hc/sync-rpc.js')>(),
@@ -126,6 +127,7 @@ class FakeClient {
       return this.terminal;
     }
     if (method === 'terminal.read') return { text: this.readText, complete: true, how: 'history' };
+    if (method === 'doc.get') return { version: 0, value: null };
     return {};
   }
   async subscribe(params: Record<string, unknown>): Promise<FakeSub> {
@@ -924,6 +926,49 @@ describe('reconnect', () => {
     current.drop();
     return { client, stream: await attached(client) };
   }
+
+  it('leaves a parked Herdr tab alone when the same worker reconnects', async () => {
+    const first = queueClient();
+    const backend = backendFor({ sessionId: SID, herdrTabTitle: 'Topic title' });
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    await vi.waitFor(() => expect(first.methods()).toContain('doc.set'));
+
+    // The new connection answers with an empty layout, as after parking the pane.
+    const second = await reconnected(first);
+    expect(second.client.methods()).toEqual(['server.status', 'terminal.get']);
+  });
+
+  it('stops retrying a failing Herdr save and tries again on the next connection', async () => {
+    const first = queueClient();
+    const second = queueClient();
+    const call = first.call.bind(first);
+    vi.spyOn(first, 'call').mockImplementation(async (method, params) => {
+      const result = await call(method, params);
+      if (method === 'doc.set') throw new HcError('rpc', 'cannot save document', { rpcCode: -32603 });
+      return result;
+    });
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.useFakeTimers();
+    try {
+      const backend = backendFor({ sessionId: SID, herdrTabTitle: 'Topic title' });
+      backend.spawn('/usr/bin/claude', [], spawnOpts());
+      await flushFakeTimers(20_000, 100);
+
+      expect(first.methods().filter(method => method === 'doc.set').length).toBeGreaterThan(1);
+      const callsAfterFailure = first.calls.length;
+      await flushFakeTimers(10_000, 100);
+      expect(first.calls).toHaveLength(callsAfterFailure);
+      expect(backend.isPaneAlive()).toBe(true);
+
+      first.drop();
+      await flushFakeTimers(1_000, 50);
+      expect(second.methods().filter(method => method === 'doc.set')).toHaveLength(1);
+      const failures = stderr.mock.calls.filter(([message]) => String(message).includes('cannot save document'));
+      expect(failures).toHaveLength(1);
+    } finally {
+      stderr.mockRestore();
+    }
+  });
 
   it('does not replay a status the worker already heard, painted or live', async () => {
     const first = queueClient();

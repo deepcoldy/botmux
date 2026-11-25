@@ -10,6 +10,7 @@ import { fenceHomeRootedEnv } from './helpers/fence-home-env.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import { workerTmuxArgs } from './helpers/worker-tmux-session.js';
+import { normaliseTraexInputNewlines, stripTraexInputCorrelation } from '../src/services/traex-skill-input.js';
 
 const delay = (ms: number) => new Promise<void>(done => setTimeout(done, ms));
 /** Longest gap between two polls that still counts against a step budget. */
@@ -95,7 +96,7 @@ const collect = (${createBracketedPasteCollector.toString()})(text => {
       idle();
     },300);
     else if (mode === 'unknown') setTimeout(idle,300);
-    else if (mode !== 'late-terminal') setTimeout(() => complete(id),mode === 'skill-adopt-terminal' ? 3400 : 300);
+    else if (mode !== 'late-terminal' && mode !== 'skill-adopt-terminal') setTimeout(() => complete(id),300);
   } else setTimeout(() => complete(id),300);
 }, text => {
   if (!mode.startsWith('parked-') || count) return true;
@@ -204,6 +205,9 @@ setInterval(() => {
         }
         sent('diagnose one', 'om_follow_one');
         sent('diagnose two', 'om_follow_two');
+        // Exercise a genuinely deferred native completion: worker scheduling
+        // or fd probing must not let it race ahead of the receipt timeout.
+        if (mode === 'skill-adopt-terminal') writeFileSync(release, 'complete after receipt exhausted');
         if (mode === 'late-terminal' || mode === 'unknown') {
           await wait(() => logs.join('').includes('Holding 2 pending message(s) behind unconfirmed input delivery'),
             'unknown input holds successors');
@@ -227,7 +231,22 @@ setInterval(() => {
           && m.turnId === 'om_follow_two' && m.status === 'completed'), 'successors completed',
         mode === 'early-send' ? 35_000 : 12_000);
         expect(received()[0]!.text.startsWith(adopt ? '/receipt check version' : 'check version')).toBe(true);
-        expect(received().slice(1).map(row => row.text)).toEqual(['diagnose one', 'diagnose two']);
+        expect(received().slice(1).map(row => stripTraexInputCorrelation(row.text))).toEqual(['diagnose one', 'diagnose two']);
+        if (adopt) {
+          // tmux transports the paste with CR separators. The routing block is
+          // submit evidence; it must not become part of the native skill args
+          // used to settle the original IM turn or hold its successors.
+          const markers = received().map(row => normaliseTraexInputNewlines(row.text)
+            .match(/\n\n<botmux_routing>\nbotmux_input_id: ([0-9a-f]{32})\n<\/botmux_routing>$/)?.[1]);
+          expect(markers.every(Boolean)).toBe(true);
+          expect(new Set(markers).size).toBe(3);
+          for (const turnId of ['om_first', 'om_follow_one', 'om_follow_two']) {
+            expect(messages.filter(m => m.type === 'final_output' && m.turnId === turnId))
+              .toEqual([expect.objectContaining({ content: 'VERSION_EXECUTED_AND_REPLIED' })]);
+            expect(messages.filter(m => m.type === 'turn_terminal' && m.turnId === turnId))
+              .toEqual([expect.objectContaining({ status: 'completed' })]);
+          }
+        }
         expect(messages.some(m => (m.type === 'user_notify' && m.kind === 'input_not_submitted')
           || (m.type === 'turn_terminal' && m.errorCode === 'submit_unconfirmed'))).toBe(false);
         expect(messages.filter(m => m.type === 'user_notify')).toEqual([]);

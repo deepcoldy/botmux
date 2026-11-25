@@ -21,7 +21,8 @@ if (process.env.BOTMUX_TEST_REQUIRE_LARK_CLI === '1' && !canIsolateNetwork) {
   throw new Error('required lark-cli contract needs working bwrap network isolation');
 }
 describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials)', () => {
-  let root: string, binding: LarkToolBinding, server: ReturnType<typeof createServer>, port: number, requests: string[];
+  type IdentityRequest = { mode: string; policyOnly?: boolean };
+  let root: string, binding: LarkToolBinding, server: ReturnType<typeof createServer>, port: number, requests: IdentityRequest[];
   let credentialTypeOverride: string | undefined;
   beforeEach(async () => {
     verifyCli();
@@ -31,10 +32,15 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
     binding = prepareLarkToolEnv({ env: { PATH: process.env.PATH }, effectivePath: '', dataDir: root, sessionId: 'contract', appId: 'cli_contract' });
     binding.realBinary = realCli!;
     server = createServer(async (req, res) => {
-      const parsed = await readRequestBodyJson<{ mode: string }>(req);
+      const parsed = await readRequestBodyJson<IdentityRequest>(req);
       if (!parsed) { res.writeHead(400).end(); return; }
-      const mode = parsed.mode; requests.push(mode);
+      requests.push(parsed);
       res.setHeader('content-type', 'application/json');
+      if (parsed.policyOnly === true) {
+        res.end(JSON.stringify({ ok: true, policyOnly: true }));
+        return;
+      }
+      const { mode } = parsed;
       res.end(JSON.stringify({ ok: true, appId: binding.appId, mode,
         credentialType: credentialTypeOverride ?? (mode === 'bot' ? 'tenant_access_token' : 'user_access_token'),
         credential: 'fake-not-a-live-credential' }));
@@ -50,10 +56,20 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
     if (root) rmSync(root, { recursive: true, force: true });
     verifyCli();
   });
-  function run(args: string[]) {
+  function run(args: string[], inheritedEnv: NodeJS.ProcessEnv = process.env) {
+    // Explicit profiles inherit the runner environment. Keep runtime/test
+    // fences while isolating the native CLI's config, data and credentials.
+    const env = { ...inheritedEnv };
+    for (const key of Object.keys(env)) {
+      if (/^(LARKSUITE_CLI_|LARK_CLI_|LARK_APP_|FEISHU_)/.test(key) || key === 'BOTMUX_AS') delete env[key];
+    }
     return new Promise<{ code: number | null; out: string; err: string }>((resolveResult, reject) => {
       const child = spawnTsScript(resolve('src/lark-tool-runner.ts'), ['--binding', larkToolBindingPath(root, 'contract'), '--', ...args], {
-        env: { ...process.env, HOME: join(root, 'home'), USERPROFILE: join(root, 'home'), BOTMUX_DAEMON_IPC_PORT: String(port) },
+        env: {
+          ...env, HOME: join(root, 'home'), USERPROFILE: join(root, 'home'),
+          LARKSUITE_CLI_CONFIG_DIR: join(root, 'native-config'), LARKSUITE_CLI_DATA_DIR: join(root, 'native-data'),
+          BOTMUX_DAEMON_IPC_PORT: String(port),
+        },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let out = '', err = ''; child.stdout!.on('data', b => out += b); child.stderr!.on('data', b => err += b);
@@ -104,29 +120,39 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
     const body = JSON.parse(result.out);
     expect(body.dry_run).toBe(true);
     expect(JSON.stringify(body)).toContain('--as=user');
-    expect(requests).toEqual(['bot']);
+    expect(requests).toEqual([{ mode: 'bot' }]);
   });
   it('preserves replacement text without switching to user', async () => {
     const result = await run(['sheets', '+cells-replace', '--spreadsheet-token', 'sheet-fixture', '--sheet-id', 'tab', '--range', 'tab!A1', '--find', 'old', '--replacement', '--as=user', '--dry-run']);
     expect(result.code, result.err).toBe(0);
     expect(JSON.parse(result.out).dry_run).toBe(true);
     expect(result.out).toContain('--as=user');
-    expect(requests).toEqual(['bot']);
+    expect(requests).toEqual([{ mode: 'bot' }]);
   });
   it('strips a trailing bound-app --profile and still uses the managed bot identity', async () => {
     const result = await run(['docs', '+fetch', '--doc', 'doc-fixture', '--dry-run', '--profile', binding.appId]);
     expect(result.code, result.err).toBe(0);
     const body = JSON.parse(result.out);
     expect(body.dry_run).toBe(true);
-    expect(requests).toEqual(['bot']);
+    expect(requests).toEqual([{ mode: 'bot' }]);
   });
-  it('passes a trailing foreign --profile to the binary without requesting managed identity', async () => {
+  it('checks policy once before passing a trailing foreign --profile to the binary without a managed credential', async () => {
     // lark-cli 1.0.80 answers an unknown profile with exit 3 / not_configured.
     // A CLI upgrade that changes this contract is diagnosed here on purpose.
-    const result = await run(['docs', '+fetch', '--doc', 'doc-fixture', '--dry-run', '--profile', 'cli_other1234']);
+    // A developer's external CLI config may actually contain this profile.
+    // The real binary must only see the fixture's disposable config.
+    const externalConfig = join(root, 'external-config');
+    mkdirSync(externalConfig);
+    writeFileSync(join(externalConfig, 'config.json'), JSON.stringify({
+      apps: [{ appId: 'cli_other1234', brand: 'feishu', users: [] }],
+    }));
+    const result = await run(
+      ['docs', '+fetch', '--doc', 'doc-fixture', '--dry-run', '--profile', 'cli_other1234'],
+      { ...process.env, LARKSUITE_CLI_CONFIG_DIR: externalConfig },
+    );
     expect(result.code, result.out + result.err).toBe(3);
     expect(JSON.parse(result.err || result.out).error?.subtype).toBe('not_configured');
-    expect(requests).toEqual([]);
+    expect(requests).toEqual([{ mode: 'bot', policyOnly: true }]);
   });
   it('rejects a daemon response whose credential type does not match the invocation', async () => {
     credentialTypeOverride = 'user_access_token';
@@ -134,7 +160,7 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
     expect(result.code).toBe(77);
     expect(result.err).toContain('identity does not match');
     expect(result.out).toBe('');
-    expect(requests).toEqual(['bot']);
+    expect(requests).toEqual([{ mode: 'bot' }]);
   });
   it.each([['event', 'list', '--json'], ['event', 'schema', 'im.message.receive_v1', '--json'], ['doctor', '--offline']])(
     'passes local command without identity or unsupported flags: %s %s', async (...args) => {

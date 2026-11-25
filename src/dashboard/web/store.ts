@@ -305,7 +305,14 @@ export class Store {
       if (cur) this.sessions.set(body.sessionId, { ...cur, ...body.patch });
     } else if (type === 'session.exited') {
       const cur = this.sessions.get(body.sessionId);
-      if (cur) this.sessions.set(body.sessionId, { ...cur, status: 'closed' });
+      if (cur) {
+        this.sessions.set(body.sessionId, {
+          ...cur,
+          status: 'closed',
+          queuedActivationPending: null,
+          queuedActivationTailCount: null,
+        });
+      }
     } else if (type === 'schedule.created') {
       this.schedules.set(body.schedule.id, body.schedule);
     } else if (type === 'schedule.updated') {

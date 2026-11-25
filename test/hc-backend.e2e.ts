@@ -15,8 +15,9 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, 
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { HcBackend } from '../src/adapters/backend/hc-backend.js';
+import { HcClient } from '../src/adapters/backend/hc/client.js';
 import { hcTerminalName, probeHcTerminal, type HcTarget } from '../src/adapters/backend/hc/cli-ops.js';
-import { hcControlEnv, hcCoreAddress, hcCorePaths, hcRuntimeDirError } from '../src/adapters/backend/hc/core.js';
+import { hcControlEnv, hcCoreAddress, hcCorePaths, hcRuntimeError } from '../src/adapters/backend/hc/core.js';
 import { resolveHcBackendGate, selectSessionBackend } from '../src/adapters/backend/session-backend-selector.js';
 import type { PersistentBackendTarget } from '../src/adapters/backend/types.js';
 import {
@@ -75,6 +76,7 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
   let root: string;
   let cli: string;
   let hostBefore: string[];
+  let initialCoreEnv: NodeJS.ProcessEnv;
   const opened: HcBackend[] = [];
 
   beforeAll(() => {
@@ -84,6 +86,11 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
     hostBefore = hostEntries();
     resetHcAvailabilityCache();
     root = mkdtempSync('/tmp/bmhce-');
+    // Exercise the macOS default address while keeping the real hc invocations
+    // under the test fence's XDG_RUNTIME_DIR.
+    initialCoreEnv = process.platform === 'darwin'
+      ? { ...process.env, SESSION_DATA_DIR: join(root, 'data'), XDG_RUNTIME_DIR: undefined }
+      : process.env;
     mkdirSync(join(root, 'home'));
     cli = join(root, 'cli.sh');
     writeFileSync(cli, CLI);
@@ -93,26 +100,28 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
 
   afterAll(() => {
     for (const backend of opened.splice(0)) backend.destroySession();
-    if (process.env.BOTMUX_HC_BIN) {
+    if (process.env.BOTMUX_HC_BIN && initialCoreEnv) {
       // `server stop` only connects: it never starts a core.
-      spawnSync(process.env.BOTMUX_HC_BIN, ['server', 'stop'], {
-        env: hcControlEnv(process.env, hcCorePaths(process.env)),
-        cwd: '/',
-        stdio: 'ignore',
-        timeout: 20_000,
-      });
+      for (const socketEnv of new Set([process.env, initialCoreEnv])) {
+        spawnSync(process.env.BOTMUX_HC_BIN, ['server', 'stop'], {
+          env: hcControlEnv(process.env, hcCorePaths(socketEnv)),
+          cwd: '/',
+          stdio: 'ignore',
+          timeout: 20_000,
+        });
+      }
     }
     resetHcAvailabilityCache();
     if (root) rmSync(root, { recursive: true, force: true });
   });
 
-  function workerGate(sessionId: string, recorded?: PersistentBackendTarget) {
+  function workerGate(sessionId: string, recorded?: PersistentBackendTarget, coreEnv = process.env) {
     return resolveHcBackendGate({
       sessionId,
       recorded,
       availability: () => probeHcAvailability({ env: process.env }),
-      defaultCore: () => hcCoreAddress(hcCorePaths(process.env)),
-      coreUnreachable: core => hcRuntimeDirError(hcCorePaths(process.env, { core })),
+      defaultCore: () => hcCoreAddress(hcCorePaths(coreEnv)),
+      coreUnreachable: core => hcRuntimeError(hcCorePaths(process.env, { core })),
       probe: target => probeHcTerminal(target),
     });
   }
@@ -129,10 +138,11 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
   }
 
   /** What a worker does with a fresh session: gate, select, spawn the CLI, wait for it. */
-  async function startSession(sessionId = randomUUID()): Promise<{ sessionId: string; target: HcTarget; session: Watched }> {
+  async function startSession(sessionId = randomUUID(), hcHerdrTabTitle?: string): Promise<{ sessionId: string; target: HcTarget; session: Watched }> {
     const gate = workerGate(sessionId);
     const selected = selectSessionBackend({
       backendType: 'hc', sessionId, persistentBackendTarget: gate.target, hasExistingSession: gate.hasExistingSession,
+      hcHerdrTabTitle,
     });
     const backend = selected.backend as HcBackend;
     opened.push(backend);
@@ -144,7 +154,7 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
 
   it('runs a CLI, reattaches it from a new worker instance and ends it from the daemon', async () => {
     const sessionId = randomUUID();
-    const gate = workerGate(sessionId);
+    const gate = workerGate(sessionId, undefined, initialCoreEnv);
     expect(gate).toMatchObject({ available: true, probe: 'missing', hasExistingSession: false });
     const selected = selectSessionBackend({
       backendType: 'hc', sessionId, persistentBackendTarget: gate.target, hasExistingSession: gate.hasExistingSession,
@@ -156,7 +166,9 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
       backendType: 'hc',
       sessionName: hcTerminalName(sessionId),
       hcSession: 'botmux',
-      socket: join(process.env.XDG_RUNTIME_DIR!, 'herdr-core', 'botmux.sock'),
+      socket: process.platform === 'darwin'
+        ? join(root, 'hc', 'botmux.sock')
+        : join(process.env.XDG_RUNTIME_DIR!, 'herdr-core', 'botmux.sock'),
     });
     // Deciding needed no core; the spawn starts the first one, from the control env.
     expect(existsSync(target.socket)).toBe(false);
@@ -239,6 +251,34 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
     killPersistentBackendTarget(active.target, active.sessionId);
     killPersistentBackendTarget(foreign.target, foreign.sessionId);
   }, 120_000);
+
+  it('registers only opted-in sessions as native Herdr tabs on the private core without enabling keep', async () => {
+    let client: HcClient | undefined;
+    try {
+      const unregistered = await startSession();
+      const title = 'Inspect the wallet flow';
+      const sessions = await Promise.all([startSession(randomUUID(), title), startSession(randomUUID(), '')]);
+      const names = [title, sessions[1].target.sessionName];
+      client = await HcClient.connect(sessions[0].target.socket);
+      const terminals = await Promise.all(sessions.map(({ target }) =>
+        client!.call<{ address: string; keep: boolean }>('terminal.get', { terminal: target.sessionName })));
+      expect(terminals.map(record => record.keep)).toEqual([false, false]);
+
+      const ownerCore = client;
+      await vi.waitFor(async () => {
+        const doc = await ownerCore.call<{ value: { spaces: Array<{ folder: string; tabs: unknown[] }> } }>('doc.get', { name: 'herdr-app' });
+        expect(doc.value?.spaces).toMatchObject([{ folder: root, tabs: [expect.anything(), expect.anything()] }]);
+        expect(doc.value.spaces[0]!.tabs).toEqual(expect.arrayContaining(terminals.map(({ address }, index) =>
+          expect.objectContaining({
+            name: names[index],
+            root: expect.objectContaining({ children: [expect.objectContaining({ content: { terminal: address } })] }),
+          }))));
+      });
+      expect(probePersistentBackendTarget(unregistered.target)).toBe('exists');
+    } finally {
+      client?.close();
+    }
+  }, 60_000);
 
   it('leaves the host hc runtime dir as it was', () => {
     expect(hostEntries().filter(entry => !hostBefore.includes(entry))).toEqual([]);
