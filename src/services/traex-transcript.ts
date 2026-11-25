@@ -78,12 +78,34 @@ import { isBotmuxGoalObjective } from '../workflows/v3/contract.js';
 import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { traeHome, traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
-import { traexHistoryInputMatches, traexSkillInputAliases } from './traex-skill-input.js';
+import { traexHistoryInputMatches, traexSkillInputAliases, stripTraexInputCorrelation } from './traex-skill-input.js';
 import { probeProcessOpenFiles, type ProcessOpenFilesDenial } from '../utils/process-open-files.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
 export { extractLastCodexTurn as extractLastTraexTurn };
 export type { CodexBridgeEvent as TraexBridgeEvent };
+
+/** A terminal may be adopted while its native turn is already running. Keep
+ * that unfinished input with the live partition, preserving its real timestamp
+ * and identity; completed history stays absorbed and can never be replayed. */
+export function splitTraexAdoptEvents(events: readonly CodexBridgeEvent[], cutoff: number): {
+  history: CodexBridgeEvent[]; live: CodexBridgeEvent[]; localSinceMs: number;
+} {
+  const split = splitCodexEventsByCutoff(events, cutoff);
+  let inputIndex = -1;
+  for (let i = split.history.length - 1; i >= 0; i--) {
+    if (split.history[i]!.kind === 'user') { inputIndex = i; break; }
+  }
+  const input = split.history[inputIndex];
+  if (!input || split.history.slice(inputIndex + 1).some(event => event.kind === 'assistant_final')) {
+    return { ...split, localSinceMs: cutoff };
+  }
+  return {
+    history: split.history.filter(event => event !== input),
+    live: [input, ...split.live],
+    localSinceMs: Math.min(cutoff, input.timestampMs),
+  };
+}
 
 export interface TraexDrainResult extends CodexDrainResult {
   /** Latest executor-reported model observed in the drained complete records. */
@@ -1071,8 +1093,8 @@ export function drainTraexRollout(
         if (item?.type !== 'message' || item.role !== 'user'
           || meta?.turn_id !== sourceTurnId || !Array.isArray(meta.content_item_kinds)
           || !meta.content_item_kinds.includes('user.text') || !Array.isArray(item.content)) continue;
-        const text = item.content.flatMap((block: any) => block?.type === 'input_text'
-          && typeof block.text === 'string' ? [block.text] : []).join('');
+        const text = stripTraexInputCorrelation(item.content.flatMap((block: any) => block?.type === 'input_text'
+          && typeof block.text === 'string' ? [block.text] : []).join(''));
         if (text && claimUserTurn(sourceTurnId)) {
           const inputTextAliases = traexSkillInputAliases(text, item.content);
           events.push({ ...base, kind: 'user', text, sourceTurnId,
@@ -1115,7 +1137,7 @@ export function drainTraexRollout(
     if (obj.type === 'event_msg'
       && payload.type === 'user_message'
       && typeof payload.message === 'string') {
-      const userText = payload.message;
+      const userText = stripTraexInputCorrelation(payload.message);
       const inputTextAliases = traexSkillInputAliases(userText);
       if (!sourceTurnId) {
         if (takeExpectedTraexUserMirror(pendingUserMirrors, 'legacy', userText, base.timestampMs)) continue;
@@ -1147,7 +1169,7 @@ export function drainTraexRollout(
     }
     if (obj.type === 'event_msg'
       && payload.type === 'item_completed') {
-      const userText = itemCompletedUserText(payload.item);
+      const userText = stripTraexInputCorrelation(itemCompletedUserText(payload.item) ?? '');
       if (userText) {
         const inputTextAliases = traexSkillInputAliases(userText, payload.item.content);
         const sourceMessageId = typeof payload.item.id === 'string' && payload.item.id

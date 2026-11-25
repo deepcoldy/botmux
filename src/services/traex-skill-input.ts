@@ -34,6 +34,13 @@ export function normaliseTraexInputNewlines(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
+/** Remove only the exact trailing block appended by an adopted input write.
+ * Transcript attribution/display use the original user text; submit history
+ * matching must retain the block so it still proves that particular write. */
+export function stripTraexInputCorrelation(text: string): string {
+  return text.replace(/\r?\n\r?\n<botmux_routing>\r?\nbotmux_input_id: [0-9a-f]{32}\r?\n<\/botmux_routing>$/, '');
+}
+
 export function traexHistoryInputMatches(recordedText: string, expectedText: string): boolean {
   const expected = normaliseTraexInputNewlines(expectedText);
   return normaliseTraexInputNewlines(recordedText) === expected
