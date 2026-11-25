@@ -149,7 +149,7 @@ import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotC
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
-import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
+import { isFableModelId, normalizeClaudeModelId, ABSORBED_REPLY_MAX_CHARS } from '../services/claude-transcript.js';
 import { cliModelMayKeepReasoningEffort, cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
@@ -238,6 +238,9 @@ import {
 } from '../im/lark/md-card.js';
 import { buildTrustedResultDeliveryCard } from '../im/lark/trusted-result-delivery-card.js';
 import { resolvePluginResultAccessUrl } from './plugin-result-access-url.js';
+import { PluginResultArtifactStore } from './plugins/mcp/result-artifact-store.js';
+import { ProtectedResultStore } from '../services/protected-result-store.js';
+import { deliverProtectedResult, ProtectedResultDeliveryError } from '../services/protected-result-delivery.js';
 import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
 import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-images.js';
 import { normalizeDoubaoReplyImages } from '../services/doubao-rich-media.js';
@@ -1148,7 +1151,7 @@ import {
 import { parseVcMeetingListenerOutput } from '../services/vc-meeting-listener-output-protocol.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
-import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn, resolveDeferredScheduledTurnId } from './silent-schedule-turns.js';
+import { armSilentScheduledTurn, disarmSilentScheduledTurn, isActiveTurnSilentSchedule, isSilentScheduledTurn, noteNonSilentTurnActivity, resolveDeferredScheduledTurnId } from './silent-schedule-turns.js';
 import { isSilentMessageListenerSession } from './message-listener-silence.js';
 import {
   mintScheduledContinuationTurnId,
@@ -4194,6 +4197,7 @@ export function ensureReadonlyTaskContinuationAttached(
           beginRecovery: false,
           dispatchAttempt: dispatch.dispatchAttempt,
         });
+        noteAdmittedTurnSilentScheduleState(ds, dispatch.turnId);
         return workerGeneration!;
       } catch (err) {
         logger.error(
@@ -9350,6 +9354,16 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
   const w = ds.worker;
+  // This function nulls ds.worker synchronously, so the later process `exit`
+  // event fails the current-worker check and cannot perform this cleanup.
+  const wasSilentSchedule = ds.lastPublishedActiveTurnSilentSchedule === true
+    || isActiveTurnSilentSchedule(ds, effectiveActiveSilentScheduleStatus(ds));
+  const hadBackgroundTasks = ds.backgroundTaskCount !== undefined;
+  ds.lastScreenTurnId = undefined;
+  ds.lastScreenTurnGeneration = undefined;
+  ds.latestSilentScheduledTurn = undefined;
+  ds.lastPublishedActiveTurnSilentSchedule = false;
+  ds.backgroundTaskCount = undefined;
   if (w && !w.killed) {
     trackLifecycleRetirement(ds, w);
     try { w.kill('SIGTERM'); } catch { /* already gone */ }
@@ -9360,6 +9374,19 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   ds.workerToken = null;
   ds.workerViewToken = null;
   ds.workerCardViewToken = null;
+  if (wasSilentSchedule || hadBackgroundTasks) {
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: {
+          status: 'dormant',
+          ...(wasSilentSchedule ? { activeTurnSilentSchedule: false } : {}),
+          ...(hadBackgroundTasks ? { backgroundTaskCount: null } : {}),
+        },
+      },
+    });
+  }
 }
 
 function clearTransferWorkerState(
@@ -13395,7 +13422,13 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   invalidateTuiPrompt(ds, 'suspendWorker');
   // Screen state describes the process we just stopped. Keeping it would make
   // the dashboard hydrate this process-less logical session as idle/working.
+  const wasSilentSchedule = ds.lastPublishedActiveTurnSilentSchedule === true;
+  const hadBackgroundTasks = ds.backgroundTaskCount !== undefined;
   ds.lastScreenStatus = undefined;
+  ds.lastScreenTurnId = undefined;
+  ds.lastScreenTurnGeneration = undefined;
+  ds.latestSilentScheduledTurn = undefined;
+  ds.lastPublishedActiveTurnSilentSchedule = false;
   ds.backgroundTaskCount = undefined;
   releaseHeldCotMessage(ds);
   ds.awaySummaryPending = undefined;
@@ -13443,6 +13476,8 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
           status: 'dormant',
           webPort: null,
           workerPid: null,
+          ...(hadBackgroundTasks ? { backgroundTaskCount: null } : {}),
+          ...(wasSilentSchedule ? { activeTurnSilentSchedule: false } : {}),
         },
       },
     });
@@ -16286,18 +16321,29 @@ export function sendWorkerSessionInput(
     : message;
   const annotated = withTurnCaller(ds, scoped);
   if (!assistantTransferInputDeliveryAllowed(ds, annotated, 'worker session input')) return false;
+  const noteAcceptedNonSilentDirectInput = (): void => {
+    if (
+      (message.type === 'raw_input' || message.type === 'inject_command')
+      && typeof noteAdmittedTurnSilentScheduleState === 'function'
+    ) {
+      noteAdmittedTurnSilentScheduleState(ds, 'turnId' in message ? message.turnId : undefined);
+    }
+  };
   if (bufferTransferInput(ds, annotated)) {
     if (onIpcDispatched) transferInputDispatchCallbacks.set(annotated, onIpcDispatched);
+    noteAcceptedNonSilentDirectInput();
     return true;
   }
   const worker = ds.worker;
   if (!worker || worker.killed) return false;
-  return afterWorkerIpcBootstrap(worker, () => {
+  const accepted = afterWorkerIpcBootstrap(worker, () => {
     if (!assistantTransferInputDeliveryAllowed(ds, annotated, 'worker session input after bootstrap')) return;
     const sent = worker.send(annotated);
     if (onIpcDispatched && sent !== false && ds.worker === worker && canForkRegisteredSession(ds)) onIpcDispatched();
     return sent;
   });
+  if (accepted) noteAcceptedNonSilentDirectInput();
+  return accepted;
 }
 
 /** Prompt-cache keep-alive delivery. Deliberately NOT routed through the
@@ -18108,6 +18154,48 @@ function rollbackWorkerForkPreInit(
   if (changed) sessionStore.updateSession(ds.session);
 }
 
+function effectiveActiveSilentScheduleStatus(ds: DaemonSession): string | undefined {
+  if (ds.session.queued || !ds.worker || ds.worker.killed) return undefined;
+  return ds.lastScreenStatus ?? (ds.workerReady === true ? 'working' : 'starting');
+}
+
+/** 统一在真实回合准入边界（send / fork / queued tail / direct raw_input）同步静默巡检态并推送 SSE 翻转。 */
+function noteAdmittedTurnSilentScheduleState(
+  ds: DaemonSession,
+  turnId: string | undefined,
+): void {
+  const effectiveStatus = effectiveActiveSilentScheduleStatus(ds);
+  const isSilentAdmission = Boolean(turnId) && isSilentScheduledTurn(ds, turnId);
+  if (!isSilentAdmission) {
+    const wasSilent = ds.lastPublishedActiveTurnSilentSchedule === true
+      || isActiveTurnSilentSchedule(ds, effectiveStatus);
+    noteNonSilentTurnActivity(ds);
+    const nextSilent = isActiveTurnSilentSchedule(ds, effectiveStatus);
+    if (wasSilent && !nextSilent) {
+      ds.lastPublishedActiveTurnSilentSchedule = false;
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: {
+          sessionId: ds.session.sessionId,
+          patch: { activeTurnSilentSchedule: false },
+        },
+      });
+    }
+    return;
+  }
+  const nextSilent = isActiveTurnSilentSchedule(ds, effectiveStatus);
+  if (nextSilent && ds.lastPublishedActiveTurnSilentSchedule !== true) {
+    ds.lastPublishedActiveTurnSilentSchedule = true;
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: { activeTurnSilentSchedule: true },
+      },
+    });
+  }
+}
+
 /** Finish ordinary-turn recovery bookkeeping only after a fresh Lark turn has
  * crossed its real admission boundary (durable activation tail or worker
  * input). The user turn is already accepted at this point, so persistence
@@ -18746,6 +18834,9 @@ export function sendWorkerInput(
       },
     });
   }
+  if (typeof noteAdmittedTurnSilentScheduleState === 'function') {
+    noteAdmittedTurnSilentScheduleState(ds, turnId);
+  }
   return true;
 }
 
@@ -19286,6 +19377,9 @@ export function promoteQueuedActivationTail(
         ...(exactInput.trustedCaller ? { trustedCaller: { ...exactInput.trustedCaller } } : {}),
       },
     });
+    if (typeof noteAdmittedTurnSilentScheduleState === 'function') {
+      noteAdmittedTurnSilentScheduleState(ds, head.turnId);
+    }
   } catch (err) {
     // Durable ownership already moved to the journal (and Codex ledger). Never
     // append another owner on retry; fence this IPC generation and let recovery
@@ -19387,6 +19481,9 @@ export function admitQueuedActivationTail(
     } catch (err) {
       logger.warn(`[${tag(ds)}] Startup circuit recovery waits for new input: ${String(err)}`);
     }
+  }
+  if (typeof noteAdmittedTurnSilentScheduleState === 'function') {
+    noteAdmittedTurnSilentScheduleState(ds, entry.turnId);
   }
   return admitted;
 }
@@ -19640,7 +19737,7 @@ export function resolveQuarantinedForkPlan(
  */
 export function freezeSessionSandboxDecision(
   ds: DaemonSession,
-  botCfg: Pick<BotConfig, 'sandbox' | 'readIsolation' | 'sandboxPaths' | 'sandboxHidePaths' | 'sandboxReadonlyPaths' | 'sandboxNetwork' | 'sandboxNetworkPolicy' | 'sandboxWithholdBotSecret' | 'scratchStorage' | 'scratchTmpfsSizeMb' | 'scratchDenyPaths'>,
+  botCfg: Pick<BotConfig, 'sandbox' | 'readIsolation' | 'sandboxPaths' | 'sandboxHidePaths' | 'sandboxReadonlyPaths' | 'sandboxNetwork' | 'sandboxNetworkPolicy' | 'sandboxWithholdBotSecret' | 'protectedResults' | 'scratchStorage' | 'scratchTmpfsSizeMb' | 'scratchDenyPaths'>,
   opts: { resume?: boolean } = {},
 ): void {
   if (ds.session.sandbox !== undefined) return;
@@ -19657,6 +19754,7 @@ export function freezeSessionSandboxDecision(
     // Decided against the sandbox the worker will actually build (BOTMUX_SANDBOX
     // forcing included), not only the configured one.
     if (sandboxWithholdsBotSecret(botCfg)) ds.session.sandboxWithholdBotSecret = true;
+    ds.session.protectedResults = botCfg.protectedResults === true ? true : undefined;
     if (ds.session.sandbox === 'scratch') {
       ds.session.sandboxScratch = {
         storage: normalizeScratchStorage(botCfg.scratchStorage),
@@ -21306,6 +21404,7 @@ function forkWorkerPrepared(
     sandboxNetwork: ds.session.sandboxNetwork !== false,
     sandboxNetworkPolicy: ds.session.sandboxNetworkPolicy ? structuredClone(ds.session.sandboxNetworkPolicy) : undefined,
     ...(ds.session.sandboxWithholdBotSecret === true ? { sandboxWithholdBotSecret: true } : {}),
+    ...(ds.session.protectedResults === true ? { protectedResults: true } : {}),
     // Per-bot local read isolation (enforced worker-side; the worker gates it).
     // Sibling data needs no app-id enumeration: per-bot dirs are denied wholesale
     // and per-bot session files by filename pattern (see buildV2DenyPaths).
@@ -21600,6 +21699,10 @@ function forkWorkerPrepared(
       },
     });
   }
+  if ((prompt.length > 0 || Boolean(initAttributionTurnId))
+    && !(Boolean(initAttributionTurnId) && isSilentScheduledTurn(ds, initAttributionTurnId))) {
+    noteNonSilentTurnActivity(ds);
+  }
   ds.spawnedAt = Date.now();
   // master: per-runtime-key CLI version (the init send already happened above via
   // the tracked-delivery if/else — do NOT re-send initMsg here).
@@ -21656,10 +21759,23 @@ function forkWorkerPrepared(
   ds.exitEventEmitted = false;
   // Notify dashboard SSE subscribers a new session is live.
   try {
+    const wasSilentBeforeFork = ds.lastPublishedActiveTurnSilentSchedule === true;
+    const spawnedRow = composeRowFromActive(ds);
+    const nextSilent = spawnedRow.activeTurnSilentSchedule === true;
+    ds.lastPublishedActiveTurnSilentSchedule = nextSilent;
     dashboardEventBus.publish({
       type: 'session.spawned',
-      body: { session: composeRowFromActive(ds) },
+      body: { session: spawnedRow },
     });
+    if (wasSilentBeforeFork && !nextSilent) {
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: {
+          sessionId: ds.session.sessionId,
+          patch: { activeTurnSilentSchedule: false },
+        },
+      });
+    }
   } catch (err) {
     logger.error(`[${t}] Failed to publish attached worker state: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -25129,6 +25245,20 @@ function setupWorkerHandlers(
 
       case 'terminal_input': {
         if (!ownsLifecycleMutation()) break;
+        if (msg.submitted) {
+          const prevSilent = ds.lastPublishedActiveTurnSilentSchedule === true;
+          noteNonSilentTurnActivity(ds);
+          if (prevSilent) {
+            ds.lastPublishedActiveTurnSilentSchedule = false;
+            dashboardEventBus.publish({
+              type: 'session.update',
+              body: {
+                sessionId: ds.session.sessionId,
+                patch: { activeTurnSilentSchedule: false },
+              },
+            });
+          }
+        }
         if (msg.submitted && ds.antigravityRotation) {
           if (ds.antigravityRotation.inFlightToken) {
             // Direct terminal input is human intervention just like a new IM
@@ -25184,11 +25314,33 @@ function setupWorkerHandlers(
           && noteStartingCardHealthFrame(ds, msg.turnId, projectedScreenStatus, msg.dispatchAttempt);
         const prevStatus = ds.lastScreenStatus;
         const prevBackgroundTaskCount = ds.backgroundTaskCount;
+        const prevActiveTurnSilentSchedule = ds.lastPublishedActiveTurnSilentSchedule === true;
         const prevLabel = streamCardLabel(ds);
         const prevActivity = typeof prevLabel === 'object' && 'activity' in prevLabel ? prevLabel.activity : undefined;
         updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = projectedScreenStatus;
+        const frameTargetsTerminatedTurn = !!screenTurnId
+          && ds.lastTurnTerminalStatus !== undefined
+          && ds.lastTurnTerminalTurnId === screenTurnId
+          && (ds.lastTurnTerminalDispatchAttempt === undefined
+            || msg.dispatchAttempt === undefined
+            || msg.dispatchAttempt <= ds.lastTurnTerminalDispatchAttempt);
+        if (projectedScreenStatus === 'working' || projectedScreenStatus === 'analyzing') {
+          if (msg.directSubmit === true) {
+            noteNonSilentTurnActivity(ds);
+          } else if (!msg.turnId) {
+            ds.lastScreenTurnId = undefined;
+            ds.lastScreenTurnGeneration = undefined;
+          } else if (screenTurnId && ownsLifecycleMutation() && !stalePostTerminalBusy && !frameTargetsTerminatedTurn) {
+            ds.lastScreenTurnId = screenTurnId;
+            ds.lastScreenTurnGeneration = workerGeneration;
+          }
+        } else {
+          ds.lastScreenTurnId = undefined;
+          ds.lastScreenTurnGeneration = undefined;
+        }
+        const nextActiveTurnSilentSchedule = isActiveTurnSilentSchedule(ds, ds.lastScreenStatus);
         workersWithScreenStatus.add(worker);
         const completedTurnFrame = frameMatchesCompletedTurn(ds, {
           turnId: msg.turnId,
@@ -25297,6 +25449,7 @@ function setupWorkerHandlers(
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
         if (prevStatus !== ds.lastScreenStatus) {
+          ds.lastPublishedActiveTurnSilentSchedule = nextActiveTurnSilentSchedule;
           // fresh:true —— 这是「状态边沿触发的 refresh 读」，transcript 此刻刚追加完
           // 本轮输出。绕过 resolver 对懒创建 rollout 的 30s miss 负缓存，否则首轮
           // (spawn 时 rollout 还没落盘)徽标要等 30s 后某次边沿才出现。
@@ -25326,6 +25479,7 @@ function setupWorkerHandlers(
                 // Live background work is also a kanban keep-on-board fact.
                 // Null clears an earlier count when the worker stops reporting it.
                 backgroundTaskCount: ds.backgroundTaskCount ?? null,
+                activeTurnSilentSchedule: nextActiveTurnSilentSchedule,
               },
             },
           });
@@ -25369,12 +25523,25 @@ function setupWorkerHandlers(
         // Background work can start or finish while the coarse status stays
         // idle/working. Publish only that fact here; usage, reactions and the
         // other side effects above remain exclusive to real status edges.
-        } else if (prevBackgroundTaskCount !== ds.backgroundTaskCount) {
+        } else if (
+          prevBackgroundTaskCount !== ds.backgroundTaskCount
+          || prevActiveTurnSilentSchedule !== nextActiveTurnSilentSchedule
+        ) {
+          if (prevActiveTurnSilentSchedule !== nextActiveTurnSilentSchedule) {
+            ds.lastPublishedActiveTurnSilentSchedule = nextActiveTurnSilentSchedule;
+          }
           dashboardEventBus.publish({
             type: 'session.update',
             body: {
               sessionId: ds.session.sessionId,
-              patch: { backgroundTaskCount: ds.backgroundTaskCount ?? null },
+              patch: {
+                ...(prevBackgroundTaskCount !== ds.backgroundTaskCount
+                  ? { backgroundTaskCount: ds.backgroundTaskCount ?? null }
+                  : {}),
+                ...(prevActiveTurnSilentSchedule !== nextActiveTurnSilentSchedule
+                  ? { activeTurnSilentSchedule: nextActiveTurnSilentSchedule }
+                  : {}),
+              },
             },
           });
         }
@@ -26275,7 +26442,12 @@ function setupWorkerHandlers(
           // task. It still must not inherit a stale working projection.
           const exitStatus = msg.code === 0 && idleAtExit ? 'idle' : 'interrupted';
           const hadBackgroundTaskCount = settleBackgroundStateOnCliLoss(ds);
+          const wasSilentSchedule = ds.lastPublishedActiveTurnSilentSchedule === true;
           ds.lastScreenStatus = exitStatus;
+          ds.lastScreenTurnId = undefined;
+          ds.lastScreenTurnGeneration = undefined;
+          ds.latestSilentScheduledTurn = undefined;
+          ds.lastPublishedActiveTurnSilentSchedule = false;
           bumpStreamCardStatusRevision(ds);
           clearUsageRefreshTimer(ds);
           dashboardEventBus.publish({ type: 'session.update', body: {
@@ -26285,6 +26457,7 @@ function setupWorkerHandlers(
               // Background work dies with this CLI. Clear it with the physical
               // loss publication; a stopped sampler cannot provide a zero frame.
               ...(hadBackgroundTaskCount ? { backgroundTaskCount: null } : {}),
+              ...(wasSilentSchedule ? { activeTurnSilentSchedule: false } : {}),
             },
           } });
         }
@@ -27125,6 +27298,7 @@ function setupWorkerHandlers(
           status: TurnDeliveryReceipt['status'],
           messageIds: string[],
           reason?: string,
+          messages = resultMessages(messageIds),
         ) => observeTurnResultDelivery(
           resultBinding,
           { status: 'unavailable', reason: 'trusted_plugin_delivery' },
@@ -27134,7 +27308,7 @@ function setupWorkerHandlers(
             platform: 'lark',
             chatId: ds.chatId,
             ...(frozen.target.mode !== 'plain' ? { parentMessageId: frozen.target.rootMessageId } : {}),
-            messages: resultMessages(messageIds),
+            messages,
             ...(reason ? { reason } : {}),
           },
         );
@@ -27144,6 +27318,54 @@ function setupWorkerHandlers(
             || !Number.isSafeInteger(msg.fileCount)
             || msg.fileCount < 0) {
             throw new Error('invalid_plugin_result_entry');
+          }
+          if (msg.readPolicy !== undefined && msg.readPolicy !== 'receipt-only') {
+            throw new Error('invalid_plugin_result_read_policy');
+          }
+          // Legacy entry-card delivery does not read artifact contents. Only the
+          // explicit protected IPC arm redeems and verifies a host snapshot.
+          if (msg.readPolicy === 'receipt-only') {
+            const artifacts = new PluginResultArtifactStore({ dataDir: config.session.dataDir });
+            const manifest = artifacts.redeem(msg.viewToken, msg.callerUnionId);
+            if (manifest.readPolicy !== 'receipt-only') throw new Error('protected_result_artifact_policy_mismatch');
+            const assertAuthority = () => {
+              if (ds.session.protectedResults !== true || !ownsWorkerSession() || msg.sessionId !== ds.session.sessionId
+                || managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
+                || currentGatewayCallerOpenId(ds, msg.turnId) !== msg.callerOpenId) {
+                throw new Error('protected_result_stale_authority');
+              }
+            };
+            if (manifest.pluginId !== msg.pluginId || manifest.deliveryId !== msg.deliveryId
+              || manifest.owner.larkAppId !== ds.larkAppId || manifest.owner.openId !== msg.callerOpenId
+              || manifest.context.sessionId !== msg.sessionId || manifest.context.turnId !== msg.turnId
+              || manifest.context.dispatchAttempt !== msg.dispatchAttempt
+              || manifest.expiresAt !== msg.expiresAt || manifest.files.length !== msg.fileCount) {
+              throw new Error('protected_result_artifact_mismatch');
+            }
+            const files = manifest.files.map((_file, index) => artifacts.readFile(manifest, index));
+            const delivery = await deliverProtectedResult({
+              store: new ProtectedResultStore(config.session.dataDir),
+              context: { appId: ds.larkAppId, pluginId: msg.pluginId, sessionId: msg.sessionId,
+                turnId: msg.turnId, ownerUnionId: msg.callerUnionId, chatId: ds.chatId,
+                responseKind: msg.responseKind,
+                ...(frozen.target.mode !== 'plain' ? { rootMessageId: frozen.target.rootMessageId } : {}) },
+              deliveryId: msg.deliveryId, markdown: artifacts.readSummary(manifest) ?? '',
+              files: files.map(file => ({ name: file.name, data: file.data })),
+              assertAuthority,
+              upload: (name, bytes) => uploadFile(ds.larkAppId, { name, bytes }, { sensitive: true }),
+              send: (content, type, uuid) => scopedReply(content, type, msg.turnId, {
+                uuid, replyTarget: frozen.target, beforeWrite: assertAuthority,
+              }),
+              render: markdown => buildCanonicalFinalReplyCard({
+                markdown: repairReplyMarkdown(markdown), recipientOpenId: msg.callerOpenId,
+                brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+                locale: localeForBot(ds.larkAppId), workingDir: ds.workingDir, localHomeLinkMode: 'disabled',
+              }),
+            });
+            const { messageIds } = delivery;
+            observeDelivery('delivered', messageIds, undefined, delivery.messages);
+            reply({ type: 'plugin_result_delivery_result', requestId: msg.requestId, ok: true, messageIds });
+            break;
           }
           const accessUrl = resolvePluginResultAccessUrl(msg.viewToken);
           if (!accessUrl) throw new Error('plugin_result_access_url_unavailable');
@@ -27168,11 +27390,12 @@ function setupWorkerHandlers(
             messageIds,
           });
         } catch (error) {
-          const messageIds: string[] = [];
+          const messageIds = error instanceof ProtectedResultDeliveryError ? error.messageIds : [];
           observeDelivery(
             messageIds.length ? 'partial' : 'failed',
             messageIds,
             'trusted_plugin_delivery_failed',
+            error instanceof ProtectedResultDeliveryError ? error.messages : [],
           );
           logger.error(
             `[${t}] Plugin result delivery failed plugin=${msg.pluginId}`,
@@ -27469,6 +27692,26 @@ function setupWorkerHandlers(
         const terminalSet = ds.terminalIdentityTurnIds ?? (ds.terminalIdentityTurnIds = new Set());
         terminalSet.add(msg.turnId);
         trimOldest(terminalSet, TERMINAL_RECEIPT_DEDUPE_MAX);
+        if (ds.lastScreenTurnId === msg.turnId && ds.lastScreenTurnGeneration === workerGeneration) {
+          ds.lastScreenTurnId = undefined;
+          ds.lastScreenTurnGeneration = undefined;
+        }
+        if (ds.latestSilentScheduledTurn?.turnId === msg.turnId) {
+          ds.latestSilentScheduledTurn = undefined;
+        }
+        if (
+          ds.lastPublishedActiveTurnSilentSchedule === true
+          && !isActiveTurnSilentSchedule(ds, effectiveActiveSilentScheduleStatus(ds))
+        ) {
+          ds.lastPublishedActiveTurnSilentSchedule = false;
+          dashboardEventBus.publish({
+            type: 'session.update',
+            body: {
+              sessionId: ds.session.sessionId,
+              patch: { activeTurnSilentSchedule: false },
+            },
+          });
+        }
         /** Retirement is independent of whether this exact start was observed yet. */
         retireReplyExecutionStarts(ds, workerGeneration, {
           turnId: msg.turnId,
@@ -28993,8 +29236,10 @@ function setupWorkerHandlers(
           break;
         }
         const loc = localeForBot(ds.larkAppId);
-        const answer = msg.answer.length > BTW_ANSWER_MAX_CHARS
-          ? `${truncateUtf16WellFormed(msg.answer, BTW_ANSWER_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
+        // Cut at the cap the worker uses to decide what it may leave out of the
+        // host turn's final: only a reply posted whole is.
+        const answer = msg.answer.length > ABSORBED_REPLY_MAX_CHARS
+          ? `${truncateUtf16WellFormed(msg.answer, ABSORBED_REPLY_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
           : msg.answer;
         const cardJson = buildContextualReplyCard({
           title: tr(msg.progress ? 'card.mid_turn_progress'
@@ -29056,6 +29301,18 @@ function setupWorkerHandlers(
           if (ownsLifecycleMutation() && msg.turnReply && typeof result.value === 'string' && result.value) {
             recordTurnTerminalCarrier(ds, msg.turnId, { messageId: result.value, kind: 'non_patchable', responseKind: 'final' });
             noteFinalOutputReceipt(ds, msg.turnId, { text: msg.answer });
+          }
+          // IPC arrival is not delivery. Only the successful POST lets the
+          // producer exclude this text from its host final. Address the exact
+          // producer, not a replacement that may now own ds.worker.
+          try {
+            if (!worker.killed) worker.send({
+              type: 'absorbed_reply_delivered', turnId: msg.turnId,
+              ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+              replyUuid: msg.replyUuid,
+            });
+          } catch (error) {
+            logger.debug(`[${t}] Follow-up reply delivery receipt not sent: ${error instanceof Error ? error.message : String(error)}`);
           }
         } finally {
           finishDelivery();
@@ -29560,12 +29817,24 @@ function setupWorkerHandlers(
           'continuation_worker_exit_backend_unverified',
         );
       }
+      const wasSilentScheduleOnExit = ds.lastPublishedActiveTurnSilentSchedule === true;
+      const hadBackgroundTasksOnExit = ds.backgroundTaskCount !== undefined;
+      ds.lastScreenTurnId = undefined;
+      ds.lastScreenTurnGeneration = undefined;
+      ds.latestSilentScheduledTurn = undefined;
+      ds.lastPublishedActiveTurnSilentSchedule = false;
+      ds.backgroundTaskCount = undefined;
       if (exitedPreviewTarget !== undefined) publishSessionPreviewCleared(ds.session.sessionId);
       dashboardEventBus.publish({
         type: 'session.update',
         body: {
           sessionId: ds.session.sessionId,
-          patch: { webPort: null, workerPid: null },
+          patch: {
+            webPort: null,
+            workerPid: null,
+            ...(hadBackgroundTasksOnExit ? { backgroundTaskCount: null } : {}),
+            ...(wasSilentScheduleOnExit ? { activeTurnSilentSchedule: false } : {}),
+          },
         },
       });
       if (preReadyExit) {
@@ -30476,6 +30745,21 @@ function deliverFinalOutput(
     onComplete?.(false);
     return;
   }
+  const assertProtectedFinalOpen = (): void => {
+    if (new ProtectedResultStore(config.session.dataDir).completedFinal(ds.larkAppId, ds.session.sessionId, msg.turnId)?.length) {
+      throw new Error('protected_final_already_delivered');
+    }
+  };
+  const acknowledgeProtectedFinal = (): boolean => {
+    const completed = new ProtectedResultStore(config.session.dataDir)
+      .completedFinal(ds.larkAppId, ds.session.sessionId, msg.turnId);
+    if (!completed?.length) return false;
+    ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+    onComplete?.(true, completed[0]);
+    return true;
+  };
+  try { if (acknowledgeProtectedFinal()) return; }
+  catch { logger.error(`[${t}] Protected final receipt unavailable; withholding automatic final`); onComplete?.(false); return; }
   const unresolvedMsg = msg;
   const linkRefKey = {
     appId: ds.larkAppId,
@@ -30736,7 +31020,7 @@ function deliverFinalOutput(
       return ledger.execute({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: msg.turnId }, 'final',
         JSON.stringify([handoff.record.target, transport.msgType, transport.content]),
         uuid => replayVettedBody(transport.content, transport.msgType, () => withAuditRedaction(transport.content, transport.msgType, body => cb.sessionReply(sessionAnchorId(ds), body, transport.msgType, ds.larkAppId, msg.turnId,
-          { ...opts, uuid, beforeWrite: handoff.control.beforeEffect, replyTarget: handoff.record.target, sourceSessionId: ds.session.sessionId }))),
+          { ...opts, uuid, beforeWrite: async () => { await handoff.control.beforeEffect(); assertProtectedFinalOpen(); }, replyTarget: handoff.record.target, sourceSessionId: ds.session.sessionId }))),
         { fenced: true, providerUuid: transport.providerUuid, reuseExistingFinal: true, beforeDispatch: handoff.control.beforeEffect,
           noSideEffect: error => error instanceof LocalAddressOutboundError || isLarkContentAuditError(error)
             || [LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG].includes(larkErrorCode(error) ?? -1) },
@@ -30763,13 +31047,14 @@ function deliverFinalOutput(
         ...(topicMessageLookup ? { topicMessageLookup } : {}),
         beforeWrite: async () => {
           if (opts?.beforeWrite) await opts.beforeWrite();
+          assertProtectedFinalOpen();
           if (!isStillOwned() || ds.session.status === 'closed') throw new Error('Final output no longer owns delivery');
         },
         ...(groupContextAuthorOrigin ? { groupContextAuthorOrigin } : {}) },
     ));
     return frozen ? replayVettedBody(frozen.content, frozen.msgType, reply) : reply();
   };
-  const ownsOpenSession = () => isStillOwned() && ds.session.status !== 'closed';
+  const ownsOpenSession = () => { assertProtectedFinalOpen(); return isStillOwned() && ds.session.status !== 'closed'; };
   setTimeout(async () => {
     if (!isStillOwned()) {
       logger.info(`[${t}] Bridge final_output abandoned — worker/session ownership changed`);
@@ -30786,6 +31071,7 @@ function deliverFinalOutput(
     }
     let sendReplyFile = false;
     try {
+      if (acknowledgeProtectedFinal()) return;
       // 文档评论入口分流：本轮若来自飞书文档评论（/watch-comment / /subscribe-lark-doc），把正文
       // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
       const docTurn = managedReceiver ? undefined : resolveDocCommentTarget(ds, msg.turnId);
@@ -31306,6 +31592,7 @@ function deliverFinalOutput(
             target: durableTarget,
           })
         : undefined;
+      if (acknowledgeProtectedFinal()) return;
       if (durableDelivery?.kind === 'ambiguous') {
         if (raiseDaemonAttention(ds, 'blocked', `Durable final output is ambiguous: ${durableDelivery.error}`, msg.turnId)) publishAttentionPatch(ds);
         logger.error(`[${t}] Durable final_output ambiguous: ${durableDelivery.error}`);
@@ -31320,7 +31607,7 @@ function deliverFinalOutput(
               ...(feedbackPolicy && feedback ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}),
             }, (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.replyTurnId ?? msg.turnId,
               frozenReplyTarget ? { uuid, beforeWrite, replyTarget: frozenReplyTarget } : { uuid, beforeWrite }),
-            { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned,
+            { dispatchAttempt: msg.dispatchAttempt, owns: () => { assertProtectedFinalOpen(); return isStillOwned(); },
               ...(resultBinding ? { onPublication: publication => { finalPublication = publication; } } : {}) })
           : undefined;
       const sendFinal = (content: string) => scopedReply(
@@ -31430,6 +31717,8 @@ function deliverFinalOutput(
       confirmLinkRefDraft();
       onComplete?.(true, messageId);
     } catch (err: any) {
+      try { if (acknowledgeProtectedFinal()) return; }
+      catch { logger.error(`[${t}] Protected final receipt unavailable; withholding automatic final`); onComplete?.(false); return; }
       if (outputControl && resolveDocCommentTarget(ds, msg.turnId)) { onComplete?.(false); return; }
       if (!isStillOwned()) { onComplete?.(false); return; }
       if (err instanceof ReplyCardWithdrawnError) {
@@ -32107,12 +32396,29 @@ export function forkAdoptWorker(
   }
   logger.info(`[${t}] Adopt worker forked (pid: ${worker.pid}, target: ${adopted.orcaTerminalHandle ?? adopted.tmuxTarget ?? `${adopted.zellijSession}/${adopted.zellijPaneId}`})`);
 
+  const wasSilentBeforeAdoptFork = ds.lastPublishedActiveTurnSilentSchedule === true;
+  if ((opts?.turnId || opts?.payload)
+    && !(Boolean(opts?.turnId) && isSilentScheduledTurn(ds, opts?.turnId))) {
+    noteNonSilentTurnActivity(ds);
+  }
   ds.exitEventEmitted = false;
   try {
+    const spawnedRow = composeRowFromActive(ds);
+    const nextSilent = spawnedRow.activeTurnSilentSchedule === true;
+    ds.lastPublishedActiveTurnSilentSchedule = nextSilent;
     dashboardEventBus.publish({
       type: 'session.spawned',
-      body: { session: composeRowFromActive(ds) },
+      body: { session: spawnedRow },
     });
+    if (wasSilentBeforeAdoptFork && !nextSilent) {
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: {
+          sessionId: ds.session.sessionId,
+          patch: { activeTurnSilentSchedule: false },
+        },
+      });
+    }
   } catch (err) {
     logger.error(`[${t}] Failed to publish adopt worker state: ${err instanceof Error ? err.message : String(err)}`);
   }

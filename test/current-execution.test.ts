@@ -370,4 +370,34 @@ describe('identity fetch refusal reasons', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(IDENTITY_REFUSAL_REASONS).toContain(error.reason);
   });
+
+  it.each([
+    ['the cn partition (only overseas partitions are retried)', 'cn'],
+    ['an unknown partition name', 'bogus'],
+  ] as const)('rejects a region the daemon would not mint on demand (%s) before any request', async (_label, region) => {
+    const fetchImpl = vi.fn();
+    const error = await resolveCurrentExecutionIdentity({ ipcPort: 12345, sessionId: 'session-a', larkAppId: 'cli_a',
+      tool: 'bytedcli', region: region as 'i18n', fetchImpl }).catch(e => e);
+    expect(error).toMatchObject({ message: 'current_execution_route_unavailable', reason: 'invalid_invocation' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects a region attached to a non-bytedcli tool before any request', async () => {
+    const fetchImpl = vi.fn();
+    const error = await resolveCurrentExecutionIdentity({ ipcPort: 12345, sessionId: 'session-a', larkAppId: 'cli_a',
+      tool: 'lark-cli', region: 'i18n', fetchImpl }).catch(e => e);
+    expect(error).toMatchObject({ message: 'current_execution_route_unavailable', reason: 'invalid_invocation' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('sends a valid overseas bytedcli region through to the daemon', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified', larkAppId: 'cli_a',
+      sessionId: 'session-a', tool: 'bytedcli', identityTurnId: 'turn-a', env: "BOTMUX_IDENTITY_MODE='user'",
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    await resolveCurrentExecutionIdentity({ ipcPort: 12345, sessionId: 'session-a', larkAppId: 'cli_a',
+      tool: 'bytedcli', region: 'i18n', fetchImpl });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(JSON.parse((fetchImpl.mock.calls[0]![1] as RequestInit).body as string)).toMatchObject({ region: 'i18n' });
+  });
 });

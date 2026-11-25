@@ -108,7 +108,6 @@ import {
 } from './im/lark/reply-card-style.js';
 import {
   normalizeAskOptionLayout,
-  setAskOptionLayoutLookup,
   type AskOptionLayout,
 } from './im/lark/ask-option-layout.js';
 import { cliModelMayKeepReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
@@ -1906,6 +1905,8 @@ export interface BotConfig {
    * agent mint the tenant token itself.
    */
   sandboxWithholdBotSecret?: boolean;
+  /** Opt-in opaque plugin results. Requires a sandbox and withholds all CLI Lark credentials. */
+  protectedResults?: boolean;
   /**
    * LEGACY read-isolation flag (pre fs-policy). The unified sandbox is
    * deny-by-default, so cross-bot read isolation is inherent — this flag is
@@ -2317,9 +2318,8 @@ export interface BotConfig {
    */
   replyStyle?: ReplyStyleConfig;
   /**
-   * `botmux ask` 选项按钮布局：'compact'（默认，按行自动换行）或 'vertical'
-   * （每行 1 个，长标签更易读）。手改的非法值在读取时 fail-soft 回退 compact，
-   * 不影响发卡；卡片在 daemon 进程内渲染，改动即时生效，无需重启 worker。
+   * 旧的 `botmux ask` 选项按钮布局（'compact' / 'vertical'）。提问卡改成每个选项一行勾选框后
+   * 已不再影响排版；为不破坏现有配置，仍照常读取、校验（非法值 fail-soft 丢弃）和保存。
    */
   askOptionLayout?: AskOptionLayout;
   /**
@@ -2804,10 +2804,6 @@ export function __testOnly_resetBotRegistry(): void {
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
 // a hard import cycle between `i18n` and `bot-registry`.
 setBotLookup((id) => bots.get(id));
-
-// 同理给 ask 卡片选项布局注册 lookup：ask-card.ts 经 turn-reply-ask.ts 间接依赖
-// 本模块，不能反向 import，只能由这里把 bots 表推进去。
-setAskOptionLayoutLookup((id) => bots.get(id));
 setHideLocalAddressesResolver(resolveHideLocalAddresses);
 
 /** Path of the bot config file we loaded (so `/oncall` can persist bindings back). */
@@ -4090,6 +4086,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (entry.sandboxWithholdBotSecret != null && typeof entry.sandboxWithholdBotSecret !== 'boolean') {
       throw new Error(`Bot config [${i}]: sandboxWithholdBotSecret must be true or false, got ${JSON.stringify(entry.sandboxWithholdBotSecret)}`);
     }
+    if (entry.protectedResults != null && typeof entry.protectedResults !== 'boolean') {
+      throw new Error(`Bot config [${i}]: protectedResults must be true or false`);
+    }
+    if (entry.protectedResults === true && (!(entry.sandbox === true || entry.sandbox === 'oncall')
+      || entry.larkToolBinding === false)) {
+      throw new Error(`Bot config [${i}]: protectedResults requires an explicit oncall sandbox and managed lark-tool binding`);
+    }
     validateCliLaunchModeConfig({
       cliId: entryCliId,
       cliLaunchMode,
@@ -4660,7 +4663,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
       // assistantMode implies it (see sandboxWithholdsBotSecret)
-      ...(entry.sandboxWithholdBotSecret === true || entry.assistantMode === true ? { sandboxWithholdBotSecret: true } : {}),
+      ...(entry.sandboxWithholdBotSecret === true || entry.assistantMode === true || entry.protectedResults === true ? { sandboxWithholdBotSecret: true } : {}),
+      ...(entry.protectedResults === true ? { protectedResults: true } : {}),
       ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),

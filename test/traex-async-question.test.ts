@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { TraexQuestionBridge } from '../src/core/traex-question-bridge.js';
 import {
   parseTraexQuestionPage, traexPendingAsyncQuestionVisible, traexQuestionAskQuestion,
-  nextTraexQuestionStep, traexQuestionStepAllowed, traexQuestionSignature, traexQuestionState,
+  traexQuestionAnswerFromAsk, nextTraexQuestionStep, traexQuestionStepAllowed, traexQuestionSignature, traexQuestionState,
   traexQuestionFlowVisible,
 } from '../src/utils/traex-question-page.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -25,6 +25,16 @@ describe('recorded TRAE 0.216 asynchronous question layouts', () => {
     expect(nextTraexQuestionStep(page, { kind: 'options', numbers: [2] })).toEqual({ kind: 'key', key: 'Down', final: false });
     expect(nextTraexQuestionStep(page, { kind: 'options', numbers: [1] })).toEqual({ kind: 'key', key: 'Enter', final: true });
     expect(traexQuestionStepAllowed(page, { kind: 'key', key: '1', final: true })).toBe(false);
+  });
+
+  it('rejects an option plus note instead of submitting the option without its note', () => {
+    const page = parseTraexQuestionPage(CHOICE)!;
+    const note = '请附日志';
+    const answer = { kind: 'options' as const, numbers: [1], note };
+    expect(traexQuestionAnswerFromAsk(page, { ...result(['1']), notes: [note] }))
+      .toBe('async option answers cannot carry notes');
+    expect(nextTraexQuestionStep(page, answer)).toEqual({ kind: 'fail', reason: 'async option answers cannot carry notes' });
+    expect(nextTraexQuestionStep(page, { kind: 'options', numbers: [1] })).toEqual({ kind: 'key', key: 'Enter', final: true });
   });
 
   it('reads native text-only input and custom Other text without treating them as labels', () => {
@@ -128,6 +138,18 @@ describe('asynchronous question cards and physical delivery', () => {
     expect(h.inputs.filter(x => x === 'Enter')).toHaveLength(1);
     expect(h.inputs).not.toContain('Tab');
     expect(h.notices).toEqual([]);
+    h.bridge.dispose();
+  });
+
+  it('does not deliver an async option alone when its card answer also carries a note', async () => {
+    const h = harness(); h.bridge.kick();
+    await vi.advanceTimersByTimeAsync(1200);
+    h.asks[0]!.answer({ ...result(['1']), notes: ['请附日志'] });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.delivered).toEqual([]);
+    expect(h.inputs).not.toContain('Enter');
+    expect(h.inputs.some(input => input.startsWith('paste:'))).toBe(false);
+    expect(h.notices).toEqual(['worker.traex_question.write_failed']);
     h.bridge.dispose();
   });
 

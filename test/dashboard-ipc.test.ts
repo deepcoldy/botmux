@@ -29,6 +29,7 @@ import * as groupsStore from '../src/services/groups-store.js';
 import * as runAsModule from '../src/core/run-as.js';
 import { invalidateGlobalConfigCache, setGroupOwnerNoticeEnabled } from '../src/global-config.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
+import * as followUpReplyChange from '../src/services/follow-up-reply-change.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import { resolveScheduleModelOverride } from '../src/core/schedule-model-override.js';
 import {
@@ -2626,6 +2627,56 @@ describe('PUT /api/bot-card-prefs — mid-turn replies (followUpReply)', () => {
       expect(await off.json()).toMatchObject({ ok: true, followUpReply: false });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).not.toHaveProperty('followUpReply');
     } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('pushes each change to this bot\'s running workers, which gate their replies on it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-follow-up-push-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-follow-up-push-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const worker = () => {
+      const sent: unknown[] = [];
+      return { sent, killed: false, send: (msg: unknown) => { sent.push(msg); return true; } };
+    };
+    const own = worker();
+    const ownKilled = { ...worker(), killed: true };
+    const otherBot = worker();
+    const unregisterFollowUpReply = followUpReplyChange.registerFollowUpReplyChangeHandler((app, enabled) => {
+      followUpReplyChange.broadcastFollowUpReplyToWorkers(workerPool.getActiveSessionsRegistry()?.values() ?? [], app, enabled);
+    });
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      workerPool.setActiveSessionsRegistry(new Map<string, any>([
+        ['s-own', { larkAppId: appId, worker: own }],
+        ['s-own-killed', { larkAppId: appId, worker: ownKilled }],
+        ['s-other', { larkAppId: 'some-other-app', worker: otherBot }],
+      ]));
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const put = (body: unknown) => fetch(`http://127.0.0.1:${handle!.port}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+
+      expect((await put({ followUpReply: true })).status).toBe(200);
+      expect((await put({ followUpReply: false })).status).toBe(200);
+      expect((await put({ goalStatusCard: true })).status).toBe(200);
+      expect(own.sent).toEqual([
+        { type: 'set_follow_up_reply', enabled: true },
+        { type: 'set_follow_up_reply', enabled: false },
+      ]);
+      expect(ownKilled.sent).toEqual([]);
+      expect(otherBot.sent).toEqual([]);
+    } finally {
+      unregisterFollowUpReply();
+      workerPool.setActiveSessionsRegistry(undefined);
       if (handle) await handle.close();
       handle = null;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;

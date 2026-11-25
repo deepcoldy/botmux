@@ -10,12 +10,19 @@ import type { CaptureAttachment } from '../../core/plugins/input-capture/attachm
 export function captureInboundText(data: any, runtime: InputCaptureRuntime,
   knownBot: (openId: string) => boolean,
   p2pReplyFoldsToChat: (chatId: string, rootId: string) => boolean = () => false): boolean {
+  // The marker is non-sensitive and survives Inbox persistence. Check it before
+  // even parsing: an already-redacted copy is just as ineligible as the raw event.
+  if (data?.__protectedResultRedacted === true) return false;
   const message = data?.message;
   if (data?.sender?.sender_type !== 'user' || !message || !['text', 'post', 'image', 'file', 'audio', 'media', 'merge_forward'].includes(message.message_type)
     || (message.root_id && !/^om_[A-Za-z0-9_-]+$/.test(message.root_id))
     || (message.thread_id && !/^omt_[A-Za-z0-9_-]{1,196}$/.test(message.thread_id))
     || message.root_id && message.root_id === message.message_id) return false;
-  const { parsed, resources } = parseEventMessage(data);
+  const { parsed, resources, data: redactedData } = parseEventMessage(data);
+  // Capture is a persistence/delivery boundary, not a reader that may fall back
+  // to the raw event. A redacted input is intentionally ineligible: its original
+  // post/audio/media content and resource keys must never enter the journal.
+  if (redactedData !== data) return false;
   if (parsed.senderType === 'app' || parsed.senderType === 'bot'
     || !parsed.senderId || knownBot(parsed.senderId)) return false;
   const attachments: CaptureAttachment[] = resources.map(resource => ({

@@ -1,10 +1,9 @@
-import { hasAskForm } from '../../core/ask-form.js';
-import { buildAskFormElements, formatAskDeadline } from './ask-form-elements.js';
+import { checkAskFormValues, hasAskForm, type AskFormProblem } from '../../core/ask-form.js';
+import { renderAskFormBody } from './ask-form-elements.js';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseLinkDestination } from 'markdown-it/lib/helpers/index.mjs';
 import type {
   AskCardDispatcher,
   AskClickOutcome,
@@ -12,10 +11,16 @@ import type {
   PendingAsk,
 } from '../../core/ask-types.js';
 import { AskDispatchError, isNativeAsyncAskOrigin } from '../../core/ask-types.js';
-import { applyAskForm, getAskSnapshot, submitAsk, submitAskForm, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
+import { applyAskForm, getAskSnapshot, submitAsk, submitAskChoices, submitAskForm, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
+import { askChoiceProblem } from '../../core/ask-choice.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
-import { askOptionLayoutForBot, type AskOptionLayout } from './ask-option-layout.js';
+import {
+  ASK_CARD_ELEMENT_LIMIT, ASK_DENSITIES, askCardConfig, askFooter, askPresentation, askReplyHint, buildAskChoiceBody, buildAskListBody,
+  buildAskSettledBody, countCardElements, deadlineLine, escapeMd, escapeQuestion, pendingHeader, settledHeader, submittedByLine,
+  type AskDensity,
+} from './ask-card-look.js';
+import { formValueTypes, parseAskChoiceFormValue } from './ask-choice-form.js';
 import { replyMessage, sendMessage, sendUserMessage, updateMessage, uploadFile } from './client.js';
 import { TRANSIENT_LARK_CODES } from './api-gate.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
@@ -33,12 +38,13 @@ export const ASK_SUBMIT_ACTION = 'ask_submit';
 export const ASK_TOGGLE_ACTION = 'ask_toggle';
 export const ASK_FORM_ACTION = 'ask_form_submit';
 
-import { supportsAskCustomInput } from '../../core/ask-custom-input.js';
-import { buildAskCustomForm } from './ask-custom-form.js';
-import { optionDescriptions } from './ask-option-descriptions.js';
-import { permissionAskSettleStatus } from './ask-permission-status.js';
+/** One submit for a whole checker form: every checker (`opt_<i>_<j>`) and own-answer input
+ *  (`custom_<i>`) arrives in `form_value`. A new action name, so a daemon that predates it
+ *  ignores the click instead of reading it as an older submit. */
+export const ASK_CHOICE_SUBMIT_ACTION = 'ask_choice_submit';
 
-const MAX_BUTTONS_PER_ACTION_ROW = 4;
+import { parseAskCustomFields, supportsAskCustomInput } from '../../core/ask-custom-input.js';
+import { permissionAskSettleStatus } from './ask-permission-status.js';
 
 /** Worst-case placeholder for ask dispatchUuid (ask- + 40 hex = 44 chars,
  * ask-persist-store.ts dispatchUuidForAsk). Used when an ask lacks a real
@@ -219,7 +225,46 @@ export function classifyAskDispatchError(err: unknown): { retryable: boolean; de
 }
 
 export function isAskCardAction(action?: string): boolean {
-  return action === ASK_SELECT_ACTION || action === ASK_SUBMIT_ACTION || action === ASK_TOGGLE_ACTION || action === ASK_FORM_ACTION;
+  return action === ASK_SELECT_ACTION || action === ASK_SUBMIT_ACTION || action === ASK_TOGGLE_ACTION || action === ASK_FORM_ACTION
+    || action === ASK_CHOICE_SUBMIT_ACTION;
+}
+
+/** A draft is kept only when the card that shows it still fits a reply / card request. */
+function askDraftFits(draft: PendingAsk): boolean {
+  return turnReplyCardRequestBytes(buildAskCard(draft), draft.deliveryTarget?.openId ?? draft.chatId,
+    draft.dispatchUuid ?? ASK_DISPATCH_UUID_WORST_CASE) <= TURN_REPLY_CARD_MAX_BYTES - (draft.replyCardTarget ? 4000 : 0);
+}
+
+/** Says which question breaks which rule; the card and the user's ticks stay as they are. */
+function choiceProblemToast(
+  questions: PendingAsk['questions'], selections: ReadonlyArray<ReadonlyArray<string>>, texts: ReadonlyArray<string | null>, locale: Locale,
+): { toast: { type: string; content: string } } | undefined {
+  return problemToast(askChoiceProblem(questions, selections, texts), locale);
+}
+
+function problemToast(problem: AskFormProblem | undefined, locale: Locale): { toast: { type: string; content: string } } | undefined {
+  if (!problem) return undefined;
+  const key = problem.kind === 'too_many' ? 'card.ask.toast.too_many'
+    : problem.kind === 'invalid_input' ? 'card.ask.toast.invalid_input' : 'card.ask.toast.unanswered';
+  return { toast: { type: 'warning', content: t(key, { n: problem.questionIndex + 1 }, locale) } };
+}
+
+function unreadableFormToast(askId: string, fieldTypes: Record<string, string>, locale: Locale): { toast: { type: string; content: string } } {
+  logger.warn(`[ask:${askId}] submitted form has an option field of unknown shape; nothing was answered: ${JSON.stringify(fieldTypes)}`);
+  return { toast: { type: 'warning', content: t('card.ask.toast.unreadable', undefined, locale) } };
+}
+
+/** Input form: turn ticked checkers / dropdown picks into the `q<i>` values the form validator reads. */
+function inputFormValues(ask: PendingAsk, formValue: unknown): ReturnType<typeof parseAskChoiceFormValue> | { kind: 'values'; values: Record<string, unknown> } {
+  const parsed = parseAskChoiceFormValue(ask.questions, formValue);
+  if (parsed.kind !== 'ok') return parsed;
+  const values = { ...parsed.fields };
+  ask.questions.forEach((q, i) => {
+    if (q.input || Object.hasOwn(values, `q${i}`)) return; // an older select_static card sends q<i> itself
+    const keys = parsed.selections[i]!;
+    values[`q${i}`] = q.multiSelect || keys.length !== 1 ? keys : keys[0];
+  });
+  return { kind: 'values', values };
 }
 
 export async function handleAskCardAction(
@@ -251,18 +296,54 @@ export async function handleAskCardAction(
       : toastForOutcome(outcome, locale);
 
   if (action === ASK_FORM_ACTION) {
-    const outcome = submitAskForm({ askId, nonce, by, values: data.action?.form_value });
+    const read = pending && hasAskForm(pending.questions) ? inputFormValues(pending, data.action?.form_value) : undefined;
+    if (read?.kind === 'stale') return staleToast(locale);
+    if (read?.kind === 'unreadable') return unreadableFormToast(askId, read.fieldTypes, locale);
+    const outcome = submitAskForm({ askId, nonce, by, values: read?.kind === 'values' ? read.values : data.action?.form_value });
+    if (outcome === 'invalid_form' && pending && read?.kind === 'values') {
+      const checked = checkAskFormValues(pending.questions, read.values);
+      const named = checked.ok ? undefined : problemToast(checked.problem, locale);
+      if (named) return named;
+    }
     if (outcome !== 'accepted') return outcomeResponse(outcome);
     const result = getAskSnapshot(askId)?.result;
     return result ? settledCardResponse(askId, result) : undefined;
   }
   // Stale controls from another presentation cannot reset a user's form draft.
   if (pending && hasAskForm(pending.questions)) return staleToast(locale);
+  if (action === ASK_CHOICE_SUBMIT_ACTION) {
+    if (!pending) return staleToast(locale);
+    const formValue = data.action?.form_value;
+    const read = parseAskChoiceFormValue(pending.questions, formValue);
+    if (read.kind === 'stale') return staleToast(locale);
+    if (read.kind === 'unreadable') return unreadableFormToast(askId, read.fieldTypes, locale);
+    if (!read.sawChoiceField && pending.questions.some(q => q.options.length)) {
+      // Unticked checkers may legitimately be left out; a form that never carries any is the
+      // unverified wire shape going wrong. Field names and types only, never the values.
+      logger.warn(`[ask:${askId}] choice form submitted without any option field: ${JSON.stringify(formValueTypes(formValue))}`);
+    }
+    const outcome = submitAskChoices({ askId, nonce, by, selections: read.selections, fields: read.fields,
+      revision: asNumber(value?.revision), confirmEmpty: value?.confirm_empty === 'true' || value?.confirm_empty === true,
+      canRenderDraft: askDraftFits });
+    if (outcome === 'accepted') {
+      const result = getAskSnapshot(askId)?.result;
+      return result ? settledCardResponse(askId, result) : undefined;
+    }
+    if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
+    if (outcome === 'draft_conflict') {
+      const current = getAskSnapshot(askId);
+      if (current) return refreshedDraftResponse(current, locale, true);
+    }
+    if (outcome === 'invalid_choice') {
+      const texts = supportsAskCustomInput(pending) ? parseAskCustomFields(read.fields, pending.questions) ?? [] : [];
+      return choiceProblemToast(pending.questions, read.selections, texts, locale) ?? toastForOutcome(outcome, locale);
+    }
+    return outcomeResponse(outcome);
+  }
   if (value?.custom_form === 'v1' && (action === ASK_TOGGLE_ACTION || action === ASK_SUBMIT_ACTION)) {
     const outcome = applyAskForm({ askId, nonce, by, revision: asNumber(value.revision),
       fields: data.action?.form_value ?? {},
-      canRenderDraft: draft => turnReplyCardRequestBytes(buildAskCard(draft), draft.deliveryTarget?.openId ?? draft.chatId,
-        draft.dispatchUuid ?? ASK_DISPATCH_UUID_WORST_CASE) <= TURN_REPLY_CARD_MAX_BYTES - (draft.replyCardTarget ? 4000 : 0),
+      canRenderDraft: askDraftFits,
       ...(action === ASK_TOGGLE_ACTION ? { toggle: { questionIndex: asNumber(value.question_index), key: asString(value.key) ?? '', custom: value.custom_choice === 'true' } } : {}),
       confirmEmpty: value.confirm_empty === 'true',
     });
@@ -410,27 +491,23 @@ function inlineAskResponse(ask: PendingAsk, result?: AskResult, confirmEmptyArme
 }
 
 /**
- * 构建 ask 卡片 JSON 字符串。
+ * 构建 ask 卡片 JSON 字符串（Card JSON 2.0）。
  *
- * 未 settle 时：
- *   - 单问单选：每个选项一个按钮，点击即 settle（旧 ask_select 语义）
- *   - 多问或多选：每个选项一个按钮用于累积勾选，最后用 Submit settle
- *
- * 旧 Card 1.0 选择卡保留稳定的 action + button 结构；
- * 显式输入表单改用 Card 2.0 form，一次提交选项和输入。
- *
- * 已 settle 时：渲染状态摘要，展示每问的选中标签（answered），或超时/失效信息。
+ * 未 settle：每问一个灰底分区（题型小字、问题、选项行、可选的「自己写答案」输入框），整张卡一个
+ * form、一个「提交」按钮，勾选只在客户端本地生效；单问单选且无自填、无预选的卡保留「点一下即提交」。
+ * 已 settle：保留每问的题型、问题与作答（✓ 选项 / 自填内容 / 输入值），审批人仍能回看问了什么、答了什么。
  */
 export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confirmEmptyArmed?: boolean }): string {
   return renderAskCard(ask, result, opts).json;
 }
 
 /**
- * 按飞书卡片请求体 30KB 上限（与 turn reply card 同一把尺子）渲染 ask 卡：
- * 问题正文与选项说明默认完整渲染；整卡超预算时先让选项说明让路（统一截到能放下的
- * 最大长度），说明全省略仍放不下才截问题正文——批准的效力取决于正文。任一截断都由发送方
- * 把全文作为文件发出。`fits` 为 false 表示截到最小仍超预算（如选项过多）。纯函数、只依赖
- * ask 本身，首发 / 勾选重绘 / settle PATCH 得到一致的截断结果。
+ * 按飞书卡片请求体 30KB 上限（与 turn reply card 同一把尺子）与 Card 2.0 每卡 200 个元素的上限渲染 ask 卡：
+ * 先选能放进元素上限的最密排布（每选项一行 → 裸勾选框 → 每问一个下拉框 → 去掉分区与题型小字），
+ * 再在该排布内按字节预算截断：问题正文与选项说明默认完整渲染；整卡超预算时先让选项说明让路（统一截到
+ * 能放下的最大长度），说明全省略仍放不下才截问题正文——批准的效力取决于正文。任一截断（含下拉框排布
+ * 放不下的说明）都由发送方把全文作为文件发出。`fits` 为 false 表示截到最小仍超预算。纯函数、只依赖
+ * ask 本身，首发 / 重绘 / settle PATCH 得到一致的结果。
  */
 export function renderAskCard(
   ask: PendingAsk,
@@ -440,18 +517,31 @@ export function renderAskCard(
   const measureUuid = ask.dispatchUuid ?? ASK_DISPATCH_UUID_WORST_CASE;
   const receiveId = ask.deliveryTarget?.openId ?? ask.chatId;
   const fits = (json: string) => turnReplyCardRequestBytes(json, receiveId, measureUuid) <= TURN_REPLY_CARD_MAX_BYTES;
-  const render = (promptCap: number, descriptionCap: number) => renderAskCardWithCap(ask, result, opts, promptCap, descriptionCap);
-  const full = render(Infinity, Infinity);
-  if (fits(full)) return { json: full, promptTruncated: false, descriptionsTruncated: false, fits: true };
   const longestDescription = Math.max(0, ...ask.questions.flatMap(q => q.options.map(o => o.description?.length ?? 0)));
-  if (longestDescription > 0) {
-    const withoutDescriptions = render(Infinity, 0);
-    if (fits(withoutDescriptions)) return { promptTruncated: false, descriptionsTruncated: true, fits: true,
-      json: largestFitting(1, longestDescription - 1, cap => render(Infinity, cap), fits) ?? withoutDescriptions };
+  const longestPrompt = Math.max(0, ...ask.questions.map(q => q.prompt.length));
+  type Rendered = { json: string; promptTruncated: boolean; descriptionsTruncated: boolean; fits: boolean };
+  const withinElements = (json: string) => countCardElements(JSON.parse(json)) <= ASK_CARD_ELEMENT_LIMIT;
+  let last: Rendered | undefined;
+  for (const density of ASK_DENSITIES) {
+    const render = (promptCap: number, descriptionCap: number) => renderAskCardWithCap(ask, result, opts, promptCap, descriptionCap, density);
+    const fitBytes = (): Rendered => {
+      const full = render(Infinity, Infinity);
+      if (fits(full.json)) return { json: full.json, promptTruncated: false, descriptionsTruncated: full.descriptionsTruncated, fits: true };
+      if (longestDescription > 0) {
+        const withoutDescriptions = render(Infinity, 0).json;
+        if (fits(withoutDescriptions)) return { promptTruncated: false, descriptionsTruncated: true, fits: true,
+          json: largestFitting(1, longestDescription - 1, cap => render(Infinity, cap).json, fits) ?? withoutDescriptions };
+      }
+      const json = largestFitting(0, longestPrompt - 1, cap => render(cap, 0).json, fits);
+      return { json: json ?? render(0, 0).json, promptTruncated: true, descriptionsTruncated: longestDescription > 0, fits: json !== undefined };
+    };
+    // Cutting text never removes an element (a cut prompt may add its notice line), so an
+    // uncut render over the element limit rules this density out before any byte fitting.
+    if (density !== ASK_DENSITIES.at(-1) && !withinElements(render(Infinity, Infinity).json)) continue;
+    last = fitBytes();
+    if (density === ASK_DENSITIES.at(-1) || (last.fits && withinElements(last.json))) return last;
   }
-  const longestPrompt = Math.max(0, ...ask.questions.map((_, i) => questionPrompt(ask, i).length));
-  const json = largestFitting(0, longestPrompt - 1, cap => render(cap, 0), fits);
-  return { json: json ?? render(0, 0), promptTruncated: true, descriptionsTruncated: longestDescription > 0, fits: json !== undefined };
+  return last!;
 }
 
 /** 二分出 `renderAt(cap)` 仍放得进预算的最大 cap（渲染体积随 cap 单调不减）。 */
@@ -469,14 +559,6 @@ function largestFitting(lo: number, hi: number, renderAt: (cap: number) => strin
 function askMention(ask: PendingAsk, result: AskResult | undefined): string | undefined {
   return !result && !ask.deliveryTarget && ask.mentionedOpenId && /^ou_[A-Za-z0-9_-]+$/.test(ask.mentionedOpenId)
     ? `<at id=${ask.mentionedOpenId}></at>` : undefined;
-}
-
-/** 未 settle 的文本作答批次会把选项标签并进问题正文展示；settle 后只展示原问题。 */
-function questionPrompt(ask: PendingAsk, index: number, settled = false): string {
-  const q = ask.questions[index]!;
-  const textReplyRequired = ask.questions.some(item => item.inputMode === 'text');
-  return !settled && textReplyRequired && q.options.length
-    ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt;
 }
 
 function capPrompt(prompt: string, cap: number, locale?: Locale): string {
@@ -524,203 +606,62 @@ function renderAskCardWithCap(
   opts: { confirmEmptyArmed?: boolean } | undefined,
   promptCap: number,
   descriptionCap: number,
-): string {
+  density: AskDensity,
+): { json: string; descriptionsTruncated: boolean } {
   const locale = localeForBot(ask.larkAppId);
   const mention = askMention(ask, result);
-  if (hasAskForm(ask.questions)) {
-    const capped = { ...ask, questions: ask.questions.map(q => ({ ...q, prompt: capPrompt(q.prompt, promptCap, locale) })) };
-    return JSON.stringify({ schema: '2.0', config: { wide_screen_mode: true },
-      header: { title: { tag: 'plain_text', content: 'botmux ask' }, template: result ? 'grey' : 'blue' },
-      body: { elements: buildAskFormElements(capped, locale, result, Math.min(300, promptCap), { mention, descriptionCap }) } });
-  }
-  const optionLayout = askOptionLayoutForBot(ask.larkAppId);
-  const deadline = formatAskDeadline(ask.deadlineAt, locale);
-  const status = result ? settleStatus(result, ask, locale) : undefined;
-  const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
-
-  // 截止时间 + 可答复人 字段行（settled 与 unsettled 均展示）
-  const metaDiv = {
-    tag: 'div',
-    fields: [
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${escapeMd(deadline)}` } },
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${approverSummary(ask, locale)}` } },
-    ],
-  };
-
-  const elements: Array<Record<string, unknown>> = [metaDiv];
-  const descriptionNotes = new Set<Record<string, unknown>>();
-  const pushDescriptions = (q: PendingAsk['questions'][number]) => {
-    const details = optionDescriptions(q, locale, descriptionCap);
-    if (!details) return;
-    const note = { tag: 'note', elements: [{ tag: 'lark_md', content: details.content }] };
-    descriptionNotes.add(note);
-    elements.push(note);
-  };
+  const presentation = askPresentation(ask);
+  const prompt = (text: string) => escapeQuestion(capPrompt(text, promptCap, locale));
+  const elements: Array<Record<string, unknown>> = [];
   if (ask.deliveryTarget) {
-    elements.push({ tag: 'note', elements: [{ tag: 'plain_text',
-      content: t('card.ask.document_origin', {
-        document: ask.deliveryTarget.fileToken, comment: ask.deliveryTarget.commentId,
-      }, locale),
-    }] });
+    elements.push({ tag: 'markdown', text_size: 'notation', content: t('card.ask.document_origin', {
+      document: ask.deliveryTarget.fileToken, comment: ask.deliveryTarget.commentId,
+    }, locale) });
   }
-
-  if (status) {
-    // 已 settle：保留原问题内容，再展示状态摘要。审批卡若在点击后
-    // 只留下「已选择」，审批人就无法回看自己批准了什么。
-    elements.push({ tag: 'hr' });
-    for (let i = 0; i < ask.questions.length; i++) {
-      elements.push({
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(capPrompt(questionPrompt(ask, i, true), promptCap, locale))}`,
-        },
-      });
-      pushDescriptions(ask.questions[i]!);
-    }
-    elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'div',
-      text: { tag: 'lark_md', content: status },
-    });
+  let header: Record<string, unknown>;
+  let descriptionsTruncated: boolean;
+  if (!result && density === 'list') {
+    // Too large for any control within the element limit: list it, answer by chat reply.
+    const body = buildAskListBody(ask, { locale, prompt, descriptionCap });
+    header = pendingHeader(ask, locale, 'text_reply');
+    if (mention) elements.push({ tag: 'markdown', content: mention });
+    elements.push(...body.elements, askFooter(deadlineLine(ask, locale), [
+      ask.deliveryTarget || isNativeAsyncAskOrigin(ask.originKind) ? askReplyHint(ask, locale) ?? ''
+        : t('card.ask.list_reply_hint', undefined, locale),
+      body.descriptionsTruncated ? t('card.ask.descriptions_truncated', undefined, locale) : '',
+    ]));
+    descriptionsTruncated = body.descriptionsTruncated;
+  } else if (presentation === 'input_form') {
+    const capped = { ...ask, questions: ask.questions.map(q => ({ ...q, prompt: capPrompt(q.prompt, promptCap, locale) })) };
+    const body = renderAskFormBody(capped, locale, result, Math.min(300, promptCap), { mention, descriptionCap, density });
+    header = result ? settledHeader(ask, result, locale) : pendingHeader(ask, locale, presentation);
+    elements.push(...body.elements);
+    descriptionsTruncated = body.descriptionsTruncated;
+  } else if (result) {
+    const permission = permissionAskSettleStatus(ask, result, locale);
+    const detail = permission?.detail ?? (result.kind !== 'invalidated' ? undefined
+      : result.failureCode === 'claimant_gone' ? t('card.ask.invalidated_claimant_gone', undefined, locale)
+        : result.failureCode === 'answer_undelivered' ? t('card.ask.invalidated_answer_undelivered', undefined, locale)
+          : escapeMd(result.reason));
+    const body = buildAskSettledBody(ask, result, { locale, prompt, descriptionCap, detail, density });
+    header = settledHeader(ask, result, locale, permission?.headline);
+    elements.push(...body.elements, askFooter(result.kind === 'answered'
+      ? submittedByLine(result.by, ask, locale) : deadlineLine(ask, locale)));
+    descriptionsTruncated = body.descriptionsTruncated;
   } else {
-    if (supportsAskCustomInput(ask)) return JSON.stringify({
-      schema: '2.0', config: { width_mode: 'fill' },
-      header: { template: 'blue', title: { tag: 'plain_text', content: t('card.ask.title', undefined, locale) } },
-      body: { elements: [
-        { tag: 'markdown', content: metaDiv.fields.map(f => f.text.content).join('\n') },
-        ...(ask.deliveryTarget ? [{ tag: 'markdown', content: t('card.ask.document_origin', {
-          document: ask.deliveryTarget.fileToken, comment: ask.deliveryTarget.commentId,
-        }, locale) }] : []),
-        buildAskCustomForm(ask, locale, confirmEmptyArmed, text => escapeQuestion(capPrompt(text, promptCap, locale)),
-          { mention, descriptionCap }),
-        ...(ask.deliveryTarget || isNativeAsyncAskOrigin(ask.originKind) ? [{ tag: 'markdown', text_size: 'notation', content:
-          t(ask.deliveryTarget ? 'card.ask.document_reply_hint' : 'card.ask.async_reply_hint', undefined, locale) }] : []),
-      ] },
-    });
-    // 未 settle：只用 action/buttons，避免 form+select 被飞书服务端静默丢弃。
-    elements.push({ tag: 'hr' });
-
-    const textReplyRequired = ask.questions.some(q => q.inputMode === 'text');
-    const requiresSubmit = textReplyRequired || ask.questions.length > 1 || ask.questions.some((q) => q.multiSelect || q.defaultSelectedKeys !== undefined);
-    const selections = ask.selections ?? ask.questions.map(() => []);
-
-    for (let i = 0; i < ask.questions.length; i++) {
-      const q = ask.questions[i]!;
-      const prompt = capPrompt(questionPrompt(ask, i), promptCap, locale);
-
-      // 问题标题。问题正文完整渲染：审批按钮的效力取决于完整信息，展示层截断
-      // 会让批准人在信息不全的情况下做决定。空 prompt 已在 ask-api 归一化时以
-      // bad_question_shape 拒绝。整卡超飞书 30KB 请求体上限时由 renderAskCard 的
-      // 字节预算截断并改由附件承载全文（promptCap 默认 Infinity，即不截断）。
-      elements.push({
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: `${i === 0 && mention ? `${mention}\n` : ''}**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(prompt)}`,
-        },
-      });
-
-      if (textReplyRequired) { pushDescriptions(q); continue; } // A batch with text inputs is answered in conversation.
-      const selected = new Set(selections[i] ?? []);
-      const optionButtons = q.options.map((opt) => ({
-        tag: 'button',
-        text: {
-          tag: 'plain_text',
-          content: requiresSubmit ? optionLabel(q.multiSelect, selected.has(opt.key), opt.label) : opt.label,
-        },
-        type: selected.has(opt.key) ? 'primary' : 'default',
-        value: requiresSubmit
-          ? {
-              action: ASK_TOGGLE_ACTION,
-              ask_id: ask.askId,
-              nonce: ask.nonce,
-              question_index: String(i),
-              key: opt.key,
-            }
-          : {
-              action: ASK_SELECT_ACTION,
-              ask_id: ask.askId,
-              nonce: ask.nonce,
-              key: opt.key,
-            },
-      }));
-      appendActionRows(elements, optionButtons, optionLayout);
-
-      // 选项说明不进按钮（飞书按钮无副标题），在按钮行下方以小字列出。
-      pushDescriptions(q);
-    }
-
-    if (requiresSubmit && !textReplyRequired) {
-      elements.push({ tag: 'hr' });
-      // 空提交二次确认：用户一个选项都没勾就点了提交，且至少有一问是多选（多选允许
-      // 「一个都不选」，但极可能是手滑）。第一次拦下来、渲染警示 + 把 Submit 按钮的
-      // value 打上 confirm_empty；用户再点一次才真正 settle 空答案。arm 态只活在按钮
-      // value 里（随卡片走），broker 不留状态，天然对 daemon 重启幂等。
-      if (confirmEmptyArmed) {
-        elements.push({
-          tag: 'div',
-          text: { tag: 'lark_md', content: t('card.ask.empty_warning', undefined, locale) },
-        });
-      }
-      elements.push({
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: {
-              tag: 'plain_text',
-              content: confirmEmptyArmed
-                ? t('card.ask.submit_confirm_empty', undefined, locale)
-                : t('card.ask.submit', undefined, locale),
-            },
-            type: confirmEmptyArmed ? 'danger' : 'primary',
-            value: {
-              action: ASK_SUBMIT_ACTION,
-              ask_id: ask.askId,
-              nonce: ask.nonce,
-              // Feishu 按钮 value 只可靠地保留字符串（布尔/数字会被字符串化，见
-              // settings-card 的 `next_value:'true'` 约定 + toggle 的 `String(i)`）。
-              // 故 arm 标志用字符串 'true'，读取端按字符串判定。
-              ...(confirmEmptyArmed ? { confirm_empty: 'true' } : {}),
-            },
-          },
-        ],
-      });
-    }
-
-    // 自定义回复提示：选项都不满意时，直接在话题里回复一句文字即可当答案。
-    elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'note',
-      elements: [
-        { tag: 'plain_text', content: t(ask.deliveryTarget ? 'card.ask.document_reply_hint'
-          : isNativeAsyncAskOrigin(ask.originKind) ? 'card.ask.async_reply_hint'
-            : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
-      ],
-    });
+    const confirmEmptyArmed = !!opts?.confirmEmptyArmed;
+    const body = buildAskChoiceBody(ask, { locale, density, prompt, descriptionCap, confirmEmptyArmed });
+    header = pendingHeader(ask, locale, presentation);
+    if (mention) elements.push({ tag: 'markdown', content: mention });
+    elements.push(...body.elements, askFooter(deadlineLine(ask, locale), [
+      askReplyHint(ask, locale) ?? '',
+      body.descriptionsTruncated ? t('card.ask.descriptions_truncated', undefined, locale) : '',
+    ]));
+    descriptionsTruncated = body.descriptionsTruncated;
   }
-
-  if (supportsAskCustomInput(ask)) return JSON.stringify({
-    schema: '2.0', config: { width_mode: 'fill' },
-    header: { template: result ? templateForResult(result) : 'blue',
-      title: { tag: 'plain_text', content: t('card.ask.title_done', undefined, locale) } },
-    body: { elements: elements.map(element => {
-      if (element.tag === 'hr') return element;
-      const div = element as { text?: { content: string }; fields?: Array<{ text: { content: string } }>; elements?: Array<{ content: string }> };
-      return { tag: 'markdown', ...(descriptionNotes.has(element) ? { text_size: 'notation' } : {}),
-        content: div.text?.content ?? div.fields?.map(f => f.text.content).join('\n')
-        ?? div.elements?.map(e => e.content).join('\n') ?? '' };
-    }) },
-  });
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    header: {
-      template: result ? templateForResult(result) : 'blue',
-      title: { tag: 'plain_text', content: result ? t('card.ask.title_done', undefined, locale) : t('card.ask.title', undefined, locale) },
-    },
-    elements,
-  });
+  return { descriptionsTruncated, json: JSON.stringify({
+    schema: '2.0', config: askCardConfig(), header, body: { vertical_spacing: '12px', elements },
+  }) };
 }
 
 /**
@@ -844,6 +785,7 @@ function toastForOutcome(outcome: AskClickOutcome, locale?: Locale): { toast: { 
       // 累积勾选，不弹 toast
       return undefined;
     case 'invalid_form':
+    case 'invalid_choice':
       return { toast: { type: 'warning', content: locale === 'en' ? 'Complete the required fields and check their formats; your draft is unchanged.' : '请补齐必填项并检查格式；已填内容保留，尚未提交。' } };
     case 'needs_empty_confirm':
       // 正常路径由 handleAskCardAction 提前拦成 arm 卡片响应，不会走到这里；
@@ -856,74 +798,6 @@ function staleToast(locale?: Locale): { toast: { type: string; content: string }
   return { toast: { type: 'warning', content: t('card.ask.toast.stale', undefined, locale) } };
 }
 
-/**
- * 生成已结束状态的摘要文本。
- *
- * answered：遍历每个问题，把选中的 key 映射为 label 并渲染。
- * timedOut / invalidated：展示对应说明。
- */
-function settleStatus(result: AskResult, ask: PendingAsk, locale?: Locale): string {
-  if (result.kind === 'answered') {
-    // 自定义回复（替代语义）：没有任何选中项、只有一段自定义文字 → 单独渲染。
-    const hasSelection = result.answers.some((keys) => keys.length > 0);
-    if (result.comment && !hasSelection) {
-      return `**${t('card.ask.custom_reply', undefined, locale)}**\n${escapeMd(result.comment)}\n${t('common.operator', { by: escapeMd(short(result.by, 28)) }, locale)}`;
-    }
-    // 每问一行：问题N：<选中标签>
-    const lines = result.answers.map((keys, i) => {
-      const q = ask.questions[i];
-      if (!q) return t('card.ask.q_unparseable', { n: i + 1 }, locale);
-      const labels = keys.map((key) => q.options.find((o) => o.key === key)?.label ?? key);
-      // Per-question custom text is answerer-controlled free text; the outer
-      // escapeMd keeps <at> mentions intact by design, so neutralise angle
-      // brackets HERE or a crafted answer would render a bot-authored mention.
-      const custom = result.customAnswers?.[i];
-      const display = custom
-        ? custom.replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        : labels.join(', ');
-      return t('card.ask.q_summary_line', { n: i + 1, labels: display }, locale);
-    });
-    const summary = lines.join('\n');
-    const commentLine = result.comment ? `\n${t('card.ask.supplement', { comment: escapeMd(result.comment) }, locale)}` : '';
-    return `**${t('card.ask.selected', undefined, locale)}**\n${escapeMd(summary)}${commentLine}\n${t('common.operator', { by: escapeMd(short(result.by, 28)) }, locale)}`;
-  }
-  const permission = permissionAskSettleStatus(ask, result, locale);
-  if (permission) return `**${permission.headline}**\n${permission.detail}`;
-  if (result.kind === 'timedOut') {
-    return `**${t('card.ask.timed_out', undefined, locale)}**`;
-  }
-  const detail = result.failureCode === 'claimant_gone'
-    ? t('card.ask.invalidated_claimant_gone', undefined, locale)
-    : result.failureCode === 'answer_undelivered'
-      ? t('card.ask.invalidated_answer_undelivered', undefined, locale)
-      : escapeMd(result.reason);
-  return `**${t('card.ask.invalidated', undefined, locale)}**\n${detail}`;
-}
-
-function templateForResult(result: AskResult): string {
-  switch (result.kind) {
-    case 'answered': return 'green';
-    case 'timedOut': return 'orange';
-    case 'invalidated': return result.cliOutcome === 'cli_auto_denied' ? 'orange' : 'grey';
-  }
-}
-
-function approverSummary(ask: PendingAsk, locale?: Locale): string {
-  if (ask.answererOpenId) {
-    // XPI can resolve this id from union_id in another app. It is valid for the
-    // broker's callback authorization, but embedding it as an at/person card
-    // resource can make Lark reject the whole card with 230099. Keep ordinary
-    // same-app asks unchanged; only the three XPI origins use a neutral label.
-    if (ask.originKind?.startsWith('host_cross_principal_')) {
-      return t('card.ask.answerable_designated_member', undefined, locale);
-    }
-    return `<at id=${ask.answererOpenId}></at>`;
-  }
-  // 答复权限 = canTalk：谁能在该群跟 bot 说话谁就能答。卡片统一显示「本群可对话成员」，
-  // 不再按 open_id 列名单（鉴权在 broker 点击时按 canTalk 判定）。
-  return t('card.ask.answerable_talk_members', undefined, locale);
-}
-
 function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
@@ -932,69 +806,4 @@ function asNumber(value: unknown): number {
   if (typeof value === 'number') return value;
   if (typeof value === 'string' && value.trim() !== '') return Number(value);
   return Number.NaN;
-}
-
-function optionLabel(multiSelect: boolean, selected: boolean, label: string): string {
-  if (multiSelect) return `${selected ? '☑' : '☐'} ${label}`;
-  return `${selected ? '◉' : '○'} ${label}`;
-}
-
-function appendActionRows(
-  elements: Array<Record<string, unknown>>,
-  actions: Array<Record<string, unknown>>,
-  layout: AskOptionLayout,
-): void {
-  if (layout === 'vertical') {
-    // 竖放：一行一按钮。单列 column_set（flex_mode:'none' + weighted 列宽）让按钮
-    // 单列排布，长选项标签不被同排按钮挤压。column_set 在旧版卡片 schema 同样
-    // 受支持，无需迁移 schema 2.0。
-    for (const action of actions) {
-      elements.push({
-        tag: 'column_set',
-        flex_mode: 'none',
-        horizontal_spacing: 'small',
-        columns: [{ tag: 'column', width: 'weighted', weight: 1, elements: [action] }],
-      });
-    }
-    return;
-  }
-  for (let i = 0; i < actions.length; i += MAX_BUTTONS_PER_ACTION_ROW) {
-    elements.push({
-      tag: 'action',
-      actions: actions.slice(i, i + MAX_BUTTONS_PER_ACTION_ROW),
-    });
-  }
-}
-
-/** Keep labelled web links usable without enabling arbitrary question markup. */
-function escapeQuestion(s: string): string {
-  let cursor = 0;
-  let rendered = '';
-  for (const match of s.matchAll(/\[([^\]\r\n]+)\]\(/g)) {
-    const start = match.index!;
-    if (start < cursor || s[start - 1] === '!') continue;
-    const escapes = s.slice(0, start).match(/\\+$/)?.[0].length ?? 0;
-    if (escapes % 2) continue;
-    const destination = parseLinkDestination(s, start + match[0].length, s.length);
-    if (!destination.ok || s[destination.pos] !== ')') continue;
-    let url: URL;
-    try { url = new URL(destination.str); } catch { continue; }
-    if (url.protocol !== 'https:' && url.protocol !== 'http:') continue;
-    // Parentheses are legal URL characters but must not terminate a Markdown link.
-    const href = url.href.replace(/\(/g, '%28').replace(/\)/g, '%29');
-    rendered += escapeMd(s.slice(cursor, start)) + `[${escapeMd(match[1]!)}](${href})`;
-    cursor = destination.pos + 1;
-  }
-  return rendered + escapeMd(s.slice(cursor));
-}
-
-function escapeMd(s: string): string {
-  // A mention is structured Lark markup: escaping the underscore in its ID
-  // makes the entire card invalid. Keep complete user/bot mentions atomic.
-  return s.replace(/<at\s+id=(?:"ou_[\w-]+"|'ou_[\w-]+'|ou_[\w-]+)\s*><\/at>|[*_~`\[\]\\]/g,
-    (token) => token.startsWith('<at') ? token : `\\${token}`);
-}
-
-function short(s: string, n: number): string {
-  return s.length > n ? `${s.slice(0, n)}…` : s;
 }
