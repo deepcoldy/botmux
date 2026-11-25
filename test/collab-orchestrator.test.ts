@@ -300,7 +300,7 @@ describe('S1 create 编排', () => {
         calls++;
         markStarted();
         await blocker;
-        return 'om_late_forward';
+        throw new Error('late unknown forward result');
       },
     });
     const first = runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), d);
@@ -315,7 +315,7 @@ describe('S1 create 编排', () => {
     expect(calls).toBe(1);
     const entry = readCollabInitEntry(tempDir, APP, initId)!;
     expect(entry.state).toBe('cancelled');
-    expect(entry.operations[collabForwardUuid(initId)].status).toBe('done');
+    expect(entry.operations[collabForwardUuid(initId)].status).toBe('unknown');
     expect(readCollabGate(tempDir, 'oc_created')?.phase).toBe('cancelled');
   });
 
