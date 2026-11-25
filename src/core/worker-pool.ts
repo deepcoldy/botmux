@@ -21853,14 +21853,15 @@ function setupWorkerHandlers(
     limit: CliUsageLimitState,
     turnId: string | undefined,
     ownsEpisode?: () => boolean,
+    notificationKey = usageLimitStateKey(limit),
   ): void => {
     const limitKey = usageLimitStateKey(limit);
     const ownsLimitEpisode = ownsEpisode ?? ((): boolean =>
       ds.lastScreenStatus === 'limited'
       && !!ds.usageLimit
       && usageLimitStateKey(ds.usageLimit) === limitKey);
-    if (ds.rateLimitNotifiedKey !== limitKey) {
-      ds.rateLimitNotifiedKey = limitKey;
+    if (ds.rateLimitNotifiedKey !== notificationKey) {
+      ds.rateLimitNotifiedKey = notificationKey;
       const notifyBody = tr(
         limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
         { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
@@ -21963,8 +21964,12 @@ function setupWorkerHandlers(
     const linkedSameEpisode = previousLimit?.nativeLogEpisodeKey !== undefined
       && previousLimit.nativeLogEpisodeKey === limit.nativeEpisodeKey
       || limit.nativeLogEpisodeKey !== undefined && limit.nativeLogEpisodeKey === previousLimit?.nativeEpisodeKey;
-    const replacedNativeEpisode = !linkedSameEpisode && previousLimit?.nativeEpisodeKey !== undefined
-      && limit.nativeEpisodeKey !== undefined && previousLimit.nativeEpisodeKey !== limit.nativeEpisodeKey;
+    const nativeSource = limit.source === 'antigravity-error-composer' || limit.source === 'antigravity-native-log';
+    const nativeConfirmation = nativeSource && previousLimit !== undefined
+      && previousLimit.nativeEpisodeKey === undefined && limit.nativeEpisodeKey !== undefined;
+    const replacedNativeEpisode = !linkedSameEpisode && (nativeConfirmation
+      || previousLimit?.nativeEpisodeKey !== undefined
+        && limit.nativeEpisodeKey !== undefined && previousLimit.nativeEpisodeKey !== limit.nativeEpisodeKey);
     if (previousStatus === 'limited' && !replacedExpiredQuota && !replacedNativeEpisode) return;
 
     // 已通过截图来源校验的旧帧仍可能指向旧话题。两个入口都先核对当前执行。
@@ -21979,6 +21984,11 @@ function setupWorkerHandlers(
       if (managedAuxUiSuppressed(turnId, attempt)) return;
     }
     const limitKey = usageLimitStateKey(limit);
+    const notificationLimitKey = nativeConfirmation
+      && previousLimit.kind === limit.kind
+      && previousLimit.retryLabel === limit.retryLabel
+      && previousLimit.relativeResetKey === limit.relativeResetKey
+      ? usageLimitStateKey(previousLimit!) : limitKey;
     // Antigravity hosted-account auto-rotation: on genuine native quota
     // exhaustion (a footerless native composer or the session's own
     // ResourceExhausted --log-file record), rotate the host vault to
@@ -22214,7 +22224,7 @@ function setupWorkerHandlers(
     if (rotationDecision.outcome === 'started') {
       return;
     }
-    if (rotationDecision.outcome === 'exhausted' && ds.rateLimitNotifiedKey !== limitKey) {
+    if (rotationDecision.outcome === 'exhausted' && ds.rateLimitNotifiedKey !== notificationLimitKey) {
       let exhaustText: string;
       if (rotationDecision.reason === 'turn_budget_exhausted') {
         exhaustText = tr('worker.agy_rotate.turn_budget_exhausted', {}, loc);
@@ -22242,7 +22252,7 @@ function setupWorkerHandlers(
       logger.warn(`[${t}] Antigravity quota rotation refused: session account identity is unknown`);
     }
 
-    const notifyOwnerAndHandOff = (): void => notifyQuotaLimitEpisode(limit, turnId);
+    const notifyOwnerAndHandOff = (): void => notifyQuotaLimitEpisode(limit, turnId, undefined, notificationLimitKey);
     const chainOwnsLimit = callbacks?.startQuotaFallbackChainSwitch?.(ds, {
       kind: limit.kind,
       transient: isTransientRateLimit(limit),
