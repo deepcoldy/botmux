@@ -15757,7 +15757,7 @@ function codexBridgeDetachFile(): void {
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
   antigravityFullUpgradeAttemptKey = undefined;
-  structuredMissingFinalWatchdog.observe(undefined);
+  structuredMissingFinalWatchdog?.observe(undefined);
 }
 
 /** Resolve the pid of the Codex process this worker observes (spawned child or
@@ -17353,13 +17353,13 @@ function maybeSettleMissingStructuredFinal(): void {
     // start a fresh bounded wait; a later tick may successfully read a final
     // that was already on disk at this deadline.
     log(`Missing-final drain before turn retirement failed: ${err.message}`);
-    structuredMissingFinalWatchdog.observe(undefined);
+    structuredMissingFinalWatchdog?.observe(undefined);
     return;
   }
   if (!drainCompleted) {
     // No transcript was actually read (detached, rebind, RPC activation, ...).
     // Keep the owner and start a fresh wait only after a real read can run.
-    structuredMissingFinalWatchdog.observe(undefined);
+    structuredMissingFinalWatchdog?.observe(undefined);
     return;
   }
   const current = structuredMissingFinalTarget();
@@ -17382,12 +17382,12 @@ function maybeSettleMissingStructuredFinal(): void {
       notifyMissingFinalTurn(turn.turnId, retireSilently);
     } catch (error) {
       log(`Missing-final notice staging failed; keeping the owner: ${error instanceof Error ? error.message : String(error)}`);
-      structuredMissingFinalWatchdog.observe(undefined);
+      structuredMissingFinalWatchdog?.observe(undefined);
       return;
     }
   }
   const dropped = codexBridgeQueue.dropPendingTurn(turn.turnId, turn.dispatchAttempt, true);
-  structuredMissingFinalWatchdog.observe(undefined);
+  structuredMissingFinalWatchdog?.observe(undefined);
   if (!dropped) return;
   // Universal output handoff can make emitReadyCodexTurns return before its
   // legacy checkpoint. The ordinary warning above already has its own pinned
@@ -17908,7 +17908,7 @@ function stopCodexBridge(): void {
   mtrBridgeSource = undefined;
   mtrBridgeOffset = 0;
   mtrBridgeBaselineDone = false;
-  structuredMissingFinalWatchdog.observe(undefined);
+  structuredMissingFinalWatchdog?.observe(undefined);
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
   resetThinkingChannel();
