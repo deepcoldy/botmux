@@ -731,6 +731,9 @@ export async function listChatMemberDisplays(larkAppId: string, chatId: string):
   const client = getBotClient(larkAppId);
   const out: ChatMemberDisplay[] = [];
   const seen = new Map<string, number>();
+  // Once two different configured apps claim the same observer-scoped openId,
+  // keep that row ambiguous even if later duplicate rows repeat one claimant.
+  const ambiguousBotOpenIds = new Set<string>();
   let pageToken: string | undefined;
   for (let page = 0; page < 20; page++) {
     const params: Record<string, string> = {
@@ -789,7 +792,14 @@ export async function listChatMemberDisplays(larkAppId: string, chatId: string):
       } else {
         const prev = out[existing]!;
         const resolvedName = name === openId && prev.name !== openId ? prev.name : name;
-        const resolvedAppId = botLarkAppId || prev.larkAppId;
+        if (botLarkAppId && prev.larkAppId && botLarkAppId !== prev.larkAppId) {
+          ambiguousBotOpenIds.add(openId);
+        }
+        // An observed external row (empty appId) does not erase a configured
+        // identity, but conflicting configured identities fail closed.
+        const resolvedAppId = ambiguousBotOpenIds.has(openId)
+          ? undefined
+          : botLarkAppId || prev.larkAppId;
         out[existing] = {
           openId,
           name: resolvedName,

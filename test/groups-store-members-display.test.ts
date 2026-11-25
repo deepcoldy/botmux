@@ -116,6 +116,39 @@ describe('listChatMemberDisplays larkAppId enrichment', () => {
     ]);
   });
 
+  it('omits larkAppId when different configured bots claim one openId, and keeps the conflict ambiguous', async () => {
+    larkGetMock.mockResolvedValue({
+      code: 0,
+      data: {
+        has_more: false,
+        items: [{ member_id: 'ou_shared', name: 'Twin', member_type: 'app' }],
+      },
+    });
+    const botRow = (larkAppId: string, source: 'configured' | 'introduce') => ({
+      larkAppId,
+      openId: 'ou_shared',
+      name: 'Twin',
+      displayName: 'Twin',
+      source,
+      hasTeamRole: false,
+      mentionable: true,
+      mentionSource: source === 'configured' ? 'cross-ref' : 'observed',
+    });
+    listChatBotMembersMock.mockResolvedValue([
+      botRow('cli_self', 'configured'),
+      botRow('cli_peer', 'configured'),
+      // An external duplicate must neither restore nor select either claimant.
+      botRow('', 'introduce'),
+      botRow('cli_self', 'configured'),
+    ]);
+
+    const rows = await listChatMemberDisplays('cli_self', 'oc_chat_ambiguous');
+    expect(rows).toEqual([
+      { openId: 'ou_shared', name: 'Twin', memberType: 'bot' },
+    ]);
+    expect(rows[0]).not.toHaveProperty('larkAppId');
+  });
+
   it('degrades gracefully when listChatBotMembers fails', async () => {
     larkGetMock.mockResolvedValue({
       code: 0,

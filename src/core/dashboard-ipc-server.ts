@@ -14568,26 +14568,25 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     kickoffPrompt?: unknown;
   };
   const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
-  const normalizedLarkAppIds = normalizeGroupLarkAppIds(body.larkAppIds);
+  // Legacy trusted callers may omit the creator from larkAppIds (or pass an
+  // empty creator-only list); createGroupWithBots adds the bound bot implicitly.
+  const normalizedLarkAppIds = normalizeGroupLarkAppIds(body.larkAppIds, { allowEmpty: true });
   if (!normalizedLarkAppIds.ok) {
     return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required', accepted: false });
   }
   const larkAppIds = normalizedLarkAppIds.larkAppIds;
-  // Bound-bot / port-reuse guard: if caller names creatorLarkAppId, verify exact
-  // match; even when omitted, require this daemon's bot to be in larkAppIds so a
-  // port-reused daemon cannot silently create a group as an unrequested creator.
+  // New callers pin the creator explicitly. Both exact identity and roster
+  // membership are enforced only for that form; without the pin, preserve the
+  // legacy implicit-creator contract instead of inventing a new requirement.
   if (body.creatorLarkAppId !== undefined) {
     if (typeof body.creatorLarkAppId !== 'string'
       || !body.creatorLarkAppId.trim()
       || body.creatorLarkAppId !== body.creatorLarkAppId.trim()) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_creator_lark_app_id', accepted: false });
     }
-    if (body.creatorLarkAppId !== cachedLarkAppId) {
+    if (body.creatorLarkAppId !== cachedLarkAppId || !larkAppIds.includes(cachedLarkAppId)) {
       return jsonRes(res, 409, { ok: false, error: 'bot_mismatch', accepted: false });
     }
-  }
-  if (!larkAppIds.includes(cachedLarkAppId)) {
-    return jsonRes(res, 409, { ok: false, error: 'bot_mismatch', accepted: false });
   }
   // userOpenIds, transferOwnerTo, notifyOwnerOpenId, managerUserIds are optional;
   // pre-validated upstream by the dashboard route. All open_ids MUST be in the

@@ -26,6 +26,7 @@ import { invalidateGlobalConfigCache, setGroupOwnerNoticeEnabled } from '../src/
 import * as chatTopNotice from '../src/im/lark/chat-top-notice.js';
 import * as larkClient from '../src/im/lark/client.js';
 import * as groupsStore from '../src/services/groups-store.js';
+import * as workerPool from '../src/core/worker-pool.js';
 import { spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
 
 const CLI_ENTRY = resolve(process.cwd(), 'src/cli.ts');
@@ -370,14 +371,16 @@ describe('group IPC & CLI capabilities', () => {
       expect(wrongCreator.status).toBe(409);
       expect(await wrongCreator.json()).toEqual({ ok: false, error: 'bot_mismatch', accepted: false });
 
-      // 3. Bound bot absent from larkAppIds → 409 bot_mismatch, accepted:false.
-      const missingSelf = await fetchDaemonIpc(handle.port, '/api/groups/create', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ larkAppIds: ['cli_other_bot'] }),
-      }, secret);
-      expect(missingSelf.status).toBe(409);
-      expect(await missingSelf.json()).toEqual({ ok: false, error: 'bot_mismatch', accepted: false });
+      // 3. Explicit creator with bound bot absent from larkAppIds (empty or peer-only) → 409 bot_mismatch.
+      for (const larkAppIds of [[], ['cli_other_bot']]) {
+        const missingSelf = await fetchDaemonIpc(handle.port, '/api/groups/create', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ creatorLarkAppId: 'cli_auth_create', larkAppIds }),
+        }, secret);
+        expect(missingSelf.status).toBe(409);
+        expect(await missingSelf.json()).toEqual({ ok: false, error: 'bot_mismatch', accepted: false });
+      }
 
       // 4. Malformed creatorLarkAppId → 400 invalid_creator_lark_app_id, accepted:false.
       const badCreator = await fetchDaemonIpc(handle.port, '/api/groups/create', {
@@ -410,6 +413,46 @@ describe('group IPC & CLI capabilities', () => {
       expect(await okRes.json()).toMatchObject({ ok: true, chatId: 'oc_auth_created' });
     });
 
+    it('preserves legacy implicit-creator requests with empty or peer-only larkAppIds', async () => {
+      setLarkAppId('cli_legacy_creator');
+      const createSpy = vi.spyOn(groupsStore, 'createChat')
+        .mockResolvedValueOnce({ chatId: 'oc_legacy_empty', invalidBotIds: [], invalidUserIds: [] })
+        .mockResolvedValueOnce({ chatId: 'oc_legacy_peer', invalidBotIds: [], invalidUserIds: [] });
+      const addBotSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([
+        { id: 'cli_legacy_peer', ok: true },
+      ]);
+      vi.spyOn(groupsStore, 'getChatShareLink').mockResolvedValue({
+        ok: true,
+        shareLink: 'https://example.test/legacy',
+      });
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const post = (larkAppIds: string[]) => fetch(`http://127.0.0.1:${handle!.port}/api/groups/create`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ larkAppIds }),
+      });
+
+      const empty = await post([]);
+      expect(empty.status).toBe(200);
+      expect(await empty.json()).toMatchObject({ ok: true, chatId: 'oc_legacy_empty', creator: 'cli_legacy_creator' });
+      expect(createSpy).toHaveBeenNthCalledWith(1, 'cli_legacy_creator', expect.objectContaining({
+        botIds: [],
+        userIds: [],
+      }));
+      expect(addBotSpy).not.toHaveBeenCalled();
+
+      const peerOnly = await post(['cli_legacy_peer']);
+      expect(peerOnly.status).toBe(200);
+      expect(await peerOnly.json()).toMatchObject({ ok: true, chatId: 'oc_legacy_peer', creator: 'cli_legacy_creator' });
+      expect(createSpy).toHaveBeenNthCalledWith(2, 'cli_legacy_creator', expect.objectContaining({
+        botIds: [],
+        userIds: [],
+      }));
+      expect(addBotSpy).toHaveBeenCalledOnce();
+      expect(addBotSpy).toHaveBeenCalledWith('cli_legacy_creator', 'oc_legacy_peer', ['cli_legacy_peer']);
+    });
+
     it('fails closed with accepted:false BEFORE createChat on every invalid new option or non-object body', async () => {
       setLarkAppId('cli_creator_4');
       const createSpy = vi.spyOn(groupsStore, 'createChat').mockResolvedValue({
@@ -428,7 +471,6 @@ describe('group IPC & CLI capabilities', () => {
       const cases: Array<[string, unknown, string]> = [
         ['null body', null, 'bad_json'],
         ['array body', ['cli_creator_4'], 'bad_json'],
-        ['empty larkAppIds', { larkAppIds: [] }, 'larkAppIds_required'],
         ['blank item in larkAppIds', { larkAppIds: ['cli_creator_4', '   '] }, 'larkAppIds_required'],
         ['non-string item in larkAppIds', { larkAppIds: ['cli_creator_4', 123] }, 'larkAppIds_required'],
         ['unpaired kickoffBotLarkAppId', { larkAppIds: ['cli_creator_4', 'cli_p'], kickoffBotLarkAppId: 'cli_p' }, 'kickoff_args_must_be_paired'],
@@ -1083,6 +1125,44 @@ describe('group IPC & CLI capabilities', () => {
           larkAppId: 'cli_headless_bot',
         });
         expect(topSpy).toHaveBeenCalledWith('cli_headless_bot', 'oc_target_1', 'om_pin_1');
+
+        // A daemon-only ordinary origin must remain allowed: the child has no
+        // local session row, so removing resolveSessionById (or retaining the
+        // poisoned appId) turns this positive case into a conservative refusal.
+        topSpy.mockClear();
+        mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+        const ancestorMarker = join(dataDir, '.botmux-cli-pids', String(process.pid));
+        writeFileSync(ancestorMarker, JSON.stringify({ sessionId: 'human_origin', turnId: 'om_turn' }));
+        registerBot({ larkAppId: 'cli_headless_bot', larkAppSecret: 's', cliId: 'claude-code', workingDir: fakeHome });
+        const previousRegistry = workerPool.getActiveSessionsRegistry();
+        workerPool.setActiveSessionsRegistry(new Map([['human_origin', {
+          session: {
+            sessionId: 'human_origin', larkAppId: 'cli_headless_bot', cliId: 'claude-code',
+            chatId: 'oc_source', chatType: 'group', rootMessageId: 'om_human', scope: 'thread',
+          },
+          larkAppId: 'cli_headless_bot', chatId: 'oc_source', chatType: 'group', workingDir: fakeHome,
+        } as any]]));
+        try {
+          const daemonOnlyOrigin = await runCliAsync(
+            ['top-notice', 'set', 'om_pin_positive', '--bot', 'cli_headless_bot', '--chat-id', 'oc_target_1', '--json'],
+            {
+              ...cleanEnv,
+              BOTMUX_SESSION_ID: 'human_origin',
+              BOTMUX_TURN_ID: 'om_turn',
+              BOTMUX_LARK_APP_ID: 'cli_fake',
+              BOTMUX_CHAT_ID: 'oc_source',
+              BOTMUX_ROOT_MESSAGE_ID: 'om_human',
+            },
+          );
+          expect(daemonOnlyOrigin.status, daemonOnlyOrigin.stderr).toBe(0);
+          expect(JSON.parse(daemonOnlyOrigin.stdout.trim())).toMatchObject({
+            ok: true, messageId: 'om_pin_positive', larkAppId: 'cli_headless_bot',
+          });
+          expect(topSpy).toHaveBeenCalledWith('cli_headless_bot', 'oc_target_1', 'om_pin_positive');
+        } finally {
+          workerPool.setActiveSessionsRegistry(previousRegistry);
+          rmSync(ancestorMarker, { force: true });
+        }
 
         topSpy.mockClear();
         const mismatch = await runCliAsync(
