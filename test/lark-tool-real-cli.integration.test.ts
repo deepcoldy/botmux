@@ -56,10 +56,20 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
     if (root) rmSync(root, { recursive: true, force: true });
     verifyCli();
   });
-  function run(args: string[]) {
+  function run(args: string[], inheritedEnv: NodeJS.ProcessEnv = process.env) {
+    // Explicit profiles inherit the runner environment. Keep runtime/test
+    // fences while isolating the native CLI's config, data and credentials.
+    const env = { ...inheritedEnv };
+    for (const key of Object.keys(env)) {
+      if (/^(LARKSUITE_CLI_|LARK_CLI_|LARK_APP_|FEISHU_)/.test(key) || key === 'BOTMUX_AS') delete env[key];
+    }
     return new Promise<{ code: number | null; out: string; err: string }>((resolveResult, reject) => {
       const child = spawnTsScript(resolve('src/lark-tool-runner.ts'), ['--binding', larkToolBindingPath(root, 'contract'), '--', ...args], {
-        env: { ...process.env, HOME: join(root, 'home'), USERPROFILE: join(root, 'home'), BOTMUX_DAEMON_IPC_PORT: String(port) },
+        env: {
+          ...env, HOME: join(root, 'home'), USERPROFILE: join(root, 'home'),
+          LARKSUITE_CLI_CONFIG_DIR: join(root, 'native-config'), LARKSUITE_CLI_DATA_DIR: join(root, 'native-data'),
+          BOTMUX_DAEMON_IPC_PORT: String(port),
+        },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let out = '', err = ''; child.stdout!.on('data', b => out += b); child.stderr!.on('data', b => err += b);
@@ -129,7 +139,17 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
   it('checks policy once before passing a trailing foreign --profile to the binary without a managed credential', async () => {
     // lark-cli 1.0.80 answers an unknown profile with exit 3 / not_configured.
     // A CLI upgrade that changes this contract is diagnosed here on purpose.
-    const result = await run(['docs', '+fetch', '--doc', 'doc-fixture', '--dry-run', '--profile', 'cli_other1234']);
+    // A developer's external CLI config may actually contain this profile.
+    // The real binary must only see the fixture's disposable config.
+    const externalConfig = join(root, 'external-config');
+    mkdirSync(externalConfig);
+    writeFileSync(join(externalConfig, 'config.json'), JSON.stringify({
+      apps: [{ appId: 'cli_other1234', brand: 'feishu', users: [] }],
+    }));
+    const result = await run(
+      ['docs', '+fetch', '--doc', 'doc-fixture', '--dry-run', '--profile', 'cli_other1234'],
+      { ...process.env, LARKSUITE_CLI_CONFIG_DIR: externalConfig },
+    );
     expect(result.code, result.out + result.err).toBe(3);
     expect(JSON.parse(result.err || result.out).error?.subtype).toBe('not_configured');
     expect(requests).toEqual([{ mode: 'bot', policyOnly: true }]);
