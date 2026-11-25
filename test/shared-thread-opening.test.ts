@@ -138,3 +138,43 @@ it('rejects an outstanding request when the shared WebSocket disconnects', async
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+it('uses JSON-RPC 2.0 for requests, notifications and bootstrap error responses', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await once(server, 'listening');
+  const address = server.address() as { port: number };
+  const received: any[] = [];
+  let pendingRead: any;
+  server.on('connection', socket => socket.on('message', data => {
+    const message = JSON.parse(String(data));
+    received.push(message);
+    if (message.method === 'initialize') {
+      socket.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {} }));
+      socket.send(JSON.stringify({ jsonrpc: '2.0', id: 90, method: 'unsupported/server-request' }));
+    }
+    const answerRead = (request: any) => socket.send(JSON.stringify({
+      jsonrpc: '2.0', id: request.id, result: { thread: { id: 'native-thread' } },
+    }));
+    if (message.id === 90 && message.error && pendingRead) answerRead(pendingRead);
+    if (message.method === 'thread/read') {
+      if (received.some(item => item.id === 90 && item.error)) answerRead(message);
+      else pendingRead = message;
+    }
+  }));
+  const client = new SharedThreadClient(`ws://127.0.0.1:${address.port}`);
+  try {
+    await client.initialize();
+    await client.request('thread/read', { threadId: 'native-thread' });
+    expect(received).toHaveLength(4);
+    expect(received.every(message => message.jsonrpc === '2.0')).toBe(true);
+    expect(received).toEqual(expect.arrayContaining([
+      expect.objectContaining({ method: 'initialize' }),
+      expect.objectContaining({ method: 'initialized' }),
+      expect.objectContaining({ method: 'thread/read' }),
+      expect.objectContaining({ id: 90, error: expect.objectContaining({ code: -32601 }) }),
+    ]));
+  } finally {
+    client.close();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

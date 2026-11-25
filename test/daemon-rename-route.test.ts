@@ -776,9 +776,17 @@ function resetRouteTestState(): void {
 describe('shared topic opening recovery routing', () => {
   beforeEach(resetRouteTestState);
 
-  function retainedOpening(root: string): DaemonSession {
+  function retainedOpening(root: string, bound = false): DaemonSession {
     const ds = seedThreadSession(root, 'shared opening');
     ds.session.cliId = 'codex';
+    if (bound) {
+      ds.session.cliSessionId = 'native-bound-thread';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      ds.session.sharedThreadOpening = {
+        endpoint: 'unix:///tmp/shared-test.sock', cwd: '/tmp', title: 'shared opening',
+        phase: 'created', threadId: 'native-bound-thread',
+      };
+    }
     ds.session.queuedActivationPending = true;
     ds.session.queuedActivationToken = 'retained-opening-token';
     ds.session.queuedActivationTurnId = 'om_retained_opening';
@@ -816,6 +824,25 @@ describe('shared topic opening recovery routing', () => {
     expect(mocks.forkWorker).toHaveBeenCalledOnce();
     expect(mocks.forkWorker.mock.calls[0]![1]).toEqual({ content: 'FIRST' });
     expect(mocks.forkWorker.mock.calls[0]![2]).toMatchObject({ turnId: 'om_retained_opening' });
+  });
+
+  it('replays the bound shared head from the next IM after admission releases the runtime gate', async () => {
+    const root = 'om_shared_bound_retry';
+    const ds = retainedOpening(root, true);
+    ds.initialStartPending = false;
+
+    await handleThreadReply(makeEventData('om_shared_bound_successor', 'SECOND', root),
+      makeCtx(root, 'om_shared_bound_successor'));
+
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ turnId: 'om_shared_bound_successor' }),
+    ]);
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    expect(mocks.forkWorker.mock.calls[0]![0]).toBe(ds);
+    expect(mocks.forkWorker.mock.calls[0]![1]).toEqual({ content: 'FIRST' });
+    expect(mocks.forkWorker.mock.calls[0]![2]).toMatchObject({
+      turnId: 'om_retained_opening',
+    });
   });
 });
 

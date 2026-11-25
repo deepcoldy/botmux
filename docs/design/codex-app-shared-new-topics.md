@@ -27,7 +27,17 @@ Creation has three durable checkpoints: unrequested, creating, and a received
 thread ID. The binding fields are committed together. Preparation failures
 retry the received ID without creating another thread; no persistent owner
 token survives a daemon restart. A received ID is saved even if the worker
-generation changes. Closing or changing the route prevents binding/launch.
+generation changes. Closing or changing the route prevents the stale runtime
+from launching. A final worker-admission rejection after binding releases only
+the runtime route claim: the activation journal remains authoritative and the
+next inbound turn replays its old head.
+
+If a closed row is reactivated while its previous creation is still in flight,
+the sessionId single-flight lock is retained and the replacement runtime gets a
+generation-, route-, activation- and claim-fenced handoff when that attempt
+settles. It then resumes a committed binding or retries a received ID. An
+attempt still stuck at `creating` remains an unknown creation result: no second
+`thread/start` is issued and the replacement receives the reconciliation error.
 
 If the server disconnects before returning a creation receipt, the result is
 unknown: input remains queued and automatic creation is not repeated. The

@@ -11,7 +11,7 @@ export class SharedThreadClient {
     mapRpcError: (method, error) => new Error(`${method}: ${error.message}`),
     onMessage: message => {
       if (message.method && message.id !== undefined) {
-        this.socket.send(JSON.stringify({ id: message.id, error: {
+        this.socket.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, error: {
           code: -32601, message: 'Unsupported bootstrap client request',
         } }));
       }
@@ -42,7 +42,7 @@ export class SharedThreadClient {
     if (this.socket.readyState !== WebSocket.OPEN) throw new Error('Shared server disconnected');
     const id = this.rpc.nextId();
     const response = this.rpc.track(id, method, { timeoutMs: 7000 });
-    this.socket.send(JSON.stringify({ id, method, params }), error => {
+    this.socket.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }), error => {
       if (error) this.rpc.abort(id, error);
     });
     return response;
@@ -53,7 +53,7 @@ export class SharedThreadClient {
       clientInfo: { name: 'botmux-shared-thread', version: '1' },
       capabilities: { experimentalApi: true },
     });
-    this.socket.send(JSON.stringify({ method: 'initialized' }));
+    this.socket.send(JSON.stringify({ jsonrpc: '2.0', method: 'initialized' }));
   }
 
   close(): void {
