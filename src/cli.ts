@@ -13030,7 +13030,13 @@ async function cmdSend(
     : undefined;
   const selectedReplyContext = replyMessageId !== currentTurnId || explicitReplyTo
     ? s.turnReplyContexts?.[replyMessageId ?? ''] : undefined;
-  const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget;
+  // Ordinary structured turns have no Codex App dispatch entry. Their own
+  // per-turn context is the daemon-frozen original destination used by both
+  // the actual send and the v1-im route guard.
+  const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget
+    ?? (replyMessageId === currentTurnId && originSessionId === sid
+      ? parseReplyMessageTarget(s.turnReplyContexts?.[currentTurnId ?? '']?.target)
+      : undefined);
   const isCrossChatOriginTurn = !!crossChatOriginForSend({
     replyContext: replyContextForQuote,
     replyTarget: s.replyTargets?.[replyMessageId ?? ''],
@@ -13813,6 +13819,13 @@ async function cmdSend(
     if (!prior?.final) {
       effectiveResponseKind = 'final';
     }
+  }
+  if (turnSendKey && effectiveResponseKind === 'final'
+    && (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined
+      || !frozenTurnReplyTarget || turnSendKey.larkAppId !== appId || turnSendKey.sessionId !== sid)
+    && turnSendLedger.requiresOriginalImReply(turnSendKey)) {
+    console.error('botmux send: final delivery is bound to the original conversation; use --response-kind auxiliary for a separate destination');
+    process.exit(2);
   }
   const persistOffBeforeProvider = (): void => {
     if (effectiveFollowThreadMode !== 'off' || !sendInto) return;
