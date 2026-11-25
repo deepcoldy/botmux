@@ -30,7 +30,7 @@ import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, settleOffline
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { isCodexAppCliId, type CliAdapter } from '../adapters/cli/types.js';
 import { readPersistedExecutionContract } from './session-controller.js';
-import { isDurableArgvCliId, isExecutionPhasePastQueued, resolveQueuedActivationEffectiveTurn } from '../services/queued-activation-reconcile.js';
+import { isDurableArgvCliId, isExecutionPhaseConfirmedBeyondSubmitting, resolveQueuedActivationEffectiveTurn } from '../services/queued-activation-reconcile.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { credentialSourceForcesBotHome } from '../services/cli-credential-source.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
@@ -3654,7 +3654,7 @@ export async function restoreActiveSessions(
           pendingRawTurnId: ds.pendingRawTurnId,
         });
         const rawContract = readPersistedExecutionContract(ds, rawTurn.turnId, rawTurn.dispatchAttempt);
-        if (rawContract.hasContract && isExecutionPhasePastQueued(rawContract.phase)) {
+        if (rawContract.hasContract && isExecutionPhaseConfirmedBeyondSubmitting(rawContract.phase)) {
           ds.pendingRawInput = undefined;
           ds.pendingRawTurnId = undefined;
         }

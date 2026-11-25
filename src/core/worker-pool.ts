@@ -13267,9 +13267,9 @@ export function __testOnly_setSuspendBackingVerifier(
   suspendBackingVerifier = verifier ?? destroySuspendBackingVerified;
 }
 
-let workerSpawnerImpl: typeof spawnWorker = spawnWorker;
+let workerSpawnerImpl: typeof spawnWorker | undefined;
 export function __testOnly_setWorkerSpawner(spawner?: typeof spawnWorker): void {
-  workerSpawnerImpl = spawner ?? spawnWorker;
+  workerSpawnerImpl = spawner;
 }
 
 const primarySuspendInFlight = new WeakMap<DaemonSession, Promise<boolean>>();
@@ -19719,8 +19719,8 @@ export type OfflineQueuedActivationSettlementOutcome =
 
 /** Synchronous offline settlement for provably-dead local sessions during
  *  `restoreActiveSessions` (missing persistent pane or non-persistent local
- *  PTY, excluding remote backends and Codex App). Clears non-'queued' opening
- *  heads without spawning an empty cold CLI, promoting any durable tail head
+ *  PTY, excluding remote backends and Codex App). Clears only opening heads with
+ *  positive post-submission evidence, promoting any durable tail head
  *  synchronously with exact rollback on transient SQLite failures (zero
  *  background retry timers). */
 export function settleOfflineReconciledQueuedActivation(
@@ -21222,8 +21222,14 @@ function forkWorkerPrepared(
       hasContract: activationContract.hasContract,
       contractPhase: activationContract.phase,
     });
-    if (activationPlan.action === 'reconcile_already_submitted') {
-      reconcileQueuedActivation = activationPlan.hint;
+    if (activationPlan.action === 'reconcile_already_submitted' || activationPlan.action === 'probe_submission') {
+      const submittedText = effectiveActivation.isRawInput
+        ? (ds.pendingRawInput ?? ds.session.queuedActivationRawInput ?? ds.session.pendingRepoSetup?.rawInput ?? '')
+        : (prompt || ds.session.queuedActivationInput?.content || '');
+      reconcileQueuedActivation = {
+        ...activationPlan.hint,
+        ...(activationPlan.action === 'probe_submission' ? { submittedText } : {}),
+      };
       prompt = '';
       promptPayload = { content: '' };
       initTurnId = undefined;
@@ -21238,7 +21244,7 @@ function forkWorkerPrepared(
         resume = true;
       }
       logger.info(
-        `[${t}] Reconciling already-submitted queued activation on recovery fork `
+        `[${t}] ${activationPlan.action === 'probe_submission' ? 'Probing unconfirmed' : 'Reconciling already-submitted'} queued activation on recovery fork `
         + `(turn=${activationPlan.hint.turnId.substring(0, 16)}, phase=${activationPlan.hint.phase})`,
       );
     }
@@ -21434,10 +21440,12 @@ function forkWorkerPrepared(
       }
     }
   }
-  if (queuedActivationToken && ds.pendingRawInput && !reconcileQueuedActivation) {
-    // Runtime-only pendingRawInput is cleared at prompt_ready. Persist the exact
-    // literal command with the activation journal so immediate raw starts can
-    // also rebuild it after a daemon restart; the ACK clears this copy.
+  if (queuedActivationToken && ds.pendingRawInput
+    && (!reconcileQueuedActivation
+      || (reconcileQueuedActivation.evidenceRequired && reconcileQueuedActivation.rawInput))) {
+    // Runtime-only pendingRawInput is cleared at prompt_ready or while arming a
+    // read-only reconciliation probe. Persist the exact literal command in both
+    // cases so a later daemon/worker replacement can rebuild the same proof watch.
     retainQueuedActivationRawInput(ds.session, ds.pendingRawInput, ds.pendingRawTurnId ?? ds.session.queuedActivationTurnId);
   }
 
@@ -21544,7 +21552,7 @@ function forkWorkerPrepared(
 
   // Node: fork `dist/worker.js`. Standalone binary: re-exec THIS binary with the
   // hidden `__worker` subcommand over the same IPC channel (see self-spawn.ts).
-  worker = workerSpawnerImpl({
+  worker = (workerSpawnerImpl ?? spawnWorker)({
     distDir: join(__dirname, '..'),
     cwd,
     execArgv: workerForkExecArgv(),

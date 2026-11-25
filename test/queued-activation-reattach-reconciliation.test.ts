@@ -134,7 +134,7 @@ function persistExecutionPhase(
   dataDir: string,
   ds: DaemonSession,
   turnId: string,
-  phase: 'queued' | 'submitting' | 'reconciling' | 'succeeded',
+  phase: 'queued' | 'submitting' | 'reconciling' | 'accepted' | 'succeeded',
   dispatchAttempt?: number,
 ) {
   const store = sessionContractStore(dataDir, APP);
@@ -164,6 +164,12 @@ function persistExecutionPhase(
         'ev-lost',
       );
       store.markUnresolvedExecutions(ref, runtimeRef);
+    } else if (phase === 'accepted') {
+      store.apply(
+        ref,
+        { type: 'execution_phase', runtime: runtimeRef, execution: execution.ref, phase: 'accepted' },
+        'ev-accepted',
+      );
     } else if (phase === 'succeeded') {
       store.apply(
         ref,
@@ -282,7 +288,7 @@ describe('SessionEventGateway & sessionEventMetadata transport admission for que
 });
 
 describe('Read-only contract inspection & init reconciliation planning (Cases A/B/C, Codex App, Legacy)', () => {
-  it('classifies Case A (reconciling) and Case B (succeeded) as reconcile_already_submitted, Case C (queued/no-contract) as replay_queued, and Codex App as codex_app_ledger', () => {
+  it('classifies Case A (reconciling) as probe_submission, Case B (succeeded) as reconcile_already_submitted, Case C (queued/no-contract) as replay_queued, and Codex App as codex_app_ledger', () => {
     const dataDir = createIsolatedDataDir();
 
     // Legacy pre-contract session: readPersistedExecutionContract must NOT call store.ensure()
@@ -331,11 +337,11 @@ describe('Read-only contract inspection & init reconciliation planning (Cases A/
       contractPhase: caseCRead.phase,
     })).toEqual({ action: 'replay_queued' });
 
-    // Case A (live production wedge): phase='reconciling'
+    // Case A (crash window): phase='reconciling' proves intent, not CLI ingestion.
     const caseASession = makeSession({
       queuedActivationPending: true,
       queuedActivationToken: 'tok-case-a',
-      queuedActivationInput: { content: 'already running prompt' },
+      queuedActivationInput: { content: 'write may not have happened' },
       queuedActivationTurnId: 'om_turn_case_a',
     });
     const caseADs = makeDaemonSession(caseASession);
@@ -353,8 +359,22 @@ describe('Read-only contract inspection & init reconciliation planning (Cases A/
       hasContract: caseARead.hasContract,
       contractPhase: caseARead.phase,
     })).toEqual({
-      action: 'reconcile_already_submitted',
-      hint: { turnId: 'om_turn_case_a', phase: 'reconciling' },
+      action: 'probe_submission',
+      hint: { turnId: 'om_turn_case_a', phase: 'reconciling', evidenceRequired: true },
+    });
+
+    expect(classifyQueuedActivationInitPlan({
+      queuedActivationPending: true,
+      queuedActivationToken: 'tok-case-a-submitting',
+      isCodexApp: false,
+      hasTextPrompt: true,
+      hasRawInput: false,
+      turnId: 'om_turn_case_a',
+      hasContract: true,
+      contractPhase: 'submitting',
+    })).toEqual({
+      action: 'probe_submission',
+      hint: { turnId: 'om_turn_case_a', phase: 'submitting', evidenceRequired: true },
     });
 
     // Case B (already finished while daemon down): phase='succeeded'
@@ -397,6 +417,40 @@ describe('Read-only contract inspection & init reconciliation planning (Cases A/
   });
 });
 
+describe('Pre-write crash evidence boundary', () => {
+  it('never upgrades turn_execution_started alone into submission proof', () => {
+    const sent: any[] = [];
+    const scope: Record<string, any> = {
+      workerSessionEventScope: undefined,
+      turnExecutionClock: { start: vi.fn() },
+      inputDeliveryEvidence: { start: vi.fn() },
+      cliSpawnGeneration: 1,
+      webTerminalInputGeneration: 0,
+      cliInterruptGeneration: 0,
+      pendingTurnExecutionStart: undefined,
+      send: (event: any) => sent.push(event),
+    };
+    loadWorkerFunction('markTurnExecutionStart', scope)('om_crash_before_write');
+    // Deliberate crash here: no PTY/RPC/argv write occurs.
+    expect(sent.map(event => event.type)).toEqual(['turn_execution_started']);
+    for (const contractPhase of ['submitting', 'reconciling'] as const) {
+      expect(classifyQueuedActivationInitPlan({
+        queuedActivationPending: true,
+        queuedActivationToken: 'tok-crash-before-write',
+        isCodexApp: false,
+        hasTextPrompt: true,
+        hasRawInput: false,
+        turnId: 'om_crash_before_write',
+        hasContract: true,
+        contractPhase,
+      })).toEqual({
+        action: 'probe_submission',
+        hint: { turnId: 'om_crash_before_write', phase: contractPhase, evidenceRequired: true },
+      });
+    }
+  });
+});
+
 describe('Synchronous offline cold-restore settlement (missing pane / local PTY)', () => {
   it('settles empty-tail non-queued local cold-restore offline with explicit-null dashboard patch and zero wasted cold-spawn', () => {
     const dataDir = createIsolatedDataDir();
@@ -408,7 +462,7 @@ describe('Synchronous offline cold-restore settlement (missing pane / local PTY)
       queuedActivationTurnId: 'om_turn_cold_1',
     });
     const ds = makeDaemonSession(session);
-    persistExecutionPhase(dataDir, ds, 'om_turn_cold_1', 'reconciling');
+    persistExecutionPhase(dataDir, ds, 'om_turn_cold_1', 'succeeded');
 
     const patches: any[] = [];
     const unsub = dashboardEventBus.subscribe(ev => {
@@ -450,7 +504,7 @@ describe('Synchronous offline cold-restore settlement (missing pane / local PTY)
       ],
     });
     const ds1 = makeDaemonSession(s1);
-    persistExecutionPhase(dataDir, ds1, 'om_turn_head', 'reconciling');
+    persistExecutionPhase(dataDir, ds1, 'om_turn_head', 'succeeded');
 
     const out1 = workerPool.settleOfflineReconciledQueuedActivation(ds1, {
       isCodexApp: false,
@@ -474,7 +528,7 @@ describe('Synchronous offline cold-restore settlement (missing pane / local PTY)
       queuedActivationTurnId: 'om_turn_err',
     });
     const ds2 = makeDaemonSession(s2);
-    persistExecutionPhase(dataDir, ds2, 'om_turn_err', 'reconciling');
+    persistExecutionPhase(dataDir, ds2, 'om_turn_err', 'succeeded');
     sessionStore.__testOnly_setBeforeRowPersist(() => {
       throw new Error('SQLITE_BUSY_TEST');
     });
@@ -506,6 +560,15 @@ describe('Synchronous offline cold-restore settlement (missing pane / local PTY)
       backingMode: 'unknown_probe',
       hasContract: true,
       turnId: 'om_unknown',
+      contractPhase: 'reconciling',
+    })).toBe('defer_to_fork');
+    expect(classifyOfflineColdRestoreSettlement({
+      queuedActivationPending: true,
+      isCodexApp: false,
+      isRemoteBackend: false,
+      backingMode: 'cold_restore',
+      hasContract: true,
+      turnId: 'om_unproven_cold',
       contractPhase: 'reconciling',
     })).toBe('defer_to_fork');
     expect(classifyOfflineColdRestoreSettlement({
@@ -778,7 +841,7 @@ describe('Worker tail isolation, reattach type-ahead gate, Case B settlement, an
 });
 
 describe('WorkerSessionEventScope.inspectSubmissionGate & flushPending defense-in-depth', () => {
-  it('separates persisted_non_queued from local_submission and only settles non-Codex-App persisted_non_queued in flushPending', async () => {
+  it('separates persisted_non_queued from local_submission and only directly settles confirmed phases in flushPending', async () => {
     const scopeObj = new WorkerSessionEventScope(
       { appId: APP, sessionId: 'sess-gate-inspect' },
       { workerId: 'worker-gen-2', generation: 2 },
@@ -795,6 +858,10 @@ describe('WorkerSessionEventScope.inspectSubmissionGate & flushPending defense-i
     scopeObj.noteAdmission({
       ref: { executionId: 'exec-3', turnId: 'om_local_untouched' },
       phase: 'queued',
+    });
+    scopeObj.noteAdmission({
+      ref: { executionId: 'exec-4', turnId: 'om_accepted' },
+      phase: 'accepted',
     });
     scopeObj.recordSubmission('om_local_untouched');
 
@@ -822,6 +889,11 @@ describe('WorkerSessionEventScope.inspectSubmissionGate & flushPending defense-i
       isCodexApp: false,
       hasToken: true,
       gate: scopeObj.inspectSubmissionGate('om_reconciling'),
+    })).toBe('observe_only');
+    expect(decideFlushSubmissionRejectionSettlement({
+      isCodexApp: false,
+      hasToken: true,
+      gate: scopeObj.inspectSubmissionGate('om_accepted'),
     })).toBe('settle_already_submitted');
     expect(decideFlushSubmissionRejectionSettlement({
       isCodexApp: false,
@@ -834,13 +906,15 @@ describe('WorkerSessionEventScope.inspectSubmissionGate & flushPending defense-i
       gate: scopeObj.inspectSubmissionGate('om_reconciling'),
     })).toBe('retain');
 
-    // Exercise REAL flushPending on both persisted_non_queued (settles) and local_submission (does NOT settle)
+    // Exercise REAL flushPending: ambiguous reconciling arms read-only observation,
+    // local_submission stays untouched, and only accepted settles without a probe.
     const h = workerSubmitHarness();
     const acked: any[] = [];
     const writeInput = vi.fn(async () => ({ submitted: true }));
     h.scope.pendingMessages.splice(
       0,
       h.scope.pendingMessages.length,
+      { content: 'confirmed input', turnId: 'om_accepted', queuedActivationToken: 'tok-accepted' },
       { content: 'already ran', turnId: 'om_reconciling', queuedActivationToken: 'tok-reconciling' },
       { content: 'local untouched', turnId: 'om_local_untouched', queuedActivationToken: 'tok-local' },
     );
@@ -856,7 +930,38 @@ describe('WorkerSessionEventScope.inspectSubmissionGate & flushPending defense-i
     });
     await h.flush();
     expect(writeInput).not.toHaveBeenCalled();
-    expect(acked).toEqual(['tok-reconciling']);
+    expect(acked).toEqual(['tok-accepted']);
+    expect(h.scope.observeUnconfirmedQueuedActivation).toHaveBeenCalledTimes(1);
+    expect(h.scope.observeUnconfirmedQueuedActivation).toHaveBeenCalledWith(
+      expect.objectContaining({ turnId: 'om_reconciling', queuedActivationToken: 'tok-reconciling' }),
+      { recheck: undefined },
+    );
+    // The unproven head is held by its observer; later input cannot overtake it.
+    expect(h.scope.pendingMessages.map((item: any) => item.turnId)).toEqual(['om_local_untouched']);
+  });
+  it('orders an observed raw settlement as ACK, bundled follow-up, then successor redrive', async () => {
+    const h = workerSubmitHarness();
+    const events: string[] = [];
+    h.scope.send = vi.fn((message: any) => {
+      if (message.type === 'queued_activation_submitted') events.push('ack');
+    });
+    h.scope.redriveRejectedStructuredReady = vi.fn(() => { events.push('redrive'); });
+    const item = { content: '/compact', turnId: 'om_raw_order', queuedActivationToken: 'tok-raw-order' };
+    h.scope.observeUnconfirmedQueuedActivation(item, {
+      deferRedrive: true,
+      onSettledExtra: () => queueMicrotask(() => {
+        events.push('followup');
+        h.scope.redriveRejectedStructuredReady();
+      }),
+    });
+    expect(h.queuedActivationReceipts.confirmToken(
+      item.queuedActivationToken,
+      { source: 'structured-transcript' },
+      { sessionId: h.scope.sessionId, generation: h.scope.cliSpawnGeneration, turnId: item.turnId },
+    )).toBe(true);
+    expect(events).toEqual(['ack']);
+    await Promise.resolve();
+    expect(events).toEqual(['ack', 'followup', 'redrive']);
   });
 });
 
@@ -1117,6 +1222,57 @@ describe('Adapter & backend parity (RemoteRunner, OpenCode/MiMoCode, Pi, Hybrid 
     expect(scopeTeardown.pendingAmbiguousFreshRpcActivation).toBeUndefined();
   });
 
+  it('ACKs ambiguous RPC activation on positive native terminals including aborted, never on teardown-only outcomes', () => {
+    const runTerminal = (status: 'completed' | 'failed' | 'aborted' | 'engine-dead' | 'stopped') => {
+      const generation = { id: status } as any;
+      const identity = { turnId: `om_rpc_${status}` } as any;
+      const ownerKey = identity.turnId;
+      const acknowledgements: string[] = [];
+      const scope: Record<string, any> = {
+        settlingRpcTerminalOwners: new Map(),
+        rpcTerminalHydrationTimers: new Map(),
+        rpcTerminalHydrationOwners: new Map(),
+        rpcTerminalHydrationTerminals: new Map(),
+        rpcTurnsAwaitingActivation: new Map(),
+        rpcTurnsAwaitingActivationIdentities: new Map(),
+        rpcTurnsAwaitingActivationReplayAnchors: new Map(),
+        pendingRpcTurnTerminals: new Map(),
+        rpcLifecycleFailClosedOwners: new Map([[ownerKey, generation]]),
+        rpcLifecycleFailClosedIdentities: new Map([[ownerKey, identity]]),
+        ambiguousRpcActivationTokens: new Map([[ownerKey, { generation, token: `tok-${status}` }]]),
+        rpcActiveOwners: new Map(),
+        rpcTurnOwnerKey: () => ownerKey,
+        sameRpcGeneration: (a: any, b: any) => a === b,
+        acknowledgeQueuedActivationToken: (token: string) => acknowledgements.push(token),
+        codexBridgeQueue: {
+          stopRpcActive: vi.fn(),
+          dropPendingTurn: vi.fn(),
+          hasPendingTurn: () => false,
+        },
+        emitTurnTerminal: vi.fn(),
+        log: vi.fn(),
+        redriveRejectedStructuredReady: vi.fn(),
+        idleDetector: undefined,
+        clearTimeout,
+      };
+      scope.clearAwaitingRpcActivation = loadWorkerFunction('clearAwaitingRpcActivation', scope);
+      scope.clearRpcLifecycleFailClosedOwner = loadWorkerFunction('clearRpcLifecycleFailClosedOwner', scope);
+      scope.finalizeRpcTurnTerminal = loadWorkerFunction('finalizeRpcTurnTerminal', scope);
+      loadWorkerFunction('settleRpcTurnTerminal', scope)(
+        { identity, nativeTurnId: `native-${status}`, status },
+        generation,
+      );
+      return { acknowledgements, tokens: scope.ambiguousRpcActivationTokens.size };
+    };
+
+    for (const status of ['completed', 'failed', 'aborted'] as const) {
+      expect(runTerminal(status)).toEqual({ acknowledgements: [`tok-${status}`], tokens: 0 });
+    }
+    for (const status of ['engine-dead', 'stopped'] as const) {
+      expect(runTerminal(status)).toEqual({ acknowledgements: [], tokens: 0 });
+    }
+  });
+
   it('reconciles already-submitted raw_input activations while delivering Case C raw_input and forwarding bundled followUpContent', async () => {
     const rawSession = {
       queuedActivationRawInput: '/clear',
@@ -1131,9 +1287,15 @@ describe('Adapter & backend parity (RemoteRunner, OpenCode/MiMoCode, Pi, Hybrid 
     expect(decidePendingRawInputAction({
       isCodexApp: false,
       hasContract: true,
-      contractPhase: 'reconciling',
+      contractPhase: 'accepted',
       hasQueuedActivationToken: true,
     })).toBe('reconcile_already_submitted');
+    expect(decidePendingRawInputAction({
+      isCodexApp: false,
+      hasContract: true,
+      contractPhase: 'reconciling',
+      hasQueuedActivationToken: true,
+    })).toBe('send_raw_input');
     expect(decidePendingRawInputAction({
       isCodexApp: false,
       hasContract: true,
@@ -1150,7 +1312,7 @@ describe('Adapter & backend parity (RemoteRunner, OpenCode/MiMoCode, Pi, Hybrid 
       isCodexAppCliId: (id?: string) => id === 'codex-app',
       decideRawInputSubmissionReconciliation,
       workerSessionEventScope: {
-        inspectSubmissionGate: () => ({ canSubmit: false, reason: 'persisted_non_queued', phase: 'reconciling', terminal: false }),
+        inspectSubmissionGate: () => ({ canSubmit: false, reason: 'persisted_non_queued', phase: 'accepted', terminal: false }),
       },
       acknowledgeQueuedActivationToken: (tok: string) => acked.push(tok),
       sendToPty: (content: string, turnId?: string, opts?: any) => {
@@ -1158,6 +1320,7 @@ describe('Adapter & backend parity (RemoteRunner, OpenCode/MiMoCode, Pi, Hybrid 
         return true;
       },
       unattendedRawInputRefusal,
+      redriveRejectedStructuredReady: vi.fn(),
       log: vi.fn(),
     };
     const handleRaw = loadWorkerMessageHandler('raw_input', rawScope);
@@ -1176,6 +1339,44 @@ describe('Adapter & backend parity (RemoteRunner, OpenCode/MiMoCode, Pi, Hybrid 
       content: 'follow up prompt after raw',
       turnId: 'om_followup_2',
     });
+
+    // Ambiguous reconciling: no write/ACK/followUp until authoritative proof arrives.
+    const ambiguousAcked: string[] = [];
+    const ambiguousFollowUps: any[] = [];
+    let settleAmbiguous: (() => void) | undefined;
+    const ambiguousScope: Record<string, any> = {
+      ...rawScope,
+      workerSessionEventScope: {
+        inspectSubmissionGate: () => ({ canSubmit: false, reason: 'persisted_non_queued', phase: 'reconciling', terminal: false }),
+      },
+      acknowledgeQueuedActivationToken: (tok: string) => ambiguousAcked.push(tok),
+      sendToPty: (content: string, turnId?: string) => {
+        ambiguousFollowUps.push({ content, turnId });
+        return true;
+      },
+      observeUnconfirmedQueuedActivation: vi.fn((item: any, opts: any) => {
+        expect(item).toMatchObject({ content: '/compact', turnId: 'om_raw_1', queuedActivationToken: 'tok-raw-ambiguous' });
+        settleAmbiguous = () => {
+          ambiguousAcked.push(item.queuedActivationToken);
+          opts.onSettledExtra({ source: 'structured-transcript' });
+        };
+        return false;
+      }),
+    };
+    await loadWorkerMessageHandler('raw_input', ambiguousScope)({
+      type: 'raw_input',
+      content: '/compact',
+      turnId: 'om_raw_1',
+      queuedActivationToken: 'tok-raw-ambiguous',
+      followUpContent: 'held follow up',
+      followUpTurnId: 'om_followup_ambiguous',
+    });
+    expect(ambiguousAcked).toEqual([]);
+    expect(ambiguousFollowUps).toEqual([]);
+    settleAmbiguous!();
+    await Promise.resolve();
+    expect(ambiguousAcked).toEqual(['tok-raw-ambiguous']);
+    expect(ambiguousFollowUps).toEqual([{ content: 'held follow up', turnId: 'om_followup_ambiguous' }]);
 
     // Ordinary IM rejection defense-in-depth
     expect(decideOrdinaryImRejectionAction('execution_reconciliation_required')).toBe('clear_without_retry');
@@ -1308,12 +1509,43 @@ describe('Adapter & backend parity (RemoteRunner, OpenCode/MiMoCode, Pi, Hybrid 
       larkAppId: APP,
       larkAppSecret: '',
       queuedActivationToken: 'tok-reconcile-1',
-      reconcileQueuedActivation: { turnId: 'om_turn_1', phase: 'reconciling' },
+      reconcileQueuedActivation: { turnId: 'om_turn_1', phase: 'succeeded' },
     });
     expect(h1.scope.sendFatalWorkerErrorAndExit).not.toHaveBeenCalled();
     expect(h1.pendingMessages).toEqual([]);
     expect(h1.sent.map(m => m.type)).toEqual(['ready', 'queued_activation_submitted']);
     expect(h1.acked).toEqual([{ token: 'tok-reconcile-1', sessionId: 'sess-init-1' }]);
+
+    // 1b. Weak reconciling evidence arms read-only observation; ready alone cannot ACK.
+    const hProbe = buildInitScope({ observeUnconfirmedQueuedActivation: vi.fn(() => false) });
+    await hProbe.handleInit({
+      type: 'init',
+      sessionId: 'sess-init-1',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_turn_1',
+      workingDir: '/tmp',
+      cliId: 'claude-code',
+      backendType: 'tmux',
+      prompt: '',
+      resume: true,
+      larkAppId: APP,
+      larkAppSecret: '',
+      queuedActivationToken: 'tok-probe-1',
+      reconcileQueuedActivation: {
+        turnId: 'om_turn_1', phase: 'reconciling', evidenceRequired: true,
+        submittedText: 'exact retained opening prompt',
+      },
+    });
+    expect(hProbe.scope.observeUnconfirmedQueuedActivation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: 'exact retained opening prompt',
+        turnId: 'om_turn_1',
+        queuedActivationToken: 'tok-probe-1',
+      }),
+    );
+    expect(hProbe.acked).toEqual([]);
+    expect(hProbe.pendingMessages).toEqual([]);
+    expect(hProbe.sent.map(m => m.type)).toEqual(['ready']);
 
     // 2. Failed spawnCli on reconciled reattach -> MUST NOT emit queued_activation_submitted!
     const h2 = buildInitScope({
@@ -1332,7 +1564,7 @@ describe('Adapter & backend parity (RemoteRunner, OpenCode/MiMoCode, Pi, Hybrid 
       larkAppId: APP,
       larkAppSecret: '',
       queuedActivationToken: 'tok-reconcile-fail',
-      reconcileQueuedActivation: { turnId: 'om_turn_1', phase: 'reconciling' },
+      reconcileQueuedActivation: { turnId: 'om_turn_1', phase: 'succeeded' },
     });
     expect(h2.acked).toEqual([]);
     expect(h2.scope.sendFatalWorkerErrorAndExit).toHaveBeenCalledTimes(1);
@@ -1451,6 +1683,27 @@ describe('Adapter & backend parity (RemoteRunner, OpenCode/MiMoCode, Pi, Hybrid 
     expect(h4ResumedCaseC.scope.sendFatalWorkerErrorAndExit).not.toHaveBeenCalled();
     expect(h4ResumedCaseC.pendingMessages).toHaveLength(1);
     expect(h4ResumedCaseC.acked).toEqual([]);
+
+    // The continuous recheck preserves the same !resume fence as the initial probe.
+    const findSubmission = vi.fn(() => ({ submitted: true, cliSessionId: 'ses_owned_42' }));
+    const recheckScope: Record<string, any> = {
+      cliAdapter: {
+        durableInitialPromptViaArgs: true,
+        findInitialPromptArgSubmission: findSubmission,
+        buildResumeCommand: () => 'opencode -s ses_owned_42',
+      },
+      lastInitConfig: { resume: true, cliSessionId: 'ses_owned_42' },
+      sessionId: 'sess-init-1',
+      decideDurableArgvReattachSubmission,
+    };
+    const makeRecheck = loadWorkerFunction('durableArgvActivationRecheck', recheckScope);
+    expect(makeRecheck({ content: 'continue', turnId: 'om_turn_oc_3' })).toBeUndefined();
+    expect(findSubmission).not.toHaveBeenCalled();
+    recheckScope.lastInitConfig.resume = false;
+    expect(makeRecheck({ content: 'continue', turnId: 'om_turn_oc_3' })!()).toEqual({
+      submitted: true,
+      cliSessionId: 'ses_owned_42',
+    });
   });
 });
 
@@ -1519,6 +1772,35 @@ describe('Production wiring & adversarial regression probes (P0/P1/P2)', () => {
     expect(dataDir).toBeTruthy();
   });
 
+  it('retains a same-worker stopped runtime for restart while keeping it out of replacement input delivery', () => {
+    createIsolatedDataDir();
+    const session = makeSession();
+    const ds = makeDaemonSession(session);
+    const controller = controllerForSession(ds, true)!;
+    const worker = controller.bindWorker(1);
+    const runtime = controller.reserveBinding('bind-stopped', worker.worker);
+    controller.bindRuntime('bind-stopped', worker.worker, {
+      backend: 'tmux',
+      physicalId: 'pid:7009:boot:1',
+      nativeSessionId: session.sessionId,
+      proof: 'process_start',
+    });
+    controller.store.apply(controller.ref, {
+      type: 'runtime_lost', runtime, confirmed: true, reason: 'cli_exit',
+    }, 'ev-runtime-stopped');
+    expect(controller.store.runtime(controller.ref, runtime.runtimeId)?.phase).toBe('stopped');
+
+    const operation = controller.beginControl('restart');
+    controller.controlStarted(operation.operation.operationId);
+    const restart = controller.command({ type: 'restart', attemptId: operation.operation.operationId });
+    expect(restart.runtime).toEqual(runtime);
+    expect(admitSessionCommand('restart', restart, runtime, operation.operation.operationId))
+      .toEqual({ allowed: true });
+
+    const message = controller.command({ type: 'message' });
+    expect(message.runtime).toBeUndefined();
+  });
+
   it('P1-1: promoteQueuedActivationTail attaches sessionCommand.execution for SessionController.ingest AND kills live worker if controller.admitInput throws', () => {
     const dataDir = createIsolatedDataDir();
     const session = makeSession({
@@ -1577,7 +1859,7 @@ describe('Production wiring & adversarial regression probes (P0/P1/P2)', () => {
     expect(dataDir).toBeTruthy();
   });
 
-  it('P1-3 + W1: real forkWorker reconciles Case A (strips prompt, sets resume=true before sandbox freeze, preserves token), replays Case C, reconciles drained Codex App, and rolls back pre-init failure cleanly', () => {
+  it('P1-3 + W1: real forkWorker probes Case A without dropping retained text, replays Case C, reconciles drained Codex App, and rolls back pre-init failure cleanly', () => {
     const dataDir = createIsolatedDataDir();
 
     // 1. Case A (phase='reconciling') on legacy sandbox-unset row:
@@ -1610,10 +1892,46 @@ describe('Production wiring & adversarial regression probes (P0/P1/P2)', () => {
     expect(initA.turnId).toBeUndefined();
     expect(initA.resume).toBe(true);
     expect(initA.queuedActivationToken).toBe('tok-fw-case-a');
-    expect(initA.reconcileQueuedActivation).toEqual({ turnId: 'om_fw_case_a', phase: 'reconciling' });
+    expect(initA.reconcileQueuedActivation).toEqual({
+      turnId: 'om_fw_case_a',
+      phase: 'reconciling',
+      evidenceRequired: true,
+      submittedText: 'already running opening',
+    });
     expect(dsA.pendingRawInput).toBeUndefined();
     // Sandbox froze with resume=true (legacy row -> 'off', not true)
     expect(dsA.session.sandbox).toBe('off');
+
+    // 1c. Raw-only weak reconciliation retains the exact command in SQLite before
+    // clearing runtime pendingRawInput, so the next replacement can probe again.
+    const sRawProbe = makeSession({
+      backendType: 'tmux',
+      queuedActivationPending: true,
+      queuedActivationToken: 'tok-fw-raw-probe',
+      queuedActivationRawTurnId: 'om_fw_raw_probe',
+      queuedActivationTurnId: 'om_fw_raw_probe',
+    });
+    const dsRawProbe = makeDaemonSession(sRawProbe, {
+      hasHistory: false,
+      pendingRawInput: '/compact',
+      pendingRawTurnId: 'om_fw_raw_probe',
+    });
+    persistExecutionPhase(dataDir, dsRawProbe, 'om_fw_raw_probe', 'reconciling');
+    const fakeWRaw = makeFakeWorker();
+    workerPool.__testOnly_setWorkerSpawner(() => fakeWRaw);
+    workerPool.forkWorker(dsRawProbe, '', { resume: false, turnId: 'om_fw_raw_probe' }, { reattachLiveBackend: true });
+    fakeWRaw.emit('message', { type: 'worker_ipc_ready' });
+    const initRaw = fakeWRaw.sent.find((m: any) => m.type === 'init');
+    expect(initRaw.reconcileQueuedActivation).toEqual({
+      turnId: 'om_fw_raw_probe',
+      phase: 'reconciling',
+      rawInput: true,
+      evidenceRequired: true,
+      submittedText: '/compact',
+    });
+    expect(dsRawProbe.pendingRawInput).toBeUndefined();
+    expect(sessionStore.getSessionFresh(sRawProbe.sessionId)?.queuedActivationRawInput).toBe('/compact');
+    expect(sessionStore.getSessionFresh(sRawProbe.sessionId)?.queuedActivationRawTurnId).toBe('om_fw_raw_probe');
 
     // 2. Case C negative control (phase='queued'): forkWorker keeps prompt intact and NO reconcileQueuedActivation
     const sC = makeSession({
@@ -1826,7 +2144,7 @@ describe('Production wiring & adversarial regression probes (P0/P1/P2)', () => {
     });
     dsRaw.session.workerGeneration = 1;
     sessionStore.updateSession(dsRaw.session);
-    persistExecutionPhase(dataDir, dsRaw, 'om_raw_submitted', 'submitting');
+    persistExecutionPhase(dataDir, dsRaw, 'om_raw_submitted', 'accepted');
     workerPool.initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
       getSessionWorkingDir: () => dataDir,
@@ -1994,14 +2312,14 @@ describe('Production wiring & adversarial regression probes (P0/P1/P2)', () => {
     // primarySnapshot has 0 executions -> MUST NOT fall through to local SQLite!
     expect(readPersistedExecutionContract(dsPrimary, 'om_primary_empty')).toEqual({ hasContract: true });
 
-    // 3. P1-8: spawnCli stashes spawnCliReconciledActivationToken on persisted_non_queued
+    // 3. P1-8: spawnCli directly reconciles only confirmed phases; ambiguous phases retain exact init text.
     const spawnScopeObj = new WorkerSessionEventScope(
       { appId: APP, sessionId: 'sess-spawn-reconcile' },
       { workerId: 'worker-gen-2', generation: 2 },
     );
     spawnScopeObj.noteAdmission({
       ref: { executionId: 'exec-spawn-1', turnId: 'om_spawn_1' },
-      phase: 'reconciling',
+      phase: 'accepted',
     });
     const spawnEnv: Record<string, any> = {
       closeRequested: false,
@@ -2038,6 +2356,33 @@ describe('Production wiring & adversarial regression probes (P0/P1/P2)', () => {
     await spawnCliFn(cfgSpawn);
     expect(cfgSpawn.prompt).toBe('');
     expect(spawnEnv.spawnCliReconciledActivationToken).toBe('tok-spawn-reconcile');
+
+    const ambiguousSpawnScope = new WorkerSessionEventScope(
+      { appId: APP, sessionId: 'sess-spawn-reconcile' },
+      { workerId: 'worker-gen-2', generation: 2 },
+    );
+    ambiguousSpawnScope.noteAdmission({
+      ref: { executionId: 'exec-spawn-ambiguous', turnId: 'om_spawn_ambiguous' },
+      phase: 'reconciling',
+    });
+    const ambiguousEnv: Record<string, any> = {
+      ...spawnEnv,
+      workerSessionEventScope: ambiguousSpawnScope,
+      spawnCliReconciledActivationToken: undefined,
+      initialInputOwnershipPending: true,
+    };
+    const ambiguousCfg: any = {
+      ...cfgSpawn,
+      prompt: 'write may not have happened',
+      turnId: 'om_spawn_ambiguous',
+      queuedActivationToken: 'tok-spawn-ambiguous',
+    };
+    await loadWorkerFunction<(cfg: any) => Promise<void>>('spawnCli', ambiguousEnv)(ambiguousCfg);
+    expect(ambiguousCfg.prompt).toBe('write may not have happened');
+    expect(ambiguousEnv.spawnCliReconciledActivationToken).toBeUndefined();
+    expect(ambiguousEnv.initialInputOwnershipPending).toBe(true);
+    expect(ambiguousEnv.send.mock.calls.filter(([message]: any[]) =>
+      message.type === 'turn_input_rejected' && message.turnId === 'om_spawn_ambiguous')).toEqual([]);
 
     // 4. P2-2: mid-close guard in settleOfflineReconciledQueuedActivation & resolveQuarantinedForkPlan catch
     const sClosing = makeSession({
@@ -2081,7 +2426,7 @@ describe('Production wiring & adversarial regression probes (P0/P1/P2)', () => {
       queuedActivationTurnId: 'om_restore_w2',
     });
     const dsSeed = makeDaemonSession(sRestore);
-    persistExecutionPhase(restoreDir, dsSeed, 'om_restore_w2', 'reconciling');
+    persistExecutionPhase(restoreDir, dsSeed, 'om_restore_w2', 'succeeded');
     const spawnCalls = vi.fn(() => makeFakeWorker());
     workerPool.__testOnly_setWorkerSpawner(spawnCalls);
     await restoreActiveSessions(new Map());

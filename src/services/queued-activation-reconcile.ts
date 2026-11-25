@@ -19,6 +19,11 @@ export interface ReconcileQueuedActivationHint {
   dispatchAttempt?: number;
   phase: ExecutionPhase;
   rawInput?: true;
+  /** `submitting`/`reconciling` is only an intent-to-write marker. Require
+   *  independent backend/transcript evidence before acknowledging the token. */
+  evidenceRequired?: true;
+  /** Exact retained bytes used only for read-only proof matching/bookkeeping. */
+  submittedText?: string;
 }
 
 export function isExecutionPhasePastQueued(phase?: ExecutionPhase): boolean {
@@ -116,6 +121,7 @@ export type QueuedActivationInitPlan =
   | { action: 'none' }
   | { action: 'codex_app_ledger' }
   | { action: 'replay_queued' }
+  | { action: 'probe_submission'; hint: ReconcileQueuedActivationHint }
   | { action: 'reconcile_already_submitted'; hint: ReconcileQueuedActivationHint };
 
 export function classifyQueuedActivationInitPlan(input: {
@@ -162,13 +168,15 @@ export function classifyQueuedActivationInitPlan(input: {
     return { action: 'replay_queued' };
   }
   if (input.hasContract && input.turnId && isExecutionPhasePastQueued(input.contractPhase)) {
+    const confirmed = isExecutionPhaseConfirmedBeyondSubmitting(input.contractPhase);
     return {
-      action: 'reconcile_already_submitted',
+      action: confirmed ? 'reconcile_already_submitted' : 'probe_submission',
       hint: {
         turnId: input.turnId,
         ...(input.dispatchAttempt !== undefined ? { dispatchAttempt: input.dispatchAttempt } : {}),
         phase: input.contractPhase!,
         ...(input.hasRawInput && !input.hasTextPrompt ? { rawInput: true } : {}),
+        ...(!confirmed ? { evidenceRequired: true as const } : {}),
       },
     };
   }
@@ -196,7 +204,7 @@ export function classifyOfflineColdRestoreSettlement(input: {
     && !isExecutionPhaseConfirmedBeyondSubmitting(input.contractPhase)) {
     return 'defer_to_fork';
   }
-  if (!input.hasContract || !input.turnId || !isExecutionPhasePastQueued(input.contractPhase)) {
+  if (!input.hasContract || !input.turnId || !isExecutionPhaseConfirmedBeyondSubmitting(input.contractPhase)) {
     return 'defer_to_fork';
   }
   return 'settle_offline';
@@ -208,7 +216,7 @@ export function decidePendingRawInputAction(input: {
   contractPhase?: ExecutionPhase;
   hasQueuedActivationToken: boolean;
 }): 'send_raw_input' | 'reconcile_already_submitted' | 'skip_already_submitted' {
-  if (!input.isCodexApp && input.hasContract && isExecutionPhasePastQueued(input.contractPhase)) {
+  if (!input.isCodexApp && input.hasContract && isExecutionPhaseConfirmedBeyondSubmitting(input.contractPhase)) {
     return input.hasQueuedActivationToken
       ? 'reconcile_already_submitted'
       : 'skip_already_submitted';
@@ -354,10 +362,12 @@ export function decideFlushSubmissionRejectionSettlement(input: {
   isCodexApp: boolean;
   hasToken: boolean;
   gate?: SubmissionGateInspection;
-}): 'settle_already_submitted' | 'retain' {
+}): 'settle_already_submitted' | 'observe_only' | 'retain' {
   if (input.isCodexApp || !input.hasToken) return 'retain';
   if (input.gate?.canSubmit === false && input.gate.reason === 'persisted_non_queued') {
-    return 'settle_already_submitted';
+    return isExecutionPhaseConfirmedBeyondSubmitting(input.gate.phase)
+      ? 'settle_already_submitted'
+      : 'observe_only';
   }
   return 'retain';
 }
@@ -366,10 +376,11 @@ export function decideRawInputSubmissionReconciliation(input: {
   isCodexApp: boolean;
   hasToken: boolean;
   gate?: SubmissionGateInspection;
-}): 'deliver' | 'skip_and_ack' | 'skip' {
+}): 'deliver' | 'observe_only' | 'skip_and_ack' | 'skip' {
   if (!input.isCodexApp
     && input.gate?.canSubmit === false
     && input.gate.reason === 'persisted_non_queued') {
+    if (!isExecutionPhaseConfirmedBeyondSubmitting(input.gate.phase)) return 'observe_only';
     return input.hasToken ? 'skip_and_ack' : 'skip';
   }
   return 'deliver';

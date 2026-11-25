@@ -293,9 +293,13 @@ export class SessionController {
     const liveCurrentWorkerRuntime = (ref?: RuntimeRef): RuntimeRef | undefined => {
       if (!ref) return undefined;
       const runtime = this.store.runtime(this.ref, ref.runtimeId);
+      // Restart intentionally targets the current worker's stopped runtime after
+      // a CLI exit. Only replacement-input delivery must exclude stopped refs;
+      // no command may borrow an unresolved or predecessor-worker runtime.
+      const restartTargetsStoppedRuntime = message.type === 'restart' && runtime?.phase === 'stopped';
       return runtime
         && sameWorker(runtime.worker, state?.worker)
-        && runtime.phase !== 'stopped'
+        && (runtime.phase !== 'stopped' || restartTargetsStoppedRuntime)
         && runtime.phase !== 'unresolved'
         ? runtime.ref
         : undefined;

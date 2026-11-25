@@ -18359,7 +18359,7 @@ function finalizeRpcTurnTerminal(
   settlingRpcTerminalOwners.delete(ownerKey);
   clearAwaitingRpcActivation(identity, generation);
   clearRpcLifecycleFailClosedOwner(identity, generation, {
-    acknowledgeActivation: terminal.status === 'completed' || terminal.status === 'failed',
+    acknowledgeActivation: terminal.status === 'completed' || terminal.status === 'failed' || terminal.status === 'aborted',
   });
   if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
     rpcActiveOwners.delete(ownerKey);
@@ -18459,7 +18459,7 @@ function settleRpcTurnTerminal(
   settlingRpcTerminalOwners.set(ownerKey, generation);
   clearAwaitingRpcActivation(terminal.identity, generation);
   clearRpcLifecycleFailClosedOwner(terminal.identity, generation, {
-    acknowledgeActivation: terminal.status === 'completed' || terminal.status === 'failed',
+    acknowledgeActivation: terminal.status === 'completed' || terminal.status === 'failed' || terminal.status === 'aborted',
   });
   if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
     rpcActiveOwners.delete(ownerKey);
@@ -27595,6 +27595,92 @@ function observeQueuedActivationReceipt(
   return false;
 }
 
+function durableArgvActivationRecheck(
+  item: PendingCliInput,
+): (() => SubmitRecheckResult | Promise<SubmitRecheckResult>) | undefined {
+  const adapter = cliAdapter;
+  if (!adapter?.durableInitialPromptViaArgs || !adapter.findInitialPromptArgSubmission || !item.content
+    || lastInitConfig?.resume) return undefined;
+  return () => {
+    const probeResult = adapter.findInitialPromptArgSubmission!(0, item.content);
+    const resumeCmd = adapter.buildResumeCommand?.({ sessionId, cliSessionId: undefined });
+    const ownedCliSessionId = resumeCmd?.match(/(?:^|\s)-s\s+(\S+)/)?.[1];
+    const decision = decideDurableArgvReattachSubmission({
+      probeResult,
+      expectedCliSessionId: lastInitConfig?.cliSessionId,
+      ownedCliSessionId,
+      promptContainsSessionId: Boolean(sessionId && item.content.includes(sessionId)),
+    });
+    return decision.action === 'already_submitted'
+      ? { submitted: true as const, ...(decision.cliSessionId ? { cliSessionId: decision.cliSessionId } : {}) }
+      : false;
+  };
+}
+
+/** A persisted `submitting`/`reconciling` phase proves only intent-to-write.
+ *  Keep the exact activation read-only until an authoritative receipt arrives;
+ *  never ACK from that phase alone and never replay the retained bytes blindly. */
+function observeUnconfirmedQueuedActivation(
+  item: PendingCliInput,
+  opts?: {
+    recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
+    durableTerminalStatus?: 'failed' | 'ambiguous';
+    deferRedrive?: boolean;
+    onSettledExtra?: (proof: QueuedActivationProof) => void;
+  },
+): boolean {
+  const evidenceTurnId = item.turnId;
+  const generation = cliSpawnGeneration;
+  const writeStartedAtMs = evidenceTurnId && typeof inputDeliveryEvidence?.writeStartedAtMs === 'function'
+    ? inputDeliveryEvidence.writeStartedAtMs({
+      turnId: evidenceTurnId,
+      dispatchAttempt: item.dispatchAttempt,
+      cliGeneration: generation,
+    })
+    : undefined;
+  let failureChain: SubmitFailureChainKey | undefined;
+  const settled = observeQueuedActivationReceipt(
+    item,
+    opts?.recheck,
+    item.content,
+    {
+      generation,
+      ...(evidenceTurnId ? { turnId: evidenceTurnId } : {}),
+      ...(evidenceTurnId ? {
+        probeEvidence: () => probeAuthoritativeQueuedActivationEvidence(
+          {
+            turnId: evidenceTurnId,
+            sendMarkerTurnId: item.turnId,
+            dispatchAttempt: item.dispatchAttempt,
+            generation,
+            allowStandaloneSendMarker: cliGenerationTurnWrites <= 1,
+          },
+          writeStartedAtMs,
+        ),
+      } : {}),
+      onSettledExtra: proof => {
+        if (failureChain) submitFailureChains.cancel(failureChain);
+        opts?.onSettledExtra?.(proof);
+        if (!opts?.deferRedrive) queueMicrotask(() => redriveRejectedStructuredReady());
+      },
+    },
+  );
+  if (!settled) {
+    failureChain = scheduleSubmitFailureNotify(
+      item.logicalContent ?? item.content,
+      opts?.recheck,
+      t('worker.transcriptLabel'),
+      undefined,
+      undefined,
+      usageLimitTracker.currentTurn(),
+      item,
+      opts?.durableTerminalStatus ?? 'ambiguous',
+      codexBridgeFallbackActive(),
+    );
+  }
+  return settled;
+}
+
 function codexAppRuntimeTypeAheadReady(): boolean {
   return isCodexAppCliId(lastInitConfig?.cliId)
     && codexAppControlProven
@@ -28385,19 +28471,33 @@ async function flushPending(): Promise<void> {
         const submissionGate = !continuedExecution
           ? workerSessionEventScope.inspectSubmissionGate?.(item.turnId, item.dispatchAttempt)
           : undefined;
-        if (typeof decideFlushSubmissionRejectionSettlement === 'function'
-          && decideFlushSubmissionRejectionSettlement({
+        const rejectionSettlement = typeof decideFlushSubmissionRejectionSettlement === 'function'
+          ? decideFlushSubmissionRejectionSettlement({
             isCodexApp: isCodexAppCliId(lastInitConfig?.cliId),
             hasToken: !!item.queuedActivationToken,
             gate: submissionGate,
-          }) === 'settle_already_submitted') {
+          })
+          : 'retain';
+        let holdForUnconfirmedActivation = false;
+        if (rejectionSettlement === 'settle_already_submitted') {
           log(
             `Settled already-submitted queued activation ${item.queuedActivationToken!.substring(0, 8)} `
             + `without re-submitting (phase=${submissionGate?.phase ?? '-'})`,
           );
           acknowledgeQueuedActivation(item);
+        } else if (rejectionSettlement === 'observe_only') {
+          log(
+            `Queued activation requires authoritative submission evidence before ACK `
+            + `(turn=${item.turnId?.substring(0, 16) ?? '-'}, phase=${submissionGate?.phase ?? '-'})`,
+          );
+          holdForUnconfirmedActivation = !observeUnconfirmedQueuedActivation(item, {
+            recheck: durableArgvActivationRecheck(item),
+          });
         }
         if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId, ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
+        // An unproven activation remains the FIFO owner. Its receipt observer
+        // holds the exact head; do not let later queued inputs overtake it.
+        if (holdForUnconfirmedActivation) break;
         continue;
       }
       if (continuedExecution && item.turnId) workerSessionEventScope?.enterContinuation(item.turnId, continuedExecution);
@@ -31182,16 +31282,26 @@ async function spawnCli(
       cfg.dispatchAttempt,
       cfg.sessionCommand?.execution,
     );
-    if (typeof decideFlushSubmissionRejectionSettlement === 'function'
-      && decideFlushSubmissionRejectionSettlement({
+    const rejectionSettlement = typeof decideFlushSubmissionRejectionSettlement === 'function'
+      ? decideFlushSubmissionRejectionSettlement({
         isCodexApp: typeof isCodexAppCliId === 'function' && isCodexAppCliId(cfg.cliId),
         hasToken: !!cfg.queuedActivationToken,
         gate: submissionGate,
-      }) === 'settle_already_submitted') {
+      })
+      : 'retain';
+    if (rejectionSettlement === 'settle_already_submitted') {
       spawnCliReconciledActivationToken = cfg.queuedActivationToken;
     }
-    if (cfg.turnId) send({ type: 'turn_input_rejected', turnId: cfg.turnId, ...(cfg.dispatchAttempt !== undefined ? { dispatchAttempt: cfg.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
-    cfg.prompt = ''; initialInputOwnershipPending = false;
+    if (cfg.turnId && rejectionSettlement !== 'observe_only') {
+      send({ type: 'turn_input_rejected', turnId: cfg.turnId, ...(cfg.dispatchAttempt !== undefined ? { dispatchAttempt: cfg.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
+    }
+    // An unconfirmed persisted phase must not authorize either a blind replay or
+    // a direct ACK. Keep the exact init payload through spawn so the adapter's
+    // authoritative reattach probe and the post-spawn receipt observer can decide.
+    if (rejectionSettlement !== 'observe_only') {
+      cfg.prompt = '';
+      initialInputOwnershipPending = false;
+    }
   }
   const execution = firstBinding || cfg.prompt ? cfg.sessionCommand?.execution : undefined;
   const previousBinding = workerSessionEventScope.currentBinding();
@@ -44940,7 +45050,18 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           ? msg.queuedActivationToken
           : (reconciledInitActivationToken ?? (typeof spawnCliReconciledActivationToken === 'string' ? spawnCliReconciledActivationToken : undefined));
         spawnCliReconciledActivationToken = undefined;
-        if (postInitReconcileToken) {
+        if (msg.reconcileQueuedActivation?.evidenceRequired && msg.queuedActivationToken) {
+          const item: PendingCliInput = {
+            content: msg.reconcileQueuedActivation.submittedText ?? '',
+            turnId: msg.reconcileQueuedActivation.turnId,
+            ...(msg.reconcileQueuedActivation.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.reconcileQueuedActivation.dispatchAttempt }
+              : {}),
+            queuedActivationToken: msg.queuedActivationToken,
+            ...(msg.nativeSessionTitle ? { nativeSessionTitle: msg.nativeSessionTitle } : {}),
+          };
+          observeUnconfirmedQueuedActivation(item);
+        } else if (postInitReconcileToken) {
           acknowledgeQueuedActivationToken(postInitReconcileToken, msg.sessionId);
         }
       } catch (err: any) {
@@ -45514,6 +45635,38 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             gate: rawSubmissionGate,
           })
         : 'deliver';
+      if (rawReconcileAction === 'observe_only') {
+        log(
+          `Raw input requires authoritative submission evidence before ACK `
+          + `(turn=${msg.turnId?.substring(0, 16) ?? '-'}, phase=${rawSubmissionGate?.phase ?? '-'})`,
+        );
+        const deliverBundledFollowUp = () => {
+          if (msg.followUpContent) {
+            sendToPty(msg.followUpContent, msg.followUpTurnId, {
+              codexAppInput: msg.followUpCodexAppInput,
+              trustedController: msg.trustedController,
+              ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
+            });
+          }
+        };
+        const item: PendingCliInput = {
+          content: msg.content,
+          ...(msg.turnId ? { turnId: msg.turnId } : {}),
+          ...(msg.queuedActivationToken ? { queuedActivationToken: msg.queuedActivationToken } : {}),
+        };
+        observeUnconfirmedQueuedActivation(item, {
+          deferRedrive: true,
+          onSettledExtra: () => {
+            // observeQueuedActivationReceipt ACKs in its finally block. Preserve
+            // the established ACK -> bundled followUp -> successor redrive order.
+            queueMicrotask(() => {
+              deliverBundledFollowUp();
+              redriveRejectedStructuredReady();
+            });
+          },
+        });
+        break;
+      }
       if (rawReconcileAction !== 'deliver') {
         log(
           `Skipped already-submitted raw input (${msg.content.substring(0, 40)}) `

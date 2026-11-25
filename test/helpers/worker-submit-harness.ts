@@ -140,6 +140,7 @@ export function workerSubmitHarness() {
   scope.acknowledgeQueuedActivation = loadWorkerFunction('acknowledgeQueuedActivation', scope);
   scope.probeAuthoritativeQueuedActivationEvidence = loadWorkerFunction('probeAuthoritativeQueuedActivationEvidence', scope);
   scope.observeQueuedActivationReceipt = vi.fn(loadWorkerFunction('observeQueuedActivationReceipt', scope));
+  scope.observeUnconfirmedQueuedActivation = vi.fn(loadWorkerFunction('observeUnconfirmedQueuedActivation', scope));
   const flush = loadWorkerFunction<() => Promise<void>>('flushPending', scope);
   return { scope, queue, flush, schedule, recheck, settlements, submitFailureChains, inputDeliveryEvidence, queuedActivationReceipts };
 }
