@@ -7,9 +7,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { checkCollabGateAdmission, collabCommandExempt, collabGateAdmissionDecision } from '../src/core/collab-gate-admission.js';
 import { classifySlash } from '../src/core/command-router.js';
-import { buildInitialCollabGate, writeCollabGate, patchCollabGate } from '../src/services/collab-gate-store.js';
+import { buildInitialCollabGate, writeCollabGate, patchCollabGate, readCollabGate } from '../src/services/collab-gate-store.js';
 import { readCollabChatQueue, enqueueCollabChatItem, collabChatQueuePath } from '../src/services/collab-chat-queue-store.js';
-import { placeCollabGroupInit, __testOnly_resetCollabInitMutexes } from '../src/services/collab-init-store.js';
+import { placeCollabGroupInit, patchCollabInitEntry, __testOnly_resetCollabInitMutexes } from '../src/services/collab-init-store.js';
 import { collabInitId, collabSourceKey, collabCreatorAdmissionOperationId, collabGateFilePath, type SessionGroupCollaborationConfig } from '../src/services/collab-group-config.js';
 import type { CollabGateFile } from '../src/services/collab-group-config.js';
 import type { TalkEvaluation } from '../src/im/lark/event-dispatcher.js';
@@ -300,6 +300,46 @@ describe('R1/R2：真实 store 持久化契约', () => {
     checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: 'cli_a', talk: allowedTalk, gate: g, sourceMessageId: 'om_1', routingEvent: { text: 'a' } });
     expect(readCollabChatQueue(dataDir, CHAT, 'cli_a').items).toHaveLength(1);
     expect(readCollabChatQueue(dataDir, CHAT, 'cli_b').items).toHaveLength(1);
+  });
+
+  it('已开放 gate + CONFIG_CHANGED → gate 关闭；旧 gate 残留也被 entry 交叉拦截', async () => {
+    const sourceKey = collabSourceKey(CREATOR, 'oc_dm', 'om_config_gate');
+    const initId = collabInitId(sourceKey);
+    const configV1: SessionGroupCollaborationConfig = {
+      enabled: true, agents: [{ appId: APP, roleMode: 'no-chat-role' }],
+      kickoff: [{ appId: APP, trigger: 'immediate' }],
+    };
+    await placeCollabGroupInit({
+      dataDir, creatorAppId: CREATOR, dmChatId: 'oc_dm', sourceKey, initId,
+      sourceMessageId: 'om_config_gate', configVersion: 'v1', configSnapshot: configV1,
+      creatorAdmissionOperationId: collabCreatorAdmissionOperationId(initId), createAttempt: 0, now: 1,
+    });
+    await patchCollabInitEntry({
+      dataDir, creatorAppId: CREATOR, initId,
+      mutate: (entry) => { entry.chatId = CHAT; return true; },
+    });
+    writeCollabGate(dataDir, gate({
+      initId, phase: 'active',
+      participants: { [APP]: { roleReady: true, kickoffState: 'started', acceptingUserTasks: true } },
+    }));
+    await placeCollabGroupInit({
+      dataDir, creatorAppId: CREATOR, dmChatId: 'oc_dm', sourceKey, initId,
+      sourceMessageId: 'om_config_gate', configVersion: 'v2',
+      configSnapshot: { ...configV1, gatePolicy: 'reject' },
+      creatorAdmissionOperationId: collabCreatorAdmissionOperationId(initId), createAttempt: 0, now: 2,
+    });
+    const closed = readCollabGate(dataDir, CHAT)!;
+    expect(closed.phase).toBe('awaiting-input');
+    expect(closed.participants[APP].acceptingUserTasks).toBe(false);
+    expect(checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk }).kind).toBe('awaiting-input');
+
+    // 模拟只完成一半或旧写者留下的开放 gate：entry 仍必须否决普通任务。
+    patchCollabGate(dataDir, CHAT, g => ({
+      ...g, phase: 'active',
+      participants: { [APP]: { ...g.participants[APP], acceptingUserTasks: true } },
+    }));
+    const r = checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk });
+    expect(r).toEqual({ kind: 'awaiting-input', reason: 'CONFIG_CHANGED' });
   });
 
   it('真实 gate 文件损坏 → reject(gate_corrupted)，不降级 not-collab、不覆盖', () => {

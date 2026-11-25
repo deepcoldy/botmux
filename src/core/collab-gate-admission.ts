@@ -144,6 +144,7 @@ export interface CollabGateAdmissionOpts {
 }
 
 export function checkCollabGateAdmission(opts: CollabGateAdmissionOpts): CollabGateAdmissionResult {
+  const gateFromDisk = opts.gate === undefined;
   let gate = opts.gate;
   if (gate === undefined) {
     const read = readCollabGateStrict(opts.dataDir, opts.chatId);
@@ -157,18 +158,35 @@ export function checkCollabGateAdmission(opts: CollabGateAdmissionOpts): CollabG
   // 不读目标 daemon 自己的 p2p 创建默认配置。opts.config 显式注入优先（测试），否则从
   // gate.creatorAppId + gate.initId 解析冻结快照。账本损坏同样 fail-closed。
   let frozenConfig: SessionGroupCollaborationConfig | undefined;
+  let frozenEntry: ReturnType<typeof readCollabInitEntry>;
   try {
-    frozenConfig = opts.config
-      ?? readCollabInitEntry(opts.dataDir, gate.creatorAppId, gate.initId)?.configSnapshot;
+    frozenEntry = opts.config ? undefined : readCollabInitEntry(opts.dataDir, gate.creatorAppId, gate.initId);
+    frozenConfig = opts.config ?? frozenEntry?.configSnapshot;
   } catch {
     return { kind: 'reject', reason: 'gate_config_corrupted' };
   }
+  // 真实落盘 gate 必须能回指 creator 的 init entry；缺失不是普通群放行依据。
+  if (gateFromDisk && !opts.config && !frozenEntry) return { kind: 'reject', reason: 'gate_entry_missing' };
 
   // F4：先拒绝未授权 talk，再判豁免/gate——未授权不触碰队列/策略。
   if (!opts.talk.allowed) return { kind: 'reject', reason: 'not_allowed' };
 
   // 管理豁免：不建会话/不注入 CLI 的管理命令放行。
   if (collabCommandExempt(opts.slashDecision)) return { kind: 'open' };
+
+  // init entry 是配置/生命周期权威；旧 gate 的 acceptingUserTasks 不得越过当前人工/终态。
+  switch (frozenEntry?.state) {
+    case 'awaiting-input':
+      return { kind: 'awaiting-input', reason: frozenEntry.awaiting?.reason ?? 'gate_awaiting_input' };
+    case 'cancelled':
+      return { kind: 'cancelled' };
+    case 'failed':
+      return { kind: 'awaiting-input', reason: 'gate_failed' };
+    case 'done':
+      return { kind: 'reject', reason: 'gate_done_not_accepting' };
+    default:
+      break;
+  }
 
   // F2：禁止阶段优先于 acceptingUserTasks 的普通任务 open。
   switch (gate.phase) {

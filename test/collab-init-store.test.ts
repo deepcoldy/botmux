@@ -199,6 +199,28 @@ describe('CollabInitStore：稳定 source store', () => {
     expect(readFileSync(fp, 'utf-8')).toBe(before);
   });
 
+  it('operation 非法内部状态 → 判 corrupted，不能绕过窗口继续 mutation', async () => {
+    const opts = placeOpts(SRC_MSG_1);
+    await placeCollabGroupInit(opts);
+    await patchCollabInitEntry({
+      dataDir: tempDir, creatorAppId: APP, initId: opts.initId,
+      mutate: (entry) => {
+        entry.operations.create = {
+          kind: 'create', status: 'unknown', uuid: 'u', firstAttemptAt: 1, payloadHash: 'h',
+        };
+        return true;
+      },
+    });
+    const fp = collabInitFilePath(tempDir, APP);
+    const raw = JSON.parse(readFileSync(fp, 'utf-8'));
+    raw.entries[opts.initId].operations.create.status = 'done_WITH_DISK_CORRUPTION';
+    writeFileSync(fp, JSON.stringify(raw), { mode: 0o600 });
+    const before = readFileSync(fp, 'utf-8');
+    expect(readCollabInitStoreStrict(tempDir, APP).kind).toBe('corrupted');
+    await expect(placeCollabGroupInit(placeOpts(SRC_MSG_2))).rejects.toThrow(CollabInitStoreCorruptedError);
+    expect(readFileSync(fp, 'utf-8')).toBe(before);
+  });
+
   it('终态 entry 的 stale active 指针不判损坏，新请求放置时清理', async () => {
     const opts = placeOpts(SRC_MSG_1);
     await placeCollabGroupInit(opts);

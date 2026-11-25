@@ -301,7 +301,10 @@ describe('preflightCollabGroupBirth', () => {
     }
 
     function recoveryOptions(startImpl: CollabBirthStartupRecoveryOpts['startImpl']): CollabBirthStartupRecoveryOpts {
-      return { dataDir: tempDir, creatorAppIds: [APP], now, preflightDeps: deps(), startImpl };
+      return {
+        dataDir: tempDir, creatorAppIds: [APP], now, preflightDeps: deps(), startImpl,
+        evaluateCreatorTalk: () => ({ allowed: true }),
+      };
     }
 
     it('重建最小原事件并恢复 durable admission 后的 running entry', async () => {
@@ -340,6 +343,59 @@ describe('preflightCollabGroupBirth', () => {
       const entry = Object.values(readCollabInitStore(tempDir, APP).entries)[0];
       expect(entry.state).toBe('awaiting-input');
       expect(entry.awaiting?.reason).toBe('CONFIG_CHANGED');
+    });
+
+    it('恢复必须重跑 peer preflight；offline → PEER_NOT_READY 且零 S1', async () => {
+      const { initId } = await seedRunning('om_peer_recheck');
+      const start = vi.fn(async () => { throw new Error('must not start'); });
+      const peer = vi.fn(async () => ({ ok: false as const, errors: ['peer offline'] }));
+      const options = recoveryOptions(start);
+      options.preflightDeps = { ...deps(), peerPreflight: peer };
+      const result = await recoverRunningCollabGroupBirthsOnStartup(options);
+      expect(peer).toHaveBeenCalledTimes(1);
+      expect(start).not.toHaveBeenCalled();
+      expect(result.resumeAttempts).toBe(0);
+      const entry = readCollabInitStore(tempDir, APP).entries[initId];
+      expect(entry.state).toBe('awaiting-input');
+      expect(entry.awaiting?.reason).toBe('PEER_NOT_READY');
+    });
+
+    it('恢复时 creator 已撤权 → CREATOR_NOT_AUTHORIZED，零 S1', async () => {
+      const { initId } = await seedRunning('om_creator_revoked');
+      const start = vi.fn(async () => { throw new Error('must not start'); });
+      const options = recoveryOptions(start);
+      options.evaluateCreatorTalk = () => ({ allowed: false, reason: 'revoked' });
+      const result = await recoverRunningCollabGroupBirthsOnStartup(options);
+      expect(result.resumeAttempts).toBe(0);
+      expect(start).not.toHaveBeenCalled();
+      const entry = readCollabInitStore(tempDir, APP).entries[initId];
+      expect(entry.state).toBe('awaiting-input');
+      expect(entry.awaiting?.reason).toBe('CREATOR_NOT_AUTHORIZED');
+    });
+
+    it('恢复 peer 检查期间取消 → 不覆盖 cancelled，不重建 active 指针', async () => {
+      const { initId } = await seedRunning('om_recovery_cancel');
+      const start = vi.fn(async () => { throw new Error('must not start'); });
+      const options = recoveryOptions(start);
+      options.preflightDeps = {
+        ...deps(),
+        peerPreflight: async () => {
+          await patchCollabInitEntry({
+            dataDir: tempDir, creatorAppId: APP, initId,
+            mutate: (entry) => { entry.state = 'cancelled'; entry.cancelReason = 'human cancel'; return true; },
+          });
+          await import('../src/services/collab-init-store.js').then(({ markCollabInitTerminal }) =>
+            markCollabInitTerminal({ dataDir: tempDir, creatorAppId: APP, initId, dmChatId: DM, state: 'cancelled', now: now(), cancelReason: 'human cancel' }));
+          return { ok: false as const, errors: ['peer offline'] };
+        },
+      };
+      const result = await recoverRunningCollabGroupBirthsOnStartup(options);
+      expect(result.resumeAttempts).toBe(0);
+      expect(start).not.toHaveBeenCalled();
+      const store = readCollabInitStore(tempDir, APP);
+      expect(store.entries[initId].state).toBe('cancelled');
+      expect(store.entries[initId].cancelReason).toBe('human cancel');
+      expect(store.activeByDmChat[DM]).toBeUndefined();
     });
 
     it('无 durable receipt 且无 chatId → 未提交占位失败并释放，不建群', async () => {

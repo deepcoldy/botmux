@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { runCollabGroupBirthS1, buildCreatorAdmissionReceipt, persistCreatorAdmissionReceipt, type CollabS1Deps, type CollabS1CreateChatOpts } from '../src/core/collab-orchestrator.js';
 import {
   placeCollabGroupInit,
+  patchCollabInitEntry,
   readCollabInitEntry,
   readCollabInitStore,
   __testOnly_resetCollabInitMutexes,
@@ -285,6 +286,37 @@ describe('S1 create 编排', () => {
     expect(entry.state).toBe('awaiting-input');
     expect(entry.awaiting?.reason).toBe('MESSAGE_UNKNOWN_EXPIRED');
     expect(entry.operations[collabForwardUuid(initId)].status).toBe('unknown');
+  });
+
+  it('取消时已有第二个 S1 排在 mutex 后 → 不再 forward，迟到结果只留审计', async () => {
+    const { initId } = await seedEntry();
+    let release!: () => void;
+    const blocker = new Promise<void>(r => { release = r; });
+    let markStarted!: () => void;
+    const firstStarted = new Promise<void>(r => { markStarted = r; });
+    let calls = 0;
+    const d = deps({
+      forward: async () => {
+        calls++;
+        markStarted();
+        await blocker;
+        return 'om_late_forward';
+      },
+    });
+    const first = runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), d);
+    await firstStarted;
+    const second = runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), d);
+    await patchCollabInitEntry({
+      dataDir: tempDir, creatorAppId: APP, initId,
+      mutate: (entry) => { entry.state = 'cancelled'; entry.cancelReason = 'human cancel'; return true; },
+    });
+    release();
+    await Promise.all([first, second]);
+    expect(calls).toBe(1);
+    const entry = readCollabInitEntry(tempDir, APP, initId)!;
+    expect(entry.state).toBe('cancelled');
+    expect(entry.operations[collabForwardUuid(initId)].status).toBe('done');
+    expect(readCollabGate(tempDir, 'oc_created')?.phase).toBe('cancelled');
   });
 
   it('creatorAdmissionReceipt 持久化后崩溃重投不二次扣费（persist→已存在短路）', async () => {

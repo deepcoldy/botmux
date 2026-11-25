@@ -64,7 +64,7 @@ function deps(overrides: Partial<S2S5Deps> = {}): S2S5Deps {
     roleVerify: roleDeps(),
     kickoffPrepare: async () => ({ ok: true }),
     kickoffStart: async () => ({ ok: true, sessionId: 's', turnId: 't', acceptedAt: '2026-01-01T00:00:00Z' }),
-    artifactFacts: async () => ({ terminalStatus: 'succeeded', delivered: true, messageId: 'om', content: `${DEFAULT_ARTIFACT_MARKER} https://example.com/x.zip`, sessionId: 'sess_up', turnId: 'turn_up', contentHash: 'hash_up' }),
+    artifactFacts: async () => ({ terminalStatus: 'succeeded', delivered: true, messageId: 'om', content: `${DEFAULT_ARTIFACT_MARKER} https://example.com/x.zip`, sessionId: 's', turnId: 't', contentHash: 'hash_up' }),
     ...overrides,
   };
 }
@@ -428,5 +428,90 @@ describe('F4：真拓扑序', () => {
     expect(third.done).toBe(true);
     expect(starts).toEqual([A, C, B]);
     expect(readCollabInitEntry(dataDir, CREATOR, initId)!.steps.kickoff.status).toBe('done');
+  });
+
+  it('KICKOFF_TIMEOUT 后人工继续等待 → 刷新 per-target since，不立即再次超时', async () => {
+    const initId = await seedEntry();
+    const cfg = config([
+      { appId: CREATOR, trigger: 'immediate' },
+      { appId: PEER, trigger: 'afterAgentTurn', afterAppId: CREATOR, artifact: { type: 'marked-url', hosts: ['example.com'] } },
+    ]);
+    const d = deps({ artifactFacts: async () => ({ terminalStatus: 'reconciling', delivered: false, content: '' }) });
+    await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    const originalSince = readCollabInitEntry(dataDir, CREATOR, initId)!.kickoffPending?.[PEER]?.since;
+    expect(typeof originalSince).toBe('number');
+    clock += 31 * 60 * 1000;
+    await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    expect(readCollabInitEntry(dataDir, CREATOR, initId)!.awaiting?.reason).toBe('KICKOFF_TIMEOUT');
+
+    const continuedAt = now();
+    await patchCollabInitEntry({
+      dataDir, creatorAppId: CREATOR, initId,
+      mutate: (entry) => {
+        entry.state = 'running';
+        entry.awaiting = { reason: 'KICKOFF_PENDING', since: continuedAt };
+        return true;
+      },
+    });
+    const resumed = await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    expect(resumed.awaitingInput).toContain('artifact not ready');
+    expect(resumed.awaitingInput).not.toBe('KICKOFF_TIMEOUT');
+    const entry = readCollabInitEntry(dataDir, CREATOR, initId)!;
+    expect(entry.state).toBe('running');
+    expect(entry.kickoffPending?.[PEER]?.since).toBe(continuedAt);
+  });
+
+  it('artifact 属于其它 session/turn → 证明不匹配，不启动下游', async () => {
+    const initId = await seedEntry();
+    const cfg = config([
+      { appId: CREATOR, trigger: 'immediate' },
+      { appId: PEER, trigger: 'afterAgentTurn', afterAppId: CREATOR, artifact: { type: 'marked-url', hosts: ['example.com'] } },
+    ]);
+    const starts: string[] = [];
+    const d = deps({
+      kickoffStart: async appId => {
+        starts.push(appId);
+        return { ok: true, sessionId: `session_${appId}`, turnId: `turn_${appId}`, acceptedAt: '2026-01-01T00:00:00Z' };
+      },
+      artifactFacts: async () => ({
+        terminalStatus: 'succeeded', delivered: true, messageId: 'om_unrelated',
+        content: `${DEFAULT_ARTIFACT_MARKER} https://example.com/unrelated.zip`,
+        sessionId: 'session_UNRELATED', turnId: 'turn_UNRELATED', contentHash: 'hash',
+      }),
+    });
+    const r = await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: cfg, deps: d });
+    expect(r.done).toBe(false);
+    expect(starts).toEqual([CREATOR]);
+    const entry = readCollabInitEntry(dataDir, CREATOR, initId)!;
+    expect(entry.state).toBe('awaiting-input');
+    expect(entry.awaiting?.reason).toBe('ARTIFACT_PROOF_MISMATCH');
+  });
+
+  it('prepare 等待期间人工改角色 → start 前重校验并拒绝启动', async () => {
+    const initId = await seedEntry();
+    const starts: string[] = [];
+    let effectiveRole: string | undefined;
+    const rd = roleDeps({
+      readRole: () => effectiveRole === undefined
+        ? { kind: 'missing' }
+        : { kind: 'readable', content: effectiveRole },
+    });
+    const d = deps({
+      roleVerify: rd,
+      kickoffPrepare: async () => {
+        effectiveRole = 'human-edited-during-prepare';
+        return { ok: true };
+      },
+      kickoffStart: async () => {
+        starts.push(CREATOR);
+        return { ok: true, sessionId: 's', turnId: 't', acceptedAt: '2026-01-01T00:00:00Z' };
+      },
+    });
+    const r = await runS5Kickoff({ dataDir, creatorAppId: CREATOR, chatId: CHAT, initId, configVersion: 'cv', config: config(), deps: d });
+    expect(r.done).toBe(false);
+    expect(starts).toEqual([]);
+    const entry = readCollabInitEntry(dataDir, CREATOR, initId)!;
+    expect(entry.state).toBe('awaiting-input');
+    expect(entry.awaiting?.reason).toBe('ROLE_CONFLICT');
   });
 });

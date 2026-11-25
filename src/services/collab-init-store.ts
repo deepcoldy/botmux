@@ -19,6 +19,7 @@ import { dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { AsyncSerialQueue } from '../utils/async-serial-queue.js';
 import type { SessionGroupCollaborationConfig } from './collab-group-config.js';
+import { patchCollabGate } from './collab-gate-store.js';
 
 export const COLLAB_INIT_SCHEMA_VERSION = 1;
 
@@ -44,8 +45,9 @@ export interface CollabGroupInitEntry {
   /** 参与 configVersion 的 S0 冻结角色内容；缺省代表旧/不完整账本，S4 必须 fail-closed。 */
   resolvedProfileEntries?: Record<string, string | null>;
   referencedTeamRoles?: Record<string, string | null>;
-  /** 重启恢复 S1 所需的原 DM sender；open_id 只在 creatorAppId 视角使用。 */
+  /** 重启恢复 S1 所需的原 DM sender；open_id/union_id 只在 creatorAppId 视角使用。 */
   sourceSenderOpenId?: string;
+  sourceSenderUnionId?: string;
   creatorAdmissionOperationId: string;
   creatorAdmissionReceipt?: unknown;
   chatId?: string;
@@ -150,6 +152,10 @@ function parseStore(raw: string): CollabInitStore {
   }
   const entries = parsed.entries as unknown as Record<string, CollabGroupInitEntry>;
   const states = new Set(['running', 'awaiting-input', 'done', 'failed', 'cancelled']);
+  const stepKeys = new Set(['create', 'invite', 'grants', 'roles', 'kickoff']);
+  const stepStates = new Set(['pending', 'running', 'done', 'failed']);
+  const operationKinds = new Set(['admission', 'create', 'forward', 'invite', 'grant', 'role', 'kickoff', 'notice']);
+  const operationStates = new Set(['planned', 'attempting', 'done', 'unknown', 'failed']);
   for (const [initId, entry] of Object.entries(entries)) {
     if (!isRecord(entry) || entry.initId !== initId) throw new Error(`entry ${initId} 身份不符`);
     if (typeof entry.dmChatId !== 'string' || !entry.dmChatId
@@ -159,8 +165,35 @@ function parseStore(raw: string): CollabInitStore {
       || !isRecord(entry.steps) || !isRecord(entry.operations)) {
       throw new Error(`entry ${initId} 结构不完整`);
     }
-    if (entry.sourceSenderOpenId !== undefined && (typeof entry.sourceSenderOpenId !== 'string' || !entry.sourceSenderOpenId)) {
-      throw new Error(`entry ${initId} sourceSenderOpenId 非法`);
+    if ((entry.sourceSenderOpenId !== undefined && (typeof entry.sourceSenderOpenId !== 'string' || !entry.sourceSenderOpenId))
+      || (entry.sourceSenderUnionId !== undefined && (typeof entry.sourceSenderUnionId !== 'string' || !entry.sourceSenderUnionId))) {
+      throw new Error(`entry ${initId} sourceSenderOpenId/UnionId 非法`);
+    }
+    if (typeof entry.creatorAdmissionOperationId !== 'string' || !entry.creatorAdmissionOperationId
+      || typeof entry.createAttempt !== 'number' || !Number.isInteger(entry.createAttempt) || entry.createAttempt < 0
+      || typeof entry.createdAt !== 'number' || !Number.isFinite(entry.createdAt)
+      || typeof entry.updatedAt !== 'number' || !Number.isFinite(entry.updatedAt)) {
+      throw new Error(`entry ${initId} 准入身份或时间戳非法`);
+    }
+    for (const stepKey of stepKeys) {
+      const step = entry.steps[stepKey as CollabStepKey];
+      if (!isRecord(step) || !stepStates.has(step.status) || typeof step.at !== 'number' || !Number.isFinite(step.at)) {
+        throw new Error(`entry ${initId} step ${stepKey} 非法`);
+      }
+    }
+    for (const [opKey, operation] of Object.entries(entry.operations)) {
+      if (!isRecord(operation) || !operationKinds.has(operation.kind) || !operationStates.has(operation.status)
+        || typeof operation.payloadHash !== 'string' || !operation.payloadHash
+        || (operation.firstAttemptAt !== undefined
+          && (typeof operation.firstAttemptAt !== 'number' || !Number.isFinite(operation.firstAttemptAt)))
+        || (operation.uuid !== undefined && (typeof operation.uuid !== 'string' || !operation.uuid))) {
+        throw new Error(`entry ${initId} operation ${opKey} 非法`);
+      }
+    }
+    if (entry.awaiting !== undefined && (!isRecord(entry.awaiting)
+      || typeof entry.awaiting.reason !== 'string' || !entry.awaiting.reason
+      || typeof entry.awaiting.since !== 'number' || !Number.isFinite(entry.awaiting.since))) {
+      throw new Error(`entry ${initId} awaiting 非法`);
     }
     if (entry.resolvedProfileEntries !== undefined && !isStringOrNullMap(entry.resolvedProfileEntries)
       || entry.referencedTeamRoles !== undefined && !isStringOrNullMap(entry.referencedTeamRoles)) {
@@ -237,6 +270,7 @@ export function placeCollabGroupInit(opts: {
   resolvedProfileEntries?: Record<string, string | null>;
   referencedTeamRoles?: Record<string, string | null>;
   sourceSenderOpenId?: string;
+  sourceSenderUnionId?: string;
   creatorAdmissionOperationId: string;
   createAttempt: number;
   now: number;
@@ -259,6 +293,17 @@ export function placeCollabGroupInit(opts: {
           };
           entry.updatedAt = opts.now;
           writeStore(opts.dataDir, opts.creatorAppId, store);
+          if (entry.chatId) {
+            // entry 先落盘，admission 交叉检查可在 gate 写失败时仍 fail-closed。
+            // gate 随后同步关闭，取消终态不被 CONFIG_CHANGED 覆盖。
+            patchCollabGate(opts.dataDir, entry.chatId, (gate) => ({
+              ...gate,
+              phase: gate.phase === 'cancelled' ? 'cancelled' : 'awaiting-input',
+              participants: Object.fromEntries(Object.entries(gate.participants).map(([appId, participant]) => [
+                appId, { ...participant, acceptingUserTasks: false },
+              ])),
+            }));
+          }
         }
       }
       return { kind: 'existing', initId: existingInitId, status: entry.state };
@@ -283,6 +328,7 @@ export function placeCollabGroupInit(opts: {
       ...(opts.resolvedProfileEntries !== undefined ? { resolvedProfileEntries: { ...opts.resolvedProfileEntries } } : {}),
       ...(opts.referencedTeamRoles !== undefined ? { referencedTeamRoles: { ...opts.referencedTeamRoles } } : {}),
       ...(opts.sourceSenderOpenId !== undefined ? { sourceSenderOpenId: opts.sourceSenderOpenId } : {}),
+      ...(opts.sourceSenderUnionId !== undefined ? { sourceSenderUnionId: opts.sourceSenderUnionId } : {}),
       creatorAdmissionOperationId: opts.creatorAdmissionOperationId,
       createAttempt: opts.createAttempt,
       state: 'running',
@@ -319,6 +365,9 @@ export function markCollabInitTerminal(opts: {
     const store = readCollabInitStore(opts.dataDir, opts.creatorAppId);
     const entry = store.entries[opts.initId];
     if (!entry) return;
+    // cancelled/done 是更高优先级事实；迟到的 failed 或旧操作不得覆盖它们。
+    if ((entry.state === 'cancelled' && opts.state !== 'cancelled')
+      || (entry.state === 'done' && opts.state !== 'done')) return;
     entry.state = opts.state;
     entry.updatedAt = opts.now;
     if (opts.cancelReason !== undefined) entry.cancelReason = opts.cancelReason;
@@ -341,6 +390,8 @@ export function patchCollabInitEntry(
     dataDir: string;
     creatorAppId: string;
     initId: string;
+    /** 可选 CAS：仅当读到的当前 phase 符合时才执行 mutate/write。 */
+    expectedState?: CollabInitState;
     mutate: (entry: CollabGroupInitEntry) => boolean;
   },
 ): Promise<CollabGroupInitEntry | undefined> {
@@ -348,6 +399,7 @@ export function patchCollabInitEntry(
     const store = readCollabInitStore(opts.dataDir, opts.creatorAppId);
     const entry = store.entries[opts.initId];
     if (!entry) return undefined;
+    if (opts.expectedState !== undefined && entry.state !== opts.expectedState) return undefined;
     const dirty = opts.mutate(entry);
     if (dirty) writeStore(opts.dataDir, opts.creatorAppId, store);
     return entry;

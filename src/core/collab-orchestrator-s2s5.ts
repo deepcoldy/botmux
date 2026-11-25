@@ -227,7 +227,7 @@ async function runS4RolesCritical(opts: {
     // F2：done 只短路重复代写，不短路当前回读；expected 内容只来自 S0 冻结快照。
     const role = runCollabRoleVerification(peer.appId, opts.chatId, opts.config, opts.deps.roleVerify, frozenRoleSnapshot(rcLoop.entry));
     if (!role.ready) {
-      await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'ROLE_CONFLICT', since: now, detail: role.conflict }; e.updatedAt = now; return true; } });
+      await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, expectedState: 'running', mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'ROLE_CONFLICT', since: now, detail: role.conflict }; e.updatedAt = now; return true; } });
       return { allReady: false, conflict: role.conflict ?? 'role_not_ready' };
     }
     const cur = readCollabInitEntry(opts.dataDir, opts.creatorAppId, opts.initId)!;
@@ -336,12 +336,16 @@ async function runS5Critical(opts: {
       if (!rc.ok) return { done: false, awaitingInput: rc.reason };
       // N2：每个等待目标独立持久 since，避免一个分支成功/等待重置另一分支的超窗。
       const curEntry = readCollabInitEntry(opts.dataDir, opts.creatorAppId, opts.initId)!;
-      const recordedSince = curEntry.kickoffPending?.[appId]?.since
-        ?? (curEntry.awaiting?.reason === 'KICKOFF_PENDING' ? curEntry.awaiting.since : undefined);
-      const since = recordedSince ?? now;
-      if (recordedSince === undefined) {
-        await patchCollabInitEntry({
+      const perTargetSince = curEntry.kickoffPending?.[appId]?.since;
+      // 兼容“继续等待”旧动作：running 下较新的 awaiting.since 必须刷新 per-target checkpoint。
+      const legacySince = curEntry.state === 'running' ? curEntry.awaiting?.since : undefined;
+      const since = legacySince !== undefined && (perTargetSince === undefined || legacySince > perTargetSince)
+        ? legacySince
+        : (perTargetSince ?? now);
+      if (perTargetSince !== since) {
+        const patched = await patchCollabInitEntry({
           dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId,
+          expectedState: 'running',
           mutate: (e) => {
             const previous = e.kickoffPending?.[appId];
             e.kickoffPending = { ...(e.kickoffPending ?? {}), [appId]: { ...previous, appId, since } };
@@ -349,16 +353,17 @@ async function runS5Critical(opts: {
             return true;
           },
         });
+        if (!patched) return { done: false, awaitingInput: 'state_changed' };
         const rcPending = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
         if (!rcPending.ok) return { done: false, awaitingInput: rcPending.reason };
       }
       if (kickoffTimedOut(since, opts.deps.now(), KICKOFF_TIMEOUT_MS)) {
-        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'KICKOFF_TIMEOUT', since }; e.updatedAt = opts.deps.now(); return true; } });
+        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, expectedState: 'running', mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'KICKOFF_TIMEOUT', since }; e.updatedAt = opts.deps.now(); return true; } });
         return { done: false, awaitingInput: 'KICKOFF_TIMEOUT' };
       }
       // terminal 明确 failed/cancelled → 直接 awaiting-input + 具体原因（N2）。
       if (facts.terminalStatus === 'failed' || facts.terminalStatus === 'cancelled') {
-        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: `ARTIFACT_${facts.terminalStatus.toUpperCase()}`, since }; e.updatedAt = opts.deps.now(); return true; } });
+        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, expectedState: 'running', mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: `ARTIFACT_${facts.terminalStatus.toUpperCase()}`, since }; e.updatedAt = opts.deps.now(); return true; } });
         return { done: false, awaitingInput: `artifact not ready: ${facts.terminalStatus}` };
       }
       if (facts.terminalStatus !== 'succeeded') {
@@ -369,10 +374,21 @@ async function runS5Critical(opts: {
       }
       // R2：完整证明才启动——缺三元组/hash → awaiting-input（N2）。
       if (!facts.sessionId || !facts.turnId || !facts.messageId || !facts.contentHash) {
-        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'ARTIFACT_PROOF_INCOMPLETE', since }; e.updatedAt = opts.deps.now(); return true; } });
+        await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, expectedState: 'running', mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'ARTIFACT_PROOF_INCOMPLETE', since }; e.updatedAt = opts.deps.now(); return true; } });
         return { done: false, awaitingInput: 'artifact proof incomplete (missing session/turn/message/hash)' };
       }
       const artifact = (k.artifact ?? { type: 'marked-url', hosts: [] }) as CollabArtifactSpec;
+      const upstreamReceipt = readCollabInitEntry(opts.dataDir, opts.creatorAppId, opts.initId)!
+        .operations[`kickoff:${depAppId}`]?.receipt as { sessionId?: string; turnId?: string } | undefined;
+      if (!upstreamReceipt?.sessionId || !upstreamReceipt.turnId
+        || facts.sessionId !== upstreamReceipt.sessionId || facts.turnId !== upstreamReceipt.turnId) {
+        await patchCollabInitEntry({
+          dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId,
+          expectedState: 'running',
+          mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'ARTIFACT_PROOF_MISMATCH', since }; e.updatedAt = opts.deps.now(); return true; },
+        });
+        return { done: false, awaitingInput: 'artifact session/turn does not match upstream kickoff receipt' };
+      }
       // satisfiedBy 用上游 afterAppId 的 kickoffId/receiptId（R2）。
       const upstreamKickoffId = collabKickoffId(opts.initId, depAppId, opts.configVersion);
       const evalResult = evaluateArtifactReady({
@@ -388,7 +404,7 @@ async function runS5Critical(opts: {
         // F2：NO_MARKER/HOST_NOT_ALLOWED/MISSING_URL 是终态失败 → awaiting-input（人工推进）；
         // NOT_DELIVERED 是真正等投递 → KICKOFF_PENDING。
         if (evalResult.reason === 'NO_MARKER' || evalResult.reason === 'HOST_NOT_ALLOWED' || evalResult.reason === 'MISSING_URL') {
-          await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: `ARTIFACT_${evalResult.reason}`, since }; e.updatedAt = opts.deps.now(); return true; } });
+          await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, expectedState: 'running', mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: `ARTIFACT_${evalResult.reason}`, since }; e.updatedAt = opts.deps.now(); return true; } });
           return { done: false, awaitingInput: `artifact not ready: ${evalResult.reason}` };
         }
         sawPending = true;
@@ -406,6 +422,26 @@ async function runS5Critical(opts: {
     const rcPrep = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
     if (!rcPrep.ok) { await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'kickoff', status: 'unknown', payloadHash, error: `cancelled after prepare: ${rcPrep.reason}` } }); return { done: false, awaitingInput: rcPrep.reason }; }
     if (!prep.ok) return { done: false, awaitingInput: `kickoff prepare failed: ${prep.message}` };
+    const reverifyBeforeStart = reverifyCollabRoleAndConfig({
+      dataDir: opts.dataDir, larkAppId: opts.creatorAppId, chatId: opts.chatId, initId: opts.initId,
+      configVersion: opts.configVersion, config: opts.config, roleVerify: opts.deps.roleVerify, targetAppId: appId,
+    });
+    if (!reverifyBeforeStart.ok) {
+      await patchCollabInitEntry({
+        dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId,
+        expectedState: 'running',
+        mutate: (e) => {
+          e.state = 'awaiting-input';
+          e.awaiting = {
+            reason: reverifyBeforeStart.reason === 'config_version_changed' ? 'CONFIG_CHANGED' : 'ROLE_CONFLICT',
+            since: opts.deps.now(), detail: reverifyBeforeStart.reason,
+          };
+          e.updatedAt = opts.deps.now();
+          return true;
+        },
+      });
+      return { done: false, awaitingInput: reverifyBeforeStart.reason };
+    }
     const started = await opts.deps.kickoffStart(appId);
     // R1：await 之后重读 state。
     const rcStart = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);

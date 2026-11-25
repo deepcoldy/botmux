@@ -37682,6 +37682,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const recovered = await recoverRunningCollabGroupBirthsOnStartup({
         dataDir: config.session.dataDir,
         creatorAppIds: [cfg.larkAppId],
+        evaluateCreatorTalk: (entry) => evaluateTalk(
+          cfg.larkAppId, entry.dmChatId, entry.sourceSenderOpenId,
+          entry.sourceSenderUnionId, undefined, 'p2p',
+        ),
       });
       if (recovered.scanned > 0) {
         logger.info(`[collab:${cfg.larkAppId}] startup recovery scanned=${recovered.scanned} resumed=${recovered.resumeAttempts} awaiting=${recovered.awaitingInput} released=${recovered.releasedUncommitted} errors=${recovered.errors.length}`);

@@ -34,6 +34,7 @@ import {
 } from '../services/collab-init-store.js';
 import {
   buildInitialCollabGate,
+  patchCollabGate,
   readCollabGate,
   writeCollabGate,
 } from '../services/collab-gate-store.js';
@@ -144,6 +145,39 @@ export async function runCollabGroupBirthS1(
   return withCollabInitIdMutex(initId, () => runS1Critical(data, ctx, initId, receipt, deps));
 }
 
+/** 非 running 时停止 S1；若群刚在取消/人工等待期间建成，补记全关闭 gate。 */
+async function inactiveS1Result(
+  deps: CollabS1Deps,
+  creatorAppId: string,
+  initId: string,
+  knownChatId?: string,
+): Promise<SessionGroupBirthResult> {
+  const entry = readCollabInitEntry(deps.dataDir, creatorAppId, initId);
+  const chatId = knownChatId ?? entry?.chatId;
+  if (entry && chatId && entry.state !== 'running') {
+    if (!readCollabGate(deps.dataDir, chatId)) {
+      writeCollabGate(deps.dataDir, buildInitialCollabGate({
+        initId,
+        configVersion: entry.configVersion,
+        creatorAppId,
+        chatId,
+        participantAppIds: entry.configSnapshot.agents.map(a => a.appId),
+      }));
+    }
+    const phase = entry.state;
+    if (phase === 'awaiting-input' || phase === 'cancelled' || phase === 'failed' || phase === 'done') {
+      patchCollabGate(deps.dataDir, chatId, gate => ({
+        ...gate,
+        phase,
+        participants: Object.fromEntries(Object.entries(gate.participants).map(([appId, participant]) => [
+          appId, { ...participant, acceptingUserTasks: false },
+        ])),
+      }));
+    }
+  }
+  return { kind: 'collab-handled', initId, ...(chatId ? { chatId } : {}), status: entry?.state ?? 'entry_missing' };
+}
+
 async function runS1Critical(
   data: any,
   ctx: RoutingContext,
@@ -157,6 +191,7 @@ async function runS1Critical(
   if (!entry) {
     return { kind: 'collab-handled', initId, status: 'entry_missing' };
   }
+  if (entry.state !== 'running') return inactiveS1Result(deps, creatorAppId, initId, entry.chatId);
 
   const ownerOpenId: string | undefined = data?.sender?.sender_id?.open_id;
   if (!ownerOpenId) {
@@ -218,10 +253,12 @@ async function runS1Critical(
       && (existingCreate?.status === 'unknown' || existingCreate?.status === 'attempting')
       && now - firstAttemptAt > COLLAB_CREATE_UUID_WINDOW_MS
     ) {
-      await patchCollabInitEntry({
+      const patched = await patchCollabInitEntry({
         dataDir: deps.dataDir, creatorAppId, initId,
+        expectedState: 'running',
         mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'CREATE_UNKNOWN_EXPIRED', since: now }; e.updatedAt = now; return true; },
       });
+      if (!patched) return inactiveS1Result(deps, creatorAppId, initId, chatId);
       return { kind: 'collab-handled', initId, status: 'awaiting_input' };
     }
     await writeCollabOperation({
@@ -229,6 +266,9 @@ async function runS1Critical(
       op: { kind: 'create', status: 'attempting', uuid: createUuid, firstAttemptAt, payloadHash: createPayloadHash },
     });
     await advanceCollabStep({ dataDir: deps.dataDir, creatorAppId, initId, step: 'create', status: 'running', now });
+    if (readCollabInitEntry(deps.dataDir, creatorAppId, initId)?.state !== 'running') {
+      return inactiveS1Result(deps, creatorAppId, initId, chatId);
+    }
 
     let createResult: { chatId: string };
     try {
@@ -238,6 +278,9 @@ async function runS1Critical(
         dataDir: deps.dataDir, creatorAppId, initId, opKey: createOpKey, now,
         op: { kind: 'create', status: 'unknown', uuid: createUuid, firstAttemptAt, payloadHash: createPayloadHash, error: String((err as any)?.message ?? err) },
       });
+      if (readCollabInitEntry(deps.dataDir, creatorAppId, initId)?.state !== 'running') {
+        return inactiveS1Result(deps, creatorAppId, initId, chatId);
+      }
       return { kind: 'collab-handled', initId, status: 'create_unknown' };
     }
     const newChatId = createResult.chatId;
@@ -261,6 +304,9 @@ async function runS1Critical(
         return true;
       },
     });
+    if (readCollabInitEntry(deps.dataDir, creatorAppId, initId)?.state !== 'running') {
+      return inactiveS1Result(deps, creatorAppId, initId, newChatId);
+    }
   }
 
   if (!chatId) {
@@ -293,6 +339,9 @@ async function runS1Critical(
       dataDir: deps.dataDir, creatorAppId, initId, opKey: regOpKey, now,
       op: { kind: 'admission', status: 'attempting', payloadHash: regPayloadHash, firstAttemptAt: regOp?.firstAttemptAt ?? now },
     });
+    if (readCollabInitEntry(deps.dataDir, creatorAppId, initId)?.state !== 'running') {
+      return inactiveS1Result(deps, creatorAppId, initId, chatId);
+    }
     deps.registerGroup(chatId, {
       ownerOpenId,
       lastSessionId: '',
@@ -304,6 +353,9 @@ async function runS1Critical(
       dataDir: deps.dataDir, creatorAppId, initId, opKey: regOpKey, now,
       op: { kind: 'admission', status: 'done', payloadHash: regPayloadHash, receipt: { chatId } },
     });
+  }
+  if (readCollabInitEntry(deps.dataDir, creatorAppId, initId)?.state !== 'running') {
+    return inactiveS1Result(deps, creatorAppId, initId, chatId);
   }
 
   // ── S1.gate：写全关闭 gate（先于任何邀请）──
@@ -336,8 +388,9 @@ async function runS1Critical(
     if ((existingForward?.status === 'unknown' || existingForward?.status === 'attempting')
       && now - firstAttemptAt > COLLAB_MESSAGE_UUID_WINDOW_MS) {
       // 飞书消息 uuid 只去重 1h；超窗后外部结果仍需人工核对，绝不自动再转一次。
-      await patchCollabInitEntry({
+      const patched = await patchCollabInitEntry({
         dataDir: deps.dataDir, creatorAppId, initId,
+        expectedState: 'running',
         mutate: (e) => {
           e.state = 'awaiting-input';
           e.awaiting = { reason: 'MESSAGE_UNKNOWN_EXPIRED', operationId: forwardUuid, since: now };
@@ -345,12 +398,16 @@ async function runS1Critical(
           return true;
         },
       });
+      if (!patched) return inactiveS1Result(deps, creatorAppId, initId, chatId);
       return { kind: 'collab-handled', initId, chatId, status: 'awaiting_input' };
     }
     await writeCollabOperation({
       dataDir: deps.dataDir, creatorAppId, initId, opKey: forwardUuid, now,
       op: { kind: 'forward', status: 'attempting', uuid: forwardUuid, firstAttemptAt, payloadHash: forwardPayloadHash },
     });
+    if (readCollabInitEntry(deps.dataDir, creatorAppId, initId)?.state !== 'running') {
+      return inactiveS1Result(deps, creatorAppId, initId, chatId);
+    }
     try {
       const forwardedId = await deps.forward(creatorAppId, messageId, chatId, forwardUuid);
       await writeCollabOperation({
@@ -365,5 +422,7 @@ async function runS1Critical(
     }
   }
 
+  const finalEntry = readCollabInitEntry(deps.dataDir, creatorAppId, initId);
+  if (finalEntry?.state !== 'running') return inactiveS1Result(deps, creatorAppId, initId, chatId);
   return { kind: 'collab-handled', initId, chatId, status: 'running' };
 }
