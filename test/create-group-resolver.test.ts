@@ -22,6 +22,7 @@ import {
 import { config } from '../src/config.js';
 import {
   createGroupCompletionStatus,
+  parseCreateGroupCliArgs,
   parseOwnerNoticeCommand,
   runOwnerNoticeCommand,
   type OwnerNoticeCommandDeps,
@@ -284,6 +285,71 @@ describe('runOwnerNoticeCommand (real config file)', () => {
   });
 });
 
+describe('parseCreateGroupCliArgs', () => {
+  it('parses valid flags in a single pass without misinterpreting prompt/name values as flags', () => {
+    expect(parseCreateGroupCliArgs([
+      '--bot', 'cli_a',
+      '--bot=cli_b',
+      '--name', '--chat',
+      '--chat-mode=topic',
+      '--kickoff-bot', 'cli_b',
+      '--kickoff-prompt', '--kickoff-bot=cli_b --team=t1 --help review',
+      '--json-status',
+    ])).toEqual({
+      kind: 'ok',
+      botRefs: ['cli_a', 'cli_b'],
+      name: '--chat',
+      chatMode: 'topic',
+      workingDir: undefined,
+      kickoffBot: 'cli_b',
+      kickoffPrompt: '--kickoff-bot=cli_b --team=t1 --help review',
+      jsonStatus: true,
+    });
+
+    // Leading-dash markdown bullet prose and equals-form literal flag text are allowed.
+    expect(parseCreateGroupCliArgs([
+      '--bot', 'cli_a', '--bot', 'cli_b',
+      '--kickoff-bot=cli_b',
+      '--kickoff-prompt', '- check tests',
+    ])).toMatchObject({ kind: 'ok', kickoffBot: 'cli_b', kickoffPrompt: '- check tests' });
+
+    expect(parseCreateGroupCliArgs([
+      '--bot', 'cli_a', '--bot', 'cli_b',
+      '--kickoff-bot=cli_b',
+      '--kickoff-prompt=--kickoff-bot',
+    ])).toMatchObject({ kind: 'ok', kickoffBot: 'cli_b', kickoffPrompt: '--kickoff-bot' });
+  });
+
+  it('rejects missing, blank, and duplicate kickoff flags (including trailing bare duplicates)', () => {
+    const cases: Array<[string[], string]> = [
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-bot', 'cli_b', '--kickoff-prompt', '--json-status'], '--kickoff-prompt 缺少值'],
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-prompt', '--kickoff-bot', 'cli_b'], '--kickoff-prompt 缺少值'],
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-prompt', '--kickoff-bot=cli_b'], '--kickoff-prompt 缺少值'],
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-prompt', '--name', 'MyGroup'], '--kickoff-prompt 缺少值'],
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-bot', ''], '--kickoff-bot 不能为空'],
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-bot', '   '], '--kickoff-bot 不能为空'],
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-bot=   '], '--kickoff-bot 不能为空'],
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-bot'], '--kickoff-bot 缺少值'],
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-bot', '--json-status'], '--kickoff-bot 缺少值'],
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-prompt', '   '], '--kickoff-prompt 不能为空'],
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-bot', 'cli_b', '--kickoff-prompt', 'hi', '--kickoff-bot'], '--kickoff-bot 不能重复指定'],
+      [['--bot', 'cli_a', '--bot', 'cli_b', '--kickoff-bot', 'cli_b', '--kickoff-prompt', 'hi', '--kickoff-prompt'], '--kickoff-prompt 不能重复指定'],
+    ];
+    for (const [argv, expected] of cases) {
+      const parsed = parseCreateGroupCliArgs(argv);
+      expect(parsed.kind, argv.join(' ')).toBe('error');
+      if (parsed.kind === 'error') expect(parsed.error, argv.join(' ')).toContain(expected);
+    }
+  });
+
+  it('detects help, deprecated --chat, and --team/--agent mode flags cleanly', () => {
+    expect(parseCreateGroupCliArgs(['--help'])).toEqual({ kind: 'help' });
+    expect(parseCreateGroupCliArgs(['owner-notice', '--help'])).toEqual({ kind: 'help' });
+    expect(parseCreateGroupCliArgs(['--bot', 'cli_a', '--chat', 'oc_1'])).toEqual({ kind: 'deprecated-chat' });
+    expect(parseCreateGroupCliArgs(['--team', 't1', '--agent', 'cli_a'])).toEqual({ kind: 'team' });
+  });
+});
+
 describe('resolveKickoff', () => {
   const selected = ['cli_creator', 'cli_reviewer'];
   const botInfo = [
@@ -326,6 +392,54 @@ describe('resolveKickoff', () => {
       error: '--kickoff-bot 不能是 creator（第一个 --bot）。',
     });
   });
+
+  it('resolves a selected non-creator bot directly by larkAppId even without bots-info.json', () => {
+    expect(resolveKickoff(' cli_reviewer ', ' start review ', selected, [])).toEqual({
+      ok: true,
+      targetLarkAppId: 'cli_reviewer',
+      prompt: 'start review',
+    });
+  });
+
+  it('rejects creator, unselected, and unknown larkAppIds cleanly', () => {
+    expect(resolveKickoff('cli_creator', 'review', selected, [])).toEqual({
+      ok: false,
+      error: '--kickoff-bot 不能是 creator（第一个 --bot）。',
+    });
+    expect(resolveKickoff('cli_unselected', 'review', selected, [], ['cli_creator', 'cli_reviewer', 'cli_unselected'])).toEqual({
+      ok: false,
+      error: '--kickoff-bot 必须属于本次 --bot 列表。',
+    });
+    expect(resolveKickoff('cli_unknown', 'review', selected, [], ['cli_creator', 'cli_reviewer'])).toEqual({
+      ok: false,
+      error: '--kickoff-bot 未匹配到本机 bot: cli_unknown',
+    });
+  });
+
+  it('fails closed on ambiguous/malformed refs and corrupted bots-info entries', () => {
+    for (const bad of ['Reviewer', 'codex', 'local_helper', 'on_union1', 'cli_', 'ou_', '--kickoff-prompt', 'cli_has space']) {
+      const res = resolveKickoff(bad, 'review', selected, botInfo);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.error).toContain('格式无效');
+    }
+    // Duplicate botOpenId in bots-info.json still fails closed.
+    const dupInfo = [
+      { larkAppId: 'cli_reviewer', botOpenId: 'ou_dup' },
+      { larkAppId: 'cli_unselected', botOpenId: 'ou_dup' },
+    ];
+    expect(resolveKickoff('ou_dup', 'review', selected, dupInfo).ok).toBe(false);
+
+    // Corrupted bots-info entry with a cli_ string stored in botOpenId must NOT hijack larkAppId lookup.
+    const poisoned = [
+      { larkAppId: 'cli_creator', botOpenId: 'cli_reviewer' },
+      { larkAppId: 'cli_reviewer', botOpenId: 'ou_reviewer_self' },
+    ];
+    expect(resolveKickoff('cli_reviewer', 'review', selected, poisoned)).toEqual({
+      ok: true,
+      targetLarkAppId: 'cli_reviewer',
+      prompt: 'review',
+    });
+  });
 });
 
 describe('createGroupCompletionStatus', () => {
@@ -340,11 +454,45 @@ describe('createGroupCompletionStatus', () => {
       success: false,
       chatCreated: true,
       chatId: 'oc_created',
+      shareLink: null,
+      shareLinkError: null,
       collaborationReady: true,
       kickoffAccepted: false,
       kickoffRequested: true,
       kickoffMessageId: null,
       kickoffError: 'network down',
+    });
+  });
+
+  it('includes shareLink and shareLinkError without flipping success on best-effort share link failure', () => {
+    expect(createGroupCompletionStatus({
+      chatId: 'oc_created',
+      shareLink: 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=tok_1',
+      shareLinkError: null,
+      collaborationReady: true,
+      kickoffRequested: false,
+      kickoffMessageId: null,
+      kickoffError: null,
+    })).toMatchObject({
+      success: true,
+      chatId: 'oc_created',
+      shareLink: 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=tok_1',
+      shareLinkError: null,
+    });
+
+    expect(createGroupCompletionStatus({
+      chatId: 'oc_created',
+      shareLink: null,
+      shareLinkError: 'permission_denied (code: 99991672)',
+      collaborationReady: true,
+      kickoffRequested: false,
+      kickoffMessageId: null,
+      kickoffError: null,
+    })).toMatchObject({
+      success: true,
+      chatId: 'oc_created',
+      shareLink: null,
+      shareLinkError: 'permission_denied (code: 99991672)',
     });
   });
 

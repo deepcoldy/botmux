@@ -166,6 +166,11 @@ export interface CodexPendingTurn {
   /** Wall-clock millis when an authoritative adapter/history check confirmed
    *  the submit. Unverified writes deliberately leave this unset. */
   submitConfirmedAtMs?: number;
+  /** True when `submitConfirmedAtMs` came only from weak `pty-output`
+   *  activity during a deferred recheck rather than an actual history/transcript
+   *  or botmux-send receipt. Keeps the bounded start lease alive while alone,
+   *  but must not block a later whole-input successor from passing it. */
+  weakSubmitConfirmation?: true;
   /** Local time the CLI reported it accepted this input while busy and is
    *  holding it until its current work ends (`input_queued`). While set the
    *  pre-start lease cannot expire: the user record is coming, just late.
@@ -355,6 +360,9 @@ export class CodexBridgeQueue {
   /** See wholeInputSuccessor. Off unless the worker enables it for a driver
    *  whose transcript timestamps and submit order it trusts. */
   private wholeInputPassing = false;
+  /** Quantisation step (ms) of transcript event timestamps for whole-input
+   *  passing (e.g. 1_000 for RFC3339 1-second timestamps such as agy). */
+  private wholeInputTimestampGranularityMs = 1;
   private bufferedUnmatched: CodexBridgeEvent[] = [];
   private lastClosedAssistantFinalTimeMs: number | undefined;
   /** Lower bound (ms) for synthesising local turns — protects against a
@@ -416,26 +424,33 @@ export class CodexBridgeQueue {
     return turn.rpcActive === true
       || turn.cliQueuedAtMs !== undefined
       || turn.inputDeliveryQuarantined === true
-      || turn.submitConfirmedAtMs !== undefined
+      || (turn.submitConfirmedAtMs !== undefined && turn.weakSubmitConfirmation !== true)
       || turn.finalText !== undefined;
   }
 
-  /** Adopt mode only: the later unstarted mark whose whole input this user
-   *  record is, and the unstarted marks it passes.
+  private wholeInputMarkFloorMs(markTimeMs: number): number {
+    if (this.wholeInputTimestampGranularityMs <= 1) return markTimeMs;
+    return Math.floor(markTimeMs / this.wholeInputTimestampGranularityMs) * this.wholeInputTimestampGranularityMs;
+  }
+
+  /** Adopt / zero-prompt mode only: the later unstarted mark whose whole
+   *  input this user record is, and the unstarted marks it passes.
    *
    *  The CLI takes input in submit order, so when a later input's own record
    *  arrives, earlier inputs that never started never reached it (an unknown
-   *  slash command, input swallowed by a modal). In adopt mode an unmatched
-   *  record becomes a local turn: without passing, the later input's reply
-   *  posts as a terminal turn and its own mark expires with a "not collected"
-   *  notice; and when the head shares the record's 30-char opening (every Lark
-   *  wiki link does), the head claims a reply to an input it never sent.
+   *  slash command, input swallowed by a modal). With local-turn synthesis on,
+   *  an unmatched record becomes a local turn: without passing, the later
+   *  input's reply posts as a terminal turn and its own mark expires with a
+   *  "not collected" notice; and when the head shares the record's 30-char
+   *  opening (every Lark wiki link does), the head claims a reply to an input
+   *  it never sent.
    *
    *  Only whole-input equality passes, never the fingerprint. Nothing passes
    *  a mark the CLI may still deliver (RPC-active, CLI-queued, quarantined,
-   *  submit-confirmed), and a record older than the later mark cannot be that
-   *  mark's input. Identical texts keep FIFO order. Non-adopt sessions keep
-   *  their buffer instead: the record replays once the dead heads expire. */
+   *  strongly submit-confirmed), and a record older than the later mark's
+   *  timestamp-granularity floor cannot be that mark's input. Identical texts
+   *  keep FIFO order. Non-local-turn sessions keep their buffer instead: the
+   *  record replays once the dead heads expire. */
   private wholeInputSuccessor(
     ev: CodexBridgeEvent,
     alsoPassing: readonly CodexPendingTurn[] = [],
@@ -448,7 +463,7 @@ export class CodexBridgeQueue {
     if (index < 0 || (index === 0 && alsoPassing.length === 0)) return undefined;
     const mark = unstarted[index];
     const ahead = unstarted.slice(0, index);
-    if (mark.markTimeMs !== undefined && ev.timestampMs < mark.markTimeMs) return undefined;
+    if (mark.markTimeMs !== undefined && ev.timestampMs < this.wholeInputMarkFloorMs(mark.markTimeMs)) return undefined;
     if ([...alsoPassing, ...ahead].some(turn => this.mayStillArrive(turn))) return undefined;
     return { mark, ahead };
   }
@@ -471,7 +486,7 @@ export class CodexBridgeQueue {
     const successor = this.wholeInputSuccessor(ev);
     const revived = this.localTurnsEnabled && this.wholeInputPassing
       ? this.queue.find(turn => turn.passedBySuccessor && !turn.started && turn.finalText === undefined
-        && !(turn.markTimeMs !== undefined && ev.timestampMs < turn.markTimeMs)
+        && !(turn.markTimeMs !== undefined && ev.timestampMs < this.wholeInputMarkFloorMs(turn.markTimeMs))
         && this.exactlyMatchesUserInput(turn, ev))
       : undefined;
     const exact = [exactHead, successor?.mark, revived].filter((turn): turn is CodexPendingTurn => !!turn);
@@ -652,8 +667,12 @@ export class CodexBridgeQueue {
    *  drivers that write each user record when the CLI takes the input, with
    *  its own clock: a reader that stamps records at read time cannot tell an
    *  old identical record from the new input. */
-  setWholeInputPassing(enabled: boolean): void {
+  setWholeInputPassing(enabled: boolean, options?: { timestampGranularityMs?: number }): void {
     this.wholeInputPassing = enabled;
+    const granularity = options?.timestampGranularityMs;
+    this.wholeInputTimestampGranularityMs = enabled && typeof granularity === 'number' && Number.isFinite(granularity) && granularity > 1
+      ? granularity
+      : 1;
   }
 
   setLocalTurns(enabled: boolean, lowerBoundMs: number = this.now()): void {
@@ -1001,24 +1020,45 @@ export class CodexBridgeQueue {
 
   /** Record positive submit evidence from an adapter/history check. The turn
    *  can still be waiting in the CLI's type-ahead queue, so this starts a
-   *  bounded hand-off lease until its transcript user event appears. */
+   *  bounded hand-off lease until its transcript user event appears.
+   *  When `options.weak` is true (deferred `pty-output` only), the bounded
+   *  lease still protects a sole pending head, but it does not block a later
+   *  whole-input successor or revive an already-passed mark. */
   confirmPendingTurn(
     turnId: string,
     confirmedAtMs: number = this.now(),
     dispatchAttempt?: number,
+    options?: { weak?: boolean },
   ): boolean {
     const turn = this.queue.find(candidate => candidate.turnId === turnId
       && candidate.dispatchAttempt === dispatchAttempt
       && candidate.finalText === undefined);
     if (!turn) return false;
-    // The CLI did take this input after all: its record is coming.
-    turn.passedBySuccessor = undefined;
-    turn.restoredPassedRevivalUntilMs = undefined;
+    if (options?.weak === true) {
+      if (turn.passedBySuccessor) return false;
+      if (turn.submitConfirmedAtMs !== undefined && turn.weakSubmitConfirmation !== true) {
+        return true;
+      }
+      turn.weakSubmitConfirmation = true;
+    } else {
+      // The CLI did take this input after all: its record is coming.
+      turn.weakSubmitConfirmation = undefined;
+      turn.passedBySuccessor = undefined;
+      turn.restoredPassedRevivalUntilMs = undefined;
+    }
     turn.submitVerificationStartedAtMs = undefined;
     turn.unconfirmedAttributionStartedAtMs = undefined;
     turn.submitConfirmedAtMs = confirmedAtMs;
     turn.writeSettledAtMs ??= confirmedAtMs;
     return true;
+  }
+
+  /** Whether this exact mark has already been passed over by a later
+   *  whole-input successor in the transcript. */
+  isPassedBySuccessor(turnId: string, dispatchAttempt?: number): boolean {
+    return this.queue.some(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.passedBySuccessor === true);
   }
 
   /** Expire, on their ordinary pre-start lease, the unstarted heads queued
