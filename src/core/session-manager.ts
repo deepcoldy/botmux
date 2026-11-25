@@ -106,7 +106,7 @@ import { resolveScheduleModelOverride } from './schedule-model-override.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
-import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
+import { sameUsageLimit } from '../utils/cli-usage-limit.js';
 import { t, localeForBot, getDefaultLocale, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
 import { resolveRoleInjection } from './role-resolver.js';
@@ -364,10 +364,19 @@ function quarantineUnregisteredRestoreSession(session: Session, reason: string):
   }
 }
 
-function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageLimit']): boolean {
-  if (!a && !b) return true;
-  if (!a || !b) return false;
-  return usageLimitStateKey(a) === usageLimitStateKey(b) && a.retryReady === b.retryReady && a.source === b.source;
+function hydrateSessionUsageLimitFields(session: Session): Pick<
+  DaemonSession,
+  'usageLimit' | 'antigravityQuotaHistory' | 'antigravityQuotaCursor'
+> {
+  return {
+    usageLimit: session.usageLimit,
+    ...(session.antigravityQuotaHistory !== undefined
+      ? { antigravityQuotaHistory: session.antigravityQuotaHistory }
+      : {}),
+    ...(session.antigravityQuotaCursor !== undefined
+      ? { antigravityQuotaCursor: session.antigravityQuotaCursor }
+      : {}),
+  };
 }
 
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
@@ -2686,12 +2695,16 @@ export function buildReforkCliInput(
  * Lets the existing card be PATCHed on next screen_update after a daemon restart,
  * instead of a fresh card being POSTed.
  */
-export function persistStreamCardState(ds: DaemonSession): void {
+export function persistStreamCardState(ds: DaemonSession, opts?: { forceWrite?: boolean }): void {
   const cardId = ds.streamCardId === STREAM_CARD_SENTINEL ? undefined : ds.streamCardId;
   const s = ds.session;
   const quotaHistory = ds.antigravityQuotaHistory ?? s.antigravityQuotaHistory;
+  const quotaCursor = ds.antigravityQuotaCursor !== undefined
+    ? ds.antigravityQuotaCursor
+    : s.antigravityQuotaCursor;
   // Skip write if nothing actually changed — avoids disk churn on every screen_update.
   if (
+    !opts?.forceWrite &&
     s.streamCardId === cardId &&
     s.streamCardNonce === ds.streamCardNonce &&
     s.streamCardReplyTargetKey === ds.streamCardReplyTargetKey &&
@@ -2701,6 +2714,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.currentTurnTitle === ds.currentTurnTitle &&
     sameUsageLimit(s.usageLimit, ds.usageLimit) &&
     isDeepStrictEqual(s.antigravityQuotaHistory, quotaHistory) &&
+    isDeepStrictEqual(s.antigravityQuotaCursor, quotaCursor) &&
     s.modelFallback?.uuid === ds.modelFallback?.uuid &&
     s.modelFallback?.claudeSessionId === ds.modelFallback?.claudeSessionId &&
     s.lastUserPrompt === ds.lastUserPrompt &&
@@ -2719,6 +2733,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.currentTurnTitle = ds.currentTurnTitle;
   s.usageLimit = ds.usageLimit;
   s.antigravityQuotaHistory = quotaHistory;
+  if (quotaCursor !== undefined) s.antigravityQuotaCursor = quotaCursor;
   s.modelFallback = ds.modelFallback;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;
@@ -3353,7 +3368,7 @@ export async function restoreActiveSessions(
             : (session.streamExpanded ? 'screenshot' : 'hidden'),
           currentImageKey: session.currentImageKey,
           currentTurnTitle: session.currentTurnTitle,
-          usageLimit: session.usageLimit,
+          ...hydrateSessionUsageLimitFields(session),
           modelFallback: session.modelFallback,
           lastUserPrompt: session.lastUserPrompt,
           lastCliInput: session.lastCliInput,
@@ -3570,7 +3585,7 @@ export async function restoreActiveSessions(
       displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
-      usageLimit: session.usageLimit,
+      ...hydrateSessionUsageLimitFields(session),
       modelFallback: session.modelFallback,
       lastUserPrompt: session.lastUserPrompt,
       lastCliInput: session.lastCliInput,
@@ -4284,7 +4299,7 @@ export async function takeOverDurableActiveRemoteSession(
       displayMode: persisted.displayMode ?? (persisted.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: persisted.currentImageKey,
       currentTurnTitle: persisted.currentTurnTitle,
-      usageLimit: persisted.usageLimit,
+      ...hydrateSessionUsageLimitFields(persisted),
       modelFallback: persisted.modelFallback,
       lastUserPrompt: persisted.lastUserPrompt,
       lastCliInput: persisted.lastCliInput,
@@ -4573,7 +4588,7 @@ export async function resumeSession(
     displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,
-    usageLimit: session.usageLimit,
+    ...hydrateSessionUsageLimitFields(session),
     modelFallback: session.modelFallback,
     lastUserPrompt: session.lastUserPrompt,
     lastCliInput: session.lastCliInput,

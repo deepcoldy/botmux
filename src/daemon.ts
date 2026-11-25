@@ -579,6 +579,8 @@ import {
   collectSessionTurnGarbage,
   sweepTraexInstallChanges,
   suspendWorker,
+  resetUsageLimitForNewTurn,
+  scheduleUsageLimitPersistenceRetry,
 } from './core/worker-pool.js';
 import { notePromptCacheKeepaliveTurnStarted, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
 import { invalidateIdleAutoCompactRetryForTurn, isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice, type IdleAutoCompactRefusalReason } from './core/idle-auto-compact.js';
@@ -7556,10 +7558,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string, opts: { 
       saveFrozenCards(ds.session.sessionId, ds.frozenCards);
     }
   }
-  if (ds.usageLimitRetryTimer) {
-    clearTimeout(ds.usageLimitRetryTimer);
-    ds.usageLimitRetryTimer = undefined;
-  }
+  resetUsageLimitForNewTurn(ds);
   // New turn — the previous turn's deliberate-silence marker (if any) has been
   // baked into the frozen card above; live cards return to normal labels.
   ds.messageListenerCompletedTurnId = undefined;
@@ -7570,14 +7569,17 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string, opts: { 
   // AFTER this point belongs to an older turn (type-ahead admits the follow-up
   // while the previous turn is still running) and must not relabel this card.
   ds.currentTurnId = turnId;
-  ds.usageLimit = undefined;
-  ds.quotaFallbackAttemptToken = undefined;
   ds.streamCardPending = true;
   ds.streamCardPendingTurnId = turnId;
   ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
   ds.currentTurnTitle = title.substring(0, 50);
   ds.currentImageKey = undefined;
-  persistStreamCardState(ds);
+  try {
+    persistStreamCardState(ds);
+  } catch (error) {
+    scheduleUsageLimitPersistenceRetry(ds);
+    throw error;
+  }
   void postTurnStartingCard(ds, sessionReply, turnId);
 }
 
@@ -33175,12 +33177,7 @@ async function handleThreadReplyAdmitted(
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
     // 飞书消息轮（非文档评论轮）：docCommentTargets 是 per-turn map，本轮 turnId
     // 不会命中文档评论的 key，无需显式清盘。
-    if (ds.usageLimitRetryTimer) {
-      clearTimeout(ds.usageLimitRetryTimer);
-      ds.usageLimitRetryTimer = undefined;
-    }
-    ds.usageLimit = undefined;
-    ds.quotaFallbackAttemptToken = undefined;
+    resetUsageLimitForNewTurn(ds);
     ds.currentTurnTitle = parsed.content.substring(0, 50);
     // The cosmetic freeze step (above) is gated on a live worker. With no
     // worker we just park the current card in frozenCards — the upcoming
@@ -33213,7 +33210,12 @@ async function handleThreadReplyAdmitted(
     // as belonging to an older turn.
     noteReplyCardTurnStarted(ds, parsed.messageId);
     ds.currentImageKey = undefined;
-    persistStreamCardState(ds);
+    try {
+      persistStreamCardState(ds);
+    } catch (error) {
+      scheduleUsageLimitPersistenceRetry(ds);
+      throw error;
+    }
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
     // `<botmux_reminder>` envelope as live-worker turns. Without this, the
     // initial prompt that worker queues for the freshly-spawned CLI is the
@@ -34754,9 +34756,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
 
       // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
       logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
-      if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
-      ds.usageLimit = undefined;
-      ds.quotaFallbackAttemptToken = undefined;
+      resetUsageLimitForNewTurn(ds);
       ds.currentTurnTitle = text.substring(0, 50);
       parkStreamCard(ds);
       ds.streamCardId = undefined;
@@ -34773,7 +34773,12 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       ds.currentTurnId = turnId;
       noteReplyCardTurnStarted(ds, turnId);
       ds.currentImageKey = undefined;
-      persistStreamCardState(ds);
+      try {
+        persistStreamCardState(ds);
+      } catch (error) {
+        scheduleUsageLimitPersistenceRetry(ds);
+        throw error;
+      }
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
       // the live-worker branch above (if (!isBridge) ensure…).
       if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
@@ -36237,6 +36242,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         larkAppId: ds.larkAppId,
         status: context.status,
       }).then(() => undefined);
+    },
+    onTerminalInputSubmitted(ds, at) {
+      const anchor = ds.runtimeRoutingAnchor
+        ?? (ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId);
+      noteFailedTurnRecoveryInput(ds.larkAppId, anchor, `web-terminal:${at}`);
     },
     onQueuedActivationSubmitted,
     // 决策看板批次回合的投递终态失败（收据超时 / worker 拒绝入队）：不往管家群贴失败
