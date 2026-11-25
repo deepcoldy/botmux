@@ -168,7 +168,7 @@ import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
 import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/file-lock.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
-import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
+import { firstPositional, unknownFlags } from './cli/arg-utils.js';
 import { defaultStatFile, parseSendInvocation, validateClientSendInvocation, type ClientSendPlan } from './cli/send-invocation.js';
 import { parseDispatchArgs } from './cli/dispatch-args.js';
 import { safeRequirementUrl } from './core/dispatch-task-tree.js';
@@ -8772,8 +8772,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                    脱离进程树）；换代/关闭后需重新注册，远端 sandbox 后端不支持
   tabs list|add|update|remove|sort
                    查看和管理当前飞书群标签页；add 按 URL 幂等，适合后台自动化调用
-  top-notice set <message_id>
-                   将当前飞书群内的一条消息设置为群置顶，适合后台自动化调用
+  top-notice set <message_id> [--bot <cli_xxx> --chat-id <oc_xxx>]
+                   将飞书群内的一条消息设置为群置顶（支持无会话 --bot 经 Daemon IPC 调用）
   continuation start
                    （实验性）功能开关启用时，TraeX 普通用户轮默认自动开启授权继承续跑；
                    start 可在取消后重新开启，并设置 --ttl-minutes N / --max-continuations N，
@@ -10490,6 +10490,7 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
   const {
     CHAT_TOP_NOTICE_CLI_USAGE,
     executeChatTopNoticeCli,
+    executeChatTopNoticeViaDaemonIpc,
     parseChatTopNoticeCli,
   } = await import('./cli/chat-top-notice-command.js');
   let parsed;
@@ -10507,6 +10508,70 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
   }
 
   assertTurnTransportOrExit('top-notice');
+  if (parsed.bot) {
+    const chatId = parsed.chatId!;
+    const dataDir = resolveDataDir();
+    const emitPolicyRefusal = (message: string): void => {
+      if (parsed.json) console.log(JSON.stringify({ ok: false, chatId, larkAppId: parsed.bot, error: message }));
+      console.error(`botmux top-notice: ${message}`);
+      process.exitCode = 1;
+    };
+    // Defense-in-depth: if invoked inside a managed session (ancestor PID
+    // marker, BOTMUX_SESSION_ID, or ml: env anchor), resolve the origin session
+    // WITHOUT letting caller-supplied BOTMUX_LARK_APP_ID poison lookup, and
+    // fail closed if origin resolution fails so `--bot` can never bypass the
+    // source-group silent_message_listener barrier.
+    const envSessionId = process.env.BOTMUX_SESSION_ID?.trim() || undefined;
+    const ancestor = findLiveAncestorSessionContext(dataDir);
+    if (ancestor && !ancestor.sessionId) {
+      emitPolicyRefusal('silent_message_listener: 无法校验当前会话来源，已拒绝置顶操作。');
+      return;
+    }
+    if (ancestor?.sessionId && envSessionId && ancestor.sessionId !== envSessionId) {
+      emitPolicyRefusal('silent_message_listener: 当前会话身份冲突，已拒绝置顶操作。');
+      return;
+    }
+    const originSid = ancestor?.sessionId || envSessionId;
+    if (originSid) {
+      const { BOTMUX_LARK_APP_ID: _ignored, ...cleanEnv } = process.env;
+      let originSession: SessionData | undefined;
+      try { originSession = loadSessions().get(originSid); } catch { /* fall through to IPC lookup */ }
+      if (!originSession) {
+        const resolved = await resolveSessionById(originSid, { dataDir, env: cleanEnv });
+        if (resolved.ok) originSession = resolved.session as unknown as SessionData;
+      }
+      if (!originSession) {
+        emitPolicyRefusal('silent_message_listener: 无法校验当前会话来源，已拒绝置顶操作。');
+        return;
+      }
+      if (isSilentMessageListenerSession(originSession) && messageListenerSendBlocked(originSession, chatId)) {
+        emitPolicyRefusal('silent_message_listener: 来源群已设置静默执行，不能在来源群置顶或取消置顶。');
+        return;
+      }
+    } else if (isMessageListenerTaskAnchor(process.env.BOTMUX_ROOT_MESSAGE_ID)) {
+      const envChatId = process.env.BOTMUX_CHAT_ID?.trim();
+      if (!envChatId || envChatId === chatId) {
+        emitPolicyRefusal('silent_message_listener: 来源群已设置静默执行，不能在来源群置顶或取消置顶。');
+        return;
+      }
+    }
+    try {
+      const result = await executeChatTopNoticeViaDaemonIpc(
+        { larkAppId: parsed.bot, chatId, messageId: parsed.messageId },
+        { dataDir },
+      );
+      console.log(parsed.json
+        ? JSON.stringify({ ok: true, ...result })
+        : `已将消息 ${result.messageId} 设为群置顶`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (parsed.json) console.log(JSON.stringify({ ok: false, chatId, larkAppId: parsed.bot, error: message }));
+      else console.error(`botmux top-notice: ${message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   await registerSelfFromCredFile();
   const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
   assertSessionTransportOrExit(session, 'top-notice');
@@ -18643,7 +18708,18 @@ botmux grant chat — 给目标 Bot 增删/查询精确群对话授权（不授�
 // ─── Create-group subcommand ─────────────────────────────────────────────────
 
 async function cmdCreateGroup(rest: string[]): Promise<void> {
-  if (rest.includes('--help') || rest.includes('-h')) {
+  const {
+    parseCreateGroupCliArgs,
+    parseOwnerNoticeCommand,
+    runOwnerNoticeCommand,
+    resolveBotRefs,
+    resolveKickoff,
+    resolveChatMode,
+    createGroupCompletionStatus,
+    shouldWriteCreateGroupCompletionStatus,
+  } = await import('./cli/create-group-resolver.js');
+  const parsedArgs = parseCreateGroupCliArgs(rest);
+  if (parsedArgs.kind === 'help') {
     console.log(`
 botmux create-group — 用一组机器人新建飞书群
 
@@ -18651,7 +18727,7 @@ botmux create-group — 用一组机器人新建飞书群
   botmux create-group --bot <name|larkAppId> [--bot ...] [--name "群名"]
                       [--chat-mode group|topic]
                       [--working-dir <path>]
-                      [--kickoff-bot <open_id> --kickoff-prompt "文本"]
+                      [--kickoff-bot <open_id|larkAppId> --kickoff-prompt "文本"]
                       [--json-status]
 
 参数:
@@ -18667,9 +18743,9 @@ botmux create-group — 用一组机器人新建飞书群
   --working-dir <path>
                  可选；创建成功后，把新群为所有成功入群的 bot 绑定到该目录（等价于逐个 /oncall bind），
                  下次在群里开新话题时直接使用该目录，跳过仓库选择卡片。也可写作 --cwd / --dir。
-  --kickoff-bot <open_id>  可选；建群成功后由 creator @ 该 bot 并发送 --kickoff-prompt，
-                 触发该 bot 自动开始工作（如 PR review）。需配合 --kickoff-prompt 使用。
-                 该 bot 必须已在 --bot 列表中（即已是群成员）。
+  --kickoff-bot <open_id|larkAppId>  可选；建群成功后由 creator @ 该 bot 并发送 --kickoff-prompt，
+                 支持传 botOpenId（ou_...）或 larkAppId（cli_...），触发该 bot 自动开始工作（如 PR review）。
+                 需配合 --kickoff-prompt 使用。该 bot 必须已在 --bot 列表中（即已是群成员）。
   --kickoff-prompt "文本"  可选；与 --kickoff-bot 配合使用，@ bot 后发送的 prompt 文本。
   --json-status    可选；在 chatId 后追加一行结构化完成状态。默认 stdout 无论完整成功或
                    部分失败都保持历史兼容，只输出单行 chatId；显式 kickoff 未发出时以非零退出表示。
@@ -18717,7 +18793,6 @@ botmux create-group — 用一组机器人新建飞书群
 
   // `create-group owner-notice …` is a settings write, not a group creation:
   // route it before every creation gate (transport, bots.json, --bot).
-  const { parseOwnerNoticeCommand, runOwnerNoticeCommand } = await import('./cli/create-group-resolver.js');
   const ownerNoticeCommand = parseOwnerNoticeCommand(rest);
   if (ownerNoticeCommand.kind !== 'none') {
     // A sandboxed CLI cannot see the host's live config.json. Worse, its fresh
@@ -18750,7 +18825,7 @@ botmux create-group — 用一组机器人新建飞书群
   // Deprecation 闸：--chat 曾经是 create-group 的「往已有群补人」模式，现已拆成独立命令
   // `bots invite`。若仍传 --chat，必须**报错早退**而不是静默忽略——否则用户本意补人、
   // 却因 --chat 被丢弃照常建了个新群（真实副作用，多一个群）。放在 team 分流之前拦。
-  if (hasFlagOrEq(rest, '--chat')) {
+  if (parsedArgs.kind === 'deprecated-chat') {
     console.error('create-group 不再支持 --chat（往已有群补人已拆成独立命令）。请改用：');
     console.error('  botmux bots invite --chat <chatId> --team <id> --agent <appId>...');
     process.exit(1);
@@ -18759,7 +18834,7 @@ botmux create-group — 用一组机器人新建飞书群
   // 团队模式：走平台端点3 建新群，与本机飞书建群是两条完全不同的路径。必须在 transport
   // 闸门之前分流——平台代建群，本机 bot 不需要飞书传输身份（沙盒/apiOnly 也能发起）。
   // 「往已有群补人」是独立的 `bots invite`，不在这里。
-  if (hasFlagOrEq(rest, '--team') || hasFlagOrEq(rest, '--agent')) {
+  if (parsedArgs.kind === 'team') {
     await cmdCreateGroupTeam(rest);
     return;
   }
@@ -18770,13 +18845,20 @@ botmux create-group — 用一组机器人新建飞书群
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
-  const botRefs = argValues(rest, '--bot');
-  const name = argValue(rest, '--name');
-  const chatModeArg = argValue(rest, '--chat-mode');
-  const workingDirArg = argValue(rest, '--working-dir', '--cwd', '--dir');
-  const kickoffBot = argValue(rest, '--kickoff-bot');
-  const kickoffPrompt = argValue(rest, '--kickoff-prompt');
-  const jsonStatus = rest.includes('--json-status');
+  if (parsedArgs.kind === 'error') {
+    console.error(parsedArgs.error);
+    process.exit(1);
+  }
+
+  const {
+    botRefs,
+    name,
+    chatMode: chatModeArg,
+    workingDir: workingDirArg,
+    kickoffBot,
+    kickoffPrompt,
+    jsonStatus,
+  } = parsedArgs;
 
   let bindWorkingDir: string | undefined;
   let bindWorkingDirResolved: string | undefined;
@@ -18829,14 +18911,6 @@ botmux create-group — 用一组机器人新建飞书群
     }
   } catch { /* */ }
 
-  const {
-    resolveBotRefs,
-    resolveKickoff,
-    resolveChatMode,
-    createGroupCompletionStatus,
-    shouldWriteCreateGroupCompletionStatus,
-  } = await import('./cli/create-group-resolver.js');
-
   const resolvedChatMode = resolveChatMode(chatModeArg);
   if (!resolvedChatMode.ok) {
     console.error(resolvedChatMode.error);
@@ -18870,6 +18944,7 @@ botmux create-group — 用一组机器人新建飞书群
     kickoffPrompt,
     resolved.larkAppIds,
     botInfoEntries.map(b => ({ larkAppId: b.larkAppId, botOpenId: b.botOpenId })),
+    botConfigs.map(c => c.larkAppId),
   );
   if (!kickoff.ok) {
     console.error(kickoff.error);
@@ -18944,6 +19019,8 @@ botmux create-group — 用一组机器人新建飞书群
           success: false,
           chatCreated: true,
           chatId: createdChatId,
+          shareLink: null,
+          shareLinkError: null,
           collaborationReady: false,
           kickoffAccepted: false,
           error: err?.message ?? String(err),
@@ -19004,6 +19081,8 @@ botmux create-group — 用一组机器人新建飞书群
   }
   const completion = createGroupCompletionStatus({
     chatId: result.chatId,
+    shareLink: result.shareLink,
+    shareLinkError: result.shareLinkError,
     collaborationReady,
     kickoffRequested,
     kickoffMessageId: result.kickoffMessageId,

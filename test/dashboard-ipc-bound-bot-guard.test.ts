@@ -93,6 +93,8 @@ const OKFALSE_ROUTES: ReadonlyArray<readonly [string, string]> = [
   ['PUT', '/api/groups/:chatId/feed-groups'],
   ['POST', '/api/groups/:chatId/messages'],
   ['GET', '/api/groups/:chatId/messages/:messageId'],
+  ['POST', '/api/groups/:chatId/top-notice'],
+  ['POST', '/api/groups/:chatId/share-link'],
   ['POST', '/api/message-listeners/:chatId/preview'],
   ['POST', '/api/message-listeners/:chatId/run-preview'],
   ['GET', '/api/message-listeners/:chatId/run-preview/:runId'],
