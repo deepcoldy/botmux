@@ -6,6 +6,7 @@ import { config } from '../../config.js';
 import { hideLocalAddressesFor } from './local-address-switch.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { isHostCapabilityLink, type HostLinkScope } from '../../core/host-capability-link.js';
+import { publicReverseProxyBaseUrl } from '../../platform/binding.js';
 import {
   LocalAddressOutboundError, localJumpTargets, sanitizeLocalAddressNode, type LocalAddressContext,
 } from './local-address-policy.js';
@@ -19,9 +20,12 @@ function read(path: string): string {
 /** A missing config section allows nothing; it must not fail the card render. */
 function hostLinkScope(): HostLinkScope {
   const { web, dashboard } = config as Partial<typeof config>;
+  let publicPath = '';
+  try { publicPath = new URL(publicReverseProxyBaseUrl() ?? '').pathname.replace(/\/+$/, ''); } catch { /* no valid public prefix */ }
   return {
     hosts: [web?.externalHost ?? '', dashboard?.externalHost ?? ''],
     dashboardPorts: [read(join(homedir(), '.botmux', '.dashboard-port')), String(dashboard?.port ?? '')].filter(Boolean),
+    dashboardPathPrefixes: publicPath ? [publicPath] : [],
   };
 }
 
