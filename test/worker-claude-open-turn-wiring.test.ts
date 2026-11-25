@@ -525,6 +525,18 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
       // Must NOT have minted a dangling execution for 'late-recovery-a_final'!
       expect(store.executions(ref, 'late-recovery-a_final')).toEqual([]);
       expect(store.executions(ref, 'om_orig_sc')).toHaveLength(1);
+
+      const missingOriginMsg = eventScope.run(binding, () => metadata({
+        type: 'final_output',
+        turnId: 'late-recovery-missing_origin',
+        replyTurnId: 'om_missing_sc',
+        content: 'Recovered after the original execution was pruned',
+        lastUuid: 'a_missing',
+      }));
+      const missingOrigin = controller.ingest(missingOriginMsg, producer);
+      expect(missingOrigin).toMatchObject({ kind: 'current' });
+      expect(store.executions(ref, 'late-recovery-missing_origin')).toEqual([]);
+      expect(store.executions(ref, 'om_missing_sc')).toHaveLength(1);
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });

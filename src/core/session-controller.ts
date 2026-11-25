@@ -493,7 +493,7 @@ export class SessionController {
       if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
       if (continuedInto) context.scope.runtime = continuedInto;
       if (existing.length === 1) context.scope.execution = existing[0].ref;
-      else if (!existing.length && message.type !== 'screen_update' && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
+      else if (!existing.length && message.type !== 'screen_update' && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(lookupTurnId, message.dispatchAttempt);
     }
     // Physical screen status is a runtime observation, not an execution claim.
     // A turn that was already running when its physical CLI continued into a
