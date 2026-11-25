@@ -768,19 +768,26 @@ describe('usage-limit sticky state self-heal', () => {
     }
   });
 
-  it('limited → working(带新鲜 usageLimit) 保持 limited：新鲜判定优先', async () => {
+  it('limited → working(带新鲜 usageLimit) 保持 limited：同回合合成冷却钉住首帧截止时间', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker, workerPort: 9999 });
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    worker.emit('message', { type: 'screen_update', content: '429 Too Many Requests', status: 'limited', usageLimit: rateLimitState() });
+    const first = rateLimitState();
+    worker.emit('message', { type: 'screen_update', content: '429 Too Many Requests', status: 'limited', usageLimit: first });
     await flush();
 
     const fresh = rateLimitState();
     worker.emit('message', { type: 'screen_update', content: '429 Too Many Requests', status: 'working', usageLimit: fresh });
     await flush();
 
-    expect(ds.usageLimit).toEqual(fresh);
+    // 同一回合/输入世代内，合成 429 冷却保留第一帧的桶截止时间，不被后续 tick 重算；
+    // 断言避开 Date.now 跨引擎毫秒漂移（bun 的 advanceTimersByTime(0) 会推进 1ms）。
+    expect(ds.usageLimit).toMatchObject({
+      kind: 'rate',
+      retryLabel: '5-10 min',
+      retryAtMs: first.retryAtMs,
+    });
     expect(ds.lastScreenStatus).toBe('limited');
   });
 

@@ -18,6 +18,7 @@
  */
 import { awaySummaryFocusRefusal } from '../../src/services/away-summary-focus.js';
 import { paneReplyDeliveryFromProcessTree } from '../../src/services/pane-reply-delivery.js';
+import { createUsageLimitTracker } from '../../src/utils/usage-limit-tracker.js';
 import { REPLY_DELIVERY_ENV } from '../../src/services/send-completion-hint.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, watch as fsWatch } from 'node:fs';
@@ -225,6 +226,18 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'localAttestedCliProcess') return scope.localAttestedCliProcess;
   if (key === 'lastUsageLimitCaptureTurn') return scope.lastUsageLimitCaptureTurn;
   if (key === 'activeTransientRateLimit') return scope.activeTransientRateLimit;
+  // noteWebTerminalInput / flushPending begin a fresh usage-limit turn on every
+  // submitted input; scopes that do not model limit detection still need a real
+  // tracker so the extracted functions never dereference undefined. Explicit
+  // scope-supplied trackers (e.g. the Antigravity screen producer) win.
+  if (key === 'usageLimitTracker') {
+    return (scope.usageLimitTracker ??= createUsageLimitTracker({
+      isRateKindSuppressed: () => false,
+      isOutputActive: () => false,
+    }));
+  }
+  // Mirrors the worker's non-authoritative-backend branch: empty snapshot string.
+  if (key === 'currentUsageLimitSnapshot') return () => '';
   if (key === 'antigravityNativeQuotaLog') return scope.antigravityNativeQuotaLog;
   if (key === 'antigravityFoldedReconcilePending') return scope.antigravityFoldedReconcilePending;
   if (key === 'ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS') return 50;
