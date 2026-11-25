@@ -2,6 +2,7 @@ import { readOncallDeploymentEnv } from '../../services/oncall-deployment-config
 import { readOncallPresetOptions } from '../../services/oncall-preset-options.js';
 import { getBot } from '../../bot-registry.js';
 import { config } from '../../config.js';
+import { buildDashboardUrls } from '../../core/dashboard-url.js';
 import { logger } from '../../utils/logger.js';
 import { OncallGroupStore, oncallForwardingPending, pendingOncallMessageIds, type OncallGroupSource } from '../../services/oncall-group-store.js';
 import { oncallGroupEnabled, type OncallGroupPolicy, type OncallForwardMode } from '../../services/oncall-group-policy.js';
@@ -10,7 +11,7 @@ import { getMessageDetail, replyMessage } from './client.js';
 import { createNativeOncallLink, readNativeOncallResult, readNativeOncallResultCandidates, readOncallChoices, readOncallGroupResult, requiresNativeOncallForm, validateOncallSelection } from '../../services/oncall-platform.js';
 import { OncallFormStore, type OncallFormDraft, type OncallNativeSubmissionAttempt } from '../../services/oncall-form-store.js';
 import { buildOncallFormCard } from './oncall-form-card.js';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { withFileLock } from '../../utils/file-lock.js';
 import { join } from 'node:path';
 import { resolveOncallUsername } from './oncall-identity.js';
@@ -315,6 +316,13 @@ function logOncallCreationFailure(error: unknown, submittedAtMs = Date.now()): v
   logger.warn(`[oncall-group] Create outcome reason=${reason} http=${status ?? 'none'} elapsedMs=${Date.now() - submittedAtMs}`);
 }
 
+function renderOncallFormCard(draft: OncallFormDraft): string {
+  if (!draft.nativeEntry && !draft.nativeFormLink) return buildOncallFormCard(draft);
+  const dashboard = buildDashboardUrls({ host: config.dashboard?.externalHost ?? '', port: config.dashboard?.port ?? 7891 });
+  // A local Dashboard address may not be reachable from the Feishu client.
+  return buildOncallFormCard(draft, dashboard.localUrl ? dashboard.url : undefined);
+}
+
 async function openOncallForm(source: OncallGroupSource, operator: NonNullable<CardActionData['operator']>): Promise<any> {
   const ownerOpenId = operator.open_id!;
   const client = await import('./client.js');
@@ -353,24 +361,35 @@ async function openOncallForm(source: OncallGroupSource, operator: NonNullable<C
       current.publishStartedAtMs ??= Date.now();
       persist();
       current.messageId = current.nativeFormLink
-        ? await replyMessage(source.appId, source.messageId, buildOncallFormCard(current), 'interactive', true, current.id, undefined, { beforeWrite: () => assertOncallFormCurrent(current) })
-        : await replyMessage(source.appId, source.messageId, buildOncallFormCard(current), 'interactive', true, current.id);
-    } else current.messageId = current.nativeFormLink
-      ? await client.sendEphemeralCard(source.appId, source.chatId, ownerOpenId, buildOncallFormCard(current), { beforeWrite: () => assertOncallFormCurrent(current) })
-      : await client.sendEphemeralCard(source.appId, source.chatId, ownerOpenId, buildOncallFormCard(current));
+        ? await replyMessage(source.appId, source.messageId, renderOncallFormCard(current), 'interactive', true, current.id, undefined, { beforeWrite: () => assertOncallFormCurrent(current) })
+        : await replyMessage(source.appId, source.messageId, renderOncallFormCard(current), 'interactive', true, current.id);
+    } else {
+      if (current.nativeFormLink) persist();
+      current.messageId = current.nativeFormLink
+        ? await client.sendEphemeralCard(source.appId, source.chatId, ownerOpenId, renderOncallFormCard(current), { beforeWrite: () => assertOncallFormCurrent(current) })
+        : await client.sendEphemeralCard(source.appId, source.chatId, ownerOpenId, renderOncallFormCard(current));
+    }
   });
   return { toast: { type: 'info', content: visibility === 'thread' ? '请选择分类并确认转人工，仅你可操作本卡片' : '表单已展示，仅你可见' } };
 }
 
-function recordNativeSubmissionAttempt(draft: OncallFormDraft, attempt: OncallNativeSubmissionAttempt): void {
+function recordNativeSubmissionAttempt(draft: OncallFormDraft, href: string, attempt: OncallNativeSubmissionAttempt): string {
   const attempts = draft.nativeSubmission?.attempts ?? [];
-  const duplicate = attempts.some(item => item.sourceLocation === attempt.sourceLocation
+  const duplicate = attempts.find(item => item.sourceLocation === attempt.sourceLocation
     && item.username === attempt.username && item.typeId === attempt.typeId && item.region === attempt.region
     && item.policyFingerprint === attempt.policyFingerprint && item.forwardMode === attempt.forwardMode);
-  if (duplicate) return;
-  // Never mutate a published snapshot. The immutable update also lets the
-  // caller's previousDraft rollback restore the exact prior collection.
-  draft.nativeSubmission = { ...(draft.nativeSubmission ?? {}), attempts: [...attempts, attempt] };
+  if (duplicate?.sidebarLink) return duplicate.sidebarLink.href;
+  const issued = { ...(duplicate ?? attempt), sidebarLink: { token: randomBytes(16).toString('hex'), href } };
+  // Persist the original selection and its capability before exposing the card.
+  draft.nativeSubmission = { ...draft.nativeSubmission,
+    attempts: duplicate ? attempts.map(item => item === duplicate ? issued : item) : [...attempts, issued] };
+  return href;
+}
+
+/** Keep a selection's marker stable on re-render and distinct across routes or policy changes. */
+function nativeSelectionMarker(draft: OncallFormDraft, typeId: number, username: string, policy: string): string {
+  const selection = JSON.stringify([draft.region, typeId, draft.priority, username, policy]);
+  return `${draft.id}.${createHash('sha256').update(selection).digest('hex').slice(0, 24)}`;
 }
 
 /** Prepare the selected form before rendering its confirmation button. */
@@ -384,18 +403,17 @@ async function prepareSelectedNativeForm(draft: OncallFormDraft, username = draf
   const policySnapshot = JSON.stringify(getBot(draft.appId).config.oncallGroup);
   let nativeFormLink: string | undefined;
   const requiresNative = await requiresNativeOncallForm(target, secret, category);
-  if (requiresNative) username = username ?? await loadUsername?.();
-  if (requiresNative && !username) throw new Error('无法确认 Oncall 提单人，请重新打开表单');
   if (requiresNative) {
+    username = username ?? await loadUsername?.();
+    if (!username) throw new Error('无法确认 Oncall 提单人，请重新打开表单');
     nativeFormLink = await createNativeOncallLink(target, secret, '', draft.description, getBot(draft.appId).config.brand, fetch,
-      { region: draft.region, typeId: category.id, priority: draft.priority, formId: draft.id });
+      { region: draft.region, typeId: category.id, priority: draft.priority, formId: nativeSelectionMarker(draft, category.id, username, policySnapshot) });
   }
   if (JSON.stringify(getBot(draft.appId).config.oncallGroup) !== policySnapshot
     || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, draft.appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新打开表单');
   if (username) draft.oncallUsername = username;
   if (nativeFormLink && username) {
-    draft.nativeFormLink = nativeFormLink;
-    recordNativeSubmissionAttempt(draft, {
+    draft.nativeFormLink = recordNativeSubmissionAttempt(draft, nativeFormLink, {
       sourceLocation: new URL(nativeFormLink).searchParams.get('url')!.slice(0, 200), username,
       preparedAtMs: Date.now(), policyFingerprint: policySnapshot, forwardMode: getBot(draft.appId).config.oncallGroup?.forwardMode ?? 'individual',
       typeId: category.id, region: draft.region,
@@ -482,7 +500,7 @@ async function writeOncallFormDraft(latest: OncallFormDraft, persist: () => void
   const beforeWrite = () => assertOncallFormCurrent(latest);
   beforeWrite();
   const client = await import('./client.js');
-  const card = buildOncallFormCard(latest);
+  const card = renderOncallFormCard(latest);
   if (latest.visibility === 'thread') {
     if (!latest.messageId) throw new Error('分类卡片尚未发布');
     await client.updateMessage(latest.appId, latest.messageId, card, { beforeWrite });
@@ -572,20 +590,20 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
           || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新打开表单');
         if (selection.requiresNativeForm) {
           const nativeLink = await createNativeOncallLink(target, secret, '', draft.description, bot.brand, fetch,
-            { region: draft.region, typeId: selection.id, priority: draft.priority, formId: draft.id });
+            { region: draft.region, typeId: selection.id, priority: draft.priority, formId: nativeSelectionMarker(draft, selection.id, username, currentPolicySnapshot) });
           if (JSON.stringify(getBot(appId).config.oncallGroup) !== currentPolicySnapshot
             || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新打开表单');
           const concurrentRequest = store.getRequest(source);
           if (concurrentRequest && concurrentRequest.status !== 'failed') {
             return { toast: { type: 'info', content: '此会话已有请求，请从结果卡继续' } };
           }
-          draft.nativeEntry = { href: nativeLink, categoryName: selection.name, policyFingerprint: currentPolicySnapshot };
           draft.oncallUsername = username;
-          recordNativeSubmissionAttempt(draft, {
+          const href = recordNativeSubmissionAttempt(draft, nativeLink, {
             sourceLocation: new URL(nativeLink).searchParams.get('url')!.slice(0, 200), username,
             preparedAtMs: Date.now(), policyFingerprint: currentPolicySnapshot, forwardMode: currentPolicy?.forwardMode ?? 'individual',
             typeId: selection.id, region: draft.region,
           });
+          draft.nativeEntry = { href, categoryName: selection.name, policyFingerprint: currentPolicySnapshot };
           draft.targetFingerprint = JSON.stringify(target);
           draft.version++;
           persist();
@@ -644,10 +662,21 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
         return { toast: { type: 'info', content: '已更新分类选择' },
           afterAck: () => refreshOncallFormCard(appId, draft.id, owner) };
       }
-      try { draft.messageId = draft.nativeFormLink
-        ? await client.sendEphemeralCard(appId, source.chatId, owner, buildOncallFormCard(draft), { beforeWrite: () => assertOncallFormCurrent(draft) })
-        : await client.sendEphemeralCard(appId, source.chatId, owner, buildOncallFormCard(draft)); }
-      catch (error) { for (const key of Object.keys(draft)) delete (draft as any)[key]; Object.assign(draft, previousDraft); throw error; }
+      try {
+        if (draft.nativeFormLink) persist();
+        draft.messageId = draft.nativeFormLink
+          ? await client.sendEphemeralCard(appId, source.chatId, owner, renderOncallFormCard(draft), { beforeWrite: () => assertOncallFormCurrent(draft) })
+          : await client.sendEphemeralCard(appId, source.chatId, owner, renderOncallFormCard(draft));
+      }
+      catch (error) {
+        const submission = draft.nativeSubmission;
+        for (const key of Object.keys(draft)) delete (draft as any)[key];
+        Object.assign(draft, previousDraft);
+        // A transport failure can follow actual delivery. Keep the exact
+        // issued URL valid even when the editable selection rolls back.
+        if (submission) draft.nativeSubmission = submission;
+        throw error;
+      }
       if (priorId) await client.deleteEphemeralCard(appId, priorId);
       return { toast: { type: 'info', content: '已保存选择，仅你可见' } };
     }, { allowClosed: true });
@@ -916,13 +945,16 @@ export async function reconcileNativeOncallSubmissions(appId: string, owns: () =
   const keys = new Set(pending.map(draft => JSON.stringify([config.session.dataDir, appId, draft.id])));
   for (const key of nativeSubmissionChecks.keys()) {
     const parts = JSON.parse(key);
-    if (parts[0] === config.session.dataDir && parts[1] === appId && !keys.has(key)) nativeSubmissionChecks.delete(key);
+    if (parts[0] === config.session.dataDir && parts[1] === appId && !keys.has(key)
+      && nativeSubmissionChecks.get(key) !== Infinity) nativeSubmissionChecks.delete(key);
   }
   for (const candidate of pending) {
     if (!owns()) return;
     const key = JSON.stringify([config.session.dataDir, appId, candidate.id]);
     if (Date.now() < (nativeSubmissionChecks.get(key) ?? 0)) continue;
-    nativeSubmissionChecks.set(key, Date.now() + 15_000);
+    // An overlapping tick must not queue behind the lock and bypass backoff.
+    nativeSubmissionChecks.set(key, Infinity);
+    let retryDelay = 15_000;
     try {
       await forms.use(appId, candidate.id, candidate.ownerOpenId, async (draft, persist) => {
         const submission = draft.nativeSubmission;
@@ -950,16 +982,16 @@ export async function reconcileNativeOncallSubmissions(appId: string, owns: () =
               .then(result => result ? [{ attempt: eligibleAttempts[0]!, result }] : [])
             : await readNativeOncallResultCandidates(target, secret, eligibleAttempts);
           if (!candidates.length) return;
-          const valid = candidates.filter(({ attempt, result }) => result.launchedAtMs >= Math.floor(attempt.preparedAtMs / 1000) * 1000
-            && result.launchedAtMs <= Date.now());
+          const valid = candidates.filter(({ attempt, result }) => result.handoffAtMs >= Math.floor(attempt.preparedAtMs / 1000) * 1000
+            && result.handoffAtMs <= Date.now());
           if (!valid.length) throw new Error('提单时间与原生表单不匹配');
           // Candidates share the one verified platform order. Prefer the latest
-          // published selection whose preparation window contains its submit time.
+          // published selection whose preparation window contains the handoff.
           const chosen = valid.sort((a, b) => b.attempt.preparedAtMs - a.attempt.preparedAtMs)[0]!;
           completionAttempt = chosen.attempt;
           assertCurrent(chosen.attempt);
           const snapshot = await snapshotOncallConversation(draft.source, {
-            cutoffMs: chosen.result.launchedAtMs, forwardMode: chosen.attempt.forwardMode,
+            cutoffMs: chosen.result.handoffAtMs, forwardMode: chosen.attempt.forwardMode,
           });
           assertCurrent(chosen.attempt);
           const { flowId, openChatId } = chosen.result;
@@ -974,11 +1006,12 @@ export async function reconcileNativeOncallSubmissions(appId: string, owns: () =
         assertCurrent(completionAttempt);
         submission.completed = true;
         persist();
-        nativeSubmissionChecks.delete(key);
       }, { allowClosed: true });
     } catch {
-      nativeSubmissionChecks.set(key, Date.now() + 60_000);
+      retryDelay = 60_000;
       logger.warn('[oncall-group] Native submission reconciliation will retry; no new ticket is created');
+    } finally {
+      nativeSubmissionChecks.set(key, Date.now() + retryDelay);
     }
   }
 }

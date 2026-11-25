@@ -1,14 +1,20 @@
 import type { OncallFormDraft } from '../../services/oncall-form-store.js';
+import { hostOncallSidebar } from '../../services/oncall-sidebar-link.js';
 import { buildOncallGroupColumn } from './oncall-card-actions.js';
 
-export function buildOncallFormCard(draft: OncallFormDraft): string {
+export function buildOncallFormCard(draft: OncallFormDraft, dashboardUrl?: string): string {
   const value = (action: string) => ({ action, draftId: draft.id, version: draft.version });
+  const sidebar = (link: string) => {
+    if (!dashboardUrl) return link;
+    const issued = draft.nativeSubmission?.attempts.find(item => item.sidebarLink?.href === link)?.sidebarLink;
+    return issued ? hostOncallSidebar(link, dashboardUrl, draft, issued.token) : link;
+  };
   if (draft.nativeEntry) return JSON.stringify({ schema: '2.0', config: { update_multi: true, width_mode: 'fill' },
     header: { title: { tag: 'plain_text', content: '发起人工 Oncall' }, template: 'blue' }, body: { elements: [
       { tag: 'markdown', content: draft.description },
       { tag: 'markdown', content: `已选：${draft.region} · ${draft.nativeEntry.categoryName} · ${draft.priority}\n此分类需要补充信息，请在飞书侧栏填写表单并确认提单。\n${draft.nativeSubmission ? '提单成功后，原回答卡将显示进群入口，并按交接设置同步当前会话。' : '平台提单暂不自动关联人工群或转交当前对话。'}` },
       { tag: 'column_set', columns: [
-        buildOncallGroupColumn({ href: draft.nativeEntry.href, status: '填写人工 Oncall 表单' }),
+        buildOncallGroupColumn({ href: sidebar(draft.nativeEntry.href), status: '填写人工 Oncall 表单' }),
         { tag: 'column', width: 'auto', elements: [{ tag: 'button', type: 'default', size: 'small',
           text: { tag: 'plain_text', content: '收起入口' }, behaviors: [{ type: 'callback', value: value('oncall_group_form_cancel') }] }] },
       ] },
@@ -36,7 +42,7 @@ export function buildOncallFormCard(draft: OncallFormDraft): string {
       { tag: 'action', actions: [
         { tag: 'button', text: { tag: 'plain_text', content: '确认发起人工 Oncall' }, type: 'primary',
           disabled: !draft.region || !draft.typeId,
-          ...(draft.nativeFormLink ? { url: draft.nativeFormLink } : { value: value('oncall_group_form_submit') }) },
+          ...(draft.nativeFormLink ? { url: sidebar(draft.nativeFormLink) } : { value: value('oncall_group_form_submit') }) },
         { tag: 'button', text: { tag: 'plain_text', content: '取消' }, value: value('oncall_group_form_cancel') },
       ] },
     ] });

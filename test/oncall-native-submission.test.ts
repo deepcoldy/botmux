@@ -61,7 +61,8 @@ async function open() {
 function submitted(d: any) {
   rows = [{ id: 1234, tenant_id: 12, source_location: d.nativeSubmission.attempts[0]!.sourceLocation, originator_user: 'actor',
     oncall_question_type_id: 34, region: 'cn', stage: 'launch_oncall', chat_id: '1234567890123',
-    create_time: new Date(started - 45_000).toISOString(), oncall_start_time: new Date(started + 2000).toISOString() }];
+    create_time: new Date(started - 45_000).toISOString(), update_time: new Date(started + 2000).toISOString(),
+    oncall_start_time: new Date(started + 2000).toISOString() }];
   vi.setSystemTime(started + 5000);
 }
 
@@ -77,7 +78,8 @@ describe('native submission completion', () => {
   it('adopts a group from an earlier platform draft and forwards the conversation through launch time once', async () => {
     const d = await open(); submitted(d);
     const page = new URL(new URL(d.nativeFormLink!).searchParams.get('url')!);
-    expect([...page.searchParams.keys()][0]).toBe('bm_form'); expect(page.searchParams.get('bm_form')).toBe(d.id);
+    expect([...page.searchParams.keys()][0]).toBe('bm_form');
+    expect(page.searchParams.get('bm_form')).toBe(new URL(d.nativeSubmission.attempts[0]!.sourceLocation).searchParams.get('bm_form'));
     expect(d.nativeSubmission.attempts[0]!.sourceLocation).toContain(d.id);
     await retryPendingOncallHandoffs('app');
     const request = new OncallGroupStore(dir).getRequest(source)!;
@@ -97,9 +99,35 @@ describe('native submission completion', () => {
     await open(); await retryPendingOncallHandoffs('app');
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled(); expect(mocks.withdraw).not.toHaveBeenCalled();
   });
-  it.each(['originator_user', 'tenant_id', 'oncall_question_type_id', 'source_location', 'region'])('rejects a mismatched %s without adoption or forwarding', async key => {
+  it.each([false, true])('uses the group creation cutoff even with delayed duty start (recorded: %s)', async dutyStarted => {
+    const d = await open();
+    submitted(d);
+    rows[0].create_chat_time = '2026-01-01T08:00:02';
+    rows[0].oncall_start_time = dutyStarted ? '2026-01-01T08:00:04' : null;
+    await retryPendingOncallHandoffs('app');
+    const request = new OncallGroupStore(dir).getRequest(source);
+    expect(request).toMatchObject({ status: 'succeeded', openChatId: 'oc_destination', submittedAtMs: started + 2000,
+      messageIdsSnapshot: ['om_q1', 'om_a1', 'om_q2', 'om_a2', 'om_file'] });
+    const raw = mocks.update.mock.calls.filter(([, message]) => message === source.messageId).at(-1)![2];
+    expect(raw).toContain('进入人工 Oncall 群');
+    expect(mocks.withdraw).toHaveBeenCalledWith('app', d.messageId, expect.objectContaining({ acceptWithdrawn: true }));
+    expect((await current(d)).nativeSubmission?.completed).toBe(true);
+    rows[0].oncall_start_time = '2026-01-01T08:00:04';
+    vi.setSystemTime(started + 20_000);
+    await retryPendingOncallHandoffs('app');
+    expect(mocks.merge).toHaveBeenCalledOnce();
+  });
+  it.each(['originator_user', 'tenant_id', 'source_location', 'region'])('rejects a mismatched %s without adoption or forwarding', async key => {
     const d = await open(); submitted(d); rows[0][key] = typeof rows[0][key] === 'number' ? 99 : 'different';
     await retryPendingOncallHandoffs('app'); expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
+  });
+  it('updates the original answer and forwards once after Oncall changes the category', async () => {
+    const d = await open(); submitted(d);
+    rows[0].oncall_question_type_id = 99;
+    await retryPendingOncallHandoffs('app');
+    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', flowId: '1234', openChatId: 'oc_destination' });
+    expect(mocks.update.mock.calls.some(([, message]) => message === source.messageId)).toBe(true);
+    expect(mocks.merge).toHaveBeenCalledOnce();
   });
   it('does not guess between two orders submitted from the same form', async () => {
     const d = await open(); submitted(d); rows.push({ ...rows[0], id: 5678 });
@@ -176,7 +204,7 @@ describe('platform completion protocol', () => {
     const call = fetcher.mock.calls.find(([url]) => url.includes('/oncall_flow/list'))!;
     const payload = JSON.parse((call[1] as any).body);
     expect(payload).toMatchObject({ current_page: 1, page_size: 100, filter_fields: expect.arrayContaining([
-      { field: 'oncall_start_time', value: '2026-01-01 08:00:00', operator: 'greater_or_equals' },
+      { field: 'update_time', value: '2026-01-01 08:00:00', operator: 'greater_or_equals' },
       { field: 'originator_user', value: 'actor', operator: 'equals' },
     ]) });
   });
@@ -197,6 +225,6 @@ describe('platform completion protocol', () => {
     `;
     const run = spawnSyncTsEvalWithRepoImports(source, { cwd: process.cwd(), env: { ...process.env, TZ: 'UTC' }, encoding: 'utf8', timeout: 30_000 });
     expect(run.status, String(run.stderr)).toBe(0);
-    expect(JSON.parse(String(run.stdout)).launchedAtMs).toBe(Date.parse('2026-01-01T00:00:02.000Z'));
+    expect(JSON.parse(String(run.stdout)).handoffAtMs).toBe(Date.parse('2026-01-01T00:00:02.000Z'));
   });
 });

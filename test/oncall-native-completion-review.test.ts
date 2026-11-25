@@ -46,6 +46,23 @@ const current = (d: any) => new OncallFormStore(dir).use('app', d.id, 'ou_actor'
 function changeTarget() { const target = loadOncallGroupTarget(dir, 'app'); writeFileSync(join(dir, 'oncall-group-targets.json'), JSON.stringify({ app: { ...target, tenantId: 99 } })); }
 
 describe('native completion independent review', () => {
+  it('skips an overlapping query and applies failure backoff from the end of the request', async () => {
+    draft();
+    let fail!: (error: Error) => void;
+    fetcher.mockImplementationOnce(() => new Promise<Response>((_resolve, reject) => { fail = reject; }));
+    const first = reconcileNativeOncallSubmissions('app');
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    vi.setSystemTime(now + 25_000);
+    const overlapping = reconcileNativeOncallSubmissions('app');
+    fail(new Error('temporary lookup failure'));
+    await Promise.all([first, overlapping]);
+    vi.setSystemTime(now + 84_999);
+    await reconcileNativeOncallSubmissions('app');
+    expect(fetcher).toHaveBeenCalledOnce();
+    vi.setSystemTime(now + 85_000);
+    await reconcileNativeOncallSubmissions('app');
+    expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('succeeded');
+  });
   it.each(['disabled', 'target', 'ownership'])('does not adopt after %s changes during the platform lookup', async intervention => {
     draft(); let release!: () => void; let owns = true;
     const pending = new Promise<void>(resolve => { release = resolve; });

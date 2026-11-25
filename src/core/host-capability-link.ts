@@ -30,6 +30,14 @@ const CAPABILITY = /^[A-Za-z0-9_-]{20,512}$/;
 const TERMINAL_PATH = new RegExp(`^/s/${ID}$`);
 const DASHBOARD_PATH = new RegExp(`^/(?:workbench|plugin-result-access/[A-Za-z0-9_-]{20,256}|board/[A-Za-z0-9_-]{1,64}/\\d{1,9}|workflow/[A-Za-z0-9_-]{1,64}/${ID})$`);
 const DASHBOARD_ROUTE = new RegExp(`^#/(?:(?:v3|workflows)/${ID}|sessions\\?session=${ID}|agent-workbench(?:-dock)?(?:\\?botmuxWorkbenchShell=immersive)?)$`);
+export const ONCALL_SIDEBAR_PATH_PREFIX = '/oncall/sidebar/';
+const DRAFT_ID = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+const ONCALL_SIDEBAR_PATH = new RegExp(`^${ONCALL_SIDEBAR_PATH_PREFIX}(cli_[a-zA-Z0-9]+)/(${DRAFT_ID})/([0-9a-f]{32})$`);
+
+export function parseOncallSidebarPath(path: string): { appId: string; id: string; token: string } | undefined {
+  const match = ONCALL_SIDEBAR_PATH.exec(path);
+  if (match) return { appId: match[1]!, id: match[2]!, token: match[3]! };
+}
 
 function normalizedHost(value: string): string {
   return value.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
@@ -59,6 +67,7 @@ export function isHostCapabilityLink(value: string, scope: HostLinkScope): boole
   const dashboard = capabilityQuery(url, ['t']);
   if (dashboard === 'other') return false;
   if (url.pathname === '/') return !url.hash || DASHBOARD_ROUTE.test(url.hash);
+  if (!url.hash && dashboard === 'none' && parseOncallSidebarPath(url.pathname)) return true;
   if (url.hash || !DASHBOARD_PATH.test(url.pathname)) return false;
   return url.pathname === '/workbench' || dashboard === 'none';
 }
