@@ -4,6 +4,9 @@ import { submitFailureChainKeyOf } from './submit-failure-chain.js';
 export interface AuthoritativeInputReceipt {
   evidence: 'structured-transcript' | 'botmux-send';
   cliSessionId?: string;
+  /** Claude transcript provenance, used to reject already-retired secondary
+   *  files when retained evidence is probed after a rotation. */
+  sourceJsonlPath?: string;
 }
 
 type Evidence = {
@@ -62,13 +65,18 @@ export class InputDeliveryEvidenceTracker {
       prevReceipt?.evidence === 'structured-transcript' || receipt.evidence === 'structured-transcript'
         ? 'structured-transcript'
         : receipt.evidence;
-    const cliSessionId = prevReceipt?.cliSessionId ?? receipt.cliSessionId;
+    // An authoritative transcript rebind may correct an early sibling bind while
+    // the adapter write is still pending. Prefer the newest receipt's owned id;
+    // only retain the old one when the newer proof carries no id at all.
+    const cliSessionId = receipt.cliSessionId ?? prevReceipt?.cliSessionId;
+    const sourceJsonlPath = receipt.sourceJsonlPath ?? prevReceipt?.sourceJsonlPath;
     this.remember(key, {
       structuredTerminal: false,
       ...prev,
       authoritativeReceipt: {
         evidence,
         ...(cliSessionId ? { cliSessionId } : {}),
+        ...(sourceJsonlPath ? { sourceJsonlPath } : {}),
       },
     });
   }

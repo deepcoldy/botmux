@@ -94,6 +94,7 @@ function createActivationSubmitHarness(opts: {
     },
     bridgeJsonlPath: isClaude ? '/tmp/claude-proj/11111111-2222-3333-4444-555555555555.jsonl' : null,
     bridgeQueue,
+    bridgeSecondaryPaths: new Map<string, number>(),
     bridgeIngest: vi.fn(),
     bridgeMarkPendingTurn: (
       content: string,
@@ -1355,5 +1356,183 @@ describe('#3748 Scenario 4: late ACK after worker generation swap / close / kill
     expect(d2.ds.initialStartPending).toBe(false);
     expect(d2.ds.initialStartClaimToken).toBeUndefined();
     expect(d2.ds.session.queuedActivationPending).toBe(true);
+  });
+});
+
+describe('queued activation review fixes: detach recovery and evidence provenance', () => {
+  function tailOnlyAfterAck() {
+    const d = createDaemonActivationHarness();
+    workerPool.admitQueuedActivationTail(d.ds, {
+      userPrompt: 'tail M2', cliInput: { content: 'tail M2' }, turnId: 'om_tail_m2',
+    }, workerPool.reserveQueuedActivationTailAdmission(d.ds));
+    Object.assign(d.ds.session, {
+      queuedActivationPending: undefined,
+      queuedActivationToken: undefined,
+      queuedActivationInput: undefined,
+      queuedActivationTurnId: undefined,
+      queuedActivationDispatchAttempt: undefined,
+      queuedActivationResume: undefined,
+      queued: false,
+    });
+    sessionStore.updateSession(d.ds.session);
+    d.ds.initialStartPending = true;
+    d.ds.initialStartClaimToken = 'claim-before-detach';
+    return d;
+  }
+
+  it('keeps the initial-start recovery gate after a transient detach promotion failure', () => {
+    const d = tailOnlyAfterAck();
+    let failOnce = true;
+    sessionStore.__testOnly_setBeforeRowPersist(() => {
+      if (failOnce) { failOnce = false; throw new Error('transient promotion failure'); }
+    });
+    expect(() => workerPool.reconcileQueuedActivationOnWorkerDetach(d.ds)).not.toThrow();
+    expect(d.ds.initialStartPending).toBe(true);
+    expect(d.ds.initialStartClaimToken).toBe('claim-before-detach');
+    expect(d.ds.quarantinedActivationTailPromotion).toBe(true);
+    expect(d.disk().queuedActivationTail?.map(entry => entry.turnId)).toEqual(['om_tail_m2']);
+
+    // The next inbound uses blank recovery after staging its own tail entry.
+    // A healthy store must now promote the retained old head exactly once.
+    const plan = workerPool.resolveQuarantinedForkPlan(d.ds, '', true);
+    expect(plan.fork).toBe(true);
+    expect(d.ds.quarantinedActivationTailPromotion).toBeUndefined();
+    expect(d.ds.session.queuedActivationPending).toBe(true);
+    expect(d.ds.session.queuedActivationInput?.content).toBe('tail M2');
+  });
+
+  it('contains a detach promotion exception without losing the retryable tail or gate', () => {
+    const d = tailOnlyAfterAck();
+    vi.mocked(bots.getBot).mockImplementation(() => { throw new Error('transient registry reload'); });
+    expect(() => workerPool.reconcileQueuedActivationOnWorkerDetach(d.ds)).not.toThrow();
+    expect(d.ds.initialStartPending).toBe(true);
+    expect(d.ds.initialStartClaimToken).toBe('claim-before-detach');
+    expect(d.ds.quarantinedActivationTailPromotion).toBe(true);
+    expect(d.ds.session.queuedActivationTail?.map(entry => entry.turnId)).toEqual(['om_tail_m2']);
+  });
+
+  it('uses the corrected owned session id when rebind lands before the adapter write returns', async () => {
+    vi.useFakeTimers();
+    const now = Date.parse('2026-11-25T12:00:00.000Z');
+    vi.setSystemTime(now);
+    let resolveWrite!: (value: Record<string, unknown>) => void;
+    const writeResult = new Promise<Record<string, unknown>>(resolve => { resolveWrite = resolve; });
+    const h = createActivationSubmitHarness({
+      cliId: 'antigravity',
+      item: {
+        turnId: 'om_rebind_before_watch', dispatchAttempt: 1,
+        content: 'exact rebind input', queuedActivationToken: 'tok-rebind-before-watch',
+      },
+    });
+    h.scope.cliAdapter.writeInput = vi.fn(() => writeResult);
+    h.scope.armAntigravityCotForTurn = vi.fn();
+    const flushing = h.flush();
+    for (let i = 0; i < 50 && h.codexQueue.peek().length === 0; i++) await Promise.resolve();
+    expect(h.codexQueue.peek()).toHaveLength(1);
+
+    h.codexQueue.ingest([{
+      kind: 'user', uuid: 'sibling-user', timestampMs: now + 100,
+      sourceSessionId: 'sibling-session', sourceTurnId: 'native-turn', text: 'exact rebind input',
+    }]);
+    // The startup observer publishes the corrected identity before rebind.
+    h.scope.persistCliSessionId('owned-session');
+    h.scope.inputDeliveryObservedCliSessionId = 'owned-session';
+    expect(h.codexQueue.rebindStartedTurnToUser('om_rebind_before_watch', {
+      kind: 'user', uuid: 'owned-user', timestampMs: now + 200,
+      sourceSessionId: 'owned-session', sourceTurnId: 'native-turn', text: 'exact rebind input',
+    })).toBe(true);
+
+    for (let i = 0; i < 50 && h.scope.cliAdapter.writeInput.mock.calls.length === 0; i++) await Promise.resolve();
+    resolveWrite({ submitted: false, recheck: async () => false });
+    await flushing;
+    expect(h.ackMessages()).toHaveLength(1);
+    expect(h.scope.persistCliSessionId.mock.calls.at(-1)?.[0]).toBe('owned-session');
+  });
+
+  it('keeps standalone send proof eligible after a proven untouched opening write', async () => {
+    vi.useFakeTimers();
+    const now = Date.parse('2026-11-25T13:00:00.000Z');
+    vi.setSystemTime(now);
+    const h = createActivationSubmitHarness({
+      cliId: 'dsh',
+      item: {
+        turnId: 'om_untouched_retry', content: 'retry after a clean refusal',
+        queuedActivationToken: 'tok-untouched-retry',
+      },
+      writeResult: { submitted: false, submissionDisposition: 'untouched' },
+    });
+    await h.flush();
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(h.queuedActivationReceipts.size()).toBe(0);
+
+    h.scope.cliAdapter.writeInput = vi.fn(async () => ({ submitted: false }));
+    await h.flush();
+    expect(h.queuedActivationReceipts.size()).toBe(1);
+    h.sendMarkers.push({
+      sentAtMs: now + 1_000, sessionId: 'sess-3748', turnId: 'om_untouched_retry',
+      deliveryKind: 'direct', responseKind: 'final', contentHash: 'h', contentPreview: 'done',
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.ackMessages()).toHaveLength(1);
+    expect(h.queuedActivationReceipts.size()).toBe(0);
+  });
+
+  it('rejects an exact user record drained from an already-retired secondary transcript', async () => {
+    vi.useFakeTimers();
+    const h = createActivationSubmitHarness({
+      cliId: 'claude-code',
+      item: {
+        turnId: 'om_new_activation', content: 'repeat the same exact request',
+        queuedActivationToken: 'tok-retired-path',
+      },
+    });
+    await h.flush();
+    h.scope.bridgeSecondaryPaths.set('/tmp/claude-proj/retired-secondary.jsonl', 123);
+    h.scope.bridgeJsonlPath = '/tmp/claude-proj/current-owned.jsonl';
+    h.bridgeQueue.ingest([{
+      type: 'user', uuid: 'delayed-old-user', timestamp: new Date().toISOString(),
+      message: { role: 'user', content: 'repeat the same exact request' },
+    }], '/tmp/claude-proj/retired-secondary.jsonl');
+    expect(h.ackMessages()).toEqual([]);
+    expect(h.queuedActivationReceipts.size()).toBe(1);
+    expect(h.inputDeliveryEvidence.authoritativeReceipt({
+      turnId: 'om_new_activation', cliGeneration: h.scope.cliSpawnGeneration,
+    })).toBeUndefined();
+  });
+
+  it('keeps retained Claude evidence valid when rotation happens after observation', async () => {
+    vi.useFakeTimers();
+    const now = Date.parse('2026-11-25T14:00:00.000Z');
+    vi.setSystemTime(now);
+    let resolveWrite!: (value: Record<string, unknown>) => void;
+    const writeResult = new Promise<Record<string, unknown>>(resolve => { resolveWrite = resolve; });
+    const oldPath = '/tmp/claude-proj/retired-retained.jsonl';
+    const h = createActivationSubmitHarness({
+      cliId: 'claude-code',
+      item: {
+        turnId: 'om_retained_rotation', content: 'exact retained input',
+        queuedActivationToken: 'tok-retained-rotation',
+      },
+    });
+    h.scope.bridgeJsonlPath = oldPath;
+    h.scope.cliAdapter.writeInput = vi.fn(() => writeResult);
+    const flushing = h.flush();
+    for (let i = 0; i < 50 && h.bridgeQueue.peek().length === 0; i++) await Promise.resolve();
+    h.bridgeQueue.ingest([{
+      type: 'user', uuid: 'retained-user', timestamp: new Date(now + 100).toISOString(),
+      message: { role: 'user', content: 'exact retained input' },
+    }], oldPath);
+    expect(h.inputDeliveryEvidence.authoritativeReceipt({
+      turnId: 'om_retained_rotation', cliGeneration: h.scope.cliSpawnGeneration,
+    })?.sourceJsonlPath).toBe(oldPath);
+
+    h.scope.bridgeSecondaryPaths.set(oldPath, 123);
+    h.scope.bridgeJsonlPath = '/tmp/claude-proj/current-after-rotation.jsonl';
+    for (let i = 0; i < 50 && h.scope.cliAdapter.writeInput.mock.calls.length === 0; i++) await Promise.resolve();
+    resolveWrite({ submitted: false, recheck: async () => false });
+    await flushing;
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.ackMessages()).toHaveLength(1);
+    expect(h.queuedActivationReceipts.size()).toBe(0);
   });
 });

@@ -18959,8 +18959,26 @@ export function reconcileQueuedActivationOnWorkerDetach(ds: DaemonSession): void
   if ((ds.session.queuedActivationTail?.length ?? 0) > 0
     && ds.session.status === 'active'
     && !pendingProtectedHttpEgressForks.has(ds.session.sessionId)) {
-    if (!promoteQueuedActivationTail(ds, { send: false })) {
+    let promoted = false;
+    try {
+      promoted = promoteQueuedActivationTail(ds, { send: false });
+    } catch (err) {
+      // Detach cleanup must never abort the worker-exit fence itself. Any
+      // pre-promotion lookup/admission/payload failure keeps the exact tail
+      // retryable through the existing inbound blank-recovery boundary.
+      logger.error(
+        `[${tag(ds)}] Queued activation detach promotion threw; retaining tail for recovery: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (!promoted) {
       ds.quarantinedActivationTailPromotion = true;
+      // The daemon's tail-only inbound recovery is gated by this runtime flag.
+      // Keeping it (and the claim token) makes the next message stage behind the
+      // retained tail, then retry a blank recovery fork instead of being refused
+      // forever as a non-empty fork of a quarantined owner.
+      ds.initialStartPending = true;
+      return;
     }
     ds.initialStartPending = false;
     ds.initialStartClaimToken = undefined;

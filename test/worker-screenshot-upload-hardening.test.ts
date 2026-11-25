@@ -566,6 +566,10 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       const ordinaryImTurnDedupe = { commit: () => {} };
       let normalWritePrepared = false, item, durableWrite = false, durableTurnInFlight = false;
       let promptReadyAtFlushStart = false, itemsWrittenInThisFlush = 0, turnSeq = 0, bridgeTurnId;
+      let cliGenerationTurnWrites = 0;
+      let webTerminalInputGeneration = 0, cliInterruptGeneration = 0;
+      const cliSpawnGeneration = 1;
+      const inputDeliveryEvidence = { start: () => {} };
       const renderer = { markNewTurn: () => {} }, writeRpcEngine = undefined;
       const inflightInputs = { onWrite: () => {} }, stuckDetector = undefined;
       const usageLimitTracker = { beginTurn: () => 1 }, currentUsageLimitSnapshot = () => undefined;

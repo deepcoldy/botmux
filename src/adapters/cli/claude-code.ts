@@ -869,6 +869,9 @@ function findJsonlAcrossProjectsRoot(
     /** Also match queued_command attachments. Same restriction: boolean
      *  checks only, never pin the match. */
     includeQueuedCommandAttachments?: boolean;
+    /** Optional strong matcher used for whole-payload proof. It propagates
+     *  into both the primary and sibling-project transcript scans. */
+    candidateMatcher?: (candidate: string) => boolean;
   },
 ): string | null {
   if (fingerprint.length < CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) return null;
@@ -1500,6 +1503,20 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       const sanitizedContent = sanitizeClaudeInput(content);
       let baseByte = pty.claudeJsonlPath ? currentFileSize(pty.claudeJsonlPath) : 0;
       const submitFingerprint = makeSubmitFingerprint(sanitizedContent);
+      // Deferred activation settlement must not turn a 30-char prefix into
+      // whole-input proof. Match the entire normalized user payload instead;
+      // this still tolerates BotMux envelopes and soft-newline read-back through
+      // the JSONL matcher's existing transcript candidates.
+      const submitFullContent = normaliseForFingerprint(
+        extractMessageContentForFingerprint(sanitizedContent) || sanitizedContent,
+      );
+      // Exact payload equality on BOTH sides, not substring containment. This
+      // rejects a short input (e.g. "ok") found inside an unrelated longer user
+      // message while allowing legal BotMux wrappers and soft-newline variants.
+      const submitPayloadMatches = (candidate: string): boolean => (
+        normaliseForFingerprint(extractMessageContentForFingerprint(candidate) || candidate)
+        === submitFullContent
+      );
       const submitSearchMinMtime = Date.now() - 60_000;
       const buildResult = (submitted: boolean, failureReason?: string): { submitted: boolean; cliSessionId?: string; failureReason?: string } => {
         const result = observedCliSessionId
@@ -1508,16 +1525,17 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         return failureReason ? { ...result, failureReason } : result;
       };
       const recheck = (): boolean => {
-        if (!submitFingerprint) return false;
+        if (!submitFullContent) return false;
         // Latest pid → path; covers post-failure rotations (/clear, /resume).
         if (pty.cliPid && pty.cliCwd) {
           const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd, variant.dataDir);
           if (resolved) applyResolved(resolved);
         }
         const currentPath = pty.claudeJsonlPath;
-        if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, {
+        if (currentPath && jsonlContainsFingerprint(currentPath, submitFullContent, {
           includeQueueOperations: true,
           minEventTimestampMs: submitSearchMinMtime,
+          candidateMatcher: submitPayloadMatches,
         })) {
           return true;
         }
@@ -1533,12 +1551,13 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // the agent's next step when it is still running.
         const searchPath = currentPath ?? pty.claudeJsonlPath;
         if (!searchPath) return false;
-        const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
+        const matched = findJsonlAcrossProjectsRoot(searchPath, submitFullContent, {
           minMtimeMs: submitSearchMinMtime,
           minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
           includeSubagentTranscripts: true,
           includeQueuedCommandAttachments: true,
+          candidateMatcher: submitPayloadMatches,
         });
         return !!matched;
       };

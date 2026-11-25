@@ -3913,6 +3913,15 @@ function notifyNativeTranscriptConsumedLarkTurn(
   }
 }
 
+/** Secondary paths are retired transcripts kept only to drain their existing
+ *  turns. They may attribute trailing records, but cannot prove that a newly
+ *  queued activation entered the current conversation. */
+function claudeActivationTranscriptPathAllowed(sourceJsonlPath?: string): boolean {
+  return !sourceJsonlPath
+    || sourceJsonlPath === bridgeJsonlPath
+    || !bridgeSecondaryPaths.has(sourceJsonlPath);
+}
+
 function observeAuthoritativeClaudeTurnStart(
   turn: {
     turnId: string;
@@ -3926,6 +3935,7 @@ function observeAuthoritativeClaudeTurnStart(
   },
   evidence: { fullContentMatch: boolean; exactContentMatch?: boolean; sourceJsonlPath?: string },
 ): void {
+  if (!claudeActivationTranscriptPathAllowed(evidence.sourceJsonlPath)) return;
   const exactContentMatch = evidence.exactContentMatch ?? turn.exactContentMatch ?? evidence.fullContentMatch;
   if (!exactContentMatch
     || !isAuthoritativeClaudeTranscriptTurn({
@@ -3939,7 +3949,11 @@ function observeAuthoritativeClaudeTurnStart(
   const cliSessionId = claudeNativeSessionIdFromJsonlPath(evidence.sourceJsonlPath);
   inputDeliveryEvidence.observeAuthoritativeReceipt(
     { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt, cliGeneration: cliSpawnGeneration },
-    { evidence: 'structured-transcript', ...(cliSessionId ? { cliSessionId } : {}) },
+    {
+      evidence: 'structured-transcript',
+      ...(cliSessionId ? { cliSessionId } : {}),
+      ...(evidence.sourceJsonlPath ? { sourceJsonlPath: evidence.sourceJsonlPath } : {}),
+    },
   );
   queuedActivationReceipts.confirmByTurn?.(
     {
@@ -12146,7 +12160,8 @@ function submitActivityEvidenceSince(
   identity: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'> | undefined,
 ): SubmitActivityEvidence | undefined {
   const claudeTurns = typeof bridgeQueue?.peek === 'function'
-    ? bridgeQueue.peek().filter(isAuthoritativeClaudeTranscriptTurn)
+    ? bridgeQueue.peek().filter(turn => isAuthoritativeClaudeTranscriptTurn(turn)
+      && claudeActivationTranscriptPathAllowed(turn.sourceJsonlPath))
     : [];
   const structuredBridgeTurns = typeof codexBridgeQueue?.peek === 'function'
     ? codexBridgeQueue.peek().filter(turn =>
@@ -12193,6 +12208,9 @@ function probeAuthoritativeQueuedActivationEvidence(
       cliGeneration: identity.generation,
     })
     : undefined;
+  // A retained receipt was already fenced when it was first observed. A later
+  // rotation does not retroactively invalidate that delivery; only newly-read
+  // secondary-path records are rejected above and in the live queue probe below.
   if (retained) {
     return {
       source: retained.evidence,
@@ -12202,6 +12220,7 @@ function probeAuthoritativeQueuedActivationEvidence(
   if (typeof bridgeQueue?.peek === 'function') {
     const matchedClaude = bridgeQueue.peek().find(turn =>
       isAuthoritativeClaudeTranscriptTurn(turn)
+      && claudeActivationTranscriptPathAllowed(turn.sourceJsonlPath)
       && turn.turnId === identity.turnId
       && turn.dispatchAttempt === identity.dispatchAttempt);
     if (matchedClaude) {
@@ -26654,7 +26673,7 @@ async function flushPending(): Promise<void> {
           turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
         }
         itemsWrittenInThisFlush++;
-        const writeOrdinalInGeneration = ++cliGenerationTurnWrites;
+        ++cliGenerationTurnWrites;
         const preAssignedEvidenceTurnId = item.turnId
           ?? (claudeBridgeActive
             ? randomBytes(8).toString('hex')
@@ -26744,7 +26763,6 @@ async function flushPending(): Promise<void> {
         markTurnExecutionStart(item.turnId, item.dispatchAttempt, {
           evidenceAlreadyStarted: !!preAssignedEvidenceTurnId,
         });
-        void writeOrdinalInGeneration;
         if (isCodexAppCliId(lastInitConfig?.cliId)) {
           log(
             `Writing Codex App input to PTY (flush): `
@@ -27643,6 +27661,12 @@ async function flushPending(): Promise<void> {
         // and continually replaces their deferred confirmation timer. Only the
         // adapter's explicit safe non-submission disposition permits retry.
         if (!recoveryFailureReason && codexAppSafeNonSubmission) {
+          // No bytes were written, so a first activation retry is still the
+          // opening write for standalone botmux-send evidence. Do not let a
+          // proven untouched/flushed-invalid attempt consume that allowance.
+          if (item.queuedActivationToken && cliGenerationTurnWrites === 1) {
+            cliGenerationTurnWrites = 0;
+          }
           requeueUnsubmittedQueuedActivation(item);
         }
         if (deliveryQuarantine && !settledQueuedActivationImmediately) break;
