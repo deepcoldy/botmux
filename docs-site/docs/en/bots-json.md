@@ -342,7 +342,7 @@ Requirements and limits:
 
 | Field | Description |
 |------|------|
-| `backendType` | Session backend: `tmux` (default), `zellij` (≥ 0.44), `herdr`, `zmx`, `hc` (Linux only, explicit opt-in, bring your own herdr-core ≥ 0.1.19), `pty`. If a persistent backend like tmux isn't available on the machine, you get a card asking you to install it; botmux never silently falls back to pty. `pty` is used only when set explicitly, and its sessions don't survive a daemon restart. See [tmux backend](/en/tmux), [ZMX backend](/en/zmx), [hc backend](/en/hc) |
+| `backendType` | Session backend: `tmux` (default), `zellij` (≥ 0.44), `herdr`, `zmx`, `hc` (Linux or macOS, explicit opt-in, bring your own herdr-core ≥ 0.1.19), `pty`. If a persistent backend like tmux isn't available on the machine, you get a card asking you to install it; botmux never silently falls back to pty. `pty` is used only when set explicitly, and its sessions don't survive a daemon restart. See [tmux backend](/en/tmux), [ZMX backend](/en/zmx), [hc backend](/en/hc) |
 | `launchShell` | Shell used to launch the CLI, overriding the daemon's `$SHELL`. Use `zsh` / `bash` / `fish` / `sh` or an absolute path. For when the login shell's rc file does something like `exec zsh` and the session never starts (you see `parse error` in the terminal). Once set, put PATH, nvm and so on in that shell's rc file (`~/.config/fish/config.fish` for fish). Applies to new tmux / zellij / zmx / hc sessions |
 | `lang` | UI language `zh` / `en`; falls back to the `BOTMUX_LANG` / `LANG` environment variables |
 | `p2pMode` | DM mode: `chat` (default, one continuous session), `thread` (each DM message starts its own session), `group` (each DM message gets its own session group). See [Group modes](/en/group) |

@@ -324,9 +324,11 @@ async function runNodeImpl(
     cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
     credentialsSourceDir: req.botSnapshot.credentialsSourceDir,
+    cliConfigDir: req.botSnapshot.cliConfigDir,
     wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
     reasoningEffort: req.botSnapshot.reasoningEffort,
+    modelBackendVariant: req.botSnapshot.modelBackendVariant,
     envPolicy: req.botSnapshot.envPolicy,
     ...workerSessionEnv,
     // Workflow nodes receive no write capability or secret channel, but must

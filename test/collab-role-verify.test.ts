@@ -1,0 +1,150 @@
+/**
+ * S4 角色严格回读（§6）：runCollabRoleVerification + gate roleReady + 队列骨架。
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { runCollabRoleVerification, markGateRoleReady, type RoleVerifyDeps, type CollabRoleSnapshot } from '../src/core/collab-role-verify.js';
+import { buildInitialCollabGate, writeCollabGate, readCollabGate } from '../src/services/collab-gate-store.js';
+import { enqueueCollabChatItem, readCollabChatQueue } from '../src/services/collab-chat-queue-store.js';
+import type { SessionGroupCollaborationConfig } from '../src/services/collab-group-config.js';
+
+let dataDir: string;
+const APP = 'cli_creator';
+const CHAT = 'oc_chat';
+
+function config(agents: any[] = [{ appId: APP, roleMode: 'no-chat-role' }]): SessionGroupCollaborationConfig {
+  return { enabled: true, agents: agents as any, kickoff: agents.map(a => ({ appId: a.appId, trigger: 'immediate' as const })) };
+}
+
+function snapshot(profile: string | null = '你好', team: string | null = null): CollabRoleSnapshot {
+  return { resolvedProfileEntries: { [APP]: profile }, referencedTeamRoles: { [APP]: team } };
+}
+
+function deps(overrides: Partial<RoleVerifyDeps> = {}): RoleVerifyDeps {
+  return {
+    dataDir,
+    now: () => Date.now(),
+    readTeamRole: () => null,
+    writeRole: () => {},
+    deleteRole: () => {},
+    readRole: () => ({ kind: 'missing' as const }),
+    ...overrides,
+  };
+}
+
+function verify(
+  cfg: SessionGroupCollaborationConfig,
+  roleDeps: RoleVerifyDeps,
+  frozen?: CollabRoleSnapshot,
+) {
+  const effective = arguments.length >= 3 ? frozen : snapshot();
+  return runCollabRoleVerification(APP, CHAT, cfg, roleDeps, effective);
+}
+
+beforeEach(() => {
+  dataDir = mkdtempSync(join(tmpdir(), 'collab-role-verify-'));
+});
+
+afterEach(() => {
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+describe('runCollabRoleVerification', () => {
+  it('no-chat-role 且本群无覆盖 → 就绪', () => {
+    const r = verify(config(), deps({ readRole: () => ({ kind: 'missing' }) }));
+    expect(r.ready).toBe(true);
+  });
+
+  it('profile + 非空：写后回读 hash 一致 → 就绪', () => {
+    let written = '';
+    const r = verify(config([{ appId: APP, profileId: 'p1' }]), deps({
+      writeRole: (_a, _c, content) => { written = content; },
+      readRole: () => ({ kind: 'readable', content: written || '你好' }),
+    }));
+    expect(r.ready).toBe(true);
+    expect(r.records[0].verified).toBe(true);
+    expect(r.records[0].expectedSource).toBe('chat');
+  });
+
+  it('profile + 非空：回读 hash 不一致 → 冲突（ROLE_CONFLICT）', () => {
+    const r = verify(config([{ appId: APP, profileId: 'p1' }]), deps({
+      readRole: () => ({ kind: 'readable', content: '完全不同' }),
+    }));
+    expect(r.ready).toBe(false);
+    expect(r.conflict).toBeTruthy();
+  });
+
+  it('profile + null → S4 失败（不启动）', () => {
+    const r = verify(config([{ appId: APP, profileId: 'p_missing' }]), deps(), snapshot(null));
+    expect(r.ready).toBe(false);
+    expect(r.conflict).toContain('条目缺失');
+  });
+
+  it('已是期望状态 → 幂等成功（不重复写）', () => {
+    let writes = 0;
+    const r = verify(config([{ appId: APP, profileId: 'p1' }]), deps({
+      writeRole: () => { writes++; },
+      readRole: () => ({ kind: 'readable', content: '你好' }),
+    }));
+    expect(r.ready).toBe(true);
+    expect(writes).toBe(0);
+  });
+
+  it('R3：代写前 read-error → fail-closed，不写不覆盖旧角色', () => {
+    let writes = 0;
+    const r = verify(config([{ appId: APP, profileId: 'p1' }]), deps({
+      writeRole: () => { writes++; },
+      readRole: () => ({ kind: 'read-error', error: 'EACCES' }),
+    }));
+    expect(r.ready).toBe(false);
+    expect(writes).toBe(0);
+    expect(r.conflict).toContain('read-error');
+  });
+
+  it('P1：空 Profile + 不可读旧文件 → 清空前 read-error fail-closed，不删除旧文件', () => {
+    let deletes = 0;
+    const r = verify(config([{ appId: APP, profileId: 'p1' }]), deps({
+      deleteRole: () => { deletes++; },
+      readRole: () => ({ kind: 'read-error', error: 'EACCES' }),
+    }), snapshot(''));
+    expect(r.ready).toBe(false);
+    expect(deletes).toBe(0);
+    expect(r.conflict).toContain('read-error');
+  });
+
+  it('team role 与 S0 快照一致才 ready；S0 后变化必须冲突', () => {
+    const cfg = config();
+    const same = verify(cfg, deps({ readTeamRole: () => 'team-v1' }), snapshot('你好', 'team-v1'));
+    expect(same.ready).toBe(true);
+    const changed = verify(cfg, deps({ readTeamRole: () => 'team-v2' }), snapshot('你好', 'team-v1'));
+    expect(changed.ready).toBe(false);
+    expect(changed.conflict).toContain('S0 后变化');
+  });
+
+  it('缺 S0 快照 → fail-closed，不代写角色', () => {
+    let writes = 0;
+    const r = verify(config([{ appId: APP, profileId: 'p1' }]), deps({ writeRole: () => { writes++; } }), undefined);
+    expect(r.ready).toBe(false);
+    expect(r.conflict).toContain('冻结快照');
+    expect(writes).toBe(0);
+  });
+});
+
+describe('gate roleReady + 队列骨架', () => {
+  it('markGateRoleReady 置 roleReady=true，revision+1', () => {
+    writeCollabGate(dataDir, buildInitialCollabGate({ initId: 'i', configVersion: 'cv', creatorAppId: APP, chatId: CHAT, participantAppIds: [APP] }));
+    const g = markGateRoleReady(dataDir, CHAT, APP)!;
+    expect(g.participants[APP].roleReady).toBe(true);
+    expect(g.revision).toBe(1);
+    expect(readCollabGate(dataDir, CHAT)!.participants[APP].roleReady).toBe(true);
+  });
+
+  it('队列同 (target, sourceMessageId) 去重', () => {
+    enqueueCollabChatItem(dataDir, CHAT, { sourceMessageId: 'om_1', targetAppId: APP, routingEvent: {}, deliveryStatus: 'pending', enqueuedAt: 1 });
+    const added = enqueueCollabChatItem(dataDir, CHAT, { sourceMessageId: 'om_1', targetAppId: APP, routingEvent: {}, deliveryStatus: 'pending', enqueuedAt: 2 });
+    expect(added).toBe(false);
+    expect(readCollabChatQueue(dataDir, CHAT, APP).items).toHaveLength(1);
+  });
+});

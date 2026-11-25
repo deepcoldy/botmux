@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { spawnSync, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -14,11 +14,13 @@ import {
 import {
   ensureHcCore,
   hcControlEnv,
+  hcCoreAddress,
   hcCorePaths,
   queryHcCoreStatus,
   type HcCorePaths,
   type HcCoreStatus,
 } from '../src/adapters/backend/hc/core.js';
+import { prepareHcSyncCore } from '../src/adapters/backend/hc/sync-rpc.js';
 import {
   HC_MIN_VERSION,
   compareHcVersion,
@@ -111,7 +113,10 @@ describe.skipIf(!realHc)('hc core and CLI operations against the real binary', (
     expect(existsSync(join(paths.configHome, 'herdr-core', 'config.toml'))).toBe(true);
     await expect(queryHcCoreStatus(paths.socket)).resolves.toMatchObject({ state: 'running', pid: first.pid });
 
-    const coreEnv = new Map(readFileSync(`/proc/${first.pid}/environ`, 'utf8').split('\0').filter(Boolean)
+    // `hc exec` runs with the core's environment on both Linux and macOS.
+    const result = hc(['exec', '--', '/usr/bin/env']);
+    expect(result.status, result.stderr).toBe(0);
+    const coreEnv = new Map(result.stdout.split('\n').filter(entry => entry.includes('='))
       .map(entry => [entry.slice(0, entry.indexOf('=')), entry.slice(entry.indexOf('=') + 1)]));
     expect(coreEnv.get('HC_SOCKET')).toBe(paths.socket);
     expect(coreEnv.get('XDG_CONFIG_HOME')).toBe(paths.configHome);
@@ -121,6 +126,15 @@ describe.skipIf(!realHc)('hc core and CLI operations against the real binary', (
     )).toEqual([]);
 
     await expect(ensureHcCore({ env })).resolves.toMatchObject({ pid: first.pid, started: false });
+  });
+
+  it.runIf(process.platform === 'darwin')('preserves a file obstructing the macOS socket before sync startup', () => {
+    const blocked = hcCorePaths({ ...env, SESSION_DATA_DIR: join(root, 'data'), XDG_RUNTIME_DIR: undefined });
+    mkdirSync(join(root, 'hc'));
+    writeFileSync(blocked.socket, 'keep this file');
+
+    expect(() => prepareHcSyncCore(hcCoreAddress(blocked), env)).toThrow(/非 socket/);
+    expect(readFileSync(blocked.socket, 'utf8')).toBe('keep this file');
   });
 
   it('lets several processes start the core at once and agree on it', async () => {

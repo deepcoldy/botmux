@@ -6168,7 +6168,39 @@ function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lo
         </div>
       </div>
       </AgentManagedLock>
+      {resolvePairedBackendId(bot.cliId, bot.backendType, bot.defaultBackendType) === 'hc' ? (
+        <HcHerdrTabsToggle bot={bot} patchBot={patchBot} />
+      ) : null}
     </section>
+  );
+}
+
+function HcHerdrTabsToggle({ bot, patchBot }: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  const save = (enabled: boolean) => saveBotField({
+    request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/hc-herdr-tabs`, { enabled }),
+    setStatus,
+    setBusy,
+    saved: tr('botDefaults.hcHerdrTabsSaved'),
+    errorText: res => configErrorText(res, tr),
+    onSaved: body => patchBot(bot.larkAppId, { hcHerdrTabs: body.hcHerdrTabs === true }),
+  });
+
+  return (
+    <>
+      <ToggleRow
+        checked={bot.hcHerdrTabs === true}
+        disabled={busy}
+        dataAction="toggle-hc-herdr-tabs"
+        title={tr('botDefaults.hcHerdrTabs')}
+        help={tr('botDefaults.hcHerdrTabsHelp')}
+        onChange={enabled => { void save(enabled); }}
+      />
+      <StatusSpan status={status} />
+    </>
   );
 }
 

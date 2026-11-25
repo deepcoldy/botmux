@@ -8,6 +8,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer, type Server } from 'node:net';
 import { dirname, join } from 'node:path';
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -50,8 +51,9 @@ let callLog: string;
 let saved: Partial<Record<(typeof ENV_KEYS)[number], string>>;
 let home: { hcSession: string; socket: string };
 let other: { hcSession: string; socket: string };
+let sockets: Server[];
 
-beforeEach(() => {
+beforeEach(async () => {
   // Unix socket paths are capped at 107 bytes; keep them out of a long TMPDIR.
   root = mkdtempSync('/tmp/bmhcp-');
   bin = join(root, 'herdr-core');
@@ -66,14 +68,21 @@ beforeEach(() => {
   home = { hcSession: 'botmux', socket: join(root, 'run', 'herdr-core', 'botmux.sock') };
   other = { hcSession: 'botmux', socket: join(root, 'run2', 'herdr-core', 'botmux.sock') };
   // Where the cores would listen: hc is never run for a core without a socket or a holder.
+  sockets = [];
   for (const core of [home, other]) {
     mkdirSync(dirname(core.socket), { recursive: true });
-    writeFileSync(core.socket, '');
+    const server = createServer(socket => socket.destroy());
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(core.socket, resolve);
+    });
+    sockets.push(server);
   }
   resetHcAvailabilityCache();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await Promise.all(sockets.map(server => new Promise<void>(resolve => server.close(() => resolve()))));
   for (const key of ENV_KEYS) {
     if (saved[key] === undefined) delete process.env[key];
     else process.env[key] = saved[key];
