@@ -5,7 +5,7 @@ import * as scheduleStore from '../services/schedule-store.js';
 import type { ScheduleOwner, ScheduleReasoningEffort } from '../services/schedule-store.js';
 import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
 import { checkTaskCalendar, manualCalendarCheck, normalizeCalendarBinding, normalizeCalendarDayType } from '../services/work-calendar.js';
-import { appendScheduleRunLog, removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
+import { appendScheduleRunLog, queryScheduleRunLogs, removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
 import type { ScheduledTaskPreconditionOutcome } from '../services/schedule-precondition-gate.js';
 import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
@@ -281,6 +281,21 @@ export function setScheduleFailureAlert(cb: ScheduleFailureAlert | null): void {
   failureAlert = cb;
 }
 
+export type ParkedRunCancellationHandler = (task: ScheduledTask, runId: string) => void;
+let parkedRunCancellationHandler: ParkedRunCancellationHandler | null = null;
+export function setParkedRunCancellationHandler(cb: ParkedRunCancellationHandler | null): void {
+  parkedRunCancellationHandler = cb;
+}
+
+function notifyParkedRunCancelled(task: ScheduledTask, runId: string): void {
+  if (!parkedRunCancellationHandler) return;
+  try {
+    parkedRunCancellationHandler(task, runId);
+  } catch (error) {
+    logger.warn(`[scheduler] Parked-run cancellation failed for ${task.id}/${runId}: ${String(error)}`);
+  }
+}
+
 function emitFailureAlertIfNeeded(
   task: ScheduledTask,
   result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number },
@@ -374,8 +389,8 @@ function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
   if (!runtimeTask(task.id, task.larkAppId)) cleanupRemovedTaskSidecars(task);
 }
 
-function markRuntimeSkipped(id: string, nextRunAt: string | undefined, runId: string): void {
-  const before = runtimeTask(id);
+function markRuntimeSkipped(id: string, nextRunAt: string | undefined, runId: string, appId?: string): void {
+  const before = runtimeTask(id, appId);
   if (!authorityStore) {
     scheduleStore.markSkipped(id, nextRunAt, runId);
   } else {
@@ -387,7 +402,7 @@ function markRuntimeSkipped(id: string, nextRunAt: string | undefined, runId: st
         deferredRun: undefined,
         runStats: recordRunOutcome(task.runStats, 'skipped'),
         ...(task.parsed.kind === 'once' ? { nextRunAt } : {}) }, runId, Date.now());
-    });
+    }, appId);
   }
   notifyAfterSettle(before, id);
 }
@@ -466,6 +481,10 @@ function recordRuntimeCalendarCheck(
 function runHasTerminalOutcome(task: ScheduledTask | undefined, runId: string): boolean {
   return task?.lastRunId === runId
     && (task.lastStatus === 'ok' || task.lastStatus === 'error' || task.lastStatus === 'skipped');
+}
+
+function runOutcomeStale(task: ScheduledTask | undefined, runId: string): boolean {
+  return !task || task.lastRunId !== runId || runHasTerminalOutcome(task, runId);
 }
 
 function markRuntimeRun(
@@ -551,6 +570,45 @@ function markRuntimeRun(
   return result;
 }
 
+function appendAcceptedRunLogOnce(
+  task: ScheduledTask,
+  context: ScheduleExecutionContext,
+  deferred: ScheduledTask['deferredRun'],
+): void {
+  const scope = task.larkAppId ?? scheduleStore.getScheduleScope();
+  if (!scope) return;
+  try {
+    // The daemon callback logs ordinary completions before this settlement.
+    // The tick fast path reaches the same settlement without that callback.
+    // Reading the retained ids makes both paths exactly-once, including a
+    // restart after a successful log append but before the task-state write.
+    const alreadyLogged = queryScheduleRunLogs(task.id, { limit: 100 }, scope).logs
+      .some(entry => entry.id === context.runId);
+    if (alreadyLogged) return;
+    const acceptedChatIds = Object.keys(deferred?.acceptedTargets ?? {});
+    const targetResults = acceptedChatIds.length > 1
+      ? acceptedChatIds.map(chatId => ({ chatId, outcome: 'model_dispatched' as const }))
+      : undefined;
+    const startedAt = deferred?.since ?? context.startedAt;
+    const finishedAt = new Date().toISOString();
+    appendScheduleRunLog({
+      id: context.runId,
+      taskId: task.id,
+      trigger: context.trigger,
+      outcome: 'model_dispatched',
+      precondition: deferred?.precondition ?? 'not_checked',
+      startedAt,
+      finishedAt,
+      durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt)),
+      additionalPrompt: !!deferred?.additionalPrompt,
+      calendarCheck: task.lastCalendarCheck,
+      ...(targetResults ? { targetResults } : {}),
+    }, scope);
+  } catch (error) {
+    logger.warn(`[scheduler] Accepted run log unavailable for ${task.id}/${context.runId}: ${String(error)}`);
+  }
+}
+
 function recordDispatchOutcome(
   task: ScheduledTask,
   context: ScheduleExecutionContext,
@@ -615,6 +673,7 @@ function recordDispatchOutcome(
     markRuntimeSkipped(task.id, nextRunAt, context.runId);
   } else {
     markRuntimeRun(task.id, true, undefined, undefined, context.runId);
+    appendAcceptedRunLogOnce(task, context, current?.deferredRun);
     cleanupIfTaskWasAutoRemoved(task);
   }
   dashboardEventBus.publish({
@@ -820,6 +879,7 @@ export function settleParkedRunOnce(
   // settlement effects here. The exact-run check above and markRuntimeRun's
   // guard make this a no-op rather than emitting a false failure for it.
   if (settled && (settled.lastRunId !== runId || settled.deferredRun?.runId === runId)) return false;
+  notifyParkedRunCancelled(before, runId);
   if (!settled) return true;
   if (result.crossedFailureThreshold) {
     emitFailureAlertIfNeeded(settled, result);
@@ -862,6 +922,33 @@ export function settleParkedRunOnce(
   return true;
 }
 
+/**
+ * Operator cancellation is not an operational failure. Settle the exact parked
+ * run before closing its worker so the resulting exit cannot turn a deliberate
+ * pause/delete/done into a failed occurrence. Fully accepted work still earns
+ * its normal successful settlement; unaccepted work is skipped without repeat
+ * consumption or a failure alert. Cancellation always reaches the daemon, even
+ * when a projection write fails.
+ */
+function cancelParkedRunForOperator(task: ScheduledTask, runId: string): void {
+  try {
+    const current = runtimeTask(task.id, task.larkAppId);
+    const deferred = current?.deferredRun;
+    if (!current || !deferred || deferred.runId !== runId) return;
+    if (deferredRunFullyAccepted(deferred)) {
+      recordDispatchOutcome(current, {
+        runId,
+        trigger: 'dashboard',
+        startedAt: deferred.since,
+      }, 'executed');
+    } else {
+      markRuntimeSkipped(task.id, current.nextRunAt, runId, task.larkAppId);
+    }
+  } finally {
+    notifyParkedRunCancelled(task, runId);
+  }
+}
+
 /** Persist `dispatching` immediately before the target's IPC send. A crash in
  *  this state becomes `ambiguous` on restart (never auto-replayed).
  *
@@ -875,11 +962,14 @@ export function markDeferredTargetDispatching(
   chatId: string,
   turnId: string,
   appId?: string,
+  details: { additionalPrompt?: string; precondition?: 'none' | 'disabled' | 'passed' } = {},
 ): boolean {
   let changed = false;
   try {
     mutateRuntimeTask(id, task => {
       if (task.lastRunId !== runId) return;
+      if ((task.lastStatus !== 'running' && task.lastStatus !== 'deferred')
+        || runHasTerminalOutcome(task, runId)) return;
       const existing = task.deferredRun?.runId === runId ? task.deferredRun : undefined;
       const targets: Record<string, ScheduleDeferredTargetState> = existing
         ? { ...existing.targets }
@@ -898,8 +988,10 @@ export function markDeferredTargetDispatching(
           since: existing?.since ?? new Date().toISOString(),
           reason: 'traex_runtime',
           detail: existing?.detail ?? 'managed TRAE runtime handoff',
-          ...(existing?.additionalPrompt ? { additionalPrompt: existing.additionalPrompt } : {}),
-          ...(existing?.precondition ? { precondition: existing.precondition } : {}),
+          ...(details.additionalPrompt ?? existing?.additionalPrompt
+            ? { additionalPrompt: details.additionalPrompt ?? existing?.additionalPrompt } : {}),
+          ...(details.precondition ?? existing?.precondition
+            ? { precondition: details.precondition ?? existing?.precondition } : {}),
           retryAt: existing?.retryAt ?? new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
           targets,
           ...(existing?.heldTargets && Object.keys(existing.heldTargets).length > 0
@@ -1124,6 +1216,10 @@ export function claimDeferredRunForDispatch(
   let result: { ok: true; task: ScheduledTask } | { ok: false; error: string } =
     { ok: false, error: 'not_deferred' };
   mutateRuntimeTask(id, task => {
+    if (runHasTerminalOutcome(task, runId)) {
+      result = { ok: false, error: 'not_deferred' };
+      return;
+    }
     if (task.lastStatus === 'running') {
       result = { ok: false, error: 'already_running' };
       return;
@@ -1146,7 +1242,9 @@ export function claimDeferredRunForDispatch(
       ? overlayDeferredContext(claimed, task.deferredRun.context)
       : claimed;
     result = { ok: true, task: { ...restored, manualRunRequested } };
-    return restored;
+    // Frozen context is for the OUTBOUND retry only. Persisting it would roll
+    // back human edits and erase runtime-materialized roots in the authority row.
+    return claimed;
   }, appId);
   return result;
 }
@@ -1609,6 +1707,17 @@ async function tick(): Promise<void> {
     // once. It reuses the stored runId so a retry cannot mint a second run.
     if (task.deferredRun) {
       const deferred = task.deferredRun;
+      // Acceptance is already terminal evidence even if a human paused or
+      // completed the task during the settlement window. Finish that run once
+      // before considering timeout, without dispatching anything new.
+      if (deferredRunFullyAccepted(deferred)) {
+        recordDispatchOutcome(task, {
+          runId: deferred.runId,
+          trigger: 'scheduler',
+          startedAt: deferred.since,
+        }, 'executed');
+        continue;
+      }
       // Single bounded exit: a handoff that never clears must not leave the
       // occurrence parked forever with no settlement and no alert.
       const since = Date.parse(deferred.since);
@@ -1794,10 +1903,11 @@ function runClaimedExecution(
     executeCallback(claimedTask, executionContext)
       .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
       .catch(err => {
-        if (runHasTerminalOutcome(runtimeTask(taskId), executionContext.runId)) return;
+        if (runOutcomeStale(runtimeTask(taskId), executionContext.runId)) return;
         logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
         const runResult = markRuntimeRun(taskId, false, err.message, undefined, executionContext.runId);
         const freshTask = runtimeTask(taskId) ?? claimedTask;
+        if (freshTask.lastStatus === 'deferred') return;
         emitFailureAlertIfNeeded(freshTask, runResult);
         cleanupIfTaskWasAutoRemoved(claimedTask);
         dashboardEventBus.publish({
@@ -2259,10 +2369,13 @@ export function removeTask(id: string): boolean {
   const removed = appId && authorityStore?.isInitialized(appId)
     ? authorityStore.revoke(appId, id)
     : scheduleStore.removeTask(id);
+  if (removed && task.deferredRun) cancelParkedRunForOperator(task, task.deferredRun.runId);
   if (removed && appId && authorityStore?.isInitialized(appId)) {
     scheduleStore.removeAuthoritativeTaskProjection(id, appId);
   }
-  if (removed) cleanupRemovedTaskSidecars(task);
+  if (removed) {
+    cleanupRemovedTaskSidecars(task);
+  }
   return removed;
 }
 
@@ -2291,10 +2404,12 @@ export function disableTask(id: string): boolean {
   if (!task) return false;
   if (!authorityStore) {
     scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual', manualRunRequested: undefined });
+    if (task.deferredRun) cancelParkedRunForOperator(task, task.deferredRun.runId);
     return true;
   }
   mutateRuntimeTask(id, current => ({ ...current,
     enabled: false, disabledReason: 'manual', manualRunRequested: undefined, manualRunAuthorization: undefined }));
+  if (task.deferredRun) cancelParkedRunForOperator(task, task.deferredRun.runId);
   return true;
 }
 
@@ -2416,6 +2531,7 @@ export function completeTask(id: string, note?: string): {
   if (!outcome) return { ok: false, error: 'not_found' };
   if (!outcome.ok) return { ok: false, error: outcome.error };
   if (!outcome.replay) {
+    if (task.deferredRun) cancelParkedRunForOperator(task, task.deferredRun.runId);
     logger.info(`[scheduler] Task "${task.name}" (${task.id}) marked done`);
     dashboardEventBus.publish({
       type: 'schedule.updated',
@@ -2526,9 +2642,10 @@ function dispatchClaimedRun(
   void Promise.resolve().then(() => executeCallback!(claimedTask, executionContext)).then(
     outcome => recordDispatchOutcome(claimedTask, executionContext, outcome),
     err => {
-      if (runHasTerminalOutcome(runtimeTask(claimedTask.id), executionContext.runId)) return;
+      if (runOutcomeStale(runtimeTask(claimedTask.id), executionContext.runId)) return;
       const msg = err instanceof Error ? err.message : String(err);
       const runResult = markRuntimeRun(claimedTask.id, false, msg, undefined, executionContext.runId);
+      if (runtimeTask(claimedTask.id)?.lastStatus === 'deferred') return;
       emitFailureAlertIfNeeded(runtimeTask(claimedTask.id) ?? claimedTask, runResult);
       cleanupIfTaskWasAutoRemoved(claimedTask);
       dashboardEventBus.publish({
@@ -2550,7 +2667,10 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
   if (!task) return { ok: false, error: 'not_found' };
   if (task.enabled === enabled
     && (enabled || (task.disabledReason === 'manual' && !task.manualRunRequested
-      && !task.manualRunAuthorization))) return { ok: true };
+      && !task.manualRunAuthorization))) {
+    if (!enabled && task.deferredRun) cancelParkedRunForOperator(task, task.deferredRun.runId);
+    return { ok: true };
+  }
   if (enabled && isUntilDoneClosed(task)) return { ok: false, error: 'schedule_until_done_closed' };
   if (enabled) {
     const next = untilDoneResumeNextRunAt(task, Date.now()) ?? computeNextRun(task.parsed);
@@ -2570,6 +2690,7 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
       mutateRuntimeTask(id, current => ({ ...current,
         enabled: false, disabledReason: 'manual', manualRunRequested: undefined, manualRunAuthorization: undefined }));
     }
+    if (task.deferredRun) cancelParkedRunForOperator(task, task.deferredRun.runId);
   }
   dashboardEventBus.publish({
     type: 'schedule.updated',
@@ -2886,7 +3007,7 @@ export function updateTask(
     // one-shot rule written mid-run would be consumed by the old recurring
     // run, and an until-done settle would overwrite the new nextRunAt. Ask
     // the caller to wait for the run to finish instead.
-    if (task.lastStatus === 'running') return { ok: false, error: 'schedule_run_in_flight' };
+    if (task.lastStatus === 'running' || task.deferredRun) return { ok: false, error: 'schedule_run_in_flight' };
     // A one-shot time already past would leave an enabled task that never fires.
     if (parsed.kind === 'once' && computeNextRun(parsed) === null) {
       return { ok: false, error: 'schedule_in_past' };

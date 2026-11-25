@@ -18,6 +18,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import ts from 'typescript';
 import { isStructuredBridgeLifecycleBlockingCli } from '../src/services/structured-bridge-clis.js';
+import { isOrdinaryImTurnId } from '../src/core/ordinary-im-turn.js';
+import { InputTurnDeduper } from '../src/core/input-turn-dedupe.js';
 import { handoffQueuedDurableInputsOnBackendExit, terminalReleasesDurableTurn } from '../src/utils/pending-input-queue.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 
@@ -76,10 +78,22 @@ function harness(cliId = 'pi', backendType = 'pty') {
     turnFailedWithoutOutput: () => false, recoverDeferredPromptReadyAtTurnTerminal: vi.fn(),
     log: vi.fn(), send: vi.fn((terminal: Terminal) => terminals.push(terminal)),
     parkCrashDiagnosticTerminal: vi.fn(),
-    traexRuntimeLease: undefined, traexLeaseRunning: false,
+    applyWorkerLaunchModel: vi.fn(), respawnConfigPatchFromMessage: vi.fn(() => ({})),
+    applyRespawnConfigPatch: vi.fn(), isOrdinaryImTurnId,
+    activeTurnBlocks: () => false,
+    activeTurnAuthority: { snapshot: () => undefined, beginTurn: vi.fn() },
+    usageLimitTracker: { beginTurn: () => 0 },
+    currentUsageLimitSnapshot: () => ({}),
+    rememberTurnLinkRefMode: vi.fn(),
+    traexRuntimeLeaseContext: undefined, traexSpawnLeaseContext: undefined,
     pendingTraexSpawnAbandon: undefined, stopTraexLeaseHeartbeat: vi.fn(),
   };
   scope.killCli = vi.fn(() => { scope.backend = null; scope.isPromptReady = false; });
+  scope.ordinaryImTurnDedupe = new InputTurnDeduper(256);
+  scope.acknowledgeTurnInputReceived = vi.fn();
+  scope.receiveOrdinaryImTurn = loadWorkerFunction('receiveOrdinaryImTurn', scope);
+  scope.acknowledgeTurnInputCommitted = loadWorkerFunction('acknowledgeTurnInputCommitted', scope);
+  scope.sendToPty = loadWorkerFunction('sendToPty', scope);
   scope.spawnCli = vi.fn(async () => { scope.backend = { destroySession: vi.fn() }; });
   scope.emitTurnTerminal = loadWorkerFunction('emitTurnTerminal', scope);
   scope.stopStartupFailedInputs = loadWorkerFunction('stopStartupFailedInputs', scope);
@@ -511,5 +525,43 @@ describe('native startup evidence and real backend exit classification', () => {
     h.transcript([{ kind: proof }]);
     await vi.advanceTimersByTimeAsync(40_000);
     expect(h.classification()).toBe(false);
+  });
+});
+
+describe('pre-ready input receipts', () => {
+  it('does not acknowledge a queued message as committed before init materializes', async () => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = false;
+    await loadWorkerMessageHandler('message', h.scope)({
+      type: 'message', content: 'pre-ready', turnId: 'om_pre_ready',
+    });
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(h.scope.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'turn_input_committed', turnId: 'om_pre_ready',
+    }));
+  });
+
+  it.each([false, true])('settles only the exiting backend lease when a replacement is current (running=%s)', running => {
+    const h = exitHarness('traex');
+    const oldLease = { release: vi.fn(async () => {}), abandon: vi.fn(async () => {}) };
+    const newLease = { release: vi.fn(async () => {}), abandon: vi.fn(async () => {}) };
+    const oldContext = { lease: oldLease, running, settled: false, heartbeat: undefined, abandon: vi.fn() };
+    const newContext = { lease: newLease, running: false, settled: false, heartbeat: undefined, abandon: vi.fn() };
+    h.scope.traexSpawnLeaseContext = oldContext;
+    h.scope.traexRuntimeLeaseContext = newContext;
+    h.scope.pendingTraexSpawnAbandon = newContext.abandon;
+    h.scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', h.scope);
+    const replacement = { name: 'replacement' };
+    h.scope.observedBackend = { name: 'old' };
+    h.scope.backend = replacement;
+
+    h.onExit(0);
+    expect(oldLease.release).toHaveBeenCalledTimes(running ? 1 : 0);
+    expect(oldLease.abandon).toHaveBeenCalledTimes(running ? 0 : 1);
+    expect(newLease.release).not.toHaveBeenCalled();
+    expect(newLease.abandon).not.toHaveBeenCalled();
+    expect(h.scope.traexRuntimeLeaseContext).toBe(newContext);
+    expect(h.scope.pendingTraexSpawnAbandon).toBe(newContext.abandon);
+    expect(h.scope.backend).toBe(replacement);
   });
 });

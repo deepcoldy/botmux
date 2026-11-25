@@ -376,9 +376,17 @@ export function scrubSessionCliHomeEnv(env: NodeJS.ProcessEnv): void {
  * REDACTED_CHILD_ENV_KEYS so a server botmux bootstraps can never seed them
  * into its global env either.
  */
+export const TRAEX_OCCUPANT_ID_ENV_KEY = 'BOTMUX_TRAEX_OCCUPANT_ID';
+export const TRAEX_DOMAIN_KEY_ENV_KEY = 'BOTMUX_TRAEX_DOMAIN_KEY';
+export const TRAEX_SNAPSHOT_DIR_ENV_KEY = 'BOTMUX_TRAEX_SNAPSHOT_DIR';
+
 export const BOTMUX_INJECTED_ENV_KEYS = [
   '__OWNER_OPEN_ID',
   'BOTMUX',
+  'BOTMUX_TRAEX_OCCUPANT_ID',
+  'BOTMUX_TRAEX_DOMAIN_KEY',
+  'BOTMUX_TRAEX_SNAPSHOT_DIR',
+  'TRAEX_CODE_MODE_HOST_PATH',
   // Trusted runtime wrapper root, refreshed by the worker after env scrubbing.
   'BOTMUX_WRAPPER_BIN',
   // Per-launch Aiden Codex shim configuration. Forward only into the owning
@@ -603,6 +611,8 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
 export const SESSION_TURN_MARKER_ENV_KEYS = [
   // "Runs inside botmux" pane marker; pane wrapper injects it per session.
   'BOTMUX',
+  'BOTMUX_TRAEX_OCCUPANT_ID',
+  'BOTMUX_TRAEX_DOMAIN_KEY',
   // Turn/session routing identity (worker-injected per pane/turn).
   'BOTMUX_SESSION_ID',
   'BOTMUX_CHAT_ID',

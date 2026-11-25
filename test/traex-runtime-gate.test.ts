@@ -6,16 +6,21 @@
  */
 import {
   chmodSync,
+  copyFileSync,
+  appendFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
@@ -30,9 +35,11 @@ import {
   readTraexRuntimeOccupants,
   releaseTraexRuntime,
   markTraexRuntimeRunning,
+  markTraexRuntimeUnknown,
   type TraexRuntimeOccupant,
 } from '../src/services/traex-runtime-registry.js';
-import { readProcessStartIdentity } from '../src/utils/process-identity.js';
+import { readProcessStartIdentity, findProcessesRunningUnder } from '../src/utils/process-identity.js';
+import { standaloneSleep } from './helpers/standalone-sleep.js';
 import { resolveInstallIdentity } from '../src/services/cli-install-identity.js';
 import {
   captureTraexReleaseIdentity,
@@ -43,6 +50,7 @@ import {
 import {
   acquireTraexRuntimeLease,
   acquireTraexRuntimeOccupancy,
+  applyTraexRuntimeOwnershipEnv,
   captureTraexRunningContentIdentity,
   computeTraexInstallSignature,
   precheckTraexRuntime,
@@ -50,6 +58,7 @@ import {
 } from '../src/services/traex-runtime-gate.js';
 
 const dirs: string[] = [];
+const children: ChildProcess[] = [];
 const rootIgnoresWritePermissionBits = process.geteuid?.() === 0;
 
 function tempDir(prefix: string): string {
@@ -71,10 +80,36 @@ function traeHome(): string {
   return tempDir('botmux-traex-home-');
 }
 
+const sleepBin = standaloneSleep();
+function realRelease(version = 'a'): string {
+  const dir = tempDir('botmux-traex-real-release-');
+  if (!sleepBin.path) throw new Error('standalone sleep unavailable');
+  copyFileSync(sleepBin.path, join(dir, 'traex'));
+  chmodSync(join(dir, 'traex'), 0o755);
+  writeFileSync(join(dir, 'traex-code-mode-host'), `helper-${version}`);
+  writeFileSync(join(dir, 'trae-installation.json'), JSON.stringify({ version }));
+  return dir;
+}
+
+function exited(child: ChildProcess): Promise<void> {
+  return new Promise(resolve => {
+    if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    child.once('exit', () => resolve());
+    child.kill('SIGKILL');
+  });
+}
+
 beforeEach(() => {
   __testOnly_resetTraexSnapshotCache();
 });
-afterEach(() => {
+afterEach(async () => {
+  for (const child of children.splice(0)) {
+    if (child.exitCode !== null || child.signalCode !== null) continue;
+    await new Promise<void>(resolve => {
+      child.once('exit', () => resolve());
+      child.kill('SIGKILL');
+    });
+  }
   for (const dir of dirs.splice(0)) {
     try { chmodSync(dir, 0o755); } catch { /* best effort */ }
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -687,5 +722,264 @@ describe('acquireTraexRuntimeLease', () => {
     const bare = tempDir('botmux-traex-release-');
     writeFileSync(join(bare, 'traex'), 'only-main');
     expect(computeTraexInstallSignature(bare)).toContain('-|-');
+  });
+});
+
+describe('runtime registry lifecycle regressions', () => {
+  function testDomain(home: string) {
+    const resolution = resolveTraexRuntimeDomain(home);
+    if (resolution.kind !== 'ready') throw new Error('domain unavailable');
+    return resolution.domain;
+  }
+
+  it('keeps no-PID starting and recovers legacy draining within the orphan grace', async () => {
+    const home = traeHome();
+    const domain = testDomain(home);
+    const snapshotDir = tempDir('botmux-traex-empty-');
+    await acquireTraexRuntimeStart(domain, {
+      occupantId: 'starting', comboKey: 'content-old', snapshotDir,
+      workerPid: 2_000_000_000, daemonPid: 2_000_000_000, now: Date.now() - 11 * 60_000,
+    });
+    expect(await releaseTraexRuntime(domain, 'starting', { requireCliGone: true })).toBe(false);
+    expect(readTraexRuntimeOccupants(domain)?.[0]?.phase).toBe('starting');
+    expect(precheckTraexRuntime({ traeHome: home, releaseDir: snapshotDir }).state).toBe('free');
+
+    const legacyHome = traeHome();
+    const legacyDomain = testDomain(legacyHome);
+    const legacyRelease = tempDir('botmux-traex-legacy-release-');
+    await acquireTraexRuntimeStart(legacyDomain, {
+      occupantId: 'legacy-draining', comboKey: '', force: true, occupancyOnly: true,
+      traexPath: legacyRelease, workerPid: 2_000_000_000, daemonPid: 2_000_000_000,
+      now: Date.now() - 31 * 60_000,
+    });
+    const registryPath = legacyDomain.registryPath;
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+    registry.occupants[0].phase = 'draining';
+    writeFileSync(registryPath, JSON.stringify(registry));
+    expect(precheckTraexRuntime({ traeHome: legacyHome, releaseDir: legacyRelease }).state).toBe('free');
+  });
+
+  it('uses the custom executable identity for precheck and lease registration', async () => {
+    const home = traeHome();
+    const dir = release('custom');
+    const executablePath = join(dir, 'custom-traex');
+    writeFileSync(executablePath, 'custom-main');
+    const signature = computeTraexInstallSignature(dir, executablePath);
+    const identity = await captureTraexReleaseIdentity(dir, executablePath);
+    expect(signature).toBe(identity.sourceSignature);
+    const lease = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: dir, executablePath,
+      workerPid: process.pid, daemonPid: process.pid,
+      snapshotsRoot: tempDir('botmux-traex-snapshots-'),
+    });
+    expect(lease.kind).toBe('granted');
+    expect(precheckTraexRuntime({ traeHome: home, releaseDir: dir, executablePath }).state).toBe('compatible');
+    writeFileSync(executablePath, 'changed-main');
+    expect(precheckTraexRuntime({ traeHome: home, releaseDir: dir, executablePath }).state).toBe('blocked');
+  });
+
+  it('clears a stale cliStart whenever a new attach lacks a birth token, even for the same PID', async () => {
+    const domain = testDomain(traeHome());
+    await acquireTraexRuntimeStart(domain, {
+      occupantId: 'pid-change', comboKey: 'content-a', cliPid: 2_000_000_000, cliStart: 'stale-birth',
+      workerPid: process.pid, daemonPid: process.pid,
+    });
+    await markTraexRuntimeRunning(domain, 'pid-change', { cliPid: process.pid });
+    let occupant = readTraexRuntimeOccupants(domain)![0];
+    expect(occupant.cliStart).toBeUndefined();
+    expect(occupantLiveness(occupant)).toBe('alive');
+
+    await markTraexRuntimeUnknown(domain, 'pid-change', { cliPid: process.pid });
+    occupant = readTraexRuntimeOccupants(domain)![0];
+    expect(occupant.cliStart).toBeUndefined();
+    expect(occupantLiveness(occupant)).toBe('alive');
+
+    await markTraexRuntimeRunning(domain, 'pid-change', { cliPid: process.pid, cliStart: 'new-birth' });
+    expect(readTraexRuntimeOccupants(domain)![0].cliStart).toBe('new-birth');
+    // The PID may have been reused since that token was captured. A later
+    // attach without fresh birth evidence must not keep the old identity.
+    await markTraexRuntimeRunning(domain, 'pid-change', { cliPid: process.pid });
+    occupant = readTraexRuntimeOccupants(domain)![0];
+    expect(occupant.cliStart).toBeUndefined();
+    expect(occupantLiveness(occupant)).toBe('alive');
+  });
+
+  it.each(['complete', 'manifest', 'drift', 'helper'] as const)('republishes a corrupted snapshot after %s', async mode => {
+    const dir = release('a');
+    const snapshotsRoot = tempDir('botmux-traex-snapshots-');
+    const snapshot = await materializeTraexSnapshot({ releaseDir: dir, snapshotsRoot });
+    if (mode === 'complete') unlinkSync(join(snapshot.dir, '.complete'));
+    else if (mode === 'manifest') writeFileSync(join(snapshot.dir, 'manifest.json'), '{broken');
+    else if (mode === 'drift') writeFileSync(snapshot.traexPath, 'drifted-content-longer');
+    else unlinkSync(snapshot.helperPath!);
+    const repaired = await materializeTraexSnapshot({ releaseDir: dir, snapshotsRoot });
+    expect(readFileSync(repaired.traexPath, 'utf8')).toBe('traex-a');
+    expect(repaired.manifest.verified).toBe(true);
+  });
+
+  it.skipIf(!sleepBin.path)('blocks snapshot repair while a writer lives and resumes after exit', async () => {
+    const dir = realRelease();
+    const snapshotsRoot = tempDir('botmux-traex-snapshots-');
+    const snapshot = await materializeTraexSnapshot({ releaseDir: dir, snapshotsRoot });
+    writeFileSync(join(snapshot.dir, 'manifest.json'), '{broken');
+    const child = spawn(snapshot.traexPath, ['60']);
+    children.push(child);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await expect(materializeTraexSnapshot({ releaseDir: dir, snapshotsRoot }))
+      .rejects.toThrow('live writer');
+    await exited(child);
+    const repaired = await materializeTraexSnapshot({ releaseDir: dir, snapshotsRoot });
+    expect(repaired.manifest.verified).toBe(true);
+  });
+
+  it.skipIf(!sleepBin.path)('restores a quarantined snapshot when an outstanding lease execs during repair', async () => {
+    const dir = realRelease();
+    const snapshotsRoot = tempDir('botmux-traex-snapshots-');
+    const snapshot = await materializeTraexSnapshot({ releaseDir: dir, snapshotsRoot });
+    const originalSize = statSync(snapshot.traexPath).size;
+    appendFileSync(snapshot.traexPath, 'DRIFTED-OLD-IMAGE');
+    let child: ChildProcess | undefined;
+    await expect(materializeTraexSnapshot({
+      releaseDir: dir,
+      snapshotsRoot,
+      __testOnly_beforeQuarantine: async () => {
+        // This lease was admitted before the repair. It execs after the first
+        // live-writer scan but before finalDir is quarantined.
+        child = spawn(snapshot.traexPath, ['60']);
+        children.push(child);
+        for (let i = 0; i < 200; i++) {
+          if ((findProcessesRunningUnder(snapshot.dir) ?? []).includes(child.pid!)) break;
+          await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        expect(findProcessesRunningUnder(snapshot.dir)).toContain(child.pid);
+      },
+    })).rejects.toThrow('exec during quarantine');
+    expect(existsSync(snapshot.dir)).toBe(true);
+    expect(findProcessesRunningUnder(snapshot.dir)).toContain(child!.pid);
+    expect(child!.exitCode).toBeNull();
+    await exited(child!);
+    const repaired = await materializeTraexSnapshot({ releaseDir: dir, snapshotsRoot });
+    expect(statSync(repaired.traexPath).size).toBe(originalSize);
+    expect(repaired.manifest.verified).toBe(true);
+  });
+
+  it.skipIf(!sleepBin.path)('scans deleted directories for live and deleted executables', async () => {
+    const snapshot = await materializeTraexSnapshot({
+      releaseDir: realRelease(), snapshotsRoot: tempDir('botmux-traex-snapshots-'),
+    });
+    const child = spawn(snapshot.traexPath, ['60']);
+    children.push(child);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    rmSync(snapshot.dir, { recursive: true, force: true });
+    expect(findProcessesRunningUnder(snapshot.dir)).toContain(child.pid);
+    expect(findProcessesRunningUnder(join(snapshot.dir, 'missing'))).toEqual([]);
+    await exited(child);
+  });
+});
+
+describe('runtime ownership and process identity', () => {
+  it('stamps coordinated leases and clears stale ownership for private/occupancy leases', async () => {
+    const home = traeHome();
+    const coordinated = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: release('a'), workerPid: process.pid, daemonPid: process.pid,
+      snapshotsRoot: tempDir('botmux-traex-snapshots-'),
+    });
+    expect(coordinated.kind).toBe('granted');
+    if (coordinated.kind !== 'granted') return;
+    const env: NodeJS.ProcessEnv = {
+      BOTMUX_TRAEX_OCCUPANT_ID: 'stale-occupant', BOTMUX_TRAEX_DOMAIN_KEY: 'stale-domain',
+    };
+    applyTraexRuntimeOwnershipEnv(env, coordinated.lease);
+    expect(env).toMatchObject({
+      BOTMUX_TRAEX_OCCUPANT_ID: coordinated.lease.occupantId,
+      BOTMUX_TRAEX_DOMAIN_KEY: coordinated.lease.domain.domainKey,
+    });
+
+    const privateLease = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: release('a'), coordinate: false,
+      workerPid: process.pid, daemonPid: process.pid,
+      snapshotsRoot: tempDir('botmux-traex-snapshots-'),
+    });
+    expect(privateLease.kind).toBe('granted');
+    if (privateLease.kind !== 'granted') return;
+    applyTraexRuntimeOwnershipEnv(env, privateLease.lease);
+    expect(env.BOTMUX_TRAEX_OCCUPANT_ID).toBeUndefined();
+    expect(env.BOTMUX_TRAEX_DOMAIN_KEY).toBeUndefined();
+
+    const occupancy = await acquireTraexRuntimeOccupancy({
+      traeHome: home, releaseDir: release('a'), existingRuntime: true,
+      workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(occupancy.kind).toBe('granted');
+    if (occupancy.kind !== 'granted') return;
+    env.BOTMUX_TRAEX_OCCUPANT_ID = 'stale-occupant';
+    env.BOTMUX_TRAEX_DOMAIN_KEY = 'stale-domain';
+    applyTraexRuntimeOwnershipEnv(env, occupancy.lease);
+    expect(env.BOTMUX_TRAEX_OCCUPANT_ID).toBeUndefined();
+    expect(env.BOTMUX_TRAEX_DOMAIN_KEY).toBeUndefined();
+  });
+
+  it.skipIf(!sleepBin.path)('isolates live writers by occupant and domain instead of snapshot path', async () => {
+    const home = traeHome();
+    const snapshotsRoot = tempDir('botmux-traex-snapshots-');
+    const first = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: realRelease(), workerPid: 2_000_000_000, daemonPid: process.pid,
+      snapshotsRoot, now: () => Date.now() - 11 * 60_000,
+    });
+    expect(first.kind).toBe('granted');
+    if (first.kind !== 'granted') return;
+    const own = spawn(first.lease.snapshot.traexPath, ['60'], {
+      env: {
+        ...process.env,
+        BOTMUX_TRAEX_OCCUPANT_ID: first.lease.occupantId,
+        BOTMUX_TRAEX_DOMAIN_KEY: first.lease.domain.domainKey,
+      },
+    });
+    const other = spawn(first.lease.snapshot.traexPath, ['60'], {
+      env: {
+        ...process.env,
+        BOTMUX_TRAEX_OCCUPANT_ID: 'other-occupant', BOTMUX_TRAEX_DOMAIN_KEY: 'other-domain',
+      },
+    });
+    children.push(own, other);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const next = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: realRelease('b'), workerPid: process.pid, daemonPid: process.pid,
+      snapshotsRoot,
+    });
+    expect(next.kind).toBe('blocked');
+
+    await exited(own);
+    const admitted = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: realRelease('b'), workerPid: process.pid, daemonPid: process.pid,
+      snapshotsRoot,
+    });
+    expect(other.exitCode).toBeNull();
+    expect(admitted.kind).toBe('granted');
+  });
+
+  it.skipIf(!sleepBin.path)('keeps writers whose descendants scrubbed ownership markers', async () => {
+    const home = traeHome();
+    const snapshotsRoot = tempDir('botmux-traex-snapshots-');
+    const first = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: realRelease(), workerPid: 2_000_000_000, daemonPid: process.pid,
+      snapshotsRoot, now: () => Date.now() - 11 * 60_000,
+    });
+    expect(first.kind).toBe('granted');
+    if (first.kind !== 'granted') return;
+    const child = spawn(first.lease.snapshot.traexPath, ['60'], {
+      env: { PATH: process.env.PATH ?? '', HOME: home },
+    });
+    children.push(child);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    expect(findProcessesRunningUnder(first.lease.snapshot.dir, {
+      occupantId: first.lease.occupantId,
+      domainKey: first.lease.domain.domainKey,
+    })).toContain(child.pid);
+    const next = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: realRelease('b'), workerPid: process.pid, daemonPid: process.pid,
+      snapshotsRoot,
+    });
+    expect(next.kind).toBe('blocked');
   });
 });

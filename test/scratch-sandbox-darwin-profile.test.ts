@@ -80,6 +80,26 @@ describe('buildMacScratchProfile — three-stage credential sealing', () => {
       .toBeGreaterThan(idx(p, '(allow file-read-metadata (literal "/Users/u/.botmux"))'));
   });
 
+  it('opens only exact snapshot content for read+exec while denying writes and siblings', () => {
+    const snapshot = '/Users/u/.botmux/traex-snapshots/combo-a';
+    const p = join(buildMacScratchProfile({
+      net: true,
+      authorityRootDenies: ['/Users/u/.botmux'],
+      writable: [],
+      readOnlyPaths: [snapshot],
+      hostWritable: ['/Users/u/.botmux/traex-snapshots'],
+      fileDenyPaths: ['/Users/u/.botmux/bots.json'],
+    }));
+    expect(idx(p, `(allow file-read* (subpath "${snapshot}")`))
+      .toBeGreaterThan(idx(p, '(deny file-read* (subpath "/Users/u/.botmux"))'));
+    expect(p).toContain(`(deny file-write* (subpath "${snapshot}")`);
+    expect(idx(p, `(deny file-write* (subpath "${snapshot}")`))
+      .toBeGreaterThan(idx(p, '(allow file-write* (subpath "/Users/u/.botmux/traex-snapshots")'));
+    expect(p).not.toContain(`(allow file-write* (subpath "${snapshot}")`);
+    expect(p).toContain('(deny file-read* (subpath "/Users/u/.botmux/bots.json")');
+    expect(p).toContain('(allow file-read-metadata (literal "/Users/u/.botmux/traex-snapshots")');
+  });
+
   it('still denies bots.json reads through the farm symlink (final file deny wins)', () => {
     const p = join(buildMacScratchProfile({
       net: true,

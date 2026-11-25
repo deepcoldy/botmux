@@ -15,6 +15,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import ts from 'typescript';
 
 const { emitHookEventMock } = vi.hoisted(() => ({ emitHookEventMock: vi.fn() }));
 
@@ -102,7 +103,9 @@ import {
   __testOnly_resetOrdinaryImDeliveries,
   requestInstallChangeSuspend,
   sweepTraexInstallChanges,
+  suspendWorker,
   sendWorkerInput,
+  promoteQueuedActivationTail,
   hasPendingOrdinaryImInput,
   recordWorkerCliInputBacklog,
 } from '../src/core/worker-pool.js';
@@ -115,6 +118,7 @@ import { isTraexProcess } from '../src/core/traex-leaf-pid.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { standaloneSleep } from './helpers/standalone-sleep.js';
 import { materializeTraexSnapshot } from '../src/services/traex-runtime-snapshot.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 const dirs: string[] = [];
 const children: ChildProcess[] = [];
@@ -249,6 +253,34 @@ describe('canSafelyReclaimWorkerForInstallChange', () => {
     ds.pendingSuspendReason = 'cli_install_changed';
     mutate(ds);
     expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(false);
+  });
+  it('reclaims with a replacement-owned tail and hands it to the replacement callback', async () => {
+    const reclaimed = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_notice'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onInstallChangeReclaimed: reclaimed,
+    } as any);
+    const ds = makeDs({
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+    });
+    ds.session.queuedActivationTail = [{ turnId: 'om_new_tail', ownerRuntime: 'new' } as any];
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(true);
+
+    const worker = ds.worker as any;
+    __testOnly_runPendingSuspendIfSettled(ds);
+    await Promise.resolve();
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+    expect(reclaimed).toHaveBeenCalledWith(ds);
+    expect(ds.session.queuedActivationTail?.[0]?.ownerRuntime).toBe('new');
+
+    const oldOwned = makeDs({ pendingSuspendReason: 'cli_install_changed', pendingSuspendGeneration: 7 });
+    oldOwned.session.queuedActivationTail = [{ turnId: 'om_old_tail', ownerRuntime: 'old' } as any];
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(oldOwned)).toBe(false);
+    expect(suspendWorker(oldOwned, 'cli_install_changed')).toBe(false);
   });
 });
 
@@ -897,6 +929,162 @@ describe('launch provenance', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(ds.localProcessAttestation?.cliInstallAtSpawn).toEqual(identity);
     expect(observeTraexInstall(ds, 'traex').state).toBe('current');
+  });
+});
+
+function loadReplacementStarter(scope: Record<string, unknown>): (ds: DaemonSession, recovery?: boolean) => void {
+  const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
+  const declaration = source.statements.find(node => ts.isFunctionDeclaration(node)
+    && node.name?.text === 'startReplacementRuntimeAfterReclaim');
+  if (!declaration) throw new Error('missing production replacement starter');
+  const code = ts.transpileModule(declaration.getText(source), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  return new Function('scope', `with (scope) { ${code}; return startReplacementRuntimeAfterReclaim; }`)(scope);
+}
+
+describe('activation tail claim cancellation', () => {
+  function tailFor(turnId: string) {
+    return {
+      id: `tail-${turnId}`, order: 1, userPrompt: `prompt-${turnId}`,
+      cliInput: { content: `prompt-${turnId}` }, turnId, ownerRuntime: 'new' as const,
+    };
+  }
+
+  function cancelledClaim(entry: string, identity: ExecutableIdentity) {
+    return {
+      entry, running: identity, installAtSpawn: identity,
+      workerGeneration: 7, cliSpawnGeneration: 1,
+    };
+  }
+
+  it('restores replacement-owned entries and promotes the oldest after an install revert', () => {
+    const { entry, identity } = tempEntry('selected-old-release');
+    const ds = makeDs({
+      lastScreenStatus: 'idle',
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false,
+        cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: cancelledClaim(entry, identity),
+    });
+    ds.session.queuedActivationTail = [tailFor('om_reverted_tail')];
+    const worker = ds.worker as any;
+    __testOnly_runPendingSuspendIfSettled(ds);
+
+    expect(ds.pendingSuspendReason).toBeUndefined();
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationInput?.content).toBe('prompt-om_reverted_tail');
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message', turnId: 'om_reverted_tail',
+    }));
+  });
+
+  it('keeps a cancelled claim retryable when the promotion write fails after ownership restoration', () => {
+    const { entry, identity } = tempEntry('selected-old-release');
+    const ds = makeDs({
+      lastScreenStatus: 'idle',
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false,
+        cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: cancelledClaim(entry, identity),
+    });
+    ds.session.queuedActivationTail = [tailFor('om_retry_tail')];
+    const update = vi.mocked(sessionStore.updateSession);
+    update.mockImplementationOnce(() => {});
+    update.mockImplementationOnce(() => { throw new Error('controlled promotion write failure'); });
+    __testOnly_runPendingSuspendIfSettled(ds);
+
+    expect(ds.pendingSuspendReason).toBe('cli_install_changed');
+    expect(ds.session.queuedActivationPending).toBeFalsy();
+    expect(ds.session.queuedActivationTail).toHaveLength(1);
+    expect(ds.session.queuedActivationTail?.[0]?.ownerRuntime).toBeUndefined();
+
+    update.mockImplementation(() => {});
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(ds.pendingSuspendReason).toBeUndefined();
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect((ds.worker as any).send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message', turnId: 'om_retry_tail',
+    }));
+  });
+
+  it('promotes a transferred tail for cold recovery after the old worker exits', () => {
+    const { entry, identity } = tempEntry('selected-old-release');
+    const ds = makeDs({
+      lastScreenStatus: 'idle',
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false,
+        cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: cancelledClaim(entry, identity),
+    });
+    ds.session.queuedActivationTail = [tailFor('om_crash_tail')];
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('exit', 1, null);
+
+    expect(ds.worker).toBeNull();
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationInput?.content).toBe('prompt-om_crash_tail');
+  });
+
+  it('starts the promoted replacement journal without waiting for another inbound', async () => {
+    const { entry, identity } = tempEntry('selected-old-release');
+    const ds = makeDs({
+      lastScreenStatus: 'idle',
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false,
+        cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: cancelledClaim(entry, identity),
+    });
+    ds.session.queuedActivationTail = [tailFor('om_accepted_tail')];
+    const forkWorker = vi.fn(() => {
+      ds.worker = makeFakeWorker();
+      return true;
+    });
+    const start = loadReplacementStarter({
+      traexReplacementStartInFlight: new Set<string>(),
+      findActiveBySessionId: () => ds,
+      randomUUID: () => 'replacement-claim',
+      runSessionTurn: async (_id: string, action: () => Promise<void>) => action(),
+      promoteQueuedActivationTail,
+      isCodexAppCliId: () => false,
+      getBot: () => ({ config: { cliId: 'traex' } }),
+      forkWorker,
+      clearInitialStartClaim: vi.fn(),
+      logger: { warn: vi.fn() },
+      tag: () => 'traex-test',
+    });
+    const exits: boolean[] = [];
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_notice'),
+      getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn(),
+      onWorkerExit: (current: DaemonSession, context: { currentWorker: boolean; replacementActivationPending: boolean }) => {
+        exits.push(context.replacementActivationPending);
+        if (context.currentWorker && context.replacementActivationPending) start(current, true);
+      },
+    } as any);
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('exit', 1, null);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(exits).toEqual([true]);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker.mock.calls[0][1]).toMatchObject({ content: 'prompt-om_accepted_tail' });
+    expect(ds.worker).not.toBeNull();
+    expect(ds.session.queuedActivationPending).toBe(true);
   });
 });
 

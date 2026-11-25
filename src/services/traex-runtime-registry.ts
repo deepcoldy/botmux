@@ -61,6 +61,8 @@ export interface TraexRuntimeOccupant {
   /** Install release dir for an occupancy-only record (no snapshot). Used only
    *  as the conservative "is any writer still running from here" scan path. */
   traexPath?: string;
+  /** Coordinated new-exec domain identity persisted with the record. */
+  ownershipDomainKey?: string;
   phase: TraexOccupantPhase;
   workerPid: number;
   workerStart?: string;
@@ -96,6 +98,7 @@ export interface TraexStartRequest {
   snapshotDir?: string;
   /** Release dir this occupancy-only runtime was observed at. */
   traexPath?: string;
+  ownershipDomainKey?: string;
   workerPid: number;
   workerStart?: string;
   daemonPid: number;
@@ -185,6 +188,7 @@ function normalizeOccupant(value: unknown): TraexRuntimeOccupant | undefined {
     ...(typeof v.installSignature === 'string' ? { installSignature: v.installSignature } : {}),
     ...(typeof v.snapshotDir === 'string' ? { snapshotDir: v.snapshotDir } : {}),
     ...(typeof v.traexPath === 'string' ? { traexPath: v.traexPath } : {}),
+    ...(typeof v.ownershipDomainKey === 'string' ? { ownershipDomainKey: v.ownershipDomainKey } : {}),
     phase,
     workerPid: v.workerPid,
     ...(typeof v.workerStart === 'string' ? { workerStart: v.workerStart } : {}),
@@ -246,6 +250,12 @@ function pidLiveness(pid: number | undefined, expectedStart: string | undefined)
  * A record created in a previous boot names pids that may now belong to
  * unrelated processes; it can never describe a live runtime.
  */
+function processOwnershipFor(occupant: TraexRuntimeOccupant) {
+  return occupant.ownershipDomainKey
+    ? { occupantId: occupant.occupantId, domainKey: occupant.ownershipDomainKey }
+    : undefined;
+}
+
 export function occupantLiveness(occupant: TraexRuntimeOccupant, now = Date.now()): OccupantLiveness {
   void now; // liveness is pid/birth based; the lease is only a status hint
   const boot = readLinuxBootIdentity();
@@ -258,7 +268,7 @@ export function occupantLiveness(occupant: TraexRuntimeOccupant, now = Date.now(
     // cannot answer (macOS); fall back to the CLI verdict rather than blocking
     // the domain forever.
     if (occupant.snapshotDir) {
-      const writers = findProcessesRunningUnder(occupant.snapshotDir);
+      const writers = findProcessesRunningUnder(occupant.snapshotDir, processOwnershipFor(occupant));
       if (writers !== undefined && writers.length > 0) return 'alive';
     }
     return 'dead';
@@ -290,7 +300,7 @@ function reconcileStartingOrphans(occupants: TraexRuntimeOccupant[], now: number
   let changed = false;
   const next: TraexRuntimeOccupant[] = [];
   for (const occupant of occupants) {
-    if (occupant.phase !== 'starting' || occupant.cliPid !== undefined) {
+    if ((occupant.phase !== 'starting' && occupant.phase !== 'draining') || occupant.cliPid !== undefined) {
       next.push(occupant);
       continue;
     }
@@ -310,7 +320,7 @@ function reconcileStartingOrphans(occupants: TraexRuntimeOccupant[], now: number
       next.push(occupant);
       continue;
     }
-    const writers = findProcessesRunningUnder(scanPath);
+    const writers = findProcessesRunningUnder(scanPath, processOwnershipFor(occupant));
     if (writers === undefined) {
       next.push(occupant);
       continue;
@@ -339,6 +349,13 @@ function reconcileStartingOrphans(occupants: TraexRuntimeOccupant[], now: number
     });
   }
   return { occupants: next, changed };
+}
+
+export function reconcileTraexStartingOrphans(
+  occupants: TraexRuntimeOccupant[],
+  now: number,
+): { occupants: TraexRuntimeOccupant[]; changed: boolean } {
+  return reconcileStartingOrphans(occupants, now);
 }
 
 /**
@@ -457,6 +474,7 @@ export async function acquireTraexRuntimeStart(
       ...(effectiveInstallSignature ? { installSignature: effectiveInstallSignature } : {}),
       ...(request.snapshotDir ? { snapshotDir: request.snapshotDir } : {}),
       ...(request.traexPath ? { traexPath: request.traexPath } : {}),
+      ...(request.ownershipDomainKey ? { ownershipDomainKey: request.ownershipDomainKey } : {}),
       // A known CLI at registration is already alive; recording it here (not
       // only in a later markRunning) gives the prune a real process to judge.
       phase: request.cliPid !== undefined ? 'running' : 'starting',
@@ -508,24 +526,39 @@ export async function acquireTraexRuntimeStart(
  * proven identity is never replaced by a later observation. The matching
  * source-install signature is retained for the daemon scheduling precheck.
  */
+function withoutStaleCliBirth(
+  occupant: TraexRuntimeOccupant,
+  detail: { cliPid?: number; cliStart?: string },
+): TraexRuntimeOccupant {
+  if (detail.cliPid !== undefined && !detail.cliStart && occupant.cliStart !== undefined) {
+    const { cliStart: _stale, ...rest } = occupant;
+    void _stale;
+    return rest;
+  }
+  return occupant;
+}
+
 export async function markTraexRuntimeRunning(
   domain: TraexRuntimeDomain,
   occupantId: string,
   detail: { cliPid: number; cliStart?: string; snapshotDir?: string; comboKey?: string; installSignature?: string; now?: number },
 ): Promise<boolean> {
-  return mutateOccupant(domain, occupantId, (occupant, now) => ({
-    ...occupant,
-    phase: 'running',
-    cliPid: detail.cliPid,
-    ...(detail.cliStart ? { cliStart: detail.cliStart } : {}),
-    ...(detail.snapshotDir ? { snapshotDir: detail.snapshotDir } : {}),
-    ...(detail.comboKey && occupant.comboKey === '' ? { comboKey: detail.comboKey } : {}),
-    ...(detail.comboKey && detail.installSignature && occupant.installSignature === undefined
-      && (occupant.comboKey === '' || occupant.comboKey === detail.comboKey)
-      ? { installSignature: detail.installSignature } : {}),
-    heartbeatAt: now,
-    leaseUntil: now + TRAEX_RUNTIME_LEASE_MS,
-  }));
+  return mutateOccupant(domain, occupantId, (occupant, now) => {
+    const current = withoutStaleCliBirth(occupant, detail);
+    return {
+      ...current,
+      phase: 'running',
+      cliPid: detail.cliPid,
+      ...(detail.cliStart ? { cliStart: detail.cliStart } : {}),
+      ...(detail.snapshotDir ? { snapshotDir: detail.snapshotDir } : {}),
+      ...(detail.comboKey && current.comboKey === '' ? { comboKey: detail.comboKey } : {}),
+      ...(detail.comboKey && detail.installSignature && current.installSignature === undefined
+        && (current.comboKey === '' || current.comboKey === detail.comboKey)
+        ? { installSignature: detail.installSignature } : {}),
+      heartbeatAt: now,
+      leaseUntil: now + TRAEX_RUNTIME_LEASE_MS,
+    };
+  });
 }
 
 /**
@@ -544,7 +577,7 @@ export async function markTraexRuntimeUnknown(
   detail: { cliPid?: number; cliStart?: string; snapshotDir?: string; now?: number } = {},
 ): Promise<boolean> {
   return mutateOccupant(domain, occupantId, (occupant, now) => {
-    const { installSignature: _dropped, ...rest } = occupant;
+    const { installSignature: _dropped, ...rest } = withoutStaleCliBirth(occupant, detail);
     void _dropped;
     return {
       ...rest,
@@ -597,6 +630,10 @@ export async function releaseTraexRuntime(
     const target = read.registry.occupants.find((occupant) => occupant.occupantId === occupantId);
     if (!target) return true;
     if (requireCliGone) {
+      // No recorded PID means the pre-exec/registration race is unresolved.
+      // Keep `starting` for bounded orphan recovery; never turn it into a
+      // permanent `draining` record that reconcileStartingOrphans would skip.
+      if (target.cliPid === undefined) return false;
       // A recorded CLI that cannot be proven dead keeps the domain. Mark it
       // `draining` so status messages explain why a newer content waits, and
       // let a later prune/release finish once the kernel proves it gone.
@@ -611,7 +648,7 @@ export async function releaseTraexRuntime(
       // rather than blocking forever, matching `occupantLiveness`.
       const cli = traexCliLiveness(target);
       const writers = target.snapshotDir
-        ? findProcessesRunningUnder(target.snapshotDir)
+        ? findProcessesRunningUnder(target.snapshotDir, processOwnershipFor(target))
         : undefined;
       const writersGone = writers === undefined || writers.length === 0;
       if (cli !== 'dead' || !writersGone) {

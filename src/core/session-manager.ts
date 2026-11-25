@@ -4934,6 +4934,13 @@ export async function executeScheduledTask(
    *  did not land; every fork/send path must then abort. */
   const persistDispatch = async (selectedSession?: DaemonSession): Promise<boolean> => {
     if (dispatchPersisted) return true;
+    const taskBeforeAdmission = (() => {
+      if (!runtime?.runId || !runtime.onBeforeDispatch) return undefined;
+      const current = getRuntimeTask(task.id, larkAppId);
+      // Direct callers may exercise dispatch without a scheduler claim. Once a
+      // claim exists, however, its exact identity is the cancellation fence.
+      return current?.lastRunId !== undefined ? current : undefined;
+    })();
     const admitted = await runtime?.onBeforeDispatch?.(scheduledTurnId, selectedSession);
     if (admitted === false) {
       logger.warn(
@@ -4942,6 +4949,28 @@ export async function executeScheduledTask(
       );
       dispatchRefused = true;
       return false;
+    }
+    if (runtime?.runId && runtime.onBeforeDispatch) {
+      const current = getRuntimeTask(task.id, larkAppId);
+      const manualAdmission = current?.manualRunAuthorization?.runId === runtime.runId
+        || current?.manualRunRequested === true;
+      const runChanged = !!taskBeforeAdmission && (
+        !current
+        || current.lastRunId !== runtime.runId
+        || (current.lastStatus !== 'running' && current.lastStatus !== 'deferred')
+        || (!!current.untilDone && current.untilDone.status !== 'open')
+        || (!current.enabled && !manualAdmission)
+      );
+      const selectedIsLive = !selectedSession
+        || ([...activeSessions.values()].includes(selectedSession) && selectedSession.session.status !== 'closed');
+      if (runChanged || !selectedIsLive) {
+        logger.warn(
+          `[scheduler] Task "${task.name}" (${task.id}) dispatch refused after admission wait: `
+          + 'run or selected session changed before fork/send',
+        );
+        dispatchRefused = true;
+        return false;
+      }
     }
     dispatchPersisted = true;
     return true;
@@ -5604,7 +5633,14 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt, scheduledTurnId);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
-      if (!(await persistDispatch(ds))) return;
+      if (!(await persistDispatch(ds))) {
+        // Authorization refused before any external effect: roll back the new
+        // placeholder completely so this anchor can be created cleanly later.
+        if (activeSessions.get(key) === ds) activeSessions.delete(key);
+        if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+        await closeSession(session.sessionId);
+        return 'deferred';
+      }
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
@@ -5655,7 +5691,7 @@ function scheduledTraexRuntimeBlocker(
   if (targetCliId !== 'traex') return undefined;
   // Injecting into a live worker does not start another runtime. If that worker
   // later has to re-exec, its own final gate remains authoritative.
-  if (selected?.worker && !selected.worker.killed) return undefined;
+  if (selected?.worker && !selected.worker.killed && selected.workerReady === true) return undefined;
   const launchSnapshot = selected?.session.cliLaunchSnapshot;
   const wrapperCli = launchSnapshot
     ? launchSnapshot.wrapperCli

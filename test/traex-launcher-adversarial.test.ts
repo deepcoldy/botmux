@@ -482,3 +482,67 @@ describe('TRAE launcher adversarial lifecycle probes', () => {
     )).toBe(true);
   });
 });
+
+describe('TraeX lease lifecycle', () => {
+  function leaseHarness(lease: any) {
+    const scope: Record<string, any> = {
+      traexRuntimeLeaseContext: undefined,
+      traexSpawnLeaseContext: undefined,
+      pendingTraexSpawnAbandon: undefined,
+    };
+    scope.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+    scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    const context = create(lease);
+    scope.traexRuntimeLeaseContext = context;
+    scope.traexSpawnLeaseContext = context;
+    scope.pendingTraexSpawnAbandon = context.abandon;
+    return { scope, context };
+  }
+
+  it('abandons a pre-exec lease exactly once', async () => {
+    const abandon = vi.fn(async () => {});
+    const { scope, context } = leaseHarness({ abandon, release: vi.fn(async () => {}) });
+    await Promise.all([context.abandon(), context.abandon()]);
+    expect(abandon).toHaveBeenCalledTimes(1);
+    expect(scope.traexRuntimeLeaseContext).toBeUndefined();
+    expect(scope.pendingTraexSpawnAbandon).toBeUndefined();
+  });
+
+  it('preserves snapshot identity on non-Linux and fails closed on Linux mismatch', async () => {
+    const lease = {
+      occupancyOnly: false,
+      snapshot: { snapshot: true, traexPath: '/snap/traex', comboKey: '', dir: '/snap' },
+      markRunning: vi.fn(async () => {}),
+      markUnknown: vi.fn(async () => {}),
+      heartbeat: vi.fn(async () => {}),
+      release: vi.fn(async () => {}),
+      abandon: vi.fn(async () => {}),
+    };
+    const { scope, context } = leaseHarness(lease);
+    Object.assign(scope, {
+      traexContentKeyInFlight: new Set<number>(),
+      readRunningExeIdentity: () => undefined,
+      isTraexProcess: () => true,
+      readProcessStartIdentity: () => undefined,
+      resolveInstallIdentity: () => ({}),
+      sameExecutableObject: () => false,
+      captureTraexRunningContentIdentity: async () => ({ comboKey: 'combo', installSignature: 'sig' }),
+      captureRunningContentKey: async () => ({ comboKey: 'combo', installSignature: 'sig' }),
+      log: vi.fn(),
+      process: { platform: 'darwin' },
+    });
+    const attach = loadWorkerFunction<(pid: number) => void>('attachTraexLeaseCli', scope);
+    attach(123);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(lease.markRunning).toHaveBeenCalledWith(123, undefined, { comboKey: 'combo', installSignature: 'sig' });
+    expect(lease.markUnknown).not.toHaveBeenCalled();
+    scope.stopTraexLeaseHeartbeat();
+
+    scope.process = { platform: 'linux' };
+    context.running = false;
+    attach(124);
+    expect(lease.markUnknown).toHaveBeenCalledWith(124, undefined);
+    scope.stopTraexLeaseHeartbeat();
+  });
+});

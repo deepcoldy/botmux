@@ -19,7 +19,7 @@
  * Cost: one snapshot per content combination, shared by every bot/generation
  * with identical bytes. Never one 670 MB copy per generation.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   createReadStream,
   existsSync,
@@ -34,6 +34,7 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 
 import { withExclusiveFileLockAsync } from '../utils/file-flock.js';
+import { findProcessesRunningUnder } from '../utils/process-identity.js';
 import { resolveInstallIdentity, type ExecutableIdentity } from './cli-install-identity.js';
 
 export const TRAEX_SNAPSHOT_MANIFEST = 'manifest.json';
@@ -459,6 +460,9 @@ export async function materializeTraexSnapshot(input: {
   /** Test seam: runs after the expected hashes are captured and before the
    *  copy starts, which is exactly the window an install switch can hit. */
   __testOnly_onCaptured?: (identity: TraexReleaseIdentity, attempt: number) => Promise<void> | void;
+  /** Test seam: a real process may exec the outstanding lease in the narrow
+   *  window between the first live-writer scan and quarantine. */
+  __testOnly_beforeQuarantine?: () => Promise<void> | void;
 }): Promise<TraexSnapshot> {
   const root = input.snapshotsRoot ?? defaultTraexSnapshotRoot();
   await fsp.mkdir(root, { recursive: true });
@@ -495,17 +499,65 @@ export async function materializeTraexSnapshot(input: {
           const manifest = buildManifest(identity, tmpDir, installation);
           writeFileSync(snapshotPaths(tmpDir).manifest, JSON.stringify(manifest), 'utf8');
           writeFileSync(snapshotPaths(tmpDir).complete, `${identity.comboKey}\n`, 'utf8');
+          const winner = reusableSnapshot(finalDir, identity);
+          if (winner) {
+            await fsp.rm(tmpDir, { recursive: true, force: true });
+            return { kind: 'snapshot', snapshot: winner };
+          }
+          // A corrupt/drifting finalDir must be quarantined, not deleted. Any
+          // live writer (or an unreadable /proc) blocks this repair so a proc
+          // path move cannot make an old runtime look gone.
+          const writers = findProcessesRunningUnder(finalDir);
+          if (writers === undefined || writers.length > 0) {
+            throw new Error(`snapshot publish blocked by a live writer or unprovable process scan at ${finalDir}`);
+          }
+          const staleDir = join(root, `.stale-${identity.comboKey}-${randomUUID()}`);
+          await input.__testOnly_beforeQuarantine?.();
+          let quarantined = false;
           try {
-            renameSync(tmpDir, finalDir);
+            try {
+              renameSync(finalDir, staleDir);
+              quarantined = true;
+            } catch (err) {
+              if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+            }
+            if (quarantined) {
+              // A pre-existing lease is not covered by this materialization
+              // lock and may have exec'd after the first scan. Its executable
+              // now resolves under staleDir. Never publish/delete over that
+              // live image: put the original path back and fail this repair.
+              const racedWriters = findProcessesRunningUnder(staleDir);
+              if (racedWriters === undefined || racedWriters.length > 0) {
+                try {
+                  renameSync(staleDir, finalDir);
+                  quarantined = false;
+                } catch { /* keep the quarantined recovery evidence */ }
+                throw new Error(`snapshot publish blocked by an exec during quarantine at ${finalDir}`);
+              }
+            }
+            try {
+              renameSync(tmpDir, finalDir);
+            } catch (err) {
+              // Another process published the same combination first. That is
+              // fine only if its manifest is the identity we verified.
+              const code = (err as NodeJS.ErrnoException).code;
+              if (code === 'EEXIST' || code === 'ENOTEMPTY' || code === 'EISDIR') {
+                await fsp.rm(tmpDir, { recursive: true, force: true });
+                const raced = reusableSnapshot(finalDir, identity);
+                if (raced) {
+                  if (quarantined) { try { rmSync(staleDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+                  return { kind: 'snapshot', snapshot: raced };
+                }
+              }
+              if (quarantined && !existsSync(finalDir)) {
+                try { renameSync(staleDir, finalDir); } catch { /* keep backup */ }
+              }
+              throw err;
+            }
+            if (quarantined) { try { rmSync(staleDir, { recursive: true, force: true }); } catch { /* best effort */ } }
           } catch (err) {
-            // Another process published the same combination first. That is
-            // fine only if its manifest is the identity we verified.
-            const code = (err as NodeJS.ErrnoException).code;
-            if (code === 'EEXIST' || code === 'ENOTEMPTY' || code === 'EISDIR') {
-              await fsp.rm(tmpDir, { recursive: true, force: true });
-              const winner = reusableSnapshot(finalDir, identity);
-              if (winner) return { kind: 'snapshot', snapshot: winner };
-              throw new Error(`snapshot publish collided with an unverified snapshot at ${finalDir}`);
+            if (quarantined && !existsSync(finalDir)) {
+              try { renameSync(staleDir, finalDir); } catch { /* keep backup */ }
             }
             throw err;
           }

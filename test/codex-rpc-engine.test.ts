@@ -43,6 +43,14 @@ const owner = (turnId: string, dispatchAttempt?: number) => ({
 });
 
 describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', () => {
+  it('publishes the real app-server PID to the runtime lease hook', async () => {
+    const spawned: number[] = [];
+    const engine = makeEngine({ onAppServerSpawn: pid => spawned.push(pid) });
+    await engine.start();
+    expect(spawned).toEqual([engine.appServerPid]);
+    await engine.stopAndWait();
+  });
+
   it.skipIf(process.platform !== 'linux')('waits for an ordinary tool descendant after its app-server leader exits', async () => {
     const childFile = join(tmpdir(), `rpc-ordinary-tool-${process.pid}-${Date.now()}`);
     const sid = `ordinary-tool-${process.pid}-${Date.now()}`;

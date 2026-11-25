@@ -1101,7 +1101,7 @@ import {
   type DaemonSession,
   type TurnTerminalCarrier,
 } from './types.js';
-import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { hasProtectedSessionMutationOwnership, protectedSessionMutationReasons } from './session-mutation-guard.js';
 import { retainQueuedActivationRawInput } from './pending-repo-journal.js';
 import { failedTurnRewindInFlight, mergeFailedTurnInput, planFailedTurnRewind, turnAnswersInChat } from './failed-turn-rewind.js';
 import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
@@ -1565,7 +1565,7 @@ export interface WorkerPoolCallbacks {
    *  worker generation ambiguous; the receiver decides retry policy. */
   onWorkerExit?: (
     ds: DaemonSession,
-    context: { sessionId: string; workerGeneration: number; currentWorker: boolean; code: number | null; signal: NodeJS.Signals | null },
+    context: { sessionId: string; workerGeneration: number; currentWorker: boolean; replacementActivationPending: boolean; code: number | null; signal: NodeJS.Signals | null },
   ) => void | Promise<void>;
   /** The exact old daemon-session object has left the active registry and is
    * marked closed. Its in-memory queued work must be retired before any same-key
@@ -13330,6 +13330,20 @@ function settleRetiredWorkerBackgroundState(ds: DaemonSession): void {
   if (settleBackgroundStateOnCliLoss(ds)) publishBackgroundTaskCountCleared(ds);
 }
 
+/** Install-change retirement is the one mutation that may proceed while the
+ * tail is wholly owned by the replacement runtime. Other protected work keeps
+ * the ordinary fail-closed guard, and a mixed/old-owned tail still blocks. */
+function hasInstallChangeMutationOwnership(ds: DaemonSession): boolean {
+  if (protectedSessionMutationReasons(ds).some(reason => reason !== 'activation_tail')) return true;
+  return (ds.session.queuedActivationTail ?? []).some(entry => entry.ownerRuntime !== 'new');
+}
+
+function hasInstallChangeSuspendGuard(ds: DaemonSession, reason: string): boolean {
+  return reason === CLI_INSTALL_CHANGED_SUSPEND
+    ? hasInstallChangeMutationOwnership(ds)
+    : hasProtectedSessionMutationOwnership(ds);
+}
+
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean, expectedOperationId?: string): boolean {
   const continuingController = primarySuspendApplying.has(ds) || expectedOperationId ? controllerForSession(ds) : undefined;
   const continuingOperationId = expectedOperationId ?? continuingController?.operation()?.operationId;
@@ -13339,7 +13353,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
     }
     return false;
   }
-  if (hasProtectedSessionMutationOwnership(ds)) {
+  if (hasInstallChangeSuspendGuard(ds, reason)) {
     logger.warn(`[${tag(ds)}] Refused worker suspend (${reason}) while Codex App dispatch ownership is non-empty`);
     return false;
   }
@@ -13609,6 +13623,21 @@ function reconcileInstallChangeClaim(ds: DaemonSession): InstallClaimVerdict | u
   if (!claim) return undefined;
   const verdict = revalidateInstallChangeClaim(ds, claim);
   if (verdict === 'replaced' || verdict === 'reverted') {
+    if (!restoreQueuedActivationOwnershipToCurrent(ds)) return 'unknown';
+    // Cancellation is not completion: drain the OLDEST entry now instead of
+    // letting every later turn append behind a permanently quarantined tail.
+    // Keep the claim until this second durable write succeeds so a later
+    // checkpoint can retry instead of leaving an ownerless idle tail forever.
+    const hasTail = (ds.session.queuedActivationTail?.length ?? 0) > 0;
+    const promoted = hasTail
+      ? (ds.worker && !ds.worker.killed
+        ? promoteQueuedActivationTail(ds)
+        : promoteQueuedActivationTail(ds, { send: false }))
+      : true;
+    if (!promoted) {
+      logger.warn(`[${tag(ds)}] Activation tail remains queued after install claim ${verdict}`);
+      return verdict;
+    }
     clearPendingSuspendClaim(ds, `install claim ${verdict}`);
   }
   return verdict;
@@ -13721,7 +13750,7 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   if (reason === CLI_INSTALL_CHANGED_SUSPEND
     && !isSuspendableBackendType(ds.initConfig?.backendType)
     && !isSessionTransferring(ds)
-    && !hasProtectedSessionMutationOwnership(ds)) {
+    && !hasInstallChangeMutationOwnership(ds)) {
     ds.hasHistory = true;
     clearPendingSuspendClaim(ds, 'pty worker retired for install change');
     killWorker(ds);
@@ -13808,7 +13837,7 @@ export function canSafelyReclaimWorkerForInstallChange(ds: DaemonSession, suspen
         || !sameRuntime(operation.targetRuntime, controller!.currentRuntime())) return false;
     } else if (ds.workerReady !== true) return false;
   } else if (ds.workerReady !== true) return false;
-  if (hasProtectedSessionMutationOwnership(ds) || isSessionTransferring(ds)) return false;
+  if (hasInstallChangeMutationOwnership(ds) || isSessionTransferring(ds)) return false;
   if (ds.pendingRepo || ds.pendingRepoCommitInFlight || ds.worktreeCreating) return false;
   if (ds.initialStartPending) return false;
   if (ds.session.queuedActivationPending || (ds.session.queuedActivationTail ?? []).some(entry => entry.ownerRuntime !== 'new')) return false;
@@ -19460,8 +19489,33 @@ export function installReclaimPendingForCurrentGeneration(ds: DaemonSession): bo
       || ds.pendingSuspendGeneration === ds.workerGeneration);
 }
 
-/**
- * Atomically hand every not-yet-promoted activation tail entry to the
+/** A cancelled install claim returns replacement-owned entries to the current
+ * runtime, preserving FIFO. Without this normalization the tail would continue
+ * to quarantine every later turn even though no reclaim remained. */
+function restoreQueuedActivationOwnershipToCurrent(ds: DaemonSession): boolean {
+  const tail = ds.session.queuedActivationTail;
+  if (!tail?.some(entry => entry.ownerRuntime === 'new')) return true;
+  const priorTail = tail;
+  ds.session.queuedActivationTail = tail.map(entry => {
+    if (entry.ownerRuntime !== 'new') return entry;
+    const { ownerRuntime: _removed, ...current } = entry;
+    void _removed;
+    return current;
+  });
+  try {
+    sessionStore.updateSession(ds.session);
+    return true;
+  } catch (err) {
+    ds.session.queuedActivationTail = priorTail;
+    logger.error(
+      `[${tag(ds)}] Failed to restore activation tail ownership to the current runtime: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
+/** Atomically hand every not-yet-promoted activation tail entry to the
  * replacement runtime. `queuedActivationTail` is a single queue with a target
  * tag, not two queues: an entry that has never crossed the old runtime's
  * submission boundary is still unowned, so retagging it is the whole transfer.
@@ -29884,6 +29938,11 @@ function setupWorkerHandlers(
     }
     // Clear the current child before notifying durable consumers. A callback
     // may schedule a retry; it must not observe/send to this dead IPC channel.
+    // Capture this BEFORE promotion clears the tail. It tells the daemon that
+    // the resulting journal belongs to replacement recovery, not an ordinary
+    // historical activation from an unrelated CLI.
+    const replacementActivationPending = currentWorker
+      && (ds.session.queuedActivationTail ?? []).some(entry => entry.ownerRuntime === 'new');
     // A stale takeover worker never clears the replacement — during takeover the
     // old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
@@ -29922,6 +29981,10 @@ function setupWorkerHandlers(
       // first idle (the deferred checkpoint's own "worker gone" branch cannot
       // help: it only runs on a screen update that will never arrive).
       clearPendingSuspendClaim(ds, 'worker exited');
+      if (restoreQueuedActivationOwnershipToCurrent(ds)
+        && !promoteQueuedActivationTail(ds, { send: false })) {
+        logger.warn(`[${tag(ds)}] Activation tail remains queued after worker exit`);
+      }
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.workerCardViewToken = null;
@@ -30040,6 +30103,7 @@ function setupWorkerHandlers(
           sessionId: ds.session.sessionId,
           workerGeneration,
           currentWorker,
+          replacementActivationPending,
           code,
           signal,
         });

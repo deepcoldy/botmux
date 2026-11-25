@@ -833,6 +833,7 @@ import {
   SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE,
   settleDeferredScheduleRun,
   settleHeldScheduleRunsOnWorkerExit,
+  cancelPreReadyScheduledWorkers,
 } from './core/deferred-schedule-settlement.js';
 import {
   renderMessageListenerPrompt,
@@ -23937,15 +23938,20 @@ const traexReplacementStartInFlight = new Set<string>();
  * forking a second worker. Running on the session turn queue keeps the promote
  * and fork atomic with respect to other session commands.
  */
-function startReplacementRuntimeAfterReclaim(ds: DaemonSession): void {
+function startReplacementRuntimeAfterReclaim(ds: DaemonSession, promotedJournalRecovery = false): void {
   const sessionId = ds.session.sessionId;
   if (traexReplacementStartInFlight.has(sessionId)) return;
   if (findActiveBySessionId(sessionId) !== ds) return;
   if (ds.worker && !ds.worker.killed) return;
-  if (ds.initialStartPending || ds.initialStartClaimToken !== undefined) return;
+  if (ds.initialStartClaimToken !== undefined) return;
   const hasParked = (ds.session.queuedActivationTail ?? [])
     .some(entry => entry.ownerRuntime === 'new');
-  if (!hasParked) return;
+  const hasPromotedJournal = promotedJournalRecovery && ds.session.queuedActivationPending === true
+    && ds.session.queuedActivationInput !== undefined;
+  // Worker-exit promotion sets initialStartPending without a claim token. It is
+  // the journal we are explicitly recovering, not a competing start.
+  if (ds.initialStartPending && !hasPromotedJournal) return;
+  if (!hasParked && !hasPromotedJournal) return;
 
   const token = randomUUID();
   ds.initialStartPending = true;
@@ -23957,11 +23963,13 @@ function startReplacementRuntimeAfterReclaim(ds: DaemonSession): void {
       if (findActiveBySessionId(sessionId) !== ds) return;
       if (ds.worker && !ds.worker.killed) return;
       if (ds.initialStartClaimToken !== token) return;
-      if (!(ds.session.queuedActivationTail ?? []).some(entry => entry.ownerRuntime === 'new')) return;
-      if (!promoteQueuedActivationTail(ds, { send: false })) {
+      const needsPromotion = (ds.session.queuedActivationTail ?? []).some(entry => entry.ownerRuntime === 'new');
+      if (!needsPromotion && !(promotedJournalRecovery && ds.session.queuedActivationPending)) return;
+      if (needsPromotion && !promoteQueuedActivationTail(ds, { send: false })) {
         logger.warn(`[${tag(ds)}] Replacement runtime start deferred: activation head promotion failed`);
         return;
       }
+      if (!ds.session.queuedActivationPending || !ds.session.queuedActivationInput) return;
       const recoverThroughCodexLedger = isCodexAppCliId(
         ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId,
       );
@@ -36032,6 +36040,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
         );
       }
+      if (context.currentWorker && context.replacementActivationPending) {
+        // The pool already promoted the transferred tail into the durable
+        // journal. Start its successor now instead of waiting for another IM.
+        startReplacementRuntimeAfterReclaim(ds, true);
+      }
     },
     onSessionRetired(ds) {
       void cancelQueuedForks(ds, 'source_changed').catch(error =>
@@ -38090,12 +38103,27 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                       onBeforeDispatch: (turnId, selectedSession) => {
                         admissionSeen = true;
                         dispatchedSession = selectedSession;
+                        const selectedBotCliId = selectedSession
+                          ? getAllBots().find(b => b.config.larkAppId === selectedSession.larkAppId)?.config.cliId
+                          : undefined;
+                        const targetCliId = selectedSession
+                          ? (selectedSession.session.cliLaunchSnapshot?.cliId
+                            ?? selectedSession.session.cliId
+                            ?? selectedBotCliId)
+                          : undefined;
+                        // Only a real TRAE dispatch participates in the handoff
+                        // ledger. Other CLIs' ordinary dispatch errors must never
+                        // be converted into a 30-minute TRAE retry storm.
+                        if (targetCliId !== 'traex') return true;
                         // Persist `dispatching` before the input can reach a
                         // worker: a crash after this point is never auto-replayed.
                         // Return the durable result — `executeScheduledTask` must
                         // stop before any fork/send when the write did not land.
                         return scheduler.markDeferredTargetDispatching(
                           task.id, executionContext.runId, targetTask.chatId!, turnId, effectiveAppId,
+                          { additionalPrompt, precondition: precondition.precondition === 'disabled' || precondition.precondition === 'passed'
+                            ? precondition.precondition
+                            : 'none' },
                         );
                       },
                     },
@@ -38219,14 +38247,27 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
       return outcome;
     } catch (error) {
-      appendExecutionLog(
-        'error',
-        resolveScheduleRunLogErrorDetails(precondition.precondition, error),
-      );
+      const current = scheduler.getRuntimeTask(task.id, effectiveAppId);
+      const terminal = current?.lastRunId === executionContext.runId
+        && (current.lastStatus === 'ok' || current.lastStatus === 'error' || current.lastStatus === 'skipped');
+      // A re-park or a terminal settlement from another edge owns the next
+      // retry/outcome. Do not append a second terminal error log for this one.
+      if (current && current.lastRunId === executionContext.runId
+        && current.lastStatus !== 'deferred' && !terminal) {
+        appendExecutionLog(
+          'error',
+          resolveScheduleRunLogErrorDetails(precondition.precondition, error),
+        );
+      }
       throw error;
     }
   });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
+  scheduler.setParkedRunCancellationHandler((_task, runId) => {
+    cancelPreReadyScheduledWorkers(activeSessions.values(), runId, async ds => {
+      await closeSessionForBackgroundCleanup(ds.session.sessionId, 'scheduled run cancelled');
+    });
+  });
   scheduler.setScheduleFailureAlert((task, consecutiveFailures, lastError) => {
     // 周期任务连续失败达到阈值：私信一个可操作的管理员一次，避免像协作人
     // 日更那样静默失败十余天无人知。无可用管理员则只留 error 日志。

@@ -1,7 +1,14 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 
 import { procStatStartTime } from './proc-stat.js';
+import { TRAEX_DOMAIN_KEY_ENV_KEY, TRAEX_OCCUPANT_ID_ENV_KEY } from './child-env.js';
+
+export interface TraexProcessOwnership {
+  occupantId: string;
+  domainKey: string;
+}
 
 const LINUX_BOOT_ID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -99,6 +106,48 @@ function systemPsBin(): string | undefined {
 
 const DELETED_SUFFIX = ' (deleted)';
 
+function canonicalPathAllowMissing(path: string): string | undefined {
+  try {
+    return realpathSync(path);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') return undefined;
+  }
+  const missing: string[] = [];
+  let current = path;
+  for (;;) {
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    missing.unshift(basename(current));
+    current = parent;
+    try {
+      return join(realpathSync(current), ...missing);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') return undefined;
+    }
+  }
+}
+
+function processMatchesOwnership(pid: number, ownership: TraexProcessOwnership | undefined): boolean {
+  if (!ownership) return true;
+  try {
+    const entries = readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
+    const values = new Map(entries.filter(entry => entry.includes('='))
+      .map(entry => [entry.slice(0, entry.indexOf('=')), entry.slice(entry.indexOf('=') + 1)]));
+    const occupantId = values.get(TRAEX_OCCUPANT_ID_ENV_KEY);
+    const domainKey = values.get(TRAEX_DOMAIN_KEY_ENV_KEY);
+    // A descendant may sanitize its environment after exec. Missing markers
+    // cannot prove it is unrelated to this lease; only two present, explicitly
+    // different identities may exclude it from the conservative writer scan.
+    if (occupantId === undefined || domainKey === undefined) return true;
+    return occupantId === ownership.occupantId && domainKey === ownership.domainKey;
+  } catch {
+    // An unreadable environment never proves a process is unrelated.
+    return true;
+  }
+}
+
 /**
  * PIDs on Linux whose executable image lives under `dir`.
  *
@@ -116,14 +165,10 @@ const DELETED_SUFFIX = ' (deleted)';
  * cannot be read. Callers must treat that as "no additional evidence", never as
  * "nothing is running".
  */
-export function findProcessesRunningUnder(dir: string): number[] | undefined {
+export function findProcessesRunningUnder(dir: string, ownership?: TraexProcessOwnership): number[] | undefined {
   if (process.platform !== 'linux') return undefined;
-  let canonicalDir: string;
-  try {
-    canonicalDir = realpathSync(dir);
-  } catch {
-    return undefined;
-  }
+  const canonicalDir = canonicalPathAllowMissing(dir);
+  if (canonicalDir === undefined) return undefined;
   const prefix = canonicalDir.endsWith('/') ? canonicalDir : `${canonicalDir}/`;
   const targetObjects = new Set<string>();
   for (const name of ['traex', 'traex-code-mode-host']) {
@@ -163,18 +208,17 @@ export function findProcessesRunningUnder(dir: string): number[] | undefined {
     const normalized = resolvedPath?.endsWith(DELETED_SUFFIX)
       ? resolvedPath.slice(0, -DELETED_SUFFIX.length)
       : resolvedPath;
-    if (textPath.startsWith(prefix) || normalized?.startsWith(prefix)) {
-      pids.push(pid);
-      continue;
-    }
+    const pathMatches = textPath.startsWith(prefix) || normalized?.startsWith(prefix);
+    let objectMatches = false;
     if (targetObjects.size > 0) {
       try {
         const st = statSync(exeLink, { bigint: true });
-        if (targetObjects.has(`${st.dev}:${st.ino}`)) pids.push(pid);
+        objectMatches = targetObjects.has(`${st.dev}:${st.ino}`);
       } catch {
         // Gone between readlink and stat: not a live writer.
       }
     }
+    if ((pathMatches || objectMatches) && processMatchesOwnership(pid, ownership)) pids.push(pid);
   }
   return pids;
 }

@@ -1110,6 +1110,10 @@ export function claimDeferredRun(
   return mutateTasks<ScheduleDeferredClaimResult>(working => {
     const task = working.get(id);
     if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (runId !== undefined && task.lastRunId === runId
+      && (task.lastStatus === 'ok' || task.lastStatus === 'error' || task.lastStatus === 'skipped')) {
+      return { result: { ok: false, error: 'not_deferred' } as const, changed: false };
+    }
     if (task.lastStatus === 'running') {
       return { result: { ok: false, error: 'already_running' } as const, changed: false };
     }

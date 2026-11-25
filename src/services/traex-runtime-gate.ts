@@ -19,6 +19,7 @@
  */
 import { realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { TRAEX_DOMAIN_KEY_ENV_KEY, TRAEX_OCCUPANT_ID_ENV_KEY } from '../utils/child-env.js';
 
 import { readProcessStartIdentity } from '../utils/process-identity.js';
 import {
@@ -41,6 +42,7 @@ import {
   markTraexRuntimeUnknown,
   occupantLiveness,
   readTraexRuntimeOccupants,
+  reconcileTraexStartingOrphans,
   releaseTraexRuntime,
   type TraexRuntimeBlocker,
 } from './traex-runtime-registry.js';
@@ -141,6 +143,19 @@ export interface TraexRuntimeLease {
   abandon(): Promise<void>;
 }
 
+export function applyTraexRuntimeOwnershipEnv(
+  env: NodeJS.ProcessEnv,
+  lease: TraexRuntimeLease | undefined,
+): void {
+  // Nested daemon/worker environments can carry an older occupant. Clear it
+  // first, then stamp only a coordinated NEW exec in its own domain.
+  delete env[TRAEX_OCCUPANT_ID_ENV_KEY];
+  delete env[TRAEX_DOMAIN_KEY_ENV_KEY];
+  if (!lease || lease.occupancyOnly === true || !lease.occupantId || !lease.domain.registryPath) return;
+  env[TRAEX_OCCUPANT_ID_ENV_KEY] = lease.occupantId;
+  env[TRAEX_DOMAIN_KEY_ENV_KEY] = lease.domain.domainKey;
+}
+
 export type TraexGateAcquireResult =
   | { kind: 'granted'; lease: TraexRuntimeLease }
   | { kind: 'blocked'; blockers: TraexRuntimeBlocker[]; detail: string }
@@ -167,11 +182,12 @@ const RELEASE_FILES = ['traex', 'traex-code-mode-host', 'trae-installation.json'
  * pre-checks only — it can never authorize an overlap; the content `comboKey`
  * from the snapshot is the authority.
  */
-export function computeTraexInstallSignature(releaseDir: string): string | undefined {
+export function computeTraexInstallSignature(releaseDir: string, executablePath?: string): string | undefined {
   const parts: string[] = [];
+  const mainExecutable = executablePath ?? join(releaseDir, 'traex');
   for (const name of RELEASE_FILES) {
     try {
-      const st = statSync(join(releaseDir, name), { bigint: true });
+      const st = statSync(name === 'traex' ? mainExecutable : join(releaseDir, name), { bigint: true });
       parts.push(`${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`);
     } catch {
       // A release without the helper/installation file is legitimate; mark the
@@ -388,7 +404,7 @@ export async function acquireTraexRuntimeLease(
     // registered `comboKey` therefore always names the bytes we are about to
     // exec, never the content that happened to be on disk earlier.
     const target = resolveLaunchTarget();
-    const currentSignature = computeTraexInstallSignature(target.releaseDir);
+    const currentSignature = computeTraexInstallSignature(target.releaseDir, target.executablePath);
     if (!snapshot || currentSignature !== snapshotSignature) {
       try {
         snapshot = shouldMaterialize
@@ -407,6 +423,7 @@ export async function acquireTraexRuntimeLease(
     const decision = await acquireTraexRuntimeStart(domain, {
       occupantId,
       comboKey: snapshot.comboKey,
+      ownershipDomainKey: domain.domainKey,
       ...(installSignature ? { installSignature } : {}),
       ...(snapshot.snapshot ? { snapshotDir: snapshot.dir } : {}),
       workerPid: input.workerPid,
@@ -619,12 +636,13 @@ export function precheckTraexRuntime(input: {
   const occupants = readTraexRuntimeOccupants(resolution.domain);
   if (!occupants) return { state: 'unknown', detail: 'registry unreadable' };
   const now = input.now ?? Date.now();
-  const alive = occupants.filter((occupant) => occupantLiveness(occupant, now) !== 'dead');
+  const reconciled = reconcileTraexStartingOrphans(occupants, now);
+  const alive = reconciled.occupants.filter((occupant) => occupantLiveness(occupant, now) !== 'dead');
   if (alive.length === 0) return { state: 'free' };
   const releaseDir = input.executablePath
     ? releaseDirForExecutable(input.executablePath)
     : input.releaseDir;
-  const signature = computeTraexInstallSignature(releaseDir);
+  const signature = computeTraexInstallSignature(releaseDir, input.executablePath);
   const blockers: TraexRuntimeBlocker[] = [];
   for (const occupant of alive) {
     // An occupant whose content was never proven can never be "the same
@@ -678,7 +696,7 @@ export async function captureTraexRunningContentIdentity(
   }
   const comboKey = (await captureTraexExecutableIdentity(running.path)).comboKey;
   if (!comboKey) return undefined;
-  const installSignature = computeTraexInstallSignature(releaseDirForExecutable(running.path));
+  const installSignature = computeTraexInstallSignature(releaseDirForExecutable(running.path), running.path);
   return {
     comboKey,
     ...(installSignature ? { installSignature } : {}),

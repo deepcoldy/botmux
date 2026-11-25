@@ -188,6 +188,9 @@ export interface CodexRpcEngineOpts {
   /** Override the per-request JSON-RPC timeout (default REQUEST_TIMEOUT_MS).
    *  Mainly for tests that assert the wedged-app-server recovery path. */
   requestTimeoutMs?: number;
+  /** Called synchronously after the app-server child exists, before readiness
+   *  or initialize. Lets the runtime record process ownership immediately. */
+  onAppServerSpawn?: (pid: number) => void;
   /** Called once if the app-server dies unexpectedly (not via stop()). The
    *  worker uses it to kill the now-orphaned `codex --remote` pane so the normal
    *  exit→daemon-refork→resume path re-engages RPC on a fresh app-server (P1). */
@@ -442,6 +445,7 @@ export class CodexRpcEngine {
       detached: true,
     });
     this.child.unref(); // don't let the app-server keep the worker's loop alive
+    if (this.child.pid !== undefined) this.opts.onAppServerSpawn?.(this.child.pid);
     this.child.stderr?.on('data', (c: Buffer) => {
       this.lastStderr = (this.lastStderr + c.toString('utf8')).slice(-4000);
     });

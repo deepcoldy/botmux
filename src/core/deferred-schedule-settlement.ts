@@ -1,5 +1,6 @@
 import type { DaemonSession } from './types.js';
 import type { ScheduledTask } from '../types.js';
+import { logger } from '../utils/logger.js';
 
 /** Worker → daemon terminal error code: a hidden schedule run's CLI never
  *  recorded the prompt it was started with, so the run never executed (#1607). */
@@ -72,6 +73,39 @@ export function settleHeldScheduleRunsOnWorkerExit(
     )) settled += 1;
   }
   return settled;
+}
+
+/** Stop pre-ready workers whose scheduled turn can no longer be allowed to
+ * execute (timeout, pause or task deletion). Ready turns are never killed by
+ * this path: they own their output and must settle through the normal lifecycle. */
+export function cancelPreReadyScheduledWorkers(
+  sessions: Iterable<DaemonSession>,
+  runId: string,
+  close: (ds: DaemonSession) => void | Promise<void>,
+): number {
+  let cancelled = 0;
+  for (const ds of sessions) {
+    const runs = [
+      ...(ds.session.scheduledRun ? [ds.session.scheduledRun] : []),
+      ...Object.values(ds.session.scheduledRuns ?? {}),
+    ];
+    if (!runs.some(run => run.runId === runId)) continue;
+    const stagedPlaceholder = ds.initialStartPending === true && !ds.worker;
+    const waitingWorker = !!ds.worker && !ds.worker.killed && ds.workerReady !== true;
+    // A fresh schedule run registers its placeholder BEFORE awaiting durable
+    // admission. Cancellation must retire that workerless placeholder too, or
+    // the already-queued continuation can later fork after pause/delete.
+    if (!stagedPlaceholder && !waitingWorker) continue;
+    cancelled += 1;
+    try {
+      void Promise.resolve(close(ds)).catch(error => {
+        logger.warn(`[scheduler] Failed to close pre-ready worker for run ${runId}: ${String(error)}`);
+      });
+    } catch (error) {
+      logger.warn(`[scheduler] Failed to close pre-ready worker for run ${runId}: ${String(error)}`);
+    }
+  }
+  return cancelled;
 }
 
 /** Execute the exact-turn lifecycle decision after a hidden schedule run

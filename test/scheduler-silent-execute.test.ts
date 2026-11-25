@@ -2000,6 +2000,7 @@ describe('task-position restart recovery', () => {
 });
 
 import * as realScheduler from '../src/core/scheduler.js';
+import { cancelPreReadyScheduledWorkers } from '../src/core/deferred-schedule-settlement.js';
 describe('independent PR2 round2 schedule admission', () => {
   it('does not fork when the production dispatch marker returns false', async () => {
     const active = new Map<string, DaemonSession>();
@@ -2023,6 +2024,101 @@ describe('independent PR2 round2 schedule admission', () => {
     expect(outcome).toBe('deferred');
     expect(forkWorkerMock).not.toHaveBeenCalled();
     expect(sendWorkerInputMock).not.toHaveBeenCalled();
+  });
+
+  it('rolls back a fresh placeholder when durable admission is refused', async () => {
+    const active = new Map<string, DaemonSession>();
+    const runtime = {
+      runId: 'run-rollback', turnId: 'schedule:task0001:rollback',
+      onBeforeDispatch: vi.fn().mockReturnValueOnce(false).mockReturnValue(true),
+    };
+    expect(await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion, undefined, runtime,
+    )).toBe('deferred');
+    expect(active.size).toBe(0);
+    expect(closeSessionMock).toHaveBeenCalledOnce();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+
+    expect(await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion, undefined, runtime,
+    )).toBe('dispatched');
+    expect(forkWorkerMock).toHaveBeenCalledOnce();
+  });
+
+  it.each(['pause', 'remove'] as const)('does not fork an admitted placeholder after %s during the admission wait', async action => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-admission-intervention-'));
+    const previousDataDir = config.session.dataDir;
+    const authority = ScheduleAuthorityStore.open(root);
+    const active = new Map<string, DaemonSession>();
+    const runId = 'run-admission-intervention';
+    const turnId = 'schedule:task0001:admission-intervention';
+    let releaseAdmission!: () => void;
+    let admissionStarted!: () => void;
+    const admissionGate = new Promise<void>(resolve => { releaseAdmission = resolve; });
+    const admitted = new Promise<void>(resolve => { admissionStarted = resolve; });
+    let cancellations = 0;
+    try {
+      config.session.dataDir = root;
+      authority.initializeApp(APP, []);
+      realScheduler.setScheduleAuthorityStore(authority);
+      realScheduler.setOwnerFilter(APP, true);
+      realScheduler.setScheduleFailureAlert(null);
+      realScheduler.setParkedRunCancellationHandler((_task, cancelledRunId) => {
+        cancellations += 1;
+        cancelPreReadyScheduledWorkers(active.values(), cancelledRunId, ds => {
+          for (const [key, candidate] of active) if (candidate === ds) active.delete(key);
+          ds.session.status = 'closed';
+          closeSessionMock(ds.session.sessionId);
+        });
+      });
+      const task = realScheduler.addTask({
+        id: 'task0001', name: 'admission intervention', schedule: 'every 30m',
+        prompt: 'check', workingDir: root, chatId: CHAT, larkAppId: APP,
+        owner: { kind: 'ownerless' }, executionPosition: 'new-topic', silent: true,
+      });
+      authority.updateTask(APP, task.id, current => ({ ...current, lastRunId: runId, lastStatus: 'running' }));
+      const claimed = authority.getRecord(APP, task.id)!.task;
+      const executing = executeScheduledTask(claimed, active, refreshCliVersion, undefined, {
+        runId,
+        turnId,
+        onBeforeDispatch: async (_turn, selected) => {
+          expect(selected?.worker).toBeNull();
+          expect(realScheduler.markDeferredTargetDispatching(task.id, runId, CHAT, turnId, APP)).toBe(true);
+          admissionStarted();
+          await admissionGate;
+          return true;
+        },
+      });
+      await admitted;
+      expect(active.size).toBe(1);
+      expect([...active.values()][0]?.worker).toBeNull();
+
+      if (action === 'pause') expect(realScheduler.disableTask(task.id)).toBe(true);
+      else expect(realScheduler.removeTask(task.id)).toBe(true);
+      expect(cancellations).toBe(1);
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+
+      releaseAdmission();
+      await expect(executing).resolves.toBe('deferred');
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(active.size).toBe(0);
+      if (action === 'pause') {
+        const settled = realScheduler.getRuntimeTask(task.id, APP)!;
+        expect(settled.lastStatus).toBe('skipped');
+        expect(settled.repeat?.completed ?? 0).toBe(0);
+        expect(settled.deferredRun).toBeUndefined();
+      } else {
+        expect(realScheduler.getRuntimeTask(task.id, APP)).toBeUndefined();
+      }
+    } finally {
+      realScheduler.stopScheduler();
+      realScheduler.setParkedRunCancellationHandler(null);
+      realScheduler.setScheduleFailureAlert(null);
+      realScheduler.setScheduleAuthorityStore(null);
+      authority.close();
+      config.session.dataDir = previousDataDir;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -2181,6 +2277,7 @@ describe('retained TRAE scheduling uses the actual session launch', () => {
     store.set(session.sessionId, session);
     return {
       session, worker: live ? { killed: false } as any : null, workerPort: null, workerToken: null,
+      workerReady: live,
       larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'thread',
       spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
       hasHistory: true, workingDir: '/tmp',
@@ -2254,6 +2351,39 @@ describe('retained TRAE scheduling uses the actual session launch', () => {
       expect(outcome).toBe('dispatched');
       expect(sendWorkerInputMock).toHaveBeenCalledOnce();
       expect(forkWorkerMock).not.toHaveBeenCalled();
+    } finally {
+      Object.assign(BOT.config, prior);
+      rmSync(isolated, { recursive: true, force: true });
+    }
+  });
+
+  it('does not skip the runtime precheck for a pre-ready worker', async () => {
+    const isolated = mkdtempSync(join(tmpdir(), 'pr2-pre-ready-precheck-'));
+    const home = join(isolated, 'home');
+    const release = join(isolated, 'release');
+    mkdirSync(join(home, 'skills'), { recursive: true });
+    mkdirSync(release, { recursive: true });
+    writeFileSync(join(home, 'skills', '.botmux-traex-runtime.json'), '{broken');
+    writeFileSync(join(release, 'traex'), 'release-a');
+    const prior = { cliId: BOT.config.cliId, cliPathOverride: BOT.config.cliPathOverride, env: (BOT.config as any).env };
+    try {
+      BOT.config.cliId = 'traex';
+      (BOT.config as any).cliPathOverride = join(release, 'traex');
+      (BOT.config as any).env = { TRAE_HOME: home };
+      const existing = retainedSession(join(release, 'traex'), true);
+      existing.workerReady = false;
+      const active = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), existing]]);
+      expect(await executeScheduledTask(
+        baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion,
+      )).toBe('deferred');
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+
+      existing.workerReady = true;
+      expect(await executeScheduledTask(
+        baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion,
+      )).toBe('dispatched');
+      expect(sendWorkerInputMock).toHaveBeenCalledOnce();
     } finally {
       Object.assign(BOT.config, prior);
       rmSync(isolated, { recursive: true, force: true });

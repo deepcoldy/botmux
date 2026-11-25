@@ -116,8 +116,11 @@ describe('independent PR2 r6 acceptance ordering', () => {
         ScheduleTargetExecutionError, activeSessions: new Map(), refreshCliVersion: async () => {},
         precondition: { precondition: 'passed' }, targetResults: undefined,
         withBotTurnAdmission: (_app: string, action: () => unknown) => action(),
+        getAllBots: () => [{ config: { larkAppId: APP, cliId: 'traex' } }],
         executeScheduledTask: async (target: any, _sessions: any, _refresh: any, _prompt: any, runtime: any) => {
-          if (!runtime.onBeforeDispatch(runtime.turnId)) return 'deferred';
+          const selectedSession = { larkAppId: APP, chatId: target.chatId,
+            session: { cliId: 'traex', cliLaunchSnapshot: { cliId: 'traex' } } };
+          if (!runtime.onBeforeDispatch(runtime.turnId, selectedSession)) return 'deferred';
           if (target.chatId === 'oc_B' && !retry) return blockerB;
           sent.push(target.chatId);
           return 'dispatched';
@@ -157,9 +160,10 @@ describe('independent PR2 r6 acceptance ordering', () => {
       ScheduleTargetExecutionError, activeSessions: sessions, refreshCliVersion: async () => {},
       precondition: { precondition: 'passed' }, targetResults: undefined,
       withBotTurnAdmission: (_app: string, action: () => unknown) => action(),
+      getAllBots: () => [{ config: { larkAppId: APP, cliId: 'claude-code' } }],
       executeScheduledTask: async (target: any, active: typeof sessions, _refresh: any, _prompt: any, runtime: any) => {
         expect(active.get(target.chatId)!.session.cliId).toBe('traex');
-        if (!runtime.onBeforeDispatch(runtime.turnId)) return 'deferred';
+        if (!runtime.onBeforeDispatch(runtime.turnId, active.get(target.chatId))) return 'deferred';
         sent.push(target.chatId);
         // IPC/fork ownership only; actual session worker still waits in its
         // TRAE start gate. No queue/native acceptance has been reported.
@@ -190,14 +194,17 @@ describe('independent PR2 r6 acceptance ordering', () => {
       executeScheduledTaskForTargets, ScheduleTargetExecutionError, activeSessions: sessions,
       refreshCliVersion: async () => {}, precondition: { precondition: 'passed' }, targetResults: undefined,
       withBotTurnAdmission: (_app: string, action: () => unknown) => action(),
+      getAllBots: () => [{ config: { larkAppId: APP, cliId: 'traex' } }],
       executeScheduledTask: async (target: any, active: typeof sessions, _refresh: any, _prompt: any, runtime: any) => {
-        if (!runtime.onBeforeDispatch(runtime.turnId)) return 'deferred';
         // New-topic routing creates its own fresh session; the old chat-scope
-        // session is NOT the owner of this scheduled turn.
+        // session is NOT the owner of this scheduled turn. Admission receives
+        // that exact new session, just like the production dispatch seam.
         const anchor = silent ? `schedule-run:${taskId}:${runtime.turnId.split(':').at(-1)}` : `om_new_${target.chatId}`;
-        active.set(`${anchor}::${APP}`, { larkAppId: APP, chatId: target.chatId,
+        const selectedSession = { larkAppId: APP, chatId: target.chatId,
           session: { cliId: 'traex', rootMessageId: anchor,
-            scheduledRun: { runId: context.runId, turnId: runtime.turnId } } });
+            scheduledRun: { runId: context.runId, turnId: runtime.turnId } } };
+        active.set(`${anchor}::${APP}`, selectedSession);
+        if (!runtime.onBeforeDispatch(runtime.turnId, selectedSession)) return 'deferred';
         opened.push(anchor);
         // The newly spawned TRAE worker owns the input but awaits the gate.
         // No acceptance receipt has been received.

@@ -24,7 +24,7 @@ import * as scheduler from '../src/core/scheduler.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import { queryScheduleRunLogs } from '../src/services/schedule-run-log-store.js';
-import { settleHeldScheduleRunsOnWorkerExit } from '../src/core/deferred-schedule-settlement.js';
+import { settleHeldScheduleRunsOnWorkerExit, cancelPreReadyScheduledWorkers } from '../src/core/deferred-schedule-settlement.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 
 const APP = 'cli_deferred_test';
@@ -45,6 +45,7 @@ beforeEach(() => {
 afterEach(() => {
   scheduler.stopScheduler();
   scheduler.setScheduleFailureAlert(null);
+  scheduler.setParkedRunCancellationHandler(null);
   vi.useRealTimers();
   vi.restoreAllMocks();
   scheduler.setScheduleAuthorityStore(null);
@@ -589,6 +590,296 @@ describe('deferred scheduled run lifecycle', () => {
     scheduler.setOwnerFilter('cli_some_other_owner', true);
     expect(scheduler.settleParkedRunOnce(task.id, runId, 'explicit app settlement', APP)).toBe(true);
     expect(scheduler.getRuntimeTask(task.id, APP)!.lastStatus).toBe('error');
+  });
+
+  it('keeps authority edits and materialized roots out of the retry claim write', async () => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    const runId = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!.runId;
+    store.updateTask(APP, task.id, current => ({
+      ...current,
+      prompt: 'edited while parked',
+      rootMessageId: 'om_materialized_root',
+      ownerOpenId: 'ou_new_owner',
+      ownerUnionId: 'on_new_owner',
+    }));
+
+    const claim = scheduler.claimDeferredRunForDispatch(task.id, runId, APP);
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    expect(claim.task.prompt).toBe('check');
+    const persisted = store.getRecord(APP, task.id)!.task;
+    expect(persisted).toMatchObject({
+      prompt: 'edited while parked',
+      rootMessageId: 'om_materialized_root',
+      ownerOpenId: 'ou_new_owner',
+      ownerUnionId: 'on_new_owner',
+      lastStatus: 'running',
+    });
+  });
+
+  it('rejects dispatching and claiming after terminal settlement', async () => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    const parked = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!;
+    expect(scheduler.settleParkedRunOnce(task.id, parked.runId, 'terminal before dispatching', APP)).toBe(true);
+
+    expect(scheduler.markDeferredTargetDispatching(task.id, parked.runId, 'oc_b', 'late-turn', APP)).toBe(false);
+    expect(scheduler.claimDeferredRunForDispatch(task.id, parked.runId, APP))
+      .toEqual({ ok: false, error: 'not_deferred' });
+    const after = scheduler.getRuntimeTask(task.id, APP)!;
+    expect(after.deferredRun).toBeUndefined();
+    expect(after.repeat?.completed).toBe(1);
+    expect(after.lastStatus).toBe('error');
+  });
+
+  it.each(['pause', 'untilDone'] as const)('settles an accepted run as success before timeout after %s', async mode => {
+    const task = addTwoTargetTask();
+    if (mode === 'untilDone') {
+      store.updateTask(APP, task.id, current => ({ ...current, untilDone: { status: 'open', attempts: 0 } }));
+    }
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    const parked = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!;
+    const since = Date.parse(parked.since);
+    for (const [chatId, turnId] of Object.entries(parked.targetTurnIds!)) {
+      expect(scheduler.markDeferredTargetAccepted(task.id, parked.runId, chatId, turnId, APP)).toBe(true);
+    }
+    if (mode === 'pause') scheduler.disableTask(task.id);
+    else expect(scheduler.completeTask(task.id).ok).toBe(true);
+    const alert = vi.fn();
+    scheduler.setScheduleFailureAlert(alert);
+
+    vi.useFakeTimers({ now: new Date(since + scheduler.TRAEX_DEFERRED_RUN_TIMEOUT_MS) });
+    scheduler.startScheduler();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const settled = scheduler.getRuntimeTask(task.id, APP)!;
+    expect(settled.lastStatus).toBe('ok');
+    expect(settled.deferredRun).toBeUndefined();
+    expect(settled.repeat?.completed).toBe(1);
+    expect(settled.enabled).toBe(false);
+    expect(settled.disabledReason).toBe(mode === 'pause' ? 'manual' : 'once_completed');
+    if (mode === 'untilDone') expect(settled.untilDone?.status).toBe('done');
+    expect(alert).not.toHaveBeenCalled();
+    scheduler.stopScheduler();
+  });
+
+  it.each(['disableTask', 'setEnabled', 'completeTask'] as const)('cancels an unaccepted run without failure accounting or a late acceptance after %s', async action => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    const parked = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!;
+    if (action === 'completeTask') {
+      store.updateTask(APP, task.id, current => ({ ...current, untilDone: { status: 'open', attempts: 0 } }));
+    }
+    const turnId = Object.values(parked.targetTurnIds!)[0]!;
+    const ds = {
+      worker: { killed: false }, workerReady: false,
+      larkAppId: APP,
+      session: { scheduledRuns: { [turnId]: { taskId: task.id, runId: parked.runId, turnId } } },
+    } as any;
+    const close = vi.fn(() => {
+      ds.worker.killed = true;
+      settleHeldScheduleRunsOnWorkerExit(ds.session, APP, {
+        getDeferredRun: (id, appId) => scheduler.getRuntimeTask(id, appId)?.deferredRun,
+        settle: scheduler.settleParkedRunOnce,
+      }, { currentWorker: true });
+    });
+    scheduler.setParkedRunCancellationHandler((_task, runId) => {
+      cancelPreReadyScheduledWorkers([ds], runId, close);
+    });
+    const alert = vi.fn();
+    scheduler.setScheduleFailureAlert(alert);
+
+    if (action === 'disableTask') expect(scheduler.disableTask(task.id)).toBe(true);
+    else if (action === 'setEnabled') expect(scheduler.setEnabled(task.id, false)).toEqual({ ok: true });
+    else expect(scheduler.completeTask(task.id).ok).toBe(true);
+
+    const settled = scheduler.getRuntimeTask(task.id, APP)!;
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(ds.worker.killed).toBe(true);
+    expect(settled.lastStatus).toBe('skipped');
+    expect(settled.deferredRun).toBeUndefined();
+    expect(settled.repeat?.completed).toBe(0);
+    expect(settled.runStats?.consecutiveFailures ?? 0).toBe(0);
+    expect(alert).not.toHaveBeenCalled();
+    expect(scheduler.noteWorkerRuntimeAccepted(task.id, parked.runId, 'oc_a', turnId, APP)).toBe(false);
+    expect(queryScheduleRunLogs(task.id, {}, APP).logs.filter(entry => entry.outcome === 'error')).toHaveLength(0);
+    if (action === 'completeTask') expect(settled.untilDone?.status).toBe('done');
+  });
+
+  it('writes exactly one successful run log when the tick settles an accepted parked run', async () => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    let executions = 0;
+    scheduler.setExecuteCallback(async (current, context) => {
+      executions += 1;
+      return callback(current, context);
+    });
+    scheduler.runNow(task.id);
+    await flush();
+    const parked = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!;
+    for (const [chatId, turnId] of Object.entries(parked.targetTurnIds!)) {
+      scheduler.noteWorkerRuntimeAccepted(task.id, parked.runId, chatId, turnId, APP);
+    }
+    vi.useFakeTimers({ now: new Date(Date.parse(parked.since) + 30_000) });
+    scheduler.startScheduler();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(scheduler.getRuntimeTask(task.id, APP)?.lastStatus).toBe('ok');
+    expect(executions).toBe(1);
+    const logs = queryScheduleRunLogs(task.id, {}, APP).logs.filter(entry => entry.id === parked.runId);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({
+      outcome: 'model_dispatched', precondition: 'passed', additionalPrompt: true,
+      targetResults: [{ chatId: 'oc_a', outcome: 'model_dispatched' }, { chatId: 'oc_b', outcome: 'model_dispatched' }],
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(queryScheduleRunLogs(task.id, {}, APP).logs.filter(entry => entry.id === parked.runId)).toHaveLength(1);
+  });
+
+  it('rejects schedule-expression edits while a run is parked', async () => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    expect(scheduler.updateTask(task.id, { schedule: '2027-01-01T00:00:00Z' }))
+      .toEqual({ ok: false, error: 'schedule_run_in_flight' });
+    expect(scheduler.getRuntimeTask(task.id, APP)!.parsed.kind).toBe('interval');
+  });
+
+  it.each(['settle', 'disable', 'remove'] as const)('notifies the daemon to cancel a pre-ready worker on %s', async action => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    const runId = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!.runId;
+    const cancel = vi.fn();
+    scheduler.setParkedRunCancellationHandler(cancel);
+    if (action === 'settle') scheduler.settleParkedRunOnce(task.id, runId, 'timeout', APP);
+    else if (action === 'disable') scheduler.disableTask(task.id);
+    else scheduler.removeTask(task.id);
+    expect(cancel).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }), runId);
+  });
+
+  it('cancels the worker even when projection deletion fails after authority revoke', async () => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    const runId = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!.runId;
+    const close = vi.fn();
+    const cancel = vi.fn((_task: ScheduledTask, cancelledRunId: string) => {
+      cancelPreReadyScheduledWorkers([{
+        worker: { killed: false }, workerReady: false,
+        session: { scheduledRuns: { turn: { taskId: task.id, runId: cancelledRunId, turnId: 'turn' } } },
+      } as any], cancelledRunId, close);
+    });
+    scheduler.setParkedRunCancellationHandler(cancel);
+    const previousNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'test';
+    scheduleStore.__setScheduleStoreBeforeRenameTestHook(() => {
+      throw new Error('controlled projection failure');
+    });
+    try {
+      expect(() => scheduler.removeTask(task.id)).toThrow('controlled projection failure');
+      expect(cancel).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }), runId);
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(store.getRecord(APP, task.id)?.state).toBe('revoked');
+      expect(scheduleStore.getTask(task.id, APP)).toBeDefined();
+    } finally {
+      scheduleStore.__setScheduleStoreBeforeRenameTestHook(undefined);
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+    }
+  });
+
+  it('closes only pre-ready workers belonging to the cancelled run', () => {
+    const runId = 'run-cancel';
+    const base = {
+      worker: { killed: false }, workerReady: false, workerPort: null, workerToken: null,
+      larkAppId: APP, chatId: 'oc_a', chatType: 'group', scope: 'thread',
+      spawnedAt: 0, lastMessageAt: 0, hasHistory: true, workingDir: '/tmp',
+    };
+    const pre = {
+      ...base,
+      session: {
+        sessionId: 'pre', rootMessageId: 'om_pre', chatId: 'oc_a', title: 'pre',
+        status: 'active', createdAt: '2026-01-01T00:00:00.000Z',
+        scheduledRuns: { turn: { taskId: 'defer001', runId, turnId: 'turn' } },
+      },
+    } as any;
+    const staged = {
+      ...base,
+      worker: null,
+      initialStartPending: true,
+      session: { ...pre.session, sessionId: 'staged', rootMessageId: 'om_staged' },
+    };
+    const ready = {
+      ...base, workerReady: true,
+      session: { ...pre.session, sessionId: 'ready', rootMessageId: 'om_ready' },
+    };
+    const other = {
+      ...base,
+      session: { ...pre.session, sessionId: 'other', rootMessageId: 'om_other',
+        scheduledRuns: { turn: { taskId: 'defer001', runId: 'run-other', turnId: 'turn' } } },
+    };
+    const close = vi.fn();
+    expect(cancelPreReadyScheduledWorkers([pre, staged, ready, other], runId, close)).toBe(2);
+    expect(close).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledWith(pre);
+    expect(close).toHaveBeenCalledWith(staged);
+  });
+
+  it('ignores a superseded in-flight callback after a newer run has settled', async () => {
+    const task = addTwoTargetTask();
+    let oldContext!: ScheduleExecutionContext;
+    let release!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const publish = vi.spyOn(dashboardEventBus, 'publish');
+    scheduler.setExecuteCallback(async (current, run) => {
+      oldContext = run;
+      scheduler.parkDeferredRun(current.id, run, {
+        runId: run.runId, detail: 'old in-flight run',
+        targets: { oc_a: 'waiting', oc_b: 'waiting' },
+        targetTurnIds: { oc_a: 'schedule:old:a', oc_b: 'schedule:old:b' },
+      });
+      await waiting;
+      return 'executed';
+    });
+    scheduler.runNow(task.id);
+    await flush();
+    expect(scheduler.settleParkedRunOnce(task.id, oldContext.runId, 'old run timed out', APP)).toBe(true);
+
+    scheduler.setExecuteCallback(async () => 'executed');
+    scheduler.runNow(task.id);
+    await flush();
+    const newer = scheduler.getRuntimeTask(task.id, APP)!;
+    expect(newer.lastRunId).not.toBe(oldContext.runId);
+    expect(newer.lastStatus).toBe('ok');
+    expect(newer.repeat?.completed).toBe(2);
+    const firedBeforeOld = publish.mock.calls.filter(([event]) => event.type === 'schedule.fired').length;
+
+    release();
+    await flush();
+    const after = scheduler.getRuntimeTask(task.id, APP)!;
+    expect(after.lastRunId).toBe(newer.lastRunId);
+    expect(after.repeat?.completed).toBe(2);
+    expect(publish.mock.calls.filter(([event]) => event.type === 'schedule.fired'))
+      .toHaveLength(firedBeforeOld);
   });
 
   it('does not let a stale run outcome clear a newer parked run', async () => {
