@@ -253,6 +253,66 @@ export function mapAntigravityCompactOffsetToFull(
   return aligned ? mapped : undefined;
 }
 
+/** Inverse coordinate mapping for paired full/compact completion proof. Records
+ * have the same order in both views; map by record index and validate the first
+ * and boundary step identities so divergent files fail closed. */
+export function mapAntigravityFullOffsetToCompact(
+  fullPath: string,
+  fullOffset: number,
+  compactPath: string,
+): number | undefined {
+  if (!Number.isSafeInteger(fullOffset) || fullOffset < 0 || !existsSync(compactPath)) return undefined;
+  if (fullOffset === 0) return 0;
+  try {
+    if (statSync(fullPath).size < fullOffset) return undefined;
+  } catch {
+    return undefined;
+  }
+  let records = 0;
+  let firstLine: string | undefined;
+  let lastLine: string | undefined;
+  const full = scanJsonlFromOffset(fullPath, 0, {
+    endOffset: fullOffset,
+    onLine: line => {
+      if (!line.trim()) return;
+      records++;
+      firstLine ??= line;
+      lastLine = line;
+    },
+  });
+  if (!full || full.newOffset + Buffer.byteLength(full.pendingTail, 'utf8') < fullOffset) return undefined;
+  if (full.pendingTail.trim()) {
+    records++;
+    firstLine ??= full.pendingTail;
+    lastLine = full.pendingTail;
+  }
+  if (records === 0) return undefined;
+  const origin = stepIdentity(firstLine!);
+  const boundary = stepIdentity(lastLine!);
+  if (origin === undefined || boundary === undefined) return undefined;
+
+  let seen = 0;
+  let mapped: number | undefined;
+  let aligned = true;
+  scanJsonlFromOffset(compactPath, 0, {
+    onLine: (line, lineStart) => {
+      if (!aligned || mapped !== undefined || !line.trim()) return;
+      seen++;
+      if (seen === 1 && stepIdentity(line) !== origin) {
+        aligned = false;
+        return;
+      }
+      if (seen < records) return;
+      if (stepIdentity(line) !== boundary) {
+        aligned = false;
+        return;
+      }
+      mapped = lineStart + Buffer.byteLength(line, 'utf8') + 1;
+    },
+  });
+  return aligned ? mapped : undefined;
+}
+
 /** Appended to a final reply that was read from the compact log with its
  *  content cut (`truncated_fields` lists "content"): the marker alone looks
  *  like model output, and a half reply must not pass as a complete one. */
@@ -1246,7 +1306,7 @@ export function hashAntigravitySubmittedText(text: string): string {
 }
 
 /** 将采样文件坐标系下的字节下界换算到当前读取的 transcriptPath；
- *  compact → full 走 mapAntigravityCompactOffsetToFull，其余无法安全对齐的跨文件切换一律 fail-closed（返回 null）。 */
+ *  compact ↔ full 按同一记录序号换算，无法安全对齐时 fail-closed（返回 null）。 */
 export function resolveAntigravityCandidateMinByteOffset(
   candidate: Pick<AntigravityCompletedTurnCandidate, 'minByteOffset' | 'sampledTranscriptPath'>,
   transcriptPath: string,
@@ -1259,7 +1319,8 @@ export function resolveAntigravityCandidateMinByteOffset(
     return mapped === undefined ? null : mapped;
   }
   if (antigravityCompactSiblingPath(sampled) === transcriptPath) {
-    return candidate.minByteOffset === 0 ? 0 : null;
+    const mapped = mapAntigravityFullOffsetToCompact(sampled, candidate.minByteOffset, transcriptPath);
+    return mapped === undefined ? null : mapped;
   }
   return null;
 }
@@ -1472,4 +1533,60 @@ export function findCompletedAntigravityTurnIds(
     return new Set();
   }
   return result;
+}
+
+/** Reject a missing, truncated or corrupt tail before using a transcript for
+ * completion authority. Only the same 4 MiB evidence window used by completion
+ * is inspected; older history need not be reparsed for this decision. */
+function antigravityTranscriptTailComplete(path: string): boolean {
+  let fd: number | undefined;
+  try {
+    const size = statSync(path).size;
+    if (size <= 0) return false;
+    fd = openSync(path, 'r');
+    const offset = Math.max(0, size - COMPLETED_TURN_MAX_TAIL_BYTES);
+    const buf = Buffer.alloc(Math.min(size, COMPLETED_TURN_MAX_TAIL_BYTES));
+    const count = readSync(fd, buf, 0, buf.length, offset);
+    if (count <= 0 || buf[count - 1] !== 0x0a) return false;
+    const lines = buf.subarray(0, count).toString('utf8').split('\n');
+    if (offset > 0) lines.shift();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try { JSON.parse(line); } catch { return false; }
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** Paired folded-turn completion proof. This is deliberately separate from
+ * no-progress replay proof: completion requires a consumed assistant answer,
+ * while replay requires no answer/tool progress. Native full/compact views must
+ * independently prove the same candidate, and every view must have a complete
+ * readable tail. Any missing/corrupt/partial sibling or tool progress fails
+ * closed instead of letting one view's DONE hide another view's execution. */
+export function findCompletedAntigravityTurnIdsPaired(
+  transcriptPath: string,
+  candidates: readonly AntigravityCompletedTurnCandidate[],
+): Set<string> {
+  if (candidates.length === 0) return new Set();
+  const isFull = basename(transcriptPath) === FULL_TRANSCRIPT_NAME;
+  const isCompact = basename(transcriptPath) === COMPACT_TRANSCRIPT_NAME;
+  const sibling = isFull ? antigravityCompactSiblingPath(transcriptPath)
+    : isCompact ? antigravityFullSiblingPath(transcriptPath) : null;
+  if (!sibling) {
+    return antigravityTranscriptTailComplete(transcriptPath)
+      ? findCompletedAntigravityTurnIds(transcriptPath, candidates) : new Set();
+  }
+  const paths = [transcriptPath, sibling];
+  const proofs = paths.map(path => antigravityTranscriptTailComplete(path)
+    ? findCompletedAntigravityTurnIds(path, candidates) : new Set<string>());
+  const completed = new Set<string>();
+  for (const turnId of proofs[0]!) {
+    if (proofs[1]!.has(turnId)) completed.add(turnId);
+  }
+  return completed;
 }

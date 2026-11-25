@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import {
   countAntigravityUserInputMatches,
   findCompletedAntigravityTurnIds,
+  findCompletedAntigravityTurnIdsPaired,
   hashAntigravitySubmittedText,
   resolveAntigravityCandidateMinByteOffset,
   resolveAntigravityTranscriptPath,
@@ -70,7 +71,12 @@ function workerHarness(opts: {
   cliSessionId: string;
   xpiOn?: boolean;
   reattach?: boolean;
+  createSibling?: boolean;
 }) {
+  const compactPath = join(opts.transcriptPath, '..', 'transcript.jsonl');
+  if (opts.createSibling !== false && basename(opts.transcriptPath) === 'transcript_full.jsonl') {
+    writeFileSync(compactPath, readFileSync(opts.transcriptPath));
+  }
   const scope: Record<string, any> = {
     sessionId: 'sid-agy',
     lastInitConfig: { cliId: 'antigravity', cliSessionId: opts.cliSessionId },
@@ -111,7 +117,7 @@ function workerHarness(opts: {
     atomicWriteFileSync,
     withPidMarkerLock: (_path: string, fn: () => void) => fn(),
     resolveAntigravityTranscriptPath: (cid: string) => (cid === opts.cliSessionId ? opts.transcriptPath : null),
-    findCompletedAntigravityTurnIds,
+    findCompletedAntigravityTurnIdsPaired,
     hashAntigravitySubmittedText,
     resolveAntigravityCandidateMinByteOffset,
     countAntigravityUserInputMatches,
@@ -473,6 +479,45 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
       expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_B');
       expect(h.currentBotmuxTurnId).toBe('om_B');
       expect(h.queuedTypeAheadTurns.map((t: any) => t.turnId)).toEqual(['om_C']);
+    });
+  });
+
+  it.each(['full-progress', 'compact-progress', 'missing', 'partial'] as const)('keeps B authority and C queued unless both transcript siblings prove completion (%s)', variant => {
+    withTempWorkspace(dir => {
+      const marker = join(dir, 'marker.json');
+      const fullPath = join(dir, 'transcript_full.jsonl');
+      const compactPath = join(dir, 'transcript.jsonl');
+      const user = userInputRecord(1, larkEnvelope('om_B', 'folded B'));
+      const completed = `${user}\n${plannerDoneRecord(2)}\n`;
+      const progress = `${user}\n${plannerToolCallRecord(2)}\n`;
+      if (variant === 'full-progress') {
+        writeFileSync(fullPath, completed);
+        writeFileSync(compactPath, progress);
+      } else if (variant === 'compact-progress') {
+        writeFileSync(fullPath, progress);
+        writeFileSync(compactPath, completed);
+      } else if (variant === 'partial') {
+        writeFileSync(fullPath, completed);
+        writeFileSync(compactPath, user);
+      } else {
+        writeFileSync(fullPath, completed);
+      }
+
+      const h = workerHarness({
+        markerPath: marker, transcriptPath: fullPath, cliSessionId: 'conv-paired', createSibling: false,
+      });
+      h.setCaptureIdentity('om_B');
+      h.markActiveTurnStarted({ turnId: 'om_B' });
+      h.queuedTypeAheadTurns.push({ turnId: 'om_C' });
+      h.rememberQueuedTurnAdvanceForPendingReady('om_A');
+      writeFileSync(marker, JSON.stringify({ sessionId: 'sid-agy', turnId: 'om_B', queuedTurns: [{ turnId: 'om_C' }] }));
+
+      runPromptReadySettlement(h);
+
+      expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_B');
+      expect(h.currentBotmuxTurnId).toBe('om_B');
+      expect(h.queuedTypeAheadTurns.map((t: any) => t.turnId)).toEqual(['om_C']);
+      expect(h.retiredTurnIds.has('om_B')).toBe(false);
     });
   });
 

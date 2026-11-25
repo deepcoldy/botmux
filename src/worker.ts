@@ -527,7 +527,7 @@ import {
   hasAntigravityPendingTasks,
   hasAntigravityTranscriptPendingTasks,
   drainAntigravityTranscript,
-  findCompletedAntigravityTurnIds,
+  findCompletedAntigravityTurnIdsPaired,
   readAntigravitySideAnswer,
   resolveAntigravityCandidateMinByteOffset,
   resolveAntigravityTranscriptPath,
@@ -9023,7 +9023,7 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
       ...(hint?.skipPriorMatches !== undefined && hint.skipPriorMatches > 0 ? { skipPriorMatches: hint.skipPriorMatches } : {}),
     };
   });
-  const completed = findCompletedAntigravityTurnIds(transcriptPath, candidates);
+  const completed = findCompletedAntigravityTurnIdsPaired(transcriptPath, candidates);
   if (completed.size === 0) return false;
 
   const hasLiveDurableSibling = (turnId: string): boolean => (
