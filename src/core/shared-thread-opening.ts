@@ -80,6 +80,11 @@ export async function openSharedThread(
     if (session.projectRouteRevision !== value.projectRouteRevision) {
       throw new Error('Shared thread route changed; reconcile before retrying');
     }
+    // The externally managed server owns model configuration; the remote TUI
+    // worker refuses an explicit serviceTier on attachment. Reset it inside the
+    // same checkpoint transaction as /adopt does at bind time, covering every
+    // retry and the already-bound idempotent re-entry below.
+    session.serviceTier = 'inherit';
     if (session.cliSessionId && session.existingAppServerEndpoint === value.endpoint) {
       return { ...value, threadId: session.cliSessionId, route: session.projectRouteRevision };
     }

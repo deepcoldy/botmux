@@ -169,6 +169,33 @@ describe('shared new topic persistence', () => {
     expect(inherited.sharedThreadOpening).toBeUndefined();
   });
 
+  it('resets the bot service tier when binding an auto-created shared thread', async () => {
+    init('shared-test');
+    registerCodexInstanceBot({ larkAppId: 'shared-test', larkAppSecret: 'test', cliId: 'codex',
+      serviceTier: 'priority',
+      existingAppServer: { endpoint: 'unix:///tmp/shared.sock', newTopics: 'create' } } as any);
+    const session = createSession('chat', 'root-tier', 'shared', 'group', 'thread',
+      { source: 'ordinary-feishu' });
+    // The fresh ordinary topic carries the bot tier; the remote attachment
+    // worker rejects any defined tier, so binding must normalize it to inherit.
+    expect(session.serviceTier).toBe('priority');
+    session.sharedThreadOpening = { endpoint: 'unix:///tmp/shared.sock', cwd: '/tmp/project', title: 'shared' };
+    updateSession(session);
+    const { openSharedThread } = await import('../src/core/shared-thread-opening.js');
+    const mutate = <T>(change: (row: import('../src/types.js').Session) => T) =>
+      mutateOwnedSessionsAtomically([session.sessionId], rows => change(rows.get(session.sessionId)!),
+        { sharedThreadOpeningWrite: true }).result;
+    await openSharedThread(mutate, { request: async (method: string) => {
+      if (method === 'thread/start') return { thread: { id: 'native-tier' } };
+      if (method === 'thread/read') return { thread: { id: 'native-tier', name: '' } };
+      return {};
+    } });
+    expect(getOwnedSession(session.sessionId)).toMatchObject({
+      cliSessionId: 'native-tier', serviceTier: 'inherit',
+      existingAppServerEndpoint: 'unix:///tmp/shared.sock',
+    });
+  });
+
   it('keeps the received identity across reload and a stale metadata update', () => {
     init('shared-test');
     const session = createSession('chat', 'root-shared', 'shared');

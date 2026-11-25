@@ -32,6 +32,17 @@ describe('new shared thread binding', () => {
     expect(f.calls.filter(method => method === 'thread/start')).toHaveLength(1);
   });
 
+  it('resets an explicit serviceTier so the remote worker can attach', async () => {
+    const f = fixture();
+    f.row().serviceTier = 'priority';
+    await f.run();
+    expect(f.row().serviceTier).toBe('inherit');
+    // The already-bound idempotent re-entry must keep the reset as well.
+    f.row().serviceTier = 'priority';
+    await f.run();
+    expect(f.row().serviceTier).toBe('inherit');
+  });
+
   it('retries preparation after a crash with the already persisted ID', async () => {
     const f = fixture();
     f.remote.request = async method => {
