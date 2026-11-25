@@ -19,7 +19,7 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const rigDirs: string[] = [];
 
-function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' | 'transcript'; zeroPrompt?: boolean; nativeIdentity?: boolean; provisionalStart?: boolean; deferStart?: boolean } = {}) {
+function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' | 'transcript'; zeroPrompt?: boolean; nativeIdentity?: boolean; provisionalStart?: boolean; deferStart?: boolean; ack?: boolean } = {}) {
   let now = 0;
   const queue = new CodexBridgeQueue(() => now);
   queue.mark('om_turn', 'question', now, opts.attempt);
@@ -38,7 +38,7 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     }]);
   }
   const scope: Record<string, any> = {
-    lastInitConfig: { cliId, replyDelivery: opts.delivery ?? 'transcript', adoptMode: false, chatId: 'oc_own', rootMessageId: 'om_root', larkAppId: 'app-own' },
+    lastInitConfig: { cliId, replyDelivery: opts.delivery ?? 'transcript', adoptMode: false, chatId: 'oc_own', rootMessageId: 'om_root', larkAppId: 'app-own', ...(opts.ack === false ? {} : { structuredNoticeAck: true as const }) },
     replyDeliveryMode: () => opts.delivery ?? 'transcript',
     zeroPromptTerminalSync: () => opts.zeroPrompt === true,
     codexAdoptJournalPath: () => undefined,
@@ -54,6 +54,7 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     codexBridgeRolloutPath: 'live-transcript',
     codexBridgeBaselineDone: true,
     rpcTranscriptIngestBlockedByAwaitingActivation: () => false,
+    backendScreenEvidenceIsAuthoritativeForMutation: () => true,
     backgroundTaskTracker: { pendingTurnAgents: () => 0 },
     structuredBridgeIs: (id: string) => id === cliId,
     antigravityPendingRebind: false,
@@ -524,6 +525,82 @@ describe('worker: missing structured final timeout', () => {
     expect(r.scope.structuredTurnsWithSubmitNotice.size).toBe(0);
   });
 
+  it('uses one legacy warning without pendingNotice when ACK is not negotiated', () => {
+    const r = workerRig('doubao', { ack: false });
+    const clock = vi.spyOn(Date, 'now');
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.scope.send.mock.calls.map(([msg]) => msg)).toEqual([{
+      type: 'user_notify', message: 'worker.structured_final_not_collected',
+      kind: 'structured_turn_not_collected', turnId: 'om_turn',
+    }]);
+    expect(r.scope.pendingMissingFinalNotices.size).toBe(0);
+    expect(readBridgeTurnJournal(r.scope.structuredBridgeJournalPath())).toEqual([]);
+  });
+
+  it('does not send silent display retirement to a daemon without ACK capability', () => {
+    const r = workerRig('doubao', { ack: false });
+    r.scope.structuredTurnsWithSubmitNotice.add('om_turn');
+    const clock = vi.spyOn(Date, 'now');
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
+    expect(r.scope.send).not.toHaveBeenCalled();
+    expect(r.scope.pendingMissingFinalNotices.size).toBe(0);
+  });
+
+  it('retains pendingNotice on disk without replay while ACK is not negotiated', () => {
+    const r = workerRig('doubao', { ack: false });
+    const journalPath = r.scope.structuredBridgeJournalPath();
+    stageBridgeTurnNotice(journalPath, {
+      turnId: 'om_turn', noticeId: 'a'.repeat(32), message: 'warning', createdAtMs: 0,
+    });
+    r.scope.restoreMissingFinalNotices = loadWorkerFunction('restoreMissingFinalNotices', r.scope);
+    r.scope.flushMissingFinalNotices = loadWorkerFunction('flushMissingFinalNotices', r.scope);
+    r.scope.restoreMissingFinalNotices();
+    r.scope.flushMissingFinalNotices();
+    expect(r.scope.send).not.toHaveBeenCalled();
+    expect(r.scope.pendingMissingFinalNotices.size).toBe(0);
+    expect(readBridgeTurnJournal(journalPath)[0]?.pendingNotice?.noticeId).toBe('a'.repeat(32));
+  });
+
+  it.each([false, true])('cannot resurrect a legacy-daemon owner after strict checkpoint failure (silent=%s)', silent => {
+    const r = workerRig('doubao', { ack: false });
+    if (silent) r.scope.structuredTurnsWithSubmitNotice.add('om_turn');
+    const journalPath = r.scope.structuredBridgeJournalPath();
+    const rolloutPath = join(rigDirs.at(-1)!, 'rollout.jsonl');
+    writeFileSync(rolloutPath, '');
+    const marked = r.queue.peek()[0]!;
+    appendBridgeTurnJournalEntry(journalPath, {
+      turnId: 'om_turn', markTimeMs: 0, fingerprint: marked.contentFingerprint,
+      wholeInputHash: marked.wholeInputHash, jsonlPath: rolloutPath, offsetAtMark: 0,
+    });
+    Object.assign(r.scope, {
+      codexBridgeRolloutPath: rolloutPath, structuredBridgeRecoveryAttempted: true,
+      codexBridgeOffset: 0, traexQuotaPending: undefined,
+      checkpointCodexAdoptTurns: () => { throw new Error('legacy checkpoint failed'); },
+    });
+    r.scope.checkpointStructuredBridgeRecovery = loadWorkerFunction('checkpointStructuredBridgeRecovery', r.scope);
+    const clock = vi.spyOn(Date, 'now');
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    expect(() => r.settle()).toThrow('legacy checkpoint failed');
+    expect(readBridgeTurnJournal(journalPath)).toEqual([]);
+    const restoredQueue = new CodexBridgeQueue(() => Date.now());
+    const recovered = restoreCodexAdoptTurns(journalPath, rolloutPath, restoredQueue, [{
+      uuid: 'native-user-1', timestampMs: 0, kind: 'user', text: 'question',
+    }], -5_000, 20_000);
+    expect(recovered.restored).toBe(0);
+    expect(restoredQueue.peek()).toEqual([]);
+    expect(r.scope.send.mock.calls.filter(([msg]) => msg.kind === 'structured_turn_not_collected'))
+      .toHaveLength(silent ? 0 : 1);
+  });
+
   it('suppresses the warning when this exact turn already has botmux-send evidence', () => {
     const r = workerRig('doubao');
     const clock = vi.spyOn(Date, 'now');
@@ -718,6 +795,28 @@ describe('worker: missing structured final timeout', () => {
     expect(r.scope.send).not.toHaveBeenCalled();
   });
 
+  it.each(['codex', 'traex'])('uses native proof from task_started corroboration to arm %s', cliId => {
+    const r = workerRig(cliId, { provisionalStart: true });
+    r.queue.ingest([{ uuid: 'native-user-corroborated', timestampMs: 0, kind: 'user', text: 'question',
+      sourceSessionId: 'provider', sourceTurnId: 'native-provisional', sourceMessageId: 'message-1' }]);
+    const turn = r.queue.peek()[0]!;
+    expect(turn).toMatchObject({
+      provisionalTaskStartedAtMs: undefined,
+      nativeUserProof: { uuid: 'native-user-corroborated', timestampMs: 0 },
+    });
+    r.scope.isPromptReady = false;
+    r.scope.hasStructuredLifecycleBlock = () => true;
+    r.scope.structuredRejectedReadyEvidenceGeneration = r.scope.ptyOutputGeneration.snapshot();
+    r.scope.structuredRejectedReadyEvidenceStartUuid = turn.nativeUserProof!.uuid;
+    const clock = vi.spyOn(Date, 'now');
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
+    expect(r.scope.send.mock.calls.filter(([msg]) => msg.kind === 'structured_turn_not_collected')).toHaveLength(1);
+  });
+
   it.each(['omp-provisional', 'antigravity-provisional', 'pending-tail'] as const)('keeps a collectible terminal behind %s', guard => {
     const r = workerRig(guard === 'omp-provisional' ? 'oh-my-pi'
       : guard === 'antigravity-provisional' ? 'antigravity' : 'codex');
@@ -744,6 +843,27 @@ describe('worker: missing structured final timeout', () => {
     r.settle();
     expect(r.queue.peek()).toHaveLength(1);
     expect(r.scope.send).not.toHaveBeenCalled();
+  });
+
+  it.each(['doubao', 'traex'])('requires authoritative screen evidence for %s unless OSC is active', cliId => {
+    const r = workerRig(cliId);
+    r.scope.backendScreenEvidenceIsAuthoritativeForMutation = () => false;
+    const clock = vi.spyOn(Date, 'now');
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(100_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    expect(r.scope.send).not.toHaveBeenCalled();
+
+    r.scope.idleDetector.programStatusActive = () => true;
+    r.settle();
+    clock.mockReturnValue(119_999);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    clock.mockReturnValue(120_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
   });
 
   it('arms on isSessionBusy alone and waits for its actual busy-to-idle edge', () => {

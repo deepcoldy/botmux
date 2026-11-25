@@ -788,6 +788,38 @@ describe('drainCodexRollout', () => {
     ]);
   });
 
+  it('persists native user proof through task_started corroboration for first and successor turns', () => {
+    const start = Date.parse('2026-04-29T07:00:00.000Z');
+    const queue = new CodexBridgeQueue(() => start);
+    queue.mark('first', 'first prompt', start);
+    writeFileSync(path,
+      ev({ timestamp: '2026-04-29T07:00:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'native-1' } })
+      + ev(userResponseItem('first prompt', '2026-04-29T07:00:01.000Z')));
+    let drained = drainCodexRollout(path, 0);
+    queue.ingest(drained.events);
+    expect(queue.peek()[0]).toMatchObject({
+      turnId: 'first', provisionalTaskStartedAtMs: undefined,
+      nativeUserProof: { timestampMs: Date.parse('2026-04-29T07:00:01.000Z') },
+    });
+
+    appendFileSync(path, ev({ timestamp: '2026-04-29T07:00:02.000Z', type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'native-1', last_agent_message: 'done' } }));
+    drained = drainCodexRollout(path, drained.newOffset, drained.state);
+    queue.ingest(drained.events);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'first', finalText: 'done' }]);
+
+    queue.mark('second', 'second prompt', start + 3_000);
+    appendFileSync(path,
+      ev({ timestamp: '2026-04-29T07:00:03.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'native-2' } })
+      + ev(userResponseItem('second prompt', '2026-04-29T07:00:04.000Z')));
+    drained = drainCodexRollout(path, drained.newOffset, drained.state);
+    queue.ingest(drained.events);
+    expect(queue.peek()[0]).toMatchObject({
+      turnId: 'second', provisionalTaskStartedAtMs: undefined,
+      nativeUserProof: { timestampMs: Date.parse('2026-04-29T07:00:04.000Z') },
+    });
+  });
+
   it('renders native CommandExecution and hides its outer JavaScript exec wrapper', () => {
     writeFileSync(path,
       ev(userResponseItem('inspect the readme'))

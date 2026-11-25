@@ -1025,6 +1025,7 @@ import {
   type TurnNoticeRecord,
 } from '../services/ordinary-recovery-notice.js';
 import { deliverStructuredNotice, StructuredNoticeCardPendingError } from '../services/structured-notice-delivery.js';
+import { isStructuredNoticeProtocolMessage } from '../services/structured-notice-protocol.js';
 import {
   attachReadonlyTaskContinuation,
   beginReadonlyTaskContinuationDelivery,
@@ -3350,6 +3351,7 @@ async function retireStructuredNoticeCard(
       larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
       turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
     });
+    if (!owns()) throw new Error('Reply-card turn no longer owns delivery');
     if (error instanceof ReplyCardWithdrawnError || record?.withdrawn) return false;
     if (record?.pendingCreate || record?.pendingPatch || record?.publishPending) {
       throw new StructuredNoticeCardPendingError();
@@ -21475,6 +21477,7 @@ function forkWorkerPrepared(
     sessionId: ds.session.sessionId,
     ...(initStatuslineLaunchGen ? { statuslineLaunchGen: initStatuslineLaunchGen } : {}),
     ...(finalOutputHandoffSupported(ds) ? { finalOutputHandoff: { version: 2 as const, token: randomUUID(), admitNew: finalOutputHandoffAdmitNew(ds) } } : {}),
+    structuredNoticeAck: true as const,
     chatId: ds.chatId,
     chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
@@ -29753,7 +29756,7 @@ function setupWorkerHandlers(
     };
     if (admission.kind === 'defer') { logDeferred('ingest'); return; }
     await sessionController.flushPrimary();
-    admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin);
+    admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin, isStructuredNoticeProtocolMessage(msg));
     if (admission.kind === 'reject') { logRejected(admission.reason); return; }
     if (admission.kind === 'defer') { logDeferred('gateway'); return; }
     // A verified native success is stronger than a lost input commit ACK.
@@ -32431,6 +32434,7 @@ export function forkAdoptWorker(
     chatId: ds.chatId,
     chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
+    structuredNoticeAck: true as const,
     terminalCardEpoch: ds.session.terminalCardEpoch,
     workingDir: adopted.cwd,
     cliId: adoptedCliId,

@@ -37,6 +37,7 @@ import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-obse
 import { ClaudeEffortObserver } from '../../src/services/claude-effort-observer.js';
 import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-choice.js';
 import { finalBridgeSendMarkerCoversOwnThread, isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { isStructuredNoticeProtocolMessage } from '../../src/services/structured-notice-protocol.js';
 import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
 import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from '../../src/core/rewind-backup-retention.js';
 import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
@@ -267,6 +268,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
     if (key === 'isFinalBridgeSendMarker') return isFinalBridgeSendMarker;
     if (key === 'finalBridgeSendMarkerCoversOwnThread') return finalBridgeSendMarkerCoversOwnThread;
+    if (key === 'isStructuredNoticeProtocolMessage') return isStructuredNoticeProtocolMessage;
     if (key === 'paneReplyDeliveryFromProcessTree') return paneReplyDeliveryFromProcessTree;
     if (key === 'REPLY_DELIVERY_ENV') return REPLY_DELIVERY_ENV;
     if (key === 'rewindableErrorCode') return rewindableErrorCode;

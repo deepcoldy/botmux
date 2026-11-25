@@ -196,6 +196,7 @@ import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
 import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, stageBridgeTurnNotice, acknowledgeBridgeTurnNotice, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
 import { RECOVERY_NOTICE_MAX_AGE_MS } from './services/ordinary-recovery-notice.js';
+import { isStructuredNoticeProtocolMessage } from './services/structured-notice-protocol.js';
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
@@ -2366,6 +2367,13 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
     || msg.type === 'type_ahead_queued' || msg.type === 'type_ahead_turn_dropped'
     || msg.type === 'type_ahead_queue_snapshot') {
     delete context.scope.execution;
+    delete context.scope.runtime;
+    delete context.scope.operationId;
+    delete context.bindingId;
+  }
+  if (isStructuredNoticeProtocolMessage(msg)) {
+    // A durable notice belongs to its worker recovery channel, not the runtime
+    // that happened to execute the turn. Keep execution for ownership checks.
     delete context.scope.runtime;
     delete context.scope.operationId;
     delete context.bindingId;
@@ -16142,7 +16150,8 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
       if (recoverySkipReason) log(`Doubao bridge recovery skipped (${recoverySkipReason})`);
       if (restored && !recoverySkipReason) {
         const journalPath = structuredBridgeJournalPath();
-        const proof = journalPath ? readBridgeTurnJournal(journalPath).find(entry => entry.turnId === restored.turnId
+        const proof = journalPath ? readBridgeTurnJournal(journalPath).find(entry => !entry.pendingNotice
+          && entry.turnId === restored.turnId
           && entry.dispatchAttempt === restored.dispatchAttempt && entry.jsonlPath === rolloutPath)?.nativeUserProof : undefined;
         const validFrontier = proof && Number.isSafeInteger(proof.trajectoryOffset)
           && proof.trajectoryOffset >= 0 && proof.trajectoryOffset <= traj.newOffset
@@ -18049,7 +18058,7 @@ interface PendingMissingFinalNotice {
 const pendingMissingFinalNotices = new Map<string, PendingMissingFinalNotice>();
 
 function transmitMissingFinalNotice(record: PendingMissingFinalNotice): void {
-  if (closeRequested) return;
+  if (closeRequested || lastInitConfig?.structuredNoticeAck !== true) return;
   const now = Date.now();
   // Stop before the daemon expires its delivered dedupe tombstone. Cleanup
   // failure keeps the expired record for another cleanup attempt, never a send.
@@ -18080,22 +18089,36 @@ function transmitMissingFinalNotice(record: PendingMissingFinalNotice): void {
 }
 
 function notifyMissingFinalTurn(turnId: string, silent = false): void {
+  const message = silent ? '' : t('worker.structured_final_not_collected', { cliName: cliName() });
   const path = codexAdoptJournalPath() ?? structuredBridgeJournalPath();
   if (!path || !sessionId || !lastInitConfig?.larkAppId) throw new Error('missing-final notice journal unavailable');
-  const message = silent ? '' : t('worker.structured_final_not_collected', { cliName: cliName() });
   const noticeId = createHash('sha256').update(JSON.stringify([
     'structured_final_not_collected', lastInitConfig.larkAppId, sessionId, turnId,
   ])).digest('hex').slice(0, 32);
-  // This atomic write is the authoritative recovery transition. A later
-  // best-effort checkpoint failure cannot restore the old business owner.
+  // This atomic write is the authoritative recovery transition for BOTH
+  // negotiated and legacy sends. A crash/checkpoint failure cannot restore the
+  // old business owner even when no daemon ACK protocol exists.
   const createdAtMs = Date.now();
   stageBridgeTurnNotice(path, { turnId, noticeId, message, createdAtMs, silent });
+  if (lastInitConfig?.structuredNoticeAck !== true) {
+    try {
+      // Old daemons cannot ACK and misinterpret silent display retirement.
+      if (!silent) send({ type: 'user_notify', message, kind: 'structured_turn_not_collected', turnId });
+    } finally {
+      // Normal legacy operation retains no tombstone/capacity. If cleanup fails,
+      // the notice-only record still prevents business-owner resurrection.
+      try { acknowledgeBridgeTurnNotice(path, turnId, noticeId); }
+      catch (error) { log(`Legacy missing-final tombstone cleanup deferred: ${String(error)}`); }
+    }
+    return;
+  }
   const record = { path, turnId, noticeId, message, silent, createdAtMs, nextAttemptAtMs: 0 };
   pendingMissingFinalNotices.set(noticeId, record);
   transmitMissingFinalNotice(record);
 }
 
 function restoreMissingFinalNotices(): void {
+  if (lastInitConfig?.structuredNoticeAck !== true) return;
   const paths = [...new Set([codexAdoptJournalPath(), structuredBridgeJournalPath()].filter((path): path is string => !!path))];
   for (const path of paths) {
     for (const entry of readBridgeTurnJournal(path)) {
@@ -18112,7 +18135,7 @@ function restoreMissingFinalNotices(): void {
 }
 
 function flushMissingFinalNotices(): void {
-  if (closeRequested) return;
+  if (closeRequested || lastInitConfig?.structuredNoticeAck !== true) return;
   const now = Date.now();
   for (const record of pendingMissingFinalNotices.values()) {
     if (record.nextAttemptAtMs <= now) transmitMissingFinalNotice(record);
@@ -18152,9 +18175,9 @@ function structuredRpcLifecycleOwnerActive(turn?: CodexPendingTurn): boolean {
 }
 
 function structuredMissingFinalHasLifecycleSignals(): boolean {
-  return !!cliAdapter?.busyPattern
-    || typeof cliAdapter?.isSessionBusy === 'function'
-    || idleDetector?.programStatusActive() === true;
+  return idleDetector?.programStatusActive() === true
+    || (backendScreenEvidenceIsAuthoritativeForMutation()
+      && (!!cliAdapter?.busyPattern || typeof cliAdapter?.isSessionBusy === 'function'));
 }
 
 function structuredMissingFinalBlockedByPage(): boolean {

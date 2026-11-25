@@ -626,8 +626,26 @@ describe('one reply card per turn', () => {
     expect(io.send).not.toHaveBeenCalled();
     expect(io.patch).not.toHaveBeenCalled();
     expect(store.read(key)).toMatchObject({ phase: 'completed', displayRetired: true, progress: [] });
+    const persisted = store.read(key);
+    const replay = await new TurnReplyCardStore(dir).update(key, { kind: 'display_retired', silent: true }, io);
+    expect(replay.delivered).toBe(false);
+    expect(store.read(key)).toEqual(persisted);
+    expect(io.send).not.toHaveBeenCalled();
+    expect(io.patch).not.toHaveBeenCalled();
     await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
     expect(io.send).not.toHaveBeenCalled();
+  });
+
+  it('replays silent native-CoT retirement without creating a ghost bubble or answer card', async () => {
+    const nativeKey = await nativeTurn('om_native_silent_replay');
+    await store.noteExternalFinal(nativeKey, input.chatId);
+    await store.update(nativeKey, { kind: 'display_retired', silent: true }, io);
+    const persisted = store.read(nativeKey);
+    await new TurnReplyCardStore(dir).update(nativeKey, { kind: 'display_retired', silent: true }, io);
+    expect(store.read(nativeKey)).toEqual(persisted);
+    expect(io.beforeCreate).not.toHaveBeenCalled();
+    expect(io.send).not.toHaveBeenCalled();
+    expect(io.patch).not.toHaveBeenCalled();
   });
 
   it('replays an unknown initial POST with its original UUID before silently retiring its display', async () => {

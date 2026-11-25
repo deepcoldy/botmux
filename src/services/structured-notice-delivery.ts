@@ -85,28 +85,34 @@ async function runStructuredNoticeDelivery(input: StructuredNoticeDeliveryInput)
     let cardRetired = false;
     try { cardRetired = await input.retireCard(); }
     catch (error) {
+      if (!input.owns()) return;
       input.onCardError?.(error);
       if (record.carrier === 'silent' || error instanceof StructuredNoticeCardPendingError) throw error;
     }
+    if (!input.owns()) return;
     if (cardRetired || record.carrier === 'silent') {
       // This is a separate durable edge, NOT a text-outbox fallback: if this write
       // fails, a retry may idempotently PATCH the card, but must not also post text.
       const current = find();
       if (!current || current.delivery.state !== 'pending') throw new Error('structured_notice_pending_record_lost');
+      const beforePersist = structuredClone(session.turnNotices);
       current.delivery.state = 'delivered';
       current.delivery.attempts += 1;
       current.delivery.deliveredAt = input.now?.() ?? Date.now();
       current.delivery.nextAttemptAt = undefined;
       current.delivery.lastError = undefined;
-      input.persist();
+      try { input.persist(); }
+      catch (error) { session.turnNotices = beforePersist; throw error; }
     } else {
       // A definite no-card outcome may change carrier, but the transition itself
       // must be durable BEFORE the first text attempt.
       const current = find();
       if (!current || current.delivery.state !== 'pending') throw new Error('structured_notice_pending_record_lost');
+      const beforePersist = structuredClone(session.turnNotices);
       current.carrier = 'text';
       current.delivery.nextAttemptAt = input.now?.() ?? Date.now();
-      input.persist();
+      try { input.persist(); }
+      catch (error) { session.turnNotices = beforePersist; throw error; }
       await input.deliverPending(noticeId);
     }
   }

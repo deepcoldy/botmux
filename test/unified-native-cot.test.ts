@@ -664,6 +664,20 @@ describe('unified replies with an independent native CoT channel', () => {
     expect(send).toHaveBeenCalledOnce();
   }, 15_000);
 
+  it('does not classify a withdrawn card as text-safe after ownership is lost', async () => {
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    vi.mocked(updateMessage).mockRejectedValue(new MessageWithdrawnError());
+    await expect(updateTurnReplyCard(ds, 'om_turn', { kind: 'terminal', phase: 'completed' }, send))
+      .rejects.toThrow(ReplyCardWithdrawnError);
+    const scope: Record<string, any> = {
+      ds, config, TurnReplyCardStore, ReplyCardWithdrawnError, StructuredNoticeCardPendingError,
+      retireReplyCardDisplay: vi.fn(async () => { throw new ReplyCardWithdrawnError(); }),
+    };
+    const classify = loadWorkerPoolFunction('retireStructuredNoticeCard', scope);
+    await expect(classify(ds, { turnId: 'om_turn', message: 'warning' }, send, () => false))
+      .rejects.toThrow('no longer owns delivery');
+  });
+
   it('still persists retirement when the preceding buffered tool PATCH exhausts its retries', async () => {
     bot.config.cotEnabled = true;
     await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);

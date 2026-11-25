@@ -27,6 +27,8 @@ import {
   appendBridgeTurnJournalEntry,
   acknowledgeBridgeTurnNotice,
   stageBridgeTurnNotice,
+  stageBridgeFinalOutput,
+  acknowledgeBridgeFinalOutput,
   BRIDGE_TURN_RECOVERY_MAX_BYTES,
   BridgeRestoreGate,
   claimRetiredGenerationEntries,
@@ -43,6 +45,7 @@ import {
 } from '../src/services/bridge-turn-journal.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
+import { finalOutputSnapshot } from '../src/services/final-output-handoff.js';
 import { logger } from '../src/utils/logger.js';
 import { splitTranscriptEventsByCutoff, type TranscriptEvent } from '../src/services/claude-transcript.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -152,12 +155,50 @@ describe('bridge turn journal file ops', () => {
     expect(JSON.parse(readFileSync(path, 'utf8')).version).toBe(1);
   });
 
+  it.each(['notice-first', 'final-first'] as const)('settles combined final and notice obligations in %s ACK order across a restart', (order) => {
+    const turnId = 'om_combined';
+    const snapshot = finalOutputSnapshot('app_test', {
+      sessionId: 'session', turnId, lastUuid: 'native-final', content: 'answer',
+    });
+    appendBridgeTurnJournalEntry(path, entry({ turnId, handoffVersion: 1 }));
+    stageBridgeFinalOutput(path, snapshot);
+    const noticeId = 'c'.repeat(32);
+    stageBridgeTurnNotice(path, { turnId, noticeId, message: 'warning', createdAtMs: 2_000 });
+    expect(readBridgeTurnJournal(path)[0]).toMatchObject({
+      pendingFinal: { intentId: snapshot.intentId }, pendingNotice: { noticeId },
+    });
+
+    if (order === 'notice-first') {
+      acknowledgeBridgeTurnNotice(path, turnId, noticeId);
+      expect(readBridgeTurnJournal(path)[0]?.pendingFinal?.intentId).toBe(snapshot.intentId);
+      expect(readBridgeTurnJournal(path)[0]?.pendingNotice).toBeUndefined();
+    } else {
+      acknowledgeBridgeFinalOutput(path, snapshot);
+      expect(readBridgeTurnJournal(path)[0]?.pendingFinal).toBeUndefined();
+      expect(readBridgeTurnJournal(path)[0]?.pendingNotice?.noticeId).toBe(noticeId);
+    }
+
+    // The journal has no process-local state: this disk round trip is the same
+    // handoff a restarted worker performs before delivering the other ACK.
+    writeBridgeTurnJournal(path, readBridgeTurnJournal(path));
+    expect(readBridgeTurnJournal(path)).toHaveLength(1);
+
+    if (order === 'notice-first') acknowledgeBridgeFinalOutput(path, snapshot);
+    else acknowledgeBridgeTurnNotice(path, turnId, noticeId);
+    expect(readBridgeTurnJournal(path)).toEqual([]);
+  });
+
   it('pins a staged notice until exact ACK without ever restoring its business owner', () => {
     const noticeId = 'a'.repeat(32);
-    appendBridgeTurnJournalEntry(path, entry({ turnId: 'om_notice', fingerprint: 'question' }));
+    appendBridgeTurnJournalEntry(path, entry({ turnId: 'om_notice', fingerprint: 'question',
+      nativeUserProof: { uuid: 'native-user', hash: 'hash', timestampMs: 1_000_000, trajectoryOffset: 0 } }));
     stageBridgeTurnNotice(path, { turnId: 'om_notice', noticeId, message: 'Open the Web terminal', createdAtMs: 1_000_100 });
     expect(readBridgeTurnJournal(path)[0]?.pendingNotice).toEqual({
       noticeId, message: 'Open the Web terminal', createdAtMs: 1_000_100,
+    });
+    expect(readBridgeTurnJournal(path)[0]).toEqual({
+      turnId: 'om_notice', markTimeMs: 1_000_000, jsonlPath: 'structured-notice', offsetAtMark: 0,
+      pendingNotice: { noticeId, message: 'Open the Web terminal', createdAtMs: 1_000_100 },
     });
     expect(selectRestorableBridgeTurns(readBridgeTurnJournal(path), {
       currentJsonlPath: '/tmp/session.jsonl', nowMs: 1_000_100,

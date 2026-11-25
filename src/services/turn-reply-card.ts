@@ -257,7 +257,8 @@ export class TurnReplyCardStore {
         // deliberately shares update()'s lock and beforeEffect/owns barrier:
         // an uncertain first POST, any final payload or an existing terminal
         // outcome must instead use the full publication/recovery protocol below.
-        if (!replyCardIsTerminal(record) && !record.messageId && !record.pendingCreate && !record.finalCard) {
+        if ((!replyCardIsTerminal(record) || (record.displayRetired && record.phase === 'completed'))
+          && !record.messageId && !record.pendingCreate && !record.finalCard) {
           record.displayRetired = true;
           record.phase = 'completed';
           delete record.pendingPatch;

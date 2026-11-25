@@ -89,6 +89,8 @@ describe('durable structured notice delivery', () => {
     expect(input.deliverPending).not.toHaveBeenCalled();
     expect(input.acknowledge).not.toHaveBeenCalled();
     expect(durablePending?.turnNotices?.[0]?.delivery.state).toBe('pending');
+    expect(session.turnNotices?.[0]).toMatchObject({ carrier: 'card' });
+    expect(session.turnNotices?.[0]?.delivery.state).toBe('pending');
 
     // Restart from the actual durable pending row. Replaying the same card PATCH
     // is idempotent; the text outbox must stay unused and exactly one ACK goes out.
@@ -254,6 +256,36 @@ describe('durable structured notice delivery', () => {
     expect(textAttempts).toBe(2);
     expect(replay.input.acknowledge).toHaveBeenCalledOnce();
     expect(session.turnNotices?.[0]?.delivery.state).toBe('delivered');
+  });
+
+  it.each(['reject', 'resolve'] as const)('does not change carrier or settle after losing ownership during card %s', async outcome => {
+    let owned = true;
+    const first = fixture({
+      owns: () => owned,
+      retireCard: vi.fn(async () => {
+        owned = false;
+        if (outcome === 'reject') throw new Error('ownership changed during card update');
+        return true;
+      }),
+    });
+    await deliverStructuredNotice(first.input);
+    expect(first.input.deliverPending).not.toHaveBeenCalled();
+    expect(first.input.acknowledge).not.toHaveBeenCalled();
+    expect(first.session.turnNotices?.[0]).toMatchObject({ carrier: 'card' });
+    expect(first.session.turnNotices?.[0]?.delivery.state).toBe('pending');
+  });
+
+  it('rolls back an in-memory carrier transition when its durable write fails', async () => {
+    let writes = 0;
+    const first = fixture({
+      retireCard: vi.fn(async () => false),
+      persist: vi.fn(() => { if (++writes === 2) throw new Error('carrier write failed'); }),
+    });
+    await expect(deliverStructuredNotice(first.input)).rejects.toThrow('carrier write failed');
+    expect(first.input.deliverPending).not.toHaveBeenCalled();
+    expect(first.input.acknowledge).not.toHaveBeenCalled();
+    expect(first.session.turnNotices?.[0]).toMatchObject({ carrier: 'card' });
+    expect(first.session.turnNotices?.[0]?.delivery.state).toBe('pending');
   });
 
   it('coalesces concurrent duplicate IPC deliveries into one card effect and one ACK', async () => {

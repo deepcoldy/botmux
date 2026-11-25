@@ -2472,6 +2472,9 @@ type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
         sessionContract?: import('./services/session-contract.js').SessionContractBootstrap;
         settledTurnTerminals?: Array<{ turnId: string; status: 'completed' }>;
         finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean };
+        /** Daemon persists and ACKs structured missing-final notices. Without
+         * this bit workers retain legacy single-send/no-silent-display behavior. */
+        structuredNoticeAck?: true;
       }
     : Message
   : never;

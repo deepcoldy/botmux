@@ -102,7 +102,7 @@ function startScenario() {
     rootMessageId: 'om_root', workingDir: dataDir, cliId: 'doubao', cliPathOverride: fakeCli,
     cliSessionId: nativeId, resume: true, backendType: 'tmux', launchShell: '/bin/bash',
     prompt: 'first pure-text question', turnId: 'om_turn_1', replyDelivery: 'transcript',
-    larkAppId: 'app_doubao', larkAppSecret: 'test-only', apiOnly: true,
+    larkAppId: 'app_doubao', larkAppSecret: 'test-only', apiOnly: true, structuredNoticeAck: true,
   } satisfies DaemonToWorker);
 
   const waitUntil = async (check: () => boolean, what: string, timeoutMs = 30_000) => {

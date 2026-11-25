@@ -166,6 +166,7 @@ describe('contract gateway and real worker boundaries', () => {
 
     const env: Record<string, any> = {
       pendingMissingFinalNotices: new Map(), closeRequested: false,
+      lastInitConfig: { structuredNoticeAck: true },
       codexAdoptJournalPath: () => undefined, structuredBridgeJournalPath: () => journalPath,
       readBridgeTurnJournal, acknowledgeBridgeTurnNotice,
       transmitMissingFinalNotice: vi.fn(), log: vi.fn(),
@@ -366,6 +367,83 @@ describe('contract gateway and real worker boundaries', () => {
     const forged = { ...report, sessionContract: { ...report.sessionContract, producer: { workerId: 'retired-worker', generation: 0 } } };
     expect(s.controller.ingest(forged, s.worker)).toMatchObject({ kind: 'reject' });
   });
+  it.each(['init', 'replacement', 'in-process', 'argv'] as const)('admits durable notices through the current worker channel (%s)', scenario => {
+    const s = fixture();
+    const execution = s.controller.admitInput('om_turn');
+    if (scenario !== 'argv') s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    const producer = scenario === 'replacement' ? s.controller.bindWorker(2).worker : s.worker;
+    const scope = new WorkerSessionEventScope(s.ref, producer);
+    scope.noteAdmission({ ref: execution, runtime: scenario === 'argv' ? undefined : s.runtime,
+      phase: scenario === 'argv' ? 'queued' : 'running' });
+    let binding: ReturnType<typeof scope.beginRuntime> | undefined;
+    if (scenario !== 'init') {
+      binding = scope.beginRuntime();
+      scope.assign(binding.bindingId, s.runtime);
+    }
+    if (scenario === 'replacement' || scenario === 'in-process') {
+      const next = s.controller.reserveBinding('binding-next', producer);
+      s.controller.bindRuntime('binding-next', producer, {
+        backend: 'tmux', physicalId: '222:start2', nativeSessionId: 'native-next', proof: 'process_start',
+      });
+      if (scenario === 'replacement') {
+        binding = scope.beginRuntime();
+        scope.assign(binding.bindingId, next);
+      }
+    }
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', { workerSessionEventScope: scope });
+    const emit = (message: any) => binding ? scope.run(binding, () => metadata(message)) : metadata(message);
+    for (const message of [
+      { type: 'user_notify', kind: 'structured_turn_not_collected', turnId: 'om_turn', noticeId: 'a'.repeat(32), message: 'warning' },
+      { type: 'turn_display_retired', turnId: 'om_turn', noticeId: 'a'.repeat(32), message: '', silent: true },
+    ]) {
+      const wire = emit(message);
+      expect(wire.sessionContract.scope.runtime).toBeUndefined();
+      expect(wire.sessionContract.bindingId).toBeUndefined();
+      expect(wire.sessionContract.scope.execution).toEqual(execution);
+      expect(s.controller.ingest(wire, producer)).toMatchObject({ kind: 'worker' });
+    }
+  });
+
+  it('rejects lookalike notices without losing execution, sequence, or worker fences', () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('om_turn');
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    scope.noteAdmission({ ref: execution, phase: 'queued' });
+    const binding = scope.beginRuntime(); scope.assign(binding.bindingId, s.runtime);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', { workerSessionEventScope: scope });
+    const wire = scope.run(binding, () => metadata({ type: 'user_notify', kind: 'structured_turn_not_collected',
+      turnId: 'om_turn', noticeId: 'a'.repeat(32), message: 'warning' }));
+    expect(s.controller.ingest({ ...wire, noticeId: undefined }, s.worker)).toMatchObject({ kind: 'reject' });
+    const forged = structuredClone(wire);
+    forged.sessionContract.scope.execution.executionId = 'missing-execution';
+    expect(s.controller.ingest(forged, s.worker)).toMatchObject({ kind: 'reject', reason: 'execution_scope_unproven' });
+    s.controller.bindWorker(2);
+    expect(s.controller.ingest(wire, s.worker)).toMatchObject({ kind: 'reject' });
+  });
+
+  it('re-admits the narrow notice after flushPrimary and delivers it to the legacy handler', async () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('om_turn');
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    scope.noteAdmission({ ref: execution, phase: 'queued' });
+    const binding = scope.beginRuntime(); scope.assign(binding.bindingId, s.runtime);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', { workerSessionEventScope: scope });
+    const wire = scope.run(binding, () => metadata({ type: 'user_notify', kind: 'structured_turn_not_collected',
+      turnId: 'om_turn', noticeId: 'a'.repeat(32), message: 'warning' }));
+    const worker = { send: vi.fn() }; s.ds.worker = worker as any;
+    const legacy = vi.fn();
+    vi.spyOn(s.controller, 'flushPrimary').mockResolvedValue();
+    const env: any = {
+      sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'notice-flush', handleLegacyWorkerMessage: legacy,
+    };
+    const handle = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', env);
+    await handle(wire);
+    expect(legacy).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'user_notify', turnId: 'om_turn', noticeId: 'a'.repeat(32),
+    }));
+  });
+
   it('continues its exact claimed managed suspend after primary control withdraws worker readiness', async () => {
     const fixtureState = fixture();
     const daemon = fixtureState.ds;
@@ -1061,6 +1139,42 @@ describe('contract gateway and real worker boundaries', () => {
       expect(s.controller.ingest(final, replacement)).toMatchObject({ kind: 'reject', reason: 'execution_scope_unproven' });
     }
   });
+  it('does not resurrect a Doubao pendingNotice as a live business owner', () => {
+    const nativeSessionId = '38459999999999999';
+    const s = fixture(nativeSessionId);
+    const turnId = 'running'; const stamp = Date.now(); const prompt = 'Read the docs';
+    const sessionsRoot = join(s.data, 'native', 'workspace', '.sessions');
+    const nativeSystem = join(sessionsRoot, nativeSessionId, 'agents', 'main', 'system');
+    mkdirSync(nativeSystem, { recursive: true });
+    const rolloutPath = join(nativeSystem, 'trajectory.jsonl');
+    const assignment = join(nativeSystem, 'assignment.md');
+    writeFileSync(assignment, `## [${new Date(stamp).toISOString()}] 需求\n${prompt}\n`);
+    writeFileSync(rolloutPath, JSON.stringify({ role: 'assistant', tool_calls: [{ id: 'read', function: { name: 'Read', arguments: '{}' } }] }) + '\n');
+    const proof = { uuid: `${assignment}:0`, hash: createHash('sha256').update(prompt).digest('hex'), timestampMs: stamp, trajectoryOffset: 0 };
+    const journal = join(s.data, 'bridge-journal.json');
+    writeBridgeTurnJournal(journal, [{
+      turnId, markTimeMs: stamp, jsonlPath: rolloutPath, offsetAtMark: 0, nativeUserProof: proof,
+      pendingNotice: { noticeId: 'a'.repeat(32), message: 'warning', createdAtMs: stamp },
+    }]);
+    const env: any = {
+      backend: { cliPid: 111 }, effectiveBackendType: 'tmux',
+      lastInitConfig: { cliId: 'doubao', cliSessionId: nativeSessionId }, lastSpawnEffectiveCliSessionId: nativeSessionId,
+      sessionId: s.ref.sessionId, currentBotmuxTurnId: turnId, currentBotmuxDispatchAttempt: undefined,
+      nativeSessionForkPending: () => false, structuredBridgeIs: (id: string) => id === 'doubao',
+      codexSubagentLimitTracker: { clear() {} }, existsSync, statSync, baselineJsonlCursor,
+      doubaoRestoredExecution: { turnId }, markerQueuedTurnStillLive: () => true,
+      backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+      structuredBridgeJournalPath: () => journal, readBridgeTurnJournal, doubaoLiveUser,
+      codexBridgeQueue: new CodexBridgeQueue(() => stamp), readProcessStartIdentity: () => 'start1',
+      doubaoTrajectoryPathForSession: () => join(nativeSystem, 'trajectory.jsonl'),
+      log: vi.fn(), fsWatch: () => ({ close() {} }), codexBridgeStartTimer() {}, checkpointStructuredBridgeRecovery() {},
+    };
+    const attach = loadWorkerFunction<(path: string, mode: string) => void>('codexBridgeAttach', env);
+    attach(rolloutPath, 'baseline-existing');
+    expect(env.codexBridgeQueue.peek()).toEqual([]);
+    expect(env.doubaoRestoredExecution).toBeUndefined();
+  });
+
   it.each(['exact', 'missing', 'different-pid', 'different-start', 'different-native'])('keeps a proven Doubao live reattach on its original execution (%s)', condition => {
     const s = fixture();
     const execution = s.controller.admitInput('running');

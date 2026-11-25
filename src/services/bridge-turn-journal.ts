@@ -236,14 +236,21 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
 export function writeBridgeTurnJournal(path: string, pending: BridgeTurnJournalEntry[], acknowledgedIntentId?: string, acknowledgedNoticeId?: string): void {
   // Takeover/pruning callers may know only CLI marks. Until their exact ACK,
   // persisted final snapshots and notice obligations survive those operations.
-  const pinned = readBridgeTurnJournal(path).filter(entry =>
-    (entry.pendingFinal && entry.pendingFinal.intentId !== acknowledgedIntentId)
-    || (entry.pendingNotice && entry.pendingNotice.noticeId !== acknowledgedNoticeId));
+  // ACKs settle obligations independently. If one obligation on a combined
+  // entry is acknowledged, pin only the other one; re-pinning the old row
+  // wholesale would resurrect the acknowledged final/notice on the next ACK.
+  const pinned = readBridgeTurnJournal(path).flatMap(entry => {
+    if (!entry.pendingFinal && !entry.pendingNotice) return [];
+    const remaining = { ...entry };
+    if (remaining.pendingFinal?.intentId === acknowledgedIntentId) delete remaining.pendingFinal;
+    if (remaining.pendingNotice?.noticeId === acknowledgedNoticeId) delete remaining.pendingNotice;
+    return remaining.pendingFinal || remaining.pendingNotice ? [remaining] : [];
+  });
   pending = [...pending];
   for (const entry of pinned) {
     const index = pending.findIndex(item => item.turnId === entry.turnId && item.dispatchAttempt === entry.dispatchAttempt);
     if (index < 0) pending.push(entry);
-    else pending[index] = entry;
+    else pending[index] = { ...entry, ...pending[index] };
   }
   const retained = pending.filter(entry => !!entry.pendingFinal || !!entry.pendingNotice || entry.handoffVersion === 1);
   if (retained.length > MAX_JOURNAL_ENTRIES) throw new Error('final_output_handoff_backpressure');
@@ -290,14 +297,23 @@ export function stageBridgeTurnNotice(
   if (!/^[a-f0-9]{32}$/.test(input.noticeId) || (!input.message && input.silent !== true) || Buffer.byteLength(input.message) > 8 * 1024
     || !Number.isFinite(input.createdAtMs)) throw new Error('invalid_bridge_notice');
   const entries = readBridgeTurnJournal(path);
-  let entry = entries.find(item => item.turnId === input.turnId && item.dispatchAttempt === undefined);
-  if (entry?.pendingNotice && entry.pendingNotice.noticeId !== input.noticeId) throw new Error('bridge_notice_conflict');
-  if (!entry) {
-    entry = { turnId: input.turnId, markTimeMs: input.createdAtMs, jsonlPath: 'structured-notice', offsetAtMark: 0 };
-    entries.push(entry);
-  }
-  entry.pendingNotice = { noticeId: input.noticeId, message: input.message, createdAtMs: input.createdAtMs,
+  const index = entries.findIndex(item => item.turnId === input.turnId && item.dispatchAttempt === undefined);
+  const existing = index >= 0 ? entries[index] : undefined;
+  if (existing?.pendingNotice && existing.pendingNotice.noticeId !== input.noticeId) throw new Error('bridge_notice_conflict');
+  const pendingNotice = { noticeId: input.noticeId, message: input.message, createdAtMs: input.createdAtMs,
     ...(input.silent ? { silent: true } : {}) };
+  if (existing?.pendingFinal) {
+    existing.pendingNotice = pendingNotice;
+  } else {
+    // A notice-only entry must be unusable by every business recovery path,
+    // including Doubao's direct nativeUserProof lookup during live-pane attach.
+    const noticeOnly: BridgeTurnJournalEntry = {
+      turnId: input.turnId, markTimeMs: existing?.markTimeMs ?? input.createdAtMs,
+      jsonlPath: 'structured-notice', offsetAtMark: 0, pendingNotice,
+    };
+    if (index < 0) entries.push(noticeOnly);
+    else entries[index] = noticeOnly;
+  }
   writeBridgeTurnJournal(path, entries);
 }
 
