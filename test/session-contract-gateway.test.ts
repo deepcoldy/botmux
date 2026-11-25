@@ -1302,24 +1302,57 @@ describe('contract gateway and real worker boundaries', () => {
     expect(legacy).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps the replay payload when a duplicate meets an in-flight delivery that later fails', async () => {
+    const { s, scope, pending, metadata, bindingMessage, exit, legacy, host } = retainedExitFixture(1);
+    await host(exit);
+    vi.spyOn(s.controller, 'bindRuntime').mockImplementation(() => { throw new Error('injected binding refusal'); });
+    let markStarted!: () => void;
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    let failLegacy!: (error: Error) => void;
+    legacy.mockImplementationOnce(() => {
+      markStarted();
+      return new Promise<void>((_resolve, reject) => { failLegacy = reject; });
+    });
+    const firstRefusal = host(bindingMessage(pending[0]!, 'tmux', '222:first'));
+    await started;
+    // The duplicate must not consume the original in-flight delivery's replay
+    // payload: its owner may still fail and need the next resolution to retry.
+    await host(exit);
+    expect(s.store.deferredPhysicalExits(s.ref)).toHaveLength(1);
+    failLegacy(new Error('injected legacy failure'));
+    await firstRefusal;
+    expect(legacy).toHaveBeenCalledOnce();
+    expect(s.store.deferredPhysicalExits(s.ref)).toHaveLength(1);
+    const reopened = new SessionContractStore(s.data, s.appId);
+    expect(reopened.deferredPhysicalExits(s.ref)).toHaveLength(1);
+    reopened.close();
+    const aborted = scope.beginRuntime(undefined, 'after-failed-delivery');
+    s.controller.reserveBinding(aborted.bindingId, s.worker);
+    await host(scope.run(aborted, () => metadata({ type: 'runtime_binding_aborted', bindingId: aborted.bindingId })));
+    expect(legacy).toHaveBeenCalledTimes(2);
+    expect(s.store.deferredPhysicalExits(s.ref)).toEqual([]);
+    await host(exit);
+    expect(legacy).toHaveBeenCalledTimes(2);
+  });
+
   it('persists physical exit notification claims across owners and SQLite reopen', () => {
     const s = fixture();
-    expect(s.store.claimPhysicalExitNotification(s.ref, 'exit:settled', 'boot-a')).toBe(true);
-    expect(s.store.claimPhysicalExitNotification(s.ref, 'exit:settled', 'boot-a')).toBe(false);
+    expect(s.store.claimPhysicalExitNotification(s.ref, 'exit:settled', 'boot-a')).toBe('claimed');
+    expect(s.store.claimPhysicalExitNotification(s.ref, 'exit:settled', 'boot-a')).toBe('already_notifying');
     s.store.settlePhysicalExitNotification(s.ref, 'exit:settled', 'boot-a');
-    expect(s.store.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-a')).toBe(true);
+    expect(s.store.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-a')).toBe('claimed');
     s.store.close();
     const reopened = new SessionContractStore(s.data, s.appId);
     // A settled notification survives both a different owner and DB reopen.
-    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:settled', 'boot-b')).toBe(false);
+    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:settled', 'boot-b')).toBe('settled');
     // An unfinished claim can be reclaimed after a daemon restart; duplicates
     // from that same new owner remain fenced until the claim is released.
-    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-b')).toBe(true);
-    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-b')).toBe(false);
+    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-b')).toBe('claimed');
+    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-b')).toBe('already_notifying');
     reopened.releasePhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-b');
-    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-a')).toBe(true);
+    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-a')).toBe('claimed');
     reopened.settlePhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-a');
-    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-b')).toBe(false);
+    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-b')).toBe('settled');
     reopened.close();
   });
 

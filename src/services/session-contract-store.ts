@@ -626,14 +626,14 @@ export class SessionContractStore {
   /** Claim the legacy notification separately from contract event dedup. The
    * same daemon owner cannot notify twice concurrently; a new owner may only
    * reclaim an unfinished notification after a process restart. */
-  claimPhysicalExitNotification(ref: ContractSessionRef, eventId: string, owner: string): boolean {
+  claimPhysicalExitNotification(ref: ContractSessionRef, eventId: string, owner: string): 'claimed' | 'already_notifying' | 'settled' {
     return this.transaction(() => {
       const current = this.entity<{ state: string; owner: string }>(ref, 'physical_exit_notification', eventId);
-      if (current?.state === 'settled') return false;
-      if (current?.state === 'notifying' && current.owner === owner) return false;
-      if (current && !['pending', 'notifying'].includes(current.state)) return false;
+      if (current?.state === 'settled') return 'settled';
+      if (current?.state === 'notifying' && current.owner === owner) return 'already_notifying';
+      if (current && !['pending', 'notifying'].includes(current.state)) return 'already_notifying';
       this.saveEntity(ref, 'physical_exit_notification', eventId, 'notifying', { state: 'notifying', owner });
-      return true;
+      return 'claimed';
     });
   }
   settlePhysicalExitNotification(ref: ContractSessionRef, eventId: string, owner: string): void {

@@ -30057,10 +30057,15 @@ function setupWorkerHandlers(
       if (admission.kind === 'current') {
         // Contract event dedup does not cover the legacy side effect. Claim it
         // across normal IPC, replay and SQLite reopen before delivering.
-        if (!sessionController.store.claimPhysicalExitNotification(sessionController.ref, metadata.eventId, owner)) {
+        const claim = sessionController.store.claimPhysicalExitNotification(sessionController.ref, metadata.eventId, owner);
+        if (claim === 'settled') {
           sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId);
           return;
         }
+        // Another handler owns the notification. It must keep the payload:
+        // that owner settles and deletes it on success, or releases the claim
+        // and leaves this same deferred row for a later resolution on failure.
+        if (claim === 'already_notifying') return;
         physicalExitClaimOwner = owner;
       } else if (admission.kind === 'historical' && !retainPhysicalExit) {
         // A genuine replacement permanently suppresses this old process's
