@@ -221,6 +221,49 @@ describe('cross-chat follow store failure and replay semantics', () => {
     expect(records).toHaveLength(3);
   });
 
+  it('never enriches a legacy receipt when the replay names a different provider receipt', () => {
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-a', {
+      sentAtMs: 1000, deliveryKind: 'detoured_send', messageId: 'om_delivery_a',
+      targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed', crossChatFollowThread: 'at',
+    });
+    // A replay backfill naming a receipt the root's latest record does not know
+    // must leave the journal untouched: stamping the old receipt with the new
+    // turn would inject an attribution the actual delivery never carried.
+    expect(ensureCrossChatFollowThreadAtBinding({
+      dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 2000, messageId: 'om_delivery_c',
+      targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed', sourceTurnId: 'om_source_c',
+    })).toBe(true);
+    const records = readFileSync(
+      join(tempDir, '.dashboard-secret.cross-chat-follow-thread', 'sess-a.jsonl'),
+      'utf-8',
+    ).trim().split('\n').map(line => JSON.parse(line));
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ messageId: 'om_delivery_a' });
+    expect(records[0]).not.toHaveProperty('sourceTurnId');
+    const match = resolve();
+    expect(match).not.toBeNull();
+    expect(match).not.toHaveProperty('sourceTurnId');
+  });
+
+  it('never re-stamps an already attributed receipt onto another source turn', () => {
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-a', {
+      sentAtMs: 1000, deliveryKind: 'detoured_send', messageId: 'om_delivery_a',
+      targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed',
+      crossChatFollowThread: 'at', turnId: 'om_source_1',
+    });
+    expect(ensureCrossChatFollowThreadAtBinding({
+      dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 3000, messageId: 'om_delivery_a',
+      targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed', sourceTurnId: 'om_source_2',
+    })).toBe(true);
+    const records = readFileSync(
+      join(tempDir, '.dashboard-secret.cross-chat-follow-thread', 'sess-a.jsonl'),
+      'utf-8',
+    ).trim().split('\n').map(line => JSON.parse(line));
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ messageId: 'om_delivery_a', sourceTurnId: 'om_source_1' });
+    expect(resolve()).toMatchObject({ sourceTurnId: 'om_source_1' });
+  });
+
   it('does not make an old replay outrank a later binding from another source session', () => {
     const candidateSessions: CrossChatCandidateSession[] = [
       ...sessions,
