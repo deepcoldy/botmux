@@ -5121,18 +5121,36 @@ function updateUsageLimitState(
   ds: DaemonSession,
   usageLimit: CliUsageLimitState | undefined,
   owns: () => boolean,
+  episodeState?: {
+    antigravityLastConfirmedQuota?: CliUsageLimitState | null;
+    antigravityRecoveredQuotaKey?: string | null;
+  },
 ): void {
-  if (!usageLimit) return;
-  // Even a repeated refusal invalidates earlier recovery evidence.
-  cancelComposerRecoveryRetry(ds);
+  let episodeChanged = false;
+  if (episodeState?.antigravityLastConfirmedQuota !== undefined) {
+    const next = episodeState.antigravityLastConfirmedQuota;
+    if (ds.antigravityLastConfirmedQuota === undefined
+      || JSON.stringify(ds.antigravityLastConfirmedQuota) !== JSON.stringify(next)) {
+      ds.antigravityLastConfirmedQuota = next;
+      episodeChanged = true;
+    }
+  }
+  if (episodeState?.antigravityRecoveredQuotaKey !== undefined) {
+    const next = episodeState.antigravityRecoveredQuotaKey;
+    if (ds.antigravityRecoveredQuotaKey !== next) {
+      ds.antigravityRecoveredQuotaKey = next;
+      episodeChanged = true;
+    }
+  }
+  if (!usageLimit && !episodeChanged) return;
+  if (usageLimit) cancelComposerRecoveryRetry(ds);
   cancelUsageLimitPersistRetry(ds);
 
   const previous = ds.usageLimit;
-  usageLimit = reconcileUsageLimitState(previous, usageLimit);
+  if (usageLimit) usageLimit = reconcileUsageLimitState(previous, usageLimit);
   // Screen updates repeat the same limit every tick while a session sits
   // blocked. Skip the persist + timer re-arm churn unless the limit changed.
-  if (
-    previous &&
+  if (usageLimit && !episodeChanged && previous &&
     !ds.usageLimitPersistPending &&
     usageLimitStateKey(previous) === usageLimitStateKey(usageLimit) &&
     previous.retryReady === usageLimit.retryReady &&
@@ -5141,8 +5159,10 @@ function updateUsageLimitState(
     previous.nativeLogEpisodeKey === usageLimit.nativeLogEpisodeKey
   ) return;
 
-  ds.usageLimit = usageLimit;
-  rememberSessionAntigravityQuota(ds, usageLimit);
+  if (usageLimit) {
+    ds.usageLimit = usageLimit;
+    rememberSessionAntigravityQuota(ds, usageLimit);
+  }
   ds.usageLimitPersistPending = true;
   try {
     persistStreamCardState(ds);
@@ -5155,7 +5175,7 @@ function updateUsageLimitState(
     return;
   }
   ds.usageLimitPersistPending = false;
-  armUsageLimitRetryTimer(ds, previous);
+  if (usageLimit) armUsageLimitRetryTimer(ds, previous);
 }
 
 function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
@@ -5218,15 +5238,22 @@ function retryUsageLimitPersistence(
   if (usageLimitPersistRetries.get(ds)?.owns()) return;
   cancelUsageLimitPersistRetry(ds);
   const key = ds.usageLimit && usageLimitStateKey(ds.usageLimit);
+  const lastConfirmed = JSON.stringify(ds.antigravityLastConfirmedQuota);
+  const recoveredKey = ds.antigravityRecoveredQuotaKey;
   let delayMs = 500;
   const schedule = (): void => {
     const timer = setTimeout(() => {
       if (usageLimitPersistRetries.get(ds)?.timer !== timer) return;
       usageLimitPersistRetries.delete(ds);
-      if (!owns() || !ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key) return;
+      const usageChanged = key
+        ? !ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key
+        : ds.usageLimit !== undefined;
+      if (!owns() || usageChanged
+        || JSON.stringify(ds.antigravityLastConfirmedQuota) !== lastConfirmed
+        || ds.antigravityRecoveredQuotaKey !== recoveredKey) return;
       try {
         persistStreamCardState(ds);
-        armUsageLimitRetryTimer(ds, previous);
+        if (key) armUsageLimitRetryTimer(ds, previous);
         ds.usageLimitPersistPending = false;
       } catch (error) {
         ds.usageLimitPersistPending = true;
@@ -20681,6 +20708,10 @@ function forkWorkerPrepared(
     ...(agentCfg.cliId === 'antigravity' ? {
       antigravityQuotaHistory: ds.antigravityQuotaHistory ?? ds.session.antigravityQuotaHistory,
       antigravityActiveQuota: ds.usageLimit,
+      antigravityLastConfirmedQuota: ds.antigravityLastConfirmedQuota !== undefined
+        ? ds.antigravityLastConfirmedQuota : ds.session.antigravityLastConfirmedQuota,
+      antigravityRecoveredQuotaKey: ds.antigravityRecoveredQuotaKey !== undefined
+        ? ds.antigravityRecoveredQuotaKey : ds.session.antigravityRecoveredQuotaKey,
     } : {}),
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
@@ -24630,7 +24661,7 @@ function setupWorkerHandlers(
             && (previousLimit.directFailure !== msg.usageLimit.directFailure
               || cliUsageLimitEpisodeKey(previousLimit) !== cliUsageLimitEpisodeKey(msg.usageLimit));
           if (lateNativeEvidence) {
-            updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation);
+            updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation, msg);
             try {
               const published = cb.onScreenStatus?.(ds, {
                 prevStatus: 'limited', status: 'limited', turnId: screenTurnId,
@@ -24650,7 +24681,7 @@ function setupWorkerHandlers(
         const prevBackgroundTaskCount = ds.backgroundTaskCount;
         const prevLabel = streamCardLabel(ds);
         const prevActivity = typeof prevLabel === 'object' && 'activity' in prevLabel ? prevLabel.activity : undefined;
-        updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation);
+        updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation, msg);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = projectedScreenStatus;
         workersWithScreenStatus.add(worker);
@@ -25139,7 +25170,7 @@ function setupWorkerHandlers(
         }
         const prevStatus = ds.lastScreenStatus;
         const previousLimit = ds.usageLimit;
-        updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation);
+        updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation, msg);
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg, ownsLifecycleMutation);
         workersWithScreenStatus.add(worker);
         stampIdleSinceAt(ds, prevStatus);
@@ -31334,6 +31365,10 @@ export function forkAdoptWorker(
     ...(adoptedCliId === 'antigravity' ? {
       antigravityQuotaHistory: ds.antigravityQuotaHistory ?? ds.session.antigravityQuotaHistory,
       antigravityActiveQuota: ds.usageLimit,
+      antigravityLastConfirmedQuota: ds.antigravityLastConfirmedQuota !== undefined
+        ? ds.antigravityLastConfirmedQuota : ds.session.antigravityLastConfirmedQuota,
+      antigravityRecoveredQuotaKey: ds.antigravityRecoveredQuotaKey !== undefined
+        ? ds.antigravityRecoveredQuotaKey : ds.session.antigravityRecoveredQuotaKey,
     } : {}),
     codexProfile: agentCfg.codexProfile,
     codexProfileHome: agentCfg.codexProfileHome,

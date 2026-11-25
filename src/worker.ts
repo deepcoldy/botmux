@@ -10203,7 +10203,8 @@ function classifyUsageLimitWithNativeEvidence(
       usageLimitTracker.noteScreenRecovery();
       return { status, usageLimitRecovery: 'antigravity-ready-composer' };
     }
-    if (confirmedEpisodeKey && confirmedEpisodeKey !== recoveredAntigravityQuotaKey) {
+    if ((limit?.source === 'antigravity-error-composer' || limit?.source === 'antigravity-native-log')
+      && confirmedEpisodeKey && confirmedEpisodeKey !== recoveredAntigravityQuotaKey) {
       recoveredAntigravityQuotaKey = undefined;
     }
     // shortcuts 页脚只证明旧版 footerless 错误已经恢复；带原生日志证据的
@@ -40654,7 +40655,15 @@ function send(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): void {
     return;
   }
   if (msg.type === 'cli_session_id') observeContractNativeSession(msg.cliSessionId);
-  const payload = sessionEventMetadata(workerIpcPayload(msg), origin);
+  const outgoing = lastInitConfig?.cliId === 'antigravity'
+    && (msg.type === 'screen_update' || msg.type === 'screenshot_uploaded')
+    ? {
+      ...msg,
+      antigravityLastConfirmedQuota: lastConfirmedAntigravityQuota ?? null,
+      antigravityRecoveredQuotaKey: recoveredAntigravityQuotaKey ?? null,
+    }
+    : msg;
+  const payload = sessionEventMetadata(workerIpcPayload(outgoing), origin);
   if (payload.type === 'final_output' && universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew === true) universalOutputHandoff.publish(payload);
   else process.send?.(payload);
   if (isWorkflowWorker() && payload.type === 'final_output') workflowFinalOutputSent = true;
@@ -41753,12 +41762,15 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       const restoredConfirmed = restoredQuota?.source === 'antigravity-error-composer'
         || restoredQuota?.source === 'antigravity-native-log'
         ? restoredQuota : antigravityQuotaHistory?.at(-1);
-      lastConfirmedAntigravityQuota = restoredConfirmed;
-      // No active native quota means the persisted episode was already cleared.
-      // Its history remains a recovery tombstone, not a fresh refusal.
-      recoveredAntigravityQuotaKey = restoredQuota?.source === 'antigravity-error-composer'
-        || restoredQuota?.source === 'antigravity-native-log' || !restoredConfirmed
-        ? undefined : cliUsageLimitEpisodeKey(restoredConfirmed);
+      // Newer daemons persist the actual last-confirmed identity separately;
+      // first-seen history order is only a legacy fallback, never authoritative.
+      lastConfirmedAntigravityQuota = msg.antigravityLastConfirmedQuota !== undefined
+        ? msg.antigravityLastConfirmedQuota ?? undefined : restoredConfirmed;
+      recoveredAntigravityQuotaKey = msg.antigravityRecoveredQuotaKey !== undefined
+        ? msg.antigravityRecoveredQuotaKey ?? undefined
+        : restoredQuota?.source === 'antigravity-error-composer'
+          || restoredQuota?.source === 'antigravity-native-log' || !lastConfirmedAntigravityQuota
+          ? undefined : cliUsageLimitEpisodeKey(lastConfirmedAntigravityQuota);
       const restoredKey = restoredQuota?.relativeResetKey;
       if (restoredQuota?.kind === 'usage' && !restoredQuota.source && restoredKey && !restoredKey.endsWith(':')) {
         unconfirmedAntigravityQuotas.set(restoredKey, restoredQuota);

@@ -389,6 +389,55 @@ describe('usage-limit sticky state self-heal', () => {
     expect(ds.rateLimitNotifiedKey).toBe(usageLimitStateKey(replacement));
   });
 
+  it('persists independent last-confirmed and recovery-tombstone fields', async () => {
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_episode_metadata', 'native episode metadata', 'group', 'chat');
+    const ds = makeDs({ session, worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const lastConfirmed = {
+      ...rateLimitState(), kind: 'usage' as const, source: 'antigravity-error-composer' as const,
+      nativeEpisodeKey: 'composer:shared-error', nativeLogEpisodeKey: 'log:native-A',
+    };
+    const usageLimit = {
+      ...rateLimitState(), kind: 'usage' as const, source: 'antigravity-native-log' as const,
+      nativeEpisodeKey: 'log:native-B',
+    };
+    await dispatch(worker, {
+      type: 'screen_update', content: 'native quota', status: 'limited', turnId: 'turn-1', usageLimit,
+      antigravityLastConfirmedQuota: lastConfirmed, antigravityRecoveredQuotaKey: 'log:native-A',
+    });
+
+    const stored = sessionStore.getSessionFresh(session.sessionId);
+    expect(stored?.antigravityLastConfirmedQuota).toEqual(lastConfirmed);
+    expect(stored?.antigravityRecoveredQuotaKey).toBe('log:native-A');
+  });
+
+  it('retries metadata-only persistence without an active usage limit', async () => {
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_episode_metadata_retry', 'metadata retry', 'group', 'chat');
+    const ds = makeDs({ session, worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const lastConfirmed = {
+      ...rateLimitState(), kind: 'usage' as const, source: 'antigravity-native-log' as const,
+      nativeEpisodeKey: 'log:native-B',
+    };
+    sessionStore.__testOnly_setBeforeRowPersist(() => {
+      sessionStore.__testOnly_setBeforeRowPersist(undefined);
+      throw new Error('injected metadata-only write failure');
+    });
+    await dispatch(worker, {
+      type: 'screen_update', content: 'recovered old page', status: 'idle', turnId: 'turn-1',
+      antigravityLastConfirmedQuota: lastConfirmed, antigravityRecoveredQuotaKey: null,
+    });
+    expect(ds.usageLimitPersistPending).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(500);
+    const stored = sessionStore.getSessionFresh(session.sessionId);
+    expect(stored?.antigravityLastConfirmedQuota).toEqual(lastConfirmed);
+    expect(stored?.antigravityRecoveredQuotaKey).toBeNull();
+    expect(ds.usageLimitPersistPending).toBe(false);
+  });
+
   it('persists native provenance when a partial quota frame later gains its complete composer', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 9, 1));

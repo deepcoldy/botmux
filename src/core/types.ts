@@ -935,6 +935,11 @@ export interface DaemonSession {
   };
   usageLimit?: CliUsageLimitState;
   antigravityQuotaHistory?: readonly CliUsageLimitState[];
+  /** Last actually confirmed native episode, independent of active quota and
+   * first-seen history order. Null is an explicit persisted empty state. */
+  antigravityLastConfirmedQuota?: CliUsageLimitState | null;
+  /** Ready-composer recovery tombstone; only a confirmed replacement clears it. */
+  antigravityRecoveredQuotaKey?: string | null;
   /** A failed persistence must be retried even if the next frame is identical. */
   usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;

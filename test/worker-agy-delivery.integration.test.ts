@@ -242,6 +242,12 @@ describe('worker delayed activation and interrupted Antigravity delivery', () =>
     await waitFor(() => worker.messages.some(m => m.type === 'ready'), worker.logs, 30_000);
     await waitFor(() => worker.messages.some(m => m.type === 'screen_update' && m.status === 'limited'
       && m.usageLimit?.retryLabel === '2h39m35s' && m.usageLimit.source === 'antigravity-native-log'), worker.logs, 20_000);
+    const frame = worker.messages.find(m => m.type === 'screen_update' && m.status === 'limited'
+      && m.usageLimit?.retryLabel === '2h39m35s' && m.usageLimit.source === 'antigravity-native-log');
+    expect(frame).toMatchObject({
+      antigravityLastConfirmedQuota: { source: 'antigravity-native-log' },
+      antigravityRecoveredQuotaKey: null,
+    });
     expect(worker.input()).toBe('');
   }, 60_000);
 

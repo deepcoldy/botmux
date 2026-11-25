@@ -13,7 +13,7 @@ function classifier(raw: () => string, cliId = 'antigravity', authoritative = tr
   readNative?: () => { key: string; text: string } | undefined) {
   const capture = vi.fn(raw);
   const usageLimitTracker = createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => outputActive });
-  const classify = loadWorkerFunction<(content: string, status: string) => any>('classifyUsageLimitWithNativeEvidence', {
+  const scope: Record<string, any> = {
     cliAdapter: { id: cliId }, backend: {}, captureBackendScreen: capture,
     backendScreenEvidenceIsAuthoritativeForMutation: () => authoritative,
     stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, annotateAntigravityUsageLimit,
@@ -23,8 +23,9 @@ function classifier(raw: () => string, cliId = 'antigravity', authoritative = tr
     lastConfirmedAntigravityQuota: undefined,
     recoveredAntigravityQuotaKey: undefined,
     unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
-  });
-  return { classify, capture, usageLimitTracker };
+  };
+  const classify = loadWorkerFunction<(content: string, status: string) => any>('classifyUsageLimitWithNativeEvidence', scope);
+  return { classify, capture, usageLimitTracker, scope };
 }
 const composer = '\r\n────\r\n>\r\n────\r\n';
 const quota = '⚠ Individual quota reached. Resets in 124h24m15s.';
@@ -272,6 +273,61 @@ describe('raw ANSI tmux quota classification', () => {
 
     nativeKey = 'native-B';
     expect(classify('', 'idle')).toMatchObject({
+      status: 'limited', usageLimit: { source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-B' },
+    });
+  });
+
+  it('does not clear a recovered tombstone for an unconfirmed generic active frame', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const refusal = '⚠ Individual quota reached. Resets in 1m.\nError ID: shared-error\n────\n>\n────\n';
+    let screen = refusal;
+    let nativeKey: string | undefined = 'native-A';
+    const { classify, scope } = classifier(() => screen, 'antigravity', true, false, undefined,
+      () => nativeKey ? { key: nativeKey, text: refusal } : undefined);
+    expect(classify('', 'idle').usageLimit).toMatchObject({ nativeLogEpisodeKey: 'log:native-A' });
+    nativeKey = undefined;
+    screen = refusal + '? for shortcuts';
+    expect(classify('', 'idle')).toEqual({ status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+
+    screen = '⚠ Individual quota reached. Resets in 1m.\n';
+    expect(classify('', 'idle').status).toBe('limited');
+    expect(classify('', 'idle').usageLimit?.source).toBeUndefined();
+    expect(scope.recoveredAntigravityQuotaKey).toBe('log:native-A');
+    screen = refusal;
+    expect(classify('', 'idle')).toEqual({ status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+
+    nativeKey = 'native-B';
+    expect(classify('', 'idle')).toMatchObject({
+      status: 'limited', usageLimit: { source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-B' },
+    });
+  });
+
+  it('restores the exact recovered identity instead of first-seen history order', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const refusal = '⚠ Individual quota reached. Resets in 1m.\nError ID: shared-error\n────\n>\n────\n';
+    let screen = refusal;
+    let nativeKey: string | undefined = 'native-A';
+    const first = classifier(() => screen, 'antigravity', true, false, undefined,
+      () => nativeKey ? { key: nativeKey, text: refusal } : undefined);
+    expect(first.classify('', 'idle').usageLimit).toMatchObject({ nativeLogEpisodeKey: 'log:native-A' });
+    nativeKey = 'native-B';
+    expect(first.classify('', 'idle').usageLimit).toMatchObject({ nativeEpisodeKey: 'log:native-B' });
+    nativeKey = 'native-A';
+    expect(first.classify('', 'idle').usageLimit).toMatchObject({ nativeLogEpisodeKey: 'log:native-A' });
+    nativeKey = undefined;
+    screen = refusal + '? for shortcuts';
+    expect(first.classify('', 'idle')).toEqual({ status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+    expect(first.scope.recoveredAntigravityQuotaKey).toBe('log:native-A');
+
+    const restored = classifier(() => screen, 'antigravity', true, false, undefined,
+      () => nativeKey ? { key: nativeKey, text: refusal } : undefined);
+    restored.scope.antigravityQuotaHistory = first.scope.antigravityQuotaHistory;
+    restored.scope.lastConfirmedAntigravityQuota = first.scope.lastConfirmedAntigravityQuota;
+    restored.scope.recoveredAntigravityQuotaKey = first.scope.recoveredAntigravityQuotaKey;
+    nativeKey = 'native-A';
+    expect(restored.classify('', 'idle')).toEqual({ status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+    nativeKey = 'native-B';
+    expect(restored.classify('', 'idle')).toMatchObject({
       status: 'limited', usageLimit: { source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-B' },
     });
   });
