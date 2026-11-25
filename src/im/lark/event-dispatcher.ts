@@ -1754,7 +1754,16 @@ export function __resetEventClaimsForTest(): void {
   // 同清「已触发任务」记录，避免编辑事件幂等在用例间串状态。
   _resetTriggeredMessagesForTest();
   pendingMessageTriggers.clear();
-  autoStartTopicStarts.clear();
+  for (const [key, entry] of autoStartTopicStarts) {
+    if (entry.dispatching) continue;
+    const timer = setTimeout(() => {
+      if (autoStartTopicStarts.get(key) === entry && !entry.dispatching) {
+        autoStartTopicStarts.delete(key);
+        entry.complete();
+      }
+    }, Math.max(1, config.daemon.forwardFollowupWaitMs * 2));
+    timer.unref?.();
+  }
 }
 
 export async function getGroupStats(
@@ -4331,6 +4340,10 @@ interface AutoStartTopicStart {
   settled: Promise<void>;
   complete: () => void;
   dispatching: boolean;
+  owners: Set<symbol>;
+  rootId: string;
+  chatId: string;
+  senderOpenId: string;
 }
 /** Shared across runtime generations so close/rebuild cannot strand root waiters. */
 const autoStartTopicStarts = new Map<string, AutoStartTopicStart>();
@@ -4345,7 +4358,15 @@ function trackAutoStartTopic(larkAppId: string, payload: PendingForwardTopicPayl
   if (existing) return existing;
   let complete!: () => void;
   const settled = new Promise<void>(resolve => { complete = resolve; });
-  const entry = { settled, complete, dispatching: false };
+  const entry = {
+    settled,
+    complete,
+    dispatching: false,
+    owners: new Set<symbol>(),
+    rootId,
+    chatId: payload.ctx.chatId,
+    senderOpenId: payload.data.sender?.sender_id?.open_id as string,
+  };
   autoStartTopicStarts.set(key, entry);
   return entry;
 }
@@ -5934,13 +5955,22 @@ export function createLarkEventDispatcherRuntime(
       return;
     }
     const entry = trackAutoStartTopic(larkAppId, payload)!;
+    const owner = Symbol('auto-start-dispatch');
+    entry.owners.add(owner);
     entry.dispatching = true;
     try {
       await dispatch();
     } finally {
-      const key = autoStartTopicKey(larkAppId, rootId);
-      if (autoStartTopicStarts.get(key) === entry) autoStartTopicStarts.delete(key);
-      entry.complete();
+      entry.owners.delete(owner);
+      // Secondary restores may time out while another generation is still
+      // running. Only the last active generation may settle the root waiters
+      // and remove the shared entry.
+      if (entry.owners.size === 0) {
+        entry.dispatching = false;
+        const key = autoStartTopicKey(larkAppId, rootId);
+        if (autoStartTopicStarts.get(key) === entry) autoStartTopicStarts.delete(key);
+        entry.complete();
+      }
     }
   };
   const dispatchPersistedForwardFollowup = (
@@ -7296,6 +7326,9 @@ export function createLarkEventDispatcherRuntime(
         routingSource = 'topic-chat';
         replyRootId = undefined;
         ownsSession = false;
+        // The original root is admitted as soon as pairing succeeds. Mark it now,
+        // not only after creation, so an edit during the async turn cannot replay it.
+        markMessageTriggered(larkAppId, pairedForwardSeed.messageId);
         try {
           putForwardFollowup(larkAppId, {
             messageId: pairedForwardSeed.messageId,
@@ -7324,37 +7357,6 @@ export function createLarkEventDispatcherRuntime(
           `[forward-followup] merged seed=${pairedForwardSeed.messageId.substring(0, 12)} ` +
           `into msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
         );
-      }
-
-      // A topic auto-start remains visible at its original Lark root from the
-      // buffer window through Session creation. Defer only ordinary same-root
-      // replies in a real thread: folded/quoted routes must keep their original
-      // shape. Unauthorized senders and messages addressed to someone else are
-      // settled by their normal gates instead of waiting behind creation.
-      const pendingAutoStart = isAllowed
-        && !pairedForwardSeed
-        && !ownsSession
-        && !messageListener
-        && !substituteTrigger
-        && !crossChatFollowUp
-        && !yieldToImportedTopicHandler
-        && !!message.root_id
-        && !!message.thread_id
-        && routing.anchor === message.root_id
-        ? autoStartTopicStarts.get(autoStartTopicKey(larkAppId, message.root_id))
-        : undefined;
-      const inFlightAutoStart = pendingAutoStart
-        && (pendingAutoStart.dispatching || forwardFollowupDelayEnabled(chatId))
-        && !(isAllowed && mentionsAnotherMember(larkAppId, message) && await mentionsOtherInChat())
-        ? pendingAutoStart
-        : undefined;
-      if (inFlightAutoStart) {
-        logger.debug(
-          `[auto-start:新话题] 等待会话创建后投递同话题回复 ` +
-          `root=${String(message.root_id).substring(0, 12)} msg=${messageId.substring(0, 12)}`,
-        );
-        await inFlightAutoStart.settled;
-        ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
       }
 
       // Permission gating — same shape as before, just keyed on
@@ -7676,7 +7678,6 @@ export function createLarkEventDispatcherRuntime(
       }
       const autoStartTopicRootId = pairedForwardSeed?.payload.autoStartTopicRootId ?? (
         topicAutoStartEnabled(chatId)
-        && !explicitlyMentionedThisBot
         && !messageListener
         && !substituteTrigger
         && resolveGroupMentionMode(larkAppId, chatId) === 'topic'
@@ -8200,6 +8201,58 @@ export function createLarkEventDispatcherRuntime(
     );
   };
 
+  const autoStartEntryForMessage = (message: any): AutoStartTopicStart | undefined => {
+    const rootId = typeof message?.root_id === 'string' ? message.root_id : undefined;
+    if (!rootId || !message.thread_id || typeof message.chat_id !== 'string') return undefined;
+    const entry = autoStartTopicStarts.get(autoStartTopicKey(larkAppId, rootId));
+    if (!entry || entry.chatId !== message.chat_id) return undefined;
+    // A config change before dispatch can release a buffered seed through the
+    // stale path. Once creation is running, later config changes cannot cancel it.
+    if (!entry.dispatching && !forwardFollowupDelayEnabled(message.chat_id)) return undefined;
+    return entry;
+  };
+  const shouldDeferAutoStartMessage = (data: any, entry: AutoStartTopicStart | undefined): boolean => {
+    if (!entry) return false;
+    const message = data?.message;
+    const senderOpenId = data?.sender?.sender_id?.open_id;
+    const senderUnionId = data?.sender?.sender_id?.union_id;
+    // Settle obvious redirects and unauthorized senders by the ordinary gate;
+    // do not park them behind an unrelated creation.
+    if (!canTalk(larkAppId, message.chat_id, senderOpenId, undefined, senderUnionId, message.chat_type)) return false;
+    if (mentionsAnotherMember(larkAppId, message)) return false;
+    if (entry.dispatching) return true;
+    if (senderOpenId !== entry.senderOpenId) return true;
+    const routingText = extractMessageTextForRouting(message);
+    const strippedRoutingText = routingText
+      ? stripLeadingMentions(routingText.trim(), message?.mentions ?? []).trim()
+      : '';
+    // Only a same-sender, non-command clarification may jump to pairing. Every
+    // other reply waits outside the chat-wide raw lane in per-root arrival order.
+    return strippedRoutingText.startsWith('/');
+  };
+  const processMessageWithAutoStartOrdering = (
+    data: any,
+    seedRoutingGate: { ready: Promise<void>; complete: () => void } | undefined,
+    ingressAnchor: string,
+  ): Promise<unknown> => {
+    const message = data?.message;
+    const rootId = typeof message?.root_id === 'string' ? message.root_id : undefined;
+    const gate = rootId ? seedRoutingGates.get(rootId) : undefined;
+    const shouldWaitForGate = !!gate && resolveGroupMentionMode(larkAppId, message.chat_id) === 'topic'
+      && forwardFollowupDelayEnabled(message.chat_id);
+    const entry = autoStartEntryForMessage(message);
+    const shouldWaitForEntry = shouldDeferAutoStartMessage(data, entry);
+    if (!shouldWaitForGate && !shouldWaitForEntry) {
+      return serializeByAnchor(ingressAnchor, () => processMessageEvent(data, seedRoutingGate));
+    }
+    return serializeByAnchor(`lark-auto-start:${larkAppId}:${rootId}`, async () => {
+      if (shouldWaitForGate) await waitForSeedRoutingGate(rootId!, true);
+      const latest = autoStartEntryForMessage(message);
+      if (shouldDeferAutoStartMessage(data, latest)) await latest!.settled;
+      return serializeByAnchor(ingressAnchor, () => processMessageEvent(data, seedRoutingGate));
+    }, 0);
+  };
+
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     // 主动开工 — 场景①: the bot was added to a chat. Hand off to the daemon,
     // which gates on the autoStartOnGroupJoin toggle + allowedUser membership.
@@ -8482,10 +8535,7 @@ export function createLarkEventDispatcherRuntime(
               );
             });
           }
-          return serializeByAnchor(
-            ingressAnchor,
-            () => processMessageEvent(data, seedRoutingGate),
-          ).then(() => undefined);
+          return processMessageWithAutoStartOrdering(data, seedRoutingGate, ingressAnchor).then(() => undefined);
         },
         'message event',
         claim,
@@ -8823,8 +8873,19 @@ export function createLarkEventDispatcherRuntime(
       initialListenerPollTimer = undefined;
       forwardFollowups.clear();
       // Closing the transport does not cancel an in-flight handleNewTopic.
-      // Keep autoStartTopicStarts waiters attached to its real settlement; a
-      // replacement runtime shares the same per-message dispatch promise.
+      // Keep dispatching waiters attached to its real settlement. For a seed
+      // still in the pairing buffer, leave one full restore window; only an
+      // abandoned buffered root completes its waiters instead of stranding them.
+      for (const [key, entry] of autoStartTopicStarts) {
+        if (entry.dispatching) continue;
+        const timer = setTimeout(() => {
+          if (autoStartTopicStarts.get(key) === entry && !entry.dispatching) {
+            autoStartTopicStarts.delete(key);
+            entry.complete();
+          }
+        }, Math.max(1, config.daemon.forwardFollowupWaitMs * 2));
+        timer.unref?.();
+      }
       if (typeof wsClient?.close === 'function') wsClient.close({ force: true });
       wsClient = undefined;
     },

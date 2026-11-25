@@ -406,6 +406,21 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     return state;
   }
 
+  function makeAutoStartRuntime(opts: Parameters<typeof setupBotState>[0] = {}) {
+    capturedHandlers = {};
+    const state = setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'topic',
+      autoStartOnNewTopic: true,
+      soloGroupMentionBypass: false,
+      ...opts,
+    });
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    runtime.connect();
+    markForwardFollowupsSessionsReady(MY_APP_ID);
+    return { runtime, state };
+  }
+
   it('holds a topic seed, then starts from its root-linked clarification', async () => {
     const seed = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
@@ -1003,6 +1018,167 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     expect(handlers.handleNewTopic).toHaveBeenCalledTimes(2);
   });
 
+  it('settles an abandoned buffered waiter after the restore window', async () => {
+    vi.useFakeTimers();
+    const { runtime } = makeAutoStartRuntime({ allowedUsers: [USER_OPEN_ID, 'ou_user_other'] });
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: '{}',
+      messageType: 'merge_forward',
+      messageId: 'om-abandoned-buffer-seed',
+      threadId: 'omt_abandoned_buffer_seed',
+      chatId: 'chat-abandoned-buffer',
+      chatType: 'group',
+    });
+    const reply = makeUserMessageEvent({
+      senderOpenId: 'ou_user_other',
+      content: JSON.stringify({ text: 'close 后无人接管的回复' }),
+      rootId: 'om-abandoned-buffer-seed',
+      messageId: 'om-abandoned-buffer-reply',
+      chatId: 'chat-abandoned-buffer',
+      chatType: 'group',
+    });
+    const flushFake = async () => {
+      for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(0);
+    };
+    try {
+      capturedHandlers['im.message.receive_v1'](seed);
+      await flushFake();
+      capturedHandlers['im.message.receive_v1'](reply);
+      await flushFake();
+      handlers.isSessionOwner.mockClear();
+
+      runtime.close();
+      await vi.advanceTimersByTimeAsync(50);
+      await flushFake();
+      expect(handlers.isSessionOwner.mock.calls.some(call => call[0] === 'om-abandoned-buffer-seed')).toBe(true);
+    } finally {
+      runtime.close();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('lets a replacement runtime adopt a buffered waiter before close cleanup', async () => {
+    vi.useFakeTimers();
+    const runtimes: Array<ReturnType<typeof createLarkEventDispatcherRuntime>> = [];
+    const makeRuntime = () => {
+      const created = makeAutoStartRuntime({ allowedUsers: [USER_OPEN_ID, 'ou_user_other'] });
+      runtimes.push(created.runtime);
+      return created.runtime;
+    };
+    let owned = false;
+    const flushFake = async () => {
+      for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(0);
+    };
+    try {
+      const first = makeRuntime();
+      const seed = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: '{}',
+        messageType: 'merge_forward',
+        messageId: 'om-adopt-buffer-seed',
+        threadId: 'omt_adopt_buffer_seed',
+        chatId: 'chat-adopt-buffer',
+        chatType: 'group',
+      });
+      const reply = makeUserMessageEvent({
+        senderOpenId: 'ou_user_other',
+        content: JSON.stringify({ text: 'restore 接管的缓冲回复' }),
+        rootId: 'om-adopt-buffer-seed',
+        messageId: 'om-adopt-buffer-reply',
+        chatId: 'chat-adopt-buffer',
+        chatType: 'group',
+      });
+      handlers.isSessionOwner.mockImplementation(anchor => owned && anchor === 'om-adopt-buffer-seed');
+      handlers.handleNewTopic.mockImplementation(async () => { owned = true; });
+
+      capturedHandlers['im.message.receive_v1'](seed);
+      await flushFake();
+      capturedHandlers['im.message.receive_v1'](reply);
+      await flushFake();
+      const persistedCall = mockWriteFileSync.mock.calls.findLast(call =>
+        String(call[0]).includes('forward-followups-') && String(call[1]).includes('om-adopt-buffer-seed'));
+      const serialized = String(persistedCall?.[1]);
+
+      first.close();
+      mockReadFileSync.mockImplementation(path => String(path).includes('forward-followups-') ? serialized : '[]');
+      makeRuntime();
+      await flushFake();
+      await vi.advanceTimersByTimeAsync(25);
+      await flushFake();
+
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+      expect(handlers.handleThreadReply).toHaveBeenCalledWith(reply, expect.objectContaining({
+        anchor: 'om-adopt-buffer-seed',
+      }));
+    } finally {
+      owned = true;
+      for (const runtime of runtimes) runtime.close();
+      await flushFake();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not orphan a buffered waiter when test reset clears the shared index', async () => {
+    vi.useFakeTimers();
+    const { runtime } = makeAutoStartRuntime({ allowedUsers: [USER_OPEN_ID, 'ou_user_other'] });
+    let releaseCreation!: () => void;
+    let owned = false;
+    const flushFake = async () => {
+      for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(0);
+    };
+    try {
+      const seed = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: '{}',
+        messageType: 'merge_forward',
+        messageId: 'om-reset-buffer-seed',
+        threadId: 'omt_reset_buffer_seed',
+        chatId: 'chat-reset-buffer',
+        chatType: 'group',
+      });
+      const reply = makeUserMessageEvent({
+        senderOpenId: 'ou_user_other',
+        content: JSON.stringify({ text: 'reset 后仍需投递的回复' }),
+        rootId: 'om-reset-buffer-seed',
+        messageId: 'om-reset-buffer-reply',
+        chatId: 'chat-reset-buffer',
+        chatType: 'group',
+      });
+      const creation = new Promise<void>(resolve => { releaseCreation = resolve; });
+      handlers.isSessionOwner.mockImplementation(anchor => owned && anchor === 'om-reset-buffer-seed');
+      handlers.handleNewTopic.mockImplementation(() => creation);
+
+      capturedHandlers['im.message.receive_v1'](seed);
+      await flushFake();
+      capturedHandlers['im.message.receive_v1'](reply);
+      await flushFake();
+      __resetEventClaimsForTest();
+      await vi.advanceTimersByTimeAsync(25);
+      await flushFake();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+
+      owned = true;
+      releaseCreation();
+      await vi.advanceTimersByTimeAsync(25);
+      await flushFake();
+      expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+      expect(handlers.handleThreadReply).toHaveBeenCalledWith(reply, expect.objectContaining({
+        anchor: 'om-reset-buffer-seed',
+      }));
+    } finally {
+      owned = true;
+      releaseCreation();
+      runtime.close();
+      await flushFake();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps a waiting reply attached when close and restore overlap an unfinished creation', async () => {
     vi.useFakeTimers();
     const runtimes: Array<ReturnType<typeof createLarkEventDispatcherRuntime>> = [];
@@ -1154,6 +1330,86 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     } finally {
       releaseCreation();
       for (const item of runtimes) item.close();
+      await flushFake();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not release root waiters when a secondary restore times out', async () => {
+    vi.useFakeTimers();
+    const runtimes: Array<ReturnType<typeof createLarkEventDispatcherRuntime>> = [];
+    let releaseCreation!: () => void;
+    let owned = false;
+    const flushFake = async () => {
+      for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(0);
+    };
+    const makeRuntime = () => {
+      const created = makeAutoStartRuntime();
+      runtimes.push(created.runtime);
+      return created.runtime;
+    };
+    try {
+      const first = makeRuntime();
+      const seed = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: '{}',
+        messageType: 'merge_forward',
+        messageId: 'om-secondary-timeout-seed',
+        threadId: 'omt_secondary_timeout_seed',
+        chatId: 'chat-secondary-timeout',
+        chatType: 'group',
+      });
+      const reply = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA 创建完成前不得提前继续' }),
+        rootId: 'om-secondary-timeout-seed',
+        messageId: 'om-secondary-timeout-reply',
+        chatId: 'chat-secondary-timeout',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      });
+      const creation = new Promise<void>(resolve => { releaseCreation = resolve; });
+      handlers.isSessionOwner.mockImplementation(anchor => owned && anchor === 'om-secondary-timeout-seed');
+      handlers.handleNewTopic.mockImplementation(async data => {
+        if (data === seed) await creation;
+      });
+      handlers.beforeSessionTurn = vi.fn(async () => undefined);
+
+      capturedHandlers['im.message.receive_v1'](seed);
+      await flushFake();
+      await vi.advanceTimersByTimeAsync(25);
+      await flushFake();
+      capturedHandlers['im.message.receive_v1'](reply);
+      await flushFake();
+      const persistedCall = mockWriteFileSync.mock.calls.findLast(call =>
+        String(call[0]).includes('forward-followups-') && String(call[1]).includes('om-secondary-timeout-seed'));
+      let stored = String(persistedCall?.[1]);
+      mockWriteFileSync.mockImplementation((path, content) => {
+        if (String(path).includes('forward-followups-')) stored = String(content);
+      });
+      mockReadFileSync.mockImplementation(path => String(path).includes('forward-followups-') ? stored : '[]');
+
+      first.close();
+      makeRuntime();
+      await flushFake();
+      await vi.advanceTimersByTimeAsync(30_000);
+      await flushFake();
+      expect(stored).not.toBe('[]');
+      expect(handlers.beforeSessionTurn).not.toHaveBeenCalled();
+
+      owned = true;
+      releaseCreation();
+      await flushFake();
+      expect(handlers.beforeSessionTurn).toHaveBeenCalledOnce();
+      expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+      expect(handlers.handleThreadReply).toHaveBeenCalledWith(reply, expect.objectContaining({
+        anchor: 'om-secondary-timeout-seed',
+      }));
+    } finally {
+      owned = true;
+      releaseCreation();
+      for (const runtime of runtimes) runtime.close();
       await flushFake();
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1936,16 +2192,17 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     }
   });
 
-  it('tracks zero-wait auto-start creation until later replies can be delivered', async () => {
+  it.each([false, true])('tracks zero-wait auto-start creation until later replies can be delivered (explicit=%s)', async explicit => {
     config.daemon.forwardFollowupWaitMs = 0;
     startAutoStartTopic();
     const seed = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
-      content: '{}',
-      messageType: 'merge_forward',
+      content: explicit ? JSON.stringify({ text: '@BotA start now' }) : '{}',
+      messageType: explicit ? 'text' : 'merge_forward',
       messageId: 'om-zero-wait-seed',
       chatId: 'chat-zero-wait',
       chatType: 'group',
+      mentions: explicit ? [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }] : undefined,
     });
     const reply = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
@@ -2048,6 +2305,13 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
       chatId: 'chat-edit-seed',
       chatType: 'group',
     });
+    let releaseCreation!: () => void;
+    const creation = new Promise<void>(resolve => { releaseCreation = resolve; });
+    let owned = false;
+    handlers.isSessionOwner.mockImplementation(anchor => owned && anchor === 'om-edit-seed');
+    handlers.handleNewTopic.mockImplementation(async data => {
+      if (data === clarification) await creation;
+    });
     await capturedHandlers['im.message.receive_v1'](seed);
     await flushEventWork();
     await capturedHandlers['im.message.receive_v1'](clarification);
@@ -2069,12 +2333,15 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     });
     await flushEventWork();
 
+    owned = true;
+    releaseCreation();
+    await flushEventWork();
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it('cleans a paired entry when beforeSessionTurn blocks before dispatch', async () => {
-    startAutoStartTopic();
+    startAutoStartTopic({ allowedUsers: [USER_OPEN_ID, 'ou_next_user'] });
     handlers.beforeSessionTurn = vi.fn(async () => ({ block: true }));
     const seed = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
@@ -2094,7 +2361,7 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
       mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
     });
     const next = makeUserMessageEvent({
-      senderOpenId: USER_OPEN_ID,
+      senderOpenId: 'ou_next_user',
       content: JSON.stringify({ text: '后续回复不应永久等待' }),
       rootId: 'om-block-seed',
       messageId: 'om-block-next',
