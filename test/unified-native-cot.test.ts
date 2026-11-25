@@ -596,4 +596,40 @@ describe('unified replies with an independent native CoT channel', () => {
       vi.useRealTimers();
     }
   });
+
+  it('keeps a merged batch observed while armed, even when the hold is released before flush', async () => {
+    // Two thinking_update batches share one 1200ms pending entry. The first is
+    // enqueued before any hold exists; the hold is then established; the second
+    // batch merges into the same entry while armed; the release frame clears
+    // the live hold before the debounce fires. The merged batch was observed
+    // while the hold was active, so its progress must still be admitted.
+    vi.useFakeTimers();
+    try {
+      bot.config.cotEnabled = true;
+      await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_turn', finalAnswer('main answer'), send);
+      await updateTurnReplyCard(ds, 'om_turn', { kind: 'terminal', phase: 'completed' }, send);
+
+      queueTurnReplyTools(ds, {
+        turnId: 'om_turn',
+        entries: [{ kind: 'tool_call', id: 'batch-a', name: 'Bash', args: '{}', subject: 'BATCH_A_MARKER' }],
+      }, send, () => true);
+      (ds as any).cotHeldForBackground = { turnId: 'om_turn' };
+      queueTurnReplyTools(ds, {
+        turnId: 'om_turn',
+        entries: [{ kind: 'tool_call', id: 'batch-b', name: 'Monitor', args: '{}', subject: 'MERGED_TAIL_MARKER' }],
+      }, send, () => true);
+      (ds as any).cotHeldForBackground = undefined;
+      await vi.advanceTimersByTimeAsync(1250);
+      await flushTurnReplyTools(ds, 'om_turn');
+
+      const record = new TurnReplyCardStore(dir).read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+      })!;
+      expect(record.phase).toBe('completed');
+      expect(JSON.stringify(record.tools)).toContain('MERGED_TAIL_MARKER');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

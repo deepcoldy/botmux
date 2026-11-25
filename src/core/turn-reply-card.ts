@@ -367,19 +367,24 @@ export function queueTurnReplyTools(ds: DaemonSession, msg: ToolsUpdate, send: R
   let pending = pendingTools.get(ds);
   if (!pending) { pending = new Map(); pendingTools.set(ds, pending); }
   const key = `${msg.turnId}:${msg.dispatchAttempt ?? ''}`;
+  // Snapshot the hold at EVERY enqueue against the exact turn key. A hold can
+  // be established between two batches merged into this same pending entry:
+  // keeping only the first batch's verdict would drop the later batch's
+  // progress once the release frame clears the live hold before the debounce
+  // fires. OR-ing the current match makes any batch observed while armed stick
+  // for the entry's lifetime; a release frame racing the 1200ms timer cannot
+  // retroactively strip it.
+  const holdMatchesNow = ds.cotHeldForBackground?.turnId === msg.turnId
+    && ds.cotHeldForBackground.dispatchAttempt === msg.dispatchAttempt;
   const existing = pending.get(key);
   if (existing) {
     existing.msg = msg;
     existing.send = send;
     existing.owns = owns;
+    existing.allowWhileTerminalAtQueue = existing.allowWhileTerminalAtQueue === true || holdMatchesNow;
     return;
   }
-  // Snapshot the hold at enqueue time: later batches merged into this same
-  // pending entry keep the first entry's verdict, and a release frame racing
-  // the 1200ms timer cannot retroactively strip it.
-  const allowWhileTerminalAtQueue = ds.cotHeldForBackground?.turnId === msg.turnId
-    && ds.cotHeldForBackground.dispatchAttempt === msg.dispatchAttempt;
-  const next: PendingTools = { msg, send, owns, allowWhileTerminalAtQueue };
+  const next: PendingTools = { msg, send, owns, allowWhileTerminalAtQueue: holdMatchesNow };
   pending.set(key, next);
   trackedToolSessions.add(ds);
   next.timer = setTimeout(() => {
