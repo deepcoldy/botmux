@@ -1930,36 +1930,27 @@ async function recoverColdImReplies(ds: DaemonSession): Promise<void> {
         } catch (error) { throw classifyFinalPublicationError(error); }
       },
       settled: settled => {
+        const copy = fileCopy.get(settled.id);
+        if (copy) {
+          try { producer.remove(copy); }
+          catch (error) { logger.warn(`[${tag(ds)}] Settled IM reply cleanup deferred: ${String(error)}`); }
+        }
         try {
           if (settled.receipt?.status === 'delivered' && settled.receipt.messageId
             && !settled.output.turnFailed && !settled.output.emptyCompletedNotice) {
             const { turnId, dispatchAttempt, content } = settled.output;
             noteFinalOutputReceipt(ds, turnId, { text: content }, { exactAttempt: { dispatchAttempt } });
-            const settledHeldReply = settleRequiredReplyCotMessage(ds, turnId, dispatchAttempt);
-            if (settledHeldReply) {
-              // This recovery runs only while no worker/CLI generation exists;
-              // its old background-task lifetime is over as well.
-              settleRequiredReplyBackground(ds);
-            } else {
-              // A restored daemon has no in-memory hold. The durable execution
-              // terminal is then the authority that the answer completes this
-              // exact attempt. recoverColdImReplies owns a worker-less session,
-              // so any old CLI-lifetime background obligation is retired at
-              // this boundary rather than leaving a native CoT bubble spinning.
-              if (proveExecution(settled)?.execution.terminal?.status === 'succeeded') {
-                finalizeCotMessage(ds, turnId, 'completed', dispatchAttempt);
-              }
-            }
+            // A worker-less session in the same daemon can still own this exact
+            // in-memory hold. After a daemon restart the CoT and hold are gone;
+            // deliverFinalOutput has already persisted the visible final reply.
+            // Missing background state is not proof of background-zero, so do
+            // not settle that half or invent a completed CoT on this path.
+            settleRequiredReplyCotMessage(ds, turnId, dispatchAttempt);
           }
         } catch (error) {
           // Delivery is already settled. UI reconciliation must never retain
           // the producer journal and replay a successfully delivered answer.
           logger.warn(`[${tag(ds)}] Cold IM reply CoT settlement deferred: ${String(error)}`);
-        }
-        const copy = fileCopy.get(settled.id);
-        if (copy) {
-          try { producer.remove(copy); }
-          catch (error) { logger.warn(`[${tag(ds)}] Settled IM reply cleanup deferred: ${String(error)}`); }
         }
         if (!journal.hasUnsettled(session.sessionId) && !journal.hasTerminalRejection(session.sessionId)
           && ds.agentAttention?.reason === FINAL_HANDOFF_DELIVERY_REASON) {
@@ -23600,6 +23591,20 @@ function setupWorkerHandlers(
         return receipt;
       },
       settled: async record => {
+        const requiredReplyDelivered = record.sink.kind === 'im' && record.sink.answerRequired === true
+          && record.receipt?.status === 'delivered' && !!record.receipt.messageId
+          && !record.output.turnFailed && !record.output.emptyCompletedNotice;
+        let cotSettled = false;
+        if (requiredReplyDelivered) {
+          const { turnId, dispatchAttempt } = record.output;
+          // The journal completed before this callback. Settle the exact-turn CoT
+          // before the first await so a CLI loss during flushPrimary cannot turn
+          // an already persisted delivered receipt into a false failed display.
+          cotSettled = settleRequiredReplyCotMessage(ds, turnId, dispatchAttempt);
+          if (!cotSettled && hasCompletedTurn(ds, turnId, dispatchAttempt)) {
+            finalizeCotMessage(ds, turnId, 'completed', dispatchAttempt);
+          }
+        }
         if (sessionController && record.origin?.scope.execution) {
           sessionController.store.apply(sessionController.ref, { type: 'execution_output', execution: record.origin.scope.execution,
             output: { availability: record.output.content ? 'available' : 'empty', content: record.output.content, completeness: record.output.turnFailed ? 'partial' : 'final' },
@@ -23607,19 +23612,12 @@ function setupWorkerHandlers(
         }
         await sessionController?.flushPrimary();
         const claim = { type: 'final_output_settled' as const, id: record.id, fingerprint: record.fingerprint, token: ds.initConfig?.finalOutputHandoff?.token ?? '' };
-        if (authority() && record.sink.kind === 'im' && record.sink.answerRequired
-          && record.receipt?.status === 'delivered' && record.receipt.messageId
-          && !record.output.turnFailed && !record.output.emptyCompletedNotice) {
-          const { turnId, dispatchAttempt, content } = record.output;
-          noteFinalOutputReceipt(ds, turnId, { text: content }, { exactAttempt: { dispatchAttempt } });
-          // The hold itself is exact terminal evidence and is installed before
-          // the durable terminal callback can await. A fast provider receipt
-          // must settle it even while recordTurnOutcome has not yet published
-          // its completed marker. Without a hold, retain the completed-turn
-          // guard so a pre-terminal output cannot close CoT by itself.
-          const settledHeldReply = settleRequiredReplyCotMessage(ds, turnId, dispatchAttempt);
-          if (settledHeldReply || hasCompletedTurn(ds, turnId, dispatchAttempt)) {
-            if (!settledHeldReply) finalizeCotMessage(ds, turnId, 'completed', dispatchAttempt);
+        if (authority() && requiredReplyDelivered) {
+          const { turnId, content } = record.output;
+          noteFinalOutputReceipt(ds, turnId, { text: content }, { exactAttempt: { dispatchAttempt: record.output.dispatchAttempt } });
+          // A delivered reply alone is not terminal evidence. Only an exact hold
+          // or the registered completed turn may settle the reaction.
+          if (cotSettled || hasCompletedTurn(ds, turnId, record.output.dispatchAttempt)) {
             void finishTurnReactions(ds, { turnId, delivered: true, owns: authority });
           }
         }

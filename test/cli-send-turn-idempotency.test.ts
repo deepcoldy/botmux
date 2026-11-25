@@ -73,6 +73,11 @@ describe('botmux send per-turn final idempotency', () => {
       expect(attempt.result.status, String(attempt.result.stderr)).toBe(0);
       expect(attempt.requests).toHaveLength(1);
       expect(attempt.requests[0]).toContain('/im/v1/messages/om_original_topic/reply');
+
+      const override = f.run('final', 'answer', ['--top-level']);
+      expect(override.result.status).toBe(2);
+      expect(override.requests).toHaveLength(0);
+      expect(String(override.result.stderr)).toContain('bound to the original conversation');
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
 

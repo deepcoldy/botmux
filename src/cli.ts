@@ -13028,14 +13028,15 @@ async function cmdSend(
   const frozenTurnDispatch = originSessionId === sid
     ? exactOriginDispatch
     : undefined;
-  // A durable final for the current turn is still bound to that turn's frozen
-  // destination. The normal current-turn path can derive the live destination
-  // on its own, but the durable delivery guard below needs the frozen target.
-  // Read only the exact selected turn so another turn cannot authorize a move.
-  const selectedReplyContext = replyMessageId
-    ? s.turnReplyContexts?.[replyMessageId]
-    : undefined;
-  const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget;
+  const selectedReplyContext = replyMessageId !== currentTurnId || explicitReplyTo
+    ? s.turnReplyContexts?.[replyMessageId ?? ''] : undefined;
+  // Ordinary structured turns have no Codex App dispatch entry. Their own
+  // per-turn context is the daemon-frozen original destination used by both
+  // the actual send and the v1-im route guard.
+  const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget
+    ?? (replyMessageId === currentTurnId && originSessionId === sid
+      ? parseReplyMessageTarget(s.turnReplyContexts?.[currentTurnId ?? '']?.target)
+      : undefined);
   const isCrossChatOriginTurn = !!crossChatOriginForSend({
     replyContext: replyContextForQuote,
     replyTarget: s.replyTargets?.[replyMessageId ?? ''],

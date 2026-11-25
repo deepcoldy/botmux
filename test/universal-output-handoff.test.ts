@@ -16,6 +16,7 @@ import { FINAL_HANDOFF_DELIVERY_REASON, FINAL_HANDOFF_WAIT_REASON } from '../src
 import { raiseDaemonAttention } from '../src/core/session-activity.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { WorkerFinalOutput } from '../src/types.js';
+import type { DaemonSession } from '../src/core/types.js';
 
 const app = 'cli_universal';
 const output: WorkerFinalOutput = { type: 'final_output', sessionId: 'session_one', turnId: 'om_turn', lastUuid: 'native_final', content: 'answer' };
@@ -219,6 +220,93 @@ describe('attention lifecycle', () => {
     // The startup blip must NOT latch the attention after a later success.
     expect(ctx.ds.agentAttention).toBeUndefined();
     vi.useRealTimers();
+  });
+  it('settles an existing required hold and reaction before terminal outcome registration', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', answerRequired: true, context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
+    const ctx = scopeFor(db, record, dir, {
+      processFinalOutput: vi.fn(async () => ({ status: 'delivered' as const, messageId: 'om_ok' })),
+    });
+    ctx.ds.requiredReplyCotHolds = new Map([[`${output.turnId}\0${output.dispatchAttempt ?? ''}`, {
+      turnId: output.turnId, dispatchAttempt: output.dispatchAttempt,
+      finishStatus: 'completed' as const, replyPending: true, backgroundPending: false,
+    }]]);
+    ctx.scope.hasCompletedTurn = () => false;
+    ctx.scope.noteFinalOutputReceipt = vi.fn();
+    ctx.scope.finishTurnReactions = vi.fn();
+    ctx.scope.finalizeCotMessage = vi.fn();
+
+    await ctx.run();
+
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(ctx.ds.requiredReplyCotHolds).toBeUndefined();
+    expect(ctx.scope.finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(
+      ctx.ds, output.turnId, 'completed', output.dispatchAttempt,
+    );
+    expect(ctx.scope.finishTurnReactions).toHaveBeenCalledOnce();
+  });
+  it('settles a delivered CoT before a flush can interleave with CLI loss', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', answerRequired: true, context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
+    const ctx = scopeFor(db, record, dir, {
+      processFinalOutput: vi.fn(async () => ({ status: 'delivered' as const, messageId: 'om_ok' })),
+    });
+    ctx.ds.requiredReplyCotHolds = new Map([[`${output.turnId}\0${output.dispatchAttempt ?? ''}`, {
+      turnId: output.turnId, dispatchAttempt: output.dispatchAttempt,
+      finishStatus: 'completed' as const, replyPending: true, backgroundPending: false,
+    }]]);
+    let cliAlive = true;
+    let releaseFlush!: () => void;
+    const flush = new Promise<void>(resolve => { releaseFlush = resolve; });
+    ctx.scope.ownsWorkerSession = () => cliAlive;
+    ctx.scope.sessionController = {
+      ref: { appId: app, sessionId: output.sessionId },
+      store: { apply: vi.fn(), read: () => ({ lifecycle: 'active' }) },
+      flushPrimary: vi.fn(() => flush),
+    };
+    ctx.scope.finalizeCotMessage = vi.fn();
+    const settleLoss = loadWorkerPoolFunction<(session: DaemonSession) => boolean>(
+      'settleBackgroundStateOnCliLoss', ctx.scope,
+    );
+
+    const running = ctx.run();
+    try {
+      await vi.waitFor(() => expect(ctx.scope.sessionController.flushPrimary).toHaveBeenCalledOnce());
+      cliAlive = false;
+      settleLoss(ctx.ds);
+    } finally {
+      releaseFlush();
+    }
+    await running;
+
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(ctx.scope.finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(
+      ctx.ds, output.turnId, 'completed', output.dispatchAttempt,
+    );
+    expect(ctx.scope.finalizeCotMessage).not.toHaveBeenCalledWith(
+      ctx.ds, output.turnId, 'failed', output.dispatchAttempt,
+    );
+    expect(ctx.ds.requiredReplyCotHolds).toBeUndefined();
+  });
+  it('withholds reaction for a pre-terminal final without an exact hold', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', answerRequired: true, context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
+    const ctx = scopeFor(db, record, dir, {
+      processFinalOutput: vi.fn(async () => ({ status: 'delivered' as const, messageId: 'om_ok' })),
+    });
+    ctx.scope.hasCompletedTurn = () => false;
+    ctx.scope.noteFinalOutputReceipt = vi.fn();
+    ctx.scope.finishTurnReactions = vi.fn();
+    ctx.scope.finalizeCotMessage = vi.fn();
+
+    await ctx.run();
+
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(ctx.scope.finishTurnReactions).not.toHaveBeenCalled();
+    expect(ctx.scope.finalizeCotMessage).not.toHaveBeenCalled();
   });
   it('files a deterministic non-native drop (binding mismatch, undefined receipt) as terminal rejected', async () => {
     const dir = directory(); const db = database();
@@ -434,7 +522,8 @@ describe('worker production IPC boundary', () => {
 });
 
 describe('native and generic settlement contracts', () => {
-  it.each(['before send', 'after Feishu accepted', 'after worker-only persistence', 'without original execution proof',
+  it.each(['before send', 'after Feishu accepted', 'after worker-only persistence',
+    'after worker-only persistence with background hold', 'without original execution proof',
     'wrong turn', 'wrong attempt', 'originless journal', 'transient store fault'] as const)(
     'reopens a scoped final %s without rerunning the model or inventing a receipt', async crash => {
       vi.useFakeTimers();
@@ -474,8 +563,15 @@ describe('native and generic settlement contracts', () => {
           bridgeFinalOutputUuid: () => 'stable_original_delivery', beginFinalOutputDelivery: () => () => {},
           sessionPromptInjection: () => 'default',
         });
-      const ds = { larkAppId: app, chatId: sink.chatId, chatType: sink.chatType, worker: null,
+      const ds: any = { larkAppId: app, chatId: sink.chatId, chatType: sink.chatType, worker: null,
         session: { sessionId: output.sessionId, status: 'active' } };
+      if (crash === 'after worker-only persistence' || crash === 'after worker-only persistence with background hold') {
+        ds.requiredReplyCotHolds = new Map([[`${snapshot.output.turnId}\0${snapshot.output.dispatchAttempt}`, {
+          turnId: snapshot.output.turnId, dispatchAttempt: snapshot.output.dispatchAttempt,
+          finishStatus: 'completed', replyPending: true,
+          backgroundPending: crash === 'after worker-only persistence with background hold',
+        }]]);
+      }
       const attempt = (journal: OutputDeliveryJournal, pending: OutputDeliveryRecord) =>
         new OutputDeliveryCoordinator(journal).deliver(pending, {
           owns: () => true,
@@ -495,6 +591,7 @@ describe('native and generic settlement contracts', () => {
       expect(db.sink(output.sessionId!, output.turnId)).toEqual(sink);
       const noteFinalOutputReceipt = vi.fn();
       const settleRequiredReplyCotMessage = vi.fn(() => false);
+      const settleRequiredReplyBackground = vi.fn();
       const finalizeCotMessage = vi.fn();
       const recover = loadWorkerPoolFunction<(ds: unknown) => Promise<void>>('recoverColdImReplies', deliveryScope({
         config: { session: { dataDir: dir } }, WorkerOutputJournal, OutputDeliveryCoordinator,
@@ -509,7 +606,11 @@ describe('native and generic settlement contracts', () => {
         raiseDaemonAttention, publishAttentionPatch: vi.fn(), publishScopedImDeliveryStatus: vi.fn(), logger: { warn: vi.fn() },
         tag: () => 'trial', shouldDropMismatchedFinalOutput: () => false, shouldDropMismatchedHermesFinalOutput: () => false,
         deliverFinalOutputWithOutputControl: helper, privateReplyEnabled: () => false,
-        noteFinalOutputReceipt, settleRequiredReplyCotMessage, finalizeCotMessage,
+        noteFinalOutputReceipt,
+        ...(crash === 'after worker-only persistence' || crash === 'after worker-only persistence with background hold'
+          ? { settleRequiredReplyBackground }
+          : { settleRequiredReplyCotMessage }),
+        finalizeCotMessage,
         FinalPublicationUnknownError, OutputDeliveryTerminalError, FINAL_HANDOFF_DELIVERY_REASON,
       }));
       await recover(ds);
@@ -546,7 +647,21 @@ describe('native and generic settlement contracts', () => {
       expect(deliverFinalOutput).toHaveBeenCalledTimes(crash === 'after Feishu accepted' ? 2 : 1);
       expect(noteFinalOutputReceipt).toHaveBeenCalledWith(ds, output.turnId,
         { text: snapshot.output.content }, { exactAttempt: { dispatchAttempt: 2 } });
-      expect(finalizeCotMessage).toHaveBeenCalledWith(ds, output.turnId, 'completed', 2);
+      if (crash === 'after worker-only persistence with background hold') {
+        expect(finalizeCotMessage).not.toHaveBeenCalled();
+        expect([...ds.requiredReplyCotHolds!.values()]).toEqual([expect.objectContaining({
+          turnId: output.turnId, dispatchAttempt: 2, replyPending: false, backgroundPending: true,
+        })]);
+        expect(settleRequiredReplyBackground).not.toHaveBeenCalled();
+      } else if (crash === 'after worker-only persistence') {
+        expect(finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(ds, output.turnId, 'completed', 2);
+        expect(ds.requiredReplyCotHolds).toBeUndefined();
+        expect(settleRequiredReplyBackground).not.toHaveBeenCalled();
+      } else {
+        // A restarted daemon has no CoT/hold to reconstruct. The visible final
+        // reply is already persisted; do not invent background-zero completion.
+        expect(finalizeCotMessage).not.toHaveBeenCalled();
+      }
       expect(producer.readPending()).toEqual([]);
       expect(db.pending(output.sessionId!)).toEqual([]);
     },
