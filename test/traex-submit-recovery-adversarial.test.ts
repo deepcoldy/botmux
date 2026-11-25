@@ -97,6 +97,20 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
 }
 
 describe('TRAE recovery adversarial interleavings', () => {
+  it('keeps the original write watermark when a delayed adopt receipt rotates the bridge', async () => {
+    const h = fixture({ acceptsRescue: false });
+    const notify = vi.fn();
+    Object.assign(h.scope, {
+      lastInitConfig: { cliId: 'traex', adoptMode: true },
+      codexBridgeFallbackActive: () => true,
+      codexBridgeNotifyCliSessionId: notify,
+    });
+    h.start();
+    h.accept();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(notify).toHaveBeenCalledExactlyOnceWith('owned-session', { adoptRotationStartMs: 100 });
+  });
+
   it.each(['receipt-wait', 'fresh-capture', 'final-receipt'] as const)('honors card stop during %s even if the original draft remains', async phase => {
     const h = fixture({ acceptsRescue: false });
     Object.assign(h.scope, {

@@ -137,6 +137,12 @@ export interface SessionRow extends SessionMessagePreview {
   /** Dashboard「创建会话」入待办池：会话已建但 CLI 未起（parked），等激活才开跑。
    *  前端据此在卡片上显示「待开始 / 开始」入口、并把卡片钉在待办池列。 */
   queued?: boolean;
+  /** Live or dormant row waiting for its opening / promoted-tail submission ACK
+   *  to clear the durable queued-activation gate. Omitted once settled. */
+  queuedActivationPending?: boolean;
+  /** Number of same-anchor turns currently buffered in queuedActivationTail
+   *  behind the activation gate. Omitted when 0. Never exposes raw prompt text. */
+  queuedActivationTailCount?: number;
   /** A TUI prompt card is open and waiting for the user's choice.
    *  Feeds the board view's needs-you column. */
   tuiPromptActive?: boolean;
@@ -192,6 +198,16 @@ export interface SessionRow extends SessionMessagePreview {
   quoteTargetId?: string;
   quoteTargetSenderOpenId?: string;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
+}
+
+export function queuedActivationRowFields(
+  s: Pick<Session, 'queuedActivationPending' | 'queuedActivationTail'>,
+): Pick<SessionRow, 'queuedActivationPending' | 'queuedActivationTailCount'> {
+  const tailCount = s.queuedActivationTail?.length ?? 0;
+  return {
+    ...(s.queuedActivationPending === true ? { queuedActivationPending: true } : {}),
+    ...(tailCount > 0 ? { queuedActivationTailCount: tailCount } : {}),
+  };
 }
 
 function composeSendRoutingFields(
@@ -455,6 +471,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     ...(topicId ? { threadId: topicId } : {}),
     pendingRepo: !!ds.pendingRepo,
     queued: !!ds.session.queued,
+    ...queuedActivationRowFields(ds.session),
     tuiPromptActive: !!ds.tuiPromptCardId,
     agentAttention: ds.agentAttention
       ? {
@@ -591,6 +608,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
     ...(topicId ? { threadId: topicId } : {}),
     queued: !!s.queued,
+    ...queuedActivationRowFields(s),
     ...(s.lastTurn ? { lastTurn: s.lastTurn } : {}),
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
     quarantined: !!s.restoreQuarantinedAt,

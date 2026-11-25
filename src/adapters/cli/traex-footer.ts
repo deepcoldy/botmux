@@ -31,6 +31,45 @@ import type { SessionRenameSurface } from './types.js';
 
 const GLYPH_FRAMES = '⋄◇◆✦◈❖✧';
 
+export const TRAEX_SPINNER_FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
+
+/** Compiled-in native activity labels. Kept beside the screen predicates so
+ * status-panel automation uses exactly the same activity vocabulary. */
+export const TRAEX_SPINNER_LABELS = [
+  'Thinking longer…', 'Deep in thought…', 'Almost there…', 'Running command…',
+  'Command in flight…', 'Chugging along…', 'Finishing up…', 'Executing…',
+  'Hang tight…', 'Waiting for response…', 'Any second now…', 'Poking the model…',
+  'On its way…', "Shh, it's thinking…", 'Thinking…', 'Reasoning through it…',
+  'Mulling it over…', 'Pondering…', 'Working it out…', 'Piecing it together…',
+  'Reviewing approval request', 'Working…', 'Working on it…',
+  'Queued for capacity', 'Queued for next turn',
+] as const;
+
+/** A complete native progress row, independent of any surrounding composer.
+ * Status panels do not have the live footer geometry used below. */
+export const TRAEX_PROGRESS_PATTERN = new RegExp(
+  `^[ \\t]*[${TRAEX_SPINNER_FRAMES}${GLYPH_FRAMES}][ \\t]+(?:${TRAEX_SPINNER_LABELS.filter(label => !label.startsWith('Queued')).join('|')})(?:…)?(?:[ \\t]*\\([^\\r\\n]*esc to interr?upt\\))?[ \\t]*$`,
+  'i',
+);
+
+/** Native empty-composer suggestions from TraeX's string table. */
+export const TRAEX_EMPTY_COMPOSER_HINTS = new Set([
+  '',
+  'Ask TRAE CLI to do anything',
+  'Ask TraeCode CLI to do anything',
+  'Explain this codebase',
+  'Summarize recent commits',
+  'Implement {feature}',
+  'Find and fix a bug in @filename',
+  'Write tests for @filename',
+  'Improve documentation in @filename',
+  'Run /review on my current changes',
+  'Use /skills to list available skills',
+  'Check recently modified functions for compatibility',
+  'How many files have been modified?',
+  'Will this algorithm scale well?',
+]);
+
 /** Column-0 status row: glyph, a spinner label starting with a capital
  *  letter ("Working…", "Shh, it's thinking…" — see TRAEX_SPINNER_LABELS),
  *  then parentheses that OPEN with the elapsed time ("1s",
@@ -77,26 +116,6 @@ export function traexViewportFooterBusy(screen: string): boolean {
   if (composer < 2) return false;
   return STATUS_ROW.test(rows[composer - 2]!);
 }
-
-// Native empty-composer suggestions from TraeX 0.210.1's string table.
-// Arbitrary draft text must not be mistaken for a composer ready to receive
-// Botmux's queued paste.
-const EMPTY_COMPOSER_HINTS = new Set([
-  '',
-  'Ask TRAE CLI to do anything',
-  'Ask TraeCode CLI to do anything',
-  'Explain this codebase',
-  'Summarize recent commits',
-  'Implement {feature}',
-  'Find and fix a bug in @filename',
-  'Write tests for @filename',
-  'Improve documentation in @filename',
-  'Run /review on my current changes',
-  'Use /skills to list available skills',
-  'Check recently modified functions for compatibility',
-  'How many files have been modified?',
-  'Will this algorithm scale well?',
-]);
 
 interface TraexComposerDraft {
   body: string;
@@ -176,7 +195,7 @@ export function traexSessionRenameSurface(screen: string, command: string): Sess
   // Dialogs and actual composer content outrank busy chrome: a running turn
   // can coexist with a draft, paste chip or half-typed /rename.
   const draft = traexComposerDraft(screen, { allowBusy: true });
-  if (draft && !EMPTY_COMPOSER_HINTS.has(draft.body)) {
+  if (draft && !TRAEX_EMPTY_COMPOSER_HINTS.has(draft.body)) {
     if (draft.collapsedChars !== undefined) return 'blocked';
     return composerTextKey(draft.body) === composerTextKey(command) ? 'unsubmitted' : 'blocked';
   }
@@ -208,7 +227,7 @@ export function traexRestoredComposerReady(
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
   while (composer >= 0 && !PROMPT_ROW.test(rows[composer]!)) composer--;
-  if (composer < 0 || !EMPTY_COMPOSER_HINTS.has(rows[composer]!.slice(1).trim())) return false;
+  if (composer < 0 || !TRAEX_EMPTY_COMPOSER_HINTS.has(rows[composer]!.slice(1).trim())) return false;
   const footer = rows.slice(composer + 1).filter(row => row.trim());
   // TraeX 0.209–0.211: optional bottom rule, initialized model/context row,
   // then the access/shortcut row. Extra rows can be a draft, picker or dialog.

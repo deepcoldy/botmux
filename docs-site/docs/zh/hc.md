@@ -10,7 +10,7 @@
 | CLI 常驻、daemon 重启不丢，浏览器里用 Web 终端 | 适合，和 tmux 一样 |
 | 开文件沙盒（`sandbox`） | 可以，和 tmux 一样 |
 | 用 `/adopt` 接入已有的终端会话 | 不行，用 tmux / Herdr / Zellij |
-| daemon 跑在 macOS 上 | 不行，hc 后端只支持 Linux |
+| daemon 跑在 macOS 上 | 可以，需自备 herdr-core |
 
 hc 需要**显式开启**：默认后端仍然是 tmux，botmux 不会帮你安装 hc，机器上有 `hc` 也不会被自动选用。
 
@@ -22,7 +22,7 @@ hc 把输出主动推给 botmux，botmux 在本地维护一份屏幕镜像，读
 
 ## 1. 准备 herdr-core
 
-要求 **herdr-core 0.1.19 或更新**，只支持 **Linux**。
+支持 **Linux 和 macOS**，需要 **herdr-core 0.1.19 或更新**。
 
 botmux 按下面的顺序找可执行文件，用第一个找到的：
 
@@ -82,9 +82,9 @@ botmux 只用它自己的 hc core，和你自己在用的 hc 完全分开：
 | 项目 | botmux 的 core |
 |---|---|
 | core 名（`HC_SESSION`） | `botmux` |
-| socket | `$XDG_RUNTIME_DIR/herdr-core/botmux.sock`（没设 `XDG_RUNTIME_DIR` 时是 `/run/user/<uid>/herdr-core/botmux.sock`） |
+| socket | 优先用 `$XDG_RUNTIME_DIR/herdr-core/botmux.sock`。未设置时，Linux 用 `/run/user/<uid>/herdr-core/botmux.sock`，macOS 默认用 `~/.botmux/hc/botmux.sock`（随 botmux 数据根目录变化） |
 | 配置目录 | `~/.botmux/hc/config`，其中的 `herdr-core/config.toml` 由 botmux 写入 |
-| 状态目录 | 和 socket 放在一起：`…/herdr-core/botmux.state` |
+| 状态目录 | socket 同目录下的 `botmux.state` |
 
 - 你自己的 core（通常是 `default`）和 `~/.config/herdr-core` 里的配置不会被 botmux 读取、连接或修改。
 - botmux 调用 hc 时会去掉继承来的 `HC_*` 变量，再显式指定上面这几项，所以你 shell 里的 `HC_SESSION`、`HC_SOCKET` 不会把会话带到别的 core。
@@ -110,7 +110,11 @@ botmux list
 - 终端已经结束或不存在；
 - 同名终端属于别的会话。
 
-hc 后端只在 Linux 上可用，所以飞书卡片上的「💻 打开 …」本机直开按钮（只在 macOS 上的 daemon 提供）不适用于 hc 会话。
+macOS 上，飞书卡片的「💻 打开 …」可用时，也会通过同样的所有权核对接入 hc 会话。
+
+在 Dashboard 的 **Bot 配置 → 高级 → 会话后端** 开启 **自动创建 Herdr 标签页**，或在对应的 `bots.json` 条目中设置 `"hcHerdrTabs": true`。该开关按 bot 设置，默认关闭，仅对 hc 会话生效。下次启动会话或由新 worker 重新接入时，botmux 会在私有 core 上按工作目录登记原生 Space，每个话题一个 Tab。
+
+新标签页使用 Botmux 的会话标题。没有标题时显示 hc 会话名（`bmx-<会话 ID 前 8 位>`）。登记时 Herdr App 可以尚未连接。把私有 core 添加为 Herdr App 的 Machine 后即可查看已登记的标签页。关闭开关后，从下次启动会话或由新 worker 重新接入起停止登记。现有标签页可在 Herdr App 中管理，同一 worker 短线重连会保留停放状态。终端恢复由 botmux 管理。
 
 ## 5. 会话的生命周期
 
@@ -127,7 +131,7 @@ daemon 不在线时执行 `botmux delete`，如果终端标签不符、herdr-cor
 
 终端所在的 core（socket）在会话第一次创建时就被记录下来。之后即使 daemon 的环境变了（比如 `XDG_RUNTIME_DIR` 不一样了），botmux 仍会到原来的 core 找它。
 
-`XDG_RUNTIME_DIR` 是 `/run/user/<uid>` 时，hc 会用 systemd 用户单元托管 core 和终端，它们不在 daemon 的进程组里，daemon 重启不会带走它们。
+Linux 上，`XDG_RUNTIME_DIR` 是 `/run/user/<uid>` 时，hc 会用 systemd 用户单元托管 core 和终端。macOS 本地会话由 hc 通过 launchd 启动 core。
 
 :::warning 升级 herdr-core
 替换磁盘上的二进制不会替换已经在跑的 core。如果正在运行的 botmux core 低于 0.1.19，新会话会被拒绝，错误信息里有这个 core 的 socket 和 pid。botmux 不会自动重启它，因为结束 core 会结束里面所有的终端；确认没有要保留的会话后，结束这个进程再重试。
@@ -135,7 +139,6 @@ daemon 不在线时执行 `botmux delete`，如果终端标签不符、herdr-cor
 
 ## 6. 和 tmux 相比的差别与限制
 
-- **只支持 Linux**，而且要你自己准备 herdr-core。
 - **不支持 `/adopt`**：botmux 不扫描 hc 里的终端，要接入已有的外部会话，用 tmux / Herdr / Zellij。
 - **没有 tmux 的 copy mode**：Web 终端的滚动由浏览器保留的回滚缓冲提供；worker 重新接上时，最多补回约 3000 行历史。
 - **空窗期的终端尺寸**：没有 worker 接着时（比如 daemon 重启的那几秒），终端保持 160×50，不会被拉成别的尺寸。

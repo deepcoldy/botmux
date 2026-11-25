@@ -25,8 +25,6 @@ import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
 import { DEFAULT_RENDER_COLS, DEFAULT_RENDER_ROWS } from '../../../utils/render-dimensions.js';
 
 export const HC_CORE_SESSION = 'botmux';
-/** Linux `sun_path` minus its NUL: hc's MAX_SOCKET_PATH. */
-export const HC_MAX_SOCKET_PATH = 107;
 /** Hex digits of a holder id in its socket name (hc paths.rs HOLDER_ID). */
 const HC_HOLDER_ID_DIGITS = 8;
 const HC_STATUS_TIMEOUT_MS = 3_000;
@@ -130,21 +128,21 @@ export function hcPaneXdgRestore(workerEnv: NodeJS.ProcessEnv): { set: Record<st
 }
 
 /** Why hc would refuse this socket path, or null when it fits. */
-export function hcSocketPathError(socket: string): string | null {
+function hcSocketPathError(socket: string, platform: NodeJS.Platform): string | null {
+  // hc uses sizeof(sockaddr_un.sun_path) minus the terminator on each OS.
+  const maxBytes = platform === 'darwin' ? 103 : 107;
   const longest = Buffer.byteLength(hcHolderSocketPrefix(socket)) + 1 + HC_HOLDER_ID_DIGITS;
   const bytes = Math.max(Buffer.byteLength(socket), longest);
-  if (bytes <= HC_MAX_SOCKET_PATH) return null;
-  return `hc socket 路径过长：${socket}（最长的 holder socket 需 ${bytes} 字节，上限 ${HC_MAX_SOCKET_PATH}）`;
+  if (bytes <= maxBytes) return null;
+  return `hc socket 路径过长：${socket}（最长的 holder socket 需 ${bytes} 字节，上限 ${maxBytes}）`;
 }
 
-/**
- * This env's botmux core or, given `core`, the one a target was frozen on
- * (hc puts sockets in `<runtime dir>/herdr-core/`).
- */
+/** This env's botmux core or, given `core`, the one a target was frozen on. */
 export function hcCorePaths(
   env: NodeJS.ProcessEnv = process.env,
-  opts: { uid?: number; core?: HcCoreAddress } = {},
+  opts: { uid?: number; platform?: NodeJS.Platform; core?: HcCoreAddress } = {},
 ): HcCorePaths {
+  const platform = opts.platform ?? process.platform;
   let session = HC_CORE_SESSION;
   let socket: string;
   let runtimeDir: string;
@@ -157,14 +155,20 @@ export function hcCorePaths(
     const xdg = env.XDG_RUNTIME_DIR;
     if (xdg && isAbsolute(xdg)) {
       runtimeDir = xdg;
+      socket = join(runtimeDir, 'herdr-core', `${session}.sock`);
+    } else if (platform === 'darwin') {
+      // Keep the address stable across launchd, an interactive shell and workers
+      // with per-session TMPDIRs. hc creates the private socket subdirectory.
+      runtimeDir = hcBotmuxRoot(env);
+      socket = join(runtimeDir, 'hc', `${session}.sock`);
     } else {
       const uid = opts.uid ?? process.getuid?.();
-      if (uid === undefined) throw new Error('hc 后端目前只支持 Linux');
+      if (uid === undefined) throw new Error('hc 后端支持 Linux 和 macOS');
       runtimeDir = `/run/user/${uid}`;
+      socket = join(runtimeDir, 'herdr-core', `${session}.sock`);
     }
-    socket = join(runtimeDir, 'herdr-core', `${session}.sock`);
   }
-  const tooLong = hcSocketPathError(socket);
+  const tooLong = hcSocketPathError(socket, platform);
   if (tooLong) throw new Error(`${tooLong}；请换一个更短的 XDG_RUNTIME_DIR`);
   return {
     session,
@@ -176,14 +180,27 @@ export function hcCorePaths(
   };
 }
 
-/**
- * Why no hc call may run against these paths, or null. Any hc call can start
- * a core, and hc creates the socket's directories recursively, so a missing
- * runtime dir would come back as a plain directory where logind owns it.
- */
+/** If the runtime directory disappeared, none of its sockets can be reached. */
 export function hcRuntimeDirError(paths: Pick<HcCorePaths, 'runtimeDir'>): string | null {
   if (isDirectory(paths.runtimeDir)) return null;
-  return `hc 运行目录 ${paths.runtimeDir} 不存在（取自 XDG_RUNTIME_DIR，未设置时为 /run/user/<uid>）`;
+  return `hc 运行目录 ${paths.runtimeDir} 不存在，请检查 XDG_RUNTIME_DIR 或默认运行目录`;
+}
+
+/** Check before hc can auto-start, create directories or replace a stale socket. */
+export function hcRuntimeError(paths: Pick<HcCorePaths, 'runtimeDir' | 'socket'>): string | null {
+  return hcRuntimeDirError(paths) ?? hcSocketFileError(paths.socket);
+}
+
+/** hc may unlink the path before binding, including during an automatic start. */
+export function hcSocketFileError(socket: string): string | null {
+  if (process.platform !== 'darwin') return null;
+  try {
+    const entry = lstatSync(socket, { throwIfNoEntry: false });
+    if (entry && !entry.isSocket()) return `hc socket 路径 ${socket} 被非 socket 文件占用`;
+  } catch (error) {
+    return `无法检查 hc socket 路径 ${socket}（${(error as NodeJS.ErrnoException).code}）`;
+  }
+  return null;
 }
 
 /**
@@ -378,8 +395,8 @@ const inflight = new Map<string, Promise<HcCoreStatus>>();
 async function startOrJoinHcCore(env: NodeJS.ProcessEnv, paths: HcCorePaths, timeoutMs: number): Promise<HcCoreStatus> {
   const availability = probeHcAvailability({ env });
   if (!availability.ok) throw new Error(availability.reason);
-  const noRuntimeDir = hcRuntimeDirError(paths);
-  if (noRuntimeDir) throw new Error(noRuntimeDir);
+  const runtimeError = hcRuntimeError(paths);
+  if (runtimeError) throw new Error(runtimeError);
   ensureHcConfig(paths.configHome);
   const deadline = Date.now() + timeoutMs;
   const remaining = (): number => Math.max(1, deadline - Date.now());
@@ -387,6 +404,8 @@ async function startOrJoinHcCore(env: NodeJS.ProcessEnv, paths: HcCorePaths, tim
   let probe = await queryHcCoreStatus(paths.socket, Math.min(HC_STATUS_TIMEOUT_MS, remaining()));
   let started = false;
   if (probe.state === 'absent') {
+    const socketError = hcSocketFileError(paths.socket);
+    if (socketError) throw new Error(socketError);
     // Concurrent starters are fine: hc's core.lock lets one core win, the
     // other cores exit, and every `server start` client waits for the winner.
     started = true;
