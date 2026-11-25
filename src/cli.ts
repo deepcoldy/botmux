@@ -345,7 +345,7 @@ import {
   resolveVerifiedDispatchReportTarget,
 } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus, type CliPermissionOutcome } from './core/ask-types.js';
-import { PERMISSION_ALLOW_KEY, type PermissionOutcomeWatcher } from './core/ask-hook/types.js';
+import { permissionAnswerAllows, type PermissionOutcomeWatcher } from './core/ask-hook/types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
 import {
   hasManagedOriginIsolationMarker,
@@ -19441,6 +19441,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       by: result.kind === 'answered' ? result.by : null,
       comment: result.kind === 'answered' ? result.comment : null,
       ...(result.kind === 'answered' && result.customAnswers ? { customAnswers: result.customAnswers } : {}),
+      ...(result.kind === 'answered' && result.notes ? { notes: result.notes } : {}),
       timedOut: result.kind === 'timedOut',
     };
     stdoutPayload = JSON.stringify(out) + '\n';
@@ -19450,6 +19451,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     // 用户以文字作答时落到空字符串；comment 可能含换行，塞进「一行一个 key」的
     // stdout 契约并不安全，因此 stdout 保持不变，改由 stderr 指明答案去向。
     if (result.customAnswers?.some(Boolean)) console.error('botmux ask: 用户按题填写了自定义答案；请用 --json 读取 customAnswers。');
+    if (result.notes?.some(Boolean)) console.error('botmux ask: 用户在勾选的选项旁写了备注；请用 --json 读取 notes。');
     if (isCustomReply(result)) {
       console.error(
         'botmux ask: 用户以文字作答，未点选任何选项；stdout 留空（stdout 只承载 option key）。' +
@@ -19786,7 +19788,7 @@ export async function runHook(
   }
 
   if (result.kind === 'answered') {
-    return { stdout: adapter.formatAnswer(result.answers, parsed, result.comment, result.customAnswers) };
+    return { stdout: adapter.formatAnswer(result.answers, parsed, result.comment, result.customAnswers, result.notes, result.locale) };
   }
 
   // timedOut / invalidated → passthrough 放行（实现了 formatUnanswered 的 CLI 带原因结束）
@@ -19876,9 +19878,8 @@ function permissionDecisionFromResult(
   format: (allow: boolean, message?: string) => string,
 ): string {
   if (result.kind === 'answered') {
-    const selected = result.answers[0] ?? [];
     const comment = (result.comment ?? '').trim();
-    if (selected.includes(PERMISSION_ALLOW_KEY) && !comment) return format(true);
+    if (permissionAnswerAllows(result)) return format(true);
     return format(false, comment
       ? `The user did not approve this operation. They replied in Lark/Feishu: ${comment.slice(0, 1000)}`
       : 'The user denied this operation in Lark/Feishu. Do not retry it as-is; choose a different approach or ask the user.');

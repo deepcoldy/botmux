@@ -15,7 +15,6 @@ import { updateTurnReplyCard, settleTurnReplyCards, replyCardModeFor } from '../
 import { TurnReplyCardStore, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
 import { buildTurnReplyAskElements } from '../src/im/lark/turn-reply-ask-elements.js';
-import { setAskOptionLayoutLookup } from '../src/im/lark/ask-option-layout.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 import { replyMessage, sendMessage, updateMessage } from '../src/im/lark/client.js';
@@ -80,12 +79,13 @@ async function ask(overrides: Partial<CreateAskInput> = {}) {
   await vi.waitFor(() => expect(getAskSnapshot(id)?.cardMessageId).toBe('om_reply'));
   return { snapshot: getAskSnapshot(id)!, answer };
 }
+const cardNodes = (node: any = JSON.parse(body)): any[] => node && typeof node === 'object'
+  ? [node, ...Object.values(node).flatMap(cardNodes)] : [];
 function optionButton(key: string) {
-  return JSON.parse(body).body.elements.flatMap((element: any) =>
-    element.columns?.flatMap((column: any) => column.elements) ?? [],
-  ).find((element: any) => element.behaviors?.some((behavior: any) =>
+  return cardNodes().find((element: any) => element.behaviors?.some((behavior: any) =>
     ['ask_select', 'ask_toggle'].includes(behavior.value?.action) && behavior.value?.key === key));
 }
+const checker = (name: string) => cardNodes().find((element: any) => element.tag === 'checker' && element.name === name);
 
 function inlineAskWithQuestions(questions: PendingAsk['questions']): Parameters<typeof buildTurnReplyAskElements>[0] {
   return { ask: {
@@ -103,6 +103,17 @@ async function click(snapshot: PendingAsk, value: Record<string, string>, by = '
   if (effect) await effect();
   expect(response).not.toHaveProperty('card');
   expect(response).not.toHaveProperty('body');
+  return response;
+}
+/** Submits the one-shot checker form of the inline Ask with these field values. */
+async function submitForm(snapshot: PendingAsk, value: Record<string, string>, formValue: Record<string, unknown>) {
+  const response = await handleAskCardAction({
+    operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_reply' },
+    action: { value: { ask_id: snapshot.askId, nonce: snapshot.nonce, ...value }, form_value: formValue },
+  }, { larkAppId: 'app', requestGrant: () => 'unavailable' });
+  const effect = (response as { afterAck?: () => Promise<void> })?.afterAck;
+  if (effect) await effect();
+  expect(response).not.toHaveProperty('card');
   return response;
 }
 
@@ -215,22 +226,22 @@ describe('Ask inside the running reply card', () => {
 
   it('preserves multi-select state across worker/CLI patches and empty-submit confirmation', async () => {
     const { snapshot, answer } = await ask({ questions: [{ ...input.questions[0], multiSelect: true }] });
-    expect(optionButton('yes')).toMatchObject({ text: { content: '继续' }, type: 'default',
-      icon: { tag: 'standard_icon', token: 'rectangle_outlined' } });
+    expect(checker('opt_0_0')).toMatchObject({ checked: false, text: { content: expect.stringContaining('继续') } });
+    // A toggle from a card sent before the upgrade still lands in the draft; later patches show it ticked.
     await click(snapshot, { action: 'ask_toggle', key: 'yes', question_index: '0' });
     await store.update(key, { kind: 'phase', phase: 'working' }, io);
-    expect(optionButton('yes')).toMatchObject({ text: { content: '继续' }, type: 'primary',
-      icon: { tag: 'standard_icon', token: 'check_outlined' } });
+    expect(checker('opt_0_0')).toMatchObject({ checked: true });
     expect(body).toContain('等待你确认');
-    await click(snapshot, { action: 'ask_toggle', key: 'yes', question_index: '0' });
-    expect(optionButton('yes')).toMatchObject({ type: 'default', icon: { token: 'rectangle_outlined' } });
-    await click(snapshot, { action: 'ask_submit' });
+    // The form submitted with every box unticked asks for confirmation, and the armed card shows them unticked.
+    await submitForm(snapshot, { action: 'ask_choice_submit' }, { opt_0_0: false, opt_0_1: false });
     await store.update(key, { kind: 'progress', text: '等待你的选择' }, io);
     expect(body).toContain('confirm_empty');
+    expect(checker('opt_0_0')).toMatchObject({ checked: false });
     expect(getAskSnapshot(snapshot.askId)?.settled).toBe(false);
-    await click(snapshot, { action: 'ask_submit', confirm_empty: 'true' });
+    await submitForm(snapshot, { action: 'ask_choice_submit', confirm_empty: 'true' }, { opt_0_0: false, opt_0_1: false });
     expect(await answer).toMatchObject({ kind: 'answered', answers: [[]] });
-    expect(body).not.toContain('ask_toggle');
+    expect(body).not.toContain('ask_choice_submit');
+    expect(body).not.toContain('"tag":"checker"');
   });
 
   it('keeps concurrent questions and reveals the next one after an answer', async () => {
@@ -352,7 +363,7 @@ describe('Ask inside the running reply card', () => {
     const { snapshot } = await ask({ questions: [{ ...input.questions[0], multiSelect: true }] });
     vi.mocked(updateMessage).mockRejectedValueOnce(new Error('connection reset'));
     await click(snapshot, { action: 'ask_toggle', key: 'yes', question_index: '0' });
-    expect(optionButton('yes')).toMatchObject({ type: 'primary', icon: { token: 'check_outlined' } });
+    expect(checker('opt_0_0')).toMatchObject({ checked: true });
     expect(replyMessage).toHaveBeenCalledTimes(1);
   });
 
@@ -399,6 +410,67 @@ describe('Ask inside the running reply card', () => {
     expect(replyCardAskTarget(group, { ...input, rootMessageId: 'om_other_thread' }, origin)).toBeUndefined();
   });
 
+  // The reply card is re-rendered from server state on every progress/phase/tool PATCH, and
+  // Feishu replaces the whole card: anything that lives only in the client until Submit is lost.
+  const runningDs = () => ({ larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
+    session: { sessionId: 'sid', rootMessageId: 'om_root' } } as DaemonSession);
+  const xyz = [{ key: 'x', label: 'X' }, { key: 'y', label: 'Y' }, { key: 'z', label: 'Z' }];
+
+  it.each([
+    ['带默认勾选的单选', { questions: [{ prompt: 'Which?', allowCustom: false, multiSelect: false, defaultSelectedKeys: ['x'], options: xyz }] }],
+    ['多选', { questions: [{ prompt: 'Which?', allowCustom: false, multiSelect: true, options: xyz }] }],
+    ['可写备注的单选', { originKind: 'hook', questions: [{ prompt: 'Which?', multiSelect: false, options: xyz }] }],
+    ['两道单选', { questions: [input.questions[0], { ...input.questions[0], prompt: '再确认一次？' }] }],
+  ] as Array<[string, Partial<CreateAskInput>]>)('表单式提问（%s）不嵌进会被刷新的回复卡', (_shape, overrides) => {
+    expect(replyCardAskTarget(runningDs(), { ...input, ...overrides }, { originTurnId: 'om_turn' })).toBeUndefined();
+  });
+
+  it('回复卡刷新进度时，用户在表单上还没提交的勾选和备注不受影响', async () => {
+    const formAsk: CreateAskInput = { ...input, originKind: 'hook',
+      questions: [{ prompt: 'Which?', multiSelect: true, defaultSelectedKeys: ['x'], options: xyz }] };
+    const replyCardTarget = replyCardAskTarget(runningDs(), formAsk, { originTurnId: 'om_turn' });
+    let askCard = '';
+    vi.mocked(replyMessage).mockImplementation(async (_app, _root, content) => { askCard = content; return 'om_ask'; });
+    const patched: string[] = [];
+    vi.mocked(updateMessage).mockImplementation(async (_app, id, content) => { patched.push(id); body = content; });
+    const answer = registerAsk({ ...formAsk, replyCardTarget });
+    const id = _allAskIds().at(-1)!;
+    await vi.waitFor(() => expect(getAskSnapshot(id)?.cardMessageId).toBe('om_ask'));
+    await Promise.allSettled([...publishing]);
+
+    // While the user unticks X, ticks Y and Z and writes a note on the client, the turn reports progress.
+    await store.update(key, { kind: 'progress', text: 'background step done' }, io);
+    await store.update(key, { kind: 'progress', text: 'another step' }, io);
+    expect(patched.length).toBeGreaterThan(0);
+    expect(patched.every(messageId => messageId === 'om_reply')).toBe(true);
+    expect(store.read(key)?.asks).toBeUndefined();
+
+    // The form the user is editing was never re-rendered, so Submit carries their draft.
+    const nodes = cardNodes(JSON.parse(askCard));
+    const submit = nodes.find((n: any) => n.tag === 'button' && n.form_action_type === 'submit');
+    const value = submit.value ?? submit.behaviors?.find((b: any) => b.type === 'callback')?.value;
+    const checkerNames = nodes.filter((n: any) => n.tag === 'checker').map((n: any) => n.name);
+    const noteName = nodes.find((n: any) => n.tag === 'input')?.name;
+    const response = await handleAskCardAction({ operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_ask' },
+      action: { value, form_value: { [checkerNames[0]]: false, [checkerNames[1]]: true, [checkerNames[2]]: true, [noteName]: '下午再做' } } },
+    { larkAppId: 'app', requestGrant: () => 'unavailable' });
+    await (response as { afterAck?: () => Promise<void> })?.afterAck?.();
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [['y', 'z']], notes: ['下午再做'] });
+  });
+
+  it.each([
+    ['一键单选', input],
+    ['权限确认', { ...input, originKind: 'hook', questions: [{ prompt: '允许执行 rm -rf build 吗？', allowCustom: false, multiSelect: false,
+      options: [{ key: 'allow', label: '允许' }, { key: 'deny', label: '拒绝' }] }] }],
+  ] as Array<[string, CreateAskInput]>)('点一下就答完的提问（%s）仍嵌在回复卡里', async (_shape, oneClick) => {
+    const replyCardTarget = replyCardAskTarget(runningDs(), oneClick, { originTurnId: 'om_turn' });
+    expect(replyCardTarget).toEqual({ turnId: 'om_turn' });
+    const { snapshot, answer } = await ask({ ...oneClick, replyCardTarget });
+    expect(store.read(key)?.asks?.map(entry => entry.ask.askId)).toEqual([snapshot.askId]);
+    await click(snapshot, { action: 'ask_select', key: oneClick.questions[0]!.options[0]!.key });
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [[oneClick.questions[0]!.options[0]!.key]] });
+  });
+
   it('keeps sandbox Ask standalone even when the daemon can read an old unified card', async () => {
     const ds = { larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
       session: { sessionId: 'sid', rootMessageId: 'om_root', sandbox: true } } as DaemonSession;
@@ -410,7 +482,10 @@ describe('Ask inside the running reply card', () => {
     expect(replyMessage).toHaveBeenCalledTimes(1);
     expect(updateMessage).not.toHaveBeenCalled();
     expect(store.read(key)?.asks).toBeUndefined();
-    await click(snapshot, { action: 'ask_select', key: 'yes' });
+    // A standalone card answers in the callback response itself (a whole card, not a reply-card refresh).
+    const response = await handleAskCardAction({ operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_reply' },
+      action: { value: { action: 'ask_select', key: 'yes', ask_id: snapshot.askId, nonce: snapshot.nonce } } }, { larkAppId: 'app' });
+    expect(response).toMatchObject({ schema: '2.0', header: { template: 'green' } });
     expect(await answer).toMatchObject({ kind: 'answered', answers: [['yes']] });
   });
 
@@ -438,8 +513,10 @@ describe('Ask inside the running reply card', () => {
 });
 
 describe('buildTurnReplyAskElements — 选项说明', () => {
-  const notes = (elements: Array<Record<string, any>>) => elements
-    .filter(element => element.tag === 'markdown' && element.text_size === 'notation').map(element => element.content).join('\n');
+  // All Markdown text of the embedded Ask, however deeply it is nested.
+  const notes = (node: unknown): string => !node || typeof node !== 'object' ? ''
+    : Array.isArray(node) ? node.map(notes).join('\n')
+      : [(node as any).tag === 'markdown' ? (node as any).content : '', ...Object.values(node).map(notes)].filter(Boolean).join('\n');
 
   it('文字作答批次不画按钮，但选项说明照常展示', () => {
     const elements = buildTurnReplyAskElements(inlineAskWithQuestions([
@@ -491,57 +568,5 @@ describe('buildTurnReplyAskElements — 选项说明', () => {
     expect(body).toContain('TAIL-A');
     expect(body).toContain('TAIL-B');
     expect(turnReplyCardRequestBytes(body, 'oc_chat')).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
-  });
-});
-
-// ─── 内嵌 ask 的 askOptionLayout 受控（PR #1587 评审建议同批项） ─────────────
-// unified/final-only 模式下 ask 内嵌在实时回复卡（Card JSON 2.0，独立渲染路径），
-// 必须与独立卡读同一个 per-bot 布局配置。
-describe('buildTurnReplyAskElements — askOptionLayout 受控', () => {
-  function makeInlineAsk(): any {
-    return {
-      ask: {
-        askId: 'ask-inline', nonce: 'nonce-inline', larkAppId: 'app',
-        sessionId: 'sid', chatId: 'oc_chat', rootMessageId: 'om_root',
-        deadlineAt: Date.now() + 60_000,
-        questions: [{ prompt: 'q', multiSelect: false, options: [
-          { key: 'a', label: 'A' }, { key: 'b', label: 'B' },
-          { key: 'c', label: 'C' }, { key: 'd', label: 'D' },
-        ] }],
-      },
-    };
-  }
-
-  afterEach(() => {
-    setAskOptionLayoutLookup(() => undefined);
-  });
-
-  it('默认 compact：选项每行 3 个（flow + auto 列）', () => {
-    setAskOptionLayoutLookup(() => undefined);
-    const els = buildTurnReplyAskElements(makeInlineAsk());
-    const rows = els.filter(el => el.tag === 'column_set');
-    expect(rows).toHaveLength(2);
-    expect(rows[0].flex_mode).toBe('flow');
-    expect(rows[0].columns).toHaveLength(3);
-    expect(rows[1].columns).toHaveLength(1);
-    for (const row of rows) {
-      for (const col of row.columns) expect(col.width).toBe('auto');
-    }
-  });
-
-  it('vertical：每个选项一行（单列 weighted、不被同排挤压）', () => {
-    setAskOptionLayoutLookup((id) => id === 'app'
-      ? { config: { askOptionLayout: 'vertical' } }
-      : undefined);
-    const els = buildTurnReplyAskElements(makeInlineAsk());
-    const rows = els.filter(el => el.tag === 'column_set');
-    expect(rows).toHaveLength(4);
-    for (const row of rows) {
-      expect(row.flex_mode).toBe('none');
-      expect(row.columns).toHaveLength(1);
-      expect(row.columns[0]).toMatchObject({ tag: 'column', width: 'weighted', weight: 1 });
-      const buttons = row.columns[0].elements.filter((el: any) => el.tag === 'button');
-      expect(buttons).toHaveLength(1);
-    }
   });
 });

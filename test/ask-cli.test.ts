@@ -284,6 +284,28 @@ describe('botmux ask — CLI boundary', () => {
     } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
   });
 
+  it('emits a note written next to ticked options as `notes` in JSON stdout, keeping the option keys in `answers`', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'ask-notes-cli-')); tempDirs.push(dataDir);
+    const server = createServer(async (req, res) => {
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
+      await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ kind: 'answered', answers: [['yes'], ['no']], notes: ['带一只狗', null], by: 'human', comment: null, timedOut: false }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      mkdirSync(join(dataDir, 'dashboard-daemons'));
+      writeFileSync(join(dataDir, 'dashboard-daemons/cli_test.json'), JSON.stringify({ larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now() }));
+      const file = join(dataDir, 'questions.json');
+      writeFileSync(file, JSON.stringify(['environment', 'scope'].map(prompt => ({ prompt, multiSelect: false, options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }] }))));
+      const out = await runAsk(dataDir, ['ask', 'buttons', '--json', '--questions-file', file]);
+      expect(out.status).toBe(0);
+      const json = JSON.parse(out.stdout);
+      expect(json).toMatchObject({ answers: [['yes'], ['no']], notes: ['带一只狗', null], comment: null });
+      expect(json).not.toHaveProperty('customAnswers');
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+
   it('--multi 发送多选问题并输出逗号分隔的 keys', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
     tempDirs.push(dataDir);
