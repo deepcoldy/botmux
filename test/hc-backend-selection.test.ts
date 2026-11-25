@@ -22,7 +22,7 @@ vi.mock('../src/adapters/backend/hc/cli-ops.js', async importOriginal => ({
   probeHcTerminal: vi.fn(() => 'missing'),
 }));
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { probeHcTerminal, type HcTarget } from '../src/adapters/backend/hc/cli-ops.js';
@@ -109,7 +109,7 @@ describe('resolveHcBackendGate', () => {
     recorded?: HcTarget;
     available?: boolean;
     probes?: Record<string, SessionProbe>;
-    unreachable?: string[];
+    unreachable?: Record<string, string>;
     defaultCore?: () => { hcSession: string; socket: string };
   }) {
     const probe = vi.fn((t: HcTarget) => opts.probes?.[t.socket] ?? 'missing');
@@ -118,7 +118,7 @@ describe('resolveHcBackendGate', () => {
       recorded: opts.recorded,
       availability: () => (opts.available === false ? { ok: false, reason: 'no herdr-core here' } : { ok: true }),
       defaultCore: opts.defaultCore ?? (() => ({ hcSession: fresh.hcSession, socket: fresh.socket })),
-      coreUnreachable: core => (opts.unreachable?.includes(core.socket) ? `${core.socket} is gone` : null),
+      coreUnreachable: core => opts.unreachable?.[core.socket] ?? null,
       probe,
     });
     const gate = decideBackendGate({
@@ -180,7 +180,7 @@ describe('resolveHcBackendGate', () => {
 
   it('treats a recorded core whose runtime dir is gone as missing', () => {
     const { resolution, probe } = resolve({
-      recorded, unreachable: [recorded.socket], probes: { [recorded.socket]: 'exists' },
+      recorded, unreachable: { [recorded.socket]: 'runtime directory missing' }, probes: { [recorded.socket]: 'exists' },
     });
 
     expect(resolution).toMatchObject({ target: fresh, probe: 'missing' });
@@ -188,12 +188,31 @@ describe('resolveHcBackendGate', () => {
     expect(probe).not.toHaveBeenCalledWith(recorded);
   });
 
+  it.each([
+    { entry: 'botmux.sock', reason: 'socket path is occupied' },
+    { entry: 'botmux.holder.1.sock', reason: 'runtime path is inaccessible' },
+  ])('refuses to migrate an unreachable recorded core with $entry still present', ({ entry, reason }) => {
+    const runtimeDir = mkdtempSync(join(tmpdir(), 'bm-hcgate-'));
+    try {
+      const blocked = target(join(runtimeDir, 'botmux.sock'));
+      writeFileSync(join(runtimeDir, entry), '');
+      const { resolution, gate, probe } = resolve({ recorded: blocked, unreachable: { [blocked.socket]: reason } });
+
+      expect(resolution).toMatchObject({ available: false, reason });
+      expect(resolution.target).toBeUndefined();
+      expect(gate.action).toBe('gate');
+      expect(probe).not.toHaveBeenCalled();
+    } finally {
+      rmSync(runtimeDir, { recursive: true, force: true });
+    }
+  });
+
   it('gates when this env names no usable default core', () => {
     const tooLong = resolve({ recorded, defaultCore: () => { throw new Error('socket path too long'); } });
     expect(tooLong.gate.action).toBe('gate');
     expect(tooLong.resolution.reason).toBe('socket path too long');
 
-    const gone = resolve({ unreachable: [fresh.socket] });
+    const gone = resolve({ unreachable: { [fresh.socket]: `${fresh.socket} is gone` } });
     expect(gone.gate.action).toBe('gate');
     expect(gone.resolution.reason).toBe(`${fresh.socket} is gone`);
     expect(gone.probe).not.toHaveBeenCalled();

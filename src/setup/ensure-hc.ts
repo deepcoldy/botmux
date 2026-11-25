@@ -151,7 +151,9 @@ export interface HcAvailabilityOptions {
 export function discoverHcBinary(opts: HcAvailabilityOptions = {}): HcAvailability {
   const env = opts.env ?? process.env;
   const platform = opts.platform ?? process.platform;
-  if (platform !== 'linux') return { ok: false, reason: `hc 后端目前只支持 Linux（当前 ${platform}）` };
+  if (platform !== 'linux' && platform !== 'darwin') {
+    return { ok: false, reason: `hc 后端支持 Linux 和 macOS（当前 ${platform}）` };
+  }
 
   const candidates = hcBinaryCandidates(env);
   const reasons: string[] = [];

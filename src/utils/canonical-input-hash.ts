@@ -42,3 +42,16 @@ export function computeInputHash(input: unknown): string {
   const hex = createHash('sha256').update(canonical, 'utf-8').digest('hex');
   return `sha256:${hex}`;
 }
+
+/**
+ * Raw lowercase-hex SHA-256 of a UTF-8 string (no `sha256:` prefix).
+ *
+ * Used for content-addressed identities whose values must be bare hex —
+ * collab initId / configVersion / createUuid (design 2026-11-20-dm-collab-group
+ * §5.1) — as opposed to `computeInputHash`, which is deliberately `sha256:`
+ * prefixed for its own callers. Callers pass an already-canonical string
+ * (via `canonicalJson`) rather than the raw value, so this never re-serializes.
+ */
+export function sha256Hex(input: string): string {
+  return createHash('sha256').update(input, 'utf-8').digest('hex');
+}

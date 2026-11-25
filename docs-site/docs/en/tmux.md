@@ -75,7 +75,7 @@ Day to day you only need tmux. If you really need to switch, use the `BACKEND_TY
 | `pty` | Emergency: tmux really can't run on this machine | No, the next message cold-resumes |
 | `herdr` / `zellij` | You already use one of these terminal tools and want to see bot sessions inside it | Yes |
 | `zmx` | You want the lightweight ZMX to host sessions; see [ZMX session backend](/en/zmx) | Yes |
-| `hc` | Many sessions and the tmux server has become the bottleneck (Linux only, bring your own herdr-core ≥ 0.1.19); see [hc session backend](/en/hc) | Yes |
+| `hc` | Many sessions and the tmux server has become the bottleneck (Linux or macOS, bring your own herdr-core ≥ 0.1.19); see [hc session backend](/en/hc) | Yes |
 
 ```bash
 # Example: temporarily run the whole machine on pty (emergency only)

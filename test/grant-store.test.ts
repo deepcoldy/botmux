@@ -263,6 +263,130 @@ describe.each(['bots-json', 'sqlite'] as const)('grant-store message quota [%s]'
     expect(registry.getBot('a1').config.dispatchLaunchQuotaReceipts?.[`quota_${'3'.repeat(32)}`]).toMatchObject({ allow: true });
   });
 
+  it('F1: consumeCollabAdmissionOnce 扣费+回执同事务，重复调用 used 不再增', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    const receiptId = `adm_${'a'.repeat(64)}`;
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_g'] },
+      quotaState: { [quotaKey]: { limit: 3, used: 0 } },
+    });
+    const { registry, store } = await freshModules();
+    const input = { larkAppId: 'a1', receiptId, quotaKey, sourceOpenId: 'ou_g', reason: 'chatGrant' };
+    const r1 = await store.consumeCollabAdmissionOnce(input);
+    expect(r1.allow).toBe(true);
+    expect(r1.used).toBe(1);
+    expect(r1.chargedAt).toBeTruthy();
+    // 重复调用（崩溃重投）：同 receiptId，used 不再增，且 facts 恒等（G2）
+    const r2 = await store.consumeCollabAdmissionOnce(input);
+    expect(r2.allow).toBe(true);
+    expect(r2.used).toBe(1);
+    expect(r2.chargedAt).toBe(r1.chargedAt); // chargedAt 从持久回执回放，不漂移
+    expect(r2.reason).toBe('chatGrant');
+    expect(readGrants().quotaState[quotaKey]).toEqual({ limit: 3, used: 1 });
+    expect(readGrants().dispatchLaunchQuotaReceipts[receiptId]).toMatchObject({ allow: true, used: 1, reason: 'chatGrant', quotaKey });
+    expect(registry.getBot('a1').config.dispatchLaunchQuotaReceipts?.[receiptId]).toMatchObject({ allow: true, used: 1 });
+  });
+
+  it('G1: globalGrant 来源（quotaKey=global:）不靠 grantChatId，正常扣费 + origin 正确', async () => {
+    const quotaKey = 'global:ou_g';
+    const receiptId = `adm_${'d'.repeat(64)}`;
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      globalGrants: ['ou_g'],
+      quotaState: { [quotaKey]: { limit: 3, used: 0 } },
+    });
+    const { store } = await freshModules();
+    // sourceOpenId=ou_g，quotaKey=global:ou_g，无 grantChatId 也应命中 globalGrant
+    const r = await store.consumeCollabAdmissionOnce({ larkAppId: 'a1', receiptId, quotaKey, sourceOpenId: 'ou_g', reason: 'globalGrant' });
+    expect(r.allow).toBe(true);
+    expect(r.used).toBe(1);
+    expect(readGrants().quotaState[quotaKey]).toEqual({ limit: 3, used: 1 });
+    expect(readGrants().dispatchLaunchQuotaReceipts[receiptId]).toMatchObject({ allow: true, reason: 'globalGrant', quotaKey });
+  });
+
+  it('G1: globalGrant 当前 DM 无 chatGrant 也不被误拒（不再写 allow=false 拒绝回执）', async () => {
+    const quotaKey = 'global:ou_g';
+    const receiptId = `adm_${'e'.repeat(64)}`;
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      globalGrants: ['ou_g'],
+      quotaState: { [quotaKey]: { limit: 1, used: 0 } },
+    });
+    const { store } = await freshModules();
+    const r = await store.consumeCollabAdmissionOnce({ larkAppId: 'a1', receiptId, quotaKey, sourceOpenId: 'ou_g', reason: 'globalGrant' });
+    expect(r.allow).toBe(true);
+    // 耗尽后撤销 global grant
+    expect(readGrants().globalGrants).toBeUndefined();
+  });
+
+  it('F2: 免额度授权（无 quotaKey）consumeCollabAdmissionOnce 写 used=0 回执，reason 准确', async () => {
+    const receiptId = `adm_${'b'.repeat(64)}`;
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { store } = await freshModules();
+    const r = await store.consumeCollabAdmissionOnce({ larkAppId: 'a1', receiptId, sourceOpenId: 'ou_owner', reason: 'allowedUser' });
+    expect(r.allow).toBe(true);
+    expect(r.used).toBe(0);
+    expect(r.quotaKey).toBeUndefined();
+    expect(readGrants().dispatchLaunchQuotaReceipts[receiptId]).toMatchObject({ allow: true, reason: 'allowedUser' });
+    expect(readGrants().dispatchLaunchQuotaReceipts[receiptId].used ?? 0).toBe(0);
+    expect(readGrants().quotaState).toBeUndefined();
+  });
+
+  it('F1: 半写后从 durable receipt 重建 provenance（getCollabAdmissionReceipt）', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    const receiptId = `adm_${'c'.repeat(64)}`;
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_g'] },
+      quotaState: { [quotaKey]: { limit: 3, used: 0 } },
+    });
+    const { store } = await freshModules();
+    await store.consumeCollabAdmissionOnce({ larkAppId: 'a1', receiptId, quotaKey, sourceOpenId: 'ou_g', reason: 'chatGrant' });
+    const durable = store.getCollabAdmissionReceipt('a1', receiptId);
+    expect(durable).toMatchObject({ allow: true, used: 1, reason: 'chatGrant', quotaKey });
+  });
+
+  it('G2: 同 receiptId 重投 facts 恒等（假时钟控制 chargedAt 不漂移，来源变更仍回放原 provenance）', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    const receiptId = `adm_${'f'.repeat(64)}`;
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_g'] },
+      quotaState: { [quotaKey]: { limit: 3, used: 0 } },
+    });
+    const { store } = await freshModules();
+    const r1 = await store.consumeCollabAdmissionOnce({ larkAppId: 'a1', receiptId, quotaKey, sourceOpenId: 'ou_g', reason: 'chatGrant' });
+    // 来源变更（reason 换成 globalGrant），同 receiptId 仍回放原 chatGrant provenance
+    const r2 = await store.consumeCollabAdmissionOnce({ larkAppId: 'a1', receiptId, quotaKey, sourceOpenId: 'ou_g', reason: 'globalGrant' });
+    expect(r2.allow).toBe(true);
+    expect(r2.used).toBe(1);
+    expect(r2.reason).toBe('chatGrant'); // 回放原 provenance，不拼接当前输入
+    expect(r2.chargedAt).toBe(r1.chargedAt);
+    expect(r2.quotaKey).toBe(quotaKey);
+  });
+
+  it('PR-3a: consumeCollabKickoffOnce kick_<64hex> 幂等不二扣', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    const receiptId = `kick_${'a'.repeat(64)}`;
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_g'] },
+      quotaState: { [quotaKey]: { limit: 3, used: 0 } },
+    });
+    const { store } = await freshModules();
+    const input = { larkAppId: 'a1', receiptId, quotaKey, sourceOpenId: 'ou_g', reason: 'chatGrant' };
+    const r1 = await store.consumeCollabKickoffOnce(input);
+    expect(r1.allow).toBe(true);
+    expect(r1.used).toBe(1);
+    // 重复 prepare/query：同 receiptId 不二扣
+    const r2 = await store.consumeCollabKickoffOnce(input);
+    expect(r2.allow).toBe(true);
+    expect(r2.used).toBe(1);
+    expect(readGrants().quotaState[quotaKey]).toEqual({ limit: 3, used: 1 });
+    expect(readGrants().dispatchLaunchQuotaReceipts[receiptId]).toMatchObject({ allow: true, used: 1, reason: 'chatGrant' });
+  });
+
   it('persists expiry and re-granting as permanent clears only the expiry record', async () => {
     writeConfig({ allowedUsers: ['ou_owner'] });
     const { registry, store } = await freshModules();

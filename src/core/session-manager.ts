@@ -4692,7 +4692,15 @@ export async function resumeSession(
   // also publish.
   dashboardEventBus.publish({
     type: 'session.update',
-    body: { sessionId, patch: { status: 'active', closedAt: null } },
+    body: {
+      sessionId,
+      patch: {
+        status: 'active',
+        closedAt: null,
+        queuedActivationPending: null,
+        queuedActivationTailCount: null,
+      },
+    },
   });
   return {
     ok: true,
@@ -6766,6 +6774,17 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     ds.session.queuedActivationResume = undefined;
     ds.session.pendingRepoSetup = undefined;
     sessionStore.updateSession(ds.session);
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: {
+          queued: false,
+          queuedActivationPending: null,
+          queuedActivationTailCount: null,
+        },
+      },
+    });
     return { ok: true };
   }
   // Repo selection / auto-worktree or another ingress already owns this

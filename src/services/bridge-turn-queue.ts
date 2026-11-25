@@ -76,6 +76,17 @@ export interface BridgePendingTurn {
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
   started: boolean;
+  /** True only when the transcript user/queued_command record's untouched
+   *  legacy-normalised text contained the entire normalised marked content
+   *  (never prefix-only, residue-only, truncation, or unfingerprinted binds). */
+  fullContentMatch?: boolean;
+  /** Strict whole-string equality against the normalised marked content (or its
+   *  sanitized/submitted exact variants). Unlike fullContentMatch (substring),
+   *  prevents short prompts like "ok" from matching unrelated longer inputs. */
+  exactContentMatch?: boolean;
+  /** Additional normalised exact-match targets (e.g. sanitized Claude input or
+   *  catalog-appended submitted text) checked with strict whole-string equality. */
+  extraExactContents?: readonly string[];
   assistantUuids: string[];
   /** An authoritative transcript boundary closed this turn. Durable turns may
    * never settle from screen-idle alone; worker terminal emission requires
@@ -440,6 +451,9 @@ interface TranscriptMarkMatch {
   truncationMatch: boolean;
   /** Only the untouched legacy candidate can prove native consumption. */
   legacyFullContentMatch: boolean;
+  /** Strict whole-string equality on the untouched legacy candidate against the
+   *  normalised mark (or its exact submitted/sanitized variants). */
+  legacyExactContentMatch: boolean;
   /** A bind that exists only because the residue candidate was considered. */
   residueOnlyMatch: boolean;
   /** A strong bind that exists only because the residue candidate was considered. */
@@ -455,6 +469,7 @@ function matchTranscriptAgainstMark(
   candidates: readonly string[],
   contentFingerprint?: string,
   contentNormalized?: string,
+  extraExactContents?: readonly string[],
 ): TranscriptMarkMatch {
   const legacy = candidates.slice(0, 1);
   const residue = candidates.slice(1);
@@ -462,9 +477,13 @@ function matchTranscriptAgainstMark(
     && texts.some(text => text.includes(contentFingerprint));
   const full = (texts: readonly string[]) => !!contentNormalized
     && texts.some(text => text.includes(contentNormalized));
+  const exact = (texts: readonly string[]) => (!!contentNormalized || (extraExactContents?.length ?? 0) > 0)
+    && texts.some(text => (!!contentNormalized && text === contentNormalized)
+      || (extraExactContents?.includes(text) ?? false));
   const truncated = (texts: readonly string[]) => texts.some(text => isTruncatedMatch(text, contentNormalized));
   const legacyFingerprintMatch = fingerprint(legacy);
   const legacyFull = full(legacy);
+  const legacyExact = exact(legacy);
   const legacyTruncationMatch = truncated(legacy);
   const residueFingerprintMatch = fingerprint(residue);
   const residueFull = full(residue);
@@ -476,6 +495,7 @@ function matchTranscriptAgainstMark(
     anyFullContentMatch: legacyFull || residueFull,
     truncationMatch: legacyTruncationMatch || residueTruncationMatch,
     legacyFullContentMatch: legacyFull,
+    legacyExactContentMatch: legacyExact,
     residueOnlyMatch: !legacyMatch && (residueFingerprintMatch || residueTruncationMatch),
     residueOnlyStrongMatch: !legacyStrongMatch && (residueFull || residueTruncationMatch),
   };
@@ -497,7 +517,12 @@ function evaluateMarksAgainstTranscript(
 ): MarkMatchEvaluation[] {
   return turns.map(turn => ({
     turn,
-    match: matchTranscriptAgainstMark(candidates, turn.contentFingerprint, turn.contentNormalized),
+    match: matchTranscriptAgainstMark(
+      candidates,
+      turn.contentFingerprint,
+      turn.contentNormalized,
+      turn.extraExactContents,
+    ),
   }));
 }
 
@@ -525,6 +550,7 @@ function residueAttributionConflictTurns(
  *  attribution heuristics, not consumption proof. */
 export interface BridgeTurnStartEvidence {
   fullContentMatch: boolean;
+  exactContentMatch?: boolean;
   sourceJsonlPath?: string;
 }
 
@@ -740,7 +766,11 @@ export class BridgeTurnQueue {
     markTimeMs: number = Date.now(),
     contentNormalized?: string,
     dispatchAttempt?: number,
-    opts?: { restoredFromJournal?: boolean; linkRefMode?: 'observe' | 'enabled' },
+    opts?: {
+      restoredFromJournal?: boolean;
+      linkRefMode?: 'observe' | 'enabled';
+      extraExactContents?: readonly string[];
+    },
   ): string {
     this.queue.push({
       turnId,
@@ -750,6 +780,7 @@ export class BridgeTurnQueue {
       assistantUuids: [],
       contentFingerprint,
       contentNormalized,
+      ...(opts?.extraExactContents?.length ? { extraExactContents: opts.extraExactContents } : {}),
       markTimeMs,
       ...(opts?.restoredFromJournal ? { restoredFromJournal: true } : {}),
     });
@@ -1469,7 +1500,10 @@ export class BridgeTurnQueue {
     if ((!evaluation.match.fingerprintMatch && !evaluation.match.truncationMatch)
       || conflict.length > 0) return;
     const fullContentMatch = evaluation.match.legacyFullContentMatch;
+    const exactContentMatch = evaluation.match.legacyExactContentMatch;
     next.started = true;
+    next.fullContentMatch = fullContentMatch;
+    next.exactContentMatch = exactContentMatch;
     this.resolveResidueConflictFor(next);
     if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
     next.markTimeMs = eventTimeMs;
@@ -1489,7 +1523,11 @@ export class BridgeTurnQueue {
     }
     this.lastLarkTurnId = next.turnId;
     this.lastLocalTurnId = undefined;
-    this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
+    this.onLarkTurnStarted?.(next, {
+      fullContentMatch,
+      exactContentMatch,
+      ...(sourceJsonlPath ? { sourceJsonlPath } : {}),
+    });
   }
 
   /** A head-of-line dropped turn takes the input it absorbed with it: left
@@ -1561,6 +1599,7 @@ export class BridgeTurnQueue {
     const next = this.queue.find(t => !t.started);
     let consumedNext = false;
     let fullContentMatch = false;
+    let exactContentMatch = false;
     if (next) {
       if (next.contentFingerprint) {
         // The mark keeps its legacy identity. Transcript text additionally
@@ -1576,6 +1615,7 @@ export class BridgeTurnQueue {
         if (conflict.length > 0) this.noteResidueConflict(conflict, eventTimeMs);
         const ambiguous = conflict.length > 0;
         fullContentMatch = match.legacyFullContentMatch;
+        exactContentMatch = match.legacyExactContentMatch;
         if (!ambiguous && match.fingerprintMatch) {
           next.started = true;
           if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
@@ -1612,8 +1652,14 @@ export class BridgeTurnQueue {
       }
     }
     if (consumedNext && next) {
+      next.fullContentMatch = fullContentMatch;
+      next.exactContentMatch = exactContentMatch;
       this.resolveResidueConflictFor(next);
-      this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
+      this.onLarkTurnStarted?.(next, {
+        fullContentMatch,
+        exactContentMatch,
+        ...(sourceJsonlPath ? { sourceJsonlPath } : {}),
+      });
     }
     if (!consumedNext) {
       // The user event neither fingerprint-matched nor proved a truncation of a
