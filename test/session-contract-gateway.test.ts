@@ -1144,6 +1144,60 @@ describe('contract gateway and real worker boundaries', () => {
     expect(s.store.runtime(s.ref, s.runtime.runtimeId)?.phase).toBe(continuation ? 'stopped' : 'retiring');
   });
 
+  it.each(['exit-before-refusal', 'exit-after-refusal'] as const)(
+    'preserves a physical exit while an unassigned same-process rebind is refused (%s)', async order => {
+    vi.useFakeTimers();
+    const s = fixture();
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const launcher = scope.beginRuntime('restart-attempt', 'same-cli');
+    s.controller.reserveBinding(launcher.bindingId, s.worker);
+    s.controller.bindRuntime(launcher.bindingId, s.worker, s.store.runtime(s.ref)!.identity!);
+    scope.assign(launcher.bindingId, s.runtime);
+    const execution = s.controller.admitInput('running-before-rebind');
+    s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    s.store.apply(s.ref, { type: 'execution_phase', execution, runtime: s.runtime, phase: 'running' });
+    scope.rememberExecution(execution, launcher);
+    scope.run(launcher, () => scope.recordSubmission(execution.turnId));
+    const pending = scope.beginRuntime('restart-attempt', launcher.physicalId);
+    s.controller.reserveBinding(pending.bindingId, s.worker);
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', { workerSessionEventScope: scope });
+    const exit = scope.run(launcher, () => metadata({ type: 'claude_exit', code: 1, turnId: execution.turnId }));
+    // Restart readiness must still await this new binding's identity; it is
+    // not a physical death report and must not borrow the predecessor.
+    const receipt = scope.run(launcher, () => metadata({ type: 'restart_result', attemptId: 'restart-attempt', status: 'succeeded' }));
+    expect(receipt.sessionContract.bindingId).toBe(pending.bindingId);
+    expect(receipt.sessionContract.scope.runtime).toBeUndefined();
+    const worker = { send: vi.fn() }; s.ds.worker = worker as any;
+    const legacy = vi.fn();
+    const host = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', {
+      sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'refused-rebind-exit', handleLegacyWorkerMessage: legacy,
+    });
+    const refuse = () => {
+      s.controller.abandonBinding(pending.bindingId, s.worker, 'refused-rebind', 'runtime_binding_refused');
+      scope.refuseBinding(pending.bindingId);
+    };
+    if (order === 'exit-before-refusal') {
+      let release!: () => void;
+      vi.spyOn(s.controller, 'flushPrimary').mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+      const handling = host(exit);
+      setTimeout(() => { refuse(); release?.(); }, 10);
+      await vi.advanceTimersByTimeAsync(11);
+      await handling;
+    } else {
+      // The exit was already emitted while the worker still awaited the
+      // refusal; host abandonment completes before that IPC message arrives.
+      refuse();
+      await host(exit);
+    }
+    expect(exit.sessionContract.scope.execution).toBeUndefined();
+    expect(s.store.deferredEvents(s.ref, pending.bindingId)).toHaveLength(0);
+    expect(s.store.runtime(s.ref, s.runtime.runtimeId)?.phase).toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)?.phase).toBe('reconciling');
+    expect(legacy).toHaveBeenCalledOnce();
+    expect(legacy).toHaveBeenCalledWith(expect.objectContaining({ type: 'claude_exit', code: 1 }));
+  });
+
   it.each(['none', 'unrelated', 'foreign_worker', 'foreign_generation'] as const)(
     'settles a multi-hop physical exit without changing terminal, queued or replacement work (replacement=%s)', replacement => {
     const s = fixture();

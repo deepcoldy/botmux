@@ -340,6 +340,19 @@ describe('idle sessions do not imply pending work', () => {
 });
 
 describe('kanban off-board composition follows the active status filter', () => {
+  it('keeps old dormant TODOs visible even when the latest reply was delivered', () => {
+    const at = Date.now() - 2 * RECENT_TURN_ON_BOARD_MS;
+    const row = { status: 'dormant', lastTurn: delivered(at), lastMessageAt: at };
+    for (const remaining of [1, 3]) {
+      const pending = { ...row, openTodos: { remaining } };
+      expect(deriveSessionTaskStatus(pending).kind).toBe('delivered');
+      expect(isOffBoardKanbanRow(pending, '')).toBe(false);
+    }
+    for (const remaining of [0, -1, undefined, '1']) {
+      expect(isOffBoardKanbanRow({ ...row, openTodos: { remaining } }, '')).toBe(true);
+    }
+    expect(isOffBoardKanbanRow(row, '')).toBe(true);
+  });
   it('does not reintroduce a silent idle round as a todo when its worker is suspended', () => {
     const lastTurn = { turnId: 'silent', outcome: 'no_output', at: Date.now() - 60_000 };
     for (const status of ['idle', 'dormant']) {

@@ -375,11 +375,22 @@ export class WorkerSessionEventScope {
    * Readiness deliberately does NOT use this: a pre-replacement callback must
    * not publish the successor's readiness (session-contract-gateway.test.ts).
    */
-  liveProcessOrigin(): CapturedSessionOrigin | undefined {
+  liveProcessOrigin(preferAssigned = false): CapturedSessionOrigin | undefined {
     const current = this.current;
     if (!current) return undefined;
     const captured = this.storage.getStore()?.binding;
     if (captured && captured.physicalId !== current.physicalId) return undefined;
+    // A physical exit must survive a pending rebind being refused. Its
+    // unassigned reservation can be abandoned (and deferred events discarded),
+    // while the last assigned binding still proves this very CLI. Restart
+    // receipts deliberately keep the pending binding and its readiness gate.
+    if (preferAssigned) {
+      let binding: RuntimeEventBinding | undefined = current;
+      while (binding?.physicalId === current.physicalId) {
+        if (binding.runtime && !this.aborted.has(binding.bindingId)) return this.snapshot(binding);
+        binding = this.predecessors.get(binding.bindingId);
+      }
+    }
     return this.snapshot(current);
   }
   /** Screen observations describe the live process, not the historical

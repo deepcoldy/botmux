@@ -2342,7 +2342,7 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // its crash recovery while the worker itself remains alive. The same-process
   // proof still leaves delayed exits from a replaced backend in history.
   const liveProcessOrigin = msg.type === 'restart_result' || msg.type === 'claude_exit'
-    ? workerSessionEventScope.liveProcessOrigin()
+    ? workerSessionEventScope.liveProcessOrigin(msg.type === 'claude_exit')
     : undefined;
   // Runtime identity follows the physical observer's binding. A submitted
   // turn may still name the previous runtime after an in-process rebind.

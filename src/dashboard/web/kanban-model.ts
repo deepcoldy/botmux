@@ -12,6 +12,7 @@ import {
   currentLastTurn,
   deriveSessionTaskStatus,
   normalizeLastTurn,
+  remainingTodos,
   taskStatusChangedAt,
   type SessionTaskFacts,
   type SessionTaskStatus,
@@ -86,7 +87,7 @@ function hasPendingWork(s: KanbanRowLike, now: number = Date.now()): boolean {
   // heldThrough does not. Legacy rows alone do not prove an outstanding input.
   const awaitingTurnOutcome = normalizeLastTurn(s.lastTurn) !== undefined && currentLastTurn(s) === undefined;
   const task = deriveSessionTaskStatus(s, now);
-  return !!s.queued || finiteOrZero(s.backgroundTaskCount) > 0 || awaitingTurnOutcome
+  return !!s.queued || finiteOrZero(s.backgroundTaskCount) > 0 || remainingTodos(s) > 0 || awaitingTurnOutcome
     || task.kind === 'unfinished' || task.kind === 'needs_you';
 }
 
