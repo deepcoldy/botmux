@@ -1433,6 +1433,49 @@ describe('TmuxPipeBackend.getPaneSize', () => {
   });
 });
 
+describe('TmuxPipeBackend.getPaneSizeAsync', () => {
+  it('queries tmux pane dimensions asynchronously without calling execSync', async () => {
+    const be = new TmuxPipeBackend('test:2.0', { socketName: 'private-test' });
+    let finish!: (error: Error | null, stdout: string) => void;
+    vi.mocked(execFile).mockImplementation(((_bin: string, _args: string[], _options: any, cb: any) => {
+      finish = cb;
+      return {};
+    }) as any);
+    const syncCalls = vi.mocked(execSync).mock.calls.length;
+    const pending = be.getPaneSizeAsync();
+    expect(vi.mocked(execFile).mock.calls.at(-1)?.slice(0, 3)).toEqual([
+      'tmux', ['-L', 'private-test', 'display-message', '-p', '-t', 'test:2.0', '#{pane_width} #{pane_height}'],
+      expect.objectContaining({ timeout: expect.any(Number), killSignal: 'SIGKILL', maxBuffer: expect.any(Number) }),
+    ]);
+    expect(vi.mocked(execSync).mock.calls).toHaveLength(syncCalls);
+    finish(null, '180 50\n');
+    expect(await pending).toEqual({ cols: 180, rows: 50 });
+  });
+
+  it('rejects on tmux errors and returns null on malformed output or exit', async () => {
+    const be = new TmuxPipeBackend('test:0.0');
+    let finish!: (error: Error | null, stdout: string) => void;
+    vi.mocked(execFile).mockImplementation(((_bin: string, _args: string[], _options: any, cb: any) => {
+      finish = cb;
+      return {};
+    }) as any);
+
+    const errRead = be.getPaneSizeAsync();
+    finish(new Error('pane gone'), '');
+    await expect(errRead).rejects.toThrow('pane gone');
+
+    const badRead = be.getPaneSizeAsync();
+    finish(null, '0 -5\n');
+    expect(await badRead).toBeNull();
+
+    const midExitRead = be.getPaneSizeAsync();
+    be.kill();
+    finish(null, '180 50\n');
+    expect(await midExitRead).toBeNull();
+    expect(await be.getPaneSizeAsync()).toBeNull();
+  });
+});
+
 describe('normaliseCaptureLineEndings', () => {
   it('handles mixed line endings idempotently', () => {
     expect(normaliseCaptureLineEndings('a\nb')).toBe('a\r\nb');
