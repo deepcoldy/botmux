@@ -70,6 +70,10 @@ describe('cross-chat task continuation caller', () => {
     ['source session is closed', { ...sourceSession(), status: 'closed' }, 'om_source_turn', botCaller, humanPrincipal],
     ['source principal is another human', sourceSession(), 'om_source_turn', botCaller,
       { ...humanPrincipal, requestUserOpenId: 'ou_other_human' }],
+    ['source principal resolves to a bot', sourceSession(), 'om_source_turn', botCaller,
+      { ...humanPrincipal, senderType: 'bot' as const }],
+    ['source principal belongs to another app', sourceSession(), 'om_source_turn', botCaller,
+      { ...humanPrincipal, requestLarkAppId: 'cli_other' }],
     ['current actor is not a bot', sourceSession(), 'om_source_turn',
       { ...botCaller, senderType: 'user' as const }, humanPrincipal],
   ])('fails closed when %s', (_label, session, sourceTurnId, rawCaller, sourcePrincipal) => {
