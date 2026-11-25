@@ -3570,6 +3570,10 @@ export async function runWorkflow(
           // the worker crash is the root cause; otherwise it's a bad manifest.
           errorClass = result.status === 'ok' ? 'manifestInvalid' : 'workerError';
           message = (verdict.problems ?? ['manifest missing or invalid']).join('; ');
+          // Lead with the process root cause: "manifest not readable" alone
+          // hides e.g. a CLI that aborted its goal on an unavailable model
+          // (set with status ok too when the abort came after the manifest).
+          if (result.failureDetail) message = `${result.failureDetail}; ${message}`;
         } else {
           // Manifest is structurally valid but declares failure (or the
           // process failed despite an ok manifest) — surface the node's own
@@ -3588,10 +3592,16 @@ export async function runWorkflow(
               retryable = m.error.retryable;
             }
           } else {
-            message = 'runNode reported process failure';
+            message = result.failureDetail
+              ? `${result.failureDetail}; runNode reported process failure`
+              : 'runNode reported process failure';
           }
         }
-        const kind = classifyTerminal(errorClass, { selfReportedFail, retryable });
+        // A pool error marked retryable (e.g. a CLI startup dialog) needs a
+        // human step first: block for a manual retry, never fail outright.
+        const kind = result.status === 'fail' && result.error?.retryable === true
+          ? 'blocked'
+          : classifyTerminal(errorClass, { selfReportedFail, retryable });
         if (kind === 'blocked') {
           // Runtime human-ask: a self-reported block carrying ASK_HUMAN_ERROR_CODE
           // means the agent wrote a question to ask.json and stopped.  Surface

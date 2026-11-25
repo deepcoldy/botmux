@@ -13030,7 +13030,13 @@ async function cmdSend(
     : undefined;
   const selectedReplyContext = replyMessageId !== currentTurnId || explicitReplyTo
     ? s.turnReplyContexts?.[replyMessageId ?? ''] : undefined;
-  const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget;
+  // Ordinary structured turns have no Codex App dispatch entry. Their own
+  // per-turn context is the daemon-frozen original destination used by both
+  // the actual send and the v1-im route guard.
+  const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget
+    ?? (replyMessageId === currentTurnId && originSessionId === sid
+      ? parseReplyMessageTarget(s.turnReplyContexts?.[currentTurnId ?? '']?.target)
+      : undefined);
   const isCrossChatOriginTurn = !!crossChatOriginForSend({
     replyContext: replyContextForQuote,
     replyTarget: s.replyTargets?.[replyMessageId ?? ''],
@@ -13814,6 +13820,13 @@ async function cmdSend(
       effectiveResponseKind = 'final';
     }
   }
+  if (turnSendKey && effectiveResponseKind === 'final'
+    && (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined
+      || !frozenTurnReplyTarget || turnSendKey.larkAppId !== appId || turnSendKey.sessionId !== sid)
+    && turnSendLedger.requiresOriginalImReply(turnSendKey)) {
+    console.error('botmux send: final delivery is bound to the original conversation; use --response-kind auxiliary for a separate destination');
+    process.exit(2);
+  }
   const persistOffBeforeProvider = (): void => {
     if (effectiveFollowThreadMode !== 'off' || !sendInto) return;
     persistCrossChatFollowThreadOffBeforeProvider({
@@ -13854,6 +13867,7 @@ async function cmdSend(
         messageId: existingTurnPrimary.messageId, targetChatId: followThreadTargetChatId,
         ...(sendInto ? { targetRootMessageId: sendInto } : {}),
         followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        sourceTurnId: originTurnId ?? currentTurnId,
       });
       if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
     }
@@ -14099,6 +14113,7 @@ async function cmdSend(
           targetChatId: voicePrimaryOutputChatId,
           ...(voiceFollowRoot ? { targetRootMessageId: voiceFollowRoot } : {}),
           followThreadEpoch: (originSession ?? s).followThreadEpoch,
+          sourceTurnId: originTurnId ?? currentTurnId,
         });
         if (!bound) console.error('botmux send: 已复用语音投递，但跨群话题绑定补建失败');
       }
@@ -15720,6 +15735,7 @@ async function cmdSend(
           targetChatId,
           ...(sendTarget.mode !== 'plain' ? { targetRootMessageId: sendTarget.rootMessageId } : {}),
           followThreadEpoch: (originSession ?? s).followThreadEpoch,
+          sourceTurnId: originTurnId ?? currentTurnId,
         });
         if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
       }

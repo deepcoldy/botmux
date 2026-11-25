@@ -3,18 +3,24 @@ import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
-import type { OncallGroupSource } from './oncall-group-store.js';
-import type { NativeOncallResultQuery, OncallChoices } from './oncall-platform.js';
-import type { OncallForwardMode } from './oncall-group-policy.js';
+import { OncallGroupStore, type OncallGroupSource } from './oncall-group-store.js';
+import { loadOncallGroupTarget } from './oncall-group-client.js';
+import type { NativeOncallResultQuery, NativeOncallScan, OncallChoices } from './oncall-platform.js';
+import { nativeFormPolicyFingerprint, oncallGroupEnabled, type OncallForwardMode, type OncallGroupPolicy } from './oncall-group-policy.js';
+import type { OncallTextField } from './oncall-custom-form.js';
+
+const FORM_LIFETIME_MS = 24 * 60 * 60_000;
 
 export interface OncallNativeSubmissionAttempt extends NativeOncallResultQuery {
   preparedAtMs: number;
   policyFingerprint: string;
   forwardMode: OncallForwardMode;
+  sidebarLink?: { token: string; href: string; hostedHref?: string };
 }
 export interface OncallNativeSubmission {
   attempts: OncallNativeSubmissionAttempt[];
   completed?: boolean;
+  scan?: NativeOncallScan;
 }
 
 function normalizeNativeSubmission(draft: any): void {
@@ -40,6 +46,8 @@ export interface OncallFormDraft {
   description: string;
   /** Prepared before publication, so custom-form confirmation opens the sidebar directly. */
   nativeFormLink?: string;
+  /** Published field definition, scoped to this draft and version. */
+  botmuxFields?: OncallTextField[];
   /** Every published selection is retained until the card is retired. */
   nativeSubmission?: OncallNativeSubmission;
   oncallUsername?: string;
@@ -57,7 +65,7 @@ export interface OncallFormDraft {
 
 export class OncallFormStore {
   private readonly directory: string;
-  constructor(dataDir: string) { this.directory = join(dataDir, 'oncall-groups', 'forms'); }
+  constructor(private readonly dataDir: string) { this.directory = join(dataDir, 'oncall-groups', 'forms'); }
   private file(...ids: string[]): string {
     return join(this.directory, createHash('sha256').update(JSON.stringify(ids)).digest('hex') + '.json');
   }
@@ -80,12 +88,28 @@ export class OncallFormStore {
         ?? this.read<{ id: string }>(this.file('index', input.appId, input.source.sessionId ?? input.source.questionId, input.ownerOpenId))?.id;
       const previous = id ? this.read<OncallFormDraft>(this.file(input.appId, id)) : undefined;
       if (previous && previous.source.chatId === input.source.chatId && previous.source.questionId === input.source.questionId
-        && !previous.closed && Date.now() - previous.createdAtMs < 24 * 60 * 60_000) return previous;
+        && !previous.closed && Date.now() - previous.createdAtMs < FORM_LIFETIME_MS) return previous;
       const draft: OncallFormDraft = { ...input, id: randomUUID(), version: 0, createdAtMs: Date.now() };
       this.write(this.file(input.appId, draft.id), draft);
       this.write(index, { id: draft.id });
       return draft;
     });
+  }
+  /** An issued capability stays bound to its original selection while the card is active. */
+  readNativeSidebarLink(appId: string, id: string, token: string, readPolicy: (appId: string) => OncallGroupPolicy | undefined): string | undefined {
+    const draft = this.read<OncallFormDraft>(this.file(appId, id));
+    if (!draft || draft.appId !== appId || draft.id !== id || draft.closed
+      || Date.now() - draft.createdAtMs >= FORM_LIFETIME_MS) return;
+    const attempt = draft.nativeSubmission?.attempts.find(item => item.sidebarLink?.token === token);
+    if (!attempt?.sidebarLink) return;
+    try {
+      const policy = readPolicy(appId);
+      if (!oncallGroupEnabled(policy, draft.source.chatId) || nativeFormPolicyFingerprint(policy) !== attempt.policyFingerprint
+        || JSON.stringify(loadOncallGroupTarget(this.dataDir, appId)) !== draft.targetFingerprint) return;
+      const request = new OncallGroupStore(this.dataDir).getRequest(draft.source);
+      if (request && request.status !== 'failed') return;
+      return attempt.sidebarLink.href;
+    } catch { return; }
   }
   publishedMessageIds(source: OncallGroupSource): Set<string> {
     let files: string[];
@@ -110,7 +134,7 @@ export class OncallFormStore {
     return files.filter(name => name.endsWith('.json')).flatMap(name => {
       const draft = this.read<OncallFormDraft>(join(this.directory, name));
       return draft?.appId === appId && draft.nativeSubmission?.attempts.length && !draft.nativeSubmission.completed
-        && Date.now() - draft.createdAtMs < 24 * 60 * 60_000 ? [draft] : [];
+        && Date.now() - draft.createdAtMs < FORM_LIFETIME_MS ? [draft] : [];
     });
   }
   async use<T>(appId: string, id: string, owner: string, operation: (draft: OncallFormDraft, persist: () => void) => Promise<T>, options: { allowClosed?: boolean; allowExpired?: boolean } = {}): Promise<T> {
@@ -118,7 +142,7 @@ export class OncallFormStore {
     return withFileLock(file, async () => {
       const draft = this.read<OncallFormDraft>(file);
       if (!draft || draft.appId !== appId || draft.ownerOpenId !== owner || (draft.closed && !options.allowClosed)
-        || (!options.allowExpired && Date.now() - draft.createdAtMs > 24 * 60 * 60_000)) throw new Error('此表单已失效或不属于当前用户');
+        || (!options.allowExpired && Date.now() - draft.createdAtMs > FORM_LIFETIME_MS)) throw new Error('此表单已失效或不属于当前用户');
       try { return await operation(draft, () => this.write(file, draft)); }
       finally { this.write(file, draft); }
     }, { maxWaitMs: 30_000 });

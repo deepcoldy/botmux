@@ -13,6 +13,7 @@ import { WorkerSessionEventScope } from '../src/services/session-event-scope.js'
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { terminalReleasesDurableTurn } from '../src/utils/pending-input-queue.js';
 import { SessionController } from '../src/core/session-controller.js';
+import { BridgeTurnQueue, makeFingerprint } from '../src/services/bridge-turn-queue.js';
 
 /**
  * Live wedge (Claude, chat-scope session + 10-minute silent schedule):
@@ -107,6 +108,60 @@ function startTurn(h: Record<string, any>, turnId: string): void {
 }
 
 describe('turn terminal releases the active turn authority', () => {
+  it('keeps bridge terminal delivery, dedup and authority retryable after IPC failure', () => {
+    const h = harness();
+    h.setCaptureIdentity('om_ipc_failure', 7);
+    h.markActiveTurnStarted({ turnId: 'om_ipc_failure', dispatchAttempt: 7 });
+    h.durableTurnInFlight = true;
+    const dir = mkdtempSync(join(tmpdir(), 'terminal-ipc-retry-'));
+    try {
+      const jsonl = join(dir, 's.jsonl');
+      const row = { type: 'user', uuid: 'u1', parentUuid: null, message: { role: 'user', content: 'durable retry' } };
+      writeFileSync(jsonl, `${JSON.stringify(row)}\n`);
+      const queue = new BridgeTurnQueue();
+      queue.mark('om_ipc_failure', makeFingerprint('durable retry'), 100, 'durable retry', 7);
+      queue.ingest([row], jsonl);
+      const head = queue.peek()[0]!;
+      expect(queue.markDurableTurnAmbiguous(head, 'claude_open_turn_timeout')).toBe(true);
+      Object.assign(h, {
+        bridgeQueue: queue,
+        bridgeJsonlPath: jsonl,
+        lastInitConfig: { cliId: 'claude-code', chatId: 'oc', rootMessageId: 'om_root', adoptMode: false },
+        workerFinalOutputHandoff: null,
+        finalHandoffAdmissionEnabled: false,
+        universalOutputHandoff: null,
+        journalBridgeTurnClear: () => {},
+        bridgeFingerprintScanLastMs: new Map(),
+        readSendMarkers: () => [],
+        rememberTurnLinkRefMode: () => {},
+        zeroPromptTerminalSync: () => false,
+        replyDeliveryMode: () => 'send',
+      });
+      const emit = loadWorkerFunction<(opts: { releaseHeldTerminals?: boolean; onlyTurn?: { turnId: string; dispatchAttempt?: number } }) => void>('emitReadyTurns', h);
+      const opts = { releaseHeldTerminals: true, onlyTurn: { turnId: 'om_ipc_failure', dispatchAttempt: 7 } };
+      h.send = vi.fn()
+        .mockImplementationOnce(() => { throw new Error('IPC unavailable'); })
+        .mockImplementation(() => {});
+
+      expect(() => emit(opts)).toThrow('IPC unavailable');
+      expect(queue.peek()[0]).toBe(head);
+      expect(h.emittedTurnTerminals.statusOf('sid', 'om_ipc_failure', 7)).toBeUndefined();
+      expect(h.activeTurnAuthority.identity()).toMatchObject({ turnId: 'om_ipc_failure', dispatchAttempt: 7 });
+      expect(h.durableTurnInFlight).toBe(true);
+      expect(h.inflightInputs.onTurnComplete).not.toHaveBeenCalled();
+
+      expect(() => emit(opts)).not.toThrow();
+      expect(queue.peek()).toEqual([]);
+      expect(h.send).toHaveBeenCalledTimes(2);
+      expect(h.emittedTurnTerminals.statusOf('sid', 'om_ipc_failure', 7)).toBe('ambiguous');
+      expect(h.activeTurnAuthority.identity()).toEqual({});
+      expect(h.durableTurnInFlight).toBe(false);
+      expect(h.inflightInputs.onTurnComplete).toHaveBeenCalledOnce();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('resolves an observed preemption from a later native completion through the real emitter', async () => {
     vi.useFakeTimers(); const data = mkdtempSync(join(tmpdir(), 'terminal-evidence-')); const store = new SessionContractStore(data, 'cli_terminal_evidence');
     try {

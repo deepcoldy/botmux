@@ -53,6 +53,7 @@ vi.mock('../src/services/platform-team-store.js', () => ({
   isPlatformTeamBot: () => false,
 }));
 vi.mock('../src/bot-registry.js', () => ({
+  durableImRepliesEnabled: vi.fn(() => false),
   getBot: () => ({ botName: 'Bot', botOpenId: 'ou_bot', config: { cliId: 'claude' } }),
 }));
 vi.mock('../src/dashboard/auth.js', () => ({
