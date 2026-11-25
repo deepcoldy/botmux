@@ -27,8 +27,10 @@ export interface UpdateClaudeStateOptions {
 }
 
 /** Preserve unparseable state bytes before an atomic rebuild. Throws (aborting
- *  the repair) when the backup sibling cannot be exclusively created. */
-function backupCorruptState(stateJsonPath: string, raw: string): void {
+ *  the repair) when the backup sibling cannot be exclusively created. The
+ *  bytes are written verbatim: decoding them as UTF-8 first would replace
+ *  invalid sequences with U+FFFD and make the backup unrecoverable. */
+function backupCorruptState(stateJsonPath: string, raw: Buffer): void {
   const backup = `${stateJsonPath}.corrupt.${Date.now()}.bak`;
   writeFileSync(backup, raw, { mode: 0o600, flag: 'wx' });
   logger.debug(`[claude-trust] corrupt state backed up to ${backup}`);
@@ -56,10 +58,13 @@ export function updateClaudeStateFile(
       let current: ClaudeState | undefined;
       let rebuilt = false;
       if (stat) {
-        const raw = readFileSync(stateJsonPath, 'utf8');
+        // Keep the raw Buffer for the backup and decode only for parsing:
+        // readFileSync(..., 'utf8') silently substitutes U+FFFD for invalid
+        // UTF-8, so a string backup could not restore the original bytes.
+        const raw = readFileSync(stateJsonPath);
         let parsed: unknown;
         try {
-          parsed = JSON.parse(raw);
+          parsed = JSON.parse(raw.toString('utf8'));
         } catch (error) {
           if (!options.repairCorruptTarget) {
             logger.debug(`[claude-trust] state update skipped: ${error}`);

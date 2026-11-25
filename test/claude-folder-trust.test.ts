@@ -237,6 +237,18 @@ describe('ensureClaudeFolderTrust', () => {
     expect(readFileSync(join(home, backup!), 'utf8')).toBe('{');
   });
 
+  it('keeps a byte-faithful backup when the corrupt target contains invalid UTF-8', () => {
+    const target = join(home, 'generic-utf8.json');
+    // Invalid UTF-8 lead/continuation bytes interleaved with an ASCII '{'.
+    const original = Buffer.from([0xff, 0xfe, 0xfd, 0x7b, 0x80]);
+    writeFileSync(target, original);
+    expect(() => updateClaudeStateFile(target, () => ({ fixed: true }), { repairCorruptTarget: true })).not.toThrow();
+    const backupName = readdirSync(home).find(name => name.startsWith('generic-utf8.json.corrupt.'));
+    expect(backupName).toBeTruthy();
+    expect(readFileSync(join(home, backupName!)).equals(original)).toBe(true);
+    expect(JSON.parse(readFileSync(target, 'utf8'))).toEqual({ fixed: true });
+  });
+
   it('is idempotent and does not rewrite when already trusted', () => {
     ensureClaudeFolderTrust(workDir);
     const firstMtime = readFileSync(configPath(), 'utf-8');
