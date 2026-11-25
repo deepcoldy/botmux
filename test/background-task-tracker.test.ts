@@ -879,23 +879,17 @@ describe('Monitor mid-stream notifications, terminal whitelist, expiry, and api-
     expect(backgroundTaskSettledIds(bareExpiry)).toEqual(['m1']);
   });
 
-  it('tracks Monitor persistent flag, taskInfo, hasPendingNonPersistentMonitor, and liveTasksSnapshot across expiry and settlement', () => {
+  it('tracks Monitor persistent flag, hasPendingNonPersistentMonitor, and liveTasksSnapshot across expiry and settlement', () => {
     const t = new BackgroundTaskTracker();
     const launchedAt = Date.parse('2026-11-25T10:00:00.000Z');
     t.observe(structuredLaunch('u-m1', 'tu-m1', { taskId: 'm-bounded', timeoutMs: 1_800_000, persistent: false }, '2026-11-25T10:00:00.000Z'));
     t.observe(structuredLaunch('u-m2', 'tu-m2', { taskId: 'm-alert', timeoutMs: 0, persistent: true }, '2026-11-25T10:00:01.000Z'));
 
-    expect(t.taskInfo('m-bounded')).toEqual({
-      kind: 'monitor',
-      persistent: false,
-      expiresAtMs: launchedAt + 1_800_000,
-    });
-    expect(t.taskInfo('m-alert')).toEqual({
-      kind: 'monitor',
-      persistent: true,
-    });
     expect(t.hasPendingNonPersistentMonitor(launchedAt + 1_799_999)).toBe(true);
     expect(t.hasPendingNonPersistentMonitor(launchedAt + 1_800_000)).toBe(false);
+    // liveTasksSnapshot carries the same kind/persistent/expiresAtMs metadata
+    // for both the bounded and the persistent Monitor, without expiry filtering
+    // hiding entries while they remain inside their window.
     expect(t.liveTasksSnapshot(launchedAt + 1_000)).toEqual([
       { taskId: 'm-bounded', kind: 'monitor', persistent: false, expiresAtMs: launchedAt + 1_800_000 },
       { taskId: 'm-alert', kind: 'monitor', persistent: true },
@@ -907,7 +901,7 @@ describe('Monitor mid-stream notifications, terminal whitelist, expiry, and api-
 
     // [Monitor expired...] settles it even without <status>.
     t.observe(userNotice('<task-notification>\n<task-id>m-bounded</task-id>\n<result>[Monitor expired after 30m]</result>\n</task-notification>'));
-    expect(t.taskInfo('m-bounded')).toBeUndefined();
+    expect(t.liveTasksSnapshot(launchedAt + 60_000).map(task => task.taskId)).toEqual(['m-alert']);
     expect(t.hasPendingNonPersistentMonitor(launchedAt + 60_000)).toBe(false);
     // Persistent alert Monitor stays live.
     expect(t.pending(launchedAt + 60_000)).toBe(1);

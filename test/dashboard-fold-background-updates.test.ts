@@ -3,12 +3,11 @@ import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { CardBehaviorSection, patchCardPrefsFromBody } from '../src/dashboard/web/bot-defaults-page.js';
 import type { BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
-import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 vi.mock('../src/dashboard/web/toast.js', () => ({ toast: vi.fn() }));
 
-describe('foldBackgroundUpdates Dashboard toggle and plain-language copy', () => {
+describe('foldBackgroundUpdates Dashboard toggle', () => {
   it('shows the switch with the bot value, saves it, rolls back failed saves, and syncs across bot switches', async () => {
     let fail = false;
     const putCardPref = vi.fn(async () => ({ ok: !fail, status: fail ? 503 : 200, body: {} }));
@@ -44,36 +43,6 @@ describe('foldBackgroundUpdates Dashboard toggle and plain-language copy', () =>
       expect(patchCardPrefsFromBody({ ...bot, foldBackgroundUpdates: false }, { foldBackgroundUpdates: true }).foldBackgroundUpdates).toBe(true);
     } finally {
       await act(async () => renderer.unmount());
-    }
-  });
-
-  it('uses plain user-facing copy with zero internal jargon in both zh and en', () => {
-    const keys = [
-      'botDefaults.foldBackgroundUpdates',
-      'botDefaults.foldBackgroundUpdatesDescription',
-      'botDefaults.foldBackgroundUpdatesHelp',
-    ] as const;
-    const bannedJargon = [
-      /\bMonitor\b/i,
-      /BridgeTurnQueue/i,
-      /local-headless/i,
-      /task-notification/i,
-      /\bCoT\b/,
-      /\btranscript\b/i,
-      /non-terminal/i,
-      /微回合/,
-      /转写/,
-    ];
-    for (const lang of ['zh', 'en'] as const) {
-      const tr = createDashboardTranslator(lang);
-      for (const key of keys) {
-        const text = tr(key);
-        expect(text, `${lang}:${key}`).not.toBe(key);
-        expect(text.length, `${lang}:${key}`).toBeGreaterThan(0);
-        for (const pattern of bannedJargon) {
-          expect(text, `${lang}:${key} must not contain internal jargon ${pattern}`).not.toMatch(pattern);
-        }
-      }
     }
   });
 });

@@ -1256,18 +1256,6 @@ export class BackgroundTaskTracker {
     return ids;
   }
 
-  /** Metadata of an unsettled tracked task, without wall-clock expiry filtering
-   *  so callers can compare `expiresAtMs` deterministically against event times. */
-  taskInfo(taskId: string): BackgroundTaskInfo | undefined {
-    const task = this.live.get(taskId);
-    if (!task) return undefined;
-    return {
-      kind: task.kind,
-      ...(task.persistent !== undefined ? { persistent: task.persistent } : {}),
-      ...(task.expiresAtMs !== undefined ? { expiresAtMs: task.expiresAtMs } : {}),
-    };
-  }
-
   /** True when at least one non-persistent (`persistent === false`) Monitor is
    *  still live at `nowMs`. Used to keep the launching turn's held CoT bubble
    *  open while a suppressed Monitor micro-turn temporarily sets `mainTurnOpen`. */

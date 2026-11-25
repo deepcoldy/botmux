@@ -319,7 +319,18 @@ export async function updateTurnReplyCard(
 }
 
 type ToolsUpdate = { turnId: string; dispatchAttempt?: number; entries: import('../types.js').CotEntry[] };
-type PendingTools = { msg: ToolsUpdate; send: ReplyCardSender; owns: () => boolean; timer?: ReturnType<typeof setTimeout> };
+type PendingTools = {
+  msg: ToolsUpdate;
+  send: ReplyCardSender;
+  owns: () => boolean;
+  timer?: ReturnType<typeof setTimeout>;
+  /** Captured at queue time against the exact turn key. The releasing
+   *  `screen_update` can clear `ds.cotHeldForBackground` BEFORE this 1200ms
+   *  debounce flushes: reading the hold only at flush time would make a
+   *  completed unified card reject the last batch of folded background
+   *  progress. Sticky for the pending entry's lifetime. */
+  allowWhileTerminalAtQueue?: boolean;
+};
 const pendingTools = new WeakMap<DaemonSession, Map<string, PendingTools>>();
 const toolFlushes = new WeakMap<DaemonSession, Map<string, Promise<void>>>();
 // Sessions owning queued/in-flight tool flushes. WeakMaps are not enumerable, so
@@ -363,7 +374,12 @@ export function queueTurnReplyTools(ds: DaemonSession, msg: ToolsUpdate, send: R
     existing.owns = owns;
     return;
   }
-  const next: PendingTools = { msg, send, owns };
+  // Snapshot the hold at enqueue time: later batches merged into this same
+  // pending entry keep the first entry's verdict, and a release frame racing
+  // the 1200ms timer cannot retroactively strip it.
+  const allowWhileTerminalAtQueue = ds.cotHeldForBackground?.turnId === msg.turnId
+    && ds.cotHeldForBackground.dispatchAttempt === msg.dispatchAttempt;
+  const next: PendingTools = { msg, send, owns, allowWhileTerminalAtQueue };
   pending.set(key, next);
   trackedToolSessions.add(ds);
   next.timer = setTimeout(() => {
@@ -390,8 +406,12 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   pending!.delete(key);
   const cfg = getBot(ds.larkAppId).config;
   const visible = ds.cotForced || replyCardPresentation(cfg, ds.chatId).showProcess;
-  const allowWhileTerminal = ds.cotHeldForBackground?.turnId === turnId
-    && ds.cotHeldForBackground.dispatchAttempt === dispatchAttempt;
+  // OR of the queue-time snapshot and the live hold: the snapshot covers a
+  // release frame that won the race against this debounce, while the live read
+  // still admits holds established after the first batch was enqueued.
+  const allowWhileTerminal = next.allowWhileTerminalAtQueue === true
+    || (ds.cotHeldForBackground?.turnId === turnId
+      && ds.cotHeldForBackground.dispatchAttempt === dispatchAttempt);
   const work = updateTurnReplyCard(ds, turnId, {
     kind: 'tools', tools: visible ? publicReplyCardTools(next.msg.entries, cfg.thinkingCardToolResult !== false) : [],
     activity: visible ? publicReplyCardActivity(next.msg.entries) : [],
