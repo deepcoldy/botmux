@@ -9318,6 +9318,7 @@ export function killWorker(
   const closeNeedsRemoteGrace = closeFrozenType !== undefined
     && isRemoteBackendType(closeFrozenType);
   armWorkerKillBackstop(w, tag(ds), closeNeedsRemoteGrace ? 24_000 : opts.codexCleanupRelease ? 6_000 : WORKER_SIGTERM_BACKSTOP_MS);
+  reconcileQueuedActivationOnWorkerDetach(ds);
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -9376,6 +9377,7 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
     try { w.kill('SIGTERM'); } catch { /* already gone */ }
     armWorkerKillBackstop(w, tag(ds));
   }
+  if (w) reconcileQueuedActivationOnWorkerDetach(ds);
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -14545,6 +14547,13 @@ async function closeSessionBody(
           ? { clearRiffParentTaskId: true }
           : {}),
       });
+      if (ds?.queuedActivationTailReleaseRetryTimer) {
+        clearTimeout(ds.queuedActivationTailReleaseRetryTimer);
+        ds.queuedActivationTailReleaseRetryTimer = undefined;
+      }
+      if (ds) {
+        ds.session.status = 'closed';
+      }
     } catch (err) {
       if (isOwnedMojoClose
           && (preparedRemoteRequestId || stored?.mojoCloseJournal?.phase === 'prepared')) {
@@ -18054,7 +18063,7 @@ type QueuedWorkerForkSnapshot = {
   initialStartPending: DaemonSession['initialStartPending'];
 };
 
-type QueuedActivationJournalSnapshot = Pick<
+export type QueuedActivationJournalSnapshot = Pick<
   Session,
   | 'queuedActivationPending'
   | 'queuedActivationToken'
@@ -19208,6 +19217,7 @@ export function promoteQueuedActivationTail(
   ds: DaemonSession,
   opts: { send?: boolean } = {},
 ): boolean {
+  if (ds.session.status !== 'active') return false;
   if (ds.session.queuedActivationPending) return true;
   if (opts.send !== false
     && (!ds.worker || ds.worker.killed)) return false;
@@ -19334,6 +19344,7 @@ export function promoteQueuedActivationTail(
   }
 
   finishPreparedInputTitle(ds, promotedTitleUpdate);
+  publishQueuedActivationStatePatch(ds);
   if (opts.send === false) return true;
   try {
     ds.worker!.send({
@@ -19433,6 +19444,7 @@ export function admitQueuedActivationTail(
   reservation?: QueuedActivationTailReservation,
   opts: { codexAppInputGateFrozen?: boolean } = {},
 ): QueuedActivationTailEntry | undefined {
+  if (ds.session.status !== 'active') return undefined;
   if (!assistantLiveInputAdmission(ds, entry.turnId, { context: 'queued activation input' })) return undefined;
   const fifoReservation = reservation ?? reserveQueuedActivationTailAdmission(ds);
   const admittedLinkRefs = entry.cliInput.linkRefs
@@ -19474,6 +19486,7 @@ export function admitQueuedActivationTail(
     ds.session.queuedActivationTail = priorTail;
     throw err;
   }
+  publishQueuedActivationStatePatch(ds);
   // A stopped CLI cannot produce the opening ACK by itself. New input now
   // owns a durable FIFO position, so it may wake the parked process WITHOUT
   // releasing that ACK gate or sending N+1 ahead of the retained opening.
@@ -19495,14 +19508,169 @@ export function admitQueuedActivationTail(
   return admitted;
 }
 
+export function publishQueuedActivationStatePatch(ds: DaemonSession): void {
+  const pending = ds.session.queuedActivationPending === true;
+  const tailCount = ds.session.queuedActivationTail?.length ?? 0;
+  try {
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: {
+          queuedActivationPending: pending ? true : null,
+          queuedActivationTailCount: tailCount > 0 ? tailCount : null,
+        },
+      },
+    });
+  } catch { /* best-effort dashboard telemetry */ }
+}
+
+export interface HandleQueuedActivationAckDeps {
+  ds: DaemonSession;
+  msg: { sessionId: string; activationToken: string };
+  tag: string;
+  ownsLifecycleMutation: () => boolean;
+  updateSession: (session: Session) => void;
+  onQueuedActivationSubmitted?: (
+    ds: DaemonSession,
+    activationToken: string,
+  ) => void | boolean | Promise<void | boolean>;
+  onAcceptedInput?: (journal: QueuedActivationJournalSnapshot) => void;
+  publishActivationStatePatch?: (ds: DaemonSession) => void;
+}
+
+export async function handleQueuedActivationSubmittedAck(
+  deps: HandleQueuedActivationAckDeps,
+): Promise<boolean> {
+  const { ds, msg, tag: t, ownsLifecycleMutation, updateSession } = deps;
+  if (!ownsLifecycleMutation() || msg.sessionId !== ds.session.sessionId) return false;
+  if (!ds.session.queuedActivationPending
+    || !ds.session.queuedActivationToken
+    || ds.session.queuedActivationToken !== msg.activationToken) {
+    logger.warn(`[${t}] Ignored stale queued activation ACK ${msg.activationToken.substring(0, 8)}`);
+    return false;
+  }
+
+  const releaseReservation = async (attempt: number): Promise<void> => {
+    if (!ownsLifecycleMutation() || !ds.initialStartPending) return;
+    try {
+      if (deps.onQueuedActivationSubmitted) {
+        const released = await deps.onQueuedActivationSubmitted(ds, msg.activationToken);
+        if (released === false && ownsLifecycleMutation() && ds.initialStartPending) {
+          const delayMs = Math.min(100 * (2 ** Math.min(attempt, 6)), 5_000);
+          logger.warn(
+            `[${t}] Queued activation follow-up was not accepted (attempt ${attempt + 1}); `
+            + `retrying in ${delayMs}ms`,
+          );
+          const timer = setTimeout(() => { void releaseReservation(attempt + 1); }, delayMs);
+          timer.unref?.();
+        }
+      } else {
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+      }
+    } catch (err) {
+      logger.error(
+        `[${t}] Queued activation follow-up release failed unexpectedly; `
+        + `delivery was not retried because acceptance is unknown: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+
+  const journal = snapshotQueuedActivationJournal(ds.session);
+  const persistActivationAck = async (attempt: number): Promise<boolean> => {
+    if (!ownsLifecycleMutation()
+      || !ds.session.queuedActivationPending
+      || ds.session.queuedActivationToken !== msg.activationToken) return false;
+    clearQueuedActivationJournal(ds.session);
+    try {
+      updateSession(ds.session);
+    } catch (err) {
+      restoreQueuedActivationJournal(ds.session, journal);
+      const delayMs = Math.min(100 * (2 ** Math.min(attempt, 6)), 5_000);
+      logger.error(
+        `[${t}] Failed to persist queued activation ACK; retained journal and `
+        + `will retry in ${delayMs}ms: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      const timer = setTimeout(() => { void persistActivationAck(attempt + 1); }, delayMs);
+      timer.unref?.();
+      return false;
+    }
+    (deps.publishActivationStatePatch ?? publishQueuedActivationStatePatch)(ds);
+    deps.onAcceptedInput?.(journal);
+    // Crossing the adapter boundary means this session now owns CLI
+    // history even if the worker dies before it can publish a session id.
+    ds.hasHistory = true;
+    await releaseReservation(0);
+    return true;
+  };
+  return await persistActivationAck(0);
+}
+
 /** True while a live worker's opening activation still owns submission order.
  * Every ingress that sees this state must use admitQueuedActivationTail rather
  * than ordinary worker IPC. A command still queued for the session (a follower
  * whose prompt is being built, the opening's own release) holds the gate too:
  * an ordinary turn arriving now must land behind it, not overtake it. */
+/** Reconcile runtime activation claims whenever a live worker detaches (exit,
+ *  spawn error, killWorker, or retireWorkerProcessOnly). Handles all three
+ *  durable shapes so the session never stays wedged with `worker=null` and
+ *  `initialStartPending=true`:
+ *  1) `queuedActivationPending=true` -> release runtime claim; next refork replays head.
+ *  2) `queuedActivationPending=false` + non-empty `queuedActivationTail` (e.g.
+ *     two-step ACK cleared head and worker detached while tail promotion was
+ *     retrying) -> promote head offline (send: false) or arm quarantine flag on
+ *     transient store failure, then release runtime claim.
+ *  3) `initialStartPending=true` with no pending repo or follow-up buffer -> clear claim. */
+export function reconcileQueuedActivationOnWorkerDetach(ds: DaemonSession): void {
+  if (ds.queuedActivationTailReleaseRetryTimer) {
+    clearTimeout(ds.queuedActivationTailReleaseRetryTimer);
+    ds.queuedActivationTailReleaseRetryTimer = undefined;
+  }
+  if (ds.session.queuedActivationPending) {
+    ds.initialStartPending = false;
+    ds.initialStartClaimToken = undefined;
+    return;
+  }
+  if ((ds.session.queuedActivationTail?.length ?? 0) > 0
+    && ds.session.status === 'active'
+    && !pendingProtectedHttpEgressForks.has(ds.session.sessionId)) {
+    let promoted = false;
+    try {
+      promoted = promoteQueuedActivationTail(ds, { send: false });
+    } catch (err) {
+      // Detach cleanup must never abort the worker-exit fence itself. Any
+      // pre-promotion lookup/admission/payload failure keeps the exact tail
+      // retryable through the existing inbound blank-recovery boundary.
+      logger.error(
+        `[${tag(ds)}] Queued activation detach promotion threw; retaining tail for recovery: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (!promoted) {
+      ds.quarantinedActivationTailPromotion = true;
+      // The daemon's tail-only inbound recovery is gated by this runtime flag.
+      // Keeping it (and the claim token) makes the next message stage behind the
+      // retained tail, then retry a blank recovery fork instead of being refused
+      // forever as a non-empty fork of a quarantined owner.
+      ds.initialStartPending = true;
+      return;
+    }
+    ds.initialStartPending = false;
+    ds.initialStartClaimToken = undefined;
+    return;
+  }
+  if (ds.initialStartPending && !ds.pendingRepo && !(ds.pendingFollowUps?.length)) {
+    ds.initialStartPending = false;
+    ds.initialStartClaimToken = undefined;
+  }
+}
+
 export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
   return ds.session.queuedActivationPending === true
     || (ds.session.queuedActivationTail?.length ?? 0) > 0
+    || (ds.pendingFollowUps?.length ?? 0) > 0
     || hasPendingSessionTurns(ds.session.sessionId)
     || (ds.initialStartPending === true
       && ds.session.queuedActivationInput !== undefined);
@@ -20116,6 +20284,7 @@ export function forkWorker(
         }
         return false;
       }
+      publishQueuedActivationStatePatch(ds);
     }
     activePendingSettled = true;
     activePending.abortCleanupPending = undefined;
@@ -21196,13 +21365,7 @@ function forkWorkerPrepared(
     if (ds.worker !== worker || ds.workerGeneration !== workerGeneration
       || ds.session.workerGeneration !== workerGeneration || !canForkRegisteredSession(ds)) return;
     if (ds.worker === worker) {
-      if (ds.session.queuedActivationPending) {
-        // The durable opening journal remains authoritative until the adapter
-        // proves submission. A failed child must release only its runtime
-        // claim so the next generation can replay that exact head.
-        ds.initialStartPending = false;
-        ds.initialStartClaimToken = undefined;
-      }
+      reconcileQueuedActivationOnWorkerDetach(ds);
       const retainExactRetirementGeneration = ds.remoteShutdownState !== undefined
         || ds.remoteCloseState !== undefined;
       if (!retainExactRetirementGeneration) {
@@ -24043,73 +24206,25 @@ function setupWorkerHandlers(
         break;
       }
       case 'queued_activation_submitted': {
-        if (ds.worker !== worker || msg.sessionId !== ds.session.sessionId) break;
-        if (!ds.session.queuedActivationPending
-          || !ds.session.queuedActivationToken
-          || ds.session.queuedActivationToken !== msg.activationToken) {
-          logger.warn(`[${t}] Ignored stale queued activation ACK ${msg.activationToken.substring(0, 8)}`);
-          break;
-        }
-        const releaseReservation = async (attempt: number): Promise<void> => {
-          if (ds.worker !== worker || !ds.initialStartPending) return;
-          try {
-            if (cb.onQueuedActivationSubmitted) {
-              const released = await cb.onQueuedActivationSubmitted(ds, msg.activationToken);
-              if (released === false && ds.worker === worker && ds.initialStartPending) {
-                const delayMs = Math.min(100 * (2 ** Math.min(attempt, 6)), 5_000);
-                logger.warn(
-                  `[${t}] Queued activation follow-up was not accepted (attempt ${attempt + 1}); `
-                  + `retrying in ${delayMs}ms`,
-                );
-                const timer = setTimeout(() => { void releaseReservation(attempt + 1); }, delayMs);
-                timer.unref?.();
-              }
-            } else {
-              ds.initialStartPending = false;
-              ds.initialStartClaimToken = undefined;
+        await handleQueuedActivationSubmittedAck({
+          ds,
+          msg,
+          tag: t,
+          ownsLifecycleMutation,
+          updateSession: session => sessionStore.updateSession(session),
+          onQueuedActivationSubmitted: cb.onQueuedActivationSubmitted,
+          onAcceptedInput: journal => {
+            // The adapter ACK is the exact acceptance boundary for both an opening
+            // and a promoted activation tail. Its snapshot survives journal cleanup,
+            // so a deferred Mojo notice follows the input that was actually accepted.
+            if (journal.queuedActivationInput) {
+              deliverMojoNoticesForAcceptedInput(ds, journal.queuedActivationInput.content,
+                journal.queuedActivationTurnId, journal.queuedActivationDispatchAttempt,
+                startupState.ownerOnlyActivationToken === msg.activationToken);
             }
-          } catch (err) {
-            logger.error(
-              `[${t}] Queued activation follow-up release failed unexpectedly; `
-              + `delivery was not retried because acceptance is unknown: `
-              + `${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        };
-
-        const journal = snapshotQueuedActivationJournal(ds.session);
-        const persistActivationAck = async (attempt: number): Promise<void> => {
-          if (ds.worker !== worker
-            || !ds.session.queuedActivationPending
-            || ds.session.queuedActivationToken !== msg.activationToken) return;
-          clearQueuedActivationJournal(ds.session);
-          try {
-            sessionStore.updateSession(ds.session);
-          } catch (err) {
-            restoreQueuedActivationJournal(ds.session, journal);
-            const delayMs = Math.min(100 * (2 ** Math.min(attempt, 6)), 5_000);
-            logger.error(
-              `[${t}] Failed to persist queued activation ACK; retained journal and `
-              + `will retry in ${delayMs}ms: ${err instanceof Error ? err.message : String(err)}`,
-            );
-            const timer = setTimeout(() => { void persistActivationAck(attempt + 1); }, delayMs);
-            timer.unref?.();
-            return;
-          }
-          // The adapter ACK is the exact acceptance boundary for both an opening
-          // and a promoted activation tail. Its snapshot survives journal cleanup,
-          // so a deferred Mojo notice follows the input that was actually accepted.
-          if (journal.queuedActivationInput) {
-            deliverMojoNoticesForAcceptedInput(ds, journal.queuedActivationInput.content,
-              journal.queuedActivationTurnId, journal.queuedActivationDispatchAttempt,
-              startupState.ownerOnlyActivationToken === msg.activationToken);
-          }
-          // Crossing the adapter boundary means this session now owns CLI
-          // history even if the worker dies before it can publish a session id.
-          ds.hasHistory = true;
-          await releaseReservation(0);
-        };
-        await persistActivationAck(0);
+          },
+          publishActivationStatePatch: publishQueuedActivationStatePatch,
+        });
         break;
       }
 
@@ -29716,12 +29831,7 @@ function setupWorkerHandlers(
       if (!failedActiveRestart && ds.antigravityRotation?.inFlightToken) {
         ds.antigravityRotation = clearInFlightAntigravityRotation(ds.antigravityRotation);
       }
-      if (ds.session.queuedActivationPending) {
-        // Journal ownership is backend-independent. The next worker replays
-        // this exact head with queuedActivationResume before durable tail N+1.
-        ds.initialStartPending = false;
-        ds.initialStartClaimToken = undefined;
-      }
+      reconcileQueuedActivationOnWorkerDetach(ds);
       ds.worker = null;
       ds.workerReady = false;
       // The worker process died; its CLI died with it.

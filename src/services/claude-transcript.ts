@@ -2316,6 +2316,10 @@ export interface JsonlFingerprintSearchOptions {
   minEventTimestampMs?: number;
   /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
   includeQueueOperations?: boolean;
+  /** Called on each normalized transcript candidate. When supplied, this
+   *  replaces the legacy substring predicate so callers can require stronger
+   *  exact-payload proof without changing other fingerprint consumers. */
+  candidateMatcher?: (candidate: string) => boolean;
   /** Called on each candidate that already passed the fingerprint match.
    *  Returning `false` skips the candidate and continues searching older
    *  files in the directory (mtime-descending walk). Used by the bridge
@@ -2368,7 +2372,11 @@ function eventAtOrAfter(ev: { timestamp?: unknown }, floorMs: number): boolean {
 export function jsonlContainsFingerprint(
   path: string,
   fingerprint: string,
-  opts?: { includeQueueOperations?: boolean; minEventTimestampMs?: number },
+  opts?: {
+    includeQueueOperations?: boolean;
+    minEventTimestampMs?: number;
+    candidateMatcher?: (candidate: string) => boolean;
+  },
 ): boolean {
   if (fingerprint.length === 0 || !existsSync(path)) return false;
   let size: number;
@@ -2423,8 +2431,10 @@ export function jsonlContainsFingerprint(
     } else {
       continue;
     }
-    if (normaliseTranscriptFingerprintCandidates(lineText)
-      .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) return true;
+    const candidates = normaliseTranscriptFingerprintCandidates(lineText);
+    if (opts?.candidateMatcher
+      ? candidates.some(opts.candidateMatcher)
+      : candidates.some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) return true;
   }
   return false;
 }
@@ -2520,8 +2530,10 @@ function jsonlTailMatchFingerprint(
         } else {
           continue;
         }
-        if (normaliseTranscriptFingerprintCandidates(text)
-          .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) {
+        const candidates = normaliseTranscriptFingerprintCandidates(text);
+        if (opts.candidateMatcher
+          ? candidates.some(opts.candidateMatcher)
+          : candidates.some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) {
           hit = true;
           break;
         }

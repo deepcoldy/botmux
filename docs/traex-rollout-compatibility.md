@@ -2,6 +2,30 @@
 
 ## Compatibility contract
 
+### Existing-terminal adoption with the shared background server
+
+TRAE CLI's shared background server owns the rollout; the terminal frontend
+does not hold that file open. `/adopt` therefore supplements process-owned
+rollout discovery with the frontend's native `/status` page. It queries only an
+idle, positively empty composer, closes the read-only page, and pins its exact
+session ID to that backend generation. No model task, user config change,
+daemon-wide file selection, or standalone-mode restart is required.
+
+Terminal-originated tasks keep using the existing local-turn forwarding path.
+An unfinished task that started before adoption remains eligible for its future
+completion; completed history is absorbed. Switching to another native thread
+sets a new history watermark, including when its rollout is created later.
+Lark-originated input carries a fresh per-write correlation marker only when
+the adopted frontend holds no rollout, so its exact submit receipt can identify
+the same shared thread without accepting a sibling terminal's identical text.
+The transcript removes only the exact generated trailing marker before native
+skill aliasing and display; submit receipt matching retains the full marker.
+
+Human drafts, busy/unknown input surfaces, cancelled worker generations, and
+unconfirmed status writes fail closed. An incomplete query blocks later task
+input until a clean composer is visible; a completed, already-attributed reply
+is forwarded independently of a later human draft or running task.
+
 The reader supports both legacy and canonical TraeX records without requiring
 users to select a version-specific delivery mode. It normalizes their inputs and
 outputs into the existing BotMux turn and CoT events.

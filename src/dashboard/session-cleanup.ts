@@ -13,10 +13,13 @@ export interface IdleCleanupSessionRow {
   status?: string;
   /** Parked backlog row: its prompt sits in queuedPrompt and no CLI has ever
    *  started for it. Dashboard rows project these as status 'idle', so the
-   *  queue flag is what keeps a parked draft out of sweeps. A queued activation
-   *  already in flight (queued cleared, queuedActivationPending set) is not
-   *  signalled here — narrow known boundary, see docs/manual-idle-cleanup.md. */
+   *  queue flag is what keeps a parked draft out of sweeps. */
   queued?: unknown;
+  /** True while an opening or promoted tail activation is still waiting for
+   *  its submission ACK. Rows holding an unsettled activation journal or
+   *  buffered follow-ups must never be swept as idle/dormant. */
+  queuedActivationPending?: unknown;
+  queuedActivationTailCount?: unknown;
   lastMessageAt?: unknown;
   pendingRepo?: unknown;
   tuiPromptActive?: unknown;
@@ -49,6 +52,11 @@ export function idleCleanupCutoffMs(hours: IdleCleanupHours, now = Date.now()): 
   return now - hours * 60 * 60 * 1000;
 }
 
+function hasQueuedActivationHold(row: IdleCleanupSessionRow): boolean {
+  return row.queuedActivationPending === true
+    || (typeof row.queuedActivationTailCount === 'number' && row.queuedActivationTailCount > 0);
+}
+
 export function isIdleCleanupCandidate(
   row: IdleCleanupSessionRow,
   hours: IdleCleanupHours,
@@ -59,10 +67,8 @@ export function isIdleCleanupCandidate(
   // Parked (never-activated) backlog drafts are projected as 'idle' by
   // dashboard-rows: their queuedPrompt is still parked, so every threshold
   // (including 0 = no age filter) skips rows still carrying the queued flag.
-  // Rows whose queued activation is already in flight (queued cleared,
-  // queuedActivationPending set) are not signalled here — narrow known
-  // boundary, see docs/manual-idle-cleanup.md.
-  if (row.queued) return false;
+  // In-flight queued activations and buffered tails are protected the same way.
+  if (row.queued || hasQueuedActivationHold(row)) return false;
   if (row.locked) return false;
   if (row.pendingRepo || row.tuiPromptActive || row.agentAttention) return false;
   if (hours === 0) return true;
@@ -82,6 +88,7 @@ export function isDormantCleanupCandidate(
 ): boolean {
   if (!row.sessionId) return false;
   if (row.status !== 'dormant') return false;
+  if (hasQueuedActivationHold(row)) return false;
   if (row.locked) return false;
   if (row.pendingRepo || row.tuiPromptActive || row.agentAttention) return false;
   if (row.webPort !== undefined && row.webPort !== null) return false;
