@@ -577,6 +577,67 @@ describe('Antigravity worker-pool replay safety', () => {
     expect(h.sessionStore.getSessionFresh(h.ds.session.sessionId)?.lastFailedTurn).toBeUndefined();
   });
 
+  it.each(['screen_update', 'screenshot_uploaded'] as const)('starts rotation on generic-to-native confirmation without repeating owner notification (%s)', async frameType => {
+    const h = await setupRotationScenario({ directFailure: true, accountCount: 3 });
+    const generic = {
+      ...nativeUsageLimit(INCIDENT_QUOTA_SCREEN, 'native-episode-a', h.nowMs),
+      source: undefined, nativeEpisodeKey: undefined, nativeLogEpisodeKey: undefined,
+    };
+    h.ds.usageLimit = undefined;
+    h.ds.lastScreenStatus = 'idle';
+    h.ds.session.usageLimit = generic;
+    h.sessionStore.updateSession(h.ds.session);
+    const emit = async (usageLimit: typeof generic) => {
+      h.worker.emit('message', frameType === 'screen_update'
+        ? { type: frameType, content: INCIDENT_QUOTA_SCREEN, status: 'limited', turnId: 'turn-1', usageLimit }
+        : { type: frameType, imageKey: 'img-generic-confirmation', status: 'limited', turnId: 'turn-1', usageLimit });
+      await h.flush();
+    };
+    await emit(generic);
+    const originalNotifiedKey = h.ds.rateLimitNotifiedKey;
+    const originalReplies = h.replies.length;
+    const native = {
+      ...generic, source: 'antigravity-native-log' as const,
+      nativeEpisodeKey: 'log:native-confirmation', directFailure: true as const,
+    };
+    await emit(native);
+    expect(h.sent.filter(msg => msg.type === 'restart')).toHaveLength(1);
+    expect(h.ds.rateLimitNotifiedKey).toBe(originalNotifiedKey);
+    const afterConfirmation = h.replies.length;
+    expect(afterConfirmation).toBe(originalReplies + 1);
+    await emit(native);
+    expect(h.sent.filter(msg => msg.type === 'restart')).toHaveLength(1);
+    expect(h.replies.length).toBe(afterConfirmation);
+  });
+
+  it.each([
+    { mode: 'same', expectedNewNotifications: 0 },
+    { mode: 'different', expectedNewNotifications: 1 },
+  ] as const)('deduplicates no-relative owner notifications only for the same original banner ($mode)', async ({ mode, expectedNewNotifications }) => {
+    const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
+    h.ds.adoptedFrom = 'edge-without-rotation';
+    h.ds.lastScreenStatus = 'idle';
+    const generic = {
+      limited: true as const, kind: (mode === 'same' ? 'usage' : 'rate') as const,
+      retryAtMs: h.nowMs + 60_000, retryLabel: mode === 'same' ? '1m' : '5-10 min', retryReady: false,
+    };
+    const emit = async (usageLimit: typeof generic) => {
+      h.worker.emit('message', { type: 'screen_update', content: 'unchanged-banner', status: 'limited', turnId: 'turn-1', usageLimit });
+      await h.flush();
+    };
+    await emit(generic);
+    const before = h.replies.length;
+    const previousNotifiedKey = h.ds.rateLimitNotifiedKey;
+    const native = {
+      ...generic, kind: 'usage' as const, retryLabel: '1m', source: 'antigravity-native-log' as const,
+      nativeEpisodeKey: mode === 'same' ? 'log:native-fresh' : 'composer:fixed-time-fresh',
+    };
+    await emit(native);
+    expect(h.replies.length).toBe(before + expectedNewNotifications);
+    if (mode === 'same') expect(h.ds.rateLimitNotifiedKey).toBe(previousNotifiedKey);
+    else expect(h.ds.rateLimitNotifiedKey).not.toBe(previousNotifiedKey);
+  });
+
   it('deduplicates a composer-to-log upgrade within one linked episode', async () => {
     const h = await setupRotationScenario({ directFailure: false, recordStatus: true });
     h.ds.adoptedFrom = 'edge-without-rotation';

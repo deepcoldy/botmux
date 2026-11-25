@@ -121,8 +121,23 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
   /** The old banner was confirmed as composer, but no native log episode was
    * associated with it. A later arbitrary log key cannot inherit its answer. */
   let preExistingUnlinkedComposer = false;
-  let lastUnlinkedComposerIdentity: string | undefined;
-  let lastNativeLogEpisode: { rawIdentity: string; episodeKey: string } | undefined;
+  const NATIVE_EPISODE_HISTORY_LIMIT = 32;
+  const nativeLogEpisodes = new Map<string, string>();
+  const unlinkedComposerIdentities = new Set<string>();
+  const rememberNativeLogEpisode = (rawIdentity: string, episodeKey: string): void => {
+    nativeLogEpisodes.delete(rawIdentity);
+    nativeLogEpisodes.set(rawIdentity, episodeKey);
+    if (nativeLogEpisodes.size > NATIVE_EPISODE_HISTORY_LIMIT) {
+      nativeLogEpisodes.delete(nativeLogEpisodes.keys().next().value!);
+    }
+  };
+  const rememberUnlinkedComposer = (rawIdentity: string): void => {
+    unlinkedComposerIdentities.delete(rawIdentity);
+    unlinkedComposerIdentities.add(rawIdentity);
+    if (unlinkedComposerIdentities.size > NATIVE_EPISODE_HISTORY_LIMIT) {
+      unlinkedComposerIdentities.delete(unlinkedComposerIdentities.values().next().value!);
+    }
+  };
   /**
    * This turn produced a harvested answer (noteTurnCompleted).
    *
@@ -180,11 +195,10 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       const current = detectCliUsageLimit(snapshot, undefined, { suppressRateKind: opts.isRateKindSuppressed() });
       preExistingBannerKey = current.limited ? bannerTextIdentity(current) : undefined;
       preExistingNativeLogEpisodeKey = preExistingBannerKey
-        && lastNativeLogEpisode?.rawIdentity === preExistingBannerKey
-        ? lastNativeLogEpisode.episodeKey : undefined;
+        ? nativeLogEpisodes.get(preExistingBannerKey) : undefined;
       preExistingUnlinkedComposer = preExistingBannerKey !== undefined
         && preExistingNativeLogEpisodeKey === undefined
-        && lastUnlinkedComposerIdentity === preExistingBannerKey;
+        && unlinkedComposerIdentities.has(preExistingBannerKey);
       staleBannerKey = current.limited && current.retryReady
         ? usageLimitStateKey(current)
         : undefined;
@@ -227,13 +241,13 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       const key = usageLimitStateKey(limit);
       const nativeLogKey = limit.source === 'antigravity-native-log' ? limit.nativeEpisodeKey : limit.nativeLogEpisodeKey;
       if (nativeLogKey && rawIdentity) {
-        lastNativeLogEpisode = { rawIdentity, episodeKey: nativeLogKey };
+        rememberNativeLogEpisode(rawIdentity, nativeLogKey);
       }
       const rawIdentityMatchesConfirmedEpisode = nativeLogKey === undefined
         || (!preExistingUnlinkedComposer && (preExistingNativeLogEpisodeKey === undefined
           || nativeLogKey === preExistingNativeLogEpisodeKey));
-      if (nativeLogKey) lastUnlinkedComposerIdentity = undefined;
-      else if (limit.source === 'antigravity-error-composer') lastUnlinkedComposerIdentity = rawIdentity;
+      if (nativeLogKey && rawIdentity) unlinkedComposerIdentities.delete(rawIdentity);
+      else if (limit.source === 'antigravity-error-composer' && rawIdentity) rememberUnlinkedComposer(rawIdentity);
       // (a) master's rule: a banner already on screen whose reset time has
       //     already passed is definitionally leftover.
       // (b) the new rule: a banner that was ALREADY on screen when this turn
