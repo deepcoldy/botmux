@@ -414,6 +414,9 @@ export interface SessionBackend {
    */
   captureViewportCells?(): import('../../utils/terminal-cells.js').ScreenRow[] | null;
   getPaneSize?(): { cols: number; rows: number } | null;
+  /** Fresh, bounded pane size read without blocking the Worker event loop.
+   *  Returns null when the backend has exited or its dimensions are unavailable. */
+  getPaneSizeAsync?(): Promise<{ cols: number; rows: number } | null>;
   /**
    * Remote sandbox access URL — backends that run on a remote sandbox (e.g.
    * riff) expose a web terminal link instead of a local PTY. The worker
