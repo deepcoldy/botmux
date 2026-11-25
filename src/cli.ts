@@ -13854,6 +13854,7 @@ async function cmdSend(
         messageId: existingTurnPrimary.messageId, targetChatId: followThreadTargetChatId,
         ...(sendInto ? { targetRootMessageId: sendInto } : {}),
         followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        sourceTurnId: originTurnId ?? currentTurnId,
       });
       if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
     }
@@ -14099,6 +14100,7 @@ async function cmdSend(
           targetChatId: voicePrimaryOutputChatId,
           ...(voiceFollowRoot ? { targetRootMessageId: voiceFollowRoot } : {}),
           followThreadEpoch: (originSession ?? s).followThreadEpoch,
+          sourceTurnId: originTurnId ?? currentTurnId,
         });
         if (!bound) console.error('botmux send: 已复用语音投递，但跨群话题绑定补建失败');
       }
@@ -15720,6 +15722,7 @@ async function cmdSend(
           targetChatId,
           ...(sendTarget.mode !== 'plain' ? { targetRootMessageId: sendTarget.rootMessageId } : {}),
           followThreadEpoch: (originSession ?? s).followThreadEpoch,
+          sourceTurnId: originTurnId ?? currentTurnId,
         });
         if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
       }

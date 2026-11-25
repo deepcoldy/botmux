@@ -8,7 +8,7 @@ import type { DaemonToWorker } from '../src/types.js';
 import { codexEmptyComposerFooter, codexNativeComposerState, codexNativeFooterRows } from '../src/services/codex-terminal-session.js';
 import { detectCodexChoiceModal } from '../src/utils/codex-choice-modal.js';
 import { promptCacheKeepaliveRefusal } from '../src/core/prompt-cache-keepalive-gate.js';
-import { pendingInputAllowsTypeAhead } from '../src/utils/pending-input-queue.js';
+import { inputForcesSerialTurn, pendingInputAllowsTypeAhead } from '../src/utils/pending-input-queue.js';
 import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gate.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
@@ -175,9 +175,36 @@ describe('native hard input-focus blocks across real delivery paths', () => {
     h.scope.applyRespawnConfigPatch = vi.fn();
     h.scope.sessionRenameInFlight = () => true;
     h.scope.sessionInputBlocksDeliveryNow = vi.fn(() => { throw new Error('must not be called during rename hold'); });
+    Object.assign(h.scope, {
+      activeTurnAuthority: { snapshot: () => undefined },
+      inputForcesSerialTurn,
+      runAdoptMessageForCapturedGeneration: vi.fn(),
+    });
+    h.scope.admitAdoptMessage = loadWorkerFunction('admitAdoptMessage', h.scope);
     await loadWorkerMessageHandler('message', h.scope)({ type: 'message', content: 'adopt queued', turnId: 'om_adopt' });
     expect(h.scope.pendingAdoptMessages).toHaveLength(1);
     expect(h.scope.sessionInputBlocksDeliveryNow).not.toHaveBeenCalled();
+  });
+
+  it('queues adopt input behind a native dialog and arms the shared recheck', async () => {
+    const h = inputHarness('traex', fixture('traex-0.216.0-rename-dialog.txt'));
+    h.scope.lastInitConfig.adoptMode = true;
+    const writeDirect = vi.fn();
+    Object.assign(h.scope, {
+      activeTurnAuthority: { snapshot: () => undefined },
+      inputForcesSerialTurn,
+      runAdoptMessageForCapturedGeneration: writeDirect,
+    });
+    const admit = loadWorkerFunction<(item: any) => Promise<void>>('admitAdoptMessage', h.scope);
+
+    await admit({ content: 'adopt blocked', turnId: 'om_adopt_blocked' });
+
+    expect(h.scope.pendingAdoptMessages).toEqual([
+      expect.objectContaining({ content: 'adopt blocked', turnId: 'om_adopt_blocked' }),
+    ]);
+    expect(writeDirect).not.toHaveBeenCalled();
+    expect(h.backend.write).not.toHaveBeenCalled();
+    expect(h.scope.armNativeInputBlockRecheck).toHaveBeenCalledOnce();
   });
 
   it('keeps one recheck while blocked, then re-drives ordinary and injection queues once clear', async () => {
