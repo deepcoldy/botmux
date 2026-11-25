@@ -260,6 +260,7 @@ import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-ep
 import { resolveDarwinCodexCaBundle } from './utils/darwin-ca-bundle.js';
 import {
   handoffQueuedDurableInputsOnBackendExit,
+  inputForcesSerialTurn,
   mergeQueuedCliInput,
   pendingInputMayFlush,
   promoteInteractiveInputPastSchedules,
@@ -27789,8 +27790,7 @@ function sendToPty(
   // when another reply from the same peer bot currently owns the CLI. Keep it
   // on the terminal boundary instead of letting adapter type-ahead, queue
   // merging, or isolation-off envelope adoption splice tasks together.
-  const queueAfterActiveTurn = opts.queueAfterActiveTurn
-    || !!opts.trustedCaller?.taskContinuation;
+  const queueAfterActiveTurn = inputForcesSerialTurn(opts);
   const next: PendingCliInput = {
     content,
     turnId,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   handoffQueuedDurableInputsOnBackendExit,
+  inputForcesSerialTurn,
   mergeQueuedCliInput,
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
@@ -160,6 +161,37 @@ describe('mergeQueuedCliInput', () => {
       turnId: 'im-2',
       vcMeetingImTurnOrigin: { ...imOrigin, larkMessageId: 'im-2' },
     })).toBe(true);
+  });
+});
+
+describe('inputForcesSerialTurn', () => {
+  const continuationCaller = {
+    requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'app', senderType: 'bot' as const,
+    taskContinuation: {
+      appId: 'app', openId: 'ou_human', sourceSessionId: 'source-session', sourceTurnId: 'om_source',
+    },
+  };
+
+  it('keeps an explicitly serial input serial', () => {
+    expect(inputForcesSerialTurn({ queueAfterActiveTurn: true })).toBe(true);
+  });
+
+  it('forces a serial boundary from the continuation principal even without the flag', () => {
+    expect(inputForcesSerialTurn({ trustedCaller: continuationCaller })).toBe(true);
+    expect(inputForcesSerialTurn({
+      queueAfterActiveTurn: true,
+      trustedCaller: continuationCaller,
+    })).toBe(true);
+  });
+
+  it('leaves ordinary inputs on the normal type-ahead path', () => {
+    expect(inputForcesSerialTurn({})).toBe(false);
+    expect(inputForcesSerialTurn({
+      trustedCaller: { requestUserOpenId: 'ou_human', requestLarkAppId: 'app', senderType: 'user' as const },
+    })).toBe(false);
+    expect(inputForcesSerialTurn({
+      trustedCaller: { requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'app', senderType: 'bot' as const },
+    })).toBe(false);
   });
 });
 

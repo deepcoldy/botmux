@@ -126,6 +126,20 @@ export function handoffQueuedDurableInputsOnBackendExit(
   return handedOff;
 }
 
+/** Whether an input must wait for the active turn's real prompt boundary.
+ *  The explicit flag marks collaborative/durable serial inputs; a cross-chat
+ *  task continuation is serial on its own even when the flag was not carried
+ *  (for example an in-worker re-enqueue), because its trustedCaller binds the
+ *  input to a bounded source-turn principal that must never splice into the
+ *  turn currently owning the CLI. Terminal-boundary counterpart of the daemon
+ *  gate in sendWorkerInput. */
+export function inputForcesSerialTurn(input: {
+  queueAfterActiveTurn?: true;
+  trustedCaller?: Pick<TrustedCaller, 'taskContinuation'>;
+}): boolean {
+  return input.queueAfterActiveTurn === true || !!input.trustedCaller?.taskContinuation;
+}
+
 export function mergeQueuedCliInput(
   pending: PendingCliInput[],
   next: PendingCliInput,
