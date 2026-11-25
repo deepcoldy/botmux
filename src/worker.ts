@@ -471,6 +471,19 @@ import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { probeTraexHookTrustSupport, traexRejectedArgument } from './adapters/cli/traex-version.js';
 import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
 import {
+  TRAEX_FIRST_PROMPT_SLOW_POLL_MS,
+  TraexFirstPromptReadinessPoller,
+  TraexNativeViewportEvidenceStore,
+  TraexNativeViewportRefreshController,
+  isTraexWebInputSettled,
+  isValidPaneDimensions,
+  nextTraexFirstPromptPollDelayMs,
+  paneDimensionsEqual,
+  stageNativeViewportInTempRendererSync,
+  type PaneDimensions,
+  type TraexNativeViewportEvidence,
+} from './core/traex-first-prompt-readiness.js';
+import {
   readRunningExeIdentity,
   resolveInstallIdentity,
   sameExecutableObject,
@@ -3594,6 +3607,10 @@ let traexStartupRendererDrain: object | undefined;
  * its next passing admission instead of outliving the first input. */
 let traexFirstSubmitConfirmed = false;
 let traexStartupWebRecheck: ReturnType<typeof setTimeout> | undefined;
+let traexControlWriteRevision = 0;
+const traexFirstPromptReadinessPoller = new TraexFirstPromptReadinessPoller();
+const traexNativeViewportEvidence = new TraexNativeViewportEvidenceStore();
+const traexNativeViewportRefresh = new TraexNativeViewportRefreshController();
 
 function shouldEnableProgramStatus(
   cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'cliVersion' | 'adoptMode'>,
@@ -3942,8 +3959,12 @@ let isPromptReady = false;
  * readiness it cleared itself, never a later write, busy event or control. */
 let promptReadinessRevision = 0;
 
-function invalidatePromptReadinessEvidence(): void {
+function invalidatePromptReadinessEvidence(opts?: { preserveTraexStartupEvidence?: boolean }): void {
   promptReadinessRevision++;
+  if (!opts?.preserveTraexStartupEvidence) {
+    if (typeof traexControlWriteRevision === 'number') traexControlWriteRevision++;
+    if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
+  }
 }
 
 /** Track every physical write in a multi-step control input, including keys
@@ -3965,8 +3986,8 @@ function readinessTrackedInput(input: PtyHandle): PtyHandle {
   });
 }
 
-function revokePromptReadiness(): void {
-  invalidatePromptReadinessEvidence();
+function revokePromptReadiness(opts?: { preserveTraexStartupEvidence?: boolean }): void {
+  invalidatePromptReadinessEvidence(opts);
   isPromptReady = false;
 }
 /** Prompt-ready edges published by markPromptReady(). A backend compares it with
@@ -4793,6 +4814,7 @@ function noteWebTerminalInput(data: string, submits = terminalInputSubmits(data)
   lastWebTerminalInputAtMs = Date.now();
   webTerminalInputGeneration++;
   webTerminalInputBackendScreenRevision = backendScreenRevision;
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   if (submits) {
     lastWebTerminalSubmitAtMs = lastWebTerminalInputAtMs;
     webTerminalSubmitGeneration++;
@@ -5826,6 +5848,7 @@ async function runStartupCommands(): Promise<boolean> {
     return true;
   }
   startupCommandsInProgress = true;
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   try {
     const hold = startupCommandAckHold;
     if (hold) {
@@ -6007,6 +6030,13 @@ function firstWriteScreen(): { viewport: string | undefined; promptVisible: bool
   }
   const visible = (text: string | undefined): boolean => !!pattern && !!text && pattern.test(stripAnsiScreenText(text));
   if (visible(viewport)) return { viewport, promptVisible: true };
+  if (lastInitConfig?.cliId === 'traex'
+    && typeof traexNativeViewportEvidence !== 'undefined'
+    && traexNativeViewportEvidence.hasEntry()) {
+    const nativeViewport = activeTraexNativeViewportEvidence()?.plainScreen;
+    if (visible(nativeViewport)) return { viewport: nativeViewport, promptVisible: true };
+    if (nativeViewport?.trim() && !viewport?.trim()) viewport = nativeViewport;
+  }
   const be = backend;
   if (be && (be.captureViewport || be.captureCurrentScreen) && backendScreenEvidenceIsAuthoritativeForMutation()) {
     const now = Date.now();
@@ -6126,6 +6156,7 @@ async function runInitialNativeRename(): Promise<void> {
     return;
   }
   try {
+    if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
     await sendRawCommandLineWithRecoveryFence(backend, cmd);
     await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
     log(`Initial native rename sent: ${cmd}`);
@@ -18523,7 +18554,11 @@ function observeRestoredStartupHistory(): void {
 function observeRestoredStartupHistoryOnScreen(): boolean {
   if (!awaitingFirstPrompt || backend instanceof ZmxBackend) return false;
   let screen = '';
-  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  try {
+    screen = lastInitConfig?.cliId === 'traex' && typeof readTraexStartupViewportScreen === 'function'
+      ? readTraexStartupViewportScreen(true)
+      : (renderer?.rawSnapshot({ preserveFormatting: true }) ?? '');
+  } catch { return false; }
   if (!screen || idleDetector?.observeStartupHistory(screen) !== true) return false;
   log(`${cliName()} restored composer observed on screen; releasing the startup hold`);
   // TraeX's quiet-composer timer may already have expired while loading held
@@ -18549,6 +18584,7 @@ function applyTraexStartupLaunchMode(
   // A cold resume is fenced like a fresh launch: its first frame is the same
   // provisional composer (see shouldFenceTraexStartupInput). A reattached
   // live pane is already past it.
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   traexNativeStartupInputPending = shouldFenceTraexStartupInput({
     cliId: cfg.cliId,
     programStatusEnabled: programStatusStream !== null,
@@ -18564,6 +18600,133 @@ function applyTraexStartupLaunchMode(
       startupReadyFromHistory: (screen: string) => traexRestoredComposerReady(screen, { resumedSession: true }),
     };
   }
+}
+
+function isTraexTmuxViewportBackend(be: unknown): be is TmuxPipeBackend {
+  return typeof TmuxPipeBackend === 'function' && be instanceof TmuxPipeBackend;
+}
+
+function isTraexHcViewportBackend(be: unknown): be is HcBackend {
+  return typeof HcBackend === 'function' && be instanceof HcBackend;
+}
+
+function isTraexNativeViewportBackend(be: unknown): be is TmuxPipeBackend | HcBackend {
+  return isTraexTmuxViewportBackend(be) || isTraexHcViewportBackend(be);
+}
+
+function currentTraexCliLifetimeNonce(): number | undefined {
+  return typeof cliLifetimeNonce === 'number' ? cliLifetimeNonce : undefined;
+}
+
+function currentTraexGridRevision(): number {
+  return typeof observedPaneGridRevision === 'number' ? observedPaneGridRevision : 0;
+}
+
+function currentTraexControlWriteRevision(): number {
+  return typeof traexControlWriteRevision === 'number' ? traexControlWriteRevision : 0;
+}
+
+function currentTraexInterruptGeneration(): number {
+  return typeof cliInterruptGeneration === 'number' ? cliInterruptGeneration : 0;
+}
+
+function clearTraexStartupWebRecheck(): void {
+  if (typeof traexStartupWebRecheck !== 'undefined' && traexStartupWebRecheck) {
+    clearTimeout(traexStartupWebRecheck);
+    traexStartupWebRecheck = undefined;
+  }
+}
+
+function currentWebResizedGridFor(be: unknown): PaneDimensions | null {
+  if (typeof webResizedBackendGrid === 'undefined' || !webResizedBackendGrid || webResizedBackendGrid.backend !== be) {
+    return null;
+  }
+  return { cols: webResizedBackendGrid.cols, rows: webResizedBackendGrid.rows };
+}
+
+function syncHcPaneSizeFor(be: unknown): PaneDimensions | null | undefined {
+  if (!isTraexHcViewportBackend(be)) return undefined;
+  try {
+    return be.getPaneSize?.() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function invalidateTraexNativeViewportEvidence(): void {
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
+}
+
+function activeTraexNativeViewportEvidence(): TraexNativeViewportEvidence | undefined {
+  if (typeof traexNativeViewportEvidence === 'undefined' || !traexNativeViewportEvidence.hasEntry()) {
+    return undefined;
+  }
+  return traexNativeViewportEvidence.read({
+    closeRequested: typeof closeRequested === 'boolean' ? closeRequested : false,
+    restartingWithoutReplacement: Boolean(cliRestartInProgress && !replacementSpawnInProgress),
+    pendingWebInput: pendingWebTerminalInput(),
+    backend: backend as object | null | undefined,
+    spawnGeneration: cliSpawnGeneration,
+    lifetimeNonce: currentTraexCliLifetimeNonce(),
+    renderer: renderer as object | null | undefined,
+    screenRevision: backendScreenRevision,
+    outputGenerationCurrent: (snapshot: number) =>
+      typeof ptyOutputGeneration !== 'undefined' && typeof ptyOutputGeneration?.isCurrent === 'function'
+        ? ptyOutputGeneration.isCurrent(snapshot)
+        : true,
+    webInputGeneration: webTerminalInputGeneration,
+    controlWriteRevision: currentTraexControlWriteRevision(),
+    interruptGeneration: currentTraexInterruptGeneration(),
+    gridRevision: currentTraexGridRevision(),
+    webResizedGrid: currentWebResizedGridFor(backend),
+    syncPaneSize: syncHcPaneSizeFor(backend),
+  });
+}
+
+function readTraexStartupViewportScreen(preserveFormatting: boolean): string {
+  const nativeEvidence = activeTraexNativeViewportEvidence();
+  if (nativeEvidence) {
+    return preserveFormatting ? nativeEvidence.formattedScreen : nativeEvidence.plainScreen;
+  }
+  try {
+    return renderer?.rawSnapshot(preserveFormatting ? { preserveFormatting: true } : undefined) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function traexWebInputSettleStatus(): { settled: boolean; remainingMs: number } {
+  return isTraexWebInputSettled({
+    webInputGeneration: webTerminalInputGeneration,
+    webInputGenerationAtSpawn: typeof webTerminalInputGenerationAtSpawn === 'number'
+      ? webTerminalInputGenerationAtSpawn
+      : undefined,
+    pendingWebInput: pendingWebTerminalInput(),
+    nowMs: Date.now(),
+    lastWebInputAtMs: typeof lastWebTerminalInputAtMs === 'number' ? lastWebTerminalInputAtMs : 0,
+    screenRevision: backendScreenRevision,
+    webInputScreenRevision: typeof webTerminalInputBackendScreenRevision === 'number'
+      ? webTerminalInputBackendScreenRevision
+      : backendScreenRevision,
+    settleMs: typeof READY_FLUSH_SETTLE_MS === 'number' ? READY_FLUSH_SETTLE_MS : 1_000,
+  });
+}
+
+function traexNativeStartupScreenAdmitsPure(
+  screen: string,
+  webInputSettled: boolean,
+  nativeCandidate = false,
+): boolean {
+  const blockingOwner = Boolean(typeof hookReviewInputHold === 'boolean' && hookReviewInputHold)
+    || (typeof heldStuckPage === 'function'
+      && (Boolean(heldStuckPage()) || (nativeCandidate && Boolean(heldStuckPage(screen)))));
+  return traexStartupInputReady({
+    screen,
+    readyPattern: cliAdapter?.readyPattern,
+    nativeState: idleDetector?.lastProgramStatusReport?.(),
+    webInputUnchanged: webInputSettled,
+    blockingOwner,
+  });
 }
 
 function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
@@ -18603,6 +18766,9 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
         traexStartupWebRecheck = setTimeout(() => {
           traexStartupWebRecheck = undefined;
           if (backend !== target || cliSpawnGeneration !== generation
+            || (typeof closeRequested === 'boolean' && closeRequested)
+            || (!traexNativeStartupInputPending && !traexFirstInputAdmissionPending)
+            || (typeof isFlushing === 'boolean' && isFlushing)
             // Re-read the confirmation at fire time: an owned receipt may have
             // landed after this callback captured the finite 90s deadline.
             || Date.now() >= (traexFirstSubmitConfirmed ? Number.POSITIVE_INFINITY : traexFirstPromptDeadlineAt)
@@ -18614,6 +18780,33 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
       }
       return true;
     }
+  }
+  // When verified native viewport evidence is still current for this exact
+  // backend/generation/renderer/screen-revision/Web-epoch/pane-size, admit
+  // from that staged snapshot without forcing a redundant drain of the stale
+  // stream renderer.
+  if (screenOverride === undefined) {
+    const nativeEvidence = activeTraexNativeViewportEvidence();
+    if (nativeEvidence?.webInputSettled) {
+      if (!traexNativeStartupScreenAdmitsPure(nativeEvidence.formattedScreen, true, true)) {
+        invalidateTraexNativeViewportEvidence();
+        return true;
+      }
+      if (traexNativeStartupInputPending) {
+        traexNativeStartupInputPending = false;
+        log('TraeX native startup input readiness verified');
+      }
+      if (traexFirstSubmitConfirmed) {
+        traexFirstInputAdmissionPending = false;
+        traexStartupRendererDrain = undefined;
+        clearTraexStartupWebRecheck();
+        invalidateTraexNativeViewportEvidence();
+        if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+      }
+      return false;
+    }
+  }
+  if (!webInputUnchanged) {
     if (traexStartupRendererWebInputGeneration !== webTerminalInputGeneration
       || traexStartupRendererScreenRevision !== backendScreenRevision) {
       // Only this fence's own retry timers are bounded by the 90s window. A
@@ -18654,6 +18847,9 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
           traexStartupWebRecheck = setTimeout(() => {
             traexStartupWebRecheck = undefined;
             if (backend !== target || renderer !== observedRenderer || cliSpawnGeneration !== generation
+              || (typeof closeRequested === 'boolean' && closeRequested)
+              || (!traexNativeStartupInputPending && !traexFirstInputAdmissionPending)
+              || (typeof isFlushing === 'boolean' && isFlushing)
               || (cliRestartInProgress && !replacementSpawnInProgress)
               || Date.now() >= retryDeadline()) return;
             markPromptReady();
@@ -18682,8 +18878,210 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
     traexNativeStartupInputPending = false;
     log('TraeX native startup input readiness verified');
   }
-  if (traexFirstSubmitConfirmed) traexFirstInputAdmissionPending = false;
+  if (traexFirstSubmitConfirmed) {
+    traexFirstInputAdmissionPending = false;
+    traexStartupRendererDrain = undefined;
+    clearTraexStartupWebRecheck();
+    invalidateTraexNativeViewportEvidence();
+    if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+  }
   return false;
+}
+
+function traexPromptReadyGateBlocks(): boolean {
+  return (typeof readyGate !== 'undefined' && readyGate?.shouldHold?.() === true)
+    || (typeof bareShellLaunchBlocked === 'boolean' && bareShellLaunchBlocked)
+    || (typeof remoteRunnerRecoveredTurnInFlight === 'boolean' && remoteRunnerRecoveredTurnInFlight)
+    || (typeof currentInputDeliveryQuarantine === 'function' && Boolean(currentInputDeliveryQuarantine()))
+    || (typeof currentPostTerminalInputFence === 'function' && Boolean(currentPostTerminalInputFence()));
+}
+
+async function probeAndPublishTraexNativeViewport(opts: {
+  observedBackend: TmuxPipeBackend | HcBackend;
+  adapter: CliAdapter | null;
+  generation: number;
+  lifetime: number | undefined;
+  observedRenderer: TerminalRenderer;
+  requireQuietWindow: boolean;
+  checkPromptReadyGates?: boolean;
+  stillActive: () => boolean;
+}): Promise<{ formattedScreen: string; plainScreen: string } | null> {
+  const {
+    observedBackend,
+    adapter,
+    generation,
+    lifetime,
+    observedRenderer,
+    requireQuietWindow,
+    checkPromptReadyGates = false,
+    stillActive,
+  } = opts;
+  const isTmux = isTraexTmuxViewportBackend(observedBackend);
+  const isHc = isTraexHcViewportBackend(observedBackend);
+  if (!isTmux && !isHc) return null;
+
+  const owner = {
+    backend: observedBackend,
+    spawnGeneration: generation,
+    lifetimeNonce: lifetime,
+    renderer: observedRenderer,
+  };
+  const clearOwnedEvidence = (): void => {
+    if (typeof traexNativeViewportEvidence !== 'undefined') {
+      traexNativeViewportEvidence.clearIfOwnedBy(owner);
+    }
+  };
+
+  const webInputGeneration = webTerminalInputGeneration;
+  const revision = backendScreenRevision;
+  const outputGeneration = ptyOutputGeneration.snapshot();
+  const controlWriteRevision = currentTraexControlWriteRevision();
+  const interruptGeneration = currentTraexInterruptGeneration();
+  const gridRevision = currentTraexGridRevision();
+  const webResizedGrid = currentWebResizedGridFor(observedBackend);
+  const hcSizeBefore = isHc ? syncHcPaneSizeFor(observedBackend) : undefined;
+
+  const fencesHold = (): boolean => stillActive()
+    && backend === observedBackend
+    && cliSpawnGeneration === generation
+    && currentTraexCliLifetimeNonce() === lifetime
+    && renderer === observedRenderer
+    && !(cliRestartInProgress && !replacementSpawnInProgress)
+    && closeRequested !== true
+    && webTerminalInputGeneration === webInputGeneration
+    && !pendingWebTerminalInput()
+    && backendScreenRevision === revision
+    && ptyOutputGeneration.isCurrent(outputGeneration)
+    && currentTraexControlWriteRevision() === controlWriteRevision
+    && currentTraexInterruptGeneration() === interruptGeneration
+    && currentTraexGridRevision() === gridRevision
+    && paneDimensionsEqual(currentWebResizedGridFor(observedBackend), webResizedGrid)
+    && !inflightInputs.hasUnacked()
+    && (!requireQuietWindow || Date.now() - lastPtyOutputAtMs >= 2_000)
+    && (!checkPromptReadyGates || !traexPromptReadyGateBlocks())
+    && (hcSizeBefore === undefined || hcSizeBefore === null
+      || paneDimensionsEqual(syncHcPaneSizeFor(observedBackend), hcSizeBefore));
+
+  if (!fencesHold()) return null;
+
+  try {
+    let tmuxSizeBefore: PaneDimensions | null = null;
+    if (isTmux) {
+      if (typeof observedBackend.getPaneSizeAsync !== 'function') {
+        clearOwnedEvidence();
+        return null;
+      }
+      tmuxSizeBefore = await observedBackend.getPaneSizeAsync();
+      if (!fencesHold() || !isValidPaneDimensions(tmuxSizeBefore)) {
+        clearOwnedEvidence();
+        return null;
+      }
+    }
+
+    const rawNative = await observedBackend.captureViewportAsync();
+    if (!fencesHold() || !rawNative || !rawNative.trim()) {
+      clearOwnedEvidence();
+      return null;
+    }
+
+    let hcSizeAfterCapture: PaneDimensions | null = null;
+    let stagingDims: PaneDimensions;
+    if (isTmux) {
+      stagingDims = tmuxSizeBefore!;
+    } else {
+      hcSizeAfterCapture = syncHcPaneSizeFor(observedBackend) ?? null;
+      if (hcSizeBefore !== null && hcSizeBefore !== undefined
+        && !paneDimensionsEqual(hcSizeBefore, hcSizeAfterCapture)) {
+        clearOwnedEvidence();
+        return null;
+      }
+      if (hcSizeAfterCapture !== null) {
+        if (!isValidPaneDimensions(hcSizeAfterCapture)) {
+          clearOwnedEvidence();
+          return null;
+        }
+        stagingDims = hcSizeAfterCapture;
+      } else {
+        stagingDims = {
+          cols: typeof renderCols === 'number' ? renderCols : DEFAULT_RENDER_COLS,
+          rows: typeof renderRows === 'number' ? renderRows : DEFAULT_RENDER_ROWS,
+        };
+      }
+    }
+
+    const fenceArmed = Boolean(traexNativeStartupInputPending || traexFirstInputAdmissionPending);
+    if (!adapter?.startupReadyFromHistory?.(rawNative)) {
+      clearOwnedEvidence();
+      return null;
+    }
+    if (fenceArmed) {
+      if (!traexWebInputSettleStatus().settled || !traexNativeStartupScreenAdmitsPure(rawNative, true, true)) {
+        clearOwnedEvidence();
+        return null;
+      }
+    }
+
+    const staged = stageNativeViewportInTempRendererSync(rawNative, stagingDims);
+    if (!staged.ok) {
+      clearOwnedEvidence();
+      return null;
+    }
+
+    let hcSizeFinal: PaneDimensions | null | undefined;
+    if (isTmux) {
+      const tmuxSizeAfter = await observedBackend.getPaneSizeAsync();
+      if (!fencesHold() || !paneDimensionsEqual(tmuxSizeBefore, tmuxSizeAfter)) {
+        clearOwnedEvidence();
+        return null;
+      }
+    } else {
+      hcSizeFinal = syncHcPaneSizeFor(observedBackend) ?? null;
+      if (!fencesHold() || !paneDimensionsEqual(hcSizeAfterCapture, hcSizeFinal)) {
+        clearOwnedEvidence();
+        return null;
+      }
+    }
+
+    if (!adapter?.startupReadyFromHistory?.(staged.formattedScreen)) {
+      clearOwnedEvidence();
+      return null;
+    }
+    const webInputSettled = traexWebInputSettleStatus().settled;
+    if (fenceArmed) {
+      if (!webInputSettled || !traexNativeStartupScreenAdmitsPure(staged.formattedScreen, true, true)) {
+        clearOwnedEvidence();
+        return null;
+      }
+    }
+
+    traexStartupRendererDrain = undefined;
+    clearTraexStartupWebRecheck();
+    traexNativeViewportEvidence.publish({
+      scope: {
+        backend: observedBackend,
+        spawnGeneration: generation,
+        lifetimeNonce: lifetime,
+        renderer: observedRenderer,
+        screenRevision: revision,
+        outputGeneration,
+        webInputGeneration,
+        controlWriteRevision,
+        interruptGeneration,
+        gridRevision,
+        webResizedGrid,
+        paneSize: isTmux ? tmuxSizeBefore : hcSizeAfterCapture,
+        syncPaneSize: isHc ? hcSizeFinal : undefined,
+      },
+      formattedScreen: staged.formattedScreen,
+      plainScreen: staged.plainScreen,
+      webInputSettled,
+      capturedAtMs: Date.now(),
+    });
+    return { formattedScreen: staged.formattedScreen, plainScreen: staged.plainScreen };
+  } catch (err) {
+    clearOwnedEvidence();
+    throw err;
+  }
 }
 
 /**
@@ -18691,25 +19089,45 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
  * not have a newline in the PTY byte stream. Fresh startup also need not emit
  * the old loading banner. Poll the rendered viewport during first-prompt
  * admission independently of both flags; never seed from append-only history.
+ *
+ * The 90s warning deadline slows observation cadence rather than stopping
+ * recovery, and same-generation renderer replacements (e.g. hc resync) keep
+ * the poller alive while discarding only the in-flight sample.
  */
 function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): void {
   if (lastInitConfig?.cliId !== 'traex' || !backendScreenEvidenceIsAuthoritativeForMutation()) return;
   const detector = idleDetector;
   const adapter = cliAdapter;
   const generation = cliSpawnGeneration;
-  const deadline = traexFirstPromptDeadlineAt || (traexFirstPromptDeadlineAt = Date.now() + FIRST_PROMPT_HARD_TIMEOUT_MS);
-  const initialRenderer = renderer;
+  const lifetime = currentTraexCliLifetimeNonce();
+  const alertDeadline = traexFirstPromptDeadlineAt || (traexFirstPromptDeadlineAt = Date.now() + FIRST_PROMPT_HARD_TIMEOUT_MS);
   const stillWaiting = (): boolean => awaitingFirstPrompt
-    && backend === observedBackend && idleDetector === detector && cliSpawnGeneration === generation
-    && renderer === initialRenderer
-    && !(cliRestartInProgress && !replacementSpawnInProgress)
-    && Date.now() < deadline;
-  const check = async (): Promise<void> => {
-    try {
-      if (!stillWaiting() || !renderer || inflightInputs.hasUnacked()
+    && closeRequested !== true
+    && backend === observedBackend
+    && idleDetector === detector
+    && cliSpawnGeneration === generation
+    && currentTraexCliLifetimeNonce() === lifetime
+    && !(cliRestartInProgress && !replacementSpawnInProgress);
+
+  traexFirstPromptReadinessPoller.start({
+    stillWaiting,
+    nextDelayMs: () => nextTraexFirstPromptPollDelayMs(Date.now(), alertDeadline),
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`${cliName()} first-prompt viewport check failed: ${msg}`);
+    },
+    check: async (isCurrentRun) => {
+      const active = (): boolean => isCurrentRun() && stillWaiting();
+      if (!active() || !renderer || inflightInputs.hasUnacked()
         || Date.now() - lastPtyOutputAtMs < 2_000) return;
+      // Avoid redundant tmux/hc captures while OSC reports working and nothing
+      // is queued for type-ahead admission, or while a downstream prompt-ready
+      // gate (readyGate / bareShell / quarantine / fence) is actively holding.
+      if (detector?.programStatusHeldWorking?.() === true
+        && (typeof hasPendingInputForFlush !== 'function' || !hasPendingInputForFlush())) return;
+      if (traexPromptReadyGateBlocks()) return;
       // A human input change invalidates this sample, not the whole poller.
-      // The next tick takes new evidence without resetting the total deadline.
+      // The next tick takes new evidence without resetting the alert deadline.
       const webInputGeneration = webTerminalInputGeneration;
       const observedRenderer = renderer;
       const revision = backendScreenRevision;
@@ -18717,48 +19135,158 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
       // xterm writes asynchronously. Read only after its queue drains, and
       // reject a concurrent redraw, resync, restart or web-terminal input.
       await observedRenderer.writeAndFlush('');
-      if (!stillWaiting() || webTerminalInputGeneration !== webInputGeneration
-        || renderer !== observedRenderer || backendScreenRevision !== revision
+      if (!active() || webTerminalInputGeneration !== webInputGeneration
+        || pendingWebTerminalInput() || renderer !== observedRenderer
+        || backendScreenRevision !== revision
         || !ptyOutputGeneration.isCurrent(outputGeneration) || inflightInputs.hasUnacked()
-        || Date.now() - lastPtyOutputAtMs < 2_000) return;
-      let screen = observedRenderer.rawSnapshot({ preserveFormatting: true });
-      if (!screen || !adapter?.startupReadyFromHistory?.(screen)
-        || traexNativeStartupInputIsPending(screen)) {
-        // A tmux or hc CLI can draw its footer before pipe-pane (or the hc
-        // attach) is in place. Later cursor-only redraws leave the renderer
-        // nonempty but incomplete, so waiting for more stream bytes can strand
-        // a ready pane until 90s. Read the actual current cells without
-        // blocking the worker; preserve the exact generation/output/web-input
-        // fence across that await.
-        if (!(observedBackend instanceof TmuxPipeBackend || observedBackend instanceof HcBackend)) return;
-        screen = await observedBackend.captureViewportAsync();
-        if (!stillWaiting() || webTerminalInputGeneration !== webInputGeneration
-          || renderer !== observedRenderer || backendScreenRevision !== revision
-          || !ptyOutputGeneration.isCurrent(outputGeneration) || inflightInputs.hasUnacked()
-          || Date.now() - lastPtyOutputAtMs < 2_000) return;
-        if (!screen || !adapter?.startupReadyFromHistory?.(screen)
-          || traexNativeStartupInputIsPending(screen)) return;
-        log(`${cliName()} initialized composer recovered from native ${effectiveBackendType} viewport`);
+        || Date.now() - lastPtyOutputAtMs < 2_000 || traexPromptReadyGateBlocks()) return;
+
+      const rendererScreen = observedRenderer.rawSnapshot({ preserveFormatting: true });
+      const fenceArmed = Boolean(traexNativeStartupInputPending || traexFirstInputAdmissionPending);
+      let readyScreen: string | null = null;
+      if (rendererScreen && adapter?.startupReadyFromHistory?.(rendererScreen)) {
+        if (!fenceArmed) {
+          readyScreen = rendererScreen;
+        } else if (traexWebInputSettleStatus().settled
+          && traexNativeStartupScreenAdmitsPure(rendererScreen, true, false)) {
+          // We just drained observedRenderer for this exact (webInputGeneration, revision);
+          // advance the drained-epoch markers so subsequent parameterless checks admit
+          // without triggering a duplicate renderer drain.
+          if (typeof webTerminalInputGenerationAtSpawn === 'number'
+            && webInputGeneration !== webTerminalInputGenerationAtSpawn) {
+            traexStartupRendererWebInputGeneration = webInputGeneration;
+            traexStartupRendererScreenRevision = revision;
+            traexStartupRendererDrain = undefined;
+            clearTraexStartupWebRecheck();
+          }
+          readyScreen = rendererScreen;
+        }
       }
-      if (detector?.observeStartupHistory(screen)) {
+
+      if (!readyScreen) {
+        // If verified native viewport evidence is already current for this exact
+        // unchanged scope (e.g. during IdleDetector's 3s SPINNER_GUARD_MS window),
+        // reuse it instead of spawning redundant native captures that could
+        // transiently self-invalidate valid evidence.
+        const existingNative = activeTraexNativeViewportEvidence();
+        if (existingNative
+          && adapter?.startupReadyFromHistory?.(existingNative.formattedScreen)
+          && (!fenceArmed
+            || (existingNative.webInputSettled
+              && traexNativeStartupScreenAdmitsPure(existingNative.formattedScreen, true, true)))) {
+          readyScreen = existingNative.formattedScreen;
+        } else {
+          // A tmux or hc CLI can draw its footer before pipe-pane (or the hc
+          // attach) is in place. Later cursor-only redraws leave the renderer
+          // nonempty but incomplete, so waiting for more stream bytes can strand
+          // a ready pane past 90s. Capture the live native viewport without
+          // blocking the worker, stage and re-verify it in a temporary renderer
+          // at the pane's real geometry, then atomically publish scoped evidence.
+          if (!isTraexNativeViewportBackend(observedBackend)) return;
+          const recovered = await probeAndPublishTraexNativeViewport({
+            observedBackend,
+            adapter,
+            generation,
+            lifetime,
+            observedRenderer,
+            requireQuietWindow: true,
+            checkPromptReadyGates: true,
+            stillActive: active,
+          });
+          if (!recovered) return;
+          readyScreen = recovered.formattedScreen;
+          log(`${cliName()} initialized composer recovered from native ${effectiveBackendType} viewport`);
+        }
+      }
+
+      if (detector?.observeStartupHistory(readyScreen)) {
         log(`${cliName()} ${lastInitConfig?.resume ? 'restored' : 'initialized'} composer observed on screen; rechecking first-prompt readiness`);
       }
       // A loaded banner may already have retired startup without setting
       // readySeen. Recheck even in that case. The detector's spinner/static
       // busy guards and normal worker ready/input fences still own admission.
       // startupReadyFromHistory being true implies readyPattern on this viewport.
-      detector?.seedReadyEvidence(true);
-    } catch (err: any) {
-      log(`${cliName()} first-prompt viewport check failed: ${err.message}`);
-    } finally {
-      if (stillWaiting()) {
-        const timer = setTimeout(() => { void check(); }, 1_000);
-        timer.unref?.();
+      const seeded = detector?.seedReadyEvidence(true);
+      if (adapter?.supportsTypeAhead === true && seeded === false && typeof flushPending === 'function') {
+        void flushPending();
       }
-    }
-  };
-  const timer = setTimeout(() => { void check(); }, 1_000);
-  timer.unref?.();
+    },
+  });
+}
+
+/**
+ * Phase-2 on-demand native viewport refresh: if first-prompt readiness already
+ * cleared (`awaitingFirstPrompt === false`) while `traexFirstInputAdmissionPending`
+ * is still armed (e.g. empty-queue recovery followed by a harmless redraw, a
+ * human Web-terminal turn, or a confirmed first write whose Web-epoch lease
+ * still needs a passing admission to retire), re-capture and re-stage the
+ * native viewport instead of stranding pending inputs or prompt readiness.
+ */
+function scheduleTraexNativeViewportRefreshIfNeeded(opts: { forPromptReady?: boolean } = {}): void {
+  const needsWork = hasPendingInputForFlush() || (opts.forPromptReady === true && !isPromptReady);
+  if (lastInitConfig?.cliId !== 'traex'
+    || !backendScreenEvidenceIsAuthoritativeForMutation()
+    || awaitingFirstPrompt !== false
+    || !traexFirstInputAdmissionPending
+    || closeRequested === true
+    || cliRestartInProgress
+    || isFlushing
+    || !backend
+    || !renderer
+    || !isTraexNativeViewportBackend(backend)
+    || !needsWork) {
+    return;
+  }
+  const observedBackend = backend;
+  const adapter = cliAdapter;
+  const detector = idleDetector;
+  const generation = cliSpawnGeneration;
+  const lifetime = currentTraexCliLifetimeNonce();
+  const stillNeeded = (): boolean => awaitingFirstPrompt === false
+    && traexFirstInputAdmissionPending
+    && closeRequested !== true
+    && backend === observedBackend
+    && cliSpawnGeneration === generation
+    && currentTraexCliLifetimeNonce() === lifetime
+    && !(cliRestartInProgress && !replacementSpawnInProgress)
+    && (hasPendingInputForFlush() || !isPromptReady);
+  const settle = traexWebInputSettleStatus();
+  traexNativeViewportRefresh.trigger({
+    stillNeeded,
+    initialDelayMs: settle.settled ? 0 : settle.remainingMs + 1,
+    retryDelayMs: TRAEX_FIRST_PROMPT_SLOW_POLL_MS,
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`${cliName()} first-input native viewport refresh failed: ${msg}`);
+    },
+    run: async (isCurrentRun) => {
+      const active = (): boolean => isCurrentRun() && stillNeeded();
+      if (!active() || !renderer || inflightInputs.hasUnacked()) return false;
+      if (!traexWebInputSettleStatus().settled) return false;
+      const recovered = await probeAndPublishTraexNativeViewport({
+        observedBackend,
+        adapter,
+        generation,
+        lifetime,
+        observedRenderer: renderer,
+        requireQuietWindow: false,
+        stillActive: active,
+      });
+      if (!recovered) return false;
+      log(`${cliName()} first-input composer refreshed from native ${effectiveBackendType} viewport`);
+      return true;
+    },
+    onAdmitted: () => {
+      if (!isPromptReady) {
+        const seeded = detector?.seedReadyEvidence?.(true);
+        if ((seeded === false || !isPromptReady) && typeof flushPending === 'function') {
+          void flushPending();
+        }
+        return;
+      }
+      if (typeof flushPending === 'function') void flushPending();
+    },
+  });
 }
 
 /** Whether the current rendered viewport must veto a traex first-prompt ready
@@ -18788,7 +19316,11 @@ function traexFirstPromptViewportRejects(): boolean {
   const predicate = cliAdapter?.startupReadyFromHistory;
   if (!predicate) return false;
   let screen = '';
-  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  try {
+    screen = typeof readTraexStartupViewportScreen === 'function'
+      ? readTraexStartupViewportScreen(true)
+      : (renderer?.rawSnapshot({ preserveFormatting: true }) ?? '');
+  } catch { return false; }
   return !!screen && !predicate(screen);
 }
 
@@ -18798,7 +19330,11 @@ function traexFirstPromptViewportRejects(): boolean {
 function traexIdleReportScreenShowsComposer(): boolean {
   if (hookReviewInputHold || heldStuckPage()) return false;
   let screen = '';
-  try { screen = renderer?.rawSnapshot() ?? ''; } catch { return false; }
+  try {
+    screen = typeof readTraexStartupViewportScreen === 'function'
+      ? readTraexStartupViewportScreen(false)
+      : (renderer?.rawSnapshot() ?? '');
+  } catch { return false; }
   return startupIdleReportScreenAdmits(screen, cliAdapter?.readyPattern);
 }
 
@@ -18807,7 +19343,11 @@ function screenShowsReadyPattern(): boolean {
   const pattern = cliAdapter?.readyPattern;
   if (!pattern) return false;
   let screen = '';
-  try { screen = renderer?.rawSnapshot() ?? ''; } catch { return false; }
+  try {
+    screen = lastInitConfig?.cliId === 'traex' && typeof readTraexStartupViewportScreen === 'function'
+      ? readTraexStartupViewportScreen(false)
+      : (renderer?.rawSnapshot() ?? '');
+  } catch { return false; }
   return !!screen && pattern.test(screen);
 }
 
@@ -19126,7 +19666,11 @@ function beginCliWriteCycle(): void {
   // terminal still settles it from the per-read drain.
   idleTranscriptSettle?.cancel();
   beginRuntimeWriteCycle({
-    setPromptReady: ready => { if (ready) isPromptReady = true; else revokePromptReadiness(); },
+    // Preserve TraeX startup native viewport evidence until the actual literal
+    // write boundary (runStartupCommands / deliverRawInput / writeRename /
+    // prepareNormalWrite) so firstWriteMayProceed and pre-dequeue checks can
+    // still inspect the verified startup screen.
+    setPromptReady: ready => { if (ready) isPromptReady = true; else revokePromptReadiness({ preserveTraexStartupEvidence: true }); },
     resetIdleDetector: () => { idleDetector?.reset({ inputCycle: true }); },
   });
   // Input is about to reach the CLI: the main agent's turn starts here, before
@@ -23708,7 +24252,10 @@ function handlePtyDataChunk(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
   const colorQueryOnly = lastInitConfig?.cliId === 'traex' && isTerminalColorQueryOnly(data);
-  if (!colorQueryOnly) backendScreenRevision += 1;
+  if (!colorQueryOnly) {
+    backendScreenRevision += 1;
+    if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
+  }
   lastPtyActivityAtMs = Date.now();
   maybeReportDeferredTopicMaterialization(data);
   maybeCaptureKiroSessionId(data);
@@ -23819,6 +24366,7 @@ function handlePtyDataChunk(data: string): void {
  */
 async function onBackendScreenResync(snapshot: string): Promise<void> {
   const revision = ++backendScreenRevision;
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   const observedScreenBackend = backend;
   const now = Date.now();
   lastPtyActivityAtMs = now;
@@ -24454,6 +25002,9 @@ function markPromptReady(): void {
       log('Holding TraeX first input until native thread initialization is ready');
     }
     idleDetector?.reset();
+    if (typeof scheduleTraexNativeViewportRefreshIfNeeded === 'function') {
+      scheduleTraexNativeViewportRefreshIfNeeded({ forPromptReady: true });
+    }
     return;
   }
   // TraeX 0.211 cursor-paints its composer: the byte-stream readyPattern
@@ -24746,6 +25297,7 @@ function markPromptReady(): void {
   maybeEmitWorkflowTranscriptOutput();
   if (awaitingFirstPrompt) {
     awaitingFirstPrompt = false;
+    if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
     awaitingPostSessionStartPromptEvidence = false;
     clearPostHookEvidenceFallback();
     renderer?.markNewTurn();  // exclude history replay from streaming card
@@ -26101,6 +26653,7 @@ async function flushPending(): Promise<void> {
   const firstAdmissionWebInputGeneration = webTerminalInputGeneration;
   const firstAdmissionBackend = backend;
   const firstAdmissionGeneration = cliSpawnGeneration;
+  let retriggerTraexNativeViewportRefresh = false;
   if (nativeSessionForkPending()) return;
   // Codex model-migration picker guard (startup only): the single admission
   // point runs before every other guard, so they are all evaluated after its
@@ -26111,7 +26664,12 @@ async function flushPending(): Promise<void> {
   if (idleDetector?.isStartupPending()) return;
   // Type-ahead arrivals bypass markPromptReady; keep the same first-input
   // evidence fence before any literal write or dequeue.
-  if (traexNativeStartupInputIsPending()) return;
+  if (traexNativeStartupInputIsPending()) {
+    if (typeof scheduleTraexNativeViewportRefreshIfNeeded === 'function') {
+      scheduleTraexNativeViewportRefreshIfNeeded();
+    }
+    return;
+  }
   // destroySession() may be asynchronous while `backend` still references the
   // old CLI. Never let a new flush (including one triggered by the old
   // backend's idle/task-done callback) write across that restart boundary.
@@ -26386,6 +26944,7 @@ async function flushPending(): Promise<void> {
     if (rawInputReady && pendingRawInputs.length > 0 && backend) {
       const raw = freshnessInputQueue.takeRaw();
       if (!raw) return;
+      if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
       await deliverRawInput(raw);
       return;
     }
@@ -26416,6 +26975,7 @@ async function flushPending(): Promise<void> {
               getCliSessionId: sessionRenameNativeSessionIdNow,
             });
           } catch { sessionRenameRecorded = undefined; }
+          if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
           await sendRawCommandLineWithRecoveryFence(renameBackend, renameCommand);
           if (cliSpawnGeneration !== renameGeneration || backend !== renameBackend || cliRestartInProgress) {
             throw new Error('rename backend generation changed before Enter settlement');
@@ -26608,9 +27168,15 @@ async function flushPending(): Promise<void> {
         if (held === undefined || pendingMessages[0] !== head) continue;
       }
       // Opening/model/question checks above can all await. A changed Web
-      // epoch revokes this first-write lease before dequeue, never after paste.
+      // epoch or screen invalidation revokes this first-write lease before
+      // dequeue, never after paste.
       if (guardTraexFirstAdmission && webTerminalInputGeneration !== firstAdmissionWebInputGeneration) {
         holdFirstAdmissionAfterWebInput();
+        break;
+      }
+      if (guardTraexFirstAdmission && traexNativeStartupInputIsPending()) {
+        keepPromptReadyAfterHold();
+        retriggerTraexNativeViewportRefresh = true;
         break;
       }
       if (webTerminalInputWireDirty()) break;
@@ -26698,6 +27264,7 @@ async function flushPending(): Promise<void> {
           throw new SubmissionWriteError('Web terminal wire is dirty before the native write', 'web_terminal_input_wire_dirty', false);
         }
         normalWritePrepared = true;
+        if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
         syncQueuedTurnsFromMarkerDisk();
 
         let currentTurnFinalDelivered = Boolean(
@@ -27427,7 +27994,15 @@ async function flushPending(): Promise<void> {
       }
       if (guardTraexFirstAdmission && result?.submitted === true) {
         traexFirstSubmitConfirmed = true;
-        if (webTerminalInputGeneration === firstAdmissionWebInputGeneration) traexFirstInputAdmissionPending = false;
+        if (webTerminalInputGeneration === firstAdmissionWebInputGeneration) {
+          traexFirstInputAdmissionPending = false;
+          if (typeof traexStartupWebRecheck !== 'undefined' && traexStartupWebRecheck) {
+            clearTimeout(traexStartupWebRecheck);
+            traexStartupWebRecheck = undefined;
+          }
+          if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
+          if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+        }
       }
       if (isCodexAppCliId(lastInitConfig?.cliId)
         && item.turnId
@@ -27634,6 +28209,10 @@ async function flushPending(): Promise<void> {
       // Keep that optimization only within one authenticated principal: a
       // different sender must wait for this turn's terminal boundary.
       if (activeTurnBlocks(pendingMessages[0] ?? {})) break;
+      // An unconfirmed first write (e.g. failureReason without quarantine) must
+      // not let a second queued message bypass first-input admission in the same
+      // batch; re-enter admission fresh on the next flush.
+      if (guardTraexFirstAdmission && !traexFirstSubmitConfirmed) break;
       // Fence-enabled adapters can batch healthy type-ahead only after each
       // write is confirmed. Terminal conflicts and unknown receipts are
       // checked again before the next item, independently from readiness.
@@ -27646,6 +28225,11 @@ async function flushPending(): Promise<void> {
   } finally {
     if (cliSubmissionInFlight) settleSubmission(cliSubmissionInFlight.item);
     isFlushing = false;
+    if ((retriggerTraexNativeViewportRefresh || (traexFirstInputAdmissionPending && hasPendingInputForFlush()))
+      && typeof scheduleTraexNativeViewportRefreshIfNeeded === 'function'
+      && (typeof traexNativeViewportEvidence === 'undefined' || !activeTraexNativeViewportEvidence())) {
+      scheduleTraexNativeViewportRefreshIfNeeded();
+    }
     // Dequeued and refused before its write edge (execution reconciliation).
     settleFailedTurnRewindOffQueue('refused before it reached the CLI', false);
     // A fast provider final can restore readiness while the flush mutex is
@@ -27907,6 +28491,7 @@ function startScreenUpdates(): void {
   // would wrap and the screenshot would show duplicated / stair-stepped
   // content (the live failure that prompted this fix).
   renderer = new TerminalRenderer(renderCols, renderRows);
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   let lastSentStatus: string | undefined;
   let lastSentExpiredQuotaKey: string | undefined;
   let lastSentRecovery: UsageAwareScreen['usageLimitRecovery'];
@@ -28239,6 +28824,7 @@ function startScreenUpdates(): void {
 function stopScreenUpdates(): void {
   if (screenUpdateTimer) { clearInterval(screenUpdateTimer); screenUpdateTimer = null; }
   if (renderer) { renderer.dispose(); renderer = null; }
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   lastAnalyzerSnapshot = '';
   antigravityFooterBackgroundTasks = 0;
 }
@@ -29319,6 +29905,9 @@ async function spawnCliBody(
   traexStartupRendererDrain = undefined;
   traexFirstSubmitConfirmed = false;
   if (traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
+  if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
+  if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   queuedTurnAdvanceConsumedForPrompt = undefined;
   retiredTurnIds.clear();
   currentCliCredentialIsolated = false;
@@ -29462,7 +30051,10 @@ async function spawnCliBody(
     });
 
     wireHerdrWebTerminalRelays(herdrBe);
-    herdrBe.onPaneGridChange(() => { observedPaneGridRevision++; });
+    herdrBe.onPaneGridChange(() => {
+      observedPaneGridRevision++;
+      if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
+    });
     seedBackendScreen('herdr adopt', herdrBe);
 
     await setupAdoptTranscriptBridges(cfg);
@@ -35876,6 +36468,8 @@ async function spawnCliBody(
   const hcBackend = backend instanceof HcBackend ? backend : null;
   hcBackend?.onPaneSizeChange(bindSessionRuntimeCallback(() => {
     if (observedBackend !== backend) return;
+    observedPaneGridRevision++;
+    if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
     broadcastOwnedPaneReadOnlyFollowerGrid();
   }, true));
   backend.onAccessUrl?.(bindSessionRuntimeCallback((url) => {
@@ -36126,6 +36720,10 @@ async function spawnCliBody(
     });
     if (codexAutoUpgrade) {
       backend = null;
+      if (typeof traexStartupWebRecheck !== 'undefined' && traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
+      if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
+      if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+      if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
       revokePromptReadiness();
       if (codexAutoUpgrade.stage === 'restoring') {
         codexAutoUpgrade.reject?.(new Error(`Replacement Codex exited before readiness (${code ?? signal})`));
@@ -36299,6 +36897,10 @@ async function spawnCliBody(
       settleFailedTurnRewindOffQueue('dropped on a CLI exit', true);
     }
     backend = null;
+    if (typeof traexStartupWebRecheck !== 'undefined' && traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
+    if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
+    if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+    if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
     stopScreenUpdates();
     stopStuckDetector();
     stopSpawnArgvTurnStartFailOpen();
@@ -36500,6 +37102,7 @@ async function spawnCliBody(
     }
     const wasAwaitingPostHookPrompt = awaitingPostSessionStartPromptEvidence;
     awaitingFirstPrompt = false;
+    if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
     awaitingPostSessionStartPromptEvidence = false;
     clearPostHookEvidenceFallback();
     renderer?.markNewTurn();
@@ -36704,6 +37307,9 @@ function killCli(opts: {
   traexStartupRendererDrain = undefined;
   traexFirstSubmitConfirmed = false;
   if (traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
+  if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
+  if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   stopReattachIdleProbe();
   stopBusyPatternIdleProbe();
   cancelTurnTerminalReadyRecovery();
@@ -36900,6 +37506,10 @@ async function restartCliProcess(
   // remain queued until a replacement backend has been installed.
   cliRestartInProgress = true;
   replacementSpawnInProgress = false;
+  if (typeof traexStartupWebRecheck !== 'undefined' && traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
+  if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
+  if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   restartWindowLaunch = undefined;
   rawInputRestartGate = true;
   // The Node worker stays alive through this restart, so the daemon will see
@@ -37644,6 +38254,8 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               } else {
                 cp.resize(msg.cols, msg.rows);
               }
+              observedPaneGridRevision++;
+              if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               await inputController.accept(msg.data, { forceUser: msg.forceUser });
             }
@@ -37821,6 +38433,8 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!result.backend && !readOnlyFollowsBackendGrid) {
                 backend?.resize(msg.cols, msg.rows);
                 if (backend) webResizedBackendGrid = { backend, cols: msg.cols, rows: msg.rows };
+                observedPaneGridRevision++;
+                if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
                 broadcastOwnedPaneReadOnlyFollowerGrid();
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
@@ -43692,13 +44306,17 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'term_action': {
-      if (isCriticalInterruptKey(msg.key)) cliInterruptGeneration++;
+      if (isCriticalInterruptKey(msg.key)) {
+        cliInterruptGeneration++;
+        if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
+      }
       await handleTermAction(msg.key);
       break;
     }
 
     case 'interrupt_turn': {
       cliInterruptGeneration++;
+      if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
       await handleExactTurnInterrupt(msg.requestId, msg.turnId);
       break;
     }
@@ -43814,6 +44432,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
       cancelRetiredRuntimeExit();
       closeRequested = true;
+      if (typeof traexStartupWebRecheck !== 'undefined' && traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
+      if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
+      if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+      if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
       const cleanupRequest = msg.codexCleanupRelease;
       let nativeSnapshot: ReturnType<typeof captureCodexNativeProcesses> | undefined;
       const cleanupIdentityMatches = !!cleanupRequest && cleanupRequest.sessionId === sessionId
@@ -44043,6 +44665,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       lastAbortedCloseRequestId = null;
       backend?.commitDestroySession?.();
       closeRequested = true;
+      if (typeof traexStartupWebRecheck !== 'undefined' && traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
+      if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
+      if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+      if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
       // Flush the fence-resolving ACK before the synchronous teardown +
       // process.exit(0); see the local-close case for the node-pty exit-wedge
       // rationale (a queued send() would be dropped and strand `/close` behind
@@ -44151,6 +44777,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       } catch { /* best-effort */ }
       stopOwnedSessionScope('suspend');
       backend = null;
+      if (typeof traexStartupWebRecheck !== 'undefined' && traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
+      if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
+      if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+      if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
       revokePromptReadiness();
       // Suspend INTENDS to resume later: keep the per-session sandbox tree (the
       // outbox + pre-created deny-mask mountpoints) intact across the suspension
@@ -44269,6 +44899,10 @@ grokRuntimePollTimer.unref?.();
 
 function cleanup(): void {
   clearDeferredSessionReady();
+  if (typeof traexStartupWebRecheck !== 'undefined' && traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
+  if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
+  if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   clearInterval(claudeEffortPollTimer);
   clearInterval(grokRuntimePollTimer);
   workerFinalOutputHandoff?.stop();
@@ -44327,6 +44961,10 @@ async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Pr
   cancelPendingCliRestart = undefined;
   cancelRestart?.();
   if (tmuxRestartTimer) { clearTimeout(tmuxRestartTimer); tmuxRestartTimer = null; }
+  if (typeof traexStartupWebRecheck !== 'undefined' && traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
+  if (typeof traexFirstPromptReadinessPoller !== 'undefined') traexFirstPromptReadinessPoller.stop();
+  if (typeof traexNativeViewportRefresh !== 'undefined') traexNativeViewportRefresh.stop();
+  if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);
