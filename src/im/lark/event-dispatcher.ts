@@ -3700,8 +3700,10 @@ export interface RoutingContext {
    *  service is idempotent, but only via its async in-flight/titled guards, so
    *  a duplicate call still burns a bounded retry round. */
   sessionGroupTitleScheduled?: boolean;
-  /** Visible reply/quote target when it differs from the Session identity in
-   * `anchor`. Used by session-group birth and forward-followup pairing.
+  /** Quote/turn anchor when it differs from the Session identity in `anchor`:
+   * quoteTargetId, turn ids and ack reactions point at this message, while
+   * visible thread replies still land under `anchor` (session.rootMessageId).
+   * Used by session-group birth and forward-followup pairing.
    * `messageId` stays the ORIGINAL inbound message for resource downloads and
    * merge-forward expansion; their keys belong to that source message. */
   replyAnchorMessageId?: string;
@@ -7317,10 +7319,10 @@ export function createLarkEventDispatcherRuntime(
         const autoStartRootId = pairedForwardSeed.payload.autoStartTopicRootId;
         pairedAutoStartKey = autoStartRootId ? autoStartTopicKey(larkAppId, autoStartRootId) : undefined;
         pairedAutoStartEntry = pairedAutoStartKey ? autoStartTopicStarts.get(pairedAutoStartKey) : undefined;
-        // The Session remains anchored at the original Lark root so all later
-        // replies keep resolving to it. Only the visible first-reply target moves
-        // to the clarification (replyAnchorMessageId below), away from the
-        // forwarding bubble itself.
+        // The Session remains anchored at the original Lark root: later replies
+        // keep resolving to it and visible thread replies stay under that root
+        // (session.rootMessageId). replyAnchorMessageId below only points the
+        // quote target / turn id / ack reaction at the clarification message.
         routing.scope = 'thread';
         routing.anchor = pairedForwardSeed.payload.ctx.anchor;
         routingSource = 'topic-chat';
