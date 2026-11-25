@@ -15,7 +15,7 @@ It fits groups where "lots of people ask, at any time, about the same project": 
 | Who can @ the bot and chat | Only the owner, admins (`allowedUsers`) and granted users | **Everyone** in the group, including other bots in it |
 | Message quota | Guests admitted by grant cards are quota-limited | **Unlimited** |
 | Where new topics start | Repo picker card, or the bot's default directory | Straight into the bound directory |
-| Who can change session state (`/cd`, `/restart`, `/close`, card buttons) | Owner / admins | Still only owner / admins |
+| Who can change session state (`/cd`, `/restart`, `/close`, card buttons) | Owner / admins; whoever opened a topic can close it | Same on both sides |
 
 Bindings are **per bot**: in a group with several bots, only the bound one opens up to the group.
 
@@ -90,7 +90,7 @@ The bot card shows "N chats bound now · M chats auto-bound before". "Auto-bound
 ## How permissions are split
 
 - **Chat**: everyone in the group can ask questions, check logs and read code, with no quota. Users on the block list (`blockedUsers`) are still blocked.
-- **Management**: changing directory, restarting, closing the session and clicking streaming-card buttons remain owner / admin only, so group members can't accidentally mess up the session.
+- **Management**: changing directory, restarting and clicking streaming-card buttons remain owner / admin only, so group members can't accidentally mess up the session. Closing is the exception: whoever opened a topic can tap "❌ Close Session" to wrap it up (the `/close` command still needs operate rights).
 - **Opening a few low-risk commands to group members**: add them under "canTalk-allowed daemon commands" in Bot Config (`canTalkDaemonCommands` in `bots.json`), e.g. `/status /help`. Commands that change state, like `/cd` and `/restart`, are best left closed.
 
 > An on-call binding **does not restrict file access**. To keep group members away from secrets and other repositories, also enable [File Sandbox](/en/sandbox) allowlist isolation (the working directory stays writable and changes land on the host). To keep changes off your main branch, open the topic in a separate worktree with `/tw`.
