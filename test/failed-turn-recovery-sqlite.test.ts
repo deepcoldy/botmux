@@ -133,6 +133,47 @@ describe('HTTP recovery with real SQLite persistence', () => {
     if (mode === 'fresh') expect(store.getSessionFresh(id)?.status).toBe('closed');
   });
 
+  it('does not let an unrelated terminal cancel the current limited record retry, and persists its proof boundary', () => {
+    vi.useFakeTimers();
+    try {
+      const id = ds.session.sessionId;
+      ds.workerGeneration = 7;
+      ds.session.workerGeneration = 7;
+      ds.session.lastFailedTurn = undefined;
+      store.updateSession(ds.session);
+      ds.lastCliInputTurnId = 'om_current';
+      ds.lastUserPrompt = 'current task';
+      ds.lastCliInput = 'wrapped current task';
+      ds.activeInteractiveTurn = { turnId: 'om_current', caller };
+      const antigravityWriteBoundary = { sampledTranscriptPath: '/tmp/current.jsonl', minByteOffset: 123 };
+      ds.usageLimit = {
+        limited: true, kind: 'usage', retryAtMs: Date.now() + 60_000,
+        retryLabel: '1m', retryReady: false, source: 'antigravity-native-log',
+        nativeEpisodeKey: 'log:current', directFailure: true, antigravityWriteBoundary,
+      };
+
+      store.__testOnly_setBeforeRowPersist(() => { throw new Error('sqlite busy'); });
+      expect(() => recordLimitedFailedTurn(ds, 'om_current')).toThrow('sqlite busy');
+      expect(store.getSessionFresh(id)?.lastFailedTurn).toBeUndefined();
+      store.__testOnly_setBeforeRowPersist(undefined);
+
+      recordFailedTurnTerminal(ds, { turnId: 'om_unrelated_old', status: 'completed' }, {
+        workerGeneration: 7, caller, silent: false,
+      });
+      vi.advanceTimersByTime(600);
+
+      expect(ds.session.lastFailedTurn).toMatchObject({
+        turnId: 'om_current', directFailure: true, antigravityWriteBoundary,
+      });
+      expect(store.getSessionFresh(id)?.lastFailedTurn).toMatchObject({
+        turnId: 'om_current', directFailure: true, antigravityWriteBoundary,
+      });
+    } finally {
+      store.__testOnly_setBeforeRowPersist(undefined);
+      vi.useRealTimers();
+    }
+  });
+
   it('aborts cleanup retry on new same-turn ds.usageLimit while permitting only current-generation completed terminal through sticky limit', async () => {
     const { clearLimitedFailedTurn, recordFailedTurnTerminal } = await import('../src/core/failed-turn-recovery.js');
     vi.useFakeTimers();

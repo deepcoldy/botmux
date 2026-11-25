@@ -17,7 +17,11 @@ afterEach(() => {
 });
 
 let scenarioSeq = 0;
-async function setupRotationScenario(input: { directFailure: boolean; accountCount?: number }) {
+async function setupRotationScenario(input: {
+  directFailure: boolean;
+  accountCount?: number;
+  boundary?: 'zero' | 'eof' | 'missing';
+}) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-agy-worker-rotation-'));
   const previousHome = process.env.HOME;
   const previousDataDir = process.env.SESSION_DATA_DIR;
@@ -84,6 +88,7 @@ async function setupRotationScenario(input: { directFailure: boolean; accountCou
   let presenceFd: number | undefined;
   const fullTranscriptPath = join(logsDir, 'transcript_full.jsonl');
   const compactTranscriptPath = join(logsDir, 'transcript.jsonl');
+  let writeBoundary: { sampledTranscriptPath: string; minByteOffset: number } | undefined;
   if (input.directFailure) {
     presenceFd = openSync(presenceLockPath, 'r');
     const cleanInputLine = JSON.stringify({
@@ -95,6 +100,14 @@ async function setupRotationScenario(input: { directFailure: boolean; accountCou
     }) + '\n';
     writeFileSync(fullTranscriptPath, cleanInputLine);
     writeFileSync(compactTranscriptPath, cleanInputLine);
+    if (input.boundary !== 'missing') {
+      writeBoundary = {
+        sampledTranscriptPath: fullTranscriptPath,
+        minByteOffset: input.boundary === 'eof' ? Buffer.byteLength(cleanInputLine) : 0,
+      };
+      session.lastFailedTurn!.antigravityWriteBoundary = writeBoundary;
+      sessionStore.updateSession(session);
+    }
   }
   const procStart = readProcessStartIdentity(process.pid);
   const ds = {
@@ -158,8 +171,16 @@ async function setupRotationScenario(input: { directFailure: boolean; accountCou
   return {
     ds, worker, sent, replies, flush, nowMs, home, root,
     directFailure: input.directFailure,
+    writeBoundary,
     conversationId, fullTranscriptPath, compactTranscriptPath, presenceLockPath,
   };
+}
+
+function proofFields(h: Awaited<ReturnType<typeof setupRotationScenario>>) {
+  return h.directFailure ? {
+    directFailure: true as const,
+    ...(h.writeBoundary ? { antigravityWriteBoundary: h.writeBoundary } : {}),
+  } : {};
 }
 
 async function emitQuotaAndStart(
@@ -177,7 +198,7 @@ async function emitQuotaAndStart(
     usageLimit: {
       limited: true, kind: 'usage', retryAtMs: h.nowMs + retryOffsetMs,
       retryLabel: '1m', retryReady: false, source: 'antigravity-error-composer',
-      ...(h.directFailure ? { directFailure: true as const } : {}),
+      ...proofFields(h),
     },
   });
   await h.flush();
@@ -192,6 +213,17 @@ async function emitQuotaAndStart(
 describe('Antigravity worker-pool replay safety', () => {
   it('does not replay an agy turn without a durable no-progress proof', async () => {
     const h = await setupRotationScenario({ directFailure: false });
+    const restart = await emitQuotaAndStart(h);
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+
+    expect(h.sent.map(msg => msg.type)).toEqual(['restart']);
+    expect(h.ds.session.antigravityAccountId).toBe('acc2');
+  });
+
+  it.each(['missing', 'eof'] as const)('fails closed at daemon settlement when the durable proof boundary is %s', async boundary => {
+    const h = await setupRotationScenario({ directFailure: true, boundary });
     const restart = await emitQuotaAndStart(h);
     h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart.attemptId });
     h.worker.emit('message', { type: 'restart_result', attemptId: restart.attemptId, status: 'succeeded', category: 'prompt_ready' });
@@ -329,7 +361,8 @@ describe('Antigravity worker-pool replay safety', () => {
     const limitA = {
       limited: true as const, kind: 'usage' as const, retryAtMs: h.nowMs + 3_600_000,
       retryLabel: '1h', retryReady: false, source: 'antigravity-native-log' as const,
-      nativeEpisodeKey: 'log:native-episode-a', directFailure: true as const,
+      nativeEpisodeKey: 'log:native-episode-a',
+      ...proofFields(h),
     };
     h.worker.emit('message', { type: 'screen_update', content: 'quota A', status: 'limited', turnId: 'turn-1', usageLimit: limitA });
     await h.flush();
@@ -341,7 +374,8 @@ describe('Antigravity worker-pool replay safety', () => {
     const limitB = {
       limited: true as const, kind: 'usage' as const, retryAtMs: h.nowMs + 3_600_000,
       retryLabel: '1h', retryReady: false, source: 'antigravity-native-log' as const,
-      nativeEpisodeKey: 'log:native-episode-b', directFailure: true as const,
+      nativeEpisodeKey: 'log:native-episode-b',
+      ...proofFields(h),
     };
     h.worker.emit('message', { type: 'screen_update', content: 'quota B', status: 'limited', turnId: 'turn-1', usageLimit: limitB });
     await h.flush();
@@ -686,7 +720,7 @@ describe('Antigravity worker-pool replay safety', () => {
     // Frame 2 brings late directFailure proof BEFORE restart settles!
     h.worker.emit('message', {
       type: 'screen_update', content: 'quota', status: 'limited', turnId: 'turn-1',
-      usageLimit: { ...epNoProof, directFailure: true },
+      usageLimit: { ...epNoProof, ...proofFields(h) },
     });
     await h.flush();
     expect(h.ds.session.lastFailedTurn?.directFailure).toBe(true);
@@ -724,7 +758,8 @@ describe('Antigravity worker-pool replay safety', () => {
     const limitA = {
       limited: true as const, kind: 'usage' as const, retryAtMs: h.nowMs + 3_600_000,
       retryLabel: '1h', retryReady: false, source: 'antigravity-native-log' as const,
-      nativeEpisodeKey: 'log:live-ep-A', directFailure: true as const,
+      nativeEpisodeKey: 'log:live-ep-A',
+      ...proofFields(h),
     };
     h.worker.emit('message', { type: 'screen_update', content: 'quota A', status: 'limited', turnId: 'turn-1', usageLimit: limitA });
     await h.flush();
@@ -789,6 +824,7 @@ describe('Antigravity worker-pool replay safety', () => {
       turnId: 'turn-1', originalTurnId: 'turn-1', cliInput: 'do work', userPrompt: 'do work',
       failedAt: new Date().toISOString(), status: 'failed', retryCount: 0,
       limitedSnapshot: true, directFailure: true,
+      ...(h.writeBoundary ? { antigravityWriteBoundary: h.writeBoundary } : {}),
       trustedCaller: { requestUserOpenId: 'ou_owner', requestLarkAppId: h.ds.larkAppId, senderType: 'user' },
     };
 
@@ -796,7 +832,8 @@ describe('Antigravity worker-pool replay safety', () => {
     const ep1 = {
       limited: true as const, kind: 'usage' as const, retryAtMs: h.nowMs + 3_600_000,
       retryLabel: '1h', retryReady: false, source: 'antigravity-native-log' as const,
-      nativeEpisodeKey: 'log:hop-1', directFailure: true as const,
+      nativeEpisodeKey: 'log:hop-1',
+      ...proofFields(h),
     };
     h.worker.emit('message', { type: 'screen_update', content: 'quota 1', status: 'limited', turnId: 'turn-1', usageLimit: ep1 });
     await h.flush();
@@ -815,7 +852,8 @@ describe('Antigravity worker-pool replay safety', () => {
     const ep2 = {
       limited: true as const, kind: 'usage' as const, retryAtMs: h.nowMs + 3_600_000,
       retryLabel: '1h', retryReady: false, source: 'antigravity-native-log' as const,
-      nativeEpisodeKey: 'log:hop-2', directFailure: true as const,
+      nativeEpisodeKey: 'log:hop-2',
+      ...proofFields(h),
     };
     h.worker.emit('message', { type: 'screen_update', content: 'quota 2', status: 'limited', turnId: replay1.turnId, usageLimit: ep2 });
     await h.flush();

@@ -154,7 +154,12 @@ import { cliModelMayKeepReasoningEffort, cliModelSupportsReasoningEffort, isBack
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
-import { markRetryAttempt, refundRetryAttempt } from '../services/failed-turn-retry.js';
+import {
+  failedTurnDirectFailureProofMatches,
+  markRetryAttempt,
+  refundRetryAttempt,
+  syncFailedTurnDirectFailureProof,
+} from '../services/failed-turn-retry.js';
 import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
 import type { QuotaFallbackChainTrigger } from './quota-fallback-chain-switch.js';
 import { TRAEX_QUOTA_ERROR_CODE } from '../services/traex-quota.js';
@@ -1134,6 +1139,7 @@ import {
   isSameUsageLimitEpisode,
   isTransientRateLimit,
   reconcileUsageLimitState,
+  sameAntigravityTranscriptWriteBoundary,
   sameUsageLimit,
   usageLimitStateKey,
   type CliUsageLimitState,
@@ -5197,6 +5203,7 @@ function usageLimitPersistenceDigest(ds: DaemonSession): string {
   return JSON.stringify([
     ds.usageLimit ? usageLimitStateKey(ds.usageLimit) : null,
     ds.usageLimit?.directFailure === true,
+    ds.usageLimit?.antigravityWriteBoundary ?? null,
     ds.usageLimit?.source ?? null,
     ds.antigravityQuotaCursor ?? null,
     ds.antigravityQuotaHistory?.length ?? 0,
@@ -5251,13 +5258,12 @@ function updateUsageLimitState(
   // Check if an unclaimed provisional `lastFailedTurn` on the same turn needs
   // its `directFailure` proof synced atomically with `ds.usageLimit`.
   const prevFailed = ds.session.lastFailedTurn;
-  const desiredDirectFailure = usageLimit.directFailure === true ? true : undefined;
   const shouldSyncProvisionalProof = Boolean(
     opts?.provenTurn
     && prevFailed?.turnId === opts.provenTurn
     && prevFailed.limitedSnapshot === true
     && !prevFailed.recovery
-    && prevFailed.directFailure !== desiredDirectFailure,
+    && !failedTurnDirectFailureProofMatches(prevFailed, usageLimit),
   );
 
   // Screen updates repeat the same limit every tick while a session sits
@@ -5279,10 +5285,7 @@ function updateUsageLimitState(
   if (opts?.turnScope !== undefined) ds.usageLimitTurnScope = opts.turnScope;
   rememberSessionAntigravityQuota(ds, usageLimit);
   if (shouldSyncProvisionalProof && prevFailed) {
-    const updatedFailed = { ...prevFailed };
-    if (desiredDirectFailure) updatedFailed.directFailure = true;
-    else delete updatedFailed.directFailure;
-    ds.session.lastFailedTurn = updatedFailed;
+    ds.session.lastFailedTurn = syncFailedTurnDirectFailureProof(prevFailed, usageLimit);
   }
   ds.usageLimitPersistPending = true;
   try {
@@ -5344,7 +5347,6 @@ function retryUsageLimitPersistence(
       usageLimitPersistRetries.delete(ds);
       if (!owns() || usageLimitPersistenceDigest(ds) !== digest) return;
       const prevFailed = ds.session.lastFailedTurn;
-      const desiredDirectFailure = ds.usageLimit?.directFailure === true ? true : undefined;
       const shouldSyncProvisionalProof = Boolean(
         entry.provenTurn
         && ds.usageLimit?.limited
@@ -5353,13 +5355,10 @@ function retryUsageLimitPersistence(
         && prevFailed?.turnId === entry.provenTurn
         && prevFailed.limitedSnapshot === true
         && !prevFailed.recovery
-        && prevFailed.directFailure !== desiredDirectFailure,
+        && !failedTurnDirectFailureProofMatches(prevFailed, ds.usageLimit!),
       );
       if (shouldSyncProvisionalProof && prevFailed) {
-        const updatedFailed = { ...prevFailed };
-        if (desiredDirectFailure) updatedFailed.directFailure = true;
-        else delete updatedFailed.directFailure;
-        ds.session.lastFailedTurn = updatedFailed;
+        ds.session.lastFailedTurn = syncFailedTurnDirectFailureProof(prevFailed, ds.usageLimit!);
       }
       try {
         persistStreamCardState(ds, { forceWrite: shouldSyncProvisionalProof });
@@ -22949,6 +22948,15 @@ function setupWorkerHandlers(
     (!startupState.ready && !workerHasInitialized(ds))
     || (ds.workerReady === false && Boolean(ds.antigravityRotation?.inFlightToken));
 
+  /** Only a genuine account-rotation restart needs the narrow pre-ready native
+   * evidence side door. During an ordinary restore, recovery/expiry must enter
+   * the normal transaction before its sole worker edge is deduplicated. */
+  const shouldUsePreReadyAntigravitySideDoor = (frame: UsageLimitFrameInput): boolean => {
+    if (!isPreReadyOrInFlightRotation()) return false;
+    if (ds.antigravityRotation?.inFlightToken) return true;
+    return !frame.usageLimitRecovery && !frame.expiredAntigravityQuota;
+  };
+
   /** Narrow pre-ready / in-flight-rotation admission gate: accepts ONLY
    *  same-turn confirmed native proof/episode updates so late revocations and
    *  replacement episodes land before settlement, while keeping all negative
@@ -23237,7 +23245,7 @@ function setupWorkerHandlers(
     const notificationKey = triggerEdge.notificationKey;
     const effectiveCliId = sessionCliId(ds, botCfg);
 
-    const currentTranscriptProvesDirectFailure = (cliInput: string): boolean => {
+    const currentTranscriptProvesDirectFailure = (failedTurn: FailedTurnRecord): boolean => {
       // Strictly query the locally attested CLI PID + birth identity (never worker.pid,
       // never falling back to stored cliSessionId on missing/ambiguous/reused PID).
       const liveConversationId = findAttestedAntigravityConversationId(ds.localProcessAttestation);
@@ -23246,7 +23254,9 @@ function setupWorkerHandlers(
       if (storedId && storedId.toLowerCase() !== liveConversationId.toLowerCase()) return false;
       const transcriptPath = resolveAntigravityTranscriptPath(liveConversationId);
       if (!transcriptPath) return false;
-      return antigravityTurnFailedWithoutOutput(transcriptPath, cliInput);
+      return antigravityTurnFailedWithoutOutput(transcriptPath, failedTurn.cliInput, {
+        writeBoundary: failedTurn.antigravityWriteBoundary,
+      });
     };
 
     // Re-evaluated synchronously both at rotation start (for switching notice)
@@ -23264,10 +23274,14 @@ function setupWorkerHandlers(
         || capturedFailedTurn.recovery
         || capturedFailedTurn.retryable === false
         || !capturedFailedTurn.cliInput.trim()
+        || !sameAntigravityTranscriptWriteBoundary(
+          currentLimit.antigravityWriteBoundary,
+          capturedFailedTurn.antigravityWriteBoundary,
+        )
       ) {
         return undefined;
       }
-      if (!currentTranscriptProvesDirectFailure(capturedFailedTurn.cliInput)) return undefined;
+      if (!currentTranscriptProvesDirectFailure(capturedFailedTurn)) return undefined;
       return {
         sourceTurnId: capturedFailedTurn.turnId,
         originalTurnId: capturedFailedTurn.originalTurnId ?? capturedFailedTurn.turnId,
@@ -26093,7 +26107,7 @@ function setupWorkerHandlers(
         // Wait for worker init, independently of Web Terminal availability.
         // ZMX intentionally reports ready with port=0, but its plain-history
         // screenshots and idle/status transitions must keep flowing.
-        if (isPreReadyOrInFlightRotation()) {
+        if (shouldUsePreReadyAntigravitySideDoor(msg)) {
           handlePreReadyAntigravityFrame(msg, screenTurnId);
           break;
         }
@@ -26729,7 +26743,7 @@ function setupWorkerHandlers(
           turnId: frameVerdict.source.turnId,
           dispatchAttempt: frameVerdict.source.dispatchAttempt,
         };
-        if (isPreReadyOrInFlightRotation()) {
+        if (shouldUsePreReadyAntigravitySideDoor(shotFrame)) {
           handlePreReadyAntigravityFrame(shotFrame, shotProvenTurn);
           break;
         }

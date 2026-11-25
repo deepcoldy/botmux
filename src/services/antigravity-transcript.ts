@@ -79,6 +79,7 @@ import { closeSync, constants, existsSync, fstatSync, openSync, readSync, statSy
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import type { CodexBridgeEvent } from './codex-transcript.js';
+import type { AntigravityTranscriptWriteBoundary } from '../utils/cli-usage-limit.js';
 import { beginJsonlDrain, iterateJsonlLines, scanJsonlFromFd, scanJsonlFromOffset } from './jsonl-cursor.js';
 
 const CONVERSATION_ID_RE = /^[A-Za-z0-9._-]+$/;
@@ -1703,37 +1704,113 @@ function pairMatchesLastUserInput(
   return { fullIdx, compactIdx };
 }
 
+type TranscriptProofTestHooks = Pick<
+  ReadPairedSnapshotsOptions,
+  'onAfterReadForTest' | 'onAfterFirstSiblingForTest'
+>;
+
+interface PairedCurrentUserInputProof {
+  readonly full: ParsedTranscriptSnapshot;
+  readonly compact: ParsedTranscriptSnapshot;
+  readonly matched: { fullIdx: number; compactIdx: number };
+}
+
+/** Shared fail-closed prefix for no-output and answered proofs. The last
+ * USER_INPUT must belong to THIS write, not an older identical-text turn. */
+function readPairedCurrentUserInput(
+  transcriptPath: string,
+  writtenInput: string,
+  boundary: AntigravityTranscriptWriteBoundary | undefined,
+  testHooks?: TranscriptProofTestHooks,
+): PairedCurrentUserInputProof | undefined {
+  if (!transcriptPath || !writtenInput || !boundary
+    || !Number.isSafeInteger(boundary.minByteOffset) || boundary.minByteOffset < 0) {
+    return undefined;
+  }
+  const skipPriorMatches = boundary.skipPriorMatches ?? 0;
+  if (!Number.isSafeInteger(skipPriorMatches) || skipPriorMatches < 0) return undefined;
+
+  const base = basename(transcriptPath);
+  const isNativePair = base === COMPACT_TRANSCRIPT_NAME || base === FULL_TRANSCRIPT_NAME;
+  const needsCrossSiblingWholeFile = isNativePair
+    && boundary.minByteOffset > 0
+    && boundary.sampledTranscriptPath !== undefined;
+
+  const pair = readPairedAntigravitySnapshots(transcriptPath, {
+    initialTailBytes: NO_OUTPUT_INITIAL_TAIL_BYTES,
+    maxTailBytes: needsCrossSiblingWholeFile ? PAIRED_COMPLETION_PROVENANCE_MAX_BYTES : NO_OUTPUT_MAX_TAIL_BYTES,
+    isSufficient: (records, windowStart, snapPath) => {
+      if (needsCrossSiblingWholeFile && windowStart > 0) return false;
+      if (boundary.minByteOffset > 0
+        && (!boundary.sampledTranscriptPath || boundary.sampledTranscriptPath === snapPath)
+        && windowStart > 0
+        && windowStart >= boundary.minByteOffset) {
+        return false;
+      }
+      if (skipPriorMatches > 0 && windowStart > 0) return false;
+      return findLastUserInputIndex(records) >= 0
+        && !(windowStart > 0 && records.some(r => isTaskResultRecord(r.rec)));
+    },
+    ...testHooks,
+  });
+  if (!pair.ok) return undefined;
+
+  const matched = pairMatchesLastUserInput(pair.full, pair.compact, writtenInput);
+  if (!matched) return undefined;
+  const fullMinOffset = mapMinByteOffsetInSnapshots(boundary, pair.full, pair.compact);
+  const compactMinOffset = mapMinByteOffsetInSnapshots(boundary, pair.compact, pair.full);
+  if (fullMinOffset === null || fullMinOffset === undefined
+    || compactMinOffset === null || compactMinOffset === undefined) {
+    return undefined;
+  }
+  if (pair.full.records[matched.fullIdx]!.lineStart < fullMinOffset
+    || pair.compact.records[matched.compactIdx]!.lineStart < compactMinOffset) {
+    return undefined;
+  }
+  if (skipPriorMatches > 0) {
+    if ((pair.full.windowStart > 0 && pair.full.windowStart >= fullMinOffset)
+      || (pair.compact.windowStart > 0 && pair.compact.windowStart >= compactMinOffset)) {
+      return undefined;
+    }
+    const expected = writtenInput.replace(/\r\n?/g, '\n');
+    const fullByStep = buildFullUserInputStepIndex(pair.full);
+    const fullMatches = countMatchingUserInputsFromOffset(pair.full, expected, fullMinOffset, false, undefined);
+    const compactMatches = countMatchingUserInputsFromOffset(pair.compact, expected, compactMinOffset, true, fullByStep);
+    if (fullMatches <= skipPriorMatches || compactMatches <= skipPriorMatches) return undefined;
+  }
+  return { full: pair.full, compact: pair.compact, matched };
+}
+
+export interface AntigravityNoOutputTurnOptions extends TranscriptProofTestHooks {
+  readonly writeBoundary?: AntigravityTranscriptWriteBoundary;
+}
+
 /**
  * Paired no-progress proof for safe Antigravity quota auto-replay.
  *
- * Reads BOTH `transcript_full.jsonl` and `transcript.jsonl` as one stat-bounded
- * stability-verified pair and returns `true` ONLY when strictly the LAST
- * `USER_INPUT` in both siblings matches `writtenInput` (CRLF-normalized) and
- * has zero subsequent records other than `CHECKPOINT` / `TASK_NOTIFICATION`.
+ * Requires the current turn's pre-write boundary and returns true ONLY when the
+ * LAST `USER_INPUT` in both siblings matches `writtenInput` at/after that mapped
+ * boundary and has zero subsequent records other than CHECKPOINT/TASK_NOTIFICATION.
  */
 export function antigravityTurnFailedWithoutOutput(
   transcriptPath: string,
   writtenInput: string,
-  testHooks?: Pick<ReadPairedSnapshotsOptions, 'onAfterReadForTest' | 'onAfterFirstSiblingForTest'>,
+  opts?: AntigravityNoOutputTurnOptions,
 ): boolean {
-  if (!transcriptPath || !writtenInput) return false;
-  const pair = readPairedAntigravitySnapshots(transcriptPath, {
-    initialTailBytes: NO_OUTPUT_INITIAL_TAIL_BYTES,
-    maxTailBytes: NO_OUTPUT_MAX_TAIL_BYTES,
-    isSufficient: records => findLastUserInputIndex(records) >= 0,
-    ...testHooks,
-  });
-  if (!pair.ok) return false;
+  const proof = readPairedCurrentUserInput(
+    transcriptPath,
+    writtenInput,
+    opts?.writeBoundary,
+    opts,
+  );
+  if (!proof) return false;
 
-  const matched = pairMatchesLastUserInput(pair.full, pair.compact, writtenInput);
-  if (!matched) return false;
-
-  for (let i = matched.fullIdx + 1; i < pair.full.records.length; i++) {
-    const type = pair.full.records[i]!.rec.type;
+  for (let i = proof.matched.fullIdx + 1; i < proof.full.records.length; i++) {
+    const type = proof.full.records[i]!.rec.type;
     if (typeof type !== 'string' || !ALLOWED_NO_OUTPUT_TRAILING_TYPES.has(type)) return false;
   }
-  for (let i = matched.compactIdx + 1; i < pair.compact.records.length; i++) {
-    const type = pair.compact.records[i]!.rec.type;
+  for (let i = proof.matched.compactIdx + 1; i < proof.compact.records.length; i++) {
+    const type = proof.compact.records[i]!.rec.type;
     if (typeof type !== 'string' || !ALLOWED_NO_OUTPUT_TRAILING_TYPES.has(type)) return false;
   }
   return true;
@@ -1760,17 +1837,7 @@ function hasPendingTasksInSnapshot(snap: ParsedTranscriptSnapshot): boolean {
   return hasAntigravityPendingTasks(state);
 }
 
-export interface AntigravityTranscriptWriteBoundary {
-  /** Transcript path sampled immediately before writing this turn to the CLI. */
-  readonly sampledTranscriptPath?: string;
-  /** Byte offset in `sampledTranscriptPath` right before this turn was written. */
-  readonly minByteOffset: number;
-  /** Earlier identical-text submissions in flight before this write. */
-  readonly skipPriorMatches?: number;
-}
-
-export interface AntigravityAnsweredTurnOptions
-  extends Pick<ReadPairedSnapshotsOptions, 'onAfterReadForTest' | 'onAfterFirstSiblingForTest'> {
+export interface AntigravityAnsweredTurnOptions extends TranscriptProofTestHooks {
   /** Mandatory pre-write transcript boundary so repeated prompts cannot match
    *  an earlier already-answered turn before the new turn's USER_INPUT flushes. */
   readonly writeBoundary?: AntigravityTranscriptWriteBoundary;
@@ -1855,64 +1922,16 @@ export function antigravityTurnAnsweredInTranscript(
   writtenInput: string,
   opts?: AntigravityAnsweredTurnOptions,
 ): boolean {
-  if (!transcriptPath || !writtenInput) return false;
-  const boundary = opts?.writeBoundary;
-  if (!boundary || !Number.isSafeInteger(boundary.minByteOffset) || boundary.minByteOffset < 0) {
-    return false;
-  }
-  const skipPriorMatches = Math.max(0, boundary.skipPriorMatches ?? 0);
-  const base = basename(transcriptPath);
-  const isNativePair = base === COMPACT_TRANSCRIPT_NAME || base === FULL_TRANSCRIPT_NAME;
-  const needsCrossSiblingWholeFile = isNativePair
-    && boundary.minByteOffset > 0
-    && boundary.sampledTranscriptPath !== undefined;
+  const proof = readPairedCurrentUserInput(
+    transcriptPath,
+    writtenInput,
+    opts?.writeBoundary,
+    opts,
+  );
+  if (!proof) return false;
+  const { full, compact, matched } = proof;
 
-  const pair = readPairedAntigravitySnapshots(transcriptPath, {
-    initialTailBytes: NO_OUTPUT_INITIAL_TAIL_BYTES,
-    maxTailBytes: needsCrossSiblingWholeFile ? PAIRED_COMPLETION_PROVENANCE_MAX_BYTES : NO_OUTPUT_MAX_TAIL_BYTES,
-    isSufficient: (records, windowStart, snapPath) => {
-      if (needsCrossSiblingWholeFile && windowStart > 0) return false;
-      if (boundary.minByteOffset > 0
-        && (!boundary.sampledTranscriptPath || boundary.sampledTranscriptPath === snapPath)
-        && windowStart > 0
-        && windowStart >= boundary.minByteOffset) {
-        return false;
-      }
-      if (skipPriorMatches > 0 && windowStart > 0) return false;
-      return findLastUserInputIndex(records) >= 0
-        && !(windowStart > 0 && records.some(r => isTaskResultRecord(r.rec)));
-    },
-    onAfterReadForTest: opts?.onAfterReadForTest,
-    onAfterFirstSiblingForTest: opts?.onAfterFirstSiblingForTest,
-  });
-  if (!pair.ok) return false;
-
-  const matched = pairMatchesLastUserInput(pair.full, pair.compact, writtenInput);
-  if (!matched) return false;
-
-  const fullMinOffset = mapMinByteOffsetInSnapshots(boundary, pair.full, pair.compact);
-  const compactMinOffset = mapMinByteOffsetInSnapshots(boundary, pair.compact, pair.full);
-  if (fullMinOffset === null || fullMinOffset === undefined
-    || compactMinOffset === null || compactMinOffset === undefined) {
-    return false;
-  }
-  if (pair.full.records[matched.fullIdx]!.lineStart < fullMinOffset
-    || pair.compact.records[matched.compactIdx]!.lineStart < compactMinOffset) {
-    return false;
-  }
-  if (skipPriorMatches > 0) {
-    if ((pair.full.windowStart > 0 && pair.full.windowStart >= fullMinOffset)
-      || (pair.compact.windowStart > 0 && pair.compact.windowStart >= compactMinOffset)) {
-      return false;
-    }
-    const expected = writtenInput.replace(/\r\n?/g, '\n');
-    const fullByStep = buildFullUserInputStepIndex(pair.full);
-    const fullMatches = countMatchingUserInputsFromOffset(pair.full, expected, fullMinOffset, false, undefined);
-    const compactMatches = countMatchingUserInputsFromOffset(pair.compact, expected, compactMinOffset, true, fullByStep);
-    if (fullMatches <= skipPriorMatches || compactMatches <= skipPriorMatches) return false;
-  }
-
-  if (hasPendingTasksInSnapshot(pair.full) || hasPendingTasksInSnapshot(pair.compact)) return false;
+  if (hasPendingTasksInSnapshot(full) || hasPendingTasksInSnapshot(compact)) return false;
 
   const minAnsweredAtMs = opts?.minAnsweredAtMs;
   const isAnsweredTail = (records: readonly ParsedTranscriptRecord[], userIdx: number): boolean => {
@@ -1962,8 +1981,8 @@ export function antigravityTurnAnsweredInTranscript(
     return true;
   };
 
-  return isAnsweredTail(pair.full.records, matched.fullIdx)
-    && isAnsweredTail(pair.compact.records, matched.compactIdx);
+  return isAnsweredTail(full.records, matched.fullIdx)
+    && isAnsweredTail(compact.records, matched.compactIdx);
 }
 
 function recordStepId(rec: Record<string, unknown>): string | undefined {

@@ -356,23 +356,64 @@ export function createAntigravityQuotaStateMachine(): AntigravityQuotaStateMachi
 
     let observed: CliUsageLimitState | undefined;
     let screenComposerKey: string | undefined;
+    const readyScreenComposerKey = readyComposer ? extractAntigravityErrorComposerKey(plain) : undefined;
+    let readyRetained: CliUsageLimitState | undefined;
+    if (
+      readyComposer
+      && input.supportsReadyFooterQuota
+      && raw.limited
+      && raw.kind === 'usage'
+      && lastConfirmed
+      && isAntigravityNativeLimit(lastConfirmed)
+      && nowMs < lastConfirmed.retryAtMs
+      && !turn.answered
+      && !retiredNativeLogKeys.has(lastConfirmed.nativeEpisodeKey ?? '')
+      && (
+        (lastConfirmed.relativeResetKey !== undefined
+          && lastConfirmed.relativeResetKey === raw.relativeResetKey)
+        || (readyScreenComposerKey !== undefined
+          && (lastConfirmedScreenComposerKey === readyScreenComposerKey
+            || lastConfirmed.linkedNativeEpisodeKey === readyScreenComposerKey))
+        || candidateLog?.nativeEpisodeKey === lastConfirmed.nativeEpisodeKey
+      )
+    ) {
+      // A ready footer alone does not disprove a still-visible, unexpired quota
+      // banner while native evidence is between turns or its countdown differs.
+      // Preserve the confirmed episode; only answered/retired proof may recover it.
+      readyRetained = {
+        ...raw,
+        source: lastConfirmed.source,
+        nativeEpisodeKey: lastConfirmed.nativeEpisodeKey,
+        ...(lastConfirmed.linkedNativeEpisodeKey
+          ? { linkedNativeEpisodeKey: lastConfirmed.linkedNativeEpisodeKey }
+          : {}),
+      };
+    }
+
+    const recoverReady = (): AntigravityQuotaClassifyResult<S> => {
+      if (lastConfirmed) {
+        recoveredEpisodeKey = cliUsageLimitEpisodeKey(lastConfirmed) ?? recoveredEpisodeKey;
+      }
+      return {
+        status: input.runtimeStatus,
+        usageLimitRecovery: 'antigravity-ready-composer',
+        detectedThisTurn: false,
+      };
+    };
 
     if (readyComposer) {
-      if (input.supportsReadyFooterQuota && logMatchesScreen && candidateLog && raw.limited) {
+      if (!raw.limited) return recoverReady();
+      if (input.supportsReadyFooterQuota && logMatchesScreen && candidateLog) {
         observed = {
           ...raw,
           source: 'antigravity-native-log',
           nativeEpisodeKey: candidateLog.nativeEpisodeKey,
         };
+      } else if (readyRetained) {
+        observed = readyRetained;
+        screenComposerKey = readyScreenComposerKey;
       } else {
-        if (lastConfirmed) {
-          recoveredEpisodeKey = cliUsageLimitEpisodeKey(lastConfirmed) ?? recoveredEpisodeKey;
-        }
-        return {
-          status: input.runtimeStatus,
-          usageLimitRecovery: 'antigravity-ready-composer',
-          detectedThisTurn: false,
-        };
+        return recoverReady();
       }
     } else if (!raw.limited) {
       return { status: input.runtimeStatus, detectedThisTurn: false };

@@ -552,7 +552,6 @@ import {
   resolveAntigravityTranscriptPath,
   type AntigravityCompletedTurnCandidate,
   type AntigravityTranscriptState,
-  type AntigravityTranscriptWriteBoundary,
 } from './services/antigravity-transcript.js';
 import {
   antigravityRecoveryBindPath,
@@ -870,6 +869,7 @@ import {
   structuredCodexLimitState,
   structuredRateLimitState,
   usageLimitEvidenceKey,
+  type AntigravityTranscriptWriteBoundary,
   type CliUsageLimitState,
 } from './utils/cli-usage-limit.js';
 import { CodexSubagentLimitTracker } from './services/codex-subagent-limit-tracker.js';
@@ -10870,8 +10870,10 @@ function withAntigravityDirectFailureProof(limit: CliUsageLimitState): CliUsageL
   if (!written) return limit;
   const transcriptPath = resolveAntigravityProofTranscriptPath();
   if (!transcriptPath) return limit;
-  return antigravityTurnFailedWithoutOutput(transcriptPath, written)
-    ? { ...limit, directFailure: true }
+  const writeBoundary = lastWrittenAntigravityTranscriptAnchor;
+  if (!writeBoundary) return limit;
+  return antigravityTurnFailedWithoutOutput(transcriptPath, written, { writeBoundary })
+    ? { ...limit, directFailure: true, antigravityWriteBoundary: { ...writeBoundary } }
     : limit;
 }
 

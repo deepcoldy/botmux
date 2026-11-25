@@ -3,7 +3,11 @@ import type { FailedTurnRecord, TrustedCaller, CliTurnPayload, Session } from '.
 import type { DaemonSession } from './types.js';
 import { activeSessionKey } from './types.js';
 import * as store from '../services/session-store.js';
-import { buildFailedTurnRecord } from '../services/failed-turn-retry.js';
+import {
+  buildFailedTurnRecord,
+  failedTurnDirectFailureProofMatches,
+  syncFailedTurnDirectFailureProof,
+} from '../services/failed-turn-retry.js';
 import { turnAnswersInChat } from './failed-turn-rewind.js';
 import { isAutoCompactSafeComposerRefusal } from './auto-compact.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
@@ -204,14 +208,11 @@ export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | unde
   const previous = ds.session.lastFailedTurn;
   if (previous?.turnId === turnId) {
     if (!previous.limitedSnapshot || previous.recovery) return;
-    const desiredDirectFailure = ds.usageLimit.directFailure === true ? true : undefined;
-    if (previous.directFailure === desiredDirectFailure) {
+    if (failedTurnDirectFailureProofMatches(previous, ds.usageLimit)) {
       cancelLimitedFailedTurnRecordRetry(ds);
       return;
     }
-    const updated: FailedTurnRecord = { ...previous };
-    if (desiredDirectFailure) updated.directFailure = true;
-    else delete updated.directFailure;
+    const updated = syncFailedTurnDirectFailureProof(previous, ds.usageLimit);
     ds.session.lastFailedTurn = updated;
     try {
       store.updateSession(ds.session);
@@ -230,7 +231,6 @@ export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | unde
     turnId,
     status: 'failed',
     errorCode: `${ds.usageLimit.kind}_limited`,
-    ...(ds.usageLimit.directFailure === true ? { directFailure: true as const } : {}),
   }, {
     userPrompt: ds.lastUserPrompt, cliInput: ds.lastCliInput, codexAppInput: ds.lastCodexAppInput,
     attachments: ds.session.lastAttachments, trustedCaller: caller, silent: isSilentScheduledTurn(ds, turnId),
@@ -239,7 +239,7 @@ export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | unde
   });
   if (record) {
     record.limitedSnapshot = true;
-    ds.session.lastFailedTurn = record;
+    ds.session.lastFailedTurn = syncFailedTurnDirectFailureProof(record, ds.usageLimit);
     try {
       store.updateSession(ds.session);
       cancelLimitedFailedTurnRecordRetry(ds);
@@ -295,7 +295,10 @@ export function recordFailedTurnTerminal(
   terminal: { turnId: string; status: string; errorCode?: string; retryable?: boolean; directFailure?: true },
   context: { workerGeneration: number; caller: TrustedCaller | undefined; silent: boolean },
 ): void {
-  cancelLimitedFailedTurnRecordRetry(ds);
+  const pendingRecordRetry = limitedFailedTurnRecordRetries.get(ds);
+  if (pendingRecordRetry?.turnId === terminal.turnId) {
+    cancelLimitedFailedTurnRecordRetry(ds);
+  }
   if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
     clearLimitedFailedTurn(ds, terminal.turnId, { currentGenerationCompleted: true });
   }

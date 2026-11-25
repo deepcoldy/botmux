@@ -516,12 +516,78 @@ describe('usage-limit sticky state self-heal', () => {
     expect(ds.usageLimit).toBeDefined();
   });
 
-  it('does not apply agy ready-composer recovery to another CLI', async () => {
+  it.each([
+    { proof: 'recovery', type: 'screen_update' },
+    { proof: 'recovery', type: 'screenshot_uploaded' },
+    { proof: 'expiry', type: 'screen_update' },
+    { proof: 'expiry', type: 'screenshot_uploaded' },
+  ] as const)('applies restored pre-ready $proof via $type before the sole worker edge is deduplicated', async ({ proof, type }) => {
+    vi.setSystemTime(new Date(2026, 9, 1));
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_pre_ready', 'pre-ready recovery', 'group', 'chat');
+    session.cliId = 'antigravity';
+    const limit: CliUsageLimitState = {
+      ...rateLimitState(), kind: 'usage', source: 'antigravity-error-composer',
+      nativeEpisodeKey: 'composer:pre-ready', relativeResetKey: 'usage:60000:pre-ready',
+    };
+    Object.assign(session, {
+      usageLimit: limit,
+      antigravityQuotaHistory: [limit],
+      antigravityQuotaCursor: { lastConfirmed: limit, recoveredEpisodeKey: null },
+    });
+    sessionStore.updateSession(session);
+    const ds = makeDs({
+      session, worker, workerPort: null, usageLimit: limit,
+      antigravityQuotaHistory: [limit],
+      antigravityQuotaCursor: { lastConfirmed: limit, recoveredEpisodeKey: null },
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    restoreUsageLimitRuntimeState(ds);
+
+    const frames: WorkerToDaemon[] = [];
+    const pending: Promise<void>[] = [];
+    const producer = antigravityScreenProducer(frame => {
+      frames.push(frame);
+      pending.push(dispatch(worker, frame));
+    });
+    producer.scope.antigravityActiveQuota = limit;
+    producer.scope.antigravityQuotaHistory = [limit];
+    producer.scope.antigravityQuotaCursor = { lastConfirmed: limit, recoveredEpisodeKey: null };
+    if (proof === 'recovery') {
+      producer.screen('output\n────\n> Auto mode: edits & safe commands\nauto-approved (shift+tab to cycle)\n────\n? for shortcuts');
+    } else {
+      producer.screen('⚠ Individual quota reached. Resets in 1m.\nError ID: pre-ready\n────\n>\n────');
+      await vi.advanceTimersByTimeAsync(61_000);
+    }
+
+    if (type === 'screen_update') {
+      producer.start();
+      await vi.advanceTimersByTimeAsync(100);
+    } else {
+      await dispatch(worker, { type: 'capture_identity', revision: 0 } as WorkerToDaemon);
+      await producer.screenshot();
+    }
+    await Promise.all(pending.splice(0));
+    expect(frames).toHaveLength(1);
+    expect(ds.usageLimit).toBeUndefined();
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit).toBeUndefined();
+
+    worker.emit('message', { type: 'ready', port: 9999, token: 'tok' });
+    if (type === 'screen_update') await vi.advanceTimersByTimeAsync(500);
+    else await producer.screenshot();
+    await Promise.all(pending.splice(0));
+    expect(frames).toHaveLength(1);
+    expect(ds.usageLimit).toBeUndefined();
+    expect(ds.lastScreenStatus).toBe('idle');
+  });
+
+  it.each([9999, null])('does not apply agy ready-composer recovery to another CLI (workerPort=%s)', async workerPort => {
     vi.useFakeTimers();
     const worker = makeFakeWorker();
     const session = sessionStore.createSession('oc_x', 'om_other_cli', 'other CLI quota', 'group', 'chat');
     session.cliId = 'codex';
-    const ds = makeDs({ session, worker, workerPort: 9999, usageLimit: rateLimitState() });
+    const ds = makeDs({ session, worker, workerPort, usageLimit: rateLimitState() });
     __testOnly_setupWorkerHandlers(ds, worker);
     await dispatch(worker, { type: 'screen_update', content: '', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
     expect(ds.usageLimit).toBeDefined();

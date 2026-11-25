@@ -1,6 +1,25 @@
 export type CliUsageLimitKind = 'usage' | 'rate';
 export type CliUsageLimitSource = 'antigravity-error-composer' | 'antigravity-native-log';
 
+/** Serializable transcript position sampled immediately before an Antigravity
+ * input was written. A no-output/answered proof may only use USER_INPUT records
+ * at or after this boundary, including when the full/compact view changes. */
+export interface AntigravityTranscriptWriteBoundary {
+  readonly sampledTranscriptPath?: string;
+  readonly minByteOffset: number;
+  readonly skipPriorMatches?: number;
+}
+
+export function sameAntigravityTranscriptWriteBoundary(
+  a: AntigravityTranscriptWriteBoundary | undefined,
+  b: AntigravityTranscriptWriteBoundary | undefined,
+): boolean {
+  return a === b || Boolean(a && b
+    && a.sampledTranscriptPath === b.sampledTranscriptPath
+    && a.minByteOffset === b.minByteOffset
+    && (a.skipPriorMatches ?? 0) === (b.skipPriorMatches ?? 0));
+}
+
 export interface CliUsageLimitState {
   limited: true;
   kind: CliUsageLimitKind;
@@ -22,6 +41,10 @@ export interface CliUsageLimitState {
   /** Paired native transcript proof that the turn produced zero output or side
    *  effects after USER_INPUT and may be safely auto-replayed after rotation. */
   directFailure?: true;
+  /** Current-turn pre-write boundary backing directFailure. It is persisted
+   *  alongside the provisional failed turn so daemon settlement re-proves the
+   *  same input window instead of accepting an older identical prompt. */
+  antigravityWriteBoundary?: AntigravityTranscriptWriteBoundary;
 }
 
 export interface CliUsageLimitNotDetected {
@@ -409,7 +432,8 @@ export function sameUsageLimit(
     && a.source === b.source
     && a.nativeEpisodeKey === b.nativeEpisodeKey
     && a.linkedNativeEpisodeKey === b.linkedNativeEpisodeKey
-    && a.directFailure === b.directFailure;
+    && a.directFailure === b.directFailure
+    && sameAntigravityTranscriptWriteBoundary(a.antigravityWriteBoundary, b.antigravityWriteBoundary);
 }
 
 /** Whether any native key of `state` is present in the durable consumed set. */
@@ -468,6 +492,13 @@ export function usageLimitEvidenceKey(state: CliUsageLimitState | undefined): st
     state.linkedNativeEpisodeKey ?? null,
     state.relativeResetKey ?? null,
     state.directFailure === true,
+    state.antigravityWriteBoundary
+      ? [
+        state.antigravityWriteBoundary.sampledTranscriptPath ?? null,
+        state.antigravityWriteBoundary.minByteOffset,
+        state.antigravityWriteBoundary.skipPriorMatches ?? 0,
+      ]
+      : null,
   ]);
 }
 

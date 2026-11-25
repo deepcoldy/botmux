@@ -106,7 +106,7 @@ describe('Antigravity native quota log reader and correlation', () => {
     expect(second?.text).toContain('1h20m0s');
   });
 
-  it('resets cleanly on same-inode O_TRUNC even when replacement log is larger, and via reset()', () => {
+  it('resets cleanly on same-inode O_TRUNC with larger or same-size regrow', () => {
     const root = makeTempDir();
     const reader = new AntigravityNativeQuotaLog('sess-trunc', root);
     mkdirSync(dirname(reader.path), { recursive: true });
@@ -120,13 +120,48 @@ describe('Antigravity native quota log reader and correlation', () => {
     writeFileSync(reader.path, shorter);
     expect(currentAntigravityNativeQuota(reader.read(), 'short')).toBeUndefined();
 
-    // Same-inode O_TRUNC followed by a LARGER log requires explicit reset() (spawn/kill, regression case).
+    // Same-inode O_TRUNC + larger regrow must reset without a spawn/kill hint.
     const larger = `${INPUT_LINE('new proc turn')}\n${'I1123 21:00:00.000000 1 a.go:1] pad\n'.repeat(20)}${EXECUTOR_QUOTA_LINE('E1123 21:00:05.000000', '45m')}\n`;
     writeFileSync(reader.path, larger);
-    reader.reset();
-    const afterReset = currentAntigravityNativeQuota(reader.read(), 'new proc turn');
-    expect(afterReset?.nativeEpisodeKey).toBe('log:E1123 21:00:05.000000');
-    expect(afterReset?.text).toContain('45m');
+    const afterRegrow = currentAntigravityNativeQuota(reader.read(), 'new proc turn');
+    expect(afterRegrow?.nativeEpisodeKey).toBe('log:E1123 21:00:05.000000');
+    expect(afterRegrow?.text).toContain('45m');
+    expect(reader.read().latestInput).toMatchObject({ sequence: 1, text: 'new proc turn' });
+    expect(currentAntigravityNativeQuota(reader.read(), 'short')).toBeUndefined();
+
+    // Equal-size replacement also changes the frontier while size === old offset.
+    const sameSize = larger
+      .replace('new proc turn', 'alt proc turn')
+      .replace('E1123 21:00:05.000000', 'E1123 22:00:05.000000')
+      .replaceAll('45m', '46m');
+    expect(Buffer.byteLength(sameSize)).toBe(Buffer.byteLength(larger));
+    writeFileSync(reader.path, sameSize);
+    expect(currentAntigravityNativeQuota(reader.read(), 'alt proc turn')?.nativeEpisodeKey)
+      .toBe('log:E1123 22:00:05.000000');
+  });
+
+  it('resets on same-size replacement when only an earlier quota line changes and the tail is identical', () => {
+    const root = makeTempDir();
+    const reader = new AntigravityNativeQuotaLog('sess-frontier-collision', root);
+    mkdirSync(dirname(reader.path), { recursive: true });
+    const input = `${INPUT_LINE('same input', 'I1126 09:00:00.000000')}\n`;
+    const quota = `${EXECUTOR_QUOTA_LINE('E1126 10:00:03.000000', '1h')}\n`;
+    const quiet = quota.replace('agent executor error:', 'agent executor Error:');
+    const padding = `I1126 10:00:04.000000 1 trace.go:1] ${'x'.repeat(700)}\n`;
+    const before = input + quiet + padding;
+    const replaced = input + quota + padding;
+    expect(Buffer.byteLength(replaced)).toBe(Buffer.byteLength(before));
+    expect(Buffer.from(replaced).subarray(-512).equals(Buffer.from(before).subarray(-512))).toBe(true);
+
+    writeFileSync(reader.path, before);
+    expect(currentAntigravityNativeQuota(reader.read(), 'same input')).toBeUndefined();
+    writeFileSync(reader.path, replaced);
+    expect(currentAntigravityNativeQuota(reader.read(), 'same input')?.nativeEpisodeKey)
+      .toBe('log:E1126 10:00:03.000000');
+
+    // Reverse direction: a removed quota must not survive as sticky old state.
+    writeFileSync(reader.path, before);
+    expect(currentAntigravityNativeQuota(reader.read(), 'same input')).toBeUndefined();
   });
 
   it('preserves multi-byte UTF-8 (Chinese & emoji) split across 256 KiB chunk boundaries on initial and incremental reads', () => {
@@ -227,6 +262,7 @@ describe('Antigravity native quota log reader and correlation', () => {
       attested?: { cliPid: number; cliProcStart: string; cliSpawnGeneration: number };
       birthMatches?: boolean;
       webSubmitGen?: number;
+      anchor?: 'missing' | 'eof';
     }) => {
       const scope: Record<string, unknown> = {
         cliAdapter: { id: 'antigravity' },
@@ -246,6 +282,11 @@ describe('Antigravity native quota log reader and correlation', () => {
         },
         resolveAntigravityTranscriptPath: (cid: string) => (cid === convA ? pathA : cid === convB ? pathB : null),
         lastWrittenCliInput: { content: 'do work' },
+        ...(opts.anchor === 'missing' ? {} : {
+          lastWrittenAntigravityTranscriptAnchor: {
+            minByteOffset: opts.anchor === 'eof' ? Buffer.byteLength(userLine) + 1 : 0,
+          },
+        }),
       };
       scope.currentAntigravityWrittenInput = loadWorkerFunction('currentAntigravityWrittenInput', scope);
       scope.resolveAntigravityProofTranscriptPath = loadWorkerFunction('resolveAntigravityProofTranscriptPath', scope);
@@ -255,6 +296,14 @@ describe('Antigravity native quota log reader and correlation', () => {
     // Prompt-injection session with codexBridgeRolloutPath=undefined still proves clean failure via attested live PID.
     const noBridgeClean = makeProofRunner({ live: { kind: 'unique', conversationId: convA }, storedId: convA });
     expect(noBridgeClean(baseLimit).directFailure).toBe(true);
+    expect(noBridgeClean(baseLimit).antigravityWriteBoundary).toEqual({ minByteOffset: 0 });
+
+    // Missing anchor and an old identical USER_INPUT before the current EOF
+    // boundary both fail closed; the latter models current input not flushed yet.
+    const missingAnchor = makeProofRunner({ live: { kind: 'unique', conversationId: convA }, storedId: convA, anchor: 'missing' });
+    expect(missingAnchor(baseLimit).directFailure).toBeUndefined();
+    const oldInputOnly = makeProofRunner({ live: { kind: 'unique', conversationId: convA }, storedId: convA, anchor: 'eof' });
+    expect(oldInputOnly(baseLimit).directFailure).toBeUndefined();
 
     // Stored clean A vs live progressed B conflict MUST fail closed.
     const conflict = makeProofRunner({ live: { kind: 'unique', conversationId: convB }, storedId: convA });

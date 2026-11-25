@@ -16,6 +16,7 @@ import {
   resolveAntigravityCandidateMinByteOffset,
   resolveAntigravityTranscriptPath,
   unwrapAntigravityUserInput,
+  type AntigravityNoOutputTurnOptions,
   type AntigravityTranscriptState,
 } from '../src/services/antigravity-transcript.js';
 import { resolveFileBridgePath } from '../src/services/file-bridge-path.js';
@@ -1519,6 +1520,14 @@ describe('paired stat-bounded Antigravity transcript proofs', () => {
     status: 'DONE',
     content,
   });
+  const noOutput = (
+    transcriptPath: string,
+    writtenInput: string,
+    opts: Omit<AntigravityNoOutputTurnOptions, 'writeBoundary'> = {},
+  ) => antigravityTurnFailedWithoutOutput(transcriptPath, writtenInput, {
+    ...opts,
+    writeBoundary: { sampledTranscriptPath: transcriptPath, minByteOffset: 0 },
+  });
 
   it('proves clean direct failure on last USER_INPUT with CRLF normalization and multi-hop repeat, and rejects any post-input progress', () => {
     const fullPath = join(dir, 'transcript_full.jsonl');
@@ -1535,9 +1544,9 @@ describe('paired stat-bounded Antigravity transcript proofs', () => {
     writeFileSync(fullPath, cleanPair);
     writeFileSync(compactPath, cleanPair);
 
-    expect(antigravityTurnFailedWithoutOutput(fullPath, 'repeat prompt\r\nline 2')).toBe(true);
-    expect(antigravityTurnFailedWithoutOutput(compactPath, 'repeat prompt\nline 2')).toBe(true);
-    expect(antigravityTurnFailedWithoutOutput(fullPath, 'wrong prompt')).toBe(false);
+    expect(noOutput(fullPath, 'repeat prompt\r\nline 2')).toBe(true);
+    expect(noOutput(compactPath, 'repeat prompt\nline 2')).toBe(true);
+    expect(noOutput(fullPath, 'wrong prompt')).toBe(false);
 
     // Long prompt truncated in compact sibling still verifies when full matches and step_index aligns.
     const longPrompt = 'L'.repeat(5000);
@@ -1546,7 +1555,7 @@ describe('paired stat-bounded Antigravity transcript proofs', () => {
       ...userRec(10, 'L...<truncated 4000 bytes>...L'),
       truncated_fields: ['content'],
     }));
-    expect(antigravityTurnFailedWithoutOutput(fullPath, longPrompt)).toBe(true);
+    expect(noOutput(fullPath, longPrompt)).toBe(true);
 
     // Reject tool call, assistant text, GENERIC, SYSTEM_MESSAGE, ERROR_MESSAGE, or partial trailing JSON.
     for (const trailing of [
@@ -1559,8 +1568,34 @@ describe('paired stat-bounded Antigravity transcript proofs', () => {
     ]) {
       writeFileSync(fullPath, line(userRec(5, 'do work')) + trailing);
       writeFileSync(compactPath, line(userRec(5, 'do work')) + trailing);
-      expect(antigravityTurnFailedWithoutOutput(fullPath, 'do work')).toBe(false);
+      expect(noOutput(fullPath, 'do work')).toBe(false);
     }
+  });
+
+  it('requires a current write boundary and rejects an older identical clean failure before current input flushes', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const compactPath = join(dir, 'transcript.jsonl');
+    const prior = line(userRec(1, 'repeat')) + line(checkpointRec(2));
+    const current = line(userRec(3, 'repeat')) + line(checkpointRec(4));
+    writeFileSync(fullPath, prior);
+    writeFileSync(compactPath, prior);
+
+    expect(antigravityTurnFailedWithoutOutput(fullPath, 'repeat')).toBe(false);
+    const eofBoundary = { sampledTranscriptPath: fullPath, minByteOffset: Buffer.byteLength(prior) };
+    expect(antigravityTurnFailedWithoutOutput(fullPath, 'repeat', { writeBoundary: eofBoundary })).toBe(false);
+    expect(antigravityTurnFailedWithoutOutput(compactPath, 'repeat', { writeBoundary: eofBoundary })).toBe(false);
+    // A claimed prior in-flight match must actually exist after the boundary.
+    expect(antigravityTurnFailedWithoutOutput(fullPath, 'repeat', {
+      writeBoundary: { minByteOffset: 0, skipPriorMatches: 1 },
+    })).toBe(false);
+
+    writeFileSync(fullPath, prior + current);
+    writeFileSync(compactPath, prior + current);
+    expect(antigravityTurnFailedWithoutOutput(fullPath, 'repeat', { writeBoundary: eofBoundary })).toBe(true);
+    expect(antigravityTurnFailedWithoutOutput(compactPath, 'repeat', { writeBoundary: eofBoundary })).toBe(true);
+    expect(antigravityTurnFailedWithoutOutput(fullPath, 'repeat', {
+      writeBoundary: { minByteOffset: 0, skipPriorMatches: 1 },
+    })).toBe(true);
   });
 
   it('rejects dual-log skew, missing sibling, and transient full sibling created+tool+deleted mid-check', () => {
@@ -1570,20 +1605,20 @@ describe('paired stat-bounded Antigravity transcript proofs', () => {
     // compact has tool_call while full only has USER_INPUT -> MUST fail closed!
     writeFileSync(fullPath, line(userRec(1, 'do work')));
     writeFileSync(compactPath, line(userRec(1, 'do work')) + line(toolRec(2)));
-    expect(antigravityTurnFailedWithoutOutput(fullPath, 'do work')).toBe(false);
+    expect(noOutput(fullPath, 'do work')).toBe(false);
 
     // Reverse skew: full has tool_call while compact only has USER_INPUT -> MUST fail closed!
     writeFileSync(fullPath, line(userRec(1, 'do work')) + line(toolRec(2)));
     writeFileSync(compactPath, line(userRec(1, 'do work')));
-    expect(antigravityTurnFailedWithoutOutput(fullPath, 'do work')).toBe(false);
+    expect(noOutput(fullPath, 'do work')).toBe(false);
 
     // missing full sibling unconditionally fails closed (no compact-only fallback!).
     unlinkSync(fullPath);
-    expect(antigravityTurnFailedWithoutOutput(compactPath, 'do work')).toBe(false);
+    expect(noOutput(compactPath, 'do work')).toBe(false);
 
     // transient full created with tool call and deleted mid-pair -> fails closed!
     let createdAndDeleted = false;
-    const res = antigravityTurnFailedWithoutOutput(compactPath, 'do work', {
+    const res = noOutput(compactPath, 'do work', {
       onAfterFirstSiblingForTest: () => {
         writeFileSync(fullPath, line(userRec(1, 'do work')) + line(toolRec(2)));
         unlinkSync(fullPath);
@@ -1626,7 +1661,7 @@ describe('paired stat-bounded Antigravity transcript proofs', () => {
     writeFileSync(fullPath, cleanOnly);
     writeFileSync(compactPath, cleanOnly);
     let racedNoOutput = 0;
-    const noOutRes = antigravityTurnFailedWithoutOutput(fullPath, 'do work', {
+    const noOutRes = noOutput(fullPath, 'do work', {
       onAfterReadForTest: readPath => {
         if (readPath === compactPath && racedNoOutput === 0) {
           racedNoOutput += 1;

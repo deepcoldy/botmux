@@ -572,19 +572,23 @@ describe('controlled failed-turn recovery', () => {
     expect(ds.session.lastFailedTurn?.limitedSnapshot).toBe(true);
     expect(ds.session.lastFailedTurn?.directFailure).toBeUndefined();
 
-    ds.usageLimit = { ...ds.usageLimit, directFailure: true };
+    const boundary = { sampledTranscriptPath: '/tmp/current.jsonl', minByteOffset: 42 };
+    ds.usageLimit = { ...ds.usageLimit, directFailure: true, antigravityWriteBoundary: boundary };
     recordLimitedFailedTurn(ds, request.turnId);
     expect(ds.session.lastFailedTurn?.directFailure).toBe(true);
+    expect(ds.session.lastFailedTurn?.antigravityWriteBoundary).toEqual(boundary);
 
     // Revocation failure rolls back in-memory lastFailedTurn cleanly.
     vi.spyOn(store, 'updateSession').mockImplementationOnce(() => { throw new Error('sqlite busy'); });
     ds.usageLimit = { ...ds.usageLimit, directFailure: undefined };
     expect(() => recordLimitedFailedTurn(ds, request.turnId)).toThrow('sqlite busy');
     expect(ds.session.lastFailedTurn?.directFailure).toBe(true);
+    expect(ds.session.lastFailedTurn?.antigravityWriteBoundary).toEqual(boundary);
 
-    // Successful revocation clears directFailure.
+    // Successful revocation clears directFailure and its boundary together.
     recordLimitedFailedTurn(ds, request.turnId);
     expect(ds.session.lastFailedTurn?.directFailure).toBeUndefined();
+    expect(ds.session.lastFailedTurn?.antigravityWriteBoundary).toBeUndefined();
 
     // Claimed recovery freezes provisional snapshot.
     ds.session.lastFailedTurn.recovery = { requestId: 'r1', mode: 'retry', turnId: 'bmx-r1', sessionId: 'old', state: 'attempting' };

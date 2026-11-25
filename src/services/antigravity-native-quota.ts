@@ -3,6 +3,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { antigravitySessionLogPath } from './antigravity-session-fork.js';
 
 const NATIVE_LOG_CHUNK_BYTES = 256 * 1024;
+const NATIVE_LOG_FRONTIER_BYTES = 64 * 1024;
 const USER_INPUT_FILE_MARKER = 'input_loop.go:';
 const USER_INPUT_CALL_MARKER = 'HandleUserInput called with text: ';
 const EXECUTOR_ERROR_MARKER = 'agent executor error:';
@@ -145,53 +146,102 @@ export function currentAntigravityNativeQuota(
  *  Starts at byte 0 on initial/reset read and drains to EOF in 256 KiB chunks
  *  using a persistent `StringDecoder('utf8')` so multi-byte characters split
  *  across chunk boundaries never corrupt `HandleUserInput` payloads. Resets
- *  unconditionally on inode change, truncation (`size < offset`), and explicit
- *  `reset()` on process spawn/kill. */
+ *  unconditionally on inode change, truncation (`size < offset`), a changed
+ *  consumed-byte frontier, or an mtime/ctime generation change at unchanged EOF
+ *  (the latter catches same-size rewrites whose tail happens to match), plus
+ *  explicit `reset()` on process spawn/kill. */
 export class AntigravityNativeQuotaLog {
   readonly path: string;
   private inode: string | undefined;
   private offset = 0;
   private tail = '';
   private decoder = new StringDecoder('utf8');
+  private frontier = Buffer.alloc(0);
+  private observedVersion: { mtimeNs: bigint; ctimeNs: bigint } | undefined;
   private state: AntigravityNativeLogState = { inputSequence: 0 };
 
   constructor(sessionId: string, root?: string) {
     this.path = antigravitySessionLogPath(sessionId, root);
   }
 
-  reset(): void {
-    this.inode = undefined;
+  private restart(inode?: string): void {
+    this.inode = inode;
     this.offset = 0;
     this.tail = '';
     this.decoder = new StringDecoder('utf8');
+    this.frontier = Buffer.alloc(0);
+    this.observedVersion = undefined;
     this.state = { inputSequence: 0 };
+  }
+
+  reset(): void {
+    this.restart();
+  }
+
+  /** Verify bytes immediately before the consumed offset on the same opened fd.
+   * Size alone cannot detect copytruncate/O_TRUNC followed by rapid regrow. */
+  private frontierMatches(fd: number): boolean {
+    if (this.offset === 0) return this.frontier.length === 0;
+    const expected = this.frontier;
+    if (expected.length === 0) return false;
+    const actual = Buffer.allocUnsafe(expected.length);
+    const position = this.offset - expected.length;
+    let filled = 0;
+    while (filled < expected.length) {
+      const n = readSync(fd, actual, filled, expected.length - filled, position + filled);
+      if (n <= 0) return false;
+      filled += n;
+    }
+    return actual.equals(expected);
+  }
+
+  private rememberFrontier(bytes: Buffer): void {
+    if (bytes.length >= NATIVE_LOG_FRONTIER_BYTES) {
+      this.frontier = Buffer.from(bytes.subarray(bytes.length - NATIVE_LOG_FRONTIER_BYTES));
+      return;
+    }
+    const combined = Buffer.concat([this.frontier, bytes]);
+    this.frontier = combined.length > NATIVE_LOG_FRONTIER_BYTES
+      ? Buffer.from(combined.subarray(combined.length - NATIVE_LOG_FRONTIER_BYTES))
+      : combined;
   }
 
   read(): Readonly<AntigravityNativeLogState> {
     let fd: number | undefined;
     try {
       fd = openSync(this.path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
-      const stat = fstatSync(fd);
+      const stat = fstatSync(fd, { bigint: true });
       if (!stat.isFile()) return this.state;
-
-      const inode = `${stat.dev}:${stat.ino}`;
-      if (inode !== this.inode || stat.size < this.offset) {
-        this.inode = inode;
-        this.offset = 0;
-        this.tail = '';
-        this.decoder = new StringDecoder('utf8');
-        this.state = { inputSequence: 0 };
+      const size = Number(stat.size);
+      if (!Number.isSafeInteger(size) || size < 0) {
+        this.restart(`${stat.dev}:${stat.ino}`);
+        return this.state;
       }
 
-      if (stat.size === this.offset) return this.state;
+      const inode = `${stat.dev}:${stat.ino}`;
+      const version = { mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+      const rewrittenWithoutGrowth = size === this.offset && this.offset > 0
+        && this.observedVersion !== undefined
+        && (version.mtimeNs !== this.observedVersion.mtimeNs
+          || version.ctimeNs !== this.observedVersion.ctimeNs);
+      if (inode !== this.inode || size < this.offset || rewrittenWithoutGrowth) {
+        this.restart(inode);
+      } else if (this.offset > 0 && !this.frontierMatches(fd)) {
+        this.restart(inode);
+      }
+      this.observedVersion = version;
 
-      const chunkBuf = Buffer.allocUnsafe(Math.min(NATIVE_LOG_CHUNK_BYTES, Math.max(1, stat.size - this.offset)));
-      while (this.offset < stat.size) {
-        const toRead = Math.min(chunkBuf.length, stat.size - this.offset);
+      if (size === this.offset) return this.state;
+
+      const chunkBuf = Buffer.allocUnsafe(Math.min(NATIVE_LOG_CHUNK_BYTES, Math.max(1, size - this.offset)));
+      while (this.offset < size) {
+        const toRead = Math.min(chunkBuf.length, size - this.offset);
         const bytesRead = readSync(fd, chunkBuf, 0, toRead, this.offset);
         if (bytesRead <= 0) break;
+        const bytes = chunkBuf.subarray(0, bytesRead);
         this.offset += bytesRead;
-        const decoded = this.decoder.write(chunkBuf.subarray(0, bytesRead));
+        this.rememberFrontier(bytes);
+        const decoded = this.decoder.write(bytes);
         if (!decoded) continue;
         const lines = (this.tail + decoded).split('\n');
         this.tail = lines.pop() ?? '';

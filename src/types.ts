@@ -12,7 +12,7 @@ import type {
   RemoteRunnerBackendState,
   RemoteRunnerUsageReport,
 } from './adapters/backend/remote-runner-protocol.js';
-import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
+import type { AntigravityTranscriptWriteBoundary, CliUsageLimitState } from './utils/cli-usage-limit.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
 import type { CodexServiceTier, CodexServiceTierPreference, CodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -322,6 +322,9 @@ export interface FailedTurnRecord {
   /** The worker saw this turn end on API errors alone (turn_terminal
    *  `directFailure`): the next input may cut it out and re-send its input. */
   directFailure?: true;
+  /** Current-turn transcript boundary backing an Antigravity limited snapshot's
+   *  directFailure proof. Missing legacy boundaries fail closed for auto-replay. */
+  antigravityWriteBoundary?: AntigravityTranscriptWriteBoundary;
   /** The terminal's `retryable`, kept for the rewind decision. */
   retryable?: boolean;
   /** Frozen at the failure: this turn's answer was meant for the chat (not an

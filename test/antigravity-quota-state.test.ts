@@ -364,7 +364,8 @@ describe('AntigravityQuotaStateMachine (SSOT)', () => {
     expect(gap.usageLimit?.nativeEpisodeKey).toBe('log:E1125 00:00:05.000000');
     expect(gap.usageLimit?.linkedNativeEpisodeKey).toBeUndefined();
 
-    // ready-composer recovery sets tombstone for log:B; footerless reader gap stays suppressed.
+    // Positive answered proof permits ready-composer recovery and sets the tombstone.
+    sm.noteTurnAnswered('log:E1125 00:00:05.000000');
     const rec = sm.classify({
       screen: `${QUOTA_LINE('1m')}\nError ID: E${FOOTER_READY}`,
       nativeViewportCaptured: true,
@@ -384,6 +385,8 @@ describe('AntigravityQuotaStateMachine (SSOT)', () => {
     });
     expect(postGap.status).toBe('idle');
 
+    // A later turn clears answered-turn suppression; the durable tombstone remains.
+    sm.beginTurn('', T0 + 8_500);
     // generic active frame never wipes recovered tombstone.
     const generic = sm.classify({
       screen: `${QUOTA_LINE('1m')}\nError ID: E`,
@@ -416,6 +419,70 @@ describe('AntigravityQuotaStateMachine (SSOT)', () => {
     // Legacy cursor derivation when persisted row lacks antigravityQuotaCursor.
     const legacyCursor = deriveLegacyAntigravityQuotaCursor(undefined, smOrder.exportHistory());
     expect(legacyCursor.recoveredEpisodeKey).toBe('composer:B');
+  });
+
+  it.each(['native-gap', 'countdown-skew'] as const)('retains an unexpired confirmed episode through ready-footer %s without positive recovery', variant => {
+    const sm = createAntigravityQuotaStateMachine();
+    const nativeA = logRefusal('E1125 00:00:01.000000', '1h', 1);
+    const banner = (duration: string, footer: string) => `${QUOTA_LINE(duration)}\nError ID: E${footer}`;
+    sm.beginTurn('', T0);
+    const initial = sm.classify({
+      screen: banner('1h', FOOTER_LESS),
+      nativeViewportCaptured: true,
+      runtimeStatus: 'idle',
+      supportsReadyFooterQuota: true,
+      nativeLogQuota: nativeA,
+      nowMs: T0,
+    });
+    expect(initial.status).toBe('limited');
+
+    const ready = sm.classify({
+      screen: banner(variant === 'countdown-skew' ? '59m' : '1h', FOOTER_READY),
+      nativeViewportCaptured: true,
+      runtimeStatus: 'idle',
+      supportsReadyFooterQuota: true,
+      ...(variant === 'native-gap' ? {} : { nativeLogQuota: nativeA }),
+      nowMs: T0 + 60_000,
+    });
+    expect(ready.status).toBe('limited');
+    expect(ready.usageLimit).toMatchObject({
+      nativeEpisodeKey: nativeA.nativeEpisodeKey,
+      retryAtMs: initial.usageLimit?.retryAtMs,
+    });
+    expect(ready.usageLimitRecovery).toBeUndefined();
+    expect(sm.exportCursor().recoveredEpisodeKey).toBeNull();
+
+    const stillGap = sm.classify({
+      screen: banner('1h', FOOTER_LESS),
+      nativeViewportCaptured: true,
+      runtimeStatus: 'idle',
+      supportsReadyFooterQuota: true,
+      nowMs: T0 + 120_000,
+    });
+    expect(stillGap.status).toBe('limited');
+    const returned = sm.classify({
+      screen: banner('1h', FOOTER_LESS),
+      nativeViewportCaptured: true,
+      runtimeStatus: 'idle',
+      supportsReadyFooterQuota: true,
+      nativeLogQuota: nativeA,
+      nowMs: T0 + 180_000,
+    });
+    expect(returned.status).toBe('limited');
+    expect(returned.usageLimit?.retryAtMs).toBe(initial.usageLimit?.retryAtMs);
+
+    // Positive current-turn answered proof still permits recovery.
+    sm.noteTurnAnswered(nativeA.nativeEpisodeKey);
+    const recovered = sm.classify({
+      screen: banner('1h', FOOTER_READY),
+      nativeViewportCaptured: true,
+      runtimeStatus: 'idle',
+      supportsReadyFooterQuota: true,
+      nativeLogQuota: nativeA,
+      nowMs: T0 + 240_000,
+    });
+    expect(recovered.usageLimitRecovery).toBe('antigravity-ready-composer');
+    expect(sm.exportCursor().recoveredEpisodeKey).toBe(nativeA.nativeEpisodeKey);
   });
 
   it('retires the current native-log refusal when the same input internally retries and answers', () => {
