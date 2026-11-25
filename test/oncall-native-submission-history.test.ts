@@ -97,6 +97,8 @@ describe('native submission snapshot history', () => {
     const changed = await current(draft.id);
     expect(changed.nativeSubmission?.attempts).toHaveLength(2);
     expect(changed.nativeSubmission?.attempts[0]).toEqual(attemptA);
+    expect(new URL(changed.nativeSubmission!.attempts[1]!.sourceLocation).searchParams.get('bm_form'))
+      .not.toBe(new URL(attemptA.sourceLocation).searchParams.get('bm_form'));
     vi.setSystemTime(now + 5000); await reconcileNativeOncallSubmissions('app');
     expect(request()).toMatchObject({ status: 'succeeded', flowId: '1234', openChatId: 'oc_destination' });
     expect((await current(draft.id)).nativeSubmission?.completed).toBe(true);

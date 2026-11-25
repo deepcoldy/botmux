@@ -9,7 +9,7 @@ export interface PrincipalLaneDispatchUnknownStartupNotice {
   sessionId: string;
   recordId: string;
   turnId: string;
-  caller: TrustedCaller;
+  caller?: TrustedCaller;
   detail: string;
 }
 

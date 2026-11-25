@@ -12,6 +12,9 @@ export interface CrossChatFollowedThreadOrigin {
 
 export interface CrossChatFollowedThreadMatch extends CrossChatFollowedThreadOrigin {
   sourceSessionId: string;
+  sourceTurnId?: string;
+  /** Exact provider receipt, retained across legacy source-turn enrichment. */
+  sourceReceiptMessageId?: string;
   followThreadEpoch?: string;
   scope: 'chat' | 'thread';
   anchor: string;
@@ -155,7 +158,10 @@ export function resolveCrossChatFollowedThread(input: {
     session: CrossChatCandidateSession;
     canonicalRootId: string;
     sentAtMs: number;
+    sourceTurnId?: string;
+    sourceReceiptMessageId?: string;
   } | null = null;
+  let ambiguous = false;
 
   for (const s of sessionById.values()) {
     if (
@@ -194,12 +200,21 @@ export function resolveCrossChatFollowedThread(input: {
       if (marker.crossChatFollowThread === 'off') continue;
       const sentAtMs = Number.isFinite(marker.sentAtMs) ? marker.sentAtMs : 0;
       if (!best || sentAtMs > best.sentAtMs) {
-        best = { session: s, canonicalRootId, sentAtMs };
+        best = {
+          session: s, canonicalRootId, sentAtMs, sourceTurnId: marker.sourceTurnId,
+          sourceReceiptMessageId: marker.messageId,
+        };
+        ambiguous = false;
+      } else if (sentAtMs === best.sentAtMs
+        && (s.sessionId !== best.session.sessionId || canonicalRootId !== best.canonicalRootId)) {
+        // Journals have no cross-session append order. A wall-clock tie cannot
+        // attest which source task (and human) owns the reply.
+        ambiguous = true;
       }
     }
   }
 
-  if (!best) return null;
+  if (!best || ambiguous) return null;
 
   const isChat = best.session.scope === 'chat';
   const runtimeRoutingAnchor = best.session.runtimeRoutingAnchor
@@ -207,6 +222,8 @@ export function resolveCrossChatFollowedThread(input: {
 
   return {
     sourceSessionId: best.session.sessionId,
+    ...(best.sourceReceiptMessageId ? { sourceReceiptMessageId: best.sourceReceiptMessageId } : {}),
+    ...(best.sourceTurnId ? { sourceTurnId: best.sourceTurnId } : {}),
     followThreadEpoch: best.session.followThreadEpoch,
     sourceChatId: best.session.chatId,
     scope: isChat ? 'chat' : 'thread',
