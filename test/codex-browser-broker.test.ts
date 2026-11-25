@@ -600,6 +600,29 @@ describe('resolveCodexBrowserPluginRoot', () => {
     });
   });
 
+  it('discovers the complete shared desktop browser bundle beside a Chrome client-only bundle', () => {
+    withPlugins(({ cache, home, plugin }) => {
+      const previousHome = process.env.HOME;
+      process.env.HOME = home;
+      try {
+        const desktop = join(home, 'Applications', 'ChatGPT.app', 'Contents', 'Resources',
+          'plugins', 'openai-bundled', 'plugins');
+        const cachedChrome = plugin(join(cache, '98.1.0'));
+        const bundledChrome = plugin(join(desktop, 'chrome'), '98.2.0');
+        rmSync(join(bundledChrome, 'scripts', 'browser-service.mjs'));
+        const sharedBrowser = plugin(join(desktop, 'browser'), '98.2.0');
+
+        expect(resolveCodexBrowserPluginRoot()).toBe(realpathSync(sharedBrowser));
+
+        rmSync(join(sharedBrowser, 'scripts', 'browser-service.mjs'));
+        expect(resolveCodexBrowserPluginRoot()).toBe(realpathSync(cachedChrome));
+      } finally {
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+      }
+    });
+  });
+
   it('keeps a newer complete cache and ignores an incomplete desktop update', () => {
     withPlugins(({ cache, bundled, plugin }) => {
       plugin(bundled, '26.1029.61003');
@@ -706,7 +729,7 @@ describe('resolveCodexBrowserPluginRoot', () => {
   });
 
   function withPlugins(run: (fixture: {
-    cache: string; bundled: string; plugin: (root: string, version?: string) => string;
+    cache: string; bundled: string; home: string; plugin: (root: string, version?: string) => string;
   }) => void): void {
     const root = mkdtempSync(join(tmpdir(), 'botmux-browser-plugin-'));
     const previousCodexHome = process.env.CODEX_HOME;
@@ -715,6 +738,7 @@ describe('resolveCodexBrowserPluginRoot', () => {
       run({
         cache: join(root, 'plugins', 'cache', 'openai-bundled', 'chrome'),
         bundled: join(root, 'desktop', 'plugins', 'chrome'),
+        home: root,
         plugin: (path, version) => {
           mkdirSync(join(path, 'scripts'), { recursive: true });
           writeFileSync(join(path, 'scripts', 'browser-client.mjs'), 'export {}');
