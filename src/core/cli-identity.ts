@@ -38,6 +38,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
+import type { BytedcliGrantRegion, BytedcliPublishedRegionState, BytedcliPublishedRegionStates } from '../platform/bytedcli-grant-regions.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import { GIT_CONFIG_PAIR_ENV_KEY, isCliIdentityPath } from '../utils/child-env.js';
 import { resolveEntrySpawn } from './self-spawn.js';
@@ -67,9 +68,12 @@ export function sessionIdentityDir(sessionDataDir: string): string {
  * selection at them. Keyed on realpath so data-dir aliases cannot split the
  * store for one session.
  */
+/** A new object for every publication, even if the credentials are identical. */
+export interface ProvenIdentitySnapshot { readonly body: string }
+
 const provenIdentityContents = new Map<
   string,
-  Map<string, Partial<Record<IdentityTool, string>>>
+  Map<string, Partial<Record<IdentityTool, ProvenIdentitySnapshot>>>
 >();
 
 function provenSessionKey(sessionDataDir: string, sessionId: string): string {
@@ -99,7 +103,7 @@ export function rememberProvenIdentityContent(
   const key = provenSessionKey(sessionDataDir, sessionId);
   const turns = provenSessionMap(key, true)!;
   const tools = turns.get(turnId) ?? {};
-  tools[tool] = body;
+  tools[tool] = { body };
   turns.set(turnId, tools);
 }
 
@@ -111,6 +115,12 @@ export function recallProvenIdentityContent(
   turnId: string,
   tool: IdentityTool,
 ): string | undefined {
+  return recallProvenIdentitySnapshot(sessionDataDir, sessionId, turnId, tool)?.body;
+}
+
+export function recallProvenIdentitySnapshot(
+  sessionDataDir: string, sessionId: string, turnId: string, tool: IdentityTool,
+): ProvenIdentitySnapshot | undefined {
   return provenSessionMap(provenSessionKey(sessionDataDir, sessionId), false)?.get(turnId)?.[tool];
 }
 
@@ -218,14 +228,14 @@ export function dropPublishedIdentitiesForOpenId(sessionDataDir: string, openId:
       if (!tools) continue;
       let removedBytedcli = false;
       for (const tool of Object.keys(tools) as IdentityTool[]) {
-        const body = tools[tool];
+        const body = tools[tool]?.body;
         if (typeof body !== 'string' || !identityMatchesOpenId(body, openId)) continue;
         delete tools[tool];
         dropped += 1;
         if (tool === 'bytedcli') removedBytedcli = true;
       }
       for (const name of COMPANION_TOOLS) {
-        const body = tools[name];
+        const body = tools[name]?.body;
         if (!removedBytedcli || typeof body !== 'string') continue;
         const stamped = stampedOpenId(body);
         if (stamped === undefined || stamped === openId) {
@@ -582,6 +592,9 @@ export interface BytedCliIdentity extends TurnBound {
   /** Who was asked for {@link regionalCloudJwts}; only shapes the refusal
    *  text for a missing region. See {@link BytedcliRegionalJwtSource}. */
   regionalCloudJwtSource?: BytedcliRegionalJwtSource;
+  regionalCloudJwtStates?: BytedcliPublishedRegionStates;
+  /** This proven publication can ask the platform again within the turn. */
+  retryRegionalCloudJwts?: true;
   /** See {@link LarkCliIdentity.openId}. */
   openId?: string;
   /**
@@ -695,7 +708,7 @@ const MEEGO_HOME_VAR = 'BOTMUX_MEEGO_HOME';
  * the bytedcli wrapper picks the one matching the call's `--site` (or
  * BYTEDCLI_CLOUD_SITE), so these never reach the child under their own names.
  */
-export type BytedcliRegion = 'i18n' | 'i18nbd' | 'tx' | 'cn';
+export type BytedcliRegion = BytedcliGrantRegion;
 const BYTEDCLI_REGIONAL_JWT_VARS: Record<BytedcliRegion, string> = {
   i18n: 'BOTMUX_IDENTITY_CLOUD_JWT_I18N',
   i18nbd: 'BOTMUX_IDENTITY_CLOUD_JWT_I18NBD',
@@ -735,8 +748,20 @@ const BYTEDCLI_SITE_ALIASES: Readonly<Record<string, string>> = {
  */
 export type BytedcliRegionalJwtSource = 'local' | 'platform' | 'platform-legacy';
 const BYTEDCLI_REGIONAL_SOURCE_VAR = 'BOTMUX_IDENTITY_REGIONAL_SOURCE';
-// A turn's tickets are fixed when the turn is prepared, so a retry inside the
-// same turn gets the same answer: the hints say to send a new message.
+const BYTEDCLI_REGIONAL_STATE_VARS: Record<BytedcliRegion, string> = {
+  i18n: 'BOTMUX_IDENTITY_REGIONAL_STATE_I18N',
+  i18nbd: 'BOTMUX_IDENTITY_REGIONAL_STATE_I18NBD',
+  tx: 'BOTMUX_IDENTITY_REGIONAL_STATE_TX',
+  cn: 'BOTMUX_IDENTITY_REGIONAL_STATE_CN',
+};
+const BYTEDCLI_REGIONAL_RETRY_VAR = 'BOTMUX_IDENTITY_REGIONAL_RETRY';
+const BYTEDCLI_REGION_STATE_HINTS: Partial<Record<BytedcliPublishedRegionState, string>> = {
+  not_authorized: '发起人尚未授权这个站点，请前往平台凭据页授权后发一条新消息再试。',
+  reauth_required: '发起人在这个站点的授权已失效，请前往平台凭据页重新授权后发一条新消息再试。',
+  pending: '平台仍在签发这个分区的凭据。',
+  failed: '平台本次未能签发这个分区的凭据。',
+  retry_exhausted: '本轮这个分区的补票已达上限，请发一条新消息再试；若仍缺票，请检查平台凭据页的站点授权。',
+};
 const BYTEDCLI_REGIONAL_MISSING_HINTS: Record<BytedcliRegionalJwtSource, string> = {
   local: '本机为发起人签票时没有签到这个分区的票：bytedcli 的登录按站点分开保存，本机的按人授权只登录了默认站点，发起人没在该站点另外登录过就签不出；也可能发起人没有该分区权限，或这次签票失败。可让 bot 改用平台授权（平台凭据页可为海外站点单独授权）。本轮内重试拿不到新票，处理后发一条新消息再试。',
   platform: '平台为发起人签票时没有签出这个分区的票：海外站点要在平台凭据页单独授权，发起人可能还没授权该站点，或该站点授权已失效；也可能这次签票失败。本轮内重试拿不到新票；授权该站点后发一条新消息再试。',
@@ -797,14 +822,16 @@ function anyCaseGlob(site: string): string {
 
 /** Shell lines: `case "$<siteVar>"` setting `<jwtVar>` to this identity's
  *  token for that site's region, and `<regionVar>` (when given) to the region. */
-function bytedcliSiteRegionCase(siteVar: string, jwtVar: string, regionVar?: string): string[] {
+function bytedcliSiteRegionCase(siteVar: string, jwtVar?: string, regionVar?: string, stateVar?: string): string[] {
   const cases = (Object.keys(BYTEDCLI_SITE_REGIONS) as BytedcliRegion[]).map(region => {
     const sites = BYTEDCLI_SITE_REGIONS[region];
     const aliases = Object.keys(BYTEDCLI_SITE_ALIASES).filter(alias => sites.includes(BYTEDCLI_SITE_ALIASES[alias]));
     // The `|` alternatives are joined here, as literal text: sh does not read
     // a `|` that comes out of a parameter expansion as a pattern separator.
     const setRegion = regionVar ? `${regionVar}=${region}; ` : '';
-    return `    ${[...sites, ...aliases].map(anyCaseGlob).join('|')}) ${setRegion}${jwtVar}=$${BYTEDCLI_REGIONAL_JWT_VARS[region]} ;;`;
+    const setJwt = jwtVar ? `${jwtVar}=$${BYTEDCLI_REGIONAL_JWT_VARS[region]}` : ':';
+    const setState = stateVar ? ` ${stateVar}=$${BYTEDCLI_REGIONAL_STATE_VARS[region]}` : '';
+    return `    ${[...sites, ...aliases].map(anyCaseGlob).join('|')}) ${setRegion}${setJwt}${setState} ;;`;
   });
   return [`  case "$${siteVar}" in`, ...cases, '  esac'];
 }
@@ -819,29 +846,10 @@ function bytedcliSiteTrim(siteVar: string): string[] {
   ];
 }
 
-/**
- * Shell lines selecting the regional ByteCloud JWT for this call's site.
- *
- * A call whose global site requires a missing partition token reports that
- * partition before invoking bytedcli. Help and commands with their own
- * credentials can still run (see {@link BYTEDCLI_REGION_FREE_FN}).
- *
- * The global site is read the way bytedcli 0.191 reads it: from the root
- * options only — it enables positional options, so a `--site` after the
- * command is that command's own option (a filter for `bytecloud
- * list-legacy-vregions`, a preset for `forge`), not the site the call is
- * authenticated against; `--cloud-site` is its spelling of `--site`; an empty
- * `--site` counts as not given (the variable then decides); the value is
- * trimmed with JS `trim()` and matched in any case.
- *
- * Which token is swapped in is decided separately and as before (#2472): by
- * the last `--site` anywhere, so a command that authenticates against its own
- * `--site` (nac) keeps getting the partition token it was getting.
- */
-function bytedcliRegionalSelection(): string[] {
+/** Resolve the global authentication site from root options, before the first
+ * command. A subcommand's own --site is still used for token overrides below. */
+function bytedcliGlobalSite(): string[] {
   const rootValueOptions = BYTEDCLI_ROOT_OPTIONS_WITH_VALUE.filter(option => option !== '--site' && option !== '--cloud-site');
-  const hints = (Object.keys(BYTEDCLI_REGIONAL_MISSING_HINTS) as BytedcliRegionalJwtSource[]).map(source =>
-    `      ${source}) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_HINTS[source])} ;;`);
   return [
     // The global site: the last --site among the root options, which end at
     // the first command the way bytedcli's getFirstCommandArgIndex finds it.
@@ -863,13 +871,40 @@ function bytedcliRegionalSelection(): string[] {
     '  done',
     '  if [ -z "$__botmux_gsite" ]; then __botmux_gsite=${BYTEDCLI_CLOUD_SITE:-}; fi',
     ...bytedcliSiteTrim('__botmux_gsite'),
+  ];
+}
+
+/** Refuse a missing global partition, then preserve the existing last-site
+ * override for subcommands that authenticate against a site of their own. */
+function bytedcliRegionalSelection(): string[] {
+  const hints = (Object.keys(BYTEDCLI_REGIONAL_MISSING_HINTS) as BytedcliRegionalJwtSource[]).map(source =>
+    `      ${source}) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_HINTS[source])} ;;`);
+  const stateHints = Object.entries(BYTEDCLI_REGION_STATE_HINTS).map(([state, hint]) =>
+    `      ${state}) __botmux_hint=${shellSingleQuote(hint)} ;;`);
+  const retryHint = '可稍等后重试本命令。若持续失败，请发一条新消息再试。';
+  return [
     '  __botmux_region=',
+    '  __botmux_state=',
     '  __botmux_regional=',
-    ...bytedcliSiteRegionCase('__botmux_gsite', '__botmux_regional', '__botmux_region'),
+    ...bytedcliSiteRegionCase('__botmux_gsite', '__botmux_regional', '__botmux_region', '__botmux_state'),
     '  if [ -n "$__botmux_region" ] && [ -z "$__botmux_regional" ] && ! __botmux_bd_region_free "$@"; then',
     `    case "$${BYTEDCLI_REGIONAL_SOURCE_VAR}" in`,
     ...hints,
     `      *) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT)} ;;`,
+    '    esac',
+    '    case "$__botmux_state" in',
+    ...stateHints,
+    '    esac',
+    '    case "$__botmux_state" in',
+    '      not_authorized|reauth_required|retry_exhausted) ;;',
+    `      pending|failed) if [ -n "$${BYTEDCLI_REGIONAL_RETRY_VAR}" ] && [ "$__botmux_region" != cn ]; then`,
+    `        __botmux_hint="$__botmux_hint"${shellSingleQuote(retryHint)}`,
+    '      else',
+    `        __botmux_hint="$__botmux_hint"${shellSingleQuote('请稍等后发一条新消息再试。')}`,
+    '      fi ;;',
+    `      *) if [ -n "$${BYTEDCLI_REGIONAL_RETRY_VAR}" ] && [ "$__botmux_region" != cn ]; then`,
+    `        __botmux_hint=${shellSingleQuote('平台本次没有返回该分区的票。' + retryHint + '若仍缺这张票，请在平台凭据页确认该站点授权。')}`,
+    '      fi ;;',
     '    esac',
     // printf's format carries no prose: the site is the caller's argument.
     "    printf '%s%s%s%s%s%s%s\\n' "
@@ -898,7 +933,7 @@ function bytedcliRegionalSelection(): string[] {
     '  __botmux_regional=',
     ...bytedcliSiteRegionCase('__botmux_site', '__botmux_regional'),
     '  if [ -n "$__botmux_regional" ]; then BYTEDCLI_USER_CLOUD_JWT=$__botmux_regional; fi',
-    `  unset __botmux_site __botmux_gsite __botmux_next __botmux_skip __botmux_arg __botmux_region __botmux_regional ${BYTEDCLI_REGIONAL_SOURCE_VAR} ${Object.values(BYTEDCLI_REGIONAL_JWT_VARS).join(' ')}`,
+    `  unset __botmux_site __botmux_gsite __botmux_next __botmux_skip __botmux_arg __botmux_region __botmux_regional __botmux_state __botmux_requested_region ${BYTEDCLI_REGIONAL_SOURCE_VAR} ${BYTEDCLI_REGIONAL_RETRY_VAR} ${Object.values(BYTEDCLI_REGIONAL_JWT_VARS).join(' ')} ${Object.values(BYTEDCLI_REGIONAL_STATE_VARS).join(' ')}`,
   ];
 }
 
@@ -959,6 +994,11 @@ export function renderIdentityEnv(identity: CliIdentity): string {
       if (key && jwt) pairs.push([key, jwt]);
     }
     if (identity.regionalCloudJwtSource) pairs.push([BYTEDCLI_REGIONAL_SOURCE_VAR, identity.regionalCloudJwtSource]);
+    if (identity.retryRegionalCloudJwts) pairs.push([BYTEDCLI_REGIONAL_RETRY_VAR, '1']);
+    for (const [region, state] of Object.entries(identity.regionalCloudJwtStates ?? {})) {
+      const key = BYTEDCLI_REGIONAL_STATE_VARS[region as BytedcliRegion];
+      if (key && state) pairs.push([key, state]);
+    }
     // Same variable the lark-cli device-code identity uses: the wrapper scopes
     // HOME to this exec only (see renderIdentityWrapper).
     if (identity.home) pairs.push([HOME_VAR, identity.home]);
@@ -1087,6 +1127,8 @@ function bytedcliHomeRoot(sessionDataDir: string, sessionId: string): string {
  *  short-alias layout (or falls back to the cache-root spelling) and only then
  *  computes the path, so the published HOME is the short one and the executor is
  *  never the first writer of the layout. See {@link bytedcliHomeRoot}. */
+export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: BytedCliIdentity): BytedCliIdentity;
+export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity;
 export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
   if (identity.tool !== 'bytedcli' || 'mode' in identity) return identity;
   if (identity.home) return identity;
@@ -1638,12 +1680,14 @@ export function renderIdentityWrapper(
   const governsMeego = tool === 'bytedcli' && !nativeCapabilities.meego;
   const isBytecloudFamily = tool === 'bytedcli' || tool === CODEBASE_COMPANION_TOOL || tool === BITSCLI_COMPANION_TOOL;
   const authProvider = tool === 'lark-cli' ? 'lark-cli' : 'bytedcli';
+  const requestsRegionalGrant = tool === 'bytedcli' && model === 'proven' && governsByteCloud;
+  const regionArg = requestsRegionalGrant ? ' ${__botmux_requested_region:+--region} ${__botmux_requested_region:+"$__botmux_requested_region"}' : '';
   const resolveBlock = model === 'proven' ? [
     // The runner proves this process tree over the daemon loopback channel and
     // prints the identity env ASSIGNMENTS, never a path. eval consumes that
     // body straight from the pipe: nothing in the session directory can select
     // or alter the identity, and no token rests on disk to be read.
-    `__botmux_cred_body=$(${[...identityResolver!, tool].map(shellSingleQuote).join(' ')}) || return ${IDENTITY_DENIED_EXIT_CODE}`,
+    `__botmux_cred_body=$(${[...identityResolver!, tool].map(shellSingleQuote).join(' ')}${regionArg}) || return ${IDENTITY_DENIED_EXIT_CODE}`,
     // An empty body is a missing/empty response (no mode assignment below),
     // never silent permission to run: deny it like a failed proof.
     `[ -n "$__botmux_cred_body" ] || return ${IDENTITY_DENIED_EXIT_CODE}`,
@@ -1710,7 +1754,7 @@ export function renderIdentityWrapper(
     // the exec site below, after identity resolution where it applies.
     ...BYTEDCLI_AUTH_REQUEST_FN,
     ...(isBytecloudFamily ? [...BYTEDCLI_SCAN_FN, ...BYTECLOUD_CLEAN_RUN_FN] : []),
-    ...(tool === 'bytedcli' ? BYTEDCLI_REGION_FREE_FN : []),
+    ...(tool === 'bytedcli' ? ['__botmux_requested_region=', ...BYTEDCLI_REGION_FREE_FN] : []),
     ...(governsMeego ? BYTEDCLI_MEEGO_FN : []),
     '__botmux_resolve() {',
     `  ${MODE_VAR}=`,
@@ -1723,7 +1767,8 @@ export function renderIdentityWrapper(
     `  ${OPEN_ID_VAR}=`,
     `  ${UNATTENDED_VAR}=`,
     ...(tool === 'bytedcli'
-      ? [...Object.values(BYTEDCLI_REGIONAL_JWT_VARS), BYTEDCLI_REGIONAL_SOURCE_VAR].map(key => `  ${key}=`)
+      ? [...Object.values(BYTEDCLI_REGIONAL_JWT_VARS), ...Object.values(BYTEDCLI_REGIONAL_STATE_VARS),
+        BYTEDCLI_REGIONAL_SOURCE_VAR, BYTEDCLI_REGIONAL_RETRY_VAR].map(key => `  ${key}=`)
       : []),
     // Same for the per-exec HOME: an inherited value must not redirect an
     // identity that does not carry one.
@@ -1780,6 +1825,13 @@ export function renderIdentityWrapper(
         `  exit ${IDENTITY_DENIED_EXIT_CODE}`,
         'fi',
       ] : []),
+    ] : []),
+    ...(tool === 'bytedcli' ? bytedcliGlobalSite() : []),
+    ...(requestsRegionalGrant ? [
+      'if ! __botmux_bd_region_free "$@"; then',
+      ...bytedcliSiteRegionCase('__botmux_gsite', undefined, '__botmux_requested_region'),
+      '  case "$__botmux_requested_region" in cn) __botmux_requested_region= ;; esac',
+      'fi',
     ] : []),
     `__botmux_resolve || exit ${IDENTITY_DENIED_EXIT_CODE}`,
     // A refusal of an unattended run (published for exactly the lapse of a
