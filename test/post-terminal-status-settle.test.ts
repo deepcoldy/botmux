@@ -154,7 +154,10 @@ import {
   unifiedReplyTurnNotCapturing,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
-import { startingCardAcceptsHostTurn } from '../src/core/starting-card-health.js';
+import {
+  STARTING_CARD_HEALTH_DELAY_MS,
+  startingCardAcceptsHostTurn,
+} from '../src/core/starting-card-health.js';
 import { armTriggerStreamingCard } from '../src/core/trigger-streaming-card.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
@@ -1024,7 +1027,7 @@ describe('starting card health watchdog', () => {
   it('degrades a turn still stuck at starting after 45s without changing execution status', async () => {
     const ds = setupStartingDs();
     await post(ds, TURN);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
     expect(ds.lastScreenStatus).toBe('working');
   });
@@ -1037,7 +1040,7 @@ describe('starting card health watchdog', () => {
     });
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
   });
 
@@ -1049,7 +1052,7 @@ describe('starting card health watchdog', () => {
     });
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
   });
 
@@ -1059,7 +1062,7 @@ describe('starting card health watchdog', () => {
     (ds.worker as any).emit('message', { type: 'prompt_ready', turnId: TURN });
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
   });
 
@@ -1069,7 +1072,7 @@ describe('starting card health watchdog', () => {
     (ds.worker as any).emit('message', {
       type: 'screen_update', content: 'other turn output', status: 'working', turnId: 'turn-other',
     });
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
     expect(updateMessageMock.mock.calls[0][1]).toBe(`om_start_${TURN}`);
   });
@@ -1082,7 +1085,7 @@ describe('starting card health watchdog', () => {
     ds.streamCardPendingTurnId = 'turn-live-0002';
     ds.streamCardTurnGeneration = 2;
     await post(ds, 'turn-live-0002');
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
 
     expect(patchedStatuses()).toEqual(['stalled']);
     expect(updateMessageMock.mock.calls[0][1]).toBe('om_start_turn-live-0002');
@@ -1094,7 +1097,7 @@ describe('starting card health watchdog', () => {
     await post(ds, TURN);
     ds.workerGeneration = 3;
     ds.session.workerGeneration = 3;
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
   });
 
@@ -1102,8 +1105,8 @@ describe('starting card health watchdog', () => {
     const ds = setupStartingDs();
     updateMessageMock.mockImplementationOnce(async () => { throw new Error('transient PATCH failure'); });
     await post(ds, TURN);
-    await vi.advanceTimersByTimeAsync(45_000);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(updateMessageMock).toHaveBeenCalledTimes(2);
     expect(lastPatchedStatus()).toBe('stalled');
     expect(ds.lastScreenStatus).toBe('working');
@@ -1124,7 +1127,7 @@ describe('starting card health watchdog', () => {
     });
     const ds = setupStartingDs();
     await post(ds, TURN);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
 
     (ds.worker as any).emit('message', {
       type: 'screen_update', content: 'running', status: 'working', turnId: TURN,
@@ -1152,7 +1155,7 @@ describe('starting card health watchdog', () => {
     expect(ds.turnDispatchAttemptHighWater).toEqual({ turnId: queuedTurn, dispatchAttempt: 0 });
     updateMessageMock.mockClear();
 
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
   });
 
@@ -1166,7 +1169,7 @@ describe('starting card health watchdog', () => {
     (ds.worker as any).emit('message', {
       type: 'capture_identity', revision: 2, turnId: queuedTurn, dispatchAttempt: 1,
     });
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).not.toContain('stalled');
   });
 
@@ -1181,14 +1184,14 @@ describe('starting card health watchdog', () => {
     (ds.worker as any).emit('message', {
       type: 'screen_update', content: 'predecessor still running', status: 'working', turnId: TURN,
     });
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
 
     (ds.worker as any).emit('message', { type: 'capture_identity', revision: 2, turnId: queuedTurn });
     await vi.advanceTimersByTimeAsync(0);
     expect(lastPatchedStatus()).toBe('working');
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(44_999);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS - 1);
     expect(patchedStatuses()).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
     expect(patchedStatuses()).toEqual(['stalled']);
@@ -1206,7 +1209,7 @@ describe('starting card health watchdog', () => {
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
 
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
   });
 
@@ -1225,7 +1228,7 @@ describe('starting card health watchdog', () => {
     expect(lastPatchedStatus()).toBe('working');
     updateMessageMock.mockClear();
 
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
   });
 
@@ -1237,7 +1240,7 @@ describe('starting card health watchdog', () => {
     vi.mocked(resolveUsageDisplay).mockReturnValue('streaming');
     try {
       await post(ds, TURN);
-      await vi.advanceTimersByTimeAsync(45_000);
+      await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
       expect(lastPatchedStatus()).toBe('stalled');
       expect(ds.usageRefreshTimer).toBeUndefined();
       updateMessageMock.mockClear();
@@ -1257,7 +1260,7 @@ describe('starting card health watchdog', () => {
   it('repaints a delivered stalled card on the first same-value working frame', async () => {
     const ds = setupStartingDs();
     await post(ds, TURN);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
     updateMessageMock.mockClear();
 
@@ -1273,7 +1276,7 @@ describe('starting card health watchdog', () => {
     noteTurnDispatchAttempt(ds, TURN, 1);
     await post(ds, TURN);
     (ds.worker as any).emit('message', terminalMsg(TURN));
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).not.toContain('stalled');
   });
 
@@ -1287,7 +1290,7 @@ describe('starting card health watchdog', () => {
     (ds.worker as any).emit('message', terminalMsg(TURN));
     resolvePost('om_start_slow_legacy_terminal');
     await posting;
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
 
     expect(patchedStatuses()).not.toContain('stalled');
     expect(lastPatchedStatus()).toBe('idle');
@@ -1298,7 +1301,7 @@ describe('starting card health watchdog', () => {
     noteTurnDispatchAttempt(ds, TURN, 2);
     await post(ds, TURN);
     (ds.worker as any).emit('message', { ...terminalMsg(TURN), dispatchAttempt: 1 });
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
   });
 
@@ -1311,7 +1314,7 @@ describe('starting card health watchdog', () => {
     expect(ds.streamCardId).toBe('om_new_card');
     updateMessageMock.mockClear();
 
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
   });
 
@@ -1325,7 +1328,7 @@ describe('starting card health watchdog', () => {
     expect(lastPatchedStatus()).toBe('starting');
     updateMessageMock.mockClear();
 
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
   });
 
@@ -1346,7 +1349,7 @@ describe('starting card health watchdog', () => {
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
 
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
   });
 
@@ -1365,7 +1368,7 @@ describe('starting card health watchdog', () => {
       type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 1,
     });
     releaseRestore();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).not.toContain('stalled');
   });
 
@@ -1389,7 +1392,7 @@ describe('starting card health watchdog', () => {
     await vi.advanceTimersByTimeAsync(0);
     releaseRestore();
     await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
 
     expect(patchedStatuses()).not.toContain('stalled');
     expect(lastPatchedStatus()).toBe(expectedStatus);
@@ -1417,7 +1420,7 @@ describe('starting card health watchdog', () => {
     await vi.advanceTimersByTimeAsync(0);
     releaseRestore();
     await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
 
     expect(lastPatchedStatus()).toBe(expected);
   });
@@ -1463,7 +1466,7 @@ describe('starting card health watchdog', () => {
     await vi.advanceTimersByTimeAsync(0);
     releaseRestore();
     await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
 
     expect(delivered.at(-1)).toBe('idle');
   });
@@ -1495,7 +1498,7 @@ describe('starting card health watchdog', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(delivered.at(-1)).toBe('working');
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(delivered.at(-1)).toBe('working');
   });
 
@@ -1503,7 +1506,7 @@ describe('starting card health watchdog', () => {
     const ds = setupStartingDs();
     ds.adoptedFrom = {} as any;
     await post(ds, TURN);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(lastPatchedStatus()).toBe('stalled');
     updateMessageMock.mockClear();
 
@@ -1517,7 +1520,7 @@ describe('starting card health watchdog', () => {
     ds.session.cliId = 'claude-code';
     ds.workerReady = true;
     await post(ds, TURN);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(lastPatchedStatus()).toBe('stalled');
     updateMessageMock.mockClear();
 
@@ -1533,7 +1536,7 @@ describe('starting card health watchdog', () => {
     const ds = setupStartingDs();
     ds.displayMode = 'screenshot';
     await post(ds, TURN);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(lastPatchedStatus()).toBe('stalled');
     ds.displayMode = 'hidden';
     updateMessageMock.mockClear();
@@ -1561,7 +1564,7 @@ describe('starting card health watchdog', () => {
     vi.mocked(resolveUsageDisplay).mockReturnValue('streaming');
     try {
       await post(ds, TURN);
-      await vi.advanceTimersByTimeAsync(45_000);
+      await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
       expect(ds.usageRefreshTimer).toBeUndefined();
       updateMessageMock.mockClear();
 
@@ -1585,14 +1588,14 @@ describe('starting card health watchdog', () => {
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
 
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
   });
 
   it('does not replace a cold-suspended idle card with a delivered stalled state', async () => {
     const ds = setupStartingDs();
     await post(ds, TURN);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(lastPatchedStatus()).toBe('stalled');
 
     ds.lastScreenStatus = 'idle';
@@ -1645,7 +1648,7 @@ describe('starting card health watchdog', () => {
     (ds.worker as any).emit('message', { type: 'direct_submit_started' });
     await vi.advanceTimersByTimeAsync(0);
     resolvePost('om_start_pending_completed_with_live_work');
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).not.toContain('stalled');
   });
 
@@ -1782,7 +1785,7 @@ describe('starting card health watchdog', () => {
     (ds.worker as any).emit('message', {
       type: 'claude_exit', code: 1, signal: null, canParkDiagnostic: false,
     });
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['idle']);
   });
 
@@ -1853,7 +1856,7 @@ describe('starting card health watchdog', () => {
     expect(delivered).toEqual(['working']);
 
     releaseRestore();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(delivered).toEqual(['working', 'starting', 'working']);
   });
 
@@ -2070,7 +2073,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     expect(patchedStatuses()).toEqual(['working']);
     updateMessageMock.mockClear();
 
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
     updateMessageMock.mockClear();
 
@@ -2098,7 +2101,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     await vi.advanceTimersByTimeAsync(0);
     expect(patchedStatuses()).toEqual(['working']);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
 
     const ds4 = setupLiveDs({ lastScreenStatus: 'idle' }, 'codex-app');
@@ -2110,7 +2113,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     expect(post4.postedStatus).toBe('working');
     updateMessageMock.mockClear();
     // Pre-POST steer_accepted without live working proof also arms host-turn health (not deferred indefinitely).
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
     // Disarm ds4 before testing the cold-turn control so fake timers stay isolated.
     (ds4.worker as any).emit('message', terminalMsg(followUpTurn, 'completed'));
@@ -2129,7 +2132,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     });
     await vi.advanceTimersByTimeAsync(0);
     expect(patchedStatuses()).toEqual([]);
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
     updateMessageMock.mockClear();
     (dsCold.worker as any).emit('message', {
@@ -2165,7 +2168,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     (dsHang.worker as any).emit('message', { type: 'capture_identity', revision: 2, turnId: followUpTurn });
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(44_999);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS - 1);
     expect(patchedStatuses()).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
     expect(patchedStatuses()).toEqual(['stalled']);
@@ -2181,7 +2184,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     updateMessageMock.mockClear();
 
     (dsHealthy.worker as any).emit('message', { type: 'screen_update', content: 't2 alive', status: 'working', turnId: followUpTurn });
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
   });
 
@@ -2198,7 +2201,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     updateMessageMock.mockClear();
 
     (ds1.worker as any).emit('message', { type: 'screen_update', content: 'live 2', status: 'working', turnId: TURN });
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
 
     // Sub-case 2: hidden-mode screenshot_uploaded working->working exits starting.
@@ -2211,7 +2214,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     await vi.advanceTimersByTimeAsync(0);
     expect(patchedStatuses()).toEqual(['working']);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
 
     // Sub-case 3: hidden-mode screenshot_uploaded respects pending trigger streaming card gate.
@@ -2304,7 +2307,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     const post1 = await postTurnCard(ds1, turn2);
     expect(post1.postedStatus).toBe('working');
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
 
     // Sub-case 2: fast idle->working->idle for T2 followed by interleaved T1 idle frame BEFORE postTurnStartingCard(T2).
@@ -2318,7 +2321,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     const post2 = await postTurnCard(ds2, turn2);
     expect(post2.postedStatus).toBe('idle');
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
   });
 
@@ -2347,7 +2350,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     expect(patchedStatuses()).toEqual(['working']);
     updateMessageMock.mockClear();
 
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
 
     // Sub-case 2: queued T2 POSTing 'starting'; mid-POST T1 emits working (and sibling idle) -> zero premature overwrites, watchdog stays deferred.
@@ -2368,7 +2371,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
 
       resolvePost2(`om_queued_mid_${midStatus}`);
       await posting2;
-      await vi.advanceTimersByTimeAsync(45_000);
+      await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
       expect(patchedStatuses()).toEqual([]);
     }
   });
@@ -2594,7 +2597,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     const postAfterRestart = await postTurnCard(dsAuto, TURN);
     expect(postAfterRestart.postedStatus).toBe('starting');
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
   });
 
@@ -2635,7 +2638,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     (ds2.worker as any).emit('message', { type: 'capture_identity', revision: 2, turnId: turn2 });
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
 
     // 3. killWorker mid-POST invalidates postTurnStartingCard ownership AND restores pre-POST cardId (never wedges CARD_POSTING_SENTINEL).
@@ -2653,7 +2656,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     expect(deleteMessageMock).toHaveBeenCalledWith(APP, 'om_after_kill');
     expect(ds3.streamCardId).toBe('om_prev_card_before_kill');
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
 
     // 4. /card mid-POST screen_update from T1 must NOT prune deferred T2 watchdog before rebind, and mid-POST status changes reconcile after /card lands.
@@ -2672,7 +2675,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     (ds4.worker as any).emit('message', { type: 'capture_identity', revision: 2, turnId: turn2 });
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
     killWorker(ds4);
 
@@ -2735,7 +2738,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     const post3 = await postTurnCard(ds3, turn2);
     expect(post3.postedStatus).toBe('working');
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
     // After terminal on a stalled card with lastScreenStatus==='idle', 120s sweep also heals it if 2s was missed.
     (ds3.worker as any).emit('message', terminalMsg(turn2, 'completed'));
@@ -2847,7 +2850,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     expect(dsShot.waitingTurnPreview).toMatchObject({ imageKey: 'img_host_folded', turnId: TURN });
     expect(patchedStatuses()).toEqual(['working']);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
   });
 
@@ -2864,7 +2867,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
       turnId: turn2,
       proofKind: 'claude_transcript_user_record',
     });
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(lastPatchedStatus()).toBe('stalled');
     expect(startingCardAcceptsHostTurn(ds1, TURN)).toBe(true);
 
@@ -2888,7 +2891,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     (ds2.worker as any).emit('message', { type: 'capture_identity', revision: 2, turnId: turn2, dispatchAttempt: 0 });
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
 
     // 3. Attempt-less completed terminal does NOT gate subsequent numbered retry frames; obsolete attempt terminal does NOT wipe newer retry provenance.
@@ -2925,7 +2928,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     await vi.advanceTimersByTimeAsync(0);
     expect(patchedStatuses()).toEqual(['working']);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual([]);
   });
 
@@ -2994,13 +2997,13 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
     updateMessageMock.mockRejectedValueOnce(new Error('503 stall'));
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     updateMessageMock.mockClear();
     (ds4.worker as any).emit('message', { type: 'capture_identity', revision: 2, turnId: turn2 });
     await vi.advanceTimersByTimeAsync(0);
     expect(patchedStatuses()).toEqual(['working']);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(44_999);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS - 1);
     expect(patchedStatuses()).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
     expect(patchedStatuses()).toEqual(['stalled']);
@@ -3016,7 +3019,7 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     noteTurnDispatchAttempt(ds5, turn2, 0);
     expect(startingCardAcceptsHostTurn(ds5, TURN)).toBe(true);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
     killWorker(ds5);
 
@@ -3035,9 +3038,140 @@ describe('starting card live-working projection, folded follow-ups, races, and s
     await posting6;
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
     expect(patchedStatuses()).toEqual(['stalled']);
   });
+
+  it('settles a queued starting publication to interrupted when startup fails during POST', async () => {
+    const turn2 = 'turn-live-0002';
+    const ds = setupLiveDs({ lastScreenStatus: 'idle' });
+    (ds.worker as any).emit('message', { type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 0 });
+    ds.currentTurnId = turn2;
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = turn2;
+    ds.streamCardTurnGeneration = 2;
+    let resolvePost!: (id: string) => void;
+    const replyMock = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const posting = postTurnStartingCard(ds, replyMock as any, turn2);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(JSON.parse(String(replyMock.mock.calls[0][1])).status).toBe('starting');
+
+    (ds.worker as any).emit('message', {
+      type: 'error', sessionId: SESSION, message: 'injected spawn failure', turnId: turn2, dispatchAttempt: 0,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.lastScreenStatus).toBe('interrupted');
+    updateMessageMock.mockClear();
+    resolvePost('om_queued_startup_failure');
+    expect(await posting).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
+    expect(patchedStatuses()).toContain('interrupted');
+  });
+
+  it('disarms the previous-attempt watchdog on the first working retry frame before capture advances', async () => {
+    const ds = setupLiveDs({ lastScreenStatus: 'idle' });
+    (ds.worker as any).emit('message', { type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 0 });
+    await postTurnCard(ds, TURN, 'om_retry_watchdog');
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'retry working', status: 'working', turnId: TURN, dispatchAttempt: 1,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(patchedStatuses()).toContain('working');
+    updateMessageMock.mockClear();
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
+    expect(patchedStatuses()).toEqual([]);
+
+    // A different, older turn must never take over the current turn's high-water.
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'late predecessor', status: 'working', turnId: 'turn-previous', dispatchAttempt: 9,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.turnDispatchAttemptHighWater).toEqual({ turnId: TURN, dispatchAttempt: 1 });
+  });
+
+  it('disarms the previous-attempt watchdog on a legacy retry screenshot before capture advances', async () => {
+    const ds = setupLiveDs({ displayMode: 'screenshot', lastScreenStatus: 'idle' });
+    noteTurnDispatchAttempt(ds, TURN, 0);
+    await postTurnCard(ds, TURN, 'om_retry_screenshot_watchdog');
+    (ds.worker as any).emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_retry_working', status: 'working', turnId: TURN, dispatchAttempt: 1,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(patchedStatuses()).toContain('working');
+    updateMessageMock.mockClear();
+    await vi.advanceTimersByTimeAsync(STARTING_CARD_HEALTH_DELAY_MS);
+    expect(patchedStatuses()).toEqual([]);
+  });
+
+  it('reconciles folded native acceptance received during a manual card POST', async () => {
+    const turn2 = 'turn-live-0002';
+    const ds = setupLiveDs({ lastScreenStatus: 'idle' });
+    (ds.worker as any).emit('message', { type: 'capture_identity', revision: 1, turnId: TURN });
+    await postTurnCard(ds, turn2, 'om_folded_before_manual');
+    let resolveManual!: (id: string) => void;
+    const manualPosting = postFreshStreamingCard(ds, vi.fn(() => new Promise<string>(resolve => { resolveManual = resolve; })) as any);
+    await vi.advanceTimersByTimeAsync(0);
+    (ds.worker as any).emit('message', {
+      type: 'native_input_consumed', turnId: turn2, dispatchAttempt: 0,
+      proofKind: 'claude_transcript_user_record',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    updateMessageMock.mockClear();
+    resolveManual('om_manual_native_acceptance');
+    expect(await manualPosting).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cachedStreamingCardStatus(ds)).toBe('working');
+    expect(patchedStatuses()).toContain('working');
+  });
+
+  it('does not resurrect native acceptance after terminal for a subsequent same-turn retry', async () => {
+    const turn2 = 'turn-live-0002';
+    const ds = setupLiveDs({ lastScreenStatus: 'idle' }, 'codex-app');
+    (ds.worker as any).emit('message', { type: 'capture_identity', revision: 1, turnId: TURN });
+    noteTurnDispatchAttempt(ds, turn2, 0);
+    await postTurnCard(ds, turn2, 'om_terminal_acceptance');
+    (ds.worker as any).emit('message', { type: 'steer_accepted', appTurnId: 'app-turn-1', turnId: turn2 });
+    (ds.worker as any).emit('message', { ...terminalMsg(turn2, 'completed'), dispatchAttempt: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', { type: 'steer_accepted', appTurnId: 'app-turn-1', turnId: turn2 });
+    await vi.advanceTimersByTimeAsync(0);
+    const retry = await postTurnCard(ds, turn2, 'om_retry_after_late_acceptance');
+    expect(retry.postedStatus).toBe('starting');
+  });
+
+  it('accepts native evidence from a strictly newer attempt after the previous terminal', async () => {
+    const turn2 = 'turn-live-0002';
+    const ds = setupLiveDs({ lastScreenStatus: 'idle' }, 'codex-app');
+    (ds.worker as any).emit('message', { type: 'capture_identity', revision: 1, turnId: TURN });
+    noteTurnDispatchAttempt(ds, turn2, 0);
+    await postTurnCard(ds, turn2, 'om_previous_attempt_terminal');
+    (ds.worker as any).emit('message', { ...terminalMsg(turn2, 'completed'), dispatchAttempt: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', {
+      type: 'native_input_consumed', turnId: turn2, dispatchAttempt: 1,
+      proofKind: 'claude_transcript_user_record',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.turnDispatchAttemptHighWater).toEqual({ turnId: turn2, dispatchAttempt: 1 });
+    const retry = await postTurnCard(ds, turn2, 'om_retry_with_new_native_acceptance');
+    expect(retry.postedStatus).toBe('working');
+  });
+
+  it.each(['kill', 'cold-suspend'] as const)('rejects a manual card commit after %s', async mode => {
+    const ds = setupLiveDs({ lastScreenStatus: 'idle' });
+    await postTurnCard(ds, TURN, 'om_before_manual_invalidation');
+    let resolveManual!: (id: string) => void;
+    const manualPosting = postFreshStreamingCard(ds, vi.fn(() => new Promise<string>(resolve => { resolveManual = resolve; })) as any);
+    await vi.advanceTimersByTimeAsync(0);
+    if (mode === 'kill') killWorker(ds);
+    else ds.session.suspendedColdResume = true;
+    deleteMessageMock.mockClear();
+    resolveManual('om_manual_after_invalidation');
+    expect(await manualPosting).toBe(false);
+    expect(ds.streamCardId).toBe('om_before_manual_invalidation');
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP, 'om_manual_after_invalidation');
+  });
 });
-
-

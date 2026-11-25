@@ -7832,6 +7832,16 @@ function reconcilePublishedStartingCard(
   };
   if (opts.superseded || ds.streamCardId !== messageId) return empty;
   const ownsHealthTurn = !!turnId && ds.currentTurnId === turnId;
+  // A fatal startup error is newer than every pre-POST health/capture snapshot.
+  // Reconcile it even while a predecessor still owns capture: the direct PATCH
+  // during POST was rejected by the sentinel, and a deferred watchdog cannot
+  // communicate this terminal failure on the queued turn's behalf.
+  if (ownsHealthTurn && ds.cliStartupFailureReason) {
+    if (opts.status !== 'interrupted') {
+      reconcilePostedStartingCard(ds, turnId, -1, 'interrupted');
+    }
+    return { ...empty, ownsHealthTurn, reconciledOutOfStarting: opts.status === 'starting' };
+  }
   // Step 1: Settle any terminal that arrived while the card POST/restore PATCH
   // was in flight (for both `starting` and `working` cards) before reconciling.
   let terminalCurrent = false;
@@ -7936,6 +7946,9 @@ function armPublishedStartingCardWatchdog(
   },
 ): void {
   if (!turnId || !outcome.ownsHealthTurn || outcome.terminalCurrent || outcome.reconciledByLiveFrame) return;
+  // Startup failure is terminal for this card; never manufacture a later
+  // `stalled` badge over the explicit interruption.
+  if (ds.cliStartupFailureReason) return;
   // - Cold / unproven `starting` cards get active/deferred watchdog tracking.
   // - Pre-POST native acceptance without live working proof MUST ALWAYS arm a
   //   watchdog (active when capturing, host-turn when folded behind host T1),
@@ -8180,10 +8193,13 @@ export async function postFreshStreamingCard(
   const completedHandoffAtPost = ds.session.handoffLiveCard?.closed
     ? ds.session.handoffLiveCard.turnId : undefined;
   const sessionAtPost = ds.session;
+  const workerAtPost = ds.worker;
   const appIdAtPost = ds.larkAppId;
   const displayAnchorAtPost = sessionAnchorId(ds);
   const runtimeKeyAtPost = activeSessionKey(ds);
   const cardReplyTarget = captureStreamingCardReplyTarget(ds);
+  const manualTurnIdAtPost = cardReplyTarget.turnId ?? ds.currentTurnId;
+  const manualNotCapturingAtPost = !!manualTurnIdAtPost && unifiedReplyTurnNotCapturing(ds, manualTurnIdAtPost);
 
   const postingNonce = randomBytes(4).toString('hex');
   ds.streamCardNonce = postingNonce;
@@ -8241,6 +8257,8 @@ export async function postFreshStreamingCard(
   };
   const stillOwnsPost = (): boolean =>
     ownsPost()
+    && !ds.session.suspendedColdResume
+    && (!workerAtPost || (ds.worker === workerAtPost && !workerAtPost.killed))
     && remoteRetirementAdmissionPhase(ds) === null
     && retainsLarkStreamingCardTransport(ds);
   if (!stillOwnsPost()) {
@@ -8307,12 +8325,17 @@ export async function postFreshStreamingCard(
     // screen_updates are working→working (no status edge) — arm the periodic
     // usage refresh here, now that the real id is committed and pending cleared.
     syncUsageRefreshTimer(ds);
-    const manualTurnId = cardReplyTarget.turnId ?? ds.currentTurnId;
-    const manualNotCapturing = !!manualTurnId && unifiedReplyTurnNotCapturing(ds, manualTurnId);
-    if (!manualNotCapturing && (ds.streamCardStatusRevision ?? 0) !== statusRevisionAtPost
-      && ds.lastScreenStatus && ds.lastScreenStatus !== status) {
-      reconcilePostedStartingCard(ds, manualTurnId, statusRevisionAtPost);
-    }
+    // The existing pending/degraded health entry was rebound to this card above.
+    // Reconcile all evidence that arrived behind the POST sentinel without
+    // re-arming (and thereby resetting) that watchdog: native acceptance,
+    // terminal settlement, capture activation, startup failure, and status edges.
+    reconcilePublishedStartingCard(ds, manualTurnIdAtPost, messageId, {
+      status,
+      statusRevisionAtPost,
+      wasNotCapturingAtPost: manualNotCapturingAtPost,
+      superseded: false,
+      trackActivation: true,
+    });
     logger.info(`[${tag(ds)}] Posted streaming card via /card`);
     continuePublishedStreamingCardPinChain(ds, messageId, predecessorIds);
     return true;
@@ -22237,10 +22260,15 @@ function setupWorkerHandlers(
   ): void => {
     const notCapturing = unifiedReplyTurnNotCapturing(ds, turnId);
     if (opts.requireNotCapturing && !notCapturing) return;
+    // Native acceptance is evidence for its explicit attempt. Advance only the
+    // current turn (never a late predecessor) before testing terminal identity:
+    // a strictly newer attempt is live retry evidence, while acceptance from the
+    // just-terminalized attempt must not recreate the history cleared by close.
+    if (turnId === ds.currentTurnId) noteTurnDispatchAttempt(ds, turnId, dispatchAttempt);
+    if (startingCardTurnTerminalCurrent(ds, turnId)) return;
     noteStartingCardNativeAcceptance(ds, turnId, dispatchAttempt);
     if (managedAuxUiSuppressed(turnId, dispatchAttempt)
       || ds.suppressRecoveryCard
-      || startingCardTurnTerminalCurrent(ds, turnId)
       || startingCardHealthStalledStatus(ds, turnId)) return;
     if (ds.currentTurnId === turnId
       && liveCardIsVisiblyStarting(ds)) {
@@ -25144,6 +25172,12 @@ function setupWorkerHandlers(
         // ZMX intentionally reports ready with port=0, but its plain-history
         // screenshots and idle/status transitions must keep flowing.
         if (!startupState.ready && !workerHasInitialized(ds)) break;
+        // A non-starting frame from the current turn's newer attempt must advance
+        // attempt identity before health matching. Restrict this to the current
+        // turn so a late predecessor can never move the global high-water back.
+        if (!stalePostTerminalBusy && msg.turnId === ds.currentTurnId) {
+          noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
+        }
         const screenTurnId = provenScreenTurnId(msg.turnId, msg.dispatchAttempt);
         const startingCardRecovered = !stalePostTerminalBusy
           && screenTurnAllowedForStartingCardHealth(msg.turnId, msg.dispatchAttempt, screenTurnId)
@@ -25719,6 +25753,9 @@ function setupWorkerHandlers(
           turnId: msg.turnId,
           dispatchAttempt: msg.dispatchAttempt,
         });
+        if (!stalePostTerminalShot && msg.turnId === ds.currentTurnId) {
+          noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
+        }
         const shotTurnId = msg.turnId ?? frameVerdict.source.turnId;
         const completedTurnShot = frameMatchesCompletedTurn(ds, {
           turnId: msg.turnId,
@@ -25790,7 +25827,6 @@ function setupWorkerHandlers(
         // above but must not overwrite the card image/cache or schedule a busy
         // PATCH — the post-terminal idle correction owns the visible card now.
         if (stalePostTerminalShot) break;
-        noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
         ds.currentImageKey = msg.imageKey;
         ds.currentImageSource = { imageKey: msg.imageKey, ...frameVerdict.source };
         // Accepted for display ⇒ consistent on re-expand: a verified public
