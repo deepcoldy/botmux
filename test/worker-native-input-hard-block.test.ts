@@ -10,6 +10,9 @@ import { detectCodexChoiceModal } from '../src/utils/codex-choice-modal.js';
 import { promptCacheKeepaliveRefusal } from '../src/core/prompt-cache-keepalive-gate.js';
 import { inputForcesSerialTurn, pendingInputAllowsTypeAhead } from '../src/utils/pending-input-queue.js';
 import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gate.js';
+import { CodexRunnerFreshnessInputQueue } from '../src/services/codex-runner-freshness.js';
+import { settleStaleWriteContinuation } from '../src/services/submit-confirmation.js';
+import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 
@@ -18,6 +21,7 @@ const COMMAND = `/rename ${TITLE}`;
 const SID = '01a20c74-121d-76b2-bc30-939e1dc3d71c';
 const fixture = (name: string) => readFileSync(new URL(`./fixtures/session-rename/${name}`, import.meta.url), 'utf8');
 const choiceModal = readFileSync(new URL('./fixtures/codex-choice-modal/tmux-pane-tool-approval-160x30.txt', import.meta.url), 'utf8');
+const traexQuestion = readFileSync(new URL('./fixtures/traex-question/traex-0.214.1-single-160x50.txt', import.meta.url), 'utf8');
 const codexDialog = (title: string) => [
   '>_ OpenAI Codex', '', '  Rename thread', '', `› ${title}`, '', 'enter submit  |  esc back',
 ].join('\n');
@@ -47,8 +51,9 @@ function inputHarness(cliId: 'codex' | 'traex', viewport: string, persistentReat
       watchSessionRename: vi.fn(() => () => false),
       writeInput: cliId === 'codex' ? vi.fn(adapter.writeInput) : vi.fn(async () => ({ submitted: true })),
     },
-    lastInitConfig: { cliId, nativeSessionTitle: TITLE, promptInjection: 'none' },
+    lastInitConfig: { cliId, backendType: 'tmux', nativeSessionTitle: TITLE, promptInjection: 'none' },
     lastSpawnPersistentReattach: persistentReattach,
+    captureBackendScreen: () => viewport,
     backendScreenEvidenceIsAuthoritativeForMutation: () => true,
     openingInputBoxSettled: true,
     inputBoxJudgeable: () => false,
@@ -73,6 +78,11 @@ function inputHarness(cliId: 'codex' | 'traex', viewport: string, persistentReat
   h.scope.sessionInputSurfaceNow = loadWorkerFunction('sessionInputSurfaceNow', h.scope);
   h.scope.sessionRenameSurfaceNow = loadWorkerFunction('sessionRenameSurfaceNow', h.scope);
   h.scope.sessionInputBlocksDeliveryNow = loadWorkerFunction('sessionInputBlocksDeliveryNow', h.scope);
+  h.scope.hasPendingInputForFlush = loadWorkerFunction('hasPendingInputForFlush', h.scope);
+  h.scope.idleDetector.programStatusBlock = () => null;
+  h.scope.traexQuestionBridgeActive = loadWorkerFunction('traexQuestionBridgeActive', h.scope);
+  h.scope.traexQuestionBlockReported = loadWorkerFunction('traexQuestionBlockReported', h.scope);
+  h.scope.traexQuestionDeliveryOwnsInput = loadWorkerFunction('traexQuestionDeliveryOwnsInput', h.scope);
   h.scope.holdNativeInputForHardBlock = loadWorkerFunction('holdNativeInputForHardBlock', h.scope);
   h.scope.armNativeInputBlockRecheck = vi.fn();
   h.scope.notifyNativeInputBlocked = vi.fn();
@@ -279,38 +289,122 @@ describe('native hard input-focus blocks across real delivery paths', () => {
     })).toBeUndefined();
   });
 
-  it('lets the TRAE question card own input instead of the generic dialog hold', async () => {
-    // A question card can make the surface read as blocked, but it has its own
-    // hold/notify/bridge path. The generic hard-block recheck must not preempt it.
-    const blocked = fixture('traex-0.216.0-rename-dialog.txt');
+  it('does not let ordinary TRAE question-bridge capability bypass the generic hard block', async () => {
+    const h = inputHarness('traex', fixture('traex-0.216.0-rename-dialog.txt'));
+    expect(h.scope.traexQuestionBridgeActive()).toBe(true);
+    expect(h.scope.traexQuestionDeliveryOwnsInput()).toBe(false);
 
-    // Question bridge active: the generic hold never arms on the same blocked screen.
-    const owned = inputHarness('traex', blocked);
-    owned.scope.traexQuestionDeliveryOwnsInput = loadWorkerFunction('traexQuestionDeliveryOwnsInput', owned.scope);
-    owned.scope.traexQuestionBridgeActive = () => true;
+    await h.flush();
+
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(h.scope.armNativeInputBlockRecheck).toHaveBeenCalled();
+  });
+
+  it('lets a visible TRAE question page use its dedicated hold, including adopt hard-block coverage', async () => {
+    const owned = inputHarness('traex', traexQuestion);
+    owned.scope.hookReviewHoldsQueuedWrite = () => true;
     await owned.flush();
+    expect(owned.scope.traexQuestionDeliveryOwnsInput()).toBe(true);
+    expect(owned.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(owned.scope.pendingMessages).toHaveLength(1);
     expect(owned.scope.armNativeInputBlockRecheck).not.toHaveBeenCalled();
     expect(owned.scope.notifyNativeInputBlocked).not.toHaveBeenCalled();
 
-    // Control: with no question card, the identical blocked screen is held generically.
-    const generic = inputHarness('traex', blocked);
-    generic.scope.traexQuestionDeliveryOwnsInput = loadWorkerFunction('traexQuestionDeliveryOwnsInput', generic.scope);
-    generic.scope.traexQuestionBridgeActive = () => false;
-    await generic.flush();
-    expect(generic.scope.armNativeInputBlockRecheck).toHaveBeenCalled();
+    // Adopted panes have no question bridge. The same page must be held by the
+    // generic surface guard, never bypassed by the dedicated terminal path.
+    const adopt = inputHarness('traex', traexQuestion);
+    adopt.scope.lastInitConfig.adoptMode = true;
+    await adopt.flush();
+    expect(adopt.scope.traexQuestionBridgeActive()).toBe(false);
+    expect(adopt.scope.traexQuestionDeliveryOwnsInput()).toBe(false);
+    expect(adopt.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(adopt.scope.pendingMessages).toHaveLength(1);
+    expect(adopt.scope.armNativeInputBlockRecheck).toHaveBeenCalled();
   });
 
-  it('traexQuestionDeliveryOwnsInput is false outside TRAE or without a question surface', () => {
+  it('honours an OSC question edge before the page is visible without opening the generic hold', async () => {
+    const h = inputHarness('traex', fixture('traex-0.216.0-renamed.txt'));
+    h.scope.idleDetector.programStatusBlock = () => ({ kind: 'question' });
+    h.scope.hookReviewHoldsQueuedWrite = () => true;
+
+    await h.flush();
+
+    expect(h.scope.traexQuestionDeliveryOwnsInput()).toBe(true);
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.armNativeInputBlockRecheck).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toHaveLength(1);
+  });
+  it('restores a dequeued raw command at the FIFO head when a dialog refuses it', async () => {
+    const h = inputHarness('codex', codexDialog(''));
+    const queue = new CodexRunnerFreshnessInputQueue<any, any>(() => 'current', () => {});
+    const later = { type: 'raw_input', content: '/status', turnId: 'raw-later' };
+    queue.enqueueRaw(later);
+    h.scope.freshnessInputQueue = queue;
+    h.scope.pendingRawInputs = queue.raw;
+    const head = { type: 'raw_input', content: '/compact', turnId: 'raw-head' };
+
+    await loadWorkerFunction<(msg: any, requeueAtHead?: boolean) => Promise<void>>('deliverRawInput', h.scope)(head, true);
+
+    expect(queue.raw).toEqual([head, later]);
+    expect(h.backend.write).not.toHaveBeenCalled();
+  });
+
+  it('applies the Codex outer hard guard to adopt, raw, pending-rename and adopt-queue writes', async () => {
+    for (const mode of ['adopt', 'raw', 'rename', 'adopt-queue'] as const) {
+      const h = inputHarness('codex', codexDialog(''));
+      if (mode === 'adopt') h.scope.lastInitConfig.adoptMode = true;
+      if (mode === 'raw') h.scope.pendingRawInputs.push({ content: '/status', turnId: 'raw' });
+      if (mode === 'rename') h.scope.pendingSessionRename = 'pending title';
+      if (mode === 'adopt-queue') h.scope.pendingAdoptMessages.push({ content: 'adopt', turnId: 'adopt' });
+
+      await h.flush();
+
+      expect(h.scope.cliAdapter.writeInput, mode).not.toHaveBeenCalled();
+      expect(h.scope.armNativeInputBlockRecheck, mode).toHaveBeenCalled();
+      expect(h.backend.write, mode).not.toHaveBeenCalled();
+    }
+  });
+
+  it('rechecks the surface at the pending-rename write edge after the outer gate', async () => {
+    const idle = fixture('traex-0.216.0-renamed.txt');
+    const dialog = fixture('traex-0.216.0-rename-dialog.txt');
+    const h = inputHarness('traex', idle);
+    h.scope.pendingMessages.splice(0);
+    h.scope.pendingSessionRename = 'replacement title';
+    const sendRename = vi.fn(async () => {});
+    h.scope.sendRawCommandLineWithRecoveryFence = sendRename;
+    let reads = 0;
+    h.backend.captureInputState = () => ({ viewport: reads++ === 0 ? idle : dialog });
+
+    await h.flush();
+
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(sendRename).not.toHaveBeenCalled();
+    expect(h.scope.pendingSessionRename).toBe('replacement title');
+    expect(h.scope.sessionRenamePhase).toBe('idle');
+    expect(h.scope.armNativeInputBlockRecheck).toHaveBeenCalled();
+  });
+
+  it('stops the shared recheck without another screen capture once every queue is empty', async () => {
+    vi.useFakeTimers();
     const h = inputHarness('traex', fixture('traex-0.216.0-rename-dialog.txt'));
-    h.scope.traexQuestionBridgeActive = () => false;
-    const resolve = loadWorkerFunction<() => boolean>('traexQuestionDeliveryOwnsInput', h.scope);
-    expect(resolve()).toBe(false); // no bridge, screen path throws without captureBackendScreen -> caught
-    h.scope.traexQuestionBridgeActive = () => true;
-    expect(resolve()).toBe(true); // bridge short-circuits before the screen read
-    const codex = inputHarness('codex', codexDialog(''));
-    codex.scope.traexQuestionBridgeActive = () => true;
-    const codexResolve = loadWorkerFunction<() => boolean>('traexQuestionDeliveryOwnsInput', codex.scope);
-    expect(codexResolve()).toBe(false); // non-TRAE never owns via this path
+    const capture = vi.fn(h.backend.captureInputState);
+    h.backend.captureInputState = capture;
+    h.scope.armNativeInputBlockRecheck = loadWorkerFunction('armNativeInputBlockRecheck', h.scope);
+    h.scope.holdNativeInputForHardBlock();
+    expect(vi.getTimerCount()).toBe(1);
+
+    h.scope.pendingMessages.splice(0);
+    h.scope.pendingAdoptMessages.splice(0);
+    h.scope.pendingRawInputs.splice(0);
+    h.scope.pendingInjections.splice(0);
+    h.scope.pendingSessionRename = null;
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(capture).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.scope.nativeInputBlockLogged).toBe(false);
   });
 });
 
@@ -371,6 +465,57 @@ describe('Codex Turn 2+ untouched refusal recovery', () => {
     await h.flush();
     expect(readinessAtPaste).toEqual([false]);
     expect(h.scope.beginCliWriteCycle.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it.each([
+    { label: 'ordinary input', token: undefined },
+    { label: 'queued activation', token: 'activation-token' },
+  ])('fences beforeSubmit and retains $label when the real adapter precheck crosses a generation', async ({ token }) => {
+    const home = mkdtempSync(join(tmpdir(), 'botmux-before-submit-stale-'));
+    dirs.push(home);
+    vi.stubEnv('CODEX_HOME', home);
+    writeFileSync(join(home, 'history.jsonl'), '');
+    const h = inputHarness('codex', empty146.viewport);
+    const item = {
+      turnId: 'stale-turn', content: 'ordinary payload',
+      ...(token ? { queuedActivationToken: token } : {}),
+    };
+    h.scope.pendingMessages.splice(0, h.scope.pendingMessages.length, item);
+    const tracker = new InflightInputTracker();
+    const onWrite = vi.spyOn(tracker, 'onWrite');
+    h.scope.inflightInputs = tracker;
+    Object.assign(h.backend, {
+      cliPid: 12345,
+      expectedCodexSessionId: SID,
+      submitBracketedPaste: vi.fn(),
+      captureInputState: () => {
+        // The real adapter is now inside its asynchronous precheck. A replacement
+        // generation must win before prepareNormalWrite or any paste can run.
+        h.scope.cliSpawnGeneration++;
+        return empty146;
+      },
+    });
+    h.scope.beginCliWriteCycle = vi.fn(() => { h.scope.isPromptReady = false; });
+    const staleSettlement = vi.fn(settleStaleWriteContinuation);
+    h.scope.settleStaleWriteContinuation = staleSettlement;
+
+    await h.flush();
+
+    expect(h.backend.submitBracketedPaste).not.toHaveBeenCalled();
+    expect(h.backend.write).not.toHaveBeenCalled();
+    // One flush-level cycle and one per-item cycle are expected; a third would
+    // prove the stale beforeSubmit callback began committing the old write.
+    expect(h.scope.beginCliWriteCycle).toHaveBeenCalledTimes(2);
+    expect(onWrite).not.toHaveBeenCalled();
+    expect(h.scope.codexBridgeQueue.peek()).toEqual([]);
+    expect(h.scope.durableTurnInFlight).not.toBe(true);
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(h.scope.pendingMessages[0]).toBe(item);
+    tracker.onCliExit();
+    expect(tracker.takeCarryOver()).toEqual([]);
+    expect(staleSettlement).not.toHaveBeenCalled();
+    expect(h.scope.emitTurnTerminal).not.toHaveBeenCalled();
+    expect(h.scope.send.mock.calls.filter(([event]: [any]) => event.type === 'queued_activation_submitted')).toEqual([]);
   });
 
   it('retains the entire FIFO with zero paste/failure, then submits each item after recovery', async () => {

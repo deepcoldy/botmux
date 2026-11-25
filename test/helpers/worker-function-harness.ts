@@ -240,6 +240,9 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'recoverSessionRenameAfterPersistentReattach') return () => false;
     if (key === 'recoverUnconfirmedSessionRename') return () => false;
     if (key === 'traexQuestionDeliveryOwnsInput') return () => false;
+    // Unrelated submission fixtures do not model the shared native-input hold;
+    // focused hard-block suites load the real function with explicit queues.
+    if (key === 'holdNativeInputForHardBlock') return () => {};
     // Input-focus guard is inert unless a fixture explicitly models a dialog or
     // draft. This keeps unrelated worker-function tests on their original path.
     if (key === 'sessionInputBlocksDeliveryNow') return () => false;

@@ -55,11 +55,11 @@ const REBOUND_MENU_FOOTER = /^\s*\S+\s+(?:select|confirm|choose)\b[^\r\n]{0,80}�
  *    over a still-live backdrop view: the dialog's rectangle begins mid-line, to
  *    the right of the backdrop's own text.
  *  Narrow panes also wrap, splitting `2. Yes, archive` across rows. */
-const NUMBERED_OPTION = /(?:^|[\s›»>])(\d+)\.(?:\s|$)/;
+const NUMBERED_OPTION = /(?:^|[\s›»>❯])(\d+)\.(?:\s|$)/;
 /** Selection marker sitting directly on an option number (`› 1. …`). */
-const MARKED_OPTION = /[›»>]\s*\d+\./;
+const MARKED_OPTION = /[›»>❯]\s*\d+\./;
 /** A marker left alone on its line by a narrow wrap. */
-const LONE_MARKER = /^\s*[›»>]\s*$/;
+const LONE_MARKER = /^\s*[›»>❯]\s*$/;
 /** The live composer prompt row (empty placeholder or user draft). */
 const COMPOSER_ROW = /^\s*[›»](?:\s|$)/;
 

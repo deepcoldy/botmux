@@ -99,8 +99,9 @@ export interface WriteInputContext {
   turnId?: string;
   /** Commit worker-side turn/write state after the adapter's pre-write input
    * checks, immediately before the actual paste. A pre-write refusal therefore
-   * leaves no durable turn, bridge mark, type-ahead or activation side effects. */
-  beforeSubmit?: () => void;
+   * leaves no durable turn, bridge mark, type-ahead or activation side effects.
+   * Returning false vetoes the paste when the worker's generation became stale. */
+  beforeSubmit?: () => boolean | void;
   onInputPrepared?: (content: string) => void;
   /** Durable replay identity. Runner adapters may forward this with turnId so
    * late output from an older attempt cannot settle its successor. */
@@ -551,6 +552,12 @@ export interface CliAdapter {
    *  answers; upper layers (resume receipt, closed card) ask it instead of
    *  assuming either way. */
   readonly resumeFindsOwnSession?: boolean;
+
+  /** This adapter performs asynchronous input-surface prechecks and invokes
+   * `context.beforeSubmit` only after they pass. The worker must therefore not
+   * also commit normal-write state through the transaction's early beforeWrite
+   * hook. Adapters without this capability retain the legacy beforeWrite path. */
+  readonly writeInputDefersPreparation?: true;
 
   /** Write user input to PTY. May fire writes asynchronously (e.g. Aiden delayed Enter).
    *  Resolves when all writes are complete.

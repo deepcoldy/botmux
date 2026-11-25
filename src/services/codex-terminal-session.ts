@@ -124,6 +124,7 @@ export function codexNativeFooterRows(footer: string[]): string | undefined {
   if (footer.length === 1) {
     const row = footer[0]!.trim();
     const nativeSingle = row.includes(' · ')
+      || /^Context\s+\d+%\s+(?:left|used)\b/i.test(row)
       || /^\d+%\s+context\s+(?:left|used)\b/i.test(row)
       || /^\d+%\s+(?:left|used)\b/i.test(row)
       || /^⚠(?:️)?\s*\d+\b/.test(row)
@@ -170,9 +171,10 @@ export function codexSessionRenameSurface(
   if (composer < 0) {
     return CODEX_ACTIVE_BUSY_PATTERN.test(rows.slice(-6).join('\n')) ? 'occupied' : 'unknown';
   }
+  const composerPrompt = /^(\s*)[›»](?:\s|$)/.exec(rows[composer]!)!;
+  const composerHomeX = (composerPrompt[1]?.length ?? 0) + 2;
   const neighborhood = rows.slice(Math.max(0, composer - 4), composer + 5).join('\n');
-  const cursor = evidence.cursor
-    ?? { x: (/^\s*/.exec(rows[composer]!)?.[0].length ?? 0) + 2, y: composer };
+  const cursor = evidence.cursor ?? { x: composerHomeX, y: composer };
   const nativeState = codexNativeComposerState({ viewport, cursor }, { allowCodex0146Hints: true });
   if (nativeState === 'empty') {
     return CODEX_ACTIVE_BUSY_PATTERN.test(neighborhood) ? 'occupied' : 'settled';
@@ -181,16 +183,17 @@ export function codexSessionRenameSurface(
   for (let end = composer + 1; end < rows.length; end++) {
     if (codexNativeFooterRows(rows.slice(end).filter(row => row.trim())) === undefined) continue;
     const composerText = rows[composer]!.replace(/^\s*[›»]/, '').trim();
-    // A bare prompt with an unfamiliar footer is unknown, never a human draft.
-    if (!composerText) return 'unknown';
+    // With the cursor still at Home, unfamiliar continuation rows may be new
+    // native chrome. Once the cursor proves multiline input, judge those rows.
+    if (!composerText && cursor.x === composerHomeX && cursor.y === composer) return 'unknown';
     const body = [rows[composer]!.replace(/^\s*[›»]/, ''), ...rows.slice(composer + 1, end).filter(row =>
-      !/^\s*(?:Queued for capacity|Resuming session)\b/i.test(row)
+      !/^\s*(?:[^\w\s]\s+)?(?:Queued for capacity|Resuming session)\b/i.test(row)
       && !/^\s*│\s*(?:model|directory):\s*loading\b/i.test(row)
       && !CODEX_ACTIVE_BUSY_PATTERN.test(row)
     )].join('');
     // A bare prompt with an unfamiliar footer is unknown, never a human draft.
     if (!body.trim()) return 'unknown';
-    if (isCodexNativeComposerHint(body) && cursor.x === 2) {
+    if (isCodexNativeComposerHint(body) && cursor.x === composerHomeX && cursor.y === composer) {
       // Ghost hints may wrap on narrow screens. Busy/loading chrome means the
       // turn is occupied; unfamiliar chrome stays unknown, never hard-blocked.
       return CODEX_ACTIVE_BUSY_PATTERN.test(neighborhood) ? 'occupied' : 'unknown';

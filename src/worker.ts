@@ -6320,11 +6320,10 @@ function startupInputHeld(): boolean {
     || startupCommandAckHold !== null;
 }
 
-/** Type the fresh-spawn `/rename` once per worker. Not part of startupCommands,
- *  so the re-arm in spawnCli cannot replay it. Once an attempt actually starts,
- *  a later restart must not apply the original title over a name the user may
- *  already have changed. A restart that is already in progress does not consume
- *  the command; the replacement flush does. */
+/** Type the fresh-spawn `/rename` once per worker, outside startupCommands so
+ * spawnCli cannot re-arm it. A restart already in progress leaves the command
+ * unconsumed for the replacement flush; once consumed, no later CLI restart
+ * reapplies the original title over a user's own rename. */
 async function runInitialNativeRename(): Promise<void> {
   const cmd = lastInitConfig?.initialNativeRename?.trim();
   if (!cmd || hasRunInitialNativeRename) return;
@@ -6460,6 +6459,11 @@ function stopNativeSessionTitleSync(): void {
  * released by prompt-ready. */
 type SessionRenamePhase = 'idle' | 'reserved' | 'writing' | 'sent';
 let sessionRenamePhase: SessionRenamePhase = 'idle';
+/** True while this rename belongs to persistent-pane reattach recovery. The
+ * provenance survives draft/dialog → settled/unknown transitions until the
+ * whole rename settles, so a later timer cannot invent readiness the previous
+ * worker never established. */
+let sessionRenamePreserveReattachReadiness = false;
 const SESSION_RENAME_IDLE_TIMEOUT_MS = 5_000;
 /** Re-read cadence while a rename the adapter can judge is not yet settled;
  *  each read is a terminal capture, so a long hold backs off. A redraw from
@@ -6505,6 +6509,7 @@ function forceClearSessionRenameInFlight(): void {
     sessionRenameReattachRetryTimer = null;
   }
   sessionRenamePhase = 'idle';
+  sessionRenamePreserveReattachReadiness = false;
   sessionRenameCommand = undefined;
   sessionRenameRecorded = undefined;
   sessionRenameHistoricalRecorded = undefined;
@@ -6553,8 +6558,12 @@ function sessionInputBlocksDeliveryNow(): boolean {
  * Never preempt it with the generic dialog hold, including a page whose stream
  * arrived before the bridge had a chance to parse it. */
 function traexQuestionDeliveryOwnsInput(): boolean {
-  if (lastInitConfig?.cliId !== 'traex') return false;
-  if (traexQuestionBridgeActive()) return true;
+  if (lastInitConfig?.cliId !== 'traex' || !traexQuestionBridgeActive()) return false;
+  // Bridge capability is static for every ordinary local TRAE session. It must
+  // not bypass the generic dialog/draft guard unless a question is actually
+  // reported or visible. Adopted panes have no question bridge, so their native
+  // question page remains owned by the generic hard block instead.
+  if (traexQuestionBlockReported()) return true;
   try { return !!backend && traexQuestionFlowVisible(captureBackendScreen(backend)); } catch { return false; }
 }
 
@@ -6571,6 +6580,13 @@ function armNativeInputBlockRecheck(): void {
   nativeInputBlockRetryTimer = setTimeout(() => {
     nativeInputBlockRetryTimer = null;
     if (generation !== cliSpawnGeneration) return;
+    // A user may submit/clear the last queued item while the native dialog is
+    // still open. With no work left there is nothing to re-drive: stop before
+    // another capture instead of polling the same screen forever.
+    if (!hasPendingInputForFlush() && pendingInjections.length === 0) {
+      nativeInputBlockLogged = false;
+      return;
+    }
     if (sessionInputBlocksDeliveryNow()) {
       armNativeInputBlockRecheck();
       return;
@@ -6720,18 +6736,21 @@ function notifySessionRenameInputHeld(): void {
 
 /** The hard-cap outcome is a different notice from the initial "still waiting"
  *  message, so it is not swallowed by that earlier notification's latch. */
-function notifySessionRenameInputTimeout(outcome: 'held' | 'released', seconds = Math.round(SESSION_RENAME_HOLD_TIMEOUT_MS / 1000)): void {
+function notifySessionRenameInputTimeout(outcome: 'held' | 'recovery-held' | 'released', seconds = Math.round(SESSION_RENAME_HOLD_TIMEOUT_MS / 1000)): void {
   const head = pendingMessages[0] ?? pendingAdoptMessages[0];
   const rawHead = pendingRawInputs[0];
-  if ((outcome === 'held' && sessionRenameHoldTimeoutNoticeSent) || (!head && !rawHead)) return;
-  if (outcome === 'held') sessionRenameHoldTimeoutNoticeSent = true;
+  const held = outcome !== 'released';
+  if ((held && sessionRenameHoldTimeoutNoticeSent) || (!head && !rawHead)) return;
+  if (held) sessionRenameHoldTimeoutNoticeSent = true;
   send({
     type: 'user_notify',
     turnId: head?.turnId ?? rawHead?.turnId ?? currentBotmuxTurnId,
     dispatchAttempt: head?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
     message: t(outcome === 'released'
       ? 'worker.session_rename_release_timeout'
-      : 'worker.session_rename_hold_timeout', {
+      : outcome === 'recovery-held'
+        ? 'worker.session_rename_recovery_held'
+        : 'worker.session_rename_hold_timeout', {
       cliName: cliName(), seconds,
     }),
   });
@@ -6741,22 +6760,54 @@ function notifySessionRenameInputTimeout(outcome: 'held' | 'released', seconds =
  * vetoes it. Unknown/unjudged evidence may recover after a receipt or the cap;
  * an ordinary busy `occupied` surface still waits for a real terminal. */
 function restoreSessionRenameReadiness(surface: SessionRenameSurface | undefined, opts: { preserveReattachGate?: boolean } = {}): void {
-  if (idleDetector?.programStatusHeldBusy() || programStatusBlockedHoldsTypeAhead()) {
+  if (idleDetector?.programStatusHeldBusy?.() || programStatusBlockedHoldsTypeAhead()) {
     return;
   }
   if (surface === 'occupied' || surface === 'blocked' || surface === 'unsubmitted') return;
-  // A reattach whose open-turn/startup gate is still pending must not be made
-  // ready by the unknown cap. Keep that gate authoritative until it is proven.
-  if (opts.preserveReattachGate && reattachOpenTurnGate) return;
+  // Reattach recovery may preserve an already-ready prompt, but it must never
+  // manufacture readiness for an unproven open-turn gate OR a quiet unknown pane
+  // whose previous worker had not established readiness before disappearing.
+  if (opts.preserveReattachGate && (reattachOpenTurnGate || !isPromptReady)) return;
   isPromptReady = true;
   if (!opts.preserveReattachGate) reattachOpenTurnGate = false;
-  idleDetector?.adoptPromptReady();
+  idleDetector?.adoptPromptReady?.();
+}
+
+/** Static properties decide whether this runtime can EVER use #3816's owned
+ * process replacement. Transient restart/write fences are deliberately absent:
+ * those may clear on a later timer and must not be mislabeled permanent. */
+function sessionRenameRecoveryRuntimeAllowed(): boolean {
+  return lastInitConfig?.cliId === 'traex'
+    && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
+    && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)
+    && !sessionRenameRecoveryUsed;
+}
+
+/** Exact live process/thread proof required before replacing a TRAE CLI. */
+function sessionRenameOwnedRecoverySessionId(): string | undefined {
+  const nativeSessionId = sessionRenameNativeSessionIdNow();
+  if (!nativeSessionId) return undefined;
+  // A user may have switched native threads since the rename started. Never
+  // trust a cached receipt identity or an ambiguous multi-thread FD set.
+  const pid = currentTraexObservedPid();
+  const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
+  if (!owned || owned.size !== 1 || !(owned.has(nativeSessionId) || owned.has(nativeSessionId.toLowerCase()))) return undefined;
+  return nativeSessionId;
+}
+
+/** A statically ineligible runtime, or one whose exact live thread cannot be
+ * proven at the cap, must reach the bounded delivery fallback. Waiting another
+ * ten seconds cannot make an ambiguous/multi-rollout identity safe to restart.
+ * Only transient restart/write fences may keep an already-proven empty composer
+ * held for a later recovery opportunity. */
+function sessionRenameRecoveryPermanentlyUnavailable(): boolean {
+  if (!sessionRenameRecoveryRuntimeAllowed()) return true;
+  if (!backend || cliRestartInProgress || closeRequested) return false;
+  return !sessionRenameOwnedRecoverySessionId();
 }
 
 function recoverUnconfirmedSessionRename(surface: SessionRenameSurface | undefined): boolean {
-  const mayRestart = !!backend && lastInitConfig?.cliId === 'traex'
-    && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
-    && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)
+  const mayRestart = sessionRenameRecoveryRuntimeAllowed() && !!backend
     && !closeRequested && !cliRestartInProgress && !rawInputRestartGate && !codexAutoUpgrade
     && !pendingWebTerminalInput() && commandLineWritesPending === 0
     && !isFlushing && !injectionFlushing;
@@ -6768,16 +6819,10 @@ function recoverUnconfirmedSessionRename(surface: SessionRenameSurface | undefin
     alreadyRecovered: sessionRenameRecoveryUsed,
     mayRestart,
   })) return false;
-  // The init-time resume target alone is not evidence. Never trade a missing
-  // receipt for a fresh conversation or restart somebody else's adopted CLI.
-  const nativeSessionId = sessionRenameNativeSessionIdNow();
+  // The init-time resume target alone is not evidence. Restart only the exact
+  // live thread owned by this CLI, never a fresh conversation or adopted peer.
+  const nativeSessionId = sessionRenameOwnedRecoverySessionId();
   if (!nativeSessionId) return false;
-  // A user may have switched native threads from the terminal since the
-  // rename started. Recheck the live process rather than trusting the cached
-  // receipt identity, and refuse an ambiguous multi-thread FD set.
-  const pid = currentTraexObservedPid();
-  const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
-  if (!owned || owned.size !== 1 || !(owned.has(nativeSessionId) || owned.has(nativeSessionId.toLowerCase()))) return false;
   sessionRenameRecoveryUsed = true;
   abandonedAutomaticRenameCommand = sessionRenameCommand;
   const head = pendingMessages[0];
@@ -6811,20 +6856,6 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
   const recoveryAfterMs = lastInitConfig?.cliId === 'traex' && surface === 'settled'
     ? SESSION_RENAME_RECOVERY_AFTER_MS : SESSION_RENAME_HOLD_TIMEOUT_MS;
   const holdExpired = Date.now() - sessionRenameSentAtMs >= recoveryAfterMs;
-  // PR #3816 owns the TRAE settled/title-mismatch restart path at 60s. Give it
-  // priority over the generic cap; other surfaces keep the 45s safety net.
-  if (!recorded && recoverUnconfirmedSessionRename(surface)) return;
-  if (lastInitConfig?.cliId === 'traex' && surface === 'settled' && holdExpired && !recorded) {
-    // #3816 cannot currently replace the CLI. Keep waiting for its next real
-    // recovery opportunity; never downgrade this to release_unconfirmed.
-    if (!sessionRenameHoldTimeoutLogged) {
-      sessionRenameHoldTimeoutLogged = true;
-      log(`WARN Native session rename recovery remains unavailable after ${recoveryAfterMs}ms; queued input stays held`);
-    }
-    notifySessionRenameInputTimeout('held', Math.round(recoveryAfterMs / 1000));
-    armSessionRenameIdleTimeout(SESSION_RENAME_SLOW_RECHECK_MS);
-    return;
-  }
   const step = decideSessionRenameSettlement({
     surface,
     recorded,
@@ -6832,10 +6863,31 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
     fromPrompt: source === 'prompt',
     holdExpired,
   });
+  // A prompt edge may clear only a positively releasable rename. In particular
+  // it must never start a CLI restart and then continue markPromptReady on the
+  // dying generation; the armed timer exclusively owns recovery and timeout.
+  if (source === 'prompt' && step !== 'release') return;
+  // PR #3816 owns the TRAE settled/title-mismatch restart path at 60s. Give it
+  // priority over the generic cap; other surfaces keep the 45s safety net.
+  if (source === 'timer' && !recorded && recoverUnconfirmedSessionRename(surface)) return;
+  if (source === 'timer' && lastInitConfig?.cliId === 'traex' && surface === 'settled'
+    && holdExpired && !recorded && !sessionRenameRecoveryPermanentlyUnavailable()) {
+    // Recovery exists for this runtime but is transiently unavailable (for
+    // example its exact live thread is still ambiguous). Keep the empty composer
+    // held with an accurate notice rather than claiming a visible draft/dialog.
+    if (!sessionRenameHoldTimeoutLogged) {
+      sessionRenameHoldTimeoutLogged = true;
+      log(`WARN Native session rename recovery remains temporarily unavailable after ${recoveryAfterMs}ms; queued input stays held`);
+    }
+    notifySessionRenameInputTimeout('recovery-held', Math.round(recoveryAfterMs / 1000));
+    armSessionRenameIdleTimeout(SESSION_RENAME_SLOW_RECHECK_MS);
+    return;
+  }
   if (step === 'release' || step === 'release_unconfirmed') {
     const held = sessionRenameHoldLogged;
     const timedOut = step === 'release_unconfirmed';
-    if (timedOut) notifySessionRenameInputTimeout('released');
+    const preserveReattachGate = sessionRenamePreserveReattachReadiness;
+    if (timedOut) notifySessionRenameInputTimeout('released', Math.round(recoveryAfterMs / 1000));
     forceClearSessionRenameInFlight();
     const evidence = surface === undefined ? 'unjudged' : 'recorded by the CLI';
     if (source === 'prompt') {
@@ -6846,7 +6898,7 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
     }
     // Restore only through the native-veto-aware path: a static empty composer
     // must not manufacture readiness over OSC-7501 approvals or held busy turns.
-    restoreSessionRenameReadiness(surface);
+    restoreSessionRenameReadiness(surface, { preserveReattachGate });
     log(timedOut
       ? `WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; releasing queued input without a receipt (${surface}); normal delivery gates remain in force`
       : surface === undefined
@@ -6864,7 +6916,6 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
     armSessionRenameIdleTimeout(remainingMs > 0 ? Math.min(SESSION_RENAME_RECHECK_MS, remainingMs) : SESSION_RENAME_RECHECK_MS);
     return;
   }
-  if (source === 'prompt') return;  // the armed timer re-reads and owns notice/recovery
   if (!sessionRenameHoldLogged) {
     sessionRenameHoldLogged = true;
     log(`Native session rename not confirmed (${surface}${sessionRenameResubmitted ? ' after one resubmit' : ''}); holding queued input until this rename is recorded and the ${cliName()} input surface is writable`);
@@ -6981,6 +7032,9 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
       });
     } catch { sessionRenameHistoricalRecorded = undefined; }
   }
+  // Preserve this provenance beyond the first surface read. A recovered draft
+  // may be cleared by a human before the ordinary rename timer releases it.
+  sessionRenamePreserveReattachReadiness = true;
   const surface = sessionRenameSurfaceNow();
   if (surface === 'unknown') {
     sessionRenameCommand = undefined;
@@ -7017,6 +7071,7 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
   }
   sessionRenameReattachRecoveryGeneration = generation;
   if (surface === undefined || surface === 'settled') {
+    sessionRenamePreserveReattachReadiness = false;
     sessionRenameCommand = undefined;
     sessionRenameHoldLogged = false;
     sessionRenameHoldNoticeSent = false;
@@ -28337,6 +28392,7 @@ async function flushPending(): Promise<void> {
       const renameGeneration = cliSpawnGeneration;
       pendingSessionRename = null;
       sessionRenamePhase = 'reserved';
+      sessionRenamePreserveReattachReadiness = false;
       try {
         const writeRename = async () => {
           // Transition to busy inside the adopt queue, after the readiness
@@ -29130,12 +29186,17 @@ async function flushPending(): Promise<void> {
               {
                 turnId: item.turnId,
                 dispatchAttempt: item.dispatchAttempt,
-                ...(lastInitConfig?.cliId === 'codex' ? { beforeSubmit: () => {
-                  // The precheck may have waited through a prompt-ready edge.
-                  // Re-open the write cycle immediately before actual paste so
-                  // composerOwned/readiness cannot describe that stale window.
+                ...(writeAdapter.writeInputDefersPreparation === true ? { beforeSubmit: () => {
+                  // The adapter's asynchronous precheck may outlive its CLI
+                  // generation. Refuse before committing ANY global turn state
+                  // or pasting into the backend that is already being replaced.
+                  if (!writeContinuationIsCurrent()) return false;
+                  // The precheck may also have waited through a prompt-ready
+                  // edge. Re-open the write cycle immediately before actual paste
+                  // so composerOwned/readiness cannot describe that stale window.
                   beginCliWriteCycle();
                   prepareNormalWrite();
+                  return true;
                 } } : {}),
                 onInputPrepared: content => { submittedText = content; },
                 ...(lastInitConfig?.cliId === 'codex'
@@ -29147,13 +29208,23 @@ async function flushPending(): Promise<void> {
               },
             ),
             settleVerifiableSubmissionForJournal,
-            lastInitConfig?.cliId === 'codex' ? undefined : prepareNormalWrite,
+            writeAdapter.writeInputDefersPreparation === true ? undefined : prepareNormalWrite,
           ).finally(() => { traexQuestionDraftWaiting = false; });
           result = transaction.result;
           recoveryFailureReason = transaction.recoveryFailureReason;
         }
         if (recoveryFailureReason) {
           result = { ...result, submitted: false };
+        }
+        if (!writeContinuationIsCurrent() && typedIntoComposer
+          && result?.submissionDisposition === 'untouched' && !normalWritePrepared) {
+          // The adapter vetoed before beforeSubmit, so onWrite/carryover never
+          // owned this item either. Restore the exact FIFO head instead of
+          // emitting an ambiguous terminal: ordinary input and queued activation
+          // must both survive a generation change with zero bytes written.
+          pendingMessages.unshift(item);
+          log(`Restored untouched pre-write input after CLI generation replacement (${item.content.length} chars)`);
+          break;
         }
         if (!writeContinuationIsCurrent()) {
           handleStaleWriteContinuation('write_generation_changed');

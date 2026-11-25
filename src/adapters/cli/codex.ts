@@ -497,6 +497,8 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       return discoverRolloutSessions(codexSessionsRoot(), limit, exclude);
     },
 
+    writeInputDefersPreparation: true,
+
     async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
       const blocked = await prepareCodexTranscriptInput(pty);
       if (blocked) return { submitted: false, submissionDisposition: 'untouched', failureReason: blocked };
@@ -533,7 +535,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         && !expectedRemoteSid && (!initialOwned || initialOwned.size === 0);
       if (correlated) content += `\n\n<botmux_routing>\nbotmux_input_id: ${randomBytes(16).toString('hex')}\n</botmux_routing>`;
       context?.onInputPrepared?.(content);
-      context?.beforeSubmit?.();
+      if (context?.beforeSubmit?.() === false) {
+        return {
+          submitted: false,
+          submissionDisposition: 'untouched',
+          failureReason: 'Codex CLI generation changed before submission',
+        };
+      }
       const acceptSid: HistorySidFilter | undefined = expectedRemoteSid
         ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
         : cliPid

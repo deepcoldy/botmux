@@ -3901,3 +3901,4 @@ describe('BridgeTurnQueue open-turn evidence, interrupts, and Scenario 3 unobser
     expect(q.getOpenTurnEvidence(head).activitySeq).toBe(before);
   });
 });
+

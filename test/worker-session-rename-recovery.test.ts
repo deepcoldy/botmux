@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,7 +9,12 @@ import { watchNativeSessionIndex } from '../src/services/native-session-index.js
 const TITLE = '[BotMux·Lark] restored title';
 const COMMAND = `/rename ${TITLE}`;
 
-function recoveryHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'unknown') {
+afterEach(() => {
+  vi.clearAllTimers();
+  vi.useRealTimers();
+});
+
+function recoveryHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'blocked' | 'unknown') {
   const probe = vi.fn(() => false);
   const watchSessionRename = vi.fn(() => probe);
   const scope: Record<string, any> = {
@@ -36,10 +41,14 @@ function recoveryHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'unkn
     armSessionRenameReattachRecoveryRetry: vi.fn(),
     notifySessionRenameInputHeld: vi.fn(),
     notifySessionRenameInputTimeout: vi.fn(),
-    restoreSessionRenameReadiness: vi.fn(),
+    idleDetector: { programStatusHeldBusy: () => false, adoptPromptReady: vi.fn() },
+    programStatusBlockedHoldsTypeAhead: () => false,
+    isPromptReady: false,
+    reattachOpenTurnGate: true,
     armSessionRenameIdleTimeout: vi.fn(),
     log: vi.fn(),
   };
+  scope.restoreSessionRenameReadiness = loadWorkerFunction('restoreSessionRenameReadiness', scope);
   return { scope, probe, watchSessionRename, recover: loadWorkerFunction<() => boolean>('recoverSessionRenameAfterPersistentReattach', scope) };
 }
 
@@ -155,6 +164,59 @@ describe('native rename recovery after persistent worker reattach', () => {
     expect(h.scope.isPromptReady).toBe(false);
     expect(h.scope.reattachOpenTurnGate).toBe(true);
     expect(h.scope.sessionRenameReattachRecoveryGeneration).toBe(h.scope.cliSpawnGeneration);
+  });
+
+  it('does not manufacture readiness at the unknown cap when no reattach gate remains', () => {
+    const h = recoveryHarness('unknown');
+    Object.assign(h.scope, {
+      sessionRenameSentAtMs: Date.now() - 45_000,
+      isPromptReady: false,
+      reattachOpenTurnGate: false,
+    });
+    h.scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', h.scope);
+
+    expect(h.recover()).toBe(false);
+
+    expect(h.scope.isPromptReady).toBe(false);
+    expect(h.scope.reattachOpenTurnGate).toBe(false);
+    expect(h.scope.idleDetector.adoptPromptReady).not.toHaveBeenCalled();
+    expect(h.scope.notifySessionRenameInputTimeout).toHaveBeenCalledWith('released');
+  });
+
+  it.each([
+    { before: 'unsubmitted' as const, after: 'settled' as const },
+    { before: 'occupied' as const, after: 'unknown' as const },
+    { before: 'blocked' as const, after: 'unknown' as const },
+  ])('preserves reattach readiness provenance across $before → $after before timer release', async ({ before, after }) => {
+    vi.useFakeTimers();
+    const h = recoveryHarness(before);
+    Object.assign(h.scope, {
+      sessionRenameIdleTimer: null,
+      SESSION_RENAME_IDLE_TIMEOUT_MS: 5_000,
+      SESSION_RENAME_RECHECK_MS: 2_000,
+      SESSION_RENAME_SLOW_RECHECK_MS: 10_000,
+      SESSION_RENAME_FAST_RECHECK_WINDOW_MS: 30_000,
+      SESSION_RENAME_RECOVERY_AFTER_MS: 60_000,
+      decideSessionRenameSettlement,
+      recoverUnconfirmedSessionRename: vi.fn(() => false),
+      resubmitSessionRename: vi.fn(() => false),
+      flushPending: vi.fn(),
+      cliName: () => 'Codex',
+    });
+    h.scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', h.scope);
+    h.scope.settleSessionRename = loadWorkerFunction('settleSessionRename', h.scope);
+    h.scope.armSessionRenameIdleTimeout = loadWorkerFunction('armSessionRenameIdleTimeout', h.scope);
+
+    expect(h.recover()).toBe(true);
+    expect(h.scope.sessionRenamePhase).toBe('sent');
+    expect(h.scope.reattachOpenTurnGate).toBe(true);
+    h.scope.sessionRenameSurfaceNow = () => after;
+    await vi.advanceTimersByTimeAsync(46_000);
+
+    expect(h.scope.sessionRenamePhase).toBe('idle');
+    expect(h.scope.isPromptReady).toBe(false);
+    expect(h.scope.reattachOpenTurnGate).toBe(true);
+    expect(h.scope.idleDetector.adoptPromptReady).not.toHaveBeenCalled();
   });
 
   it('keeps one recovery clock when an unknown surface becomes an exact surviving draft', () => {

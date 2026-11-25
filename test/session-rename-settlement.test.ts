@@ -10,6 +10,7 @@ import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { watchNativeSessionIndex } from '../src/services/native-session-index.js';
 import { composerTextKey } from '../src/utils/composer-text-key.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 
 // Real viewports captured from traecli 0.216.0 and codex-cli 0.167.0 in a
 // private tmux pane (paths and the binary location sanitized).
@@ -22,6 +23,35 @@ const cursorOf = (name: string): { x: number; y: number } => {
 const TITLE = '[BotMux·Lark] 修复登录页报错';
 const COMMAND = `/rename ${TITLE}`;
 const NATIVE_ID = '01a2';
+
+type RecordedTerminalItem = [number, 'out' | 'write' | 'key', string];
+interface RecordedTerminalSession {
+  cli: string;
+  version: string;
+  scenario: string;
+  items: RecordedTerminalItem[];
+}
+
+async function renderTraexApproval(): Promise<string> {
+  const { recordings } = JSON.parse(readFileSync(
+    new URL('./fixtures/program-status/codex-traex-osc7501.json', import.meta.url), 'utf8',
+  )) as { recordings: RecordedTerminalSession[] };
+  const recording = recordings.find(item => item.cli === 'traex'
+    && item.version === '0.214.1' && item.scenario === 'approval-15s');
+  if (!recording) throw new Error('missing traex 0.214.1 approval-15s recording');
+  const approvalKey = recording.items.find(([, kind, data]) => kind === 'key' && data === 'Enter (approve)');
+  if (!approvalKey) throw new Error('missing approval key in recording');
+  const renderer = new TerminalRenderer(160, 50);
+  try {
+    for (const [time, kind, data] of recording.items) {
+      if (time >= approvalKey[0]) break;
+      if (kind === 'out') await renderer.writeAndFlush(data);
+    }
+    return renderer.rawSnapshot();
+  } finally {
+    renderer.dispose();
+  }
+}
 
 describe('decideSessionRenameSettlement', () => {
   const decide = (over: Partial<Parameters<typeof decideSessionRenameSettlement>[0]>) =>
@@ -130,23 +160,24 @@ describe('TRAE native rename surface (0.216.0)', () => {
     expect(traexSessionRenameSurface(busyDraft, '/rename another title')).toBe('blocked');
   });
 
-  it('treats model pickers and native question pages as hard input owners', () => {
+  it('treats model pickers, question pages and real TRAE selection surfaces as hard input owners', async () => {
     const picker = ['─'.repeat(80), '', '  Select Model and Effort', '',
       '❯  7. GPT-5.6-Sol / Standard', '  2. Other option', '', '  enter confirm  |  esc go back'].join('\n');
     expect(traexSessionRenameSurface(picker, COMMAND)).toBe('blocked');
     const question = readFileSync(new URL('./fixtures/traex-question/traex-0.214.1-submit-confirm-160x50.txt', import.meta.url), 'utf8');
     expect(traexSessionRenameSurface(question, COMMAND)).toBe('blocked');
-    // Sanitized viewport shape from the real approval-15s recording.
-    const approval = [
-      '  Would you like to run the following command?',
-      '  Environment: local',
-      '  $ touch /tmp/work/approved-marker',
-      '› 1. Yes, proceed (y)',
-      '  2. Yes, and do not ask again for this command',
-      '  3. No, and tell Codex what to do differently',
-      'Press enter to confirm or esc to cancel',
-    ].join('\n');
+
+    const approval = await renderTraexApproval();
+    expect(approval).toContain('❯ 1. Yes, proceed');
+    expect(detectCodexChoiceModal(approval)).toMatchObject({ kind: 'choice-list' });
     expect(traexSessionRenameSurface(approval, COMMAND)).toBe('blocked');
+
+    const folderTrust = readFileSync(
+      new URL('./fixtures/stuck-pages/traex-0.213.1-folder-trust.txt', import.meta.url), 'utf8',
+    );
+    expect(folderTrust).toContain('❯ 1. Yes, continue');
+    expect(detectCodexChoiceModal(folderTrust)).toMatchObject({ kind: 'choice-list' });
+    expect(traexSessionRenameSurface(folderTrust, COMMAND)).toBe('blocked');
   });
 
   it('keeps the rename dialog and a busy turn occupied even with a receipt', () => {

@@ -2741,6 +2741,7 @@ export const messages: Record<string, string> = {
   'worker.opening_input_held': '⏳ 消息暂未写入 {cliName}。\n原因：{reason}\n消息保留在队列中，输入框空出来后会自动发送，无需重发。',
   'worker.native_input_surface_held': '⏳ {cliName} 当前有对话框或未提交的草稿，消息仍保留在队列中。处理后会自动继续投递，无需重发。',
   'worker.session_rename_recovering': '会话改名一直未确认。已确认 {cliName} 输入框空闲，正在重新加载会话；排队消息会保留并在就绪后发送，无需重发。',
+  'worker.session_rename_recovery_held': '⚠️ {cliName} 的会话改名超过 {seconds} 秒仍未确认。输入框看起来空闲，但暂时无法核实并安全恢复原会话；排队消息继续保留，不会自动粘贴到当前终端。请打开 Web 终端检查，无需重发消息。',
   'worker.session_rename_input_held': '⏳ {cliName} 的会话改名还没确认完成，排队的消息暂未写入，以免被并进会话标题。\n确认后会自动发送，无需重发。若长时间没有恢复，请打开 Web 终端查看输入框：留着完整的 /rename 命令就按回车执行，只有半截就清空输入框；输入框已经是空的仍没有恢复时，发送 /restart 重启会话，排队的消息会保留并在重启后发送。',
   'worker.session_rename_release_timeout': '⚠️ {cliName} 的会话改名超过 {seconds} 秒仍未留下可核实的执行记录。排队消息现在按正常投递规则继续发送；原生会话标题可能没有更新，请打开 Web 终端检查。',
   'worker.session_rename_hold_timeout': '⚠️ {cliName} 的会话改名超过 {seconds} 秒仍未确认，当前仍有未提交的改名命令、对话框或草稿。为避免消息被写进标题、弹窗或草稿，排队消息继续暂扣，且不会自动再按回车。\n请打开 Web 终端处理对应的命令、对话框或草稿；无法恢复时发送 /restart，排队消息会保留。',

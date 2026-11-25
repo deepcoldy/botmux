@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { decideSessionRenameSettlement } from '../src/core/session-rename-settlement.js';
+import { decideSessionRenameSettlement, shouldRecoverUnconfirmedSessionRename } from '../src/core/session-rename-settlement.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 function renameTimerHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'blocked' | 'unknown') {
@@ -32,6 +32,11 @@ function renameTimerHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'b
     pendingMessages: [{ content: 'queued', turnId: 'turn' }],
     pendingAdoptMessages: [],
     pendingRawInputs: [],
+    backend: {},
+    effectiveBackendType: 'tmux',
+    sessionRenameRecoveryUsed: false,
+    closeRequested: false,
+    cliRestartInProgress: false,
     currentBotmuxDispatchAttempt: 1,
     send: vi.fn(),
     t: (key: string) => key,
@@ -42,6 +47,9 @@ function renameTimerHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'b
   scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', scope);
   scope.notifySessionRenameInputTimeout = loadWorkerFunction('notifySessionRenameInputTimeout', scope);
   scope.restoreSessionRenameReadiness = loadWorkerFunction('restoreSessionRenameReadiness', scope);
+  scope.sessionRenameRecoveryRuntimeAllowed = loadWorkerFunction('sessionRenameRecoveryRuntimeAllowed', scope);
+  scope.sessionRenameOwnedRecoverySessionId = loadWorkerFunction('sessionRenameOwnedRecoverySessionId', scope);
+  scope.sessionRenameRecoveryPermanentlyUnavailable = loadWorkerFunction('sessionRenameRecoveryPermanentlyUnavailable', scope);
   scope.settleSessionRename = loadWorkerFunction('settleSessionRename', scope);
   scope.armSessionRenameIdleTimeout = loadWorkerFunction('armSessionRenameIdleTimeout', scope);
   return { scope, arm: scope.armSessionRenameIdleTimeout as () => void };
@@ -125,13 +133,79 @@ describe('native rename confirmation hold cap', () => {
 
     const unavailable = renameTimerHarness('settled');
     unavailable.scope.lastInitConfig = { cliId: 'traex' };
+    // Exact ownership exists; only the mocked recovery attempt is temporarily
+    // unable to proceed. This must remain distinct from a multi-rollout cap.
+    unavailable.scope.sessionRenameNativeSessionIdNow = () => 'native-id';
+    unavailable.scope.currentTraexObservedPid = () => 123;
+    unavailable.scope.findTraexRolloutSetByPid = () => new Set(['native-id']);
     unavailable.scope.recoverUnconfirmedSessionRename = vi.fn(() => false);
     unavailable.scope.notifySessionRenameInputTimeout = vi.fn();
     unavailable.arm();
     await vi.advanceTimersByTimeAsync(61_000);
     expect(unavailable.scope.flushPending).not.toHaveBeenCalled();
-    expect(unavailable.scope.notifySessionRenameInputTimeout).toHaveBeenCalledWith('held', 60);
+    expect(unavailable.scope.notifySessionRenameInputTimeout).toHaveBeenCalledWith('recovery-held', 60);
     expect(unavailable.scope.sessionRenamePhase).toBe('sent');
+  });
+
+  it('does not hold forever when TRAE recovery is permanently ineligible', async () => {
+    vi.useFakeTimers();
+    for (const mode of ['adopt', 'already-used', 'zmx', 'sandbox-without-fd', 'multi-rollout'] as const) {
+      const h = renameTimerHarness('settled');
+      h.scope.lastInitConfig = {
+        cliId: 'traex',
+        ...(mode === 'adopt' ? { adoptMode: true } : {}),
+        ...(mode === 'sandbox-without-fd' ? { sandbox: 'scratch' } : {}),
+      };
+      if (mode === 'already-used') h.scope.sessionRenameRecoveryUsed = true;
+      if (mode === 'zmx') h.scope.effectiveBackendType = 'zmx';
+      if (mode === 'sandbox-without-fd') h.scope.sessionRenameNativeSessionIdNow = () => undefined;
+      if (mode === 'multi-rollout') {
+        Object.assign(h.scope, {
+          sessionRenameNativeSessionIdNow: () => 'sid-a',
+          currentTraexObservedPid: () => 123,
+          findTraexRolloutSetByPid: () => new Set(['sid-a', 'sid-b']),
+          rawInputRestartGate: false,
+          codexAutoUpgrade: undefined,
+          pendingWebTerminalInput: () => false,
+          commandLineWritesPending: 0,
+          isFlushing: false,
+          injectionFlushing: false,
+          shouldRecoverUnconfirmedSessionRename,
+          restartCliProcess: vi.fn(),
+        });
+        h.scope.recoverUnconfirmedSessionRename = loadWorkerFunction('recoverUnconfirmedSessionRename', h.scope);
+      }
+      if (mode !== 'multi-rollout') h.scope.recoverUnconfirmedSessionRename = vi.fn(() => false);
+      h.scope.notifySessionRenameInputTimeout = vi.fn();
+      h.arm();
+
+      await vi.advanceTimersByTimeAsync(61_000);
+
+      expect(h.scope.flushPending, mode).toHaveBeenCalledOnce();
+      expect(h.scope.sessionRenamePhase, mode).toBe('idle');
+      expect(h.scope.notifySessionRenameInputTimeout, mode).toHaveBeenCalledWith('released', 60);
+      expect(h.scope.notifySessionRenameInputTimeout, mode).not.toHaveBeenCalledWith('recovery-held', 60);
+      if (mode === 'multi-rollout') expect(h.scope.restartCliProcess).not.toHaveBeenCalled();
+    }
+  });
+
+  it('keeps prompt edges out of restart recovery and leaves recovery to the timer', () => {
+    const h = renameTimerHarness('settled');
+    h.scope.lastInitConfig = { cliId: 'traex' };
+    h.scope.sessionRenameSentAtMs = Date.now() - 60_000;
+    h.scope.recoverUnconfirmedSessionRename = vi.fn(() => true);
+    h.scope.notifySessionRenameInputTimeout = vi.fn();
+
+    h.scope.settleSessionRename('prompt');
+
+    expect(h.scope.recoverUnconfirmedSessionRename).not.toHaveBeenCalled();
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+    expect(h.scope.notifySessionRenameInputTimeout).not.toHaveBeenCalled();
+    expect(h.scope.sessionRenamePhase).toBe('sent');
+    expect(h.scope.sessionRenameCommand).toBe('/rename title');
+
+    h.scope.settleSessionRename('timer');
+    expect(h.scope.recoverUnconfirmedSessionRename).toHaveBeenCalledOnce();
   });
 
   it('does not clear an unproven reattach open-turn gate on unknown recovery', () => {
@@ -141,18 +215,30 @@ describe('native rename confirmation hold cap', () => {
     expect(h.scope.reattachOpenTurnGate).toBe(true);
   });
 
-  it('never restores readiness over an OSC-7501 approval or held busy record', async () => {
+  it.each([
+    { heldBusy: true, blocked: false },
+    { heldBusy: false, blocked: true },
+  ])('never restores readiness over an authoritative native veto: %o', async ({ heldBusy, blocked }) => {
     vi.useFakeTimers();
     for (const surface of ['settled', 'unknown'] as const) {
       const h = renameTimerHarness(surface);
-      h.scope.idleDetector.programStatusHeldBusy = () => true;
-      h.scope.programStatusBlockedHoldsTypeAhead = () => true;
+      h.scope.idleDetector.programStatusHeldBusy = () => heldBusy;
+      h.scope.programStatusBlockedHoldsTypeAhead = () => blocked;
       h.arm();
       await vi.advanceTimersByTimeAsync(46_000);
       expect(h.scope.isPromptReady).toBe(false);
       expect(h.scope.reattachOpenTurnGate).toBe(true);
       expect(h.scope.idleDetector.adoptPromptReady).not.toHaveBeenCalled();
     }
+  });
+
+  it('adopts readiness through the idle detector after a confirmed safe release', () => {
+    const h = renameTimerHarness('settled');
+    h.scope.isPromptReady = false;
+    h.scope.reattachOpenTurnGate = false;
+    h.scope.restoreSessionRenameReadiness('settled');
+    expect(h.scope.isPromptReady).toBe(true);
+    expect(h.scope.idleDetector.adoptPromptReady).toHaveBeenCalledOnce();
   });
 
   it('keeps holding a visible rename command after the cap and tells the user why', async () => {
