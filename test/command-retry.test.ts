@@ -34,6 +34,7 @@ vi.mock('../src/core/terminal-url.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
+  durableImRepliesEnabled: vi.fn(() => false),
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: 'Claude',
     config: {

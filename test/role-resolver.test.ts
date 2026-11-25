@@ -314,6 +314,32 @@ describe('buildFollowUpContent role injection', () => {
       globalDefault.mockRestore();
     }
   });
+  it.each(['codex', 'opencode'] as const)('shares stable role context before session ids across %s openings and follow-ups', async (cliId) => {
+    await fresh();
+    const { writeRoleFile } = await import('../src/core/role-resolver.js');
+    writeRoleFile('app1', 'oc_cache', 'CACHEABLE_ROLE\nKeep the verified permission boundary.');
+    const { buildNewTopicPrompt, buildFollowUpContent, buildReforkCliInput } = await import('../src/core/session-manager.js');
+    const opts = { larkAppId: 'app1', chatId: 'oc_cache', cliId };
+    const builders = [
+      (sid: string) => buildNewTopicPrompt('hello', sid, cliId, undefined,
+        undefined, undefined, undefined, undefined, { name: 'Bot', openId: 'ou_bot' }, 'en', undefined, opts),
+      (sid: string) => buildFollowUpContent('continue', sid, opts),
+      (sid: string) => buildReforkCliInput({
+        larkAppId: 'app1', chatId: 'oc_cache', hasHistory: true,
+        session: { sessionId: sid, chatId: 'oc_cache', status: 'active', cliId, backendType: 'pty' },
+      } as any, 'resume', { cliId }).content,
+    ];
+    for (const build of builders) {
+      const first = build('cache-session-a');
+      const second = build('cache-session-b');
+      const prefix = first.slice(0, first.indexOf('cache-session-a'));
+      expect(prefix).toContain('CACHEABLE_ROLE');
+      expect(second.slice(0, second.indexOf('cache-session-b'))).toBe(prefix);
+      expect(first.indexOf('<role ')).toBeLessThan(first.indexOf('<session_id>'));
+      expect(first.indexOf('<session_id>')).toBeLessThan(first.indexOf('<user_message>'));
+    }
+  });
+
   it('places stable role context before the follow-up user message', async () => {
     await fresh();
     const { writeRoleFile } = await import('../src/core/role-resolver.js');
@@ -328,7 +354,7 @@ describe('buildFollowUpContent role injection', () => {
 
     expect(prompt).toContain('<role context="group" chat_id="oc_follow">');
     expect(prompt).toContain('FOLLOWUP_PERSONA');
-    expect(prompt.indexOf('<session_id>')).toBeLessThan(prompt.indexOf('<role '));
+    expect(prompt.indexOf('<role ')).toBeLessThan(prompt.indexOf('<session_id>'));
     expect(prompt.indexOf('<role ')).toBeLessThan(prompt.indexOf('<botmux_reminder>'));
     expect(prompt.indexOf('<botmux_reminder>')).toBeLessThan(prompt.indexOf('<user_message>'));
     expect(prompt.indexOf('<sender ')).toBeGreaterThan(prompt.indexOf('</user_message>'));

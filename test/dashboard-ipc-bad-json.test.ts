@@ -26,6 +26,8 @@ const ROUTES: ReadonlyArray<readonly [string, string]> = [
   ['PUT', '/api/chat-group-grant'],
   ['PUT', '/api/groups/:chatId/name'],
   ['PUT', '/api/groups/:chatId/feed-groups'],
+  ['POST', '/api/groups/:chatId/top-notice'],
+  ['POST', '/api/groups/:chatId/share-link'],
   ['PUT', '/api/oncall/:chatId'],
   ['POST', '/api/roles/batch'],
   ['POST', '/api/doc-watches'],
