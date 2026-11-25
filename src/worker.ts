@@ -3320,8 +3320,20 @@ function seedAndTrustClaudeState(
       // The source can contribute top-level onboarding state and this one
       // project's decision. Other projects remain private to the source.
       let source: Record<string, any> = {};
-      if (current?.projects?.[canonical]?.hasTrustDialogAccepted !== false && existsSync(seedFrom)) {
-        source = JSON.parse(readFileSync(seedFrom, 'utf8'));
+      let allowChatDefault = true;
+      if (current?.projects?.[canonical]?.hasTrustDialogAccepted !== false) {
+        try {
+          const parsed = JSON.parse(readFileSync(seedFrom, 'utf8'));
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid source state');
+          source = parsed;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            // Onboarding is independent of trust. An unreadable source must
+            // never turn a formerly negative decision into a default grant.
+            allowChatDefault = false;
+            log('[read-isolation] Claude source state could not be read; leaving missing project trust unset');
+          }
+        }
       }
       const { projects: sourceProjects, ...top } = source;
       const data = current ?? top;
@@ -3332,7 +3344,7 @@ function seedAndTrustClaudeState(
       const sourceDecision = sourceProjects?.[canonical]?.hasTrustDialogAccepted;
       const previous = entry.hasTrustDialogAccepted;
       if (sourceDecision === false) entry.hasTrustDialogAccepted = false;
-      else if (previous === undefined && (sourceDecision === true || !isWorkflowWorker())) entry.hasTrustDialogAccepted = true;
+      else if (previous === undefined && (sourceDecision === true || (allowChatDefault && !isWorkflowWorker()))) entry.hasTrustDialogAccepted = true;
       if (current?.hasCompletedOnboarding === true && entry.hasTrustDialogAccepted === previous) return;
       if (entry.hasTrustDialogAccepted !== undefined) data.projects[canonical] = entry;
       data.hasCompletedOnboarding = true;

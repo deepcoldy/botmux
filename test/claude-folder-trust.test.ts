@@ -136,6 +136,24 @@ describe('ensureClaudeFolderTrust', () => {
     });
   });
 
+  it.each([false, true])('finishes onboarding without inferring trust from a damaged source (existing profile %s)', existing => {
+    const isolated = join(home, 'isolated.json');
+    if (existing) writeFileSync(isolated, JSON.stringify({ keep: 7, projects: { '/local': { hasTrustDialogAccepted: false } } }));
+    writeFileSync(configPath(), '{');
+    const seed = loadWorkerFunction<(path: string, cwd: string, log: () => void, source: string) => void>(
+      'seedAndTrustClaudeState', { existsSync, readFileSync, realpathSync, updateClaudeStateFile, isWorkflowWorker: () => false },
+    );
+    seed(isolated, workDir, () => {}, configPath());
+    expect(existsSync(isolated)).toBe(true);
+    const data = JSON.parse(readFileSync(isolated, 'utf8'));
+    expect(data.hasCompletedOnboarding).toBe(true);
+    expect(data.projects[canonical()]?.hasTrustDialogAccepted).toBeUndefined();
+    if (existing) {
+      expect(data.keep).toBe(7);
+      expect(data.projects['/local'].hasTrustDialogAccepted).toBe(false);
+    }
+  });
+
   it('is idempotent and does not rewrite when already trusted', () => {
     ensureClaudeFolderTrust(workDir);
     const firstMtime = readFileSync(configPath(), 'utf-8');
