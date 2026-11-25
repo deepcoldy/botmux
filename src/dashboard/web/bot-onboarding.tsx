@@ -1,7 +1,7 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { DropdownMenu } from './dashboard-components.js';
-import { fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption } from './bot-defaults.js';
+import { cliSearchTerms, fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption } from './bot-defaults.js';
 import { ModelPickerField } from './field-controls.js';
 import { confirm } from './confirm-modal.js';
 import { t } from './ui.js';
@@ -95,6 +95,8 @@ type CliOption = {
   available?: boolean;
   availabilityStatus?: import('../../setup/cli-availability.js').CliAvailabilityStatus;
   command?: string;
+  /** Launch commands and short aliases from the CLI registry, used only for search. */
+  searchTerms?: readonly string[];
   availabilityReason?: string;
   cliLaunchMode?: 'forge-traex';
   /** 静态模型候选（与 bot-defaults.ts 的 CliOption 对齐）。 */
@@ -263,6 +265,10 @@ async function fetchCliOptions(): Promise<CliOptionsState> {
       return {
         options: (body.options as any[]).map((o: any) => ({
           ...o,
+          // 容错：缺失/非数组 → []；空数组由 cliSearchTerms 回退到 command。
+          searchTerms: Array.isArray(o?.searchTerms)
+            ? o.searchTerms.filter((term: unknown): term is string => typeof term === 'string')
+            : [],
           // 容错：缺失/非数组 → []，与 bot-defaults.ts 的 fetchCliOptions 对齐。
           modelChoices: Array.isArray(o?.modelChoices)
             ? o.modelChoices.filter((m: unknown): m is string => typeof m === 'string')
@@ -707,6 +713,7 @@ function OnboardingForm(props: {
     .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
     .map(option => ({
       value: option.id,
+      searchTerms: cliSearchTerms(option),
       label: (option.id === props.form.cliId ? availabilityStatus : cliAvailabilityStatus(option)) === 'unavailable'
         ? t('botOnboarding.cliMissingOption', { label: option.label, command: option.command ?? option.id })
         : option.label,
