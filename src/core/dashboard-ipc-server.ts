@@ -5192,9 +5192,6 @@ function authLinkDeliverer(
 ): (text: string, privateCommand: string) => Promise<AuthLinkDelivery> {
   const loc = localeForBot(ds.larkAppId);
   const privateChat = ds.chatType === 'p2p';
-  function requireCurrent() {
-    if (isCurrent?.() === false) throw new Error('authorization context changed');
-  }
   return async (text, privateCommand) => {
     const others = (await missingAuthorizationEntries(cfg, openId, { except: provider, ...(published ? { published } : {}) }).catch(() => []))
       .flatMap(({ provider: other, url }) => url
@@ -5206,11 +5203,9 @@ function authLinkDeliverer(
       locale: loc,
       privateCommand,
       replyInPlace: content => replyInSession(ds, content, isCurrent),
-      sendDirect: async (to, content) => { requireCurrent(); return sendUserMessage(ds.larkAppId, to, content); },
-      ...(privateChat ? {} : { sendEphemeral: async (to: string, card: string) => {
-        requireCurrent();
-        return sendEphemeralCard(ds.larkAppId, ds.chatId, to, card);
-      } }),
+      sendDirect: (to, content) => sendUserMessage(ds.larkAppId, to, content),
+      ...(privateChat ? {} : { sendEphemeral: (to: string, card: string) => sendEphemeralCard(ds.larkAppId, ds.chatId, to, card) }),
+      isCurrent,
     }).catch(err => {
       logger.warn(`[session-auth] session=${ds.session.sessionId} provider=${provider} link not delivered: ${err instanceof Error ? err.message : String(err)}`);
       return 'dm_failed' as const;

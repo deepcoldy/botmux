@@ -828,6 +828,7 @@ export const messages: Record<string, string> = {
   'cmd.login.no_credentials': '❌ 无法获取应用凭证',
   'cmd.logout.ok': '已撤销你在这台机器上的触发人授权。之后的轮次不会再使用这些凭证；需要时重新发送 /login。',
   'cmd.logout.platform_note': '{tool} 的平台授权请在平台凭据页撤销。{url}',
+  'cmd.logout.platform_unbound': '中心化平台上的授权这次没有撤销（本进程撤不掉平台 grant）。本机尚未绑定平台，无法给出凭据页链接。',
   'cmd.logout.no_sender': '无法确认是谁发送的 /logout，没有撤销任何授权。',
   'cmd.logout.no_bot': '当前机器人没有可用的应用配置，无法撤销授权。',
   // 这几条走 stderr 给「命令没跑起来」的那个人看：必须说清是谁的授权缺了、

@@ -26,6 +26,7 @@ import { createServer, type Server } from 'node:http';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
 import { __resetPlatformAuthorizationRequestForTest } from '../src/core/platform-authorization-request.js';
+import { __resetProviderAuthForTest } from '../src/core/provider-auth-request.js';
 import * as credentialRequestClient from '../src/platform/credential-request-client.js';
 import { t } from '../src/i18n/index.js';
 import * as schedulerModule from '../src/core/scheduler.js';
@@ -913,7 +914,10 @@ describe('platform-issued user credentials in a bound session', () => {
     });
     vi.mocked(bots.getBot).mockReturnValue({ config: platformBot() } as any);
   });
-  afterEach(() => __setPlatformCredentialDepsForTest(null));
+  afterEach(() => {
+    __setPlatformCredentialDepsForTest(null);
+    __resetProviderAuthForTest();
+  });
   const runTool = (args: string[], port: number, extraEnv: Record<string, string> = {}) => new Promise<{ code: number | null; out: string; err: string }>((resolve, reject) => {
     const child = spawnTsScript(join(process.cwd(), 'src/lark-tool-runner.ts'), ['--binding', larkToolBindingPath(dir, 'tool-session'), '--', ...args], {
       env: { ...process.env, BOTMUX_DAEMON_IPC_PORT: String(port), ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'],
@@ -1026,6 +1030,39 @@ describe('platform-issued user credentials in a bound session', () => {
     expect(platformRequest.mock.calls[0][0]).toEqual({ unionId: 'on_sender', appId: 'cli_bound', tools: ['lark-cli'] });
     expect(dm).not.toHaveBeenCalled();
     expect(reply.mock.calls.map(c => String(c[2])).join('')).not.toContain('https://');
+  });
+  it('releases a pre-write cancelled legacy-platform delivery so a current retry can send it', async () => {
+    __resetProviderAuthForTest();
+    session.chatType = 'group';
+    const source: Exclude<TriggerUserAuthCredentialSourceConfig, string> = { 'lark-user': 'auto', bytecloud: 'local' };
+    vi.mocked(bots.getBot).mockReturnValue({ config: {
+      ...platformBot(source),
+      triggerUserAuth: {
+        enabled: true, tools: ['lark-cli', 'bytedcli'], capabilities: ['lark-user', 'bytecloud'], credentialSource: source,
+      },
+    } } as any);
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    platformRequest.mockResolvedValue({ ok: false, reason: 'not_deployed' });
+    // Change the route while the delivery helper gathers other missing entries,
+    // before either private-write provider is invoked.
+    vi.spyOn(bytedcliAuth, 'describeBytedcliAuth').mockImplementation(async () => {
+      source['lark-user'] = 'platform';
+      return { state: 'authorized' };
+    });
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const ephemeral = vi.spyOn(larkClient, 'sendEphemeralCard').mockResolvedValue('om_card' as any);
+    vi.spyOn(larkClient, 'replyMessage').mockResolvedValue('om_reply');
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => PLATFORM, resolveUnionId: async () => 'on_sender',
+      requestGrant: async () => ({ ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' }) as any,
+    });
+
+    expect((await request('user')).status).toBe(403);
+    expect(dm).not.toHaveBeenCalled();
+    expect(ephemeral).not.toHaveBeenCalled();
+
+    expect((await request('user')).status).toBe(403);
+    expect(dm).toHaveBeenCalledTimes(1);
   });
   it('a platform without the credential-request endpoint keeps the plain credentials page DM', async () => {
     session.chatType = 'group';

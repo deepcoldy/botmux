@@ -136,7 +136,7 @@ export function platformAuthLink(page: string, locale?: Locale): { authUrl: stri
 export async function deliverProviderLink(
   input: { provider: AuthProvider | 'lark-cli'; openId: string; locale?: Locale; chatId?: string; tenant?: MeegoTenant },
   link: { authUrl: string; text: string; command: string },
-  deps: Pick<ProviderAuthDeps, 'deliver' | 'isCurrent' | 'now'>,
+  deps: Pick<ProviderAuthDeps, 'deliver' | 'now'>,
 ): Promise<ProviderAuthResult> {
   const { provider, openId, locale, chatId, tenant } = input;
   const vars = { provider: PROVIDER_LABEL[provider] };
@@ -155,16 +155,20 @@ export async function deliverProviderLink(
   const claimed = { at, reached: true };
   recent.set(key, claimed);
   const delivery = await deps.deliver(link.text, link.command);
-  if (delivery === 'dm_failed' && deps.isCurrent?.() === false) {
+  if (delivery === 'cancelled_before_write') {
     if (recent.get(key) === claimed) recent.delete(key);
-  } else {
+  } else if (recent.get(key) === claimed) {
+    // A delivery that outlived its claim must not overwrite a newer attempt.
+    // dm_failed is also used for unknown post-write outcomes, so it never
+    // proves that releasing the claim would be safe.
     recent.set(key, { at, reached: delivery !== 'dm_failed' });
   }
   switch (delivery) {
     case 'inline': return { status: 'delivered', delivery, message: t('provider_auth.delivered_inline', vars, locale) };
     case 'dm': return { status: 'delivered', delivery, message: t('provider_auth.delivered_dm', vars, locale) };
     case 'ephemeral': return { status: 'delivered', delivery, message: t('provider_auth.delivered_ephemeral', vars, locale) };
-    case 'dm_failed': return { status: 'undeliverable', delivery, message: t('provider_auth.undeliverable', vars, locale) };
+    case 'cancelled_before_write':
+    case 'dm_failed': return { status: 'undeliverable', delivery: 'dm_failed', message: t('provider_auth.undeliverable', vars, locale) };
   }
 }
 

@@ -4811,7 +4811,10 @@ export async function handleCommand(
           capabilityOn(policy, 'bytecloud') && credentialSourceOf(policy, 'bytecloud') !== 'local' ? 'bytedcli' : '',
         ].filter(Boolean).join(' / ');
         const platformUrl = platformTools ? platformCredentialsUrl() : null;
-        const platformNote = platformUrl ? `\n${t('cmd.logout.platform_note', { tool: platformTools, url: platformUrl }, loc)}` : '';
+        const platformNote = !platformTools ? ''
+          : platformUrl
+            ? `\n${t('cmd.logout.platform_note', { tool: platformTools, url: platformUrl }, loc)}`
+            : `\n${t('cmd.logout.platform_unbound', undefined, loc)}`;
         await sessionReply(rootId, t('cmd.logout.ok', undefined, loc) + platformNote);
         break;
       }

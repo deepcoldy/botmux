@@ -830,6 +830,7 @@ export const messages: Record<string, string> = {
   'cmd.login.no_credentials': '❌ Cannot read app credentials.',
   'cmd.logout.ok': 'Your trigger-user authorization on this machine has been revoked. Later turns will not keep using those credentials; send /login when you want to authorize again.',
   'cmd.logout.platform_note': 'Use the platform credentials page to revoke your centrally managed authorization for {tool} at {url}.',
+  'cmd.logout.platform_unbound': 'The central-platform grant was not revoked — this process cannot revoke it. This machine is not bound to a platform, so there is no credentials page to open.',
   'cmd.logout.no_sender': 'Could not tell who sent /logout, so nothing was revoked.',
   'cmd.logout.no_bot': 'This bot has no app configuration, so the authorization could not be revoked.',
   // Printed on stderr to whoever's command did not run: name whose

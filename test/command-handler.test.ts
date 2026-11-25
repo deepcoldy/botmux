@@ -8433,6 +8433,18 @@ describe('handleCommand', () => {
         if (previousGetBot) vi.mocked(getBot).mockImplementation(previousGetBot);
       }
     });
+
+    it('warns that platform grants survive logout when the host is unbound', async () => {
+      governBot({
+        enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+      });
+      vi.mocked(platformCredentialsUrl).mockReturnValue(null);
+      const deps = makeDeps();
+      await handleCommand('/logout', ROOT_ID, makeLarkMessage('/logout'), deps, LARK_APP_ID);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain(t('cmd.logout.platform_unbound', undefined, 'zh'));
+    });
   });
 
   describe('/login', () => {
