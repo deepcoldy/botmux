@@ -12,7 +12,7 @@ import {
   setExplicitAskSessionChecker,
   submitCustomReply,
 } from '../src/core/ask-broker.js';
-import { parseAskBody, registerAskForResponse, verifiedAskMention } from '../src/core/ask-api.js';
+import { askResponseBody, parseAskBody, registerAskForResponse, verifiedAskMention } from '../src/core/ask-api.js';
 import { authorizeSessionScopedIpc, bindSessionScopedIpcIdentity } from '../src/core/daemon-ipc-session-auth.js';
 import { createExplicitAskContinuation, explicitAskOriginIsLive, explicitAskSessionBound } from '../src/core/explicit-ask-continuation.js';
 import { frozenReplyContextForTurn } from '../src/core/reply-target.js';
@@ -101,6 +101,8 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       explicitAskContinuation: continuation,
       explicitAskOriginIsLive,
       registerAskForResponse,
+      askResponseBody,
+      localeForBot: () => 'zh',
       verifiedAskMention,
       isKnownPeerBot: () => false,
       isHumanOpenId: async () => true,

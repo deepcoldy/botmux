@@ -203,6 +203,28 @@ describe('checkRequiredScopes — 官方增量确认', () => {
     expect(h.dm).not.toHaveBeenCalled();
   });
 
+  it('老 bot 带着已从默认清单移除的历史权限时，不自愈、不撤销、不打扰 owner', async () => {
+    const legacyGranted = [
+      'docs:document.comment:update',
+      'docx:document.block:convert',
+    ];
+    stubLark({ granted: [...critical, ...optional, ...legacyGranted] });
+    await checkRequiredScopes(APP);
+
+    expect(h.automate).not.toHaveBeenCalled();
+    expect(h.register).not.toHaveBeenCalled();
+    expect(h.dm).not.toHaveBeenCalled();
+    // 除取 tenant token 与只读 app-info 外不应出现其它请求；尤其不能因默认清单
+    // 变短而把老应用里仍然生效的历史权限当成多余项删除。
+    const unexpectedRequests = vi.mocked(fetch).mock.calls.filter(([url, init]) => {
+      const target = String(url);
+      if (target.includes('tenant_access_token')) return false;
+      const method = String(init?.method ?? 'GET').toUpperCase();
+      return method !== 'GET' || !target.includes('/v6/applications/');
+    });
+    expect(unexpectedRequests).toEqual([]);
+  });
+
   it.each(['feishu', 'lark'])('仅缺可选权限时重复自检不向 owner 发送链接（%s）', async brand => {
     h.bot = makeBot({ brand });
     stubLark({ granted: critical });

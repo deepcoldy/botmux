@@ -62,6 +62,20 @@ describe('requestCredentialGrant', () => {
     expect(platformCredentialsUrl({ binding: BINDING })).toBe('https://platform.example.test/credentials');
   });
 
+  it('requests one regional partition and ignores unknown region names and states', async () => {
+    const { calls, http } = fakeHttp([{ status: 200, json: {
+      ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(),
+      variables: { BYTEDCLI_USER_CLOUD_JWT: 'default-jwt' },
+      cloudJwtRegions: ['i18n'],
+      cloudJwtRegionStates: { i18n: 'pending', i18nbd: 'retry_exhausted', tx: 'unknown-state', misspelled: 'failed' },
+    } }]);
+    const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli', cloudJwtRegions: ['i18n'] }, { binding: BINDING, http });
+    expect(calls[0]!.body).toMatchObject({ cloudJwtRegions: ['i18n'] });
+    expect(r).toMatchObject({ ok: true, value: { cloudJwtRegions: ['i18n'] } });
+    if (!r.ok) throw new Error('unreachable');
+    expect(r.value.cloudJwtRegionStates).toEqual({ i18n: 'pending' });
+  });
+
   it('accepts the optional Codebase JWT for bytedcli', async () => {
     const { http } = fakeHttp([{ status: 200, json: {
       ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(),
@@ -288,7 +302,7 @@ describe('requestCredentialGrant transport failures', () => {
 
   /** A platform that answers request i after `delays[i]` ms (`null`: never)
    *  and drops a request once the client aborts it, like `postJson`. */
-  function slowPlatform(delays: Array<number | null>) {
+  function slowPlatform(delays: Array<number | null>, response: { status: number; json: unknown } = GRANT_200) {
     const calls: Array<{ timeoutMs: number }> = [];
     let firstCall!: () => void;
     // Bun's fake clock can fire a due timer before microtasks already queued
@@ -300,7 +314,7 @@ describe('requestCredentialGrant transport failures', () => {
         const delay = delays[calls.length] ?? null;
         calls.push({ timeoutMs: opts.timeoutMs });
         firstCall();
-        const timer = delay === null ? undefined : setTimeout(() => resolve(GRANT_200), delay);
+        const timer = delay === null ? undefined : setTimeout(() => resolve(response), delay);
         opts.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); }, { once: true });
       }),
     };
@@ -319,6 +333,23 @@ describe('requestCredentialGrant transport failures', () => {
       await vi.advanceTimersByTimeAsync(60_000);
       const r = await pending;
       expect(r.ok).toBe(true);
+      expect(calls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lets a regional bytedcli grant finish when the platform responds after 12s', async () => {
+    vi.useFakeTimers();
+    try {
+      const { calls, http, reached } = slowPlatform([12_000], { status: 200, json: {
+        ok: true, tool: 'bytedcli', unionId: REQ.unionId, expiresAt: future(),
+        variables: { BYTEDCLI_USER_CLOUD_JWT: 'default-jwt' },
+      } });
+      const pending = requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+      await reached;
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(await pending).toMatchObject({ ok: true });
       expect(calls).toHaveLength(1);
     } finally {
       vi.useRealTimers();

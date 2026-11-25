@@ -85,7 +85,10 @@ export function codexUserInputAnswer(
       throw new Error(`ask returned invalid answers for question ${index + 1}`);
     }
     const custom = result.customAnswers?.[index]?.trim();
-    const values = custom ? [custom] : selected.length ? [...selected] : comment ? [comment] : [];
+    // Codex's own picker sends a note typed next to an option as one more entry, `user_note: …`.
+    const note = result.notes?.[index]?.trim();
+    const values = custom ? [custom] : selected.length ? [...selected, ...(note ? [`user_note: ${note}`] : [])]
+      : comment ? [comment] : [];
     if (!values.length && !entry.question.multiSelect) {
       throw new Error(`ask returned no answer for question ${index + 1}`);
     }

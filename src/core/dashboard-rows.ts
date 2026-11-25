@@ -34,6 +34,7 @@ import { isSuspendableBackendType, resolvePersistentBackendTarget } from './pers
 import { isNativeTopicId } from './native-topic-id.js';
 import { sessionExecutionActivity } from './session-execution-activity.js';
 import type { ExecutionActivity } from './execution-activity.js';
+import { isActiveTurnSilentSchedule } from './silent-schedule-turns.js';
 
 export interface SessionRow extends SessionMessagePreview {
   /** Current-turn execution observation (working rows only). */
@@ -155,6 +156,9 @@ export interface SessionRow extends SessionMessagePreview {
   lastTurn?: SessionLastTurn;
   /** Main turn ended but this many background tasks are still running (live rows only). */
   backgroundTaskCount?: number;
+  /** True only while a live busy turn is proven to be a silent scheduled run
+   *  (no newer non-silent turn has opened on this session). */
+  activeTurnSilentSchedule?: boolean;
   /** 当前忙碌段的起点（进入 starting/working/analyzing 的边沿），只在活跃会话上有。 */
   busySinceAt?: number;
   /** 任务态（会话状态重设计 P2）：从 CLI transcript 读到的当前 TODO 完成度。
@@ -394,6 +398,12 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
   const executionActivity = sessionExecutionActivity(ds);
   const lastMessageAt = sessionLastActivityAtMs(ds.session) || ds.lastMessageAt;
   const lastActivityAt = Math.max(lastMessageAt || 0, executionActivity?.lastProgressAtMs ?? 0);
+  const status: SessionRow['status'] = ds.session.queued
+    ? 'idle'
+    : (!ds.worker || ds.worker.killed
+        ? 'dormant'
+        : (ds.lastScreenStatus ?? (ds.workerReady === true ? 'working' : 'starting')));
+  const activeTurnSilentSchedule = isActiveTurnSilentSchedule(ds, status);
   return {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
@@ -420,11 +430,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     // first turn (screen updates are suppressed until the first idle prompt).
     // Long first turns — e.g. meeting agents fed a transcript delivery right at
     // spawn — previously sat in「启动中」for minutes; project them as working.
-    status: ds.session.queued
-      ? 'idle'
-      : (!ds.worker || ds.worker.killed
-          ? 'dormant'
-          : (ds.lastScreenStatus ?? (ds.workerReady === true ? 'working' : 'starting'))),
+    status,
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
     lastMessageAt,
@@ -477,6 +483,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
       : undefined,
     ...(ds.session.lastTurn ? { lastTurn: ds.session.lastTurn } : {}),
     ...(ds.backgroundTaskCount !== undefined ? { backgroundTaskCount: ds.backgroundTaskCount } : {}),
+    ...(activeTurnSilentSchedule ? { activeTurnSilentSchedule: true } : {}),
     ...(ds.busySinceAt !== undefined ? { busySinceAt: ds.busySinceAt } : {}),
     ...maybeSessionRowUsage(ds.session, ds.workingDir, opts),
     openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),

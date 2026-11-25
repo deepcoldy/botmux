@@ -7,6 +7,7 @@
  */
 
 import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
+import type { Locale } from '../i18n/types.js';
 
 /** 原生异步问题不属于当前回复卡，正文结束时仍应保留回答入口。 */
 export const NATIVE_STANDALONE_ASK_ORIGIN = 'native-user-input-standalone';
@@ -104,8 +105,17 @@ export type AskResult =
       answers: ReadonlyArray<ReadonlyArray<string>>;
       /** Form-only values, aligned with questions; choice/empty input slots are null. */
       inputs?: ReadonlyArray<string | null>;
-      /** Per-question free text; replaces only that question's selected keys. */
+      /** Per-question free text written with NO option ticked: it is that question's answer
+       *  (its `answers[i]` is empty). Results stored by older versions use it the same way. */
       customAnswers?: ReadonlyArray<string | null>;
+      /** Per-question note written next to ticked options: `answers[i]` holds the options and
+       *  this text goes with them. Absent on results from older versions; a consumer that
+       *  ignores it still gets the right options. */
+      notes?: ReadonlyArray<string | null>;
+      /** The asking bot's language, so a hook words what it writes around the answer (the note
+       *  marker) like the bot does. Added by the daemon to the HTTP response only, never stored;
+       *  absent from older daemons, where the hook keeps its process default. */
+      locale?: Locale;
       by: string;
       /** 自定义回复原文（用户在话题里直接打字作答）；按钮选择时为 null。 */
       comment: string | null;
@@ -145,7 +155,10 @@ export interface AskJsonOutput {
   /** v0.1.8 新增：按问题分组的完整答案，answered 时非 null。 */
   answers: string[][] | null;
   inputs?: Array<string | null> | null;
+  /** Text a question was answered with instead of an option (that question's `answers[i]` is empty). */
   customAnswers?: ReadonlyArray<string | null>;
+  /** Note the user added next to the options ticked for that question (`answers[i]` non-empty). */
+  notes?: ReadonlyArray<string | null>;
   by: string | null;
   /** 自定义回复原文；按钮选择 / 超时 / 失效时为 null。 */
   comment: string | null;
@@ -288,7 +301,10 @@ export type AskClickOutcome =
    *  都允许空集（全多选），提交极可能是手滑——先不 settle，要求带 confirmEmpty 再点
    *  一次。仅当所有问题都可空时才可能返回；任一单选未选走 `stale`（空非有效答案）。 */
   | 'needs_empty_confirm'
-  | 'invalid_form';
+  | 'invalid_form'
+  /** A one-shot choice form broke a per-question rule (see `askChoiceProblem`): nothing
+   *  changed, the card keeps the user's ticks and text, the handler says which question. */
+  | 'invalid_choice';
 
 /** 旧单选语义兼容：仅当"单问且恰好选 1 个"时返回该 key，否则 null。
  *  `botmux ask buttons` 子命令与其测试据此保持单选行为不变。 */

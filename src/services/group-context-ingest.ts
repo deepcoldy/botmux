@@ -1,3 +1,4 @@
+import { redactProtectedLarkEvent, ProtectedResultReadError } from '../im/lark/protected-event.js';
 /**
  * group-context-ingest.ts — 把飞书群消息事件静默写进 group-context-store。
  *
@@ -98,6 +99,7 @@ function retentionFromSettings(settings: GroupContextSettings): { maxAgeMs?: num
  * 原始 content 作正文，宁可存一条粗糙的也不丢。
  */
 export function normalizeGroupContextEvent(larkAppId: string, data: any): GroupContextMessageInput | undefined {
+  data = redactProtectedLarkEvent(data);
   let message = data?.message;
   const sender = data?.sender;
   if (!message || typeof message !== 'object') return undefined;
@@ -127,7 +129,8 @@ export function normalizeGroupContextEvent(larkAppId: string, data: any): GroupC
     });
     text = parsed.content ?? '';
     resourceRefs = (resources ?? []).map(r => ({ type: r.type, key: r.key, ...(r.name ? { name: r.name } : {}) }));
-  } catch {
+  } catch (error) {
+    if (error instanceof ProtectedResultReadError) throw error;
     text = '';
   }
   if (!text && !projection && typeof message.content === 'string') text = message.content;

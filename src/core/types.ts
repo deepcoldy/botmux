@@ -590,6 +590,17 @@ export interface DaemonSession {
   turnDispatchAttemptHighWater?: { turnId: string; dispatchAttempt: number };
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** 最近一次忙碌 screen_update 绑定的实际执行回合及其 worker 代际（内存态）。
+   *  用于判断当前活跃执行是否纯属静默定时巡检，并在 worker 替换/退闲后自动失效。 */
+  lastScreenTurnId?: string;
+  lastScreenTurnGeneration?: number;
+  /** 最近一次发布到 dashboardEventBus 的 activeTurnSilentSchedule 值，用于避免漏发或重复发 SSE patch。 */
+  lastPublishedActiveTurnSilentSchedule?: boolean;
+  /** 会话内回合准入与人工介入的单调序号，用于区分“巡检前的旧真人 currentTurnId”与“巡检期间的新插话/终端直连输入”。 */
+  turnOrderSeq?: number;
+  lastNonSilentTurnSeq?: number;
+  silentScheduledTurnMeta?: Map<string, { seq: number; currentTurnIdAtArm?: string }>;
+  latestSilentScheduledTurn?: { turnId: string; seq: number };
   /** `backgroundTasks` of the last working/idle screen_update: the main turn
    *  ended while this many background tasks kept running. Card label (see
    *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
@@ -1108,6 +1119,10 @@ export interface DaemonSession {
      * these old descendants; the long-lived CLI root itself is the exception. */
     preexistingProcessIdentities?: string[];
   };
+  /** Turns the worker typed behind the running turn (type-ahead), oldest
+   *  first. Prompt-context claims evaluate them together with the managed
+   *  origin and only consume a globally unique match. */
+  typeAheadPromptTurnIds?: string[];
   /** Worker-reported identity storage decision for the CURRENT worker
    *  generation. Only the worker knows the effective spawn shape (the
    *  BOTMUX_SANDBOX override, remote-backend bypass, whether bwrap/Seatbelt

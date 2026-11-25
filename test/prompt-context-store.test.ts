@@ -27,9 +27,11 @@ afterEach(() => {
 const {
   writePromptContext,
   claimPromptContext,
+  claimPromptContextAmongTurns,
   fingerprintPromptText,
   prefixOf,
   removePromptContextDir,
+  removePromptContextForTurn,
   rekeyPromptContext,
 } = await import('../src/services/prompt-context-store.js');
 
@@ -131,6 +133,59 @@ describe('prompt-context-store', () => {
     const corrupted = `<user_message>\n${longLine}\\r第二行\\r</user_message>`;
     expect(claimByPrompt('sess-pc', 'turn-A', corrupted)).toBe('ENV-A');
     expect(claimByPrompt('sess-pc', 'turn-B', corrupted)).toBe('ENV-B');
+  });
+
+  it('候选集同指纹有多条时 fail-open，且不消费任何 sidecar', () => {
+    const prompt = '<user_message>\n继续\n</user_message>';
+    writePromptContext('sess-ambiguous', 'turn-A', prompt, 'ENV-A');
+    writePromptContext('sess-ambiguous', 'turn-B', prompt, 'ENV-B');
+    const fingerprint = fingerprintPromptText(prompt);
+    const prefix = prefixOf(prompt);
+    expect(claimPromptContextAmongTurns('sess-ambiguous', ['turn-running', 'turn-A', 'turn-B'], fingerprint, prefix))
+      .toBeUndefined();
+    expect(readdirSync(join(tmpRoot, 'prompt-ctx', 'sess-ambiguous'))).toHaveLength(2);
+    // 歧义没有吞掉任何一轮；候选恢复唯一后仍各领各的。
+    expect(claimPromptContextAmongTurns('sess-ambiguous', ['turn-A'], fingerprint, prefix))
+      .toEqual({ turnId: 'turn-A', envelope: 'ENV-A' });
+    expect(claimPromptContextAmongTurns('sess-ambiguous', ['turn-B'], fingerprint, prefix))
+      .toEqual({ turnId: 'turn-B', envelope: 'ENV-B' });
+  });
+
+  it('候选集先做全局精确匹配，不让旧轮的前缀兜底抢走新轮精确命中', () => {
+    const common = 'abcdefghijklmnopqrstuvwxyz一二三四五六七八九十';
+    const promptA = `${common}-old-tail`;
+    const promptB = `${common}-new-tail`;
+    expect(prefixOf(promptA)).toBe(prefixOf(promptB));
+    writePromptContext('sess-exact-first', 'turn-A', promptA, 'ENV-A');
+    writePromptContext('sess-exact-first', 'turn-B', promptB, 'ENV-B');
+    expect(claimPromptContextAmongTurns('sess-exact-first', ['turn-A', 'turn-B'],
+      fingerprintPromptText(promptB), prefixOf(promptB)))
+      .toEqual({ turnId: 'turn-B', envelope: 'ENV-B' });
+    expect(claimByPrompt('sess-exact-first', 'turn-A', promptA)).toBe('ENV-A');
+  });
+
+  it('精确匹配为零时只允许全局唯一前缀匹配，多条同前缀同样不消费', () => {
+    const common = 'abcdefghijklmnopqrstuvwxyz一二三四五六七八九十';
+    const promptA = `${common}-old-tail`;
+    const promptB = `${common}-new-tail`;
+    writePromptContext('sess-prefix-ambiguous', 'turn-A', promptA, 'ENV-A');
+    writePromptContext('sess-prefix-ambiguous', 'turn-B', promptB, 'ENV-B');
+    const unmatchedFingerprint = fingerprintPromptText('paste-corrupted-tail');
+    const prefix = prefixOf(promptB);
+    expect(claimPromptContextAmongTurns('sess-prefix-ambiguous', ['turn-A', 'turn-B'], unmatchedFingerprint, prefix))
+      .toBeUndefined();
+    expect(readdirSync(join(tmpRoot, 'prompt-ctx', 'sess-prefix-ambiguous'))).toHaveLength(2);
+    expect(claimPromptContextAmongTurns('sess-prefix-ambiguous', ['turn-B'], unmatchedFingerprint, prefix))
+      .toEqual({ turnId: 'turn-B', envelope: 'ENV-B' });
+    expect(claimByPrompt('sess-prefix-ambiguous', 'turn-A', promptA)).toBe('ENV-A');
+  });
+
+  it('removePromptContextForTurn 只删除指定轮次', () => {
+    writePromptContext('sess-remove-turn', 'turn-A', 'A', 'ENV-A');
+    writePromptContext('sess-remove-turn', 'turn-B', 'B', 'ENV-B');
+    removePromptContextForTurn('sess-remove-turn', 'turn-A');
+    expect(claimByPrompt('sess-remove-turn', 'turn-A', 'A')).toBeUndefined();
+    expect(claimByPrompt('sess-remove-turn', 'turn-B', 'B')).toBe('ENV-B');
   });
 
   it('损坏的 sidecar 返回 undefined 而不是抛错', () => {

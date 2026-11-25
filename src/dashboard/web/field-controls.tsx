@@ -9,6 +9,7 @@ import { useT } from './react-hooks.js';
 export type DropdownFieldOption<T extends string> = {
   value: T;
   label: ReactNode;
+  searchTerms?: readonly string[];
   hint?: ReactNode;
   disabled?: boolean;
 };

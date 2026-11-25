@@ -606,6 +606,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       retired: [], started: [],
     });
     expect(send.mock.calls.map(call => call[0])).toEqual([
+      { type: 'type_ahead_queued', turnId: 'om_queued' },
       { type: 'turn_input_committed', turnId: 'om_queued' },
     ]);
 
@@ -618,7 +619,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       type: 'capture_identity', revision: 1, turnId: 'om_queued', dispatchAttempt: 7,
     });
     expect(harness.advance()).toBe(false);
-    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenCalledTimes(3);
   });
 });
 

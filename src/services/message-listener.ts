@@ -1,3 +1,4 @@
+import { redactProtectedLarkEvent } from '../im/lark/protected-event.js';
 import { getAllBots, type BotState, type MessageListenerConfig } from '../bot-registry.js';
 import { extractCardContent, extractMentionIdentities, extractPostListenerText, unwrapUserDslContent } from '../im/lark/message-parser.js';
 import { resolveCurrentChatBotOpenIdsByLarkAppIds } from '../im/lark/client.js';
@@ -135,6 +136,13 @@ export function extractListenerMessageText(message: any): string {
  * match — it only ever upgrades. Mutates `match` in place.
  */
 export function refreshListenerCardTextFromResolved(match: MessageListenerMatch, message: any): void {
+  const safe = redactProtectedLarkEvent({ message }).message;
+  if (safe !== message) {
+    match.messageText = extractListenerMessageText(safe);
+    match.messageTitle = undefined;
+    match.msgType = 'text';
+    return;
+  }
   if (match.msgType !== 'interactive') return;
   const text = extractListenerMessageText(message);
   if (text.trim()) match.messageText = text;
@@ -329,6 +337,8 @@ export function evaluateMessageListener(input: {
   explicitlyMentionedThisBot: boolean;
   messageTextOverride?: string;
 }): MessageListenerMatch | undefined {
+  const safe = redactProtectedLarkEvent({ message: input.message }).message;
+  if (safe !== input.message) input = { ...input, message: safe, messageTextOverride: undefined };
   if (input.explicitlyMentionedThisBot) return undefined;
   const messageId = String(input.message?.message_id ?? '');
   const rootId = input.message?.root_id ? String(input.message.root_id) : '';
@@ -391,6 +401,8 @@ export async function evaluateMessageListenerWithDocumentTitles(
   input: Parameters<typeof evaluateMessageListener>[0],
   deps: { resolveDocumentTitles?: (larkAppId: string, text: string) => Promise<string[]> } = {},
 ): Promise<MessageListenerMatch | undefined> {
+  const safe = redactProtectedLarkEvent({ message: input.message }).message;
+  if (safe !== input.message) input = { ...input, message: safe, messageTextOverride: undefined };
   const listener = findMessageListenerForChat(input.bot, input.chatId);
   const policy = listener?.contentPolicy;
   const localText = input.messageTextOverride ?? extractListenerMessageText(input.message);

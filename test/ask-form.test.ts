@@ -11,6 +11,7 @@ import { buildTurnReplyAskElements, turnReplyAskSummary } from '../src/im/lark/t
 import { _resetForTest, _getPending, applyAskForm, registerAsk, setCardDispatcher, setCanTalkChecker, submitAsk, submitAskForm, submitCustomReply, submitAskFromDesktop, toggleAsk, registerHostAsk } from '../src/core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest } from '../src/core/explicit-ask-continuation.js';
 import type { AskQuestion, CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
+import { t } from '../src/i18n/index.js';
 
 const questions: AskQuestion[] = [
   { prompt: 'AI introduced?', multiSelect: false, options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }], defaultSelectedKeys: [] },
@@ -169,6 +170,22 @@ describe('production broker and card callback', () => {
     expect(await result).toMatchObject({ answers: [[], [], []], comment: 'No, 0.5 days, extra note' });
     expect(await result).not.toHaveProperty('inputs');
   });
+  // Questions are checked in order and the toast names the first one at fault, input fields included.
+  it.each([
+    ['数字超出范围', questions, { q0: 'no', q1: '30', q2: '' }, 'card.ask.toast.invalid_input', 2],
+    ['数字写成文字', questions, { q0: 'no', q1: 'abc', q2: '' }, 'card.ask.toast.invalid_input', 2],
+    ['文字超长', questions, { q0: 'no', q1: '1', q2: 'x'.repeat(51) }, 'card.ask.toast.invalid_input', 3],
+    ['必填数字没填', questions, { q0: 'no', q1: '', q2: '' }, 'card.ask.toast.unanswered', 2],
+    ['输入题在前、后面的单选也没选', [questions[1], questions[0]], { q0: 'abc' }, 'card.ask.toast.invalid_input', 1],
+    ['输入题都对、单选没选', [questions[1], questions[0]], { q0: '3' }, 'card.ask.toast.unanswered', 2],
+  ] as Array<[string, AskQuestion[], Record<string, string>, string, number]>)('输入表单提交失败（%s）：提示点名真正出错的那道题', async (_case, qs, form_value, key, n) => {
+    const result = registerAsk({ ...base, questions: qs }); await vi.advanceTimersByTimeAsync(0);
+    const response = await handleAskCardAction({ operator: { open_id: 'ou_requester' },
+      action: { value: { action: 'ask_form_submit', ask_id: sent.askId, nonce: sent.nonce }, form_value } } as any);
+    expect(response).toEqual({ toast: { type: 'warning', content: t(key, { n }) } });
+    expect(_getPending(sent.askId)?.settled).toBe(false);
+    expect(submitAskForm({ ...args(), values: qs === questions ? values : { q0: '3', q1: 'no' } })).toBe('accepted'); await result;
+  });
   it('invalid callback only toasts, valid callback renders terminal form without losing inputs', async () => {
     const result = registerAsk(base); await vi.advanceTimersByTimeAsync(0);
     const callback = (form_value: unknown) => ({ operator: { open_id: 'ou_requester' }, action: { value: { action: 'ask_form_submit', ask_id: sent.askId, nonce: sent.nonce }, form_value } });
@@ -200,23 +217,29 @@ describe('production broker and card callback', () => {
     const waiting = registerAsk({ ...base, questions: [{ ...questions[0], multiSelect: true, defaultSelectedKeys: ['yes'] }, ...questions.slice(1)] });
     await vi.advanceTimersByTimeAsync(0);
     const card = JSON.parse(buildAskCard(sent));
-    const fields = card.body.elements.find((e: any) => e.tag === 'form').elements;
-    const choice = fields.find((e: any) => e.tag === 'multi_select_static');
-    expect(choice.selected_values).toEqual(['yes']);
-    expect(choice).not.toHaveProperty('initial_options');
-    expect(choice).not.toHaveProperty('behaviors');
-    const submit = fields.find((e: any) => e.tag === 'button');
+    const nodes = (v: any): any[] => v && typeof v === 'object' ? [v, ...Object.values(v).flatMap(nodes)] : [];
+    const form = card.body.elements.find((e: any) => e.tag === 'form');
+    // The default is a ticked checker; ticking stays in the client (no callback per checker).
+    const checkers = nodes(form).filter((e: any) => e.tag === 'checker');
+    expect(checkers.map((c: any) => [c.name, c.checked])).toEqual([['opt_0_0', true], ['opt_0_1', false]]);
+    expect(checkers.every((c: any) => !('behaviors' in c))).toBe(true);
+    const submit = nodes(form).find((e: any) => e.tag === 'button');
     expect(submit.form_action_type).toBe('submit');
     expect(submit.behaviors).toEqual([{ type: 'callback', value: { action: 'ask_form_submit', ask_id: sent.askId, nonce: sent.nonce } }]);
     expect(submit).not.toHaveProperty('action_type');
-    expect(submitAskForm({ ...args(), values })).toBe('accepted'); await waiting;
+    // One submit carries the ticks and the inputs together.
+    const settled: any = await handleAskCardAction({ operator: { open_id: 'ou_requester' }, action: {
+      value: submit.behaviors[0].value, form_value: { opt_0_0: true, opt_0_1: false, q1: '0.5', q2: '' } } });
+    expect(await waiting).toMatchObject({ kind: 'answered', answers: [['yes'], [], []], inputs: [null, '0.5', null] });
+    expect(settled.header.template).toBe('green');
   });
   it('uses one Card 2.0 form in standalone and inline paths with no toggle callbacks', async () => {
     const result = registerAsk(base); await vi.advanceTimersByTimeAsync(0);
     const card = JSON.parse(buildAskCard(sent));
     expect(card.schema).toBe('2.0');
     expect(card.body.elements.filter((e: any) => e.tag === 'form')).toHaveLength(1);
-    expect(JSON.stringify(card)).toContain('select_static'); expect(JSON.stringify(card)).toContain('input');
+    expect(JSON.stringify(card)).toContain('"tag":"checker"'); expect(JSON.stringify(card)).toContain('"tag":"input"');
+    expect(JSON.stringify(card)).not.toContain('select_static');
     expect(JSON.stringify(card)).not.toContain('ask_toggle');
     expect(buildTurnReplyAskElements({ ask: sent } as any, 'zh')).toEqual(card.body.elements);
     submitAskForm({ ...args(), values }); const answer = await result;
