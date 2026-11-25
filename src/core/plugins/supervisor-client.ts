@@ -43,16 +43,40 @@ export function readPluginProcesses(): PluginProcessInfo[] {
   }
   const processes = new Map<string, PluginProcessInfo>();
   for (const proc of state?.procs ?? []) {
-    const alive = pidAlive(proc.pid)
-      && !isLinuxZombie(proc.pid)
-      && (!proc.processStart || readDurableProcessIdentity(proc.pid) === proc.processStart);
-    processes.set(proc.name, {
-      name: proc.name,
-      ...(alive ? { pid: proc.pid } : {}),
-      ...(alive && proc.processStart ? { processStart: proc.processStart } : {}),
-      status: !alive && proc.status === 'online' ? 'stopped' : proc.status,
-      configHash: proc?.configHash,
-    });
+    // Three-state liveness, so a read failure can never masquerade as stopped:
+    //  - dead: kill(0) fails or the process is a zombie → 'stopped', pid dropped;
+    //  - verified: alive AND (no recorded birth, or birth identity matches) →
+    //    the supervisor's own status, pid and processStart kept;
+    //  - unknown: alive but birth identity is unreadable or does not match
+    //    (PID reuse candidate, /proc hiccup) → 'unknown' with the live pid
+    //    retained but no processStart. Lifecycle guards (uninstall/update/start)
+    //    must treat unknown like online, never like stopped; the webhook/service
+    //    proxy independently requires a verified birth and answers 503 otherwise.
+    const liveness = pidAlive(proc.pid) && !isLinuxZombie(proc.pid);
+    let info: PluginProcessInfo;
+    if (!liveness) {
+      info = {
+        name: proc.name,
+        status: proc.status === 'online' ? 'stopped' : proc.status,
+        configHash: proc?.configHash,
+      };
+    } else if (!proc.processStart || readDurableProcessIdentity(proc.pid) === proc.processStart) {
+      info = {
+        name: proc.name,
+        pid: proc.pid,
+        ...(proc.processStart ? { processStart: proc.processStart } : {}),
+        status: proc.status,
+        configHash: proc?.configHash,
+      };
+    } else {
+      info = {
+        name: proc.name,
+        pid: proc.pid,
+        status: 'unknown',
+        configHash: proc?.configHash,
+      };
+    }
+    processes.set(proc.name, info);
   }
   for (const [id, item] of Object.entries(desired.services)) {
     const name = pluginServiceName(id);

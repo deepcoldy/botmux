@@ -403,6 +403,9 @@ describe('plugin service host env injection, webhooks port/token, and liveness r
       { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'stopped' }] },
       { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 0, processStart: 'boot-2', status: 'online' }] },
       { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, status: 'online' }] },
+      // A live pid whose birth identity could not be verified projects as
+      // 'unknown' (pid retained, no processStart): the proxy must fail 503.
+      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, status: 'unknown' }] },
     ];
     for (const c of supCases) {
       expect(resolveRunningPluginServiceTarget('live-svc', {

@@ -282,6 +282,10 @@ function findService(name: string): PluginProcessInfo | undefined {
 }
 
 function isStoppedService(app: PluginProcessInfo): boolean {
+  // Requires BOTH no live pid and a terminal status. An 'unknown' row keeps its
+  // live pid (birth identity unreadable/unmatched), so it never counts as
+  // stopped: uninstall/update must fail closed rather than touch a process that
+  // is still running but cannot be verified.
   return app.pid === undefined && (app.status === 'stopped' || app.status === 'errored');
 }
 
