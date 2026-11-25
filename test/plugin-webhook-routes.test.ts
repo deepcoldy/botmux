@@ -603,7 +603,9 @@ describe('plugin webhook route gateway (POST /webhook/plugin/:pluginId/*)', () =
         // persisted ids keep their exact case for lookup/token verification.
         const m = url.pathname.match(/^\/webhook\/([^/]+)(?:\/([^/]+))?$/);
         if (m && decodeURIComponent(m[1]).toLowerCase() === 'plugin') {
-          legacyReached.push(`${req.method} ${req.url}`);
+          legacyReached.push(m[2]
+            ? `${req.method} ${url.pathname} token=${decodeURIComponent(m[2])}`
+            : `${req.method} ${url.pathname} token=(query)`);
           res.writeHead(202, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ routed: 'legacy-connector' }));
           return true;
@@ -621,25 +623,32 @@ describe('plugin webhook route gateway (POST /webhook/plugin/:pluginId/*)', () =
       ['POST', '/webhook/PLUGIN/upper-secret'],
       ['POST', '/webhook/Plugin?token=mixed-secret'],
       ['POST', '/webhook/%50lugin/mixed-secret'],
+      // Opaque custom secrets containing '/' or '\': publicWebhookUrl() encodes
+      // them with encodeURIComponent, so the wire path carries %2F / %5C.
+      ['POST', `/webhook/plugin/${encodeURIComponent('a/b')}`],
+      ['POST', `/webhook/plugin/${encodeURIComponent('a\\b')}`],
     ];
     for (const [method, path] of legacyCases) {
       const res = await sendHttp(frontPort, { method, path, ...(method === 'GET' ? {} : { body: '' }) });
       expect(res.status, `${method} ${path}`).toBe(202);
       expect(JSON.parse(res.body.toString()).routed).toBe('legacy-connector');
     }
-    expect(legacyReached).toHaveLength(7);
+    expect(legacyReached).toHaveLength(9);
+    // The encoded token must reach the legacy router decoded verbatim for HMAC/token verification.
+    expect(legacyReached).toContain(`POST /webhook/plugin/a%2Fb token=a/b`);
+    expect(legacyReached).toContain(`POST /webhook/plugin/a%5Cb token=a\\b`);
 
     // Three-segment plugin shape stays owned by the gateway: unknown plugin is
     // answered by the plugin handler, never leaked to the connector router.
     const ghost = await sendHttp(frontPort, { method: 'POST', path: '/webhook/plugin/ghost/x', body: '' });
     expect(ghost.status).toBe(404);
     expect(JSON.parse(ghost.body.toString()).error).toBe('plugin_not_found');
-    expect(legacyReached).toHaveLength(7);
+    expect(legacyReached).toHaveLength(9);
 
     // Declared plugin routes still forward to the plugin upstream.
     const ok = await sendHttp(frontPort, { method: 'POST', path: '/webhook/plugin/demo/events', body: '' });
     expect(ok.status).toBe(202);
-    expect(legacyReached).toHaveLength(7);
+    expect(legacyReached).toHaveLength(9);
   });
 
   it('never falls through backslash/dot traversal shapes that new URL normalizes onto other routes', async () => {
@@ -659,6 +668,11 @@ describe('plugin webhook route gateway (POST /webhook/plugin/:pluginId/*)', () =
       '/webhook/%70lugin/..\\..\\__health',
       '/webhook/plugin/../../__health',
       '/webhook/PLUGIN/..\\..\\__health',
+      // Encoded complete dot segments normalize onto a trailing-slash shape.
+      '/webhook/plugin/%2e%2e',
+      '/webhook/plugin/%2e',
+      // A raw null byte is outside the visible-ASCII origin form.
+      '/webhook/plugin/%00b',
     ];
     for (const path of traversals) {
       const rawRes = await sendRawHttpLine(

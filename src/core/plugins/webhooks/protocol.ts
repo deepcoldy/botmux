@@ -444,11 +444,16 @@ export type ParsedServiceProxyRequest =
  * delivering on upgrade. The legacy router re-runs its own token/HMAC
  * verification, so falling through never bypasses authentication.
  *
- * The full raw path must pass the same strict checks as plugin routes BEFORE
- * the fall-through: `new URL(...)` would otherwise collapse backslashes/dot
- * segments after `earlyGuard` has already handed the request over, letting a
- * shape like `/webhook/plugin/..\..\__health` normalize onto an unrelated
- * unauthenticated route.
+ * The gate deliberately does NOT reuse the plugin strict-path validator: a
+ * legacy custom secret may contain `/` or `\`, and `publicWebhookUrl` bakes
+ * `encodeURIComponent(secret)` into the path, so the opaque token segment can
+ * legitimately contain `%2F`/`%5C`. Safety instead comes from:
+ *  - normalization invariance: `new URL(rawPath).pathname` must equal the raw
+ *    path byte-for-byte, so raw backslashes, raw/encoded complete dot segments
+ *    and double slashes (anything WHATWG URL rewrites onto another route) fail;
+ *  - single-wire-segment shape (the encoded token cannot split mid-parse);
+ *  - rejection of malformed percent encoding and control characters.
+ * The legacy router uses the decoded token only for signature comparison.
  */
 export function isLegacyPluginConnectorWebhookTarget(rawUrl: string | undefined): boolean {
   const target = parseRawOriginFormTarget(rawUrl);
@@ -458,28 +463,45 @@ export function isLegacyPluginConnectorWebhookTarget(rawUrl: string | undefined)
   if (segments[1] !== 'webhook' || segments.length < 3 || segments.length > 4) return false;
   // A trailing slash (`/webhook/plugin/`) never matched the legacy segment regex.
   if (segments.length === 4 && segments[3] === '') return false;
-  // Reject backslashes, dot segments, encoded separators, control chars, and
-  // any other shape WHATWG URL normalization would rewrite onto another route.
+
+  // Reject any shape WHATWG URL normalization would rewrite onto another route.
+  let normalizedPathname: string;
   try {
-    validateStrictPluginHttpPath(target.rawPath, {
-      allowRoot: false,
-      allowTrailingSlash: false,
-      maxLength: 2048,
-      errorCode: 'invalid_legacy_connector_path',
-    });
+    normalizedPathname = new URL(target.rawPath, 'http://botmux.invalid').pathname;
   } catch {
     return false;
   }
+  if (normalizedPathname !== target.rawPath) return false;
+
   let connectorId: string;
   try {
     connectorId = decodeURIComponent(segments[2]);
   } catch {
     return false;
   }
+  if (CONTROL_CHAR_RE.test(connectorId)) return false;
   // Case-insensitive: connectors created before the reservation may use
   // `PLUGIN`/`Plugin`; the legacy router looks up the stored id exactly and
-  // re-verifies its own token before delivering.
-  return connectorId.toLowerCase() === 'plugin';
+  // re-verifies its own token before delivering. The equality itself also
+  // rejects dot segments and any non-`plugin` connector id.
+  if (connectorId.toLowerCase() !== 'plugin') return false;
+
+  if (segments.length === 4) {
+    // Opaque token: encoded separators stay one wire segment and are allowed.
+    // A token that decodes to a complete `.`/`..` cannot reach here because the
+    // invariance check above already rejects every such shape, so only guard
+    // against malformed percent encoding and control characters.
+    let decodedToken: string;
+    try {
+      decodedToken = decodeURIComponent(segments[3]);
+    } catch {
+      return false;
+    }
+    if (CONTROL_CHAR_RE.test(decodedToken)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**

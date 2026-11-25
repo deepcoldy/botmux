@@ -394,6 +394,13 @@ describe('plugin webhooks contribution scanning, matching, and raw URL protocol 
       ['/webhook/PLUGIN/upper-secret', 'uppercase persisted connector id'],
       ['/webhook/Plugin?token=mixed-secret', 'mixed-case connector id'],
       ['/webhook/%50lugin/mixed-secret', 'percent-encoded capital P'],
+      // Opaque custom secrets: publicWebhookUrl() encodes '/' and '\' — the
+      // percent-encoded token stays one wire segment and reaches the legacy
+      // router, which decodes it for signature comparison.
+      ['/webhook/plugin/a%2Fb', 'custom secret containing an encoded slash'],
+      ['/webhook/plugin/a%5Cb', 'custom secret containing an encoded backslash'],
+      ['/webhook/plugin/a%2Fb%5Cc', 'mixed encoded separators inside token'],
+      ['/webhook/plugin/a%2e%2e', 'encoded dots inside a larger opaque token segment'],
     ];
     for (const [rawUrl, label] of legacyTrue) {
       expect(isLegacyPluginConnectorWebhookTarget(rawUrl), label).toBe(true);
@@ -403,12 +410,15 @@ describe('plugin webhooks contribution scanning, matching, and raw URL protocol 
       ['/webhook/plugin/demo/events', 'plugin route requires 3+ segments'],
       ['/webhook/plugin/ghost/x', 'unknown plugin still has plugin shape, no fall-through'],
       ['/webhook/other/token', 'different connector id'],
-      ['/webhook/plugin/a/b', 'three segments is plugin shape'],
+      ['/webhook/plugin/a/b', 'raw slash splits into plugin-shaped segments'],
       ['/webhook/plugin/..\\..\\__health', 'backslash traversal must stay behind the strict guard'],
       ['/webhook/%70lugin/..\\..\\__health', 'encoded id plus backslash traversal'],
-      ['/webhook/plugin/../../__health', 'dot-segment traversal rejected by strict path validation'],
-      ['/webhook/plugin/a%2fb', 'encoded slash in token segment'],
-      ['/webhook/plugin/a%5Cb', 'encoded backslash in token segment'],
+      ['/webhook/plugin/../../__health', 'dot-segment traversal rejected by normalization invariance'],
+      ['/webhook/plugin/%2e%2e', 'complete encoded dot-dot segment normalizes onto trailing slash'],
+      ['/webhook/plugin/%2e', 'complete encoded dot segment normalizes onto trailing slash'],
+      ['/webhook/plugin/a%zz', 'malformed percent sequence in token'],
+      ['/webhook/plugin/a%2', 'truncated percent sequence in token'],
+      ['/webhook/plugin/%00b', 'null byte encoded in token segment'],
       ['//evil.example/webhook/plugin/token', 'protocol-relative target rejected'],
       ['/webhook', 'unrelated webhook prefix'],
       ['/webhook/plugin?x=1#frag', 'fragment-bearing target rejected at origin-form parse'],
