@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { claudeTranscriptTailMidToolCycle, createTranscriptTerminalSettle } from '../src/services/transcript-terminal-settle.js';
+import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
+import type { TranscriptEvent } from '../src/services/claude-transcript.js';
+import {
+  claudeTranscriptTailMidToolCycle,
+  createTranscriptTerminalSettle,
+  midToolCycleHoldApplies,
+} from '../src/services/transcript-terminal-settle.js';
 
 describe('createTranscriptTerminalSettle', () => {
   beforeEach(() => { vi.useFakeTimers(); });
@@ -208,5 +214,64 @@ describe('claudeTranscriptTailMidToolCycle', () => {
     expect(claudeTranscriptTailMidToolCycle(lines(half))).toBe(false);
     expect(claudeTranscriptTailMidToolCycle(lines(finalText.slice(finalText.indexOf('{', 1)), toolUse))).toBe(true);
     expect(claudeTranscriptTailMidToolCycle('')).toBe(false);
+  });
+});
+
+describe('midToolCycleHoldApplies', () => {
+  it('only a live turn of the current writer may hold', () => {
+    expect(midToolCycleHoldApplies({})).toBe(true);
+    expect(midToolCycleHoldApplies(undefined)).toBe(false);
+    expect(midToolCycleHoldApplies({ isLocal: true })).toBe(false);
+    expect(midToolCycleHoldApplies({ restoredFromJournal: true })).toBe(false);
+    expect(midToolCycleHoldApplies({ carriedAcrossGeneration: true })).toBe(false);
+  });
+});
+
+/** The worker's wiring (bridgeHeadTurnAwaitingTerminal + makeBridgeTranscriptSettle) on a real
+ *  BridgeTurnQueue: a cold resume restores a turn from the journal whose transcript tail is a
+ *  static `tool_use` (its writer died mid tool); the first idle edge of the new CLI must release
+ *  it on the original 2 s bound, not hold it to maxHoldMs. A live turn with the same tail holds. */
+describe('mid-tool hold vs. a journal-restored dead-writer turn', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  const question = 'build the site';
+  const toolUseTail = JSON.stringify({
+    type: 'assistant', uuid: 'a1',
+    message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} }] },
+  });
+  const events: TranscriptEvent[] = [
+    { type: 'user', uuid: 'u1', message: { role: 'user', content: question } },
+    { type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash' }] as any } },
+  ];
+
+  function settleOn(restored: boolean) {
+    const q = new BridgeTurnQueue();
+    const norm = normaliseForFingerprint(question);
+    q.mark('om_turn', makeFingerprint(norm), Date.now() - 1_000, norm, undefined, restored ? { restoredFromJournal: true } : undefined);
+    q.ingest(events);
+    const head = q.peek()[0];
+    expect(head?.started, 'the user record was matched to the turn').toBe(true);
+    expect(q.isTurnOpenAtIdle(head!), 'no terminal read yet: the idle edge waits').toBe(true);
+    const proceed = vi.fn();
+    createTranscriptTerminalSettle({
+      awaitingTerminal: () => { const h = q.peek()[0]; return !!h && !h.isLocal && h.started && q.isTurnOpenAtIdle(h); },
+      midToolCycle: () => midToolCycleHoldApplies(q.peek()[0]) && claudeTranscriptTailMidToolCycle(`${toolUseTail}\n`),
+    }).request(proceed);
+    return proceed;
+  }
+
+  it('a restored turn is released on the normal bound', () => {
+    const proceed = settleOn(true);
+    vi.advanceTimersByTime(1_900);
+    expect(proceed).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(200);
+    expect(proceed).toHaveBeenCalledTimes(1);
+  });
+
+  it('a live turn with the same tail still holds past the bound (control)', () => {
+    const proceed = settleOn(false);
+    vi.advanceTimersByTime(60_000);
+    expect(proceed).not.toHaveBeenCalled();
   });
 });

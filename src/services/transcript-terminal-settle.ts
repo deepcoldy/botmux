@@ -113,6 +113,19 @@ export function createTranscriptTerminalSettle(opts: TranscriptTerminalSettleOpt
   };
 }
 
+/** Whether a mid-tool-cycle hold may apply to this head turn. Only a turn the
+ *  current CLI is still writing can be "inside its tool cycle": a
+ *  journal-restored turn (its writer was a previous process) or one carried
+ *  across a transcript rotation (the old file's writer) left a static tail, so
+ *  a trailing `tool_use` there proves nothing, and the bridge queue already
+ *  releases such heads at the idle/terminal boundary. Holding them would only
+ *  delay prompt-ready (and a cold-resume continuation) by up to `maxHoldMs`. */
+export function midToolCycleHoldApplies(
+  head: { isLocal?: boolean; restoredFromJournal?: boolean; carriedAcrossGeneration?: boolean } | undefined,
+): boolean {
+  return !!head && !head.isLocal && !head.restoredFromJournal && !head.carriedAcrossGeneration;
+}
+
 /** True when the tail of a Claude Code transcript (JSONL text, possibly
  *  starting mid-line) shows the turn is still inside its tool cycle: the last
  *  main-chain assistant record stopped for `tool_use`, or a tool_result was

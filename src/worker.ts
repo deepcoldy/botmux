@@ -197,7 +197,7 @@ import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_M
 import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
-import { claudeTranscriptTailMidToolCycle, createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
+import { claudeTranscriptTailMidToolCycle, createTranscriptTerminalSettle, midToolCycleHoldApplies, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
 import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, finalBridgeSendMarkerCoversOwnThread, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
@@ -13787,10 +13787,6 @@ let provisionalExitBoundActivitySeq = 0;
  *  generation; a rotation arms the next turn's own deadline fresh. */
 let bridgeTranscriptGeneration = 0;
 
-/** Build a settle that tracks its in-flight state and owns the watchdog
- *  lifecycle: requesting an idle wait disarms the watchdog (the idle edge's
- *  own settle takes over); cancel/proceed lets bridgeIngest re-arm it if the
- *  head is still waiting afterwards. */
 /** True while the Claude transcript's tail shows the turn is still inside its
  *  tool cycle: the last assistant record stopped for `tool_use`, or a
  *  tool_result was written after it (the next model call is in flight). Herdr
@@ -13816,6 +13812,10 @@ function claudeTranscriptMidToolCycle(): boolean {
   }
 }
 
+/** Build a settle that tracks its in-flight state and owns the watchdog
+ *  lifecycle: requesting an idle wait disarms the watchdog (the idle edge's
+ *  own settle takes over); cancel/proceed lets bridgeIngest re-arm it if the
+ *  head is still waiting afterwards. */
 function makeBridgeTranscriptSettle(
   awaitingTerminal: () => boolean,
   onTimeout?: () => void,
@@ -13826,7 +13826,9 @@ function makeBridgeTranscriptSettle(
   const inner = createTranscriptTerminalSettle({
     awaitingTerminal: () => isCurrent() && awaitingTerminal(),
     onTimeout: onTimeout && (() => { if (isCurrent()) onTimeout(); }),
-    midToolCycle: () => isCurrent() && claudeTranscriptMidToolCycle(),
+    // A dead writer's static tail (journal-restored / carried-over head) keeps
+    // the original bounded settle; see midToolCycleHoldApplies.
+    midToolCycle: () => isCurrent() && midToolCycleHoldApplies(bridgeQueue.peek()[0]) && claudeTranscriptMidToolCycle(),
   });
   return {
     request: (proceed: () => void): void => {
