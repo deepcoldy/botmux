@@ -6,6 +6,12 @@ import { detectModelsViaExec, parseDebugModelsJson, detectModelCapabilitiesViaEx
 import type { CliAdapter, CliLaunchNotice, PtyHandle, StructuredBridgeSpec, WriteInputContext } from './types.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import {
+  bindTraexSessionFromCorrelatedInput,
+  traexTerminalIdentityGeneration,
+  traexTerminalInputBlocked,
+} from '../../services/traex-terminal-session.js';
 import { traeCliStatePath, traeConfigPath, traeHome, traeHomeFor, traeInstallationIdPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import { watchNativeSessionIndex } from '../../services/native-session-index.js';
 import {
@@ -24,7 +30,16 @@ import {
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
-import { traexModelPickerPage, traexRestoredComposerReady, traexSessionRenameSurface, traexViewportFooterBusy } from './traex-footer.js';
+import {
+  traexModelPickerPage,
+  traexRestoredComposerReady,
+  traexSessionRenameSurface,
+  traexViewportFooterBusy,
+  TRAEX_PROGRESS_PATTERN,
+  TRAEX_SPINNER_FRAMES,
+  TRAEX_SPINNER_LABELS,
+} from './traex-footer.js';
+export { TRAEX_SPINNER_LABELS } from './traex-footer.js';
 import { probeTraexHookTrustSupport, TRAEX_HOOK_TRUST_FLAG, TRAEX_HOOK_TRUST_MIN_VERSION, TRAEX_PROGRAM_STATUS_MIN_VERSION } from './traex-version.js';
 
 /**
@@ -164,38 +179,6 @@ export function traeMigrationDoneMarkers(env: NodeJS.ProcessEnv = process.env): 
  * only the queue strings would flash Idle the moment the queue resolves
  * into a real working turn.
  */
-const TRAEX_SPINNER_FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
-
-export const TRAEX_SPINNER_LABELS = [
-  // Set 1 — thinking/working rotation (compiled-in spinner string table).
-  'Thinking longer…',
-  'Deep in thought…',
-  'Almost there…',
-  'Running command…',
-  'Command in flight…',
-  'Chugging along…',
-  'Finishing up…',
-  'Executing…',
-  'Hang tight…',
-  'Waiting for response…',
-  'Any second now…',
-  'Poking the model…',
-  'On its way…',
-  "Shh, it's thinking…",
-  'Thinking…',
-  'Reasoning through it…',
-  'Mulling it over…',
-  'Pondering…',
-  'Working it out…',
-  'Piecing it together…',
-  // Set 2 — approval/working/queue.
-  'Reviewing approval request',
-  'Working…',
-  'Working on it…',
-  'Queued for capacity',
-  'Queued for next turn',
-] as const;
-
 /** Line-anchored standalone busy/queue strings. Shared by the active
  *  busy pattern and the pre-idle static latch (see below). */
 const TRAEX_QUEUE_STATIC_ARMS = [
@@ -219,9 +202,6 @@ const TRAEX_CAPACITY_QUEUE_PATTERN = new RegExp(
   ].join('|'),
   'im',
 );
-
-const TRAEX_PROGRESS_PATTERN = new RegExp(
-  `^[ \t]*[${TRAEX_SPINNER_FRAMES}⋄✧◇✦❖◈◆][ \t]+(?:${TRAEX_SPINNER_LABELS.filter(label => !label.startsWith('Queued')).join('|')})(?:[ \t]*\\([^\\r\\n]*esc to interrupt\\))?[ \t]*$`, 'i');
 
 /** The native pending-input panel can push live activity above the final
  * twelve rows. Only skip a verified panel between its exact header and the
@@ -525,6 +505,10 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
+      if (traexTerminalInputBlocked(pty)) return {
+        submitted: false,
+        failureReason: 'TRAE native status query did not finish. Close the status page or clear its remaining command in the terminal before sending another task; no task was pasted.',
+      };
       // /model is a native menu, not a model turn. Pasting a question into it
       // loses the paste and its Enter only dismisses the picker; history never
       // receives the question and the worker quarantines all later input.
@@ -544,6 +528,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const trySendEnter = (): boolean => {
         if (context?.submitGuard && !context.submitGuard.current()) return false;
         try {
+          if (correlated && pty.cliPid !== inputPid) return false;
           if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
           else pty.write('\r');
           return true;
@@ -566,6 +551,16 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // absent file just means baseByte=0 and the first appended line matches.
       const historyPath = traeHistoryPath();
       const baseByte = traexHistorySize(historyPath);
+
+      const inputPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
+        ? pty.cliPid
+        : undefined;
+      const initialOwned = context?.correlateTranscript === true && inputPid
+        ? findTraexRolloutSetByPid(inputPid) : undefined;
+      const correlated = context?.correlateTranscript === true && !!inputPid
+        && initialOwned !== undefined && initialOwned.size === 0;
+      const inputGeneration = correlated ? traexTerminalIdentityGeneration(pty) : undefined;
+      if (correlated) content += `\n\n<botmux_routing>\nbotmux_input_id: ${randomBytes(16).toString('hex')}\n</botmux_routing>`;
 
       // Two separable facts, matched with two different scans:
       //  - SUBMIT confirmation: any full-content match in the global submit log,
@@ -631,6 +626,15 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // result to return now, or null to keep waiting. `final` relaxes the
       // owned-wait: at budget end / on the worker recheck, confirm on any-text.
       const resolve = (final: boolean) => {
+        if (correlated) {
+          const match = anyMatch();
+          if (match.found && match.cliSessionId
+            && bindTraexSessionFromCorrelatedInput(pty, inputPid!, match.cliSessionId, inputGeneration!)) {
+            return { submitted: true as const, cliSessionId: match.cliSessionId, ownershipProven: true };
+          }
+          if (match.found) return { submitted: true as const };
+          return null;
+        }
         // The worker can rewire this same handle from a launcher/missing PID to
         // the real TraeX leaf after writeInput returns its deferred recheck.
         // Resolve ownership from the CURRENT pid on every poll, not a stale
