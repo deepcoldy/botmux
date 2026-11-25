@@ -143,7 +143,7 @@ describe('plugin supervisor lifecycle evidence', () => {
 
     // Lifecycle protection must stay fail-closed: an unknown-but-live process
     // cannot be treated as stopped for uninstall/update.
-    
+
     expect(() => assertPluginServiceStopped('demo', 'uninstall')).toThrow();
 
     // Recovery: once the identity is readable again and matches, online returns.

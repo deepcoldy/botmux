@@ -56,16 +56,22 @@ export interface ResolvePluginLoopbackTargetDeps {
  * token + verified OS process birth identity) for an installed plugin service
  * without holding `withPluginServiceLock`.
  *
+ * Two evidence modes:
+ * - Supervisor files present: the authoritative inputs are the host-written
+ *   `desired` spec (port, running flag) and the LIVE supervisor process table
+ *   (pid + birth identity). The dashboard-cached `service.json` is only a
+ *   status projection there — a transiently-unreadable birth identity can make
+ *   it record `unknown`, and gating on that stale row would keep the proxy 503
+ *   even after the live process recovers, so it is NOT consulted in this mode.
+ * - No supervisor files: `service.json` is the sole durable evidence and stays
+ *   strictly validated (online + live non-zombie pid + matching birth identity).
+ *
  * Fail-closed invariants:
- * - Rejects missing/offline `service.json` or invalid port (`1..65535`).
+ * - Rejects invalid/missing ports (`1..65535`) in either mode.
  * - Rejects self-proxy / daemon IPC / session preview ports in `forbiddenPorts`.
- * - When plugin supervisor state/desired files exist:
- *   - Requires `desired.services[pluginId]?.running === true` (with `Object.hasOwn`).
- *   - Requires `desiredEntry.spec.external.env.PORT` to be present and equal to `port`.
- *   - Rejects cross-plugin port collisions across running desired services.
- *   - Requires a live `online` supervisor proc with a non-empty verified `processStart`.
- * - When no supervisor files exist, unconditionally requires a live non-zombie
- *   `serviceState.pid` matching a non-empty `serviceState.processStart`.
+ * - Supervisor mode additionally requires `desired.services[pluginId].running`,
+ *   rejects cross-plugin port collisions, and requires a live `online` proc
+ *   with a non-empty verified `processStart`.
  * - Requires a valid host-managed loopback bearer token (`readToken`).
  */
 export function resolveRunningPluginServiceTarget(
@@ -77,24 +83,19 @@ export function resolveRunningPluginServiceTarget(
   }
   const readState = deps.readServiceState ?? readPluginServiceState;
   const serviceState = readState(pluginId);
-  const port = parseValidTcpPort(serviceState?.port);
-  if (!serviceState || serviceState.pluginId !== pluginId || serviceState.status !== 'online' || port === undefined) {
-    return { ok: false, status: 503, error: 'plugin_service_unavailable' };
-  }
-
-  const forbidden = deps.forbiddenPorts?.();
-  if (forbidden?.has(port)) {
-    return { ok: false, status: 503, error: 'plugin_service_unavailable' };
-  }
 
   const hasSupervisor = deps.hasSupervisorFiles
     ? deps.hasSupervisorFiles()
     : (existsSync(pluginSupervisorStatePath()) || existsSync(pluginSupervisorDesiredPath()));
 
+  const forbidden = deps.forbiddenPorts?.();
   let pid: number;
   let processStart: string;
+  let port: number;
 
   if (hasSupervisor) {
+    // Authoritative: desired spec + live process table. A stale/unknown row in
+    // the service.json cache must not block recovery once the proc is verified.
     try {
       const desired = (deps.readDesired ?? readPluginSupervisorDesired)();
       const desiredEntry = Object.hasOwn(desired.services, pluginId)
@@ -104,13 +105,16 @@ export function resolveRunningPluginServiceTarget(
         return { ok: false, status: 503, error: 'plugin_service_unavailable' };
       }
       const desiredPort = parseValidTcpPort(desiredEntry.spec?.external?.env?.PORT);
-      if (desiredPort === undefined || desiredPort !== port) {
+      if (desiredPort === undefined) {
+        return { ok: false, status: 503, error: 'plugin_service_unavailable' };
+      }
+      if (forbidden?.has(desiredPort)) {
         return { ok: false, status: 503, error: 'plugin_service_unavailable' };
       }
       for (const [otherId, otherEntry] of Object.entries(desired.services)) {
         if (otherId !== pluginId && otherEntry.running === true) {
           const otherPort = parseValidTcpPort(otherEntry.spec?.external?.env?.PORT);
-          if (otherPort === port) {
+          if (otherPort === desiredPort) {
             return { ok: false, status: 503, error: 'plugin_service_unavailable' };
           }
         }
@@ -130,10 +134,24 @@ export function resolveRunningPluginServiceTarget(
       }
       pid = proc.pid;
       processStart = proc.processStart;
+      port = desiredPort;
     } catch {
       return { ok: false, status: 503, error: 'plugin_service_unavailable' };
     }
   } else {
+    // service.json is the only durable evidence: keep every strict check.
+    const legacyPort = parseValidTcpPort(serviceState?.port);
+    if (
+      !serviceState
+      || serviceState.pluginId !== pluginId
+      || serviceState.status !== 'online'
+      || legacyPort === undefined
+    ) {
+      return { ok: false, status: 503, error: 'plugin_service_unavailable' };
+    }
+    if (forbidden?.has(legacyPort)) {
+      return { ok: false, status: 503, error: 'plugin_service_unavailable' };
+    }
     const aliveFn = deps.isPidAlive ?? pidAlive;
     const zombieFn = deps.isZombie ?? isLinuxZombie;
     const startFn = deps.readProcessStart ?? readDurableProcessIdentity;
@@ -151,6 +169,7 @@ export function resolveRunningPluginServiceTarget(
     }
     pid = serviceState.pid;
     processStart = serviceState.processStart;
+    port = legacyPort;
   }
 
   let token: string;

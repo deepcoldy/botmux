@@ -379,6 +379,38 @@ describe('plugin service host env injection, webhooks port/token, and liveness r
       forbiddenPorts: () => new Set([3999, 18888]),
     })).toEqual({ ok: true, host: '127.0.0.1', port: 44199, token, pid: 999, processStart: 'boot-2' });
 
+    // 1b. A stale 'unknown' service.json (transient /proc hiccup persisted by a
+    // status query) must not block recovery: supervisor mode trusts desired +
+    // the LIVE verified process, not the cached projection.
+    const recoveredDesired = {
+      revision: 'r1',
+      target: 'live-svc',
+      services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) },
+    };
+    expect(resolveRunningPluginServiceTarget('live-svc', {
+      readServiceState: () => ({ ...baseState, status: 'unknown' }),
+      hasSupervisorFiles: () => true,
+      readDesired: () => recoveredDesired,
+      readProcesses: () => [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }],
+    })).toEqual({ ok: true, host: '127.0.0.1', port: 44199, token, pid: 999, processStart: 'boot-2' });
+
+    // 1c. But if the live process is still unverified (unknown), it stays 503
+    // even when desired/port are otherwise valid.
+    expect(resolveRunningPluginServiceTarget('live-svc', {
+      readServiceState: () => ({ ...baseState, status: 'unknown' }),
+      hasSupervisorFiles: () => true,
+      readDesired: () => recoveredDesired,
+      readProcesses: () => [{ name: pluginServiceName('live-svc'), pid: 999, status: 'unknown' }],
+    })).toEqual({ ok: false, status: 503, error: 'plugin_service_unavailable' });
+
+    // 1d. The desired port (not the stale cache) is authoritative in supervisor mode.
+    expect(resolveRunningPluginServiceTarget('live-svc', {
+      readServiceState: () => ({ ...baseState, status: 'unknown', port: 55555 }),
+      hasSupervisorFiles: () => true,
+      readDesired: () => recoveredDesired,
+      readProcesses: () => [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }],
+    })).toEqual({ ok: true, host: '127.0.0.1', port: 44199, token, pid: 999, processStart: 'boot-2' });
+
     // 2. serviceState validation failures
     for (const badState of [
       undefined,
@@ -392,12 +424,13 @@ describe('plugin service host env injection, webhooks port/token, and liveness r
       })).toEqual({ ok: false, status: 503, error: 'plugin_service_unavailable' });
     }
 
-    // 3. Supervisor fail-closed cases: missing desired, running=false, missing PORT, port drift, port collision, missing/dead/no-processStart proc, corrupt supervisor
+    // 3. Supervisor fail-closed cases: missing desired, running=false, missing PORT, port collision, missing/dead/no-processStart proc, corrupt supervisor.
+    //    Port drift between desired and the stale service.json cache is NOT a
+    //    failure anymore: desired + live verified proc are authoritative (case 1d).
     const supCases = [
       { desired: { revision: 'r1', target: 'live-svc', services: {} }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }] },
       { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': { ...makeDesiredSpec('live-svc', { PORT: '44199' }), running: false } } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }] },
       { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', {}) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }] },
-      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44200' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }] },
       { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }), 'other-svc': makeDesiredSpec('other-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }] },
       { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [] },
       { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'stopped' }] },
