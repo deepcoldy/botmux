@@ -18,6 +18,13 @@ export type AssistantSpawn =
   | { kind: 'owner'; openId: string; workDir: string }
   | { kind: 'unclaimed' };
 
+/** bot 处于助理模式且不允许多人群（assistantGroupChat 没开）：群里真人超过 1 个时不工作。 */
+export function assistantMultiUserGroupsOff(larkAppId: string): boolean {
+  let cfg: BotConfig;
+  try { cfg = getBot(larkAppId).config; } catch { return false; }
+  return cfg.assistantMode === true && cfg.assistantGroupChat !== true;
+}
+
 export function resolveAssistantSpawn(
   larkAppId: string,
   chatId: string,

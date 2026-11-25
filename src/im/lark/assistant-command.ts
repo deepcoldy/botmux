@@ -10,7 +10,7 @@
  * 不在助理模式的 bot 一律回「未启用」；私聊永远归发消息的人，命令只回状态。
  * 设计见 docs/design/2026-11-20-assistant-mode.md §5.1。
  */
-import { isBotMentioned, canOperate, extractMessageTextForRouting } from './event-dispatcher.js';
+import { isBotMentioned, canOperate, extractMessageTextForRouting, getGroupStats } from './event-dispatcher.js';
 import { mentionOpenId, stripLeadingMentions } from './message-parser.js';
 import { replyMessage } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -19,9 +19,48 @@ import { config } from '../../config.js';
 import { getSessionGroup } from '../../services/session-groups-store.js';
 import { getAssistantOwner, setAssistantOwner } from '../../services/assistant-owner-store.js';
 import { isValidAssistantOpenId, notifyAssistantOwnerChanged, resolveAssistantOwnerOpenId } from '../../core/assistant-mode.js';
+import { assistantMultiUserGroupsOff } from '../../core/assistant-spawn.js';
 import { logger } from '../../utils/logger.js';
 
 export const ASSISTANT_COMMAND_RE = /^\/assistant(?:\s|$)/i;
+
+const MULTI_USER_NOTICE_MS = 10 * 60_000;
+const multiUserNoticeAt = new Map<string, number>();
+
+/**
+ * 助理模式不允许多人群（assistantGroupChat 没开）时群消息的总闸，放在一切群内处理（旁听、
+ * 命令、认领、建会话）之前：群里真人 ≥2 时整条吞掉，只有真人 @ 本 bot 时回一句，同群
+ * 10 分钟最多一次。人数查不到时按多人群处理。返回 true = 已吞掉。
+ */
+export async function tryHandleAssistantMultiUserGroup(
+  larkAppId: string,
+  message: any,
+  senderOpenId: string | undefined,
+  senderIsBot: boolean,
+  now = Date.now(),
+): Promise<boolean> {
+  const chatId: string | undefined = message?.chat_id;
+  if (message?.chat_type === 'p2p' || !chatId || !assistantMultiUserGroupsOff(larkAppId)) return false;
+  // 缓存说是单人群时重查一次：有人刚进群、而进群事件推给了别的副本时，缓存会停在 1 人。
+  const { userCount } = await getGroupStats(larkAppId, chatId, { revalidateSolo: true });
+  if (userCount <= 1) return false;
+  if (senderIsBot || !isBotMentioned(larkAppId, message, senderOpenId)) return true;
+  const key = `${larkAppId}:${chatId}`;
+  if ((multiUserNoticeAt.get(key) ?? -Infinity) > now - MULTI_USER_NOTICE_MS) return true;
+  multiUserNoticeAt.set(key, now);
+  logger.info(`[assistant-mode:${larkAppId}] multi-user group ${chatId.slice(0, 12)} (${userCount} users); notice sent`);
+  const messageId: string | undefined = message.message_id;
+  if (messageId) {
+    await replyMessage(larkAppId, messageId, t('cmd.assistant.multi_user_group', undefined, localeForBot(larkAppId)), 'text', false)
+      .catch(err => logger.warn(`[assistant-mode] multi-user-group notice failed: ${err?.message ?? err}`));
+  }
+  return true;
+}
+
+/** 测试用：清空限频记录。 */
+export function resetAssistantMultiUserNoticesForTest(): void {
+  multiUserNoticeAt.clear();
+}
 
 export async function tryHandleAssistantCommand(
   larkAppId: string,

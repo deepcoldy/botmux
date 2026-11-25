@@ -663,6 +663,7 @@ export const messages: Record<string, string> = {
   'worker.assistant.session_retired': '⚠️ This conversation was started before personal-assistant mode was enabled (or before the owner changed) and has been closed. Your last message was not processed — please send it again and I will continue in a new conversation.',
   'cmd.assistant.p2p': 'In a DM I am already your assistant — nothing to claim. /assistant is for groups.',
   'cmd.assistant.status': 'Assistant owner of this group: {owner}',
+  'cmd.assistant.multi_user_group': 'This assistant-mode bot does not work in groups with more than one person. Use it in a DM or a group where you are the only member.',
   'cmd.assistant.unclaimed': 'This group is unclaimed. Reply /assistant claim to make me your assistant; a bot admin can also assign it with /assistant owner @someone.',
   'cmd.assistant.no_sender': '⚠️ Cannot identify the sender; claim refused.',
   'cmd.assistant.already_yours': 'This group is already yours.',

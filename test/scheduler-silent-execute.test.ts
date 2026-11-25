@@ -71,11 +71,15 @@ const sendMessageMock = vi.fn(async () => 'om_banner_123');
 const replyMessageMock = vi.fn(async () => 'om_reply_456');
 const getChatModeMock = vi.fn(async () => 'group');
 const getMessageThreadIdMock = vi.fn(async () => 'omt_target_thread');
+const getChatRoutingFactsMock = vi.fn(async () => ({ external: false, mode: 'group' as 'group' | 'p2p' }));
+const getChatInfoMock = vi.fn(async () => ({ userCount: 2, botCount: 1 }));
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: (...a: any[]) => sendMessageMock(...a),
   replyMessage: (...a: any[]) => replyMessageMock(...a),
   getChatMode: (...a: any[]) => getChatModeMock(...a),
   getMessageThreadId: (...a: any[]) => getMessageThreadIdMock(...a),
+  getChatRoutingFacts: (...a: any[]) => getChatRoutingFactsMock(...a),
+  getChatInfo: (...a: any[]) => getChatInfoMock(...a),
   downloadMessageResource: vi.fn(),
   listChatBotMembers: vi.fn(async () => []),
   listCurrentChatBotMembers: vi.fn(async () => []),
@@ -1996,5 +2000,57 @@ describe('task-position restart recovery', () => {
 
     expect(sessionStoreCloseMock).toHaveBeenCalledWith('sess-restore-unmaterialized');
     expect(daemonActiveSessions.size).toBe(0);
+  });
+});
+
+describe('assistant mode without multi-user groups (assistantGroupChat off)', () => {
+  const cfg = BOT.config as typeof BOT.config & { assistantMode?: boolean; assistantGroupChat?: boolean };
+  beforeEach(() => {
+    cfg.assistantMode = true;
+    delete cfg.assistantGroupChat;
+    getChatRoutingFactsMock.mockReset();
+    getChatRoutingFactsMock.mockResolvedValue({ external: false, mode: 'group' });
+    getChatInfoMock.mockReset();
+    getChatInfoMock.mockResolvedValue({ userCount: 2, botCount: 1 });
+  });
+  afterEach(() => { delete cfg.assistantMode; delete cfg.assistantGroupChat; });
+  const REFUSED = /multi-user groups are not allowed/;
+
+  it('refuses a run into a group with two people before posting anything', async () => {
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({}), active, refreshCliVersion)).rejects.toThrow(REFUSED);
+    expect(getChatInfoMock).toHaveBeenCalledWith(APP, CHAT);
+    expect(sendMessageMock).not.toHaveBeenCalled(); expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled(); expect(store.size).toBe(0);
+  });
+
+  it('refuses when the chat lookup fails', async () => {
+    getChatRoutingFactsMock.mockRejectedValue(new Error('lark down'));
+    await expect(executeScheduledTask(baseTask({}), new Map(), refreshCliVersion)).rejects.toThrow(REFUSED);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('lets a one-person group through', async () => {
+    getChatInfoMock.mockResolvedValue({ userCount: 1, botCount: 2 });
+    await executeScheduledTask(baseTask({}), new Map(), refreshCliVersion).catch((e: Error) => expect(e.message).not.toMatch(REFUSED));
+    expect(getChatInfoMock).toHaveBeenCalledOnce();
+  });
+
+  it('a cross-chat task labelled p2p is looked up: a real DM passes, without counting members', async () => {
+    getChatRoutingFactsMock.mockResolvedValue({ external: false, mode: 'p2p' });
+    await executeScheduledTask(baseTask({ chatType: 'p2p', creatorChatId: 'oc_elsewhere' }), new Map(), refreshCliVersion)
+      .catch((e: Error) => expect(e.message).not.toMatch(REFUSED));
+    expect(getChatRoutingFactsMock).toHaveBeenCalledOnce();
+    expect(getChatInfoMock).not.toHaveBeenCalled();
+  });
+
+  it('a task in its own DM and a bot that allows multi-user groups need no lookup', async () => {
+    await executeScheduledTask(baseTask({ chatType: 'p2p', creatorChatId: CHAT }), new Map(), refreshCliVersion)
+      .catch((e: Error) => expect(e.message).not.toMatch(REFUSED));
+    cfg.assistantGroupChat = true;
+    await executeScheduledTask(baseTask({ id: 'task0002' }), new Map(), refreshCliVersion)
+      .catch((e: Error) => expect(e.message).not.toMatch(REFUSED));
+    expect(getChatRoutingFactsMock).not.toHaveBeenCalled();
+    expect(getChatInfoMock).not.toHaveBeenCalled();
   });
 });

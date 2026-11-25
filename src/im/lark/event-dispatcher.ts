@@ -72,7 +72,8 @@ import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSecretaryCommand } from './secretary-command.js';
 import { observeGroupSecretaryMessage } from '../../services/group-secretary-runtime.js';
-import { tryHandleAssistantCommand } from './assistant-command.js';
+import { tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from './assistant-command.js';
+import { assistantMultiUserGroupsOff } from '../../core/assistant-spawn.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { resolveSubstituteAppMentions, substituteMentionIdentities } from './substitute-app-mentions.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
@@ -6076,6 +6077,13 @@ export function createLarkEventDispatcherRuntime(
       const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
       const messageId = message.message_id;
 
+      // 个人助理模式且不允许多人群：真人 ≥2 的群里什么都不做（不旁听、不路由、不认领），被真人 @ 时回一句。
+      if (chatType === 'group') {
+        const st = sender?.sender_type;
+        if (await tryHandleAssistantMultiUserGroup(larkAppId, message,
+          sender?.sender_id?.open_id, st === 'app' || st === 'bot')) return;
+      }
+
       // 群聊上下文共享：静默旁听写入（group-context-ingest），放在任何 sender 分支 /
       // self return / mention gate 之前，让没被 @ 的消息也进共享记录。它自带开关
       // （默认关）与错误隔离，永不抛出、不推进 seen-message 去重、不启动 worker；
@@ -8014,6 +8022,12 @@ export function createLarkEventDispatcherRuntime(
         // 这次入群不跑入群钩子 / 入群命令 / 拉 owner / 自动开工，不发言也不开会话。
         if (isStewardSilentJoin(config.session.dataDir, larkAppId, chatId)) {
           logger.info(`[steward-join] joined chat=${chatId.substring(0, 12)} silently as a steward; skipping group-join actions`);
+          return;
+        }
+        // 个人助理模式不允许多人群：被拉进真人 ≥2 的群时入群钩子 / 入群命令 / 拉 owner / 归属 / 自动开工一概不做。
+        if (assistantMultiUserGroupsOff(larkAppId)
+          && (await getGroupStats(larkAppId, chatId, { requireFresh: true })).userCount > 1) {
+          logger.info(`[assistant-mode:${larkAppId}] bot added to multi-user group ${chatId.substring(0, 12)}; ignoring`);
           return;
         }
         logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);

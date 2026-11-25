@@ -125,6 +125,17 @@ describe('bot-config store', () => {
     return { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation };
   }
 
+  it('assistantGroupChat: an immediate boolean that persists and reaches the live config', async () => {
+    const { registry, store } = await loaded({ assistantMode: true });
+    const spec = store.findConfigField('assistantGroupChat')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'immediate' });
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.assistantGroupChat).toBe(true);
+    expect(readConfig().assistantGroupChat).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.assistantGroupChat).not.toBe(true);
+  });
+
   it('publishes recap revocation to live config before a queued card settlement', async () => {
     const { registry, store, awaySummaryFocusRevocation } = await loaded({ replyCardRecap: true });
     const { noteRecapCard, noteRecapTurnStarted } = await import('../src/core/turn-recap-state.js');

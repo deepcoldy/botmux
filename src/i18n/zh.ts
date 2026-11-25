@@ -661,6 +661,7 @@ export const messages: Record<string, string> = {
   'worker.assistant.session_retired': '⚠️ 这个会话是开启个人助理模式前、或换主人前建的，已结束。刚才这条没有处理，请重新发一次，我会在新会话里接着做。',
   'cmd.assistant.p2p': '私聊里我就是你的助理，不需要认领。/assistant 只在群里用。',
   'cmd.assistant.status': '本群助理主人：{owner}',
+  'cmd.assistant.multi_user_group': '助理模式不支持多人群，只能在只有你一个人的群里或私聊中使用。',
   'cmd.assistant.unclaimed': '本群还没有认领。回复 /assistant claim 让我成为你的助理；bot 管理员也可以用 /assistant owner @某人 指定。',
   'cmd.assistant.no_sender': '⚠️ 认不出发命令的人，无法认领。',
   'cmd.assistant.already_yours': '本群已经是你的助理了。',
