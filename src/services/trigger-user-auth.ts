@@ -119,6 +119,7 @@ export interface TriggerUserAuthConfig {
    * of source.
    */
   gitHost?: string;
+  gitCommitIdentity?: boolean;
   /**
    * Optional second source for a Codebase JWT, used only when `bytedcli` cannot
    * produce one (missing, broken, mid-upgrade). Same reason as `gitHost` for
@@ -276,6 +277,9 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     throw new TriggerUserAuthConfigError('triggerUserAuth.allowOwnerActor must be a boolean');
   }
 
+  if (rec.gitCommitIdentity !== undefined && typeof rec.gitCommitIdentity !== 'boolean') {
+    throw new TriggerUserAuthConfigError('triggerUserAuth.gitCommitIdentity must be a boolean');
+  }
   const gitHost = optionalHost(rec.gitHost, 'triggerUserAuth.gitHost');
   const gitTokenExchangeUrl = optionalHttpsUrl(
     rec.gitTokenExchangeUrl,
@@ -324,6 +328,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     ...(rec.allowSpeakerSwitch === true ? { allowSpeakerSwitch: true } : {}),
     ...(rec.allowOwnerActor === true ? { allowOwnerActor: true } : {}),
     ...(dispatchOnly ? { dispatchOnly } : {}),
+    ...(rec.gitCommitIdentity === true ? { gitCommitIdentity: true } : {}),
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
   };

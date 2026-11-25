@@ -223,6 +223,35 @@ describe('TraexQuestionBridge', () => {
     expect(h.tui.answers).toEqual(['1:None of the above+note:用 TiDB，兼容 MySQL 协议']);
   });
 
+  it('enters an option with the card note through that option\'s own notes: move (never its digit), Tab, paste, Enter', async () => {
+    const h = harness([DB]);
+    await raiseCard(h);
+    h.asks[0]!.answer(answered(['3'], { notes: ['用第二个方案吧，另外帮我看下日志'] }));
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(h.tui.inputs).toEqual(['Down', 'Down', 'Tab', 'paste:用第二个方案吧，另外帮我看下日志', 'Enter']);
+    expect(h.tui.answers).toEqual(['1:SQLite+note:用第二个方案吧，另外帮我看下日志']);
+  });
+
+  it('ticks the chosen boxes, then adds the card note to a multiSelect question', async () => {
+    const h = harness([FEATURES]);
+    await raiseCard(h);
+    h.asks[0]!.answer(answered(['3', '1'], { notes: ['先开缓存'] }));
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(h.tui.inputs).toEqual(['1', '3', 'Tab', 'paste:先开缓存', 'Enter']);
+    expect(h.tui.answers).toEqual(['1:Caching,Tracing+note:先开缓存']);
+  });
+
+  it('an option-with-note answer that stops halfway closes the notes it opened on that option', async () => {
+    const h = harness([DB]);
+    await raiseCard(h);
+    h.state.refuse = input => input.startsWith('paste:');
+    h.asks[0]!.answer(answered(['2'], { notes: ['备注'] }));
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(h.tui.inputs).toEqual(['Down', 'Tab', 'Tab']);
+    expect(h.tui.notes).toBeUndefined();
+    expect(h.tui.answers).toEqual([]);
+  });
+
   it('ticks exactly the chosen boxes on a multiSelect question', async () => {
     const h = harness([FEATURES]);
     await raiseCard(h);

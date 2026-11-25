@@ -1,6 +1,8 @@
+import { resolveBotmuxAncestorContext, resolveCurrentActor } from './cli/current-actor.js';
 import { parseArgs } from 'node:util';
 import { CurrentExecutionIdentityError, resolveCurrentExecutionIdentity } from './cli/current-execution.js';
 import { IDENTITY_ROUTE_TOOLS } from './services/trigger-user-auth.js';
+import { isBytedcliOverseasRegion } from './platform/bytedcli-grant-regions.js';
 import { identityRefusalLines } from './cli/identity-refusal-guidance.js';
 
 // Governed tools plus the Codebase and Bits CLI companions that mirror bytedcli's
@@ -13,19 +15,26 @@ let requestedTool = 'tool';
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args[0] === '__cli-identity-runner') args.shift();
+  if (args.length === 1 && args[0] === '--git-actor-email') {
+    const { ipcPort, sessionId } = resolveBotmuxAncestorContext();
+    const { actor } = await resolveCurrentActor({ ipcPort, sessionId });
+    process.stdout.write(actor.email);
+    return;
+  }
   const { values } = parseArgs({ args, options: {
     'data-dir': { type: 'string' }, 'session-id': { type: 'string' },
-    'app-id': { type: 'string' }, 'ipc-port': { type: 'string' }, tool: { type: 'string' },
+    'app-id': { type: 'string' }, 'ipc-port': { type: 'string' }, tool: { type: 'string' }, region: { type: 'string' },
   } });
-  const tool = values.tool;
+  const { tool, region } = values;
   if (tool && (IDENTITY_TOOLS as readonly string[]).includes(tool)) requestedTool = tool;
   if (!values['session-id'] || !values['app-id']
-    || !(IDENTITY_TOOLS as readonly string[]).includes(tool ?? '')) {
+    || !(IDENTITY_TOOLS as readonly string[]).includes(tool ?? '')
+    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliOverseasRegion(region)))) {
     throw new CurrentExecutionIdentityError('current_execution_route_unavailable', 'invalid_invocation');
   }
   const execution = await resolveCurrentExecutionIdentity({
     ipcPort: Number(values['ipc-port']), sessionId: values['session-id'], larkAppId: values['app-id'],
-    tool: tool!, as: process.env.BOTMUX_AS || undefined,
+    tool: tool!, as: process.env.BOTMUX_AS || undefined, region,
   });
   // The daemon proved the caller's lineage and returns the identity env
   // ASSIGNMENTS themselves. Print only the body for the wrapper to eval. The

@@ -1,3 +1,8 @@
+import {
+  TASK_ROUTING_COST_TIERS,
+  TASK_ROUTING_LIMITS,
+  type TaskRoutingCostTier,
+} from '../../core/task-routing/model.js';
 import { DEFAULT_OWNER_REMINDER_QUIET_HOURS, normalizeOwnerReminderQuietHours } from '../../core/session-owner-reminder-quiet-hours.js';
 import type { OncallPresetOptions } from '../../services/oncall-preset-options.js';
 import { normalizePassthroughCommand, parseCustomPassthroughInput } from '../../core/passthrough-commands.js';
@@ -30,6 +35,7 @@ import {
   BOT_DEFAULTS_TAB_LABEL_KEYS,
   agentSelectionKey,
   cliIdOf,
+  cliSearchTerms,
   createRefreshGate,
   createOncePerKeyGate,
   displayCliId,
@@ -659,6 +665,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     ...Object.fromEntries(REPLY_FOOTER_KEYS.map(key => [key, body[key] !== false])),
     showReplyTiming: body.showReplyTiming,
     usageDisplay: body.usageDisplay,
+    showUsageQuota: body.showUsageQuota !== false,
     disableStreamingCard: body.disableStreamingCard,
     replyCardMode: body.replyCardMode,
     hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
@@ -3816,6 +3823,7 @@ export function BotAgentSection(props: {
     .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
     .map(option => ({
       value: option.id,
+      searchTerms: cliSearchTerms(option),
       label: (option.id === cliKey ? availabilityStatus : cliAvailabilityStatus(option)) === 'unavailable' && !(option.id === 'codex' && usesAlternativeCodexExecutable)
         ? tr('botDefaults.agentMissingOption', { label: option.label, command: option.command ?? option.id })
         : `${option.label}（${option.id}）`,
@@ -5057,6 +5065,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const credentialSource = policy?.credentialSource ?? 'auto';
   const delegateOnMention = policy?.delegateOnMention !== false;
   const allowSpeakerSwitch = policy?.allowSpeakerSwitch === true;
+  const gitCommitIdentity = policy?.gitCommitIdentity === true;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
@@ -5097,13 +5106,14 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
-  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean }) {
+  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean; gitCommitIdentity?: boolean }) {
     return {
       enabled: true,
       capabilities: next.capabilities ?? capabilities,
       credentialSource: next.credentialSource ?? credentialSource,
       delegateOnMention: next.delegateOnMention ?? delegateOnMention,
       allowSpeakerSwitch: next.allowSpeakerSwitch ?? allowSpeakerSwitch,
+      gitCommitIdentity: next.gitCommitIdentity ?? gitCommitIdentity,
       ...(policy?.legacyCapabilities && !next.capabilities ? { legacyCapabilities: true } : {}),
     };
   }
@@ -5193,6 +5203,14 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
           {info?.crossPrincipalIsolation === true ? (
             <p className="bd-section-note" data-action="trigger-user-auth-speaker-switch-xpi-note">{tr('botDefaults.triggerUserAuthAllowSpeakerSwitchXpi')}</p>
           ) : null}
+          <ToggleRow
+            checked={gitCommitIdentity}
+            disabled={busy}
+            dataAction="toggle-trigger-user-auth-git-commit-identity"
+            title={tr('botDefaults.triggerUserAuthGitCommitIdentity')}
+            help={tr('botDefaults.triggerUserAuthGitCommitIdentityHelp')}
+            onChange={checked => saveWith({ gitCommitIdentity: checked })}
+          />
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthCapabilityNote')}</p>
           {capabilities.includes('bytecloud') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
@@ -6576,6 +6594,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [showTiming, setShowTiming] = useState(bot.showReplyTiming === true);
   useEffect(() => { setFooterPrefs(normalizeReplyFooter(bot)); setShowTiming(bot.showReplyTiming === true); }, [bot.replyFooterEnabled, bot.replyFooterBrand, bot.replyFooterModel, bot.replyFooterUsage, bot.replyFooterRecipients, bot.replyFooterVoice, bot.showReplyTiming]);
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
+  const [showUsageQuota, setShowUsageQuota] = useState(bot.showUsageQuota !== false);
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
   const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
@@ -6597,6 +6616,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
 
   useEffect(() => {
     setUsageDisplay(bot.usageDisplay ?? 'streaming');
+    setShowUsageQuota(bot.showUsageQuota !== false);
     setDisableStreaming(bot.disableStreamingCard === true);
     setReplyMode(bot.replyCardMode ?? 'legacy');
     setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
@@ -6613,7 +6633,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.showUsageQuota, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6892,6 +6912,21 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             </div>
           )}
           <div className="bd-card-control-list">
+            {bot.usageSupported === true && (
+              <ToggleRow
+                checked={showUsageQuota}
+                disabled={busy !== null}
+                dataAction="toggle-show-usage-quota"
+                title={tr('botDefaults.showUsageQuota')}
+                description={tr('botDefaults.showUsageQuotaDescription')}
+                help={tr('botDefaults.showUsageQuotaHelp')}
+                onChange={checked => {
+                  const previous = showUsageQuota;
+                  setShowUsageQuota(checked);
+                  void savePatch({ showUsageQuota: checked }, 'showUsageQuota', () => setShowUsageQuota(previous));
+                }}
+              />
+            )}
             <ToggleRow
               checked={writableLink}
               disabled={busy !== null}
@@ -7920,30 +7955,77 @@ function SessionModeSection(props: {
   );
 }
 
-/** Per-bot participation switch. Advanced cost/profile fields round-trip unchanged. */
+const TASK_ROUTING_TIER_KEYS: Readonly<Record<TaskRoutingCostTier, string>> = {
+  low: 'botDefaults.taskRoutingTierLow',
+  medium: 'botDefaults.taskRoutingTierMedium',
+  high: 'botDefaults.taskRoutingTierHigh',
+};
+
+/** Per-bot task-routing opt-in switch + natural-language capability profile editor. */
 export function TaskRoutingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState<StatusMessage>(null);
+  const appId = props.bot.larkAppId;
   const current = props.bot.taskRouting ?? null;
   const ineligible = props.bot.apiOnly === true || props.bot.steward?.enabled === true;
 
-  async function save(enabled: boolean): Promise<void> {
+  const savedTier: TaskRoutingCostTier = current?.costTier ?? 'medium';
+  const savedStrengths = current?.strengths ?? '';
+  const savedLimitations = current?.limitations ?? '';
+
+  const [costTier, setCostTier] = useState<TaskRoutingCostTier>(savedTier);
+  const [strengths, setStrengths] = useState(savedStrengths);
+  const [limitations, setLimitations] = useState(savedLimitations);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [profileStatus, setProfileStatus] = useState<StatusMessage>(null);
+
+  useEffect(() => { setCostTier(savedTier); }, [appId, savedTier]);
+  useEffect(() => { setStrengths(savedStrengths); }, [appId, savedStrengths]);
+  useEffect(() => { setLimitations(savedLimitations); }, [appId, savedLimitations]);
+  useEffect(() => { setStatus(null); setProfileStatus(null); }, [appId]);
+
+  const profileDirty = costTier !== savedTier
+    || strengths.trim() !== savedStrengths.trim()
+    || limitations.trim() !== savedLimitations.trim();
+
+  async function saveEnabled(enabled: boolean): Promise<void> {
     await saveBotField({
-      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/task-routing`, {
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(appId)}/task-routing`, {
         taskRouting: { ...current, enabled },
       }),
       setStatus,
       setBusy,
       saved: tr('botDefaults.taskRoutingSaved'),
       onSaved: body => {
-        props.patchBot(props.bot.larkAppId, { taskRouting: body.taskRouting ?? null });
+        props.patchBot(appId, { taskRouting: body.taskRouting ?? null });
+      },
+    });
+  }
+
+  async function saveProfile(): Promise<void> {
+    const trimmedStrengths = strengths.trim();
+    const trimmedLimitations = limitations.trim();
+    const payload = {
+      enabled: current?.enabled === true,
+      costTier,
+      ...(trimmedStrengths ? { strengths: trimmedStrengths } : {}),
+      ...(trimmedLimitations ? { limitations: trimmedLimitations } : {}),
+    };
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(appId)}/task-routing`, {
+        taskRouting: payload,
+      }),
+      setStatus: setProfileStatus,
+      setBusy,
+      saved: tr('botDefaults.taskRoutingProfileSaved'),
+      onSaved: body => {
+        props.patchBot(appId, { taskRouting: body.taskRouting ?? null });
       },
     });
   }
 
   return (
-    <section className="bd-section" data-task-routing-section>
+    <section className="bd-section bd-tr-section" aria-busy={busy} data-task-routing-section>
       <h3 className="bd-section-title">{tr('botDefaults.sectionTaskRouting')}</h3>
       <ToggleRow
         checked={current?.enabled === true}
@@ -7952,9 +8034,83 @@ export function TaskRoutingSection(props: { bot: BotDefaultsRow; patchBot: Patch
         title={tr('botDefaults.taskRoutingEnabled')}
         help={tr('botDefaults.taskRoutingEnabledHelp')}
         description={ineligible ? tr('botDefaults.taskRoutingIneligible') : undefined}
-        onChange={checked => { void save(checked); }}
+        onChange={checked => { void saveEnabled(checked); }}
       />
       <div className="bd-mode-group-side"><StatusSpan status={status} attr={{ 'data-task-routing-status': '' }} /></div>
+
+      {!ineligible ? (
+        <div className="bd-tr-profile-fields">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.taskRoutingCostTierHelp')}>{tr('botDefaults.taskRoutingCostTier')}</FieldTitle>
+            <div className="bd-tr-tier-group" role="radiogroup" aria-label={tr('botDefaults.taskRoutingCostTier')}>
+              {TASK_ROUTING_COST_TIERS.map(tier => (
+                <button
+                  key={tier}
+                  type="button"
+                  role="radio"
+                  aria-checked={costTier === tier}
+                  data-tier={tier}
+                  className={`bd-tr-tier-btn${costTier === tier ? ' is-active' : ''}`}
+                  disabled={busy}
+                  onClick={() => setCostTier(tier)}
+                >
+                  {tr(TASK_ROUTING_TIER_KEYS[tier])}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="bd-field">
+            <div className="bd-tr-field-head">
+              <FieldTitle help={tr('botDefaults.taskRoutingStrengthsHelp')}>{tr('botDefaults.taskRoutingStrengths')}</FieldTitle>
+              <span className="bd-tr-counter">{Array.from(strengths).length}/{TASK_ROUTING_LIMITS.maxStrengthsChars}</span>
+            </div>
+            <textarea
+              className="bd-tr-textarea"
+              data-input="task-routing-strengths"
+              rows={3}
+              maxLength={TASK_ROUTING_LIMITS.maxStrengthsChars}
+              disabled={busy}
+              value={strengths}
+              placeholder={tr('botDefaults.taskRoutingStrengthsPlaceholder')}
+              onChange={event => setStrengths(event.currentTarget.value)}
+            />
+          </div>
+
+          <div className="bd-field">
+            <div className="bd-tr-field-head">
+              <FieldTitle help={tr('botDefaults.taskRoutingLimitationsHelp')}>{tr('botDefaults.taskRoutingLimitations')}</FieldTitle>
+              <span className="bd-tr-counter">{Array.from(limitations).length}/{TASK_ROUTING_LIMITS.maxLimitationsChars}</span>
+            </div>
+            <textarea
+              className="bd-tr-textarea"
+              data-input="task-routing-limitations"
+              rows={3}
+              maxLength={TASK_ROUTING_LIMITS.maxLimitationsChars}
+              disabled={busy}
+              value={limitations}
+              placeholder={tr('botDefaults.taskRoutingLimitationsPlaceholder')}
+              onChange={event => setLimitations(event.currentTarget.value)}
+            />
+          </div>
+
+          <div className="actions bd-tr-actions">
+            <button
+              type="button"
+              className="primary"
+              data-action="save-task-routing-profile"
+              disabled={busy || !profileDirty}
+              onClick={() => { void saveProfile(); }}
+            >
+              {tr('botDefaults.taskRoutingSaveProfile')}
+            </button>
+            <StatusSpan status={profileStatus} attr={{ 'data-task-routing-profile-status': '' }} />
+          </div>
+          {current?.enabled === true ? (
+            <a className="bd-steward-open" href="#/assign">{tr('botDefaults.taskRoutingOpenPage')} →</a>
+          ) : null}
+        </div>
+      ) : null}
     </section>
   );
 }

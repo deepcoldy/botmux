@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import type { AskResult, AskQuestion } from '../core/ask-types.js';
+import { NATIVE_STANDALONE_ASK_ORIGIN } from '../core/ask-types.js';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';
 import { loopbackFetch } from '../core/loopback-fetch.js';
 import { readManagedOriginCapability } from '../core/managed-origin-capability.js';
 import { findOnlineDaemon, resolveDaemonIpcPort } from '../utils/daemon-discovery.js';
+import { CODEX_ASYNC_ASK_ORIGIN, CODEX_ASYNC_RESTORE_ASK_ORIGIN } from './codex-async-user-input.js';
 
 export type CodexUserInputAnswer = { answers: Record<string, { answers: string[] }> };
 export interface CodexUserInputContext {
@@ -15,6 +17,8 @@ export interface CodexUserInputContext {
   /** Botmux reply identity, not the app-server's native turn id. */
   originTurnId?: string;
   originDispatchAttempt?: number;
+  /** 异步原生问题的卡片应独立于回复正文，不能在正文终局时被收走。 */
+  standalone?: boolean;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -81,7 +85,10 @@ export function codexUserInputAnswer(
       throw new Error(`ask returned invalid answers for question ${index + 1}`);
     }
     const custom = result.customAnswers?.[index]?.trim();
-    const values = custom ? [custom] : selected.length ? [...selected] : comment ? [comment] : [];
+    // Codex's own picker sends a note typed next to an option as one more entry, `user_note: …`.
+    const note = result.notes?.[index]?.trim();
+    const values = custom ? [custom] : selected.length ? [...selected, ...(note ? [`user_note: ${note}`] : [])]
+      : comment ? [comment] : [];
     if (!values.length && !entry.question.multiSelect) {
       throw new Error(`ask returned no answer for question ${index + 1}`);
     }
@@ -108,6 +115,7 @@ export async function postCodexAsk(
   signal?: AbortSignal,
   asyncUserInput?: { threadId: string; itemId: string; nativeTurnId?: string },
   asyncFailure?: 'limit' | 'invalid_questions',
+  asyncRestore?: boolean,
 ): Promise<AskResult> {
   const env = context.env ?? process.env;
   if (env.BOTMUX_WORKFLOW === '1') {
@@ -142,7 +150,9 @@ export async function postCodexAsk(
       // A server request belongs to this process/turn. Do not reattach a card
       // from an older runner merely because its JSON-RPC id was reused.
       requestId: asyncUserInput?.itemId ?? randomUUID(),
-      originKind: asyncUserInput ? 'native-user-input-async' : 'native-user-input',
+      originKind: asyncUserInput
+        ? (asyncRestore ? CODEX_ASYNC_RESTORE_ASK_ORIGIN : CODEX_ASYNC_ASK_ORIGIN)
+        : context.standalone ? NATIVE_STANDALONE_ASK_ORIGIN : 'native-user-input',
       ...(asyncUserInput ? { asyncUserInput } : {}),
       ...(asyncFailure ? { asyncFailure } : {}),
       ...(claim ? { originCapability: claim.capability } : {}),

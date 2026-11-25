@@ -33,6 +33,20 @@ describe('waitForWorkerMessage', () => {
     expect(child.listenerCount('message')).toBe(0);
   });
 
+  it('skips historical and live messages rejected by the event predicate', async () => {
+    const child = fakeChild();
+    const previous = { type: 'ready', port: 40001 } satisfies WorkerToDaemon;
+    const replacement = { type: 'ready', port: 40002 } satisfies WorkerToDaemon;
+    const pending = waitForWorkerMessage(
+      child, [previous], 'ready', [], 100, message => message.port === replacement.port,
+    );
+
+    child.emit('message', previous);
+    child.emit('message', replacement);
+    await expect(pending).resolves.toBe(replacement);
+    expect(child.listenerCount('message')).toBe(0);
+  });
+
   it('rejects on child exit without waiting for the deadline', async () => {
     const child = fakeChild();
     const pending = waitForWorkerMessage(child, [], 'ready', [], 100);

@@ -48,9 +48,10 @@ describe('native text question cards', () => {
       const all = nodes(card);
       // The text question is a form input; the batch settles through one submit.
       expect(all.some(n => n.tag === 'input' && n.name === 'custom_0')).toBe(true);
-      expect(all.filter(n => n.tag === 'button' && n.value?.action === 'ask_submit')).toHaveLength(1);
+      const callback = (n: any) => n.value ?? n.behaviors?.find((b: any) => b.type === 'callback')?.value;
+      expect(all.filter(n => n.tag === 'button' && callback(n)?.action === 'ask_choice_submit')).toHaveLength(1);
       // No single-step select control: mixed batches cannot settle one question alone.
-      expect(all.every(n => n.value?.action !== 'ask_select')).toBe(true);
+      expect(all.every(n => callback(n)?.action !== 'ask_select')).toBe(true);
     }
     controller.abort(); await result;
   });

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
+import {
+  armSilentScheduledTurn,
+  disarmSilentScheduledTurn,
+  isActiveTurnSilentSchedule,
+  isSilentScheduledTurn,
+  noteNonSilentTurnActivity,
+} from '../src/core/silent-schedule-turns.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function session(hidden = false): DaemonSession {
@@ -60,8 +66,151 @@ describe('isSilentScheduledTurn', () => {
     armSilentScheduledTurn(ds, 'schedule:old:run', 0);
     expect(isSilentScheduledTurn(ds, 'schedule:old:run', now)).toBe(false);
     expect(ds.silentScheduledTurns).toBeUndefined();
+    expect(ds.silentScheduledTurnMeta).toBeUndefined();
+    expect(ds.latestSilentScheduledTurn).toBeUndefined();
     armSilentScheduledTurn(ds, 'schedule:new:run', now);
     disarmSilentScheduledTurn(ds, 'schedule:new:run');
     expect(isSilentScheduledTurn(ds, 'schedule:new:run', now)).toBe(false);
+  });
+
+  it('cleans up silentScheduledTurnMeta and latestSilentScheduledTurn on TTL expiry across 300 rounds', () => {
+    const ds = session();
+    const TTL_PLUS_ONE = 24 * 60 * 60 * 1000 + 1;
+    let t = now;
+    for (let i = 0; i < 300; i += 1) {
+      const turnId = `schedule:ttl:${i}`;
+      armSilentScheduledTurn(ds, turnId, t);
+      t += TTL_PLUS_ONE;
+      expect(isSilentScheduledTurn(ds, turnId, t)).toBe(false);
+      expect(ds.silentScheduledTurns).toBeUndefined();
+      expect(ds.silentScheduledTurnMeta).toBeUndefined();
+      expect(ds.latestSilentScheduledTurn).toBeUndefined();
+    }
+    // Capacity bound also prunes metadata and latest pointer synchronously.
+    for (let i = 0; i < 300; i += 1) {
+      armSilentScheduledTurn(ds, `schedule:cap:${i}`, t);
+    }
+    expect(ds.silentScheduledTurns?.size).toBeLessThanOrEqual(256);
+    expect(ds.silentScheduledTurnMeta?.size).toBeLessThanOrEqual(256);
+  });
+});
+
+describe('isActiveTurnSilentSchedule', () => {
+  function liveSession(hidden = false): DaemonSession {
+    const ds = session(hidden);
+    ds.worker = { killed: false } as any;
+    ds.workerGeneration = 2;
+    return ds;
+  }
+
+  it('is true only while a live busy turn is a silent schedule on the current worker generation', () => {
+    const ds = liveSession();
+    armSilentScheduledTurn(ds, 'schedule:poll:1', now);
+    ds.currentTurnId = 'schedule:poll:1';
+    ds.lastScreenTurnId = 'schedule:poll:1';
+    ds.lastScreenTurnGeneration = 2;
+
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(true);
+    expect(isActiveTurnSilentSchedule(ds, 'analyzing', now)).toBe(true);
+    expect(isActiveTurnSilentSchedule(ds, 'starting', now)).toBe(true);
+    expect(isActiveTurnSilentSchedule(ds, 'idle', now)).toBe(false);
+    expect(isActiveTurnSilentSchedule(ds, 'limited', now)).toBe(false);
+    expect(isActiveTurnSilentSchedule(ds, 'dormant', now)).toBe(false);
+    // Does not clear the silent registry needed by late screenshot/idle suppression.
+    expect(isSilentScheduledTurn(ds, 'schedule:poll:1', now)).toBe(true);
+  });
+
+  it('flips false immediately when a human/non-silent turn opens during a silent schedule', () => {
+    const ds = liveSession();
+    armSilentScheduledTurn(ds, 'schedule:poll:1', now);
+    ds.lastScreenTurnId = 'schedule:poll:1';
+    ds.lastScreenTurnGeneration = 2;
+    ds.currentTurnId = 'om_human_interrupt';
+
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(false);
+  });
+
+  it('stays true when a shared session runs a silent schedule while ds.currentTurnId still holds an older finished human turn', () => {
+    const ds = liveSession();
+    // Human turn finished earlier; session-manager reuses the session without overwriting ds.currentTurnId.
+    ds.currentTurnId = 'om_human_finished';
+    noteNonSilentTurnActivity(ds);
+
+    armSilentScheduledTurn(ds, 'schedule:poll:1', now);
+    // Even before the first screen_update (starting/working), the newly armed silent schedule is recognized.
+    expect(isActiveTurnSilentSchedule(ds, 'starting', now)).toBe(true);
+
+    ds.lastScreenTurnId = 'schedule:poll:1';
+    ds.lastScreenTurnGeneration = 2;
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(true);
+
+    // Once a NEW human turn interrupts mid-schedule, the exemption drops immediately.
+    ds.currentTurnId = 'om_human_new';
+    noteNonSilentTurnActivity(ds);
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(false);
+  });
+
+  it('keeps activeTurnSilentSchedule false via lastNonSilentTurnSeq when ds.currentTurnId does not change and a lagging frame re-attributes the silent turn', () => {
+    const ds = liveSession();
+    ds.currentTurnId = 'om_human_finished';
+    noteNonSilentTurnActivity(ds);
+
+    armSilentScheduledTurn(ds, 'schedule:poll:seq', now);
+    ds.lastScreenTurnId = 'schedule:poll:seq';
+    ds.lastScreenTurnGeneration = 2;
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(true);
+
+    // Non-silent admission (e.g. card retry / direct submit) bumps sequence without touching ds.currentTurnId.
+    noteNonSilentTurnActivity(ds);
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(false);
+
+    // A lagging working frame still naming the older silent turnId must remain false solely via seq ordering.
+    ds.lastScreenTurnId = 'schedule:poll:seq';
+    ds.lastScreenTurnGeneration = 2;
+    expect(ds.currentTurnId).toBe('om_human_finished');
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(false);
+  });
+
+  it('stays false while a human turn executes even if a silent schedule queued behind it', () => {
+    const ds = liveSession();
+    armSilentScheduledTurn(ds, 'schedule:poll:2', now);
+    ds.lastScreenTurnId = 'om_human_running';
+    ds.lastScreenTurnGeneration = 2;
+    ds.currentTurnId = 'schedule:poll:2';
+
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(false);
+  });
+
+  it('ignores stale worker generations and dead/suspended workers', () => {
+    const ds = liveSession();
+    armSilentScheduledTurn(ds, 'schedule:poll:1', now);
+    ds.lastScreenTurnId = 'schedule:poll:1';
+    ds.lastScreenTurnGeneration = 1; // older worker generation
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(false);
+
+    ds.currentTurnId = 'schedule:poll:1';
+    ds.lastScreenTurnGeneration = 2;
+    ds.worker = { killed: true } as any;
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(false);
+    ds.worker = null;
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(false);
+  });
+
+  it('returns false for a screen-bound silent turn once its terminal has been recorded', () => {
+    const ds = liveSession();
+    armSilentScheduledTurn(ds, 'schedule:poll:term', now);
+    ds.lastScreenTurnId = 'schedule:poll:term';
+    ds.lastScreenTurnGeneration = 2;
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(true);
+
+    ds.lastTurnTerminalTurnId = 'schedule:poll:term';
+    ds.lastTurnTerminalStatus = 'completed';
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(false);
+
+    // Also cleared via terminalIdentityTurnIds when ds.currentTurnId belonged to an older human turn.
+    ds.lastTurnTerminalTurnId = undefined;
+    ds.lastTurnTerminalStatus = undefined;
+    ds.terminalIdentityTurnIds = new Set(['schedule:poll:term']);
+    expect(isActiveTurnSilentSchedule(ds, 'working', now)).toBe(false);
   });
 });

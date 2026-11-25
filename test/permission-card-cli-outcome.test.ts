@@ -168,6 +168,16 @@ describe('runHook — Claude Code 自行了结确认时回报结局', () => {
     expect(opts.reports).toHaveLength(0);
   });
 
+  it('卡片选了允许但附话 → 拒绝并把附话转给 CLI', async () => {
+    const comment = '先别删，换个目录';
+    const opts = hookOptions();
+    const { out } = startHook(async () => ({ kind: 'answered', answers: [['allow']], by: 'ou_owner', comment, timedOut: false }), opts);
+    const decision = decisionOf((await out).stdout);
+    expect(decision.behavior).toBe('deny');
+    expect(decision.message).toContain(comment);
+    expect(opts.reports).toHaveLength(0);
+  });
+
   it('daemon 重启导致长连接中途断开、正在重连时 CLI 自动拒绝 → 仍回报同一 requestId', async () => {
     const opts = hookOptions();
     let calls = 0;
@@ -464,7 +474,7 @@ describe('权限卡结局文案', () => {
     expect(cardVisibleText(buildAskCard(ask(), timedOut))).toContain(t('card.ask.permission_timed_out'));
     const plain = { ...ask(), questions: [{ prompt: '选哪个？', multiSelect: false, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] }] };
     const text = cardVisibleText(buildAskCard(plain, timedOut));
-    expect(text).toContain(t('card.ask.timed_out'));
+    expect(text).toContain(t('card.ask.header.timed_out'));
     expect(text).not.toContain(t('card.ask.permission_timed_out'));
   });
 

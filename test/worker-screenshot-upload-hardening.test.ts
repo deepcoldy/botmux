@@ -566,6 +566,10 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       const ordinaryImTurnDedupe = { commit: () => {} };
       let normalWritePrepared = false, item, durableWrite = false, durableTurnInFlight = false;
       let promptReadyAtFlushStart = false, itemsWrittenInThisFlush = 0, turnSeq = 0, bridgeTurnId;
+      let cliGenerationTurnWrites = 0;
+      let webTerminalInputGeneration = 0, cliInterruptGeneration = 0;
+      const cliSpawnGeneration = 1;
+      const inputDeliveryEvidence = { start: () => {} };
       const renderer = { markNewTurn: () => {} }, writeRpcEngine = undefined;
       const inflightInputs = { onWrite: () => {} }, stuckDetector = undefined;
       const usageLimitTracker = { beginTurn: () => 1 }, currentUsageLimitSnapshot = () => undefined;
@@ -602,6 +606,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       retired: [], started: [],
     });
     expect(send.mock.calls.map(call => call[0])).toEqual([
+      { type: 'type_ahead_queued', turnId: 'om_queued' },
       { type: 'turn_input_committed', turnId: 'om_queued' },
     ]);
 
@@ -614,7 +619,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       type: 'capture_identity', revision: 1, turnId: 'om_queued', dispatchAttempt: 7,
     });
     expect(harness.advance()).toBe(false);
-    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenCalledTimes(3);
   });
 });
 

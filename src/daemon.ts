@@ -183,6 +183,7 @@ import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } f
 import { buildMarkdownCard, contextPercentUsed } from './im/lark/md-card.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField, setAssistantModeEnabledHook } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
+import { broadcastFollowUpReplyToWorkers, registerFollowUpReplyChangeHandler } from './services/follow-up-reply-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
@@ -736,6 +737,7 @@ import {
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
 import { backfillOwnerUnionId, claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { offerAuthorizationAtCreation, clearRestoredLapses, privateNoticeSender, unattendedTask } from './core/capability-authorization.js';
+import { stopAllMeegoPollers } from './services/meego-auth.js';
 import { allowsPersonalIdentityForTurn, isPersonActorTurnId, isRunAsTurnId, isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
 import { resolveRunAs } from './core/run-as.js';
 import { capabilityOn, delegatesOnMention, dispatchOnlyToolsForTurn, TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
@@ -1197,12 +1199,12 @@ import {
 } from './core/completion-proposal.js';
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
-import { handleCliResolvedRequest, parseAskBody, registerAskForResponse, verifiedAskMention } from './core/ask-api.js';
-import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
+import { askResponseBody, handleCliResolvedRequest, parseAskBody, registerAskForResponse, verifiedAskMention } from './core/ask-api.js';
+import { CODEX_ASYNC_RESTORE_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerNeedsRawInput, codexAsyncAskOriginEligible, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
 import { submitDocumentAskReply } from './core/ask-broker.js';
-import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
+import { shouldReturnAskStartupNotReady, isNativeAsyncAskOrigin } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 import { replyCardAskTarget } from './core/turn-reply-ask.js';
@@ -3555,6 +3557,7 @@ async function ensureVcMeetingReceiverSession(
     session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
     session.sandboxNetworkPolicy = bot.config.sandboxNetworkPolicy ? structuredClone(bot.config.sandboxNetworkPolicy) : undefined;
     session.sandboxWithholdBotSecret = sandboxWithholdsBotSecret(bot.config) ? true : undefined;
+    session.protectedResults = bot.config.protectedResults === true ? true : undefined;
     session.backendType = isolation.backendType;
     sessionStore.updateSession(session);
 
@@ -12340,6 +12343,18 @@ function asyncAskAudience(ds: DaemonSession, originTurnId: string | undefined):
     ? { kind: 'shared' } : { kind: 'unavailable' };
 }
 
+/** A restored async question lost its originating botmux turn with the
+ *  worker. Freeze it to the last human caller instead of widening a human
+ *  conversation to every member who can talk in the chat. */
+function restoredAsyncAskAudience(ds: DaemonSession): ReturnType<typeof asyncAskAudience> {
+  const last = ds.session.lastCallerOpenId;
+  if (last && !isKnownPeerBot(config.session.dataDir, ds.larkAppId, last)
+    && evaluateAskAnswerTalk(ds.larkAppId, ds.chatId, last, ds.chatType)) {
+    return { kind: 'human', answererOpenId: last };
+  }
+  return asyncAskAudience(ds, undefined);
+}
+
 async function notifyAsyncAsk(ds: DaemonSession, root: string | null, turnId: string | undefined, text: string): Promise<void> {
   try {
     await sessionReply(sessionAnchorId(ds), [...text].slice(0, 6000).join(''), 'text', ds.larkAppId, turnId, {
@@ -12462,9 +12477,17 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     ? askSession?.session.docCommentTargets?.[body.originTurnId] : undefined;
   const asyncDocumentTarget = documentSource ? { ...documentSource } : undefined;
   const asyncInput = boundAsk.asyncUserInput;
+  const asyncCliId = askSession
+    ? askSession.session.cliLaunchSnapshot?.cliId
+      ?? askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId
+    : undefined;
+  // A TUI Codex session has no app-server input channel, but it still writes
+  // the question to its rollout and consumes the native reply envelope as a
+  // normal user message. The hybrid RPC mode keeps the existing app-server
+  // path, so only the non-RPC codex launch is admitted here.
+  const asyncTuiCodex = codexAsyncAnswerNeedsRawInput(asyncCliId, askSession?.initConfig?.codexRpcInput);
   const asyncAskOriginIsCurrent = asyncInput && askSession
-    && isCodexAppCliId(askSession.session.cliLaunchSnapshot?.cliId
-      ?? askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId)
+    && codexAsyncAskOriginEligible(asyncCliId, askSession.initConfig?.codexRpcInput)
     ? captureCodexAsyncAskOrigin(askSession, asyncInput.threadId) : undefined;
   const isAsyncAskCurrent = () => !res.destroyed && findActiveBySessionId(boundAsk.sessionId) === askSession
     && asyncAskOriginIsCurrent?.() === true;
@@ -12493,7 +12516,9 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   const asyncOriginTurn = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
   const audience = asyncInput && askSession
     ? documentDelivery ? { kind: 'human' as const, answererOpenId: documentDelivery.openId }
-      : asyncAskAudience(askSession, asyncOriginTurn)
+      : boundAsk.originKind === CODEX_ASYNC_RESTORE_ASK_ORIGIN
+        ? restoredAsyncAskAudience(askSession)
+        : asyncAskAudience(askSession, asyncOriginTurn)
     : undefined;
   const asyncCaller = audience?.kind === 'human' ? audience.answererOpenId : undefined;
   const asyncOriginMessageId = typeof body.originTurnId === 'string' && body.originTurnId.startsWith('om_')
@@ -12609,13 +12634,18 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         beginReplyTargetTurn(askSession, boundAsk.rootMessageId ?? undefined, turnId, new Date().toISOString(), {
           senderOpenId: by, participants: [{ openId: by, isBot: byIsBot }], inThread: !!boundAsk.rootMessageId,
         });
-        const input = buildFollowUpCliInput(text, boundAsk.sessionId, {
-          cliId: 'codex-app', sender, codexAppText: text,
-          larkAppId: boundAsk.larkAppId, chatId: boundAsk.chatId,
-          selfMention: { name: bot.botName, openId: bot.botOpenId },
-          sessionBackendType: askSession.session.backendType,
-          promptInjection: sessionPromptInjection(askSession), turnId,
-        });
+        // A TUI Codex session has no app-server input channel: the native
+        // reply envelope must reach the composer verbatim. Botmux's role and
+        // formatting blocks would wrap it and break the question correlation.
+        const input: CliTurnPayload = asyncTuiCodex
+          ? { content: text }
+          : buildFollowUpCliInput(text, boundAsk.sessionId, {
+            cliId: 'codex-app', sender, codexAppText: text,
+            larkAppId: boundAsk.larkAppId, chatId: boundAsk.chatId,
+            selfMention: { name: bot.botName, openId: bot.botOpenId },
+            sessionBackendType: askSession.session.backendType,
+            promptInjection: sessionPromptInjection(askSession), turnId,
+          });
         if (documentDelivery && asyncDocumentTarget) {
           // The originating turn can finish and consume its comment route while
           // this card is pending. The answer's new turn must retain that route,
@@ -12712,7 +12742,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     }
   }
 
-  return jsonRes(res, 200, result);
+  return jsonRes(res, 200, askResponseBody(result, boundAsk.originKind, localeForBot(boundAsk.larkAppId)));
 };
 ipcRoute('POST', '/api/asks', handleAskRequest);
 ipcRoute('POST', '/api/asks/form-v1', handleAskRequest);
@@ -23998,6 +24028,7 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
  * queue (a follower admission that found the route released); every other
  * caller goes through {@link releaseQueuedActivationReservation}. */
 function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedToken?: string): boolean {
+  if (ds.session.status !== 'active') return true;
   // A prior callback retry may observe the successor already promoted. That is
   // success for the acknowledged predecessor; never append/send the same tail
   // head a second time while its fresh token owns the journal.
@@ -26250,6 +26281,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.sandboxNetwork = source.sandboxNetwork;
   child.sandboxNetworkPolicy = source.sandboxNetworkPolicy ? structuredClone(source.sandboxNetworkPolicy) : undefined;
   child.sandboxWithholdBotSecret = source.sandboxWithholdBotSecret;
+  child.protectedResults = source.protectedResults;
   // 个人助理模式：独立任务仍在同一 chat，归同一个主人（cwd 取自源会话，已是主人的 work/）。
   if (source.assistantOwnerOpenId) child.assistantOwnerOpenId = source.assistantOwnerOpenId;
   child.reasoningEffort = source.reasoningEffort;
@@ -31553,7 +31585,7 @@ async function handleThreadReplyAdmitted(
   if (askCandidate) {
     const candidates = listPendingAsksByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor });
     const quoted = candidates.find(ask => !!ask.cardMessageId && parsed.parentId === ask.cardMessageId);
-    const ambiguous = candidates.length > 1 && candidates.some(ask => ask.originKind === CODEX_ASYNC_ASK_ORIGIN);
+    const ambiguous = candidates.length > 1 && candidates.some(ask => isNativeAsyncAskOrigin(ask.originKind));
     const pendingAsk = quoted ?? (ambiguous ? undefined : findPendingAskByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor }));
     if (ambiguous && !quoted) {
       await sessionReply(anchor, tr('card.ask.async_ambiguous', undefined, localeForBot(larkAppId)), 'text', larkAppId);
@@ -36449,6 +36481,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // so dashboard IPC and other consumers can list/lookup live sessions.
   setActiveSessionsRegistry(activeSessions);
   registerPinStreamingCardChangeHandler(reconcileBotStreamingCardPins);
+  registerFollowUpReplyChangeHandler((larkAppId, enabled) => {
+    broadcastFollowUpReplyToWorkers(activeSessions.values(), larkAppId, enabled);
+  });
 
   if (cfg.dispatchLaunchPolicy?.enabled === true) {
     const operationStore = createDispatchLaunchOperationStore({
@@ -37808,6 +37843,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableBridgeFinalOutputHandler(request => deliverDurablePrimaryMessage({
       ...request,
       hookContext: {
+        protectedFinal: true,
         sessionId: request.daemonSession.session.sessionId,
         turnId: request.turnId,
         ...(request.replyFileDigest ? { replyFileDigest: request.replyFileDigest } : {}),
@@ -39202,6 +39238,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
+    stopAllMeegoPollers();
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     // Keep the occupancy lease for the whole teardown: workers still settle
     // rows into this cache and persist them below. Extend it once here (the
@@ -39474,6 +39511,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
+    stopAllMeegoPollers();
     ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
     oncallHandoffStopped = true;

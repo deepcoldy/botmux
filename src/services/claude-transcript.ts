@@ -902,6 +902,8 @@ export function eventTimeMs(ev: TranscriptEvent): number | undefined {
  *  Code's structured `toolUseResult` (the launch-ack text is for the model and
  *  is not parsed here):
  *  - Agent `run_in_background` → `{ isAsync:true, status:'async_launched', agentId }`;
+ *  - Workflow → `{ status:'async_launched', taskType:'local_workflow', taskId }`,
+ *    tracked like an agent: it wakes the model when it finishes;
  *  - Bash `run_in_background` (or a command the user backgrounded) →
  *    `{ backgroundTaskId }`;
  *  - Monitor → `{ taskId, timeoutMs, persistent }`. A non-persistent Monitor
@@ -921,6 +923,9 @@ export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunc
   if (!r || typeof r !== 'object' || Array.isArray(r)) return [];
   if ((r.isAsync === true || r.status === 'async_launched') && typeof r.agentId === 'string' && r.agentId) {
     return [{ taskId: r.agentId, kind: 'agent' }];
+  }
+  if (r.status === 'async_launched' && r.taskType === 'local_workflow' && typeof r.taskId === 'string' && r.taskId) {
+    return [{ taskId: r.taskId, kind: 'agent' }];
   }
   if (typeof r.backgroundTaskId === 'string' && r.backgroundTaskId) {
     return [{ taskId: r.backgroundTaskId, kind: 'shell' }];
@@ -1668,6 +1673,7 @@ export class AbsorbedReplyCollector {
     return {
       text: picked.map(part => part.text).join('\n\n'),
       lastUuid: picked[picked.length - 1].uuid,
+      uuids: [...new Set(picked.map(part => part.uuid))],
       source: texts.length > 0 ? 'text' : 'thinking',
     };
   }
@@ -1675,12 +1681,19 @@ export class AbsorbedReplyCollector {
 
 /** The reply to a folded input. `source: 'thinking'` means the model said it
  *  only in a thinking summary — possibly a plan rather than an answer, and
- *  content a bot with its thinking display off does not show. */
+ *  content a bot with its thinking display off does not show. `uuids` are
+ *  the records it was read from, in transcript order. */
 export interface AbsorbedInputReply {
   text: string;
   lastUuid: string;
+  uuids: string[];
   source: 'text' | 'thinking';
 }
+
+/** Longest folded-turn reply the daemon posts whole; a longer one is cut in
+ *  its card. The worker leaves only a reply posted whole out of the host
+ *  turn's final. */
+export const ABSORBED_REPLY_MAX_CHARS = 6_000;
 
 /** {@link AbsorbedReplyCollector} over a whole transcript: the reply to the
  *  input folded in at the record `absorbedAtUuid`, read up to the end of the
@@ -2185,6 +2198,10 @@ export interface JsonlFingerprintSearchOptions {
   minEventTimestampMs?: number;
   /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
   includeQueueOperations?: boolean;
+  /** Called on each normalized transcript candidate. When supplied, this
+   *  replaces the legacy substring predicate so callers can require stronger
+   *  exact-payload proof without changing other fingerprint consumers. */
+  candidateMatcher?: (candidate: string) => boolean;
   /** Called on each candidate that already passed the fingerprint match.
    *  Returning `false` skips the candidate and continues searching older
    *  files in the directory (mtime-descending walk). Used by the bridge
@@ -2237,7 +2254,11 @@ function eventAtOrAfter(ev: { timestamp?: unknown }, floorMs: number): boolean {
 export function jsonlContainsFingerprint(
   path: string,
   fingerprint: string,
-  opts?: { includeQueueOperations?: boolean; minEventTimestampMs?: number },
+  opts?: {
+    includeQueueOperations?: boolean;
+    minEventTimestampMs?: number;
+    candidateMatcher?: (candidate: string) => boolean;
+  },
 ): boolean {
   if (fingerprint.length === 0 || !existsSync(path)) return false;
   let size: number;
@@ -2292,8 +2313,10 @@ export function jsonlContainsFingerprint(
     } else {
       continue;
     }
-    if (normaliseTranscriptFingerprintCandidates(lineText)
-      .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) return true;
+    const candidates = normaliseTranscriptFingerprintCandidates(lineText);
+    if (opts?.candidateMatcher
+      ? candidates.some(opts.candidateMatcher)
+      : candidates.some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) return true;
   }
   return false;
 }
@@ -2389,8 +2412,10 @@ function jsonlTailMatchFingerprint(
         } else {
           continue;
         }
-        if (normaliseTranscriptFingerprintCandidates(text)
-          .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) {
+        const candidates = normaliseTranscriptFingerprintCandidates(text);
+        if (opts.candidateMatcher
+          ? candidates.some(opts.candidateMatcher)
+          : candidates.some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) {
           hit = true;
           break;
         }

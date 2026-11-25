@@ -114,6 +114,24 @@ describe('terminal prompt-ready recovery', () => {
     expect(h.scope.markPromptReady).toHaveBeenCalledTimes(1);
   });
 
+  it('rechecks Antigravity activity appended during an unchanged screen settle', async () => {
+    const h = harness({ settle: true });
+    h.scope.cliAdapter.id = 'antigravity';
+    h.scope.screen = 'COMPOSER';
+    h.scope.deferBusyReady = () => {};
+    h.scope.deferPromptReadyWhileBusy = loadWorkerFunction('deferPromptReadyWhileBusy', h.scope);
+    h.scope.settleBackendScreenBeforeIdle.mockImplementationOnce(async () => {
+      h.scope.dbBusy = true;
+      return { proceed: true };
+    });
+    h.recover();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.scope.markPromptReady).not.toHaveBeenCalled();
+    h.scope.dbBusy = false;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.scope.markPromptReady).toHaveBeenCalledTimes(1);
+  });
+
   it('a late async settle cannot publish ready for a newer attempt', async () => {
     const h = harness({ settle: true }); h.scope.screen = 'COMPOSER';
     let finish!: (value: { proceed: boolean }) => void;

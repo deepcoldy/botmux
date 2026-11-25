@@ -231,6 +231,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...normalizeReplyFooter(j),
     showReplyTiming: j?.showReplyTiming === true,
     usageDisplay: normalizeUsageDisplay(j ?? {}),
+    showUsageQuota: j?.showUsageQuota !== false,
     usageSupported: j?.usageSupported === true,
     disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',
     replyCardMode: j?.replyCardMode === 'unified' || j?.replyCardMode === 'final-only' ? 'unified' : 'legacy',
@@ -385,6 +386,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   trustSameOwnerBots: boolean | undefined;
   grantDelegateBots: string[] | undefined;
   archiveCodex: boolean | undefined;
+  taskRouting: unknown;
 } {
   return {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
@@ -405,6 +407,8 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
       : undefined,
     // 显式开/关原样带回（否则 daemon 离线时会显示成「跟随全局」）；缺省或非法值不带，按跟随全局显示。
     archiveCodex: typeof rawEntry?.archiveCodex === 'boolean' ? rawEntry.archiveCodex : undefined,
+    // 离线 bot 也带回已保存的任务分配画像，避免 daemon 离线时 Bot 配置页把画像显示为空。
+    taskRouting: rawEntry?.taskRouting,
   };
 }
 
