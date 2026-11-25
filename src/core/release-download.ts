@@ -121,7 +121,9 @@ export function getReleaseStream(
         if (cres.statusCode !== 200) { socket.destroy(); reject(new Error(`代理 CONNECT 失败: HTTP ${cres.statusCode}`)); return; }
         if (options.signal?.aborted) { socket.destroy(); reject(options.signal.reason); return; }
         const targetHost = stripHostBrackets(target.hostname);
-        const tls = tlsConnect({ socket, ...(isIP(targetHost) ? {} : { servername: targetHost }) }, () => {
+        // `host` sets the certificate identity even with an existing socket.
+        // Without it Node verifies IP targets as localhost when SNI is omitted.
+        const tls = tlsConnect({ socket, host: targetHost, ...(isIP(targetHost) ? {} : { servername: targetHost }) }, () => {
           const greq = httpsRequest({
             method: 'GET', path: `${target.pathname}${target.search}`,
             headers: { ...options.headers, host: target.host, 'user-agent': userAgent },
