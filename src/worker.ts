@@ -41081,7 +41081,7 @@ function markTurnExecutionStart(turnId: string | undefined, dispatchAttempt?: nu
   }, startedAtMs, webTerminalInputGeneration, cliInterruptGeneration);
   if (!turnId) return;
   const binding = workerSessionEventScope?.contextBinding() ?? workerSessionEventScope?.currentBinding();
-  if (workerSessionEventScope && !binding?.runtime) {
+  if (workerSessionEventScope && !binding) {
     const argvBaked = pendingTurnExecutionStart?.turnId === turnId
       && pendingTurnExecutionStart.dispatchAttempt === dispatchAttempt
       ? pendingTurnExecutionStart.argvBaked : undefined;
@@ -43212,7 +43212,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // revokes it on the pre-execution ready, so its late assignment remains
         // eligible even after the UI seed flags have been cleared.
         const completedReady = deferredStartMatches && isPromptReady === true;
-        if (deferredStartMatches && (resumedTerminal || locallyTerminated || completedReady)) pendingTurnExecutionStart = undefined;
+        if (deferredStartMatches && (resumedTerminal || locallyTerminated || completedReady || resumedState?.runtime)) pendingTurnExecutionStart = undefined;
         const replayExecutionStart = deferredStartMatches && !resumedTerminal && !locallyTerminated && !completedReady
           && !resumedState?.runtime && deferredStart.argvBaked === true;
         const republishOrigin = !!resumedExecution && hasLiveTurnCapability && !alreadyPublishedForExecution;

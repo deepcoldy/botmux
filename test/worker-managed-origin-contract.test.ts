@@ -118,17 +118,40 @@ describe('argv-baked opening execution through the session contract', () => {
     return { h, scope, startInitial };
   }
 
-  async function bindOpeningRuntime(h: ReturnType<typeof fixture>, scope: WorkerSessionEventScope) {
-    const opening = scope.beginRuntime();
+  function beginOpeningRuntime(h: ReturnType<typeof fixture>, scope: WorkerSessionEventScope, physicalId?: string) {
+    const opening = scope.beginRuntime(undefined, physicalId);
     scope.run(opening, () => {
       h.env.send({ type: 'runtime_binding_started', bindingId: opening.bindingId });
-      opening.identity = { backend: 'tmux', physicalId: '300:3000', proof: 'process_start', nativeSessionId: 'argv-cold-start' };
-      h.env.send({ type: 'runtime_binding', bindingId: opening.bindingId, identity: opening.identity });
+    }, h.execution);
+    return opening;
+  }
+
+  async function finishOpeningRuntime(
+    h: ReturnType<typeof fixture>,
+    scope: WorkerSessionEventScope,
+    opening: ReturnType<WorkerSessionEventScope['beginRuntime']>,
+    opts: { continuesBindingId?: string; nativeSessionId?: string } = {},
+  ) {
+    scope.run(opening, () => {
+      opening.identity = {
+        backend: 'tmux', physicalId: opening.physicalId, proof: 'process_start',
+        nativeSessionId: opts.nativeSessionId ?? 'argv-cold-start',
+      };
+      h.env.send({
+        type: 'runtime_binding', bindingId: opening.bindingId, identity: opening.identity,
+        ...(opts.continuesBindingId ? { continuesBindingId: opts.continuesBindingId } : {}),
+      });
     }, h.execution);
     await h.drain();
     const assignments = h.commands.filter(m => m.type === 'runtime_contract_assigned' && m.bindingId === opening.bindingId);
     expect(assignments).toHaveLength(1);
-    return { opening, assigned: assignments[0] };
+    return assignments[0];
+  }
+
+  async function bindOpeningRuntime(h: ReturnType<typeof fixture>, scope: WorkerSessionEventScope) {
+    const opening = beginOpeningRuntime(h, scope);
+    const assigned = await finishOpeningRuntime(h, scope, opening);
+    return { opening, assigned };
   }
 
   it.each([
@@ -178,7 +201,6 @@ describe('argv-baked opening execution through the session contract', () => {
     const screenCall = ingest.mock.calls.findIndex(([message]) => message.type === 'screen_update');
     expect(screenCall).toBeGreaterThanOrEqual(0);
     expect(ingest.mock.results[screenCall]?.value).toMatchObject({ kind: 'current' });
-    expect(ingest.mock.results[screenCall]?.value).not.toMatchObject({ reason: 'execution_scope_unproven' });
 
     // A repeated daemon assignment cannot publish a second start.
     await assign(assigned);
@@ -205,6 +227,91 @@ describe('argv-baked opening execution through the session contract', () => {
     const starts = h.wire.filter(m => m.type === 'turn_execution_started');
     expect(starts).toHaveLength(1);
     expect(starts[0]).toMatchObject({ turnId, dispatchAttempt, startedAtMs: initialAtMs + 5_000 });
+    expect(h.env.pendingTurnExecutionStart).toBeUndefined();
+  });
+
+  it('replays an argv start without requiring a live sandbox relay capability', async () => {
+    const { h, scope, startInitial } = coldStart({ cliId: 'pi' });
+    const { turnId, dispatchAttempt } = h.execution;
+    startInitial(turnId, dispatchAttempt);
+    // Capability publication can fail independently of execution tracking.
+    expect(h.env.sandboxRelayCapability).toBeUndefined();
+    const { assigned } = await bindOpeningRuntime(h, scope);
+    await loadWorkerMessageHandler('runtime_contract_assigned', h.env)(assigned);
+    await h.drain();
+    const starts = h.wire.filter(m => m.type === 'turn_execution_started');
+    expect(starts).toHaveLength(1);
+    expect(starts[0].sessionContract.scope).toMatchObject({ runtime: assigned.runtime, execution: h.execution });
+    expect(h.wire.filter(m => m.type === 'managed_turn_origin')).toHaveLength(0);
+  });
+
+  it('lets a non-argv literal write use bindingId while runtime assignment is pending, then drains it', async () => {
+    vi.useFakeTimers();
+    const { h, scope, startInitial } = coldStart({ cliId: 'claude-code', argvTracked: false });
+    const { turnId, dispatchAttempt } = h.execution;
+    const initialAtMs = Date.now();
+    startInitial(turnId, dispatchAttempt);
+    h.env.publishSandboxRelayCapability();
+    const opening = beginOpeningRuntime(h, scope);
+
+    // The reservation exists but identity/runtime have not landed yet. The
+    // bindingId is sufficient for the host to hold this real write for draining.
+    vi.setSystemTime(initialAtMs + 5_000);
+    scope.run(opening, () => h.env.markTurnExecutionStart(turnId, dispatchAttempt), h.execution);
+    await h.drain();
+    const starts = h.wire.filter(m => m.type === 'turn_execution_started');
+    expect(starts).toHaveLength(1);
+    expect(starts[0]).toMatchObject({
+      turnId, dispatchAttempt, startedAtMs: initialAtMs + 5_000,
+      sessionContract: { bindingId: opening.bindingId },
+    });
+    expect(starts[0].sessionContract.scope.runtime).toBeUndefined();
+    expect(h.store.deferredEvents(h.controller.ref, opening.bindingId)).toHaveLength(1);
+
+    const assigned = await finishOpeningRuntime(h, scope, opening);
+    expect(h.store.execution(h.controller.ref, h.execution.executionId)).toMatchObject({ phase: 'submitting', runtime: assigned.runtime });
+    await loadWorkerMessageHandler('runtime_contract_assigned', h.env)(assigned);
+    await h.drain();
+    expect(h.wire.filter(m => m.type === 'turn_execution_started')).toHaveLength(1);
+  });
+
+  it('drains a follow-up literal write made while an in-process rebind is still unassigned', async () => {
+    const { h, scope } = coldStart({ cliId: 'claude-code', argvTracked: false });
+    const next = h.controller.admitInput('om_turn_2');
+    scope.noteAdmission({ ref: next, phase: 'queued' });
+    h.env.currentBotmuxTurnId = next.turnId;
+    h.env.currentBotmuxDispatchAttempt = next.dispatchAttempt;
+    const rebind = beginOpeningRuntime(h, scope, h.current.physicalId);
+
+    scope.run(rebind, () => h.env.markTurnExecutionStart(next.turnId, next.dispatchAttempt), next);
+    await h.drain();
+    const starts = h.wire.filter(m => m.type === 'turn_execution_started');
+    expect(starts).toHaveLength(1);
+    expect(starts[0].sessionContract).toMatchObject({ bindingId: rebind.bindingId });
+    expect(h.store.deferredEvents(h.controller.ref, rebind.bindingId)).toHaveLength(1);
+
+    const assigned = await finishOpeningRuntime(h, scope, rebind, {
+      continuesBindingId: h.current.bindingId,
+      nativeSessionId: 'native',
+    });
+    expect(h.store.execution(h.controller.ref, next.executionId)).toMatchObject({ phase: 'submitting', runtime: assigned.runtime });
+    await loadWorkerMessageHandler('runtime_contract_assigned', h.env)(assigned);
+    await h.drain();
+    expect(h.wire.filter(m => m.type === 'turn_execution_started')).toHaveLength(1);
+  });
+
+  it('does not replay when the resumed admission already has a runtime binding', async () => {
+    const { h, scope, startInitial } = coldStart({ cliId: 'pi' });
+    const { turnId, dispatchAttempt } = h.execution;
+    startInitial(turnId, dispatchAttempt);
+    h.env.publishSandboxRelayCapability();
+    const { assigned } = await bindOpeningRuntime(h, scope);
+    assigned.executions = [h.execution];
+    assigned.admissionStates = assigned.admissionStates.map((state: any) => state.ref.executionId === h.execution.executionId
+      ? { ...state, runtime: assigned.runtime, phase: 'submitting' } : state);
+    await loadWorkerMessageHandler('runtime_contract_assigned', h.env)(assigned);
+    await h.drain();
+    expect(h.wire.filter(m => m.type === 'turn_execution_started')).toHaveLength(0);
     expect(h.env.pendingTurnExecutionStart).toBeUndefined();
   });
 

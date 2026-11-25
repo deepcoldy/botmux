@@ -1456,11 +1456,6 @@ setInterval(() => {}, 1_000);
     await waitForLog(child, logs, 'reporting working (not idle) so turn reactions can settle later');
     expect(delayedAssignment).toBeDefined();
     child.send(delayedAssignment!);
-    // Production sends the assignment before draining events held on its binding.
-    for (const pending of store.deferredEvents<WorkerToDaemon>(controller.ref, delayedAssignment!.bindingId)) {
-      controller.ingest(pending, sessionContract.worker);
-    }
-    store.clearDeferredEvents?.(controller.ref, delayedAssignment!.bindingId);
     const started = await waitForMessage(child, messages, 'turn_execution_started', logs);
     expect(started.sessionContract?.scope.runtime).toBeDefined();
     expect(admissions).toContainEqual({ type: 'turn_execution_started', kind: 'current' });
