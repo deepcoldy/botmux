@@ -864,6 +864,63 @@ describe('plugin MCP Gateway', () => {
     await gateway.close();
   });
 
+  it('exposes only bound metadata from the host status tool and rejects malformed callbacks', async () => {
+    installFixturePlugin('plugin-status', 'plain');
+    let senderType: 'user' | 'bot' = 'user';
+    let invalid = false;
+    const handler = vi.fn(async () => invalid
+      ? { status: 'delivered', messageIds: ['PRIVATE_BODY'] }
+      : { status: 'delivered', deliveryId: 'delivery_status_001', messageIds: ['om_safe'], attachmentCount: 0, privateRows: 'PRIVATE_BODY' });
+    const gateway = new PluginMcpGateway(['plugin-status'], process.env, {
+      trustedTurnIdentity: () => ({ caller: { requestUserUnionId: 'on_status', requestUserOpenId: 'ou_status',
+        requestLarkAppId: 'cli_status', source: 'gateway_meta', senderType }, turnId: 'om_status' }),
+      trustedResultStatus: handler as any,
+    });
+    const client = new Client({ name: 'status-test', version: '1' });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(b), client.connect(a)]);
+    try {
+      expect((await client.listTools()).tools.some(tool => tool.name === 'botmux_result_delivery_status')).toBe(true);
+      const args = { plugin_id: 'plugin-status', delivery_id: 'delivery_status_001' };
+      const result = await client.callTool({ name: 'botmux_result_delivery_status', arguments: args });
+      expect(JSON.stringify(result)).toContain('om_safe');
+      expect(JSON.stringify(result)).not.toContain('PRIVATE_BODY');
+      await expect(client.callTool({ name: 'botmux_result_delivery_status', arguments: { ...args, session_id: 'other' } })).rejects.toThrow();
+      senderType = 'bot';
+      await expect(client.callTool({ name: 'botmux_result_delivery_status', arguments: args })).rejects.toThrow();
+      expect(handler).toHaveBeenCalledTimes(1);
+      senderType = 'user'; invalid = true;
+      await expect(client.callTool({ name: 'botmux_result_delivery_status', arguments: args })).rejects.toThrow(/protected_result_status_invalid/);
+    } finally { await client.close(); await gateway.close(); }
+  });
+
+  it.each([false, true])('requires protected capability before receipt-only delivery (enabled=%s)', async enabled => {
+    installFixturePlugin('plugin-protected', 'delivery-protected');
+    const delivered = vi.fn(async () => ({ delivered: true, deliveryId: 'delivery_fixture_001', fileCount: 1, messageIds: ['om_result'] }));
+    const gateway = new PluginMcpGateway(['plugin-protected'], process.env, {
+      trustedTurnIdentity: () => ({ caller: { requestUserUnionId: 'on_status', requestUserOpenId: 'ou_status',
+        requestLarkAppId: 'cli_status', source: 'gateway_meta', senderType: 'user' }, turnId: 'om_status' }),
+      trustedResultDelivery: delivered,
+      protectedResultDeliveryAvailable: () => enabled,
+    });
+    const client = new Client({ name: 'protected-capability-test', version: '1' });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(b), client.connect(a)]);
+    try {
+      if (!enabled) {
+        await expect(client.callTool({ name: 'echo', arguments: {} })).rejects.toThrow(/protected_result_profile_required/);
+        expect(delivered).not.toHaveBeenCalled();
+        return;
+      }
+      const result = await client.callTool({ name: 'echo', arguments: {} });
+      expect(delivered).toHaveBeenCalledTimes(1);
+      const visible = JSON.stringify(result);
+      expect(visible).not.toContain('PRIVATE_ROWS_MUST_NOT_REACH_CALLER');
+      expect(visible).not.toContain('private-result-row');
+      expect(visible).toContain('om_result');
+    } finally { await client.close(); await gateway.close(); }
+  });
+
   it('pins one trusted identity snapshot across downstream execution and host delivery', async () => {
     installFixturePlugin('plugin-delivery', 'delivery');
     const identities = [

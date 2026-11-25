@@ -1188,7 +1188,7 @@ import {
 } from './core/completion-proposal.js';
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
-import { handleCliResolvedRequest, parseAskBody, registerAskForResponse, verifiedAskMention } from './core/ask-api.js';
+import { askResponseBody, handleCliResolvedRequest, parseAskBody, registerAskForResponse, verifiedAskMention } from './core/ask-api.js';
 import { CODEX_ASYNC_RESTORE_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerNeedsRawInput, codexAsyncAskOriginEligible, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
@@ -3542,6 +3542,7 @@ async function ensureVcMeetingReceiverSession(
     session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
     session.sandboxNetworkPolicy = bot.config.sandboxNetworkPolicy ? structuredClone(bot.config.sandboxNetworkPolicy) : undefined;
     session.sandboxWithholdBotSecret = sandboxWithholdsBotSecret(bot.config) ? true : undefined;
+    session.protectedResults = bot.config.protectedResults === true ? true : undefined;
     session.backendType = isolation.backendType;
     sessionStore.updateSession(session);
 
@@ -12488,7 +12489,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     }
   }
 
-  return jsonRes(res, 200, result);
+  return jsonRes(res, 200, askResponseBody(result, boundAsk.originKind, localeForBot(boundAsk.larkAppId)));
 };
 ipcRoute('POST', '/api/asks', handleAskRequest);
 ipcRoute('POST', '/api/asks/form-v1', handleAskRequest);
@@ -26025,6 +26026,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.sandboxNetwork = source.sandboxNetwork;
   child.sandboxNetworkPolicy = source.sandboxNetworkPolicy ? structuredClone(source.sandboxNetworkPolicy) : undefined;
   child.sandboxWithholdBotSecret = source.sandboxWithholdBotSecret;
+  child.protectedResults = source.protectedResults;
   // 个人助理模式：独立任务仍在同一 chat，归同一个主人（cwd 取自源会话，已是主人的 work/）。
   if (source.assistantOwnerOpenId) child.assistantOwnerOpenId = source.assistantOwnerOpenId;
   child.reasoningEffort = source.reasoningEffort;
@@ -37291,6 +37293,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableBridgeFinalOutputHandler(request => deliverDurablePrimaryMessage({
       ...request,
       hookContext: {
+        protectedFinal: true,
         sessionId: request.daemonSession.session.sessionId,
         turnId: request.turnId,
         ...(request.replyFileDigest ? { replyFileDigest: request.replyFileDigest } : {}),

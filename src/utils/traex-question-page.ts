@@ -454,7 +454,9 @@ export function traexQuestionAskQuestion(page: TraexQuestionPage): AskQuestion {
 }
 
 export type TraexQuestionAnswer =
-  | { kind: 'options'; numbers: number[] }
+  /** `note`: text the user wrote next to these options on the card; it goes into TRAE's own
+   *  notes field for them (TRAE then answers `[label, "user_note: …"]`). */
+  | { kind: 'options'; numbers: number[]; note?: string }
   | { kind: 'custom'; text: string };
 
 /** Longest custom answer typed into the notes field (the card itself caps a
@@ -497,7 +499,9 @@ export function traexQuestionAnswerFromAsk(page: TraexQuestionPage, result: AskR
   }
   if (numbers.length === 0) return 'no option selected';
   if (!page.multiSelect && numbers.length !== 1) return 'more than one option for a single-choice question';
-  return { kind: 'options', numbers: numbers.sort((a, b) => a - b) };
+  const note = sanitizeTraexQuestionNote(result.notes?.[0] ?? '');
+  if (note && page.delivery === 'async') return 'async option answers cannot carry notes';
+  return { kind: 'options', numbers: numbers.sort((a, b) => a - b), ...(note ? { note } : {}) };
 }
 
 export type TraexQuestionStep =
@@ -537,6 +541,7 @@ export function nextTraexQuestionStep(page: TraexQuestionPage, answer: TraexQues
   const other = page.options[page.options.length - 1]!.number;
   if (page.delivery === 'async') {
     if (answer.kind === 'options') {
+      if (answer.note) return { kind: 'fail', reason: 'async option answers cannot carry notes' };
       const [number] = answer.numbers;
       if (answer.numbers.length !== 1 || !number || number >= other) return { kind: 'fail', reason: 'invalid option' };
       if (page.notesText) return { kind: 'fail', reason: 'the notes field contains other text' };
@@ -546,6 +551,7 @@ export function nextTraexQuestionStep(page: TraexQuestionPage, answer: TraexQues
     if (page.notesText && !notesHold(page.notesText, answer.text)) return { kind: 'fail', reason: 'the notes field contains other text' };
     return page.notesText ? { kind: 'key', key: 'Enter', final: true } : { kind: 'paste', text: answer.text };
   }
+  if (answer.kind === 'options' && answer.note) return optionsWithNoteStep(page, answer.numbers, answer.note, other);
   if (answer.kind === 'options') {
     if (page.notesOpen) return { kind: 'fail', reason: 'the notes field is open' };
     if (!page.multiSelect) {
@@ -578,6 +584,38 @@ export function nextTraexQuestionStep(page: TraexQuestionPage, answer: TraexQues
   if (page.notesText === undefined) return { kind: 'fail', reason: 'the notes field is not visible' };
   if (page.notesText === '') return { kind: 'paste', text: answer.text };
   if (notesHold(page.notesText, answer.text)) return { kind: 'key', key: 'Enter', final: true };
+  return { kind: 'fail', reason: 'the notes field already holds other text' };
+}
+
+/** Options plus a note: set the options without submitting (a single choice is reached with
+ *  Up/Down, since its digit would submit at once; boxes are toggled by digit), open the notes
+ *  field with Tab, paste the note, then Enter submits the option(s) together with the note. */
+function optionsWithNoteStep(page: TraexQuestionPage, numbers: number[], note: string, other: number): TraexQuestionStep {
+  if (!page.notesOpen) {
+    if (!page.multiSelect) {
+      const [number] = numbers;
+      if (numbers.length !== 1 || !number || number >= other) return { kind: 'fail', reason: 'invalid option' };
+      if (page.highlighted !== number) return moveTowards(page, number);
+    } else {
+      const wanted = new Set(numbers);
+      if (wanted.has(other) || wanted.size === 0) return { kind: 'fail', reason: 'invalid option' };
+      for (const option of page.options) {
+        if ((option.checked === true) !== wanted.has(option.number)) return { kind: 'key', key: String(option.number), final: false };
+      }
+    }
+    return { kind: 'key', key: 'Tab', final: false };
+  }
+  if (page.multiSelect) {
+    const wanted = new Set(numbers);
+    const checked = page.options.filter(option => option.checked === true);
+    if (wanted.size === 0 || wanted.size !== numbers.length || wanted.has(other)
+      || checked.length !== numbers.length || checked.some(option => !wanted.has(option.number))) {
+      return { kind: 'fail', reason: 'the selected options do not match the answer' };
+    }
+  } else if (page.highlighted !== numbers[0]) return { kind: 'fail', reason: 'the notes field belongs to another option' };
+  if (page.notesText === undefined) return { kind: 'fail', reason: 'the notes field is not visible' };
+  if (page.notesText === '') return { kind: 'paste', text: note };
+  if (notesHold(page.notesText, note)) return { kind: 'key', key: 'Enter', final: true };
   return { kind: 'fail', reason: 'the notes field already holds other text' };
 }
 
