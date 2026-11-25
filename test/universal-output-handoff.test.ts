@@ -493,18 +493,23 @@ describe('native and generic settlement contracts', () => {
       db.close();
       db = database(dir);
       expect(db.sink(output.sessionId!, output.turnId)).toEqual(sink);
+      const noteFinalOutputReceipt = vi.fn();
+      const settleRequiredReplyCotMessage = vi.fn(() => false);
+      const finalizeCotMessage = vi.fn();
       const recover = loadWorkerPoolFunction<(ds: unknown) => Promise<void>>('recoverColdImReplies', deliveryScope({
         config: { session: { dataDir: dir } }, WorkerOutputJournal, OutputDeliveryCoordinator,
         outputDeliveryJournal: () => db, isSessionTransferring: () => false,
         controllerForSession: () => ({ outputOrigin: () => hasProof ? origin : undefined,
           store: { execution: () => {
             if (storeUnavailable) throw new Error('temporary store read failure');
-            return { phase: 'succeeded', ref: storedRef };
+            return { phase: 'succeeded', ref: storedRef,
+              terminal: { status: 'succeeded', evidence: 'native_terminal' } };
           }, executions: () => [] } }),
         sameExecution,
         raiseDaemonAttention, publishAttentionPatch: vi.fn(), publishScopedImDeliveryStatus: vi.fn(), logger: { warn: vi.fn() },
         tag: () => 'trial', shouldDropMismatchedFinalOutput: () => false, shouldDropMismatchedHermesFinalOutput: () => false,
         deliverFinalOutputWithOutputControl: helper, privateReplyEnabled: () => false,
+        noteFinalOutputReceipt, settleRequiredReplyCotMessage, finalizeCotMessage,
         FinalPublicationUnknownError, OutputDeliveryTerminalError, FINAL_HANDOFF_DELIVERY_REASON,
       }));
       await recover(ds);
@@ -539,6 +544,9 @@ describe('native and generic settlement contracts', () => {
       expect(db.read(snapshot.id)?.receipt).toMatchObject({ status: 'delivered', messageId: 'om_original_answer' });
       expect([...received.values()]).toEqual([{ content: snapshot.output.content, target }]);
       expect(deliverFinalOutput).toHaveBeenCalledTimes(crash === 'after Feishu accepted' ? 2 : 1);
+      expect(noteFinalOutputReceipt).toHaveBeenCalledWith(ds, output.turnId,
+        { text: snapshot.output.content }, { exactAttempt: { dispatchAttempt: 2 } });
+      expect(finalizeCotMessage).toHaveBeenCalledWith(ds, output.turnId, 'completed', 2);
       expect(producer.readPending()).toEqual([]);
       expect(db.pending(output.sessionId!)).toEqual([]);
     },

@@ -357,6 +357,77 @@ describe('independent turn terminal receipt', () => {
       expect.objectContaining({ replyTarget: target, sourceSessionId: sessionId }));
   });
 
+  it('retries a failed missing-reply notice when the same terminal is replayed after background zero', async () => {
+    const ds = makeDs();
+    const turnId = 'om_required_background_replay';
+    bindLarkTurn(ds, turnId, 'om_original_topic');
+    ds.initConfig = { finalOutputHandoff: { version: 2, token: 'trial', frozenImOnly: true } } as DaemonSession['initConfig'];
+    ds.lastScreenStatus = 'working';
+    ds.lastScreenContent = 'working';
+    ds.workerReady = true;
+    ds.activeTurnId = turnId;
+    ds.activeDispatchAttempt = 2;
+    const target = { mode: 'thread', rootMessageId: 'om_original_topic' } as const;
+    outputDeliveryJournal(dataDir, ds.larkAppId).rememberSink(ds.session.sessionId, turnId,
+      { kind: 'im', context: { target }, chatId: ds.chatId, chatType: ds.chatType, answerRequired: true });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    sessionReplyMock.mockRejectedValueOnce(new Error('first notice failed'))
+      .mockResolvedValueOnce('om_missing_retry' as any);
+
+    await deliver(ds, terminalMsg(turnId, {
+      dispatchAttempt: 2, outputDisposition: 'empty_answer', backgroundTasks: 1,
+    }));
+    await deliver(ds, {
+      type: 'screen_update', content: 'ready', status: 'idle',
+      turnId: 'om_newer_screen_turn', dispatchAttempt: 1,
+    } as WorkerToDaemon);
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(ds.silentReceiptTurnIds?.has(turnId)).not.toBe(true));
+
+    await deliver(ds, terminalMsg(turnId, {
+      dispatchAttempt: 2, outputDisposition: 'empty_answer', backgroundTasks: 1,
+    }));
+
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(2));
+    expect(ds.pendingRequiredReplyMissingReceipts).toBeUndefined();
+  });
+
+  it('cancels a missing-reply notice at beforeWrite when the exact final wins the race', async () => {
+    const ds = makeDs();
+    const turnId = 'om_required_before_write_race';
+    bindLarkTurn(ds, turnId, 'om_original_topic');
+    const appId = ds.larkAppId;
+    const sessionId = ds.session.sessionId;
+    ds.initConfig = { finalOutputHandoff: { version: 2, token: 'trial', frozenImOnly: true } } as DaemonSession['initConfig'];
+    const target = { mode: 'thread', rootMessageId: 'om_original_topic' } as const;
+    outputDeliveryJournal(dataDir, appId).rememberSink(sessionId, turnId,
+      { kind: 'im', context: { target }, chatId: ds.chatId, chatType: ds.chatType, answerRequired: true });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const ledger = new TurnSendLedger(dataDir);
+    let providerEffects = 0;
+    sessionReplyMock.mockImplementationOnce(async (...args: any[]) => {
+      await ledger.execute({ larkAppId: appId, sessionId, turnId, dispatchAttempt: 2 },
+        'final', 'real answer', async () => 'om_real_answer');
+      await args[5]?.beforeWrite?.();
+      providerEffects++;
+      return 'om_false_missing';
+    });
+
+    await deliver(ds, terminalMsg(turnId, {
+      dispatchAttempt: 2, outputDisposition: 'empty_answer',
+    }));
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledOnce());
+    await settle(ds);
+
+    expect(providerEffects).toBe(0);
+    expect(ds.silentReceiptTurnIds?.has(turnId)).toBe(true);
+    await deliver(ds, terminalMsg(turnId, {
+      dispatchAttempt: 2, outputDisposition: 'empty_answer',
+    }));
+    await settle(ds);
+    expect(sessionReplyMock).toHaveBeenCalledOnce();
+  });
+
   it.each(['background_zero', 'cli_loss'] as const)(
     'does not lose an empty required reply notice when %s races terminal persistence', async settlement => {
       const ds = makeDs();

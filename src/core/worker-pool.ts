@@ -1930,6 +1930,32 @@ async function recoverColdImReplies(ds: DaemonSession): Promise<void> {
         } catch (error) { throw classifyFinalPublicationError(error); }
       },
       settled: settled => {
+        try {
+          if (settled.receipt?.status === 'delivered' && settled.receipt.messageId
+            && !settled.output.turnFailed && !settled.output.emptyCompletedNotice) {
+            const { turnId, dispatchAttempt, content } = settled.output;
+            noteFinalOutputReceipt(ds, turnId, { text: content }, { exactAttempt: { dispatchAttempt } });
+            const settledHeldReply = settleRequiredReplyCotMessage(ds, turnId, dispatchAttempt);
+            if (settledHeldReply) {
+              // This recovery runs only while no worker/CLI generation exists;
+              // its old background-task lifetime is over as well.
+              settleRequiredReplyBackground(ds);
+            } else {
+              // A restored daemon has no in-memory hold. The durable execution
+              // terminal is then the authority that the answer completes this
+              // exact attempt. recoverColdImReplies owns a worker-less session,
+              // so any old CLI-lifetime background obligation is retired at
+              // this boundary rather than leaving a native CoT bubble spinning.
+              if (proveExecution(settled)?.execution.terminal?.status === 'succeeded') {
+                finalizeCotMessage(ds, turnId, 'completed', dispatchAttempt);
+              }
+            }
+          }
+        } catch (error) {
+          // Delivery is already settled. UI reconciliation must never retain
+          // the producer journal and replay a successfully delivered answer.
+          logger.warn(`[${tag(ds)}] Cold IM reply CoT settlement deferred: ${String(error)}`);
+        }
         const copy = fileCopy.get(settled.id);
         if (copy) {
           try { producer.remove(copy); }
@@ -9512,12 +9538,11 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   // event fails the current-worker check and cannot perform this cleanup.
   const wasSilentSchedule = ds.lastPublishedActiveTurnSilentSchedule === true
     || isActiveTurnSilentSchedule(ds, effectiveActiveSilentScheduleStatus(ds));
-  const hadBackgroundTasks = ds.backgroundTaskCount !== undefined;
+  const hadBackgroundTasks = settleBackgroundStateOnCliLoss(ds);
   ds.lastScreenTurnId = undefined;
   ds.lastScreenTurnGeneration = undefined;
   ds.latestSilentScheduledTurn = undefined;
   ds.lastPublishedActiveTurnSilentSchedule = false;
-  ds.backgroundTaskCount = undefined;
   if (w && !w.killed) {
     trackLifecycleRetirement(ds, w);
     try { w.kill('SIGTERM'); } catch { /* already gone */ }
@@ -13439,7 +13464,7 @@ function finalizeOrHoldCotMessage(
   // A replay of an already finalized turn must not create a fresh hold. In
   // particular, an interrupted CLI exit is terminal, not a new background wait.
   if (cotMessageFinishStatus(ds, msg)) return;
-  if (msg.status === 'completed' && msg.backgroundTasks) {
+  if (msg.status === 'completed' && (msg.backgroundTasks || opts?.replyPending)) {
     if (opts?.replyPending || opts?.finishStatus) {
       const holds = ds.requiredReplyCotHolds ?? (ds.requiredReplyCotHolds = new Map());
       holds.set(requiredKey, {
@@ -13447,7 +13472,7 @@ function finalizeOrHoldCotMessage(
         dispatchAttempt: msg.dispatchAttempt,
         finishStatus: opts.finishStatus ?? 'completed',
         replyPending: opts.replyPending === true,
-        backgroundPending: true,
+        backgroundPending: !!msg.backgroundTasks,
       });
     } else {
       ds.cotHeldForBackground = { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
@@ -13526,7 +13551,12 @@ function settleRequiredReplyCotMessage(
 
 function failRequiredReplyCotHolds(ds: DaemonSession): void {
   for (const required of ds.requiredReplyCotHolds?.values() ?? []) {
-    finalizeCotMessage(ds, required.turnId, 'failed', required.dispatchAttempt);
+    // Losing the CLI fails an answer that is still missing. If the exact
+    // answer already landed and only the CLI-owned background count remained,
+    // retirement is the zero boundary and the turn stays completed.
+    finalizeCotMessage(ds, required.turnId,
+      required.replyPending ? 'failed' : required.finishStatus,
+      required.dispatchAttempt);
   }
   ds.requiredReplyCotHolds = undefined;
   for (const pendingReceipt of ds.pendingRequiredReplyMissingReceipts?.values() ?? []) {
@@ -23582,10 +23612,14 @@ function setupWorkerHandlers(
           && !record.output.turnFailed && !record.output.emptyCompletedNotice) {
           const { turnId, dispatchAttempt, content } = record.output;
           noteFinalOutputReceipt(ds, turnId, { text: content }, { exactAttempt: { dispatchAttempt } });
-          if (hasCompletedTurn(ds, turnId, dispatchAttempt)) {
-            if (!settleRequiredReplyCotMessage(ds, turnId, dispatchAttempt)) {
-              finalizeCotMessage(ds, turnId, 'completed', dispatchAttempt);
-            }
+          // The hold itself is exact terminal evidence and is installed before
+          // the durable terminal callback can await. A fast provider receipt
+          // must settle it even while recordTurnOutcome has not yet published
+          // its completed marker. Without a hold, retain the completed-turn
+          // guard so a pre-terminal output cannot close CoT by itself.
+          const settledHeldReply = settleRequiredReplyCotMessage(ds, turnId, dispatchAttempt);
+          if (settledHeldReply || hasCompletedTurn(ds, turnId, dispatchAttempt)) {
+            if (!settledHeldReply) finalizeCotMessage(ds, turnId, 'completed', dispatchAttempt);
             void finishTurnReactions(ds, { turnId, delivered: true, owns: authority });
           }
         }
@@ -28071,6 +28105,7 @@ function setupWorkerHandlers(
           && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
         let requiredReplyMissingPublisher: (() => void) | undefined;
         let requiredReplyMissingPublishRequested = false;
+        const requiredReplyMissingSuppressed = new Error('required reply already delivered');
         const publishRequiredReplyMissing = (): void => {
           // A durable final can land while the terminal persistence callback is
           // awaited. Re-read it at the actual publish edge so an earlier zero
@@ -28079,23 +28114,29 @@ function setupWorkerHandlers(
           if (requiredReplyMissingPublisher) requiredReplyMissingPublisher();
           else requiredReplyMissingPublishRequested = true;
         };
-        if (!requiredReplyPending || msg.backgroundTasks) {
-          finalizeOrHoldCotMessage(ds, msg, {
-            ...(emptyRequiredReply && !answered() ? { finishStatus: 'failed' as const } : {}),
-            ...(requiredReplyPending ? { replyPending: true } : {}),
-          });
-        }
+        finalizeOrHoldCotMessage(ds, msg, {
+          ...(emptyRequiredReply && !answered() ? { finishStatus: 'failed' as const } : {}),
+          ...(requiredReplyPending ? { replyPending: true } : {}),
+        });
         // Register the user-visible closure obligation in the same synchronous
         // segment as its hold. cb.onTurnTerminal below may await durable store
         // I/O while a zero screen, suspend, or CLI loss settles the hold.
         if (requiredReplyMissingNeeded && msg.backgroundTasks) {
-          const receipts = ds.pendingRequiredReplyMissingReceipts
-            ?? (ds.pendingRequiredReplyMissingReceipts = new Map());
-          receipts.set(requiredReplyCotHoldKey(msg.turnId, msg.dispatchAttempt), {
-            turnId: msg.turnId,
-            dispatchAttempt: msg.dispatchAttempt,
-            publish: publishRequiredReplyMissing,
-          });
+          const key = requiredReplyCotHoldKey(msg.turnId, msg.dispatchAttempt);
+          if (ds.requiredReplyCotHolds?.has(key)) {
+            const receipts = ds.pendingRequiredReplyMissingReceipts
+              ?? (ds.pendingRequiredReplyMissingReceipts = new Map());
+            receipts.set(key, {
+              turnId: msg.turnId,
+              dispatchAttempt: msg.dispatchAttempt,
+              publish: publishRequiredReplyMissing,
+            });
+          } else {
+            // A replay after the background hold was already released still
+            // owes (or retries) the user-visible missing-reply closure. Do not
+            // leave a receipt that no future zero frame can consume.
+            publishRequiredReplyMissing();
+          }
         }
         ds.cotForced = undefined;
         ds.lastThinkingUpdate = undefined;
@@ -28771,8 +28812,16 @@ function setupWorkerHandlers(
             'text',
             msg.turnId,
             { uuid: silentTurnReceiptUuid(ds.session.sessionId, msg.turnId),
-              ...(requiresReply ? { replyTarget: frozenSink.context.target } : {}) },
+              ...(requiresReply ? {
+                replyTarget: frozenSink.context.target,
+                beforeWrite: () => {
+                  if (answered()) throw requiredReplyMissingSuppressed;
+                },
+              } : {}) },
           ).catch(err => {
+            // The exact final won the last provider-boundary race. Keep the
+            // dedupe claim: this closure is now satisfied and must not retry.
+            if (err === requiredReplyMissingSuppressed) return;
             // Nothing reached the thread: drop the claim AND restore the
             // (already consumed) origin record, so a dispatchAttempt replay
             // retries instead of losing the closure for good.

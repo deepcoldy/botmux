@@ -270,6 +270,52 @@ describe('CoT message of a turn that ended with background tasks running', () =>
     },
   );
 
+  it('tracks a reply-only required turn so CLI loss can close it', () => {
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const hold = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks?: number },
+      opts: { replyPending: true },
+    ) => void>('finalizeOrHoldCotMessage', scope);
+    const loseCli = loadWorkerPoolFunction<(ds: DaemonSession) => boolean>(
+      'settleBackgroundStateOnCliLoss', scope,
+    );
+    const ds = {} as DaemonSession;
+
+    hold(ds, { turnId: 'om_reply_only', status: 'completed', dispatchAttempt: 4 },
+      { replyPending: true });
+
+    expect([...ds.requiredReplyCotHolds!.values()]).toEqual([{
+      turnId: 'om_reply_only', dispatchAttempt: 4, finishStatus: 'completed',
+      replyPending: true, backgroundPending: false,
+    }]);
+    loseCli(ds);
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(
+      ds, 'om_reply_only', 'failed', 4,
+    );
+    expect(ds.requiredReplyCotHolds).toBeUndefined();
+  });
+
+  it('keeps a delivered required turn completed when graceful CLI retirement clears its background hold', () => {
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const loseCli = loadWorkerPoolFunction<(ds: DaemonSession) => boolean>(
+      'settleBackgroundStateOnCliLoss', scope,
+    );
+    const ds = {
+      backgroundTaskCount: 1,
+      requiredReplyCotHolds: new Map([['om_delivered\0' + 2, {
+        turnId: 'om_delivered', dispatchAttempt: 2, finishStatus: 'completed' as const,
+        replyPending: false, backgroundPending: true,
+      }]]),
+    } as unknown as DaemonSession;
+
+    expect(loseCli(ds)).toBe(true);
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(
+      ds, 'om_delivered', 'completed', 2,
+    );
+    expect(ds.requiredReplyCotHolds).toBeUndefined();
+  });
+
   it('holds the synthetic required-reply failure until background zero', () => {
     const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
     const hold = loadWorkerPoolFunction<(
