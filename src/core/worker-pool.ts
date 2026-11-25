@@ -21602,6 +21602,7 @@ function forkWorkerPrepared(
     // getSessionPersistentBackendType). A brand-new session (no stamp) resolves
     // from live config, so a dashboard backend switch only affects NEW sessions.
     backendType: resolvedBackendType,
+    hcHerdrTabTitle: resolvedBackendType === 'hc' && botCfg.hcHerdrTabs === true ? ds.session.title : undefined,
     // Shared Herdr is not derivable from sessionId: preserve the exact host +
     // managed-agent affinity across daemon/worker replacement.
     persistentBackendTarget: ds.session.persistentBackendTarget,

@@ -11581,6 +11581,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     // disables the toggle wherever the worker would fail-close on it.
     readIsolationSupported: readIsolationEnforceable(cachedLarkAppId),
     backendType: backendTypeStore.getBotBackendType(cachedLarkAppId) ?? null,
+    hcHerdrTabs: getBot(cachedLarkAppId).config.hcHerdrTabs === true,
     // 没有覆盖时会话实际用的后端（BACKEND_TYPE / 自动探测）。Dashboard 判断零注入等
     // 依赖后端的能力时按「覆盖值，否则这个默认值」算生效后端。
     defaultBackendType: config.daemon.backendType,
@@ -13966,6 +13967,11 @@ botConfigPutRoute<{ herdr?: unknown }>('/api/bot-herdr', 'herdr', {
     return fieldOk(coerced.value);
   },
   respond: value => ({ ok: true, herdr: value ? JSON.stringify(value, null, 2) : '' }),
+});
+
+botConfigPutRoute<{ enabled?: unknown }>('/api/bot-hc-herdr-tabs', 'hcHerdrTabs', {
+  normalize: body => typeof body?.enabled === 'boolean' ? fieldOk(body.enabled) : fieldInvalid('invalid_boolean'),
+  respond: value => ({ ok: true, hcHerdrTabs: value === true }),
 });
 
 // Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:

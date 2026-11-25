@@ -695,7 +695,7 @@ import { OrcaBackend, renderOrcaTranscriptHistory } from './adapters/backend/orc
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { HcBackend } from './adapters/backend/hc-backend.js';
 import { hcDiagnosticTarget, hcTerminalName, killHcTerminal, probeHcTerminal, type HcTarget } from './adapters/backend/hc/cli-ops.js';
-import { hcCoreAddress, hcCorePaths, hcRuntimeDirError } from './adapters/backend/hc/core.js';
+import { hcCoreAddress, hcCorePaths, hcRuntimeError } from './adapters/backend/hc/core.js';
 import { hcDiagnosticAttachCommand, parkHcDiagnosticTerminal } from './adapters/backend/hc/diagnostic-terminal.js';
 import { probeHcAvailability } from './setup/ensure-hc.js';
 import {
@@ -31170,7 +31170,7 @@ async function spawnCliBody(
         defaultCore: () => hcCoreAddress(hcCorePaths(process.env)),
         coreUnreachable: core => {
           try {
-            return hcRuntimeDirError(hcCorePaths(process.env, { core }));
+            return hcRuntimeError(hcCorePaths(process.env, { core }));
           } catch (err) {
             return err instanceof Error ? err.message : String(err);
           }
@@ -31771,6 +31771,7 @@ async function spawnCliBody(
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    hcHerdrTabTitle: cfg.hcHerdrTabTitle,
     herdrConfig: effectiveHerdrConfig,
     remoteBackendState: cfg.remoteBackendState,
     herdrOwnershipScope: isolationRuntimeDataDir,

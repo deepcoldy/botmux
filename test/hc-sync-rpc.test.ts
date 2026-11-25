@@ -70,4 +70,13 @@ describe('startHcCoreSync', () => {
     expect(runs()).toBe(1);
     expect(sleeps).toEqual([]);
   });
+
+  it.runIf(process.platform === 'darwin')('does not retry if a file appears at the socket during backoff', () => {
+    const core = scriptedHc([UNAVAILABLE, STARTED]);
+    setHcStartupRetrySleepForTests(() => writeFileSync(core.socket, 'keep me'));
+
+    expect(() => startHcCoreSync(core)).toThrow(/非 socket/);
+    expect(runs()).toBe(1);
+    expect(readFileSync(core.socket, 'utf8')).toBe('keep me');
+  });
 });
