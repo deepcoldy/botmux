@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { publishActiveTurn, writeSessionIdentity, recallProvenIdentityContent } from '../src/core/cli-identity.js';
 import { config } from '../src/config.js';
+import type { CredentialGrantRequest, CredentialGrantResult } from '../src/platform/credential-grant-client.js';
 import { trackTurnIdentityPublication } from '../src/core/turn-cli-identity.js';
 
 let ipc: IpcServerHandle | null = null;
@@ -256,6 +257,173 @@ describe('POST /api/current-execution', () => {
     } finally {
       __setPlatformCredentialDepsForTest(null);
       __resetTransientRefusalsForTest();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['an older platform response without states', undefined],
+    ['a pending partition', 'pending'],
+    ['a failed mint', 'failed'],
+    ['two missing partitions requested in parallel', 'two_partitions'],
+    ['an unauthorized partition', 'not_authorized'],
+    ['a revoked partition', 'reauth_required'],
+    ['a turn advanced during the grant', 'next_turn'],
+    ['a different speaker took over during the grant', 'next_speaker'],
+    ['the policy switched to local during the grant', 'local_policy'],
+    ['the identity was republished during the grant', 'republication'],
+    ['the user revoked credentials during the grant', 'revoked'],
+  ] as const)('handles a partial regional grant: %s', async (_label, scenario) => {
+    const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+    const ds = session();
+    ds.managedTurnOrigin.callerOpenId = 'ou_alice';
+    // The model/lineage tests exercise the Linux gate. Stub those checks here
+    // so the grant behavior can run on either platform.
+    vi.spyOn(workerPool, 'identityModelRefusalReason').mockReturnValue(undefined);
+    const attestation = await import('../src/core/current-actor-attestation.js');
+    vi.spyOn(attestation, 'resolveLoopbackPeerProcesses').mockResolvedValue({
+      ok: true, peer: { pid: process.pid, procStart: '1' },
+    });
+    let twoRegionalCallersReady!: () => void;
+    const twoRegionalCallers = new Promise<void>(resolve => { twoRegionalCallersReady = resolve; });
+    let provenRequests = 0;
+    vi.spyOn(attestation, 'attestCurrentExecutionLoopbackPeer').mockImplementation(() => {
+      if (++provenRequests === 3) twoRegionalCallersReady();
+      return {
+        ds, turnId: ds.managedTurnOrigin.turnId, generation: ds.workerGeneration,
+        dispatchAttempt: ds.managedTurnOrigin.dispatchAttempt, capability: ds.managedTurnOrigin.capability,
+        workerPid: process.pid, workerProcStart: '1', processIdentities: [],
+      };
+    });
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    const botConfig = {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+      triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }),
+    } as any;
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: botConfig } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-identity-partial-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    const jwt = (region: string) => ['e30', Buffer.from(JSON.stringify({
+      region, exp: Math.floor(Date.now() / 1000) + 3600,
+    })).toString('base64url'), 'signature'].join('.');
+    const i18n = jwt('i18n');
+    const tx = jwt('tx');
+    const i18nbd = jwt('i18nbd');
+    let finishGrant!: () => void;
+    const releaseGrant = new Promise<void>(resolve => { finishGrant = resolve; });
+    let grantStarted!: () => void;
+    const started = new Promise<void>(resolve => { grantStarted = resolve; });
+    const state = scenario === 'pending' || scenario === 'failed' || scenario === 'not_authorized'
+      || scenario === 'reauth_required' ? scenario : undefined;
+    let grants = 0;
+    const requestGrant = vi.fn(async (req: CredentialGrantRequest): Promise<CredentialGrantResult> => {
+      const first = ++grants === 1;
+      const region = req.cloudJwtRegions?.[0];
+      if (!first) {
+        grantStarted();
+        await releaseGrant;
+      }
+      return {
+        ok: true as const, value: {
+          tool: 'bytedcli' as const, unionId: 'on_alice', expiresAt: Date.now() + 3_600_000,
+          cloudJwtRegions: first ? ['i18n', 'tx', 'i18nbd'] : [...(req.cloudJwtRegions ?? [])],
+          ...(first && state ? { cloudJwtRegionStates: { i18n: state } } : {}),
+          variables: first
+            ? { BYTEDCLI_USER_CLOUD_JWT: 'original-default', BYTEDCLI_USER_CLOUD_JWT_TX: tx }
+            : {
+              BYTEDCLI_USER_CLOUD_JWT: 'other-default',
+              ...(region === 'i18nbd' ? { BYTEDCLI_USER_CLOUD_JWT_I18NBD: i18nbd } : { BYTEDCLI_USER_CLOUD_JWT_I18N: i18n }),
+            },
+        },
+      };
+    });
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice',
+      requestGrant,
+    });
+    const fetchIdentity = async (region?: string, status = 200) => {
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli', region }),
+      });
+      expect(response.status).toBe(status);
+      return ((await response.json()) as { env: string }).env;
+    };
+    try {
+      await publishTurnCliIdentity({
+        botConfig, sessionDataDir: dataDir, sessionId: 's-execution', senderOpenId: 'ou_alice',
+        turnId: 'trigger-current', storageModel: 'proven',
+      });
+      expect(await fetchIdentity()).not.toContain(i18n);
+      expect(requestGrant).toHaveBeenCalledTimes(1);
+      if (state === 'not_authorized' || state === 'reauth_required') {
+        const env = await fetchIdentity('i18n');
+        expect(env).not.toContain(i18n);
+        expect(env).toContain(state);
+        expect(requestGrant).toHaveBeenCalledTimes(1);
+        return;
+      }
+      if (scenario === 'next_turn' || scenario === 'next_speaker' || scenario === 'local_policy'
+        || scenario === 'republication' || scenario === 'revoked') {
+        const staleExecution = scenario === 'next_turn' || scenario === 'next_speaker';
+        const status = staleExecution ? 403 : scenario === 'revoked' ? 404 : 200;
+        const pendingFetch = fetchIdentity('i18n', status);
+        await started;
+        if (scenario === 'next_turn') ds.managedTurnOrigin.turnId = 'trigger-next';
+        if (scenario === 'next_speaker') ds.managedTurnOrigin.callerOpenId = 'ou_bob';
+        if (scenario === 'local_policy') {
+          botConfig.triggerUserAuth = parseTriggerUserAuthConfig({
+            enabled: true, tools: ['bytedcli'], credentialSource: 'local',
+          });
+        }
+        if (scenario === 'republication') {
+          writeSessionIdentity(dataDir, 's-execution', {
+            tool: 'bytedcli', cloudJwt: 'replacement-default', turnId: 'trigger-current', openId: 'ou_alice',
+          }, 'proven');
+        }
+        if (scenario === 'revoked') {
+          const { dropPublishedIdentitiesForOpenId } = await import('../src/core/cli-identity.js');
+          expect(dropPublishedIdentitiesForOpenId(dataDir, 'ou_alice')).toBeGreaterThan(0);
+        }
+        finishGrant();
+        const env = await pendingFetch;
+        expect(env ?? '').not.toContain(i18n);
+        expect(recallProvenIdentityContent(dataDir, 's-execution', 'trigger-current', 'bytedcli') ?? '').not.toContain(i18n);
+        if (scenario === 'republication') expect(env).toContain('replacement-default');
+        return;
+      }
+      const otherRegion = scenario === 'two_partitions' ? 'i18nbd' : 'i18n';
+      const requests = Promise.all([fetchIdentity('i18n'), fetchIdentity(otherRegion)]);
+      await Promise.all([started, twoRegionalCallers]);
+      finishGrant();
+      const [first, concurrent] = await requests;
+      if (scenario === 'two_partitions') {
+        expect(concurrent).toContain(i18nbd);
+        expect(recallProvenIdentityContent(dataDir, 's-execution', 'trigger-current', 'bytedcli'))
+          .toContain(i18n);
+        expect(await fetchIdentity('i18n')).toContain(i18nbd);
+        expect(requestGrant).toHaveBeenCalledTimes(3);
+        return;
+      }
+      expect(first).toBe(concurrent);
+      expect(first).toContain(i18n);
+      expect(first).toContain(tx);
+      expect(first).toContain('original-default');
+      expect(first).not.toContain('other-default');
+      expect(requestGrant).toHaveBeenCalledTimes(2);
+      expect(requestGrant).toHaveBeenLastCalledWith(expect.objectContaining({
+        unionId: 'on_alice', turnId: 'trigger-current', cloudJwtRegions: ['i18n'],
+      }), expect.anything());
+      expect(await fetchIdentity('i18n')).toBe(first);
+      expect(requestGrant).toHaveBeenCalledTimes(2);
+    } finally {
+      finishGrant();
+      __setPlatformCredentialDepsForTest(null);
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
@@ -577,6 +745,21 @@ describe('POST /api/current-execution', () => {
     ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
     for (const body of [null, [], {}, { sessionId: 3 }]) expect((await request(body)).status).toBe(400);
     expect((await request({ sessionId: 'x'.repeat(1200) })).status).toBe(413);
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown or non-overseas region on the identity route before session work', async () => {
+    const lookup = vi.spyOn(workerPool, 'findActiveBySessionId');
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const postIdentity = (body: unknown) => fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    for (const body of [
+      { sessionId: 's-execution', tool: 'bytedcli', region: 'cn' },
+      { sessionId: 's-execution', tool: 'bytedcli', region: 'bogus' },
+      { sessionId: 's-execution', tool: 'bytedcli', region: 42 },
+      { sessionId: 's-execution', tool: 'lark-cli', region: 'i18n' },
+    ]) expect((await postIdentity(body)).status).toBe(400);
     expect(lookup).not.toHaveBeenCalled();
   });
 });
