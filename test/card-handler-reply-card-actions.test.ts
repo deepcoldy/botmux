@@ -539,7 +539,7 @@ describe('reply_model_pick action', () => {
   it('renders a configured gateway model once and accepts that same model on callback', async () => {
     enableMenu();
     const bot = getBot(LARK_APP_ID);
-    const gateway = 'gateway/gemini-4_neon:2026.1';
+    const gateway = 'gateway/custom_model-v2:1.0';
     bot.config.customModels = [gateway, 'opus'];
     bot.config.model = 'gateway/default-model';
     detectModelsMock.mockResolvedValue(['opus', gateway, 'other-model']);
