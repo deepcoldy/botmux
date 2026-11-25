@@ -5,6 +5,7 @@ export interface OncallGroupPolicy {
   chatIds: string[];
   flowMode?: 'direct' | 'classify';
   formDisplay?: 'native' | 'private_card' | 'thread_card';
+  customFormMode?: 'native' | 'botmux';
   forwardMode?: OncallForwardMode;
   identitySource?: 'bot' | 'shared';
   button?: { timing?: 'first' | 'final'; minTurns?: number };
@@ -13,7 +14,7 @@ export interface OncallGroupPolicy {
 export function normalizeOncallGroupPolicy(value: unknown): OncallGroupPolicy {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('oncallGroup must be an object');
   const input = value as Record<string, unknown>;
-  if (Object.keys(input).some(key => !['enabled', 'chatIds', 'flowMode', 'formDisplay', 'forwardMode', 'identitySource', 'button'].includes(key))) throw new Error('Unknown oncallGroup field');
+  if (Object.keys(input).some(key => !['enabled', 'chatIds', 'flowMode', 'formDisplay', 'customFormMode', 'forwardMode', 'identitySource', 'button'].includes(key))) throw new Error('Unknown oncallGroup field');
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new Error('enabled must be boolean');
   if (input.chatIds !== undefined && (!Array.isArray(input.chatIds) || input.chatIds.length > 500
     || input.chatIds.some(id => typeof id !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(id)))) {
@@ -21,11 +22,13 @@ export function normalizeOncallGroupPolicy(value: unknown): OncallGroupPolicy {
   }
   if (input.flowMode !== undefined && !['direct', 'classify'].includes(input.flowMode as string)) throw new Error('Invalid Oncall flowMode');
   if (input.formDisplay !== undefined && !['native', 'private_card', 'thread_card'].includes(input.formDisplay as string)) throw new Error('Invalid Oncall formDisplay');
+  if (input.customFormMode !== undefined && !['native', 'botmux'].includes(input.customFormMode as string)) throw new Error('Invalid Oncall customFormMode');
   if (input.forwardMode !== undefined && !['none', 'individual', 'merge'].includes(input.forwardMode as string)) throw new Error('Invalid Oncall forwardMode');
   if (input.identitySource !== undefined && !['bot', 'shared'].includes(input.identitySource as string)) throw new Error('Invalid Oncall identitySource');
   const result: OncallGroupPolicy = { enabled: input.enabled === true, chatIds: [...new Set((input.chatIds ?? []) as string[])] };
   if (input.flowMode !== undefined) result.flowMode = input.flowMode as OncallGroupPolicy['flowMode'];
   if (input.formDisplay !== undefined) result.formDisplay = input.formDisplay as OncallGroupPolicy['formDisplay'];
+  if (input.customFormMode !== undefined) result.customFormMode = input.customFormMode as OncallGroupPolicy['customFormMode'];
   if (input.forwardMode !== undefined) result.forwardMode = input.forwardMode as OncallGroupPolicy['forwardMode'];
   if (input.identitySource !== undefined) result.identitySource = input.identitySource as OncallGroupPolicy['identitySource'];
   if (input.button !== undefined) {
@@ -41,4 +44,11 @@ export function normalizeOncallGroupPolicy(value: unknown): OncallGroupPolicy {
 
 export function oncallGroupEnabled(policy: OncallGroupPolicy | undefined, chatId: string): boolean {
   return policy?.enabled === true && policy.chatIds.includes(chatId);
+}
+
+/** Keep already issued native form attempts valid when the display preference changes. */
+export function nativeFormPolicyFingerprint(policy: OncallGroupPolicy | undefined): string | undefined {
+  if (!policy) return;
+  const { customFormMode: _mode, ...handoffPolicy } = policy;
+  return JSON.stringify(handoffPolicy);
 }
