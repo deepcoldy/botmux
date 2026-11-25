@@ -27595,6 +27595,28 @@ function observeQueuedActivationReceipt(
   return false;
 }
 
+const unconfirmedQueuedActivations = new Map<string, { item: PendingCliInput; generation: number }>();
+/** Explicit operator-authorized replay tokens, valid for exactly one CLI generation. */
+const authorizedQueuedActivationReplays = new Map<string, number>();
+
+/** Called only after an explicitly authorized restart enters its new CLI generation. */
+function authorizeUnconfirmedQueuedActivationReplay(): number {
+  const items: PendingCliInput[] = [];
+  for (const [token, entry] of [...unconfirmedQueuedActivations]) {
+    unconfirmedQueuedActivations.delete(token);
+    // Stale/cancelled observers and already-settled tokens never gain replay authority.
+    if (!queuedActivationReceipts.has(token) || queuedActivationReceipts.isSettled(token)) continue;
+    queuedActivationReceipts.cancel(token);
+    authorizedQueuedActivationReplays.set(token, cliSpawnGeneration);
+    items.push(entry.item);
+  }
+  if (items.length > 0) {
+    pendingMessages.unshift(...items);
+    log(`Operator authorized replay of ${items.length} unconfirmed queued activation(s) for CLI generation ${cliSpawnGeneration}`);
+  }
+  return items.length;
+}
+
 function durableArgvActivationRecheck(
   item: PendingCliInput,
 ): (() => SubmitRecheckResult | Promise<SubmitRecheckResult>) | undefined {
@@ -27626,11 +27648,13 @@ function observeUnconfirmedQueuedActivation(
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
     durableTerminalStatus?: 'failed' | 'ambiguous';
     deferRedrive?: boolean;
-    onSettledExtra?: (proof: QueuedActivationProof) => void;
+    onSettledExtra?: (proof: QueuedActivationProof, redrive: () => void) => void;
   },
 ): boolean {
   const evidenceTurnId = item.turnId;
   const generation = cliSpawnGeneration;
+  const activationToken = item.queuedActivationToken;
+  if (activationToken) unconfirmedQueuedActivations.set(activationToken, { item, generation });
   const writeStartedAtMs = evidenceTurnId && typeof inputDeliveryEvidence?.writeStartedAtMs === 'function'
     ? inputDeliveryEvidence.writeStartedAtMs({
       turnId: evidenceTurnId,
@@ -27639,6 +27663,11 @@ function observeUnconfirmedQueuedActivation(
     })
     : undefined;
   let failureChain: SubmitFailureChainKey | undefined;
+  const receiptBackend = backend;
+  const redrive = (): void => {
+    if (cliSpawnGeneration !== generation || backend !== receiptBackend || cliRestartInProgress) return;
+    try { redriveRejectedStructuredReady(); } finally { void flushPending(); }
+  };
   const settled = observeQueuedActivationReceipt(
     item,
     opts?.recheck,
@@ -27659,9 +27688,10 @@ function observeUnconfirmedQueuedActivation(
         ),
       } : {}),
       onSettledExtra: proof => {
+        if (activationToken) unconfirmedQueuedActivations.delete(activationToken);
         if (failureChain) submitFailureChains.cancel(failureChain);
-        opts?.onSettledExtra?.(proof);
-        if (!opts?.deferRedrive) queueMicrotask(() => redriveRejectedStructuredReady());
+        opts?.onSettledExtra?.(proof, redrive);
+        if (!opts?.deferRedrive) queueMicrotask(redrive);
       },
     },
   );
@@ -28465,7 +28495,13 @@ async function flushPending(): Promise<void> {
         break;
       }
       const continuedExecution = item.traexAutoModelRecovery ? item.traexAutoModelContinuation?.execution : undefined;
-      if (workerSessionEventScope && !(continuedExecution && item.turnId
+      const replayAuthorized = !continuedExecution && !!item.queuedActivationToken
+        && authorizedQueuedActivationReplays.get(item.queuedActivationToken) === cliSpawnGeneration;
+      if (replayAuthorized) {
+        authorizedQueuedActivationReplays.delete(item.queuedActivationToken!);
+        log(`Writing operator-authorized unconfirmed activation replay (turn=${item.turnId?.substring(0, 16) ?? '-'})`);
+      }
+      if (workerSessionEventScope && !replayAuthorized && !(continuedExecution && item.turnId
         ? workerSessionEventScope.canSubmitContinuation(item.turnId, continuedExecution)
         : workerSessionEventScope.canSubmit(item.turnId, item.dispatchAttempt))) {
         const submissionGate = !continuedExecution
@@ -39214,6 +39250,8 @@ async function restartCliProcess(
   opts: {
     immediate?: boolean;
     preservePending?: boolean;
+    /** Explicit user restart may retry unconfirmed activations once in the new generation. */
+    allowUnconfirmedActivationReplay?: boolean;
     skipRestartBudget?: boolean;
     exactResumeSessionId?: string;
     restartCause?: CliRestartCause;
@@ -39257,6 +39295,7 @@ async function restartCliProcess(
   }
   if (typeof queuedActivationReceipts?.size === 'function'
     && queuedActivationReceipts.size() > 0
+    && !opts.allowUnconfirmedActivationReplay
     && !closeRequested) {
     queuedActivationReceipts.clear();
     log(`In-worker CLI restart (${reason}) has an unsettled queued activation receipt; retiring worker for daemon journal recovery`);
@@ -39272,6 +39311,10 @@ async function restartCliProcess(
   // until killCli/spawnCli would leave a window where an old timer can mutate
   // the next durable attempt while destroySession is still awaiting.
   cliSpawnGeneration += 1;
+  // Authorization is always generation-scoped: an unrelated later restart drops it.
+  authorizedQueuedActivationReplays.clear();
+  if (opts.allowUnconfirmedActivationReplay) authorizeUnconfirmedQueuedActivationReplay();
+  unconfirmedQueuedActivations.clear();
   // Old-generation deferred submit rechecks are stale by definition: cancel
   // them now so no lingering timer warns or mutates the replacement attempt.
   submitFailureChains.clear();
@@ -45656,12 +45699,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         };
         observeUnconfirmedQueuedActivation(item, {
           deferRedrive: true,
-          onSettledExtra: () => {
+          onSettledExtra: (_proof, redrive) => {
             // observeQueuedActivationReceipt ACKs in its finally block. Preserve
             // the established ACK -> bundled followUp -> successor redrive order.
             queueMicrotask(() => {
-              deliverBundledFollowUp();
-              redriveRejectedStructuredReady();
+              try { deliverBundledFollowUp(); } finally { redrive(); }
             });
           },
         });
@@ -45944,6 +45986,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // auto-restart 那条裸 restart 的计数兜底。
         {
           preservePending: true,
+          allowUnconfirmedActivationReplay: msg.allowUnconfirmedActivationReplay === true && !!msg.attemptId,
           immediate: msg.reason === 'account_rotation',
           skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort || msg.reason === 'account_rotation',
           ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}),

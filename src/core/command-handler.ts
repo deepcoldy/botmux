@@ -161,7 +161,7 @@ import { messageMentionsBot, parseApiMessage, extractResources } from '../im/lar
 import { updateSessionTitle } from './session-title.js';
 import { markProjectImportPending, noteProjectAssociationChanged } from './project-session-association-events.js';
 import { requestAgentSessionRename, resolveAgentSessionAutoRename } from './session-rename.js';
-import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { hasNonActivationSessionMutationOwnership, hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission, withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, withOpenTranscript, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
 import { REWIND_BACKUP_RETENTION, pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from './rewind-backup-retention.js';
@@ -3245,7 +3245,7 @@ export async function handleCommand(
           // route. requestSessionRestart does not itself gate on dispatch
           // ownership, so reject here before the coordinator tears the worker
           // down (mirrors the card-handler restart path).
-          if (hasProtectedSessionMutationOwnership(ds)) {
+          if (hasNonActivationSessionMutationOwnership(ds)) {
             await sessionReply(
               rootId,
               '当前 Codex App 仍有未结算消息，暂不能重启；请等待本轮完成或关闭会话。',
@@ -3265,7 +3265,7 @@ export async function handleCommand(
               render: status => buildRestartStatusCard({ status, cliName, source: 'slash', locale: loc }),
               post: card => sessionReply(rootId, card, 'interactive'),
             }),
-          });
+          }, { allowUnconfirmedActivationReplay: true });
           logger.info(`[${logTag}] Restart by /restart command`);
         } else {
           await replyNoSession(replyHere, loc);

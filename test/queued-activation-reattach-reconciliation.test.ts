@@ -917,6 +917,7 @@ describe('WorkerSessionEventScope.inspectSubmissionGate & flushPending defense-i
       { content: 'confirmed input', turnId: 'om_accepted', queuedActivationToken: 'tok-accepted' },
       { content: 'already ran', turnId: 'om_reconciling', queuedActivationToken: 'tok-reconciling' },
       { content: 'local untouched', turnId: 'om_local_untouched', queuedActivationToken: 'tok-local' },
+      { content: 'successor payload', turnId: 'om_successor' },
     );
     Object.assign(h.scope, {
       sessionId: 'sess-gate-inspect',
@@ -937,8 +938,67 @@ describe('WorkerSessionEventScope.inspectSubmissionGate & flushPending defense-i
       { recheck: undefined },
     );
     // The unproven head is held by its observer; later input cannot overtake it.
-    expect(h.scope.pendingMessages.map((item: any) => item.turnId)).toEqual(['om_local_untouched']);
+    expect(h.scope.pendingMessages.map((item: any) => item.turnId)).toEqual(['om_local_untouched', 'om_successor']);
+
+    // Once authoritative proof arrives, ACK precedes an automatic FIFO redrive;
+    // no extra prompt/ready event is required for the successor to be written.
+    expect(h.queuedActivationReceipts.confirmToken(
+      'tok-reconciling',
+      { source: 'structured-transcript' },
+      { sessionId: h.scope.sessionId, generation: h.scope.cliSpawnGeneration, turnId: 'om_reconciling' },
+    )).toBe(true);
+    await vi.waitFor(() => {
+      expect(h.scope.pendingMessages).toHaveLength(0);
+      expect(writeInput).toHaveBeenCalledTimes(1);
+    });
+    expect(writeInput).toHaveBeenCalledWith(expect.anything(), 'successor payload', expect.anything());
+    expect(acked).toEqual(['tok-accepted', 'tok-reconciling']);
   });
+  it('allows an explicit unconfirmed replay once in its authorized generation and never from a stale generation', async () => {
+    const h = workerSubmitHarness();
+    const scopeObj = new WorkerSessionEventScope(
+      { appId: APP, sessionId: 'sess-operator-replay' },
+      { workerId: 'worker-gen-2', generation: 2 },
+    );
+    scopeObj.beginRuntime();
+    scopeObj.noteAdmission({ ref: { executionId: 'exec-replay', turnId: 'om_replay' }, phase: 'reconciling' });
+    scopeObj.noteAdmission({ ref: { executionId: 'exec-stale', turnId: 'om_stale' }, phase: 'reconciling' });
+    const acked: string[] = [];
+    const writeInput = vi.fn(async () => ({ submitted: true }));
+    Object.assign(h.scope, {
+      workerSessionEventScope: scopeObj,
+      lastInitConfig: { cliId: 'claude-code' },
+      decideFlushSubmissionRejectionSettlement,
+      isCodexAppCliId: () => false,
+      cliAdapter: { reliableTurnTerminal: true, writeInput },
+      acknowledgeQueuedActivation: (item: any) => acked.push(item.queuedActivationToken),
+    });
+    h.scope.pendingMessages.splice(0, h.scope.pendingMessages.length, {
+      content: 'retry exact retained payload', turnId: 'om_replay', queuedActivationToken: 'tok-replay',
+    });
+    await h.flush();
+    expect(writeInput).not.toHaveBeenCalled();
+    expect(h.queuedActivationReceipts.has('tok-replay')).toBe(true);
+
+    expect(loadWorkerFunction('authorizeUnconfirmedQueuedActivationReplay', h.scope)()).toBe(1);
+    expect(h.scope.pendingMessages.map((item: any) => item.turnId)).toEqual(['om_replay']);
+    expect(h.scope.authorizedQueuedActivationReplays.get('tok-replay')).toBe(h.scope.cliSpawnGeneration);
+    h.submitFailureChains.clear();
+    await h.flush();
+    expect(writeInput).toHaveBeenCalledTimes(1);
+    expect(writeInput).toHaveBeenCalledWith(expect.anything(), 'retry exact retained payload', expect.anything());
+    expect(acked).toEqual(['tok-replay']);
+    expect(h.scope.authorizedQueuedActivationReplays.has('tok-replay')).toBe(false);
+
+    // A token authorized only for an older generation cannot bypass the gate again.
+    h.scope.authorizedQueuedActivationReplays.set('tok-stale', h.scope.cliSpawnGeneration - 1);
+    h.scope.pendingMessages.push({ content: 'must not replay', turnId: 'om_stale', queuedActivationToken: 'tok-stale' });
+    await h.flush();
+    expect(writeInput).toHaveBeenCalledTimes(1);
+    expect(acked).toEqual(['tok-replay']);
+    expect(h.queuedActivationReceipts.has('tok-stale')).toBe(true);
+  });
+
   it('orders an observed raw settlement as ACK, bundled follow-up, then successor redrive', async () => {
     const h = workerSubmitHarness();
     const events: string[] = [];
@@ -1343,6 +1403,7 @@ describe('Adapter & backend parity (RemoteRunner, OpenCode/MiMoCode, Pi, Hybrid 
     // Ambiguous reconciling: no write/ACK/followUp until authoritative proof arrives.
     const ambiguousAcked: string[] = [];
     const ambiguousFollowUps: any[] = [];
+    const ambiguousRedrive = vi.fn();
     let settleAmbiguous: (() => void) | undefined;
     const ambiguousScope: Record<string, any> = {
       ...rawScope,
@@ -1358,7 +1419,7 @@ describe('Adapter & backend parity (RemoteRunner, OpenCode/MiMoCode, Pi, Hybrid 
         expect(item).toMatchObject({ content: '/compact', turnId: 'om_raw_1', queuedActivationToken: 'tok-raw-ambiguous' });
         settleAmbiguous = () => {
           ambiguousAcked.push(item.queuedActivationToken);
-          opts.onSettledExtra({ source: 'structured-transcript' });
+          opts.onSettledExtra({ source: 'structured-transcript' }, ambiguousRedrive);
         };
         return false;
       }),

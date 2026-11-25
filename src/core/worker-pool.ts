@@ -10006,6 +10006,10 @@ export function latestLaunchCommandsForRespawn(ds: DaemonSession): {
 
 export interface SessionRestartOptions {
   topicEffort?: import('../utils/traex-session-effort.js').TraexTopicEffortRestart;
+  /** Explicit general restart only: authorize one generation-scoped replay of
+   *  activations still lacking submission evidence. Never set for model/effort,
+   *  cwd-move, account-rotation, or crash-recovery restarts. */
+  allowUnconfirmedActivationReplay?: boolean;
   /**
    * Role-switch cwd move: the worker converges `lastInitConfig.workingDir` to
    * this path before respawning (`restart.updateWorkingDir`). The caller must
@@ -10100,6 +10104,7 @@ export function requestSessionRestart(
         ds.cliReady = false;
         try {
           ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
+            ...(opts.allowUnconfirmedActivationReplay === true ? { allowUnconfirmedActivationReplay: true as const } : {}),
             ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model,
             ...(opts.topicEffort ? { topicEffort: opts.topicEffort } : {}),
             traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),

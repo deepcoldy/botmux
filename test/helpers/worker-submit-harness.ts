@@ -105,7 +105,9 @@ export function workerSubmitHarness() {
     submitActivityEvidenceSince: () => 'pty-output',
     releaseInputDeliveryQuarantine: vi.fn(),
     deferNativeCodexInputCommit: () => false,
+    deferTurnInputCommitUntilSubmission: () => false,
     queuePostSubmitNativeSessionTitle: vi.fn(), persistCliSessionId: vi.fn(),
+    maybeQueuePostSubmitNativeSessionTitle: vi.fn(),
     syncFreshCodexNativeSessionTitle: vi.fn(async () => {}),
     projectedRuntimeScreenStatus: () => (scope.isPromptReady ? 'idle' : 'working'),
     publishScreenStatus: vi.fn(),
@@ -142,5 +144,6 @@ export function workerSubmitHarness() {
   scope.observeQueuedActivationReceipt = vi.fn(loadWorkerFunction('observeQueuedActivationReceipt', scope));
   scope.observeUnconfirmedQueuedActivation = vi.fn(loadWorkerFunction('observeUnconfirmedQueuedActivation', scope));
   const flush = loadWorkerFunction<() => Promise<void>>('flushPending', scope);
+  scope.flushPending = flush;
   return { scope, queue, flush, schedule, recheck, settlements, submitFailureChains, inputDeliveryEvidence, queuedActivationReceipts };
 }

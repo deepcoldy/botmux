@@ -154,7 +154,7 @@ import {
   openLocalCliInIterm,
   preflightLocalCliOpen,
 } from '../../services/local-cli-opener.js';
-import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
+import { hasNonActivationSessionMutationOwnership, hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
 import { runDetachedBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 import { setSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
@@ -3896,7 +3896,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // Codex App: an accepted-but-unsettled dispatch still owns the turn route.
       // requestSessionRestart does not itself gate on dispatch ownership, so
       // reject here before the restart coordinator tears the worker down.
-      if (hasProtectedSessionMutationOwnership(ds)) {
+      if (hasNonActivationSessionMutationOwnership(ds)) {
         await sessionReply(
           rootId,
           '当前 Codex App 仍有未结算消息，暂不能重启；请等待本轮完成或关闭会话。',
@@ -3921,7 +3921,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           render: status => buildRestartStatusCard({ status, cliName, source: 'card', locale: locDs }),
           post: card => sessionReply(rootId, card, 'interactive'),
         }),
-      });
+      }, { allowUnconfirmedActivationReplay: true });
     }
 
     if (actionType === 'close') {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
 import {
+  hasNonActivationSessionMutationOwnership,
   hasProtectedSessionMutationOwnership,
   protectedSessionMutationReasons,
 } from '../src/core/session-mutation-guard.js';
@@ -75,5 +76,41 @@ describe('hasProtectedSessionMutationOwnership', () => {
         dispatchId: 'dispatch-n', turnId: 'turn-n', state: 'accepted', content: 'N',
       }],
     }))).toEqual(['codex_app_dispatch']);
+  });
+});
+
+describe('hasNonActivationSessionMutationOwnership', () => {
+  it('allows activation-only restart ownership while preserving every other protected gate', () => {
+    const activationOnly = {
+      session: session({
+        queuedActivationPending: true,
+        queuedActivationTail: [{
+          id: 'tail-1', order: 1, userPrompt: 'N+1',
+          cliInput: { content: 'N+1' }, turnId: 'turn-n-plus-1',
+        }],
+      }),
+      initialStartPending: true,
+    } as DaemonSession;
+    expect(hasProtectedSessionMutationOwnership(activationOnly)).toBe(true);
+    expect(hasNonActivationSessionMutationOwnership(activationOnly)).toBe(false);
+    expect(hasNonActivationSessionMutationOwnership({ session: session() })).toBe(false);
+    // A bare start reservation or an unpromoted tail has no live replay observer.
+    expect(hasNonActivationSessionMutationOwnership({ session: session(), initialStartPending: true })).toBe(true);
+    expect(hasNonActivationSessionMutationOwnership({
+      session: session({
+        queuedActivationTail: [{
+          id: 'tail-1', order: 1, userPrompt: 'N+1', cliInput: { content: 'N+1' }, turnId: 'turn-n-plus-1',
+        }],
+      }),
+      initialStartPending: true,
+    })).toBe(true);
+    for (const overrides of [
+      { queued: true },
+      { pendingRepoSetup: { mode: 'picker', prompt: 'OPENING_N' } },
+      { principalLaneQueuedTurns: [{ turnId: 'om_b2' }] },
+      { codexAppDispatchLedger: [{ dispatchId: 'dispatch-n', turnId: 'turn-n', state: 'accepted', content: 'N' }] },
+    ] as const) {
+      expect(hasNonActivationSessionMutationOwnership({ session: session(overrides as Partial<Session>) })).toBe(true);
+    }
   });
 });
