@@ -241,7 +241,7 @@ pane 脚本还要做三件事：
   - 传 `core` 时原样采用 target 冻结的 `socket`/`hcSession`，`runtimeDir` 由 socket 反推。
   - socket 不是绝对路径或超过 107 字节时抛错。
 - `hcCoreAddress(paths) → HcCoreAddress {hcSession, socket}`：创建终端时冻结进 target。
-- `hcRuntimeDirError(paths) → string | null`：任何 hc 调用前都必须是 null。hc 连不上就会自动拉起 core，并递归创建 socket 所在目录，所以缺失的运行目录会被造成一个普通目录。
+- `hcRuntimeError(paths) → string | null`：启动前检查运行目录是否存在，macOS 上也检查 socket 路径是否被普通文件等占用。hc 自动启动会创建缺失的目录，并可能替换已有的路径。旧 core 的路径不可用时，worker 先用 `hcCoreAbsent` 核实 socket 和 holder 都已消失，再考虑迁移到默认 core。
 - `hcCoreAbsent(socket) → boolean`：socket 和 holder socket（`<stem>.holder.sock`、`<stem>.holder.<id>.sock`）都不在时为 true，见第 6 节。
 - `hcControlEnv(base?, paths?)`：每个 hc 子进程都用这份 env，不得用 CLI child env。
 - `ensureHcCore({env?, core?, timeoutMs = 20s}) → HcCoreStatus {bin, session, socket, version, pid, started}`：

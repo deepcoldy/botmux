@@ -57,10 +57,36 @@ describe('publishHcHerdrTab', () => {
     expect(tab().name).toBe('My Herdr title');
   });
 
-  it('recovers from a failed save and contention without duplicating a tab whose reply timed out', async () => {
+  it('preserves a tab whose id survived a manual rebuild of its panes', async () => {
+    type Layout = { spaces: { id: string; tabs: { id: string; name: string; root: unknown }[] }[] };
+    let value: Layout | null = null;
+    let version = 0;
+    const call = vi.fn(async (method: string, params: { value?: Layout }) => {
+      if (method === 'doc.get') return { version, value: structuredClone(value) };
+      value = structuredClone(params.value!);
+      return { version: ++version };
+    });
+    const client = { call: call as HcClient['call'] };
+    await publishHcHerdrTab(client, 'session-a', terminal, 'Original title', () => true);
+
+    const tab = value!.spaces[0]!.tabs[0]!;
+    tab.name = 'Rebuilt tab';
+    tab.root = {
+      id: 'user-root', type: 'row',
+      children: [{ id: 'user-pane', type: 'block', content: { terminal: 't42' } }],
+    };
+    version++;
+    call.mockClear();
+
+    await publishHcHerdrTab(client, 'session-a', terminal, 'Original title', () => true);
+
+    expect(call.mock.calls.map(([method]) => method)).toEqual(['doc.get']);
+  });
+
+  it('confirms a saved tab whose reply times out at the end of a round of contention', async () => {
     let version = 0;
     let value: { spaces: { tabs: unknown[] }[] } | null = null;
-    let conflictingWrites = 6;
+    let conflictingWrites = 7;
     let saveFailed = false;
     const call = vi.fn(async (method: string, params: { version?: number; value?: typeof value }) => {
       if (method === 'doc.get') return { version, value: structuredClone(value) };
@@ -78,9 +104,9 @@ describe('publishHcHerdrTab', () => {
     vi.useFakeTimers();
     try {
       const publishing = publishHcHerdrTab({ call: call as HcClient['call'] }, 'session-a', terminal, 'Title', () => true);
-      await flushFakeTimers(20_000, 100);
-      await publishing;
+      await Promise.all([publishing, flushFakeTimers(20_000, 100)]);
       expect(conflictingWrites).toBe(-1);
+      expect(call.mock.calls.at(-1)?.[0]).toBe('doc.get');
       expect(value!.spaces[0]!.tabs).toMatchObject([{ name: 'Title' }]);
     } finally {
       vi.useRealTimers();
@@ -93,7 +119,7 @@ describe('publishHcHerdrTab', () => {
     vi.useFakeTimers();
     try {
       const publishing = publishHcHerdrTab({ call: call as HcClient['call'] }, 'session-a', terminal, 'Title', () => current);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
       expect(vi.getTimerCount()).toBe(1);
       current = false;
       await vi.runAllTimersAsync();

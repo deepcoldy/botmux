@@ -17,7 +17,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { HcBackend } from '../src/adapters/backend/hc-backend.js';
 import { HcClient } from '../src/adapters/backend/hc/client.js';
 import { hcTerminalName, probeHcTerminal, type HcTarget } from '../src/adapters/backend/hc/cli-ops.js';
-import { hcControlEnv, hcCoreAddress, hcCorePaths, hcRuntimeDirError } from '../src/adapters/backend/hc/core.js';
+import { hcControlEnv, hcCoreAddress, hcCorePaths, hcRuntimeError } from '../src/adapters/backend/hc/core.js';
 import { resolveHcBackendGate, selectSessionBackend } from '../src/adapters/backend/session-backend-selector.js';
 import type { PersistentBackendTarget } from '../src/adapters/backend/types.js';
 import {
@@ -121,7 +121,7 @@ describe.skipIf(!realHc)('hc end to end against the real binary', () => {
       recorded,
       availability: () => probeHcAvailability({ env: process.env }),
       defaultCore: () => hcCoreAddress(hcCorePaths(coreEnv)),
-      coreUnreachable: core => hcRuntimeDirError(hcCorePaths(process.env, { core })),
+      coreUnreachable: core => hcRuntimeError(hcCorePaths(process.env, { core })),
       probe: target => probeHcTerminal(target),
     });
   }

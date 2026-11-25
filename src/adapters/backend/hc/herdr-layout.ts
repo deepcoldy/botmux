@@ -8,6 +8,7 @@ const TIMEOUT = { timeoutMs: 2_000 };
 const RPC_INTERNAL_ERROR = -32603;
 const RETRY_INITIAL_MS = 50;
 const RETRY_MAX_MS = 2_000;
+const MAX_ATTEMPTS = 9;
 
 interface HerdrPane {
   id?: string;
@@ -84,6 +85,15 @@ function placeTerminal(document: HerdrLayout, sessionId: string, address: string
   return true;
 }
 
+async function readLayout(client: Pick<HcClient, 'call'>): Promise<{ version: number; document: HerdrLayout }> {
+  const current = await client.call<{ version: number; value: HerdrLayout | null }>('doc.get', { name: DOCUMENT }, TIMEOUT);
+  const document = current.value ?? {};
+  if (typeof document !== 'object' || Array.isArray(document) || (document.spaces != null && !Array.isArray(document.spaces))) {
+    throw new Error('无法识别现有 Herdr 布局');
+  }
+  return { version: current.version, document };
+}
+
 /** Place a terminal in the current core's native Herdr layout. The app's
  * label-based adoption would enable keep and restore a shell in place of a lost
  * agent. A document pane references the running terminal without that policy. */
@@ -96,24 +106,34 @@ export async function publishHcHerdrTab(
 ): Promise<void> {
   if (!terminal.cwd) return;
   const title = sessionTitle.trim() || hcTerminalName(sessionId);
-  for (let retryMs = RETRY_INITIAL_MS; isCurrent(); retryMs = Math.min(retryMs * 2, RETRY_MAX_MS)) {
+  let retryMs = RETRY_INITIAL_MS;
+  for (let attempt = 1; isCurrent(); attempt++) {
+    let writing = false;
     try {
-      const current = await client.call<{ version: number; value: HerdrLayout | null }>('doc.get', { name: DOCUMENT }, TIMEOUT);
-      const document = current.value ?? {};
-      if (typeof document !== 'object' || Array.isArray(document) || (document.spaces != null && !Array.isArray(document.spaces))) {
-        throw new Error('无法识别现有 Herdr 布局');
-      }
+      const { version, document } = await readLayout(client);
       if (!isCurrent() || !placeTerminal(document, sessionId, terminal.address, terminal.cwd, title)) return;
-      await client.call('doc.set', { name: DOCUMENT, version: current.version, value: document }, TIMEOUT);
+      writing = true;
+      await client.call('doc.set', { name: DOCUMENT, version, value: document }, TIMEOUT);
       return;
     } catch (error) {
       const retryableRpc = isHcError(error, 'rpc') && (error.kind === 'conflict' || error.rpcCode === RPC_INTERNAL_ERROR);
       if (!isHcError(error, 'timeout') && !retryableRpc) throw error;
       if (!isCurrent()) return;
+      if (attempt === MAX_ATTEMPTS) {
+        // A timed-out save may have committed. Give it a final read-only check
+        // so a reconnect can honor a user parking the registered pane.
+        if (writing && isHcError(error, 'timeout')) {
+          const latest = await readLayout(client).catch(() => null);
+          if (!isCurrent() || (latest && !placeTerminal(latest.document, sessionId, terminal.address, terminal.cwd, title))) return;
+        }
+        // Reject so the worker can try again on its next connection.
+        throw new Error(`Herdr 布局登记已尝试 ${attempt} 次：${error.message}`, { cause: error });
+      }
       // Restoring many workers can race on one document. Spread retries and
       // re-read every time, including after a write whose reply was lost.
       const delay = retryMs + Math.floor(Math.random() * retryMs);
       await new Promise<void>(resolve => { setTimeout(resolve, delay).unref(); });
+      retryMs = Math.min(retryMs * 2, RETRY_MAX_MS);
     }
   }
 }

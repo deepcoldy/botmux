@@ -12,8 +12,8 @@
  */
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { hcControlEnv, hcCorePaths } from '../src/adapters/backend/hc/core.js';
 import { prepareOutageLabWorld, startOutageLabSession, type OutageLabSession } from './helpers/backend-outage-lab.js';
 
@@ -45,6 +45,32 @@ describe.skipIf(!realHc)('worker: claude_exit names a lost hc core', () => {
     return s;
   };
   const exitsOf = (s: OutageLabSession) => s.ipc.filter(m => m.type === 'claude_exit');
+
+  it.runIf(process.platform === 'darwin').each(['default', 'old'] as const)(
+    'refuses a recorded %s core whose socket path is occupied',
+    async (location) => {
+      prepareOutageLabWorld(world);
+      const socket = location === 'default' ? core.socket : join(dirname(core.socket), 'old.sock');
+      mkdirSync(dirname(socket), { recursive: true });
+      writeFileSync(socket, 'keep this file', { flag: 'wx' });
+      try {
+        const s = startOutageLabSession(world, 2, { backendType: 'hc' });
+        sessions.push(s);
+        s.init.persistentBackendTarget = {
+          backendType: 'hc', sessionName: s.paneTarget, hcSession: core.session, socket,
+        };
+        s.sendInit();
+        const outcome = () => s.ipc.find(m => m.type === 'error' || m.type === 'prompt_ready');
+        await vi.waitFor(() => expect(outcome(), s.logs()).toBeDefined(), { timeout: 15_000, interval: 50 });
+        expect(outcome(), s.logs()).toMatchObject({ type: 'error', message: expect.stringContaining('本机 hc 不可用') });
+        expect(outcome()?.message).toContain('被非 socket 文件占用');
+        expect(readFileSync(socket, 'utf8')).toBe('keep this file');
+      } finally {
+        unlinkSync(socket);
+      }
+    },
+    20_000,
+  );
 
   it('reports nothing for an ordinary exit, and the core socket when the core stops', async () => {
     prepareOutageLabWorld(world);

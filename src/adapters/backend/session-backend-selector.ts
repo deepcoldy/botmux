@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 
 import { HcBackend } from './hc-backend.js';
 import { hcTerminalName, probeHcTerminal, type HcTarget } from './hc/cli-ops.js';
-import { hcCoreAddress, hcCorePaths, type HcCoreAddress } from './hc/core.js';
+import { hcCoreAbsent, hcCoreAddress, hcCorePaths, type HcCoreAddress } from './hc/core.js';
 import { HerdrBackend } from './herdr-backend.js';
 import { PtyBackend } from './pty-backend.js';
 import { MojoBackend } from './mojo-backend.js';
@@ -316,8 +316,8 @@ function recordedHcTarget(target: PersistentBackendTarget | undefined): HcTarget
  *     core, as {@link resolveManagedTmuxPlacement} does).
  *   - Otherwise the default core of this env: a new terminal goes there, and a
  *     live one there (a target whose report to the daemon was lost) is
- *     reattached. A recorded core whose runtime dir is gone counts as missing:
- *     its sockets lived there.
+ *     reattached. If the recorded socket path is unusable, migration requires
+ *     both the socket and its holders to be absent.
  */
 export function resolveHcBackendGate(deps: {
   sessionId: string;
@@ -325,7 +325,7 @@ export function resolveHcBackendGate(deps: {
   availability: () => { ok: true } | { ok: false; reason: string };
   /** Throws a readable reason when this env names no usable core. */
   defaultCore: () => HcCoreAddress;
-  /** Readable reason nothing can listen at this core (its runtime dir is gone), else null. */
+  /** Why the core cannot listen at its socket path, or null if the path is usable. */
   coreUnreachable: (core: HcCoreAddress) => string | null;
   probe: (target: HcTarget) => SessionProbe;
 }): HcGateResolution {
@@ -344,7 +344,9 @@ export function resolveHcBackendGate(deps: {
   if (!availability.ok) return refuse(availability.reason);
   const recorded = recordedHcTarget(deps.recorded);
   if (recorded) {
-    const probe = deps.coreUnreachable(recorded) ? 'missing' : deps.probe(recorded);
+    const unreachable = deps.coreUnreachable(recorded);
+    if (unreachable && !hcCoreAbsent(recorded.socket)) return refuse(unreachable);
+    const probe = unreachable ? 'missing' : deps.probe(recorded);
     if (probe !== 'missing') return frozen(recorded, probe);
   }
   let core: HcCoreAddress;
