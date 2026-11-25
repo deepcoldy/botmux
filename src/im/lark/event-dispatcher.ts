@@ -1754,6 +1754,7 @@ export function __resetEventClaimsForTest(): void {
   // 同清「已触发任务」记录，避免编辑事件幂等在用例间串状态。
   _resetTriggeredMessagesForTest();
   pendingMessageTriggers.clear();
+  autoStartTopicStarts.clear();
 }
 
 export async function getGroupStats(
@@ -4326,6 +4327,29 @@ function isMessageTriggerClaimed(larkAppId: string, messageId: string): boolean 
     || pendingMessageTriggers.has(messageTriggerKey(larkAppId, messageId));
 }
 
+interface AutoStartTopicStart {
+  settled: Promise<void>;
+  complete: () => void;
+  dispatching: boolean;
+}
+/** Shared across runtime generations so close/rebuild cannot strand root waiters. */
+const autoStartTopicStarts = new Map<string, AutoStartTopicStart>();
+function autoStartTopicKey(larkAppId: string, rootId: string): string {
+  return `${larkAppId}:${rootId}`;
+}
+function trackAutoStartTopic(larkAppId: string, payload: PendingForwardTopicPayload): AutoStartTopicStart | undefined {
+  const rootId = payload.autoStartTopicRootId;
+  if (!rootId) return undefined;
+  const key = autoStartTopicKey(larkAppId, rootId);
+  const existing = autoStartTopicStarts.get(key);
+  if (existing) return existing;
+  let complete!: () => void;
+  const settled = new Promise<void>(resolve => { complete = resolve; });
+  const entry = { settled, complete, dispatching: false };
+  autoStartTopicStarts.set(key, entry);
+  return entry;
+}
+
 async function dispatchHumanMessageViaHandlers(
   larkAppId: string,
   handlers: EventHandlers,
@@ -4396,6 +4420,10 @@ async function dispatchHumanMessageViaHandlers(
         admitted: payload.ctx.ingressAdmission?.admitted === true,
       })) {
         markMessageTriggered(appId, messageId);
+        const seedMessageId = payload.ctx.forwardSeedData?.message?.message_id;
+        if (typeof seedMessageId === 'string' && seedMessageId && seedMessageId !== messageId) {
+          markMessageTriggered(appId, seedMessageId);
+        }
       }
     }
   })();
@@ -5896,21 +5924,6 @@ export function createLarkEventDispatcherRuntime(
     // message-listener) keeps serializeByAnchor's default cap.
     await dispatchHumanMessageViaHandlers(larkAppId, handlers, payload, 0, pendingWaitMs);
   };
-  const autoStartTopicStarts = new Map<string, {
-    settled: Promise<void>;
-    complete: () => void;
-  }>();
-  const trackAutoStartTopic = (payload: PendingForwardTopicPayload) => {
-    const rootId = payload.autoStartTopicRootId;
-    if (!rootId) return undefined;
-    const existing = autoStartTopicStarts.get(rootId);
-    if (existing) return existing;
-    let complete!: () => void;
-    const settled = new Promise<void>(resolve => { complete = resolve; });
-    const entry = { settled, complete };
-    autoStartTopicStarts.set(rootId, entry);
-    return entry;
-  };
   const dispatchWithAutoStartTracking = async (
     payload: PendingForwardTopicPayload,
     dispatch: () => Promise<void>,
@@ -5920,11 +5933,13 @@ export function createLarkEventDispatcherRuntime(
       await dispatch();
       return;
     }
-    const entry = trackAutoStartTopic(payload)!;
+    const entry = trackAutoStartTopic(larkAppId, payload)!;
+    entry.dispatching = true;
     try {
       await dispatch();
     } finally {
-      if (autoStartTopicStarts.get(rootId) === entry) autoStartTopicStarts.delete(rootId);
+      const key = autoStartTopicKey(larkAppId, rootId);
+      if (autoStartTopicStarts.get(key) === entry) autoStartTopicStarts.delete(key);
       entry.complete();
     }
   };
@@ -5978,6 +5993,7 @@ export function createLarkEventDispatcherRuntime(
       payload: record.payload,
       flush,
     }, remainingMs)) {
+      trackAutoStartTopic(larkAppId, record.payload);
       logger.info(`[forward-followup] restored pending seed=${record.messageId.substring(0, 12)} remaining=${remainingMs}ms`);
     } else {
       void flush(record.payload).catch(err => logger.error(`Error restoring delayed topic seed: ${err}`));
@@ -6133,6 +6149,9 @@ export function createLarkEventDispatcherRuntime(
     seedRoutingGate?: { ready: Promise<void>; complete: () => void },
     primary?: PrimaryProcessContext,
   ): Promise<DurableLarkCanonicalHandlerResult | void> {
+    let pairedAutoStartEntry: AutoStartTopicStart | undefined;
+    let pairedAutoStartKey: string | undefined;
+    let autoStartDispatchStarted = false;
     try {
       data = redactProtectedLarkEvent(data, config.session.dataDir);
       let message = data.message;
@@ -7237,7 +7256,7 @@ export function createLarkEventDispatcherRuntime(
       // stays in the buffer and flushes on its original timer. In topic mode
       // only an auto-start-enabled chat holds seeds; an ordinary unmentioned
       // reply therefore finds nothing to pair with and keeps its @ gate.
-      if (!crossChatFollowUp && !yieldToImportedTopicHandler && senderOpenId && isAllowed && message.root_id && !isControlCommand) {
+      if (!crossChatFollowUp && !yieldToImportedTopicHandler && !messageListener && !substituteTrigger && senderOpenId && isAllowed && message.root_id && !isControlCommand) {
         const pairingMentionMode = resolveGroupMentionMode(larkAppId, chatId);
         const pairingDelayEnabled = forwardFollowupDelayEnabled(chatId);
         await waitForSeedRoutingGate(
@@ -7254,9 +7273,9 @@ export function createLarkEventDispatcherRuntime(
           && (pairingMentionMode === 'ambient' || pairingMentionMode === 'topic')
           && !explicitlyMentionedThisBot
           && await mentionsOtherInChat();
-        if (pairingDelayEnabled && !pairingRedirect) {
+        if (pairingDelayEnabled && !pairingRedirect && !ownsSession) {
           pairedForwardSeed = forwardFollowups.take(pairingInput);
-        } else if (!pairingDelayEnabled) {
+        } else if (ownsSession || !pairingDelayEnabled) {
           // Do not consume the old seed until the current reply has passed its
           // admission gates. A rejected reply must leave the original timer intact.
           releaseStalePendingSeed = true;
@@ -7265,12 +7284,15 @@ export function createLarkEventDispatcherRuntime(
       if (pairedForwardSeed) {
         // Register before any later await so another reply already queued behind
         // the root gate cannot slip between the pairing and the actual dispatch.
-        trackAutoStartTopic(pairedForwardSeed.payload);
+        const autoStartRootId = pairedForwardSeed.payload.autoStartTopicRootId;
+        pairedAutoStartKey = autoStartRootId ? autoStartTopicKey(larkAppId, autoStartRootId) : undefined;
+        pairedAutoStartEntry = pairedAutoStartKey ? autoStartTopicStarts.get(pairedAutoStartKey) : undefined;
         // The Session remains anchored at the original Lark root so all later
         // replies keep resolving to it. Only the visible first-reply target moves
         // to the clarification (replyAnchorMessageId below), away from the
         // forwarding bubble itself.
         routing.scope = 'thread';
+        routing.anchor = pairedForwardSeed.payload.ctx.anchor;
         routingSource = 'topic-chat';
         replyRootId = undefined;
         ownsSession = false;
@@ -7304,19 +7326,27 @@ export function createLarkEventDispatcherRuntime(
         );
       }
 
-      // A topic auto-start remains the owner of its original Lark root while
-      // handleNewTopic is still creating the Session. Hold same-root replies at
-      // this boundary, then re-check ownership. The per-anchor serializer
-      // preserves their dispatch order after the creation settles. An already
-      // admitted root is not disowned by a later autoStart/excluded config edit.
-      const inFlightAutoStart = !pairedForwardSeed
-        && !explicitlyMentionedThisBot
+      // A topic auto-start remains visible at its original Lark root from the
+      // buffer window through Session creation. Defer only ordinary same-root
+      // replies in a real thread: folded/quoted routes must keep their original
+      // shape. Unauthorized senders and messages addressed to someone else are
+      // settled by their normal gates instead of waiting behind creation.
+      const pendingAutoStart = isAllowed
+        && !pairedForwardSeed
+        && !ownsSession
         && !messageListener
         && !substituteTrigger
         && !crossChatFollowUp
         && !yieldToImportedTopicHandler
-        && message.root_id
-        ? autoStartTopicStarts.get(message.root_id)
+        && !!message.root_id
+        && !!message.thread_id
+        && routing.anchor === message.root_id
+        ? autoStartTopicStarts.get(autoStartTopicKey(larkAppId, message.root_id))
+        : undefined;
+      const inFlightAutoStart = pendingAutoStart
+        && (pendingAutoStart.dispatching || forwardFollowupDelayEnabled(chatId))
+        && !(isAllowed && mentionsAnotherMember(larkAppId, message) && await mentionsOtherInChat())
+        ? pendingAutoStart
         : undefined;
       if (inFlightAutoStart) {
         logger.debug(
@@ -7324,8 +7354,6 @@ export function createLarkEventDispatcherRuntime(
           `root=${String(message.root_id).substring(0, 12)} msg=${messageId.substring(0, 12)}`,
         );
         await inFlightAutoStart.settled;
-        routing.scope = 'thread';
-        routingSource = 'real-thread';
         ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
       }
 
@@ -7545,8 +7573,7 @@ export function createLarkEventDispatcherRuntime(
                 && !mentionsOther
                 && mentionMode === 'topic'
                 && routingSource === 'real-thread'
-                && !!message.root_id
-                && getCachedChatMode(larkAppId, chatId) === 'topic';
+                && !!message.root_id;
               if (unownedAutoTopicReply) {
                 // Narrow enough not to log ordinary group chatter, but visible at
                 // the default level if an auto-start creation race still drops a reply.
@@ -7649,6 +7676,9 @@ export function createLarkEventDispatcherRuntime(
       }
       const autoStartTopicRootId = pairedForwardSeed?.payload.autoStartTopicRootId ?? (
         topicAutoStartEnabled(chatId)
+        && !explicitlyMentionedThisBot
+        && !messageListener
+        && !substituteTrigger
         && resolveGroupMentionMode(larkAppId, chatId) === 'topic'
         && routingSource === 'topic-chat'
         && ctx.scope === 'thread'
@@ -7668,6 +7698,9 @@ export function createLarkEventDispatcherRuntime(
       }
       const shouldDelayTopicSeed = config.daemon.forwardFollowupWaitMs > 0
         && forwardFollowupDelayEnabled(chatId)
+        && (resolveGroupMentionMode(larkAppId, chatId) !== 'topic' || !explicitlyMentionedThisBot)
+        && !messageListener
+        && !substituteTrigger
         && !pairedForwardSeed
         && !isControlCommand
         && !!senderOpenId
@@ -7693,6 +7726,7 @@ export function createLarkEventDispatcherRuntime(
             payload,
             flush: delayedPayload => dispatchPersistedForwardFollowup(messageId, delayedPayload),
           })) {
+            trackAutoStartTopic(larkAppId, payload);
             logger.debug(
               `[forward-followup] holding topic seed msg=${messageId.substring(0, 12)} ` +
               `for ${config.daemon.forwardFollowupWaitMs}ms`,
@@ -7718,6 +7752,7 @@ export function createLarkEventDispatcherRuntime(
         } catch (err) {
           logger.warn(`[forward-followup] failed to persist paired payload before dispatch: ${err}`);
         }
+        autoStartDispatchStarted = true;
         void dispatchPersistedForwardFollowup(pairedForwardSeed.messageId, payload)
           .catch(err => logger.error(`Error handling paired message event: ${err}`));
         return;
@@ -7768,6 +7803,12 @@ export function createLarkEventDispatcherRuntime(
       logger.error(`Error handling message event: ${err}`);
       if (primary) throw err;
     } finally {
+      if (pairedAutoStartEntry && pairedAutoStartKey && !autoStartDispatchStarted && !pairedAutoStartEntry.dispatching) {
+        if (autoStartTopicStarts.get(pairedAutoStartKey) === pairedAutoStartEntry) {
+          autoStartTopicStarts.delete(pairedAutoStartKey);
+        }
+        pairedAutoStartEntry.complete();
+      }
       seedRoutingGate?.complete();
     }
   }

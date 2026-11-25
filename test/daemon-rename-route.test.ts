@@ -5196,6 +5196,46 @@ describe('runtime passthrough cascade (PR-3)', () => {
     }
   });
 
+  it('已有会话续话携带 forwardSeedData：合并转发正文与附件一并进入 worker', async () => {
+    const merge = await import('../src/im/lark/merge-forward.js');
+    const expand = vi.spyOn(merge, 'expandMergeForward').mockImplementation(async (_app, _id, parsed) => {
+      parsed.content = '转发正文：登录失败';
+      parsed.msgType = 'merge_forward_expanded';
+      return { extraResources: [{ type: 'image', key: 'img_fwd_reply_1', name: 'login.png' }] };
+    });
+    try {
+      const { ds } = seedLiveThreadSession('om_reply_forward_root');
+      const seed = makeEventData('om_reply_forward_seed', '', 'om_reply_forward_root');
+      seed.message.message_type = 'merge_forward';
+      seed.message.content = '{}';
+      const followup = makeEventData('om_reply_forward_followup', '分析这个', 'om_reply_forward_root');
+      mocks.downloadResources.mockResolvedValueOnce({
+        attachments: [{ type: 'image', name: 'login.png', path: '/tmp/login.png' }],
+        needLogin: false,
+      });
+
+      await handleThreadReply(followup, {
+        ...makeCtx('om_reply_forward_root', 'om_reply_forward_followup'),
+        forwardSeedData: seed,
+      });
+      await tick(15);
+
+      expect(expand).toHaveBeenCalledOnce();
+      await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalled());
+      const payload = JSON.stringify((ds.worker as any).send.mock.calls.map((call: any[]) => call[0]));
+      expect(payload).toContain('<forwarded_context>');
+      expect(payload).toContain('转发正文：登录失败');
+      expect(payload).toContain('<user_request>');
+      expect(payload).toContain('分析这个');
+      const resources = JSON.stringify(mocks.downloadResources.mock.calls[0]);
+      expect(resources).toContain('img_fwd_reply_1');
+      expect(resources).toContain('om_reply_forward_seed');
+      expect(payload).toContain('/tmp/login.png');
+    } finally {
+      expand.mockRestore();
+    }
+  });
+
   it('级联在飞时推迟的合并转发：子消息只展开一次', async () => {
     const merge = await import('../src/im/lark/merge-forward.js');
     const expand = vi.spyOn(merge, 'expandMergeForward').mockImplementation(async (_app, _id, parsed) => {

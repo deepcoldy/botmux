@@ -28060,6 +28060,33 @@ function handlePendingForkTopicInput(data: any, ctx: RoutingContext): boolean {
   return true;
 }
 
+async function prepareForwardSeedForTurn(
+  larkAppId: string,
+  forwardSeedData: any,
+  numberer: ReturnType<typeof createImgNumberer>,
+): Promise<{ content: string; resources: MessageResource[]; mentions: import('./types.js').LarkMention[] | undefined }> {
+  if (!forwardSeedData) return { content: '', resources: [], mentions: undefined };
+  await resolveNonsupportMessage(forwardSeedData, larkAppId);
+  const seedMessageId = forwardSeedData.message?.message_id as string | undefined;
+  const seedResult = parseEventMessage(forwardSeedData, numberer);
+  if (seedResult.parsed.msgType === 'merge_forward' && seedMessageId) {
+    const { extraResources } = await expandMergeForward(
+      larkAppId,
+      seedMessageId,
+      seedResult.parsed,
+      numberer,
+    );
+    seedResult.resources.push(...extraResources);
+  }
+  return {
+    content: seedResult.parsed.content.trim(),
+    resources: seedMessageId
+      ? bindResourcesToMessage(seedResult.resources, seedMessageId)
+      : seedResult.resources,
+    mentions: seedResult.parsed.mentions,
+  };
+}
+
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
   if (feedbackMaintenanceActive(config.session.dataDir)) throw new Error('feedback_storage_maintenance');
   if (handlePendingForkTopicInput(data, ctx)) return;
@@ -28157,28 +28184,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 「恢复会话」，或发 /resume（无会话时由 botmux 认领，见 command-schema）。
 
   const numberer = createImgNumberer();
-  let forwardSeedContent = '';
-  let forwardSeedResources: MessageResource[] = [];
-  let forwardSeedMentions: import('./types.js').LarkMention[] | undefined;
-  if (ctx.forwardSeedData) {
-    await resolveNonsupportMessage(ctx.forwardSeedData, larkAppId);
-    const seedMessageId = ctx.forwardSeedData.message?.message_id as string | undefined;
-    const seedResult = parseEventMessage(ctx.forwardSeedData, numberer);
-    if (seedResult.parsed.msgType === 'merge_forward' && seedMessageId) {
-      const { extraResources } = await expandMergeForward(
-        larkAppId,
-        seedMessageId,
-        seedResult.parsed,
-        numberer,
-      );
-      seedResult.resources.push(...extraResources);
-    }
-    forwardSeedMentions = seedResult.parsed.mentions;
-    forwardSeedContent = seedResult.parsed.content.trim();
-    forwardSeedResources = seedMessageId
-      ? bindResourcesToMessage(seedResult.resources, seedMessageId)
-      : seedResult.resources;
-  }
+  const forwardSeed = await prepareForwardSeedForTurn(larkAppId, ctx.forwardSeedData, numberer);
+  const forwardSeedContent = forwardSeed.content;
+  const forwardSeedResources = forwardSeed.resources;
+  const forwardSeedMentions = forwardSeed.mentions;
   await resolveNonsupportMessage(data, larkAppId);
   const { parsed, resources } = parseEventMessage(data, numberer);
   const followupMentions = parsed.mentions;
@@ -30672,11 +30681,17 @@ async function handleThreadReplyAdmitted(
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
   const runtimeSessionKey = sessionKey(ctx.runtimeRoutingAnchor ?? anchor, larkAppId);
   await waitForAutoStartJoinReady(larkAppId, anchor);
+  const numberer = createImgNumberer();
+  const forwardSeed = !prepared && !replay
+    ? await prepareForwardSeedForTurn(larkAppId, ctx.forwardSeedData, numberer)
+    : { content: '', resources: [], mentions: undefined };
   // replay 已是首过 preamble 的结果：不再解析 nonsupport/interactive，也不重新 parse。
   if (!prepared && !replay) await resolveNonsupportMessage(data, larkAppId);
-  const parsedResult = replay ?? prepared ?? parseEventMessage(data);
+  const parsedResult = replay ?? prepared ?? parseEventMessage(data, numberer);
   const parsed = parsedResult.parsed;
   const resources = parsedResult.resources;
+  resources.unshift(...forwardSeed.resources);
+  parsed.mentions = mergeMessageMentions(forwardSeed.mentions, parsed.mentions);
   // Expand merge_forward: fetch sub-messages and collect their resources.
   // 快照里的 resources 已经含展开结果，重入再拉会把子消息资源追加第二遍。
   if (!prepared && !replay && parsed.msgType === 'merge_forward') {
@@ -30845,10 +30860,11 @@ async function handleThreadReplyAdmitted(
     : (crossChatOrigin ? `${renderCrossChatReplyHint(crossChatOrigin)}\n` : '')
       + baseQuoteAndBotContext;
   const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx);
+  const turnContent = composeForwardFollowupContent(forwardSeed.content, parsed.content);
   const initialPromptContent = zeroInjection
-    ? zeroPromptTaskContent(stripCrossPrincipalAsToken(parsed.content).text, larkAppId, parsed.rootId ?? parsed.messageId, 'none')
+    ? zeroPromptTaskContent(stripCrossPrincipalAsToken(turnContent).text, larkAppId, parsed.rootId ?? parsed.messageId, 'none')
     : baseQuoteAndBotContext + initialCodexAppApplicationContext
-      + stripCrossPrincipalAsToken(parsed.content).text;
+      + stripCrossPrincipalAsToken(turnContent).text;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
   if (!prepared && !ctx.cascadeBodyReentry && !ctx.completionProposalContinuation) {
