@@ -135,6 +135,9 @@ describe('mcode ACP wire client', () => {
       return { action: 'accept', content: { answer: `answer-${index}` } };
     });
     try {
+      // Each question must be visible to a separate reader. WAL keeps those commits
+      // visible without a disk sync per fixture write under the protocol deadline.
+      f.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL');
       const run = runMinimaxAcp({ ...f.options, content: `native-questions-${count}`, onUserInput: input,
         onUpdate(update) {
           if (!update.toolCallId?.startsWith('questionnaire-')) return;
