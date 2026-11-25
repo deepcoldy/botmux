@@ -1089,21 +1089,27 @@ export class BridgeTurnQueue {
     onTurnDurationAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
   ): void {
     if (sourceJsonlPath && events.length > 0) this.onEventsRead?.(events, sourceJsonlPath);
-    let prevBatchUuid = this.lastSeenRecordUuid;
+    let batchMadeUuidProgress = false;
     for (const ev of events) {
       if (ev.type === 'queue-operation') {
         this.observeCliQueueOperation(ev);
         continue;
       }
       if (isMainThreadApiRequestEvent(ev)) {
-        const apiKey = typeof ev.id === 'string' && ev.id.length > 0
+        const hasStableId = typeof ev.id === 'string' && ev.id.length > 0;
+        const apiKey = hasStableId
           ? `id:${ev.id}`
           : typeof ev.timestamp === 'string' && ev.timestamp.length > 0
-            ? `ts:${ev.timestamp}:${prevBatchUuid}:${sourceJsonlPath ?? ''}`
+            ? `ts:${ev.timestamp}:${sourceJsonlPath ?? ''}`
             : undefined;
-        // Skip completely unkeyed records so replay stays strictly idempotent.
-        if (!apiKey || this.seenApiRequestKeys.has(apiKey)) continue;
-        addBoundedKey(this.seenApiRequestKeys, apiKey, MAX_SEEN_API_REQUEST_KEYS);
+        // An id-less request is distinguishable from a same-timestamp successor
+        // only when this batch also contains NEW uuid progress. Without such
+        // progress, treat timestamp+path as a replay key: using the mutable
+        // lastSeenRecordUuid made the same request gain a fresh key whenever a
+        // replay batch started at the request after later records had landed.
+        const seen = !!apiKey && this.seenApiRequestKeys.has(apiKey);
+        if (!apiKey || (seen && (hasStableId || !batchMadeUuidProgress))) continue;
+        if (!seen) addBoundedKey(this.seenApiRequestKeys, apiKey, MAX_SEEN_API_REQUEST_KEYS);
         this.apiRequestObservedInGeneration = true;
         if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
           const live = this.liveStateFor(this.collecting);
@@ -1116,11 +1122,11 @@ export class BridgeTurnQueue {
       }
       const uuid = ev.uuid;
       if (typeof uuid === 'string' && uuid.length > 0) {
-        prevBatchUuid = uuid;
         this.lastSeenRecordUuid = uuid;
       }
       if (!uuid || this.seen.has(uuid)) continue;
       this.seen.add(uuid);
+      batchMadeUuidProgress = true;
       if ((ev as any).isSidechain === true) {
         if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
           const live = this.liveStates.get(this.collecting);

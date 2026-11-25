@@ -3841,5 +3841,23 @@ describe('BridgeTurnQueue open-turn evidence, interrupts, and Scenario 3 unobser
       expect(q.getOpenTurnEvidence(q.openLiveNonLocalTurn()!).apiRequestInFlight).toBe(true);
     }
   });
+
+  it('does not recount an id-less api-request when a replay batch starts at the request', () => {
+    const q = new BridgeTurnQueue();
+    const timestamp = '2026-11-25T00:00:00.000Z';
+    const request = { type: 'api-request', querySource: 'repl_main_thread', timestamp };
+    q.mark('om_api_replay', makeFingerprint('api replay'), Date.now(), 'api replay');
+    q.ingest([
+      mkUser('u1', 'api replay'),
+      request,
+      mkAssistant('a1', 'u1', [{ type: 'text', text: 'streaming' }], null),
+    ], '/t/s.jsonl');
+    const head = q.openLiveNonLocalTurn()!;
+    const before = q.getOpenTurnEvidence(head).activitySeq;
+
+    q.ingest([request], '/t/s.jsonl');
+
+    expect(q.getOpenTurnEvidence(head).activitySeq).toBe(before);
+  });
 });
 
