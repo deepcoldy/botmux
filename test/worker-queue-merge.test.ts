@@ -1,6 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import {
   handoffQueuedDurableInputsOnBackendExit,
+  inputForcesSerialTurn,
   mergeQueuedCliInput,
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
@@ -51,6 +54,49 @@ describe('mergeQueuedCliInput', () => {
       trustedCaller: { requestUserUnionId: 'on_b', requestLarkAppId: 'app', senderType: 'user' as const },
     })).toBe(false);
     expect(pending).toHaveLength(1);
+  });
+
+  it('never merges different source tasks from the same reply bot', () => {
+    const caller = (openId: string, sourceTurnId: string) => ({
+      requestUserOpenId: 'ou_reply_bot', requestUserUnionId: 'on_reply_bot',
+      requestLarkAppId: 'app', senderType: 'bot' as const,
+      taskContinuation: {
+        appId: 'app', openId, sourceSessionId: 'source-session', sourceTurnId,
+      },
+    });
+    const pending = [{
+      content: 'task A result', turnId: 'om_reply_a',
+      trustedCaller: caller('ou_human_a', 'om_source_a'),
+    }];
+
+    expect(mergeQueuedCliInput(pending, {
+      content: 'task B result', turnId: 'om_reply_b',
+      trustedCaller: caller('ou_human_b', 'om_source_b'),
+    })).toBe(false);
+    expect(pending).toEqual([{
+      content: 'task A result', turnId: 'om_reply_a',
+      trustedCaller: caller('ou_human_a', 'om_source_a'),
+    }]);
+  });
+
+  it('retains ordinary merge behavior for the exact same continuation principal', () => {
+    const trustedCaller = {
+      requestUserOpenId: 'ou_reply_bot', requestUserUnionId: 'on_reply_bot',
+      requestLarkAppId: 'app', senderType: 'bot' as const,
+      taskContinuation: {
+        appId: 'app', openId: 'ou_human', sourceSessionId: 'source-session',
+        sourceTurnId: 'om_source',
+      },
+    };
+    const pending = [{ content: 'first', turnId: 'om_reply_a', trustedCaller }];
+
+    expect(mergeQueuedCliInput(pending, {
+      content: 'second', turnId: 'om_reply_b',
+      trustedCaller: { ...trustedCaller, taskContinuation: { ...trustedCaller.taskContinuation } },
+    })).toBe(true);
+    expect(pending[0]).toMatchObject({
+      content: 'first\n\nsecond', turnId: 'om_reply_b', trustedCaller,
+    });
   });
 
   it('never merges across a durable envelope boundary in either direction', () => {
@@ -117,6 +163,128 @@ describe('mergeQueuedCliInput', () => {
       turnId: 'im-2',
       vcMeetingImTurnOrigin: { ...imOrigin, larkMessageId: 'im-2' },
     })).toBe(true);
+  });
+});
+
+describe('inputForcesSerialTurn', () => {
+  const continuationCaller = {
+    requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'app', senderType: 'bot' as const,
+    taskContinuation: {
+      appId: 'app', openId: 'ou_human', sourceSessionId: 'source-session', sourceTurnId: 'om_source',
+    },
+  };
+
+  it('keeps an explicitly serial input serial', () => {
+    expect(inputForcesSerialTurn({ queueAfterActiveTurn: true })).toBe(true);
+  });
+
+  it('forces a serial boundary from the continuation principal even without the flag', () => {
+    expect(inputForcesSerialTurn({ trustedCaller: continuationCaller })).toBe(true);
+    expect(inputForcesSerialTurn({
+      queueAfterActiveTurn: true,
+      trustedCaller: continuationCaller,
+    })).toBe(true);
+  });
+
+  it('leaves ordinary inputs on the normal type-ahead path', () => {
+    expect(inputForcesSerialTurn({})).toBe(false);
+    expect(inputForcesSerialTurn({
+      trustedCaller: { requestUserOpenId: 'ou_human', requestLarkAppId: 'app', senderType: 'user' as const },
+    })).toBe(false);
+    expect(inputForcesSerialTurn({
+      trustedCaller: { requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'app', senderType: 'bot' as const },
+    })).toBe(false);
+  });
+
+  it('serializes callerless input while a continuation owns the active turn', () => {
+    expect(inputForcesSerialTurn({}, continuationCaller)).toBe(true);
+    expect(inputForcesSerialTurn({
+      trustedCaller: { requestUserOpenId: 'ou_other', requestLarkAppId: 'app', senderType: 'user' as const },
+    }, continuationCaller)).toBe(true);
+    expect(inputForcesSerialTurn({}, {
+      requestUserOpenId: 'ou_human', requestLarkAppId: 'app', senderType: 'user' as const,
+    })).toBe(false);
+  });
+});
+
+describe('sendToPty serial admission', () => {
+  it('tags callerless input as serial at the real non-adopt write boundary', () => {
+    const activeTurnAuthority = new ActiveTurnAuthority();
+    const activeCaller = {
+      requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'app', senderType: 'bot' as const,
+      taskContinuation: {
+        appId: 'app', openId: 'ou_human_a', sourceSessionId: 'source', sourceTurnId: 'om_source_a',
+      },
+    };
+    expect(activeTurnAuthority.reserve({ turnId: 'om_active_a', caller: activeCaller })).toBe(true);
+    expect(activeTurnAuthority.markStarted({ turnId: 'om_active_a', caller: activeCaller })).toBe(true);
+    const pendingMessages: any[] = [];
+    const sendToPty = loadWorkerFunction<(content: string, turnId?: string, opts?: any) => boolean>('sendToPty', {
+      rememberTurnLinkRefMode: () => {},
+      inputForcesSerialTurn,
+      activeTurnAuthority,
+      traexAutoModelRuntimeEligible: () => false,
+      traexAutoModelController: undefined,
+      pendingMessages,
+      // Stop immediately after the item is materialized; the queue envelope is
+      // the behavior under test, not a real backend write.
+      initPromptMaterialized: false,
+      log: () => {},
+    });
+
+    expect(sendToPty('unverified follow-up', 'om_followup_b')).toBe(true);
+    expect(pendingMessages).toHaveLength(1);
+    expect(pendingMessages[0]).toMatchObject({
+      turnId: 'om_followup_b', queueAfterActiveTurn: true,
+    });
+  });
+});
+
+describe('daemon-message serial admission', () => {
+  it('normalizes a promoted continuation before the IPC authority precheck', async () => {
+    const activeTurnAuthority = new ActiveTurnAuthority();
+    const activeCaller = {
+      requestUserOpenId: 'ou_other', requestLarkAppId: 'app', senderType: 'user' as const,
+    };
+    expect(activeTurnAuthority.reserve({ turnId: 'om_running', caller: activeCaller })).toBe(true);
+    expect(activeTurnAuthority.markStarted({ turnId: 'om_running', caller: activeCaller })).toBe(true);
+    const sendToPty = vi.fn(() => true);
+    const sent: any[] = [];
+    const scope: Record<string, any> = {
+      activeTurnAuthority,
+      inputForcesSerialTurn,
+      crossPrincipalIsolationOn: () => true,
+      lastInitConfig: { adoptMode: false, cliId: 'claude-code' },
+      restoredDeploymentTurnId: undefined,
+      backend: {}, crashDiagnosticStopped: false,
+      discardDeploymentContinuation: vi.fn(), applyWorkerLaunchModel: vi.fn(),
+      applyRespawnConfigPatch: vi.fn(), respawnConfigPatchFromMessage: vi.fn(() => ({})),
+      finalHandoffAdmissionEnabled: false,
+      isOrdinaryImTurnId: () => false,
+      tmuxScrolledHalfPages: 0,
+      sendToPty,
+      deferTurnInputCommitUntilSubmission: () => false,
+      acknowledgeTurnInputCommitted: vi.fn(),
+      send: (msg: any) => sent.push(msg),
+      log: vi.fn(),
+    };
+    scope.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', scope);
+    scope.activeTurnBlocks = loadWorkerFunction('activeTurnBlocks', scope);
+    const receive = loadWorkerFunction<(raw: unknown) => Promise<void>>('handleContractDaemonMessage', scope);
+
+    await receive({
+      type: 'message', content: 'promoted tail', turnId: 'om_promoted',
+      trustedCaller: {
+        requestUserOpenId: 'ou_receipt_bot', requestLarkAppId: 'app', senderType: 'bot',
+        taskContinuation: {
+          appId: 'app', openId: 'ou_source_human', sourceSessionId: 'source', sourceTurnId: 'om_source',
+        },
+      },
+    });
+
+    expect(sent.filter(msg => msg.type === 'turn_input_rejected')).toEqual([]);
+    expect(sendToPty).toHaveBeenCalledOnce();
+    expect(sendToPty.mock.calls[0]?.[2]).toMatchObject({ queueAfterActiveTurn: true });
   });
 });
 

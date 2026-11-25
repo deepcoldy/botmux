@@ -150,7 +150,12 @@ export interface StructuredSubmitLifecycleController {
     dispatchAttempt?: number,
     expectedSourceSessionId?: string,
   ): boolean;
-  confirmPendingTurn(turnId: string, confirmedAtMs?: number, dispatchAttempt?: number): boolean;
+  confirmPendingTurn(
+    turnId: string,
+    confirmedAtMs?: number,
+    dispatchAttempt?: number,
+    options?: { weak?: boolean },
+  ): boolean;
   finishSubmitVerification(turnId: string, finishedAtMs?: number, dispatchAttempt?: number): boolean;
 }
 
@@ -298,7 +303,10 @@ export async function settleDeferredSubmitConfirmation(
   let lifecycle: DeferredSubmitConfirmationSettlement['lifecycle'] = 'unchanged';
   if (input.structuredTarget && input.turnId) {
     if (action.kind === 'suppress-confirmed' || action.kind === 'suppress-active') {
-      if (controller.confirmPendingTurn(input.turnId, undefined, input.dispatchAttempt)) {
+      const confirmOptions = action.kind === 'suppress-active' && action.evidence === 'pty-output'
+        ? { weak: true }
+        : undefined;
+      if (controller.confirmPendingTurn(input.turnId, undefined, input.dispatchAttempt, confirmOptions)) {
         lifecycle = 'confirmed';
       } else if (controller.finishSubmitVerification(input.turnId, undefined, input.dispatchAttempt)) {
         lifecycle = 'verification-finished';

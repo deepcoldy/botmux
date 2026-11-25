@@ -121,12 +121,16 @@ import { nextStepIo } from '../src/core/next-step-io.js';
 import { recapIdle } from '../src/core/turn-recap-state.js';
 import { notifyAwaySummaryFocusRevoked } from '../src/services/away-summary-focus-revocation.js';
 import { claudeAwaySummaryText } from '../src/services/turn-recap.js';
+import { outputDeliveryJournal } from '../src/services/output-delivery-journal.js';
+import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
+import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 
 const sessions: DaemonSession[] = [];
+let terminalPersistGate: Promise<void> | undefined;
 
 // A real sample (test/fixtures/turn-recap/README.md): an away summary Claude
 // Code wrote into its transcript.
@@ -216,6 +220,7 @@ const sessionReplyMock = vi.fn(async () => 'om_terminal_receipt');
 
 describe('independent turn terminal receipt', () => {
   beforeEach(() => {
+    terminalPersistGate = undefined;
     for (const key of Object.keys(botConfig)) delete botConfig[key];
     Object.assign(botConfig, {
       // The receipt strip is the send-delivery UI contract; traex / claude-code /
@@ -232,6 +237,7 @@ describe('independent turn terminal receipt', () => {
       getSessionWorkingDir: () => '/tmp',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
+      onTurnTerminal: () => terminalPersistGate,
     } as any);
   });
 
@@ -262,6 +268,222 @@ describe('independent turn terminal receipt', () => {
     expect(call[5]?.replyTarget).toEqual({ mode: 'thread', rootMessageId: 'om_exact_root' });
     expect(call[5]?.uuid).toMatch(/^tr_[0-9a-f]{47}$/);
   });
+
+  it.each([
+    ['empty_answer', 'progress'],
+    ['nothing_to_send', 'older-attempt'],
+    ['nothing_to_send', 'exact-final'],
+  ] as const)('settles a required %s only with the exact final receipt (%s)', async (outputDisposition, prior) => {
+    const ds = makeDs();
+    const turnId = `om_required_${prior}`;
+    bindLarkTurn(ds, turnId, 'om_newer_route');
+    const appId = ds.larkAppId;
+    const sessionId = ds.session.sessionId;
+    ds.initConfig = { finalOutputHandoff: { version: 2, token: 'trial', frozenImOnly: true } } as DaemonSession['initConfig'];
+    const target = { mode: 'thread', rootMessageId: 'om_original_topic' } as const;
+    outputDeliveryJournal(dataDir, appId).rememberSink(sessionId, turnId,
+      { kind: 'im', context: { target }, chatId: ds.chatId, chatType: ds.chatType, answerRequired: true });
+    const ledger = new TurnSendLedger(dataDir);
+    await ledger.execute({ larkAppId: appId, sessionId, turnId, dispatchAttempt: prior === 'older-attempt' ? 1 : 2 },
+      prior === 'progress' ? 'progress' : 'final', prior, async () => 'om_already_visible');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const terminal = terminalMsg(turnId, { dispatchAttempt: 2, outputDisposition });
+
+    await deliver(ds, terminal, terminal);
+    await settle(ds);
+
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    if (prior === 'exact-final') {
+      expect(sessionReplyMock).not.toHaveBeenCalled();
+    } else {
+      expect(sessionReplyMock).toHaveBeenCalledExactlyOnceWith(expect.anything(),
+        expect.stringMatching(/未生成可交付答复|without an answer to deliver/), 'text', appId, turnId,
+        expect.objectContaining({ replyTarget: target, sourceSessionId: sessionId }));
+    }
+  });
+
+  it('waits for background zero before reporting an empty required reply', async () => {
+    const ds = makeDs();
+    const turnId = 'om_required_background_empty';
+    bindLarkTurn(ds, turnId, 'om_original_topic');
+    const appId = ds.larkAppId;
+    const sessionId = ds.session.sessionId;
+    ds.initConfig = { finalOutputHandoff: { version: 2, token: 'trial', frozenImOnly: true } } as DaemonSession['initConfig'];
+    const target = { mode: 'thread', rootMessageId: 'om_original_topic' } as const;
+    ds.lastScreenStatus = 'working';
+    ds.lastScreenContent = 'working';
+    ds.workerReady = true;
+    ds.activeTurnId = turnId;
+    ds.activeDispatchAttempt = 2;
+    outputDeliveryJournal(dataDir, appId).rememberSink(sessionId, turnId,
+      { kind: 'im', context: { target }, chatId: ds.chatId, chatType: ds.chatType, answerRequired: true });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    await deliver(ds, terminalMsg(turnId, {
+      dispatchAttempt: 2,
+      outputDisposition: 'empty_answer',
+      backgroundTasks: 1,
+    }));
+    await settle(ds);
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect([...ds.requiredReplyCotHolds!.values()]).toEqual([{
+      turnId,
+      dispatchAttempt: 2,
+      finishStatus: 'failed',
+      replyPending: false,
+      backgroundPending: true,
+    }]);
+    expect([...ds.pendingRequiredReplyMissingReceipts!.values()]).toEqual([
+      expect.objectContaining({ turnId, dispatchAttempt: 2 }),
+    ]);
+
+    await deliver(ds, {
+      type: 'screen_update',
+      content: 'ready',
+      status: 'idle',
+      // The tracker is worker-wide: by the time it drains, a newer turn may
+      // own the screen tuple. The older empty required turn must still close.
+      turnId: 'om_newer_screen_turn',
+      dispatchAttempt: 1,
+    } as WorkerToDaemon);
+    await settle(ds);
+
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(ds.requiredReplyCotHolds).toBeUndefined();
+    expect(ds.pendingRequiredReplyMissingReceipts).toBeUndefined();
+    expect(sessionReplyMock).toHaveBeenCalledExactlyOnceWith(expect.anything(),
+      expect.stringMatching(/未生成可交付答复|without an answer to deliver/), 'text', appId, turnId,
+      expect.objectContaining({ replyTarget: target, sourceSessionId: sessionId }));
+  });
+
+  it('retries a failed missing-reply notice when the same terminal is replayed after background zero', async () => {
+    const ds = makeDs();
+    const turnId = 'om_required_background_replay';
+    bindLarkTurn(ds, turnId, 'om_original_topic');
+    ds.initConfig = { finalOutputHandoff: { version: 2, token: 'trial', frozenImOnly: true } } as DaemonSession['initConfig'];
+    ds.lastScreenStatus = 'working';
+    ds.lastScreenContent = 'working';
+    ds.workerReady = true;
+    ds.activeTurnId = turnId;
+    ds.activeDispatchAttempt = 2;
+    const target = { mode: 'thread', rootMessageId: 'om_original_topic' } as const;
+    outputDeliveryJournal(dataDir, ds.larkAppId).rememberSink(ds.session.sessionId, turnId,
+      { kind: 'im', context: { target }, chatId: ds.chatId, chatType: ds.chatType, answerRequired: true });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    sessionReplyMock.mockRejectedValueOnce(new Error('first notice failed'))
+      .mockResolvedValueOnce('om_missing_retry' as any);
+
+    await deliver(ds, terminalMsg(turnId, {
+      dispatchAttempt: 2, outputDisposition: 'empty_answer', backgroundTasks: 1,
+    }));
+    await deliver(ds, {
+      type: 'screen_update', content: 'ready', status: 'idle',
+      turnId: 'om_newer_screen_turn', dispatchAttempt: 1,
+    } as WorkerToDaemon);
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(ds.silentReceiptTurnIds?.has(turnId)).not.toBe(true));
+
+    await deliver(ds, terminalMsg(turnId, {
+      dispatchAttempt: 2, outputDisposition: 'empty_answer', backgroundTasks: 1,
+    }));
+
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(2));
+    expect(ds.pendingRequiredReplyMissingReceipts).toBeUndefined();
+  });
+
+  it('cancels a missing-reply notice at beforeWrite when the exact final wins the race', async () => {
+    const ds = makeDs();
+    const turnId = 'om_required_before_write_race';
+    bindLarkTurn(ds, turnId, 'om_original_topic');
+    const appId = ds.larkAppId;
+    const sessionId = ds.session.sessionId;
+    ds.initConfig = { finalOutputHandoff: { version: 2, token: 'trial', frozenImOnly: true } } as DaemonSession['initConfig'];
+    const target = { mode: 'thread', rootMessageId: 'om_original_topic' } as const;
+    outputDeliveryJournal(dataDir, appId).rememberSink(sessionId, turnId,
+      { kind: 'im', context: { target }, chatId: ds.chatId, chatType: ds.chatType, answerRequired: true });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const ledger = new TurnSendLedger(dataDir);
+    let providerEffects = 0;
+    sessionReplyMock.mockImplementationOnce(async (...args: any[]) => {
+      await ledger.execute({ larkAppId: appId, sessionId, turnId, dispatchAttempt: 2 },
+        'final', 'real answer', async () => 'om_real_answer');
+      await args[5]?.beforeWrite?.();
+      providerEffects++;
+      return 'om_false_missing';
+    });
+
+    await deliver(ds, terminalMsg(turnId, {
+      dispatchAttempt: 2, outputDisposition: 'empty_answer',
+    }));
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledOnce());
+    await settle(ds);
+
+    expect(providerEffects).toBe(0);
+    expect(ds.silentReceiptTurnIds?.has(turnId)).toBe(true);
+    await deliver(ds, terminalMsg(turnId, {
+      dispatchAttempt: 2, outputDisposition: 'empty_answer',
+    }));
+    await settle(ds);
+    expect(sessionReplyMock).toHaveBeenCalledOnce();
+  });
+
+  it.each(['background_zero', 'cli_loss'] as const)(
+    'does not lose an empty required reply notice when %s races terminal persistence', async settlement => {
+      const ds = makeDs();
+      const turnId = `om_required_race_${settlement}`;
+      bindLarkTurn(ds, turnId, 'om_original_topic');
+      const appId = ds.larkAppId;
+      const sessionId = ds.session.sessionId;
+      ds.initConfig = { finalOutputHandoff: { version: 2, token: 'trial', frozenImOnly: true } } as DaemonSession['initConfig'];
+      const target = { mode: 'thread', rootMessageId: 'om_original_topic' } as const;
+      ds.lastScreenStatus = 'working';
+      ds.lastScreenContent = 'working';
+      ds.workerReady = true;
+      ds.activeTurnId = turnId;
+      ds.activeDispatchAttempt = 2;
+      outputDeliveryJournal(dataDir, appId).rememberSink(sessionId, turnId,
+        { kind: 'im', context: { target }, chatId: ds.chatId, chatType: ds.chatType, answerRequired: true });
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      let releasePersist!: () => void;
+      terminalPersistGate = new Promise<void>(resolve => { releasePersist = resolve; });
+
+      const terminalDelivery = deliver(ds, terminalMsg(turnId, {
+        dispatchAttempt: 2,
+        outputDisposition: 'empty_answer',
+        backgroundTasks: 1,
+      }));
+      await vi.waitFor(() => {
+        expect(ds.requiredReplyCotHolds?.size).toBe(1);
+        expect(ds.pendingRequiredReplyMissingReceipts?.size).toBe(1);
+      });
+
+      if (settlement === 'background_zero') {
+        await deliver(ds, {
+          type: 'screen_update', content: 'ready', status: 'idle',
+          turnId: 'om_newer_screen_turn', dispatchAttempt: 1,
+        } as WorkerToDaemon);
+      } else {
+        const settleCliLoss = loadWorkerPoolFunction<(session: DaemonSession) => boolean>(
+          'settleBackgroundStateOnCliLoss',
+          { finalizeCotMessage: vi.fn() },
+        );
+        settleCliLoss(ds);
+      }
+      expect(ds.requiredReplyCotHolds).toBeUndefined();
+      expect(ds.pendingRequiredReplyMissingReceipts).toBeUndefined();
+      expect(sessionReplyMock).not.toHaveBeenCalled();
+
+      releasePersist();
+      await terminalDelivery;
+      await settle(ds);
+
+      expect(sessionReplyMock).toHaveBeenCalledExactlyOnceWith(expect.anything(),
+        expect.stringMatching(/未生成可交付答复|without an answer to deliver/), 'text', appId, turnId,
+        expect.objectContaining({ replyTarget: target, sourceSessionId: sessionId }));
+      expect(ds.pendingRequiredReplyMissingReceipts).toBeUndefined();
+    },
+  );
 
   it('posts no completed strip while the turn ended with background tasks running', async () => {
     const ds = makeDs();

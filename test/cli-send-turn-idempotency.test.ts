@@ -56,6 +56,31 @@ function createFixture(
 }
 
 describe('botmux send per-turn final idempotency', () => {
+  it('accepts a durable final for the current turn at its exact frozen destination', () => {
+    const turnId = 'om_turn_idempotency';
+    const f = createFixture(undefined, {
+      turnReplyContexts: {
+        [turnId]: { target: { mode: 'thread', rootMessageId: 'om_original_topic' } },
+      },
+    }, turnId);
+    try {
+      new TurnSendLedger(f.dataDir).enableHandoffFence({
+        larkAppId: 'cli_test', sessionId: f.sessionId, turnId,
+      }, true);
+
+      const attempt = f.run('final', 'answer');
+
+      expect(attempt.result.status, String(attempt.result.stderr)).toBe(0);
+      expect(attempt.requests).toHaveLength(1);
+      expect(attempt.requests[0]).toContain('/im/v1/messages/om_original_topic/reply');
+
+      const override = f.run('final', 'answer', ['--top-level']);
+      expect(override.result.status).toBe(2);
+      expect(override.requests).toHaveLength(0);
+      expect(String(override.result.stderr)).toContain('bound to the original conversation');
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 30_000);
+
   it('does not reserve or publish when a thread source has no message identity', () => {
     const f = createFixture('stop', { rootMessageId: '' });
     try {

@@ -17,6 +17,8 @@ import { cotMessageFinishStatus } from '../../src/im/lark/cot-message.js';
 import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
 import { ProtectedResultStore } from '../../src/services/protected-result-store.js';
 import { hasProtectedSessionMutationOwnership, protectedSessionMutationReasons } from '../../src/core/session-mutation-guard.js';
+import { parseScheduledTurnId } from '../../src/core/scheduled-turn-provenance.js';
+import { scheduledSessionRun } from '../../src/core/scheduled-send.js';
 
 /** deliverFinalOutput's protected final gate reads `config.session.dataDir` and
  * constructs ProtectedResultStore. Sliced closures do not load module imports,
@@ -65,6 +67,8 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'traexRuntimeDeferredNotice') return scope[key] ??= new Map();
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
+  if (key === 'parseScheduledTurnId') return parseScheduledTurnId;
+  if (key === 'scheduledSessionRun') return scheduledSessionRun;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'cotMessageFinishStatus') return cotMessageFinishStatus;
   if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
@@ -89,11 +93,14 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'ProtectedResultStore') return ProtectedResultStore;
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
+  if (key === 'collectSessionTurnGarbage') return () => {};
   if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
     'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
     'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage',
-    'clearWorkerRuntimeProvenance', 'hasInstallChangeMutationOwnership', 'hasInstallChangeSuspendGuard'].includes(key)) {
+    'requiredReplyCotHoldKey', 'settleRequiredReplyBackground', 'settleRequiredReplyCotMessage',
+    'failRequiredReplyCotHolds', 'clearWorkerRuntimeProvenance',
+    'hasInstallChangeMutationOwnership', 'hasInstallChangeSuspendGuard'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];

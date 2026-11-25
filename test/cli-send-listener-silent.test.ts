@@ -114,6 +114,7 @@ describe('other source-group write paths from silent listener tasks', () => {
 
   it.each([
     ['top-notice through another source-group session', ['top-notice', 'set', 'om_human', '--session-id', 'human', '--json']],
+    ['top-notice via --bot in the source group', ['top-notice', 'set', 'om_human', '--bot', 'cli_other', '--chat-id', 'oc_test', '--json']],
     ['tabs add in the source group', ['tabs', 'add', 'https://example.com/doc', '--name', 'progress', '--json']],
     ['tabs update in the source group', ['tabs', 'update', 'tab_1', '--name', 'progress', '--json']],
     ['tabs remove through another source-group session', ['tabs', 'remove', 'tab_1', '--session-id', 'human', '--json']],
@@ -126,6 +127,42 @@ describe('other source-group write paths from silent listener tasks', () => {
       expect(chatRequests(result.stdout)).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks top-notice --bot cleanly (with JSON error, no stack trace) even when BOTMUX_LARK_APP_ID or env session is tampered', () => {
+    for (const [label, extraEnv] of [
+      ['tampered BOTMUX_LARK_APP_ID', { BOTMUX_LARK_APP_ID: 'cli_fake' }],
+      ['unset BOTMUX_SESSION_ID with live ancestor marker + fake appId', { BOTMUX_SESSION_ID: '', BOTMUX_LARK_APP_ID: 'cli_fake' }],
+    ] as Array<[string, Record<string, string>]>) {
+      const { root, result } = spawnInSilentSession(
+        ['top-notice', 'set', 'om_human', '--bot', 'cli_other', '--chat-id', 'oc_test', '--json'],
+        { BOTMUX_TEST_CAPTURE_HTTP: '1', ...extraEnv },
+      );
+      try {
+        expect(result.status, label).toBe(1);
+        expect(result.stderr, label).toContain('silent_message_listener');
+        expect(result.stderr, label).not.toContain('at cmdTopNotice');
+        expect(JSON.parse(result.stdout.trim()), label).toMatchObject({
+          ok: false,
+          chatId: 'oc_test',
+          larkAppId: 'cli_other',
+        });
+        expect(chatRequests(result.stdout), label).toEqual([]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+    // Conflicting BOTMUX_SESSION_ID against live ancestor marker is refused even earlier by the managed-origin gate (exit 2).
+    const conflict = spawnInSilentSession(
+      ['top-notice', 'set', 'om_human', '--bot', 'cli_other', '--chat-id', 'oc_test', '--json'],
+      { BOTMUX_TEST_CAPTURE_HTTP: '1', BOTMUX_SESSION_ID: 'missing-sid' },
+    );
+    try {
+      expect(conflict.result.status).toBe(2);
+      expect(chatRequests(conflict.result.stdout)).toEqual([]);
+    } finally {
+      rmSync(conflict.root, { recursive: true, force: true });
     }
   });
 

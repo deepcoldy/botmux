@@ -20,7 +20,9 @@ import {
   backgroundTaskDispatchToolUseIds,
   backgroundTaskLaunches,
   backgroundTaskSettledIds,
+  isClaudeApiRequestBlob,
   isClaudeTurnTerminalEvent,
+  isClaudeUserInterruptEvent,
   isMeaningfulQueuedCommand,
   isMeaningfulUserEvent,
   isScheduledTurnStartEvent,
@@ -225,7 +227,7 @@ export function claudeInterruptedWork(
   };
 
   for (const ev of events) {
-    if (!ev || typeof ev !== 'object' || ev.isSidechain === true) continue;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) continue;
     const atMs = eventTimeMs(ev);
     // Untimestamped lines are Claude Code's own bookkeeping (titles, modes,
     // snapshots), not conversation; anything at/after the launch is the new
@@ -245,7 +247,7 @@ export function claudeInterruptedWork(
     }
 
     const role = ev.message?.role ?? ev.type;
-    if (role === 'user' && typeof (ev as { interruptedMessageId?: unknown }).interruptedMessageId === 'string') {
+    if (isClaudeUserInterruptEvent(ev)) {
       turnOpen = false;
     } else if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev) || isScheduledTurnStartEvent(ev)) {
       turnOpen = true;

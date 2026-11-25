@@ -933,6 +933,15 @@ describe('activeTurnSilentSchedule projection and SSE updates', () => {
       await screenUpdate('working', 2, { turnId: 'schedule:poll:process-retire' });
       expect(composeRowFromActive(ds, { includeTokenUsage: false }).activeTurnSilentSchedule).toBe(true);
       expect(ds.backgroundTaskCount).toBe(2);
+      const publishMissing = vi.fn();
+      const requiredKey = 'om_required_retire\0' + 3;
+      ds.requiredReplyCotHolds = new Map([[requiredKey, {
+        turnId: 'om_required_retire', dispatchAttempt: 3, finishStatus: 'failed',
+        replyPending: false, backgroundPending: true,
+      }]]);
+      ds.pendingRequiredReplyMissingReceipts = new Map([[requiredKey, {
+        turnId: 'om_required_retire', dispatchAttempt: 3, publish: publishMissing,
+      }]]);
       patches.length = 0;
 
       // The mocked worker never emits `exit`, matching the race where the
@@ -940,6 +949,9 @@ describe('activeTurnSilentSchedule projection and SSE updates', () => {
       retireWorkerProcessOnly(ds, 'process-retire-regression');
 
       expect(composeRowFromActive(ds, { includeTokenUsage: false }).backgroundTaskCount).toBeUndefined();
+      expect(ds.requiredReplyCotHolds).toBeUndefined();
+      expect(ds.pendingRequiredReplyMissingReceipts).toBeUndefined();
+      expect(publishMissing).toHaveBeenCalledOnce();
       expect(patches.at(-1)).toEqual({
         status: 'dormant', activeTurnSilentSchedule: false, backgroundTaskCount: null,
       });

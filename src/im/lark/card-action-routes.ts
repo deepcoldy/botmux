@@ -13,8 +13,9 @@
  * - v3 路由：6 个谓词按原顺序逐个试，命中即返回；对应 deps 未接线时 run() 返回 undefined
  *   （与原 `if (!deps.xxx) return;` 一致）。它们在通用敏感动作权限门**之前**——
  *   v3 卡 value 没有 root_id/session_id，权限由各自 handler 的 binding 校验兜底。
- * - 敏感动作：只管「哪些 action 过 canOperate 门」以及门的两处例外（拒绝时给 toast、
- *   pendingRepo 阶段发起人放行）；门本身的判定流程仍在 card-handler.ts。
+ * - 敏感动作：只管「哪些 action 过 canOperate 门」以及门的三处例外（拒绝时给 toast、
+ *   pendingRepo 阶段发起人放行、话题会话发起人关闭自己的会话）；门本身的判定流程仍在
+ *   card-handler.ts。
  */
 import { localeForBot, type Locale } from '../../i18n/index.js';
 import { CLEANUP_SESSION_WORKTREE_ACTION } from './session-worktree-cleanup-card.js';
@@ -245,6 +246,17 @@ export interface SensitiveCardActionMeta {
    * 所有后续会话），属管理动作，必须走 canOperate。
    */
   readonly pendingRepoOwnerException?: true;
+  /**
+   * 按话题划分的会话（thread scope，含私聊）的发起人可以不过 canOperate 放行——能开会话
+   * 的人也该能收尾。
+   * 只对 thread scope 生效：chat scope 是整个群（或整个私聊）共用一个会话，发起人只是
+   * 第一个 @ 的人，不单独拥有处置权。共享 adopt 会话也不适用：那上面 `close` 的含义是
+   * 断开接进来的外部 CLI，不是关掉自己开的会话。
+   * 不复查 canTalk：关闭不向 CLI 注入任何输入，只是终止这个会话自己正在跑的回合；而授权
+   * 到期 / 额度用完的访客恰恰最需要关掉自己留下的会话。
+   * durable primary 模式下走不到这里：`close` 在 dispatcher 里就按 canOperate 截住了。
+   */
+  readonly sessionOwnerException?: true;
 }
 
 const NO_META: SensitiveCardActionMeta = {};
@@ -260,7 +272,7 @@ const NO_META: SensitiveCardActionMeta = {};
 
 export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta> = new Map<string, SensitiveCardActionMeta>([
   ['restart', NO_META],
-  ['close', NO_META],
+  ['close', { sessionOwnerException: true }],
   ['resume', NO_META],
   // 会话关闭卡「清理 worktree」（#698）：删目录前还会在 handler 里按会话所在群复核一次。
   [CLEANUP_SESSION_WORKTREE_ACTION, { denyToastKey: 'card.worktree_cleanup.no_permission' }],

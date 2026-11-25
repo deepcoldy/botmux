@@ -124,9 +124,15 @@ export class TurnSendLedger {
 
   /** Host marks the exact admitted turn before its CLI can publish. This lets
    * matching CLI builds fence explicit finals even if launcher env is scrubbed. */
-  enableHandoffFence(key: TurnSendLedgerKey): void {
+  enableHandoffFence(key: TurnSendLedgerKey, originalImReply = false): void {
     this.ensureSessionDirectory(key);
-    atomicWriteFileSync(this.handoffFencePath(key), 'v1\n', { mode: 0o600, durable: true, followTargetSymlink: false });
+    if (!originalImReply && this.handoffFenced(key)) return;
+    atomicWriteFileSync(this.handoffFencePath(key), originalImReply ? 'v1-im\n' : 'v1\n',
+      { mode: 0o600, durable: true, followTargetSymlink: false });
+  }
+
+  requiresOriginalImReply(key: TurnSendLedgerKey): boolean {
+    return this.handoffFenced(key) && readFileSync(this.handoffFencePath(key), 'utf8') === 'v1-im\n';
   }
 
   private handoffFencePath(key: TurnSendLedgerKey): string {
@@ -226,6 +232,11 @@ export class TurnSendLedger {
   read(key: TurnSendLedgerKey): TurnSendLedgerRecord | undefined {
     const path = this.existingPath(key);
     return path ? this.readPath(path) : undefined;
+  }
+
+  readFinalForAttempt(key: TurnSendLedgerKey): TurnSendLedgerRecord['final'] {
+    const record = this.read(key);
+    return record?.dispatchAttempt === key.dispatchAttempt ? record?.final : undefined;
   }
 
   private write(key: TurnSendLedgerKey, record: TurnSendLedgerRecord): void {
@@ -455,6 +466,12 @@ export class TurnSendLedger {
     this.ensureSessionDirectory(key);
     return withFileLock(this.recordPath(key), async () => {
       const record = this.read(key) ?? { ...key, version: 1 as const };
+      if (kind === 'final' && (record.final || record.publication)
+        && record.dispatchAttempt !== key.dispatchAttempt && this.requiresOriginalImReply(key)) {
+        // The logical turn still owns only one provider effect. A receipt (or
+        // uncertain send) from an older execution cannot settle a new attempt.
+        throw new FinalPublicationUnknownError();
+      }
       if (!record.final && record.nonIdempotentSequence) {
         const step = record.nonIdempotentSequence.inFlightStep;
         if (step !== undefined) {
