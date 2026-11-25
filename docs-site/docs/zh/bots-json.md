@@ -343,7 +343,7 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 
 | 字段 | 说明 |
 |------|------|
-| `backendType` | 会话后端：`tmux`（默认）、`zellij`（≥ 0.44）、`herdr`、`zmx`、`hc`（仅 Linux，需显式选用并自备 herdr-core ≥ 0.1.19）、`pty`。tmux 这类持久后端在本机不可用时，会弹卡提示安装，不会悄悄降级成 pty。`pty` 只在显式指定时使用，daemon 重启后会话不保留。见 [tmux 后端](/tmux)、[ZMX 后端](/zmx)、[hc 后端](/hc) |
+| `backendType` | 会话后端：`tmux`（默认）、`zellij`（≥ 0.44）、`herdr`、`zmx`、`hc`（Linux / macOS，需显式选用并自备 herdr-core ≥ 0.1.19）、`pty`。tmux 这类持久后端在本机不可用时，会弹卡提示安装，不会悄悄降级成 pty。`pty` 只在显式指定时使用，daemon 重启后会话不保留。见 [tmux 后端](/tmux)、[ZMX 后端](/zmx)、[hc 后端](/hc) |
 | `launchShell` | 启动 CLI 用的 shell，覆盖 daemon 的 `$SHELL`。填 `zsh` / `bash` / `fish` / `sh` 或绝对路径。用在登录 shell 的 rc 文件里有 `exec zsh` 之类跳转、导致会话起不来（终端里出现 `parse error`）的情况。指定后，PATH、nvm 等要写在所选 shell 的 rc 文件里（fish 是 `~/.config/fish/config.fish`）。对 tmux / zellij / zmx / hc 的新会话生效 |
 | `lang` | 界面语言 `zh` / `en`；不填时看 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `p2pMode` | 私聊模式：`chat`（默认，一个连续会话）、`thread`（每条私聊消息开一个独立会话）、`group`（每条私聊消息自动建一个专属会话群）。见[群聊模式](/group) |
@@ -541,6 +541,7 @@ MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allo
 - 没授权过的人调用时，命令会被拒绝，拒绝信息里附带授权链接。AI 也会自己用 `botmux auth request` 把链接发给这个人（见 [Agent 自助发起授权](/cli-commands#agent-auth-request)），或者让他在话题里发 `/login`。授权完成后重试即可。
 - 绝不会退回到 Bot 或其他人的身份代跑，也没有「退回机器登录态」的选项。旧配置里的 `fallback` 字段会被忽略。`bytedcli` 没有 Bot 身份，没授权就是失败。
 - 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用[中心化平台](/platform) / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`allowSpeakerSwitch`（默认 `false`：设为 `true` 后，多人话题里才能在某一条命令前加 `BOTMUX_AS=<open_id>` 用本轮另一位发言人的身份执行；默认关闭时 `BOTMUX_AS` 一律被拒）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
+- 共享 Linux 开发机可设置 `triggerUserAuth.gitCommitIdentity: true`。会话 PATH 中的 Git 包装器会在每次执行 `commit`、`commit-tree`、`merge`、`cherry-pick`、`revert`、`rebase`、`am` 和 `pull` 时核验本轮触发人，用其邮箱作为默认作者与提交者。核验失败会拒绝这些操作（包括快进 pull）。Git 保留重放提交的原作者，显式指定身份仍按 Git 规则生效；受管路径上会清理环境中的 `GIT_AUTHOR_*` / `GIT_COMMITTER_*` 身份变量，shell 配置里的导出不能覆盖已核验的触发人。绝对路径与 Git 别名不在覆盖范围内。受管命令暂不支持 `BOTMUX_AS`，会拒绝执行；oncall 禁网或 slirp 隔离 daemon loopback 时，该组合会在会话启动时被拒绝。此项默认关闭，启动会话时生效，也可在 Dashboard 该 Bot 设置的「安全」区开关。
 
 #### 升级注意：旧格式授权要重新 `/login` {#legacy-user-token}
 
@@ -561,10 +562,11 @@ v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」�
 | `pinStreamingCard` | `true` 时自动置顶当前的实时状态卡，默认关闭。置顶失败不影响其它功能。单个群可以用 `/card pin off` 关掉 |
 | `cotEnabled` | 默认开启：用飞书原生「思考过程」消息实时展示模型的思考和工具调用。单个群可用 `/cot off` 关掉 |
 | `usageDisplay` | Context / Token 用量显示在哪：`streaming`（默认，实时卡正文）、`footer`（答复卡页脚）、`off`（不显示）。只影响显示，不影响用量统计。旧字段 `showUsageInCardFooter: false` 等同 `off` |
+| `showUsageQuota` | 是否在卡片用量行中显示 `5h` / `7d` 账号周期额度，默认开启；设 `false` 仅隐藏 `5h` / `7d`，仍保留上下文占用、token 统计、自定义扩展段与模型名。只影响显示，不影响后台额度检测 |
 | `cardFooterExtension` | 在用量后面追加几段自定义文字，内容来自你配置的命令：`{"command": "<命令>", "refreshSeconds": 60}`。命令交给 `/bin/sh -c` 执行，每个 bot 跑一份；`refreshSeconds` 默认 60，范围 10–3600。输出按行（或 `{"segments": [...]}`）取最多 4 段，每段最多 40 字。命令超过 3 秒算失败，失败时沿用上次结果，连续 10 分钟没成功就不显示。见[实时流式卡片](/cards) |
 | `brandLabel` | 卡片底部签名。不填显示默认的 `botmux` 链接；`""` 隐藏；其它文字原样显示（支持 markdown）。Dashboard「全局设置 → 飞书卡片」里的总开关关掉时，所有 bot 都不显示签名 |
 | `replyCardActions` | 普通答复卡上显示一个紧凑的操作菜单（打开终端 / 切换模型 / 关闭会话）。默认关闭 |
-| `askOptionLayout` | `botmux ask` 选项按钮的排布：`compact`（默认，自动换行）或 `vertical`（每行一个，长选项更好读） |
+| `askOptionLayout` | 已不影响排版：提问卡现在每个选项一行勾选框。旧值 `compact` / `vertical` 仍可保留，不会报错 |
 | `writableTerminalLinkInCard` | `true` 时卡片里直接放可写终端链接（看得到卡片的人都能操作终端）。默认藏在「获取写权限」按钮后面，只私发给点击的人 |
 | `goalStatusCard` | `true` 时，Codex / TRAE 会话设定原生目标后发一张目标状态卡，原地更新状态和 CLI 累计时长；默认关闭。静默、私有回复、文档、会议等会话不显示 |
 | `privateCard` | `true` 时 `/card` 只发给管理员可见的私有卡片，只在普通群有效，且不会实时刷新 |

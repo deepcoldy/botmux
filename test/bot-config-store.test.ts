@@ -509,6 +509,22 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.backendType).toBe('hc');
   });
 
+  it('defaults hc Herdr tabs off and round-trips the opt-in through live config and reload', async () => {
+    const { registry, store } = await loaded({ backendType: 'hc' });
+    const tabs = store.findConfigField('hcHerdrTabs')!;
+    expect(registry.getBot('app_default').config.hcHerdrTabs).toBeUndefined();
+
+    expect(await store.applyConfigField('app_default', tabs, true)).toMatchObject({ ok: true });
+    expect(readConfig().hcHerdrTabs).toBe(true);
+    expect(registry.getBot('app_default').config.hcHerdrTabs).toBe(true);
+    expect(registry.loadBotConfigs()[0]?.hcHerdrTabs).toBe(true);
+
+    expect(await store.applyConfigField('app_default', tabs, false)).toMatchObject({ ok: true });
+    expect(readConfig()).not.toHaveProperty('hcHerdrTabs');
+    expect(registry.getBot('app_default').config.hcHerdrTabs).toBeUndefined();
+    expect(registry.loadBotConfigs()[0]?.hcHerdrTabs).toBeUndefined();
+  });
+
   it('pairs a remote daemon default back to pty for a local CLI, as spawning does', async () => {
     process.env.BACKEND_TYPE = 'riff';
     try {

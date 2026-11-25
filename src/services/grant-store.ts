@@ -315,6 +315,144 @@ export async function consumeDispatchLaunchQuotaOnce(
 }
 
 /**
+ * 协作 creator 准入扣费（PR-2a F1/F2/R3/G1/G2）：扣费与准入回执同事务原子落盘。
+ *
+ * 幂等键 = `creatorAdmissionOperationId`（`adm_<64hex>`），quotaKey 用当次 ev.quotaKey。
+ * 免额度授权（owner/allowedUser，无 quotaKey）只写回执、不动额度（used=0）。回执携带
+ * 当次 reason/quotaKey/used/chargedAt 事实快照，供恢复路径重建 provenance。
+ *
+ * G1：来源 scope 由 quotaKey 决定（`chat:…` = chatGrant，`global:…` = globalGrant），
+ * 不靠「grantChatId 是否存在」判断——否则 DM 恒传 chatId 会让合法 globalGrant 永远不匹配。
+ * G2：命中/新写两条路径都从持久回执回放完整事实（allow/used/reason/quotaKey/chargedAt），
+ * 禁止用当前输入的 quotaKey / 当前时间拼接，同 key 重投事实恒等。
+ *
+ * 保留 creator 身份边界：quotaKey 只用当次 evaluateTalk 产出的 key，不用调用方拼的 key。
+ */
+export async function consumeCollabAdmissionOnce(
+  input: { larkAppId: string; receiptId: string; quotaKey?: string; sourceOpenId: string; reason: string },
+): Promise<{ allow: boolean; used: number; quotaKey?: string; chargedAt: string; reason?: string }> {
+  const { larkAppId, receiptId, quotaKey, sourceOpenId, reason } = input;
+  getBot(larkAppId); // throw → 调用方 fail-closed
+  const chargedAt = new Date().toISOString();
+  const r = await mutateGrantState<{ allow: boolean; used: number; chargedAt: string; reason?: string; quotaKey?: string }>(larkAppId, (tx) => {
+    const existing = tx.receiptGet(receiptId);
+    if (existing && typeof existing.allow === 'boolean') {
+      // G2：命中早退回放完整持久回执（含 chargedAt/reason/quotaKey），不拼接当前输入。
+      return {
+        write: false,
+        result: { allow: existing.allow, used: existing.used ?? 0, chargedAt: existing.chargedAt, reason: existing.reason, quotaKey: existing.quotaKey },
+      };
+    }
+    // 免额度：无 quotaKey → 直接放行，写 used=0 回执。
+    if (!quotaKey) {
+      tx.receiptSet(receiptId, { allow: true, chargedAt, used: 0, reason, quotaKey: undefined });
+      return { write: true, result: { allow: true, used: 0, chargedAt, reason, quotaKey: undefined } };
+    }
+    // G1：来源 scope 由 quotaKey 决定，不靠 grantChatId 是否存在。
+    const scope = parseGrantKey(quotaKey);
+    const chatGrantMatches = scope?.scope === 'chat'
+      && scope.openId === sourceOpenId
+      && tx.chatHas(scope.chatId, sourceOpenId);
+    const globalGrantMatches = scope?.scope === 'global'
+      && scope.openId === sourceOpenId
+      && tx.globalHas(sourceOpenId);
+    const rec = tx.quotaGet(quotaKey);
+    const allow = (chatGrantMatches || globalGrantMatches) && (!rec || rec.used < rec.limit);
+    let used = rec?.used ?? 0;
+    if (allow && rec) {
+      const quota = { limit: rec.limit, used: rec.used + 1 };
+      tx.quotaSet(quotaKey, quota);
+      used = quota.used;
+      if (quota.used >= quota.limit) {
+        if (scope?.scope === 'chat') {
+          tx.chatRemove(scope.chatId, sourceOpenId);
+        } else if (scope?.scope === 'global') {
+          tx.globalRemove(sourceOpenId);
+        }
+        tx.quotaSet(quotaKey, null);
+        tx.expirySet(quotaKey, null);
+      }
+    }
+    tx.receiptSet(receiptId, { allow, chargedAt, used, reason, quotaKey });
+    return { write: true, result: { allow, used, chargedAt, reason, quotaKey } };
+  });
+  if (!r.ok) throw new Error(`collab admission quota RMW failed: ${r.reason}`);
+  return { allow: r.result.allow, used: r.result.used, chargedAt: r.result.chargedAt, reason: r.result.reason, quotaKey: r.result.quotaKey };
+}
+
+/**
+ * 协作 kickoff 目标扣费（PR-3a）：扣费与回执同事务原子落盘。
+ *
+ * 幂等键 = kickoffId（`kick_<64hex>`）。talk/quotaKey 由**目标 daemon 自己** evaluateBotTalk
+ * 产出后传入（不接收 creator 传的 app-scoped open_id 当事实）。重复 prepare/query 返回同一
+ * receipt 不二扣；取消按 commit/release 语义由调用方结算。回执带 used/reason/quotaKey/chargedAt。
+ */
+export async function consumeCollabKickoffOnce(
+  input: { larkAppId: string; receiptId: string; quotaKey?: string; sourceOpenId: string; reason: string },
+): Promise<{ allow: boolean; used: number; quotaKey?: string; chargedAt: string; reason?: string }> {
+  const { larkAppId, receiptId, quotaKey, sourceOpenId, reason } = input;
+  getBot(larkAppId); // throw → 调用方 fail-closed
+  const chargedAt = new Date().toISOString();
+  const r = await mutateGrantState<{ allow: boolean; used: number; chargedAt: string; reason?: string; quotaKey?: string }>(larkAppId, (tx) => {
+    const existing = tx.receiptGet(receiptId);
+    if (existing && typeof existing.allow === 'boolean') {
+      return {
+        write: false,
+        result: { allow: existing.allow, used: existing.used ?? 0, chargedAt: existing.chargedAt, reason: existing.reason, quotaKey: existing.quotaKey },
+      };
+    }
+    // 免额度：无 quotaKey → 直接放行，写 used=0 回执。
+    if (!quotaKey) {
+      tx.receiptSet(receiptId, { allow: true, chargedAt, used: 0, reason, quotaKey: undefined });
+      return { write: true, result: { allow: true, used: 0, chargedAt, reason, quotaKey: undefined } };
+    }
+    // 来源 scope 由 quotaKey 决定（chat/global），与 consumeCollabAdmissionOnce 一致。
+    const scope = parseGrantKey(quotaKey);
+    const chatGrantMatches = scope?.scope === 'chat'
+      && scope.openId === sourceOpenId
+      && tx.chatHas(scope.chatId, sourceOpenId);
+    const globalGrantMatches = scope?.scope === 'global'
+      && scope.openId === sourceOpenId
+      && tx.globalHas(sourceOpenId);
+    const rec = tx.quotaGet(quotaKey);
+    const allow = (chatGrantMatches || globalGrantMatches) && (!rec || rec.used < rec.limit);
+    let used = rec?.used ?? 0;
+    if (allow && rec) {
+      const quota = { limit: rec.limit, used: rec.used + 1 };
+      tx.quotaSet(quotaKey, quota);
+      used = quota.used;
+      if (quota.used >= quota.limit) {
+        if (scope?.scope === 'chat') {
+          tx.chatRemove(scope.chatId, sourceOpenId);
+        } else if (scope?.scope === 'global') {
+          tx.globalRemove(sourceOpenId);
+        }
+        tx.quotaSet(quotaKey, null);
+        tx.expirySet(quotaKey, null);
+      }
+    }
+    tx.receiptSet(receiptId, { allow, chargedAt, used, reason, quotaKey });
+    return { write: true, result: { allow, used, chargedAt, reason, quotaKey } };
+  });
+  if (!r.ok) throw new Error(`collab kickoff quota RMW failed: ${r.reason}`);
+  return { allow: r.result.allow, used: r.result.used, chargedAt: r.result.chargedAt, reason: r.result.reason, quotaKey: r.result.quotaKey };
+}
+
+/**
+ * 读取协作 creator 准入回执（durable）。用于恢复路径：投影写失败时从 grant-state
+ * 重建 provenance，不二扣也不丢已扣额度。
+ */
+export function getCollabAdmissionReceipt(larkAppId: string, receiptId: string): { allow: boolean; used: number; reason?: string; quotaKey?: string; chargedAt: string } | undefined {
+  try {
+    const bot = getBot(larkAppId);
+    const rec = objectGrantTx(bot.config).receiptGet(receiptId);
+    return rec ? { allow: rec.allow, used: rec.used ?? 0, reason: rec.reason, quotaKey: rec.quotaKey, chargedAt: rec.chargedAt } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * 整群 talk 授权：把 chatId 加入 allowedChatGroups（"talk-open 的 chat_id 列表"）。
  * 命中后该 chat 任何成员都过 canTalk（见 event-dispatcher.canTalk），不授 canOperate。
  */

@@ -59,6 +59,7 @@ describe('tmuxKeyToBytes', () => {
     expect(tmuxKeyToBytes('Tab')).toBe('\t');
     expect(tmuxKeyToBytes('BSpace')).toBe('\x7f');
     expect(tmuxKeyToBytes('Up')).toBe('\x1b[A');
+    expect(tmuxKeyToBytes('M-Up')).toBe('\x1b[1;3A');
     expect(tmuxKeyToBytes('M-Enter')).toBe('\x1b\r');
   });
 
@@ -66,6 +67,7 @@ describe('tmuxKeyToBytes', () => {
     expect(tmuxKeyToBytes('C-c')).toBe('\x03');
     expect(tmuxKeyToBytes('C-d')).toBe('\x04');
     expect(tmuxKeyToBytes('C-a')).toBe('\x01');
+    expect(tmuxKeyToBytes('C-u')).toBe('\x15');
   });
 
   it('maps M-<x> meta combos to ESC-prefixed bytes', () => {

@@ -9,7 +9,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as pty from 'node-pty';
@@ -19,6 +19,7 @@ import { hcDiagnosticAttachCommand, parkHcDiagnosticTerminal } from '../src/adap
 import { HcBackend } from '../src/adapters/backend/hc-backend.js';
 import { RunnerControlDecoder } from '../src/adapters/cli/runner-control-channel.js';
 import { hcTerminalPanePid } from '../src/codex-rpc-lifecycle.js';
+import { readFleetProcessCommandLine } from '../src/core/fleet-process-identity.js';
 import { linuxIsolationLaunchViaArgsFile } from '../src/core/linux-isolation.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
@@ -202,7 +203,7 @@ describe.skipIf(!realHc)('worker hc paths against the real binary', () => {
     await until(() => expect(output()).toContain('READY'));
     const pid = backend.getStablePanePid()!;
     // The pane launcher execs down to the CLI: the pane's pid is a live local process running it.
-    expect(readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')).toEqual(['sleep', '300', '']);
+    expect(readFleetProcessCommandLine(pid)).toBe('sleep 300');
     const start = readProcessStartIdentity(pid);
     expect(start).toBeTruthy();
     const scope = new WorkerSessionEventScope({ appId: 'cli_hc_identity', sessionId: sid }, { workerId: 'w', generation: 1 });

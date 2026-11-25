@@ -20,6 +20,7 @@ import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
   createRefreshGate,
+  cliSearchTerms,
   fallbackCliOptionsState,
   fetchBotDefaults,
   fetchCliOptions,
@@ -1067,7 +1068,7 @@ function EditorSection(props: {
 }
 
 /** 执行分组：与 Bot 配置页「Agent 配置」同一套控件（CLI / 模型 / 思考强度 / 配置目录）。 */
-function ExecFields(props: {
+export function ExecFields(props: {
   draft: Draft['exec'];
   cliState: CliOptionsState;
   disabled: boolean;
@@ -1096,10 +1097,11 @@ function ExecFields(props: {
     .map(item => ({
       value: item.id,
       label: item.label,
+      searchTerms: cliSearchTerms(item),
       hint: (item.id === draft.cliId ? availabilityStatus : cliAvailabilityStatus(item)) === 'unavailable'
         ? item.availabilityReason ?? tr('agents.cliUnavailable') : undefined,
     }));
-  if (!cliOptions.some(item => item.value === draft.cliId)) cliOptions.unshift({ value: draft.cliId, label: draft.cliId, hint: undefined });
+  if (!cliOptions.some(item => item.value === draft.cliId)) cliOptions.unshift({ value: draft.cliId, label: draft.cliId, searchTerms: [], hint: undefined });
   return (
     <>
       <div className="bd-row">

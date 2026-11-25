@@ -16,6 +16,13 @@ export {
   readProcessStartIdentity,
 } from '../utils/process-identity.js';
 
+export interface AntigravityReconcileHint {
+  textSha256: string;
+  sampledTranscriptPath?: string;
+  minByteOffset?: number;
+  skipPriorMatches?: number;
+}
+
 export interface QueuedTypeAheadTurn {
   turnId: string;
   /** The CLI consumed this input; queue admission alone is insufficient. */
@@ -24,6 +31,7 @@ export interface QueuedTypeAheadTurn {
   linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
+  antigravityReconcileHint?: AntigravityReconcileHint;
 }
 
 export interface AncestorSessionContext {
@@ -36,6 +44,7 @@ export interface AncestorSessionContext {
   queuedTurnId?: string;
   queuedTurns?: QueuedTypeAheadTurn[];
   steerPromotedTurn?: boolean;
+  antigravityReconcileHint?: AntigravityReconcileHint;
 }
 
 interface IdentityBoundSessionMarker extends AncestorSessionContext {
@@ -94,6 +103,33 @@ function parseDispatchAttempt(value: unknown): number | undefined {
     : undefined;
 }
 
+function parseAntigravityReconcileHint(value: unknown): AntigravityReconcileHint | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const hint = value as Record<string, unknown>;
+  if (typeof hint.textSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(hint.textSha256)) return undefined;
+  const sampledTranscriptPath = typeof hint.sampledTranscriptPath === 'string'
+    && hint.sampledTranscriptPath.length > 0 && hint.sampledTranscriptPath.length <= 4096
+    ? hint.sampledTranscriptPath : undefined;
+  const minByteOffset = typeof hint.minByteOffset === 'number'
+    && Number.isSafeInteger(hint.minByteOffset) && hint.minByteOffset >= 0
+    ? hint.minByteOffset : undefined;
+  const skipPriorMatches = typeof hint.skipPriorMatches === 'number'
+    && Number.isSafeInteger(hint.skipPriorMatches) && hint.skipPriorMatches >= 0
+    ? hint.skipPriorMatches : undefined;
+  // Optional fields are atomic with the hash: dropping an invalid offset but
+  // retaining the hash would re-open matching from byte zero and could assign
+  // an older identical USER_INPUT to a different scheduled turn.
+  if ('sampledTranscriptPath' in hint && sampledTranscriptPath === undefined) return undefined;
+  if ('minByteOffset' in hint && minByteOffset === undefined) return undefined;
+  if ('skipPriorMatches' in hint && skipPriorMatches === undefined) return undefined;
+  return {
+    textSha256: hint.textSha256,
+    ...(sampledTranscriptPath ? { sampledTranscriptPath } : {}),
+    ...(minByteOffset !== undefined ? { minByteOffset } : {}),
+    ...(skipPriorMatches !== undefined && skipPriorMatches > 0 ? { skipPriorMatches } : {}),
+  };
+}
+
 function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarker {
   const text = raw.trim();
   if (!text.startsWith('{')) return { sessionId: text };
@@ -110,6 +146,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       queuedTurns?: unknown;
       steerPromotedTurn?: unknown;
       capability?: unknown;
+      antigravityReconcileHint?: unknown;
     };
     const dispatchAttempt = parseDispatchAttempt(parsed.dispatchAttempt);
     const linkRefMode = parsed.linkRefMode === 'observe' || parsed.linkRefMode === 'enabled'
@@ -120,6 +157,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
           .filter((t: any) => typeof t?.turnId === 'string' && t.turnId)
           .map((t: any) => {
             const attempt = parseDispatchAttempt(t.dispatchAttempt);
+            const reconcileHint = parseAntigravityReconcileHint(t.antigravityReconcileHint);
             return {
               turnId: String(t.turnId),
               ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
@@ -129,12 +167,14 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
                 : {}),
               ...(t.trustedCaller && typeof t.trustedCaller === 'object' ? { trustedCaller: t.trustedCaller } : {}),
               ...(t.trustedController && typeof t.trustedController === 'object' ? { trustedController: t.trustedController } : {}),
+              ...(reconcileHint ? { antigravityReconcileHint: reconcileHint } : {}),
             };
           })
       : undefined;
     const queuedTurnId = typeof parsed.queuedTurnId === 'string' && parsed.queuedTurnId
       ? parsed.queuedTurnId
       : (queuedTurns && queuedTurns.length > 0 ? queuedTurns[0].turnId : undefined);
+    const reconcileHint = parseAntigravityReconcileHint(parsed.antigravityReconcileHint);
     return {
       sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
       ...(typeof parsed.turnId === 'string' && parsed.turnId ? { turnId: parsed.turnId } : {}),
@@ -147,6 +187,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       ...(queuedTurns && queuedTurns.length > 0 ? { queuedTurns } : {}),
       ...(parsed.steerPromotedTurn === true ? { steerPromotedTurn: true } : {}),
       ...(typeof parsed.capability === 'string' ? { capability: parsed.capability } : {}),
+      ...(reconcileHint ? { antigravityReconcileHint: reconcileHint } : {}),
     };
   } catch {
     return { sessionId: '' };
@@ -221,6 +262,7 @@ export function findAuthenticatedAncestorSessionContext(
         ...(marker.queuedTurnId ? { queuedTurnId: marker.queuedTurnId } : {}),
         ...(marker.queuedTurns && marker.queuedTurns.length > 0 ? { queuedTurns: marker.queuedTurns } : {}),
         ...(marker.steerPromotedTurn ? { steerPromotedTurn: true } : {}),
+        ...(marker.antigravityReconcileHint ? { antigravityReconcileHint: marker.antigravityReconcileHint } : {}),
       };
     }
     const parent = readParentPid(pid);
@@ -302,6 +344,7 @@ export function findAncestorSessionMarkerContext(
           ...(marker.queuedTurnId ? { queuedTurnId: marker.queuedTurnId } : {}),
           ...(marker.queuedTurns && marker.queuedTurns.length > 0 ? { queuedTurns: marker.queuedTurns } : {}),
           ...(marker.steerPromotedTurn ? { steerPromotedTurn: true } : {}),
+          ...(marker.antigravityReconcileHint ? { antigravityReconcileHint: marker.antigravityReconcileHint } : {}),
         };
       }
       // Marker present but not ours: keep climbing (see doc comment above).
@@ -362,6 +405,7 @@ export function advanceAncestorSessionTurn(
         ...(nextTurn.linkRefMode ? { linkRefMode: nextTurn.linkRefMode } : {}),
         ...(nextTurn.trustedCaller ? { trustedCaller: nextTurn.trustedCaller } : {}),
         ...(nextTurn.trustedController ? { trustedController: nextTurn.trustedController } : {}),
+        ...(nextTurn.antigravityReconcileHint ? { antigravityReconcileHint: nextTurn.antigravityReconcileHint } : {}),
         ...(marker.procStart ? { procStart: marker.procStart } : {}),
         ...(nextQueuedTurnId ? { queuedTurnId: nextQueuedTurnId } : {}),
         ...(queuedTurns.length > 0 ? { queuedTurns } : {}),

@@ -104,6 +104,8 @@ export function publishClosedSessionPatch(
         previewUserAt: null,
         previewBotAt: null,
         previewBotState: null,
+        queuedActivationPending: null,
+        queuedActivationTailCount: null,
       },
     },
   });

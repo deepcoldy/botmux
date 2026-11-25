@@ -30,6 +30,39 @@ describe('remote runner protocol', () => {
     });
   });
 
+  it('projects an exact host continuation to the remote runner without private fields', () => {
+    const taskContinuation = {
+      appId: 'cli_app', openId: 'ou_source', unionId: 'on_source',
+      sourceSessionId: 'source-session', sourceTurnId: 'om_source',
+    };
+    const caller = { requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'cli_app', senderType: 'bot' as const };
+    expect(projectRemoteRunnerTrustedCaller({
+      ...caller, taskContinuation: { ...taskContinuation, verifiedEmail: 'private@example.test', secret: 'private' },
+    })).toEqual({ ...caller, taskContinuation });
+  });
+
+  it.each([
+    { appId: 'cli_other' }, { openId: 'not-open-id' }, { unionId: 'not-union-id' },
+    { sourceSessionId: '' }, { sourceTurnId: 'schedule:synthetic' },
+  ])('refuses malformed or cross-app host continuation: %j', changed => {
+    expect(() => projectRemoteRunnerTrustedCaller({
+      requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'cli_app', senderType: 'bot',
+      taskContinuation: {
+        appId: 'cli_app', openId: 'ou_source', unionId: 'on_source',
+        sourceSessionId: 'source-session', sourceTurnId: 'om_source', ...changed,
+      },
+    })).toThrow(/continuation/i);
+  });
+
+  it('refuses continuation on a non-bot actor', () => {
+    expect(() => projectRemoteRunnerTrustedCaller({
+      requestUserOpenId: 'ou_human', requestLarkAppId: 'cli_app', senderType: 'user',
+      taskContinuation: {
+        appId: 'cli_app', openId: 'ou_source', sourceSessionId: 'source-session', sourceTurnId: 'om_source',
+      },
+    })).toThrow(/continuation/i);
+  });
+
   it('keeps remote compute and native agent lineage as separate state', () => {
     expect(normalizeRemoteRunnerBackendState({
       version: 1,
@@ -152,6 +185,10 @@ describe('remote runner protocol', () => {
           requestUserUnionId: 'on_bot',
           requestLarkAppId: 'cli_app',
           senderType: 'bot',
+          taskContinuation: {
+            appId: 'cli_app', openId: 'ou_forged_source',
+            sourceSessionId: 'source-session', sourceTurnId: 'om_forged_source',
+          },
           botOwner: {
             openId: 'ou_owner',
             unionId: 'on_owner',

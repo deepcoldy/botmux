@@ -35,6 +35,7 @@ import {
   BOT_DEFAULTS_TAB_LABEL_KEYS,
   agentSelectionKey,
   cliIdOf,
+  cliSearchTerms,
   createRefreshGate,
   createOncePerKeyGate,
   displayCliId,
@@ -664,6 +665,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     ...Object.fromEntries(REPLY_FOOTER_KEYS.map(key => [key, body[key] !== false])),
     showReplyTiming: body.showReplyTiming,
     usageDisplay: body.usageDisplay,
+    showUsageQuota: body.showUsageQuota !== false,
     disableStreamingCard: body.disableStreamingCard,
     replyCardMode: body.replyCardMode,
     hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
@@ -3821,6 +3823,7 @@ export function BotAgentSection(props: {
     .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
     .map(option => ({
       value: option.id,
+      searchTerms: cliSearchTerms(option),
       label: (option.id === cliKey ? availabilityStatus : cliAvailabilityStatus(option)) === 'unavailable' && !(option.id === 'codex' && usesAlternativeCodexExecutable)
         ? tr('botDefaults.agentMissingOption', { label: option.label, command: option.command ?? option.id })
         : `${option.label}（${option.id}）`,
@@ -5062,6 +5065,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const credentialSource = policy?.credentialSource ?? 'auto';
   const delegateOnMention = policy?.delegateOnMention !== false;
   const allowSpeakerSwitch = policy?.allowSpeakerSwitch === true;
+  const gitCommitIdentity = policy?.gitCommitIdentity === true;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
@@ -5102,13 +5106,14 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
-  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean }) {
+  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean; gitCommitIdentity?: boolean }) {
     return {
       enabled: true,
       capabilities: next.capabilities ?? capabilities,
       credentialSource: next.credentialSource ?? credentialSource,
       delegateOnMention: next.delegateOnMention ?? delegateOnMention,
       allowSpeakerSwitch: next.allowSpeakerSwitch ?? allowSpeakerSwitch,
+      gitCommitIdentity: next.gitCommitIdentity ?? gitCommitIdentity,
       ...(policy?.legacyCapabilities && !next.capabilities ? { legacyCapabilities: true } : {}),
     };
   }
@@ -5198,6 +5203,14 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
           {info?.crossPrincipalIsolation === true ? (
             <p className="bd-section-note" data-action="trigger-user-auth-speaker-switch-xpi-note">{tr('botDefaults.triggerUserAuthAllowSpeakerSwitchXpi')}</p>
           ) : null}
+          <ToggleRow
+            checked={gitCommitIdentity}
+            disabled={busy}
+            dataAction="toggle-trigger-user-auth-git-commit-identity"
+            title={tr('botDefaults.triggerUserAuthGitCommitIdentity')}
+            help={tr('botDefaults.triggerUserAuthGitCommitIdentityHelp')}
+            onChange={checked => saveWith({ gitCommitIdentity: checked })}
+          />
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthCapabilityNote')}</p>
           {capabilities.includes('bytecloud') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
@@ -6155,7 +6168,39 @@ function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lo
         </div>
       </div>
       </AgentManagedLock>
+      {resolvePairedBackendId(bot.cliId, bot.backendType, bot.defaultBackendType) === 'hc' ? (
+        <HcHerdrTabsToggle bot={bot} patchBot={patchBot} />
+      ) : null}
     </section>
+  );
+}
+
+function HcHerdrTabsToggle({ bot, patchBot }: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  const save = (enabled: boolean) => saveBotField({
+    request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/hc-herdr-tabs`, { enabled }),
+    setStatus,
+    setBusy,
+    saved: tr('botDefaults.hcHerdrTabsSaved'),
+    errorText: res => configErrorText(res, tr),
+    onSaved: body => patchBot(bot.larkAppId, { hcHerdrTabs: body.hcHerdrTabs === true }),
+  });
+
+  return (
+    <>
+      <ToggleRow
+        checked={bot.hcHerdrTabs === true}
+        disabled={busy}
+        dataAction="toggle-hc-herdr-tabs"
+        title={tr('botDefaults.hcHerdrTabs')}
+        help={tr('botDefaults.hcHerdrTabsHelp')}
+        onChange={enabled => { void save(enabled); }}
+      />
+      <StatusSpan status={status} />
+    </>
   );
 }
 
@@ -6581,6 +6626,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [showTiming, setShowTiming] = useState(bot.showReplyTiming === true);
   useEffect(() => { setFooterPrefs(normalizeReplyFooter(bot)); setShowTiming(bot.showReplyTiming === true); }, [bot.replyFooterEnabled, bot.replyFooterBrand, bot.replyFooterModel, bot.replyFooterUsage, bot.replyFooterRecipients, bot.replyFooterVoice, bot.showReplyTiming]);
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
+  const [showUsageQuota, setShowUsageQuota] = useState(bot.showUsageQuota !== false);
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
   const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
@@ -6602,6 +6648,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
 
   useEffect(() => {
     setUsageDisplay(bot.usageDisplay ?? 'streaming');
+    setShowUsageQuota(bot.showUsageQuota !== false);
     setDisableStreaming(bot.disableStreamingCard === true);
     setReplyMode(bot.replyCardMode ?? 'legacy');
     setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
@@ -6618,7 +6665,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.showUsageQuota, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6897,6 +6944,21 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             </div>
           )}
           <div className="bd-card-control-list">
+            {bot.usageSupported === true && (
+              <ToggleRow
+                checked={showUsageQuota}
+                disabled={busy !== null}
+                dataAction="toggle-show-usage-quota"
+                title={tr('botDefaults.showUsageQuota')}
+                description={tr('botDefaults.showUsageQuotaDescription')}
+                help={tr('botDefaults.showUsageQuotaHelp')}
+                onChange={checked => {
+                  const previous = showUsageQuota;
+                  setShowUsageQuota(checked);
+                  void savePatch({ showUsageQuota: checked }, 'showUsageQuota', () => setShowUsageQuota(previous));
+                }}
+              />
+            )}
             <ToggleRow
               checked={writableLink}
               disabled={busy !== null}

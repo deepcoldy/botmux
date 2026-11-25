@@ -507,6 +507,50 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     expect(declared.has('im:feed_group_v1:write')).toBe(true);
   });
 
+  it('manifest prunes only redundant user scopes and retains tenant document capabilities', async () => {
+    // 2026-11 验收边界：tenant 权限会被 agent 经 lark-cli 用于文档读写和评论操作，
+    // 不能用「botmux src 零调用」判定无用；审批收窄只落在有冗余/按需路径的 user 项。
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const tenant = new Set<string>(manifest.scopes?.tenant ?? []);
+    const user = new Set<string>(manifest.scopes?.user ?? []);
+
+    // lark-cli 的更新回复与 fileComment.patch（解决/恢复评论）同时接受 comment:update 和
+    // comment:write_only，而后者仍在 user 桶；块转换没有内置 user 工作流，未来确需时走
+    // extra-scopes / 按需授权。
+    const removedUser = [
+      'docs:document.comment:update',
+      'docx:document.block:convert',
+    ];
+    expect(removedUser.filter(name => user.has(name))).toEqual([]);
+
+    // tenant 文档能力默认保留，包括只有 tenant 桶的 comment:delete。阴性对照同时防止
+    // 读空清单或误删 comment:create / Docx 写入等实际功能也让上面的断言通过。
+    for (const retained of [
+      'contact:contact.base:readonly',
+      'docs:document.comment:create',
+      'docs:document.comment:delete',
+      'docs:document.comment:update',
+      'docs:document.comment:write_only',
+      'docx:document.block:convert',
+      'docx:document:write_only',
+      'im:message',
+    ]) {
+      expect(tenant.has(retained), `应保留 tenant 文档/核心权限 ${retained}`).toBe(true);
+    }
+    for (const retained of [
+      'contact:contact.base:readonly',
+      'docs:document.comment:create',
+      'docs:document.comment:write_only',
+      'docx:document:write_only',
+    ]) {
+      expect(user.has(retained), `应保留实际仍在使用的 user 权限 ${retained}`).toBe(true);
+    }
+  });
+
   it('VC meeting bot event checklist uses the confirmed Open Platform keys', () => {
     expect([...VC_MEETING_BOT_EVENTS]).toEqual([
       'vc.bot.meeting_invited_v1',

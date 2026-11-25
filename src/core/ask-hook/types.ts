@@ -1,4 +1,5 @@
-import type { AskQuestion, CliPermissionOutcome } from '../ask-types.js';
+import type { AskQuestion, AskResult, CliPermissionOutcome } from '../ask-types.js';
+import type { Locale } from '../../i18n/types.js';
 
 /** adapter 解析一个 hook payload 后得到的问题列表和原始上下文。 */
 export interface ParsedAsk {
@@ -22,6 +23,8 @@ export interface HookAskAdapter {
    * answersByQuestion[i] = questions[i] 选中的 key 数组。
    * `comment` 为用户自定义回复原文（话题里直接打字作答）；按钮选择时为 null/缺省。
    * 没有任何选中项的问题，若 comment 非空则回落到 comment（替代语义）。
+   * `customAnswers[i]`：该问没勾选项、只写了文字时的答案；`notes[i]`：勾了选项又写的备注，
+   * 随选项一起交给 CLI（各 CLI 的放法见各适配器）。
    * 返回写回 CLI 的 directive JSON 字符串。
    */
   formatAnswer(
@@ -29,6 +32,9 @@ export interface HookAskAdapter {
     parsed: ParsedAsk,
     comment?: string | null,
     customAnswers?: ReadonlyArray<string | null>,
+    notes?: ReadonlyArray<string | null>,
+    /** 提问机器人的界面语言（daemon 随答案带回）：备注标记等措辞跟着它走。 */
+    locale?: Locale,
   ): string;
 
   /** hook 接管失败时的"放行/无操作" directive（让 CLI 回退原生终端提问）。 */
@@ -79,4 +85,9 @@ export const PERMISSION_DENY_KEY = 'deny';
 export function isHookPermissionAsk(ask: { originKind?: string; questions: ReadonlyArray<AskQuestion> }): boolean {
   return ask.originKind === 'hook' && ask.questions.length === 1 && ask.questions[0]!.allowCustom === false
     && ask.questions[0]!.options.map(o => o.key).join('\n') === `${PERMISSION_ALLOW_KEY}\n${PERMISSION_DENY_KEY}`;
+}
+
+/** 一次作答是否放行权限请求：点了「允许」且没有附话。在话题里回复（附话）一律算拒绝，并把话转给 CLI。 */
+export function permissionAnswerAllows(result: Extract<AskResult, { kind: 'answered' }>): boolean {
+  return (result.answers[0] ?? []).includes(PERMISSION_ALLOW_KEY) && !(result.comment ?? '').trim();
 }
