@@ -89,7 +89,11 @@ describe('worker interrupt action integration', () => {
 
   it('awaits the async action in the worker IPC switch', () => {
     const start = workerSource.indexOf("case 'term_action':");
-    expect(workerSource.slice(start, start + 160)).toContain('await handleTermAction(msg.key)');
+    // K3 护栏：分支在自己的 break 之前必须 await 异步动作（fire-and-forget 会让
+    // Ctrl+C 与 Worker 状态清理脱序）。分支内允许插入中断代际/存证失效等同级语句，
+    // 所以用本分支自己的 break 收口，而不是钉死固定字符窗口。
+    const caseBody = workerSource.slice(start, workerSource.indexOf('break;', start));
+    expect(caseBody).toContain('await handleTermAction(msg.key)');
   });
 
   it('rejects viewer/RPC Codex modes before any PTY control key is sent', () => {

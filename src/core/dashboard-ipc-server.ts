@@ -8216,7 +8216,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
     type: 'session.update',
     body: {
       sessionId,
-      patch: { status: 'active', closedAt: null },
+      patch: {
+        status: 'active',
+        closedAt: null,
+        queuedActivationPending: null,
+        queuedActivationTailCount: null,
+      },
     },
   });
 

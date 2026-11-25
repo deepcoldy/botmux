@@ -2401,7 +2401,11 @@ describe('onLarkTurnStarted evidence', () => {
     const q = queueWith((turn, evidence) => seen.push([turn.turnId, evidence]));
     q.mark('om_turn', makeFingerprint(marked), Date.now(), normaliseForFingerprint(marked));
     q.ingest([user('u1', marked)], '/claude/projects/x/abcd-session.jsonl');
-    expect(seen).toEqual([['om_turn', { fullContentMatch: true, sourceJsonlPath: '/claude/projects/x/abcd-session.jsonl' }]]);
+    expect(seen).toEqual([['om_turn', {
+      fullContentMatch: true,
+      exactContentMatch: true,
+      sourceJsonlPath: '/claude/projects/x/abcd-session.jsonl',
+    }]]);
   });
 
   it('reports fingerprint-only and truncated binds as non-proof', () => {

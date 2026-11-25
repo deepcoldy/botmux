@@ -502,13 +502,16 @@ describe('screen and output', () => {
     client.sub!.emit('size', { cols: 80, rows: 24 });
     expect(sizes).toHaveBeenCalledWith({ cols: 80, rows: 24 });
     expect(backend.getPaneSize()).toEqual({ cols: 80, rows: 24 });
+    await expect(backend.getPaneSizeAsync()).resolves.toEqual({ cols: 80, rows: 24 });
     client.sub!.emit('size', { cols: 80, rows: 24 });
     expect(sizes).toHaveBeenCalledTimes(1);
 
     backend.resize(120, 40);
     expect(stream.resized).toEqual([[120, 40]]);
     expect(backend.getPaneSize()).toEqual({ cols: 120, rows: 40 });
+    await expect(backend.getPaneSizeAsync()).resolves.toEqual({ cols: 120, rows: 40 });
     backend.kill();
+    await expect(backend.getPaneSizeAsync()).resolves.toBeNull();
   });
 
   it('keeps its latest size when the core acknowledges an earlier request late', async () => {

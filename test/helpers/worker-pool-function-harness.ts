@@ -42,8 +42,24 @@ import {
 /** Untracked handler fixtures still have the daemon's empty delivery registry.
  * Resolve settlement through production functions so fixtures exercise its
  * identity checks rather than substituting a no-op completion callback. */
+
+/** Module-level weak-state containers owned by worker-pool.ts. Source-sliced
+ * closures cannot see the module scope, so each fixture scope gets fresh
+ * instances (mirroring the `workerCommittedTurnIds` seeding below). */
+const WORKER_POOL_WEAK_CONTAINERS: Record<string, () => WeakMap<object, any> | WeakSet<object>> = {
+  workersWithLiveWorkingStatus: () => new WeakMap(),
+  visibleStreamingCardStatus: () => new WeakMap(),
+  pendingStreamingCardPatchVisibleStatus: () => new WeakMap(),
+  inFlightStreamingCardPatchVisibleStatus: () => new WeakMap(),
+  completedTerminalTurns: () => new WeakMap(),
+  postTerminalDirectSubmitSessions: () => new WeakSet(),
+};
+
 function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
   if (key in scope) return scope[key as string];
+  if (typeof key === 'string' && key in WORKER_POOL_WEAK_CONTAINERS) {
+    return scope[key] ??= WORKER_POOL_WEAK_CONTAINERS[key]();
+  }
   if (key === 'randomUUID') return randomUUID;
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
@@ -72,7 +88,8 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
     'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
-    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage'].includes(key)) {
+    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage',
+    'clearWorkerRuntimeProvenance'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];
