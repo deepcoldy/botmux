@@ -53,6 +53,49 @@ describe('mergeQueuedCliInput', () => {
     expect(pending).toHaveLength(1);
   });
 
+  it('never merges different source tasks from the same reply bot', () => {
+    const caller = (openId: string, sourceTurnId: string) => ({
+      requestUserOpenId: 'ou_reply_bot', requestUserUnionId: 'on_reply_bot',
+      requestLarkAppId: 'app', senderType: 'bot' as const,
+      taskContinuation: {
+        appId: 'app', openId, sourceSessionId: 'source-session', sourceTurnId,
+      },
+    });
+    const pending = [{
+      content: 'task A result', turnId: 'om_reply_a',
+      trustedCaller: caller('ou_human_a', 'om_source_a'),
+    }];
+
+    expect(mergeQueuedCliInput(pending, {
+      content: 'task B result', turnId: 'om_reply_b',
+      trustedCaller: caller('ou_human_b', 'om_source_b'),
+    })).toBe(false);
+    expect(pending).toEqual([{
+      content: 'task A result', turnId: 'om_reply_a',
+      trustedCaller: caller('ou_human_a', 'om_source_a'),
+    }]);
+  });
+
+  it('retains ordinary merge behavior for the exact same continuation principal', () => {
+    const trustedCaller = {
+      requestUserOpenId: 'ou_reply_bot', requestUserUnionId: 'on_reply_bot',
+      requestLarkAppId: 'app', senderType: 'bot' as const,
+      taskContinuation: {
+        appId: 'app', openId: 'ou_human', sourceSessionId: 'source-session',
+        sourceTurnId: 'om_source',
+      },
+    };
+    const pending = [{ content: 'first', turnId: 'om_reply_a', trustedCaller }];
+
+    expect(mergeQueuedCliInput(pending, {
+      content: 'second', turnId: 'om_reply_b',
+      trustedCaller: { ...trustedCaller, taskContinuation: { ...trustedCaller.taskContinuation } },
+    })).toBe(true);
+    expect(pending[0]).toMatchObject({
+      content: 'first\n\nsecond', turnId: 'om_reply_b', trustedCaller,
+    });
+  });
+
   it('never merges across a durable envelope boundary in either direction', () => {
     const durableTail = [{ content: 'meeting envelope', turnId: 'delivery', dispatchAttempt: 1 }];
     expect(mergeQueuedCliInput(durableTail, { content: 'human follow-up', turnId: 'im-1' })).toBe(false);

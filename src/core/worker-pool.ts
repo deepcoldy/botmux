@@ -17867,10 +17867,7 @@ function mergeKeepsFailedInputDelivered(
   if (!record || record.silent || record.answersInChat !== true || !turnAnswersInChat(ds, turnId)) return false;
   if (!caller) return true;
   const failedBy = record.trustedCaller;
-  return !!failedBy
-    && failedBy.requestLarkAppId === caller.requestLarkAppId
-    && !!caller.requestUserOpenId
-    && failedBy.requestUserOpenId === caller.requestUserOpenId;
+  return sameTrustedPrincipal(failedBy, caller);
 }
 
 /** The worker's answer to an input's failed-turn rewind directive. Once the
@@ -18192,6 +18189,11 @@ export function sendWorkerInput(
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
     ...(opts.queueAfterActiveTurn
+      // A peer bot may deliver several followed cross-chat replies for
+      // different source humans/tasks. Each attested continuation is a
+      // separate principal and must reach the worker as an independent turn,
+      // even while the experimental cross-principal gate is disabled.
+      || !!opts.trustedCaller?.taskContinuation
       || (opts.dispatchAttempt === undefined && opts.trustedCaller?.source === 'schedule_creator')
       || shouldQueueAfterActiveTurn(ds, {
         turnId: effectiveTurnId, dispatchAttempt: opts.dispatchAttempt,

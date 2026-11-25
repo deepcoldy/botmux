@@ -56,6 +56,46 @@ function resolve() {
 }
 
 describe('cross-chat follow store failure and replay semantics', () => {
+  it('persists the source turn only for a fresh host-observed delivery', () => {
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-a', {
+      sentAtMs: 1000,
+      turnId: 'om_source_human',
+      deliveryKind: 'detoured_send',
+      messageId: 'om_root_b',
+      targetChatId: 'oc_followed',
+      crossChatFollowThread: 'at',
+    });
+    expect(resolve()).toMatchObject({
+      sourceSessionId: 'sess-a',
+      sourceTurnId: 'om_source_human',
+    });
+    const record = JSON.parse(readFileSync(
+      join(tempDir, '.dashboard-secret.cross-chat-follow-thread', 'sess-a.jsonl'),
+      'utf-8',
+    ).trim());
+    expect(record).toMatchObject({ sourceTurnId: 'om_source_human' });
+    expect(record).not.toHaveProperty('turnId');
+
+    const replayDir = mkdtempSync(join(tmpdir(), 'cross-chat-store-replay-recovery-'));
+    try {
+      expect(ensureCrossChatFollowThreadAtBinding({
+        dataDir: replayDir,
+        sessionId: 'sess-a',
+        sentAtMs: 1000,
+        messageId: 'om_root_b',
+        targetChatId: 'oc_followed',
+        sourceTurnId: 'om_replayed_human',
+      })).toBe(true);
+      const replayRecord = JSON.parse(readFileSync(
+        join(replayDir, '.dashboard-secret.cross-chat-follow-thread', 'sess-a.jsonl'),
+        'utf-8',
+      ).trim());
+      expect(replayRecord).toMatchObject({ sourceTurnId: 'om_replayed_human' });
+    } finally {
+      rmSync(replayDir, { recursive: true, force: true });
+    }
+  });
+
   it('reports an off append failure instead of treating the old at as a tombstone', () => {
     const marker = {
       dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 1000, messageId: 'om_root_b',
@@ -148,8 +188,82 @@ describe('cross-chat follow store failure and replay semantics', () => {
     expect(resolve()).toBeNull();
     expect(ensureCrossChatFollowThreadAtBinding({
       dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 1000, messageId: 'om_root_b', targetChatId: 'oc_followed',
+      sourceTurnId: 'om_old_source',
     })).toBe(true);
     expect(resolve()).toBeNull();
+  });
+
+  it('enriches only the same legacy provider receipt and never overwrites a newer root binding', () => {
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-a', {
+      sentAtMs: 1000, deliveryKind: 'detoured_send', messageId: 'om_delivery_old',
+      targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed', crossChatFollowThread: 'at',
+    });
+    expect(ensureCrossChatFollowThreadAtBinding({
+      dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 1000, messageId: 'om_delivery_old',
+      targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed', sourceTurnId: 'om_source_old',
+    })).toBe(true);
+    expect(resolve()).toMatchObject({ sourceTurnId: 'om_source_old' });
+
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-a', {
+      sentAtMs: 2000, deliveryKind: 'detoured_send', messageId: 'om_delivery_new',
+      targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed', crossChatFollowThread: 'at',
+      turnId: 'om_source_new',
+    });
+    expect(ensureCrossChatFollowThreadAtBinding({
+      dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 1000, messageId: 'om_delivery_old',
+      targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed', sourceTurnId: 'om_source_old',
+    })).toBe(true);
+    expect(resolve()).toMatchObject({ sourceTurnId: 'om_source_new' });
+    const records = readFileSync(
+      join(tempDir, '.dashboard-secret.cross-chat-follow-thread', 'sess-a.jsonl'),
+      'utf-8',
+    ).trim().split('\n');
+    expect(records).toHaveLength(3);
+  });
+
+  it('does not make an old replay outrank a later binding from another source session', () => {
+    const candidateSessions: CrossChatCandidateSession[] = [
+      ...sessions,
+      {
+        sessionId: 'sess-b', larkAppId: 'cli_cross', chatId: 'oc_other_origin',
+        rootMessageId: 'oc_other_origin', scope: 'chat', status: 'active',
+      },
+    ];
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-a', {
+      sentAtMs: 1000, deliveryKind: 'detoured_send', messageId: 'om_delivery_a',
+      targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed',
+      crossChatFollowThread: 'at',
+    });
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-b', {
+      sentAtMs: 2000, deliveryKind: 'detoured_send', messageId: 'om_delivery_b',
+      targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed',
+      crossChatFollowThread: 'at', turnId: 'om_source_b',
+    });
+    const resolveBoth = () => resolveCrossChatFollowedThread({
+      dataDir: tempDir, larkAppId: 'cli_cross', chatId: 'oc_followed',
+      candidateRootIds: ['om_root_b'], sessions: candidateSessions,
+    });
+    expect(resolveBoth()).toMatchObject({
+      sourceSessionId: 'sess-b', sourceTurnId: 'om_source_b',
+    });
+
+    expect(ensureCrossChatFollowThreadAtBinding({
+      dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 3000,
+      messageId: 'om_delivery_a', targetRootMessageId: 'om_root_b',
+      targetChatId: 'oc_followed', sourceTurnId: 'om_source_a',
+    })).toBe(true);
+
+    expect(resolveBoth()).toMatchObject({
+      sourceSessionId: 'sess-b', sourceTurnId: 'om_source_b',
+    });
+    const enriched = readFileSync(
+      join(tempDir, '.dashboard-secret.cross-chat-follow-thread', 'sess-a.jsonl'),
+      'utf-8',
+    ).trim().split('\n').map(line => JSON.parse(line));
+    expect(enriched).toHaveLength(2);
+    expect(enriched[1]).toMatchObject({
+      sentAtMs: 1000, sourceTurnId: 'om_source_a', messageId: 'om_delivery_a',
+    });
   });
 
   it('serializes replay at with a concurrent off writer across real processes', async () => {

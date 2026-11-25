@@ -331,6 +331,11 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { comparableSessionDir } from './core/working-dir-range.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage, WorkerToDaemon } from './types.js';
 import { mergeStagedSessionTurnInputs, projectLarkTurnInbound, stageSessionTurnInbound } from './services/session-turns.js';
+import {
+  buildTaskContinuationCaller,
+  reforkActivationTrustedCaller,
+  taskContinuationSourceOpenId,
+} from './core/task-continuation-caller.js';
 
 export function useOrdinaryOutputDelivery(): void {
   setDurableBridgeFinalOutputHandler(undefined);
@@ -4425,6 +4430,7 @@ function crossChatFollowUpIsCurrent(ctx: RoutingContext): boolean {
     : undefined;
   const valid = !!current
     && current.sourceSessionId === expected.sourceSessionId
+    && current.sourceTurnId === expected.sourceTurnId
     && current.followThreadEpoch === expected.followThreadEpoch
     && current.sourceChatId === expected.sourceChatId
     && current.scope === expected.scope
@@ -30937,10 +30943,31 @@ async function handleThreadReplyAdmitted(
     senderIsBotTriState(parsed.senderType, isForeignBot),
     parsed.messageId,
   );
+  const continuationTrustedCaller = ctx.crossChatThreadFollowUp?.sourceTurnId
+    && rawThreadTrustedCaller?.senderType === 'bot'
+    ? await (async (): Promise<TrustedCaller | undefined> => {
+        const source = findActiveBySessionId(ctx.crossChatThreadFollowUp!.sourceSessionId);
+        if (!source || source.larkAppId !== larkAppId || source.session.status !== 'active') return undefined;
+        const sourceTurnId = ctx.crossChatThreadFollowUp!.sourceTurnId!;
+        const sourceOpenId = taskContinuationSourceOpenId(source.session, sourceTurnId);
+        if (!sourceOpenId) return undefined;
+        const principal = await trustedCallerForInboundTurn(
+          larkAppId, sourceOpenId, undefined, false, sourceTurnId,
+        );
+        return buildTaskContinuationCaller({
+          rawCaller: rawThreadTrustedCaller,
+          sourcePrincipal: principal,
+          larkAppId,
+          sourceSession: source.session,
+          sourceTurnId,
+        });
+      })()
+    : undefined;
   // Cross-chat followed thread replies are admitted via talk-gate exemption on
   // the bot's own cross-chat thread, so they never replace the origin session's
   // execution principal (nor trigger XPI principal staging in the origin chat).
   const threadTrustedCaller = ctx.crossChatThreadFollowUp ? undefined : rawThreadTrustedCaller;
+  const turnTrustedCaller = threadTrustedCaller ?? continuationTrustedCaller;
   const xpiControlNotice = rawThreadTrustedCaller?.senderType === 'bot'
     ? parseCrossPrincipalControlNotice(parsed.content)
     : undefined;
@@ -31709,6 +31736,7 @@ async function handleThreadReplyAdmitted(
         // (initialStartPending follower) tail entry — the strip-proof admit rebuild
         // then preserves it through promote/repark. Only a plain-human turn is true.
         if (codexAppSteerable) followUp.codexAppSteerable = true;
+        if (turnTrustedCaller) followUp.trustedCaller = turnTrustedCaller;
         return followUp;
       },
     });
@@ -31806,7 +31834,7 @@ async function handleThreadReplyAdmitted(
         ds.pendingPrompt = promptContent;
         ds.pendingTurnId = parsed.messageId;
         ds.pendingStructuredOpeningTurnId = parsed.messageId;
-        ds.pendingTrustedCaller = threadTrustedCaller;
+        ds.pendingTrustedCaller = turnTrustedCaller;
         ds.pendingCodexAppText = parsed.content;
         ds.pendingAcceptedInput = ctx.acceptedInput;
         ds.pendingCodexAppApplicationContext = codexAppApplicationContext;
@@ -31864,6 +31892,7 @@ async function handleThreadReplyAdmitted(
         ds.session.queuedCodexAppMessageContext ??= ds.pendingCodexAppMessageContext;
         // R5-B1-1: freeze steer authorization onto the pending-repo follower tail.
         if (codexAppSteerable) exactFollowUp.codexAppSteerable = true;
+        if (turnTrustedCaller) exactFollowUp.trustedCaller = turnTrustedCaller;
         // No await separates this arrival from its admission, so the FIFO
         // order is stamped by the admit itself.
         const admitted = admitQueuedActivationTail(ds, {
@@ -32529,7 +32558,7 @@ async function handleThreadReplyAdmitted(
             : {}),
           ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true as const } : {}),
-          ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
+          ...(turnTrustedCaller ? { trustedCaller: turnTrustedCaller } : {}),
           // Design §5.5: a main-topic handoff lands in this bot's ordinary
           // session there, which may be busy with someone else's turn. It
           // must start as a turn of its own (its node deadline counts from
@@ -32549,11 +32578,11 @@ async function handleThreadReplyAdmitted(
           retryDurablePrimaryIngress(ctx, 'attached task provider submit receipt is still pending');
         }
         beginNewTurn(ds, parsed.content, parsed.messageId);
-        if (threadTrustedCaller) {
+        if (turnTrustedCaller) {
           setActiveInteractiveTurn(
             ds,
             parsed.messageId,
-            threadTrustedCaller,
+            turnTrustedCaller,
             stripCrossPrincipalAsToken(parsed.content).text,
           );
         }
@@ -32702,7 +32731,7 @@ async function handleThreadReplyAdmitted(
           // the live-worker path (admission computed once at line ~18431; COPIED
           // here, never re-inferred). System/recovery openings keep it absent.
           if (codexAppSteerable) currentFollowUp.codexAppSteerable = true;
-          if (threadTrustedCaller) currentFollowUp.trustedCaller = threadTrustedCaller;
+          if (turnTrustedCaller) currentFollowUp.trustedCaller = turnTrustedCaller;
           return currentFollowUp;
         },
       });
@@ -32805,6 +32834,11 @@ async function handleThreadReplyAdmitted(
     // existing tail before starting the activation journal.
     const queuedHasDurableTail = queuedOpeningHasTail(ds.session, ctx.acceptedInput);
     if (queuedHasDurableTail) await stageCurrentBehindQueuedActivation();
+    const reforkTrustedCaller = reforkActivationTrustedCaller({
+      threadCaller: threadTrustedCaller,
+      continuationCaller: continuationTrustedCaller,
+      queuedHasDurableTail,
+    });
     const reforkContent = queuedDashboardTurn && !queuedHasDurableTail
       ? `${ds.session.queuedPrompt}\n\n${promptContent}`
       : queuedHasDurableTail
@@ -32976,7 +33010,7 @@ async function handleThreadReplyAdmitted(
           ...((ds.session.xpiSharedCwdAdmissionGroupId || ds.session.principalLane)
             ? { atMostOnce: true }
             : {}),
-          ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
+          ...(reforkTrustedCaller ? { trustedCaller: reforkTrustedCaller } : {}),
           ...((ds.session.xpiSharedCwdAdmissionGroupId || ds.session.principalLane)
             ? {
                 onWorkerGenerationReserved(workerGeneration: number) {
@@ -33008,8 +33042,8 @@ async function handleThreadReplyAdmitted(
         if (codexAppSteerable && !queuedDashboardTurn && !queuedHasDurableTail) {
           wrappedInput.codexAppSteerable = true;
         }
-        if (threadTrustedCaller && !queuedHasDurableTail) {
-          wrappedInput.trustedCaller = threadTrustedCaller;
+        if (reforkTrustedCaller && !queuedHasDurableTail) {
+          wrappedInput.trustedCaller = reforkTrustedCaller;
         }
         reforkAccepted = forkWorker(ds, wrappedInput, {
           // See `hadPriorCliInput` above — an opening on a CLI that never took any
@@ -33073,13 +33107,13 @@ async function handleThreadReplyAdmitted(
       return;
     }
     markIngressAdmitted(ctx);
-    if (reforkAccepted && threadTrustedCaller) {
+    if (reforkAccepted && reforkTrustedCaller) {
       setActiveInteractiveTurn(
         ds,
         queuedHasDurableTail
           ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
           : parsed.messageId,
-        threadTrustedCaller,
+        reforkTrustedCaller,
         queuedHasDurableTail ? undefined : stripCrossPrincipalAsToken(parsed.content).text,
       );
     }

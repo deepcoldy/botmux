@@ -12,6 +12,7 @@ export interface CrossChatFollowedThreadOrigin {
 
 export interface CrossChatFollowedThreadMatch extends CrossChatFollowedThreadOrigin {
   sourceSessionId: string;
+  sourceTurnId?: string;
   followThreadEpoch?: string;
   scope: 'chat' | 'thread';
   anchor: string;
@@ -155,6 +156,7 @@ export function resolveCrossChatFollowedThread(input: {
     session: CrossChatCandidateSession;
     canonicalRootId: string;
     sentAtMs: number;
+    sourceTurnId?: string;
   } | null = null;
 
   for (const s of sessionById.values()) {
@@ -194,7 +196,7 @@ export function resolveCrossChatFollowedThread(input: {
       if (marker.crossChatFollowThread === 'off') continue;
       const sentAtMs = Number.isFinite(marker.sentAtMs) ? marker.sentAtMs : 0;
       if (!best || sentAtMs > best.sentAtMs) {
-        best = { session: s, canonicalRootId, sentAtMs };
+        best = { session: s, canonicalRootId, sentAtMs, sourceTurnId: marker.sourceTurnId };
       }
     }
   }
@@ -207,6 +209,7 @@ export function resolveCrossChatFollowedThread(input: {
 
   return {
     sourceSessionId: best.session.sessionId,
+    ...(best.sourceTurnId ? { sourceTurnId: best.sourceTurnId } : {}),
     followThreadEpoch: best.session.followThreadEpoch,
     sourceChatId: best.session.chatId,
     scope: isChat ? 'chat' : 'thread',

@@ -658,6 +658,7 @@ export class PluginMcpGateway {
       // two fields above: a plugin that maps the caller onto real access needs
       // it, an unrelated HTTP-transport server does not.
       ...(caller?.senderType ? { senderType: caller.senderType } : {}),
+      ...(caller?.taskContinuation ? { taskContinuation: caller.taskContinuation } : {}),
       ...(identity?.turnId ? { turnId: identity.turnId } : {}),
       ...(this.env.BOTMUX_SESSION_ID ? { sessionId: this.env.BOTMUX_SESSION_ID } : {}),
       ...(identity?.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),

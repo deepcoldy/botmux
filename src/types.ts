@@ -123,6 +123,17 @@ export interface TrustedCaller {
     email: string;
     source: 'bot_config';
   };
+  /** Human principal of the exact source turn for a followed cross-chat bot
+   * reply. The immediate caller remains the bot above; credential consumers
+   * must opt in to this bounded continuation instead of rewriting senderType. */
+  taskContinuation?: {
+    appId: string;
+    openId: string;
+    unionId?: string;
+    verifiedEmail?: string;
+    sourceSessionId: string;
+    sourceTurnId: string;
+  };
 }
 
 export interface VcMeetingConsumerProfileFilter {

@@ -122,6 +122,8 @@ import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleThreadReply as handleThreadReply,
 } from '../src/daemon.js';
+import { beginReplyTargetTurn } from '../src/core/reply-target.js';
+import { setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
@@ -183,12 +185,35 @@ function resumeRegisters(): void {
 
 const replies = (): string[] => mocks.replyMessage.mock.calls.map(call => String(call[2] ?? ''));
 
-function writeFollowBinding(sessionId: string, followThreadEpoch?: string): void {
+function writeFollowBinding(sessionId: string, followThreadEpoch?: string, turnId?: string): void {
   recordBridgeReplyMarker({
     dataDir: mocks.dataDir, sessionId, sentAtMs: 1000, messageId: 'om_external_followed_root',
     deliveryKind: 'detoured_send', content: 'cross-chat', targetChatId: 'oc_external_followed',
-    crossChatFollowThread: 'at', followThreadEpoch,
+    crossChatFollowThread: 'at', followThreadEpoch, turnId,
   });
+}
+
+function primeContinuationSource(source: DaemonSession): void {
+  source.session.followThreadEpoch = 'epoch-current';
+  beginReplyTargetTurn(source, undefined, 'om_origin_human', new Date().toISOString(), {
+    senderOpenId: OWNER,
+    participants: [{ openId: OWNER, isBot: false }],
+    sourceMessageId: 'om_origin_human',
+  });
+  writeFollowBinding(source.session.sessionId, 'epoch-current', 'om_origin_human');
+}
+
+function attachContinuationContext(ctx: RoutingContext, sessionId: string): void {
+  ctx.crossChatThreadFollowUp = {
+    sourceSessionId: sessionId,
+    sourceTurnId: 'om_origin_human',
+    sourceChatId: CHAT,
+    followedChatId: 'oc_external_followed',
+    followedRootMessageId: 'om_external_followed_root',
+    scope: 'thread',
+    anchor: ROOT,
+    followThreadEpoch: 'epoch-current',
+  };
 }
 
 beforeEach(() => {
@@ -204,6 +229,7 @@ beforeEach(() => {
   bot.botOpenId = APP_OPEN_ID;
   bot.botName = 'Worker';
   activeSessions.clear();
+  setActiveSessionsRegistry(activeSessions);
   mocks.closedRows.length = 0;
   mocks.createdSessions.length = 0;
   mocks.getChatMode.mockResolvedValue('topic');
@@ -211,6 +237,7 @@ beforeEach(() => {
 });
 
 afterAll(() => {
+  setActiveSessionsRegistry(undefined);
   rmSync(mocks.ownRoot, { recursive: true, force: true });
 });
 
@@ -336,6 +363,99 @@ describe('a message in a topic whose session was closed (real route)', () => {
     expect(String(mocks.forkWorker.mock.calls[0]?.[1].content)).toContain('@session fresh');
   });
 
+  it('freezes the source-human continuation on a cross-chat durable follower behind an opening', async () => {
+    vi.useFakeTimers({ now: new Date('2026-11-25T00:00:00.000Z') });
+    try {
+      resumeRegisters();
+      await mocks.resumeSession('sess-live');
+      mocks.resumeSession.mockClear();
+      const source = activeSessions.get(sessionKey(ROOT, APP))!;
+      primeContinuationSource(source);
+      source.initialStartPending = true;
+      source.initialStartClaimToken = 'opening-owned-by-earlier-handler';
+      const { data, ctx } = event('长任务完成，请继续', 'bot');
+      attachContinuationContext(ctx, 'sess-live');
+
+      await handleThreadReply(data, ctx);
+
+      expect(source.session.queuedActivationTail).toHaveLength(1);
+      expect(source.session.queuedActivationTail?.[0]?.cliInput.trustedCaller).toMatchObject({
+        requestUserOpenId: LEAD_OPEN_ID,
+        senderType: 'bot',
+        taskContinuation: {
+          openId: OWNER,
+          sourceSessionId: 'sess-live',
+          sourceTurnId: 'om_origin_human',
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('freezes the source-human continuation when a cross-chat reply becomes a pending-repo opening', async () => {
+    vi.useFakeTimers({ now: new Date('2026-11-25T00:00:00.000Z') });
+    try {
+      resumeRegisters();
+      await mocks.resumeSession('sess-live');
+      mocks.resumeSession.mockClear();
+      const source = activeSessions.get(sessionKey(ROOT, APP))!;
+      primeContinuationSource(source);
+      source.pendingRepo = true;
+      source.pendingPrompt = undefined;
+      source.pendingRawInput = undefined;
+      source.pendingAttachments = undefined;
+      const { data, ctx } = event('选择仓库后继续', 'bot');
+      attachContinuationContext(ctx, 'sess-live');
+
+      await handleThreadReply(data, ctx);
+
+      expect(source.pendingTurnId).toBe(ctx.messageId);
+      expect(source.pendingTrustedCaller).toMatchObject({
+        requestUserOpenId: LEAD_OPEN_ID,
+        senderType: 'bot',
+        taskContinuation: {
+          openId: OWNER,
+          sourceSessionId: 'sess-live',
+          sourceTurnId: 'om_origin_human',
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('freezes the source-human continuation on a pending-repo follower tail', async () => {
+    vi.useFakeTimers({ now: new Date('2026-11-25T00:00:00.000Z') });
+    try {
+      resumeRegisters();
+      await mocks.resumeSession('sess-live');
+      mocks.resumeSession.mockClear();
+      const source = activeSessions.get(sessionKey(ROOT, APP))!;
+      primeContinuationSource(source);
+      source.pendingRepo = true;
+      source.pendingPrompt = '已有 opening';
+      source.pendingTurnId = 'om_existing_opening';
+      const { data, ctx } = event('跟在 opening 后继续', 'bot');
+      attachContinuationContext(ctx, 'sess-live');
+
+      await handleThreadReply(data, ctx);
+
+      expect(source.session.queuedActivationTail).toHaveLength(1);
+      expect(source.session.queuedActivationTail?.[0]?.cliInput.trustedCaller).toMatchObject({
+        requestUserOpenId: LEAD_OPEN_ID,
+        senderType: 'bot',
+        taskContinuation: {
+          openId: OWNER,
+          sourceSessionId: 'sess-live',
+          sourceTurnId: 'om_origin_human',
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('rejects a cross-chat follow-up when the source lifecycle changed before admission', async () => {
     resumeRegisters();
     await mocks.resumeSession('sess-live');
@@ -348,6 +468,25 @@ describe('a message in a topic whose session was closed (real route)', () => {
       sourceSessionId: 'sess-live', sourceChatId: CHAT, followedChatId: 'oc_external_followed',
       followedRootMessageId: 'om_external_followed_root', scope: 'thread', anchor: ROOT,
       followThreadEpoch: 'epoch-old',
+    };
+    await handleThreadReply(data, ctx);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.resumeSession).not.toHaveBeenCalled();
+  });
+
+  it('rejects a cross-chat continuation when the followed root was rebound to another source turn', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    source.session.followThreadEpoch = 'epoch-current';
+    writeFollowBinding('sess-live', 'epoch-current', 'om_new_source_turn');
+    const { data, ctx } = event('stale principal continuation', 'bot');
+    ctx.crossChatThreadFollowUp = {
+      sourceSessionId: 'sess-live', sourceTurnId: 'om_old_source_turn', sourceChatId: CHAT,
+      followedChatId: 'oc_external_followed', followedRootMessageId: 'om_external_followed_root',
+      scope: 'thread', anchor: ROOT, followThreadEpoch: 'epoch-current',
     };
     await handleThreadReply(data, ctx);
     expect(mocks.forkWorker).not.toHaveBeenCalled();

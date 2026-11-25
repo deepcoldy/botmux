@@ -165,6 +165,7 @@ describe('cross-chat followed thread binding', () => {
       content: '发车通知',
       targetChatId: GROUP_B,
       crossChatFollowThread: 'at',
+      turnId: 'om_origin_human_turn',
     });
 
     const matchTopLevel = resolveCrossChatFollowedThread({
@@ -176,6 +177,7 @@ describe('cross-chat followed thread binding', () => {
     });
     expect(matchTopLevel).toEqual({
       sourceSessionId: 'sess-a',
+      sourceTurnId: 'om_origin_human_turn',
       sourceChatId: GROUP_A,
       scope: 'chat',
       anchor: GROUP_A,

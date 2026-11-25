@@ -19172,6 +19172,7 @@ async function writeAdoptMessage(
   trustedCaller?: TrustedCaller,
   trustedController?: TrustedCaller,
   fence?: AdoptWriteFence,
+  queueAfterActiveTurn?: true,
 ): Promise<AdoptWriteResult> {
   rememberTurnLinkRefMode(turnId, dispatchAttempt, linkRefMode);
   const executionFence = fence ?? captureAdoptWriteFence();
@@ -19194,7 +19195,13 @@ async function writeAdoptMessage(
   setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId);
   currentBotmuxLinkRefMode = linkRefMode;
   currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
-  markActiveTurnStarted({ turnId, dispatchAttempt, trustedCaller, trustedController });
+  markActiveTurnStarted({
+    turnId,
+    dispatchAttempt,
+    trustedCaller,
+    trustedController,
+    ...(queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
+  });
   if (dispatchAttempt !== undefined) durableTurnInFlight = true;
   writeCliPidMarker();
   publishSandboxRelayCapability();
@@ -19467,11 +19474,37 @@ async function runAdoptMessageForCapturedGeneration(
       item.trustedCaller,
       item.trustedController,
       fence,
+      item.queueAfterActiveTurn,
     ),
   });
   if (queued.status === 'stale-before-write') return 'stale-before-write';
   if (queued.value === 'stale-before-write') requeueOnce();
   return queued.value;
+}
+
+/** Admit one ordinary adopted-pane message without crossing a serial turn
+ * boundary. Adopt IPC listeners can overlap, so a queueAfterActiveTurn item
+ * must enter the prompt-driven queue even when the backend object is already
+ * available; writing it directly would adopt its envelope over the busy turn
+ * while retaining that turn's caller. */
+async function admitAdoptMessage(item: PendingCliInput): Promise<void> {
+  if (cliRestartInProgress || rawInputRestartGate || !backend
+    || item.queueAfterActiveTurn
+    || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()) {
+    pendingAdoptMessages.push(item);
+    log(item.queueAfterActiveTurn
+      ? `Queued serial adopt message until the active turn reaches a real prompt boundary (${item.content.length} chars)`
+      : `Deferred adopt message until the CLI generation/input gate settles (${item.content.length} chars)`);
+    // A serial item may arrive while the adopted pane is already idle. Re-drive
+    // now; flushPending itself requires prompt readiness and a stable generation,
+    // and otherwise the next real ready edge retries.
+    if (item.queueAfterActiveTurn) void flushPending();
+    return;
+  }
+  await runAdoptMessageForCapturedGeneration(item, () => {
+    pendingAdoptMessages.push(item);
+    log(`Re-queued stale adopt message for the replacement CLI generation (${item.content.length} chars)`);
+  });
 }
 
 function isWorkflowWorker(): boolean {
@@ -27752,6 +27785,12 @@ function sendToPty(
   } = {},
 ): boolean {
   rememberTurnLinkRefMode(turnId, opts.dispatchAttempt, opts.linkRefMode);
+  // A followed cross-chat bot reply is a separate source-turn principal even
+  // when another reply from the same peer bot currently owns the CLI. Keep it
+  // on the terminal boundary instead of letting adapter type-ahead, queue
+  // merging, or isolation-off envelope adoption splice tasks together.
+  const queueAfterActiveTurn = opts.queueAfterActiveTurn
+    || !!opts.trustedCaller?.taskContinuation;
   const next: PendingCliInput = {
     content,
     turnId,
@@ -27761,7 +27800,7 @@ function sendToPty(
     // exhausted latch that outlives the queued pane (reselectPerTurn off)
     // must NOT tag later independent turns here — that would suppress message
     // merging and markNewTurn for the rest of the session.
-    ...((opts.queueAfterActiveTurn || (traexAutoModelRuntimeEligible()
+    ...((queueAfterActiveTurn || (traexAutoModelRuntimeEligible()
       && traexAutoModelController?.capacityCurrentlyBlocking()))
       ? { queueAfterActiveTurn: true } : {}),
     ...(opts.replyTurnId ? { replyTurnId: opts.replyTurnId } : {}),
@@ -27834,7 +27873,7 @@ function sendToPty(
   // wedged blocking flag silently swallows every subsequent message — without
   // this override the user has no way to recover from Lark. Mirrors the
   // web-terminal text-input path (handleTuiTextInput).
-  if (tuiPromptBlocking && !opts.queueAfterActiveTurn) {
+  if (tuiPromptBlocking && !queueAfterActiveTurn) {
     log(`User override: incoming Lark message clears tuiPromptBlocking — "${content.substring(0, 80)}"`);
     tuiPromptBlocking = false;
     // Tear down the prompt card so the user doesn't see stale options.
@@ -42670,6 +42709,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         const item: PendingCliInput = {
           content,
           turnId: msg.turnId,
+          ...(msg.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
           replyTurnId: msg.replyTurnId,
           dispatchAttempt: msg.dispatchAttempt,
           linkRefMode: msg.linkRefMode,
@@ -42684,15 +42724,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // process.on('message') does not serialize async listeners. Hold the
         // per-worker queue across transcript mark + complete adapter write so
         // two CoCo/Codex paste→wait→Enter/history cycles cannot overlap.
-        if (cliRestartInProgress || rawInputRestartGate || !backend || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()) {
-          pendingAdoptMessages.push(item);
-          log(`Deferred adopt message until the CLI generation/input gate settles (${content.length} chars)`);
-        } else {
-          await runAdoptMessageForCapturedGeneration(item, () => {
-            pendingAdoptMessages.push(item);
-            log(`Re-queued stale adopt message for the replacement CLI generation (${content.length} chars)`);
-          });
-        }
+        await admitAdoptMessage(item);
       } else {
         const enqueueMessage = (): void => {
           // Non-adopt: enqueue only. Bridge mark is deferred to flushPending
