@@ -696,4 +696,85 @@ describe('CoT message of a turn that ended with background tasks running', () =>
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('retains ds.managedTurnOrigin on completed turn_terminal ONLY when authorityHeldForBackground is true', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    ds.managedTurnOrigin = {
+      capability: 'cap_keep_1',
+      policyCapability: 'pol_1',
+      turnId: 'om_turn',
+      callerOpenId: 'ou_user_a',
+      preexistingProcessIdentities: ['100:1'],
+    };
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_turn',
+      status: 'completed',
+      backgroundTasks: 1,
+      authorityHeldForBackground: true,
+    });
+    expect(ds.managedTurnOrigin?.turnId).toBe('om_turn');
+    expect(ds.managedTurnOrigin?.capability).toBe('cap_keep_1');
+    expect(ds.managedTurnOrigin?.callerOpenId).toBe('ou_user_a');
+
+    // Without authorityHeldForBackground (e.g. Turn 2 ending while Turn 1 bg task runs),
+    // daemon MUST wipe ds.managedTurnOrigin even when backgroundTasks === 1!
+    ds.managedTurnOrigin = {
+      capability: 'cap_wipe_2',
+      policyCapability: 'pol_1',
+      turnId: 'om_turn2',
+      callerOpenId: 'ou_user_b',
+    };
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_turn2',
+      status: 'completed',
+      backgroundTasks: 1,
+    });
+    expect(ds.managedTurnOrigin?.turnId).toBeUndefined();
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+
+    // Failed terminal MUST NEVER retain ds.managedTurnOrigin even if authorityHeldForBackground were forged!
+    ds.managedTurnOrigin = {
+      capability: 'cap_wipe_3',
+      policyCapability: 'pol_1',
+      turnId: 'om_turn3',
+      callerOpenId: 'ou_user_a',
+    };
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_turn3',
+      status: 'failed',
+      authorityHeldForBackground: true,
+    });
+    expect(ds.managedTurnOrigin?.turnId).toBeUndefined();
+  });
+
+  it('clears ds.activeInteractiveTurn synchronously on suspendWorker and killWorker', () => {
+    const { ds } = setup({ cliId: 'claude-code' });
+    ds.activeInteractiveTurn = {
+      turnId: 'om_turn',
+      caller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_user_a', senderType: 'user' },
+    };
+    ds.initConfig = { backendType: 'tmux' } as DaemonSession['initConfig'];
+    __testOnly_setSuspendBackingVerifier(() => true);
+    try {
+      expect(suspendWorker(ds)).toBe(true);
+    } finally {
+      __testOnly_setSuspendBackingVerifier();
+    }
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+
+    const s2 = setup({ cliId: 'claude-code', adopted: true });
+    s2.ds.worker = null;
+    s2.ds.activeInteractiveTurn = {
+      turnId: 'om_turn',
+      caller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_user_a', senderType: 'user' },
+    };
+    killWorker(s2.ds);
+    expect(s2.ds.activeInteractiveTurn).toBeUndefined();
+  });
 });

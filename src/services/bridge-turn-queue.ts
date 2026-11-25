@@ -31,6 +31,7 @@
 import {
   normaliseForFingerprint,
   normaliseTranscriptFingerprintCandidates,
+  isClaudeApiRequestBlob,
   isMeaningfulUserEvent,
   isMeaningfulQueuedCommand,
   isMidTurnAbsorbedQueuedCommand,
@@ -1315,6 +1316,7 @@ export class BridgeTurnQueue {
         this.settleBackgroundTasksFromEvent(ev, true);
         continue;
       }
+      if (isClaudeApiRequestBlob(ev)) continue;
       if (isMainThreadApiRequestEvent(ev)) {
         const hasStableId = typeof ev.id === 'string' && ev.id.length > 0;
         const apiKey = hasStableId

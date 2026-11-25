@@ -57,6 +57,13 @@ import {
 } from '../../src/core/traex-first-prompt-readiness.js';
 import { DEFAULT_RENDER_COLS, DEFAULT_RENDER_ROWS } from '../../src/utils/render-dimensions.js';
 import { WebTerminalInputController, WebTerminalInputWireState } from '../../src/core/web-terminal-input-controller.js';
+import {
+  BackgroundTurnAuthorityHold,
+  LegacyAgentAckPairer,
+  applyClaudeTranscriptEventToAuthorityHold,
+  isDeferrableAuthorityReleaseReason,
+} from '../../src/core/background-turn-authority.js';
+import { backgroundTaskSettledIds, eventTimeMs, isClaudeTurnDurationEvent } from '../../src/services/claude-transcript.js';
 import { BusyReadyDeferralTracker, BusyReadyLogThrottle } from '../../src/utils/busy-ready-deferral.js';
 import { ClaudePermissionNoticeTracker } from '../../src/services/claude-action-prompt.js';
 import {
@@ -111,9 +118,50 @@ const INERT_BACKGROUND_TASK_TRACKER = {
   backgroundWait: () => 0,
   hasPendingNonPersistentMonitor: () => false,
   pending: () => 0,
+  pendingTurnAgents: () => 0,
+  liveTaskIds: () => [] as string[],
   liveTasksSnapshot: () => [],
   liveSinceMsValue: () => 0,
+  noteMainTurn() {},
+  observe() {},
+  launch() {},
+  settle() {},
+  reset() {},
 };
+const INERT_BACKGROUND_AUTHORITY_HOLD = {
+  phase: () => 'IDLE' as const,
+  owner: () => undefined,
+  liveFloorMs: () => 0,
+  holds: () => false,
+  isBackgroundHeld: () => false,
+  isIdleWaiting: () => false,
+  isWakeActive: () => false,
+  hasOwnedWork: () => false,
+  nextDeadlineMs: () => undefined,
+  noteDurationMarkerObserved() {},
+  resetDurationMarkerObserved() {},
+  isDurationMarkerObserved: () => false,
+  isForegroundProvisionalEndObserved: () => false,
+  seedPreexistingLiveTasks() {},
+  recordHistoricalSettlement() {},
+  onForegroundTurnStarted: () => ({ action: 'none' as const }),
+  onTaskLaunched: () => ({ action: 'none' as const }),
+  onTaskSettled: () => ({ action: 'none' as const }),
+  onPendingWakeRemoved: () => ({ action: 'none' as const }),
+  onWakeDelivered: () => ({ action: 'none' as const }),
+  onForegroundProvisionalEnd() {},
+  onForegroundTurnEnded: () => ({ action: 'none' as const }),
+  onForegroundTurnTerminal: () => false,
+  onWakeTurnProvisionalEnd: () => ({ action: 'none' as const }),
+  onWakeTurnActivity() {},
+  onWakeTurnEnded: () => ({ action: 'none' as const }),
+  onSuperseded: () => ({ action: 'none' as const }),
+  onPromptReady: () => ({ action: 'none' as const }),
+  onTick: () => ({ action: 'none' as const }),
+  clearIfOwner() {},
+  reset() {},
+};
+const INERT_LEGACY_AGENT_ACK_PAIRER = { observe: () => [] as Array<{ taskId: string; kind: 'agent' }>, reset() {} };
 /** The worker's away-summary focus controller, doing nothing unless a test supplies its own. */
 const INERT_AWAY_SUMMARY_FOCUS = { request() {}, noteSuggestion() {}, beforeDaemonMessage() {}, noteRecap() {}, noteCliTurnStarted() {}, restore() {}, reset() {}, isBlurred: false, isActive: false };
 
@@ -208,6 +256,20 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'daemonCotHoldMayBeActive') return (scope.daemonCotHoldMayBeActive ??= false);
   if (key === 'backgroundTasksTrackedForSiblings') return (scope.backgroundTasksTrackedForSiblings ??= false);
   if (key === 'foldBackgroundUpdatesLive') return scope.foldBackgroundUpdatesLive;
+  if (key === 'backgroundAuthorityHold') return INERT_BACKGROUND_AUTHORITY_HOLD;
+  if (key === 'legacyAgentAckPairer') return INERT_LEGACY_AGENT_ACK_PAIRER;
+  if (key === 'backgroundHoldTimer') return (scope.backgroundHoldTimer ??= null);
+  if (key === 'isDeferrableAuthorityReleaseReason') return isDeferrableAuthorityReleaseReason;
+  if (key === 'applyClaudeTranscriptEventToAuthorityHold') return applyClaudeTranscriptEventToAuthorityHold;
+  if (key === 'BackgroundTurnAuthorityHold') return BackgroundTurnAuthorityHold;
+  if (key === 'LegacyAgentAckPairer') return LegacyAgentAckPairer;
+  if (key === 'backgroundTaskSettledIds') return backgroundTaskSettledIds;
+  if (key === 'eventTimeMs') return eventTimeMs;
+  if (key === 'isClaudeTurnDurationEvent') return isClaudeTurnDurationEvent;
+  if (key === 'applyBackgroundAuthorityTransition') return () => {};
+  if (key === 'supersedeBackgroundAuthorityHold') return () => {};
+  if (key === 'scheduleBackgroundHoldTimer') return () => {};
+  if (key === 'clearBackgroundHoldTimer') return () => {};
   return undefined;
 }
 
@@ -337,7 +399,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'isAuthoritativeSubmitSendMarker') return isAuthoritativeSubmitSendMarker;
     if (key === 'randomBytes') return randomBytes;
     if (key === 'sanitizeClaudeInput') return sanitizeClaudeInput;
-    if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'isTraexTmuxViewportBackend', 'isTraexHcViewportBackend', 'isTraexNativeViewportBackend', 'currentTraexCliLifetimeNonce', 'currentTraexGridRevision', 'currentTraexControlWriteRevision', 'currentTraexInterruptGeneration', 'clearTraexStartupWebRecheck', 'currentWebResizedGridFor', 'syncHcPaneSizeFor', 'invalidateTraexNativeViewportEvidence', 'activeTraexNativeViewportEvidence', 'readTraexStartupViewportScreen', 'traexWebInputSettleStatus', 'traexNativeStartupScreenAdmitsPure', 'traexPromptReadyGateBlocks', 'probeAndPublishTraexNativeViewport', 'scheduleTraexNativeViewportRefreshIfNeeded', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'backgroundTranscriptChainFilePath', 'persistBackgroundTranscriptChain', 'latestClosedTranscriptOffset', 'prepareBackgroundTranscriptReplay', 'recordBackgroundTranscriptRotation', 'spawnCliBody', 'deferSessionReadyUntilRuntimeAssigned', 'takeDeferredSessionReady', 'replayDeferredSessionReady', 'clearDeferredSessionReady', 'setCaptureIdentity', 'cotEntryWellFormed', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'acknowledgeQueuedActivationToken', 'probeAuthoritativeQueuedActivationEvidence', 'observeAuthoritativeClaudeTurnStart', 'observeAuthoritativeStructuredTurnStart', 'claudeActivationTranscriptPathAllowed', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', 'foldBackgroundUpdatesInitEnabled', 'foldBackgroundUpdatesEnabled', 'setFoldBackgroundUpdatesLive', 'resetFoldBackgroundUpdatesStateForInit', 'isSuppressedNonTerminalMonitorWake', 'sendTerminalTurnStarted', 'resolveMonitorWakeCotAnchor', 'computeBackgroundCotHold', 'observePendingMonitorWakeCotActivity', 'flushPendingMonitorWakeCotOnTextlessComplete', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
+    if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'isTraexTmuxViewportBackend', 'isTraexHcViewportBackend', 'isTraexNativeViewportBackend', 'currentTraexCliLifetimeNonce', 'currentTraexGridRevision', 'currentTraexControlWriteRevision', 'currentTraexInterruptGeneration', 'clearTraexStartupWebRecheck', 'currentWebResizedGridFor', 'syncHcPaneSizeFor', 'invalidateTraexNativeViewportEvidence', 'activeTraexNativeViewportEvidence', 'readTraexStartupViewportScreen', 'traexWebInputSettleStatus', 'traexNativeStartupScreenAdmitsPure', 'traexPromptReadyGateBlocks', 'probeAndPublishTraexNativeViewport', 'scheduleTraexNativeViewportRefreshIfNeeded', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'backgroundTranscriptChainFilePath', 'persistBackgroundTranscriptChain', 'latestClosedTranscriptOffset', 'prepareBackgroundTranscriptReplay', 'recordBackgroundTranscriptRotation', 'isClaudeFamilyCli', 'spawnCliBody', 'deferSessionReadyUntilRuntimeAssigned', 'takeDeferredSessionReady', 'replayDeferredSessionReady', 'clearDeferredSessionReady', 'setCaptureIdentity', 'cotEntryWellFormed', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'acknowledgeQueuedActivationToken', 'probeAuthoritativeQueuedActivationEvidence', 'observeAuthoritativeClaudeTurnStart', 'observeAuthoritativeStructuredTurnStart', 'claudeActivationTranscriptPathAllowed', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', 'foldBackgroundUpdatesInitEnabled', 'foldBackgroundUpdatesEnabled', 'setFoldBackgroundUpdatesLive', 'resetFoldBackgroundUpdatesStateForInit', 'isSuppressedNonTerminalMonitorWake', 'sendTerminalTurnStarted', 'resolveMonitorWakeCotAnchor', 'computeBackgroundCotHold', 'observePendingMonitorWakeCotActivity', 'flushPendingMonitorWakeCotOnTextlessComplete', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }

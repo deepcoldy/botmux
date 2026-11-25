@@ -341,7 +341,7 @@ export function hasTranscriptRole(
  *  placeholders and Claude's `<synthetic>` sentinel are not the main session's
  *  model, so they yield undefined rather than a false "model changed". */
 export function servingModelFromAssistantEvent(ev: TranscriptEvent): string | undefined {
-  if (!ev || typeof ev !== 'object') return undefined;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) return undefined;
   if ((ev as any).isSidechain === true) return undefined;
   if (ev.isApiErrorMessage === true || isTranscriptRateLimitEvent(ev)) return undefined;
   if (!hasTranscriptRole(ev, 'assistant')) return undefined;
@@ -650,7 +650,7 @@ export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
  *  its content shape. Provider-success accounting must exclude all of these;
  *  turn-terminal classification narrows this further for local tool calls. */
 export function isSyntheticAssistantRecord(ev: TranscriptEvent | null | undefined): boolean {
-  if (!ev || typeof ev !== 'object' || ev.isApiErrorMessage === true) return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isApiErrorMessage === true) return false;
   return hasTranscriptRole(ev, 'assistant') && ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
 }
 
@@ -683,7 +683,7 @@ export function isSyntheticNoModelReplyEvent(ev: TranscriptEvent | null | undefi
 export function classifyClaudeTerminalEvent(
   ev: TranscriptEvent,
 ): ClaudeTerminalOutcome | undefined {
-  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return undefined;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return undefined;
   if (isTranscriptRateLimitEvent(ev)) {
     return {
       status: 'rate_limited',
@@ -757,7 +757,7 @@ export function classifyClaudeTerminalEvent(
  * of them.
  */
 export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
-  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return false;
   if (isClaudeTurnDurationEvent(ev)) return true;
   if (!hasTranscriptRole(ev, 'assistant')) return false;
   if (ev.isApiErrorMessage !== true && ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER
@@ -846,7 +846,7 @@ const BACKGROUND_LAUNCH_AGENT_ID_RE = /\bagentId:\s*(\S+)/;
  *  none. The launch-ack lives in the FOLLOWING user event's tool_result, so the
  *  caller pairs this with {@link backgroundTaskDispatchAcks}. */
 export function backgroundTaskDispatchToolUseIds(ev: TranscriptEvent): string[] {
-  if (!ev || (ev as any).isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
   if (!hasTranscriptRole(ev, 'assistant')) return [];
   const content = ev.message?.content;
   if (!Array.isArray(content)) return [];
@@ -866,7 +866,7 @@ export function backgroundTaskDispatchToolUseIds(ev: TranscriptEvent): string[] 
  *  tool_results whose text carries BOTH the launch phrasing and an `agentId:`
  *  line qualify, so a synchronous tool result is never counted. */
 export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUseId: string; agentId: string }> {
-  if (!ev || (ev as any).isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
   if (!hasTranscriptRole(ev, 'user')) return [];
   const content = ev.message?.content;
   if (!Array.isArray(content)) return [];
@@ -890,6 +890,7 @@ export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUse
  *  START WITH the tag — a tool_result that merely contains the literal string
  *  (e.g. grep over this source) is not one. */
 function deliveredTaskNotificationText(ev: TranscriptEvent): string | undefined {
+  if (isClaudeApiRequestBlob(ev)) return undefined;
   let text: string;
   if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
     const prompt = ev.attachment.prompt;
@@ -938,7 +939,7 @@ const TERMINAL_TASK_NOTIFICATION_STATUSES = new Set([
 const MONITOR_EXPIRY_BRACKET_LINE_RE = /^\[\s*Monitor\s+(?:expired|timed\s+out|timeout)(?:\s+[^\]]*)?\]$/i;
 const MONITOR_EXPIRY_SUMMARY_RE = /^Monitor(?:\s+(?:"[^"]*"|'[^']*'))?(?:\s*:)?\s+(?:has\s+)?(?:expired|timed\s+out)\b/i;
 
-function isTerminalTaskNotificationStatus(status: string | undefined): boolean {
+export function isTerminalTaskNotificationStatus(status: string | undefined): boolean {
   return status !== undefined && TERMINAL_TASK_NOTIFICATION_STATUSES.has(status.trim().toLowerCase());
 }
 
@@ -946,7 +947,7 @@ function isTerminalTaskNotificationStatus(status: string | undefined): boolean {
  *  `<result>` body by matching from the FIRST `<result>` to the LAST `</result>`
  *  (or EOF if unclosed). Prevents monitored stdout containing literal `</result>`
  *  followed by `<status>` or `<task-id>` XML from breaking out into metadata. */
-function extractTaskNotificationParts(text: string): { metaText: string; resultText: string } {
+export function extractTaskNotificationParts(text: string): { metaText: string; resultText: string } {
   const openTag = '<result>';
   const closeTag = '</result>';
   const openIdx = text.indexOf(openTag);
@@ -964,7 +965,7 @@ function extractTaskNotificationParts(text: string): { metaText: string; resultT
   };
 }
 
-function isMonitorExpiryNotificationParts(parts: { metaText: string; resultText: string }): boolean {
+export function isMonitorExpiryNotificationParts(parts: { metaText: string; resultText: string }): boolean {
   if (parts.resultText && MONITOR_EXPIRY_BRACKET_LINE_RE.test(parts.resultText)) return true;
   const summary = /<summary>([\s\S]*?)<\/summary>/i.exec(parts.metaText)?.[1]?.trim();
   if (summary && (MONITOR_EXPIRY_SUMMARY_RE.test(summary) || MONITOR_EXPIRY_BRACKET_LINE_RE.test(summary))) {
@@ -1052,7 +1053,7 @@ export function eventTimeMs(ev: TranscriptEvent): number | undefined {
  *    running (`Message queued for delivery …`) changes nothing.
  *  The id is the one the task's `<task-notification>` later reports as `<task-id>`. */
 export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunch[] {
-  if (!ev || ev.isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return [];
   if (!hasTranscriptRole(ev, 'user')) return [];
   const r = ev.toolUseResult as Record<string, unknown> | undefined;
   if (!r || typeof r !== 'object' || Array.isArray(r)) return [];
@@ -1093,7 +1094,7 @@ export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunc
  *  - a successful TaskStop result (`toolUseResult.task_id` + `task_type`).
  *    Stopping a shell this way usually writes no notification at all. */
 export function backgroundTaskSettledIds(ev: TranscriptEvent): string[] {
-  if (!ev || ev.isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return [];
   const text = anyTaskNotificationText(ev);
   if (text !== undefined) {
     const parts = extractTaskNotificationParts(text);
@@ -1148,11 +1149,18 @@ export function backgroundTaskStopsInSiblingTranscripts(
   return ids;
 }
 
+/** Claude Code >= 2.1.31x logs copied request messages as `type:"api-request-blob"`
+ *  with no `uuid` or `timestamp`, carrying `message.role: "user" | "assistant"`.
+ *  These are wire-level debug blobs, never conversation turn events. */
+export function isClaudeApiRequestBlob(ev: TranscriptEvent | null | undefined): boolean {
+  return !!ev && typeof ev === 'object' && ev.type === 'api-request-blob';
+}
+
 /** True when the main agent is (re)starting work: a real prompt (typed, or
  *  dequeued type-ahead), a scheduler fire, a delivered task notification, or a
  *  `queue-operation dequeue` (Claude Code took a queued item to run). */
 export function isClaudeMainTurnStart(ev: TranscriptEvent | null | undefined): boolean {
-  if (!ev || typeof ev !== 'object' || ev.isSidechain === true) return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return false;
   if (ev.type === 'queue-operation') return ev.operation === 'dequeue';
   return isMeaningfulUserEvent(ev)
     || isMeaningfulQueuedCommand(ev)
@@ -1217,7 +1225,7 @@ export class BackgroundTaskTracker {
   private mainTurnOpen = false;
 
   observe(ev: TranscriptEvent): void {
-    if (!ev || ev.isSidechain === true) return;
+    if (!ev || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return;
     if (isClaudeUserInterruptEvent(ev)) {
       this.mainTurnOpen = false;
       return;
@@ -1442,7 +1450,7 @@ export class ClaudeModelRequestClock {
   }
 
   observe(ev: TranscriptEvent): void {
-    if (!ev || typeof ev !== 'object' || ev.isSidechain === true) return;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return;
     if (ev.type !== 'queue-operation' && isClaudeMainTurnStart(ev)) {
       const upkeep = isIdleUpkeepTurnStart(ev);
       // Upkeep folded into a running turn does not take that turn over.
@@ -1600,7 +1608,7 @@ export function drainTranscript(
  */
 export function pickAssistantTextEvents(events: TranscriptEvent[]): TranscriptEvent[] {
   return events.filter(e => {
-    if (!e || typeof e !== 'object') return false;
+    if (!e || typeof e !== 'object' || isClaudeApiRequestBlob(e)) return false;
     if ((e as any).isSidechain === true) return false;
     // API-error lines are execution metadata rather than assistant answers.
     // The bridge emits a structured terminal outcome (or the existing limited
@@ -1777,7 +1785,7 @@ export function trailingAssistantText(
   // closed mid-tooling — there is no final answer to fall back with.
   for (let i = end + 1; i < events.length; i++) {
     const ev = events[i];
-    if (!ev || typeof ev !== 'object') continue;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
     if (hasTranscriptRole(ev, 'assistant') && hasToolUseBlock(ev)) return '';
     if (hasTranscriptRole(ev, 'user') && (isMeaningfulUserEvent(ev) || isClaudeUserInterruptEvent(ev))) break;
   }
@@ -1829,7 +1837,7 @@ export class AbsorbedReplyCollector {
    *  in — and keeps returning true; records fed after that are ignored. */
   feed(ev: TranscriptEvent): boolean {
     if (this.complete) return true;
-    if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return false;
     // Claude Code ≥ 2.1.31x writes an `api-request-blob` (a copy of the
     // request's user content: role "user", no uuid) between a folded input and
     // the model's answer to it. Read only uuid records, as the bridge queue
@@ -1914,7 +1922,7 @@ function collectTrailingTextRun(
   const run: TranscriptEvent[] = [];
   for (let i = end; i >= 0; i--) {
     const ev = events[i];
-    if (!ev || typeof ev !== 'object') continue;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
     if (hasTranscriptRole(ev, 'assistant')) {
       if (hasToolUseBlock(ev)) return { run, boundary: i };
       if (ev.uuid && uuids.has(ev.uuid)) { run.unshift(ev); continue; }
@@ -1944,7 +1952,7 @@ function textBeforeHousekeeping(
   let i = boundary;
   for (; i >= 0; i--) {
     const ev = events[i];
-    if (!ev || typeof ev !== 'object') continue;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
     const content = Array.isArray(ev.message?.content) ? ev.message.content as any[] : [];
     if (hasTranscriptRole(ev, 'assistant')) {
       const hasText = pickAssistantTextEvents([ev]).length > 0;
@@ -2140,7 +2148,7 @@ export const CLAUDE_CRON_CREATE_TOOL = 'CronCreate';
  *  the caller pairs this with {@link cronCreateAcks} — same dispatch/ack split
  *  as background Task dispatches. */
 export function cronCreateToolUseIds(ev: TranscriptEvent | null | undefined): string[] {
-  if (!ev || (ev as any).isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
   if (!hasTranscriptRole(ev, 'assistant')) return [];
   const content = ev.message?.content;
   if (!Array.isArray(content)) return [];
@@ -2169,7 +2177,7 @@ const CRON_CREATE_ACK_TASK_ID_RE =
 
 export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
   Array<{ toolUseId: string; taskId: string }> {
-  if (!ev || (ev as any).isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
   if (!hasTranscriptRole(ev, 'user')) return [];
   const content = ev.message?.content;
   if (!Array.isArray(content)) return [];
@@ -2208,7 +2216,7 @@ export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
  *  (`botmux schedule add`), whose turns carry daemon-assigned
  *  `schedule:<taskId>:<uuid>` ids and never touch this path. */
 export function isScheduledTurnStartEvent(ev: TranscriptEvent | null | undefined): boolean {
-  if (!hasTranscriptRole(ev, 'user')) return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || !hasTranscriptRole(ev, 'user')) return false;
   // Hard guard: only internal meta records. Must stay ahead of the
   // promptSource fallback below.
   if (ev!.isMeta !== true) return false;
@@ -2299,7 +2307,7 @@ function collectAssistantTurns(
   };
 
   for (const ev of events) {
-    if (!ev || typeof ev !== 'object') continue;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
     if (isMeaningfulUserEvent(ev)) {
       // New turn boundary — reset the assistant accumulator.
       flush();

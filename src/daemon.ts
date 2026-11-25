@@ -81,7 +81,7 @@ import {
 import { describeCloseResidual as describeTopicCloseResidual } from './core/close-residual.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
-import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
+import { homedir, loadavg, cpus } from 'node:os';
 import { activeVcMeetingInviters, createVcMeetingInviterGrant, type VcMeetingInviterGrant } from './services/vc-meeting-inviter-policy.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -125,6 +125,7 @@ import {
   type OverloadCardBrowser,
   type OverloadCardState,
 } from './core/host-overload-alert.js';
+import { readOverloadHostReading } from './core/overload-host-reading.js';
 import { registerOverloadNonce } from './im/lark/overload-nonce.js';
 import { cotRecoveryMatches, settleCotMessageForShutdown, sweepOrphanCotMessages } from './im/lark/cot-message.js';
 import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-reply-card.js';
@@ -36026,9 +36027,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const tick = await runHostPressureTick({
         state: hostPressureState,
         reading: {
-          load15: loadavg()[2] ?? 0,
-          memTotalBytes: totalmem(),
-          memFreeBytes: freemem(),
+          ...readOverloadHostReading(),
           cpuPct: hostCpuPct,
         },
         config: resolved.hostPressure,
@@ -36388,7 +36387,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const shouldAdvanceCrossPrincipal = completedTurnHasCrossPrincipalFollower(ds, terminal);
       const principalLaneTerminalOwned = !ds.session.principalLane
         || principalLaneRunningTurnMatches(ds, terminal.turnId, context.workerGeneration);
-      if (principalLaneTerminalOwned
+      const retainInteractiveForBackground = config.crossPrincipalInterruption
+        && terminal.status === 'completed'
+        && terminal.authorityHeldForBackground === true;
+      if (!retainInteractiveForBackground
+          && principalLaneTerminalOwned
           && ds.activeInteractiveTurn?.turnId === terminal.turnId) {
         ds.activeInteractiveTurn = undefined;
       }
@@ -36476,9 +36479,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         logger.error(`[trigger-user-auth] turn identity restore failed for ${ds.session.sessionId} turn=${turnId}: ${error instanceof Error ? error.message : String(error)}`);
       });
     },
+    onManagedTurnOriginRevoked(ds, _revokedTurnId) {
+      if (ds.activeInteractiveTurn) return;
+      resumeQueuedForks(ds);
+      queueMicrotask(() => {
+        void confirmNextCrossPrincipalSuggestion(ds);
+        void driveCrossPrincipalInterruptions(ds);
+      });
+    },
     onCliExit(ds, context) {
       ds.messageListenerCompletedTurnId = undefined;
+      const hadInteractiveTurn = !!ds.activeInteractiveTurn;
       ds.activeInteractiveTurn = undefined;
+      if (hadInteractiveTurn) {
+        resumeQueuedForks(ds);
+        queueMicrotask(() => {
+          void confirmNextCrossPrincipalSuggestion(ds);
+          void driveCrossPrincipalInterruptions(ds);
+        });
+      }
       // Same idempotent-async convergence as onWorkerExit: the MANAGED CLI can
       // exit inside a still-live Node worker (persistent-pane / codex-app
       // auto-restart), in which case onWorkerExit never fires. An incomplete
@@ -36508,7 +36527,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       onXpiSharedCwdWorkerExit(ds, context);
       const principalLaneExitOwned = !ds.session.principalLane
         || ds.principalLaneRunningTurn?.workerGeneration === context.workerGeneration;
+      const hadInteractiveTurn = principalLaneExitOwned && !!ds.activeInteractiveTurn;
       if (principalLaneExitOwned) ds.activeInteractiveTurn = undefined;
+      if (hadInteractiveTurn) {
+        resumeQueuedForks(ds);
+        queueMicrotask(() => {
+          void confirmNextCrossPrincipalSuggestion(ds);
+          void driveCrossPrincipalInterruptions(ds);
+        });
+      }
       // If the crashed generation belonged to an ordinary immediate turn, a
       // queued principal-lane follower is still `queued` and may safely refork
       // now that worker exit proves the old generation cannot write. If the
@@ -39035,11 +39062,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // take effect on the next sample without a restart.
         const overloadThresholds = resolveOverloadThresholds();
 
-        const reading = {
-          load15: loadavg()[2] ?? 0,
-          memTotalBytes: totalmem(),
-          memFreeBytes: freemem(),
-        };
+        const reading = readOverloadHostReading();
         const { nextState, action } = evaluateOverload(overloadState, reading, overloadThresholds, Date.now());
         overloadState = nextState;
         if (!action) return;
