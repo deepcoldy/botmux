@@ -1,6 +1,7 @@
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import { composerTextKey } from '../../utils/composer-text-key.js';
 import { traexQuestionFlowVisible } from '../../utils/traex-question-page.js';
+import { detectCodexChoiceModal } from '../../utils/codex-choice-modal.js';
 import type { SessionRenameSurface } from './types.js';
 
 /**
@@ -188,13 +189,14 @@ function traexRenameDialogVisible(screen: string): boolean {
  * the receipt-based fallback for future native footer layouts.
  */
 export function traexSessionRenameSurface(screen: string, command: string): SessionRenameSurface {
-  if (traexModelPickerPage(screen) || traexRenameDialogVisible(screen) || traexQuestionFlowVisible(screen)) {
+  if (traexModelPickerPage(screen) || traexRenameDialogVisible(screen) || traexQuestionFlowVisible(screen)
+    || detectCodexChoiceModal(screen)) {
     return 'blocked';
   }
   if (traexRestoredComposerReady(screen)) return 'settled';
   // Dialogs and actual composer content outrank busy chrome: a running turn
   // can coexist with a draft, paste chip or half-typed /rename.
-  const draft = traexComposerDraft(screen, { allowBusy: true });
+  const draft = traexComposerDraft(screen, { allowBusy: true, requireThreadReady: false });
   if (draft && !TRAEX_EMPTY_COMPOSER_HINTS.has(draft.body)) {
     if (draft.collapsedChars !== undefined) return 'blocked';
     return composerTextKey(draft.body) === composerTextKey(command) ? 'unsubmitted' : 'blocked';

@@ -11,7 +11,7 @@ import { promptCacheKeepaliveRefusal } from '../src/core/prompt-cache-keepalive-
 import { pendingInputAllowsTypeAhead } from '../src/utils/pending-input-queue.js';
 import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gate.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
-import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 
 const TITLE = '[BotMux·Lark] 修复登录页报错';
 const COMMAND = `/rename ${TITLE}`;
@@ -167,6 +167,19 @@ describe('native hard input-focus blocks across real delivery paths', () => {
     expect(h.backend.write).not.toHaveBeenCalled();
   });
 
+  it('does not re-evaluate a hard block while an adopt rename already owns the input', async () => {
+    const h = inputHarness('traex', fixture('traex-0.216.0-rename-dialog.txt'));
+    h.scope.lastInitConfig.adoptMode = true;
+    h.scope.applyWorkerLaunchModel = vi.fn();
+    h.scope.respawnConfigPatchFromMessage = () => ({});
+    h.scope.applyRespawnConfigPatch = vi.fn();
+    h.scope.sessionRenameInFlight = () => true;
+    h.scope.sessionInputBlocksDeliveryNow = vi.fn(() => { throw new Error('must not be called during rename hold'); });
+    await loadWorkerMessageHandler('message', h.scope)({ type: 'message', content: 'adopt queued', turnId: 'om_adopt' });
+    expect(h.scope.pendingAdoptMessages).toHaveLength(1);
+    expect(h.scope.sessionInputBlocksDeliveryNow).not.toHaveBeenCalled();
+  });
+
   it('keeps one recheck while blocked, then re-drives ordinary and injection queues once clear', async () => {
     vi.useFakeTimers();
     const h = inputHarness('traex', fixture('traex-0.216.0-rename-dialog.txt'));
@@ -241,6 +254,64 @@ describe('native hard input-focus blocks across real delivery paths', () => {
 });
 
 describe('Codex Turn 2+ untouched refusal recovery', () => {
+  it('does not latch a background-only hold or spin an empty injection queue', async () => {
+    const h = inputHarness('traex', fixture('traex-0.216.0-rename-dialog.txt'));
+    h.scope.pendingMessages.splice(0, 1);
+    h.scope.pendingSessionRename = 'background-only';
+    h.scope.holdNativeInputForHardBlock();
+    expect(h.scope.nativeInputBlockLogged).toBe(false);
+    h.scope.pendingMessages.push({ content: 'user turn', turnId: 'turn-user' });
+    h.scope.holdNativeInputForHardBlock();
+    expect(h.scope.notifyNativeInputBlocked).toHaveBeenCalledOnce();
+    expect(h.scope.nativeInputBlockLogged).toBe(true);
+
+    h.scope.pendingInjections = [];
+    h.scope.armNativeInputBlockRecheck.mockClear();
+    await loadWorkerFunction<() => Promise<void>>('flushPendingInjections', h.scope)();
+    expect(h.scope.armNativeInputBlockRecheck).not.toHaveBeenCalled();
+  });
+
+  it('re-opens the write cycle after precheck and before actual paste', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'botmux-before-submit-cycle-'));
+    dirs.push(home);
+    vi.stubEnv('CODEX_HOME', home);
+    writeFileSync(join(home, 'history.jsonl'), '');
+    const h = workerSubmitHarness();
+    const readinessAtPaste: boolean[] = [];
+    const backend = {
+      cliPid: 12345,
+      expectedCodexSessionId: SID,
+      write: vi.fn(),
+      captureInputState: () => {
+        // Simulate a prompt-ready edge while the adapter is prechecking.
+        h.scope.isPromptReady = true;
+        return empty146;
+      },
+      submitBracketedPaste: vi.fn((text: string) => {
+        readinessAtPaste.push(h.scope.isPromptReady);
+        appendFileSync(join(home, 'history.jsonl'), `${JSON.stringify({ session_id: SID, text })}\n`);
+      }),
+    };
+    Object.assign(h.scope, {
+      backend,
+      cliAdapter: createCodexAdapter(),
+      lastInitConfig: { cliId: 'codex', nativeSessionTitle: TITLE, promptInjection: 'none' },
+      sessionInputBlocksDeliveryNow: () => false,
+      holdNativeInputForHardBlock: vi.fn(),
+      inputBoxJudgeable: () => false,
+      currentCodexObservedPid: () => 12345,
+      stampMojoTurnMark: vi.fn(),
+      deferTurnInputCommitUntilSubmission: () => false,
+      maybeQueuePostSubmitNativeSessionTitle: () => false,
+      acknowledgeNativeInputConsumed: vi.fn(),
+      codexBridgeFallbackActive: () => false,
+    });
+    h.scope.beginCliWriteCycle = vi.fn(() => { h.scope.isPromptReady = false; });
+    await h.flush();
+    expect(readinessAtPaste).toEqual([false]);
+    expect(h.scope.beginCliWriteCycle.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
   it('retains the entire FIFO with zero paste/failure, then submits each item after recovery', async () => {
     const home = mkdtempSync(join(tmpdir(), 'botmux-turn2-untouched-'));
     dirs.push(home);
@@ -284,7 +355,8 @@ describe('Codex Turn 2+ untouched refusal recovery', () => {
       deferTurnInputCommitUntilSubmission: () => false,
       maybeQueuePostSubmitNativeSessionTitle: () => false,
       dropFailedBridgeMark: vi.fn(),
-      sessionInputBlocksDeliveryNow: () => false, // dialog appears after the outer screen check
+      sessionInputBlocksDeliveryNow: () => false,
+      holdNativeInputForHardBlock: vi.fn(), // dialog appears after the outer screen check
     });
     h.scope.holdOpeningInput = loadWorkerFunction('holdOpeningInput', h.scope);
     h.scope.notifyHeldInput = loadWorkerFunction('notifyHeldInput', h.scope);
@@ -294,7 +366,7 @@ describe('Codex Turn 2+ untouched refusal recovery', () => {
     expect(backend.write).not.toHaveBeenCalled();
     expect(h.scope.pendingMessages.map(item => item.turnId)).toEqual(['turn-1', 'turn-2']);
     expect(h.scope.openingInputBoxSettled).toBe(false);
-    expect(h.scope.firstWriteLivenessConfirmed).toBe(false);
+    expect(h.scope.armFirstWriteLivenessRecheck).not.toHaveBeenCalled();
     expect(h.scope.send.mock.calls.map(([event]) => event.message)).not.toContain('worker.submit_impossible');
 
     state = empty146;
@@ -341,6 +413,7 @@ describe('Codex Turn 2+ untouched refusal recovery', () => {
       acknowledgeQueuedActivation: vi.fn(),
       dropFailedBridgeMark: vi.fn(),
       sessionInputBlocksDeliveryNow: () => false,
+      holdNativeInputForHardBlock: vi.fn(),
     });
     h.scope.holdOpeningInput = loadWorkerFunction('holdOpeningInput', h.scope);
     h.scope.notifyHeldInput = loadWorkerFunction('notifyHeldInput', h.scope);

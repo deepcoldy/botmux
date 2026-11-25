@@ -6204,7 +6204,7 @@ function armFirstWriteLivenessRecheck(): void {
     // Always replace the previous one instead of overwriting the variable and
     // leaving an unreferenced live timer behind (the old 2^N failure mode).
     if (firstWriteLivenessTimer) clearTimeout(firstWriteLivenessTimer);
-    const delayMs = firstWriteLivenessHeld ? FIRST_WRITE_HELD_POLL_MS : ms;
+    const delayMs = ms;
     const timer = setTimeout(() => {
       if (firstWriteLivenessTimer === timer) firstWriteLivenessTimer = null;
       tick();
@@ -6265,7 +6265,6 @@ function firstWriteMayProceed(): boolean {
     if (firstWriteLivenessHeld) log(`First write released after ${elapsedMs}ms (${verdict.reason})`);
     firstWriteLivenessConfirmed = true;
     firstWriteLivenessHeld = false;
-    firstWriteHeldNoticeSent = false;
     stopFirstWriteLivenessRecheck();
     return true;
   }
@@ -6515,6 +6514,15 @@ function sessionInputBlocksDeliveryNow(): boolean {
   return surface === 'blocked' || surface === 'unsubmitted';
 }
 
+/** TRAE's native question card owns its dedicated hold/notify/bridge path.
+ * Never preempt it with the generic dialog hold, including a page whose stream
+ * arrived before the bridge had a chance to parse it. */
+function traexQuestionDeliveryOwnsInput(): boolean {
+  if (lastInitConfig?.cliId !== 'traex') return false;
+  if (traexQuestionBridgeActive()) return true;
+  try { return !!backend && traexQuestionFlowVisible(captureBackendScreen(backend)); } catch { return false; }
+}
+
 const NATIVE_INPUT_BLOCK_RECHECK_MS = 5_000;
 let nativeInputBlockRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let nativeInputBlockLogged = false;
@@ -6550,11 +6558,17 @@ function notifyNativeInputBlocked(): void {
   });
 }
 
-function holdNativeInputForHardBlock(): void {
+function holdNativeInputForHardBlock(reason?: string): void {
+  const hasUserInput = !!(pendingMessages[0] ?? pendingAdoptMessages[0] ?? pendingRawInputs[0]);
+  if (!hasUserInput && pendingSessionRename === null && pendingInjections.length === 0) return;
   if (!nativeInputBlockLogged) {
-    nativeInputBlockLogged = true;
     log('Native dialog or unsubmitted draft owns the CLI input; holding every input class behind a 5s recheck');
-    notifyNativeInputBlocked();
+    if (hasUserInput) {
+      if (reason) notifyHeldInput(t('worker.opening_input_held', { cliName: cliName(), reason }));
+      else notifyNativeInputBlocked();
+    }
+    // A background-only hold must not latch out a later real user's notice.
+    nativeInputBlockLogged = hasUserInput;
   }
   armNativeInputBlockRecheck();
 }
@@ -6579,9 +6593,20 @@ function sessionRenameNativeSessionIdNow(): string | undefined {
   let observed: string | undefined;
   if (cliId === 'traex') {
     const owned = findTraexRolloutSetByPid(pid);
-    if (!owned) return undefined;
-    const owns = (sid: string): boolean => owned.has(sid) || owned.has(sid.toLowerCase());
     const bridgeSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
+    if (!owned || owned.size === 0) {
+      // TRAE shared terminals can identify the current session without a local
+      // rollout fd, but only through the exact terminal binding from #3815.
+      if (backend && bridgeSid && traexTerminalSessionIsBound(adapterInputHandle(backend), bridgeSid)) {
+        observed = bridgeSid;
+      } else if (backend && inputDeliveryObservedCliSessionId
+        && traexTerminalSessionIsBound(adapterInputHandle(backend), inputDeliveryObservedCliSessionId)) {
+        observed = inputDeliveryObservedCliSessionId;
+      }
+      if (observed) inputDeliveryObservedCliSessionId = observed;
+      return observed;
+    }
+    const owns = (sid: string): boolean => owned.has(sid) || owned.has(sid.toLowerCase());
     // Multiple owned rollouts prove possession, not which top-level thread is
     // current. Bridge/cache are usable only when ownership is already unique.
     if (owned.size === 1 && bridgeSid && owns(bridgeSid)) observed = bridgeSid;
@@ -6660,7 +6685,7 @@ function notifySessionRenameInputHeld(): void {
 
 /** The hard-cap outcome is a different notice from the initial "still waiting"
  *  message, so it is not swallowed by that earlier notification's latch. */
-function notifySessionRenameInputTimeout(outcome: 'held' | 'released'): void {
+function notifySessionRenameInputTimeout(outcome: 'held' | 'released', seconds = Math.round(SESSION_RENAME_HOLD_TIMEOUT_MS / 1000)): void {
   const head = pendingMessages[0] ?? pendingAdoptMessages[0];
   const rawHead = pendingRawInputs[0];
   if ((outcome === 'held' && sessionRenameHoldTimeoutNoticeSent) || (!head && !rawHead)) return;
@@ -6672,7 +6697,7 @@ function notifySessionRenameInputTimeout(outcome: 'held' | 'released'): void {
     message: t(outcome === 'released'
       ? 'worker.session_rename_release_timeout'
       : 'worker.session_rename_hold_timeout', {
-      cliName: cliName(), seconds: Math.round(SESSION_RENAME_HOLD_TIMEOUT_MS / 1000),
+      cliName: cliName(), seconds,
     }),
   });
 }
@@ -6680,13 +6705,16 @@ function notifySessionRenameInputTimeout(outcome: 'held' | 'released'): void {
 /** Restore readiness only when no authoritative native busy/permission record
  * vetoes it. Unknown/unjudged evidence may recover after a receipt or the cap;
  * an ordinary busy `occupied` surface still waits for a real terminal. */
-function restoreSessionRenameReadiness(surface: SessionRenameSurface | undefined): void {
+function restoreSessionRenameReadiness(surface: SessionRenameSurface | undefined, opts: { preserveReattachGate?: boolean } = {}): void {
   if (idleDetector?.programStatusHeldBusy() || programStatusBlockedHoldsTypeAhead()) {
     return;
   }
   if (surface === 'occupied' || surface === 'blocked' || surface === 'unsubmitted') return;
+  // A reattach whose open-turn/startup gate is still pending must not be made
+  // ready by the unknown cap. Keep that gate authoritative until it is proven.
+  if (opts.preserveReattachGate && reattachOpenTurnGate) return;
   isPromptReady = true;
-  reattachOpenTurnGate = false;
+  if (!opts.preserveReattachGate) reattachOpenTurnGate = false;
   idleDetector?.adoptPromptReady();
 }
 
@@ -6750,7 +6778,18 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
   const holdExpired = Date.now() - sessionRenameSentAtMs >= recoveryAfterMs;
   // PR #3816 owns the TRAE settled/title-mismatch restart path at 60s. Give it
   // priority over the generic cap; other surfaces keep the 45s safety net.
-  if (source === 'timer' && recoverUnconfirmedSessionRename(surface)) return;
+  if (!recorded && recoverUnconfirmedSessionRename(surface)) return;
+  if (lastInitConfig?.cliId === 'traex' && surface === 'settled' && holdExpired && !recorded) {
+    // #3816 cannot currently replace the CLI. Keep waiting for its next real
+    // recovery opportunity; never downgrade this to release_unconfirmed.
+    if (!sessionRenameHoldTimeoutLogged) {
+      sessionRenameHoldTimeoutLogged = true;
+      log(`WARN Native session rename recovery remains unavailable after ${recoveryAfterMs}ms; queued input stays held`);
+    }
+    notifySessionRenameInputTimeout('held', Math.round(recoveryAfterMs / 1000));
+    armSessionRenameIdleTimeout(SESSION_RENAME_SLOW_RECHECK_MS);
+    return;
+  }
   const step = decideSessionRenameSettlement({
     surface,
     recorded,
@@ -6918,7 +6957,7 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
       log('Native session rename confirmed by the CLI record after persistent reattach; releasing restored input');
       forceClearSessionRenameInFlight();
       sessionRenameReattachRecoveryGeneration = generation;
-      restoreSessionRenameReadiness(surface);
+      restoreSessionRenameReadiness(surface, { preserveReattachGate: true });
       return false;
     }
     if (!sessionRenameHoldLogged) {
@@ -6929,7 +6968,7 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
       notifySessionRenameInputTimeout('released');
       forceClearSessionRenameInFlight();
       sessionRenameReattachRecoveryGeneration = generation;
-      restoreSessionRenameReadiness(surface);
+      restoreSessionRenameReadiness(surface, { preserveReattachGate: true });
       log(`WARN Native session rename recovery remained unknown after ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; releasing restored input to the normal delivery gates`);
       return false;
     }
@@ -21733,6 +21772,7 @@ const inFlightKeepaliveFingerprints = new Map<string, number>();
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
+  if (pendingInjections.length === 0) return;
   if (nativeSessionForkPending() || webTerminalInputWireDirty()) return;
   if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
   if (webTerminalInputWireDirty()) return;
@@ -27429,7 +27469,8 @@ async function flushPending(): Promise<void> {
   const codexDirectWriteNeedsHardGuard = lastInitConfig?.cliId === 'codex'
     && (!backend.captureInputState || lastInitConfig.adoptMode === true
       || pendingSessionRename !== null || pendingRawInputs.length > 0 || pendingAdoptMessages.length > 0);
-  if ((lastInitConfig?.cliId !== 'codex' || codexDirectWriteNeedsHardGuard) && sessionInputBlocksDeliveryNow()) {
+  if (!traexQuestionDeliveryOwnsInput()
+    && (lastInitConfig?.cliId !== 'codex' || codexDirectWriteNeedsHardGuard) && sessionInputBlocksDeliveryNow()) {
     holdNativeInputForHardBlock();
     return;
   }
@@ -27552,7 +27593,7 @@ async function flushPending(): Promise<void> {
   // it. Inputs that cannot type ahead (durable attempts) need that readiness
   // back for the hold's re-check to reach them on a screen that stays silent.
   const keepPromptReadyAfterHold = (): void => {
-    if (promptReadyAtFlushStart && itemsWrittenInThisFlush === 0) isPromptReady = true;
+    if (promptReadyAtFlushStart && itemsWrittenInThisFlush === 0) restoreSessionRenameReadiness(undefined);
   };
   const holdFirstAdmissionAfterWebInput = (): void => {
     openingInputBoxSettled = false;
@@ -27581,6 +27622,7 @@ async function flushPending(): Promise<void> {
       publishScreenStatus('working', { force: true });
     }
     cliSubmissionInFlight = null;
+    if (submitted) firstWriteHeldNoticeSent = false;
     if (inFlight.bridgeTurnId) bridgeQueue.releaseWriteHold(inFlight.bridgeTurnId, item.dispatchAttempt);
     if (inFlight.readyDeferred) {
       // A turn this write opened makes the prompt ready again when it ends;
@@ -27746,8 +27788,7 @@ async function flushPending(): Promise<void> {
         if (current && failureAction === 'retry') {
           if (pendingSessionRename === null) pendingSessionRename = title;
           forceClearSessionRenameInFlight();
-          isPromptReady = true;
-          reattachOpenTurnGate = false;
+          restoreSessionRenameReadiness(undefined);
           // The outer flush still owns isFlushing. Re-drive only after its
           // finally releases the mutex; web-dirty/backend gates may refuse the
           // retry before writing again without spinning this call stack.
@@ -28473,7 +28514,13 @@ async function flushPending(): Promise<void> {
               {
                 turnId: item.turnId,
                 dispatchAttempt: item.dispatchAttempt,
-                ...(lastInitConfig?.cliId === 'codex' ? { beforeSubmit: prepareNormalWrite } : {}),
+                ...(lastInitConfig?.cliId === 'codex' ? { beforeSubmit: () => {
+                  // The precheck may have waited through a prompt-ready edge.
+                  // Re-open the write cycle immediately before actual paste so
+                  // composerOwned/readiness cannot describe that stale window.
+                  beginCliWriteCycle();
+                  prepareNormalWrite();
+                } } : {}),
                 onInputPrepared: content => { submittedText = content; },
                 ...(lastInitConfig?.cliId === 'codex'
                   && !lastInitConfig.adoptMode && lastInitConfig.promptInjection !== 'none'
@@ -28900,7 +28947,7 @@ async function flushPending(): Promise<void> {
           pendingMessages.unshift(item);
           openingInputBoxSettled = false;
           keepPromptReadyAfterHold();
-          holdOpeningInput(result.failureReason ?? 'Codex input is not ready');
+          holdNativeInputForHardBlock(result.failureReason ?? 'Codex input is not ready');
           log(`Retained untouched Codex input and its queued tail: ${result.failureReason ?? 'composer not ready'}`);
           break;
         }
@@ -44390,8 +44437,9 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // process.on('message') does not serialize async listeners. Hold the
         // per-worker queue across transcript mark + complete adapter write so
         // two CoCo/Codex paste→wait→Enter/history cycles cannot overlap.
-        const adoptInputBlocked = sessionInputBlocksDeliveryNow();
-        if (cliRestartInProgress || rawInputRestartGate || !backend || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight() || adoptInputBlocked) {
+        const adoptAlreadyHeld = cliRestartInProgress || rawInputRestartGate || !backend || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight();
+        const adoptInputBlocked = !adoptAlreadyHeld && sessionInputBlocksDeliveryNow();
+        if (adoptAlreadyHeld || adoptInputBlocked) {
           pendingAdoptMessages.push(item);
           if (adoptInputBlocked) holdNativeInputForHardBlock();
           log(`Deferred adopt message until the CLI generation/input gate settles (${content.length} chars)`);

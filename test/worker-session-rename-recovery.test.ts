@@ -198,6 +198,9 @@ describe('sessionRenameNativeSessionIdNow', () => {
       inputDeliveryObservedCliSessionId: undefined,
       lastInitConfig: { cliId: 'traex', cliSessionId: 'stale-config-id' },
       backend: {}, codexBridgeRolloutPath: '/tmp/rollout-native.jsonl',
+      adapterInputHandle: (value: unknown) => value,
+      traexTerminalSessionIsBound: () => false,
+      traexSessionIdFromRolloutPath: () => undefined,
       currentTraexObservedPid: () => 123,
       findTraexRolloutSetByPid: () => new Set(['native-id']),
       traexSessionIdFromRolloutPath: () => 'native-id',
@@ -212,6 +215,9 @@ describe('sessionRenameNativeSessionIdNow', () => {
       inputDeliveryObservedCliSessionId: undefined,
       lastInitConfig: { cliId: 'traex', cliSessionId: 'stale-config-id' },
       backend: {}, codexBridgeRolloutPath: '/tmp/rollout-native.jsonl',
+      adapterInputHandle: (value: unknown) => value,
+      traexTerminalSessionIsBound: () => false,
+      traexSessionIdFromRolloutPath: () => undefined,
       currentTraexObservedPid: () => 123,
       findTraexRolloutSetByPid: () => undefined,
     };
@@ -370,6 +376,41 @@ describe('sessionRenameNativeSessionIdNow', () => {
     const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
     expect(resolve()).toBe('rpc-thread');
     expect(scope.inputDeliveryObservedCliSessionId).toBe('rpc-thread');
+  });
+
+  it('uses the exact TRAE terminal binding when shared or sandbox ownership is unavailable', () => {
+    for (const owned of [new Set<string>(), undefined] as const) {
+      const backend = {};
+      const scope: Record<string, any> = {
+        inputDeliveryObservedCliSessionId: undefined,
+        lastInitConfig: { cliId: 'traex' }, backend,
+        adapterInputHandle: (value: unknown) => value,
+        traexTerminalSessionIsBound: (_terminal: unknown, sid: string) => sid === 'thread-a',
+        codexRpcEngine: undefined, codexBridgeRolloutPath: '/tmp/rollout-thread-a.jsonl',
+        currentTraexObservedPid: () => 123,
+        findTraexRolloutSetByPid: () => owned,
+        traexSessionIdFromRolloutPath: () => 'thread-a',
+      };
+      const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
+      expect(resolve()).toBe('thread-a');
+      expect(scope.inputDeliveryObservedCliSessionId).toBe('thread-a');
+    }
+  });
+
+  it('rejects an unbound TRAE bridge/cache when shared ownership is unavailable', () => {
+    const backend = {};
+    const scope: Record<string, any> = {
+      inputDeliveryObservedCliSessionId: 'thread-a',
+      lastInitConfig: { cliId: 'traex' }, backend,
+      adapterInputHandle: (value: unknown) => value,
+      traexTerminalSessionIsBound: () => false,
+      codexRpcEngine: undefined, codexBridgeRolloutPath: '/tmp/rollout-thread-a.jsonl',
+      currentTraexObservedPid: () => 123,
+      findTraexRolloutSetByPid: () => new Set<string>(),
+      traexSessionIdFromRolloutPath: () => 'thread-a',
+    };
+    const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
+    expect(resolve()).toBeUndefined();
   });
 
   it('uses an explicitly bound remote Codex thread without requiring a local rollout fd', () => {

@@ -20,6 +20,7 @@ function renameTimerHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'b
     SESSION_RENAME_SLOW_RECHECK_MS: 10_000,
     SESSION_RENAME_FAST_RECHECK_WINDOW_MS: 30_000,
     SESSION_RENAME_HOLD_TIMEOUT_MS: 45_000,
+    SESSION_RENAME_RECOVERY_AFTER_MS: 60_000,
     sessionRenameSurfaceNow: () => surface,
     decideSessionRenameSettlement,
     idleDetector: { programStatusHeldBusy: () => false, adoptPromptReady: vi.fn() },
@@ -109,6 +110,35 @@ describe('native rename confirmation hold cap', () => {
     expect(h.scope.flushPending).not.toHaveBeenCalled();
     expect(h.scope.send.mock.calls.map(([event]: [any]) => event.message))
       .not.toContain('worker.session_rename_release_timeout');
+  });
+
+  it('never restarts TRAE after a valid receipt, and waits safely if recovery is unavailable', async () => {
+    vi.useFakeTimers();
+    const confirmed = renameTimerHarness('settled');
+    confirmed.scope.lastInitConfig = { cliId: 'traex' };
+    confirmed.scope.sessionRenameRecorded = () => true;
+    confirmed.scope.recoverUnconfirmedSessionRename = vi.fn();
+    confirmed.arm();
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(confirmed.scope.recoverUnconfirmedSessionRename).not.toHaveBeenCalled();
+    expect(confirmed.scope.flushPending).toHaveBeenCalledOnce();
+
+    const unavailable = renameTimerHarness('settled');
+    unavailable.scope.lastInitConfig = { cliId: 'traex' };
+    unavailable.scope.recoverUnconfirmedSessionRename = vi.fn(() => false);
+    unavailable.scope.notifySessionRenameInputTimeout = vi.fn();
+    unavailable.arm();
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(unavailable.scope.flushPending).not.toHaveBeenCalled();
+    expect(unavailable.scope.notifySessionRenameInputTimeout).toHaveBeenCalledWith('held', 60);
+    expect(unavailable.scope.sessionRenamePhase).toBe('sent');
+  });
+
+  it('does not clear an unproven reattach open-turn gate on unknown recovery', () => {
+    const h = renameTimerHarness('unknown');
+    h.scope.restoreSessionRenameReadiness('unknown', { preserveReattachGate: true });
+    expect(h.scope.isPromptReady).toBe(false);
+    expect(h.scope.reattachOpenTurnGate).toBe(true);
   });
 
   it('never restores readiness over an OSC-7501 approval or held busy record', async () => {

@@ -28,7 +28,7 @@ export function workerSubmitHarness() {
     FIRST_PROMPT_HARD_TIMEOUT_MS: CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS,
     cliRestartInProgress: false, isPromptReady: true, isFlushing: false,
     codexModelMigrationCheckNeeded: () => false,
-    idleDetector: { isStartupPending: () => false, programStatusHeldWorking: () => false },
+    idleDetector: { isStartupPending: () => false, programStatusHeldWorking: () => false, programStatusHeldBusy: () => false, adoptPromptReady: vi.fn() },
     shouldHoldCodexRunnerInput: () => false,
     currentInputDeliveryQuarantine: () => null,
     hasPendingInputForFlush: () => pendingMessages.length > 0,
@@ -127,6 +127,7 @@ export function workerSubmitHarness() {
     shouldStopPendingBatch: () => true,
   };
   scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
+  scope.restoreSessionRenameReadiness = loadWorkerFunction('restoreSessionRenameReadiness', scope);
   scope.screenShowsCredentialPage = loadWorkerFunction('screenShowsCredentialPage', scope);
   // Real write-edge transport fold: a no-op unless an item carries a parked
   // TraeX RPC catalog and no RPC engine will write it.

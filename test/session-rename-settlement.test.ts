@@ -136,6 +136,17 @@ describe('TRAE native rename surface (0.216.0)', () => {
     expect(traexSessionRenameSurface(picker, COMMAND)).toBe('blocked');
     const question = readFileSync(new URL('./fixtures/traex-question/traex-0.214.1-submit-confirm-160x50.txt', import.meta.url), 'utf8');
     expect(traexSessionRenameSurface(question, COMMAND)).toBe('blocked');
+    // Sanitized viewport shape from the real approval-15s recording.
+    const approval = [
+      '  Would you like to run the following command?',
+      '  Environment: local',
+      '  $ touch /tmp/work/approved-marker',
+      '› 1. Yes, proceed (y)',
+      '  2. Yes, and do not ask again for this command',
+      '  3. No, and tell Codex what to do differently',
+      'Press enter to confirm or esc to cancel',
+    ].join('\n');
+    expect(traexSessionRenameSurface(approval, COMMAND)).toBe('blocked');
   });
 
   it('keeps the rename dialog and a busy turn occupied even with a receipt', () => {
@@ -213,6 +224,21 @@ describe('Codex native rename surface (0.167.0)', () => {
     expect(codexSessionRenameSurface({ viewport: other }, COMMAND)).toBe('blocked');
   });
 
+  it('keeps a pasted TRAE draft blocked even on the provisional resume footer', () => {
+    const pasted = readFileSync(new URL('./fixtures/traex-cold-resume/0.216.0-resume-provisional-pasted.txt', import.meta.url), 'utf8');
+    expect(traexSessionRenameSurface(pasted, COMMAND)).toBe('blocked');
+  });
+
+  it('lets Codex hints and unfamiliar chrome degrade to unknown instead of permanent blocked', () => {
+    for (const viewport of [
+      '› Implement {feature}\nQueued for capacity\nmodel · /tmp',
+      '› Implement\n {feature}\nmodel · /tmp',
+      '›\nunknown\nother · weird',
+    ]) {
+      expect(codexSessionRenameSurface({ viewport, cursor: { x: 2, y: 0 } }, COMMAND), JSON.stringify(viewport)).toBe('unknown');
+    }
+  });
+
   it('classifies a footerless non-empty draft as blocked rather than occupied', () => {
     expect(codexSessionRenameSurface({ viewport: '› a human draft', cursor: { x: 13, y: 0 } }, COMMAND)).toBe('blocked');
   });
@@ -221,6 +247,9 @@ describe('Codex native rename surface (0.167.0)', () => {
     expect(codexSessionRenameSurface({ viewport: '›\nmodel · /tmp', cursor: { x: 2, y: 0 } }, COMMAND)).toBe('settled');
     expect(codexSessionRenameSurface({ viewport: '›\nunknown footer', cursor: { x: 2, y: 0 } }, COMMAND)).toBe('unknown');
     expect(codexNativeFooterRows(['enter to submit / esc to cancel'])).toBeUndefined();
+    for (const valid of ['  100% context left', '01a20bdb-47c4-7702-8188-21c3628071d2', '⚠️ 3']) {
+      expect(codexNativeFooterRows([valid])).toBe(valid.trim());
+    }
   });
 
   it('rejects a manually typed 0.146.1 hint when the cursor is past Home', () => {

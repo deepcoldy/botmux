@@ -52,6 +52,11 @@ const CODEX_0146_COMPOSER_HINTS: ReadonlySet<string> = new Set([
 
 type CodexNativeComposerOptions = { allowCodex0146Hints?: boolean };
 
+function isCodexNativeComposerHint(body: string): boolean {
+  const normalized = body.replace(/\s+/g, ' ').trim();
+  return normalized === 'Ask Codex to do anything' || CODEX_0146_COMPOSER_HINTS.has(normalized);
+}
+
 export function codexEmptyComposerFooter(
   state: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined,
   opts: CodexNativeComposerOptions = {},
@@ -116,9 +121,16 @@ export function codexNativeFooterRows(footer: string[]): string | undefined {
   if (footer.length < 1 || footer.length > 2) return undefined;
   if (footer.some(row => /^\s*(?:press\s+)?enter\b[^\r\n]*\besc\b/i.test(row)
     || /^\s*enter\s+submit\s*\|\s*esc\s+back\s*$/i.test(row))) return undefined;
-  if (footer.length === 1
-    && !footer[0]!.includes(' · ')
-    && !/^\s*(?:← for agents|\? for shortcuts|esc to interrupt|tab to queue|⚠\s*\d+\b)/.test(footer[0]!)) return undefined;
+  if (footer.length === 1) {
+    const row = footer[0]!.trim();
+    const nativeSingle = row.includes(' · ')
+      || /^\d+%\s+context\s+(?:left|used)\b/i.test(row)
+      || /^\d+%\s+(?:left|used)\b/i.test(row)
+      || /^⚠(?:️)?\s*\d+\b/.test(row)
+      || /^(?:← for agents|\? for shortcuts|esc to interrupt|tab to queue)\b/.test(row)
+      || codexFooterSessionId(row) !== undefined;
+    if (!nativeSingle) return undefined;
+  }
   // The second footer row is the native hints/warning row. A warning-only row
   // is native too: when hints are hidden the warning is the only thing left in
   // that row. Codex degrades the notice by width: `\u26a0 N warnings \u00b7 f2
@@ -168,9 +180,21 @@ export function codexSessionRenameSurface(
   const wanted = composerTextKey(command);
   for (let end = composer + 1; end < rows.length; end++) {
     if (codexNativeFooterRows(rows.slice(end).filter(row => row.trim())) === undefined) continue;
-    const body = [rows[composer]!.replace(/^\s*[›»]/, ''), ...rows.slice(composer + 1, end)].join('');
+    const composerText = rows[composer]!.replace(/^\s*[›»]/, '').trim();
+    // A bare prompt with an unfamiliar footer is unknown, never a human draft.
+    if (!composerText) return 'unknown';
+    const body = [rows[composer]!.replace(/^\s*[›»]/, ''), ...rows.slice(composer + 1, end).filter(row =>
+      !/^\s*(?:Queued for capacity|Resuming session)\b/i.test(row)
+      && !/^\s*│\s*(?:model|directory):\s*loading\b/i.test(row)
+      && !CODEX_ACTIVE_BUSY_PATTERN.test(row)
+    )].join('');
     // A bare prompt with an unfamiliar footer is unknown, never a human draft.
     if (!body.trim()) return 'unknown';
+    if (isCodexNativeComposerHint(body) && cursor.x === 2) {
+      // Ghost hints may wrap on narrow screens. Busy/loading chrome means the
+      // turn is occupied; unfamiliar chrome stays unknown, never hard-blocked.
+      return CODEX_ACTIVE_BUSY_PATTERN.test(neighborhood) ? 'occupied' : 'unknown';
+    }
     return composerTextKey(body) === wanted ? 'unsubmitted' : 'blocked';
   }
   if (nativeState === 'draft') return 'blocked';
