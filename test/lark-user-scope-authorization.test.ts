@@ -4,7 +4,7 @@ import * as workerPool from '../src/core/worker-pool.js';
 import * as botRegistry from '../src/bot-registry.js';
 import * as identities from '../src/im/lark/identity-cache.js';
 import * as tokens from '../src/utils/user-token.js';
-import { isKnownLarkUserScope } from '../src/utils/lark-scope-catalog.js';
+import { isKnownLarkUserScope, ON_DEMAND_USER_SCOPES } from '../src/utils/lark-scope-catalog.js';
 
 // Regressions for valid user scopes being rejected with `unknown_scopes` before
 // any authorize URL could be minted because the names were absent from
@@ -102,6 +102,35 @@ describe('Contact user search scope is in the catalog', () => {
 
   it('still rejects a misspelled contact search scope', () => {
     expect(isKnownLarkUserScope('contact:user:serach')).toBe(false);
+  });
+});
+
+describe('Scopes removed from the default user manifest remain legal', () => {
+  const removedDefaultScopes = [
+    'docs:document.comment:update',
+    'docx:document.block:convert',
+  ];
+
+  it.each(removedDefaultScopes)('accepts %s without allowUnknown', scope => {
+    expect(isKnownLarkUserScope(scope)).toBe(true);
+  });
+
+  it('still rejects misspellings of those scopes', () => {
+    expect(isKnownLarkUserScope('docs:document.comment:udpate')).toBe(false);
+    expect(isKnownLarkUserScope('docx:document.block:conver')).toBe(false);
+  });
+
+  it('does not make existing token scopes subject to on-demand renewal pruning', () => {
+    for (const scope of removedDefaultScopes) {
+      expect(ON_DEMAND_USER_SCOPES).not.toContain(scope);
+    }
+  });
+
+  it('accepts both through auth-request without allowUnknown', async () => {
+    const res = await post({ scopes: removedDefaultScopes });
+    expect(res.status).toBe(200);
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(tokens.requestUserAuthorization).mock.calls[0][3]).toEqual(removedDefaultScopes);
   });
 });
 
