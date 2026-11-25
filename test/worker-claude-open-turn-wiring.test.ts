@@ -384,6 +384,7 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
       queue.ingest(rows, jsonl);
 
       const markers: BridgeSendMarker[] = [];
+      const notifiedExplicitReplyTurnIds: string[] = [];
       const sent: unknown[] = [];
       const terminals: unknown[] = [];
 
@@ -409,7 +410,9 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
           ms: readonly BridgeSendMarker[],
         ) => attributableBridgeReplyMarkers({ ...gateInput, turnId }, nextBoundaryMs, ms),
         isFinalBridgeSendMarker,
-        notifyExplicitRepliesObserved: () => {},
+        notifyExplicitRepliesObserved: (turnId: string, observed: readonly unknown[]) => {
+          if (observed.length > 0) notifiedExplicitReplyTurnIds.push(turnId);
+        },
         drainTranscript,
         followUpReplyEnabled: () => false,
         joinAssistantText,
@@ -453,6 +456,7 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
       emitReadyTurns({ explicitTerminalOnly: true });
       expect(sent).toHaveLength(1); // zero duplicate post!
       expect(terminals).toHaveLength(1); // zero duplicate terminal!
+      expect(notifiedExplicitReplyTurnIds).toEqual(['om_orig']);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

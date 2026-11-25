@@ -14496,7 +14496,7 @@ function emitReadyTurns(opts: {
       finalMarkerTurns.add(turn);
     }
     notifyExplicitRepliesObserved(
-      turn.turnId,
+      sendDedupTurnId,
       explicitReplyMarkers,
     );
 
