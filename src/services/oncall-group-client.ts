@@ -151,7 +151,7 @@ export class OncallGroupApiError extends Error {
 }
 
 export async function createOncallGroup(target: OncallGroupTarget, secret: string, username: string, message: string,
-  fetcher: typeof fetch = fetch, selection?: { region: string; typeId: number; priority: 'P2' | 'P1' | 'P0' },
+  fetcher: typeof fetch = fetch, selection?: { region: string; typeId: number; priority: 'P2' | 'P1' | 'P0'; workflowConfig?: string },
   attemptId?: string): Promise<{ flowId: string; openChatId: string }> {
   if (!selection && (!target.typeId || !target.region)) throw new Error('直接建群需要配置固定区域和分类');
   let response: Response;
@@ -161,7 +161,8 @@ export async function createOncallGroup(target: OncallGroupTarget, secret: strin
       headers: { 'content-type': 'application/json', Authorization: `Bearer ${secret}`, 'x-api-user': username },
       body: JSON.stringify({ tenant_id: target.tenantId, type_id: selection?.typeId ?? target.typeId, region: selection?.region ?? target.region,
         type: 'create_chat', priority: selection?.priority ?? 'P2', source_type: 'open_api',
-        source_location: attemptId ? oncallCreationSource(attemptId) : 'botmux', trigger_message: message }),
+        source_location: attemptId ? oncallCreationSource(attemptId) : 'botmux', trigger_message: message,
+        ...(selection?.workflowConfig !== undefined ? { workflow_config: selection.workflowConfig } : {}) }),
     });
   } catch (error) { throw new OncallGroupApiError(true, undefined,
     error instanceof Error && error.name === 'TimeoutError' ? 'timeout' : 'transport', error); }

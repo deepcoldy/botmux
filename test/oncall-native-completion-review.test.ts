@@ -46,6 +46,23 @@ const current = (d: any) => new OncallFormStore(dir).use('app', d.id, 'ou_actor'
 function changeTarget() { const target = loadOncallGroupTarget(dir, 'app'); writeFileSync(join(dir, 'oncall-group-targets.json'), JSON.stringify({ app: { ...target, tenantId: 99 } })); }
 
 describe('native completion independent review', () => {
+  it('skips an overlapping query and applies failure backoff from the end of the request', async () => {
+    draft();
+    let fail!: (error: Error) => void;
+    fetcher.mockImplementationOnce(() => new Promise<Response>((_resolve, reject) => { fail = reject; }));
+    const first = reconcileNativeOncallSubmissions('app');
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    vi.setSystemTime(now + 25_000);
+    const overlapping = reconcileNativeOncallSubmissions('app');
+    fail(new Error('temporary lookup failure'));
+    await Promise.all([first, overlapping]);
+    vi.setSystemTime(now + 84_999);
+    await reconcileNativeOncallSubmissions('app');
+    expect(fetcher).toHaveBeenCalledOnce();
+    vi.setSystemTime(now + 85_000);
+    await reconcileNativeOncallSubmissions('app');
+    expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('succeeded');
+  });
   it.each(['disabled', 'target', 'ownership'])('does not adopt after %s changes during the platform lookup', async intervention => {
     draft(); let release!: () => void; let owns = true;
     const pending = new Promise<void>(resolve => { release = resolve; });
@@ -159,8 +176,9 @@ describe('native normalized source matching review', () => {
   it('stops after the bounded page window and refuses to infer absence from an incomplete scan', async () => {
     const other = { ...rows[0], source_location: 'https://oncall.example.test/chat?bm_form=other' };
     fetcher.mockImplementation(async (_url: string, options: any) => {
-      const page = JSON.parse(options.body).current_page;
-      return json(page > 10 ? [] : Array.from({ length: 100 }, (_, i) => ({ ...other, id: page * 1000 + i })));
+      const cursor = JSON.parse(options.body).filter_fields.find((filter: any) => filter.field === 'id');
+      const first = cursor ? Number(cursor.value) : 1;
+      return json(Array.from({ length: 100 }, (_, i) => ({ ...other, id: first + i })));
     });
     await expect(readNativeOncallResult(target, 'secret', expected, fetcher)).rejects.toThrow();
     expect(fetcher).toHaveBeenCalledTimes(10);
@@ -169,8 +187,8 @@ describe('native normalized source matching review', () => {
     const wanted = { ...rows[0], source_location: 'https://oncall.example.test/chat?bm_form=wanted&bizFrom=lark' };
     const other = { ...wanted, source_location: 'https://oncall.example.test/chat?bm_form=other' };
     fetcher.mockImplementation(async (_url: string, options: any) => {
-      const page = JSON.parse(options.body).current_page;
-      return json(page === 1 ? [wanted, ...Array.from({ length: 99 }, (_, i) => ({ ...other, id: 10000 + i }))] : [{ ...wanted, id: 9876 }]);
+      const cursor = JSON.parse(options.body).filter_fields.find((filter: any) => filter.field === 'id');
+      return json(!cursor ? [wanted, ...Array.from({ length: 99 }, (_, i) => ({ ...other, id: 10000 + i }))] : [{ ...wanted, id: 11000 }]);
     });
     await expect(readNativeOncallResult(target, 'secret', expected, fetcher)).rejects.toThrow();
     expect(fetcher).toHaveBeenCalledTimes(2);

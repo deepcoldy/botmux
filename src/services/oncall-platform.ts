@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
 import { oncallCreationSource, type OncallGroupCreation, type OncallGroupTarget } from './oncall-group-client.js';
 import { larkHosts, type Brand } from '../im/lark/lark-hosts.js';
+import { isNativeOncallSelectionMarker } from './oncall-sidebar-link.js';
 
 export interface OncallCategory {
   id: number;
@@ -12,7 +14,7 @@ export interface OncallCategory {
 }
 export interface OncallChoices { regions: Record<string, OncallCategory[]> }
 export interface OncallNativeSelection { region: string; typeId: number; priority: 'P2' | 'P1' | 'P0'; formId?: string }
-export type OncallSelection = OncallCategory & { requiresNativeForm: boolean };
+export type OncallSelection = OncallCategory & { requiresNativeForm: boolean; workflow?: unknown[] };
 
 /** Reconcile an uncertain create by its opaque attempt marker, never by question text. */
 export async function readOncallGroupResult(creation: OncallGroupCreation, secret: string, attemptId: string,
@@ -94,30 +96,30 @@ export async function readOncallChoices(target: OncallGroupTarget, secret: strin
   return { regions };
 }
 
-/** Validate the current route before deciding whether the card or the platform
- * should collect the form. Custom fields are handled by the native form. */
+/** Validate the current route and load the current custom-field definition. */
 export async function validateOncallSelection(target: OncallGroupTarget, secret: string, username: string,
   region: string, typeId: number, fetcher: typeof fetch = fetch): Promise<OncallSelection> {
   const choices = await readOncallChoices(target, secret, username, fetcher);
   const category = choices.regions[region]?.find(item => item.id === typeId);
   if (!category || category.type_action !== 'create_chat') throw new Error('请选择可创建工单的有效分类');
-  return { ...category, requiresNativeForm: await requiresNativeOncallForm(target, secret, category, fetcher, username) };
+  const workflow = await readOncallWorkflow(target, secret, category, fetcher, username);
+  return { ...category, workflow, requiresNativeForm: workflow === undefined || workflow.length > 0 };
 }
 
 /** Workflow metadata is reusable when the authorized choices were just loaded. */
-export async function requiresNativeOncallForm(target: OncallGroupTarget, secret: string, category: OncallCategory,
-  fetcher: typeof fetch = fetch, username = ''): Promise<boolean> {
+export async function readOncallWorkflow(target: OncallGroupTarget, secret: string, category: OncallCategory,
+  fetcher: typeof fetch = fetch, username = ''): Promise<unknown[] | undefined> {
   if (category.tenant_id !== target.tenantId || category.type_action !== 'create_chat') throw new Error('请选择可创建工单的有效分类');
   // This is the explicit human-handoff path: recommended document search and
   // self-diagnosis stages do not add a second prerequisite after confirmation.
-  if (!category.workflow_id) return true;
+  if (!category.workflow_id) return undefined;
   const data = await get(target, secret, username, `workflow/${category.workflow_id}`, {}, fetcher);
   if (data.tenant_id !== target.tenantId || data.type_id !== category.id) throw new Error('表单与当前分类不匹配，请重选');
   let fields: unknown;
   try { fields = typeof data.config === 'string' ? JSON.parse(data.config) : data.config; }
   catch { throw new Error('平台表单配置无效'); }
   if (!Array.isArray(fields)) throw new Error('平台表单配置无效');
-  return fields.length > 0;
+  return fields;
 }
 
 export async function createNativeOncallLink(target: OncallGroupTarget, secret: string, username: string,
@@ -174,11 +176,27 @@ export interface NativeOncallResultQuery {
   typeId: number;
   region: string;
   preparedAtMs?: number;
+  hostedSourceLocation?: string;
 }
-export interface NativeOncallResult { flowId: string; openChatId: string; launchedAtMs: number }
+export interface NativeOncallResult { flowId: string; openChatId: string; handoffAtMs: number }
 export interface NativeOncallResultCandidate<T extends NativeOncallResultQuery = NativeOncallResultQuery> {
   attempt: T;
   result: NativeOncallResult;
+}
+
+export interface NativeOncallScan {
+  key: string;
+  createdThrough: string;
+  afterId: number;
+  flowId?: number;
+}
+interface NativeOncallScanProgress {
+  checkpoint?: NativeOncallScan;
+  save: (checkpoint: NativeOncallScan | undefined) => void;
+}
+
+function platformTime(timeMs: number): string {
+  return new Date(timeMs + 8 * 60 * 60_000).toISOString().slice(0, 19).replace('T', ' ');
 }
 
 function nativeSourceMatcher(sourceLocation: string) {
@@ -198,75 +216,116 @@ function nativeSourceMatcher(sourceLocation: string) {
 }
 
 /** Match every published selection in one complete scan. Multiple distinct
- * orders remain ambiguous; one order may match several equivalent attempts. */
+ * orders for one draft remain ambiguous. */
 export async function readNativeOncallResultCandidates<T extends NativeOncallResultQuery>(
   target: OncallGroupTarget, secret: string, expected: T | readonly T[],
-  fetcher: typeof fetch = fetch): Promise<NativeOncallResultCandidate<T>[]> {
+  fetcher: typeof fetch = fetch, progress?: NativeOncallScanProgress): Promise<NativeOncallResultCandidate<T>[]> {
   const queries: readonly T[] = Array.isArray(expected) ? expected : [expected as T];
   if (!queries.length) return [];
   if (!secret || queries.some(item => !item.username || !item.sourceLocation)) throw new Error('Oncall 提单结果查询配置不完整');
   const username = queries[0]!.username;
   if (queries.some(item => item.username !== username)) throw new Error('同一表单的提单人不一致');
   const sources = queries.map(item => nativeSourceMatcher(item.sourceLocation));
-  const formId = sources[0]!.formId;
-  if (sources.some(item => item.formId !== formId) || (!formId && queries.length !== 1)) {
-    throw new Error('同一批原生提单缺少统一关联标识');
-  }
-  // Lark/platform may normalize channel parameters. Match the opaque form ID
-  // inside source_location, rather than requiring an identical query string.
-  // Legacy unmarked forms retain exact-source matching for verified migration.
-  // create_time can belong to a platform draft that predates the Botmux form.
-  const found = new Map<number, { row: any; attempts: T[] }>();
-  const fallbackPreparedAtMs = Date.now() - 24 * 60 * 60_000;
-  const preparedAtMs = Math.min(...queries.map(item => item.preparedAtMs ?? fallbackPreparedAtMs));
-  const since = new Date(preparedAtMs + 8 * 60 * 60_000).toISOString().slice(0, 19).replace('T', ' ');
-  for (let page = 1; ; page++) {
-    if (page > 10) throw new Error('Oncall 查询结果过多，请管理员核对');
+  if (!sources.every(item => item.formId) && queries.length !== 1) throw new Error('同一批原生提单缺少统一关联标识');
+  const exactSources = queries.map((item, index) => item.hostedSourceLocation ?? (sources[index]!.formId ? undefined : item.sourceLocation));
+  const exact = exactSources.every(source => source !== undefined);
+  const key = createHash('sha256').update(JSON.stringify([target, queries])).digest('hex');
+  const checkpoint = progress?.checkpoint?.key === key ? progress.checkpoint : undefined;
+  const since = platformTime(Math.min(...queries.map(item => item.preparedAtMs ?? Date.now() - 24 * 60 * 60_000)));
+  const createdThrough = checkpoint?.createdThrough ?? platformTime(Date.now());
+  let afterId = checkpoint?.afterId ?? 0;
+  let flowId = checkpoint?.flowId;
+  let matched: { row: any; attempts: T[] } | undefined;
+
+  async function list(filters: Array<{ field: string; value: string | Array<string | number>; operator: string }>, pageSize: number) {
     let response: Response;
     try {
       response = await fetcher(endpoint(target, 'oncall_flow/list').href, { method: 'POST', redirect: 'error',
         signal: AbortSignal.timeout(10_000), headers: { Authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
         body: JSON.stringify({ filter_fields: [
           { field: 'tenant_id', value: [target.tenantId], operator: 'in' },
-          ...(formId ? [{ field: 'oncall_start_time', value: since, operator: 'greater_or_equals' }]
-            : [{ field: 'source_location', value: [queries[0]!.sourceLocation], operator: 'in' }]),
           { field: 'originator_user', value: username, operator: 'equals' },
           { field: 'stage', value: ['launch_oncall'], operator: 'in' },
-        ], current_page: page, page_size: formId ? 100 : 2, sort: { field: 'create_time', operator: 'asc' } }),
+          ...filters,
+        ], current_page: 1, page_size: pageSize, sort: { field: 'id', operator: 'asc' } }),
       });
     } catch { throw new Error('Oncall 提单结果暂不可读取'); }
     if (!response.ok) throw new Error('Oncall 服务账号缺少工单查询权限或连接失败');
     const body = await response.json();
     if (body?.code !== 0 || !Array.isArray(body.data)) throw new Error('Oncall 提单结果格式无效');
-    for (const row of body.data) {
-      const sourceAttempts = queries.filter((_, index) => sources[index]!.matches(row?.source_location));
-      if (!sourceAttempts.length) continue;
-      if (row.tenant_id !== target.tenantId || row.originator_user !== username || row.stage !== 'launch_oncall'
-        || !Number.isSafeInteger(row.id) || row.id <= 0) throw new Error('Oncall 提单结果与原表单不匹配');
-      const attempts = sourceAttempts.filter(item => row.oncall_question_type_id === item.typeId && row.region === item.region);
-      const previous = found.get(row.id);
-      found.set(row.id, { row, attempts: [...(previous?.attempts ?? []), ...attempts]
-        .filter((item, index, all) => all.indexOf(item) === index) });
-      if (found.size > 1) throw new Error('同一表单存在多个工单，请管理员核对');
-    }
-    if (!formId || body.data.length < 100) break;
+    return body.data;
   }
-  if (!found.size) return [];
-  const { row, attempts } = [...found.values()][0]!;
-  if (!attempts.length) return [];
-  if (!row.chat_id || !row.oncall_start_time) return [];
-  const timestamp = String(row.oncall_start_time);
+
+  function match(row: any) {
+    const matches = sources.map((source, index) => {
+      const exactSource = exactSources[index];
+      return exactSource ? row?.source_location === exactSource : source.matches(row?.source_location);
+    });
+    if (!matches.some(Boolean)) return;
+    if (row.tenant_id !== target.tenantId || row.originator_user !== username || row.stage !== 'launch_oncall'
+      || !Number.isSafeInteger(row.id) || row.id <= 0) throw new Error('Oncall 提单结果与原表单不匹配');
+    if (flowId !== undefined && flowId !== row.id) {
+      progress?.save(undefined);
+      throw new Error('同一表单存在多个工单，请管理员核对');
+    }
+    flowId = row.id;
+    // A selection-specific marker identifies the category at submission time.
+    matched = { row, attempts: queries.filter((item, index) => matches[index] && row.region === item.region
+      && (isNativeOncallSelectionMarker(sources[index]!.formId) || row.oncall_question_type_id === item.typeId)) };
+  }
+
+  if (exact) {
+    // Two rows are enough to prove ambiguity. Re-check the source in case a
+    // gateway does not enforce the filter.
+    const rows = await list([{ field: 'source_location', value: [...new Set(exactSources)], operator: 'in' }], 2);
+    for (const row of rows) match(row);
+    if (rows.length >= 2) throw new Error('Oncall 来源查询结果不唯一');
+  } else {
+    const pageSize = 100;
+    for (let page = 0; page < 10; page++) {
+      const rows = await list([
+        { field: 'update_time', value: since, operator: 'greater_or_equals' },
+        // An order that is updated while we scan must stay in the same window.
+        { field: 'create_time', value: createdThrough, operator: 'less_or_equals' },
+        ...(afterId ? [{ field: 'id', value: String(afterId + 1), operator: 'greater_or_equals' }] : []),
+      ], pageSize);
+      for (const row of rows) {
+        if (!Number.isSafeInteger(row?.id) || row.id <= afterId) throw new Error('Oncall 工单分页未按 ID 推进');
+        afterId = row.id;
+        match(row);
+      }
+      if (rows.length < pageSize) break;
+      if (page === 9) {
+        if (!progress) throw new Error('Oncall 查询结果过多，请管理员核对');
+        progress.save({ key, createdThrough, afterId, flowId });
+        return [];
+      }
+    }
+    if (!matched && flowId !== undefined) {
+      // Persist only the ID. Re-read the matched row before adopting it.
+      const rows = await list([{ field: 'id', value: [String(flowId)], operator: 'in' }], 2);
+      if (rows.length === 1 && rows[0]?.id === flowId) match(rows[0]);
+    }
+  }
+  // Chat creation is the handoff boundary even if duty is queued until later.
+  const handoffTime = matched?.row.create_chat_time || matched?.row.oncall_start_time;
+  if (!matched?.attempts.length || !matched.row.chat_id || !handoffTime) {
+    if (progress?.checkpoint) progress.save(undefined);
+    return [];
+  }
+  const { row, attempts } = matched;
+  const timestamp = String(handoffTime);
   // This platform's unqualified timestamps are China Standard Time, in both
   // T- and space-separated forms. Qualify them explicitly: an unqualified
   // string passed to Date.parse is interpreted in the daemon's local timezone,
   // which silently shifts the result on a host outside UTC+8.
   const qualified = /^\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(\.\d+)?$/.test(timestamp)
     ? `${timestamp.replace(' ', 'T')}+08:00` : timestamp;
-  const launchedAtMs = Date.parse(qualified);
-  if (!Number.isFinite(launchedAtMs)) throw new Error('Oncall 发起人工时间无效');
+  const handoffAtMs = Date.parse(qualified);
+  if (!Number.isFinite(handoffAtMs)) throw new Error('Oncall 发起人工时间无效');
   const openChatId = await get(target, secret, '', 'platform/chat_id_to_open_chat_id', { chat_id: String(row.chat_id) }, fetcher);
   if (typeof openChatId !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(openChatId)) throw new Error('Oncall 人工群标识无效');
-  const result = { flowId: String(row.id), openChatId, launchedAtMs };
+  const result = { flowId: String(row.id), openChatId, handoffAtMs };
   return attempts.map(attempt => ({ attempt, result }));
 }
 
