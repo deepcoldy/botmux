@@ -660,7 +660,7 @@ import {
 import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from './core/rewind-backup-retention.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, CliLaunchNotice, PtyHandle, SessionRenameSurface, SubmitGuard, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
-import { decideSessionRenameSettlement, sessionRenameWriteFailureAction } from './core/session-rename-settlement.js';
+import { decideSessionRenameSettlement, sessionRenameWriteFailureAction, shouldRecoverUnconfirmedSessionRename } from './core/session-rename-settlement.js';
 import { detectCliStartupBlocker, screenMayShowCredential, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
 import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
@@ -1659,6 +1659,9 @@ function queuePostSubmitNativeSessionTitle(title: string | undefined): boolean {
   if (!supportsPostSubmitRenameSessionTitle(cfg.cliId)) return false;
   if (codexRpcEngine || remoteWsUrl) return false;
   if (!cliAdapter?.buildSessionRenameCommand) return false;
+  // A failed cosmetic sync must not re-arm itself after its recovery restart.
+  // Explicit rename_session requests can still retry the title normally.
+  if (cliAdapter.buildSessionRenameCommand(trimmed) === abandonedAutomaticRenameCommand) return false;
   if (isRemoteBackendType(effectiveBackendType)) return false;
   nativeSessionTitleRevision += 1;
   nativeSessionTitleAppliedThreadId = undefined;
@@ -6272,6 +6275,11 @@ const SESSION_RENAME_IDLE_TIMEOUT_MS = 5_000;
 const SESSION_RENAME_RECHECK_MS = 2_000;
 const SESSION_RENAME_SLOW_RECHECK_MS = 10_000;
 const SESSION_RENAME_FAST_RECHECK_WINDOW_MS = 30_000;
+const SESSION_RENAME_RECOVERY_AFTER_MS = 60_000;
+/** Worker-lifetime latches: killCli clears the in-flight rename, not these.
+ * One recovery cannot loop into another restart or spend the FRESH budget. */
+let sessionRenameRecoveryUsed = false;
+let abandonedAutomaticRenameCommand: string | undefined;
 let sessionRenameIdleTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionRenameReattachRetryTimer: ReturnType<typeof setTimeout> | null = null;
 /** The rename in flight: the exact command typed, the adapter's durable-record
@@ -6404,6 +6412,50 @@ function notifySessionRenameInputHeld(): void {
   });
 }
 
+function recoverUnconfirmedSessionRename(surface: SessionRenameSurface | undefined): boolean {
+  const mayRestart = !!backend && lastInitConfig?.cliId === 'traex'
+    && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
+    && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)
+    && !closeRequested && !cliRestartInProgress && !rawInputRestartGate && !codexAutoUpgrade
+    && !pendingWebTerminalInput() && commandLineWritesPending === 0
+    && !isFlushing && !injectionFlushing;
+  if (!shouldRecoverUnconfirmedSessionRename({
+    surface,
+    elapsedMs: Date.now() - sessionRenameSentAtMs,
+    timeoutMs: SESSION_RENAME_RECOVERY_AFTER_MS,
+    hasQueuedInput: pendingMessages.length > 0 || pendingRawInputs.length > 0,
+    alreadyRecovered: sessionRenameRecoveryUsed,
+    mayRestart,
+  })) return false;
+  // The init-time resume target alone is not evidence. Never trade a missing
+  // receipt for a fresh conversation or restart somebody else's adopted CLI.
+  const nativeSessionId = sessionRenameNativeSessionIdNow();
+  if (!nativeSessionId) return false;
+  // A user may have switched native threads from the terminal since the
+  // rename started. Recheck the live process rather than trusting the cached
+  // receipt identity, and refuse an ambiguous multi-thread FD set.
+  const pid = currentTraexObservedPid();
+  const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
+  if (!owned || owned.size !== 1 || !(owned.has(nativeSessionId) || owned.has(nativeSessionId.toLowerCase()))) return false;
+  sessionRenameRecoveryUsed = true;
+  abandonedAutomaticRenameCommand = sessionRenameCommand;
+  const head = pendingMessages[0];
+  const rawHead = pendingRawInputs[0];
+  send({
+    type: 'user_notify', turnId: head?.turnId ?? rawHead?.turnId,
+    dispatchAttempt: head?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+    message: t('worker.session_rename_recovering', { cliName: cliName() }),
+  });
+  log('Native session rename receipt timed out at an empty composer; restarting the owned CLI with queued input preserved');
+  // Keep the old rename fenced until teardown. The replacement process has
+  // no stale composer/paste buffer, so its normal ready gate may drain input.
+  void restartCliProcess('native session rename receipt timeout', {
+    immediate: true, preservePending: true, skipRestartBudget: true,
+    exactResumeSessionId: nativeSessionId,
+  });
+  return true;
+}
+
 /** Judge the rename in flight and act on it: release queued input, press the
  *  one recovery Enter, or keep holding and re-read. `prompt` is a screen-idle
  *  edge (markPromptReady already restores readiness and flushes); `timer` is
@@ -6451,6 +6503,7 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
     log(`Native session rename not confirmed (${surface}${sessionRenameResubmitted ? ' after one resubmit' : ''}); holding queued input until this rename is recorded and the ${cliName()} input surface is writable`);
   }
   notifySessionRenameInputHeld();
+  if (recoverUnconfirmedSessionRename(surface)) return;
   armSessionRenameIdleTimeout(Date.now() - sessionRenameSentAtMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
     ? SESSION_RENAME_RECHECK_MS : SESSION_RENAME_SLOW_RECHECK_MS);
 }
@@ -29128,6 +29181,7 @@ async function spawnCli(
     reuseExistingScratchTree?: boolean;
   } = {},
 ): Promise<void> {
+  if (closeRequested) throw new CliSpawnSupersededError();
   if (!workerSessionEventScope) return spawnCliBody(cfg, opts);
   const firstBinding = !workerSessionEventScope.currentBinding();
   if (cfg.prompt && !workerSessionEventScope.canSubmit(cfg.turnId, cfg.dispatchAttempt, cfg.sessionCommand?.execution)) {
@@ -36988,6 +37042,7 @@ async function restartCliProcess(
         ]);
       }
       if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
+      if (closeRequested) { settleRespawn('superseded'); return; }
       const teardownVerdict = classifyRestartTeardown(teardownOutcome, {
         remote: isRemoteBackendType(effectiveBackendType),
       });
@@ -37035,10 +37090,12 @@ async function restartCliProcess(
       // A normal restart cannot observe activity from the retired process.
       // Only capacity-model rotation carries that waiting latch forward.
       traexAutoModelController?.noteProcessExited(opts.restartCause === 'traex-auto-model');
-      if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
+      if (restartEpoch !== cliRestartEpoch || closeRequested) { settleRespawn('superseded'); return; }
       awaitingFirstPrompt = true;
       setTimeout(async () => {
-        if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
+        // A close can arrive while teardown or this respawn delay is awaiting.
+        // Its ACK may still be flushing, so waiting for killCli is too late.
+        if (restartEpoch !== cliRestartEpoch || closeRequested) { settleRespawn('superseded'); return; }
         let spawnedWorkingDir: string | undefined;
         let spawnedLaunch: RestartLaunchSettings | undefined;
         if (lastInitConfig) {
