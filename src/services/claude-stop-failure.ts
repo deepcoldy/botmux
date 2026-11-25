@@ -341,7 +341,7 @@ export function decideClaudeStopFailureFallback(input: {
   surfaced: boolean;
 }): ClaudeStopFailureFallback {
   const { outcome } = input;
-  if (!outcome || outcome.status === 'completed') return { action: 'skip', reason: 'unclassified' };
+  if (!outcome || outcome.status === 'completed' || outcome.status === 'cancelled') return { action: 'skip', reason: 'unclassified' };
   if (outcome.status === 'rate_limited') return { action: 'skip', reason: 'rate_limited' };
   if (input.surfaced) return { action: 'skip', reason: 'surfaced' };
   if (input.turnId && !input.settled && input.cliIdle) {

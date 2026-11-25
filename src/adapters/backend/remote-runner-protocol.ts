@@ -116,6 +116,13 @@ export interface RemoteRunnerUsageReport {
 }
 
 export interface RemoteRunnerTrustedCaller {
+  taskContinuation?: {
+    appId: string;
+    openId: string;
+    unionId?: string;
+    sourceSessionId: string;
+    sourceTurnId: string;
+  };
   requestUserOpenId?: string;
   requestUserUnionId?: string;
   requestLarkAppId?: string;
@@ -133,6 +140,26 @@ export interface RemoteRunnerTrustedCaller {
 export function projectRemoteRunnerTrustedCaller(
   caller: RemoteRunnerTrustedCaller & Record<string, unknown>,
 ): RemoteRunnerTrustedCaller {
+  let taskContinuation: RemoteRunnerTrustedCaller['taskContinuation'];
+  if (caller.taskContinuation !== undefined) {
+    const raw = record(caller.taskContinuation);
+    const appId = nonEmptyString(raw?.appId, 256);
+    const openId = nonEmptyString(raw?.openId, 256);
+    const unionId = raw?.unionId === undefined ? undefined : nonEmptyString(raw.unionId, 256);
+    const sourceSessionId = nonEmptyString(raw?.sourceSessionId, 256);
+    const sourceTurnId = nonEmptyString(raw?.sourceTurnId, 256);
+    if (!raw || caller.senderType !== 'bot' || appId !== caller.requestLarkAppId
+      || !appId?.startsWith('cli_') || !ID_RE.test(appId)
+      || !openId?.startsWith('ou_') || !ID_RE.test(openId)
+      || (raw.unionId !== undefined && (!unionId?.startsWith('on_') || !ID_RE.test(unionId)))
+      || !sourceSessionId || !ID_RE.test(sourceSessionId)
+      || !sourceTurnId?.startsWith('om_') || !ID_RE.test(sourceTurnId)) {
+      throw new Error('Invalid host task continuation for remote runner');
+    }
+    // Host-attested outbound context only. Never copy protected email or
+    // arbitrary persisted fields; recovered provider events cannot mint it.
+    taskContinuation = { appId, openId, ...(unionId ? { unionId } : {}), sourceSessionId, sourceTurnId };
+  }
   return {
     ...(caller.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
     ...(caller.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
@@ -141,6 +168,7 @@ export function projectRemoteRunnerTrustedCaller(
     ...(caller.taskId ? { taskId: caller.taskId } : {}),
     ...(caller.senderType ? { senderType: caller.senderType } : {}),
     ...(caller.botOwner ? { botOwner: { ...caller.botOwner } } : {}),
+    ...(taskContinuation ? { taskContinuation } : {}),
   };
 }
 

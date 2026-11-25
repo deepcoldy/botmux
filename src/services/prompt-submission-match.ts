@@ -33,8 +33,18 @@ export interface SubmittedPrompt {
   prefix?: string;
 }
 
+export interface WrittenInputIdentity {
+  turnId: string;
+  dispatchAttempt?: number;
+}
+
+interface WrittenInputEntry extends WrittenInputIdentity {
+  fingerprint: string;
+  prefix: string;
+}
+
 export class WrittenInputLedger {
-  private written: Array<{ turnId: string; fingerprint: string; prefix: string }> = [];
+  private written: WrittenInputEntry[] = [];
   /** Prefixes that can no longer be evidence: spent by a claim or orphaned
    *  when their fingerprint was forgotten (eviction, a rewrite that changes
    *  the opening). The set lives for the worker process; each entry is at
@@ -42,7 +52,7 @@ export class WrittenInputLedger {
    *  it stays small. */
   private taintedPrefixes = new Set<string>();
 
-  noteWritten(turnId: string, content: string): void {
+  noteWritten(turnId: string, content: string, dispatchAttempt?: number): void {
     const fingerprint = fingerprintPromptText(content);
     const prefix = prefixOf(content);
     // A turn rewritten with a different opening abandons the old prefix: with
@@ -53,8 +63,9 @@ export class WrittenInputLedger {
         this.taintedPrefixes.add(entry.prefix);
       }
     }
-    this.written = this.written.filter((entry) => entry.turnId !== turnId);
-    this.written.push({ turnId, fingerprint, prefix });
+    this.written = this.written.filter((entry) =>
+      entry.turnId !== turnId || entry.dispatchAttempt !== dispatchAttempt);
+    this.written.push({ turnId, dispatchAttempt, fingerprint, prefix });
     while (this.written.length > WRITTEN_INPUTS_MAX) {
       const [evicted] = this.written.splice(0, 1);
       if (evicted.prefix) this.taintedPrefixes.add(evicted.prefix);
@@ -65,13 +76,16 @@ export class WrittenInputLedger {
    *  fallback resolves only while it is unique and unclaimed: a shared,
    *  spent or orphaned prefix cannot tell two written turns apart, so it
    *  resolves nothing and consumes nothing. */
-  takeSubmitted(prompt: SubmittedPrompt): string | undefined {
+  takeSubmittedIdentity(prompt: SubmittedPrompt): WrittenInputIdentity | undefined {
     if (prompt.fingerprint) {
       const index = this.written.findIndex((entry) => entry.fingerprint === prompt.fingerprint);
       if (index >= 0) {
         const [entry] = this.written.splice(index, 1);
         if (entry.prefix) this.taintedPrefixes.add(entry.prefix);
-        return entry.turnId;
+        return {
+          turnId: entry.turnId,
+          ...(entry.dispatchAttempt !== undefined ? { dispatchAttempt: entry.dispatchAttempt } : {}),
+        };
       }
     }
     if (!prompt.prefix || this.taintedPrefixes.has(prompt.prefix)) return undefined;
@@ -82,6 +96,13 @@ export class WrittenInputLedger {
     if (matches.length !== 1) return undefined;
     const [entry] = this.written.splice(matches[0], 1);
     if (entry.prefix) this.taintedPrefixes.add(entry.prefix);
-    return entry.turnId;
+    return {
+      turnId: entry.turnId,
+      ...(entry.dispatchAttempt !== undefined ? { dispatchAttempt: entry.dispatchAttempt } : {}),
+    };
+  }
+
+  takeSubmitted(prompt: SubmittedPrompt): string | undefined {
+    return this.takeSubmittedIdentity(prompt)?.turnId;
   }
 }

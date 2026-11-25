@@ -22,6 +22,7 @@ import {
   backgroundTaskSettledIds,
   isClaudeApiRequestBlob,
   isClaudeTurnTerminalEvent,
+  isClaudeUserInterruptEvent,
   isMeaningfulQueuedCommand,
   isMeaningfulUserEvent,
   isScheduledTurnStartEvent,
@@ -246,7 +247,7 @@ export function claudeInterruptedWork(
     }
 
     const role = ev.message?.role ?? ev.type;
-    if (role === 'user' && typeof (ev as { interruptedMessageId?: unknown }).interruptedMessageId === 'string') {
+    if (isClaudeUserInterruptEvent(ev)) {
       turnOpen = false;
     } else if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev) || isScheduledTurnStartEvent(ev)) {
       turnOpen = true;
