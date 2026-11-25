@@ -650,7 +650,6 @@ export class BridgeTurnQueue {
   private lastProviderReplyAtMs: number | undefined;
   private readonly liveStates = new WeakMap<BridgePendingTurn, ClaudeTurnLiveState>();
   private readonly seenApiRequestKeys = new Set<string>();
-  private lastSeenRecordUuid = '';
   private apiRequestObservedInGeneration = false;
   private recentUnobservedTurn: RecentUnobservedTurn | null = null;
   private readonly reattachedFromUnobserved = new WeakSet<BridgePendingTurn>();
@@ -794,7 +793,6 @@ export class BridgeTurnQueue {
     this.durationMarkerWaitExpired = false;
     this.recentUnobservedTurn = null;
     this.seenApiRequestKeys.clear();
-    this.lastSeenRecordUuid = '';
     this.apiRequestObservedInGeneration = false;
   }
 
@@ -1105,7 +1103,7 @@ export class BridgeTurnQueue {
         // An id-less request is distinguishable from a same-timestamp successor
         // only when this batch also contains NEW uuid progress. Without such
         // progress, treat timestamp+path as a replay key: using the mutable
-        // lastSeenRecordUuid made the same request gain a fresh key whenever a
+        // last-seen batch cursor made the same request gain a fresh key whenever a
         // replay batch started at the request after later records had landed.
         const seen = !!apiKey && this.seenApiRequestKeys.has(apiKey);
         if (!apiKey || (seen && (hasStableId || !batchMadeUuidProgress))) continue;
@@ -1121,9 +1119,6 @@ export class BridgeTurnQueue {
         continue;
       }
       const uuid = ev.uuid;
-      if (typeof uuid === 'string' && uuid.length > 0) {
-        this.lastSeenRecordUuid = uuid;
-      }
       if (!uuid || this.seen.has(uuid)) continue;
       this.seen.add(uuid);
       batchMadeUuidProgress = true;
