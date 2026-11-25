@@ -11,6 +11,7 @@ import { parseOption, parseAskQuestions } from './ask-questions.js';
 export { parseAskQuestions } from './ask-questions.js';
 import type { CreateAskInput, AskResult, AskOption, AskQuestion, CliPermissionOutcome } from './ask-types.js';
 import { isCliPermissionOutcome, shouldReturnAskStartupNotReady, NATIVE_STANDALONE_ASK_ORIGIN } from './ask-types.js';
+import type { Locale } from '../i18n/types.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import type { VcMeetingLiveManagedOrigin } from '../services/vc-meeting-send-policy.js';
 import { isCodexAsyncAskOrigin, parseCodexAsyncUserInput, type CodexAsyncUserInput } from '../services/codex-async-user-input.js';
@@ -285,6 +286,12 @@ export function handleCliResolvedRequest(raw: unknown, ctx: {
   });
   if (outcome === 'not_found') return { status: 409, body: { ok: false, error: 'ask_not_found' } };
   return { status: 200, body: { ok: true, outcome } };
+}
+
+/** What the daemon answers a waiting asker with: a hook also gets the asking bot's language
+ *  (`AskResult.locale`), since the hook process cannot see per-bot settings. */
+export function askResponseBody(result: AskResult, originKind: string | undefined, locale: Locale): AskResult {
+  return result.kind === 'answered' && originKind === 'hook' ? { ...result, locale } : result;
 }
 
 /** The response, not IncomingMessage.close, tracks the long-poll lifetime:

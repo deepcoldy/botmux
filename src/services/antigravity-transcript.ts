@@ -74,6 +74,7 @@
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
+import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fstatSync, openSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -1149,4 +1150,252 @@ export function hasAntigravityTranscriptPendingTasks(transcriptPath: string): bo
   // Only a file with no explicit turn boundary at all remains fail-closed.
   const exhaustive = scanTranscriptTailForPendingTasks(transcriptPath, Number.MAX_SAFE_INTEGER);
   return exhaustive.bounded ? exhaustive.pending : true;
+}
+
+export interface AntigravityCompletedTurnCandidate {
+  turnId: string;
+  submittedText?: string;
+  /** 归一化 submittedText 的 SHA-256 摘要（用于从 PID marker 恢复而不落盘明文）。 */
+  submittedTextSha256?: string;
+  /** 采样 minByteOffset 时的 transcript 文件路径（用于 compact → full 视图切换时换算偏移）。 */
+  sampledTranscriptPath?: string;
+  /** 提交该候选回合前采样的 transcript 字节偏移下界；纯文本匹配仅接受 >= 换算后下界的 USER_INPUT，
+   *  避免同文重复提示词（如静态定时巡检或零注入下的「继续」）误命中更早的已完成回合。 */
+  minByteOffset?: number;
+  /** 提交前同会话内排在它之前、且尚未落盘到 minByteOffset 之前的同文/未知正文在途回合数；
+   *  纯文本匹配必须跳过前 skipPriorMatches 条命中，才把后续独立 occurrence 归属给本候选。 */
+  skipPriorMatches?: number;
+}
+
+export function hashAntigravitySubmittedText(text: string): string {
+  return createHash('sha256').update(text.replace(/\r\n?/g, '\n')).digest('hex');
+}
+
+/** 将采样文件坐标系下的字节下界换算到当前读取的 transcriptPath；
+ *  compact → full 走 mapAntigravityCompactOffsetToFull，其余无法安全对齐的跨文件切换一律 fail-closed（返回 null）。 */
+export function resolveAntigravityCandidateMinByteOffset(
+  candidate: Pick<AntigravityCompletedTurnCandidate, 'minByteOffset' | 'sampledTranscriptPath'>,
+  transcriptPath: string,
+): number | undefined | null {
+  if (candidate.minByteOffset === undefined) return undefined;
+  const sampled = candidate.sampledTranscriptPath;
+  if (!sampled || sampled === transcriptPath) return candidate.minByteOffset;
+  if (antigravityFullSiblingPath(sampled) === transcriptPath) {
+    const mapped = mapAntigravityCompactOffsetToFull(sampled, candidate.minByteOffset, transcriptPath);
+    return mapped === undefined ? null : mapped;
+  }
+  if (antigravityCompactSiblingPath(sampled) === transcriptPath) {
+    return candidate.minByteOffset === 0 ? 0 : null;
+  }
+  return null;
+}
+
+/** 统计 transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 次数。 */
+export function countAntigravityUserInputMatches(
+  transcriptPath: string,
+  textSha256: string,
+  minByteOffset = 0,
+  maxByteOffset?: number,
+): number {
+  if (!transcriptPath || !existsSync(transcriptPath)) return 0;
+  if (maxByteOffset !== undefined && maxByteOffset <= minByteOffset) return 0;
+  let count = 0;
+  scanJsonlFromOffset(transcriptPath, minByteOffset, {
+    ...(maxByteOffset !== undefined ? { endOffset: maxByteOffset } : {}),
+    onLine: line => {
+      if (!line.trim()) return;
+      let rec: any;
+      try {
+        rec = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (!isExplicitUserInput(rec)) return;
+      const unwrapped = unwrapAntigravityUserInput(typeof rec.content === 'string' ? rec.content : '');
+      if (hashAntigravitySubmittedText(unwrapped) === textSha256) count += 1;
+    },
+  });
+  return count;
+}
+
+const COMPLETED_TURN_INITIAL_TAIL_BYTES = 256 * 1024;
+const COMPLETED_TURN_MAX_TAIL_BYTES = 4 * 1024 * 1024;
+
+/** 从 BotMux 注入的 envelope 头部提取 `<message_location message_id="..."/>`。
+ *  仅扫描 `<user_message>` 之前的系统头，防止正文引用伪造回执归属。 */
+function extractBotmuxMessageLocationId(unwrappedUserInput: string): string | undefined {
+  const userMsgIdx = unwrappedUserInput.indexOf('<user_message>');
+  const header = userMsgIdx >= 0 ? unwrappedUserInput.slice(0, userMsgIdx) : unwrappedUserInput;
+  const match = header.match(/(?:^|\n)<message_location\b[^>]*\bmessage_id="([^"]+)"[^>]*\/>(?:\n|$)/);
+  return match?.[1];
+}
+
+/** 从 Antigravity 原生 transcript 判定哪些候选非 durable 回合已被消费并完成。
+ *  仅当 transcript 尾部不处于忙碌态，且候选回合对应的独立 USER_INPUT 之后
+ *  存在非空无工具调用的 PLANNER_RESPONSE（DONE）时，才认定其已完成（fail-closed）。 */
+export function findCompletedAntigravityTurnIds(
+  transcriptPath: string,
+  candidates: readonly AntigravityCompletedTurnCandidate[],
+): Set<string> {
+  const result = new Set<string>();
+  if (candidates.length === 0 || !existsSync(transcriptPath)) return result;
+  // 最新回合仍有未完成的非 daemon 后台任务或 subagent 时，其无工具 PLANNER_RESPONSE 只是等待旁白，
+  // 绝不能提前判定该回合已结束并回收归属权。
+  if (hasAntigravityTranscriptPendingTasks(transcriptPath)) return result;
+
+  const candidateIds = new Set<string>();
+  const hashToCandidates = new Map<string, Array<{
+    turnId: string;
+    minByteOffset?: number;
+    skipPriorMatches: number;
+  }>>();
+  let earliestMinOffset: number | undefined;
+  for (const candidate of candidates) {
+    if (!candidate.turnId) continue;
+    candidateIds.add(candidate.turnId);
+    const textSha256 = candidate.submittedTextSha256
+      ?? (candidate.submittedText ? hashAntigravitySubmittedText(candidate.submittedText) : undefined);
+    if (textSha256) {
+      const effectiveMinOffset = resolveAntigravityCandidateMinByteOffset(candidate, transcriptPath);
+      if (effectiveMinOffset === null) continue;
+      if (effectiveMinOffset !== undefined) {
+        earliestMinOffset = earliestMinOffset === undefined
+          ? effectiveMinOffset
+          : Math.min(earliestMinOffset, effectiveMinOffset);
+      }
+      const entry = {
+        turnId: candidate.turnId,
+        minByteOffset: effectiveMinOffset,
+        skipPriorMatches: Math.max(0, candidate.skipPriorMatches ?? 0),
+      };
+      const list = hashToCandidates.get(textSha256);
+      if (list) {
+        if (!list.some(item => item.turnId === candidate.turnId)) list.push(entry);
+      } else {
+        hashToCandidates.set(textSha256, [entry]);
+      }
+    }
+  }
+  if (candidateIds.size === 0) return result;
+
+  try {
+    const fd = openSync(transcriptPath, 'r');
+    try {
+      const stats = fstatSync(fd);
+      if (stats.size === 0) return result;
+
+      let chunkSize = Math.min(stats.size, COMPLETED_TURN_INITIAL_TAIL_BYTES);
+      while (chunkSize <= stats.size) {
+        const windowStart = stats.size - chunkSize;
+        const buf = Buffer.alloc(chunkSize);
+        readSync(fd, buf, 0, chunkSize, windowStart);
+
+        let busy = false;
+        const pending = new Set<string>();
+        const completed = new Set<string>();
+        const seenCandidates = new Set<string>();
+        const plainTextSeenCounts = new Map<string, number>();
+        const plainTextClaimed = new Set<string>();
+
+        let pos = 0;
+        if (windowStart > 0) {
+          const firstNl = buf.indexOf(0x0a);
+          pos = firstNl >= 0 ? firstNl + 1 : buf.length;
+        }
+        while (pos < buf.length) {
+          const nl = buf.indexOf(0x0a, pos);
+          const lineEnd = nl >= 0 ? nl : buf.length;
+          const lineFileOffset = windowStart + pos;
+          const line = buf.subarray(pos, lineEnd).toString('utf-8').trim();
+          pos = nl >= 0 ? nl + 1 : buf.length;
+          if (!line) continue;
+          let rec: any;
+          try {
+            rec = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          const type = rec?.type;
+          if (type === 'USER_INPUT') {
+            if (rec.source !== undefined && rec.source !== 'USER_EXPLICIT') continue;
+            busy = true;
+            const unwrapped = unwrapAntigravityUserInput(
+              typeof rec.content === 'string' ? rec.content : '',
+            ).replace(/\r\n?/g, '\n');
+            const matched: string[] = [];
+            const locId = extractBotmuxMessageLocationId(unwrapped);
+            if (locId && candidateIds.has(locId)) {
+              matched.push(locId);
+            }
+            if (hashToCandidates.size > 0) {
+              const byHash = hashToCandidates.get(hashAntigravitySubmittedText(unwrapped));
+              if (byHash) {
+                let claimedThisOccurrence = false;
+                for (const entry of byHash) {
+                  if (locId && locId !== entry.turnId) continue;
+                  if (entry.minByteOffset !== undefined && lineFileOffset < entry.minByteOffset) continue;
+                  const seen = (plainTextSeenCounts.get(entry.turnId) ?? 0) + 1;
+                  plainTextSeenCounts.set(entry.turnId, seen);
+                  if (claimedThisOccurrence || plainTextClaimed.has(entry.turnId)) continue;
+                  if (seen <= entry.skipPriorMatches) continue;
+                  plainTextClaimed.add(entry.turnId);
+                  claimedThisOccurrence = true;
+                  if (!matched.includes(entry.turnId)) matched.push(entry.turnId);
+                }
+              }
+            }
+            for (const turnId of matched) {
+              seenCandidates.add(turnId);
+              completed.delete(turnId);
+              pending.add(turnId);
+            }
+            continue;
+          }
+          if (type === 'PLANNER_RESPONSE') {
+            if (Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0) {
+              busy = true;
+              continue;
+            }
+            const content = typeof rec.content === 'string' ? rec.content.trim() : '';
+            if (content.length > 0 && (rec.status === undefined || rec.status === 'DONE')) {
+              busy = false;
+              for (const turnId of pending) completed.add(turnId);
+              pending.clear();
+            }
+            continue;
+          }
+          if (type === 'GENERIC') {
+            busy = true;
+            continue;
+          }
+          if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
+            busy = false;
+            continue;
+          }
+          if (type === 'SYSTEM_MESSAGE') {
+            if (/cancell?ed|interrupted|aborted/i.test(String(rec.content ?? ''))) {
+              busy = false;
+            }
+            continue;
+          }
+        }
+
+        // transcript 自身仍处于执行态时绝不提前回收任何候选回合。
+        if (busy) return new Set();
+
+        const coversMinOffsets = earliestMinOffset === undefined || windowStart <= earliestMinOffset;
+        if ((seenCandidates.size === candidateIds.size && coversMinOffsets)
+          || chunkSize >= stats.size
+          || chunkSize >= COMPLETED_TURN_MAX_TAIL_BYTES) {
+          return completed;
+        }
+        chunkSize = Math.min(stats.size, Math.min(chunkSize * 4, COMPLETED_TURN_MAX_TAIL_BYTES));
+      }
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return new Set();
+  }
+  return result;
 }

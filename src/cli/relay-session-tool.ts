@@ -12,6 +12,7 @@
  */
 import { constants as fsConstants, closeSync, mkdirSync, openSync, writeSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { normalizeHistoryReadFilters, rejectDuplicateReadFlags } from '../core/history-read-options.js';
 import type {
   RemoteRunnerSessionToolAttachment,
   RemoteRunnerSessionToolRequest,
@@ -46,8 +47,14 @@ export function buildRelaySessionToolRequest(
   args: readonly string[],
   ownSessionId: string | undefined,
 ): Built {
-  const valueFlags = new Set(tool === 'history' ? ['--limit', '--scope', '--session-id'] : ['--session-id']);
-  const boolFlags = new Set(tool === 'history' ? ['--with-card-json'] : ['--raw']);
+  const valueFlags = new Set(tool === 'history'
+    ? ['--limit', '--scope', '--session-id', '--view', '--query', '--type', '--since', '--until'] : ['--session-id']);
+  const boolFlags = new Set(tool === 'history' ? ['--with-card-json'] : ['--raw', '--no-download']);
+  try {
+    rejectDuplicateReadFlags(args, {
+      valueFlags: [...valueFlags], boolFlags: [...boolFlags],
+    });
+  } catch (error) { return { ok: false, error: (error as Error).message }; }
   const values = new Map<string, string>();
   const bools = new Set<string>();
   const positionals: string[] = [];
@@ -86,13 +93,22 @@ export function buildRelaySessionToolRequest(
     if (scope !== undefined && !['session', 'thread', 'chat', 'ambient'].includes(scope)) {
       return { ok: false, error: `botmux history: unknown --scope ${scope}` };
     }
+    const filters = normalizeHistoryReadFilters({
+      ...(values.has('--view') ? { view: values.get('--view') } : {}),
+      ...(values.has('--query') ? { query: values.get('--query') } : {}),
+      ...(values.has('--type') ? { types: values.get('--type')!.split(',').map(type => type.trim()).filter(Boolean) } : {}),
+      ...(values.has('--since') ? { since: values.get('--since') } : {}),
+      ...(values.has('--until') ? { until: values.get('--until') } : {}),
+      ...(bools.has('--with-card-json') ? { withCardJson: true } : {}),
+    });
+    if (!filters) return { ok: false, error: 'botmux history: invalid history filters' };
     return {
       ok: true,
       request: {
         tool: 'history',
         ...(limit !== undefined ? { limit } : {}),
         ...(scope !== undefined ? { scope: scope as 'session' | 'thread' | 'chat' | 'ambient' } : {}),
-        ...(bools.has('--with-card-json') ? { withCardJson: true } : {}),
+        ...filters,
       },
     };
   }
@@ -101,7 +117,8 @@ export function buildRelaySessionToolRequest(
     return { ok: false, error: 'botmux quoted: the sandbox relay reads exactly one message id per call' };
   }
   if (!/^om_[A-Za-z0-9_-]+$/.test(ids[0]!)) return { ok: false, error: `Invalid message id: ${ids[0]}` };
-  return { ok: true, request: { tool: 'quoted', messageId: ids[0]!, ...(bools.has('--raw') ? { raw: true } : {}) } };
+  return { ok: true, request: { tool: 'quoted', messageId: ids[0]!, ...(bools.has('--raw') ? { raw: true } : {}),
+    ...(bools.has('--no-download') ? { download: false } : {}) } };
 }
 
 /**

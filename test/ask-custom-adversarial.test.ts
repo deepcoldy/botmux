@@ -44,9 +44,12 @@ describe('custom Ask independent adversarial probes', () => {
     } });
     const formInput = nodes(response).find(n => n.name === 'custom_0');
     expect(formInput.default_value).toBe('');
-    const submit = nodes(response).find(n => n.name === 'submit_answers');
+    // The armed card is the redesigned form: its one submit carries every (unticked) box and input.
+    const submit = nodes(response).find(n => n.tag === 'button' && n.form_action_type === 'submit');
+    expect(submit.behaviors[0].value).toMatchObject({ action: 'ask_choice_submit', confirm_empty: 'true' });
     await handleAskCardAction({ operator: { open_id: 'owner' }, action: {
-      value: submit.value, form_value: { custom_0: formInput.default_value, custom_1: '' },
+      value: submit.behaviors[0].value,
+      form_value: { opt_0_0: false, opt_0_1: false, opt_1_0: false, opt_1_1: false, custom_0: formInput.default_value, custom_1: '' },
     } });
     expect(await promise).toMatchObject({ kind: 'answered', answers: [[], []] });
     expect(getAskSnapshot(args.askId)?.result).not.toHaveProperty('customAnswers');
@@ -86,9 +89,9 @@ describe('custom Ask independent adversarial probes', () => {
     const retry = await legacyClick('b');
     expect(upgraded.selections).toEqual(getAskSnapshot(args.askId)?.selections);
     // The old card client needs the current form in order to continue after a lost response.
-    const submit = nodes(retry).find(n => n.name === 'submit_answers');
+    const submit = nodes(retry).find(n => n.tag === 'button' && n.form_action_type === 'submit');
     expect(submit).toBeDefined();
-    expect(Number(submit.value.revision)).toBe(getAskSnapshot(args.askId)?.customRevision);
+    expect(Number(submit.behaviors[0].value.revision)).toBe(getAskSnapshot(args.askId)?.customRevision);
   });
 
   it('manual invalidation after a saved draft prevents the delayed submit', async () => {

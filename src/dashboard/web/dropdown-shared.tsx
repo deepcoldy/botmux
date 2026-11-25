@@ -9,6 +9,8 @@ import { floatingPortalHost } from './floating-host.js';
 export type DropdownOption<T extends string> = {
   value: T;
   label: ReactNode;
+  /** Hidden search keywords, such as a CLI's launch command and aliases. */
+  searchTerms?: readonly string[];
   /**
    * Optional second line under the label, shown in the popup only (the
    * collapsed trigger keeps rendering `label` alone via dropdownLabel).
@@ -109,11 +111,12 @@ export function DropdownOptionContent(props: { option: DropdownOption<string> })
   );
 }
 
-/** Match on the visible label when it is plain text, plus the value itself (users search either "Claude" or "claude-code"). */
+/** Match the value, a plain-text visible label, and optional hidden keywords such as launch commands. */
 export function filterDropdownOptions<T extends string>(options: DropdownOption<T>[], query: string): DropdownOption<T>[] {
   const q = query.trim().toLowerCase();
   if (!q) return options;
   return options.filter(option =>
     option.value.toLowerCase().includes(q)
-    || (typeof option.label === 'string' && option.label.toLowerCase().includes(q)));
+    || (typeof option.label === 'string' && option.label.toLowerCase().includes(q))
+    || option.searchTerms?.some(term => term.toLowerCase().includes(q)));
 }

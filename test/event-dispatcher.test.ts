@@ -321,6 +321,7 @@ import { _resetCacheForTest as _resetSeenMessagesForTest } from '../src/services
 import { _resetReverifyForTest, reverifyPendingCount } from '../src/im/lark/mention-reverify.js';
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
+import { ProtectedResultStore, PROTECTED_RESULT_PLACEHOLDER } from '../src/services/protected-result-store.js';
 import { isSubstituteEnabledForChat, setSubstituteEnabledForChat } from '../src/services/substitute-chat-toggle-store.js';
 import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-store.js';
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
@@ -2018,6 +2019,17 @@ function makeHistoryMessage(opts: {
   };
 }
 
+/** Use a real index under the fs mock's existing real-filesystem carve-out. */
+function seedProtectedResultMessage(dataDir: string, chatId: string, messageId: string, resource?: string): void {
+  const store = new ProtectedResultStore(dataDir);
+  const context = { appId: 'cli_writer', pluginId: 'synthetic', sessionId: 'session_one',
+    turnId: 'om_turn', ownerUnionId: 'on_owner', chatId };
+  store.begin(context, 'delivery_listener', 'a'.repeat(64));
+  if (resource) store.update(context, 'delivery_listener', { resource });
+  store.update(context, 'delivery_listener', { message: { messageId, kind: 'primary' } });
+  store.update(context, 'delivery_listener', { status: 'delivered' });
+}
+
 describe('startLarkEventDispatcher — connection wiring', () => {
   it.each(['feishu', 'lark'] as const)('starts %s with the registered dispatcher and exposes its live status', (brand) => {
     const client = startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers(), brand);
@@ -2349,6 +2361,46 @@ describe('Lark event dispatcher — durable primary processor', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     runtime.close();
+  });
+
+  it('redacts protected rich text before durable primary capture', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX));
+    const previousDataDir = config.session.dataDir;
+    const secret = 'SYNTHETIC_DURABLE_CAPTURE_SECRET_9381';
+    const runtimeHandlers = makeHandlers();
+    const captureHumanInput = vi.fn(() => true);
+    runtimeHandlers.captureHumanInput = captureHumanInput;
+    let runtime: ReturnType<typeof createLarkEventDispatcherRuntime> | undefined;
+    try {
+      setupBotState({ allowedUsers: [USER_OPEN_ID] });
+      vi.stubEnv('SESSION_DATA_DIR', dataDir);
+      config.session.dataDir = dataDir;
+      seedProtectedResultMessage(dataDir, 'oc_primary_capture', 'om_primary_capture_protected', 'file_sensitive');
+      runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', runtimeHandlers);
+      const content = JSON.stringify({ zh_cn: { title: secret, content: [[
+        { tag: 'text', text: secret }, { tag: 'media', file_key: 'file_sensitive' },
+      ]] } });
+      const data = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, content,
+        messageId: 'om_primary_capture_protected', rootId: 'om_primary_question', threadId: 'omt_primary_question',
+        chatId: 'oc_primary_capture', chatType: 'group', messageType: 'post' });
+      Object.assign(data.message, { body: { content }, card_json: { business: secret } });
+
+      await expect(processPrimary(runtime, data, 'om_primary_capture_protected')).resolves.toEqual({
+        kind: 'ignored', reason: 'durable primary captured human input',
+      });
+      expect(captureHumanInput).toHaveBeenCalledOnce();
+      const captured = captureHumanInput.mock.calls[0][0] as any;
+      expect(JSON.stringify(captured)).not.toContain(secret);
+      expect(JSON.stringify(captured)).not.toContain('file_sensitive');
+      expect(captured.message.body).toBeUndefined();
+      expect(captured.message.card_json).toBeUndefined();
+      expect(captured.message.content).toContain(PROTECTED_RESULT_PLACEHOLDER);
+    } finally {
+      runtime?.close();
+      config.session.dataDir = previousDataDir;
+      vi.unstubAllEnvs();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it('retries the durable claim when captured-input persistence fails', async () => {
@@ -5037,6 +5089,42 @@ describe('im.message.receive_v1 — pre-ACK input capture', () => {
     await flushEventWork();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+  it('redacts protected rich text before synchronous pre-ACK capture', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX));
+    const previousDataDir = config.session.dataDir;
+    const secret = 'SYNTHETIC_PRE_ACK_SECRET_9381';
+    try {
+      capturedHandlers = {}; __resetAnchorQueues(); __resetEventClaimsForTest(); setupBotState();
+      vi.stubEnv('SESSION_DATA_DIR', dataDir);
+      config.session.dataDir = dataDir;
+      seedProtectedResultMessage(dataDir, 'oc_capture_pre_ack', 'om_capture_pre_ack', 'file_sensitive');
+      const handlers = makeHandlers();
+      const captureHumanInput = vi.fn(() => true);
+      startLarkEventDispatcher(MY_APP_ID, 'secret', { ...handlers, captureHumanInput });
+      const content = JSON.stringify({ zh_cn: { title: secret, content: [[
+        { tag: 'text', text: secret }, { tag: 'media', file_key: 'file_sensitive' },
+      ]] } });
+      const event = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, content,
+        messageId: 'om_capture_pre_ack', rootId: 'om_capture_root', chatId: 'oc_capture_pre_ack', messageType: 'post' });
+      Object.assign(event.message, { body: { content }, card_json: { business: secret } });
+
+      expect(capturedHandlers['im.message.receive_v1'](event)).toBeUndefined();
+      expect(captureHumanInput).toHaveBeenCalledOnce();
+      const captured = captureHumanInput.mock.calls[0][0] as any;
+      expect(JSON.stringify(captured)).not.toContain(secret);
+      expect(JSON.stringify(captured)).not.toContain('file_sensitive');
+      expect(captured.message.body).toBeUndefined();
+      expect(captured.message.card_json).toBeUndefined();
+      expect(captured.message.content).toContain(PROTECTED_RESULT_PLACEHOLDER);
+      await flushEventWork();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      vi.unstubAllEnvs();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });
 
