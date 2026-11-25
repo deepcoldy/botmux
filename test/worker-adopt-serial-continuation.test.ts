@@ -4,7 +4,7 @@ import { inputForcesSerialTurn } from '../src/utils/pending-input-queue.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 describe('adopted-pane serial continuation boundary', () => {
-  it('queues a serial continuation instead of writing it into a busy adopted pane', async () => {
+  it('queues a promoted continuation even without an explicit serial marker', async () => {
     const pendingAdoptMessages: any[] = [];
     const flushPending = vi.fn();
     const writeDirect = vi.fn();
@@ -25,7 +25,6 @@ describe('adopted-pane serial continuation boundary', () => {
     const item = {
       content: 'task B result',
       turnId: 'om_reply_b',
-      queueAfterActiveTurn: true as const,
       trustedCaller: {
         requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'app', senderType: 'bot' as const,
         taskContinuation: {
@@ -36,7 +35,10 @@ describe('adopted-pane serial continuation boundary', () => {
 
     await admit(item);
 
-    expect(pendingAdoptMessages).toEqual([item]);
+    expect(pendingAdoptMessages).toHaveLength(1);
+    expect(pendingAdoptMessages[0]).toMatchObject({
+      turnId: 'om_reply_b', queueAfterActiveTurn: true, trustedCaller: item.trustedCaller,
+    });
     expect(writeDirect).not.toHaveBeenCalled();
     expect(flushPending).toHaveBeenCalledOnce();
   });

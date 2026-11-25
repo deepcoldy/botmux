@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import {
@@ -237,6 +237,54 @@ describe('sendToPty serial admission', () => {
     expect(pendingMessages[0]).toMatchObject({
       turnId: 'om_followup_b', queueAfterActiveTurn: true,
     });
+  });
+});
+
+describe('daemon-message serial admission', () => {
+  it('normalizes a promoted continuation before the IPC authority precheck', async () => {
+    const activeTurnAuthority = new ActiveTurnAuthority();
+    const activeCaller = {
+      requestUserOpenId: 'ou_other', requestLarkAppId: 'app', senderType: 'user' as const,
+    };
+    expect(activeTurnAuthority.reserve({ turnId: 'om_running', caller: activeCaller })).toBe(true);
+    expect(activeTurnAuthority.markStarted({ turnId: 'om_running', caller: activeCaller })).toBe(true);
+    const sendToPty = vi.fn(() => true);
+    const sent: any[] = [];
+    const scope: Record<string, any> = {
+      activeTurnAuthority,
+      inputForcesSerialTurn,
+      crossPrincipalIsolationOn: () => true,
+      lastInitConfig: { adoptMode: false, cliId: 'claude-code' },
+      restoredDeploymentTurnId: undefined,
+      backend: {}, crashDiagnosticStopped: false,
+      discardDeploymentContinuation: vi.fn(), applyWorkerLaunchModel: vi.fn(),
+      applyRespawnConfigPatch: vi.fn(), respawnConfigPatchFromMessage: vi.fn(() => ({})),
+      finalHandoffAdmissionEnabled: false,
+      isOrdinaryImTurnId: () => false,
+      tmuxScrolledHalfPages: 0,
+      sendToPty,
+      deferTurnInputCommitUntilSubmission: () => false,
+      acknowledgeTurnInputCommitted: vi.fn(),
+      send: (msg: any) => sent.push(msg),
+      log: vi.fn(),
+    };
+    scope.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', scope);
+    scope.activeTurnBlocks = loadWorkerFunction('activeTurnBlocks', scope);
+    const receive = loadWorkerFunction<(raw: unknown) => Promise<void>>('handleContractDaemonMessage', scope);
+
+    await receive({
+      type: 'message', content: 'promoted tail', turnId: 'om_promoted',
+      trustedCaller: {
+        requestUserOpenId: 'ou_receipt_bot', requestLarkAppId: 'app', senderType: 'bot',
+        taskContinuation: {
+          appId: 'app', openId: 'ou_source_human', sourceSessionId: 'source', sourceTurnId: 'om_source',
+        },
+      },
+    });
+
+    expect(sent.filter(msg => msg.type === 'turn_input_rejected')).toEqual([]);
+    expect(sendToPty).toHaveBeenCalledOnce();
+    expect(sendToPty.mock.calls[0]?.[2]).toMatchObject({ queueAfterActiveTurn: true });
   });
 });
 

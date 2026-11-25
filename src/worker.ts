@@ -41809,7 +41809,15 @@ function seedInitTurnTerminals(msg: Extract<DaemonToWorker, { type: 'init' }>): 
 let nextStepGeneration: AbortController | undefined;
 
 async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Promise<void> {
-  const msg = raw as DaemonToWorker;
+  const received = raw as DaemonToWorker;
+  // A promoted durable tail may bypass sendWorkerInput's explicit serial flag.
+  // Normalize before the authority precheck so continuation inputs queue rather
+  // than being rejected or adopted into the active turn on either IPC path.
+  const msg = received.type === 'message'
+    && inputForcesSerialTurn(received, activeTurnAuthority.snapshot()?.caller)
+    && !received.queueAfterActiveTurn
+    ? { ...received, queueAfterActiveTurn: true as const }
+    : received;
 
   switch (msg.type) {
     case 'request_next_step': {

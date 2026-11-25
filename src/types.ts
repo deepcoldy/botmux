@@ -442,16 +442,17 @@ export interface PrincipalLaneBinding {
 }
 
 /**
- * One exact human turn admitted behind an already-running turn in the same
- * principal lane.  The final CLI payload is persisted so daemon-side FIFO does
- * not depend on re-parsing a Lark event after the transport has acknowledged
- * it.  `attempting` is a commit-unknown fence: a restart must never replay a
- * turn that may already have crossed the worker IPC boundary.
+ * One exact turn admitted behind an already-running turn in the same principal
+ * lane. The final CLI payload is persisted so daemon-side FIFO does not depend
+ * on re-parsing a Lark event after the transport has acknowledged it.
+ * `attempting` is a commit-unknown fence: a restart must never replay a turn
+ * that may already have crossed the worker IPC boundary. A legacy cross-chat
+ * callerless turn keeps `caller` absent; no owner/session identity is invented.
  */
 export interface PrincipalLaneQueuedTurn {
   version: 1;
   turnId: string;
-  caller: TrustedCaller;
+  caller?: TrustedCaller;
   userPrompt: string;
   title: string;
   cliInput: CliTurnPayload;
@@ -469,7 +470,7 @@ export interface PrincipalLaneDispatchUnknownNotice {
   version: 1;
   id: string;
   turnId: string;
-  caller: TrustedCaller;
+  caller?: TrustedCaller;
   detectedAt: string;
   noticePending: true;
 }

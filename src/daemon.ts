@@ -23964,8 +23964,17 @@ function enqueuePrincipalLaneTurn(
     createdAt: new Date().toISOString(),
     dispatchState: 'queued',
   });
+  const previous = ds.session.principalLaneQueuedTurns;
   ds.session.principalLaneQueuedTurns = queued;
-  sessionStore.updateSession(ds.session);
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    // Before worker IPC this turn has no external effect. Restore the exact
+    // in-memory queue so an ingress retry can actually persist it rather than
+    // treating the duplicate turnId as already durable.
+    ds.session.principalLaneQueuedTurns = previous;
+    throw error;
+  }
 }
 
 function terminalizePrincipalLaneDispatchUnknown(
@@ -24102,21 +24111,34 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
   }
 
   head.dispatchState = 'attempting';
-  sessionStore.updateSession(ds.session);
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    // No IPC has crossed yet, so attempting was only an in-memory intent. Move
+    // back to queued and let the bounded retry path re-drive the exact head;
+    // leaving it attempting would suppress every later drive until restart.
+    head.dispatchState = 'queued';
+    schedulePrincipalLaneDispatchRetry(ds, head.turnId);
+    logger.warn(
+      `[${tag(ds)}] Principal-lane attempting marker was not persisted; retained queued head for retry `
+      + `turn=${head.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  }
   let accepted = false;
   let ipcDispatchAttempted = false;
   try {
     if (ds.worker && !ds.worker.killed) {
       accepted = sendWorkerInput(ds, head.cliInput, head.turnId, {
         ...(head.codexAppSteerable ? { codexAppSteerable: true } : {}),
-        trustedCaller: head.caller,
+        ...(head.caller ? { trustedCaller: head.caller } : {}),
       });
     } else if (ds.adoptedFrom) {
       accepted = forkAdoptWorker(ds, {
         payload: head.cliInput,
         turnId: head.turnId,
         atMostOnce: true,
-        trustedCaller: head.caller,
+        ...(head.caller ? { trustedCaller: head.caller } : {}),
         onWorkerGenerationReserved: workerGeneration => {
           ensurePrincipalLaneInboundTurnBinding(ds, head.turnId, workerGeneration);
         },
@@ -24127,7 +24149,7 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
         resume: head.resume,
         turnId: head.turnId,
         atMostOnce: true,
-        trustedCaller: head.caller,
+        ...(head.caller ? { trustedCaller: head.caller } : {}),
         onIpcDispatchAttempted: () => { ipcDispatchAttempted = true; },
       });
     }
@@ -24172,7 +24194,16 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
 
   clearPrincipalLaneDispatchRetry(ds, head.turnId);
   beginNewTurn(ds, head.title, head.turnId);
-  setActiveInteractiveTurn(ds, head.turnId, head.caller, head.title);
+  if (head.caller) {
+    setActiveInteractiveTurn(ds, head.turnId, head.caller, head.title);
+  } else {
+    // A callerless legacy turn still owns the lane's running marker. Do not
+    // invent an interactive principal merely to keep the FIFO state machine.
+    ds.principalLaneRunningTurn = {
+      turnId: head.turnId,
+      workerGeneration: ds.workerGeneration ?? ds.session.workerGeneration ?? 0,
+    };
+  }
   rememberLastCliInput(ds, head.userPrompt, head.cliInput, head.turnId);
   logger.info(
     `[${tag(ds)}] Dispatched principal-lane FIFO head turn=${head.turnId.slice(0, 12)} `
@@ -24608,7 +24639,7 @@ async function notifyPrincipalLaneDispatchUnknown(
   const pending = session?.principalLaneDispatchUnknownNotices
     ?.find(item => item.id === notice.recordId && item.noticePending === true);
   if (!session || !pending) return;
-  const callerAt = pending.caller.requestUserOpenId
+  const callerAt = pending.caller?.requestUserOpenId
     ? `<at id=${pending.caller.requestUserOpenId}></at> `
     : (session.ownerOpenId ? `<at id=${session.ownerOpenId}></at> ` : '');
   try {
@@ -30948,7 +30979,7 @@ async function handleThreadReplyAdmitted(
   // sufficient for callerless conversation, but NOT for minting the original
   // human's continuation. Re-check the actual reply bot against the FOLLOWED
   // chat's authorization; ctx.chatId has already been rewritten to the source.
-  const continuationReplyBotAllowed = rawThreadTrustedCaller?.senderType === 'bot'
+  const continuationReplyBotAllowed = () => rawThreadTrustedCaller?.senderType === 'bot'
     && !!ctx.crossChatThreadFollowUp
     && evaluateBotTalk(
       larkAppId,
@@ -30958,7 +30989,7 @@ async function handleThreadReplyAdmitted(
       threadTeamTrustAppId,
     ).allowed;
   const continuationTrustedCaller = ctx.crossChatThreadFollowUp?.sourceTurnId
-    && continuationReplyBotAllowed
+    && continuationReplyBotAllowed()
     ? await (async (): Promise<TrustedCaller | undefined> => {
         const source = findActiveBySessionId(ctx.crossChatThreadFollowUp!.sourceSessionId);
         if (!source || source.larkAppId !== larkAppId || source.session.status !== 'active') return undefined;
@@ -30968,6 +30999,10 @@ async function handleThreadReplyAdmitted(
         const principal = await trustedCallerForInboundTurn(
           larkAppId, sourceOpenId, undefined, false, sourceTurnId,
         );
+        // Authorization may have been revoked while the source principal was
+        // resolved. Re-check at the actual mint boundary; the callerless route
+        // remains available, but no new human continuation may be signed then.
+        if (!continuationReplyBotAllowed()) return undefined;
         return buildTaskContinuationCaller({
           rawCaller: rawThreadTrustedCaller,
           sourcePrincipal: principal,
@@ -32512,13 +32547,13 @@ async function handleThreadReplyAdmitted(
     // worker turn marker after this handler returns.  Persist the final payload
     // behind the active turn instead of exposing B2 to B1's worker process.
     if (!crossChatFollowUpIsCurrent(ctx)) return;
-    if (ds.session.principalLane && threadTrustedCaller
+    if (ds.session.principalLane && (turnTrustedCaller || ctx.crossChatThreadFollowUp)
         && (ds.principalLaneRunningTurn
           || ds.activeInteractiveTurn
           || (ds.session.principalLaneQueuedTurns?.length ?? 0) > 0)) {
       enqueuePrincipalLaneTurn(ds, {
         turnId: parsed.messageId,
-        caller: threadTrustedCaller,
+        ...(turnTrustedCaller ? { caller: turnTrustedCaller } : {}),
         userPrompt: promptContent,
         title: stripCrossPrincipalAsToken(parsed.content).text,
         cliInput,
@@ -32962,11 +32997,11 @@ async function handleThreadReplyAdmitted(
     // A dead worker must not let a newly-arrived turn jump ahead of a durable
     // principal-lane follower. Append this exact rebuilt input and wake the
     // oldest queued turn; driveNextPrincipalLaneTurn will re-fork that head.
-    if (ds.session.principalLane && threadTrustedCaller
+    if (ds.session.principalLane && (turnTrustedCaller || ctx.crossChatThreadFollowUp)
         && (ds.session.principalLaneQueuedTurns?.length ?? 0) > 0) {
       enqueuePrincipalLaneTurn(ds, {
         turnId: parsed.messageId,
-        caller: threadTrustedCaller,
+        ...(turnTrustedCaller ? { caller: turnTrustedCaller } : {}),
         userPrompt: promptContent,
         title: stripCrossPrincipalAsToken(parsed.content).text,
         cliInput: wrappedInput,

@@ -28,6 +28,7 @@ const mocks = vi.hoisted(() => {
     dataDir,
     replyMessage: vi.fn(async (..._args: any[]) => 'om_reply'),
     sendMessage: vi.fn(async (..._args: any[]) => 'om_sent'),
+    resolveMessageSenderUnionId: vi.fn(async () => null),
     getChatMode: vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p'),
     resolveSender: vi.fn(async (_appId: string, openId?: string, senderType?: string) => (
       openId ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const } : undefined
@@ -68,6 +69,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     sendMessage: mocks.sendMessage,
     getChatMode: mocks.getChatMode,
     getChatModeStrict: mocks.getChatMode,
+    resolveMessageSenderUnionId: mocks.resolveMessageSenderUnionId,
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'topic' as const })),
     getChatInfo: vi.fn(async () => ({ userCount: 1, botCount: 2 })),
     listChatBotMembers: vi.fn(async () => []),
@@ -582,6 +584,188 @@ describe('a message in a topic whose session was closed (real route)', () => {
     expect(mocks.resumeSession).not.toHaveBeenCalled();
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(mocks.createdSessions[0].continuity).toBeUndefined();
+  });
+
+  it.each([
+    { liveWorker: true },
+    { liveWorker: false },
+  ])('keeps a continuation behind the principal-lane FIFO (live worker=$liveWorker)', async ({ liveWorker }) => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    source.session.principalLane = { laneId: 'lane-a' } as any;
+    source.worker = liveWorker ? { killed: false } as any : null;
+    source.workerGeneration = 7;
+    source.activeInteractiveTurn = {
+      turnId: 'om_lane_a',
+      caller: { requestUserOpenId: OWNER, requestLarkAppId: APP, senderType: 'user' },
+    };
+    source.principalLaneRunningTurn = { turnId: 'om_lane_a', workerGeneration: 7 };
+    source.session.principalLaneQueuedTurns = [{
+      version: 1, turnId: 'om_lane_b', caller: source.activeInteractiveTurn.caller,
+      userPrompt: 'queued B', title: 'queued B', cliInput: { content: 'queued B' },
+      createdAt: new Date().toISOString(), dispatchState: 'queued', resume: true,
+    }] as any;
+    const { data, ctx } = event('continuation C', 'bot');
+    attachContinuationContext(ctx, 'sess-live');
+
+    await handleThreadReply(data, ctx);
+
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(source.session.principalLaneQueuedTurns.map(turn => turn.turnId)).toEqual(['om_lane_b', ctx.messageId]);
+    expect(source.session.principalLaneQueuedTurns[1]?.caller).toMatchObject({
+      taskContinuation: { openId: OWNER, sourceSessionId: 'sess-live', sourceTurnId: 'om_origin_human' },
+    });
+    expect(source.principalLaneRunningTurn).toEqual({ turnId: 'om_lane_a', workerGeneration: 7 });
+  });
+
+  it.each([
+    { liveWorker: true },
+    { liveWorker: false },
+  ])('keeps a callerless cross-chat reply in the principal-lane FIFO (live worker=$liveWorker)', async ({ liveWorker }) => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    source.session.principalLane = { laneId: 'lane-a' } as any;
+    source.worker = liveWorker ? { killed: false } as any : null;
+    source.workerGeneration = 7;
+    const caller = { requestUserOpenId: OWNER, requestLarkAppId: APP, senderType: 'user' as const };
+    source.activeInteractiveTurn = liveWorker ? { turnId: 'om_lane_a', caller } : undefined;
+    source.principalLaneRunningTurn = liveWorker ? { turnId: 'om_lane_a', workerGeneration: 7 } : undefined;
+    source.session.principalLaneQueuedTurns = [{
+      version: 1, turnId: 'om_lane_b', ...(liveWorker ? { caller } : {}), userPrompt: 'durable B', title: 'durable B',
+      cliInput: { content: 'durable B' }, createdAt: new Date().toISOString(),
+      dispatchState: 'queued', resume: true,
+    }] as any;
+    if (!liveWorker) mocks.forkWorker.mockReturnValue(true);
+    const { data, ctx } = event('callerless C', 'stranger-bot');
+    attachContinuationContext(ctx, 'sess-live');
+
+    await handleThreadReply(data, ctx);
+
+    const queue = source.session.principalLaneQueuedTurns;
+    expect(queue.map(turn => turn.turnId)).toEqual(['om_lane_b', ctx.messageId]);
+    expect(queue[1]).not.toHaveProperty('caller');
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    if (liveWorker) {
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(source.principalLaneRunningTurn).toEqual({ turnId: 'om_lane_a', workerGeneration: 7 });
+    } else {
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      expect(mocks.forkWorker.mock.calls[0]?.[2]?.turnId).toBe('om_lane_b');
+      expect(mocks.forkWorker.mock.calls[0]?.[2]).not.toHaveProperty('trustedCaller');
+      expect(source.principalLaneRunningTurn).toEqual({ turnId: 'om_lane_b', workerGeneration: 7 });
+      expect(source.activeInteractiveTurn).toBeUndefined();
+      expect(queue.map(turn => turn.dispatchState)).toEqual(['attempting', 'queued']);
+    }
+  });
+
+  it('withholds continuation when receipt-bot authorization is revoked during source-principal resolution', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    source.worker = { killed: false } as any;
+    let finishUnion!: (value: string | null) => void;
+    mocks.resolveMessageSenderUnionId.mockImplementationOnce(() => new Promise(resolve => { finishUnion = resolve; }));
+    const { data, ctx } = event('revoke while constructing', 'bot');
+    attachContinuationContext(ctx, 'sess-live');
+    const { evaluateBotTalk } = await import('../src/im/lark/event-dispatcher.js');
+    expect(evaluateBotTalk(APP, 'oc_external_followed', LEAD_OPEN_ID).allowed).toBe(true);
+
+    const handling = handleThreadReply(data, ctx);
+    await vi.waitFor(() => expect(mocks.resolveMessageSenderUnionId).toHaveBeenCalledWith(APP, 'om_origin_human'));
+    getBot(APP).resolvedAllowedUsers = [OWNER];
+    (getBot(APP).config as any).allowedUsers = [OWNER];
+    expect(evaluateBotTalk(APP, 'oc_external_followed', LEAD_OPEN_ID).allowed).toBe(false);
+    finishUnion(null);
+    await handling;
+
+    expect(mocks.sendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(mocks.sendWorkerInput.mock.calls[0]?.[3]).not.toHaveProperty('trustedCaller');
+  });
+
+  it('rolls back a lane enqueue that could not be persisted so ingress retry can save it', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    source.session.principalLane = { laneId: 'lane-a' } as any;
+    source.worker = { killed: false } as any;
+    source.workerGeneration = 7;
+    const caller = { requestUserOpenId: OWNER, requestLarkAppId: APP, senderType: 'user' as const };
+    source.activeInteractiveTurn = { turnId: 'om_lane_a', caller };
+    source.principalLaneRunningTurn = { turnId: 'om_lane_a', workerGeneration: 7 };
+    source.session.principalLaneQueuedTurns = [{
+      version: 1, turnId: 'om_lane_b', caller, userPrompt: 'durable B', title: 'durable B',
+      cliInput: { content: 'durable B' }, createdAt: new Date().toISOString(),
+      dispatchState: 'queued', resume: true,
+    }] as any;
+    let injected = false;
+    mocks.updateSession.mockImplementation((session: any) => {
+      if (!injected && (session.principalLaneQueuedTurns?.length ?? 0) > 1) {
+        injected = true;
+        throw new Error('injected enqueue persistence failure');
+      }
+    });
+    const { data, ctx } = event('continuation C', 'bot');
+    attachContinuationContext(ctx, 'sess-live');
+
+    const firstError = await handleThreadReply(data, ctx).then(() => undefined, error => error);
+    expect(String(firstError)).toContain('injected enqueue persistence failure');
+    expect(source.session.principalLaneQueuedTurns.map(turn => turn.turnId)).toEqual(['om_lane_b']);
+
+    await handleThreadReply(data, ctx);
+
+    expect(source.session.principalLaneQueuedTurns.map(turn => turn.turnId)).toEqual(['om_lane_b', ctx.messageId]);
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+  });
+
+  it('requeues a pre-IPC attempting head when its marker cannot be persisted', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    source.session.principalLane = { laneId: 'lane-a' } as any;
+    source.worker = null;
+    source.workerGeneration = 7;
+    const caller = { requestUserOpenId: OWNER, requestLarkAppId: APP, senderType: 'user' as const };
+    source.session.principalLaneQueuedTurns = [{
+      version: 1, turnId: 'om_lane_b', caller, userPrompt: 'durable B', title: 'durable B',
+      cliInput: { content: 'durable B' }, createdAt: new Date().toISOString(),
+      dispatchState: 'queued', resume: true,
+    }] as any;
+    let injected = false;
+    mocks.updateSession.mockImplementation((session: any) => {
+      if (!injected && session.principalLaneQueuedTurns?.[0]?.dispatchState === 'attempting') {
+        injected = true;
+        throw new Error('injected attempting persistence failure');
+      }
+    });
+    const { data, ctx } = event('continuation behind B', 'bot');
+    attachContinuationContext(ctx, 'sess-live');
+
+    await handleThreadReply(data, ctx);
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(source.session.principalLaneQueuedTurns[0]).toMatchObject({ turnId: 'om_lane_b', dispatchState: 'queued' });
+    expect(source.principalLaneDispatchRetry?.turnId).toBe('om_lane_b');
+
+    const { __testOnly_driveNextPrincipalLaneTurn: drive } = await import('../src/daemon.js');
+    mocks.forkWorker.mockReturnValue(true);
+    expect(drive(source)).toBe(true);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[2]?.turnId).toBe('om_lane_b');
+    expect(source.principalLaneRunningTurn).toEqual({ turnId: 'om_lane_b', workerGeneration: 7 });
+    expect(source.principalLaneDispatchRetry).toBeUndefined();
   });
 });
 
