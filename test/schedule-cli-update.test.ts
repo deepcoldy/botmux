@@ -611,6 +611,18 @@ describe('schedule CLI in an assistant-mode sandbox', () => {
     expect(f.read()['11223344']).toMatchObject({ chatId: 'oc_chat', rootMessageId: 'om_root' });
   });
 
+  it('creates a task in a bot-delegated turn that has no human caller', async () => {
+    // The proof carries no callerOpenId, so only the confined session lookup
+    // can locate the session; this pins that fallback against removal.
+    const f = fixture(); const observed: Array<Record<string, unknown>> = [];
+    await assistantSession(f, observed, proof => { delete proof.callerOpenId; });
+    const result = await f.run(['add', '1m', 'remind me', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    const request = observed.find(item => 'task' in item)!;
+    expect(request.sessionId).toBe(sid);
+    expect(request.task).toMatchObject({ chatId: 'oc_chat', rootMessageId: 'om_root', executionPosition: 'topic' });
+  });
+
   it('reports an unreadable task store instead of listing no tasks', async () => {
     const f = fixture(); const observed: Array<Record<string, unknown>> = [];
     await assistantSession(f, observed);

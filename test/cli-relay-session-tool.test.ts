@@ -104,9 +104,25 @@ describe('history / quoted through the outbox when send-cred is withheld', () =>
     } finally { host.stop(); }
   }, 60_000);
 
+  it.each([
+    { args: ['quoted', 'om_probe', '--raw', '--no-download'],
+      request: { tool: 'quoted', messageId: 'om_probe', raw: true, download: false } },
+    { args: ['history', '--view=index', '--query=synthetic', '--type=text', '--since=2026-11-24', '--until=2026-11-25'],
+      request: { tool: 'history', view: 'index', query: 'synthetic', types: ['text'], since: '2026-11-24', until: '2026-11-25' } },
+  ])('carries the requested read controls through the actual CLI outbox: $args', async ({ args, request }) => {
+    const s = setup(false);
+    const host = mockHost(s.outbox, { code: 0, stdout: 'SAFE-HOST-RECEIPT', stderr: '' });
+    try {
+      const res = await run(args, s);
+      expect(res.status, res.stderr).toBe(0);
+      expect(res.stdout).toBe('SAFE-HOST-RECEIPT');
+      expect(host.request()).toEqual({ command: 'session-tool', tool: request, originCapability: CAP });
+    } finally { host.stop(); }
+  }, 60_000);
+
   it('refuses options the relay cannot honour without writing a request', async () => {
     const s = setup(false);
-    const res = await run(['history', '--query', 'secret'], s);
+    const res = await run(['history', '--unexpected-filter', 'secret'], s);
     expect(res.status).toBe(2);
     expect(readdirSync(s.outbox).filter(n => n.endsWith('.req.json'))).toEqual([]);
   }, 60_000);

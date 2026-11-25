@@ -2323,6 +2323,7 @@ describe('absorbedInputReplyText', () => {
     expect(absorbedInputReplyText(events, 'q1')).toEqual({
       text: '这 3 个 case 用的是 gpt-6-astra，评分用 gpt-6.1-sol。',
       lastUuid: 'a3',
+      uuids: ['a3'],
       source: 'thinking',
     });
   });
@@ -2339,6 +2340,7 @@ describe('absorbedInputReplyText', () => {
     expect(absorbedInputReplyText(events, 'q1')).toEqual({
       text: 'Cases run on gpt-6-astra.\n\nGrading uses gpt-6.1-sol.',
       lastUuid: 'a3',
+      uuids: ['a2', 'a3'],
       source: 'text',
     });
   });
@@ -2352,7 +2354,7 @@ describe('absorbedInputReplyText', () => {
       text('a1', 'the answer'),
     ];
     (events[2] as any).isSidechain = true;
-    expect(absorbedInputReplyText(events, 'q1')).toEqual({ text: 'the answer', lastUuid: 'a1', source: 'text' });
+    expect(absorbedInputReplyText(events, 'q1')).toEqual({ text: 'the answer', lastUuid: 'a1', uuids: ['a1'], source: 'text' });
   });
 
   it('does not reach past the end of the host turn', () => {
@@ -2376,7 +2378,7 @@ describe('absorbedInputReplyText', () => {
       reminder('qC', 'is CI green?'), text('aC', 'CI is green.'), tool('t2'),
     ];
     expect(absorbedInputReplyText(events, 'qB')).toBeUndefined();
-    expect(absorbedInputReplyText(events, 'qC')).toEqual({ text: 'CI is green.', lastUuid: 'aC', source: 'text' });
+    expect(absorbedInputReplyText(events, 'qC')).toEqual({ text: 'CI is green.', lastUuid: 'aC', uuids: ['aC'], source: 'text' });
   });
 
   it('reads past the request copy Claude Code writes before the answer', () => {
@@ -2401,7 +2403,7 @@ describe('absorbedInputReplyText', () => {
       thinking('a1', ''), thinking('a2', '已登录，先启动一个 case。'), tool('t1'),
     ];
     expect(absorbedInputReplyText(events, 'q1')).toBeUndefined();
-    expect(absorbedInputReplyText(events, 'q2')).toEqual({ text: '已登录，先启动一个 case。', lastUuid: 'a2', source: 'thinking' });
+    expect(absorbedInputReplyText(events, 'q2')).toEqual({ text: '已登录，先启动一个 case。', lastUuid: 'a2', uuids: ['a2'], source: 'thinking' });
   });
 });
 
@@ -2415,10 +2417,10 @@ describe('AbsorbedReplyCollector (live feed)', () => {
     expect(c.feed(ev('a1', { type: 'tool_use', id: 't1', name: 'Bash', input: {} }))).toBe(false);
     expect(c.reply()).toBeUndefined();
     expect(c.feed(ev('a2', { type: 'thinking', thinking: 'it is gpt-6-astra' }))).toBe(false);
-    expect(c.reply()).toEqual({ text: 'it is gpt-6-astra', lastUuid: 'a2', source: 'thinking' });
+    expect(c.reply()).toEqual({ text: 'it is gpt-6-astra', lastUuid: 'a2', uuids: ['a2'], source: 'thinking' });
     expect(c.feed(ev('a3', { type: 'tool_use', id: 't2', name: 'Bash', input: {} }))).toBe(true);
     expect(c.feed(ev('a4', { type: 'text', text: 'later narration' }))).toBe(true);
-    expect(c.reply()).toEqual({ text: 'it is gpt-6-astra', lastUuid: 'a2', source: 'thinking' });
+    expect(c.reply()).toEqual({ text: 'it is gpt-6-astra', lastUuid: 'a2', uuids: ['a2'], source: 'thinking' });
   });
 });
 

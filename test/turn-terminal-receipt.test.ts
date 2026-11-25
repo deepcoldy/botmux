@@ -263,6 +263,18 @@ describe('independent turn terminal receipt', () => {
     expect(call[5]?.uuid).toMatch(/^tr_[0-9a-f]{47}$/);
   });
 
+  it('posts no completed strip while the turn ended with background tasks running', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_background');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    await deliver(ds, terminalMsg('om_turn_background', { backgroundTasks: 1 }));
+    await settle(ds);
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+  });
+
   it('still posts the strip when a suspend is queued for the turn, then carries the suspend out', async () => {
     // The suspend route queues `botmux suspend` while the session works; the
     // turn's terminal is where it may run. It must not take the worker before
@@ -705,6 +717,90 @@ describe('independent turn terminal receipt', () => {
     expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
     // The claim is taken only after the drain, once the final has landed.
     expect(ds.terminalReceiptTurnIds?.has(turnId)).toBe(true);
+  });
+
+  it('does not patch a deferred fallback final while background tasks run', async () => {
+    const ds = makeDs();
+    const turnId = 'om_turn_background_progress_then_fallback';
+    bindLarkTurn(ds, turnId);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId, messageId: 'om_progress_card',
+      responseKind: 'progress', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    let releaseDelivery: ((messageId: string) => void) | undefined;
+    sessionReplyMock.mockImplementationOnce(
+      () => new Promise<string>(resolve => { releaseDelivery = resolve; }) as any,
+    );
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: 'sid-terminal-receipt', content: '最终答复正文',
+      lastUuid: 'uuid-fallback-final', turnId,
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg(turnId, { backgroundTasks: 1 }));
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    releaseDelivery!('om_fallback_final_card');
+    await settle(ds);
+    expect(patchCardStreamElement).not.toHaveBeenCalled();
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    expect(ds.terminalReceiptTurnIds?.has(turnId)).not.toBe(true);
+  });
+
+  it('still places the next-step row and recap panel on the final card while background tasks run', async () => {
+    Object.assign(botConfig, { replyCardNextStep: true, replyCardRecap: true });
+    const ds = makeDs();
+    const turnId = 'om_turn_background_rows_immediate';
+    bindLarkTurn(ds, turnId);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId, messageId: 'om_answer_card',
+      responseKind: 'final', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    await deliver(ds, terminalMsg(turnId, { backgroundTasks: 1 }));
+    await settle(ds);
+    // The completion footer and strip stay suppressed...
+    expect(patchCardStreamElement).not.toHaveBeenCalled();
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    // ...but the opt-in rows still land on the settled final reply card.
+    await deliver(ds, { type: 'prompt_suggestion', text: 'CI 绿了就合', turnId });
+    await deliver(ds, { type: 'cli_recap', text: AWAY_SUMMARY, turnId });
+    await nextStepIdle(ds);
+    await recapIdle(ds);
+    const inserted = vi.mocked(insertCardElements).mock.calls;
+    expect(inserted.map(call => (call[3][0] as any).element_id).sort())
+      .toEqual(['botmux_next_step', 'botmux_turn_recap']);
+    expect(inserted.every(call => call[6] === 'om_answer_card')).toBe(true);
+  });
+
+  it('places the next-step row on a fallback final card that lands while background tasks run', async () => {
+    Object.assign(botConfig, { replyCardNextStep: true });
+    const ds = makeDs();
+    const turnId = 'om_turn_background_rows_deferred';
+    bindLarkTurn(ds, turnId);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId, messageId: 'om_progress_card',
+      responseKind: 'progress', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    let releaseDelivery: ((messageId: string) => void) | undefined;
+    sessionReplyMock.mockImplementationOnce(
+      () => new Promise<string>(resolve => { releaseDelivery = resolve; }) as any,
+    );
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: 'sid-terminal-receipt', content: '最终答复正文',
+      lastUuid: 'uuid-fallback-final-rows', turnId,
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg(turnId, { backgroundTasks: 1 }));
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    releaseDelivery!('om_fallback_final_card');
+    await settle(ds);
+    expect(patchCardStreamElement).not.toHaveBeenCalled();
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    await deliver(ds, { type: 'prompt_suggestion', text: '继续跑测试', turnId });
+    await nextStepIdle(ds);
+    const inserted = vi.mocked(insertCardElements).mock.calls;
+    expect(inserted).toHaveLength(1);
+    expect((inserted[0][3][0] as any).element_id).toBe('botmux_next_step');
+    expect(inserted[0][6]).toBe('om_fallback_final_card');
   });
 
   it.each(['progress', 'auxiliary'] as const)(

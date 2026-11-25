@@ -21,6 +21,7 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
   let markerPath: string;
   let scope: Record<string, unknown>;
   let published: Array<string | undefined>;
+  let sent: Array<{ type: string; turnIds?: string[] }>;
   const caller = {
     requestUserOpenId: 'ou_asker',
     requestUserUnionId: 'on_asker',
@@ -33,6 +34,7 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
     // Named for a pid that is alive with a known birth time: this test process.
     markerPath = join(dir, String(process.pid));
     published = [];
+    sent = [];
     scope = {
       heldPidMarkerPaths: new Set<string>(),
       existsSync, readFileSync, unlinkSync, basename,
@@ -54,6 +56,7 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
       queuedTypeAheadTurns: [],
       queuedTurnAdvanceConsumedForPrompt: undefined,
       workerSessionEventScope: undefined,
+      send: (message: { type: string; turnIds?: string[] }) => { sent.push(message); },
       markTurnRetired: (turnId: string) => { (scope.retiredTurnIds as Set<string>).add(turnId); },
       markActiveTurnStarted: () => {},
       adoptDisplacedActiveTurn: () => { throw new Error('no turn was current before the bind'); },
@@ -111,6 +114,40 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
       .toMatchObject({ turnId: 'om_live', identityTurnId: 'om_opening', caller });
     expect(published).toEqual(['om_live']);
     expect(onDisk()).toMatchObject({ turnId: 'om_live', identityTurnId: 'om_opening', capability: 'c'.repeat(64) });
+  });
+
+  it('reports the complete restored type-ahead queue after binding the marker', () => {
+    writeFileSync(markerPath, JSON.stringify({
+      sessionId: 's-bind',
+      turnId: 'om_live',
+      procStart: readProcessStartIdentity(process.pid),
+      queuedTurns: [{ turnId: 'om_queued_A' }, { turnId: 'om_queued_B' }],
+    }));
+
+    bind();
+
+    expect(scope.queuedTypeAheadTurns).toEqual([
+      expect.objectContaining({ turnId: 'om_queued_A' }),
+      expect.objectContaining({ turnId: 'om_queued_B' }),
+    ]);
+    expect(sent.filter(message => message.type === 'type_ahead_queue_snapshot')).toEqual([
+      { type: 'type_ahead_queue_snapshot', turnIds: ['om_queued_A', 'om_queued_B'] },
+    ]);
+  });
+
+  it('emits a drop only when no queued sibling attempt still owns the turn sidecar', () => {
+    scope.queuedTypeAheadTurns = [
+      { turnId: 'om_retry', dispatchAttempt: 1 },
+      { turnId: 'om_retry', dispatchAttempt: 2 },
+    ];
+    const drop = scope.dropQueuedTurnRecord as (turnId: string, attempt?: number, opts?: { tombstone?: boolean }) => boolean;
+
+    expect(drop('om_retry', 1, { tombstone: false })).toBe(true);
+    expect(sent.filter(message => message.type === 'type_ahead_turn_dropped')).toEqual([]);
+    expect(drop('om_retry', 2)).toBe(true);
+    expect(sent.filter(message => message.type === 'type_ahead_turn_dropped')).toEqual([
+      { type: 'type_ahead_turn_dropped', turnId: 'om_retry' },
+    ]);
   });
 
   it('marks a marker-reattached merged turn as provenance-incomplete', () => {

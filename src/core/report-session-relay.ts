@@ -468,14 +468,19 @@ export function resolveReportRelayFallbackTarget(input: {
   originalSession?: ReportSessionRelayTargetView;
   sessions: readonly ReportSessionRelayTargetView[];
 }): ReportSessionRelayFallbackDecision {
-  if (input.originalTarget.scope === 'thread') {
+  const original = input.originalSession;
+  const signedChatId = input.originalTarget.chatId;
+  const recordedChatId = original?.chatId;
+  const originalChatId = signedChatId ?? recordedChatId;
+  // 持久行可以补充旧绑定缺失的 scope/chat，但不能推翻已签字段；原会话实际是
+  // thread 时也不能借旧绑定缺少 scope 而落到同群 chat 会话。
+  if (input.originalTarget.scope === 'thread' || original?.scope === 'thread') {
     return {
       ok: false,
       error: 'fallback_scope_unsupported',
-      ...(input.originalTarget.chatId ? { originalChatId: input.originalTarget.chatId } : {}),
+      ...(originalChatId ? { originalChatId } : {}),
     };
   }
-  const original = input.originalSession;
   if (original && original.sessionId !== input.originalTarget.sessionId) {
     return { ok: false, error: 'fallback_not_applicable' };
   }
@@ -483,7 +488,6 @@ export function resolveReportRelayFallbackTarget(input: {
     return { ok: false, error: 'original_session_not_closed' };
   }
 
-  const originalChatId = original?.chatId ?? input.originalTarget.chatId;
   if (!originalChatId || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(originalChatId)) {
     return { ok: false, error: 'original_chat_unproven' };
   }

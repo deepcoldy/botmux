@@ -80,6 +80,7 @@ describe('trusted plugin result delivery', () => {
     const delivery = parseTrustedResultDelivery({
       schemaVersion: 1,
       deliveryId: 'report_20261014',
+      readPolicy: 'receipt-only',
       markdown: '完成',
       files: [{ path: 'report.pdf' }],
     }, home);
@@ -98,6 +99,12 @@ describe('trusted plugin result delivery', () => {
     const manifest = store.redeem(artifact.viewToken, 'on_requester123');
     expect(store.readSummary(manifest)).toBe('完成');
     expect(readFileSync(store.filePath(manifest, 0).path, 'utf8')).toBe('report');
+    expect(manifest.readPolicy).toBe('receipt-only');
+    expect(store.readFile(manifest, 0)).toEqual({ data: Buffer.from('report'), name: 'report.pdf', size: 6 });
+    writeFileSync(store.filePath(manifest, 0).path, 'BROKEN');
+    expect(() => store.readFile(manifest, 0)).toThrow(/integrity_failed/);
+    expect(() => parseTrustedResultDelivery({ schemaVersion: 1, deliveryId: 'bad_policy_abcdefgh',
+      markdown: 'text', readPolicy: 'anything' }, home)).toThrow(/read_policy/);
   });
 
   it('rejects symlinks, paths outside outbound, and oversized files without consuming sources', () => {

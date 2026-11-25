@@ -50,6 +50,10 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.codexAppInput?.additionalContext?.botmux_attachments.value).toContain('/tmp/data.csv');
     expect(built.codexAppInput?.additionalContext?.botmux_available_bots.value).toContain('ou_peer');
     expect(built.codexAppInput?.localImages).toEqual([{ path: '/tmp/a.jpg', detail: 'original' }]);
+    expect(built.attachments).toEqual([
+      { type: 'image', path: '/tmp/a.jpg', name: 'a.jpg' },
+      { type: 'file', path: '/tmp/data.csv', name: 'data.csv' },
+    ]);
   });
 
   it('keeps mentioned bots separate while collapsing a large available-bot roster as untrusted context', () => {

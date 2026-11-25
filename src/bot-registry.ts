@@ -108,7 +108,6 @@ import {
 } from './im/lark/reply-card-style.js';
 import {
   normalizeAskOptionLayout,
-  setAskOptionLayoutLookup,
   type AskOptionLayout,
 } from './im/lark/ask-option-layout.js';
 import { cliModelMayKeepReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
@@ -130,6 +129,10 @@ import {
   normalizeQuotaFallbackBotConfig,
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
+import {
+  normalizeQuotaFallbackChainConfig,
+  type QuotaFallbackChainConfig,
+} from './services/quota-fallback-chain.js';
 import {
   normalizeTraexAutoModelConfig,
   TRAEX_AUTO_MODEL_ID,
@@ -1902,6 +1905,8 @@ export interface BotConfig {
    * agent mint the tenant token itself.
    */
   sandboxWithholdBotSecret?: boolean;
+  /** Opt-in opaque plugin results. Requires a sandbox and withholds all CLI Lark credentials. */
+  protectedResults?: boolean;
   /**
    * LEGACY read-isolation flag (pre fs-policy). The unified sandbox is
    * deny-by-default, so cross-bot read isolation is inherent — this flag is
@@ -1982,6 +1987,12 @@ export interface BotConfig {
    * Missing/invalid/disabled means no automatic handoff.
    */
   quotaFallbackBot?: QuotaFallbackBotConfig;
+  /**
+   * Optional same-bot CLI/model chain used before `quotaFallbackBot`: on a
+   * usage or rate limit the session restarts in place on the next step.
+   * Missing/invalid/disabled means sessions stay on the bot's own CLI.
+   */
+  quotaFallbackChain?: QuotaFallbackChainConfig;
   /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
@@ -2307,9 +2318,8 @@ export interface BotConfig {
    */
   replyStyle?: ReplyStyleConfig;
   /**
-   * `botmux ask` 选项按钮布局：'compact'（默认，按行自动换行）或 'vertical'
-   * （每行 1 个，长标签更易读）。手改的非法值在读取时 fail-soft 回退 compact，
-   * 不影响发卡；卡片在 daemon 进程内渲染，改动即时生效，无需重启 worker。
+   * 旧的 `botmux ask` 选项按钮布局（'compact' / 'vertical'）。提问卡改成每个选项一行勾选框后
+   * 已不再影响排版；为不破坏现有配置，仍照常读取、校验（非法值 fail-soft 丢弃）和保存。
    */
   askOptionLayout?: AskOptionLayout;
   /**
@@ -2323,6 +2333,15 @@ export interface BotConfig {
    * `usageDisplay` set is read as `'off'` (see {@link resolveUsageDisplay}).
    */
   usageDisplay?: UsageDisplayMode;
+  /**
+   * Whether to show 5h / 7d rolling account quota percentages in the card usage
+   * line (streaming card body & reply-card footer). Default ON (absent = true);
+   * only an explicit `false` hides the 5h / 7d segments while keeping context
+   * usage (`ctx`), token counts, cache hit rate, custom extensions and model
+   * identity visible. Display only — statusline persistence and quota fallback
+   * are unaffected.
+   */
+  showUsageQuota?: boolean;
   replyFooterEnabled?: boolean;
   replyFooterBrand?: boolean;
   replyFooterModel?: boolean;
@@ -2778,16 +2797,13 @@ export function __testOnly_resetBotRegistry(): void {
   brandLabelCache = null;
   cachedLarkUploadHttpPool = undefined;
   usageDisplayCache = null;
+  showUsageQuotaCache = null;
   replyStyleCache = null;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
 // a hard import cycle between `i18n` and `bot-registry`.
 setBotLookup((id) => bots.get(id));
-
-// 同理给 ask 卡片选项布局注册 lookup：ask-card.ts 经 turn-reply-ask.ts 间接依赖
-// 本模块，不能反向 import，只能由这里把 bots 表推进去。
-setAskOptionLayoutLookup((id) => bots.get(id));
 setHideLocalAddressesResolver(resolveHideLocalAddresses);
 
 /** Path of the bot config file we loaded (so `/oncall` can persist bindings back). */
@@ -3319,7 +3335,13 @@ export function findOncallChatForAnyBot(chatId: string): OncallChat | undefined 
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
 let usageDisplayCache: { mtimeMs: number; map: Map<string, UsageDisplayMode> } | null = null;
+let showUsageQuotaCache: { mtimeMs: number; map: Map<string, boolean> } | null = null;
 let replyStyleCache: { mtimeMs: number; map: Map<string, ReplyStyleConfig | undefined> } | null = null;
+
+/** Default ON: only an explicit `false` hides the 5h / 7d quota segments. */
+export function normalizeShowUsageQuota(entry?: { showUsageQuota?: unknown }): boolean {
+  return entry?.showUsageQuota !== false;
+}
 
 /** Normalize a raw bots.json entry's usage-display intent to the enum, applying
  *  backward compat: an explicit `usageDisplay` wins; otherwise a legacy
@@ -3480,6 +3502,42 @@ export function resolveUsageDisplay(larkAppId: string): UsageDisplayMode {
   } catch {
     return DEFAULT_USAGE_DISPLAY;
   }
+}
+
+/**
+ * Whether to show 5h / 7d rolling account quota percentages in card usage
+ * lines (default ON). Live registry first, disk bots.json second (so host
+ * `botmux send` sees hot `/botconfig` updates), own-bot spawn env fallback for
+ * sandboxed / remote sessions where bots.json is unreadable.
+ */
+export function resolveShowUsageQuota(larkAppId: string): boolean {
+  const inMem = bots.get(larkAppId);
+  if (inMem) return normalizeShowUsageQuota(inMem.config);
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (path) {
+    try {
+      const stat = statSync(path);
+      if (!showUsageQuotaCache || showUsageQuotaCache.mtimeMs !== stat.mtimeMs) {
+        const raw = JSON.parse(readFileSync(path, 'utf-8'));
+        const map = new Map<string, boolean>();
+        if (Array.isArray(raw)) {
+          for (const entry of raw) {
+            if (entry && typeof entry.larkAppId === 'string') {
+              map.set(entry.larkAppId, normalizeShowUsageQuota(entry));
+            }
+          }
+        }
+        showUsageQuotaCache = { mtimeMs: stat.mtimeMs, map };
+      }
+      const configured = showUsageQuotaCache.map.get(larkAppId);
+      if (configured !== undefined) return configured;
+    } catch { /* isolated send: disk is intentionally unreadable */ }
+  }
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && process.env.BOTMUX_SHOW_USAGE_QUOTA === 'false') {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -4028,6 +4086,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (entry.sandboxWithholdBotSecret != null && typeof entry.sandboxWithholdBotSecret !== 'boolean') {
       throw new Error(`Bot config [${i}]: sandboxWithholdBotSecret must be true or false, got ${JSON.stringify(entry.sandboxWithholdBotSecret)}`);
     }
+    if (entry.protectedResults != null && typeof entry.protectedResults !== 'boolean') {
+      throw new Error(`Bot config [${i}]: protectedResults must be true or false`);
+    }
+    if (entry.protectedResults === true && (!(entry.sandbox === true || entry.sandbox === 'oncall')
+      || entry.larkToolBinding === false)) {
+      throw new Error(`Bot config [${i}]: protectedResults requires an explicit oncall sandbox and managed lark-tool binding`);
+    }
     validateCliLaunchModeConfig({
       cliId: entryCliId,
       cliLaunchMode,
@@ -4379,6 +4444,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ? (traexAutoModel ? TRAEX_AUTO_MODEL_ID : undefined)
       : requestedModel;
 
+    const normalizedQuotaFallbackChain = normalizeQuotaFallbackChainConfig(entry.quotaFallbackChain, {
+      cliId: entryCliId,
+      model,
+      backendType: typeof entry.backendType === 'string' ? entry.backendType : undefined,
+      codexRpcInput: entry.codexRpcInput === true,
+    });
+    if (normalizedQuotaFallbackChain.error) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] quotaFallbackChain ignored: ${normalizedQuotaFallbackChain.error}`,
+      );
+    }
+
     // Shared effort applies only where a model has no independent entry.
     const sharedEffortModels = traexAutoModel
       ? traexAutoModel.models.filter(id => !Object.prototype.hasOwnProperty.call(traexAutoModel.modelSettings ?? {}, id))
@@ -4586,7 +4663,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
       // assistantMode implies it (see sandboxWithholdsBotSecret)
-      ...(entry.sandboxWithholdBotSecret === true || entry.assistantMode === true ? { sandboxWithholdBotSecret: true } : {}),
+      ...(entry.sandboxWithholdBotSecret === true || entry.assistantMode === true || entry.protectedResults === true ? { sandboxWithholdBotSecret: true } : {}),
+      ...(entry.protectedResults === true ? { protectedResults: true } : {}),
       ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
@@ -4616,6 +4694,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       longTaskReminder: normalizeLongTaskReminderConfig(entry.longTaskReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,
+      quotaFallbackChain: normalizedQuotaFallbackChain.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
@@ -4710,6 +4789,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
         ? undefined
         : normalizeUsageDisplay(entry),
+      // Default ON: only an explicit false hides 5h / 7d quota segments.
+      showUsageQuota: entry.showUsageQuota === false ? false : undefined,
       ...normalizeReplyFooter(entry),
       showReplyTiming: entry.showReplyTiming === true || undefined,
       // Retired final-only preference must not opt into an extra terminal card.

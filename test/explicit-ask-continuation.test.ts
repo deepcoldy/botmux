@@ -533,7 +533,9 @@ describe('explicit Ask durable continuation', () => {
       const session = { larkAppId: 'app', chatId: 'chat', replyCardRunningTurnId: key.turnId,
         session: { sessionId: 'session', rootMessageId: 'om_root', scope: 'thread',
           cliId: 'claude-code', sandbox: false, workerGeneration: 1 } } as DaemonSession;
-      const semanticInput = { ...input, rootMessageId: 'om_root', timeoutMs: 0 };
+      // One-click (no own-answer box): only draftless asks are embedded in the reply card.
+      const semanticInput = { ...input, rootMessageId: 'om_root', timeoutMs: 0,
+        questions: [{ ...input.questions[0], allowCustom: false }] };
       const originalTarget = replyCardAskTarget(session, semanticInput, { originTurnId: key.turnId });
       expect(originalTarget).toMatchObject({ turnId: key.turnId });
       const persistedTarget = JSON.parse(JSON.stringify(originalTarget));

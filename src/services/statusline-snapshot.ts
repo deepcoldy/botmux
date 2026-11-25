@@ -498,16 +498,23 @@ export function removeStatuslineDir(dataDir: string, sessionId: string): void {
 }
 
 /** 快照 → 卡片用量段子集。百分比四舍五入到整数（statusline 给的是
- *  `14.000000000000002` 这类浮点）；一个字段都没有时返回 undefined，调用方不带 key。 */
-export function toCardQuota(snap: StatuslineSnapshot | undefined): StatuslineQuota | undefined {
+ *  `14.000000000000002` 这类浮点）；一个字段都没有时返回 undefined，调用方不带 key。
+ *  `includeRateLimits: false` 时仅省略 5h / 7d 周期额度，保留上下文占用与窗口大小。 */
+export function toCardQuota(
+  snap: StatuslineSnapshot | undefined,
+  opts?: { includeRateLimits?: boolean },
+): StatuslineQuota | undefined {
   if (!snap) return undefined;
+  const includeRateLimits = opts?.includeRateLimits !== false;
   const q: StatuslineQuota = {};
   if (snap.contextPercent !== undefined) q.contextPercent = Math.round(snap.contextPercent);
   if (snap.contextWindowTokens !== undefined) q.contextWindowTokens = snap.contextWindowTokens;
-  if (snap.fiveHourPercent !== undefined) q.fiveHourPercent = Math.round(snap.fiveHourPercent);
-  if (snap.fiveHourResetsAtMs !== undefined) q.fiveHourResetsAtMs = snap.fiveHourResetsAtMs;
-  if (snap.sevenDayPercent !== undefined) q.sevenDayPercent = Math.round(snap.sevenDayPercent);
-  if (snap.sevenDayResetsAtMs !== undefined) q.sevenDayResetsAtMs = snap.sevenDayResetsAtMs;
+  if (includeRateLimits) {
+    if (snap.fiveHourPercent !== undefined) q.fiveHourPercent = Math.round(snap.fiveHourPercent);
+    if (snap.fiveHourResetsAtMs !== undefined) q.fiveHourResetsAtMs = snap.fiveHourResetsAtMs;
+    if (snap.sevenDayPercent !== undefined) q.sevenDayPercent = Math.round(snap.sevenDayPercent);
+    if (snap.sevenDayResetsAtMs !== undefined) q.sevenDayResetsAtMs = snap.sevenDayResetsAtMs;
+  }
   return Object.keys(q).length > 0 ? q : undefined;
 }
 

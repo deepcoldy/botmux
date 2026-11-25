@@ -92,6 +92,7 @@ const closeSessionMock = vi.fn();
 const sessionStoreCloseMock = vi.fn();
 const getActiveSessionsRegistryMock = vi.fn(() => null as any);
 vi.mock('../src/core/worker-pool.js', () => ({
+  WORKER_SIGKILL_BACKSTOP_MS: 7_000,
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => {
     // Faithfully model the production queued-session transition. A loose

@@ -2987,6 +2987,8 @@ export function reactivateClosedSession(
   next.queuedActivationPending = undefined;
   next.queuedActivationToken = undefined;
   next.queuedActivationInput = undefined;
+  next.queuedActivationRawInput = undefined;
+  next.queuedActivationRawTurnId = undefined;
   next.queuedActivationTurnId = undefined;
   next.queuedActivationDispatchAttempt = undefined;
   next.queuedActivationResume = undefined;
@@ -4046,7 +4048,7 @@ const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'modelPin', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
-  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy', 'sandboxWithholdBotSecret',
+  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy', 'sandboxWithholdBotSecret', 'protectedResults',
   'protectedHttpEgressPolicy',
 ] as const satisfies readonly (keyof Session)[];
 
