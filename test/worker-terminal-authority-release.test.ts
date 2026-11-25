@@ -107,6 +107,31 @@ function startTurn(h: Record<string, any>, turnId: string): void {
 }
 
 describe('turn terminal releases the active turn authority', () => {
+  it('keeps dedup and authority retryable when terminal IPC fails before acceptance', () => {
+    const h = harness();
+    h.setCaptureIdentity('om_ipc_failure', 7);
+    h.markActiveTurnStarted({ turnId: 'om_ipc_failure', dispatchAttempt: 7 });
+    h.durableTurnInFlight = true;
+    h.send = vi.fn()
+      .mockImplementationOnce(() => { throw new Error('IPC unavailable'); })
+      .mockImplementation(() => {});
+
+    expect(() => h.emitTurnTerminal('om_ipc_failure', 'ambiguous', 'claude_open_turn_timeout', 7))
+      .toThrow('IPC unavailable');
+    expect(h.emittedTurnTerminals.statusOf('sid', 'om_ipc_failure', 7)).toBeUndefined();
+    expect(h.activeTurnAuthority.identity()).toMatchObject({ turnId: 'om_ipc_failure', dispatchAttempt: 7 });
+    expect(h.durableTurnInFlight).toBe(true);
+    expect(h.inflightInputs.onTurnComplete).not.toHaveBeenCalled();
+
+    expect(() => h.emitTurnTerminal('om_ipc_failure', 'ambiguous', 'claude_open_turn_timeout', 7))
+      .not.toThrow();
+    expect(h.send).toHaveBeenCalledTimes(2);
+    expect(h.emittedTurnTerminals.statusOf('sid', 'om_ipc_failure', 7)).toBe('ambiguous');
+    expect(h.activeTurnAuthority.identity()).toEqual({});
+    expect(h.durableTurnInFlight).toBe(false);
+    expect(h.inflightInputs.onTurnComplete).toHaveBeenCalledOnce();
+  });
+
   it('resolves an observed preemption from a later native completion through the real emitter', async () => {
     vi.useFakeTimers(); const data = mkdtempSync(join(tmpdir(), 'terminal-evidence-')); const store = new SessionContractStore(data, 'cli_terminal_evidence');
     try {

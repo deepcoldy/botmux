@@ -13674,7 +13674,8 @@ function reconcileClaudeOpenTurnWatchdogAfterIngest(): void {
     return;
   }
   const head = bridgeQueue.peek()[0];
-  if (boundKey && head && claudeOpenTurnKey(head) === boundKey && bridgeQueue.isAwaitingDurationMarker(head)) {
+  if (boundKey && head && claudeOpenTurnKey(head) === boundKey
+    && (bridgeQueue.isAwaitingDurationMarker(head) || head.terminalOutcome?.status === 'ambiguous')) {
     if (bootstrapMarkerSafety || claudeOpenTurnWatchdog.getPhase() !== 'awaiting-marker-redrive') {
       const savedSource = claudeOpenTurnWatchdog.savedEvidenceSource();
       stopClaudeOpenTurnWatchdogTimers();
@@ -13712,7 +13713,10 @@ function reconcileClaudeOpenTurnWatchdogAfterIngest(): void {
             disarmClaudeOpenTurnWatchdog();
             return;
           }
-          if (idleDetector?.programStatusHeldBusy()) return;
+          if (idleDetector?.programStatusHeldBusy()) {
+            armMarkerSafety();
+            return;
+          }
           const pendingAmbiguousDrain = current.terminalOutcome?.status === 'ambiguous';
           if (bridgeQueue.isAwaitingDurationMarker(current) || pendingAmbiguousDrain) {
             try {
@@ -13730,7 +13734,7 @@ function reconcileClaudeOpenTurnWatchdogAfterIngest(): void {
               // bounded exit. Retry only while the exact same head still waits;
               // a partially successful emit or a successor disarms below.
               if (bridgeQueue.peek()[0] === current
-                && (bridgeQueue.isAwaitingDurationMarker(current) || pendingAmbiguousDrain)
+                && (bridgeQueue.isAwaitingDurationMarker(current) || current.terminalOutcome?.status === 'ambiguous')
                 && claudeOpenTurnWatchdog.isAwaitingMarkerRedriveFor(boundKey)) {
                 armMarkerSafety();
                 return;
@@ -14752,7 +14756,11 @@ function emitReadyTurns(opts: {
   // after the model used `botmux send`. Completion is not optional. Emit it
   // only after all corresponding final_output IPC messages have been queued so
   // the daemon observes a stable per-turn ordering.
-  for (const turn of ready) {
+  let terminalIndex = 0;
+  try {
+  for (let i = 0; i < ready.length; i++) {
+    terminalIndex = i;
+    const turn = ready[i];
     if (unsubmitted.has(turn.turnId) || workerFinalOutputHandoff?.hasTurn(turn.turnId)) continue;
     if (universalOutputHandoff || handoffTurnIds.has(turn.turnId)) journalBridgeTurnClear(turn.turnId, turn.dispatchAttempt);
     if (turn.rateLimited) continue;
@@ -14880,6 +14888,13 @@ function emitReadyTurns(opts: {
       outputDisposition,
       undefined,
     );
+  }
+  } catch (error) {
+    // Terminal-loop failures are just as recoverable as final_output failures:
+    // restore the exact unemitted suffix so a bounded release cannot redrive a
+    // successor while this turn's terminal is still undelivered.
+    bridgeQueue.restoreDrained(ready.slice(terminalIndex));
+    throw error;
   }
 }
 
@@ -40467,14 +40482,6 @@ function emitTurnTerminal(
       log(`Structured bridge retired terminal attempt turn=${turnId.slice(0, 12)} attempt=${dispatchAttempt ?? '-'} status=${status}`);
     }
   }
-  // Revoke before publishing terminal. A stale terminal from a superseded
-  // same-principal steer must not clear the newer turn's authority.
-  if (!releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt })) {
-    releaseTerminatedActiveTurnAuthority();
-  } else {
-    scheduleConsumedQueuedTurnAdvance();
-  }
-  retireTerminatedQueuedTurn(turnId, dispatchAttempt, status);
   if (kimiActivityObserver) drainKimiActivityInto({ turnId, dispatchAttempt });
   if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
     flushThinkingUpdate();
@@ -40506,13 +40513,29 @@ function emitTurnTerminal(
     ...(composerRefusal && errorCode === 'safe_composer_required' ? { composerRefusal } : {}),
   };
   const scope = workerSessionEventScope;
-  if (continuationFailure && scope) {
-    scope.reportContinuationFailure(continuationFailure, () => {
-      if (workerSessionEventScope !== scope) return false;
-      send(terminal);
-      return true;
-    });
-  } else send(terminal);
+  try {
+    if (continuationFailure && scope) {
+      scope.reportContinuationFailure(continuationFailure, () => {
+        if (workerSessionEventScope !== scope) return false;
+        send(terminal);
+        return true;
+      });
+    } else send(terminal);
+  } catch (error) {
+    // The terminal was not accepted. Keep authority and queue state retryable;
+    // only the dedup claim needs an exact-status rollback at this boundary.
+    emittedTurnTerminals.release(sessionId, turnId, dispatchAttempt, dedupStatus);
+    throw error;
+  }
+  // Publish authority retirement only after terminal acceptance. A stale
+  // terminal from a superseded same-principal steer still cannot clear the
+  // newer turn's authority, while an IPC failure leaves the exact turn held.
+  if (!releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt })) {
+    releaseTerminatedActiveTurnAuthority();
+  } else {
+    scheduleConsumedQueuedTurnAdvance();
+  }
+  retireTerminatedQueuedTurn(turnId, dispatchAttempt, status);
   // After the terminal is on the wire, re-drive the exact attempt's busy
   // deferral through the fenced readiness probe. Never force a live composer.
   recoverDeferredPromptReadyAtTurnTerminal({ turnId, dispatchAttempt });

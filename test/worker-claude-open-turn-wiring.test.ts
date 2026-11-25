@@ -296,6 +296,58 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
     expect(h.redrives()).toBe(1);
   });
 
+  it('Finding 3c: durable marker-release emit failure re-arms instead of redriving', () => {
+    const h = createWatchdogWiring();
+    h.queue.noteDurationMarkerObserved();
+    h.queue.mark('om_durable_emit_error', makeFingerprint('durable emit error'), 100, 'durable emit error', 1);
+    h.queue.ingest([mkUser('u1', 'durable emit error')], '/t/s.jsonl');
+    expect(h.hold('screen')).toBe(true);
+    h.queue.ingest([mkAssistant('a1', 'u1', 'Durable answer', 'end_turn')], '/t/s.jsonl');
+    h.reconcile();
+    const originalEmit = h.scope.emitReadyTurns as (opts: unknown) => void;
+    let attempts = 0;
+    h.scope.emitReadyTurns = (opts: unknown) => {
+      attempts++;
+      if (attempts === 1) throw new Error('durable transient emit failure');
+      originalEmit(opts);
+    };
+
+    vi.advanceTimersByTime(CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS + 100);
+    expect(attempts).toBe(1);
+    expect(h.queue.peek()[0]?.turnId).toBe('om_durable_emit_error');
+    expect(h.watchdog.isActive()).toBe(true);
+    expect(h.redrives()).toBe(0);
+
+    vi.advanceTimersByTime(CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS + 100);
+    expect(attempts).toBe(2);
+    expect(h.queue.peek()).toEqual([]);
+    expect(h.redrives()).toBe(1);
+  });
+
+  it('Finding 3d: marker safety re-arms while busy and fires after busy clears', () => {
+    const h = createWatchdogWiring();
+    h.queue.noteDurationMarkerObserved();
+    h.queue.mark('om_durable_busy', makeFingerprint('durable busy'), 100, 'durable busy', 1);
+    h.queue.ingest([mkUser('u1', 'durable busy')], '/t/s.jsonl');
+    expect(h.hold('screen')).toBe(true);
+    h.queue.ingest([mkAssistant('a1', 'u1', 'Durable answer', 'end_turn')], '/t/s.jsonl');
+    h.reconcile();
+    h.setProgramStatusHeldBusy(true);
+
+    vi.advanceTimersByTime(CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS + 100);
+    expect(h.emitted).toEqual([]);
+    expect(h.watchdog.isActive()).toBe(true);
+    h.setProgramStatusHeldBusy(false);
+    h.reconcile();
+    vi.advanceTimersByTime(CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS + 100);
+    expect(h.drainedTurns).toHaveLength(1);
+    expect(h.drainedTurns[0]).toMatchObject({
+      turnId: 'om_durable_busy',
+      terminalOutcome: { status: 'ambiguous', errorCode: 'duration_marker_missing' },
+    });
+    h.disarm();
+  });
+
   it('Durable pre-terminal hold reaches the bounded release action', () => {
     const h = createWatchdogWiring({ bareQuietMs: 1_000 });
     h.queue.mark('om_durable_open', makeFingerprint('open durable'), 100, 'open durable', 3);
@@ -330,6 +382,66 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
     ], '/t/s.jsonl');
     expect(h.queue.drainEmittable({ explicitTerminalOnly: true })[0]?.turnId)
       .toBe('local-headless-a_late');
+  });
+
+  it('Durable terminal-loop IPC failure restores the exact head and permits retry', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bmx-terminal-retry-'));
+    try {
+      const jsonl = join(dir, 's.jsonl');
+      const rows = [mkUser('u1', 'durable terminal retry')];
+      writeFileSync(jsonl, rows.map(row => `${JSON.stringify(row)}\n`).join(''));
+      const queue = new BridgeTurnQueue();
+      queue.mark('om_terminal_retry', makeFingerprint('durable terminal retry'), 100, 'durable terminal retry', 7);
+      queue.ingest(rows, jsonl);
+      const head = queue.peek()[0]!;
+      expect(queue.markDurableTurnAmbiguous(head, 'claude_open_turn_timeout')).toBe(true);
+      const terminalAttempts: unknown[] = [];
+      const scope: Record<string, unknown> = {
+        bridgeQueue: queue,
+        bridgeJsonlPath: jsonl,
+        sessionId: 'sess-1',
+        lastInitConfig: { cliId: 'claude-code', chatId: 'oc_c', rootMessageId: 'om_r', adoptMode: false },
+        workerFinalOutputHandoff: null,
+        finalHandoffAdmissionEnabled: false,
+        universalOutputHandoff: null,
+        journalBridgeTurnClear: () => {},
+        bridgeFingerprintScanLastMs: new Map(),
+        readSendMarkers: () => [],
+        rememberTurnLinkRefMode: () => {},
+        zeroPromptTerminalSync: () => false,
+        replyDeliveryMode: () => 'send' as const,
+        shouldSuppressBridgeEmit,
+        attributableExplicitReplyMarkersForTurnWindow: () => [],
+        isFinalBridgeSendMarker,
+        notifyExplicitRepliesObserved: () => {},
+        drainTranscript,
+        followUpReplyEnabled: () => false,
+        joinAssistantText,
+        trailingAssistantText,
+        isClaudeMemoryToolUse,
+        hasTrailingBridgeSentinelLine,
+        bridgeGateInputForTurn,
+        usageLimitTracker: { noteTurnCompleted: () => {} },
+        isBridgeNothingToSendFinal,
+        bridgePostText,
+        send: () => {},
+        emitTurnTerminal: (...args: unknown[]) => {
+          terminalAttempts.push(args);
+          if (terminalAttempts.length === 1) throw new Error('terminal IPC unavailable');
+        },
+        log: () => {},
+      };
+      const emit = loadWorkerFunction<(opts: { releaseHeldTerminals?: boolean; onlyTurn?: { turnId: string; dispatchAttempt?: number } }) => void>('emitReadyTurns', scope);
+      const opts = { releaseHeldTerminals: true, onlyTurn: { turnId: 'om_terminal_retry', dispatchAttempt: 7 } };
+
+      expect(() => emit(opts)).toThrow('terminal IPC unavailable');
+      expect(queue.peek()[0]).toBe(head);
+      expect(() => emit(opts)).not.toThrow();
+      expect(queue.peek()).toEqual([]);
+      expect(terminalAttempts).toHaveLength(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('Late-recovered turn without an active watchdog still gets bounded marker-loss settlement', () => {
