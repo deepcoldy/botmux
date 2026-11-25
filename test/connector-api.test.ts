@@ -110,6 +110,78 @@ describe('connector-api write routes', () => {
     expect(okRes.status).toBe(201);
   });
 
+  it('allows PUT maintenance and secret rotation on a persisted reserved-id connector while still blocking creates', async () => {
+    const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+    const { upsertConnector, getConnector } = await import('../src/services/connector-store.js');
+    const secret = createWebhookSecret('legacy-plugin-secret');
+    // Simulate a connector persisted before the id reservation shipped.
+    upsertConnector({
+      id: 'plugin',
+      name: 'Before',
+      enabled: true,
+      verify: {
+        type: 'token',
+        secretRef: secret.ref,
+        signatureHeader: 'x-botmux-signature',
+        timestampHeader: 'x-botmux-timestamp',
+        nonceHeader: 'x-botmux-nonce',
+        toleranceSeconds: 300,
+      },
+      target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_legacy' },
+      promptEnvelope: { sourceName: 'legacy', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024 },
+      loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+      lifecycleExtractors: null,
+      createdAt: '2026-07-01T00:00:00.000Z',
+      updatedAt: '2026-07-01T00:00:00.000Z',
+    });
+
+    const renameRes = await fetch(`${baseUrl}/api/connectors/plugin`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'After' }),
+    });
+    expect(renameRes.status, await renameRes.clone().text()).toBe(200);
+    expect(getConnector('plugin')?.name).toBe('After');
+    expect(getConnector('plugin')?.id).toBe('plugin');
+
+    const rotateRes = await fetch(`${baseUrl}/api/connectors/plugin`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ rotateSecret: true }),
+    });
+    expect(rotateRes.status, await rotateRes.clone().text()).toBe(200);
+    const rotatedBody = await json(rotateRes);
+    expect(rotatedBody.secret).toBeTruthy();
+    expect(rotatedBody.webhookUrl).toContain('/webhook/plugin/');
+
+    // Uppercase persisted id is maintained under its exact id as well.
+    upsertConnector({
+      ...(getConnector('plugin') as any),
+      id: 'PLUGIN',
+      name: 'Upper Before',
+    });
+    const upperPut = await fetch(`${baseUrl}/api/connectors/PLUGIN`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Upper After' }),
+    });
+    expect(upperPut.status, await upperPut.clone().text()).toBe(200);
+    expect(getConnector('PLUGIN')?.name).toBe('Upper After');
+
+    // Creates/renames onto the reserved id remain blocked.
+    const createRes = await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'plugin',
+        name: 'New attempt',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    });
+    expect(createRes.status).toBe(400);
+    expect(await json(createRes)).toMatchObject({ ok: false, error: 'reserved_connector_id' });
+  });
+
   it('rejects new workflow connectors without retaining a connector or generated secret', async () => {
     const res = await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',

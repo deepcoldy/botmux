@@ -285,7 +285,12 @@ function normalizeConnectorInput(
   const rateLimitCleared = c.rateLimit === null;
   const rateLimit = rateLimitCleared ? null : record(c.rateLimit ?? prior?.rateLimit);
   const id = opts.id ?? (typeof c.id === 'string' && c.id.trim() ? c.id.trim() : prior?.id ?? newConnectorId());
-  if (id.toLowerCase() === 'plugin') return { ok: false, error: 'reserved_connector_id' };
+  // The reserved id blocks new connectors and renames onto it, but a connector
+  // persisted before the reservation keeps the same id for PUT maintenance
+  // (name/target edits, secret rotation); its webhook URLs must stay workable.
+  const touchesReservedId = id.toLowerCase() === 'plugin';
+  const isSamePersistedConnector = prior !== null && prior.id === id;
+  if (touchesReservedId && !isSamePersistedConnector) return { ok: false, error: 'reserved_connector_id' };
   const name = typeof c.name === 'string' && c.name.trim() ? c.name.trim() : prior?.name;
   if (!name) return { ok: false, error: 'name_required' };
 

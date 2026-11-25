@@ -438,11 +438,17 @@ export type ParsedServiceProxyRequest =
  * `/webhook/<connectorId>` or `/webhook/<connectorId>/<token>` — one or two
  * path segments — while a plugin webhook always requires three
  * (`/webhook/plugin/<pluginId>/<subpath>`). A persisted connector whose id is
- * the now-reserved literal `plugin` therefore owns the 1–2 segment shape: the
- * plugin gateway must let such requests fall through instead of answering
- * 404/400, or the connector's existing webhook URLs stop delivering on upgrade.
- * The legacy router re-runs its own token/HMAC verification, so falling through
- * never bypasses authentication.
+ * the now-reserved literal `plugin` (in any letter case) therefore owns the
+ * 1–2 segment shape: the plugin gateway must let such requests fall through
+ * instead of answering 404/400, or the connector's existing webhook URLs stop
+ * delivering on upgrade. The legacy router re-runs its own token/HMAC
+ * verification, so falling through never bypasses authentication.
+ *
+ * The full raw path must pass the same strict checks as plugin routes BEFORE
+ * the fall-through: `new URL(...)` would otherwise collapse backslashes/dot
+ * segments after `earlyGuard` has already handed the request over, letting a
+ * shape like `/webhook/plugin/..\..\__health` normalize onto an unrelated
+ * unauthenticated route.
  */
 export function isLegacyPluginConnectorWebhookTarget(rawUrl: string | undefined): boolean {
   const target = parseRawOriginFormTarget(rawUrl);
@@ -452,13 +458,28 @@ export function isLegacyPluginConnectorWebhookTarget(rawUrl: string | undefined)
   if (segments[1] !== 'webhook' || segments.length < 3 || segments.length > 4) return false;
   // A trailing slash (`/webhook/plugin/`) never matched the legacy segment regex.
   if (segments.length === 4 && segments[3] === '') return false;
+  // Reject backslashes, dot segments, encoded separators, control chars, and
+  // any other shape WHATWG URL normalization would rewrite onto another route.
+  try {
+    validateStrictPluginHttpPath(target.rawPath, {
+      allowRoot: false,
+      allowTrailingSlash: false,
+      maxLength: 2048,
+      errorCode: 'invalid_legacy_connector_path',
+    });
+  } catch {
+    return false;
+  }
   let connectorId: string;
   try {
     connectorId = decodeURIComponent(segments[2]);
   } catch {
     return false;
   }
-  return connectorId === 'plugin';
+  // Case-insensitive: connectors created before the reservation may use
+  // `PLUGIN`/`Plugin`; the legacy router looks up the stored id exactly and
+  // re-verifies its own token before delivering.
+  return connectorId.toLowerCase() === 'plugin';
 }
 
 /**

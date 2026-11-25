@@ -599,9 +599,10 @@ describe('plugin webhook route gateway (POST /webhook/plugin/:pluginId/*)', () =
         demo: makePluginRecord('demo', { schemaVersion: 1, routes: [{ path: '/events' }] }),
       },
       legacyRoute: (req, res, url) => {
-        // Exact production connector regex from src/dashboard/webhook-routes.ts
+        // Exact production connector regex from src/dashboard/webhook-routes.ts;
+        // persisted ids keep their exact case for lookup/token verification.
         const m = url.pathname.match(/^\/webhook\/([^/]+)(?:\/([^/]+))?$/);
-        if (m && decodeURIComponent(m[1]) === 'plugin') {
+        if (m && decodeURIComponent(m[1]).toLowerCase() === 'plugin') {
           legacyReached.push(`${req.method} ${req.url}`);
           res.writeHead(202, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ routed: 'legacy-connector' }));
@@ -616,25 +617,57 @@ describe('plugin webhook route gateway (POST /webhook/plugin/:pluginId/*)', () =
       ['POST', '/webhook/plugin?token=legacy-secret'],
       ['GET', '/webhook/plugin?token=legacy-secret'],
       ['POST', '/webhook/%70lugin/legacy-secret'],
+      // Case variants were creatable/deliverable before the id reservation.
+      ['POST', '/webhook/PLUGIN/upper-secret'],
+      ['POST', '/webhook/Plugin?token=mixed-secret'],
+      ['POST', '/webhook/%50lugin/mixed-secret'],
     ];
     for (const [method, path] of legacyCases) {
       const res = await sendHttp(frontPort, { method, path, ...(method === 'GET' ? {} : { body: '' }) });
       expect(res.status, `${method} ${path}`).toBe(202);
       expect(JSON.parse(res.body.toString()).routed).toBe('legacy-connector');
     }
-    expect(legacyReached).toHaveLength(4);
+    expect(legacyReached).toHaveLength(7);
 
     // Three-segment plugin shape stays owned by the gateway: unknown plugin is
     // answered by the plugin handler, never leaked to the connector router.
     const ghost = await sendHttp(frontPort, { method: 'POST', path: '/webhook/plugin/ghost/x', body: '' });
     expect(ghost.status).toBe(404);
     expect(JSON.parse(ghost.body.toString()).error).toBe('plugin_not_found');
-    expect(legacyReached).toHaveLength(4);
+    expect(legacyReached).toHaveLength(7);
 
     // Declared plugin routes still forward to the plugin upstream.
     const ok = await sendHttp(frontPort, { method: 'POST', path: '/webhook/plugin/demo/events', body: '' });
     expect(ok.status).toBe(202);
-    expect(legacyReached).toHaveLength(4);
+    expect(legacyReached).toHaveLength(7);
+  });
+
+  it('never falls through backslash/dot traversal shapes that new URL normalizes onto other routes', async () => {
+    const legacyReached: string[] = [];
+    const { frontPort } = await startFixture({
+      plugins: { demo: makePluginRecord('demo', { schemaVersion: 1, routes: [{ path: '/events' }] }) },
+      legacyRoute: () => {
+        legacyReached.push('should-never-happen');
+        return false;
+      },
+    });
+    // Raw wire requests through the real earlyGuard → new URL ordering. The
+    // fixture front serves /__health (like dashboard.ts): a fall-through here
+    // would normalize onto it and answer 200 instead of the strict 400.
+    const traversals = [
+      '/webhook/plugin/..\\..\\__health',
+      '/webhook/%70lugin/..\\..\\__health',
+      '/webhook/plugin/../../__health',
+      '/webhook/PLUGIN/..\\..\\__health',
+    ];
+    for (const path of traversals) {
+      const rawRes = await sendRawHttpLine(
+        frontPort,
+        `POST ${path} HTTP/1.1\r\nHost: 127.0.0.1:${frontPort}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`,
+      );
+      expect(rawRes, path).toMatch(/^HTTP\/1\.1 400 /);
+    }
+    expect(legacyReached).toHaveLength(0);
   });
 
   it('partitions concurrency and in-flight buffer budgets across IPs and plugins and frees buffers after upstream write', async () => {

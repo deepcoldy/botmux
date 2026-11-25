@@ -391,6 +391,9 @@ describe('plugin webhooks contribution scanning, matching, and raw URL protocol 
       ['/webhook/plugin?token=abc', 'connector id with query token'],
       ['/webhook/plugin/legacy-secret', 'token baked into path'],
       ['/webhook/%70lugin/legacy-secret', 'percent-encoded lowercase p'],
+      ['/webhook/PLUGIN/upper-secret', 'uppercase persisted connector id'],
+      ['/webhook/Plugin?token=mixed-secret', 'mixed-case connector id'],
+      ['/webhook/%50lugin/mixed-secret', 'percent-encoded capital P'],
     ];
     for (const [rawUrl, label] of legacyTrue) {
       expect(isLegacyPluginConnectorWebhookTarget(rawUrl), label).toBe(true);
@@ -400,11 +403,13 @@ describe('plugin webhooks contribution scanning, matching, and raw URL protocol 
       ['/webhook/plugin/demo/events', 'plugin route requires 3+ segments'],
       ['/webhook/plugin/ghost/x', 'unknown plugin still has plugin shape, no fall-through'],
       ['/webhook/other/token', 'different connector id'],
-      ['/webhook/PLUGIN/token', 'case-sensitive reserved id'],
-      ['/webhook/%50lugin/token', 'encoded capital P decodes to Plugin, not plugin'],
       ['/webhook/plugin/a/b', 'three segments is plugin shape'],
+      ['/webhook/plugin/..\\..\\__health', 'backslash traversal must stay behind the strict guard'],
+      ['/webhook/%70lugin/..\\..\\__health', 'encoded id plus backslash traversal'],
+      ['/webhook/plugin/../../__health', 'dot-segment traversal rejected by strict path validation'],
+      ['/webhook/plugin/a%2fb', 'encoded slash in token segment'],
+      ['/webhook/plugin/a%5Cb', 'encoded backslash in token segment'],
       ['//evil.example/webhook/plugin/token', 'protocol-relative target rejected'],
-      ['/webhook/plugin/a/../b', 'traversal-bearing 4+ segment path'],
       ['/webhook', 'unrelated webhook prefix'],
       ['/webhook/plugin?x=1#frag', 'fragment-bearing target rejected at origin-form parse'],
       ['not a url', 'garbage input'],
