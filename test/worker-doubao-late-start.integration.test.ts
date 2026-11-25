@@ -52,7 +52,7 @@ afterEach(async () => {
 
 const pause = (ms: number) => new Promise(done => setTimeout(done, ms));
 
-function startScenario(opts: { submitDelayMs?: number; fresh?: boolean; exportOnly?: boolean; backend?: 'tmux' | 'pty'; handoff?: boolean } = {}) {
+function startScenario(opts: { submitDelayMs?: number; pasteDelayMs?: number; fresh?: boolean; exportOnly?: boolean; backend?: 'tmux' | 'pty'; handoff?: boolean } = {}) {
   root = mkdtempSync(join(tmpdir(), 'doubao-late-start-'));
   const dataDir = join(root, 'data');
   mkdirSync(dataDir);
@@ -71,6 +71,7 @@ function startScenario(opts: { submitDelayMs?: number; fresh?: boolean; exportOn
   writeFileSync(join(ctlDir, 'export.json'), JSON.stringify(opts.fresh ? [] : [{ query: 'Old prompt', response: 'Old answer' }]));
   if (opts.exportOnly) writeFileSync(join(ctlDir, 'export-only'), '');
   if (opts.submitDelayMs) writeFileSync(join(ctlDir, 'submit-delay'), String(opts.submitDelayMs));
+  if (opts.pasteDelayMs) writeFileSync(join(ctlDir, 'paste-delay'), String(opts.pasteDelayMs));
   // Unix socket paths are bounded; keep the private tmux dir short.
   tmuxRoot = mkdtempSync('/tmp/bmx-dl-');
   tmuxEnv = privateTmuxEnv(tmuxRoot);
@@ -162,6 +163,114 @@ async function finishFirstTurn(s: ReturnType<typeof startScenario>): Promise<voi
 }
 
 describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('Doubao input accepted while the CLI is busy', () => {
+  it.each(['tmux', 'pty'] as const)('bypasses asynchronous clipboard work and automatically collects consecutive answers on %s', async backend => {
+    const s = startScenario({ fresh: true, exportOnly: true, backend, pasteDelayMs: 1600 });
+    await s.waitUntil(() => s.assignmentText().includes('first task'), 'delayed paste first submit', 30_000);
+    s.control('finish-1', 'FIRST_DELAYED_PASTE');
+    await s.waitUntil(() => s.finals('om_turn_1').length > 0, 'first automatic final', 30_000);
+    s.control('paste-delay', '2100');
+    const second = 'second task\n────────\nAsk Doubao to do anything\nline four\nline five\\';
+    s.sendMessage('om_turn_2', second);
+    await s.waitUntil(() => s.assignmentText().includes(second), 'second automatic submit', 30_000);
+    s.control('finish-2', 'SECOND_DELAYED_PASTE');
+    await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'second automatic final', 30_000);
+    await pause(1500);
+    expect(s.finals('om_turn_1').map(msg => (msg as { content: string }).content)).toEqual(['FIRST_DELAYED_PASTE']);
+    expect(s.finals('om_turn_2').map(msg => (msg as { content: string }).content)).toEqual(['SECOND_DELAYED_PASTE']);
+    expect(s.pastes('first task')).toBe(1);
+    expect(s.pastes('line five')).toBe(1);
+    expect(s.assignmentText().split(second)).toHaveLength(2);
+    expect(s.notices('om_turn_2')).toEqual([]);
+    expect(readFileSync(s.trajectory, 'utf8')).toBe('');
+    // The tmux transport must not put large literal input in a single argv.
+    const large = `third task ${'x'.repeat(140_000)}\nlarge input ends here`;
+    s.sendMessage('om_turn_3', large);
+    await s.waitUntil(() => s.assignmentText().includes(large), 'large input delivered intact', 30_000);
+    s.control('finish-3', 'LARGE_INPUT_ANSWER');
+    await s.waitUntil(() => s.finals('om_turn_3').length > 0, 'large input answer', 30_000);
+    expect(s.finals('om_turn_3').map(msg => (msg as { content: string }).content)).toEqual(['LARGE_INPUT_ANSWER']);
+    expect(s.pastes('large input ends here')).toBe(1);
+  }, 90_000);
+
+  it('never treats an opaque collapsed control-bearing paste as proof of the complete draft', async () => {
+    const s = startScenario({ fresh: true, exportOnly: true });
+    await finishFirstTurn(s);
+    s.sendMessage('om_turn_2', 'opaque paste\t\nsecond line\nthird line\nfourth line');
+    await s.waitUntil(() => s.pane().includes('[Pasted text'), 'opaque paste rendered');
+    await s.waitUntil(() => s.logs.some(line => line.includes('Quarantined input delivery')), 'unproven draft quarantined', 30_000);
+    expect(s.assignmentText()).not.toContain('opaque paste');
+    expect(s.finals('om_turn_2')).toEqual([]);
+    // A human may submit this draft; Botmux must never guess from its line count.
+    s.pressInTerminal('C-u');
+  }, 60_000);
+
+  it('never submits a delayed paste after the user stops it, and holds the successor off that draft', async () => {
+    const s = startScenario({ fresh: true, exportOnly: true });
+    await finishFirstTurn(s);
+    s.control('paste-hold');
+    s.sendMessage('om_turn_2', 'stopped while waiting\tfor clipboard');
+    await s.waitUntil(() => s.pastes('stopped while waiting') === 1, 'pending paste bytes delivered');
+    child!.send({ type: 'interrupt_turn', requestId: 'stop-paste', turnId: 'om_turn_2' } satisfies DaemonToWorker);
+    await s.waitUntil(() => s.messages.some(msg => msg.type === 'turn_interrupt_result' && msg.requestId === 'stop-paste'), 'stop handled');
+    s.sendMessage('om_turn_3', 'successor must wait for cleared composer');
+    s.clear('paste-hold');
+    await s.waitUntil(() => s.pane().includes('stopped while waiting'), 'cancelled paste remains a draft');
+    await pause(2000);
+    expect(s.assignmentText()).not.toContain('stopped while waiting');
+    expect(s.pastes('successor must wait')).toBe(0);
+    expect(s.finals('om_turn_2')).toEqual([]);
+    s.pressInTerminal('C-u');
+    await s.waitUntil(() => s.assignmentText().includes('successor must wait'), 'successor submitted after clearing', 90_000);
+    s.control('finish-2', 'SUCCESSOR_ONLY');
+    await s.waitUntil(() => s.finals('om_turn_3').length > 0, 'successor final', 30_000);
+    expect(s.finals('om_turn_3').map(msg => (msg as { content: string }).content)).toEqual(['SUCCESSOR_ONLY']);
+  }, 150_000);
+
+  it('does not submit a partial or manually changed draft while a clipboard probe is pending', async () => {
+    const s = startScenario({ fresh: true, exportOnly: true });
+    await finishFirstTurn(s);
+    s.control('paste-hold');
+    s.sendMessage('om_turn_2', 'second task with delayed\tclipboard');
+    await s.waitUntil(() => s.pastes('second task with delayed') === 1, 'paste frame delivered');
+    // A half-written draft is visible, but it is not the complete input. When
+    // clipboard work finishes it must not make that mixed draft ours to submit.
+    s.pressInTerminal('manual-fragment');
+    await s.waitUntil(() => s.logs.some(line => line.includes('Quarantined input delivery')), 'changed draft held', 20_000);
+    s.sendMessage('om_turn_3', 'successor after a changed draft');
+    s.clear('paste-hold');
+    await s.waitUntil(() => s.pane().includes('clipboard'), 'late paste rendered');
+    await pause(1500);
+    expect(s.assignmentText()).not.toContain('second task with delayed');
+    expect(s.pastes('successor after a changed')).toBe(0);
+    s.pressInTerminal('C-u');
+    await s.waitUntil(() => s.assignmentText().includes('successor after a changed'), 'successor cleanly submitted', 90_000);
+    s.control('finish-2', 'CLEAN_SUCCESSOR');
+    await s.waitUntil(() => s.finals('om_turn_3').length > 0, 'clean successor final');
+    expect(s.finals('om_turn_2')).toEqual([]);
+    expect(s.finals('om_turn_3').map(msg => (msg as { content: string }).content)).toEqual(['CLEAN_SUCCESSOR']);
+  }, 150_000);
+
+  it('does not let paste readiness after the wait expires submit a held successor or revive the old turn', async () => {
+    const s = startScenario({ fresh: true, exportOnly: true });
+    await finishFirstTurn(s);
+    s.control('paste-hold');
+    s.sendMessage('om_turn_2', 'late paste\t\nsecond line\nthird line\nfourth line');
+    await s.waitUntil(() => s.pastes('late paste') === 1, 'clipboard started');
+    await s.waitUntil(() => s.logs.some(line => line.includes('Quarantined input delivery')), 'bounded readiness wait ended', 30_000);
+    s.sendMessage('om_turn_3', 'successor overlapping expired paste wait');
+    s.clear('paste-hold');
+    await s.waitUntil(() => s.pane().includes('[Pasted text'), 'paste completes after deadline');
+    await pause(1500);
+    expect(s.assignmentText()).not.toContain('late paste');
+    expect(s.pastes('successor overlapping')).toBe(0);
+    s.pressInTerminal('C-u');
+    await s.waitUntil(() => s.assignmentText().includes('successor overlapping'), 'successor after clearing expired draft', 90_000);
+    s.control('finish-2', 'AFTER_EXPIRED_PASTE');
+    await s.waitUntil(() => s.finals('om_turn_3').length > 0, 'overlapping successor final');
+    expect(s.finals('om_turn_2')).toEqual([]);
+    expect(s.finals('om_turn_3').map(msg => (msg as { content: string }).content)).toEqual(['AFTER_EXPIRED_PASTE']);
+  }, 150_000);
+
   it('export recovery survives an observer reattach without submitting the pending input again', async () => {
     const s = startScenario({ fresh: true, exportOnly: true });
     await s.waitUntil(() => s.assignmentText().includes('first task'), 'native input proof', 30_000);

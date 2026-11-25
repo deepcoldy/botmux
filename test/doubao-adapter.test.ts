@@ -140,13 +140,24 @@ function appendAssignment(root: string, sid: string, prompt: string, mtimeMs = D
 
 function fakeTmuxPty(): PtyHandle & { log: string[] } {
   const log: string[] = [];
+  let composer = '';
+  const screen = () => ['─'.repeat(60), `❯ ${composer || 'Ask Doubao to do anything'}`, '─'.repeat(60)].join('\n');
   return {
     log,
     write(data: string) { log.push(`write:${data}`); },
-    pasteText(text: string) { log.push(`paste:${text}`); },
+    pasteText(text: string) {
+      log.push(`paste:${text}`);
+      const lines = text.split('\n');
+      composer = lines.length >= 4 ? `[Pasted text #1 +${lines.length - 1} lines]` : lines.join(' ');
+    },
     sendText(text: string) { log.push(`text:${text}`); },
-    sendSpecialKeys(...keys: string[]) { log.push(`keys:${keys.join(',')}`); },
+    sendSpecialKeys(...keys: string[]) { log.push(`keys:${keys.join(',')}`); composer = ''; },
+    captureViewportAsync: async () => screen(),
   };
+}
+
+function writtenInput(pty: { log: string[] }): string {
+  return pty.log[0]!.replace(/^(?:paste|text):/, '').replace(/\x13$/, '');
 }
 
 describe('doubao buildArgs', () => {
@@ -678,7 +689,7 @@ describe('doubao writeInput', () => {
 
     const landed = new Promise<void>((resolve) => {
       setTimeout(() => {
-        writeAssignment(root, OTHER_SID, pty.log[0]!.slice('paste:'.length));
+        writeAssignment(root, OTHER_SID, writtenInput(pty));
         resolve();
       }, 500);
     });
@@ -698,7 +709,7 @@ describe('doubao writeInput', () => {
       const pty = fakeTmuxPty();
       const landed = new Promise<void>((resolve) => {
         setTimeout(() => {
-          writeAssignment(root, sid, pty.log[0]!.slice('paste:'.length));
+          writeAssignment(root, sid, writtenInput(pty));
           resolve();
         }, 500);
       });
@@ -718,11 +729,12 @@ describe('doubao writeInput', () => {
     const ptyA = fakeTmuxPty();
     const landedA = new Promise<void>((resolve) => {
       setTimeout(() => {
-        writeAssignment(root, SID, ptyA.log[0]!.slice('paste:'.length));
+        writeAssignment(root, SID, writtenInput(ptyA));
         resolve();
       }, 500);
     });
     const resultA = adapter.writeInput(ptyA, envelope);
+    await new Promise(resolve => setTimeout(resolve, 0));
     // Replace the launch while A is still awaiting its assignment/poll.
     adapter.buildArgs({ sessionId: 'bmx-first', resume: false });
     expect(await resultA).toEqual({ submitted: true, cliSessionId: SID, ownershipProven: true });
@@ -731,7 +743,7 @@ describe('doubao writeInput', () => {
     const ptyB = fakeTmuxPty();
     const landedB = new Promise<void>((resolve) => {
       setTimeout(() => {
-        writeAssignment(root, OTHER_SID, ptyB.log[0]!.slice('paste:'.length));
+        writeAssignment(root, OTHER_SID, writtenInput(ptyB));
         resolve();
       }, 500);
     });
@@ -757,7 +769,7 @@ describe('doubao writeInput', () => {
     });
     const currentLanded = new Promise<void>((resolve) => {
       setTimeout(() => {
-        writeAssignment(root, OTHER_SID, pty.log[0]!.slice('paste:'.length));
+        writeAssignment(root, OTHER_SID, writtenInput(pty));
         resolve();
       }, 700);
     });
@@ -779,7 +791,7 @@ describe('doubao writeInput', () => {
 
     const landed = new Promise<void>((resolve) => {
       setTimeout(() => {
-        appendAssignment(root, OTHER_SID, pty.log[0]!.slice('paste:'.length));
+        appendAssignment(root, OTHER_SID, writtenInput(pty));
         resolve();
       }, 500);
     });
@@ -794,26 +806,30 @@ describe('doubao writeInput', () => {
     return { now: () => t, sleep: async (ms: number) => { t += ms; } };
   }
 
-  it('pastes the whole prompt once and submits with a single Enter', async () => {
+  it('writes printable text and its native submit key in one operation', async () => {
     const adapter = createDoubaoAdapter('/bin/doubao', { submitClock: submitClock() });
     adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: SID });
     const pty = fakeTmuxPty();
     await adapter.writeInput(pty, 'line one\nline two');
-    expect(pty.log).toEqual(['paste:line one\nline two', 'keys:Enter']);
+    expect(pty.log).toEqual(['text:line one\nline two\x13']);
   });
 
-  it('wraps raw PTY input in bracketed paste so newlines do not submit', async () => {
+  it('uses native soft newlines and a single final submit on raw PTY', async () => {
     const adapter = createDoubaoAdapter('/bin/doubao', { submitClock: submitClock() });
     adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: SID });
     const log: string[] = [];
-    await adapter.writeInput({ write: (d: string) => { log.push(d); } }, 'a\nb');
-    expect(log).toEqual(['\x1b[200~a\nb\x1b[201~', '\r']);
+    const rule = '─'.repeat(60);
+    await adapter.writeInput({
+      write: (d: string) => { log.push(d); },
+      captureViewportAsync: async () => [rule, log.length === 1 ? '❯ a b' : '❯ Ask Doubao to do anything', rule].join('\n'),
+    }, 'a\nb');
+    expect(log).toEqual(['a\nb\x13']);
   });
 
   it('reports an unconfirmed Enter as not submitted, keeping a receipt recheck', async () => {
     const adapter = createDoubaoAdapter('/bin/doubao', { submitClock: submitClock() });
     adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: SID });
-    const pty = { ...fakeTmuxPty(), sendSpecialKeys: () => false };
+    const pty = { ...fakeTmuxPty(), sendText: () => false };
     const result = await adapter.writeInput(pty, 'hi');
     expect(result).toMatchObject({ submitted: false });
     expect(typeof (result as { recheck?: unknown }).recheck).toBe('function');
@@ -825,7 +841,7 @@ describe('doubao writeInput', () => {
       // Nothing landed: a definite non-submission the user hears about at once.
       ['❯  Ask Doubao to do anything', { submitted: false, failureReason: expect.stringContaining('Enter was not sent') }],
       // Something landed (or cannot be seen): an ambiguous draft, never submitted by botmux.
-      ['❯ hi', { submitted: false, recheck: expect.any(Function) }],
+      ['❯ hi there', { submitted: false, recheck: expect.any(Function) }],
     ] as const) {
       const adapter = createDoubaoAdapter('/bin/doubao', { submitClock: submitClock() });
       adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: SID });
@@ -834,10 +850,10 @@ describe('doubao writeInput', () => {
         write: data => { log.push(`write:${data}`); },
         pasteText: text => { log.push(`paste:${text}`); return false; },
         sendSpecialKeys: (...keys) => { log.push(`keys:${keys.join(',')}`); },
-        captureViewportAsync: async () => [rule, composer, rule].join('\n'),
+        captureViewportAsync: async () => [rule, log.length ? composer : '❯ Ask Doubao to do anything', rule].join('\n'),
       };
-      expect(await adapter.writeInput(pty, 'hi')).toEqual(expected);
-      expect(log).toEqual(['paste:hi']);
+      expect(await adapter.writeInput(pty, 'hi\tthere')).toEqual(expected);
+      expect(log).toEqual(['paste:hi\tthere']);
     }
   });
 
@@ -851,11 +867,11 @@ describe('doubao writeInput', () => {
     expect(await adapter.writeInput(fakeTmuxPty(), 'second task')).toBeUndefined();
 
     const pty = fakeTmuxPty();
-    const pasted = pty.pasteText!.bind(pty);
-    pty.pasteText = (text: string) => {
+    const pasted = pty.sendText!.bind(pty);
+    pty.sendText = (text: string) => {
       pasted(text);
       // Doubao sends it: the request is appended to the session's own log.
-      appendFileSync(assignment, `## [2026-11-21T03:15:52Z] 需求\n${text}\n\n`);
+      appendFileSync(assignment, `## [2026-11-21T03:15:52Z] 需求\n${text.replace(/\x13$/, '')}\n\n`);
     };
     expect(await adapter.writeInput(pty, 'second task')).toEqual({
       submitted: true, cliSessionId: SID, ownershipProven: true,
@@ -869,23 +885,23 @@ describe('doubao writeInput', () => {
     adapter.buildArgs({ sessionId: 'bmx-first', resume: false });
     const first = fakeTmuxPty();
     const landed = new Promise<void>(resolve => setTimeout(() => {
-      writeAssignment(root, SID, first.log[0]!.slice('paste:'.length));
+      writeAssignment(root, SID, writtenInput(first));
       resolve();
     }, 300));
     expect(await adapter.writeInput(first, envelope)).toEqual({ submitted: true, cliSessionId: SID, ownershipProven: true });
     await landed;
 
     const next = fakeTmuxPty();
-    const pasted = next.pasteText!.bind(next);
-    next.pasteText = (text: string) => {
+    const pasted = next.sendText!.bind(next);
+    next.sendText = (text: string) => {
       pasted(text);
-      appendAssignment(root, SID, text);
+      appendAssignment(root, SID, text.replace(/\x13$/, ''));
     };
     expect(await adapter.writeInput(next, 'follow-up question')).toEqual({
       submitted: true, cliSessionId: SID, ownershipProven: true,
     });
     // Continuation input carries no capture id.
-    expect(next.log[0]).toBe('paste:follow-up question');
+    expect(next.log[0]).toBe('text:follow-up question\x13');
   });
 });
 

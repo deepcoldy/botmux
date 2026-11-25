@@ -1473,6 +1473,10 @@ export class TmuxPipeBackend implements SessionBackend {
     return this.pasteBuffer(text, false);
   }
 
+  sendUnbracketedText(text: string): boolean {
+    return this.pasteBuffer(text, false, true);
+  }
+
   /** The framed paste is one tmux command batch; Enter follows as a second,
    * back-to-back tmux call. Send ESC markers as literal keys: newer servers
    * sanitize ESC inside buffers.
@@ -1502,7 +1506,7 @@ export class TmuxPipeBackend implements SessionBackend {
     });
   }
 
-  private pasteBuffer(text: string, submit: boolean): boolean {
+  private pasteBuffer(text: string, submit: boolean, unbracketed = false): boolean {
     if (this.exited || !this.preparePaneForWrite()) return false;
     const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
     return this.guardedSend('paste-buffer', () => {
@@ -1540,7 +1544,7 @@ export class TmuxPipeBackend implements SessionBackend {
         // stay outside the guard and need no nested quoting.
         const guardedPaste = ['if-shell', '-F', '-t', this.paneTarget, '#{pane_dead}',
           `display-message -p ${PASTE_REFUSED_DEAD_PANE}`,
-          ['paste-buffer', '-b', bufferName, '-t', this.paneTarget, '-d', submit ? '-r' : '-p'].map(tmuxQuote).join(' ')];
+          ['paste-buffer', '-b', bufferName, '-t', this.paneTarget, '-d', submit || unbracketed ? '-r' : '-p'].map(tmuxQuote).join(' ')];
         const commands = submit
           ? ['send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[200~', ';',
             ...guardedPaste, ';', 'send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[201~']

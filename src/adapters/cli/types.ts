@@ -14,6 +14,9 @@ export interface PtyHandle {
    *  occurred, so callers must treat false as ambiguous rather than proof that
    *  zero bytes landed. `void`/`true` means the write was issued. */
   sendText?(text: string): void | boolean;
+  /** Unframed bytes in one operation, without argv size limits. Only for CLIs
+   * with synchronous native text/key parsing; control bytes are caller-owned. */
+  sendUnbracketedText?(text: string): void | boolean;
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
    *  Returns `false` on an unconfirmed write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;

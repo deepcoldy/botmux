@@ -30,6 +30,9 @@ import { join } from 'node:path';
  *                       (Ctrl+Q → remove);
  *   - `submit-delay`    milliseconds between sending a request and its
  *                       assignment.md section (default 300);
+ *   - `paste-delay`     clipboard probe delay before text appears in the
+ *                       composer; Enter is ignored while it is pending;
+ *   - `paste-hold`      keep the clipboard probe pending until removed;
  *   - `row-first`       the request's `role:user` trajectory row lands first,
  *                       its assignment.md section this many ms later;
  *   - `row-after`       the section lands first, the request row this many
@@ -86,6 +89,8 @@ const exported = has('export.json') ? JSON.parse(fs.readFileSync(EXPORT, 'utf8')
 
 let composer = '';
 let pasted = 0;
+let pendingPaste = false;
+let pasteGeneration = 0;
 let turn = null;            // { n, startedAt, midDone }
 let background = null;      // { startedAt }
 let turnCount = 0;
@@ -156,10 +161,11 @@ function pump() {
 }
 
 function submit() {
-  if (!composer) return;
+  if (!composer || pendingPaste) return;
   if (has('drop-enter')) return;
   const text = composer;
   composer = '';
+  pasted = 0;
   if (has('background-busy') && !turn && !background) background = { startedAt: Date.now() };
   queue.push(text);
   pump();
@@ -184,8 +190,18 @@ process.stdin.on('data', chunk => {
       pending = pending.slice(end + 6);
       inPaste = false;
       const text = pasteBuf.replace(/\\r\\n?/g, '\\n');
-      if (text.split('\\n').length >= 4) pasted++;
-      composer += text;
+      const generation = ++pasteGeneration;
+      pendingPaste = true;
+      const readyAt = Date.now() + (Number(read('paste-delay')) || 0);
+      const finishPaste = () => {
+        if (generation !== pasteGeneration) return;
+        if (has('paste-hold') || Date.now() < readyAt) { setTimeout(finishPaste, 50); return; }
+        pendingPaste = false;
+        if (text.split('\\n').length >= 4) pasted++;
+        composer += text;
+        render();
+      };
+      setTimeout(finishPaste, 0);
       pasteBuf = '';
       continue;
     }
@@ -199,8 +215,10 @@ process.stdin.on('data', chunk => {
     }
     const ch = pending[0];
     pending = pending.slice(1);
-    if (ch === '\\r' || ch === '\\n') submit();
+    if (ch === '\\r' || ch === '\\x13') submit();
+    else if (ch === '\\n') composer += '\\n';
     else if (ch === '\\x7f') composer = composer.slice(0, -1);
+    else if (ch === '\\x15') { composer = ''; pasted = 0; pendingPaste = false; pasteGeneration++; }
     else if (ch === '\\x03') process.exit(0);
     else if (ch >= ' ') composer += ch;
   }

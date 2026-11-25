@@ -22224,6 +22224,18 @@ function settleBackendScreenBeforeIdle(
 /** Submission writes must surface ZMX's explicit false result, while its
  * best-effort navigation/startup keystrokes keep their non-throwing contract. */
 function adapterInputHandle(target: SessionBackend): PtyHandle {
+  if (target instanceof PtyBackend && lastInitConfig?.cliId === 'doubao') {
+    return {
+      write: data => target.write(data),
+      captureViewportAsync: async () => {
+        const screen = renderer;
+        if (backend !== target || !screen) return '';
+        await screen.writeAndFlush('');
+        return backend === target && renderer === screen
+          ? screen.rawSnapshot({ preserveFormatting: true }) : '';
+      },
+    };
+  }
   return target instanceof ZmxBackend
     ? strictInputHandle(target)
     : target;
@@ -25725,6 +25737,8 @@ async function flushPending(): Promise<void> {
       const writeBackend = backend;
       const writeAdapter = cliAdapter;
       const writeRpcEngine = codexRpcEngine;
+      const writeInterruptGeneration = cliInterruptGeneration;
+      const writeWebInputGeneration = webTerminalInputGeneration;
       const writeContinuationIsCurrent = (): boolean => (
         cliSpawnGeneration === writeGeneration
         && backend === writeBackend
@@ -26200,6 +26214,16 @@ async function flushPending(): Promise<void> {
                 ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
                 ...(lastInitConfig?.cliId === 'traex' ? { submitGuard: traexQuestionSubmitGuard(item) } : {}),
+                ...(lastInitConfig?.cliId === 'doubao' ? { submitGuard: {
+                  current: () => writeContinuationIsCurrent()
+                    && !closeRequested
+                    && cliInterruptGeneration === writeInterruptGeneration
+                    && webTerminalInputGeneration === writeWebInputGeneration
+                    && !webTerminalInputWireDirty(),
+                  blocked: async () => undefined,
+                  maxWaitMs: 0,
+                  pollMs: 0,
+                } } : {}),
               },
             ),
             settleVerifiableSubmissionForJournal,

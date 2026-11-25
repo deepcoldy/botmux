@@ -21,6 +21,7 @@ import {
   DOUBAO_BUSY_FOOTER,
   DOUBAO_QUEUE_LINE,
   doubaoComposerState,
+  doubaoComposerMatchesPaste,
   doubaoScreenHoldsSubmittedInput,
   doubaoScreenShowsNoPendingInput,
 } from './doubao-screen.js';
@@ -277,6 +278,7 @@ export const DOUBAO_SUBMIT_RECEIPT_BUDGET_MS = 10_000;
 /** The composer is read no earlier than this after Enter: Doubao clears it
  *  synchronously on accept, but the pane needs a repaint to show that. */
 const DOUBAO_COMPOSER_SETTLE_MS = 1_000;
+const DOUBAO_PASTE_READY_BUDGET_MS = 8_000;
 
 const DOUBAO_PASTE_NOT_DELIVERED = 'The terminal did not confirm the paste and the Doubao input box is still empty; Enter was not sent. Retry the message.';
 
@@ -567,7 +569,7 @@ export function createDoubaoAdapter(pathOverride?: string, deps: {
       return doubaoSessionExists(cliSessionId);
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
+    async writeInput(pty: PtyHandle, content: string, context) {
       const current = launch;
       const launchCapture = current.capture;
       const submittedContent = launchCapture
@@ -613,21 +615,62 @@ export function createDoubaoAdapter(pathOverride?: string, deps: {
       // content (large pastes collapse to `[Pasted text #n +N lines]` and are
       // expanded verbatim on submit); only the following Enter submits.
       // Per-line send-keys would turn each embedded newline into Enter.
-      if (pty.pasteText && pty.sendSpecialKeys) {
-        if (pty.pasteText(submittedContent) === false) {
-          // Never follow an unconfirmed paste with Enter. An empty composer
-          // proves nothing landed; anything else may be a partial draft.
-          const screen = await captureDoubaoScreen(pty);
-          return screen && doubaoComposerState(screen) === 'empty'
-            ? { submitted: false, failureReason: DOUBAO_PASTE_NOT_DELIVERED }
-            : { submitted: false, recheck: receipt };
+      const initialScreen = await captureDoubaoScreen(pty);
+      if (current !== launch || context?.submitGuard?.current() === false) return { submitted: false, recheck: receipt };
+      context?.submitGuard?.beforeWrite?.();
+      if (!initialScreen || doubaoComposerState(initialScreen) !== 'empty') {
+        return { submitted: false, failureReason: 'Doubao input box is not confirmed empty; no paste or Enter was sent.' };
+      }
+      // Doubao's native key parser inserts printable text synchronously; LF is
+      // Ctrl+J (newline) and Ctrl+S submits even after a trailing backslash.
+      // One literal write avoids both the clipboard probe and a delayed Enter
+      // taking over a human's replacement draft. Control-bearing text must not
+      // be interpreted as terminal keys; retain the safe paste path for it.
+      const literalContent = submittedContent.replace(/\r\n?/g, '\n');
+      if (!/[\x00-\x09\x0b-\x1f\x7f-\x9f]/.test(literalContent)) {
+        const input = `${literalContent}\x13`;
+        const sent = pty.sendUnbracketedText ? pty.sendUnbracketedText(input)
+          : pty.sendText ? pty.sendText(input) : pty.write(input);
+        if (sent === false) return { submitted: false, recheck: receipt };
+        return awaitDoubaoSubmitReceipt(pty, receipt, {
+          budgetMs: launchCapture ? DOUBAO_SUBMIT_CAPTURE_BUDGET_MS : DOUBAO_SUBMIT_RECEIPT_BUDGET_MS,
+          ...deps.submitClock,
+        });
+      }
+      const paste = pty.pasteText && pty.sendSpecialKeys
+        ? () => pty.pasteText!(submittedContent)
+        : () => pty.write(wrapBracketedPaste(submittedContent));
+      if (paste() === false) {
+        // Never follow an unconfirmed paste with Enter. An empty composer
+        // proves nothing landed; anything else may be a partial draft.
+        const screen = await captureDoubaoScreen(pty);
+        return screen && doubaoComposerState(screen) === 'empty'
+          ? { submitted: false, failureReason: DOUBAO_PASTE_NOT_DELIVERED }
+          : { submitted: false, recheck: receipt };
+      }
+      // 2.37 probes clipboard images asynchronously even for text. Enter while
+      // pendingPaste is true is dropped. Its draft render is the readiness
+      // receipt; wait for it rather than retrying Enter after an ambiguous send.
+      const pasteNow = deps.submitClock?.now ?? Date.now;
+      const pasteSleep = deps.submitClock?.sleep ?? delay;
+      const pasteDeadline = pasteNow() + DOUBAO_PASTE_READY_BUDGET_MS;
+      for (;;) {
+        const hit = receipt();
+        if (hit && typeof hit === 'object' && hit.submitted) return hit;
+        if (current !== launch || context?.submitGuard?.current() === false) return { submitted: false, recheck: receipt };
+        const screen = await captureDoubaoScreen(pty);
+        if (current !== launch || context?.submitGuard?.current() === false) return { submitted: false, recheck: receipt };
+        if (screen && doubaoComposerMatchesPaste(screen, submittedContent)) {
+          const accepted = receipt();
+          if (accepted && typeof accepted === 'object' && accepted.submitted) return accepted;
+          const sent = pty.pasteText && pty.sendSpecialKeys ? pty.sendSpecialKeys('Enter') : pty.write('\r');
+          if (sent === false) return { submitted: false, recheck: receipt };
+          break;
         }
-        await delay(300);
-        if (pty.sendSpecialKeys('Enter') === false) return { submitted: false, recheck: receipt };
-      } else {
-        if (pty.write(wrapBracketedPaste(submittedContent)) === false) return { submitted: false, recheck: receipt };
-        await delay(1000);
-        if (pty.write('\r') === false) return { submitted: false, recheck: receipt };
+        if ((screen && doubaoComposerState(screen) === 'draft') || pasteNow() >= pasteDeadline) {
+          return { submitted: false, recheck: receipt };
+        }
+        await pasteSleep(DOUBAO_SUBMIT_CAPTURE_INTERVAL_MS);
       }
       // assignment.md is appended once doubao sends the turn (later on a cold
       // service start, see DOUBAO_SUBMIT_CAPTURE_BUDGET_MS). A capture miss

@@ -37,7 +37,7 @@ export type DoubaoComposerState = 'empty' | 'draft' | 'unknown';
  * an empty composer renders its placeholder there. `unknown` when no such row
  * is on screen (startup, a panel covering the conversation).
  */
-export function doubaoComposerState(screen: string): DoubaoComposerState {
+export function doubaoComposerText(screen: string): string | undefined {
   const lines = stripAnsiScreenText(screen).split(/\r?\n/);
   for (let i = lines.length - 1; i > 0; i--) {
     const row = /^\s*❯\s?(.*)$/.exec(lines[i]!);
@@ -51,9 +51,22 @@ export function doubaoComposerState(screen: string): DoubaoComposerState {
       body.push(continuation[1]!);
     }
     const text = body.join(' ').trim();
-    return !text || DOUBAO_COMPOSER_PLACEHOLDER.test(text) ? 'empty' : 'draft';
+    return DOUBAO_COMPOSER_PLACEHOLDER.test(text) ? '' : text;
   }
-  return 'unknown';
+  return undefined;
+}
+
+export function doubaoComposerState(screen: string): DoubaoComposerState {
+  const text = doubaoComposerText(screen);
+  return text === undefined ? 'unknown' : text ? 'draft' : 'empty';
+}
+
+/** Only a fully visible draft can prove paste readiness. A collapsed label
+ * exposes a line count, not the text: a same-sized human replacement is ambiguous. */
+export function doubaoComposerMatchesPaste(screen: string, content: string): boolean {
+  const text = doubaoComposerText(screen);
+  if (content.replace(/\r\n?/g, '\n').split('\n').length >= 4) return false;
+  return text !== undefined && text.replace(/\s+/g, ' ') === content.replace(/\s+/g, ' ').trim();
 }
 
 /** Doubao is visibly still holding input it already took: a turn is running
