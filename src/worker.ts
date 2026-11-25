@@ -76,6 +76,8 @@ import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrap
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { workerCliExecutionReport } from './core/cli-execution-mode.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
+import { ProtectedResultStore } from './services/protected-result-store.js';
+import { protectedResultProfileAvailable } from './services/protected-result-delivery.js';
 import { tokenStoreProtection, capabilityOn, larkUserNative } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
@@ -168,8 +170,8 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, ABSORBED_REPLY_MAX_CHARS, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, liveFoldedReplyUuids, noteHostFinalCarried, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -468,7 +470,8 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, readCodexLiveSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, readCodexLiveSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, codexRolloutHasAsyncQuestionReply, findPendingCodexAsyncQuestion, selectNewCodexAsyncQuestions, type CodexAsyncQuestionRecord, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { parseCodexAsyncQuestions } from './services/codex-async-user-input.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
@@ -487,7 +490,8 @@ import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
-import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
+import type { AskQuestion } from './core/ask-types.js';
+import { traexQuestionFlowVisible, traexPendingAsyncQuestionCount, traexPendingAsyncQuestionVisible, parseTraexQuestionPage, traexQuestionSignature, traexQuestionState, type TraexQuestionPage } from './utils/traex-question-page.js';
 import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession, doubaoLiveUser } from './services/doubao-transcript.js';
@@ -522,15 +526,20 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
+  countAntigravityUserInputMatches,
+  hashAntigravitySubmittedText,
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
   hasAntigravityPendingTasks,
   hasAntigravityTranscriptPendingTasks,
   drainAntigravityTranscript,
+  findCompletedAntigravityTurnIds,
   readAntigravitySideAnswer,
+  resolveAntigravityCandidateMinByteOffset,
   resolveAntigravityTranscriptPath,
+  type AntigravityCompletedTurnCandidate,
   type AntigravityTranscriptState,
 } from './services/antigravity-transcript.js';
 import {
@@ -659,7 +668,7 @@ import {
 import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from './core/rewind-backup-retention.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, CliLaunchNotice, PtyHandle, SessionRenameSurface, SubmitGuard, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
-import { decideSessionRenameSettlement, sessionRenameWriteFailureAction } from './core/session-rename-settlement.js';
+import { decideSessionRenameSettlement, sessionRenameWriteFailureAction, shouldRecoverUnconfirmedSessionRename } from './core/session-rename-settlement.js';
 import { detectCliStartupBlocker, screenMayShowCredential, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
 import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
@@ -1658,6 +1667,9 @@ function queuePostSubmitNativeSessionTitle(title: string | undefined): boolean {
   if (!supportsPostSubmitRenameSessionTitle(cfg.cliId)) return false;
   if (codexRpcEngine || remoteWsUrl) return false;
   if (!cliAdapter?.buildSessionRenameCommand) return false;
+  // A failed cosmetic sync must not re-arm itself after its recovery restart.
+  // Explicit rename_session requests can still retry the title normally.
+  if (cliAdapter.buildSessionRenameCommand(trimmed) === abandonedAutomaticRenameCommand) return false;
   if (isRemoteBackendType(effectiveBackendType)) return false;
   nativeSessionTitleRevision += 1;
   nativeSessionTitleAppliedThreadId = undefined;
@@ -2336,7 +2348,11 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // A failed-turn rewind is reported from inside a CLI restart: the runtime
   // it began under is being retired and the message's turn has not run yet.
   // It is this worker's account of its own input queue, like the backlog.
-  if (msg.type === 'cli_input_backlog' || msg.type === 'failed_turn_rewind') {
+  // Type-ahead registrations, drops and restore snapshots are queue observations
+  // too: they may name a queued execution, but never assert that it has started.
+  if (msg.type === 'cli_input_backlog' || msg.type === 'failed_turn_rewind'
+    || msg.type === 'type_ahead_queued' || msg.type === 'type_ahead_turn_dropped'
+    || msg.type === 'type_ahead_queue_snapshot') {
     delete context.scope.execution;
     delete context.scope.runtime;
     delete context.scope.operationId;
@@ -2751,6 +2767,7 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     expiresAt: artifact.expiresAt,
     fileCount: artifact.fileCount,
     responseKind: resolvedDelivery.responseKind ?? 'final',
+    ...(resolvedDelivery.readPolicy ? { readPolicy: resolvedDelivery.readPolicy } : {}),
   };
   const scopedPayload = sessionEventMetadata(payload, sessionOrigin);
   try {
@@ -2796,6 +2813,7 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     delivered: true as const,
     deliveryId: resolvedDelivery.deliveryId,
     fileCount: resolvedDelivery.files?.length ?? 0,
+    messageIds: response.messageIds,
   };
 };
 /** Counts consecutive in-worker restart cycles (see case 'restart'). Used by
@@ -3111,6 +3129,23 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     dataDir: config.session.dataDir,
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
     trustedResultDelivery: deliverPluginResultThroughHost,
+    ...(lastInitConfig?.protectedResults === true ? {
+      protectedResultDeliveryAvailable: () => protectedResultProfileAvailable({
+        enabled: lastInitConfig?.protectedResults === true,
+        withholdCredentials: lastInitConfig?.sandboxWithholdBotSecret === true,
+        sandboxMode: lastResolvedSandboxMode,
+        managedBinding: !!lastInitConfig && usesLarkToolBinding(lastInitConfig, config.session.dataDir, isWorkflowWorker()),
+        platform: process.platform,
+      }),
+      trustedResultStatus: async ({ identity, pluginId, deliveryId }) => {
+        const cfg = lastInitConfig;
+        if (!cfg || identity.caller?.senderType !== 'user' || !identity.caller.requestUserUnionId
+          || identity.caller.requestLarkAppId !== cfg.larkAppId) throw new Error('protected_result_status_identity_required');
+        return new ProtectedResultStore(config.session.dataDir).statusForCaller({
+          appId: cfg.larkAppId, sessionId, ownerUnionId: identity.caller.requestUserUnionId, chatId: cfg.chatId,
+        }, pluginId, deliveryId);
+      },
+    } : {}),
     linkRefRegistration: registerMcpLinkRefsThroughHost,
     requestProtectedSecretChannel: requestProtectedSecretChannel,
     protectedMcpPolicy: lastInitConfig?.protectedMcpPolicy,
@@ -6248,6 +6283,11 @@ const SESSION_RENAME_IDLE_TIMEOUT_MS = 5_000;
 const SESSION_RENAME_RECHECK_MS = 2_000;
 const SESSION_RENAME_SLOW_RECHECK_MS = 10_000;
 const SESSION_RENAME_FAST_RECHECK_WINDOW_MS = 30_000;
+const SESSION_RENAME_RECOVERY_AFTER_MS = 60_000;
+/** Worker-lifetime latches: killCli clears the in-flight rename, not these.
+ * One recovery cannot loop into another restart or spend the FRESH budget. */
+let sessionRenameRecoveryUsed = false;
+let abandonedAutomaticRenameCommand: string | undefined;
 let sessionRenameIdleTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionRenameReattachRetryTimer: ReturnType<typeof setTimeout> | null = null;
 /** The rename in flight: the exact command typed, the adapter's durable-record
@@ -6380,6 +6420,50 @@ function notifySessionRenameInputHeld(): void {
   });
 }
 
+function recoverUnconfirmedSessionRename(surface: SessionRenameSurface | undefined): boolean {
+  const mayRestart = !!backend && lastInitConfig?.cliId === 'traex'
+    && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
+    && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)
+    && !closeRequested && !cliRestartInProgress && !rawInputRestartGate && !codexAutoUpgrade
+    && !pendingWebTerminalInput() && commandLineWritesPending === 0
+    && !isFlushing && !injectionFlushing;
+  if (!shouldRecoverUnconfirmedSessionRename({
+    surface,
+    elapsedMs: Date.now() - sessionRenameSentAtMs,
+    timeoutMs: SESSION_RENAME_RECOVERY_AFTER_MS,
+    hasQueuedInput: pendingMessages.length > 0 || pendingRawInputs.length > 0,
+    alreadyRecovered: sessionRenameRecoveryUsed,
+    mayRestart,
+  })) return false;
+  // The init-time resume target alone is not evidence. Never trade a missing
+  // receipt for a fresh conversation or restart somebody else's adopted CLI.
+  const nativeSessionId = sessionRenameNativeSessionIdNow();
+  if (!nativeSessionId) return false;
+  // A user may have switched native threads from the terminal since the
+  // rename started. Recheck the live process rather than trusting the cached
+  // receipt identity, and refuse an ambiguous multi-thread FD set.
+  const pid = currentTraexObservedPid();
+  const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
+  if (!owned || owned.size !== 1 || !(owned.has(nativeSessionId) || owned.has(nativeSessionId.toLowerCase()))) return false;
+  sessionRenameRecoveryUsed = true;
+  abandonedAutomaticRenameCommand = sessionRenameCommand;
+  const head = pendingMessages[0];
+  const rawHead = pendingRawInputs[0];
+  send({
+    type: 'user_notify', turnId: head?.turnId ?? rawHead?.turnId,
+    dispatchAttempt: head?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+    message: t('worker.session_rename_recovering', { cliName: cliName() }),
+  });
+  log('Native session rename receipt timed out at an empty composer; restarting the owned CLI with queued input preserved');
+  // Keep the old rename fenced until teardown. The replacement process has
+  // no stale composer/paste buffer, so its normal ready gate may drain input.
+  void restartCliProcess('native session rename receipt timeout', {
+    immediate: true, preservePending: true, skipRestartBudget: true,
+    exactResumeSessionId: nativeSessionId,
+  });
+  return true;
+}
+
 /** Judge the rename in flight and act on it: release queued input, press the
  *  one recovery Enter, or keep holding and re-read. `prompt` is a screen-idle
  *  edge (markPromptReady already restores readiness and flushes); `timer` is
@@ -6427,6 +6511,7 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
     log(`Native session rename not confirmed (${surface}${sessionRenameResubmitted ? ' after one resubmit' : ''}); holding queued input until this rename is recorded and the ${cliName()} input surface is writable`);
   }
   notifySessionRenameInputHeld();
+  if (recoverUnconfirmedSessionRename(surface)) return;
   armSessionRenameIdleTimeout(Date.now() - sessionRenameSentAtMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
     ? SESSION_RENAME_RECHECK_MS : SESSION_RENAME_SLOW_RECHECK_MS);
 }
@@ -6886,6 +6971,12 @@ function setCaptureIdentity(
 }
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let currentTurnSteerPromoted = false;
+interface AntigravityReconcileHint {
+  textSha256: string;
+  sampledTranscriptPath?: string;
+  minByteOffset?: number;
+  skipPriorMatches?: number;
+}
 interface QueuedTypeAheadTurnRecord {
   turnId: string;
   inputConsumed?: true;
@@ -6896,6 +6987,7 @@ interface QueuedTypeAheadTurnRecord {
   trustedController?: TrustedCaller;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   turnCallerOpenId?: string;
+  antigravityReconcileHint?: AntigravityReconcileHint;
 }
 let queuedTypeAheadTurns: QueuedTypeAheadTurnRecord[] = [];
 /** Newest type-ahead turn retired at its terminal while folded into the turn
@@ -6926,6 +7018,117 @@ function markTurnRetired(turnId?: string): void {
     const oldest = retiredTurnIds.values().next().value;
     if (oldest) retiredTurnIds.delete(oldest);
   }
+}
+/** 仅保留最近写入 PTY 的非 durable 回合正文及其写入前 transcript 采样证据，
+ *  用于 Antigravity 折叠回合在 prompt_ready 时核对原生 transcript 消费与完成证据。 */
+const recentSubmittedTurnTexts = new Map<string, {
+  text: string;
+  textSha256?: string;
+  sampledTranscriptPath?: string;
+  minByteOffset?: number;
+  skipPriorMatches?: number;
+}>();
+function rememberSubmittedTurnText(
+  turnId: string | undefined,
+  content: string | undefined,
+  dispatchAttempt: number | undefined,
+  opts?: { isTypeAhead?: boolean },
+): AntigravityReconcileHint | undefined {
+  if (!turnId || !content || dispatchAttempt !== undefined) return undefined;
+  const textSha256 = typeof hashAntigravitySubmittedText === 'function'
+    ? hashAntigravitySubmittedText(content)
+    : undefined;
+  let sampledTranscriptPath: string | undefined;
+  let minByteOffset: number | undefined;
+  let skipPriorMatches = 0;
+  if (lastInitConfig?.cliId === 'antigravity' && !isRemoteBackendType(effectiveBackendType)) {
+    const cid = inputDeliveryObservedCliSessionId ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+    const transcriptPath = cid ? resolveAntigravityTranscriptPath(cid) : null;
+    if (transcriptPath) {
+      sampledTranscriptPath = transcriptPath;
+      try {
+        minByteOffset = statSync(transcriptPath).size;
+      } catch {
+        minByteOffset = 0;
+      }
+    } else {
+      minByteOffset = 0;
+    }
+
+    const isUnflushedSameTextHint = (prev: {
+      textSha256?: string;
+      sampledTranscriptPath?: string;
+      minByteOffset?: number;
+      skipPriorMatches?: number;
+    }): boolean => {
+      if (!textSha256 || prev.textSha256 !== textSha256) return false;
+      if (!sampledTranscriptPath || minByteOffset === undefined || minByteOffset === 0) return true;
+      const prevOffset = typeof resolveAntigravityCandidateMinByteOffset === 'function'
+        ? resolveAntigravityCandidateMinByteOffset(prev, sampledTranscriptPath)
+        : prev.minByteOffset;
+      if (prevOffset === null || prevOffset === undefined || prevOffset >= minByteOffset) return true;
+      const flushed = typeof countAntigravityUserInputMatches === 'function'
+        ? countAntigravityUserInputMatches(sampledTranscriptPath, textSha256, prevOffset, minByteOffset)
+        : 0;
+      return flushed < (prev.skipPriorMatches ?? 0) + 1;
+    };
+
+    const countedPriorIds = new Set<string>();
+    for (const [otherId, other] of recentSubmittedTurnTexts) {
+      if (otherId === turnId || retiredTurnIds.has(otherId)) continue;
+      if (isUnflushedSameTextHint(other)) {
+        skipPriorMatches += 1;
+        countedPriorIds.add(otherId);
+      }
+    }
+    const priorLiveTurnIds: string[] = [];
+    if (currentBotmuxTurnId && currentBotmuxTurnId !== turnId && !retiredTurnIds.has(currentBotmuxTurnId)) {
+      priorLiveTurnIds.push(currentBotmuxTurnId);
+    }
+    for (const q of queuedTypeAheadTurns) {
+      if (q.turnId === turnId) break;
+      if (!retiredTurnIds.has(q.turnId) && !priorLiveTurnIds.includes(q.turnId)) {
+        priorLiveTurnIds.push(q.turnId);
+      }
+    }
+    for (const prevId of priorLiveTurnIds) {
+      if (countedPriorIds.has(prevId)) continue;
+      const qHint = queuedTypeAheadTurns.find(q => q.turnId === prevId)?.antigravityReconcileHint;
+      if (qHint) {
+        if (isUnflushedSameTextHint(qHint)) {
+          skipPriorMatches += 1;
+          countedPriorIds.add(prevId);
+        }
+      } else if (!recentSubmittedTurnTexts.has(prevId) && (!sampledTranscriptPath || minByteOffset === 0)) {
+        skipPriorMatches += 1;
+        countedPriorIds.add(prevId);
+      }
+    }
+    if (opts?.isTypeAhead === true && countedPriorIds.size === 0 && (!sampledTranscriptPath || minByteOffset === 0)) {
+      skipPriorMatches += 1;
+    }
+  }
+  const record = {
+    text: content,
+    ...(textSha256 ? { textSha256 } : {}),
+    ...(sampledTranscriptPath ? { sampledTranscriptPath } : {}),
+    minByteOffset,
+    ...(skipPriorMatches > 0 ? { skipPriorMatches } : {}),
+  };
+  recentSubmittedTurnTexts.delete(turnId);
+  recentSubmittedTurnTexts.set(turnId, record);
+  if (recentSubmittedTurnTexts.size > 64) {
+    const oldest = recentSubmittedTurnTexts.keys().next().value;
+    if (oldest) recentSubmittedTurnTexts.delete(oldest);
+  }
+  return textSha256
+    ? {
+        textSha256,
+        ...(sampledTranscriptPath ? { sampledTranscriptPath } : {}),
+        ...(minByteOffset !== undefined ? { minByteOffset } : {}),
+        ...(skipPriorMatches > 0 ? { skipPriorMatches } : {}),
+      }
+    : undefined;
 }
 let durableTurnInFlight = false;
 /** A remote provider declared one already-submitted turn during resume. This is
@@ -8525,6 +8728,9 @@ function writeCliPidMarker(): void {
                     ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
                     ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
                     ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
+                    ...(qt.antigravityReconcileHint && typeof qt.antigravityReconcileHint.textSha256 === 'string'
+                      ? { antigravityReconcileHint: qt.antigravityReconcileHint }
+                      : {}),
                   });
                 }
               }
@@ -8537,20 +8743,37 @@ function writeCliPidMarker(): void {
         const procStart = Number.isInteger(markerPid) && markerPid > 0
           ? readProcessStartIdentity(markerPid)
           : undefined;
-        const queuedTurns = queuedTypeAheadTurns.map(t => ({
-          turnId: t.turnId,
-          ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
-          ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
-          ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
-          ...(t.linkRefMode ? { linkRefMode: t.linkRefMode } : {}),
-          ...(t.trustedCaller ? { trustedCaller: t.trustedCaller } : {}),
-          ...(t.trustedController ? { trustedController: t.trustedController } : {}),
-          ...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {}),
-        }));
+        const hintForTurn = (tid: string | undefined, inlineHint?: AntigravityReconcileHint): AntigravityReconcileHint | undefined => {
+          if (inlineHint && typeof inlineHint.textSha256 === 'string') return inlineHint;
+          if (!tid || typeof recentSubmittedTurnTexts === 'undefined') return undefined;
+          const rec = recentSubmittedTurnTexts.get(tid);
+          if (!rec || typeof rec !== 'object' || typeof rec.textSha256 !== 'string') return undefined;
+          return {
+            textSha256: rec.textSha256,
+            ...(rec.sampledTranscriptPath ? { sampledTranscriptPath: rec.sampledTranscriptPath } : {}),
+            ...(rec.minByteOffset !== undefined ? { minByteOffset: rec.minByteOffset } : {}),
+            ...(rec.skipPriorMatches !== undefined && rec.skipPriorMatches > 0 ? { skipPriorMatches: rec.skipPriorMatches } : {}),
+          };
+        };
+        const queuedTurns = queuedTypeAheadTurns.map(t => {
+          const reconcileHint = hintForTurn(t.turnId, t.antigravityReconcileHint);
+          return {
+            turnId: t.turnId,
+            ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
+            ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
+            ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
+            ...(t.linkRefMode ? { linkRefMode: t.linkRefMode } : {}),
+            ...(t.trustedCaller ? { trustedCaller: t.trustedCaller } : {}),
+            ...(t.trustedController ? { trustedController: t.trustedController } : {}),
+            ...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {}),
+            ...(reconcileHint ? { antigravityReconcileHint: reconcileHint } : {}),
+          };
+        });
         const queuedTurnId = queuedTurns[0]?.turnId;
         const authority = activeTurnAuthority.snapshot();
         const effectiveCaller = authority?.caller;
         const effectiveController = authority?.controller;
+        const activeReconcileHint = hintForTurn(currentBotmuxTurnId);
         atomicWriteFileSync(markerPath, JSON.stringify({
           sessionId,
           turnId: currentBotmuxTurnId ?? null,
@@ -8560,6 +8783,7 @@ function writeCliPidMarker(): void {
           ...(authority?.identityTurnId ? { identityTurnId: authority.identityTurnId } : {}),
           ...(effectiveCaller ? { trustedCaller: effectiveCaller } : {}),
           ...(effectiveController ? { trustedController: effectiveController } : {}),
+          ...(activeReconcileHint ? { antigravityReconcileHint: activeReconcileHint } : {}),
           ...(queuedTurnId ? { queuedTurnId } : {}),
           ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
           ...(procStart ? { procStart } : {}),
@@ -8682,9 +8906,13 @@ function bindCliPidMarker(markerPath: string, pid: number): void {
     && (currentBotmuxTurnId !== turnBefore || currentBotmuxDispatchAttempt !== attemptBefore)) {
     log(`Restored executing turn ${currentBotmuxTurnId.slice(0, 12)} from the CLI PID marker`);
     // On success its tail rewrites the marker with the fresh capability.
-    if (publishSandboxRelayCapability()) return;
+    if (publishSandboxRelayCapability()) {
+      send({ type: 'type_ahead_queue_snapshot', turnIds: queuedTypeAheadTurns.map(turn => turn.turnId) });
+      return;
+    }
   }
   writeCliPidMarker();
+  send({ type: 'type_ahead_queue_snapshot', turnIds: queuedTypeAheadTurns.map(turn => turn.turnId) });
 }
 
 function syncQueuedTurnsFromMarkerDisk(): boolean {
@@ -8783,6 +9011,143 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   publishSandboxRelayCapability();
   log(`Advanced active turn (${reason}): ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
   return true;
+}
+
+/** Antigravity 常规模式不经 transcript bridge 逐轮发 turn_terminal；多条 type-ahead 消息会被折叠进同一次运行。
+ *  在 prompt_ready 结算前，凭原生 transcript 中“已消费且后接完成态无工具 PLANNER_RESPONSE、且当前非忙碌”的精确证据，
+ *  回收已结束的非 durable 候选回合，避免迟读磁盘 marker 或队列推进重新占用已空闲 CLI 的 activeTurnAuthority。 */
+function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
+  if (lastInitConfig?.cliId !== 'antigravity' || isRemoteBackendType(effectiveBackendType)) return false;
+  const cliSessionId = inputDeliveryObservedCliSessionId ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  if (!cliSessionId) return false;
+
+  const diskTurnHeads: Array<{ turnId: string; dispatchAttempt?: number }> = [];
+  const diskQueuedTurns: Array<{ turnId: string; dispatchAttempt?: number }> = [];
+  const diskReconcileHints = new Map<string, AntigravityReconcileHint>();
+  for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
+    if (!markerPath || !existsSync(markerPath)) continue;
+    try {
+      withPidMarkerLock(markerPath, () => {
+        const parsed = JSON.parse(readFileSync(markerPath, 'utf-8'));
+        if (parsed && typeof parsed.turnId === 'string' && parsed.turnId) {
+          diskTurnHeads.push({
+            turnId: parsed.turnId,
+            ...(typeof parsed.dispatchAttempt === 'number' ? { dispatchAttempt: parsed.dispatchAttempt } : {}),
+          });
+          if (parsed.antigravityReconcileHint && typeof parsed.antigravityReconcileHint.textSha256 === 'string') {
+            diskReconcileHints.set(parsed.turnId, parsed.antigravityReconcileHint);
+          }
+        }
+        if (parsed && Array.isArray(parsed.queuedTurns)) {
+          for (const qt of parsed.queuedTurns) {
+            if (qt && typeof qt.turnId === 'string' && qt.turnId) {
+              diskQueuedTurns.push({
+                turnId: qt.turnId,
+                ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
+              });
+              if (qt.antigravityReconcileHint && typeof qt.antigravityReconcileHint.textSha256 === 'string') {
+                diskReconcileHints.set(qt.turnId, qt.antigravityReconcileHint);
+              }
+            }
+          }
+        }
+      });
+    } catch {
+      // ignore unreadable marker
+    }
+  }
+
+  const hasDiskDiff = diskTurnHeads.some(head => head.turnId !== currentBotmuxTurnId);
+  if (
+    queuedTypeAheadTurns.length === 0
+    && !queuedTurnAdvanceConsumedForPrompt
+    && !hasDiskDiff
+    && diskQueuedTurns.length === 0
+  ) {
+    return false;
+  }
+
+  const transcriptPath = resolveAntigravityTranscriptPath(cliSessionId);
+  if (!transcriptPath) return false;
+
+  const candidateIds = new Set<string>();
+  for (const queued of queuedTypeAheadTurns) {
+    if (queued.dispatchAttempt === undefined) candidateIds.add(queued.turnId);
+  }
+  const promotedCandidateId = queuedTurnAdvanceConsumedForPrompt?.promotedTurnId ?? currentBotmuxTurnId;
+  if (queuedTurnAdvanceConsumedForPrompt && promotedCandidateId && currentBotmuxDispatchAttempt === undefined) {
+    candidateIds.add(promotedCandidateId);
+  }
+  for (const head of diskTurnHeads) {
+    if (head.dispatchAttempt === undefined && head.turnId !== currentBotmuxTurnId) {
+      candidateIds.add(head.turnId);
+    }
+  }
+  for (const qt of diskQueuedTurns) {
+    if (qt.dispatchAttempt === undefined) candidateIds.add(qt.turnId);
+  }
+  if (candidateIds.size === 0) return false;
+
+  const candidates: AntigravityCompletedTurnCandidate[] = [...candidateIds].map(turnId => {
+    const remembered = recentSubmittedTurnTexts.get(turnId);
+    const queuedHint = queuedTypeAheadTurns.find(q => q.turnId === turnId)?.antigravityReconcileHint;
+    const diskHint = diskReconcileHints.get(turnId);
+    const hint = remembered ?? queuedHint ?? diskHint;
+    return {
+      turnId,
+      ...(remembered?.text ? { submittedText: remembered.text } : {}),
+      ...(hint?.textSha256 ? { submittedTextSha256: hint.textSha256 } : {}),
+      ...(hint?.sampledTranscriptPath ? { sampledTranscriptPath: hint.sampledTranscriptPath } : {}),
+      ...(hint?.minByteOffset !== undefined ? { minByteOffset: hint.minByteOffset } : {}),
+      ...(hint?.skipPriorMatches !== undefined && hint.skipPriorMatches > 0 ? { skipPriorMatches: hint.skipPriorMatches } : {}),
+    };
+  });
+  const completed = findCompletedAntigravityTurnIds(transcriptPath, candidates);
+  if (completed.size === 0) return false;
+
+  const hasLiveDurableSibling = (turnId: string): boolean => (
+    (currentBotmuxTurnId === turnId && currentBotmuxDispatchAttempt !== undefined)
+    || queuedTypeAheadTurns.some(t => t.turnId === turnId && t.dispatchAttempt !== undefined)
+    || diskTurnHeads.some(h => h.turnId === turnId && h.dispatchAttempt !== undefined)
+    || diskQueuedTurns.some(q => q.turnId === turnId && q.dispatchAttempt !== undefined)
+  );
+
+  const reconciled: string[] = [];
+  let needsMarkerRewrite = false;
+  for (const turnId of completed) {
+    const dropped = dropQueuedTurnRecord(turnId, undefined, { tombstone: false });
+    if (dropped) {
+      needsMarkerRewrite = true;
+      reconciled.push(turnId);
+    }
+    const durableSibling = hasLiveDurableSibling(turnId);
+    if (!durableSibling && turnId !== currentBotmuxTurnId) {
+      const alreadyRetired = retiredTurnIds.has(turnId);
+      markTurnRetired(turnId);
+      if (!alreadyRetired && !reconciled.includes(turnId)) reconciled.push(turnId);
+      if (diskTurnHeads.some(h => h.turnId === turnId) || diskQueuedTurns.some(q => q.turnId === turnId)) {
+        needsMarkerRewrite = true;
+      }
+    }
+  }
+
+  if (
+    queuedTurnAdvanceConsumedForPrompt
+    && promotedCandidateId
+    && currentBotmuxTurnId === promotedCandidateId
+    && currentBotmuxDispatchAttempt === undefined
+    && completed.has(promotedCandidateId)
+  ) {
+    queuedTurnAdvanceConsumedForPrompt = undefined;
+    if (!reconciled.includes(promotedCandidateId)) reconciled.push(promotedCandidateId);
+  }
+
+  if (reconciled.length > 0) {
+    log(`Reconciled completed Antigravity folded turn(s) at prompt_ready: ${reconciled.map(id => id.slice(0, 12)).join(', ')}`);
+    if (needsMarkerRewrite) writeCliPidMarker();
+    return true;
+  }
+  return false;
 }
 let lastStructuredBridgeActivityAtMs = 0;
 const codexAppTurnLiveness = new CodexAppTurnLiveness();
@@ -10188,6 +10553,17 @@ const backgroundTaskPins = new BackgroundTaskPinSnapshot();
  *  Rides on screen_update and changes no status decision; the daemon shows it
  *  on the card and keeps the session from being suspended while it is set. */
 let backgroundWaitTasks = 0;
+/** Antigravity 常规模式原生页脚报告的后台任务/计时器数；与前台 activeTurnAuthority 解耦，
+ *  仅经 refreshBackgroundWait 汇入 screen_update.backgroundTasks。 */
+let antigravityFooterBackgroundTasks = 0;
+
+function observeAntigravityFooterBackgroundTasks(screen: string | undefined): void {
+  if (lastInitConfig?.cliId !== 'antigravity' || !screen) return;
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
+  const parsed = parseAntigravityFooterBackgroundTasks(screen);
+  if (parsed === undefined) return;
+  antigravityFooterBackgroundTasks = parsed;
+}
 
 function backgroundWaitPayload(): { backgroundTasks?: number } {
   return backgroundWaitTasks > 0 ? { backgroundTasks: backgroundWaitTasks } : {};
@@ -10353,7 +10729,8 @@ function modelRequestPayload(): { awaySummaryPending: boolean; modelRequestSessi
 }
 
 function refreshBackgroundWait(): void {
-  const next = backgroundTaskTracker.backgroundWait();
+  const footerTasks = typeof antigravityFooterBackgroundTasks === 'number' ? antigravityFooterBackgroundTasks : 0;
+  const next = Math.max(backgroundTaskTracker.backgroundWait(), footerTasks);
   if (next > 0 && backgroundWaitTasks === 0) backgroundStopScanSinceMs = Date.now();
   if (next === 0) backgroundStopScanOffsets.clear();
   backgroundWaitTasks = next;
@@ -11015,26 +11392,161 @@ function observeThinkingAttribution(ev: TranscriptEvent, turn: BridgePendingTurn
 /** Per folded turn: the live trigger's state (takeAbsorbedReplyCandidates). */
 const absorbedReplyCollectors = new WeakMap<BridgePendingTurn, AbsorbedReplyCollector>();
 
-/** Opt-in per bot (followUpReply), fixed for this worker process. Off, a
- *  folded input is handled exactly as before: no reply of its own. */
+/** Opt-in per bot (followUpReply), as this worker process started with it.
+ *  Off, a folded input is handled exactly as before: no reply of its own. */
 function followUpReplyEnabled(): boolean {
   return lastInitConfig?.followUpReply === true;
 }
 
-/** Post a folded turn's reply and mark it answered. */
+/** The bot's followUpReply as the daemon last pushed it (set_follow_up_reply);
+ *  undefined until the switch changes after this worker started. */
+let followUpReplyLive: boolean | undefined;
+
+/** Live replies awaiting proof that the daemon actually posted them. Without
+ *  that proof their text remains eligible for the host turn's final. Bounded
+ *  because a failed delivery never gets a receipt; an evicted/late receipt is
+ *  deliberately ignored, which can duplicate but can never silently drop. */
+const pendingAbsorbedReplyDeliveries = new Map<string, { turn: BridgePendingTurn; uuids: string[] }>();
+const PENDING_ABSORBED_REPLY_DELIVERIES_MAX = 32;
+
+type EmitReadyTurnsOptions = {
+  explicitTerminalOnly?: boolean;
+  releaseHeldTerminals?: boolean;
+  /** Pass-through identity gate for the no-idle watchdog. */
+  onlyTurn?: { turnId: string; dispatchAttempt?: number };
+};
+
+/** A same-batch transcript read can finish its host before the daemon's POST
+ *  has even started. Defer that host briefly instead of posting both channels.
+ *  The bound covers the daemon's 0/5s/15s retry schedule plus transport slack;
+ *  after it, emitting the unfiltered final is the no-loss fallback. */
+const ABSORBED_REPLY_DELIVERY_WAIT_MS = 30_000;
+const deferredAbsorbedReplyFinals = new Map<BridgePendingTurn, {
+  opts: EmitReadyTurnsOptions;
+  timer: ReturnType<typeof setTimeout>;
+}>();
+
+function absorbedReplyDeliveryKey(turnId: string, dispatchAttempt: number | undefined, replyUuid: string): string {
+  return JSON.stringify([turnId, dispatchAttempt ?? null, replyUuid]);
+}
+
+/** The daemon pushed a change of the bot's followUpReply switch. */
+function setFollowUpReplyLive(enabled: boolean): void {
+  followUpReplyLive = enabled;
+  log(`followUpReply → ${enabled ? 'on' : 'off'}`);
+}
+
+/** A fresh accepted init is the config baseline. In particular, a live value
+ *  left by an earlier logical session must not override the new init config. */
+function resetFollowUpReplyStateForInit(): void {
+  followUpReplyLive = undefined;
+  pendingAbsorbedReplyDeliveries.clear();
+  for (const deferred of deferredAbsorbedReplyFinals.values()) clearTimeout(deferred.timer);
+  deferredAbsorbedReplyFinals.clear();
+}
+
+/** followUpReply for Claude Code adopt folds, which follows the switch while
+ *  the worker runs, as the daemon's posting gate does: a live reply leaves the
+ *  host turn's final only after its actual delivery is confirmed. Codex replies
+ *  leave nothing out of a final and keep the spawn-time value. */
+function foldReplyEnabled(): boolean {
+  return followUpReplyLive ?? followUpReplyEnabled();
+}
+
+/** Whether this host must wait for at least one live delivery receipt. */
+function hostWithPendingAbsorbedReply(host: BridgePendingTurn): boolean {
+  for (const pending of pendingAbsorbedReplyDeliveries.values()) {
+    if (host.absorbedTurns?.includes(pending.turn)) return true;
+  }
+  return false;
+}
+
+function deferredHostForAbsorbedReply(turn: BridgePendingTurn): BridgePendingTurn | undefined {
+  for (const host of deferredAbsorbedReplyFinals.keys()) {
+    if (host.absorbedTurns?.includes(turn)) return host;
+  }
+  return undefined;
+}
+
+function runDeferredAbsorbedReplyFinal(host: BridgePendingTurn): void {
+  const deferred = deferredAbsorbedReplyFinals.get(host);
+  if (!deferred) return;
+  clearTimeout(deferred.timer);
+  deferredAbsorbedReplyFinals.delete(host);
+  try { emitReadyTurns(deferred.opts); }
+  catch (error) { log(`Deferred folded-turn final failed: ${String(error)}`); }
+}
+
+function timeOutDeferredAbsorbedReplyFinal(host: BridgePendingTurn): void {
+  // Timeout is the decision to use the unfiltered final. Invalidate this host's
+  // pending receipts so the wait gate cannot simply re-arm itself; a late ACK
+  // then finds no entry and cannot retract text after the fallback went out.
+  for (const [key, pending] of pendingAbsorbedReplyDeliveries) {
+    if (host.absorbedTurns?.includes(pending.turn)) pendingAbsorbedReplyDeliveries.delete(key);
+  }
+  runDeferredAbsorbedReplyFinal(host);
+}
+
+function deferAbsorbedReplyFinal(host: BridgePendingTurn, opts: EmitReadyTurnsOptions): void {
+  if (deferredAbsorbedReplyFinals.has(host)) return;
+  const timer = setTimeout(() => timeOutDeferredAbsorbedReplyFinal(host), ABSORBED_REPLY_DELIVERY_WAIT_MS);
+  timer.unref?.();
+  deferredAbsorbedReplyFinals.set(host, { opts, timer });
+}
+
+/** Confirm the exact live reply the daemon posted. No receipt arrives for a
+ *  reply rejected by the live switch or one whose POST retries were exhausted. */
+function noteAbsorbedReplyDelivered(turnId: string, dispatchAttempt: number | undefined, replyUuid: string): void {
+  const key = absorbedReplyDeliveryKey(turnId, dispatchAttempt, replyUuid);
+  const pending = pendingAbsorbedReplyDeliveries.get(key);
+  if (!pending) return;
+  pendingAbsorbedReplyDeliveries.delete(key);
+  pending.turn.absorbedReplyDelivered = true;
+  pending.turn.absorbedReplyTextUuids = pending.uuids;
+  const host = deferredHostForAbsorbedReply(pending.turn);
+  // Partial confirmation must neither release the host early nor renew its
+  // no-loss timeout. The last pending receipt releases the original wait.
+  if (host && !hostWithPendingAbsorbedReply(host)) runDeferredAbsorbedReplyFinal(host);
+}
+
+/** Post a folded turn's reply and mark it handed to the daemon. */
 function sendAbsorbedReply(turn: BridgePendingTurn, reply: AbsorbedInputReply, when: 'live' | 'at turn end'): void {
+  const wholeText = reply.source === 'text' && reply.text.length <= ABSORBED_REPLY_MAX_CHARS;
+  const pendingKey = when === 'live' && wholeText
+    ? absorbedReplyDeliveryKey(turn.turnId, turn.dispatchAttempt, reply.lastUuid)
+    : undefined;
+  if (pendingKey) {
+    pendingAbsorbedReplyDeliveries.set(pendingKey, { turn, uuids: reply.uuids });
+    if (pendingAbsorbedReplyDeliveries.size > PENDING_ABSORBED_REPLY_DELIVERIES_MAX) {
+      pendingAbsorbedReplyDeliveries.delete(pendingAbsorbedReplyDeliveries.keys().next().value!);
+    }
+  }
+  try {
+    // Live receipts may be dispatched as soon as the daemon's POST completes;
+    // initialize the unconfirmed state before handing the message over.
+    turn.absorbedReplyDelivered = false;
+    turn.absorbedReplyTextUuids = [];
+    send({
+      type: 'absorbed_reply',
+      turnId: turn.turnId,
+      ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      answer: reply.text,
+      replyUuid: reply.lastUuid,
+      source: reply.source,
+      // The folded turn has no other reply. Under transcript delivery, which
+      // posts no completion receipt, it stands as the turn's final.
+      ...(replyDeliveryMode() === 'transcript' ? { turnReply: true as const } : {}),
+    });
+  } catch (error) {
+    if (pendingKey) pendingAbsorbedReplyDeliveries.delete(pendingKey);
+    delete turn.absorbedReplyTextUuids;
+    throw error;
+  }
+  // A synchronous IPC throw above leaves the reply to the host. A live reply's
+  // text is excluded later, only by noteAbsorbedReplyDelivered. At turn end the
+  // host final has already gone out, so there is no later exclusion to wait for.
   turn.absorbedReplySent = true;
-  send({
-    type: 'absorbed_reply',
-    turnId: turn.turnId,
-    ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
-    answer: reply.text,
-    replyUuid: reply.lastUuid,
-    source: reply.source,
-    // The folded turn has no other reply. Under transcript delivery, which
-    // posts no completion receipt, it stands as the turn's final.
-    ...(replyDeliveryMode() === 'transcript' ? { turnReply: true as const } : {}),
-  });
+  if (when === 'at turn end') turn.absorbedReplyTextUuids = wholeText ? reply.uuids : [];
   log(`Folded turn ${turn.turnId.substring(0, 8)} answered ${when} (${reply.source}, ${reply.text.length} chars)`);
 }
 
@@ -11047,7 +11559,7 @@ const FOLD_READ_OFFSETS_MAX = 32;
 
 /** Called by the polling read with the batch it is about to ingest. */
 function noteFoldReadOffsets(events: readonly TranscriptEvent[], path: string, batchOffset: number): void {
-  if (!followUpReplyEnabled()) return;
+  if (!foldReplyEnabled()) return;
   for (const ev of events) {
     if (!ev.uuid || !isMidTurnAbsorbedQueuedCommand(ev)) continue;
     foldReadOffsets.set(ev.uuid, { path, offset: batchOffset });
@@ -11075,7 +11587,7 @@ function readFoldReply(turn: BridgePendingTurn): AbsorbedInputReply | undefined 
  *  observer's local-turn exit. The reply is read from the transcript, not
  *  from what this observer saw: see takeAbsorbedReplyCandidates. */
 function observeAbsorbedReplies(ev: TranscriptEvent, host: BridgePendingTurn): void {
-  if (lastInitConfig?.adoptMode !== true || !followUpReplyEnabled() || !host.absorbedTurns?.length) return;
+  if (lastInitConfig?.adoptMode !== true || !foldReplyEnabled() || !host.absorbedTurns?.length) return;
   for (const turn of takeAbsorbedReplyCandidates(host, ev, absorbedReplyCollectors)) {
     const reply = readFoldReply(turn);
     if (reply) sendAbsorbedReply(turn, reply, 'live');
@@ -14252,6 +14764,10 @@ function stopBridgeWatcher(): void {
   // is cleared below (an exit outside drainReliableTerminalBeforeInterrupt:
   // ordinary and adopt turns), as it would have been without the hold.
   if (bridgeJsonlPath && bridgeBaselineDone) {
+    // Teardown must not clear a host that is parked only in the in-memory ACK
+    // wait. Synchronously choose its no-loss fallback before clearPending();
+    // the release-held pass below still covers a final awaiting its marker.
+    for (const host of [...deferredAbsorbedReplyFinals.keys()]) timeOutDeferredAbsorbedReplyFinal(host);
     try { emitReadyTurns({ explicitTerminalOnly: true, releaseHeldTerminals: true }); } catch (err: any) {
       log(`Bridge held-terminal release failed: ${err.message}`);
     }
@@ -14413,12 +14929,7 @@ function bridgeDrainAndMaybeEmit(opts: { releaseHeldTerminals?: boolean } = {}):
  *
  *  Caches per-path drains so a batch of turns from the same file only reads
  *  the transcript once (O(jsonl size) per distinct path). */
-function emitReadyTurns(opts: {
-  explicitTerminalOnly?: boolean;
-  releaseHeldTerminals?: boolean;
-  /** Pass-through identity gate for the no-idle watchdog. */
-  onlyTurn?: { turnId: string; dispatchAttempt?: number };
-} = {}): void {
+function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
   // Retire the journal entries of turns the queue dropped head-of-line. These
   // never reach `ready`, so this must run BEFORE the empty-`ready` early return
   // below — a drop very often coincides with a tick that emits nothing.
@@ -14429,13 +14940,17 @@ function emitReadyTurns(opts: {
       + `— it produced no assistant text and a newer turn started`);
   }
   const release = opts.releaseHeldTerminals ? { releaseHeldTerminals: true } : {};
+  // Adopt sessions never arm the open-turn watchdog and keep headless/fold
+  // attribution; tell the queue not to mint a Scenario 3 recovery anchor.
+  const queueAdoptMode = lastInitConfig?.adoptMode === true;
   const ready = bridgeQueue.drainEmittable(opts.explicitTerminalOnly
-    ? { explicitTerminalOnly: true, ...release, onlyTurn: opts.onlyTurn }
+    ? { explicitTerminalOnly: true, ...release, onlyTurn: opts.onlyTurn, adoptMode: queueAdoptMode }
     : {
         terminalBoundary: true,
         requireExplicitTerminalForDurable: true,
         ...release,
         onlyTurn: opts.onlyTurn,
+        adoptMode: queueAdoptMode,
       });
   if (ready.length === 0) return;
   const handoffPath = workerFinalOutputHandoff ? bridgeTurnJournalFilePath() : undefined;
@@ -14500,6 +15015,22 @@ function emitReadyTurns(opts: {
     // this worker generation. Re-freeze its exact journaled mode before the
     // final crosses workerIpcPayload, which deliberately ignores caller fields.
     rememberTurnLinkRefMode(turn.turnId, turn.dispatchAttempt, turn.linkRefMode);
+    // A release-held teardown pass must settle NOW, not create a new ACK wait
+    // immediately before clearPending(). Its unconfirmed uuid set is empty, so
+    // bypassing the wait takes the conservative full-final path.
+    if (!opts.releaseHeldTerminals && adoptMode && foldReplyEnabled() && turn.absorbedTurns?.length && hostWithPendingAbsorbedReply(turn)) {
+      // The live IPC and a batched terminal can be read in ONE worker stack.
+      // Wait for the daemon's actual POST rather than immediately including the
+      // same text in final_output and duplicating it when that POST succeeds.
+      // Failed hosts wait too: their timeout fallback is the folded turn's own
+      // final below, not the failed host's suppressed final.
+      deferAbsorbedReplyFinal(turn, opts);
+      const remaining = ready.slice(i);
+      bridgeQueue.restoreDrained(remaining);
+      for (const item of remaining) unsubmitted.add(item.turnId);
+      log(`Bridge final for turn ${turn.turnId.substring(0, 8)} waits for folded-reply delivery confirmation`);
+      break;
+    }
     // Claude API-error text is execution metadata, not a model answer. The
     // structured terminal below owns retry/attention; never leak the raw
     // provider error through transcript fallback (regardless of send markers).
@@ -14555,13 +15086,6 @@ function emitReadyTurns(opts: {
       explicitReplyMarkers,
     );
 
-    // A folded turn answered live while its host ran (observeAbsorbedReplies):
-    // its reply is out, so it settles without posting it a second time.
-    if (adoptMode && turn.absorbedReplySent) {
-      observedOutputTurns.add(turn);
-      continue;
-    }
-
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
     if (!path) continue;
     let drained = cache.get(path);
@@ -14569,23 +15093,67 @@ function emitReadyTurns(opts: {
       drained = drainTranscript(path, 0);
       cache.set(path, drained);
     }
+    const absorbedHost = turn.absorbedIntoTurnId
+      ? ready.find(candidate => candidate.turnId === turn.absorbedIntoTurnId)
+      : undefined;
+    if (adoptMode && turn.absorbedReplySent && !turn.absorbedReplyDelivered
+      && absorbedHost?.terminalOutcome && absorbedHost.terminalOutcome.status !== 'completed') {
+      // A failed host has no final to provide the no-loss fallback. Once the
+      // original live reply has timed out without its delivery receipt, put
+      // this fold's own answer through the ordinary final_output path instead
+      // of settling it completed on an IPC handoff alone.
+      const reply = turn.absorbedReplyAmbiguous || !turn.absorbedAtUuid
+        ? undefined
+        : absorbedInputReplyText(drained.events, turn.absorbedAtUuid);
+      if (reply?.source === 'text') {
+        observedOutputTurns.add(turn);
+        emittedFinalOutputTurns.add(turn);
+        send({
+          type: 'final_output', content: reply.text, lastUuid: reply.lastUuid, turnId: turn.turnId,
+          ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+        });
+      }
+      continue;
+    }
+    // A folded turn handed over live while its host ran does not post another
+    // direct reply here. Its text stays in the host final unless the daemon
+    // confirmed that the live card was actually delivered.
+    if (adoptMode && turn.absorbedReplySent) {
+      observedOutputTurns.add(turn);
+      continue;
+    }
     // Adopt: a message Claude Code folded into the running turn has no reply
     // of its own — everything after it is attributed to the host turn — so
     // answer it the way the live path does (observeAbsorbedReplies): with the
     // model's first output after the fold, which may exist only as a thinking
     // summary. It settles with its host either way.
-    if (adoptMode && followUpReplyEnabled() && turn.absorbedIntoTurnId && turn.absorbedAtUuid) {
+    if (adoptMode && foldReplyEnabled() && turn.absorbedIntoTurnId && turn.absorbedAtUuid) {
       const reply = turn.absorbedReplyAmbiguous
         ? undefined
         : absorbedInputReplyText(drained.events, turn.absorbedAtUuid);
-      if (reply) {
+      // Text is the only source the host's joined final can carry. Require an
+      // actual uuid subset too: after a sessionId rotation the fold may come
+      // from a NEW jsonl while the host still drains the OLD one, so `carried`
+      // cannot contain the answer and this turn must post its own reply.
+      const carried = turn.absorbedHostFinalUuids;
+      if (reply?.source === 'text' && carried && reply.uuids.every(uuid => carried.has(uuid))) {
+        observedOutputTurns.add(turn);
+        log(`Folded turn ${turn.turnId.substring(0, 8)} answered by its host turn's final`);
+      } else if (reply) {
         sendAbsorbedReply(turn, reply, 'at turn end');
         observedOutputTurns.add(turn);
       }
       continue;
     }
     const set = new Set(turn.assistantUuids);
-    const matched = drained.events.filter(e => e.uuid && set.has(e.uuid));
+    // Actual delivery is a historical fact: keep confirmed live text out even
+    // if the switch has since been turned off. Unconfirmed replies have an empty
+    // uuid set, so switching off still leaves their text in this final.
+    const liveReplyUuids = adoptMode ? liveFoldedReplyUuids(turn) : undefined;
+    const matched = drained.events.filter(e => e.uuid && set.has(e.uuid) && !liveReplyUuids?.has(e.uuid));
+    /** This turn's final went out, `whole` or cut: folded turns whose answer
+     *  it carries whole into the chat settle on it (see the folded branch). */
+    const noteFinalCarried = (whole: boolean) => { noteHostFinalCarried(turn, matched, whole); };
     // Non-adopt fallback posts the turn's FINAL answer (text after the last
     // tool_use), not the whole-turn narration collage — joining every interim
     // block both reads as noise in Lark and inflates finalText past the
@@ -14600,7 +15168,15 @@ function emitReadyTurns(opts: {
       : trailingAssistantText(drained.events, turn.assistantUuids, replyDeliveryMode() === 'transcript'
         ? { isHousekeepingToolUse: block => isClaudeMemoryToolUse(block, path), endsWithSentinel: hasTrailingBridgeSentinelLine }
         : {});
-    if (assistantText.length === 0) continue;
+    if (assistantText.length === 0) {
+      // All this turn said went out live as replies to the messages folded
+      // into it: that is its output, so it settles as answered, with no final.
+      if (liveReplyUuids && turn.assistantUuids.some(uuid => liveReplyUuids.has(uuid))) {
+        observedOutputTurns.add(turn);
+        log(`Bridge final for turn ${turn.turnId.substring(0, 8)} not posted: all its text went out as replies to folded messages`);
+      }
+      continue;
+    }
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
     const gateTurn = sendDedupTurnId === turn.turnId ? turn : { ...turn, turnId: sendDedupTurnId };
@@ -14673,6 +15249,7 @@ function emitReadyTurns(opts: {
           kind: 'local-turn',
           userText: fields.userText,
         });
+        noteFinalCarried(postText.trim().length <= LOCAL_TURN_ASSISTANT_MAX);
         continue;
       }
       // Headless local turn — see formatHeadlessLocalTurnContent for context.
@@ -14687,6 +15264,7 @@ function emitReadyTurns(opts: {
         ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
         kind: 'local-turn-headless',
       });
+      noteFinalCarried(postText.trim().length <= LOCAL_TURN_ASSISTANT_MAX);
       continue;
     }
 
@@ -14709,6 +15287,7 @@ function emitReadyTurns(opts: {
         log(`Final output snapshot was not committed; retaining queue/journal: ${String(error)}`);
         break;
       }
+      noteFinalCarried(true);
       handoffOfferedTurns.add(turn);
       continue;
     }
@@ -14733,6 +15312,7 @@ function emitReadyTurns(opts: {
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
       ...(restoredTurn ? { restoredTurn } : {}),
     });
+    noteFinalCarried(true);
   }
   } catch (error) {
     bridgeQueue.restoreDrained(ready.slice(emitIndex));
@@ -17050,6 +17630,10 @@ function codexBridgeIngest(opts: {
     backend.appendWebHistory(renderOrcaTranscriptHistory(result.events));
   }
   codexBridgeQueue.ingest(result.events);
+  if (structuredBridgeIs('codex')) {
+    observeCodexTuiAsyncQuestions(result.events);
+    maybeRestoreCodexTuiAsyncQuestion();
+  }
   const hasAssistantFinal = result.events.some(event => event.kind === 'assistant_final');
   // Keep a complete-line frontier for the already attributed live owner.
   // Do not advance it past an undelivered terminal: a successor must replay
@@ -20400,6 +20984,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
 const KEY_TO_ANSI: Record<string, string> = {
   Up: '\x1b[A', Down: '\x1b[B', Left: '\x1b[D', Right: '\x1b[C',
   Enter: '\r', Space: ' ', Tab: '\t', Escape: '\x1b',
+  'M-Up': '\x1b[1;3A', 'C-u': '\x15',
 };
 
 /** Turn already preempted by a new user message. One preemption per turn: a
@@ -21102,20 +21687,61 @@ function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispat
 
 /** One answer input into the current CLI, serialized with other terminal
  *  writes; false when the backend changed or refused it. */
-async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void): Promise<boolean> {
+async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, expected?: TraexQuestionPage): Promise<boolean> {
   const target = backend;
+  const lifetime = cliLifetimeNonce;
   if (!target || cliRestartInProgress || nativeSessionForkPending()) return false;
   try {
     return await runAfterAmbiguousSubmissionWrites(
       target,
-      () => {
-        if (backend !== target) return false;
+      async () => {
+        if (backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress || nativeSessionForkPending()) return false;
+        if (expected) {
+          const screen = await traexQuestionCapture();
+          if (!screen || backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress
+            || nativeSessionForkPending() || !traexQuestionBridgeActive()) return false;
+          const page = parseTraexQuestionPage(screen);
+          if (!page || traexQuestionSignature(page) !== traexQuestionSignature(expected)
+            || traexQuestionState(page) !== traexQuestionState(expected)) return false;
+        }
         invalidatePromptReadinessEvidence();
         return write(readinessTrackedInput(adapterInputHandle(target))) !== false;
       },
     );
   } catch (err: any) {
     log(`TraeX question answer write failed: ${err?.message ?? err}`);
+    return false;
+  }
+}
+
+/** 打开异步问题的收起面板。序列化等待后再次采集，不能把快捷键写给已换页/换代的 CLI。 */
+function traexQuestionMayOpenPending(known?: TraexQuestionPage): boolean {
+  // 重挂时静止的 CLI 不会重放 OSC；恢复身份或已经生成的原题卡片可用于打开面板，
+  // 但不能替代实际答复时的完整题目、输入状态和进程核验。
+  return traexQuestionBlockReported() || known?.delivery === 'async'
+    || (lastInitConfig?.resume === true && cliOutlivesWorker && lastSpawnEffectiveResume);
+}
+
+async function traexQuestionOpenPending(known?: TraexQuestionPage): Promise<boolean> {
+  const target = backend;
+  const lifetime = cliLifetimeNonce;
+  if (!target || !traexQuestionBridgeActive() || !traexQuestionMayOpenPending(known) || cliRestartInProgress || nativeSessionForkPending()) return false;
+  try {
+    return await runAfterAmbiguousSubmissionWrites(target, async () => {
+      if (backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress
+        || nativeSessionForkPending() || !traexQuestionBridgeActive() || !traexQuestionMayOpenPending(known)) return false;
+      const screen = await traexQuestionCapture();
+      if (!screen || backend !== target || cliLifetimeNonce !== lifetime || cliRestartInProgress
+        || nativeSessionForkPending() || !traexQuestionBridgeActive() || !traexQuestionMayOpenPending(known)
+        || !traexPendingAsyncQuestionVisible(screen)) return false;
+      const input = readinessTrackedInput(adapterInputHandle(target));
+      invalidatePromptReadinessEvidence();
+      if (input.sendSpecialKeys) return input.sendSpecialKeys('M-Up') !== false;
+      input.write(KEY_TO_ANSI['M-Up']!);
+      return true;
+    });
+  } catch (err: any) {
+    log(`TraeX pending question could not be opened: ${err?.message ?? err}`);
     return false;
   }
 }
@@ -21131,8 +21757,10 @@ const traexQuestionBridge = new TraexQuestionBridge({
   enabled: () => traexQuestionBridgeActive() && !cliRestartInProgress,
   lifetime: () => cliLifetimeNonce,
   capture: traexQuestionCapture,
+  openPending: traexQuestionOpenPending,
+  mayOpenPending: traexQuestionMayOpenPending,
   // The same daemon ask broker (and card) as the RPC path's native questions.
-  ask: (question, signal) => {
+  ask: (question, signal, page) => {
     const cfg = lastInitConfig;
     if (!cfg) return Promise.reject(new Error('session not initialised'));
     return postCodexAsk({
@@ -21142,18 +21770,19 @@ const traexQuestionBridge = new TraexQuestionBridge({
       rootMessageId: cfg.rootMessageId,
       originTurnId: currentBotmuxTurnId,
       originDispatchAttempt: currentBotmuxDispatchAttempt,
+      ...(page?.delivery === 'async' ? { standalone: true } : {}),
     }, [question], signal);
   },
-  writeKey: key => traexQuestionWrite(target => {
+  writeKey: (key, expected) => traexQuestionWrite(target => {
     if (target.sendSpecialKeys) return target.sendSpecialKeys(key);
     target.write(KEY_TO_ANSI[key] ?? key);
     return true;
-  }),
-  paste: text => traexQuestionWrite(target => {
+  }, expected),
+  paste: (text, expected) => traexQuestionWrite(target => {
     if (target.pasteText) target.pasteText(text);
     else target.write(wrapBracketedPaste(text));
     return true;
-  }),
+  }, expected),
   notify: (key, params) => send({
     type: 'user_notify',
     turnId: currentBotmuxTurnId,
@@ -21162,6 +21791,136 @@ const traexQuestionBridge = new TraexQuestionBridge({
   }),
   log,
 });
+
+// ─── Codex TUI async questions ───────────────────────────────────────────────
+
+/** A Codex TUI session writes `request_user_input_async` to its rollout as an
+ *  AgentMessage with delivery=async, but has no JSON-RPC channel to the
+ *  daemon. Card the same question here; the daemon's existing async-answer
+ *  path writes the native reply envelope back as a normal user message.
+ *  Hybrid RPC sessions already bridge the item through the app-server. */
+function codexTuiAsyncQuestionEligible(): boolean {
+  return cliAdapter?.id === 'codex'
+    && !codexRpcEngine
+    && lastInitConfig?.codexRpcInput !== true
+    && !!backend && !remoteWsUrl
+    && lastInitConfig?.adoptMode !== true
+    && !(lastInitConfig && isRemoteBackendType(lastInitConfig.backendType));
+}
+
+function codexTuiAsyncQuestionThread(): string | undefined {
+  return lastInitConfig?.cliSessionId
+    ?? (codexBridgeRolloutPath ? codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined);
+}
+
+/** The rollout stores plain titles and option labels; the card expects the
+ *  same bounded AskQuestion shape the RPC path parses. */
+function codexTuiAsyncAskQuestions(question: CodexAsyncQuestionRecord): AskQuestion[] {
+  try {
+    return parseCodexAsyncQuestions({
+      type: 'agentMessage',
+      delivery: 'async',
+      questions: question.questions.map(item => ({
+        title: item.title,
+        ...(item.options.length ? { options: item.options } : {}),
+      })),
+    });
+  } catch {
+    return [];
+  }
+}
+
+const codexTuiAsyncQuestionsSeen = new Set<string>();
+const codexTuiAsyncQuestionAborts = new Map<string, AbortController>();
+let codexTuiAsyncRestoreChecked = false;
+let codexTuiAsyncRestoreFirstSeenAtMs: number | undefined;
+/** Let the TUI repaint after a restart before concluding a question is gone. */
+const CODEX_TUI_RESTORE_SETTLE_MS = 5_000;
+
+async function openCodexTuiAsyncQuestion(question: CodexAsyncQuestionRecord, restored = false): Promise<void> {
+  const cfg = lastInitConfig;
+  const threadId = question.threadId ?? codexTuiAsyncQuestionThread();
+  if (!cfg || !threadId) return;
+  // The user may have answered in the terminal between the drain and this
+  // task; a card for a settled question would only invite a duplicate reply.
+  if (codexBridgeRolloutPath && codexRolloutHasAsyncQuestionReply(codexBridgeRolloutPath, question.itemId)) return;
+  const questions = codexTuiAsyncAskQuestions(question);
+  if (!questions.length) return;
+  const controller = new AbortController();
+  codexTuiAsyncQuestionAborts.set(question.itemId, controller);
+  try {
+    const result = await postCodexAsk({
+      sessionId: cfg.sessionId,
+      larkAppId: cfg.larkAppId,
+      chatId: cfg.chatId,
+      rootMessageId: cfg.rootMessageId,
+      originTurnId: currentBotmuxTurnId,
+      originDispatchAttempt: currentBotmuxDispatchAttempt,
+    }, questions, controller.signal, {
+      threadId,
+      itemId: question.itemId,
+      ...(question.nativeTurnId ? { nativeTurnId: question.nativeTurnId } : {}),
+    }, undefined, restored);
+    if (result.kind !== 'answered') log(`Codex async question ${question.itemId} ended: ${result.kind}`);
+  } catch (err: any) {
+    if (!controller.signal.aborted) {
+      // The card was never delivered; allow a later recovery check to retry.
+      codexTuiAsyncQuestionsSeen.delete(question.itemId);
+      log(`Codex async question ${question.itemId} card failed: ${err?.message ?? err}`);
+    }
+  } finally {
+    if (codexTuiAsyncQuestionAborts.get(question.itemId) === controller) {
+      codexTuiAsyncQuestionAborts.delete(question.itemId);
+    }
+  }
+}
+
+/** Card each async question once. A native reply already in the rollout (the
+ *  user answered in the terminal) withdraws the pending card instead. */
+function observeCodexTuiAsyncQuestions(events: CodexBridgeEvent[]): void {
+  if (!codexTuiAsyncQuestionEligible()) return;
+  for (const event of events) {
+    if (event.kind !== 'user' || !event.text.includes('send_user_message_question_reply')) continue;
+    for (const [itemId, controller] of codexTuiAsyncQuestionAborts) {
+      if (!event.text.includes(itemId)) continue;
+      controller.abort();
+      codexTuiAsyncQuestionAborts.delete(itemId);
+    }
+  }
+  for (const question of selectNewCodexAsyncQuestions(events, codexTuiAsyncQuestionThread(), codexTuiAsyncQuestionsSeen)) {
+    void openCodexTuiAsyncQuestion(question);
+  }
+}
+
+/** Re-offer the last unanswered question after a worker restart: the
+ *  incremental drain baselines at the end and never replays the record. */
+function maybeRestoreCodexTuiAsyncQuestion(): void {
+  if (codexTuiAsyncRestoreChecked || !codexTuiAsyncQuestionEligible()) return;
+  if (!codexBridgeRolloutPath || !backend) return;
+  const now = Date.now();
+  codexTuiAsyncRestoreFirstSeenAtMs ??= now;
+  let screen = '';
+  try { screen = captureBackendScreen(backend); } catch { return; }
+  // An empty capture is not evidence that the question is gone; retry later.
+  if (!screen.trim()) return;
+  if (traexPendingAsyncQuestionCount(screen) === undefined) {
+    // The TUI repaints after the first tick. Concluding "no question" from a
+    // screen captured too early would permanently skip a pending question, so
+    // wait out a short settle window before giving up.
+    if (now - codexTuiAsyncRestoreFirstSeenAtMs >= CODEX_TUI_RESTORE_SETTLE_MS) {
+      codexTuiAsyncRestoreChecked = true;
+    }
+    return;
+  }
+  const question = findPendingCodexAsyncQuestion(codexBridgeRolloutPath);
+  codexTuiAsyncRestoreChecked = true;
+  if (!question || codexTuiAsyncQuestionsSeen.has(question.itemId)) return;
+  if (codexRolloutHasAsyncQuestionReply(codexBridgeRolloutPath, question.itemId)) return;
+  const ownedThread = codexTuiAsyncQuestionThread();
+  if (ownedThread && question.threadId && question.threadId !== ownedThread) return;
+  codexTuiAsyncQuestionsSeen.add(question.itemId);
+  void openCodexTuiAsyncQuestion(question, true);
+}
 
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
@@ -24488,6 +25247,9 @@ function markPromptReady(): void {
   // already-promoted authority only while the PTY generation still identifies
   // this same A edge; later B output makes the observation stale. The matching
   // observation also prevents this same A edge from advancing twice to C.
+  if (typeof reconcileCompletedAntigravityTurnsAtPromptReady === 'function') {
+    reconcileCompletedAntigravityTurnsAtPromptReady();
+  }
   const observedQueuedAdvanceGeneration = queuedTurnAdvanceConsumedForPrompt?.outputGeneration;
   const readyTransition = (syncedFromDisk: boolean) => decideQueuedReadyTransition({
     observedOutputGeneration: observedQueuedAdvanceGeneration,
@@ -24629,6 +25391,9 @@ function markPromptReady(): void {
   // finishTurnReactions() — a premature ✅ DONE mid-turn (and a
   // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
   // correct 'working' publish for these paths, so this idle must not escape first.
+  if (typeof observeAntigravityFooterBackgroundTasks === 'function') {
+    observeAntigravityFooterBackgroundTasks(renderer?.rawSnapshot() || lastAnalyzerSnapshot);
+  }
   refreshBackgroundWait();
   if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
@@ -24717,7 +25482,12 @@ function persistCliSessionId(cliSessionId: string): void {
   // During an interactive fork the CLI temporarily resumes the parent. Its
   // early PID/transcript observations must never acknowledge the pending fork.
   if (nativeSessionForkPending()) return;
+  const previousCliSessionId = inputDeliveryObservedCliSessionId;
   inputDeliveryObservedCliSessionId = cliSessionId;
+  if (lastInitConfig?.cliId === 'antigravity' && previousCliSessionId && previousCliSessionId !== cliSessionId) {
+    antigravityFooterBackgroundTasks = 0;
+    refreshBackgroundWait();
+  }
   const published = publishCliSessionIdToDaemon({
     cliSessionId,
     // Snapshot only worker-owned, durable local Codex roots. Never infer an
@@ -26591,8 +27361,12 @@ async function flushPending(): Promise<void> {
           }
         }
 
+        const reconcileHint = typeof rememberSubmittedTurnText === 'function'
+          ? rememberSubmittedTurnText(item.turnId, item.content, item.dispatchAttempt, { isTypeAhead })
+          : undefined;
         if (isTypeAhead && item.turnId) {
           log(`Queuing type-ahead turn attribution: active=${currentBotmuxTurnId?.slice(0, 12)}, queued=${item.turnId.slice(0, 12)}`);
+          send({ type: 'type_ahead_queued', turnId: item.turnId });
           if (!queuedTypeAheadTurns.some(t => t.turnId === item.turnId)) {
             queuedTypeAheadTurns.push({
               turnId: item.turnId,
@@ -26602,6 +27376,7 @@ async function flushPending(): Promise<void> {
               trustedController: item.trustedController,
               vcMeetingImTurnOrigin: item.vcMeetingImTurnOrigin,
               turnCallerOpenId: item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId,
+              ...(reconcileHint ? { antigravityReconcileHint: reconcileHint } : {}),
             });
           }
         } else {
@@ -27650,7 +28425,13 @@ function sendToPty(
     startupComplete: idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   })) {
-    if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);
+    if (!mergedQueued) {
+      if (activeTurnBlocks(next)) {
+        log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — waiting for active turn ${activeTurnAuthority.snapshot()?.turnId?.slice(0, 12) ?? '-'}`);
+      } else {
+        log(`Writing to PTY: "${content.substring(0, 80)}"`);
+      }
+    }
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
     if (!mergedQueued) log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
@@ -27916,14 +28697,19 @@ function startScreenUpdates(): void {
       // one the per-chunk hold check missed (its card is raised from a fresh
       // capture, see core/traex-question-bridge.ts).
       if (traexQuestionBridgeActive()
-        && [lastAnalyzerSnapshot, renderer?.rawSnapshot() ?? ''].some(screen => traexQuestionFlowVisible(screen))) {
+        && [lastAnalyzerSnapshot, renderer?.rawSnapshot() ?? ''].some(screen => traexQuestionFlowVisible(screen) || traexPendingAsyncQuestionVisible(screen))) {
         traexQuestionBridge.kick();
       }
 
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
         observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
-        if (snapshot.refreshed && status === 'idle' && snapshot.nativeScreen) {
-          publishNativeReasoningFooter(snapshot.nativeScreen, snapshot.observedAtMs);
+        if (snapshot.refreshed && snapshot.nativeScreen) {
+          if (typeof observeAntigravityFooterBackgroundTasks === 'function') {
+            observeAntigravityFooterBackgroundTasks(snapshot.nativeScreen);
+          }
+          if (status === 'idle') {
+            publishNativeReasoningFooter(snapshot.nativeScreen, snapshot.observedAtMs);
+          }
         }
       }
       // Kimi paints its cache-expiry menu once and then sits still: the
@@ -28038,6 +28824,7 @@ function stopScreenUpdates(): void {
   if (screenUpdateTimer) { clearInterval(screenUpdateTimer); screenUpdateTimer = null; }
   if (renderer) { renderer.dispose(); renderer = null; }
   lastAnalyzerSnapshot = '';
+  antigravityFooterBackgroundTasks = 0;
 }
 
 // ─── PTY Management ──────────────────────────────────────────────────────────
@@ -28666,6 +29453,9 @@ function probeBusyPatternIdle(
         if (settle.degraded) {
           log(`${source} idle probe: screen settle degraded; finalizing from the last successful snapshot`);
         }
+        // Agy may append a tool call during an async ZMX capture without
+        // changing the composer or its screen revision.
+        if (cliAdapter?.id === 'antigravity' && deferPromptReadyWhileBusy(source, be)) return;
         markPromptReadyFromBusyProbe(be);
         if (!isPromptReady && busyReadyDeferral.active) scheduleBusyPatternIdleProbe(source);
       });
@@ -28903,6 +29693,7 @@ async function spawnCli(
     reuseExistingScratchTree?: boolean;
   } = {},
 ): Promise<void> {
+  if (closeRequested) throw new CliSpawnSupersededError();
   if (!workerSessionEventScope) return spawnCliBody(cfg, opts);
   const firstBinding = !workerSessionEventScope.currentBinding();
   if (cfg.prompt && !workerSessionEventScope.canSubmit(cfg.turnId, cfg.dispatchAttempt, cfg.sessionCommand?.execution)) {
@@ -29055,6 +29846,7 @@ async function spawnCliBody(
   // its tasks; startBridgeWatcher rebuilds them from its transcript.
   backgroundTaskTracker.reset(Math.floor(Date.now() / 1000) * 1000);
   backgroundWaitTasks = 0;
+  antigravityFooterBackgroundTasks = 0;
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(homedir(), '.botmux', 'data');
   const sessionScratchDir = ensureSessionTempDir(isolationRuntimeDataDir, cfg.sessionId);
@@ -36831,6 +37623,7 @@ async function restartCliProcess(
         ]);
       }
       if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
+      if (closeRequested) { settleRespawn('superseded'); return; }
       const teardownVerdict = classifyRestartTeardown(teardownOutcome, {
         remote: isRemoteBackendType(effectiveBackendType),
       });
@@ -36878,10 +37671,12 @@ async function restartCliProcess(
       // A normal restart cannot observe activity from the retired process.
       // Only capacity-model rotation carries that waiting latch forward.
       traexAutoModelController?.noteProcessExited(opts.restartCause === 'traex-auto-model');
-      if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
+      if (restartEpoch !== cliRestartEpoch || closeRequested) { settleRespawn('superseded'); return; }
       awaitingFirstPrompt = true;
       setTimeout(async () => {
-        if (restartEpoch !== cliRestartEpoch) { settleRespawn('superseded'); return; }
+        // A close can arrive while teardown or this respawn delay is awaiting.
+        // Its ACK may still be flushing, so waiting for killCli is too late.
+        if (restartEpoch !== cliRestartEpoch || closeRequested) { settleRespawn('superseded'); return; }
         let spawnedWorkingDir: string | undefined;
         let spawnedLaunch: RestartLaunchSettings | undefined;
         if (lastInitConfig) {
@@ -40295,9 +41090,11 @@ function dropQueuedTurnRecord(
   queuedTypeAheadTurns = queuedTypeAheadTurns.filter(queued => queued.turnId !== turnId
     || (queued.dispatchAttempt !== undefined && queued.dispatchAttempt !== dispatchAttempt));
   if (queuedTypeAheadTurns.length === before) return false;
-  // A retry of the same turn under another attempt is still live work.
-  if (opts.tombstone !== false
-    && !queuedTypeAheadTurns.some(queued => queued.turnId === turnId)) markTurnRetired(turnId);
+  // A retry of the same turn under another attempt is still live work. Its
+  // sidecar is keyed by turnId, so only the last queued sibling may retire it.
+  const hasLiveSibling = queuedTypeAheadTurns.some(queued => queued.turnId === turnId);
+  if (!hasLiveSibling) send({ type: 'type_ahead_turn_dropped', turnId });
+  if (opts.tombstone !== false && !hasLiveSibling) markTurnRetired(turnId);
   return true;
 }
 
@@ -41746,6 +42543,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         }
       }
       lastInitConfig = msg;
+      resetFollowUpReplyStateForInit();
       antigravityQuotaHistory = msg.antigravityQuotaHistory;
       unconfirmedAntigravityQuotas = new Map();
       const restoredQuota = msg.antigravityActiveQuota;
@@ -43548,6 +44346,18 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // without a session restart.
       setDefaultLocale(msg.locale);
       log(`Locale → ${msg.locale}`);
+      break;
+    }
+
+    case 'set_follow_up_reply': {
+      // Any config entry point flipped the bot's mid-turn reply switch. The
+      // daemon gates posting on it live, so the worker follows the same value.
+      setFollowUpReplyLive(msg.enabled);
+      break;
+    }
+
+    case 'absorbed_reply_delivered': {
+      noteAbsorbedReplyDelivered(msg.turnId, msg.dispatchAttempt, msg.replyUuid);
       break;
     }
 

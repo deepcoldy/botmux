@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BridgeTurnQueue, makeFingerprint } from '../src/services/bridge-turn-queue.js';
+import { BridgeTurnQueue, makeFingerprint, noteHostFinalCarried, liveFoldedReplyUuids } from '../src/services/bridge-turn-queue.js';
 import {
   CLAUDE_AWAITING_MARKER_REDRIVE_SAFETY_MS,
   CLAUDE_OPEN_TURN_POLL_MS,
@@ -710,6 +710,8 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
         send: (msg: unknown) => { sent.push(msg); },
         emitTurnTerminal: (...args: unknown[]) => { terminals.push(args); },
         log: () => {},
+        noteHostFinalCarried,
+        liveFoldedReplyUuids,
       };
 
       const emitReadyTurns = loadWorkerFunction<(opts?: { explicitTerminalOnly?: boolean }) => void>('emitReadyTurns', scope);

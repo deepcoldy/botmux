@@ -328,7 +328,7 @@ import { listProjectGroups, type ProjectGroupState } from './services/project-gr
 import { resolveProjectProgressCardConfig } from './services/project-progress-card-config.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
-import { ALL_CLI_IDS, createCliAdapterSync, rawCliExecutable, resolveCommandReal } from './adapters/cli/registry.js';
+import { ALL_CLI_IDS, CLI_ALIASES, createCliAdapterSync, rawCliExecutable, resolveCommandReal } from './adapters/cli/registry.js';
 import { createDashboardExecutableResolver, resolveDashboardRuntimeUpdateTargets } from './dashboard/cli-executable-resolver.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import {
@@ -6419,6 +6419,7 @@ const server = createServer(async (req, res) => {
             available: availability.available,
             availabilityStatus: availability.status,
             command: availability.command,
+            searchTerms: CLI_ALIASES[o.cliId],
             availabilityReason: availability.reason,
             ...(o.cliLaunchMode ? { cliLaunchMode: o.cliLaunchMode } : {}),
             modelChoices,

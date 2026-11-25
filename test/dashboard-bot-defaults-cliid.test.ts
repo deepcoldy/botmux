@@ -14,6 +14,8 @@ import {
 } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled, onboardingRetryMode } from '../src/dashboard/web/bot-onboarding.js';
 import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
+import { filterDropdownOptions } from '../src/dashboard/web/dropdown-shared.js';
+import { CLI_ALIASES, rawCliExecutable } from '../src/adapters/cli/registry.js';
 
 // Profile scanning has its own component/browser tests. Keep these agent-save
 // contract tests independent of that additional GET request.
@@ -114,6 +116,40 @@ describe('bot defaults cli label', () => {
     expect(root.findByProps({ 'data-input': 'agentCliId' }).props.value).toBe('traex');
     expect(root.findByProps({ 'data-input': 'agentModel' }).props.value).toBe('glm-5.1');
     expect(root.findAllByProps({ 'data-action': 'save-agent' })).toHaveLength(1);
+  });
+
+  it('searches launch commands and aliases without changing label or config ID matching', () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => ({
+      ok: true,
+      json: async () => url.includes('/availability?') ? { status: 'available' } : { models: [], source: 'static' },
+    })));
+    const option = (id: 'antigravity' | 'claude-code' | 'oh-my-pi', label: string) => ({
+      id, label, command: rawCliExecutable(id), searchTerms: CLI_ALIASES[id],
+    });
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_search', cliId: 'antigravity', model: '' },
+        sessionFallback: 'antigravity',
+        cliState: {
+          options: [
+            option('antigravity', 'Antigravity'),
+            option('claude-code', 'Claude'),
+            option('oh-my-pi', 'Oh My Pi'),
+          ],
+          ttadkModelDefault: 'glm-5.1',
+          ttadkModelSuggestions: [],
+        },
+        patchBot: () => undefined,
+      }));
+    });
+    const options = renderer.root.findByProps({ dataInput: 'agentCliId' }).props.options;
+    const matches = (query: string) => filterDropdownOptions(options, query).map(item => item.value);
+    expect(matches('agy')).toEqual(['antigravity']);
+    expect(matches('CC')).toEqual(['claude-code']);
+    expect(matches('Oh My')).toEqual(['oh-my-pi']);
+    expect(matches('-my-pi')).toEqual(['oh-my-pi']);
+    act(() => renderer.unmount());
   });
 
   it('marks a locally missing Agent in the dropdown and shows an inline warning', () => {

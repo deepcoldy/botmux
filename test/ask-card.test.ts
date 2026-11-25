@@ -30,11 +30,7 @@ import {
   handleAskCardAction,
   parseFormSelections,
 } from '../src/im/lark/ask-card.js';
-import {
-  askOptionLayoutForBot,
-  normalizeAskOptionLayout,
-  setAskOptionLayoutLookup,
-} from '../src/im/lark/ask-option-layout.js';
+import { normalizeAskOptionLayout } from '../src/im/lark/ask-option-layout.js';
 import { getDefaultLocale, setDefaultLocale, t as tr } from '../src/i18n/index.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 import { buildAskFormElements } from '../src/im/lark/ask-form-elements.js';
@@ -44,22 +40,20 @@ const mockedSubmitAsk = vi.mocked(submitAsk);
 
 describe('no-deadline card presentation', () => {
   it('does not format the zero sentinel as an epoch date in standalone, form or inline Ask cards', () => {
-    const formatDate = vi.spyOn(Date.prototype, 'toLocaleString');
-    try {
-      const ask = makePending({ originKind: 'host_explicit', deadlineAt: 0,
-        questions: makePending().questions.map(question => ({ ...question, allowCustom: false })) });
-      const standalone = JSON.parse(renderAskCard(ask).json);
-      const form = buildAskFormElements({ ...ask, questions: [{
-        prompt: 'Input', options: [], multiSelect: false, input: { type: 'text' },
-      }] }, 'en');
-      const inline = buildTurnReplyAskElements({ ask }, 'en');
-      expect(standalone.elements.length).toBeGreaterThan(0);
-      expect(form.some(element => element.tag === 'form')).toBe(true);
-      expect(inline.some(element => element.tag === 'column_set')).toBe(true);
-      expect(formatDate).not.toHaveBeenCalled();
-      renderAskCard(makePending());
-      expect(formatDate).toHaveBeenCalled();
-    } finally { formatDate.mockRestore(); }
+    const ask = makePending({ originKind: 'host_explicit', deadlineAt: 0,
+      questions: makePending().questions.map(question => ({ ...question, allowCustom: false })) });
+    const footers = [
+      JSON.parse(renderAskCard(ask).json).body.elements.at(-1).content,
+      buildAskFormElements({ ...ask, questions: [{ prompt: 'Input', options: [], multiSelect: false, input: { type: 'text' } }] }, 'en').at(-1)!.content,
+      buildTurnReplyAskElements({ ask }, 'en').at(-1)!.content,
+    ];
+    expect(footers[0]).toContain(tr('card.ask.footer.no_deadline'));
+    expect(footers[1]).toContain(tr('card.ask.footer.no_deadline', undefined, 'en'));
+    expect(footers[2]).toContain(tr('card.ask.footer.no_deadline', undefined, 'en'));
+    for (const footer of footers) expect(footer).not.toMatch(/1970|1969/);
+    const dated = JSON.parse(renderAskCard(makePending()).json).body.elements.at(-1).content;
+    expect(dated).not.toContain(tr('card.ask.footer.no_deadline'));
+    expect(dated).toMatch(/\d{2}:\d{2}/);
   });
 });
 
@@ -111,25 +105,49 @@ function notationBlocks(node: unknown): string[] {
   return Object.values(el).flatMap(notationBlocks);
 }
 
+/** Every node of a card, depth-first. */
+function allNodes(value: unknown): any[] {
+  return value && typeof value === 'object' ? [value, ...Object.values(value).flatMap(allNodes)] : [];
+}
+
+/** Each question as its heading shows it (number prefix and bold markers removed) plus any continuation lines. */
+function questionTexts(card: unknown): string[] {
+  return allNodes(card).filter(n => n.tag === 'column' && n.elements?.some((e: any) => e.text_size === 'heading')).map(column => {
+    const at = column.elements.findIndex((e: any) => e.text_size === 'heading');
+    const next = column.elements[at + 1];
+    const more = next?.tag === 'markdown' && next.text_size === 'normal' ? `\n${next.content}` : '';
+    return column.elements[at].content.replace(/^\*\*(?:\d+\. )?/, '').replace(/\*\*$/, '') + more;
+  });
+}
+
+/** Text of every option control in card order: checker rows and one-click rows. */
+function optionTexts(card: unknown): string[] {
+  return allNodes(card).flatMap(n => n.tag === 'checker' ? [n.text.content]
+    : n.tag === 'interactive_container' ? n.elements.map((e: any) => e.content) : []);
+}
+
+/** Callback value of a button / one-click row. */
+const callbackOf = (node: any) => node.value ?? node.behaviors?.find((b: any) => b.type === 'callback')?.value;
+
 describe('buildAskCard', () => {
   it.each([false, true])('preserves labelled web links before and after settlement (%s)', (settled) => {
     const ask = makePending();
     ask.questions[0]!.prompt = 'Review [design](https://example.com/design?id=4&rev=2) and [preview](http://localhost:3000/path_(v2)) before _confirming_.';
     const result: AskResult | undefined = settled ? { kind: 'answered', answers: [['deploy']], by: 'ou_owner', comment: null, timedOut: false } : undefined;
     const card = JSON.parse(buildAskCard(ask, result));
-    const question = card.elements.find((item: any) => item.text?.content?.includes('Review'));
-    expect(question.text.content).toContain('[design](https://example.com/design?id=4&rev=2)');
-    expect(question.text.content).toContain('[preview](http://localhost:3000/path_%28v2%29)');
-    expect(question.text.content).toContain('\\_confirming\\_');
+    const question = questionTexts(card).find(text => text.includes('Review'))!;
+    expect(question).toContain('[design](https://example.com/design?id=4&rev=2)');
+    expect(question).toContain('[preview](http://localhost:3000/path_%28v2%29)');
+    expect(question).toContain('\\_confirming\\_');
   });
 
   it('keeps unsupported, escaped and incomplete link markup literal', () => {
     const ask = makePending();
     ask.questions[0]!.prompt = String.raw`literal \[escaped](https://example.com) ![image](https://example.com/a.png) [unsafe](javascript:alert(1)) [file](file:///tmp/a) [broken](https://example.com`;
     const card = JSON.parse(buildAskCard(ask));
-    const question = card.elements.find((item: any) => item.text?.content?.includes('literal'));
+    const question = questionTexts(card).find(text => text.includes('literal'))!;
     for (const label of ['escaped', 'image', 'unsafe', 'file', 'broken']) {
-      expect(question.text.content).toContain(`\\[${label}\\]`);
+      expect(question).toContain(`\\[${label}\\]`);
     }
   });
 
@@ -140,13 +158,13 @@ describe('buildAskCard', () => {
       options: [{ key: 'independent', label: 'independent' }, { key: 'suggestion', label: 'suggestion' }],
     }] });
     const card = JSON.parse(buildAskCard(ask));
-    const question = card.elements.find((item: any) => item.text?.content?.includes('choose'));
-    expect(question.text.content).toContain(tag);
-    expect(question.text.content).toContain('\\_one\\_');
-    expect(question.text.content).not.toContain('ou\\_');
+    const question = questionTexts(card).find(text => text.includes('choose'))!;
+    expect(question).toContain(tag);
+    expect(question).toContain('\\_one\\_');
+    expect(question).not.toContain('ou\\_');
   });
 
-  it('多问卡片：每问一个分区 + option buttons + 一个 submit', () => {
+  it('多问卡片：每问一个灰底分区、每个选项一行勾选框，整卡一个 form 一个提交', () => {
     const ask = makePending({
       questions: [
         { prompt: 'q1', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] },
@@ -154,21 +172,20 @@ describe('buildAskCard', () => {
       ],
     });
     const json = JSON.parse(buildAskCard(ask));
-    const blob = JSON.stringify(json);
-
-    // 每问的 prompt 文本出现在卡片中
-    expect(blob).toContain('q1');
-    expect(blob).toContain('q2');
-
-    // submit 按钮 action 存在
-    expect(blob).toContain(ASK_SUBMIT_ACTION);
-
-    // 每问的选项通过 ask_toggle button 编码 question_index + key
-    expect(blob).toContain(ASK_TOGGLE_ACTION);
-    expect(blob).toContain('"question_index":"0"');
-    expect(blob).toContain('"key":"y"');
-    expect(blob).toContain('"question_index":"1"');
-    expect(blob).toContain('"key":"a"');
+    expect(json.schema).toBe('2.0');
+    const forms = allNodes(json).filter(n => n.tag === 'form');
+    expect(forms).toHaveLength(1);
+    const blocks = forms[0].elements.filter((n: any) => n.tag === 'column_set');
+    expect(blocks.map((b: any) => b.background_style)).toEqual(['qblock', 'qblock']);
+    expect(questionTexts(json)).toEqual(['q1', 'q2']);
+    expect(blocks.map((b: any) => allNodes(b).filter(n => n.tag === 'checker').map(n => n.name)))
+      .toEqual([['opt_0_0', 'opt_0_1'], ['opt_1_0', 'opt_1_1']]);
+    // Ticking stays in the client: no checker carries a callback; one submit answers everything.
+    expect(allNodes(json).filter(n => n.tag === 'checker').every(n => !n.behaviors)).toBe(true);
+    const buttons = allNodes(json).filter(n => n.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0]).toMatchObject({ form_action_type: 'submit', type: 'primary_filled', width: 'fill' });
+    expect(callbackOf(buttons[0])).toEqual({ action: 'ask_choice_submit', ask_id: 'ask-1', nonce: 'nonce-1' });
   });
 
   it('渲染 options[].description：选项详细解释随卡片展示，无 description 时不多渲染', () => {
@@ -182,16 +199,18 @@ describe('buildAskCard', () => {
         ],
       }],
     });
-    const blob = JSON.stringify(JSON.parse(buildAskCard(withDesc)));
-    expect(blob).toContain('先放 5% 流量观察 30 分钟');
-    expect(blob).toContain('**灰度**');
+    const rows = optionTexts(JSON.parse(buildAskCard(withDesc)));
+    // The description sits on its own option's row, below the label.
+    expect(rows).toHaveLength(2);
+    expect(rows[0]!.split('\n')[0]).toContain('灰度');
+    expect(rows[0]!.split('\n')[1]).toContain('先放 5% 流量观察 30 分钟');
+    expect(rows[1]).not.toContain('\n');
 
-    // 无 description 的旧载荷：不出现 label：说明块（按钮仍在）。
+    // 无 description 的旧载荷：每个选项只有标签一行。
     const plain = makePending({
       questions: [{ prompt: '继续？', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] }],
     });
-    const plainBlob = JSON.stringify(JSON.parse(buildAskCard(plain)));
-    expect(plainBlob).not.toContain('**是**：');
+    expect(optionTexts(JSON.parse(buildAskCard(plain))).every(text => !text.includes('\n'))).toBe(true);
   });
 
   it('--mention：第一问前注入真实 <at>，无 mention 时不渲染 at', () => {
@@ -234,18 +253,25 @@ describe('buildAskCard', () => {
       ['输入表单', { originKind: 'explicit', questions: [choice, effort] }],
     ];
 
+    const answeredGray: AskResult = { kind: 'answered', answers: [['gray'], []], inputs: [null, '3'], by: 'ou_owner', comment: null, timedOut: false };
     it.each([
       ...cards.map(([name, over]) => [name, over, undefined] as const),
       ['文本作答批次', { questions: [{ ...choice, inputMode: 'text' as const }] }, undefined] as const,
-      ...cards.map(([name, over]) => [`settle 后的${name}`, over, timedOut] as const),
-    ])('%s：说明以小字列在卡内，标签和说明里的 at 标签实体解码后也不会变成真实 @', (_name, over, result) => {
+      ...cards.map(([name, over]) => [`settle 后的${name}`, over, answeredGray] as const),
+    ])('%s：说明紧跟在自己的选项下，标签和说明里的 at 标签实体解码后也不会变成真实 @', (_name, over, result) => {
       const json = buildAskCard(makePending(over), result);
-      const notes = notationBlocks(JSON.parse(json)).filter(note => note.includes('先放 5% 流量'));
-      expect(notes).toHaveLength(1);
-      expect(notes[0]).toContain('**灰度');
-      expect(notes[0]).toMatch(/观察 30 分钟[^\n]*\n\n\*\*全量\*\*：立即放开所有流量/);
-      expect(notes[0]!.replace(/&lt;/g, '<').replace(/&gt;/g, '>')).not.toContain('<at');
+      // Unsettled: the option rows (or the text batch's option list); settled: the chosen answer line.
+      const texts = allNodes(JSON.parse(json)).flatMap(n => n.tag === 'checker' ? [n.text.content]
+        : n.tag === 'markdown' ? [n.content] : []).filter(text => text.includes('先放 5% 流量'));
+      expect(texts).toHaveLength(1);
+      const lines = texts[0]!.split('\n');
+      const label = lines.findIndex(line => line.includes('灰度'));
+      expect(label).toBeGreaterThanOrEqual(0);
+      expect(lines[label + 1]).toContain('先放 5% 流量');
+      expect(lines[label + 2]).toContain('观察 30 分钟');
+      expect(texts[0]!.replace(/&lt;/g, '<').replace(/&gt;/g, '>')).not.toContain('<at');
       expect(json).not.toContain('<at id=all');
+      expect(json).not.toContain('<at id=ou_label');
     });
 
     it.each(cards)('--mention：待答的%s在第一问前点名一次；settle 后和发给文档作者的私聊卡不点名', (_name, over) => {
@@ -260,22 +286,21 @@ describe('buildAskCard', () => {
     });
   });
 
-  it('单问卡片：渲染 prompt、可答复栏、ask_id、nonce', () => {
+  it('单问单选、无自填无预选：点一下即提交的卡，每个选项一整行可点', () => {
     const card = JSON.parse(buildAskCard(makePending()));
     const text = JSON.stringify(card);
 
-    expect(card.header.title.content).toBe('botmux ask');
-    expect(text).toContain('线上 latency');
-    // 可答复栏 = canTalk 语义，统一显示「本群可对话成员」，不再按 open_id 列名单
-    const metaDiv = card.elements[0];
-    expect(metaDiv.fields[1].text.content).toContain('可对话成员');
-    expect(text).toContain('"ask_id":"ask-1"');
-    expect(text).toContain('"nonce":"nonce-1"');
-    // 单问单选：稳定 action button，点击即答；不使用会被飞书 silent-drop 的 form/select_static
-    expect(text).toContain(ASK_SELECT_ACTION);
-    expect(text).not.toContain('select_static');
+    expect(card.header).toMatchObject({ template: 'blue', title: { content: tr('card.ask.header.pending_one') } });
+    expect(questionTexts(card)).toEqual(['线上 latency 涨了 30%，下一步怎么处理？']);
+    // 可答复 = canTalk 语义，统一显示「本群可对话成员」，在最后一行小字里
+    expect(card.body.elements.at(-1)).toMatchObject({ tag: 'markdown', text_size: 'notation' });
+    expect(card.body.elements.at(-1).content).toContain(tr('card.ask.footer.talk_members'));
+    // 每个选项一行，整行回调旧的单选即答动作；没有 form、没有提交按钮
+    const rows = allNodes(card).filter(n => n.tag === 'interactive_container');
+    expect(rows.map(callbackOf)).toEqual(['deploy', 'rollback', 'abort'].map(key => ({ action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key })));
+    expect(optionTexts(card).map(content => content.split('\n')[0])).toEqual(['**继续发布**', '**回滚**', '**中止**']);
     expect(text).not.toContain('"tag":"form"');
-    expect(text).toContain('继续发布');
+    expect(text).not.toContain('"tag":"button"');
   });
 
   it('XPI 指定答复人只用于点击鉴权，不作为 at/person 资源写进卡片', () => {
@@ -284,7 +309,7 @@ describe('buildAskCard', () => {
       originKind: 'host_cross_principal_owner',
     }));
 
-    expect(text).toContain('指定成员（仅本人可操作）');
+    expect(text).toContain(tr('card.ask.footer.designated'));
     expect(text).not.toContain('ou_cross_app_answerer');
     expect(text).not.toContain('<at');
   });
@@ -331,20 +356,22 @@ describe('buildAskCard', () => {
     expect(JSON.parse(text).header.template).toBe('green');
   });
 
-  it('多问/多选：使用 buttons + submit，不使用 form/select_static', () => {
+  it('多问/多选：题型小字区分单选与多选，勾选框不发回调，不用下拉框', () => {
     const ask = makePending({
       questions: [
         { prompt: 'single', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] },
         { prompt: 'multi', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
       ],
     });
-    const blob = buildAskCard(ask);
-    expect(blob).toContain(ASK_TOGGLE_ACTION);
-    expect(blob).toContain(ASK_SUBMIT_ACTION);
-    expect(blob).toContain('☐ A');
+    const card = JSON.parse(buildAskCard(ask));
+    const eyebrows = allNodes(card).filter(n => n.tag === 'markdown' && n.text_size === 'notation' && n.content.includes('<font color'))
+      .slice(0, 2).map(n => n.content);
+    expect(eyebrows[0]).toContain(tr('card.ask.kind.single'));
+    expect(eyebrows[1]).toContain(tr('card.ask.kind.multi'));
+    const blob = JSON.stringify(card);
+    expect(blob).not.toContain(ASK_TOGGLE_ACTION);
     expect(blob).not.toContain('"select_static"');
     expect(blob).not.toContain('"multi_select_static"');
-    expect(blob).not.toContain('"tag":"form"');
   });
 
   it('settled 态（answered）：渲染答案摘要、无可点组件', () => {
@@ -360,16 +387,14 @@ describe('buildAskCard', () => {
     }));
     const text = JSON.stringify(json);
 
-    expect(json.header.template).toBe('green');
-    // 答案摘要包含"已选择"文字
-    expect(text).toContain('已选择');
+    expect(json.header).toMatchObject({ template: 'green', title: { content: tr('card.ask.header.answered') } });
     // 终态仍保留原问题，让审批人能回看自己批准的内容。
-    expect(text).toContain('审批内容：补充回归测试');
-    // 选中标签"是"出现在卡片中
-    expect(text).toContain('是');
-    // 不含任何 action 动作（无可交互组件）
-    expect(text).not.toContain(ASK_SELECT_ACTION);
-    expect(text).not.toContain(ASK_SUBMIT_ACTION);
+    expect(questionTexts(json)).toEqual(['审批内容：补充回归测试']);
+    // 选中的答案以 ✓ 行列在问题下
+    expect(allNodes(json).some(n => n.tag === 'markdown' && n.content === '✓ **是**')).toBe(true);
+    expect(text).not.toContain('否');
+    // 无可交互组件
+    expect(allNodes(json).filter(n => n.behaviors || ['button', 'checker', 'input', 'form'].includes(n.tag))).toEqual([]);
   });
 
   it('settled 态（answered）：多问多选答案各问均渲染', () => {
@@ -442,12 +467,8 @@ describe('buildAskCard', () => {
     expect(blob).toContain(tail);
     expect(blob).not.toContain('已截断');
 
-    // 完整正文原样落在问题 div（prompt 不含会被 escapeMd 转义的字符）
-    const questionDiv = json.elements.find(
-      (el: any) => el.tag === 'div' && typeof el.text?.content === 'string' && el.text.content.includes(head),
-    );
-    expect(questionDiv).toBeDefined();
-    expect(questionDiv.text.content).toBe(`**问题 1**\n${prompt}`);
+    // 完整正文原样落在问题标题里（prompt 不含会被 escapeMd 转义的字符）
+    expect(questionTexts(json)).toEqual([prompt]);
   });
 
   it('多问卡片：每个长问题正文都完整渲染', () => {
@@ -463,12 +484,7 @@ describe('buildAskCard', () => {
     });
 
     const json = JSON.parse(buildAskCard(ask));
-    const questionDivs = json.elements.filter(
-      (el: any) => el.tag === 'div' && typeof el.text?.content === 'string' && el.text.content.startsWith('**问题 '),
-    );
-    expect(questionDivs).toHaveLength(2);
-    expect(questionDivs[0].text.content).toBe(`**问题 1**\n${promptA}`);
-    expect(questionDivs[1].text.content).toBe(`**问题 2**\n${promptB}`);
+    expect(questionTexts(json)).toEqual([promptA, promptB]);
   });
 
   it('英文 locale：长问题正文完整渲染，无 truncated 标记', () => {
@@ -489,11 +505,7 @@ describe('buildAskCard', () => {
       const blob = JSON.stringify(json);
       expect(blob).toContain(tail);
       expect(blob).not.toContain('(truncated)');
-      const questionDiv = json.elements.find(
-        (el: any) => el.tag === 'div' && typeof el.text?.content === 'string' && el.text.content.includes(head),
-      );
-      expect(questionDiv).toBeDefined();
-      expect(questionDiv.text.content).toBe(`**Question 1**\n${prompt}`);
+      expect(questionTexts(json)).toEqual([prompt]);
     } finally {
       setDefaultLocale(prevLocale);
     }
@@ -502,9 +514,7 @@ describe('buildAskCard', () => {
 
 describe('ask 卡整卡字节预算（飞书卡片请求体 30KB）', () => {
   const cardBytes = (json: string, chatId = 'oc_chat') => turnReplyCardRequestBytes(json, chatId);
-  const questionDivs = (json: string) => (JSON.parse(json).elements as any[]).filter(
-    (el) => el.tag === 'div' && typeof el.text?.content === 'string' && el.text.content.startsWith('**问题 '),
-  );
+  const questionDivs = (json: string) => questionTexts(JSON.parse(json));
 
   it.each([
     ['多字节中文', `${'中文多字节正文'.repeat(3000)}【中文尾部】`],
@@ -517,8 +527,8 @@ describe('ask 卡整卡字节预算（飞书卡片请求体 30KB）', () => {
     expect(rendered.promptTruncated).toBe(true);
     expect(cardBytes(rendered.json)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
     expect(buildAskCard(ask)).toBe(rendered.json);
-    const [div] = questionDivs(rendered.json);
-    expect(div.text.content).toContain('完整内容见本话题中的附件文件');
+    const [question] = questionDivs(rendered.json);
+    expect(question).toContain('完整内容见本话题中的附件文件');
     // 预算内尽量多展示：截断后的正文仍占据大部分预算，而不是退化成很短的摘要
     expect(cardBytes(rendered.json)).toBeGreaterThan(TURN_REPLY_CARD_MAX_BYTES * 0.8);
     // 全文（含尾部）在附件内容中完整可达
@@ -535,7 +545,7 @@ describe('ask 卡整卡字节预算（飞书卡片请求体 30KB）', () => {
     const ask = makePending({ questions: [{ prompt, multiSelect: false, options: [{ key: 'y', label: '是' }] }] });
     const rendered = renderAskCard(ask);
     expect(rendered.promptTruncated).toBe(false);
-    expect(questionDivs(rendered.json)[0].text.content).toBe(`**问题 1**\n${prompt}`);
+    expect(questionDivs(rendered.json)).toEqual([prompt]);
   });
 
   it('多问：只截断超长的那一问，短问题保持完整', () => {
@@ -548,9 +558,9 @@ describe('ask 卡整卡字节预算（飞书卡片请求体 30KB）', () => {
     const rendered = renderAskCard(ask);
     expect(rendered.promptTruncated).toBe(true);
     expect(cardBytes(rendered.json)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
-    const divs = questionDivs(rendered.json);
-    expect(divs[0].text.content).toBe(`**问题 1**\n${shortPrompt}`);
-    expect(divs[1].text.content).toContain('完整内容见本话题中的附件文件');
+    const shown = questionDivs(rendered.json);
+    expect(shown[0]).toBe(shortPrompt);
+    expect(shown[1]).toContain('完整内容见本话题中的附件文件');
     const attachment = askPromptAttachmentText(ask);
     expect(attachment).toContain(shortPrompt);
     expect(attachment).toContain(longPrompt);
@@ -591,7 +601,7 @@ describe('ask 卡整卡字节预算（飞书卡片请求体 30KB）', () => {
     const rendered = renderAskCard(makePending({ ...over, questions: [{ prompt: '选哪个？', multiSelect: false, options }] }));
     expect(rendered).toMatchObject({ promptTruncated: false, descriptionsTruncated: true, fits: true });
     // Lone surrogates survive JSON.stringify only as `\ud83d` escapes, so inspect the parsed text.
-    const notes = notationBlocks(JSON.parse(rendered.json)).join('\n');
+    const notes = optionTexts(JSON.parse(rendered.json)).join('\n');
     expect(notes).toContain('😀…');
     expect(notes).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
   });
@@ -646,7 +656,7 @@ describe('handleAskCardAction', () => {
     });
     expect(accepted).toBeDefined();
     expect(accepted?.toast).toBeUndefined();
-    expect((accepted as Record<string, any>)?.header?.title?.content).toContain('已结束');
+    expect((accepted as Record<string, any>)?.header?.title?.content).toBe(tr('card.ask.header.answered'));
     await expect(promise).resolves.toMatchObject({ kind: 'answered', answers: [['deploy']], by: 'ou_owner' });
   });
 
@@ -719,8 +729,9 @@ describe('handleAskCardAction', () => {
       },
     });
 
+    // The repainted card is the new form, with the toggled option ticked.
     expect(JSON.stringify(patch)).toContain('custom_0');
-    expect(JSON.stringify(patch)).toContain('\"type\":\"primary\"');
+    expect(allNodes(patch).filter(n => n.tag === 'checker').map(n => [n.name, n.checked])).toEqual([['opt_0_0', true], ['opt_0_1', false]]);
   });
 });
 
@@ -974,7 +985,7 @@ describe('handleAskCardAction: ask_submit 路径', () => {
     expect(result).toBeDefined();
     expect(result?.toast).toBeUndefined();
     const card = result as Record<string, any>;
-    expect(card.header?.title?.content).toContain('已结束');
+    expect(card.header?.title?.content).toBe(tr('card.ask.header.answered'));
     expect(card.header?.template).toBe('green');
     // 终态卡片包含选中的答案摘要
     expect(JSON.stringify(card)).toContain('是');
@@ -1026,7 +1037,7 @@ describe('handleAskCardAction: ask_submit 路径', () => {
     expect(result).toBeDefined();
     expect(result?.toast).toBeUndefined();
     const card = result as Record<string, any>;
-    expect(card.header?.title?.content).toContain('已结束');
+    expect(card.header?.title?.content).toBe(tr('card.ask.header.answered'));
     expect(JSON.stringify(card)).toContain('A');
   });
 });
@@ -1073,7 +1084,7 @@ describe('handleAskCardAction: 空多选提交二次确认', () => {
     expect(cardBlob).toContain('确认空提交');
     expect(cardBlob).toContain('confirm_empty');
     expect(cardBlob).toContain('你还没有勾选任何选项');
-    expect(cardBlob).not.toContain('已结束');
+    expect(cardBlob).not.toContain(tr('card.ask.header.answered'));
     // 未 settle，可继续
     expect(_getPending(ask.askId)?.settled).toBe(false);
   });
@@ -1098,7 +1109,7 @@ describe('handleAskCardAction: 空多选提交二次确认', () => {
     expect(mockedSubmitAsk).toHaveBeenLastCalledWith({ askId: ask.askId, nonce: ask.nonce, by: 'ou_owner', confirmEmpty: true });
     const card = result as Record<string, any>;
     // 终态卡片（settle 用 settledCardResponse，直接是 raw 卡片体，不含 card 包裹）
-    expect(card.header?.title?.content).toContain('已结束');
+    expect(card.header?.title?.content).toBe(tr('card.ask.header.answered'));
     expect(_getPending(ask.askId)?.settled).toBe(true);
   });
 
@@ -1171,7 +1182,7 @@ describe('handleAskCardAction: 空多选提交二次确认', () => {
     });
 
     const card = result as Record<string, any>;
-    expect(card.header?.title?.content).toContain('已结束');
+    expect(card.header?.title?.content).toBe(tr('card.ask.header.answered'));
     expect(JSON.stringify(card)).not.toContain('确认空提交');
     expect(_getPending(ask.askId)?.settled).toBe(true);
   });
@@ -1370,12 +1381,7 @@ describe('createLarkAskCardDispatcher', () => {
   });
 });
 
-describe('ask option layout（askOptionLayout per-bot 配置）', () => {
-  afterEach(() => {
-    // 还原为「无配置」lookup，避免污染同文件其它用例（未配置即 compact）。
-    setAskOptionLayoutLookup(() => undefined);
-  });
-
+describe('askOptionLayout per-bot 配置（仍接受、校验，但已不影响卡片排版）', () => {
   it('normalizeAskOptionLayout：合法值原样通过，非法值给 warning 并丢弃', () => {
     expect(normalizeAskOptionLayout(undefined)).toEqual({ warnings: [] });
     expect(normalizeAskOptionLayout(null)).toEqual({ warnings: [] });
@@ -1386,71 +1392,5 @@ describe('ask option layout（askOptionLayout per-bot 配置）', () => {
       expect(r.layout, JSON.stringify(bad)).toBeUndefined();
       expect(r.warnings).toHaveLength(1);
     }
-  });
-
-  it('askOptionLayoutForBot：lookup 未注册 / bot 未知 / 值非法 / 抛错一律回退 compact', () => {
-    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
-    setAskOptionLayoutLookup(() => undefined);
-    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
-    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'sideways' } }));
-    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
-    setAskOptionLayoutLookup(() => { throw new Error('boom'); });
-    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
-    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'vertical' } }));
-    expect(askOptionLayoutForBot('cli_ask')).toBe('vertical');
-    expect(askOptionLayoutForBot(undefined)).toBe('compact');
-  });
-
-  it('默认 compact：action 行每行最多 4 个按钮，无 column_set', () => {
-    const ask = makePending({
-      questions: [{
-        prompt: 'q', multiSelect: false,
-        options: Array.from({ length: 6 }, (_, i) => ({ key: `k${i}`, label: `L${i}` })),
-      }],
-    });
-    const card = JSON.parse(buildAskCard(ask));
-    expect(card.elements.some((el: any) => el.tag === 'column_set')).toBe(false);
-    const optionRows = card.elements.filter((el: any) =>
-      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SELECT_ACTION));
-    expect(optionRows).toHaveLength(2);
-    expect(optionRows[0].actions).toHaveLength(4);
-    expect(optionRows[1].actions).toHaveLength(2);
-  });
-
-  it('vertical：每个选项一个 column_set 行，单列 weighted、一按钮', () => {
-    setAskOptionLayoutLookup((id) => id === 'cli_ask'
-      ? { config: { askOptionLayout: 'vertical' } }
-      : undefined);
-    const card = JSON.parse(buildAskCard(makePending()));
-    const columnSets = card.elements.filter((el: any) => el.tag === 'column_set');
-    expect(columnSets).toHaveLength(3);
-    for (const row of columnSets) {
-      expect(row.flex_mode).toBe('none');
-      expect(row.horizontal_spacing).toBe('small');
-      expect(row.columns).toHaveLength(1);
-      expect(row.columns[0]).toMatchObject({ tag: 'column', width: 'weighted', weight: 1 });
-      const buttons = row.columns[0].elements.filter((el: any) => el.tag === 'button');
-      expect(buttons).toHaveLength(1);
-      expect(buttons[0].value.action).toBe(ASK_SELECT_ACTION);
-    }
-    // vertical 下不再有装选项按钮的 action 行
-    expect(card.elements.some((el: any) =>
-      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SELECT_ACTION))).toBe(false);
-  });
-
-  it('vertical 只影响选项按钮：submit 行仍是 action 行，按钮值不变', () => {
-    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'vertical' } }));
-    const ask = makePending({
-      questions: [
-        { prompt: 'q1', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
-      ],
-    });
-    const card = JSON.parse(buildAskCard(ask));
-    const submitRow = card.elements.find((el: any) =>
-      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SUBMIT_ACTION));
-    expect(submitRow).toBeDefined();
-    const toggleRows = card.elements.filter((el: any) => el.tag === 'column_set');
-    expect(toggleRows).toHaveLength(2);
-    expect(toggleRows[0].columns[0].elements[0].value.action).toBe(ASK_TOGGLE_ACTION);
   });
 });

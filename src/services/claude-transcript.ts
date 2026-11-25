@@ -1686,6 +1686,7 @@ export class AbsorbedReplyCollector {
     return {
       text: picked.map(part => part.text).join('\n\n'),
       lastUuid: picked[picked.length - 1].uuid,
+      uuids: [...new Set(picked.map(part => part.uuid))],
       source: texts.length > 0 ? 'text' : 'thinking',
     };
   }
@@ -1693,12 +1694,19 @@ export class AbsorbedReplyCollector {
 
 /** The reply to a folded input. `source: 'thinking'` means the model said it
  *  only in a thinking summary — possibly a plan rather than an answer, and
- *  content a bot with its thinking display off does not show. */
+ *  content a bot with its thinking display off does not show. `uuids` are
+ *  the records it was read from, in transcript order. */
 export interface AbsorbedInputReply {
   text: string;
   lastUuid: string;
+  uuids: string[];
   source: 'text' | 'thinking';
 }
+
+/** Longest folded-turn reply the daemon posts whole; a longer one is cut in
+ *  its card. The worker leaves only a reply posted whole out of the host
+ *  turn's final. */
+export const ABSORBED_REPLY_MAX_CHARS = 6_000;
 
 /** {@link AbsorbedReplyCollector} over a whole transcript: the reply to the
  *  input folded in at the record `absorbedAtUuid`, read up to the end of the

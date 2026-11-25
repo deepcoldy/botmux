@@ -49,3 +49,22 @@ export function decideSessionRenameSettlement(state: {
   if (state.surface === 'occupied') return 'hold';
   return state.recorded ? 'release' : 'hold';
 }
+
+/** Missing a rename receipt must never authorize typing into the old CLI.
+ * A private, positively idle CLI can instead be replaced, preserving its
+ * native conversation and all inputs that have not yet been submitted.
+ * Unknown/occupied surfaces still require the existing manual recovery. */
+export function shouldRecoverUnconfirmedSessionRename(state: {
+  surface: SessionRenameSurface | undefined;
+  elapsedMs: number;
+  timeoutMs: number;
+  hasQueuedInput: boolean;
+  alreadyRecovered: boolean;
+  mayRestart: boolean;
+}): boolean {
+  return state.surface === 'settled'
+    && state.elapsedMs >= state.timeoutMs
+    && state.hasQueuedInput
+    && !state.alreadyRecovered
+    && state.mayRestart;
+}

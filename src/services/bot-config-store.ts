@@ -60,6 +60,7 @@ import {
   notifyPinStreamingCardChanged,
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
+import { notifyFollowUpReplyChanged } from './follow-up-reply-change.js';
 import {
   cliModelMayKeepReasoningEffort,
   cliModelSupportsReasoningEffort,
@@ -830,6 +831,9 @@ async function applyConfigFieldInternal(
       notifyPinStreamingCardChanged(larkAppId, nextPinStreamingCard);
     }
   }
+  // /config, /botconfig and the config-card boolean toggles all land here.
+  // Keep workers on the same live value as the daemon's absorbed_reply gate.
+  if (spec.configKey === 'followUpReply') notifyFollowUpReplyChanged(larkAppId, bot.config.followUpReply === true);
   logger.info(`[config:${larkAppId}] set ${spec.key}: ${oldText} -> ${newText}`);
   return { ok: true, oldText, newText, effect: spec.effect };
 }
