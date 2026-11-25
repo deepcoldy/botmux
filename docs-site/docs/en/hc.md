@@ -10,7 +10,7 @@ First, check whether it fits:
 | A long-lived CLI that survives daemon restarts, plus the Web Terminal | Yes, same as tmux |
 | A file sandbox (`sandbox`) | Yes, same as tmux |
 | `/adopt` an existing terminal session | No, use tmux / Herdr / Zellij |
-| A daemon running on macOS | No, the hc backend is Linux only |
+| A daemon running on macOS | Yes, with herdr-core installed |
 
 hc is **explicit opt-in**: the default backend is still tmux, botmux does not install hc, and finding `hc` on the machine never makes botmux pick it automatically.
 
@@ -22,7 +22,7 @@ hc pushes output to botmux, which keeps a local screen mirror, so reading a scre
 
 ## 1. Get herdr-core
 
-You need **herdr-core 0.1.19 or newer**, on **Linux**.
+You need **herdr-core 0.1.19 or newer** on **Linux or macOS**.
 
 botmux looks for the executable in this order and uses the first one it finds:
 
@@ -82,9 +82,9 @@ botmux uses only its own hc core, fully separate from any hc you use yourself:
 | Item | botmux's core |
 |---|---|
 | Core name (`HC_SESSION`) | `botmux` |
-| Socket | `$XDG_RUNTIME_DIR/herdr-core/botmux.sock` (`/run/user/<uid>/herdr-core/botmux.sock` when `XDG_RUNTIME_DIR` is unset) |
+| Socket | `$XDG_RUNTIME_DIR/herdr-core/botmux.sock` when set. Otherwise `/run/user/<uid>/herdr-core/botmux.sock` on Linux, or `~/.botmux/hc/botmux.sock` under the botmux data root on macOS |
 | Config directory | `~/.botmux/hc/config`; botmux writes its `herdr-core/config.toml` |
-| State directory | Next to the socket: `…/herdr-core/botmux.state` |
+| State directory | `botmux.state` next to the socket |
 
 - botmux never reads, connects to or modifies your own core (usually `default`) or the config in `~/.config/herdr-core`.
 - When botmux calls hc it drops inherited `HC_*` variables and sets the items above explicitly, so `HC_SESSION` or `HC_SOCKET` in your shell cannot steer a session to another core.
@@ -110,7 +110,11 @@ Before attaching, botmux asks the core directly whether the terminal is still li
 - the terminal has ended or no longer exists;
 - a terminal with the same name belongs to another session.
 
-The hc backend is Linux only, so the one-click **💻 Open …** button on Feishu cards (offered only by daemons on macOS) does not apply to hc sessions.
+On macOS, the **💻 Open …** button on Feishu cards uses the same ownership check when attaching to an hc session.
+
+In the Dashboard, enable **Automatically create Herdr tabs** under **Bot Config → Advanced → Session backend**, or set `"hcHerdrTabs": true` on that bot in `bots.json`. The setting defaults to off and applies to hc sessions. When a session starts or a new worker reattaches, botmux registers one Tab per topic in a native Space grouped by working directory on its private core.
+
+New tabs use the Botmux session title, falling back to the hc session name (`bmx-<first eight characters of the session ID>`). Registration works before Herdr App connects. Add the private core as a Machine in Herdr App to see the registered tabs. Turning it off applies when a session next starts or a new worker reattaches. Existing tabs can be managed in Herdr App, and a parked tab stays parked if the same worker reconnects. Botmux manages terminal recovery.
 
 ## 5. Session lifecycle
 
@@ -127,7 +131,7 @@ If you run `botmux delete` while the daemon is offline and the terminal's label 
 
 The core (socket) a terminal lives on is recorded when the session is first created. Even if the daemon's environment changes later (for example a different `XDG_RUNTIME_DIR`), botmux still looks for it on that original core.
 
-When `XDG_RUNTIME_DIR` is `/run/user/<uid>`, hc runs the core and its terminals in systemd user units outside the daemon's process group, so a daemon restart does not take them down.
+On Linux, hc runs the core and its terminals in systemd user units when `XDG_RUNTIME_DIR` is `/run/user/<uid>`. For local macOS sessions, hc starts the core through launchd.
 
 :::warning Upgrading herdr-core
 Replacing the binary on disk does not replace a core that is already running. If the running botmux core is older than 0.1.19, new sessions are refused, and the error names that core's socket and pid. botmux does not restart it for you, because ending the core ends every terminal in it; once you have confirmed no session needs keeping, end that process and try again.
@@ -135,7 +139,6 @@ Replacing the binary on disk does not replace a core that is already running. If
 
 ## 6. Differences from tmux and limitations
 
-- **Linux only**, and you provide herdr-core yourself.
 - **No `/adopt`**: botmux does not scan terminals in hc. To adopt an existing external session, use tmux / Herdr / Zellij.
 - **No tmux copy mode**: scrolling in the Web Terminal comes from the browser's own scrollback; when a worker reattaches it restores up to about 3000 lines of history.
 - **Terminal size between workers**: while no worker is attached (for example during the few seconds of a daemon restart), the terminal stays at 160×50 instead of being resized.

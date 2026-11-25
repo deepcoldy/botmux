@@ -75,7 +75,7 @@ botmux 的会话放在独立的 tmux server（`tmux -L botmux`）上，不和你
 | `pty` | 应急：机器上实在跑不了 tmux | 不能，下条消息冷恢复 |
 | `herdr` / `zellij` | 你本来就用这两个终端工具，想在里面直接看到 bot 会话 | 能 |
 | `zmx` | 想用轻量的 ZMX 托管会话，见 [ZMX 会话后端](/zmx) | 能 |
-| `hc` | 会话很多、tmux server 成了瓶颈（仅 Linux，需自备 herdr-core ≥ 0.1.19），见 [hc 会话后端](/hc) | 能 |
+| `hc` | 会话很多、tmux server 成了瓶颈（Linux / macOS，需自备 herdr-core ≥ 0.1.19），见 [hc 会话后端](/hc) | 能 |
 
 ```bash
 # 例：整台机器临时改用 pty（仅应急）

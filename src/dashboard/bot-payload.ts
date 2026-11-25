@@ -227,6 +227,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       : [],
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
+    hcHerdrTabs: j?.hcHerdrTabs === true,
     defaultBackendType: typeof j?.defaultBackendType === 'string' && j.defaultBackendType ? j.defaultBackendType : null,
     ...normalizeReplyFooter(j),
     showReplyTiming: j?.showReplyTiming === true,

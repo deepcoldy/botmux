@@ -169,8 +169,26 @@ describe('hcCorePaths', () => {
   });
 
   it('falls back to /run/user/<uid> without an absolute XDG_RUNTIME_DIR', () => {
-    expect(hcCorePaths({}, { uid: 4242 }).runtimeDir).toBe('/run/user/4242');
-    expect(hcCorePaths({ XDG_RUNTIME_DIR: 'relative/run' }, { uid: 4242 }).runtimeDir).toBe('/run/user/4242');
+    const linux = { uid: 4242, platform: 'linux' } as const;
+    expect(hcCorePaths({}, linux).runtimeDir).toBe('/run/user/4242');
+    expect(hcCorePaths({ XDG_RUNTIME_DIR: 'relative/run' }, linux).runtimeDir).toBe('/run/user/4242');
+  });
+
+  it('uses the botmux root for the macOS fallback and keeps the address across TMPDIR changes', () => {
+    const env = { SESSION_DATA_DIR: '/srv/botmux/data' };
+    const darwin = { platform: 'darwin' } as const;
+    const paths = hcCorePaths(env, darwin);
+
+    expect(paths).toMatchObject({
+      runtimeDir: '/srv/botmux',
+      socket: '/srv/botmux/hc/botmux.sock',
+      stateHome: '/srv/botmux/hc/botmux.state',
+    });
+    expect(hcCorePaths({ ...env, TMPDIR: '/tmp/worker', XDG_RUNTIME_DIR: 'relative/run' }, darwin)).toEqual(paths);
+    expect(hcCorePaths({ ...env, XDG_RUNTIME_DIR: '/tmp/xdg' }, darwin).socket).toBe('/tmp/xdg/herdr-core/botmux.sock');
+    expect(hcCorePaths({ ...env, XDG_RUNTIME_DIR: '/tmp/xdg' }, {
+      ...darwin, core: { hcSession: paths.session, socket: paths.socket },
+    })).toEqual(paths);
   });
 
   it('takes a target\'s frozen core as given, whatever the env says now', () => {
@@ -183,14 +201,14 @@ describe('hcCorePaths', () => {
     expect(() => hcCorePaths({}, { core: { ...core, socket: `/${'r'.repeat(107)}/botmux.sock` } })).toThrow();
   });
 
-  it('accepts exactly up to the byte limit of the longest holder socket path', () => {
+  it.each([['linux', 107], ['darwin', 103]] as const)('honors the %s byte limit for the longest holder socket', (platform, maxBytes) => {
     // A holder listens on `<prefix minus .sock>.<8 hex>.sock`: 9 bytes past the prefix.
     const overhead = hcCorePaths({ XDG_RUNTIME_DIR: '/x' }).holderSocket.length - '/x'.length + 9;
-    const fits = `/${'r'.repeat(107 - overhead - 1)}`;
+    const fits = `/${'r'.repeat(maxBytes - overhead - 1)}`;
 
-    expect(hcCorePaths({ XDG_RUNTIME_DIR: fits }).socket.startsWith(fits)).toBe(true);
-    expect(() => hcCorePaths({ XDG_RUNTIME_DIR: `${fits}r` })).toThrow();
-    expect(() => hcCorePaths({ XDG_RUNTIME_DIR: `${fits.slice(0, -1)}é` })).toThrow();
+    expect(hcCorePaths({ XDG_RUNTIME_DIR: fits }, { platform }).socket.startsWith(fits)).toBe(true);
+    expect(() => hcCorePaths({ XDG_RUNTIME_DIR: `${fits}r` }, { platform })).toThrow();
+    expect(() => hcCorePaths({ XDG_RUNTIME_DIR: `${fits.slice(0, -1)}é` }, { platform })).toThrow();
   });
 });
 

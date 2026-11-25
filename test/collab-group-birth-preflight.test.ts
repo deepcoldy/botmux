@@ -1,0 +1,457 @@
+/**
+ * preflightCollabGroupBirth 阶段 1（design §5.2）契约测试。
+ *
+ * 直接驱动 preflight + 注入 deps（临时 dataDir + 假时钟 + 假 peer preflight），
+ * 并 mock bot-registry 让 bot 带 collaboration 配置。覆盖：
+ *   - 关闭协作 → legacy 且无 store 写入；
+ *   - enabled 结构失败 → failed，不占位；
+ *   - 同 sourceKey 重投 → existing 同 initId；
+ *   - 同 DM 不同 source → busy；
+ *   - peer 失败 → failed 且释放 activeByDmChat（fail-closed）；
+ *   - ready 时带 creatorAdmissionOperationId。
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+let tempDir: string;
+let clock = 0;
+const now = () => ++clock;
+
+// mock 的 bot 配置状态用 vi.hoisted 提升：vi.mock 工厂被 vitest 物理提升到静态 import
+// 之前，只有 hoisted 回调能在工厂求值前就绪。setBotConfig 仅存在于 mock 工厂、真实
+// bot-registry 并无此导出，因此不能静态 import（bun:test 的 mock.module 不回填真实模块
+// 不存在的命名导出，会在加载期 SyntaxError）。本文件经 vi.hoisted 被 bun-leg selector
+// 判定为 vitest-only，bun 腿跳过、vitest 腿照常覆盖。
+const { configs, setBotConfig } = vi.hoisted(() => {
+  const configs = new Map<string, any>();
+  return {
+    configs,
+    setBotConfig: (appId: string, cfg: any) => { configs.set(appId, cfg); },
+  };
+});
+
+// config.js 会拉入 zod / voice 等大依赖图，直接 mock 掉，避免无关模块加载。
+vi.mock('../src/config.js', () => ({
+  config: { session: { get dataDir() { return tempDir; } }, daemon: { backendType: 'pty' } },
+}));
+
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: (appId: string) => ({ config: configs.get(appId) ?? { sessionGroup: undefined } }),
+  loadBotConfigsCached: () => [],
+}));
+
+// 直接 import（避免 config.js 的 SESSION_DATA_DIR 依赖）——preflight 用 deps.dataDir。
+import { preflightCollabGroupBirth, startCollabGroupBirth, releaseCollabGroupBirth, realCollabPeerPreflight, recoverRunningCollabGroupBirthsOnStartup, type CollabBirthStartupRecoveryOpts } from '../src/core/collab-group-birth.js';
+import { readCollabInitStore, patchCollabInitEntry, __testOnly_resetCollabInitMutexes } from '../src/services/collab-init-store.js';
+import { collabInitId, collabSourceKey } from '../src/services/collab-group-config.js';
+import { preflightCollabPeer } from '../src/core/collab-preflight-ipc.js';
+import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
+
+const APP = 'cli_creator';
+const DM = 'oc_dm';
+
+function ctx(messageId: string): RoutingContext {
+  return {
+    chatId: DM,
+    messageId,
+    chatType: 'p2p',
+    scope: 'thread',
+    anchor: messageId,
+    larkAppId: APP,
+  };
+}
+
+function data(messageId: string): any {
+  return {
+    sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+    message: { message_id: messageId, chat_id: DM, chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text: 'hi' }) },
+  };
+}
+
+function collabEnabledConfig(): any {
+  return {
+    sessionGroup: {
+      collaboration: {
+        enabled: true,
+        agents: [{ appId: 'cli_creator', roleMode: 'no-chat-role' }],
+        kickoff: [{ appId: 'cli_creator', trigger: 'immediate' }],
+      },
+    },
+  };
+}
+
+function deps() {
+  return {
+    dataDir: tempDir,
+    now,
+    resolveProfile: () => 'role-content',
+    resolveTeamRole: () => null,
+    resolveAgent: (appId: string) => ({ exists: true, apiOnly: false }),
+    peerPreflight: async () => ({ ok: true as const }),
+  };
+}
+
+beforeEach(() => {
+  tempDir = mkdtempSync(join(tmpdir(), 'collab-preflight-'));
+  clock = 0;
+  __testOnly_resetCollabInitMutexes();
+});
+
+afterEach(() => {
+  rmSync(tempDir, { recursive: true, force: true });
+  __testOnly_resetCollabInitMutexes();
+});
+
+describe('preflightCollabGroupBirth', () => {
+  it('默认关闭 → legacy 且无 collab store 写入', async () => {
+    setBotConfig(APP, { sessionGroup: undefined });
+    const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
+    expect(r.kind).toBe('legacy');
+    expect(readCollabInitStore(tempDir, APP).entries).toEqual({});
+  });
+
+  it('enabled 但结构失败 → failed，不占位不建群', async () => {
+    setBotConfig(APP, {
+      sessionGroup: { collaboration: { enabled: true, agents: [], kickoff: [] } },
+    });
+    const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
+    expect(r.kind).toBe('failed');
+    expect(readCollabInitStore(tempDir, APP).entries).toEqual({});
+  });
+
+  it('同 sourceKey 重投 → existing 同 initId（config v1→v2 不建第二请求）', async () => {
+    setBotConfig(APP, collabEnabledConfig());
+    const sourceKey = collabSourceKey(APP, DM, 'om_1');
+    const initId = collabInitId(sourceKey);
+
+    const first = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
+    expect(first.kind).toBe('ready');
+
+    // config v2（不同内容）也重投同一 source → existing 同 initId
+    setBotConfig(APP, {
+      sessionGroup: {
+        collaboration: {
+          enabled: true,
+          agents: [{ appId: 'cli_creator', roleMode: 'no-chat-role' }],
+          kickoff: [{ appId: 'cli_creator', trigger: 'immediate', prompt: 'v2' }],
+        },
+      },
+    });
+    const second = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
+    expect(second.kind).toBe('existing');
+    if (second.kind === 'existing') {
+      expect(second.initId).toBe(initId);
+      expect(second.status).toBe('awaiting-input');
+    }
+    // 只有一个 entry；同一请求不得沿用旧 running 快照自动恢复
+    const entry = readCollabInitStore(tempDir, APP).entries[initId];
+    expect(entry.state).toBe('awaiting-input');
+    expect(entry.awaiting?.reason).toBe('CONFIG_CHANGED');
+  });
+
+  it('同 DM 不同 source → busy', async () => {
+    setBotConfig(APP, collabEnabledConfig());
+    const first = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
+    expect(first.kind).toBe('ready');
+    const second = await preflightCollabGroupBirth(data('om_2'), ctx('om_2'), deps());
+    expect(second.kind).toBe('busy');
+  });
+
+  it('peer 失败 → failed 且释放 activeByDmChat（fail-closed，不 fallback legacy）', async () => {
+    setBotConfig(APP, collabEnabledConfig());
+    const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), {
+      ...deps(),
+      peerPreflight: async () => ({ ok: false, errors: ['target 未声明 durable-turn-output-receipt-v1'] }),
+    });
+    expect(r.kind).toBe('failed');
+    if (r.kind === 'failed') expect(r.releasesDmChat).toBe(true);
+    // activeByDmChat 已释放，entry 保留为 failed
+    const store = readCollabInitStore(tempDir, APP);
+    expect(store.activeByDmChat[DM]).toBeUndefined();
+    const entry = Object.values(store.entries)[0];
+    expect(entry.state).toBe('failed');
+  });
+
+  it('ready 时带 creatorAdmissionOperationId + configVersion', async () => {
+    setBotConfig(APP, collabEnabledConfig());
+    const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
+    expect(r.kind).toBe('ready');
+    if (r.kind !== 'ready') return;
+    expect(r.initId).toBe(collabInitId(collabSourceKey(APP, DM, 'om_1')));
+    expect(r.creatorAdmissionOperationId).toBeTruthy();
+    expect(r.configVersion).toBeTruthy();
+    expect(r.config.enabled).toBe(true);
+    const entry = readCollabInitStore(tempDir, APP).entries[r.initId];
+    expect(entry.sourceSenderOpenId).toBe('ou_owner');
+    expect(entry.resolvedProfileEntries).toEqual({});
+    expect(entry.referencedTeamRoles).toEqual({ [APP]: null });
+  });
+
+  it('peer 失败场景：afterAgentTurn 但目标未声明 durable-turn-output-receipt-v1 → failed', async () => {
+    setBotConfig(APP, {
+      sessionGroup: {
+        collaboration: {
+          enabled: true,
+          agents: [{ appId: 'cli_creator', roleMode: 'no-chat-role' }, { appId: 'cli_builder', roleMode: 'no-chat-role' }],
+          kickoff: [
+            { appId: 'cli_creator', trigger: 'immediate' },
+            { appId: 'cli_builder', trigger: 'afterAgentTurn', afterAppId: 'cli_creator', artifact: { type: 'marked-url', hosts: ['example.com'] } },
+          ],
+        },
+      },
+    });
+    const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), {
+      ...deps(),
+      peerPreflight: async () => ({ ok: false, errors: ['peer 未声明 durable-turn-output-receipt-v1'] }),
+    });
+    expect(r.kind).toBe('failed');
+  });
+
+  it('startCollabGroupBirth 占位语义：返回 collab-handled（不递归 handleNewTopic）', async () => {
+    setBotConfig(APP, collabEnabledConfig());
+    const initId = collabInitId(collabSourceKey(APP, DM, 'om_1'));
+    const r = await startCollabGroupBirth(data('om_1'), ctx('om_1'), initId, undefined);
+    expect(r.kind).toBe('collab-handled');
+    if (r.kind === 'collab-handled') expect(r.initId).toBe(initId);
+  });
+
+  it('releaseCollabGroupBirth 释放 activeByDmChat（扣费被拒后不永久 busy）', async () => {
+    setBotConfig(APP, collabEnabledConfig());
+    const initId = collabInitId(collabSourceKey(APP, DM, 'om_1'));
+    await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
+    // 释放前 busy
+    expect((await preflightCollabGroupBirth(data('om_2'), ctx('om_2'), deps())).kind).toBe('busy');
+    await releaseCollabGroupBirth({ dataDir: tempDir, creatorAppId: APP, initId, dmChatId: DM, now });
+    // 释放后新 source 可建新请求
+    const next = await preflightCollabGroupBirth(data('om_2'), ctx('om_2'), deps());
+    expect(next.kind).toBe('ready');
+    // sourceIndex 永久：原 source 仍 existing
+    expect((await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps())).kind).toBe('existing');
+  });
+
+  it('peerPreflight Promise rejection → failed 并释放占位，不残留 running（P2#5）', async () => {
+    setBotConfig(APP, collabEnabledConfig());
+    const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), {
+      ...deps(),
+      peerPreflight: async () => { throw new Error('boom'); },
+    });
+    expect(r.kind).toBe('failed');
+    if (r.kind === 'failed') expect(r.releasesDmChat).toBe(true);
+    // 占位已释放：无 running 残留，同 DM 下一条不 busy
+    const store = readCollabInitStore(tempDir, APP);
+    expect(store.activeByDmChat[DM]).toBeUndefined();
+    expect(Object.values(store.entries).some(e => e.state === 'running')).toBe(false);
+    const next = await preflightCollabGroupBirth(data('om_2'), ctx('om_2'), deps());
+    expect(next.kind).toBe('ready');
+  });
+
+  it('真实 IPC deadline 到期 → preflight failed 并释放 activeByDmChat', async () => {
+    setBotConfig(APP, collabEnabledConfig());
+    const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), {
+      ...deps(),
+      peerPreflight: () => preflightCollabPeer(
+        { larkAppId: 'cli_peer', ipcPort: 1, bootInstanceId: 'x'.repeat(43), dispatchLaunchIpcProtocol: 'v1' },
+        { schemaVersion: 1, initId: 'a'.repeat(64), sourceMessageId: 'om_1', configVersion: 'cv', targetLarkAppId: 'cli_peer' },
+        {
+          secret: 's'.repeat(32), timeoutMs: 5,
+          fetchImpl: ((_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+          })) as typeof fetch,
+        },
+      ).then(() => ({ ok: false, errors: ['timeout'] })),
+    });
+    expect(r.kind).toBe('failed');
+    expect(readCollabInitStore(tempDir, APP).activeByDmChat[DM]).toBeUndefined();
+  });
+
+  it('生产默认：S2-S5 编排未接入生产 → 合法 enabled 配置 fail-closed（不切回 ready）', async () => {
+    setBotConfig(APP, collabEnabledConfig());
+    // 不注入 peerPreflight：生产 defaultDeps 保持 fail-closed（S2-S5 未接入，不把 ready 切开放行）。
+    const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), {
+      dataDir: tempDir,
+      now,
+      resolveProfile: () => 'r',
+      resolveTeamRole: () => null,
+      resolveAgent: (appId) => (appId === APP ? { exists: true, apiOnly: false } : undefined),
+    });
+    expect(r.kind).toBe('failed');
+    if (r.kind === 'failed') expect(r.reason).toContain('S2-S5 编排未接入');
+  });
+
+  describe('running entry 启动恢复', () => {
+    async function seedRunning(source = 'om_recovery', withReceipt = true) {
+      setBotConfig(APP, collabEnabledConfig());
+      const preflight = await preflightCollabGroupBirth(data(source), ctx(source), deps());
+      expect(preflight.kind).toBe('ready');
+      const initId = collabInitId(collabSourceKey(APP, DM, source));
+      const receipt = {
+        operationId: `adm-op-${initId}`,
+        quotaKey: `chat:${DM}:ou_owner`, used: 1, chargedAt: 1000, allow: true as const,
+        originReason: 'chatGrant', originQuotaKey: `chat:${DM}:ou_owner`, originChatId: DM,
+      };
+      if (withReceipt) {
+        await patchCollabInitEntry({
+          dataDir: tempDir, creatorAppId: APP, initId,
+          mutate: (entry) => { entry.creatorAdmissionReceipt = receipt; return true; },
+        });
+      }
+      return { initId, receipt };
+    }
+
+    function recoveryOptions(startImpl: CollabBirthStartupRecoveryOpts['startImpl']): CollabBirthStartupRecoveryOpts {
+      return {
+        dataDir: tempDir, creatorAppIds: [APP], now, preflightDeps: deps(), startImpl,
+        evaluateCreatorTalk: () => ({ allowed: true }),
+      };
+    }
+
+    it('重建最小原事件并恢复 durable admission 后的 running entry', async () => {
+      const { initId, receipt } = await seedRunning();
+      const calls: any[] = [];
+      const result = await recoverRunningCollabGroupBirthsOnStartup(recoveryOptions(async (...args) => {
+        calls.push(args);
+        return { kind: 'collab-handled', initId, status: 'running' };
+      }));
+      expect(result.scanned).toBe(1);
+      expect(result.resumeAttempts).toBe(1);
+      expect(result.errors).toEqual([]);
+      expect(calls).toHaveLength(1);
+      expect(calls[0][0].sender.sender_id.open_id).toBe('ou_owner');
+      expect(calls[0][1].messageId).toBe('om_recovery');
+      expect(calls[0][2]).toBe(initId);
+      expect(calls[0][3]).toEqual(receipt);
+    });
+
+    it('恢复前配置已变化 → CONFIG_CHANGED，不调用 S1', async () => {
+      await seedRunning();
+      setBotConfig(APP, {
+        sessionGroup: {
+          collaboration: {
+            enabled: true,
+            agents: [{ appId: APP, roleMode: 'no-chat-role' }],
+            kickoff: [{ appId: APP, trigger: 'immediate', prompt: 'changed' }],
+          },
+        },
+      });
+      const start = vi.fn(async () => { throw new Error('must not start'); });
+      const result = await recoverRunningCollabGroupBirthsOnStartup(recoveryOptions(start));
+      expect(result.resumeAttempts).toBe(0);
+      expect(result.awaitingInput).toBe(1);
+      expect(start).not.toHaveBeenCalled();
+      const entry = Object.values(readCollabInitStore(tempDir, APP).entries)[0];
+      expect(entry.state).toBe('awaiting-input');
+      expect(entry.awaiting?.reason).toBe('CONFIG_CHANGED');
+    });
+
+    it('恢复必须重跑 peer preflight；offline → PEER_NOT_READY 且零 S1', async () => {
+      const { initId } = await seedRunning('om_peer_recheck');
+      const start = vi.fn(async () => { throw new Error('must not start'); });
+      const peer = vi.fn(async () => ({ ok: false as const, errors: ['peer offline'] }));
+      const options = recoveryOptions(start);
+      options.preflightDeps = { ...deps(), peerPreflight: peer };
+      const result = await recoverRunningCollabGroupBirthsOnStartup(options);
+      expect(peer).toHaveBeenCalledTimes(1);
+      expect(start).not.toHaveBeenCalled();
+      expect(result.resumeAttempts).toBe(0);
+      const entry = readCollabInitStore(tempDir, APP).entries[initId];
+      expect(entry.state).toBe('awaiting-input');
+      expect(entry.awaiting?.reason).toBe('PEER_NOT_READY');
+    });
+
+    it('恢复时 creator 已撤权 → CREATOR_NOT_AUTHORIZED，零 S1', async () => {
+      const { initId } = await seedRunning('om_creator_revoked');
+      const start = vi.fn(async () => { throw new Error('must not start'); });
+      const options = recoveryOptions(start);
+      options.evaluateCreatorTalk = () => ({ allowed: false, reason: 'revoked' });
+      const result = await recoverRunningCollabGroupBirthsOnStartup(options);
+      expect(result.resumeAttempts).toBe(0);
+      expect(start).not.toHaveBeenCalled();
+      const entry = readCollabInitStore(tempDir, APP).entries[initId];
+      expect(entry.state).toBe('awaiting-input');
+      expect(entry.awaiting?.reason).toBe('CREATOR_NOT_AUTHORIZED');
+    });
+
+    it('恢复 peer 检查期间取消 → 不覆盖 cancelled，不重建 active 指针', async () => {
+      const { initId } = await seedRunning('om_recovery_cancel');
+      const start = vi.fn(async () => { throw new Error('must not start'); });
+      const options = recoveryOptions(start);
+      options.preflightDeps = {
+        ...deps(),
+        peerPreflight: async () => {
+          await patchCollabInitEntry({
+            dataDir: tempDir, creatorAppId: APP, initId,
+            mutate: (entry) => { entry.state = 'cancelled'; entry.cancelReason = 'human cancel'; return true; },
+          });
+          await import('../src/services/collab-init-store.js').then(({ markCollabInitTerminal }) =>
+            markCollabInitTerminal({ dataDir: tempDir, creatorAppId: APP, initId, dmChatId: DM, state: 'cancelled', now: now(), cancelReason: 'human cancel' }));
+          return { ok: false as const, errors: ['peer offline'] };
+        },
+      };
+      const result = await recoverRunningCollabGroupBirthsOnStartup(options);
+      expect(result.resumeAttempts).toBe(0);
+      expect(start).not.toHaveBeenCalled();
+      const store = readCollabInitStore(tempDir, APP);
+      expect(store.entries[initId].state).toBe('cancelled');
+      expect(store.entries[initId].cancelReason).toBe('human cancel');
+      expect(store.activeByDmChat[DM]).toBeUndefined();
+    });
+
+    it('无 durable receipt 且无 chatId → 未提交占位失败并释放，不建群', async () => {
+      const { initId } = await seedRunning('om_uncommitted', false);
+      const start = vi.fn(async () => { throw new Error('must not start'); });
+      const result = await recoverRunningCollabGroupBirthsOnStartup(recoveryOptions(start));
+      expect(result.releasedUncommitted).toBe(1);
+      expect(result.resumeAttempts).toBe(0);
+      expect(start).not.toHaveBeenCalled();
+      const store = readCollabInitStore(tempDir, APP);
+      expect(store.entries[initId].state).toBe('failed');
+      expect(store.activeByDmChat[DM]).toBeUndefined();
+    });
+  });
+
+  it('R4：creator 被 afterAgentTurn 依赖且 backendType=herdr（不声明能力）→ 未就绪', async () => {
+    setBotConfig(APP, { backendType: 'herdr', sessionGroup: undefined });
+    // creator 被 peer 依赖，但 creator 自己 backendType=herdr 不声明 durable-turn-output-receipt-v1。
+    const r = await realCollabPeerPreflight({
+      config: {
+        enabled: true,
+        agents: [{ appId: APP, roleMode: 'no-chat-role' }, { appId: 'cli_peer', roleMode: 'no-chat-role' }],
+        kickoff: [
+          { appId: APP, trigger: 'immediate' },
+          { appId: 'cli_peer', trigger: 'afterAgentTurn', afterAppId: APP, artifact: { type: 'marked-url', hosts: ['x.com'] } },
+        ],
+      } as any,
+      initId: 'a'.repeat(64),
+      sourceMessageId: 'om_src',
+      configVersion: 'cv',
+      creatorAppId: APP,
+      dataDir: tempDir,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errors.some(e => e.includes('creator') && e.includes('durable-turn-output-receipt'))).toBe(true);
+  });
+
+  it('P2：creator cliId=mojo + 未显式 backendType → resolvePairedBackendId 解析为 mojo，未就绪', async () => {
+    // cliId=mojo 是远程 backend id，resolvePairedBackendId 返回 'mojo'，不在 durable-turn-output-receipt-v1 组合。
+    setBotConfig(APP, { cliId: 'mojo', backendType: undefined, sessionGroup: undefined });
+    const r = await realCollabPeerPreflight({
+      config: {
+        enabled: true,
+        agents: [{ appId: APP, roleMode: 'no-chat-role' }, { appId: 'cli_peer', roleMode: 'no-chat-role' }],
+        kickoff: [
+          { appId: APP, trigger: 'immediate' },
+          { appId: 'cli_peer', trigger: 'afterAgentTurn', afterAppId: APP, artifact: { type: 'marked-url', hosts: ['x.com'] } },
+        ],
+      } as any,
+      initId: 'a'.repeat(64),
+      sourceMessageId: 'om_src',
+      configVersion: 'cv',
+      creatorAppId: APP,
+      dataDir: tempDir,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errors.some(e => e.includes('creator') && e.includes('mojo'))).toBe(true);
+  });
+});
