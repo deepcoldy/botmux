@@ -31,8 +31,10 @@ export type PlatformAuthorizationRequestResult =
   | { kind: 'legacy' }
   /** Several cards were already sent to the person today; nothing was sent. */
   | { kind: 'request_cap'; repeat?: true }
-  /** The platform did not take the request; nothing was sent. */
-  | { kind: 'unavailable' };
+  /** The platform did not take the request; nothing was sent. `guardRefused`
+   * distinguishes a caller's turn fence from a platform/lookup failure so a
+   * different, still-valid caller sharing the request can try on its own. */
+  | { kind: 'unavailable'; guardRefused?: true };
 
 export interface PlatformAuthorizationRequestArgs {
   botConfig: Pick<BotConfig, 'larkAppId' | 'triggerUserAuth'>;
@@ -41,7 +43,8 @@ export interface PlatformAuthorizationRequestArgs {
   unionId?: string;
   /** Extra lark-cli scopes the refused command needs. */
   scopes?: readonly string[];
-  /** Recheck a live turn after resolving the person, before sending a card. */
+  /** Check this caller before reusing an answer and again after resolving the
+   * person, before sending a card. */
   stillAllowed?: () => boolean;
 }
 
@@ -80,6 +83,10 @@ function platformTools(botConfig: Pick<BotConfig, 'triggerUserAuth'>): TriggerUs
   ];
 }
 
+function callerAllowed(args: PlatformAuthorizationRequestArgs): boolean {
+  try { return args.stillAllowed ? args.stillAllowed() === true : true; } catch { return false; }
+}
+
 export async function askPlatformToAuthorize(
   args: PlatformAuthorizationRequestArgs,
   deps: Partial<Deps> = {},
@@ -88,19 +95,35 @@ export async function askPlatformToAuthorize(
   const who = args.unionId ?? args.openId ?? '';
   const scopes = [...new Set(args.scopes ?? [])].sort();
   const key = JSON.stringify([args.botConfig.larkAppId, who, scopes]);
-  const now = d.now();
-  const hit = recent.get(key);
-  if (hit && now - hit.at < LINK_RESEND_MS) return asRepeat(hit.answer);
-  for (const [k, v] of recent) if (now - v.at >= LINK_RESEND_MS) recent.delete(k);
-  const shared = inFlight.get(key);
-  if (shared) return asRepeat(await shared);
-  const pending = withHardTimeout(() => ask(args, scopes, d), ASK_TIMEOUT_MS)
-    .catch(() => unavailable(`no answer within ${ASK_TIMEOUT_MS}ms`));
-  inFlight.set(key, pending);
-  let result: PlatformAuthorizationRequestResult;
-  try { result = await pending; } finally { inFlight.delete(key); }
-  if (result.kind === 'sent' || result.kind === 'undeliverable' || result.kind === 'request_cap') recent.set(key, { at: d.now(), answer: result });
-  return result;
+  while (true) {
+    // A cached/shared answer is never a substitute for this caller's own fence.
+    if (!callerAllowed(args)) return { kind: 'unavailable' };
+    const now = d.now();
+    const hit = recent.get(key);
+    if (hit && now - hit.at < LINK_RESEND_MS) return asRepeat(hit.answer);
+    for (const [k, v] of recent) if (now - v.at >= LINK_RESEND_MS) recent.delete(k);
+    const shared = inFlight.get(key);
+    if (shared) {
+      const result = asRepeat(await shared);
+      if (result.kind === 'unavailable' && result.guardRefused) {
+        // The owner became invalid while resolving the person. That says
+        // nothing about this caller: let valid joiners start or share a new
+        // request instead of inheriting another turn's stopped authorization.
+        if (inFlight.get(key) === shared) inFlight.delete(key);
+        continue;
+      }
+      return result;
+    }
+    const pending = withHardTimeout(() => ask(args, scopes, d), ASK_TIMEOUT_MS)
+      .catch(() => unavailable(`no answer within ${ASK_TIMEOUT_MS}ms`));
+    inFlight.set(key, pending);
+    let result: PlatformAuthorizationRequestResult;
+    try { result = await pending; } finally {
+      if (inFlight.get(key) === pending) inFlight.delete(key);
+    }
+    if (result.kind === 'sent' || result.kind === 'undeliverable' || result.kind === 'request_cap') recent.set(key, { at: d.now(), answer: result });
+    return result;
+  }
 }
 
 async function ask(
@@ -109,7 +132,7 @@ async function ask(
   const tools = platformTools(args.botConfig);
   const unionId = args.unionId ?? (args.openId ? await d.unionIdFor(args.botConfig.larkAppId, args.openId) : null);
   if (!unionId) return unavailable('sender union_id unresolved');
-  if (args.stillAllowed && !args.stillAllowed()) return { kind: 'unavailable' };
+  if (!callerAllowed(args)) return { kind: 'unavailable', guardRefused: true };
   const result = await d.request({
     unionId, appId: args.botConfig.larkAppId, tools,
     ...(scopes.length ? { scopes } : {}),

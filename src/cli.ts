@@ -16455,6 +16455,7 @@ async function cmdCard(rest: string[]): Promise<void> {
 
 async function cmdAuth(rest: string[]): Promise<void> {
   const { AUTH_REQUEST_USAGE, parseAuthRequestArgs, providerAuthAnswerTag, providerAuthExitCode } = await import('./cli/auth-request.js');
+  const { PROVIDER_AUTH_REQUEST_CLIENT_TIMEOUT_MS } = await import('./platform/credential-grant-budget.js');
   let parsed;
   try {
     parsed = parseAuthRequestArgs(rest);
@@ -16512,7 +16513,7 @@ async function cmdAuth(rest: string[]): Promise<void> {
         ...(process.env.BOTMUX_AS ? { as: process.env.BOTMUX_AS } : {}),
       };
       // A request may start a device login, or ask the platform to send a card, before it answers.
-      const requestTimeout = Math.min(parsed.command === 'request' ? 60_000 : 10_000, Math.max(1, remaining));
+      const requestTimeout = Math.min(parsed.command === 'request' ? PROVIDER_AUTH_REQUEST_CLIENT_TIMEOUT_MS : 10_000, Math.max(1, remaining));
       const authPath = `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`;
       const response = toolBinding
         ? await loopbackFetch(`http://127.0.0.1:${toolBinding.ipcPort}${authPath}`, {

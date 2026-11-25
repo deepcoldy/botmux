@@ -23,6 +23,7 @@ import { __resetProviderAuthForTest } from '../src/core/provider-auth-request.js
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
 import { __resetPlatformAuthorizationRequestForTest } from '../src/core/platform-authorization-request.js';
 import type { CredentialGrantRequest, CredentialGrantResult } from '../src/platform/credential-grant-client.js';
+import { GRANT_WAIT_CAP_MS } from '../src/platform/credential-grant-budget.js';
 import * as credentialRequestClient from '../src/platform/credential-request-client.js';
 import * as turnCliIdentity from '../src/core/turn-cli-identity.js';
 import { t } from '../src/i18n/index.js';
@@ -1091,6 +1092,84 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       expect(await response.json()).toMatchObject({ ok: true, provider: 'bytedcli', status: 'delivered', delivery: 'platform_dm' });
       expect(requestGrant).toHaveBeenCalledTimes(1);
       expect(platformRequest).toHaveBeenCalledTimes(1);
+      expectNoDeviceLogin();
+    });
+
+    it('retries once past the refusal cooldown when the platform reports ready', async () => {
+      const expired = await publishExpiringByteCloud();
+      const fresh = cloudJwt(Date.now() + 3_600_000);
+      requestGrant
+        .mockResolvedValueOnce({ ok: false, reason: 'not_authorized', error: 'credential_reauth_required' })
+        .mockResolvedValueOnce(byteCloudGrant(fresh));
+      platformRequest.mockResolvedValue({ ok: true, status: 'ready' });
+
+      const response = await ask({ provider: 'bytedcli' });
+      expect(await response.json()).toMatchObject({ ok: true, provider: 'bytedcli', status: 'ready' });
+      expect(requestGrant).toHaveBeenCalledTimes(2);
+      expect(platformRequest).toHaveBeenCalledTimes(1);
+      expect(currentByteCloud()).toContain(fresh);
+      expect(currentByteCloud()).not.toContain(expired);
+      expectNoDeviceLogin();
+    });
+
+    it('starts one forced renewal after a joined older attempt returns a stale refusal', async () => {
+      await publishExpiringByteCloud();
+      let refuse!: (result: CredentialGrantResult) => void;
+      requestGrant.mockImplementationOnce(() => new Promise<CredentialGrantResult>(resolve => { refuse = resolve; }));
+      const args = {
+        sessionDataDir: config.session.dataDir, sessionId: 'auth-session', turnId: 'om_turn', speakerOpenId: 'ou_sender',
+        currentPolicy: () => botRegistry.getBot('cli_test').config.triggerUserAuth,
+        executionStillCurrent: () => true, waitMs: 10_000,
+      };
+      const unforced = turnCliIdentity.refreshExpiredPlatformBytedcliDefault(args);
+      await vi.waitFor(() => expect(requestGrant).toHaveBeenCalledTimes(1));
+      const forced = turnCliIdentity.refreshExpiredPlatformBytedcliDefault({ ...args, force: true });
+      const fresh = cloudJwt(Date.now() + 3_600_000);
+      requestGrant.mockResolvedValueOnce(byteCloudGrant(fresh));
+      refuse({ ok: false, reason: 'not_authorized', error: 'stale refusal' });
+
+      expect(await unforced).toBe('not_authorized');
+      expect(await forced).toBe('ready');
+      expect(requestGrant).toHaveBeenCalledTimes(2);
+      expect(currentByteCloud()).toContain(fresh);
+    });
+
+    it('shares a failed forced attempt instead of forcing again in series', async () => {
+      await publishExpiringByteCloud();
+      let refuse!: (result: CredentialGrantResult) => void;
+      requestGrant.mockImplementationOnce(() => new Promise<CredentialGrantResult>(resolve => { refuse = resolve; }));
+      const args = {
+        sessionDataDir: config.session.dataDir, sessionId: 'auth-session', turnId: 'om_turn', speakerOpenId: 'ou_sender',
+        currentPolicy: () => botRegistry.getBot('cli_test').config.triggerUserAuth,
+        executionStillCurrent: () => true, waitMs: 10_000, force: true,
+      };
+      const first = turnCliIdentity.refreshExpiredPlatformBytedcliDefault(args);
+      await vi.waitFor(() => expect(requestGrant).toHaveBeenCalledTimes(1));
+      const second = turnCliIdentity.refreshExpiredPlatformBytedcliDefault(args);
+      refuse({ ok: false, reason: 'not_authorized', error: 'still unauthorized' });
+
+      expect(await first).toBe('not_authorized');
+      expect(await second).toBe('not_authorized');
+      expect(requestGrant).toHaveBeenCalledTimes(1);
+    });
+
+    it('starts the post-authorization grant with a fresh budget after the first budget is exhausted', async () => {
+      await publishExpiringByteCloud();
+      requestGrant.mockImplementationOnce(async () => {
+        vi.setSystemTime(Date.now() + GRANT_WAIT_CAP_MS);
+        return { ok: false, reason: 'not_authorized', error: 'credential_reauth_required' };
+      });
+      platformRequest.mockImplementationOnce(async () => {
+        vi.setSystemTime(Date.now() + 15_000);
+        return { ok: true, status: 'ready' };
+      });
+      const fresh = cloudJwt(Date.now() + 3_600_000);
+      requestGrant.mockResolvedValue(byteCloudGrant(fresh));
+
+      const response = await ask({ provider: 'bytedcli' });
+      expect(await response.json()).toMatchObject({ ok: true, provider: 'bytedcli', status: 'ready' });
+      expect(requestGrant).toHaveBeenCalledTimes(2);
+      expect(currentByteCloud()).toContain(fresh);
       expectNoDeviceLogin();
     });
 

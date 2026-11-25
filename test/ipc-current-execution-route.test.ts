@@ -430,7 +430,7 @@ describe('POST /api/current-execution', () => {
 
   it.each([
     'renewed', 'stale', 'malformed', 'unavailable', 'turn advanced', 'worker replaced', 'policy changed',
-    'binding changed', 'snapshot replaced', 'revoked', 'CN uses default', 'CN has its own JWT', 'default does not claim CN',
+    'binding changed', 'snapshot replaced', 'revoked', 'consent missing', 'CN uses default', 'CN has its own JWT', 'default does not claim CN',
   ] as const)('handles default ByteCloud renewal in the proven turn: %s', async scenario => {
     const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
     const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
@@ -479,6 +479,7 @@ describe('POST /api/current-execution', () => {
       const first = ++grants === 1;
       if (!first) await grantHeld;
       if (grants === 2 && scenario === 'unavailable') return { ok: false, reason: 'network', error: 'fixture unavailable' };
+      if (grants === 2 && scenario === 'consent missing') return { ok: false, reason: 'consent_missing', error: 'machine consent missing' };
       const cloudJwt = first || scenario === 'stale' ? original
         : scenario === 'malformed' ? newer.slice(0, newer.lastIndexOf('.')) : newer;
       return { ok: true, value: {
@@ -568,6 +569,12 @@ describe('POST /api/current-execution', () => {
       const snapshotBeforeResponse = published();
       releaseGrant();
       const response = await first;
+      if (scenario === 'consent missing') {
+        expect(response).toMatchObject({ status: 200 });
+        expect(response.body.env).toContain('[reason=platform_consent_missing]');
+        expect(published()).toBe(snapshotBeforeResponse);
+        return;
+      }
       expect(response.body.env).toBeUndefined();
       if (scenario === 'stale' || scenario === 'malformed' || scenario === 'unavailable') {
         expect(response).toMatchObject({ status: 503, body: { reason: 'bytecloud_grant_unavailable' } });

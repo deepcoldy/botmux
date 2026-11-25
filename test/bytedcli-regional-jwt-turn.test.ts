@@ -169,9 +169,10 @@ function bytedcliWithEnv(env: Record<string, string>, ...args: string[]): { stat
     const body = recallProvenIdentityContent(dir, SESSION, lastTurn, 'bytedcli');
     expect(body).toBeDefined();
     resolver = [join(dir, 'identity-resolver')];
+    rmSync(join(dir, 'resolver-args'), { force: true });
     writeFileSync(resolver[0]!, [
       '#!/bin/sh',
-      'printf "%s\\n" "$*" > "$SESSION_DATA_DIR/resolver-args"',
+      'printf "%s\\n" "$*" >> "$SESSION_DATA_DIR/resolver-args"',
       "cat <<'BOTMUX_IDENTITY_EOF'",
       body,
       'BOTMUX_IDENTITY_EOF',
@@ -334,11 +335,47 @@ it('tells the proven identity resolver which ByteCloud ticket a command needs', 
   }
   expect(bytedcli('--site', 'BoE', 'env', 'service', 'list')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
   expect(resolverArgs()).toBe('bytedcli --region default');
+  for (const args of [
+    ['--site', 'boei18n', 'env', 'service', 'list'],
+    ['--site=boe-i18n', 'scm', 'repo', 'build'],
+    ['--site', 'unlisted-example', 'scm', 'repo', 'build'],
+  ]) {
+    expect(bytedcli(...args)).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+    expect(resolverArgs()).toBe('bytedcli --region default');
+  }
+  for (const cloudSite of ['boei18n', 'unlisted-example']) {
+    expect(bytedcliWithEnv({ BYTEDCLI_CLOUD_SITE: cloudSite }, 'scm', 'repo', 'build'))
+      .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+    expect(resolverArgs()).toBe('bytedcli --region default');
+  }
   expect(bytedcliWithEnv(site, '--site', 'cn', 'aa', 'query')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
   expect(resolverArgs()).toBe('bytedcli --region cn');
   expect(bytedcliWithEnv({ BYTEDCLI_CLOUD_SITE: 'cn' }, 'scm', 'repo', 'build'))
     .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
   expect(resolverArgs()).toBe('bytedcli --region cn');
+  expect(bytedcli('--site', 'cn', 'aa', 'query', '--site', 'boei18n'))
+    .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+  expect(resolverArgs()).toBe('bytedcli --region default');
+  expect(bytedcli('--site', 'cn', 'aa', 'query', '--site', 'i18n-tt'))
+    .toMatchObject({ status: 0, jwt: jwt('i18n', 'on_alice') });
+  expect(resolverArgs()).toBe('bytedcli');
+  expect(bytedcli('aa', 'query', '--site', 'cn'))
+    .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+  expect(resolverArgs()).toBe('bytedcli --region cn');
+  expect(bytedcli('--site', 'i18n-tt', 'aa', 'query', '--site', 'boe'))
+    .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+  expect(resolverArgs()).toBe('bytedcli --region i18n\nbytedcli --region default');
+  expect(bytedcli('--site', 'i18n-tt', 'aa', 'query', '--site', 'cn'))
+    .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+  expect(resolverArgs()).toBe('bytedcli --region i18n\nbytedcli --region cn');
+  expect(bytedcli('aa', 'query', '--site', 'us-ttp'))
+    .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+  expect(resolverArgs()).toBe('bytedcli\nbytedcli --region default');
+  expect(bytedcli('--site', 'i18n-tt', 'aa', 'query', '--site', 'us-ttp'))
+    .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+  expect(resolverArgs()).toBe('bytedcli --region i18n\nbytedcli --region default');
+  expectRefused(bytedcli('--site', 'us-ttp', 'aa', 'query'), 'tx');
+  expect(resolverArgs()).toBe('bytedcli --region tx');
 
   for (const args of [['aa', 'query', '--help'], ['codebase', 'mr', 'list'], ['meego', 'workitem', 'list']]) {
     expect(bytedcliWithEnv(site, ...args).status).toBe(0);

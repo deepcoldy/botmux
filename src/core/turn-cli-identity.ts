@@ -540,14 +540,14 @@ interface RegionalGrantAttempt {
 
 type PlatformGrantAuthority = Pick<Extract<PlatformIdentityResolution, { state: 'granted' }>, 'unionId' | 'bindingKey'>;
 
-type DefaultGrantFailure = 'unavailable' | 'not_authorized' | 'denied';
+type DefaultGrantFailure = 'unavailable' | 'not_authorized' | 'consent_missing' | 'denied';
 
 interface PlatformBytedcliPublication extends PlatformGrantContext, PlatformGrantAuthority {
   identity: BytedCliIdentity;
   snapshot: ProvenIdentitySnapshot;
   authEpoch: number;
   attempts: Map<BytedcliOverseasRegion, RegionalGrantAttempt>;
-  renewal: { retryAfter: number; inFlight?: Promise<void>; failure?: DefaultGrantFailure };
+  renewal: { retryAfter: number; inFlight?: Promise<void>; inFlightForced?: boolean; failure?: DefaultGrantFailure };
 }
 
 // Once a publication is superseded, revoked or collected, its retry state
@@ -634,7 +634,7 @@ function bytecloudJwtExpiry(jwt: string): number | undefined {
  * Only a live, later-expiring JWT can replace it. Keep regional, Codebase and
  * Meego fields from the latest publication, including any concurrent regional fill. */
 export async function refreshExpiredPlatformBytedcliDefault(
-  args: RefreshPlatformGrantArgs & { region?: 'default' | 'cn' },
+  args: RefreshPlatformGrantArgs & { region?: 'default' | 'cn'; force?: boolean },
 ): Promise<'untracked' | 'ready' | 'superseded' | DefaultGrantFailure> {
   const entry = publishedPlatformBytedcli(args);
   if (!entry) return 'untracked';
@@ -647,37 +647,54 @@ export async function refreshExpiredPlatformBytedcliDefault(
   if (expiresAt === undefined || expiresAt > Date.now()) return 'ready';
 
   const attempt = entry.renewal;
-  if (!attempt.inFlight && args.waitMs > 0 && Date.now() >= attempt.retryAfter) {
-    attempt.failure = undefined;
-    attempt.inFlight = (async () => {
-      const grant = await resolvePlatformIdentity({
-        botConfig: entry.botConfig, tool: 'bytedcli', unionId: entry.unionId,
-        sessionId: entry.sessionId, turnId: entry.turnId, cloudJwtRegions: [],
+  const waitDeadline = Date.now() + args.waitMs;
+  let startedAttempt = false;
+  while (true) {
+    const waitMs = waitDeadline - Date.now();
+    if (!attempt.inFlight && waitMs > 0 && ((args.force && !startedAttempt) || Date.now() >= attempt.retryAfter)) {
+      startedAttempt = true;
+      attempt.failure = undefined;
+      attempt.inFlightForced = args.force === true;
+      attempt.inFlight = (async () => {
+        const grant = await resolvePlatformIdentity({
+          botConfig: entry.botConfig, tool: 'bytedcli', unionId: entry.unionId,
+          sessionId: entry.sessionId, turnId: entry.turnId, cloudJwtRegions: [],
+        });
+        if (!stillAllowed()) return;
+        if (grant.state !== 'granted') {
+          attempt.failure = grant.state === 'not_authorized'
+            ? grant.consent ? 'consent_missing' : 'not_authorized'
+            : grant.state === 'denied' ? grant.state : 'unavailable';
+          return;
+        }
+        if (grant.bindingKey !== entry.bindingKey || grant.identity.tool !== 'bytedcli') return;
+        const nextJwt = grant.identity.cloudJwt;
+        if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(nextJwt)
+          || (typeof originalRegion === 'string' && jwtClaims(nextJwt)?.region !== originalRegion)) return;
+        const nextExpiry = bytecloudJwtExpiry(nextJwt);
+        const now = Date.now();
+        if (nextExpiry === undefined || nextExpiry <= Math.max(now, expiresAt) || grant.expiresAt <= now) return;
+        replacePlatformBytedcliPublication(entry, { ...entry.identity, cloudJwt: nextJwt });
+      })().catch(() => {
+        logger.warn('[trigger-user-auth] could not renew the turn\'s default ByteCloud JWT');
+      }).finally(() => {
+        attempt.retryAfter = Date.now() + PLATFORM_GRANT_RETRY_INTERVAL_MS;
+        attempt.inFlight = undefined;
       });
-      if (!stillAllowed()) return;
-      if (grant.state !== 'granted') {
-        attempt.failure = grant.state === 'not_authorized' || grant.state === 'denied' ? grant.state : 'unavailable';
-        return;
-      }
-      if (grant.bindingKey !== entry.bindingKey || grant.identity.tool !== 'bytedcli') return;
-      const nextJwt = grant.identity.cloudJwt;
-      if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(nextJwt)
-        || (typeof originalRegion === 'string' && jwtClaims(nextJwt)?.region !== originalRegion)) return;
-      const nextExpiry = bytecloudJwtExpiry(nextJwt);
-      const now = Date.now();
-      if (nextExpiry === undefined || nextExpiry <= Math.max(now, expiresAt) || grant.expiresAt <= now) return;
-      replacePlatformBytedcliPublication(entry, { ...entry.identity, cloudJwt: nextJwt });
-    })().catch(() => {
-      logger.warn('[trigger-user-auth] could not renew the turn\'s default ByteCloud JWT');
-    }).finally(() => {
-      attempt.retryAfter = Date.now() + PLATFORM_GRANT_RETRY_INTERVAL_MS;
-      attempt.inFlight = undefined;
-    });
+    }
+    const joinedAttempt = attempt.inFlight;
+    const joinedForced = joinedAttempt ? attempt.inFlightForced : false;
+    await waitForPlatformGrant(joinedAttempt, waitMs);
+    if (!publicationValid(stillAllowed)) return 'superseded';
+    const updatedExpiry = bytecloudJwtExpiry(entry.identity.cloudJwt);
+    if (updatedExpiry !== undefined && updatedExpiry > Date.now()) return 'ready';
+    // A ready-authorized caller that joined an older ordinary attempt gets one
+    // forced attempt of its own after that stale refusal. Callers that joined
+    // an already-forced attempt share its result instead of forcing in series.
+    if (args.force && !startedAttempt && joinedAttempt && !joinedForced
+      && !attempt.inFlight && waitDeadline - Date.now() > 0) continue;
+    return attempt.failure ?? 'unavailable';
   }
-  await waitForPlatformGrant(attempt.inFlight, args.waitMs);
-  if (!publicationValid(stillAllowed)) return 'superseded';
-  const updatedExpiry = bytecloudJwtExpiry(entry.identity.cloudJwt);
-  return updatedExpiry !== undefined && updatedExpiry > Date.now() ? 'ready' : attempt.failure ?? 'unavailable';
 }
 
 /** Refresh one missing partition for the already-proven speaker. Concurrent

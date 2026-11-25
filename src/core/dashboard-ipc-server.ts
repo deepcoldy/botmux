@@ -195,7 +195,7 @@ import {
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
 } from '../cli/current-execution.js';
 import { isBytedcliIdentityRegion } from '../platform/bytedcli-grant-regions.js';
-import { GRANT_WAIT_CAP_MS } from '../platform/credential-grant-budget.js';
+import { GRANT_WAIT_CAP_MS, PROVIDER_AUTH_REQUEST_ROUTE_BUDGET_MS } from '../platform/credential-grant-budget.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
 import { configuredCliExecutionMode, sessionCliExecutionInfo } from './cli-execution-mode.js';
 import { getDashboardAdminOpenIds } from '../bot-registry.js';
@@ -1903,12 +1903,14 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       if (renewed === 'unavailable') return jsonRes(res, 503, blocked('bytecloud_grant_unavailable'));
       if (renewed === 'denied') return jsonRes(res, 403, blocked('bytecloud_grant_denied'));
       env = recallProvenIdentityContent(dataDir, sessionId, speakerTurnId, tool);
-      if (renewed === 'not_authorized') {
+      if (renewed === 'not_authorized' || renewed === 'consent_missing') {
         // Refuse this command without overwriting the turn's other credentials.
         // The existing wrapper flow can ask the platform for authorization.
-        const hint = t('trigger_user_auth.denied_platform_login', { tool, provider: 'ByteCloud' }, localeForBot(liveAppId));
+        const consent = renewed === 'consent_missing';
+        const hint = t(consent ? 'trigger_user_auth.denied_platform_consent' : 'trigger_user_auth.denied_platform_login',
+          { tool, provider: 'ByteCloud' }, localeForBot(liveAppId));
         env = renderIdentityEnv({ tool: 'bytedcli', mode: 'denied', turnId: speakerTurnId,
-          openId: choice.speaker?.openId, message: `${hint}\n${reasonTag('platform_not_authorized')}` });
+          openId: choice.speaker?.openId, message: `${hint}\n${reasonTag(consent ? 'platform_consent_missing' : 'platform_not_authorized')}` });
       }
     }
     if (env) {
@@ -5110,11 +5112,18 @@ async function handleProviderAuthRequest(
           ?.some(speaker => speaker.openId === openId && speaker.turnId === publishedTurnId) ?? false;
       } catch { return false; }
     };
-    const grantDeadline = Date.now() + GRANT_WAIT_CAP_MS;
-    const refreshBytedcli = () => refreshExpiredPlatformBytedcliDefault({
-      sessionDataDir: dataDir, sessionId, turnId: publishedTurnId, speakerOpenId: openId,
-      currentPolicy, executionStillCurrent, waitMs: grantDeadline - Date.now(),
-    });
+    const routeDeadline = Date.now() + PROVIDER_AUTH_REQUEST_ROUTE_BUDGET_MS;
+    const grantDeadline = Math.min(routeDeadline, Date.now() + GRANT_WAIT_CAP_MS);
+    const refreshBytedcli = ({ afterPlatformReady = false } = {}) => {
+      // A ready answer authorizes one immediate re-ask, past the previous
+      // refusal's cooldown. It gets its own grant window, bounded by this
+      // request's overall route budget so the CLI can still receive an answer.
+      const deadline = afterPlatformReady ? Math.min(routeDeadline, Date.now() + GRANT_WAIT_CAP_MS) : grantDeadline;
+      return refreshExpiredPlatformBytedcliDefault({
+        sessionDataDir: dataDir, sessionId, turnId: publishedTurnId, speakerOpenId: openId,
+        currentPolicy, executionStillCurrent, waitMs: deadline - Date.now(), force: afterPlatformReady,
+      });
+    };
     const renewalUnavailable = (superseded: boolean) => jsonRes(res, 200, { ok: true, provider, status: 'unavailable',
       message: t(superseded ? 'provider_auth.ready_bytedcli_superseded' : 'provider_auth.ready_bytedcli_unavailable', undefined, loc) });
     const renewalDenied = () => jsonRes(res, 409, { ok: false, status: 'refused', error: 'platform_denied',
@@ -5140,7 +5149,7 @@ async function handleProviderAuthRequest(
         return jsonRes(res, 200, { ok: true, provider, status: 'ready', message: t('provider_auth.ready_bytedcli_already', undefined, loc) });
       }
       if (renewed === 'denied') return renewalDenied();
-      if (renewed !== 'not_authorized') return renewalUnavailable(renewed === 'superseded');
+      if (renewed !== 'not_authorized' && renewed !== 'consent_missing') return renewalUnavailable(renewed === 'superseded');
       needsRenewalAuthorization = true;
     }
     const asked = await askPlatformToAuthorize({ botConfig: cfg, openId,
@@ -5160,7 +5169,7 @@ async function handleProviderAuthRequest(
       // The card endpoint reports authorization, while readiness also requires
       // a usable JWT in this turn, including if the recovery just published it.
       if (provider === 'bytedcli' && published?.('bytedcli')?.includes("BOTMUX_IDENTITY_MODE='user'")) {
-        const renewed = await refreshBytedcli();
+        const renewed = await refreshBytedcli({ afterPlatformReady: true });
         if (!executionStillCurrent()) return renewalUnavailable(true);
         if (renewed === 'denied') return renewalDenied();
         if (renewed !== 'ready' && renewed !== 'untracked') return renewalUnavailable(renewed === 'superseded');
