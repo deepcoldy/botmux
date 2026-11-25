@@ -714,7 +714,13 @@ export class PluginMcpGateway {
     identity: GatewayTrustedTurnIdentity | undefined,
     connection: GatewayConnection,
   ): T {
-    const trusted = this.trustedTurnMeta(identity);
+    // Host-attested caller metadata is local-only. In particular,
+    // taskContinuation carries the source human and exact source turn; putting
+    // it in a streamable-http JSON-RPC _meta would disclose that authority to an
+    // unrelated remote server even though the trusted HTTP headers are clean.
+    const trusted = connection.server.transport === 'stdio'
+      ? this.trustedTurnMeta(identity)
+      : undefined;
     const grant = this.protectedTurnGrant(connection, identity);
     const cleanedMeta = Object.fromEntries(
       Object.entries(params._meta ?? {})

@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
+import { inputForcesSerialTurn } from '../src/utils/pending-input-queue.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 describe('adopted-pane serial continuation boundary', () => {
@@ -7,6 +9,8 @@ describe('adopted-pane serial continuation boundary', () => {
     const flushPending = vi.fn();
     const writeDirect = vi.fn();
     const scope: Record<string, any> = {
+      activeTurnAuthority: new ActiveTurnAuthority(),
+      inputForcesSerialTurn,
       cliRestartInProgress: false,
       rawInputRestartGate: false,
       backend: {},
@@ -37,9 +41,47 @@ describe('adopted-pane serial continuation boundary', () => {
     expect(flushPending).toHaveBeenCalledOnce();
   });
 
+  it('queues a callerless follow-up instead of adopting the active continuation identity', async () => {
+    const activeTurnAuthority = new ActiveTurnAuthority();
+    const activeCaller = {
+      requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'app', senderType: 'bot' as const,
+      taskContinuation: {
+        appId: 'app', openId: 'ou_human_a', sourceSessionId: 'source', sourceTurnId: 'om_source_a',
+      },
+    };
+    expect(activeTurnAuthority.reserve({ turnId: 'om_active_a', caller: activeCaller })).toBe(true);
+    expect(activeTurnAuthority.markStarted({ turnId: 'om_active_a', caller: activeCaller })).toBe(true);
+    const pendingAdoptMessages: any[] = [];
+    const writeDirect = vi.fn();
+    const scope: Record<string, any> = {
+      activeTurnAuthority,
+      inputForcesSerialTurn,
+      cliRestartInProgress: false,
+      rawInputRestartGate: false,
+      backend: {},
+      pendingAdoptMessages,
+      recoverSessionRenameAfterPersistentReattach: () => false,
+      sessionRenameInFlight: () => false,
+      runAdoptMessageForCapturedGeneration: writeDirect,
+      flushPending: vi.fn(),
+      log: vi.fn(),
+    };
+    const admit = loadWorkerFunction<(item: any) => Promise<void>>('admitAdoptMessage', scope);
+
+    await admit({ content: 'unverified follow-up', turnId: 'om_followup_b' });
+
+    expect(writeDirect).not.toHaveBeenCalled();
+    expect(pendingAdoptMessages).toHaveLength(1);
+    expect(pendingAdoptMessages[0]).toMatchObject({
+      turnId: 'om_followup_b', queueAfterActiveTurn: true,
+    });
+  });
+
   it('keeps the existing direct path for an ordinary adopted-pane message', async () => {
     const writeDirect = vi.fn(async () => 'completed');
     const scope: Record<string, any> = {
+      activeTurnAuthority: new ActiveTurnAuthority(),
+      inputForcesSerialTurn,
       cliRestartInProgress: false,
       rawInputRestartGate: false,
       backend: {},

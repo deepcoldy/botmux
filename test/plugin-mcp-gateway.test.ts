@@ -866,6 +866,50 @@ describe('plugin MCP Gateway', () => {
     }
   });
 
+  it('withholds task continuation metadata from a streamable-http downstream', async () => {
+    installFixturePlugin('plugin-a', 'alpha');
+    const gateway = new PluginMcpGateway(
+      ['plugin-a'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-http-continuation' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_reply_bot',
+            requestUserUnionId: 'on_reply_bot',
+            requestLarkAppId: 'cli_continuation',
+            senderType: 'bot',
+            taskContinuation: {
+              appId: 'cli_continuation',
+              openId: 'ou_original_human',
+              unionId: 'on_original_human',
+              verifiedEmail: 'original-human@example.test',
+              sourceSessionId: 'source-session',
+              sourceTurnId: 'om_source_turn',
+            },
+          },
+          turnId: 'om_bot_reply',
+        }),
+      },
+    );
+    const client = new Client({ name: 'gateway-http-continuation-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      await client.callTool({ name: 'echo', arguments: {} });
+      const route = (gateway as any).toolRoutes.get('echo');
+      route.connection.server = { ...route.connection.server, transport: 'streamable-http' };
+      const result = await client.callTool({ name: 'echo', arguments: {} });
+      const text = (result.content[0] as any).text;
+      expect(text).not.toContain('botmuxTrustedCaller');
+      expect(text).not.toContain('taskContinuation');
+      expect(text).not.toContain('ou_original_human');
+      expect(text).not.toContain('original-human@example.test');
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
   it('delivers local plugin results through the trusted host without exposing downstream rows', async () => {
     installFixturePlugin('plugin-delivery', 'delivery');
     const delivered: any[] = [];

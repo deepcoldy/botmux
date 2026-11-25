@@ -475,6 +475,24 @@ describe('a message in a topic whose session was closed (real route)', () => {
     expect(mocks.resumeSession).not.toHaveBeenCalled();
   });
 
+  it('keeps an unauthorized reply bot callerless without minting the source-human continuation', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    primeContinuationSource(source);
+    // The source chat being talk-open must not authorize a stranger in the
+    // followed chat. This also catches accidentally authorizing against CHAT.
+    getBot(APP).config.allowedChatGroups = [CHAT];
+    const { data, ctx } = event('陌生 Bot 回执', 'stranger-bot');
+    attachContinuationContext(ctx, 'sess-live');
+
+    await handleThreadReply(data, ctx);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[1]?.trustedCaller).toBeUndefined();
+  });
+
   it('rejects a cross-chat continuation when the followed root was rebound to another source turn', async () => {
     resumeRegisters();
     await mocks.resumeSession('sess-live');

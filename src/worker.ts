@@ -19489,6 +19489,13 @@ async function runAdoptMessageForCapturedGeneration(
  * available; writing it directly would adopt its envelope over the busy turn
  * while retaining that turn's caller. */
 async function admitAdoptMessage(item: PendingCliInput): Promise<void> {
+  // A callerless follow-up must not adopt a live continuation's authority when
+  // cross-principal isolation is off. Freeze the serial marker onto the durable
+  // queue item before any await so the eventual write starts its own turn.
+  if (inputForcesSerialTurn(item, activeTurnAuthority.snapshot()?.caller)
+    && !item.queueAfterActiveTurn) {
+    item = { ...item, queueAfterActiveTurn: true };
+  }
   if (cliRestartInProgress || rawInputRestartGate || !backend
     || item.queueAfterActiveTurn
     || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()) {
@@ -27790,7 +27797,10 @@ function sendToPty(
   // when another reply from the same peer bot currently owns the CLI. Keep it
   // on the terminal boundary instead of letting adapter type-ahead, queue
   // merging, or isolation-off envelope adoption splice tasks together.
-  const queueAfterActiveTurn = inputForcesSerialTurn(opts);
+  const queueAfterActiveTurn = inputForcesSerialTurn(
+    opts,
+    activeTurnAuthority.snapshot()?.caller,
+  );
   const next: PendingCliInput = {
     content,
     turnId,

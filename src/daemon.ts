@@ -30943,8 +30943,22 @@ async function handleThreadReplyAdmitted(
     senderIsBotTriState(parsed.senderType, isForeignBot),
     parsed.messageId,
   );
+  // Follow routing deliberately exempts a followed cross-chat thread from the
+  // ordinary talk gate (only an explicit block is rejected upstream). That is
+  // sufficient for callerless conversation, but NOT for minting the original
+  // human's continuation. Re-check the actual reply bot against the FOLLOWED
+  // chat's authorization; ctx.chatId has already been rewritten to the source.
+  const continuationReplyBotAllowed = rawThreadTrustedCaller?.senderType === 'bot'
+    && !!ctx.crossChatThreadFollowUp
+    && evaluateBotTalk(
+      larkAppId,
+      ctx.crossChatThreadFollowUp.followedChatId,
+      threadSenderOpenId,
+      threadTeamTrustUnionId,
+      threadTeamTrustAppId,
+    ).allowed;
   const continuationTrustedCaller = ctx.crossChatThreadFollowUp?.sourceTurnId
-    && rawThreadTrustedCaller?.senderType === 'bot'
+    && continuationReplyBotAllowed
     ? await (async (): Promise<TrustedCaller | undefined> => {
         const source = findActiveBySessionId(ctx.crossChatThreadFollowUp!.sourceSessionId);
         if (!source || source.larkAppId !== larkAppId || source.session.status !== 'active') return undefined;

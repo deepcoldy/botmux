@@ -131,13 +131,21 @@ export function handoffQueuedDurableInputsOnBackendExit(
  *  task continuation is serial on its own even when the flag was not carried
  *  (for example an in-worker re-enqueue), because its trustedCaller binds the
  *  input to a bounded source-turn principal that must never splice into the
- *  turn currently owning the CLI. Terminal-boundary counterpart of the daemon
- *  gate in sendWorkerInput. */
-export function inputForcesSerialTurn(input: {
-  queueAfterActiveTurn?: true;
-  trustedCaller?: Pick<TrustedCaller, 'taskContinuation'>;
-}): boolean {
-  return input.queueAfterActiveTurn === true || !!input.trustedCaller?.taskContinuation;
+ *  turn currently owning the CLI. While such a continuation owns the active
+ *  turn, callerless/other inputs must also wait: with cross-principal isolation
+ *  disabled, their historical envelope adoption would otherwise retain the
+ *  active continuation's credentials. Terminal-boundary counterpart of the
+ *  daemon gate in sendWorkerInput. */
+export function inputForcesSerialTurn(
+  input: {
+    queueAfterActiveTurn?: true;
+    trustedCaller?: Pick<TrustedCaller, 'taskContinuation'>;
+  },
+  activeCaller?: Pick<TrustedCaller, 'taskContinuation'>,
+): boolean {
+  return input.queueAfterActiveTurn === true
+    || !!input.trustedCaller?.taskContinuation
+    || !!activeCaller?.taskContinuation;
 }
 
 export function mergeQueuedCliInput(

@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import {
   handoffQueuedDurableInputsOnBackendExit,
   inputForcesSerialTurn,
@@ -192,6 +194,49 @@ describe('inputForcesSerialTurn', () => {
     expect(inputForcesSerialTurn({
       trustedCaller: { requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'app', senderType: 'bot' as const },
     })).toBe(false);
+  });
+
+  it('serializes callerless input while a continuation owns the active turn', () => {
+    expect(inputForcesSerialTurn({}, continuationCaller)).toBe(true);
+    expect(inputForcesSerialTurn({
+      trustedCaller: { requestUserOpenId: 'ou_other', requestLarkAppId: 'app', senderType: 'user' as const },
+    }, continuationCaller)).toBe(true);
+    expect(inputForcesSerialTurn({}, {
+      requestUserOpenId: 'ou_human', requestLarkAppId: 'app', senderType: 'user' as const,
+    })).toBe(false);
+  });
+});
+
+describe('sendToPty serial admission', () => {
+  it('tags callerless input as serial at the real non-adopt write boundary', () => {
+    const activeTurnAuthority = new ActiveTurnAuthority();
+    const activeCaller = {
+      requestUserOpenId: 'ou_reply_bot', requestLarkAppId: 'app', senderType: 'bot' as const,
+      taskContinuation: {
+        appId: 'app', openId: 'ou_human_a', sourceSessionId: 'source', sourceTurnId: 'om_source_a',
+      },
+    };
+    expect(activeTurnAuthority.reserve({ turnId: 'om_active_a', caller: activeCaller })).toBe(true);
+    expect(activeTurnAuthority.markStarted({ turnId: 'om_active_a', caller: activeCaller })).toBe(true);
+    const pendingMessages: any[] = [];
+    const sendToPty = loadWorkerFunction<(content: string, turnId?: string, opts?: any) => boolean>('sendToPty', {
+      rememberTurnLinkRefMode: () => {},
+      inputForcesSerialTurn,
+      activeTurnAuthority,
+      traexAutoModelRuntimeEligible: () => false,
+      traexAutoModelController: undefined,
+      pendingMessages,
+      // Stop immediately after the item is materialized; the queue envelope is
+      // the behavior under test, not a real backend write.
+      initPromptMaterialized: false,
+      log: () => {},
+    });
+
+    expect(sendToPty('unverified follow-up', 'om_followup_b')).toBe(true);
+    expect(pendingMessages).toHaveLength(1);
+    expect(pendingMessages[0]).toMatchObject({
+      turnId: 'om_followup_b', queueAfterActiveTurn: true,
+    });
   });
 });
 
