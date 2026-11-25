@@ -192,7 +192,8 @@ describe.skipIf(process.platform === 'win32')('HcClient', () => {
       expect((await rejection(HcClient.connect(missing))).code).toBe('unreachable');
       const notSocket = join(dir, 'plain-file');
       writeFileSync(notSocket, '');
-      expect((await rejection(HcClient.connect(notSocket))).code).toBe('unreachable');
+      // Darwin reports ENOTSOCK for a plain file, while Linux reports ECONNREFUSED.
+      expect((await rejection(HcClient.connect(notSocket))).code).toBe(process.platform === 'darwin' ? 'io' : 'unreachable');
     });
 
     it('sends a generation-1 framed hello and then speaks frames', async () => {

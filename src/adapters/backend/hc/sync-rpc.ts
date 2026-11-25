@@ -10,7 +10,8 @@ import {
   ensureHcConfig,
   hcControlEnv,
   hcCorePaths,
-  hcRuntimeDirError,
+  hcRuntimeError,
+  hcSocketFileError,
   parseHcCliError,
   type HcCoreAddress,
 } from './core.js';
@@ -63,8 +64,8 @@ export function prepareHcSyncCore(core: HcCoreAddress, base: NodeJS.ProcessEnv =
   const availability = probeHcAvailability({ env: base });
   if (!availability.ok) throw new Error(availability.reason);
   const paths = hcCorePaths(base, { core });
-  const noRuntimeDir = hcRuntimeDirError(paths);
-  if (noRuntimeDir) throw new Error(noRuntimeDir);
+  const runtimeError = hcRuntimeError(paths);
+  if (runtimeError) throw new Error(runtimeError);
   ensureHcConfig(paths.configHome);
   return { bin: availability.bin, env: hcControlEnv(base, paths), socket: paths.socket };
 }
@@ -77,6 +78,8 @@ export function runHcSync(
   timeoutMs: number,
   maxBuffer: number = HC_SYNC_MAX_BUFFER,
 ): { ok: true; stdout: string } | { ok: false; kind: string | null; message: string } {
+  const socketError = hcSocketFileError(core.socket);
+  if (socketError) return { ok: false, kind: 'socket_obstructed', message: socketError };
   const label = `hc ${args.filter(arg => arg !== '--json').join(' ')}`;
   const result = spawnSync(core.bin, args, {
     env: core.env,
