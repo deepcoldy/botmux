@@ -16,7 +16,7 @@ import {
 import { dispatchLaunchIpcTarget } from './dispatch-launch-ipc-client.js';
 import type { OnlineDaemonInfo } from '../utils/daemon-discovery.js';
 import { loopbackFetchImpl } from './loopback-fetch.js';
-import { COLLAB_IPC_ROUTE_PREFIX } from './collab-preflight-ipc.js';
+import { COLLAB_IPC_ROUTE_PREFIX, COLLAB_IPC_TIMEOUT_MS, isCollabIpcTimeoutError } from './collab-preflight-ipc.js';
 import type { CollabKickoffOperationV1 } from './collab-kickoff-store.js';
 import type { CollabArtifactSatisfiedBy } from './collab-artifact-ready.js';
 
@@ -106,7 +106,7 @@ export async function requestCollabKickoff(
   kickoffId: string,
   action: CollabKickoffMutation | undefined,
   body: unknown,
-  opts: { secret?: string; secretPath?: string; fetchImpl?: typeof fetch; timestamp?: string; nonce?: string } = {},
+  opts: { secret?: string; secretPath?: string; fetchImpl?: typeof fetch; timestamp?: string; nonce?: string; timeoutMs?: number } = {},
 ): Promise<CollabKickoffResponseV1> {
   let target: DispatchLaunchIpcTarget;
   try {
@@ -125,17 +125,22 @@ export async function requestCollabKickoff(
   const bodyRaw = action ? JSON.stringify(body ?? {}) : '';
   const nonce = opts.nonce ?? generateDispatchLaunchIpcNonce();
   const headers = dispatchLaunchIpcHeaders({ secret, method, pathWithQuery, bodyRaw, target, timestamp: opts.timestamp, nonce });
+  const signal = AbortSignal.timeout(opts.timeoutMs ?? COLLAB_IPC_TIMEOUT_MS);
   let response: Response;
   try {
     response = await (opts.fetchImpl ?? loopbackFetchImpl)(
       `http://127.0.0.1:${target.ipcPort}${pathWithQuery}`,
-      { method, headers: { 'content-type': 'application/json', ...headers }, ...(action ? { body: bodyRaw } : {}) },
+      { method, headers: { 'content-type': 'application/json', ...headers }, ...(action ? { body: bodyRaw } : {}), signal },
     );
   } catch (err) {
-    return { ok: false, errorCode: 'PEER_OFFLINE', message: err instanceof Error ? err.message : String(err) };
+    return { ok: false, errorCode: isCollabIpcTimeoutError(err) ? 'PEER_TIMEOUT' : 'PEER_OFFLINE', message: err instanceof Error ? err.message : String(err) };
   }
   let respBody: string;
-  try { respBody = await response.text(); } catch { return { ok: false, errorCode: 'RESPONSE_READ_FAILED', message: 'failed to read response body' }; }
+  try {
+    respBody = await response.text();
+  } catch (err) {
+    return { ok: false, errorCode: isCollabIpcTimeoutError(err) ? 'PEER_TIMEOUT' : 'RESPONSE_READ_FAILED', message: err instanceof Error ? err.message : String(err) };
+  }
   // F3：严格验证 HTTP 200。HTTP500 等错误状态即便签名有效也判失败。
   if (response.status !== 200) {
     return { ok: false, errorCode: 'HTTP_ERROR', message: `kickoff http ${response.status}` };

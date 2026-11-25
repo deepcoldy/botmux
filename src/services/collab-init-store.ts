@@ -14,7 +14,7 @@
  * 本模块不读 config；`dataDir` 由调用方显式传入（preflight 从 daemon 接缝带入），
  * 便于测试用临时目录 + 假时钟直接驱动。
  */
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { AsyncSerialQueue } from '../utils/async-serial-queue.js';
@@ -41,6 +41,11 @@ export interface CollabGroupInitEntry {
   sourceMessageId: string;
   configVersion: string;
   configSnapshot: SessionGroupCollaborationConfig;
+  /** 参与 configVersion 的 S0 冻结角色内容；缺省代表旧/不完整账本，S4 必须 fail-closed。 */
+  resolvedProfileEntries?: Record<string, string | null>;
+  referencedTeamRoles?: Record<string, string | null>;
+  /** 重启恢复 S1 所需的原 DM sender；open_id 只在 creatorAppId 视角使用。 */
+  sourceSenderOpenId?: string;
   creatorAdmissionOperationId: string;
   creatorAdmissionReceipt?: unknown;
   chatId?: string;
@@ -57,7 +62,7 @@ export interface CollabGroupInitEntry {
     receipt?: unknown;
     error?: string;
   }>;
-  kickoffPending?: Record<string, { appId: string; satisfiedBy?: unknown }>;
+  kickoffPending?: Record<string, { appId: string; since?: number; satisfiedBy?: unknown }>;
   createdAt: number;
   updatedAt: number;
   cancelReason?: string;
@@ -115,29 +120,88 @@ function emptyStore(): CollabInitStore {
   return { schemaVersion: COLLAB_INIT_SCHEMA_VERSION, entries: {}, sourceIndex: {}, activeByDmChat: {} };
 }
 
-/** 读盘（不存在/损坏返回空 store，不抛）。 */
-export function readCollabInitStore(dataDir: string, creatorAppId: string): CollabInitStore {
-  const fp = collabInitFilePath(dataDir, creatorAppId);
-  if (!existsSync(fp)) return emptyStore();
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return emptyStore();
-    const raw = parsed as Record<string, unknown>;
-    const entries = (raw.entries && typeof raw.entries === 'object' && !Array.isArray(raw.entries)
-      ? raw.entries : {}) as Record<string, CollabGroupInitEntry>;
-    const sourceIndex = (raw.sourceIndex && typeof raw.sourceIndex === 'object' && !Array.isArray(raw.sourceIndex)
-      ? raw.sourceIndex : {}) as Record<string, string>;
-    const activeByDmChat = (raw.activeByDmChat && typeof raw.activeByDmChat === 'object' && !Array.isArray(raw.activeByDmChat)
-      ? raw.activeByDmChat : {}) as Record<string, string>;
-    return {
-      schemaVersion: typeof raw.schemaVersion === 'number' ? raw.schemaVersion : COLLAB_INIT_SCHEMA_VERSION,
-      entries,
-      sourceIndex,
-      activeByDmChat,
-    };
-  } catch {
-    return emptyStore();
+export type CollabInitStoreReadResult =
+  | { kind: 'missing' }
+  | { kind: 'corrupted'; message: string }
+  | { kind: 'ok'; store: CollabInitStore };
+
+export class CollabInitStoreCorruptedError extends Error {
+  constructor(public readonly filePath: string, message: string) {
+    super(`collab init store corrupted at ${filePath}: ${message}`);
+    this.name = 'CollabInitStoreCorruptedError';
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isStringOrNullMap(value: unknown): value is Record<string, string | null> {
+  return isRecord(value) && Object.values(value).every(v => typeof v === 'string' || v === null);
+}
+
+function parseStore(raw: string): CollabInitStore {
+  const parsed: unknown = JSON.parse(raw);
+  if (!isRecord(parsed) || parsed.schemaVersion !== COLLAB_INIT_SCHEMA_VERSION) {
+    throw new Error('schemaVersion 不符或文件不是对象');
+  }
+  if (!isRecord(parsed.entries) || !isRecord(parsed.sourceIndex) || !isRecord(parsed.activeByDmChat)) {
+    throw new Error('entries/sourceIndex/activeByDmChat 必须是对象');
+  }
+  const entries = parsed.entries as unknown as Record<string, CollabGroupInitEntry>;
+  const states = new Set(['running', 'awaiting-input', 'done', 'failed', 'cancelled']);
+  for (const [initId, entry] of Object.entries(entries)) {
+    if (!isRecord(entry) || entry.initId !== initId) throw new Error(`entry ${initId} 身份不符`);
+    if (typeof entry.dmChatId !== 'string' || !entry.dmChatId
+      || typeof entry.sourceMessageId !== 'string' || !entry.sourceMessageId
+      || typeof entry.configVersion !== 'string' || !entry.configVersion
+      || !isRecord(entry.configSnapshot) || !states.has(entry.state)
+      || !isRecord(entry.steps) || !isRecord(entry.operations)) {
+      throw new Error(`entry ${initId} 结构不完整`);
+    }
+    if (entry.sourceSenderOpenId !== undefined && (typeof entry.sourceSenderOpenId !== 'string' || !entry.sourceSenderOpenId)) {
+      throw new Error(`entry ${initId} sourceSenderOpenId 非法`);
+    }
+    if (entry.resolvedProfileEntries !== undefined && !isStringOrNullMap(entry.resolvedProfileEntries)
+      || entry.referencedTeamRoles !== undefined && !isStringOrNullMap(entry.referencedTeamRoles)) {
+      throw new Error(`entry ${initId} 角色快照非法`);
+    }
+  }
+  const sourceIndex = parsed.sourceIndex as unknown as Record<string, string>;
+  for (const [sourceKey, initId] of Object.entries(sourceIndex)) {
+    if (typeof initId !== 'string' || !entries[initId]) throw new Error(`sourceIndex 悬空: ${sourceKey}`);
+  }
+  const activeByDmChat = parsed.activeByDmChat as unknown as Record<string, string>;
+  for (const [dmChatId, initId] of Object.entries(activeByDmChat)) {
+    const entry = typeof initId === 'string' ? entries[initId] : undefined;
+    if (!entry || entry.dmChatId !== dmChatId) {
+      throw new Error(`activeByDmChat 悬空或身份不符: ${dmChatId}`);
+    }
+  }
+  return { schemaVersion: COLLAB_INIT_SCHEMA_VERSION, entries, sourceIndex, activeByDmChat };
+}
+
+/** 只有 ENOENT 是 missing；读取、JSON、schema 或索引一致性错误均为 corrupted。 */
+export function readCollabInitStoreStrict(dataDir: string, creatorAppId: string): CollabInitStoreReadResult {
+  const fp = collabInitFilePath(dataDir, creatorAppId);
+  let raw: string;
+  try { raw = readFileSync(fp, 'utf-8'); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return { kind: 'missing' };
+    return { kind: 'corrupted', message: err instanceof Error ? err.message : String(err) };
+  }
+  try { return { kind: 'ok', store: parseStore(raw) }; }
+  catch (err) { return { kind: 'corrupted', message: err instanceof Error ? err.message : String(err) }; }
+}
+
+/**
+ * 常规读取：文件不存在返回空 store；损坏抛错，调用方不得把旧文件当空账本覆盖。
+ */
+export function readCollabInitStore(dataDir: string, creatorAppId: string): CollabInitStore {
+  const read = readCollabInitStoreStrict(dataDir, creatorAppId);
+  if (read.kind === 'missing') return emptyStore();
+  if (read.kind === 'corrupted') throw new CollabInitStoreCorruptedError(collabInitFilePath(dataDir, creatorAppId), read.message);
+  return read.store;
 }
 
 function writeStore(dataDir: string, creatorAppId: string, store: CollabInitStore): void {
@@ -170,6 +234,9 @@ export function placeCollabGroupInit(opts: {
   sourceMessageId: string;
   configVersion: string;
   configSnapshot: SessionGroupCollaborationConfig;
+  resolvedProfileEntries?: Record<string, string | null>;
+  referencedTeamRoles?: Record<string, string | null>;
+  sourceSenderOpenId?: string;
   creatorAdmissionOperationId: string;
   createAttempt: number;
   now: number;
@@ -180,13 +247,30 @@ export function placeCollabGroupInit(opts: {
     if (store.sourceIndex[opts.sourceKey]) {
       const existingInitId = store.sourceIndex[opts.sourceKey];
       const entry = store.entries[existingInitId];
-      return { kind: 'existing', initId: existingInitId, status: entry?.state ?? 'running' };
+      // 同 source 的配置变化不得沿用旧 running 快照自动恢复。原地转入人工态，
+      // activeByDmChat 保留；终态请求只返回原结果，不因配置编辑重新打开。
+      if ((entry.state === 'running' || entry.state === 'awaiting-input') && entry.configVersion !== opts.configVersion) {
+        if (entry.state !== 'awaiting-input' || entry.awaiting?.reason !== 'CONFIG_CHANGED') {
+          entry.state = 'awaiting-input';
+          entry.awaiting = {
+            reason: 'CONFIG_CHANGED',
+            since: opts.now,
+            detail: { storedConfigVersion: entry.configVersion, incomingConfigVersion: opts.configVersion },
+          };
+          entry.updatedAt = opts.now;
+          writeStore(opts.dataDir, opts.creatorAppId, store);
+        }
+      }
+      return { kind: 'existing', initId: existingInitId, status: entry.state };
     }
 
     const activeInitId = store.activeByDmChat[opts.dmChatId];
-    if (activeInitId && store.entries[activeInitId]) {
+    const activeEntry = activeInitId ? store.entries[activeInitId] : undefined;
+    if (activeEntry && (activeEntry.state === 'running' || activeEntry.state === 'awaiting-input')) {
       return { kind: 'busy', initId: activeInitId };
     }
+    // entry 终态是权威：清理上一轮中途写出的 stale active 指针，不让它制造永久 busy。
+    if (activeInitId) delete store.activeByDmChat[opts.dmChatId];
 
     store.sourceIndex[opts.sourceKey] = opts.initId;
     store.activeByDmChat[opts.dmChatId] = opts.initId;
@@ -196,6 +280,9 @@ export function placeCollabGroupInit(opts: {
       sourceMessageId: opts.sourceMessageId,
       configVersion: opts.configVersion,
       configSnapshot: opts.configSnapshot,
+      ...(opts.resolvedProfileEntries !== undefined ? { resolvedProfileEntries: { ...opts.resolvedProfileEntries } } : {}),
+      ...(opts.referencedTeamRoles !== undefined ? { referencedTeamRoles: { ...opts.referencedTeamRoles } } : {}),
+      ...(opts.sourceSenderOpenId !== undefined ? { sourceSenderOpenId: opts.sourceSenderOpenId } : {}),
       creatorAdmissionOperationId: opts.creatorAdmissionOperationId,
       createAttempt: opts.createAttempt,
       state: 'running',

@@ -5,6 +5,7 @@ import { describe, it, expect } from 'vitest';
 import {
   parseCollabPreflightRequest,
   declaresDurableTurnOutputReceipt,
+  declaresDurableTurnOutputReceiptForCli,
   COLLAB_IPC_ROUTE_PREFIX,
   COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT,
   preflightCollabPeer,
@@ -56,6 +57,12 @@ describe('declaresDurableTurnOutputReceipt', () => {
     expect(declaresDurableTurnOutputReceipt('riff')).toBe(false);
     expect(declaresDurableTurnOutputReceipt('remote-runner')).toBe(false);
   });
+  it('远程 CLI 即使 backendType 缺省也按实际配对拒绝能力声明', () => {
+    for (const cliId of ['riff', 'mojo', 'remote-runner']) {
+      expect(declaresDurableTurnOutputReceiptForCli(cliId, undefined, undefined)).toBe(false);
+    }
+    expect(declaresDurableTurnOutputReceiptForCli('claude-code', undefined, 'tmux')).toBe(true);
+  });
 });
 
 describe('preflightCollabPeer fail-closed', () => {
@@ -76,6 +83,24 @@ describe('preflightCollabPeer fail-closed', () => {
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.errorCode).toBe('PEER_OFFLINE');
+  });
+
+  it('peer 永不响应 → deadline abort 并返回 PEER_TIMEOUT', async () => {
+    let signal: AbortSignal | null | undefined;
+    const fakeFetch = ((_url: string, init: RequestInit) => {
+      signal = init.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    }) as typeof fetch;
+    const r = await preflightCollabPeer(
+      { larkAppId: 'cli_peer', ipcPort: 1, bootInstanceId: 'x'.repeat(43), dispatchLaunchIpcProtocol: 'v1' } as any,
+      validReq(),
+      { secret: 's'.repeat(32), fetchImpl: fakeFetch, timeoutMs: 5 },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errorCode).toBe('PEER_TIMEOUT');
+    expect(signal?.aborted).toBe(true);
   });
 
   it('R5：protocolVersion 不兼容的已签名响应被拒（不补默认成功）', async () => {

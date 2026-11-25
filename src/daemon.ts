@@ -779,7 +779,7 @@ import {
   COLLAB_IPC_ROUTE_PREFIX,
   COLLAB_IPC_PROTOCOL_VERSION,
   COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT,
-  declaresDurableTurnOutputReceipt,
+  declaresDurableTurnOutputReceiptForCli,
   parseCollabPreflightRequest,
 } from './core/collab-preflight-ipc.js';
 import { parseCollabKickoffRequest, validateCollabKickoffPrepare, type CollabKickoffMutation } from './core/collab-kickoff-ipc.js';
@@ -1240,7 +1240,7 @@ import { isValidAssistantOpenId, resolveAssistantOwnerOpenId, setAssistantOwnerC
 import { getAssistantOwner, markAssistantOwnerLeft, setAssistantOwner } from './services/assistant-owner-store.js';
 import { assistantScheduleCreatorAllowed, assistantSessionStillOwned, isAssistantOwnerOfChat, resolveAssistantSpawn } from './core/assistant-spawn.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
-import { preflightCollabGroupBirth, startCollabGroupBirth, releaseCollabGroupBirth } from './core/collab-group-birth.js';
+import { preflightCollabGroupBirth, startCollabGroupBirth, releaseCollabGroupBirth, recoverRunningCollabGroupBirthsOnStartup } from './core/collab-group-birth.js';
 import { buildCreatorAdmissionReceipt, persistCreatorAdmissionReceipt } from './core/collab-orchestrator.js';
 import { readCollabInitEntry } from './services/collab-init-store.js';
 import { collabCreatorAdmissionOperationId, collabCreatorAdmissionReceiptId, type CreatorAdmissionReceipt } from './services/collab-group-config.js';
@@ -9318,10 +9318,14 @@ async function collabPreflightRoute(req: IncomingMessage, res: ServerResponse, p
   if (targetLarkAppId !== selfV3LarkAppId) {
     return reply(400, { ok: false, errorCode: 'TARGET_MISMATCH' });
   }
+  let cliId: string | undefined;
   let backendType: string | undefined;
-  try { backendType = getBot(selfV3LarkAppId).config.backendType; }
-  catch { return reply(404, { ok: false, errorCode: 'TARGET_NOT_FOUND', message: 'target bot not registered' }); }
-  const capabilities = declaresDurableTurnOutputReceipt(backendType)
+  try {
+    const botCfg = getBot(selfV3LarkAppId).config;
+    cliId = botCfg.cliId;
+    backendType = botCfg.backendType;
+  } catch { return reply(404, { ok: false, errorCode: 'TARGET_NOT_FOUND', message: 'target bot not registered' }); }
+  const capabilities = declaresDurableTurnOutputReceiptForCli(cliId, backendType, config.daemon.backendType)
     ? [COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT]
     : [];
   // workingDir 可接受性：PR-2b 只做「可接受」的静态判定（bot 已注册即视为可接受），
@@ -28340,9 +28344,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       return;
     }
     if (collabPreflight.kind === 'existing') {
-      // R4：paid-but-not-created 重投可继续 S1 且 quota 不变。preflight 已确认同 source；
-      // 若 durable 准入回执已存在（grant-state，非仅 entry 投影）但 entry 尚无 chatId，
-      // 重建 receipt 续跑 S1（不二次扣费），否则退回进度回执。
+      // R4：paid-but-not-created 及 chatId 已落后的半完成 S1 都可续跑且 quota 不变。
+      // preflight 已确认同 source/configVersion；durable 准入回执存在时，重建 receipt 并重入
+      // operation 账本，由 S1 跳过 create/register/gate/forward 的已完成项，不二次扣费/建群/转发。
       const existingEntry = readCollabInitEntry(config.session.dataDir, larkAppId, collabPreflight.initId);
       const durable = getCollabAdmissionReceipt(larkAppId, collabCreatorAdmissionReceiptId(collabPreflight.initId));
       const receipt: CreatorAdmissionReceipt | undefined = existingEntry?.creatorAdmissionReceipt as CreatorAdmissionReceipt | undefined
@@ -28356,7 +28360,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
           originQuotaKey: durable.quotaKey,
           originChatId: chatId,
         } : undefined);
-      if (receipt && !existingEntry?.chatId && existingEntry?.state === 'running') {
+      if (receipt && existingEntry?.state === 'running') {
         const resumeResult = await startCollabGroupBirth(data, ctx, collabPreflight.initId, receipt);
         if (resumeResult.kind === 'collab-handled') return;
       }
@@ -37668,6 +37672,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       await dispatchLaunchTargetCoordinator.recover();
     } catch (error) {
       logger.error(`[dispatch-launch] recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  // 恢复本 daemon 自己拥有的 collab S1 半完成账本。必须在消息 dispatcher 启动前完成，
+  // 且只扫当前 appId，避免 one-daemon-per-bot 下多个进程重放同一外部 operation。
+  if (!cfg.apiOnly) {
+    try {
+      const recovered = await recoverRunningCollabGroupBirthsOnStartup({
+        dataDir: config.session.dataDir,
+        creatorAppIds: [cfg.larkAppId],
+      });
+      if (recovered.scanned > 0) {
+        logger.info(`[collab:${cfg.larkAppId}] startup recovery scanned=${recovered.scanned} resumed=${recovered.resumeAttempts} awaiting=${recovered.awaitingInput} released=${recovered.releasedUncommitted} errors=${recovered.errors.length}`);
+      }
+      for (const error of recovered.errors) {
+        logger.warn(`[collab:${error.creatorAppId}] startup recovery failed init=${error.initId ?? '-'}: ${error.message}`);
+      }
+    } catch (error) {
+      logger.warn(`[collab:${cfg.larkAppId}] startup recovery aborted: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 

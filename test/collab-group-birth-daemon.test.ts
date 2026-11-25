@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => {
     dataDir,
     createGroupWithBots: vi.fn(),
     replyMessage: vi.fn(async () => 'om_reply'),
+    forwardMessage: vi.fn(async () => 'om_forwarded'),
     sendMessage: vi.fn(async () => 'om_intro'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
@@ -79,7 +80,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
-    forwardMessage: vi.fn(async () => 'om_forwarded'),
+    forwardMessage: mocks.forwardMessage,
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
     getChatInfo: vi.fn(async () => ({ userCount: 1, botCount: 1 })),
@@ -412,6 +413,39 @@ describe('协作初始化入口：fail-closed 不扣费不建群', () => {
       expect(mocks.createGroupWithBots).not.toHaveBeenCalled();
     } finally {
       __testOnly_setCollabPeerPreflight(undefined);
+    }
+  });
+
+  it('chatId 已落 + forward unknown：同 source 经 existing 接缝续跑，不二次扣费/建群', async () => {
+    __testOnly_setCollabPeerPreflight(async () => ({ ok: true }));
+    const source = 'om_forward_resume';
+    const createSpy = vi.fn(async () => ({ code: 0, data: { chat_id: BORN_GROUP } }));
+    (getBot(APP).client as any).im = { v1: { chat: { create: createSpy } } };
+    mocks.forwardMessage.mockReset();
+    mocks.forwardMessage.mockRejectedValueOnce(new Error('forward timeout'));
+    mocks.forwardMessage.mockResolvedValue('om_forwarded_retry');
+    try {
+      await handleNewTopic(dmEvent('forward resume', source), dmCtx(source));
+      const initId = collabInitId(collabSourceKey(APP, DM_CHAT, source));
+      let entry = readCollabInitStore(mocks.dataDir, APP).entries[initId];
+      const forwardKey = Object.keys(entry.operations).find(k => entry.operations[k].kind === 'forward')!;
+      expect(entry.chatId).toBe(BORN_GROUP);
+      expect(entry.state).toBe('running');
+      expect(entry.operations[forwardKey].status).toBe('unknown');
+      expect(chargedUnits()).toBe(1);
+      expect(createSpy).toHaveBeenCalledTimes(1);
+      expect(mocks.forwardMessage).toHaveBeenCalledTimes(1);
+
+      await handleNewTopic(dmEvent('forward resume', source), dmCtx(source));
+      entry = readCollabInitStore(mocks.dataDir, APP).entries[initId];
+      expect(entry.operations[forwardKey].status).toBe('done');
+      expect(mocks.forwardMessage).toHaveBeenCalledTimes(2);
+      expect(createSpy).toHaveBeenCalledTimes(1);
+      expect(chargedUnits()).toBe(1);
+    } finally {
+      __testOnly_setCollabPeerPreflight(undefined);
+      mocks.forwardMessage.mockReset();
+      mocks.forwardMessage.mockResolvedValue('om_forwarded');
     }
   });
 

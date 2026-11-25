@@ -103,6 +103,8 @@ export function collabPayloadHash(payload: unknown): string {
 
 /** 建群 uuid 去重窗口（§10.3）：飞书同 uuid 10h 内去重，超窗不自动重建。 */
 export const COLLAB_CREATE_UUID_WINDOW_MS = 10 * 60 * 60 * 1000;
+/** 消息/转发 uuid 去重窗口（§10.3）：1h，超窗必须人工核对，不自动重发。 */
+export const COLLAB_MESSAGE_UUID_WINDOW_MS = 60 * 60 * 1000;
 
 /**
  * 阶段 2 持久化的 creator 扣费回执（防崩溃重投二次扣费）。幂等键 =
@@ -407,6 +409,8 @@ export function validateSessionGroupCollaborationConfig(
           errors.push(`agent ${agent.appId} 的 Profile 条目缺失（profile=${pid}）：null 是失败`);
         } else {
           resolvedProfileEntries[agent.appId] = content;
+          // 空条目会显式清除 chat override 并沿用 team/none；team 内容也必须进入 S0 冻结版本。
+          if (content === '') referencedTeamRoles[agent.appId] = deps.resolveTeamRole(agent.appId);
         }
       }
     }

@@ -20,10 +20,12 @@ import {
 import { dispatchLaunchIpcTarget } from './dispatch-launch-ipc-client.js';
 import type { OnlineDaemonInfo } from '../utils/daemon-discovery.js';
 import { loopbackFetchImpl } from './loopback-fetch.js';
+import { resolvePairedBackendId } from './remote-cli-ids.js';
 
 export const COLLAB_IPC_ROUTE_PREFIX = '/__collab-ipc/v1';
 export const COLLAB_IPC_PROTOCOL_VERSION = 1;
 export const COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT = 'durable-turn-output-receipt-v1';
+export const COLLAB_IPC_TIMEOUT_MS = 10_000;
 
 export interface CollabPreflightRequestV1 {
   schemaVersion: 1;
@@ -85,6 +87,20 @@ export function declaresDurableTurnOutputReceipt(backendType: string | undefined
   return backendType === undefined || backendType === 'pty' || backendType === 'tmux';
 }
 
+/** creator 与 peer handler 共用的实际 CLI/backend 配对能力口径。 */
+export function declaresDurableTurnOutputReceiptForCli(
+  cliId: string | undefined,
+  backendType: string | null | undefined,
+  daemonBackendType: string | null | undefined,
+): boolean {
+  return declaresDurableTurnOutputReceipt(resolvePairedBackendId(cliId, backendType, daemonBackendType));
+}
+
+export function isCollabIpcTimeoutError(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
 /** `POST /__collab-ipc/v1/:initId/preflight`。 */
 export function collabPreflightPath(initId: string): string {
   return `${COLLAB_IPC_ROUTE_PREFIX}/${encodeURIComponent(initId)}/preflight`;
@@ -104,7 +120,7 @@ export class CollabPreflightTransportError extends Error {
 export async function preflightCollabPeer(
   daemon: Pick<OnlineDaemonInfo, 'larkAppId' | 'ipcPort' | 'bootInstanceId' | 'dispatchLaunchIpcProtocol'>,
   req: CollabPreflightRequestV1,
-  opts: { secret?: string; secretPath?: string; fetchImpl?: typeof fetch; timestamp?: string; nonce?: string } = {},
+  opts: { secret?: string; secretPath?: string; fetchImpl?: typeof fetch; timestamp?: string; nonce?: string; timeoutMs?: number } = {},
 ): Promise<CollabPreflightResponseV1> {
   let target: DispatchLaunchIpcTarget;
   try {
@@ -123,20 +139,21 @@ export async function preflightCollabPeer(
   const bodyRaw = JSON.stringify(req);
   const nonce = opts.nonce ?? generateDispatchLaunchIpcNonce();
   const headers = dispatchLaunchIpcHeaders({ secret, method, pathWithQuery, bodyRaw, target, timestamp: opts.timestamp, nonce });
+  const signal = AbortSignal.timeout(opts.timeoutMs ?? COLLAB_IPC_TIMEOUT_MS);
   let response: Response;
   try {
     response = await (opts.fetchImpl ?? loopbackFetchImpl)(
       `http://127.0.0.1:${target.ipcPort}${pathWithQuery}`,
-      { method, headers: { 'content-type': 'application/json', ...headers }, body: bodyRaw },
+      { method, headers: { 'content-type': 'application/json', ...headers }, body: bodyRaw, signal },
     );
   } catch (err) {
-    return { ok: false, errorCode: 'PEER_OFFLINE', message: err instanceof Error ? err.message : String(err) };
+    return { ok: false, errorCode: isCollabIpcTimeoutError(err) ? 'PEER_TIMEOUT' : 'PEER_OFFLINE', message: err instanceof Error ? err.message : String(err) };
   }
   let respBody: string;
   try {
     respBody = await response.text();
-  } catch {
-    return { ok: false, errorCode: 'RESPONSE_READ_FAILED', message: 'failed to read response body' };
+  } catch (err) {
+    return { ok: false, errorCode: isCollabIpcTimeoutError(err) ? 'PEER_TIMEOUT' : 'RESPONSE_READ_FAILED', message: err instanceof Error ? err.message : String(err) };
   }
   // R5：严格验证成功 HTTP 状态。非 200 一律未就绪。
   if (response.status !== 200) {

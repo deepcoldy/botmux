@@ -5,7 +5,7 @@
  * 用真实临时目录 + 假时钟驱动（不 mock config —— store 的 dataDir 显式传入）。
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, statSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, statSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -13,6 +13,9 @@ import {
   markCollabInitTerminal,
   placeCollabGroupInit,
   readCollabInitStore,
+  readCollabInitStoreStrict,
+  patchCollabInitEntry,
+  CollabInitStoreCorruptedError,
   __testOnly_resetCollabInitMutexes,
   type CollabPlaceResult,
 } from '../src/services/collab-init-store.js';
@@ -171,5 +174,42 @@ describe('CollabInitStore：稳定 source store', () => {
     expect(Object.keys(store.entries)).toHaveLength(2);
     expect(store.entries[optsA.initId]).toBeTruthy();
     expect(store.entries[optsB.initId]).toBeTruthy();
+  });
+
+  it('损坏 JSON → strict corrupted，mutation 失败且原文件字节不变', async () => {
+    await placeCollabGroupInit(placeOpts(SRC_MSG_1));
+    const fp = collabInitFilePath(tempDir, APP);
+    writeFileSync(fp, '{broken-json', { mode: 0o600 });
+    const before = readFileSync(fp, 'utf-8');
+    expect(readCollabInitStoreStrict(tempDir, APP).kind).toBe('corrupted');
+    await expect(placeCollabGroupInit(placeOpts(SRC_MSG_2))).rejects.toThrow(CollabInitStoreCorruptedError);
+    expect(readFileSync(fp, 'utf-8')).toBe(before);
+  });
+
+  it('sourceIndex 悬空 → 判 corrupted，不允许重新占位覆盖', async () => {
+    const opts = placeOpts(SRC_MSG_1);
+    await placeCollabGroupInit(opts);
+    const fp = collabInitFilePath(tempDir, APP);
+    const raw = JSON.parse(readFileSync(fp, 'utf-8'));
+    raw.sourceIndex['["dangling"]'] = 'f'.repeat(64);
+    writeFileSync(fp, JSON.stringify(raw), { mode: 0o600 });
+    const before = readFileSync(fp, 'utf-8');
+    expect(readCollabInitStoreStrict(tempDir, APP).kind).toBe('corrupted');
+    await expect(placeCollabGroupInit(placeOpts(SRC_MSG_2))).rejects.toThrow(CollabInitStoreCorruptedError);
+    expect(readFileSync(fp, 'utf-8')).toBe(before);
+  });
+
+  it('终态 entry 的 stale active 指针不判损坏，新请求放置时清理', async () => {
+    const opts = placeOpts(SRC_MSG_1);
+    await placeCollabGroupInit(opts);
+    await patchCollabInitEntry({
+      dataDir: tempDir, creatorAppId: APP, initId: opts.initId,
+      mutate: (entry) => { entry.state = 'cancelled'; return true; },
+    });
+    expect(readCollabInitStoreStrict(tempDir, APP).kind).toBe('ok');
+    const next = await placeCollabGroupInit(placeOpts(SRC_MSG_2));
+    expect(next.kind).toBe('created');
+    const store = readCollabInitStore(tempDir, APP);
+    expect(store.activeByDmChat[DM]).toBe(next.initId);
   });
 });

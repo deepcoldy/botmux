@@ -26,9 +26,7 @@ import type { SessionGroupCollaborationConfig } from '../services/collab-group-c
 export interface RoleVerifyDeps {
   dataDir: string;
   now: () => number;
-  /** 解析 profile 条目内容（真实 readRoleProfileEntry 或替身）。null = 条目不存在，'' = 显式清空。 */
-  readProfile: (profileId: string, appId: string) => string | null;
-  /** 解析 team role 内容（无则 null）。 */
+  /** 读取当前有效 team role，用于与 S0 快照比对；null = 当前无 team role。 */
   readTeamRole: (appId: string) => string | null;
   /** 写本群角色文件（真实 writeRoleFile 或替身）。 */
   writeRole: (larkAppId: string, chatId: string, content: string) => void;
@@ -36,6 +34,15 @@ export interface RoleVerifyDeps {
   deleteRole: (larkAppId: string, chatId: string) => void;
   /** 严格回读（真实 readRoleFileStrict 或替身）。 */
   readRole: (larkAppId: string, chatId: string) => StrictRoleRead;
+}
+
+export interface CollabRoleSnapshot {
+  resolvedProfileEntries: Record<string, string | null>;
+  referencedTeamRoles: Record<string, string | null>;
+}
+
+function hasOwn(values: Record<string, string | null>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(values, key);
 }
 
 export interface RoleVerifyOutcome {
@@ -66,26 +73,36 @@ export function runCollabRoleVerification(
   chatId: string,
   config: SessionGroupCollaborationConfig,
   deps: RoleVerifyDeps,
+  snapshot: CollabRoleSnapshot | undefined,
 ): RoleVerifyOutcome {
   const records: RoleVerifyOutcome['records'] = [];
   const applicable = config.agents.filter(a => a.appId === larkAppId);
 
   for (const agent of applicable) {
     if (agent.roleMode === 'no-chat-role') {
-      // 不写本群覆盖；核对 team/none 及期望 hash。
+      if (!snapshot || !hasOwn(snapshot.referencedTeamRoles, agent.appId)) {
+        records.push({ appId: agent.appId, expectedSource: 'team', verified: false, conflict: true });
+        return { ready: false, records, conflict: `agent ${agent.appId} 缺 S0 team role 冻结快照` };
+      }
+      // 不写本群覆盖；实际 team/none 必须仍等于 S0 快照，不能读取新内容后自我证明。
       const strict = deps.readRole(larkAppId, chatId);
       if (strict.kind === 'read-error') {
         records.push({ appId: agent.appId, expectedSource: 'team', verified: false, conflict: true });
         return { ready: false, records, conflict: `agent ${agent.appId} 角色回读失败（read-error）` };
       }
       if (!isNoChatOverride(strict)) {
-        // 本群有覆盖，但 no-chat-role 期望沿用 team/none → 冲突。
         records.push({ appId: agent.appId, expectedSource: 'team', verified: false, conflict: true });
         return { ready: false, records, conflict: `agent ${agent.appId} 期望 no-chat-role 但本群有覆盖` };
       }
-      const teamContent = deps.readTeamRole(agent.appId);
+      const teamContent = snapshot.referencedTeamRoles[agent.appId];
       const expectedHash = teamContent === null ? undefined : roleContentHash(teamContent);
-      records.push({ appId: agent.appId, expectedSource: 'team', expectedHash, verified: true });
+      const actualTeamContent = deps.readTeamRole(agent.appId);
+      const actualHash = actualTeamContent === null ? undefined : roleContentHash(actualTeamContent);
+      if (actualHash !== expectedHash) {
+        records.push({ appId: agent.appId, expectedSource: teamContent === null ? 'none' : 'team', expectedHash, actualHash, verified: false, conflict: true });
+        return { ready: false, records, conflict: `agent ${agent.appId} team role 已在 S0 后变化` };
+      }
+      records.push({ appId: agent.appId, expectedSource: teamContent === null ? 'none' : 'team', expectedHash, actualHash, verified: true });
       continue;
     }
 
@@ -95,12 +112,20 @@ export function runCollabRoleVerification(
       records.push({ appId: agent.appId, expectedSource: 'none', verified: false });
       return { ready: false, records, conflict: `agent ${agent.appId} 缺 profileId` };
     }
-    const entryContent = deps.readProfile(profileId, agent.appId);
+    if (!snapshot || !hasOwn(snapshot.resolvedProfileEntries, agent.appId)) {
+      records.push({ appId: agent.appId, expectedSource: 'none', verified: false, conflict: true });
+      return { ready: false, records, conflict: `agent ${agent.appId} 缺 S0 Profile 冻结快照（profile=${profileId}）` };
+    }
+    const entryContent = snapshot.resolvedProfileEntries[agent.appId];
     if (entryContent === null) {
       records.push({ appId: agent.appId, expectedSource: 'none', verified: false });
       return { ready: false, records, conflict: `agent ${agent.appId} 的 Profile 条目缺失（profile=${profileId}）` };
     }
     if (entryContent === '') {
+      if (!hasOwn(snapshot.referencedTeamRoles, agent.appId)) {
+        records.push({ appId: agent.appId, expectedSource: 'team', verified: false, conflict: true });
+        return { ready: false, records, conflict: `agent ${agent.appId} 空 Profile 缺 S0 team role 冻结快照` };
+      }
       // profile + ''：显式清空本群覆盖。严格回读须在**任何角色修改（含删除）之前**：
       // read-error 立即 fail-closed 并保留旧文件，不因不可读旧文件而被 deleteRole 绕过。
       const strictBefore = deps.readRole(larkAppId, chatId);
@@ -118,9 +143,15 @@ export function runCollabRoleVerification(
         records.push({ appId: agent.appId, expectedSource: 'team', verified: false, conflict: true });
         return { ready: false, records, conflict: `agent ${agent.appId} 清空后仍有本群覆盖` };
       }
-      const teamContent = deps.readTeamRole(agent.appId);
-      const expectedHash = teamContent === null ? undefined : roleContentHash(teamContent);
-      records.push({ appId: agent.appId, expectedSource: 'team', expectedHash, verified: true });
+      const expectedTeamContent = snapshot.referencedTeamRoles[agent.appId];
+      const expectedHash = expectedTeamContent === null ? undefined : roleContentHash(expectedTeamContent);
+      const actualTeamContent = deps.readTeamRole(agent.appId);
+      const actualHash = actualTeamContent === null ? undefined : roleContentHash(actualTeamContent);
+      if (actualHash !== expectedHash) {
+        records.push({ appId: agent.appId, expectedSource: expectedTeamContent === null ? 'none' : 'team', expectedHash, actualHash, verified: false, conflict: true });
+        return { ready: false, records, conflict: `agent ${agent.appId} team role 已在 S0 后变化` };
+      }
+      records.push({ appId: agent.appId, expectedSource: expectedTeamContent === null ? 'none' : 'team', expectedHash, actualHash, verified: true });
       continue;
     }
 

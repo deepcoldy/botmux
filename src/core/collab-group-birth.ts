@@ -17,6 +17,7 @@ import { resolveTeamRoleFile } from '../core/role-resolver.js';
 import {
   buildCollabConfigVersion,
   collabCreatorAdmissionOperationId,
+  collabCreatorAdmissionReceiptId,
   collabInitId,
   collabSourceKey,
   COLLAB_CREATE_ATTEMPT_INITIAL,
@@ -28,14 +29,19 @@ import {
 import { loadBotConfigsCached } from '../bot-registry.js';
 import {
   markCollabInitTerminal,
+  patchCollabInitEntry,
   placeCollabGroupInit,
+  readCollabInitEntry,
+  readCollabInitStore,
+  type CollabGroupInitEntry,
 } from '../services/collab-init-store.js';
 import { createChatWithUuid } from '../services/groups-store.js';
 import { registerSessionGroup } from '../services/session-groups-store.js';
+import { getCollabAdmissionReceipt } from '../services/grant-store.js';
 import { forwardMessage } from '../im/lark/client.js';
 import { runCollabGroupBirthS1, type CollabS1Deps } from './collab-orchestrator.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
-import { preflightCollabPeer, COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT, declaresDurableTurnOutputReceipt } from './collab-preflight-ipc.js';
+import { preflightCollabPeer, COLLAB_IPC_DURABLE_TURN_OUTPUT_RECEIPT, declaresDurableTurnOutputReceiptForCli } from './collab-preflight-ipc.js';
 import { resolvePairedBackendId } from './remote-cli-ids.js';
 import type { RoutingContext } from '../im/lark/event-dispatcher.js';
 
@@ -131,7 +137,7 @@ export async function realCollabPeerPreflight(ctx: CollabPeerPreflightContext): 
   if (requiresDurableReceipt.has(ctx.creatorAppId)) {
     const creatorCfg = getBot(ctx.creatorAppId).config;
     const actualBackend = resolvePairedBackendId(creatorCfg.cliId, creatorCfg.backendType, config.daemon.backendType);
-    const creatorCapable = declaresDurableTurnOutputReceipt(actualBackend);
+    const creatorCapable = declaresDurableTurnOutputReceiptForCli(creatorCfg.cliId, creatorCfg.backendType, config.daemon.backendType);
     if (!creatorCapable) {
       errors.push(`creator ${ctx.creatorAppId} 被 afterAgentTurn 依赖但未声明 durable-turn-output-receipt-v1（backend=${actualBackend ?? 'unknown'}）`);
     }
@@ -218,19 +224,28 @@ export async function preflightCollabGroupBirth(
   });
   const creatorAdmissionOperationId = collabCreatorAdmissionOperationId(initId);
 
-  const placed = await placeCollabGroupInit({
-    dataDir,
-    creatorAppId,
-    dmChatId,
-    sourceKey,
-    initId,
-    sourceMessageId: messageId,
-    configVersion,
-    configSnapshot: validation.config,
-    creatorAdmissionOperationId,
-    createAttempt: COLLAB_CREATE_ATTEMPT_INITIAL,
-    now: deps.now(),
-  });
+  let placed: Awaited<ReturnType<typeof placeCollabGroupInit>>;
+  try {
+    placed = await placeCollabGroupInit({
+      dataDir,
+      creatorAppId,
+      dmChatId,
+      sourceKey,
+      initId,
+      sourceMessageId: messageId,
+      configVersion,
+      configSnapshot: validation.config,
+      resolvedProfileEntries: validation.resolvedProfileEntries,
+      referencedTeamRoles: validation.referencedTeamRoles,
+      sourceSenderOpenId: data?.sender?.sender_id?.open_id,
+      creatorAdmissionOperationId,
+      createAttempt: COLLAB_CREATE_ATTEMPT_INITIAL,
+      now: deps.now(),
+    });
+  } catch (err) {
+    // 损坏或写盘结果未知均 fail-closed；不得把旧账本当空文件覆盖，也不擅自释放未知占位。
+    return { kind: 'failed', reason: `协作初始化账本不可用：${String((err as any)?.message ?? err)}`, releasesDmChat: false };
+  }
 
   if (placed.kind === 'existing') return { kind: 'existing', initId: placed.initId, status: placed.status };
   if (placed.kind === 'busy') return { kind: 'busy', initId: placed.initId };
@@ -324,4 +339,142 @@ export async function releaseCollabGroupBirth(opts: {
     state: 'failed',
     now: opts.now(),
   });
+}
+
+export interface CollabBirthStartupRecoveryOpts {
+  dataDir: string;
+  /** 必须只传当前 daemon 自己负责的 appId，避免多 daemon 重放同一账本。 */
+  creatorAppIds: readonly string[];
+  now?: () => number;
+  preflightDeps?: Partial<CollabPreflightDeps>;
+  startDeps?: Partial<CollabS1Deps>;
+  startImpl?: typeof startCollabGroupBirth;
+  readAdmissionReceipt?: typeof getCollabAdmissionReceipt;
+}
+
+export interface CollabBirthStartupRecoveryResult {
+  scanned: number;
+  resumeAttempts: number;
+  awaitingInput: number;
+  releasedUncommitted: number;
+  errors: Array<{ creatorAppId: string; initId?: string; message: string }>;
+}
+
+function recoveryEvent(entry: CollabGroupInitEntry, creatorAppId: string): { data: any; ctx: RoutingContext } {
+  const data = {
+    sender: { sender_id: { open_id: entry.sourceSenderOpenId }, sender_type: 'user' },
+    message: { message_id: entry.sourceMessageId, chat_id: entry.dmChatId, chat_type: 'p2p' },
+  };
+  const ctx: RoutingContext = {
+    larkAppId: creatorAppId,
+    chatId: entry.dmChatId,
+    messageId: entry.sourceMessageId,
+    chatType: 'p2p',
+    scope: 'thread',
+    anchor: entry.sourceMessageId,
+  };
+  return { data, ctx };
+}
+
+function durableReceiptForRecovery(
+  entry: CollabGroupInitEntry,
+  creatorAppId: string,
+  readReceipt: typeof getCollabAdmissionReceipt,
+  now: () => number,
+): CreatorAdmissionReceipt | undefined {
+  const projected = entry.creatorAdmissionReceipt as CreatorAdmissionReceipt | undefined;
+  if (projected?.operationId) return projected;
+  const durable = readReceipt(creatorAppId, collabCreatorAdmissionReceiptId(entry.initId));
+  if (!durable?.allow) return undefined;
+  return {
+    operationId: collabCreatorAdmissionOperationId(entry.initId),
+    quotaKey: durable.quotaKey,
+    used: durable.used,
+    chargedAt: Date.parse(durable.chargedAt) || now(),
+    allow: true,
+    originReason: durable.reason,
+    originQuotaKey: durable.quotaKey,
+    originChatId: entry.dmChatId,
+  };
+}
+
+/**
+ * 启动只扫描 running：先经现有 preflight 重新求当前 configVersion，再恢复 durable admission
+ * 之后的 S1。awaiting-input/failed/cancelled/done 一律不自动推进。无 receipt 且无 chatId 的
+ * 占位在扣费+回执同事务语义下不可能已扣费，置 failed 释放 DM；其它不确定形状转人工态。
+ */
+export async function recoverRunningCollabGroupBirthsOnStartup(
+  opts: CollabBirthStartupRecoveryOpts,
+): Promise<CollabBirthStartupRecoveryResult> {
+  const now = opts.now ?? (() => Date.now());
+  const start = opts.startImpl ?? startCollabGroupBirth;
+  const readReceipt = opts.readAdmissionReceipt ?? getCollabAdmissionReceipt;
+  const result: CollabBirthStartupRecoveryResult = { scanned: 0, resumeAttempts: 0, awaitingInput: 0, releasedUncommitted: 0, errors: [] };
+  const markAwaiting = async (creatorAppId: string, entry: CollabGroupInitEntry, reason: string): Promise<void> => {
+    await patchCollabInitEntry({
+      dataDir: opts.dataDir, creatorAppId, initId: entry.initId,
+      mutate: (e) => {
+        e.state = 'awaiting-input';
+        e.awaiting = { reason, since: now() };
+        e.updatedAt = now();
+        return true;
+      },
+    });
+    result.awaitingInput++;
+  };
+
+  for (const creatorAppId of opts.creatorAppIds) {
+    let entries: CollabGroupInitEntry[];
+    try {
+      entries = Object.values(readCollabInitStore(opts.dataDir, creatorAppId).entries)
+        .filter(entry => entry.state === 'running');
+    } catch (err) {
+      result.errors.push({ creatorAppId, message: String((err as any)?.message ?? err) });
+      continue;
+    }
+    for (const entry of entries) {
+      result.scanned++;
+      try {
+        if (!entry.sourceSenderOpenId) {
+          await markAwaiting(creatorAppId, entry, 'RECOVERY_IDENTITY_MISSING');
+          continue;
+        }
+        const { data, ctx } = recoveryEvent(entry, creatorAppId);
+        const preflight = await preflightCollabGroupBirth(data, ctx, {
+          ...opts.preflightDeps,
+          dataDir: opts.dataDir,
+          now,
+        });
+        if (preflight.kind !== 'existing') {
+          // 配置被关闭或变得非法同样属于冻结版本变化，不得恢复旧快照。
+          await markAwaiting(creatorAppId, entry, 'CONFIG_CHANGED');
+          continue;
+        }
+        const fresh = readCollabInitEntry(opts.dataDir, creatorAppId, entry.initId);
+        if (!fresh || fresh.state !== 'running') {
+          if (fresh?.state === 'awaiting-input') result.awaitingInput++;
+          continue;
+        }
+        const receipt = durableReceiptForRecovery(fresh, creatorAppId, readReceipt, now);
+        if (!receipt) {
+          if (fresh.chatId) {
+            await markAwaiting(creatorAppId, fresh, 'ADMISSION_RECEIPT_MISSING');
+          } else {
+            await patchCollabInitEntry({
+              dataDir: opts.dataDir, creatorAppId, initId: fresh.initId,
+              mutate: (e) => { e.awaiting = { reason: 'ADMISSION_NOT_COMMITTED', since: now() }; return true; },
+            });
+            await markCollabInitTerminal({ dataDir: opts.dataDir, creatorAppId, initId: fresh.initId, dmChatId: fresh.dmChatId, state: 'failed', now: now() });
+            result.releasedUncommitted++;
+          }
+          continue;
+        }
+        await start(data, ctx, fresh.initId, receipt, { ...opts.startDeps, dataDir: opts.dataDir, now });
+        result.resumeAttempts++;
+      } catch (err) {
+        result.errors.push({ creatorAppId, initId: entry.initId, message: String((err as any)?.message ?? err) });
+      }
+    }
+  }
+  return result;
 }

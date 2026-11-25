@@ -252,6 +252,28 @@ describe('validateSessionGroupCollaborationConfig（结构校验）', () => {
     expect(v.referencedTeamRoles['cli_builder']).toBe('team-role');
   });
 
+  it('空 Profile 的 team fallback 也进入 S0 快照并影响 configVersion', () => {
+    const cfg = validConfig({
+      agents: [{ appId: 'cli_creator' }, { appId: 'cli_builder', profileId: 'builder_empty' }],
+      kickoff: [
+        { appId: 'cli_creator', trigger: 'immediate' },
+        { appId: 'cli_builder', trigger: 'afterAgentTurn', afterAppId: 'cli_creator', artifact: { type: 'marked-url', hosts: ['x.com'] } },
+      ],
+    });
+    const validate = (team: string) => validateSessionGroupCollaborationConfig(cfg, {
+      dataDir: '/tmp/x',
+      resolveProfile: (_pid, appId) => appId === 'cli_builder' ? '' : 'creator-role',
+      resolveTeamRole: appId => appId === 'cli_builder' ? team : null,
+    });
+    const v1 = validate('team-v1');
+    const v2 = validate('team-v2');
+    expect(v1.ok && v2.ok).toBe(true);
+    if (!v1.ok || !v2.ok) return;
+    expect(v1.resolvedProfileEntries.cli_builder).toBe('');
+    expect(v1.referencedTeamRoles.cli_builder).toBe('team-v1');
+    expect(buildCollabConfigVersion(v1)).not.toBe(buildCollabConfigVersion(v2));
+  });
+
   it('省略 roleMode（默认 profile）保留 profileId override，且与显式 roleMode:profile 等价（P1#2）', () => {
     const resolveProfile = (_pid: string, appId: string) => (appId === 'cli_builder' ? 'builder-override-role' : 'creator-default-role');
     const base = {

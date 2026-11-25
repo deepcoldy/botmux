@@ -1,13 +1,11 @@
 /**
- * 每接收方持久队列（design 2026-11-20-dm-collab-group §8.3）。
+ * 每接收方持久队列（design §8.3）。
  *
  * 文件按 target 分区：`{dataDir}/collab-chat-queues/{chatId}/{targetAppId}.json`。每个
  * target daemon 只读写自己的队列文件（单 writer），不同 target 共享 dataDir/chat 时物理
- * 隔离，互不覆盖（N1）。gate 未 open 时，目标 daemon 把规范化路由事件按
- * (targetAppId, sourceMessageId) 复合键入队；gate open 后按序重放进正常准入，不重发
- * 飞书用户消息。
+ * 隔离，互不覆盖。只有 ENOENT 是空队列；损坏必须 fail-closed，禁止把 pending 消息当空队列覆盖。
  */
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
@@ -30,38 +28,81 @@ export interface CollabChatQueueFile {
 
 export const COLLAB_CHAT_QUEUE_SCHEMA_VERSION = 1;
 
+export type CollabChatQueueReadResult =
+  | { kind: 'missing' }
+  | { kind: 'corrupted'; message: string }
+  | { kind: 'ok'; queue: CollabChatQueueFile };
+
+export class CollabChatQueueCorruptedError extends Error {
+  constructor(public readonly filePath: string, message: string) {
+    super(`collab chat queue corrupted at ${filePath}: ${message}`);
+    this.name = 'CollabChatQueueCorruptedError';
+  }
+}
+
 /** 按 target 分区：`{dataDir}/collab-chat-queues/{chatId}/{targetAppId}.json`。 */
 export function collabChatQueuePath(dataDir: string, chatId: string, targetAppId: string): string {
   return join(dataDir, 'collab-chat-queues', chatId, `${targetAppId}.json`);
 }
 
-/** 读取某 target 的队列（不存在/损坏返回空）。 */
-export function readCollabChatQueue(dataDir: string, chatId: string, targetAppId: string): CollabChatQueueFile {
-  const fp = collabChatQueuePath(dataDir, chatId, targetAppId);
-  const empty = { schemaVersion: COLLAB_CHAT_QUEUE_SCHEMA_VERSION, chatId, targetAppId, items: [] as CollabChatQueueItem[] };
-  if (!existsSync(fp)) return empty;
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return empty;
-    const raw = parsed as Record<string, unknown>;
-    const items = Array.isArray(raw.items) ? raw.items as CollabChatQueueItem[] : [];
-    return { schemaVersion: COLLAB_CHAT_QUEUE_SCHEMA_VERSION, chatId, targetAppId, items };
-  } catch {
-    return empty;
-  }
+function emptyQueue(chatId: string, targetAppId: string): CollabChatQueueFile {
+  return { schemaVersion: COLLAB_CHAT_QUEUE_SCHEMA_VERSION, chatId, targetAppId, items: [] };
 }
 
-/**
- * 入队（按 (targetAppId, sourceMessageId) 复合键去重，返回是否新增）。
- * 单 writer：一个 target 队列只有一个 writer（该 target daemon），RMW 无需跨进程锁。
- */
+function parseQueue(raw: string, chatId: string, targetAppId: string): CollabChatQueueFile {
+  const parsed: unknown = JSON.parse(raw);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('queue 非对象');
+  const q = parsed as Partial<CollabChatQueueFile>;
+  if (q.schemaVersion !== COLLAB_CHAT_QUEUE_SCHEMA_VERSION || q.chatId !== chatId
+    || q.targetAppId !== targetAppId || !Array.isArray(q.items)) {
+    throw new Error('queue schemaVersion/身份/items 不符');
+  }
+  for (const item of q.items) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)
+      || typeof item.sourceMessageId !== 'string' || !item.sourceMessageId
+      || item.targetAppId !== targetAppId
+      || !['pending', 'delivered', 'rejected'].includes(item.deliveryStatus)
+      || typeof item.enqueuedAt !== 'number' || !Number.isFinite(item.enqueuedAt)) {
+      throw new Error('queue item 结构非法');
+    }
+  }
+  return q as CollabChatQueueFile;
+}
+
+/** 严格读：只有 ENOENT 是 missing；读取、JSON、schema 或身份错误都是 corrupted。 */
+export function readCollabChatQueueStrict(dataDir: string, chatId: string, targetAppId: string): CollabChatQueueReadResult {
+  const fp = collabChatQueuePath(dataDir, chatId, targetAppId);
+  let raw: string;
+  try { raw = readFileSync(fp, 'utf-8'); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return { kind: 'missing' };
+    return { kind: 'corrupted', message: err instanceof Error ? err.message : String(err) };
+  }
+  try { return { kind: 'ok', queue: parseQueue(raw, chatId, targetAppId) }; }
+  catch (err) { return { kind: 'corrupted', message: err instanceof Error ? err.message : String(err) }; }
+}
+
+/** 常规读：不存在返回空队列；损坏抛错，禁止后续 mutation 覆盖旧 pending 项。 */
+export function readCollabChatQueue(dataDir: string, chatId: string, targetAppId: string): CollabChatQueueFile {
+  const read = readCollabChatQueueStrict(dataDir, chatId, targetAppId);
+  if (read.kind === 'missing') return emptyQueue(chatId, targetAppId);
+  if (read.kind === 'corrupted') throw new CollabChatQueueCorruptedError(collabChatQueuePath(dataDir, chatId, targetAppId), read.message);
+  return read.queue;
+}
+
+function writeQueue(dataDir: string, queue: CollabChatQueueFile): void {
+  parseQueue(JSON.stringify(queue), queue.chatId, queue.targetAppId);
+  const fp = collabChatQueuePath(dataDir, queue.chatId, queue.targetAppId);
+  mkdirSync(dirname(fp), { recursive: true });
+  atomicWriteFileSync(fp, `${JSON.stringify(queue, null, 2)}\n`, { mode: 0o600, durable: true });
+}
+
+/** 入队（按 (targetAppId, sourceMessageId) 复合键去重，返回是否新增）。 */
 export function enqueueCollabChatItem(dataDir: string, chatId: string, item: CollabChatQueueItem): boolean {
   const q = readCollabChatQueue(dataDir, chatId, item.targetAppId);
   if (q.items.some(i => i.sourceMessageId === item.sourceMessageId)) return false;
   q.items.push(item);
-  const fp = collabChatQueuePath(dataDir, chatId, item.targetAppId);
-  mkdirSync(dirname(fp), { recursive: true });
-  atomicWriteFileSync(fp, `${JSON.stringify(q, null, 2)}\n`, { mode: 0o600, durable: true });
+  writeQueue(dataDir, q);
   return true;
 }
 
@@ -71,26 +112,16 @@ export function markCollabChatItemDelivered(dataDir: string, chatId: string, tar
   const item = q.items.find(i => i.sourceMessageId === sourceMessageId);
   if (!item) return;
   item.deliveryStatus = status;
-  const fp = collabChatQueuePath(dataDir, chatId, targetAppId);
-  mkdirSync(dirname(fp), { recursive: true });
-  atomicWriteFileSync(fp, `${JSON.stringify(q, null, 2)}\n`, { mode: 0o600, durable: true });
+  writeQueue(dataDir, q);
 }
 
-/**
- * 队列重放：gate open 后按 sourceMessageId 顺序返回仍 pending 的规范化路由事件（供调用方
- * 复用原 turn/admission 幂等键重放进正常准入）。不重发飞书消息——重放的是路由事件，不是
- * 用户可见消息。
- */
+/** gate open 后按入队时间返回仍 pending 的事件；重放不复读飞书用户消息。 */
 export function listPendingCollabChatItems(dataDir: string, chatId: string, targetAppId: string): CollabChatQueueItem[] {
   const q = readCollabChatQueue(dataDir, chatId, targetAppId);
   return q.items.filter(i => i.deliveryStatus === 'pending').sort((a, b) => a.enqueuedAt - b.enqueuedAt);
 }
 
-/**
- * 目标重启对账：以 gate 文件为准——open（acceptingUserTasks）→ 保留 pending 待重放；
- * closed（gate 不存在 / 本 bot 非 participant / acceptingUserTasks=false 且 phase 非 open）
- * → 保留原队列不变（不自动释放）。返回仍需重放的 pending 项。
- */
+/** 目标重启对账：gate 未 open 保留原队列；open 返回仍需重放的 pending 项。 */
 export function reconcileCollabChatQueue(opts: {
   dataDir: string;
   chatId: string;

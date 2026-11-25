@@ -14,8 +14,8 @@
  * 所有 forward（含 bot_gated）不豁免；passthrough/delegated_turn/daemon(precreate|existing|
  * existing_only) 不豁免。
  */
-import { readCollabGate } from '../services/collab-gate-store.js';
-import { enqueueCollabChatItem, readCollabChatQueue } from '../services/collab-chat-queue-store.js';
+import { readCollabGateStrict } from '../services/collab-gate-store.js';
+import { enqueueCollabChatItem, readCollabChatQueue, CollabChatQueueCorruptedError } from '../services/collab-chat-queue-store.js';
 import { readCollabInitEntry } from '../services/collab-init-store.js';
 import type { TalkEvaluation } from '../im/lark/event-dispatcher.js';
 import type { MentionIdentity } from '../im/lark/message-parser.js';
@@ -144,15 +144,25 @@ export interface CollabGateAdmissionOpts {
 }
 
 export function checkCollabGateAdmission(opts: CollabGateAdmissionOpts): CollabGateAdmissionResult {
-  const gate = opts.gate ?? readCollabGate(opts.dataDir, opts.chatId);
-  if (!gate) return { kind: 'not-collab' };
+  let gate = opts.gate;
+  if (gate === undefined) {
+    const read = readCollabGateStrict(opts.dataDir, opts.chatId);
+    if (read.kind === 'missing') return { kind: 'not-collab' };
+    if (read.kind === 'corrupted') return { kind: 'reject', reason: 'gate_corrupted' };
+    gate = read.gate;
+  }
   const participant = gate.participants[opts.botAppId];
   if (!participant) return { kind: 'not-collab' };
   // F1：gatePolicy 从该群**已冻结的 configSnapshot** 读（creator 的 collab-group-init entry），
   // 不读目标 daemon 自己的 p2p 创建默认配置。opts.config 显式注入优先（测试），否则从
-  // gate.creatorAppId + gate.initId 解析冻结快照。
-  const frozenConfig = opts.config
-    ?? readCollabInitEntry(opts.dataDir, gate.creatorAppId, gate.initId)?.configSnapshot;
+  // gate.creatorAppId + gate.initId 解析冻结快照。账本损坏同样 fail-closed。
+  let frozenConfig: SessionGroupCollaborationConfig | undefined;
+  try {
+    frozenConfig = opts.config
+      ?? readCollabInitEntry(opts.dataDir, gate.creatorAppId, gate.initId)?.configSnapshot;
+  } catch {
+    return { kind: 'reject', reason: 'gate_config_corrupted' };
+  }
 
   // F4：先拒绝未授权 talk，再判豁免/gate——未授权不触碰队列/策略。
   if (!opts.talk.allowed) return { kind: 'reject', reason: 'not_allowed' };
@@ -194,20 +204,24 @@ export function checkCollabGateAdmission(opts: CollabGateAdmissionOpts): CollabG
       const enqueue = opts.enqueueImpl ?? ((d, c, item) => enqueueCollabChatItem(d, c, item));
       const positionImpl = opts.queuePositionImpl ?? ((d, c, targetAppId, smid) =>
         readQueuePosition(d, c, targetAppId, smid));
-      // 先查已有位置（重复投递返回原位置），否则入队。
-      const existingPos = positionImpl(opts.dataDir, opts.chatId, opts.botAppId, sourceMessageId);
-      if (existingPos > 0) return { kind: 'queue', position: existingPos };
-      const added = enqueue(opts.dataDir, opts.chatId, {
-        sourceMessageId,
-        targetAppId: opts.botAppId,
-        routingEvent: opts.routingEvent,
-        deliveryStatus: 'pending',
-        enqueuedAt: now,
-      });
-      // F3：enqueue 失败不宣称成功。
-      if (!added) return { kind: 'reject', reason: 'gate_queue_failed' };
-      const pos = positionImpl(opts.dataDir, opts.chatId, opts.botAppId, sourceMessageId);
-      return { kind: 'queue', position: pos > 0 ? pos : 1 };
+      try {
+        // 先查已有位置（重复投递返回原位置），否则入队。损坏队列绝不覆盖成空文件。
+        const existingPos = positionImpl(opts.dataDir, opts.chatId, opts.botAppId, sourceMessageId);
+        if (existingPos > 0) return { kind: 'queue', position: existingPos };
+        const added = enqueue(opts.dataDir, opts.chatId, {
+          sourceMessageId,
+          targetAppId: opts.botAppId,
+          routingEvent: opts.routingEvent,
+          deliveryStatus: 'pending',
+          enqueuedAt: now,
+        });
+        // F3：enqueue 失败不宣称成功。
+        if (!added) return { kind: 'reject', reason: 'gate_queue_failed' };
+        const pos = positionImpl(opts.dataDir, opts.chatId, opts.botAppId, sourceMessageId);
+        return { kind: 'queue', position: pos > 0 ? pos : 1 };
+      } catch (err) {
+        return { kind: 'reject', reason: err instanceof CollabChatQueueCorruptedError ? 'gate_queue_corrupted' : 'gate_queue_failed' };
+      }
     }
   }
 }

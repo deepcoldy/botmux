@@ -22,7 +22,7 @@ import {
   withCollabInitIdMutex,
   type CollabGroupInitEntry,
 } from '../services/collab-init-store.js';
-import { runCollabRoleVerification, markGateRoleReady, type RoleVerifyDeps } from './collab-role-verify.js';
+import { runCollabRoleVerification, markGateRoleReady, type RoleVerifyDeps, type CollabRoleSnapshot } from './collab-role-verify.js';
 import { evaluateArtifactReady, kickoffTimedOut, KICKOFF_TIMEOUT_MS, type ArtifactReadyFacts, type CollabArtifactSatisfiedBy } from './collab-artifact-ready.js';
 
 export interface S2S5Deps {
@@ -56,6 +56,14 @@ function recheckState(dataDir: string, creatorAppId: string, initId: string): { 
   return { ok: true, entry: entry! };
 }
 
+function frozenRoleSnapshot(entry: CollabGroupInitEntry): CollabRoleSnapshot | undefined {
+  if (entry.resolvedProfileEntries === undefined || entry.referencedTeamRoles === undefined) return undefined;
+  return {
+    resolvedProfileEntries: entry.resolvedProfileEntries,
+    referencedTeamRoles: entry.referencedTeamRoles,
+  };
+}
+
 /**
  * 每次状态迁移/kickoff 准入前：活动 state + configVersion 比对 + 目标角色重校验。
  */
@@ -74,7 +82,7 @@ export function reverifyCollabRoleAndConfig(opts: {
   if (!guard.ok) return guard;
   if (entry!.configVersion !== opts.configVersion) return { ok: false, reason: 'config_version_changed' };
   const target = opts.targetAppId ?? opts.larkAppId;
-  const role = runCollabRoleVerification(target, opts.chatId, opts.config, opts.roleVerify);
+  const role = runCollabRoleVerification(target, opts.chatId, opts.config, opts.roleVerify, frozenRoleSnapshot(entry!));
   if (!role.ready) return { ok: false, reason: role.conflict ?? 'role_not_ready' };
   return { ok: true };
 }
@@ -89,7 +97,14 @@ function checkPayloadHash(existing: CollabGroupInitEntry['operations'][string] |
 }
 
 /** S2 invite：逐 peer 落 operation + 缺员重发；每个 await 后重读 state。 */
-export async function runS2Invites(opts: {
+export function runS2Invites(opts: {
+  dataDir: string; creatorAppId: string; chatId: string; initId: string;
+  peers: Array<{ appId: string }>; deps: S2S5Deps;
+}): Promise<void> {
+  return withCollabInitIdMutex(opts.initId, () => runS2InvitesCritical(opts));
+}
+
+async function runS2InvitesCritical(opts: {
   dataDir: string; creatorAppId: string; chatId: string; initId: string;
   peers: Array<{ appId: string }>; deps: S2S5Deps;
 }): Promise<void> {
@@ -113,6 +128,7 @@ export async function runS2Invites(opts: {
     }
     if (!checkPayloadHash(existing, payloadHash).ok) return;
     await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'invite', status: 'attempting', payloadHash, firstAttemptAt: existing?.firstAttemptAt ?? now } });
+    if (!recheckState(opts.dataDir, opts.creatorAppId, opts.initId).ok) return;
     if (!members.includes(peer.appId)) {
       try {
         await opts.deps.addBotToChat(opts.creatorAppId, opts.chatId, peer.appId);
@@ -133,7 +149,14 @@ export async function runS2Invites(opts: {
 }
 
 /** S3 grants：逐 peer 落 operation + IPC 触发；每个 await 后重读 state。 */
-export async function runS3Grants(opts: {
+export function runS3Grants(opts: {
+  dataDir: string; creatorAppId: string; chatId: string; initId: string;
+  peers: Array<{ appId: string }>; deps: S2S5Deps;
+}): Promise<Array<{ appId: string; ready: boolean; message?: string }>> {
+  return withCollabInitIdMutex(opts.initId, () => runS3GrantsCritical(opts));
+}
+
+async function runS3GrantsCritical(opts: {
   dataDir: string; creatorAppId: string; chatId: string; initId: string;
   peers: Array<{ appId: string }>; deps: S2S5Deps;
 }): Promise<Array<{ appId: string; ready: boolean; message?: string }>> {
@@ -156,6 +179,11 @@ export async function runS3Grants(opts: {
     }
     if (!checkPayloadHash(existing, payloadHash).ok) { results.push({ appId: peer.appId, ready: false, message: 'payloadHash conflict' }); continue; }
     await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'grant', status: 'attempting', payloadHash, firstAttemptAt: existing?.firstAttemptAt ?? now } });
+    const rcBeforeGrant = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
+    if (!rcBeforeGrant.ok) {
+      results.push({ appId: peer.appId, ready: false, message: rcBeforeGrant.reason });
+      continue;
+    }
     const g = await opts.deps.triggerGrant(peer.appId);
     // R1：await 之后重读 state。
     const rc = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
@@ -176,7 +204,14 @@ export async function runS3Grants(opts: {
 }
 
 /** S4 roles：逐 peer 角色校验（done 只短路重复代写不短路回读），全绿 markGateRoleReady。 */
-export async function runS4Roles(opts: {
+export function runS4Roles(opts: {
+  dataDir: string; creatorAppId: string; chatId: string; initId: string; configVersion: string;
+  config: SessionGroupCollaborationConfig; peers: Array<{ appId: string }>; deps: S2S5Deps;
+}): Promise<{ allReady: boolean; conflict?: string }> {
+  return withCollabInitIdMutex(opts.initId, () => runS4RolesCritical(opts));
+}
+
+async function runS4RolesCritical(opts: {
   dataDir: string; creatorAppId: string; chatId: string; initId: string; configVersion: string;
   config: SessionGroupCollaborationConfig; peers: Array<{ appId: string }>; deps: S2S5Deps;
 }): Promise<{ allReady: boolean; conflict?: string }> {
@@ -185,10 +220,12 @@ export async function runS4Roles(opts: {
   const guard = guardActiveState(entry);
   if (!guard.ok) return { allReady: false, conflict: guard.reason };
   for (const peer of opts.peers) {
+    const rcLoop = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
+    if (!rcLoop.ok) return { allReady: false, conflict: rcLoop.reason };
     const opKey = `role:${peer.appId}`;
     const payloadHash = collabPayloadHash({ appId: peer.appId, configVersion: opts.configVersion });
-    // F2：done 只短路重复代写，不短路当前回读。
-    const role = runCollabRoleVerification(peer.appId, opts.chatId, opts.config, opts.deps.roleVerify);
+    // F2：done 只短路重复代写，不短路当前回读；expected 内容只来自 S0 冻结快照。
+    const role = runCollabRoleVerification(peer.appId, opts.chatId, opts.config, opts.deps.roleVerify, frozenRoleSnapshot(rcLoop.entry));
     if (!role.ready) {
       await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'ROLE_CONFLICT', since: now, detail: role.conflict }; e.updatedAt = now; return true; } });
       return { allReady: false, conflict: role.conflict ?? 'role_not_ready' };
@@ -197,24 +234,26 @@ export async function runS4Roles(opts: {
     const existing = cur.operations[opKey];
     if (!checkPayloadHash(existing, payloadHash).ok) return { allReady: false, conflict: 'payloadHash conflict' };
     await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'role', status: 'done', payloadHash, receipt: { verified: true } } });
+    const rcBeforeGate = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
+    if (!rcBeforeGate.ok) return { allReady: false, conflict: rcBeforeGate.reason };
     markGateRoleReady(opts.dataDir, opts.chatId, peer.appId);
   }
   return { allReady: true };
 }
 
-/** 真 DAG 拓扑序：immediate 或前驱已 started 才就绪。 */
+/** 真 DAG 拓扑序：这里只计算依赖顺序，不把“已入列”误当成“已启动”。 */
 function topologicalOrder(config: SessionGroupCollaborationConfig): string[] {
   const kickoff = config.kickoff;
-  const started = new Set<string>();
+  const ordered = new Set<string>();
   const out: string[] = [];
   let progressed = true;
   while (out.length < kickoff.length && progressed) {
     progressed = false;
     for (const k of kickoff) {
       if (out.includes(k.appId)) continue;
-      if (k.trigger === 'immediate') { out.push(k.appId); started.add(k.appId); progressed = true; continue; }
+      if (k.trigger === 'immediate') { out.push(k.appId); ordered.add(k.appId); progressed = true; continue; }
       const dep = k.afterAppId!;
-      if (started.has(dep)) { out.push(k.appId); started.add(k.appId); progressed = true; }
+      if (ordered.has(dep)) { out.push(k.appId); ordered.add(k.appId); progressed = true; }
     }
   }
   return out;
@@ -241,6 +280,8 @@ async function runS5Critical(opts: {
   if (!guard.ok) return { done: false, awaitingInput: guard.reason };
 
   const order = topologicalOrder(opts.config);
+  let sawPending = false;
+  let pendingReason: string | undefined;
 
   for (const appId of order) {
     // 循环开头重读 state + 角色/config。
@@ -273,6 +314,18 @@ async function runS5Critical(opts: {
     }
     if (!checkPayloadHash(curOp, payloadHash).ok) return { done: false, awaitingInput: `kickoff payloadHash conflict: ${appId}` };
 
+    // 拓扑入列不等于上游已启动。上游尚无 durable done 时只跳过本分支，
+    // 其它 immediate / 已满足依赖的独立分支仍须继续调度。
+    if (k.trigger === 'afterAgentTurn') {
+      const upstream = readCollabInitEntry(opts.dataDir, opts.creatorAppId, opts.initId)!
+        .operations[`kickoff:${k.afterAppId!}`];
+      if (upstream?.status !== 'done') {
+        sawPending = true;
+        pendingReason = `dependency not started: ${k.afterAppId}`;
+        continue;
+      }
+    }
+
     // afterAgentTurn：等依赖满足（R2：绑定上游完整证明）。
     let satisfiedBy: CollabArtifactSatisfiedBy | undefined;
     if (k.trigger === 'afterAgentTurn') {
@@ -281,9 +334,24 @@ async function runS5Critical(opts: {
       // R1：await 之后重读 state。
       const rc = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
       if (!rc.ok) return { done: false, awaitingInput: rc.reason };
-      // N2：先统一建立持久 since（pending），再用当前时钟检查超窗。
+      // N2：每个等待目标独立持久 since，避免一个分支成功/等待重置另一分支的超窗。
       const curEntry = readCollabInitEntry(opts.dataDir, opts.creatorAppId, opts.initId)!;
-      const since = curEntry.awaiting?.since ?? now;
+      const recordedSince = curEntry.kickoffPending?.[appId]?.since
+        ?? (curEntry.awaiting?.reason === 'KICKOFF_PENDING' ? curEntry.awaiting.since : undefined);
+      const since = recordedSince ?? now;
+      if (recordedSince === undefined) {
+        await patchCollabInitEntry({
+          dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId,
+          mutate: (e) => {
+            const previous = e.kickoffPending?.[appId];
+            e.kickoffPending = { ...(e.kickoffPending ?? {}), [appId]: { ...previous, appId, since } };
+            e.updatedAt = opts.deps.now();
+            return true;
+          },
+        });
+        const rcPending = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
+        if (!rcPending.ok) return { done: false, awaitingInput: rcPending.reason };
+      }
       if (kickoffTimedOut(since, opts.deps.now(), KICKOFF_TIMEOUT_MS)) {
         await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: 'KICKOFF_TIMEOUT', since }; e.updatedAt = opts.deps.now(); return true; } });
         return { done: false, awaitingInput: 'KICKOFF_TIMEOUT' };
@@ -294,11 +362,10 @@ async function runS5Critical(opts: {
         return { done: false, awaitingInput: `artifact not ready: ${facts.terminalStatus}` };
       }
       if (facts.terminalStatus !== 'succeeded') {
-        // waiting_input/blocked/reconciling：pending 保持，不启动。
-        if (!curEntry.awaiting) {
-          await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.awaiting = { reason: 'KICKOFF_PENDING', since }; e.updatedAt = opts.deps.now(); return true; } });
-        }
-        return { done: false, awaitingInput: `artifact not ready: ${facts.terminalStatus}` };
+        // waiting_input/blocked/reconciling：只保留本分支 pending，不饿死独立分支。
+        sawPending = true;
+        pendingReason = `artifact not ready: ${facts.terminalStatus}`;
+        continue;
       }
       // R2：完整证明才启动——缺三元组/hash → awaiting-input（N2）。
       if (!facts.sessionId || !facts.turnId || !facts.messageId || !facts.contentHash) {
@@ -324,15 +391,16 @@ async function runS5Critical(opts: {
           await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.state = 'awaiting-input'; e.awaiting = { reason: `ARTIFACT_${evalResult.reason}`, since }; e.updatedAt = opts.deps.now(); return true; } });
           return { done: false, awaitingInput: `artifact not ready: ${evalResult.reason}` };
         }
-        if (!curEntry.awaiting) {
-          await patchCollabInitEntry({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, mutate: (e) => { e.awaiting = { reason: 'KICKOFF_PENDING', since }; e.updatedAt = opts.deps.now(); return true; } });
-        }
-        return { done: false, awaitingInput: `artifact not ready: ${evalResult.reason}` };
+        sawPending = true;
+        pendingReason = `artifact not ready: ${evalResult.reason}`;
+        continue;
       }
       satisfiedBy = evalResult.satisfiedBy;
     }
 
     await writeCollabOperation({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, opKey, now, op: { kind: 'kickoff', status: 'attempting', uuid: kickoffId, payloadHash, firstAttemptAt: curOp?.firstAttemptAt ?? now } });
+    const rcBeforePrepare = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
+    if (!rcBeforePrepare.ok) return { done: false, awaitingInput: rcBeforePrepare.reason };
     const prep = await opts.deps.kickoffPrepare(appId, k.prompt ?? '');
     // R1：await 之后重读 state。
     const rcPrep = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
@@ -359,13 +427,16 @@ async function runS5Critical(opts: {
       mutate: (e) => {
         e.operations[opKey] = { kind: 'kickoff', status: 'done', uuid: kickoffId, firstAttemptAt: curOp?.firstAttemptAt ?? now, payloadHash, receipt: { sessionId: started.sessionId, turnId: started.turnId, acceptedAt: started.acceptedAt, ...(satisfiedBy ? { satisfiedBy } : {}) } };
         e.kickoffPending = { ...(e.kickoffPending ?? {}), [appId]: { appId, ...(satisfiedBy ? { satisfiedBy } : {}) } };
-        delete e.awaiting; // 清理旧 pending 计时，避免下一跳被错误超窗
+        if (e.awaiting?.reason === 'KICKOFF_PENDING') delete e.awaiting; // 兼容旧共享 pending 投影
         e.updatedAt = now;
         return true;
       },
     });
   }
 
+  if (sawPending) return { done: false, awaitingInput: pendingReason ?? 'dependency pending' };
+  const finalState = recheckState(opts.dataDir, opts.creatorAppId, opts.initId);
+  if (!finalState.ok) return { done: false, awaitingInput: finalState.reason };
   await advanceCollabStep({ dataDir: opts.dataDir, creatorAppId: opts.creatorAppId, initId: opts.initId, step: 'kickoff', status: 'done', now });
   return { done: true };
 }

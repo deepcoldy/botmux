@@ -94,6 +94,21 @@ describe('requestCollabKickoff fail-closed', () => {
     if (!r.ok) expect(r.errorCode).toBe('PEER_OFFLINE');
   });
 
+  it('响应头已到但 body 永不结束 → deadline 覆盖 body read', async () => {
+    const fakeFetch = (async (_url: string, init: RequestInit) => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        init.signal?.addEventListener('abort', () => controller.error(init.signal?.reason), { once: true });
+      },
+    }), { status: 200 })) as typeof fetch;
+    const r = await requestCollabKickoff(
+      { larkAppId: 'cli_peer', ipcPort: 1, bootInstanceId: 'x'.repeat(43), dispatchLaunchIpcProtocol: 'v1' } as any,
+      'i'.repeat(64), 'k'.repeat(64), 'prepare', validPrepare(),
+      { secret: 's'.repeat(32), fetchImpl: fakeFetch, timeoutMs: 5 },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errorCode).toBe('PEER_TIMEOUT');
+  });
+
   it('F3：签名有效的 started 但 sessionId 空 → BAD_RESPONSE', async () => {
     const secret = 's'.repeat(32);
     const initId = 'i'.repeat(64);

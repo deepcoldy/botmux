@@ -2,15 +2,15 @@
  * collab per-chat gate 准入（PR-3b-1 §8.1/§8.3）：checkCollabGateAdmission + 命令豁免白名单。
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { checkCollabGateAdmission, collabCommandExempt, collabGateAdmissionDecision } from '../src/core/collab-gate-admission.js';
 import { classifySlash } from '../src/core/command-router.js';
 import { buildInitialCollabGate, writeCollabGate, patchCollabGate } from '../src/services/collab-gate-store.js';
-import { readCollabChatQueue } from '../src/services/collab-chat-queue-store.js';
+import { readCollabChatQueue, enqueueCollabChatItem, collabChatQueuePath } from '../src/services/collab-chat-queue-store.js';
 import { placeCollabGroupInit, __testOnly_resetCollabInitMutexes } from '../src/services/collab-init-store.js';
-import { collabInitId, collabSourceKey, collabCreatorAdmissionOperationId, type SessionGroupCollaborationConfig } from '../src/services/collab-group-config.js';
+import { collabInitId, collabSourceKey, collabCreatorAdmissionOperationId, collabGateFilePath, type SessionGroupCollaborationConfig } from '../src/services/collab-group-config.js';
 import type { CollabGateFile } from '../src/services/collab-group-config.js';
 import type { TalkEvaluation } from '../src/im/lark/event-dispatcher.js';
 import type { SlashRouteDecision } from '../src/core/command-router.js';
@@ -300,5 +300,31 @@ describe('R1/R2：真实 store 持久化契约', () => {
     checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: 'cli_a', talk: allowedTalk, gate: g, sourceMessageId: 'om_1', routingEvent: { text: 'a' } });
     expect(readCollabChatQueue(dataDir, CHAT, 'cli_a').items).toHaveLength(1);
     expect(readCollabChatQueue(dataDir, CHAT, 'cli_b').items).toHaveLength(1);
+  });
+
+  it('真实 gate 文件损坏 → reject(gate_corrupted)，不降级 not-collab、不覆盖', () => {
+    writeCollabGate(dataDir, gate());
+    const fp = collabGateFilePath(dataDir, CHAT);
+    writeFileSync(fp, '{broken', { mode: 0o600 });
+    const before = readFileSync(fp, 'utf-8');
+    const r = checkCollabGateAdmission({ dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk });
+    expect(r).toEqual({ kind: 'reject', reason: 'gate_corrupted' });
+    expect(readFileSync(fp, 'utf-8')).toBe(before);
+  });
+
+  it('真实队列文件损坏 → reject(gate_queue_corrupted)，pending 原字节保留', () => {
+    enqueueCollabChatItem(dataDir, CHAT, {
+      sourceMessageId: 'om_pending', targetAppId: APP,
+      routingEvent: { content: 'keep me' }, deliveryStatus: 'pending', enqueuedAt: 1,
+    });
+    const fp = collabChatQueuePath(dataDir, CHAT, APP);
+    writeFileSync(fp, '{broken', { mode: 0o600 });
+    const before = readFileSync(fp, 'utf-8');
+    const r = checkCollabGateAdmission({
+      dataDir, chatId: CHAT, botAppId: APP, talk: allowedTalk, gate: gate(),
+      sourceMessageId: 'om_new', routingEvent: { content: 'new' },
+    });
+    expect(r).toEqual({ kind: 'reject', reason: 'gate_queue_corrupted' });
+    expect(readFileSync(fp, 'utf-8')).toBe(before);
   });
 });

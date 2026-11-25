@@ -15,6 +15,7 @@ import {
 } from '../src/services/collab-init-store.js';
 import {
   collabCreateUuid,
+  collabForwardUuid,
   collabCreatorAdmissionOperationId,
   collabInitId,
   collabPayloadHash,
@@ -244,6 +245,46 @@ describe('S1 create 编排', () => {
     expect(entry.operations[collabCreateUuid(initId, 0)].status).toBe('unknown');
     expect(registeredGroups).toHaveLength(0);
     expect(readCollabGate(tempDir, 'oc_created')).toBeUndefined();
+  });
+
+  it('forward unknown 59min 内用同 uuid 重试并落 done', async () => {
+    const { initId } = await seedEntry();
+    let calls = 0;
+    const d = deps({
+      forward: async (appId, messageId, chatId, uuid) => {
+        calls++;
+        forwarded.push({ appId, messageId, chatId, uuid });
+        if (calls === 1) throw new Error('timeout');
+        return 'om_forwarded_retry';
+      },
+    });
+    await runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), d);
+    clock = 59 * 60 * 1000;
+    await runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), d);
+    expect(calls).toBe(2);
+    expect(forwarded[0].uuid).toBe(forwarded[1].uuid);
+    const entry = readCollabInitEntry(tempDir, APP, initId)!;
+    expect(entry.operations[collabForwardUuid(initId)].status).toBe('done');
+    expect(entry.state).toBe('running');
+  });
+
+  it('forward unknown 61min → MESSAGE_UNKNOWN_EXPIRED，不自动再转发', async () => {
+    const { initId } = await seedEntry();
+    let calls = 0;
+    const d = deps({
+      forward: async () => { calls++; throw new Error('timeout'); },
+    });
+    await runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), d);
+    expect(readCollabInitEntry(tempDir, APP, initId)!.chatId).toBe('oc_created');
+    clock = 61 * 60 * 1000;
+    const resumed = await runCollabGroupBirthS1(data(SRC), ctx(SRC), initId, receipt(), d);
+    expect(calls).toBe(1);
+    expect(resumed.kind).toBe('collab-handled');
+    if (resumed.kind === 'collab-handled') expect(resumed.status).toBe('awaiting_input');
+    const entry = readCollabInitEntry(tempDir, APP, initId)!;
+    expect(entry.state).toBe('awaiting-input');
+    expect(entry.awaiting?.reason).toBe('MESSAGE_UNKNOWN_EXPIRED');
+    expect(entry.operations[collabForwardUuid(initId)].status).toBe('unknown');
   });
 
   it('creatorAdmissionReceipt 持久化后崩溃重投不二次扣费（persist→已存在短路）', async () => {

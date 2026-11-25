@@ -21,6 +21,7 @@ import {
   collabForwardUuid,
   collabPayloadHash,
   COLLAB_CREATE_UUID_WINDOW_MS,
+  COLLAB_MESSAGE_UUID_WINDOW_MS,
   type CreatorAdmissionReceipt,
 } from '../services/collab-group-config.js';
 import {
@@ -331,9 +332,24 @@ async function runS1Critical(
       await failInit(deps, creatorAppId, initId, entry.dmChatId, 'forward operation payloadHash conflict', now);
       return { kind: 'collab-handled', initId, status: 'failed' };
     }
+    const firstAttemptAt = existingForward?.firstAttemptAt ?? now;
+    if ((existingForward?.status === 'unknown' || existingForward?.status === 'attempting')
+      && now - firstAttemptAt > COLLAB_MESSAGE_UUID_WINDOW_MS) {
+      // 飞书消息 uuid 只去重 1h；超窗后外部结果仍需人工核对，绝不自动再转一次。
+      await patchCollabInitEntry({
+        dataDir: deps.dataDir, creatorAppId, initId,
+        mutate: (e) => {
+          e.state = 'awaiting-input';
+          e.awaiting = { reason: 'MESSAGE_UNKNOWN_EXPIRED', operationId: forwardUuid, since: now };
+          e.updatedAt = now;
+          return true;
+        },
+      });
+      return { kind: 'collab-handled', initId, chatId, status: 'awaiting_input' };
+    }
     await writeCollabOperation({
       dataDir: deps.dataDir, creatorAppId, initId, opKey: forwardUuid, now,
-      op: { kind: 'forward', status: 'attempting', uuid: forwardUuid, firstAttemptAt: existingForward?.firstAttemptAt ?? now, payloadHash: forwardPayloadHash },
+      op: { kind: 'forward', status: 'attempting', uuid: forwardUuid, firstAttemptAt, payloadHash: forwardPayloadHash },
     });
     try {
       const forwardedId = await deps.forward(creatorAppId, messageId, chatId, forwardUuid);
