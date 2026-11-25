@@ -521,6 +521,17 @@ describe('Botmux custom Oncall form', () => {
     await handleOncallFormAction(submit, 'app');
     expect(creates()).toHaveLength(0);
   });
+  it.each(['😀', '𠀀'])('counts Unicode characters in Botmux form fields (%s)', async char => {
+    const shown = await showFields(await open());
+    const submit = event('oncall_group_form_botmux_submit', shown.draft);
+    submit.action.form_value = { oncall_field_0: char.repeat(1001) };
+    expect((await handleOncallFormAction(submit, 'app')).toast.type).toBe('error');
+    expect(creates()).toHaveLength(0);
+    submit.action.form_value.oncall_field_0 = char.repeat(1000);
+    expect((await handleOncallFormAction(submit, 'app')).toast.type).toBe('success');
+    const body = JSON.parse(creates()[0][1].body);
+    expect(JSON.parse(body.workflow_config).biz_id1.value).toBe(submit.action.form_value.oncall_field_0);
+  });
   it('does not accept a rendered Botmux form after switching to native', async () => {
     const shown = await showFields(await open());
     mocks.bot.config.oncallGroup.customFormMode = 'native';

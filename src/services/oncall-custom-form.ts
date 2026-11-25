@@ -55,7 +55,7 @@ export function serializeBotmuxOncallForm(fields: OncallTextField[], values: Rec
   return JSON.stringify(Object.fromEntries(fields.map((field, index) => {
     const name = oncallFieldName(index);
     const value = Object.hasOwn(values, name) ? values[name] : '';
-    if (typeof value !== 'string' || value.length > ONCALL_FIELD_LIMIT) throw new Error(`请检查「${field.label}」的内容长度`);
+    if (typeof value !== 'string' || [...value].length > ONCALL_FIELD_LIMIT) throw new Error(`请检查「${field.label}」的内容长度`);
     if (field.required && !value.trim()) throw new Error(`请填写「${field.label}」`);
     return [field.key, { value, name: field.key, type: 'input' }];
   })));

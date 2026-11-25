@@ -176,8 +176,9 @@ describe('native normalized source matching review', () => {
   it('stops after the bounded page window and refuses to infer absence from an incomplete scan', async () => {
     const other = { ...rows[0], source_location: 'https://oncall.example.test/chat?bm_form=other' };
     fetcher.mockImplementation(async (_url: string, options: any) => {
-      const page = JSON.parse(options.body).current_page;
-      return json(page > 10 ? [] : Array.from({ length: 100 }, (_, i) => ({ ...other, id: page * 1000 + i })));
+      const cursor = JSON.parse(options.body).filter_fields.find((filter: any) => filter.field === 'id');
+      const first = cursor ? Number(cursor.value) : 1;
+      return json(Array.from({ length: 100 }, (_, i) => ({ ...other, id: first + i })));
     });
     await expect(readNativeOncallResult(target, 'secret', expected, fetcher)).rejects.toThrow();
     expect(fetcher).toHaveBeenCalledTimes(10);
@@ -186,8 +187,8 @@ describe('native normalized source matching review', () => {
     const wanted = { ...rows[0], source_location: 'https://oncall.example.test/chat?bm_form=wanted&bizFrom=lark' };
     const other = { ...wanted, source_location: 'https://oncall.example.test/chat?bm_form=other' };
     fetcher.mockImplementation(async (_url: string, options: any) => {
-      const page = JSON.parse(options.body).current_page;
-      return json(page === 1 ? [wanted, ...Array.from({ length: 99 }, (_, i) => ({ ...other, id: 10000 + i }))] : [{ ...wanted, id: 9876 }]);
+      const cursor = JSON.parse(options.body).filter_fields.find((filter: any) => filter.field === 'id');
+      return json(!cursor ? [wanted, ...Array.from({ length: 99 }, (_, i) => ({ ...other, id: 10000 + i }))] : [{ ...wanted, id: 11000 }]);
     });
     await expect(readNativeOncallResult(target, 'secret', expected, fetcher)).rejects.toThrow();
     expect(fetcher).toHaveBeenCalledTimes(2);

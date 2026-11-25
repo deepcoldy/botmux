@@ -1,15 +1,10 @@
 import type { OncallFormDraft } from '../../services/oncall-form-store.js';
-import { hostOncallSidebar } from '../../services/oncall-sidebar-link.js';
 import { ONCALL_FIELD_LIMIT, oncallFieldName } from '../../services/oncall-custom-form.js';
 import { buildOncallGroupColumn } from './oncall-card-actions.js';
 
-export function buildOncallFormCard(draft: OncallFormDraft, dashboardUrl?: string): string {
+export function buildOncallFormCard(draft: OncallFormDraft): string {
   const value = (action: string) => ({ action, draftId: draft.id, version: draft.version });
-  const sidebar = (link: string) => {
-    if (!dashboardUrl) return link;
-    const issued = draft.nativeSubmission?.attempts.find(item => item.sidebarLink?.href === link)?.sidebarLink;
-    return issued ? hostOncallSidebar(link, dashboardUrl, draft, issued.token) : link;
-  };
+  const sidebar = (link: string) => draft.nativeSubmission?.attempts.find(item => item.sidebarLink?.href === link)?.sidebarLink?.hostedHref ?? link;
   if (draft.botmuxFields?.length) {
     const category = draft.choices.regions[draft.region]?.find(item => item.id === draft.typeId);
     const plainText = (content: string) => ({ tag: 'plain_text', content });

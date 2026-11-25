@@ -5,6 +5,7 @@ import { runInNewContext } from 'node:vm';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { isHostCapabilityLink } from '../src/core/host-capability-link.js';
+import { hostOncallSidebar } from '../src/services/oncall-sidebar-link.js';
 import { handleOncallSidebar } from '../src/dashboard/oncall-sidebar.js';
 import { buildOncallFormCard } from '../src/im/lark/oncall-form-card.js';
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
@@ -41,10 +42,10 @@ async function fixture(oldMarker = false) {
     draft.nativeFormLink = appLink.href;
     draft.nativeSubmission = { attempts: [{ sourceLocation: nativePage.href, username: 'actor', typeId: 2, region: 'cn',
       policyFingerprint: JSON.stringify(policy), preparedAtMs: Date.now(), forwardMode: 'merge',
-      sidebarLink: { href: appLink.href, token } }] };
+      sidebarLink: { href: appLink.href, token, hostedHref: hostOncallSidebar(appLink.href, host, draft, token) } }] };
   });
   const read = await forms.use(appId, draft.id, owner, async draft => ({ ...draft }));
-  const button = JSON.parse(buildOncallFormCard(read, host)).elements.at(-1).actions[0];
+  const button = JSON.parse(buildOncallFormCard(read)).elements.at(-1).actions[0];
   return { forms, draft: read, nativePage, button, page: new URL(new URL(button.url).searchParams.get('url')!) };
 }
 
@@ -59,8 +60,8 @@ it('opens the native form in place and answers only its origin and frame with a 
   expect(new URL(button.url).searchParams.get('mode')).toBe('sidebar-semi');
   expect(page.origin).toBe(host);
   expect(page.href).not.toContain('private');
-  const behindProxy = JSON.parse(buildOncallFormCard(draft, 'https://dashboard.example.test/botmux')).elements.at(-1).actions[0];
-  expect(new URL(new URL(behindProxy.url).searchParams.get('url')!).pathname).toBe(`/botmux${page.pathname}`);
+  const behindProxy = hostOncallSidebar(draft.nativeFormLink!, 'https://dashboard.example.test/botmux', draft, token);
+  expect(new URL(new URL(behindProxy).searchParams.get('url')!).pathname).toBe(`/botmux${page.pathname}`);
   expect(isHostCapabilityLink(page.href, { hosts: [page.hostname], dashboardPorts: [page.port] })).toBe(true);
   const { status, res, body } = visit(page);
   expect(status).toBe(200);

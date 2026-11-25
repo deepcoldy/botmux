@@ -5,7 +5,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
 import { OncallGroupStore, type OncallGroupSource } from './oncall-group-store.js';
 import { loadOncallGroupTarget } from './oncall-group-client.js';
-import type { NativeOncallResultQuery, OncallChoices } from './oncall-platform.js';
+import type { NativeOncallResultQuery, NativeOncallScan, OncallChoices } from './oncall-platform.js';
 import { nativeFormPolicyFingerprint, oncallGroupEnabled, type OncallForwardMode, type OncallGroupPolicy } from './oncall-group-policy.js';
 import type { OncallTextField } from './oncall-custom-form.js';
 
@@ -15,11 +15,12 @@ export interface OncallNativeSubmissionAttempt extends NativeOncallResultQuery {
   preparedAtMs: number;
   policyFingerprint: string;
   forwardMode: OncallForwardMode;
-  sidebarLink?: { token: string; href: string };
+  sidebarLink?: { token: string; href: string; hostedHref?: string };
 }
 export interface OncallNativeSubmission {
   attempts: OncallNativeSubmissionAttempt[];
   completed?: boolean;
+  scan?: NativeOncallScan;
 }
 
 function normalizeNativeSubmission(draft: any): void {

@@ -6,6 +6,13 @@ export function isNativeOncallSelectionMarker(marker: string | null): boolean {
   return marker !== null && SELECTION_MARKER.test(marker);
 }
 
+/** Match what the hosted page supplies to Oncall, without the question data. */
+export function oncallSidebarSource(page: URL): string {
+  const source = new URL(page.origin + page.pathname);
+  source.searchParams.set('bm_form', page.searchParams.get('bm_form')!);
+  return source.href;
+}
+
 /** The embedded page must be the same trusted, marked URL used for result lookup. */
 export function oncallSidebarPage(link: string, draftId: string): URL | undefined {
   try {

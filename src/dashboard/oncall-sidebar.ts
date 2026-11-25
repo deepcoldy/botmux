@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { ONCALL_SIDEBAR_PATH_PREFIX, parseOncallSidebarPath } from '../core/host-capability-link.js';
 import { OncallFormStore } from '../services/oncall-form-store.js';
 import type { OncallGroupPolicy } from '../services/oncall-group-policy.js';
-import { oncallSidebarPage } from '../services/oncall-sidebar-link.js';
+import { oncallSidebarPage, oncallSidebarSource } from '../services/oncall-sidebar-link.js';
 
 export function handleOncallSidebar(req: IncomingMessage, res: ServerResponse, url: URL, dataDir: string,
   readPolicy: (appId: string) => OncallGroupPolicy | undefined): boolean {
@@ -25,12 +25,8 @@ export function handleOncallSidebar(req: IncomingMessage, res: ServerResponse, u
 
   // Oncall prefers the parent's reply and truncates the source address. Send
   // only the URL components used by reconciliation, without the question text.
-  const source = new URL(page);
-  source.hash = '';
-  source.search = '';
-  source.searchParams.set('bm_form', page.searchParams.get('bm_form')!);
   const nonce = randomBytes(16).toString('base64');
-  const payload = JSON.stringify({ frameUrl: page.href, origin: page.origin, source: source.href }).replaceAll('<', '\\u003c');
+  const payload = JSON.stringify({ frameUrl: page.href, origin: page.origin, source: oncallSidebarSource(page) }).replaceAll('<', '\\u003c');
   res.writeHead(200, {
     'Content-Type': 'text/html; charset=utf-8',
     'Content-Security-Policy': `default-src 'none'; base-uri 'none'; frame-src ${page.origin}; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'`,
