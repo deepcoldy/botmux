@@ -127,11 +127,19 @@ import type { DaemonSession } from '../../core/types.js';
 import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
 import { buildTerminalUrl, platformTerminalReadEntryActive } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch, worktreeTargetPath } from '../../services/git-worktree.js';
+import { createRepoWorktree, isValidBranchName, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch, worktreeTargetPath } from '../../services/git-worktree.js';
 import { repinSessionWorkingDir } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
-import { configWriteFailureText, handleCommand } from '../../core/command-handler.js';
+import { configWriteFailureText, createSlashGroup, handleCommand, slashGroupReceiptText } from '../../core/command-handler.js';
+import {
+  GROUP_CREATE_DIR_ACTION,
+  GROUP_CREATE_SUBMIT_ACTION,
+  buildGroupCreatedCard,
+  consumeGroupCreateForm,
+  getGroupCreateForm,
+  selectGroupCreateDir,
+} from '../../core/group-create-card.js';
 import {
   DISMISS_CLEANUP_WT_ACTION,
   DISMISS_CONFIRM_ACTION,
@@ -2639,6 +2647,74 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     );
     if (cardMessageId) deleteMessage(larkAppId, cardMessageId);
     return;
+  }
+
+  // ─── /g 建群卡片：下拉选目录（记录在表单内存态） / 提交建群 ──────────────
+  if (larkAppId && (value?.action === GROUP_CREATE_DIR_ACTION || value?.action === GROUP_CREATE_SUBMIT_ACTION)) {
+    const loc = localeForBot(larkAppId);
+    const opened = getGroupCreateForm(value.form, operatorOpenId);
+    if (!opened.ok) {
+      return { toast: { type: 'error', content: t(`card.group_create.${opened.reason}`, undefined, loc) } };
+    }
+    const { form } = opened;
+    if (value.action === GROUP_CREATE_DIR_ACTION) {
+      const raw = typeof action?.option === 'string' ? action.option.trim() : '';
+      const dir = validateWorkingDir(raw, loc);
+      if (!dir.ok) return { toast: { type: 'error', content: dir.error } };
+      selectGroupCreateDir(form, dir.resolvedPath);
+      return { toast: { type: 'success', content: t('card.group_create.dir_selected', { dir: dir.resolvedPath }, loc) } };
+    }
+    const fv: Record<string, unknown> = (action as any)?.form_value ?? {};
+    const name = String(fv.group_name ?? '').trim();
+    const typedDir = String(fv.group_dir ?? '').trim();
+    let workingDir = form.selectedDir;
+    if (typedDir) {
+      const dir = validateWorkingDir(typedDir, loc);
+      if (!dir.ok) return { toast: { type: 'error', content: dir.error } };
+      workingDir = dir.resolvedPath;
+    }
+    const branch = String(fv.group_branch ?? '').trim();
+    if (branch && !workingDir) {
+      return { toast: { type: 'error', content: t('card.group_create.repo_required', undefined, loc) } };
+    }
+    if (branch && !(await isValidBranchName(branch))) {
+      return { toast: { type: 'error', content: t('daemon.topic_header_branch_invalid', { arg: branch }, loc) } };
+    }
+    consumeGroupCreateForm(form);
+    return {
+      toast: { type: 'info', content: t('card.group_create.creating', undefined, loc) },
+      afterAck: async () => {
+        const created = await createSlashGroup({
+          creatorAppId: form.creatorAppId,
+          senderOpenId: form.senderOpenId,
+          groupArgs: {
+            ...form.groupArgs,
+            name,
+            body: name,
+            workingDir,
+            branch: branch || undefined,
+          },
+          larkAppIdsForGroup: form.larkAppIdsForGroup,
+          appIdToName: new Map(Object.entries(form.appIdToName)),
+          loc,
+          logTag: 'group-create-card',
+        });
+        // A v1 form card cannot be patched into another card, so the result goes
+        // out as a new card where `/g` was sent and the used form is withdrawn
+        // after the callback ACK. If the card cannot be sent, keep the form and
+        // fall back to the text receipt under it.
+        try {
+          await sessionReply(form.rootId, buildGroupCreatedCard(created, loc), 'interactive');
+          deferRepoCardWithdraw(larkAppId, cardMessageId);
+        } catch (err) {
+          logger.warn(`[group-create-card] result card failed: ${err instanceof Error ? err.message : String(err)}`);
+          if (cardMessageId) {
+            try { await replyMessage(larkAppId, cardMessageId, slashGroupReceiptText(created, loc), 'text', false); }
+            catch (replyErr) { logger.warn(`[group-create-card] receipt reply failed: ${replyErr instanceof Error ? replyErr.message : String(replyErr)}`); }
+          }
+        }
+      },
+    };
   }
 
   // ─── /botconfig 交互卡片：切换布尔开关 / 选择 cli·model·lang / 编辑自由输入项 ──

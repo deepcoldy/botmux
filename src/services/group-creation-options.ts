@@ -13,6 +13,11 @@ export interface GroupCreationDefaults {
    *  released behavior — `/g <text>` only names a plain group. `--start` /
    *  `--no-start` override it for one command. */
   autoStart?: boolean;
+  /** Opt-in form card mode: when `true`, a bare `/g` (no name, dir, branch, or
+   *  task) opens an interactive form card to pick a directory, branch and
+   *  optional group name. Absent / `false` keeps the released bare `/g`
+   *  immediate-creation behavior. `--card` / `--no-card` override it per call. */
+  card?: boolean;
 }
 
 const AVATAR_MODES: readonly GroupAvatarMode[] = ['name', 'logo', 'off'];
@@ -21,7 +26,7 @@ export function parseGroupCreationDefaults(value: unknown): GroupCreationDefault
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('groupCreation must be an object');
   const v = value as Record<string, unknown>;
   for (const key of Object.keys(v)) {
-    if (!['agents', 'tag', 'avatar', 'autoStart'].includes(key)) throw new Error(`Unknown groupCreation option: ${key}`);
+    if (!['agents', 'tag', 'avatar', 'autoStart', 'card'].includes(key)) throw new Error(`Unknown groupCreation option: ${key}`);
   }
   const out: GroupCreationDefaults = {};
   if (v.agents !== undefined) {
@@ -43,6 +48,10 @@ export function parseGroupCreationDefaults(value: unknown): GroupCreationDefault
     if (typeof v.autoStart !== 'boolean') throw new Error('autoStart must be true or false');
     out.autoStart = v.autoStart;
   }
+  if (v.card !== undefined) {
+    if (typeof v.card !== 'boolean') throw new Error('card must be true or false');
+    out.card = v.card;
+  }
   return out;
 }
 
@@ -51,9 +60,13 @@ export interface GroupCreationArgs extends GroupCreationDefaults {
   /** Every line left after removing the options: the task when `autoStart` is true. */
   body: string;
   roleProfileId?: string;
+  workingDir?: string;
+  branch?: string;
+  /** True only when `--card` was explicitly passed on this command. */
+  cardExplicit?: boolean;
 }
 
-type OutputKey = 'agents' | 'tag' | 'avatar' | 'role-profile' | 'start';
+type OutputKey = 'agents' | 'tag' | 'avatar' | 'role-profile' | 'start' | 'dir' | 'branch' | 'card';
 
 /** Discriminated union — value flags only declare `apply`, opt-out flags only
  *  declare `clear`, opt-in switches only declare `set`. Keeps every spec
@@ -64,6 +77,8 @@ type FlagSpec =
   | { kind: 'optIn'; key: OutputKey; set(bag: Record<string, unknown>): void };
 
 const FLAG_SPECS: Record<string, FlagSpec> = {
+  'dir': { kind: 'value', key: 'dir', apply(bag, value) { bag.workingDir = value; } },
+  'branch': { kind: 'value', key: 'branch', apply(bag, value) { bag.branch = value; } },
   'agents': {
     kind: 'value', key: 'agents',
     apply(bag, value) {
@@ -85,6 +100,9 @@ const FLAG_SPECS: Record<string, FlagSpec> = {
   // Same key: `--start --no-start` in one command is a duplicate, not a race.
   'start': { kind: 'optIn', key: 'start', set(bag) { bag.autoStart = true; } },
   'no-start': { kind: 'optOut', key: 'start', clear(bag) { bag.autoStart = false; } },
+  // Same key: `--card --no-card` in one command is a duplicate, not a race.
+  'card': { kind: 'optIn', key: 'card', set(bag) { bag.card = true; bag.cardExplicit = true; } },
+  'no-card': { kind: 'optOut', key: 'card', clear(bag) { bag.card = false; delete bag.cardExplicit; } },
 };
 
 /**
@@ -199,9 +217,48 @@ export function parseGroupCreationArgs(rawArgs: string, defaults?: GroupCreation
   const firstLine = body.split(/\r?\n/).map(x => x.trim()).find(Boolean) ?? '';
 
   const roleProfileId = typeof bag.roleProfileId === 'string' ? bag.roleProfileId : undefined;
+  const workingDir = typeof bag.workingDir === 'string' ? bag.workingDir : undefined;
+  const branch = typeof bag.branch === 'string' ? bag.branch : undefined;
+  const cardExplicit = bag.cardExplicit === true;
   delete bag.roleProfileId;
+  delete bag.workingDir;
+  delete bag.branch;
+  delete bag.cardExplicit;
   const parsed = parseGroupCreationDefaults(bag);
-  return { ...parsed, name: firstLine, body: body.trim(), roleProfileId };
+  return {
+    ...parsed,
+    name: firstLine,
+    body: body.trim(),
+    roleProfileId,
+    ...(workingDir ? { workingDir } : {}),
+    ...(branch ? { branch } : {}),
+    ...(cardExplicit ? { cardExplicit: true } : {}),
+  };
+}
+
+/**
+ * Decide whether `/g` opens the interactive creation card or creates a group
+ * immediately.
+ *
+ * Backward-compatibility contract:
+ *  - Without `groupCreation.card: true` and without `--card`, always `'direct'`
+ *    (bare `/g` keeps its released immediate-creation + AI-title behavior).
+ *  - Explicit `--card` opens the form card (prefilling any parsed name/dir/branch),
+ *    unless a task would actually auto-start (`'conflict_with_start'`).
+ *  - Opt-in `groupCreation.card: true` (without `--no-card`) opens the form card
+ *    only when no name, dir, branch, or task was supplied on the command line.
+ */
+export function shouldOpenGroupCreateCard(
+  args: Pick<GroupCreationArgs, 'card' | 'cardExplicit' | 'name' | 'workingDir' | 'branch'>,
+  opts: { autoStart: boolean },
+): 'card' | 'conflict_with_start' | 'direct' {
+  if (args.cardExplicit) {
+    return opts.autoStart ? 'conflict_with_start' : 'card';
+  }
+  if (args.card === true) {
+    return (!args.name && !args.workingDir && !args.branch && !opts.autoStart) ? 'card' : 'direct';
+  }
+  return 'direct';
 }
 
 const GROUP_COMMAND_PREFIX = /^\/(?:group|g)(?=\s|$)/i;

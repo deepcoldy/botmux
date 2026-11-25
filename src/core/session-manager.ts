@@ -1,3 +1,4 @@
+import { createdGroupWorkingDir } from '../services/created-groups-store.js';
 import { renderInboundMessageLocation, type InboundMessageLocation } from './reply-message.js';
 import { isWorkflowNodeSessionMarker, workflowHandoffInputOptions } from './workflow-node-session.js';
 import { isLeadOnlySession } from './lead-only.js';
@@ -5932,6 +5933,8 @@ export async function deliverWorkflowNodeTurn(
 function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string): string | undefined {
   const oncall = findOncallChat(larkAppId, chatId)?.workingDir;
   if (oncall) return oncall;
+  const groupDir = createdGroupWorkingDir(chatId);
+  if (groupDir) return groupDir;
   const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
   if (!raw) return undefined;
   const resolved = expandHome(raw);
