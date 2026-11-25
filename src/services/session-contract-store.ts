@@ -623,6 +623,35 @@ export class SessionContractStore {
   deferredPhysicalExits<T>(ref: ContractSessionRef): T[] {
     return (this.db.prepare("SELECT value FROM deferred_events WHERE session_key=? AND json_extract(value,'$.type')='claude_exit' ORDER BY sequence,event_id").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value));
   }
+  /** Claim the legacy notification separately from contract event dedup. The
+   * same daemon owner cannot notify twice concurrently; a new owner may only
+   * reclaim an unfinished notification after a process restart. */
+  claimPhysicalExitNotification(ref: ContractSessionRef, eventId: string, owner: string): boolean {
+    return this.transaction(() => {
+      const current = this.entity<{ state: string; owner: string }>(ref, 'physical_exit_notification', eventId);
+      if (current?.state === 'settled') return false;
+      if (current?.state === 'notifying' && current.owner === owner) return false;
+      if (current && !['pending', 'notifying'].includes(current.state)) return false;
+      this.saveEntity(ref, 'physical_exit_notification', eventId, 'notifying', { state: 'notifying', owner });
+      return true;
+    });
+  }
+  settlePhysicalExitNotification(ref: ContractSessionRef, eventId: string, owner: string): void {
+    this.transaction(() => {
+      const current = this.entity<{ state: string; owner: string }>(ref, 'physical_exit_notification', eventId);
+      if (current?.state === 'settled') return;
+      // A stale owner must not settle a newer owner's in-flight claim.
+      if (current?.state === 'notifying' && current.owner !== owner) return;
+      this.saveEntity(ref, 'physical_exit_notification', eventId, 'settled', { state: 'settled', owner });
+    });
+  }
+  releasePhysicalExitNotification(ref: ContractSessionRef, eventId: string, owner: string): void {
+    this.transaction(() => {
+      const current = this.entity<{ state: string; owner: string }>(ref, 'physical_exit_notification', eventId);
+      if (current?.state !== 'notifying' || current.owner !== owner) return;
+      this.saveEntity(ref, 'physical_exit_notification', eventId, 'pending', { state: 'pending', owner });
+    });
+  }
   discardDeferred(ref: ContractSessionRef, bindingId: string): void {
     this.db.prepare('DELETE FROM deferred_events WHERE session_key=? AND binding_id=?').run(sessionKey(ref), bindingId);
   }

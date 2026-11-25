@@ -1256,6 +1256,9 @@ describe('contract gateway and real worker boundaries', () => {
     expect(s.store.deferredPhysicalExits(s.ref)).toEqual([]);
     expect(s.store.runtime(s.ref, s.runtime.runtimeId)?.phase).toBe('stopped');
     expect(s.store.execution(s.ref, execution.executionId)?.phase).toBe('reconciling');
+    await Promise.all([host(exit), host(exit)]);
+    expect(legacy).toHaveBeenCalledOnce();
+    expect(s.store.deferredPhysicalExits(s.ref)).toEqual([]);
   });
 
   it.each(['continuation', 'replacement'] as const)('settles a retained exit on a successful %s without widening physical authority', async kind => {
@@ -1280,6 +1283,44 @@ describe('contract gateway and real worker boundaries', () => {
       expect(legacy).not.toHaveBeenCalled();
       expect(s.store.runtime(s.ref, live?.runtimeId)?.phase).toBe('starting');
     }
+    await host(exit);
+    expect(legacy).toHaveBeenCalledTimes(kind === 'continuation' ? 1 : 0);
+  });
+
+  it('releases a failed legacy exit claim so the same event can retry', async () => {
+    const { s, pending, bindingMessage, exit, legacy, host } = retainedExitFixture(1);
+    await host(exit);
+    legacy.mockImplementationOnce(() => { throw new Error('injected legacy failure'); });
+    vi.spyOn(s.controller, 'bindRuntime').mockImplementation(() => { throw new Error('injected binding refusal'); });
+    await host(bindingMessage(pending[0]!, 'tmux', '222:real-cli'));
+    expect(legacy).toHaveBeenCalledOnce();
+    expect(s.store.deferredPhysicalExits(s.ref)).toHaveLength(1);
+    await host(exit);
+    expect(legacy).toHaveBeenCalledTimes(2);
+    expect(s.store.deferredPhysicalExits(s.ref)).toEqual([]);
+    await host(exit);
+    expect(legacy).toHaveBeenCalledTimes(2);
+  });
+
+  it('persists physical exit notification claims across owners and SQLite reopen', () => {
+    const s = fixture();
+    expect(s.store.claimPhysicalExitNotification(s.ref, 'exit:settled', 'boot-a')).toBe(true);
+    expect(s.store.claimPhysicalExitNotification(s.ref, 'exit:settled', 'boot-a')).toBe(false);
+    s.store.settlePhysicalExitNotification(s.ref, 'exit:settled', 'boot-a');
+    expect(s.store.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-a')).toBe(true);
+    s.store.close();
+    const reopened = new SessionContractStore(s.data, s.appId);
+    // A settled notification survives both a different owner and DB reopen.
+    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:settled', 'boot-b')).toBe(false);
+    // An unfinished claim can be reclaimed after a daemon restart; duplicates
+    // from that same new owner remain fenced until the claim is released.
+    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-b')).toBe(true);
+    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-b')).toBe(false);
+    reopened.releasePhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-b');
+    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-a')).toBe(true);
+    reopened.settlePhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-a');
+    expect(reopened.claimPhysicalExitNotification(s.ref, 'exit:unfinished', 'boot-b')).toBe(false);
+    reopened.close();
   });
 
   it.each(['none', 'unrelated', 'foreign_worker', 'foreign_generation'] as const)(

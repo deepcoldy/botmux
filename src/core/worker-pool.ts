@@ -30051,6 +30051,23 @@ function setupWorkerHandlers(
           .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
       }
     }
+    let physicalExitClaimOwner: string | undefined;
+    if (msg.type === 'claude_exit' && metadata) {
+      const owner = getDaemonBootId();
+      if (admission.kind === 'current') {
+        // Contract event dedup does not cover the legacy side effect. Claim it
+        // across normal IPC, replay and SQLite reopen before delivering.
+        if (!sessionController.store.claimPhysicalExitNotification(sessionController.ref, metadata.eventId, owner)) {
+          sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId);
+          return;
+        }
+        physicalExitClaimOwner = owner;
+      } else if (admission.kind === 'historical' && !retainPhysicalExit) {
+        // A genuine replacement permanently suppresses this old process's
+        // legacy exit; remember that disposition for late duplicate IPC too.
+        sessionController.store.settlePhysicalExitNotification(sessionController.ref, metadata.eventId, owner);
+      }
+    }
     const deliveryAdmission = admission;
     const deliver = async (): Promise<void> => {
       if (msg.type === 'turn_terminal' && msg.continuationFailure) enqueueContinuationFailureNotice(ds, msg.continuationFailure);
@@ -30062,13 +30079,23 @@ function setupWorkerHandlers(
         await sessionController.run(deliveryAdmission, () => handleLegacyWorkerMessage(msg));
       }
     };
-    if (msg.type === 'turn_terminal' && msg.continuationFailure) {
-      const failure = msg.continuationFailure;
-      await sessionController.deliverContinuationFailure(failure.continuation.execution, msg.errorCode!, deliver);
-      if (ds.worker === worker && sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) {
-        worker.send({ type: 'continuation_failure_ack', bindingId: failure.bindingId, execution: failure.continuation.execution });
+    try {
+      if (msg.type === 'turn_terminal' && msg.continuationFailure) {
+        const failure = msg.continuationFailure;
+        await sessionController.deliverContinuationFailure(failure.continuation.execution, msg.errorCode!, deliver);
+        if (ds.worker === worker && sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) {
+          worker.send({ type: 'continuation_failure_ack', bindingId: failure.bindingId, execution: failure.continuation.execution });
+        }
+      } else await deliver();
+      if (physicalExitClaimOwner) {
+        sessionController.store.settlePhysicalExitNotification(sessionController.ref, metadata!.eventId, physicalExitClaimOwner);
       }
-    } else await deliver();
+    } catch (error) {
+      if (physicalExitClaimOwner) {
+        sessionController.store.releasePhysicalExitNotification(sessionController.ref, metadata!.eventId, physicalExitClaimOwner);
+      }
+      throw error;
+    }
     if (metadata && !retainPhysicalExit) sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId);
   };
   worker.on('message', msg => {

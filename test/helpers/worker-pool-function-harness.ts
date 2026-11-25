@@ -61,6 +61,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
     return scope[key] ??= WORKER_POOL_WEAK_CONTAINERS[key]();
   }
   if (key === 'randomUUID') return randomUUID;
+  if (key === 'getDaemonBootId') return scope[key] ??= () => 'worker-pool-test-boot';
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
