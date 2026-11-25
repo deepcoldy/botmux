@@ -75,10 +75,20 @@ jobs:
   # measured runner variance while still bounding a hung shard. A stale table
   # only makes shards less even, never drops a file (refresh with
   # scripts/update-shard-timings.mjs). See #2986.
+  #
+  # 2026-11: the four plans are now perfectly balanced (~3251s each), so the
+  # limiter is no longer shard skew but total suite size: planned wall time plus
+  # the same ±15% runner variance sits on the 30-min boundary, and two PRs hit
+  # step-cancellations on DIFFERENT shards with zero failing tests — run
+  # 45630149613 shard 1/4 at 30m17s and run 45672387709 shard 4/4 at 30m14s
+  # (tracked in #3849). Raising the cap to 45 min absorbs the variance while
+  # still bounding a genuinely hung shard; shard count stays at 4 to avoid
+  # adding runner queue pressure. `bun-test` shards finish in 13–21 min, so
+  # their 30-min cap is left unchanged.
   test:
     name: test (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -106,9 +116,9 @@ jobs:
           bun-version: 1.4.4
       - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
       - run: bun run build
-      # No rerun on failure: a shard spends up to ~24 of its 30 minutes in
-      # vitest, so a second pass cannot finish anyway, and a flake must surface
-      # to be fixed rather than be retried away (#2464).
+      # No rerun on failure: a shard spends most of its cap in vitest, so a
+      # second pass cannot finish anyway, and a flake must surface to be fixed
+      # rather than be retried away (#2464).
       - name: Unit tests (shard ${{ matrix.shard }}/4)
         run: bun run test -- --shard=${{ matrix.shard }}/4
 

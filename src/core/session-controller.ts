@@ -610,9 +610,11 @@ export class SessionController {
     }
     if (message.type === 'claude_exit' && runtime) {
       let currentPhysicalExit = false;
-      // The exit callback keeps the binding its CLI was spawned under.
+      // Exits may name the launcher's binding or the latest same-process
+      // binding. Retire both directions of the proven continuation lineage;
+      // executions stay on the runtime they originally ran under.
       const exited = new Map<string, RuntimeContract>();
-      for (const ref of [runtime, ...this.store.continuedRuntimes(this.ref, runtime, channel)]) {
+      for (const ref of this.store.runtimeExitLineage(this.ref, runtime, channel)) {
         for (const sibling of this.store.physicalRuntimes(this.ref, ref)) exited.set(sibling.ref.runtimeId, sibling);
       }
       for (const sibling of exited.values()) {
