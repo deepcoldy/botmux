@@ -117,7 +117,12 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'task-routing',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionTaskRouting',
-    fieldKeys: ['botDefaults.taskRoutingEnabled'],
+    fieldKeys: [
+      'botDefaults.taskRoutingEnabled',
+      'botDefaults.taskRoutingCostTier',
+      'botDefaults.taskRoutingStrengths',
+      'botDefaults.taskRoutingLimitations',
+    ],
   },
   {
     id: 'substitute',
@@ -158,7 +163,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'network-policy', tab: 'security', titleKey: 'botDefaults.networkPolicy', tile: 'sandbox' },
   { id: 'codex-auth', tab: 'security', titleKey: 'botDefaults.sectionCodexAuth', fieldKeys: ['botDefaults.codexAuthSyncLabel'] },
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
-  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention', 'botDefaults.triggerUserAuthAllowSpeakerSwitch'] },
+  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention', 'botDefaults.triggerUserAuthAllowSpeakerSwitch', 'botDefaults.triggerUserAuthGitCommitIdentity'] },
   { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle', 'botDefaults.larkUserOwnerFallbackToggle'] },
   { id: 'approval-compat', tab: 'security', titleKey: 'botDefaults.sectionApprovalCompat', fieldKeys: ['botDefaults.autoAvoidApprovalToggle'] },
   {
@@ -185,7 +190,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.followUpReply', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
-      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
+      'botDefaults.usageDisplay', 'botDefaults.showUsageQuota', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
       'botDefaults.replyCardRecap',
       'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
       'botDefaults.replyFooterEnabled', 'botDefaults.replyFooterBrand', 'botDefaults.replyFooterModel',
@@ -248,6 +253,15 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.quotaFallbackEnabled', 'botDefaults.quotaFallbackTarget', 'botDefaults.quotaFallbackMessage',
       'botDefaults.quotaFallbackKindUsage', 'botDefaults.quotaFallbackKindRate',
+    ],
+  },
+  {
+    id: 'quota-fallback-chain',
+    tab: 'advanced',
+    titleKey: 'botDefaults.quotaFallbackChainTitle',
+    tile: 'quota-fallback',
+    fieldKeys: [
+      'botDefaults.quotaFallbackChainEnabled', 'botDefaults.quotaFallbackChainSteps',
     ],
   },
   {
@@ -468,6 +482,7 @@ export type BotDefaultsRow = {
     /** One command can run as another speaker of a multi-person turn. Absent = off. */
     allowSpeakerSwitch?: boolean;
     gitHost?: string;
+    gitCommitIdentity?: boolean;
     gitTokenExchangeUrl?: string;
   } | null;
   /** lark-cli 应用绑定开关（默认开启）。默认开启以当前 Bot 应用凭证调用并支持 --profile 透传；设为 false 显式关闭。 */
@@ -499,6 +514,7 @@ export type BotDefaultsRow = {
   /** daemon 的默认后端：`backendType` 没有覆盖时会话实际用它（见 effectiveBackendType）。 */
   defaultBackendType?: string | null;
   usageDisplay?: 'streaming' | 'footer' | 'off';
+  showUsageQuota?: boolean;
   replyFooterEnabled?: boolean;
   replyFooterBrand?: boolean;
   replyFooterModel?: boolean;
@@ -544,6 +560,11 @@ export type BotDefaultsRow = {
     targetAppId: string;
     kinds: Array<'usage' | 'rate'>;
     message: string;
+  } | null;
+  quotaFallbackChain?: {
+    enabled: true;
+    kinds: Array<'usage' | 'rate'>;
+    steps: Array<{ cliId: string; model?: string }>;
   } | null;
   online?: boolean;
   startupBlocked?: {

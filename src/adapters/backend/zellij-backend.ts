@@ -433,6 +433,7 @@ export function tmuxKeyToBytes(key: string): string {
     End: '\x1b[F',
     PageUp: '\x1b[5~',
     PageDown: '\x1b[6~',
+    'M-Up': '\x1b[1;3A',
     'M-Enter': '\x1b\r',
   };
   if (key in named) return named[key]!;

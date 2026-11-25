@@ -13,6 +13,7 @@ import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '
 import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
 import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
+import { cotMessageFinishStatus } from '../../src/im/lark/cot-message.js';
 import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
 import { ProtectedResultStore } from '../../src/services/protected-result-store.js';
 
@@ -47,6 +48,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
+  if (key === 'cotMessageFinishStatus') return cotMessageFinishStatus;
   if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
   if (key === 'cancelAntigravityRotationReplay') return cancelAntigravityRotationReplay;
   if (key === 'clearInFlightAntigravityRotation') return clearInFlightAntigravityRotation;
@@ -69,7 +71,8 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
   if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
-    'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed'].includes(key)) {
+    'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
+    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];

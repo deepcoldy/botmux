@@ -5,6 +5,7 @@ import { getBot, normalizeUsageDisplay } from '../bot-registry.js';
 import { localeForBot } from '../i18n/index.js';
 import { getAskSnapshot } from './ask-broker.js';
 import type { AskResult, CreateAskInput, PendingAsk } from './ask-types.js';
+import { NATIVE_STANDALONE_ASK_ORIGIN } from './ask-types.js';
 import type { DaemonSession } from './types.js';
 import { patchReplyCardWithAuditRedaction, replyCardSandboxBlocked } from './turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal, type TurnReplyCardTransport } from '../services/turn-reply-card.js';
@@ -19,9 +20,10 @@ import type { GroupContextDeliveryBinding } from '../services/group-context-deli
  * A mention needs a new message: an inline Ask arrives by PATCH, which never notifies. */
 export function replyCardAskTarget(
   ds: DaemonSession | undefined,
-  input: Pick<CreateAskInput, 'sessionId' | 'larkAppId' | 'chatId' | 'rootMessageId' | 'questions' | 'mentionedOpenId'>,
+  input: Pick<CreateAskInput, 'sessionId' | 'larkAppId' | 'chatId' | 'rootMessageId' | 'questions' | 'mentionedOpenId' | 'originKind'>,
   origin: { originTurnId?: unknown; originDispatchAttempt?: unknown },
 ): CreateAskInput['replyCardTarget'] {
+  if (input.originKind === NATIVE_STANDALONE_ASK_ORIGIN) return undefined;
   const sameAnchor = ds && ((ds.scope ?? ds.session.scope) === 'chat'
     ? input.rootMessageId === null || input.rootMessageId === ds.chatId
     : input.rootMessageId === ds.session.rootMessageId);

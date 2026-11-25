@@ -38,6 +38,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
+import type { BytedcliGrantRegion, BytedcliPublishedRegionState, BytedcliPublishedRegionStates } from '../platform/bytedcli-grant-regions.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import { GIT_CONFIG_PAIR_ENV_KEY, isCliIdentityPath } from '../utils/child-env.js';
 import { resolveEntrySpawn } from './self-spawn.js';
@@ -67,9 +68,12 @@ export function sessionIdentityDir(sessionDataDir: string): string {
  * selection at them. Keyed on realpath so data-dir aliases cannot split the
  * store for one session.
  */
+/** A new object for every publication, even if the credentials are identical. */
+export interface ProvenIdentitySnapshot { readonly body: string }
+
 const provenIdentityContents = new Map<
   string,
-  Map<string, Partial<Record<IdentityTool, string>>>
+  Map<string, Partial<Record<IdentityTool, ProvenIdentitySnapshot>>>
 >();
 
 function provenSessionKey(sessionDataDir: string, sessionId: string): string {
@@ -99,7 +103,7 @@ export function rememberProvenIdentityContent(
   const key = provenSessionKey(sessionDataDir, sessionId);
   const turns = provenSessionMap(key, true)!;
   const tools = turns.get(turnId) ?? {};
-  tools[tool] = body;
+  tools[tool] = { body };
   turns.set(turnId, tools);
 }
 
@@ -111,6 +115,12 @@ export function recallProvenIdentityContent(
   turnId: string,
   tool: IdentityTool,
 ): string | undefined {
+  return recallProvenIdentitySnapshot(sessionDataDir, sessionId, turnId, tool)?.body;
+}
+
+export function recallProvenIdentitySnapshot(
+  sessionDataDir: string, sessionId: string, turnId: string, tool: IdentityTool,
+): ProvenIdentitySnapshot | undefined {
   return provenSessionMap(provenSessionKey(sessionDataDir, sessionId), false)?.get(turnId)?.[tool];
 }
 
@@ -218,14 +228,14 @@ export function dropPublishedIdentitiesForOpenId(sessionDataDir: string, openId:
       if (!tools) continue;
       let removedBytedcli = false;
       for (const tool of Object.keys(tools) as IdentityTool[]) {
-        const body = tools[tool];
+        const body = tools[tool]?.body;
         if (typeof body !== 'string' || !identityMatchesOpenId(body, openId)) continue;
         delete tools[tool];
         dropped += 1;
         if (tool === 'bytedcli') removedBytedcli = true;
       }
       for (const name of COMPANION_TOOLS) {
-        const body = tools[name];
+        const body = tools[name]?.body;
         if (!removedBytedcli || typeof body !== 'string') continue;
         const stamped = stampedOpenId(body);
         if (stamped === undefined || stamped === openId) {
@@ -582,6 +592,9 @@ export interface BytedCliIdentity extends TurnBound {
   /** Who was asked for {@link regionalCloudJwts}; only shapes the refusal
    *  text for a missing region. See {@link BytedcliRegionalJwtSource}. */
   regionalCloudJwtSource?: BytedcliRegionalJwtSource;
+  regionalCloudJwtStates?: BytedcliPublishedRegionStates;
+  /** This proven publication can ask the platform again within the turn. */
+  retryRegionalCloudJwts?: true;
   /** See {@link LarkCliIdentity.openId}. */
   openId?: string;
   /**
@@ -695,7 +708,7 @@ const MEEGO_HOME_VAR = 'BOTMUX_MEEGO_HOME';
  * the bytedcli wrapper picks the one matching the call's `--site` (or
  * BYTEDCLI_CLOUD_SITE), so these never reach the child under their own names.
  */
-export type BytedcliRegion = 'i18n' | 'i18nbd' | 'tx' | 'cn';
+export type BytedcliRegion = BytedcliGrantRegion;
 const BYTEDCLI_REGIONAL_JWT_VARS: Record<BytedcliRegion, string> = {
   i18n: 'BOTMUX_IDENTITY_CLOUD_JWT_I18N',
   i18nbd: 'BOTMUX_IDENTITY_CLOUD_JWT_I18NBD',
@@ -735,8 +748,20 @@ const BYTEDCLI_SITE_ALIASES: Readonly<Record<string, string>> = {
  */
 export type BytedcliRegionalJwtSource = 'local' | 'platform' | 'platform-legacy';
 const BYTEDCLI_REGIONAL_SOURCE_VAR = 'BOTMUX_IDENTITY_REGIONAL_SOURCE';
-// A turn's tickets are fixed when the turn is prepared, so a retry inside the
-// same turn gets the same answer: the hints say to send a new message.
+const BYTEDCLI_REGIONAL_STATE_VARS: Record<BytedcliRegion, string> = {
+  i18n: 'BOTMUX_IDENTITY_REGIONAL_STATE_I18N',
+  i18nbd: 'BOTMUX_IDENTITY_REGIONAL_STATE_I18NBD',
+  tx: 'BOTMUX_IDENTITY_REGIONAL_STATE_TX',
+  cn: 'BOTMUX_IDENTITY_REGIONAL_STATE_CN',
+};
+const BYTEDCLI_REGIONAL_RETRY_VAR = 'BOTMUX_IDENTITY_REGIONAL_RETRY';
+const BYTEDCLI_REGION_STATE_HINTS: Partial<Record<BytedcliPublishedRegionState, string>> = {
+  not_authorized: '发起人尚未授权这个站点，请前往平台凭据页授权后发一条新消息再试。',
+  reauth_required: '发起人在这个站点的授权已失效，请前往平台凭据页重新授权后发一条新消息再试。',
+  pending: '平台仍在签发这个分区的凭据。',
+  failed: '平台本次未能签发这个分区的凭据。',
+  retry_exhausted: '本轮这个分区的补票已达上限，请发一条新消息再试；若仍缺票，请检查平台凭据页的站点授权。',
+};
 const BYTEDCLI_REGIONAL_MISSING_HINTS: Record<BytedcliRegionalJwtSource, string> = {
   local: '本机为发起人签票时没有签到这个分区的票：bytedcli 的登录按站点分开保存，本机的按人授权只登录了默认站点，发起人没在该站点另外登录过就签不出；也可能发起人没有该分区权限，或这次签票失败。可让 bot 改用平台授权（平台凭据页可为海外站点单独授权）。本轮内重试拿不到新票，处理后发一条新消息再试。',
   platform: '平台为发起人签票时没有签出这个分区的票：海外站点要在平台凭据页单独授权，发起人可能还没授权该站点，或该站点授权已失效；也可能这次签票失败。本轮内重试拿不到新票；授权该站点后发一条新消息再试。',
@@ -797,14 +822,16 @@ function anyCaseGlob(site: string): string {
 
 /** Shell lines: `case "$<siteVar>"` setting `<jwtVar>` to this identity's
  *  token for that site's region, and `<regionVar>` (when given) to the region. */
-function bytedcliSiteRegionCase(siteVar: string, jwtVar: string, regionVar?: string): string[] {
+function bytedcliSiteRegionCase(siteVar: string, jwtVar?: string, regionVar?: string, stateVar?: string): string[] {
   const cases = (Object.keys(BYTEDCLI_SITE_REGIONS) as BytedcliRegion[]).map(region => {
     const sites = BYTEDCLI_SITE_REGIONS[region];
     const aliases = Object.keys(BYTEDCLI_SITE_ALIASES).filter(alias => sites.includes(BYTEDCLI_SITE_ALIASES[alias]));
     // The `|` alternatives are joined here, as literal text: sh does not read
     // a `|` that comes out of a parameter expansion as a pattern separator.
     const setRegion = regionVar ? `${regionVar}=${region}; ` : '';
-    return `    ${[...sites, ...aliases].map(anyCaseGlob).join('|')}) ${setRegion}${jwtVar}=$${BYTEDCLI_REGIONAL_JWT_VARS[region]} ;;`;
+    const setJwt = jwtVar ? `${jwtVar}=$${BYTEDCLI_REGIONAL_JWT_VARS[region]}` : ':';
+    const setState = stateVar ? ` ${stateVar}=$${BYTEDCLI_REGIONAL_STATE_VARS[region]}` : '';
+    return `    ${[...sites, ...aliases].map(anyCaseGlob).join('|')}) ${setRegion}${setJwt}${setState} ;;`;
   });
   return [`  case "$${siteVar}" in`, ...cases, '  esac'];
 }
@@ -819,29 +846,10 @@ function bytedcliSiteTrim(siteVar: string): string[] {
   ];
 }
 
-/**
- * Shell lines selecting the regional ByteCloud JWT for this call's site.
- *
- * A call whose global site requires a missing partition token reports that
- * partition before invoking bytedcli. Help and commands with their own
- * credentials can still run (see {@link BYTEDCLI_REGION_FREE_FN}).
- *
- * The global site is read the way bytedcli 0.191 reads it: from the root
- * options only — it enables positional options, so a `--site` after the
- * command is that command's own option (a filter for `bytecloud
- * list-legacy-vregions`, a preset for `forge`), not the site the call is
- * authenticated against; `--cloud-site` is its spelling of `--site`; an empty
- * `--site` counts as not given (the variable then decides); the value is
- * trimmed with JS `trim()` and matched in any case.
- *
- * Which token is swapped in is decided separately and as before (#2472): by
- * the last `--site` anywhere, so a command that authenticates against its own
- * `--site` (nac) keeps getting the partition token it was getting.
- */
-function bytedcliRegionalSelection(): string[] {
+/** Resolve the global authentication site from root options, before the first
+ * command. A subcommand's own --site is still used for token overrides below. */
+function bytedcliGlobalSite(): string[] {
   const rootValueOptions = BYTEDCLI_ROOT_OPTIONS_WITH_VALUE.filter(option => option !== '--site' && option !== '--cloud-site');
-  const hints = (Object.keys(BYTEDCLI_REGIONAL_MISSING_HINTS) as BytedcliRegionalJwtSource[]).map(source =>
-    `      ${source}) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_HINTS[source])} ;;`);
   return [
     // The global site: the last --site among the root options, which end at
     // the first command the way bytedcli's getFirstCommandArgIndex finds it.
@@ -863,13 +871,40 @@ function bytedcliRegionalSelection(): string[] {
     '  done',
     '  if [ -z "$__botmux_gsite" ]; then __botmux_gsite=${BYTEDCLI_CLOUD_SITE:-}; fi',
     ...bytedcliSiteTrim('__botmux_gsite'),
+  ];
+}
+
+/** Refuse a missing global partition, then preserve the existing last-site
+ * override for subcommands that authenticate against a site of their own. */
+function bytedcliRegionalSelection(): string[] {
+  const hints = (Object.keys(BYTEDCLI_REGIONAL_MISSING_HINTS) as BytedcliRegionalJwtSource[]).map(source =>
+    `      ${source}) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_HINTS[source])} ;;`);
+  const stateHints = Object.entries(BYTEDCLI_REGION_STATE_HINTS).map(([state, hint]) =>
+    `      ${state}) __botmux_hint=${shellSingleQuote(hint)} ;;`);
+  const retryHint = '可稍等后重试本命令。若持续失败，请发一条新消息再试。';
+  return [
     '  __botmux_region=',
+    '  __botmux_state=',
     '  __botmux_regional=',
-    ...bytedcliSiteRegionCase('__botmux_gsite', '__botmux_regional', '__botmux_region'),
+    ...bytedcliSiteRegionCase('__botmux_gsite', '__botmux_regional', '__botmux_region', '__botmux_state'),
     '  if [ -n "$__botmux_region" ] && [ -z "$__botmux_regional" ] && ! __botmux_bd_region_free "$@"; then',
     `    case "$${BYTEDCLI_REGIONAL_SOURCE_VAR}" in`,
     ...hints,
     `      *) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT)} ;;`,
+    '    esac',
+    '    case "$__botmux_state" in',
+    ...stateHints,
+    '    esac',
+    '    case "$__botmux_state" in',
+    '      not_authorized|reauth_required|retry_exhausted) ;;',
+    `      pending|failed) if [ -n "$${BYTEDCLI_REGIONAL_RETRY_VAR}" ] && [ "$__botmux_region" != cn ]; then`,
+    `        __botmux_hint="$__botmux_hint"${shellSingleQuote(retryHint)}`,
+    '      else',
+    `        __botmux_hint="$__botmux_hint"${shellSingleQuote('请稍等后发一条新消息再试。')}`,
+    '      fi ;;',
+    `      *) if [ -n "$${BYTEDCLI_REGIONAL_RETRY_VAR}" ] && [ "$__botmux_region" != cn ]; then`,
+    `        __botmux_hint=${shellSingleQuote('平台本次没有返回该分区的票。' + retryHint + '若仍缺这张票，请在平台凭据页确认该站点授权。')}`,
+    '      fi ;;',
     '    esac',
     // printf's format carries no prose: the site is the caller's argument.
     "    printf '%s%s%s%s%s%s%s\\n' "
@@ -898,7 +933,7 @@ function bytedcliRegionalSelection(): string[] {
     '  __botmux_regional=',
     ...bytedcliSiteRegionCase('__botmux_site', '__botmux_regional'),
     '  if [ -n "$__botmux_regional" ]; then BYTEDCLI_USER_CLOUD_JWT=$__botmux_regional; fi',
-    `  unset __botmux_site __botmux_gsite __botmux_next __botmux_skip __botmux_arg __botmux_region __botmux_regional ${BYTEDCLI_REGIONAL_SOURCE_VAR} ${Object.values(BYTEDCLI_REGIONAL_JWT_VARS).join(' ')}`,
+    `  unset __botmux_site __botmux_gsite __botmux_next __botmux_skip __botmux_arg __botmux_region __botmux_regional __botmux_state __botmux_requested_region ${BYTEDCLI_REGIONAL_SOURCE_VAR} ${BYTEDCLI_REGIONAL_RETRY_VAR} ${Object.values(BYTEDCLI_REGIONAL_JWT_VARS).join(' ')} ${Object.values(BYTEDCLI_REGIONAL_STATE_VARS).join(' ')}`,
   ];
 }
 
@@ -959,6 +994,11 @@ export function renderIdentityEnv(identity: CliIdentity): string {
       if (key && jwt) pairs.push([key, jwt]);
     }
     if (identity.regionalCloudJwtSource) pairs.push([BYTEDCLI_REGIONAL_SOURCE_VAR, identity.regionalCloudJwtSource]);
+    if (identity.retryRegionalCloudJwts) pairs.push([BYTEDCLI_REGIONAL_RETRY_VAR, '1']);
+    for (const [region, state] of Object.entries(identity.regionalCloudJwtStates ?? {})) {
+      const key = BYTEDCLI_REGIONAL_STATE_VARS[region as BytedcliRegion];
+      if (key && state) pairs.push([key, state]);
+    }
     // Same variable the lark-cli device-code identity uses: the wrapper scopes
     // HOME to this exec only (see renderIdentityWrapper).
     if (identity.home) pairs.push([HOME_VAR, identity.home]);
@@ -1087,6 +1127,8 @@ function bytedcliHomeRoot(sessionDataDir: string, sessionId: string): string {
  *  short-alias layout (or falls back to the cache-root spelling) and only then
  *  computes the path, so the published HOME is the short one and the executor is
  *  never the first writer of the layout. See {@link bytedcliHomeRoot}. */
+export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: BytedCliIdentity): BytedCliIdentity;
+export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity;
 export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
   if (identity.tool !== 'bytedcli' || 'mode' in identity) return identity;
   if (identity.home) return identity;
@@ -1609,9 +1651,10 @@ export interface NativeBytedcliCapabilities {
 }
 
 const AS_UNAVAILABLE_MSG = 'botmux: 这次调用无法使用 BOTMUX_AS（命令使用本机原生登录，或本会话按单快照模式运行，不逐次向 daemon 取身份），命令未执行；去掉 BOTMUX_AS 重试。';
+const GIT_COMMIT_AS_UNAVAILABLE_MSG = 'botmux: gitCommitIdentity 暂不支持 BOTMUX_AS，命令未执行；去掉 BOTMUX_AS 后重试。';
 /** Shell line refusing a call that names `BOTMUX_AS` where the wrapper cannot honour it. */
-const refuseBotmuxAs = (leave: string): string =>
-  `[ -z "\${BOTMUX_AS:-}" ] || { printf '%s\\n' ${shellSingleQuote(AS_UNAVAILABLE_MSG)} >&2; ${leave} ${IDENTITY_DENIED_EXIT_CODE}; }`;
+const refuseBotmuxAs = (leave: string, message = AS_UNAVAILABLE_MSG): string =>
+  `[ -z "\${BOTMUX_AS:-}" ] || { printf '%s\\n' ${shellSingleQuote(message)} >&2; ${leave} ${IDENTITY_DENIED_EXIT_CODE}; }`;
 
 function bytedcliNativePassthrough(realBinaryPath: string, native: NativeBytedcliCapabilities): string[] {
   if (!native.meego && !native.bytecloud) return [];
@@ -1637,12 +1680,14 @@ export function renderIdentityWrapper(
   const governsMeego = tool === 'bytedcli' && !nativeCapabilities.meego;
   const isBytecloudFamily = tool === 'bytedcli' || tool === CODEBASE_COMPANION_TOOL || tool === BITSCLI_COMPANION_TOOL;
   const authProvider = tool === 'lark-cli' ? 'lark-cli' : 'bytedcli';
+  const requestsRegionalGrant = tool === 'bytedcli' && model === 'proven' && governsByteCloud;
+  const regionArg = requestsRegionalGrant ? ' ${__botmux_requested_region:+--region} ${__botmux_requested_region:+"$__botmux_requested_region"}' : '';
   const resolveBlock = model === 'proven' ? [
     // The runner proves this process tree over the daemon loopback channel and
     // prints the identity env ASSIGNMENTS, never a path. eval consumes that
     // body straight from the pipe: nothing in the session directory can select
     // or alter the identity, and no token rests on disk to be read.
-    `__botmux_cred_body=$(${[...identityResolver!, tool].map(shellSingleQuote).join(' ')}) || return ${IDENTITY_DENIED_EXIT_CODE}`,
+    `__botmux_cred_body=$(${[...identityResolver!, tool].map(shellSingleQuote).join(' ')}${regionArg}) || return ${IDENTITY_DENIED_EXIT_CODE}`,
     // An empty body is a missing/empty response (no mode assignment below),
     // never silent permission to run: deny it like a failed proof.
     `[ -n "$__botmux_cred_body" ] || return ${IDENTITY_DENIED_EXIT_CODE}`,
@@ -1709,7 +1754,7 @@ export function renderIdentityWrapper(
     // the exec site below, after identity resolution where it applies.
     ...BYTEDCLI_AUTH_REQUEST_FN,
     ...(isBytecloudFamily ? [...BYTEDCLI_SCAN_FN, ...BYTECLOUD_CLEAN_RUN_FN] : []),
-    ...(tool === 'bytedcli' ? BYTEDCLI_REGION_FREE_FN : []),
+    ...(tool === 'bytedcli' ? ['__botmux_requested_region=', ...BYTEDCLI_REGION_FREE_FN] : []),
     ...(governsMeego ? BYTEDCLI_MEEGO_FN : []),
     '__botmux_resolve() {',
     `  ${MODE_VAR}=`,
@@ -1722,7 +1767,8 @@ export function renderIdentityWrapper(
     `  ${OPEN_ID_VAR}=`,
     `  ${UNATTENDED_VAR}=`,
     ...(tool === 'bytedcli'
-      ? [...Object.values(BYTEDCLI_REGIONAL_JWT_VARS), BYTEDCLI_REGIONAL_SOURCE_VAR].map(key => `  ${key}=`)
+      ? [...Object.values(BYTEDCLI_REGIONAL_JWT_VARS), ...Object.values(BYTEDCLI_REGIONAL_STATE_VARS),
+        BYTEDCLI_REGIONAL_SOURCE_VAR, BYTEDCLI_REGIONAL_RETRY_VAR].map(key => `  ${key}=`)
       : []),
     // Same for the per-exec HOME: an inherited value must not redirect an
     // identity that does not carry one.
@@ -1779,6 +1825,13 @@ export function renderIdentityWrapper(
         `  exit ${IDENTITY_DENIED_EXIT_CODE}`,
         'fi',
       ] : []),
+    ] : []),
+    ...(tool === 'bytedcli' ? bytedcliGlobalSite() : []),
+    ...(requestsRegionalGrant ? [
+      'if ! __botmux_bd_region_free "$@"; then',
+      ...bytedcliSiteRegionCase('__botmux_gsite', undefined, '__botmux_requested_region'),
+      '  case "$__botmux_requested_region" in cn) __botmux_requested_region= ;; esac',
+      'fi',
     ] : []),
     `__botmux_resolve || exit ${IDENTITY_DENIED_EXIT_CODE}`,
     // A refusal of an unattended run (published for exactly the lapse of a
@@ -2198,6 +2251,73 @@ export function renderGitAskpassScript(bytedcliPath: string, exchangeUrl?: strin
   ].join('\n');
 }
 
+const GIT_COMMIT_WRAPPER_MARKER = '# botmux trigger-user git commit identity';
+
+/** Parse global options in a function so exec receives the original argv. */
+export function renderGitCommitWrapper(realGit: string, resolver: readonly string[]): string {
+  return [
+    '#!/bin/sh',
+    GIT_COMMIT_WRAPPER_MARKER,
+    `real_git=${shellSingleQuote(realGit)}`,
+    // Role-specific config outranks user.* even across config scopes. Capture
+    // explicit user.* options before overriding the host's four role defaults.
+    'capture_user_config() {',
+    '  case "$1" in -c) pair=$2 ;; *) pair=${1#--config-env=} ;; esac',
+    '  case "${pair%%=*}" in',
+    '    [uU][sS][eE][rR].[eE][mM][aA][iI][lL]) override_email=$("$real_git" "$@" config --get user.email) || exit 1 ;;',
+    '    [uU][sS][eE][rR].[nN][aA][mM][eE]) override_name=$("$real_git" "$@" config --get user.name) || exit 1 ;;',
+    '  esac',
+    '}',
+    'unset override_name override_email',
+    'needs_actor() {',
+    '  while [ "$#" -gt 0 ]; do',
+    '    case "$1" in',
+    // These global forms terminate in version/path/help output (or their own
+    // usage error); Git never executes a later subcommand. Do not demand an
+    // actor for read-only informational invocations such as `git --help commit`.
+    '      -h|--help|--version|--exec-path|--html-path|--man-path|--info-path|--list-cmds|--list-cmds=*) return 1 ;;',
+    '      -c) [ "$#" -ge 2 ] || return 1; capture_user_config -c "$2"; shift 2 ;;',
+    '      --config-env=*) capture_user_config "$1"; shift ;;',
+    '      --config-env) [ "$#" -ge 2 ] || return 1; capture_user_config "--config-env=$2"; shift 2 ;;',
+    // Every value-taking global option must list its separate argv form: a
+    // missing entry lets the value hit the `*) return 1` passthrough and the
+    // commit-family subcommand below it runs unwrapped. --shallow-file is
+    // accepted by git 2.39; --replace-git-ref / --attr-source arrive with newer
+    // git and the equals forms already stop at the generic `-*)` branch.
+    '      -C|--git-dir|--work-tree|--namespace|--super-prefix|--attr-source|--shallow-file|--replace-git-ref)',
+    '        [ "$#" -ge 2 ] || return 1; shift 2 ;;',
+    '      -*) shift ;;',
+    '      commit|commit-tree|merge|cherry-pick|revert|rebase|am|pull)',
+    '        case "$#:${2-}" in 2:--abort|2:--quit|2:-h|2:--help) return 1 ;; esac',
+    '        return 0 ;;',
+    '      *) return 1 ;;',
+    '    esac',
+    '  done',
+    '  return 1',
+    '}',
+    'if ! needs_actor "$@"; then exec "$real_git" "$@"; fi',
+    // The current-actor route attests the turn principal, not a speaker selected
+    // for one command. Until it has speaker-aware semantics, never silently
+    // attribute a requested BOTMUX_AS call to the principal. Read-only and push
+    // paths never reach this guard; the existing askpass flow keeps its own AS handling.
+    refuseBotmuxAs('exit', GIT_COMMIT_AS_UNAVAILABLE_MSG),
+    `email="$(${resolver.map(shellSingleQuote).join(' ')})" || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    // Ambient identity env vars outrank every -c config key (git gives them
+    // precedence over all config scopes). A shell profile or an export inside
+    // the session would otherwise let a PATH-wrapped commit land with the
+    // machine's identity, exactly the mis-attribution this wrapper exists to
+    // stop. The IDENT combined forms are cleared too: ignored by some git
+    // versions, but the same channel wherever they are honored. Explicit argv
+    // overrides (-c user.*, --author) still win via the capture above.
+    'unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_IDENT',
+    'unset GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_IDENT',
+    'name=${override_name-${email%@*}}',
+    'email=${override_email-$email}',
+    'exec "$real_git" -c "user.name=$name" -c "user.email=$email" -c "author.name=$name" -c "author.email=$email" -c "committer.name=$name" -c "committer.email=$email" "$@"',
+    '',
+  ].join('\n');
+}
+
 /** Filename of the git askpass helper inside a session's wrapper dir. */
 export const GIT_ASKPASS_BASENAME = 'botmux-git-askpass';
 
@@ -2314,6 +2434,18 @@ export function applyTurnGitConfigEnv(
   if (pairs.length) Object.assign(env, encodeGitConfigPairs(pairs));
 }
 
+export interface TriggerUserCliEnvOptions {
+  /** The session runs in a fresh bwrap root that only mounts CANONICAL paths.
+   *  A symlinked home / data root (`/home/u` -> `/data00/home/u`) has no alias
+   *  there, so every path written into the session env or a generated script
+   *  must be the realpath. Left off, nothing changes for unsandboxed sessions. */
+  canonicalPaths?: boolean;
+  /** Actual spawn-network fact, not a value re-derived from frozen config.
+   *  False means the engaged sandbox cuts the daemon loopback (--unshare-net or
+   *  slirp); undefined preserves the legacy callers that have no network fact. */
+  loopbackShared?: boolean;
+}
+
 /**
  * The single wiring seam every CLI/engine spawn site must call to install the
  * trigger-user identity: it prepares the wrapper env (PATH shim, askpass,
@@ -2336,7 +2468,7 @@ export function prepareTurnGitConfigEnv(
   log: (message: string) => void,
   model: IdentityStorageModel,
   execution?: { appId: string; ipcPort?: number },
-  options?: { canonicalPaths?: boolean },
+  options?: TriggerUserCliEnvOptions,
 ): Array<[string, string]> {
   const pairs = prepareTriggerUserCliEnv(env, sessionDataDir, sessionId, policy, log, model, execution, options);
   applyTurnGitConfigEnv(env, pairs);
@@ -2407,13 +2539,14 @@ export function prepareTriggerUserCliEnv(
   policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
   model: IdentityStorageModel,
   execution?: { appId: string; ipcPort?: number },
-  /** `canonicalPaths`: the session runs in a fresh bwrap root that only mounts
-   *  CANONICAL paths. A symlinked home / data root (`/home/u` -> `/data00/home/u`)
-   *  has no alias there, so every path written into the session env or into a
-   *  generated script must be the realpath or it is `not found` inside. Left
-   *  off, nothing changes for unsandboxed sessions. */
-  options?: { canonicalPaths?: boolean },
+  options?: TriggerUserCliEnvOptions,
 ): Array<[string, string]> {
+  if (policy?.enabled && policy.gitCommitIdentity && options?.loopbackShared === false) {
+    throw new Error('triggerUserAuth.gitCommitIdentity 需要会话内可访问 daemon loopback；'
+      + '当前沙盒通过 --unshare-net 或 slirp 隔离了 loopback，无法核验当前回合触发人。'
+      + '请关闭 gitCommitIdentity，或调整沙盒网络后重启会话');
+  }
+  const gitCommitIdentity = policy?.enabled === true && policy.gitCommitIdentity === true;
   // Before anything else, including the early return below: a policy that is
   // off now may have been on when this session last spawned.
   if (sessionDataDir) {
@@ -2424,7 +2557,25 @@ export function prepareTriggerUserCliEnv(
       log(`[trigger-user-auth] WARN could not remove ungoverned wrappers: ${(e as Error).message}`);
     }
   }
-  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return [];
+  if (sessionDataDir && !gitCommitIdentity) {
+    const git = join(sessionIdentityBinDir(sessionDataDir, sessionId), 'git');
+    try {
+      const stat = lstatSync(git);
+      if (stat.isFile() && stat.size <= 64 * 1024
+        && readFileSync(git, 'utf8').split('\n', 2)[1] === GIT_COMMIT_WRAPPER_MARKER) {
+        rmSync(git, { force: true });
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log(`[trigger-user-auth] WARN could not remove git commit wrapper: ${(error as Error).message}`);
+      }
+    }
+  }
+  // The worker may legitimately filter every ordinary tool out (the dedicated
+  // Lark binding owns lark-cli). Git attribution is an independent opt-in and
+  // must still be installed; otherwise an explicit request silently falls back
+  // to the host's author/committer.
+  if (!policy?.enabled || (!policy.tools.length && !gitCommitIdentity) || !sessionDataDir) return [];
   const canonicalPaths = options?.canonicalPaths === true;
   sessionDataDir = sessionVisiblePath(sessionDataDir, canonicalPaths);
   childEnv.SESSION_DATA_DIR = sessionDataDir;
@@ -2433,16 +2584,20 @@ export function prepareTriggerUserCliEnv(
   // Turn-authored git -c pairs; returned to the caller for the pane carrier.
   let gitConfigPairs: Array<[string, string]> = [];
   let identityResolver: string[] | undefined;
-  if (model === 'proven' && process.platform === 'linux' && execution) {
+  let gitResolver: string[] | undefined;
+  if (gitCommitIdentity || (model === 'proven' && process.platform === 'linux' && execution)) {
     const moduleDir = dirname(fileURLToPath(import.meta.url));
     const sourceExecArgs = process.execArgv.map((arg, index, args) =>
       args[index - 1] === '--import' && arg === 'tsx' ? createRequire(import.meta.url).resolve('tsx') : arg);
     const runner = moduleDir.endsWith('/src/core')
       ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../cli-identity-runner.ts')] }
       : resolveEntrySpawn('cli-identity-runner', resolve(moduleDir, '..'));
-    identityResolver = [...[runner.command, ...runner.args].map(p => sessionVisiblePath(p, canonicalPaths)),
-      '--data-dir', sessionDataDir, '--session-id', sessionId, '--app-id', execution.appId,
-      '--ipc-port', String(execution.ipcPort), '--tool'];
+    const launcher = [runner.command, ...runner.args].map(p => sessionVisiblePath(p, canonicalPaths));
+    if (gitCommitIdentity) gitResolver = [...launcher, '--git-actor-email'];
+    if (model === 'proven' && process.platform === 'linux' && execution) {
+      identityResolver = [...launcher, '--data-dir', sessionDataDir, '--session-id', sessionId,
+        '--app-id', execution.appId, '--ipc-port', String(execution.ipcPort), '--tool'];
+    }
   }
   // Initialize the directory for THIS model before sandbox spawn so its bound
   // directory survives the existence-filter and leftovers from the other model
@@ -2462,6 +2617,21 @@ export function prepareTriggerUserCliEnv(
     log(`[trigger-user-auth] WARN could not initialize identity storage: ${(e as Error).message}`);
   }
   let installedAny = false;
+  if (gitResolver) {
+    if (process.platform !== 'linux') {
+      // The resolver proves lineage through /proc and the daemon's loopback
+      // peer scan, neither of which exists off Linux. The wrapper still fails
+      // closed (every governed subcommand exits 77); say why in the log so the
+      // refusal is not mistaken for an authorization problem.
+      log('[trigger-user-auth] WARN gitCommitIdentity is supported only on Linux; '
+        + 'on this platform git commit-family commands will be refused until it is turned off');
+    }
+    const realGit = findRealToolBinary('git', childEnv.PATH, [wrapperDir]);
+    if (!realGit) throw new Error('gitCommitIdentity requires git on PATH');
+    mkdirSync(wrapperDir, { recursive: true });
+    atomicWriteFileSync(join(wrapperDir, 'git'),
+      renderGitCommitWrapper(sessionVisiblePath(realGit, canonicalPaths), gitResolver), { mode: 0o755 });
+  }
   for (const [tool, commandName] of identityTools.flatMap(tool =>
     [tool, ...(IDENTITY_WRAPPER_ALIASES[tool] ?? [])].map(name => [tool, name] as const))) {
     try {
@@ -2486,11 +2656,11 @@ export function prepareTriggerUserCliEnv(
   // the failure mode observed in production, where the agent cheerfully
   // reported `identity: user` (the machine account) as "normal". Absence of a
   // wrapper is invisible by nature, so it has to be said out loud.
-  if (!installedAny) {
+  if (!installedAny && identityTools.length) {
     log('[trigger-user-auth] WARN no tool wrapper installed — this session is NOT running under '
       + 'trigger-user identity; calls will use whatever credentials the machine has');
   }
-  if (installedAny) {
+  if (installedAny || gitResolver) {
     childEnv.PATH = [wrapperDir, ...(childEnv.PATH ?? '').split(delimiter).filter(p => p !== wrapperDir)].join(delimiter);
     // A prepend alone loses to path_helper in the login shell the agent's
     // tool calls run through — see installLoginShellPathShim. These three

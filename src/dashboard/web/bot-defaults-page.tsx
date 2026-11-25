@@ -1,3 +1,8 @@
+import {
+  TASK_ROUTING_COST_TIERS,
+  TASK_ROUTING_LIMITS,
+  type TaskRoutingCostTier,
+} from '../../core/task-routing/model.js';
 import { DEFAULT_OWNER_REMINDER_QUIET_HOURS, normalizeOwnerReminderQuietHours } from '../../core/session-owner-reminder-quiet-hours.js';
 import type { OncallPresetOptions } from '../../services/oncall-preset-options.js';
 import { normalizePassthroughCommand, parseCustomPassthroughInput } from '../../core/passthrough-commands.js';
@@ -659,6 +664,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     ...Object.fromEntries(REPLY_FOOTER_KEYS.map(key => [key, body[key] !== false])),
     showReplyTiming: body.showReplyTiming,
     usageDisplay: body.usageDisplay,
+    showUsageQuota: body.showUsageQuota !== false,
     disableStreamingCard: body.disableStreamingCard,
     replyCardMode: body.replyCardMode,
     hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
@@ -1254,7 +1260,10 @@ function BotDefaultsCard(props: {
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('sender-tag')}><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
-            <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}>
+              <QuotaFallbackChainSection bot={bot} cliState={cliState} startCli={cli} patchBot={patchBot} />
+              <QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} />
+            </section>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} refreshBot={props.refreshBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('owner-reminder')}><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -1911,6 +1920,192 @@ function QuotaFallbackSection(props: { bot: BotDefaultsRow; bots: BotDefaultsRow
       <div className="actions">
         <button type="button" className="primary" data-action="save-quota-fallback" disabled={busy} onClick={() => void save()}>{tr('botDefaults.quotaFallbackSave')}</button>
         <StatusSpan status={status} attr={{ 'data-quota-fallback-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+type QuotaFallbackChainStepDraft = { cliId: string; model: string };
+
+function quotaFallbackChainDraft(config: BotDefaultsRow['quotaFallbackChain']): QuotaFallbackChainStepDraft[] {
+  const steps = config?.steps.map(step => ({ cliId: step.cliId, model: step.model ?? '' })) ?? [];
+  return steps.length ? steps : [{ cliId: '', model: '' }];
+}
+
+export function QuotaFallbackChainSection(props: { bot: BotDefaultsRow; cliState: CliOptionsState; startCli: string; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = props.bot.quotaFallbackChain ?? null;
+  const [enabled, setEnabled] = useState(initial?.enabled === true);
+  const [kinds, setKinds] = useState<QuotaFallbackKind[]>(initial?.kinds ?? ['usage', 'rate']);
+  const [steps, setSteps] = useState<QuotaFallbackChainStepDraft[]>(() => quotaFallbackChainDraft(initial));
+  const [detected, setDetected] = useState<Record<string, readonly string[]>>({});
+  const requestedModels = useRef(new Set<string>());
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const next = props.bot.quotaFallbackChain ?? null;
+    setEnabled(next?.enabled === true);
+    setKinds(next?.kinds ?? ['usage', 'rate']);
+    setSteps(quotaFallbackChainDraft(next));
+  }, [props.bot.quotaFallbackChain]);
+
+  // A step launches the stock CLI, so its catalogue is probed without this bot's runtime.
+  useEffect(() => {
+    for (const { cliId } of steps) {
+      if (!cliId || requestedModels.current.has(cliId)) continue;
+      requestedModels.current.add(cliId);
+      void fetchDetectedModels(cliId).then(result => {
+        setDetected(current => ({ ...current, [cliId]: result?.models ?? [] }));
+      });
+    }
+  }, [steps]);
+
+  const cliOptions = useMemo<DropdownFieldOption<string>[]>(() => [
+    { value: '', label: tr('botDefaults.quotaFallbackChainStepCliPlaceholder') },
+    ...props.cliState.options
+      .filter(option => !option.gateway && !option.cliLaunchMode)
+      .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
+      .map(option => ({ value: option.id, label: `${option.label}（${option.id}）` })),
+  ], [props.cliState.options, tr]);
+
+  const startCliLabel = selectedCliOption(props.cliState.options, props.startCli)?.label ?? props.startCli;
+  const startAgent = props.bot.model ? `${startCliLabel} · ${props.bot.model}` : startCliLabel;
+
+  function modelOptions(cliId: string): string[] {
+    const option = selectedCliOption(props.cliState.options, cliId);
+    return mergeModelCandidates(option?.modelChoices ?? [], detected[cliId]);
+  }
+
+  function updateStep(index: number, patch: Partial<QuotaFallbackChainStepDraft>): void {
+    setSteps(current => current.map((step, i) => i === index ? { ...step, ...patch } : step));
+  }
+
+  function toggleKind(kind: QuotaFallbackKind, checked: boolean): void {
+    setKinds(current => checked
+      ? (current.includes(kind) ? current : [...current, kind])
+      : current.filter(item => item !== kind));
+  }
+
+  async function save(): Promise<void> {
+    if (enabled && (steps.length === 0 || steps.some(step => !step.cliId))) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackChainStepsRequired')}` });
+      return;
+    }
+    if (enabled && kinds.length === 0) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackKindsRequired')}` });
+      return;
+    }
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/quota-fallback-chain`,
+        {
+          enabled,
+          kinds,
+          steps: steps.map(step => ({ cliId: step.cliId, ...(step.model.trim() ? { model: step.model.trim() } : {}) })),
+        },
+      );
+      if (res.ok && res.body.ok) {
+        props.patchBot(props.bot.larkAppId, { quotaFallbackChain: res.body.quotaFallbackChain ?? null });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else if (res.body?.error === 'invalid_quota_fallback_chain') {
+        setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackChainInvalid', { reason: String(res.body?.reason ?? '') })}` });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section bd-quota-fallback-chain" data-quota-fallback-chain>
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.quotaFallbackChainHelp')}>{tr('botDefaults.quotaFallbackChainTitle')}</FieldTitle></h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-quota-fallback-chain"
+        title={tr('botDefaults.quotaFallbackChainEnabled')}
+        help={tr('botDefaults.quotaFallbackChainEnabledHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <FieldTitle help={tr('botDefaults.quotaFallbackChainStepsHelp')}>{tr('botDefaults.quotaFallbackChainSteps')}</FieldTitle>
+        <small className="bd-section-note">{tr('botDefaults.quotaFallbackChainStart', { agent: startAgent })}</small>
+        <div className="bd-quota-chain-list" data-input="quotaFallbackChainSteps">
+          <div className="bd-quota-chain-row bd-quota-chain-head" aria-hidden="true">
+            <span />
+            <span>{tr('botDefaults.quotaFallbackChainStepCli')}</span>
+            <span>{tr('botDefaults.quotaFallbackChainStepModel')}</span>
+            <span />
+          </div>
+          {steps.map((step, index) => (
+            <div className="bd-quota-chain-row" key={index} data-quota-fallback-chain-step={index}>
+              <span className="bd-quota-chain-index">{index + 1}</span>
+              <DropdownField<string>
+                dataInput={`quotaFallbackChainCli${index}`}
+                ariaLabel={`${index + 1}. ${tr('botDefaults.quotaFallbackChainStepCli')}`}
+                value={step.cliId}
+                disabled={busy || !enabled}
+                options={cliOptions}
+                searchable
+                onChange={cliId => updateStep(index, { cliId, model: '' })}
+              />
+              <ModelPickerField
+                key={step.cliId}
+                value={step.model}
+                onChange={model => updateStep(index, { model })}
+                options={modelOptions(step.cliId)}
+                disabled={busy || !enabled || !step.cliId}
+                dataInput={`quotaFallbackChainModel${index}`}
+                ariaLabel={`${index + 1}. ${tr('botDefaults.quotaFallbackChainStepModel')}`}
+                defaultLabel={tr('botDefaults.modelPickerDefault')}
+                customLabel={tr('botDefaults.modelPickerCustom')}
+                includeDefault
+                menuClassName="bd-field-menu"
+              />
+              <button
+                type="button"
+                data-action="remove-quota-fallback-chain-step"
+                disabled={busy || !enabled || steps.length === 1}
+                onClick={() => setSteps(current => current.filter((_, i) => i !== index))}
+              >
+                {tr('botDefaults.quotaFallbackChainRemove')}
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="actions">
+          <button
+            type="button"
+            data-action="add-quota-fallback-chain-step"
+            disabled={busy || !enabled}
+            onClick={() => setSteps(current => [...current, { cliId: '', model: '' }])}
+          >
+            {tr('botDefaults.quotaFallbackChainAdd')}
+          </button>
+        </div>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title">{tr('botDefaults.quotaFallbackKinds')}</h4>
+        <div className="bd-owner-reminder-states">
+          {(['usage', 'rate'] as const).map(kind => (
+            <label key={kind}>
+              <input type="checkbox" checked={kinds.includes(kind)} disabled={busy || !enabled} onChange={event => toggleKind(kind, event.currentTarget.checked)} />
+              <span>{tr(kind === 'usage' ? 'botDefaults.quotaFallbackKindUsage' : 'botDefaults.quotaFallbackKindRate')}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <small className="bd-section-note">{tr('botDefaults.quotaFallbackChainNote')}</small>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-quota-fallback-chain" disabled={busy} onClick={() => void save()}>{tr('botDefaults.quotaFallbackChainSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-quota-fallback-chain-status': '' }} />
       </div>
     </section>
   );
@@ -4868,6 +5063,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const credentialSource = policy?.credentialSource ?? 'auto';
   const delegateOnMention = policy?.delegateOnMention !== false;
   const allowSpeakerSwitch = policy?.allowSpeakerSwitch === true;
+  const gitCommitIdentity = policy?.gitCommitIdentity === true;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
@@ -4908,13 +5104,14 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
-  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean }) {
+  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean; gitCommitIdentity?: boolean }) {
     return {
       enabled: true,
       capabilities: next.capabilities ?? capabilities,
       credentialSource: next.credentialSource ?? credentialSource,
       delegateOnMention: next.delegateOnMention ?? delegateOnMention,
       allowSpeakerSwitch: next.allowSpeakerSwitch ?? allowSpeakerSwitch,
+      gitCommitIdentity: next.gitCommitIdentity ?? gitCommitIdentity,
       ...(policy?.legacyCapabilities && !next.capabilities ? { legacyCapabilities: true } : {}),
     };
   }
@@ -5004,6 +5201,14 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
           {info?.crossPrincipalIsolation === true ? (
             <p className="bd-section-note" data-action="trigger-user-auth-speaker-switch-xpi-note">{tr('botDefaults.triggerUserAuthAllowSpeakerSwitchXpi')}</p>
           ) : null}
+          <ToggleRow
+            checked={gitCommitIdentity}
+            disabled={busy}
+            dataAction="toggle-trigger-user-auth-git-commit-identity"
+            title={tr('botDefaults.triggerUserAuthGitCommitIdentity')}
+            help={tr('botDefaults.triggerUserAuthGitCommitIdentityHelp')}
+            onChange={checked => saveWith({ gitCommitIdentity: checked })}
+          />
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthCapabilityNote')}</p>
           {capabilities.includes('bytecloud') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
@@ -6387,6 +6592,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [showTiming, setShowTiming] = useState(bot.showReplyTiming === true);
   useEffect(() => { setFooterPrefs(normalizeReplyFooter(bot)); setShowTiming(bot.showReplyTiming === true); }, [bot.replyFooterEnabled, bot.replyFooterBrand, bot.replyFooterModel, bot.replyFooterUsage, bot.replyFooterRecipients, bot.replyFooterVoice, bot.showReplyTiming]);
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
+  const [showUsageQuota, setShowUsageQuota] = useState(bot.showUsageQuota !== false);
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
   const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
@@ -6408,6 +6614,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
 
   useEffect(() => {
     setUsageDisplay(bot.usageDisplay ?? 'streaming');
+    setShowUsageQuota(bot.showUsageQuota !== false);
     setDisableStreaming(bot.disableStreamingCard === true);
     setReplyMode(bot.replyCardMode ?? 'legacy');
     setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
@@ -6424,7 +6631,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.showUsageQuota, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard, bot.followUpReply]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6703,6 +6910,21 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             </div>
           )}
           <div className="bd-card-control-list">
+            {bot.usageSupported === true && (
+              <ToggleRow
+                checked={showUsageQuota}
+                disabled={busy !== null}
+                dataAction="toggle-show-usage-quota"
+                title={tr('botDefaults.showUsageQuota')}
+                description={tr('botDefaults.showUsageQuotaDescription')}
+                help={tr('botDefaults.showUsageQuotaHelp')}
+                onChange={checked => {
+                  const previous = showUsageQuota;
+                  setShowUsageQuota(checked);
+                  void savePatch({ showUsageQuota: checked }, 'showUsageQuota', () => setShowUsageQuota(previous));
+                }}
+              />
+            )}
             <ToggleRow
               checked={writableLink}
               disabled={busy !== null}
@@ -7731,30 +7953,77 @@ function SessionModeSection(props: {
   );
 }
 
-/** Per-bot participation switch. Advanced cost/profile fields round-trip unchanged. */
+const TASK_ROUTING_TIER_KEYS: Readonly<Record<TaskRoutingCostTier, string>> = {
+  low: 'botDefaults.taskRoutingTierLow',
+  medium: 'botDefaults.taskRoutingTierMedium',
+  high: 'botDefaults.taskRoutingTierHigh',
+};
+
+/** Per-bot task-routing opt-in switch + natural-language capability profile editor. */
 export function TaskRoutingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState<StatusMessage>(null);
+  const appId = props.bot.larkAppId;
   const current = props.bot.taskRouting ?? null;
   const ineligible = props.bot.apiOnly === true || props.bot.steward?.enabled === true;
 
-  async function save(enabled: boolean): Promise<void> {
+  const savedTier: TaskRoutingCostTier = current?.costTier ?? 'medium';
+  const savedStrengths = current?.strengths ?? '';
+  const savedLimitations = current?.limitations ?? '';
+
+  const [costTier, setCostTier] = useState<TaskRoutingCostTier>(savedTier);
+  const [strengths, setStrengths] = useState(savedStrengths);
+  const [limitations, setLimitations] = useState(savedLimitations);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [profileStatus, setProfileStatus] = useState<StatusMessage>(null);
+
+  useEffect(() => { setCostTier(savedTier); }, [appId, savedTier]);
+  useEffect(() => { setStrengths(savedStrengths); }, [appId, savedStrengths]);
+  useEffect(() => { setLimitations(savedLimitations); }, [appId, savedLimitations]);
+  useEffect(() => { setStatus(null); setProfileStatus(null); }, [appId]);
+
+  const profileDirty = costTier !== savedTier
+    || strengths.trim() !== savedStrengths.trim()
+    || limitations.trim() !== savedLimitations.trim();
+
+  async function saveEnabled(enabled: boolean): Promise<void> {
     await saveBotField({
-      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/task-routing`, {
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(appId)}/task-routing`, {
         taskRouting: { ...current, enabled },
       }),
       setStatus,
       setBusy,
       saved: tr('botDefaults.taskRoutingSaved'),
       onSaved: body => {
-        props.patchBot(props.bot.larkAppId, { taskRouting: body.taskRouting ?? null });
+        props.patchBot(appId, { taskRouting: body.taskRouting ?? null });
+      },
+    });
+  }
+
+  async function saveProfile(): Promise<void> {
+    const trimmedStrengths = strengths.trim();
+    const trimmedLimitations = limitations.trim();
+    const payload = {
+      enabled: current?.enabled === true,
+      costTier,
+      ...(trimmedStrengths ? { strengths: trimmedStrengths } : {}),
+      ...(trimmedLimitations ? { limitations: trimmedLimitations } : {}),
+    };
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(appId)}/task-routing`, {
+        taskRouting: payload,
+      }),
+      setStatus: setProfileStatus,
+      setBusy,
+      saved: tr('botDefaults.taskRoutingProfileSaved'),
+      onSaved: body => {
+        props.patchBot(appId, { taskRouting: body.taskRouting ?? null });
       },
     });
   }
 
   return (
-    <section className="bd-section" data-task-routing-section>
+    <section className="bd-section bd-tr-section" aria-busy={busy} data-task-routing-section>
       <h3 className="bd-section-title">{tr('botDefaults.sectionTaskRouting')}</h3>
       <ToggleRow
         checked={current?.enabled === true}
@@ -7763,9 +8032,83 @@ export function TaskRoutingSection(props: { bot: BotDefaultsRow; patchBot: Patch
         title={tr('botDefaults.taskRoutingEnabled')}
         help={tr('botDefaults.taskRoutingEnabledHelp')}
         description={ineligible ? tr('botDefaults.taskRoutingIneligible') : undefined}
-        onChange={checked => { void save(checked); }}
+        onChange={checked => { void saveEnabled(checked); }}
       />
       <div className="bd-mode-group-side"><StatusSpan status={status} attr={{ 'data-task-routing-status': '' }} /></div>
+
+      {!ineligible ? (
+        <div className="bd-tr-profile-fields">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.taskRoutingCostTierHelp')}>{tr('botDefaults.taskRoutingCostTier')}</FieldTitle>
+            <div className="bd-tr-tier-group" role="radiogroup" aria-label={tr('botDefaults.taskRoutingCostTier')}>
+              {TASK_ROUTING_COST_TIERS.map(tier => (
+                <button
+                  key={tier}
+                  type="button"
+                  role="radio"
+                  aria-checked={costTier === tier}
+                  data-tier={tier}
+                  className={`bd-tr-tier-btn${costTier === tier ? ' is-active' : ''}`}
+                  disabled={busy}
+                  onClick={() => setCostTier(tier)}
+                >
+                  {tr(TASK_ROUTING_TIER_KEYS[tier])}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="bd-field">
+            <div className="bd-tr-field-head">
+              <FieldTitle help={tr('botDefaults.taskRoutingStrengthsHelp')}>{tr('botDefaults.taskRoutingStrengths')}</FieldTitle>
+              <span className="bd-tr-counter">{Array.from(strengths).length}/{TASK_ROUTING_LIMITS.maxStrengthsChars}</span>
+            </div>
+            <textarea
+              className="bd-tr-textarea"
+              data-input="task-routing-strengths"
+              rows={3}
+              maxLength={TASK_ROUTING_LIMITS.maxStrengthsChars}
+              disabled={busy}
+              value={strengths}
+              placeholder={tr('botDefaults.taskRoutingStrengthsPlaceholder')}
+              onChange={event => setStrengths(event.currentTarget.value)}
+            />
+          </div>
+
+          <div className="bd-field">
+            <div className="bd-tr-field-head">
+              <FieldTitle help={tr('botDefaults.taskRoutingLimitationsHelp')}>{tr('botDefaults.taskRoutingLimitations')}</FieldTitle>
+              <span className="bd-tr-counter">{Array.from(limitations).length}/{TASK_ROUTING_LIMITS.maxLimitationsChars}</span>
+            </div>
+            <textarea
+              className="bd-tr-textarea"
+              data-input="task-routing-limitations"
+              rows={3}
+              maxLength={TASK_ROUTING_LIMITS.maxLimitationsChars}
+              disabled={busy}
+              value={limitations}
+              placeholder={tr('botDefaults.taskRoutingLimitationsPlaceholder')}
+              onChange={event => setLimitations(event.currentTarget.value)}
+            />
+          </div>
+
+          <div className="actions bd-tr-actions">
+            <button
+              type="button"
+              className="primary"
+              data-action="save-task-routing-profile"
+              disabled={busy || !profileDirty}
+              onClick={() => { void saveProfile(); }}
+            >
+              {tr('botDefaults.taskRoutingSaveProfile')}
+            </button>
+            <StatusSpan status={profileStatus} attr={{ 'data-task-routing-profile-status': '' }} />
+          </div>
+          {current?.enabled === true ? (
+            <a className="bd-steward-open" href="#/assign">{tr('botDefaults.taskRoutingOpenPage')} →</a>
+          ) : null}
+        </div>
+      ) : null}
     </section>
   );
 }

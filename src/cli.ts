@@ -7816,7 +7816,9 @@ async function readCardUsageSnapshotForSend(
         const observedModel = snapshot.tokens?.model?.trim();
         const expectedModel = observedModel || configuredRuntime.model || session.model;
         if (snap && isStatuslineModelCompatible(resolvedCliId, snap.model, expectedModel)) {
-          const quota = toCardQuota(snap);
+          const quota = toCardQuota(snap, {
+            includeRateLimits: larkAppId ? resolveShowUsageQuota(larkAppId) : true,
+          });
           if (quota) return { ...configuredRuntime, ...snapshot, quota };
         }
       }
@@ -9046,6 +9048,27 @@ async function detectConfinedCurrentSession(): Promise<CurrentSession | null> {
     ownerOpenId: location.ownerOpenId,
     ownerUnionId: location.ownerUnionId,
   };
+}
+
+/** The confined CLI's own session row, rebuilt from the daemon's proof for
+ *  the live turn. Only the session this process runs in qualifies, and the row
+ *  only routes the command: every request still authenticates to the daemon. */
+async function confinedSessionRow(sid: string): Promise<SessionData | undefined> {
+  if (sid !== process.env.BOTMUX_SESSION_ID) return undefined;
+  const current = await detectConfinedCurrentSession();
+  if (!current || current.sessionId !== sid || !current.larkAppId) return undefined;
+  return {
+    sessionId: current.sessionId,
+    status: 'active',
+    larkAppId: current.larkAppId,
+    chatId: current.chatId,
+    rootMessageId: current.rootMessageId,
+    chatType: current.chatType,
+    scope: current.scope,
+    workingDir: current.workingDir,
+    ownerOpenId: current.ownerOpenId,
+    ownerUnionId: current.ownerUnionId,
+  } as unknown as SessionData;
 }
 
 /**
@@ -10357,7 +10380,15 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
       return { sid, larkAppId: riff.session.larkAppId!, session: riff.session };
     }
   }
-  const s = await requireSessionById(sid);
+  const resolved = await resolveSessionById(sid, { dataDir: resolveDataDir() });
+  let s: SessionData | undefined = resolved.ok ? resolved.session as unknown as SessionData : undefined;
+  // Assistant mode withholds both the daemon secret and the session store
+  // from the confined CLI, so the lookup above cannot see its own session.
+  if (!resolved.ok && resolved.reason === 'not_found') s = await confinedSessionRow(sid);
+  if (!s) {
+    console.error(resolved.ok ? `未找到 session ${sid}` : resolved.message);
+    process.exit(1);
+  }
   if (!s.larkAppId) {
     console.error(`session ${sid} 缺少 larkAppId，无法获取消息`);
     process.exit(1);
@@ -10948,6 +10979,7 @@ import {
   resolveBrandLabel,
   resolveReplyStyleConfig,
   resolveUsageDisplay,
+  resolveShowUsageQuota,
   resolveReplyFooterPreferences,
 } from './bot-registry.js';
 import type { ReplyCardPresentation, ReplyCardRenderSnapshot } from './services/reply-card-render.js';
@@ -11666,6 +11698,7 @@ async function registerSelfFromCredFile(): Promise<void> {
   // setting); only an isolated sandbox falls back to the worker's snapshot.
   // The cred file outlives the sandboxed session that wrote it.
   const hideLocalAddresses = resolveHideLocalAddresses(appId);
+  const showUsageQuota = resolveShowUsageQuota(appId);
   registerBot({
     larkAppId: appId,
     larkAppSecret: cred.larkAppSecret ?? '',
@@ -11681,6 +11714,7 @@ async function registerSelfFromCredFile(): Promise<void> {
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    showUsageQuota: showUsageQuota ? undefined : false,
     hideLocalAddresses: hideLocalAddresses || undefined,
   } as import('./bot-registry.js').BotConfig);
 }
@@ -11770,6 +11804,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    showUsageQuota: process.env.BOTMUX_SHOW_USAGE_QUOTA === 'false' ? false : undefined,
     hideLocalAddresses: process.env.BOTMUX_HIDE_LOCAL_ADDRESSES === '1' || undefined,
   } as unknown as import('./bot-registry.js').BotConfig;
 
@@ -20226,8 +20261,9 @@ async function cmdUserPromptHook(): Promise<void> {
   // 也不能把目录改可写（会给沙箱里的模型伪造 sidecar 的能力）。
   // 不需要 inline 检测：daemon 按权威 turnId 取，上一轮的 stale sidecar 不会被返回。
   try {
-    const [{ fingerprintPromptText, prefixOf }] = await Promise.all([
+    const [{ fingerprintPromptText, prefixOf }, { claimPromptContextEnvelopeWithLiveOrigin }] = await Promise.all([
       import('./services/prompt-context-store.js'),
+      import('./services/prompt-context-claim-client.js'),
     ]);
     const larkAppId = process.env.BOTMUX_LARK_APP_ID;
     let discoveredPort: number | undefined;
@@ -20238,39 +20274,36 @@ async function cmdUserPromptHook(): Promise<void> {
     );
     if (!ipcPort) process.exit(0);
 
-    const body: Record<string, unknown> = {
-      fingerprint: fingerprintPromptText(prompt),
-      prefix: prefixOf(prompt),
-    };
     let hostSecret: string | undefined;
     if (!process.env.BOTMUX_SEND_RELAY) {
       try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
     }
-    if (!hostSecret) {
-      const claim = readManagedOriginCapability(
-        resolveDataDir(),
-        sessionId,
-        process.env.BOTMUX_SEND_RELAY,
-        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
-      );
-      if (claim) {
-        body.originCapability = claim.capability;
-        if (claim.turnId) body.originTurnId = claim.turnId;
-        if (claim.dispatchAttempt !== undefined) body.originDispatchAttempt = claim.dispatchAttempt;
-      }
-    }
-    const init = {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    } satisfies RequestInit;
+    const readOrigin = hostSecret ? undefined : () => readManagedOriginCapability(
+      resolveDataDir(),
+      sessionId,
+      process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+    ) ?? undefined;
+    // A queued turn may advance and rotate its capability during a 404 retry.
+    // Keep a live reader; each attempt constructs a fresh authenticated body.
+    const fingerprint = fingerprintPromptText(prompt);
+    const prefix = prefixOf(prompt);
     const path = `/api/sessions/${encodeURIComponent(sessionId)}/prompt-ctx/claim`;
-    const res = hostSecret
-      ? await fetchDaemonIpc(ipcPort, path, init, hostSecret)
-      : await loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
-    if (res.status !== 200) process.exit(0);
-    const data = await res.json() as { envelope?: unknown };
-    const envelope = typeof data?.envelope === 'string' ? data.envelope : undefined;
+    const envelope = await claimPromptContextEnvelopeWithLiveOrigin({
+      fingerprint,
+      prefix,
+      readOrigin,
+      request: body => {
+        const init = {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        } satisfies RequestInit;
+        return hostSecret
+          ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
+          : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+      },
+    });
     if (envelope) {
       const payload = JSON.stringify({
         hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: envelope },

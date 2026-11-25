@@ -178,7 +178,7 @@ import {
   type StreamingCardButtonId,
 } from '../im/lark/streaming-card-buttons.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
-import { claimPromptContext } from '../services/prompt-context-store.js';
+import { claimPromptContextAmongTurns } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
@@ -193,6 +193,8 @@ import {
   CURRENT_EXECUTION_IDENTITY_ROUTE,
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
 } from '../cli/current-execution.js';
+import { isBytedcliOverseasRegion } from '../platform/bytedcli-grant-regions.js';
+import { GRANT_WAIT_CAP_MS } from '../platform/credential-grant-budget.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
 import { configuredCliExecutionMode, sessionCliExecutionInfo } from './cli-execution-mode.js';
 import { getDashboardAdminOpenIds } from '../bot-registry.js';
@@ -275,6 +277,7 @@ import {
   normalizeQuotaFallbackBotConfig,
   type QuotaFallbackBotConfig,
 } from '../services/quota-fallback.js';
+import { normalizeQuotaFallbackChainConfig } from '../services/quota-fallback-chain.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode, repoPickerScanOptions } from '../global-config.js';
@@ -676,7 +679,7 @@ import { reasonTag, platformAuthorizeUrl } from './platform-credential-source.js
 import { askPlatformToAuthorize, type PlatformAuthorizationRequestResult } from './platform-authorization-request.js';
 import { hasReason, PLATFORM_WILL_NOT_ISSUE_REASONS } from './refusal-reasons.js';
 import { requestUnattendedAuthorization, noticeUnattendedLapse, clearUnattendedLapse, definitelyNotAuthorized, missingAuthorizationEntries, privateNoticeSender, unattendedTask, unattendedRefusalText, type UnattendedNoticeOutcome, type UnattendedProvider } from './capability-authorization.js';
-import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
+import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, retryMissingRegionalGrant, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -1754,6 +1757,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const blocked = (reason: string) => ({
     schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'current_execution_unverified', reason,
   });
+  const grantDeadline = Date.now() + GRANT_WAIT_CAP_MS;
   let body: unknown;
   try { body = await readBoundedJsonBody(req, 1024, 1000); }
   catch (error) {
@@ -1772,7 +1776,11 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const toolValue = typeof record?.tool === 'string' ? record.tool : '';
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
-  if (!sessionId || !tool || (record?.as !== undefined && typeof record.as !== 'string')) return jsonRes(res, 400, blocked('invalid_request'));
+  const region = record?.region;
+  if (!sessionId || !tool || (record?.as !== undefined && typeof record.as !== 'string')
+    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliOverseasRegion(region)))) {
+    return jsonRes(res, 400, blocked('invalid_request'));
+  }
   const requestedAs = record?.as as string | undefined;
   const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
@@ -1835,14 +1843,36 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     // The policy is passed as a READER, not a config: a Dashboard edit replaces
     // the whole bot config object, so anything captured here would be a stale
     // snapshot that cannot see a change made while the re-ask is in flight —
-    // exactly the window in which the answer gets written to disk.
+    // exactly the window in which the answer gets published.
     const liveAppId = ds.larkAppId;
+    const dataDir = config.session.dataDir;
+    const currentPolicy = () => getBot(liveAppId).config.triggerUserAuth;
+    const worker = ds.worker;
+    const originCapability = ds.managedTurnOrigin?.capability;
+    const callerOpenId = ds.managedTurnOrigin?.callerOpenId;
+    const executionStillCurrent = () => {
+      const origin = ds.managedTurnOrigin;
+      if (findActiveBySessionId(sessionId) !== ds || ds.worker !== worker || !worker
+        || worker.killed || worker.connected === false || ds.workerGeneration !== document.workerGeneration
+        || !origin || origin.turnId !== document.turnId
+        || (origin.identityTurnId ?? origin.turnId) !== identityTurnId
+        || origin.capability !== originCapability || origin.callerOpenId !== callerOpenId
+        || origin.dispatchAttempt !== document.dispatchAttempt) return false;
+      try {
+        if (identityModelRefusalReason(ds)) return false;
+        if (requestedAs === undefined) return true;
+        return governedSpeakers({ policy: currentPolicy(), tool, sessionDataDir: dataDir, sessionId, origin })
+          ?.some(speaker => speaker.openId === requestedAs && speaker.turnId === speakerTurnId) ?? false;
+      } catch {
+        return false;
+      }
+    };
     await retryTransientTurnIdentity({
       sessionDataDir: config.session.dataDir, sessionId, turnId: speakerTurnId,
       tool: tool === 'codebase' || tool === 'bitscli' ? 'bytedcli' : tool,
       // A bot that no longer exists is "no longer governed": policyStillWants
       // treats a throwing reader as a refusal to publish.
-      currentPolicy: () => getBot(liveAppId).config.triggerUserAuth,
+      currentPolicy,
     });
     let env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
     if (!env) {
@@ -1851,6 +1881,14 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       // publication instead of refusing as if nothing would ever come.
       await awaitTurnIdentityPublication(config.session.dataDir, sessionId);
       env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
+    }
+    if (env && region && !delegation) {
+      await retryMissingRegionalGrant({
+        sessionDataDir: dataDir, sessionId, turnId: speakerTurnId, region, speakerOpenId: choice.speaker?.openId,
+        currentPolicy, executionStillCurrent, waitMs: grantDeadline - Date.now(),
+      });
+      if (!executionStillCurrent()) return jsonRes(res, 403, blocked('lineage_unproven'));
+      env = recallProvenIdentityContent(dataDir, sessionId, speakerTurnId, tool);
     }
     if (env) {
       return jsonRes(res, 200, {
@@ -2864,10 +2902,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/turns/:triggerId/interrupt', async (_
  * Host-side atomic claim/pop for the UserPromptSubmit hook（#794 方向 B）。
  *
  * 沙箱内的 `botmux user-prompt-hook` 不能在 read-only 的 `prompt-ctx/<sid>` 里
- * unlink（HIGH-2），同正文多轮也不能靠 FIFO 猜（HIGH-1：某轮漏 claim 会串轮到
- * 后续轮）。hook 把 (session 凭据 + fingerprint) 提交到这里，宿主按
- * **managedTurnOrigin.turnId 权威 turn 绑定**精确取该轮的 envelope，先删再返回。
- * 漏 claim 只孤儿化自己那条，不污染后续轮；上一轮的 stale sidecar 永远不会被返回。
+ * unlink（HIGH-2），同正文多轮也不能靠 FIFO 猜（HIGH-1）。hook 提交
+ * (session 凭据 + fingerprint)，宿主在 managedTurnOrigin 与 worker 报告的
+ * type-ahead 候选集里做全局唯一匹配，先删再返回。任何歧义都不消费：
+ * 漏 claim 只孤儿化自己那条，不污染后续轮。
  *
  * 鉴权与 /close、/slash 同构：trusted-host HMAC，或本会话 rotating per-turn
  * capability（沙箱内读 host secret 失败时的回退）。任何未命中/失败 → 404/403，
@@ -2901,13 +2939,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/prompt-ctx/claim', async (req, res, p
       });
     } catch { /* IPC gone */ }
   }
-  // 权威 turnId：daemon 当前这轮的 turnId（worker 发布的 managed_turn_origin）。
-  // hook 不需要、也不应自己提供 turnId——daemon 只认自己的权威值，避免 FIFO 串轮。
+  // 当前轮与 worker 报告的排队轮组成一个候选集。hook 不提供 turnId，因此
+  // 只有全局唯一精确/前缀匹配才能领取；同正文多候选必须 fail-open，不能按队序猜。
   const turnId = ds?.managedTurnOrigin?.turnId;
   if (!turnId) return jsonRes(res, 404, { ok: false, error: 'no_active_turn' });
-  const envelope = claimPromptContext(params.sessionId, turnId, fingerprint, prefix);
-  if (!envelope) return jsonRes(res, 404, { ok: false, error: 'not_found' });
-  jsonRes(res, 200, { ok: true, envelope });
+  const claimed = claimPromptContextAmongTurns(params.sessionId,
+    [turnId, ...(ds?.typeAheadPromptTurnIds ?? [])], fingerprint, prefix);
+  if (!claimed) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  if (ds?.typeAheadPromptTurnIds?.includes(claimed.turnId)) {
+    ds.typeAheadPromptTurnIds = ds.typeAheadPromptTurnIds.filter(id => id !== claimed.turnId);
+  }
+  jsonRes(res, 200, { ok: true, envelope: claimed.envelope });
 });
 
 /** Return only the live bot's normalized native-subagent policy. The session
@@ -5064,6 +5106,7 @@ async function handleProviderAuthRequest(
     adoptBytedcliForTurn: person => adoptLocalBytedcliAuthorization({
       sessionDataDir: config.session.dataDir, sessionId, turnId: publishedTurnId,
       botConfig: cfg, senderOpenId: person,
+      currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
     }),
     deliver: authLinkDeliverer(ds, cfg, openId, provider as AuthProvider, published),
   });
@@ -11531,6 +11574,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     ...normalizeReplyFooter(cardPrefs),
     showReplyTiming: cardPrefs.showReplyTiming,
     usageDisplay: cardPrefs.usageDisplay,
+    showUsageQuota: cardPrefs.showUsageQuota,
     // Whether this bot's CLI can produce native usage at all. When false the
     // dashboard hides the usage-display control (offering it would be a knob
     // that is always empty — the CLI has no resolvable transcript).
@@ -11576,6 +11620,10 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
     quotaFallbackBot: (() => {
       try { return getBot(cachedLarkAppId).config.quotaFallbackBot ?? null; }
+      catch { return null; }
+    })(),
+    quotaFallbackChain: (() => {
+      try { return getBot(cachedLarkAppId).config.quotaFallbackChain ?? null; }
       catch { return null; }
     })(),
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
@@ -11707,6 +11755,42 @@ ipcRoute('PUT', '/api/bot-quota-fallback', requireBoundBot(async (req, res) => {
   }
 }, NOT_BOUND_BODY.okFalse));
 
+// Per-bot same-bot CLI/model chain. Validated against the bot's own CLI, which
+// is step 0 of the chain.
+ipcRoute('PUT', '/api/bot-quota-fallback-chain', requireBoundBot(async (req, res) => {
+  let body: Record<string, unknown>;
+  try {
+    const raw = await readJsonBody(req);
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_quota_fallback_chain' });
+    }
+    body = raw as Record<string, unknown>;
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const bot = getBot(cachedLarkAppId).config;
+  const normalized = body.enabled === true
+    ? normalizeQuotaFallbackChainConfig(body, {
+      cliId: bot.cliId, model: bot.model, backendType: bot.backendType, codexRpcInput: bot.codexRpcInput,
+    })
+    : {};
+  if (body.enabled === true && !normalized.config) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_quota_fallback_chain', reason: normalized.error });
+  }
+  const config = normalized.config ?? null;
+  try {
+    const result = await rmwBotEntry(cachedLarkAppId, entry => {
+      if (config) entry.quotaFallbackChain = config;
+      else delete entry.quotaFallbackChain;
+    });
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+    bot.quotaFallbackChain = config ?? undefined;
+    jsonRes(res, 200, { ok: true, quotaFallbackChain: config });
+  } catch (error: any) {
+    jsonRes(res, 500, { ok: false, error: 'quota_fallback_chain_save_failed', reason: ipcErrorText(error) });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
 // Per-bot card-behaviour toggles. Body may carry any subset of booleans; only
 // present keys are applied.
 ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
@@ -11722,6 +11806,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardShowTools?: unknown;
     replyCardNativeCot?: unknown;
     usageDisplay?: unknown;
+    showUsageQuota?: unknown;
     replyCardMode?: unknown;
     disableStreamingCard?: unknown; streamingCardFoldedLayout?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; followUpReply?: unknown; privateCard?: unknown; replyCardActions?: unknown; replyCardNextStep?: unknown; replyCardRecap?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
@@ -11744,6 +11829,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardShowTools?: boolean;
     replyCardNativeCot?: boolean;
     usageDisplay?: UsageDisplayMode;
+    showUsageQuota?: boolean;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
     disableStreamingCard?: boolean; streamingCardFoldedLayout?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; followUpReply?: boolean; privateCard?: boolean; replyCardActions?: boolean; replyCardNextStep?: boolean; replyCardRecap?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
@@ -11766,6 +11852,12 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     }
   }
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
+  if (body.showUsageQuota !== undefined) {
+    if (typeof body.showUsageQuota !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_show_usage_quota' });
+    }
+    patch.showUsageQuota = body.showUsageQuota;
+  }
   if (body.replyCardMode !== undefined) {
     if (body.replyCardMode !== 'legacy' && body.replyCardMode !== 'unified') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_reply_card_mode' });

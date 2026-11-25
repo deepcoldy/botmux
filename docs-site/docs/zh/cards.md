@@ -246,6 +246,8 @@ Claude Code 有些操作要在终端里弹确认框，比如内置安全检查�
 
 只影响展示，不影响用量统计。
 
+如果只想隐藏其中的 `5h` / `7d` 账号周期额度而保留上下文与 token 用量，可在 Dashboard「Bot 配置 → 消息卡片 → 卡片内容」关闭「显示账号额度（5h / 7d）」，或执行 `/botconfig set showUsageQuota off`（`bots.json` 键 `showUsageQuota: false`，即时生效）。
+
 ### 显示耗时
 
 默认关闭。在 Dashboard「Bot 配置 → 消息卡片 → 任务卡片 → 等待与执行耗时」打开，或发 `/botconfig set showReplyTiming on`（`bots.json` 键 `showReplyTiming`）。打开后，最终回复页脚会显示「等待 3.2 秒 · 执行耗时 23.4 秒」，从新收到的消息开始计。

@@ -51,6 +51,12 @@ import {
   resolveAntigravitySpawnStoreOptions,
 } from '../../src/services/antigravity-accounts.js';
 import { drainAntigravityTranscript } from '../../src/services/antigravity-transcript.js';
+import {
+  normalizeBackgroundTranscriptPath,
+  normalizeBackgroundTranscriptSegments,
+  readBackgroundTranscriptChain,
+  writeBackgroundTranscriptChain,
+} from '../../src/services/background-transcript-chain.js';
 
 /** Failed-turn rewind wiring that emitTurnTerminal, flushPending and
  *  handleTermAction call into (see src/worker.ts startFailedTurnRewind):
@@ -75,6 +81,7 @@ const TRAEX_QUESTION_FUNCTIONS = [
 /** Inert stand-in for the worker's TraexQuestionBridge instance (a const, not
  *  a function); a caller that observes it passes its own in `scope`. */
 const INERT_TRAEX_QUESTION_BRIDGE = { kick() {}, reset() {}, hasOpenCard: () => false, dispose() {} };
+const INERT_BACKGROUND_TASK_TRACKER = { backgroundWait: () => 0 };
 /** The worker's away-summary focus controller, doing nothing unless a test supplies its own. */
 const INERT_AWAY_SUMMARY_FOCUS = { request() {}, noteSuggestion() {}, beforeDaemonMessage() {}, noteRecap() {}, noteCliTurnStarted() {}, restore() {}, reset() {}, isBlurred: false, isActive: false };
 
@@ -150,6 +157,8 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   }
   if (key === 'cliRestartEpoch') return (scope.cliRestartEpoch ??= 0);
   if (key === 'deferredSessionReady') return (scope.deferredSessionReady ??= []);
+  if (key === 'pendingAbsorbedReplyDeliveries') return (scope.pendingAbsorbedReplyDeliveries ??= new Map());
+  if (key === 'deferredAbsorbedReplyFinals') return (scope.deferredAbsorbedReplyFinals ??= new Map());
   return undefined;
 }
 
@@ -180,6 +189,11 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
       return dependencies.get(key);
     }
     if (key === 'randomUUID') return randomUUID;
+    if (key === 'join') return join;
+    if (key === 'readBackgroundTranscriptChain') return readBackgroundTranscriptChain;
+    if (key === 'writeBackgroundTranscriptChain') return writeBackgroundTranscriptChain;
+    if (key === 'normalizeBackgroundTranscriptPath') return normalizeBackgroundTranscriptPath;
+    if (key === 'normalizeBackgroundTranscriptSegments') return normalizeBackgroundTranscriptSegments;
     if (key === 'clearStatuslineSnapshot') return clearStatuslineSnapshot;
     if (key === 'confirmedTerminalEffortChoice') return () => undefined;
     if (key === 'noteTerminalEffortInput') return () => {};
@@ -243,8 +257,9 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'drainAntigravityTranscript') return drainAntigravityTranscript;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
     if (key === 'awaySummaryFocus') return INERT_AWAY_SUMMARY_FOCUS;
+    if (key === 'backgroundTaskTracker') return INERT_BACKGROUND_TASK_TRACKER;
     if (key === 'awaySummaryFocusRefusal') return awaySummaryFocusRefusal;
-    if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'deferSessionReadyUntilRuntimeAssigned', 'takeDeferredSessionReady', 'replayDeferredSessionReady', 'clearDeferredSessionReady', 'setCaptureIdentity', 'cotEntryWellFormed', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
+    if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'backgroundTranscriptChainFilePath', 'persistBackgroundTranscriptChain', 'latestClosedTranscriptOffset', 'prepareBackgroundTranscriptReplay', 'recordBackgroundTranscriptRotation', 'spawnCliBody', 'deferSessionReadyUntilRuntimeAssigned', 'takeDeferredSessionReady', 'replayDeferredSessionReady', 'clearDeferredSessionReady', 'setCaptureIdentity', 'cotEntryWellFormed', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }

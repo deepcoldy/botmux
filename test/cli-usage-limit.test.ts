@@ -6,6 +6,8 @@ import {
   HARD_RATE_LIMIT_COOLDOWN_MS,
   usageLimitStateKey,
   structuredRateLimitState,
+  isTransientRateLimit,
+  structuredCodexLimitState,
   isStructuredRateLimitAuthoritative,
 } from '../src/utils/cli-usage-limit.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
@@ -405,5 +407,17 @@ describe('detectScreenUsageLimit — runtime-status gate (误报根治)', () => 
 
   it('omitting outputActive keeps the conservative suppress-on-working default', () => {
     expect(detectScreenUsageLimit(business429Screen, 'working', now).limited).toBe(false);
+  });
+});
+
+describe('isTransientRateLimit', () => {
+  const now = new Date('2026-11-24T10:00:00');
+  it('marks a rate limit without a provider reset time as transient', () => {
+    expect(isTransientRateLimit(structuredRateLimitState('', now))).toBe(true);
+    expect(isTransientRateLimit(structuredCodexLimitState('429 Too Many Requests', 'rate', now))).toBe(true);
+  });
+  it('treats a stated reset time or a usage quota as exhausted', () => {
+    expect(isTransientRateLimit(structuredRateLimitState("You've hit your session limit · resets 10:40pm", now))).toBe(false);
+    expect(isTransientRateLimit(structuredCodexLimitState('', 'usage', now))).toBe(false);
   });
 });

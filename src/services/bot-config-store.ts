@@ -60,6 +60,7 @@ import {
   notifyPinStreamingCardChanged,
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
+import { notifyFollowUpReplyChanged } from './follow-up-reply-change.js';
 import {
   cliModelMayKeepReasoningEffort,
   cliModelSupportsReasoningEffort,
@@ -151,6 +152,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'replyFooterRecipients', configKey: 'replyFooterRecipients', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '回复页脚收件人及其 @ 通知 on|off（默认 on）；总开关关闭时保留各信息块配置' },
   { key: 'replyFooterVoice', configKey: 'replyFooterVoice', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '回复页脚语音总结按钮 on|off（默认 on）；总开关关闭时保留各信息块配置' },
   { key: 'usageDisplay', configKey: 'usageDisplay', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['streaming', 'footer', 'off'], hint: '用量显示位置:streaming=流式卡正文(默认)｜footer=回复卡页脚｜off=不显示' },
+  { key: 'showUsageQuota', configKey: 'showUsageQuota', kind: 'boolean', effect: 'immediate', clearable: true, defaultOn: true, hint: '卡片用量行是否显示 5h / 7d 账号额度 on|off（默认 on）；仅影响卡片展示，关闭后保留上下文占用与 token 统计，不影响后台额度检测' },
   { key: 'showReplyTiming', configKey: 'showReplyTiming', kind: 'boolean', effect: 'immediate', clearable: false, hint: '最终回复页脚分别显示等待和执行耗时 on|off（默认 off）；普通发送显示执行至回复，结束后显示最终耗时；等待含排队/准备，缺失计时则不显示' },
   { key: 'autoStartPrompt', configKey: 'autoStartOnGroupJoinPrompt', kind: 'string', effect: 'immediate', clearable: true, hint: '被拉进新群主动开工的首轮 prompt（配合 autoStartOnGroupJoin）' },
   { key: 'allowedUsers', configKey: 'allowedUsers', kind: 'allowedUsers', effect: 'immediate', clearable: false, hint: '管理员名单（邮箱/on_/ou_，逗号或空格分隔）；改后需加 确认' },
@@ -227,7 +229,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
   { key: 'credentialsSourceDir', configKey: 'credentialsSourceDir', kind: 'dir', effect: 'next-session', clearable: true, hint: 'CLI 凭证来源目录（如 ~/accounts/acct-b，内按 CLI 分子目录：claude/.credentials.json）：bot 每次冷启动从这里复制凭证，而不是用本机共享登录；来源不可用即拒绝启动、绝不回退共享登录；目前仅支持 claude-code；未开沙箱的 bot 会因此改用 per-bot 数据目录（旧会话转写/记忆不迁移，全局 settings 只继承 env，CLAUDE.md/skills/plugins 等不带过去），无法重定向数据目录（wrapperCli / adapter 不支持 / 缺 SESSION_DATA_DIR）则拒绝启动；token 刷新由外部负责；unset 回共享登录' },
   { key: 'codexInstancePool', configKey: 'codexInstancePool', kind: 'json', effect: 'next-session', clearable: true, hint: '会话级 Codex 实例：显式 defaultInstanceId 与 instances[{id,codexHome,weight}]，weight默认1；scope=ordinary-feishu，strategy=random。仅新会话分配，已有会话保持绑定。使用 botmux codex-instances check 检查本机目录。' },
-  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后，勾选的能力用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"capabilities":["lark-user","bytecloud","meego"]}：lark-user=飞书用户身份（lark-cli --as user），bytecloud=ByteCloud（bytedcli、codebase、git push、bitscli / bits-cli，同一个开关），meego=Meego（仅 bytedcli meego，独立的 meegle 命令不受管）；bytecloud / meego 未列出时对应命令保持原生，直接用本机登录态；非法取值会被拒绝保存。省略 capabilities 时按 tools 推导（lark-cli→lark-user，bytedcli→bytecloud+meego；tools 也省略=全部）。未授权时命令一律拒绝（拒绝消息里会附授权入口，授权一次后重试即可），不会用 bot 或任何人的身份代跑；旧配置里的 fallback 字段会被忽略。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 delegateOnMention（默认 true）：本 bot 在真人直接发起的一轮里用 botmux send --mention 交接给同机 bot 时，对方以这位发起人的身份调用工具；设为 false 关闭。可选 allowSpeakerSwitch（默认 false）：设为 true 后，多人话题里可在某一条命令前加 BOTMUX_AS=<open_id> 让这一条命令用本轮另一位发言人的账号。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
+  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后，勾选的能力用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"capabilities":["lark-user","bytecloud","meego"]}：lark-user=飞书用户身份（lark-cli --as user），bytecloud=ByteCloud（bytedcli、codebase、git push、bitscli / bits-cli，同一个开关），meego=Meego（仅 bytedcli meego，独立的 meegle 命令不受管）；bytecloud / meego 未列出时对应命令保持原生，直接用本机登录态；非法取值会被拒绝保存。省略 capabilities 时按 tools 推导（lark-cli→lark-user，bytedcli→bytecloud+meego；tools 也省略=全部）。未授权时命令一律拒绝（拒绝消息里会附授权入口，授权一次后重试即可），不会用 bot 或任何人的身份代跑；旧配置里的 fallback 字段会被忽略。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 delegateOnMention（默认 true）：本 bot 在真人直接发起的一轮里用 botmux send --mention 交接给同机 bot 时，对方以这位发起人的身份调用工具；设为 false 关闭。可选 allowSpeakerSwitch（默认 false）：设为 true 后，多人话题里可在某一条命令前加 BOTMUX_AS=<open_id> 让这一条命令用本轮另一位发言人的账号。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。可选 gitCommitIdentity（默认 false，仅 Linux 生效）：设为 true 后，会话 PATH 中的 git 包装器在 commit、commit-tree、merge、cherry-pick、revert、rebase、am、pull 时按本轮已核验触发人的邮箱署名，核验失败以退出码 77 拒绝（含快进 pull）；重放提交保留原作者，显式 -c/--author 身份仍生效，环境里的 GIT_AUTHOR_*/GIT_COMMITTER_* 身份变量会被清理，绝对路径 git 与别名不在覆盖范围；受管命令不支持 BOTMUX_AS，oncall 禁网或 slirp 隔离 loopback 的组合会在会话启动时拒绝。下个会话生效；unset 清除（关闭）' },
   { key: 'larkUserOwnerFallback', configKey: 'larkUserOwnerFallback', kind: 'boolean', defaultOn: true, effect: 'immediate', clearable: true, hint: '没有发起人时用主人的飞书身份 on|off（默认 on）：脚本、Webhook、平台、没有创建人的定时任务等没有真人发起的回合（以及签名派发里发起人是主人的 bot 消息）里，lark-cli --as user 使用 bot 主人对本应用的授权（主人没授权时私聊主人授权链接）；有真人发起的回合仍只用发起人自己的授权，不借主人的。off = 这类回合的 --as user 直接拒绝（原来的严格行为）。按触发人鉴权开启且勾了「飞书用户身份」时不生效。即时生效' },
   { key: 'larkToolBinding', configKey: 'larkToolBinding', kind: 'boolean', defaultOn: true, effect: 'next-session', clearable: true, hint: 'lark-cli 绑定当前机器人应用身份 on|off（默认 on）：会话内 lark-cli 默认使用当前 bot 凭证并允许 --profile 切换宿主 profile；设为 off 则完全不注入当前 bot 凭据；需 /restart 重启或新建会话生效' },
   { key: 'autoAvoidApproval', configKey: 'autoAvoidApproval', kind: 'boolean', defaultOn: true, effect: 'immediate', clearable: true, hint: '飞书开放平台卡审批自动避开 on|off（默认 on）：仅在提交版本前审批预判会命中企业管理员人工审批时介入，草稿态自动二分跳过需审权限并提示手动申请链接；免审账号零改动；off 则直接按原清单提交审批' },
@@ -829,6 +831,9 @@ async function applyConfigFieldInternal(
       notifyPinStreamingCardChanged(larkAppId, nextPinStreamingCard);
     }
   }
+  // /config, /botconfig and the config-card boolean toggles all land here.
+  // Keep workers on the same live value as the daemon's absorbed_reply gate.
+  if (spec.configKey === 'followUpReply') notifyFollowUpReplyChanged(larkAppId, bot.config.followUpReply === true);
   logger.info(`[config:${larkAppId}] set ${spec.key}: ${oldText} -> ${newText}`);
   return { ok: true, oldText, newText, effect: spec.effect };
 }

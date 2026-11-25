@@ -8,7 +8,7 @@ export function inheritSessionLaunchConfiguration(source: Session, target: Sessi
   const fields = [
     'cliId', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride', 'cliConfigDir',
     'wrapperCli', 'cliLaunchMode', 'agentFrozen', 'cliLaunchSnapshot', 'backendType',
-    'codexProfile', 'codexProfileHome', 'model', 'modelBackendVariant', 'reasoningEffort', 'serviceTier',
+    'codexProfile', 'codexProfileHome', 'model', 'modelBackendVariant', 'reasoningEffort', 'serviceTier', 'quotaFallback',
     'sandbox', 'sandboxPaths', 'sandboxScratch', 'sandboxHidePaths',
     'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy', 'sandboxWithholdBotSecret', 'protectedResults', 'autoWorktreeFallbackDir',
     // 个人助理模式的归属是启动决定的一部分（cwd / CLI 数据目录 / 沙盒子树都跟着它）。

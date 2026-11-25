@@ -519,4 +519,11 @@ describe('toCardQuota', () => {
     expect(toCardQuota({ ts: NOW })).toBeUndefined();
     expect(toCardQuota({ ts: NOW, model: 'x' })).toBeUndefined();
   });
+  it('omits 5h / 7d rate limits when includeRateLimits is false while keeping context metrics', () => {
+    expect(toCardQuota(parseStatuslinePayload(SAMPLE, NOW)!, { includeRateLimits: false })).toEqual({
+      contextPercent: 23,
+      contextWindowTokens: 1_000_000,
+    });
+    expect(toCardQuota({ ts: NOW, fiveHourPercent: 21, sevenDayPercent: 7 }, { includeRateLimits: false })).toBeUndefined();
+  });
 });

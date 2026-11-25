@@ -248,6 +248,7 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
     writeFileSync(join(root, 'test', 'startup.test.ts'), `
       import { expect, it } from 'bun:test';
       import { spawn } from 'node:child_process';
+      import { readFileSync } from 'node:fs';
       import { join } from 'node:path';
       import { applyTmuxFenceEnv, createTmuxFence } from ${JSON.stringify(fenceHelper)};
       it('exits while the real client is still starting the server', () => {
@@ -257,6 +258,16 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
         const client = spawn(tmux, ['-S', ${JSON.stringify(socket)}, 'new-session', '-d', '-s', 'late', 'sleep 60'], { stdio: 'ignore', detached: true });
         client.unref();
         expect(client.pid).toBeGreaterThan(1);
+        // Wait only until the shim has recorded its synchronous pending intent
+        // (right before exec'ing the delayed wrapper's sleep). Otherwise a busy
+        // CI host can let bun exit before the detached shell even starts.
+        const serverLog = process.env.BOTMUX_TMUX_SERVER_LOG!;
+        const marker = \`pending\\t\${${JSON.stringify(socket)}}\\t\${client.pid}\`;
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline && !readFileSync(serverLog, 'utf8').includes(marker)) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        }
+        expect(readFileSync(serverLog, 'utf8')).toContain(marker);
         // The delayed real tmux has not created the server yet, and this test
         // deliberately has no afterAll. The outer runner must settle the start.
       });
@@ -306,6 +317,7 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
     writeFileSync(join(root, 'test', 'restart.test.ts'), `
       import { expect, it } from 'bun:test';
       import { spawn, spawnSync } from 'node:child_process';
+      import { readFileSync } from 'node:fs';
       import { join } from 'node:path';
       import { applyTmuxFenceEnv, createTmuxFence } from ${JSON.stringify(fenceHelper)};
       import { registerTmuxServer } from ${JSON.stringify(reaperHelper)};
@@ -324,6 +336,13 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
         const client = spawn(tmux, ['-S', socket, 'new-session', '-d', '-s', 'new', 'sleep 60'], { stdio: 'ignore', detached: true });
         client.unref();
         expect(client.pid).toBeGreaterThan(1);
+        const serverLog = process.env.BOTMUX_TMUX_SERVER_LOG!;
+        const marker = \`pending\\t\${socket}\\t\${client.pid}\`;
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline && !readFileSync(serverLog, 'utf8').includes(marker)) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        }
+        expect(readFileSync(serverLog, 'utf8')).toContain(marker);
         // Deliberately no teardownTmuxFence: both outer-runner sweeps must settle it.
       });
     `);
