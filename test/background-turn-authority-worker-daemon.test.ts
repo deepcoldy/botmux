@@ -1924,10 +1924,193 @@ describe('Issue #3636 Class A — End-to-End Worker + Daemon + IPC (botmux send 
     const realFlushPending = loadWorkerFunction<() => Promise<void>>('flushPending', h.env);
     await realFlushPending();
 
-    // Must NOT have called beginCliWriteCycle or cleared isPromptReady=false!
+    // Must NOT have called beginCliWriteCycle or cleared isPromptReady=false during HELD_WAITING_BG!
     expect(h.env.beginCliWriteCycle).not.toHaveBeenCalled();
     expect(h.env.isPromptReady).toBe(true);
     expect(h.env.pendingMessages).toHaveLength(1);
+
+    // Contrast (P1-2): when a LIVE FOREGROUND turn (isIdleWaiting() === false) blocks a
+    // queueAfterActiveTurn input, flushPending MUST clear isPromptReady=false via beginCliWriteCycle
+    // so the live turn's own turn_idle edge is never dropped as `already-ready`!
+    h.hold.onForegroundTurnStarted({ turnId: 'om_turn_live', caller: USER_A });
+    h.authority.clear();
+    h.authority.reserve({ turnId: 'om_turn_live', caller: USER_A });
+    h.authority.markStarted({ turnId: 'om_turn_live', caller: USER_A });
+    expect(h.hold.isIdleWaiting()).toBe(false);
+    h.env.isPromptReady = true;
+    h.env.CodexAppFlushPromptReplay = CodexAppFlushPromptReplay;
+    h.env.codexRpcEngine = null;
+    h.env.publishedCliInputBacklog = undefined;
+    h.env.bareShellChecked = true;
+    h.env.hasRunStartupCommands = true;
+    h.env.firstWriteMayProceed = () => true;
+    h.env.runStartupCommands = vi.fn(async () => {});
+    h.env.detectBareShellLaunch = () => false;
+    h.env.traexAutoModelRuntimeEligible = () => false;
+    h.env.traexQuestionBridgeActive = () => false;
+    await realFlushPending();
+    expect(h.env.beginCliWriteCycle).toHaveBeenCalledTimes(1);
+    expect(h.env.isPromptReady).toBe(false);
+    expect(h.env.pendingMessages).toHaveLength(1);
+  });
+
+  it('P2 boundary: User B arriving during WAKE_ACTIVE stays fenced off CLI, then after wake closes User A cap returns 403 and User B runs strictly as User B', async () => {
+    const h = await createEndToEndHarness({ crossPrincipalIsolation: false });
+    const t0 = Date.now() - 60_000;
+    h.hold.reset(t0);
+    h.tracker.reset(t0);
+
+    const execA = await h.startManagedTurn('om_turn_a', USER_A);
+    const capA = h.ds.managedTurnOrigin.capability;
+    h.scope.run(h.runtimeBinding, () => {
+      h.env.observeClaudeBackgroundTasks([
+        { type: 'user', uuid: 'u1', timestamp: evIso(t0 + 100), toolUseResult: { backgroundTaskId: 'bg_wake_p2' }, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'bg' }] } },
+        { type: 'system', subtype: 'turn_duration', uuid: 'd1', timestamp: evIso(t0 + 200) },
+      ]);
+      h.env.emitTurnTerminal('om_turn_a', 'completed');
+      h.env.observeClaudeBackgroundTasks([
+        {
+          type: 'user', uuid: 'uw', timestamp: evIso(t0 + 500), isSidechain: false,
+          promptSource: 'system', turnOrigin: 'task_notification',
+          message: { role: 'user', content: '<task-notification>\n<task-id>bg_wake_p2</task-id>\n<status>completed</status>\n</task-notification>' },
+        },
+      ]);
+    }, execA);
+    await h.drainIpc();
+    expect(h.hold.isWakeActive()).toBe(true);
+
+    // Wire real flushPending to verify User B cannot cross the CLI write fence while WAKE_ACTIVE
+    const writtenTexts: string[] = [];
+    h.env.backend = { write: vi.fn(), writeInput: vi.fn(async () => true), isAlive: () => true };
+    h.env.effectiveBackendType = 'tmux';
+    h.env.cliRestartInProgress = false;
+    h.env.tuiPromptBlocking = false;
+    h.env.readyGate = { shouldHold: () => false };
+    h.env.isSettlingFirstFlush = false;
+    h.env.awaitingPostSessionStartPromptEvidence = false;
+    h.env.bridgeJsonlPath = null;
+    h.env.codexBridgeFallbackActive = () => false;
+    h.env.runtimePtyInputPolicy = () => ({ supportsTypeAhead: true, allowBackToBackWrites: true });
+    h.env.promotePendingHumanInterruption = vi.fn();
+    h.env.pendingInputAllowsTypeAhead = () => true;
+    h.env.directRpcTurnBlocksTypeAhead = () => false;
+    h.env.programStatusBlockedHoldsTypeAhead = () => false;
+    h.env.traexQuestionHoldsHeldInput = () => false;
+    h.env.nativeSessionForkPending = () => false;
+    h.env.currentInputDeliveryQuarantine = () => false;
+    h.env.currentPostTerminalInputFence = () => false;
+    h.env.shouldDeferUserFlush = () => false;
+    h.env.traexAutoModelInputHold = () => false;
+    h.env.sessionRenameBlocksInput = () => false;
+    h.env.codexModelMigrationCheckNeeded = () => false;
+    h.env.codexModelMigrationBlocking = false;
+    h.env.traexAutoModelSwitching = false;
+    h.env.codexAutoUpgrade = null;
+    h.env.initialInputOwnershipPending = false;
+    h.env.shouldHoldCodexRunnerInput = () => false;
+    h.env.codexRunnerFreshness = {};
+    h.env.isCodexAppCliId = () => false;
+    h.env.putBackStoppedRewindCutBeforeWrites = () => false;
+    h.env.ambiguousSubmissionRecoveryHold = null;
+    h.env.hasPendingInputForFlush = () => h.env.pendingMessages.length > 0;
+    h.env.resetTraexAutoModelBeforePendingTurn = () => false;
+    h.env.sessionRenameInFlight = () => false;
+    h.env.injectionFlushing = false;
+    h.env.traexNativeStartupInputIsPending = () => false;
+    h.env.webTerminalInputWireDirty = () => false;
+    h.env.bareShellLaunchBlocked = false;
+    h.env.hookReviewHoldsQueuedWrite = () => false;
+    h.env.pendingInputMayFlush = () => true;
+    h.env.rpcLifecycleFailClosedOwners = new Set();
+    h.env.probeStartupBlocker = () => false;
+    h.env.commandLineWritesPending = 0;
+    h.env.pendingInjections = [];
+    h.env.CodexAppFlushPromptReplay = CodexAppFlushPromptReplay;
+    h.env.codexRpcEngine = null;
+    h.env.publishedCliInputBacklog = undefined;
+    h.env.usageLimitTracker = { beginTurn: vi.fn(() => 1), currentTurn: () => 1 };
+    h.env.detectBareShellLaunch = () => false;
+    h.env.bareShellChecked = true;
+    h.env.hasRunStartupCommands = true;
+    h.env.runStartupCommands = vi.fn(async () => {});
+    h.env.firstWriteMayProceed = () => true;
+    h.env.traexQuestionBridgeActive = () => false;
+    h.env.settleVerifiableSubmissionForJournal = vi.fn();
+    h.env.freshnessInputQueue = { takeNormal: () => h.env.pendingMessages.shift() };
+    h.env.inlineParkedTraexSkillCatalog = vi.fn();
+    h.env.attachDeferredPluginSkillCatalog = vi.fn();
+    h.env.applyMojoLivePatch = vi.fn();
+    h.env.SubmissionWriteError = class extends Error {};
+    h.env.adapterInputHandle = (be: unknown) => be;
+    h.env.t = (k: string) => k;
+    h.env.cliAdapter = {
+      id: 'claude-code',
+      claudeDataDir: join(h.root, '.claude'),
+      writeInput: vi.fn(async (_be: unknown, text: string) => {
+        writtenTexts.push(text);
+        return true;
+      }),
+    };
+    h.env.runAmbiguousSubmissionTransaction = async (_be: unknown, fn: () => Promise<any>, _settle: unknown, beforeWrite: () => void) => {
+      beforeWrite();
+      const result = await fn();
+      return { result, recoveryFailureReason: undefined };
+    };
+    h.env.syncQueuedTurnsFromMarkerDisk = () => false;
+    h.env.readSendMarkers = () => [];
+    h.env.traexAutoModelRuntimeEligible = () => false;
+    h.env.rememberSubmittedTurnText = () => undefined;
+    h.env.noteCliInputWritten = vi.fn();
+    h.env.beginCliWriteCycle = vi.fn();
+    h.env.markTurnExecutionStart = vi.fn();
+    h.env.stampMojoTurnMark = vi.fn();
+    h.env.sendCliInputBacklog = vi.fn();
+    h.env.cliSubmissionInFlight = null;
+    h.env.firstAdmissionDone = true;
+    h.env.openingInputBoxSettled = true;
+    h.env.isClaudeCode = () => true;
+    h.env.recordCliSubmissionInFlight = vi.fn();
+    h.env.structuredTurnsWithSubmitNotice = new Set();
+    h.env.armInputDeliveryQuarantine = vi.fn();
+    h.env.noteOrdinaryImCommitted = vi.fn();
+    h.env.scheduleSubmitFailureNotify = vi.fn();
+    h.env.isPromptReady = false;
+
+    const realFlushPending = loadWorkerFunction<() => Promise<void>>('flushPending', h.env);
+
+    // User B arrives while WAKE_ACTIVE: queued in pendingMessages, NEVER written to CLI!
+    await h.handleMessage({ type: 'message', turnId: 'om_turn_b', content: 'USER B DURING WAKE', trustedCaller: USER_B });
+    await realFlushPending();
+    expect(writtenTexts).toEqual([]);
+    expect(h.hold.isWakeActive()).toBe(true);
+
+    // User A's wake micro-turn finishes -> User A's origin & capA immediately revoked (403)!
+    h.scope.run(h.runtimeBinding, () => {
+      h.env.observeClaudeBackgroundTasks([
+        { type: 'system', subtype: 'turn_duration', uuid: 'dw-end', timestamp: evIso(t0 + 900) },
+      ]);
+    }, execA);
+    await h.drainIpc();
+    expect(h.hold.phase()).toBe('IDLE');
+    expect((await h.callBotmuxSendAttest(capA)).status).toBe(403);
+    expect((await h.callLarkAsUser()).status).toBe(403);
+
+    // Now flush User B -> executes strictly as User B, zero User A inheritance!
+    const execB = h.controller.admitInput('om_turn_b');
+    h.scope.noteAdmission({ ref: execB, phase: 'queued' });
+    await h.scope.run(h.runtimeBinding, async () => {
+      await realFlushPending();
+    }, execB);
+    await h.drainIpc();
+
+    expect(writtenTexts).toEqual(['USER B DURING WAKE']);
+    expect(h.authority.snapshot()?.turnId).toBe('om_turn_b');
+    expect(h.authority.snapshot()?.caller?.requestUserOpenId).toBe(USER_B.requestUserOpenId);
+    expect(h.authority.snapshot()?.identityTurnId).toBeUndefined();
+    expect(h.authority.speakers().map(s => s.openId)).toEqual([USER_B.requestUserOpenId]);
+    const larkB = await h.callLarkAsUser();
+    expect(larkB.status).toBe(200);
+    expect(await larkB.json()).toMatchObject({ ok: true, credential: `token-for-${USER_B.requestUserOpenId}` });
   });
 });
 

@@ -23854,7 +23854,7 @@ function setupWorkerHandlers(
             };
           } else {
             ds.activeInteractiveTurn = undefined;
-            cb.onManagedTurnOriginRevoked?.(ds, msg.turnId);
+            if (typeof cb !== 'undefined') cb?.onManagedTurnOriginRevoked?.(ds, msg.turnId);
           }
         }
         discardTriggerStreamingCard(ds, msg.turnId);
@@ -29157,7 +29157,7 @@ function setupWorkerHandlers(
           if (msg.turnId && ds.activeInteractiveTurn?.turnId === msg.turnId) {
             const cleared = ds.activeInteractiveTurn.turnId;
             ds.activeInteractiveTurn = undefined;
-            cb.onManagedTurnOriginRevoked?.(ds, cleared);
+            if (typeof cb !== 'undefined') cb?.onManagedTurnOriginRevoked?.(ds, cleared);
           }
           break;
         }
@@ -29204,9 +29204,9 @@ function setupWorkerHandlers(
             : undefined;
           // Reclaim proven identity material pinned by a background-held origin
           // whose foreground turn_terminal already ran.
-          collectSessionTurnGarbage(ds);
-          if (!ds.activeInteractiveTurn) {
-            cb.onManagedTurnOriginRevoked?.(ds, interactiveMatchTurnId ?? '');
+          if (typeof collectSessionTurnGarbage === 'function') collectSessionTurnGarbage(ds);
+          if (!ds.activeInteractiveTurn && typeof cb !== 'undefined') {
+            cb?.onManagedTurnOriginRevoked?.(ds, interactiveMatchTurnId ?? '');
           }
           break;
         }
@@ -29742,7 +29742,7 @@ function setupWorkerHandlers(
         if (msg.turnId && ds.activeInteractiveTurn?.turnId === msg.turnId) {
           const cleared = ds.activeInteractiveTurn.turnId;
           ds.activeInteractiveTurn = undefined;
-          cb.onManagedTurnOriginRevoked?.(ds, cleared);
+          if (typeof cb !== 'undefined') cb?.onManagedTurnOriginRevoked?.(ds, cleared);
           logger.warn(`[${t}] Applied fail-closed interactive-turn revoke backstop after contract reject (${reason}, turn=${cleared})`);
         }
         return;
@@ -29771,8 +29771,8 @@ function setupWorkerHandlers(
               policyCapability: origin.policyCapability,
             }
           : undefined;
-        collectSessionTurnGarbage(ds);
-        if (!ds.activeInteractiveTurn) cb.onManagedTurnOriginRevoked?.(ds, matchTurnId ?? '');
+        if (typeof collectSessionTurnGarbage === 'function') collectSessionTurnGarbage(ds);
+        if (!ds.activeInteractiveTurn && typeof cb !== 'undefined') cb?.onManagedTurnOriginRevoked?.(ds, matchTurnId ?? '');
         logger.warn(`[${t}] Applied fail-closed live-capability revoke backstop after contract reject (${reason}, turn=${matchTurnId ?? '-'})`);
         return;
       }

@@ -15,9 +15,18 @@
  *     (including spoofed `attachment(queued_command)` without
  *     `commandMode: 'task-notification'`) fails closed and immediately revokes
  *     the held authority.
- *  4. Any new human/local/scheduled/raw input, `/clear`, `/new`, or interrupt
- *     immediately supersedes a background hold so principal A's authorization
- *     can never leak to principal B or to unattended/local turns.
+ *  4. Preemption & serialization boundary:
+ *     - While idle between turns (`HELD_WAITING_BG` / `WAKE_PENDING`), any
+ *       authorized incoming IM message immediately supersedes and revokes A's
+ *       hold before admission/write;
+ *     - While a wake micro-turn is actively running (`WAKE_ACTIVE`), incoming
+ *       IM messages are held in `pendingMessages` behind the worker write fence
+ *       (never typed ahead or folded into A's running wake) and A's hold is
+ *       revoked before the queued message is written, so B can never execute
+ *       under or inherit A's credentials;
+ *     - Local/Web Terminal submit, `/clear`, `/new`, `raw_input`, non-keepalive
+ *       `inject_command`, built-in `CronCreate`, and interrupts revoke
+ *       immediately in every held phase (including `WAKE_ACTIVE`).
  *  5. Every hold is bounded by hard limits (30m wall-clock TTL, 10 chained
  *     wake-up micro-turns, 10s `WAKE_PENDING` watchdog, 30s missing-duration
  *     wake fallback, 0ms immediate release for `killed`/`stopped`/`TaskStop`/

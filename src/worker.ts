@@ -4082,7 +4082,8 @@ function notifyTerminalTurnStarted(turn: {
   isBackgroundWake?: boolean;
   backgroundWakeUnrouted?: boolean;
 }): void {
-  if (backgroundAuthorityHold.isBackgroundHeld()) {
+  if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld()
+    && typeof supersedeBackgroundAuthorityHold === 'function') {
     if (turn.isScheduled) {
       supersedeBackgroundAuthorityHold('superseded_by_scheduled');
     } else if (turn.isLocal && !turn.isBackgroundWake && !turn.turnId.startsWith('local-headless-')) {
@@ -4975,7 +4976,7 @@ function noteWebTerminalInput(data: string, submits = terminalInputSubmits(data)
   webTerminalInputGeneration++;
   webTerminalInputBackendScreenRevision = backendScreenRevision;
   if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
-  if (submits || data.includes('\x03')) {
+  if ((submits || data.includes('\x03')) && typeof supersedeBackgroundAuthorityHold === 'function') {
     supersedeBackgroundAuthorityHold(data.includes('\x03') ? 'superseded_by_interrupt' : 'superseded_by_local_turn');
   }
   if (submits) {
@@ -6834,7 +6835,8 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         const trimmedRawCmd = msg.content.trim().toLowerCase();
         const isClearOrNewRaw = trimmedRawCmd === '/clear' || trimmedRawCmd.startsWith('/clear ')
           || trimmedRawCmd === '/new' || trimmedRawCmd.startsWith('/new ');
-        if (isClearOrNewRaw || backgroundAuthorityHold.isBackgroundHeld()) {
+        if ((isClearOrNewRaw || (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld()))
+          && typeof supersedeBackgroundAuthorityHold === 'function') {
           supersedeBackgroundAuthorityHold(isClearOrNewRaw ? 'superseded_by_clear' : 'superseded_by_raw_input');
         }
         if (!activeTurnAuthority.inheritOrStartControl(
@@ -8367,6 +8369,7 @@ function markActiveTurnStarted(input: {
   const identity = turnAuthorityIdentity(input);
   if (!identity.turnId) return;
   const syncHold = (): void => {
+    if (typeof backgroundAuthorityHold === 'undefined' || typeof applyBackgroundAuthorityTransition !== 'function') return;
     const snap = activeTurnAuthority.snapshot();
     applyBackgroundAuthorityTransition(backgroundAuthorityHold.onForegroundTurnStarted({
       turnId: snap?.turnId,
@@ -8395,9 +8398,14 @@ function releaseActiveTurnAuthority(
   reason: string,
   exact?: { turnId: string; dispatchAttempt?: number },
 ): boolean {
-  const currentActive = activeTurnAuthority.snapshot();
+  const currentActive = typeof activeTurnAuthority !== 'undefined'
+    && typeof activeTurnAuthority?.snapshot === 'function'
+    ? activeTurnAuthority.snapshot()
+    : undefined;
   if (currentActive
+    && typeof isDeferrableAuthorityReleaseReason === 'function'
     && isDeferrableAuthorityReleaseReason(reason)
+    && typeof backgroundAuthorityHold !== 'undefined'
     && backgroundAuthorityHold.holds(currentActive.turnId, currentActive.dispatchAttempt, Date.now())) {
     return false;
   }
@@ -8405,8 +8413,10 @@ function releaseActiveTurnAuthority(
     ? activeTurnAuthority.releaseExact(exact)
     : activeTurnAuthority.clear();
   if (!released) return false;
-  backgroundAuthorityHold.clearIfOwner(released.turnId, released.dispatchAttempt);
-  clearBackgroundHoldTimer();
+  if (typeof backgroundAuthorityHold !== 'undefined') {
+    backgroundAuthorityHold.clearIfOwner(released.turnId, released.dispatchAttempt);
+  }
+  if (typeof clearBackgroundHoldTimer === 'function') clearBackgroundHoldTimer();
   completeManagedTurnOriginRevocation(
     sandboxRelayCapability,
     released.turnId,
@@ -8538,7 +8548,9 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       const explicitOrigin = binding?.runtime
         ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
         : undefined;
-      publishedOriginContractScope = explicitOrigin && execution ? explicitOrigin : undefined;
+      publishedOriginContractScope = explicitOrigin && execution
+        ? { ...explicitOrigin, executionId: execution.executionId }
+        : undefined;
       pendingManagedTurnOriginScope = explicitOrigin;
       try {
         send({
@@ -8587,7 +8599,7 @@ function unlinkManagedOriginCapabilityFiles(): void {
   }
 }
 
-let publishedOriginContractScope: CapturedSessionOrigin | undefined;
+let publishedOriginContractScope: (Partial<CapturedSessionOrigin> & { bindingId: string; executionId?: string }) | undefined;
 let pendingManagedTurnOriginScope: CapturedSessionOrigin | undefined;
 
 function completeManagedTurnOriginRevocation(
@@ -8615,8 +8627,8 @@ function completeManagedTurnOriginRevocation(
       ?? (savedMatchesTurn ? savedScope.execution : undefined);
     const explicitOrigin = binding?.runtime
       ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
-      : savedMatchesTurn
-        ? savedScope
+      : savedMatchesTurn && savedScope.runtime
+        ? { bindingId: savedScope.bindingId, runtime: savedScope.runtime, ...(savedScope.execution ? { execution: savedScope.execution } : {}) }
         : undefined;
     send({
       type: 'managed_turn_origin_revoked',
@@ -8646,10 +8658,10 @@ function completeManagedTurnOriginRevocation(
 function revokeManagedTurnOriginForRestart(): void {
   const revoked = sandboxRelayCapability;
   const activeIdentity = activeTurnAuthority.identity();
-  const wasBackgroundHeld = backgroundAuthorityHold.isBackgroundHeld();
-  backgroundAuthorityHold.reset();
-  legacyAgentAckPairer.reset();
-  clearBackgroundHoldTimer();
+  const wasBackgroundHeld = typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld();
+  if (typeof backgroundAuthorityHold !== 'undefined') backgroundAuthorityHold.reset();
+  if (typeof legacyAgentAckPairer !== 'undefined') legacyAgentAckPairer.reset();
+  if (typeof clearBackgroundHoldTimer === 'function') clearBackgroundHoldTimer();
   if (wasBackgroundHeld) activeTurnAuthority.clear();
   completeManagedTurnOriginRevocation(
     revoked,
@@ -8801,16 +8813,18 @@ function adoptInitialActiveTurn(parsed: {
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
   });
-  const adoptedSnap = activeTurnAuthority.snapshot();
-  backgroundAuthorityHold.onForegroundTurnStarted({
-    turnId: adoptedSnap?.turnId,
-    identityTurnId: adoptedSnap?.identityTurnId,
-    dispatchAttempt: adoptedSnap?.dispatchAttempt,
-    adoptMode: lastInitConfig?.adoptMode === true,
-    caller: adoptedSnap?.caller,
-    speakers: adoptedSnap?.speakers,
-    provenanceIncomplete: adoptedSnap?.provenanceIncomplete,
-  });
+  if (typeof backgroundAuthorityHold !== 'undefined') {
+    const adoptedSnap = activeTurnAuthority.snapshot();
+    backgroundAuthorityHold.onForegroundTurnStarted({
+      turnId: adoptedSnap?.turnId,
+      identityTurnId: adoptedSnap?.identityTurnId,
+      dispatchAttempt: adoptedSnap?.dispatchAttempt,
+      adoptMode: lastInitConfig?.adoptMode === true,
+      caller: adoptedSnap?.caller,
+      speakers: adoptedSnap?.speakers,
+      provenanceIncomplete: adoptedSnap?.provenanceIncomplete,
+    });
+  }
 }
 
 function adoptDisplacedActiveTurn(parsed: {
@@ -8863,16 +8877,18 @@ function adoptDisplacedActiveTurn(parsed: {
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
   });
-  const adoptedSnap = activeTurnAuthority.snapshot();
-  backgroundAuthorityHold.onForegroundTurnStarted({
-    turnId: adoptedSnap?.turnId,
-    identityTurnId: adoptedSnap?.identityTurnId,
-    dispatchAttempt: adoptedSnap?.dispatchAttempt,
-    adoptMode: lastInitConfig?.adoptMode === true,
-    caller: adoptedSnap?.caller,
-    speakers: adoptedSnap?.speakers,
-    provenanceIncomplete: adoptedSnap?.provenanceIncomplete,
-  });
+  if (typeof backgroundAuthorityHold !== 'undefined') {
+    const adoptedSnap = activeTurnAuthority.snapshot();
+    backgroundAuthorityHold.onForegroundTurnStarted({
+      turnId: adoptedSnap?.turnId,
+      identityTurnId: adoptedSnap?.identityTurnId,
+      dispatchAttempt: adoptedSnap?.dispatchAttempt,
+      adoptMode: lastInitConfig?.adoptMode === true,
+      caller: adoptedSnap?.caller,
+      speakers: adoptedSnap?.speakers,
+      provenanceIncomplete: adoptedSnap?.provenanceIncomplete,
+    });
+  }
 }
 
 /** Same-turn marker recovery is for a persistent CLI reattach, never a fresh
@@ -9009,9 +9025,9 @@ function writeCliPidMarker(): void {
         const effectiveCaller = authority?.caller;
         const effectiveController = authority?.controller;
         const activeReconcileHint = hintForTurn(currentBotmuxTurnId);
-        const markerTurnNonResurrectable = backgroundAuthorityHold.isBackgroundHeld()
+        const markerTurnNonResurrectable = (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld())
           || (!authority && !!currentBotmuxTurnId
-            && (retiredTurnIds.has(currentBotmuxTurnId)
+            && ((typeof retiredTurnIds !== 'undefined' && retiredTurnIds.has(currentBotmuxTurnId))
               || (typeof turnTerminalEmitted === 'function'
                 && turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt))));
         atomicWriteFileSync(markerPath, JSON.stringify({
@@ -11029,7 +11045,11 @@ function seedBackgroundTasksFromTranscript(paths?: readonly (string | Background
     }
     if (segment.path === currentPath) currentCursor = cursor;
   }
-  backgroundAuthorityHold.seedPreexistingLiveTasks(backgroundTaskTracker.liveTaskIds());
+  if (typeof backgroundAuthorityHold !== 'undefined'
+    && typeof backgroundTaskTracker !== 'undefined'
+    && typeof backgroundTaskTracker?.liveTaskIds === 'function') {
+    backgroundAuthorityHold.seedPreexistingLiveTasks(backgroundTaskTracker.liveTaskIds());
+  }
   refreshBackgroundWait();
   return currentCursor;
 }
@@ -11049,7 +11069,9 @@ function modelRequestPayload(): { awaySummaryPending: boolean; modelRequestSessi
 }
 
 function refreshBackgroundWait(): void {
-  applyBackgroundAuthorityTransition(backgroundAuthorityHold.onTick(Date.now()));
+  if (typeof applyBackgroundAuthorityTransition === 'function' && typeof backgroundAuthorityHold !== 'undefined') {
+    applyBackgroundAuthorityTransition(backgroundAuthorityHold.onTick(Date.now()));
+  }
   const footerTasks = typeof antigravityFooterBackgroundTasks === 'number' ? antigravityFooterBackgroundTasks : 0;
   const next = Math.max(backgroundTaskTracker.backgroundWait(), footerTasks);
   if (next > 0 && backgroundWaitTasks === 0) backgroundStopScanSinceMs = Date.now();
@@ -11100,7 +11122,9 @@ function settleBackgroundTasksFromSiblings(): void {
     // not bring the task back.
     const now = Date.now();
     backgroundTaskTracker.settle(taskId, now);
-    applyBackgroundAuthorityTransition(backgroundAuthorityHold.onTaskSettled(taskId, { wakes: false, atMs: now }, now));
+    if (typeof applyBackgroundAuthorityTransition === 'function' && typeof backgroundAuthorityHold !== 'undefined') {
+      applyBackgroundAuthorityTransition(backgroundAuthorityHold.onTaskSettled(taskId, { wakes: false, atMs: now }, now));
+    }
   }
 }
 
@@ -13158,7 +13182,7 @@ function bridgeAbsorbBaseline(backgroundTasksCursor?: JsonlCursor | null): void 
     // restart must already wait for the duration marker.
     if (transcriptShowsTurnDurationMarker(bridgeJsonlPath)) {
       bridgeQueue.noteDurationMarkerObserved();
-      backgroundAuthorityHold.noteDurationMarkerObserved();
+      if (typeof backgroundAuthorityHold !== 'undefined') backgroundAuthorityHold.noteDurationMarkerObserved();
     }
     // Restart recovery: if the previous generation left pending Lark turns in
     // the durable journal (worker/daemon died mid-turn), re-mark them and
@@ -13361,7 +13385,9 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // next ingest from offset 0 will find that user event and start the
   // turn. Clearing here would race-drop exactly the message we're
   // trying to deliver.
-  if (previousJsonlPath && previousJsonlPath !== matched && backgroundAuthorityHold.isBackgroundHeld()) {
+  if (previousJsonlPath && previousJsonlPath !== matched
+    && typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld()
+    && typeof supersedeBackgroundAuthorityHold === 'function') {
     supersedeBackgroundAuthorityHold('superseded_by_clear');
   }
   bridgeJsonlPath = matched;
@@ -13391,14 +13417,22 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // backgroundAuthorityHold) BEFORE seeding preexisting live tasks, so tasks
   // that already stopped in history do not block later SendMessage resumes.
   for (const ev of history) {
-    backgroundTaskTracker.observe(ev);
-    const atMs = eventTimeMs(ev);
-    for (const id of backgroundTaskSettledIds(ev)) {
-      backgroundAuthorityHold.recordHistoricalSettlement(id, atMs);
+    if (typeof backgroundTaskTracker !== 'undefined' && typeof backgroundTaskTracker?.observe === 'function') {
+      backgroundTaskTracker.observe(ev);
+    }
+    if (typeof backgroundAuthorityHold !== 'undefined' && typeof eventTimeMs === 'function' && typeof backgroundTaskSettledIds === 'function') {
+      const atMs = eventTimeMs(ev);
+      for (const id of backgroundTaskSettledIds(ev)) {
+        backgroundAuthorityHold.recordHistoricalSettlement(id, atMs);
+      }
     }
   }
-  backgroundAuthorityHold.seedPreexistingLiveTasks(backgroundTaskTracker.liveTaskIds());
-  observeClaudeBackgroundTasks(live);
+  if (typeof backgroundAuthorityHold !== 'undefined'
+    && typeof backgroundTaskTracker !== 'undefined'
+    && typeof backgroundTaskTracker?.liveTaskIds === 'function') {
+    backgroundAuthorityHold.seedPreexistingLiveTasks(backgroundTaskTracker.liveTaskIds());
+  }
+  if (typeof observeClaudeBackgroundTasks === 'function') observeClaudeBackgroundTasks(live);
   for (const ev of drained.events) modelRequestClock.observe(ev);
   bridgeBaselineDone = true;
   bridgePathConfirmedAtMs = Date.now();
@@ -13669,7 +13703,9 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
     try { bridgeWatcher.close(); } catch { /* ignore */ }
     bridgeWatcher = null;
   }
-  if (previousJsonlPath && previousJsonlPath !== newPath && backgroundAuthorityHold.isBackgroundHeld()) {
+  if (previousJsonlPath && previousJsonlPath !== newPath
+    && typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld()
+    && typeof supersedeBackgroundAuthorityHold === 'function') {
     supersedeBackgroundAuthorityHold('superseded_by_clear');
   }
   bridgeJsonlPath = newPath;
@@ -13696,14 +13732,22 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   // CLI process are ignored by the tracker itself. Fold history first so
   // already-stopped tasks do not remain stuck in allLiveTaskIds.
   for (const ev of history) {
-    backgroundTaskTracker.observe(ev);
-    const atMs = eventTimeMs(ev);
-    for (const id of backgroundTaskSettledIds(ev)) {
-      backgroundAuthorityHold.recordHistoricalSettlement(id, atMs);
+    if (typeof backgroundTaskTracker !== 'undefined' && typeof backgroundTaskTracker?.observe === 'function') {
+      backgroundTaskTracker.observe(ev);
+    }
+    if (typeof backgroundAuthorityHold !== 'undefined' && typeof eventTimeMs === 'function' && typeof backgroundTaskSettledIds === 'function') {
+      const atMs = eventTimeMs(ev);
+      for (const id of backgroundTaskSettledIds(ev)) {
+        backgroundAuthorityHold.recordHistoricalSettlement(id, atMs);
+      }
     }
   }
-  backgroundAuthorityHold.seedPreexistingLiveTasks(backgroundTaskTracker.liveTaskIds());
-  observeClaudeBackgroundTasks(live);
+  if (typeof backgroundAuthorityHold !== 'undefined'
+    && typeof backgroundTaskTracker !== 'undefined'
+    && typeof backgroundTaskTracker?.liveTaskIds === 'function') {
+    backgroundAuthorityHold.seedPreexistingLiveTasks(backgroundTaskTracker.liveTaskIds());
+  }
+  if (typeof observeClaudeBackgroundTasks === 'function') observeClaudeBackgroundTasks(live);
   for (const ev of result.events) modelRequestClock.observe(ev);
   bridgeBaselineDone = true;
   bridgePathConfirmedAtMs = Date.now();
@@ -14289,8 +14333,8 @@ function beginNewBridgeTranscriptGeneration(): void {
   bridgeQueue.markPendingTurnsCarriedAcrossGeneration();
   bridgeTranscriptGeneration++;
   bridgeQueue.resetDurationMarkerVerdicts();
-  backgroundAuthorityHold.resetDurationMarkerObserved();
-  legacyAgentAckPairer.reset();
+  if (typeof backgroundAuthorityHold !== 'undefined') backgroundAuthorityHold.resetDurationMarkerObserved();
+  if (typeof legacyAgentAckPairer !== 'undefined') legacyAgentAckPairer.reset();
 }
 
 /** Void the armed deadline and its turn binding. */
@@ -14780,9 +14824,9 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
 }
 
 function stopBridgeWatcher(): void {
-  backgroundAuthorityHold.reset();
-  legacyAgentAckPairer.reset();
-  clearBackgroundHoldTimer();
+  if (typeof backgroundAuthorityHold !== 'undefined') backgroundAuthorityHold.reset();
+  if (typeof legacyAgentAckPairer !== 'undefined') legacyAgentAckPairer.reset();
+  if (typeof clearBackgroundHoldTimer === 'function') clearBackgroundHoldTimer();
   // This generation's transcript ends here. A turn whose stop_reason was read
   // but whose duration marker never came is final — settle it before the slate
   // is cleared below (an exit outside drainReliableTerminalBeforeInterrupt:
@@ -20302,7 +20346,7 @@ async function writeAdoptMessage(
   setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId);
   currentBotmuxLinkRefMode = linkRefMode;
   currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
-  supersedeBackgroundAuthorityHold('superseded_by_message');
+  if (typeof supersedeBackgroundAuthorityHold === 'function') supersedeBackgroundAuthorityHold('superseded_by_message');
   markActiveTurnStarted({ turnId, dispatchAttempt, trustedCaller, trustedController });
   if (dispatchAttempt !== undefined) durableTurnInFlight = true;
   writeCliPidMarker();
@@ -21431,7 +21475,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   // `esc` is not treated as stop — it commonly just dismisses a TUI menu (e.g.
   // /model), and retiring there would swallow the still-running turn.
   if (criticalInterrupt && requestedKey === 'ctrlc') {
-    supersedeBackgroundAuthorityHold('superseded_by_interrupt');
+    if (typeof supersedeBackgroundAuthorityHold === 'function') supersedeBackgroundAuthorityHold('superseded_by_interrupt');
     retireDoubaoBridgeTurnOnInterrupt(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
     if (cliAdapter?.id === 'cursor') submitCursorParkedFollowUpAfterStop(targetBackend, lifetime);
   }
@@ -21512,7 +21556,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
   }
   if (traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(turnId);
   if (delivered) {
-    supersedeBackgroundAuthorityHold('superseded_by_interrupt');
+    if (typeof supersedeBackgroundAuthorityHold === 'function') supersedeBackgroundAuthorityHold('superseded_by_interrupt');
     // Ctrl+C can exit the CLI and enter its ordinary crash-replay path. Retire
     // only this exact turn BEFORE acknowledging interruption to the daemon;
     // otherwise the caller sees interrupted while auto-restart executes it again.
@@ -21800,7 +21844,9 @@ async function flushPendingInjections(): Promise<void> {
       if (webTerminalInputWireDirty()) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
-      if (item.kind !== 'keepalive' && backgroundAuthorityHold.isBackgroundHeld()) {
+      if (item.kind !== 'keepalive'
+        && typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld()
+        && typeof supersedeBackgroundAuthorityHold === 'function') {
         const trimmedInject = cmd.trim().toLowerCase();
         const isClearOrNewInject = trimmedInject === '/clear' || trimmedInject.startsWith('/clear ')
           || trimmedInject === '/new' || trimmedInject.startsWith('/new ');
@@ -25863,13 +25909,19 @@ function markPromptReady(): void {
     && pendingSessionRename === null
     && !isFlushing;
   const promptReadyNow = Date.now();
-  applyBackgroundAuthorityTransition(backgroundAuthorityHold.onPromptReady(promptReadyNow));
-  const activeSnapForReady = activeTurnAuthority.snapshot();
-  const holdKeepsAuthority = backgroundAuthorityHold.holds(
-    activeSnapForReady?.turnId,
-    activeSnapForReady?.dispatchAttempt,
-    promptReadyNow,
-  );
+  if (typeof applyBackgroundAuthorityTransition === 'function' && typeof backgroundAuthorityHold !== 'undefined') {
+    applyBackgroundAuthorityTransition(backgroundAuthorityHold.onPromptReady(promptReadyNow));
+  }
+  const activeSnapForReady = typeof activeTurnAuthority !== 'undefined'
+    && typeof activeTurnAuthority?.snapshot === 'function'
+    ? activeTurnAuthority.snapshot()
+    : undefined;
+  const holdKeepsAuthority = typeof backgroundAuthorityHold !== 'undefined'
+    && backgroundAuthorityHold.holds(
+      activeSnapForReady?.turnId,
+      activeSnapForReady?.dispatchAttempt,
+      promptReadyNow,
+    );
   if (beforeMarkerSync.releaseActiveTurnAuthority && !readyContinuesTurn && !holdKeepsAuthority) {
     releaseActiveTurnAuthority('prompt_ready');
   }
@@ -27551,12 +27603,13 @@ async function flushPending(): Promise<void> {
   const { supportsTypeAhead: runtimeSupportsTypeAhead, allowBackToBackWrites } = runtimePtyInputPolicy();
   // Hold incoming writes while a background wake-up micro-turn is actively
   // running so another message cannot type-ahead/fold into principal A's wake.
-  if (backgroundAuthorityHold.isWakeActive()) {
+  if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isWakeActive()) {
     log(`Holding pending write while background wake-up micro-turn is active`);
     return;
   }
   promotePendingHumanInterruption();
-  if (backgroundAuthorityHold.isIdleWaiting() && pendingMessages.length > 0) {
+  if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isIdleWaiting()
+    && pendingMessages.length > 0 && typeof supersedeBackgroundAuthorityHold === 'function') {
     const nextMsg = pendingMessages[0]!;
     const canSupersedeIdleHold = !crossPrincipalIsolationOn()
       || !activeTurnAuthority.blocks(turnAuthorityIdentity({
@@ -27596,13 +27649,17 @@ async function flushPending(): Promise<void> {
   }
   if (!isPromptReady && pendingMessages.length === 0) return;
   if (!isPromptReady && !typeAheadAllowed) return;
-  // Do not clear `isPromptReady` via `beginCliWriteCycle()` when only
-  // `pendingMessages` is ready and its head is blocked by `activeTurnBlocks()`
-  // (e.g. a `queueAfterActiveTurn` turn parked behind an XPI=ON background hold):
-  // clearing `isPromptReady` without writing would strand non-type-ahead / durable
-  // turns once the hold later releases on an already-idle CLI.
+  // Do not clear `isPromptReady` via `beginCliWriteCycle()` ONLY when the
+  // active authority is an idle background hold (`isIdleWaiting()`): the CLI is
+  // already idle at its prompt, so clearing readiness would strand non-type-ahead
+  // / durable turns when the background task later settles without waking the CLI.
+  // When a live foreground turn (e.g. type-ahead successor H) blocks `pendingMessages[0]`,
+  // `isPromptReady` MUST be cleared so H's own `turn_idle` edge is not dropped as
+  // `already-ready`.
   if (!rawInputReady && !supportedSessionRenameReady && !adoptInputReady
-    && pendingMessages.length > 0 && activeTurnBlocks(pendingMessages[0]!)) {
+    && pendingMessages.length > 0 && activeTurnBlocks(pendingMessages[0]!)
+    && typeof backgroundAuthorityHold !== 'undefined'
+    && backgroundAuthorityHold.isIdleWaiting()) {
     return;
   }
 
@@ -27876,7 +27933,9 @@ async function flushPending(): Promise<void> {
           || cliRestartInProgress || webTerminalInputWireDirty()) break;
       }
       if (activeTurnBlocks(pendingMessages[0]!)) {
-        keepPromptReadyAfterHold();
+        if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isIdleWaiting()) {
+          keepPromptReadyAfterHold();
+        }
         break;
       }
       const admissionHead = pendingMessages[0]!;
@@ -28057,7 +28116,8 @@ async function flushPending(): Promise<void> {
         // the newly started foreground turn.
         if (claudeBridgeActive) {
           try { bridgeIngest(); } catch { /* best-effort */ }
-          if (backgroundAuthorityHold.isIdleWaiting()) {
+          if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isIdleWaiting()
+            && typeof supersedeBackgroundAuthorityHold === 'function') {
             const canSupersede = !crossPrincipalIsolationOn()
               || !activeTurnAuthority.blocks(turnAuthorityIdentity({
                 turnId: item.turnId,
@@ -28083,8 +28143,9 @@ async function flushPending(): Promise<void> {
         }
 
         const currentTurnAlreadyTerminated = !!currentBotmuxTurnId
-          && (retiredTurnIds.has(currentBotmuxTurnId)
-            || turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt));
+          && ((typeof retiredTurnIds !== 'undefined' && retiredTurnIds.has(currentBotmuxTurnId))
+            || (typeof turnTerminalEmitted === 'function'
+              && turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt)));
         const isTypeAhead = !!currentBotmuxTurnId
           && !currentTurnFinalDelivered
           && !!item.turnId
@@ -30293,7 +30354,8 @@ function checkStaleProgramStatus(): void {
     heldWorking: detector.programStatusHeldWorking(),
     programStatusQuietMs: detector.programStatusQuietMs(now),
     transcriptEndedForMs: claudeTranscriptTurnEnd.endedForMs(now),
-    backgroundTasksRunning: backgroundTaskTracker.pending(now) + (backgroundAuthorityHold.isBackgroundHeld() ? 1 : 0),
+    backgroundTasksRunning: backgroundTaskTracker.pending(now)
+      + (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld() ? 1 : 0),
   };
   const verdict = staleProgramStatusVerdict(evidence);
   if (verdict === 'stop') return;
@@ -30894,9 +30956,9 @@ async function spawnCliBody(
   // its tasks; startBridgeWatcher rebuilds them from its transcript.
   const liveFloorMs = Math.floor(Date.now() / 1000) * 1000;
   backgroundTaskTracker.reset(liveFloorMs);
-  backgroundAuthorityHold.reset(liveFloorMs);
-  legacyAgentAckPairer.reset();
-  clearBackgroundHoldTimer();
+  if (typeof backgroundAuthorityHold !== 'undefined') backgroundAuthorityHold.reset(liveFloorMs);
+  if (typeof legacyAgentAckPairer !== 'undefined') legacyAgentAckPairer.reset();
+  if (typeof clearBackgroundHoldTimer === 'function') clearBackgroundHoldTimer();
   backgroundWaitTasks = 0;
   antigravityFooterBackgroundTasks = 0;
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
@@ -37990,9 +38052,9 @@ async function spawnCliBody(
     foldedTypeAheadTurn = undefined;
     queuedTurnAdvanceConsumedForPrompt = undefined;
     retiredTurnIds.clear();
-    backgroundAuthorityHold.reset();
-    legacyAgentAckPairer.reset();
-    clearBackgroundHoldTimer();
+    if (typeof backgroundAuthorityHold !== 'undefined') backgroundAuthorityHold.reset();
+    if (typeof legacyAgentAckPairer !== 'undefined') legacyAgentAckPairer.reset();
+    if (typeof clearBackgroundHoldTimer === 'function') clearBackgroundHoldTimer();
     activeTurnAuthority.clear();
     if (!intentionalRestart && activeRestartAttemptId) {
       send({
@@ -38459,9 +38521,9 @@ function killCli(opts: {
   foldedTypeAheadTurn = undefined;
   queuedTurnAdvanceConsumedForPrompt = undefined;
   retiredTurnIds.clear();
-  backgroundAuthorityHold.reset();
-  legacyAgentAckPairer.reset();
-  clearBackgroundHoldTimer();
+  if (typeof backgroundAuthorityHold !== 'undefined') backgroundAuthorityHold.reset();
+  if (typeof legacyAgentAckPairer !== 'undefined') legacyAgentAckPairer.reset();
+  if (typeof clearBackgroundHoldTimer === 'function') clearBackgroundHoldTimer();
   activeTurnAuthority.clear();
   currentVcMeetingImTurnOrigin = undefined;
   submittedCodexAppReplyTurnIds.clear();
@@ -42125,7 +42187,8 @@ function markTurnExecutionStart(
 function releaseTerminatedActiveTurnAuthority(): void {
   const active = activeTurnAuthority.snapshot();
   if (!sessionId || !active?.turnId) return;
-  if (backgroundAuthorityHold.holds(active.turnId, active.dispatchAttempt, Date.now())) return;
+  if (typeof backgroundAuthorityHold !== 'undefined'
+    && backgroundAuthorityHold.holds(active.turnId, active.dispatchAttempt, Date.now())) return;
   if (emittedTurnTerminals.statusOf(sessionId, active.turnId, active.dispatchAttempt) === undefined) return;
   releaseActiveTurnAuthority('stale_terminal', { turnId: active.turnId, dispatchAttempt: active.dispatchAttempt });
 }
@@ -42370,16 +42433,18 @@ function emitTurnTerminal(
   if (status !== 'completed') lastTurnFailureSurfacedAtMs = Date.now();
   traexAutoModelController?.endTurn(turnId);
   const timing = turnExecutionClock.settle(turnId, dispatchAttempt, completedAtMs);
-  const hasOtherQueuedTypeAhead = queuedTypeAheadTurns.some(q =>
+  const hasOtherQueuedTypeAhead = typeof queuedTypeAheadTurns !== 'undefined'
+    && Array.isArray(queuedTypeAheadTurns) && queuedTypeAheadTurns.some(q =>
     q.turnId !== turnId
     && (typeof turnTerminalEmitted === 'function' ? !turnTerminalEmitted(q.turnId, q.dispatchAttempt) : true));
-  const authorityHeldForBackground = backgroundAuthorityHold.onForegroundTurnTerminal(
-    { turnId, dispatchAttempt, status, hasQueuedTypeAhead: hasOtherQueuedTypeAhead },
-    Date.now(),
-  );
+  const authorityHeldForBackground = typeof backgroundAuthorityHold !== 'undefined'
+    && backgroundAuthorityHold.onForegroundTurnTerminal(
+      { turnId, dispatchAttempt, status, hasQueuedTypeAhead: hasOtherQueuedTypeAhead },
+      Date.now(),
+    );
   if (authorityHeldForBackground) {
-    writeCliPidMarker();
-    scheduleBackgroundHoldTimer();
+    if (typeof writeCliPidMarker === 'function') writeCliPidMarker();
+    if (typeof scheduleBackgroundHoldTimer === 'function') scheduleBackgroundHoldTimer();
   }
   if (status !== 'completed') {
     const dropped = codexBridgeQueue.dropPendingTurn(turnId, dispatchAttempt, true);
@@ -44288,7 +44353,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           : undefined;
         const alreadyPublishedForExecution = !!resumedExecution
           && publishedOriginContractScope?.bindingId === assignedBinding.bindingId
-          && publishedOriginContractScope.execution?.executionId === resumedExecution.executionId;
+          && (publishedOriginContractScope.executionId ?? publishedOriginContractScope.execution?.executionId) === resumedExecution.executionId;
         if (resumedExecution && !alreadyPublishedForExecution
           && (!resumedState || !['succeeded', 'failed', 'cancelled'].includes(resumedState.phase))) {
           scope.run(assignedBinding, () => {
@@ -44394,7 +44459,8 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // when this message is authorized to supersede it (always under XPI=OFF,
       // or same principal under XPI=ON). Never let an incoming turn adopt
       // principal A's held background authority via adoptEnvelopePreservingPrincipal.
-      if (backgroundAuthorityHold.isIdleWaiting()) {
+      if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isIdleWaiting()
+        && typeof supersedeBackgroundAuthorityHold === 'function') {
         const canSupersedeIdleHold = !crossPrincipalIsolationOn()
           || !activeTurnAuthority.blocks(turnAuthorityIdentity({
             turnId: msg.turnId,
@@ -45267,7 +45333,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         log('Prompt-cache keep-alive deferred while an away summary is pending');
         break;
       }
-      if (backgroundAuthorityHold.isBackgroundHeld()) {
+      if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld()) {
         send({ type: 'prompt_cache_keepalive_result', injected: false, reason: 'background_hold_active' });
         log('Prompt-cache keep-alive deferred while background task authority hold is active');
         break;
@@ -45504,10 +45570,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         });
       }
       const submittedTurnId = writtenInputs.takeSubmitted(msg);
-      if (backgroundAuthorityHold.isBackgroundHeld()
+      if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld()
+        && typeof supersedeBackgroundAuthorityHold === 'function'
         && (!submittedTurnId
           || submittedTurnId === backgroundAuthorityHold.owner()?.turnId
-          || retiredTurnIds.has(submittedTurnId))) {
+          || (typeof retiredTurnIds !== 'undefined' && retiredTurnIds.has(submittedTurnId)))) {
         supersedeBackgroundAuthorityHold('superseded_by_local_turn');
       }
       if (submittedTurnId) send({ type: 'prompt_submitted_input', turnId: submittedTurnId });

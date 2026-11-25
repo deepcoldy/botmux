@@ -1580,7 +1580,7 @@ async function handleManagedOriginAttestation(
   });
   if (!verified.ok || !ds?.managedTurnOrigin || !liveTurnId || !workerLive) {
     const reason = !ds ? 'no_session' : !workerLive ? 'worker_not_live' : !liveTurnId ? 'no_live_origin' : 'capability_mismatch';
-    logOriginAuthRefusal(sessionId, 'managed_origin_attest', reason, ds);
+    if (typeof logOriginAuthRefusal === 'function') logOriginAuthRefusal(sessionId, 'managed_origin_attest', reason, ds);
     return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
   }
   const origin = ds.managedTurnOrigin;
@@ -3735,7 +3735,7 @@ function sessionCliIpcAuth(
     claimedDispatchAttempt: claimedAttempt,
   });
   if (!decision.ok) {
-    if (ds) {
+    if (ds && typeof logOriginAuthRefusal === 'function') {
       logOriginAuthRefusal(sessionId, 'session_cli_ipc', !ds.managedTurnOrigin?.turnId ? 'no_live_origin' : decision.error, ds);
     }
     return { ok: false, error: decision.error };
@@ -4724,7 +4724,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const turnId = liveOrigin?.turnId ?? detachedForUser?.scheduledTurnId;
   if (!turnId) {
     const peerUnverified = process.platform === 'linux' && !!ds?.managedTurnOrigin?.turnId && !execution;
-    logOriginAuthRefusal(params.sessionId, 'lark_tool_user', peerUnverified ? 'peer_unverified' : 'no_live_origin', ds);
+    if (typeof logOriginAuthRefusal === 'function') {
+      logOriginAuthRefusal(params.sessionId, 'lark_tool_user', peerUnverified ? 'peer_unverified' : 'no_live_origin', ds);
+    }
     return jsonRes(res, 403, {
       ok: false,
       error: peerUnverified
@@ -4803,7 +4805,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const originSender = ownerFallback?.openId ?? turnPrincipal;
   const sender = delegated?.targetOpenId ?? originSender;
   if (!sender) {
-    logOriginAuthRefusal(params.sessionId, 'lark_tool_user', 'no_sender', ds);
+    if (typeof logOriginAuthRefusal === 'function') {
+      logOriginAuthRefusal(params.sessionId, 'lark_tool_user', 'no_sender', ds);
+    }
     return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
   }
   const cached = delegated ? undefined : getIdentity(bot.larkAppId, sender);
