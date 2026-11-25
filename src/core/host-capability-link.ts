@@ -23,6 +23,8 @@ export interface HostLinkScope {
   /** Ports the Dashboard answers on; a bare root is only a host page there.
    *  The terminal root is refused only on listed ports: an empty list refuses none. */
   dashboardPorts: readonly string[];
+  /** Configured public reverse-proxy base paths for hosted oncall pages. */
+  dashboardPathPrefixes?: readonly string[];
 }
 
 const ID = '[A-Za-z0-9][A-Za-z0-9._-]{0,127}';
@@ -37,6 +39,15 @@ const ONCALL_SIDEBAR_PATH = new RegExp(`^${ONCALL_SIDEBAR_PATH_PREFIX}(cli_[a-zA
 export function parseOncallSidebarPath(path: string): { appId: string; id: string; token: string } | undefined {
   const match = ONCALL_SIDEBAR_PATH.exec(path);
   if (match) return { appId: match[1]!, id: match[2]!, token: match[3]! };
+}
+
+function isScopedOncallSidebarPath(path: string, prefixes: readonly string[]): boolean {
+  if (parseOncallSidebarPath(path)) return true;
+  return prefixes.some(prefix => {
+    const base = prefix.replace(/\/+$/, '');
+    return base.startsWith('/') && !!base && path.startsWith(base)
+      && !!parseOncallSidebarPath(path.slice(base.length));
+  });
 }
 
 function normalizedHost(value: string): string {
@@ -67,7 +78,7 @@ export function isHostCapabilityLink(value: string, scope: HostLinkScope): boole
   const dashboard = capabilityQuery(url, ['t']);
   if (dashboard === 'other') return false;
   if (url.pathname === '/') return !url.hash || DASHBOARD_ROUTE.test(url.hash);
-  if (!url.hash && dashboard === 'none' && parseOncallSidebarPath(url.pathname)) return true;
+  if (!url.hash && dashboard === 'none' && isScopedOncallSidebarPath(url.pathname, scope.dashboardPathPrefixes ?? [])) return true;
   if (url.hash || !DASHBOARD_PATH.test(url.pathname)) return false;
   return url.pathname === '/workbench' || dashboard === 'none';
 }

@@ -5,6 +5,10 @@ import { runInNewContext } from 'node:vm';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { isHostCapabilityLink } from '../src/core/host-capability-link.js';
+import { config } from '../src/config.js';
+import { localHttpOrigin } from '../src/core/dashboard-url.js';
+import { sendableCardLink } from '../src/im/lark/local-address-context.js';
+import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
 import { hostOncallSidebar } from '../src/services/oncall-sidebar-link.js';
 import { handleOncallSidebar } from '../src/dashboard/oncall-sidebar.js';
 import { buildOncallFormCard } from '../src/im/lark/oncall-form-card.js';
@@ -24,7 +28,7 @@ beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), 'oncall-sidebar-'));
   writeFileSync(join(dataDir, 'oncall-group-targets.json'), JSON.stringify({ [appId]: target }));
 });
-afterEach(() => { rmSync(dataDir, { recursive: true, force: true }); vi.useRealTimers(); });
+afterEach(() => { rmSync(dataDir, { recursive: true, force: true }); vi.useRealTimers(); vi.unstubAllEnvs(); });
 
 async function fixture(oldMarker = false) {
   const forms = new OncallFormStore(dataDir);
@@ -83,6 +87,23 @@ it('opens the native form in place and answers only its origin and frame with a 
   const source = contentWindow.postMessage.mock.calls[0]?.[0].url;
   expect(source).toBe(`${origin}/chat?bm_form=${nativePage.searchParams.get('bm_form')}`);
   expect(contentWindow.postMessage).toHaveBeenCalledExactlyOnceWith({ url: source }, origin);
+});
+
+it('accepts only the configured local reverse-proxy path prefix for hosted cards', async () => {
+  const { draft } = await fixture();
+  const base = localHttpOrigin(config.dashboard.externalHost, config.dashboard.port);
+  vi.stubEnv('BOTMUX_PUBLIC_URL', `${base}/botmux/`);
+  const restore = setHideLocalAddressesResolver(() => true);
+  try {
+    const hosted = hostOncallSidebar(draft.nativeFormLink!, `${base}/botmux`, draft, token);
+    const page = new URL(new URL(hosted).searchParams.get('url')!);
+    expect(page.pathname).toBe(`/botmux/oncall/sidebar/${appId}/${draft.id}/${token}`);
+    expect(sendableCardLink(hosted, appId)).toBe(true);
+    expect(sendableCardLink(page.href, appId)).toBe(true);
+    const otherPrefix = new URL(page);
+    otherPrefix.pathname = page.pathname.replace(/^\/botmux\//, '/other/');
+    expect(sendableCardLink(otherPrefix.href, appId)).toBe(false);
+  } finally { restore(); }
 });
 
 it('keeps the displayed selection usable while a new card is being published', async () => {
