@@ -72,7 +72,7 @@ import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSecretaryCommand } from './secretary-command.js';
 import { observeGroupSecretaryMessage } from '../../services/group-secretary-runtime.js';
-import { tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from './assistant-command.js';
+import { assistantGroupIsMultiUser, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from './assistant-command.js';
 import { assistantMultiUserGroupsOff } from '../../core/assistant-spawn.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { resolveSubstituteAppMentions, substituteMentionIdentities } from './substitute-app-mentions.js';
@@ -4381,6 +4381,11 @@ async function dispatchPolledMessageListenerMatch(input: {
   chatId: string;
   messageId: string;
 }): Promise<void> {
+  // 个人助理模式不允许多人群：轮询补到的群消息同样不派发（与实时消息入口的闸一致）。
+  if (assistantMultiUserGroupsOff(input.larkAppId) && await assistantGroupIsMultiUser(input.larkAppId, input.chatId)) {
+    logger.debug(`[message-listener:${input.larkAppId}] multi-user group ${input.chatId.substring(0, 12)}; polled message ignored`);
+    return;
+  }
   if (!claimMessageOnce(input.larkAppId, input.messageId)) {
     logger.debug(`[message-listener:${input.larkAppId}] polled duplicate ignored msg=${input.messageId.substring(0, 12)}`);
     return;
@@ -7694,7 +7699,9 @@ export function createLarkEventDispatcherRuntime(
       data.__groupContextHandled = true;
       try {
         const editedChatId: string | undefined = data.message?.chat_id;
-        if (editedChatId && data.message.chat_type !== 'p2p' && isGroupContextEnabled(larkAppId, editedChatId)) {
+        // 个人助理模式不允许多人群：多人群的编辑不旁听（私聊本就不采集）。
+        if (editedChatId && data.message.chat_type !== 'p2p' && isGroupContextEnabled(larkAppId, editedChatId)
+          && !(assistantMultiUserGroupsOff(larkAppId) && await assistantGroupIsMultiUser(larkAppId, editedChatId))) {
           const mode = getCachedChatMode(larkAppId, editedChatId) ?? await getChatModeStrict(larkAppId, editedChatId);
           if (mode === 'p2p') data.message.chat_type = 'p2p';
           else if (mode === 'group' || mode === 'topic') {
@@ -8026,7 +8033,7 @@ export function createLarkEventDispatcherRuntime(
         }
         // 个人助理模式不允许多人群：被拉进真人 ≥2 的群时入群钩子 / 入群命令 / 拉 owner / 归属 / 自动开工一概不做。
         if (assistantMultiUserGroupsOff(larkAppId)
-          && (await getGroupStats(larkAppId, chatId, { requireFresh: true })).userCount > 1) {
+          && (await getGroupStats(larkAppId, chatId, { requireFresh: true })).userCount !== 1) {
           logger.info(`[assistant-mode:${larkAppId}] bot added to multi-user group ${chatId.substring(0, 12)}; ignoring`);
           return;
         }

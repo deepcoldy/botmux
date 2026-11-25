@@ -302,6 +302,7 @@ vi.mock('../src/im/lark/transport/resilient-ws-client.js', () => ({
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
 import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetListenerCircuitsForTest, __setListenerClockForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, getGroupStats, isBotMentioned, learnSameOwnerSiblingCrossRef, maybeApplyForceTopicOverride, mentionsAnotherInChatMember, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, updateBotOpenIdCrossRef, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { resetAssistantMultiUserNoticesForTest } from '../src/im/lark/assistant-command.js';
 import { writeGroupCollaborationMode } from '../src/services/group-collaboration-mode-store.js';
 import { __resetSubtopicHandoffCacheForTest, findLiveMentionlessSubtopicOwner, ORCHESTRATE_DISPATCH_STORE_FILE, resolveManagedSubtopicMentionlessHandoff, type SubtopicMentionlessHandoff, type SubtopicSessionSnapshot } from '../src/services/subtopic-mentionless-handoff.js';
 import { PROJECT_GROUP_STORE_FILE } from '../src/services/project-group-store.js';
@@ -18212,5 +18213,70 @@ describe('in-chat @ membership check is only paid when its answer matters (comma
     await flushEventWork();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('assistant mode without multi-user groups (assistantGroupChat off)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+  const groupMessage = (id: string) => makeUserMessageEvent({
+    senderOpenId: USER_OPEN_ID,
+    content: JSON.stringify({ text: '@Bot hello' }),
+    messageId: id,
+    chatId: 'chat-assistant-multi',
+    chatType: 'group',
+    mentions: [{ key: '@_bot', name: 'Bot', id: { open_id: MY_OPEN_ID } }],
+  });
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    __resetChatStatsForTest();
+    resetAssistantMultiUserNoticesForTest();
+    emitHookEventMock.mockClear();
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    (mockGetBot() as any).config.assistantMode = true;
+    handlers = makeHandlers();
+    mockGetChatMode.mockResolvedValue('group');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    markForwardFollowupsSessionsReady(MY_APP_ID);
+  });
+
+  it('drops a message in a group with two people and answers an @ with the notice', async () => {
+    mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+    await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-multi-1'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, 'msg-assistant-multi-1', expect.stringContaining('多人群'), 'text', false);
+  });
+
+  it('serves a group where the owner is the only person', async () => {
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 2 });
+    await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-solo-1'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('serves multi-user groups when assistantGroupChat is on', async () => {
+    (mockGetBot() as any).config.assistantGroupChat = true;
+    mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+    await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-on-1'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('does nothing when added to a group with two people, and joins a one-person group normally', async () => {
+    const handleBotAdded = vi.fn(async () => {});
+    Object.assign(handlers, { handleBotAdded });
+    mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+    capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'chat-assistant-add-1', operator_id: { open_id: USER_OPEN_ID } });
+    await flushEventWork();
+    expect(handleBotAdded).not.toHaveBeenCalled();
+    expect(emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added')).toHaveLength(0);
+
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+    capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'chat-assistant-add-2', operator_id: { open_id: 'ou_someone_else' } });
+    await flushEventWork();
+    expect(handleBotAdded).toHaveBeenCalledWith('chat-assistant-add-2', 'ou_someone_else', MY_APP_ID);
   });
 });

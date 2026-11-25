@@ -4915,7 +4915,7 @@ export async function executeScheduledTask(
     let multiUser = true;
     try {
       const facts = await larkClient.getChatRoutingFacts(larkAppId, task.chatId);
-      multiUser = facts.mode !== 'p2p' && (await larkClient.getChatInfo(larkAppId, task.chatId)).userCount > 1;
+      multiUser = facts.mode !== 'p2p' && (await larkClient.getChatInfo(larkAppId, task.chatId)).userCount !== 1;
     } catch { /* 查不到 → 按多人群拒 */ }
     if (multiUser) {
       logger.warn(`[scheduler] refusing to fire ${task.id}: assistant mode does not serve multi-user group ${task.chatId}`);

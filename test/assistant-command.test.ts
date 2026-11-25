@@ -21,7 +21,10 @@ vi.mock('../src/bot-registry.js', () => ({
 const mockIsBotMentioned = vi.fn(() => true);
 const mockCanOperate = vi.fn(() => false);
 let groupUserCount = 1;
-const mockGetGroupStats = vi.fn(async () => ({ userCount: groupUserCount, botCount: 1 }));
+/** 缓存里的人数（不带 requireFresh 时返回）；undefined = 与最新值相同。 */
+let cachedUserCount: number | undefined;
+const mockGetGroupStats = vi.fn(async (_app: string, _chat: string, opts?: { requireFresh?: boolean }) =>
+  ({ userCount: opts?.requireFresh || cachedUserCount === undefined ? groupUserCount : cachedUserCount, botCount: 1 }));
 vi.mock('../src/im/lark/event-dispatcher.js', () => ({
   isBotMentioned: (...a: any[]) => mockIsBotMentioned(...a),
   canOperate: (...a: any[]) => mockCanOperate(...a),
@@ -90,6 +93,7 @@ beforeEach(() => {
   assistantMode = true;
   assistantGroupChat = true;
   groupUserCount = 1;
+  cachedUserCount = undefined;
   sessionGroupOwner = undefined;
   resetAssistantMultiUserNoticesForTest();
   mockGetGroupStats.mockClear();
@@ -217,8 +221,28 @@ describe('assistantGroupChat off: multi-user group gate', () => {
 
   it('a group with only one person works as before, re-checking a cached solo count', async () => {
     expect(await gate(msg('hi'))).toBe(false);
-    expect(mockGetGroupStats).toHaveBeenCalledWith(APP, CHAT, { revalidateSolo: true });
+    expect(mockGetGroupStats).toHaveBeenLastCalledWith(APP, CHAT, { requireFresh: true });
     expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('a stale cached solo count does not let a second person through', async () => {
+    cachedUserCount = 1;
+    groupUserCount = 2;
+    mockIsBotMentioned.mockReturnValue(false);
+    expect(await gate(msg('hi'))).toBe(true);
+  });
+
+  it('a cached multi-user count is trusted without another lookup', async () => {
+    groupUserCount = 3;
+    mockIsBotMentioned.mockReturnValue(false);
+    expect(await gate(msg('hi'))).toBe(true);
+    expect(mockGetGroupStats).toHaveBeenCalledTimes(1);
+  });
+
+  it('a missing member count (reported as 0) is treated as multi-user', async () => {
+    groupUserCount = 0;
+    mockIsBotMentioned.mockReturnValue(false);
+    expect(await gate(msg('hi'))).toBe(true);
   });
 
   it('two people: a human @ gets the notice as a reply, at most once per group per 10 minutes', async () => {

@@ -41,20 +41,27 @@ export async function tryHandleAssistantMultiUserGroup(
 ): Promise<boolean> {
   const chatId: string | undefined = message?.chat_id;
   if (message?.chat_type === 'p2p' || !chatId || !assistantMultiUserGroupsOff(larkAppId)) return false;
-  // 缓存说是单人群时重查一次：有人刚进群、而进群事件推给了别的副本时，缓存会停在 1 人。
-  const { userCount } = await getGroupStats(larkAppId, chatId, { revalidateSolo: true });
-  if (userCount <= 1) return false;
+  if (!(await assistantGroupIsMultiUser(larkAppId, chatId))) return false;
   if (senderIsBot || !isBotMentioned(larkAppId, message, senderOpenId)) return true;
   const key = `${larkAppId}:${chatId}`;
   if ((multiUserNoticeAt.get(key) ?? -Infinity) > now - MULTI_USER_NOTICE_MS) return true;
   multiUserNoticeAt.set(key, now);
-  logger.info(`[assistant-mode:${larkAppId}] multi-user group ${chatId.slice(0, 12)} (${userCount} users); notice sent`);
+  logger.info(`[assistant-mode:${larkAppId}] multi-user group ${chatId.slice(0, 12)}; notice sent`);
   const messageId: string | undefined = message.message_id;
   if (messageId) {
     await replyMessage(larkAppId, messageId, t('cmd.assistant.multi_user_group', undefined, localeForBot(larkAppId)), 'text', false)
       .catch(err => logger.warn(`[assistant-mode] multi-user-group notice failed: ${err?.message ?? err}`));
   }
   return true;
+}
+
+/**
+ * 群里的真人数是否不是恰好 1 个（bot 不计；字段缺失、查不到都算多人）。缓存说是多人就照用；
+ * 说是单人时强制重查一次：有人刚进群、而进群事件推给了别的副本时，缓存会停在 1 人。
+ */
+export async function assistantGroupIsMultiUser(larkAppId: string, chatId: string): Promise<boolean> {
+  if ((await getGroupStats(larkAppId, chatId)).userCount !== 1) return true;
+  return (await getGroupStats(larkAppId, chatId, { requireFresh: true })).userCount !== 1;
 }
 
 /** 测试用：清空限频记录。 */

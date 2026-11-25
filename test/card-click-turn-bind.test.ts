@@ -16,7 +16,7 @@ const mocks = vi.hoisted(() => ({
   secretPaths: [] as string[],
   assistantSpawn: { kind: 'off' } as { kind: 'off' } | { kind: 'unclaimed' } | { kind: 'owner'; openId: string; workDir: string },
 }));
-vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => mocks.assistantSpawn }));
+vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => mocks.assistantSpawn, assistantMultiUserGroupsOff: () => false }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),

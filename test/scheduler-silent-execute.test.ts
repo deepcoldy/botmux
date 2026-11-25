@@ -2024,6 +2024,11 @@ describe('assistant mode without multi-user groups (assistantGroupChat off)', ()
     expect(forkWorkerMock).not.toHaveBeenCalled(); expect(store.size).toBe(0);
   });
 
+  it('refuses when the member count is missing (reported as 0)', async () => {
+    getChatInfoMock.mockResolvedValue({ userCount: 0, botCount: 1 });
+    await expect(executeScheduledTask(baseTask({}), new Map(), refreshCliVersion)).rejects.toThrow(REFUSED);
+  });
+
   it('refuses when the chat lookup fails', async () => {
     getChatRoutingFactsMock.mockRejectedValue(new Error('lark down'));
     await expect(executeScheduledTask(baseTask({}), new Map(), refreshCliVersion)).rejects.toThrow(REFUSED);
