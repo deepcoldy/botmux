@@ -27,7 +27,7 @@ vi.mock('../src/im/lark/client.js', () => ({ replyMessage: mocks.reply, updateMe
 import { handleOncallGroupAction, handleOncallFormAction, retryPendingOncallHandoffs } from '../src/im/lark/oncall-group.js';
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
-import { createNativeOncallLink, readNativeOncallResult } from '../src/services/oncall-platform.js';
+import { createNativeOncallLink, readNativeOncallResultCandidates } from '../src/services/oncall-platform.js';
 import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { buildDashboardUrls } from '../src/core/dashboard-url.js';
 const target = { endpoint: 'https://oncall.example.test/api/inf/v1/chat/', tenantId: 12, emailDomain: 'example.test' };
@@ -235,11 +235,90 @@ describe('platform completion protocol', () => {
     expect(new URL(expected).searchParams.size).toBe(1);
     rows[0].source_location = expected;
     await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    vi.setSystemTime(started + 21_000);
+    await retryPendingOncallHandoffs(appId);
     const lists = fetcher.mock.calls.filter(([url]) => url.includes('/oncall_flow/list'));
-    expect(lists).toHaveLength(1);
+    expect(lists).toHaveLength(2);
     expect(JSON.parse(lists[0]![1].body).filter_fields).toContainEqual({ field: 'source_location', value: [expected], operator: 'in' });
+    expect(JSON.parse(lists[1]![1].body).filter_fields).toContainEqual(expect.objectContaining({ field: 'update_time', operator: 'greater_or_equals' }));
     expect(new OncallGroupStore(dir).getRequest(source)?.flowId).toBe('1234');
     expect(mocks.merge).toHaveBeenCalledOnce();
+  });
+
+  it('ignores unrelated rows returned by a hosted exact-source query', async () => {
+    mocks.remote = 'sso';
+    vi.stubEnv('BOTMUX_PUBLIC_URL', 'https://dashboard.example.test');
+    const d = await open(); submitted(d);
+    const expected = d.nativeSubmission.attempts[0]!.hostedSourceLocation!;
+    rows[0].source_location = expected;
+    rows.push({ ...rows[0], id: 5678, source_location: 'https://oncall.example.test/chat?bm_form=other' });
+    const respond = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation(async (url, init) => {
+      const filters = url.includes('/oncall_flow/list') ? JSON.parse(String(init?.body)).filter_fields : [];
+      if (filters.some((filter: any) => filter.field === 'source_location')) return json(rows);
+      return respond(url, init);
+    });
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1234 });
+    vi.setSystemTime(started + 21_000);
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)?.flowId).toBe('1234');
+    expect(mocks.merge).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])('rechecks normalized hosted sources before adoption (exact duplicate: %s)', async duplicate => {
+    mocks.remote = 'sso';
+    vi.stubEnv('BOTMUX_PUBLIC_URL', 'https://dashboard.example.test');
+    const d = await open(); submitted(d);
+    const expected = d.nativeSubmission.attempts[0]!.hostedSourceLocation!;
+    const exact = { ...rows[0], id: 5678, source_location: expected };
+    rows[0].source_location = `${expected}&bizFrom=lark`;
+    if (duplicate) rows.push(exact);
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    vi.setSystemTime(started + 21_000);
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)?.flowId).toBe(duplicate ? undefined : '1234');
+    expect(mocks.merge).toHaveBeenCalledTimes(duplicate ? 0 : 1);
+  });
+
+  it('refreshes the creation horizon before starting a delayed verification', async () => {
+    mocks.remote = 'sso';
+    vi.stubEnv('BOTMUX_PUBLIC_URL', 'https://dashboard.example.test');
+    const d = await open(); submitted(d);
+    rows[0].source_location = d.nativeSubmission.attempts[0]!.hostedSourceLocation!;
+    await retryPendingOncallHandoffs(appId);
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1234 });
+    rows.push({ ...rows[0], id: 5678,
+      create_time: new Date(started + 10_000).toISOString(), update_time: new Date(started + 10_000).toISOString() });
+    vi.setSystemTime(started + 21_000);
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
+    expect(mocks.merge).not.toHaveBeenCalled();
+  });
+
+  it('refuses adoption within bounded paginated verification retries', async () => {
+    mocks.remote = 'sso';
+    vi.stubEnv('BOTMUX_PUBLIC_URL', 'https://dashboard.example.test');
+    const d = await open(); submitted(d);
+    const targetRow = { ...rows[0], id: 101, source_location: d.nativeSubmission.attempts[0]!.hostedSourceLocation! };
+    rows = [...Array.from({ length: 100 }, (_, i) => ({ ...rows[0], id: i + 1,
+      source_location: 'https://oncall.example.test/chat?bm_form=other' })), targetRow];
+    await retryPendingOncallHandoffs(appId);
+    let passes = 0;
+    while ((await current(d)).nativeSubmission?.scan && passes < 5) {
+      passes++;
+      vi.setSystemTime(started + 6_000 + passes * 15_000);
+      await retryPendingOncallHandoffs(appId);
+      expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+      if (passes === 1) expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 101, verifyRounds: 1 });
+    }
+    expect(passes).toBeGreaterThan(1);
+    expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
+    expect(mocks.merge).not.toHaveBeenCalled();
   });
 
   it.each(['sso', 'devbox'] as const)('leaves the native AppLink intact when only %s is configured', async remote => {
@@ -268,8 +347,137 @@ describe('platform completion protocol', () => {
     const lists = fetcher.mock.calls.filter(([url]) => url.includes('/oncall_flow/list'));
     expect(lists).toHaveLength(11);
     expect(JSON.parse(lists[10]![1].body).filter_fields).toContainEqual({ field: 'id', value: '1001', operator: 'greater_or_equals' });
-    expect(new OncallGroupStore(dir).getRequest(source)?.flowId).toBe(duplicate ? undefined : '1234');
-    expect(mocks.merge).toHaveBeenCalledTimes(duplicate ? 0 : 1);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect(mocks.merge).not.toHaveBeenCalled();
+    if (duplicate) return;
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1234 });
+    rows = [wanted];
+    vi.setSystemTime(started + 36_000);
+    await retryPendingOncallHandoffs(appId);
+    expect(fetcher.mock.calls.filter(([url]) => url.includes('/oncall_flow/list'))).toHaveLength(12);
+    expect(new OncallGroupStore(dir).getRequest(source)?.flowId).toBe('1234');
+    expect(mocks.merge).toHaveBeenCalledOnce();
+  });
+
+  it('rechecks an older ID that enters the window after the cursor has passed it', async () => {
+    const d = await open(); submitted(d);
+    const targetRow = { ...rows[0], id: 1001 };
+    const duplicate = { ...rows[0], id: 1, update_time: new Date(started - 60_000).toISOString() };
+    rows = [duplicate, ...Array.from({ length: 999 }, (_, i) => ({ ...rows[0], id: i + 2,
+      source_location: 'https://oncall.example.test/chat?bm_form=other' })), targetRow];
+    await retryPendingOncallHandoffs(appId);
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 1001, flowId: 1001 });
+    duplicate.update_time = new Date(started + 6000).toISOString();
+    vi.setSystemTime(started + 21_000);
+    await retryPendingOncallHandoffs(appId);
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1001 });
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    vi.setSystemTime(started + 36_000);
+    await retryPendingOncallHandoffs(appId);
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 1000, flowId: 1, verifyFlowId: 1001 });
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    vi.setSystemTime(started + 51_000);
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
+    expect(mocks.merge).not.toHaveBeenCalled();
+  });
+
+  it('rechecks an older ID that changes between two pages of the first scan', async () => {
+    const d = await open(); submitted(d);
+    const targetRow = { ...rows[0], id: 102 };
+    const duplicate = { ...rows[0], id: 1, update_time: new Date(started - 60_000).toISOString() };
+    rows = [duplicate, ...Array.from({ length: 100 }, (_, i) => ({ ...rows[0], id: i + 2,
+      source_location: 'https://oncall.example.test/chat?bm_form=other' })), targetRow];
+    const respond = fetcher.getMockImplementation()!;
+    let firstPage = true;
+    fetcher.mockImplementation(async (url, init) => {
+      const result = await respond(url, init);
+      if (firstPage && url.includes('/oncall_flow/list')) {
+        firstPage = false;
+        duplicate.update_time = new Date(started + 5000).toISOString();
+      }
+      return result;
+    });
+    await retryPendingOncallHandoffs(appId);
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 102 });
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    vi.setSystemTime(started + 21_000);
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
+    expect(mocks.merge).not.toHaveBeenCalled();
+  });
+
+  it('restarts verification when an older ID arrives between verification pages', async () => {
+    mocks.remote = 'sso';
+    vi.stubEnv('BOTMUX_PUBLIC_URL', 'https://dashboard.example.test');
+    const d = await open(); submitted(d);
+    const targetRow = { ...rows[0], id: 102, source_location: d.nativeSubmission.attempts[0]!.hostedSourceLocation! };
+    const duplicate = { ...rows[0], id: 1, update_time: new Date(started - 60_000).toISOString() };
+    rows = [duplicate, ...Array.from({ length: 100 }, (_, i) => ({ ...rows[0], id: i + 2,
+      source_location: 'https://oncall.example.test/chat?bm_form=other' })), targetRow];
+    await retryPendingOncallHandoffs(appId);
+    const respond = fetcher.getMockImplementation()!;
+    let firstVerificationPage = true;
+    fetcher.mockImplementation(async (url, init) => {
+      const result = await respond(url, init);
+      const filters = url.includes('/oncall_flow/list') ? JSON.parse(String(init?.body)).filter_fields : [];
+      if (firstVerificationPage && filters.some((filter: any) => filter.field === 'update_time')) {
+        firstVerificationPage = false;
+        duplicate.update_time = new Date(started + 22_000).toISOString();
+      }
+      return result;
+    });
+    vi.setSystemTime(started + 21_000);
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 102, verifyRounds: 1 });
+    vi.setSystemTime(started + 36_000);
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
+    expect(mocks.merge).not.toHaveBeenCalled();
+  });
+
+  it('restarts verification after its own 1000-row checkpoint before adopting', async () => {
+    mocks.remote = 'sso';
+    vi.stubEnv('BOTMUX_PUBLIC_URL', 'https://dashboard.example.test');
+    const d = await open(); submitted(d);
+    const targetRow = { ...rows[0], id: 1002, source_location: d.nativeSubmission.attempts[0]!.hostedSourceLocation! };
+    const duplicate = { ...rows[0], id: 1, update_time: new Date(started - 60_000).toISOString() };
+    rows = [duplicate, ...Array.from({ length: 1000 }, (_, i) => ({ ...rows[0], id: i + 2,
+      source_location: 'https://oncall.example.test/chat?bm_form=other' })), targetRow];
+    await retryPendingOncallHandoffs(appId);
+    vi.setSystemTime(started + 21_000);
+    await retryPendingOncallHandoffs(appId);
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 1001, verifyFlowId: 1002, verifyRounds: 0 });
+    duplicate.update_time = new Date(started + 22_000).toISOString();
+    vi.setSystemTime(started + 36_000);
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1002, verifyRounds: 1 });
+    rows = [duplicate, targetRow];
+    vi.setSystemTime(started + 51_000);
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
+    expect(mocks.merge).not.toHaveBeenCalled();
+  });
+
+  it('rejects a different single order returned by the verification pass', async () => {
+    const d = await open(); submitted(d);
+    const targetRow = { ...rows[0], id: 101 };
+    rows = [...Array.from({ length: 100 }, (_, i) => ({ ...rows[0], id: i + 1,
+      source_location: 'https://oncall.example.test/chat?bm_form=other' })), targetRow];
+    await retryPendingOncallHandoffs(appId);
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 101 });
+    rows = [{ ...targetRow, id: 202 }];
+    vi.setSystemTime(started + 21_000);
+    await retryPendingOncallHandoffs(appId);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
+    expect(mocks.merge).not.toHaveBeenCalled();
   });
 
   it('keeps the scan checkpoint when group ID conversion fails after the last page', async () => {
@@ -293,12 +501,17 @@ describe('platform completion protocol', () => {
     failConversion = false;
     vi.setSystemTime(started + 82_000);
     await retryPendingOncallHandoffs(appId);
+    expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1 });
+    expect(mocks.merge).not.toHaveBeenCalled();
+    rows = [wanted];
+    vi.setSystemTime(started + 97_000);
+    await retryPendingOncallHandoffs(appId);
     expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
     expect(mocks.merge).toHaveBeenCalledOnce();
   });
   it('queries the verified actor and preparation window with a bounded result set', async () => {
     const d = await open(); submitted(d);
-    await readNativeOncallResult(target, 'service-secret', { sourceLocation: d.nativeSubmission.attempts[0]!.sourceLocation, username: 'actor', typeId: 34, region: 'cn', preparedAtMs: started }, fetcher);
+    await readNativeOncallResultCandidates(target, 'service-secret', { sourceLocation: d.nativeSubmission.attempts[0]!.sourceLocation, username: 'actor', typeId: 34, region: 'cn', preparedAtMs: started }, fetcher);
     const call = fetcher.mock.calls.find(([url]) => url.includes('/oncall_flow/list'))!;
     const payload = JSON.parse((call[1] as any).body);
     expect(payload).toMatchObject({ current_page: 1, page_size: 100, filter_fields: expect.arrayContaining([
@@ -310,16 +523,16 @@ describe('platform completion protocol', () => {
     // A UTC daemon must read Beijing wall-clock time the same as a UTC+8 daemon.
     // Run the real function in a TZ=UTC child: a bare Date.parse would shift it.
     const source = `
-      import { readNativeOncallResult } from './src/services/oncall-platform.js';
+      import { readNativeOncallResultCandidates } from './src/services/oncall-platform.js';
       const rows = [{ id: 1234, tenant_id: 12, source_location: 'https://oncall.example.test/chat?bm_form=tz-form',
         originator_user: 'actor', oncall_question_type_id: 34, region: 'cn', stage: 'launch_oncall',
         chat_id: '123456789', oncall_start_time: '2026-01-01 08:00:02' }];
       const fetcher = async url => new Response(JSON.stringify({ code: 0,
         data: url.includes('chat_id_to_open_chat_id') ? 'oc_destination' : rows }));
-      const result = await readNativeOncallResult(
+      const matches = await readNativeOncallResultCandidates(
         { endpoint: 'https://oncall.example.test/api/inf/v1/chat/', tenantId: 12, emailDomain: 'example.test' },
         'secret', { sourceLocation: 'https://oncall.example.test/chat?bm_form=tz-form', username: 'actor', typeId: 34, region: 'cn' }, fetcher);
-      process.stdout.write(JSON.stringify(result));
+      process.stdout.write(JSON.stringify(matches[0]?.result));
     `;
     const run = spawnSyncTsEvalWithRepoImports(source, { cwd: process.cwd(), env: { ...process.env, TZ: 'UTC' }, encoding: 'utf8', timeout: 30_000 });
     expect(run.status, String(run.stderr)).toBe(0);

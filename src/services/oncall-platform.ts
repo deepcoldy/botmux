@@ -189,7 +189,12 @@ export interface NativeOncallScan {
   createdThrough: string;
   afterId: number;
   flowId?: number;
+  /** A candidate is adoptable only after this fresh full-window check stays unique. */
+  verifyFlowId?: number;
+  /** Completed verification passes that still could not prove a stable one-page window. */
+  verifyRounds?: number;
 }
+const MAX_NATIVE_ONCALL_VERIFICATION_ROUNDS = 2;
 interface NativeOncallScanProgress {
   checkpoint?: NativeOncallScan;
   save: (checkpoint: NativeOncallScan | undefined) => void;
@@ -228,14 +233,23 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
   const sources = queries.map(item => nativeSourceMatcher(item.sourceLocation));
   if (!sources.every(item => item.formId) && queries.length !== 1) throw new Error('同一批原生提单缺少统一关联标识');
   const exactSources = queries.map((item, index) => item.hostedSourceLocation ?? (sources[index]!.formId ? undefined : item.sourceLocation));
-  const exact = exactSources.every(source => source !== undefined);
   const key = createHash('sha256').update(JSON.stringify([target, queries])).digest('hex');
   const checkpoint = progress?.checkpoint?.key === key ? progress.checkpoint : undefined;
+  const verifyFlowId = checkpoint?.verifyFlowId;
+  const afterIdAtStart = checkpoint?.afterId ?? 0;
+  const resumedVerification = verifyFlowId !== undefined && afterIdAtStart > 0;
+  const verifyRounds = checkpoint?.verifyRounds ?? 0;
+  // Verification always uses the normalized-source scan, even for hosted links.
+  const exact = verifyFlowId === undefined && exactSources.every(source => source !== undefined);
   const since = platformTime(Math.min(...queries.map(item => item.preparedAtMs ?? Date.now() - 24 * 60 * 60_000)));
-  const createdThrough = checkpoint?.createdThrough ?? platformTime(Date.now());
-  let afterId = checkpoint?.afterId ?? 0;
+  // A fresh verification must include orders created since the candidate was found.
+  // Once its paginated scan starts, the horizon stays fixed across checkpoints.
+  const createdThrough = verifyFlowId !== undefined && afterIdAtStart === 0
+    ? platformTime(Date.now()) : checkpoint?.createdThrough ?? platformTime(Date.now());
+  let afterId = afterIdAtStart;
   let flowId = checkpoint?.flowId;
   let matched: { row: any; attempts: T[] } | undefined;
+  let scannedMultiplePages = false;
 
   async function list(filters: Array<{ field: string; value: string | Array<string | number>; operator: string }>, pageSize: number) {
     let response: Response;
@@ -256,10 +270,10 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
     return body.data;
   }
 
-  function match(row: any) {
+  function match(row: any, exactSource = false) {
     const matches = sources.map((source, index) => {
-      const exactSource = exactSources[index];
-      return exactSource ? row?.source_location === exactSource : source.matches(row?.source_location);
+      const expectedSource = exactSources[index];
+      return exactSource && expectedSource ? row?.source_location === expectedSource : source.matches(row?.source_location);
     });
     if (!matches.some(Boolean)) return;
     if (row.tenant_id !== target.tenantId || row.originator_user !== username || row.stage !== 'launch_oncall'
@@ -275,14 +289,17 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
   }
 
   if (exact) {
-    // Two rows are enough to prove ambiguity. Re-check the source in case a
-    // gateway does not enforce the filter.
+    // Re-check every row in case a gateway ignores the source filter. Only a
+    // second distinct matching flow ID is ambiguous; unrelated rows are not.
     const rows = await list([{ field: 'source_location', value: [...new Set(exactSources)], operator: 'in' }], 2);
-    for (const row of rows) match(row);
-    if (rows.length >= 2) throw new Error('Oncall 来源查询结果不唯一');
-  } else {
+    for (const row of rows) match(row, true);
+  }
+  // A normalized hosted source may not satisfy exact equality. Fall back to
+  // the bounded normalized-source scan instead of treating zero exact hits as absence.
+  if (!exact || !matched) {
     const pageSize = 100;
     for (let page = 0; page < 10; page++) {
+      if (page > 0) scannedMultiplePages = true;
       const rows = await list([
         { field: 'update_time', value: since, operator: 'greater_or_equals' },
         // An order that is updated while we scan must stay in the same window.
@@ -297,7 +314,8 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
       if (rows.length < pageSize) break;
       if (page === 9) {
         if (!progress) throw new Error('Oncall 查询结果过多，请管理员核对');
-        progress.save({ key, createdThrough, afterId, flowId });
+        progress.save({ key, createdThrough, afterId, flowId, verifyFlowId,
+          ...(verifyFlowId !== undefined ? { verifyRounds } : {}) });
         return [];
       }
     }
@@ -323,15 +341,30 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
     ? `${timestamp.replace(' ', 'T')}+08:00` : timestamp;
   const handoffAtMs = Date.parse(qualified);
   if (!Number.isFinite(handoffAtMs)) throw new Error('Oncall 发起人工时间无效');
+  if (verifyFlowId !== undefined && row.id !== verifyFlowId) {
+    progress?.save(undefined);
+    throw new Error('原生提单复核结果已变化，请管理员核对');
+  }
+  if (progress && verifyFlowId !== undefined && (resumedVerification || scannedMultiplePages)) {
+    // A paginated verification can reproduce the same late-lower-ID blind spot
+    // it was meant to close. Only a fresh, single-page pass proves uniqueness.
+    const nextRound = verifyRounds + 1;
+    if (nextRound >= MAX_NATIVE_ONCALL_VERIFICATION_ROUNDS) {
+      progress.save(undefined);
+      throw new Error('原生提单复核窗口未稳定，请管理员核对');
+    }
+    progress.save({ key, createdThrough: platformTime(Date.now()), afterId: 0, verifyFlowId, verifyRounds: nextRound });
+    return [];
+  }
   const openChatId = await get(target, secret, '', 'platform/chat_id_to_open_chat_id', { chat_id: String(row.chat_id) }, fetcher);
   if (typeof openChatId !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(openChatId)) throw new Error('Oncall 人工群标识无效');
   const result = { flowId: String(row.id), openChatId, handoffAtMs };
+  if (progress && verifyFlowId === undefined && (checkpoint !== undefined || exact || scannedMultiplePages)) {
+    // A cursor that has already passed older IDs cannot see a late update there.
+    // Re-scan from the beginning before adoption; exact-source hits also use
+    // this pass when a gateway ignores its filter or normalizes the stored URL.
+    progress.save({ key, createdThrough: platformTime(Date.now()), afterId: 0, verifyFlowId: row.id, verifyRounds: 0 });
+    return [];
+  }
   return attempts.map(attempt => ({ attempt, result }));
-}
-
-/** Exact source and actor matching; an ambiguous result is never guessed. */
-export async function readNativeOncallResult(target: OncallGroupTarget, secret: string,
-  expected: NativeOncallResultQuery, fetcher: typeof fetch = fetch): Promise<NativeOncallResult | undefined> {
-  const matches = await readNativeOncallResultCandidates(target, secret, expected, fetcher);
-  return matches[0]?.result;
 }

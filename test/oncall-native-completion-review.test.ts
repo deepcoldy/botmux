@@ -12,7 +12,7 @@ vi.mock('../src/im/lark/client.js', () => ({ updateMessage: mocks.update, delete
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
 import { reconcileNativeOncallSubmissions, retryPendingOncallHandoffs } from '../src/im/lark/oncall-group.js';
-import { readNativeOncallResult } from '../src/services/oncall-platform.js';
+import { readNativeOncallResultCandidates } from '../src/services/oncall-platform.js';
 import { loadOncallGroupTarget } from '../src/services/oncall-group-client.js';
 let dir: string, now: number, fetcher: ReturnType<typeof vi.fn>, rows: any[];
 const source: OncallGroupSource = { appId: 'app', sessionId: 'old', chatId: 'oc_source', rootId: 'om_q1', questionId: 'om_q1', messageId: 'om_a1', answer: 'old answer' };
@@ -164,14 +164,57 @@ describe('native normalized source matching review', () => {
   const expected = { sourceLocation: 'https://oncall.example.test/chat?bm_form=wanted&bizFrom=botmux', username: 'actor', typeId: 34, region: 'cn' };
   it('does not adopt an order for a different form even when all business fields agree', async () => {
     rows[0].source_location = 'https://oncall.example.test/chat?bm_form=other&bizFrom=lark';
-    await expect(readNativeOncallResult(target, 'secret', expected, fetcher)).resolves.toBeUndefined();
+    await expect(readNativeOncallResultCandidates(target, 'secret', expected, fetcher)).resolves.toEqual([]);
     expect(fetcher).toHaveBeenCalledOnce();
   });
   it.each(['https://another.example.test/chat?bm_form=wanted', 'https://oncall.example.test/another?bm_form=wanted',
     'https://oncall.example.test/chat?bm_form=wanted&bm_form=other'])('rejects an untrusted origin, path or duplicated correlation: %s', async location => {
     rows[0].source_location = location;
-    await expect(readNativeOncallResult(target, 'secret', expected, fetcher)).resolves.toBeUndefined();
+    await expect(readNativeOncallResultCandidates(target, 'secret', expected, fetcher)).resolves.toEqual([]);
     expect(fetcher).toHaveBeenCalledOnce();
+  });
+  it('rechecks a legacy exact source when the gateway returns unrelated rows', async () => {
+    const legacy = { ...expected, sourceLocation: 'https://oncall.example.test/chat?legacy=1' };
+    rows = [
+      { ...rows[0], source_location: legacy.sourceLocation },
+      { ...rows[0], id: 1235, source_location: 'https://oncall.example.test/chat?legacy=other' },
+      { ...rows[0], id: 5678, source_location: legacy.sourceLocation },
+    ];
+    fetcher.mockImplementation(async (url: string, options: any) => {
+      if (!url.includes('/oncall_flow/list')) return json('oc_destination');
+      return json(rows.slice(0, JSON.parse(options.body).page_size));
+    });
+    const progress: any = { checkpoint: undefined, save(next: any) { progress.checkpoint = next; } };
+    await expect(readNativeOncallResultCandidates(target, 'secret', legacy, fetcher, progress)).resolves.toEqual([]);
+    expect(progress.checkpoint).toMatchObject({ afterId: 0, verifyFlowId: 1234 });
+    await expect(readNativeOncallResultCandidates(target, 'secret', legacy, fetcher, progress))
+      .rejects.toThrow('同一表单存在多个工单');
+  });
+
+  it('rejects non-monotonic IDs between pages', async () => {
+    const other = { ...rows[0], source_location: 'https://oncall.example.test/chat?bm_form=other' };
+    fetcher.mockImplementation(async (_url: string, options: any) => {
+      const filters = JSON.parse(options.body).filter_fields;
+      const cursor = filters.find((filter: any) => filter.field === 'id' && filter.operator === 'greater_or_equals');
+      return json(cursor ? [{ ...other, id: 100 }]
+        : Array.from({ length: 100 }, (_, i) => ({ ...other, id: i + 1 })));
+    });
+    await expect(readNativeOncallResultCandidates(target, 'secret', expected, fetcher)).rejects.toThrow('Oncall 工单分页未按 ID 推进');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+  it('ignores a checkpoint bound to a different query key', async () => {
+    const wanted = { ...rows[0], id: 1, source_location: expected.sourceLocation };
+    let payload: any;
+    fetcher.mockImplementation(async (url: string, options: any) => {
+      if (url.includes('/oncall_flow/list')) { payload = JSON.parse(options.body); return json([wanted]); }
+      return json('oc_destination');
+    });
+    const matches = await readNativeOncallResultCandidates(target, 'secret', expected, fetcher, {
+      checkpoint: { key: 'unrelated-query', createdThrough: '2025-01-01 08:00:00', afterId: 1000 }, save: vi.fn(),
+    });
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.result.flowId).toBe('1');
+    expect(payload.filter_fields.find((filter: any) => filter.field === 'id' && filter.operator === 'greater_or_equals')).toBeUndefined();
   });
   it('stops after the bounded page window and refuses to infer absence from an incomplete scan', async () => {
     const other = { ...rows[0], source_location: 'https://oncall.example.test/chat?bm_form=other' };
@@ -180,7 +223,7 @@ describe('native normalized source matching review', () => {
       const first = cursor ? Number(cursor.value) : 1;
       return json(Array.from({ length: 100 }, (_, i) => ({ ...other, id: first + i })));
     });
-    await expect(readNativeOncallResult(target, 'secret', expected, fetcher)).rejects.toThrow();
+    await expect(readNativeOncallResultCandidates(target, 'secret', expected, fetcher)).rejects.toThrow();
     expect(fetcher).toHaveBeenCalledTimes(10);
   });
   it('refuses a second matching order found on a later page', async () => {
@@ -190,7 +233,7 @@ describe('native normalized source matching review', () => {
       const cursor = JSON.parse(options.body).filter_fields.find((filter: any) => filter.field === 'id');
       return json(!cursor ? [wanted, ...Array.from({ length: 99 }, (_, i) => ({ ...other, id: 10000 + i }))] : [{ ...wanted, id: 11000 }]);
     });
-    await expect(readNativeOncallResult(target, 'secret', expected, fetcher)).rejects.toThrow();
+    await expect(readNativeOncallResultCandidates(target, 'secret', expected, fetcher)).rejects.toThrow();
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 });
