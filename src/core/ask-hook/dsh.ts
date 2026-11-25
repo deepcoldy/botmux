@@ -124,18 +124,21 @@ const dshAdapter: HookAskAdapter = {
     parsed: ParsedAsk,
     comment?: string | null,
     customAnswers?: ReadonlyArray<string | null>,
+    notes?: ReadonlyArray<string | null>,
   ): string {
     const rawQuestions = Array.isArray((parsed.raw as { rawQuestions?: unknown }).rawQuestions)
       ? ((parsed.raw as { rawQuestions: RawDshQuestion[] }).rawQuestions)
       : [];
     const customText = (comment ?? '').trim();
     const answers = parsed.questions.map((_q, i) => {
-      const text = customAnswers?.[i] ?? customText;
       const selected = customAnswers?.[i] ? [] : [...(answersByQuestion[i] ?? [])];
+      // dsh takes `custom` next to `selected`: the own answer when nothing is selected,
+      // or the note written next to the selected options.
+      const text = selected.length ? notes?.[i] ?? '' : customAnswers?.[i] ?? customText;
       return {
         id: rawQuestionId(rawQuestions[i] ?? {}, i),
         selected,
-        ...(selected.length === 0 && text.length > 0 ? { custom: text } : {}),
+        ...(text.length > 0 ? { custom: text } : {}),
       };
     });
     return JSON.stringify({ answers });

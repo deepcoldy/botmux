@@ -1,7 +1,9 @@
 /** Execute a production closure with explicit host dependencies, matching the
  * worker-function harness while the pool still has no importable host seam. */
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import ts from 'typescript';
 import { controllerForSession } from '../../src/core/session-controller.js';
 import { activeSessionKey } from '../../src/core/types.js';
@@ -11,7 +13,20 @@ import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '
 import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
 import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
+import { cotMessageFinishStatus } from '../../src/im/lark/cot-message.js';
 import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
+import { ProtectedResultStore } from '../../src/services/protected-result-store.js';
+
+/** deliverFinalOutput's protected final gate reads `config.session.dataDir` and
+ * constructs ProtectedResultStore. Sliced closures do not load module imports,
+ * so give the harness a real empty data dir: with no protection index every
+ * protected lookup resolves to undefined, leaving existing fixtures unchanged.
+ * Created lazily — module import can run before the fenced tmp dir exists. */
+let harnessDataDir: string | undefined;
+function getHarnessDataDir(): string {
+  if (!harnessDataDir) harnessDataDir = mkdtempSync(join(tmpdir(), 'worker-pool-harness-protected-'));
+  return harnessDataDir;
+}
 import {
   cancelAntigravityRotationReplay,
   clearInFlightAntigravityRotation,
@@ -33,6 +48,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
+  if (key === 'cotMessageFinishStatus') return cotMessageFinishStatus;
   if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
   if (key === 'cancelAntigravityRotationReplay') return cancelAntigravityRotationReplay;
   if (key === 'clearInFlightAntigravityRotation') return clearInFlightAntigravityRotation;
@@ -49,12 +65,16 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'noteExplicitEffortPreferenceEdit') return noteExplicitEffortPreferenceEdit;
   if (key === 'assertSessionLaunchModelChoiceAllowed') return assertSessionLaunchModelChoiceAllowed;
   if (key === 'cliModelMayKeepReasoningEffort') return cliModelMayKeepReasoningEffort;
-  if (key === 'config') return { terminalEffortWriteback: false };
+  if (key === 'config') return { terminalEffortWriteback: false, session: { dataDir: getHarnessDataDir() } };
+  if (key === 'ProtectedResultStore') return ProtectedResultStore;
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
   if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
-    'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed'].includes(key)) {
+    'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
+    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage',
+    'requiredReplyCotHoldKey', 'settleRequiredReplyBackground', 'settleRequiredReplyCotMessage',
+    'failRequiredReplyCotHolds'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];

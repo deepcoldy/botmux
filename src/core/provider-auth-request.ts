@@ -14,6 +14,7 @@ import type { AuthLinkDelivery } from './auth-link-delivery.js';
 import type { MeegoTenant } from '../services/bytedcli-home.js';
 import type { MeegoLoginRequest } from '../services/meego-auth.js';
 import type { BytedcliLoginStart } from '../services/bytedcli-auth.js';
+import type { AdoptResult } from './turn-cli-identity.js';
 
 export type AuthProvider = 'meego' | 'bytedcli';
 
@@ -42,9 +43,9 @@ export interface ProviderAuthDeps {
   /** A link to send; or `authorized` when bytedcli already holds a confirmed
    *  login; or `failed` with a redacted reason. */
   startBytedcliLogin: (openId: string) => Promise<BytedcliLoginStart>;
-  /** Hands a finished ByteCloud login to the running turn; true when the turn
-   *  can use it now. */
-  adoptBytedcliForTurn: (openId: string) => Promise<'adopted' | 'already' | 'none'>;
+  /** Hands a finished ByteCloud login to the running turn; `'unavailable'` when
+   *  minting fails transiently, `'superseded'` when a safety fence changed. */
+  adoptBytedcliForTurn: (openId: string) => Promise<AdoptResult>;
   /** {@link deliverAuthLink} bound to this conversation and person. */
   deliver: (text: string, privateCommand: string) => Promise<AuthLinkDelivery>;
   now?: () => number;
@@ -85,7 +86,18 @@ export async function requestProviderAuth(
       ? { state: 'authorized' as const }
       : await deps.startBytedcliLogin(openId);
     if (started.state === 'authorized') {
-      const adopted = await deps.adoptBytedcliForTurn(openId);
+      let adopted: AdoptResult;
+      try {
+        adopted = await deps.adoptBytedcliForTurn(openId);
+      } catch {
+        adopted = 'unavailable';
+      }
+      if (adopted === 'unavailable') {
+        return { status: 'unavailable', message: t('provider_auth.ready_bytedcli_unavailable', undefined, locale) };
+      }
+      if (adopted === 'superseded') {
+        return { status: 'unavailable', message: t('provider_auth.ready_bytedcli_superseded', undefined, locale) };
+      }
       const key = { adopted: 'provider_auth.ready_bytedcli_now', already: 'provider_auth.ready_bytedcli_already', none: 'provider_auth.ready_bytedcli' }[adopted];
       return { status: 'ready', message: t(key, undefined, locale) };
     }

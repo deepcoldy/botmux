@@ -275,9 +275,10 @@ describe('toggle status without a fresh worker report', () => {
     worker.emit('exit', 1, null);
     await flush();
     expect(ds.worker).toBeNull();
-    // The exit path keeps the last report; the card must not trust it.
+    // The exit path keeps the last screen status for audit, but the dead
+    // generation's background tasks must not keep occupying the session.
     expect(ds.lastScreenStatus).toBe('working');
-    expect(ds.backgroundTaskCount).toBe(2);
+    expect(ds.backgroundTaskCount).toBeUndefined();
 
     const card = await toggleCurrent(ds, deps);
     expect(statusOf(card)).toBe(IDLE);

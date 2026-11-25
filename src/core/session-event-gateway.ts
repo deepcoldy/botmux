@@ -22,8 +22,9 @@ const immutableFacts = new Set(['turn_terminal', 'final_output', 'final_output_o
 // cli_input_backlog reports the worker's own input queue, which outlives runtime
 // re-bindings; the worker sends it without a runtime (see sessionEventMetadata).
 // failed_turn_rewind likewise: it is sent from inside the CLI restart that cuts
-// a failed turn, before the queued message runs.
-const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack', 'persistent_backend_target', 'session_identity_decision', 'cli_input_backlog', 'failed_turn_rewind']);
+// a failed turn, before the queued message runs. Type-ahead queue observations
+// are also worker-scoped: naming an execution never claims that it started.
+const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack', 'persistent_backend_target', 'session_identity_decision', 'cli_input_backlog', 'failed_turn_rewind', 'type_ahead_queued', 'type_ahead_turn_dropped', 'type_ahead_queue_snapshot']);
 /** A trusted channel supplies producer identity. An event cannot self-upgrade
  * to the current execution instance merely because its IPC worker survived. */
 export class SessionEventGateway {
@@ -84,7 +85,13 @@ export class SessionEventGateway {
             && !['succeeded', 'failed', 'cancelled'].includes(execution.phase)
             && !!sourceRuntime
             && this.store.runtimeContinues(this.session, sourceRuntime.ref, runtime, sourceRuntime.worker)));
-      if (!sameRuntime(execution.runtime, runtime) && !sameContinuedExecutionRuntime
+      // A physical exit belongs to the proven runtime/producer, not to an
+      // input admission. An argv opening prompt can still be queued here when
+      // the CLI exits before its first transcript start. Refusing that exit
+      // leaves the worker alive with backend=null and no daemon restart owner.
+      // Keep validating the execution reference above; never grant it runtime
+      // ownership merely because its process died.
+      if (type !== 'claude_exit' && !sameRuntime(execution.runtime, runtime) && !sameContinuedExecutionRuntime
         && !(!execution.runtime && (recovery || workerEvents.has(type) || unboundCurrent))) {
         return { kind: 'reject', reason: 'execution_scope_unproven' };
       }

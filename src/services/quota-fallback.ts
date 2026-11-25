@@ -73,6 +73,28 @@ export type QuotaFallbackConfigNormalization =
 const LARK_APP_ID_RE = /^cli_[A-Za-z0-9]+$/;
 const NATIVE_AT_TAG_RE = /<\/?at(?:\s|>|$)/i;
 
+/** Limit kinds that trigger a quota fallback; missing means both. */
+export function normalizeQuotaFallbackKinds(
+  raw: unknown,
+  field: string,
+): { kinds: QuotaFallbackKind[] } | { error: string } {
+  if (raw === undefined) return { kinds: ['usage', 'rate'] };
+  if (!Array.isArray(raw)) {
+    return { error: `${field}.kinds must be an array containing usage and/or rate` };
+  }
+  const kinds: QuotaFallbackKind[] = [];
+  for (const kind of raw) {
+    if (kind !== 'usage' && kind !== 'rate') {
+      return { error: `${field}.kinds accepts only usage and rate` };
+    }
+    if (!kinds.includes(kind)) kinds.push(kind);
+  }
+  if (kinds.length === 0) {
+    return { error: `${field}.kinds must contain at least one limit kind` };
+  }
+  return { kinds };
+}
+
 /**
  * Normalize the optional bots.json block. Invalid enabled blocks are disabled
  * as one unit (and surfaced to the caller as an error) rather than partially
@@ -102,23 +124,9 @@ export function normalizeQuotaFallbackBotConfig(
     return { error: 'quotaFallbackBot.targetAppId must not point to the current bot' };
   }
 
-  let kinds: QuotaFallbackKind[] = ['usage', 'rate'];
-  if (value.kinds !== undefined) {
-    if (!Array.isArray(value.kinds)) {
-      return { error: 'quotaFallbackBot.kinds must be an array containing usage and/or rate' };
-    }
-    const normalized: QuotaFallbackKind[] = [];
-    for (const kind of value.kinds) {
-      if (kind !== 'usage' && kind !== 'rate') {
-        return { error: 'quotaFallbackBot.kinds accepts only usage and rate' };
-      }
-      if (!normalized.includes(kind)) normalized.push(kind);
-    }
-    if (normalized.length === 0) {
-      return { error: 'quotaFallbackBot.kinds must contain at least one limit kind' };
-    }
-    kinds = normalized;
-  }
+  const normalizedKinds = normalizeQuotaFallbackKinds(value.kinds, 'quotaFallbackBot');
+  if ('error' in normalizedKinds) return { error: normalizedKinds.error };
+  const kinds = normalizedKinds.kinds;
 
   const message = value.message === undefined
     ? DEFAULT_QUOTA_FALLBACK_MESSAGE

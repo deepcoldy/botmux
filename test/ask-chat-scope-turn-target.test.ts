@@ -12,7 +12,7 @@ import {
   setExplicitAskSessionChecker,
   submitCustomReply,
 } from '../src/core/ask-broker.js';
-import { parseAskBody, registerAskForResponse, verifiedAskMention } from '../src/core/ask-api.js';
+import { askResponseBody, parseAskBody, registerAskForResponse, verifiedAskMention } from '../src/core/ask-api.js';
 import { authorizeSessionScopedIpc, bindSessionScopedIpcIdentity } from '../src/core/daemon-ipc-session-auth.js';
 import { createExplicitAskContinuation, explicitAskOriginIsLive, explicitAskSessionBound } from '../src/core/explicit-ask-continuation.js';
 import { frozenReplyContextForTurn } from '../src/core/reply-target.js';
@@ -20,6 +20,7 @@ import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
 import { isSilentMessageListenerSession } from '../src/core/message-listener-silence.js';
 import { productionConst } from './helpers/codex-async-answer-function-harness.js';
 import { captureCodexAsyncAskOrigin } from '../src/core/codex-async-ask-origin.js';
+import { codexAsyncAnswerNeedsRawInput, codexAsyncAskOriginEligible } from '../src/services/codex-async-user-input.js';
 import * as sessionControllers from '../src/core/session-controller.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -91,10 +92,17 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       captureRoutingGeneration: () => ({}),
       isCurrentRoutingGeneration: () => true,
       replyCardAskTarget: () => undefined,
+      // handleAskRequest evaluates the TUI raw-input gate before any branch;
+      // bind the production functions so every post() call shares stubs that
+      // cannot drift from src/services/codex-async-user-input.ts.
+      codexAsyncAnswerNeedsRawInput,
+      codexAsyncAskOriginEligible,
       getSessionPersistentBackendType: () => 'tmux',
       explicitAskContinuation: continuation,
       explicitAskOriginIsLive,
       registerAskForResponse,
+      askResponseBody,
+      localeForBot: () => 'zh',
       verifiedAskMention,
       isKnownPeerBot: () => false,
       isHumanOpenId: async () => true,

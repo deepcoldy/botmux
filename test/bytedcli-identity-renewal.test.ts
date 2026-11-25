@@ -77,6 +77,19 @@ describe('bytedcli identity renewal', () => {
     expect(trackedBytedcliRenewalCount()).toBe(0);
   });
 
+  it.each(['before', 'during'])('withholds renewed material when the person publication fence fails %s renewal', async when => {
+    const identity = publish(60, 60);
+    let admitted = when === 'during';
+    const validateBeforeWrite = vi.fn(() => admitted);
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity, validateBeforeWrite });
+    renew.mockImplementation(async () => { admitted = false; return { cloudJwt: 'person-fence-must-not-publish' }; });
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).toHaveBeenCalledTimes(when === 'during' ? 1 : 0);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).not.toContain('person-fence-must-not-publish');
+    expect(trackedBytedcliRenewalCount()).toBe(0);
+  });
+
   it('keeps the renewal entry across a transient authorization check and renews after recovery', async () => {
     const identity = publish(60, 60);
     const check = vi.fn()

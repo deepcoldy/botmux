@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-const mocks = vi.hoisted(() => ({ config: { larkAppId: 'cli_runtime_probe', larkAppSecret: 'secret', brand: 'feishu', ownerGroupFollow: { enabled: true } }, owner: 'ou_owner', token: vi.fn(async (_app: string, _secret: string, _brand: string, _owner: string, _signal?: AbortSignal) => 'owner-token'), bound: vi.fn(), ask: vi.fn(async (_args: unknown): Promise<any> => ({ kind: 'sent', deduped: false })), botList: vi.fn(), notify: vi.fn(async (..._args: any[]) => {}) }));
+import type { OwnerGroupFollowConfig } from '../src/services/owner-group-follow-policy.js';
+const mocks = vi.hoisted(() => ({ config: { larkAppId: 'cli_runtime_probe', larkAppSecret: 'secret', brand: 'feishu', ownerGroupFollow: { enabled: true } as OwnerGroupFollowConfig }, owner: 'ou_owner', token: vi.fn(async (_app: string, _secret: string, _brand: string, _owner: string, _signal?: AbortSignal) => 'owner-token'), bound: vi.fn(), ask: vi.fn(async (_args: unknown): Promise<any> => ({ kind: 'sent', deduped: false })), botList: vi.fn(), notify: vi.fn(async (..._args: any[]) => {}) }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: () => ({ config: mocks.config }), getOwnerOpenId: () => mocks.owner, getBotClient: () => ({}) }));
 vi.mock('../src/utils/user-token.js', () => ({ resolveUserToken: mocks.token }));
 vi.mock('../src/core/lark-tool-platform-credential.js', () => ({ resolveBoundLarkUserCredential: mocks.bound, platformIncrementalAuthorizeUrl: (page: string) => page }));
@@ -13,7 +14,7 @@ vi.mock('../src/im/lark/client.js', () => ({ sendUserMessage: mocks.notify }));
 import { startOwnerGroupFollow, callOwnerFollowApi } from '../src/services/owner-group-follow-runtime.js';
 import { OwnerGroupFollowStore } from '../src/services/owner-group-follow-store.js';
 import { notifyOwnerGroupFollowChanged } from '../src/services/owner-group-follow-policy.js';
-let dir: string, stop: (() => void) | undefined, owners: string[], inviteBody: any;
+let dir: string, stop: (() => void) | undefined, owners: (string | { chat_id: string; name?: string; description?: string })[], inviteBody: any;
 beforeEach(() => {
   vi.useFakeTimers(); vi.setSystemTime(new Date('2026-01-01T00:00:00Z')); dir = mkdtempSync(join(tmpdir(), 'follow-runtime-test-'));
   mocks.config.ownerGroupFollow = { enabled: true };
@@ -25,7 +26,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
     if (init.method === 'POST') { expect(JSON.parse(init.body as string)).toEqual({ id_list: ['cli_runtime_probe'] }); return new Response(JSON.stringify(inviteBody)); }
     expect(init.headers).toMatchObject({ Authorization: 'Bearer owner-token' });
-    return new Response(JSON.stringify({ code: 0, data: { items: owners.map(chat_id => ({ chat_id })), has_more: false } }));
+    return new Response(JSON.stringify({ code: 0, data: { items: owners.map(item => typeof item === 'string' ? { chat_id: item } : item), has_more: false } }));
   }));
 });
 afterEach(() => { stop?.(); stop = undefined; vi.unstubAllGlobals(); vi.useRealTimers(); rmSync(dir, { recursive: true, force: true }); });
@@ -54,6 +55,33 @@ describe('owner follow runtime API boundaries', () => {
     expect(mocks.bound.mock.calls.every(([input]) => input.openId === 'ou_owner' && input.delegated === false && input.sessionId === 'owner-group-follow:cli_runtime_probe')).toBe(true);
     expect(mocks.token.mock.calls.every(call => call[3] === 'ou_owner' && call[0] === 'cli_runtime_probe')).toBe(true);
     expect(store().read()?.entries.oc_new.status).toBe('joined');
+  });
+  it('invites by name or description from the existing list request and filters closed or unrelated alarms', async () => {
+    mocks.config.ownerGroupFollow = {
+      enabled: true,
+      includeRules: [
+        { field: 'name', op: 'endsWith', pattern: '[缺陷同步群]' },
+        { field: 'description', op: 'regex', pattern: '报警处理群|告警处理|值班处理|alarm group|incident triage' },
+      ],
+      excludeRules: [{ field: 'name', op: 'contains', pattern: '[已关单]' }],
+    };
+    await start();
+    owners.push(
+      { chat_id: 'oc_bug', name: '登录重试[缺陷同步群]' },
+      { chat_id: 'oc_desc_alert', name: '临时讨论', description: '自动创建的报警处理群' },
+      { chat_id: 'oc_desc_alert_en', name: 'Temporary chat', description: 'Auto-created alarm group for latency triage' },
+      { chat_id: 'oc_regular', name: '常驻告警群', description: '团队日常值班' },
+      { chat_id: 'oc_closed', name: '[已关单]处理群', description: '自动创建的报警处理群' },
+    );
+    await scan();
+    const calls = vi.mocked(fetch).mock.calls;
+    expect(calls.filter(([, init]) => init?.method === 'GET').map(([url]) => new URL(String(url)).pathname))
+      .toEqual(['/open-apis/im/v1/chats', '/open-apis/im/v1/chats']);
+    expect(calls.filter(([, init]) => init?.method === 'POST').map(([url]) => new URL(String(url)).pathname)).toEqual([
+      '/open-apis/im/v1/chats/oc_bug/members', '/open-apis/im/v1/chats/oc_desc_alert/members', '/open-apis/im/v1/chats/oc_desc_alert_en/members',
+    ]);
+    expect(mocks.botList).toHaveBeenCalledTimes(2);
+    expect(store().read()?.knownChatIds).toEqual(['oc_old', 'oc_bug', 'oc_desc_alert', 'oc_desc_alert_en', 'oc_regular', 'oc_closed']);
   });
   it.each(['envelope', 'sdk-exception'] as const)('does not request user authorization to repair a bot application permission failure (%s)', async shape => {
     mocks.bound.mockResolvedValue({ ok: true, credential: 'owner-token', appId: 'cli_platform', issuer: 'platform' });

@@ -41,6 +41,18 @@ describe('opt-in card callback diagnostics', () => {
     }
   });
 
+  it('shows each submitted form field with its value type only (how a checker arrives), never the value', () => {
+    vi.stubEnv('BOTMUX_CARD_ACTION_DIAGNOSTICS', '1');
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+    const input = { action: { value: { action: 'ask_choice_submit' },
+      form_value: { opt_0_0: true, opt_0_1: 'false', pick_1: ['k1'], custom_0: 'typed private answer' } } };
+    logCardActionDiagnostics('handler', input, normalizeCardActionData(input));
+    expect(info).toHaveBeenCalledWith('[card-action-diagnostics]', expect.objectContaining({
+      formValue: { opt_0_0: 'boolean', opt_0_1: 'string', pick_1: 'array', custom_0: 'string' },
+    }));
+    expect(JSON.stringify(info.mock.calls)).not.toContain('typed private answer');
+  });
+
   it('does not log arbitrary strings or objects as parsed callback fields', () => {
     vi.stubEnv('BOTMUX_CARD_ACTION_DIAGNOSTICS', '1');
     const info = vi.spyOn(logger, 'info').mockImplementation(() => {});

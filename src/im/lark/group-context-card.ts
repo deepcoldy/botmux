@@ -197,6 +197,22 @@ function buttonLink(node: CardNode): string | undefined {
   return url ? label ? `[${label}](${url})` : url : undefined;
 }
 
+/** An Ask's question or option as plain text: the card's own styling (colour and tag markup,
+ * bold markers, Markdown escapes added for display) is not part of what was asked. */
+function plainAskText(text: string): string {
+  return text.replace(/<\/?(?:font|text_tag)\b[^>]*>/g, '').replace(/(?<!\\)\*\*/g, '').replace(/\\([\\`*_~[\]])/g, '$1');
+}
+
+/** Visible option text of an options region: legacy buttons, checker rows, one-click rows (their
+ * Markdown), a plain option list, or a select's options. */
+function optionLabels(region: CardNode): string[] {
+  const labels = nodes(region).flatMap(node => node.tag === 'button' || node.tag === 'checker' ? [renderedText(node.text)]
+    : node.tag === 'markdown' ? [renderedText(node)]
+      : (node.tag === 'select_static' || node.tag === 'multi_select_static') && Array.isArray(node.options)
+        ? node.options.map((option: CardNode) => renderedText(option?.text)) : []);
+  return labels.map(plainAskText).filter(label => label.trim());
+}
+
 function projectNode(value: any, legacy = false, apiFormat = false): any {
   if (!value || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.map(child => projectNode(child, legacy, apiFormat)).filter(child => child !== undefined);
@@ -207,7 +223,10 @@ function projectNode(value: any, legacy = false, apiFormat = false): any {
     if (chartData) return chartData;
   }
   if (/^botmux_turn_options_\d+$/.test(value.element_id ?? '')) {
-    return { tag: 'markdown', content: nodes(value).filter(node => node.tag === 'button').map(button => renderedText(button.text)).filter(Boolean).join('\n') };
+    return { tag: 'markdown', content: optionLabels(value).join('\n') };
+  }
+  if (/^botmux_turn_question_\d+$/.test(value.element_id ?? '') && value.tag === 'markdown') {
+    return { tag: 'markdown', content: plainAskText(renderedText(value)) };
   }
   if (value.tag === 'button') {
     const link = buttonLink(value);

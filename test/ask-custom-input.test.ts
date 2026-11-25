@@ -6,11 +6,12 @@ import { _resetForTest, applyAskForm, getAskSnapshot, registerAsk, registerHostA
   setCardDispatcher, setAskPersistStore, restorePersistedAsks, submitAskFromDesktop } from '../src/core/ask-broker.js';
 import { createAskPersistStore } from '../src/core/ask-persist-store.js';
 import type { CreateAskInput, PendingAsk, AskResult } from '../src/core/ask-types.js';
+import { NATIVE_STANDALONE_ASK_ORIGIN } from '../src/core/ask-types.js';
 import { handleAskCardAction, buildAskCard } from '../src/im/lark/ask-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from '../src/im/lark/turn-reply-ask-elements.js';
 import { parseAskQuestions } from '../src/core/ask-questions.js';
 import { codexUserInputAnswer } from '../src/services/codex-user-input.js';
-import { codexAsyncAnswerText } from '../src/services/codex-async-user-input.js';
+import { codexAsyncAnswerText, CODEX_ASYNC_RESTORE_ASK_ORIGIN } from '../src/services/codex-async-user-input.js';
 import claude from '../src/core/ask-hook/claude-code.js';
 import opencode from '../src/core/ask-hook/opencode.js';
 import dsh from '../src/core/ask-hook/dsh.js';
@@ -40,69 +41,88 @@ function descendants(value: any): any[] {
 }
 
 describe('per-question custom form', () => {
-  it('renders each option on its own row and the last other option alongside a single-line input', async () => {
+  it('renders each option as its own checker row and one single-line own-answer input per question', async () => {
     const { ask } = await start();
     const form = descendants(JSON.parse(buildAskCard(ask))).find(n => n.tag === 'form');
-    const rows = form.elements.filter((n: any) => n.tag === 'column_set');
-    expect(rows).toHaveLength(4);
-    expect(rows[0].columns[0].elements.map((button: any) => button.text.content)).toEqual(['◉ A', '○ B']);
-    expect(rows[1].columns).toHaveLength(2);
-    expect(rows[1].columns[0].elements[0].text.content).toContain('○');
-    expect(rows[1].columns[0].elements[0].value.custom_choice).toBe('true');
-    expect(rows[1].columns[1].elements[0]).toMatchObject({ tag: 'input', name: 'custom_0' });
-    expect(rows[1].columns[1].elements[0].input_type).not.toBe('multiline_text');
+    const blocks = form.elements.filter((n: any) => n.tag === 'column_set');
+    expect(blocks).toHaveLength(2);
+    for (const [i, block] of blocks.entries()) {
+      const inside = descendants(block);
+      expect(inside.filter(n => n.tag === 'checker').map(n => [n.name, n.checked])).toEqual([[`opt_${i}_0`, true], [`opt_${i}_1`, false]]);
+      const input = inside.find(n => n.tag === 'input');
+      expect(input).toMatchObject({ name: `custom_${i}`, default_value: '' });
+      expect(input.input_type).not.toBe('multiline_text');
+    }
+    expect(descendants(form).filter(n => n.tag === 'button')).toHaveLength(1);
   });
 
-  it('keeps eleven questions with 42 options within the verified card element budget', async () => {
+  it('keeps eleven questions with 42 options within the card element limit, every option still answerable', async () => {
     const counts = [3, 4, 4, 4, 4, 4, 4, 4, 3, 4, 4];
     const qs = counts.map((count, i) => ({ prompt: `问题 ${i + 1}`, multiSelect: false,
       options: Array.from({ length: count }, (_, j) => ({ key: `k${j}`, label: `选项${j}` })) }));
     const { ask } = await start({ questions: qs });
     const card = JSON.parse(buildAskCard(ask));
     const nodes = descendants(card);
-    expect(nodes.filter(n => n.tag === 'button')).toHaveLength(42 + 11 + 1);
+    expect(nodes.filter(n => typeof n.tag === 'string').length).toBeLessThanOrEqual(200);
+    expect(nodes.filter(n => n.tag === 'checker')).toHaveLength(42);
     expect(nodes.filter(n => n.tag === 'input')).toHaveLength(11);
-    expect(nodes.filter(n => typeof n.tag === 'string')).toHaveLength(199);
+    expect(nodes.filter(n => n.tag === 'button')).toHaveLength(1);
   });
 
-  it('selects other, persists its empty state, requires text and submits the custom answer', async () => {
+  it('a legacy "other" click keeps working: its empty state persists, then the new form needs text before it settles', async () => {
     const { ask, promise } = await start();
-    const initial = descendants(JSON.parse(buildAskCard(ask))).find(n => n.name === 'custom_option_0');
+    // Wire value of the v1 card's "other" button, sent before the upgrade.
     const clicked: any = await handleAskCardAction({ operator: { open_id: 'ou_owner' }, action: {
-      value: initial.value, form_value: { custom_0: '', custom_1: '' },
+      value: { action: 'ask_toggle', question_index: '0', custom_choice: 'true', ask_id: ask.askId, nonce: ask.nonce, custom_form: 'v1', revision: '0' },
+      form_value: { custom_0: '', custom_1: '' },
     } });
     expect(getAskSnapshot(ask.askId)).toMatchObject({ selections: [[], ['a']], customAnswers: ['', null] });
-    const nodes = descendants(clicked.card.data);
-    expect(nodes.find(n => n.name === 'custom_option_0').text.content).toContain('◉');
-    const submit = nodes.find(n => n.name === 'submit_answers');
+    const submit = descendants(clicked.card.data).find(n => n.tag === 'button' && n.form_action_type === 'submit').behaviors[0].value;
+    expect(submit).toMatchObject({ action: 'ask_choice_submit', revision: '1' });
     const empty: any = await handleAskCardAction({ operator: { open_id: 'ou_owner' }, action: {
-      value: submit.value, form_value: { custom_0: '', custom_1: '' },
+      value: submit, form_value: { opt_0_0: false, opt_0_1: false, opt_1_0: true, opt_1_1: false, custom_0: '', custom_1: '' },
     } });
     expect(empty.toast.type).toBe('warning');
     expect(getAskSnapshot(ask.askId)?.settled).toBe(false);
     await handleAskCardAction({ operator: { open_id: 'ou_owner' }, action: {
-      value: submit.value, form_value: { custom_0: '指定社区', custom_1: '' },
+      value: submit, form_value: { opt_0_0: false, opt_0_1: false, opt_1_0: true, opt_1_1: false, custom_0: '指定社区', custom_1: '' },
     } });
     expect(await promise).toMatchObject({ answers: [[], ['a']], customAnswers: ['指定社区', null] });
   });
 
-  it('captures text while toggling another question, then submits the mixed batch exactly once', async () => {
+  it('a legacy v1 submit still rejects an "other" left empty', async () => {
+    const { ask } = await start();
+    await handleAskCardAction({ operator: { open_id: 'ou_owner' }, action: {
+      value: { action: 'ask_toggle', question_index: '0', custom_choice: 'true', ask_id: ask.askId, nonce: ask.nonce, custom_form: 'v1', revision: '0' },
+      form_value: { custom_0: '', custom_1: '' },
+    } });
+    const response: any = await handleAskCardAction({ operator: { open_id: 'ou_owner' }, action: {
+      value: { action: 'ask_submit', ask_id: ask.askId, nonce: ask.nonce, custom_form: 'v1', revision: '1' },
+      form_value: { custom_0: '', custom_1: '' },
+    } });
+    expect(response.toast.type).toBe('warning');
+    expect(getAskSnapshot(ask.askId)?.settled).toBe(false);
+  });
+
+  it('captures text while a legacy toggle repaints the card, then the new form submits the mixed batch exactly once', async () => {
     const { ask, promise, args } = await start();
     const firstCard = JSON.parse(buildAskCard(ask));
     expect(firstCard.schema).toBe('2.0');
     const nodes = descendants(firstCard);
     expect(nodes.filter(n => n.tag === 'input').map(n => n.name)).toEqual(['custom_0', 'custom_1']);
-    expect(nodes.filter(n => n.tag === 'button').every(n => n.action_type === 'form_submit')).toBe(true);
-    const toggle = nodes.find(n => n.value?.question_index === '1' && n.value?.key === 'b');
+    expect(nodes.filter(n => n.tag === 'button').every(n => n.form_action_type === 'submit')).toBe(true);
     const response: any = await handleAskCardAction({ operator: { open_id: 'ou_owner' }, action: {
-      value: toggle.value, form_value: { custom_0: '社区 C\n只用隔离数据', custom_1: '' },
+      value: { action: 'ask_toggle', question_index: '1', key: 'b', ask_id: ask.askId, nonce: ask.nonce, custom_form: 'v1', revision: '0' },
+      form_value: { custom_0: '社区 C\n只用隔离数据', custom_1: '' },
     } });
     expect(getAskSnapshot(ask.askId)?.settled).toBe(false);
-    const draft = descendants(response.card.data).find(n => n.name === 'custom_0');
+    const repainted = descendants(response.card.data);
+    const draft = repainted.find(n => n.name === 'custom_0');
     expect(draft.default_value).toBe('社区 C\n只用隔离数据');
-    const submit = descendants(response.card.data).find(n => n.name === 'submit_answers');
+    expect(repainted.filter(n => n.tag === 'checker' && n.checked).map(n => n.name)).toEqual(['opt_1_1']);
+    const submit = repainted.find(n => n.tag === 'button').behaviors[0].value;
     await handleAskCardAction({ operator: { open_id: 'ou_owner' }, action: {
-      value: submit.value, form_value: { custom_0: draft.default_value, custom_1: '' },
+      value: submit, form_value: { opt_0_0: false, opt_0_1: false, opt_1_0: false, opt_1_1: true, custom_0: draft.default_value, custom_1: '' },
     } });
     expect(await promise).toMatchObject({ kind: 'answered', answers: [[], ['b']], customAnswers: ['社区 C\n只用隔离数据', null], comment: null });
     expect(applyAskForm({ ...args, revision: 1, fields: { custom_0: 'overwrite' } })).toBe('already_settled');
@@ -168,6 +188,14 @@ describe('per-question custom form', () => {
     expect(applyAskForm({ ...args, fields: { custom_0: 'yes' } })).toBe('invalid_custom');
     expect(parseAskQuestions([{ ...questions[0], allowCustom: false }])).toMatchObject([{ allowCustom: false }]);
     expect(typeof parseAskQuestions([{ ...questions[0], allowCustom: 'yes' }])).toBe('string');
+  });
+
+  it.each([NATIVE_STANDALONE_ASK_ORIGIN, CODEX_ASYNC_RESTORE_ASK_ORIGIN])('keeps native async custom answers in the card form with quote-specific reply guidance: %s', async originKind => {
+    const { ask } = await start({ originKind });
+    expect(supportsAskCustomInput(ask)).toBe(true);
+    const card = buildAskCard(ask);
+    expect(descendants(JSON.parse(card)).filter(n => n.tag === 'input')).toHaveLength(2);
+    expect(card).toBe(buildAskCard({ ...ask, originKind: 'native-user-input-async' }));
   });
 
   it('inline and settled cards preserve per-question answers', async () => {

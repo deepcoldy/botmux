@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { historyReadFilterArgs } from '../core/history-read-options.js';
 import {
   closeSync,
   constants as fsConstants,
@@ -70,7 +71,7 @@ export function remoteRunnerSessionToolArgs(
         'history',
         ...(request.limit !== undefined ? ['--limit', String(request.limit)] : []),
         ...(request.scope ? ['--scope', request.scope] : []),
-        ...(request.withCardJson ? ['--with-card-json'] : []),
+        ...historyReadFilterArgs(request),
         '--session-id', sessionId,
       ];
     case 'quoted':
@@ -78,6 +79,7 @@ export function remoteRunnerSessionToolArgs(
         'quoted', request.messageId,
         '--remote-runner-session-tool',
         ...(request.raw ? ['--raw'] : []),
+        ...(request.download === false ? ['--no-download'] : []),
         '--session-id', sessionId,
       ];
     case 'bots.list':
