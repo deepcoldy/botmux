@@ -4,11 +4,14 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { SessionController } from '../src/core/session-controller.js';
+import { SessionContractStore } from '../src/services/session-contract-store.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
 const tmuxSessions = new Set<string>();
+const contractStores = new Set<SessionContractStore>();
 const tmuxAvailable = (() => {
   try { execFileSync('tmux', ['-V'], { stdio: 'ignore' }); return true; } catch { return false; }
 })();
@@ -30,6 +33,8 @@ afterEach(async () => {
     try { execFileSync('tmux', ['kill-session', '-t', session]); } catch { /* already stopped */ }
   }
   tmuxSessions.clear();
+  for (const store of contractStores) store.close();
+  contractStores.clear();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.clear();
 });
@@ -813,6 +818,16 @@ setInterval(() => {}, 1_000);
     tempDirs.add(root);
     const dataDir = join(root, 'session');
     mkdirSync(dataDir, { recursive: true });
+    const ds: any = {
+      session: { sessionId: 'sid-worker-pi-first-turn', status: 'active', cliId: 'pi', workerGeneration: 1 },
+      larkAppId: 'app_test', workerGeneration: 1,
+    };
+    const store = new SessionContractStore(root, 'app_test');
+    contractStores.add(store);
+    const controller = new SessionController(ds, store);
+    const sessionContract = controller.bindWorker(1);
+    const execution = controller.admitInput('om_turn');
+    const admissions: Array<{ type: string; status?: string; kind: string; reason?: string }> = [];
 
     // Realistic transcript shape (user at start, terminal at end) — a started
     // pi turn without a terminal lifecycle-blocks ready.
@@ -849,7 +864,35 @@ setInterval(() => {}, 1_000);
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
     children.add(child);
-    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      // Minimal production-shaped host: reserve/bind the real contract, then
+      // admit every ordinary worker event through the real controller.
+      if (message.type === 'runtime_binding_started') {
+        controller.reserveBinding(message.bindingId, sessionContract.worker);
+        const reservation = controller.store.binding(controller.ref, message.bindingId)!;
+        child.send({ type: 'runtime_contract_reserved', bindingId: message.bindingId, runtime: reservation.ref, mayStart: true });
+        return;
+      }
+      if (message.type === 'runtime_binding') {
+        const runtime = controller.bindRuntime(message.bindingId, sessionContract.worker, message.identity);
+        child.send({
+          type: 'runtime_contract_assigned', bindingId: message.bindingId, runtime: runtime.ref,
+          mayExecute: runtime.phase !== 'retiring',
+          executions: store.executions(controller.ref).filter(value => value.runtime?.runtimeId === runtime.ref.runtimeId).map(value => value.ref),
+          admissionStates: store.executions(controller.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })),
+        });
+        return;
+      }
+      const admission = controller.ingest(message, sessionContract.worker);
+      admissions.push({
+        type: message.type,
+        ...(message.type === 'screen_update' ? { status: message.status } : {}),
+        kind: admission.kind,
+        ...('reason' in admission ? { reason: admission.reason } : {}),
+      });
+    });
     child.stdout?.on('data', chunk => logs.push(chunk.toString()));
     child.stderr?.on('data', chunk => logs.push(chunk.toString()));
 
@@ -867,6 +910,8 @@ setInterval(() => {}, 1_000);
       larkAppId: 'app_test',
       larkAppSecret: 'secret',
       turnId: 'om_turn',
+      sessionContract,
+      sessionCommand: { version: 2, execution },
     } satisfies DaemonToWorker);
 
     await waitForLog(child, logs, 'Codex bridge fresh-empty:');
@@ -888,6 +933,12 @@ setInterval(() => {}, 1_000);
     );
     expect(preReady.some(message => message.status === 'working'), JSON.stringify(messages)).toBe(true);
     expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
+    // Raw worker output alone is insufficient: the old cold start emitted a
+    // working frame whose execution had never been bound, so the host refused it.
+    expect(admissions.filter(value => value.type === 'turn_execution_started').map(value => value.kind)).toEqual(['current']);
+    expect(admissions, JSON.stringify(admissions)).toContainEqual({ type: 'screen_update', status: 'working', kind: 'current' });
+    expect(store.execution(controller.ref, execution.executionId)).toMatchObject({ phase: 'submitting' });
+    expect(store.execution(controller.ref, execution.executionId)?.runtime).toBeDefined();
     // The turn's terminal: readiness follows once the fake clears Working...
     // (external idle defers on the busy viewport, then the probe/quiescence
     // finishes the turn).
@@ -1308,6 +1359,18 @@ setInterval(() => {}, 1_000);
     tempDirs.add(root);
     const dataDir = join(root, 'session');
     mkdirSync(dataDir, { recursive: true });
+    const ds: any = {
+      session: { sessionId: 'sid-worker-grok-first-turn', status: 'active', cliId: 'grok', workerGeneration: 1 },
+      initConfig: { cliId: 'grok', backendType: 'pty' },
+      larkAppId: 'app_test', workerGeneration: 1,
+    };
+    const store = new SessionContractStore(root, 'app_test');
+    contractStores.add(store);
+    const controller = new SessionController(ds, store);
+    const sessionContract = controller.bindWorker(1);
+    const execution = controller.admitInput('om_turn');
+    let delayedAssignment: Extract<DaemonToWorker, { type: 'runtime_contract_assigned' }> | undefined;
+    const admissions: Array<{ type: string; kind: string; reason?: string }> = [];
 
     // Fake Grok: emit output for ~4s (so the 2s first-turn publisher tick fires and
     // sends the projected working while awaitingFirstPrompt), WITHOUT ever rendering
@@ -1342,7 +1405,29 @@ setInterval(() => {}, 1_000);
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
     children.add(child);
-    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'runtime_binding_started') {
+        controller.reserveBinding(message.bindingId, sessionContract.worker);
+        const reservation = controller.store.binding(controller.ref, message.bindingId)!;
+        child.send({ type: 'runtime_contract_reserved', bindingId: message.bindingId, runtime: reservation.ref, mayStart: true });
+        return;
+      }
+      if (message.type === 'runtime_binding') {
+        const runtime = controller.bindRuntime(message.bindingId, sessionContract.worker, message.identity);
+        // Deliberately hold the assignment until the first pre-execution ready.
+        delayedAssignment = {
+          type: 'runtime_contract_assigned', bindingId: message.bindingId, runtime: runtime.ref,
+          mayExecute: runtime.phase !== 'retiring',
+          executions: store.executions(controller.ref).filter(value => value.runtime?.runtimeId === runtime.ref.runtimeId).map(value => value.ref),
+          admissionStates: store.executions(controller.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })),
+        };
+        return;
+      }
+      const admission = controller.ingest(message, sessionContract.worker);
+      admissions.push({ type: message.type, kind: admission.kind, ...('reason' in admission ? { reason: admission.reason } : {}) });
+    });
     child.stdout?.on('data', chunk => logs.push(chunk.toString()));
     child.stderr?.on('data', chunk => logs.push(chunk.toString()));
 
@@ -1359,6 +1444,8 @@ setInterval(() => {}, 1_000);
       larkAppId: 'app_test',
       larkAppSecret: 'secret',
       turnId: 'om_turn',
+      sessionContract,
+      sessionCommand: { version: 2, execution },
     } satisfies DaemonToWorker);
 
     // The first-turn publisher emits the projected working before any ready edge.
@@ -1367,6 +1454,18 @@ setInterval(() => {}, 1_000);
     // working. Reaching this log proves we passed the generic-snapshot point (9337)
     // that the fix must keep from emitting idle.
     await waitForLog(child, logs, 'reporting working (not idle) so turn reactions can settle later');
+    expect(delayedAssignment).toBeDefined();
+    child.send(delayedAssignment!);
+    // Production sends the assignment before draining events held on its binding.
+    for (const pending of store.deferredEvents<WorkerToDaemon>(controller.ref, delayedAssignment!.bindingId)) {
+      controller.ingest(pending, sessionContract.worker);
+    }
+    store.clearDeferredEvents?.(controller.ref, delayedAssignment!.bindingId);
+    const started = await waitForMessage(child, messages, 'turn_execution_started', logs);
+    expect(started.sessionContract?.scope.runtime).toBeDefined();
+    expect(admissions).toContainEqual({ type: 'turn_execution_started', kind: 'current' });
+    expect(store.execution(controller.ref, execution.executionId)).toMatchObject({ phase: 'submitting' });
+    expect(store.execution(controller.ref, execution.executionId)?.runtime).toBeDefined();
     // Let any stray snapshot land.
     await new Promise(resolvePromise => setTimeout(resolvePromise, 500));
 
