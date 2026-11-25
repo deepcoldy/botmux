@@ -32,7 +32,7 @@ import { stripAnsiScreenText } from './idle-detector.js';
  * match) and the numbered option block must sit above it.
  */
 
-const VIEWPORT_LINES = 40;
+const VIEWPORT_LINES = 80;
 /** How far above the footer numbered rows may start. */
 const OPTIONS_SEARCH_LINES = 30;
 
@@ -87,11 +87,12 @@ const COMPOSER_ROW = /^\s*[›»](?:\s|$)/;
 const FOOTER_TAIL_LINES = 20;
 /** Backdrop chrome that may legitimately follow a mid-screen dialog footer. */
 const STATUS_ROW = /^\s*\S[^\r\n]*·[^\r\n]*$/;
+const BACKDROP_HINT_ROW = /^\s*(?:← for agents|\? for shortcuts|esc to interrupt|tab to queue|⚠\s*\d+\b)/;
 
 function backdropChromeOnly(lines: string[]): boolean {
   return lines.every(line => {
     const text = line.trim();
-    return !text || COMPOSER_ROW.test(line) || STATUS_ROW.test(text);
+    return !text || COMPOSER_ROW.test(line) || STATUS_ROW.test(text) || BACKDROP_HINT_ROW.test(text);
   });
 }
 

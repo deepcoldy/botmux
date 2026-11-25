@@ -8,6 +8,8 @@ import type { DaemonToWorker } from '../src/types.js';
 import { codexEmptyComposerFooter, codexNativeComposerState, codexNativeFooterRows } from '../src/services/codex-terminal-session.js';
 import { detectCodexChoiceModal } from '../src/utils/codex-choice-modal.js';
 import { promptCacheKeepaliveRefusal } from '../src/core/prompt-cache-keepalive-gate.js';
+import { pendingInputAllowsTypeAhead } from '../src/utils/pending-input-queue.js';
+import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gate.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
@@ -23,13 +25,20 @@ const empty146 = {
   viewport: 'Previous conversation\n› Implement {feature}\n\n  gpt-5.6-sol default · ~/data',
   cursor: { x: 2, y: 1 },
 };
+function codexCursor(viewport: string): { x: number; y: number } {
+  const rows = viewport.split(/\r?\n/);
+  for (let y = rows.length - 1; y >= 0; y--) {
+    if (/^\s*[›»](?!\s*\d+\.)(?:\s|$)/.test(rows[y]!)) return { x: 2, y };
+  }
+  return { x: 2, y: 0 };
+}
 
 function inputHarness(cliId: 'codex' | 'traex', viewport: string, persistentReattach = false) {
   const h = workerSubmitHarness();
   const adapter = cliId === 'codex' ? createCodexAdapter() : createTraexAdapter();
   const backend = {
     write: vi.fn(),
-    captureInputState: () => ({ viewport, cursor: cliId === 'codex' ? { x: 2, y: 0 } : undefined }),
+    captureInputState: () => ({ viewport, cursor: cliId === 'codex' ? codexCursor(viewport) : undefined }),
   };
   Object.assign(h.scope, {
     backend,
@@ -64,6 +73,9 @@ function inputHarness(cliId: 'codex' | 'traex', viewport: string, persistentReat
   h.scope.sessionInputSurfaceNow = loadWorkerFunction('sessionInputSurfaceNow', h.scope);
   h.scope.sessionRenameSurfaceNow = loadWorkerFunction('sessionRenameSurfaceNow', h.scope);
   h.scope.sessionInputBlocksDeliveryNow = loadWorkerFunction('sessionInputBlocksDeliveryNow', h.scope);
+  h.scope.holdNativeInputForHardBlock = loadWorkerFunction('holdNativeInputForHardBlock', h.scope);
+  h.scope.armNativeInputBlockRecheck = vi.fn();
+  h.scope.notifyNativeInputBlocked = vi.fn();
   Object.assign(h.scope, {
     firstWriteLivenessConfirmed: true,
     firstWriteLivenessHeld: false,
@@ -78,6 +90,14 @@ function inputHarness(cliId: 'codex' | 'traex', viewport: string, persistentReat
   }
   return { ...h, backend, adapter: h.scope.cliAdapter };
 }
+
+const dirs: string[] = [];
+afterEach(() => {
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  vi.clearAllTimers();
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+});
 
 describe('native hard input-focus blocks across real delivery paths', () => {
   it.each([
@@ -128,6 +148,7 @@ describe('native hard input-focus blocks across real delivery paths', () => {
       revokePromptReadiness: vi.fn(),
       finalizeRawCommandDelivery: ({ accepted }: { accepted: boolean }) => accepted,
       flushPending: vi.fn(async () => {}),
+      canStartInjectionFlush: () => true,
     });
     h.scope.idleDetector.reset = vi.fn();
     h.scope.freshnessInputQueue.enqueueRaw = enqueueRaw;
@@ -146,9 +167,27 @@ describe('native hard input-focus blocks across real delivery paths', () => {
     expect(h.backend.write).not.toHaveBeenCalled();
   });
 
+  it('keeps one recheck while blocked, then re-drives ordinary and injection queues once clear', async () => {
+    vi.useFakeTimers();
+    const h = inputHarness('traex', fixture('traex-0.216.0-rename-dialog.txt'));
+    h.scope.armNativeInputBlockRecheck = loadWorkerFunction('armNativeInputBlockRecheck', h.scope);
+    h.scope.flushPending = vi.fn(async () => {});
+    h.scope.flushPendingInjections = vi.fn(async () => {});
+    h.scope.holdNativeInputForHardBlock();
+    expect(vi.getTimerCount()).toBe(1);
+    for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(5_000);
+    expect(vi.getTimerCount()).toBe(1);
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+    h.scope.sessionInputBlocksDeliveryNow = () => false;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.scope.flushPending).toHaveBeenCalledOnce();
+    expect(h.scope.flushPendingInjections).toHaveBeenCalledOnce();
+  });
+
   it('rejects dialog footers before they can impersonate an empty Codex composer', () => {
     for (const viewport of [codexDialog(''), choiceModal]) {
-      expect(codexEmptyComposerFooter({ viewport, cursor: { x: 2, y: 0 } })).toBeUndefined();
+      expect(codexEmptyComposerFooter({ viewport, cursor: codexCursor(viewport) })).toBeUndefined();
     }
     expect(codexNativeFooterRows(['enter submit  |  esc back'])).toBeUndefined();
   });
@@ -182,9 +221,12 @@ describe('native hard input-focus blocks across real delivery paths', () => {
     const h = workerSubmitHarness();
     Object.assign(h.scope, {
       isPromptReady: false,
-      programStatusBlockedHoldsTypeAhead: () => true,
-      pendingInputAllowsTypeAhead: (_supports: boolean, _durable: boolean, _item: unknown, blocked: boolean) => !blocked,
+      pendingInputAllowsTypeAhead,
+      programStatusBlockHoldsTypeAhead,
     });
+    h.scope.cliAdapter.programStatusBlockedHoldsInput = true;
+    h.scope.idleDetector.programStatusBlock = () => ({ kind: 'permission' });
+    h.scope.programStatusBlockedHoldsTypeAhead = loadWorkerFunction('programStatusBlockedHoldsTypeAhead', h.scope);
     await h.flush();
     expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
     expect(h.scope.pendingMessages).toHaveLength(1);
@@ -199,12 +241,6 @@ describe('native hard input-focus blocks across real delivery paths', () => {
 });
 
 describe('Codex Turn 2+ untouched refusal recovery', () => {
-  const dirs: string[] = [];
-  afterEach(() => {
-    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-    vi.unstubAllEnvs();
-  });
-
   it('retains the entire FIFO with zero paste/failure, then submits each item after recovery', async () => {
     const home = mkdtempSync(join(tmpdir(), 'botmux-turn2-untouched-'));
     dirs.push(home);
@@ -267,5 +303,58 @@ describe('Codex Turn 2+ untouched refusal recovery', () => {
     expect(submissions).toEqual(['first queued message', 'second queued message']);
     expect(h.scope.pendingMessages).toHaveLength(0);
     expect(h.scope.send.mock.calls.map(([event]) => event.message)).not.toContain('worker.submit_impossible');
+  });
+
+  it('does not commit durable, bridge, type-ahead or activation state before a precheck refusal', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'botmux-durable-untouched-'));
+    dirs.push(home);
+    vi.stubEnv('CODEX_HOME', home);
+    writeFileSync(join(home, 'history.jsonl'), '');
+    const state = { viewport: codexDialog(''), cursor: { x: 2, y: 4 } };
+    const backend = {
+      cliPid: 12345,
+      expectedCodexSessionId: SID,
+      write: vi.fn(),
+      captureInputState: () => state,
+      submitBracketedPaste: vi.fn(),
+    };
+    const h = workerSubmitHarness();
+    h.scope.pendingMessages.splice(0, 1, {
+      turnId: 'turn-durable', dispatchAttempt: 1, queuedActivationToken: 'qa-durable', content: 'blocked',
+    });
+    Object.assign(h.scope, {
+      backend,
+      cliAdapter: createCodexAdapter(),
+      lastInitConfig: { cliId: 'codex', nativeSessionTitle: TITLE, promptInjection: 'none' },
+      durableTurnInFlight: false,
+      queuedTypeAheadTurns: [],
+      openingInputBoxSettled: true,
+      inputBoxJudgeable: () => false,
+      firstWriteLivenessConfirmed: true,
+      firstWriteLivenessHeld: false,
+      firstWriteHeldNoticeSent: false,
+      armFirstWriteLivenessRecheck: vi.fn(),
+      currentCodexObservedPid: () => 12345,
+      stampMojoTurnMark: vi.fn(),
+      deferTurnInputCommitUntilSubmission: () => false,
+      maybeQueuePostSubmitNativeSessionTitle: () => false,
+      acknowledgeQueuedActivation: vi.fn(),
+      dropFailedBridgeMark: vi.fn(),
+      sessionInputBlocksDeliveryNow: () => false,
+    });
+    h.scope.holdOpeningInput = loadWorkerFunction('holdOpeningInput', h.scope);
+    h.scope.notifyHeldInput = loadWorkerFunction('notifyHeldInput', h.scope);
+    h.scope.inflightInputs.onWrite = vi.fn();
+
+    await h.flush();
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(backend.submitBracketedPaste).not.toHaveBeenCalled();
+    expect(h.scope.durableTurnInFlight).toBe(false);
+    expect(h.scope.inflightInputs.onWrite).not.toHaveBeenCalled();
+    expect(h.queue.hasPendingTurn('turn-durable')).toBe(false);
+    expect(h.scope.queuedTypeAheadTurns).toEqual([]);
+    expect(h.scope.send.mock.calls.map(([event]) => event.type)).not.toContain('type_ahead_queued');
+    expect(h.scope.send.mock.calls.map(([event]) => event.type)).not.toContain('queued_activation_submitted');
+    expect(h.scope.acknowledgeQueuedActivation).not.toHaveBeenCalled();
   });
 });

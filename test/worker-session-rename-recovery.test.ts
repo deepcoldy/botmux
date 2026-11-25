@@ -36,6 +36,7 @@ function recoveryHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'unkn
     armSessionRenameReattachRecoveryRetry: vi.fn(),
     notifySessionRenameInputHeld: vi.fn(),
     notifySessionRenameInputTimeout: vi.fn(),
+    restoreSessionRenameReadiness: vi.fn(),
     armSessionRenameIdleTimeout: vi.fn(),
     log: vi.fn(),
   };
@@ -49,8 +50,13 @@ describe('native rename recovery after persistent worker reattach', () => {
     expect(h.scope.sessionRenamePhase).toBe('sent');
     expect(h.scope.sessionRenameCommand).toBe(COMMAND);
     expect(h.scope.armSessionRenameIdleTimeout).toHaveBeenCalledOnce();
-    expect(h.watchSessionRename).toHaveBeenCalledWith(COMMAND, {
+    expect(h.watchSessionRename).toHaveBeenCalledTimes(2);
+    expect(h.watchSessionRename).toHaveBeenNthCalledWith(1, COMMAND, {
       getCliSessionId: h.scope.sessionRenameNativeSessionIdNow,
+    });
+    expect(h.watchSessionRename).toHaveBeenNthCalledWith(2, COMMAND, {
+      getCliSessionId: h.scope.sessionRenameNativeSessionIdNow,
+      fromByte: 0,
     });
     expect(h.recover()).toBe(false);
     expect(h.scope.armSessionRenameIdleTimeout).toHaveBeenCalledOnce();
@@ -121,11 +127,11 @@ describe('native rename recovery after persistent worker reattach', () => {
         return watchNativeSessionIndex(path, TITLE, opts.getCliSessionId, opts.fromByte);
       };
       expect(h.recover()).toBe(true);
-      expect(arms).toBe(1);
+      expect(arms).toBe(2);
 
       appendFileSync(path, `${JSON.stringify({ id: 'native-id', thread_name: TITLE })}\n`);
       expect(h.recover()).toBe(false);
-      expect(arms).toBe(1);
+      expect(arms).toBe(2);
       expect(h.scope.sessionRenameRecorded).toBeUndefined();
       expect(h.scope.sessionRenamePhase).toBe('idle');
     } finally {
@@ -264,6 +270,25 @@ describe('sessionRenameNativeSessionIdNow', () => {
     expect(scope.inputDeliveryObservedCliSessionId).toBe('thread-b');
   });
 
+  it('refuses a bare bridge/cache identity when shared or sandbox ownership is unbound', () => {
+    for (const owned of [new Set<string>(), undefined] as const) {
+      const backend = {};
+      const scope: Record<string, any> = {
+        inputDeliveryObservedCliSessionId: 'thread-a',
+        lastInitConfig: { cliId: 'codex' }, backend,
+        adapterInputHandle: (value: unknown) => value,
+        codexTerminalSessionIsBound: () => false,
+        codexRpcEngine: undefined, codexBridgeRolloutPath: '/tmp/rollout-thread-a.jsonl',
+        currentCodexObservedPid: () => 123,
+        findCodexRolloutSetByPid: () => owned,
+        codexGenerationSessionIdFromRolloutPath: () => 'thread-a',
+      };
+      const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
+      expect(resolve()).toBeUndefined();
+      expect(scope.inputDeliveryObservedCliSessionId).toBe('thread-a');
+    }
+  });
+
   it('follows the live Codex thread instead of polling a previously cached thread id', () => {
     const scope: Record<string, any> = {
       inputDeliveryObservedCliSessionId: 'thread-a',
@@ -332,6 +357,19 @@ describe('sessionRenameNativeSessionIdNow', () => {
     const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
     expect(resolve()).toBeUndefined();
     expect(scope.inputDeliveryObservedCliSessionId).toBe('thread-b');
+  });
+
+  it('uses the explicitly bound RPC thread for TRAE shared app-server sessions', () => {
+    const scope: Record<string, any> = {
+      inputDeliveryObservedCliSessionId: undefined,
+      lastInitConfig: { cliId: 'traex' },
+      backend: {}, codexRpcEngine: { activeThreadId: 'rpc-thread' },
+      currentTraexObservedPid: () => undefined,
+      findTraexRolloutSetByPid: () => undefined,
+    };
+    const resolve = loadWorkerFunction<() => string | undefined>('sessionRenameNativeSessionIdNow', scope);
+    expect(resolve()).toBe('rpc-thread');
+    expect(scope.inputDeliveryObservedCliSessionId).toBe('rpc-thread');
   });
 
   it('uses an explicitly bound remote Codex thread without requiring a local rollout fd', () => {

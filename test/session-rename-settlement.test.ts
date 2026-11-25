@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { decideSessionRenameSettlement, sessionRenameWriteFailureAction } from '../src/core/session-rename-settlement.js';
 import { traexSessionRenameSurface } from '../src/adapters/cli/traex-footer.js';
-import { codexNativeComposerState, codexSessionRenameSurface } from '../src/services/codex-terminal-session.js';
+import { codexNativeComposerState, codexSessionRenameSurface, codexNativeFooterRows } from '../src/services/codex-terminal-session.js';
+import { detectCodexChoiceModal } from '../src/utils/codex-choice-modal.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { watchNativeSessionIndex } from '../src/services/native-session-index.js';
@@ -122,6 +123,21 @@ describe('TRAE native rename surface (0.216.0)', () => {
     expect(traexSessionRenameSurface(foreignDraft, COMMAND)).toBe('blocked');
   });
 
+  it('lets drafts and exact commands outrank busy chrome', () => {
+    const busyDraft = fixture('traex-0.216.0-renamed-while-busy.txt')
+      .replace('❯ Run /review on my current changes', `❯ ${COMMAND}`);
+    expect(traexSessionRenameSurface(busyDraft, COMMAND)).toBe('unsubmitted');
+    expect(traexSessionRenameSurface(busyDraft, '/rename another title')).toBe('blocked');
+  });
+
+  it('treats model pickers and native question pages as hard input owners', () => {
+    const picker = ['─'.repeat(80), '', '  Select Model and Effort', '',
+      '❯  7. GPT-5.6-Sol / Standard', '  2. Other option', '', '  enter confirm  |  esc go back'].join('\n');
+    expect(traexSessionRenameSurface(picker, COMMAND)).toBe('blocked');
+    const question = readFileSync(new URL('./fixtures/traex-question/traex-0.214.1-submit-confirm-160x50.txt', import.meta.url), 'utf8');
+    expect(traexSessionRenameSurface(question, COMMAND)).toBe('blocked');
+  });
+
   it('keeps the rename dialog and a busy turn occupied even with a receipt', () => {
     const dialog = traexSessionRenameSurface(fixture('traex-0.216.0-rename-dialog.txt'), COMMAND);
     const busy = traexSessionRenameSurface(fixture('traex-0.216.0-renamed-while-busy.txt'), '/rename 修复登录页报错');
@@ -188,6 +204,37 @@ describe('Codex native rename surface (0.167.0)', () => {
     expect(codexNativeComposerState(state)).toBe('unknown');
     expect(codexNativeComposerState(state, { allowCodex0146Hints: true })).toBe('empty');
     expect(codexSessionRenameSurface(state, COMMAND)).toBe('settled');
+  });
+
+  it('lets exact commands and drafts outrank busy chrome', () => {
+    const exact = done.replace('› Ask Codex to do anything', '  Working… (2s • esc to interrupt)\n\n› /rename [BotMux·Lark] 修复登录页报错');
+    expect(codexSessionRenameSurface({ viewport: exact }, COMMAND)).toBe('unsubmitted');
+    const other = done.replace('› Ask Codex to do anything', '  Working… (2s • esc to interrupt)\n\n› a human draft');
+    expect(codexSessionRenameSurface({ viewport: other }, COMMAND)).toBe('blocked');
+  });
+
+  it('classifies a footerless non-empty draft as blocked rather than occupied', () => {
+    expect(codexSessionRenameSurface({ viewport: '› a human draft', cursor: { x: 13, y: 0 } }, COMMAND)).toBe('blocked');
+  });
+
+  it('classifies a bare prompt and unfamiliar footer as unknown, never as a draft', () => {
+    expect(codexSessionRenameSurface({ viewport: '›\nmodel · /tmp', cursor: { x: 2, y: 0 } }, COMMAND)).toBe('unknown');
+    expect(codexNativeFooterRows(['enter to submit / esc to cancel'])).toBeUndefined();
+  });
+
+  it('rejects a manually typed 0.146.1 hint when the cursor is past Home', () => {
+    const state = {
+      viewport: 'Previous conversation\n› Implement {feature}\n\n  gpt-5.6-sol default · ~/data',
+      cursor: { x: 20, y: 1 },
+    };
+    expect(createCodexAdapter().inputBoxReady!(state)).toBe(false);
+    expect(codexSessionRenameSurface(state, COMMAND)).not.toBe('settled');
+  });
+
+  it('detects a choice modal in a tall viewport with hint-only backdrop rows', () => {
+    const modal = readFileSync(new URL('./fixtures/codex-choice-modal/tmux-pane-tool-approval-160x30.txt', import.meta.url), 'utf8');
+    const tall = `${'context\n'.repeat(40)}${modal}\n? for shortcuts`;
+    expect(detectCodexChoiceModal(tall)).toBeDefined();
   });
 
   it('is the judge the Codex adapter declares', () => {

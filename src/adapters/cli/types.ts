@@ -97,6 +97,10 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** Commit worker-side turn/write state after the adapter's pre-write input
+   * checks, immediately before the actual paste. A pre-write refusal therefore
+   * leaves no durable turn, bridge mark, type-ahead or activation side effects. */
+  beforeSubmit?: () => void;
   onInputPrepared?: (content: string) => void;
   /** Durable replay identity. Runner adapters may forward this with turnId so
    * late output from an older attempt cannot settle its successor. */

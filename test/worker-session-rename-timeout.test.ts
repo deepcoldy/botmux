@@ -22,6 +22,8 @@ function renameTimerHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'b
     SESSION_RENAME_HOLD_TIMEOUT_MS: 45_000,
     sessionRenameSurfaceNow: () => surface,
     decideSessionRenameSettlement,
+    idleDetector: { programStatusHeldBusy: () => false, adoptPromptReady: vi.fn() },
+    programStatusBlockedHoldsTypeAhead: () => false,
     isPromptReady: false,
     reattachOpenTurnGate: true,
     flushPending: vi.fn(),
@@ -38,6 +40,7 @@ function renameTimerHarness(surface: 'settled' | 'unsubmitted' | 'occupied' | 'b
   };
   scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', scope);
   scope.notifySessionRenameInputTimeout = loadWorkerFunction('notifySessionRenameInputTimeout', scope);
+  scope.restoreSessionRenameReadiness = loadWorkerFunction('restoreSessionRenameReadiness', scope);
   scope.settleSessionRename = loadWorkerFunction('settleSessionRename', scope);
   scope.armSessionRenameIdleTimeout = loadWorkerFunction('armSessionRenameIdleTimeout', scope);
   return { scope, arm: scope.armSessionRenameIdleTimeout as () => void };
@@ -61,11 +64,44 @@ describe('native rename confirmation hold cap', () => {
     await vi.advanceTimersByTimeAsync(2_000);
     expect(h.scope.flushPending).toHaveBeenCalledOnce();
     expect(h.scope.sessionRenamePhase).toBe('idle');
-    expect(h.scope.isPromptReady).toBe(surface === 'settled');
-    expect(h.scope.reattachOpenTurnGate).toBe(surface !== 'settled');
+    expect(h.scope.isPromptReady).toBe(surface !== 'occupied');
+    expect(h.scope.reattachOpenTurnGate).toBe(surface === 'occupied');
     expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'user_notify', turnId: 'turn', message: 'worker.session_rename_release_timeout',
     }));
+  });
+
+  it('uses a historical receipt for an already-renamed busy reattach, but never for unknown evidence', async () => {
+    vi.useFakeTimers();
+    const settled = renameTimerHarness('settled');
+    settled.scope.sessionRenameRecorded = () => false;
+    settled.scope.sessionRenameHistoricalRecorded = () => true;
+    settled.arm();
+    await vi.advanceTimersToNextTimerAsync();
+    expect(settled.scope.flushPending).toHaveBeenCalledOnce();
+    expect(settled.scope.send.mock.calls.map(([event]: [any]) => event.message))
+      .not.toContain('worker.session_rename_release_timeout');
+
+    const unknown = renameTimerHarness('unknown');
+    unknown.scope.sessionRenameRecorded = () => false;
+    unknown.scope.sessionRenameHistoricalRecorded = () => true;
+    unknown.arm();
+    await vi.advanceTimersToNextTimerAsync();
+    expect(unknown.scope.flushPending).not.toHaveBeenCalled();
+  });
+
+  it('never restores readiness over an OSC-7501 approval or held busy record', async () => {
+    vi.useFakeTimers();
+    for (const surface of ['settled', 'unknown'] as const) {
+      const h = renameTimerHarness(surface);
+      h.scope.idleDetector.programStatusHeldBusy = () => true;
+      h.scope.programStatusBlockedHoldsTypeAhead = () => true;
+      h.arm();
+      await vi.advanceTimersByTimeAsync(46_000);
+      expect(h.scope.isPromptReady).toBe(false);
+      expect(h.scope.reattachOpenTurnGate).toBe(true);
+      expect(h.scope.idleDetector.adoptPromptReady).not.toHaveBeenCalled();
+    }
   });
 
   it('keeps holding a visible rename command after the cap and tells the user why', async () => {

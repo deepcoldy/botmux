@@ -4,6 +4,35 @@ import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 
 afterEach(() => { vi.useRealTimers(); });
 
+it('replaces the first-write recheck on synchronous flush re-entry instead of multiplying timers', async () => {
+  vi.useFakeTimers();
+  const scope: Record<string, any> = {
+    firstWriteLivenessTimer: null,
+    backend: {}, cliSpawnGeneration: 3,
+    firstWriteLivenessConfirmed: false,
+    firstWriteLivenessHeld: true,
+    firstWriteHeldNoticeSent: true,
+    pendingMessages: [],
+    hasPendingInputForFlush: () => true,
+    hasRunStartupCommands: true,
+    FIRST_PROMPT_HARD_TIMEOUT_MS: 90_000,
+    firstWriteSpawnedAtMs: Date.now() - 90_000,
+    FIRST_WRITE_LIVENESS_POLL_MS: 250,
+    FIRST_WRITE_HELD_POLL_MS: 250,
+    adapterInputBoxReady: () => undefined,
+    firstWriteScreen: () => ({ viewport: '', promptVisible: false }),
+    notifyFirstWriteHeldPastHardCap: vi.fn(),
+    log: vi.fn(),
+  };
+  scope.flushPending = vi.fn(() => scope.holdOpeningInput('blocked'));
+  scope.holdOpeningInput = loadWorkerFunction('holdOpeningInput', scope);
+  scope.armFirstWriteLivenessRecheck = loadWorkerFunction('armFirstWriteLivenessRecheck', scope);
+  scope.armFirstWriteLivenessRecheck();
+  await vi.advanceTimersByTimeAsync(2_000);
+  expect(vi.getTimerCount()).toBeLessThanOrEqual(1);
+  expect(scope.flushPending.mock.calls.length).toBeGreaterThan(1);
+});
+
 it.each([false, true])('a passthrough queues behind an opening whose input box has not settled (settled: %s)', async settled => {
   const queued = !settled;
   const enqueueRaw = vi.fn();

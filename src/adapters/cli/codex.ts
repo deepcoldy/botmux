@@ -533,6 +533,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         && !expectedRemoteSid && (!initialOwned || initialOwned.size === 0);
       if (correlated) content += `\n\n<botmux_routing>\nbotmux_input_id: ${randomBytes(16).toString('hex')}\n</botmux_routing>`;
       context?.onInputPrepared?.(content);
+      context?.beforeSubmit?.();
       const acceptSid: HistorySidFilter | undefined = expectedRemoteSid
         ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
         : cliPid

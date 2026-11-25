@@ -1,5 +1,6 @@
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import { composerTextKey } from '../../utils/composer-text-key.js';
+import { traexQuestionFlowVisible } from '../../utils/traex-question-page.js';
 import type { SessionRenameSurface } from './types.js';
 
 /**
@@ -106,7 +107,7 @@ interface TraexComposerDraft {
  * carries only a length, never ownership of the content behind it. */
 function traexComposerDraft(
   screen: string,
-  opts: { requireThreadReady?: boolean } = {},
+  opts: { requireThreadReady?: boolean; allowBusy?: boolean } = {},
 ): TraexComposerDraft | undefined {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
@@ -117,6 +118,7 @@ function traexComposerDraft(
     if (!traexRestoredComposerReady(empty, {
       requireThreadReady: opts.requireThreadReady !== false,
       draftFooter: true,
+      allowBusy: opts.allowBusy === true,
     })) continue;
     const body = [rows[composer]!.slice(1), ...rows.slice(composer + 1, end)]
       .join('\n').trim();
@@ -167,13 +169,19 @@ function traexRenameDialogVisible(screen: string): boolean {
  * the receipt-based fallback for future native footer layouts.
  */
 export function traexSessionRenameSurface(screen: string, command: string): SessionRenameSurface {
-  if (traexViewportFooterBusy(screen)) return 'occupied';
-  if (traexModelPickerPage(screen) || traexRenameDialogVisible(screen)) return 'blocked';
+  if (traexModelPickerPage(screen) || traexRenameDialogVisible(screen) || traexQuestionFlowVisible(screen)) {
+    return 'blocked';
+  }
   if (traexRestoredComposerReady(screen)) return 'settled';
-  const draft = traexComposerDraft(screen);
-  if (!draft) return 'unknown';
-  if (draft.collapsedChars !== undefined) return 'blocked';
-  return composerTextKey(draft.body) === composerTextKey(command) ? 'unsubmitted' : 'blocked';
+  // Dialogs and actual composer content outrank busy chrome: a running turn
+  // can coexist with a draft, paste chip or half-typed /rename.
+  const draft = traexComposerDraft(screen, { allowBusy: true });
+  if (draft && !EMPTY_COMPOSER_HINTS.has(draft.body)) {
+    if (draft.collapsedChars !== undefined) return 'blocked';
+    return composerTextKey(draft.body) === composerTextKey(command) ? 'unsubmitted' : 'blocked';
+  }
+  if (traexViewportFooterBusy(screen)) return 'occupied';
+  return 'unknown';
 }
 
 /**
@@ -193,6 +201,8 @@ export function traexRestoredComposerReady(
      * the draft rows). TraeX swaps the native hint row for draft-only hints
      * then; only traexComposerHoldsInput judges such a surface. */
     draftFooter?: boolean;
+    /** Rename classification must still parse a draft while a turn is busy. */
+    allowBusy?: boolean;
   } = {},
 ): boolean {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
@@ -306,5 +316,6 @@ export function traexRestoredComposerReady(
   if (rows.slice(0, composer).some(row => /^(?:Sign in\b|Press (?:enter|return) to open (?:the )?browser\b|(?:waiting for|awaiting) authori[sz]ation\b)/i.test(row))) return false;
   // Check the live area above the composer, not stale quoted transcript rows.
   const live = rows.slice(Math.max(0, composer - 3), composer + 1).join('\n');
-  return !/(?:model|directory):[ \t]*loading\b|Resuming session|esc to interr?upt|Queued for (?:capacity|next turn)|Too many requests right now/i.test(live);
+  return opts.allowBusy === true
+    || !/(?:model|directory):[ \t]*loading\b|Resuming session|esc to interr?upt|Queued for (?:capacity|next turn)|Too many requests right now/i.test(live);
 }

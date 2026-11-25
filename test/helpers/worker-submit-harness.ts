@@ -67,7 +67,7 @@ export function workerSubmitHarness() {
     }),
     isCodexAppCliId: () => false,
     runAmbiguousSubmissionTransaction: async (_backend: unknown, write: () => Promise<unknown>,
-      _accepted: unknown, prepare: () => void) => { prepare(); return { result: await write() }; },
+      _accepted: unknown, prepare: () => void) => { prepare?.(); return { result: await write() }; },
     adapterInputHandle: (backend: unknown) => backend,
     settleVerifiableSubmissionForJournal: vi.fn(),
     armInputDeliveryQuarantine: vi.fn(() => null),
