@@ -24,7 +24,7 @@ import { RUNTIME_RESERVATION_DEADLINE_MS, RuntimeReservationExpiredError } from 
 import { prepareCodexAppDispatch, hasUnsettledCodexAppDispatch } from '../src/utils/codex-app-dispatch-ledger.js';
 import { publishCliSessionIdToDaemon } from '../src/core/cli-session-id-publisher.js';
 import { baselineJsonlCursor } from '../src/services/jsonl-cursor.js';
-import { readBridgeTurnJournal, writeBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
+import { readBridgeTurnJournal, writeBridgeTurnJournal, stageBridgeTurnNotice, acknowledgeBridgeTurnNotice } from '../src/services/bridge-turn-journal.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { doubaoLiveUser, doubaoSystemDirForSession } from '../src/services/doubao-transcript.js';
 import { createManagedAskControl, managedAskOriginKey } from '../src/core/managed-ask-control.js';
@@ -141,6 +141,43 @@ describe('contract gateway and real worker boundaries', () => {
     expect(messages[1].sessionContract.scope).toEqual({ runtime: next });
     expect(s.controller.ingest(messages[1], s.worker)).toMatchObject({ kind: 'current' });
     expect(s.store.executions(s.ref)).toHaveLength(0);
+  });
+
+  it.each([false, true])('admits a missing-final ACK after runtime replacement and clears its %s pendingNotice', async silent => {
+    const s = fixture();
+    const journalPath = join(s.data, 'turn-marks', 'session.structured');
+    const noticeId = 'a'.repeat(32);
+    stageBridgeTurnNotice(journalPath, {
+      turnId: 'om_turn', noticeId, message: silent ? '' : 'Open the Web terminal',
+      createdAtMs: 1_000, silent,
+    });
+    const admitted = s.controller.admitInput('om_turn');
+    s.store.bindQueuedExecution(s.ref, admitted, s.runtime);
+    const replacement = s.controller.reserveBinding('binding-replacement', s.worker);
+    s.controller.bindRuntime('binding-replacement', s.worker, {
+      backend: 'tmux', physicalId: '222:start2', nativeSessionId: 'native-replacement', proof: 'process_start',
+    });
+    s.ds.initConfig = { cliId: 'codex' } as any;
+    const command = s.controller.command({ type: 'structured_turn_not_collected_ack', turnId: 'om_turn', noticeId });
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const current = scope.beginRuntime(undefined, '222:start2');
+    scope.assign(current.bindingId, replacement);
+    expect(command.runtime).not.toEqual(scope.currentBinding()?.runtime);
+
+    const env: Record<string, any> = {
+      pendingMissingFinalNotices: new Map(), closeRequested: false,
+      codexAdoptJournalPath: () => undefined, structuredBridgeJournalPath: () => journalPath,
+      readBridgeTurnJournal, acknowledgeBridgeTurnNotice,
+      transmitMissingFinalNotice: vi.fn(), log: vi.fn(),
+    };
+    env.restoreMissingFinalNotices = loadWorkerFunction('restoreMissingFinalNotices', env);
+    env.acknowledgeMissingFinalNotice = loadWorkerFunction('acknowledgeMissingFinalNotice', env);
+    env.restoreMissingFinalNotices();
+    expect(env.pendingMissingFinalNotices.size).toBe(1);
+    expect(admitSessionCommand('structured_turn_not_collected_ack', command, scope.currentBinding()?.runtime)).toEqual({ allowed: true });
+    env.acknowledgeMissingFinalNotice('om_turn', noticeId);
+    expect(env.pendingMissingFinalNotices.size).toBe(0);
+    expect(readBridgeTurnJournal(journalPath)).toEqual([]);
   });
 
   it.each([true, false])('does not let a retired %s-filter capture poison the next runtime screen cache', async delayedFilter => {

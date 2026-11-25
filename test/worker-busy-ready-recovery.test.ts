@@ -160,7 +160,7 @@ describe('terminal prompt-ready recovery', () => {
       readyGate: { shouldHold: () => false }, freshnessInputQueue: { onPromptReady: () => undefined },
       spawnArgvTurnStartGateHolds: () => true, hasStructuredLifecycleBlock: () => true,
       releaseInterruptedStructuredBridgeOnFirstPrompt: vi.fn(),
-      codexBridgeQueue: { preStartLeaseRemainingMs: () => undefined }, ptyOutputGeneration: { snapshot: () => 1 },
+      codexBridgeQueue: { preStartLeaseRemainingMs: () => undefined, peek: () => [] }, ptyOutputGeneration: { snapshot: () => 1 },
       flushQueuedInputAfterTurnStartEvidence: vi.fn(),
     });
     h.scope.markPromptReady = loadWorkerFunction('markPromptReady', h.scope);
