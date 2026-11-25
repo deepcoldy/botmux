@@ -1,6 +1,8 @@
 import { ensureClaudeFolderTrust } from './claude-folder-trust.js';
 export { ensureClaudeFolderTrust } from './claude-folder-trust.js';
 import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecution } from './cli-execution-mode.js';
+import { SharedThreadClient, openSharedThread } from './shared-thread-opening.js';
+
 import { isLeadOnlySession } from './lead-only.js';
 import { decideAssistantAdmission, decideAssistantLiveInputAdmission } from './assistant-spawn.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
@@ -381,6 +383,19 @@ const restartCoordinator = new RestartCoordinator({ persistence: {
 } });
 const topicEffortRestartReadiness = new Map<string, { attemptId: string; worker: DaemonSession['worker']; workerGeneration?: number; workerReady: boolean; cliReady: boolean; requested: import('../utils/traex-session-effort.js').TraexTopicEffortRestart }>();
 const hostPressureWarningsLogged = new Set<string>();
+interface PendingSharedThreadOpening {
+  owner: DaemonSession;
+  handoff?: {
+    ds: DaemonSession;
+    generation?: number;
+    route?: number;
+    activationToken?: string;
+    backgroundEpoch?: number;
+    claimToken?: string;
+    replay: () => void;
+  };
+}
+const pendingSharedThreadOpenings = new Map<string, PendingSharedThreadOpening>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 
 /** Nonce of the keyed stuck card whose POST is in flight for a session (no
@@ -20638,6 +20653,70 @@ function completedRecoveryTurnTerminals(
   return ids.length > 0 ? ids.map(turnId => ({ turnId, status: 'completed' as const })) : undefined;
 }
 
+/** Replay the durable shared-opening head after binding or a runtime handoff.
+ *  A final non-throwing admission refusal must release the runtime route gate;
+ *  otherwise later IM turns only append to the durable tail and never refork. */
+function replaySharedThreadActivation(
+  ds: DaemonSession,
+  opts: ForkWorkerOptions,
+  replay: { openingTurnId?: string; durablePrimaryInbox?: true; atMostOnce?: boolean },
+): void {
+  const route = ds.session.projectRouteRevision;
+  const claimToken = ds.initialStartClaimToken;
+  const activationToken = ds.session.queuedActivationToken;
+  const backgroundEpoch = ds.session.backgroundExecutionEpoch;
+  // A failed spawn may advance workerGeneration before it throws or returns.
+  // Fence this compensation by the exact claim token, not by that generation.
+  const releaseClaim = (): void => {
+    if (findActiveBySessionId(ds.session.sessionId) === ds && ds.session.status === 'active' && !ds.worker
+      && ds.initialStartClaimToken === claimToken && ds.session.projectRouteRevision === route
+      && ds.session.queuedActivationToken === activationToken
+      && ds.session.backgroundExecutionEpoch === backgroundEpoch) {
+      ds.initialStartPending = false;
+      ds.initialStartClaimToken = undefined;
+    }
+  };
+  try {
+    const input = ds.session.queuedActivationInput;
+    if (!input) throw new Error('Shared opening input missing');
+    let synchronous = true;
+    let synchronousAdmission: WorkerForkAdmission | undefined;
+    const replayOpts: ForkWorkerOptions = {
+      ...opts,
+      onAdmission: admission => {
+        try {
+          opts.onAdmission?.(admission);
+        } finally {
+          if (synchronous) synchronousAdmission = admission;
+          // An asynchronous final rejection no longer has a return value to
+          // observe, so it must release the claim from the callback itself.
+          else if (admission === 'rejected') releaseClaim();
+        }
+      },
+    };
+    const started = forkWorker(ds, input, { resume: true, turnId: ds.session.queuedActivationTurnId,
+      dispatchAttempt: ds.session.queuedActivationDispatchAttempt, codexAppInputGateFrozen: true,
+      ...(replay.durablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
+      ...(replay.atMostOnce ? { atMostOnce: true as const } : {}),
+    }, replayOpts);
+    synchronous = false;
+    // forkReservedInitialSession deliberately observes this synchronous out-flag
+    // by object identity; wrapping onAdmission must not detach that contract.
+    if (replayOpts.marginalReclaimScheduled) opts.marginalReclaimScheduled = true;
+    // Synchronous false (for example tail-only quarantine) and a synchronous
+    // rejected result each need their own observable cleanup path.
+    if (!started) releaseClaim();
+    if (started && synchronousAdmission === 'rejected') releaseClaim();
+  } catch (error) {
+    releaseClaim();
+    const message = `Shared thread opening failed; queued input retained: ${String(error)}`;
+    logger.error(`[${tag(ds)}] ${message}`);
+    const callbacks = requireCallbacks();
+    void callbacks.sessionReply(sessionAnchorId(ds), message, 'text', ds.larkAppId,
+      replay.openingTurnId, { sourceSessionId: ds.session.sessionId }).catch(err => logger.error(String(err)));
+  }
+}
+
 function forkWorkerPrepared(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
@@ -21114,6 +21193,128 @@ function forkWorkerPrepared(
     }
     notifyBlocked(admission, opts.admissionReclaimedCount ?? 0);
     reportAdmission('rejected');
+    return true;
+  }
+  if (ds.session.sharedThreadOpening && !ds.session.existingAppServerEndpoint) {
+    if (ds.session.cliId !== 'codex' || ds.session.cliSessionId || ds.worker
+      || botCfg.readIsolation === true || botCfg.wrapperCli || protectedHttpEgressPolicy
+      || ds.session.sandbox === true || ds.session.sandbox === 'scratch'
+      || ds.pendingRawInput || promptPayload.codexAppInput) {
+      throw new Error('New shared thread requires an ordinary Codex topic');
+    }
+    const openingTurnId = initTurnId ?? ds.session.queuedActivationTurnId;
+    if (prompt.length > 0) {
+      if (!openingTurnId) throw new Error('Shared opening requires a durable turn identity');
+      const previous = ds.session.queuedActivationTurnId === openingTurnId
+        ? ds.session.queuedActivationInput
+        : ds.session.queuedActivationTail?.find(entry => entry.turnId === openingTurnId)?.cliInput;
+      if (previous && JSON.stringify(previous) !== JSON.stringify(promptPayload)) {
+        throw new Error('Shared opening turn payload changed');
+      }
+      if (!previous) admitQueuedActivationTail(ds, {
+        userPrompt: prompt, cliInput: promptPayload, turnId: openingTurnId,
+        ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
+      }, undefined, { codexAppInputGateFrozen: initCodexAppInputGateFrozen });
+    }
+    if (!ds.session.queuedActivationPending && !promoteQueuedActivationTail(ds, { send: false })) {
+      throw new Error('Shared opening has no queued input');
+    }
+    const opening = ds.session.sharedThreadOpening;
+    if (!opening.cwd) {
+      const cwd = cb.getSessionWorkingDir(ds) || homedir();
+      if (!existsSync(cwd)) {
+        cb.onMissingWorkingDir?.(ds, cwd, { turnId: openingTurnId });
+        throw new MissingWorkingDirError(cwd);
+      }
+      opening.cwd = cwd;
+      opening.title = ds.session.nativeSessionTitle || ds.session.title;
+      opening.projectRouteRevision = ds.session.projectRouteRevision;
+      sessionStore.updateSession(ds.session);
+    }
+    reportAdmission('deferred');
+    const pending = pendingSharedThreadOpenings.get(ds.session.sessionId);
+    if (pending) {
+      // A closed/reactivated topic reuses the sessionId. Keep remote creation
+      // single-flight, but let the replacement runtime continue the durable
+      // head when the stale opener settles instead of stranding its route gate.
+      const sameHandoff = pending.handoff?.ds === ds
+        && pending.handoff.generation === ds.session.workerGeneration
+        && pending.handoff.route === ds.session.projectRouteRevision
+        && pending.handoff.activationToken === ds.session.queuedActivationToken
+        && pending.handoff.backgroundEpoch === ds.session.backgroundExecutionEpoch
+        && pending.handoff.claimToken === ds.initialStartClaimToken;
+      if (pending.owner !== ds && findActiveBySessionId(ds.session.sessionId) === ds && !sameHandoff) {
+        pending.handoff = {
+          ds,
+          generation: ds.session.workerGeneration,
+          route: ds.session.projectRouteRevision,
+          activationToken: ds.session.queuedActivationToken,
+          backgroundEpoch: ds.session.backgroundExecutionEpoch,
+          claimToken: ds.initialStartClaimToken,
+          replay: () => replaySharedThreadActivation(ds, opts, {
+            openingTurnId, durablePrimaryInbox: initDurablePrimaryInbox, atMostOnce: initAtMostOnce,
+          }),
+        };
+      }
+      return true;
+    }
+    const openingAttempt: PendingSharedThreadOpening = { owner: ds };
+    pendingSharedThreadOpenings.set(ds.session.sessionId, openingAttempt);
+    const generation = ds.session.workerGeneration;
+    const route = ds.session.projectRouteRevision;
+    const activationToken = ds.session.queuedActivationToken;
+    const backgroundEpoch = ds.session.backgroundExecutionEpoch;
+    void (async () => {
+      const client = new SharedThreadClient(opening.endpoint);
+      try {
+        await client.initialize();
+        await openSharedThread(change => sessionStore.mutateOwnedSessionsAtomically(
+          [ds.session.sessionId], rows => change(rows.get(ds.session.sessionId)!),
+          { nonblocking: true, sharedThreadOpeningWrite: true },
+        ).result, client);
+        if (findActiveBySessionId(ds.session.sessionId) !== ds || ds.session.status !== 'active'
+          || ds.session.workerGeneration !== generation || ds.session.projectRouteRevision !== route
+          || ds.session.queuedActivationToken !== activationToken
+          || ds.session.backgroundExecutionEpoch !== backgroundEpoch) return;
+        const saved = sessionStore.getOwnedSession(ds.session.sessionId);
+        if (!saved?.cliSessionId || !saved.existingAppServerEndpoint) throw new Error('Shared binding missing');
+        ds.session.cliSessionId = saved.cliSessionId;
+        ds.session.existingAppServerEndpoint = saved.existingAppServerEndpoint;
+        ds.session.sharedThreadOpening = saved.sharedThreadOpening;
+        replaySharedThreadActivation(ds, opts, {
+          openingTurnId, durablePrimaryInbox: initDurablePrimaryInbox, atMostOnce: initAtMostOnce,
+        });
+      } finally {
+        client.close();
+      }
+    })().catch(error => {
+      if (findActiveBySessionId(ds.session.sessionId) === ds && !ds.worker
+        && ds.session.queuedActivationToken === activationToken
+        && ds.session.backgroundExecutionEpoch === backgroundEpoch) {
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+      }
+      const message = `Shared thread opening failed; queued input retained: ${String(error)}`;
+      logger.error(`[${tag(ds)}] ${message}`);
+      void cb.sessionReply(sessionAnchorId(ds), message, 'text', ds.larkAppId,
+        openingTurnId, { sourceSessionId: ds.session.sessionId }).catch(err => logger.error(String(err)));
+    }).finally(() => {
+      if (pendingSharedThreadOpenings.get(ds.session.sessionId) !== openingAttempt) return;
+      pendingSharedThreadOpenings.delete(ds.session.sessionId);
+      const handoff = openingAttempt.handoff;
+      if (!handoff) return;
+      const current = handoff.ds;
+      if (findActiveBySessionId(current.session.sessionId) !== current || current === ds
+        || current.session.status !== 'active' || current.worker || !current.initialStartPending
+        || current.session.workerGeneration !== handoff.generation
+        || current.session.projectRouteRevision !== handoff.route
+        || current.session.queuedActivationToken !== handoff.activationToken
+        || current.session.backgroundExecutionEpoch !== handoff.backgroundEpoch
+        || current.initialStartClaimToken !== handoff.claimToken
+        || !current.session.queuedActivationPending
+        || (!current.session.sharedThreadOpening && !current.session.existingAppServerEndpoint)) return;
+      handoff.replay();
+    });
     return true;
   }
   if (

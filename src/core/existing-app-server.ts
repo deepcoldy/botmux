@@ -11,6 +11,7 @@
 
 export interface ExistingAppServerConfig {
   endpoint: string;
+  newTopics?: 'create';
 }
 
 function endpointError(label: string, message: string): Error {
@@ -97,8 +98,12 @@ export function normalizeExistingAppServerConfig(
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw endpointError(label, 'must be an object with an endpoint field');
   }
-  const value = raw as { endpoint?: unknown };
+  const value = raw as { endpoint?: unknown; newTopics?: unknown };
+  if (value.newTopics !== undefined && value.newTopics !== 'create') {
+    throw endpointError(label, 'newTopics must be create when enabled');
+  }
   return {
     endpoint: normalizeExistingAppServerEndpoint(value.endpoint, `${label}.endpoint`),
+    ...(value.newTopics === 'create' ? { newTopics: 'create' as const } : {}),
   };
 }
