@@ -7955,6 +7955,36 @@ describe('TraeX RPC ordinary follow-up FIFO policy', () => {
       queueAfterActiveTurn: true,
     }));
   });
+
+  it('always gives a followed cross-chat continuation its own serial turn', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex', codexRpcInput: true }));
+    const worker = makeFakeWorker();
+    const base = makeDs();
+    const ds = makeDs({
+      worker,
+      session: { ...base.session, cliId: 'codex' },
+      initConfig: { type: 'init', cliId: 'codex', codexRpcInput: true } as any,
+    });
+    const replyBot = {
+      requestUserOpenId: 'ou_reply_bot', requestUserUnionId: 'on_reply_bot',
+      requestLarkAppId: 'app_test', senderType: 'bot' as const,
+      taskContinuation: {
+        appId: 'app_test', openId: 'ou_source_human', sourceSessionId: 'source-session',
+        sourceTurnId: 'om_source_turn',
+      },
+    };
+
+    expect(sendWorkerInput(ds, 'cross-chat result', 'om_reply', {
+      trustedCaller: replyBot,
+    })).toBe(true);
+
+    expect(worker.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'om_reply',
+      trustedCaller: replyBot,
+      queueAfterActiveTurn: true,
+    }));
+  });
 });
 
 describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', () => {

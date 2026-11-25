@@ -331,6 +331,11 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { comparableSessionDir } from './core/working-dir-range.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage, WorkerToDaemon } from './types.js';
 import { mergeStagedSessionTurnInputs, projectLarkTurnInbound, stageSessionTurnInbound } from './services/session-turns.js';
+import {
+  buildTaskContinuationCaller,
+  reforkActivationTrustedCaller,
+  taskContinuationSourceOpenId,
+} from './core/task-continuation-caller.js';
 
 export function useOrdinaryOutputDelivery(): void {
   setDurableBridgeFinalOutputHandler(undefined);
@@ -4440,6 +4445,15 @@ function crossChatFollowUpIsCurrent(ctx: RoutingContext): boolean {
     : undefined;
   const valid = !!current
     && current.sourceSessionId === expected.sourceSessionId
+    && (current.sourceTurnId === expected.sourceTurnId
+      // Replay can enrich the SAME provider receipt while attachments load.
+      // Missing receipt proof or any actual rebind still fails closed; the
+      // admitted legacy turn remains callerless, not newly authenticated.
+      || (!expected.sourceTurnId && !!current.sourceTurnId
+        && !!expected.sourceReceiptMessageId
+        && current.sourceReceiptMessageId === expected.sourceReceiptMessageId))
+    && (expected.sourceReceiptMessageId === undefined
+      || current.sourceReceiptMessageId === expected.sourceReceiptMessageId)
     && current.followThreadEpoch === expected.followThreadEpoch
     && current.sourceChatId === expected.sourceChatId
     && current.scope === expected.scope
@@ -24213,8 +24227,17 @@ function enqueuePrincipalLaneTurn(
     createdAt: new Date().toISOString(),
     dispatchState: 'queued',
   });
+  const previous = ds.session.principalLaneQueuedTurns;
   ds.session.principalLaneQueuedTurns = queued;
-  sessionStore.updateSession(ds.session);
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    // Before worker IPC this turn has no external effect. Restore the exact
+    // in-memory queue so an ingress retry can actually persist it rather than
+    // treating the duplicate turnId as already durable.
+    ds.session.principalLaneQueuedTurns = previous;
+    throw error;
+  }
 }
 
 function terminalizePrincipalLaneDispatchUnknown(
@@ -24351,21 +24374,34 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
   }
 
   head.dispatchState = 'attempting';
-  sessionStore.updateSession(ds.session);
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    // No IPC has crossed yet, so attempting was only an in-memory intent. Move
+    // back to queued and let the bounded retry path re-drive the exact head;
+    // leaving it attempting would suppress every later drive until restart.
+    head.dispatchState = 'queued';
+    schedulePrincipalLaneDispatchRetry(ds, head.turnId);
+    logger.warn(
+      `[${tag(ds)}] Principal-lane attempting marker was not persisted; retained queued head for retry `
+      + `turn=${head.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  }
   let accepted = false;
   let ipcDispatchAttempted = false;
   try {
     if (ds.worker && !ds.worker.killed) {
       accepted = sendWorkerInput(ds, head.cliInput, head.turnId, {
         ...(head.codexAppSteerable ? { codexAppSteerable: true } : {}),
-        trustedCaller: head.caller,
+        ...(head.caller ? { trustedCaller: head.caller } : {}),
       });
     } else if (ds.adoptedFrom) {
       accepted = forkAdoptWorker(ds, {
         payload: head.cliInput,
         turnId: head.turnId,
         atMostOnce: true,
-        trustedCaller: head.caller,
+        ...(head.caller ? { trustedCaller: head.caller } : {}),
         onWorkerGenerationReserved: workerGeneration => {
           ensurePrincipalLaneInboundTurnBinding(ds, head.turnId, workerGeneration);
         },
@@ -24376,7 +24412,7 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
         resume: head.resume,
         turnId: head.turnId,
         atMostOnce: true,
-        trustedCaller: head.caller,
+        ...(head.caller ? { trustedCaller: head.caller } : {}),
         onIpcDispatchAttempted: () => { ipcDispatchAttempted = true; },
       });
     }
@@ -24421,7 +24457,16 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
 
   clearPrincipalLaneDispatchRetry(ds, head.turnId);
   beginNewTurn(ds, head.title, head.turnId);
-  setActiveInteractiveTurn(ds, head.turnId, head.caller, head.title);
+  if (head.caller) {
+    setActiveInteractiveTurn(ds, head.turnId, head.caller, head.title);
+  } else {
+    // A callerless legacy turn still owns the lane's running marker. Do not
+    // invent an interactive principal merely to keep the FIFO state machine.
+    ds.principalLaneRunningTurn = {
+      turnId: head.turnId,
+      workerGeneration: ds.workerGeneration ?? ds.session.workerGeneration ?? 0,
+    };
+  }
   rememberLastCliInput(ds, head.userPrompt, head.cliInput, head.turnId);
   logger.info(
     `[${tag(ds)}] Dispatched principal-lane FIFO head turn=${head.turnId.slice(0, 12)} `
@@ -24857,7 +24902,7 @@ async function notifyPrincipalLaneDispatchUnknown(
   const pending = session?.principalLaneDispatchUnknownNotices
     ?.find(item => item.id === notice.recordId && item.noticePending === true);
   if (!session || !pending) return;
-  const callerAt = pending.caller.requestUserOpenId
+  const callerAt = pending.caller?.requestUserOpenId
     ? `<at id=${pending.caller.requestUserOpenId}></at> `
     : (session.ownerOpenId ? `<at id=${session.ownerOpenId}></at> ` : '');
   try {
@@ -31378,10 +31423,49 @@ async function handleThreadReplyAdmitted(
     senderIsBotTriState(parsed.senderType, isForeignBot),
     parsed.messageId,
   );
+  // Follow routing deliberately exempts a followed cross-chat thread from the
+  // ordinary talk gate (only an explicit block is rejected upstream). That is
+  // sufficient for callerless conversation, but NOT for minting the original
+  // human's continuation. Re-check the actual reply bot against the FOLLOWED
+  // chat's authorization; ctx.chatId has already been rewritten to the source.
+  const continuationReplyBotAllowed = () => rawThreadTrustedCaller?.senderType === 'bot'
+    && !!ctx.crossChatThreadFollowUp
+    && evaluateBotTalk(
+      larkAppId,
+      ctx.crossChatThreadFollowUp.followedChatId,
+      threadSenderOpenId,
+      threadTeamTrustUnionId,
+      threadTeamTrustAppId,
+    ).allowed;
+  const continuationTrustedCaller = ctx.crossChatThreadFollowUp?.sourceTurnId
+    && continuationReplyBotAllowed()
+    ? await (async (): Promise<TrustedCaller | undefined> => {
+        const source = findActiveBySessionId(ctx.crossChatThreadFollowUp!.sourceSessionId);
+        if (!source || source.larkAppId !== larkAppId || source.session.status !== 'active') return undefined;
+        const sourceTurnId = ctx.crossChatThreadFollowUp!.sourceTurnId!;
+        const sourceOpenId = taskContinuationSourceOpenId(source.session, sourceTurnId);
+        if (!sourceOpenId) return undefined;
+        const principal = await trustedCallerForInboundTurn(
+          larkAppId, sourceOpenId, undefined, false, sourceTurnId,
+        );
+        // Authorization may have been revoked while the source principal was
+        // resolved. Re-check at the actual mint boundary; the callerless route
+        // remains available, but no new human continuation may be signed then.
+        if (!continuationReplyBotAllowed()) return undefined;
+        return buildTaskContinuationCaller({
+          rawCaller: rawThreadTrustedCaller,
+          sourcePrincipal: principal,
+          larkAppId,
+          sourceSession: source.session,
+          sourceTurnId,
+        });
+      })()
+    : undefined;
   // Cross-chat followed thread replies are admitted via talk-gate exemption on
   // the bot's own cross-chat thread, so they never replace the origin session's
   // execution principal (nor trigger XPI principal staging in the origin chat).
   const threadTrustedCaller = ctx.crossChatThreadFollowUp ? undefined : rawThreadTrustedCaller;
+  const turnTrustedCaller = threadTrustedCaller ?? continuationTrustedCaller;
   const xpiControlNotice = rawThreadTrustedCaller?.senderType === 'bot'
     ? parseCrossPrincipalControlNotice(parsed.content)
     : undefined;
@@ -32192,6 +32276,7 @@ async function handleThreadReplyAdmitted(
         // (initialStartPending follower) tail entry — the strip-proof admit rebuild
         // then preserves it through promote/repark. Only a plain-human turn is true.
         if (codexAppSteerable) followUp.codexAppSteerable = true;
+        if (turnTrustedCaller) followUp.trustedCaller = turnTrustedCaller;
         return followUp;
       },
     });
@@ -32289,7 +32374,7 @@ async function handleThreadReplyAdmitted(
         ds.pendingPrompt = promptContent;
         ds.pendingTurnId = parsed.messageId;
         ds.pendingStructuredOpeningTurnId = parsed.messageId;
-        ds.pendingTrustedCaller = threadTrustedCaller;
+        ds.pendingTrustedCaller = turnTrustedCaller;
         ds.pendingCodexAppText = parsed.content;
         ds.pendingAcceptedInput = ctx.acceptedInput;
         ds.pendingCodexAppApplicationContext = codexAppApplicationContext;
@@ -32347,6 +32432,7 @@ async function handleThreadReplyAdmitted(
         ds.session.queuedCodexAppMessageContext ??= ds.pendingCodexAppMessageContext;
         // R5-B1-1: freeze steer authorization onto the pending-repo follower tail.
         if (codexAppSteerable) exactFollowUp.codexAppSteerable = true;
+        if (turnTrustedCaller) exactFollowUp.trustedCaller = turnTrustedCaller;
         // No await separates this arrival from its admission, so the FIFO
         // order is stamped by the admit itself.
         const admitted = admitQueuedActivationTail(ds, {
@@ -32952,13 +33038,13 @@ async function handleThreadReplyAdmitted(
     // worker turn marker after this handler returns.  Persist the final payload
     // behind the active turn instead of exposing B2 to B1's worker process.
     if (!crossChatFollowUpIsCurrent(ctx)) return;
-    if (ds.session.principalLane && threadTrustedCaller
+    if (ds.session.principalLane && (turnTrustedCaller || ctx.crossChatThreadFollowUp)
         && (ds.principalLaneRunningTurn
           || ds.activeInteractiveTurn
           || (ds.session.principalLaneQueuedTurns?.length ?? 0) > 0)) {
       enqueuePrincipalLaneTurn(ds, {
         turnId: parsed.messageId,
-        caller: threadTrustedCaller,
+        ...(turnTrustedCaller ? { caller: turnTrustedCaller } : {}),
         userPrompt: promptContent,
         title: stripCrossPrincipalAsToken(parsed.content).text,
         cliInput,
@@ -33012,7 +33098,7 @@ async function handleThreadReplyAdmitted(
             : {}),
           ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true as const } : {}),
-          ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
+          ...(turnTrustedCaller ? { trustedCaller: turnTrustedCaller } : {}),
           // Design §5.5: a main-topic handoff lands in this bot's ordinary
           // session there, which may be busy with someone else's turn. It
           // must start as a turn of its own (its node deadline counts from
@@ -33032,11 +33118,11 @@ async function handleThreadReplyAdmitted(
           retryDurablePrimaryIngress(ctx, 'attached task provider submit receipt is still pending');
         }
         beginNewTurn(ds, parsed.content, parsed.messageId);
-        if (threadTrustedCaller) {
+        if (turnTrustedCaller) {
           setActiveInteractiveTurn(
             ds,
             parsed.messageId,
-            threadTrustedCaller,
+            turnTrustedCaller,
             stripCrossPrincipalAsToken(parsed.content).text,
           );
         }
@@ -33185,7 +33271,7 @@ async function handleThreadReplyAdmitted(
           // the live-worker path (admission computed once at line ~18431; COPIED
           // here, never re-inferred). System/recovery openings keep it absent.
           if (codexAppSteerable) currentFollowUp.codexAppSteerable = true;
-          if (threadTrustedCaller) currentFollowUp.trustedCaller = threadTrustedCaller;
+          if (turnTrustedCaller) currentFollowUp.trustedCaller = turnTrustedCaller;
           return currentFollowUp;
         },
       });
@@ -33288,6 +33374,11 @@ async function handleThreadReplyAdmitted(
     // existing tail before starting the activation journal.
     const queuedHasDurableTail = queuedOpeningHasTail(ds.session, ctx.acceptedInput);
     if (queuedHasDurableTail) await stageCurrentBehindQueuedActivation();
+    const reforkTrustedCaller = reforkActivationTrustedCaller({
+      threadCaller: threadTrustedCaller,
+      continuationCaller: continuationTrustedCaller,
+      queuedHasDurableTail,
+    });
     const reforkContent = queuedDashboardTurn && !queuedHasDurableTail
       ? `${ds.session.queuedPrompt}\n\n${promptContent}`
       : queuedHasDurableTail
@@ -33397,11 +33488,11 @@ async function handleThreadReplyAdmitted(
     // A dead worker must not let a newly-arrived turn jump ahead of a durable
     // principal-lane follower. Append this exact rebuilt input and wake the
     // oldest queued turn; driveNextPrincipalLaneTurn will re-fork that head.
-    if (ds.session.principalLane && threadTrustedCaller
+    if (ds.session.principalLane && (turnTrustedCaller || ctx.crossChatThreadFollowUp)
         && (ds.session.principalLaneQueuedTurns?.length ?? 0) > 0) {
       enqueuePrincipalLaneTurn(ds, {
         turnId: parsed.messageId,
-        caller: threadTrustedCaller,
+        ...(turnTrustedCaller ? { caller: turnTrustedCaller } : {}),
         userPrompt: promptContent,
         title: stripCrossPrincipalAsToken(parsed.content).text,
         cliInput: wrappedInput,
@@ -33459,7 +33550,7 @@ async function handleThreadReplyAdmitted(
           ...((ds.session.xpiSharedCwdAdmissionGroupId || ds.session.principalLane)
             ? { atMostOnce: true }
             : {}),
-          ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
+          ...(reforkTrustedCaller ? { trustedCaller: reforkTrustedCaller } : {}),
           ...((ds.session.xpiSharedCwdAdmissionGroupId || ds.session.principalLane)
             ? {
                 onWorkerGenerationReserved(workerGeneration: number) {
@@ -33491,8 +33582,8 @@ async function handleThreadReplyAdmitted(
         if (codexAppSteerable && !queuedDashboardTurn && !queuedHasDurableTail) {
           wrappedInput.codexAppSteerable = true;
         }
-        if (threadTrustedCaller && !queuedHasDurableTail) {
-          wrappedInput.trustedCaller = threadTrustedCaller;
+        if (reforkTrustedCaller && !queuedHasDurableTail) {
+          wrappedInput.trustedCaller = reforkTrustedCaller;
         }
         reforkAccepted = forkWorker(ds, wrappedInput, {
           // See `hadPriorCliInput` above — an opening on a CLI that never took any
@@ -33556,13 +33647,13 @@ async function handleThreadReplyAdmitted(
       return;
     }
     markIngressAdmitted(ctx);
-    if (reforkAccepted && threadTrustedCaller) {
+    if (reforkAccepted && reforkTrustedCaller) {
       setActiveInteractiveTurn(
         ds,
         queuedHasDurableTail
           ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
           : parsed.messageId,
-        threadTrustedCaller,
+        reforkTrustedCaller,
         queuedHasDurableTail ? undefined : stripCrossPrincipalAsToken(parsed.content).text,
       );
     }

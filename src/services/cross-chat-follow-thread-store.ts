@@ -35,12 +35,14 @@ export function ensureCrossChatFollowThreadAtBinding(input: {
   targetChatId: string;
   targetRootMessageId?: string;
   followThreadEpoch?: string;
+  sourceTurnId?: string;
 }): boolean {
   const canonicalRoot = input.targetRootMessageId ?? input.messageId;
   const filePath = crossChatFollowThreadPath(input.dataDir, input.sessionId);
   try {
     mkdirSync(crossChatFollowThreadDir(input.dataDir), { recursive: true });
     return withFileLockSync(filePath, () => {
+      let latest: BridgeSendMarker | undefined;
       if (existsSync(filePath)) {
         for (const line of readFileSync(filePath, 'utf-8').split('\n')) {
           if (!line.trim()) continue;
@@ -51,9 +53,36 @@ export function ensureCrossChatFollowThreadAtBinding(input: {
             && record.targetChatId === input.targetChatId
             && record.followThreadEpoch === input.followThreadEpoch
             && (record.messageId === canonicalRoot || record.targetRootMessageId === canonicalRoot)) {
-            return true;
+            latest = record;
           }
         }
+      }
+      if (latest) {
+        // The append order is authoritative for one canonical root. Never
+        // revive a later off tombstone, replace an already-attributed binding,
+        // or let an old receipt overwrite a newer send into the same root.
+        if (latest.crossChatFollowThread !== 'at'
+          || latest.sourceTurnId
+          || !input.sourceTurnId
+          || latest.messageId !== input.messageId) {
+          return true;
+        }
+        // A legacy/replayed `at` for this exact provider receipt may be safely
+        // enriched after upgrade. Append instead of rewriting the journal so a
+        // crash cannot destroy the older routing record. Preserve the original
+        // delivery timestamp and routing tuple: replay time is not send time,
+        // and promoting it would let an older session outrank a later real send
+        // to the same followed root.
+        return appendCrossChatFollowThreadBindingUnlocked(input.dataDir, input.sessionId, {
+          sentAtMs: latest.sentAtMs,
+          deliveryKind: 'detoured_send',
+          messageId: latest.messageId,
+          targetChatId: latest.targetChatId,
+          ...(latest.targetRootMessageId ? { targetRootMessageId: latest.targetRootMessageId } : {}),
+          crossChatFollowThread: 'at',
+          followThreadEpoch: latest.followThreadEpoch,
+          turnId: input.sourceTurnId,
+        });
       }
       return appendCrossChatFollowThreadBindingUnlocked(input.dataDir, input.sessionId, {
         sentAtMs: input.sentAtMs,
@@ -63,6 +92,7 @@ export function ensureCrossChatFollowThreadAtBinding(input: {
         ...(input.targetRootMessageId ? { targetRootMessageId: input.targetRootMessageId } : {}),
         crossChatFollowThread: 'at',
         followThreadEpoch: input.followThreadEpoch,
+        turnId: input.sourceTurnId,
       });
     });
   } catch {
@@ -104,6 +134,7 @@ function appendCrossChatFollowThreadBindingUnlocked(
     ...(marker.targetRootMessageId ? { targetRootMessageId: marker.targetRootMessageId } : {}),
     crossChatFollowThread: marker.crossChatFollowThread!,
     ...(marker.followThreadEpoch ? { followThreadEpoch: marker.followThreadEpoch } : {}),
+    ...(marker.turnId ? { sourceTurnId: marker.turnId } : {}),
   };
   appendFileSync(crossChatFollowThreadPath(dataDir, sessionId), `${JSON.stringify(record)}\n`);
   return true;

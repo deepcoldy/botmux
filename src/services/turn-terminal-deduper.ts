@@ -39,6 +39,14 @@ export class TurnTerminalDeduper {
     return this.emitted.get(terminalKey(sessionId, turnId, dispatchAttempt));
   }
 
+  /** Roll back a claim only when terminal IPC failed before acceptance.
+   *  The status guard preserves a newer, contradictory claim if one raced us. */
+  release(sessionId: string, turnId: string, dispatchAttempt: number | undefined, status: string): void {
+    if (!sessionId || !turnId) return;
+    const key = terminalKey(sessionId, turnId, dispatchAttempt);
+    if (this.emitted.get(key) === status) this.emitted.delete(key);
+  }
+
   size(): number {
     return this.emitted.size;
   }
