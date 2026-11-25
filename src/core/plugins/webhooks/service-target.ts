@@ -71,7 +71,8 @@ export interface ResolvePluginLoopbackTargetDeps {
  * - Rejects self-proxy / daemon IPC / session preview ports in `forbiddenPorts`.
  * - Supervisor mode additionally requires `desired.services[pluginId].running`,
  *   rejects cross-plugin port collisions, and requires a live `online` proc
- *   with a non-empty verified `processStart`.
+ *   whose non-empty `configHash` explicitly matches the desired spec hash (no
+ *   `undefined === undefined` pass) and which carries a verified `processStart`.
  * - Requires a valid host-managed loopback bearer token (`readToken`).
  */
 export function resolveRunningPluginServiceTarget(
@@ -108,6 +109,16 @@ export function resolveRunningPluginServiceTarget(
       if (desiredPort === undefined) {
         return { ok: false, status: 503, error: 'plugin_service_unavailable' };
       }
+      // Generation binding: production always writes a non-empty sha256
+      // configHash into both the desired spec and the live proc row. Require an
+      // explicit match so a desired config/port update cannot pair with a still
+      // running OLD process during the supervisor restart window — otherwise the
+      // host bearer token could be dialed to the wrong listener on the new port.
+      // Missing hashes fail closed (no `undefined === undefined` pass).
+      const desiredHash = desiredEntry.spec?.external?.configHash;
+      if (typeof desiredHash !== 'string' || !desiredHash) {
+        return { ok: false, status: 503, error: 'plugin_service_unavailable' };
+      }
       if (forbidden?.has(desiredPort)) {
         return { ok: false, status: 503, error: 'plugin_service_unavailable' };
       }
@@ -129,6 +140,9 @@ export function resolveRunningPluginServiceTarget(
         || proc.pid <= 0
         || typeof proc.processStart !== 'string'
         || !proc.processStart
+        || typeof proc.configHash !== 'string'
+        || !proc.configHash
+        || proc.configHash !== desiredHash
       ) {
         return { ok: false, status: 503, error: 'plugin_service_unavailable' };
       }

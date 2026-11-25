@@ -375,7 +375,7 @@ describe('plugin service host env injection, webhooks port/token, and liveness r
         target: 'live-svc',
         services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) },
       }),
-      readProcesses: () => [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }],
+      readProcesses: () => [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', configHash: 'abc', status: 'online' }],
       forbiddenPorts: () => new Set([3999, 18888]),
     })).toEqual({ ok: true, host: '127.0.0.1', port: 44199, token, pid: 999, processStart: 'boot-2' });
 
@@ -387,11 +387,12 @@ describe('plugin service host env injection, webhooks port/token, and liveness r
       target: 'live-svc',
       services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) },
     };
+    const verifiedProc = [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', configHash: 'abc', status: 'online' }];
     expect(resolveRunningPluginServiceTarget('live-svc', {
       readServiceState: () => ({ ...baseState, status: 'unknown' }),
       hasSupervisorFiles: () => true,
       readDesired: () => recoveredDesired,
-      readProcesses: () => [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }],
+      readProcesses: () => verifiedProc,
     })).toEqual({ ok: true, host: '127.0.0.1', port: 44199, token, pid: 999, processStart: 'boot-2' });
 
     // 1c. But if the live process is still unverified (unknown), it stays 503
@@ -408,8 +409,33 @@ describe('plugin service host env injection, webhooks port/token, and liveness r
       readServiceState: () => ({ ...baseState, status: 'unknown', port: 55555 }),
       hasSupervisorFiles: () => true,
       readDesired: () => recoveredDesired,
-      readProcesses: () => [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }],
+      readProcesses: () => verifiedProc,
     })).toEqual({ ok: true, host: '127.0.0.1', port: 44199, token, pid: 999, processStart: 'boot-2' });
+
+    // 1e. configHash generation binding: an online proc running the OLD config
+    // while desired already carries the NEW hash/port must fail closed, and so
+    // must any missing hash (no undefined === undefined pass).
+    for (const proc of [
+      { name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', configHash: 'old-config', status: 'online' },
+      { name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' },
+    ]) {
+      expect(resolveRunningPluginServiceTarget('live-svc', {
+        readServiceState: () => ({ ...baseState, status: 'unknown' }),
+        hasSupervisorFiles: () => true,
+        readDesired: () => recoveredDesired,
+        readProcesses: () => [proc],
+      })).toEqual({ ok: false, status: 503, error: 'plugin_service_unavailable' });
+    }
+    // A desired spec without a hash also fails closed even with a matching live proc.
+    expect(resolveRunningPluginServiceTarget('live-svc', {
+      readServiceState: () => baseState,
+      hasSupervisorFiles: () => true,
+      readDesired: () => ({
+        revision: 'r1', target: 'live-svc',
+        services: { 'live-svc': { running: true, spec: { name: pluginServiceName('live-svc'), external: { env: { PORT: '44199' } } } } },
+      }),
+      readProcesses: () => verifiedProc,
+    })).toEqual({ ok: false, status: 503, error: 'plugin_service_unavailable' });
 
     // 2. serviceState validation failures
     for (const badState of [
@@ -427,15 +453,17 @@ describe('plugin service host env injection, webhooks port/token, and liveness r
     // 3. Supervisor fail-closed cases: missing desired, running=false, missing PORT, port collision, missing/dead/no-processStart proc, corrupt supervisor.
     //    Port drift between desired and the stale service.json cache is NOT a
     //    failure anymore: desired + live verified proc are authoritative (case 1d).
+    //    Procs carry the matching 'abc' hash unless the case itself targets proc evidence.
+    const okProc = { name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', configHash: 'abc', status: 'online' };
     const supCases = [
-      { desired: { revision: 'r1', target: 'live-svc', services: {} }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }] },
-      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': { ...makeDesiredSpec('live-svc', { PORT: '44199' }), running: false } } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }] },
-      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', {}) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }] },
-      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }), 'other-svc': makeDesiredSpec('other-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'online' }] },
+      { desired: { revision: 'r1', target: 'live-svc', services: {} }, procs: [okProc] },
+      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': { ...makeDesiredSpec('live-svc', { PORT: '44199' }), running: false } } }, procs: [okProc] },
+      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', {}) } }, procs: [okProc] },
+      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }), 'other-svc': makeDesiredSpec('other-svc', { PORT: '44199' }) } }, procs: [okProc] },
       { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [] },
-      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', status: 'stopped' }] },
-      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 0, processStart: 'boot-2', status: 'online' }] },
-      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, status: 'online' }] },
+      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, processStart: 'boot-2', configHash: 'abc', status: 'stopped' }] },
+      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 0, processStart: 'boot-2', configHash: 'abc', status: 'online' }] },
+      { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, configHash: 'abc', status: 'online' }] },
       // A live pid whose birth identity could not be verified projects as
       // 'unknown' (pid retained, no processStart): the proxy must fail 503.
       { desired: { revision: 'r1', target: 'live-svc', services: { 'live-svc': makeDesiredSpec('live-svc', { PORT: '44199' }) } }, procs: [{ name: pluginServiceName('live-svc'), pid: 999, status: 'unknown' }] },
