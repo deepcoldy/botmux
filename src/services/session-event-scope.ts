@@ -166,15 +166,46 @@ export class WorkerSessionEventScope {
     this.noteAdmission({ ref: execution, runtime: state?.runtime ?? source.runtime, phase: 'failed' });
     return this.snapshot(source, execution);
   }
-  canSubmit(turnId?: string, dispatchAttempt?: number, admitted?: ExecutionRef): boolean {
-    if (!turnId) return true;
-    if (admitted && admitted.turnId !== turnId) return false;
+  inspectSubmissionGate(
+    turnId?: string,
+    dispatchAttempt?: number,
+    admitted?: ExecutionRef,
+  ): import('./queued-activation-reconcile.js').SubmissionGateInspection {
+    if (!turnId) return { canSubmit: true };
+    if (admitted && admitted.turnId !== turnId) {
+      return { canSubmit: false, reason: 'admitted_mismatch' };
+    }
     const execution = admitted ?? this.executionForTurn(turnId, dispatchAttempt);
-    if (!execution && [...this.knownExecutions.values()].some(value => value.turnId === turnId)) return false;
-    const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
-    if (state && state.phase !== 'queued') return false;
+    if (!execution && [...this.knownExecutions.values()].some(value => value.turnId === turnId)) {
+      return { canSubmit: false, reason: 'ambiguous_execution' };
+    }
     const submission = this.submissions.get(this.turnKey(turnId, admitted?.dispatchAttempt ?? dispatchAttempt));
-    return !submission;
+    const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
+    const terminal = state
+      ? ['succeeded', 'failed', 'cancelled'].includes(state.phase)
+      : undefined;
+    if (submission) {
+      return {
+        canSubmit: false,
+        reason: 'local_submission',
+        ...(state ? { phase: state.phase, terminal } : {}),
+      };
+    }
+    if (state && state.phase !== 'queued') {
+      return {
+        canSubmit: false,
+        reason: 'persisted_non_queued',
+        phase: state.phase,
+        terminal,
+      };
+    }
+    return {
+      canSubmit: true,
+      ...(state ? { phase: state.phase, terminal } : {}),
+    };
+  }
+  canSubmit(turnId?: string, dispatchAttempt?: number, admitted?: ExecutionRef): boolean {
+    return this.inspectSubmissionGate(turnId, dispatchAttempt, admitted).canSubmit;
   }
   recordSubmission(turnId?: string, dispatchAttempt?: number): void {
     const binding = this.storage.getStore()?.binding ?? this.current;

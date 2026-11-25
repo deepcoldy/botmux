@@ -1,11 +1,13 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { DaemonSession } from './types.js';
 import { config } from '../config.js';
 import { sessionContractStore, type SessionContractStore } from '../services/session-contract-store.js';
 import {
   contractReadiness, sameWorker, sameRuntime, sameExecution, type ContractSessionRef, type WorkerRef, type RuntimeRef,
-  type RuntimeIdentity, type SessionEventContext, type ContractEvent, type ExecutionRef, type ControlKind,
+  type RuntimeIdentity, type SessionEventContext, type ContractEvent, type ExecutionRef, type ExecutionContract, type ExecutionPhase, type ControlKind,
   type ControlOperation, type RuntimeContract, type RuntimeExecutionContinuation, type RuntimeExecutionContinuationFailure,
   TRAEX_CONTINUATION_BACKENDS,
   sessionContractsEnabled,
@@ -284,8 +286,40 @@ export class SessionController {
   command(message: { type: string; turnId?: string; dispatchAttempt?: number; attemptId?: string; sessionCommand?: import('../services/session-contract.js').SessionCommandContext }): import('../services/session-contract.js').SessionCommandContext {
     const execution = message.sessionCommand?.execution ?? (message.turnId ? this.store.executions(this.ref, message.turnId, message.dispatchAttempt)[0]?.ref : undefined);
     const operation = message.attemptId ? this.operation(message.attemptId) : this.operation();
-    const target = execution ? this.store.execution(this.ref, execution.executionId)?.runtime ?? this.currentRuntime() : this.currentRuntime();
-    return message.sessionCommand ?? { version: 2, ...(target ? { runtime: target } : {}),
+    // Never stamp a predecessor worker's stopped/unresolved runtime onto a
+    // replacement worker's command before the replacement binds its own runtime;
+    // admitSessionCommand rejects that stale runtime with stale_runtime_target.
+    const state = this.store.read(this.ref);
+    const liveCurrentWorkerRuntime = (ref?: RuntimeRef): RuntimeRef | undefined => {
+      if (!ref) return undefined;
+      const runtime = this.store.runtime(this.ref, ref.runtimeId);
+      return runtime
+        && sameWorker(runtime.worker, state?.worker)
+        && runtime.phase !== 'stopped'
+        && runtime.phase !== 'unresolved'
+        ? runtime.ref
+        : undefined;
+    };
+    const liveCurrentRuntime = liveCurrentWorkerRuntime(state?.activeRuntime);
+    const execRuntime = execution
+      ? liveCurrentWorkerRuntime(this.store.execution(this.ref, execution.executionId)?.runtime)
+      : undefined;
+    const target = execRuntime ?? liveCurrentRuntime;
+    const base = message.sessionCommand;
+    if (base) {
+      // Never retrofit `runtime` onto a pre-scoped `message` command: during an
+      // in-worker restart/rebind the worker has no assigned runtime yet, and
+      // admitSessionCommand allows runtime-less `message` delivery so turns are
+      // never silently dropped as stale_runtime_target.
+      const attachRuntime = message.type !== 'message' && !base.runtime && !!target;
+      return {
+        ...base,
+        ...(attachRuntime ? { runtime: target } : {}),
+        ...(!base.execution && execution ? { execution } : {}),
+        ...(!base.operationId && operation ? { operationId: operation.operationId } : {}),
+      };
+    }
+    return { version: 2, ...(target ? { runtime: target } : {}),
       ...(execution ? { execution } : {}), ...(operation ? { operationId: operation.operationId } : {}) };
   }
   operation(operationId?: string): ControlOperation | undefined { return this.store.operation(this.ref, operationId); }
@@ -439,7 +473,7 @@ export class SessionController {
         // is worker-scoped and must outlive the released reservation.
         const failureReport = message.type === 'error' || message.type === 'worker_error' || (message.type === 'restart_result' && message.status !== 'succeeded');
         if (!runtime.identity && !failureReport && ['stopped', 'retiring'].includes(runtime.phase)) return { kind: 'reject', reason: 'runtime_reservation_abandoned' };
-        if (!runtime.identity && !failureReport && (waitsForBinding || !['ready', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'restart_result', 'session_ready_ack', 'persistent_backend_target'].includes(message.type))) {
+        if (!runtime.identity && !failureReport && (waitsForBinding || !['ready', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'restart_result', 'session_ready_ack', 'persistent_backend_target', 'queued_activation_submitted'].includes(message.type))) {
           this.store.deferEvent(this.ref, context.bindingId, context.eventId, context.sequence, message);
           return { kind: 'defer', bindingId: context.bindingId };
         }
@@ -624,4 +658,87 @@ export function controllerForSession(ds: DaemonSession, bootstrap = false): Sess
   }
   if (!controller) { controller = new SessionController(ds); controllers.set(ds, controller); }
   return controller;
+}
+
+function readExecutionFromPrimarySnapshot(
+  snapshot: NonNullable<DaemonSession['session']['sessionRuntimeContract']>,
+  ref: ContractSessionRef,
+  turnId: string,
+  dispatchAttempt?: number,
+): ExecutionContract | undefined {
+  if (snapshot.session.ref.appId !== ref.appId || snapshot.session.ref.sessionId !== ref.sessionId) {
+    return undefined;
+  }
+  const rows = snapshot.tables?.entities;
+  if (!Array.isArray(rows)) return undefined;
+  for (const row of rows) {
+    if (row.kind !== 'execution' || typeof row.value !== 'string') continue;
+    try {
+      const parsed = JSON.parse(row.value) as ExecutionContract;
+      if (parsed?.ref?.turnId === turnId && parsed.ref.dispatchAttempt === dispatchAttempt) {
+        return parsed;
+      }
+    } catch { /* ignore malformed row */ }
+  }
+  return undefined;
+}
+
+/** Read-only inspection of a persisted execution contract for a session turn.
+ *  Never calls `store.ensure()`, never constructs a `SessionController`, and
+ *  never mutates `ds` or SQLite — safe to call before rollbackable restore or
+ *  fork decisions. */
+export function readPersistedExecutionContract(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): { hasContract: boolean; execution?: ExecutionContract; phase?: ExecutionPhase } {
+  if (!sessionContractsEnabled() || !isOutputJournalAppId(ds.larkAppId)) {
+    return { hasContract: false };
+  }
+  const ref: ContractSessionRef = { appId: ds.larkAppId, sessionId: ds.session.sessionId };
+  const cached = controllers.get(ds);
+  if (cached && cached.ref.appId === ref.appId && cached.ref.sessionId === ref.sessionId) {
+    const state = cached.store.read(ref);
+    if (!state) return { hasContract: false };
+    const execution = turnId ? cached.store.executions(ref, turnId, dispatchAttempt)[0] : undefined;
+    return {
+      hasContract: true,
+      ...(execution ? { execution, phase: execution.phase } : {}),
+    };
+  }
+  const primarySnapshot = ds.session.sessionRuntimeContract && sessionContractPrimary(ds.larkAppId)
+    ? ds.session.sessionRuntimeContract
+    : undefined;
+  if (primarySnapshot
+    && primarySnapshot.session.ref.appId === ref.appId
+    && primarySnapshot.session.ref.sessionId === ref.sessionId) {
+    // Primary snapshot is authoritative: SessionController.constructor restores
+    // it over local SQLite, so never fall through to stale local rows if the
+    // queried execution is absent from the snapshot.
+    const execution = turnId
+      ? readExecutionFromPrimarySnapshot(primarySnapshot, ref, turnId, dispatchAttempt)
+      : undefined;
+    return {
+      hasContract: true,
+      ...(execution ? { execution, phase: execution.phase } : {}),
+    };
+  }
+  const dbPath = join(config.session.dataDir, 'session-stores', ds.larkAppId, 'sessions.db');
+  if (!ds.initConfig?.sessionContract
+    && ds.session.sessionContractRevision === undefined
+    && !existsSync(dbPath)) {
+    return { hasContract: false };
+  }
+  try {
+    const store = sessionContractStore(config.session.dataDir, ds.larkAppId);
+    const state = store.read(ref);
+    if (!state) return { hasContract: false };
+    const execution = turnId ? store.executions(ref, turnId, dispatchAttempt)[0] : undefined;
+    return {
+      hasContract: true,
+      ...(execution ? { execution, phase: execution.phase } : {}),
+    };
+  } catch {
+    return { hasContract: false };
+  }
 }

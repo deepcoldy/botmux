@@ -2309,6 +2309,7 @@ type DaemonToWorkerBase =
 
     & { traexAutoModel?: import('./services/traex-auto-model.js').TraexAutoModelConfig }
     & { antigravityQuotaHistory?: readonly CliUsageLimitState[]; antigravityActiveQuota?: CliUsageLimitState }
+    & { reconcileQueuedActivation?: import('./services/queued-activation-reconcile.js').ReconcileQueuedActivationHint }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
