@@ -1198,6 +1198,90 @@ describe('contract gateway and real worker boundaries', () => {
     expect(legacy).toHaveBeenCalledWith(expect.objectContaining({ type: 'claude_exit', code: 1 }));
   });
 
+  function retainedExitFixture(pendingCount: number) {
+    const s = fixture();
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const launcher = scope.beginRuntime(undefined, 'same-cli');
+    s.controller.reserveBinding(launcher.bindingId, s.worker);
+    s.controller.bindRuntime(launcher.bindingId, s.worker, s.store.runtime(s.ref)!.identity!);
+    scope.assign(launcher.bindingId, s.runtime);
+    const execution = s.controller.admitInput('running-before-resolution');
+    s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    s.store.apply(s.ref, { type: 'execution_phase', execution, runtime: s.runtime, phase: 'running' });
+    const pending = Array.from({ length: pendingCount }, () => {
+      const binding = scope.beginRuntime(undefined, launcher.physicalId);
+      s.controller.reserveBinding(binding.bindingId, s.worker);
+      return binding;
+    });
+    const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', { workerSessionEventScope: scope });
+    const exit = scope.run(launcher, () => metadata({ type: 'claude_exit', code: 1, turnId: execution.turnId }));
+    const worker = { send: vi.fn((message: any) => {
+      if (message.type === 'runtime_contract_assigned') scope.assign(message.bindingId, message.runtime);
+      if (message.type === 'runtime_binding_refused') scope.refuseBinding(message.bindingId);
+    }) };
+    s.ds.worker = worker as any;
+    const legacy = vi.fn();
+    const host = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', {
+      sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker, sameWorker,
+      logger: { warn: vi.fn(), debug: vi.fn() }, t: 'retained-physical-exit', handleLegacyWorkerMessage: legacy,
+    });
+    return { s, scope, launcher, pending, metadata, exit, worker, legacy, host, execution,
+      bindingMessage: (binding: RuntimeEventBinding, backend: string, physicalId: string, continuation = false) => scope.run(binding, () => metadata({
+        type: 'runtime_binding', bindingId: binding.bindingId,
+        identity: { backend, physicalId, proof: 'process_start' },
+        ...(continuation ? { continuesBindingId: launcher.bindingId } : {}),
+      })) };
+  }
+
+  it.each([1, 2])('replays a fully historical exit only after the last of %s pending binding(s) is refused', async pendingCount => {
+    const { s, pending, bindingMessage, exit, legacy, host, execution } = retainedExitFixture(pendingCount);
+    await host(exit);
+    if (pendingCount > 1) await host(exit); // Retrying the same IPC keeps one pending notification.
+    expect(legacy).not.toHaveBeenCalled();
+    expect(s.store.deferredPhysicalExits(s.ref)).toHaveLength(1);
+    const reopened = new SessionContractStore(s.data, s.appId);
+    expect(reopened.deferredPhysicalExits(s.ref)).toHaveLength(1);
+    reopened.close();
+    vi.spyOn(s.controller, 'bindRuntime').mockImplementation(() => { throw new Error('injected binding refusal'); });
+    for (const [index, binding] of pending.entries()) {
+      const refusal = bindingMessage(binding, 'tmux', '222:real-cli');
+      await host(refusal);
+      if (index < pending.length - 1) {
+        expect(legacy).not.toHaveBeenCalled();
+        expect(s.store.deferredPhysicalExits(s.ref)).toHaveLength(1);
+      }
+    }
+    expect(legacy).toHaveBeenCalledOnce();
+    expect(legacy).toHaveBeenCalledWith(expect.objectContaining({ type: 'claude_exit', code: 1 }));
+    expect(s.store.deferredPhysicalExits(s.ref)).toEqual([]);
+    expect(s.store.runtime(s.ref, s.runtime.runtimeId)?.phase).toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)?.phase).toBe('reconciling');
+  });
+
+  it.each(['continuation', 'replacement'] as const)('settles a retained exit on a successful %s without widening physical authority', async kind => {
+    const { s, pending, bindingMessage, exit, legacy, host, execution } = retainedExitFixture(1);
+    await host(exit);
+    expect(legacy).not.toHaveBeenCalled();
+    expect(s.store.deferredPhysicalExits(s.ref)).toHaveLength(1);
+    const identity = kind === 'continuation'
+      ? { backend: 'tmux', physicalId: '222:real-cli', proof: 'process_start' }
+      : { backend: 'pty', physicalId: 'different-process', proof: 'process_start' };
+    const binding = pending[0]!;
+    const message = bindingMessage(binding, identity.backend, identity.physicalId, kind === 'continuation');
+    await host(message);
+    expect(s.store.deferredPhysicalExits(s.ref)).toEqual([]);
+    expect(s.store.runtime(s.ref, s.runtime.runtimeId)?.phase).toBe('stopped');
+    expect(s.store.execution(s.ref, execution.executionId)?.phase).toBe('reconciling');
+    const live = s.controller.currentRuntime();
+    if (kind === 'continuation') {
+      expect(legacy).toHaveBeenCalledOnce();
+      expect(s.store.runtime(s.ref, live?.runtimeId)?.phase).toBe('stopped');
+    } else {
+      expect(legacy).not.toHaveBeenCalled();
+      expect(s.store.runtime(s.ref, live?.runtimeId)?.phase).toBe('starting');
+    }
+  });
+
   it.each(['none', 'unrelated', 'foreign_worker', 'foreign_generation'] as const)(
     'settles a multi-hop physical exit without changing terminal, queued or replacement work (replacement=%s)', replacement => {
     const s = fixture();

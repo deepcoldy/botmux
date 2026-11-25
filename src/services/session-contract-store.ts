@@ -617,6 +617,12 @@ export class SessionContractStore {
   deferredEvents<T>(ref: ContractSessionRef, bindingId: string): T[] {
     return (this.db.prepare('SELECT value FROM deferred_events WHERE session_key=? AND binding_id=? ORDER BY sequence,event_id').all(sessionKey(ref), bindingId) as Array<{ value: string }>).map(row => JSON.parse(row.value));
   }
+  /** Physical exits retained while a replacement decides whether their legacy
+   * lifecycle notification may run. Other deferred event types stay scoped to
+   * their own binding and never join this replay path. */
+  deferredPhysicalExits<T>(ref: ContractSessionRef): T[] {
+    return (this.db.prepare("SELECT value FROM deferred_events WHERE session_key=? AND json_extract(value,'$.type')='claude_exit' ORDER BY sequence,event_id").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value));
+  }
   discardDeferred(ref: ContractSessionRef, bindingId: string): void {
     this.db.prepare('DELETE FROM deferred_events WHERE session_key=? AND binding_id=?').run(sessionKey(ref), bindingId);
   }

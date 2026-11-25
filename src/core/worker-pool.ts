@@ -29830,6 +29830,13 @@ function setupWorkerHandlers(
       }
       return;
     }
+    const replayDeferredPhysicalExits = async (skip?: ReadonlySet<string>): Promise<void> => {
+      for (const pending of sessionController.store.deferredPhysicalExits<WorkerToDaemon>(sessionController.ref)) {
+        const eventId = (pending.sessionContract as WorkerContractContext | undefined)?.eventId;
+        if (eventId && skip?.has(eventId)) continue;
+        await handleWorkerMessage(pending);
+      }
+    };
     if (msg.type === 'runtime_binding_started' || msg.type === 'runtime_binding' || msg.type === 'runtime_binding_aborted') {
       if (!sessionController.admitsRegistration(msg.type, msg.bindingId, metadata, contractWorker) || ds.worker !== worker) return;
       try {
@@ -29862,6 +29869,7 @@ function setupWorkerHandlers(
           await sessionController.flushPrimary();
           if (ds.worker !== worker || !sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) return;
           worker.send({ type: 'runtime_binding_aborted_ack', bindingId: msg.bindingId });
+          await replayDeferredPhysicalExits();
         }
         else {
           const runtime = sessionController.bindRuntime(msg.bindingId, contractWorker, msg.identity, msg.operationId, msg.continuesBindingId);
@@ -29899,7 +29907,13 @@ function setupWorkerHandlers(
             ...(observerDecision ? { observerDecision: true } : {}),
             executions: sessionController.store.executions(sessionController.ref).filter(execution => execution.runtime?.runtimeId === runtime.ref.runtimeId).map(execution => execution.ref),
             admissionStates: sessionController.store.executions(sessionController.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) } as DaemonToWorker);
-          for (const pending of sessionController.store.deferredEvents<WorkerToDaemon>(sessionController.ref, msg.bindingId)) await handleWorkerMessage(pending);
+          const replayedExits = new Set<string>();
+          for (const pending of sessionController.store.deferredEvents<WorkerToDaemon>(sessionController.ref, msg.bindingId)) {
+            const eventId = (pending.sessionContract as WorkerContractContext | undefined)?.eventId;
+            if (pending.type === 'claude_exit' && eventId) replayedExits.add(eventId);
+            await handleWorkerMessage(pending);
+          }
+          await replayDeferredPhysicalExits(replayedExits);
         }
       } catch (error) {
         logger.warn(`[${t}] Runtime contract binding not confirmed: ${String(error)}`);
@@ -29917,6 +29931,7 @@ function setupWorkerHandlers(
               await sessionController.flushPrimary();
               if (ds.worker === worker && sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) {
                 worker.send({ type: 'runtime_binding_refused', bindingId: msg.bindingId } as DaemonToWorker);
+                await replayDeferredPhysicalExits();
               }
             }
           } catch (settleError) { logger.warn(`[${t}] Refused runtime binding not settled: ${String(settleError)}`); }
@@ -29994,6 +30009,18 @@ function setupWorkerHandlers(
     admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin);
     if (admission.kind === 'reject') { logRejected(admission.reason); return; }
     if (admission.kind === 'defer') { logDeferred('gateway'); return; }
+    // A physical exit can be durably settled yet remain historical solely
+    // because a replacement reservation is still pending. Retain its original
+    // notification until that reservation resolves; otherwise a later refusal
+    // would leave the worker alive with backend=null but no legacy recovery.
+    const retainPhysicalExit = msg.type === 'claude_exit' && admission.kind === 'historical'
+      && !!admission.context.scope.runtime
+      && sessionController.store.hasPendingRuntimeReplacement(sessionController.ref, admission.context.scope.runtime);
+    if (retainPhysicalExit && metadata) {
+      sessionController.store.deferEvent(sessionController.ref,
+        admission.context.bindingId ?? `physical-exit:${metadata.eventId}`,
+        metadata.eventId, metadata.sequence, msg);
+    }
     // A verified native success is stronger than a lost input commit ACK.
     // Ambiguous/failed/cancelled boundaries do not prove queue admission.
     if ((admission.kind === 'current' || admission.kind === 'historical')
@@ -30042,7 +30069,7 @@ function setupWorkerHandlers(
         worker.send({ type: 'continuation_failure_ack', bindingId: failure.bindingId, execution: failure.continuation.execution });
       }
     } else await deliver();
-    if (metadata) sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId);
+    if (metadata && !retainPhysicalExit) sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId);
   };
   worker.on('message', msg => {
     const pending = handleWorkerMessage(msg as WorkerToDaemon);
