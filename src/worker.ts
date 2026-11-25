@@ -15099,6 +15099,9 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
             const procStart = pid ? readProcessStartIdentity(pid) : undefined;
             if (pid && procStart && nativeSessionId && doubaoTrajectoryPathForSession(nativeSessionId) === rolloutPath) {
               doubaoRestoredRuntimeIdentity = { pid, procStart, nativeSessionId };
+              // Reattach starts without an observed id. This native proof is
+              // also sufficient for read-only export, without another submit.
+              inputDeliveryObservedCliSessionId = nativeSessionId;
             }
           }
           if (restoredLiveOwner) log(`Doubao live execution restored (turn=${restored.turnId}, attempt=${restored.dispatchAttempt ?? 'none'})`);

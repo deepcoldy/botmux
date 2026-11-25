@@ -956,6 +956,9 @@ describe('contract gateway and real worker boundaries', () => {
     expect(env.doubaoRestoredExecution).toBeUndefined();
     if (matching) expect(env.doubaoRestoredRuntimeIdentity).toEqual({ pid: 111, procStart: 'start1', nativeSessionId });
     else expect(env.doubaoRestoredRuntimeIdentity).toBeUndefined();
+    // The export reader must regain an observed id only after this exact
+    // native proof, not from the configured resume target alone.
+    expect(env.inputDeliveryObservedCliSessionId).toBe(matching ? nativeSessionId : undefined);
     const identity = loadWorkerFunction<(binding: any) => any>('runtimeIdentityForContract', env);
     s.controller.reserveBinding(binding.bindingId, replacement);
     const runtime = s.controller.bindRuntime(binding.bindingId, replacement, identity(binding));

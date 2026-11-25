@@ -79,26 +79,12 @@ function startScenario(opts: { submitDelayMs?: number; fresh?: boolean; exportOn
     { env: tmuxEnv, timeout: 5_000 });
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
-  child = spawnTsScript(resolve('src/worker.ts'), [], {
-    cwd: resolve('.'),
-    env: {
-      ...tmuxEnv, HOME: root, USERPROFILE: root, XDG_DATA_HOME: join(root, '.local', 'share'),
-      SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, BOTMUX_NO_CLAIM: '1',
-      LARK_APP_ID: 'app_doubao', LARK_APP_SECRET: 'test-only',
-    },
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-  });
-  child.on('message', raw => {
-    const message = raw as WorkerToDaemon;
-    messages.push(message);
-    if (opts.handoff && message.type === 'final_output' && message.handoff) {
-      child!.send({ type: 'final_output_settled', ...message.handoff });
-    }
-  });
-  child.stdout?.on('data', data => logs.push(data.toString()));
-  child.stderr?.on('data', data => logs.push(data.toString()));
-  sessionName = TmuxBackend.sessionName(sessionId);
-  child.send({
+  const workerEnv = {
+    ...tmuxEnv, HOME: root, USERPROFILE: root, XDG_DATA_HOME: join(root, '.local', 'share'),
+    SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, BOTMUX_NO_CLAIM: '1',
+    LARK_APP_ID: 'app_doubao', LARK_APP_SECRET: 'test-only',
+  };
+  const init = {
     type: 'init', sessionId, daemonBootId: 'doubao-late-start-boot', chatId: 'oc_test', chatType: 'group',
     rootMessageId: 'om_root', workingDir: dataDir, cliId: 'doubao', cliPathOverride: fakeCli,
     ...(opts.fresh ? {} : { cliSessionId: nativeId, resume: true }),
@@ -108,7 +94,24 @@ function startScenario(opts: { submitDelayMs?: number; fresh?: boolean; exportOn
       : 'first task: inspect the build', turnId: 'om_turn_1',
     larkAppId: 'app_doubao', larkAppSecret: 'test-only', apiOnly: true,
     ...(opts.handoff ? { finalOutputHandoff: { version: 2, token: 'fixture-token', admitNew: true } } : {}),
-  } satisfies DaemonToWorker);
+  } satisfies DaemonToWorker;
+  const spawnObserver = (message: DaemonToWorker) => {
+    child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'), env: workerEnv, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    child.on('message', raw => {
+      const event = raw as WorkerToDaemon;
+      messages.push(event);
+      if (opts.handoff && event.type === 'final_output' && event.handoff) {
+        child!.send({ type: 'final_output_settled', ...event.handoff });
+      }
+    });
+    child.stdout?.on('data', data => logs.push(data.toString()));
+    child.stderr?.on('data', data => logs.push(data.toString()));
+    child.send(message);
+  };
+  sessionName = TmuxBackend.sessionName(sessionId);
+  spawnObserver(init);
   const waitUntil = async (check: () => boolean, what: string, timeoutMs = 20_000) => {
     const deadline = Date.now() + timeoutMs;
     while (!check()) {
@@ -137,10 +140,16 @@ function startScenario(opts: { submitDelayMs?: number; fresh?: boolean; exportOn
   const pane = () => execFileSync('tmux', ['-L', 'botmux', 'capture-pane', '-p', '-t', sessionName!],
     { env: tmuxEnv, timeout: 5_000 }).toString();
   const notices = (turnId: string) => messages.filter(msg => msg.type === 'user_notify' && msg.turnId === turnId);
+  const restartObserver = async () => {
+    const previous = child!;
+    previous.kill('SIGTERM');
+    await waitUntil(() => previous.exitCode !== null || previous.signalCode !== null, 'observer detached');
+    spawnObserver({ ...init, cliSessionId: nativeId, resume: true, prompt: '', turnId: undefined });
+  };
   return {
     messages, logs, waitUntil, control, clear, assignmentText, pastes, finals, uncollected, sendMessage,
     pressEnterInTerminal, pressInTerminal, pane, notices,
-    trajectory, ctlDir, dataDir, sessionId,
+    trajectory, ctlDir, dataDir, sessionId, restartObserver,
   };
 }
 
@@ -153,6 +162,24 @@ async function finishFirstTurn(s: ReturnType<typeof startScenario>): Promise<voi
 }
 
 describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('Doubao input accepted while the CLI is busy', () => {
+  it('export recovery survives an observer reattach without submitting the pending input again', async () => {
+    const s = startScenario({ fresh: true, exportOnly: true });
+    await s.waitUntil(() => s.assignmentText().includes('first task'), 'native input proof', 30_000);
+    await s.waitUntil(() => {
+      try {
+        const journal = JSON.parse(readFileSync(join(s.dataDir, 'turn-marks', `${s.sessionId}.json.structured`), 'utf8'));
+        return journal.pending.some((turn: { turnId: string; nativeUserProof?: unknown }) => turn.turnId === 'om_turn_1' && turn.nativeUserProof);
+      } catch { return false; }
+    }, 'native attribution proof persisted');
+    await s.restartObserver();
+    await s.waitUntil(() => s.messages.filter(msg => msg.type === 'ready').length >= 2, 'replacement observer ready');
+    s.control('finish-1', 'ANSWER_AFTER_REATTACH');
+    await s.waitUntil(() => s.finals('om_turn_1').length > 0, 'pending answer recovered without new submit', 30_000);
+    await pause(2_000);
+    expect(s.finals('om_turn_1').map(msg => (msg as { content: string }).content)).toEqual(['ANSWER_AFTER_REATTACH']);
+    expect(s.pastes('first task')).toBe(1);
+  }, 90_000);
+
   it.each(['tmux', 'pty'] as const)('export recovery collects a fresh tool-less first answer once on %s, including consecutive turns and late logs', async backend => {
     const s = startScenario({ fresh: true, exportOnly: true, backend });
     await s.waitUntil(() => s.assignmentText().includes('first task'), 'first assignment proof', 30_000);
