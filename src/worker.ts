@@ -32410,6 +32410,7 @@ async function spawnCliBody(
     ...argvBakedOpts,
     reliableTurnTerminal: cliAdapter.reliableTurnTerminal === true,
   });
+  armPendingArgvTurnExecutionStart(cfg.turnId, cfg.dispatchAttempt, spawnArgvNeedsWorkingSeed);
   // Fresh evidence window for the argv first-turn start gate (Pi): the new
   // generation must not inherit a previous spawn's latch or fail-open timer.
   stopSpawnArgvTurnStartFailOpen();
@@ -41063,6 +41064,10 @@ let lastTurnFailureSurfacedAtMs: number | undefined;
 /** Opens at each turn's literal CLI write, closes at its terminal. See
  *  turn-execution-clock.ts for why queueing time is deliberately excluded. */
 const turnExecutionClock = new TurnExecutionClock();
+/** Init precedes the opening runtime binding. Retain that start locally instead
+ *  of sending an event the contract gateway must reject; argv-baked turns have
+ *  no later literal write that could publish it again. */
+let pendingTurnExecutionStart: { turnId: string; dispatchAttempt?: number; startedAtMs: number; argvBaked?: boolean } | undefined;
 
 /** Arm the execution window for the turn whose input is being written right
  *  now. Called from every literal-write site (flush, adopt, passthrough, init)
@@ -41074,7 +41079,32 @@ function markTurnExecutionStart(turnId: string | undefined, dispatchAttempt?: nu
   inputDeliveryEvidence.start({
     turnId, dispatchAttempt, cliGeneration: cliSpawnGeneration,
   }, startedAtMs, webTerminalInputGeneration, cliInterruptGeneration);
-  if (turnId) send({ type: 'turn_execution_started', turnId, dispatchAttempt, startedAtMs });
+  if (!turnId) return;
+  const binding = workerSessionEventScope?.contextBinding() ?? workerSessionEventScope?.currentBinding();
+  if (workerSessionEventScope && !binding?.runtime) {
+    const argvBaked = pendingTurnExecutionStart?.turnId === turnId
+      && pendingTurnExecutionStart.dispatchAttempt === dispatchAttempt
+      ? pendingTurnExecutionStart.argvBaked : undefined;
+    pendingTurnExecutionStart = {
+      turnId,
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      startedAtMs,
+      ...(argvBaked ? { argvBaked } : {}),
+    };
+    return;
+  }
+  pendingTurnExecutionStart = undefined;
+  send({ type: 'turn_execution_started', turnId, dispatchAttempt, startedAtMs });
+}
+
+/** Freeze argv-delivery eligibility when spawn decides it. The ready/idle UI
+ *  seed flags are deliberately independent: Grok clears them on its first
+ *  pre-execution ready, while the turn still needs this start replayed. */
+function armPendingArgvTurnExecutionStart(turnId: string | undefined, dispatchAttempt: number | undefined, argvBaked: boolean): void {
+  if (!argvBaked || !pendingTurnExecutionStart) return;
+  if (pendingTurnExecutionStart.turnId !== turnId
+    || pendingTurnExecutionStart.dispatchAttempt !== dispatchAttempt) return;
+  pendingTurnExecutionStart.argvBaked = true;
 }
 
 /** The authority can be left holding a turn whose terminal already went out:
@@ -41556,6 +41586,7 @@ function scheduleConsumedQueuedTurnAdvance(): void {
  * Backend startup may await later; a receipt only proves worker ownership. */
 function initializeWorkerSessionContract(msg: Extract<DaemonToWorker, { type: 'init' }>): void {
   sessionId = msg.sessionId;
+  pendingTurnExecutionStart = undefined;
   workerSessionEventScope = msg.sessionContract ? new WorkerSessionEventScope(msg.sessionContract.session, msg.sessionContract.worker) : undefined;
   for (const state of msg.sessionContract?.executions ?? []) workerSessionEventScope?.noteAdmission(state);
   if (msg.sessionCommand?.execution) workerSessionEventScope?.rememberExecution(msg.sessionCommand.execution);
@@ -43132,16 +43163,22 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       for (const observed of msg.observedExecutions ?? []) {
         scope?.rememberObservedExecution(msg.bindingId, observed.runtime, observed.execution);
       }
-      const hasLiveTurnCapability = typeof currentBotmuxTurnId === 'string' && currentBotmuxTurnId.length > 0
-        && (typeof retiredTurnIds === 'undefined' || !retiredTurnIds.has(currentBotmuxTurnId))
+      const hasLiveTurn = typeof currentBotmuxTurnId === 'string' && currentBotmuxTurnId.length > 0
+        && (typeof retiredTurnIds === 'undefined' || !retiredTurnIds.has(currentBotmuxTurnId));
+      const hasLiveTurnCapability = hasLiveTurn
         && typeof sandboxRelayCapability !== 'undefined' && sandboxRelayCapability !== null
         && sandboxRelayCapability.turnId === currentBotmuxTurnId
         && sandboxRelayCapability.dispatchAttempt === currentBotmuxDispatchAttempt
         && (typeof activeTurnAuthority === 'undefined' || !activeTurnAuthority.identity().turnId
           || (activeTurnAuthority.identity().turnId === currentBotmuxTurnId
             && activeTurnAuthority.identity().dispatchAttempt === currentBotmuxDispatchAttempt));
+      if (pendingTurnExecutionStart
+        && (pendingTurnExecutionStart.turnId !== currentBotmuxTurnId
+          || pendingTurnExecutionStart.dispatchAttempt !== currentBotmuxDispatchAttempt)) {
+        pendingTurnExecutionStart = undefined;
+      }
       if (msg.mayExecute && scope && assignedBinding?.runtime && scope.currentBinding() === assignedBinding
-        && hasLiveTurnCapability) {
+        && hasLiveTurn) {
         const directExecution = (msg.executions ?? []).find(execution =>
           execution.turnId === currentBotmuxTurnId && execution.dispatchAttempt === currentBotmuxDispatchAttempt);
         const observedEntry = !directExecution
@@ -43162,10 +43199,38 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         const alreadyPublishedForExecution = !!resumedExecution
           && publishedOriginContractScope?.bindingId === assignedBinding.bindingId
           && publishedOriginContractScope.executionId === resumedExecution.executionId;
-        if (resumedExecution && !alreadyPublishedForExecution
-          && (!resumedState || !['succeeded', 'failed', 'cancelled'].includes(resumedState.phase))) {
+        const resumedTerminal = !!resumedState && ['succeeded', 'failed', 'cancelled'].includes(resumedState.phase);
+        const deferredStart = pendingTurnExecutionStart;
+        const deferredStartMatches = !!deferredStart && !!resumedExecution
+          && deferredStart.turnId === resumedExecution.turnId
+          && deferredStart.dispatchAttempt === resumedExecution.dispatchAttempt;
+        // The daemon's admission snapshot can predate a terminal emitted by this
+        // worker. The local exact-attempt tombstone closes that replay window.
+        const locallyTerminated = deferredStartMatches && typeof turnTerminalEmitted === 'function'
+          && turnTerminalEmitted(deferredStart.turnId, deferredStart.dispatchAttempt);
+        // For quiescence argv CLIs the first ready is completion. Grok instead
+        // revokes it on the pre-execution ready, so its late assignment remains
+        // eligible even after the UI seed flags have been cleared.
+        const completedReady = deferredStartMatches && isPromptReady === true;
+        if (deferredStartMatches && (resumedTerminal || locallyTerminated || completedReady)) pendingTurnExecutionStart = undefined;
+        const replayExecutionStart = deferredStartMatches && !resumedTerminal && !locallyTerminated && !completedReady
+          && !resumedState?.runtime && deferredStart.argvBaked === true;
+        const republishOrigin = !!resumedExecution && hasLiveTurnCapability && !alreadyPublishedForExecution;
+        if (resumedExecution && !resumedTerminal && (replayExecutionStart || republishOrigin)) {
           scope.run(assignedBinding, () => {
-            publishSandboxRelayCapability();
+            if (republishOrigin) publishSandboxRelayCapability();
+            if (replayExecutionStart && deferredStart) {
+              pendingTurnExecutionStart = undefined;
+              // Screen timers started during init have no captured binding. The
+              // replayed submission lets their later frames observe this runtime.
+              scope.recordSubmission(deferredStart.turnId, deferredStart.dispatchAttempt);
+              send({
+                type: 'turn_execution_started',
+                turnId: deferredStart.turnId,
+                dispatchAttempt: deferredStart.dispatchAttempt,
+                startedAtMs: deferredStart.startedAtMs,
+              });
+            }
           }, resumedExecution);
         }
       }
