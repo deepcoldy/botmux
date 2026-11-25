@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -14,6 +14,10 @@ import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
 } from '../src/core/managed-origin-capability.js';
+import {
+  findCompletedAntigravityTurnIds,
+  hashAntigravitySubmittedText,
+} from '../src/services/antigravity-transcript.js';
 
 const ORIGIN_CHANNEL = 'a'.repeat(64);
 
@@ -291,6 +295,84 @@ describe('resolveSessionContext()', () => {
     // No more queued turns
     const adv3 = advanceAncestorSessionTurn(dir, process.pid, 'turn-3');
     expect(adv3).toEqual({ advanced: false, turnId: 'turn-3' });
+  });
+
+  it('preserves Antigravity reconcile hints while advancing queued turns', () => {
+    const hint = {
+      textSha256: 'a'.repeat(64),
+      sampledTranscriptPath: '/tmp/transcript.jsonl',
+      minByteOffset: 42,
+      skipPriorMatches: 1,
+    };
+    const nextHint = { textSha256: 'b'.repeat(64), minByteOffset: 0 };
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid',
+      turnId: 'turn-1',
+      queuedTurns: [
+        { turnId: 'turn-2', antigravityReconcileHint: hint },
+        { turnId: 'turn-3', antigravityReconcileHint: nextHint },
+      ],
+    }));
+
+    expect(findAncestorSessionMarkerContext(dir, process.pid, 'env-sid')?.queuedTurns?.[0]
+      .antigravityReconcileHint).toEqual(hint);
+    expect(advanceAncestorSessionTurn(dir, process.pid, 'turn-1')).toEqual({ advanced: true, turnId: 'turn-2' });
+
+    const advanced = JSON.parse(readFileSync(join(dir, '.botmux-cli-pids', String(process.pid)), 'utf8'));
+    expect(advanced.antigravityReconcileHint).toEqual(hint);
+    expect(advanced.queuedTurns).toHaveLength(1);
+    expect(advanced.queuedTurns[0].antigravityReconcileHint).toEqual(nextHint);
+  });
+
+  it('drops malformed Antigravity reconcile hints without blocking turn advancement', () => {
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid',
+      turnId: 'turn-1',
+      queuedTurns: [{
+        turnId: 'turn-2',
+        antigravityReconcileHint: { textSha256: 'not-a-sha256', minByteOffset: -1 },
+      }],
+    }));
+
+    expect(findAncestorSessionMarkerContext(dir, process.pid, 'env-sid')?.queuedTurns?.[0]
+      .antigravityReconcileHint).toBeUndefined();
+    expect(advanceAncestorSessionTurn(dir, process.pid, 'turn-1')).toEqual({ advanced: true, turnId: 'turn-2' });
+    const advanced = JSON.parse(readFileSync(join(dir, '.botmux-cli-pids', String(process.pid)), 'utf8'));
+    expect(advanced.turnId).toBe('turn-2');
+    expect(advanced.antigravityReconcileHint).toBeUndefined();
+  });
+
+  it.each([
+    { minByteOffset: -1 },
+    { minByteOffset: 0.5 },
+    { sampledTranscriptPath: '' },
+    { skipPriorMatches: -1 },
+  ])('rejects the whole hint when an optional field is invalid: %j', badField => {
+    const prompt = '[定时任务] 相同提示词';
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid',
+      turnId: 'schedule:old',
+      queuedTurns: [{
+        turnId: 'schedule:new',
+        antigravityReconcileHint: { textSha256: hashAntigravitySubmittedText(prompt), ...badField },
+      }],
+    }));
+    expect(advanceAncestorSessionTurn(dir, process.pid, 'schedule:old')).toEqual({ advanced: true, turnId: 'schedule:new' });
+
+    const advanced = JSON.parse(readFileSync(join(dir, '.botmux-cli-pids', String(process.pid)), 'utf8'));
+    expect(advanced.antigravityReconcileHint).toBeUndefined();
+    const hint = advanced.antigravityReconcileHint;
+    const transcript = join(dir, 'transcript_full.jsonl');
+    writeFileSync(transcript, [
+      JSON.stringify({ step_index: 1, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: `<USER_REQUEST>\n${prompt}\n</USER_REQUEST>` }),
+      JSON.stringify({ step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'done' }),
+    ].join('\n') + '\n');
+    // The transcript contains only an older completed occurrence. A weakened
+    // parser would retain the hash, drop the bad offset and falsely complete it.
+    expect([...findCompletedAntigravityTurnIds(transcript, [{
+      turnId: 'schedule:new',
+      ...(hint ? { submittedTextSha256: hint.textSha256 } : {}),
+    }])]).toEqual([]);
   });
 
   it('handles single legacy queuedTurnId when advancing turn', () => {
