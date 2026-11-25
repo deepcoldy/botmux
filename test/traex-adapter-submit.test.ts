@@ -11,7 +11,7 @@ import { discoverRolloutSessions } from '../src/services/resumable-session-disco
 import { traexRolloutUserInputs, traexSessionIdFromRolloutPath } from '../src/services/traex-transcript.js';
 import { traeSessionsRoot } from '../src/services/traex-paths.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
-import { traexTerminalSessionIsBound } from '../src/services/traex-terminal-session.js';
+import { traexTerminalSessionIsBound, refreshTraexTerminalSession } from '../src/services/traex-terminal-session.js';
 
 // TRAE submit verification polls the global submit log history.jsonl (written
 // at SUBMIT time), NOT the per-session rollout. This mirrors the codex adapter
@@ -163,6 +163,51 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     expect(traexTerminalSessionIsBound(pty, SID_1)).toBe(true);
     expect(traexTerminalSessionIsBound(pty, SID_2)).toBe(false);
     expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+  });
+
+  it('refuses to paste while a native status query is unconfirmed, then accepts input once the composer is clean', async () => {
+    const idleViewport = (input: string) => ({
+      viewport: `latest answer\n❯ ${input}\n▀▀▀▀▀\n  GPT-6 · ~/work · Context 79% left\n  ? for shortcuts`,
+      cursor: { x: 2, y: 1 },
+    });
+    let state = idleViewport('Implement {feature}');
+    const pty: PtyHandle & { pasteText: ReturnType<typeof vi.fn>; sendSpecialKeys: ReturnType<typeof vi.fn> } = {
+      cliPid: process.pid,
+      write: vi.fn(),
+      pasteText: vi.fn(),
+      sendText: vi.fn((text: string) => { state = idleViewport(text); }),
+      // A failed Enter leaves the /status draft in the composer and the query unconfirmed.
+      sendSpecialKeys: vi.fn(() => false),
+      captureInputState: () => state,
+    };
+    const resolution = await refreshTraexTerminalSession(pty);
+    expect(resolution).toEqual({ kind: 'unavailable' });
+
+    const blocked = await createTraexAdapter().writeInput(pty, 'queued task');
+    expect(blocked).toMatchObject({ submitted: false });
+    expect(blocked.failureReason).toContain('status');
+    expect(pty.pasteText).not.toHaveBeenCalled();
+    expect(pty.write).not.toHaveBeenCalled();
+
+    // A positively empty composer releases the gate; the next write is attempted normally.
+    state = idleViewport('Implement {feature}');
+    const released = await createTraexAdapter().writeInput(pty, 'queued task');
+    expect(released.submitted).toBe(false);
+    expect(pty.pasteText).toHaveBeenCalledOnce();
+  });
+
+  it('never presses Enter for a correlated write after the frontend PID generation changes', async () => {
+    const pty: PtyHandle & { pasteText: ReturnType<typeof vi.fn>; sendSpecialKeys: ReturnType<typeof vi.fn> } = {
+      cliPid: process.pid,
+      write: vi.fn(),
+      // The backend is replaced between paste and submit (cliRestart / rewired leaf).
+      pasteText: vi.fn(() => { pty.cliPid = process.pid + 1; }),
+      sendSpecialKeys: vi.fn(),
+    };
+    const result = await createTraexAdapter().writeInput(pty, 'generation guarded', { correlateTranscript: true });
+    expect(result.submitted).toBe(false);
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(pty.write).not.toHaveBeenCalled();
   });
 
   beforeEach(() => {
