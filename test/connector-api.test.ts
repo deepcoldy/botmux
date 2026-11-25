@@ -81,6 +81,35 @@ afterEach(async () => {
 });
 
 describe('connector-api write routes', () => {
+  it('rejects reserved connector id "plugin" case-insensitively without persisting secret', async () => {
+    for (const badId of ['plugin', 'PLUGIN', ' Plugin ']) {
+      const res = await fetch(`${baseUrl}/api/connectors`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          id: badId,
+          name: 'Reserved collision test',
+          target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+        }),
+      });
+      expect(res.status).toBe(400);
+      expect(await json(res)).toMatchObject({ ok: false, error: 'reserved_connector_id' });
+    }
+    expect((await json(await fetch(`${baseUrl}/api/connectors`))).connectors).toEqual([]);
+    expect((await json(await fetch(`${baseUrl}/api/webhook-secrets`))).secrets).toEqual([]);
+
+    const okRes = await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'plugin-demo',
+        name: 'Non-reserved id',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    });
+    expect(okRes.status).toBe(201);
+  });
+
   it('rejects new workflow connectors without retaining a connector or generated secret', async () => {
     const res = await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',

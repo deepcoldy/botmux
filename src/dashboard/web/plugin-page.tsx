@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from 'react';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
+import { readControlCsrfToken } from './control-csrf.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { ModalDialog } from './modal-dialog.js';
 import { RefreshIconButton } from './dashboard-components.js';
@@ -91,6 +92,7 @@ interface ManagedPlugin {
     dashboard?: Array<{ id: string; route: string; entry: string }>;
     cli?: { entry?: string; commands?: PluginCliCommand[] };
     service?: { entry?: string; mode?: string };
+    webhooks?: { schemaVersion: 1; maxBodyBytes?: number; routes: Array<{ path: string; prefix?: true; endpoint?: string; maxBodyBytes?: number }> };
     prerequisites?: { entry: string };
   };
   dependencies?: string[];
@@ -126,7 +128,7 @@ interface PluginFeedback {
 
 type PluginServiceAction = 'start' | 'stop' | 'restart';
 type PendingToggles = ReadonlyMap<string, boolean>;
-type PluginDashboardApi = ReturnType<typeof pluginDashboardApi>;
+export type PluginDashboardApi = ReturnType<typeof createPluginDashboardApi>;
 type PluginDashboardComponent = ComponentType<{ pluginId: string; api: PluginDashboardApi }>;
 interface PluginManagementContext {
   presentation: { displayName: string; audience?: string; description?: string; version: string };
@@ -882,7 +884,7 @@ function PluginManagementPage(): React.JSX.Element {
   const [focusedPlugin, setFocusedPlugin] = useState<string | null>(null);
 
   const marketRequest = useCallback(async (action: string, body: unknown) => {
-    const csrf = document.querySelector<HTMLMetaElement>('meta[name="botmux-csrf"]')?.content || '';
+    const csrf = readControlCsrfToken() ?? '';
     const response = await fetch(`/api/plugins/market/${action}`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-csrf': csrf }, body: JSON.stringify(body),
     });
@@ -1115,9 +1117,110 @@ function PluginManagementPage(): React.JSX.Element {
   );
 }
 
-function pluginDashboardApi(pluginId: string) {
+const SERVICE_PROXY_PLUGIN_ID_RE = /^[a-z][a-z0-9._-]{0,63}$/;
+const SERVICE_PROXY_SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+const SERVICE_PROXY_CONTROL_RE = /[\u0000-\u001f\u007f]/;
+const SERVICE_PROXY_ENCODED_SEP_RE = /%(?:2f|5c)/i;
+
+/**
+ * Validate and normalize a plugin-relative path into a same-origin Dashboard
+ * service proxy URL (`/api/plugins/<pluginId>/service...`). Rejects schemes,
+ * protocol-relative URLs, backslashes, `#`, control chars, and `.`/`..` path
+ * traversal segments while preserving raw query strings verbatim.
+ */
+export function resolvePluginServiceProxyUrl(pluginId: string, path: string): string {
+  if (typeof pluginId !== 'string' || !SERVICE_PROXY_PLUGIN_ID_RE.test(pluginId)) {
+    throw new TypeError('invalid_plugin_id');
+  }
+  if (typeof path !== 'string') {
+    throw new TypeError('invalid_service_fetch_path');
+  }
+  if (path !== path.trim() || SERVICE_PROXY_CONTROL_RE.test(path) || path.includes('#')) {
+    throw new TypeError('invalid_service_fetch_path');
+  }
+  if (
+    SERVICE_PROXY_SCHEME_RE.test(path)
+    || path.startsWith('//')
+    || path.startsWith('\\')
+    || path.startsWith('/\\')
+  ) {
+    throw new TypeError('invalid_service_fetch_path');
+  }
+
+  const queryIndex = path.indexOf('?');
+  const pathPart = queryIndex >= 0 ? path.slice(0, queryIndex) : path;
+  const queryPart = queryIndex >= 0 ? path.slice(queryIndex) : '';
+
+  if (pathPart.includes('//') || pathPart.includes('\\')) {
+    throw new TypeError('invalid_service_fetch_path');
+  }
+
+  let normalizedPath = '';
+  if (pathPart === '' || pathPart === '/') {
+    normalizedPath = pathPart;
+  } else {
+    const trimmedLeading = pathPart.startsWith('/') ? pathPart.slice(1) : pathPart;
+    const hasTrailingSlash = trimmedLeading.endsWith('/');
+    const body = hasTrailingSlash ? trimmedLeading.slice(0, -1) : trimmedLeading;
+    const segments = body.length > 0 ? body.split('/') : [];
+    for (const segment of segments) {
+      if (!segment || segment === '.' || segment === '..' || SERVICE_PROXY_ENCODED_SEP_RE.test(segment)) {
+        throw new TypeError('invalid_service_fetch_path');
+      }
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(segment);
+      } catch {
+        throw new TypeError('invalid_service_fetch_path');
+      }
+      if (
+        decoded === '.'
+        || decoded === '..'
+        || decoded.includes('/')
+        || decoded.includes('\\')
+        || SERVICE_PROXY_CONTROL_RE.test(decoded)
+      ) {
+        throw new TypeError('invalid_service_fetch_path');
+      }
+    }
+    normalizedPath = `/${trimmedLeading}`;
+  }
+
+  const prefix = `/api/plugins/${encodeURIComponent(pluginId)}/service`;
+  const expectedPathname = `${prefix}${normalizedPath}`;
+  const target = `${expectedPathname}${queryPart}`;
+  const check = new URL(target, 'https://botmux.invalid');
+  if (
+    check.origin !== 'https://botmux.invalid'
+    || (check.pathname !== prefix && !check.pathname.startsWith(`${prefix}/`))
+    || check.pathname.split('/').length !== expectedPathname.split('/').length
+    || check.pathname.endsWith('/') !== expectedPathname.endsWith('/')
+  ) {
+    throw new TypeError('invalid_service_fetch_path');
+  }
+  return target;
+}
+
+function buildServiceFetchHeaders(rawHeaders: HeadersInit | undefined): Headers {
+  if (!rawHeaders) return new Headers();
+  if (
+    rawHeaders instanceof Headers
+    || Array.isArray(rawHeaders)
+    || (typeof rawHeaders === 'object' && typeof (rawHeaders as { [Symbol.iterator]?: unknown })[Symbol.iterator] === 'function')
+  ) {
+    return new Headers(rawHeaders);
+  }
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(rawHeaders)) {
+    if (value !== undefined) headers.set(key, String(value));
+  }
+  return headers;
+}
+
+export function createPluginDashboardApi(pluginId: string, fetchImpl?: typeof fetch) {
+  const doFetch: typeof fetch = (input, init) => (fetchImpl ?? globalThis.fetch)(input, init);
   async function settings(method: string, value?: unknown) {
-    const response = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings`, {
+    const response = await doFetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings`, {
       method, headers: { 'content-type': 'application/json' },
       ...(method === 'PUT' ? { body: JSON.stringify(value) } : {}),
     });
@@ -1130,6 +1233,22 @@ function pluginDashboardApi(pluginId: string) {
     managementFeatures: { dialogBody: true },
     getSettings: () => settings('GET'),
     saveSettings: (value: unknown) => settings('PUT', value),
+    async serviceFetch(path: string, init?: RequestInit): Promise<Response> {
+      const targetUrl = resolvePluginServiceProxyUrl(pluginId, path);
+      const headers = buildServiceFetchHeaders(init?.headers);
+      const csrfToken = readControlCsrfToken();
+      if (csrfToken) {
+        headers.set('x-botmux-csrf', csrfToken);
+      } else {
+        headers.delete('x-botmux-csrf');
+      }
+      return doFetch(targetUrl, {
+        ...init,
+        headers,
+        credentials: 'same-origin',
+        redirect: 'manual',
+      });
+    },
     async listBots() { return (await fetchPluginManagement()).bots; },
     async getServiceStatus() {
       const payload = await fetchPluginManagement();
@@ -1145,6 +1264,10 @@ function pluginDashboardApi(pluginId: string) {
       return postServiceAction(pluginId, 'restart');
     },
   };
+}
+
+function pluginDashboardApi(pluginId: string) {
+  return createPluginDashboardApi(pluginId);
 }
 
 function PluginDashboardRoute(props: { hash: string }): React.JSX.Element {

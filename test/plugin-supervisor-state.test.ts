@@ -3,13 +3,22 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readPluginProcesses, changePluginService } from '../src/core/plugins/supervisor-client.js';
+import { readDurableProcessIdentity } from '../src/utils/process-identity.js';
 import {
   pluginSupervisorDir, pluginSupervisorDesiredPath, pluginSupervisorResultPath,
   pluginSupervisorStatePath, readPluginSupervisorDesired,
 } from '../src/core/plugins/supervisor-store.js';
 
 const legacy = vi.hoisted(() => ({ alive: false }));
+const zombiePids = vi.hoisted(() => new Set<number>());
 vi.mock('../src/core/legacy-pm2-reaper.js', () => ({ liveGodAt: () => legacy.alive }));
+vi.mock('../src/utils/process-identity.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/utils/process-identity.js')>();
+  return {
+    ...actual,
+    isLinuxZombie: (pid: number) => zombiePids.has(pid) || actual.isLinuxZombie(pid),
+  };
+});
 
 describe('plugin supervisor lifecycle evidence', () => {
   let home: string;
@@ -17,6 +26,7 @@ describe('plugin supervisor lifecycle evidence', () => {
     home = mkdtempSync(join(tmpdir(), 'plugin-supervisor-state-'));
     vi.stubEnv('HOME', home);
     legacy.alive = false;
+    zombiePids.clear();
     mkdirSync(pluginSupervisorDir(), { recursive: true });
   });
   afterEach(() => {
@@ -71,5 +81,39 @@ describe('plugin supervisor lifecycle evidence', () => {
     await expect(changePluginService('demo', 'stop')).rejects.toThrow('plugin_legacy_pm2_running');
     expect(existsSync(pluginSupervisorDesiredPath())).toBe(false);
     expect(existsSync(pluginSupervisorStatePath())).toBe(false);
+  });
+
+  it('verifies processStart identity and rejects recycled or zombie PIDs in readPluginProcesses', () => {
+    const selfStart = readDurableProcessIdentity(process.pid);
+    expect(selfStart).toBeTruthy();
+
+    write(pluginSupervisorStatePath(), {
+      procs: [{ name: stopped.name, appId: '', pid: process.pid, processStart: selfStart, status: 'online' }],
+    });
+    expect(readPluginProcesses()).toEqual([expect.objectContaining({
+      name: stopped.name,
+      pid: process.pid,
+      processStart: selfStart,
+      status: 'online',
+    })]);
+
+    // Recycled PID (mismatched processStart) is treated as stopped without pid/processStart
+    write(pluginSupervisorStatePath(), {
+      procs: [{ name: stopped.name, appId: '', pid: process.pid, processStart: 'recycled-boot:999', status: 'online' }],
+    });
+    const recycled = readPluginProcesses()[0];
+    expect(recycled.status).toBe('stopped');
+    expect(recycled.pid).toBeUndefined();
+    expect(recycled.processStart).toBeUndefined();
+
+    // Zombie PID with matching processStart is treated as stopped
+    zombiePids.add(process.pid);
+    write(pluginSupervisorStatePath(), {
+      procs: [{ name: stopped.name, appId: '', pid: process.pid, processStart: selfStart, status: 'online' }],
+    });
+    const zombie = readPluginProcesses()[0];
+    expect(zombie.status).toBe('stopped');
+    expect(zombie.pid).toBeUndefined();
+    expect(zombie.processStart).toBeUndefined();
   });
 });

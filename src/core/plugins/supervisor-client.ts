@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { readDurableProcessIdentity } from '../../utils/process-identity.js';
+import { isLinuxZombie, readDurableProcessIdentity } from '../../utils/process-identity.js';
 import { scrubExternalMemberEnv } from '../../utils/child-env.js';
 import { pidAlive } from '../fleet-supervisor.js';
 import { isStandaloneBinary, resolveEntrySpawn } from '../self-spawn.js';
@@ -20,6 +20,7 @@ import {
 export interface PluginProcessInfo {
   name: string;
   pid?: number;
+  processStart?: string;
   status?: string;
   configHash?: string;
 }
@@ -42,10 +43,13 @@ export function readPluginProcesses(): PluginProcessInfo[] {
   }
   const processes = new Map<string, PluginProcessInfo>();
   for (const proc of state?.procs ?? []) {
-    const alive = pidAlive(proc.pid);
+    const alive = pidAlive(proc.pid)
+      && !isLinuxZombie(proc.pid)
+      && (!proc.processStart || readDurableProcessIdentity(proc.pid) === proc.processStart);
     processes.set(proc.name, {
       name: proc.name,
       ...(alive ? { pid: proc.pid } : {}),
+      ...(alive && proc.processStart ? { processStart: proc.processStart } : {}),
       status: !alive && proc.status === 'online' ? 'stopped' : proc.status,
       configHash: proc?.configHash,
     });

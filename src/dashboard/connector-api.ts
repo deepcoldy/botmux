@@ -285,6 +285,7 @@ function normalizeConnectorInput(
   const rateLimitCleared = c.rateLimit === null;
   const rateLimit = rateLimitCleared ? null : record(c.rateLimit ?? prior?.rateLimit);
   const id = opts.id ?? (typeof c.id === 'string' && c.id.trim() ? c.id.trim() : prior?.id ?? newConnectorId());
+  if (id.toLowerCase() === 'plugin') return { ok: false, error: 'reserved_connector_id' };
   const name = typeof c.name === 'string' && c.name.trim() ? c.name.trim() : prior?.name;
   if (!name) return { ok: false, error: 'name_required' };
 
