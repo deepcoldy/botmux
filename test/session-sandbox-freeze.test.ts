@@ -68,6 +68,21 @@ beforeEach(() => {
 });
 
 describe('freezeSessionSandboxDecision', () => {
+  it.each(['claude-code', 'codex'])('freezes protected result isolation before live configuration changes (%s)', cliId => {
+    const ds = makeSession();
+    ds.session.cliId = cliId;
+    const cfg = botCfg({ sandbox: true, protectedResults: true });
+    freezeSessionSandboxDecision(ds, cfg);
+    expect(ds.session.protectedResults).toBe(true);
+    expect(ds.session.sandboxWithholdBotSecret).toBe(true);
+    cfg.protectedResults = false;
+    cfg.sandbox = false;
+    freezeSessionSandboxDecision(ds, cfg);
+    expect(ds.session.protectedResults).toBe(true);
+    expect(ds.session.sandboxWithholdBotSecret).toBe(true);
+    expect(ds.session.sandbox).toBe(true);
+  });
+
   it('records the live bot config on the session at freeze time and persists it', () => {
     const ds = makeSession();
     freezeSessionSandboxDecision(ds, botCfg({

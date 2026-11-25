@@ -51,8 +51,13 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
 
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
 type Case = readonly [string, string, number, unknown, Record<string, unknown>?];
+const followInclude = { field: 'description', op: 'contains', pattern: 'alarm group' };
+const followExclude = { field: 'name', op: 'contains', pattern: '[已关单]' };
+const followConfig = { enabled: true, includeRules: [followInclude], excludeRules: [followExclude] };
 const CASES: readonly Case[] = [
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true,"excludeChatIds":["oc_skip"]}}', 200, { ok: true, ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }, { ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }],
+  ['/api/bot-owner-group-follow', JSON.stringify({ ownerGroupFollow: { ...followConfig, includeRules: [followInclude, { ...followInclude, caseSensitive: false }] } }), 200, { ok: true, ownerGroupFollow: followConfig }, { ownerGroupFollow: followConfig }],
+  ['/api/bot-owner-group-follow', JSON.stringify({ ownerGroupFollow: { excludeRules: [{ field: 'any', op: 'regex', pattern: '(a|aa)+' }] } }), 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}', 200, { ok: true, ownerGroupFollow: null }, { ownerGroupFollow: undefined }],
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":"true"}}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"excludeChatIds":["ou_other"]}}', 400, { ok: false, error: 'invalid_json' }],

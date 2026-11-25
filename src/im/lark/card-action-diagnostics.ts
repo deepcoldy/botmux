@@ -38,6 +38,8 @@ export function logCardActionDiagnostics(
     outer: fieldTypes(outer), event: fieldTypes(outer.event),
     action: fieldTypes(source.action), actionKeys: Object.keys(action),
     actionValueType: typeof action.value,
+    // Each submitted form field's type (a checker's wire shape is not documented), never its value.
+    formValue: fieldTypes(action.form_value),
     behaviorValueTypes: Array.isArray(action.behaviors)
       ? action.behaviors.map(behavior => ({
         type: actionLabel(record(behavior).type), valueType: typeof record(behavior).value,

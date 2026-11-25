@@ -467,9 +467,9 @@ describe('antigravity writeInput — single-Enter submit', () => {
       fake.pty.submitBracketedPaste = text => { appendHistory(text); return true; };
       await selected.writeInput(fake.pty, 'turn with unknown id at submit');
       appendFileSync(transcript, '{"type":"USER_INPUT","status":"DONE"}\n');
-      // Regular verdict: a running transcript yields to an empty composer on screen
-      // (cancelled turn), which the grace must not override.
-      expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(false);
+      // The new USER_INPUT is live even while the type-ahead composer is visible.
+      expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(true);
+      expect(selected.isSessionBusy!({ getCurrentScreen: () => idleScreen })).toBe(true);
     });
 
     it('stays busy during the grace when no viewport can be read', async () => {

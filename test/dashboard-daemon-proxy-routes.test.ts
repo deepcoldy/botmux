@@ -7,6 +7,7 @@ import {
 } from '../src/dashboard/daemon-proxy-routes.js';
 import { REPLY_STYLE_REQUEST_MAX_BYTES } from '../src/dashboard/reply-style.js';
 import { ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES } from '../src/im/lark/ask-option-layout.js';
+import { normalizeOwnerGroupFollowConfig } from '../src/services/owner-group-follow-policy.js';
 import { proxyRouteFor, resolveUpstream, runProxyRoute } from './helpers/daemon-proxy-harness.js';
 
 const JSON_HEAD = { 'content-type': 'application/json' };
@@ -57,6 +58,7 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/backend-type', '/api/bot-backend-type', 'raw'],
   ['PUT', '/api/bots/cli_a/hc-herdr-tabs', '/api/bot-hc-herdr-tabs', 'raw'],
   ['PUT', '/api/bots/cli_a/card-prefs', '/api/bot-card-prefs', 'raw'],
+  ['PUT', '/api/bots/cli_a/quota-fallback-chain', '/api/bot-quota-fallback-chain', 'json'],
   ['PUT', '/api/bots/cli_a/substitute-mode', '/api/bot-substitute-mode', 'raw'],
   ['POST', '/api/bots/cli_a/substitute-targets/resolve', '/api/bot-substitute-targets/resolve', 'raw'],
   ['PUT', '/api/bots/cli_a/summary-range', '/api/bot-summary-range', 'raw'],
@@ -253,6 +255,21 @@ describe('handleDaemonProxyRoute: bodies with a byte cap', () => {
 });
 
 describe('handleDaemonProxyRoute: JSON-validated routes', () => {
+  it('forwards a full owner follow configuration with multibyte patterns and excluded IDs', async () => {
+    const rules = Array.from({ length: 50 }, (_, i) => ({
+      field: 'description', op: 'startsWith', pattern: '群'.repeat(198) + String(i).padStart(2, '0'), caseSensitive: true,
+    }));
+    const ownerGroupFollow = {
+      enabled: true, includeRules: rules, excludeRules: rules,
+      excludeChatIds: Array.from({ length: 1000 }, (_, i) => `oc_${i.toString(16).padStart(32, '0')}`),
+    };
+    expect(normalizeOwnerGroupFollowConfig(ownerGroupFollow)).toEqual(ownerGroupFollow);
+    const body = JSON.stringify({ ownerGroupFollow });
+    const out = await runProxyRoute({ method: 'PUT', url: '/api/bots/cli_a/owner-group-follow', body });
+    expect(out.head).toEqual([200, JSON_HEAD]);
+    expect(out.proxyCalls).toEqual([{ appId: 'cli_a', path: '/api/bot-owner-group-follow', init: { method: 'PUT', headers: JSON_HEAD, body } }]);
+  });
+
   it.each([
     ['reply-style', '/api/bot-reply-style', REPLY_STYLE_REQUEST_MAX_BYTES],
     ['ask-option-layout', '/api/bot-ask-option-layout', ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES],

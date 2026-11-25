@@ -50,6 +50,11 @@ describe('ZellijObserveBackend input encoding', () => {
     expect(actionArgs('write')).toEqual(['write', '--pane-id', P, '3']);
   });
 
+  it('sendSpecialKeys(M-Up) → modified-arrow bytes, never literal key-name text', () => {
+    be.sendSpecialKeys('M-Up');
+    expect(actionArgs('write')).toEqual(['write', '--pane-id', P, '27', '91', '49', '59', '51', '65']);
+  });
+
   it('returns false when the targeted pane action is unavailable', () => {
     failActions = true;
     expect(be.sendText('/goal x')).toBe(false);

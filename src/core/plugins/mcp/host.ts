@@ -8,6 +8,7 @@ import {
   PluginMcpGateway,
   type GatewayLinkRefRegistrationHandler,
   type GatewayTrustedResultDeliveryHandler,
+  type GatewayTrustedResultStatusHandler,
   type GatewayTrustedTurnIdentityProvider,
 } from './gateway.js';
 import { acceptMcpGatewayHandshake, mcpGatewayAuthTokenPath } from './socket-auth.js';
@@ -64,6 +65,8 @@ export async function startSessionMcpGatewayHost(opts: {
   dataDir: string;
   trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+  trustedResultStatus?: GatewayTrustedResultStatusHandler;
+  protectedResultDeliveryAvailable?: () => boolean;
   linkRefRegistration?: GatewayLinkRefRegistrationHandler;
   requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
   protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
@@ -101,6 +104,8 @@ export async function startSessionMcpGatewayHost(opts: {
       }, {
         trustedTurnIdentity: opts.trustedTurnIdentity,
         trustedResultDelivery: opts.trustedResultDelivery,
+        trustedResultStatus: opts.trustedResultStatus,
+        protectedResultDeliveryAvailable: opts.protectedResultDeliveryAvailable,
         linkRefRegistration: opts.linkRefRegistration,
         requestProtectedSecretChannel: opts.requestProtectedSecretChannel,
         protectedMcpPolicy: opts.protectedMcpPolicy,
