@@ -148,6 +148,15 @@ import {
   SchedulePreconditionError,
 } from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
+import * as chatTopNotice from '../im/lark/chat-top-notice.js';
+import * as larkClient from '../im/lark/client.js';
+import {
+  isPlainJsonObject,
+  normalizeGroupLarkAppIds,
+  parseGroupCreateOptions,
+  parseGroupShareLinkRequest,
+  parseGroupTopNoticeRequest,
+} from './group-ipc-options.js';
 import { GROUP_SEND_BODY_MAX_BYTES, parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage, sendRequestBoundMessage, type GroupSendInput } from '../services/request-bound-group-send.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
@@ -629,7 +638,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, LarkTransportDisabledError, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization, type UserAuthorizationPollResult } from '../utils/user-token.js';
 import { describeMissingUserScopes, type AppVersionReviewLookup } from '../utils/lark-app-version.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
@@ -10266,6 +10275,108 @@ ipcRoute('POST', '/api/groups/:chatId/leave', requireBoundBot(async (_req, res, 
   jsonRes(res, 200, r);
 }));
 
+function isLarkTransportDisabledError(err: unknown): boolean {
+  return err instanceof LarkTransportDisabledError
+    || (err instanceof Error && err.name === 'LarkTransportDisabledError');
+}
+
+function isBoundBotApiOnly(larkAppId: string): boolean {
+  try {
+    return getBot(larkAppId).config.apiOnly === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Host-only top-notice setter through this daemon's exact bound bot identity.
+ * Enforces bound-bot mismatch (port-reuse guard), apiOnly transport refusal,
+ * live chat membership, and message-to-chat ownership (inside putChatTopNotice).
+ */
+ipcRoute('POST', '/api/groups/:chatId/top-notice', requireBoundBot(async (req, res, p) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res, 16 * 1024);
+  if (body === BAD_JSON) return;
+  const larkAppId = cachedLarkAppId;
+  const parsed = parseGroupTopNoticeRequest(p.chatId, body, larkAppId);
+  if (!parsed.ok) return jsonRes(res, parsed.status, { ok: false, error: parsed.error });
+  if (isBoundBotApiOnly(larkAppId)) {
+    return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+  }
+  try {
+    const inChat = await larkClient.isCurrentBotInChat(larkAppId, parsed.chatId);
+    if (!inChat) return jsonRes(res, 403, { ok: false, error: 'bot_not_in_chat' });
+  } catch (err) {
+    if (isLarkTransportDisabledError(err)) {
+      return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+    }
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
+  }
+  try {
+    await chatTopNotice.putChatTopNotice(larkAppId, parsed.chatId, parsed.messageId);
+    return jsonRes(res, 200, {
+      ok: true,
+      larkAppId,
+      chatId: parsed.chatId,
+      messageId: parsed.messageId,
+    });
+  } catch (err) {
+    if (isLarkTransportDisabledError(err)) {
+      return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+    }
+    const msg = ipcErrorText(err);
+    if (msg.startsWith('message_chat_unavailable')) {
+      return jsonRes(res, 404, { ok: false, error: 'message_chat_unavailable' });
+    }
+    if (msg.startsWith('message_chat_mismatch')) {
+      return jsonRes(res, 409, { ok: false, error: 'message_chat_mismatch' });
+    }
+    return jsonRes(res, 502, { ok: false, error: msg });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
+/**
+ * Host-only share-link generator through this daemon's exact bound bot identity.
+ * Enforces bound-bot mismatch, apiOnly transport refusal, and live chat membership
+ * before invoking `getChatShareLink`.
+ */
+ipcRoute('POST', '/api/groups/:chatId/share-link', requireBoundBot(async (req, res, p) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res, 16 * 1024);
+  if (body === BAD_JSON) return;
+  const larkAppId = cachedLarkAppId;
+  const parsed = parseGroupShareLinkRequest(p.chatId, body, larkAppId);
+  if (!parsed.ok) return jsonRes(res, parsed.status, { ok: false, error: parsed.error });
+  if (isBoundBotApiOnly(larkAppId)) {
+    return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+  }
+  try {
+    const inChat = await larkClient.isCurrentBotInChat(larkAppId, parsed.chatId);
+    if (!inChat) return jsonRes(res, 403, { ok: false, error: 'bot_not_in_chat' });
+  } catch (err) {
+    if (isLarkTransportDisabledError(err)) {
+      return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+    }
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
+  }
+  try {
+    const result = await groupsStore.getChatShareLink(larkAppId, parsed.chatId, parsed.validityPeriod);
+    if (!result.ok) {
+      return jsonRes(res, 502, { ok: false, error: result.error });
+    }
+    return jsonRes(res, 200, {
+      ok: true,
+      larkAppId,
+      chatId: parsed.chatId,
+      validityPeriod: parsed.validityPeriod,
+      shareLink: result.shareLink,
+    });
+  } catch (err) {
+    if (isLarkTransportDisabledError(err)) {
+      return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+    }
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
 // ─── Oncall bindings (dashboard) ───────────────────────────────────────────
 // PUT  /api/oncall/:chatId  body: {workingDir} — bind or update workingDir
 // DELETE /api/oncall/:chatId — unbind
@@ -10982,11 +11093,20 @@ ipcRoute('GET', '/api/groups/:chatId/members-display', requireBoundBot(async (_r
     // The list is this bot's viewpoint and includes the bot itself. Flag that
     // row so pickers can keep it out of "grant to" choices: exact chat grants
     // reject the receiver as its own subject (receiver_cannot_be_subject).
+    // Keep selfOpenId authoritative when known, while falling back safely to
+    // larkAppId when openId fell back to appId or before /bot/v3/info resolves
+    // (requiring a unique larkAppId match so same-name external bots are not flagged).
     const selfOpenId = getBotOpenId(cachedLarkAppId);
+    const selfAppMatches = members.filter(member => member.larkAppId === cachedLarkAppId).length;
+    const isSelfMember = (member: (typeof members)[number]): boolean => (
+      (Boolean(selfOpenId) && member.openId === selfOpenId)
+      || (member.larkAppId === cachedLarkAppId && (
+        member.openId === cachedLarkAppId
+        || (!selfOpenId && selfAppMatches === 1)
+      ))
+    );
     jsonRes(res, 200, {
-      members: selfOpenId
-        ? members.map(member => (member.openId === selfOpenId ? { ...member, self: true } : member))
-        : members,
+      members: members.map(member => (isSelfMember(member) ? { ...member, self: true } : member)),
     });
   } catch (err) {
     jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
@@ -14446,42 +14566,58 @@ ipcRoute('PUT', '/api/bot-working-dir-mode', requireBoundBot(async (req, res) =>
 // initial bot members. The dashboard's public route picks any online daemon
 // to act as creator, then forwards here.
 ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
-  let body: {
+  let rawBody: unknown;
+  try {
+    rawBody = await readJsonBody<unknown>(req);
+  } catch {
+    return jsonRes(res, 400, { error: 'bad_json', accepted: false });
+  }
+  if (!isPlainJsonObject(rawBody)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json', accepted: false });
+  }
+  const body = rawBody as {
     name?: unknown;
+    creatorLarkAppId?: unknown;
     larkAppIds?: unknown;
     userOpenIds?: unknown;
     ownerUnionIds?: unknown;
     transferOwnerUnionId?: unknown;
     transferOwnerTo?: unknown;
     notifyOwnerOpenId?: unknown;
+    ownerNotice?: unknown;
+    managerUserIds?: unknown;
     bindWorkingDir?: unknown;
     roleProfileId?: unknown;
     chatMode?: unknown;
     botCollaboration?: unknown;
+    kickoffBotLarkAppId?: unknown;
+    kickoffPrompt?: unknown;
   };
-  try {
-    body = await readJsonBody<{
-      name?: string;
-      larkAppIds?: string[];
-      userOpenIds?: string[];
-      ownerUnionIds?: string[];
-      transferOwnerUnionId?: string;
-      transferOwnerTo?: string;
-      notifyOwnerOpenId?: string;
-      bindWorkingDir?: string;
-      roleProfileId?: string;
-    }>(req);
-  } catch {
-    return jsonRes(res, 400, { error: 'bad_json', accepted: false });
-  }
   const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
-  if (!Array.isArray(body.larkAppIds) || !body.larkAppIds.every(x => typeof x === 'string')) {
-    return jsonRes(res, 400, { error: 'larkAppIds_required', accepted: false });
+  // Legacy trusted callers may omit the creator from larkAppIds (or pass an
+  // empty creator-only list); createGroupWithBots adds the bound bot implicitly.
+  const normalizedLarkAppIds = normalizeGroupLarkAppIds(body.larkAppIds, { allowEmpty: true });
+  if (!normalizedLarkAppIds.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required', accepted: false });
   }
-  // userOpenIds, transferOwnerTo, notifyOwnerOpenId are optional; pre-validated
-  // upstream by the dashboard route. All open_ids MUST be in the calling bot's
-  // app scope (caller is responsible — Lark open_ids are app-scoped, see
-  // dashboard/operator-selector.ts).
+  const larkAppIds = normalizedLarkAppIds.larkAppIds;
+  // New callers pin the creator explicitly. Both exact identity and roster
+  // membership are enforced only for that form; without the pin, preserve the
+  // legacy implicit-creator contract instead of inventing a new requirement.
+  if (body.creatorLarkAppId !== undefined) {
+    if (typeof body.creatorLarkAppId !== 'string'
+      || !body.creatorLarkAppId.trim()
+      || body.creatorLarkAppId !== body.creatorLarkAppId.trim()) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_creator_lark_app_id', accepted: false });
+    }
+    if (body.creatorLarkAppId !== cachedLarkAppId || !larkAppIds.includes(cachedLarkAppId)) {
+      return jsonRes(res, 409, { ok: false, error: 'bot_mismatch', accepted: false });
+    }
+  }
+  // userOpenIds, transferOwnerTo, notifyOwnerOpenId, managerUserIds are optional;
+  // pre-validated upstream by the dashboard route. All open_ids MUST be in the
+  // calling bot's app scope (caller is responsible — Lark open_ids are app-scoped,
+  // see dashboard/operator-selector.ts).
   const userIds = Array.isArray(body.userOpenIds) && body.userOpenIds.every(x => typeof x === 'string')
     ? (body.userOpenIds as string[])
     : [];
@@ -14508,10 +14644,12 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
   if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id', accepted: false });
   }
-  // Optional (design 2026-11-03 workflow-dashboard-orchestration §8): a topic
-  // group, and the talk-only grant matrix between the bots that joined (what
-  // CLI create-group writes). Absent → today's behaviour, byte for byte.
-  const groupCreationExtras = parseGroupCreateExtras(body);
+  // Optional fields: chatMode, botCollaboration, kickoffBotLarkAppId,
+  // kickoffPrompt, ownerNotice, managerUserIds. Absent → legacy behaviour byte for byte.
+  const groupCreationExtras = parseGroupCreateOptions(body, {
+    larkAppIds,
+    creatorLarkAppId: cachedLarkAppId,
+  });
   if (!groupCreationExtras.ok) return jsonRes(res, 400, { ok: false, error: groupCreationExtras.error, accepted: false });
   const bindWorkingDir = typeof body.bindWorkingDir === 'string' ? body.bindWorkingDir.trim() : '';
   let bindResolvedPath: string | undefined;
@@ -14520,19 +14658,31 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     if (!v.ok) return jsonRes(res, 400, { ok: false, error: v.error, accepted: false });
     bindResolvedPath = v.resolvedPath;
   }
+  if (isBoundBotApiOnly(cachedLarkAppId)) {
+    return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled', accepted: false });
+  }
+  const effectiveUserIds = groupCreationExtras.managerUserIds?.length
+    ? Array.from(new Set([...userIds, ...groupCreationExtras.managerUserIds]))
+    : userIds;
   let createdChatId: string | undefined;
   try {
     const r = await createGroupWithBots({
       creatorLarkAppId: cachedLarkAppId,
-      larkAppIds: body.larkAppIds as string[],
+      larkAppIds,
       name,
-      userOpenIds: userIds,
+      userOpenIds: effectiveUserIds,
       ownerUnionIds,
       transferOwnerUnionId: transferOwnerUnionId ?? undefined,
       transferOwnerTo: transferTo ?? undefined,
       notifyOwnerOpenId: notifyTo ?? undefined,
+      ...(groupCreationExtras.ownerNotice === false ? { ownerNotice: false as const } : {}),
+      ...(groupCreationExtras.managerUserIds !== undefined ? { managerUserIds: groupCreationExtras.managerUserIds } : {}),
       bindWorkingDir: bindWorkingDir || undefined,
       roleProfileId: roleProfileId ?? undefined,
+      ...(groupCreationExtras.kickoffBotLarkAppId !== undefined ? {
+        kickoffBotLarkAppId: groupCreationExtras.kickoffBotLarkAppId,
+        kickoffPrompt: groupCreationExtras.kickoffPrompt,
+      } : {}),
       onChatCreated: chatId => { createdChatId = chatId; },
       ...(groupCreationExtras.chatMode ? { chatMode: groupCreationExtras.chatMode } : {}),
       ...(groupCreationExtras.botCollaboration
@@ -14541,6 +14691,9 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     });
     jsonRes(res, 200, bindResolvedPath ? { ...r, bindResolvedPath } : r);
   } catch (e) {
+    if (!createdChatId && isLarkTransportDisabledError(e)) {
+      return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled', accepted: false });
+    }
     // No `accepted:false` here: createChat may already have committed. Preserve
     // the id when the service reached its post-create checkpoint for recovery.
     jsonRes(res, 502, {
@@ -14552,20 +14705,25 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
 }));
 
 /** The optional `/api/groups/create` fields (absent = unchanged behaviour). */
-export function parseGroupCreateExtras(body: { chatMode?: unknown; botCollaboration?: unknown }):
-  | { ok: true; chatMode?: 'topic' | 'group'; botCollaboration: boolean }
+export function parseGroupCreateExtras(body: {
+  chatMode?: unknown;
+  botCollaboration?: unknown;
+  kickoffBotLarkAppId?: unknown;
+  kickoffPrompt?: unknown;
+  ownerNotice?: unknown;
+  managerUserIds?: unknown;
+}):
+  | {
+    ok: true;
+    chatMode?: 'topic' | 'group';
+    botCollaboration: boolean;
+    kickoffBotLarkAppId?: string;
+    kickoffPrompt?: string;
+    ownerNotice?: boolean;
+    managerUserIds?: string[];
+  }
   | { ok: false; error: string } {
-  if (body.chatMode !== undefined && body.chatMode !== 'topic' && body.chatMode !== 'group') {
-    return { ok: false, error: 'invalid_chat_mode' };
-  }
-  if (body.botCollaboration !== undefined && typeof body.botCollaboration !== 'boolean') {
-    return { ok: false, error: 'invalid_bot_collaboration' };
-  }
-  return {
-    ok: true,
-    ...(body.chatMode !== undefined ? { chatMode: body.chatMode as 'topic' | 'group' } : {}),
-    botCollaboration: body.botCollaboration === true,
-  };
+  return parseGroupCreateOptions(body);
 }
 
 /** The talk-only grant matrix between local bots in one chat, through each
@@ -14762,7 +14920,16 @@ export function startIpcServer(opts: {
         const m = r.pattern.exec(url.pathname);
         if (!m) continue;
         const params: Record<string, string> = {};
-        r.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
+        try {
+          for (let i = 0; i < r.keys.length; i++) {
+            params[r.keys[i]] = decodeURIComponent(m[i + 1]);
+          }
+        } catch (err) {
+          if (err instanceof URIError) {
+            return jsonRes(res, 400, { ok: false, error: 'invalid_url_encoding' });
+          }
+          throw err;
+        }
         await r.handler(req, res, params);
         return;
       }

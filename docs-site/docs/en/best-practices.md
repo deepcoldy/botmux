@@ -33,7 +33,7 @@ You are "Example User"'s on-call bot and will receive all kinds of questions:
 
 ![The "Clean up worktree" button on the close card](/img/worktree-cleanup-close-card.png)
 
-**How permissions split:** once on-call is bound, everyone in the group can **talk** to the bot; actions that **change the session**, such as `/cd`, `/restart`, `/close` and card buttons, stay limited to the owner and admins (`allowedUsers`). See [Permissions](/en/permissions).
+**How permissions split:** once on-call is bound, everyone in the group can **talk** to the bot; actions that **change the session**, such as `/cd`, `/restart`, `/close` and card buttons, stay limited to the owner and admins (`allowedUsers`); the one exception is that the person who opened a topic can tap "❌ Close Session" on the card to close their own topic (the `/close` command still needs operate access). See [Permissions](/en/permissions).
 
 **Several projects?** Create several bots and `/oncall bind` each one to a different project directory.
 

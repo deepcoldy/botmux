@@ -410,6 +410,20 @@ describe('Oncall unified save', () => {
     expect(field('oncallFormDisplay')).toBeDefined();
   });
 
+  it('defaults to native and saves the Botmux custom form through the existing policy control', async () => {
+    await render();
+    const field = () => renderer.root.findByProps({ dataInput: 'oncallCustomFormMode' });
+    expect(field().props.value).toBe('native');
+    act(() => field().props.onChange('botmux'));
+    expect(writes()).toHaveLength(0);
+    await save();
+    expect(writes().map(([url]) => url)).toEqual(['/api/bots/app/oncall-group']);
+    expect(JSON.parse(writes()[0][1].body).oncallGroup.customFormMode).toBe('botmux');
+    expect(field().props.value).toBe('botmux');
+    act(() => renderer.root.findByProps({ dataInput: 'oncallFormDisplay' }).props.onChange('native'));
+    expect(renderer.root.findAllByProps({ dataInput: 'oncallCustomFormMode' })).toHaveLength(0);
+  });
+
   it('clears preset routing when the business line changes', async () => {
     await render({ ...initialPolicy, flowMode: 'direct' });
     const field = (name: string) => renderer.root.findAllByType(DropdownField).find(node => node.props.dataInput === name)!;
