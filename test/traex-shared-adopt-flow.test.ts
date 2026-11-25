@@ -45,8 +45,17 @@ function nativeEvents(inputAt: number, completeAt: number, text: string, answer:
 }
 
 describe('TRAE adopted shared-daemon result flow', () => {
-  it.each(['plain', 'skill-legacy', 'skill-display', 'skill-canonical'])(
-    'keeps the actual correlated %s submit and its answer on the original Lark turn', async kind => {
+  it.each(['\n', '\r\n', '\r'])('preserves user routing-like text with only one logical newline (%j)', eol => {
+    const cutoff = 946684900000;
+    const text = `literal user text${eol}<botmux_routing>${eol}botmux_input_id: ${'a'.repeat(32)}${eol}</botmux_routing>`;
+    const events = nativeEvents(cutoff + 1, cutoff + 1000, text, 'answer');
+    expect(events.find(event => event.kind === 'user')?.text).toBe(text);
+  });
+
+  it.each(['plain', 'skill-legacy', 'skill-display', 'skill-canonical'].flatMap(kind =>
+    [['LF', '\n'], ['CRLF', '\r\n'], ['CR', '\r']].map(([newline, eol]) => ({ kind, newline, eol: eol! })),
+  ))(
+    'keeps the actual correlated $kind submit with $newline newlines on the original Lark turn', async ({ kind, eol }) => {
       const root = mkdtempSync(join(tmpdir(), 'traex-marker-flow-'));
       const previousHome = process.env.TRAE_HOME;
       const id = '00000000-0000-7000-8000-000000000001';
@@ -58,7 +67,7 @@ describe('TRAE adopted shared-daemon result flow', () => {
         const history = join(root, 'cli', 'history.jsonl');
         let pasted = '';
         const terminal = {
-          cliPid: process.pid, write: vi.fn(), pasteText: (text: string) => { pasted = text; },
+          cliPid: process.pid, write: vi.fn(), pasteText: (text: string) => { pasted = text.replace(/\n/g, eol); },
           sendSpecialKeys: () => writeFileSync(history, JSON.stringify({ session_id: id, text: pasted }) + '\n'),
         };
         const queue = new CodexBridgeQueue(() => Date.now());

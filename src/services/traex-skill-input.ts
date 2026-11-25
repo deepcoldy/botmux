@@ -38,7 +38,7 @@ export function normaliseTraexInputNewlines(text: string): string {
  * Transcript attribution/display use the original user text; submit history
  * matching must retain the block so it still proves that particular write. */
 export function stripTraexInputCorrelation(text: string): string {
-  return text.replace(/\r?\n\r?\n<botmux_routing>\r?\nbotmux_input_id: [0-9a-f]{32}\r?\n<\/botmux_routing>$/, '');
+  return text.replace(/(?:\r\n|\r(?!\n)|\n){2}<botmux_routing>(?:\r\n|\r(?!\n)|\n)botmux_input_id: [0-9a-f]{32}(?:\r\n|\r(?!\n)|\n)<\/botmux_routing>$/, '');
 }
 
 export function traexHistoryInputMatches(recordedText: string, expectedText: string): boolean {
