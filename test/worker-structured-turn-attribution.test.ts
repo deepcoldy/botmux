@@ -222,7 +222,7 @@ describe('structured turn send attribution retirement', () => {
 });
 
 describe('structured bridge terminal: the provider error summary goes with a failed turn', () => {
-  function emitOne(turn: CodexPendingTurn) {
+  function emitOne(turn: CodexPendingTurn, overrides: Record<string, unknown> = {}) {
     const scope: Record<string, any> = {
       sessionId: 'sid', universalOutputHandoff: false,
       bridgeGateInputForTurn: (_sid: unknown, _turn: unknown, gate: unknown) => gate,
@@ -240,10 +240,22 @@ describe('structured bridge terminal: the provider error summary goes with a fai
       releaseInputDeliveryQuarantineForStructuredTerminal: vi.fn(),
       retireRpcLifecycleFromStructuredTerminal: vi.fn(), emitTurnTerminal: vi.fn(),
       retireStructuredTurnAttribution: vi.fn(), send: vi.fn(), log: vi.fn(),
+      ...overrides,
     };
     loadWorkerFunction('emitReadyCodexTurns', scope)();
     return scope.emitTurnTerminal.mock.calls as unknown[][];
   }
+
+  it('hands an admitted native answer to the durable path even when the legacy marker gate would suppress it', () => {
+    const send = vi.fn();
+    const body = '检查已完成。\n\n1. 仓库身份一致。\n2. 本地和云端均为 v3。';
+    emitOne({ turnId: 'om_final', started: true, finalText: body, markTimeMs: 200 }, {
+      send, frozenImReplyTurn: () => true, structuredFallbackKind: () => 'final',
+      shouldSuppressStructuredFallback: () => true, bridgePostText: (text: string) => text,
+      deliveredFinalFailureNoticeSuppressed: () => false,
+    });
+    expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ type: 'final_output', content: body, turnId: 'om_final' }));
+  });
 
   it('failed with a summary: the summary is the terminal\'s error text (its 8th argument)', () => {
     const calls = emitOne({ turnId: 'om_failed', started: true, finalText: '', markTimeMs: 200,

@@ -1259,6 +1259,15 @@ export interface Session {
    * to this external server.
    */
   existingAppServerEndpoint?: string;
+  /** Frozen at ordinary-topic creation; input stays in the activation journal. */
+  sharedThreadOpening?: {
+    endpoint: string;
+    cwd?: string;
+    title?: string;
+    projectRouteRevision?: number;
+    phase?: 'creating' | 'created';
+    threadId?: string;
+  };
   /** Provenance: the botmux sessionId this session was forked from (`/fork`).
    *  Purely informational — surfaced in UI/pickers so a fork is distinguishable
    *  from its parent. Does not affect routing or lifecycle. */
@@ -2482,7 +2491,7 @@ type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
         /** Explicit, off-by-default ordinary bridge handoff negotiation. */
         sessionContract?: import('./services/session-contract.js').SessionContractBootstrap;
         settledTurnTerminals?: Array<{ turnId: string; status: 'completed' }>;
-        finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean };
+        finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean; frozenImOnly?: true };
       }
     : Message
   : never;
@@ -2970,7 +2979,7 @@ export type WorkerToDaemonBase =
   /** Executor-observed Codex tier, bound to this worker + rollout generation.
    * `null` explicitly clears any previous generation's snapshot. */
   | { type: 'codex_service_tier'; snapshot: CodexServiceTierSnapshot | null }
-  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number; sandboxNamespace?: 'pid' | 'user' }
+  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number; sandboxNamespace?: 'pid' | 'user'; /** Workflow worker only: Claude cleared the node's `/goal` (claude-transcript ClaudeGoalAbortWatch). */ goalAborted?: true }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   /** Worker observed a successful explicit `botmux send` for this turn, so
    * the daemon should treat listener-preview runs as visibly replied even
@@ -3038,7 +3047,13 @@ export type WorkerToDaemonBase =
         /** A resumed CLI reported what the previous process left unfinished
          *  (restart-interruption.ts). During a backend outage the daemon folds
          *  it into the topic's single outage status card. */
-        | 'restart_interruption';
+        | 'restart_interruption'
+        /** A known startup dialog (folder trust, login, …) holds a CLI that was
+         *  never input-ready. Chat sessions deliver it as plain text like an
+         *  unkinded notice; the v3 workflow pool fails the node on it. */
+        | 'cli_startup_blocked';
+      /** `kind='cli_startup_blocked'`: which dialog matched (core/cli-startup-blocker). */
+      startupBlocker?: Pick<import('./core/cli-startup-blocker.js').CliStartupBlocker, 'kind' | 'rule' | 'folder'>;
       /** Permission prompt persisted across fresh worker captures; no daemon-side grace needed. */
       permissionPromptStable?: boolean;
       /** Bounded plain-text bottom of the screen for an input_not_submitted
@@ -3151,6 +3166,13 @@ export type WorkerToDaemonBase =
       /** Background tasks (agents, workflows, shells, monitors) still running
        *  when a `completed` turn ended. Absent means none. */
       backgroundTasks?: number;
+      /** Worker intentionally retains this turn's managed-origin authority past
+       *  foreground terminal while owned finite background task(s) or their wake-up
+       *  micro-turn remain active. Daemon skips its defense-in-depth wipe of
+       *  `ds.managedTurnOrigin` (and retains `ds.activeInteractiveTurn` under XPI=ON);
+       *  a later `managed_turn_origin_revoked` (or new origin / CLI exit / worker exit)
+       *  clears it. Older workers omit this field (fail closed). */
+      authorityHeldForBackground?: true;
       errorCode?: string;
       /** With `errorCode: 'safe_composer_required'` only: why the worker
        *  refused the unattended maintenance write. Absent from older workers;
@@ -3181,6 +3203,8 @@ export type WorkerToDaemonBase =
        *    must settle this fail-closed — no output was ever observed; the
        *    claude bridge guarantees `final_output` precedes this terminal, so
        *    no answer can still arrive.
+       *  - 'empty_answer': a structured, observed terminal had no answer on a
+       *    turn admitted with a required IM reply. It is neither delivery nor silence.
        *  - 'explicit_final_delivered': the claude transcript bridge popped a
        *    real (non-local) turn without transcript terminal evidence, but an
        *    explicit final `botmux send` marker proves the answer was delivered
@@ -3193,7 +3217,7 @@ export type WorkerToDaemonBase =
        *  RPC-hydration timeout path, which emits `completed` with no
        *  final_output after fs-lag and must NOT be read as silence or as a dead
        *  turn (that would mask a real, still-arriving answer). */
-      outputDisposition?: 'nothing_to_send' | 'boundary_unobserved' | 'explicit_final_delivered';
+      outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered';
       /** Wall-clock epoch ms at which the CLI turn actually reached its native
        *  terminal. Absent when the emitter cannot vouch for a real instant, in
        *  which case the recorder falls back to its own write time (which is NOT

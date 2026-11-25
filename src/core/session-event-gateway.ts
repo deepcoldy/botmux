@@ -86,7 +86,7 @@ export class SessionEventGateway {
         && (this.store.runtimeContinues(this.session, execution.runtime, runtime, channel)
           || this.store.runtimeContinues(this.session, runtime, execution.runtime, channel)
           || (sameRuntime(state.activeRuntime, runtime)
-            && !['succeeded', 'failed', 'cancelled'].includes(execution.phase)
+            && (type === 'managed_turn_origin_revoked' || !['succeeded', 'failed', 'cancelled'].includes(execution.phase))
             && !!sourceRuntime
             && this.store.runtimeContinues(this.session, sourceRuntime.ref, runtime, sourceRuntime.worker)));
       // A physical exit belongs to the proven runtime/producer, not to an

@@ -12,6 +12,24 @@ const key = {
 };
 
 describe('TurnSendLedger', () => {
+  it('preserves the opt-in of the original bot and turn once admitted', () => {
+    const root = mkdtempSync(join(tmpdir(), 'im-reply-admission-'));
+    try {
+      const ledger = new TurnSendLedger(root);
+      expect(ledger.requiresOriginalImReply(key)).toBe(false);
+      ledger.enableHandoffFence(key);
+      expect(ledger.requiresOriginalImReply(key)).toBe(false);
+      ledger.enableHandoffFence(key, true);
+      ledger.enableHandoffFence({ ...key, dispatchAttempt: 2 });
+      const reopened = new TurnSendLedger(root);
+      expect(reopened.requiresOriginalImReply({ ...key, dispatchAttempt: 2 })).toBe(true);
+      expect(reopened.requiresOriginalImReply({ ...key, larkAppId: 'cli_other' })).toBe(false);
+      expect(reopened.requiresOriginalImReply({ ...key, turnId: 'turn_other' })).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('keeps unmarked final publishers on their existing contract when the global rollout switch is on', async () => {
     const root = mkdtempSync(join(tmpdir(), 'handoff-unmarked-'));
     const previous = process.env.BOTMUX_FINAL_OUTPUT_HANDOFF;

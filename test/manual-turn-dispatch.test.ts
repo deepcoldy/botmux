@@ -1,5 +1,6 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from 'vitest';
 vi.mock('../src/bot-registry.js', () => ({
+  durableImRepliesEnabled: vi.fn(() => false),
   getBot: () => ({ config: { larkAppId: 'review_probe', cliId: 'codex' }, botName: 'probe', resolvedAllowedUsers: [] }),
   getAllBots: () => [], getOwnerOpenId: () => undefined, getLoadedConfigPath: () => undefined,
 }));

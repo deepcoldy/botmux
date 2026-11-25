@@ -57,6 +57,8 @@ export function workerSubmitHarness() {
     attachDeferredPluginSkillCatalog: vi.fn(), applyMojoLivePatch: vi.fn(),
     usageLimitTracker: { currentTurn: () => 1, beginTurn: () => 1, detectedThisTurn: () => false },
     syncQueuedTurnsFromMarkerDisk: vi.fn(), readSendMarkers: () => [], queuedTypeAheadTurns: [],
+    retiredTurnIds: new Set<string>(),
+    turnTerminalEmitted: () => false,
     setCaptureIdentity: vi.fn(), markActiveTurnStarted: vi.fn(),
     inflightInputs: { onWrite: vi.fn(), forget: vi.fn(), retire: vi.fn() },
     noteCliInputWritten: vi.fn(), writeCliPidMarker: vi.fn(), publishSandboxRelayCapability: vi.fn(),

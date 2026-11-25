@@ -3,6 +3,7 @@ import { createSessionContentSearch } from './dashboard/session-content-search.j
 import { TopicIndexError } from './services/topic-search/query.js';
 import { queryTopicSearchOffMainThread } from './dashboard/topic-search-client.js';
 import { proxySessionStopControl } from './dashboard/session-stop-control.js';
+import { prepareDashboardGroupCreate } from './core/group-ipc-options.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
@@ -7603,8 +7604,15 @@ const server = createServer(async (req, res) => {
 
     let mGroupMembersDisplay: RegExpMatchArray | null;
     if (req.method === 'GET' && (mGroupMembersDisplay = url.pathname.match(/^\/api\/groups\/([^/]+)\/([^/]+)\/members-display$/))) {
-      const larkAppId = decodeURIComponent(mGroupMembersDisplay[1]);
-      const chatId = decodeURIComponent(mGroupMembersDisplay[2]);
+      let larkAppId: string;
+      let chatId: string;
+      try {
+        larkAppId = decodeURIComponent(mGroupMembersDisplay[1]);
+        chatId = decodeURIComponent(mGroupMembersDisplay[2]);
+      } catch (err) {
+        if (err instanceof URIError) return jsonRes(res, 400, { ok: false, error: 'invalid_url_encoding' });
+        throw err;
+      }
       const upstream = await proxyToDaemon(larkAppId, `/api/groups/${encodeURIComponent(chatId)}/members-display`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
@@ -8275,7 +8283,7 @@ const server = createServer(async (req, res) => {
     // are app-scoped, so creator daemon and operator open_id come from the
     // SAME bot by construction. See dashboard/operator-selector.ts.
     if (req.method === 'POST' && url.pathname === '/api/groups/create') {
-      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; ownerUnionIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown; feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown; chatMode?: unknown; botCollaboration?: unknown };
+      let parsed: unknown;
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -8284,75 +8292,38 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      const selectedIds = Array.isArray(parsed.larkAppIds)
-        ? (parsed.larkAppIds as unknown[]).filter((x): x is string => typeof x === 'string')
-        : [];
-      if (selectedIds.length === 0) {
-        return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required' });
-      }
-      const roleProfileId = typeof parsed.roleProfileId === 'string' && parsed.roleProfileId.trim()
-        ? parsed.roleProfileId.trim()
-        : null;
-      if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
-      }
-      // Optional (workflow-dashboard-orchestration §8): topic group mode and
-      // the bots' collaboration grants. Not sent → forwarded body unchanged.
-      if (parsed.chatMode !== undefined && parsed.chatMode !== 'topic' && parsed.chatMode !== 'group') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_chat_mode' });
-      }
-      if (parsed.botCollaboration !== undefined && typeof parsed.botCollaboration !== 'boolean') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_bot_collaboration' });
-      }
-
-      const explicit = Array.isArray(parsed.userOpenIds)
-        ? (parsed.userOpenIds as unknown[]).filter((x): x is string => typeof x === 'string')
-        : [];
-
-      const pick = pickCreatorForGroup(selectedIds, (id) => {
+      const apiOnlyIds = new Set<string>();
+      try {
+        for (const bot of loadBotConfigs()) {
+          if (bot.apiOnly === true) apiOnlyIds.add(bot.larkAppId);
+        }
+      } catch { /* bots.json unavailable → rely on daemon descriptors */ }
+      const plan = prepareDashboardGroupCreate(parsed, (id) => {
         const d = registry.getByAppId(id);
         return d ? { larkAppId: d.larkAppId, resolvedAllowedUsers: d.resolvedAllowedUsers ?? [] } : undefined;
-      });
-      if (!pick) {
+      }, { isApiOnly: id => apiOnlyIds.has(id) });
+      if (!plan.ok) {
+        return jsonRes(res, plan.status, { ok: false, error: plan.error });
+      }
+      const creator = registry.getByAppId(plan.creatorLarkAppId);
+      if (!creator) {
         return jsonRes(res, 503, { ok: false, error: 'no_online_daemon' });
       }
-      const creator = registry.getByAppId(pick.creatorLarkAppId)!;
-      const merged = new Set<string>([...explicit, ...pick.userOpenIds]);
-      // 跨 app 邀请通道：按 union_id 加人（open_id 是 app 作用域的，union_id 稳定，
-      // 由 creator daemon 解析成本 app 的 open_id 再加）。平台「拉群」即走这条。
-      const ownerUnionIds = Array.isArray(parsed.ownerUnionIds)
-        ? (parsed.ownerUnionIds as unknown[]).filter((x): x is string => typeof x === 'string')
-        : [];
-      // Auto-invite/transfer/notify target: prefer the explicit open_id passed
-      // by the caller (rare API consumer use), else the creator bot's first
-      // resolved allowlist entry.
-      const autoInvited: string | null = explicit[0] ?? pick.userOpenIds[0] ?? null;
-
-      const forwardBody = {
-        name: typeof parsed.name === 'string' ? parsed.name : undefined,
-        larkAppIds: selectedIds,
-        userOpenIds: [...merged],
-        ownerUnionIds,
-        // Auto-transfer ownership to the auto-invited operator. Scope-safe
-        // because the open_id was sourced from the creator bot's own allowlist.
-        transferOwnerTo: autoInvited ?? undefined,
-        // Send an @-mention message into the new chat so the operator gets a
-        // Feishu push notification — being a chat member alone doesn't always
-        // surface the chat in their sidebar (esp. mobile).
-        notifyOwnerOpenId: autoInvited ?? undefined,
-        bindWorkingDir: typeof parsed.bindWorkingDir === 'string' && parsed.bindWorkingDir.trim()
-          ? parsed.bindWorkingDir.trim()
-          : undefined,
-        roleProfileId: roleProfileId ?? undefined,
-        ...(parsed.chatMode !== undefined ? { chatMode: parsed.chatMode } : {}),
-        ...(parsed.botCollaboration !== undefined ? { botCollaboration: parsed.botCollaboration } : {}),
-      };
-      const upstream = await fetchDaemonIpc(
-        creator.ipcPort,
-        '/api/groups/create',
-        { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(forwardBody) },
-      );
-      const upstreamText = await upstream.text();
+      const { autoInvited, roleProfileId, forwardBody } = plan;
+      const parsedRecord = parsed as Record<string, unknown>;
+      let upstream: Response;
+      let upstreamText: string;
+      try {
+        upstream = await fetchDaemonIpc(
+          creator.ipcPort,
+          '/api/groups/create',
+          { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(forwardBody) },
+        );
+        upstreamText = await upstream.text();
+      } catch (err) {
+        logger.warn(`[dashboard] POST /api/groups/create proxy failed for ${creator.larkAppId}: ${err instanceof Error ? err.message : String(err)}`);
+        return jsonRes(res, 502, { ok: false, error: 'group_create_proxy_failed' });
+      }
       let upstreamJson: any = null;
       try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
       if (upstreamJson && typeof upstreamJson === 'object') {
@@ -8371,9 +8342,9 @@ const server = createServer(async (req, res) => {
         } else {
           upstreamJson.autoInvitedOpenId = autoInvited;
         }
-        const existingFeedGroupId = typeof parsed.feedGroupId === 'string' ? parsed.feedGroupId.trim() : '';
-        const newFeedGroupName = typeof parsed.newFeedGroupName === 'string' ? parsed.newFeedGroupName.trim() : '';
-        const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
+        const existingFeedGroupId = typeof parsedRecord.feedGroupId === 'string' ? parsedRecord.feedGroupId.trim() : '';
+        const newFeedGroupName = typeof parsedRecord.newFeedGroupName === 'string' ? parsedRecord.newFeedGroupName.trim() : '';
+        const feedGroupAppId = typeof parsedRecord.feedGroupAppId === 'string' ? parsedRecord.feedGroupAppId.trim() : '';
         if (upstream.ok && upstreamJson.ok && typeof upstreamJson.chatId === 'string' && (existingFeedGroupId || newFeedGroupName)) {
           try {
             const configuredFeedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
