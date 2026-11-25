@@ -51,6 +51,9 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     RECOVERY_NOTICE_MAX_AGE_MS,
     createHash,
     codexBridgeQueue: queue,
+    codexBridgeRolloutPath: 'live-transcript',
+    codexBridgeBaselineDone: true,
+    rpcTranscriptIngestBlockedByAwaitingActivation: () => false,
     backgroundTaskTracker: { pendingTurnAgents: () => 0 },
     structuredBridgeIs: (id: string) => id === cliId,
     antigravityPendingRebind: false,
@@ -82,7 +85,7 @@ function workerRig(cliId = 'codex', opts: { attempt?: number; delivery?: 'send' 
     settlingRpcTerminalOwners: new Map(),
     structuredTurnsWithSubmitNotice: new Set<string>(),
     structuredMissingFinalWatchdog: new StructuredMissingFinalWatchdog(),
-    codexBridgeIngest: vi.fn(),
+    codexBridgeIngest: vi.fn(() => true),
     checkpointCodexAdoptRecovery: vi.fn(),
     checkpointStructuredBridgeRecovery: vi.fn(),
     dropPendingTurn: undefined,
@@ -449,6 +452,42 @@ describe('worker: missing structured final timeout', () => {
     expect(readBridgeTurnJournal(journalPath)).toEqual([]);
   });
 
+  it('does not retire when the deadline has no attached transcript to drain', () => {
+    const r = workerRig('codex');
+    Object.assign(r.scope, {
+      codexBridgeWatcher: null, codexBridgeOffset: 0,
+      codexSubagentLimitTracker: { clear: vi.fn() }, structuredBridgeDriverState: undefined,
+      ompQuietCandidateKey: undefined, ompQuietCandidateCompleteOffset: undefined,
+      antigravityQuietCandidateKey: undefined, antigravityQuietCandidateCompleteOffset: undefined,
+      antigravityFullUpgradeAttemptKey: undefined,
+    });
+    r.scope.codexBridgeDetachFile = loadWorkerFunction('codexBridgeDetachFile', r.scope);
+    r.scope.codexBridgeIngest = loadWorkerFunction('codexBridgeIngest', r.scope);
+    const clock = vi.spyOn(Date, 'now');
+    clock.mockReturnValue(0);
+    r.settle();
+    clock.mockReturnValue(10_000);
+    r.scope.codexBridgeDetachFile();
+    expect(r.scope.codexBridgeRolloutPath).toBeUndefined();
+    expect(r.scope.structuredMissingFinalTarget()).toBeUndefined();
+    clock.mockReturnValue(20_000);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    expect(r.scope.send).not.toHaveBeenCalled();
+
+    // A same-path reattach still gets a fresh full wait because detach reset it.
+    r.scope.codexBridgeRolloutPath = 'live-transcript';
+    r.scope.codexBridgeBaselineDone = true;
+    r.scope.codexBridgeIngest = vi.fn(() => true);
+    r.settle();
+    clock.mockReturnValue(39_999);
+    r.settle();
+    expect(r.queue.peek()).toHaveLength(1);
+    clock.mockReturnValue(40_000);
+    r.settle();
+    expect(r.queue.peek()).toEqual([]);
+  });
+
   it('does not time out while an authoritative Antigravity rebind is pending', () => {
     const r = workerRig('antigravity');
     const clock = vi.spyOn(Date, 'now');
@@ -641,6 +680,7 @@ describe('worker: missing structured final timeout', () => {
     const clock = vi.spyOn(Date, 'now');
     r.scope.codexBridgeIngest.mockImplementation(() => {
       r.queue.ingest([{ uuid: 'late-final', timestampMs: 20_000, kind: 'assistant_final', text: 'arrived during drain' }]);
+      return true;
     });
     clock.mockReturnValue(0);
     r.settle();

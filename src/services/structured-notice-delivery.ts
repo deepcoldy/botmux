@@ -66,7 +66,7 @@ async function runStructuredNoticeDelivery(input: StructuredNoticeDeliveryInput)
     const now = input.now?.() ?? Date.now();
     const created: TurnNoticeRecord = {
       kind: 'user_notify', turnId: input.turnId, msgType: 'text', content: input.content,
-      retention: 'structured', createdAt: now,
+      retention: 'structured', carrier: input.allowTextFallback === false ? 'silent' : 'card', createdAt: now,
       delivery: { state: 'pending', attempts: 0, uuid: noticeId, nextAttemptAt: now },
     };
     session.turnNotices = addTurnNotice(previous, created);
@@ -77,28 +77,41 @@ async function runStructuredNoticeDelivery(input: StructuredNoticeDeliveryInput)
     input.onEnqueued?.();
   }
 
-  let cardRetired = false;
-  try { cardRetired = await input.retireCard(); }
-  catch (error) {
-    input.onCardError?.(error);
-    if (input.allowTextFallback === false || error instanceof StructuredNoticeCardPendingError) throw error;
-  }
-  if (cardRetired || input.allowTextFallback === false) {
-    // This is a separate durable edge, NOT a text-outbox fallback: if this write
-    // fails, a retry may idempotently PATCH the card, but must not also post text.
-    const current = find();
-    if (!current || current.delivery.state !== 'pending') throw new Error('structured_notice_pending_record_lost');
-    current.delivery.state = 'delivered';
-    current.delivery.attempts += 1;
-    current.delivery.deliveredAt = input.now?.() ?? Date.now();
-    current.delivery.nextAttemptAt = undefined;
-    current.delivery.lastError = undefined;
-    input.persist();
-  } else {
+  if (record.carrier === 'text') {
+    // Text owns the effect from this point onward, including an unknown text
+    // result followed by a lost ACK. Never rerun the card on such a replay.
     await input.deliverPending(noticeId);
+  } else {
+    let cardRetired = false;
+    try { cardRetired = await input.retireCard(); }
+    catch (error) {
+      input.onCardError?.(error);
+      if (record.carrier === 'silent' || error instanceof StructuredNoticeCardPendingError) throw error;
+    }
+    if (cardRetired || record.carrier === 'silent') {
+      // This is a separate durable edge, NOT a text-outbox fallback: if this write
+      // fails, a retry may idempotently PATCH the card, but must not also post text.
+      const current = find();
+      if (!current || current.delivery.state !== 'pending') throw new Error('structured_notice_pending_record_lost');
+      current.delivery.state = 'delivered';
+      current.delivery.attempts += 1;
+      current.delivery.deliveredAt = input.now?.() ?? Date.now();
+      current.delivery.nextAttemptAt = undefined;
+      current.delivery.lastError = undefined;
+      input.persist();
+    } else {
+      // A definite no-card outcome may change carrier, but the transition itself
+      // must be durable BEFORE the first text attempt.
+      const current = find();
+      if (!current || current.delivery.state !== 'pending') throw new Error('structured_notice_pending_record_lost');
+      current.carrier = 'text';
+      current.delivery.nextAttemptAt = input.now?.() ?? Date.now();
+      input.persist();
+      await input.deliverPending(noticeId);
+    }
   }
   if (!find()) throw new Error('structured_notice_durable_record_lost');
-  // Pending is safe to ACK: the daemon's session record is now the recovery
-  // owner and resumeTurnNotices() will resume it after a daemon restart.
+  // Pending is safe to ACK: the daemon owns the durable row. Text resumes via
+  // resumeTurnNotices(); card/silent rows wait for the worker's same-ID replay.
   if (input.owns()) input.acknowledge();
 }

@@ -24438,7 +24438,13 @@ function setupWorkerHandlers(
         if (msg.noticeId) {
           const turnId = msg.turnId;
           const noticeId = msg.noticeId;
-          if (!ownsLifecycleMutation() || managedAuxUiSuppressed(turnId, msg.dispatchAttempt)) break;
+          if (!ownsLifecycleMutation()) break;
+          if (managedAuxUiSuppressed(turnId, msg.dispatchAttempt)) {
+            // Intentional suppression is terminal; unlike ownership loss it must
+            // ACK without UI so the worker can clear its pendingNotice.
+            worker.send({ type: 'structured_turn_not_collected_ack', turnId, noticeId });
+            break;
+          }
           try {
             await deliverStructuredNotice({
               session: ds.session, noticeId, turnId, content: '', allowTextFallback: false,
@@ -26526,7 +26532,13 @@ function setupWorkerHandlers(
         if (msg.kind === 'structured_turn_not_collected' && msg.noticeId && msg.turnId) {
           const turnId = msg.turnId;
           const noticeId = msg.noticeId;
-          if (!ownsLifecycleMutation() || managedAuxUiSuppressed(turnId, msg.dispatchAttempt)) break;
+          if (!ownsLifecycleMutation()) break;
+          if (managedAuxUiSuppressed(turnId, msg.dispatchAttempt)) {
+            // Intentional suppression is terminal; unlike ownership loss it must
+            // ACK without UI so the worker can clear its pendingNotice.
+            worker.send({ type: 'structured_turn_not_collected_ack', turnId, noticeId });
+            break;
+          }
           try {
             await deliverStructuredNotice({
               session: ds.session, noticeId, turnId, content: msg.message,

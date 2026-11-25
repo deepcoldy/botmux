@@ -10,6 +10,7 @@ import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnR
 import { abortCotMessage, handleCotThinkingSuperseded, handleCotThinkingUpdate, finalizeCotMessage } from '../src/im/lark/cot-message.js';
 import { TurnReplyCardStore, ReplyCardWithdrawnError } from '../src/services/turn-reply-card.js';
 import { deliverStructuredNotice, StructuredNoticeCardPendingError } from '../src/services/structured-notice-delivery.js';
+import { stageBridgeTurnNotice, readBridgeTurnJournal, acknowledgeBridgeTurnNotice } from '../src/services/bridge-turn-journal.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
 import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
@@ -763,6 +764,34 @@ describe('unified replies with an independent native CoT channel', () => {
     handle(update('legacy enabled')); await settle();
     expect(request.mock.calls.some(([req]) => req.method === 'POST')).toBe(true);
     finalizeCotMessage(ds, 'om_turn', 'completed'); await settle();
+  });
+
+  it('ACKs intentional suppression without consuming durable notice capacity', async () => {
+    const worker = { send: vi.fn() };
+    const handle = loadWorkerPoolMessageHandlers(['user_notify', 'turn_display_retired'], {
+      ds, worker, ownsLifecycleMutation: () => true, managedAuxUiSuppressed: () => true,
+    }, true);
+    const journalPath = join(dir, 'suppressed.structured');
+    for (let i = 0; i < 33; i++) {
+      const warningId = i.toString(16).padStart(32, '0');
+      const silentId = i.toString(16).padStart(32, 'f');
+      stageBridgeTurnNotice(journalPath, {
+        turnId: `om_warning_${i}`, noticeId: warningId, message: 'warning', createdAtMs: i,
+      });
+      await handle({ type: 'user_notify', kind: 'structured_turn_not_collected',
+        turnId: `om_warning_${i}`, noticeId: warningId, message: 'warning' });
+      acknowledgeBridgeTurnNotice(journalPath, `om_warning_${i}`, warningId);
+      stageBridgeTurnNotice(journalPath, {
+        turnId: `om_silent_${i}`, noticeId: silentId, message: '', createdAtMs: i, silent: true,
+      });
+      await handle({ type: 'turn_display_retired', turnId: `om_silent_${i}`, noticeId: silentId,
+        message: '', silent: true });
+      acknowledgeBridgeTurnNotice(journalPath, `om_silent_${i}`, silentId);
+      expect(readBridgeTurnJournal(journalPath)).toEqual([]);
+    }
+    expect(worker.send).toHaveBeenCalledTimes(66);
+    expect(ds.session.turnNotices).toBeUndefined();
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('drain cancels a queued tools timer so it cannot write into a later test data dir', async () => {

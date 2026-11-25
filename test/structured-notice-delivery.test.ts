@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Session } from '../src/types.js';
 import { deliverStructuredNotice, StructuredNoticeCardPendingError, type StructuredNoticeDeliveryInput } from '../src/services/structured-notice-delivery.js';
+import { RecoveryNoticeOutbox, type TurnNoticeRecord } from '../src/services/ordinary-recovery-notice.js';
 
 const noticeId = 'a'.repeat(32);
 function fixture(overrides: Partial<StructuredNoticeDeliveryInput> = {}) {
@@ -47,7 +48,7 @@ describe('durable structured notice delivery', () => {
     expect(input.acknowledge).toHaveBeenCalledOnce();
     expect(session.turnNotices?.[0]?.delivery.state).toBe('pending');
 
-    const restarted = structuredClone(snapshots[0]!);
+    const restarted = structuredClone(snapshots.at(-1)!);
     const delivered = fixture({
       session: restarted,
       retireCard: vi.fn(async () => false),
@@ -175,6 +176,84 @@ describe('durable structured notice delivery', () => {
     expect(fresh.input.acknowledge).toHaveBeenCalledOnce();
     expect(fresh.session.turnNotices).toHaveLength(1);
     expect(fresh.session.turnNotices?.[0]?.delivery.uuid).toBe('f'.repeat(32));
+  });
+
+  it.each([false, true])('never resumes a pending %s card as text after restart', async silent => {
+    const first = fixture({
+      allowTextFallback: silent ? false : undefined,
+      retireCard: vi.fn(async () => { throw new StructuredNoticeCardPendingError(); }),
+    });
+    await expect(deliverStructuredNotice(first.input)).rejects.toThrow('structured_notice_card_effect_pending');
+    const restarted = structuredClone(first.snapshots[0]!);
+    expect(restarted.turnNotices?.[0]?.carrier).toBe(silent ? 'silent' : 'card');
+    const posted = vi.fn();
+    const scheduled: Array<() => void> = [];
+    const outbox = new RecoveryNoticeOutbox<() => void, TurnNoticeRecord>({
+      schedule: (_delay, run) => { scheduled.push(run); return run; }, cancel: () => {}, now: () => 1_000,
+    });
+    const host = {
+      key: restarted.sessionId,
+      list: () => restarted.turnNotices ?? [],
+      update: (_id: string, mutate: (row: TurnNoticeRecord) => void) => {
+        const row = restarted.turnNotices?.[0]; if (row) mutate(row); return row;
+      },
+      send: posted, canDeliver: () => true,
+    };
+    outbox.resume(host);
+    expect(scheduled).toEqual([]);
+    expect(posted).not.toHaveBeenCalled();
+
+    const replay = fixture({ session: restarted });
+    await deliverStructuredNotice(replay.input);
+    expect(replay.input.retireCard).toHaveBeenCalledOnce();
+    expect(replay.input.acknowledge).toHaveBeenCalledOnce();
+    expect(posted).not.toHaveBeenCalled();
+  });
+
+  it('persists the card-to-text transition before text and never reruns a card on text replay', async () => {
+    const session = { sessionId: 'text-replay', turnNotices: undefined } as unknown as Session;
+    const scheduled: Array<() => void> = [];
+    const outbox = new RecoveryNoticeOutbox<() => void, TurnNoticeRecord>({
+      schedule: (_delay, run) => { scheduled.push(run); return run; }, cancel: () => {}, now: () => 5_000,
+    });
+    let textAttempts = 0;
+    const persistedCarrierAtText: Array<string | undefined> = [];
+    const host = {
+      key: session.sessionId,
+      list: () => session.turnNotices ?? [],
+      update: (_id: string, mutate: (row: TurnNoticeRecord) => void) => {
+        const row = session.turnNotices?.[0]; if (row) mutate(row); return row;
+      },
+      send: vi.fn(async () => {
+        persistedCarrierAtText.push(first.snapshots.at(-1)?.turnNotices?.[0]?.carrier);
+        textAttempts++;
+        if (textAttempts === 1) throw new Error('timeout after provider acceptance');
+        return 'om_text';
+      }),
+      canDeliver: () => true,
+    };
+    const firstCard = vi.fn(async () => { throw new Error('definite pre-publication failure'); });
+    const first = fixture({
+      session, retireCard: firstCard,
+      deliverPending: id => outbox.deliver(host, id),
+      acknowledge: vi.fn(() => { throw new Error('ACK result unknown'); }),
+    });
+    await expect(deliverStructuredNotice(first.input)).rejects.toThrow('ACK result unknown');
+    expect(session.turnNotices?.[0]).toMatchObject({ carrier: 'text' });
+    expect(persistedCarrierAtText).toEqual(['text']);
+    expect(textAttempts).toBe(1);
+
+    const replayCard = vi.fn(async () => true);
+    const replay = fixture({
+      session, retireCard: replayCard, deliverPending: id => outbox.deliver(host, id),
+      acknowledge: vi.fn(),
+    });
+    await deliverStructuredNotice(replay.input);
+    expect(firstCard).toHaveBeenCalledOnce();
+    expect(replayCard).not.toHaveBeenCalled();
+    expect(textAttempts).toBe(2);
+    expect(replay.input.acknowledge).toHaveBeenCalledOnce();
+    expect(session.turnNotices?.[0]?.delivery.state).toBe('delivered');
   });
 
   it('coalesces concurrent duplicate IPC deliveries into one card effect and one ACK', async () => {

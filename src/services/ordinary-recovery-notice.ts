@@ -419,6 +419,7 @@ export interface TurnNoticeRecord {
    * dedupe tombstones for the recovery lifetime; ordinary notices keep the old
    * pending-only compaction behavior. */
   retention?: 'structured';
+  carrier?: 'card' | 'text' | 'silent';
   delivery: OrdinaryRecoveryNoticeRecord['delivery'];
 }
 
@@ -453,6 +454,9 @@ export function addTurnNotice(
 export interface OutboxNoticeRecord {
   logicalTurnId?: string;
   createdAt: number;
+  /** Structured records keep their exact carrier across restart/replay. Only
+   * text-owned or legacy undefined records may enter the generic text outbox. */
+  carrier?: 'card' | 'text' | 'silent';
   delivery: OrdinaryRecoveryNoticeRecord['delivery'];
 }
 
@@ -515,7 +519,7 @@ export class RecoveryNoticeOutbox<TTimer = unknown, TRecord extends OutboxNotice
    *  to deliver and stop). */
   resume(host: RecoveryNoticeHost<TRecord>): void {
     for (const record of host.list()) {
-      if (record.delivery.state !== 'pending') continue;
+      if (record.delivery.state !== 'pending' || record.carrier === 'card' || record.carrier === 'silent') continue;
       const recordKey = outboxNoticeKey(record);
       const key = this.keyOf(host.key, recordKey);
       if (this.inFlight.has(key)) continue;
@@ -570,7 +574,7 @@ export class RecoveryNoticeOutbox<TTimer = unknown, TRecord extends OutboxNotice
     const key = this.keyOf(host.key, logicalTurnId);
     if (this.inFlight.has(key)) return;
     const record = host.list().find(entry => outboxNoticeKey(entry) === logicalTurnId);
-    if (!record || record.delivery.state !== 'pending') return;
+    if (!record || record.delivery.state !== 'pending' || record.carrier === 'card' || record.carrier === 'silent') return;
     const now = this.now();
     if (recoveryNoticeExpired(record, now)) {
       this.safeUpdate(host, logicalTurnId, entry => {

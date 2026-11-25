@@ -15757,6 +15757,7 @@ function codexBridgeDetachFile(): void {
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
   antigravityFullUpgradeAttemptKey = undefined;
+  structuredMissingFinalWatchdog.observe(undefined);
 }
 
 /** Resolve the pid of the Codex process this worker observes (spawned child or
@@ -16509,11 +16510,11 @@ function codexBridgeIngest(opts: {
   flushOmpTrailingFinal?: boolean;
   flushAntigravityTrailingFinal?: boolean;
   retireAntigravityPendingTurns?: boolean;
-} = {}): void {
+} = {}): boolean {
   // An authoritative rebind is pending: freeze the possibly-misbound file.
   // This includes quiet flushes, whose waiting narration or sibling answer
   // could otherwise settle the live owner before REAL becomes readable.
-  if (structuredBridgeIs('antigravity') && antigravityPendingRebind) return;
+  if (structuredBridgeIs('antigravity') && antigravityPendingRebind) return false;
   // Follow-up RPC turns install their exact bridge mark only after the
   // turn/start ACK passes the generation fence. Ordinary ingest must not
   // advance the rollout cursor in that window. Terminal hydration for an
@@ -16522,16 +16523,16 @@ function codexBridgeIngest(opts: {
   if (rpcTranscriptIngestBlockedByAwaitingActivation(
     rpcTurnsAwaitingActivation.keys(),
     opts.hydrationOwnerKey,
-  )) return;
+  )) return false;
   if (structuredBridgeIs('hermes')) {
     hermesBridgeIngest();
-    return;
+    return true;
   }
   if (structuredBridgeIs('mtr')) {
     mtrBridgeIngest();
-    return;
+    return true;
   }
-  if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
+  if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return false;
   // While a newly reported Antigravity conversation is still waiting for its
   // lazily-created brain file (`codexBridgePendingSessionId`), do not let
   // fs.watch or steady-state ticks ingest new unstarted turns from the
@@ -16543,7 +16544,7 @@ function codexBridgeIngest(opts: {
     && codexBridgePendingSessionId
     && !(codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1)
   ) {
-    return;
+    return false;
   }
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset, {
     flushOmpTrailingFinal: opts.flushOmpTrailingFinal,
@@ -16637,6 +16638,7 @@ function codexBridgeIngest(opts: {
     // stays stranded). Deliver it after the caller unwinds, to the same CLI.
     deferFinalIdleSignal();
   }
+  return true;
 }
 
 /** The idle signal of a final consumed by a non-signalling drain, raised on
@@ -17298,6 +17300,7 @@ const structuredMissingFinalWatchdog = new StructuredMissingFinalWatchdog();
  *  idle edge they rejected while the structured owner stayed open. */
 function structuredMissingFinalTarget(): StructuredMissingFinalTarget | undefined {
   if (replyDeliveryMode() !== 'transcript' && !zeroPromptTerminalSync()) return undefined;
+  if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return undefined;
   const turn = codexBridgeQueue.peek()[0];
   if (!turn?.started || turn.finalText !== undefined || turn.isLocal) return undefined;
   if (!structuredMissingFinalHasLifecycleSignals() || structuredMissingFinalBlockedByPage()) return undefined;
@@ -17331,6 +17334,7 @@ function structuredMissingFinalTarget(): StructuredMissingFinalTarget | undefine
     turn,
     key: JSON.stringify([
       turn.turnId, turn.dispatchAttempt, cliSpawnGeneration,
+      codexBridgeRolloutPath,
       turn.sourceTurnId, turn.nativeUserProof?.uuid, turn.transcriptStartTimeMs,
       lastStructuredBridgeActivityAtMs, outputGeneration,
     ]),
@@ -17343,11 +17347,18 @@ function structuredMissingFinalTarget(): StructuredMissingFinalTarget | undefine
 function maybeSettleMissingStructuredFinal(): void {
   const target = structuredMissingFinalTarget();
   if (!structuredMissingFinalWatchdog.observe(target?.key)) return;
-  try { codexBridgeIngest(); } catch (err: any) {
+  let drainCompleted = false;
+  try { drainCompleted = codexBridgeIngest(); } catch (err: any) {
     // A read error is not evidence that the final is absent. Keep the owner and
     // start a fresh bounded wait; a later tick may successfully read a final
     // that was already on disk at this deadline.
     log(`Missing-final drain before turn retirement failed: ${err.message}`);
+    structuredMissingFinalWatchdog.observe(undefined);
+    return;
+  }
+  if (!drainCompleted) {
+    // No transcript was actually read (detached, rebind, RPC activation, ...).
+    // Keep the owner and start a fresh wait only after a real read can run.
     structuredMissingFinalWatchdog.observe(undefined);
     return;
   }
@@ -17897,6 +17908,7 @@ function stopCodexBridge(): void {
   mtrBridgeSource = undefined;
   mtrBridgeOffset = 0;
   mtrBridgeBaselineDone = false;
+  structuredMissingFinalWatchdog.observe(undefined);
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
   resetThinkingChannel();
