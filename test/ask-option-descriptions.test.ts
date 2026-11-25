@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AskQuestion } from '../src/core/ask-types.js';
-import { capChars, optionDescriptions } from '../src/im/lark/ask-option-descriptions.js';
+import { capChars } from '../src/im/lark/ask-option-descriptions.js';
+import { optionContent } from '../src/im/lark/ask-card-look.js';
 
 describe('capChars', () => {
   it.each([
@@ -20,7 +21,7 @@ describe('capChars', () => {
   });
 });
 
-describe('optionDescriptions', () => {
+describe('optionContent', () => {
   const q: AskQuestion = { prompt: '选哪个？', multiSelect: false, options: [
     { key: 'a', label: '甲', description: '😀😀😀' },
     { key: 'b', label: '乙', description: 'x😀😀😀' },
@@ -33,8 +34,9 @@ describe('optionDescriptions', () => {
     [4, '😀😀…', 'x😀…'],
     [5, '😀😀…', 'x😀😀…'],
   ] as Array<[number, string, string]>)('共享 cap=%i：两条说明 emoji 奇偶相反，被切开代理对的那条退一位', (cap, first, second) => {
-    const out = optionDescriptions(q, 'zh', cap)!;
-    expect(out.truncated).toBe(true);
-    expect(out.content.split('\n\n').slice(0, 2)).toEqual([`**甲**：${first}`, `**乙**：${second}`]);
+    const rows = q.options.map(option => optionContent(q, option, 'zh', cap));
+    expect(rows.every(row => row.truncated)).toBe(true);
+    // The description is the row's second line; what it shows, without its colour markup.
+    expect(rows.map(row => row.content.split('\n')[1]!.replace(/<[^>]+>/g, ''))).toEqual([first, second]);
   });
 });
