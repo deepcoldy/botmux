@@ -28,6 +28,7 @@ import { larkToolPrompt } from '../src/core/lark-tool-binding.js';
 import { t } from '../src/i18n/index.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import { escapeXmlTagLikeTokens } from '../src/utils/xml.js';
+import { writeRoleFile, deleteRoleFile } from '../src/core/role-resolver.js';
 
 const policy = parseTriggerUserAuthConfig({ enabled: true })!;
 
@@ -352,6 +353,22 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
       expect(text).toContain('<botmux_credentials>');
       expect(text).not.toContain('/login bytedcli');
     });
+  });
+
+  it.each(['codex', 'opencode'] as const)('keeps the %s credential boundary after the stable role and before user content', (cliId) => {
+    writeRoleFile(APP, 'oc_auth_prefix', 'CUSTOM_ROLE_WITH_AUTH');
+    try {
+      withTriggerUserAuth(true, () => {
+        const text = buildNewTopicPrompt('do the task', 'auth-prefix-session', cliId,
+          undefined, undefined, undefined, undefined, undefined, undefined, 'en', undefined,
+          { larkAppId: APP, chatId: 'oc_auth_prefix' });
+        expect(text).toContain('CUSTOM_ROLE_WITH_AUTH');
+        expect(text).toContain(buildCredentialBoundaryBlock({ ...policy, tools: ['bytedcli'] }, 'en'));
+        expect(text.indexOf('<role ')).toBeLessThan(text.indexOf('<botmux_credentials>'));
+        expect(text.indexOf('</botmux_credentials>')).toBeLessThan(text.indexOf('<session_id>'));
+        expect(text.indexOf('<session_id>')).toBeLessThan(text.indexOf('<user_message>'));
+      }, ['bytedcli']);
+    } finally { deleteRoleFile(APP, 'oc_auth_prefix'); }
   });
 
   it('omits it when the policy is off', () => {
