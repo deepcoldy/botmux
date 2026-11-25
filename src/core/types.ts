@@ -1134,6 +1134,14 @@ export interface DaemonSession {
      * these old descendants; the long-lived CLI root itself is the exception. */
     preexistingProcessIdentities?: string[];
   };
+  /** Bounded per-worker-generation tombstone set of revoked managed-origin
+   *  capabilities. Prevents an async-delayed `managed_turn_origin` from
+   *  reinstalling a capability whose `managed_turn_origin_revoked` already
+   *  processed (for example via fail-closed backstop). */
+  revokedManagedOriginCapabilities?: {
+    workerGeneration: number;
+    tokens: Set<string>;
+  };
   /** Turns the worker typed behind the running turn (type-ahead), oldest
    *  first. Prompt-context claims evaluate them together with the managed
    *  origin and only consume a globally unique match. */

@@ -1569,6 +1569,10 @@ export interface WorkerPoolCallbacks {
   /** The current worker published the live origin of `turnId`, an execution
    *  the session contract admitted and has not terminated. */
   onManagedTurnOrigin?: (ds: DaemonSession, turnId: string) => void;
+  /** The current worker explicitly revoked its live turn origin (for example
+   *  after background tasks and their wake-up micro-turn finished) and cleared
+   *  `ds.activeInteractiveTurn`, so queued XPI/forks can drain. */
+  onManagedTurnOriginRevoked?: (ds: DaemonSession, revokedTurnId: string) => void;
   /** A process exit makes every unresolved receipt dispatched to this exact
    *  worker generation ambiguous; the receiver decides retry policy. */
   onWorkerExit?: (
@@ -9400,6 +9404,9 @@ export function killWorker(
   // daemon-side copy synchronously; the worker may never get a chance to send
   // its ordered revoke IPC on close/crash paths.
   ds.managedTurnOrigin = undefined;
+  const killedInteractiveTurnId = ds.activeInteractiveTurn?.turnId;
+  ds.activeInteractiveTurn = undefined;
+  if (killedInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, killedInteractiveTurnId);
   // The worker/CLI generation is ending — any outstanding stuck-warning card
   // must be invalidated so a late click cannot inject keys into a replacement
   // worker (or into nothing, if no replacement comes).
@@ -9491,6 +9498,9 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   clearAcceptedInputTurns(ds);
   ds.protectedLoopbackProxyAttestation = undefined;
   ds.managedTurnOrigin = undefined;
+  const retiredInteractiveTurnId = ds.activeInteractiveTurn?.turnId;
+  ds.activeInteractiveTurn = undefined;
+  if (retiredInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, retiredInteractiveTurnId);
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
   const w = ds.worker;
@@ -9547,6 +9557,9 @@ function clearTransferWorkerState(
   clearAcceptedInputTurns(ds);
   ds.protectedLoopbackProxyAttestation = undefined;
   ds.managedTurnOrigin = undefined;
+  const retiredInteractiveTurnId = ds.activeInteractiveTurn?.turnId;
+  ds.activeInteractiveTurn = undefined;
+  if (retiredInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, retiredInteractiveTurnId);
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
   if (!worker || ds.worker === worker || ds.worker === null) {
@@ -13642,6 +13655,9 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   ds.workerViewToken = null;
   ds.workerCardViewToken = null;
   ds.managedTurnOrigin = undefined;
+  const suspendedInteractiveTurnId = ds.activeInteractiveTurn?.turnId;
+  ds.activeInteractiveTurn = undefined;
+  if (suspendedInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, suspendedInteractiveTurnId);
   // The worker is being suspended — the CLI will be destroyed and cold-resumed
   // later. Invalidate any stuck-warning card so a late click cannot inject keys
   // after the CLI is gone (or into a different CLI on resume).
@@ -24071,6 +24087,18 @@ function setupWorkerHandlers(
         // only prove the un-attempted execution; a later re-accepted attempt
         // stays protected. A retry with the same identity may re-register.
         settleAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, false);
+        if (ds.activeInteractiveTurn?.turnId === msg.turnId) {
+          if (msg.activeTurnId && msg.activeCaller) {
+            ds.activeInteractiveTurn = {
+              turnId: msg.activeTurnId,
+              caller: msg.activeCaller,
+              ...(msg.activeController ? { controller: msg.activeController } : {}),
+            };
+          } else {
+            ds.activeInteractiveTurn = undefined;
+            if (typeof cb !== 'undefined') cb?.onManagedTurnOriginRevoked?.(ds, msg.turnId);
+          }
+        }
         discardTriggerStreamingCard(ds, msg.turnId);
         const purgeClick = takePurgeClickRollback(ds, msg.turnId);
         if (purgeClick) {
@@ -28131,8 +28159,15 @@ function setupWorkerHandlers(
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
         // this exact terminal edge. Tuple-match prevents a late turn N event
-        // from clearing a capability already rotated for turn N+1.
-        if (ds.managedTurnOrigin?.turnId === msg.turnId
+        // from clearing a capability already rotated for turn N+1. Skip ONLY
+        // when a completed turn explicitly retained authority for its own
+        // finite background tasks (`authorityHeldForBackground: true`); a
+        // subsequent `managed_turn_origin_revoked` (or new origin / exit) then
+        // clears `ds.managedTurnOrigin` and runs GC.
+        const retainOriginForBackground = msg.status === 'completed'
+          && msg.authorityHeldForBackground === true;
+        if (!retainOriginForBackground
+          && ds.managedTurnOrigin?.turnId === msg.turnId
           && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
           ds.managedTurnOrigin = ds.managedTurnOrigin.policyCapability
             ? {
@@ -29290,6 +29325,15 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin with mismatched sessionId`);
           break;
         }
+        // Async flushPrimary() can resume a managed_turn_origin after its own
+        // revocation already ran (e.g. via the fail-closed backstop). Refuse to
+        // reinstall a capability that this worker generation already revoked.
+        const revokedCaps = ds.revokedManagedOriginCapabilities;
+        if (revokedCaps && revokedCaps.workerGeneration === ds.workerGeneration
+          && revokedCaps.tokens.has(msg.capability)) {
+          logger.warn(`[${t}] Dropped managed_turn_origin whose capability was already revoked in this worker generation`);
+          break;
+        }
         // Isolated children use one stable per-session pathname visible through
         // an exact Seatbelt/bwrap read carve-out.
         // Only the daemon handler for the CURRENT ChildProcess generation may
@@ -29407,15 +29451,32 @@ function setupWorkerHandlers(
         // Same-generation exact-turn revocation is positive idle evidence for
         // daemon-side pre-routing. Never let historical caller/session fields
         // keep this optimistic hint alive after the worker released authority.
-        if (ds.activeInteractiveTurn?.turnId === msg.turnId) {
-          ds.activeInteractiveTurn = undefined;
+        // Record revoked capability tombstone for this worker generation so an
+        // in-flight managed_turn_origin resuming after flushPrimary() cannot
+        // reinstall an already-revoked capability.
+        if (typeof msg.capability === 'string' && msg.capability) {
+          const gen = ds.workerGeneration ?? 0;
+          if (!ds.revokedManagedOriginCapabilities || ds.revokedManagedOriginCapabilities.workerGeneration !== gen) {
+            ds.revokedManagedOriginCapabilities = { workerGeneration: gen, tokens: new Set() };
+          }
+          ds.revokedManagedOriginCapabilities.tokens.add(msg.capability);
+          if (ds.revokedManagedOriginCapabilities.tokens.size > 256) {
+            ds.revokedManagedOriginCapabilities.tokens.delete(ds.revokedManagedOriginCapabilities.tokens.values().next().value!);
+          }
         }
         // Same-worker IPC is ordered, but exact-match both authorities so a
         // delayed revoke can never clear a token already rotated by the next
         // turn. Live-send and policy authority are independent: a stale token
         // for one must not block a matching revoke for the other.
         const origin = ds.managedTurnOrigin;
-        if (!origin) break;
+        if (!origin) {
+          if (msg.turnId && ds.activeInteractiveTurn?.turnId === msg.turnId) {
+            const cleared = ds.activeInteractiveTurn.turnId;
+            ds.activeInteractiveTurn = undefined;
+            if (typeof cb !== 'undefined') cb?.onManagedTurnOriginRevoked?.(ds, cleared);
+          }
+          break;
+        }
         if (msg.originChannelId
           && origin.originChannelId
           && origin.originChannelId !== msg.originChannelId) {
@@ -29441,6 +29502,13 @@ function setupWorkerHandlers(
         }
         if (!revokeLive && !revokePolicy) break;
         if (revokeLive) {
+          // Only clear ds.activeInteractiveTurn after validating channel &
+          // capability match so a stale capability revoke can never wipe XPI
+          // tracking of a rotated live origin.
+          const interactiveMatchTurnId = msg.turnId ?? origin.turnId;
+          if (interactiveMatchTurnId && ds.activeInteractiveTurn?.turnId === interactiveMatchTurnId) {
+            ds.activeInteractiveTurn = undefined;
+          }
           ds.managedTurnOrigin = origin.policyCapability && !revokePolicy
             ? {
                 capability: randomBytes(32).toString('hex'),
@@ -29450,6 +29518,12 @@ function setupWorkerHandlers(
                 policyCapability: origin.policyCapability,
               }
             : undefined;
+          // Reclaim proven identity material pinned by a background-held origin
+          // whose foreground turn_terminal already ran.
+          if (typeof collectSessionTurnGarbage === 'function') collectSessionTurnGarbage(ds);
+          if (!ds.activeInteractiveTurn && typeof cb !== 'undefined') {
+            cb?.onManagedTurnOriginRevoked?.(ds, interactiveMatchTurnId ?? '');
+          }
           break;
         }
         const { policyCapability: _revokedPolicyCapability, ...liveOrigin } = origin;
@@ -29970,9 +30044,75 @@ function setupWorkerHandlers(
         logger.debug(`[${t}] Scoped event rejected: ${msg.type} ${reason}`);
       }
     };
+    const applyLiveWorkerRevokeBackstop = (reason: string): void => {
+      if (msg.type !== 'managed_turn_origin_revoked') return;
+      if (ds.worker !== worker || msg.sessionId !== ds.session.sessionId) return;
+      // Record revoked capability tombstone even if ds.managedTurnOrigin has
+      // not been installed yet (e.g. an earlier managed_turn_origin is still
+      // awaiting flushPrimary()).
+      if (typeof msg.capability === 'string' && msg.capability) {
+        const gen = ds.workerGeneration ?? 0;
+        if (!ds.revokedManagedOriginCapabilities || ds.revokedManagedOriginCapabilities.workerGeneration !== gen) {
+          ds.revokedManagedOriginCapabilities = { workerGeneration: gen, tokens: new Set() };
+        }
+        ds.revokedManagedOriginCapabilities.tokens.add(msg.capability);
+        if (ds.revokedManagedOriginCapabilities.tokens.size > 256) {
+          ds.revokedManagedOriginCapabilities.tokens.delete(ds.revokedManagedOriginCapabilities.tokens.values().next().value!);
+        }
+      }
+      const origin = ds.managedTurnOrigin;
+      if (!origin) {
+        if (msg.turnId && ds.activeInteractiveTurn?.turnId === msg.turnId) {
+          const cleared = ds.activeInteractiveTurn.turnId;
+          ds.activeInteractiveTurn = undefined;
+          if (typeof cb !== 'undefined') cb?.onManagedTurnOriginRevoked?.(ds, cleared);
+          logger.warn(`[${t}] Applied fail-closed interactive-turn revoke backstop after contract reject (${reason}, turn=${cleared})`);
+        }
+        return;
+      }
+      if (msg.originChannelId && origin.originChannelId && origin.originChannelId !== msg.originChannelId) return;
+      const unboundLiveRevoke = !msg.capability && !msg.policyCapability
+        && !!msg.turnId
+        && origin.turnId === msg.turnId
+        && origin.dispatchAttempt === msg.dispatchAttempt;
+      const revokeLive = unboundLiveRevoke
+        || (typeof msg.capability === 'string' && origin.capability === msg.capability);
+      const revokePolicy = typeof msg.policyCapability === 'string'
+        && origin.policyCapability === msg.policyCapability;
+      if (!revokeLive && !revokePolicy) return;
+      if (revokeLive) {
+        const matchTurnId = msg.turnId ?? origin.turnId;
+        if (matchTurnId && ds.activeInteractiveTurn?.turnId === matchTurnId) {
+          ds.activeInteractiveTurn = undefined;
+        }
+        ds.managedTurnOrigin = origin.policyCapability && !revokePolicy
+          ? {
+              capability: randomBytes(32).toString('hex'),
+              ...(msg.originChannelId ?? origin.originChannelId
+                ? { originChannelId: msg.originChannelId ?? origin.originChannelId }
+                : {}),
+              policyCapability: origin.policyCapability,
+            }
+          : undefined;
+        if (typeof collectSessionTurnGarbage === 'function') collectSessionTurnGarbage(ds);
+        if (!ds.activeInteractiveTurn && typeof cb !== 'undefined') cb?.onManagedTurnOriginRevoked?.(ds, matchTurnId ?? '');
+        logger.warn(`[${t}] Applied fail-closed live-capability revoke backstop after contract reject (${reason}, turn=${matchTurnId ?? '-'})`);
+        return;
+      }
+      const { policyCapability: _revokedPolicyCapability, ...liveOrigin } = origin;
+      ds.managedTurnOrigin = liveOrigin;
+      logger.warn(`[${t}] Applied fail-closed policy-capability revoke backstop after contract reject (${reason})`);
+    };
     let admission = sessionController.ingest(msg as unknown as import('./session-controller.js').ControlledWorkerMessage, contractWorker, recoveredOrigin);
     if (admission.kind === 'reject') {
       logRejected(admission.reason);
+      if (msg.type === 'managed_turn_origin_revoked') {
+        // Record tombstone synchronously before awaiting flushPrimary(), then
+        // apply backstop after any in-flight managed_turn_origin settles.
+        applyLiveWorkerRevokeBackstop(admission.reason);
+        await sessionController.flushPrimary();
+        applyLiveWorkerRevokeBackstop(admission.reason);
+      }
       if (metadata) sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId, msg);
       return;
     }
@@ -29992,7 +30132,11 @@ function setupWorkerHandlers(
     if (admission.kind === 'defer') { logDeferred('ingest'); return; }
     await sessionController.flushPrimary();
     admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin);
-    if (admission.kind === 'reject') { logRejected(admission.reason); return; }
+    if (admission.kind === 'reject') {
+      logRejected(admission.reason);
+      applyLiveWorkerRevokeBackstop(admission.reason);
+      return;
+    }
     if (admission.kind === 'defer') { logDeferred('gateway'); return; }
     // A verified native success is stronger than a lost input commit ACK.
     // Ambiguous/failed/cancelled boundaries do not prove queue admission.
