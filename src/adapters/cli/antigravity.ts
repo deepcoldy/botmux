@@ -193,6 +193,30 @@ export function isAntigravityWorkingScreen(screen: string): boolean {
   return /(?:^|\n)[ \t]*esc to cancel(?:\s|$)/i.test(stripAnsiScreenText(screen));
 }
 
+const PROACTIVE_FEEDBACK_HEADER_RE = /^How's the CLI experience so far\?/i;
+const PROACTIVE_FEEDBACK_OPTIONS_RE = /\[1\]\s+\S+.*\[2\]\s+\S+.*\[3\]\s+\S+.*\[0\]\s+\S+/;
+
+/** Detect agy's inline ProactiveFeedbackModel survey ("How's the CLI experience
+ *  so far? Help us improve:" + `[1] ... [2] ... [3] ... [0] ...`) at the tail
+ *  of the viewport. While active, agy silently drops tea.PasteMsg and consumes
+ *  the trailing Enter only to dismiss itself. Inspects only the trailing rows
+ *  so quoted conversation text above cannot false-positive. */
+export function isAntigravityProactiveFeedbackScreen(screen: string): boolean {
+  if (!screen) return false;
+  const rows = stripAnsiScreenText(screen)
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map(row => row.trim())
+    .filter(row => row.length > 0);
+  const tail = rows.slice(-12);
+  for (let i = 0; i < tail.length; i++) {
+    if (!PROACTIVE_FEEDBACK_HEADER_RE.test(tail[i]!)) continue;
+    const lookahead = tail.slice(i + 1, i + 4);
+    if (lookahead.some(row => PROACTIVE_FEEDBACK_OPTIONS_RE.test(row))) return true;
+  }
+  return false;
+}
+
 const ANTIGRAVITY_FOOTER_START_RE = /^(?:\? for shortcuts|esc to cancel)(?:\s|$)/i;
 const ANTIGRAVITY_FOOTER_TASKS_RE = /(?:^|·|\s)(\d+)\s+task\(s\)(?:\s|$|·)/i;
 
@@ -615,6 +639,13 @@ export function supportsAntigravityStatusline(version: string | undefined): bool
   return antigravityVersionAtLeast(version, 1, 5, 8);
 }
 
+/** Verified release baseline supporting `showFeedbackSurvey: false` inside
+ *  ephemeral `--settings` JSON (verified on agy 1.5.16+; older builds reject
+ *  unknown `--settings` keys at startup with exit code 1). */
+export function supportsAntigravityFeedbackSurveySetting(version: string | undefined): boolean {
+  return antigravityVersionAtLeast(version, 1, 5, 16);
+}
+
 /** 找回被进程级 `--settings` 遮蔽的用户 Antigravity statusLine 命令。
  *  读取 `~/.gemini/antigravity-cli/settings.json` 中的 `statusLine`：
  *  仅当未显式禁用（`enabled !== false`）、未指定非 command 类型、且 `command` 非空时返回。
@@ -740,14 +771,18 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // 默认底部栏（保证 `? for shortcuts` readyPattern 与 idle 判定不受影响）。
       // 用户原有的自定义 statusLine.command 由 worker 通过 BOTMUX_STATUSLINE_CHAIN 透传。
       if (supportsAntigravityStatusline(cliVersion)) {
-        args.push('--settings', JSON.stringify({
+        const settings: Record<string, unknown> = {
           statusLine: {
             type: 'command',
             enabled: true,
             command: statuslineHookCommand(),
             stack_with_default: true,
           },
-        }));
+          ...(supportsAntigravityFeedbackSurveySetting(cliVersion)
+            ? { showFeedbackSurvey: false }
+            : {}),
+        };
+        args.push('--settings', JSON.stringify(settings));
       }
       // agy 1.5.4 supports -i, but its startup prompt bypasses history.jsonl.
       // Keep the same verified stdin submit path for initial and later turns.
@@ -791,6 +826,18 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
         if (content.includes('\x1b')) return { submitted: false, failureReason: 'antigravity_paste_control_character' };
         content = content.replace(/\r\n?/g, '\n');
       }
+      try {
+        const screen = pty.captureCurrentScreen?.();
+        if (screen && isAntigravityProactiveFeedbackScreen(screen)) {
+          // agy >= 1.5.16's ProactiveFeedbackModel silently drops tea.PasteMsg
+          // while active and dismisses itself on the trailing Enter, losing
+          // the pasted payload. Dismiss with Escape first so the composer
+          // receives the upcoming submit.
+          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Escape');
+          else pty.write('\x1b');
+          await delay(50);
+        }
+      } catch { /* Screen probe or Escape dismiss is best-effort before normal submit. */ }
       // agy 1.5.4 accepts complete bracketed-paste frames. Older/unknown
       // versions retain the original M-Enter soft-newline contract. A write
       // acknowledgement is not submission evidence: both paths still use the

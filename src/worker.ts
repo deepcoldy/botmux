@@ -26227,6 +26227,10 @@ function scheduleSubmitFailureNotify(
   // With botmux's SessionStart hook armed, that signal and the transcript are
   // the only arbiters (see decideSessionStartGatedSubmitWarning).
   const sessionStartGated = readyGate.isArmed;
+  const isPassedBySuccessor = (): boolean => structuredTarget
+    && !!bridgeTurnId
+    && typeof codexBridgeQueue?.isPassedBySuccessor === 'function'
+    && codexBridgeQueue.isPassedBySuccessor(bridgeTurnId, turnIdentity?.dispatchAttempt);
   const runDeferredRecheck = async (chainIsCurrent: () => boolean): Promise<void> => {
     const settlement = await settleDeferredSubmitConfirmation(codexBridgeQueue, {
       turnId: bridgeTurnId,
@@ -26235,12 +26239,18 @@ function scheduleSubmitFailureNotify(
       structuredTarget,
       recheck,
       usageLimitDetected: () => usageLimitTracker.detectedThisTurn(turnSeq),
-      activityEvidence: () => submitActivityEvidenceSince(
-        activityBaselineMs,
-        evidenceTurnId
-          ? { turnId: evidenceTurnId, dispatchAttempt: turnIdentity?.dispatchAttempt }
-          : turnIdentity,
-      ),
+      activityEvidence: () => {
+        const evidence = submitActivityEvidenceSince(
+          activityBaselineMs,
+          evidenceTurnId
+            ? { turnId: evidenceTurnId, dispatchAttempt: turnIdentity?.dispatchAttempt }
+            : turnIdentity,
+        );
+        // Once a later input has passed this mark in the transcript, global
+        // PTY output comes from the successor turn and must not keep this
+        // dead attempt's recheck alive.
+        return isPassedBySuccessor() && evidence === 'pty-output' ? undefined : evidence;
+      },
       isCurrent: combineSubmitCurrentFences(chainIsCurrent, deferredAttemptIsCurrent),
     });
     // Replacing a same-key timer invalidates an already-running callback. The
@@ -26615,8 +26625,10 @@ function scheduleSubmitFailureNotify(
         return cliAdapter.busyPattern.test(busyProbeRegion(submitDiagnosisScreen));
       } catch { return false; }
     })();
+    const passedBySuccessor = isPassedBySuccessor();
     if (
-      shouldWaitThroughBusyTurn({
+      !passedBySuccessor
+      && shouldWaitThroughBusyTurn({
         busy: busyNow,
         diagnosisReason: submitDiagnosis.reason,
         waitsSoFar: busySilenceExtra,
@@ -26644,7 +26656,8 @@ function scheduleSubmitFailureNotify(
       log(`Deferred recheck: ${gated.reason} — PTY activity is not submit evidence. preview="${preview}"`);
     }
     if (
-      submitDiagnosis.reason === 'still_active'
+      !passedBySuccessor
+      && submitDiagnosis.reason === 'still_active'
       && !pendingInputGone
       && !sessionStartGated
       && activeSilenceExtra < SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA
@@ -36876,6 +36889,11 @@ async function spawnCliBody(
   // (would otherwise swallow the fresh session's first turn).
   if (zeroPromptTerminalSync()) {
     codexBridgeQueue.setLocalTurns(true, Date.now());
+    if (cfg.cliId === 'antigravity') {
+      codexBridgeQueue.setWholeInputPassing(true, { timestampGranularityMs: 1_000 });
+    } else if (cfg.cliId === 'codex') {
+      codexBridgeQueue.setWholeInputPassing(true);
+    }
   }
   const spawnBridge = bridgeSpecFor(cfg.cliId)?.spawn;
   if (cfg.cliId === 'hermes') {

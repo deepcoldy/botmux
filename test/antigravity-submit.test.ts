@@ -24,7 +24,7 @@ const previousScale = process.env.BOTMUX_TIME_SCALE;
 process.env.HOME = home;
 process.env.BOTMUX_TIME_SCALE = String(SCALE);
 
-const { createAntigravityAdapter } = await import(
+const { createAntigravityAdapter, isAntigravityProactiveFeedbackScreen } = await import(
   '../src/adapters/cli/antigravity.js'
 );
 
@@ -480,6 +480,85 @@ describe('antigravity writeInput — single-Enter submit', () => {
       await selected.writeInput(fake.pty, 'no viewport');
       expect(selected.isSessionBusy!({ cliSessionId: undefined })).toBe(true);
       expect(selected.isSessionBusy!({ cliSessionId: undefined, getCurrentScreen: () => { throw new Error('pane gone'); } })).toBe(true);
+    });
+  });
+
+  describe('proactive feedback survey guard', () => {
+    const surveyBanner = [
+      '⚠ Individual quota reached. Please upgrade your subscription to increase your limits.',
+      'Error ID: 9a295ca9-0fc2-4b27-8093-9edff973f739-151',
+      '────────────────────────────────────────────────────────────',
+      "How's the CLI experience so far? Help us improve:",
+      '  [1] Bad   [2] Fine   [3] Good   [0] Dismiss',
+      '────────────────────────────────────────────────────────────',
+      '>',
+      '────────────────────────────────────────────────────────────',
+      '? for shortcuts',
+    ].join('\n');
+
+    it('detects the live survey banner at the viewport tail but ignores quoted scrollback above', () => {
+      expect(isAntigravityProactiveFeedbackScreen(surveyBanner)).toBe(true);
+      expect(isAntigravityProactiveFeedbackScreen(
+        [
+          "How's the CLI experience so far? Help us improve:",
+          '  [1] Bad   [2] Fine   [3] Good   [0] Dismiss',
+          ...Array.from({ length: 15 }, (_, i) => `tool output line ${i}`),
+          '────────────────────────────────────────────────────────────',
+          '>',
+          '────────────────────────────────────────────────────────────',
+          '? for shortcuts',
+        ].join('\n'),
+      )).toBe(false);
+      expect(isAntigravityProactiveFeedbackScreen('>\n? for shortcuts\n')).toBe(false);
+    });
+
+    it('dismisses a visible proactive feedback banner with Escape before bracketed paste', async () => {
+      resetHistory();
+      const events: string[] = [];
+      const selected = adapterForVersion('1.5.17');
+      let screen = surveyBanner;
+      const fake = makePty();
+      fake.pty.captureCurrentScreen = () => screen;
+      fake.pty.sendSpecialKeys = (...keys: string[]) => {
+        events.push(`key:${keys.join('+')}`);
+        if (keys[0] === 'Escape') screen = '>\n? for shortcuts';
+        return true;
+      };
+      fake.pty.submitBracketedPaste = text => {
+        events.push(`paste:${text}`);
+        appendHistory(text);
+        return true;
+      };
+
+      const result = await selected.writeInput(fake.pty, '继续？');
+      expect(result).toBeUndefined();
+      expect(events).toEqual(['key:Escape', 'paste:继续？']);
+    });
+
+    it('does not send Escape before pasting on a normal idle composer screen', async () => {
+      resetHistory();
+      const events: string[] = [];
+      const selected = adapterForVersion('1.5.17');
+      const fake = makePty();
+      fake.pty.captureCurrentScreen = () => [
+        '────────────────────────────────────────────────────────────',
+        '>',
+        '────────────────────────────────────────────────────────────',
+        '? for shortcuts',
+      ].join('\n');
+      fake.pty.sendSpecialKeys = (...keys: string[]) => {
+        events.push(`key:${keys.join('+')}`);
+        return true;
+      };
+      fake.pty.submitBracketedPaste = text => {
+        events.push(`paste:${text}`);
+        appendHistory(text);
+        return true;
+      };
+
+      const result = await selected.writeInput(fake.pty, '继续');
+      expect(result).toBeUndefined();
+      expect(events).toEqual(['paste:继续']);
     });
   });
 });
