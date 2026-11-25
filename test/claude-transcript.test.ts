@@ -2441,6 +2441,7 @@ describe('Claude /goal abort record', () => {
     expect(claudeGoalAbortNotice({ ...cleared, content: 'Goal set: write the report' } as TranscriptEvent)).toBeUndefined();
     expect(claudeGoalAbortNotice({ ...cleared, isSidechain: true } as TranscriptEvent)).toBeUndefined();
     expect(claudeGoalAbortNotice({ type: 'user', message: { content: (cleared as any).content } } as TranscriptEvent)).toBeUndefined();
+    expect(claudeGoalAbortNotice({ ...cleared, subtype: 'local_command' })).toBeUndefined();
     expect(claudeGoalAbortNotice(undefined)).toBeUndefined();
   });
 
@@ -2449,6 +2450,12 @@ describe('Claude /goal abort record', () => {
     expect(watch.observe([apiError])).toBeUndefined();
     expect(watch.observe([cleared])).toBe(`${(cleared as any).content} Cause: Please run /login · API Error: 403 Forbidden`);
     expect(watch.observe([apiError, cleared])).toBeUndefined();
+  });
+
+  it('does not attribute a newer error without text to an older error', () => {
+    const watch = new ClaudeGoalAbortWatch();
+    const newer = { ...apiError, error: 'billing_error', message: { role: 'assistant', content: [] } } as TranscriptEvent;
+    expect(watch.observe([apiError, newer, cleared])).toBe((cleared as any).content);
   });
 
   it('does not blame an API error the CLI already recovered from', () => {

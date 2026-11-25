@@ -1354,33 +1354,43 @@ describe('v3 default worker factory (spawnWorkerFactory) across runtime shapes',
 });
 
 describe('workflow node startup: folder trust and startup blockers', () => {
-  it('trusts the canonical cwd in the frozen Claude profile before spawning the worker', async () => {
-    const req = request();
-    const cwd = join(dir, 'repo');
-    const alias = join(dir, 'repo-link');
-    const profile = join(dir, 'claude-profile');
-    mkdirSync(cwd);
-    mkdirSync(profile);
-    symlinkSync(cwd, alias);
-    req.botSnapshot.workingDir = alias;
-    req.botSnapshot.cliConfigDir = profile;
-    const stateFile = join(profile, '.claude.json');
-    writeFileSync(stateFile, JSON.stringify({ account: 'preserved', projects: { other: { keep: true } } }));
-    const worker = new ScriptedWorker();
-    let stateAtSpawn: any;
-    const running = createEphemeralPool({
-      factory: { spawn: () => { stateAtSpawn = JSON.parse(readFileSync(stateFile, 'utf8')); return worker; } },
-      workerPath: '/tmp/worker.js',
-      resolveLarkAppSecret: () => 'secret',
-    }).runNode(req);
-    await worker.waitForInit();
-    worker.emitExit(1);
-    await running;
-    // Claude keys trust by realpath(cwd); other keys in its hot state file survive.
-    expect(stateAtSpawn).toEqual({ account: 'preserved', projects: {
-      other: { keep: true }, [realpathSync(cwd)]: { hasTrustDialogAccepted: true },
-    } });
-  });
+  afterEach(() => { __testOnly_resetBotRegistry(); });
+
+  it.each(['configured', 'override', 'sandbox', 'different profile'] as const)(
+    'prepares the frozen Claude profile only for its configured project: %s', async (scenario) => {
+      const req = request();
+      const cwd = join(dir, 'repo');
+      const alias = join(dir, 'repo-link');
+      const profile = join(dir, 'claude-profile');
+      mkdirSync(cwd);
+      mkdirSync(profile);
+      symlinkSync(cwd, alias);
+      req.botSnapshot.workingDir = alias;
+      req.botSnapshot.cliConfigDir = profile;
+      if (scenario === 'sandbox') req.botSnapshot.sandbox = true;
+      registerBot({
+        larkAppId: req.botSnapshot.larkAppId, larkAppSecret: 'test-only', cliId: 'claude-code', apiOnly: true,
+        defaultWorkingDir: scenario === 'override' ? dir : cwd,
+        cliConfigDir: scenario === 'different profile' ? dir : profile,
+      });
+      const stateFile = join(profile, '.claude.json');
+      writeFileSync(stateFile, JSON.stringify({ account: 'preserved', projects: { other: { keep: true } } }));
+      const worker = new ScriptedWorker();
+      let stateAtSpawn: any;
+      const running = createEphemeralPool({
+        factory: { spawn: () => { stateAtSpawn = JSON.parse(readFileSync(stateFile, 'utf8')); return worker; } },
+        workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret',
+      }).runNode(req);
+      await worker.waitForInit();
+      worker.emitExit(1);
+      await running;
+      // Claude keys trust by realpath(cwd); other keys in its hot state file survive.
+      expect(stateAtSpawn).toEqual({ account: 'preserved', projects: {
+        other: { keep: true }, ...(scenario === 'configured' ? { [realpathSync(cwd)]: { hasTrustDialogAccepted: true } } : {}),
+      } });
+    },
+  );
 
   it.each(['folder_trust', 'login', 'api_key', 'update', 'terms', 'permission_mode'] as const)(
     'fails a node blocked on %s at once as retryable, waiting for the real worker close', async (kind) => {

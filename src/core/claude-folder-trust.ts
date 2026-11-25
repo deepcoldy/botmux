@@ -1,50 +1,46 @@
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, rmdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 
-// Lives outside worker-pool so the v3 workflow pool, which spawns node workers
-// without going through forkWorker, can seed the same trust without importing
-// the daemon's worker pool.
-
-// ─── Claude Code folder-trust pre-acceptance ─────────────────────────────────
-//
-// A freshly spawned `claude` in a workingDir that has never been trusted blocks
-// on the interactive "Do you trust the files in this folder?" dialog. botmux
-// can't answer it — it then mistypes the user's first message into the dialog
-// and the session breaks (surfaced as `tmux send-keys … failed`). There is no
-// CLI flag to skip it (Claude only auto-skips trust in non-interactive `-p` /
-// non-TTY mode, which botmux is not), so we pre-seed the acceptance.
-
-/** Pre-accept Claude Code's per-project folder-trust dialog for `workingDir`.
- *  Claude keys trust off realpath(cwd) (its getcwd(3) is already realpath'd),
- *  so seed that path. Merge-safe + best-effort: only ADDS the flag, never
- *  clobbers other keys; any failure is swallowed so it can't block spawn. */
-export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: string = join(homedir(), '.claude.json')): void {
+/** Set a missing project decision under the same mkdir lock that Claude uses
+ * for its .claude.json. A competing writer owns both its lock and its data. */
+export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath = join(homedir(), '.claude.json')): 'locked' | void {
+  const lock = stateJsonPath + '.lock';
   try {
-    const configPath = stateJsonPath;
-    let canonical: string;
-    try { canonical = realpathSync(workingDir); } catch { canonical = workingDir; }
-
-    let data: any = {};
-    if (existsSync(configPath)) {
-      try { data = JSON.parse(readFileSync(configPath, 'utf-8')); } catch { return; }
+    const canonical = realpathSync(workingDir);
+    try {
+      mkdirSync(lock, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return 'locked';
+      throw error;
     }
-    if (!data || typeof data !== 'object') return;
-    if (!data.projects || typeof data.projects !== 'object') data.projects = {};
+    try {
+      const stat = statSync(stateJsonPath, { throwIfNoEntry: false });
+      const data = stat ? JSON.parse(readFileSync(stateJsonPath, 'utf8')) : {};
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+      if (data.projects === undefined) data.projects = {};
+      if (!data.projects || typeof data.projects !== 'object' || Array.isArray(data.projects)) return;
+      const entry = data.projects[canonical] ?? {};
+      if (typeof entry !== 'object' || Array.isArray(entry) || 'hasTrustDialogAccepted' in entry) return;
+      data.projects[canonical] = { ...entry, hasTrustDialogAccepted: true };
+      atomicWriteFileSync(stateJsonPath, JSON.stringify(data, null, 2), { mode: stat ? stat.mode & 0o777 : 0o600 });
+      logger.info(`[claude-trust] Pre-accepted folder trust for ${canonical}`);
+    } finally {
+      rmdirSync(lock);
+    }
+  } catch (error) {
+    logger.debug(`[claude-trust] seed failed (ignored): ${error}`);
+  }
+}
 
-    const entry = data.projects[canonical] && typeof data.projects[canonical] === 'object'
-      ? data.projects[canonical]
-      : (data.projects[canonical] = {});
-    if (entry.hasTrustDialogAccepted === true) return; // already trusted — skip write
-
-    entry.hasTrustDialogAccepted = true;
-    // 原子写：~/.claude.json 是 Claude Code 的热状态文件，所有并发 claude
-    // 实例都在读写，裸写半截会弄坏它们的状态。
-    atomicWriteFileSync(configPath, JSON.stringify(data, null, 2));
-    logger.info(`[claude-trust] Pre-accepted folder trust for ${canonical}`);
-  } catch (err) {
-    logger.debug(`[claude-trust] seed failed (ignored): ${err}`);
+/** Cold workflow nodes may start together against one profile. Yield briefly
+ * to a competing writer; a longer-lived lock leaves the CLI in charge. */
+export async function prepareWorkflowClaudeTrust(workingDir: string, stateJsonPath: string, signal?: AbortSignal): Promise<void> {
+  for (let attempt = 0; attempt < 6 && !signal?.aborted; attempt++) {
+    if (ensureClaudeFolderTrust(workingDir, stateJsonPath) !== 'locked') return;
+    if (attempt < 5) await delay(25);
   }
 }

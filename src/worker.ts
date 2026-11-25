@@ -3316,6 +3316,8 @@ function seedAndTrustClaudeState(
   seedFrom: string = join(homedir(), '.claude.json'),
 ): void {
   try {
+    let canonical = workingDir;
+    try { canonical = realpathSync(workingDir); } catch { /* cwd may not exist yet */ }
     let data: Record<string, any> = {};
     if (existsSync(statePath)) {
       try { data = JSON.parse(readFileSync(statePath, 'utf-8')); } catch { data = {}; }
@@ -3324,6 +3326,11 @@ function seedAndTrustClaudeState(
         const g = JSON.parse(readFileSync(seedFrom, 'utf-8')) as Record<string, any>;
         const { projects: _drop, ...top } = g;
         data = top;
+        // The isolated profile omits other projects, but must retain an
+        // existing negative decision for this specific working directory.
+        if (g.projects?.[canonical]?.hasTrustDialogAccepted === false) {
+          data.projects = { [canonical]: { hasTrustDialogAccepted: false } };
+        }
       } catch { data = {}; }
     }
     if (!data.projects || typeof data.projects !== 'object') data.projects = {};
@@ -3339,12 +3346,10 @@ function seedAndTrustClaudeState(
     // per-cwd trust-dialog acceptance below. If the seed/global already set it,
     // this is a no-op.
     data.hasCompletedOnboarding = true;
-    let canonical = workingDir;
-    try { canonical = realpathSync(workingDir); } catch { /* cwd may not exist yet */ }
     const entry = data.projects[canonical] && typeof data.projects[canonical] === 'object'
       ? data.projects[canonical]
       : (data.projects[canonical] = {});
-    entry.hasTrustDialogAccepted = true;
+    entry.hasTrustDialogAccepted ??= true;
     writeFileSync(statePath, JSON.stringify(data, null, 2), { mode: 0o600 });
   } catch (e) {
     log(`[read-isolation] WARN seed .claude.json failed: ${(e as Error).message}`);

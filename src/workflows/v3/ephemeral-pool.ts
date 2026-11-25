@@ -15,8 +15,8 @@ import { SessionContractStore } from '../../services/session-contract-store.js';
 import { sessionContractsEnabled } from '../../services/session-contract.js';
 import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
-import { getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
-import { statSync } from 'node:fs';
+import { effectiveDefaultWorkingDir, getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
+import { realpathSync, statSync } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,7 +25,8 @@ import type { WorkerToDaemon } from '../../types.js';
 import type { BackendType } from '../../adapters/backend/types.js';
 import { config } from '../../config.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
-import { ensureClaudeFolderTrust } from '../../core/claude-folder-trust.js';
+import { resolveSandboxMode } from '../../adapters/cli/sandbox-mode.js';
+import { prepareWorkflowClaudeTrust } from '../../core/claude-folder-trust.js';
 import { spawnWorker } from '../../core/self-spawn.js';
 import {
   expandWorkflowWorkingDir,
@@ -91,6 +92,28 @@ export interface EphemeralPoolDeps {
 function liveBotConfig(larkAppId: string): BotConfig | undefined {
   try { return getBot(larkAppId).config; } catch { /* not hosted by this daemon */ }
   try { return loadBotConfigsCached().find(b => b.larkAppId === larkAppId); } catch { return undefined; }
+}
+
+/** A run may override its cwd or replay an old profile. Only seed the live
+ * bot's configured project and profile. A sandbox or credential-isolated
+ * worker provisions its own state and must leave its source profile alone. */
+async function prepareNodeFolderTrust(
+  snapshot: RunNodeRequest['botSnapshot'], cwd: string, sandboxEnv: string | undefined, signal?: AbortSignal,
+): Promise<void> {
+  if (snapshot.credentialsSourceDir || resolveSandboxMode({ configSandbox: snapshot.sandbox, envValue: sandboxEnv }) !== 'off') return;
+  const bot = liveBotConfig(snapshot.larkAppId);
+  if (!bot || bot.cliId !== snapshot.cliId || bot.cliConfigDir !== snapshot.cliConfigDir) return;
+  const adapter = createCliAdapterSync(snapshot.cliId, snapshot.cliPathOverride, { configDir: snapshot.cliConfigDir });
+  if (!adapter.claudeStateJsonPath) return;
+
+  const canonical = realpathSync(cwd);
+  const directories = [effectiveDefaultWorkingDir(bot), bot.workingDir, ...(bot.workingDirs ?? [])];
+  const configured = directories.some(directory => {
+    const path = expandWorkflowWorkingDir(directory);
+    if (!path) return false;
+    try { return realpathSync(path) === canonical; } catch { return false; }
+  });
+  if (configured) await prepareWorkflowClaudeTrust(canonical, adapter.claudeStateJsonPath, signal);
 }
 
 /** Throws when the live bot runs personal-assistant mode (see runNodeImpl). */
@@ -200,18 +223,6 @@ async function runNodeImpl(
   }
 
   const cwd = expandWorkflowWorkingDir(req.botSnapshot.workingDir) ?? process.cwd();
-  try {
-    // Same pre-acceptance as an ordinary chat spawn (worker-pool), against the
-    // frozen bot's own Claude-family state file (cliConfigDir profile, Seed
-    // runtime dir, …). Otherwise the node's first run in a new cwd stops on the
-    // trust dialog and the goal prompt never reaches the composer.
-    const adapter = createCliAdapterSync(req.botSnapshot.cliId, req.botSnapshot.cliPathOverride,
-      { configDir: req.botSnapshot.cliConfigDir });
-    if (adapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, adapter.claudeStateJsonPath);
-  } catch (err) {
-    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
-    throw err;
-  }
   const sessionId = syntheticSessionUuid(`v3-${req.runId}-${req.attemptId}`);
   const global = readGlobalConfig();
   const protectedEnvKeys = protectedMcpCurrentRedactedEnvKeys(global.protectedMcpCapabilities, configuredProtectedMcpEnvKeys());
@@ -230,6 +241,17 @@ async function runNodeImpl(
     BOTMUX_WORKFLOW_NODE_ID: req.node.id,
   };
   for (const key of protectedEnvKeys) delete workerEnv[key];
+  try {
+    await prepareNodeFolderTrust(req.botSnapshot, cwd, workerEnv.BOTMUX_SANDBOX, cancelSignal);
+  } catch (error) {
+    // Trust is optional. A missing cwd or profile must still take the normal
+    // worker startup path and surface the actual launch error or dialog.
+    await appendLine(stderrPath(req), `[v3] folder trust preparation skipped: ${error}`);
+  }
+  if (cancelSignal?.aborted) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
+    return { status: 'cancelled', manifestPath, cancelReason: cancelSignal.reason };
+  }
   // Where the worker writes this attempt's skill manifest + snapshot (its own
   // SESSION_DATA_DIR, i.e. config.session.dataDir unless req.env overrides it).
   const workerDataDir = workerEnv.SESSION_DATA_DIR || config.session.dataDir;

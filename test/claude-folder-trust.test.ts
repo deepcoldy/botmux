@@ -4,10 +4,12 @@
  * untrusted workingDir don't block on the interactive confirmation screen.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, realpathSync, mkdirSync, rmdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { ensureClaudeFolderTrust } from '../src/core/worker-pool.js';
+import { prepareWorkflowClaudeTrust } from '../src/core/claude-folder-trust.js';
 
 describe('ensureClaudeFolderTrust', () => {
   let home: string;
@@ -35,6 +37,7 @@ describe('ensureClaudeFolderTrust', () => {
     ensureClaudeFolderTrust(workDir);
     const data = JSON.parse(readFileSync(configPath(), 'utf-8'));
     expect(data.projects[canonical()].hasTrustDialogAccepted).toBe(true);
+    if (process.platform !== 'win32') expect(statSync(configPath()).mode & 0o777).toBe(0o600);
   });
 
   it('merges into an existing config without clobbering other keys', () => {
@@ -58,6 +61,62 @@ describe('ensureClaudeFolderTrust', () => {
     expect(entry.hasTrustDialogAccepted).toBe(true);
     expect(entry.lastCost).toBe(2.5);
     expect(entry.allowedTools).toEqual(['Bash']);
+  });
+
+  it('preserves an explicit negative decision and private permissions', () => {
+    const before = JSON.stringify({ projects: { [canonical()]: { hasTrustDialogAccepted: false } } });
+    writeFileSync(configPath(), before, { mode: 0o600 });
+    ensureClaudeFolderTrust(workDir);
+    expect(readFileSync(configPath(), 'utf8')).toBe(before);
+    const other = mkdtempSync(join(home, 'other-'));
+    ensureClaudeFolderTrust(other);
+    if (process.platform !== 'win32') expect(statSync(configPath()).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(configPath(), 'utf8')).projects[canonical()].hasTrustDialogAccepted).toBe(false);
+  });
+
+  it('leaves a concurrent Claude writer alone and merges its committed state on the next attempt', () => {
+    const lock = configPath() + '.lock';
+    mkdirSync(lock);
+    ensureClaudeFolderTrust(workDir);
+    expect(existsSync(configPath())).toBe(false);
+    expect(statSync(lock).isDirectory()).toBe(true);
+    writeFileSync(configPath(), JSON.stringify({ projects: { '/other': { lastCost: 7 } } }));
+    rmdirSync(lock);
+    ensureClaudeFolderTrust(workDir);
+    const state = JSON.parse(readFileSync(configPath(), 'utf8'));
+    expect(state.projects['/other']).toEqual({ lastCost: 7 });
+    expect(state.projects[canonical()].hasTrustDialogAccepted).toBe(true);
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('merges after a competing writer releases the lock and respects cancellation while waiting', async () => {
+    const lock = configPath() + '.lock';
+    mkdirSync(lock);
+    const controller = new AbortController();
+    const cancelledDir = mkdtempSync(join(home, 'cancelled-'));
+    const cancelled = prepareWorkflowClaudeTrust(cancelledDir, configPath(), controller.signal);
+    const running = prepareWorkflowClaudeTrust(workDir, configPath());
+    controller.abort();
+    writeFileSync(configPath(), JSON.stringify({ projects: { concurrent: { keep: true } } }));
+    rmdirSync(lock);
+    await Promise.all([running, cancelled]);
+    expect(JSON.parse(readFileSync(configPath(), 'utf8')).projects).toEqual({
+      concurrent: { keep: true }, [canonical()]: { hasTrustDialogAccepted: true },
+    });
+  });
+
+  it('carries a negative source decision into a new isolated profile and preserves it on resume', () => {
+    const isolated = join(home, 'isolated.json');
+    writeFileSync(configPath(), JSON.stringify({ projects: {
+      [canonical()]: { hasTrustDialogAccepted: false }, '/other': { keepPrivate: true },
+    } }));
+    const seed = loadWorkerFunction<(path: string, cwd: string, log: () => void, source: string) => void>(
+      'seedAndTrustClaudeState', { existsSync, readFileSync, realpathSync, writeFileSync },
+    );
+    seed(isolated, workDir, () => {}, configPath());
+    expect(JSON.parse(readFileSync(isolated, 'utf8')).projects).toEqual({ [canonical()]: { hasTrustDialogAccepted: false } });
+    seed(isolated, workDir, () => {}, configPath());
+    expect(JSON.parse(readFileSync(isolated, 'utf8')).projects[canonical()].hasTrustDialogAccepted).toBe(false);
   });
 
   it('is idempotent and does not rewrite when already trusted', () => {

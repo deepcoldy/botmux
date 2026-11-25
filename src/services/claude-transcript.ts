@@ -185,7 +185,7 @@ export function apiErrorMessageText(ev: TranscriptEvent): string {
  *  `{type:"system", subtype:"informational", content:"Goal cleared after an
  *  unrecoverable error (<label>): …"}`. Returns that notice, else undefined. */
 export function claudeGoalAbortNotice(ev: TranscriptEvent | null | undefined): string | undefined {
-  if (!ev || typeof ev !== 'object' || ev.type !== 'system' || ev.isSidechain === true) return undefined;
+  if (!ev || typeof ev !== 'object' || ev.type !== 'system' || ev.subtype !== 'informational' || ev.isSidechain === true) return undefined;
   const content = (ev as { content?: unknown }).content;
   if (typeof content !== 'string') return undefined;
   return /^Goal cleared after an unrecoverable error\b/.test(content) ? content : undefined;
@@ -205,7 +205,7 @@ export class ClaudeGoalAbortWatch {
       if (!ev || typeof ev !== 'object' || ev.isSidechain === true) continue;
       if (ev.type === 'assistant') {
         // A real reply after an error means that error was recovered from.
-        this.lastApiError = ev.isApiErrorMessage === true ? apiErrorMessageText(ev).trim() || this.lastApiError : undefined;
+        this.lastApiError = ev.isApiErrorMessage === true ? apiErrorMessageText(ev).trim() : undefined;
         continue;
       }
       const notice = claudeGoalAbortNotice(ev);
