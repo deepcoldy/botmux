@@ -1,3 +1,4 @@
+import { durableImRepliesEnabled } from '../bot-registry.js';
 import type { DaemonSession } from './types.js';
 import type { FrozenSessionReplyContext, FrozenSessionReplyTarget, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
 
@@ -484,7 +485,7 @@ export function beginReplyTargetTurn(
   delete exactContexts[turnId];
   exactContexts[turnId] = {
     target: exactTarget,
-    ...(opts?.senderOpenId && (process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1' || ds.initConfig?.finalOutputHandoff?.admitNew)
+    ...(opts?.senderOpenId && (process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1' || durableImRepliesEnabled(ds.larkAppId) || ds.initConfig?.finalOutputHandoff?.admitNew)
       ? { requesterOpenId: opts.senderOpenId,
           ...(opts.participants?.some(p => p.openId === opts.senderOpenId)
             ? { requesterIsBot: opts.participants.find(p => p.openId === opts.senderOpenId)!.isBot }

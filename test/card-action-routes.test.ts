@@ -261,6 +261,11 @@ describe('敏感动作清单', () => {
     expect(sensitiveCardActionMeta('worktree_toggle_mode')?.pendingRepoOwnerException).toBeUndefined();
   });
 
+  it('会话发起人例外只给 close', () => {
+    const exempt = [...SENSITIVE_CARD_ACTIONS].filter(([, m]) => m.sessionOwnerException).map(([a]) => a);
+    expect(exempt).toEqual(['close']);
+  });
+
   it('未登记 / 非字符串 → undefined（不过门）', () => {
     for (const a of ['nope', '', 'RESTART', undefined, null, 5, {}, ['restart']]) {
       expect(sensitiveCardActionMeta(a), String(a)).toBeUndefined();

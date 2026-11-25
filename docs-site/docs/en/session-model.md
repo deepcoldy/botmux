@@ -111,13 +111,13 @@ When an agent renames the group on its own because the task moved to a new phase
 | Tier | What it allows | Who has it |
 |------|----------------|------------|
 | **Talk** | Ask questions, have it check logs, read code | Admins (`allowedUsers`), everyone in allowlisted groups (`allowedChatGroups`), guests granted access (`/grant`), on-call group members, and so on; anyone in `blockedUsers` is always denied |
-| **Operate** | botmux slash commands (such as `/cd`, `/restart`, `/close`, `/rename`, `/card`) and card buttons | Admins (`allowedUsers`). If no allowlist is configured at all, everyone has it |
+| **Operate** | botmux slash commands (such as `/cd`, `/restart`, `/close`, `/rename`, `/card`) and card buttons | Admins (`allowedUsers`). If no allowlist is configured at all, everyone has it. The person who opened a per-topic session (direct messages included) can additionally close it ("❌ Close Session" on the card) |
 | **Manage** | `/grant` / `/revoke` to authorize others, toggling on-call, etc. | The bot owner and admins |
 
 - botmux commands need operate access by default. A few only need talk access, such as `/resume`.
 - To let people with talk access run specific commands, add those commands to `canTalkDaemonCommands` in `bots.json`.
 
-With these tiers you can safely add the bot to an on-call group: everyone can ask, but only admins can change session state, and a stray click from someone else won't break the session. Full rules (quotas, expiry, "joining a group ≠ being authorized", block list, grant request cards) are in [Permissions & Access](/en/permissions).
+With these tiers you can safely add the bot to an on-call group: everyone can ask, and by default only admins can change session state—a stray click from someone else won't break the session; the one exception is that the person who opened a topic can close their own topic (see the Operate row above; the `/close` command still needs operate access). Full rules (quotas, expiry, "joining a group ≠ being authorized", block list, grant request cards) are in [Permissions & Access](/en/permissions).
 
 ## Common confusions
 

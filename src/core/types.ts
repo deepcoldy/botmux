@@ -609,6 +609,21 @@ export interface DaemonSession {
   /** A completed turn whose CoT message is left open while background tasks
    *  run; closing it renders 「任务已完成」. See finalizeOrHoldCotMessage. */
   cotHeldForBackground?: { turnId: string; dispatchAttempt?: number };
+  /** answerRequired turns need two independent settlement facts. A map avoids
+   * a newer terminal evicting an older turn whose durable reply is still due. */
+  requiredReplyCotHolds?: Map<string, {
+    turnId: string;
+    dispatchAttempt?: number;
+    finishStatus: 'completed' | 'failed';
+    replyPending: boolean;
+    backgroundPending: boolean;
+  }>;
+  /** Per-turn in-memory continuations for required-reply-missing notices. */
+  pendingRequiredReplyMissingReceipts?: Map<string, {
+    turnId: string;
+    dispatchAttempt?: number;
+    publish: () => void;
+  }>;
   /** Last screen_update's away-summary state (waiting or blurred). Automatic
    *  compact must not restore focus and cancel Claude's one-shot recap.
    *  In-memory; absent from older workers means unknown/false. */

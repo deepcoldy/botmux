@@ -170,8 +170,9 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, ABSORBED_REPLY_MAX_CHARS, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, ABSORBED_REPLY_MAX_CHARS, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, ClaudeGoalAbortWatch, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, liveFoldedReplyUuids, noteHostFinalCarried, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { updateClaudeStateFile } from './core/claude-folder-trust.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -3341,10 +3342,8 @@ function writeCredIfChanged(dst: string, raw: string): void {
   writeFileSync(dst, body, { mode: 0o600 });
 }
 
-/** Seed a fresh per-bot `.claude.json` from the global top-level flags (minus projects)
- *  so onboarding/promo dialogs are pre-dismissed and the account is recognized, then
- *  mark this bot's realpath(cwd) trusted. Merge-safe: only seeds when absent; always
- *  refreshes the cwd trust. */
+/** Seed an isolated profile's top-level onboarding state and the current
+ * project's trust decision. Other projects belong to the source profile. */
 function seedAndTrustClaudeState(
   statePath: string,
   workingDir: string,
@@ -3353,38 +3352,60 @@ function seedAndTrustClaudeState(
   seedFrom: string = join(homedir(), '.claude.json'),
 ): void {
   try {
-    let data: Record<string, any> = {};
-    if (existsSync(statePath)) {
-      try { data = JSON.parse(readFileSync(statePath, 'utf-8')); } catch { data = {}; }
-    } else {
-      try {
-        const g = JSON.parse(readFileSync(seedFrom, 'utf-8')) as Record<string, any>;
-        const { projects: _drop, ...top } = g;
-        data = top;
-      } catch { data = {}; }
-    }
-    if (!data.projects || typeof data.projects !== 'object') data.projects = {};
-    // Onboarding gate: Claude Code holds the FIRST launch on a one-time
-    // theme/onboarding selection until `hasCompletedOnboarding:true` is on the
-    // top level of .claude.json. The seed above copies it from the host's
-    // global ~/.claude.json — but a CLEAN environment (fresh sandbox, e.g.
-    // core-only in riff, or any box that never ran Claude globally) has no
-    // global file to copy it from, so the redirected CLAUDE_CONFIG_DIR session
-    // would stick on that first-frame selection until a human clears it once.
-    // Force it here (idempotent, top-level) so a headless/programmatic first
-    // launch never blocks on interactive onboarding — same intent as the
-    // per-cwd trust-dialog acceptance below. If the seed/global already set it,
-    // this is a no-op.
-    data.hasCompletedOnboarding = true;
-    let canonical = workingDir;
-    try { canonical = realpathSync(workingDir); } catch { /* cwd may not exist yet */ }
-    const entry = data.projects[canonical] && typeof data.projects[canonical] === 'object'
-      ? data.projects[canonical]
-      : (data.projects[canonical] = {});
-    entry.hasTrustDialogAccepted = true;
-    writeFileSync(statePath, JSON.stringify(data, null, 2), { mode: 0o600 });
-  } catch (e) {
-    log(`[read-isolation] WARN seed .claude.json failed: ${(e as Error).message}`);
+    const canonical = realpathSync(workingDir);
+    updateClaudeStateFile(statePath, (current, { rebuilt }) => {
+      // The source can contribute top-level onboarding state and this one
+      // project's decision. Other projects remain private to the source.
+      let source: Record<string, any> = {};
+      let allowChatDefault = true;
+      if (current?.projects?.[canonical]?.hasTrustDialogAccepted !== false) {
+        try {
+          const parsed = JSON.parse(readFileSync(seedFrom, 'utf8'));
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid source state');
+          source = parsed;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            // Onboarding is independent of trust. An unreadable source must
+            // never turn a formerly negative decision into a default grant.
+            allowChatDefault = false;
+            log('[read-isolation] Claude source state could not be read; leaving missing project trust unset');
+          }
+        }
+      }
+      const { projects: sourceProjects, ...top } = source;
+      const data = current ?? top;
+      // This profile owns the file, so a wrong-shaped projects map is rebuilt
+      // in place rather than left to trap Claude on its theme/error screens.
+      // A missing map is normal first-seed initialization, not a repair.
+      let repaired = rebuilt;
+      if (data.projects === undefined) {
+        data.projects = {};
+      } else if (!data.projects || typeof data.projects !== 'object' || Array.isArray(data.projects)) {
+        data.projects = {};
+        repaired = true;
+      }
+      let entry = data.projects[canonical];
+      if (entry === undefined) {
+        entry = {};
+      } else if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        // A non-object entry cannot carry a trust decision; replace just that
+        // slot and keep every other project's state.
+        entry = {};
+        data.projects[canonical] = entry;
+        repaired = true;
+      }
+      const sourceDecision = sourceProjects?.[canonical]?.hasTrustDialogAccepted;
+      const previous = entry.hasTrustDialogAccepted;
+      if (sourceDecision === false) entry.hasTrustDialogAccepted = false;
+      else if (previous === undefined && (sourceDecision === true || (allowChatDefault && !isWorkflowWorker()))) entry.hasTrustDialogAccepted = true;
+      // A repair must be persisted even when the seed itself changes nothing.
+      if (!repaired && current?.hasCompletedOnboarding === true && entry.hasTrustDialogAccepted === previous) return;
+      if (entry.hasTrustDialogAccepted !== undefined) data.projects[canonical] = entry;
+      data.hasCompletedOnboarding = true;
+      return data;
+    }, { repairCorruptTarget: true });
+  } catch (error) {
+    log(`[read-isolation] WARN seed .claude.json failed: ${(error as Error).message}`);
   }
 }
 
@@ -4626,8 +4647,13 @@ function probeStartupBlocker(source: string): CliStartupBlocker | null {
     // causes is the same story, so do not tell it twice.
     const alreadyExplained = blocker.kind === 'folder_trust'
       && reportedUntrustedWorkspaces.has(blocker.folder ?? lastInitConfig.workingDir);
-    if (!alreadyExplained) {
-      send({ type: 'user_notify', message: startupBlockerNotice(blocker), turnId: currentBotmuxTurnId });
+    // A workflow node has no thread reader for that earlier notice: its pool
+    // needs this structured event to fail the node instead of waiting out the
+    // node deadline, so it is always sent there.
+    if (!alreadyExplained || isWorkflowWorker()) {
+      send({ type: 'user_notify', kind: 'cli_startup_blocked',
+        startupBlocker: { kind: blocker.kind, rule: blocker.rule, ...(blocker.folder ? { folder: blocker.folder } : {}) },
+        message: startupBlockerNotice(blocker), turnId: currentBotmuxTurnId });
     }
   }
   return blocker;
@@ -12328,7 +12354,7 @@ function initializeFinalOutputHandoff(cfg: Extract<DaemonToWorker, { type: 'init
       context: origin => workerSessionEventScope?.replayEnvelope(origin) ?? origin,
       error: error => log(`Universal output recovery pending: ${String(error)}`),
     });
-    if (cfg.finalOutputHandoff.admitNew && cfg.turnId) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: cfg.larkAppId, sessionId: cfg.sessionId, turnId: cfg.turnId });
+    if (cfg.finalOutputHandoff.admitNew && !cfg.finalOutputHandoff.frozenImOnly && cfg.turnId) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: cfg.larkAppId, sessionId: cfg.sessionId, turnId: cfg.turnId });
     universalOutputHandoff.start();
   }
   finalHandoffAdmissionEnabled = cfg.finalOutputHandoff?.version === 1 && cfg.finalOutputHandoff.admitNew === true;
@@ -14768,6 +14794,7 @@ function bridgeIngest(): void {
   // signal — read it here (event-driven, once per record) instead of scraping
   // the TUI. The queue already skips it as an assistant reply.
   maybeEmitStructuredRateLimit(result.events);
+  maybeFailWorkflowOnGoalAbort(result.events);
   observeModelFallbackEvents(bridgeJsonlPath, result.events);
   const cliRecap = observeCurrentCliRecap(result.events);
   if (cliRecap) send({ type: 'cli_recap', ...cliRecap });
@@ -14783,6 +14810,19 @@ function bridgeIngest(): void {
       reconcileClaudeOpenTurnWatchdogAfterIngest();
     }
   }
+}
+
+const workflowGoalAbortWatch = new ClaudeGoalAbortWatch();
+/** A workflow node drives Claude through a single `/goal`. Once Claude clears
+ *  that goal on an unrecoverable API error nothing will write the manifest, so
+ *  report a worker error now (the pool fails the node with this as the cause)
+ *  instead of idling until the node deadline. */
+function maybeFailWorkflowOnGoalAbort(events: readonly TranscriptEvent[]): void {
+  if (!isWorkflowWorker() || workflowFinalOutputSent) return;
+  const message = workflowGoalAbortWatch.observe(events);
+  if (!message) return;
+  log(`Workflow goal cleared by the CLI; failing the node: ${message}`);
+  send({ type: 'error', message, goalAborted: true });
 }
 
 /** Scan newly-drained Claude transcript events for a structured rate-limit
@@ -18825,6 +18865,11 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
     const fallbackKind = structuredFallbackKind(
       gateInput, nextBoundaryMs, markers, adoptMode, structuredBridgeIs('codex'), replyDeliveryMode(),
     );
+    const requiresReply = !turn.isLocal && frozenImReplyTurn(turn.turnId);
+    // For an admitted human reply, only the host's exact final ledger can
+    // suppress publication. Transcript/send-marker heuristics also see progress.
+    const durableAnswer = requiresReply && fallbackKind === 'final'
+      && (turn.terminalStatus ?? 'completed') === 'completed' && !isBridgeNothingToSendFinal(turn.finalText);
     if ((turn.finalText ?? '').trim().length === 0) {
       const attributableMarkers = attributableBridgeReplyMarkers(
         gateInput,
@@ -18881,8 +18926,8 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
     if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
     }
-    if (!content) continue;
-    if (shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
+    if (!content || (fallbackKind === 'empty_completed' && requiresReply)) continue;
+    if (!durableAnswer && shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
       log(`Structured bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`
         + (fallbackKind === 'failed' ? `; execution remains failed (${turn.terminalErrorCode ?? 'worker_turn_failed'})` : ''));
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
@@ -18982,7 +19027,9 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
       turn.terminalStatus ?? 'completed',
       turn.terminalErrorCode,
       turn.dispatchAttempt,
-      nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+      nothingToSendTurns.has(turn) ? 'nothing_to_send'
+        : !turn.isLocal && !turn.finalText?.trim() && frozenImReplyTurn(turn.turnId) ? 'empty_answer'
+        : undefined,
     );
   }
   retireStructuredTurnAttribution(ready.flatMap(turn => [...(turn.supersededTurns ?? []), turn]));
@@ -23512,7 +23559,9 @@ function handleVisibleStartupInteraction(data: string): boolean {
   // project/plugin hooks owned outside BotMux. The operator can safely choose
   // "Continue without trusting" through the Web Terminal when Codex presents
   // its Hooks review menu.
-  if (lastInitConfig?.existingAppServerEndpoint) return false;
+  // A workflow reports an interactive trust dialog to its owner as blocked.
+  // A scheduled Enter could accept it before the pool receives that notice.
+  if (lastInitConfig?.existingAppServerEndpoint || isWorkflowWorker()) return false;
 
   // Checked before the trust latch: the migration picker follows the trust
   // dialog on a first launch. Observation only — the chunk is not consumed.
@@ -26782,6 +26831,10 @@ function scheduleSubmitFailureNotify(
   // With botmux's SessionStart hook armed, that signal and the transcript are
   // the only arbiters (see decideSessionStartGatedSubmitWarning).
   const sessionStartGated = readyGate.isArmed;
+  const isPassedBySuccessor = (): boolean => structuredTarget
+    && !!bridgeTurnId
+    && typeof codexBridgeQueue?.isPassedBySuccessor === 'function'
+    && codexBridgeQueue.isPassedBySuccessor(bridgeTurnId, turnIdentity?.dispatchAttempt);
   const runDeferredRecheck = async (chainIsCurrent: () => boolean): Promise<void> => {
     const settlement = await settleDeferredSubmitConfirmation(codexBridgeQueue, {
       turnId: bridgeTurnId,
@@ -26790,12 +26843,18 @@ function scheduleSubmitFailureNotify(
       structuredTarget,
       recheck,
       usageLimitDetected: () => usageLimitTracker.detectedThisTurn(turnSeq),
-      activityEvidence: () => submitActivityEvidenceSince(
-        activityBaselineMs,
-        evidenceTurnId
-          ? { turnId: evidenceTurnId, dispatchAttempt: turnIdentity?.dispatchAttempt }
-          : turnIdentity,
-      ),
+      activityEvidence: () => {
+        const evidence = submitActivityEvidenceSince(
+          activityBaselineMs,
+          evidenceTurnId
+            ? { turnId: evidenceTurnId, dispatchAttempt: turnIdentity?.dispatchAttempt }
+            : turnIdentity,
+        );
+        // Once a later input has passed this mark in the transcript, global
+        // PTY output comes from the successor turn and must not keep this
+        // dead attempt's recheck alive.
+        return isPassedBySuccessor() && evidence === 'pty-output' ? undefined : evidence;
+      },
       isCurrent: combineSubmitCurrentFences(chainIsCurrent, deferredAttemptIsCurrent),
     });
     // Replacing a same-key timer invalidates an already-running callback. The
@@ -27170,8 +27229,10 @@ function scheduleSubmitFailureNotify(
         return cliAdapter.busyPattern.test(busyProbeRegion(submitDiagnosisScreen));
       } catch { return false; }
     })();
+    const passedBySuccessor = isPassedBySuccessor();
     if (
-      shouldWaitThroughBusyTurn({
+      !passedBySuccessor
+      && shouldWaitThroughBusyTurn({
         busy: busyNow,
         diagnosisReason: submitDiagnosis.reason,
         waitsSoFar: busySilenceExtra,
@@ -27199,7 +27260,8 @@ function scheduleSubmitFailureNotify(
       log(`Deferred recheck: ${gated.reason} — PTY activity is not submit evidence. preview="${preview}"`);
     }
     if (
-      submitDiagnosis.reason === 'still_active'
+      !passedBySuccessor
+      && submitDiagnosis.reason === 'still_active'
       && !pendingInputGone
       && !sessionStartGated
       && activeSilenceExtra < SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA
@@ -37443,6 +37505,11 @@ async function spawnCliBody(
   // (would otherwise swallow the fresh session's first turn).
   if (zeroPromptTerminalSync()) {
     codexBridgeQueue.setLocalTurns(true, Date.now());
+    if (cfg.cliId === 'antigravity') {
+      codexBridgeQueue.setWholeInputPassing(true, { timestampGranularityMs: 1_000 });
+    } else if (cfg.cliId === 'codex') {
+      codexBridgeQueue.setWholeInputPassing(true);
+    }
   }
   const spawnBridge = bridgeSpecFor(cfg.cliId)?.spawn;
   if (cfg.cliId === 'hermes') {
@@ -42664,7 +42731,7 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
-  outputDisposition?: 'nothing_to_send' | 'boundary_unobserved' | 'explicit_final_delivered',
+  outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered',
   retryable?: boolean,
   /** Backend-supplied completion instant (codex-app's runner timestamps its own
    *  finals). Clamped to now by the clock; absent means "use this instant". */
@@ -42847,6 +42914,13 @@ function publishCliInputBacklog(): void {
   send({ type: 'cli_input_backlog', ...backlog });
 }
 
+function frozenImReplyTurn(turnId: string): boolean {
+  const appId = lastInitConfig?.larkAppId;
+  const dataDir = process.env.SESSION_DATA_DIR;
+  return !!(lastInitConfig?.finalOutputHandoff?.version === 2 && appId && dataDir && sessionId
+    && new TurnSendLedger(dataDir).requiresOriginalImReply({ larkAppId: appId, sessionId, turnId }));
+}
+
 function send(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): void {
   // A native conversation ID is read from the live CLI when the callback runs.
   // Pollers and timers keep the binding they were created under, and an
@@ -42877,7 +42951,10 @@ function send(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): void {
   }
   if (msg.type === 'cli_session_id') observeContractNativeSession(msg.cliSessionId);
   const payload = sessionEventMetadata(workerIpcPayload(msg), origin);
-  if (payload.type === 'final_output' && universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew === true) universalOutputHandoff.publish(payload);
+  if (payload.type === 'final_output' && universalOutputHandoff
+    && (lastInitConfig?.finalOutputHandoff?.frozenImOnly
+      ? frozenImReplyTurn(payload.turnId)
+      : lastInitConfig?.finalOutputHandoff?.admitNew === true)) universalOutputHandoff.publish(payload);
   else process.send?.(payload);
   if (isWorkflowWorker() && payload.type === 'final_output') workflowFinalOutputSent = true;
 }
@@ -42902,7 +42979,7 @@ function acknowledgeTurnInputCommitted(
   durablePrimaryInbox?: true,
 ): void {
   if (!turnId) return;
-  if (universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew && lastInitConfig.larkAppId && process.env.SESSION_DATA_DIR) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: lastInitConfig.larkAppId, sessionId: sessionId!, turnId, dispatchAttempt });
+  if (universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew && !lastInitConfig.finalOutputHandoff.frozenImOnly && lastInitConfig.larkAppId && process.env.SESSION_DATA_DIR) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: lastInitConfig.larkAppId, sessionId: sessionId!, turnId, dispatchAttempt });
   ordinaryImTurnDedupe.commit(turnId);
   send({
     type: 'turn_input_committed',
@@ -42913,7 +42990,7 @@ function acknowledgeTurnInputCommitted(
 }
 
 function acknowledgeTurnInputReceived(turnId?: string): void {
-  if (turnId && universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew && lastInitConfig.larkAppId && process.env.SESSION_DATA_DIR) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: lastInitConfig.larkAppId, sessionId: sessionId!, turnId });
+  if (turnId && universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew && !lastInitConfig.finalOutputHandoff.frozenImOnly && lastInitConfig.larkAppId && process.env.SESSION_DATA_DIR) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: lastInitConfig.larkAppId, sessionId: sessionId!, turnId });
   if (turnId) send({ type: 'turn_input_received', turnId });
 }
 
