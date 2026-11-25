@@ -275,7 +275,7 @@ const submit = () => {
   else if (text.startsWith('LONGTOOL')) { toolTurn(text, Number(text.split(/\\s+/)[1]) || 20000, 'done'); return; }
   else if (text.startsWith('HANG')) { toolTurn(text, 0, 'hang'); return; }
   else if (text.startsWith('INTERRUPTED')) { toolTurn(text, 500, 'interrupted'); return; }
-  else if (text.startsWith('FAIL_AFTER_QUIET')) { failTurn(text, 4000); return; }
+  else if (text.startsWith('FAIL_AFTER_QUIET')) { failTurn(text, Number(text.split(/\\s+/)[1]) || 4000); return; }
   else if (text.startsWith('FAIL')) { failTurn(text, 0); return; }
   else if (text.startsWith('MONITOR:')) {
     const taskId = text.slice('MONITOR:'.length).trim() || 'mon-1';
@@ -489,6 +489,8 @@ export function setupFakeClaude(opts: {
    *  without the directories that hold another `claude`; setup fails if a
    *  shell lookup the way the worker does it still finds one. */
   onPath?: boolean;
+  /** Optional extra environment variables passed to spawned workers. */
+  workerEnv?: Record<string, string>;
 }): Harness {
   mkdirSync(join(homedir(), '.botmux'), { recursive: true, mode: 0o700 });
   const root = mkdtempSync(join(tmpdir(), 'bmx-clear-restore-'));
@@ -636,6 +638,7 @@ child.on('exit', code => process.exit(code ?? 1));
           SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId,
           LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
           ...pathEnv,
+          ...opts.workerEnv,
         }),
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       };

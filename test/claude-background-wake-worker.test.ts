@@ -733,4 +733,95 @@ describe('worker foldBackgroundUpdates: non-terminal Monitor mid-stream gating &
     // Sibling scan floor stayed anchored to original Monitor launch (not jumped forward!).
     expect(hHuman.scope.backgroundStopScanSinceMs).toBe(initialScanSince);
   });
+
+  it('keeps Scenario 3A late-recovery anchored on the originating turn (CoT key, cotHoldForBackground, launched Monitor anchor) and preserves deferredTerminalTurnStarts across Loop 2 rollbacks', () => {
+    const base = Date.now() + 1_000;
+    const ev = makeTurnEvents(base);
+
+    // 1. Scenario 3A late-recovery (#3810) x folded Monitor updates (#3823):
+    const h = createHarness({ replyDelivery: 'transcript', foldBackgroundUpdates: true });
+    // Non-durable turn (dispatchAttempt: undefined) can pop at a bounded unobserved idle boundary.
+    h.queue.mark('om_1', 'watch late', base, 'watch late');
+    // Turn emits interim text (no stop_reason / no turn_duration) and launches bounded Monitor m1.
+    h.feed([
+      { ...ev.user('u1', 100, 'watch late'), parentUuid: null } as TranscriptEvent,
+      { ...ev.monitorAck('ack-m1', 200, 'm1', false), parentUuid: 'u1' } as TranscriptEvent,
+      {
+        type: 'assistant', uuid: 'a1-interim', parentUuid: 'ack-m1', timestamp: new Date(base + 300).toISOString(),
+        isSidechain: false, message: { role: 'assistant', stop_reason: null, content: [{ type: 'text', text: '正在盯构建' }] },
+      } as TranscriptEvent,
+    ], false);
+    // Pop at bounded unobserved idle boundary -> emits om_1 and records recentUnobservedTurn (Scenario 3A).
+    h.emitReadyTurns({ explicitTerminalOnly: false });
+    expect(h.finals().map(f => f.turnId)).toEqual(['om_1']);
+    expect(h.scope.thinkingTurnKey).toBe('om_1|');
+
+    // Late record re-attaches via Scenario 3A (`late-recovery-a2-late`) and also launches Monitor m2.
+    h.feed([
+      {
+        type: 'assistant', uuid: 'a2-late', parentUuid: 'a1-interim', timestamp: new Date(base + 2_000).toISOString(),
+        isSidechain: false, message: { role: 'assistant', stop_reason: null, content: [{ type: 'text', text: '补充最终结论' }] },
+      } as TranscriptEvent,
+      { ...ev.monitorAck('ack-m2', 2_100, 'm2', false), parentUuid: 'a2-late' } as TranscriptEvent,
+    ], false);
+    // Confirm Scenario 3A actually synthesized `late-recovery-a2-late`!
+    expect(h.queue.peek().some(t => t.turnId === 'late-recovery-a2-late')).toBe(true);
+    // thinkingTurnKey must stay anchored to om_1| (NOT 'late-recovery-a2-late|'),
+    // hasActiveNonLocalTurn must stay false (so backgroundCotHold stays true!),
+    // and Monitor m2 must anchor to om_1 (NOT synthetic late-recovery-a2-late)!
+    expect(h.scope.thinkingTurnKey).toBe('om_1|');
+    expect(h.queue.hasActiveNonLocalTurn()).toBe(false);
+    expect(h.scope.backgroundCotHold).toBe(true);
+    expect(h.queue.backgroundTaskAnchorTurnIds(['m2'])).toEqual(['om_1']);
+
+    // Finish late-recovery, then fire a non-terminal wake from m2 -> CoT still streams into om_1|!
+    h.feed([ev.duration('d-late', 2_200)]);
+    expect(h.finals().some(f => f.turnId === 'late-recovery-a2-late' && f.replyTurnId === 'om_1')).toBe(true);
+    const thinkingsBeforeMon = h.thinkings().length;
+    h.feed([
+      ev.notice('n-m2', 5_000, '<task-notification>\n<task-id>m2</task-id>\n<result>m2 tick</result>\n</task-notification>'),
+      ev.thinking('w-m2-th', 5_100, 'm2 仍在运行'),
+      ev.text('w-m2-tx', 5_200, '继续等待 m2'),
+      ev.duration('d-m2', 5_300),
+    ]);
+    expect(h.finals().map(f => f.content)).not.toContain('继续等待 m2');
+    expect(h.thinkings().length).toBeGreaterThan(thinkingsBeforeMon);
+    const latestCot = h.thinkings().at(-1);
+    expect(latestCot).toMatchObject({ turnId: 'om_1' });
+    expect((latestCot?.entries as Array<{ text?: string }>).some(e => e.text === 'm2 仍在运行')).toBe(true);
+
+    // 2. Loop 2 rollback preserves deferredTerminalTurnStarts for a suppressed Monitor wake:
+    const hRollback = createHarness({ zeroPrompt: true, replyDelivery: 'transcript', foldBackgroundUpdates: true });
+    hRollback.scope.emittedTurnTerminals = { release: () => {} };
+    let failOnce = true;
+    const origEmit = hRollback.scope.emitTurnTerminal as (...args: any[]) => void;
+    hRollback.scope.emitTurnTerminal = (turnId: string, ...rest: any[]) => {
+      if (failOnce && turnId === 'om_1') {
+        failOnce = false;
+        throw new Error('transient IPC error');
+      }
+      return origEmit(turnId, ...rest);
+    };
+    hRollback.queue.mark('om_1', 'watch rollback', base, 'watch rollback', 1);
+    // Ingest om_1 + suppressed Monitor wake together in one batch (without emitting yet).
+    hRollback.feed([
+      ev.user('u1', 100, 'watch rollback'),
+      ev.monitorAck('ack-m1', 200, 'm1', false),
+      ev.text('a1', 300, 'started'),
+      ev.duration('d1', 400),
+      ev.notice('n1', 5_000, '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>'),
+      ev.text('w1', 5_100, 'waiting'),
+      ev.duration('dw1', 5_200),
+    ], false);
+    expect(hRollback.terminalStarts()).toHaveLength(0);
+    // First emit throws in Loop 2 on om_1 -> restores [om_1, local-headless-w1].
+    expect(() => hRollback.emitReadyTurns({ explicitTerminalOnly: true })).toThrow('transient IPC error');
+    // Operator toggles foldBackgroundUpdates OFF before retry -> JIT terminal_turn_started MUST still fire before final_output!
+    (hRollback.scope.setFoldBackgroundUpdatesLive as (v: boolean) => void)(false);
+    hRollback.emitReadyTurns({ explicitTerminalOnly: true });
+    const startIdx = hRollback.sent.findIndex(m => m.type === 'terminal_turn_started' && m.turnId === 'local-headless-w1');
+    const finalIdx = hRollback.sent.findIndex(m => m.type === 'final_output' && m.turnId === 'local-headless-w1');
+    expect(startIdx).toBeGreaterThanOrEqual(0);
+    expect(finalIdx).toBeGreaterThan(startIdx);
+  });
 });

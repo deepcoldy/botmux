@@ -22,6 +22,7 @@ import {
   backgroundTaskSettledIds,
   hasTranscriptRole,
   isClaudeTurnTerminalEvent,
+  isClaudeUserInterruptEvent,
   isMeaningfulQueuedCommand,
   isMeaningfulUserEvent,
   isScheduledTurnStartEvent,
@@ -247,7 +248,7 @@ export function claudeInterruptedWork(
 
     const isUser = hasTranscriptRole(ev, 'user');
     const isAssistant = hasTranscriptRole(ev, 'assistant');
-    if (isUser && typeof (ev as { interruptedMessageId?: unknown }).interruptedMessageId === 'string') {
+    if (isClaudeUserInterruptEvent(ev)) {
       turnOpen = false;
     } else if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev) || isScheduledTurnStartEvent(ev)) {
       turnOpen = true;

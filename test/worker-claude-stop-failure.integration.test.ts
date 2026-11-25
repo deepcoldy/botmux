@@ -144,12 +144,32 @@ describe.skipIf(!runnable)('Claude StopFailure fallback, hook client → daemon 
     expect(g.notices().map(n => n.message)).not.toContain(UNSETTLED_NOTICE);
   }, 120_000);
 
-  it('reports a failure that lands after its turn was already closed', async () => {
-    // The quiet screen mid-turn closes the turn as completed; the API error
-    // that ends the real work afterwards has no turn left to fail.
+  it('holds an open mid-tool turn across a brief quiet pause so the transcript settles the failure directly', async () => {
+    // Under default bounds, a 4s quiet pause mid-tool does not prematurely pop
+    // the open turn; the trailing API error settles the turn directly as failed.
     const h = setup({ turnMs: 1_000 });
     const g = await startWorker(h);
     const prompt = 'FAIL_AFTER_QUIET long task';
+    g.child.send({ type: 'message', content: prompt, turnId: 'om_long_task_held' } satisfies DaemonToWorker);
+    await g.waitFor(() => h.failedAt(prompt) !== undefined, 'the turn to end on its API error', 60_000);
+    await g.waitFor(() => terminalsOf(g, 'om_long_task_held').length > 0, 'the transcript terminal');
+    expect(terminalsOf(g, 'om_long_task_held')).toEqual([expect.objectContaining({
+      status: 'failed', errorCode: 'provider_server_error', retryable: true,
+    })]);
+
+    expect(await runHookClient(h, 'om_long_task_held')).toBe(0);
+    await sleep(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS + 2_000);
+    expect(terminalsOf(g, 'om_long_task_held')).toHaveLength(1);
+    expect(g.notices().map(n => n.message)).not.toContain(UNSETTLED_NOTICE);
+  }, 120_000);
+
+  it('reports a failure that lands after its turn was already closed', async () => {
+    // Once the bounded open-turn watchdog expires on a prolonged quiet screen,
+    // the turn closes as completed; the API error that ends the real work
+    // afterwards has no open turn left to fail, so StopFailure surfaces it.
+    const h = setup({ turnMs: 1_000, workerEnv: { BOTMUX_TEST_CLAUDE_OPEN_TURN_INFLIGHT_MS: '1000' } });
+    const g = await startWorker(h);
+    const prompt = 'FAIL_AFTER_QUIET 7000 long task';
     g.child.send({ type: 'message', content: prompt, turnId: 'om_long_task' } satisfies DaemonToWorker);
     await g.waitFor(() => h.failedAt(prompt) !== undefined, 'the turn to end on its API error', 60_000);
     await sleep(2_000);

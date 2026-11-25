@@ -487,7 +487,16 @@ describe('source-structure guards (no injectable seam)', () => {
   // queue/ask 只能转发同帧早先算好的三态局部量；dispatch launch 把直接触发者标成 bot，且 callerUnionId 证词绝不喂给
   // evaluateBotTalk。来历：#1145、#2039。
   it('every trusted caller stamps a tri-state sender type and never vouches for a bot as a person', () => {
-    const inbound = callArgs(daemonSource, 'trustedCallerForInboundTurn');
+    const allCalls = callArgs(daemonSource, 'trustedCallerForInboundTurn');
+    // Source-turn recovery is not an inbound sender classification. Its human
+    // identity comes from the daemon-owned registry, with behavioural refusal
+    // coverage in task-continuation-caller.test.ts. Keep it separate so this
+    // guard still rejects a literal false at ANY actual IM entry.
+    const sourcePrincipalCalls = allCalls.filter(args => args[4] === 'sourceTurnId');
+    expect(sourcePrincipalCalls).toEqual([
+      ['larkAppId', 'sourceOpenId', 'undefined', 'false', 'sourceTurnId'],
+    ]);
+    const inbound = allCalls.filter(args => args[4] !== 'sourceTurnId');
     expect(inbound).toHaveLength(6);
     // The card-click entry has no platform sender_type. It must pass the
     // card-click predicate (peer cross-ref, identity-cache bot/app, and the

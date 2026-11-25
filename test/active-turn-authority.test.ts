@@ -8,12 +8,62 @@ const humanA = {
   senderType: 'user' as const,
 };
 
+const continuationCaller = (openId: string, sourceTurnId: string, sourceSessionId = 'source-session') => ({
+  requestUserOpenId: 'ou_reply_bot',
+  requestUserUnionId: 'on_reply_bot',
+  requestLarkAppId: 'cli_app',
+  senderType: 'bot' as const,
+  taskContinuation: {
+    appId: 'cli_app',
+    openId,
+    sourceSessionId,
+    sourceTurnId,
+  },
+});
+
 describe('ActiveTurnAuthority', () => {
   it('normalizes an omitted interactive source', () => {
     expect(sameTrustedPrincipal(
       humanA,
       { ...humanA, source: 'interactive' },
     )).toBe(true);
+  });
+
+  it('treats the exact source task as part of a peer-bot continuation principal', () => {
+    const taskA = continuationCaller('ou_human_a', 'om_source_a');
+    expect(sameTrustedPrincipal(taskA, { ...taskA, taskContinuation: { ...taskA.taskContinuation } })).toBe(true);
+    expect(sameTrustedPrincipal(taskA, continuationCaller('ou_human_b', 'om_source_a'))).toBe(false);
+    expect(sameTrustedPrincipal(taskA, continuationCaller('ou_human_a', 'om_source_b'))).toBe(false);
+    expect(sameTrustedPrincipal(taskA, continuationCaller('ou_human_a', 'om_source_a', 'other-session'))).toBe(false);
+    expect(sameTrustedPrincipal(taskA, {
+      ...taskA,
+      taskContinuation: { ...taskA.taskContinuation, appId: 'other_app' },
+    })).toBe(false);
+    expect(sameTrustedPrincipal(taskA, {
+      ...taskA,
+      taskContinuation: undefined,
+    })).toBe(false);
+  });
+
+  it('does not grant active authority across source tasks from the same reply bot', () => {
+    const authority = new ActiveTurnAuthority();
+    const taskA = continuationCaller('ou_human_a', 'om_source_a');
+    const taskB = continuationCaller('ou_human_b', 'om_source_b');
+    authority.reserve({ turnId: 'om_reply_a', caller: taskA });
+    authority.markStarted({ turnId: 'om_reply_a', caller: taskA });
+
+    expect(authority.blocks({ turnId: 'om_reply_b', caller: taskB })).toBe(true);
+    expect(authority.reserve({ turnId: 'om_reply_b', caller: taskB })).toBe(false);
+    expect(authority.identity()).toMatchObject({ turnId: 'om_reply_a', caller: taskA });
+  });
+
+  it('freezes the nested continuation tuple when reserving authority', () => {
+    const authority = new ActiveTurnAuthority();
+    const caller = continuationCaller('ou_human_a', 'om_source_a');
+    authority.reserve({ turnId: 'om_reply_a', caller });
+    caller.taskContinuation.sourceTurnId = 'om_mutated';
+
+    expect(authority.identity().caller?.taskContinuation?.sourceTurnId).toBe('om_source_a');
   });
 
   it('keeps the complete caller + turn tuple immutable across later reservations', () => {

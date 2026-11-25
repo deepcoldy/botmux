@@ -139,6 +139,9 @@ async function runCase(name: string, options: Record<string, any> = {}) {
           ds, promptContent:'replacement task', parsed:{messageId:'replacement-turn',content:'replacement task',mentions:[]},
           codexAppApplicationContext:undefined, codexAppMessageContext:undefined, attachments:[],
           followUpSender:{openId:senderId,type:'user'}, codexAppSteerable:true, threadTrustedCaller:replacementCaller,
+          // Ordinary replacement has no continuation; use the same caller
+          // selected by the enclosing handler, including explicit absence.
+          turnTrustedCaller:replacementCaller,
           stagePendingRepoSetup:(session: any, args: any)=>{session.session.pendingRepoSetup=args;},
           markIngressAdmitted:noop,ctx:{},sessionReply:async()=>'',tr:(key: string)=>key,
           localeForBot:()=> 'en',larkAppId:'test-app',anchor:'root-message',
