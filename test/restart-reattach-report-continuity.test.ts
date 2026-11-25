@@ -1266,8 +1266,13 @@ describe('historical follow-up reply delivery', () => {
   });
   function realHistoricalReplyHarness(overrides: Record<string, unknown> = {}) {
     const effects: string[] = [];
+    const deliveryReceipts: unknown[] = [];
     const ds: any = { larkAppId: 'a', chatId: 'oc_c', adoptedFrom: {}, session: { sessionId: 's', status: 'active', cliId: 'claude-code' } };
-    const worker: any = { connected: true };
+    const worker: any = { connected: true, killed: false, send: (msg: unknown) => {
+      deliveryReceipts.push(msg);
+      effects.push('worker-delivery-receipt');
+      return true;
+    } };
     ds.worker = worker;
     const contractWorker: any = { workerId: 'w', generation: 1 };
     const context: any = {
@@ -1306,14 +1311,14 @@ describe('historical follow-up reply delivery', () => {
       type: 'absorbed_reply', turnId: 'om_fold', answer: 'answer', replyUuid: 'a1', source: 'text', turnReply: true,
       sessionContract: context,
     };
-    return { effects, handle, message };
+    return { effects, deliveryReceipts, handle, message };
   }
 
   it('does not acknowledge a historical reply before its POST has completed', async () => {
     let resolvePost!: (messageId: string) => void;
     let postStarted!: () => void;
     const started = new Promise<void>(resolve => { postStarted = resolve; });
-    const { effects, handle, message } = realHistoricalReplyHarness({
+    const { effects, deliveryReceipts, handle, message } = realHistoricalReplyHarness({
       scopedReply: () => new Promise<string>(resolve => {
         effects.push('post-start');
         resolvePost = resolve;
@@ -1327,15 +1332,38 @@ describe('historical follow-up reply delivery', () => {
     effects.push('post-resolve');
     resolvePost('om_reply');
     await pending;
-    expect(effects).toEqual(['post-start', 'post-resolve', 'carrier', 'receipt', 'drain-finished', 'ack']);
+    expect(effects).toEqual(['post-start', 'post-resolve', 'carrier', 'receipt', 'worker-delivery-receipt', 'drain-finished', 'ack']);
+    expect(deliveryReceipts).toEqual([{ type: 'absorbed_reply_delivered', turnId: 'om_fold', replyUuid: 'a1' }]);
   });
 
   it('does not acknowledge a historical reply whose delivery did not complete', async () => {
-    const { effects, handle, message } = realHistoricalReplyHarness({
+    const { effects, deliveryReceipts, handle, message } = realHistoricalReplyHarness({
       deliverWithRetry: async () => ({ delivered: false }),
     });
     await expect(handle(message)).rejects.toThrow('Follow-up reply delivery did not complete');
     expect(effects).not.toContain('ack');
+    expect(deliveryReceipts).toEqual([]);
+  });
+
+  it('does not confirm delivery after the real Lark retry backoff is exhausted', async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const { effects, deliveryReceipts, handle, message } = realHistoricalReplyHarness({
+        scopedReply: async () => { attempts++; throw new Error('Lark unavailable'); },
+      });
+      const pending = handle(message);
+      const rejection = expect(pending).rejects.toThrow('Follow-up reply delivery did not complete');
+      await vi.runAllTimersAsync();
+      await rejection;
+      expect(attempts).toBeGreaterThan(1);
+      expect(effects).not.toContain('ack');
+      expect(effects).not.toContain('carrier');
+      expect(effects).not.toContain('receipt');
+      expect(deliveryReceipts).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

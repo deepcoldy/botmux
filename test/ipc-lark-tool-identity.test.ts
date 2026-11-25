@@ -94,6 +94,18 @@ function useRunAsTurn(allowedUsers: string[]) {
   return botConfig;
 }
 describe('session application identity route', () => {
+  it.each(['bot', 'user'])('revokes credential export if protection is enabled during %s resolution', async mode => {
+    const resolve = async () => {
+      session.session.protectedResults = true;
+      return 'late-protected-token';
+    };
+    if (mode === 'bot') botToken.mockImplementation(resolve);
+    else vi.mocked(tokens.resolveUserToken).mockImplementation(resolve);
+    const response = await request(mode);
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ ok: false, error: 'protected_result_credential_export_denied' });
+  });
+
   it.skipIf(process.platform !== 'linux')('accepts a signed original peer through the trusted loopback proxy and binds it to the live turn', async () => {
     const cliRoot: ChildProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
       stdio: 'ignore',
@@ -639,6 +651,69 @@ describe('session application identity route', () => {
     expect(response.status).toBe(409);
     expect(await response.text()).not.toContain('late-user-token');
   });
+  it.each([
+    ['application', () => { session.larkAppId = 'cli_other'; }],
+    ['chat', () => { session.chatId = 'oc_other'; }],
+    ['stored chat', () => { session.session.chatId = 'oc_other'; }],
+    ['session', () => { session.session.sessionId = 'other-session'; }],
+    ['headless metadata', () => { session.session.headless = { id: headlessId, source: 'cli' }; }],
+    ['disabled transport', () => {
+      vi.mocked(bots.getBot).mockReturnValue({ config: {
+        larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', apiOnly: true,
+      } } as any);
+    }],
+    ['disabled binding', () => {
+      vi.mocked(bots.getBot).mockReturnValue({ config: {
+        larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: false,
+      } } as any);
+    }],
+    ['missing configuration', () => {
+      vi.mocked(bots.getBot).mockImplementation(() => { throw new Error('bot removed'); });
+    }],
+  ] as const)('does not export a user credential after the request target changes: %s', async (_name, change) => {
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      change();
+      return 'late-user-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    expect(body).not.toHaveProperty('credential');
+    expect(JSON.stringify(body)).not.toContain('late-user-token');
+  });
+  it('rejects a managed credential when policy switches to native during resolution', async () => {
+    const managed = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: true,
+      triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'] }) } as any;
+    vi.mocked(bots.getBot).mockReturnValue({ config: managed } as any);
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      vi.mocked(bots.getBot).mockReturnValue({ config: { ...managed,
+        triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities: ['bytecloud'] }),
+      } } as any);
+      return 'late-native-transition-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    expect(JSON.stringify(await response.json())).not.toContain('late-native-transition-token');
+    const native = await request('user');
+    expect(native.status).toBe(200);
+    expect(await native.json()).toMatchObject({ native: true });
+    expect(JSON.stringify(native)).not.toContain('late-native-transition-token');
+  });
+  it('rejects a delegated credential when lark-cli capability is revoked during resolution', async () => {
+    await delegate();
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
+        larkToolBinding: true, triggerUserAuth: { enabled: false, tools: [] },
+      } } as any);
+      return 'late-delegated-policy-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    expect(JSON.stringify(await response.json())).not.toContain('late-delegated-policy-token');
+    const next = await request('user');
+    expect(next.status).not.toBe(200);
+    expect(JSON.stringify(next)).not.toContain('late-delegated-policy-token');
+  });
   it.skipIf(process.platform !== 'linux')('allows a callerless scheduled execution with a scoped delegated user', async () => {
     await delegate();
     delete session.managedTurnOrigin.callerOpenId;
@@ -720,6 +795,18 @@ describe('session application identity route', () => {
     }
     const passthrough = await run(['docs', '+fetch', '--profile=cli_other']); expect(passthrough.code, passthrough.err).toBe(0);
     expect(passthrough.out).toBe('cli_wrong|||wrong-user|docs +fetch --profile=cli_other');
+    // A protected session cannot export either managed or profile credentials.
+    session.session.protectedResults = true;
+    const grants = botToken.mock.calls.length;
+    const userGrants = vi.mocked(tokens.resolveUserToken).mock.calls.length;
+    for (const args of [['docs', '+fetch'], ['docs', '+fetch', '--as=user'], ['docs', '+fetch', '--profile=cli_other']]) {
+      const denied = await run(args);
+      expect(denied.code, denied.err).toBe(77);
+      expect(denied.out).toBe('');
+      expect(denied.err).toContain('protected_result_credential_export_denied');
+    }
+    expect(botToken.mock.calls.length).toBe(grants);
+    expect(vi.mocked(tokens.resolveUserToken).mock.calls.length).toBe(userGrants);
   });
   it('BOTMUX_AS picks one speaker of a multi-speaker turn; the default stays the turn principal after a merge', async () => {
     session.managedTurnOrigin.speakers = [{ openId: 'ou_sender', turnId: 'om_a' }, { openId: 'ou_other', turnId: 'om_turn' }];

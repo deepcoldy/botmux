@@ -37,6 +37,7 @@
  *     call fails with the hook error (hence the guarded install command).
  */
 
+import { answerWithNote } from '../ask-notes.js';
 import type { AskQuestion } from '../ask-types.js';
 import type { HookAskAdapter, ParsedAsk, UnansweredAsk } from './types.js';
 
@@ -88,6 +89,7 @@ function answerLines(
   answersByQuestion: ReadonlyArray<ReadonlyArray<string>>,
   comment: string | null | undefined,
   customAnswers: ReadonlyArray<string | null> | undefined,
+  notes: ReadonlyArray<string | null> | undefined,
 ): string[] {
   const customText = (comment ?? '').trim();
   return questions.map((q, i) => {
@@ -95,7 +97,8 @@ function answerLines(
     // contract); a whole-card text reply stands in for unanswered questions.
     const custom = customAnswers?.[i]?.trim();
     const labels = (answersByQuestion[i] ?? []).map(key => q.options.find(o => o.key === key)?.label ?? key);
-    const answer = custom || (labels.length > 0 ? labels.join(', ') : customText || 'User Skipped');
+    // The lines are English ("A1: …", "User Skipped"), so is the note marker.
+    const answer = custom || (labels.length > 0 ? answerWithNote(labels.join(', '), notes?.[i], 'en') : customText || 'User Skipped');
     return `A${i + 1}: ${answer.replace(/\r\n?/g, '\n')}`;
   });
 }
@@ -121,8 +124,8 @@ const antigravityAdapter: HookAskAdapter = {
     return { questions, raw: payload };
   },
 
-  formatAnswer(answersByQuestion, parsed, comment, customAnswers): string {
-    return deny([ANSWERED_PREAMBLE, ...answerLines(parsed.questions, answersByQuestion, comment, customAnswers)].join('\n'));
+  formatAnswer(answersByQuestion, parsed, comment, customAnswers, notes): string {
+    return deny([ANSWERED_PREAMBLE, ...answerLines(parsed.questions, answersByQuestion, comment, customAnswers, notes)].join('\n'));
   },
 
   formatUnanswered(outcome: UnansweredAsk): string {

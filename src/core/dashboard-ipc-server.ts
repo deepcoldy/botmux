@@ -193,6 +193,8 @@ import {
   CURRENT_EXECUTION_IDENTITY_ROUTE,
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
 } from '../cli/current-execution.js';
+import { isBytedcliOverseasRegion } from '../platform/bytedcli-grant-regions.js';
+import { GRANT_WAIT_CAP_MS } from '../platform/credential-grant-budget.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
 import { configuredCliExecutionMode, sessionCliExecutionInfo } from './cli-execution-mode.js';
 import { getDashboardAdminOpenIds } from '../bot-registry.js';
@@ -667,6 +669,7 @@ import {
 } from './detached-scheduled-identity.js';
 import { noteSenderUnionId } from './platform-credential-source.js';
 import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
+import { ProtectedResultStore } from '../services/protected-result-store.js';
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { chooseTurnSpeaker, governedSpeakers } from './turn-speakers.js';
 import { resolveUserToken } from '../utils/user-token.js';
@@ -676,7 +679,7 @@ import { reasonTag, platformAuthorizeUrl } from './platform-credential-source.js
 import { askPlatformToAuthorize, type PlatformAuthorizationRequestResult } from './platform-authorization-request.js';
 import { hasReason, PLATFORM_WILL_NOT_ISSUE_REASONS } from './refusal-reasons.js';
 import { requestUnattendedAuthorization, noticeUnattendedLapse, clearUnattendedLapse, definitelyNotAuthorized, missingAuthorizationEntries, privateNoticeSender, unattendedTask, unattendedRefusalText, type UnattendedNoticeOutcome, type UnattendedProvider } from './capability-authorization.js';
-import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
+import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, retryMissingRegionalGrant, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -1754,6 +1757,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const blocked = (reason: string) => ({
     schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'current_execution_unverified', reason,
   });
+  const grantDeadline = Date.now() + GRANT_WAIT_CAP_MS;
   let body: unknown;
   try { body = await readBoundedJsonBody(req, 1024, 1000); }
   catch (error) {
@@ -1772,7 +1776,11 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const toolValue = typeof record?.tool === 'string' ? record.tool : '';
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
-  if (!sessionId || !tool || (record?.as !== undefined && typeof record.as !== 'string')) return jsonRes(res, 400, blocked('invalid_request'));
+  const region = record?.region;
+  if (!sessionId || !tool || (record?.as !== undefined && typeof record.as !== 'string')
+    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliOverseasRegion(region)))) {
+    return jsonRes(res, 400, blocked('invalid_request'));
+  }
   const requestedAs = record?.as as string | undefined;
   const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
@@ -1835,14 +1843,36 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     // The policy is passed as a READER, not a config: a Dashboard edit replaces
     // the whole bot config object, so anything captured here would be a stale
     // snapshot that cannot see a change made while the re-ask is in flight —
-    // exactly the window in which the answer gets written to disk.
+    // exactly the window in which the answer gets published.
     const liveAppId = ds.larkAppId;
+    const dataDir = config.session.dataDir;
+    const currentPolicy = () => getBot(liveAppId).config.triggerUserAuth;
+    const worker = ds.worker;
+    const originCapability = ds.managedTurnOrigin?.capability;
+    const callerOpenId = ds.managedTurnOrigin?.callerOpenId;
+    const executionStillCurrent = () => {
+      const origin = ds.managedTurnOrigin;
+      if (findActiveBySessionId(sessionId) !== ds || ds.worker !== worker || !worker
+        || worker.killed || worker.connected === false || ds.workerGeneration !== document.workerGeneration
+        || !origin || origin.turnId !== document.turnId
+        || (origin.identityTurnId ?? origin.turnId) !== identityTurnId
+        || origin.capability !== originCapability || origin.callerOpenId !== callerOpenId
+        || origin.dispatchAttempt !== document.dispatchAttempt) return false;
+      try {
+        if (identityModelRefusalReason(ds)) return false;
+        if (requestedAs === undefined) return true;
+        return governedSpeakers({ policy: currentPolicy(), tool, sessionDataDir: dataDir, sessionId, origin })
+          ?.some(speaker => speaker.openId === requestedAs && speaker.turnId === speakerTurnId) ?? false;
+      } catch {
+        return false;
+      }
+    };
     await retryTransientTurnIdentity({
       sessionDataDir: config.session.dataDir, sessionId, turnId: speakerTurnId,
       tool: tool === 'codebase' || tool === 'bitscli' ? 'bytedcli' : tool,
       // A bot that no longer exists is "no longer governed": policyStillWants
       // treats a throwing reader as a refusal to publish.
-      currentPolicy: () => getBot(liveAppId).config.triggerUserAuth,
+      currentPolicy,
     });
     let env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
     if (!env) {
@@ -1851,6 +1881,14 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       // publication instead of refusing as if nothing would ever come.
       await awaitTurnIdentityPublication(config.session.dataDir, sessionId);
       env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
+    }
+    if (env && region && !delegation) {
+      await retryMissingRegionalGrant({
+        sessionDataDir: dataDir, sessionId, turnId: speakerTurnId, region, speakerOpenId: choice.speaker?.openId,
+        currentPolicy, executionStillCurrent, waitMs: grantDeadline - Date.now(),
+      });
+      if (!executionStillCurrent()) return jsonRes(res, 403, blocked('lineage_unproven'));
+      env = recallProvenIdentityContent(dataDir, sessionId, speakerTurnId, tool);
     }
     if (env) {
       return jsonRes(res, 200, {
@@ -4517,6 +4555,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const detachedScheduled = backgroundInput ? resolveRegisteredBackgroundContext(backgroundInput) : null;
   const targetLarkAppId = ds?.larkAppId ?? detachedScheduled?.larkAppId;
   const targetChatId = ds?.chatId ?? detachedScheduled?.chatId;
+  const targetSessionChatId = ds?.session.chatId;
   const validHeadlessSession = !!ds?.session.headless
     && ds.session.headless.source === 'cli'
     && isHeadlessId(ds.session.headless.id)
@@ -4532,7 +4571,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     || !boundLarkToolRequest(req, params.sessionId, targetLarkAppId, botConfig)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
   }
-  if (!body || Object.keys(body).some(key => key !== 'mode' && key !== 'as') || !['bot', 'user'].includes(String(body.mode))
+  if (!body || Object.keys(body).some(key => !['mode', 'as', 'policyOnly'].includes(key)) || !['bot', 'user'].includes(String(body.mode))
+    || body.policyOnly !== undefined && typeof body.policyOnly !== 'boolean'
     || (body.as !== undefined && (body.mode !== 'user' || typeof body.as !== 'string'))) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' });
   }
@@ -4540,6 +4580,25 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   let bot: ReturnType<typeof getBot>['config'];
   try { bot = getBot(targetLarkAppId!).config; }
   catch { return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' }); }
+  // Re-evaluate after credential resolution too: operator edits and protected
+  // deliveries may land while a grant/token request is awaiting a provider.
+  const protectedCredentialRefusal = (): string | undefined => {
+    try {
+      const live = getBot(targetLarkAppId!).config;
+      return live.protectedResults === true || ds?.session.protectedResults === true
+        || detachedScheduled?.session.protectedResults === true
+        || new ProtectedResultStore(config.session.dataDir).sessionHasProtection(live.larkAppId, params.sessionId)
+        ? 'protected_result_credential_export_denied' : undefined;
+    } catch { return 'protected_result_policy_unavailable'; }
+  };
+  const refuseProtectedCredential = (): boolean => {
+    const error = protectedCredentialRefusal();
+    if (!error) return false;
+    jsonRes(res, error === 'protected_result_policy_unavailable' ? 503 : 403, { ok: false, error });
+    return true;
+  };
+  if (refuseProtectedCredential()) return;
+  if (body.policyOnly === true) return jsonRes(res, 200, { ok: true, policyOnly: true });
   // Per-person auth is on but lark-user is not among its capabilities: the machine's own lark-cli login serves `--as user`.
   if (body.mode === 'user' && larkUserNative(bot.triggerUserAuth)) {
     if (body.as !== undefined) return jsonRes(res, 403, { ok: false, error: AS_UNAVAILABLE_NATIVE });
@@ -4592,6 +4651,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     if (!stillValidSession || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)) {
       return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
     }
+    if (refuseProtectedCredential()) return;
     return jsonRes(res, 200, {
       ok: true, appId: bot.larkAppId, mode: 'bot', credentialType: 'tenant_access_token', credential: token,
     });
@@ -4765,7 +4825,40 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
           === (liveOrigin?.callerOpenId ? turnCaller : turnPrincipal))
       && ds.managedTurnOrigin?.identityTurnId === identityTurnId)
     : (!!backgroundInput && !!detachedForUser && backgroundContextStillValid(backgroundInput, detachedForUser));
-  if (!boundLarkToolRequest(req, params.sessionId, bot.larkAppId)
+  // Caller/turn stability does not imply that the original transport still
+  // exists. Unlike bot credentials, personal credentials must never enter a
+  // headless session, including one created while the provider was awaited.
+  let userTargetStillValid = false;
+  try {
+    const liveBot = getBot(targetLarkAppId!).config;
+    const targetMatches = (candidate: Pick<DaemonSession, 'session' | 'larkAppId' | 'chatId'>): boolean =>
+      candidate.larkAppId === targetLarkAppId && candidate.chatId === targetChatId
+      && candidate.session.sessionId === params.sessionId
+      && (targetSessionChatId !== undefined
+        ? candidate.session.chatId === targetSessionChatId
+        // Older active sessions can lack the stored chat field. Its absence is
+        // not contradictory evidence; a present, different chat still refuses.
+        : candidate.session.chatId === undefined || candidate.session.chatId === targetChatId);
+    const liveDs = detachedForUser ? undefined : findActiveBySessionId(params.sessionId);
+    const liveDetached = detachedForUser && backgroundInput
+      ? resolveRegisteredBackgroundContext(backgroundInput) : null;
+    userTargetStillValid = liveBot.larkAppId === targetLarkAppId && liveBot.apiOnly !== true
+      && boundLarkToolRequest(req, params.sessionId, targetLarkAppId, liveBot)
+      // A request admitted as managed must not finish under a newly native or
+      // capability-revoked policy. Re-evaluate both against the LIVE bot too.
+      && !larkUserNative(liveBot.triggerUserAuth)
+      && (!delegated || triggerUserAuthApplies(liveBot.triggerUserAuth, 'lark-cli'))
+      && (detachedForUser
+        ? !!liveDetached && liveDetached.job.id === detachedForUser.job.id
+          && targetMatches(liveDetached) && !liveDetached.session.headless
+          // A detached stored identity can remain valid while the active registry
+          // is replaced. Check that live replacement too, not only the old snapshot.
+          && (!liveDetached.ds || (targetMatches(liveDetached.ds) && !liveDetached.ds.session.headless))
+          && !sessionTransportDisabled(liveDetached)
+        : !!liveDs && liveDs.session.status === 'active' && targetMatches(liveDs)
+          && !liveDs.session.headless && !sessionTransportDisabled(liveDs));
+  } catch { /* Unknown live configuration cannot authorize credential export. */ }
+  if (!userTargetStillValid
     || !stableAfterAwait
     // The switch, the owner or the turn's speakers may have changed meanwhile.
     || !ownerFallbackStillHolds(ds, ownerFallback)
@@ -4820,6 +4913,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   if (!resolved.ok) return jsonRes(res, 403, { ok: false, error: delegated
     ? `The original user's authorization for ${bot.larkAppId} is missing. Run botmux auth request --scope "<required scopes>" --json and send the link to that human, then retry with --as user. Do not ask the dispatch bot to authorize.`
     : `Application ${bot.larkAppId} needs this user's authorization. Run ${asPrefix}botmux auth request --scope "<required scopes>" --json${asPrefix ? ` and ${asPrefix}botmux auth wait` : ', or send /login in this conversation'}, then retry with --as user.` });
+  if (refuseProtectedCredential()) return;
   auditOwnerFallback('granted');
   return jsonRes(res, 200, {
     ok: true, appId: resolved.appId, mode: 'user', credentialType: 'user_access_token', credential: resolved.credential,

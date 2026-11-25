@@ -1125,7 +1125,11 @@ describe('public process and fallback compatibility', () => {
         questions: [{ prompt: '继续吗？', multiSelect: false, options: [{ key: 'yes', label: '继续' }, { key: 'no', label: '停止' }] }],
       } }];
       const card = JSON.parse(buildTurnReplyCard(record, { ...presentation, showProcess: view !== 'hidden' }));
-      const live = card.body.elements.filter((element: any) => element.tag === 'markdown').map((element: any) => element.content).join('\n');
+      // Every Markdown shown outside the collapsed process panel, however deeply nested.
+      const visible = (node: any): string[] => !node || typeof node !== 'object' ? []
+        : Array.isArray(node) ? node.flatMap(visible) : node.tag === 'collapsible_panel' ? []
+          : [...(node.tag === 'markdown' ? [node.content] : []), ...Object.values(node).flatMap(visible)];
+      const live = visible(card.body.elements).join('\n');
       expect(live).not.toContain('NARRATION_A');
       if (view === 'pending-ask') expect(live).toContain('继续吗');
       if (view === 'final') expect(live).toContain('完整答复');
