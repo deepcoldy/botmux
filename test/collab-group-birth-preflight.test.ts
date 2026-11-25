@@ -19,22 +19,30 @@ let tempDir: string;
 let clock = 0;
 const now = () => ++clock;
 
+// mock 的 bot 配置状态用 vi.hoisted 提升：vi.mock 工厂被 vitest 物理提升到静态 import
+// 之前，只有 hoisted 回调能在工厂求值前就绪。setBotConfig 仅存在于 mock 工厂、真实
+// bot-registry 并无此导出，因此不能静态 import（bun:test 的 mock.module 不回填真实模块
+// 不存在的命名导出，会在加载期 SyntaxError）。本文件经 vi.hoisted 被 bun-leg selector
+// 判定为 vitest-only，bun 腿跳过、vitest 腿照常覆盖。
+const { configs, setBotConfig } = vi.hoisted(() => {
+  const configs = new Map<string, any>();
+  return {
+    configs,
+    setBotConfig: (appId: string, cfg: any) => { configs.set(appId, cfg); },
+  };
+});
+
 // config.js 会拉入 zod / voice 等大依赖图，直接 mock 掉，避免无关模块加载。
 vi.mock('../src/config.js', () => ({
   config: { session: { get dataDir() { return tempDir; } }, daemon: { backendType: 'pty' } },
 }));
 
-vi.mock('../src/bot-registry.js', () => {
-  const configs = new Map<string, any>();
-  return {
-    getBot: (appId: string) => ({ config: configs.get(appId) ?? { sessionGroup: undefined } }),
-    loadBotConfigsCached: () => [],
-    __testOnly_setBotConfig: (appId: string, cfg: any) => { configs.set(appId, cfg); },
-  };
-});
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: (appId: string) => ({ config: configs.get(appId) ?? { sessionGroup: undefined } }),
+  loadBotConfigsCached: () => [],
+}));
 
 // 直接 import（避免 config.js 的 SESSION_DATA_DIR 依赖）——preflight 用 deps.dataDir。
-import { __testOnly_setBotConfig } from '../src/bot-registry.js';
 import { preflightCollabGroupBirth, startCollabGroupBirth, releaseCollabGroupBirth, realCollabPeerPreflight } from '../src/core/collab-group-birth.js';
 import { readCollabInitStore, __testOnly_resetCollabInitMutexes } from '../src/services/collab-init-store.js';
 import { collabInitId, collabSourceKey } from '../src/services/collab-group-config.js';
@@ -97,14 +105,14 @@ afterEach(() => {
 
 describe('preflightCollabGroupBirth', () => {
   it('默认关闭 → legacy 且无 collab store 写入', async () => {
-    __testOnly_setBotConfig(APP, { sessionGroup: undefined });
+    setBotConfig(APP, { sessionGroup: undefined });
     const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
     expect(r.kind).toBe('legacy');
     expect(readCollabInitStore(tempDir, APP).entries).toEqual({});
   });
 
   it('enabled 但结构失败 → failed，不占位不建群', async () => {
-    __testOnly_setBotConfig(APP, {
+    setBotConfig(APP, {
       sessionGroup: { collaboration: { enabled: true, agents: [], kickoff: [] } },
     });
     const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
@@ -113,7 +121,7 @@ describe('preflightCollabGroupBirth', () => {
   });
 
   it('同 sourceKey 重投 → existing 同 initId（config v1→v2 不建第二请求）', async () => {
-    __testOnly_setBotConfig(APP, collabEnabledConfig());
+    setBotConfig(APP, collabEnabledConfig());
     const sourceKey = collabSourceKey(APP, DM, 'om_1');
     const initId = collabInitId(sourceKey);
 
@@ -121,7 +129,7 @@ describe('preflightCollabGroupBirth', () => {
     expect(first.kind).toBe('ready');
 
     // config v2（不同内容）也重投同一 source → existing 同 initId
-    __testOnly_setBotConfig(APP, {
+    setBotConfig(APP, {
       sessionGroup: {
         collaboration: {
           enabled: true,
@@ -138,7 +146,7 @@ describe('preflightCollabGroupBirth', () => {
   });
 
   it('同 DM 不同 source → busy', async () => {
-    __testOnly_setBotConfig(APP, collabEnabledConfig());
+    setBotConfig(APP, collabEnabledConfig());
     const first = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
     expect(first.kind).toBe('ready');
     const second = await preflightCollabGroupBirth(data('om_2'), ctx('om_2'), deps());
@@ -146,7 +154,7 @@ describe('preflightCollabGroupBirth', () => {
   });
 
   it('peer 失败 → failed 且释放 activeByDmChat（fail-closed，不 fallback legacy）', async () => {
-    __testOnly_setBotConfig(APP, collabEnabledConfig());
+    setBotConfig(APP, collabEnabledConfig());
     const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), {
       ...deps(),
       peerPreflight: async () => ({ ok: false, errors: ['target 未声明 durable-turn-output-receipt-v1'] }),
@@ -161,7 +169,7 @@ describe('preflightCollabGroupBirth', () => {
   });
 
   it('ready 时带 creatorAdmissionOperationId + configVersion', async () => {
-    __testOnly_setBotConfig(APP, collabEnabledConfig());
+    setBotConfig(APP, collabEnabledConfig());
     const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
     expect(r.kind).toBe('ready');
     if (r.kind !== 'ready') return;
@@ -172,7 +180,7 @@ describe('preflightCollabGroupBirth', () => {
   });
 
   it('peer 失败场景：afterAgentTurn 但目标未声明 durable-turn-output-receipt-v1 → failed', async () => {
-    __testOnly_setBotConfig(APP, {
+    setBotConfig(APP, {
       sessionGroup: {
         collaboration: {
           enabled: true,
@@ -192,7 +200,7 @@ describe('preflightCollabGroupBirth', () => {
   });
 
   it('startCollabGroupBirth 占位语义：返回 collab-handled（不递归 handleNewTopic）', async () => {
-    __testOnly_setBotConfig(APP, collabEnabledConfig());
+    setBotConfig(APP, collabEnabledConfig());
     const initId = collabInitId(collabSourceKey(APP, DM, 'om_1'));
     const r = await startCollabGroupBirth(data('om_1'), ctx('om_1'), initId, undefined);
     expect(r.kind).toBe('collab-handled');
@@ -200,7 +208,7 @@ describe('preflightCollabGroupBirth', () => {
   });
 
   it('releaseCollabGroupBirth 释放 activeByDmChat（扣费被拒后不永久 busy）', async () => {
-    __testOnly_setBotConfig(APP, collabEnabledConfig());
+    setBotConfig(APP, collabEnabledConfig());
     const initId = collabInitId(collabSourceKey(APP, DM, 'om_1'));
     await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), deps());
     // 释放前 busy
@@ -214,7 +222,7 @@ describe('preflightCollabGroupBirth', () => {
   });
 
   it('peerPreflight Promise rejection → failed 并释放占位，不残留 running（P2#5）', async () => {
-    __testOnly_setBotConfig(APP, collabEnabledConfig());
+    setBotConfig(APP, collabEnabledConfig());
     const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), {
       ...deps(),
       peerPreflight: async () => { throw new Error('boom'); },
@@ -230,7 +238,7 @@ describe('preflightCollabGroupBirth', () => {
   });
 
   it('生产默认：S2-S5 编排未接入生产 → 合法 enabled 配置 fail-closed（不切回 ready）', async () => {
-    __testOnly_setBotConfig(APP, collabEnabledConfig());
+    setBotConfig(APP, collabEnabledConfig());
     // 不注入 peerPreflight：生产 defaultDeps 保持 fail-closed（S2-S5 未接入，不把 ready 切开放行）。
     const r = await preflightCollabGroupBirth(data('om_1'), ctx('om_1'), {
       dataDir: tempDir,
@@ -244,7 +252,7 @@ describe('preflightCollabGroupBirth', () => {
   });
 
   it('R4：creator 被 afterAgentTurn 依赖且 backendType=herdr（不声明能力）→ 未就绪', async () => {
-    __testOnly_setBotConfig(APP, { backendType: 'herdr', sessionGroup: undefined });
+    setBotConfig(APP, { backendType: 'herdr', sessionGroup: undefined });
     // creator 被 peer 依赖，但 creator 自己 backendType=herdr 不声明 durable-turn-output-receipt-v1。
     const r = await realCollabPeerPreflight({
       config: {
@@ -267,7 +275,7 @@ describe('preflightCollabGroupBirth', () => {
 
   it('P2：creator cliId=mojo + 未显式 backendType → resolvePairedBackendId 解析为 mojo，未就绪', async () => {
     // cliId=mojo 是远程 backend id，resolvePairedBackendId 返回 'mojo'，不在 durable-turn-output-receipt-v1 组合。
-    __testOnly_setBotConfig(APP, { cliId: 'mojo', backendType: undefined, sessionGroup: undefined });
+    setBotConfig(APP, { cliId: 'mojo', backendType: undefined, sessionGroup: undefined });
     const r = await realCollabPeerPreflight({
       config: {
         enabled: true,

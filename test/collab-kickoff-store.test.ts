@@ -127,7 +127,8 @@ describe('collab-kickoff-store', () => {
     expect(readFileSync(join(opDir, file), 'utf-8')).toBe('{broken json');
   });
 
-  it('R3：父目录不可遍历 → strict 读判 corrupted 不判 missing', async () => {
+  // root 绕过 DAC 权限位，chmod 000 不产生 EACCES（读仍成功），该用例仅在非 root 下有区分力。
+  it.skipIf(process.getuid?.() === 0)('R3：父目录不可遍历 → strict 读判 corrupted 不判 missing', async () => {
     const { chmodSync } = await import('node:fs');
     // 建 op 目录并把父目录 chmod 000
     const opDir = join(dataDir, 'collab-kickoff', 'operations', TARGET);

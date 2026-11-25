@@ -55,7 +55,8 @@ describe('readRoleFileStrict 四态', () => {
     expect(r.kind).toBe('read-error');
   });
 
-  it('R3：父目录不可遍历（非 ENOENT）判 read-error 不判 missing', () => {
+  // root 绕过 DAC 权限位，chmod 000 不产生 EACCES（读仍成功），该用例仅在非 root 下有区分力。
+  it.skipIf(process.getuid?.() === 0)('R3：父目录不可遍历（非 ENOENT）判 read-error 不判 missing', () => {
     mkdirSync(join(dataDir, 'roles'), { recursive: true });
     const appDir = join(dataDir, 'roles', APP);
     mkdirSync(appDir, { recursive: true });
