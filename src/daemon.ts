@@ -28705,6 +28705,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     logger.info(`[/t] Force-topic invocation: prompt="${forceTopic.prompt.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, repo=${topicSpec.workingDir ?? '-'}, model=${topicSpec.model ?? '-'}, effort=${topicSpec.reasoningEffort ?? '-'}, title=${topicSpec.title ? 'yes' : 'no'})`);
   }
 
+  // CAS 落败重路由携带的是同一个 parsed 对象；不能让它仍只含留言原文。
+  parsed.content = content;
+
   // senderOpenId 已在上方（force-topic grant 限制前）声明；这里只补 master 新增的 senderUnionId。
   const senderUnionId: string | undefined = data.sender?.sender_id?.union_id;
   const trustedCaller = await trustedCallerForInboundTurn(
@@ -31136,7 +31139,7 @@ async function handleThreadReplyAdmitted(
   // Expand merge_forward: fetch sub-messages and collect their resources.
   // 快照里的 resources 已经含展开结果，重入再拉会把子消息资源追加第二遍。
   if (!prepared && !replay && parsed.msgType === 'merge_forward') {
-    const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed);
+    const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed, numberer);
     resources.push(...extraResources);
   }
 
@@ -31289,12 +31292,12 @@ async function handleThreadReplyAdmitted(
   // `let` (not const): the v3 grill gate below may replace this with a
   // skill-trigger prompt when the user sends `/workflow [new] <目标>` mid-thread.
   const baseQuoteAndBotContext = zeroInjection ? ''
-    : buildQuoteHint(
+    : (ctx.forwardSeedData ? '' : buildQuoteHint(
         parsed,
         crossChatOrigin ? 'thread' : scope,
         crossChatOrigin?.followedRootMessageId ?? anchor,
         localeForBot(larkAppId),
-      )
+      ))
       + botSenderPrefix
       + buildReportReplyContext(inputSession?.session.reportReplyReferences);
   const initialCodexAppMessageContext = zeroInjection ? ''
@@ -31302,6 +31305,9 @@ async function handleThreadReplyAdmitted(
       + baseQuoteAndBotContext;
   const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx);
   const turnContent = composeForwardFollowupContent(forwardSeed.content, parsed.content);
+  // Every subsequent branch — quota/prompt.submit, codex-app clean input, CAS
+  // prepared reroute and worker delivery — must see the same merged content.
+  parsed.content = turnContent;
   const initialPromptContent = zeroInjection
     ? zeroPromptTaskContent(stripCrossPrincipalAsToken(turnContent).text, larkAppId, parsed.rootId ?? parsed.messageId, 'none')
     : baseQuoteAndBotContext + initialCodexAppApplicationContext

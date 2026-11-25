@@ -2701,6 +2701,9 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(entry).toBeTruthy();
     const participantIds = (entry?.participants ?? []).map(p => p.openId);
     expect(participantIds).toContain(OTHER_BOT);
+    const delivered = JSON.stringify(mocks.forkWorker.mock.calls);
+    expect(delivered).toContain('原始转发');
+    expect(delivered).toContain('补充');
   });
 
   it('new topic: passes the accepted Lark message id into the first worker', async () => {
@@ -5196,7 +5199,7 @@ describe('runtime passthrough cascade (PR-3)', () => {
     }
   });
 
-  it('已有会话续话携带 forwardSeedData：合并转发正文与附件一并进入 worker', async () => {
+  it.each(['claude-code', 'codex-app'] as const)('已有会话续话携带 forwardSeedData（cli=%s）：合并转发正文与附件一并进入 worker', async cliId => {
     const merge = await import('../src/im/lark/merge-forward.js');
     const expand = vi.spyOn(merge, 'expandMergeForward').mockImplementation(async (_app, _id, parsed) => {
       parsed.content = '转发正文：登录失败';
@@ -5205,6 +5208,7 @@ describe('runtime passthrough cascade (PR-3)', () => {
     });
     try {
       const { ds } = seedLiveThreadSession('om_reply_forward_root');
+      ds.session.cliId = cliId;
       const seed = makeEventData('om_reply_forward_seed', '', 'om_reply_forward_root');
       seed.message.message_type = 'merge_forward';
       seed.message.content = '{}';
@@ -5221,6 +5225,7 @@ describe('runtime passthrough cascade (PR-3)', () => {
       await tick(15);
 
       expect(expand).toHaveBeenCalledOnce();
+      expect(expand.mock.calls[0]?.[3]?.assign).toBeTypeOf('function');
       await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalled());
       const payload = JSON.stringify((ds.worker as any).send.mock.calls.map((call: any[]) => call[0]));
       expect(payload).toContain('<forwarded_context>');

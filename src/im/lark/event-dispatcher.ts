@@ -86,7 +86,7 @@ import {
   globalQuotaKey,
   removeExpiredGrant,
 } from '../../services/grant-store.js';
-import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
+import { ForwardFollowupBuffer, type ForwardFollowupSeed } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import {
@@ -4345,6 +4345,7 @@ interface AutoStartTopicStart {
   chatId: string;
   senderOpenId: string;
 }
+type AutoStartDefer = (entry: AutoStartTopicStart, continuation: () => Promise<unknown>) => void;
 /** Shared across runtime generations so close/rebuild cannot strand root waiters. */
 const autoStartTopicStarts = new Map<string, AutoStartTopicStart>();
 function autoStartTopicKey(larkAppId: string, rootId: string): string {
@@ -6068,9 +6069,7 @@ export function createLarkEventDispatcherRuntime(
         if (completed) return;
         completed = true;
         resolveReady();
-        setTimeout(() => {
-          if (seedRoutingGates.get(messageId) === gate) seedRoutingGates.delete(messageId);
-        }, config.daemon.forwardFollowupWaitMs);
+        if (seedRoutingGates.get(messageId) === gate) seedRoutingGates.delete(messageId);
       },
     };
     seedRoutingGates.set(messageId, gate);
@@ -6178,6 +6177,7 @@ export function createLarkEventDispatcherRuntime(
     data: any,
     seedRoutingGate?: { ready: Promise<void>; complete: () => void },
     primary?: PrimaryProcessContext,
+    deferAutoStart?: AutoStartDefer,
   ): Promise<DurableLarkCanonicalHandlerResult | void> {
     let pairedAutoStartEntry: AutoStartTopicStart | undefined;
     let pairedAutoStartKey: string | undefined;
@@ -7277,8 +7277,8 @@ export function createLarkEventDispatcherRuntime(
       // extractMessageTextForRouting 只 join text 节点，拼出来的正文天然以命令开头，
       // 拿它做位置判断会把前导 @ 误判成「命令在最前」（见 commandPrecedesMentions）。
       const commandLeadsMessage = commandPrecedesMentions(message);
-      let pairedForwardSeed;
-      let stalePendingSeed;
+      let pairedForwardSeed: ForwardFollowupSeed<PendingForwardTopicPayload> | undefined;
+      let stalePendingSeed: ForwardFollowupSeed<PendingForwardTopicPayload> | undefined;
       let releaseStalePendingSeed = false;
       // Require isAllowed before pairing: a root-linked clarification from a
       // sender who was /revoked within the grace window must not consume the
@@ -7359,6 +7359,7 @@ export function createLarkEventDispatcherRuntime(
         );
       }
 
+      const continueAfterAutoStart = async () => {
       // Permission gating — same shape as before, just keyed on
       // `ownsSession` (anchor-aware) instead of "rootId presence":
       //
@@ -7760,6 +7761,7 @@ export function createLarkEventDispatcherRuntime(
       }
 
       if (stalePendingSeed) {
+        const staleSeed = stalePendingSeed;
         if (primary) {
           throw new Error('durable primary routing does not yet support stale forward-followup seeds');
         }
@@ -7770,12 +7772,12 @@ export function createLarkEventDispatcherRuntime(
         // deliberately not awaited by the raw lane.
         void sessionsReady.then(() => {
           void dispatchWithAutoStartTracking(
-            stalePendingSeed.payload,
-            () => dispatchHumanMessage(stalePendingSeed.payload),
+            staleSeed.payload,
+            () => dispatchHumanMessage(staleSeed.payload),
           )
-            .then(() => removeForwardFollowup(larkAppId, stalePendingSeed.messageId))
+            .then(() => removeForwardFollowup(larkAppId, staleSeed.messageId))
             .catch(err => logger.warn(
-              `[forward-followup] failed to flush stale seed=${stalePendingSeed.messageId.substring(0, 12)}; `
+              `[forward-followup] failed to flush stale seed=${staleSeed.messageId.substring(0, 12)}; `
               + `continuing current msg=${messageId.substring(0, 12)}: ${err}`,
             ));
           void dispatchWithAutoStartTracking(payload, () => dispatchHumanMessage(payload))
@@ -7800,6 +7802,34 @@ export function createLarkEventDispatcherRuntime(
       }
       void dispatchWithAutoStartTracking(payload, () => dispatchHumanMessage(payload))
         .catch(err => logger.error(`Error handling message event: ${err}`));
+      };
+      // Close a TOCTOU gap without waiting in the raw chat lane or replaying
+      // routing side effects. Keep this continuation local to the current event.
+      const pendingAutoStart = isAllowed
+        && !pairedForwardSeed
+        && !ownsSession
+        && !messageListener
+        && !substituteTrigger
+        && !crossChatFollowUp
+        && !yieldToImportedTopicHandler
+        && !!message.root_id
+        && !!message.thread_id
+        && routing.anchor === message.root_id
+        ? autoStartTopicStarts.get(autoStartTopicKey(larkAppId, message.root_id))
+        : undefined;
+      if (pendingAutoStart && (pendingAutoStart.dispatching || forwardFollowupDelayEnabled(chatId))) {
+        const resume = async () => {
+          ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
+          return await continueAfterAutoStart();
+        };
+        if (deferAutoStart) {
+          deferAutoStart(pendingAutoStart, resume);
+          return;
+        }
+        await pendingAutoStart.settled;
+        return await resume();
+      }
+      return await continueAfterAutoStart();
     } catch (err) {
       logger.error(`Error handling message event: ${err}`);
       if (primary) throw err;
@@ -7830,7 +7860,7 @@ export function createLarkEventDispatcherRuntime(
     // 批准时会连着重放多条（原消息 + 待批期间暂存的消息）：与实时入站走同一条按会话的入站串行道，
     // 否则 processMessageEvent 内的异步路由会让后一条先投到会话。setImmediate 是 FIFO，调用顺序即入道顺序。
     setImmediate(() => {
-      void serializeByAnchor(rawMessageIngressAnchor(larkAppId, data?.message), () => processMessageEvent(data))
+      void processMessageWithAutoStartOrdering(data, undefined, rawMessageIngressAnchor(larkAppId, data?.message))
         .catch(err => logger.error(`Error replaying message event after grant: ${err}`));
     });
   }
@@ -7970,7 +8000,7 @@ export function createLarkEventDispatcherRuntime(
         if (unionId) data.sender.sender_id.union_id = unionId;
       }
       // 复用完整消息处理链路：权限/@ 闸、mention 策略、路由、会话派发全部与新消息一致。
-      return await processMessageEvent(data, undefined, primary);
+      return await processMessageWithAutoStartOrdering(data, undefined, rawMessageIngressAnchor(larkAppId, data.message), primary, true);
     } catch (err) {
       logger.error(`Error handling message updated event: ${err}`);
       if (primary) throw err;
@@ -8141,7 +8171,7 @@ export function createLarkEventDispatcherRuntime(
       const unionId = await resolveUnionIdFromOpenId(larkAppId, senderOpenId);
       if (unionId) data.sender.sender_id.union_id = unionId;
     }
-    await processMessageEvent(data);
+    await processMessageWithAutoStartOrdering(data, undefined, rawMessageIngressAnchor(larkAppId, data.message));
     return 'dispatched';
   }
 
@@ -8211,15 +8241,25 @@ export function createLarkEventDispatcherRuntime(
     if (!entry.dispatching && !forwardFollowupDelayEnabled(message.chat_id)) return undefined;
     return entry;
   };
-  const shouldDeferAutoStartMessage = (data: any, entry: AutoStartTopicStart | undefined): boolean => {
+  const shouldDeferAutoStartMessage = async (data: any, entry: AutoStartTopicStart | undefined): Promise<boolean> => {
     if (!entry) return false;
     const message = data?.message;
     const senderOpenId = data?.sender?.sender_id?.open_id;
     const senderUnionId = data?.sender?.sender_id?.union_id;
-    // Settle obvious redirects and unauthorized senders by the ordinary gate;
-    // do not park them behind an unrelated creation.
-    if (!canTalk(larkAppId, message.chat_id, senderOpenId, undefined, senderUnionId, message.chat_type)) return false;
-    if (mentionsAnotherMember(larkAppId, message)) return false;
+    const senderType = data?.sender?.sender_type;
+    const allowed = senderType === 'app' || senderType === 'bot'
+      ? evaluateBotTalk(larkAppId, message.chat_id, senderOpenId, senderUnionId, data?.sender?.sender_id?.app_id).allowed
+      : canTalk(larkAppId, message.chat_id, senderOpenId, undefined, senderUnionId, message.chat_type);
+    // Settle unauthorized senders by the ordinary gate. Bot senders use the same
+    // owner/team-aware predicate as the main message path.
+    if (!allowed) return false;
+    const explicitlyMentioned = isBotMentioned(larkAppId, message, senderOpenId);
+    if (!explicitlyMentioned && mentionsAnotherMember(larkAppId, message) && !commandPrecedesMentions(message)) {
+      // Syntactic @s are only a redirect when the target is actually in this chat;
+      // otherwise continue waiting so the post-creation owner gate can admit it.
+      const inChat = await mentionsAnotherInChatMember(larkAppId, message, message.chat_id, senderOpenId, true);
+      if (inChat) return false;
+    }
     if (entry.dispatching) return true;
     if (senderOpenId !== entry.senderOpenId) return true;
     const routingText = extractMessageTextForRouting(message);
@@ -8230,27 +8270,38 @@ export function createLarkEventDispatcherRuntime(
     // other reply waits outside the chat-wide raw lane in per-root arrival order.
     return strippedRoutingText.startsWith('/');
   };
-  const processMessageWithAutoStartOrdering = (
+  const processMessageWithAutoStartOrdering = async (
     data: any,
     seedRoutingGate: { ready: Promise<void>; complete: () => void } | undefined,
     ingressAnchor: string,
-  ): Promise<unknown> => {
+    primary?: PrimaryProcessContext,
+    rawLaneHeld = false,
+  ): Promise<DurableLarkCanonicalHandlerResult | void> => {
     const message = data?.message;
     const rootId = typeof message?.root_id === 'string' ? message.root_id : undefined;
+    const deferAutoStart: AutoStartDefer = (entry, continuation) => {
+      void serializeByAnchor(`lark-auto-start:${larkAppId}:${rootId}`, async () => {
+        await entry.settled;
+        await continuation();
+      }, 0).catch(err => logger.error(`Error handling deferred auto-start continuation: ${err}`));
+    };
+    const process = () => processMessageEvent(data, seedRoutingGate, primary, deferAutoStart);
+    // Updated-event readback already owns this raw lane. Re-queueing that same
+    // anchor here would wait on the caller itself; only the continuation may
+    // leave it for the per-root queue when an active creation appears.
+    if (rawLaneHeld) return processMessageEvent(data, seedRoutingGate, primary, deferAutoStart);
     const gate = rootId ? seedRoutingGates.get(rootId) : undefined;
     const shouldWaitForGate = !!gate && resolveGroupMentionMode(larkAppId, message.chat_id) === 'topic'
       && forwardFollowupDelayEnabled(message.chat_id);
-    const entry = autoStartEntryForMessage(message);
-    const shouldWaitForEntry = shouldDeferAutoStartMessage(data, entry);
-    if (!shouldWaitForGate && !shouldWaitForEntry) {
-      return serializeByAnchor(ingressAnchor, () => processMessageEvent(data, seedRoutingGate));
+    if (shouldWaitForGate) await waitForSeedRoutingGate(rootId!, true);
+    const latest = autoStartEntryForMessage(message);
+    if (await shouldDeferAutoStartMessage(data, latest)) {
+      return serializeByAnchor(`lark-auto-start:${larkAppId}:${rootId}`, async () => {
+        await latest!.settled;
+        return serializeByAnchor(ingressAnchor, process);
+      }, 0);
     }
-    return serializeByAnchor(`lark-auto-start:${larkAppId}:${rootId}`, async () => {
-      if (shouldWaitForGate) await waitForSeedRoutingGate(rootId!, true);
-      const latest = autoStartEntryForMessage(message);
-      if (shouldDeferAutoStartMessage(data, latest)) await latest!.settled;
-      return serializeByAnchor(ingressAnchor, () => processMessageEvent(data, seedRoutingGate));
-    }, 0);
+    return serializeByAnchor(ingressAnchor, process);
   };
 
   const eventDispatcher = new Lark.EventDispatcher({}).register({
@@ -8543,7 +8594,7 @@ export function createLarkEventDispatcherRuntime(
       const rawSenderType = data?.sender?.sender_type;
       if (
         scheduled
-        && config.daemon.forwardFollowupWaitMs > 0
+        && (config.daemon.forwardFollowupWaitMs > 0 || topicAutoStartEnabled(rawMessage.chat_id))
         && rawMessage?.message_id
         && rawMessage.chat_type !== 'p2p'
         && !rawMessage.root_id
