@@ -115,6 +115,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import { __testOnly_setSuspendBackingVerifier, __testOnly_setupWorkerHandlers, initWorkerPool, killWorker, suspendWorker } from '../src/core/worker-pool.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 
 interface SetupOptions {
   cliId?: string;
@@ -221,6 +222,257 @@ describe('CoT message of a turn that ended with background tasks running', () =>
     expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'completed', 1);
     screen(worker);
     expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['reply_first', 'background_first'] as const)(
+    'requires both the exact durable reply and background zero before closing CoT (%s)', order => {
+      const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+      const hold = loadWorkerPoolFunction<(
+        ds: DaemonSession,
+        msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks: number },
+        opts: { replyPending: boolean },
+      ) => void>('finalizeOrHoldCotMessage', scope);
+      const settleReply = loadWorkerPoolFunction<(
+        ds: DaemonSession,
+        turnId: string,
+        dispatchAttempt: number,
+      ) => boolean>('settleRequiredReplyCotMessage', scope);
+      const settleBackground = loadWorkerPoolFunction<(
+        ds: DaemonSession,
+      ) => void>('settleRequiredReplyBackground', scope);
+      const ds = {} as DaemonSession;
+
+      hold(ds, { turnId: 'om_required', status: 'completed', dispatchAttempt: 2, backgroundTasks: 1 },
+        { replyPending: true });
+      expect([...ds.requiredReplyCotHolds!.values()]).toEqual([{
+        turnId: 'om_required', dispatchAttempt: 2, finishStatus: 'completed',
+        replyPending: true, backgroundPending: true,
+      }]);
+
+      if (order === 'reply_first') {
+        expect(settleReply(ds, 'om_required', 2)).toBe(true);
+        expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+        settleBackground(ds);
+      } else {
+        settleBackground(ds);
+        expect([...ds.requiredReplyCotHolds!.values()]).toEqual([{
+          turnId: 'om_required', dispatchAttempt: 2, finishStatus: 'completed',
+          replyPending: true, backgroundPending: false,
+        }]);
+        expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+        expect(settleReply(ds, 'om_required', 2)).toBe(true);
+      }
+
+      expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(
+        ds, 'om_required', 'completed', 2,
+      );
+      expect(ds.requiredReplyCotHolds).toBeUndefined();
+    },
+  );
+
+  it('tracks a reply-only required turn so CLI loss can close it', () => {
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const hold = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks?: number },
+      opts: { replyPending: true },
+    ) => void>('finalizeOrHoldCotMessage', scope);
+    const loseCli = loadWorkerPoolFunction<(ds: DaemonSession) => boolean>(
+      'settleBackgroundStateOnCliLoss', scope,
+    );
+    const ds = {} as DaemonSession;
+
+    hold(ds, { turnId: 'om_reply_only', status: 'completed', dispatchAttempt: 4 },
+      { replyPending: true });
+
+    expect([...ds.requiredReplyCotHolds!.values()]).toEqual([{
+      turnId: 'om_reply_only', dispatchAttempt: 4, finishStatus: 'completed',
+      replyPending: true, backgroundPending: false,
+    }]);
+    loseCli(ds);
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(
+      ds, 'om_reply_only', 'failed', 4,
+    );
+    expect(ds.requiredReplyCotHolds).toBeUndefined();
+  });
+
+  it('keeps a delivered required turn completed when graceful CLI retirement clears its background hold', () => {
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const loseCli = loadWorkerPoolFunction<(ds: DaemonSession) => boolean>(
+      'settleBackgroundStateOnCliLoss', scope,
+    );
+    const ds = {
+      backgroundTaskCount: 1,
+      requiredReplyCotHolds: new Map([['om_delivered\0' + 2, {
+        turnId: 'om_delivered', dispatchAttempt: 2, finishStatus: 'completed' as const,
+        replyPending: false, backgroundPending: true,
+      }]]),
+    } as unknown as DaemonSession;
+
+    expect(loseCli(ds)).toBe(true);
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(
+      ds, 'om_delivered', 'completed', 2,
+    );
+    expect(ds.requiredReplyCotHolds).toBeUndefined();
+  });
+
+  it('holds the synthetic required-reply failure until background zero', () => {
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const hold = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks: number },
+      opts: { finishStatus: 'failed' },
+    ) => void>('finalizeOrHoldCotMessage', scope);
+    const settleBackground = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+    ) => void>('settleRequiredReplyBackground', scope);
+    const ds = {} as DaemonSession;
+
+    hold(ds, { turnId: 'om_empty', status: 'completed', dispatchAttempt: 3, backgroundTasks: 1 },
+      { finishStatus: 'failed' });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    settleBackground(ds);
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(ds, 'om_empty', 'failed', 3);
+  });
+
+  it('cancels the delayed missing-reply closure when a durable final arrives', () => {
+    const publishMissing = vi.fn();
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const hold = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks: number },
+      opts: { finishStatus: 'failed' },
+    ) => void>('finalizeOrHoldCotMessage', scope);
+    const settleReply = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      turnId: string,
+      dispatchAttempt: number,
+    ) => boolean>('settleRequiredReplyCotMessage', scope);
+    const settleBackground = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+    ) => void>('settleRequiredReplyBackground', scope);
+    const key = 'om_empty\0' + 3;
+    const ds = {
+      pendingRequiredReplyMissingReceipts: new Map([[key, {
+        turnId: 'om_empty', dispatchAttempt: 3, publish: publishMissing,
+      }]]),
+    } as unknown as DaemonSession;
+
+    hold(ds, { turnId: 'om_empty', status: 'completed', dispatchAttempt: 3, backgroundTasks: 1 },
+      { finishStatus: 'failed' });
+    expect(settleReply(ds, 'om_empty', 3)).toBe(true);
+    settleBackground(ds);
+
+    expect(publishMissing).not.toHaveBeenCalled();
+    expect(ds.pendingRequiredReplyMissingReceipts).toBeUndefined();
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(ds, 'om_empty', 'completed', 3);
+  });
+
+  it('does not let a later terminal evict an older required-reply hold', () => {
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const hold = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks?: number },
+      opts?: { replyPending?: boolean },
+    ) => void>('finalizeOrHoldCotMessage', scope);
+    const ds = {} as DaemonSession;
+
+    hold(ds, { turnId: 'om_required', status: 'completed', dispatchAttempt: 2, backgroundTasks: 1 },
+      { replyPending: true });
+    hold(ds, { turnId: 'om_newer', status: 'completed', dispatchAttempt: 1 });
+
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(ds, 'om_newer', 'completed', 1);
+    expect([...ds.requiredReplyCotHolds!.values()]).toEqual([expect.objectContaining({
+      turnId: 'om_required', dispatchAttempt: 2, replyPending: true,
+    })]);
+  });
+
+  it.each(['reply_first', 'background_first'] as const)(
+    'settles an older required hold when aggregate zero is attributed to a newer turn (%s)', order => {
+      const { ds, worker } = setup({ cliId: 'claude-code' });
+      const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+      const settleReply = loadWorkerPoolFunction<(
+        ds: DaemonSession,
+        turnId: string,
+        dispatchAttempt: number,
+      ) => boolean>('settleRequiredReplyCotMessage', scope);
+      ds.requiredReplyCotHolds = new Map([['om_older\0' + 2, {
+        turnId: 'om_older',
+        dispatchAttempt: 2,
+        finishStatus: 'completed',
+        replyPending: order === 'background_first',
+        backgroundPending: true,
+      }]]);
+
+      // The later terminal and zero frame both carry om_turn, but the
+      // worker-level tracker draining also settles the older om_older hold.
+      terminal(worker);
+      screen(worker);
+
+      if (order === 'background_first') {
+        expect(ds.requiredReplyCotHolds?.get('om_older\0' + 2)).toEqual(expect.objectContaining({
+          replyPending: true,
+          backgroundPending: false,
+        }));
+        expect(settleReply(ds, 'om_older', 2)).toBe(true);
+      }
+      expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_older', 'completed', 2);
+      expect(ds.requiredReplyCotHolds).toBeUndefined();
+    },
+  );
+
+  it('settles every required hold when the worker-level background count reaches zero', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    ds.requiredReplyCotHolds = new Map([
+      ['om_a\0' + 1, {
+        turnId: 'om_a', dispatchAttempt: 1, finishStatus: 'completed',
+        replyPending: false, backgroundPending: true,
+      }],
+      ['om_b\0' + 3, {
+        turnId: 'om_b', dispatchAttempt: 3, finishStatus: 'completed',
+        replyPending: false, backgroundPending: true,
+      }],
+    ]);
+
+    screen(worker);
+
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_a', 'completed', 1);
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_b', 'completed', 3);
+    expect(ds.requiredReplyCotHolds).toBeUndefined();
+  });
+
+  it('keeps a delayed missing receipt cancellable across a later terminal', () => {
+    const publishMissing = vi.fn();
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const hold = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks?: number },
+      opts?: { finishStatus?: 'failed' },
+    ) => void>('finalizeOrHoldCotMessage', scope);
+    const settleReply = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      turnId: string,
+      dispatchAttempt: number,
+    ) => boolean>('settleRequiredReplyCotMessage', scope);
+    const settleBackground = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+    ) => void>('settleRequiredReplyBackground', scope);
+    const key = 'om_empty\0' + 3;
+    const ds = {} as DaemonSession;
+
+    hold(ds, { turnId: 'om_empty', status: 'completed', dispatchAttempt: 3, backgroundTasks: 1 },
+      { finishStatus: 'failed' });
+    ds.pendingRequiredReplyMissingReceipts = new Map([[key, {
+      turnId: 'om_empty', dispatchAttempt: 3, publish: publishMissing,
+    }]]);
+    hold(ds, { turnId: 'om_newer', status: 'completed', dispatchAttempt: 1 });
+
+    expect(publishMissing).not.toHaveBeenCalled();
+    expect(ds.pendingRequiredReplyMissingReceipts?.has(key)).toBe(true);
+    expect(settleReply(ds, 'om_empty', 3)).toBe(true);
+    settleBackground(ds);
+    expect(publishMissing).not.toHaveBeenCalled();
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_empty', 'completed', 3);
   });
 
   it('keeps the held CoT message open when the same terminal is replayed', () => {

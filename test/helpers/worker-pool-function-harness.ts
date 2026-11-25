@@ -90,7 +90,8 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
     'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
     'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage',
-    'clearWorkerRuntimeProvenance'].includes(key)) {
+    'requiredReplyCotHoldKey', 'settleRequiredReplyBackground', 'settleRequiredReplyCotMessage',
+    'failRequiredReplyCotHolds', 'clearWorkerRuntimeProvenance'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];

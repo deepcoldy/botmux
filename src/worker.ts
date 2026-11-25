@@ -12565,7 +12565,7 @@ function initializeFinalOutputHandoff(cfg: Extract<DaemonToWorker, { type: 'init
       context: origin => workerSessionEventScope?.replayEnvelope(origin) ?? origin,
       error: error => log(`Universal output recovery pending: ${String(error)}`),
     });
-    if (cfg.finalOutputHandoff.admitNew && cfg.turnId) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: cfg.larkAppId, sessionId: cfg.sessionId, turnId: cfg.turnId });
+    if (cfg.finalOutputHandoff.admitNew && !cfg.finalOutputHandoff.frozenImOnly && cfg.turnId) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: cfg.larkAppId, sessionId: cfg.sessionId, turnId: cfg.turnId });
     universalOutputHandoff.start();
   }
   finalHandoffAdmissionEnabled = cfg.finalOutputHandoff?.version === 1 && cfg.finalOutputHandoff.admitNew === true;
@@ -19131,6 +19131,11 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
     const fallbackKind = structuredFallbackKind(
       gateInput, nextBoundaryMs, markers, adoptMode, structuredBridgeIs('codex'), replyDeliveryMode(),
     );
+    const requiresReply = !turn.isLocal && frozenImReplyTurn(turn.turnId);
+    // For an admitted human reply, only the host's exact final ledger can
+    // suppress publication. Transcript/send-marker heuristics also see progress.
+    const durableAnswer = requiresReply && fallbackKind === 'final'
+      && (turn.terminalStatus ?? 'completed') === 'completed' && !isBridgeNothingToSendFinal(turn.finalText);
     if ((turn.finalText ?? '').trim().length === 0) {
       const attributableMarkers = attributableBridgeReplyMarkers(
         gateInput,
@@ -19187,8 +19192,8 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
     if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
     }
-    if (!content) continue;
-    if (shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
+    if (!content || (fallbackKind === 'empty_completed' && requiresReply)) continue;
+    if (!durableAnswer && shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
       log(`Structured bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`
         + (fallbackKind === 'failed' ? `; execution remains failed (${turn.terminalErrorCode ?? 'worker_turn_failed'})` : ''));
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
@@ -19288,7 +19293,9 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
       turn.terminalStatus ?? 'completed',
       turn.terminalErrorCode,
       turn.dispatchAttempt,
-      nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+      nothingToSendTurns.has(turn) ? 'nothing_to_send'
+        : !turn.isLocal && !turn.finalText?.trim() && frozenImReplyTurn(turn.turnId) ? 'empty_answer'
+        : undefined,
     );
   }
   retireStructuredTurnAttribution(ready.flatMap(turn => [...(turn.supersededTurns ?? []), turn]));
@@ -43105,7 +43112,7 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
-  outputDisposition?: 'nothing_to_send' | 'boundary_unobserved' | 'explicit_final_delivered',
+  outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered',
   retryable?: boolean,
   /** Backend-supplied completion instant (codex-app's runner timestamps its own
    *  finals). Clamped to now by the clock; absent means "use this instant". */
@@ -43302,6 +43309,13 @@ function publishCliInputBacklog(): void {
   send({ type: 'cli_input_backlog', ...backlog });
 }
 
+function frozenImReplyTurn(turnId: string): boolean {
+  const appId = lastInitConfig?.larkAppId;
+  const dataDir = process.env.SESSION_DATA_DIR;
+  return !!(lastInitConfig?.finalOutputHandoff?.version === 2 && appId && dataDir && sessionId
+    && new TurnSendLedger(dataDir).requiresOriginalImReply({ larkAppId: appId, sessionId, turnId }));
+}
+
 function send(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): void {
   // A native conversation ID is read from the live CLI when the callback runs.
   // Pollers and timers keep the binding they were created under, and an
@@ -43332,7 +43346,10 @@ function send(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): void {
   }
   if (msg.type === 'cli_session_id') observeContractNativeSession(msg.cliSessionId);
   const payload = sessionEventMetadata(workerIpcPayload(msg), origin);
-  if (payload.type === 'final_output' && universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew === true) universalOutputHandoff.publish(payload);
+  if (payload.type === 'final_output' && universalOutputHandoff
+    && (lastInitConfig?.finalOutputHandoff?.frozenImOnly
+      ? frozenImReplyTurn(payload.turnId)
+      : lastInitConfig?.finalOutputHandoff?.admitNew === true)) universalOutputHandoff.publish(payload);
   else process.send?.(payload);
   if (isWorkflowWorker() && payload.type === 'final_output') workflowFinalOutputSent = true;
 }
@@ -43357,7 +43374,7 @@ function acknowledgeTurnInputCommitted(
   durablePrimaryInbox?: true,
 ): void {
   if (!turnId) return;
-  if (universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew && lastInitConfig.larkAppId && process.env.SESSION_DATA_DIR) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: lastInitConfig.larkAppId, sessionId: sessionId!, turnId, dispatchAttempt });
+  if (universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew && !lastInitConfig.finalOutputHandoff.frozenImOnly && lastInitConfig.larkAppId && process.env.SESSION_DATA_DIR) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: lastInitConfig.larkAppId, sessionId: sessionId!, turnId, dispatchAttempt });
   ordinaryImTurnDedupe.commit(turnId);
   send({
     type: 'turn_input_committed',
@@ -43368,7 +43385,7 @@ function acknowledgeTurnInputCommitted(
 }
 
 function acknowledgeTurnInputReceived(turnId?: string): void {
-  if (turnId && universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew && lastInitConfig.larkAppId && process.env.SESSION_DATA_DIR) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: lastInitConfig.larkAppId, sessionId: sessionId!, turnId });
+  if (turnId && universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew && !lastInitConfig.finalOutputHandoff.frozenImOnly && lastInitConfig.larkAppId && process.env.SESSION_DATA_DIR) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: lastInitConfig.larkAppId, sessionId: sessionId!, turnId });
   if (turnId) send({ type: 'turn_input_received', turnId });
 }
 

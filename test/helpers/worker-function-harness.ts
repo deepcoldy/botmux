@@ -36,7 +36,8 @@ import { readNativeReasoningFooter } from '../../src/utils/native-reasoning-foot
 import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-observer.js';
 import { ClaudeEffortObserver } from '../../src/services/claude-effort-observer.js';
 import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-choice.js';
-import { finalBridgeSendMarkerCoversOwnThread, isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { finalBridgeSendMarkerCoversOwnThread, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { TurnSendLedger } from '../../src/services/turn-send-ledger.js';
 import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
 import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from '../../src/core/rewind-backup-retention.js';
 import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
@@ -368,6 +369,12 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'awaySummaryFocus') return INERT_AWAY_SUMMARY_FOCUS;
     if (key === 'backgroundTaskTracker') return INERT_BACKGROUND_TASK_TRACKER;
     if (key === 'awaySummaryFocusRefusal') return awaySummaryFocusRefusal;
+    if (key === 'isBridgeNothingToSendFinal') return isBridgeNothingToSendFinal;
+    if (key === 'TurnSendLedger') return TurnSendLedger;
+    if (key === 'frozenImReplyTurn') {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
     if (key === 'proofFromSubmitRecheckResult') return proofFromSubmitRecheckResult;
     if (key === 'recheckResultFromProof') return recheckResultFromProof;
     if (key === 'matchesQueuedActivationTurn') return matchesQueuedActivationTurn;

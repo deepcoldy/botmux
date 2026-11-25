@@ -169,15 +169,19 @@ export async function transferGroupOwner(opts: TransferGroupOwnerOpts): Promise<
 }
 
 export async function createGroupWithBots(opts: CreateGroupOpts): Promise<CreateGroupResult> {
+  const creatorLarkAppId = opts.creatorLarkAppId.trim();
+  const normalizedLarkAppIds = Array.from(
+    new Set(opts.larkAppIds.map(id => id.trim()).filter(Boolean)),
+  );
   // Filter creator out of the bot invite list. createChat does this defensively
   // too, but doing it here makes the service contract explicit and keeps
   // invalidBotIds reporting stable across underlying API changes.
-  const otherBots = opts.larkAppIds.filter(id => id !== opts.creatorLarkAppId);
+  const otherBots = normalizedLarkAppIds.filter(id => id !== creatorLarkAppId);
   // 飞书 chat.create 的 bot_id_list 上限仅 5、chatMembers.create 的 id_list 同样很小（实测 >5 即 400）。
   // 故建群时不带 bot（只 creator + 邀请人），所有 bot 一律按每批 5 个增量加入，避免触顶。批里只要有
   // 一个非法 id（如已停用的 app），飞书会整批拒（code≠0）→ 逐个重试以保住同批的有效 bot。失败并入 invalidBotIds。
   const BOT_BATCH = 5;
-  const r = await createChat(opts.creatorLarkAppId, {
+  const r = await createChat(creatorLarkAppId, {
     name: opts.name,
     botIds: [],
     userIds: opts.deferUserInvites ? [] : (opts.userOpenIds ?? []),
@@ -185,23 +189,23 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   });
   await opts.onChatCreated?.(r.chatId);
   if (opts.deferUserInvites && opts.userOpenIds?.length) {
-    const added = await addUsersToChatByOpenId(opts.creatorLarkAppId, r.chatId, opts.userOpenIds);
+    const added = await addUsersToChatByOpenId(creatorLarkAppId, r.chatId, opts.userOpenIds);
     for (const id of added.invalidUserIds) {
       if (!r.invalidUserIds.includes(id)) r.invalidUserIds.push(id);
     }
   }
   for (let i = 0; i < otherBots.length; i += BOT_BATCH) {
     const batch = otherBots.slice(i, i + BOT_BATCH);
-    let added = await addBotToChat(opts.creatorLarkAppId, r.chatId, batch);
+    let added = await addBotToChat(creatorLarkAppId, r.chatId, batch);
     if (added.some(a => !a.ok) && batch.length > 1) {
       added = [];
-      for (const id of batch) added.push(...await addBotToChat(opts.creatorLarkAppId, r.chatId, [id]));
+      for (const id of batch) added.push(...await addBotToChat(creatorLarkAppId, r.chatId, [id]));
     }
     for (const a of added) if (!a.ok) r.invalidBotIds.push(a.id);
   }
 
   const invalidBots = new Set(r.invalidBotIds);
-  const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
+  const joinedBotIds = Array.from(new Set([creatorLarkAppId, ...normalizedLarkAppIds]))
     .filter(id => !invalidBots.has(id));
 
   // Optional decoration must never delay inviting the requested teammates.
@@ -213,12 +217,12 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   if (opts.customization?.avatar === 'name') {
     try {
       const { applyGroupNameAvatar } = await import('./group-name-avatar.js');
-      await applyGroupNameAvatar(opts.creatorLarkAppId, r.chatId, opts.name ?? '');
+      await applyGroupNameAvatar(creatorLarkAppId, r.chatId, opts.name ?? '');
     } catch (err: any) { customization!.avatarError = err?.message ?? String(err); }
   } else if (opts.customization?.avatar === 'logo') {
     try {
       const { applyLogoGroupAvatar } = await import('./session-group-avatar.js');
-      await applyLogoGroupAvatar(opts.creatorLarkAppId, r.chatId);
+      await applyLogoGroupAvatar(creatorLarkAppId, r.chatId);
     } catch (err: any) { customization!.avatarError = err?.message ?? String(err); }
   }
 
@@ -230,7 +234,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   let shareLink: string | null = null;
   let shareLinkError: string | null = null;
   {
-    const sl = await getChatShareLink(opts.creatorLarkAppId, r.chatId);
+    const sl = await getChatShareLink(creatorLarkAppId, r.chatId);
     if (sl.ok) shareLink = sl.shareLink;
     else shareLinkError = sl.error;
   }
@@ -240,7 +244,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   // still exists. The creator's own owner (if any) is harmless to re-add.
   let invalidOwnerUnionIds: string[] = [];
   if (opts.ownerUnionIds && opts.ownerUnionIds.length > 0) {
-    const ar = await addUsersToChatByUnionId(opts.creatorLarkAppId, r.chatId, opts.ownerUnionIds);
+    const ar = await addUsersToChatByUnionId(creatorLarkAppId, r.chatId, opts.ownerUnionIds);
     invalidOwnerUnionIds = ar.invalidUserIds;
   }
 
@@ -252,13 +256,12 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   // chats only get stewards that opted in. Counted from who actually joined;
   // open_id and union_id may be the same person, so the larger count is used.
   const dataDir = config.session.dataDir;
-  const creatorLarkAppId = opts.creatorLarkAppId;
   const memberOpenIds = (opts.userOpenIds ?? []).filter(id => !r.invalidUserIds.includes(id));
   const memberUnionIds = (opts.ownerUnionIds ?? []).filter(id => !invalidOwnerUnionIds.includes(id));
   const soloGroup = joinedBotIds.length <= 1 && Math.max(new Set(memberOpenIds).size, new Set(memberUnionIds).size) <= 1;
   const stewardJoins = await joinStewardsToNewChat({
     creatorLarkAppId,
-    requestedBotAppIds: opts.larkAppIds,
+    requestedBotAppIds: normalizedLarkAppIds,
     soloGroup,
     memberOpenIds,
     memberUnionIds,
@@ -286,11 +289,42 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
       transferError = 'invitee_rejected';
     } else {
       try {
-        const resolved = await resolveAllowedUsersWithMap(opts.creatorLarkAppId, [transferOwnerUnionId]);
+        const resolved = await resolveAllowedUsersWithMap(creatorLarkAppId, [transferOwnerUnionId]);
         transferOwnerTo = resolved.map.get(transferOwnerUnionId) ?? null;
         if (!transferOwnerTo) transferError = 'owner_union_id_unresolved';
       } catch {
         transferError = 'owner_union_id_unresolved';
+      }
+    }
+  }
+
+  // Grant group manager role to non-owner managers BEFORE transferring ownership:
+  // Feishu `im.v1.chatManagers.addManagers` is strictly owner-only (code 232025
+  // once the creator bot is demoted, with no `operate_as_owner` override).
+  // - Any user in `invalidUserIds` is skipped (not in chat).
+  // - The planned `transferOwnerTo` target is deferred until after transfer so
+  //   we don't redundantly promote someone who is about to become owner; if
+  //   transfer fails, the creator bot is still owner and can add them as a
+  //   manager fallback below.
+  let managersAdded: string[] = [];
+  let managerError: string | null = null;
+  const rawManagerIds = Array.from(
+    new Set((opts.managerUserIds ?? []).map(id => id.trim()).filter(Boolean)),
+  );
+  const willAttemptTransfer = Boolean(
+    transferOwnerTo && !transferError && !r.invalidUserIds.includes(transferOwnerTo),
+  );
+  if (rawManagerIds.length > 0) {
+    const preTransferManagers = rawManagerIds.filter(
+      id => !r.invalidUserIds.includes(id) && (!willAttemptTransfer || id !== transferOwnerTo),
+    );
+    if (preTransferManagers.length > 0) {
+      const mr = await addChatManagers(creatorLarkAppId, r.chatId, preTransferManagers);
+      if (mr.ok) {
+        managersAdded = mr.addedManagers;
+      } else {
+        managerError = mr.error;
+        logger.warn(`[group-creator] addChatManagers failed after retries for ${r.chatId.substring(0, 12)}: ${mr.error}`);
       }
     }
   }
@@ -303,7 +337,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
       transferError = 'invitee_rejected';
     } else {
       const transferred = await transferGroupOwner({
-        creatorLarkAppId: opts.creatorLarkAppId,
+        creatorLarkAppId,
         chatId: r.chatId,
         ownerId: transferOwnerTo,
       });
@@ -319,29 +353,19 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   if (opts.customization?.tag) {
     try {
       const { addCreatedChatToFeedGroup } = await import('./feed-group-tagger.js');
-      await addCreatedChatToFeedGroup(opts.creatorLarkAppId, r.chatId, opts.customization.userOpenId, opts.customization.tag);
+      await addCreatedChatToFeedGroup(creatorLarkAppId, r.chatId, opts.customization.userOpenId, opts.customization.tag);
     } catch (err: any) { customization!.tagError = err?.message ?? String(err); }
   }
 
-  // Grant group manager role to specified users in managerUserIds.
-  // Only the chat owner can add managers:
-  // - If ownership was transferred successfully, ownerTransferredTo is excluded (already owner).
-  // - If ownership transfer failed (and the target was not rejected by invalidUserIds),
-  //   the target can still be added as a manager fallback if included in managerUserIds.
-  // - Any user in invalidUserIds is skipped since they were rejected by Lark and are not in the chat.
-  let managersAdded: string[] = [];
-  let managerError: string | null = null;
-  const rawManagerIds = (opts.managerUserIds ?? []).map(id => id.trim()).filter(Boolean);
-  if (rawManagerIds.length > 0) {
-    const toAdd = rawManagerIds.filter(id => id !== ownerTransferredTo && !r.invalidUserIds.includes(id));
-    if (toAdd.length > 0) {
-      const mr = await addChatManagers(opts.creatorLarkAppId, r.chatId, toAdd);
-      if (mr.ok) {
-        managersAdded = mr.addedManagers;
-      } else {
-        managerError = mr.error;
-        logger.warn(`[group-creator] addChatManagers failed after retries for ${r.chatId.substring(0, 12)}: ${mr.error}`);
-      }
+  // Fallback: if ownership transfer failed, the creator bot is still the chat
+  // owner; promote `transferOwnerTo` to manager if it was also in managerUserIds.
+  if (willAttemptTransfer && !ownerTransferredTo && transferOwnerTo && rawManagerIds.includes(transferOwnerTo)) {
+    const mr = await addChatManagers(creatorLarkAppId, r.chatId, [transferOwnerTo]);
+    if (mr.ok) {
+      managersAdded = Array.from(new Set([...managersAdded, ...mr.addedManagers]));
+    } else {
+      managerError = managerError ? `${managerError}; ${mr.error}` : mr.error;
+      logger.warn(`[group-creator] addChatManagers fallback failed after retries for ${r.chatId.substring(0, 12)}: ${mr.error}`);
     }
   }
 
@@ -360,9 +384,9 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     } else {
       try {
         notifyMessageId = await sendMessage(
-          opts.creatorLarkAppId,
+          creatorLarkAppId,
           r.chatId,
-          `<at user_id="${notifyOwnerOpenId}"></at> ${t('cmd.group.owner_notice', undefined, localeForBot(opts.creatorLarkAppId))}`,
+          `<at user_id="${notifyOwnerOpenId}"></at> ${t('cmd.group.owner_notice', undefined, localeForBot(creatorLarkAppId))}`,
           'text',
         );
       } catch (e: any) {
@@ -411,16 +435,16 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
       roleProfileBootstrapError = 'invalid_role_profile_id';
     } else {
       try {
-        const creatorContent = readRoleProfileEntry(config.session.dataDir, roleProfileId, opts.creatorLarkAppId);
+        const creatorContent = readRoleProfileEntry(config.session.dataDir, roleProfileId, creatorLarkAppId);
         // null = no entry; '' = explicit (clear) entry — both skip the write on
         // a fresh chat, but only a truly missing entry counts as "not applicable".
         const creatorHasEntry = creatorContent !== null;
         if (creatorContent) {
-          writeRoleFile(opts.creatorLarkAppId, r.chatId, creatorContent);
+          writeRoleFile(creatorLarkAppId, r.chatId, creatorContent);
         }
-        const peerBotIds = joinedBotIds.filter(id => id !== opts.creatorLarkAppId);
+        const peerBotIds = joinedBotIds.filter(id => id !== creatorLarkAppId);
         if (peerBotIds.length > 0) {
-          const members = await listChatBotMembers(opts.creatorLarkAppId, r.chatId);
+          const members = await listChatBotMembers(creatorLarkAppId, r.chatId);
           const byAppId = new Map(members.map(m => [m.larkAppId, m]));
           const mentions = peerBotIds
             .map(id => byAppId.get(id))
@@ -430,7 +454,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
             roleProfileBootstrapError = 'no_mentionable_bots';
           } else {
             roleProfileBootstrapMessageId = await sendMessage(
-              opts.creatorLarkAppId,
+              creatorLarkAppId,
               r.chatId,
               `${mentions.join(' ')} /role profile apply ${roleProfileId} --quiet`,
               'text',
@@ -460,9 +484,9 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   if (!!kickoffBot !== !!kickoffPrompt) {
     kickoffError = 'kickoff_args_must_be_paired';
   } else if (kickoffBot && kickoffPrompt) {
-    if (kickoffBot === opts.creatorLarkAppId) {
+    if (kickoffBot === creatorLarkAppId) {
       kickoffError = 'creator_cannot_kickoff_self';
-    } else if (!opts.larkAppIds.includes(kickoffBot)) {
+    } else if (!normalizedLarkAppIds.includes(kickoffBot)) {
       kickoffError = 'kickoff_bot_not_selected';
     } else if (r.invalidBotIds.includes(kickoffBot)) {
       kickoffError = 'invitee_rejected';
@@ -470,7 +494,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
 
     try {
       if (!kickoffError) {
-        const members = await listChatBotMembers(opts.creatorLarkAppId, r.chatId);
+        const members = await listChatBotMembers(creatorLarkAppId, r.chatId);
         const target = members.find(member => member.larkAppId === kickoffBot);
         if (!target) {
           kickoffError = 'kickoff_bot_not_found_in_chat';
@@ -478,7 +502,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
           kickoffError = 'kickoff_bot_not_mentionable';
         } else {
           kickoffMessageId = await sendMessage(
-            opts.creatorLarkAppId,
+            creatorLarkAppId,
             r.chatId,
             `<at user_id="${target.openId}"></at> ${kickoffPrompt}`,
             'text',
@@ -493,7 +517,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   return {
     ok: true,
     chatId: r.chatId,
-    creator: opts.creatorLarkAppId,
+    creator: creatorLarkAppId,
     invalidBotIds: r.invalidBotIds,
     invalidUserIds: r.invalidUserIds,
     invalidOwnerUnionIds,
