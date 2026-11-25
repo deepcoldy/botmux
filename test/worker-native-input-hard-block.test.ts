@@ -278,6 +278,40 @@ describe('native hard input-focus blocks across real delivery paths', () => {
       bareShell: false, inputPending: false, cliId: 'codex', codexInputState: empty146,
     })).toBeUndefined();
   });
+
+  it('lets the TRAE question card own input instead of the generic dialog hold', async () => {
+    // A question card can make the surface read as blocked, but it has its own
+    // hold/notify/bridge path. The generic hard-block recheck must not preempt it.
+    const blocked = fixture('traex-0.216.0-rename-dialog.txt');
+
+    // Question bridge active: the generic hold never arms on the same blocked screen.
+    const owned = inputHarness('traex', blocked);
+    owned.scope.traexQuestionDeliveryOwnsInput = loadWorkerFunction('traexQuestionDeliveryOwnsInput', owned.scope);
+    owned.scope.traexQuestionBridgeActive = () => true;
+    await owned.flush();
+    expect(owned.scope.armNativeInputBlockRecheck).not.toHaveBeenCalled();
+    expect(owned.scope.notifyNativeInputBlocked).not.toHaveBeenCalled();
+
+    // Control: with no question card, the identical blocked screen is held generically.
+    const generic = inputHarness('traex', blocked);
+    generic.scope.traexQuestionDeliveryOwnsInput = loadWorkerFunction('traexQuestionDeliveryOwnsInput', generic.scope);
+    generic.scope.traexQuestionBridgeActive = () => false;
+    await generic.flush();
+    expect(generic.scope.armNativeInputBlockRecheck).toHaveBeenCalled();
+  });
+
+  it('traexQuestionDeliveryOwnsInput is false outside TRAE or without a question surface', () => {
+    const h = inputHarness('traex', fixture('traex-0.216.0-rename-dialog.txt'));
+    h.scope.traexQuestionBridgeActive = () => false;
+    const resolve = loadWorkerFunction<() => boolean>('traexQuestionDeliveryOwnsInput', h.scope);
+    expect(resolve()).toBe(false); // no bridge, screen path throws without captureBackendScreen -> caught
+    h.scope.traexQuestionBridgeActive = () => true;
+    expect(resolve()).toBe(true); // bridge short-circuits before the screen read
+    const codex = inputHarness('codex', codexDialog(''));
+    codex.scope.traexQuestionBridgeActive = () => true;
+    const codexResolve = loadWorkerFunction<() => boolean>('traexQuestionDeliveryOwnsInput', codex.scope);
+    expect(codexResolve()).toBe(false); // non-TRAE never owns via this path
+  });
 });
 
 describe('Codex Turn 2+ untouched refusal recovery', () => {
