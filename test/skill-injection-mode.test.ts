@@ -20,6 +20,7 @@ import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { buildNewTopicPrompt } from '../src/core/session-manager.js';
 import { runSkillsAdminCommand } from '../src/core/skills/cli-admin-command.js';
 import { readFileSync } from 'node:fs';
+import { invalidateCustomizationCache, setSkillOverrideBody } from '../src/services/customization-store.js';
 
 const APP = 'cli_app_codex';
 
@@ -204,6 +205,22 @@ describe('built-in skill catalog', () => {
     expect(entries.find((e) => e.name === 'botmux-send')?.description).toContain('向飞书发送消息');
   });
 
+  it('compacts shipped descriptions while retaining every available entry and full on-demand content', () => {
+    const entries = builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: true, excludeRoutingCovered: true });
+    const block = buildBuiltinSkillCatalogBlock(entries);
+    const fullDescriptionChars = entries.reduce((sum, entry) => sum + entry.description.length, 0);
+    expect(block.length).toBeLessThan(fullDescriptionChars);
+    for (const entry of entries) {
+      expect(block).toContain(`- ${entry.name}:`);
+      expect(builtinSkillContent(entry.name)).toContain(`name: ${entry.name}`);
+    }
+    for (const name of ['botmux-schedule', 'botmux-ask', 'botmux-handoff']) {
+      const entry = entries.find((entry) => entry.name === name)!;
+      expect(block).not.toContain(entry.description);
+      expect(entry.content).toContain(entry.description);
+    }
+  });
+
   it('adds the persistent-schedule boundary only to Remote Runner catalogs', () => {
     const entries = builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: false });
     const remote = buildBuiltinSkillCatalogBlock(entries, 'en', { remoteRunner: true });
@@ -260,6 +277,29 @@ describe('built-in skill catalog', () => {
     expect(zh).toContain('botmux &lt;子命令&gt; --help');
     expect(en).toContain('&lt;botmux_routing&gt;');
     expect(en).toContain('botmux &lt;cmd&gt; --help');
+  });
+});
+
+describe('compact catalog with user skill overrides', () => {
+  let dataDir: string;
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'botmux-catalog-override-'));
+    vi.stubEnv('SESSION_DATA_DIR', dataDir);
+    invalidateCustomizationCache();
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    invalidateCustomizationCache();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it.each(['botmux-send', 'botmux-schedule', 'botmux-handoff'])('preserves the explicit %s description', (name) => {
+    const description = 'CUSTOM_TRIGGER <fixture> & explicit user rules';
+    setSkillOverrideBody(name, `---\nname: ${name}\ndescription: ${description}\n---\nUSER_BODY`);
+    const entries = builtinSkillEntries({ asksViaHook: false, excludeRoutingCovered: true });
+    const block = buildBuiltinSkillCatalogBlock(entries);
+    expect(block).toContain('CUSTOM_TRIGGER &lt;fixture&gt; &amp; explicit user rules');
+    expect(builtinSkillContent(name)).toContain('USER_BODY');
   });
 });
 

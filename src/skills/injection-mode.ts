@@ -193,21 +193,60 @@ export interface BuiltinSkillEntry { name: string; description: string; content:
  *  basic command, while its full skill owns complex delivery and safety rules. */
 const FULLY_ROUTING_COVERED_SKILLS = new Set(['botmux-history', 'botmux-quoted', 'botmux-bots']);
 
+/** Discovery triggers only; full/native metadata stays in definitions.ts. */
+const COMPACT_CATALOG_DESCRIPTIONS: Record<string, { zh: string; en: string }> = {
+  'botmux-chat-rename': {
+    zh: '修改当前群名；用户要求或群目标、阶段明显变化时使用。',
+    en: 'Rename this chat when requested or its goal/stage changes.',
+  },
+  'botmux-session-rename': {
+    zh: '修改当前任务的 Dashboard 会话标题；不改群名或飞书话题名。',
+    en: 'Rename this task in Dashboard, not the Lark chat or topic.',
+  },
+  'botmux-schedule': {
+    zh: '创建、查询、修改、暂停或取消飞书定时提醒；如每天、每周、每月、明天或 N 分钟后。',
+    en: 'Create/manage Lark reminders: daily, weekly, monthly, tomorrow, or in N minutes.',
+  },
+  'botmux-handoff': {
+    zh: '将下一步或单个专项交给一个 bot；默认留在当前话题，不新建子项目。',
+    en: 'Hand the next step or one subtask to a bot; stay in this topic by default.',
+  },
+  'botmux-orchestrate': {
+    zh: '多 bot 分工、持续多话题协调并汇总验收的长期项目；单次 DAG 用 workflow，单 bot 接力用 handoff。',
+    en: 'Long-running multi-bot/multi-topic coordination and acceptance; use workflow for a bounded DAG, handoff for one bot.',
+  },
+  'botmux-ask': {
+    zh: '向用户发选择题或输入表单并等待机器可解析的回答；支持多题、预选和整卡提交。',
+    en: 'Ask choices or an input form and wait for a structured answer; supports multiple questions and defaults.',
+  },
+  'botmux-whiteboard': {
+    zh: '读写本地项目白板，保存摘要、决策、阻塞和交接上下文。',
+    en: 'Read/write the local project whiteboard for decisions, blockers and handoff context.',
+  },
+  'botmux-chat-manager': {
+    zh: '设置、取消或查看当前普通群的负责人、默认接话人。',
+    en: 'Set, clear or view this ordinary chat\'s manager/default speaker.',
+  },
+};
+
 /** Keep the prompt-mode discovery cost bounded. The native/global skill keeps
  *  its full frontmatter description; the one-line session catalog only needs a
- *  high-signal trigger for the send cases that routing does not fully cover. */
+ *  short triggers for capabilities that routing does not fully cover. */
 function promptCatalogDescription(
   entry: BuiltinSkillEntry,
   locale?: Locale,
   opts: { remoteRunner?: boolean } = {},
 ): string {
+  const custom = isBuiltinSkillBodyOverridden(entry.name);
+  const description = custom ? entry.description
+    : COMPACT_CATALOG_DESCRIPTIONS[entry.name]?.[locale === 'en' ? 'en' : 'zh'] ?? entry.description;
   if (entry.name === 'botmux-schedule' && opts.remoteRunner) {
     const boundary = locale === 'en'
       ? 'This session runs in a temporary Remote Runner environment. For any reminder or scheduled task that must run in the future, you MUST use the persistent `botmux schedule`; never use container cron, session-only `cron_create` / `CronCreate`, or `/loop`. If this turn is itself a fired schedule, execute it instead of creating another one.'
       : '当前会话运行在可能被回收的 Remote Runner 临时环境中。凡需在未来触发的提醒或定时任务，必须使用持久化的 `botmux schedule`；不得使用容器内 cron、仅随 Session 存续的 `cron_create` / `CronCreate` 或 `/loop`。当前回合本身是已触发的定时任务时，应直接执行，不要再次创建。';
-    return `${boundary} ${entry.description}`;
+    return `${boundary} ${description}`;
   }
-  if (entry.name !== 'botmux-send') return entry.description;
+  if (entry.name !== 'botmux-send' || custom) return description;
   return locale === 'en'
     ? 'Read once before the first complex Lark send: multi-line/structured Markdown (tables or code blocks), attachments/cards/@mentions, cross-chat/top-level publishing, or --attention. Follow the full heredoc/--content-file guidance; never pass JSON.stringify/JSON-escaped \\n as literal text.'
     : '首次复杂飞书发送前读取：多行/结构化 Markdown（表格或代码块）、附件/卡片/@mention、跨群/顶层发布或 --attention。按完整说明使用 heredoc/--content-file，不要把 JSON.stringify/JSON 转义产生的 \\n 当字面量发送。';
@@ -319,11 +358,11 @@ export function buildBuiltinSkillCatalogBlock(
   const hasRouting = opts.hasRoutingBlock !== false;
   const intro = hasRouting
     ? (en
-      ? '<botmux_routing> covers basic communication only. These supplementary botmux skills are available in this session. Match the task against a description, then run `botmux skill show <name>` to read that skill\'s full instructions before acting — do not guess the commands.'
-      : '<botmux_routing> 只覆盖基础通信用法。当前 botmux 会话还有下面这些可按需读取的内置技能。先按描述判断该用哪个，再用 `botmux skill show <name>` 读取完整说明后再执行——不要凭空猜命令。')
+      ? 'Basic communication: <botmux_routing>. Match a skill below and read `botmux skill show <name>` before acting; do not guess commands.'
+      : '基础通信见 <botmux_routing>。按描述选择技能，执行前用 `botmux skill show <name>` 读取完整说明，不猜命令。')
     : (en
-      ? 'These botmux skills are available in this session, and they are the ONLY documentation for them. Match the task against a description, then run `botmux skill show <name>` to read that skill\'s full instructions before acting — do not guess the commands.'
-      : '当前 botmux 会话有下面这些内置技能，且这里是它们唯一的说明来源。先按描述判断该用哪个，再用 `botmux skill show <name>` 读取完整说明后再执行——不要凭空猜命令。');
+      ? 'These are this session\'s botmux skill entrypoints. Match a description and read `botmux skill show <name>` before acting; do not guess commands.'
+      : '当前会话的 botmux 技能入口如下。按描述选择，执行前用 `botmux skill show <name>` 读取完整说明，不猜命令。');
   const lines = entries.map((e) => escapeXmlText(`- ${e.name}: ${promptCatalogDescription(e, locale, opts)}`));
   // Distinct tag from the user-registered skill catalog (`<botmux_skills
   // mode=...>`, injected only in the worker via prepareSessionSkillPrompt) so
