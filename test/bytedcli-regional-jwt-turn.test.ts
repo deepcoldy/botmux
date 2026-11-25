@@ -318,7 +318,7 @@ describe('platform grant', () => {
 });
 });
 
-it('passes only the active global overseas partition to the proven identity resolver', async () => {
+it('tells the proven identity resolver which ByteCloud ticket a command needs', async () => {
   storageModel = 'proven';
   platform.partitions.on_alice = ['i18n'];
   await publishFor('platform', ALICE);
@@ -328,12 +328,25 @@ it('passes only the active global overseas partition to the proven identity reso
     expect(bytedcliWithEnv(site, ...args).status).toBe(0);
     expect(resolverArgs()).toBe('bytedcli --region i18n');
   }
-  for (const args of [['--site', 'cn', 'aa', 'query'], ['aa', 'query', '--help'],
-    ['codebase', 'mr', 'list'], ['meego', 'workitem', 'list']]) {
+  for (const args of [['scm', 'repo', 'build'], ['env', 'service', 'list']]) {
+    expect(bytedcli(...args)).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+    expect(resolverArgs()).toBe('bytedcli --region default');
+  }
+  expect(bytedcli('--site', 'BoE', 'env', 'service', 'list')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+  expect(resolverArgs()).toBe('bytedcli --region default');
+  expect(bytedcliWithEnv(site, '--site', 'cn', 'aa', 'query')).toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+  expect(resolverArgs()).toBe('bytedcli --region cn');
+  expect(bytedcliWithEnv({ BYTEDCLI_CLOUD_SITE: 'cn' }, 'scm', 'repo', 'build'))
+    .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
+  expect(resolverArgs()).toBe('bytedcli --region cn');
+
+  for (const args of [['aa', 'query', '--help'], ['codebase', 'mr', 'list'], ['meego', 'workitem', 'list']]) {
     expect(bytedcliWithEnv(site, ...args).status).toBe(0);
     expect(resolverArgs()).toBe('bytedcli');
   }
-  expect(bytedcli('bytecloud', 'list-legacy-vregions', '--site', 'eu-ttp').status).toBe(0);
+  // The subcommand owns this site flag and already has its own partition JWT.
+  expect(bytedcli('bytecloud', 'list-legacy-vregions', '--site', 'eu-ttp'))
+    .toMatchObject({ status: 0, jwt: jwt('i18n', 'on_alice') });
   expect(resolverArgs()).toBe('bytedcli');
 });
 

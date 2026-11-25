@@ -2,7 +2,7 @@ import { resolveBotmuxAncestorContext, resolveCurrentActor } from './cli/current
 import { parseArgs } from 'node:util';
 import { CurrentExecutionIdentityError, resolveCurrentExecutionIdentity } from './cli/current-execution.js';
 import { IDENTITY_ROUTE_TOOLS } from './services/trigger-user-auth.js';
-import { isBytedcliOverseasRegion } from './platform/bytedcli-grant-regions.js';
+import { isBytedcliIdentityRegion } from './platform/bytedcli-grant-regions.js';
 import { identityRefusalLines } from './cli/identity-refusal-guidance.js';
 
 // Governed tools plus the Codebase and Bits CLI companions that mirror bytedcli's
@@ -29,7 +29,7 @@ async function main(): Promise<void> {
   if (tool && (IDENTITY_TOOLS as readonly string[]).includes(tool)) requestedTool = tool;
   if (!values['session-id'] || !values['app-id']
     || !(IDENTITY_TOOLS as readonly string[]).includes(tool ?? '')
-    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliOverseasRegion(region)))) {
+    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliIdentityRegion(region)))) {
     throw new CurrentExecutionIdentityError('current_execution_route_unavailable', 'invalid_invocation');
   }
   const execution = await resolveCurrentExecutionIdentity({

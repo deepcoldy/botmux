@@ -41,6 +41,8 @@ export interface PlatformAuthorizationRequestArgs {
   unionId?: string;
   /** Extra lark-cli scopes the refused command needs. */
   scopes?: readonly string[];
+  /** Recheck a live turn after resolving the person, before sending a card. */
+  stillAllowed?: () => boolean;
 }
 
 interface Deps {
@@ -107,6 +109,7 @@ async function ask(
   const tools = platformTools(args.botConfig);
   const unionId = args.unionId ?? (args.openId ? await d.unionIdFor(args.botConfig.larkAppId, args.openId) : null);
   if (!unionId) return unavailable('sender union_id unresolved');
+  if (args.stillAllowed && !args.stillAllowed()) return { kind: 'unavailable' };
   const result = await d.request({
     unionId, appId: args.botConfig.larkAppId, tools,
     ...(scopes.length ? { scopes } : {}),

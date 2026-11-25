@@ -874,8 +874,27 @@ function bytedcliGlobalSite(): string[] {
   ];
 }
 
-/** Refuse a missing global partition, then preserve the existing last-site
- * override for subcommands that authenticate against a site of their own. */
+/** The last --site anywhere still controls token selection for commands whose
+ * subcommand authenticates against its own site. Arguments are only read. */
+function bytedcliSelectedSite(): string[] {
+  return [
+    '  __botmux_site=',
+    '  __botmux_next=',
+    '  for __botmux_arg in "$@"; do',
+    '    if [ -n "$__botmux_next" ]; then __botmux_site=$__botmux_arg; __botmux_next=; continue; fi',
+    '    case "$__botmux_arg" in',
+    '      --) break ;;',
+    '      --site|--cloud-site) __botmux_next=1 ;;',
+    '      --site=*) __botmux_site=${__botmux_arg#--site=} ;;',
+    '      --cloud-site=*) __botmux_site=${__botmux_arg#--cloud-site=} ;;',
+    '    esac',
+    '  done',
+    '  if [ -z "$__botmux_site" ]; then __botmux_site=${BYTEDCLI_CLOUD_SITE:-}; fi',
+    ...bytedcliSiteTrim('__botmux_site'),
+  ];
+}
+
+/** Refuse a missing global partition and then select the token. */
 function bytedcliRegionalSelection(): string[] {
   const hints = (Object.keys(BYTEDCLI_REGIONAL_MISSING_HINTS) as BytedcliRegionalJwtSource[]).map(source =>
     `      ${source}) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_HINTS[source])} ;;`);
@@ -915,21 +934,6 @@ function bytedcliRegionalSelection(): string[] {
     `    printf '%s\\n' "$__botmux_hint" '[reason=regional_jwt_missing]' >&2`,
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '  fi',
-    // The token to send: by the last --site anywhere (#2472). Arguments are
-    // only read, never rewritten: "$@" is passed to the tool unchanged.
-    '  __botmux_site=',
-    '  __botmux_next=',
-    '  for __botmux_arg in "$@"; do',
-    '    if [ -n "$__botmux_next" ]; then __botmux_site=$__botmux_arg; __botmux_next=; continue; fi',
-    '    case "$__botmux_arg" in',
-    '      --) break ;;',
-    '      --site|--cloud-site) __botmux_next=1 ;;',
-    '      --site=*) __botmux_site=${__botmux_arg#--site=} ;;',
-    '      --cloud-site=*) __botmux_site=${__botmux_arg#--cloud-site=} ;;',
-    '    esac',
-    '  done',
-    '  if [ -z "$__botmux_site" ]; then __botmux_site=${BYTEDCLI_CLOUD_SITE:-}; fi',
-    ...bytedcliSiteTrim('__botmux_site'),
     '  __botmux_regional=',
     ...bytedcliSiteRegionCase('__botmux_site', '__botmux_regional'),
     '  if [ -n "$__botmux_regional" ]; then BYTEDCLI_USER_CLOUD_JWT=$__botmux_regional; fi',
@@ -1826,11 +1830,19 @@ export function renderIdentityWrapper(
         'fi',
       ] : []),
     ] : []),
-    ...(tool === 'bytedcli' ? bytedcliGlobalSite() : []),
+    ...(tool === 'bytedcli' ? [...bytedcliGlobalSite(), ...bytedcliSelectedSite()] : []),
     ...(requestsRegionalGrant ? [
       'if ! __botmux_bd_region_free "$@"; then',
       ...bytedcliSiteRegionCase('__botmux_gsite', undefined, '__botmux_requested_region'),
-      '  case "$__botmux_requested_region" in cn) __botmux_requested_region= ;; esac',
+      '  case "$__botmux_requested_region" in',
+      '    cn)',
+      '      __botmux_selected_region=',
+      ...bytedcliSiteRegionCase('__botmux_site', undefined, '__botmux_selected_region'),
+      '      [ "$__botmux_selected_region" = cn ] || __botmux_requested_region=',
+      '      unset __botmux_selected_region ;;',
+      '    "")',
+      '      case "$__botmux_gsite:$__botmux_site" in :|[bB][oO][eE]:[bB][oO][eE]) __botmux_requested_region=default ;; esac ;;',
+      '  esac',
       'fi',
     ] : []),
     `__botmux_resolve || exit ${IDENTITY_DENIED_EXIT_CODE}`,
