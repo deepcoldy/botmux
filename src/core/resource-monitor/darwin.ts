@@ -286,12 +286,14 @@ export function applyFootprints(
 export function parseVmStat(raw: string, totalBytes: number): { memTotalBytes: number; memAvailableBytes: number } | null {
   const pageSize = Number(raw.match(/page size of (\d+) bytes/)?.[1]);
   if (!Number.isFinite(pageSize) || pageSize <= 0) return null;
-  const pages = (label: string): number => {
+  const pages = (label: string): number | null => {
     const match = raw.match(new RegExp(`^${label}:\\s+(\\d+)\\.?\\s*$`, 'm'));
-    return match ? Number(match[1]) : 0;
+    return match ? Number(match[1]) : null;
   };
-  const reclaimable = pages('Pages free') + pages('Pages speculative') + pages('Pages inactive');
-  if (reclaimable <= 0) return null;
+  const counters = [pages('Pages free'), pages('Pages speculative'), pages('Pages inactive')];
+  if (counters.some(value => value === null || !Number.isFinite(value))) return null;
+  // Zero available pages is a valid exhausted host, not a failed sample.
+  const reclaimable = counters.reduce<number>((sum, value) => sum + value!, 0);
   return {
     memTotalBytes: totalBytes,
     memAvailableBytes: reclaimable * pageSize,
