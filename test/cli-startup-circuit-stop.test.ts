@@ -76,6 +76,8 @@ function harness(cliId = 'pi', backendType = 'pty') {
     turnFailedWithoutOutput: () => false, recoverDeferredPromptReadyAtTurnTerminal: vi.fn(),
     log: vi.fn(), send: vi.fn((terminal: Terminal) => terminals.push(terminal)),
     parkCrashDiagnosticTerminal: vi.fn(),
+    traexRuntimeLease: undefined, traexLeaseRunning: false,
+    pendingTraexSpawnAbandon: undefined, stopTraexLeaseHeartbeat: vi.fn(),
   };
   scope.killCli = vi.fn(() => { scope.backend = null; scope.isPromptReady = false; });
   scope.spawnCli = vi.fn(async () => { scope.backend = { destroySession: vi.fn() }; });
