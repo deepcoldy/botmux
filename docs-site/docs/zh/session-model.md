@@ -111,7 +111,7 @@ agent 因为任务阶段变化主动改群名时，会加 `--proactive`，10 分
 | 层级 | 能做什么 | 谁有 |
 |------|----------|------|
 | **对话权** | 提问、让它查日志、读代码 | 管理员（`allowedUsers`）、白名单群里的所有人（`allowedChatGroups`）、被授权的访客（`/grant`）、Oncall 群成员等；`blockedUsers` 里的人一律不行 |
-| **操作权** | botmux 的斜杠命令（如 `/cd`、`/restart`、`/close`、`/rename`、`/card`）和卡片按钮 | 管理员（`allowedUsers`）。没配任何白名单时人人都有 |
+| **操作权** | botmux 的斜杠命令（如 `/cd`、`/restart`、`/close`、`/rename`、`/card`）和卡片按钮 | 管理员（`allowedUsers`）。没配任何白名单时人人都有。按话题划分的会话（含私聊）的发起人另可关闭自己发起的会话（卡片上的「❌ 关闭会话」） |
 | **管理** | `/grant`、`/revoke` 给别人授权，开关 Oncall 等 | 机器人主人和管理员 |
 
 - botmux 命令默认都要操作权。少数命令只要对话权，比如 `/resume`。
