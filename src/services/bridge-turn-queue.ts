@@ -541,6 +541,9 @@ interface RecentUnobservedTurn {
   chainUuids: Set<string>;
   progressChainUuids: Set<string>;
   sawParentUuid: boolean;
+  pendingToolUseIds: Set<string>;
+  apiRequestInFlight: boolean;
+  awaitingPostToolAssistant: boolean;
   hadTrailingVisibleText: boolean;
   closedAtMs: number;
 }
@@ -700,8 +703,8 @@ export class BridgeTurnQueue {
   }
 
   /** True when `turn` was re-opened from a recent unobserved-boundary IM close
-   *  (Scenario 3). Such turns must not re-enter the open-turn watchdog, V1
-   *  handoff admission, or emit a duplicate `turn_terminal`. */
+   *  (Scenario 3). Such turns get a fresh bounded open-turn episode, but must
+   *  not enter V1 handoff admission or emit a duplicate `turn_terminal`. */
   isLateUnobservedRecovery(turn: BridgePendingTurn): boolean {
     return this.reattachedFromUnobserved.has(turn);
   }
@@ -749,7 +752,6 @@ export class BridgeTurnQueue {
     if (!head || head.isLocal || !head.started || head !== this.collecting) return undefined;
     if (head.terminalObserved || head.closedByDurationMarker || head.rateLimited) return undefined;
     if (head.restoredFromJournal || head.carriedAcrossGeneration) return undefined;
-    if (this.reattachedFromUnobserved.has(head)) return undefined;
     return head;
   }
 
@@ -1198,6 +1200,10 @@ export class BridgeTurnQueue {
               live.activitySeq++;
             } else if (!this.collecting && this.recentUnobservedTurn) {
               if (matchesRecentUnobservedLineage(ev, sourceJsonlPath, this.recentUnobservedTurn, Date.now())) {
+                for (const toolUseId of userToolResultIds(ev)) {
+                  this.recentUnobservedTurn.pendingToolUseIds.delete(toolUseId);
+                }
+                this.recentUnobservedTurn.awaitingPostToolAssistant = true;
                 this.extendRecentUnobservedChain(uuid, ev);
               } else {
                 this.recentUnobservedTurn = null;
@@ -1270,6 +1276,7 @@ export class BridgeTurnQueue {
           live.activitySeq++;
         } else if (!this.collecting && this.recentUnobservedTurn) {
           if (matchesRecentUnobservedLineage(ev, sourceJsonlPath, this.recentUnobservedTurn, Date.now())) {
+            this.recentUnobservedTurn.awaitingPostToolAssistant = true;
             this.extendRecentUnobservedChain(uuid, ev);
           } else {
             this.recentUnobservedTurn = null;
@@ -1441,6 +1448,9 @@ export class BridgeTurnQueue {
             const live = this.liveStateFor(recovered);
             live.startUuid = anchor.startUuid;
             live.sawParentUuid = anchor.sawParentUuid;
+            live.pendingToolUseIds = new Set(anchor.pendingToolUseIds);
+            live.apiRequestInFlight = anchor.apiRequestInFlight;
+            live.awaitingPostToolAssistant = anchor.awaitingPostToolAssistant;
             live.reattachedAtMs = Date.now();
             for (const id of anchor.chainUuids) addBoundedKey(live.chainUuids, id, MAX_TRACKED_CHAIN_UUIDS);
             for (const id of anchor.progressChainUuids) addBoundedKey(live.progressChainUuids, id, MAX_TRACKED_PROGRESS_UUIDS);
@@ -2185,6 +2195,9 @@ export class BridgeTurnQueue {
           chainUuids: new Set(live?.chainUuids ?? []),
           progressChainUuids: new Set(live?.progressChainUuids ?? []),
           sawParentUuid: live?.sawParentUuid ?? false,
+          pendingToolUseIds: new Set(live?.pendingToolUseIds ?? []),
+          apiRequestInFlight: live?.apiRequestInFlight ?? false,
+          awaitingPostToolAssistant: live?.awaitingPostToolAssistant ?? false,
           hadTrailingVisibleText: live?.hasTrailingVisibleText ?? false,
           closedAtMs: Date.now(),
         };

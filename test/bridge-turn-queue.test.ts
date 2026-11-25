@@ -3523,6 +3523,43 @@ describe('BridgeTurnQueue open-turn evidence, interrupts, and Scenario 3 unobser
     }
   });
 
+  it('Scenario 3 re-attachment restores execution evidence and survives another idle before the final', () => {
+    for (const resultFirst of [false, true]) {
+      const q = new BridgeTurnQueue();
+      q.mark('om_reopen', makeFingerprint('reopen'), Date.now() - 1_000, 'reopen');
+      q.ingest([
+        mkUser('u1', 'reopen'),
+        mkAssistant('a_nar', 'u1', [{ type: 'text', text: 'working' }]),
+        mkAssistant('a_tool', 'a_nar', [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: {} }], 'tool_use'),
+      ], '/t/s.jsonl');
+      expect(q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true })[0]?.turnId)
+        .toBe('om_reopen');
+
+      if (resultFirst) q.ingest([mkToolResult('tr1', 'a_tool', 'tu1')], '/t/s.jsonl');
+      q.ingest([
+        mkAssistant('a_late', resultFirst ? 'tr1' : 'a_tool', [{ type: 'text', text: 'still working' }], null),
+      ], '/t/s.jsonl');
+      const reopened = q.openLiveNonLocalTurn();
+      expect(reopened?.turnId).toBe('om_reopen');
+      expect(q.getOpenTurnEvidence(reopened!)).toMatchObject({
+        unmatchedToolUseCount: resultFirst ? 0 : 1,
+        awaitingPostToolAssistant: false,
+      });
+      if (!resultFirst) {
+        expect(q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true })).toEqual([]);
+      }
+
+      if (!resultFirst) q.ingest([mkToolResult('tr1', 'a_late', 'tu1')], '/t/s.jsonl');
+      q.ingest([
+        mkAssistant('a_final', 'tr1', [{ type: 'text', text: 'real final' }], 'end_turn'),
+        mkDuration('d1', 'a_final'),
+      ], '/t/s.jsonl');
+      const recovered = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(recovered).toHaveLength(1);
+      expect(recovered[0]).toMatchObject({ turnId: 'om_reopen', isLocal: false });
+    }
+  });
+
   it('Scenario 3B (trailing text already emitted at unobserved pop): mints late-recovery-* anchored to om_A, unless covered by explicit send', () => {
     const q = new BridgeTurnQueue();
     q.mark('om_B', makeFingerprint('check status'), Date.now() - 5_000, 'check status');

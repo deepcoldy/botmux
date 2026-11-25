@@ -351,6 +351,39 @@ describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)',
     h.disarm();
   });
 
+  it('Scenario 3 re-attachment starts a fresh bounded open-turn episode', () => {
+    for (const resultFirst of [false, true]) {
+      const h = createWatchdogWiring();
+      h.queue.mark('om_reopen', makeFingerprint('reopen'), 100, 'reopen');
+      h.queue.ingest([
+        mkUser('u1', 'reopen'),
+        mkAssistant('a_nar', 'u1', 'working', null),
+        {
+          ...mkAssistant('a_tool', 'a_nar', '', 'tool_use'),
+          message: {
+            role: 'assistant', model: 'claude-test', stop_reason: 'tool_use',
+            content: [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: {} }],
+          },
+        },
+      ], '/t/s.jsonl');
+      expect(h.hold('screen')).toBe(true);
+      h.disarm();
+      h.queue.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true });
+      if (resultFirst) {
+        h.queue.ingest([{
+          type: 'user', uuid: 'tr1', parentUuid: 'a_tool', timestamp: new Date().toISOString(),
+          message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }] },
+        }], '/t/s.jsonl');
+      }
+      h.queue.ingest([
+        mkAssistant('a_late', resultFirst ? 'tr1' : 'a_tool', 'still working', null),
+      ], '/t/s.jsonl');
+
+      expect(h.hold('screen')).toBe(true);
+      h.disarm();
+    }
+  });
+
   it('Finding 17: openClaudeTurnHasExplicitFinalSend ignores cross-chat detoured_send and terminalIndependent markers', () => {
     const now = Date.now();
     const h = createWatchdogWiring({
