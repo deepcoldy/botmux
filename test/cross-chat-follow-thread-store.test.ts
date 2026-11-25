@@ -309,6 +309,31 @@ describe('cross-chat follow store failure and replay semantics', () => {
     });
   });
 
+  it('rejects cross-session timestamp ties in either traversal order, but accepts a later unique owner', () => {
+    const other = { ...sessions[0], sessionId: 'sess-b', chatId: 'oc_other' };
+    for (const [sessionId, turnId] of [['sess-a', 'om_source_a'], ['sess-b', 'om_source_b']]) {
+      recordCrossChatFollowThreadBinding(tempDir, sessionId, {
+        sentAtMs: 1000, deliveryKind: 'detoured_send', messageId: `om_receipt_${sessionId}`,
+        targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed',
+        crossChatFollowThread: 'at', turnId,
+      });
+    }
+    const resolveOrder = (order: CrossChatCandidateSession[]) => resolveCrossChatFollowedThread({
+      dataDir: tempDir, larkAppId: 'cli_cross', chatId: 'oc_followed',
+      candidateRootIds: ['om_root_b'], sessions: order,
+    });
+    expect(resolveOrder([sessions[0], other])).toBeNull();
+    expect(resolveOrder([other, sessions[0]])).toBeNull();
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-b', {
+      sentAtMs: 1001, deliveryKind: 'detoured_send', messageId: 'om_new_receipt',
+      targetRootMessageId: 'om_root_b', targetChatId: 'oc_followed',
+      crossChatFollowThread: 'at', turnId: 'om_source_b',
+    });
+    for (const order of [[sessions[0], other], [other, sessions[0]]]) {
+      expect(resolveOrder(order)).toMatchObject({ sourceSessionId: 'sess-b', sourceTurnId: 'om_source_b' });
+    }
+  });
+
   it('serializes replay at with a concurrent off writer across real processes', async () => {
     const replayReady = join(tempDir, 'replay-ready');
     const offReady = join(tempDir, 'off-ready');

@@ -178,6 +178,7 @@ describe('cross-chat followed thread binding', () => {
     expect(matchTopLevel).toEqual({
       sourceSessionId: 'sess-a',
       sourceTurnId: 'om_origin_human_turn',
+      sourceReceiptMessageId: SENT_ROOT_IN_B,
       sourceChatId: GROUP_A,
       scope: 'chat',
       anchor: GROUP_A,

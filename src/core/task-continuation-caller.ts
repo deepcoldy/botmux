@@ -65,7 +65,6 @@ export function buildTaskContinuationCaller(input: {
       ...(sourcePrincipal.requestUserUnionId
         ? { unionId: sourcePrincipal.requestUserUnionId }
         : {}),
-      ...(sourcePrincipal.verifiedEmail ? { verifiedEmail: sourcePrincipal.verifiedEmail } : {}),
       sourceSessionId: sourceSession.sessionId,
       sourceTurnId,
     },

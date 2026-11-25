@@ -118,6 +118,8 @@ vi.mock('../src/core/session-manager.js', async () => {
 
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
+import { ensureCrossChatFollowThreadAtBinding } from '../src/services/cross-chat-follow-thread-store.js';
+import { resolveCrossChatFollowedThread } from '../src/services/cross-chat-thread-binding.js';
 
 import { registerBot, getBot } from '../src/bot-registry.js';
 import {
@@ -512,6 +514,44 @@ describe('a message in a topic whose session was closed (real route)', () => {
     expect(mocks.forkWorker).not.toHaveBeenCalled();
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(mocks.resumeSession).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('keeps an in-flight legacy receipt only when enrichment is the same receipt (replace=%s)', async replace => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    source.session.followThreadEpoch = 'epoch-current';
+    writeFollowBinding('sess-live', 'epoch-current');
+    const expected = resolveCrossChatFollowedThread({
+      dataDir: mocks.dataDir, larkAppId: APP, chatId: 'oc_external_followed',
+      candidateRootIds: ['om_external_followed_root'], sessions: [source.session],
+    });
+    expect(expected).not.toBeNull();
+    expect(expected?.sourceTurnId).toBeUndefined();
+    const { data, ctx } = event('legacy receipt awaiting download', 'bot');
+    ctx.crossChatThreadFollowUp = expected!;
+    let finishDownload!: (value: { attachments: never[]; needLogin: boolean }) => void;
+    mocks.downloadResources.mockImplementationOnce(() => new Promise(resolve => { finishDownload = resolve; }));
+    const handling = handleThreadReply(data, ctx);
+    await vi.waitFor(() => expect(mocks.downloadResources).toHaveBeenCalled());
+    if (replace) {
+      recordBridgeReplyMarker({
+        dataDir: mocks.dataDir, sessionId: 'sess-live', sentAtMs: 2000,
+        messageId: 'om_different_receipt', targetRootMessageId: 'om_external_followed_root',
+        deliveryKind: 'detoured_send', content: 'new binding', targetChatId: 'oc_external_followed',
+        crossChatFollowThread: 'at', followThreadEpoch: 'epoch-current', turnId: 'om_new_source',
+      });
+    } else {
+      expect(ensureCrossChatFollowThreadAtBinding({
+        dataDir: mocks.dataDir, sessionId: 'sess-live', sentAtMs: 2000,
+        messageId: 'om_external_followed_root', targetChatId: 'oc_external_followed',
+        followThreadEpoch: 'epoch-current', sourceTurnId: 'om_enriched_source',
+      })).toBe(true);
+    }
+    finishDownload({ attachments: [], needLogin: false });
+    await handling;
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(replace ? 0 : 1);
+    if (!replace) expect(mocks.forkWorker.mock.calls[0]?.[1]?.trustedCaller).toBeUndefined();
   });
 
   it('rejects a cross-chat follow-up when the source closes during attachment download', async () => {

@@ -200,7 +200,10 @@ export function pendingInputAllowsTypeAhead(
     && !durableTurnInFlight
     && !directRpcTurnInFlight
     && next?.dispatchAttempt === undefined
-    && !next?.vcMeetingImTurnOrigin;
+    && !next?.vcMeetingImTurnOrigin
+    // Adopt init can reserve this same logical turn before the external pane
+    // is idle, so authority matching cannot authorize busy type-ahead.
+    && !inputForcesSerialTurn(next ?? {});
 }
 
 /** Args-baked first prompts bypass `flushPending`, which is where durable HOL

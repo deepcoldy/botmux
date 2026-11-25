@@ -4430,7 +4430,15 @@ function crossChatFollowUpIsCurrent(ctx: RoutingContext): boolean {
     : undefined;
   const valid = !!current
     && current.sourceSessionId === expected.sourceSessionId
-    && current.sourceTurnId === expected.sourceTurnId
+    && (current.sourceTurnId === expected.sourceTurnId
+      // Replay can enrich the SAME provider receipt while attachments load.
+      // Missing receipt proof or any actual rebind still fails closed; the
+      // admitted legacy turn remains callerless, not newly authenticated.
+      || (!expected.sourceTurnId && !!current.sourceTurnId
+        && !!expected.sourceReceiptMessageId
+        && current.sourceReceiptMessageId === expected.sourceReceiptMessageId))
+    && (expected.sourceReceiptMessageId === undefined
+      || current.sourceReceiptMessageId === expected.sourceReceiptMessageId)
     && current.followThreadEpoch === expected.followThreadEpoch
     && current.sourceChatId === expected.sourceChatId
     && current.scope === expected.scope

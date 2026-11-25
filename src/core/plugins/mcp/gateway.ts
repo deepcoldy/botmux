@@ -658,7 +658,15 @@ export class PluginMcpGateway {
       // two fields above: a plugin that maps the caller onto real access needs
       // it, an unrelated HTTP-transport server does not.
       ...(caller?.senderType ? { senderType: caller.senderType } : {}),
-      ...(caller?.taskContinuation ? { taskContinuation: caller.taskContinuation } : {}),
+      // Project the public continuation fields even for persisted callers from
+      // older workers; verified email belongs only to protected grants.
+      ...(caller?.taskContinuation ? { taskContinuation: {
+        appId: caller.taskContinuation.appId,
+        openId: caller.taskContinuation.openId,
+        ...(caller.taskContinuation.unionId ? { unionId: caller.taskContinuation.unionId } : {}),
+        sourceSessionId: caller.taskContinuation.sourceSessionId,
+        sourceTurnId: caller.taskContinuation.sourceTurnId,
+      } } : {}),
       ...(identity?.turnId ? { turnId: identity.turnId } : {}),
       ...(this.env.BOTMUX_SESSION_ID ? { sessionId: this.env.BOTMUX_SESSION_ID } : {}),
       ...(identity?.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),

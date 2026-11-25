@@ -832,6 +832,8 @@ describe('plugin MCP Gateway', () => {
               appId: 'cli_continuation',
               openId: 'ou_original_human',
               unionId: 'on_original_human',
+              // Persisted callers from older workers can still have extra fields.
+              ...{ verifiedEmail: 'legacy-human@example.test', unexpectedSecret: 'legacy-secret' },
               sourceSessionId: 'source-session',
               sourceTurnId: 'om_source_turn',
             },
@@ -860,6 +862,9 @@ describe('plugin MCP Gateway', () => {
       expect(text).toContain('"taskContinuation":{"appId":"cli_continuation","openId":"ou_original_human","unionId":"on_original_human","sourceSessionId":"source-session","sourceTurnId":"om_source_turn"}');
       expect(text).not.toContain('ou_forged');
       expect(text).not.toContain('om_forged');
+      expect(text).not.toContain('verifiedEmail');
+      expect(text).not.toContain('legacy-human@example.test');
+      expect(text).not.toContain('legacy-secret');
     } finally {
       await client.close();
       await gateway.close();

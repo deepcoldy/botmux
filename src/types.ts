@@ -130,7 +130,6 @@ export interface TrustedCaller {
     appId: string;
     openId: string;
     unionId?: string;
-    verifiedEmail?: string;
     sourceSessionId: string;
     sourceTurnId: string;
   };

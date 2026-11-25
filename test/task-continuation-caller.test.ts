@@ -57,7 +57,6 @@ describe('cross-chat task continuation caller', () => {
         appId: APP_ID,
         openId: HUMAN,
         unionId: 'on_original_human',
-        verifiedEmail: 'human@bytedance.com',
         sourceSessionId: 'source-session',
         sourceTurnId: 'om_source_turn',
       },
