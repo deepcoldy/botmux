@@ -1,5 +1,5 @@
 import type { DaemonSession } from './types.js';
-import type { PendingRepoSetup } from '../types.js';
+import type { PendingRepoSetup, Session } from '../types.js';
 import { readGlobalConfig } from '../global-config.js';
 import { getBot } from '../bot-registry.js';
 import { resolveEffectiveLinkRefMode } from '../services/link-ref-config.js';
@@ -95,6 +95,18 @@ export function persistPendingRepoCardMessageId(ds: DaemonSession, messageId: st
     setup.repoCardMessageId = prior;
     throw err;
   }
+}
+
+export function retainQueuedActivationRawInput(session: Session, rawInput: string, rawTurnId?: string): void {
+  session.queuedActivationRawInput = rawInput;
+  session.queuedActivationRawTurnId = rawTurnId;
+}
+
+export function restoreQueuedActivationRawInput(ds: DaemonSession): void {
+  const raw = ds.session.queuedActivationRawInput;
+  if (raw === undefined) return;
+  ds.pendingRawInput = raw;
+  ds.pendingRawTurnId = ds.session.queuedActivationRawTurnId ?? ds.session.queuedActivationTurnId;
 }
 
 export function restorePendingRepoRuntime(ds: DaemonSession): boolean {

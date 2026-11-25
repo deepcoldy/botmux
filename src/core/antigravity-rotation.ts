@@ -8,6 +8,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import type { LarkAttachment } from '../types.js';
 import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
 import type { RestartObserverStatus } from './restart-coordinator.js';
 import {
@@ -74,6 +75,7 @@ export interface AntigravityReplayPayload {
   sourceTurnId?: string;
   cliInput: string;
   userPrompt: string;
+  attachments?: LarkAttachment[];
 }
 
 export interface AntigravityAutoRotateEligibilityInput {

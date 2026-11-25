@@ -1,10 +1,13 @@
 import type { AskQuestion, PendingAsk } from './ask-types.js';
+import { isNativeAsyncAskOrigin } from './ask-types.js';
 
 export const ASK_CUSTOM_MAX_LENGTH = 1000;
 export const ASK_CUSTOM_TOTAL_LENGTH = 2000;
 /** Only general question origins. Host-owned security/identity approvals stay closed. */
 export function supportsAskCustomInput(ask: Pick<PendingAsk, 'originKind' | 'questions'>): boolean {
-  return !ask.questions.some(q => q.input) && ['explicit', 'host_explicit', 'hook', 'native-user-input', 'native-user-input-async'].includes(ask.originKind ?? '')
+  const generalOrigin = ['explicit', 'host_explicit', 'hook', 'native-user-input'].includes(ask.originKind ?? '')
+    || isNativeAsyncAskOrigin(ask.originKind);
+  return !ask.questions.some(q => q.input) && generalOrigin
     && ask.questions.some(q => q.allowCustom !== false);
 }
 

@@ -67,6 +67,7 @@ function harness(extra: Record<string, unknown> = {}) {
     knownTraexReasoningEffortsForModel, cliModelSupportsReasoningEffort: () => true, send: vi.fn(), log: vi.fn(),
     resolveTraexAutoModelSettings, validTraexAutoModelRuntime,
     restartCliProcess: vi.fn(async () => {}), t: (key: string) => key,
+    recoverUnconfirmedSessionRename: () => false,
     ...extra,
   };
   wireAutoModelSettings(scope);

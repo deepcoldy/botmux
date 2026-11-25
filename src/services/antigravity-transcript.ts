@@ -74,7 +74,8 @@
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
-import { existsSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { closeSync, existsSync, fstatSync, openSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import type { CodexBridgeEvent } from './codex-transcript.js';
@@ -292,19 +293,50 @@ export interface AntigravityTranscriptState {
   /** Legacy command wait, separate from subagent waits: foreground work can
    *  clear this even when an agy build omitted the command callback. */
   hasPendingTask?: boolean;
+  /** Tracked background command/timer task IDs whose completion notifications
+   *  have not yet arrived (deduplicated). When multiple tasks run in parallel,
+   *  a completion notification removes only its own ID instead of dropping the
+   *  remaining waits. */
+  pendingTaskIds?: string[];
+  /** A background RUNNING record without a task ID is a separate anonymous
+   *  wait. Removing the last known sibling ID must not clear it. */
+  hasPendingAnonymousTask?: boolean;
   /** The RUNNING record's logical step. Only its immediate DONE successor is
    *  accepted as callback-less command-result evidence; poll results can be
    *  physically written before their lower-step tool_call. */
   pendingTaskRunningStep?: number;
+  /** Task ID that owns pendingTaskRunningStep and any adjacent DONE evidence.
+   *  Recovery of one known command must not clear its running siblings. */
+  pendingTaskRunningTaskId?: string;
   /** The command RUNNING step's immediate non-launch DONE successor landed.
    *  invoke_subagent may use this narrower callback-less recovery signal;
    *  the launch alone does not prove an independent command ended. */
   hasPendingTaskResult?: boolean;
+  /** Known task IDs with their own adjacent DONE evidence. Unlike the legacy
+   *  singleton fields, this survives interleaved RUNNING records. */
+  pendingTaskResultIds?: string[];
   /** Launched subagents whose first notifications have not arrived,
    *  deduplicated by id. A notification can request guidance rather than
    *  finish the work; send_message does not re-arm this wait because it does
    *  not promise a reply. An array keeps carried worker state serializable. */
   pendingSubagentIds?: string[];
+  /** Daemon task IDs intentionally excluded from turn-blocking waits. Their
+   *  completion/scheduled notifications must not settle an anonymous command. */
+  ignoredDaemonTaskIds?: string[];
+  /** Ephemeral launch hints for `IsDaemon: true` background calls in the latest
+   *  tool_calls batch so standing daemons (dev servers / standing crons) are
+   *  not latched as turn-blocking waits. Mixed batches retain ordinary
+   *  descriptions and logical-step hints: only positive launch correlation may
+   *  exclude a RUNNING record; unresolved description collisions stay pending. */
+  pendingDaemonHints?: {
+    allDaemon?: boolean;
+    descriptions?: string[];
+    nonDaemonDescriptions?: string[];
+    /** GENERIC's logical step is the planner step plus the tool call's
+     *  one-based ordinal. A matching step + description can disambiguate a
+     *  mixed batch even when another candidate shares the description. */
+    stepHints?: { stepIndex: number; isDaemon: boolean; descriptions: string[] }[];
+  };
 }
 
 /** Every GENERIC record in observed logs with this phrase has status RUNNING;
@@ -312,11 +344,30 @@ export interface AntigravityTranscriptState {
  *  still alive" marker. Status RUNNING alone is accepted too (it never occurs
  *  for foreground tool results in observed logs). */
 const BACKGROUND_TASK_PHRASE_RE = /running as a background task/i;
+const BACKGROUND_TASK_ID_RE = /(?:with\s+)?task\s+id:?\s*([A-Za-z0-9._/-]+)/i;
+const LEGACY_TASK_RESULT_RE = /^[Tt]ask(?:\s+id)?\s*:?[ \t]*"?([A-Za-z0-9._/-]+)"?[ \t]+(?:finished|completed|was cancel(?:l)?ed|failed|timed out)\b/;
+// Unheaded cancellation is necessarily a coarse recovery signal. Restrict the
+// clear-all reset to an explicit user/request/turn cancellation (or a terse
+// leading "canceled/interrupted/aborted"); a notice about one background task
+// must not erase unrelated command/subagent waits that are still outstanding.
+const SYSTEM_CANCEL_RE = /^(?:(?:the\s+)?user\s+)?(?:cancell?ed|interrupted|aborted)\b|^(?:the\s+)?(?:(?:user\s+)?request|turn)\s+(?:was\s+)?(?:cancell?ed|interrupted|aborted)\b/i;
+const SYSTEM_SINGLE_TASK_CANCEL_RE = /^(?:the\s+)?(?:background\s+)?task\s+(?:was\s+)?(?:cancell?ed|interrupted|aborted)\b/i;
 
 function isBackgroundTaskRunningRecord(obj: any): boolean {
   if (obj?.type !== 'GENERIC') return false;
   return obj?.status === 'RUNNING'
     || (typeof obj?.content === 'string' && BACKGROUND_TASK_PHRASE_RE.test(obj.content));
+}
+
+function backgroundTaskId(obj: any): string | undefined {
+  const content = typeof obj?.content === 'string' ? obj.content : '';
+  return content.match(BACKGROUND_TASK_ID_RE)?.[1];
+}
+
+function backgroundTaskDescription(obj: any): string | undefined {
+  const content = typeof obj?.content === 'string' ? obj.content : '';
+  const line = content.match(/(?:^|\n)Task Description:\s*([^\r\n]+)/i)?.[1]?.trim();
+  return line || undefined;
 }
 
 export interface AntigravityDrainResult {
@@ -353,20 +404,27 @@ function cloneState(state: AntigravityTranscriptState | undefined): AntigravityT
   return {
     ...(candidate ? { provisionalFinal: { ...candidate } } : {}),
     ...pendingState(state),
+    ...daemonHintState(state),
     ...(state?.sourceTurnId ? { sourceTurnId: state.sourceTurnId } : {}),
   };
 }
 
 /** Shared by the worker's quiet latch and both drainer flush paths. */
 export function hasAntigravityPendingTasks(state: AntigravityTranscriptState): boolean {
-  return !!state.hasPendingTask || !!state.pendingSubagentIds?.length;
+  return !!state.hasPendingTask || !!state.pendingTaskIds?.length || !!state.pendingSubagentIds?.length;
 }
 
 function commandState(state: AntigravityTranscriptState | undefined): AntigravityTranscriptState {
-  return state?.hasPendingTask ? {
+  const hasPending = !!state?.hasPendingTask || !!state?.pendingTaskIds?.length;
+  const resultIds = state?.pendingTaskResultIds?.filter(id => state.pendingTaskIds?.includes(id));
+  return hasPending ? {
     hasPendingTask: true,
-    ...(state.pendingTaskRunningStep !== undefined ? { pendingTaskRunningStep: state.pendingTaskRunningStep } : {}),
-    ...(state.hasPendingTaskResult ? { hasPendingTaskResult: true } : {}),
+    ...(state?.pendingTaskIds?.length ? { pendingTaskIds: [...state.pendingTaskIds] } : {}),
+    ...(state?.hasPendingAnonymousTask ? { hasPendingAnonymousTask: true } : {}),
+    ...(state?.pendingTaskRunningStep !== undefined ? { pendingTaskRunningStep: state.pendingTaskRunningStep } : {}),
+    ...(state?.pendingTaskRunningTaskId ? { pendingTaskRunningTaskId: state.pendingTaskRunningTaskId } : {}),
+    ...(state?.hasPendingTaskResult ? { hasPendingTaskResult: true } : {}),
+    ...(resultIds?.length ? { pendingTaskResultIds: [...resultIds] } : {}),
   } : {};
 }
 
@@ -374,11 +432,142 @@ function pendingState(state: AntigravityTranscriptState | undefined): Antigravit
   return {
     ...commandState(state),
     ...(state?.pendingSubagentIds?.length ? { pendingSubagentIds: [...state.pendingSubagentIds] } : {}),
+    ...ignoredDaemonTaskState(state),
   };
+}
+
+function ignoredDaemonTaskState(state: AntigravityTranscriptState | undefined): AntigravityTranscriptState {
+  return state?.ignoredDaemonTaskIds?.length
+    ? { ignoredDaemonTaskIds: [...state.ignoredDaemonTaskIds] }
+    : {};
+}
+
+function commandWaitCount(state: AntigravityTranscriptState | undefined): number {
+  const identifiedAndAnonymous = (state?.pendingTaskIds?.length ?? 0) + (state?.hasPendingAnonymousTask ? 1 : 0);
+  return identifiedAndAnonymous || (state?.hasPendingTask ? 1 : 0);
 }
 
 function subagentState(ids: readonly string[] | undefined): AntigravityTranscriptState {
   return ids?.length ? { pendingSubagentIds: [...ids] } : {};
+}
+
+function daemonHintState(state: AntigravityTranscriptState | undefined): AntigravityTranscriptState {
+  const hints = state?.pendingDaemonHints;
+  if (!hints || (!hints.allDaemon && !hints.descriptions?.length)) return {};
+  return {
+    pendingDaemonHints: {
+      ...(hints.allDaemon ? { allDaemon: true } : {}),
+      ...(hints.descriptions?.length ? { descriptions: [...hints.descriptions] } : {}),
+      ...(hints.nonDaemonDescriptions?.length ? { nonDaemonDescriptions: [...hints.nonDaemonDescriptions] } : {}),
+      ...(hints.stepHints?.length ? {
+        stepHints: hints.stepHints.map(hint => ({ ...hint, descriptions: [...hint.descriptions] })),
+      } : {}),
+    },
+  };
+}
+
+function daemonHintsFromToolCalls(
+  toolCalls: readonly any[],
+  plannerStepIndex?: number,
+): AntigravityTranscriptState['pendingDaemonHints'] {
+  let daemonCount = 0;
+  let nonDaemonBgCapableCount = 0;
+  const descriptions: string[] = [];
+  const nonDaemonDescriptions: string[] = [];
+  const stepHints: { stepIndex: number; isDaemon: boolean; descriptions: string[] }[] = [];
+  for (const [callIndex, call] of toolCalls.entries()) {
+    const name = call?.name ?? call?.function?.name;
+    if (name !== 'run_command' && name !== 'schedule') continue;
+    const args = toolCallArguments(call);
+    const isDaemon = decodeArgumentValue(args?.IsDaemon) === true;
+    if (isDaemon) daemonCount++;
+    else nonDaemonBgCapableCount++;
+
+    const callDescriptions: string[] = [];
+    for (const rawField of [args?.CommandLine, args?.Prompt, args?.CronExpression]) {
+      const decoded = decodeArgumentValue(rawField);
+      if (typeof decoded === 'string' && decoded.trim()) callDescriptions.push(decoded.trim());
+    }
+    const cronExpression = decodeArgumentValue(args?.CronExpression);
+    if (typeof cronExpression === 'string' && cronExpression.trim()) {
+      // RUNNING records wrap schedule expressions as `Cron: <expression>`;
+      // retain the raw form too for builds that omit the wrapper.
+      callDescriptions.push(`Cron: ${cronExpression.trim()}`);
+    }
+    (isDaemon ? descriptions : nonDaemonDescriptions).push(...callDescriptions);
+    if (typeof plannerStepIndex === 'number' && Number.isInteger(plannerStepIndex)) {
+      stepHints.push({
+        stepIndex: plannerStepIndex + callIndex + 1,
+        isDaemon,
+        descriptions: callDescriptions,
+      });
+    }
+  }
+  if (daemonCount === 0) return undefined;
+  return {
+    ...(nonDaemonBgCapableCount === 0 ? { allDaemon: true } : {}),
+    ...(descriptions.length > 0 ? { descriptions } : {}),
+    ...(nonDaemonDescriptions.length > 0 ? { nonDaemonDescriptions } : {}),
+    ...(stepHints.length > 0 ? { stepHints } : {}),
+  };
+}
+
+function isDaemonBackgroundRecord(
+  obj: any,
+  hints: AntigravityTranscriptState['pendingDaemonHints'],
+): boolean {
+  if (!hints) return false;
+  if (hints.allDaemon) {
+    // The latest batch being all-daemon says nothing about older/out-of-order
+    // records. Exact logical-step correlation alone is sufficient for its own
+    // launches, even when a compact RUNNING omits Task Description.
+    return hints.stepHints?.some(hint => hint.isDaemon && hint.stepIndex === obj.step_index) === true;
+  }
+  const desc = backgroundTaskDescription(obj);
+  if (!desc) return false;
+  const matches = (candidate: string) => candidate.startsWith(desc) || desc.startsWith(candidate);
+  const stepHint = hints.stepHints?.find(hint =>
+    hint.stepIndex === obj.step_index && hint.descriptions.some(matches));
+  if (stepHint) return stepHint.isDaemon;
+  if (!hints.descriptions?.length) return false;
+  if (!hints.descriptions.some(matches)) return false;
+  // A compact log may truncate either side of a description. If the same
+  // observation also matches an ordinary launch, its daemon provenance is
+  // ambiguous: keep the turn-blocking wait rather than releasing authority
+  // while an ordinary background command is still running.
+  return !hints.nonDaemonDescriptions?.some(matches);
+}
+
+function removePendingTaskId(
+  state: AntigravityTranscriptState,
+  completedId: string | undefined,
+): AntigravityTranscriptState {
+  const ids = state.pendingTaskIds;
+  if (ids && ids.length > 0) {
+    // Once concrete IDs are tracked, an absent or unrelated ID proves nothing
+    // about those waits. This applies to completion notifications and explicit
+    // manage_task kills alike, including a sole tracked task.
+    if (!completedId || !ids.includes(completedId)) return commandState(state);
+    const remaining = ids.filter(id => id !== completedId);
+    if (remaining.length > 0) {
+      const remainingResultIds = state.pendingTaskResultIds?.filter(id => remaining.includes(id));
+      // RUNNING-step/result evidence belongs to the command that produced it.
+      // The legacy fields do not record that owner, so never transfer them to
+      // a surviving sibling after another task completes.
+      return {
+        hasPendingTask: true,
+        pendingTaskIds: remaining,
+        ...(state.hasPendingAnonymousTask ? { hasPendingAnonymousTask: true } : {}),
+        ...(remainingResultIds?.length ? { pendingTaskResultIds: remainingResultIds } : {}),
+      };
+    }
+    return state.hasPendingAnonymousTask
+      ? { hasPendingTask: true, hasPendingAnonymousTask: true }
+      : {};
+  }
+  // Legacy RUNNING records without an ID retain their historical clear-all
+  // completion behavior; there is no concrete wait identity to preserve.
+  return {};
 }
 
 /** Match the tool's result header, not arbitrary conversationIds in output. */
@@ -430,6 +619,36 @@ function abandonSubagentWaits(state: AntigravityTranscriptState, toolCalls: any[
     // immediately flush that stale candidate before the kill's result lands.
     const { provisionalFinal: _final, pendingSubagentIds: _ids, ...rest } = state;
     state = { ...rest, ...subagentState(ids) };
+  }
+  return state;
+}
+
+/** An explicit `manage_task(Action="kill", TaskId=...)` abandons that
+ *  background task wait without clearing unrelated tasks or subagents. */
+function abandonCommandWaits(state: AntigravityTranscriptState, toolCalls: any[]): AntigravityTranscriptState {
+  for (const call of toolCalls) {
+    if ((call?.name ?? call?.function?.name) !== 'manage_task') continue;
+    const args = toolCallArguments(call);
+    const action = decodeArgumentValue(args?.Action);
+    const taskId = decodeArgumentValue(args?.TaskId);
+    if (action !== 'kill' || typeof taskId !== 'string' || !taskId.trim()) continue;
+    // A concrete kill ID cannot be correlated to an anonymous legacy wait.
+    // Completion notifications retain their legacy recovery semantics, but an
+    // explicit kill for another/unknown task must not erase that wait.
+    if (!state.pendingTaskIds?.length && state.hasPendingTask) continue;
+    const nextCmd = removePendingTaskId(state, taskId.trim());
+    const {
+      provisionalFinal: _final,
+      hasPendingTask: _pending,
+      pendingTaskIds: _taskIds,
+      hasPendingAnonymousTask: _anonymous,
+      pendingTaskRunningStep: _step,
+      pendingTaskRunningTaskId: _taskId,
+      hasPendingTaskResult: _res,
+      pendingTaskResultIds: _resultIds,
+      ...rest
+    } = state;
+    state = { ...rest, ...nextCmd };
   }
   return state;
 }
@@ -493,14 +712,18 @@ function foldRecord(
     }
     const raw = typeof obj.content === 'string' ? obj.content : '';
     const text = unwrapAntigravityUserInput(raw);
+    // Turn-scoped waits reset at an explicit input, but daemon identity must
+    // survive so a late notification from an older turn cannot settle a new
+    // anonymous ordinary wait.
+    const carriedDaemonIds = ignoredDaemonTaskState(state);
     if (text) {
       const next = adoptMode ? { sourceTurnId: uuid } : {};
       events.push({ uuid, timestampMs, kind: 'user', text, ...next,
         ...(adoptMode ? { inputTextAliases: [] } : {}),
       });
-      return next;
+      return { ...next, ...carriedDaemonIds };
     }
-    return {};
+    return carriedDaemonIds;
   }
 
   if (type === 'PLANNER_RESPONSE') {
@@ -517,18 +740,53 @@ function foldRecord(
       //    session 098f4ab3's 491-char release summary) still emit its real
       //    final instead of latching forever.
       state = abandonSubagentWaits(state, obj.tool_calls);
-      if (obj.tool_calls.every(isTaskPollToolCall)) return state;
+      state = abandonCommandWaits(state, obj.tool_calls);
+      const daemonHints = daemonHintsFromToolCalls(obj.tool_calls, obj.step_index);
+      if (obj.tool_calls.every(isTaskPollToolCall)) {
+        const { pendingDaemonHints: _staleDaemon, ...rest } = state;
+        return daemonHints ? { ...rest, pendingDaemonHints: daemonHints } : rest;
+      }
       const hasOrdinaryForeground = obj.tool_calls.some((call: any) =>
         !isTaskPollToolCall(call) && !isSubagentLaunchToolCall(call));
+      // A physically late launch has its RUNNING logical step inside this
+      // planner batch's immediate tool-result range. It is provenance for that
+      // wait, not foreground recovery; genuinely separate foreground work
+      // (including older step numbers from observed real logs) may still clear.
+      const runningBelongsToPlannerBatch = state.pendingTaskRunningStep !== undefined
+        && typeof obj.step_index === 'number'
+        && Number.isInteger(obj.step_index)
+        && obj.step_index < state.pendingTaskRunningStep
+        && state.pendingTaskRunningStep <= obj.step_index + obj.tool_calls.length;
+      const foregroundRecovery = hasOrdinaryForeground && !runningBelongsToPlannerBatch;
       // Ordinary foreground work retains the legacy recovery heuristic. A
       // subagent launch is narrower: it recovers a missing callback only after
       // a command-result DONE, never while the command is still merely RUNNING.
-      const launchRecovery = state.hasPendingTaskResult
+      const launchRecovery = (state.hasPendingTaskResult || !!state.pendingTaskResultIds?.length)
         && obj.tool_calls.some(isSubagentLaunchToolCall);
+      const provenResultIds = [...new Set([
+        ...(state.pendingTaskResultIds ?? []),
+        ...(state.hasPendingTaskResult && state.pendingTaskRunningTaskId ? [state.pendingTaskRunningTaskId] : []),
+      ])];
+      let recoveredCommand = commandState(state);
+      if (foregroundRecovery || launchRecovery) {
+        if (state.pendingTaskIds?.length) {
+          // Each known command needs its own adjacent DONE. Recover every
+          // proven ID while retaining any sibling still lacking that evidence.
+          for (const taskId of provenResultIds) {
+            recoveredCommand = removePendingTaskId(recoveredCommand, taskId);
+          }
+        } else if (commandWaitCount(state) <= 1) {
+          // Only the anonymous legacy wait retains the old foreground recovery
+          // heuristic; a concrete task ID requires its own result evidence.
+          recoveredCommand = {};
+        }
+      }
       return {
         ...turn,
-        ...(!hasOrdinaryForeground && !launchRecovery ? commandState(state) : {}),
+        ...recoveredCommand,
         ...subagentState(state.pendingSubagentIds),
+        ...ignoredDaemonTaskState(state),
+        ...(daemonHints ? { pendingDaemonHints: daemonHints } : {}),
       };
     }
     const text = typeof obj.content === 'string' ? obj.content : '';
@@ -558,11 +816,42 @@ function foldRecord(
   // outstanding-task state must survive it; the completion SYSTEM_MESSAGE is
   // the actual wake-up that clears it.
   if (isBackgroundTaskRunningRecord(obj)) {
-    const { hasPendingTaskResult: _staleResult, pendingTaskRunningStep: _staleStep, ...rest } = state;
+    if (isDaemonBackgroundRecord(obj, state.pendingDaemonHints)) {
+      // Standing daemon processes (`IsDaemon: true`, e.g. dev servers or
+      // recurring crons meant to outlive the turn) must not block turn idle.
+      // Retain their IDs only to distinguish their notifications from an
+      // anonymous ordinary command completion.
+      const daemonTaskId = backgroundTaskId(obj);
+      const withDaemonId = daemonTaskId ? {
+        ...state,
+        ignoredDaemonTaskIds: [...new Set([...(state.ignoredDaemonTaskIds ?? []), daemonTaskId])],
+      } : state;
+      return { ...turn, ...pendingState(withDaemonId), ...daemonHintState(state) };
+    }
+    const {
+      hasPendingTaskResult: _staleResult,
+      pendingTaskRunningStep: _staleStep,
+      pendingTaskRunningTaskId: _staleTaskId,
+      pendingTaskResultIds: _staleResultIds,
+      ...rest
+    } = state;
     const runningStep = typeof obj.step_index === 'number' && Number.isInteger(obj.step_index)
       ? obj.step_index
       : undefined;
-    return { ...rest, hasPendingTask: true, ...(runningStep !== undefined ? { pendingTaskRunningStep: runningStep } : {}) };
+    const taskId = backgroundTaskId(obj);
+    const nextTaskIds = taskId
+      ? [...new Set([...(state.pendingTaskIds ?? []), taskId])]
+      : state.pendingTaskIds;
+    const nextResultIds = state.pendingTaskResultIds?.filter(id => id !== taskId);
+    return {
+      ...rest,
+      hasPendingTask: true,
+      ...(nextTaskIds?.length ? { pendingTaskIds: nextTaskIds } : {}),
+      ...(!taskId ? { hasPendingAnonymousTask: true } : {}),
+      ...(runningStep !== undefined ? { pendingTaskRunningStep: runningStep } : {}),
+      ...(taskId ? { pendingTaskRunningTaskId: taskId } : {}),
+      ...(nextResultIds?.length ? { pendingTaskResultIds: nextResultIds } : {}),
+    };
   }
   if (type === 'GENERIC') {
     // Foreground tool output after a content-only step cancels the candidate;
@@ -579,10 +868,19 @@ function foldRecord(
       && ids.length === 0
       && state.pendingTaskRunningStep !== undefined
       && obj.step_index === state.pendingTaskRunningStep + 1;
+    const resultOwner = commandResult ? state.pendingTaskRunningTaskId : undefined;
+    const withCommandResult = commandResult ? {
+      ...state,
+      hasPendingTaskResult: true,
+      ...(resultOwner ? {
+        pendingTaskResultIds: [...new Set([...(state.pendingTaskResultIds ?? []), resultOwner])],
+      } : {}),
+    } : state;
     return {
       ...turn,
-      ...pendingState(commandResult ? { ...state, hasPendingTaskResult: true } : state),
+      ...pendingState(withCommandResult),
       ...subagentState([...new Set([...(state.pendingSubagentIds ?? []), ...ids])]),
+      ...daemonHintState(state),
     };
   }
 
@@ -599,20 +897,55 @@ function foldRecord(
     // Older builds omit sender and sometimes [Message] itself. Match only a
     // task result at the payload's start, never a quoted result in a reminder
     // or a subagent's report body.
-    const legacyTaskResult = !sender
-      && /^[Tt]ask(?: id)?\s+[^\n]*? (?:finished|completed|was cancel(?:l)?ed|failed|timed out)\b/.test(payload);
+    const legacyMatch = !sender ? payload.match(LEGACY_TASK_RESULT_RE) : null;
+    const legacyTaskResult = !!legacyMatch;
+    const legacyTaskId = legacyMatch?.[1];
     // Pure system notices do not wake the planner with a result and may land
-    // after its real final. Preserve both pending work and the held candidate.
-    if (!header && !legacyTaskResult) return state;
+    // after its real final. Preserve both pending work and the held candidate,
+    // except explicit user cancellation notices which terminate pending waits.
+    if (!header && !legacyTaskResult) {
+      const trimmedPayload = payload.trim();
+      if (!/^Reminder:/i.test(trimmedPayload) && SYSTEM_CANCEL_RE.test(trimmedPayload)) {
+        return { ...turn, ...ignoredDaemonTaskState(state) };
+      }
+      const pendingCommands = commandWaitCount(state);
+      if (!/^Reminder:/i.test(trimmedPayload)
+        && pendingCommands === 1
+        && !state.pendingSubagentIds?.length
+        && SYSTEM_SINGLE_TASK_CANCEL_RE.test(trimmedPayload)) {
+        return { ...turn, ...ignoredDaemonTaskState(state) };
+      }
+      return state;
+    }
     const ids = state.pendingSubagentIds?.filter(id => id !== sender);
+    const ignoredDaemonCompletion = (taskSender && sender !== undefined
+      && state.ignoredDaemonTaskIds?.includes(sender) === true)
+      || (legacyTaskResult && legacyTaskId !== undefined
+        && state.ignoredDaemonTaskIds?.includes(legacyTaskId) === true);
+    // While a daemon launch is still awaiting its RUNNING record, an unrelated
+    // or early completion cannot prove that an anonymous ordinary task ended.
+    // Keep both the wait and launch hints so a later RUNNING can establish the
+    // daemon identity instead of being latched or killed as ordinary work.
+    if (!ignoredDaemonCompletion
+      && (taskSender || legacyTaskResult)
+      && !state.pendingTaskIds?.length
+      && state.hasPendingTask
+      && state.pendingDaemonHints) {
+      return state;
+    }
+    if (ignoredDaemonCompletion) return state;
     return {
       ...turn,
-      ...(!taskSender && !legacyTaskResult ? commandState(state) : {}),
+      ...(taskSender || legacyTaskResult
+        ? removePendingTaskId(state, taskSender ? sender : legacyTaskId)
+        : commandState(state)),
       ...subagentState(ids),
+      ...ignoredDaemonTaskState(state),
+      ...daemonHintState(state),
     };
   }
   if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
-    return { ...turn, ...subagentState(state.pendingSubagentIds) };
+    return { ...turn, ...subagentState(state.pendingSubagentIds), ...ignoredDaemonTaskState(state) };
   }
 
   // CHECKPOINT / TASK_NOTIFICATION / unknown types neither confirm nor cancel;
@@ -650,7 +983,8 @@ export function drainAntigravityTranscript(
     // screen cannot prove the turn is done.
     if (options.flushTrailingFinal && incomingState.provisionalFinal && !hasAntigravityPendingTasks(incomingState)) {
       const events = [incomingState.provisionalFinal];
-      return { events, newOffset: fromOffset, pendingTail: '', state: pendingState(incomingState) };
+      const nextState = pendingState(incomingState);
+      return { events, newOffset: fromOffset, pendingTail: '', state: nextState };
     }
     return { events: [], newOffset: fromOffset, pendingTail: '', state: cloneState(incomingState) };
   }
@@ -700,4 +1034,368 @@ export function readAntigravitySideAnswer(conversationId: string, question: stri
   const input = events.filter(event => event.kind === 'user');
   if (input.length !== 1 || input[0]!.text.trim() !== question) return;
   return events.reverse().find(event => event.kind === 'assistant_final')?.text.trim() || undefined;
+}
+
+const PENDING_SCAN_INITIAL_CHUNK = 64 * 1024;
+const PENDING_SCAN_FULL_MAX_CHUNK = 1024 * 1024;
+const PENDING_SCAN_COMPACT_MAX_CHUNK = 4 * 1024 * 1024;
+
+function isExplicitUserInput(rec: any): boolean {
+  return rec?.type === 'USER_INPUT' && (rec.source === undefined || rec.source === 'USER_EXPLICIT');
+}
+
+function isTaskResultRecord(rec: any): boolean {
+  if (rec?.type !== 'SYSTEM_MESSAGE' || typeof rec.content !== 'string') return false;
+  const content = rec.content;
+  const header = systemMessageHeader(content);
+  const sender = header.match(/(?:^|\s)sender=([A-Za-z0-9._/-]+)(?:\s|$)/)?.[1];
+  if (sender !== undefined && /\/task-[A-Za-z0-9._-]+$/.test(sender)) return true;
+  const payload = header
+    ? (header.match(/(?:^|\s)content=(.*)/)?.[1] ?? header)
+    : systemMessagePayload(content);
+  return LEGACY_TASK_RESULT_RE.test(payload);
+}
+
+function scanTranscriptTailForPendingTasks(
+  transcriptPath: string,
+  maxChunkBytes: number,
+): { bounded: boolean; pending: boolean } {
+  if (!existsSync(transcriptPath)) return { bounded: true, pending: false };
+  try {
+    const fd = openSync(transcriptPath, 'r');
+    try {
+      const stats = fstatSync(fd);
+      if (stats.size === 0) return { bounded: true, pending: false };
+
+      let chunkSize = Math.min(stats.size, PENDING_SCAN_INITIAL_CHUNK);
+      let lastParsed: any[] = [];
+      while (chunkSize <= stats.size) {
+        const buf = Buffer.alloc(chunkSize);
+        readSync(fd, buf, 0, chunkSize, stats.size - chunkSize);
+        const text = buf.toString('utf-8');
+        const rawLines = text.split('\n');
+        const candidateLines = stats.size > chunkSize ? rawLines.slice(1) : rawLines;
+        const parsed: any[] = [];
+        for (const raw of candidateLines) {
+          const line = raw.trim();
+          if (!line) continue;
+          try { parsed.push(JSON.parse(line)); } catch { /* ignore partial/corrupt lines */ }
+        }
+        lastParsed = parsed;
+
+        let turnStart = -1;
+        for (let i = parsed.length - 1; i >= 0; i--) {
+          if (isExplicitUserInput(parsed[i])) {
+            turnStart = i;
+            break;
+          }
+        }
+        const needsEarlierProvenance = stats.size > chunkSize && parsed.some(isTaskResultRecord);
+        if (turnStart >= 0 && !needsEarlierProvenance) {
+          let state: AntigravityTranscriptState = {};
+          const events: CodexBridgeEvent[] = [];
+          // Fold the whole retained window: each USER_INPUT resets turn waits,
+          // while daemon IDs are deliberately carried forward. Starting at the
+          // latest input would lose older daemon identity needed to reject its
+          // late notification in a newer anonymous-task turn.
+          for (let i = 0; i < parsed.length; i++) {
+            state = foldRecord(transcriptPath, i, parsed[i], 0, events, state, false, false);
+          }
+          return { bounded: true, pending: hasAntigravityPendingTasks(state) };
+        }
+        if (chunkSize >= stats.size) return { bounded: false, pending: false };
+        if (chunkSize >= maxChunkBytes) break;
+        chunkSize = Math.min(stats.size, Math.min(chunkSize * 4, maxChunkBytes));
+      }
+
+      let state: AntigravityTranscriptState = {};
+      const events: CodexBridgeEvent[] = [];
+      for (let i = 0; i < lastParsed.length; i++) {
+        state = foldRecord(transcriptPath, i, lastParsed[i], 0, events, state, false, false);
+      }
+      return { bounded: false, pending: hasAntigravityPendingTasks(state) };
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return { bounded: true, pending: false };
+  }
+}
+
+/**
+ * Inspect the latest explicit user turn in an Antigravity transcript on disk
+ * and report whether any non-daemon background command task or subagent is
+ * still pending.
+ *
+ * Used by the worker's prompt-ready authority guard when the structured
+ * transcript bridge is not active (ordinary `replyDelivery: 'send'` mode) or
+ * has not yet attached, reusing the exact same `foldRecord` state machine as
+ * `drainAntigravityTranscript`.
+ */
+export function hasAntigravityTranscriptPendingTasks(transcriptPath: string): boolean {
+  if (!transcriptPath || !existsSync(transcriptPath)) return false;
+  const fullLimit = antigravityCompactSiblingPath(transcriptPath)
+    ? PENDING_SCAN_FULL_MAX_CHUNK
+    : PENDING_SCAN_COMPACT_MAX_CHUNK;
+  const primary = scanTranscriptTailForPendingTasks(transcriptPath, fullLimit);
+  if (primary.bounded) return primary.pending;
+  const compactSibling = antigravityCompactSiblingPath(transcriptPath);
+  if (compactSibling && existsSync(compactSibling)) {
+    const compact = scanTranscriptTailForPendingTasks(compactSibling, PENDING_SCAN_COMPACT_MAX_CHUNK);
+    if (compact.bounded) return compact.pending;
+  }
+  // A capped window without an explicit USER_INPUT boundary is inconclusive,
+  // not proof of either state. Widen once to the whole file so long completed
+  // turns can release while a RUNNING beyond the cap still holds authority.
+  // Only a file with no explicit turn boundary at all remains fail-closed.
+  const exhaustive = scanTranscriptTailForPendingTasks(transcriptPath, Number.MAX_SAFE_INTEGER);
+  return exhaustive.bounded ? exhaustive.pending : true;
+}
+
+export interface AntigravityCompletedTurnCandidate {
+  turnId: string;
+  submittedText?: string;
+  /** 归一化 submittedText 的 SHA-256 摘要（用于从 PID marker 恢复而不落盘明文）。 */
+  submittedTextSha256?: string;
+  /** 采样 minByteOffset 时的 transcript 文件路径（用于 compact → full 视图切换时换算偏移）。 */
+  sampledTranscriptPath?: string;
+  /** 提交该候选回合前采样的 transcript 字节偏移下界；纯文本匹配仅接受 >= 换算后下界的 USER_INPUT，
+   *  避免同文重复提示词（如静态定时巡检或零注入下的「继续」）误命中更早的已完成回合。 */
+  minByteOffset?: number;
+  /** 提交前同会话内排在它之前、且尚未落盘到 minByteOffset 之前的同文/未知正文在途回合数；
+   *  纯文本匹配必须跳过前 skipPriorMatches 条命中，才把后续独立 occurrence 归属给本候选。 */
+  skipPriorMatches?: number;
+}
+
+export function hashAntigravitySubmittedText(text: string): string {
+  return createHash('sha256').update(text.replace(/\r\n?/g, '\n')).digest('hex');
+}
+
+/** 将采样文件坐标系下的字节下界换算到当前读取的 transcriptPath；
+ *  compact → full 走 mapAntigravityCompactOffsetToFull，其余无法安全对齐的跨文件切换一律 fail-closed（返回 null）。 */
+export function resolveAntigravityCandidateMinByteOffset(
+  candidate: Pick<AntigravityCompletedTurnCandidate, 'minByteOffset' | 'sampledTranscriptPath'>,
+  transcriptPath: string,
+): number | undefined | null {
+  if (candidate.minByteOffset === undefined) return undefined;
+  const sampled = candidate.sampledTranscriptPath;
+  if (!sampled || sampled === transcriptPath) return candidate.minByteOffset;
+  if (antigravityFullSiblingPath(sampled) === transcriptPath) {
+    const mapped = mapAntigravityCompactOffsetToFull(sampled, candidate.minByteOffset, transcriptPath);
+    return mapped === undefined ? null : mapped;
+  }
+  if (antigravityCompactSiblingPath(sampled) === transcriptPath) {
+    return candidate.minByteOffset === 0 ? 0 : null;
+  }
+  return null;
+}
+
+/** 统计 transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 次数。 */
+export function countAntigravityUserInputMatches(
+  transcriptPath: string,
+  textSha256: string,
+  minByteOffset = 0,
+  maxByteOffset?: number,
+): number {
+  if (!transcriptPath || !existsSync(transcriptPath)) return 0;
+  if (maxByteOffset !== undefined && maxByteOffset <= minByteOffset) return 0;
+  let count = 0;
+  scanJsonlFromOffset(transcriptPath, minByteOffset, {
+    ...(maxByteOffset !== undefined ? { endOffset: maxByteOffset } : {}),
+    onLine: line => {
+      if (!line.trim()) return;
+      let rec: any;
+      try {
+        rec = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (!isExplicitUserInput(rec)) return;
+      const unwrapped = unwrapAntigravityUserInput(typeof rec.content === 'string' ? rec.content : '');
+      if (hashAntigravitySubmittedText(unwrapped) === textSha256) count += 1;
+    },
+  });
+  return count;
+}
+
+const COMPLETED_TURN_INITIAL_TAIL_BYTES = 256 * 1024;
+const COMPLETED_TURN_MAX_TAIL_BYTES = 4 * 1024 * 1024;
+
+/** 从 BotMux 注入的 envelope 头部提取 `<message_location message_id="..."/>`。
+ *  仅扫描 `<user_message>` 之前的系统头，防止正文引用伪造回执归属。 */
+function extractBotmuxMessageLocationId(unwrappedUserInput: string): string | undefined {
+  const userMsgIdx = unwrappedUserInput.indexOf('<user_message>');
+  const header = userMsgIdx >= 0 ? unwrappedUserInput.slice(0, userMsgIdx) : unwrappedUserInput;
+  const match = header.match(/(?:^|\n)<message_location\b[^>]*\bmessage_id="([^"]+)"[^>]*\/>(?:\n|$)/);
+  return match?.[1];
+}
+
+/** 从 Antigravity 原生 transcript 判定哪些候选非 durable 回合已被消费并完成。
+ *  仅当 transcript 尾部不处于忙碌态，且候选回合对应的独立 USER_INPUT 之后
+ *  存在非空无工具调用的 PLANNER_RESPONSE（DONE）时，才认定其已完成（fail-closed）。 */
+export function findCompletedAntigravityTurnIds(
+  transcriptPath: string,
+  candidates: readonly AntigravityCompletedTurnCandidate[],
+): Set<string> {
+  const result = new Set<string>();
+  if (candidates.length === 0 || !existsSync(transcriptPath)) return result;
+  // 最新回合仍有未完成的非 daemon 后台任务或 subagent 时，其无工具 PLANNER_RESPONSE 只是等待旁白，
+  // 绝不能提前判定该回合已结束并回收归属权。
+  if (hasAntigravityTranscriptPendingTasks(transcriptPath)) return result;
+
+  const candidateIds = new Set<string>();
+  const hashToCandidates = new Map<string, Array<{
+    turnId: string;
+    minByteOffset?: number;
+    skipPriorMatches: number;
+  }>>();
+  let earliestMinOffset: number | undefined;
+  for (const candidate of candidates) {
+    if (!candidate.turnId) continue;
+    candidateIds.add(candidate.turnId);
+    const textSha256 = candidate.submittedTextSha256
+      ?? (candidate.submittedText ? hashAntigravitySubmittedText(candidate.submittedText) : undefined);
+    if (textSha256) {
+      const effectiveMinOffset = resolveAntigravityCandidateMinByteOffset(candidate, transcriptPath);
+      if (effectiveMinOffset === null) continue;
+      if (effectiveMinOffset !== undefined) {
+        earliestMinOffset = earliestMinOffset === undefined
+          ? effectiveMinOffset
+          : Math.min(earliestMinOffset, effectiveMinOffset);
+      }
+      const entry = {
+        turnId: candidate.turnId,
+        minByteOffset: effectiveMinOffset,
+        skipPriorMatches: Math.max(0, candidate.skipPriorMatches ?? 0),
+      };
+      const list = hashToCandidates.get(textSha256);
+      if (list) {
+        if (!list.some(item => item.turnId === candidate.turnId)) list.push(entry);
+      } else {
+        hashToCandidates.set(textSha256, [entry]);
+      }
+    }
+  }
+  if (candidateIds.size === 0) return result;
+
+  try {
+    const fd = openSync(transcriptPath, 'r');
+    try {
+      const stats = fstatSync(fd);
+      if (stats.size === 0) return result;
+
+      let chunkSize = Math.min(stats.size, COMPLETED_TURN_INITIAL_TAIL_BYTES);
+      while (chunkSize <= stats.size) {
+        const windowStart = stats.size - chunkSize;
+        const buf = Buffer.alloc(chunkSize);
+        readSync(fd, buf, 0, chunkSize, windowStart);
+
+        let busy = false;
+        const pending = new Set<string>();
+        const completed = new Set<string>();
+        const seenCandidates = new Set<string>();
+        const plainTextSeenCounts = new Map<string, number>();
+        const plainTextClaimed = new Set<string>();
+
+        let pos = 0;
+        if (windowStart > 0) {
+          const firstNl = buf.indexOf(0x0a);
+          pos = firstNl >= 0 ? firstNl + 1 : buf.length;
+        }
+        while (pos < buf.length) {
+          const nl = buf.indexOf(0x0a, pos);
+          const lineEnd = nl >= 0 ? nl : buf.length;
+          const lineFileOffset = windowStart + pos;
+          const line = buf.subarray(pos, lineEnd).toString('utf-8').trim();
+          pos = nl >= 0 ? nl + 1 : buf.length;
+          if (!line) continue;
+          let rec: any;
+          try {
+            rec = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          const type = rec?.type;
+          if (type === 'USER_INPUT') {
+            if (rec.source !== undefined && rec.source !== 'USER_EXPLICIT') continue;
+            busy = true;
+            const unwrapped = unwrapAntigravityUserInput(
+              typeof rec.content === 'string' ? rec.content : '',
+            ).replace(/\r\n?/g, '\n');
+            const matched: string[] = [];
+            const locId = extractBotmuxMessageLocationId(unwrapped);
+            if (locId && candidateIds.has(locId)) {
+              matched.push(locId);
+            }
+            if (hashToCandidates.size > 0) {
+              const byHash = hashToCandidates.get(hashAntigravitySubmittedText(unwrapped));
+              if (byHash) {
+                let claimedThisOccurrence = false;
+                for (const entry of byHash) {
+                  if (locId && locId !== entry.turnId) continue;
+                  if (entry.minByteOffset !== undefined && lineFileOffset < entry.minByteOffset) continue;
+                  const seen = (plainTextSeenCounts.get(entry.turnId) ?? 0) + 1;
+                  plainTextSeenCounts.set(entry.turnId, seen);
+                  if (claimedThisOccurrence || plainTextClaimed.has(entry.turnId)) continue;
+                  if (seen <= entry.skipPriorMatches) continue;
+                  plainTextClaimed.add(entry.turnId);
+                  claimedThisOccurrence = true;
+                  if (!matched.includes(entry.turnId)) matched.push(entry.turnId);
+                }
+              }
+            }
+            for (const turnId of matched) {
+              seenCandidates.add(turnId);
+              completed.delete(turnId);
+              pending.add(turnId);
+            }
+            continue;
+          }
+          if (type === 'PLANNER_RESPONSE') {
+            if (Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0) {
+              busy = true;
+              continue;
+            }
+            const content = typeof rec.content === 'string' ? rec.content.trim() : '';
+            if (content.length > 0 && (rec.status === undefined || rec.status === 'DONE')) {
+              busy = false;
+              for (const turnId of pending) completed.add(turnId);
+              pending.clear();
+            }
+            continue;
+          }
+          if (type === 'GENERIC') {
+            busy = true;
+            continue;
+          }
+          if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
+            busy = false;
+            continue;
+          }
+          if (type === 'SYSTEM_MESSAGE') {
+            if (/cancell?ed|interrupted|aborted/i.test(String(rec.content ?? ''))) {
+              busy = false;
+            }
+            continue;
+          }
+        }
+
+        // transcript 自身仍处于执行态时绝不提前回收任何候选回合。
+        if (busy) return new Set();
+
+        const coversMinOffsets = earliestMinOffset === undefined || windowStart <= earliestMinOffset;
+        if ((seenCandidates.size === candidateIds.size && coversMinOffsets)
+          || chunkSize >= stats.size
+          || chunkSize >= COMPLETED_TURN_MAX_TAIL_BYTES) {
+          return completed;
+        }
+        chunkSize = Math.min(stats.size, Math.min(chunkSize * 4, COMPLETED_TURN_MAX_TAIL_BYTES));
+      }
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return new Set();
+  }
+  return result;
 }

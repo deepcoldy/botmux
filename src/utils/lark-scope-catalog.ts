@@ -35,10 +35,19 @@ export const RESOURCE_DOWNLOAD_OAUTH_SCOPES: readonly string[] = ['im:resource']
 export const ON_DEMAND_USER_SCOPES: readonly string[] = RESOURCE_DOWNLOAD_OAUTH_SCOPES;
 
 /**
- * 飞书确有用户身份、但 botmux 的权限清单（user 桶）没有的 scope。按需权限也在其中：
- * 清单里不放是为了建 bot 时不申请，`/login --scope im:resource` 仍须能申请。
+ * 飞书确有用户身份、但 botmux 的默认权限清单（user 桶）没有的 scope。
+ * 清单里不放是为了建 bot 时不申请，但老应用、extra-scopes 或按需授权仍须通过名称校验。
+ *
+ * 这里只放行名称校验；是否影响旧 token 续权由 ON_DEMAND_USER_SCOPES 单独决定。
+ * 从默认 user 清单移除的历史合法项可以留在这里，切勿因此加入 ON_DEMAND_USER_SCOPES。
  */
-const EXTRA_USER_SCOPES: ReadonlySet<string> = new Set(['im:chat', 'im:chat:readonly', ...ON_DEMAND_USER_SCOPES]);
+const EXTRA_USER_SCOPES: ReadonlySet<string> = new Set([
+  'im:chat',
+  'im:chat:readonly',
+  'docs:document.comment:update',
+  'docx:document.block:convert',
+  ...ON_DEMAND_USER_SCOPES,
+]);
 
 export function isValidLarkScopeSyntax(scope: string): boolean {
   return /^[a-z0-9_]+(:[a-z0-9_.-]+)+$/i.test(scope) || scope === 'offline_access';

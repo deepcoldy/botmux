@@ -17,6 +17,7 @@ import { recordScheduledSessionRun } from '../src/core/scheduled-send.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { startingCardHealthyStatus } from '../src/core/starting-card-health.js';
 
 const APP = 'cli_reattach_stale_turn';
 const SESSION = 'reattach-stale-turn-session';
@@ -552,5 +553,32 @@ describe('Daemon IPC convergence: observe, relay, transferSession, and turn attr
     const admitted = s.store.executions(s.ref, 'om_second_turn');
     expect(admitted).toHaveLength(1);
     expect(admitted[0]?.ref).toEqual(second);
+  });
+
+  it('records starting-card health for queued Turn 2+ under SessionContract v2 while rejecting stale reattach turnIds', async () => {
+    const { ds, controller, sendFromWorker } = await bootFakeContractWorker({
+      sessionId: 'contract-v2-starting-health',
+    });
+    const turn2 = 'om_queued_turn_2';
+    controller.admitInput(turn2, 0);
+
+    // Queued/unbound Turn 2 frame must still populate per-turn starting-card health (Race A & live disarm).
+    await sendFromWorker({
+      type: 'screen_update',
+      status: 'working',
+      content: 'turn 2 running',
+      turnId: turn2,
+      dispatchAttempt: 0,
+    });
+    expect(startingCardHealthyStatus(ds, turn2)).toBe('working');
+
+    // Stale prior-runtime turnId that is neither admitted nor current/pending must NOT populate health.
+    await sendFromWorker({
+      type: 'screen_update',
+      status: 'working',
+      content: 'stale prior runtime',
+      turnId: STALE_TURN,
+    });
+    expect(startingCardHealthyStatus(ds, STALE_TURN)).toBeUndefined();
   });
 });

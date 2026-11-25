@@ -15,6 +15,7 @@ import { NEXT_STEP_ELEMENT_ID } from './next-step-card.js';
 import { TURN_RECAP_ELEMENT_ID } from './turn-recap-card.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
 import { stripTrailingGroupContextCardPurposeMarker, hasTrailingGroupContextMediaPurposeMarker } from './group-context-card.js';
+import { redactProtectedLarkEvent } from './protected-event.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -551,8 +552,10 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
 export function parseEventMessage(
   data: RawEventData,
   numberer: ImgNumberer = createImgNumberer(),
-): { parsed: LarkMessage; resources: MessageResource[] } {
-  const { sender, message } = data;
+): { parsed: LarkMessage; resources: MessageResource[]; data: RawEventData } {
+  data = redactProtectedLarkEvent(data);
+  const sender = data.sender;
+  const message = data.message;
 
   // Trace non-text messages at debug only (DEBUG=1 gated). The raw card/post
   // content can be many KB and may include attachment metadata that's
@@ -597,7 +600,7 @@ export function parseEventMessage(
     createTime: message.create_time,
     mentions,
   };
-  return { parsed, resources };
+  return { parsed, resources, data };
 }
 
 /** `resolveMentions`: render `@_user_N` placeholders with the message's own

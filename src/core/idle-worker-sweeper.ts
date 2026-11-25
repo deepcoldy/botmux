@@ -538,7 +538,8 @@ function holdsReclaimForUnsettledTurn(ds: DaemonSession, now: number): boolean {
  *  - no input delivered to it is still waiting for its CLI to take it, and
  *  - no answer of its last turn is still on its way to the group (bounded,
  *    see {@link unsettledTurnHold}).
- * Ordered least-recently-messaged first so all policies evict LRU.
+ * Order by the last activity, including the idle edge: a long-running turn
+ * can have the oldest message and still have just finished work.
  */
 function suspendableIdleCandidates(
   activeSessions: Map<string, DaemonSession>,
@@ -570,7 +571,8 @@ function suspendableIdleCandidates(
     // The input landed, but the turn it started has not settled (output side
     // of the guard above): its answer would be lost with the worker.
     .filter(ds => !holdsReclaimForUnsettledTurn(ds, now))
-    .sort((a, b) => (a.lastMessageAt || 0) - (b.lastMessageAt || 0));
+    .sort((a, b) => (conservativeIdleActivityAt(a) ?? 0) - (conservativeIdleActivityAt(b) ?? 0)
+      || (a.lastMessageAt || 0) - (b.lastMessageAt || 0));
 }
 
 function isCurrentSuspendableIdleCandidate(
@@ -620,8 +622,8 @@ function suspendAutomaticCandidate(
 
 /**
  * Count-based live-worker cap plus optional idle TTL. When this bot has more
- * live workers than its configured `maxLiveWorkers`, its longest-idle (by
- * lastMessageAt) eligible sessions are suspended down to the cap
+ * live workers than its configured `maxLiveWorkers`, its least recently
+ * active eligible sessions are suspended down to the cap
  * ('live_worker_cap'). Independently, when `idleTtlMs` is set, every eligible
  * session that has stayed idle past the TTL is suspended ('idle_ttl'), even
  * while under the cap. The two policies take the UNION of the same ordered,

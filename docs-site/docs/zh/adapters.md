@@ -409,10 +409,11 @@ botmux setup    # CLI 选 Doubao，再选项目目录
 - 原轮次结束、进程退出或会话关闭后取消等待，迟到的答复不再回传。
 - daemon 重启后，这类请求不会自动重试或恢复。
 
-**异步提问（`request_user_input_async`，仅 `codex-app`）：**
+**异步提问（`request_user_input_async`，`codex-app` 与 Codex TUI）：**
 
 - 模型提问后可以继续做别的事；原轮次正常结束后，卡片仍可作答。答案保留原调用 ID 和题号。
 - 开启 `codexAppCleanInput`、原轮仍在执行、且支持定向输入时，原提问对象的答复会直接并入原轮；否则在同一线程开新一轮。迟到答案不会并入别的任务。
+- Codex TUI 从 rollout 识别异步问题，答复以原生 `<send_user_message_question_reply>` 信封开新一轮投递；不参与 `codexAppCleanInput` 的并入逻辑。
 - 卡片显示「已结束」表示问答已收集完，不代表模型已经读到答案。
 - 答复权限：真人发起的轮次，注册时锁定唯一答复人；定时 / 自治轮次允许有发言权限（canTalk）的成员代答，定时任务创建者仍需操作权限（canOperate），静默定时任务不弹卡；文档评论轮次只有原评论人能在私信里答。
 - 多张待答卡同时存在时，文字答案要**引用目标卡片**；没引用的消息按普通输入处理，并提示你消歧。
