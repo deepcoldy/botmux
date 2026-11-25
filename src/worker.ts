@@ -3329,7 +3329,7 @@ function seedAndTrustClaudeState(
 ): void {
   try {
     const canonical = realpathSync(workingDir);
-    updateClaudeStateFile(statePath, current => {
+    updateClaudeStateFile(statePath, (current, { rebuilt }) => {
       // The source can contribute top-level onboarding state and this one
       // project's decision. Other projects remain private to the source.
       let source: Record<string, any> = {};
@@ -3350,19 +3350,36 @@ function seedAndTrustClaudeState(
       }
       const { projects: sourceProjects, ...top } = source;
       const data = current ?? top;
-      if (data.projects === undefined) data.projects = {};
-      if (!data.projects || typeof data.projects !== 'object' || Array.isArray(data.projects)) return;
-      const entry = data.projects[canonical] ?? {};
-      if (typeof entry !== 'object' || Array.isArray(entry)) return;
+      // This profile owns the file, so a wrong-shaped projects map is rebuilt
+      // in place rather than left to trap Claude on its theme/error screens.
+      // A missing map is normal first-seed initialization, not a repair.
+      let repaired = rebuilt;
+      if (data.projects === undefined) {
+        data.projects = {};
+      } else if (!data.projects || typeof data.projects !== 'object' || Array.isArray(data.projects)) {
+        data.projects = {};
+        repaired = true;
+      }
+      let entry = data.projects[canonical];
+      if (entry === undefined) {
+        entry = {};
+      } else if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        // A non-object entry cannot carry a trust decision; replace just that
+        // slot and keep every other project's state.
+        entry = {};
+        data.projects[canonical] = entry;
+        repaired = true;
+      }
       const sourceDecision = sourceProjects?.[canonical]?.hasTrustDialogAccepted;
       const previous = entry.hasTrustDialogAccepted;
       if (sourceDecision === false) entry.hasTrustDialogAccepted = false;
       else if (previous === undefined && (sourceDecision === true || (allowChatDefault && !isWorkflowWorker()))) entry.hasTrustDialogAccepted = true;
-      if (current?.hasCompletedOnboarding === true && entry.hasTrustDialogAccepted === previous) return;
+      // A repair must be persisted even when the seed itself changes nothing.
+      if (!repaired && current?.hasCompletedOnboarding === true && entry.hasTrustDialogAccepted === previous) return;
       if (entry.hasTrustDialogAccepted !== undefined) data.projects[canonical] = entry;
       data.hasCompletedOnboarding = true;
       return data;
-    });
+    }, { repairCorruptTarget: true });
   } catch (error) {
     log(`[read-isolation] WARN seed .claude.json failed: ${(error as Error).message}`);
   }

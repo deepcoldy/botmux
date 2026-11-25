@@ -4,7 +4,7 @@
  * untrusted workingDir don't block on the interactive confirmation screen.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, realpathSync, mkdirSync, rmdirSync, statSync, symlinkSync, lstatSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, realpathSync, mkdirSync, rmdirSync, statSync, symlinkSync, lstatSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -152,6 +152,89 @@ describe('ensureClaudeFolderTrust', () => {
       expect(data.keep).toBe(7);
       expect(data.projects['/local'].hasTrustDialogAccepted).toBe(false);
     }
+  });
+
+  it.each([
+    ['malformed JSON', '{', true, undefined],
+    ['a projects:null map', JSON.stringify({ projects: null, keepTop: 1 }), false, 1],
+    ['a projects array', JSON.stringify({ projects: [], keepTop: 2 }), false, 2],
+  ])('repairs %s in an isolated profile so onboarding and trust are seeded (regression #3832)', (_label, damaged, expectBackup, keptTop) => {
+    const isolated = join(home, 'isolated.json');
+    writeFileSync(isolated, damaged, { mode: 0o600 });
+    writeFileSync(configPath(), JSON.stringify({ projects: { [canonical()]: { hasTrustDialogAccepted: true } } }));
+    const seed = loadWorkerFunction<(path: string, cwd: string, log: () => void, source: string) => void>(
+      'seedAndTrustClaudeState', { existsSync, readFileSync, realpathSync, updateClaudeStateFile, isWorkflowWorker: () => false },
+    );
+    seed(isolated, workDir, () => {}, configPath());
+    const data = JSON.parse(readFileSync(isolated, 'utf8'));
+    expect(data.hasCompletedOnboarding).toBe(true);
+    expect(data.projects[canonical()].hasTrustDialogAccepted).toBe(true);
+    if (keptTop !== undefined) expect(data.keepTop).toBe(keptTop);
+    const backups = readdirSync(home).filter(name => name.startsWith('isolated.json.corrupt.'));
+    if (expectBackup) {
+      expect(backups).toHaveLength(1);
+      expect(readFileSync(join(home, backups[0]!), 'utf8')).toBe(damaged);
+    } else {
+      expect(backups).toEqual([]);
+    }
+    if (process.platform !== 'win32') expect(statSync(isolated).mode & 0o777).toBe(0o600);
+  });
+
+  it('repairs a non-object project entry in place without touching other projects', () => {
+    const isolated = join(home, 'isolated.json');
+    writeFileSync(isolated, JSON.stringify({
+      keepTop: 3,
+      projects: { [canonical()]: 'broken', '/other/project': { hasTrustDialogAccepted: false, note: 'keep' } },
+    }));
+    writeFileSync(configPath(), JSON.stringify({ projects: { [canonical()]: { hasTrustDialogAccepted: true } } }));
+    const seed = loadWorkerFunction<(path: string, cwd: string, log: () => void, source: string) => void>(
+      'seedAndTrustClaudeState', { existsSync, readFileSync, realpathSync, updateClaudeStateFile, isWorkflowWorker: () => false },
+    );
+    seed(isolated, workDir, () => {}, configPath());
+    const data = JSON.parse(readFileSync(isolated, 'utf8'));
+    expect(data.keepTop).toBe(3);
+    expect(data.projects[canonical()]).toEqual({ hasTrustDialogAccepted: true });
+    expect(data.projects['/other/project']).toEqual({ hasTrustDialogAccepted: false, note: 'keep' });
+    expect(readdirSync(home).filter(name => name.includes('.corrupt.'))).toEqual([]);
+  });
+
+  it('keeps an inherited negative decision when rebuilding a malformed target', () => {
+    const isolated = join(home, 'isolated.json');
+    writeFileSync(isolated, '{');
+    writeFileSync(configPath(), JSON.stringify({ projects: { [canonical()]: { hasTrustDialogAccepted: false } } }));
+    const seed = loadWorkerFunction<(path: string, cwd: string, log: () => void, source: string) => void>(
+      'seedAndTrustClaudeState', { existsSync, readFileSync, realpathSync, updateClaudeStateFile, isWorkflowWorker: () => false },
+    );
+    seed(isolated, workDir, () => {}, configPath());
+    const data = JSON.parse(readFileSync(isolated, 'utf8'));
+    expect(data.hasCompletedOnboarding).toBe(true);
+    expect(data.projects[canonical()].hasTrustDialogAccepted).toBe(false);
+    expect(readdirSync(home).filter(name => name.startsWith('isolated.json.corrupt.'))).toHaveLength(1);
+  });
+
+  it('persists a projects:null repair on a workflow worker even without a trust decision', () => {
+    const isolated = join(home, 'isolated.json');
+    writeFileSync(isolated, JSON.stringify({ hasCompletedOnboarding: true, projects: null }));
+    const seed = loadWorkerFunction<(path: string, cwd: string, log: () => void, source: string) => void>(
+      'seedAndTrustClaudeState', { existsSync, readFileSync, realpathSync, updateClaudeStateFile, isWorkflowWorker: () => true },
+    );
+    seed(isolated, workDir, () => {}, join(home, 'missing-source.json'));
+    const data = JSON.parse(readFileSync(isolated, 'utf8'));
+    expect(data.projects).toEqual({});
+    expect(data.hasCompletedOnboarding).toBe(true);
+  });
+
+  it('leaves malformed JSON untouched by default and only rebuilds when repair is opted in', () => {
+    const target = join(home, 'generic.json');
+    writeFileSync(target, '{');
+    expect(updateClaudeStateFile(target, () => ({ fixed: true }))).toBeUndefined();
+    expect(readFileSync(target, 'utf8')).toBe('{');
+    expect(updateClaudeStateFile(target, () => ({ fixed: true }), { repairCorruptTarget: true })).toBeUndefined();
+    const repaired = JSON.parse(readFileSync(target, 'utf8'));
+    expect(repaired).toEqual({ fixed: true });
+    const backup = readdirSync(home).find(name => name.startsWith('generic.json.corrupt.'));
+    expect(backup).toBeTruthy();
+    expect(readFileSync(join(home, backup!), 'utf8')).toBe('{');
   });
 
   it('is idempotent and does not rewrite when already trusted', () => {
