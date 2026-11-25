@@ -80,6 +80,7 @@ async function startWorker(
   outputWhileStalled = false,
   forceTmux = false,
   unknownFooterWhileUnsubmitted = false,
+  mismatchedRenameReceipt = false,
 ): Promise<Harness> {
   const sessionId = randomUUID();
   const root = mkdtempSync(join(tmpdir(), 'botmux-traex-rename-hold-'));
@@ -138,7 +139,8 @@ function enter(fromUser) {
       render();
       return;
     }
-    const name = draft.slice(8).trim();
+    const requestedName = draft.slice(8).trim();
+    const name = ${mismatchedRenameReceipt} ? requestedName + ' (normalised)' : requestedName;
     draft = '';
     fs.appendFileSync(${JSON.stringify(renamesPath)}, line({ name }));
     fs.appendFileSync(indexPath, line({ id: sessionId, thread_name: name, updated_at: new Date().toISOString() }));
@@ -286,6 +288,23 @@ function send(child: ChildProcess, message: DaemonToWorker): Promise<void> {
 }
 
 describe('TRAE native rename left in the composer', () => {
+  it('restarts an idle CLI with a different saved title and delivers every held follow-up once', async () => {
+    const h = await startWorker(0, false, false, false, false, true);
+    await send(h.child, { type: 'rename_session', title: TITLE });
+    await send(h.child, { type: 'message', content: FOLLOW_UP, turnId: 'om_follow' });
+    await waitFor(h.child, () => h.logs.some(line => line.includes('Native session rename not confirmed (settled)')),
+      h.logs, 'missing exact-title receipt', 30_000);
+    expect(h.submissions()).toEqual([]);
+    await waitFor(h.child, () => h.logs.some(line => line.includes('Restart requested (native session rename receipt timeout)')),
+      h.logs, 'bounded rename recovery', 80_000);
+    // Input arriving during teardown belongs to the replacement too.
+    await send(h.child, { type: 'message', content: 'another follow-up', turnId: 'om_second' });
+    await waitFor(h.child, () => h.submissions().includes('another follow-up'), h.logs, 'held inputs after recovery', 40_000);
+    expect(h.submissions()).toEqual([FOLLOW_UP, 'another follow-up']);
+    expect(h.renames()).toEqual([TITLE + ' (normalised)']);
+    expect(h.logs.filter(line => line.includes('Restart requested (native session rename receipt timeout)'))).toHaveLength(1);
+  }, 150_000);
+
   it('holds a follow-up arriving after the rename wait, completes the rename once, then delivers it as its own turn', async () => {
     const h = await startWorker(1);
     await send(h.child, { type: 'message', content: 'first question', turnId: 'om_first' });
