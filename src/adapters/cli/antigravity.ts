@@ -200,21 +200,34 @@ const PROACTIVE_FEEDBACK_OPTIONS_RE = /\[1\]\s+\S+.*\[2\]\s+\S+.*\[3\]\s+\S+.*\[
  *  so far? Help us improve:" + `[1] ... [2] ... [3] ... [0] ...`) at the tail
  *  of the viewport. While active, agy silently drops tea.PasteMsg and consumes
  *  the trailing Enter only to dismiss itself. Inspects only the trailing rows
- *  so quoted conversation text above cannot false-positive. */
+ *  so quoted conversation text above cannot false-positive.
+ *
+ *  The native widget is an idle-composer overlay: its viewport tail ends in an
+ *  empty composer plus `? for shortcuts`. A running turn ends in
+ *  `esc to cancel`, so survey-shaped text quoted by model output while busy
+ *  must not read as the live widget — writeInput would otherwise press Escape
+ *  and cancel the active turn when a type-ahead follow-up arrives. The footer
+ *  check is tail-anchored on purpose: an `esc to cancel` phrase lingering in
+ *  upper scrollback at idle must not suppress dismissal of a real survey. */
 export function isAntigravityProactiveFeedbackScreen(screen: string): boolean {
   if (!screen) return false;
-  const rows = stripAnsiScreenText(screen)
-    .replace(/\r\n?/g, '\n')
+  const plain = stripAnsiScreenText(screen).replace(/\r\n?/g, '\n');
+  const rows = plain
     .split('\n')
     .map(row => row.trim())
     .filter(row => row.length > 0);
   const tail = rows.slice(-12);
+  let surveyTextVisible = false;
   for (let i = 0; i < tail.length; i++) {
     if (!PROACTIVE_FEEDBACK_HEADER_RE.test(tail[i]!)) continue;
     const lookahead = tail.slice(i + 1, i + 4);
-    if (lookahead.some(row => PROACTIVE_FEEDBACK_OPTIONS_RE.test(row))) return true;
+    if (lookahead.some(row => PROACTIVE_FEEDBACK_OPTIONS_RE.test(row))) {
+      surveyTextVisible = true;
+      break;
+    }
   }
-  return false;
+  if (!surveyTextVisible) return false;
+  return readyComposerRowAbove(plain) !== undefined;
 }
 
 const ANTIGRAVITY_FOOTER_START_RE = /^(?:\? for shortcuts|esc to cancel)(?:\s|$)/i;

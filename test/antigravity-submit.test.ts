@@ -24,7 +24,11 @@ const previousScale = process.env.BOTMUX_TIME_SCALE;
 process.env.HOME = home;
 process.env.BOTMUX_TIME_SCALE = String(SCALE);
 
-const { createAntigravityAdapter, isAntigravityProactiveFeedbackScreen } = await import(
+const {
+  createAntigravityAdapter,
+  isAntigravityProactiveFeedbackScreen,
+  isAntigravityWorkingScreen,
+} = await import(
   '../src/adapters/cli/antigravity.js'
 );
 
@@ -559,6 +563,84 @@ describe('antigravity writeInput — single-Enter submit', () => {
       const result = await selected.writeInput(fake.pty, '继续');
       expect(result).toBeUndefined();
       expect(events).toEqual(['paste:继续']);
+    });
+
+    it('does not mistake survey-shaped text quoted on a busy working screen for the live survey', () => {
+      const busyQuotedSurvey = [
+        'Here is a replica of the feedback prompt:',
+        "How's the CLI experience so far? Help us improve:",
+        '  [1] Bad   [2] Fine   [3] Good   [0] Dismiss',
+        'It renders inline while the turn keeps running.',
+        '⠋ Thinking about the layout…',
+        'esc to cancel',
+      ].join('\n');
+      expect(isAntigravityWorkingScreen(busyQuotedSurvey)).toBe(true);
+      expect(isAntigravityProactiveFeedbackScreen(busyQuotedSurvey)).toBe(false);
+    });
+
+    it('still recognizes the real idle survey when upper scrollback quotes the busy footer phrase', () => {
+      // The guard is tail-anchored: an `esc to cancel` phrase lingering in
+      // upper output at idle must not suppress dismissal of the live widget.
+      const surveyWithStaleScrollback = [
+        'esc to cancel — this is the footer shown while a turn is running.',
+        ...surveyBanner.split('\n'),
+      ].join('\n');
+      expect(isAntigravityWorkingScreen(surveyWithStaleScrollback)).toBe(true);
+      expect(isAntigravityProactiveFeedbackScreen(surveyWithStaleScrollback)).toBe(true);
+    });
+
+    it('sends no Escape for a type-ahead paste while the busy screen quotes survey text', async () => {
+      resetHistory();
+      const events: string[] = [];
+      const selected = adapterForVersion('1.5.17');
+      const busyScreen = [
+        'Here is a replica of the feedback prompt:',
+        "How's the CLI experience so far? Help us improve:",
+        '  [1] Bad   [2] Fine   [3] Good   [0] Dismiss',
+        '⠋ Thinking about the layout…',
+        'esc to cancel',
+      ].join('\n');
+      const fake = makePty();
+      fake.pty.captureCurrentScreen = () => busyScreen;
+      fake.pty.sendSpecialKeys = (...keys: string[]) => {
+        events.push(`key:${keys.join('+')}`);
+        return true;
+      };
+      fake.pty.submitBracketedPaste = text => {
+        events.push(`paste:${text}`);
+        appendHistory(text);
+        return true;
+      };
+
+      const result = await selected.writeInput(fake.pty, 'please keep working');
+      expect(result).toBeUndefined();
+      expect(events).toEqual(['paste:please keep working']);
+    });
+
+    it('still dismisses the real survey with Escape when a busy-footer phrase lingers in scrollback', async () => {
+      resetHistory();
+      const events: string[] = [];
+      const selected = adapterForVersion('1.5.17');
+      let screen = [
+        'esc to cancel — this is the footer shown while a turn is running.',
+        ...surveyBanner.split('\n'),
+      ].join('\n');
+      const fake = makePty();
+      fake.pty.captureCurrentScreen = () => screen;
+      fake.pty.sendSpecialKeys = (...keys: string[]) => {
+        events.push(`key:${keys.join('+')}`);
+        if (keys[0] === 'Escape') screen = '>\n? for shortcuts';
+        return true;
+      };
+      fake.pty.submitBracketedPaste = text => {
+        events.push(`paste:${text}`);
+        appendHistory(text);
+        return true;
+      };
+
+      const result = await selected.writeInput(fake.pty, '继续？');
+      expect(result).toBeUndefined();
+      expect(events).toEqual(['key:Escape', 'paste:继续？']);
     });
   });
 });
