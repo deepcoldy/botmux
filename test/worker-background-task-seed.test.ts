@@ -451,7 +451,11 @@ describe('turn_terminal background task count', () => {
 
   it('preserves backgroundTasks on a same-batch completed turn when foldBackgroundUpdates is on and a bounded Monitor is live', () => {
     const tracker = new BackgroundTaskTracker();
-    const t0 = Date.parse('2026-11-25T10:00:00.000Z');
+    // Anchor relative to the real clock so the bounded Monitor stays inside its
+    // 30m window on every runner: a fixed historical timestamp would make the
+    // default-now hasPendingNonPersistentMonitor()/emitTurnTerminal checks read
+    // it as expired on the Bun leg (no global fake timer), unlike vitest.
+    const t0 = Date.now() - 60_000;
     tracker.observe({
       type: 'user', uuid: 'm-ack', timestamp: new Date(t0).toISOString(), isSidechain: false,
       message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'started' }] },

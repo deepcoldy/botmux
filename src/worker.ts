@@ -30846,7 +30846,7 @@ async function spawnCliBody(
   daemonCotHoldMayBeActive = false;
   backgroundTasksTrackedForSiblings = false;
   antigravityFooterBackgroundTasks = 0;
-  bridgeQueue.resetBackgroundTasks?.();
+  bridgeQueue?.resetBackgroundTasks?.();
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(homedir(), '.botmux', 'data');
   const sessionScratchDir = ensureSessionTempDir(isolationRuntimeDataDir, cfg.sessionId);
