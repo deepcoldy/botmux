@@ -59,7 +59,14 @@ export class Aggregator {
       }
       case 'session.exited': {
         const cur = this.sessions.get(ev.body.sessionId);
-        if (cur) this.sessions.set(ev.body.sessionId, { ...cur, status: 'closed' });
+        if (cur) {
+          this.sessions.set(ev.body.sessionId, {
+            ...cur,
+            status: 'closed',
+            queuedActivationPending: null,
+            queuedActivationTailCount: null,
+          });
+        }
         break;
       }
       case 'schedule.created': {

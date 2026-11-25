@@ -23772,6 +23772,7 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
  * queue (a follower admission that found the route released); every other
  * caller goes through {@link releaseQueuedActivationReservation}. */
 function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedToken?: string): boolean {
+  if (ds.session.status !== 'active') return true;
   // A prior callback retry may observe the successor already promoted. That is
   // success for the acknowledged predecessor; never append/send the same tail
   // head a second time while its fresh token owns the journal.

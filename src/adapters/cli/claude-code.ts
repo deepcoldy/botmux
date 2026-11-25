@@ -609,7 +609,13 @@ export function extractMessageContentForFingerprint(content: string): string {
     const closeIdx = content.indexOf(closeTag, openIdx + openTag.length);
     if (closeIdx !== -1) {
       const inner = content.slice(openIdx + openTag.length, closeIdx);
-      const cleaned = inner.replace(LARK_METADATA_HEADER_RE, '').trim();
+      // Unwrap <botmux_task ...>...</botmux_task> wrapper tags (preserving the
+      // inner instruction body) so truncated task-envelope turns still produce
+      // a submit fingerprint matching the recorded user line.
+      const unwrapped = inner
+        .replace(/^\s*<botmux_task\b[^>]*>\s*/i, '')
+        .replace(/\s*<\/botmux_task>\s*$/i, '');
+      const cleaned = unwrapped.replace(LARK_METADATA_HEADER_RE, '').trim();
       if (cleaned.length > 0) return cleaned;
       const rawCleaned = inner.trim();
       if (rawCleaned.length > 0) return rawCleaned;

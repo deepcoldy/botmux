@@ -784,4 +784,41 @@ describe('redactSettingsForPublic', () => {
     }) as any;
     expect(out).toEqual({ publicReadOnly: false });
   });
+
+  it('projects only boolean/count queued-activation metadata without leaking tokens or buffered prompts', async () => {
+    const { queuedActivationRowFields } = await import('../src/core/dashboard-rows.js');
+    const rowFields = queuedActivationRowFields({
+      queuedActivationPending: true,
+      queuedActivationTail: [{
+        id: 't1',
+        order: 1,
+        userPrompt: 'SECRET_USER_PROMPT_PAYLOAD',
+        cliInput: { content: 'SECRET_CLI_INPUT_PAYLOAD' },
+        turnId: 'om_secret_turn',
+      }],
+    });
+    expect(rowFields).toEqual({ queuedActivationPending: true, queuedActivationTailCount: 1 });
+    const redacted = redactSessionsForPublic([{
+      sessionId: 's-act',
+      status: 'idle',
+      queued: false,
+      ...rowFields,
+    }]) as any[];
+    expect(redacted[0]).toMatchObject({
+      sessionId: 's-act',
+      queuedActivationPending: true,
+      queuedActivationTailCount: 1,
+    });
+    expect(JSON.stringify(redacted)).not.toContain('SECRET_USER_PROMPT_PAYLOAD');
+    expect(JSON.stringify(redacted)).not.toContain('SECRET_CLI_INPUT_PAYLOAD');
+
+    const clearedPatch = redactSessionEventForPublic('session.update', {
+      sessionId: 's-act',
+      patch: { queuedActivationPending: null, queuedActivationTailCount: null },
+    }) as any;
+    expect(clearedPatch.patch).toEqual({
+      queuedActivationPending: null,
+      queuedActivationTailCount: null,
+    });
+  });
 });
