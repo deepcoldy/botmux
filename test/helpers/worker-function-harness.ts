@@ -201,6 +201,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     // keep the new reattach reconciliation inert unless a test loads it as
     // the function under test with its own explicit backend/generation scope.
     if (key === 'recoverSessionRenameAfterPersistentReattach') return () => false;
+    if (key === 'recoverUnconfirmedSessionRename') return () => false;
     // Input-focus guard is inert unless a fixture explicitly models a dialog or
     // draft. This keeps unrelated worker-function tests on their original path.
     if (key === 'sessionInputBlocksDeliveryNow') return () => false;
@@ -307,6 +308,7 @@ export function loadWorkerMessageHandler(name: string, scope: Record<string, unk
       if (scopedDefault !== undefined) return scopedDefault;
       if (key === 'recordStructuredInput') return () => {};
       if (key === 'recoverSessionRenameAfterPersistentReattach') return () => false;
+    if (key === 'recoverUnconfirmedSessionRename') return () => false;
       if (key === 'updateSessionTurnNativeAnchor') return () => {};
       if (key === 'revokePromptReadiness') return loadWorkerFunction('revokePromptReadiness', scope);
       if (key === 'replayDeferredSessionReady') return loadWorkerFunction('replayDeferredSessionReady', scope);

@@ -48,6 +48,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { writeAndFlush } from './cli/stdout-flush.js';
 import { parseHistoryReadOptions, parseQuotedReadOptions, readHistoryMessages, HISTORY_READ_USAGE, QUOTED_READ_USAGE } from './cli/history-read.js';
+import { ProtectedResultStore } from './services/protected-result-store.js';
 import { withMessageReadContext } from './im/lark/message-read-context.js';
 import { readQuotedMessages } from './cli/quoted-read.js';
 import { join, dirname, basename, resolve } from 'node:path';
@@ -13395,6 +13396,17 @@ async function cmdSend(
     customCard = { ...buildSendDiffCard(diffInput, extractCardText(stripTrailingOaiMemoryCitation(content))).card };
   }
   const customFinal = !!customCard && effectiveResponseKind === 'final';
+  if (effectiveResponseKind === 'final' && currentTurnId
+    && (process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1' || process.env.BOTMUX_READ_ISOLATED !== '1')) {
+    const delivered = new ProtectedResultStore(sendDataDir).completedFinal(
+      originSession?.larkAppId ?? s.larkAppId, originSessionId ?? sid, originTurnId ?? currentTurnId,
+    );
+    if (delivered?.length) {
+      console.log(JSON.stringify({ success: true, replayed: true, protectedResult: true,
+        messageId: delivered[0], attachmentMessageIds: delivered.slice(1), sessionId: sid }));
+      process.exit(0);
+    }
+  }
   if (customFinal) {
     const error = customFinalCardError(customCard!);
     if (error) { console.error(`botmux send: ${error}`); process.exit(2); }

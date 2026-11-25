@@ -217,8 +217,9 @@ describe('Codex native rename surface (0.167.0)', () => {
     expect(codexSessionRenameSurface({ viewport: '› a human draft', cursor: { x: 13, y: 0 } }, COMMAND)).toBe('blocked');
   });
 
-  it('classifies a bare prompt and unfamiliar footer as unknown, never as a draft', () => {
-    expect(codexSessionRenameSurface({ viewport: '›\nmodel · /tmp', cursor: { x: 2, y: 0 } }, COMMAND)).toBe('unknown');
+  it('accepts a bare native prompt with a valid footer and keeps an unfamiliar footer unknown', () => {
+    expect(codexSessionRenameSurface({ viewport: '›\nmodel · /tmp', cursor: { x: 2, y: 0 } }, COMMAND)).toBe('settled');
+    expect(codexSessionRenameSurface({ viewport: '›\nunknown footer', cursor: { x: 2, y: 0 } }, COMMAND)).toBe('unknown');
     expect(codexNativeFooterRows(['enter to submit / esc to cancel'])).toBeUndefined();
   });
 

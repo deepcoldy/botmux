@@ -90,6 +90,27 @@ describe('native rename confirmation hold cap', () => {
     expect(unknown.scope.flushPending).not.toHaveBeenCalled();
   });
 
+  it('gives the TRAE settled recovery path priority over the generic cap', async () => {
+    vi.useFakeTimers();
+    const h = renameTimerHarness('settled');
+    h.scope.lastInitConfig = { cliId: 'traex' };
+    let recovered = false;
+    h.scope.recoverUnconfirmedSessionRename = vi.fn(() => {
+      if (Date.now() - h.scope.sessionRenameSentAtMs < 60_000) return false;
+      recovered = true;
+      return true;
+    });
+    h.arm();
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(recovered).toBe(false);
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(17_000);
+    expect(recovered).toBe(true);
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+    expect(h.scope.send.mock.calls.map(([event]: [any]) => event.message))
+      .not.toContain('worker.session_rename_release_timeout');
+  });
+
   it('never restores readiness over an OSC-7501 approval or held busy record', async () => {
     vi.useFakeTimers();
     for (const surface of ['settled', 'unknown'] as const) {
