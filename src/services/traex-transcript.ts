@@ -97,7 +97,11 @@ export function splitTraexAdoptEvents(events: readonly CodexBridgeEvent[], cutof
     if (split.history[i]!.kind === 'user') { inputIndex = i; break; }
   }
   const input = split.history[inputIndex];
-  if (!input || split.history.slice(inputIndex + 1).some(event => event.kind === 'assistant_final')) {
+  const completed = split.history.slice(inputIndex + 1).some(event => event.kind === 'assistant_final'
+    // A late terminal from an older native turn says nothing about this input.
+    // Preserve the ordering fallback only when a legacy side lacks an id.
+    && (!input?.sourceTurnId || !event.sourceTurnId || event.sourceTurnId === input.sourceTurnId));
+  if (!input || completed) {
     return { ...split, localSinceMs: cutoff };
   }
   return {

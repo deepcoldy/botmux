@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
+import { TRAEX_EMPTY_COMPOSER_HINTS, TRAEX_SPINNER_LABELS } from '../src/adapters/cli/traex-footer.js';
 import { findTraexRolloutSetByPid } from '../src/services/traex-transcript.js';
 import {
   refreshTraexTerminalSession, traexTerminalSessionIsBound, traexTerminalIdentityNeedsRefresh,
   traexEmptyComposer, traexStatusSessionId, bindTraexSessionFromCorrelatedInput,
-  traexTerminalInputBlocked,
+  traexTerminalInputBlocked, traexTerminalIdentityGeneration,
 } from '../src/services/traex-terminal-session.js';
 
 vi.mock('../src/services/traex-transcript.js', () => ({ findTraexRolloutSetByPid: vi.fn() }));
@@ -47,7 +48,7 @@ describe('TRAE shared-daemon terminal identity', () => {
     const t = terminal();
     const request = refreshTraexTerminalSession(t.pty);
     expect(refreshTraexTerminalSession(t.pty)).toBe(request);
-    expect(await resolve(request)).toEqual({ kind: 'terminal', sessionId: sid });
+    expect(await resolve(request)).toEqual({ kind: 'terminal', sessionId: sid, inputReleased: true });
     expect(t.sendText).toHaveBeenCalledExactlyOnceWith('/status');
     expect(t.sendSpecialKeys.mock.calls).toEqual([['Enter'], ['Escape']]);
     expect(traexTerminalSessionIsBound(t.pty, sid)).toBe(true);
@@ -193,11 +194,110 @@ describe('TRAE shared-daemon terminal identity', () => {
 
   it('pins an exact input receipt to its submitting backend, never a same-PID peer or successor', () => {
     const t = terminal();
-    expect(bindTraexSessionFromCorrelatedInput(t.pty, 43212, sid)).toBe(true);
+    expect(bindTraexSessionFromCorrelatedInput(t.pty, 43212, sid, traexTerminalIdentityGeneration(t.pty))).toBe(true);
     expect(traexTerminalSessionIsBound(t.pty, sid)).toBe(true);
     expect(traexTerminalSessionIsBound({ ...t.pty }, sid)).toBe(false);
     t.pty.cliPid = 43213;
-    expect(bindTraexSessionFromCorrelatedInput(t.pty, 43212, other)).toBe(false);
+    expect(bindTraexSessionFromCorrelatedInput(t.pty, 43212, other, traexTerminalIdentityGeneration(t.pty))).toBe(false);
+    expect(traexTerminalSessionIsBound(t.pty, sid)).toBe(false);
+  });
+
+  it('accepts every native empty-composer hint while preserving cursor geometry', () => {
+    for (const hint of TRAEX_EMPTY_COMPOSER_HINTS) {
+      expect(traexEmptyComposer(idle('latest answer', hint)), hint).toBe(true);
+    }
+    expect(traexEmptyComposer({ ...idle('latest answer', 'Summarize recent commits'), cursor: { x: 26, y: 1 } })).toBe(false);
+  });
+
+  it('never dismisses a status panel that overlaps any native active-turn label', async () => {
+    vi.useFakeTimers(); vi.mocked(findTraexRolloutSetByPid).mockReturnValue(new Set());
+    for (const label of TRAEX_SPINNER_LABELS) {
+      const t = terminal();
+      t.sendSpecialKeys.mockImplementation(key => {
+        if (key !== 'Enter') return;
+        const current = panel(other);
+        const activeLabel = label.endsWith('…') ? label : `${label}…`;
+        current.viewport += `\n❖ ${activeLabel} (12s • esc to interrupt)`;
+        current.cursor = { x: 0, y: 7 };
+        t.changeState(current);
+      });
+      expect(await resolve(refreshTraexTerminalSession(t.pty)), label).toEqual({ kind: 'unavailable' });
+      expect(t.sendSpecialKeys.mock.calls, label).toEqual([['Enter']]);
+      expect(traexTerminalSessionIsBound(t.pty, other)).toBe(false);
+    }
+  });
+
+  it('closes a recognised negative status result, releases commands, and does not reopen it on an unchanged idle screen', async () => {
+    vi.useFakeTimers(); vi.mocked(findTraexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal();
+    t.sendSpecialKeys.mockImplementation(key => {
+      if (key === 'Enter') t.changeState({
+        ...panel(sid),
+        viewport: panel(sid).viewport.replace('Local background server', 'Embedded process'),
+      });
+      if (key === 'Escape') t.changeState(idle());
+    });
+    expect(await resolve(refreshTraexTerminalSession(t.pty))).toEqual({ kind: 'unavailable', inputReleased: true });
+    expect(t.sendSpecialKeys.mock.calls).toEqual([['Enter'], ['Escape']]);
+    expect(traexTerminalInputBlocked(t.pty)).toBe(false);
+    expect(traexTerminalSessionIsBound(t.pty, sid)).toBe(false);
+    expect(traexTerminalIdentityNeedsRefresh(t.pty)).toBe(false);
+    expect(await refreshTraexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
+    expect(t.sendText).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for a shared-server panel painted across multiple frames before binding', async () => {
+    vi.useFakeTimers(); vi.mocked(findTraexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal();
+    t.sendSpecialKeys.mockImplementation(key => {
+      if (key === 'Enter') {
+        const complete = panel(sid);
+        const partial = {
+          ...complete,
+          viewport: complete.viewport.replace(` Session: ${sid}\n Limits: data not available yet`, ''),
+          cursor: { x: 45, y: 4 },
+        };
+        t.changeState(partial);
+        setTimeout(() => t.changeState(complete), 100);
+      }
+      if (key === 'Escape') t.changeState(idle());
+    });
+    expect(await resolve(refreshTraexTerminalSession(t.pty))).toEqual({ kind: 'terminal', sessionId: sid, inputReleased: true });
+    expect(t.sendSpecialKeys.mock.calls).toEqual([['Enter'], ['Escape']]);
+    expect(traexTerminalSessionIsBound(t.pty, sid)).toBe(true);
+  });
+
+  it('closes a persistently incomplete local-host panel without caching it as unsupported', async () => {
+    vi.useFakeTimers(); vi.mocked(findTraexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal();
+    t.sendSpecialKeys.mockImplementation(key => {
+      if (key === 'Enter') {
+        const complete = panel(sid);
+        t.changeState({
+          ...complete,
+          viewport: complete.viewport.replace(` Session: ${sid}\n Limits: data not available yet`, ''),
+          cursor: { x: 45, y: 4 },
+        });
+      }
+      if (key === 'Escape') t.changeState(idle());
+    });
+    expect(await resolve(refreshTraexTerminalSession(t.pty))).toEqual({ kind: 'unavailable', inputReleased: true });
+    expect(t.sendSpecialKeys.mock.calls).toEqual([['Enter'], ['Escape']]);
+    expect(traexTerminalInputBlocked(t.pty)).toBe(false);
+    expect(traexTerminalIdentityNeedsRefresh(t.pty)).toBe(true);
+  });
+
+  it('rejects a delayed receipt captured before a newer same-PID status identity', async () => {
+    vi.useFakeTimers(); vi.mocked(findTraexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal();
+    const staleGeneration = traexTerminalIdentityGeneration(t.pty);
+    t.sendSpecialKeys.mockImplementation(key => {
+      if (key === 'Enter') t.changeState(panel(other));
+      if (key === 'Escape') t.changeState(idle());
+    });
+    expect(await resolve(refreshTraexTerminalSession(t.pty))).toMatchObject({ kind: 'terminal', sessionId: other });
+    expect(bindTraexSessionFromCorrelatedInput(t.pty, 43212, sid, staleGeneration)).toBe(false);
+    expect(traexTerminalSessionIsBound(t.pty, other)).toBe(true);
     expect(traexTerminalSessionIsBound(t.pty, sid)).toBe(false);
   });
 });

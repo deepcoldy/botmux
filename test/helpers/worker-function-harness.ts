@@ -42,6 +42,7 @@ import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSessi
 import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
 import { traexAutoModelPolicyKey } from '../../src/services/traex-auto-model.js';
 import { traexStartupInputReady } from '../../src/core/traex-startup-input.js';
+import { traexTerminalInputBlocked } from '../../src/services/traex-terminal-session.js';
 import { WebTerminalInputController, WebTerminalInputWireState } from '../../src/core/web-terminal-input-controller.js';
 import { BusyReadyDeferralTracker, BusyReadyLogThrottle } from '../../src/utils/busy-ready-deferral.js';
 import { ClaudePermissionNoticeTracker } from '../../src/services/claude-action-prompt.js';
@@ -251,6 +252,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
     if (key === 'antigravityBlockingPageTail') return antigravityBlockingPageTail;
     if (key === 'traexStartupInputReady') return traexStartupInputReady;
+    if (key === 'traexTerminalInputBlocked') return traexTerminalInputBlocked;
     if (key === 'reconcileActiveAntigravityToken') return reconcileActiveAntigravityToken;
     if (key === 'inspectAntigravityAccounts') return inspectAntigravityAccounts;
     if (key === 'resolveAntigravitySpawnStoreOptions') return resolveAntigravitySpawnStoreOptions;

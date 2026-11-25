@@ -7,6 +7,7 @@ import { drainTraexRollout, splitTraexAdoptEvents } from '../src/services/traex-
 import { bridgeGateInputForTurn, bridgePostText, structuredFallbackKind, shouldSuppressStructuredFallback } from '../src/services/bridge-fallback-gate.js';
 import { bridgeTurnOutcome } from '../src/utils/usage-limit-tracker.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { traexTerminalSessionIsBound } from '../src/services/traex-terminal-session.js';
 
@@ -125,6 +126,31 @@ describe('TRAE adopted shared-daemon result flow', () => {
     expect(scope.emitTurnTerminal).toHaveBeenCalledTimes(1);
   });
 
+  it('does not let an older native final hide a different unfinished input', () => {
+    const cutoff = 946684900000;
+    const root = mkdtempSync(join(tmpdir(), 'traex-adopt-out-of-order-final-'));
+    const path = join(root, 'rollout-00000000-0000-7000-8000-000000000001.jsonl');
+    const line = (at: number, payload: object) => JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
+    try {
+      writeFileSync(path,
+        line(cutoff - 300, { type: 'user_message', message: 'old input', turn_id: 'old' })
+        + line(cutoff - 200, { type: 'user_message', message: 'running input', turn_id: 'running' })
+        + line(cutoff - 100, { type: 'task_complete', turn_id: 'old', last_agent_message: 'old answer' })
+        + line(cutoff + 100, { type: 'task_complete', turn_id: 'running', last_agent_message: 'running answer' }));
+      const split = splitTraexAdoptEvents(drainTraexRollout(path, 0, { adoptMode: true }).events, cutoff);
+      expect(split.live.map(event => event.sourceTurnId)).toEqual(['running', 'running']);
+      const queue = new CodexBridgeQueue(() => cutoff + 1000);
+      queue.setLocalTurns(true, split.localSinceMs);
+      queue.absorb(split.history); queue.ingest(split.live);
+      queue.setLocalTurns(true, cutoff);
+      const scope = outputScope(queue);
+      scope.emit();
+      expect(scope.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'final_output', kind: 'local-turn', userText: 'running input', content: 'running answer',
+      }));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('forwards a confirmed Lark task without waiting for a human draft or a subsequent task to finish', () => {
     const cutoff = 946684900000;
     const queue = new CodexBridgeQueue(() => cutoff + 10000);
@@ -151,5 +177,36 @@ describe('TRAE adopted shared-daemon result flow', () => {
     const unrelated = nativeEvents(cutoff - 30000, cutoff - 20000, 'historical task', 'historical answer');
     queue.ingest(unrelated);
     expect(queue.drainEmittable()).toEqual([]);
+  });
+  it('anchors an immediate correlated notification at the literal write when its receipt arrives late', async () => {
+    vi.useFakeTimers();
+    const writeAt = 946684900000;
+    vi.setSystemTime(writeAt);
+    const h = workerSubmitHarness();
+    const { scope } = h;
+    scope.pendingMessages.splice(0);
+    const terminal = { cliPid: 43212, write: vi.fn() };
+    const fence = { backend: terminal };
+    const notify = vi.fn();
+    const cliSessionId = '00000000-0000-7000-8000-000000000001';
+    Object.assign(scope, {
+      backend: terminal,
+      lastInitConfig: { cliId: 'traex', adoptMode: true },
+      captureAdoptWriteFence: () => fence,
+      adoptWriteFenceIsCurrent: () => true,
+      rememberTurnLinkRefMode: vi.fn(),
+      adoptComposerConflict: () => undefined,
+      isStructuredBridgeAdoptInputCli: (id: string) => id === 'traex',
+      structuredBridgeIs: (id: string) => id === 'traex',
+      codexBridgeIngest: vi.fn(),
+      codexBridgeNotifyCliSessionId: notify,
+    });
+    scope.cliAdapter.writeInput = vi.fn(async () => {
+      vi.setSystemTime(writeAt + 10_000);
+      return { submitted: true, cliSessionId };
+    });
+    const write = loadWorkerFunction('writeAdoptMessage', scope);
+    expect(await write('Lark task B', 'om-b')).toBe('completed');
+    expect(notify).toHaveBeenCalledExactlyOnceWith(cliSessionId, { adoptRotationStartMs: writeAt });
   });
 });

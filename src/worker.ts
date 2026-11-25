@@ -453,7 +453,7 @@ import { WebTerminalInputController, WebTerminalInputWireState } from './core/we
 import { isTerminalColorQueryOnly } from './core/terminal-color-query.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
-import { refreshTraexTerminalSession, traexTerminalSessionIsBound, traexTerminalIdentityNeedsRefresh } from './services/traex-terminal-session.js';
+import { refreshTraexTerminalSession, traexTerminalSessionIsBound, traexTerminalIdentityNeedsRefresh, traexTerminalInputBlocked } from './services/traex-terminal-session.js';
 import { splitTraexAdoptEvents } from './services/traex-transcript.js';
 import {
   generateCodexAppThreadTitle,
@@ -6560,6 +6560,15 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
     fence?: AdoptWriteFence,
     onFollowUp?: () => void,
   ): Promise<boolean> => {
+    if (lastInitConfig?.cliId === 'traex' && lastInitConfig.adoptMode
+      && traexTerminalInputBlocked(adapterInputHandle(targetBackend))) {
+      // Native passthrough and ordinary adapter writes share the same uncertain
+      // /status boundary. Hold the original message; the terminal-identity poll
+      // re-drives it only after a freshly closed panel proves a clean composer.
+      if (!pendingRawInputs.includes(msg)) pendingRawInputs.push(msg);
+      log(`Deferred TRAE passthrough until the native status query settles: ${msg.content}`);
+      return false;
+    }
     let sent = false;
     let recoveryFailureReason: string | undefined;
     try {
@@ -16921,7 +16930,17 @@ function maybeFollowTraexSessionRotationViaPid(): void {
         if (!adoptWriteFenceIsCurrent(fence)) return;
         const terminal = adapterInputHandle(fence.backend);
         const resolved = await refreshTraexTerminalSession(terminal, () => adoptWriteFenceIsCurrent(fence));
-        if (!adoptWriteFenceIsCurrent(fence) || resolved.kind !== 'terminal') return;
+        if (!adoptWriteFenceIsCurrent(fence)) return;
+        if (resolved.inputReleased) {
+          // Raw commands and native rename were held without writing. Release
+          // them only after this same query observed the restored composer. A
+          // recognised negative status result releases input too; only identity
+          // binding below depends on a shared-server session id.
+          queueMicrotask(() => {
+            if (adoptWriteFenceIsCurrent(fence)) void flushPending();
+          });
+        }
+        if (resolved.kind !== 'terminal') return;
         const boundSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
         if (boundSid !== resolved.sessionId) {
           persistCliSessionId(resolved.sessionId);
@@ -19331,7 +19350,13 @@ async function writeAdoptMessage(
       }
       if (result?.cliSessionId) {
         persistCliSessionId(result.cliSessionId);
-        codexBridgeNotifyCliSessionId(result.cliSessionId);
+        codexBridgeNotifyCliSessionId(result.cliSessionId, {
+          // Receipt polling can outlive the turn itself. Split the new rollout
+          // at the literal write, not when this late notification happened.
+          adoptRotationStartMs: inputDeliveryEvidence.writeStartedAtMs({
+            turnId, dispatchAttempt, cliGeneration: cliSpawnGeneration,
+          }),
+        });
       }
       if (result?.submitted === true && adoptStructuredBridgeTurnId) {
         codexBridgeQueue.confirmPendingTurn(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
@@ -25398,7 +25423,9 @@ function scheduleSubmitFailureNotify(
         queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle);
         if (cliSessionId) {
           persistCliSessionId(cliSessionId);
-          if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
+          if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId, {
+            adoptRotationStartMs: activityBaselineMs,
+          });
           void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
         } else if (settlement.unprovenCliSessionId) {
           // The confirmation above renewed this turn's lease, and the history
@@ -26286,8 +26313,11 @@ async function flushPending(): Promise<void> {
   // Native /rename is an administrative command, not a steer/queued model
   // message. It must wait for a real prompt even on type-ahead CLIs. Normal
   // pending messages can still drain while busy; the rename stays queued.
-  const sessionRenameReady = isPromptReady && pendingSessionRename !== null;
-  const rawInputReady = isPromptReady && pendingRawInputs.length > 0;
+  const traexNativeCommandBlocked = (pendingRawInputs.length > 0 || pendingSessionRename !== null)
+    && lastInitConfig?.cliId === 'traex' && lastInitConfig.adoptMode === true && !!backend
+    && traexTerminalInputBlocked(adapterInputHandle(backend));
+  const sessionRenameReady = isPromptReady && pendingSessionRename !== null && !traexNativeCommandBlocked;
+  const rawInputReady = isPromptReady && pendingRawInputs.length > 0 && !traexNativeCommandBlocked;
   const adoptInputReady = isPromptReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
   let supportedSessionRenameReady = sessionRenameReady;
   const renameOnRemoteBackend = effectiveBackendType === 'riff'
