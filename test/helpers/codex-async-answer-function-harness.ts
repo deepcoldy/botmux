@@ -4,13 +4,35 @@ import ts from 'typescript';
 
 // Execute the production function/closure with controlled dependencies, as in
 // helpers/worker-function-harness. No assertions inspect source text.
+const INERT_HOLD = {
+  phase: () => 'IDLE',
+  owner: () => undefined,
+  holds: () => false,
+  isBackgroundHeld: () => false,
+  isIdleWaiting: () => false,
+  isWakeActive: () => false,
+  onForegroundTurnStarted: () => ({ action: 'none' }),
+  onForegroundTurnTerminal: () => false,
+  onPromptReady: () => ({ action: 'none' }),
+  onSuperseded: () => ({ action: 'none' }),
+  clearIfOwner() {},
+  reset() {},
+};
 function evaluate(text: string, scope: Record<string, any>): any {
   const js = ts.transpileModule(`const probe = ${text.replace(/^export /, '')};`, { compilerOptions: {
     target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None,
   } }).outputText;
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
-    get: (target, key) => key in target ? target[key as string] : (globalThis as any)[key],
+    get: (target, key) => {
+      if (key in target) return target[key as string];
+      if (key === 'backgroundAuthorityHold') return INERT_HOLD;
+      if (key === 'applyBackgroundAuthorityTransition') return () => {};
+      if (key === 'supersedeBackgroundAuthorityHold') return () => {};
+      if (key === 'clearBackgroundHoldTimer') return () => {};
+      if (key === 'scheduleBackgroundHoldTimer') return () => {};
+      return (globalThis as any)[key];
+    },
     set: (target, key, value) => { target[key as string] = value; return true; },
   });
   return new Function('scope', `with (scope) { ${js}; return probe; }`)(proxy);

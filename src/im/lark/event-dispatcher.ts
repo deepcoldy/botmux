@@ -3722,6 +3722,11 @@ interface PendingForwardTopicPayload {
   data: any;
   ctx: RoutingContext;
   ownsSession: boolean;
+  /** Seed auto-started by `autoStartOnNewTopic` (no @). Held under every
+   *  mention mode so a root-linked clarification ("forward + comment") that
+   *  arrives a moment later pairs with it instead of being dropped as an
+   *  un-@ reply in a topic the bot does not own yet (#3784). */
+  autoTopicSeed?: boolean;
 }
 
 function listenerRoutingContext(input: {
@@ -5865,7 +5870,8 @@ export function createLarkEventDispatcherRuntime(
     const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
     // Startup restore precedes signed-default hydration; cold cache is
     // deliberately fail-closed until the next authorized human message.
-    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId, chatId));
+    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId, chatId))
+      || record.payload.autoTopicSeed === true;  // auto-start seeds are held under any mode (#3784)
     if (isUnpairedSeed && delayStillEnabled && remainingMs > 0 && forwardFollowups.hold({
       larkAppId,
       chatId,
@@ -7141,7 +7147,11 @@ export function createLarkEventDispatcherRuntime(
         if (pairingDelayEnabled && !ambientRedirect) {
           pairedForwardSeed = forwardFollowups.take(pairingInput);
         } else if (!pairingDelayEnabled) {
-          stalePendingSeed = forwardFollowups.take(pairingInput);
+          // A held auto-start seed pairs under any mention mode (#3784); any
+          // other held seed here is stale (the chat left never/ambient).
+          const held = forwardFollowups.take(pairingInput);
+          if (held?.payload.autoTopicSeed) pairedForwardSeed = held;
+          else stalePendingSeed = held;
         }
       }
       if (pairedForwardSeed) {
@@ -7191,6 +7201,8 @@ export function createLarkEventDispatcherRuntime(
       //   p2p                     → allowlist only
       // 免@ 斜杠命令的命中结果：在群聊闸里结算，随 ctx 下发给 daemon 渲染 prompt。
       let commandTrigger: CommandTriggerMatch | undefined;
+      /** Set when this message is admitted only as an autoStartOnNewTopic seed. */
+      let autoTopicSeed = false;
       if (chatType === 'group') {
         const mentionMode = resolveGroupMentionMode(larkAppId, chatId);
         const soloGroupMentionBypass = isSoloGroupMentionBypassEnabled(larkAppId, chatId);
@@ -7297,9 +7309,10 @@ export function createLarkEventDispatcherRuntime(
         // 默认 'always' 在多人群里必须 @，想要话题内免@续话就把 mentionMode 配成
         // 'topic'（下方条款已同时覆盖话题群 thread 与普通群 shared topic），
         // 'never'/'ambient' 亦按各自语义生效。1人1bot 群在 solo 开关启用时走末条放行。
-        // 注：pairedForwardSeed 仅在 never/ambient 模式下产生，且 ambient redirect
-        // 已在配对前排除，故 isAllowed=true 时下方 never/ambient 条款必然放行；
-        // 不在此单独加 clause，以免 isAllowed=false 时绕过权限检查。
+        // 注：pairedForwardSeed 在 never/ambient 模式下产生（ambient redirect 已在配对前
+        // 排除，isAllowed=true 时下方 never/ambient 条款必然放行）；另有一种是和
+        // autoStartOnNewTopic 自动开工的种子配对（任何 @ 模式，#3784），下方单列一条
+        // 带 isAllowed 的放行，isAllowed=false 时不会绕过权限检查。
         // 末条 solo 放行不看 mentionsOther：消息 @ 了别的具体成员时,上面已用
         // revalidateSolo 重查过人数——「刚拉新 bot、缓存仍是陈旧 {1,1}」会查出多 bot
         // 而不放行；重查后仍是 1人1bot,说明被 @ 的人不在群里（飞书允许 @ 群外的人）,
@@ -7318,6 +7331,9 @@ export function createLarkEventDispatcherRuntime(
           || (isAllowed && mentionMode === 'never')
           || (isAllowed && mentionMode === 'ambient' && !mentionsOther)
           || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsOther)
+          // A clarification paired with a held auto-start seed (#3784): the seed
+          // already admitted the topic; pairing itself required isAllowed.
+          || (isAllowed && !!pairedForwardSeed?.payload.autoTopicSeed)
           || commandTriggerRelax
           || !!builtinMentionlessCommand
           || (soloGroupMentionBypass && ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
@@ -7395,6 +7411,7 @@ export function createLarkEventDispatcherRuntime(
               return;
             }
             logger.info(`[auto-start:新话题] ${chatId.substring(0, 12)} 新话题免@自动开工 msg=${messageId.substring(0, 12)}`);
+            autoTopicSeed = true;
           }
         }
       } else if (!isAllowed) {
@@ -7476,10 +7493,14 @@ export function createLarkEventDispatcherRuntime(
       if (chatType === 'p2p' && forceTopicApplied) {
         recordP2pForceTopicRoot(larkAppId, messageId, chatId);
       }
-      const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
+      const payload = {
+        data, ctx, ownsSession, ...(autoTopicSeed ? { autoTopicSeed: true } : {}),
+      } satisfies PendingForwardTopicPayload;
       const groupMentionMode = resolveGroupMentionMode(larkAppId, chatId);
       const shouldDelayTopicSeed = config.daemon.forwardFollowupWaitMs > 0
-        && usesForwardFollowupDelay(groupMentionMode)
+        // Durable primary routing cannot hold seeds yet (it throws below), so an
+        // auto-start seed there keeps starting at once, as before (#3784).
+        && (usesForwardFollowupDelay(groupMentionMode) || (autoTopicSeed && !primary))
         && !pairedForwardSeed
         && !isControlCommand
         && !!senderOpenId
