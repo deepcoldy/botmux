@@ -637,7 +637,7 @@ import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } fro
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { restoredTurnLabel } from './services/restored-turn-label.js';
-import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, resolveJsonlFromPidState, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, resolveJsonlFromPidState, findOpenClaudeSessionIds, readClaudeLiveSessionId, sanitizeClaudeInput, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { resolveShadowedAntigravityStatusLine } from './adapters/cli/antigravity.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
@@ -861,6 +861,9 @@ import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scru
 import {
   combineSubmitCurrentFences,
   decideSubmitConfirmationAction,
+  isAuthoritativeClaudeTranscriptTurn,
+  isAuthoritativeStructuredTranscriptTurn,
+  isAuthoritativeSubmitSendMarker,
   selectSubmitActivityEvidence,
   settleDeferredSubmitConfirmation,
   settleStaleWriteContinuation,
@@ -871,7 +874,11 @@ import {
   createSubmitFailureChainController,
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
-import { createQueuedActivationReceiptObserver } from './services/queued-activation-receipts.js';
+import {
+  claudeNativeSessionIdFromJsonlPath,
+  createQueuedActivationReceiptObserver,
+  type QueuedActivationProof,
+} from './services/queued-activation-receipts.js';
 import { claudeComposerHoldsInput, decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure, diagnoseSubmitFailure, shouldWaitThroughBusyTurn, SUBMIT_POST_SESSION_START_GRACE_MS, type SubmitFailureDiagnosisReason } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
@@ -2121,11 +2128,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         // Fresh RPC input bypasses pendingMessages/flushPending entirely. The
         // app-server's accepted turn/start (or positive rollout proof) is the
         // durable submission boundary for the daemon's queued-opening journal.
-        send({
-          type: 'queued_activation_submitted',
-          sessionId: cfg.sessionId,
-          activationToken: cfg.queuedActivationToken,
-        });
+        acknowledgeQueuedActivationToken(cfg.queuedActivationToken, cfg.sessionId);
       }
       outcome = first.outcome; // accepted | ambiguous — both stay engaged, prompt never re-queued
     }
@@ -2503,6 +2506,12 @@ function refreshActiveRuntimeContract(): void {
   void publishRuntimeContract(active);
 }
 let cliSpawnGeneration = 0;
+/** Number of normal turn writes started in the current CLI generation.
+ *  Standalone botmux-send activation proof (without transcript/recheck
+ *  corroboration) is only accepted on the opening write (count === 1), where
+ *  no active prior turn or background subagent can inherit the rotated PID
+ *  marker and falsely confirm an unsubmitted successor. */
+let cliGenerationTurnWrites = 0;
 /** What the TRAE install entry resolved to right before the spawn of
  *  `generation`. Published only while that spawn is still the current one. */
 let traexInstallAtSpawn: { generation: number; identity: ExecutableIdentity | undefined } | undefined;
@@ -3951,6 +3960,107 @@ function notifyNativeTranscriptConsumedLarkTurn(
     acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', resolvedSessionId, turn.userUuid);
   } else {
     acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', resolvedSessionId);
+  }
+}
+
+/** Secondary paths are retired transcripts kept only to drain their existing
+ *  turns. They may attribute trailing records, but cannot prove that a newly
+ *  queued activation entered the current conversation. */
+function claudeActivationTranscriptPathAllowed(sourceJsonlPath?: string): boolean {
+  return !sourceJsonlPath
+    || sourceJsonlPath === bridgeJsonlPath
+    || !bridgeSecondaryPaths.has(sourceJsonlPath);
+}
+
+function observeAuthoritativeClaudeTurnStart(
+  turn: {
+    turnId: string;
+    dispatchAttempt?: number;
+    started?: boolean;
+    fullContentMatch?: boolean;
+    exactContentMatch?: boolean;
+    isLocal?: boolean;
+    isScheduled?: boolean;
+    restoredFromJournal?: boolean;
+  },
+  evidence: { fullContentMatch: boolean; exactContentMatch?: boolean; sourceJsonlPath?: string },
+): void {
+  if (!claudeActivationTranscriptPathAllowed(evidence.sourceJsonlPath)) return;
+  const exactContentMatch = evidence.exactContentMatch ?? turn.exactContentMatch ?? evidence.fullContentMatch;
+  if (!exactContentMatch
+    || !isAuthoritativeClaudeTranscriptTurn({
+      ...turn,
+      started: true,
+      fullContentMatch: evidence.fullContentMatch,
+      exactContentMatch,
+    })) {
+    return;
+  }
+  const cliSessionId = claudeNativeSessionIdFromJsonlPath(evidence.sourceJsonlPath);
+  inputDeliveryEvidence.observeAuthoritativeReceipt(
+    { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt, cliGeneration: cliSpawnGeneration },
+    {
+      evidence: 'structured-transcript',
+      ...(cliSessionId ? { cliSessionId } : {}),
+      ...(evidence.sourceJsonlPath ? { sourceJsonlPath: evidence.sourceJsonlPath } : {}),
+    },
+  );
+  queuedActivationReceipts.confirmByTurn?.(
+    {
+      sessionId,
+      generation: cliSpawnGeneration,
+      turnId: turn.turnId,
+      dispatchAttempt: turn.dispatchAttempt,
+    },
+    { source: 'structured-transcript', ...(cliSessionId ? { cliSessionId } : {}) },
+  );
+}
+
+function observeAuthoritativeStructuredTurnStart(
+  turn: {
+    turnId: string;
+    dispatchAttempt?: number;
+    started?: boolean;
+    provisionalTaskStartedAtMs?: number;
+    exactUserInputMatch?: boolean;
+    sourceSessionId?: string;
+    isLocal?: boolean;
+    restoredFromJournal?: boolean;
+  },
+  evidence?: { exactUserInputMatch: boolean },
+): void {
+  startupNativeInputSeen = true;
+  const watchedActivation = typeof queuedActivationReceipts?.hasTurn === 'function'
+    && queuedActivationReceipts.hasTurn({
+      sessionId,
+      generation: cliSpawnGeneration,
+      turnId: turn.turnId,
+      dispatchAttempt: turn.dispatchAttempt,
+    });
+  // Never move a watched queued-activation item out of unacked on a prefix-only
+  // match: if the CLI crashes before full confirmation, carryOver must not lose it.
+  if (!turn.isLocal && (!watchedActivation || evidence?.exactUserInputMatch === true)) {
+    inflightInputs.onTurnStarted(turn.turnId);
+  }
+  if (evidence?.exactUserInputMatch === true
+    && isAuthoritativeStructuredTranscriptTurn(turn)
+    && (!turn.sourceSessionId
+      || !inputDeliveryObservedCliSessionId
+      || turn.sourceSessionId === inputDeliveryObservedCliSessionId)) {
+    const cliSessionId = turn.sourceSessionId;
+    inputDeliveryEvidence.observeAuthoritativeReceipt(
+      { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt, cliGeneration: cliSpawnGeneration },
+      { evidence: 'structured-transcript', ...(cliSessionId ? { cliSessionId } : {}) },
+    );
+    queuedActivationReceipts.confirmByTurn?.(
+      {
+        sessionId,
+        generation: cliSpawnGeneration,
+        turnId: turn.turnId,
+        dispatchAttempt: turn.dispatchAttempt,
+      },
+      { source: 'structured-transcript', ...(cliSessionId ? { cliSessionId } : {}) },
+    );
   }
 }
 
@@ -6804,11 +6914,9 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       // adapter lifecycle in runAdoptRawInputSequence below.
       onFollowUp: () => onFollowUp?.(),
       // Pending-repo raw openings are durable too. ACK only after text + Enter.
-      onActivationAck: () => send({
-        type: 'queued_activation_submitted',
-        sessionId,
-        activationToken: msg.queuedActivationToken!,
-      }),
+      onActivationAck: () => {
+        acknowledgeQueuedActivationToken(msg.queuedActivationToken);
+      },
       onDurableFailure: () => {
         revokePromptReadiness();
         log('Durable raw activation write rejected; retiring worker generation');
@@ -10552,7 +10660,10 @@ const bridgeQueue = new BridgeTurnQueue(
     persistScheduledTaskAnchor(taskId, anchor);
     syncCronTaskAnchorsToDaemon();
   },
-  notifyNativeTranscriptConsumedLarkTurn,
+  (turn, evidence) => {
+    notifyNativeTranscriptConsumedLarkTurn(turn, evidence);
+    observeAuthoritativeClaudeTurnStart(turn, evidence);
+  },
   // Every transcript read that feeds the queue (the polling read, rotation
   // switches, fingerprint follow, journal recovery, retired secondary paths)
   // also feeds the StopFailure evidence.
@@ -11713,9 +11824,8 @@ codexBridgeQueue.setCotObserver((entries, turn) => {
 });
 // Same evidence for the structured bridges (Pi, TraeX, Grok, …): the turn's
 // own user record is in the CLI's transcript.
-codexBridgeQueue.setTurnStartObserver((turn) => {
-  startupNativeInputSeen = true;
-  if (!turn.isLocal) inflightInputs.onTurnStarted(turn.turnId);
+codexBridgeQueue.setTurnStartObserver((turn, evidence) => {
+  observeAuthoritativeStructuredTurnStart(turn, evidence);
 });
 // Codex mid-turn replies: whenever the model says something to a Lark turn and
 // goes back to work, post it under that message — progress, or for a same-turn
@@ -12590,18 +12700,111 @@ function submitActivityEvidenceSince(
   sinceMs: number,
   identity: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'> | undefined,
 ): SubmitActivityEvidence | undefined {
-  const structuredTurns = [
-    ...bridgeQueue.peek(),
-    ...codexBridgeQueue.peek(),
-  ].filter(turn => turn.started);
+  const claudeTurns = typeof bridgeQueue?.peek === 'function'
+    ? bridgeQueue.peek().filter(turn => isAuthoritativeClaudeTranscriptTurn(turn)
+      && claudeActivationTranscriptPathAllowed(turn.sourceJsonlPath))
+    : [];
+  const structuredBridgeTurns = typeof codexBridgeQueue?.peek === 'function'
+    ? codexBridgeQueue.peek().filter(turn =>
+      isAuthoritativeStructuredTranscriptTurn(turn)
+      && (!turn.sourceSessionId
+        || !inputDeliveryObservedCliSessionId
+        || turn.sourceSessionId === inputDeliveryObservedCliSessionId))
+    : [];
+  const retained = identity?.turnId && typeof inputDeliveryEvidence?.authoritativeReceipt === 'function'
+    ? inputDeliveryEvidence.authoritativeReceipt({
+      turnId: identity.turnId,
+      dispatchAttempt: identity.dispatchAttempt,
+      cliGeneration: cliSpawnGeneration,
+    })
+    : undefined;
   return selectSubmitActivityEvidence({
     target: identity,
+    sessionId,
+    sinceMs,
+    ...(retained ? { retainedReceipt: retained } : {}),
     // Session-global structured activity cannot prove which turn advanced.
     // Keep it weak/bounded, together with PTY output.
     ptyActive: lastPtyActivityAtMs > sinceMs || lastStructuredBridgeActivityAtMs > sinceMs,
-    structuredTurns,
-    sendMarkers: readSendMarkers().filter(marker => marker.sentAtMs >= sinceMs),
+    structuredTurns: [...claudeTurns, ...structuredBridgeTurns],
+    sendMarkers: typeof readSendMarkers === 'function' ? readSendMarkers() : [],
   });
+}
+
+function probeAuthoritativeQueuedActivationEvidence(
+  identity: {
+    turnId?: string;
+    sendMarkerTurnId?: string;
+    dispatchAttempt?: number;
+    generation: number;
+    allowStandaloneSendMarker?: boolean;
+  },
+  sinceMs?: number,
+): QueuedActivationProof | undefined {
+  if (!identity.turnId || identity.generation !== cliSpawnGeneration) return undefined;
+  const retained = typeof inputDeliveryEvidence?.authoritativeReceipt === 'function'
+    ? inputDeliveryEvidence.authoritativeReceipt({
+      turnId: identity.turnId,
+      dispatchAttempt: identity.dispatchAttempt,
+      cliGeneration: identity.generation,
+    })
+    : undefined;
+  // A retained receipt was already fenced when it was first observed. A later
+  // rotation does not retroactively invalidate that delivery; only newly-read
+  // secondary-path records are rejected above and in the live queue probe below.
+  if (retained) {
+    return {
+      source: retained.evidence,
+      ...(retained.cliSessionId ? { cliSessionId: retained.cliSessionId } : {}),
+    };
+  }
+  if (typeof bridgeQueue?.peek === 'function') {
+    const matchedClaude = bridgeQueue.peek().find(turn =>
+      isAuthoritativeClaudeTranscriptTurn(turn)
+      && claudeActivationTranscriptPathAllowed(turn.sourceJsonlPath)
+      && turn.turnId === identity.turnId
+      && turn.dispatchAttempt === identity.dispatchAttempt);
+    if (matchedClaude) {
+      const cliSessionId = claudeNativeSessionIdFromJsonlPath(matchedClaude.sourceJsonlPath);
+      return {
+        source: 'structured-transcript',
+        ...(cliSessionId ? { cliSessionId } : {}),
+      };
+    }
+  }
+  if (typeof codexBridgeQueue?.peek === 'function') {
+    const matchedStructured = codexBridgeQueue.peek().find(turn =>
+      isAuthoritativeStructuredTranscriptTurn(turn)
+      && turn.turnId === identity.turnId
+      && turn.dispatchAttempt === identity.dispatchAttempt
+      && (!turn.sourceSessionId
+        || !inputDeliveryObservedCliSessionId
+        || turn.sourceSessionId === inputDeliveryObservedCliSessionId));
+    if (matchedStructured) {
+      return {
+        source: 'structured-transcript',
+        ...(matchedStructured.sourceSessionId ? { cliSessionId: matchedStructured.sourceSessionId } : {}),
+      };
+    }
+  }
+  const markerTurnId = 'sendMarkerTurnId' in identity ? identity.sendMarkerTurnId : identity.turnId;
+  if (identity.allowStandaloneSendMarker !== false
+    && markerTurnId
+    && typeof readSendMarkers === 'function') {
+    const matchedMarker = readSendMarkers().find(marker =>
+      isAuthoritativeSubmitSendMarker(
+        marker,
+        { turnId: markerTurnId, dispatchAttempt: identity.dispatchAttempt },
+        {
+          sessionId,
+          ...(sinceMs !== undefined ? { sinceMs } : {}),
+        },
+      ));
+    if (matchedMarker) {
+      return { source: 'botmux-send' };
+    }
+  }
+  return undefined;
 }
 
 function clearSendMarkers(): void {
@@ -14428,6 +14631,7 @@ function bridgeMarkPendingTurn(
   preferredTurnId?: string,
   dispatchAttempt?: number,
   linkRefMode?: 'observe' | 'enabled',
+  submittedMessage?: string,
 ): string | undefined {
   if (!bridgeJsonlPath) return undefined;
   if (!bridgeBaselineDone) {
@@ -14461,9 +14665,23 @@ function bridgeMarkPendingTurn(
   // pane to false-match than the 30-char substring fingerprint.
   const normalised = normaliseForFingerprint(messageText);
   const contentNormalized = normalised.length > 0 ? normalised : undefined;
+  const extraExactSet = new Set<string>();
+  const addExactVariant = (raw: string | undefined) => {
+    if (!raw) return;
+    const norm = normaliseForFingerprint(raw);
+    if (norm && norm !== contentNormalized) extraExactSet.add(norm);
+    const sanitized = normaliseForFingerprint(sanitizeClaudeInput(raw));
+    if (sanitized && sanitized !== contentNormalized) extraExactSet.add(sanitized);
+  };
+  addExactVariant(messageText);
+  if (submittedMessage && submittedMessage !== messageText) addExactVariant(submittedMessage);
+  const extraExactContents = extraExactSet.size > 0 ? [...extraExactSet] : undefined;
   const turnId = preferredTurnId ?? randomBytes(8).toString('hex');
   const markTimeMs = Date.now();
-  bridgeQueue.mark(turnId, fingerprint, markTimeMs, contentNormalized, dispatchAttempt, { linkRefMode });
+  bridgeQueue.mark(turnId, fingerprint, markTimeMs, contentNormalized, dispatchAttempt, {
+    linkRefMode,
+    ...(extraExactContents ? { extraExactContents } : {}),
+  });
   // Journal the mark so a worker/daemon restart mid-turn can restore it
   // (bridgeAbsorbBaseline). Excluded:
   //   - adopt mode: its baseline absorbs the whole transcript with different
@@ -17429,6 +17647,7 @@ function codexBridgeMarkPendingTurn(
   dispatchAttempt?: number,
   markTimeMs: number = Date.now(),
   linkRefMode?: 'observe' | 'enabled',
+  submittedMessage?: string,
 ): string | undefined {
   if (!codexBridgeFallbackActive()) return undefined;
   // Doubao has no per-tool timestamp/turn ID. Retire already-written orphan
@@ -17440,7 +17659,16 @@ function codexBridgeMarkPendingTurn(
   structuredTurnsWithSubmitNotice.delete(turnId);
   const recoveryCursorAtMark = structuredBridgeRecoveryCursorAtMark();
   const requireExactInput = lastInitConfig?.adoptMode === true && structuredBridgeIs('antigravity');
-  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark, linkRefMode, requireExactInput);
+  codexBridgeQueue.mark(
+    turnId,
+    messageText,
+    markTimeMs,
+    dispatchAttempt,
+    recoveryCursorAtMark,
+    linkRefMode,
+    requireExactInput,
+    submittedMessage,
+  );
   checkpointCodexAdoptRecovery();
   checkpointStructuredBridgeRecovery();
   return turnId;
@@ -19551,7 +19779,8 @@ function stopStartupFailedInputs(): void {
   // a newer ordinary message overtake the opening.
   pendingMessages.push(...queued.filter(item => item.queuedActivationToken));
   const carried = [...inflightInputs.takeCarryOver(), ...inflightInputs.takeStartedCarryOver()];
-  const activationNeedsReconciliation = carried.some(item => item.queuedActivationToken);
+  const activationNeedsReconciliation = carried.some(item => item.queuedActivationToken)
+    || (typeof queuedActivationReceipts?.size === 'function' && queuedActivationReceipts.size() > 0);
   const failed = [...queued.filter(item => !item.queuedActivationToken), ...carried];
   const rawActivations = pendingRawInputs.filter(item => item.queuedActivationToken);
   pendingRawInputs.splice(0, pendingRawInputs.length, ...rawActivations);
@@ -25822,7 +26051,7 @@ function scheduleSubmitFailureNotify(
   durableTerminalStatus: 'failed' | 'ambiguous' = 'failed',
   structuredTarget = false,
   onConfirmed?: (cliSessionId?: string, unprovenCliSessionId?: string) => void,
-): void {
+): SubmitFailureChainKey | undefined {
   const preview = buildSubmitMessagePreview(msg);
   const emitDurableTerminal = (errorCode: string): void => {
     if (turnIdentity?.turnId && turnIdentity.dispatchAttempt !== undefined) {
@@ -25852,24 +26081,26 @@ function scheduleSubmitFailureNotify(
         message: t('worker.submit_impossible', { cliName: cliName(), reason, preview }),
       });
     }
-    return;
+    return undefined;
   }
   const cliGenerationAtSchedule = cliSpawnGeneration;
+  const evidenceTurnId = turnIdentity?.turnId ?? bridgeTurnId;
+  const allowStandaloneSendMarker = cliGenerationTurnWrites <= 1;
   // A successful botmux send can precede writeInput's submitted:false return.
   // Anchor to the literal write, not to the end of adapter receipt polling.
   const activityBaselineMs = inputDeliveryEvidence.writeStartedAtMs({
-    turnId: turnIdentity?.turnId,
+    turnId: evidenceTurnId,
     dispatchAttempt: turnIdentity?.dispatchAttempt,
     cliGeneration: cliGenerationAtSchedule,
   }) ?? Date.now();
   const backendAtSchedule = backend;
   const externalInputGenerationAtWrite = inputDeliveryEvidence.externalInputGenerationAtWrite({
-    turnId: turnIdentity?.turnId,
+    turnId: evidenceTurnId,
     dispatchAttempt: turnIdentity?.dispatchAttempt,
     cliGeneration: cliGenerationAtSchedule,
   });
   const interruptGenerationAtWrite = inputDeliveryEvidence.interruptGenerationAtWrite({
-    turnId: turnIdentity?.turnId,
+    turnId: evidenceTurnId,
     dispatchAttempt: turnIdentity?.dispatchAttempt,
     cliGeneration: cliGenerationAtSchedule,
   });
@@ -25937,10 +26168,16 @@ function scheduleSubmitFailureNotify(
     const settlement = await settleDeferredSubmitConfirmation(codexBridgeQueue, {
       turnId: bridgeTurnId,
       dispatchAttempt: turnIdentity?.dispatchAttempt,
+      expectedSourceSessionId: inputDeliveryObservedCliSessionId,
       structuredTarget,
       recheck,
       usageLimitDetected: () => usageLimitTracker.detectedThisTurn(turnSeq),
-      activityEvidence: () => submitActivityEvidenceSince(activityBaselineMs, turnIdentity),
+      activityEvidence: () => submitActivityEvidenceSince(
+        activityBaselineMs,
+        evidenceTurnId
+          ? { turnId: evidenceTurnId, dispatchAttempt: turnIdentity?.dispatchAttempt }
+          : turnIdentity,
+      ),
       isCurrent: combineSubmitCurrentFences(chainIsCurrent, deferredAttemptIsCurrent),
     });
     // Replacing a same-key timer invalidates an already-running callback. The
@@ -25979,6 +26216,28 @@ function scheduleSubmitFailureNotify(
           traexRescueReadBackPending = false;
           noteTraexRescue('read-back: owned receipt found after the submit key');
         }
+        if (turnIdentity?.queuedActivationToken
+          && typeof queuedActivationReceipts?.confirmToken === 'function'
+          && queuedActivationReceipts.confirmToken(
+            turnIdentity.queuedActivationToken,
+            {
+              source: 'deferred-recheck',
+              ...(cliSessionId ? { cliSessionId } : {}),
+              ...(settlement.ownershipProven === true ? { ownershipProven: true } : {}),
+              ...(settlement.unprovenCliSessionId
+                ? { unprovenCliSessionId: settlement.unprovenCliSessionId }
+                : {}),
+            },
+            {
+              sessionId,
+              generation: cliGenerationAtSchedule,
+              ...(evidenceTurnId !== undefined ? { turnId: evidenceTurnId } : {}),
+              dispatchAttempt: turnIdentity.dispatchAttempt,
+            },
+          )) {
+          log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
+          return;
+        }
         traexFirstSubmitConfirmed = true;
         if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
           acknowledgeTurnInputCommitted(turnIdentity?.turnId, turnIdentity?.dispatchAttempt);
@@ -26012,16 +26271,61 @@ function scheduleSubmitFailureNotify(
           armDeferredRecheck();
           return;
         }
+        if (turnIdentity?.queuedActivationToken
+          && typeof queuedActivationReceipts?.has === 'function'
+          && queuedActivationReceipts.has(turnIdentity.queuedActivationToken)) {
+          // A usage-limit banner does not prove this queued activation was
+          // received. Do not silently drop the bridge mark and abandon the
+          // watched activation; fall through to emit the visible unconfirmed
+          // notice while keeping read-only receipt observation alive.
+          break;
+        }
         dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
         redriveRejectedStructuredReady();
         log(`Deferred recheck missing but usage limit was detected for this turn — suppressing submit warning. preview="${preview}"`);
         emitDurableTerminal('submit_usage_limit');
         return;
       case 'suppress-active':
-        // Strong success evidence — a structured transcript entry or a botmux
-        // send marker — proves the turn actually progressed, so the chain is
-        // cancelled here and now: no more timers, no unconfirmed warning.
+        // Strong success evidence — a full structured transcript entry or an
+        // authoritative botmux send marker — proves the turn actually entered
+        // execution, so settle any watched queued activation through the single
+        // idempotent observer and cancel the warning chain.
         if (action.evidence === 'structured-transcript' || action.evidence === 'botmux-send') {
+          if (turnIdentity?.queuedActivationToken
+            && typeof queuedActivationReceipts?.confirmToken === 'function') {
+            const hasActiveWatch = typeof queuedActivationReceipts.has === 'function'
+              && queuedActivationReceipts.has(turnIdentity.queuedActivationToken);
+            const proof = typeof probeAuthoritativeQueuedActivationEvidence === 'function'
+              ? probeAuthoritativeQueuedActivationEvidence(
+                {
+                  turnId: evidenceTurnId,
+                  sendMarkerTurnId: turnIdentity.turnId,
+                  dispatchAttempt: turnIdentity.dispatchAttempt,
+                  generation: cliGenerationAtSchedule,
+                  allowStandaloneSendMarker,
+                },
+                activityBaselineMs,
+              )
+              : undefined;
+            if (proof && queuedActivationReceipts.confirmToken(
+              turnIdentity.queuedActivationToken,
+              proof,
+              {
+                sessionId,
+                generation: cliGenerationAtSchedule,
+                ...(evidenceTurnId !== undefined ? { turnId: evidenceTurnId } : {}),
+                dispatchAttempt: turnIdentity.dispatchAttempt,
+              },
+            )) {
+              log(`Deferred recheck saw ${action.evidence} success evidence — settled queued activation and cancelled chain, no warning. preview="${preview}"`);
+              return;
+            }
+            // If an active queued-activation watch rejected this evidence
+            // (e.g. foreign sessionId or non-opening botmux-send), never
+            // silently cancel the warning chain while leaving the activation
+            // wedged — fall through to surface the unconfirmed notice.
+            if (hasActiveWatch) break;
+          }
           onConfirmed?.();
           redriveRejectedStructuredReady();
           log(`Deferred recheck saw ${action.evidence} success evidence — cancelling chain, no warning. preview="${preview}"`);
@@ -26081,6 +26385,10 @@ function scheduleSubmitFailureNotify(
       releaseInputDeliveryQuarantine(quarantineAtSchedule, 'unconfirmed input no longer pending in the CLI', { redriveTerminal: true });
       dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
       redriveRejectedStructuredReady();
+      if (turnIdentity?.queuedActivationToken) {
+        log(`Settled cleared queued activation ${turnIdentity.queuedActivationToken.substring(0, 8)} after quarantined draft disappeared`);
+        acknowledgeQueuedActivationToken(turnIdentity.queuedActivationToken);
+      }
       if (quarantineAtSchedule!.submitWarningSent) return;
     }
     // Receipt checks are read-only. A parked TRAE draft gets at most one
@@ -26143,9 +26451,15 @@ function scheduleSubmitFailureNotify(
         && freshScreen && traexComposerHoldsInput(freshScreen, draftContent)) {
         const receipt = await settleDeferredSubmitConfirmation(codexBridgeQueue, {
           turnId: bridgeTurnId, dispatchAttempt: turnIdentity?.dispatchAttempt,
+          expectedSourceSessionId: inputDeliveryObservedCliSessionId,
           structuredTarget, recheck,
           usageLimitDetected: () => usageLimitTracker.detectedThisTurn(turnSeq),
-          activityEvidence: () => submitActivityEvidenceSince(activityBaselineMs, turnIdentity),
+          activityEvidence: () => submitActivityEvidenceSince(
+            activityBaselineMs,
+            evidenceTurnId
+              ? { turnId: evidenceTurnId, dispatchAttempt: turnIdentity?.dispatchAttempt }
+              : turnIdentity,
+          ),
           isCurrent: combineSubmitCurrentFences(chainIsCurrent, deferredAttemptIsCurrent),
         });
         if (!chainIsCurrent() || !deferredAttemptIsCurrent()) return;
@@ -26278,7 +26592,12 @@ function scheduleSubmitFailureNotify(
     }
     log(`Submit failure diagnosis: ${submitDiagnosis.reason} (${submitDiagnosis.evidence})${submitDiagnosis.matched ? ` match=${submitDiagnosis.matched}` : ''} preview="${preview}"`);
 
-    if (!retainQuarantinedReceipt) dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
+    const keepMarkForWatchedActivation = !!turnIdentity?.queuedActivationToken
+      && typeof queuedActivationReceipts?.has === 'function'
+      && queuedActivationReceipts.has(turnIdentity.queuedActivationToken);
+    if (!retainQuarantinedReceipt && !keepMarkForWatchedActivation) {
+      dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
+    }
     redriveRejectedStructuredReady();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
     emitDurableTerminal('submit_unconfirmed');
@@ -26294,7 +26613,7 @@ function scheduleSubmitFailureNotify(
         message: t(
           effectiveBackendType === 'zmx'
             ? 'worker.submit_unconfirmed_zmx'
-            : turnIdentity?.queuedActivationToken && recheck
+            : turnIdentity?.queuedActivationToken && (recheck || evidenceTurnId)
               ? 'worker.activation_submit_unconfirmed'
               : submitDiagnosis.reason === 'logged_out'
                 ? 'submitDiag.logged_out'
@@ -26355,6 +26674,7 @@ function scheduleSubmitFailureNotify(
     }
   };
   armDeferredRecheck();
+  return chainKey;
 }
 
 /**
@@ -26470,42 +26790,79 @@ function requeueUnsubmittedQueuedActivation(item: PendingCliInput): void {
   log(`Retained queued activation ${item.queuedActivationToken.substring(0, 8)} for retry`);
 }
 
-function acknowledgeQueuedActivation(item: PendingCliInput): void {
-  if (!item.queuedActivationToken) return;
-  queuedActivationReceipts.cancel(item.queuedActivationToken);
+function acknowledgeQueuedActivationToken(
+  token: string | undefined,
+  overrideSessionId?: string,
+): boolean {
+  if (!token) return false;
+  const claimed = typeof queuedActivationReceipts?.claimOnce === 'function'
+    ? queuedActivationReceipts.claimOnce(token)
+    : (queuedActivationReceipts?.cancel?.(token), true);
+  if (!claimed) return false;
   send({
     type: 'queued_activation_submitted',
-    sessionId,
-    activationToken: item.queuedActivationToken,
+    sessionId: overrideSessionId ?? sessionId,
+    activationToken: token,
   });
+  if (typeof publishCliInputBacklog === 'function') publishCliInputBacklog();
+  return true;
+}
+
+function acknowledgeQueuedActivation(item: PendingCliInput): void {
+  acknowledgeQueuedActivationToken(item.queuedActivationToken);
 }
 
 function observeQueuedActivationReceipt(
   item: PendingCliInput,
-  recheck: () => SubmitRecheckResult | Promise<SubmitRecheckResult>,
+  recheck: (() => SubmitRecheckResult | Promise<SubmitRecheckResult>) | undefined,
   submittedText: string,
-): void {
-  if (!item.queuedActivationToken || !backend) return;
-  const generation = cliSpawnGeneration;
+  opts?: {
+    generation?: number;
+    turnId?: string;
+    probeEvidence?: () => QueuedActivationProof | undefined;
+    skipBookkeepingOnProof?: (proof: QueuedActivationProof) => boolean;
+    onSettledExtra?: (proof: QueuedActivationProof) => void;
+  },
+): boolean {
+  if (!item.queuedActivationToken || !backend) return false;
+  const generation = opts?.generation ?? cliSpawnGeneration;
+  const watchTurnId = opts?.turnId ?? item.turnId;
   const receiptBackend = backend;
-  queuedActivationReceipts.watch(item.queuedActivationToken, {
-    recheck,
+  const watched = queuedActivationReceipts.watch(item.queuedActivationToken, {
+    ...(recheck ? { recheck } : {}),
+    ...(opts?.probeEvidence ? { probeEvidence: opts.probeEvidence } : {}),
+    sessionId,
+    generation,
+    ...(watchTurnId !== undefined ? { turnId: watchTurnId } : {}),
+    ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
     isCurrent: () => cliSpawnGeneration === generation
       && backend === receiptBackend && !cliRestartInProgress,
-    onConfirmed: result => {
-      const cliSessionId = typeof result === 'object' && result ? result.cliSessionId : undefined;
-      const unprovenCliSessionId = typeof result === 'object' && result ? result.unprovenCliSessionId : undefined;
-      recordStructuredInput(item.turnId, submittedText, item.structuredSourceTurnIds,
-        cliSessionId, !unprovenCliSessionId);
-      if (cliSessionId) {
-        persistCliSessionId(cliSessionId);
-        if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
-        void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
+    onSettled: proof => {
+      try {
+        if (!opts?.skipBookkeepingOnProof?.(proof)) {
+          const cliSessionId = proof.cliSessionId;
+          const unprovenCliSessionId = proof.unprovenCliSessionId;
+          recordStructuredInput(item.turnId, submittedText, item.structuredSourceTurnIds,
+            cliSessionId, !unprovenCliSessionId);
+          if (cliSessionId) {
+            persistCliSessionId(cliSessionId);
+            if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
+            void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
+          }
+          opts?.onSettledExtra?.(proof);
+          queuePostSubmitNativeSessionTitle(item.nativeSessionTitle);
+        }
+      } catch (err: any) {
+        log(`Queued activation settlement bookkeeping failed (continuing ACK): ${err?.message ?? err}`);
+      } finally {
+        acknowledgeQueuedActivation(item);
       }
-      queuePostSubmitNativeSessionTitle(item.nativeSessionTitle);
-      acknowledgeQueuedActivation(item);
     },
   });
+  if (watched && opts?.probeEvidence && typeof queuedActivationReceipts.probeToken === 'function') {
+    return queuedActivationReceipts.probeToken(item.queuedActivationToken);
+  }
+  return false;
 }
 
 function codexAppRuntimeTypeAheadReady(): boolean {
@@ -27473,23 +27830,56 @@ async function flushPending(): Promise<void> {
           turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
         }
         itemsWrittenInThisFlush++;
+        ++cliGenerationTurnWrites;
+        const preAssignedEvidenceTurnId = item.turnId
+          ?? (claudeBridgeActive
+            ? randomBytes(8).toString('hex')
+            : codexBridgeActive && !writeRpcEngine
+              ? `codex-${randomBytes(8).toString('hex')}`
+              : undefined);
+        // Arm InputDeliveryEvidenceTracker BEFORE marking the bridge queues:
+        // CodexBridgeQueue.mark() synchronously replays bufferedUnmatched and
+        // may fire observeAuthoritativeReceipt() before writeInput() returns.
+        if (preAssignedEvidenceTurnId && typeof inputDeliveryEvidence?.start === 'function') {
+          inputDeliveryEvidence.start(
+            {
+              turnId: preAssignedEvidenceTurnId,
+              dispatchAttempt: item.dispatchAttempt,
+              cliGeneration: cliSpawnGeneration,
+            },
+            Date.now(),
+            webTerminalInputGeneration,
+            cliInterruptGeneration,
+          );
+        }
         // Anchor the bridge baseline only after this turn owns the ZMX
         // submission lock, immediately before its literal write.
         if (claudeBridgeActive) {
           try { bridgeIngest(); } catch { /* best-effort */ }
           bridgeTurnId = bridgeMarkPendingTurn(
             logicalMsg,
-            item.turnId,
+            preAssignedEvidenceTurnId,
             item.dispatchAttempt,
             item.linkRefMode,
+            msg !== logicalMsg ? msg : undefined,
           );
           if (bridgeTurnId && cliSubmissionInFlight?.item === item) {
             bridgeQueue.holdForWrite(bridgeTurnId, item.dispatchAttempt);
             cliSubmissionInFlight.bridgeTurnId = bridgeTurnId;
           }
         } else if (codexBridgeActive && !writeRpcEngine) {
-          bridgeTurnId = codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt, Date.now(), item.linkRefMode);
+          bridgeTurnId = codexBridgeMarkPendingTurn(
+            logicalMsg,
+            preAssignedEvidenceTurnId,
+            item.dispatchAttempt,
+            Date.now(),
+            item.linkRefMode,
+            msg !== logicalMsg ? msg : undefined,
+          );
           if (bridgeTurnId) {
+            if (msg !== logicalMsg) {
+              codexBridgeQueue.setSubmittedInputText?.(bridgeTurnId, msg, item.dispatchAttempt);
+            }
             codexBridgeQueue.beginSubmitVerification(bridgeTurnId, undefined, item.dispatchAttempt);
           }
           // Cursor reaches this branch in EVERY mode (its structured fallback
@@ -27527,7 +27917,9 @@ async function flushPending(): Promise<void> {
         // never executed must not report a (near-zero) duration — it still gets a
         // real completedAtMs (the failure instant), just no durationMs. Arming
         // here also keeps queueing time out of the span.
-        markTurnExecutionStart(item.turnId, item.dispatchAttempt);
+        markTurnExecutionStart(item.turnId, item.dispatchAttempt, {
+          evidenceAlreadyStarted: !!preAssignedEvidenceTurnId,
+        });
         if (isCodexAppCliId(lastInitConfig?.cliId)) {
           log(
             `Writing Codex App input to PTY (flush): `
@@ -28028,8 +28420,9 @@ async function flushPending(): Promise<void> {
             item,
           };
           log('Held definitely-unwritten input until ZMX recovery restart');
-        } else {
+        } else if ((!normalWritePrepared || submissionPreparationFailed) && !recoveryFailureReason) {
           requeueUnsubmittedQueuedActivation(item);
+        } else {
           if (recoveryFailureReason) inflightInputs.retire(item);
         }
         if (dispatchStillPending && durableWrite && item.turnId && !recoveryFailureReason) {
@@ -28050,16 +28443,63 @@ async function flushPending(): Promise<void> {
               deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item, msg);
               if (deliveryQuarantine) inflightInputs.forget(item);
             }
-            scheduleSubmitFailureNotify(
-              logicalMsg,
-              undefined,
-              t('worker.transcriptLabel'),
-              bridgeTurnId,
-              undefined,
-              turnSeq,
-              item,
-              'ambiguous',
-            );
+            const catchEvidenceTurnId = item.turnId ?? bridgeTurnId;
+            const catchGeneration = cliSpawnGeneration;
+            const catchAllowStandaloneSendMarker = cliGenerationTurnWrites <= 1;
+            const catchActivityBaselineMs = typeof inputDeliveryEvidence?.writeStartedAtMs === 'function'
+              ? (inputDeliveryEvidence.writeStartedAtMs({
+                turnId: catchEvidenceTurnId,
+                dispatchAttempt: item.dispatchAttempt,
+                cliGeneration: catchGeneration,
+              }) ?? Date.now())
+              : Date.now();
+            let catchChainKey: SubmitFailureChainKey | undefined;
+            let settledCatchImmediately = false;
+            if (normalWritePrepared
+              && !submissionPreparationFailed
+              && item.queuedActivationToken
+              && catchEvidenceTurnId) {
+              settledCatchImmediately = observeQueuedActivationReceipt(
+                item,
+                undefined,
+                submittedText,
+                {
+                  generation: catchGeneration,
+                  turnId: catchEvidenceTurnId,
+                  probeEvidence: () => probeAuthoritativeQueuedActivationEvidence(
+                    {
+                      turnId: catchEvidenceTurnId,
+                      sendMarkerTurnId: item.turnId,
+                      dispatchAttempt: item.dispatchAttempt,
+                      generation: catchGeneration,
+                      allowStandaloneSendMarker: catchAllowStandaloneSendMarker,
+                    },
+                    catchActivityBaselineMs,
+                  ),
+                  onSettledExtra: () => {
+                    if (catchChainKey) submitFailureChains.cancel(catchChainKey);
+                    releaseInputDeliveryQuarantine(
+                      deliveryQuarantine,
+                      'authoritative deferred submit evidence',
+                      { redriveTerminal: true },
+                    );
+                    redriveRejectedStructuredReady();
+                  },
+                },
+              );
+            }
+            if (!settledCatchImmediately) {
+              catchChainKey = scheduleSubmitFailureNotify(
+                logicalMsg,
+                undefined,
+                t('worker.transcriptLabel'),
+                bridgeTurnId,
+                undefined,
+                turnSeq,
+                item,
+                'ambiguous',
+              );
+            }
           }
         }
         break;
@@ -28197,6 +28637,7 @@ async function flushPending(): Promise<void> {
             );
           }
         }
+        let settledQueuedActivationImmediately = false;
         if (backend && dispatchStillPending) {
           // master's ZMX recovery: a sticky submission-journal failure means the
           // current item may actually have landed. Retire it and stop the batch
@@ -28206,41 +28647,178 @@ async function flushPending(): Promise<void> {
             notifyAmbiguousSubmissionRecovery(recoveryFailureReason, item);
             break;
           }
+          const activationGeneration = cliSpawnGeneration;
+          const activationEvidenceTurnId = item.turnId ?? bridgeTurnId;
+          const allowStandaloneSendMarker = cliGenerationTurnWrites <= 1;
+          const activationActivityBaselineMs = typeof inputDeliveryEvidence?.writeStartedAtMs === 'function'
+            ? (inputDeliveryEvidence.writeStartedAtMs({
+              turnId: activationEvidenceTurnId,
+              dispatchAttempt: item.dispatchAttempt,
+              cliGeneration: activationGeneration,
+            }) ?? Date.now())
+            : Date.now();
           if (result.submissionDisposition === 'dirty_unknown') {
             inflightInputs.retire(item);
+            let dirtyChainKey: SubmitFailureChainKey | undefined;
+            if (item.queuedActivationToken && activationEvidenceTurnId) {
+              settledQueuedActivationImmediately = observeQueuedActivationReceipt(
+                item,
+                undefined,
+                submittedText,
+                {
+                  generation: activationGeneration,
+                  turnId: activationEvidenceTurnId,
+                  probeEvidence: () => probeAuthoritativeQueuedActivationEvidence(
+                    {
+                      turnId: activationEvidenceTurnId,
+                      sendMarkerTurnId: item.turnId,
+                      dispatchAttempt: item.dispatchAttempt,
+                      generation: activationGeneration,
+                      allowStandaloneSendMarker,
+                    },
+                    activationActivityBaselineMs,
+                  ),
+                  onSettledExtra: () => {
+                    if (dirtyChainKey) submitFailureChains.cancel(dirtyChainKey);
+                    redriveRejectedStructuredReady();
+                  },
+                },
+              );
+              if (!settledQueuedActivationImmediately && effectiveBackendType !== 'remote-runner') {
+                dirtyChainKey = scheduleSubmitFailureNotify(
+                  logicalMsg,
+                  undefined,
+                  t('worker.transcriptLabel'),
+                  bridgeTurnId,
+                  undefined,
+                  turnSeq,
+                  item,
+                  'ambiguous',
+                  codexBridgeActive,
+                );
+              }
+            }
             break;
           }
-          scheduleSubmitFailureNotify(
-            logicalMsg,
-            result.recheck,
-            t('worker.transcriptLabel'),
-            bridgeTurnId,
-            result.failureReason,
-            turnSeq,
-            item,
-            'failed',
-            codexBridgeActive,
-            (confirmedCliSessionId, unprovenCliSessionId) => {
-              // The immediate write returned submitted:false, so the normal
-              // post-write anchor was skipped. Preserve the exact prepared
-              // bytes (including any adapter correlation marker) when the
-              // deferred receipt later proves this same input was accepted.
-              recordStructuredInput(item.turnId, submittedText,
-                item.structuredSourceTurnIds, confirmedCliSessionId, !unprovenCliSessionId);
-              releaseInputDeliveryQuarantine(
-                deliveryQuarantine,
-                'authoritative deferred submit evidence',
-                { redriveTerminal: true },
-              );
-            },
-          );
-          if (!result.failureReason && result.recheck) {
-            observeQueuedActivationReceipt(item, result.recheck, submittedText);
-          } else if (result.failureReason && item.queuedActivationToken && !codexAppSafeNonSubmission) {
-            // The thread was just told this input was not written; follow-ups
-            // the daemon holds behind the activation would otherwise wait forever.
-            log(`Settled refused queued activation ${item.queuedActivationToken.substring(0, 8)}`);
-            acknowledgeQueuedActivation(item);
+          const retainQuarantinedActivation = cliAdapter?.quarantineUnconfirmedSubmits === true
+            && codexBridgeActive && !!result.recheck && !!bridgeTurnId
+            && !!deliveryQuarantine && item.dispatchAttempt === undefined
+            && deliveryQuarantine.turnId === item.turnId;
+          const durableQuarantinedRecheck = cliAdapter?.quarantineUnconfirmedSubmits === true
+            && !!deliveryQuarantine && item.dispatchAttempt !== undefined && result.recheck
+            ? async (): Promise<SubmitRecheckResult> => {
+              const checked = await result.recheck!();
+              if (typeof checked === 'object' && checked
+                && checked.submitted === true
+                && checked.ownershipProven === true
+                && !!checked.cliSessionId) {
+                return checked;
+              }
+              return false;
+            }
+            : result.recheck;
+          let activationChainKey: SubmitFailureChainKey | undefined;
+          if (!result.failureReason
+            && !codexAppSafeNonSubmission
+            && item.queuedActivationToken
+            && (durableQuarantinedRecheck || activationEvidenceTurnId)) {
+            settledQueuedActivationImmediately = observeQueuedActivationReceipt(
+              item,
+              durableQuarantinedRecheck,
+              submittedText,
+              {
+                generation: activationGeneration,
+                ...(activationEvidenceTurnId ? { turnId: activationEvidenceTurnId } : {}),
+                ...(activationEvidenceTurnId ? {
+                  probeEvidence: () => probeAuthoritativeQueuedActivationEvidence(
+                    {
+                      turnId: activationEvidenceTurnId,
+                      sendMarkerTurnId: item.turnId,
+                      dispatchAttempt: item.dispatchAttempt,
+                      generation: activationGeneration,
+                      allowStandaloneSendMarker,
+                    },
+                    activationActivityBaselineMs,
+                  ),
+                } : {}),
+                // Unattributed sibling-pane history receipts on an ordinary
+                // quarantined TRAE draft still settle the daemon activation ACK
+                // (preserving worker-agy-delivery compatibility), while skipping
+                // worker-local bookkeeping and keeping quarantine/warning chain
+                // armed until an owned cliSessionId or authoritative transcript
+                // arrives so recordStructuredInput is never duplicated.
+                skipBookkeepingOnProof: proof => retainQuarantinedActivation
+                  && proof.source === 'adapter-recheck'
+                  && !proof.cliSessionId,
+                onSettledExtra: proof => {
+                  if (activationChainKey) submitFailureChains.cancel(activationChainKey);
+                  if (codexBridgeActive && bridgeTurnId) {
+                    codexBridgeQueue.confirmPendingTurn?.(bridgeTurnId, undefined, item.dispatchAttempt);
+                  }
+                  traexFirstSubmitConfirmed = true;
+                  if (typeof deferNativeCodexInputCommit === 'function'
+                    && deferNativeCodexInputCommit(item.dispatchAttempt)) {
+                    acknowledgeTurnInputCommitted?.(item.turnId, item.dispatchAttempt);
+                  }
+                  if (!proof.cliSessionId && proof.unprovenCliSessionId) {
+                    codexBridgeNoteUnprovenCliSessionId?.(proof.unprovenCliSessionId, {
+                      turnId: item.turnId,
+                      bridgeTurnId,
+                      dispatchAttempt: item.dispatchAttempt,
+                    });
+                  }
+                  if (proof.ownershipProven === true
+                    && typeof codexHistoryMatchProvesConsumption === 'function'
+                    && codexHistoryMatchProvesConsumption()) {
+                    acknowledgeNativeInputConsumed?.(
+                      item.turnId,
+                      'codex_history_match',
+                      proof.cliSessionId ?? lastInitConfig?.cliSessionId,
+                      undefined,
+                      item.dispatchAttempt,
+                    );
+                  }
+                  releaseInputDeliveryQuarantine(
+                    deliveryQuarantine,
+                    'authoritative deferred submit evidence',
+                    { redriveTerminal: true },
+                  );
+                  redriveRejectedStructuredReady();
+                },
+              },
+            );
+          }
+          if (!settledQueuedActivationImmediately) {
+            activationChainKey = scheduleSubmitFailureNotify(
+              logicalMsg,
+              durableQuarantinedRecheck,
+              t('worker.transcriptLabel'),
+              bridgeTurnId,
+              result.failureReason,
+              turnSeq,
+              item,
+              'failed',
+              codexBridgeActive,
+              (confirmedCliSessionId, unprovenCliSessionId) => {
+                // The immediate write returned submitted:false, so the normal
+                // post-write anchor was skipped. Preserve the exact prepared
+                // bytes (including any adapter correlation marker) when the
+                // deferred receipt later proves this same input was accepted.
+                recordStructuredInput(item.turnId, submittedText,
+                  item.structuredSourceTurnIds, confirmedCliSessionId, !unprovenCliSessionId);
+                releaseInputDeliveryQuarantine(
+                  deliveryQuarantine,
+                  'authoritative deferred submit evidence',
+                  { redriveTerminal: true },
+                );
+              },
+            );
+            if (result.failureReason && item.queuedActivationToken && !codexAppSafeNonSubmission) {
+              // The thread was just told this input was not written; follow-ups
+              // the daemon holds behind the activation would otherwise wait forever.
+              log(`Settled refused queued activation ${item.queuedActivationToken.substring(0, 8)}`);
+              acknowledgeQueuedActivation(item);
+            }
           }
         }
         // A missing history receipt is ambiguous, not proof that the input was
@@ -28248,9 +28826,15 @@ async function flushPending(): Promise<void> {
         // and continually replaces their deferred confirmation timer. Only the
         // adapter's explicit safe non-submission disposition permits retry.
         if (!recoveryFailureReason && codexAppSafeNonSubmission) {
+          // No bytes were written, so a first activation retry is still the
+          // opening write for standalone botmux-send evidence. Do not let a
+          // proven untouched/flushed-invalid attempt consume that allowance.
+          if (item.queuedActivationToken && cliGenerationTurnWrites === 1) {
+            cliGenerationTurnWrites = 0;
+          }
           requeueUnsubmittedQueuedActivation(item);
         }
-        if (deliveryQuarantine) break;
+        if (deliveryQuarantine && !settledQueuedActivationImmediately) break;
       } else if (item.queuedActivationToken) {
         // The daemon keeps the exact journal and route reservation until this
         // adapter-level boundary. IPC loss may replay at-least-once; an early
@@ -29936,6 +30520,7 @@ async function spawnCliBody(
   }
   // Deferred submit-failure chains are generation-keyed; a fresh generation
   // invalidates every live chain before any old timer can touch new state.
+  cliGenerationTurnWrites = 0;
   submitFailureChains.clear();
   inputDeliveryEvidence.clear();
   queuedActivationReceipts.clear();
@@ -36865,6 +37450,31 @@ async function spawnCliBody(
       );
       return;
     }
+    if (!intentionalRestart
+      && typeof queuedActivationReceipts?.size === 'function'
+      && queuedActivationReceipts.size() > 0) {
+      if (cliAdapter?.reliableTurnTerminal === true || lastSpawnArgvDurableInitialPrompt) {
+        drainReliableTerminalBeforeInterrupt();
+        drainArgvDurableInitialPromptCompletion();
+      }
+      if (exitedTurnId && typeof queuedActivationReceipts?.probeByTurn === 'function') {
+        queuedActivationReceipts.probeByTurn({
+          sessionId,
+          generation: cliSpawnGeneration,
+          turnId: exitedTurnId,
+          dispatchAttempt: exitedDispatchAttempt,
+        });
+      }
+      if (queuedActivationReceipts.size() > 0) {
+        queuedActivationReceipts.clear();
+        log('CLI exited with an unsettled queued activation receipt; retiring worker so daemon journal recovery owns retry');
+        void sendFatalWorkerErrorAndExit(
+          new Error('CLI exited with an unsettled queued activation receipt'),
+          exitedTurnId,
+        );
+        return;
+      }
+    }
     if ((cliAdapter?.reliableTurnTerminal === true || lastSpawnArgvDurableInitialPrompt)
       && exitedTurnId
       && exitedDispatchAttempt !== undefined) {
@@ -37342,6 +37952,10 @@ function killCli(opts: {
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
   cliSpawnGeneration++;
+  cliGenerationTurnWrites = 0;
+  submitFailureChains?.clear?.();
+  inputDeliveryEvidence?.clear?.();
+  queuedActivationReceipts?.clear?.();
   claudeEffortObserver.reset();
   awaySummaryFocus.reset();
   if (dshProcessAttestation?.retryTimer) clearTimeout(dshProcessAttestation.retryTimer);
@@ -37562,6 +38176,17 @@ async function restartCliProcess(
     lastCliExitServerReplaced = false;
     log(`Restart ignored in shared-adopt mode (${reason})`);
     settleRespawn('failed');
+    return;
+  }
+  if (typeof queuedActivationReceipts?.size === 'function'
+    && queuedActivationReceipts.size() > 0
+    && !closeRequested) {
+    queuedActivationReceipts.clear();
+    log(`In-worker CLI restart (${reason}) has an unsettled queued activation receipt; retiring worker for daemon journal recovery`);
+    settleRespawn('failed');
+    void sendFatalWorkerErrorAndExit(
+      new Error(`In-worker CLI restart (${reason}) requires daemon journal recovery for unsettled queued activation`),
+    );
     return;
   }
   restartEpoch = ++cliRestartEpoch;
@@ -41067,13 +41692,19 @@ const turnExecutionClock = new TurnExecutionClock();
 /** Arm the execution window for the turn whose input is being written right
  *  now. Called from every literal-write site (flush, adopt, passthrough, init)
  *  so `durationMs` measures the CLI, not the daemon's backlog. */
-function markTurnExecutionStart(turnId: string | undefined, dispatchAttempt?: number): void {
+function markTurnExecutionStart(
+  turnId: string | undefined,
+  dispatchAttempt?: number,
+  opts?: { evidenceAlreadyStarted?: boolean },
+): void {
   workerSessionEventScope?.recordSubmission(turnId, dispatchAttempt);
   const startedAtMs = Date.now();
   turnExecutionClock.start(turnId, dispatchAttempt, startedAtMs);
-  inputDeliveryEvidence.start({
-    turnId, dispatchAttempt, cliGeneration: cliSpawnGeneration,
-  }, startedAtMs, webTerminalInputGeneration, cliInterruptGeneration);
+  if (!opts?.evidenceAlreadyStarted) {
+    inputDeliveryEvidence.start({
+      turnId, dispatchAttempt, cliGeneration: cliSpawnGeneration,
+    }, startedAtMs, webTerminalInputGeneration, cliInterruptGeneration);
+  }
   if (turnId) send({ type: 'turn_execution_started', turnId, dispatchAttempt, startedAtMs });
 }
 
@@ -41319,6 +41950,19 @@ function emitTurnTerminal(
     turnExecutionClock.forget(turnId, dispatchAttempt);
     return;
   }
+  // A fast (<20s) completed turn cancels submitFailureChains above before its
+  // deferred recheck ever runs. Probe read-only authoritative proof (full
+  // transcript receipt or exact-turn botmux-send marker) now so a completed
+  // opening turn never strands queuedActivationPending. Never settle on bare
+  // completion without authoritative proof.
+  if (status === 'completed' && typeof queuedActivationReceipts?.probeByTurn === 'function') {
+    queuedActivationReceipts.probeByTurn({
+      sessionId,
+      generation: cliSpawnGeneration,
+      turnId,
+      dispatchAttempt,
+    });
+  }
   if (status !== 'completed') lastTurnFailureSurfacedAtMs = Date.now();
   traexAutoModelController?.endTurn(turnId);
   const timing = turnExecutionClock.settle(turnId, dispatchAttempt, completedAtMs);
@@ -41441,7 +42085,8 @@ function cliInputBacklog(): CliInputBacklog {
       || pendingRawInputs.length > 0
       || pendingAdoptMessages.length > 0
       || cliSubmissionInFlight !== null
-      || submitFailureChains.size() > 0,
+      || submitFailureChains.size() > 0
+      || (typeof queuedActivationReceipts?.size === 'function' && queuedActivationReceipts.size() > 0),
     ...(writingTurnId ? { writingTurnId } : {}),
   };
 }
@@ -42817,15 +43462,27 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // return from spawnCli before that write — exclude them explicitly so
         // the stale module-level value can't leak in.
         const deferInitialPrompt = lastSpawnDeferInitialPrompt;
+        const argvEvidenceStartedAtMs = Date.now();
+        let argvBridgeTurnId: string | undefined;
         if (msg.prompt && cliAdapter?.passesInitialPromptViaArgs && !deferInitialPrompt && codexBridgeFallbackActive()) {
+          // Arm inputDeliveryEvidence BEFORE codexBridgeMarkPendingTurn so any
+          // bufferedUnmatched transcript record replayed inside mark() is not
+          // overwritten by a later start() call.
+          const preArgvTurnId = msg.turnId ?? `codex-${randomBytes(8).toString('hex')}`;
+          inputDeliveryEvidence.start(
+            { turnId: preArgvTurnId, dispatchAttempt: msg.dispatchAttempt, cliGeneration: cliSpawnGeneration },
+            argvEvidenceStartedAtMs,
+            webTerminalInputGeneration,
+            cliInterruptGeneration,
+          );
           // Args-baked first prompts (notably Pi) never pass through the normal
           // 'message' IPC path, so the structured bridge would otherwise see the
           // transcript final answer with no pending turn to attribute it to.
           // Mark it here before the CLI starts processing; late-attach is fine
           // because CodexBridgeQueue is path-agnostic until ingest discovers the
           // transcript file.
-          const bridgeTurnId = codexBridgeMarkPendingTurn(msg.prompt, msg.turnId, msg.dispatchAttempt);
-          if (bridgeTurnId) codexBridgeQueue.confirmPendingTurn(bridgeTurnId, undefined, msg.dispatchAttempt);
+          argvBridgeTurnId = codexBridgeMarkPendingTurn(msg.prompt, preArgvTurnId, msg.dispatchAttempt);
+          if (argvBridgeTurnId) codexBridgeQueue.confirmPendingTurn(argvBridgeTurnId, undefined, msg.dispatchAttempt);
         }
         // Queue the initial prompt for flushPending (pure decision, unit-tested):
         //  - paste (no engine): normal queue.
@@ -42953,70 +43610,124 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             }
             const argvGeneration = cliSpawnGeneration;
             const argvBackend = backend;
-            const finalizeArgvSubmission = (cliSessionId?: string) => {
-              if (!cliSessionId) return;
-              if (msg.queuedActivationToken) {
-                send({
-                  type: 'queued_activation_submitted',
-                  sessionId,
-                  activationToken: msg.queuedActivationToken,
-                });
-              }
-              if (!submission
-                || submission.baseline === null
-                || !msg.turnId
-                || msg.dispatchAttempt === undefined
-                || !cliAdapter?.isInitialPromptComplete
-                || !argvBackend) return;
-              const completion = {
-                baseline: submission.baseline,
-                content: submission.content,
-                cliSessionId,
-                turnId: msg.turnId,
+            const argvEvidenceTurnId = msg.turnId ?? argvBridgeTurnId;
+            const argvWriteStartedAtMs = argvEvidenceStartedAtMs;
+            if (argvEvidenceTurnId
+              && inputDeliveryEvidence.writeStartedAtMs({
+                turnId: argvEvidenceTurnId,
                 dispatchAttempt: msg.dispatchAttempt,
-                adapter: cliAdapter,
+                cliGeneration: argvGeneration,
+              }) === undefined) {
+              inputDeliveryEvidence.start(
+                { turnId: argvEvidenceTurnId, dispatchAttempt: msg.dispatchAttempt, cliGeneration: argvGeneration },
+                argvWriteStartedAtMs,
+                webTerminalInputGeneration,
+                cliInterruptGeneration,
+              );
+            }
+            const argvIsCurrent = (): boolean => (
+              cliSpawnGeneration === argvGeneration
+              && argvBackend !== null
+              && backend === argvBackend
+              && !cliRestartInProgress
+            );
+            let argvChainKey: SubmitFailureChainKey | undefined;
+            const needsArgvDurableCompletionWatcher = !!submission
+              && submission.baseline !== null
+              && !!msg.turnId
+              && msg.dispatchAttempt !== undefined
+              && !!cliAdapter?.isInitialPromptComplete
+              && !!argvBackend;
+            const finalizeArgvSubmission = (cliSessionId?: string) => {
+              if (!argvIsCurrent()) return;
+              if (cliSessionId) persistCliSessionId(cliSessionId);
+              if (msg.queuedActivationToken) {
+                acknowledgeQueuedActivationToken(msg.queuedActivationToken);
+              }
+              // Keep deferred recheck alive when durable argv completion still
+              // needs cliSessionId to arm watchArgvDurableInitialPromptCompletion.
+              if (!cliSessionId && needsArgvDurableCompletionWatcher) return;
+              if (argvChainKey) submitFailureChains.cancel(argvChainKey);
+              if (!cliSessionId || !needsArgvDurableCompletionWatcher) return;
+              const completion = {
+                baseline: submission!.baseline!,
+                content: submission!.content,
+                cliSessionId,
+                turnId: msg.turnId!,
+                dispatchAttempt: msg.dispatchAttempt!,
+                adapter: cliAdapter!,
               };
               argvDurableInitialPromptCompletion = completion;
               watchArgvDurableInitialPromptCompletion({
                 ...completion,
-                backend: argvBackend,
+                backend: argvBackend!,
                 generation: argvGeneration,
               });
+            };
+            const watchArgvActivationAndNotify = (
+              recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>,
+            ) => {
+              let settledImmediately = false;
+              if (msg.queuedActivationToken && (recheck || argvEvidenceTurnId)) {
+                const watched = queuedActivationReceipts.watch(msg.queuedActivationToken, {
+                  ...(recheck ? { recheck } : {}),
+                  ...(argvEvidenceTurnId ? {
+                    probeEvidence: () => probeAuthoritativeQueuedActivationEvidence(
+                      {
+                        turnId: argvEvidenceTurnId,
+                        sendMarkerTurnId: msg.turnId,
+                        dispatchAttempt: msg.dispatchAttempt,
+                        generation: argvGeneration,
+                        allowStandaloneSendMarker: true,
+                      },
+                      argvWriteStartedAtMs,
+                    ),
+                  } : {}),
+                  sessionId,
+                  generation: argvGeneration,
+                  ...(argvEvidenceTurnId !== undefined ? { turnId: argvEvidenceTurnId } : {}),
+                  ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+                  isCurrent: argvIsCurrent,
+                  onSettled: proof => finalizeArgvSubmission(proof.cliSessionId),
+                });
+                if (watched && argvEvidenceTurnId) {
+                  settledImmediately = queuedActivationReceipts.probeToken(msg.queuedActivationToken);
+                }
+              }
+              if ((!settledImmediately || (needsArgvDurableCompletionWatcher && !argvDurableInitialPromptCompletion?.cliSessionId))
+                && submission) {
+                argvChainKey = scheduleSubmitFailureNotify(
+                  submission.content,
+                  recheck,
+                  t('worker.transcriptLabel'),
+                  argvBridgeTurnId,
+                  undefined,
+                  usageLimitTracker.currentTurn(),
+                  {
+                    turnId: msg.turnId,
+                    dispatchAttempt: msg.dispatchAttempt,
+                    ...(msg.queuedActivationToken ? { queuedActivationToken: msg.queuedActivationToken } : {}),
+                  },
+                  'failed',
+                  false,
+                  cliSessionId => finalizeArgvSubmission(cliSessionId),
+                );
+              }
             };
             if (submission && confirm && argvBackend) {
               try {
                 const result = await confirm(submission.baseline, submission.content);
-                if (cliSpawnGeneration === argvGeneration && backend === argvBackend) {
+                if (argvIsCurrent()) {
                   if (result.cliSessionId) persistCliSessionId(result.cliSessionId);
                   if (result.submitted) {
                     finalizeArgvSubmission(result.cliSessionId);
                   } else {
-                    scheduleSubmitFailureNotify(
-                      submission.content,
-                      result.recheck,
-                      t('worker.transcriptLabel'),
-                      undefined,
-                      undefined,
-                      usageLimitTracker.currentTurn(),
-                      { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt },
-                      'failed',
-                      false,
-                      cliSessionId => finalizeArgvSubmission(cliSessionId),
-                    );
+                    watchArgvActivationAndNotify(result.recheck);
                   }
                 }
               } catch {
-                if (cliSpawnGeneration === argvGeneration && backend === argvBackend) {
-                  scheduleSubmitFailureNotify(
-                    submission.content,
-                    undefined,
-                    t('worker.transcriptLabel'),
-                    undefined,
-                    undefined,
-                    usageLimitTracker.currentTurn(),
-                    { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt },
-                    'failed',
-                  );
+                if (argvIsCurrent()) {
+                  watchArgvActivationAndNotify(undefined);
                 }
               }
             }

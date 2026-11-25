@@ -209,11 +209,29 @@ function stripCursorReasoningLeak(text: string): string {
   return text.slice(0, marker.index).trimEnd();
 }
 
+const CURSOR_USER_QUERY_OPEN = '<user_query>';
+const CURSOR_USER_QUERY_CLOSE = '</user_query>';
+
+/** Unwrap cursor-agent's outer `<user_query>\n...\n</user_query>` envelope on
+ *  user transcript records, preserving any literal inner tags via lastIndexOf. */
+export function unwrapCursorUserInput(content: string): string {
+  if (!content.startsWith(CURSOR_USER_QUERY_OPEN)) return content;
+  const afterOpen = CURSOR_USER_QUERY_OPEN.length;
+  const innerStart = content.charCodeAt(afterOpen) === 10 /* \n */ ? afterOpen + 1 : afterOpen;
+  const closeAt = content.lastIndexOf(CURSOR_USER_QUERY_CLOSE);
+  if (closeAt < innerStart) return content;
+  const trailing = content.slice(closeAt + CURSOR_USER_QUERY_CLOSE.length).trim();
+  if (trailing.length > 0) return content;
+  const innerEnd = closeAt > innerStart && content.charCodeAt(closeAt - 1) === 10 ? closeAt - 1 : closeAt;
+  return content.slice(innerStart, innerEnd);
+}
+
 function eventFromLine(path: string, lineStart: number, obj: any, timestampMs: number): CodexBridgeEvent | undefined {
   const role = obj?.role ?? obj?.message?.role;
   const content = obj?.message?.content;
   if (role === 'user') {
-    const t = joinTextBlocks(content);
+    const raw = joinTextBlocks(content);
+    const t = unwrapCursorUserInput(raw);
     if (!t) return undefined;
     return { uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text: t };
   }

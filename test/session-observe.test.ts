@@ -447,3 +447,74 @@ describe('session-observe task block', () => {
     }).task).toBeUndefined();
   });
 });
+
+describe('normalizeSessionRow queued activation visibility (#3748)', () => {
+  it('surfaces queuedActivationPending and queuedActivationTailCount on live idle and dormant rows without changing queued semantics', () => {
+    const idleBlocked = normalizeSessionRow(
+      makeRow({
+        status: 'idle',
+        queued: false,
+        queuedActivationPending: true,
+        queuedActivationTailCount: 3,
+      }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect(idleBlocked.liveness).toBe('alive');
+    expect(idleBlocked.turn).toBe('idle');
+    expect(idleBlocked.queued).toBe(false);
+    expect(idleBlocked.queuedActivationPending).toBe(true);
+    expect(idleBlocked.queuedActivationTailCount).toBe(3);
+
+    const dormantBlocked = normalizeSessionRow(
+      makeRow({
+        status: 'dormant',
+        queued: false,
+        queuedActivationPending: true,
+        queuedActivationTailCount: 2,
+      }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect(dormantBlocked.liveness).toBe('not_running');
+    expect(dormantBlocked.queuedActivationPending).toBe(true);
+    expect(dormantBlocked.queuedActivationTailCount).toBe(2);
+  });
+
+  it('omits queuedActivationPending and queuedActivationTailCount when settled, zero, closed, or probe failed', () => {
+    const settled = normalizeSessionRow(
+      makeRow({
+        status: 'idle',
+        queued: false,
+        queuedActivationPending: false,
+        queuedActivationTailCount: 0,
+      }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect('queuedActivationPending' in settled).toBe(false);
+    expect('queuedActivationTailCount' in settled).toBe(false);
+
+    const closed = normalizeSessionRow(
+      makeRow({
+        status: 'closed',
+        queuedActivationPending: true,
+        queuedActivationTailCount: 3,
+      }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect('queuedActivationPending' in closed).toBe(false);
+    expect('queuedActivationTailCount' in closed).toBe(false);
+
+    const failedProbe = normalizeSessionRow(
+      makeRow({
+        status: 'idle',
+        queuedActivationPending: true,
+        queuedActivationTailCount: 3,
+      }),
+      {
+        observedAt: OBSERVED_AT,
+        probe: { status: 'unreachable', source: 'daemon-ipc' },
+      },
+    );
+    expect('queuedActivationPending' in failedProbe).toBe(false);
+    expect('queuedActivationTailCount' in failedProbe).toBe(false);
+  });
+});
