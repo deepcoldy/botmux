@@ -742,12 +742,27 @@ export interface ChatMemberDisplay {
   openId: string;
   name: string;
   memberType: 'user' | 'bot' | 'unknown';
+  /** Configured Feishu app ID when this bot maps to a local botmux bot. */
+  larkAppId?: string;
+}
+
+function pickNonEmptyDisplayName(candidates: readonly unknown[], fallback: string): string {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string') {
+      const trimmed = candidate.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+  return fallback;
 }
 
 export async function listChatMemberDisplays(larkAppId: string, chatId: string): Promise<ChatMemberDisplay[]> {
   const client = getBotClient(larkAppId);
   const out: ChatMemberDisplay[] = [];
   const seen = new Map<string, number>();
+  // Once two different configured apps claim the same observer-scoped openId,
+  // keep that row ambiguous even if later duplicate rows repeat one claimant.
+  const ambiguousBotOpenIds = new Set<string>();
   let pageToken: string | undefined;
   for (let page = 0; page < 20; page++) {
     const params: Record<string, string> = {
@@ -763,13 +778,26 @@ export async function listChatMemberDisplays(larkAppId: string, chatId: string):
     for (const item of res.data?.items ?? []) {
       const openId = String(item?.member_id ?? '').trim();
       if (!openId) continue;
-      const name = String(item?.name ?? item?.member_name ?? item?.display_name ?? openId).trim() || openId;
+      const name = pickNonEmptyDisplayName([item?.name, item?.member_name, item?.display_name], openId);
       const typeRaw = String(item?.member_type ?? item?.type ?? '').trim();
       const memberType: ChatMemberDisplay['memberType'] = typeRaw === 'bot' || typeRaw === 'app'
         ? 'bot'
         : typeRaw === 'user' ? 'user' : 'unknown';
-      seen.set(openId, out.length);
-      out.push({ openId, name, memberType });
+      const existing = seen.get(openId);
+      if (existing === undefined) {
+        seen.set(openId, out.length);
+        out.push({ openId, name, memberType });
+      } else {
+        const prev = out[existing]!;
+        const resolvedName = name === openId && prev.name !== openId ? prev.name : name;
+        const resolvedType = memberType === 'unknown' && prev.memberType !== 'unknown' ? prev.memberType : memberType;
+        out[existing] = {
+          openId,
+          name: resolvedName,
+          memberType: resolvedType,
+          ...(prev.larkAppId ? { larkAppId: prev.larkAppId } : {}),
+        };
+      }
     }
     if (!res.data?.has_more || !res.data?.page_token) break;
     pageToken = res.data.page_token;
@@ -779,13 +807,34 @@ export async function listChatMemberDisplays(larkAppId: string, chatId: string):
     for (const bot of bots) {
       const openId = String(bot.openId ?? '').trim();
       if (!openId) continue;
-      const name = String(bot.displayName ?? bot.name ?? openId).trim() || openId;
+      const name = pickNonEmptyDisplayName([bot.displayName, bot.name], openId);
+      const botLarkAppId = typeof bot.larkAppId === 'string' ? bot.larkAppId.trim() : '';
       const existing = seen.get(openId);
       if (existing === undefined) {
         seen.set(openId, out.length);
-        out.push({ openId, name, memberType: 'bot' });
+        out.push({
+          openId,
+          name,
+          memberType: 'bot',
+          ...(botLarkAppId ? { larkAppId: botLarkAppId } : {}),
+        });
       } else {
-        out[existing] = { openId, name, memberType: 'bot' };
+        const prev = out[existing]!;
+        const resolvedName = name === openId && prev.name !== openId ? prev.name : name;
+        if (botLarkAppId && prev.larkAppId && botLarkAppId !== prev.larkAppId) {
+          ambiguousBotOpenIds.add(openId);
+        }
+        // An observed external row (empty appId) does not erase a configured
+        // identity, but conflicting configured identities fail closed.
+        const resolvedAppId = ambiguousBotOpenIds.has(openId)
+          ? undefined
+          : botLarkAppId || prev.larkAppId;
+        out[existing] = {
+          openId,
+          name: resolvedName,
+          memberType: 'bot',
+          ...(resolvedAppId ? { larkAppId: resolvedAppId } : {}),
+        };
       }
     }
   } catch (err) {

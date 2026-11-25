@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
+import { diagnoseBackendSubmitFailure, shouldWaitThroughBusyTurn } from '../src/services/submit-failure-diagnosis.js';
 import {
   combineSubmitCurrentFences,
   decideSubmitConfirmationAction,
@@ -505,3 +506,128 @@ describe('settleStaleWriteContinuation', () => {
     }]);
   });
 });
+
+describe('weak pty-output confirmation vs wholeInputPassing successor', () => {
+  it('allows a 1s-quantised whole-input successor to pass a weak pty-output head without synthesising codex-local', async () => {
+    let now = 50_000;
+    const queue = new CodexBridgeQueue(() => now);
+    queue.setLocalTurns(true, 10_000);
+    queue.setWholeInputPassing(true, { timestampGranularityMs: 1_000 });
+
+    // Turn 1 ("继续？") failed in-band confirmation, then deferred recheck saw
+    // only weak pty-output activity (e.g. agy dismissing its feedback banner).
+    queue.mark('turn-dropped', '继续？', 16_657, 1);
+    queue.beginSubmitVerification('turn-dropped', 16_657, 1);
+    now = 39_883;
+    const weakSettlement = await settleDeferredSubmitConfirmation(queue, {
+      turnId: 'turn-dropped',
+      dispatchAttempt: 1,
+      structuredTarget: true,
+      recheck: async () => false,
+      usageLimitDetected: () => false,
+      activityEvidence: () => 'pty-output',
+      isCurrent: () => true,
+    });
+    expect(weakSettlement).toMatchObject({
+      action: { kind: 'suppress-active', evidence: 'pty-output' },
+      lifecycle: 'confirmed',
+    });
+    expect(queue.peek()[0]?.weakSubmitConfirmation).toBe(true);
+
+    // Turn 2 ("继续") is marked at 50_977ms and strongly confirmed via history.
+    now = 50_977;
+    queue.mark('turn-follow', '继续', 50_977, 1);
+    queue.confirmPendingTurn('turn-follow', 50_977, 1);
+
+    // Historical record strictly before the 1s floor (49_000 < 50_000) is NOT attributed to Turn 2.
+    queue.ingest([{ kind: 'user', uuid: 'u-old', text: '继续', timestampMs: 49_000 }]);
+    expect(queue.peek().find(turn => turn.turnId === 'turn-follow')?.started).toBe(false);
+
+    // Antigravity's RFC3339 created_at truncates 50_977ms to 50_000ms.
+    // Turn 2 must still pass Turn 1 cleanly rather than synthesising codex-local.
+    queue.ingest([
+      { kind: 'user', uuid: 'u-follow', text: '继续', timestampMs: 50_000 },
+      { kind: 'assistant_final', uuid: 'a-follow', text: '已完成', timestampMs: 51_000 },
+    ]);
+
+    expect(queue.isPassedBySuccessor('turn-dropped', 1)).toBe(true);
+    expect(queue.peek().some(turn => turn.isLocal === true)).toBe(false);
+    expect(queue.peek().find(turn => turn.turnId === 'turn-follow')).toMatchObject({
+      started: true,
+      exactUserInputMatch: true,
+    });
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'turn-follow', finalText: '已完成' }),
+    ]);
+
+    // Weak pty-output must never revive an already-passed head.
+    expect(queue.confirmPendingTurn('turn-dropped', 52_000, 1, { weak: true })).toBe(false);
+    expect(queue.isPassedBySuccessor('turn-dropped', 1)).toBe(true);
+
+    // Strongly confirmed heads still block wholeInputPassing.
+    const strongQueue = new CodexBridgeQueue(() => 60_000);
+    strongQueue.setLocalTurns(true, 10_000);
+    strongQueue.setWholeInputPassing(true, { timestampGranularityMs: 1_000 });
+    strongQueue.mark('t-strong', '继续？', 20_000);
+    strongQueue.confirmPendingTurn('t-strong', 20_500);
+    strongQueue.mark('t-next', '继续', 30_900);
+    strongQueue.ingest([{ kind: 'user', uuid: 'u-next', text: '继续', timestampMs: 30_000 }]);
+    expect(strongQueue.isPassedBySuccessor('t-strong')).toBe(false);
+    expect(strongQueue.peek().find(turn => turn.turnId === 't-next')?.started).toBe(false);
+  });
+
+  it('stops a passed turn deferred recheck from borrowing successor busy/pty activity', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const h = workerSubmitHarness();
+    const busyScreen = '⠋ Working...\n─────────────\n>\n─────────────\nesc to cancel';
+    try {
+      h.queue.setLocalTurns(true, 0);
+      h.queue.setWholeInputPassing(true, { timestampGranularityMs: 1_000 });
+      Object.assign(h.scope, {
+        cliAdapter: { ...h.scope.cliAdapter, busyPattern: /esc to cancel/ },
+        effectiveBackendType: 'tmux',
+        captureBackendScreen: () => busyScreen,
+        busyProbeRegion: (screen: string) => screen,
+        lastPtyActivityAtMs: 19_000,
+        dropFailedBridgeMark: vi.fn((turnId?: string, dispatchAttempt?: number) => {
+          if (turnId) h.queue.dropPendingTurn(turnId, dispatchAttempt);
+        }),
+        diagnoseBackendSubmitFailure,
+        shouldWaitThroughBusyTurn,
+        SUBMIT_DIAG_BUSY_SILENCE_MAX_EXTRA: 12,
+        SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA: 1,
+      });
+
+      await h.flush();
+      h.scope.lastInitConfig = { cliId: 'antigravity' };
+      expect(h.queue.hasPendingTurn('delivery', 1)).toBe(true);
+
+      // A later turn arrives in transcript and passes 'delivery'.
+      h.queue.mark('turn-2', '继续', 5_000, 1);
+      h.queue.ingest([{ kind: 'user', uuid: 'u-2', text: '继续', timestampMs: 5_000 }]);
+      expect(queueIsPassed(h.queue, 'delivery', 1)).toBe(true);
+
+      // On the single 20s recheck, passed 'delivery' must not suppress via
+      // session-global pty-output / busyPattern / still_active.
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(h.settlements[0]).toMatchObject({
+        action: { kind: 'notify-stuck' },
+      });
+      expect(h.scope.emitTurnTerminal).toHaveBeenCalledWith(
+        'delivery',
+        'failed',
+        'submit_unconfirmed',
+        1,
+      );
+      expect(h.submitFailureChains.size()).toBe(0);
+    } finally {
+      h.submitFailureChains.clear();
+      vi.useRealTimers();
+    }
+  });
+});
+
+function queueIsPassed(queue: CodexBridgeQueue, turnId: string, dispatchAttempt?: number): boolean {
+  return queue.isPassedBySuccessor(turnId, dispatchAttempt);
+}

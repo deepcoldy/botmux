@@ -137,6 +137,8 @@ export interface GroupMemberDisplay {
   memberType: 'user' | 'bot' | 'unknown';
   /** The viewing bot's own row (it cannot be granted access to itself). */
   self?: boolean;
+  /** Configured Feishu app ID when this bot maps to a local botmux bot. */
+  larkAppId?: string;
 }
 
 export interface RoleProfileSummary {
