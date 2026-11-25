@@ -7,6 +7,8 @@ import { isHostCapabilityLink } from '../src/core/host-capability-link.js';
 describe('local address presentation policy', () => {
   it.each([
     'drive:file:download drive:file:upload drive:file.like:readonly drive:file.meta.sec_label.read_only',
+    'file:download file:relative/path',
+    'vscode:extension/ms-python.python',
     '/login --scope --allow-unknown minutes:minutes.basic:read drive:file:download drive:file:upload offline_access',
     '```ts\n{ file: string; cursor: number; idea?: boolean; skill: string }\n```',
     '```css\n.button { cursor: pointer; }\n```',
@@ -21,6 +23,9 @@ describe('local address presentation policy', () => {
   it.each([
     'file:///Users/alice/project/a.ts', 'FILE://localhost/tmp/test.txt', 'file:/home/alice/a.ts',
     'file:C:/Users/alice/a.ts', 'file:C|/Users/alice/a.ts', 'file:\\Users\\alice\\a.ts',
+    'file:../secret.txt', 'file:./secret.txt', 'file:..\\secret.txt', 'file:.\\secret.txt',
+    'file:%2Fhome%2Falice%2Fsecret.txt', 'file:%2fhome%2falice%2fsecret.txt',
+    'file:%5CUsers%5Calice%5Csecret.txt', 'file:%5cUsers%5calice%5csecret.txt',
     'vscode://file/home/alice/a.ts:10:2', 'vscode-insiders://file/Users/alice/a.ts',
     'vscode-remote://ssh-remote+host/home/alice/a.ts', 'vscode:/project/a.ts',
     'cursor://file/Users/alice/a.ts:1', 'idea://open?file=/Users/alice/a.ts',
@@ -274,9 +279,16 @@ describe('local address presentation policy', () => {
         .toThrowError(expect.objectContaining({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' }));
     });
 
+  it.each(['file:../secret.txt', 'file:%2Fhome%2Falice%2Fsecret.txt'])(
+    'refuses malformed card JSON carrying a rootless local file URI: %s', address => {
+      expect(() => prepareLocalAddressContent('{"content":"' + address, 'interactive'))
+        .toThrowError(expect.objectContaining({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' }));
+    });
+
   it('refuses malformed local JSON but preserves safe malformed input for provider validation', () => {
     expect(() => prepareLocalAddressContent('{"content":"/tmp/result', 'interactive')).toThrow();
     expect(prepareLocalAddressContent('{"content":"safe', 'interactive')).toBe('{"content":"safe');
+    expect(prepareLocalAddressContent('{"content":"file:download', 'interactive')).toBe('{"content":"file:download');
   });
 
   it('is idempotent and does not invent a remote link for an undelivered artifact', () => {

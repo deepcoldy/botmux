@@ -52,8 +52,9 @@ const ROOT_PATH = /^(?:\/(?:home|Users|root|tmp|private|var|run|mnt|media|Volume
 // text like `2>/dev/null` stays readable. A process's cwd and root under /proc
 // lead back into the filesystem and stay covered.
 // Scheme-like prose needs a path marker so OAuth scopes and code keys stay
-// readable. File URLs also accept Windows drives and backslashes.
-const ADDRESS_TOKEN = /(?:\b(?:file:(?:[a-z][:|])?[\\/]|(?:vscode(?:-insiders)?|vscode-remote|cursor|idea|jetbrains|subl|atom|skill):\/)[^\s<>"'\x60，。、；！？]*|(?<![\w/])(?!\/dev\/(?:null|stdin|stdout|stderr|fd\/\d+)(?![\w.\/-])|\/(?:proc|sys)(?:\/|$)(?!(?:self|thread-self|\d+)\/(?:task\/\d+\/)?(?:cwd|root)(?:\/|$)))(?:\/(?:home|Users|root|tmp|private|var|run|mnt|media|Volumes|opt|srv|etc|usr|bin|sbin|dev|proc|sys|data\d*|workspace|workspaces)(?=\/|$)|~(?=\/|$)|\$(?:HOME|\{HOME\})(?=\/|$)|%USERPROFILE%(?=[\\/]|$)|[a-z]:[\\/]|\\\\)[^\s<>"'\x60，。、；！？()[\]]*)/giu;
+// readable. File URLs accept Windows drives, explicit relative paths and
+// percent-encoded path separators as well as literal slashes and backslashes.
+const ADDRESS_TOKEN = /(?:\b(?:file:(?:(?:[a-z][:|])?[\\/]|\.{1,2}[\\/]|%(?:2f|5c))|(?:vscode(?:-insiders)?|vscode-remote|cursor|idea|jetbrains|subl|atom|skill):\/)[^\s<>"'\x60，。、；！？]*|(?<![\w/])(?!\/dev\/(?:null|stdin|stdout|stderr|fd\/\d+)(?![\w.\/-])|\/(?:proc|sys)(?:\/|$)(?!(?:self|thread-self|\d+)\/(?:task\/\d+\/)?(?:cwd|root)(?:\/|$)))(?:\/(?:home|Users|root|tmp|private|var|run|mnt|media|Volumes|opt|srv|etc|usr|bin|sbin|dev|proc|sys|data\d*|workspace|workspaces)(?=\/|$)|~(?=\/|$)|\$(?:HOME|\{HOME\})(?=\/|$)|%USERPROFILE%(?=[\\/]|$)|[a-z]:[\\/]|\\\\)[^\s<>"'\x60，。、；！？()[\]]*)/giu;
 const LINK_KEYS = new Set(['href', 'url', 'pc_url', 'android_url', 'ios_url', 'default_url']);
 const STRUCTURAL_KEYS = new Set([
   'tag', 'element_id', 'name', 'data_type', 'img_key', 'image_key', 'file_key',
