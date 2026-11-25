@@ -7,11 +7,76 @@ export interface SubmitEvidenceIdentity {
   dispatchAttempt?: number;
 }
 
+export interface SubmitStructuredTurnEvidence extends SubmitEvidenceIdentity {
+  /** Optional explicit full-content flag; when explicitly false, partial/prefix
+   *  or uncorroborated starts are rejected as authoritative submit proof. */
+  fullInputMatch?: boolean;
+}
+
+export interface SubmitSendMarkerEvidence extends SubmitEvidenceIdentity {
+  sessionId?: string;
+  sentAtMs?: number;
+  terminalIndependent?: boolean;
+}
+
 export interface SubmitActivityEvidenceInput {
   target?: SubmitEvidenceIdentity;
+  sessionId?: string;
+  sinceMs?: number;
+  retainedReceipt?: { evidence: 'structured-transcript' | 'botmux-send' };
   ptyActive: boolean;
-  structuredTurns: readonly SubmitEvidenceIdentity[];
-  sendMarkers: readonly SubmitEvidenceIdentity[];
+  structuredTurns: readonly SubmitStructuredTurnEvidence[];
+  sendMarkers: readonly SubmitSendMarkerEvidence[];
+}
+
+export function isAuthoritativeClaudeTranscriptTurn(turn: {
+  started?: boolean;
+  fullContentMatch?: boolean;
+  exactContentMatch?: boolean;
+  isLocal?: boolean;
+  isScheduled?: boolean;
+  restoredFromJournal?: boolean;
+}): boolean {
+  const matched = turn.exactContentMatch !== undefined
+    ? turn.exactContentMatch === true
+    : turn.fullContentMatch === true;
+  return turn.started === true
+    && matched
+    && !turn.isLocal
+    && !turn.isScheduled
+    && !turn.restoredFromJournal;
+}
+
+export function isAuthoritativeStructuredTranscriptTurn(turn: {
+  started?: boolean;
+  provisionalTaskStartedAtMs?: number;
+  exactUserInputMatch?: boolean;
+  isLocal?: boolean;
+  restoredFromJournal?: boolean;
+}): boolean {
+  return turn.started === true
+    && turn.provisionalTaskStartedAtMs === undefined
+    && turn.exactUserInputMatch === true
+    && !turn.isLocal
+    && !turn.restoredFromJournal;
+}
+
+export function isAuthoritativeSubmitSendMarker(
+  marker: SubmitSendMarkerEvidence,
+  target: SubmitEvidenceIdentity,
+  opts?: { sessionId?: string; sinceMs?: number },
+): boolean {
+  if (!matchesExactEvidence(target, marker)) return false;
+  if (marker.terminalIndependent === true) return false;
+  if (opts?.sessionId !== undefined && marker.sessionId !== undefined
+    && marker.sessionId !== opts.sessionId) {
+    return false;
+  }
+  if (opts?.sinceMs !== undefined) {
+    if (typeof marker.sentAtMs !== 'number' || !Number.isFinite(marker.sentAtMs)) return false;
+    if (marker.sentAtMs < opts.sinceMs) return false;
+  }
+  return true;
 }
 
 function matchesExactEvidence(
@@ -28,10 +93,16 @@ export function selectSubmitActivityEvidence(
 ): SubmitActivityEvidence | undefined {
   const target = input.target;
   if (target) {
-    if (input.structuredTurns.some(turn => matchesExactEvidence(target, turn))) {
+    if (target.turnId !== undefined && input.retainedReceipt) {
+      return input.retainedReceipt.evidence;
+    }
+    if (input.structuredTurns.some(turn => turn.fullInputMatch !== false && matchesExactEvidence(target, turn))) {
       return 'structured-transcript';
     }
-    if (input.sendMarkers.some(marker => matchesExactEvidence(target, marker))) {
+    if (input.sendMarkers.some(marker => isAuthoritativeSubmitSendMarker(marker, target, {
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+      ...(input.sinceMs !== undefined ? { sinceMs: input.sinceMs } : {}),
+    }))) {
       return 'botmux-send';
     }
   }
@@ -71,6 +142,14 @@ export interface StructuredSubmitLifecycleController {
   /** The exact attempt is still queued but already closed by its native
    *  terminal (e.g. FIFO-held behind an unfinished predecessor). */
   hasTerminalTurn(turnId: string, dispatchAttempt?: number): boolean;
+  /** Stronger variant: the closed turn also proved whole-input receipt (never
+   *  provisional task_started or prefix-only partial match). Optional for
+   *  backwards compatibility with test doubles. */
+  hasExactTerminalTurn?(
+    turnId: string,
+    dispatchAttempt?: number,
+    expectedSourceSessionId?: string,
+  ): boolean;
   confirmPendingTurn(turnId: string, confirmedAtMs?: number, dispatchAttempt?: number): boolean;
   finishSubmitVerification(turnId: string, finishedAtMs?: number, dispatchAttempt?: number): boolean;
 }
@@ -78,6 +157,9 @@ export interface StructuredSubmitLifecycleController {
 export interface DeferredSubmitConfirmationInput {
   turnId?: string;
   dispatchAttempt?: number;
+  /** Observed native session id for this worker generation, used to reject
+   *  foreign-session closed terminals. */
+  expectedSourceSessionId?: string;
   /** True only when turnId names a CodexBridgeQueue mark. Claude fallback
    *  turns use BridgeTurnQueue IDs, so treating every bridge ID as a
    *  structured target would incorrectly discard every Claude recheck. */
@@ -143,6 +225,10 @@ export async function settleDeferredSubmitConfirmation(
 ): Promise<DeferredSubmitConfirmationSettlement> {
   const closedButUndrained = (): boolean => !!input.structuredTarget && !!input.turnId
     && controller.hasTerminalTurn(input.turnId, input.dispatchAttempt);
+  const exactClosedButUndrained = (): boolean => !!input.structuredTarget && !!input.turnId
+    && (controller.hasExactTerminalTurn
+      ? controller.hasExactTerminalTurn(input.turnId, input.dispatchAttempt, input.expectedSourceSessionId)
+      : controller.hasTerminalTurn(input.turnId, input.dispatchAttempt));
   const targetStillCurrent = (): StaleDeferredSubmitConfirmationSettlement | undefined => {
     if (input.isCurrent && !input.isCurrent()) {
       return { stale: true, staleReason: 'generation', lifecycle: 'unchanged' };
@@ -165,11 +251,11 @@ export async function settleDeferredSubmitConfirmation(
   // function is called. Never run its old adapter closure against a new CLI.
   const staleBeforeRecheck = targetStillCurrent();
   if (staleBeforeRecheck) return staleBeforeRecheck;
-  // Its native terminal already proves the submit, and the FIFO drain owns its
-  // final/terminal. Settle as structured success without the adapter recheck:
-  // a missed receipt plus usage-limit/no-activity must not fail or drop a
-  // turn that has already answered.
-  if (closedButUndrained()) {
+  // Its native terminal with whole-input match already proves the submit, and
+  // the FIFO drain owns its final/terminal. Settle as structured success
+  // without the adapter recheck: a missed receipt plus usage-limit/no-activity
+  // must not fail or drop a turn that has already answered.
+  if (exactClosedButUndrained()) {
     return {
       stale: false,
       action: { kind: 'suppress-active', evidence: 'structured-transcript' },

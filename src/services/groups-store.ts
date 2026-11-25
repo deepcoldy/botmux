@@ -230,6 +230,33 @@ export async function createChat(
   creatorLarkAppId: string,
   opts: { name?: string; botIds: string[]; userIds?: string[]; chatMode?: ChatMode },
 ): Promise<{ chatId: string; invalidBotIds: string[]; invalidUserIds: string[] }> {
+  return createChatInternal(creatorLarkAppId, opts, undefined);
+}
+
+/**
+ * Create a chat with a caller-supplied `uuid` for idempotent creation.
+ *
+ * Feishu `im.v1.chat.create` accepts a `uuid` in **params** (not data) and
+ * dedupes by it for ~10h — same uuid re-sent within the window returns the
+ * original chatId instead of creating a second chat (design
+ * 2026-11-20-dm-collab-group §5.1 / §10.3; issue #3405). The uuid travels as
+ * `params.uuid`, verified against the SDK payload type.
+ *
+ * Everything else (creator filtering, empty-list omission, chat_mode explicit
+ * only) is identical to `createChat`.
+ */
+export async function createChatWithUuid(
+  creatorLarkAppId: string,
+  opts: { name?: string; botIds: string[]; userIds?: string[]; chatMode?: ChatMode; uuid: string },
+): Promise<{ chatId: string; invalidBotIds: string[]; invalidUserIds: string[] }> {
+  return createChatInternal(creatorLarkAppId, opts, opts.uuid);
+}
+
+async function createChatInternal(
+  creatorLarkAppId: string,
+  opts: { name?: string; botIds: string[]; userIds?: string[]; chatMode?: ChatMode },
+  uuid: string | undefined,
+): Promise<{ chatId: string; invalidBotIds: string[]; invalidUserIds: string[] }> {
   const client = getBotClient(creatorLarkAppId);
   // Filter out the creator from bot_id_list — Lark errors if the inviter
   // appears in their own invite list.
@@ -245,6 +272,8 @@ export async function createChat(
   if (opts.chatMode) data.chat_mode = opts.chatMode;
   const params: Record<string, unknown> = {};
   if (userIds.length > 0) params.user_id_type = 'open_id';
+  // uuid is a params-level idempotency key (not data), per the SDK payload type.
+  if (uuid !== undefined) params.uuid = uuid;
   const res: any = await (client as any).im.v1.chat.create({ data, params });
   if (res.code !== 0 && res.code !== undefined) {
     throw new Error(`Failed to create chat: ${res.msg ?? 'unknown'} (code: ${res.code})`);

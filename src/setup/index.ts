@@ -78,7 +78,7 @@ export function shouldHardFailStartupForMissingTmux(opts: {
  * Decide whether `botmux start`/`restart` must refuse to spawn the daemon
  * because hc is missing. Same rule as tmux: only a binary that is GENUINELY
  * ABSENT (no discovery candidate on disk) can be fatal; a present binary that
- * failed its probe (timeout, too old, non-Linux) degrades per session, where
+ * failed its probe (timeout, too old, unsupported platform) degrades per session, where
  * the selector refuses hc with the reason.
  *
  * It is fatal only when hc is the sole backend wanted: every bot resolves to
