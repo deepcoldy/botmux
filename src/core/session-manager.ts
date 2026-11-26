@@ -1,3 +1,4 @@
+import { createdGroupWorkingDir } from '../services/created-groups-store.js';
 import { renderInboundMessageLocation, type InboundMessageLocation } from './reply-message.js';
 import { isWorkflowNodeSessionMarker, workflowHandoffInputOptions } from './workflow-node-session.js';
 import { isLeadOnlySession } from './lead-only.js';
@@ -5992,6 +5993,8 @@ export async function deliverWorkflowNodeTurn(
 function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string): string | undefined {
   const oncall = findOncallChat(larkAppId, chatId)?.workingDir;
   if (oncall) return oncall;
+  const groupDir = createdGroupWorkingDir(chatId);
+  if (groupDir) return groupDir;
   const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
   if (!raw) return undefined;
   const resolved = expandHome(raw);
@@ -6056,7 +6059,11 @@ async function forkOrShowRepoCard(
   // 非 git 仓库 / 建失败 → 回退默认目录（提示经 notify 发）。registry 拿不到时兜底走原同步路径。
   const registry = getActiveSessionsRegistry();
   if (registry && ds.workingDir && !ds.worktreeCreating && botAutoWorktreeEnabled(larkAppId)) {
+    // A directory explicitly bound via `/g --dir` (created-groups.json) is a
+    // user-pinned directory even when its path happens to equal the bot default:
+    // it must start in place, never be silently rewritten into an auto-worktree.
     const isBotDefaultDir = !findOncallChat(larkAppId, ds.chatId)?.workingDir
+      && !createdGroupWorkingDir(ds.chatId)
       && ds.workingDir === expandHome(effectiveDefaultWorkingDir(bot.config) ?? '');
     if (isBotDefaultDir) {
       const baseDir = ds.workingDir;

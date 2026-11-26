@@ -1,3 +1,4 @@
+import { createdGroupWorkingDir } from './services/created-groups-store.js';
 import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from './core/cli-execution-mode.js';
 import { resolveNativeScheduledControlActor } from './core/scheduled-control-actor.js';
 import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
@@ -6444,7 +6445,7 @@ function resolveForceTopicCurrentWorkingDir(ctx: {
   const current = validateExplicitForceTopicWorkingDir(currentSession?.workingDir, loc);
   if (current) return current;
 
-  const oncall = validateExplicitForceTopicWorkingDir(findOncallChat(ctx.larkAppId, ctx.chatId)?.workingDir, loc);
+  const oncall = validateExplicitForceTopicWorkingDir(findOncallChat(ctx.larkAppId, ctx.chatId)?.workingDir ?? createdGroupWorkingDir(ctx.chatId), loc);
   if (oncall) return oncall;
 
   const peers = ctx.scope === 'chat'
@@ -23599,6 +23600,15 @@ async function resolvePinnedWorkingDir(ctx: {
   }
   let oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
   if (!oncallEntry) {
+    const groupDir = createdGroupWorkingDir(ctx.chatId);
+    if (groupDir) {
+      return {
+        pinnedWorkingDir: groupDir,
+        oncallEntry: undefined,
+        inheritedFrom: null,
+        pinnedFromBotDefault: false,
+      };
+    }
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
   // Resolve the bot default first so we know whether inheritance is only the
