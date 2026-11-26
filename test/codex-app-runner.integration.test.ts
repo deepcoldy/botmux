@@ -871,6 +871,10 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
           expect(posts).toEqual([]);
           expect(cards).toEqual([]);
           expect(harness.stdout.split(text)).toHaveLength(2);
+          // The notice owns its line boundary: it must not fuse with the
+          // following final-answer output in the terminal.
+          expect(harness.stdout).not.toContain(`${text}Independent work completed`);
+          expect(harness.stdout).toContain(`${text}\nIndependent work completed`);
           expect(control.markers.filter(m => m.kind === 'thinking').map(m => m.payload)).toEqual([
             { turnId: 'om_async_input', entries: [{ kind: 'thinking', text }] },
           ]);

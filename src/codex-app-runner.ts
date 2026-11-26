@@ -1638,7 +1638,12 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
       if (typeof notificationTurnId === 'string') handleAsyncUserInput(item, notificationTurnId, turn);
     } else if (!turn.knownAgentItemIds.has(id)) {
       turn.knownAgentItemIds.add(id);
-      if (typeof item.text === 'string' && item.text.trim()) output.display(item.text);
+      // A plain notice carries no promise of a trailing newline; without one
+      // it fuses with the next terminal line. Keep the thinking marker on the
+      // raw text — only the PTY display gets the boundary.
+      if (typeof item.text === 'string' && item.text.trim()) {
+        output.display(item.text.endsWith('\n') ? item.text : `${item.text}\n`);
+      }
       publishTurnThinking(turn, msg.method, params);
     }
     return;
