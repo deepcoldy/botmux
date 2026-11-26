@@ -1,4 +1,5 @@
 import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from './core/cli-execution-mode.js';
+import { advancePendingStreamingCardTurn } from './core/streaming-card-post-slot.js';
 import { resolveNativeScheduledControlActor } from './core/scheduled-control-actor.js';
 import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
 import { sandboxWithholdsBotSecret } from './adapters/cli/sandbox-mode.js';
@@ -5747,6 +5748,7 @@ async function sessionReply(
     logger.debug(`[lark-transport] suppressed reply for no-transport session (app=${appId} anchor=${anchor.substring(0, 16)})`);
     return '';
   }
+  let effectiveGroupUuid = opts?.uuid;
   if (ds && privateReplyEnabled(ds.session)) {
     await assertSendTopicsAvailable(appId,
       [opts?.replyTarget?.mode === 'thread' ? opts.replyTarget.rootMessageId : anchor],
@@ -5757,6 +5759,12 @@ async function sessionReply(
         senderIsBot: opts?.replyContext?.requesterIsBot ?? (opts?.replyContext?.requesterOpenId ? false : opts?.replyContext?.replyTargetSenderIsBot) ?? ds.session.turnReplyContexts?.[turnId ?? '']?.replyTargetSenderIsBot, beforeWrite: opts?.beforeWrite, failClosed: !!opts?.replyContext,
       });
     if (privateMessageId !== undefined) return privateMessageId;
+    if (effectiveGroupUuid) {
+      effectiveGroupUuid = `pf_${createHash('sha256')
+        .update(JSON.stringify(['botmux.session-reply.private-fallback.v1', effectiveGroupUuid]), 'utf8')
+        .digest('hex')
+        .slice(0, 32)}`;
+    }
   }
   const hookContext = ds ? {
     sessionId: ds.session.sessionId,
@@ -5846,6 +5854,18 @@ async function sessionReply(
   // from activeSessions BEFORE sending the close-confirmation reply, so by
   // the time we run, ds is gone — but the anchor (chatId, oc_xxx) is enough
   // to know we should sendMessage, not reply_in_thread to a non-message-id.
+  const deriveTopicRedirectUuid = (
+    uuid: string | undefined,
+    rootMessageId: string,
+  ): string | undefined => {
+    if (!uuid) return undefined;
+    const digest = createHash('sha256')
+      .update(JSON.stringify(['botmux.session-reply.topic-redirect.v1', uuid, rootMessageId]), 'utf8')
+      .digest('hex')
+      .slice(0, 32);
+    return `tr_${digest}`;
+  };
+
   if (ds?.scope === 'chat' || anchor.startsWith('oc_')) {
     const chatId = ds?.chatId ?? anchor;
     if (opts?.quoteMessageId) {
@@ -5855,7 +5875,7 @@ async function sessionReply(
           content,
           msgType,
           false,
-          opts.uuid,
+          effectiveGroupUuid,
         );
       } catch (err) {
         if (!(err instanceof MessageWithdrawnError) || getBot(appId).config.topicUnavailablePolicy === 'stop') throw err;
@@ -5864,7 +5884,7 @@ async function sessionReply(
           `[routing] VC IM quote target withdrawn (${opts.quoteMessageId}); `
           + 'falling back to one stable-UUID chat message',
         );
-        return sendWithHookPolicy(chatId, content, msgType, opts.uuid);
+        return sendWithHookPolicy(chatId, content, msgType, effectiveGroupUuid);
       }
     }
     if (opts?.replyTarget?.mode === 'thread' || opts?.replyTarget?.mode === 'quote') {
@@ -5873,7 +5893,7 @@ async function sessionReply(
         content,
         msgType,
         opts.replyTarget.mode === 'thread',
-        opts.uuid,
+        effectiveGroupUuid,
       );
     }
     if (opts?.replyTarget?.mode === 'plain') {
@@ -5885,13 +5905,19 @@ async function sessionReply(
       if (ds?.scope === 'chat' && ds.session.rootMessageId) {
         const mode = await getChatMode(appId, chatId, { forceRefresh: true });
         if (mode === 'topic') {
-          return replyWithHookPolicy(ds.session.rootMessageId, content, msgType, true, opts.uuid);
+          return replyWithHookPolicy(
+            ds.session.rootMessageId,
+            content,
+            msgType,
+            true,
+            deriveTopicRedirectUuid(effectiveGroupUuid, ds.session.rootMessageId),
+          );
         }
       }
-      return sendWithHookPolicy(chatId, content, msgType, opts.uuid);
+      return sendWithHookPolicy(chatId, content, msgType, effectiveGroupUuid);
     }
     if (opts?.placement === 'chat') {
-      return sendWithHookPolicy(chatId, content, msgType, opts.uuid);
+      return sendWithHookPolicy(chatId, content, msgType, effectiveGroupUuid);
     }
     if (opts?.placement === 'topic') {
       const topicKey = opts.meetingTopicKey;
@@ -5901,12 +5927,12 @@ async function sessionReply(
       const root = await ensureVcMeetingListenerTopicRoot(
         config.session.dataDir,
         topicKey,
-        () => sendWithHookPolicy(chatId, content, msgType, opts.uuid),
+        () => sendWithHookPolicy(chatId, content, msgType, effectiveGroupUuid),
       );
       if (root.created) {
         return root.rootMessageId;
       }
-      return replyWithHookPolicy(root.rootMessageId, content, msgType, true, opts.uuid);
+      return replyWithHookPolicy(root.rootMessageId, content, msgType, true, effectiveGroupUuid);
     }
     if (ds?.scope === 'chat') {
       const fresh = sessionStore.readSessionRowFromDisk(ds.session.sessionId, ds.larkAppId);
@@ -5923,21 +5949,27 @@ async function sessionReply(
       // (drives the real sessionReply) and test/reply-target-fallback.test.ts
       // (the resolveSessionReplyTarget × fallbackTurnId composition it relies on).
       const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds, turnId));
-      if (target.mode === 'thread') return replyWithHookPolicy(target.rootMessageId, content, msgType, true, opts?.uuid);
-      if (target.mode === 'quote') return replyWithHookPolicy(target.rootMessageId, content, msgType, false, opts?.uuid);
+      if (target.mode === 'thread') return replyWithHookPolicy(target.rootMessageId, content, msgType, true, effectiveGroupUuid);
+      if (target.mode === 'quote') return replyWithHookPolicy(target.rootMessageId, content, msgType, false, effectiveGroupUuid);
       if (ds.session.rootMessageId && !ds.session.externalTriggerTopicless) {
         const mode = await getChatMode(appId, chatId, { forceRefresh: true });
         if (mode === 'topic') {
           logger.warn(`[routing] Chat-scope session ${ds.session.sessionId.substring(0, 8)} is now topic-mode; replying in original thread ${ds.session.rootMessageId.substring(0, 12)}`);
-          return replyWithHookPolicy(ds.session.rootMessageId, content, msgType, true, opts?.uuid);
+          return replyWithHookPolicy(
+            ds.session.rootMessageId,
+            content,
+            msgType,
+            true,
+            deriveTopicRedirectUuid(effectiveGroupUuid, ds.session.rootMessageId),
+          );
         }
       }
     }
-    return sendWithHookPolicy(chatId, content, msgType, opts?.uuid);
+    return sendWithHookPolicy(chatId, content, msgType, effectiveGroupUuid);
   }
 
   if (opts?.placement === 'chat' && ds && opts.sourceSessionId === ds.session.sessionId) {
-    return sendWithHookPolicy(ds.chatId, content, msgType, opts.uuid);
+    return sendWithHookPolicy(ds.chatId, content, msgType, effectiveGroupUuid);
   }
 
   // Thread-scope (or unknown / legacy): reply in thread.
@@ -5945,9 +5977,9 @@ async function sessionReply(
     throw new Error('plain frozen reply target is invalid for a thread-scoped session');
   }
   if (opts?.replyTarget?.mode === 'thread' || opts?.replyTarget?.mode === 'quote') {
-    return replyWithHookPolicy(opts.replyTarget.rootMessageId, content, msgType, opts.replyTarget.mode === 'thread', opts.uuid);
+    return replyWithHookPolicy(opts.replyTarget.rootMessageId, content, msgType, opts.replyTarget.mode === 'thread', effectiveGroupUuid);
   }
-  return replyWithHookPolicy(anchor, content, msgType, true, opts?.uuid);
+  return replyWithHookPolicy(anchor, content, msgType, true, effectiveGroupUuid);
 }
 
 // Test seams: drive the real sessionReply (the chat-scope thread/top-level
@@ -7507,7 +7539,8 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string, opts: { 
   ds.streamingCardForced = undefined;
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
-  if (ds.streamCardId && workerHasInitialized(ds)) {
+  const alreadyParked = !!ds.streamCardNonce && ds.parkedStreamCardNonce === ds.streamCardNonce;
+  if (ds.streamCardId && workerHasInitialized(ds) && !alreadyParked) {
     const readUrl = readableTerminalUrlFor(ds);
     const dsBotCfg = getBot(ds.larkAppId).config;
     const effectiveCliId = ds.session.cliId ?? dsBotCfg.cliId;
@@ -7571,9 +7604,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string, opts: { 
   // AFTER this point belongs to an older turn (type-ahead admits the follow-up
   // while the previous turn is still running) and must not relabel this card.
   ds.currentTurnId = turnId;
-  ds.streamCardPending = true;
-  ds.streamCardPendingTurnId = turnId;
-  ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+  advancePendingStreamingCardTurn(ds, turnId);
   ds.currentTurnTitle = title.substring(0, 50);
   ds.currentImageKey = undefined;
   try {
@@ -33195,9 +33226,7 @@ async function handleThreadReplyAdmitted(
     // image_key (for example an old Claude Code frame) can be reused on the
     // new Worker card until the next screenshot upload, which makes a fresh
     // @mention appear to resurrect the wrong CLI UI.
-    ds.streamCardPending = true;
-    ds.streamCardPendingTurnId = parsed.messageId;
-    ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+    advancePendingStreamingCardTurn(ds, parsed.messageId);
     // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it):
     // without clearing, a previous turn's deliberate-silence marker survives the
     // re-fork and mislabels THIS turn's idle card 「已处理 · 判定无需回复」.
@@ -34763,9 +34792,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       parkStreamCard(ds);
       ds.streamCardId = undefined;
       ds.streamCardNonce = undefined;
-      ds.streamCardPending = true;
-      ds.streamCardPendingTurnId = turnId;
-      ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+      advancePendingStreamingCardTurn(ds, turnId);
       // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it) —
       // see the Lark-message re-fork branch above.
       ds.messageListenerCompletedTurnId = undefined;

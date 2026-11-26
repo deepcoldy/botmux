@@ -1,6 +1,7 @@
 import { durableImRepliesEnabled } from '../bot-registry.js';
 import type { DaemonSession } from './types.js';
 import type { FrozenSessionReplyContext, FrozenSessionReplyTarget, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
+import { clearStreamingCardPostSlots } from './streaming-card-post-slot.js';
 
 /** Merge participants by open_id, keeping the richest label (a later entry can
  *  fill a missing name / promote isBot). Order-stable on first appearance so a
@@ -763,6 +764,7 @@ export function rehomeReplyTargetState(ds: DaemonSession): void {
   ds.session.quoteTargetSenderIsBot = undefined;
   ds.streamCardReplyTargetKey = undefined;
   ds.session.streamCardReplyTargetKey = undefined;
+  clearStreamingCardPostSlots(ds);
 }
 
 /**

@@ -2,6 +2,7 @@ import type { Session } from '../types.js';
 import { replyMessage, sendUserMessage } from '../im/lark/client.js';
 import { readRoleReplyPrivately, readRolePrivateReplyNotice } from './role-resolver.js';
 import { pickTurnReplyTarget } from './reply-target.js';
+import { classifyStreamingCardPostError } from './streaming-card-post-slot.js';
 import { logger } from '../utils/logger.js';
 
 // Reuse the group session and its existing per-turn sender record.
@@ -32,7 +33,10 @@ export async function sendPrivateReply(
       ? await sendUserMessage(...args, undefined, { beforeWrite: options.beforeWrite })
       : await sendUserMessage(...args);
   } catch (err) {
-    if (options?.failClosed) throw err;
+    // When the caller passed an explicit idempotency UUID and DM delivery ended
+    // in a commit-unknown error (e.g. HTTP 500 code=2200 or timeout), never fall
+    // open to the public group — the DM may already have landed under that UUID.
+    if (options?.failClosed || (uuid && classifyStreamingCardPostError(err).mayHaveCommitted)) throw err;
     logger.warn(`[private-reply] delivery failed for turn ${turnId}; using group reply: ${String(err)}`);
     return undefined;
   }

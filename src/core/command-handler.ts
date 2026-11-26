@@ -1,4 +1,7 @@
 import { sessionDelegatedSlashCommands } from './remote-runner-slash.js';
+import { advancePendingStreamingCardTurn } from './streaming-card-post-slot.js';
+import { isSilentMessageListenerSession } from './message-listener-silence.js';
+import { privateReplyEnabled } from './private-reply.js';
 import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
 import { resolveSessionModelPinView } from './session-model.js';
 import { sessionContractPrimary } from './session-contract-primary.js';
@@ -1678,6 +1681,9 @@ export async function handleCardCommand(
       } else if (r.sent < r.total) {
         await reply(t('cmd.card.private_partial', { sent: r.sent, total: r.total }, loc));
       }
+      return;
+    }
+    if (isSilentMessageListenerSession(ds.session) || privateReplyEnabled(ds.session)) {
       return;
     }
     ds.streamingCardForced = true;
@@ -3811,6 +3817,10 @@ export async function handleCommand(
                 session.ownerOpenId = oldSession.ownerOpenId;
                 session.creatorOpenId = oldSession.creatorOpenId;
                 session.lastCallerOpenId = oldSession.lastCallerOpenId;
+                current.streamCardId = undefined;
+                current.streamCardNonce = undefined;
+                current.streamCardPending = undefined;
+                current.streamCardPendingTurnId = undefined;
                 rehomeReplyTargetState(current);
                 sessionStore.updateSession(session);
                 current.hasHistory = false;
@@ -4175,6 +4185,7 @@ export async function handleCommand(
         rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
         // The retry is this session's latest turn now: retire the previous card's rows.
         noteReplyCardTurnStarted(ds, retryTurnId);
+        if (ds.streamCardPending) advancePendingStreamingCardTurn(ds);
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
         await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
