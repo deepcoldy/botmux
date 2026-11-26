@@ -2125,7 +2125,10 @@ export function stageRelayMedia(staging: string, outbox: string, requestId: stri
   try { mkdirSync(dir, { mode: 0o700 }); } catch { return null; }
   const dest = join(dir, relayOriginalAttachmentName(requestId, outboxName));
   if (!materializeOutboxFile(outbox, outboxName, dest)) {
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ }
+    // Same mount guard as every sandbox-tree removal: relay-staging is
+    // host-private and never bound into the sandbox, but a recursive delete
+    // must still refuse to traverse a mount point rather than rm through it.
+    removeTreeUnlessMounted(dir);
     return null;
   }
   return dest;
@@ -2291,7 +2294,9 @@ export function startOutboxWatcher(
     }
     // else: the outbox was replaced while serving this request — the response
     // is dropped and the sandbox-side CLI reports its relay timeout.
-    for (const p of staged) { try { rmSync(p, { recursive: true, force: true }); } catch { /* */ } }
+    // Entries are either flat content/card files or per-file media dirs;
+    // all removals go through the mount-guarded helper (no bare recursive rm).
+    for (const p of staged) { removeTreeUnlessMounted(p); }
     inFlight.delete(name);
   };
 
