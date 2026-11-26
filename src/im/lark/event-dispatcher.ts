@@ -8,6 +8,7 @@ import { canInviterTalkToMeeting } from '../../services/vc-meeting-inviter-acces
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCardActionData } from './card-action-data.js';
+import { GROUP_SUPERVISION_CARD_ACTION } from './group-supervision-card.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { createHash } from 'node:crypto';
 import { startLarkConnection, type LarkConnection } from './transport/connection.js';
@@ -1600,6 +1601,7 @@ function cardActionKey(larkAppId: string, data: any): string {
     feedbackReason: value?.reason_key,
     proposalId: value?.proposal_id,
     proposalDecision: value?.decision,
+    supervisionCommand: value?.action === GROUP_SUPERVISION_CARD_ACTION ? value.command : undefined,
     rootId: value?.root_id,
     sessionId: value?.session_id,
     // Detail actions can share action labels across rows; include row ids so

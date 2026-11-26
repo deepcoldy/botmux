@@ -26,6 +26,7 @@ import type { SessionLastTurn } from '../src/core/session-task-status.js';
 import { noteFinalReplyText, recordTurnOutcome, turnFinalText, turnOutcomePendingOrChanged, turnSupervisionFinalReply } from '../src/core/turn-outcome.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { isForkSourceBusy } from '../src/core/worker-pool.js';
+import { buildGroupSupervisionCard } from '../src/im/lark/group-supervision-card.js';
 import { invocationRequest } from '../src/services/constrained-invocation/contract.js';
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
 import { buildInitialCollabGate, writeCollabGate } from '../src/services/collab-gate-store.js';
@@ -73,6 +74,21 @@ function fixture(session = {} as Session, criteria = 'The build and affected tes
 }
 
 describe('group session supervision', () => {
+  it('keeps all criteria visible within the Feishu card size limit when every evidence quote is long', () => {
+    const criteria = Array.from({ length: 20 }, (_, index) => `${index + 1} ${'验'.repeat(72)}`);
+    const { task } = fixture(undefined, criteria.join('\n'));
+    const evidence = Array.from({ length: 20 }, () => '证'.repeat(398) + '✅');
+    const card = buildGroupSupervisionCard({
+      locale: 'zh', status: 'cmd.supervise.accepted', task: {
+        ...task, state: 'accepted', assessments: [{ turnId: task.turnId, at: 3, stage: 'acceptance', result: { verdict: 'accepted', evidence } }],
+      },
+    });
+    const content = JSON.stringify(card);
+    expect(Buffer.byteLength(JSON.stringify({ msg_type: 'interactive', content }))).toBeLessThan(30_000);
+    for (const criterion of criteria) expect(content).toContain(criterion);
+    expect(content).toContain('…');
+  });
+
   it('routes an existing-session command with literal multiline criteria', () => {
     const content = '/supervise on\nTests pass\n/check evidence';
     expect(classifySlash({

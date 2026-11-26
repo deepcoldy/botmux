@@ -38,6 +38,7 @@ import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from 
 import * as sessionStore from '../services/session-store.js';
 import { markReportReplyInput } from './report-source-reply.js';
 import { stopGroupSessionSupervision } from './group-session-supervision.js';
+import { buildGroupSupervisionCard } from '../im/lark/group-supervision-card.js';
 import { findEffortTaskConfirmation, recordEffortTaskConfirmation } from '../services/codex-effort-task-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -663,7 +664,7 @@ export interface CommandHandlerDeps {
    * Missing policy wiring fails closed rather than reviving a revoked fork. */
   canRunQueuedFork?: (source: DaemonSession, message: LarkMessage) => boolean;
   prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
-  superviseSession?: (ds: DaemonSession, message: LarkMessage, reply: GuardReply) => Promise<void>;
+  superviseSession?: (ds: DaemonSession, message: LarkMessage) => string;
   submitQueuedMessage?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
   /** Task text attached to a successful native effort change uses normal input delivery. */
   submitEffortTask?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
@@ -4206,13 +4207,12 @@ export async function handleCommand(
       }
 
       case '/supervise': {
-        if (!ds) { await replyNoSession(replyHere, loc); break; }
-        if (message.senderType !== 'user' || !canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
-          await replyHere(t('daemon.cmd_allowed_users_only', { cmd }, loc));
-          break;
-        }
-        if (deps.superviseSession) await deps.superviseSession(ds, message, replyHere);
-        else await replyHere(t('cmd.supervise.unavailable', undefined, loc));
+        const card = (status: string) => JSON.stringify(buildGroupSupervisionCard({ locale: loc, status }));
+        const body = !ds ? card('card.supervise.no_session')
+          : message.senderType !== 'user' || !canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)
+            ? card('cmd.supervise.owner_only')
+            : deps.superviseSession?.(ds, message) ?? card('cmd.supervise.unavailable');
+        await sessionReply(rootId, body, 'interactive');
         break;
       }
 

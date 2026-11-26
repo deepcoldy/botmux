@@ -415,11 +415,11 @@ Disabled by default. Both windows default to 10 minutes and accept integers from
 /botconfig unset groupSessionSupervisor
 ```
 
-In an existing local Feishu group session, the requester can use `/supervise on` to track their latest task. Botmux derives acceptance criteria from the original request and shows them with `/supervise`. To supply criteria explicitly, use `/supervise on <acceptance criteria>`, with one criterion per line. Botmux checks every 30 seconds and restores tracked tasks after a restart. If the execution stops without a result, it can make one attempt to move the original session forward. A result judged complete enters pending review. A separate model call then checks the reported evidence against each criterion. Botmux sends up to two rework turns, each listing the unmet criteria.
+In an existing local Feishu group session, send a task, use `/supervise` to open the card, and click **Start supervision**. Botmux derives acceptance criteria from the original request. Click **Refresh** to see them. To supply criteria explicitly, use `/supervise on <acceptance criteria>`, with one criterion per line. Botmux checks every 30 seconds and restores tracked tasks after a restart. If the execution stops without a result, it can make one attempt to move the original session forward. A result judged complete enters pending review. A separate model call then checks the reported evidence against each criterion. Botmux sends up to two rework turns, each listing the unmet criteria.
 
-Botmux records the reason and evidence for observable waits such as CI, then rechecks in the original session, backing off from five minutes to an hour. It posts in the original topic when execution stalls, needs human input, exhausts its rework budget, or passes review.
+Botmux records the reason and evidence for observable waits such as CI, then rechecks in the original session, backing off from five minutes to an hour. It sends a card to the original session when execution stalls, needs human input, exhausts its rework budget, or passes review.
 
-Use `/supervise` for status and evidence. Human decisions pause automatic work. The requester can choose from the notice with `/supervise decide <reference> <option number>`, or give the session further instructions and use `/supervise resume` to keep tracking the original criteria. `/stop` pauses execution and supervision. `/supervise off` ends supervision.
+The card shows status, criteria, evidence, and options that require a human decision. The authorized requester can choose an option on the card. If further instructions are needed, send them in the original session, refresh the card, and click **Resume**. Click **End supervision** to stop tracking the task. If the card expires, send `/supervise` to open a new one. `/stop` pauses execution and supervision. `/supervise resume`, `/supervise off`, and `/supervise decide` are also available.
 
 ## Permissions and authorization
 

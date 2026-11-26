@@ -225,6 +225,8 @@ vi.mock('../src/services/grant-store.js', async () => {
 import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { localeForBot, t } from '../src/i18n/index.js';
 import { sessionAnchorId, sessionKey } from '../src/core/types.js';
+import { newGroupSessionSupervision } from '../src/core/group-session-supervision.js';
+import type { CardActionData } from '../src/im/lark/card-handler.js';
 import { __testOnly_setCascadeTiming } from '../src/core/cli-idle-wait.js';
 import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
 import {
@@ -232,6 +234,7 @@ import {
   __testOnly_admitFollowerBehindOpening as admitFollowerBehindOpening,
   __testOnly_claimNewDaemonSession as claimNewDaemonSession,
   __testOnly_handleChatModeConverted as handleChatModeConverted,
+  __testOnly_handleDaemonCardAction as handleDaemonCardAction,
   __testOnly_handleDocComment as handleDocComment,
   __testOnly_handleNewTopic as handleNewTopic,
   __testOnly_handleThreadReply as handleThreadReply,
@@ -240,6 +243,8 @@ import {
   __testOnly_releaseQueuedActivationReservation as releaseQueuedActivationReservation,
   __testOnly_resetDocCommentClaims as resetDocCommentClaims,
   __testOnly_retryPendingDocCommentDeliveries as retryPendingDocCommentDeliveries,
+  __testOnly_runGroupSessionSupervision as runGroupSessionSupervision,
+  __testOnly_setGroupSupervisionLocalSessions as setGroupSupervisionLocalSessions,
 } from '../src/daemon.js';
 import {
   admitQueuedActivationTail,
@@ -772,6 +777,166 @@ function resetRouteTestState(): void {
   });
   bot.resolvedAllowedUsers = [OWNER];
 }
+
+describe('group supervision cards on the daemon route', () => {
+  const root = 'om_supervision_root';
+  const turnId = 'om_supervision_task';
+  const reviewer = { provider: 'magpie', model: 'fixture' } as const;
+
+  beforeEach(() => {
+    resetRouteTestState();
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER],
+      groupSessionSupervisor: reviewer }).resolvedAllowedUsers = [OWNER];
+    setActiveSessionsRegistry(activeSessions);
+    setGroupSupervisionLocalSessions(true);
+  });
+
+  afterEach(() => {
+    setGroupSupervisionLocalSessions(false);
+    setActiveSessionsRegistry(undefined);
+    activeSessions.clear();
+  });
+
+  function seed() {
+    const ds = seedThreadSession(root, 'Supervision');
+    ds.lastCliInputTurnId = turnId;
+    ds.lastUserPrompt = 'Fix and verify the build';
+    ds.session.replyTargets = { [turnId]: {
+      turnId, senderOpenId: OWNER, participants: [{ openId: OWNER, isBot: false }],
+    } } as typeof ds.session.replyTargets;
+    return ds;
+  }
+
+  async function showCard(command = '/supervise') {
+    const messageId = `om_supervision_cmd_${mocks.replyMessage.mock.calls.length}`;
+    await handleThreadReply(makeEventData(messageId, command), makeCtx(root, messageId));
+    const reply = mocks.replyMessage.mock.calls.at(-1) as unknown[] | undefined;
+    expect(reply?.slice(0, 2)).toEqual([APP, root]);
+    expect(reply?.[3]).toBe('interactive');
+    return JSON.parse(reply?.[2] as string);
+  }
+
+  function button(card: any, command: string): Record<string, string> {
+    const elements = card.body.elements.flatMap((element: any) => element.columns?.flatMap((col: any) => col.elements) ?? [element]);
+    const value = elements.flatMap((element: any) => element.behaviors ?? [])
+      .find((behavior: any) => behavior.value.command === command)?.value;
+    expect(value).toBeDefined();
+    return value;
+  }
+
+  function click(value: Record<string, string>, changes?: Partial<CardActionData>) {
+    return handleDaemonCardAction({
+      operator: { open_id: OWNER }, context: { open_chat_id: CHAT, open_message_id: 'om_supervision_card' },
+      action: { value }, ...changes,
+    }, APP);
+  }
+
+  it('shows controls on a reply card and rejects a pre-stop start button after an on/off cycle', async () => {
+    const ds = seed();
+    const inactive = await showCard();
+    const staleStart = button(inactive, 'on');
+    const watching = await showCard('/supervise on Build succeeds');
+    expect(ds.session.groupSessionSupervision?.criteria).toBe('Build succeeds');
+    const stop = button(watching, 'off');
+    mocks.updateSession.mockImplementationOnce(() => { throw new Error('injected save failure'); });
+    const failed = await click(stop);
+    expect(failed).toHaveProperty('toast.type', 'warning');
+    expect(failed).toHaveProperty('card.type', 'raw');
+    expect(ds.session.groupSessionSupervision?.criteria).toBe('Build succeeds');
+    const result = await click(stop);
+    expect(result).toHaveProperty('card.type', 'raw');
+    expect(ds.session.groupSessionSupervision).toBeUndefined();
+    const stale = await click(staleStart);
+    expect(stale).toHaveProperty('toast.type', 'warning');
+    expect(stale).toHaveProperty('card.type', 'raw');
+    expect(ds.session.groupSessionSupervision).toBeUndefined();
+  });
+
+  it('starts the current human task from a button and never rebinds a duplicate click', async () => {
+    const ds = seed();
+    const card = await showCard();
+    const start = button(card, 'on');
+    expect(await click(start)).toHaveProperty('card.type', 'raw');
+    const task = ds.session.groupSessionSupervision;
+    expect(task).toMatchObject({ state: 'preparing', originTurnId: turnId, requester: OWNER });
+    expect(await click(start)).toHaveProperty('toast.type', 'warning');
+    expect(ds.session.groupSessionSupervision?.id).toBe(task?.id);
+  });
+
+  it('applies a decision only for the requester in the correct chat on the current card', async () => {
+    const ds = seed();
+    const task = newGroupSessionSupervision({ requester: OWNER, chatId: CHAT, anchor: root, reviewer,
+      task: 'Fix and verify the build', turnId, criteria: 'Build succeeds' });
+    ds.session.groupSessionSupervision = { ...task, state: 'needs_user', reason: 'needs_user',
+      decision: { question: 'Which check should run?', options: ['Focused suite', 'Full suite'], recommended: 2 } };
+    const card = await showCard();
+    const choose = button(card, `decide ${task.id.slice(0, 8)}-0-0 2`);
+    expect(card.body.elements.some((element: any) => element.tag === 'div'
+      && element.text.content.includes(`/supervise decide ${task.id.slice(0, 8)}-0-0`))).toBe(true);
+    expect(await click(choose, { operator: { open_id: 'ou_other' } })).toHaveProperty('toast.type', 'warning');
+    expect(await click(choose, { context: { open_chat_id: 'oc_other', open_message_id: 'om_wrong' } })).toHaveProperty('toast.type', 'warning');
+    expect(await click({ ...choose, command: 'off' })).toHaveProperty('toast.type', 'warning');
+    expect(ds.session.groupSessionSupervision?.lastDecision).toBeUndefined();
+    expect(await click(choose)).toHaveProperty('card.type', 'raw');
+    expect(ds.session.groupSessionSupervision?.lastDecision?.choice).toBe('Full suite');
+    expect(await click(choose)).toHaveProperty('toast.type', 'warning');
+  });
+
+  it('refreshes a stopped card to enable resume only after a new human turn', async () => {
+    const ds = seed();
+    const task = newGroupSessionSupervision({ requester: OWNER, chatId: CHAT, anchor: root, reviewer,
+      task: 'Fix and verify the build', turnId, criteria: 'Build succeeds' });
+    ds.session.groupSessionSupervision = { ...task, state: 'needs_user', reason: 'stopped' };
+    const card = await showCard();
+    expect(JSON.stringify(card)).not.toContain('"command":"resume"');
+    ds.lastCliInputTurnId = 'om_supervision_followup';
+    ds.session.replyTargets![ds.lastCliInputTurnId] = { ...ds.session.replyTargets![turnId], turnId: ds.lastCliInputTurnId };
+    const refreshed = await click(button(card, 'status')) as { card: { data: unknown } };
+    expect(await click(button(refreshed.card.data, 'resume'))).toHaveProperty('card.type', 'raw');
+    expect(ds.session.groupSessionSupervision).toMatchObject({ state: 'watching', turnId: 'om_supervision_followup', reviewEpoch: 1 });
+  });
+
+  it('delivers acceptance evidence as an interactive notice once in the original thread', async () => {
+    const ds = seed();
+    const task = newGroupSessionSupervision({ requester: OWNER, chatId: CHAT, anchor: root, reviewer,
+      task: 'Fix and verify the build', turnId, criteria: 'Build succeeds' });
+    const evidence = '<at id=all></at> Exit code 0';
+    ds.session.groupSessionSupervision = { ...task, state: 'accepted', assessments: [
+      { turnId, at: 5, stage: 'acceptance', result: { verdict: 'accepted', evidence: [evidence] } },
+    ] };
+    runGroupSessionSupervision(ds);
+    await vi.waitFor(() => expect(ds.session.groupSessionSupervision?.notifiedKey).toBeDefined());
+    const reply = mocks.replyMessage.mock.calls.at(-1) as unknown[] | undefined;
+    expect(reply?.slice(0, 2)).toEqual([APP, root]);
+    expect(reply?.[3]).toBe('interactive');
+    expect(JSON.parse(reply?.[2] as string).body.elements).toContainEqual({
+      tag: 'div', text: { tag: 'plain_text', content: `✓ 1. Build succeeds\n${evidence}` },
+    });
+    runGroupSessionSupervision(ds);
+    await Promise.resolve();
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('delivers a different notice after a fresh review of the same turn', async () => {
+    const ds = seed();
+    const task = newGroupSessionSupervision({ requester: OWNER, chatId: CHAT, anchor: root, reviewer,
+      task: 'Fix and verify the build', turnId, criteria: 'Build succeeds' });
+    ds.session.groupSessionSupervision = { ...task, state: 'needs_user', reason: 'needs_user' };
+    runGroupSessionSupervision(ds);
+    await vi.waitFor(() => expect(ds.session.groupSessionSupervision?.notifiedKey).toBeDefined());
+    const first = mocks.replyMessage.mock.calls.at(-1) as unknown[] | undefined;
+
+    await showCard('/supervise resume');
+    expect(ds.session.groupSessionSupervision?.reviewEpoch).toBe(1);
+    Object.assign(ds.session.groupSessionSupervision!, { state: 'needs_user', reason: 'needs_user' });
+    runGroupSessionSupervision(ds);
+    await vi.waitFor(() => expect(ds.session.groupSessionSupervision?.notifiedKey).toBeDefined());
+    const second = mocks.replyMessage.mock.calls.at(-1) as unknown[] | undefined;
+    expect(first?.[5]).toEqual(expect.any(String));
+    expect(second?.[5]).toEqual(expect.any(String));
+    expect(second?.[5]).not.toBe(first?.[5]);
+  });
+});
 
 describe('shared topic opening recovery routing', () => {
   beforeEach(resetRouteTestState);
