@@ -84,6 +84,8 @@ export interface CodexCapacityFallbackState {
   pendingAsk?: CodexCapacityFallbackPendingAsk;
   declinedForTurn?: boolean;
   switching?: boolean;
+  /** The source turn completed naturally while a confirmed switch was in flight. */
+  terminalSettled?: boolean;
 }
 
 export interface CodexCapacityFallbackTrigger {
@@ -239,9 +241,16 @@ export function settleCodexCapacityFallback(
     state.pendingAsk = undefined;
     try { invalidate(ask, reason); } catch { /* best effort */ }
   }
-  if (!state.switching) {
-    ds.codexCapacityFallback = undefined;
+  if (state.switching) {
+    // A natural answer is an external cancellation, unlike the kill/new-generation
+    // notifications produced by this switch itself. Keep the state as the switch's
+    // ownership token, but make every subsequent checkpoint refuse the resume.
+    if (reason === 'final_output' || reason.startsWith('turn_terminal:')) {
+      state.terminalSettled = true;
+    }
+    return;
   }
+  ds.codexCapacityFallback = undefined;
 }
 
 interface SwitchPlan {
@@ -257,12 +266,13 @@ interface SwitchPlan {
   overloadedModels: string[];
 }
 
-type DowngradeOutcome = 'switched' | 'declined' | 'gone' | 'failed';
+type DowngradeOutcome = 'switched' | 'declined' | 'gone' | 'failed' | 'rollback_failed';
 
 async function runDowngrade(
   ds: DaemonSession,
   trigger: CodexCapacityFallbackTrigger,
   plan: SwitchPlan,
+  state: CodexCapacityFallbackState,
   locale: Locale,
   deps: CodexCapacityFallbackDeps,
 ): Promise<DowngradeOutcome> {
@@ -283,12 +293,15 @@ async function runDowngrade(
     dashboardEventBus.publish({ type: 'session.update', body: { sessionId, patch } });
   });
 
+  const switchCancelled = (): boolean => state.terminalSettled === true || ds.codexCapacityFallback !== state;
+  const cancelledOutcome = (): DowngradeOutcome => switchCancelled() ? 'gone' : 'declined';
+
   const gate = await withMutation(ds.larkAppId, MUTATION_ACQUIRE_TIMEOUT_MS, async (): Promise<DowngradeOutcome> => {
     const registered = (): boolean => findActive(ds.session.sessionId) === ds && ds.session.status === 'active';
-    const owned = (): boolean => registered() && ds.worker === trigger.worker && !trigger.worker.killed
+    const owned = (): boolean => !switchCancelled() && registered() && ds.worker === trigger.worker && !trigger.worker.killed
       && ds.lastCliInputTurnId === plan.sourceTurnId && !hasNewerInput(ds)
       && Boolean(ds.session.cliSessionId);
-    if (!owned()) return 'declined';
+    if (!owned()) return cancelledOutcome();
 
     const botCfg = getBotConfig(ds.larkAppId);
     const cliId = 'codex' as const;
@@ -334,19 +347,35 @@ async function runDowngrade(
       active: ds.activeInteractiveTurn,
       reply: ds.currentReplyTarget,
       failedTurnRecovery: ds.session.failedTurnRecovery,
-      replyTargets: ds.session.replyTargets,
-      turnReplyContexts: ds.session.turnReplyContexts,
       spawnModelOverride: ds.spawnModelOverride,
       modelPinCleared: ds.modelPinCleared,
       launch: structuredClone(Object.fromEntries(SWITCHED_SESSION_FIELDS.map(key => [key, ds.session[key]]))),
     };
-    const restoreRouting = (): void => {
-      ds.activeInteractiveTurn = previous.active;
-      ds.currentReplyTarget = previous.reply;
-      ds.session.currentReplyTarget = previous.reply ? { ...previous.reply } : undefined;
-      ds.session.failedTurnRecovery = previous.failedTurnRecovery;
-      ds.session.replyTargets = previous.replyTargets;
-      ds.session.turnReplyContexts = previous.turnReplyContexts;
+    const restoreRouting = (naturalTerminal = false): void => {
+      // Undo only routing still owned by THIS continuation. Whole-object snapshot
+      // restoration can overwrite terminal/new-input work that ran while we awaited.
+      if (ds.activeInteractiveTurn?.turnId === turnId) {
+        ds.activeInteractiveTurn = naturalTerminal ? undefined : previous.active;
+      }
+      if (ds.currentReplyTarget?.turnId === turnId) {
+        ds.currentReplyTarget = naturalTerminal ? undefined : previous.reply;
+      }
+      if (ds.session.currentReplyTarget?.turnId === turnId) {
+        ds.session.currentReplyTarget = naturalTerminal ? undefined : previous.reply ? { ...previous.reply } : undefined;
+      }
+      if (ds.session.failedTurnRecovery?.turnId === turnId) {
+        ds.session.failedTurnRecovery = previous.failedTurnRecovery;
+      }
+      if (ds.session.replyTargets?.[turnId]) {
+        const next = { ...ds.session.replyTargets };
+        delete next[turnId];
+        ds.session.replyTargets = Object.keys(next).length > 0 ? next : undefined;
+      }
+      if (ds.session.turnReplyContexts?.[turnId]) {
+        const next = { ...ds.session.turnReplyContexts };
+        delete next[turnId];
+        ds.session.turnReplyContexts = Object.keys(next).length > 0 ? next : undefined;
+      }
     };
     const restoreLaunch = (): void => {
       const session = ds.session as unknown as Record<string, unknown>;
@@ -359,7 +388,19 @@ async function runDowngrade(
       ds.modelPinCleared = previous.modelPinCleared;
     };
     const persistBestEffort = (): void => {
-      try { updateSession(ds.session); } catch { /* next write carries it */ }
+      try { updateSession(ds.session); } catch { /* best effort routing rollback */ }
+    };
+    const restoreLaunchAndPersist = (): boolean => {
+      restoreLaunch();
+      // A pin rollback is an explicit intent write. An ordinary metadata write
+      // would retain the durable NEW pin and undo the in-memory restoration.
+      try {
+        updateSession(ds.session, plan.mode === 'pin' ? { modelPinWrite: true } : undefined);
+        return true;
+      } catch (error) {
+        logger.warn(`[codex-capacity] ${ds.session.sessionId}: launch rollback could not be persisted: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      }
     };
 
     try {
@@ -390,15 +431,15 @@ async function runDowngrade(
       updateSession(ds.session);
       await prepareIdentity(ds, turnId);
     } catch (error) {
-      restoreRouting();
+      restoreRouting(state.terminalSettled === true);
       persistBestEffort();
       logger.warn(`[codex-capacity] ${ds.session.sessionId}: continuation not prepared: ${error instanceof Error ? error.message : String(error)}`);
-      return 'declined';
+      return cancelledOutcome();
     }
     if (!owned()) {
-      restoreRouting();
+      restoreRouting(state.terminalSettled === true);
       persistBestEffort();
-      return 'declined';
+      return cancelledOutcome();
     }
 
     // Retire the stalled Codex process holding the 300s backoff sleep.
@@ -412,14 +453,14 @@ async function runDowngrade(
     } catch (error) {
       logger.warn(`[codex-capacity] ${ds.session.sessionId}: worker retirement failed: ${error instanceof Error ? error.message : String(error)}`);
       if (!registered()) return 'gone';
-      restoreRouting();
-      restoreLaunch();
-      persistBestEffort();
+      restoreRouting(state.terminalSettled === true);
+      if (!restoreLaunchAndPersist()) return 'rollback_failed';
+      if (switchCancelled()) return 'gone';
       const oldWorkerIntact = ds.worker === retiring && !retiring.killed;
       return oldWorkerIntact ? 'declined' : 'failed';
     }
 
-    const retirementOwned = registered()
+    const retirementOwned = !switchCancelled() && registered()
       && ds.worker === null
       && (ds.workerGeneration ?? ds.session.workerGeneration) === retiringGeneration
       && ds.lastCliInputTurnId === plan.sourceTurnId
@@ -470,9 +511,8 @@ async function runDowngrade(
     }
 
     if (!input) {
-      restoreRouting();
-      restoreLaunch();
-      persistBestEffort();
+      restoreRouting(state.terminalSettled === true);
+      if (!restoreLaunchAndPersist()) return 'rollback_failed';
       return 'failed';
     }
 
@@ -500,7 +540,7 @@ async function runDowngrade(
     }
     return 'switched';
   });
-  return gate.acquired ? gate.value : 'declined';
+  return gate.acquired ? gate.value : cancelledOutcome();
 }
 
 /**
@@ -737,7 +777,7 @@ export function handleCodexCapacityRetry(
     };
     let outcome: DowngradeOutcome;
     try {
-      outcome = await runDowngrade(ds, trigger, plan, locale, deps);
+      outcome = await runDowngrade(ds, trigger, plan, state, locale, deps);
     } catch (error) {
       logger.error(`${tagged}: downgrade to ${toModel} threw: ${error instanceof Error ? error.message : String(error)}`);
       outcome = 'failed';
@@ -754,9 +794,15 @@ export function handleCodexCapacityRetry(
         { fromModel, toModel },
         locale,
       ));
-    } else if (outcome === 'failed') {
+    } else if (outcome === 'failed' || outcome === 'rollback_failed') {
       state.declinedForTurn = true;
-      reply(t('worker.codex_capacity_fallback.switch_failed', { fromModel, toModel }, locale));
+      reply(t(
+        outcome === 'rollback_failed'
+          ? 'worker.codex_capacity_fallback.switch_rollback_failed'
+          : 'worker.codex_capacity_fallback.switch_failed',
+        { fromModel, toModel },
+        locale,
+      ));
     } else if (outcome === 'gone' && ds.codexCapacityFallback === state) {
       ds.codexCapacityFallback = undefined;
     }

@@ -231,6 +231,7 @@ export const messages: Record<string, string> = {
   'worker.codex_capacity_fallback.switched_temporary': '🔄 已确认临时降级：{fromModel} → {toModel}（不改话题固定），正在续接原会话继续处理上一条请求。',
   'worker.codex_capacity_fallback.switched_pin': '🔄 已确认降级并固定本话题：{fromModel} → {toModel}，正在续接原会话继续处理上一条请求。',
   'worker.codex_capacity_fallback.switch_failed': '⚠️ 降级切换到 {toModel} 失败，原模型配置已保留；请稍后重发或手动 `/models` 切换。',
+  'worker.codex_capacity_fallback.switch_rollback_failed': '⚠️ 降级切换到 {toModel} 失败，且恢复原模型配置的写入未成功；当前配置可能仍为 {toModel}。请通过 `/models` 检查并手动恢复所需模型。',
   'worker.codex_capacity_fallback.waiting': '⏳ 已保持 {fromModel} 继续排队等待 Codex 自动重试。',
   'worker.codex_capacity_fallback.pin_forbidden': '⚠️ 当前操作人无权修改本话题固定模型，已保持原模型等待。',
   'worker.codex_capacity_fallback.continue_prompt': '[Botmux 算力降级续跑] 上一条请求在模型 {fromModel} 上因算力拥堵未能完成，用户已确认切换至 {toModel}。请基于已有原生会话上下文继续完成上一条请求；上一个模型可能已经完成了部分步骤，先检查当前状态，已经成功的有副作用操作不要重复执行。',

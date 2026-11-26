@@ -1,4 +1,7 @@
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   _resetForTest as resetAskBroker,
@@ -8,6 +11,7 @@ import {
   setCardDispatcher,
 } from '../src/core/ask-broker.js';
 import type { AskResult, CreateAskInput } from '../src/core/ask-types.js';
+import { recordFailedTurnTerminal } from '../src/core/failed-turn-recovery.js';
 import {
   buildCodexCapacityFallbackPrompt,
   CODEX_CAPACITY_FALLBACK_ASK_ORIGIN,
@@ -19,6 +23,8 @@ import {
   type CodexCapacityFallbackDeps,
   type CodexCapacityFallbackTrigger,
 } from '../src/core/codex-capacity-fallback.js';
+import { config } from '../src/config.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 const APP = 'cli_codex_cap';
 const CHAT = 'oc_chat';
@@ -444,6 +450,108 @@ describe('handleCodexCapacityRetry', () => {
     expect(reply).toHaveBeenCalledWith(expect.stringContaining('失败'));
   });
 
+  it.each(['final_output', 'turn_terminal:completed'])(
+    'aborts before worker retirement when %s arrives during identity preparation',
+    async reason => {
+      const ds = makeDs();
+      let enteredPrepare!: () => void;
+      const prepareEntered = new Promise<void>(resolve => { enteredPrepare = resolve; });
+      let releasePrepare!: () => void;
+      const prepareHeld = new Promise<void>(resolve => { releasePrepare = resolve; });
+      const harness = makeDeps(ds, {
+        prepareRecoveryIdentity: async () => {
+          enteredPrepare();
+          await prepareHeld;
+        },
+      });
+      const { trigger, reply } = makeTrigger(ds);
+
+      expect(handleCodexCapacityRetry(ds, trigger, harness.deps)).toBe(true);
+      await prepareEntered;
+      expect(ds.codexCapacityFallback?.switching).toBe(true);
+      const continuationTurnId = ds.activeInteractiveTurn?.turnId;
+      expect(continuationTurnId).not.toBe(TURN);
+
+      settleCodexCapacityFallback(ds, reason, TURN, { invalidateAsk: harness.deps.invalidateAsk });
+      // Match the daemon's exact-turn cleanup: the synthetic continuation has
+      // already replaced the source active turn, so the predicate cannot clear it.
+      if (ds.activeInteractiveTurn?.turnId === TURN) ds.activeInteractiveTurn = undefined;
+      ds.session.workerGeneration = 1;
+      recordFailedTurnTerminal(ds, { turnId: TURN, status: 'completed' }, {
+        workerGeneration: 1,
+        caller: undefined,
+        silent: false,
+      });
+      expect(ds.activeInteractiveTurn?.turnId).toBe(continuationTurnId);
+      // Completed delivery also pruned the source target while preparation awaited.
+      delete ds.session.replyTargets[TURN];
+
+      releasePrepare();
+      await flushMicrotasks();
+
+      expect(harness.killed).toHaveLength(0);
+      expect(harness.forkedCalls).toHaveLength(0);
+      expect(ds.codexCapacityFallback).toBeUndefined();
+      expect(ds.activeInteractiveTurn).toBeUndefined();
+      expect(ds.session.failedTurnRecovery).toBeUndefined();
+      expect(ds.session.replyTargets).toBeUndefined();
+      expect(reply).not.toHaveBeenCalled();
+    },
+  );
+
+  it('aborts the resume when final_output arrives while waiting for the old worker to exit', async () => {
+    const ds = makeDs();
+    let enteredWait!: () => void;
+    const waitEntered = new Promise<void>(resolve => { enteredWait = resolve; });
+    let releaseWait!: () => void;
+    const waitHeld = new Promise<void>(resolve => { releaseWait = resolve; });
+    const harness = makeDeps(ds, {
+      waitForWorkerExit: async () => {
+        enteredWait();
+        await waitHeld;
+        return true;
+      },
+    });
+    const { trigger, reply } = makeTrigger(ds);
+
+    expect(handleCodexCapacityRetry(ds, trigger, harness.deps)).toBe(true);
+    await waitEntered;
+    expect(harness.killed).toHaveLength(1);
+    settleCodexCapacityFallback(ds, 'final_output', TURN, { invalidateAsk: harness.deps.invalidateAsk });
+    releaseWait();
+    await flushMicrotasks();
+
+    expect(harness.forkedCalls).toHaveLength(0);
+    expect(ds.codexCapacityFallback).toBeUndefined();
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('does not mistake the switch-owned kill and new generation for external terminal cancellation', async () => {
+    const ds = makeDs();
+    let forks = 0;
+    const harness = makeDeps(ds, {
+      waitForWorkerExit: async () => {
+        settleCodexCapacityFallback(ds, 'killWorker', undefined, { invalidateAsk: harness.deps.invalidateAsk });
+        return true;
+      },
+      forkWorker: ((targetDs: any) => {
+        forks++;
+        settleCodexCapacityFallback(targetDs, 'new_worker_generation', undefined, { invalidateAsk: harness.deps.invalidateAsk });
+        targetDs.worker = harness.nextWorker;
+        return true;
+      }) as any,
+    });
+    const { trigger } = makeTrigger(ds);
+
+    expect(handleCodexCapacityRetry(ds, trigger, harness.deps)).toBe(true);
+    await flushMicrotasks();
+
+    expect(harness.killed).toHaveLength(1);
+    expect(forks).toBe(1);
+    expect(ds.lastCliInputTurnId).toMatch(new RegExp(`^${CODEX_CAPACITY_FALLBACK_TURN_PREFIX}`));
+    expect(ds.codexCapacityFallback?.sourceTurnId).toBe(ds.lastCliInputTurnId);
+  });
+
   it('invalidates an open confirmation card when the turn settles on its own', async () => {
     const ds = makeDs();
     let resolveAsk!: (res: AskResult) => void;
@@ -467,6 +575,127 @@ describe('handleCodexCapacityRetry', () => {
     resolveAsk({ kind: 'invalidated', reason: 'turn_terminal:completed', selected: null, by: null, comment: null, timedOut: false });
     await flushMicrotasks();
     expect(harness.killed).toHaveLength(0);
+  });
+
+  describe('pin rollback through the real SQLite session store', () => {
+    let dataDir: string;
+    let previousDataDir: string;
+
+    beforeEach(() => {
+      dataDir = mkdtempSync(join(tmpdir(), 'codex-capacity-rollback-'));
+      previousDataDir = config.session.dataDir;
+      config.session.dataDir = dataDir;
+      sessionStore.init(APP);
+    });
+
+    afterEach(() => {
+      sessionStore.__testOnly_setBeforeRowPersist(undefined);
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    });
+
+    async function expectPinRollback(initialPin?: {
+      model: string;
+      effort: 'high';
+      source: 'card';
+      setBy: string;
+      setAt: string;
+    }): Promise<void> {
+      const session = sessionStore.createSession(CHAT, 'om_root', 'title', 'group', 'thread');
+      session.larkAppId = APP;
+      session.status = 'active';
+      session.ownerOpenId = HUMAN;
+      session.cliId = 'codex';
+      session.model = 'gpt-6.1-sol';
+      session.cliSessionId = '01a21656-47a5-7c23-94b6-464238559697';
+      session.modelPin = initialPin;
+      sessionStore.updateSession(session, { modelPinWrite: true });
+      const ds = makeDs();
+      ds.session = session;
+      const harness = makeDeps(ds, {
+        updateSession: sessionStore.updateSession,
+        forkWorker: (() => false) as any,
+        registerAsk: async () => ({ kind: 'answered', answers: [['pin']], by: HUMAN, comment: null, timedOut: false }),
+      });
+      const { trigger, reply } = makeTrigger(ds);
+
+      expect(handleCodexCapacityRetry(ds, trigger, harness.deps)).toBe(true);
+      await flushMicrotasks();
+
+      expect(harness.killed).toHaveLength(1);
+      expect(harness.forkedCalls).toHaveLength(0);
+      expect(reply).toHaveBeenCalledWith(expect.stringContaining('失败'));
+      const memoryPin = ds.session.modelPin;
+      sessionStore.init(APP);
+      const durablePin = sessionStore.getOwnedSession(session.sessionId)?.modelPin;
+      expect(memoryPin).toEqual(initialPin);
+      expect(durablePin).toEqual(initialPin);
+    }
+
+    it('restores an existing pin in memory and in the reloaded durable row after fork failure', async () => {
+      await expectPinRollback({
+        model: 'gpt-6.1-sol',
+        effort: 'high',
+        source: 'card',
+        setBy: HUMAN,
+        setAt: '2026-11-25T00:00:00.000Z',
+      });
+    });
+
+    it('leaves no pin in memory or in the reloaded durable row when there was none before fork failure', async () => {
+      await expectPinRollback();
+    });
+
+    it('reports restoration as unconfirmed when the compensating pin write itself fails', async () => {
+      const session = sessionStore.createSession(CHAT, 'om_root', 'title', 'group', 'thread');
+      session.larkAppId = APP;
+      session.status = 'active';
+      session.ownerOpenId = HUMAN;
+      session.cliId = 'codex';
+      session.model = 'gpt-6.1-sol';
+      session.cliSessionId = '01a21656-47a5-7c23-94b6-464238559697';
+      session.modelPin = {
+        model: 'gpt-6.1-sol',
+        effort: 'high',
+        source: 'card',
+        setBy: HUMAN,
+        setAt: '2026-11-25T00:00:00.000Z',
+      };
+      sessionStore.updateSession(session, { modelPinWrite: true });
+      const ds = makeDs();
+      ds.session = session;
+      let forkAttempts = 0;
+      const harness = makeDeps(ds, {
+        updateSession: sessionStore.updateSession,
+        forkWorker: (() => {
+          forkAttempts++;
+          // The new pin is already durable. Fail only the compensating write.
+          sessionStore.__testOnly_setBeforeRowPersist(() => {
+            sessionStore.__testOnly_setBeforeRowPersist(undefined);
+            throw new Error('injected rollback write failure');
+          });
+          return false;
+        }) as any,
+        registerAsk: async () => ({ kind: 'answered', answers: [['pin']], by: HUMAN, comment: null, timedOut: false }),
+      });
+      const { trigger, reply } = makeTrigger(ds);
+
+      expect(handleCodexCapacityRetry(ds, trigger, harness.deps)).toBe(true);
+      await flushMicrotasks();
+
+      expect(forkAttempts).toBe(1);
+      expect(ds.codexCapacityFallback?.declinedForTurn).toBe(true);
+      const notice = reply.mock.calls.map(call => call[0]).join('\n');
+      expect(notice).toContain('/models');
+      expect(notice).not.toContain('原模型配置已保留');
+      const memoryPin = ds.session.modelPin?.model;
+      sessionStore.init(APP);
+      const durablePin = sessionStore.getOwnedSession(session.sessionId)?.modelPin?.model;
+      // updateSession's failure recovery exposes the still-durable new pin;
+      // the notification must not claim that the old pin was restored.
+      expect(memoryPin).toBe('gpt-5.4');
+      expect(durablePin).toBe('gpt-5.4');
+    });
   });
 
   it('rejects ineligible sessions and enforces MAX_CODEX_CAPACITY_HOPS', () => {

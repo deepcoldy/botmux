@@ -228,6 +228,7 @@ export const messages: Record<string, string> = {
   'worker.codex_capacity_fallback.switched_temporary': '🔄 Confirmed temporary downgrade: {fromModel} → {toModel} (topic pin unchanged). Resuming the native conversation to continue the last request.',
   'worker.codex_capacity_fallback.switched_pin': '🔄 Confirmed downgrade and pinned topic model: {fromModel} → {toModel}. Resuming the native conversation to continue the last request.',
   'worker.codex_capacity_fallback.switch_failed': '⚠️ Failed to switch to {toModel}; previous model settings were restored. Please resend or switch manually via `/models`.',
+  'worker.codex_capacity_fallback.switch_rollback_failed': '⚠️ Failed to switch to {toModel}, and restoring the previous model settings could not be persisted. The current setting may still be {toModel}; check `/models` and restore the desired model manually.',
   'worker.codex_capacity_fallback.waiting': '⏳ Keeping {fromModel} waiting for Codex built-in retries.',
   'worker.codex_capacity_fallback.pin_forbidden': '⚠️ Only authorized session operators may pin a topic model; keeping the current model waiting.',
   'worker.codex_capacity_fallback.continue_prompt': '[Botmux capacity downgrade] The previous request hit a capacity limit on {fromModel} and the user confirmed switching to {toModel}. Continue the last request from the existing native conversation context; check the current state first and do not repeat side-effecting operations that already succeeded.',
