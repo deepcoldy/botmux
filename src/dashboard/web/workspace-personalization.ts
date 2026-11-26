@@ -30,7 +30,7 @@ export interface WorkspacePreset {
 }
 
 export const WORKSPACE_PERSONALIZATION_STORAGE_KEY = 'botmux.workspace.personalization.v1';
-export const DEFAULT_WORKSPACE_MODE: WorkspaceMode = 'focused';
+export const DEFAULT_WORKSPACE_MODE: WorkspaceMode = 'all';
 export const CORE_NAV_IDS: readonly string[] = ['overview', 'sessions', 'groups', 'bot-defaults', 'settings'];
 
 function preset(id: WorkspacePresetId, pinnedIds: readonly string[]): WorkspacePreset {

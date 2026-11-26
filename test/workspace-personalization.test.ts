@@ -13,7 +13,7 @@ const en = createDashboardTranslator('en');
 const available = new Set(NAV_ITEMS.map(item => item.id));
 
 function state(overrides: Partial<WorkspacePersonalizationState> = {}): WorkspacePersonalizationState {
-  return { mode: 'focused', pinnedIds: [], dismissedAutoIds: [], dismissedGuideIds: [], ...overrides };
+  return { mode: 'all', pinnedIds: [], dismissedAutoIds: [], dismissedGuideIds: [], ...overrides };
 }
 
 function memoryStorage(raw?: string) {
@@ -26,18 +26,19 @@ function memoryStorage(raw?: string) {
 }
 
 describe('workspace personalization', () => {
-  it('defaults to focused with fresh empty preferences', () => {
-    expect(DEFAULT_WORKSPACE_MODE).toBe('focused');
+  it('defaults to full navigation with fresh empty preferences', () => {
+    expect(DEFAULT_WORKSPACE_MODE).toBe('all');
     const defaults = loadWorkspacePersonalization(memoryStorage());
     expect(defaults).toEqual(state());
+    expect(filterSidebarItemsForWorkspace(NAV_ITEMS, defaults, [])).toBe(NAV_ITEMS);
     defaults.pinnedIds.push('skills');
     expect(loadWorkspacePersonalization(memoryStorage())).toEqual(state());
   });
 
-  it('round-trips the selected mode and all three preference lists', () => {
+  it.each(['all', 'focused'] as const)('round-trips the selected %s mode and all three preference lists', mode => {
     const storage = memoryStorage();
     const preferences = state({
-      mode: 'all', pinnedIds: ['skills', 'monitoring'], dismissedAutoIds: ['schedules'], dismissedGuideIds: ['workflows'],
+      mode, pinnedIds: ['skills', 'monitoring'], dismissedAutoIds: ['schedules'], dismissedGuideIds: ['workflows'],
     });
     saveWorkspacePersonalization(preferences, storage);
     expect(loadWorkspacePersonalization(storage)).toEqual(preferences);
@@ -67,8 +68,8 @@ describe('workspace personalization', () => {
     const storage = memoryStorage();
     vi.stubGlobal('localStorage', storage);
     try {
-      saveWorkspacePersonalization(state({ mode: 'all' }));
-      expect(loadWorkspacePersonalization().mode).toBe('all');
+      saveWorkspacePersonalization(state({ mode: 'focused' }));
+      expect(loadWorkspacePersonalization().mode).toBe('focused');
     } finally {
       vi.unstubAllGlobals();
     }
@@ -120,7 +121,7 @@ describe('workspace personalization', () => {
 
   it('keeps core, explicit, automatic and pinned plugin entries in input order', () => {
     const items = [...NAV_ITEMS, { id: 'plugin:sample', plugin: true }, { id: 'unknown' }];
-    const focused = state({ pinnedIds: ['skills'], dismissedAutoIds: ['decision-board'] });
+    const focused = state({ mode: 'focused', pinnedIds: ['skills'], dismissedAutoIds: ['decision-board'] });
     expect(filterSidebarItemsForWorkspace(items, focused, ['schedules', 'decision-board', 'unknown']).map(item => item.id))
       .toEqual(['overview', 'sessions', 'groups', 'schedules', 'bot-defaults', 'skills', 'settings', 'plugin:sample']);
     expect(filterSidebarItemsForWorkspace(items, { ...focused, mode: 'all' }, ['schedules'])).toBe(items);
@@ -147,7 +148,7 @@ describe('workspace personalization', () => {
     expect(resolveEffectivePinnedIds(removed, [])).toEqual(new Set(['skills']));
     expect(resolveEffectivePinnedIds(removed, automatic)).toEqual(new Set(['skills', 'decision-board']));
     const pinned = pinCapability({ ...removed, mode: 'all' }, 'schedules');
-    expect(pinned).toEqual(state({ pinnedIds: ['skills', 'schedules'], dismissedAutoIds: ['task-routing'] }));
+    expect(pinned).toEqual(state({ mode: 'focused', pinnedIds: ['skills', 'schedules'], dismissedAutoIds: ['task-routing'] }));
     expect(resolveEffectivePinnedIds(pinned, automatic)).toEqual(new Set(['skills', 'schedules', 'decision-board']));
     expect(unpinCapability(pinned, 'skills').dismissedAutoIds).toEqual(['task-routing']);
   });
@@ -162,11 +163,11 @@ describe('workspace personalization', () => {
     expect(WORKSPACE_PRESETS.map(preset => preset.id)).toEqual(Object.keys(expected));
     for (const preset of WORKSPACE_PRESETS) {
       const next = applyWorkspacePreset(state({ mode: 'all', pinnedIds: ['feedback'], dismissedGuideIds: ['skills'] }), preset.id);
-      expect(next).toEqual(state({ pinnedIds: expected[preset.id], dismissedGuideIds: ['skills'] }));
+      expect(next).toEqual(state({ mode: 'focused', pinnedIds: expected[preset.id], dismissedGuideIds: ['skills'] }));
       expect(detectActivePreset({ ...next, pinnedIds: [...next.pinnedIds].reverse() })).toBe(preset.id);
       expect(detectActivePreset({ ...next, mode: 'all' })).toBeNull();
     }
-    expect(detectActivePreset(state({ pinnedIds: ['feedback'] }))).toBeNull();
+    expect(detectActivePreset(state({ mode: 'focused', pinnedIds: ['feedback'] }))).toBeNull();
   });
 
   it('keeps explicit suppressions across presets and resets to the cores with live signals', () => {
@@ -175,7 +176,7 @@ describe('workspace personalization', () => {
     expect(oncall.dismissedAutoIds).toEqual(['decision-board']);
     expect(resolveEffectivePinnedIds(oncall, ['schedules', 'task-routing']).has('task-routing')).toBe(true);
     const minimal = applyWorkspacePreset(oncall, 'minimal', ['schedules', 'task-routing']);
-    expect(minimal).toEqual(state({ dismissedAutoIds: ['schedules', 'task-routing'], dismissedGuideIds: ['skills'] }));
+    expect(minimal).toEqual(state({ mode: 'focused', dismissedAutoIds: ['schedules', 'task-routing'], dismissedGuideIds: ['skills'] }));
     expect(filterSidebarItemsForWorkspace(NAV_ITEMS, minimal, ['schedules', 'task-routing']).map(item => item.id))
       .toEqual(CORE_NAV_IDS);
   });

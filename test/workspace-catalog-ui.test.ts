@@ -58,7 +58,7 @@ describe('workspace capability catalog', () => {
     expect(root.findByType('dialog').props).toMatchObject({ role: 'dialog', 'aria-modal': 'true' });
     expect(cards(root)).toHaveLength(19);
     expect(card(root, 'schedules').findByProps({ className: 'wc-badge is-active' }).children).toEqual(['In use · 3']);
-    expect(root.findByProps({ 'data-preset-id': 'minimal' }).props['aria-pressed']).toBe(true);
+    expect(root.findByProps({ 'data-preset-id': 'minimal' }).props['aria-pressed']).toBe(false);
     for (const preset of WORKSPACE_PRESETS.filter(entry => entry.id !== 'minimal')) {
       const button = root.findByProps({ 'data-preset-id': preset.id });
       click(button);
@@ -91,7 +91,6 @@ describe('workspace capability catalog', () => {
     const root = mount(createElement(CatalogFixture));
     const mode = (mode: WorkspaceMode) => root.findByProps({ className: 'wc-mode' }).findAllByType('button')
       .find(node => node.children.includes(tr(`workspace.mode.${mode}`)))!;
-    click(mode('all'));
     expect(mode('all').props['aria-pressed']).toBe(true);
     expect(card(root, 'skills').findByProps({ className: 'wc-badge' }).children).toEqual([tr('workspace.badge.all')]);
     click(mode('focused'));
