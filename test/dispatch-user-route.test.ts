@@ -180,6 +180,8 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
   const release = vi.fn(() => { throw released; });
   const scope = {
     workerSessionEventScope: undefined,
+    // This lifecycle/delegation fixture has no active preemption request.
+    traexPreemption: undefined,
     minimaxCompactQueueSuppressesPromptReady, pendingRawInputs: [],
     lastInitConfig: { cliId }, codexBridgeQueue: queue, isStructuredBridgeLifecycleBlockingCli, isCodexAppCliId,
     rpcTurnsAwaitingActivation: new Set(), rpcLifecycleFailClosedOwners: new Set(), rpcTerminalHydrationOwners: new Set(),
