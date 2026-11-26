@@ -522,7 +522,7 @@ import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
-import type { AskQuestion } from './core/ask-types.js';
+import type { AskQuestion, AskResult } from './core/ask-types.js';
 import { traexQuestionFlowVisible, traexPendingAsyncQuestionCount, traexPendingAsyncQuestionVisible, parseTraexQuestionPage, traexQuestionSignature, traexQuestionState, type TraexQuestionPage } from './utils/traex-question-page.js';
 import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -560,7 +560,7 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
+import { hasAntigravitySideQuestionComposer, isAntigravityIdleComposerScreen, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
 import {
   antigravityTurnAnsweredInTranscript,
   antigravityTurnFailedWithoutOutput,
@@ -8856,6 +8856,7 @@ function markActiveTurnStarted(input: {
   const identity = turnAuthorityIdentity(input);
   if (!identity.turnId) return;
   const syncHold = (): void => {
+    baselineAntigravityFooterTasksForActiveTurn();
     if (typeof backgroundAuthorityHold === 'undefined' || typeof applyBackgroundAuthorityTransition !== 'function') return;
     const snap = activeTurnAuthority.snapshot();
     applyBackgroundAuthorityTransition(backgroundAuthorityHold.onForegroundTurnStarted({
@@ -9815,8 +9816,7 @@ interface AntigravityFoldedReconcileResult {
 
 interface AntigravityFoldedReconcilePending {
   cliSpawnGeneration: number;
-  ptyOutputGeneration: number;
-  webTerminalInputGeneration: number;
+  webTerminalSubmitGeneration: number;
   currentTurnId: string | undefined;
   currentDispatchAttempt: number | undefined;
   promotedTurnId: string | undefined;
@@ -9830,14 +9830,31 @@ interface AntigravityFoldedReconcilePending {
   watcher?: FSWatcher;
 }
 
+/** A sibling-proven completed turn waiting only for its live background work.
+ * PTY output is deliberately not an identity fence: background redraws advance
+ * it without changing the turn. Spawn, turn and direct-submit identities still are. */
+interface AntigravityFoldedBackgroundHold {
+  cliSpawnGeneration: number;
+  turnId: string;
+  dispatchAttempt: number | undefined;
+  webTerminalSubmitGeneration: number;
+  clearTimer?: ReturnType<typeof setTimeout>;
+  recheckTimer?: ReturnType<typeof setInterval>;
+}
+
 const ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS = 50;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS = 1_000;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS = 20;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WATCH_WAKEUPS = 50;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS = 15_000;
+const ANTIGRAVITY_FOLDED_BACKGROUND_RECHECK_MS = 2_000;
 let antigravityFoldedReconcilePending: AntigravityFoldedReconcilePending | undefined;
+let antigravityFoldedBackgroundHold: AntigravityFoldedBackgroundHold | undefined;
 
 function cancelAntigravityFoldedReconcilePending(): void {
+  if (antigravityFoldedBackgroundHold?.clearTimer) clearTimeout(antigravityFoldedBackgroundHold.clearTimer);
+  if (antigravityFoldedBackgroundHold?.recheckTimer) clearInterval(antigravityFoldedBackgroundHold.recheckTimer);
+  antigravityFoldedBackgroundHold = undefined;
   const pending = antigravityFoldedReconcilePending;
   if (!pending) return;
   antigravityFoldedReconcilePending = undefined;
@@ -10039,15 +10056,99 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(
   };
 }
 
+function hasAntigravityFoldedLiveHoldEvidence(): boolean {
+  if (typeof hasLiveAntigravityPendingTasks === 'function' && hasLiveAntigravityPendingTasks()) return true;
+  if (!backend || typeof backendScreenEvidenceIsAuthoritativeForMutation !== 'function'
+    || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  try {
+    const screen = captureBackendScreen(backend);
+    observeAntigravityFooterBackgroundTasks(screen);
+    // Background footers can report zero while a newer foreground turn is busy.
+    // Overlays/capture failures are inconclusive, never permission to settle.
+    return !isAntigravityIdleComposerScreen(screen);
+  } catch {
+    return true;
+  }
+}
+
+function armAntigravityFoldedBackgroundHold(
+  pending: AntigravityFoldedReconcilePending,
+  promotedTurnId: string,
+): void {
+  cancelAntigravityFoldedReconcilePending();
+  const hold: AntigravityFoldedBackgroundHold = {
+    cliSpawnGeneration: pending.cliSpawnGeneration,
+    turnId: promotedTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+    webTerminalSubmitGeneration: pending.webTerminalSubmitGeneration,
+  };
+  antigravityFoldedBackgroundHold = hold;
+  hold.recheckTimer = setInterval(() => {
+    if (antigravityFoldedBackgroundHold !== hold) return;
+    driveAntigravityFoldedBackgroundHold(true);
+  }, ANTIGRAVITY_FOLDED_BACKGROUND_RECHECK_MS);
+  hold.recheckTimer.unref();
+  revokePromptReadiness();
+  idleDetector?.reset();
+  refreshBackgroundWait();
+  publishScreenStatus('working');
+}
+
+/** True keeps or invalidates the hold without running the generic ready path.
+ *  False means fresh evidence permits settlement; callers then re-drive ready. */
+function retainAntigravityFoldedBackgroundHold(quiet = false): boolean {
+  const hold = antigravityFoldedBackgroundHold;
+  if (!hold) return false;
+  const active = activeTurnAuthority.snapshot();
+  if (
+    cliSpawnGeneration !== hold.cliSpawnGeneration
+    || cliRestartInProgress
+    || webTerminalSubmitGeneration !== hold.webTerminalSubmitGeneration
+    || currentBotmuxTurnId !== hold.turnId
+    || currentBotmuxDispatchAttempt !== hold.dispatchAttempt
+    || active?.turnId !== hold.turnId
+    || active.dispatchAttempt !== hold.dispatchAttempt
+    || active.started !== true
+    || durableTurnInFlight
+    || pendingMessages.length > 0
+    || pendingRawInputs.length > 0
+    || isFlushing
+  ) {
+    cancelAntigravityFoldedReconcilePending();
+    return true;
+  }
+  if (hasAntigravityFoldedLiveHoldEvidence()) {
+    if (!quiet) {
+      if (isPromptReady) revokePromptReadiness();
+      idleDetector?.reset();
+      refreshBackgroundWait();
+      publishScreenStatus('working');
+    }
+    return true;
+  }
+  cancelAntigravityFoldedReconcilePending();
+  // The observer/timer may run while a duplicate ready is still latched. Force
+  // the full path so the settled predecessor cannot strand its queued successor.
+  revokePromptReadiness();
+  return false;
+}
+
+function driveAntigravityFoldedBackgroundHold(quiet = false): void {
+  if (retainAntigravityFoldedBackgroundHold(quiet)) return;
+  markPromptReady();
+}
+
 function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
   const pending = antigravityFoldedReconcilePending;
   if (!pending) return false;
+  // Do not fence on PTY output here: background footer redraws advance it.
+  // Spawn/turn/direct-submit identities invalidate stale work; the reconcile
+  // below always reads fresh transcript evidence for that exact identity.
   if (
     !isPromptReady
     || cliSpawnGeneration !== pending.cliSpawnGeneration
     || cliRestartInProgress
-    || ptyOutputGeneration.snapshot() !== pending.ptyOutputGeneration
-    || webTerminalInputGeneration !== pending.webTerminalInputGeneration
+    || webTerminalSubmitGeneration !== pending.webTerminalSubmitGeneration
     || currentBotmuxTurnId !== pending.currentTurnId
     || currentBotmuxDispatchAttempt !== pending.currentDispatchAttempt
     || durableTurnInFlight
@@ -10063,7 +10164,6 @@ function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
   const res = reconcileCompletedAntigravityTurnsAtPromptReady(pending.promotedTurnId);
   if (res.reconciled) {
     const promotedTurnId = pending.promotedTurnId;
-    cancelAntigravityFoldedReconcilePending();
     if (
       res.completedCurrentTurn
       && promotedTurnId
@@ -10071,31 +10171,39 @@ function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
       && currentBotmuxDispatchAttempt === undefined
       && !durableTurnInFlight
     ) {
-      const stillPendingTasks = typeof hasLiveAntigravityPendingTasks === 'function'
-        && hasLiveAntigravityPendingTasks();
-      if (!stillPendingTasks) {
-        markTurnRetired(promotedTurnId);
-        releaseActiveTurnAuthority(`prompt_ready_reconciled:${reason}`);
-        syncQueuedTurnsFromMarkerDisk();
-        if (queuedTypeAheadTurns.length > 0) {
-          advanceQueuedTypeAheadTurn(`prompt_ready_reconciled:${reason}`);
-          queuedTurnAdvanceConsumedForPrompt = undefined;
-        }
-        writeCliPidMarker();
-        if (renderer && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
-          && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
-          const { content } = renderer.snapshot();
-          send({
-            type: 'screen_update',
-            content,
-            ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
-            ...backgroundWaitPayload(),
-            ...modelRequestPayload(),
-            turnId: currentBotmuxTurnId,
-            dispatchAttempt: currentBotmuxDispatchAttempt,
-          });
-        }
+      if (hasAntigravityFoldedLiveHoldEvidence()) {
+        armAntigravityFoldedBackgroundHold(pending, promotedTurnId);
+        return true;
       }
+      cancelAntigravityFoldedReconcilePending();
+      markTurnRetired(promotedTurnId);
+      releaseActiveTurnAuthority(`prompt_ready_reconciled:${reason}`);
+      const beforeSyncTurnId = currentBotmuxTurnId;
+      const beforeSyncDispatchAttempt = currentBotmuxDispatchAttempt;
+      syncQueuedTurnsFromMarkerDisk();
+      let promotedSuccessor = beforeSyncTurnId !== currentBotmuxTurnId
+        || beforeSyncDispatchAttempt !== currentBotmuxDispatchAttempt;
+      if (queuedTypeAheadTurns.length > 0) {
+        advanceQueuedTypeAheadTurn(`prompt_ready_reconciled:${reason}`);
+        queuedTurnAdvanceConsumedForPrompt = undefined;
+        promotedSuccessor = true;
+      }
+      writeCliPidMarker();
+      if (renderer && !promotedSuccessor && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
+        && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+        const { content } = renderer.snapshot();
+        send({
+          type: 'screen_update',
+          content,
+          ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
+          ...backgroundWaitPayload(),
+          ...modelRequestPayload(),
+          turnId: currentBotmuxTurnId,
+          dispatchAttempt: currentBotmuxDispatchAttempt,
+        });
+      }
+    } else {
+      cancelAntigravityFoldedReconcilePending();
     }
     // Partial reconciliation (e.g. om_B flushed to compact before om_C): re-arm
     // within the original budget whenever sibling skew still holds on live work.
@@ -10186,8 +10294,7 @@ function armAntigravityFoldedReconcilePending(
   cancelAntigravityFoldedReconcilePending();
   const pending: AntigravityFoldedReconcilePending = {
     cliSpawnGeneration,
-    ptyOutputGeneration: ptyOutputGeneration.snapshot(),
-    webTerminalInputGeneration,
+    webTerminalSubmitGeneration,
     currentTurnId: currentBotmuxTurnId,
     currentDispatchAttempt: currentBotmuxDispatchAttempt,
     promotedTurnId,
@@ -11852,14 +11959,121 @@ let daemonCotHoldMayBeActive = false;
 let backgroundTasksTrackedForSiblings = false;
 /** Antigravity 常规模式原生页脚报告的后台任务/计时器数；与前台 activeTurnAuthority 解耦，
  *  仅经 refreshBackgroundWait 汇入 screen_update.backgroundTasks。 */
+interface AntigravityFooterTurnBaseline {
+  cliSpawnGeneration: number;
+  turnId: string;
+  dispatchAttempt: number | undefined;
+  count: number;
+  lastCount: number;
+  transcriptPath?: string;
+  transcriptOffset?: number;
+  transcriptDev?: bigint;
+  transcriptIno?: bigint;
+  observedCurrentPending: boolean;
+  sawIncrease: boolean;
+}
+let antigravityFooterTurnBaseline: AntigravityFooterTurnBaseline | undefined;
 let antigravityFooterBackgroundTasks = 0;
+
+function baselineAntigravityFooterTasksForActiveTurn(): void {
+  if (lastInitConfig?.cliId !== 'antigravity') return;
+  const active = activeTurnAuthority.snapshot();
+  if (active?.started !== true || !active.turnId) {
+    antigravityFooterTurnBaseline = undefined;
+    return;
+  }
+  const previous = antigravityFooterTurnBaseline;
+  if (previous && previous.cliSpawnGeneration === cliSpawnGeneration
+    && previous.turnId === active.turnId
+    && previous.dispatchAttempt === active.dispatchAttempt) return;
+  // Reattach/restore owns existing native work but did not start a fresh write;
+  // never baseline away the very tasks that may still need this authority.
+  if ((backend as (SessionBackend & { isReattach?: boolean }) | undefined)?.isReattach === true) {
+    antigravityFooterTurnBaseline = undefined;
+    return;
+  }
+  let count = antigravityFooterBackgroundTasks;
+  if (backend && typeof backendScreenEvidenceIsAuthoritativeForMutation === 'function'
+    && backendScreenEvidenceIsAuthoritativeForMutation()) {
+    try {
+      const parsed = parseAntigravityFooterBackgroundTasks(captureBackendScreen(backend));
+      if (parsed !== undefined) count = parsed;
+    } catch { /* Use the latest display count when a one-shot capture fails. */ }
+  }
+  let transcriptPath: string | undefined;
+  let transcriptOffset: number | undefined;
+  let transcriptDev: bigint | undefined;
+  let transcriptIno: bigint | undefined;
+  try {
+    transcriptPath = resolveLiveAntigravityTranscriptPath();
+    if (transcriptPath) {
+      const stat = statSync(transcriptPath, { throwIfNoEntry: false, bigint: true });
+      transcriptOffset = Number(stat?.size ?? 0);
+      if (!Number.isSafeInteger(transcriptOffset)) throw new Error('transcript anchor exceeds safe byte range');
+      transcriptDev = stat?.dev;
+      transcriptIno = stat?.ino;
+    }
+  } catch { /* Discovery may lag the write; absence of an anchor stays conservative. */ }
+  antigravityFooterBackgroundTasks = count;
+  antigravityFooterTurnBaseline = {
+    cliSpawnGeneration,
+    turnId: active.turnId,
+    dispatchAttempt: active.dispatchAttempt,
+    count,
+    lastCount: count,
+    transcriptPath,
+    transcriptOffset,
+    transcriptDev,
+    transcriptIno,
+    observedCurrentPending: false,
+    sawIncrease: false,
+  };
+}
+
+function noteAntigravityFooterTaskObservation(count: number): void {
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority?.snapshot?.();
+  if (!baseline || active?.started !== true
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration
+    || baseline.turnId !== active.turnId
+    || baseline.dispatchAttempt !== active.dispatchAttempt) return;
+  // Compare the latest valid samples, so 1→0→1 also proves new work. Once
+  // this turn added work, keep evidence until all tasks drain; without native
+  // task ids, a decrease alone must not guess which task finished.
+  if (count > baseline.lastCount) baseline.sawIncrease = true;
+  baseline.lastCount = count;
+}
+
+function antigravityFooterTaskEvidenceForActiveTurn(): boolean {
+  const baseline = antigravityFooterTurnBaseline;
+  // Restored/adopted turns have no new-write baseline; preserve conservative
+  // handling of work already belonging to their live native conversation.
+  if (!baseline) return true;
+  const active = activeTurnAuthority?.snapshot?.();
+  if (!active || active.started !== true
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration
+    || baseline.turnId !== active.turnId
+    || baseline.dispatchAttempt !== active.dispatchAttempt) return true;
+  return baseline.sawIncrease;
+}
 
 function observeAntigravityFooterBackgroundTasks(screen: string | undefined): void {
   if (lastInitConfig?.cliId !== 'antigravity' || !screen) return;
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
   const parsed = parseAntigravityFooterBackgroundTasks(screen);
   if (parsed === undefined) return;
+  noteAntigravityFooterTaskObservation(parsed);
   antigravityFooterBackgroundTasks = parsed;
+  const hold = parsed === 0 ? antigravityFoldedBackgroundHold : undefined;
+  if (!hold || hold.clearTimer) return;
+  // A footer clear need not write either transcript. Re-drive outside the
+  // sampler stack; all normal generation/turn fences run when the timer fires.
+  hold.clearTimer = setTimeout(() => {
+    if (antigravityFoldedBackgroundHold !== hold) return;
+    hold.clearTimer = undefined;
+    driveAntigravityFoldedBackgroundHold();
+  }, 0);
+  hold.clearTimer.unref();
 }
 
 function computeBackgroundCotHold(nowMs = Date.now()): boolean {
@@ -17526,11 +17740,44 @@ function resolveLiveAntigravityTranscriptPath(): string | undefined {
   return resolveFileBridgePath('antigravity', { sessionId: cid, pid: effectivePid });
 }
 
-/** Whether the live Antigravity turn has pending background command task(s) or
- *  subagent(s). Works both when the structured bridge is active (zero-prompt /
- *  adopt) and in ordinary `replyDelivery: 'send'` mode where the bridge does
- *  not attach. Never holds a cold/resumed idle startup with no started turn or
- *  a viewport that explicitly shows an interrupted turn. */
+/** Re-anchor only on the current turn's unique authenticated envelope in the
+ *  replacement file. A new inode or truncation must never reuse old offsets. */
+function reanchorAntigravityTurnBaseline(
+  transcriptPath: string,
+  stat: { dev: bigint; ino: bigint },
+): boolean {
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority.snapshot();
+  if (!baseline || active?.started !== true || !active.turnId
+    || baseline.turnId !== active.turnId || baseline.dispatchAttempt !== active.dispatchAttempt
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration) return false;
+  try {
+    const replay = drainAntigravityTranscript(transcriptPath, 0, {}, {});
+    if (replay.pendingTail.length > 0) return false;
+    const matches = replay.events.filter(event => {
+      if (event.kind !== 'user') return false;
+      const header = event.text.replace(/\r\n?/g, '\n').split('<user_message>', 1)[0] ?? event.text;
+      return header.match(/(?:^|\n)<message_location\b[^>]*\bmessage_id="([^"]+)"[^>]*\/>(?:\n|$)/)?.[1] === active.turnId;
+    });
+    if (matches.length !== 1) return false;
+    const prefix = `${transcriptPath}:`;
+    const uuid = matches[0]!.uuid;
+    if (!uuid.startsWith(prefix)) return false;
+    const offset = Number(uuid.slice(prefix.length));
+    if (!Number.isSafeInteger(offset) || offset < 0) return false;
+    baseline.transcriptOffset = offset;
+    baseline.transcriptDev = stat.dev;
+    baseline.transcriptIno = stat.ino;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether the live Antigravity turn still has background work. A fresh
+ *  native footer can show running commands missing from the transcript.
+ *  Never hold an explicitly interrupted turn or use the footer to hold a
+ *  cold/resumed idle startup with no started turn. */
 function hasLiveAntigravityPendingTasks(): boolean {
   if (!structuredBridgeIs('antigravity') || cliAdapter?.runnerFramedInput) return false;
   const activeTurnStarted = activeTurnAuthority.snapshot()?.started === true;
@@ -17543,6 +17790,14 @@ function hasLiveAntigravityPendingTasks(): boolean {
     try {
       const screen = captureBackendScreen(backend);
       if (screen && isAntigravityInterruptedScreen(screen)) return false;
+      // The cached footer count is for display and survives unparseable
+      // frames. Only the current viewport may veto this ready edge.
+      const footerTasks = parseAntigravityFooterBackgroundTasks(screen);
+      if (footerTasks !== undefined) {
+        noteAntigravityFooterTaskObservation(footerTasks);
+        antigravityFooterBackgroundTasks = footerTasks;
+      }
+      if (activeTurnStarted && (footerTasks ?? 0) > 0 && antigravityFooterTaskEvidenceForActiveTurn()) return true;
     } catch { /* Missing viewport is not interruption evidence. */ }
   }
   if (codexBridgeFallbackActive()) {
@@ -17553,7 +17808,43 @@ function hasLiveAntigravityPendingTasks(): boolean {
     // to a direct disk scan while the bridge has not yet attached/baselined.
     if (codexBridgeRolloutPath && codexBridgeBaselineDone) return false;
   }
-  const transcriptPath = resolveLiveAntigravityTranscriptPath();
+  const resolvedTranscriptPath = resolveLiveAntigravityTranscriptPath();
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority.snapshot();
+  const transcriptPath = resolvedTranscriptPath ?? baseline?.transcriptPath;
+  if (baseline && active?.started === true
+    && baseline.cliSpawnGeneration === cliSpawnGeneration
+    && baseline.turnId === active.turnId
+    && baseline.dispatchAttempt === active.dispatchAttempt
+    && baseline.transcriptPath && baseline.transcriptPath === transcriptPath
+    && baseline.transcriptOffset !== undefined) {
+    try {
+      const stat = statSync(transcriptPath!, { throwIfNoEntry: false, bigint: true });
+      if (!stat) return baseline.observedCurrentPending;
+      const size = Number(stat.size);
+      if (!Number.isSafeInteger(size)) return true;
+      if (stat.dev !== baseline.transcriptDev || stat.ino !== baseline.transcriptIno
+        || size < baseline.transcriptOffset) {
+        if (!reanchorAntigravityTurnBaseline(transcriptPath!, stat)) return true;
+      } else {
+        const replay = drainAntigravityTranscript(transcriptPath!, baseline.transcriptOffset, {}, {});
+        if (replay.pendingTail.length > 0) return true;
+        // No explicit user input after this write's byte anchor means the old
+        // RUNNING tail cannot belong to the newly started turn. Once current
+        // pending was observed, losing that user proof is instead inconclusive.
+        if (!replay.events.some(event => event.kind === 'user')) {
+          if (baseline.observedCurrentPending) return true;
+          baseline.observedCurrentPending = false;
+          return false;
+        }
+      }
+      const pending = hasAntigravityTranscriptPendingTasks(transcriptPath!);
+      baseline.observedCurrentPending = pending;
+      return pending;
+    } catch {
+      return true;
+    }
+  }
   return !!transcriptPath && hasAntigravityTranscriptPendingTasks(transcriptPath);
 }
 
@@ -22391,6 +22682,7 @@ let tuiPromptBlocking = false;
 /** One composed status projection shared by the immediate screen path,
  * periodic text updates, and screenshot uploads. */
 function projectedRuntimeScreenStatus(): RuntimeScreenStatus {
+  if (antigravityFoldedBackgroundHold) return 'working';
   return zcodeProgressStatus(codexAppLivenessStatus(projectRuntimeScreenStatus({
     promptReady: isPromptReady,
     analyzing: false,
@@ -24493,7 +24785,7 @@ function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispat
 
 /** One answer input into the current CLI, serialized with other terminal
  *  writes; false when the backend changed or refused it. */
-async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, expected?: TraexQuestionPage): Promise<boolean> {
+async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, expected?: TraexQuestionPage, final = false): Promise<boolean> {
   const target = backend;
   const lifetime = cliLifetimeNonce;
   if (!target || cliRestartInProgress || nativeSessionForkPending()) return false;
@@ -24510,11 +24802,15 @@ async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, e
           if (!page || traexQuestionSignature(page) !== traexQuestionSignature(expected)
             || traexQuestionState(page) !== traexQuestionState(expected)) return false;
         }
+        if (final && expected?.delivery === 'async' && !prepareTraexNativeAnswer()) return false;
         invalidatePromptReadinessEvidence();
-        return write(readinessTrackedInput(adapterInputHandle(target))) !== false;
+        const written = write(readinessTrackedInput(adapterInputHandle(target))) !== false;
+        if (final && traexNativeAnswerSubmission) traexNativeAnswerSubmission.written = written;
+        return written;
       },
     );
   } catch (err: any) {
+    if (final && traexNativeAnswerSubmission) traexNativeAnswerSubmission.written = false;
     log(`TraeX question answer write failed: ${err?.message ?? err}`);
     return false;
   }
@@ -24552,6 +24848,79 @@ async function traexQuestionOpenPending(known?: TraexQuestionPage): Promise<bool
   }
 }
 
+type TraexNativeAnswerInput = Extract<DaemonToWorker, { type: 'message' }>;
+const traexNativeAnswerAdmissions = new Map<string, (input?: TraexNativeAnswerInput) => void>();
+const traexNativeAnswerInputs = new WeakMap<AskResult, TraexNativeAnswerInput>();
+let traexNativeAnswerSubmission: { input: TraexNativeAnswerInput; prepared: boolean; written?: boolean } | undefined;
+
+function prepareTraexNativeAnswer(): boolean {
+  const submission = traexNativeAnswerSubmission;
+  if (!submission || submission.prepared) return true;
+  const input = submission.input;
+  const typeAhead = !!currentBotmuxTurnId && currentBotmuxTurnId !== input.turnId
+    && !turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
+  if ((!typeAhead && !reserveActiveTurn(input)) || (workerSessionEventScope && !workerSessionEventScope.canSubmit(input.turnId, input.dispatchAttempt))) return false;
+  workerSessionEventScope?.enterTurn(input.turnId, input.dispatchAttempt);
+  const item: PendingCliInput = { ...input, noReplay: true };
+  if (typeAhead && input.turnId) {
+    queuedTypeAheadTurns.push({ turnId: input.turnId, dispatchAttempt: input.dispatchAttempt,
+      linkRefMode: input.linkRefMode, trustedCaller: input.trustedCaller, trustedController: input.trustedController,
+      turnCallerOpenId: input.turnCallerOpenId ?? input.trustedCaller?.requestUserOpenId });
+  } else {
+    renderer?.markNewTurn();
+    usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+    setCaptureIdentity(input.turnId, input.dispatchAttempt, input.turnCallerOpenId ?? input.trustedCaller?.requestUserOpenId);
+    currentBotmuxLinkRefMode = input.linkRefMode;
+    markActiveTurnStarted(input);
+  }
+  workerSessionEventScope?.recordSubmission(input.turnId, input.dispatchAttempt);
+  inflightInputs.onWrite(item);
+  noteCliInputWritten(item);
+  writeCliPidMarker();
+  publishSandboxRelayCapability();
+  const turnId = codexBridgeMarkPendingTurn(input.content, input.turnId, input.dispatchAttempt, Date.now(), input.linkRefMode);
+  if (turnId) codexBridgeQueue.beginSubmitVerification(turnId, undefined, input.dispatchAttempt);
+  markTurnExecutionStart(input.turnId, input.dispatchAttempt);
+  traexAutoModelTurnReplayForbidden = true;
+  submission.prepared = true;
+  return true;
+}
+
+async function runTraexNativeAnswer(
+  page: TraexQuestionPage,
+  result: AskResult | undefined,
+  write: () => Promise<boolean | undefined>,
+  admittedInput?: TraexNativeAnswerInput,
+): Promise<void> {
+  const input = admittedInput ?? (result ? traexNativeAnswerInputs.get(result) : undefined);
+  if (page.delivery !== 'async') { await write(); return; }
+  if (!input) throw new Error('Native question answer admission unavailable');
+  if (result) traexNativeAnswerInputs.delete(result);
+  const submission = { input, prepared: false, written: undefined as boolean | undefined };
+  const run = async (): Promise<void> => {
+    traexNativeAnswerSubmission = submission;
+    try {
+      await write();
+    } finally {
+      if (traexNativeAnswerSubmission === submission) traexNativeAnswerSubmission = undefined;
+      if (!submission.prepared || submission.written === false) {
+        if (input.turnId) {
+          codexBridgeQueue.dropPendingTurn(input.turnId, input.dispatchAttempt, true);
+          inflightInputs.retireTurn(input.turnId);
+          releaseActiveTurnAuthority('native_question_not_submitted', { turnId: input.turnId, dispatchAttempt: input.dispatchAttempt });
+          emitTurnTerminal(input.turnId, 'failed', 'native_question_not_submitted', input.dispatchAttempt);
+        }
+      } else if (input.turnId) {
+        codexBridgeQueue.finishSubmitVerification(input.turnId, undefined, input.dispatchAttempt);
+        codexBridgeDrainAndMaybeEmit();
+      }
+    }
+  };
+  const binding = workerSessionEventScope?.currentBinding();
+  if (binding && workerSessionEventScope) await workerSessionEventScope.run(binding, run, input.sessionCommand?.execution);
+  else await run();
+}
+
 const traexQuestionBridge = new TraexQuestionBridge({
   now: () => Date.now(),
   setTimer: (fn, ms) => {
@@ -24566,24 +24935,60 @@ const traexQuestionBridge = new TraexQuestionBridge({
   openPending: traexQuestionOpenPending,
   mayOpenPending: traexQuestionMayOpenPending,
   // The same daemon ask broker (and card) as the RPC path's native questions.
-  ask: (question, signal, page) => {
+  ask: async (question, signal, page) => {
     const cfg = lastInitConfig;
     if (!cfg) return Promise.reject(new Error('session not initialised'));
-    return postCodexAsk({
-      sessionId: cfg.sessionId,
-      larkAppId: cfg.larkAppId,
-      chatId: cfg.chatId,
-      rootMessageId: cfg.rootMessageId,
-      originTurnId: currentBotmuxTurnId,
-      originDispatchAttempt: currentBotmuxDispatchAttempt,
-      ...(page?.delivery === 'async' ? { standalone: true } : {}),
-    }, [question], signal);
+    const requestId = page?.delivery === 'async' ? randomUUID() : undefined;
+    let admittedInput: TraexNativeAnswerInput | undefined;
+    let answerHandedOff = false;
+    let resolveAdmission: ((input?: TraexNativeAnswerInput) => void) | undefined;
+    const admitted = requestId ? new Promise<TraexNativeAnswerInput | undefined>(resolve => {
+      resolveAdmission = input => { if (input) admittedInput = input; resolve(input); };
+    }) : undefined;
+    const abort = () => resolveAdmission?.();
+    if (requestId) {
+      traexNativeAnswerAdmissions.set(requestId, resolveAdmission!);
+      signal.addEventListener('abort', abort, { once: true });
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await postCodexAsk({
+        sessionId: cfg.sessionId,
+        larkAppId: cfg.larkAppId,
+        chatId: cfg.chatId,
+        rootMessageId: cfg.rootMessageId,
+        originTurnId: currentBotmuxTurnId,
+        originDispatchAttempt: currentBotmuxDispatchAttempt,
+        ...(requestId ? { requestId } : {}),
+        ...(page?.delivery === 'async' ? { standalone: true } : {}),
+      }, [question], signal);
+      if (result.kind === 'answered' && admitted) {
+        timer = setTimeout(abort, 30_000);
+        timer.unref?.();
+        const input = await admitted;
+        if (!input) throw new Error('Native question answer admission unavailable');
+        traexNativeAnswerInputs.set(result, input);
+        answerHandedOff = true;
+      }
+      return result;
+    } finally {
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+      if (requestId) traexNativeAnswerAdmissions.delete(requestId);
+      // The daemon can commit the native answer before its HTTP response returns.
+      // If abort or transport failure prevents the bridge handoff, retire it through
+      // the same answer lifecycle without writing to a withdrawn question page.
+      if (page && admittedInput && !answerHandedOff) {
+        await runTraexNativeAnswer(page, undefined, async () => false, admittedInput);
+      }
+    }
   },
+  runAnswer: runTraexNativeAnswer,
   writeKey: (key, expected) => traexQuestionWrite(target => {
     if (target.sendSpecialKeys) return target.sendSpecialKeys(key);
     target.write(KEY_TO_ANSI[key] ?? key);
     return true;
-  }, expected),
+  }, expected, key === 'Enter'),
   paste: (text, expected) => traexQuestionWrite(target => {
     if (target.pasteText) target.pasteText(text);
     else target.write(wrapBracketedPaste(text));
@@ -27906,6 +28311,7 @@ function markPromptReady(): void {
     schedulePostTerminalFenceRecheck('prompt-ready deferred by fence');
     return;
   }
+  if (antigravityFoldedBackgroundHold && retainAntigravityFoldedBackgroundHold()) return;
   if (isPromptReady) {
     stopStructuredStartGraceRecheck();
     if (typeof antigravityFoldedReconcilePending !== 'undefined'
@@ -28165,8 +28571,13 @@ function markPromptReady(): void {
   judgeClaudeBridgeTurn();
   bridgeQueue.cliQueueDrained();
   settleSessionRenameOnPrompt();
+  const beforeSyncTurnId = currentBotmuxTurnId;
+  const beforeSyncDispatchAttempt = currentBotmuxDispatchAttempt;
   const syncedFromDisk = syncQueuedTurnsFromMarkerDisk();
+  let advancedQueuedTurn = beforeSyncTurnId !== currentBotmuxTurnId
+    || beforeSyncDispatchAttempt !== currentBotmuxDispatchAttempt;
   if (readyTransition(syncedFromDisk).advanceQueuedTurn) {
+    advancedQueuedTurn = true;
     advanceQueuedTypeAheadTurn('prompt_ready');
   }
   queuedTurnAdvanceConsumedForPrompt = undefined;
@@ -28271,7 +28682,7 @@ function markPromptReady(): void {
     observeAntigravityFooterBackgroundTasks(renderer?.rawSnapshot() || lastAnalyzerSnapshot);
   }
   refreshBackgroundWait();
-  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  if (renderer && !advancedQueuedTurn && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',
@@ -28333,7 +28744,9 @@ function markPromptReady(): void {
       log(backgroundTaskTracker.pendingTurnAgents() > 0
         ? `Idle prompt while ${backgroundTaskTracker.pendingTurnAgents()} background agent(s) pending — reporting working until their completion notification arrives`
         : 'Idle prompt while Antigravity background task(s)/subagent(s) pending — reporting working until completion notification arrives');
-    } else {
+    } else if (!advancedQueuedTurn) {
+      // A promoted folded successor owns the next working episode; never attach
+      // the predecessor's idle completion frame to its new turn identity.
       publishScreenStatus('idle');
     }
   } else if (hasPendingWork) {
@@ -28362,6 +28775,7 @@ function persistCliSessionId(cliSessionId: string): void {
   inputDeliveryObservedCliSessionId = cliSessionId;
   if (lastInitConfig?.cliId === 'antigravity' && previousCliSessionId && previousCliSessionId !== cliSessionId) {
     antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
     refreshBackgroundWait();
   }
   const published = publishCliSessionIdToDaemon({
@@ -32527,6 +32941,7 @@ function stopScreenUpdates(): void {
   if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   lastAnalyzerSnapshot = '';
   antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
   cancelAntigravityFoldedReconcilePending();
 }
 
@@ -33603,6 +34018,7 @@ async function spawnCliBody(
   daemonCotHoldMayBeActive = false;
   backgroundTasksTrackedForSiblings = false;
   antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
   bridgeQueue?.resetBackgroundTasks?.();
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(homedir(), '.botmux', 'data');
@@ -47694,7 +48110,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         && msg.dispatchAttempt === undefined
         // ordinary-turn 前缀族（om_ / bmx-recovery- / board: 决策看板批次）共用一套
         // 收到/提交去重；board: 的 id 按批次稳定，重投/补投是同一个回合。
-        && isOrdinaryImTurnId(msg.turnId)
+        && (isOrdinaryImTurnId(msg.turnId) || msg.nativeQuestionAnswer !== undefined)
         ? msg.turnId
         : undefined;
       if (ordinaryImTurnId) {
@@ -47783,6 +48199,17 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ...(active?.caller ? { activeCaller: active.caller } : {}),
             ...(active?.controller ? { activeController: active.controller } : {}),
           });
+        }
+        break;
+      }
+      if (msg.nativeQuestionAnswer) {
+        const admit = traexNativeAnswerAdmissions.get(msg.nativeQuestionAnswer.requestId);
+        if (admit) {
+          traexNativeAnswerAdmissions.delete(msg.nativeQuestionAnswer.requestId);
+          admit(msg);
+          acknowledgeTurnInputCommitted(msg.turnId, msg.dispatchAttempt, msg.durablePrimaryInbox);
+        } else if (msg.turnId) {
+          emitTurnTerminal(msg.turnId, 'cancelled', 'native_question_no_longer_pending', msg.dispatchAttempt);
         }
         break;
       }

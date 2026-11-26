@@ -196,6 +196,10 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     // chaining only guards nullish VALUES, not an identifier missing from a
     // bare `with(scope)` object); the sandbox leaf path has its own suite.
     refreshSandboxedCliLeafAttestation: undefined,
+    // AGY folded background hold (worker.ts module-level let). The rework reads
+    // it at the top of markPromptReady; undefined keeps the `hold && ...` guard
+    // false and short-circuits before the retain helper is referenced.
+    antigravityFoldedBackgroundHold: undefined,
     stopBusyPatternIdleProbe: vi.fn(), readyGate: { shouldHold: () => false },
     // markPromptReady's busy-deferral bookkeeping (worker.ts module-level
     // symbols in the real process): this fixture asserts lifecycle/release

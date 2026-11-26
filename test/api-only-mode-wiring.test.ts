@@ -497,7 +497,7 @@ describe('source-structure guards (no injectable seam)', () => {
       ['larkAppId', 'sourceOpenId', 'undefined', 'false', 'sourceTurnId'],
     ]);
     const inbound = allCalls.filter(args => args[4] !== 'sourceTurnId');
-    expect(inbound).toHaveLength(6);
+    expect(inbound).toHaveLength(7);
     // The card-click entry has no platform sender_type. It must pass the
     // card-click predicate (peer cross-ref, identity-cache bot/app, and the
     // three union-id bot tables) rather than a literal false, which would
@@ -515,7 +515,7 @@ describe('source-structure guards (no injectable seam)', () => {
     expect(predicate).toContain('isPlatformTeamBot(');
     expect(predicate).toContain('isTrustedSameOwnerSiblingBot(');
     const humanEntries = inbound.filter(args => !/cardClickOperatorIsBotOrApp\(/.test(args[3] ?? ''));
-    expect(humanEntries).toHaveLength(5);
+    expect(humanEntries).toHaveLength(6);
     // Three inline IM entries (new topic, principal-lane proposer, thread
     // reply) name parsed.senderType and the cross-ref foreign-bot leg at the
     // call site. The (?!false) lookahead rejects downgrading any single site
@@ -528,7 +528,7 @@ describe('source-structure guards (no injectable seam)', () => {
     // The queue and ask sites forward a tri-state value computed earlier in
     // the same frame; pin the local names so a boolean literal goes red.
     const precomputedEntries = humanEntries.filter(args => !args.some(a => /\bparsed\.senderType\b/.test(a)));
-    expect(precomputedEntries).toHaveLength(2);
+    expect(precomputedEntries).toHaveLength(3);
     for (const args of precomputedEntries) {
       expect(args[3], args.join(', ')).toMatch(/^(?:senderIsBot|byType)$/);
     }
