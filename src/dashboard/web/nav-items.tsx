@@ -139,6 +139,32 @@ export const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }
 ];
 
 /**
+ * 侧边栏鉴权可见性的纯判定。app.tsx 持有模块级登录态且 import 即有 DOM 启动副作用，
+ * 无法直接单测，故把判定抽到这个无副作用模块。
+ */
+
+/**
+ * manage 项只在 /api/settings 明确回答登录态、且当前是 owner 时可见。
+ * 登录态未知时 isAuthed 的默认值 true 不可信（见 app.tsx authStateKnown 注释），
+ * 探测失败期间宁可不展示管理入口，也不给只读访客露出会 401 的页面。
+ */
+export function isManageNavAllowed(authStateKnown: boolean, isAuthed: boolean): boolean {
+  return authStateKnown && isAuthed;
+}
+
+/**
+ * 决策看板入口可见性：owner 在尚未配置管家时也允许看到入口（页面本身是引导配置的空态）；
+ * 登录态未知、或明确的只读访客都不显示。已经探测到管家看板的历史路径保持不变。
+ */
+export function isDecisionBoardNavVisible(input: {
+  authStateKnown: boolean;
+  isAuthed: boolean;
+  stewardBoardExists: boolean;
+}): boolean {
+  return (input.authStateKnown && input.isAuthed) || input.stewardBoardExists;
+}
+
+/**
  * 不在侧边栏、但有独立地址的页面 / 页内 tab，⌘K 照样收录。父项在侧边栏里不可见（没权限、
  * 客户端壳过滤）时子页面也不收录；客户端壳会重定向走的地址同样跳过（见 app.tsx paletteNavPages）。
  */

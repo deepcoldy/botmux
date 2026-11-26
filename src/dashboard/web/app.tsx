@@ -62,7 +62,14 @@ import {
   parseWorkbenchCapabilities,
 } from './agent-workbench-capabilities.js';
 import { isMacLike, isPaletteHotkey, paletteShortcutLabel } from './command-palette-model.js';
-import { NAV_GROUPS, NAV_ITEMS, NAV_SUBPAGES, type NavItem } from './nav-items.js';
+import {
+  NAV_GROUPS,
+  NAV_ITEMS,
+  NAV_SUBPAGES,
+  isDecisionBoardNavVisible,
+  isManageNavAllowed,
+  type NavItem,
+} from './nav-items.js';
 import { FeatureCatalogModal, WorkspaceGuideBanner } from './workspace-catalog.js';
 import {
   CORE_NAV_IDS,
@@ -209,7 +216,9 @@ function sidebarNavItems(): NavItem[] {
     if (item.id === 'terminal') return !clientShell && ui.hostTerminal;
     // Owners can discover these pages before setting them up. Scoped identities
     // retain the existing access check for the decision board.
-    if (item.id === 'decision-board') return (authStateKnown && isAuthed) || decisionBoardNavVisible;
+    if (item.id === 'decision-board') {
+      return isDecisionBoardNavVisible({ authStateKnown, isAuthed, stewardBoardExists: decisionBoardNavVisible });
+    }
     return true;
   });
   if (pinnedPluginNavItems.length === 0) return builtInItems;
@@ -223,7 +232,7 @@ function sidebarNavItems(): NavItem[] {
 }
 
 function permittedSidebarNavItems(): NavItem[] {
-  return sidebarNavItems().filter(item => (authStateKnown && isAuthed) || !item.manage);
+  return sidebarNavItems().filter(item => isManageNavAllowed(authStateKnown, isAuthed) || !item.manage);
 }
 
 /** ⌘K 面板的「页面」条目：与侧边栏同一份可见性（权限 / 客户端壳 / pinned 插件）。 */

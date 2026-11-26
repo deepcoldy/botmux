@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { NAV_GROUPS, NAV_ITEMS } from '../src/dashboard/web/nav-items.js';
+import {
+  NAV_GROUPS,
+  NAV_ITEMS,
+  isDecisionBoardNavVisible,
+  isManageNavAllowed,
+} from '../src/dashboard/web/nav-items.js';
 
 /**
  * 侧边栏导航有两处真相源：`NAV_ITEMS` 定义每一项，`NAV_GROUPS` 决定分组与
@@ -21,5 +26,27 @@ describe('dashboard sidebar nav grouping', () => {
     expect(orphans, `nav items missing from the sidebar menu: ${orphans.join(', ')}`).toEqual([]);
     const ghosts = [...grouped].filter(id => !ids.has(id));
     expect(ghosts, `NAV_GROUPS references unknown ids: ${ghosts.join(', ')}`).toEqual([]);
+  });
+});
+
+describe('dashboard sidebar auth visibility predicates', () => {
+  it('hides manage entries until the auth probe explicitly confirms an owner', () => {
+    // 探测未完成时 isAuthed 的默认 true 不可信，不能据此展示管理入口。
+    expect(isManageNavAllowed(false, true)).toBe(false);
+    expect(isManageNavAllowed(false, false)).toBe(false);
+    expect(isManageNavAllowed(true, true)).toBe(true);
+    expect(isManageNavAllowed(true, false)).toBe(false);
+  });
+
+  it('lets owners discover the decision board without a steward but keeps guests out', () => {
+    // 登录态未知：哪怕 isAuthed 默认 true，也不提前露出入口。
+    expect(isDecisionBoardNavVisible({ authStateKnown: false, isAuthed: true, stewardBoardExists: false })).toBe(false);
+    // owner 已确认、还没配管家：允许发现，页面本身是引导配置空态。
+    expect(isDecisionBoardNavVisible({ authStateKnown: true, isAuthed: true, stewardBoardExists: false })).toBe(true);
+    // 明确的只读访客：不显示。
+    expect(isDecisionBoardNavVisible({ authStateKnown: true, isAuthed: false, stewardBoardExists: false })).toBe(false);
+    // 已探测到管家看板的历史路径保持不变。
+    expect(isDecisionBoardNavVisible({ authStateKnown: false, isAuthed: false, stewardBoardExists: true })).toBe(true);
+    expect(isDecisionBoardNavVisible({ authStateKnown: true, isAuthed: false, stewardBoardExists: true })).toBe(true);
   });
 });
