@@ -213,5 +213,22 @@ describe('readConfiguredBotCount', () => {
 
     writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_retired', larkAppSecret: 's', cliId: 'gemini' }]));
     expect(readConfiguredBotCount(botsPath)).toBe(1);
+
+    // Roster validation must retain cliId/backendType; dropping them falsely
+    // rejects a pool that the real daemon loader accepts.
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'cli_codex_pool',
+      larkAppSecret: 's',
+      cliId: 'codex',
+      backendType: 'tmux',
+      codexInstancePool: {
+        enabled: true,
+        scope: 'ordinary-feishu',
+        strategy: 'random',
+        defaultInstanceId: 'default',
+        instances: [{ id: 'default', codexHome: join(tmpDir, 'codex-default') }],
+      },
+    }]));
+    expect(readConfiguredBotCount(botsPath)).toBe(1);
   });
 });

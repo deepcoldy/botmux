@@ -306,7 +306,7 @@ describe('Dashboard bot onboarding HTTP route', () => {
     }
   });
 
-  it('supports POST /api/bot-onboarding/:id/cancel and respects custom BOTS_CONFIG in GET /api/settings', () => {
+  it('supports cancellation and uses custom BOTS_CONFIG for both settings and real manual onboarding writes', () => {
     const home = mkdtempSync(join(tmpdir(), 'botmux-onboarding-cancel-route-'));
     const botmuxDir = join(home, '.botmux');
     const dataDir = join(botmuxDir, 'data');
@@ -319,12 +319,21 @@ describe('Dashboard bot onboarding HTTP route', () => {
       writeFileSync(join(botmuxDir, '.data-dir'), dataDir, { mode: 0o600 });
 
       const child = spawnSyncTsEvalWithRepoImports(`
-        import { readFileSync } from 'node:fs';
+        import { existsSync, readFileSync } from 'node:fs';
         import { homedir } from 'node:os';
         import { join } from 'node:path';
         import { loopbackFetch } from './src/core/loopback-fetch.js';
         import { loadOrCreatePersistedToken } from './src/dashboard/auth.js';
         import { BotOnboardingManager } from './src/dashboard/bot-onboarding.js';
+
+        const originalStart = BotOnboardingManager.prototype.start;
+        BotOnboardingManager.prototype.start = function (input) {
+          // Keep the real manager persistence path while replacing only network/live hooks.
+          this.validateCredentials = async () => ({ ok: true });
+          this.detectUnusableOwners = async () => [];
+          this.startBotLive = async () => ({ ok: true });
+          return originalStart.call(this, input);
+        };
 
         BotOnboardingManager.prototype.cancel = function (id) {
           if (id === 'active-job') return { ok: true, job: { id, status: 'failed', error: 'cancelled' } };
@@ -358,8 +367,41 @@ describe('Dashboard bot onboarding HTTP route', () => {
           return { status: r.status, body: await r.json() };
         };
 
+        const manualStartRes = await loopbackFetch(origin + '/api/bot-onboarding/start', {
+          method: 'POST',
+          headers: { ...headers, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            registrationMode: 'manual',
+            appId: 'cli_custommanual',
+            appSecret: 'custom-secret',
+            owner: 'owner@example.com',
+            cliId: 'mira',
+            workingDir: homedir(),
+            dirMode: 'fixed',
+          }),
+          signal: AbortSignal.timeout(3_000),
+        });
+        const manualStartBody = await manualStartRes.json();
+        const manualId = manualStartBody.job?.id;
+        let manualJob = manualStartBody.job;
+        const manualDeadline = Date.now() + 5_000;
+        while (manualId && !['completed', 'failed'].includes(manualJob?.status) && Date.now() < manualDeadline) {
+          await new Promise(resolve => setTimeout(resolve, 20));
+          const jobRes = await loopbackFetch(origin + '/api/bot-onboarding/' + manualId, { headers, signal: AbortSignal.timeout(3_000) });
+          manualJob = (await jobRes.json()).job;
+        }
+        const customAfter = JSON.parse(readFileSync(process.env.BOTS_CONFIG, 'utf8'));
+        const settingsAfterRes = await loopbackFetch(origin + '/api/settings', { headers, signal: AbortSignal.timeout(3_000) });
+        const settingsAfter = await settingsAfterRes.json();
+
         console.log('CANCEL_AND_SETTINGS=' + JSON.stringify({
           configuredBotCount: settingsBody.configuredBotCount,
+          manualStatus: manualStartRes.status,
+          manualBody: manualStartBody,
+          manualJobStatus: manualJob?.status,
+          customAppIds: customAfter.map(bot => bot.larkAppId),
+          configuredBotCountAfter: settingsAfter.configuredBotCount,
+          defaultConfigExists: existsSync(join(homedir(), '.botmux', 'bots.json')),
           cancelActive: await cancelCall('active-job'),
           cancelDone: await cancelCall('done-job'),
           cancelMissing: await cancelCall('missing-job'),
@@ -389,6 +431,11 @@ describe('Dashboard bot onboarding HTTP route', () => {
       const parsed = JSON.parse(line!.slice(prefix.length));
       // Default ~/.botmux/bots.json does not exist, yet custom BOTS_CONFIG has 1 bot -> must return 1.
       expect(parsed.configuredBotCount).toBe(1);
+      expect(parsed.manualStatus, JSON.stringify(parsed.manualBody)).toBe(202);
+      expect(parsed.manualJobStatus).toBe('completed');
+      expect(parsed.customAppIds).toEqual(['local_custom_1', 'cli_custommanual']);
+      expect(parsed.configuredBotCountAfter).toBe(2);
+      expect(parsed.defaultConfigExists).toBe(false);
       expect(parsed.cancelActive).toMatchObject({ status: 200, body: { ok: true, job: { id: 'active-job', error: 'cancelled' } } });
       expect(parsed.cancelDone).toMatchObject({ status: 409, body: { ok: false, error: 'already_completed' } });
       expect(parsed.cancelMissing).toMatchObject({ status: 404, body: { ok: false, error: 'unknown_onboarding_job' } });

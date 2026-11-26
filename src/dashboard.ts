@@ -486,7 +486,7 @@ const dashboardAutostart = createDashboardAutostartController({
 /** Per-daemon budget for the cross-daemon insight overview fan-out — bounds
  *  aggregate latency when one daemon's insight parse is slow or hung. */
 const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
-const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
+const BOTS_JSON_PATH = resolveBotsConfigFile();
 const queryDashboardUsage = createUsageAnalytics();
 const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
@@ -5314,7 +5314,7 @@ const server = createServer(async (req, res) => {
         // 那里进来的机器主人和协管者都解析成 legacy 身份，能看到。
         hostTerminal: legacyAuthed,
         bound: readPlatformBinding() !== null,
-        ...(authed ? { configuredBotCount: readConfiguredBotCount(getLoadedConfigPath() ?? resolveBotsConfigFile()) } : {}),
+        ...(authed ? { configuredBotCount: readConfiguredBotCount(BOTS_JSON_PATH) } : {}),
       });
     }
     if (req.method === 'PUT' && url.pathname === '/api/settings') {

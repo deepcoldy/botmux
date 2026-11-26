@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { FileLockTimeoutError, withFileLock } from '../utils/file-lock.js';
+import { withFileLock } from '../utils/file-lock.js';
 import {
   captureFleetProcessIdentity,
   fleetProcessIdentityRuntime,
@@ -234,12 +234,10 @@ export function createDesktopHostLeaseRegistry(
       if (!identity || disposed || !existsSync(botmuxHome)) return false;
       try {
         return await withFileLock(lockTarget, async () => writeSelfLeaseUnlocked(identity), { maxWaitMs: lockMaxWaitMs });
-      } catch (err) {
-        if (err instanceof FileLockTimeoutError) {
-          // Do not stall host startup on a slow unrelated fleet operation; still
-          // publish our lease so subsequent stop --if-empty sees us.
-          return writeSelfLeaseUnlocked(identity);
-        }
+      } catch {
+        // Never publish an unfenced lease. If the fleet lock is busy, the caller
+        // must retry registration before adopting; an unlocked lease can appear
+        // after an exiting host's locked check and still lose the stop race.
         return false;
       }
     })().finally(() => {

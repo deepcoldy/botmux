@@ -52,7 +52,10 @@ export function validateBotConfigEntries(parsed: unknown): BotConfigValidationRe
     return { ok: true, count: 0 };
   }
 
-  const activeForRoster: Array<{ larkAppId: string; codexInstancePool?: ReturnType<typeof normalizeCodexInstancePool> }> = [];
+  const activeForRoster: Array<Record<string, any> & {
+    larkAppId: string;
+    codexInstancePool?: ReturnType<typeof normalizeCodexInstancePool>;
+  }> = [];
 
   try {
     for (let i = 0; i < parsed.length; i += 1) {
@@ -255,7 +258,9 @@ export function validateBotConfigEntries(parsed: unknown): BotConfigValidationRe
         parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy);
       }
 
-      activeForRoster.push({ larkAppId: entry.larkAppId, codexInstancePool });
+      // Roster validation normalizes the pool again; preserve the complete entry so
+      // cliId/backendType and all exclusion fields match the real daemon loader.
+      activeForRoster.push({ ...entry, larkAppId: entry.larkAppId, codexInstancePool });
     }
 
     validateCodexInstanceRoster(activeForRoster as any);

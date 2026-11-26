@@ -123,7 +123,7 @@ async function bootstrap(): Promise<void> {
   });
   const hostLease = createDesktopHostLeaseRegistry(paths.botmuxHome);
   activeHostLease = hostLease;
-  await hostLease.ensureRegistered();
+  const initialLeaseRegistered = await hostLease.ensureRegistered();
   if (quitting) return;
 
   const zeroBotLifecycle = createZeroBotLifecycle({
@@ -135,8 +135,8 @@ async function bootstrap(): Promise<void> {
     warn: message => console.warn(`[desktop] ${message}`),
   });
   // If a prior Electron session crashed abnormally while leaving an app-owned
-  // 0-bot onboarding supervisor alive, adopt it now so normal Quit reaps it.
-  zeroBotLifecycle.adoptRunningZeroBot();
+  // 0-bot onboarding supervisor alive, adopt it only after holding a fenced lease.
+  if (initialLeaseRegistered) zeroBotLifecycle.adoptRunningZeroBot();
   activeZeroBotLifecycle = zeroBotLifecycle;
   const runtime = zeroBotLifecycle.runtime;
 
@@ -171,8 +171,8 @@ async function bootstrap(): Promise<void> {
   })
     .then(async outcome => {
       if (quitting) return;
-      await hostLease.ensureRegistered();
-      if (!quitting && outcome === 'skipped') {
+      const leaseRegistered = await hostLease.ensureRegistered();
+      if (!quitting && outcome === 'skipped' && leaseRegistered) {
         zeroBotLifecycle.adoptRunningZeroBot();
       }
     })

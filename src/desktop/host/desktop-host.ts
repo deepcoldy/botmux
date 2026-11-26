@@ -548,7 +548,10 @@ export async function runDesktopHost(): Promise<void> {
           // so an exiting prior host cannot stop it underneath us.
           await hostLease.ensureRegistered();
           if (closing) return;
-          if (!zeroBotLifecycle.adoptRunningZeroBot()) {
+          const leaseRegistered = await hostLease.ensureRegistered();
+          if (closing) return;
+          const adopted = leaseRegistered && zeroBotLifecycle.adoptRunningZeroBot();
+          if (!adopted) {
             initialState = await runtime.getState();
             if (closing) return;
           }

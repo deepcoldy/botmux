@@ -1911,7 +1911,11 @@ export async function automateOpenPlatformSetup(
     };
   }
 
-  const postJson = async (path: string, body?: unknown, options: OpenPlatformPostOptions = {}): Promise<unknown> => {
+  const postJson = async (path: string, body?: unknown, requestOptions: OpenPlatformPostOptions = {}): Promise<unknown> => {
+    const signal = requestOptions.signal && options.signal && requestOptions.signal !== options.signal
+      ? AbortSignal.any([requestOptions.signal, options.signal])
+      : requestOptions.signal ?? options.signal;
+    throwIfAborted(signal);
     const url = `${apiOrigin}${path}`;
     const response = await session.fetchRaw(fetcher, url, {
       method: 'POST',
@@ -1923,7 +1927,7 @@ export async function automateOpenPlatformSetup(
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-      ...(options.signal ? { signal: options.signal } : {}),
+      ...(signal ? { signal } : {}),
     });
     let data: any;
     try {
@@ -2736,8 +2740,8 @@ export interface OpenPlatformApiClient {
    * 与 GET/HEAD 同权享受完整的瞬态错误退避重试，且**预算只在 fetchRaw 这一层**
    * —— 调用方不要再在外面套第二轮 retry，那会与内层相乘（实测 3×3=9 次）。
    */
-  postJsonIdempotent(path: string, body?: unknown): Promise<unknown>;
-  postForm(path: string, body: FormData): Promise<unknown>;
+  postJsonIdempotent(path: string, body?: unknown, options?: OpenPlatformPostOptions): Promise<unknown>;
+  postForm(path: string, body: FormData, options?: OpenPlatformPostOptions): Promise<unknown>;
 }
 
 export type OpenPlatformClientResult =
@@ -2751,9 +2755,10 @@ export type OpenPlatformClientResult =
  */
 export async function createOpenPlatformApiClient(
   cookies: StoredCookie[],
-  opts: { fetchImpl?: typeof fetch } = {},
+  opts: { fetchImpl?: typeof fetch; signal?: AbortSignal } = {},
 ): Promise<OpenPlatformClientResult> {
   const fetcher = opts.fetchImpl ?? fetch;
+  const defaultSignal = opts.signal;
   const session = new MutableCookieJar(cookies);
   let csrfToken: string | null = null;
   let apiOrigin = 'https://open.feishu.cn';
@@ -2779,6 +2784,10 @@ export async function createOpenPlatformApiClient(
   const request = async (
     path: string, body?: BodyInit, contentType?: string, opts: { idempotent?: boolean; signal?: AbortSignal } = {},
   ): Promise<unknown> => {
+    const signal = opts.signal && defaultSignal && opts.signal !== defaultSignal
+      ? AbortSignal.any([opts.signal, defaultSignal])
+      : opts.signal ?? defaultSignal;
+    throwIfAborted(signal);
     const url = `${apiOrigin}${path}`;
     const response = await session.fetchRaw(fetcher, url, {
       method: 'POST',
@@ -2790,8 +2799,8 @@ export async function createOpenPlatformApiClient(
         ...(contentType ? { 'content-type': contentType } : {}),
       },
       body,
-      ...(opts.signal ? { signal: opts.signal } : {}),
-    }, 10, opts);
+      ...(signal ? { signal } : {}),
+    }, 10, { ...opts, ...(signal ? { signal } : {}) });
     let data: any;
     try {
       data = await response.json();
@@ -2809,14 +2818,15 @@ export async function createOpenPlatformApiClient(
 
   const postJson: OpenPlatformPostJson = async (path, body, opts = {}) =>
     request(path, body === undefined ? undefined : JSON.stringify(body), body === undefined ? undefined : 'application/json', opts);
-  const postJsonIdempotent = async (path: string, body?: unknown): Promise<unknown> =>
+  const postJsonIdempotent: OpenPlatformApiClient['postJsonIdempotent'] = async (path, body, options = {}) =>
     request(
       path,
       body === undefined ? undefined : JSON.stringify(body),
       body === undefined ? undefined : 'application/json',
-      { idempotent: true },
+      { ...options, idempotent: true },
     );
-  const postForm = async (path: string, body: FormData): Promise<unknown> => request(path, body);
+  const postForm: OpenPlatformApiClient['postForm'] = async (path, body, options = {}) =>
+    request(path, body, undefined, options);
 
   return { ok: true, client: { apiOrigin, postJson, postJsonIdempotent, postForm }, identity };
 }
@@ -3043,6 +3053,31 @@ function isDefiniteTemplateRejection(err: unknown): boolean {
   return /^HTTP 404\b/.test(err.message);
 }
 
+function withOpenPlatformClientSignal(
+  client: OpenPlatformApiClient,
+  signal: AbortSignal | undefined,
+): OpenPlatformApiClient {
+  if (!signal) return client;
+  // Bind once at the client boundary so helper functions receiving postJson cannot
+  // accidentally drop cancellation. Check before every call: an abort received while
+  // an earlier request was in flight must prevent the next remote side effect.
+  return {
+    ...client,
+    postJson: (path, body, options = {}) => {
+      throwIfAborted(signal);
+      return client.postJson(path, body, { ...options, signal: options.signal ?? signal });
+    },
+    postJsonIdempotent: (path, body, options = {}) => {
+      throwIfAborted(signal);
+      return client.postJsonIdempotent(path, body, { ...options, signal: options.signal ?? signal });
+    },
+    postForm: (path, body, options = {}) => {
+      throwIfAborted(signal);
+      return client.postForm(path, body, { ...options, signal: options.signal ?? signal });
+    },
+  };
+}
+
 /**
  * 用已经登录的开放平台 Web session 创建一个企业自建应用并读取凭证。
  *
@@ -3066,6 +3101,7 @@ export async function createOpenPlatformAppWithClient(
     creatorUserId: string;
     autoAvoidApproval?: boolean;
     approvalMaxProbes?: number;
+    signal?: AbortSignal;
     onStatus?: (message: string) => void | Promise<void>;
   },
 ): Promise<{
@@ -3075,6 +3111,8 @@ export async function createOpenPlatformAppWithClient(
   approvalDisabledRefreshToken?: boolean;
   approvalCompatibility?: ApprovalCompatibilityOutcome;
 }> {
+  client = withOpenPlatformClientSignal(client, options.signal);
+  throwIfAborted(options.signal);
   const name = options.name.trim();
   if (!name) throw new Error('应用名称不能为空');
   if (!options.creatorUserId) throw new Error('创建应用缺少创建者 userId,无法完成上架启用');
@@ -3416,7 +3454,10 @@ export async function createFeishuOpenPlatformApp(
     return { ok: false, reason: 'aborted', message: '用户已取消操作', sessionFile: prepared.sessionFile };
   }
 
-  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, {
+    fetchImpl: options.fetchImpl,
+    signal: options.signal,
+  });
   if (options.signal?.aborted) {
     return { ok: false, reason: 'aborted', message: '用户已取消操作', sessionFile: prepared.sessionFile };
   }

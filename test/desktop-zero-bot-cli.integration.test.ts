@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -18,6 +18,7 @@ import {
   createDesktopHostLeaseRegistry,
   parseStopIfEmptyCliOutcome,
 } from '../src/core/desktop-host-leases.js';
+import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const REPO_ROOT = resolve(import.meta.dirname, '..');
 const CLI_DIST = join(REPO_ROOT, 'dist', 'cli.js');
@@ -386,4 +387,45 @@ describe('0-bot CLI + Desktop end-to-end onboarding lifecycle', () => {
     expect(parsedMissing).toMatchObject({ ok: false, reason: 'dependency_missing' });
     expect(parsedMissing.message).toContain('herdr-core');
   }, 45_000);
+
+  it('never publishes an unfenced host lease when the fleet mutation lock times out', async () => {
+    const home = makeTempHome();
+    const botmuxHome = join(home, '.botmux');
+    mkdirSync(botmuxHome, { recursive: true });
+    const lockTarget = join(botmuxHome, 'pm2-fleet-mutation');
+    const holder = spawnTsEvalWithRepoImports(`
+      import { withFileLock } from './src/utils/file-lock.js';
+      await withFileLock(process.env.PROBE_LOCK, async () => {
+        console.log('LOCKED');
+        await new Promise(resolve => { process.stdin.once('data', resolve); });
+      }, { maxWaitMs: 2_000 });
+    `, {
+      env: { ...process.env, PROBE_LOCK: lockTarget },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let lease: ReturnType<typeof createDesktopHostLeaseRegistry> | undefined;
+    try {
+      await new Promise<void>((resolveReady, reject) => {
+        const timer = setTimeout(() => reject(new Error('lock holder did not start')), 5_000);
+        holder.stdout?.on('data', chunk => {
+          if (!String(chunk).includes('LOCKED')) return;
+          clearTimeout(timer);
+          resolveReady();
+        });
+      });
+      lease = createDesktopHostLeaseRegistry(botmuxHome, { selfPid: process.pid, lockMaxWaitMs: 30 });
+      expect(await lease.ensureRegistered()).toBe(false);
+      expect(existsSync(join(botmuxHome, '.desktop-host-leases', `host-${process.pid}.json`))).toBe(false);
+      expect(holder.exitCode).toBeNull();
+    } finally {
+      lease?.unregister();
+      if (holder.exitCode === null && holder.signalCode === null) holder.stdin?.write('release');
+      if (holder.exitCode === null && holder.signalCode === null) {
+        await new Promise<void>(resolveExit => {
+          const timer = setTimeout(() => { holder.kill('SIGKILL'); resolveExit(); }, 2_000);
+          holder.once('exit', () => { clearTimeout(timer); resolveExit(); });
+        });
+      }
+    }
+  }, 10_000);
 });

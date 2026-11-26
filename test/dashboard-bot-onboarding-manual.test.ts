@@ -411,6 +411,40 @@ describe('BotOnboardingManager manual App ID / App Secret onboarding', () => {
     expect(persisted[0].larkAppId).toBe('cli_reconcile1');
   });
 
+  it('does not treat a concurrently drifted local record as an exact uncertain-commit match', async () => {
+    const startBotLive = vi.fn(async () => ({ ok: true }));
+    const mgr = new BotOnboardingManager({
+      botsJsonPath,
+      startBotLive,
+      runBotsMutation: async mutation => {
+        await mutation();
+        const drifted = JSON.parse(readFileSync(botsJsonPath, 'utf8'));
+        drifted[0].defaultWorkingDir = join(tmpDir, 'drifted-working-dir');
+        drifted[0].model = 'drifted-model';
+        writeFileSync(botsJsonPath, JSON.stringify(drifted, null, 2));
+        throw new Error('coordinator commit ack lost');
+      },
+    });
+
+    const job = mgr.start({
+      registrationMode: 'local',
+      appName: 'local-exact-record',
+      cliId: 'claude-code',
+      workingDir: tmpDir,
+      dirMode: 'fixed',
+      model: 'original-model',
+    });
+    await job.done;
+
+    expect(mgr.get(job.id)?.status).toBe('failed');
+    expect(startBotLive).not.toHaveBeenCalled();
+    const persisted = JSON.parse(readFileSync(botsJsonPath, 'utf8'));
+    expect(persisted[0]).toMatchObject({
+      defaultWorkingDir: join(tmpDir, 'drifted-working-dir'),
+      model: 'drifted-model',
+    });
+  });
+
   it('cancels an in-flight QR onboarding job cooperatively so late QR resolution never writes bots.json or starts a bot', async () => {
     let releaseCreateApp!: () => void;
     let receivedSignal: AbortSignal | undefined;

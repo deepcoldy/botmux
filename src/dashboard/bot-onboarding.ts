@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 import { dirname, join } from 'node:path';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic, mutateBotsJsonAtomic } from '../setup/bots-store.js';
 import { validateBotConfigEntries } from '../setup/bots-config-validation.js';
@@ -118,39 +119,18 @@ function assertBotsArrayValidForDaemon(entries: unknown): void {
   }
 }
 
-/** Strict exact-record equality for uncertain-commit reconciliation in manual onboarding. */
-function sameManualBotRecord(candidate: unknown, expected: Record<string, any>): boolean {
+/** Exact JSON-record equality shared by manual/local/generic uncertain-commit reconciliation. */
+function sameBotRecord(candidate: unknown, expected: Record<string, any>): boolean {
   if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false;
-  const record = candidate as Record<string, any>;
-  if (
-    record.larkAppId !== expected.larkAppId
-    || record.larkAppSecret !== expected.larkAppSecret
-    || record.localIdentity !== expected.localIdentity
-    || record.brand !== expected.brand
-    || record.cliId !== expected.cliId
-    || record.wrapperCli !== expected.wrapperCli
-    || record.cliLaunchMode !== expected.cliLaunchMode
-    || record.defaultWorkingDir !== expected.defaultWorkingDir
-    || record.workingDir !== expected.workingDir
-    || record.model !== expected.model
-    || record.displayName !== expected.displayName
-    || record.name !== expected.name
-  ) {
+  try {
+    // bots.json is JSON, so compare the value that would actually be persisted:
+    // object key order and optional undefined fields do not create false drift,
+    // while nested env/sandbox and every scalar/array value remain significant.
+    const canonical = (value: unknown) => JSON.parse(JSON.stringify(value));
+    return isDeepStrictEqual(canonical(candidate), canonical(expected));
+  } catch {
     return false;
   }
-  const candidateOwners = Array.isArray(record.allowedUsers) ? record.allowedUsers : undefined;
-  const expectedOwners = Array.isArray(expected.allowedUsers) ? expected.allowedUsers : undefined;
-  if (!candidateOwners || !expectedOwners) return candidateOwners === expectedOwners;
-  if (
-    candidateOwners.length !== expectedOwners.length
-    || !candidateOwners.every((entry, idx) => entry === expectedOwners[idx])
-  ) {
-    return false;
-  }
-  const expectedKeys = Object.keys(expected).filter(key => expected[key] !== undefined);
-  const candidateKeys = Object.keys(record).filter(key => record[key] !== undefined);
-  return candidateKeys.length === expectedKeys.length
-    && candidateKeys.every(key => expected[key] !== undefined);
 }
 
 /** Fail closed if `bots.json` exists on disk and is malformed, non-array, unreadable, or rejected by the daemon loader. */
@@ -2524,22 +2504,12 @@ export class BotOnboardingManager {
       // The file rename may already have succeeded when a coordinator's
       // post-write commit fails. Reconcile that exact record instead of letting
       // a no-appId failure trigger a second create/append on local retry.
-      if (
-        !allocated
-        || error instanceof OnboardingCancelledError
-        || error instanceof InvalidBotsJsonError
-      ) {
+      if (!allocated || error instanceof OnboardingCancelledError) {
         throw error;
       }
       const expected = allocated as Record<string, any>;
       const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
-      const index = bots.findIndex((bot: any) => (
-        bot?.larkAppId === expected.larkAppId
-        && bot?.localIdentity === true
-        && bot?.cliId === expected.cliId
-        && bot?.displayName === expected.displayName
-        && bot?.name === expected.name
-      ));
+      const index = bots.findIndex((bot: any) => sameBotRecord(bot, expected));
       if (index < 0) {
         this.committedJobs.delete(id);
         throw error;
@@ -2574,7 +2544,6 @@ export class BotOnboardingManager {
         !writeAttempted
         || error instanceof OnboardingCancelledError
         || error instanceof DuplicateAppIdError
-        || error instanceof InvalidBotsJsonError
       ) {
         throw error;
       }
@@ -2582,7 +2551,7 @@ export class BotOnboardingManager {
       // error threw, reconcile our exact record and continue to live-start instead
       // of stranding the user with `duplicate_app` on retry.
       const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
-      const index = bots.findIndex(entry => sameManualBotRecord(entry, normalized));
+      const index = bots.findIndex(entry => sameBotRecord(entry, normalized));
       if (index < 0) {
         this.committedJobs.delete(id);
         throw error;
@@ -2595,18 +2564,34 @@ export class BotOnboardingManager {
   private async persistBot(id: string, bot: Record<string, any>): Promise<number> {
     if (this.isCancelled(id)) throw new OnboardingCancelledError();
     const normalized = normalizeBotConfig(bot);
-    return this.runBotsMutation(() => this.mutateBotsJsonValidated(previous => {
-      if (this.isCancelled(id)) throw new OnboardingCancelledError();
-      const existing = previous.findIndex((b: any) => b?.larkAppId === bot.larkAppId);
-      this.committedJobs.add(id);
-      if (existing >= 0) {
-        const next = [...previous];
-        next[existing] = normalized;
-        return { bots: next, result: existing };
+    let writeAttempted = false;
+    try {
+      return await this.runBotsMutation(() => this.mutateBotsJsonValidated(previous => {
+        if (this.isCancelled(id)) throw new OnboardingCancelledError();
+        const existing = previous.findIndex((b: any) => b?.larkAppId === bot.larkAppId);
+        writeAttempted = true;
+        this.committedJobs.add(id);
+        if (existing >= 0) {
+          const next = [...previous];
+          next[existing] = normalized;
+          return { bots: next, result: existing };
+        }
+        const index = previous.length;
+        return { bots: [...previous, normalized], result: index };
+      }));
+    } catch (error) {
+      if (!writeAttempted || error instanceof OnboardingCancelledError) throw error;
+      // A coordinator may lose its post-rename ACK. Reconcile the complete record
+      // before reporting failure, and never leave a failed next-generation check
+      // looking like a committed job to cancel().
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const index = bots.findIndex(entry => sameBotRecord(entry, normalized));
+      if (index < 0) {
+        this.committedJobs.delete(id);
+        throw error;
       }
-      const index = previous.length;
-      return { bots: [...previous, normalized], result: index };
-    }));
+      return index;
+    }
   }
 
   /**

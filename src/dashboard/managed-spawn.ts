@@ -27,6 +27,22 @@ export interface BotLifecycleSpawnResult {
   message?: string;
 }
 
+/** Kill a lifecycle CLI and any dependency installer it spawned. */
+export function killBotLifecycleProcessTree(child: ReturnType<typeof spawn>): void {
+  const pid = child.pid;
+  try {
+    if (pid && pid > 0 && process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+      return;
+    }
+    if (pid && pid > 0) {
+      process.kill(-pid, 'SIGKILL');
+      return;
+    }
+  } catch { /* fall through to the direct child / already exited */ }
+  try { child.kill('SIGKILL'); } catch { /* already exited */ }
+}
+
 /** `botmux <verb>-bot <appId> --json` with a redacted env. */
 function spawnBotLifecycleCli(
   verb: 'start-bot' | 'stop-bot',
@@ -54,9 +70,12 @@ function spawnBotLifecycleCli(
         // package update replaces that dir, so a still-running dashboard would spawn
         // start-bot in a deleted directory (uv_cwd/ENOENT). See globalInstallUpdateCwd.
         cwd: globalInstallUpdateCwd(),
+        // Dependency provisioning may spawn brew/apt/curl. Own the POSIX process
+        // group so a timeout cannot leave those installers running after failure.
+        detached: process.platform !== 'win32',
       });
       const timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        killBotLifecycleProcessTree(child);
         done({ ok: false, message: timeoutLabel });
       }, timeoutMs);
       timer.unref?.();
