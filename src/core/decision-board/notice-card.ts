@@ -21,7 +21,12 @@ export function escapeNoticeMarkdown(text: string): string {
     .replace(/^([ \t]*)-/gm, '$1\\-')
     .replace(/^([ \t]*)\+/gm, '$1\\+')
     .replace(/^([ \t]*)(\d+)\./gm, '$1$2\\.')
-    .replace(/^([ \t]*)#(?=\s)/gm, '$1\\#')
+    // ATX 标题可含 1–6 个 #，也可以只有标记而没有后续文字；七个以上不是标题。
+    .replace(/^([ \t]*)(#{1,6})(?=[ \t]+|$)/gm, '$1\\$2')
+    // Setext 的等号下划线同样不能把上一行 owner 原文变成标题。
+    .replace(/^([ \t]*)(=+)(?=[ \t]*$)/gm, '$1\\$2')
+    // CommonMark 的 Tab 停在列 4：1–3 个前导空格 + Tab 也会形成缩进代码块。
+    .replace(/^ {1,3}\t/gm, indent => `${indent.slice(0, -1)}&#32;`)
     .replace(/^ {4}/gm, '&#32;   ')
     .replace(/^\t/gm, '&#32;');
 }

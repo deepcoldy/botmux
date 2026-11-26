@@ -7,7 +7,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DecisionBoardService, boardErrorStatus, type DecisionBoardServiceDeps } from '../src/core/decision-board/service.js';
-import type { StewardConfig } from '../src/core/decision-board/model.js';
+import {
+  formatBatchEcho,
+  formatBatchEchoCard,
+  splitEchoText,
+  type BatchMessageEntry,
+  type StewardConfig,
+} from '../src/core/decision-board/model.js';
 import type { ChatLookupResult } from '../src/core/decision-board/chat-lookup.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { decisionBoardDbPath } from '../src/services/decision-board-store.js';
@@ -23,6 +29,7 @@ let deliverImpl: DecisionBoardServiceDeps['deliver'];
 /** 假的查群：默认每个群都查得到，群名 = 「群名-<chatId>」；用例里按需改。 */
 let lookupImpl: (chatId: string) => Promise<ChatLookupResult>;
 let bannerImpl: DecisionBoardServiceDeps['banner'];
+let dashboardOrigin: string | undefined;
 let lookups: string[];
 /** 每次查群收到的截止时间（一条命令里几个群共用一份）。 */
 let deadlines: number[];
@@ -38,13 +45,14 @@ beforeEach(() => {
   deadlines = [];
   lookupImpl = async chatId => ({ ok: true, chatId, appId: APP, name: `群名-${chatId}` });
   bannerImpl = ({ batchId, count }) => `收到 ${count} 项（#${batchId}）`;
+  dashboardOrigin = 'https://dash.example';
   service = new DecisionBoardService({
     dataDir: dir,
     larkAppId: () => APP,
     steward: () => steward,
     locale: () => locale,
     brand: () => 'feishu',
-    dashboardOrigin: () => 'https://dash.example',
+    dashboardOrigin: () => dashboardOrigin,
     ownerOpenId: () => 'ou_owner',
     ownerName: async () => '主人',
     timeZone: () => 'UTC',
@@ -679,6 +687,31 @@ describe('提交与投递', () => {
     const whole = texts.join('');
     expect(whole).toBe(`收到 1 项（#1）\n\n#1 长说明（待拍板）\n选：B 不合\n说明：\n${longText}`);
     expect(delivered[0].prompt).toContain(`说明：\n${longText}`);
+  });
+
+  it('纯文本已拆条时即使完整卡片能放下也不出卡，避免与后续段落重复', async () => {
+    // 卡片会把标题内部空白压成一行，纯文本则保留：两边测量的不是同一份字节数。
+    // 没有 Dashboard origin 时事项不带链接，正是这个反例需要的合法生产形状。
+    dashboardOrigin = undefined;
+    const title = `x${' '.repeat(198)}y`;
+    const entries: BatchMessageEntry[] = [];
+    const submitted: Array<{ seq: number; draftUpdatedAt: string }> = [];
+    for (let i = 0; i < 160; i++) {
+      const item = await addDecideItem(title);
+      const draft = service.putDraft(item.seq, 'owner', { choice: 'A', text: '', baseRev: item.rev }).draft!;
+      entries.push({ seq: item.seq, title, state: 'decide', choice: 'A', choiceLabel: '合', text: '', fileCount: 0 });
+      submitted.push({ seq: item.seq, draftUpdatedAt: draft.updatedAt });
+    }
+    const echo = { header: '收到 160 项（#1）', entries, locale: 'zh' as const };
+    const expectedTexts = splitEchoText(formatBatchEcho(echo));
+    expect(expectedTexts.length).toBeGreaterThan(1);
+    expect(formatBatchEchoCard(echo)).toBeDefined();
+
+    await service.submit({ author: 'owner', nonce: 'split-card-gate', items: submitted });
+
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.announcement.texts).toEqual(expectedTexts);
+    expect(delivered[0]!.announcement.card).toBeUndefined();
   });
 
   it('公告构造抛错也落 failed 并可重投，不留 dispatched 死行', async () => {
