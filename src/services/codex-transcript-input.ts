@@ -85,7 +85,7 @@ export async function prepareCodexTranscriptInput(terminal: PtyHandle): Promise<
     }
     const now = Date.now();
     if (state && transcriptFooter(state.viewport) === undefined) {
-      const composer = codexNativeComposerState(state);
+      const composer = codexNativeComposerState(state, { allowCodex0146Hints: true });
       if (composer === 'empty') { closing.delete(terminal); return undefined; }
       // A close can expose a draft-looking redraw frame before the empty
       // composer settles. Observe within the existing deadline; never write
@@ -109,7 +109,7 @@ export async function prepareCodexTranscriptInput(terminal: PtyHandle): Promise<
   }
   if (!closing.has(terminal)) return 'Codex is not at an empty input box; no message was written.';
   if (state && transcriptFooter(state.viewport) === undefined
-    && codexNativeComposerState(state) === 'draft') {
+    && codexNativeComposerState(state, { allowCodex0146Hints: true }) === 'draft') {
     return 'Codex has an existing draft; no message was written.';
   }
   return 'Codex transcript did not return to an empty input box; no message was written.';

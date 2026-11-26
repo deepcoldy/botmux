@@ -4,7 +4,7 @@
  * 把 botmux 的 askUserQuestion hook 写入各 CLI 的配置文件。
  * 幂等：写前比对内容，相同则跳过；展开 ~ 路径；出错只 warn 不抛。
  */
-import { readFileSync, mkdirSync, existsSync, chmodSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync, chmodSync, statSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -345,25 +345,77 @@ export function hasInstalledPromptHook(hookInstall: HookInstallConfig): boolean 
  *  effective 路径（与 worker 的 effectiveReadyHookInstall 改写同逻辑）。 */
 export function hasInstalledPromptHookAtPath(configPath: string): boolean {
   const settings = readJsonFile<ClaudeSettings>(expandHome(configPath));
+  if (settings?.disableAllHooks === true) return false;
   const groups = settings?.hooks?.UserPromptSubmit;
   return Array.isArray(groups) && groups.some((group) => isBotmuxPromptHookGroup(group));
 }
 
 /**
- * 带 60s TTL 缓存的 preflight——每个 follow-up turn 都会判定一次模式，读文件虽便宜
- * 也没必要每 turn 读。缓存按 configPath 键控（全局 vs per-bot 自然分键）；安装发生在
- * daemon 启动时（ensureCliSkills），60s 内的滞后可接受（最坏情况是新装 hook 后
- * 60s 内仍走 inline）。
+ * 带 60s TTL + 文件元数据（ino/size/mtimeMs/ctimeMs）校验的正向 preflight——
+ * 每个 turn 都会判定一次模式，读文件虽便宜也没必要每 turn 重读，同时经一次廉价
+ * `statSync` 感知外部删除/改写，避免设置被清空后仍盲目信任 60s 旧缓存。
+ * 只缓存已安装的 `true`，**不缓存 `false`**：隔离沙盒 / credentialsSourceDir 的
+ * per-bot `<BOT_HOME>/claude/settings.json` 由 worker 子进程安装（不同进程内存），
+ * 缓存负向结果会把随后 60s 内的所有续轮/新会话错钉在 inline 模式。缓存键按 `expandHome`
+ * 归一化，保证 `~/...` 与展开路径一致命中和失效。
  */
-const promptHookPreflightCache = new Map<string, { at: number; ok: boolean }>();
+interface CachedPromptHookStat {
+  at: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  ok: true;
+}
+const promptHookPreflightCache = new Map<string, CachedPromptHookStat>();
 const PROMPT_HOOK_PREFLIGHT_TTL_MS = 60_000;
 
+export function invalidatePromptHookPreflightCache(configPath?: string): void {
+  if (configPath === undefined) {
+    promptHookPreflightCache.clear();
+    return;
+  }
+  promptHookPreflightCache.delete(expandHome(configPath));
+}
+
 export function hasInstalledPromptHookCached(configPath: string): boolean {
+  const key = expandHome(configPath);
+  let st: ReturnType<typeof statSync>;
+  try {
+    st = statSync(key);
+    if (!st.isFile()) {
+      promptHookPreflightCache.delete(key);
+      return false;
+    }
+  } catch {
+    promptHookPreflightCache.delete(key);
+    return false;
+  }
   const now = Date.now();
-  const cached = promptHookPreflightCache.get(configPath);
-  if (cached && now - cached.at < PROMPT_HOOK_PREFLIGHT_TTL_MS) return cached.ok;
-  const ok = hasInstalledPromptHookAtPath(configPath);
-  promptHookPreflightCache.set(configPath, { at: now, ok });
+  const cached = promptHookPreflightCache.get(key);
+  if (
+    cached
+    && now - cached.at < PROMPT_HOOK_PREFLIGHT_TTL_MS
+    && cached.ino === st.ino
+    && cached.size === st.size
+    && cached.mtimeMs === st.mtimeMs
+    && cached.ctimeMs === st.ctimeMs
+  ) {
+    return true;
+  }
+  const ok = hasInstalledPromptHookAtPath(key);
+  if (ok) {
+    promptHookPreflightCache.set(key, {
+      at: now,
+      ino: st.ino,
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
+      ok: true,
+    });
+  } else {
+    promptHookPreflightCache.delete(key);
+  }
   return ok;
 }
 
@@ -493,6 +545,7 @@ function installClaudeSettings(
     // succeeds, so a failed settings update cannot claim per-bot keys as shared.
     writeIfChanged(inheritedEnvState.path, inheritedEnvState.content, 0o600);
   }
+  invalidatePromptHookPreflightCache(configPath);
   if (changed) {
     logger.info(`[hook] 已写入 Claude hook → ${configPath}`);
   } else {

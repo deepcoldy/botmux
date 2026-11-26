@@ -33,19 +33,52 @@ export function codexTerminalSessionIsBound(terminal: PtyHandle, sessionId: stri
     && binding.sessionId === sessionId.toLowerCase();
 }
 
+/** Display-only composer hints embedded in codex-cli 0.146.1. Startup,
+ * rename, normal delivery and keepalive all accept this exact inventory only
+ * when the cursor still sits at the composer's native Home position. */
+const CODEX_0146_COMPOSER_HINTS: ReadonlySet<string> = new Set([
+  'Explain this codebase',
+  'Summarize recent commits',
+  'Implement {feature}',
+  'Find and fix a bug in @filename',
+  'Write tests for @filename',
+  'Improve documentation in @filename',
+  'Run /review on my current changes',
+  'Use /skills to list available skills',
+  'Check recently modified functions for compatibility',
+  'How many files have been modified?',
+  'Will this algorithm scale well?',
+]);
+
+type CodexNativeComposerOptions = { allowCodex0146Hints?: boolean };
+
+function isCodexNativeComposerHint(body: string): boolean {
+  const normalized = body.replace(/\s+/g, ' ').trim();
+  return normalized === 'Ask Codex to do anything' || CODEX_0146_COMPOSER_HINTS.has(normalized);
+}
+
 export function codexEmptyComposerFooter(
   state: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined,
+  opts: CodexNativeComposerOptions = {},
 ): string | undefined {
   if (!state) return undefined;
-  const lines = stripAnsiScreenText(state.viewport).split(/\r?\n/);
+  const viewport = stripAnsiScreenText(state.viewport);
+  // A centered confirmation or the native rename dialog can leave a perfectly
+  // plausible composer/backdrop behind. Never mistake that backdrop for input.
+  if (codexRenameDialogVisible(viewport) || detectCodexChoiceModal(viewport)) return undefined;
+  const lines = viewport.split(/\r?\n/);
   if (detectCodexComposerState({ ...state, viewport: lines.join('\n') }) !== 'empty') return undefined;
   const line = lines[state.cursor.y];
   if (line === undefined) return undefined;
   // Cursor position alone cannot distinguish a draft whose cursor is at Home.
   // Accept only an empty row or the known native placeholder, plus a live
   // initialized footer below it. Unknown placeholders fail closed.
-  const prompt = /^(\s*)[›»] (?:Ask Codex to do anything)?\s*$/.exec(line);
-  if (!prompt || state.cursor.x !== (prompt[1]?.length ?? 0) + 2) return undefined;
+  const prompt = /^(\s*)[›»](?: (.*))?$/.exec(line);
+  if (!prompt) return undefined;
+  const ghostText = (prompt[2] ?? '').trimEnd();
+  const nativeGhostText = ghostText === '' || ghostText === 'Ask Codex to do anything'
+    || (opts.allowCodex0146Hints === true && CODEX_0146_COMPOSER_HINTS.has(ghostText));
+  if (!nativeGhostText || state.cursor.x !== (prompt[1]?.length ?? 0) + 2) return undefined;
   // Match native state rows, not words inside transcript prose or tool output.
   const below = lines.slice(state.cursor.y + 1);
   // Both layouts are native: an inline status/hints row, or a separate status
@@ -72,10 +105,11 @@ export function codexEmptyComposerFooter(
  */
 export function codexNativeComposerState(
   state: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined,
+  opts: CodexNativeComposerOptions = {},
 ): 'empty' | 'draft' | 'unknown' {
   const coarse = detectCodexComposerState(state);
   if (coarse !== 'empty') return coarse;
-  return codexEmptyComposerFooter(state) !== undefined ? 'empty' : 'unknown';
+  return codexEmptyComposerFooter(state, opts) !== undefined ? 'empty' : 'unknown';
 }
 
 function emptyComposerFooter(terminal: PtyHandle): string | undefined {
@@ -85,6 +119,19 @@ function emptyComposerFooter(terminal: PtyHandle): string | undefined {
 /** Validate the native one/two-row footer after the caller bounds its location. */
 export function codexNativeFooterRows(footer: string[]): string | undefined {
   if (footer.length < 1 || footer.length > 2) return undefined;
+  if (footer.some(row => /^\s*(?:press\s+)?enter\b[^\r\n]*\besc\b/i.test(row)
+    || /^\s*enter\s+submit\s*\|\s*esc\s+back\s*$/i.test(row))) return undefined;
+  if (footer.length === 1) {
+    const row = footer[0]!.trim();
+    const nativeSingle = row.includes(' · ')
+      || /^Context\s+\d+%\s+(?:left|used)\b/i.test(row)
+      || /^\d+%\s+context\s+(?:left|used)\b/i.test(row)
+      || /^\d+%\s+(?:left|used)\b/i.test(row)
+      || /^⚠(?:️)?\s*\d+\b/.test(row)
+      || /^(?:← for agents|\? for shortcuts|esc to interrupt|tab to queue)\b/.test(row)
+      || codexFooterSessionId(row) !== undefined;
+    if (!nativeSingle) return undefined;
+  }
   // The second footer row is the native hints/warning row. A warning-only row
   // is native too: when hints are hidden the warning is the only thing left in
   // that row. Codex degrades the notice by width: `\u26a0 N warnings \u00b7 f2
@@ -107,35 +154,54 @@ function codexRenameDialogVisible(viewport: string): boolean {
 /**
  * Where a native Codex `/rename <title>` stands after its Enter.
  * `settled` only describes an empty composer; the worker separately requires
- * this thread's durable receipt. Known busy/dialog/draft surfaces are
- * `occupied` and outrank that receipt; an unrecognised footer stays `unknown`
- * so a matching receipt can still settle a future native layout.
+ * this thread's durable receipt. Known busy turns are `occupied`; dialogs,
+ * pickers and non-empty drafts are `blocked` and never time out into delivery.
+ * An unrecognised footer stays `unknown` so a matching receipt can still settle
+ * a future native layout.
  */
 export function codexSessionRenameSurface(
   evidence: { viewport: string; cursor?: { x: number; y: number } },
   command: string,
 ): SessionRenameSurface {
   const viewport = stripAnsiScreenText(evidence.viewport);
-  if (detectCodexChoiceModal(viewport) || codexRenameDialogVisible(viewport)) return 'occupied';
+  if (detectCodexChoiceModal(viewport) || codexRenameDialogVisible(viewport)) return 'blocked';
   const rows = viewport.split(/\r?\n/);
   let composer = rows.length - 1;
   while (composer >= 0 && !/^\s*[›»](?:\s|$)/.test(rows[composer]!)) composer--;
   if (composer < 0) {
     return CODEX_ACTIVE_BUSY_PATTERN.test(rows.slice(-6).join('\n')) ? 'occupied' : 'unknown';
   }
+  const composerPrompt = /^(\s*)[›»](?:\s|$)/.exec(rows[composer]!)!;
+  const composerHomeX = (composerPrompt[1]?.length ?? 0) + 2;
   const neighborhood = rows.slice(Math.max(0, composer - 4), composer + 5).join('\n');
-  if (CODEX_ACTIVE_BUSY_PATTERN.test(neighborhood)) return 'occupied';
-  const cursor = evidence.cursor
-    ?? { x: (/^\s*/.exec(rows[composer]!)?.[0].length ?? 0) + 2, y: composer };
-  const nativeState = codexNativeComposerState({ viewport, cursor });
-  if (nativeState === 'empty') return 'settled';
+  const cursor = evidence.cursor ?? { x: composerHomeX, y: composer };
+  const nativeState = codexNativeComposerState({ viewport, cursor }, { allowCodex0146Hints: true });
+  if (nativeState === 'empty') {
+    return CODEX_ACTIVE_BUSY_PATTERN.test(neighborhood) ? 'occupied' : 'settled';
+  }
   const wanted = composerTextKey(command);
   for (let end = composer + 1; end < rows.length; end++) {
     if (codexNativeFooterRows(rows.slice(end).filter(row => row.trim())) === undefined) continue;
-    const body = [rows[composer]!.replace(/^\s*[›»]/, ''), ...rows.slice(composer + 1, end)].join('');
-    return composerTextKey(body) === wanted ? 'unsubmitted' : 'occupied';
+    const composerText = rows[composer]!.replace(/^\s*[›»]/, '').trim();
+    // With the cursor still at Home, unfamiliar continuation rows may be new
+    // native chrome. Once the cursor proves multiline input, judge those rows.
+    if (!composerText && cursor.x === composerHomeX && cursor.y === composer) return 'unknown';
+    const body = [rows[composer]!.replace(/^\s*[›»]/, ''), ...rows.slice(composer + 1, end).filter(row =>
+      !/^\s*(?:[^\w\s]\s+)?(?:Queued for capacity|Resuming session)\b/i.test(row)
+      && !/^\s*│\s*(?:model|directory):\s*loading\b/i.test(row)
+      && !CODEX_ACTIVE_BUSY_PATTERN.test(row)
+    )].join('');
+    // A bare prompt with an unfamiliar footer is unknown, never a human draft.
+    if (!body.trim()) return 'unknown';
+    if (isCodexNativeComposerHint(body) && cursor.x === composerHomeX && cursor.y === composer) {
+      // Ghost hints may wrap on narrow screens. Busy/loading chrome means the
+      // turn is occupied; unfamiliar chrome stays unknown, never hard-blocked.
+      return CODEX_ACTIVE_BUSY_PATTERN.test(neighborhood) ? 'occupied' : 'unknown';
+    }
+    return composerTextKey(body) === wanted ? 'unsubmitted' : 'blocked';
   }
-  return nativeState === 'draft' ? 'occupied' : 'unknown';
+  if (nativeState === 'draft') return 'blocked';
+  return CODEX_ACTIVE_BUSY_PATTERN.test(neighborhood) ? 'occupied' : 'unknown';
 }
 
 // A complete Codex thread UUID (the `thread-id` / legacy `session-id` item).

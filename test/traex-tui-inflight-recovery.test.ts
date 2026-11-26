@@ -68,6 +68,7 @@ function reattachHarness() {
   h.scope.requeueUnsubmittedQueuedActivation = loadWorkerFunction('requeueUnsubmittedQueuedActivation', h.scope);
   h.scope.runAmbiguousSubmissionTransaction = async (_backend: unknown, write: () => Promise<unknown>, _accepted: unknown, prepare?: () => void) => { prepare?.(); return { result: await write() }; };
   h.scope.sessionRenameSurfaceNow = loadWorkerFunction('sessionRenameSurfaceNow', h.scope);
+  h.scope.sessionInputSurfaceNow = loadWorkerFunction('sessionInputSurfaceNow', h.scope);
   h.scope.traexPersistentReattachBusyComposerFence = loadWorkerFunction('traexPersistentReattachBusyComposerFence', h.scope);
   h.scope.traexPersistentReattachSteeringFence = loadWorkerFunction('traexPersistentReattachSteeringFence', h.scope);
   h.scope.recoverSessionRenameAfterPersistentReattach = loadWorkerFunction('recoverSessionRenameAfterPersistentReattach', h.scope);
@@ -88,6 +89,15 @@ describe('plain TRAE busy input after persistent worker reattach', () => {
     expect(h.scope.cliAdapter.watchSessionRename).not.toHaveBeenCalled();
     expect(h.scope.isPromptReady).toBe(false);
     expect(h.scope.awaitingFirstPrompt).toBe(true);
+  });
+
+  it('revalidates a foreign warm cache against an owned rollout before writing', async () => {
+    const h = reattachHarness();
+    h.scope.inputDeliveryObservedCliSessionId = 'foreign-id';
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
+    expect(h.scope.pendingMessages).toHaveLength(0);
+    expect(h.scope.sessionRenameNativeSessionIdNow()).toBe('owned-native-id');
   });
 
   it('kicks the real flush from sendToPty before first idle on the replacement worker', async () => {
@@ -120,7 +130,10 @@ describe('plain TRAE busy input after persistent worker reattach', () => {
     ['ordinary draft', (h: ReturnType<typeof reattachHarness>) => { h.scope.backend.captureInputState = () => ({ viewport: busy.replace('Run /review on my current changes', 'unfinished user draft') }); }],
     ['unknown viewport', (h: ReturnType<typeof reattachHarness>) => { h.scope.backend.captureInputState = () => ({ viewport: '' }); }],
     ['missing owned session', (h: ReturnType<typeof reattachHarness>) => { h.scope.findTraexRolloutSetByPid = () => undefined; }],
-    ['warm but foreign identity cache', (h: ReturnType<typeof reattachHarness>) => { h.scope.inputDeliveryObservedCliSessionId = 'foreign-id'; }],
+    ['foreign identity cache without rollout fallback', (h: ReturnType<typeof reattachHarness>) => {
+      h.scope.inputDeliveryObservedCliSessionId = 'foreign-id';
+      h.scope.findTraexRolloutByPid = () => undefined;
+    }],
     ['cold startup', (h: ReturnType<typeof reattachHarness>) => { h.scope.lastSpawnPersistentReattach = false; h.scope.idleDetector.isStartupPending = () => true; }],
     ['real startup hold', (h: ReturnType<typeof reattachHarness>) => { h.scope.traexNativeStartupInputIsPending = () => true; }],
     ['durable owner', (h: ReturnType<typeof reattachHarness>) => { h.scope.durableTurnInFlight = true; }],

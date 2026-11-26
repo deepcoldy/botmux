@@ -234,6 +234,7 @@ import { logger } from '../utils/logger.js';
 import { createCliAdapterSync, type CliAdapterOptions } from '../adapters/cli/registry.js';
 import { antigravityTransport } from '../services/antigravity-transport.js';
 import { cliSupportsConfigDir } from './cli-config-dir.js';
+import { prepareHookEnvelopeForReplay } from './prompt-hook-replay.js';
 import {
   resolveCliRuntime,
   runtimeInstallationKey,
@@ -1517,6 +1518,14 @@ export interface WorkerPoolCallbacks {
    *  True when the limit is handled by moving this session to the next
    *  CLI/model, so the owner pause notice and backup-bot handoff are skipped. */
   startQuotaFallbackChainSwitch?: (ds: DaemonSession, trigger: QuotaFallbackChainTrigger) => boolean;
+  /** User-confirmed Codex capacity downgrade (core/codex-capacity-fallback.ts). */
+  onCodexCapacityRetry?: (
+    ds: DaemonSession,
+    trigger: import('./codex-capacity-fallback.js').CodexCapacityFallbackTrigger,
+  ) => boolean;
+  /** Invalidate any open Codex capacity-downgrade confirmation card once the
+   *  turn settles, is superseded by new input, or the worker retires. */
+  onCodexCapacitySettle?: (ds: DaemonSession, reason: string, turnId?: string) => void;
   /** A scheduled task as the host authority store holds it, for deciding who a
    *  scheduled turn runs as. Never backed by schedules.json (agent-writable
    *  inside a sandbox). Absent or undefined → the turn carries no identity. */
@@ -4037,25 +4046,41 @@ export function ensureOrdinaryTurnRecoveryAttached(
       if (silent) armSilentScheduledTurn(ds, dispatch.turnId);
       let enqueued = false;
       try {
-        if (!ds.worker || ds.worker.killed || ds.worker.connected === false) {
-          enqueued = forkWorker(
+        const willUseLiveWorker = !!(ds.worker && !ds.worker.killed && ds.worker.connected !== false);
+        const isClaude = sessionCliId(ds, botCfg) === 'claude-code';
+        const failedTurn = ds.session.lastFailedTurn;
+        const logicalHookEnvelope = ds.session.ordinaryTurnRecovery?.retryInputs?.[dispatch.logicalTurnId]?.hookEnvelope
+          ?? (failedTurn?.turnId === dispatch.logicalTurnId ? failedTurn.hookEnvelope : undefined);
+        // Every continuation needs the original delivery envelope: hook context
+        // is not present in the resumed transcript. Only an actual replay may
+        // change the payload shape; other CLIs keep their legacy string input.
+        const replayed = isClaude && logicalHookEnvelope
+          ? prepareHookEnvelopeForReplay({
             ds,
-            trustedCaller ? { content: dispatch.prompt, trustedCaller } : dispatch.prompt,
-            { resume: true, turnId: dispatch.turnId },
-          );
+            content: dispatch.prompt,
+            turnId: dispatch.turnId,
+            hookEnvelope: logicalHookEnvelope,
+            willUseLiveWorker,
+          })
+          : undefined;
+        if (!willUseLiveWorker) {
+          const forkInput = replayed
+            ? { ...replayed, ...(trustedCaller ? { trustedCaller } : {}) }
+            : trustedCaller ? { content: dispatch.prompt, trustedCaller } : dispatch.prompt;
+          enqueued = forkWorker(ds, forkInput, { resume: true, turnId: dispatch.turnId });
         } else {
           // A turn that failed without any output is cut first and its input
           // re-sent instead of the recovery prompt: nothing ran, so there is
           // no checkpoint to continue from (core/failed-turn-rewind.ts).
           enqueued = sendWorkerInput(
             ds,
-            dispatch.prompt,
+            replayed ?? dispatch.prompt,
             dispatch.turnId,
             {
               ...(trustedCaller ? { trustedCaller } : {}),
               // Only Claude Code transcripts can be cut; other CLIs keep their
               // continuation exactly as it was.
-              ...(sessionCliId(ds, botCfg) === 'claude-code' ? { failedTurnResendOf: dispatch.logicalTurnId } : {}),
+              ...(isClaude ? { failedTurnResendOf: dispatch.logicalTurnId } : {}),
             },
           );
         }
@@ -9703,6 +9728,7 @@ export function killWorker(
   // worker (or into nothing, if no replacement comes).
   invalidateStuckWarning(ds, 'killWorker');
   invalidateTuiPrompt(ds, 'killWorker');
+  callbacks?.onCodexCapacitySettle?.(ds, 'killWorker');
   if (!ds.worker || ds.worker.killed) {
     // No live worker to receive {type:'close'}, so its destroySession() — which
     // tears down the persistent backing session (tmux/herdr/zellij/zmx) — never
@@ -9794,6 +9820,7 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   if (retiredInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, retiredInteractiveTurnId);
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
+  callbacks?.onCodexCapacitySettle?.(ds, reason);
   const w = ds.worker;
   // This function nulls ds.worker synchronously, so the later process `exit`
   // event fails the current-worker check and cannot perform this cleanup.
@@ -9853,6 +9880,7 @@ function clearTransferWorkerState(
   if (retiredInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, retiredInteractiveTurnId);
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
+  callbacks?.onCodexCapacitySettle?.(ds, reason);
   if (!worker || ds.worker === worker || ds.worker === null) {
     ds.worker = null;
     ds.workerPort = null;
@@ -10331,6 +10359,7 @@ export function writeSessionModelPin(
   }
   if (!pin) ds.modelPinCleared = true;
   else delete ds.modelPinCleared;
+  callbacks?.onCodexCapacitySettle?.(ds, 'model_pin_changed');
   dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId,
     patch: { modelPin: resolveSessionModelPinView(ds, cfg) ?? null } } });
   try { scheduleActiveRuntimePatch(ds); } catch (error) { logger.warn(`[${tag(ds)}] Pin card refresh failed: ${String(error)}`); }
@@ -14090,6 +14119,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   const suspendedInteractiveTurnId = ds.activeInteractiveTurn?.turnId;
   ds.activeInteractiveTurn = undefined;
   if (suspendedInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, suspendedInteractiveTurnId);
+  callbacks?.onCodexCapacitySettle?.(ds, 'suspendWorker');
   // The worker is being suspended — the CLI will be destroyed and cold-resumed
   // later. Invalidate any stuck-warning card so a late click cannot inject keys
   // after the CLI is gone (or into a different CLI on resume).
@@ -19121,6 +19151,7 @@ function failedTurnRewindForInput(
     record: ds.session.lastFailedTurn,
     turnId,
     content: payload.content,
+    nextHookEnvelope: payload.hookEnvelope,
     mode,
   });
 }
@@ -19153,7 +19184,7 @@ function mergeKeepsFailedInputDelivered(
  *  joins the chain whose card is updated in place. */
 export function applyFailedTurnRewindResult(
   ds: DaemonSession,
-  result: { turnId: string; failedTurnId: string; outcome: 'rewound' | 'declined'; reason: string },
+  result: { turnId: string; failedTurnId: string; outcome: 'rewound' | 'declined'; inlineEnvelope?: true; reason: string },
 ): void {
   const pending = ds.pendingFailedTurnRewinds?.get(result.turnId);
   ds.pendingFailedTurnRewinds?.delete(result.turnId);
@@ -19170,6 +19201,7 @@ export function applyFailedTurnRewindResult(
   // meanwhile (it queued behind this one's restart): that one keeps it.
   // Inputs never remembered as latest (an automatic continuation) leave the
   // failed turn as the latest, which they now replace.
+  const carriedHookEnvelope = result.inlineEnvelope ? undefined : pending.hookEnvelope;
   if (ds.lastCliInputTurnId === result.turnId || ds.lastCliInputTurnId === result.failedTurnId) {
     const userPrompt = pending.mode === 'merge' && ds.lastCliInputTurnId === result.turnId && ds.lastUserPrompt
       ? mergeFailedTurnInput(pending.failedUserPrompt, ds.lastUserPrompt)
@@ -19180,9 +19212,20 @@ export function applyFailedTurnRewindResult(
     ds.session.lastUserPrompt = userPrompt;
     ds.session.lastCliInput = pending.content;
     ds.session.lastCliInputTurnId = result.turnId;
+    if (carriedHookEnvelope) {
+      ds.lastHookEnvelope = carriedHookEnvelope;
+      ds.session.lastHookEnvelope = carriedHookEnvelope;
+    } else {
+      delete ds.lastHookEnvelope;
+      delete ds.session.lastHookEnvelope;
+    }
   }
   const retryInput = ds.session.ordinaryTurnRecovery?.retryInputs?.[result.turnId];
-  if (retryInput) retryInput.cliInput = pending.content;
+  if (retryInput) {
+    retryInput.cliInput = pending.content;
+    if (carriedHookEnvelope) retryInput.hookEnvelope = carriedHookEnvelope;
+    else delete retryInput.hookEnvelope;
+  }
   if (ds.session.lastFailedTurn?.turnId === result.failedTurnId) delete ds.session.lastFailedTurn;
   const previous = ds.session.failedTurnRewindChain;
   const continues = previous?.turnId === result.failedTurnId;
@@ -19328,6 +19371,7 @@ export function sendWorkerInput(
         userPrompt: normalized.content,
         cliInput: {
           content: normalized.content,
+          ...(normalized.hookEnvelope ? { hookEnvelope: normalized.hookEnvelope } : {}),
           ...(normalized.codexAppInput
             ? { codexAppInput: normalized.codexAppInput }
             : {}),
@@ -19523,6 +19567,9 @@ export function sendWorkerInput(
       failedTurnId: failedTurnRewind.failedTurnId,
       mode: failedTurnRewind.mode,
       content: failedTurnRewind.content,
+      ...(!failedTurnRewind.inlineEnvelope && normalized.hookEnvelope
+        ? { hookEnvelope: normalized.hookEnvelope }
+        : {}),
       failedUserPrompt: ds.session.lastFailedTurn?.userPrompt ?? failedTurnRewind.failedInput,
       worker: ds.worker,
     });
@@ -19536,6 +19583,7 @@ export function sendWorkerInput(
       ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
       input: {
         cliInput: normalized.content,
+        ...(normalized.hookEnvelope ? { hookEnvelope: normalized.hookEnvelope } : {}),
         ...(opts.trustedCaller ? { trustedCaller: { ...opts.trustedCaller } } : {}),
       },
     });
@@ -19944,6 +19992,7 @@ export function promoteQueuedActivationTail(
   );
   let exactInput: CliTurnPayload = {
     content: head.cliInput.content,
+    ...(head.cliInput.hookEnvelope ? { hookEnvelope: head.cliInput.hookEnvelope } : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(head.cliInput.linkRefs ? { linkRefs: head.cliInput.linkRefs } : {}),
     // R5-B1-2: preserve the frozen steer authorization onto the promoted
@@ -20090,6 +20139,7 @@ export function promoteQueuedActivationTail(
         : {}),
       input: {
         cliInput: exactInput.content,
+        ...(exactInput.hookEnvelope ? { hookEnvelope: exactInput.hookEnvelope } : {}),
         ...(exactInput.trustedCaller ? { trustedCaller: { ...exactInput.trustedCaller } } : {}),
       },
     });
@@ -20163,6 +20213,7 @@ export function admitQueuedActivationTail(
     ...entry,
     cliInput: {
       content: frozenInput.content,
+      ...(frozenInput.hookEnvelope ? { hookEnvelope: frozenInput.hookEnvelope } : {}),
       ...(acceptedCodexAppInput ? { codexAppInput: acceptedCodexAppInput } : {}),
       ...(frozenInput.linkRefs ? { linkRefs: frozenInput.linkRefs } : {}),
       // R5-B1-2: preserve the frozen steer authorization across the tail rebuild
@@ -20910,6 +20961,7 @@ function queueBehindPendingProtectedHttpEgressFork(
         userPrompt: payload.content,
         cliInput: {
           content: payload.content,
+          ...(payload.hookEnvelope ? { hookEnvelope: payload.hookEnvelope } : {}),
           ...(payload.codexAppInput ? { codexAppInput: payload.codexAppInput } : {}),
           ...(payload.linkRefs ? { linkRefs: payload.linkRefs } : {}),
           ...(payload.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
@@ -21501,6 +21553,7 @@ function forkWorkerPrepared(
         userPrompt: prompt,
         cliInput: {
           content: prompt,
+          ...(promptPayload.hookEnvelope ? { hookEnvelope: promptPayload.hookEnvelope } : {}),
           ...(promptPayload.codexAppInput
             ? { codexAppInput: promptPayload.codexAppInput }
             : {}),
@@ -22959,6 +23012,7 @@ function forkWorkerPrepared(
         : {}),
       input: {
         cliInput: prompt,
+        ...(promptPayload.hookEnvelope ? { hookEnvelope: promptPayload.hookEnvelope } : {}),
         ...(initTrustedCaller ? { trustedCaller: { ...initTrustedCaller } } : {}),
       },
     });
@@ -23499,6 +23553,7 @@ function setupWorkerHandlers(
   // can leave a stale card that would otherwise inject keys into the new CLI.
   invalidateStuckWarning(ds, 'new_worker_generation');
   invalidateTuiPrompt(ds, 'new_worker_generation');
+  callbacks?.onCodexCapacitySettle?.(ds, 'new_worker_generation');
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
@@ -26705,6 +26760,24 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'codex_capacity_retry': {
+        if (!ownsLifecycleMutation()) break;
+        if (managedAuxUiSuppressed(msg.turnId)) break;
+        callbacks?.onCodexCapacityRetry?.(ds, {
+          turnId: msg.turnId,
+          nativeSessionId: msg.nativeSessionId,
+          ...(msg.model ? { model: msg.model } : {}),
+          ...(msg.codexTurnId ? { codexTurnId: msg.codexTurnId } : {}),
+          ...(msg.retryAttempt !== undefined ? { retryAttempt: msg.retryAttempt } : {}),
+          ...(msg.maxRetries !== undefined ? { maxRetries: msg.maxRetries } : {}),
+          ...(msg.retryDelaySec !== undefined ? { retryDelaySec: msg.retryDelaySec } : {}),
+          observedAtMs: msg.observedAtMs,
+          worker,
+          reply: text => scopedReply(text, 'text', msg.turnId),
+        });
+        break;
+      }
+
       case 'restart_result': {
         if (ds.worker !== worker) {
           logger.warn(`[${t}] Ignored restart_result from stale worker generation`);
@@ -28472,6 +28545,7 @@ function setupWorkerHandlers(
         // click could inject its keys into the replacement CLI.
         invalidateStuckWarning(ds, 'claude_exit');
         invalidateTuiPrompt(ds, 'claude_exit');
+        callbacks?.onCodexCapacitySettle?.(ds, 'claude_exit');
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
         try {
@@ -29912,6 +29986,7 @@ function setupWorkerHandlers(
           ds.session,
           readonlyTerminal,
         );
+        callbacks?.onCodexCapacitySettle?.(ds, `turn_terminal:${msg.status}`, msg.turnId);
         const ordinaryHttpTerminal = codexCapacityRecoveryCli(sessionCliId(ds, botCfg)) && (ds.pendingWaitPromises?.has(msg.turnId)
           || ds.asyncTriggerResults?.has(msg.turnId)
           || ds.settledHttpTerminalTurns?.has(msg.turnId));
@@ -31301,6 +31376,7 @@ function setupWorkerHandlers(
       }
 
       case 'final_output': {
+        if (msg.turnId) callbacks?.onCodexCapacitySettle?.(ds, 'final_output', msg.turnId);
         if (!msg.handoff) {
           if (effectiveCliId === 'codex' && msg.sessionId === ds.session.sessionId) terminateProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
           await processFinalOutput(msg);
@@ -32041,6 +32117,7 @@ function setupWorkerHandlers(
       ds.scheduledControlActors = undefined;
       ds.taskContinuationRpcProof = undefined;
       ds.activeInteractiveTurn = undefined;
+      callbacks?.onCodexCapacitySettle?.(ds, 'worker_exit');
       if (ds.remoteCloseState) {
         ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
         noteRiffCloseWorkerGone(ds, { exited: true });
