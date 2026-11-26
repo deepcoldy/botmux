@@ -483,4 +483,49 @@ describe('a turn that failed without output, then more input (daemon side)', () 
     await s.failed('trg_1', { directFailure: true });
     expect(s.input('trg_2', '继续').failedTurnRewind).toBeUndefined();
   });
+
+  it('restores both hook envelopes inline for a merge and persists that same final input', async () => {
+    const s = session();
+    const oldEnvelope = '<sender name="OLD_TURN_ENVELOPE" />';
+    const newEnvelope = '<sender name="NEW_TURN_ENVELOPE" />';
+    rememberLastCliInput(s.ds, 'old task', { content: 'old raw task', hookEnvelope: oldEnvelope }, 'trg_1');
+    await s.failed('trg_1', { directFailure: true });
+
+    const nextPayload = { content: 'new raw task', hookEnvelope: newEnvelope };
+    expect(sendWorkerInput(s.ds, nextPayload, 'trg_2')).toBe(true);
+    rememberLastCliInput(s.ds, 'new task', nextPayload, 'trg_2');
+    const sent = s.toWorker.filter(message => message.type === 'message' && message.turnId === 'trg_2').at(-1) as any;
+    expect(sent.failedTurnRewind).toMatchObject({ mode: 'merge', inlineEnvelope: true });
+    expect(sent.failedTurnRewind.content).toContain(oldEnvelope);
+    expect(sent.failedTurnRewind.content).toContain(newEnvelope);
+    expect(sent.failedTurnRewind.content).toContain('old raw task');
+    expect(sent.failedTurnRewind.content).toContain('new raw task');
+
+    await s.fromWorker({
+      type: 'failed_turn_rewind', turnId: 'trg_2', failedTurnId: 'trg_1',
+      outcome: 'rewound', inlineEnvelope: true, reason: 'test',
+    });
+    expect(s.ds.lastCliInput).toBe(sent.failedTurnRewind.content);
+    expect(s.ds.lastHookEnvelope).toBeUndefined();
+    expect(s.ds.session.lastHookEnvelope).toBeUndefined();
+  });
+
+  it('keeps an inline resend envelope when replay preflight cannot use a sidecar', async () => {
+    const s = session();
+    const envelope = '<botmux_reminder>INLINE_RESEND_ENVELOPE</botmux_reminder>';
+    rememberLastCliInput(s.ds, 'old task', { content: 'old raw task', hookEnvelope: envelope }, 'trg_1');
+    await s.failed('trg_1', { directFailure: true });
+    const inlineInput = `${envelope}\n\nold raw task`;
+
+    expect(sendWorkerInput(s.ds, { content: inlineInput }, 'retry-1', { failedTurnResendOf: 'trg_1' })).toBe(true);
+    rememberLastCliInput(s.ds, 'old task', { content: inlineInput }, 'retry-1');
+    const sent = s.toWorker.filter(message => message.type === 'message' && message.turnId === 'retry-1').at(-1) as any;
+    expect(sent.failedTurnRewind).toMatchObject({ mode: 'resend', content: inlineInput, inlineEnvelope: true });
+    await s.fromWorker({
+      type: 'failed_turn_rewind', turnId: 'retry-1', failedTurnId: 'trg_1',
+      outcome: 'rewound', inlineEnvelope: true, reason: 'test',
+    });
+    expect(s.ds.lastCliInput).toBe(inlineInput);
+    expect(s.ds.lastHookEnvelope).toBeUndefined();
+  });
 });

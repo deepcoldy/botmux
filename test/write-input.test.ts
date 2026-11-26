@@ -1652,6 +1652,28 @@ Fix the test suite failure on CI
 
     const ledByFormatting = '<botmux_formatting>短进度优先纯文本。</botmux_formatting>\n\n<user_message>\n继续看一下\n</user_message>';
     expect(extractMessageContentForFingerprint(ledByFormatting)).toBe('继续看一下');
+
+    // Hook-mode opening blocks previously missing from BOTMUX_ENVELOPE_TAGS +
+    // <botmux_task> tag unwrapping (preserving task body without <user_message>).
+    const hookOpening = [
+      '<project_group_mode>Project mode rules</project_group_mode>',
+      '<botmux_steward>Steward hint</botmux_steward>',
+      '<botmux_group_join>Group join context</botmux_group_join>',
+      '<shared_group_context>Recent chat history</shared_group_context>',
+      '<botmux_task trusted="true">Deploy service A</botmux_task>',
+      '<botmux_link_refs>L1=https://example.test</botmux_link_refs>',
+      '<botmux_skills mode="priority">- deploy</botmux_skills>',
+    ].join('\n\n');
+    expect(extractMessageContentForFingerprint(hookOpening)).toBe('Deploy service A');
+
+    // Malformed `<role <foo>` or `<role/bar>` prose must not delete user text,
+    // and repeated unclosed `<botmux_task` must stay strictly O(N).
+    expect(extractMessageContentForFingerprint('compare <role <foo> ok')).toBe('compare <role <foo> ok');
+    expect(extractMessageContentForFingerprint('path <role/bar> ok')).toBe('path <role/bar> ok');
+    const tTask = Date.now();
+    const taskSoup = '<botmux_task a='.repeat(40000) + 'payload';
+    expect(extractMessageContentForFingerprint(taskSoup)).toContain('payload');
+    expect(Date.now() - tTask).toBeLessThan(500);
   });
 
   it('stripBotmuxEnvelopeBlocks stays linear and preserves later blocks on malformed tag soup', () => {

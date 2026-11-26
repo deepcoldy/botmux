@@ -1,5 +1,7 @@
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import { composerTextKey } from '../../utils/composer-text-key.js';
+import { traexQuestionFlowVisible } from '../../utils/traex-question-page.js';
+import { detectCodexChoiceModal } from '../../utils/codex-choice-modal.js';
 import type { SessionRenameSurface } from './types.js';
 
 /**
@@ -85,6 +87,8 @@ const STATUS_ROW = new RegExp(
  *  continuations and composer-draft continuations are indented two columns,
  *  so a quoted "❯ …" never reaches column 0. */
 const PROMPT_ROW = /^[›❯](?:[ \t]|$)/;
+/** Native status cells can be cut off by a cwd wider than the pane. */
+const TRUNCATED_STATUS_ROW = /^[ \t]*(?![^\r\n]*│)\S[^\r\n]* · [^\r\n]*…[ \t]*$/;
 
 /** Native /model overlays replace the composer. Match only the live tail
  * below the final rule, never an old menu quoted in the transcript. Return
@@ -116,6 +120,28 @@ export function traexViewportFooterBusy(screen: string): boolean {
   return STATUS_ROW.test(rows[composer - 2]!);
 }
 
+/** A model turn may keep the initialized, empty type-ahead composer visible.
+ * This is input evidence only, never an idle or rename-completion signal. */
+export function traexActiveEmptyComposerReady(screen: string): boolean {
+  const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
+  let composer = rows.length - 1;
+  while (composer >= 0 && !PROMPT_ROW.test(rows[composer]!)) composer--;
+  if (composer < 2 || !TRAEX_EMPTY_COMPOSER_HINTS.has(rows[composer]!.slice(1).trim())) return false;
+  const activity = rows[composer - 2]!;
+  if (!STATUS_ROW.test(activity) || !TRAEX_PROGRESS_PATTERN.test(activity)
+    || /Reviewing approval request|Queued for/i.test(activity)) return false;
+  // Do not accept the provisional shortcut-only surface. Model/context cells
+  // below this exact empty composer are independent initialization evidence.
+  const footer = rows.slice(composer + 1).filter(row => row.trim());
+  if (/^[ \t]*─+[ \t]*$/.test(footer[0] ?? '')) footer.shift();
+  if (!/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0] ?? '')
+    && !TRUNCATED_STATUS_ROW.test(footer[0] ?? '')) return false;
+  // Remove only the positively recognized model status row; all other draft,
+  // dialog, login, loading and footer checks remain in the existing predicate.
+  rows[composer - 2] = '';
+  return traexRestoredComposerReady(rows.join('\n'), { requireThreadReady: true });
+}
+
 interface TraexComposerDraft {
   body: string;
   collapsedChars?: number;
@@ -125,7 +151,7 @@ interface TraexComposerDraft {
  * carries only a length, never ownership of the content behind it. */
 function traexComposerDraft(
   screen: string,
-  opts: { requireThreadReady?: boolean } = {},
+  opts: { requireThreadReady?: boolean; allowBusy?: boolean } = {},
 ): TraexComposerDraft | undefined {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
@@ -136,6 +162,7 @@ function traexComposerDraft(
     if (!traexRestoredComposerReady(empty, {
       requireThreadReady: opts.requireThreadReady !== false,
       draftFooter: true,
+      allowBusy: opts.allowBusy === true,
     })) continue;
     const body = [rows[composer]!.slice(1), ...rows.slice(composer + 1, end)]
       .join('\n').trim();
@@ -180,19 +207,26 @@ function traexRenameDialogVisible(screen: string): boolean {
 /**
  * Where a native `/rename <title>` stands after its Enter (0.216.0, recorded).
  * `settled` only describes an empty composer; the worker still requires this
- * thread's durable rename receipt. `occupied` means a known busy turn, dialog
- * or user draft owns input and must outrank that receipt. `unknown` preserves
+ * thread's durable rename receipt. `occupied` means an ordinary busy turn.
+ * `blocked` means a dialog, picker, non-empty draft or paste chip explicitly
+ * owns the input focus and must never time out into delivery. `unknown` preserves
  * the receipt-based fallback for future native footer layouts.
  */
 export function traexSessionRenameSurface(screen: string, command: string): SessionRenameSurface {
-  if (traexViewportFooterBusy(screen) || traexModelPickerPage(screen) || traexRenameDialogVisible(screen)) {
-    return 'occupied';
+  if (traexModelPickerPage(screen) || traexRenameDialogVisible(screen) || traexQuestionFlowVisible(screen)
+    || detectCodexChoiceModal(screen)) {
+    return 'blocked';
   }
   if (traexRestoredComposerReady(screen)) return 'settled';
-  const draft = traexComposerDraft(screen);
-  if (!draft) return 'unknown';
-  if (draft.collapsedChars !== undefined) return 'occupied';
-  return composerTextKey(draft.body) === composerTextKey(command) ? 'unsubmitted' : 'occupied';
+  // Dialogs and actual composer content outrank busy chrome: a running turn
+  // can coexist with a draft, paste chip or half-typed /rename.
+  const draft = traexComposerDraft(screen, { allowBusy: true, requireThreadReady: false });
+  if (draft && !TRAEX_EMPTY_COMPOSER_HINTS.has(draft.body)) {
+    if (draft.collapsedChars !== undefined) return 'blocked';
+    return composerTextKey(draft.body) === composerTextKey(command) ? 'unsubmitted' : 'blocked';
+  }
+  if (traexViewportFooterBusy(screen)) return 'occupied';
+  return 'unknown';
 }
 
 /**
@@ -212,6 +246,8 @@ export function traexRestoredComposerReady(
      * the draft rows). TraeX swaps the native hint row for draft-only hints
      * then; only traexComposerHoldsInput judges such a surface. */
     draftFooter?: boolean;
+    /** Rename classification must still parse a draft while a turn is busy. */
+    allowBusy?: boolean;
   } = {},
 ): boolean {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
@@ -219,9 +255,9 @@ export function traexRestoredComposerReady(
   while (composer >= 0 && !PROMPT_ROW.test(rows[composer]!)) composer--;
   if (composer < 0 || !TRAEX_EMPTY_COMPOSER_HINTS.has(rows[composer]!.slice(1).trim())) return false;
   const footer = rows.slice(composer + 1).filter(row => row.trim());
-  // TraeX 0.209–0.211: optional bottom rule, initialized model/context row,
-  // then the access/shortcut row. Extra rows can be a draft, picker or dialog.
-  const hasBottomRule = /^[ \t]*─+[ \t]*$/.test(footer[0] ?? '');
+  // The optional bottom rule can be a line or a solid row of upper half-blocks.
+  // The solid rule starts at column zero; wrapped draft rows are indented.
+  const hasBottomRule = /^(?:[ \t]*─+|▀{3,})[ \t]*$/.test(footer[0] ?? '');
   if (hasBottomRule) footer.shift();
   if (footer.length < 1 || footer.length > 2) return false;
   // An owned native idle/done proves initialization even when a newer CLI
@@ -306,10 +342,9 @@ export function traexRestoredComposerReady(
   // pane only emits native status cells (toasts render above the composer),
   // so this arm deliberately trusts the footer-region geometry; revisit it if
   // a future build moves notification content below the composer.
-  const truncatedStatusRow = /^[ \t]*(?![^\r\n]*│)\S[^\r\n]* · [^\r\n]*…[ \t]*$/;
   if (!reportedIdleFooter && !repositoryNotice && !shortcutOnlyFooter
     && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)
-    && !truncatedStatusRow.test(footer[0]!)) return false;
+    && !TRUNCATED_STATUS_ROW.test(footer[0]!)) return false;
   // Only the model cell is initialization evidence; a cwd named "loading"
   // in a later footer cell must not strand an otherwise initialized prompt.
   if (!repositoryNotice && /\bloading\b/i.test(footer[0]!.split(' · ', 1)[0]!)) return false;
@@ -325,5 +360,6 @@ export function traexRestoredComposerReady(
   if (rows.slice(0, composer).some(row => /^(?:Sign in\b|Press (?:enter|return) to open (?:the )?browser\b|(?:waiting for|awaiting) authori[sz]ation\b)/i.test(row))) return false;
   // Check the live area above the composer, not stale quoted transcript rows.
   const live = rows.slice(Math.max(0, composer - 3), composer + 1).join('\n');
-  return !/(?:model|directory):[ \t]*loading\b|Resuming session|esc to interr?upt|Queued for (?:capacity|next turn)|Too many requests right now/i.test(live);
+  return opts.allowBusy === true
+    || !/(?:model|directory):[ \t]*loading\b|Resuming session|esc to interr?upt|Queued for (?:capacity|next turn)|Too many requests right now/i.test(live);
 }

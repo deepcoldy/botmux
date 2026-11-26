@@ -1728,13 +1728,6 @@ export interface BotConfig {
    */
   codexBrowser?: CodexBrowserConfig;
   /**
-   * Per-turn 上下文注入方式（#794）。`auto`：对支持的 CLI（目前仅 claude-code），
-   * 把 reminder/whiteboard 从 user turn 文本挪到 UserPromptSubmit hook 注入的
-   * system-reminder，终端输入框只保留消息本身；不支持的 CLI 自动回退内联。
-   * 缺省/`off`：保持内联 envelope（历史行为）。从下一个 follow-up turn 生效。
-   */
-  envelopeInjection?: 'auto' | 'off';
-  /**
    * 最终回复投递方式。`send`（除 doubao 外所有 CLI 的默认）：模型必须自己执行
    * `botmux send` 把回复发到飞书，系统提示与每轮 reminder 都这么要求。`transcript`
    * （自动转发最终回复，按需显式开启）：daemon 从 CLI 会话记录自动取本轮最后的
@@ -2165,6 +2158,12 @@ export interface BotConfig {
   /** 助理模式的人设模板目录：每次 spawn 覆盖同步进 owner 的 work/（模板有的覆盖、
    *  用户自己的文件保留）。缺省 = effectiveDefaultWorkingDir。 */
   assistantTemplateDir?: string;
+  /**
+   * 助理模式下是否允许多人群（默认关）。关着时只在真人只有 1 个的群里工作（bot 不计）；
+   * 真人 ≥2 的群消息一律不处理，被真人 @ 时回一句「助理模式不支持多人群」（同群 10 分钟最多一次）。
+   * 只在 assistantMode 开着时有意义。
+   */
+  assistantGroupChat?: boolean;
   /**
    * 是否接受**其他 bot** 通过 `botmux send --slash` 发来的原生斜杠命令
    * （/clear、/model、/close…）。默认开（undefined = 开）；只有显式 false 才关。
@@ -4665,9 +4664,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       durableImReplies: entry.durableImReplies === true || undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
-      // Only the non-default hook mode is persisted; absent, 'off', and invalid
-      // values all retain the historical inline behavior.
-      envelopeInjection: entry.envelopeInjection === 'auto' ? 'auto' : undefined,
+      // Legacy `envelopeInjection` ('auto' | 'off') keys in existing bots.json
+      // are compatibly ignored: Claude Code hook injection is now default-on.
       codexBrowser,
       codexRpcInput: typeof entry.codexRpcInput === 'boolean' ? entry.codexRpcInput : undefined,
       existingAppServer,
@@ -4781,6 +4779,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       assistantTemplateDir: typeof entry.assistantTemplateDir === 'string' && entry.assistantTemplateDir.trim()
         ? entry.assistantTemplateDir.trim()
         : undefined,
+      assistantGroupChat: entry.assistantGroupChat === true || undefined,
       messageQuota,
       grantDefaultDurationMs,
       quotaState,

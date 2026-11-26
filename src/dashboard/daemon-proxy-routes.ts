@@ -209,7 +209,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   },
   // p2p-mode：`{ p2pMode: 'chat'|'thread'|'group' }`（其余值清回扁平连续 chat 默认）。
   putBotConfig('p2p-mode'),
-  // envelope-injection：`{ envelopeInjection: 'auto'|'off'|'' }`（#794：hook 注入 per-turn 上下文）。
+  // envelope-injection：只读兼容代理（hook 注入已默认开启，避免旧客户端/缓存分包 404）。
   putBotConfig('envelope-injection'),
   putBotConfig('prompt-injection'),
   // topic-unavailable-policy：per-bot 原话题不可用策略，沿用既有 config store。

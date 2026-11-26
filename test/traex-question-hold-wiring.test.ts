@@ -17,8 +17,10 @@
  *  - the quiet page is never taken for a finished turn.
  */
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { productionConst } from './helpers/codex-async-answer-function-harness.js';
+import { TraexQuestionBridge } from '../src/core/traex-question-bridge.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import type { CliId } from '../src/adapters/cli/types.js';
@@ -120,6 +122,32 @@ function harness(cliId: CliId, opts: {
   for (const name of WORKER_FUNCTIONS) scope[name] = loadWorkerFunction(name, scope);
   return { scope, sent, logs, kicks: () => kicks, idleResets: () => idleResets, fn: (name: (typeof WORKER_FUNCTIONS)[number]) => scope[name] };
 }
+
+describe('native answer production wiring', () => {
+  function assemble() {
+    const runAnswer = vi.fn();
+    const write = vi.fn(async (_write: unknown, _page: unknown, _final: boolean) => true);
+    const bridge = productionConst('src/worker.ts', 'traexQuestionBridge', {
+      TraexQuestionBridge,
+      runTraexNativeAnswer: runAnswer,
+      traexQuestionWrite: write,
+      log: () => {},
+    });
+    return { deps: (bridge as any).deps, runAnswer, write };
+  }
+
+  it('injects the real native answer lifecycle into the bridge', () => {
+    const { deps, runAnswer } = assemble();
+    expect(deps.runAnswer).toBe(runAnswer);
+  });
+
+  it('marks only Enter as the final native answer write', async () => {
+    const { deps, write } = assemble();
+    await deps.writeKey('Enter', {});
+    await deps.writeKey('Down', {});
+    expect(write.mock.calls.map(call => call[2])).toEqual([true, false]);
+  });
+});
 
 describe('which sessions bridge the question page', () => {
   it('a TraeX session on the terminal path does', () => {

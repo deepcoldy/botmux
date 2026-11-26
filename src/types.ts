@@ -307,6 +307,8 @@ export interface FailedTurnRecord {
   turnId: string;
   userPrompt: string;
   cliInput: string;
+  /** Per-turn hook envelope stripped from `cliInput` in hook mode, retained for lossless replay. */
+  hookEnvelope?: string;
   codexAppInput?: CodexAppTurnInput;
   /** Daemon-retained attachments paired with the exact CLI input, for replay and quota handoff. */
   attachments?: LarkAttachment[];
@@ -365,6 +367,13 @@ export interface FailedTurnRewindDirective {
   mode: 'resend' | 'merge';
   /** What the CLI gets once the turn is cut. */
   content: string;
+  /** The final content already carries every hook envelope inline. The worker
+   * must retire (not rekey) this turn's sidecar only after the rewritten input
+   * is accepted; a failed respawn keeps the original sidecar for rollback. */
+  inlineEnvelope?: true;
+  /** Envelope expected to remain in this turn's sidecar for a resend. Kept so
+   * the worker can inline it after a rekey failure or restore it on rollback. */
+  hookEnvelope?: string;
 }
 
 /** Stable human/bot identity used only for principal-lane routing.  The
@@ -1208,6 +1217,8 @@ export interface Session {
   modelFallback?: ModelFallbackState;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Per-turn hook envelope stripped from lastCliInput in hook mode, retained for lossless retry/replay. */
+  lastHookEnvelope?: string;
   /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
   lastCliInputTurnId?: string;
   /** Structured companion for lastCliInput so retry_last_task can preserve a
@@ -2221,6 +2232,10 @@ export interface CodexAppGenerationCommit {
 /** A legacy CLI prompt plus an optional backend-specific structured sidecar. */
 export interface CliTurnPayload {
   content: string;
+  /** Per-turn metadata moved out of `content` into a prompt-ctx sidecar under
+   *  Claude Code UserPromptSubmit hook mode; retained by daemon for lossless
+   *  failed-turn retries and replays. */
+  hookEnvelope?: string;
   /** Daemon-frozen LinkRef mode plus admission-only source material. */
   linkRefs?: LinkRefTurnEnvelope;
   codexAppInput?: CodexAppTurnInput;
@@ -2338,7 +2353,7 @@ type DaemonToWorkerBase =
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
   | { type: 'request_next_step'; turnId: string; dispatchAttempt?: number; userPrompt?: string; answer: string }
-  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig | null; replyDelivery?: 'send' | 'transcript'; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true; failedTurnRewind?: FailedTurnRewindDirective }
+  | { type: 'message'; queueAfterActiveTurn?: true; content: string; nativeQuestionAnswer?: { requestId: string }; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig | null; replyDelivery?: 'send' | 'transcript'; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true; failedTurnRewind?: FailedTurnRewindDirective }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -2744,7 +2759,7 @@ export type WorkerToDaemonBase =
    * turn acknowledgement. Neither IPC arrival, queue ownership nor a generic
    * adapter `submitted` flag qualifies. The daemon covers shared group
    * background at this boundary; terminal completion stays the fallback. */
-  | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; dispatchAttempt?: number; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'claude_transcript_user_record'; nativeSessionId?: string; nativeTurnId?: string }
+  | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; dispatchAttempt?: number; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'codex_rpc_turn_steer' | 'claude_transcript_user_record'; nativeSessionId?: string; nativeTurnId?: string }
   | { type: 'traex_native_context_receipt'; receipt: import('./core/traex-native-context.js').TraexNativeContextReceipt }
   /** The CLI's UserPromptSubmit hook submitted a prompt that is, or starts
    * with, the text this worker wrote for this turn. Read before the model
@@ -2912,6 +2927,19 @@ export type WorkerToDaemonBase =
   | { type: 'cli_runtime_version'; version: string }
   /** Fresh local Codex process, never a reattachment to an existing pane. */
   | ({ type: 'codex_model_launch' } & import('./services/codex-model-selection.js').CodexModelLaunchObservation)
+  /** Codex entered an internal responses_retry backoff on a model capacity error
+   *  observed from `<CODEX_HOME>/logs_<N>.sqlite` before any rollout terminal. */
+  | {
+      type: 'codex_capacity_retry';
+      turnId: string;
+      nativeSessionId: string;
+      model?: string;
+      codexTurnId?: string;
+      retryAttempt?: number;
+      maxRetries?: number;
+      retryDelaySec?: number;
+      observedAtMs: number;
+    }
   /** The CLI said its own install changed under the running process (Pi after
    *  a global upgrade: on-demand modules then fail with "Cannot find module").
    *  The daemon retires the worker once the current turn settles, so the next
@@ -3287,6 +3315,8 @@ export type WorkerToDaemonBase =
       turnId: string;
       failedTurnId: string;
       outcome: 'rewound' | 'declined';
+      /** The final rewritten input no longer uses its sidecar. */
+      inlineEnvelope?: true;
       reason: string;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }

@@ -169,6 +169,19 @@ describe('re-delivery content and permission', () => {
     expect(userMessageExcerpt(bare)).toBe('继续看一下这个 PR');
   });
 
+  it('hook 模式开场与重投输入剥掉前置/后置上下文块体，任务行只显示用户原话', () => {
+    const hookOpening = [
+      '<role context="group">Internal role</role>',
+      '<chat_context_policy>Chat policy</chat_context_policy>',
+      '<shared_group_context>Group history</shared_group_context>',
+      '看下支付回调为什么失败',
+      '<attachments>file.log</attachments>',
+      '<botmux_link_refs>L1=https://example.test</botmux_link_refs>',
+    ].join('\n\n');
+    expect(userMessageExcerpt(hookOpening)).toBe('看下支付回调为什么失败');
+    expect(userMessageExcerpt(buildRecoveryRetryContent(hookOpening))).toBe('看下支付回调为什么失败');
+  });
+
   it('allows the sender (while allowed to talk) and admins only', () => {
     const base = { operatorOpenId: 'ou_asker', initiatorOpenId: 'ou_asker', operatorIsAdmin: false, operatorCanTalk: true };
     expect(recoveryRetryPermitted(base)).toBe(true);
