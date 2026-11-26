@@ -5680,6 +5680,16 @@ async function sendRawCommandLine(
     isCurrent: () => backend === be && cliSpawnGeneration === writeGeneration
       && cliLifetimeNonce === writeLifetime && !webTerminalInputWireDirty(),
   };
+  // Mojo is headless: write(content) submits a complete task, and a separate
+  // Enter is an empty task that it correctly refuses. Do not add a TUI beat or
+  // submit key; acceptance must clear readiness before native task completion
+  // re-arms the queue. Typing without submitting has no headless counterpart.
+  if (effectiveBackendType === 'mojo') {
+    if (opts.submit === false || !writeOptions.isCurrent() || be.write(content) === false) {
+      throw new Error('backend rejected command text or submit key input');
+    }
+    return;
+  }
   // `submit: false` types the line and leaves it in the composer; the caller
   // presses Enter itself. Used by the Codex effort controller, whose Enter must
   // come after a screen re-check (see typeRawCommandLine).
