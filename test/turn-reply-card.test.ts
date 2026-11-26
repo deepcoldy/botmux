@@ -619,6 +619,90 @@ describe('one reply card per turn', () => {
     expect(cards.get(retired.messageId!)).toContain('已由后续消息接续');
   });
 
+  it('silently retires a pure unpublished display under the publication barrier without creating a card', async () => {
+    const retired = await store.update(key, { kind: 'display_retired', silent: true }, io);
+    expect(retired.delivered).toBe(false);
+    expect(io.beforeEffect).toHaveBeenCalledOnce();
+    expect(io.send).not.toHaveBeenCalled();
+    expect(io.patch).not.toHaveBeenCalled();
+    expect(store.read(key)).toMatchObject({ phase: 'completed', displayRetired: true, progress: [] });
+    const persisted = store.read(key);
+    const replay = await new TurnReplyCardStore(dir).update(key, { kind: 'display_retired', silent: true }, io);
+    expect(replay.delivered).toBe(false);
+    expect(store.read(key)).toEqual(persisted);
+    expect(io.send).not.toHaveBeenCalled();
+    expect(io.patch).not.toHaveBeenCalled();
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    expect(io.send).not.toHaveBeenCalled();
+  });
+
+  it('replays silent native-CoT retirement without creating a ghost bubble or answer card', async () => {
+    const nativeKey = await nativeTurn('om_native_silent_replay');
+    await store.noteExternalFinal(nativeKey, input.chatId);
+    await store.update(nativeKey, { kind: 'display_retired', silent: true }, io);
+    const persisted = store.read(nativeKey);
+    await new TurnReplyCardStore(dir).update(nativeKey, { kind: 'display_retired', silent: true }, io);
+    expect(store.read(nativeKey)).toEqual(persisted);
+    expect(io.beforeCreate).not.toHaveBeenCalled();
+    expect(io.send).not.toHaveBeenCalled();
+    expect(io.patch).not.toHaveBeenCalled();
+  });
+
+  it('replays an unknown initial POST with its original UUID before silently retiring its display', async () => {
+    const send = io.send;
+    io.send = vi.fn(async (content, uuid) => {
+      await send(content, uuid);
+      throw new Error('connection lost after acceptance');
+    });
+    await expect(store.update(key, { kind: 'start' }, io)).rejects.toThrow('connection lost');
+    const original = vi.mocked(io.send).mock.calls[0];
+    io.send = vi.fn(send);
+    const retired = await new TurnReplyCardStore(dir).update(key, { kind: 'display_retired', silent: true }, io);
+    expect(vi.mocked(io.send).mock.calls[0]).toEqual(original);
+    expect(io.patch).toHaveBeenCalledOnce();
+    expect(retired.record).toMatchObject({
+      messageId: original[1], phase: 'completed', displayRetired: true,
+    });
+    expect(retired.record.pendingCreate).toBeUndefined();
+    expect(retired.record.pendingPatch).toBeUndefined();
+    expect(retired.record.publishPending).toBeUndefined();
+  });
+
+  it.each(['working', 'completed'] as const)('publishes a persisted %s final instead of treating its unseen record as an empty display', async phase => {
+    const answer = finalEvent('FINAL-PERSISTED-BEFORE-PUBLICATION');
+    const legacy = { ...store.read(key)!, phase,
+      finalCard: answer.card, finalText: answer.text, finalSource: answer.source };
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(legacy));
+    const retired = await store.update(key, { kind: 'display_retired', silent: true }, io);
+    expect(io.send).toHaveBeenCalledOnce();
+    expect(retired.record).toMatchObject({ phase: 'completed', finalText: answer.text, finalDelivered: true });
+    expect(cards.get(retired.messageId!)).toContain(answer.text);
+  });
+
+  it('preserves an existing terminal outcome and its facts during silent retirement', async () => {
+    const terminal = { ...store.read(key)!, phase: 'failed' as const,
+      progress: ['original failure'], durationMs: 456, completedAtMs: 123 };
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(terminal));
+    await new TurnReplyCardStore(dir).update(key, { kind: 'display_retired', silent: true }, io);
+    const retired = store.read(key)!;
+    expect(retired).toMatchObject({
+      phase: 'failed', progress: ['original failure'], durationMs: 456, completedAtMs: 123,
+    });
+    expect(retired.displayRetired).not.toBe(true);
+    expect(io.beforeEffect).toHaveBeenCalled();
+    expect(io.send).toHaveBeenCalledOnce();
+    expect(cards.get(retired.messageId!)).toContain('original failure');
+  });
+
+  it('leaves an unpublished record untouched when the publication barrier rejects ownership', async () => {
+    const before = store.read(key);
+    io.beforeEffect = vi.fn(() => { throw new Error('stale worker'); });
+    await expect(store.update(key, { kind: 'display_retired', silent: true }, io)).rejects.toThrow('stale worker');
+    expect(store.read(key)).toEqual(before);
+    expect(io.send).not.toHaveBeenCalled();
+    expect(io.patch).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('persists an image-free final after provider rejection with an existing card=%s', async existing => {
     if (existing) await store.update(key, { kind: 'start' }, io);
     const send = io.send;
