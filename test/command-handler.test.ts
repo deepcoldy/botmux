@@ -5335,7 +5335,11 @@ describe('handleCommand', () => {
 
       await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
 
-      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'slash' }));
+      expect(requestSessionRestart).toHaveBeenCalledWith(
+        ds,
+        expect.objectContaining({ source: 'slash' }),
+        { allowUnconfirmedActivationReplay: true },
+      );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
@@ -5403,7 +5407,11 @@ describe('handleCommand', () => {
 
       await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
 
-      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'slash' }));
+      expect(requestSessionRestart).toHaveBeenCalledWith(
+        ds,
+        expect.objectContaining({ source: 'slash' }),
+        { allowUnconfirmedActivationReplay: true },
+      );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
@@ -5419,7 +5427,11 @@ describe('handleCommand', () => {
 
       await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
 
-      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'slash' }));
+      expect(requestSessionRestart).toHaveBeenCalledWith(
+        ds,
+        expect.objectContaining({ source: 'slash' }),
+        { allowUnconfirmedActivationReplay: true },
+      );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
