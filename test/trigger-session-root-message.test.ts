@@ -46,7 +46,7 @@ const mockCreateSession = vi.fn();
 const mockUpdateSession = vi.fn();
 const mockCloseSession = vi.fn();
 const assistant = vi.hoisted(() => ({ spawn: { kind: 'off' } as any }));
-vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => assistant.spawn }));
+vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => assistant.spawn, assistantMultiUserGroupsOff: () => false }));
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
