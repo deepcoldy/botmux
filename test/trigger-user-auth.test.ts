@@ -124,12 +124,12 @@ describe('parseTriggerUserAuthConfig', () => {
     expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: 'nope' })).toThrow(/object/);
   });
 
-  it('accepts and ignores dispatch-only scopes while the policy is disabled', () => {
+  it('retains valid dormant dispatch scopes without activating them', () => {
     const valid = { tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] };
     // A natural manual kill switch: turning `enabled` off must not invalidate
     // the whole bots.json load, even if the dormant scope is malformed.
     const disabled = parseTriggerUserAuthConfig({ enabled: false, tools: [], dispatchOnly: valid });
-    expect(disabled).not.toHaveProperty('dispatchOnly');
+    expect(disabled?.dispatchOnly).toEqual(valid);
     expect(disabled?.enabled).toBe(false);
     const malformed = parseTriggerUserAuthConfig({ enabled: false, dispatchOnly: { tools: ['nope'] } });
     expect(malformed).not.toHaveProperty('dispatchOnly');

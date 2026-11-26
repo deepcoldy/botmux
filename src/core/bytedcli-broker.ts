@@ -1,3 +1,4 @@
+import { runBytedcliSafeCommand } from './bytedcli-safe-commands.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -17,6 +18,7 @@ import type { BytedcliOperation } from './bytedcli-operation-policy.js';
 import type { ProcessIdentity } from './current-actor-attestation.js';
 export interface BytedcliBrokerDependencies {
   readonly authority: (sessionId:string,peer:ProcessIdentity,operation:BytedcliOperation,context?:BytedcliAuthorityRequestContext) => Promise<BytedcliAuthorityResult>;
+  readonly personalLeases?: () => Promise<import('./bytedcli-broker-credentials.js').BytedcliLeaseResolver>;
   readonly currentWorkerGeneration?: (sessionId:string)=>number|undefined;
   readonly executor: {execute:(request:BytedcliExecutionRequest)=>Promise<BytedcliExecResponse>;
     retireSession:(sessionId:string,workerGeneration?:number)=>Promise<void>; close:()=>Promise<void>};
@@ -110,9 +112,14 @@ export class BytedcliBroker {
       const current=await result.authority.recheck();
       if(current)return answer(res,403,failed(current));
       if(controller.signal.aborted)return answer(res,408,failed(deadline?'timeout':'cancelled'));
-      this.preauth--;preauthHeld=false;
-      submitted=true;
-      const response=await this.deps.executor.execute({requestId,operation,authority:result.authority,signal:controller.signal});
+      const safe = operation.effect === 'help' || operation.effect === 'auth';
+      // Keep the preauth slot until safe adapter provider work settles. Business
+      // operations transfer ownership to the executor's bounded queue instead.
+      if (!safe) { this.preauth--;preauthHeld=false; }
+      submitted=!safe;
+      const execution = {requestId,operation,authority:result.authority,signal:controller.signal};
+      const response=safe ? await runBytedcliSafeCommand(execution,this.deps.personalLeases)
+        : await this.deps.executor.execute(execution);
       executorOutcome=response.outcome;
       const after=await result.authority.recheck();
       if(after||controller.signal.aborted)return answer(res,403,failed(after??(deadline?'timeout':'cancelled')));
@@ -161,12 +168,14 @@ export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-brok
       runtimeExecutable:layout.runtimeExecutable,path:layout.path,probeHome:home,probeCwd:cwd,signal});}
     finally{rmSync(root,{recursive:true,force:true});}
   };
+  let personalLeases: Promise<import('./bytedcli-broker-credentials.js').BytedcliLeaseResolver> | undefined;
+  const getLeases=()=>personalLeases??=createBytedcliHostCredentialResolver({machineHome:layout.machineHome,machineProfile:layout.machineProfile,privateRoot:layout.privateRoot,trustedCli,networkEnv:layout.networkEnv});
   const getExecutor=()=>pending??=(async()=>{
-    const leases=await createBytedcliHostCredentialResolver({machineHome:layout.machineHome,machineProfile:layout.machineProfile,privateRoot:layout.privateRoot,trustedCli,networkEnv:layout.networkEnv});
+    const leases=await getLeases();
     executor=new BytedcliExecutor({privateRoot:layout.privateRoot,trustedCli,leases,audit:new BytedcliBrokerAudit(layout.auditRoot),networkEnv:layout.networkEnv});
     if(closed)await executor.close();return executor;
   })();
-  return new BytedcliBroker({currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,contains:ds=>{
+  return new BytedcliBroker({personalLeases:getLeases,currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,contains:ds=>{
     if(bytecloudBrokerEnabled(host.policy(ds)))markBytedcliStrictSession(ds);
     return bytedcliContainmentAvailable(ds,layout.protectedRoots);
   }},sessionId,peer,operation,context),executor:{execute:async request=>{

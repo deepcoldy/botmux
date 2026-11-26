@@ -166,6 +166,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
   { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: [
     'botDefaults.triggerUserAuthToggle',
+    'botDefaults.bytecloudExecution',
     'botDefaults.triggerUserAuthSource',
     'botDefaults.triggerUserAuthSourceDefault',
     'botDefaults.triggerUserAuthDelegateOnMention',
@@ -491,6 +492,9 @@ export type BotDefaultsRow = {
     legacyCapabilities?: boolean;
     /** A shared mode or separate modes for Feishu and ByteCloud. */
     credentialSource?: TriggerUserAuthCredentialSourceConfig;
+    bytecloudExecution?: 'trigger-user' | 'read-machine-write-actor';
+    allowOwnerActor?: boolean;
+    dispatchOnly?: import('../../services/trigger-user-auth.js').TriggerUserAuthConfig['dispatchOnly'];
     /** `--mention` handoffs to bots on this machine carry this turn's sender.
      *  Absent = on (the default); only `false` is stored. */
     delegateOnMention?: boolean;

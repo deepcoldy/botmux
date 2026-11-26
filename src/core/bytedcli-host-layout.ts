@@ -1,3 +1,4 @@
+import { readGlobalConfig } from '../global-config.js';
 import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
@@ -49,5 +50,5 @@ let frozenLayout: BytedcliHostLayout | undefined;
 /** Machine configuration must be installed before the first worker/broker. */
 export function freezeBytedcliHostLayout(layout?: BytedcliHostLayout): BytedcliHostLayout {
   if (layout && frozenLayout && layout !== frozenLayout) throw new Error('ByteCloud host layout already frozen');
-  return frozenLayout ??= layout ?? bytedcliTrustedHostLayout();
+  return frozenLayout ??= layout ?? bytedcliTrustedHostLayout(readGlobalConfig().bytedcliBroker);
 }

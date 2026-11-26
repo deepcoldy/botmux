@@ -64,12 +64,15 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
   if(context?.freezeGeneration && !context.freezeGeneration(execution.workerGeneration))return fail('execution_stale');
   const ds = proof.ds, worker = ds.worker;
   const identityTurn = execution.identityTurnId ?? execution.turnId;
+  const needsActor = operation.effect === 'write' || operation.effect === 'auth';
   const policy = deps.policy(ds), fingerprint = stable(policy);
   if (!bytecloudBrokerEnabled(policy)) return fail('broker_disabled');
   if (!deps.contains(ds)) return fail('broker_containment_unavailable');
   const caller = callerFor(ds,identityTurn), callerKey = stable(caller);
   const delegated = currentLarkToolDelegation(deps.dataDir,sessionId,identityTurn), delegationKey = stable(delegated);
   const taskId = parseScheduledTurnId(identityTurn);
+  // Business delegation/scheduled run scopes do not grant personal auth control.
+  if (operation.effect === 'auth' && (delegated || taskId || isOwnerActorTurnId(identityTurn) || caller?.senderType !== 'user')) return fail('actor_required');
   const record = taskId ? deps.schedule(ds.larkAppId,taskId) : undefined;
   const schedule = record ? structuredClone(record) : undefined;
   const scheduledCaller = schedule ? trustedCallerForScheduledTask(schedule.task,ds.larkAppId) : undefined;
@@ -101,7 +104,7 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
     : caller?.requestUserOpenId);
   const epochReader = deps.authEpoch ?? readCliAuthEpoch;
   const bindingReader = deps.bindingKey ?? activePlatformCredentialBindingKey;
-  const epoch = operation.effect === 'write' && credentialOpenId ? epochReader(credentialOpenId) : undefined;
+  const epoch = needsActor && credentialOpenId ? epochReader(credentialOpenId) : undefined;
   const binding = bindingReader();
   const synchronousCheck = ():BytedcliExecErrorCode | undefined => {
     if (!currentTurnPeerAttestationStable(proof,input) || ds.worker !== worker
@@ -114,8 +117,8 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
     const currentDelegation=currentLarkToolDelegation(deps.dataDir,sessionId,identityTurn);
     if (stable(currentDelegation) !== delegationKey || currentDelegation?.recheck !== delegated?.recheck
       || currentDelegation?.taskAuthorized !== delegated?.taskAuthorized) return 'delegation_revoked';
-    if (operation.effect === 'write' && credentialOpenId && epochReader(credentialOpenId) !== epoch) return 'authorization_revoked';
-    if (operation.effect === 'write' && bindingReader() !== binding) return 'binding_changed';
+    if (needsActor && credentialOpenId && epochReader(credentialOpenId) !== epoch) return 'authorization_revoked';
+    if (needsActor && bindingReader() !== binding) return 'binding_changed';
   };
   const recheck = async ():Promise<BytedcliExecErrorCode | undefined> => {
     const error = synchronousCheck(); if (error) return error;
@@ -125,7 +128,7 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
   const initial = await recheck(); if (initial) return fail(initial);
   if(context?.signal.aborted)return fail('cancelled');
   let actor:BytedcliFrozenAuthority['actor'];
-  if (operation.effect === 'write') {
+  if (needsActor) {
     if (isOwnerActorTurnId(identityTurn) || (!delegated && (scheduledCaller ?? caller)?.senderType !== 'user')
       || (taskId && (!schedule?.runScopes.includes('bytedcli') || !trustedCallerForScheduledTask(schedule.task,ds.larkAppId)))) return fail('actor_required');
     const unionId = delegated?.unionId ?? scheduledCaller?.requestUserUnionId ?? caller?.requestUserUnionId;

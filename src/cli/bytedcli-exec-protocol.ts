@@ -23,7 +23,7 @@ export interface BytedcliExecRequest {
 export const BYTEDCLI_EXEC_ERROR_CODES = [
   'invalid_request', 'unsupported_operation', 'unsupported_cli_version', 'broker_disabled',
   'broker_containment_unavailable', 'execution_unverified', 'execution_stale', 'permission_denied',
-  'actor_required', 'actor_auth_required', 'actor_identity_unverified', 'machine_auth_required',
+  'personal_auth_control_required', 'actor_required', 'actor_auth_required', 'actor_identity_unverified', 'machine_auth_required',
   'region_auth_required', 'authorization_revoked', 'binding_changed', 'delegation_revoked',
   'policy_changed', 'busy', 'timeout', 'cancelled', 'input_limit', 'output_limit', 'audit_unavailable',
   'executor_unavailable', 'upstream_failed', 'write_outcome_unknown', 'internal_error',

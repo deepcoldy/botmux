@@ -1,3 +1,4 @@
+import { bytecloudBrokerEnabled } from '../../core/identity-policy.js';
 import {
   TASK_ROUTING_COST_TIERS,
   TASK_ROUTING_LIMITS,
@@ -5071,6 +5072,8 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
   const { bot, patchBot } = props;
   const policy = bot.triggerUserAuth ?? null;
   const enabled = policy?.enabled === true;
+  const execution = policy?.bytecloudExecution ?? 'trigger-user';
+  const strict = bytecloudBrokerEnabled(policy ? { ...policy, tools: policy.tools ?? ['lark-cli', 'bytedcli'] } : undefined);
   const capabilities = policy?.capabilities ?? ['lark-user' as const, 'bytecloud' as const, 'meego' as const];
   const credentialSource = policy?.credentialSource ?? 'auto';
   const sourceOverrides = typeof credentialSource === 'object' ? credentialSource : undefined;
@@ -5129,9 +5132,12 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
     });
   }
 
-  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean; gitCommitIdentity?: boolean }) {
+  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean; gitCommitIdentity?: boolean; bytecloudExecution?: typeof execution }) {
+    const { legacyCapabilities: _legacy, ...preserved } = policy ?? {};
     return {
+      ...preserved,
       enabled: true,
+      bytecloudExecution: next.bytecloudExecution ?? execution,
       capabilities: next.capabilities ?? capabilities,
       credentialSource: next.credentialSource ?? credentialSource,
       delegateOnMention: next.delegateOnMention ?? delegateOnMention,
@@ -5165,8 +5171,24 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
         dataAction="toggle-trigger-user-auth"
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
-        onChange={checked => void save(checked ? policyWith({}) : null)}
+        onChange={checked => void save({ ...policyWith({}), enabled: checked })}
       />
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.bytecloudExecution')}</span>
+          <select data-action="trigger-user-auth-bytecloud-execution" value={execution} disabled={busy}
+            onChange={event => void save({ ...policyWith({ bytecloudExecution: event.currentTarget.value as typeof execution }), enabled })}>
+            <option value="trigger-user">{tr('botDefaults.bytecloudExecutionActor')}</option>
+            <option value="read-machine-write-actor">{tr('botDefaults.bytecloudExecutionSplit')}</option>
+          </select>
+        </label>
+      </div>
+      {execution === 'read-machine-write-actor' ? <p className="bd-section-note" data-action="trigger-user-auth-bytecloud-state" data-active={strict}>
+        {tr(strict ? 'botDefaults.bytecloudExecutionSelected' : 'botDefaults.bytecloudExecutionInactive')}
+      </p> : null}
+      {execution === 'read-machine-write-actor' ? <p className="bd-section-note" data-action="trigger-user-auth-bytecloud-restrictions">
+        {tr('botDefaults.bytecloudExecutionRestrictions')}
+      </p> : null}
       {enabled ? (
         <>
           <div className="bd-row">
@@ -5180,7 +5202,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
                   disabled={busy}
                   onChange={event => toggleCapability(capability, event.currentTarget.checked)}
                 />
-                <span>{tr(`botDefaults.triggerUserAuthCapability.${capability}`)}</span>
+                <span>{tr(strict && capability === 'bytecloud' ? 'botDefaults.bytecloudBrokerCapability' : `botDefaults.triggerUserAuthCapability.${capability}`)}</span>
               </label>
             ))}
           </div>
@@ -5222,7 +5244,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
               {sourceCapabilities.map(capability => (
                 <div key={capability} className="bd-row">
                   <label>
-                    <span>{tr(`botDefaults.triggerUserAuthCapability.${capability}`)}</span>
+                    <span>{tr(strict && capability === 'bytecloud' ? 'botDefaults.bytecloudBrokerCapability' : `botDefaults.triggerUserAuthCapability.${capability}`)}</span>
                     <select
                       data-action={`trigger-user-auth-source-${capability}`}
                       value={sourceOverrides[capability] ?? ''}
@@ -5237,7 +5259,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
               ))}
             </>
           ) : null}
-          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthSourceHelp')}</p>
+          <p className="bd-section-note">{tr(strict ? 'botDefaults.bytecloudBrokerSourceHelp' : 'botDefaults.triggerUserAuthSourceHelp')}</p>
           {platformCapable && info?.platformBound === false ? (
             <p className="bd-section-note" data-trigger-user-auth-platform="unbound">
               ⚠️ {tr(platformOnly
@@ -5261,7 +5283,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
           />
           <ToggleRow
             checked={allowSpeakerSwitch}
-            disabled={busy || (info?.crossPrincipalIsolation === true && !allowSpeakerSwitch)}
+            disabled={busy || strict || (info?.crossPrincipalIsolation === true && !allowSpeakerSwitch)}
             dataAction="toggle-trigger-user-auth-allow-speaker-switch"
             title={tr('botDefaults.triggerUserAuthAllowSpeakerSwitch')}
             help={tr('botDefaults.triggerUserAuthAllowSpeakerSwitchHelp')}
@@ -5278,8 +5300,8 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
             help={tr('botDefaults.triggerUserAuthGitCommitIdentityHelp')}
             onChange={checked => saveWith({ gitCommitIdentity: checked })}
           />
-          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthCapabilityNote')}</p>
-          {capabilities.includes('bytecloud') ? (
+          <p className="bd-section-note">{tr(strict ? 'botDefaults.bytecloudBrokerAuthNote' : 'botDefaults.triggerUserAuthCapabilityNote')}</p>
+          {capabilities.includes('bytecloud') && !strict ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
           ) : null}
           {typeof info?.authorizedCount === 'number' ? (

@@ -92,3 +92,18 @@ it('allows host-authorized ownerless scheduled shared reads while fencing task l
  record={...record,state:'active',task:{...record.task,chatId:'oc_foreign'}};
  expect(await resolveBytedcliAuthority(deps,'s-authority',{pid:process.pid,procStart:readProcessStartIdentity(process.pid)!},read)).toMatchObject({errorCode:'permission_denied'});
 });
+
+it.each(['status','userinfo','login','logout'])('auth %s requires verified direct personal authority and fences revocation',async action=>{
+ const f=setup();const operation=parseBytedcliOperation(['auth',action]);
+ const result=await resolve(f,operation);expect(result.ok).toBe(true);
+ if(!result.ok)return;expect(result.authority.actor?.credentialOpenId).toBe('ou_A');expect(f.identities()).toBe(1);
+ f.change('epoch');expect(await result.authority.recheck()).toBe('authorization_revoked');
+});
+it('business delegation never conveys control of personal authorization',async()=>{
+ const f=setup();rememberLarkToolDelegation(dataDir,'s-authority','executing-A',{targetOpenId:'ou_target',credentialOpenId:'ou_source',unionId:'on_human',tools:['bytedcli'],dispatchRoot:'root'});
+ expect(await resolve(f,parseBytedcliOperation(['auth','login']))).toMatchObject({ok:false,errorCode:'actor_required'});
+});
+it('help does not resolve personal contact identity',async()=>{
+ const f=setup();delete f.ds.managedTurnOrigin.trustedCaller;
+ expect((await resolve(f,parseBytedcliOperation(['--help']))).ok).toBe(true);expect(f.identities()).toBe(0);
+});

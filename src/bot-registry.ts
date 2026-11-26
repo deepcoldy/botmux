@@ -1840,6 +1840,8 @@ export interface BotConfig {
    * platform-bound machine the link points at the platform and no machine-local
    * device login is started. See services/trigger-user-auth.ts.
    */
+  /** Includes dormant bytecloudExecution and per-capability/owner/delegation/git
+   * choices; parseTriggerUserAuthConfig is shared with saves and Dashboard. */
   triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
   /**
    * lark-cli 应用绑定开关（默认开启）。

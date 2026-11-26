@@ -40,6 +40,8 @@ Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话
 - **CLI 不感知飞书上下文** — 把机器人拉进话题群 / oncall 群，@ 一句就在你本机的代码库里开跑；会话可以用 `/relay` 原样搬到另一个群，上下文一点不丢。
 - **单个 Agent 不够用** — 同一个群里放多个不同 CLI 的机器人，@ 谁谁干活，让 Claude Code 和 Codex 一起 review 同一个 MR、各自独立分析、观点不同自动互怼。
 
+
+可选的 [ByteCloud 读写身份分离](docs/bytedcli-read-write-identity.md)：已审计读取用机器账号，写入用当前执行人的个人授权，适用于受支持的 Linux 隔离会话。
 ## 5 分钟接入
 
 > 一次飞书扫码即可连续建好应用、配全权限并自动发版（手动粘贴凭证也是可选路径）。不需要飞书时用 `botmux setup add --local`，或在 Dashboard「添加机器人」里选「仅本地」。写进 `bots.json` 的 `local_*` id 只是本机身份，不是飞书 App ID。

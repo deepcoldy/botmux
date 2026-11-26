@@ -1,3 +1,4 @@
+import { freezeBytedcliHostLayout } from './core/bytedcli-host-layout.js';
 import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from './core/cli-execution-mode.js';
 import { resolveNativeScheduledControlActor } from './core/scheduled-control-actor.js';
 import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
@@ -36976,6 +36977,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (coreOnly) armCoreOnlyReadinessGate();
   setCrossPrincipalInterruptionDisableHandler(() => cancelAllCrossPrincipalInterruptionsForFeatureDisable());
   const ipcHandle = await startIpcServer({
+    bytedcliHostLayout: freezeBytedcliHostLayout(),
     port: ipcPort,
     host: '127.0.0.1',
     authRequired: true,

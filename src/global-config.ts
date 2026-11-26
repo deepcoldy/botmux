@@ -1,3 +1,4 @@
+import { parseBytedcliMachineProfile } from './core/bytedcli-broker-credentials.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 /**
  * Global botmux configuration stored at `~/.botmux/config.json`.
@@ -309,7 +310,19 @@ export const SCHEDULE_CHILD_ONE_SHOT_MAX_DELAY_MINUTES = 7 * 24 * 60;
 export const SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_TASKS_PER_TURN = 1;
 export const SCHEDULE_CHILD_ONE_SHOT_MAX_TASKS_PER_TURN = 16;
 
+/** Invalid host identity selection must never silently become the default account. */
+export function parseBytedcliBrokerConfig(raw: unknown): { machineProfile?: string } | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => key !== 'machineProfile')) {
+    throw new Error('invalid bytedcliBroker config');
+  }
+  const machineProfile = parseBytedcliMachineProfile((raw as { machineProfile?: unknown }).machineProfile);
+  return machineProfile ? { machineProfile } : {};
+}
+
 export interface GlobalConfig {
+  /** Host only; frozen before the first worker/broker. Change requires a new daemon generation. */
+  bytedcliBroker?: { machineProfile?: string };
   lang?: Locale;
   /** Machine-wide LinkRef rollout setting. Missing keeps legacy behavior. */
   linkRefs?: LinkRefConfig;
@@ -1115,6 +1128,8 @@ export function readGlobalConfig(): GlobalConfig {
   const raw = readRawConfig();
   lastConfiguredProtectedMcpEnvKeys = protectedMcpConfiguredEnvKeys(raw.protectedMcpCapabilities);
   const out: GlobalConfig = {};
+  const bytedcliBroker = parseBytedcliBrokerConfig(raw.bytedcliBroker);
+  if (bytedcliBroker) out.bytedcliBroker = bytedcliBroker;
   if (isLocale(raw.lang)) out.lang = raw.lang;
   const linkRefs = normalizeLinkRefConfig(raw.linkRefs);
   if (linkRefs) out.linkRefs = linkRefs;
@@ -1468,6 +1483,7 @@ export function repoPickerScanOptions(): ProjectScanOptions {
  *  a known key from the file. */
 export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, GlobalConfig[keyof GlobalConfig] | null>>): void {
   assertDurableConfigMutationAllowed('global');
+  if (patch.bytedcliBroker != null) parseBytedcliBrokerConfig(patch.bytedcliBroker);
   const path = globalConfigPath();
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });

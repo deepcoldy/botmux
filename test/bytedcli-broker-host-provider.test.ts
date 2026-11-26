@@ -77,3 +77,17 @@ describe('production host credential assembly through fake SDK only', () => {
     expect(s.calls).toEqual([]);
   });
 });
+
+it('personal status projection uses the trusted minimal-env host runner without exposing provider bodies',async()=>{
+ const s=setup();mkdirSync(bytedcliHomeFor(s.request.actor.credentialOpenId),{recursive:true,mode:0o700});
+ const resolver=await createBytedcliHostCredentialResolver(s.options);
+ const {runBytedcliSafeCommand}=await import('../src/core/bytedcli-safe-commands.js');
+ const {parseBytedcliOperation}=await import('../src/core/bytedcli-operation-policy.js');
+ const response=await runBytedcliSafeCommand({requestId:'safe-status',operation:parseBytedcliOperation(['auth','userinfo']),
+  authority:{daemonBootId:'b',botAppId:'app',sessionId:'s',turnId:'t',workerGeneration:1,dispatchAttempt:0,policyFingerprint:'p',actor:s.request.actor,recheck:async()=>undefined}},async()=>resolver);
+ expect(JSON.parse(Buffer.from(response.stdoutBase64,'base64').toString())).toEqual({state:'authorized',identity:'actor',source:'local',email:'person@example.test'});
+ expect(s.calls.filter(call=>call.argv.includes('status')).every(call=>call.env.HOME===bytedcliHomeFor(s.request.actor.credentialOpenId))).toBe(true);
+ expect(s.calls.every(call=>!call.argv.includes('--profile')&&!call.argv.includes('login')&&!call.argv.includes('logout'))).toBe(true);
+ expect(response.stdoutBase64).not.toContain(Buffer.from(s.jwt).toString('base64'));
+ expect(platform.calls).toEqual([]);
+});
