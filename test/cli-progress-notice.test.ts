@@ -313,7 +313,7 @@ describe('worker progress observation independent of display cap', () => {
       THINKING_ACCUMULATED_CAP: 60_000, thinkingCapNoted: true,
     };
     const observe = loadWorkerFunction('observeCotEntries', scope);
-    observe([{ kind, text: 'private-content', args: 'private-arguments', result: 'private-result' }], { turnId: 'om_turn' });
+    observe([{ kind, id: 'call_progress', name: 'private-tool', text: 'private-content', args: 'private-arguments', result: 'private-result' }], { turnId: 'om_turn' });
     if (stage) expect(send).toHaveBeenCalledExactlyOnceWith({ type: 'turn_progress', turnId: 'om_turn', stage });
     else expect(send).not.toHaveBeenCalled();
   });

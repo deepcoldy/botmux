@@ -1226,7 +1226,7 @@ import { CODEX_ASYNC_RESTORE_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnsw
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
 import { submitDocumentAskReply } from './core/ask-broker.js';
-import { shouldReturnAskStartupNotReady, isNativeAsyncAskOrigin } from './core/ask-types.js';
+import { shouldReturnAskStartupNotReady, isNativeAsyncAskOrigin, NATIVE_STANDALONE_ASK_ORIGIN } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 import { replyCardAskTarget } from './core/turn-reply-ask.js';
@@ -12469,6 +12469,9 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         : askSession.session.rootMessageId,
     });
   }
+  if (boundAsk.originKind === NATIVE_STANDALONE_ASK_ORIGIN && !boundAsk.requestId) {
+    return jsonRes(res, 409, { ok: false, error: 'native_question_request_required' });
+  }
   if (askSession?.session.vcMeetingReceiver) {
     // A meeting receiver ask would post a Lark card outside the managed action
     // ledger/provider-idempotency boundary. Durable replay could therefore
@@ -12651,6 +12654,38 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
       : undefined, presentation)
     : await registerAskForResponse({ ...askInput, ...presentation }, res);
   if (res.destroyed) return;
+
+  if (boundAsk.originKind === NATIVE_STANDALONE_ASK_ORIGIN && askSession && result.kind === 'answered') {
+    const actor = askAnswerActorFor(result);
+    const byIsBot = actor?.botSender === true || isKnownPeerBot(config.session.dataDir, askSession.larkAppId, result.by);
+    const byType = byIsBot ? true : actor ? (actor.senderType === 'user' ? false : undefined) : false;
+    const sender = await resolveSender(askSession.larkAppId, result.by, byIsBot ? 'bot' : 'user');
+    const trustedCaller = await trustedCallerForInboundTurn(boundAsk.larkAppId, result.by, actor?.memberUnionId, byType);
+    if (!askGeneration || !isCurrentRoutingGeneration(askGeneration) || askSession.worker !== askWorker) {
+      return jsonRes(res, 409, { ok: false, error: 'async_answer_not_delivered' });
+    }
+    const question = boundAsk.questions[0];
+    const text = result.customAnswers?.[0]?.trim() || result.comment?.trim()
+      || result.answers[0].map(key => question.options.find(option => option.key === key)!.label).join('\n');
+    const turnId = `native-question-answer-${boundAsk.requestId}`;
+    const replyRoot = boundAsk.rootMessageId
+      ?? (askTurnTarget?.mode === 'thread' ? askTurnTarget.rootMessageId : undefined);
+    beginReplyTargetTurn(askSession, replyRoot, turnId, new Date().toISOString(), {
+      senderOpenId: result.by, participants: [{ openId: result.by, isBot: byIsBot }], inThread: !!replyRoot,
+    });
+    await noteTurnReceived(askSession, turnId, text, sender, turnId);
+    const trustedController = trustedSessionController(askSession);
+    if (!isCurrentRoutingGeneration(askGeneration) || askSession.worker !== askWorker
+      || !sendWorkerSessionInput(askSession, { type: 'message', content: text,
+        nativeQuestionAnswer: { requestId: boundAsk.requestId! }, turnId, atMostOnce: true,
+        ...(trustedCaller ? { trustedCaller } : {}), ...(trustedController ? { trustedController } : {}) })) {
+      return jsonRes(res, 409, { ok: false, error: 'async_answer_not_delivered' });
+    }
+    beginNewTurn(askSession, '原生异步提问答复', turnId);
+    markSessionActivity(askSession);
+    sessionStore.updateSession(askSession.session);
+    logger.info(`[${boundAsk.sessionId.slice(0, 8)}] native question ${boundAsk.requestId} answer admitted as ${turnId}`);
+  }
 
   if (asyncInput && askSession && result.kind === 'answered') {
     const isCurrent = isAsyncAskCurrent;

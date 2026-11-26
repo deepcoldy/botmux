@@ -25,6 +25,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { DaemonToWorker } from '../src/types.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -37,10 +38,11 @@ vi.setConfig({ testTimeout: 180_000 });
  * key wins the merge and rewrites session routing). Recording only the JWT made
  * that test a restatement of the validator unit test.
  */
-function writeJwtRecorder(root: string, dump: string): void {
+function writeJwtRecorder(root: string, dump: string, completionDelayMs = 0): void {
   const bin = join(root, 'mojo');
   writeFileSync(bin, `#!/usr/bin/env bash
 echo "[$X_JWT_TOKEN] sid=$BOTMUX_SESSION_ID" >> ${dump}
+${completionDelayMs > 0 ? 'sleep ' + completionDelayMs / 1000 : ''}
 echo '{"type":"system","subtype":"init","session_id":"sid-x"}'
 echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-x","warnings":[]}'
 `);
@@ -108,10 +110,10 @@ interface Harness {
   msgs: Array<{ type: string; message?: string }>;
 }
 
-function bootWorker(opts: { mojo?: Record<string, unknown>; appId?: string }): Harness {
+function bootWorker(opts: { mojo?: Record<string, unknown>; appId?: string; completionDelayMs?: number }): Harness {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-xb-')));
   const dump = join(root, 'jwts.txt');
-  writeJwtRecorder(root, dump);
+  writeJwtRecorder(root, dump, opts.completionDelayMs);
   const appId = opts.appId ?? 'app_xb';
   writeFileSync(join(root, 'bots.json'), JSON.stringify([{
     larkAppId: appId, larkAppSecret: 'secret',
@@ -307,13 +309,13 @@ describe('mojo cross-boundary contracts', () => {
     } finally { teardown(h); }
   });
 
-  it('2c. a passthrough turn honours a cleared credential', async () => {
+  it.each([0, 500])('2c. a passthrough turn honours a cleared credential (completion delay %d ms)', async completionDelayMs => {
     // /compact, /model and friends arrive as `raw_input`, not `message`. That IPC
     // carried no credential snapshot and the worker applied none, yet for mojo it
     // becomes a REAL turn (MojoBackend has no sendText, so it falls through to
     // be.write()). A cleared or rotated JWT therefore did not apply to any of
     // these turns — the stale token was used again.
-    const h = bootWorker({ mojo: { jwtEnv: 'MY_JWT', env: { MY_JWT: 'stale-A' } } });
+    const h = bootWorker({ mojo: { jwtEnv: 'MY_JWT', env: { MY_JWT: 'stale-A' } }, completionDelayMs });
     try {
       h.child.send({
         type: 'init',
@@ -337,6 +339,7 @@ describe('mojo cross-boundary contracts', () => {
       h.child.send({ type: 'raw_input', content: '/model', mojoLivePatch: { jwt: null } } as DaemonToWorker);
       await waitFor(() => lines(h.dump).length >= 3, 30_000, () => `second passthrough never ran\n${h.logs.join('')}`);
       expect(lines(h.dump)[2]).toBe('[]');
+      expect(h.logs.join('')).not.toContain('Passthrough slash command failed');
     } finally { teardown(h); }
   });
 
@@ -447,5 +450,40 @@ describe('mojo cross-boundary contracts', () => {
       rmSync(perBot, { recursive: true, force: true });
       teardown(h);
     }
+  });
+});
+
+describe('Mojo headless raw submission at the worker boundary', () => {
+  const rawHarness = () => {
+    const write = vi.fn(() => true);
+    const target = { write };
+    const scope: Record<string, any> = {
+      backend: target, cliAdapter: {}, lastInitConfig: { cliId: 'mojo' }, effectiveBackendType: 'mojo',
+      cliSpawnGeneration: 2, cliLifetimeNonce: 3, webTerminalInputWireDirty: () => false,
+      rawCommandWriteOptionsFor: () => ({}),
+    };
+    const send = loadWorkerFunction<(target: unknown, content: string, opts?: { submit?: boolean }) => Promise<void>>('sendRawCommandLine', scope);
+    return { send, scope, target, write };
+  };
+
+  it('submits a complete Mojo command with one write and no empty Enter', async () => {
+    const h = rawHarness();
+    await h.send(h.target, '/compact');
+    expect(h.write).toHaveBeenCalledExactlyOnceWith('/compact');
+  });
+
+  it('preserves an explicit backend rejection without retrying the command', async () => {
+    const h = rawHarness();
+    h.write.mockReturnValue(false);
+    await expect(h.send(h.target, '/compact')).rejects.toThrow('backend rejected');
+    expect(h.write).toHaveBeenCalledExactlyOnceWith('/compact');
+  });
+
+  it.each(['dirty wire', 'replaced backend', 'typing without submit'])('writes no Mojo task for %s', async refusal => {
+    const h = rawHarness();
+    if (refusal === 'dirty wire') h.scope.webTerminalInputWireDirty = () => true;
+    if (refusal === 'replaced backend') h.scope.backend = {};
+    await expect(h.send(h.target, '/compact', refusal === 'typing without submit' ? { submit: false } : {})).rejects.toThrow('backend rejected');
+    expect(h.write).not.toHaveBeenCalled();
   });
 });

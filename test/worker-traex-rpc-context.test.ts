@@ -32,8 +32,11 @@ function rpcHarness() {
     lastInitConfig: { cliId: 'traex', codexRpcInput: true, cliSessionId: 'thread' },
     codexRpcEngine: {
       activeThreadId: 'thread', activeNativeTurnId: undefined,
+      canSteerTurn: () => false,
       sendTurn: acceptingSendTurn(),
     },
+    rpcTurnsAwaitingActivation: new Map(), rpcActiveOwners: new Map(),
+    settlingRpcTerminalOwners: new Map(), rpcTerminalHydrationOwners: new Map(),
     installAwaitingRpcActivation: vi.fn(),
     clearAwaitingRpcActivation: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),
@@ -47,6 +50,9 @@ function rpcHarness() {
     maybeQueuePostSubmitNativeSessionTitle: () => false,
     stampMojoTurnMark: vi.fn(),
   });
+  h.scope.hybridRpcInputMaySteer = loadWorkerFunction('hybridRpcInputMaySteer', h.scope);
+  h.scope.rpcTurnOwnerKey = loadWorkerFunction('rpcTurnOwnerKey', h.scope);
+  h.scope.hybridRpcTurnBlocksAdministrativeInput = loadWorkerFunction('hybridRpcTurnBlocksAdministrativeInput', h.scope);
   h.scope.publishTraexNativeContextReceipt = loadWorkerFunction('publishTraexNativeContextReceipt', h.scope);
   h.scope.invalidateTraexNativeContextReceipt = loadWorkerFunction('invalidateTraexNativeContextReceipt', h.scope);
   return h;

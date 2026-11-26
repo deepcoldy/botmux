@@ -53,7 +53,7 @@ import { supportsZeroPromptInjection } from './core/prompt-injection.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule-settlement.js';
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
 import { TurnProgressNotice, progressNoticeIntervalMinutes } from './utils/turn-progress-notice.js';
-import { traexComposerHoldsInput, traexRestoredComposerReady } from './adapters/cli/traex-footer.js';
+import { traexActiveEmptyComposerReady, traexComposerHoldsInput, traexRestoredComposerReady } from './adapters/cli/traex-footer.js';
 import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 import {
   BackgroundTurnAuthorityHold,
@@ -531,7 +531,7 @@ import { releaseDirForExecutable } from './services/traex-runtime-snapshot.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
-import type { AskQuestion } from './core/ask-types.js';
+import type { AskQuestion, AskResult } from './core/ask-types.js';
 import { traexQuestionFlowVisible, traexPendingAsyncQuestionCount, traexPendingAsyncQuestionVisible, parseTraexQuestionPage, traexQuestionSignature, traexQuestionState, type TraexQuestionPage } from './utils/traex-question-page.js';
 import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -569,7 +569,7 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
+import { hasAntigravitySideQuestionComposer, isAntigravityIdleComposerScreen, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
 import {
   antigravityTurnAnsweredInTranscript,
   antigravityTurnFailedWithoutOutput,
@@ -1195,6 +1195,9 @@ const rpcEngagementFence = new RpcEngagementFence();
 interface RpcTurnGeneration {
   engine: CodexRpcEngine;
   cliGeneration: number;
+  /** Exact native turn being steered while this owner awaits activation.
+   * Undefined for an independent turn/start, whose predecessor may still hydrate. */
+  steerNativeTurnId?: string;
 }
 
 interface PendingRpcTerminal {
@@ -1496,6 +1499,17 @@ function stopCodexRpcEngine(): Promise<boolean> {
     }
   }
   for (const pending of [...rpcTerminalHydrationTerminals.values()]) {
+    if (pending.terminal.status === 'completed') {
+      // A same-native steer may still await activation. Give its predecessor
+      // one final owned drain BEFORE dropping pending turns: ordinary ACK-race
+      // hydration deferral must not discard an already-readable final at teardown.
+      try {
+        codexBridgeDrainAndMaybeEmit({
+          signalIdle: false,
+          hydrationOwnerKey: rpcTurnOwnerKey(pending.terminal.identity),
+        });
+      } catch { /* teardown still finalizes the exact owner below */ }
+    }
     finalizeRpcTurnTerminal(pending.terminal, pending.generation, true);
   }
   // A dispatched delivery for which the app-server never yielded a native turn
@@ -6128,6 +6142,16 @@ async function sendRawCommandLine(
     isCurrent: () => backend === be && cliSpawnGeneration === writeGeneration
       && cliLifetimeNonce === writeLifetime && !webTerminalInputWireDirty(),
   };
+  // Mojo is headless: write(content) submits a complete task, and a separate
+  // Enter is an empty task that it correctly refuses. Do not add a TUI beat or
+  // submit key; acceptance must clear readiness before native task completion
+  // re-arms the queue. Typing without submitting has no headless counterpart.
+  if (effectiveBackendType === 'mojo') {
+    if (opts.submit === false || !writeOptions.isCurrent() || be.write(content) === false) {
+      throw new Error('backend rejected command text or submit key input');
+    }
+    return;
+  }
   // `submit: false` types the line and leaves it in the composer; the caller
   // presses Enter itself. Used by the Codex effort controller, whose Enter must
   // come after a screen re-check (see typeRawCommandLine).
@@ -7560,7 +7584,35 @@ function armSessionRenameReattachRecoveryRetry(): void {
  * receipt. Unknown evidence blocks and schedules another read during the bounded
  * window; at the cap it fails open to the normal delivery gates. Only an exact
  * unsubmitted rename command remains held beyond the cap. */
-function recoverSessionRenameAfterPersistentReattach(): boolean {
+function recoverSessionRenameAfterPersistentReattach(item?: PendingCliInput): boolean {
+  // An ordinary adapter owns the composer from paste through submit receipt.
+  // Its temporary draft is not a predecessor's rename; queue arrivals behind
+  // that writer without interpreting or mutating the rename lifecycle. Real
+  // rename phases remain enforced independently by sessionRenameInFlight().
+  if (isFlushing || injectionFlushing || commandLineWritesPending > 0 || cliSubmissionInFlight) {
+    // Ordinary arrivals join the active drain. Administrative callers must
+    // remain held; false there means their raw/adopt command may write now.
+    return item === undefined;
+  }
+  // A native model can still be working in a surviving pane whose composer
+  // is already empty. Admit only this fresh human input; administrative
+  // recovery remains pending and the native turn remains busy. If the same
+  // positive busy surface cannot issue a lease (including foreign identity),
+  // do not let the ordinary settled-surface path release it by accident.
+  if (item && lastInitConfig?.cliId === 'traex') {
+    if (traexPersistentReattachSteeringFence(item)) return false;
+    const target = backend;
+    if (target) {
+      let viewport = '';
+      try { viewport = (target.captureInputState?.() ?? { viewport: captureBackendScreen(target) }).viewport; }
+      catch { /* unknown evidence is handled by the ordinary recovery below */ }
+      if (traexActiveEmptyComposerReady(viewport)) {
+        notifySessionRenameInputHeld();
+        armSessionRenameReattachRecoveryRetry();
+        return true;
+      }
+    }
+  }
   const generation = cliSpawnGeneration;
   if (sessionRenameReattachRecoveryGeneration === generation || sessionRenamePhase !== 'idle') return false;
   const adapter = cliAdapter;
@@ -7569,6 +7621,14 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
     || !adapter.sessionRenameSurface || !backendScreenEvidenceIsAuthoritativeForMutation()) {
     sessionRenameReattachRecoveryGeneration = generation;
     return false;
+  }
+  // Background/admin probes must not turn a positively empty busy composer
+  // into a fictional rename in flight. Keep their recovery pending; only an
+  // individually authorized ordinary input can use the steering lease above.
+  if (lastInitConfig?.cliId === 'traex' && traexPersistentReattachBusyComposerFence()) {
+    notifySessionRenameInputHeld();
+    armSessionRenameReattachRecoveryRetry();
+    return true;
   }
   const command = adapter.buildSessionRenameCommand(title);
   if (!sessionRenameSentAtMs) sessionRenameSentAtMs = Date.now();
@@ -9246,6 +9306,7 @@ function markActiveTurnStarted(input: {
   const identity = turnAuthorityIdentity(input);
   if (!identity.turnId) return;
   const syncHold = (): void => {
+    baselineAntigravityFooterTasksForActiveTurn();
     if (typeof backgroundAuthorityHold === 'undefined' || typeof applyBackgroundAuthorityTransition !== 'function') return;
     const snap = activeTurnAuthority.snapshot();
     applyBackgroundAuthorityTransition(backgroundAuthorityHold.onForegroundTurnStarted({
@@ -10205,8 +10266,7 @@ interface AntigravityFoldedReconcileResult {
 
 interface AntigravityFoldedReconcilePending {
   cliSpawnGeneration: number;
-  ptyOutputGeneration: number;
-  webTerminalInputGeneration: number;
+  webTerminalSubmitGeneration: number;
   currentTurnId: string | undefined;
   currentDispatchAttempt: number | undefined;
   promotedTurnId: string | undefined;
@@ -10220,14 +10280,31 @@ interface AntigravityFoldedReconcilePending {
   watcher?: FSWatcher;
 }
 
+/** A sibling-proven completed turn waiting only for its live background work.
+ * PTY output is deliberately not an identity fence: background redraws advance
+ * it without changing the turn. Spawn, turn and direct-submit identities still are. */
+interface AntigravityFoldedBackgroundHold {
+  cliSpawnGeneration: number;
+  turnId: string;
+  dispatchAttempt: number | undefined;
+  webTerminalSubmitGeneration: number;
+  clearTimer?: ReturnType<typeof setTimeout>;
+  recheckTimer?: ReturnType<typeof setInterval>;
+}
+
 const ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS = 50;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS = 1_000;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS = 20;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WATCH_WAKEUPS = 50;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS = 15_000;
+const ANTIGRAVITY_FOLDED_BACKGROUND_RECHECK_MS = 2_000;
 let antigravityFoldedReconcilePending: AntigravityFoldedReconcilePending | undefined;
+let antigravityFoldedBackgroundHold: AntigravityFoldedBackgroundHold | undefined;
 
 function cancelAntigravityFoldedReconcilePending(): void {
+  if (antigravityFoldedBackgroundHold?.clearTimer) clearTimeout(antigravityFoldedBackgroundHold.clearTimer);
+  if (antigravityFoldedBackgroundHold?.recheckTimer) clearInterval(antigravityFoldedBackgroundHold.recheckTimer);
+  antigravityFoldedBackgroundHold = undefined;
   const pending = antigravityFoldedReconcilePending;
   if (!pending) return;
   antigravityFoldedReconcilePending = undefined;
@@ -10429,15 +10506,99 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(
   };
 }
 
+function hasAntigravityFoldedLiveHoldEvidence(): boolean {
+  if (typeof hasLiveAntigravityPendingTasks === 'function' && hasLiveAntigravityPendingTasks()) return true;
+  if (!backend || typeof backendScreenEvidenceIsAuthoritativeForMutation !== 'function'
+    || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  try {
+    const screen = captureBackendScreen(backend);
+    observeAntigravityFooterBackgroundTasks(screen);
+    // Background footers can report zero while a newer foreground turn is busy.
+    // Overlays/capture failures are inconclusive, never permission to settle.
+    return !isAntigravityIdleComposerScreen(screen);
+  } catch {
+    return true;
+  }
+}
+
+function armAntigravityFoldedBackgroundHold(
+  pending: AntigravityFoldedReconcilePending,
+  promotedTurnId: string,
+): void {
+  cancelAntigravityFoldedReconcilePending();
+  const hold: AntigravityFoldedBackgroundHold = {
+    cliSpawnGeneration: pending.cliSpawnGeneration,
+    turnId: promotedTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+    webTerminalSubmitGeneration: pending.webTerminalSubmitGeneration,
+  };
+  antigravityFoldedBackgroundHold = hold;
+  hold.recheckTimer = setInterval(() => {
+    if (antigravityFoldedBackgroundHold !== hold) return;
+    driveAntigravityFoldedBackgroundHold(true);
+  }, ANTIGRAVITY_FOLDED_BACKGROUND_RECHECK_MS);
+  hold.recheckTimer.unref();
+  revokePromptReadiness();
+  idleDetector?.reset();
+  refreshBackgroundWait();
+  publishScreenStatus('working');
+}
+
+/** True keeps or invalidates the hold without running the generic ready path.
+ *  False means fresh evidence permits settlement; callers then re-drive ready. */
+function retainAntigravityFoldedBackgroundHold(quiet = false): boolean {
+  const hold = antigravityFoldedBackgroundHold;
+  if (!hold) return false;
+  const active = activeTurnAuthority.snapshot();
+  if (
+    cliSpawnGeneration !== hold.cliSpawnGeneration
+    || cliRestartInProgress
+    || webTerminalSubmitGeneration !== hold.webTerminalSubmitGeneration
+    || currentBotmuxTurnId !== hold.turnId
+    || currentBotmuxDispatchAttempt !== hold.dispatchAttempt
+    || active?.turnId !== hold.turnId
+    || active.dispatchAttempt !== hold.dispatchAttempt
+    || active.started !== true
+    || durableTurnInFlight
+    || pendingMessages.length > 0
+    || pendingRawInputs.length > 0
+    || isFlushing
+  ) {
+    cancelAntigravityFoldedReconcilePending();
+    return true;
+  }
+  if (hasAntigravityFoldedLiveHoldEvidence()) {
+    if (!quiet) {
+      if (isPromptReady) revokePromptReadiness();
+      idleDetector?.reset();
+      refreshBackgroundWait();
+      publishScreenStatus('working');
+    }
+    return true;
+  }
+  cancelAntigravityFoldedReconcilePending();
+  // The observer/timer may run while a duplicate ready is still latched. Force
+  // the full path so the settled predecessor cannot strand its queued successor.
+  revokePromptReadiness();
+  return false;
+}
+
+function driveAntigravityFoldedBackgroundHold(quiet = false): void {
+  if (retainAntigravityFoldedBackgroundHold(quiet)) return;
+  markPromptReady();
+}
+
 function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
   const pending = antigravityFoldedReconcilePending;
   if (!pending) return false;
+  // Do not fence on PTY output here: background footer redraws advance it.
+  // Spawn/turn/direct-submit identities invalidate stale work; the reconcile
+  // below always reads fresh transcript evidence for that exact identity.
   if (
     !isPromptReady
     || cliSpawnGeneration !== pending.cliSpawnGeneration
     || cliRestartInProgress
-    || ptyOutputGeneration.snapshot() !== pending.ptyOutputGeneration
-    || webTerminalInputGeneration !== pending.webTerminalInputGeneration
+    || webTerminalSubmitGeneration !== pending.webTerminalSubmitGeneration
     || currentBotmuxTurnId !== pending.currentTurnId
     || currentBotmuxDispatchAttempt !== pending.currentDispatchAttempt
     || durableTurnInFlight
@@ -10453,7 +10614,6 @@ function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
   const res = reconcileCompletedAntigravityTurnsAtPromptReady(pending.promotedTurnId);
   if (res.reconciled) {
     const promotedTurnId = pending.promotedTurnId;
-    cancelAntigravityFoldedReconcilePending();
     if (
       res.completedCurrentTurn
       && promotedTurnId
@@ -10461,31 +10621,39 @@ function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
       && currentBotmuxDispatchAttempt === undefined
       && !durableTurnInFlight
     ) {
-      const stillPendingTasks = typeof hasLiveAntigravityPendingTasks === 'function'
-        && hasLiveAntigravityPendingTasks();
-      if (!stillPendingTasks) {
-        markTurnRetired(promotedTurnId);
-        releaseActiveTurnAuthority(`prompt_ready_reconciled:${reason}`);
-        syncQueuedTurnsFromMarkerDisk();
-        if (queuedTypeAheadTurns.length > 0) {
-          advanceQueuedTypeAheadTurn(`prompt_ready_reconciled:${reason}`);
-          queuedTurnAdvanceConsumedForPrompt = undefined;
-        }
-        writeCliPidMarker();
-        if (renderer && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
-          && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
-          const { content } = renderer.snapshot();
-          send({
-            type: 'screen_update',
-            content,
-            ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
-            ...backgroundWaitPayload(),
-            ...modelRequestPayload(),
-            turnId: currentBotmuxTurnId,
-            dispatchAttempt: currentBotmuxDispatchAttempt,
-          });
-        }
+      if (hasAntigravityFoldedLiveHoldEvidence()) {
+        armAntigravityFoldedBackgroundHold(pending, promotedTurnId);
+        return true;
       }
+      cancelAntigravityFoldedReconcilePending();
+      markTurnRetired(promotedTurnId);
+      releaseActiveTurnAuthority(`prompt_ready_reconciled:${reason}`);
+      const beforeSyncTurnId = currentBotmuxTurnId;
+      const beforeSyncDispatchAttempt = currentBotmuxDispatchAttempt;
+      syncQueuedTurnsFromMarkerDisk();
+      let promotedSuccessor = beforeSyncTurnId !== currentBotmuxTurnId
+        || beforeSyncDispatchAttempt !== currentBotmuxDispatchAttempt;
+      if (queuedTypeAheadTurns.length > 0) {
+        advanceQueuedTypeAheadTurn(`prompt_ready_reconciled:${reason}`);
+        queuedTurnAdvanceConsumedForPrompt = undefined;
+        promotedSuccessor = true;
+      }
+      writeCliPidMarker();
+      if (renderer && !promotedSuccessor && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
+        && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+        const { content } = renderer.snapshot();
+        send({
+          type: 'screen_update',
+          content,
+          ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
+          ...backgroundWaitPayload(),
+          ...modelRequestPayload(),
+          turnId: currentBotmuxTurnId,
+          dispatchAttempt: currentBotmuxDispatchAttempt,
+        });
+      }
+    } else {
+      cancelAntigravityFoldedReconcilePending();
     }
     // Partial reconciliation (e.g. om_B flushed to compact before om_C): re-arm
     // within the original budget whenever sibling skew still holds on live work.
@@ -10576,8 +10744,7 @@ function armAntigravityFoldedReconcilePending(
   cancelAntigravityFoldedReconcilePending();
   const pending: AntigravityFoldedReconcilePending = {
     cliSpawnGeneration,
-    ptyOutputGeneration: ptyOutputGeneration.snapshot(),
-    webTerminalInputGeneration,
+    webTerminalSubmitGeneration,
     currentTurnId: currentBotmuxTurnId,
     currentDispatchAttempt: currentBotmuxDispatchAttempt,
     promotedTurnId,
@@ -12242,14 +12409,121 @@ let daemonCotHoldMayBeActive = false;
 let backgroundTasksTrackedForSiblings = false;
 /** Antigravity 常规模式原生页脚报告的后台任务/计时器数；与前台 activeTurnAuthority 解耦，
  *  仅经 refreshBackgroundWait 汇入 screen_update.backgroundTasks。 */
+interface AntigravityFooterTurnBaseline {
+  cliSpawnGeneration: number;
+  turnId: string;
+  dispatchAttempt: number | undefined;
+  count: number;
+  lastCount: number;
+  transcriptPath?: string;
+  transcriptOffset?: number;
+  transcriptDev?: bigint;
+  transcriptIno?: bigint;
+  observedCurrentPending: boolean;
+  sawIncrease: boolean;
+}
+let antigravityFooterTurnBaseline: AntigravityFooterTurnBaseline | undefined;
 let antigravityFooterBackgroundTasks = 0;
+
+function baselineAntigravityFooterTasksForActiveTurn(): void {
+  if (lastInitConfig?.cliId !== 'antigravity') return;
+  const active = activeTurnAuthority.snapshot();
+  if (active?.started !== true || !active.turnId) {
+    antigravityFooterTurnBaseline = undefined;
+    return;
+  }
+  const previous = antigravityFooterTurnBaseline;
+  if (previous && previous.cliSpawnGeneration === cliSpawnGeneration
+    && previous.turnId === active.turnId
+    && previous.dispatchAttempt === active.dispatchAttempt) return;
+  // Reattach/restore owns existing native work but did not start a fresh write;
+  // never baseline away the very tasks that may still need this authority.
+  if ((backend as (SessionBackend & { isReattach?: boolean }) | undefined)?.isReattach === true) {
+    antigravityFooterTurnBaseline = undefined;
+    return;
+  }
+  let count = antigravityFooterBackgroundTasks;
+  if (backend && typeof backendScreenEvidenceIsAuthoritativeForMutation === 'function'
+    && backendScreenEvidenceIsAuthoritativeForMutation()) {
+    try {
+      const parsed = parseAntigravityFooterBackgroundTasks(captureBackendScreen(backend));
+      if (parsed !== undefined) count = parsed;
+    } catch { /* Use the latest display count when a one-shot capture fails. */ }
+  }
+  let transcriptPath: string | undefined;
+  let transcriptOffset: number | undefined;
+  let transcriptDev: bigint | undefined;
+  let transcriptIno: bigint | undefined;
+  try {
+    transcriptPath = resolveLiveAntigravityTranscriptPath();
+    if (transcriptPath) {
+      const stat = statSync(transcriptPath, { throwIfNoEntry: false, bigint: true });
+      transcriptOffset = Number(stat?.size ?? 0);
+      if (!Number.isSafeInteger(transcriptOffset)) throw new Error('transcript anchor exceeds safe byte range');
+      transcriptDev = stat?.dev;
+      transcriptIno = stat?.ino;
+    }
+  } catch { /* Discovery may lag the write; absence of an anchor stays conservative. */ }
+  antigravityFooterBackgroundTasks = count;
+  antigravityFooterTurnBaseline = {
+    cliSpawnGeneration,
+    turnId: active.turnId,
+    dispatchAttempt: active.dispatchAttempt,
+    count,
+    lastCount: count,
+    transcriptPath,
+    transcriptOffset,
+    transcriptDev,
+    transcriptIno,
+    observedCurrentPending: false,
+    sawIncrease: false,
+  };
+}
+
+function noteAntigravityFooterTaskObservation(count: number): void {
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority?.snapshot?.();
+  if (!baseline || active?.started !== true
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration
+    || baseline.turnId !== active.turnId
+    || baseline.dispatchAttempt !== active.dispatchAttempt) return;
+  // Compare the latest valid samples, so 1→0→1 also proves new work. Once
+  // this turn added work, keep evidence until all tasks drain; without native
+  // task ids, a decrease alone must not guess which task finished.
+  if (count > baseline.lastCount) baseline.sawIncrease = true;
+  baseline.lastCount = count;
+}
+
+function antigravityFooterTaskEvidenceForActiveTurn(): boolean {
+  const baseline = antigravityFooterTurnBaseline;
+  // Restored/adopted turns have no new-write baseline; preserve conservative
+  // handling of work already belonging to their live native conversation.
+  if (!baseline) return true;
+  const active = activeTurnAuthority?.snapshot?.();
+  if (!active || active.started !== true
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration
+    || baseline.turnId !== active.turnId
+    || baseline.dispatchAttempt !== active.dispatchAttempt) return true;
+  return baseline.sawIncrease;
+}
 
 function observeAntigravityFooterBackgroundTasks(screen: string | undefined): void {
   if (lastInitConfig?.cliId !== 'antigravity' || !screen) return;
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
   const parsed = parseAntigravityFooterBackgroundTasks(screen);
   if (parsed === undefined) return;
+  noteAntigravityFooterTaskObservation(parsed);
   antigravityFooterBackgroundTasks = parsed;
+  const hold = parsed === 0 ? antigravityFoldedBackgroundHold : undefined;
+  if (!hold || hold.clearTimer) return;
+  // A footer clear need not write either transcript. Re-drive outside the
+  // sampler stack; all normal generation/turn fences run when the timer fires.
+  hold.clearTimer = setTimeout(() => {
+    if (antigravityFoldedBackgroundHold !== hold) return;
+    hold.clearTimer = undefined;
+    driveAntigravityFoldedBackgroundHold();
+  }, 0);
+  hold.clearTimer.unref();
 }
 
 function computeBackgroundCotHold(nowMs = Date.now()): boolean {
@@ -13063,16 +13337,17 @@ let thinkingCapNoted = false;
 
 /** Whether an entry has the fields its kind promises. Entries are parsed from
  *  CLI transcripts, so the type is not a guarantee: a missing string would throw
- *  in `cotEntryChars`, and an unknown kind would make the running total NaN and
- *  switch off the accumulated cap. */
+ *  in `cotEntryChars`, an unknown kind would make the running total NaN and
+ *  switch off the accumulated cap, and a tool entry's `id` pairs a call with its
+ *  result downstream (`publicReplyCardTools`). */
 function cotEntryWellFormed(entry: CotEntry): boolean {
   const e = entry as Partial<Record<string, unknown>> | null;
   switch (e?.kind) {
     case 'thinking':
     case 'text': return typeof e.text === 'string';
-    case 'tool_call': return typeof e.name === 'string' && typeof e.args === 'string'
+    case 'tool_call': return typeof e.id === 'string' && typeof e.name === 'string' && typeof e.args === 'string'
       && (e.subject === undefined || typeof e.subject === 'string');
-    case 'tool_result': return typeof e.result === 'string';
+    case 'tool_result': return typeof e.id === 'string' && typeof e.result === 'string';
     default: return false;
   }
 }
@@ -13122,12 +13397,17 @@ function cotEntryWithoutSentinel(entry: CotEntry): CotEntry | null {
 }
 
 function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string; dispatchAttempt?: number }): void {
-  if (entries.length === 0) return;
+  // Malformed entries are dropped before anything reads them: counting one would
+  // throw out of the transcript drain and lose the rest of the turn's activity,
+  // and the progress signal below reads the last entry's kind. A batch with no
+  // well-formed entry is no observed activity.
+  const wellFormed = entries.filter(cotEntryWellFormed);
+  if (wellFormed.length === 0) return;
   // Independent of the capped/display-only CoT buffer. No text, args or results
   // leave this signal; terminal spinners and process heartbeats never count.
   if (lastInitConfig?.cliId === 'traex'
     || (lastInitConfig?.cliId === 'codex' && lastInitConfig.noProgressNotify?.cliEnabled === true)) {
-    const last = entries[entries.length - 1];
+    const last = wellFormed[wellFormed.length - 1];
     send({ type: 'turn_progress', turnId: turn.turnId,
       ...(turn.dispatchAttempt === undefined ? {} : { dispatchAttempt: turn.dispatchAttempt }),
       stage: last.kind === 'tool_call' ? 'tool_started'
@@ -13137,10 +13417,7 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   // exists, so `bridge-fallback-gate` deliberately does NOT strip it there and
   // the reply card shows it verbatim. Stripping it from the bubble alone would
   // make the two messages of one turn contradict each other.
-  // Both paths drop a malformed entry: counting it would throw out of the
-  // transcript drain and lose the rest of the turn's activity.
   const adoptMode = lastInitConfig?.adoptMode === true;
-  const wellFormed = entries.filter(cotEntryWellFormed);
   const kept = adoptMode
     ? wellFormed
     : wellFormed.flatMap(entry => {
@@ -13637,7 +13914,14 @@ function observeCodexMidTurnReply(ev: CodexBridgeEvent, turn: CodexPendingTurn):
     : `Turn ${turn.turnId.substring(0, 8)} progress posted live (${reply.text.length} chars)`);
 }
 codexBridgeQueue.setMidTurnReplyObserver(observeCodexMidTurnReply);
-codexBridgeQueue.setCotSupersededObserver((turn) => {
+function observeCodexCotSuperseded(turn: CodexPendingTurn): void {
+  // A confirmed same-native correction removes its predecessor from the bridge
+  // queue. Retire only that RPC lifecycle lease; the merged final still owns
+  // the predecessor's completion metadata and no terminal is synthesized here.
+  retireRpcLifecycleFromStructuredTerminal(
+    { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt },
+    true,
+  );
   if (!sessionId || turn.isLocal) return;
   const ownsThinking = thinkingTurn?.turnId === turn.turnId
     && thinkingTurn.dispatchAttempt === turn.dispatchAttempt;
@@ -13652,7 +13936,8 @@ codexBridgeQueue.setCotSupersededObserver((turn) => {
     ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
   });
   if (ownsThinking) resetThinkingChannel();
-});
+}
+codexBridgeQueue.setCotSupersededObserver(observeCodexCotSuperseded);
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 let ompQuietCandidateKey: string | undefined;
@@ -17914,11 +18199,44 @@ function resolveLiveAntigravityTranscriptPath(): string | undefined {
   return resolveFileBridgePath('antigravity', { sessionId: cid, pid: effectivePid });
 }
 
-/** Whether the live Antigravity turn has pending background command task(s) or
- *  subagent(s). Works both when the structured bridge is active (zero-prompt /
- *  adopt) and in ordinary `replyDelivery: 'send'` mode where the bridge does
- *  not attach. Never holds a cold/resumed idle startup with no started turn or
- *  a viewport that explicitly shows an interrupted turn. */
+/** Re-anchor only on the current turn's unique authenticated envelope in the
+ *  replacement file. A new inode or truncation must never reuse old offsets. */
+function reanchorAntigravityTurnBaseline(
+  transcriptPath: string,
+  stat: { dev: bigint; ino: bigint },
+): boolean {
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority.snapshot();
+  if (!baseline || active?.started !== true || !active.turnId
+    || baseline.turnId !== active.turnId || baseline.dispatchAttempt !== active.dispatchAttempt
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration) return false;
+  try {
+    const replay = drainAntigravityTranscript(transcriptPath, 0, {}, {});
+    if (replay.pendingTail.length > 0) return false;
+    const matches = replay.events.filter(event => {
+      if (event.kind !== 'user') return false;
+      const header = event.text.replace(/\r\n?/g, '\n').split('<user_message>', 1)[0] ?? event.text;
+      return header.match(/(?:^|\n)<message_location\b[^>]*\bmessage_id="([^"]+)"[^>]*\/>(?:\n|$)/)?.[1] === active.turnId;
+    });
+    if (matches.length !== 1) return false;
+    const prefix = `${transcriptPath}:`;
+    const uuid = matches[0]!.uuid;
+    if (!uuid.startsWith(prefix)) return false;
+    const offset = Number(uuid.slice(prefix.length));
+    if (!Number.isSafeInteger(offset) || offset < 0) return false;
+    baseline.transcriptOffset = offset;
+    baseline.transcriptDev = stat.dev;
+    baseline.transcriptIno = stat.ino;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether the live Antigravity turn still has background work. A fresh
+ *  native footer can show running commands missing from the transcript.
+ *  Never hold an explicitly interrupted turn or use the footer to hold a
+ *  cold/resumed idle startup with no started turn. */
 function hasLiveAntigravityPendingTasks(): boolean {
   if (!structuredBridgeIs('antigravity') || cliAdapter?.runnerFramedInput) return false;
   const activeTurnStarted = activeTurnAuthority.snapshot()?.started === true;
@@ -17931,6 +18249,14 @@ function hasLiveAntigravityPendingTasks(): boolean {
     try {
       const screen = captureBackendScreen(backend);
       if (screen && isAntigravityInterruptedScreen(screen)) return false;
+      // The cached footer count is for display and survives unparseable
+      // frames. Only the current viewport may veto this ready edge.
+      const footerTasks = parseAntigravityFooterBackgroundTasks(screen);
+      if (footerTasks !== undefined) {
+        noteAntigravityFooterTaskObservation(footerTasks);
+        antigravityFooterBackgroundTasks = footerTasks;
+      }
+      if (activeTurnStarted && (footerTasks ?? 0) > 0 && antigravityFooterTaskEvidenceForActiveTurn()) return true;
     } catch { /* Missing viewport is not interruption evidence. */ }
   }
   if (codexBridgeFallbackActive()) {
@@ -17941,7 +18267,43 @@ function hasLiveAntigravityPendingTasks(): boolean {
     // to a direct disk scan while the bridge has not yet attached/baselined.
     if (codexBridgeRolloutPath && codexBridgeBaselineDone) return false;
   }
-  const transcriptPath = resolveLiveAntigravityTranscriptPath();
+  const resolvedTranscriptPath = resolveLiveAntigravityTranscriptPath();
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority.snapshot();
+  const transcriptPath = resolvedTranscriptPath ?? baseline?.transcriptPath;
+  if (baseline && active?.started === true
+    && baseline.cliSpawnGeneration === cliSpawnGeneration
+    && baseline.turnId === active.turnId
+    && baseline.dispatchAttempt === active.dispatchAttempt
+    && baseline.transcriptPath && baseline.transcriptPath === transcriptPath
+    && baseline.transcriptOffset !== undefined) {
+    try {
+      const stat = statSync(transcriptPath!, { throwIfNoEntry: false, bigint: true });
+      if (!stat) return baseline.observedCurrentPending;
+      const size = Number(stat.size);
+      if (!Number.isSafeInteger(size)) return true;
+      if (stat.dev !== baseline.transcriptDev || stat.ino !== baseline.transcriptIno
+        || size < baseline.transcriptOffset) {
+        if (!reanchorAntigravityTurnBaseline(transcriptPath!, stat)) return true;
+      } else {
+        const replay = drainAntigravityTranscript(transcriptPath!, baseline.transcriptOffset, {}, {});
+        if (replay.pendingTail.length > 0) return true;
+        // No explicit user input after this write's byte anchor means the old
+        // RUNNING tail cannot belong to the newly started turn. Once current
+        // pending was observed, losing that user proof is instead inconclusive.
+        if (!replay.events.some(event => event.kind === 'user')) {
+          if (baseline.observedCurrentPending) return true;
+          baseline.observedCurrentPending = false;
+          return false;
+        }
+      }
+      const pending = hasAntigravityTranscriptPendingTasks(transcriptPath!);
+      baseline.observedCurrentPending = pending;
+      return pending;
+    } catch {
+      return true;
+    }
+  }
   return !!transcriptPath && hasAntigravityTranscriptPendingTasks(transcriptPath);
 }
 
@@ -20282,12 +20644,22 @@ function hydrateCompletedRpcTurn(
   // old generation when teardown reaches the engine.
   if (cliSpawnGeneration !== generation.cliGeneration
     || codexRpcEngine !== generation.engine) return;
-  try {
-    codexBridgeDrainAndMaybeEmit({
-      signalIdle: false,
-      hydrationOwnerKey: ownerKey,
-    });
-  } catch { /* retry */ }
+  // A successful steer ACK lets the engine emit predecessor terminals before
+  // the sender continuation activates the correction. Draining now would let a
+  // predecessor consume their shared native turn's assistant_final before the
+  // correction owns a bridge mark. Skip only an exact same-generation steer;
+  // an independent turn/start retains the predecessor-hydration exemption.
+  const awaitingSameNativeSteer = [...rpcTurnsAwaitingActivation.values()].some(awaiting =>
+    awaiting.steerNativeTurnId === terminal.nativeTurnId
+    && sameRpcGeneration(awaiting, generation));
+  if (!awaitingSameNativeSteer) {
+    try {
+      codexBridgeDrainAndMaybeEmit({
+        signalIdle: false,
+        hydrationOwnerKey: ownerKey,
+      });
+    } catch { /* retry */ }
+  }
   if (!codexBridgeQueue.hasPendingTurn(identity.turnId, identity.dispatchAttempt)) {
     // Structured ingest already emitted final_output + terminal in the canonical
     // order. The explicit native terminal below is idempotently suppressed.
@@ -20478,15 +20850,29 @@ function releaseRpcTurnTerminalDeferral(
 
 function retireRpcLifecycleFromStructuredTerminal(
   identity: CodexRpcTurnIdentity,
+  supersededSettlement = false,
 ): void {
   const ownerKey = rpcTurnOwnerKey(identity);
+  const settlingGeneration = settlingRpcTerminalOwners.get(ownerKey);
   // Native completion hydration owns its own finalization after this canonical
-  // drain returns. Do not tear down that generation's settlement underneath it.
-  if (settlingRpcTerminalOwners.has(ownerKey)) return;
-  const generation = rpcActiveOwners.get(ownerKey)
+  // drain returns. A confirmed same-native supersession is the exception: its
+  // merged successor owns the only final, so the deferred predecessor must not
+  // later publish an independent terminal.
+  if (settlingGeneration && !supersededSettlement) return;
+  const generation = settlingGeneration ?? rpcActiveOwners.get(ownerKey)
     ?? rpcLifecycleFailClosedOwners.get(ownerKey)
     ?? rpcTurnsAwaitingActivation.get(ownerKey);
   if (!generation) return;
+  if (supersededSettlement && settlingGeneration) {
+    const timer = rpcTerminalHydrationTimers.get(ownerKey);
+    if (timer) clearTimeout(timer);
+    rpcTerminalHydrationTimers.delete(ownerKey);
+    if (sameRpcGeneration(rpcTerminalHydrationOwners.get(ownerKey), generation)) {
+      rpcTerminalHydrationOwners.delete(ownerKey);
+      rpcTerminalHydrationTerminals.delete(ownerKey);
+    }
+    settlingRpcTerminalOwners.delete(ownerKey);
+  }
   clearAwaitingRpcActivation(identity, generation);
   if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
     rpcActiveOwners.delete(ownerKey);
@@ -22779,6 +23165,7 @@ let tuiPromptBlocking = false;
 /** One composed status projection shared by the immediate screen path,
  * periodic text updates, and screenshot uploads. */
 function projectedRuntimeScreenStatus(): RuntimeScreenStatus {
+  if (antigravityFoldedBackgroundHold) return 'working';
   return zcodeProgressStatus(codexAppLivenessStatus(projectRuntimeScreenStatus({
     promptReady: isPromptReady,
     analyzing: false,
@@ -24947,7 +25334,7 @@ function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispat
 
 /** One answer input into the current CLI, serialized with other terminal
  *  writes; false when the backend changed or refused it. */
-async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, expected?: TraexQuestionPage): Promise<boolean> {
+async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, expected?: TraexQuestionPage, final = false): Promise<boolean> {
   const target = backend;
   const lifetime = cliLifetimeNonce;
   if (!target || cliRestartInProgress || nativeSessionForkPending()) return false;
@@ -24964,11 +25351,15 @@ async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, e
           if (!page || traexQuestionSignature(page) !== traexQuestionSignature(expected)
             || traexQuestionState(page) !== traexQuestionState(expected)) return false;
         }
+        if (final && expected?.delivery === 'async' && !prepareTraexNativeAnswer()) return false;
         invalidatePromptReadinessEvidence();
-        return write(readinessTrackedInput(adapterInputHandle(target))) !== false;
+        const written = write(readinessTrackedInput(adapterInputHandle(target))) !== false;
+        if (final && traexNativeAnswerSubmission) traexNativeAnswerSubmission.written = written;
+        return written;
       },
     );
   } catch (err: any) {
+    if (final && traexNativeAnswerSubmission) traexNativeAnswerSubmission.written = false;
     log(`TraeX question answer write failed: ${err?.message ?? err}`);
     return false;
   }
@@ -25006,6 +25397,79 @@ async function traexQuestionOpenPending(known?: TraexQuestionPage): Promise<bool
   }
 }
 
+type TraexNativeAnswerInput = Extract<DaemonToWorker, { type: 'message' }>;
+const traexNativeAnswerAdmissions = new Map<string, (input?: TraexNativeAnswerInput) => void>();
+const traexNativeAnswerInputs = new WeakMap<AskResult, TraexNativeAnswerInput>();
+let traexNativeAnswerSubmission: { input: TraexNativeAnswerInput; prepared: boolean; written?: boolean } | undefined;
+
+function prepareTraexNativeAnswer(): boolean {
+  const submission = traexNativeAnswerSubmission;
+  if (!submission || submission.prepared) return true;
+  const input = submission.input;
+  const typeAhead = !!currentBotmuxTurnId && currentBotmuxTurnId !== input.turnId
+    && !turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
+  if ((!typeAhead && !reserveActiveTurn(input)) || (workerSessionEventScope && !workerSessionEventScope.canSubmit(input.turnId, input.dispatchAttempt))) return false;
+  workerSessionEventScope?.enterTurn(input.turnId, input.dispatchAttempt);
+  const item: PendingCliInput = { ...input, noReplay: true };
+  if (typeAhead && input.turnId) {
+    queuedTypeAheadTurns.push({ turnId: input.turnId, dispatchAttempt: input.dispatchAttempt,
+      linkRefMode: input.linkRefMode, trustedCaller: input.trustedCaller, trustedController: input.trustedController,
+      turnCallerOpenId: input.turnCallerOpenId ?? input.trustedCaller?.requestUserOpenId });
+  } else {
+    renderer?.markNewTurn();
+    usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+    setCaptureIdentity(input.turnId, input.dispatchAttempt, input.turnCallerOpenId ?? input.trustedCaller?.requestUserOpenId);
+    currentBotmuxLinkRefMode = input.linkRefMode;
+    markActiveTurnStarted(input);
+  }
+  workerSessionEventScope?.recordSubmission(input.turnId, input.dispatchAttempt);
+  inflightInputs.onWrite(item);
+  noteCliInputWritten(item);
+  writeCliPidMarker();
+  publishSandboxRelayCapability();
+  const turnId = codexBridgeMarkPendingTurn(input.content, input.turnId, input.dispatchAttempt, Date.now(), input.linkRefMode);
+  if (turnId) codexBridgeQueue.beginSubmitVerification(turnId, undefined, input.dispatchAttempt);
+  markTurnExecutionStart(input.turnId, input.dispatchAttempt);
+  traexAutoModelTurnReplayForbidden = true;
+  submission.prepared = true;
+  return true;
+}
+
+async function runTraexNativeAnswer(
+  page: TraexQuestionPage,
+  result: AskResult | undefined,
+  write: () => Promise<boolean | undefined>,
+  admittedInput?: TraexNativeAnswerInput,
+): Promise<void> {
+  const input = admittedInput ?? (result ? traexNativeAnswerInputs.get(result) : undefined);
+  if (page.delivery !== 'async') { await write(); return; }
+  if (!input) throw new Error('Native question answer admission unavailable');
+  if (result) traexNativeAnswerInputs.delete(result);
+  const submission = { input, prepared: false, written: undefined as boolean | undefined };
+  const run = async (): Promise<void> => {
+    traexNativeAnswerSubmission = submission;
+    try {
+      await write();
+    } finally {
+      if (traexNativeAnswerSubmission === submission) traexNativeAnswerSubmission = undefined;
+      if (!submission.prepared || submission.written === false) {
+        if (input.turnId) {
+          codexBridgeQueue.dropPendingTurn(input.turnId, input.dispatchAttempt, true);
+          inflightInputs.retireTurn(input.turnId);
+          releaseActiveTurnAuthority('native_question_not_submitted', { turnId: input.turnId, dispatchAttempt: input.dispatchAttempt });
+          emitTurnTerminal(input.turnId, 'failed', 'native_question_not_submitted', input.dispatchAttempt);
+        }
+      } else if (input.turnId) {
+        codexBridgeQueue.finishSubmitVerification(input.turnId, undefined, input.dispatchAttempt);
+        codexBridgeDrainAndMaybeEmit();
+      }
+    }
+  };
+  const binding = workerSessionEventScope?.currentBinding();
+  if (binding && workerSessionEventScope) await workerSessionEventScope.run(binding, run, input.sessionCommand?.execution);
+  else await run();
+}
+
 const traexQuestionBridge = new TraexQuestionBridge({
   now: () => Date.now(),
   setTimer: (fn, ms) => {
@@ -25020,24 +25484,60 @@ const traexQuestionBridge = new TraexQuestionBridge({
   openPending: traexQuestionOpenPending,
   mayOpenPending: traexQuestionMayOpenPending,
   // The same daemon ask broker (and card) as the RPC path's native questions.
-  ask: (question, signal, page) => {
+  ask: async (question, signal, page) => {
     const cfg = lastInitConfig;
     if (!cfg) return Promise.reject(new Error('session not initialised'));
-    return postCodexAsk({
-      sessionId: cfg.sessionId,
-      larkAppId: cfg.larkAppId,
-      chatId: cfg.chatId,
-      rootMessageId: cfg.rootMessageId,
-      originTurnId: currentBotmuxTurnId,
-      originDispatchAttempt: currentBotmuxDispatchAttempt,
-      ...(page?.delivery === 'async' ? { standalone: true } : {}),
-    }, [question], signal);
+    const requestId = page?.delivery === 'async' ? randomUUID() : undefined;
+    let admittedInput: TraexNativeAnswerInput | undefined;
+    let answerHandedOff = false;
+    let resolveAdmission: ((input?: TraexNativeAnswerInput) => void) | undefined;
+    const admitted = requestId ? new Promise<TraexNativeAnswerInput | undefined>(resolve => {
+      resolveAdmission = input => { if (input) admittedInput = input; resolve(input); };
+    }) : undefined;
+    const abort = () => resolveAdmission?.();
+    if (requestId) {
+      traexNativeAnswerAdmissions.set(requestId, resolveAdmission!);
+      signal.addEventListener('abort', abort, { once: true });
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await postCodexAsk({
+        sessionId: cfg.sessionId,
+        larkAppId: cfg.larkAppId,
+        chatId: cfg.chatId,
+        rootMessageId: cfg.rootMessageId,
+        originTurnId: currentBotmuxTurnId,
+        originDispatchAttempt: currentBotmuxDispatchAttempt,
+        ...(requestId ? { requestId } : {}),
+        ...(page?.delivery === 'async' ? { standalone: true } : {}),
+      }, [question], signal);
+      if (result.kind === 'answered' && admitted) {
+        timer = setTimeout(abort, 30_000);
+        timer.unref?.();
+        const input = await admitted;
+        if (!input) throw new Error('Native question answer admission unavailable');
+        traexNativeAnswerInputs.set(result, input);
+        answerHandedOff = true;
+      }
+      return result;
+    } finally {
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+      if (requestId) traexNativeAnswerAdmissions.delete(requestId);
+      // The daemon can commit the native answer before its HTTP response returns.
+      // If abort or transport failure prevents the bridge handoff, retire it through
+      // the same answer lifecycle without writing to a withdrawn question page.
+      if (page && admittedInput && !answerHandedOff) {
+        await runTraexNativeAnswer(page, undefined, async () => false, admittedInput);
+      }
+    }
   },
+  runAnswer: runTraexNativeAnswer,
   writeKey: (key, expected) => traexQuestionWrite(target => {
     if (target.sendSpecialKeys) return target.sendSpecialKeys(key);
     target.write(KEY_TO_ANSI[key] ?? key);
     return true;
-  }, expected),
+  }, expected, key === 'Enter'),
   paste: (text, expected) => traexQuestionWrite(target => {
     if (target.pasteText) target.pasteText(text);
     else target.write(wrapBracketedPaste(text));
@@ -28360,6 +28860,7 @@ function markPromptReady(): void {
     schedulePostTerminalFenceRecheck('prompt-ready deferred by fence');
     return;
   }
+  if (antigravityFoldedBackgroundHold && retainAntigravityFoldedBackgroundHold()) return;
   if (isPromptReady) {
     stopStructuredStartGraceRecheck();
     if (typeof antigravityFoldedReconcilePending !== 'undefined'
@@ -28619,8 +29120,13 @@ function markPromptReady(): void {
   judgeClaudeBridgeTurn();
   bridgeQueue.cliQueueDrained();
   settleSessionRenameOnPrompt();
+  const beforeSyncTurnId = currentBotmuxTurnId;
+  const beforeSyncDispatchAttempt = currentBotmuxDispatchAttempt;
   const syncedFromDisk = syncQueuedTurnsFromMarkerDisk();
+  let advancedQueuedTurn = beforeSyncTurnId !== currentBotmuxTurnId
+    || beforeSyncDispatchAttempt !== currentBotmuxDispatchAttempt;
   if (readyTransition(syncedFromDisk).advanceQueuedTurn) {
+    advancedQueuedTurn = true;
     advanceQueuedTypeAheadTurn('prompt_ready');
   }
   queuedTurnAdvanceConsumedForPrompt = undefined;
@@ -28725,7 +29231,7 @@ function markPromptReady(): void {
     observeAntigravityFooterBackgroundTasks(renderer?.rawSnapshot() || lastAnalyzerSnapshot);
   }
   refreshBackgroundWait();
-  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  if (renderer && !advancedQueuedTurn && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',
@@ -28787,7 +29293,9 @@ function markPromptReady(): void {
       log(backgroundTaskTracker.pendingTurnAgents() > 0
         ? `Idle prompt while ${backgroundTaskTracker.pendingTurnAgents()} background agent(s) pending — reporting working until their completion notification arrives`
         : 'Idle prompt while Antigravity background task(s)/subagent(s) pending — reporting working until completion notification arrives');
-    } else {
+    } else if (!advancedQueuedTurn) {
+      // A promoted folded successor owns the next working episode; never attach
+      // the predecessor's idle completion frame to its new turn identity.
       publishScreenStatus('idle');
     }
   } else if (hasPendingWork) {
@@ -28816,6 +29324,7 @@ function persistCliSessionId(cliSessionId: string): void {
   inputDeliveryObservedCliSessionId = cliSessionId;
   if (lastInitConfig?.cliId === 'antigravity' && previousCliSessionId && previousCliSessionId !== cliSessionId) {
     antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
     refreshBackgroundWait();
   }
   const published = publishCliSessionIdToDaemon({
@@ -30236,18 +30745,91 @@ function programStatusBlockedHoldsTypeAhead(): boolean {
     && programStatusBlockHoldsTypeAhead(idleDetector?.programStatusBlock() ?? null);
 }
 
-/** The hybrid WebSocket RPC engine only has a serial turn/start contract. It
- *  does not implement Codex App's ordered turn/steer grouping, so type-ahead
- *  must stop while the exact native turn is awaiting activation, active, or
- *  still hydrating its terminal. The queued follow-up is re-driven by the
- *  normal terminal -> idle path and starts as its own turn afterwards. */
+/** A proven active native turn can accept an explicit steer. Awaiting ACKs,
+ * terminal hydration and unknown outcomes remain generation-wide barriers. */
 function directRpcTurnBlocksTypeAhead(): boolean {
   return codexRpcEngine !== undefined && (
     rpcTurnsAwaitingActivation.size > 0
-    || rpcActiveOwners.size > 0
     || settlingRpcTerminalOwners.size > 0
     || rpcTerminalHydrationOwners.size > 0
+    || rpcLifecycleFailClosedOwners.size > 0
+    || ((rpcActiveOwners.size > 0 || !!codexRpcEngine.activeNativeTurnId)
+      && codexRpcEngine.canSteerTurn?.(codexRpcEngine.activeNativeTurnId) !== true)
   );
+}
+
+/** Administrative input is never an active-turn steer, even if a stale screen
+ * says idle while the RPC turn remains live or its output is being hydrated. */
+function hybridRpcTurnBlocksAdministrativeInput(): boolean {
+  return codexRpcEngine !== undefined && (
+    !!codexRpcEngine.activeNativeTurnId || rpcActiveOwners.size > 0
+    || rpcTurnsAwaitingActivation.size > 0 || settlingRpcTerminalOwners.size > 0
+    || rpcTerminalHydrationOwners.size > 0 || rpcLifecycleFailClosedOwners.size > 0
+  );
+}
+
+/** Only a fresh authenticated human IM message may enter the active native
+ * turn. Preserve the existing XPI control policy and every explicit FIFO fence. */
+function hybridRpcInputMaySteer(item: PendingCliInput, expectedTurnId: string): boolean {
+  return !lastInitConfig?.adoptMode
+    && item.turnId?.startsWith('om_') === true
+    && item.dispatchAttempt === undefined
+    && item.queueAfterActiveTurn !== true
+    && item.noReplay !== true
+    && !item.taskContinuation && !item.vcMeetingImTurnOrigin
+    && item.trustedCaller?.senderType === 'user'
+    && item.trustedCaller.source !== 'schedule_creator'
+    && !activeTurnBlocks(item)
+    && codexRpcEngine?.canSteerTurn?.(expectedTurnId) === true;
+}
+
+/** A busy surviving TUI is initialized without publishing a new idle edge.
+ * This is a per-input write lease, never prompt readiness or rename settlement.
+ * Re-prove the PID's rollout ownership even when the identity cache is warm. */
+function traexPersistentReattachBusyComposerFence(): {
+  backend: SessionBackend; adapter: CliAdapter; generation: number; lifetime: number; webInputGeneration: number;
+  pid: number; nativeSessionId: string;
+} | undefined {
+  const target = backend;
+  const adapter = cliAdapter;
+  if (!target || !adapter || target.submitTurn || !lastSpawnPersistentReattach
+    || lastInitConfig?.cliId !== 'traex' || lastInitConfig.adoptMode
+    || lastInitConfig.existingAppServerEndpoint || codexRpcEngine
+    || !['pty', 'tmux', 'hc'].includes(effectiveBackendType)
+    || sessionRenamePhase !== 'idle' || sessionRenameInFlight()
+    || cliRestartInProgress || rawInputRestartGate || webTerminalInputWireDirty()
+    || commandLineWritesPending > 0 || injectionFlushing || hookReviewHoldsQueuedWrite()
+    || !backendScreenEvidenceIsAuthoritativeForMutation()) return undefined;
+  const generation = cliSpawnGeneration;
+  const lifetime = cliLifetimeNonce;
+  const webInputGeneration = webTerminalInputGeneration;
+  const pid = currentTraexObservedPid();
+  if (!pid) return undefined;
+  const nativeSessionId = sessionRenameNativeSessionIdNow();
+  const owned = findTraexRolloutSetByPid(pid);
+  if (!nativeSessionId || !owned
+    || !(owned.has(nativeSessionId) || owned.has(nativeSessionId.toLowerCase()))) return undefined;
+  let viewport: string;
+  try { viewport = (target.captureInputState?.() ?? { viewport: captureBackendScreen(target) }).viewport; }
+  catch { return undefined; }
+  if (!traexActiveEmptyComposerReady(viewport) || backend !== target || cliAdapter !== adapter || cliSpawnGeneration !== generation
+    || cliLifetimeNonce !== lifetime
+    || webTerminalInputGeneration !== webInputGeneration || currentTraexObservedPid() !== pid
+    || cliRestartInProgress || webTerminalInputWireDirty()) return undefined;
+  return { backend: target, adapter, generation, lifetime, webInputGeneration, pid, nativeSessionId };
+}
+
+function traexPersistentReattachSteeringFence(item?: PendingCliInput):
+  (NonNullable<ReturnType<typeof traexPersistentReattachBusyComposerFence>> & { item: PendingCliInput }) | undefined {
+  if (!item || item.turnId?.startsWith('om_') !== true || item.noReplay === true
+    || item.durablePrimaryInbox || item.taskContinuation || item.traexAutoModelRecovery || item.traexAutoModelContinuation
+    || item.codexAppInput || item.codexAppDispatchId || item.queuedActivationToken || item.restartNoteOriginalContent
+    || item.trustedCaller?.senderType !== 'user' || item.trustedCaller.source !== undefined
+    || !pendingInputAllowsTypeAhead(runtimePtyInputPolicy().supportsTypeAhead, durableTurnInFlight, item,
+      directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead())
+    || activeTurnBlocks(item)) return undefined;
+  const physical = traexPersistentReattachBusyComposerFence();
+  return physical ? { ...physical, item } : undefined;
 }
 
 /** Reorder only an authorized interactive steer, never settle its host turn. */
@@ -30335,7 +30917,18 @@ async function flushPending(): Promise<void> {
     if (isFlushing || backend !== target || cliRestartInProgress || webTerminalInputWireDirty()) return;
   }
   if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
-  if (recoverSessionRenameAfterPersistentReattach()) return;
+  let reattachSteerFence = lastSpawnPersistentReattach && lastInitConfig?.cliId === 'traex'
+    ? traexPersistentReattachSteeringFence(pendingMessages[0]) : undefined;
+  const reattachSteerFenceIsCurrent = (item: PendingCliInput): boolean => {
+    const current = traexPersistentReattachSteeringFence(item);
+    return !!reattachSteerFence && !!current && current.item === reattachSteerFence.item
+      && current.backend === reattachSteerFence.backend && current.adapter === reattachSteerFence.adapter
+      && current.generation === reattachSteerFence.generation
+      && current.lifetime === reattachSteerFence.lifetime
+      && current.webInputGeneration === reattachSteerFence.webInputGeneration
+      && current.pid === reattachSteerFence.pid && current.nativeSessionId === reattachSteerFence.nativeSessionId;
+  };
+  if (recoverSessionRenameAfterPersistentReattach(pendingMessages[0])) return;
   if (resetTraexAutoModelBeforePendingTurn()) return;
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
@@ -30364,6 +30957,11 @@ async function flushPending(): Promise<void> {
     log(`Holding pending input behind ${rpcLifecycleFailClosedOwners.size} unresolved Codex RPC delivery owner(s)`);
     return;
   }
+  // These transport phases own readiness even after the native id disappears.
+  // A stale screen idle (or an earlier owner's callback) cannot start a new
+  // task before every pending ACK and terminal hydration has settled.
+  if (codexRpcEngine && (rpcTurnsAwaitingActivation.size > 0
+    || settlingRpcTerminalOwners.size > 0 || rpcTerminalHydrationOwners.size > 0)) return;
   // Only after the serial/lifecycle gates above may screen evidence classify the
   // current input owner. Otherwise BotMux's own in-flight command or an active
   // durable turn is misreported as a user draft. Dedicated interaction owners
@@ -30469,9 +31067,11 @@ async function flushPending(): Promise<void> {
   const traexNativeCommandBlocked = (pendingRawInputs.length > 0 || pendingSessionRename !== null)
     && lastInitConfig?.cliId === 'traex' && lastInitConfig.adoptMode === true && !!backend
     && traexTerminalInputBlocked(adapterInputHandle(backend));
-  const sessionRenameReady = isPromptReady && pendingSessionRename !== null && !traexNativeCommandBlocked;
-  const rawInputReady = isPromptReady && pendingRawInputs.length > 0 && !traexNativeCommandBlocked;
-  const adoptInputReady = isPromptReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
+  const administrativeInputReady = !reattachSteerFence
+    && (!codexRpcEngine || !hybridRpcTurnBlocksAdministrativeInput());
+  const sessionRenameReady = isPromptReady && administrativeInputReady && pendingSessionRename !== null && !traexNativeCommandBlocked;
+  const rawInputReady = isPromptReady && administrativeInputReady && pendingRawInputs.length > 0 && !traexNativeCommandBlocked;
+  const adoptInputReady = isPromptReady && administrativeInputReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
   let supportedSessionRenameReady = sessionRenameReady;
   const renameOnRemoteBackend = effectiveBackendType === 'riff'
     || effectiveBackendType === 'mojo'
@@ -30780,6 +31380,17 @@ async function flushPending(): Promise<void> {
         }
         break;
       }
+      // The previous adapter can await while another human correction arrives.
+      // Its lease belongs to that previous item; prove a new empty composer
+      // for this head rather than carrying the first item's admission forward.
+      if (reattachSteerFence && itemsWrittenInThisFlush > 0) {
+        const nextFence = traexPersistentReattachSteeringFence(pendingMessages[0]);
+        if (!nextFence) {
+          armSessionRenameReattachRecoveryRetry();
+          break;
+        }
+        reattachSteerFence = nextFence;
+      }
       const admissionHead = pendingMessages[0]!;
       const admissionBackend = backend;
       const admissionGeneration = cliSpawnGeneration;
@@ -30868,9 +31479,23 @@ async function flushPending(): Promise<void> {
         break;
       }
       if (webTerminalInputWireDirty()) break;
+      // Settling the opening composer and question/model checks can await.
+      // Retain the exact queue head if this busy-reattach lease changed; no
+      // dequeue, rename Enter, or new prompt-ready state has occurred.
+      if (reattachSteerFence) {
+        if (!pendingMessages[0] || !reattachSteerFenceIsCurrent(pendingMessages[0])) break;
+      }
       const catalogAdmissionHead = pendingMessages[0];
       if (catalogAdmissionHead?.turnId
         && admitTraexCatalogModelBeforeInput(catalogAdmissionHead.turnId, catalogAdmissionHead.dispatchAttempt)) break;
+      // Explicit FIFO, non-interactive input and a rejected steer remain at
+      // the head until the native task closes. A stale ready screen cannot
+      // turn them into a second turn/start against the live native id.
+      if (codexRpcEngine?.activeNativeTurnId && catalogAdmissionHead
+        && !hybridRpcInputMaySteer(catalogAdmissionHead, codexRpcEngine.activeNativeTurnId)) {
+        keepPromptReadyAfterHold();
+        break;
+      }
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       // A follow-up turn must never be written onto a degraded model while the
@@ -30978,12 +31603,19 @@ async function flushPending(): Promise<void> {
       let normalWritePrepared = false;
       let retiredBeforeSubmit = false;
       let webWireWriteRefused = false;
+      let reattachSteerWriteRefused = false;
       let submissionPreparationFailed = false;
       // Remote-runner, RPC and Codex App runner input bypass the composer.
       const typedIntoComposer = !writeBackend.submitTurn && !writeRpcEngine
         && !(item.codexAppInput && writeAdapter.writeStructuredInput);
       const prepareNormalWrite = (): void => {
         if (normalWritePrepared) return;
+        // A backend submission mutex may await after dequeue. Capture again
+        // at the literal write edge, before rotating capture or turn authority.
+        if (reattachSteerFence && !reattachSteerFenceIsCurrent(item)) {
+          reattachSteerWriteRefused = true;
+          throw new SubmissionWriteError('Persistent TRAE steering lease changed before native write', undefined, false);
+        }
         if (webTerminalInputWireDirty()) {
           webWireWriteRefused = true;
           throw new SubmissionWriteError('Web terminal wire is dirty before the native write', 'web_terminal_input_wire_dirty', false);
@@ -31344,6 +31976,7 @@ async function flushPending(): Promise<void> {
       let rpcTurnIdentity: CodexRpcTurnIdentity | undefined;
       let rpcTurnGeneration: RpcTurnGeneration | undefined;
       let rpcContext: PreparedTraexNativeContext | undefined;
+      let rpcSteering = false;
       try {
         if (item.taskContinuation && !writeRpcEngine) {
           emitTurnTerminal(
@@ -31426,13 +32059,32 @@ async function flushPending(): Promise<void> {
           // surfaces as a normal submit-failure notice.
           let rpcNativeTurnId: string | undefined;
           await runAfterAmbiguousSubmissionWrites(writeBackend, async () => {
+            // The mutex wait can outlive native completion or another ACK.
+            // Exclude this item's own activation lease, but never start/steer
+            // across another owner's unresolved transport or hydration phase.
+            const ownerKey = rpcTurnOwnerKey(rpcTurnIdentity!);
+            if ([...rpcTurnsAwaitingActivation.keys()].some(key => key !== ownerKey)
+              || settlingRpcTerminalOwners.size > 0 || rpcTerminalHydrationOwners.size > 0
+              || rpcLifecycleFailClosedOwners.size > 0) {
+              throw new CodexRpcDeliveryError(
+                'RPC lifecycle is still settling before native input', 'rpc_turn_start_not_sent', 'not_sent',
+              );
+            }
             const activeNativeTurnId = writeRpcEngine.activeNativeTurnId;
             if (activeNativeTurnId) {
-              throw new CodexRpcDeliveryError(
-                `refusing turn/start while active native turn ${activeNativeTurnId} has not reached terminal`,
-                'rpc_turn_start_active',
-                'not_sent',
-              );
+              if (!hybridRpcInputMaySteer(item, activeNativeTurnId)) {
+                throw new CodexRpcDeliveryError(
+                  `refusing turn/start while active native turn ${activeNativeTurnId} has not reached terminal`,
+                  'rpc_turn_start_active', 'not_sent',
+                );
+              }
+              rpcTurnGeneration!.steerNativeTurnId = activeNativeTurnId;
+              rpcSteering = true;
+              rpcNativeTurnId = (await writeRpcEngine.steerTurn(
+                rpcContext?.content ?? msg, rpcTurnIdentity!, activeNativeTurnId,
+                { onDispatch: prepareNormalWrite },
+              )).nativeTurnId;
+              return;
             }
             // Commit attribution/durable ownership only once the frame is on
             // the socket: a not_sent rejection (dead socket, concurrent start)
@@ -31462,7 +32114,7 @@ async function flushPending(): Promise<void> {
             item.structuredSourceTurnIds, writeRpcEngine.activeThreadId);
           // The app-server acknowledged turn/start for this exact input on
           // the engine's active thread, fenced to the current generation.
-          acknowledgeNativeInputConsumed(item.turnId, 'codex_rpc_turn_start',
+          acknowledgeNativeInputConsumed(item.turnId, rpcSteering ? 'codex_rpc_turn_steer' : 'codex_rpc_turn_start',
             writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId,
             item.dispatchAttempt);
           publishTraexNativeContextReceipt(rpcContext, rpcTurnIdentity.turnId, 'accepted');
@@ -31508,6 +32160,20 @@ async function flushPending(): Promise<void> {
           recoveryFailureReason = transaction.recoveryFailureReason;
         } else {
           submissionBackend = writeBackend;
+          const nativeGuard = lastInitConfig?.cliId === 'traex' ? traexQuestionSubmitGuard(item) : undefined;
+          const writeSteerFence = reattachSteerFence;
+          const submitGuard = nativeGuard && writeSteerFence ? {
+            ...nativeGuard,
+            // TraeX's adapter awaits picker setup before beforeWrite. Keep
+            // authority/commit preparation at that last pre-paste boundary.
+            beforeWrite: () => { prepareNormalWrite(); nativeGuard.beforeWrite?.(); },
+            current: () => nativeGuard.current()
+              && backend === writeSteerFence.backend && cliAdapter === writeSteerFence.adapter
+              && cliSpawnGeneration === writeSteerFence.generation
+              && cliLifetimeNonce === writeSteerFence.lifetime
+              && webTerminalInputGeneration === writeSteerFence.webInputGeneration
+              && currentTraexObservedPid() === writeSteerFence.pid,
+          } : nativeGuard;
           if (writeAdapter.writeInputDefersPreparation === true && !pendingMessages.includes(item)) {
             // Keep the exact item under the ordinary pending lifecycle until its
             // asynchronous precheck reaches beforeSubmit. backend.onExit,
@@ -31557,11 +32223,12 @@ async function flushPending(): Promise<void> {
                   ? { correlateTranscript: true as const } : {}),
                 ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
-                ...(lastInitConfig?.cliId === 'traex' ? { submitGuard: traexQuestionSubmitGuard(item) } : {}),
+                ...(submitGuard ? { submitGuard } : {}),
               },
             ),
             settleVerifiableSubmissionForJournal,
-            writeAdapter.writeInputDefersPreparation === true ? undefined : prepareNormalWrite,
+            (writeAdapter.writeInputDefersPreparation === true || reattachSteerFence)
+              ? undefined : prepareNormalWrite,
           ).finally(() => { traexQuestionDraftWaiting = false; });
           result = transaction.result;
           recoveryFailureReason = transaction.recoveryFailureReason;
@@ -31603,6 +32270,13 @@ async function flushPending(): Promise<void> {
           scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
         }
       } catch (err: any) {
+        if (reattachSteerWriteRefused && !normalWritePrepared && writeContinuationIsCurrent()) {
+          pendingMessages.unshift(item);
+          requeueUnsubmittedQueuedActivation(item);
+          keepPromptReadyAfterHold();
+          log('Retained definitely-unwritten correction after persistent TRAE steering lease changed');
+          break;
+        }
         if ((webWireWriteRefused || (err instanceof SubmissionWriteError && !err.submissionStarted
           && webTerminalInputWireDirty())) && !tracksCodexAppLiveness && writeContinuationIsCurrent()) {
           if (writeAdapter.writeInputDefersPreparation !== true && !pendingMessages.includes(item)) {
@@ -31673,6 +32347,7 @@ async function flushPending(): Promise<void> {
           && err instanceof CodexRpcDeliveryError
           && err.deliveryDisposition === 'not_sent') {
           clearAwaitingRpcActivation(rpcTurnIdentity, rpcTurnGeneration);
+          if (rpcSteering || writeRpcEngine?.activeNativeTurnId) item.queueAfterActiveTurn = true;
           pendingMessages.unshift(item);
           log(
             `Codex RPC turn/start was not sent; retained the FIFO head `
@@ -32493,6 +33168,8 @@ function sendToPty(
     next,
     directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
   ) && !activeTurnBlocks(next);
+  const reattachSteerReady = lastSpawnPersistentReattach && lastInitConfig?.cliId === 'traex'
+    && traexPersistentReattachSteeringFence(next) !== undefined;
   const shouldMergeQueued = !traexAutoModelRuntimeEligible()
     && opts.dispatchAttempt === undefined && !durableTurnInFlight
     && !isFlushing && !shouldWriteNow({
@@ -32500,7 +33177,7 @@ function sendToPty(
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
-    startupComplete: idleDetector?.isStartupComplete(),
+    startupComplete: reattachSteerReady || idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   }) && cliAdapter.mergeQueuedInput === true;
   const mergedQueued = shouldMergeQueued && mergeQueuedCliInput(pendingMessages, next);
@@ -32542,12 +33219,12 @@ function sendToPty(
   // TUI has booted. First-ready or positive initialization evidence proves
   // this; keep that evidence available to messages arriving after the startup
   // observer's one-time queue flush, even if resyncs prevent ordinary idle.
-  if (!recoverSessionRenameAfterPersistentReattach() && !sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
+  if (!recoverSessionRenameAfterPersistentReattach(next) && !sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
     isPromptReady,
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
-    startupComplete: idleDetector?.isStartupComplete(),
+    startupComplete: reattachSteerReady || idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   })) {
     if (!mergedQueued) {
@@ -32977,6 +33654,7 @@ function stopScreenUpdates(): void {
   if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   lastAnalyzerSnapshot = '';
   antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
   cancelAntigravityFoldedReconcilePending();
 }
 
@@ -34138,6 +34816,7 @@ async function spawnCliBody(
   daemonCotHoldMayBeActive = false;
   backgroundTasksTrackedForSiblings = false;
   antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
   bridgeQueue?.resetBackgroundTasks?.();
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(homedir(), '.botmux', 'data');
@@ -48545,7 +49224,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         && msg.dispatchAttempt === undefined
         // ordinary-turn 前缀族（om_ / bmx-recovery- / board: 决策看板批次）共用一套
         // 收到/提交去重；board: 的 id 按批次稳定，重投/补投是同一个回合。
-        && isOrdinaryImTurnId(msg.turnId)
+        && (isOrdinaryImTurnId(msg.turnId) || msg.nativeQuestionAnswer !== undefined)
         ? msg.turnId
         : undefined;
       if (ordinaryImTurnId) {
@@ -48634,6 +49313,17 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ...(active?.caller ? { activeCaller: active.caller } : {}),
             ...(active?.controller ? { activeController: active.controller } : {}),
           });
+        }
+        break;
+      }
+      if (msg.nativeQuestionAnswer) {
+        const admit = traexNativeAnswerAdmissions.get(msg.nativeQuestionAnswer.requestId);
+        if (admit) {
+          traexNativeAnswerAdmissions.delete(msg.nativeQuestionAnswer.requestId);
+          admit(msg);
+          acknowledgeTurnInputCommitted(msg.turnId, msg.dispatchAttempt, msg.durablePrimaryInbox);
+        } else if (msg.turnId) {
+          emitTurnTerminal(msg.turnId, 'cancelled', 'native_question_no_longer_pending', msg.dispatchAttempt);
         }
         break;
       }
@@ -49056,7 +49746,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       const startupInputGateHolds = !firstWriteLivenessConfirmed
         || (!openingInputBoxSettled && pendingMessages.length > 0)
         || startupCommandsInProgress || startupCommandAckHold !== null || nativeSessionForkPending();
-      if (cliRestartInProgress || rawInputRestartGate || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()
+      // A busy native turn can accept passthrough, but an adapter's pending
+      // paste/Enter/receipt owns the composer until its flush releases it.
+      if (isFlushing || cliSubmissionInFlight || commandLineWritesPending > 0
+        || cliRestartInProgress || rawInputRestartGate || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()
+        || (codexRpcEngine && hybridRpcTurnBlocksAdministrativeInput())
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked

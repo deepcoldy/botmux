@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createTraexAdapter, TRAEX_SPINNER_LABELS } from '../src/adapters/cli/traex.js';
-import { traexViewportFooterBusy } from '../src/adapters/cli/traex-footer.js';
+import { traexActiveEmptyComposerReady, traexViewportFooterBusy } from '../src/adapters/cli/traex-footer.js';
 
 const adapter = createTraexAdapter('/bin/traex');
 /** The worker's real entry point: full authoritative viewport via getter. */
@@ -57,6 +57,44 @@ const LIVE_REPLY = [
 const LIVE_BAR = '  tape-model · Context 99% left · /tmp/w                                                ☢ Full Access (shift+tab to cycle) · ← for agents';
 const LIVE_TITLED_RULE = `${'─'.repeat(136)} Output code block ─`;
 const LIVE_BOTTOM_RULE = '─'.repeat(160);
+
+describe('active TRAE empty composer admission', () => {
+  it('recognizes a resolved empty composer while model activity is visible', () => {
+    const viewport = [
+      '▍ current task', '◆ Working… (2s • esc to interrupt)', RULE,
+      '❯ Use /skills to list available skills', RULE,
+      '  Seed-Evolving high · Context 99% left · /tmp/w',
+      '  ☢ Full Access · ? for shortcuts · ← for agents',
+    ].join('\n');
+    expect(traexActiveEmptyComposerReady(viewport)).toBe(true);
+    expect(traexActiveEmptyComposerReady(viewport.replace('Use /skills to list available skills', '/rename title'))).toBe(false);
+    expect(traexActiveEmptyComposerReady(viewport.replace('Use /skills to list available skills', '[Pasted Content 120 chars]'))).toBe(false);
+  });
+
+  it.each(['Queued for capacity', 'Queued for next turn', 'Reviewing approval request'])
+    ('does not grant type-ahead from %s activity', label => {
+      expect(traexActiveEmptyComposerReady([
+        `◆ ${label}… (2s • esc to interrupt)`, RULE, '❯ Explain this codebase', RULE,
+        '  Seed-Evolving high · Context 99% left · /tmp/w',
+        '  ☢ Full Access · ? for shortcuts · ← for agents',
+      ].join('\n'))).toBe(false);
+    });
+
+  it('retains unknown and provisional footer blocking', () => {
+    const top = ['◆ Working… (2s • esc to interrupt)', RULE, '❯ Explain this codebase', RULE];
+    expect(traexActiveEmptyComposerReady([...top, '  ? for shortcuts'].join('\n'))).toBe(false);
+    expect(traexActiveEmptyComposerReady([...top, '  an unknown native footer'].join('\n'))).toBe(false);
+    expect(traexActiveEmptyComposerReady([...top, '  loading · Context 99% left'].join('\n'))).toBe(false);
+  });
+
+  it('recognizes the existing native truncated status row while retaining unknown and loading rejection', () => {
+    const top = ['◆ Working… (2s • esc to interrupt)', RULE, '❯ Explain this codebase', RULE];
+    const viewport = [...top, '  Seed-Evolving · ~/dev/workspaces/long-merchant-subsi…', '  ☢ Full Access · ? for shortcuts · ← for agents'].join('\n');
+    expect(traexActiveEmptyComposerReady(viewport)).toBe(true);
+    expect(traexActiveEmptyComposerReady(viewport.replace('Seed-Evolving', 'loading'))).toBe(false);
+    expect(traexActiveEmptyComposerReady(viewport.replace('Seed-Evolving · ~/dev/workspaces/long-merchant-subsi…', 'unknown native footer…'))).toBe(false);
+  });
+});
 
 describe('TraeX 0.209 viewport footer busy evidence', () => {
   it('matches the recorded live pane: mid-turn busy, settled idle, draft idle', () => {

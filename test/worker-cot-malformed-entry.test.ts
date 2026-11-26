@@ -57,6 +57,8 @@ describe('worker CoT intake', () => {
     'tool_call without args': { kind: 'tool_call', id: 't1', name: 'Bash' },
     'tool_call with a non-string subject': { kind: 'tool_call', id: 't1', name: 'Bash', args: '{}', subject: 42 },
     'tool_result without result': { kind: 'tool_result', id: 't1' },
+    'tool_call with a non-string id': { kind: 'tool_call', id: 7, name: 'Bash', args: '{}' },
+    'tool_result without id': { kind: 'tool_result', result: 'ok' },
     'unknown kind': { kind: 'image', url: 'x' },
     'null entry': null,
   };
@@ -70,4 +72,20 @@ describe('worker CoT intake', () => {
       });
     }
   }
+
+  // The progress signal reads the last entry's kind; it reads the last
+  // well-formed one, and a batch with none is no observed activity.
+  it('reports progress from the last well-formed entry when the last one is malformed', () => {
+    const w = worker({ cliId: 'traex' });
+    expect(() => w.observeCotEntries([...tail.slice(0, 2), null as any], { turnId: 'om_bad' })).not.toThrow();
+    expect(w.send).toHaveBeenCalledExactlyOnceWith({ type: 'turn_progress', turnId: 'om_bad', stage: 'tool_started' });
+    expect(w.thinkingEntries).toEqual(tail.slice(0, 2));
+  });
+
+  it('reports no progress for a batch with no well-formed entry', () => {
+    const w = worker({ cliId: 'traex' });
+    expect(() => w.observeCotEntries([null as any, { kind: 'text' } as any], { turnId: 'om_bad' })).not.toThrow();
+    expect(w.send).not.toHaveBeenCalled();
+    expect(w.thinkingEntries).toEqual([]);
+  });
 });
