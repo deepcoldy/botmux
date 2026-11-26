@@ -479,6 +479,7 @@ it('re-ACKs a repeated native registration without cancelling the admitted answe
     backend: {}, crashDiagnosticStopped: false, applyWorkerLaunchModel: () => {},
     applyRespawnConfigPatch: () => {}, respawnConfigPatchFromMessage: () => ({}),
     isOrdinaryImTurnId, finalHandoffAdmissionEnabled: false, activeTurnBlocks: () => false,
+    activeTurnAuthority: { snapshot: () => undefined },
     ordinaryImTurnDedupe: new InputTurnDeduper(256),
     universalOutputHandoff: undefined, send: (event: { type: string }) => events.push(event),
     traexNativeAnswerAdmissions: new Map([['request', (input: unknown) => accepted.push(input)]]),
