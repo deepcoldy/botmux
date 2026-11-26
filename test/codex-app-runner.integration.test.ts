@@ -918,12 +918,16 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
               await waitFor(harness, () => harness.stdout.includes('END EXAMPLE'));
               expect(harness.stdout.match(/END EXAMPLE/g)).toHaveLength(1);
             } else {
-                expect(control.finals[0].content).toBe('Independent work completed');
+              expect(control.finals[0].content).toBe('Independent work completed');
               expect(harness.stdout).not.toContain('PPE (Recommended) / Production');
               const progress = control.markers.filter(m => m.kind === 'thinking').flatMap(m => m.payload.entries);
-              expect(progress).not.toEqual(expect.arrayContaining([
-                expect.objectContaining({ text: expect.stringContaining('PPE (Recommended) / Production') }),
-              ]));
+              // The question text must never surface as progress: a streamed
+              // delta leaks its first line, completion leaks the whole item.
+              for (const leaked of ['Which environment?', 'PPE (Recommended) / Production']) {
+                expect(progress).not.toEqual(expect.arrayContaining([
+                  expect.objectContaining({ text: expect.stringContaining(leaked) }),
+                ]));
+              }
             }
             expect(deliveries).toHaveLength(0);
             const ask = cards[0];
