@@ -22,6 +22,7 @@ import type { BotConfig } from '../bot-registry.js';
 import { getBot } from '../bot-registry.js';
 import type { CliTurnPayload, LarkAttachment, Session, TrustedCaller } from '../types.js';
 import type { DaemonSession } from './types.js';
+import { advancePendingStreamingCardTurn } from './streaming-card-post-slot.js';
 import * as sessionStore from '../services/session-store.js';
 import { cancelOrdinaryTurnRecoveryForUserInput } from '../services/ordinary-turn-recovery.js';
 import { resetCodexModelSelection } from '../services/codex-model-selection.js';
@@ -527,7 +528,10 @@ async function runDowngrade(
       }
       rememberInput(ds, plan.userPrompt, input, turnId);
       noteStarted(ds, turnId);
-      ds.streamCardPending = true;
+      // A capacity hop starts a fresh turn: rotate the streaming-card generation
+      // and clear prior-turn slots so a commit-unknown uuid from the overloaded
+      // turn can never be reused on the downgraded worker's card.
+      advancePendingStreamingCardTurn(ds);
       persistCard(ds);
       updateSession(ds.session);
       if (plan.mode === 'pin') {

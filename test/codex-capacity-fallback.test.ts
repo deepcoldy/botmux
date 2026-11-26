@@ -25,6 +25,12 @@ import {
 } from '../src/core/codex-capacity-fallback.js';
 import { config } from '../src/config.js';
 import * as sessionStore from '../src/services/session-store.js';
+import {
+  acquireTurnStreamingCardPostSlot,
+  classifyStreamingCardPostError,
+  hashStreamingCardBody,
+  recordStreamingCardPostFailure,
+} from '../src/core/streaming-card-post-slot.js';
 
 const APP = 'cli_codex_cap';
 const CHAT = 'oc_chat';
@@ -349,6 +355,49 @@ describe('handleCodexCapacityRetry', () => {
     expect(harness.askInputs).toHaveLength(2);
     expect(harness.askInputs[1]?.requestId).toBe(`${nextTurnId}:gpt-5.4:gpt-5.3-codex`);
     expect(harness.forkedCalls[1]?.spawnModelOverride).toBe('gpt-5.3-codex');
+  });
+
+  it('rotates streaming-card generation and slots across a capacity hop so the new card never reuses the prior commit-unknown uuid', async () => {
+    const ds = makeDs({ streamCardTurnGeneration: 7, streamCardPending: true });
+    // Simulate an overloaded-turn card that landed but returned 500: its
+    // commit-unknown slot would otherwise be sticky for same-generation retries.
+    const seeded = acquireTurnStreamingCardPostSlot(ds, {
+      sessionId: ds.session.sessionId,
+      larkAppId: APP,
+      anchorId: 'om_root',
+      replyTargetKey: 'thread:om_root',
+      turnGeneration: 7,
+      canonicalTurnId: TURN,
+    });
+    recordStreamingCardPostFailure(
+      ds,
+      seeded.slot,
+      classifyStreamingCardPostError({ isAxiosError: true, response: { status: 500, data: { code: 2200 } } }),
+      hashStreamingCardBody('overloaded-turn'),
+      'working',
+    );
+
+    const harness = makeDeps(ds);
+    const { trigger } = makeTrigger(ds);
+    expect(handleCodexCapacityRetry(ds, trigger, harness.deps)).toBe(true);
+    await flushMicrotasks();
+
+    // The hop starts a fresh turn: generation bumped and a new pending turn armed.
+    expect(ds.streamCardTurnGeneration).toBe(8);
+    expect(ds.streamCardPending).toBe(true);
+
+    // The downgraded worker's card must allocate a fresh slot instead of
+    // deduplicating onto the overloaded turn's possibly-landed message.
+    const after = acquireTurnStreamingCardPostSlot(ds, {
+      sessionId: ds.session.sessionId,
+      larkAppId: APP,
+      anchorId: 'om_root',
+      replyTargetKey: 'thread:om_root',
+      turnGeneration: 8,
+      canonicalTurnId: ds.lastCliInputTurnId,
+    });
+    expect(after.reused).toBe(false);
+    expect(after.slot.uuid).not.toBe(seeded.slot.uuid);
   });
 
   it('pins the fallback model for the topic when user chooses pin and has operate permission', async () => {
