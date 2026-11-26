@@ -339,6 +339,15 @@ describe('schedule CLI prompt updates', () => {
     expect(readScheduleUpdate(['id', '--prompt=--literal\nbody']).prompt).toBe('--literal\nbody');
     expect(() => readScheduleUpdate(['id', '--prompt', 'a', '--prompt', 'b'])).toThrow('duplicate');
   });
+  it('parses --silent and --no-silent as the only boolean switches', () => {
+    expect(readScheduleUpdate(['id', '--silent'])).toEqual({ silent: true });
+    expect(readScheduleUpdate(['id', '--no-silent'])).toEqual({ silent: false });
+    expect(readScheduleUpdate(['id', '--silent', '--prompt', 'p'])).toEqual({ silent: true, prompt: 'p' });
+    expect(() => readScheduleUpdate(['id', '--silent', '--no-silent'])).toThrow('只能二选一');
+    expect(() => readScheduleUpdate(['id', '--silent', '--silent'])).toThrow('duplicate');
+    expect(() => readScheduleUpdate(['id', '--silent=true'])).toThrow('不接受取值');
+    expect(() => readScheduleUpdate(['id'])).toThrow('没有要修改的字段');
+  });
   it('creates and updates from an ownerless managed session with no bots.json', async () => {
     const f = fixture(); const calls = await managed(f);
     const add = await f.run(['add', '0 12 * * *', 'new task', '--new-topic', '--id', '11223344']);

@@ -10261,6 +10261,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
               : '任务已结束，不会自动执行'
             : '任务已暂停，恢复后按此频率执行';
         console.log(`   下次执行: ${nextLine}`);
+        if (updates.silent !== undefined) {
+          console.log(`   静默执行: ${task.silent ? '已开启' : '已关闭'}`);
+        }
         if (task.enabled && task.calendar !== undefined) {
           console.log(`   日历 ${task.calendar} 允许的下次执行: ${task.nextEligibleRunAt ? fmt(task.nextEligibleRunAt) : '—'}`);
         }
