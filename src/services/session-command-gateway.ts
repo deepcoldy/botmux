@@ -4,7 +4,7 @@ const receipts = new Set(['runtime_contract_assigned', 'runtime_contract_reserve
   'codex_app_dispatch_persisted', 'codex_app_text_persisted', 'structured_turn_not_collected_ack', 'deployment_continuation_cancelled',
   'link_ref_register_result', 'link_ref_resolve_result', 'link_ref_restore_mode_result',
   'worker_ipc_probe', 'close_abort', 'goal_update_ack', 'terminal_effort_writeback_ack',
-  'set_follow_up_reply', 'absorbed_reply_delivered']);
+  'set_follow_up_reply', 'set_fold_background_updates', 'absorbed_reply_delivered']);
 
 /** All executor commands share this fence, independent of backend or input
  * channel. A recovery receipt may address an older effect without controlling

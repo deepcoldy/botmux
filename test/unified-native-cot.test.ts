@@ -940,4 +940,130 @@ describe('unified replies with an independent native CoT channel', () => {
     await Promise.all([flushing, draining]);
     expect(drained).toBe(true);
   });
+
+  it('still appends trailing folded tools when the hold-release frame beats the 1200ms debounce', async () => {
+    // Regression for the fold-background-updates trailing-progress race:
+    // the worker flushes its last thinking_update and immediately sends the
+    // zero-hold release frame; the daemon queues the tools update with a
+    // 1200ms debounce, and reading cotHeldForBackground only at flush time
+    // rejected the last batch on the already-completed unified card.
+    vi.useFakeTimers();
+    try {
+      bot.config.cotEnabled = true;
+      await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_turn', finalAnswer('main answer'), send);
+      await updateTurnReplyCard(ds, 'om_turn', { kind: 'terminal', phase: 'completed' }, send);
+      (ds as any).cotHeldForBackground = { turnId: 'om_turn' };
+
+      queueTurnReplyTools(ds, {
+        turnId: 'om_turn',
+        entries: [{ kind: 'tool_call', id: 'tail-1', name: 'Monitor', args: '{}', subject: 'CI_TAIL_MARKER' }],
+      }, send, () => true);
+      // The release screen_update clears the hold before the debounce fires.
+      (ds as any).cotHeldForBackground = undefined;
+      await vi.advanceTimersByTimeAsync(1250);
+      // Fake timers do not drain the voided timer callback's full async chain;
+      // an explicit flush mirrors what the unref timer completes in production.
+      await flushTurnReplyTools(ds, 'om_turn');
+
+      const record = new TurnReplyCardStore(dir).read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+      })!;
+      expect(record.phase).toBe('completed');
+      expect(JSON.stringify(record.tools)).toContain('CI_TAIL_MARKER');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('admits tools flushed after a hold established post-enqueue, via the live hold read', async () => {
+    // The OR branch: no hold at enqueue time (card still open), the hold is
+    // established when the turn terminates with background tasks, and only
+    // then does the 1200ms debounce flush against the completed card.
+    vi.useFakeTimers();
+    try {
+      bot.config.cotEnabled = true;
+      await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+      queueTurnReplyTools(ds, {
+        turnId: 'om_turn',
+        entries: [{ kind: 'tool_call', id: 'mid-1', name: 'Bash', args: '{}', subject: 'LIVE_HOLD_MARKER' }],
+      }, send, () => true);
+      await updateTurnReplyCard(ds, 'om_turn', finalAnswer('main answer'), send);
+      await updateTurnReplyCard(ds, 'om_turn', { kind: 'terminal', phase: 'completed' }, send);
+      (ds as any).cotHeldForBackground = { turnId: 'om_turn' };
+      await vi.advanceTimersByTimeAsync(1250);
+      await flushTurnReplyTools(ds, 'om_turn');
+
+      const record = new TurnReplyCardStore(dir).read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+      })!;
+      expect(JSON.stringify(record.tools)).toContain('LIVE_HOLD_MARKER');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the completed card immutable when neither queue-time nor live hold applies', async () => {
+    vi.useFakeTimers();
+    try {
+      bot.config.cotEnabled = true;
+      await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_turn', finalAnswer('main answer'), send);
+      await updateTurnReplyCard(ds, 'om_turn', { kind: 'terminal', phase: 'completed' }, send);
+      const before = JSON.stringify(new TurnReplyCardStore(dir).read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+      })!);
+
+      queueTurnReplyTools(ds, {
+        turnId: 'om_turn',
+        entries: [{ kind: 'tool_call', id: 'stray-1', name: 'Bash', args: '{}', subject: 'STRAY_MARKER' }],
+      }, send, () => true);
+      await vi.advanceTimersByTimeAsync(1250);
+      await flushTurnReplyTools(ds, 'om_turn');
+
+      const after = JSON.stringify(new TurnReplyCardStore(dir).read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+      })!);
+      expect(after).toBe(before);
+      expect(after).not.toContain('STRAY_MARKER');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a merged batch observed while armed, even when the hold is released before flush', async () => {
+    // Two thinking_update batches share one 1200ms pending entry. The first is
+    // enqueued before any hold exists; the hold is then established; the second
+    // batch merges into the same entry while armed; the release frame clears
+    // the live hold before the debounce fires. The merged batch was observed
+    // while the hold was active, so its progress must still be admitted.
+    vi.useFakeTimers();
+    try {
+      bot.config.cotEnabled = true;
+      await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_turn', finalAnswer('main answer'), send);
+      await updateTurnReplyCard(ds, 'om_turn', { kind: 'terminal', phase: 'completed' }, send);
+
+      queueTurnReplyTools(ds, {
+        turnId: 'om_turn',
+        entries: [{ kind: 'tool_call', id: 'batch-a', name: 'Bash', args: '{}', subject: 'BATCH_A_MARKER' }],
+      }, send, () => true);
+      (ds as any).cotHeldForBackground = { turnId: 'om_turn' };
+      queueTurnReplyTools(ds, {
+        turnId: 'om_turn',
+        entries: [{ kind: 'tool_call', id: 'batch-b', name: 'Monitor', args: '{}', subject: 'MERGED_TAIL_MARKER' }],
+      }, send, () => true);
+      (ds as any).cotHeldForBackground = undefined;
+      await vi.advanceTimersByTimeAsync(1250);
+      await flushTurnReplyTools(ds, 'om_turn');
+
+      const record = new TurnReplyCardStore(dir).read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn',
+      })!;
+      expect(record.phase).toBe('completed');
+      expect(JSON.stringify(record.tools)).toContain('MERGED_TAIL_MARKER');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

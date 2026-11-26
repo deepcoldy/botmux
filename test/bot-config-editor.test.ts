@@ -474,6 +474,15 @@ describe('applyBotConfigEdits', () => {
     expect(cleared.allowedChatGroups).toBeUndefined();
   });
 
+  it('edits foldBackgroundUpdates as default-OFF sparse boolean (only true persists)', () => {
+    const base = { larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code' };
+    expect(applyBotConfigEdits(base, { foldBackgroundUpdates: 'true' }).foldBackgroundUpdates).toBe(true);
+    expect(applyBotConfigEdits(base, { foldBackgroundUpdates: 'on' }).foldBackgroundUpdates).toBe(true);
+    expect(applyBotConfigEdits({ ...base, foldBackgroundUpdates: true }, { foldBackgroundUpdates: 'false' }).foldBackgroundUpdates).toBeUndefined();
+    expect(applyBotConfigEdits({ ...base, foldBackgroundUpdates: true }, { foldBackgroundUpdates: '-' }).foldBackgroundUpdates).toBeUndefined();
+    expect(() => applyBotConfigEdits(base, { foldBackgroundUpdates: 'maybe' })).toThrow();
+  });
+
   it('rejects bare email prefixes in allowedUsers (only full email or ou_ accepted)', () => {
     expect(() => applyBotConfigEdits({
       larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',

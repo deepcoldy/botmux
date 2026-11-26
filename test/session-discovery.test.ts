@@ -54,7 +54,8 @@ vi.mock('node:os', () => {
     homedir: () => '/home/testuser',
     // session-discovery 用 platform() 决定 Linux /proc 快路径 vs macOS ps/lsof 兜底。
     // 既有 mock 数据全部按 Linux 形态准备，所以这里固定为 'linux'。
-    // macOS 兜底路径的覆盖见 test/session-discovery.smoke.test.ts。
+    // Bun 可能在此 mock 前加载 os；setupMocks 同时提供等价 BSD 进程表。
+    // macOS 真实兜底路径另由 smoke 测试验证。
     platform: () => 'linux',
   };
 });
@@ -253,8 +254,10 @@ function setupMocks(opts: {
    *  Used to test CoCo session discovery (and any future fd-walking logic).
    *  Pass `'<path> (deleted)'` suffix to simulate procfs's deleted-inode marker. */
   procFdMap?: Record<number, string[]>;
+  /** Actual loaded binary, independent of argv[0] or a retargeted symlink. */
+  executableMap?: Record<number, string>;
 }) {
-  const { paneLines, commMap = {}, cwdMap = {}, childMap = {}, cmdlineMap = {}, dimsMap = {}, claudeMeta = {}, statMap = {}, bootTimeSeconds = 1_700_000_000, procFdMap = {} } = opts;
+  const { paneLines, commMap = {}, cwdMap = {}, childMap = {}, cmdlineMap = {}, dimsMap = {}, claudeMeta = {}, statMap = {}, bootTimeSeconds = 1_700_000_000, procFdMap = {}, executableMap = {} } = opts;
 
   // Replace blanket existsSync / readdirSync mocks with procFdMap-aware ones.
   mockExistsSync.mockImplementation((path: unknown) => {
@@ -276,6 +279,13 @@ function setupMocks(opts: {
 
   mockExecSync.mockImplementation((cmd: unknown) => {
     const cmdStr = String(cmd);
+
+    const commMatch = cmdStr.match(/^ps -o comm= -p (\d+)$/);
+    if (commMatch) {
+      const pid = Number(commMatch[1]);
+      if (pid in commMap) return commMap[pid] + '\n';
+      throw new Error('ENOENT');
+    }
 
     // tmux list-panes
     if (cmdStr.includes('list-panes')) {
@@ -326,6 +336,35 @@ function setupMocks(opts: {
 
     throw new Error(`unexpected execSync call: ${cmdStr}`);
   });
+
+  // Equivalent BSD probes keep these fixtures valid when Bun preloads the OS
+  // module before the test's platform mock. Only protocol data is faked; the
+  // discovery / PID selection / filtering functions still execute for real.
+  vi.mocked(execFileSync).mockImplementation(((file: string, args: string[]) => {
+    const pid = Number(args[args.indexOf('-p') + 1]);
+    if (file === 'lsof') {
+      const selector = args[args.indexOf('-d') + 1];
+      if (args.includes('-d') && selector === 'cwd' && pid in cwdMap) {
+        return `p${pid}\nfcwd\nn${cwdMap[pid]}\n`;
+      }
+      if (args.includes('-d') && selector === 'txt' && pid in executableMap) {
+        return `p${pid}\nftxt\nn${executableMap[pid]}\n`;
+      }
+      // The procfs-only deleted marker is not a BSD lsof pathname. Such
+      // entries have no live pathname in this equivalent BSD fixture.
+      if (!args.includes('-d') && pid in procFdMap) {
+        return `p${pid}\n` + procFdMap[pid]!.filter(path => !path.endsWith(' (deleted)')).map((path, i) => `f${i}\nn${path}\n`).join('');
+      }
+    }
+    if (file === 'ps' && args.includes('args=') && pid in cmdlineMap) {
+      return cmdlineMap[pid]!.join(' ');
+    }
+    if (file === 'ps' && args.includes('lstart=') && pid in statMap) {
+      return new Date((bootTimeSeconds + statMap[pid]! / 100) * 1000).toUTCString();
+    }
+    if (file === 'getconf' && args[0] === 'CLK_TCK') return '100\n';
+    throw new Error('probe unavailable in fixture');
+  }) as typeof execFileSync);
 
   mockReadFileSync.mockImplementation((path: unknown) => {
     const pathStr = String(path);
@@ -378,6 +417,12 @@ function setupMocks(opts: {
 
   mockReadlinkSync.mockImplementation((path: unknown) => {
     const pathStr = String(path);
+    const exeMatch = pathStr.match(/^\/proc\/(\d+)\/exe$/);
+    if (exeMatch) {
+      const pid = Number(exeMatch[1]);
+      if (pid in executableMap) return executableMap[pid];
+      throw new Error('ENOENT');
+    }
     const cwdMatch = pathStr.match(/\/proc\/(\d+)\/cwd/);
     if (cwdMatch) {
       const pid = Number(cwdMatch[1]);
@@ -1015,6 +1060,89 @@ describe('discoverAdoptableSessions', () => {
 
     expect(results).toHaveLength(1);
     expect(results[0]!.sessionId).toBeUndefined();
+  });
+
+  // The process title is shared with legacy CoCo; the loaded executable is
+  // authoritative even when argv[0] still names a stable traecli symlink.
+  it.each(['/opt/traex', '/opt/TRAE CLI/traex', '/opt/traex (deleted)'])(
+    'discovers and revalidates TRAE titled traecli from executable %s', executable => {
+      setupMocks({
+        paneLines: 'work:0.0 9400\n',
+        commMap: { 9400: 'bash', 9401: 'traecli' },
+        childMap: { 9400: [9401] },
+        cmdlineMap: { 9401: ['/opt/bin/traecli'] },
+        executableMap: { 9401: executable },
+        cwdMap: { 9401: '/workspace/root' },
+        dimsMap: { 'work:0.0': '120 30' },
+      });
+
+      const [candidate] = discoverAdoptableSessions('traex');
+      expect(candidate).toMatchObject({ cliId: 'traex', cliPid: 9401, cwd: '/workspace/root' });
+      expect(discoverAdoptableSessionByTarget('work:0.0', 'traex')).toEqual(candidate);
+      expect(validateAdoptTarget(candidate!)).toBe(true);
+      expect(discoverAdoptableSessions('coco')).toEqual([]);
+    },
+  );
+
+  it('uses bounded lsof evidence when procfs cannot expose the executable', () => {
+    setupMocks({
+      paneLines: 'fallback:0.0 9700\n',
+      commMap: { 9700: 'traecli' },
+      executableMap: { 9700: '/opt/traex' },
+      cwdMap: { 9700: '/workspace/root' },
+      dimsMap: { 'fallback:0.0': '120 30' },
+    });
+    const readlink = mockReadlinkSync.getMockImplementation()!;
+    mockReadlinkSync.mockImplementation(((path: unknown) => {
+      if (String(path).endsWith('/exe')) throw new Error('procfs denied');
+      return readlink(path as string);
+    }) as typeof readlinkSync);
+    expect(discoverAdoptableSessions('traex')[0]).toMatchObject({ cliPid: 9700, cliId: 'traex' });
+    expect(vi.mocked(execFileSync).mock.calls.some(([file, args]) =>
+      file === 'lsof' && Array.isArray(args) && args.includes('txt'),
+    )).toBe(true);
+  });
+
+  it('retains the renamed native root instead of following its TRAE subagent', () => {
+    setupMocks({
+      paneLines: 'work:0.0 9400\n',
+      commMap: { 9400: 'bash', 9401: 'traecli', 9402: 'traex' },
+      childMap: { 9400: [9401], 9401: [9402] },
+      executableMap: { 9401: '/opt/traex' },
+      cwdMap: { 9401: '/workspace/root', 9402: '/workspace/subagent' },
+      dimsMap: { 'work:0.0': '120 30' },
+    });
+    expect(discoverAdoptableSessions('traex')[0]).toMatchObject({
+      cliPid: 9401, cwd: '/workspace/root',
+    });
+  });
+
+  it('keeps legacy CoCo titled traecli out of a TRAE bot and accepts it for CoCo', () => {
+    setupMocks({
+      paneLines: 'legacy:0.0 9500\n',
+      commMap: { 9500: 'traecli' },
+      cmdlineMap: { 9500: ['/opt/bin/traecli', 'traex'] },
+      executableMap: { 9500: '/opt/coco' },
+      cwdMap: { 9500: '/workspace/legacy' },
+      dimsMap: { 'legacy:0.0': '120 30' },
+    });
+    const [candidate] = discoverAdoptableSessions('coco');
+    expect(candidate).toMatchObject({ cliId: 'coco', cliPid: 9500 });
+    expect(validateAdoptTarget(candidate!)).toBe(true);
+    expect(discoverAdoptableSessionByTarget('legacy:0.0', 'traex')).toBeUndefined();
+    expect(discoverAdoptableSessions('traex')).toEqual([]);
+  });
+
+  it('does not reinterpret an unverified traecli title based on the requested CLI or a prompt', () => {
+    setupMocks({
+      paneLines: 'unknown:0.0 9600\n',
+      commMap: { 9600: 'traecli' },
+      cmdlineMap: { 9600: ['/opt/bin/traecli', 'explain /opt/traex'] },
+      cwdMap: { 9600: '/workspace/unknown' },
+      dimsMap: { 'unknown:0.0': '120 30' },
+    });
+    expect(discoverAdoptableSessions('traex')).toEqual([]);
+    expect(discoverAdoptableSessions('coco')[0]?.cliId).toBe('coco');
   });
 
   // ── TRAE (traex) /proc/<pid>/fd-based session discovery ─────────────────

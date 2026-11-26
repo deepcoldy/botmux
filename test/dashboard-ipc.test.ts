@@ -30,6 +30,7 @@ import * as runAsModule from '../src/core/run-as.js';
 import { invalidateGlobalConfigCache, setGroupOwnerNoticeEnabled } from '../src/global-config.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
 import * as followUpReplyChange from '../src/services/follow-up-reply-change.js';
+import * as foldBackgroundUpdatesChange from '../src/services/fold-background-updates-change.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import { resolveScheduleModelOverride } from '../src/core/schedule-model-override.js';
 import {
@@ -2676,6 +2677,80 @@ describe('PUT /api/bot-card-prefs — mid-turn replies (followUpReply)', () => {
       expect(otherBot.sent).toEqual([]);
     } finally {
       unregisterFollowUpReply();
+      workerPool.setActiveSessionsRegistry(undefined);
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-card-prefs — fold background updates (foldBackgroundUpdates)', () => {
+  it('is default-off, persists only true, rejects non-booleans with 400, and broadcasts live updates to matching workers', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-fold-bg-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-fold-bg-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const worker = () => {
+      const sent: unknown[] = [];
+      return { sent, killed: false, connected: true, send: (msg: unknown) => { sent.push(msg); return true; } };
+    };
+    const own = worker();
+    const ownKilled = { ...worker(), killed: true };
+    const otherBot = worker();
+    const unregister = foldBackgroundUpdatesChange.registerFoldBackgroundUpdatesChangeHandler((app, enabled) => {
+      foldBackgroundUpdatesChange.broadcastFoldBackgroundUpdatesToWorkers(
+        workerPool.getActiveSessionsRegistry()?.values() ?? [],
+        app,
+        enabled,
+      );
+    });
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      workerPool.setActiveSessionsRegistry(new Map<string, any>([
+        ['s-own', { larkAppId: appId, worker: own, session: { sessionId: 's-own', status: 'active' } }],
+        ['s-own-killed', { larkAppId: appId, worker: ownKilled, session: { sessionId: 's-own-killed', status: 'active' } }],
+        ['s-other', { larkAppId: 'some-other-app', worker: otherBot, session: { sessionId: 's-other', status: 'active' } }],
+      ]));
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const put = (body: unknown) => fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).foldBackgroundUpdates).toBe(false);
+
+      const bad = await put({ foldBackgroundUpdates: 'yes' });
+      expect(bad.status).toBe(400);
+      expect(await bad.json()).toMatchObject({ ok: false, error: 'invalid_fold_background_updates' });
+
+      const on = await put({ foldBackgroundUpdates: true });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, foldBackgroundUpdates: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].foldBackgroundUpdates).toBe(true);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).foldBackgroundUpdates).toBe(true);
+
+      const off = await put({ foldBackgroundUpdates: false });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, foldBackgroundUpdates: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).not.toHaveProperty('foldBackgroundUpdates');
+
+      // Unrelated preference toggle must not broadcast set_fold_background_updates.
+      expect((await put({ goalStatusCard: true })).status).toBe(200);
+
+      expect(own.sent).toEqual([
+        { type: 'set_fold_background_updates', enabled: true },
+        { type: 'set_fold_background_updates', enabled: false },
+      ]);
+      expect(ownKilled.sent).toEqual([]);
+      expect(otherBot.sent).toEqual([]);
+    } finally {
+      unregister();
       workerPool.setActiveSessionsRegistry(undefined);
       if (handle) await handle.close();
       handle = null;

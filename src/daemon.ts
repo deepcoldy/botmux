@@ -185,6 +185,7 @@ import { buildMarkdownCard, contextPercentUsed } from './im/lark/md-card.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField, setAssistantModeEnabledHook } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { broadcastFollowUpReplyToWorkers, registerFollowUpReplyChangeHandler } from './services/follow-up-reply-change.js';
+import { broadcastFoldBackgroundUpdatesToWorkers, registerFoldBackgroundUpdatesChangeHandler } from './services/fold-background-updates-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
@@ -579,6 +580,7 @@ import {
   collectSessionTurnGarbage,
   sweepTraexInstallChanges,
   suspendWorker,
+  sendFoldBackgroundUpdatesSetting,
   resetUsageLimitForNewTurn,
   scheduleUsageLimitPersistenceRetry,
 } from './core/worker-pool.js';
@@ -36611,6 +36613,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   registerPinStreamingCardChangeHandler(reconcileBotStreamingCardPins);
   registerFollowUpReplyChangeHandler((larkAppId, enabled) => {
     broadcastFollowUpReplyToWorkers(activeSessions.values(), larkAppId, enabled);
+  });
+  registerFoldBackgroundUpdatesChangeHandler((larkAppId, enabled) => {
+    broadcastFoldBackgroundUpdatesToWorkers(
+      activeSessions.values(),
+      larkAppId,
+      enabled,
+      (ds, value) => sendFoldBackgroundUpdatesSetting(ds, value),
+    );
   });
 
   if (cfg.dispatchLaunchPolicy?.enabled === true) {
