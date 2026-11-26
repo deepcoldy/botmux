@@ -91,7 +91,7 @@ describe('askPlatformToAuthorize', () => {
     const result = await askPlatformToAuthorize({
       botConfig: bot(['lark-user']), openId: 'ou_a', isCurrent: () => current,
     }, deps);
-    expect(result).toEqual({ kind: 'unavailable' });
+    expect(result).toEqual({ kind: 'unavailable', guardRefused: true });
     expect(requests).toEqual([]);
   });
 
@@ -192,5 +192,45 @@ describe('askPlatformToAuthorize', () => {
     expect((await ask()).kind).toBe('unavailable');
     expect(await ask()).toEqual({ kind: 'sent', deduped: false });
     expect(requests).toHaveLength(2);
+  });
+
+  it('lets a valid caller retry when the shared request stopped on another caller\'s fence', async () => {
+    const { requests, deps } = setup();
+    let resolveUnion!: (value: string) => void;
+    deps.unionIdFor.mockReturnValue(new Promise<string | null>(resolve => { resolveUnion = resolve; }));
+    let allowA = true;
+    let bFenceCalls = 0;
+    const args = { botConfig: bot(['bytecloud']), openId: 'ou_a' };
+    const a = askPlatformToAuthorize({ ...args, stillAllowed: () => allowA }, deps);
+    const b = askPlatformToAuthorize({ ...args, stillAllowed: () => { bFenceCalls++; return true; } }, deps);
+    allowA = false;
+    resolveUnion('on_alice');
+
+    expect(await a).toMatchObject({ kind: 'unavailable', guardRefused: true });
+    expect(await b).toEqual({ kind: 'sent', deduped: false });
+    expect(bFenceCalls).toBeGreaterThan(0);
+    expect(requests).toHaveLength(1);
+  });
+
+  it('checks a guarded caller\'s own fence before reusing a recent answer', async () => {
+    const { requests, deps } = setup();
+    const args = { botConfig: bot(['bytecloud']), openId: 'ou_a' };
+    expect(await askPlatformToAuthorize(args, deps)).toEqual({ kind: 'sent', deduped: false });
+    expect(await askPlatformToAuthorize({ ...args, stillAllowed: () => false }, deps))
+      .toEqual({ kind: 'unavailable' });
+    expect(requests).toHaveLength(1);
+  });
+
+  it('still coalesces concurrent callers whose guards remain valid', async () => {
+    const { requests, deps } = setup();
+    let resolveUnion!: (value: string) => void;
+    deps.unionIdFor.mockReturnValue(new Promise<string | null>(resolve => { resolveUnion = resolve; }));
+    const args = { botConfig: bot(['bytecloud']), openId: 'ou_a', stillAllowed: () => true };
+    const a = askPlatformToAuthorize(args, deps);
+    const b = askPlatformToAuthorize(args, deps);
+    resolveUnion('on_alice');
+    expect(await a).toEqual({ kind: 'sent', deduped: false });
+    expect(await b).toEqual({ kind: 'sent', deduped: true });
+    expect(requests).toHaveLength(1);
   });
 });
