@@ -32,8 +32,32 @@ afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); for (const db of dbs
 
 function deliveryScope(scope: Record<string, any>) {
   Object.assign(scope, { INTERNAL_BRIDGE_FINAL_REJECTION, REUSED_IM_FINAL_RECEIPT, isInternalBridgeFinal });
+  scope.TurnSendLedger ??= TurnSendLedger;
+  scope.outputSnapshot ??= outputSnapshot;
+  scope.requiredReplyDisplayDecision = loadWorkerPoolFunction('requiredReplyDisplayDecision', scope);
+  scope.managedAuxUiSuppressed ??= () => false;
+  scope.settleTurnReplyCardTerminal ??= vi.fn(async () => {});
+  scope.scopedReply ??= vi.fn();
   scope.assertFrozenImDeliveryAllowed = loadWorkerPoolFunction('assertFrozenImDeliveryAllowed', scope);
   scope.classifyFinalPublicationError = loadWorkerPoolFunction('classifyFinalPublicationError', scope);
+  return scope;
+}
+
+function currentDisplayScope(scope: Record<string, any>) {
+  scope.requiredReplyDisplayDecision ??= loadWorkerPoolFunction('requiredReplyDisplayDecision', scope);
+  scope.replyCardModeFor ??= () => 'unified';
+  scope.retireReplyCardDisplay ??= vi.fn(async () => true);
+  scope.settleTurnReplyCardTerminal ??= vi.fn(async () => {});
+  scope.tr ??= () => 'pending'; scope.localeForBot ??= () => 'en';
+  scope.isReplayOfHeldCotTerminal ??= () => false;
+  scope.releaseHeldCotMessage ??= vi.fn();
+  scope.cotMessageFinishStatus ??= () => undefined;
+  scope.hasCotMessageForTurn ??= () => true;
+  scope.finalizeCotMessage ??= vi.fn();
+  scope.requiredReplyCotHoldKey = loadWorkerPoolFunction('requiredReplyCotHoldKey', scope);
+  scope.finalizeOrHoldCotMessage = loadWorkerPoolFunction('finalizeOrHoldCotMessage', scope);
+  scope.settleRequiredReplyCotMessage = loadWorkerPoolFunction('settleRequiredReplyCotMessage', scope);
+  scope.settleCurrentTurnDisplay = loadWorkerPoolFunction('settleCurrentTurnDisplay', scope);
   return scope;
 }
 
@@ -180,6 +204,7 @@ describe('attention lifecycle', () => {
       bridgeFinalExcludedTexts: ['ROUTE: generic'],
     } as const;
     const internal = { ...output, content: 'ROUTE: generic' };
+    db.rememberSink(internal.sessionId!, internal.turnId, sink);
     const record = db.accept(outputSnapshot(app, internal), sink);
     const attempt = vi.fn(async () => { throw new OutputDeliveryTerminalError(INTERNAL_BRIDGE_FINAL_REJECTION); });
     const ctx = scopeFor(db, record, dir, { processFinalOutput: attempt });
@@ -600,6 +625,7 @@ describe('native and generic settlement contracts', () => {
     { state: 'wrong attempt', card: 'held' },
     { state: 'empty', card: 'failed' },
     { state: 'rejected', card: 'failed' },
+    { state: 'rejected with in-flight output', card: 'held' },
     { state: 'wrong rejection', card: 'held' },
     { state: 'delivered', card: 'completed' },
     { state: 'legacy', card: 'completed' },
@@ -616,10 +642,13 @@ describe('native and generic settlement contracts', () => {
       await new TurnSendLedger(dir).execute({ ...key, dispatchAttempt: state === 'delivered' ? 2 : 1 },
         'final', 'explicit', async () => 'om_final', { fenced: true });
     }
-    if (state === 'rejected' || state === 'wrong rejection') {
-      const rejected = db.accept(outputSnapshot(app, { ...output, dispatchAttempt: state === 'rejected' ? 2 : 1 }), sink);
+    if (state === 'rejected' || state === 'wrong rejection' || state === 'rejected with in-flight output') {
+      const rejected = db.accept(outputSnapshot(app, { ...output, dispatchAttempt: state === 'wrong rejection' ? 1 : 2 }), sink);
       expect(db.claim(rejected.id, 'owner')).toBe(true);
       expect(db.rejectTerminal(rejected.id, 'owner', INTERNAL_BRIDGE_FINAL_REJECTION)).toBe(true);
+      if (state === 'rejected with in-flight output') {
+        db.accept(outputSnapshot(app, { ...output, lastUuid: 'real_pending', content: 'real answer', dispatchAttempt: 2 }), sink);
+      }
     }
     const earlierHold = { turnId: 'om_other', dispatchAttempt: 1 };
     const ds = { larkAppId: app, cotHeldForBackground: earlierHold } as DaemonSession;
@@ -627,7 +656,7 @@ describe('native and generic settlement contracts', () => {
     const retireReplyCardDisplay = vi.fn();
     const settleTurnReplyCardTerminal = vi.fn();
     const scope = {
-      TurnSendLedger, config: { session: { dataDir: dir } },
+      TurnSendLedger, config: { session: { dataDir: dir } }, INTERNAL_BRIDGE_FINAL_REJECTION,
       finalizeCotMessage, retireReplyCardDisplay, settleTurnReplyCardTerminal,
       tr: () => 'pending', localeForBot: () => 'en',
       requiredReplyCotHoldKey: (turnId: string, attempt?: number) => `${turnId}:${attempt}`,
@@ -637,6 +666,7 @@ describe('native and generic settlement contracts', () => {
     Object.assign(scope, {
       finalizeOrHoldCotMessage: loadWorkerPoolFunction('finalizeOrHoldCotMessage', scope),
       settleRequiredReplyCotMessage: loadWorkerPoolFunction('settleRequiredReplyCotMessage', scope),
+      requiredReplyDisplayDecision: loadWorkerPoolFunction('requiredReplyDisplayDecision', scope),
     });
     const settleDisplay = loadWorkerPoolFunction<(ds: DaemonSession, msg: WorkerToDaemon,
       journal: OutputDeliveryJournal, send: unknown, owns: () => boolean, suppress: boolean) => Promise<void>>(
@@ -757,7 +787,8 @@ describe('native and generic settlement contracts', () => {
 
   it.each(['before send', 'after Feishu accepted', 'after worker-only persistence',
     'after worker-only persistence with background hold', 'without original execution proof',
-    'wrong turn', 'wrong attempt', 'originless journal', 'transient store fault', 'with only a routing label'] as const)(
+    'wrong turn', 'wrong attempt', 'originless journal', 'transient store fault', 'with only a routing label',
+    'with an already rejected routing label'] as const)(
     'reopens a scoped final %s without rerunning the model or inventing a receipt', async crash => {
       vi.useFakeTimers();
       const dir = directory();
@@ -768,7 +799,8 @@ describe('native and generic settlement contracts', () => {
       db.rememberSink(output.sessionId!, output.turnId, sink);
       db.rememberSink(output.sessionId!, output.turnId, { kind: 'http', mode: 'async' });
       db.rememberSink(output.sessionId!, output.turnId, { ...sink, context: { target: { mode: 'thread', rootMessageId: 'om_wrong' } } });
-      const content = crash === 'with only a routing label' ? 'ROUTE: generic' : '完整方案\n\n1. 检查\n2. 回读';
+      const content = crash === 'with only a routing label' || crash === 'with an already rejected routing label'
+        ? 'ROUTE: generic' : '完整方案\n\n1. 检查\n2. 回读';
       const snapshot = outputSnapshot(app, { ...output, content, dispatchAttempt: 2 });
       const ref = { executionId: 'native-turn', turnId: output.turnId, dispatchAttempt: 2 };
       const origin = { scope: { execution: ref } } as NonNullable<OutputDeliveryRecord['origin']>;
@@ -785,6 +817,11 @@ describe('native and generic settlement contracts', () => {
         db.accept({ ...snapshot, origin }, sink);
       }
       if (crash === 'originless journal') db.accept(snapshot, sink);
+      if (crash === 'with an already rejected routing label') {
+        const rejected = db.accept({ ...snapshot, origin }, sink);
+        expect(db.claim(rejected.id, 'owner')).toBe(true);
+        expect(db.rejectTerminal(rejected.id, 'owner', INTERNAL_BRIDGE_FINAL_REJECTION)).toBe(true);
+      }
       const received = new Map<string, { content: string; target: unknown }>();
       let loseResponse = crash === 'after Feishu accepted';
       const deliverFinalOutput = vi.fn((_ds, msg, _tag, _attempt, done, _owns, route, _unused, _initiator, _legacy, _effect, control) => {
@@ -850,6 +887,16 @@ describe('native and generic settlement contracts', () => {
         FinalPublicationUnknownError, OutputDeliveryTerminalError, FINAL_HANDOFF_DELIVERY_REASON,
       }));
       await recover(ds);
+      if (crash === 'with an already rejected routing label') {
+        expect(db.read(snapshot.id)).toMatchObject({ state: 'rejected', reason: INTERNAL_BRIDGE_FINAL_REJECTION });
+        expect(producer.readPending()).toHaveLength(0);
+        expect(deliverFinalOutput).not.toHaveBeenCalled();
+        expect(noteFinalOutputReceipt).not.toHaveBeenCalled();
+        await recover(ds);
+        expect(producer.readPending()).toHaveLength(0);
+        expect(db.read(snapshot.id)).toMatchObject({ state: 'rejected', reason: INTERNAL_BRIDGE_FINAL_REJECTION });
+        return;
+      }
       if (crash === 'with only a routing label') {
         expect(db.read(snapshot.id)).toMatchObject({ state: 'rejected', reason: 'output_internal_bridge_text' });
         expect(db.read(snapshot.id)?.receipt).toBeUndefined();
@@ -940,6 +987,90 @@ describe('native and generic settlement contracts', () => {
     const helper = loadWorkerPoolFunction<(ds: any, msg: WorkerFinalOutput, t: string, control: any) => Promise<any>>('deliverFinalOutputWithOutputControl', { TurnSendLedger, isInternalBridgeFinal, config: { session: { dataDir: dir } }, deliverFinalOutput, bridgeFinalOutputUuid: () => 'stable', beginFinalOutputDelivery: vi.fn() });
     const receipt = await helper(ds, output, 'probe', { record, owns: () => true });
     expect(receipt.messageId).toBe('om_explicit'); expect(deliverFinalOutput).not.toHaveBeenCalled();
+  });
+
+  it('records direct suppression and settles the following current terminal as failed', async () => {
+    const dir = directory();
+    const db = database(dir);
+    db.rememberSink(output.sessionId!, output.turnId, {
+      kind: 'im', answerRequired: true, chatId: 'oc_original', chatType: 'group',
+      context: { target: { mode: 'thread', rootMessageId: 'om_original' } },
+      bridgeFinalExcludedTexts: ['generic'],
+    });
+    const send = vi.fn();
+    const ds = { larkAppId: app, session: { sessionId: output.sessionId!, status: 'active' as const },
+      initConfig: { finalOutputHandoff: { admitNew: true } } };
+    const scope = currentDisplayScope(deliveryScope({
+      ds, journal: undefined, t: 'probe', config: { session: { dataDir: dir } },
+      outputDeliveryJournal: () => db,
+      shouldDropMismatchedFinalOutput: () => false, shouldDropMismatchedHermesFinalOutput: () => false,
+      finalOutputPolicyTurnId: (message: WorkerFinalOutput) => message.replyTurnId ?? message.turnId,
+      finalOutputDedupeKey: () => 'direct-dedupe',
+      managedFinalOutputSuppressed: () => false, logger: { warn: vi.fn() },
+      deliverFinalOutputWithShutdownDrain: send,
+    }));
+    const processOutput = loadWorkerPoolClosure<
+      (message: WorkerFinalOutput, control?: OutputDeliveryControl) => Promise<OutputReceipt | undefined>
+    >('processFinalOutput', scope);
+    const internal = { ...output, content: 'generic', kind: 'bridge' as const };
+    expect(await processOutput(internal)).toEqual({ status: 'suppressed', owner: INTERNAL_BRIDGE_FINAL_REJECTION });
+    expect(send).not.toHaveBeenCalled();
+    expect(db.read(outputSnapshot(app, internal).id)).toMatchObject({
+      state: 'rejected', reason: INTERNAL_BRIDGE_FINAL_REJECTION,
+    });
+    const result = scope.settleCurrentTurnDisplay(ds, { type: 'turn_terminal', sessionId: output.sessionId,
+      turnId: output.turnId, dispatchAttempt: output.dispatchAttempt, status: 'completed' }, db, vi.fn(), () => true, false, vi.fn());
+    await result.settleCard;
+    expect(result.requiredReplyMissing).toBe(true);
+    expect(ds.requiredReplyCotHolds).toBeUndefined();
+    expect(scope.finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(ds, output.turnId, 'failed', output.dispatchAttempt);
+    expect(scope.settleTurnReplyCardTerminal).toHaveBeenCalledWith(ds,
+      expect.objectContaining({ status: 'failed' }), expect.any(Function), expect.any(Function));
+  });
+
+  it('settles the last pending hold when a sibling output finishes suppressed', async () => {
+    const dir = directory();
+    const db = database(dir);
+    const sink = { kind: 'im', answerRequired: true, chatId: 'oc', chatType: 'group',
+      context: { target: { mode: 'thread', rootMessageId: 'om_topic' } },
+      bridgeFinalExcludedTexts: ['generic'] } as const;
+    db.rememberSink(output.sessionId!, output.turnId, sink);
+    const internal = db.accept(outputSnapshot(app, { ...output, content: 'generic', dispatchAttempt: 2 }), sink);
+    expect(db.claim(internal.id, 'owner')).toBe(true);
+    expect(db.rejectTerminal(internal.id, 'owner', INTERNAL_BRIDGE_FINAL_REJECTION)).toBe(true);
+    const sibling = db.accept(outputSnapshot(app, { ...output, lastUuid: 'empty_sibling', content: '', dispatchAttempt: 2 }), sink);
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const worker = { send: vi.fn() };
+    const ds: any = { larkAppId: app, chatId: 'oc', chatType: 'group', worker,
+      session: { sessionId: output.sessionId!, status: 'active' },
+      initConfig: { finalOutputHandoff: { version: 2, token: 'tok' } } };
+    const scope = currentDisplayScope(deliveryScope({
+      ds, worker, journal: db, coordinator: new OutputDeliveryCoordinator(db), t: 'probe',
+      config: { session: { dataDir: dir } }, ownsLifecycleMutation: () => true,
+      ownsWorkerSession: () => true, isSessionTransferring: () => false, sessionController: undefined,
+      processFinalOutput: async () => { await blocked; return { status: 'suppressed' as const }; },
+      evaluateTalk: () => ({ allowed: true, reason: 'allowedUser' }), privateReplyEnabled: () => false,
+      shouldDropMismatchedFinalOutput: () => false, shouldDropMismatchedHermesFinalOutput: () => false,
+      logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+    const work = loadWorkerPoolClosure<(value: OutputDeliveryRecord) => Promise<void>>('runOutput', scope)(sibling);
+    await vi.waitFor(() => expect(db.read(sibling.id)?.state).toBe('processing'));
+    const pending = scope.settleCurrentTurnDisplay(ds, { type: 'turn_terminal', sessionId: output.sessionId,
+      turnId: output.turnId, dispatchAttempt: 2, status: 'completed' }, db, vi.fn(), () => true, false, vi.fn());
+    await pending.settleCard;
+    expect(pending.requiredReplyMissing).toBe(false);
+    expect(ds.requiredReplyCotHolds?.get(scope.requiredReplyCotHoldKey(output.turnId, 2))).toMatchObject({
+      replyPending: true, backgroundPending: false,
+    });
+    release();
+    await work;
+    expect(db.read(sibling.id)).toMatchObject({ state: 'settled', receipt: { status: 'suppressed' } });
+    expect(ds.requiredReplyCotHolds).toBeUndefined();
+    expect(scope.finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(ds, output.turnId, 'failed', 2);
+    expect(scope.settleTurnReplyCardTerminal).toHaveBeenCalledWith(ds,
+      expect.objectContaining({ status: 'failed' }), expect.any(Function), expect.any(Function));
+    expect(db.pending(output.sessionId!)).toEqual([]);
   });
 
   it.each([false, true])('keeps a late recovered routing label out of its original topic (V2: %s)', async version2 => {

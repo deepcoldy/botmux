@@ -6,13 +6,17 @@ import type { DaemonSession } from '../src/core/types.js';
 import { config } from '../src/config.js';
 import { getBot, getBotClient } from '../src/bot-registry.js';
 import { updateMessage, MessageWithdrawnError } from '../src/im/lark/client.js';
-import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnReplyCard, updateReplyCardNativeThinking, prepareReplyCardNativeThinking, retireReplyCardDisplay, supersedeTurnReplyCard, __testOnlyDrainTurnReplyTools } from '../src/core/turn-reply-card.js';
+import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnReplyCard, updateReplyCardNativeThinking, prepareReplyCardNativeThinking, retireReplyCardDisplay, settleTurnReplyCardTerminal, supersedeTurnReplyCard, __testOnlyDrainTurnReplyTools } from '../src/core/turn-reply-card.js';
 import { abortCotMessage, handleCotThinkingSuperseded, handleCotThinkingUpdate, finalizeCotMessage, cotMessageFinishStatus } from '../src/im/lark/cot-message.js';
 import { TurnReplyCardStore, ReplyCardWithdrawnError } from '../src/services/turn-reply-card.js';
 import { deliverStructuredNotice, StructuredNoticeCardPendingError } from '../src/services/structured-notice-delivery.js';
 import { stageBridgeTurnNotice, readBridgeTurnJournal, acknowledgeBridgeTurnNotice } from '../src/services/bridge-turn-journal.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
-import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
+import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
+import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
+import { OutputDeliveryCoordinator, OutputDeliveryTerminalError } from '../src/services/output-delivery-coordinator.js';
+import { outputSnapshot } from '../src/services/universal-output-handoff.js';
+import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { SessionController } from '../src/core/session-controller.js';
 
@@ -93,6 +97,41 @@ describe('unified replies with an independent native CoT channel', () => {
     .flatMap(([req]) => req.data.events.map((e: any) => ({ type: e.event_type, content: JSON.parse(e.content) })));
   const finalAnswer = (text: string) => ({ kind: 'final' as const, text, source: 'bridge' as const,
     card: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: text }] } }) });
+  const internalRejection = 'output_internal_bridge_text';
+  const attempt = 2;
+
+  function internalOutput() {
+    const journal = new OutputDeliveryJournal(dir, ds.larkAppId);
+    const sink = { kind: 'im' as const, answerRequired: true as const, chatId: ds.chatId, chatType: 'group' as const,
+      context: { target: { mode: 'thread' as const, rootMessageId: 'om_root' } },
+      bridgeFinalExcludedTexts: ['generic'] };
+    journal.rememberSink(ds.session.sessionId, 'om_turn', sink);
+    const snapshot = outputSnapshot(ds.larkAppId, { type: 'final_output', sessionId: ds.session.sessionId,
+      turnId: 'om_turn', dispatchAttempt: attempt, lastUuid: 'internal', content: 'generic', kind: 'bridge' });
+    const record = journal.accept(snapshot, sink);
+    return { journal, record };
+  }
+
+  function requiredDisplayScope(journal: OutputDeliveryJournal) {
+    const finalize = vi.fn();
+    const scope: Record<string, any> = {
+      ds, journal, config, TurnSendLedger, INTERNAL_BRIDGE_FINAL_REJECTION: internalRejection,
+      replyCardModeFor, retireReplyCardDisplay, settleTurnReplyCardTerminal,
+      tr: () => 'reply pending', localeForBot: () => 'en',
+      isReplayOfHeldCotTerminal: () => false, releaseHeldCotMessage: vi.fn(),
+      cotMessageFinishStatus, hasCotMessageForTurn: () => true, finalizeCotMessage: finalize,
+    };
+    scope.requiredReplyCotHoldKey = loadWorkerPoolFunction('requiredReplyCotHoldKey', scope);
+    scope.finalizeOrHoldCotMessage = loadWorkerPoolFunction('finalizeOrHoldCotMessage', scope);
+    scope.requiredReplyDisplayDecision = loadWorkerPoolFunction('requiredReplyDisplayDecision', scope);
+    scope.settleRequiredReplyCotMessage = loadWorkerPoolFunction('settleRequiredReplyCotMessage', scope);
+    return { scope, finalize };
+  }
+
+  function readCard() {
+    return new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
+      turnId: 'om_turn', dispatchAttempt: attempt });
+  }
 
   it.each(['claude-code', 'codex'] as const)('keeps a long %s turn on one answer card plus one native bubble', async cli => {
     ds.session.cliId = cli;
@@ -465,6 +504,77 @@ describe('unified replies with an independent native CoT channel', () => {
     expect(cotMessageFinishStatus(ds, turn)).toBeUndefined();
     finalizeCotMessage(ds, turn.turnId, 'completed');
     expect(cotMessageFinishStatus(ds, turn)).toBe('done');
+  });
+
+  it.each(['legacy', 'unified'] as const)('settles a current terminal after an internal rejection as failed (%s)', async mode => {
+    bot.config.replyCardMode = mode;
+    const { journal, record } = internalOutput();
+    try {
+      if (mode === 'unified') await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send, { dispatchAttempt: attempt });
+      expect(journal.claim(record.id, 'owner')).toBe(true);
+      expect(journal.rejectTerminal(record.id, 'owner', internalRejection)).toBe(true);
+      const { scope, finalize } = requiredDisplayScope(journal);
+      const settleDisplay = loadWorkerPoolFunction<(
+        session: DaemonSession, msg: any, outputs: OutputDeliveryJournal, sender: typeof send,
+        owns: () => boolean, suppress: boolean, publishMissing: () => void,
+      ) => { settleCard?: Promise<void | boolean>; requiredReplyMissing: boolean }>('settleCurrentTurnDisplay', scope);
+      const result = settleDisplay(ds, { type: 'turn_terminal', sessionId: ds.session.sessionId,
+        turnId: 'om_turn', dispatchAttempt: attempt, status: 'completed' }, journal, send, () => true, false, vi.fn());
+      await result.settleCard;
+      expect(result.requiredReplyMissing).toBe(true);
+      expect(ds.requiredReplyCotHolds).toBeUndefined();
+      expect(finalize).toHaveBeenCalledExactlyOnceWith(ds, 'om_turn', 'failed', attempt);
+      if (mode === 'unified') expect(readCard()).toMatchObject({ phase: 'failed' });
+      else expect(result.settleCard).toBeUndefined();
+    } finally {
+      journal.close();
+    }
+  });
+
+  it.each(['legacy', 'unified'] as const)('settles the reply card when rejection follows a pending terminal (%s)', async mode => {
+    bot.config.replyCardMode = mode;
+    const { journal, record } = internalOutput();
+    const worker = { send: vi.fn() };
+    ds.worker = worker as any;
+    ds.chatType = 'group';
+    ds.initConfig = { finalOutputHandoff: { version: 2, token: 'tok' } } as any;
+    try {
+      if (mode === 'unified') {
+        await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send, { dispatchAttempt: attempt });
+        await retireReplyCardDisplay(ds, { turnId: 'om_turn', dispatchAttempt: attempt,
+          message: 'reply pending', preserveCot: true }, send, () => true);
+        expect(readCard()).toMatchObject({ phase: 'ambiguous', displayRetired: true });
+      }
+      const { scope, finalize } = requiredDisplayScope(journal);
+      ds.requiredReplyCotHolds = new Map([[scope.requiredReplyCotHoldKey('om_turn', attempt), {
+        turnId: 'om_turn', dispatchAttempt: attempt, finishStatus: 'completed', replyPending: true, backgroundPending: false,
+      }]]);
+      Object.assign(scope, {
+        worker, t: 'probe', coordinator: new OutputDeliveryCoordinator(journal),
+        ownsLifecycleMutation: () => true, ownsWorkerSession: () => true, isSessionTransferring: () => false,
+        sessionController: undefined, managedAuxUiSuppressed: () => false,
+        processFinalOutput: async () => { throw new OutputDeliveryTerminalError(internalRejection); },
+        assertFrozenImDeliveryAllowed: vi.fn(), classifyFinalPublicationError: (error: unknown) => error,
+        raiseDaemonAttention: () => false, publishAttentionPatch: vi.fn(), publishScopedImDeliveryStatus: vi.fn(),
+        shouldDropMismatchedFinalOutput: () => false, shouldDropMismatchedHermesFinalOutput: () => false,
+        scopedReply: (body: string, type: string, _turn: string, opts: any) => send(body, type, opts.uuid, opts.beforeWrite),
+        logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      });
+      const runOutput = loadWorkerPoolClosure<(value: typeof record) => Promise<void>>('runOutput', scope);
+      await runOutput(record);
+      if (mode === 'unified') {
+        await vi.waitFor(() => expect(readCard()).toMatchObject({ phase: 'failed' }), { timeout: 2_000 });
+      } else {
+        await settle();
+        expect(readCard()).toBeUndefined();
+      }
+      expect(journal.read(record.id)).toMatchObject({ state: 'rejected', reason: internalRejection });
+      expect(ds.requiredReplyCotHolds).toBeUndefined();
+      expect(finalize).toHaveBeenCalledExactlyOnceWith(ds, 'om_turn', 'failed', attempt);
+      expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'final_output_settled', id: record.id }));
+    } finally {
+      journal.close();
+    }
   });
 
   it('replays the pending first POST through silent retirement and then patches the same card', async () => {

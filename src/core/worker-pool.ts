@@ -13964,6 +13964,73 @@ function settleRequiredReplyCotMessage(
   return true;
 }
 
+function requiredReplyDisplayDecision(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
+  journal: OutputDeliveryJournal | undefined,
+): { requiresReply: boolean; hasReply: boolean; missing: boolean; pending: boolean } {
+  const sink = msg.status === 'completed' ? journal?.sink(msg.sessionId, msg.turnId) : undefined;
+  const requiresReply = sink?.kind === 'im' && sink.answerRequired === true;
+  if (!requiresReply) return { requiresReply: false, hasReply: false, missing: false, pending: false };
+  const hasReply = !!new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
+    larkAppId: ds.larkAppId, sessionId: msg.sessionId, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+  })?.messageId;
+  const outputs = journal?.forTurn(msg.sessionId, msg.turnId).filter(record =>
+    record.output.dispatchAttempt === msg.dispatchAttempt) ?? [];
+  const hasInFlightOutput = outputs.some(record =>
+    record.state === 'pending' || record.state === 'processing' || record.state === 'blocked');
+  const hasInternalRejection = outputs.some(record =>
+    record.state === 'rejected' && record.reason === INTERNAL_BRIDGE_FINAL_REJECTION);
+  const emptyAnswer = msg.outputDisposition === 'nothing_to_send' || msg.outputDisposition === 'empty_answer';
+  const missing = !hasReply && (emptyAnswer || (hasInternalRejection && !hasInFlightOutput));
+  return { requiresReply: true, hasReply, missing, pending: !hasReply && !missing };
+}
+
+function settleCurrentTurnDisplay(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
+  journal: OutputDeliveryJournal | undefined,
+  send: Parameters<typeof settleTurnReplyCardTerminal>[2],
+  ownsDisplay: () => boolean,
+  suppressCard: boolean,
+  publishRequiredReplyMissing: () => void,
+) {
+  const display = requiredReplyDisplayDecision(ds, msg, journal);
+  const waitingForReply = display.pending;
+  const cardTerminal = display.missing ? { ...msg, status: 'failed' as const } : msg;
+  let settleCard: Promise<void | boolean> | undefined;
+  if (!suppressCard && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
+    if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
+    settleCard = waitingForReply
+      ? retireReplyCardDisplay(ds, { ...msg, preserveCot: true, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
+        send, ownsDisplay)
+      : settleTurnReplyCardTerminal(ds, cardTerminal, send, ownsDisplay);
+  }
+  const requiredReplyMissingNeeded = display.missing && !display.hasReply && !suppressCard;
+  finalizeOrHoldCotMessage(ds, msg, {
+    ...(display.missing ? { finishStatus: 'failed' as const } : {}),
+    ...(display.pending ? { replyPending: true } : {}),
+  });
+  // Register the user-visible closure obligation in the same synchronous
+  // segment as its hold. The terminal persistence callback may await durable
+  // store I/O while a zero screen, suspend, or CLI loss settles the hold.
+  if (requiredReplyMissingNeeded && msg.backgroundTasks) {
+    const key = requiredReplyCotHoldKey(msg.turnId, msg.dispatchAttempt);
+    if (ds.requiredReplyCotHolds?.has(key)) {
+      const receipts = ds.pendingRequiredReplyMissingReceipts
+        ?? (ds.pendingRequiredReplyMissingReceipts = new Map());
+      receipts.set(key, {
+        turnId: msg.turnId,
+        dispatchAttempt: msg.dispatchAttempt,
+        publish: publishRequiredReplyMissing,
+      });
+    } else {
+      publishRequiredReplyMissing();
+    }
+  }
+  return { settleCard, cardTerminal, waitingForReply, requiredReplyMissing: display.missing, requiredReplyMissingNeeded };
+}
+
 async function settleHistoricalTurnDisplay(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
@@ -13973,21 +14040,13 @@ async function settleHistoricalTurnDisplay(
   suppressCard: boolean,
 ): Promise<void> {
   if (!ownsDisplay()) return;
-  const sink = msg.status === 'completed' ? journal?.sink(msg.sessionId, msg.turnId) : undefined;
-  const requiresReply = sink?.kind === 'im' && sink.answerRequired === true;
-  const hasReply = requiresReply && !!new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
-    larkAppId: ds.larkAppId, sessionId: msg.sessionId, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
-  })?.messageId;
-  const missing = requiresReply && !hasReply
-    && (msg.outputDisposition === 'nothing_to_send' || msg.outputDisposition === 'empty_answer'
-      || journal?.forTurn(msg.sessionId, msg.turnId).some(record =>
-        record.output.dispatchAttempt === msg.dispatchAttempt && record.state === 'rejected') === true);
-  const pending = requiresReply && !hasReply && !missing;
-  const terminal = missing ? { ...msg, status: 'failed' as const } : msg;
+  const display = requiredReplyDisplayDecision(ds, msg, journal);
+  const pending = display.pending;
+  const terminal = display.missing ? { ...msg, status: 'failed' as const } : msg;
   if (!isReplayOfHeldCotTerminal(ds, msg)) {
     if (pending) {
       finalizeOrHoldCotMessage(ds, msg, { replyPending: true, preserveEarlierHold: true });
-    } else if (!(requiresReply && settleRequiredReplyCotMessage(ds, msg.turnId, msg.dispatchAttempt, missing ? 'failed' : 'completed'))) {
+    } else if (!(display.requiresReply && settleRequiredReplyCotMessage(ds, msg.turnId, msg.dispatchAttempt, display.missing ? 'failed' : 'completed'))) {
       finalizeCotMessage(ds, msg.turnId, terminal.status, msg.dispatchAttempt);
     }
   }
@@ -24828,6 +24887,26 @@ function setupWorkerHandlers(
           markMessageListenerRunPreviewRunning(msg.turnId);
         }
         if (!outputControl) {
+          const directJournal = journal ?? (ds.initConfig?.finalOutputHandoff?.admitNew
+            ? outputDeliveryJournal(config.session.dataDir, ds.larkAppId) : undefined);
+          const directSink = msg.sessionId === ds.session.sessionId
+            ? directJournal?.sink(msg.sessionId, policyTurnId) : undefined;
+          if (directSink?.kind === 'im' && isInternalBridgeFinal(directSink, finalOutput)) {
+            // Direct/V1 delivery has no coordinator callback of its own. Leave
+            // the same exact-attempt durable rejection that V2 terminals and
+            // cold recovery use, rather than a receipt-less suppression that
+            // would leave their required-reply display pending forever.
+            const snapshot = outputSnapshot(ds.larkAppId, finalOutput);
+            const record = directJournal!.accept(snapshot, directSink);
+            if (record.state !== 'settled' && record.state !== 'rejected') {
+              const owner = directJournal!.newOwner();
+              if (directJournal!.claim(record.id, owner)) {
+                directJournal!.rejectTerminal(record.id, owner, INTERNAL_BRIDGE_FINAL_REJECTION);
+              }
+            }
+            logger.warn(`[${t}] Ignored internal final text on direct delivery for turn ${policyTurnId.substring(0, 8)}`);
+            return { status: 'suppressed', owner: INTERNAL_BRIDGE_FINAL_REJECTION };
+          }
           if (sessionController && ownsWorkerSession() && !isSessionTransferring(ds) && !sessionController.currentAuthority()) {
             reportUndeliveredFinal(msg, 'superseded_runtime');
           }
@@ -24849,6 +24928,27 @@ function setupWorkerHandlers(
     // silently parks it (and the session attention) forever.
     const authority = (): boolean => ownsWorkerSession() && !isSessionTransferring(ds)
       && (!sessionController || !['closing', 'closed'].includes(sessionController.store.read(sessionController.ref)!.lifecycle));
+    const reconcileRequiredReplyDisplayAfterOutput = (record: OutputDeliveryRecord): void => {
+      const { turnId, dispatchAttempt } = record.output;
+      if (!authority() || record.sink.kind !== 'im' || !record.sink.answerRequired
+        || !ds.requiredReplyCotHolds?.has(requiredReplyCotHoldKey(turnId, dispatchAttempt))) return;
+      const display = requiredReplyDisplayDecision(ds, { type: 'turn_terminal', sessionId: ds.session.sessionId,
+        turnId, dispatchAttempt, status: 'completed' }, journal);
+      const nonInternalRejection = record.state === 'rejected' && record.reason !== INTERNAL_BRIDGE_FINAL_REJECTION;
+      const status = display.hasReply ? 'completed' as const
+        : nonInternalRejection || display.missing ? 'failed' as const : undefined;
+      if (!status) return;
+      settleRequiredReplyCotMessage(ds, turnId, dispatchAttempt, status);
+      // Keep the pre-existing non-internal rejection card behavior unchanged.
+      // Internal rejection and a final suppressed sibling, however, must close
+      // the exact card whose last in-flight output has just disappeared.
+      if ((record.state === 'settled' || record.reason === INTERNAL_BRIDGE_FINAL_REJECTION)
+        && !managedAuxUiSuppressed(turnId, dispatchAttempt)) {
+        void settleTurnReplyCardTerminal(ds, { turnId, dispatchAttempt, status },
+          (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), authority)
+          .catch(error => logger.warn(`[${t}] output reply-card terminal: ${error.message}`));
+      }
+    };
     await coordinator.deliver(record, {
       owns: authority,
       process: async (record, control) => {
@@ -24909,6 +25009,11 @@ function setupWorkerHandlers(
           if (!cotSettled && hasCompletedTurn(ds, turnId, dispatchAttempt)) {
             finalizeCotMessage(ds, turnId, 'completed', dispatchAttempt);
           }
+        } else if (record.receipt?.status === 'suppressed') {
+          // A suppressed sibling is terminal evidence too: once it removes the
+          // last in-flight output, an earlier internal rejection can finally
+          // settle the exact required-reply hold instead of waiting forever.
+          reconcileRequiredReplyDisplayAfterOutput(record);
         }
         if (sessionController && record.origin?.scope.execution) {
           sessionController.store.apply(sessionController.ref, { type: 'execution_output', execution: record.origin.scope.execution,
@@ -24959,14 +25064,7 @@ function setupWorkerHandlers(
       },
       rejected: record => {
         if (!authority()) return;
-        const { turnId, dispatchAttempt } = record.output;
-        const sink = record.sink;
-        if (sink.kind === 'im' && sink.answerRequired && ds.requiredReplyCotHolds?.has(requiredReplyCotHoldKey(turnId, dispatchAttempt))) {
-          const hasReply = !!new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
-            larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId, dispatchAttempt,
-          })?.messageId;
-          settleRequiredReplyCotMessage(ds, turnId, dispatchAttempt, hasReply ? 'completed' : 'failed');
-        }
+        reconcileRequiredReplyDisplayAfterOutput(record);
         if (record.reason !== INTERNAL_BRIDGE_FINAL_REJECTION) return;
         // This only clears the producer retry. The durable rejection remains
         // visible and never enters the delivered or DONE paths.
@@ -29292,8 +29390,6 @@ function setupWorkerHandlers(
             larkAppId: ds.larkAppId, sessionId: msg.sessionId, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
           })?.messageId
           : isFinalTurnTerminalCarrier(ds.turnTerminalCarriers?.get(msg.turnId));
-        const emptyRequiredReply = requiresReply && msg.status === 'completed'
-          && (msg.outputDisposition === 'nothing_to_send' || msg.outputDisposition === 'empty_answer');
         // The exact turn is over. This is the only boundary that releases the
         // accepted-input guard for it, and only for the exact attempt it names:
         // a late terminal from an older attempt must not release a newer one.
@@ -29484,50 +29580,11 @@ function setupWorkerHandlers(
               }
             : undefined;
         }
-        // Settle this turn's native CoT message, if one is live. Cosmetic and
-        // self-catching — must never delay or fail the terminal path
-        // (RUN_FINISHED auto-completes the CoT server-side). Also consumes the
-        // one-shot `/cot show` force and drops the mid-turn thinking cache (a
-        // post-terminal summon would create a bubble nobody ever finishes).
-        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
-          if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
-          const replyCardSend: Parameters<typeof settleTurnReplyCardTerminal>[2] =
-            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite });
-          const waitingForReply = requiresReply && msg.status === 'completed' && !answered() && !emptyRequiredReply;
-          const cardTerminal = emptyRequiredReply && !answered() ? { ...msg, status: 'failed' as const } : msg;
-          const settleCard = waitingForReply
-            ? retireReplyCardDisplay(ds, { ...msg, preserveCot: true, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
-              replyCardSend, ownsLifecycleMutation)
-            : settleTurnReplyCardTerminal(ds, cardTerminal, replyCardSend, ownsLifecycleMutation);
-          void settleCard
-            .then(async () => {
-              if (cardTerminal.status !== 'completed' || waitingForReply) return;
-              if (nextStepIo.enabled(ds) && isCodexFamilyCliId(terminalCliId)) {
-                await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
-                if (!ownsLifecycleMutation()) return;
-              }
-              // The row outlives this worker: its removal runs when the next
-              // turn starts, possibly on a replacement worker (suspend,
-              // restart, crash). Ownership is the session, not this process.
-              const session = ds.session;
-              const ownsCard = () => ds.session === session && session.status !== 'closed';
-              noteNextStepCard(ds, msg.turnId, { kind: 'unified', publish: async next => {
-                await updateTurnReplyCard(ds, msg.turnId, { kind: 'next_step', ...(next ? { nextStep: next } : {}) },
-                  replyCardSend, { dispatchAttempt: msg.dispatchAttempt, owns: ownsCard });
-              } }, nextStepIo, msg.dispatchAttempt);
-              if (recapWanted) {
-                noteRecapCard(ds, msg.turnId, { kind: 'unified', publish: async markdown => {
-                  await updateTurnReplyCard(ds, msg.turnId, { kind: 'recap', markdown },
-                    replyCardSend, { dispatchAttempt: msg.dispatchAttempt, owns: ownsCard });
-                } }, turnRecapIo);
-              }
-            })
-            .catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
-        }
-        const requiredReplyPending = requiresReply && msg.status === 'completed'
-          && !answered() && !emptyRequiredReply;
-        const requiredReplyMissingNeeded = emptyRequiredReply && !answered()
-          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
+        // A current terminal and a late delivery rejection must resolve the
+        // exact same durable reply state. The card remains asynchronous; the
+        // CoT/hold decision is synchronous with the terminal IPC.
+        const replyCardSend: Parameters<typeof settleTurnReplyCardTerminal>[2] =
+          (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite });
         let requiredReplyMissingPublisher: (() => void) | undefined;
         let requiredReplyMissingPublishRequested = false;
         const requiredReplyMissingSuppressed = new Error('required reply already delivered');
@@ -29539,30 +29596,33 @@ function setupWorkerHandlers(
           if (requiredReplyMissingPublisher) requiredReplyMissingPublisher();
           else requiredReplyMissingPublishRequested = true;
         };
-        finalizeOrHoldCotMessage(ds, msg, {
-          ...(emptyRequiredReply && !answered() ? { finishStatus: 'failed' as const } : {}),
-          ...(requiredReplyPending ? { replyPending: true } : {}),
-        });
-        // Register the user-visible closure obligation in the same synchronous
-        // segment as its hold. cb.onTurnTerminal below may await durable store
-        // I/O while a zero screen, suspend, or CLI loss settles the hold.
-        if (requiredReplyMissingNeeded && msg.backgroundTasks) {
-          const key = requiredReplyCotHoldKey(msg.turnId, msg.dispatchAttempt);
-          if (ds.requiredReplyCotHolds?.has(key)) {
-            const receipts = ds.pendingRequiredReplyMissingReceipts
-              ?? (ds.pendingRequiredReplyMissingReceipts = new Map());
-            receipts.set(key, {
-              turnId: msg.turnId,
-              dispatchAttempt: msg.dispatchAttempt,
-              publish: publishRequiredReplyMissing,
-            });
-          } else {
-            // A replay after the background hold was already released still
-            // owes (or retries) the user-visible missing-reply closure. Do not
-            // leave a receipt that no future zero frame can consume.
-            publishRequiredReplyMissing();
-          }
-        }
+        const currentDisplay = settleCurrentTurnDisplay(ds, msg, journal, replyCardSend,
+          ownsLifecycleMutation, managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt), publishRequiredReplyMissing);
+        const { settleCard, cardTerminal, waitingForReply, requiredReplyMissing, requiredReplyMissingNeeded } = currentDisplay;
+        if (settleCard) void settleCard
+          .then(async () => {
+            if (cardTerminal.status !== 'completed' || waitingForReply) return;
+            if (nextStepIo.enabled(ds) && isCodexFamilyCliId(terminalCliId)) {
+              await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+              if (!ownsLifecycleMutation()) return;
+            }
+            // The row outlives this worker: its removal runs when the next
+            // turn starts, possibly on a replacement worker (suspend,
+            // restart, crash). Ownership is the session, not this process.
+            const session = ds.session;
+            const ownsCard = () => ds.session === session && session.status !== 'closed';
+            noteNextStepCard(ds, msg.turnId, { kind: 'unified', publish: async next => {
+              await updateTurnReplyCard(ds, msg.turnId, { kind: 'next_step', ...(next ? { nextStep: next } : {}) },
+                replyCardSend, { dispatchAttempt: msg.dispatchAttempt, owns: ownsCard });
+            } }, nextStepIo, msg.dispatchAttempt);
+            if (recapWanted) {
+              noteRecapCard(ds, msg.turnId, { kind: 'unified', publish: async markdown => {
+                await updateTurnReplyCard(ds, msg.turnId, { kind: 'recap', markdown },
+                  replyCardSend, { dispatchAttempt: msg.dispatchAttempt, owns: ownsCard });
+              } }, turnRecapIo);
+            }
+          })
+          .catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
         ds.cotForced = undefined;
         ds.lastThinkingUpdate = undefined;
         // 「执行失败」只在下一条 IM 消息入轮时清（beginNewTurn / 输入提交）。在
@@ -30085,7 +30145,7 @@ function setupWorkerHandlers(
             if (!usesOutcomeBasedTurnReactions(ds)) return;
             // The persistent delivery owner may still be reconciling a provider
             // effect. Keep the original ack until it can report an actual result.
-            if (requiresReply && msg.status === 'completed' && !delivered && !emptyRequiredReply) return;
+            if (requiresReply && msg.status === 'completed' && !delivered && !requiredReplyMissing) return;
             await finishTurnReactions(ds, {
               turnId: msg.turnId,
               delivered,
