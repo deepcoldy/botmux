@@ -175,7 +175,7 @@ describe('a prompt-ready edge that is not the turn boundary keeps the turn autho
   });
 });
 
-describe('hasLiveAntigravityPendingTasks in default replyDelivery=send mode (structured bridge inactive)', () => {
+describe('hasLiveAntigravityPendingTasks across send mode and adopt/zero-prompt bridge mode', () => {
   const idleFooter = '────────\n>\n────────\n? for shortcuts';
   const pendingFooter = `${idleFooter} · gemini-4-neon · 1 task(s) · /tasks`;
   const dirs: string[] = [];
@@ -351,5 +351,28 @@ describe('hasLiveAntigravityPendingTasks in default replyDelivery=send mode (str
     expect(h.isPromptReady).toBe(true);
     expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
     expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+  });
+
+  it('never lets a footer task count veto the ready edge in adopt/zero-prompt bridge mode without a botmux-started turn', () => {
+    const { h } = sendModeHarness({
+      screen: pendingFooter,
+      bridgeActive: true,
+      bridgeAttached: true,
+      turnStarted: false,
+      records: [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'human turn before attach' },
+        { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'settled before the bridge attached' },
+      ],
+    });
+
+    // In adopt/zero-prompt the baselined bridge owns turn boundaries. The live
+    // footer's task count belongs to no botmux-started turn, so it must not hold
+    // this edge; only the bridge/transcript path may decide.
+    expect(h.hasLiveAntigravityPendingTasks()).toBe(false);
+
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.isPromptReady).toBe(true);
+    expect(h.publishScreenStatus).toHaveBeenCalledWith('idle');
+    expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
   });
 });
