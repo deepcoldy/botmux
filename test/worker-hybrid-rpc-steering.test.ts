@@ -288,6 +288,8 @@ function lifecycleHarness() {
     'stopCodexRpcEngine', 'notifyRpcTeardownBeforeActivation']) {
     s[name] = loadWorkerFunction(name, s);
   }
+  s.ambiguousRpcActivationTokens = new Map();
+  s.pendingAmbiguousFreshRpcActivation = undefined;
   h.queue.setCotSupersededObserver(s.observeCodexCotSuperseded);
   s.codexBridgeDrainAndMaybeEmit = () => { h.queue.ingest(events.splice(0)); s.emitReadyCodexTurns(); };
   s.idleDetector.fireIdle = vi.fn(() => { s.isPromptReady = true; });
