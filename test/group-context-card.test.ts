@@ -140,6 +140,23 @@ describe('group-context card projection', () => {
     expect(projectGroupContextCard(simplified(raw))).toEqual({ kind: 'unresolved' });
   });
 
+  it('renders synthetic multi-question numbers without the display-only escaped dot', () => {
+    const raw = buildTurnReplyCard(record({ asks: [{ ask: {
+      askId: 'ask', nonce: 'SECRET_NONCE', larkAppId: 'app_test', chatId: 'chat', rootMessageId: 'root', sessionId: 'session',
+      createdAt: 1, deadlineAt: 100000, settled: false,
+      questions: [
+        { prompt: 'Q_ONE', multiSelect: false, options: [{ key: 'yes', label: 'PUBLIC_YES' }, { key: 'no', label: 'PUBLIC_NO' }] },
+        { prompt: 'Q_TWO', multiSelect: false, options: [{ key: 'go', label: 'PUBLIC_GO' }, { key: 'stop', label: 'PUBLIC_STOP' }] },
+      ],
+    } }] }), presentation);
+    const projected = conversation(stampBotmuxCallbackMarkers(raw));
+    expect(projected.text).toContain('1. Q_ONE');
+    expect(projected.text).toContain('2. Q_TWO');
+    expect(projected.text).not.toContain('\\.');
+    expect(projected.text).toContain('PUBLIC_YES');
+    expect(projected.text).toContain('PUBLIC_STOP');
+  });
+
   it('stamps standalone progress and messages with an invisible purpose that survives Format A', () => {
     const raw = buildCanonicalFinalReplyCard({ markdown: 'Completed is an ordinary answer' });
     const runtime = markGroupContextCardPurpose(raw, 'runtime');

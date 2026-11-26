@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 import { resolveAssistantSpawn } from './assistant-spawn.js';
 import { outputDeliveryJournal } from '../services/output-delivery-journal.js';
-import { armTriggerStreamingCard } from './trigger-streaming-card.js';
+import { armTriggerStreamingCard, discardTriggerStreamingCard } from './trigger-streaming-card.js';
 import { messageListenerTaskAnchor } from './message-listener-silence.js';
 import { rememberExternalTriggerTurn, rememberTriggerTurn } from './turn-origin.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
@@ -1424,6 +1424,22 @@ async function triggerSessionTurnAdmitted(
   // really a topic group still opens the thread (topic-group rule wins).
   const opensExplicitTopic = hasExplicitTopicMessage
     && (regularGroupMode !== 'shared' || explicitChatMode === 'topic');
+  // In a regular group configured as `shared`, an explicit non-empty topic seed
+  // keeps the group's single `scope: 'chat'` session (creating or reusing it),
+  // posts the seed at top level, and anchors THIS trigger turn's replies into
+  // that seed thread (mirroring top-level @mentions in `shared` mode).
+  const opensSharedTopic = hasExplicitTopicMessage
+    && !rootMessageId
+    && !req.target.sessionId
+    && !httpVirtual
+    && !internal?.messageListenerRun
+    && regularGroupMode === 'shared'
+    && explicitChatMode === 'group';
+  const withdrawMessageBestEffort = (messageId: string): void => {
+    void import('../im/lark/client.js')
+      .then(client => (typeof client.deleteMessage === 'function' ? client.deleteMessage(larkAppId, messageId) : undefined))
+      .catch(() => {});
+  };
   if (!ds && !req.target.sessionId && !rootMessageId && !httpVirtual
       && !opensExplicitTopic
       && (regularGroupMode !== 'new-topic' || topicMessage === null)) {
@@ -1451,72 +1467,136 @@ async function triggerSessionTurnAdmitted(
         ?? { openId: ownerOpenId, type: 'user' as const }
       : runAsPerson;
     if (ownerOpenId && getStrictOwnerOpenId(larkAppId) !== owner?.openId) return ownerUnresolved();
-    // Ownership guard (PR #597): the target must still be the live, registered
-    // occupant before we dispatch. Validate by object identity at its canonical
-    // key AND — because a session can legitimately be reached via a non-canonical
-    // routing key (e.g. an external trigger addressed a chat-scope session by a
-    // fold-back rootMessageId anchor) — accept it if it is still registered
-    // anywhere in the map. This keeps the guard against eviction/replacement
-    // while not rejecting a validly-found session whose canonical key differs
-    // from the lookup key.
-    const targetKey = activeSessionKey(target);
-    const stillRegistered = deps.activeSessions.get(targetKey) === target
-      || [...deps.activeSessions.values()].includes(target);
-    if (!stillRegistered || target.session.status !== 'active' || (owner && target.larkAppId !== larkAppId)) {
-      return {
-        ok: false,
-        triggerId,
-        errorCode: 'session_not_found',
-        error: `active session ownership changed before dispatch: ${target.session.sessionId}`,
-      };
+    const checkExistingRunnable = (): TriggerResponse | undefined => {
+      // Ownership guard (PR #597): the target must still be the live, registered
+      // occupant before we dispatch. Validate by object identity at its canonical
+      // key AND — because a session can legitimately be reached via a non-canonical
+      // routing key (e.g. an external trigger addressed a chat-scope session by a
+      // fold-back rootMessageId anchor) — accept it if it is still registered
+      // anywhere in the map. This keeps the guard against eviction/replacement
+      // while not rejecting a validly-found session whose canonical key differs
+      // from the lookup key.
+      const targetKey = activeSessionKey(target);
+      const stillRegistered = deps.activeSessions.get(targetKey) === target
+        || [...deps.activeSessions.values()].includes(target);
+      if (!stillRegistered || target.session.status !== 'active' || (owner && target.larkAppId !== larkAppId)) {
+        return {
+          ok: false,
+          triggerId,
+          errorCode: 'session_not_found',
+          error: `active session ownership changed before dispatch: ${target.session.sessionId}`,
+        };
+      }
+      const live = !!target.worker && !target.worker.killed;
+      if (owner && hasQueuedActivationAdmissionGate(target)) {
+        return { ok: false, triggerId, errorCode: 'session_not_runnable', error: 'wait for the session activation to complete before sending as a named person' };
+      }
+      if (!live && (target.pendingRepo || target.initialStartPending
+        || target.worktreeCreating || target.session.queued
+        || hasProtectedSessionMutationOwnership(target))) {
+        const state = target.pendingRepo
+          ? 'pending_repo'
+          : target.initialStartPending
+            ? 'initial_start_pending'
+            : target.worktreeCreating
+              ? 'worktree_creating'
+              : target.session.queued
+                ? 'queued_backlog'
+                : 'durable_owner';
+        return {
+          ok: false,
+          triggerId,
+          // Pre-delivery rejection: the session exists but cannot accept input
+          // yet (directory choice, first start, worktree setup, queue). A
+          // distinct code keeps this apart from the catch-all `trigger_failed`,
+          // which can also surface POST-delivery bookkeeping faults — callers
+          // use this code to prove input never reached a worker.
+          errorCode: 'session_not_runnable',
+          error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
+        };
+      }
+      return undefined;
+    };
+    const preflightFailure = checkExistingRunnable();
+    if (preflightFailure) return preflightFailure;
+
+    let sharedTopicRootId: string | undefined;
+    const withdrawSharedTopicSeed = (): void => {
+      if (!sharedTopicRootId) return;
+      const msgId = sharedTopicRootId;
+      sharedTopicRootId = undefined;
+      withdrawMessageBestEffort(msgId);
+    };
+    if (opensSharedTopic && target.scope === 'chat' && topicMessage !== null) {
+      sharedTopicRootId = await sendMessage(larkAppId, chatId, topicMessage);
+      const postSeedFailure = checkExistingRunnable();
+      if (postSeedFailure) {
+        withdrawSharedTopicSeed();
+        return postSeedFailure;
+      }
     }
+
     const workerIsLive = !!target.worker && !target.worker.killed;
-    if (owner && hasQueuedActivationAdmissionGate(target)) {
-      return { ok: false, triggerId, errorCode: 'session_not_runnable', error: 'wait for the session activation to complete before sending as a named person' };
-    }
-    if (!workerIsLive && (target.pendingRepo || target.initialStartPending
-      || target.worktreeCreating || target.session.queued
-      || hasProtectedSessionMutationOwnership(target))) {
-      const state = target.pendingRepo
-        ? 'pending_repo'
-        : target.initialStartPending
-          ? 'initial_start_pending'
-          : target.worktreeCreating
-            ? 'worktree_creating'
-            : target.session.queued
-              ? 'queued_backlog'
-              : 'durable_owner';
-      return {
-        ok: false,
-        triggerId,
-        // Pre-delivery rejection: the session exists but cannot accept input
-        // yet (directory choice, first start, worktree setup, queue). A
-        // distinct code keeps this apart from the catch-all `trigger_failed`,
-        // which can also surface POST-delivery bookkeeping faults — callers
-        // use this code to prove input never reached a worker.
-        errorCode: 'session_not_runnable',
-        error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
-      };
-    }
     const replyAnchor = target.currentReplyTarget ?? target.session.currentReplyTarget;
     const ownerRoot = owner
-      ? target.scope === 'thread' ? target.session.rootMessageId : replyAnchor?.rootMessageId
+      ? (sharedTopicRootId ?? (target.scope === 'thread' ? target.session.rootMessageId : replyAnchor?.rootMessageId))
       : undefined;
-    if (!owner) stageTriggerReadModel(target, req, triggerId);
-    const content = buildExistingSessionContent(
-      target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext,
-      owner ? renderInboundMessageLocation({ rootMessageId: ownerRoot }) : codexAppMessageContext, triggerId, owner, ownerRoot,
-    );
+    let content: ReturnType<typeof buildExistingSessionContent>;
+    try {
+      if (!owner) stageTriggerReadModel(target, req, triggerId, undefined, sharedTopicRootId);
+      content = buildExistingSessionContent(
+        target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext,
+        owner ? renderInboundMessageLocation({ rootMessageId: ownerRoot }) : codexAppMessageContext, triggerId, owner, ownerRoot,
+      );
+    } catch (err) {
+      withdrawSharedTopicSeed();
+      throw err;
+    }
+    let rollbackSharedReplyState: (() => void) | undefined;
+    const snapshotSharedReplyState = (): void => {
+      if (!sharedTopicRootId || rollbackSharedReplyState) return;
+      const previousSessionState = structuredClone({
+        turnReplyContexts: target.session.turnReplyContexts,
+        replyTargets: target.session.replyTargets,
+        replyTargetsPrunedThrough: target.session.replyTargetsPrunedThrough,
+        replyThreadAliases: target.session.replyThreadAliases,
+        currentReplyTarget: target.session.currentReplyTarget,
+        hiddenThinkingTurns: target.session.hiddenThinkingTurns,
+      });
+      const previousAliases = target.replyThreadAliases;
+      const previousCurrent = target.currentReplyTarget;
+      rollbackSharedReplyState = () => {
+        Object.assign(target.session, previousSessionState);
+        target.replyThreadAliases = previousAliases;
+        target.currentReplyTarget = previousCurrent;
+        try { sessionStore.updateSession(target.session); } catch { /* best-effort rollback */ }
+        rollbackSharedReplyState = undefined;
+      };
+    };
+    const abortSharedTopicDispatch = (): void => {
+      rollbackSharedReplyState?.();
+      discardTriggerStreamingCard(target, triggerId);
+      disarmLoudFinalSuppression(target);
+      withdrawSharedTopicSeed();
+    };
     const prepareExistingDispatch = (willFork: boolean): number | undefined => {
+      snapshotSharedReplyState();
       if (owner) {
         beginReplyTargetTurn(target, ownerRoot, triggerId, undefined, {
           senderOpenId: owner.openId,
           participants: [{ openId: owner.openId, name: owner.name, isBot: false }],
-          quoteOnly: target.scope === 'chat' ? replyAnchor?.quoteOnly : undefined,
+          quoteOnly: sharedTopicRootId ? undefined : (target.scope === 'chat' ? replyAnchor?.quoteOnly : undefined),
           synthetic: true,
+          ...(sharedTopicRootId ? { registerSharedTopic: true as const } : {}),
         });
         sessionStore.updateSession(target.session);
         stageTriggerReadModel(target, req, triggerId, owner, ownerRoot);
+      } else if (sharedTopicRootId) {
+        beginReplyTargetTurn(target, sharedTopicRootId, triggerId, undefined, {
+          synthetic: true,
+          registerSharedTopic: true,
+        });
+        sessionStore.updateSession(target.session);
       }
       return prepareStableDispatch(target, willFork);
     };
@@ -1687,16 +1767,21 @@ async function triggerSessionTurnAdmitted(
             message: 'delivered to existing session and completed',
           }),
           () => {
-            const dispatchAttempt = prepareExistingDispatch(false);
-            armFinalOutputSuppression(target, dispatchAttempt);
-            const accepted = sendWorkerInput(target, content, triggerId, {
-              ...(owner ? { trustedCaller: content.trustedCaller } : {}),
-              ...(runAs !== undefined ? { queueAfterActiveTurn: true as const } : {}),
-              ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-              ...(steerRequested ? { codexAppSteerable: true as const } : {}),
-            });
-            if (!accepted) throw new Error('worker refused trigger input before acceptance');
-            recordAcceptedInput();
+            try {
+              const dispatchAttempt = prepareExistingDispatch(false);
+              armFinalOutputSuppression(target, dispatchAttempt);
+              const accepted = sendWorkerInput(target, content, triggerId, {
+                ...(owner ? { trustedCaller: content.trustedCaller } : {}),
+                ...(runAs !== undefined ? { queueAfterActiveTurn: true as const } : {}),
+                ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+                ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+              });
+              if (!accepted) throw new Error('worker refused trigger input before acceptance');
+              recordAcceptedInput();
+            } catch (err) {
+              abortSharedTopicDispatch();
+              throw err;
+            }
           },
         );
       }
@@ -1744,6 +1829,7 @@ async function triggerSessionTurnAdmitted(
             ...(steerRequested ? { codexAppSteerable: true as const } : {}),
           });
         } catch (err) {
+          abortSharedTopicDispatch();
           // A throw AFTER the barrier (begin/prepare/arm/send). Nothing is proven
           // dispatched; terminalize the attempting lease durably so a same-key
           // retry resolves `failed` at-most-once instead of reusing it forever.
@@ -1756,6 +1842,7 @@ async function triggerSessionTurnAdmitted(
           };
         }
         if (!accepted) {
+          abortSharedTopicDispatch();
           target.asyncTriggerResults?.delete(triggerId);
           if (target.latestAsyncTriggerId === triggerId) target.latestAsyncTriggerId = undefined;
           // The worker refused the input synchronously — nothing was dispatched.
@@ -1791,18 +1878,25 @@ async function triggerSessionTurnAdmitted(
         };
       }
 
-      const dispatchAttempt = prepareExistingDispatch(false);
-      armFinalOutputSuppression(target, dispatchAttempt);
-      armLoudFinalSuppression(target);
-      const accepted = sendWorkerInput(target, content, triggerId, {
-        ...(owner ? { trustedCaller: content.trustedCaller } : {}),
-        ...(runAs !== undefined ? { queueAfterActiveTurn: true as const } : {}),
-        ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-        ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
-        ...(steerRequested ? { codexAppSteerable: true as const } : {}),
-        ...(internal?.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
-      });
+      let accepted: boolean;
+      try {
+        const dispatchAttempt = prepareExistingDispatch(false);
+        armFinalOutputSuppression(target, dispatchAttempt);
+        armLoudFinalSuppression(target);
+        accepted = sendWorkerInput(target, content, triggerId, {
+          ...(owner ? { trustedCaller: content.trustedCaller } : {}),
+          ...(runAs !== undefined ? { queueAfterActiveTurn: true as const } : {}),
+          ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+          ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
+          ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+          ...(internal?.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
+        });
+      } catch (err) {
+        abortSharedTopicDispatch();
+        throw err;
+      }
       if (!accepted) {
+        abortSharedTopicDispatch();
         internal?.onDispatchRefused?.();
         disarmLoudFinalSuppression(target);
         return {
@@ -1844,13 +1938,18 @@ async function triggerSessionTurnAdmitted(
           message: 'delivered to existing session and completed',
         }),
         () => {
-          const dispatchAttempt = prepareExistingDispatch(true);
-          armFinalOutputSuppression(target, dispatchAttempt);
-          forkWorker(target, withSteer(content), {
-            resume: target.hasHistory,
-            turnId: triggerId,
-            ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-          });
+          try {
+            const dispatchAttempt = prepareExistingDispatch(true);
+            armFinalOutputSuppression(target, dispatchAttempt);
+            forkWorker(target, withSteer(content), {
+              resume: target.hasHistory,
+              turnId: triggerId,
+              ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+            });
+          } catch (err) {
+            abortSharedTopicDispatch();
+            throw err;
+          }
         },
       );
     }
@@ -1893,6 +1992,7 @@ async function triggerSessionTurnAdmitted(
         });
         recordHeadlessTurn(target);
       } catch (err) {
+        abortSharedTopicDispatch();
         // A throw AFTER the attempting barrier (begin/prepare/fork). Terminalize
         // the lease durably so the caller polls a terminal instead of `running`
         // forever; at-most-once, never re-dispatched. Keyed turns route through the
@@ -1919,15 +2019,21 @@ async function triggerSessionTurnAdmitted(
       };
     }
 
-    const dispatchAttempt = prepareExistingDispatch(true);
-    armFinalOutputSuppression(target, dispatchAttempt);
-    armLoudFinalSuppression(target);
-    forkWorker(target, withSteer(content), {
-      resume: target.hasHistory,
-      turnId: triggerId,
-      ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
-      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-    });
+    try {
+      const dispatchAttempt = prepareExistingDispatch(true);
+      armFinalOutputSuppression(target, dispatchAttempt);
+      armLoudFinalSuppression(target);
+      forkWorker(target, withSteer(content), {
+        resume: target.hasHistory,
+        turnId: triggerId,
+        ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
+        ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      });
+    } catch (err) {
+      abortSharedTopicDispatch();
+      disarmLoudFinalSuppression(target);
+      throw err;
+    }
     return {
       ok: true,
       triggerId,
@@ -2144,6 +2250,87 @@ async function triggerSessionTurnAdmitted(
   const newDs = claim.ds;
   const session = newDs.session;
 
+  let sharedTopicRootId: string | undefined;
+  const withdrawSharedTopicSeed = (): void => {
+    if (!sharedTopicRootId) return;
+    const msgId = sharedTopicRootId;
+    sharedTopicRootId = undefined;
+    withdrawMessageBestEffort(msgId);
+  };
+  const hasAdmittedFollowers = (): boolean =>
+    hasQueuedActivationAdmissionGate(newDs)
+    || (newDs.session.queuedActivationTail?.length ?? 0) > 0
+    || (newDs.pendingFollowUps?.length ?? 0) > 0;
+  let rollbackNewSharedReplyState: (() => void) | undefined;
+  const snapshotNewSharedReplyState = (): void => {
+    if (!sharedTopicRootId || rollbackNewSharedReplyState) return;
+    const previousSessionState = structuredClone({
+      turnReplyContexts: newDs.session.turnReplyContexts,
+      replyTargets: newDs.session.replyTargets,
+      replyTargetsPrunedThrough: newDs.session.replyTargetsPrunedThrough,
+      replyThreadAliases: newDs.session.replyThreadAliases,
+      currentReplyTarget: newDs.session.currentReplyTarget,
+      hiddenThinkingTurns: newDs.session.hiddenThinkingTurns,
+    });
+    const previousAliases = newDs.replyThreadAliases;
+    const previousCurrent = newDs.currentReplyTarget;
+    rollbackNewSharedReplyState = () => {
+      Object.assign(newDs.session, previousSessionState);
+      newDs.replyThreadAliases = previousAliases;
+      newDs.currentReplyTarget = previousCurrent;
+      try { sessionStore.updateSession(newDs.session); } catch { /* best-effort rollback */ }
+      rollbackNewSharedReplyState = undefined;
+    };
+  };
+  const retireUnstartedReservation = async (): Promise<void> => {
+    await withActiveSessionKeyLock(deps.activeSessions, key, () => {
+      if (deps.activeSessions.get(key) !== newDs) return;
+      if (newDs.worker && !newDs.worker.killed) return;
+      if (!newDs.initialStartPending && !newDs.pendingRepo) return;
+      if (hasAdmittedFollowers()) return;
+      deps.activeSessions.delete(key);
+      sessionStore.closeSession(session.sessionId);
+    });
+  };
+  const abortUnstartedNewSharedSession = async (): Promise<void> => {
+    disarmLoudFinalSuppression(newDs);
+    discardTriggerStreamingCard(newDs, triggerId);
+    rollbackNewSharedReplyState?.();
+    withdrawSharedTopicSeed();
+    await retireUnstartedReservation();
+  };
+  const handleLostFirstOwnerReservation = (): TriggerResponse => {
+    withdrawSharedTopicSeed();
+    // Never close a session that was taken over in place (live worker or
+    // admitted follower already owns it); only retire a displaced candidate.
+    const takenOverInPlace = deps.activeSessions.get(key) === newDs
+      && newDs.session.status === 'active'
+      && ((!!newDs.worker && !newDs.worker.killed) || hasAdmittedFollowers());
+    if (!takenOverInPlace && newDs.session.status !== 'closed') {
+      if (deps.activeSessions.get(key) === newDs) deps.activeSessions.delete(key);
+      sessionStore.closeSession(session.sessionId);
+    }
+    return {
+      ok: false,
+      triggerId,
+      errorCode: 'trigger_failed',
+      error: 'new trigger session lost its first-owner reservation before startup',
+    };
+  };
+  if (opensSharedTopic && scope === 'chat' && topicMessage !== null) {
+    try {
+      sharedTopicRootId = await sendMessage(larkAppId, chatId, topicMessage);
+    } catch (err) {
+      await retireUnstartedReservation();
+      throw err;
+    }
+    if (deps.activeSessions.get(key) !== newDs
+      || newDs.session.status !== 'active'
+      || (useAutoWt ? !newDs.pendingRepo : !newDs.initialStartPending)) {
+      return handleLostFirstOwnerReservation();
+    }
+  }
+
   if (useAutoWt) {
     // The key-lock claim registered pendingRepo before this dynamic import;
     // repo commit and inbound routing therefore see the same reservation.
@@ -2159,17 +2346,34 @@ async function triggerSessionTurnAdmitted(
     // actively contributed to should surface its answer, and we never wrongly
     // suppress a normal turn. The suppression is best-effort for this narrow race,
     // not a hard guarantee — consistent with the 256/TTL best-effort bound.
-    if (loudTurnId) newDs.pendingTurnId = loudTurnId;
-    prepareTriggerPresentation(newDs, !!loudTurnId);
-    armLoudFinalSuppression(newDs);
-    const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
-    void runAutoWorktreeCommit({
-      ds: newDs, anchor, larkAppId, baseDir: wd.workingDir, title: triggerTitle(req),
-      operatorOpenId: session.ownerOpenId, activeSessions: deps.activeSessions,
-      // Thread-scope anchor is a topic-root message id (om_…) → reply-in-thread;
-      // chat-scope anchor is a chat_id → plain send. (Fixes the om_→chat_id misroute.)
-      notify: (m) => scope === 'thread' ? replyMessage(larkAppId, anchor, m, 'text', true) : sendMessage(larkAppId, anchor, m),
-    });
+    try {
+      if (sharedTopicRootId) {
+        snapshotNewSharedReplyState();
+        beginReplyTargetTurn(newDs, sharedTopicRootId, triggerId, undefined, {
+          synthetic: true,
+          registerSharedTopic: true,
+        });
+        sessionStore.updateSession(session);
+        stageTriggerReadModel(newDs, req, triggerId, undefined, sharedTopicRootId);
+      }
+      if (loudTurnId || sharedTopicRootId) newDs.pendingTurnId = loudTurnId ?? triggerId;
+      prepareTriggerPresentation(newDs, !!loudTurnId);
+      armLoudFinalSuppression(newDs);
+      const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
+      const notifyTarget = scope === 'thread' ? anchor : sharedTopicRootId;
+      void runAutoWorktreeCommit({
+        ds: newDs, anchor, larkAppId, baseDir: wd.workingDir, title: triggerTitle(req),
+        operatorOpenId: session.ownerOpenId, activeSessions: deps.activeSessions,
+        // Thread-scope anchor or shared-mode topic seed is a topic-root message id (om_…) → reply-in-thread;
+        // flat chat-scope anchor is a chat_id → plain send. (Fixes the om_→chat_id misroute.)
+        notify: (m) => notifyTarget ? replyMessage(larkAppId, notifyTarget, m, 'text', true) : sendMessage(larkAppId, anchor, m),
+      });
+    } catch (err) {
+      if (sharedTopicRootId || rollbackNewSharedReplyState) {
+        await abortUnstartedNewSharedSession();
+      }
+      throw err;
+    }
     return {
       ok: true,
       triggerId,
@@ -2192,65 +2396,77 @@ async function triggerSessionTurnAdmitted(
   } catch (err) {
     // Prompt construction failed before any worker existed. Retire only the
     // still-owned reservation so a retry is not blocked by a ghost active row.
-    await withActiveSessionKeyLock(deps.activeSessions, key, () => {
-      if (deps.activeSessions.get(key) === newDs && newDs.initialStartPending) {
-        deps.activeSessions.delete(key);
-        sessionStore.closeSession(session.sessionId);
-      }
-    });
+    withdrawSharedTopicSeed();
+    await retireUnstartedReservation();
     throw err;
   }
-  const newTurnRoot = scope === 'thread' ? anchor : undefined;
-  stageTriggerReadModel(newDs, req, triggerId, runAsPerson, newTurnRoot);
-  const promptInput = buildNewTopicCliInput(prompt,
-    session.sessionId,
-    session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
-    session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
-    undefined,
-    undefined,
-    availableBots,
-    undefined,
-    { name: bot.botName, openId: bot.botOpenId },
-    localeForBot(larkAppId),
-    undefined,
-    {
-      larkAppId,
-      chatId,
-      whiteboardId: newDs.session.whiteboardId,
-      codexAppText,
-      codexAppApplicationContext,
-      codexAppMessageContext,
-      // Trigger sessions are newly created above and fork without resume.
-      larkToolResume: false,
-    },
-  );
+  const newTurnRoot = scope === 'thread' ? anchor : sharedTopicRootId;
+  let promptInput: ReturnType<typeof buildNewTopicCliInput>;
+  try {
+    stageTriggerReadModel(newDs, req, triggerId, runAsPerson, newTurnRoot);
+    promptInput = buildNewTopicCliInput(prompt,
+      session.sessionId,
+      session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
+      session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
+      undefined,
+      undefined,
+      availableBots,
+      undefined,
+      { name: bot.botName, openId: bot.botOpenId },
+      localeForBot(larkAppId),
+      undefined,
+      {
+        larkAppId,
+        chatId,
+        whiteboardId: newDs.session.whiteboardId,
+        codexAppText,
+        codexAppApplicationContext,
+        codexAppMessageContext,
+        // Trigger sessions are newly created above and fork without resume.
+        larkToolResume: false,
+      },
+    );
+  } catch (err) {
+    if (sharedTopicRootId) await abortUnstartedNewSharedSession();
+    throw err;
+  }
   // No await from the ownership check through forkWorker. The reservation and
   // opening buffers are released only after synchronous pre-accept succeeds.
   if (deps.activeSessions.get(key) !== newDs
     || newDs.session.status !== 'active'
     || !newDs.initialStartPending) {
-    if (newDs.session.status !== 'closed') sessionStore.closeSession(session.sessionId);
-    return {
-      ok: false,
-      triggerId,
-      errorCode: 'trigger_failed',
-      error: 'new trigger session lost its first-owner reservation before startup',
-    };
+    return handleLostFirstOwnerReservation();
   }
   // HTTP options.steer on a FRESH turn marks the opening root as steerable
   // (codex canSteer requires the root itself to be positively authorized), so a
   // later follow-up can natively turn/steer into it. No-op for non-codex CLIs.
   if (steerRequested) promptInput.codexAppSteerable = true;
-  if (runAsPerson) {
-    // The opening turn belongs to the named person: its reply target records them
-    // as the sender (identity publication reads it) and the worker acts for them.
-    promptInput.trustedCaller = { requestLarkAppId: larkAppId, requestUserOpenId: runAsPerson.openId, senderType: 'user' };
-    beginReplyTargetTurn(newDs, newTurnRoot, triggerId, undefined, {
-      senderOpenId: runAsPerson.openId,
-      participants: [{ openId: runAsPerson.openId, name: runAsPerson.name, isBot: false }],
-      synthetic: true,
-    });
-    sessionStore.updateSession(session);
+  try {
+    if (runAsPerson) {
+      // The opening turn belongs to the named person: its reply target records them
+      // as the sender (identity publication reads it) and the worker acts for them.
+      snapshotNewSharedReplyState();
+      promptInput.trustedCaller = { requestLarkAppId: larkAppId, requestUserOpenId: runAsPerson.openId, senderType: 'user' };
+      beginReplyTargetTurn(newDs, newTurnRoot, triggerId, undefined, {
+        senderOpenId: runAsPerson.openId,
+        participants: [{ openId: runAsPerson.openId, name: runAsPerson.name, isBot: false }],
+        synthetic: true,
+        ...(sharedTopicRootId ? { registerSharedTopic: true as const } : {}),
+      });
+      sessionStore.updateSession(session);
+    } else if (sharedTopicRootId) {
+      snapshotNewSharedReplyState();
+      beginReplyTargetTurn(newDs, sharedTopicRootId, triggerId, undefined, {
+        synthetic: true,
+        registerSharedTopic: true,
+      });
+      sessionStore.updateSession(session);
+    }
+  } catch (err) {
+    if (sharedTopicRootId || rollbackNewSharedReplyState) {
+      await abortUnstartedNewSharedSession();
+    }
+    throw err;
   }
   rememberInput(newDs, prompt, promptInput);
 
@@ -2277,6 +2493,7 @@ async function triggerSessionTurnAdmitted(
     // down our just-created session and resolve from the winner's terminal
     // evidence (via resolveIdempotencyHit → async-store), never dispatching.
     const reuseExistingWinner = async (winner: idempotencyStore.IdempotencyRecord): Promise<TriggerResponse> => {
+      withdrawSharedTopicSeed();
       await closeSessionForBackgroundCleanup(session.sessionId, 'trigger-session cleanup');
       const decision = resolveIdempotencyHit(winner, ownerBootId, deps.activeSessions);
       const winnerChatId = (decision.kind !== 'takeover' && decision.chatId) ? decision.chatId : chatId;
@@ -2307,6 +2524,7 @@ async function triggerSessionTurnAdmitted(
       if (res.kind === 'existing') return await reuseExistingWinner(res.record);
       idempotencyLease = res.record;
     } catch (err) {
+      withdrawSharedTopicSeed();
       if (err instanceof idempotencyStore.IdempotencyConflictError) {
         await closeSessionForBackgroundCleanup(session.sessionId, 'trigger-session cleanup');
         return { ok: false, errorCode: 'idempotency_conflict', error: 'idempotencyKey already used with a different request payload', idempotencyKey };
@@ -2327,7 +2545,8 @@ async function triggerSessionTurnAdmitted(
   };
 
   if (req.options?.waitForFinalOutput) {
-    return waitForSessionFinalOutput(
+    let waitDispatchThrew = false;
+    const waitResult = await waitForSessionFinalOutput(
       newDs,
       triggerId,
       req.options?.timeoutMs ?? 120_000,
@@ -2340,14 +2559,23 @@ async function triggerSessionTurnAdmitted(
         message: 'queued new session turn and completed',
       }),
       () => {
-        const dispatchAttempt = prepareStableDispatch(newDs, true);
-        armFinalOutputSuppression(newDs, dispatchAttempt);
-        forkWorker(newDs, promptInput, dispatchAttempt === undefined
-          ? triggerId
-          : { turnId: triggerId, dispatchAttempt });
-        releaseInitialReservation();
+        try {
+          const dispatchAttempt = prepareStableDispatch(newDs, true);
+          armFinalOutputSuppression(newDs, dispatchAttempt);
+          forkWorker(newDs, promptInput, dispatchAttempt === undefined
+            ? triggerId
+            : { turnId: triggerId, dispatchAttempt });
+          releaseInitialReservation();
+        } catch (err) {
+          waitDispatchThrew = true;
+          throw err;
+        }
       },
     );
+    if (waitDispatchThrew && (sharedTopicRootId || rollbackNewSharedReplyState)) {
+      await abortUnstartedNewSharedSession();
+    }
+    return waitResult;
   }
 
   if (req.options?.asyncReturnSessionId) {
@@ -2403,6 +2631,7 @@ async function triggerSessionTurnAdmitted(
           logger.error(`[idempotency] barrier-fail release could not converge the lease (${(e as Error).message}); left for reconcile`);
         }
       }
+      withdrawSharedTopicSeed();
       await closeSessionForBackgroundCleanup(session.sessionId, 'trigger-session cleanup');
       if (terminalizedCrossedFence) {
         // Observable terminal: the caller can poll this sessionId and get `failed`.
@@ -2477,6 +2706,7 @@ async function triggerSessionTurnAdmitted(
           logger.error(`[idempotency] dispatch threw AND recordFailedStrict failed — lease stays attempting for next-boot reconcile: ${(e as Error).message}`);
         }
       }
+      withdrawSharedTopicSeed();
       try { await closeSessionForBackgroundCleanup(session.sessionId, 'trigger-session cleanup'); } catch { /* best-effort; terminal already durable if terminalDurable */ }
       if (idempotencyKey && !terminalDurable) {
         return {
@@ -2504,23 +2734,30 @@ async function triggerSessionTurnAdmitted(
     };
   }
 
-  if (stableTurnId) {
-    const dispatchAttempt = prepareStableDispatch(newDs, true);
-    armFinalOutputSuppression(newDs, dispatchAttempt);
-    forkWorker(newDs, promptInput, dispatchAttempt === undefined
-      ? triggerId
-      : { turnId: triggerId, dispatchAttempt });
-    releaseInitialReservation();
-  }
-  else if (loudTurnId) {
-    prepareTriggerPresentation(newDs, true);
-    armLoudFinalSuppression(newDs);
-    forkWorker(newDs, promptInput, loudTurnId);
-    releaseInitialReservation();
-  }
-  else {
-    forkWorker(newDs, promptInput, triggerId);
-    releaseInitialReservation();
+  try {
+    if (stableTurnId) {
+      const dispatchAttempt = prepareStableDispatch(newDs, true);
+      armFinalOutputSuppression(newDs, dispatchAttempt);
+      forkWorker(newDs, promptInput, dispatchAttempt === undefined
+        ? triggerId
+        : { turnId: triggerId, dispatchAttempt });
+      releaseInitialReservation();
+    }
+    else if (loudTurnId) {
+      prepareTriggerPresentation(newDs, true);
+      armLoudFinalSuppression(newDs);
+      forkWorker(newDs, promptInput, loudTurnId);
+      releaseInitialReservation();
+    }
+    else {
+      forkWorker(newDs, promptInput, triggerId);
+      releaseInitialReservation();
+    }
+  } catch (err) {
+    if (sharedTopicRootId || rollbackNewSharedReplyState) {
+      await abortUnstartedNewSharedSession();
+    }
+    throw err;
   }
 
   return {

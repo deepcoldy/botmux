@@ -26,6 +26,7 @@ import { discardStagedExplainer, readStagedExplainer, stageBoardExplainer } from
 import { BOARD_EXPLAINERS_PER_ATTACH, normalizeBoardFileName } from './files.js';
 import {
   formatHintNotice,
+  formatHintNoticeCard,
   formatHintPrompt,
   formatHintTurnId,
   parseCloseWhenSpec,
@@ -51,6 +52,7 @@ import {
 } from './owner-api.js';
 import {
   formatTaskNotice,
+  formatTaskNoticeCard,
   formatTaskPrompt,
   itemChatIds,
   itemTaskHint,
@@ -78,6 +80,7 @@ import {
   composeStewardGuide,
   effectivePrimaryChat,
   formatBatchEcho,
+  formatBatchEchoCard,
   formatBatchMessage,
   splitEchoText,
   formatBoardTurnId,
@@ -126,7 +129,7 @@ export interface DecisionBoardServiceDeps {
     turnId: string;
     prompt: string;
     /** 管家群里的回显：逐项内容的文本（已按单条上限拆好）与附图，按顺序发。 */
-    announcement: { texts: string[]; images: LarkAttachment[] };
+    announcement: { texts: string[]; images: LarkAttachment[]; /** 首条文本的紧凑卡片版；失败时回退 texts[0]。 */ card?: string };
     attachments: LarkAttachment[];
     ownerOpenId?: string;
     ownerName?: string;
@@ -936,6 +939,7 @@ export class DecisionBoardService {
       channel: 'task',
       prompt: formatTaskPrompt(entries, this.deps.locale()),
       notice: formatTaskNotice(entries, this.deps.locale()),
+      card: formatTaskNoticeCard(entries, this.deps.locale()),
     });
     if (!sent) this.retryTaskChats(entries.map(e => e.hint.chatId));
     else this.deps.log('info', `[decision-board] task alert: notified ${sent}`);
@@ -1410,6 +1414,7 @@ export class DecisionBoardService {
         channel: 'hint',
         prompt: formatHintPrompt(entries, locale),
         notice: formatHintNotice(entries, locale),
+        card: formatHintNoticeCard(entries, locale),
       });
     }
     if (summary.marked || summary.cleared || notified) {
@@ -1430,7 +1435,7 @@ export class DecisionBoardService {
     keys: Array<{ seq: number; key: string; chat?: string }>,
     round: number,
     locale: Locale,
-    content: { channel: NoticeChannel; prompt: string; notice: string },
+    content: { channel: NoticeChannel; prompt: string; notice: string; card?: string },
   ): Promise<number> {
     const steward = this.deps.steward();
     if (!stewardReady(steward)) return 0;
@@ -1456,7 +1461,7 @@ export class DecisionBoardService {
         await this.deps.deliver({
           turnId,
           prompt: content.prompt,
-          announcement: { texts: splitEchoText(content.notice), images: [] },
+          announcement: { texts: splitEchoText(content.notice), images: [], ...(content.card ? { card: content.card } : {}) },
           attachments: [],
           chatId: steward.chatId,
           sessionTitle: locale === 'en' ? 'Steward' : '管家',
@@ -1519,6 +1524,8 @@ export class DecisionBoardService {
     const dir = this.deps.batchAttachmentsDir(batchId);
     const entries = decisions.map(d => {
       const item = store.getItem(app, d.seq);
+      const links = this.itemLinks(d.seq);
+      const itemLink = links.appLink ?? links.url;
       // 排队期间管家改了问题或选项：同一个选项键可能换了意思，不附现在的原文、不标推荐。
       const optionsChanged = !!item && !!d.choice && !!d.askKey && d.askKey !== decisionAskKey(item);
       const option = optionsChanged ? undefined : item?.options.find(o => o.key === d.choice);
@@ -1555,6 +1562,7 @@ export class DecisionBoardService {
         ...(d.supersededBy !== undefined ? { supersededBy: d.supersededBy } : {}),
         text: d.text,
         fileCount: d.fileIds.length,
+        ...(itemLink ? { link: itemLink } : {}),
         ...(chat?.url ? { primaryChat: { text: chat.text, url: chat.url } } : {}),
       };
     });
@@ -1568,17 +1576,22 @@ export class DecisionBoardService {
     });
     let sessionId: string | undefined;
     try {
+      const echo = {
+        header: this.deps.banner({ batchId, count: decisions.length, locale }),
+        entries,
+        locale,
+      };
+      const echoTexts = splitEchoText(formatBatchEcho(echo));
+      // 长说明不截断：卡片放不下时完整沿用既有纯文本拆条。
+      const echoCard = echoTexts.length === 1 ? formatBatchEchoCard(echo) : undefined;
       const res = await this.deps.deliver({
         turnId,
         prompt,
         announcement: {
           // 群里看到的就是 owner 提交的内容：与批次消息同一份逐项文本，不带给管家的执行指令。
-          texts: splitEchoText(formatBatchEcho({
-            header: this.deps.banner({ batchId, count: decisions.length, locale }),
-            entries,
-            locale,
-          })),
+          texts: echoTexts,
           images: attachments,
+          ...(echoCard ? { card: echoCard } : {}),
         },
         attachments,
         ...(ownerOpenId ? { ownerOpenId } : {}),

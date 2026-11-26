@@ -31,7 +31,7 @@ import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/work
 import { failedTurnRewindInFlight } from '../../core/failed-turn-rewind.js';
 import { messageMentionsBot } from './message-parser.js';
 import { validateModelPin } from '../../core/model-pin.js';
-import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
+import { canOperate, canTalk, canRunDaemonCommand, humanCanRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
 import { handleTmuxUpgradeCardAction, isTmuxUpgradeAction } from '../../core/tmux-upgrade.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, deleteEphemeralCard, getMessageDetail, getChatModeStrict, getCachedChatModeStrict, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
@@ -128,11 +128,20 @@ import type { DaemonSession } from '../../core/types.js';
 import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
 import { buildTerminalUrl, platformTerminalReadEntryActive } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch, worktreeTargetPath } from '../../services/git-worktree.js';
+import { createRepoWorktree, isValidBranchName, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch, worktreeTargetPath } from '../../services/git-worktree.js';
 import { repinSessionWorkingDir } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
-import { configWriteFailureText, handleCommand } from '../../core/command-handler.js';
+import { configWriteFailureText, createSlashGroup, handleCommand, slashGroupReceiptText } from '../../core/command-handler.js';
+import {
+  GROUP_CREATE_DIR_ACTION,
+  GROUP_CREATE_SUBMIT_ACTION,
+  buildGroupCreatedCard,
+  claimGroupCreateForm,
+  getGroupCreateForm,
+  releaseGroupCreateForm,
+  selectGroupCreateDir,
+} from '../../core/group-create-card.js';
 import {
   DISMISS_CLEANUP_WT_ACTION,
   DISMISS_CONFIRM_ACTION,
@@ -155,7 +164,7 @@ import {
   openLocalCliInIterm,
   preflightLocalCliOpen,
 } from '../../services/local-cli-opener.js';
-import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
+import { hasNonActivationSessionMutationOwnership, hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
 import { runDetachedBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 import { setSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
@@ -2642,6 +2651,109 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return;
   }
 
+  // ─── /g 建群卡片：下拉选目录（记录在表单内存态） / 提交建群 ──────────────
+  if (larkAppId && (value?.action === GROUP_CREATE_DIR_ACTION || value?.action === GROUP_CREATE_SUBMIT_ACTION)) {
+    const loc = localeForBot(larkAppId);
+    const opened = getGroupCreateForm(value.form, operatorOpenId);
+    if (!opened.ok) {
+      return { toast: { type: 'error', content: t(`card.group_create.${opened.reason}`, undefined, loc) } };
+    }
+    const { form } = opened;
+    // Re-run the live command-entry permission gate on every interaction. The
+    // owner id stored when the card opened is historical: within the 30-min
+    // TTL the user may have lost allowedUsers / entered blockedUsers / become
+    // restrictGrantCommands-blocked, and a forwarded card must not let them
+    // create groups, invite bots or worktrees anyway.
+    // humanCanRunDaemonCommand is the exact command-entry pair for a caller
+    // without a real inbound message: grantCommandRestriction (restrictGrantCommands
+    // on chat/global-grant users) FIRST, then canRunDaemonCommand. The command
+    // token is the one that opened the card (`/g` or `/group`) so a bot that
+    // allows only one spelling still authorizes correctly. Card callbacks carry
+    // no union_id, so that leg stays fail-closed; an empty open_id cannot pass.
+    if (!humanCanRunDaemonCommand(
+      larkAppId, form.sourceChatId, operatorOpenId ?? '',
+      undefined, form.sourceCommand, form.sourceChatType,
+    )) {
+      logger.info(`[group-create-card] blocked card action for unauthorized operator: ${operatorOpenId}`);
+      return { toast: { type: 'error', content: t('card.group_create.need_auth', undefined, loc) } };
+    }
+    if (value.action === GROUP_CREATE_DIR_ACTION) {
+      const raw = typeof action?.option === 'string' ? action.option.trim() : '';
+      const dir = validateWorkingDir(raw, loc);
+      if (!dir.ok) return { toast: { type: 'error', content: dir.error } };
+      selectGroupCreateDir(form, dir.resolvedPath);
+      return { toast: { type: 'success', content: t('card.group_create.dir_selected', { dir: dir.resolvedPath }, loc) } };
+    }
+    const fv: Record<string, unknown> = (action as any)?.form_value ?? {};
+    const name = String(fv.group_name ?? '').trim();
+    const typedDir = String(fv.group_dir ?? '').trim();
+    let workingDir = form.selectedDir;
+    if (typedDir) {
+      const dir = validateWorkingDir(typedDir, loc);
+      if (!dir.ok) return { toast: { type: 'error', content: dir.error } };
+      workingDir = dir.resolvedPath;
+    }
+    const branch = String(fv.group_branch ?? '').trim();
+    // Synchronous pre-checks happen before claiming so a rejected submit keeps
+    // the form open for correction.
+    if (branch && !workingDir) {
+      return { toast: { type: 'error', content: t('card.group_create.repo_required', undefined, loc) } };
+    }
+    // Atomic claim BEFORE the async branch validation: concurrent submits have
+    // distinct event ids and both reach this point; only the claimant that
+    // actually removes the form may build an afterAck (single createSlashGroup).
+    if (!claimGroupCreateForm(form)) {
+      return { toast: { type: 'error', content: t('card.group_create.expired', undefined, loc) } };
+    }
+    if (branch) {
+      let branchOk = true;
+      try {
+        branchOk = await isValidBranchName(branch);
+      } catch (err) {
+        releaseGroupCreateForm(form);
+        throw err;
+      }
+      if (!branchOk) {
+        releaseGroupCreateForm(form);
+        return { toast: { type: 'error', content: t('daemon.topic_header_branch_invalid', { arg: branch }, loc) } };
+      }
+    }
+    return {
+      toast: { type: 'info', content: t('card.group_create.creating', undefined, loc) },
+      afterAck: async () => {
+        const created = await createSlashGroup({
+          creatorAppId: form.creatorAppId,
+          senderOpenId: form.senderOpenId,
+          groupArgs: {
+            ...form.groupArgs,
+            name,
+            body: name,
+            workingDir,
+            branch: branch || undefined,
+          },
+          larkAppIdsForGroup: form.larkAppIdsForGroup,
+          appIdToName: new Map(Object.entries(form.appIdToName)),
+          loc,
+          logTag: 'group-create-card',
+        });
+        // A v1 form card cannot be patched into another card, so the result goes
+        // out as a new card where `/g` was sent and the used form is withdrawn
+        // after the callback ACK. If the card cannot be sent, keep the form and
+        // fall back to the text receipt under it.
+        try {
+          await sessionReply(form.rootId, buildGroupCreatedCard(created, loc), 'interactive');
+          deferRepoCardWithdraw(larkAppId, cardMessageId);
+        } catch (err) {
+          logger.warn(`[group-create-card] result card failed: ${err instanceof Error ? err.message : String(err)}`);
+          if (cardMessageId) {
+            try { await replyMessage(larkAppId, cardMessageId, slashGroupReceiptText(created, loc), 'text', false); }
+            catch (replyErr) { logger.warn(`[group-create-card] receipt reply failed: ${replyErr instanceof Error ? replyErr.message : String(replyErr)}`); }
+          }
+        }
+      },
+    };
+  }
+
   // ─── /botconfig 交互卡片：切换布尔开关 / 选择 cli·model·lang / 编辑自由输入项 ──
   const CONFIG_CARD_ACTIONS = [
     'config_toggle', 'config_set', 'models_default_pick', 'models_default_effort_pick', 'config_quota', 'config_quota_open',
@@ -3999,7 +4111,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // Codex App: an accepted-but-unsettled dispatch still owns the turn route.
       // requestSessionRestart does not itself gate on dispatch ownership, so
       // reject here before the restart coordinator tears the worker down.
-      if (hasProtectedSessionMutationOwnership(ds)) {
+      if (hasNonActivationSessionMutationOwnership(ds)) {
         await sessionReply(
           rootId,
           '当前 Codex App 仍有未结算消息，暂不能重启；请等待本轮完成或关闭会话。',
@@ -4024,7 +4136,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           render: status => buildRestartStatusCard({ status, cliName, source: 'card', locale: locDs }),
           post: card => sessionReply(rootId, card, 'interactive'),
         }),
-      });
+      }, { allowUnconfirmedActivationReplay: true });
     }
 
     if (actionType === 'close') {

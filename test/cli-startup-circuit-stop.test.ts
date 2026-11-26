@@ -630,6 +630,26 @@ describe('pre-ready input receipts', () => {
     }));
   });
 
+  it.each(['reconcile', 'remote'])('never claims a %s recovered opening was only queued', proof => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = false;
+    h.scope.lastInitConfig.turnId = 'schedule:recovered';
+    h.scope.cliAdapter = { passesInitialPromptViaArgs: false };
+    h.scope.backend = null;
+    if (proof === 'reconcile') {
+      h.scope.lastInitConfig.reconcileQueuedActivation = {
+        turnId: 'schedule:recovered', phase: 'succeeded',
+      };
+    } else {
+      h.scope.remoteRunnerRecoveredTurnIdentity = { turnId: 'schedule:recovered' };
+    }
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-recovered', 'schedule:recovered');
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'queued_turn_cancel_result', turnId: 'schedule:recovered', status: 'restart_required',
+    }));
+  });
+
   it.each([false, true])('settles only the exiting backend lease when a replacement is current (running=%s)', running => {
     const h = exitHarness('traex');
     const oldLease = { release: vi.fn(async () => {}), abandon: vi.fn(async () => {}) };

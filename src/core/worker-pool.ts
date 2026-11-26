@@ -5,8 +5,19 @@ import { SharedThreadClient, openSharedThread } from './shared-thread-opening.js
 
 import { isLeadOnlySession } from './lead-only.js';
 import { decideAssistantAdmission, decideAssistantLiveInputAdmission } from './assistant-spawn.js';
-import { controllerForSession, type WorkerContractContext } from './session-controller.js';
+import { controllerForSession, readPersistedExecutionContract, type WorkerContractContext } from './session-controller.js';
 import { WorkerOutputJournal } from '../services/worker-output-journal.js';
+import {
+  classifyOfflineColdRestoreSettlement,
+  classifyQueuedActivationInitPlan,
+  decideCodexAppSettlementActivationToken,
+  decideOrdinaryImRejectionAction,
+  decidePendingRawInputAction,
+  isDurableArgvCliId,
+  resolveQueuedActivationEffectiveTurn,
+  shouldSkipResumeForReconciledBridge,
+  type ReconcileQueuedActivationHint,
+} from '../services/queued-activation-reconcile.js';
 import {
   dropTypeAheadPromptTurn,
   noteTypeAheadPromptTurn,
@@ -1508,6 +1519,14 @@ export interface WorkerPoolCallbacks {
    *  True when the limit is handled by moving this session to the next
    *  CLI/model, so the owner pause notice and backup-bot handoff are skipped. */
   startQuotaFallbackChainSwitch?: (ds: DaemonSession, trigger: QuotaFallbackChainTrigger) => boolean;
+  /** User-confirmed Codex capacity downgrade (core/codex-capacity-fallback.ts). */
+  onCodexCapacityRetry?: (
+    ds: DaemonSession,
+    trigger: import('./codex-capacity-fallback.js').CodexCapacityFallbackTrigger,
+  ) => boolean;
+  /** Invalidate any open Codex capacity-downgrade confirmation card once the
+   *  turn settles, is superseded by new input, or the worker retires. */
+  onCodexCapacitySettle?: (ds: DaemonSession, reason: string, turnId?: string) => void;
   /** A scheduled task as the host authority store holds it, for deciding who a
    *  scheduled turn runs as. Never backed by schedules.json (agent-writable
    *  inside a sandbox). Absent or undefined → the turn carries no identity. */
@@ -9699,6 +9718,7 @@ export function killWorker(
   // worker (or into nothing, if no replacement comes).
   invalidateStuckWarning(ds, 'killWorker');
   invalidateTuiPrompt(ds, 'killWorker');
+  callbacks?.onCodexCapacitySettle?.(ds, 'killWorker');
   if (!ds.worker || ds.worker.killed) {
     // No live worker to receive {type:'close'}, so its destroySession() — which
     // tears down the persistent backing session (tmux/herdr/zellij/zmx) — never
@@ -9790,6 +9810,7 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   if (retiredInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, retiredInteractiveTurnId);
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
+  callbacks?.onCodexCapacitySettle?.(ds, reason);
   const w = ds.worker;
   // This function nulls ds.worker synchronously, so the later process `exit`
   // event fails the current-worker check and cannot perform this cleanup.
@@ -9849,6 +9870,7 @@ function clearTransferWorkerState(
   if (retiredInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, retiredInteractiveTurnId);
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
+  callbacks?.onCodexCapacitySettle?.(ds, reason);
   if (!worker || ds.worker === worker || ds.worker === null) {
     ds.worker = null;
     ds.workerPort = null;
@@ -10327,6 +10349,7 @@ export function writeSessionModelPin(
   }
   if (!pin) ds.modelPinCleared = true;
   else delete ds.modelPinCleared;
+  callbacks?.onCodexCapacitySettle?.(ds, 'model_pin_changed');
   dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId,
     patch: { modelPin: resolveSessionModelPinView(ds, cfg) ?? null } } });
   try { scheduleActiveRuntimePatch(ds); } catch (error) { logger.warn(`[${tag(ds)}] Pin card refresh failed: ${String(error)}`); }
@@ -10440,6 +10463,10 @@ export function latestLaunchCommandsForRespawn(ds: DaemonSession): {
 
 export interface SessionRestartOptions {
   topicEffort?: import('../utils/traex-session-effort.js').TraexTopicEffortRestart;
+  /** Explicit general restart only: authorize one generation-scoped replay of
+   *  activations still lacking submission evidence. Never set for model/effort,
+   *  cwd-move, account-rotation, or crash-recovery restarts. */
+  allowUnconfirmedActivationReplay?: boolean;
   /**
    * Role-switch cwd move: the worker converges `lastInitConfig.workingDir` to
    * this path before respawning (`restart.updateWorkingDir`). The caller must
@@ -10534,6 +10561,7 @@ export function requestSessionRestart(
         ds.cliReady = false;
         try {
           ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
+            ...(opts.allowUnconfirmedActivationReplay === true ? { allowUnconfirmedActivationReplay: true as const } : {}),
             ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model,
             ...(opts.topicEffort ? { topicEffort: opts.topicEffort } : {}),
             traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
@@ -13805,6 +13833,11 @@ export function __testOnly_setSuspendBackingVerifier(
   suspendBackingVerifier = verifier ?? destroySuspendBackingVerified;
 }
 
+let workerSpawnerImpl: typeof spawnWorker | undefined;
+export function __testOnly_setWorkerSpawner(spawner?: typeof spawnWorker): void {
+  workerSpawnerImpl = spawner;
+}
+
 const primarySuspendInFlight = new WeakMap<DaemonSession, Promise<boolean>>();
 const primarySuspendApplying = new WeakSet<DaemonSession>();
 function managedSuspendAttemptId(ds: DaemonSession, baseOperationId?: string): string | undefined {
@@ -14090,6 +14123,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   const suspendedInteractiveTurnId = ds.activeInteractiveTurn?.turnId;
   ds.activeInteractiveTurn = undefined;
   if (suspendedInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, suspendedInteractiveTurnId);
+  callbacks?.onCodexCapacitySettle?.(ds, 'suspendWorker');
   // The worker is being suspended — the CLI will be destroyed and cold-resumed
   // later. Invalidate any stuck-warning card so a late click cannot inject keys
   // after the CLI is gone (or into a different CLI on resume).
@@ -16782,6 +16816,14 @@ async function rejectOrdinaryImDelivery(
   const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration);
   const record = pendingOrdinaryImDeliveries.get(key);
   if (!record) return;
+  if (decideOrdinaryImRejectionAction(rejection.reason) === 'clear_without_retry') {
+    clearOrdinaryImDelivery(record);
+    logger.info(
+      `[${tag(ds)}] Cleared ordinary IM delivery without retry turn=${turnId.substring(0, 16)} `
+      + `reason=${rejection.reason}`,
+    );
+    return;
+  }
   if (rejection.rejectedBeforeAdmission && requireCallbacks().onOrdinaryImInputRejected) {
     if (record.rejectionHandoff) {
       await record.rejectionHandoff;
@@ -17054,8 +17096,8 @@ export function sendWorkerSessionInput(
   }
   const controller = controllerForSession(ds);
   if (controller && !controller.acceptsUserInput()) return false;
-  const scoped = controller && message.type === 'message' && message.turnId
-    ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, message.dispatchAttempt) } }
+  const scoped = controller && (message.type === 'message' || message.type === 'raw_input') && message.turnId
+    ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, 'dispatchAttempt' in message ? message.dispatchAttempt : undefined) } }
     : message;
   const annotated = withTurnCaller(ds, scoped);
   if (!assistantTransferInputDeliveryAllowed(ds, annotated, 'worker session input')) return false;
@@ -20168,6 +20210,13 @@ export function promoteQueuedActivationTail(
   publishQueuedActivationStatePatch(ds);
   if (opts.send === false) return true;
   try {
+    let admittedExecution: import('../services/session-contract.js').ExecutionRef | undefined;
+    if (head.turnId) {
+      const controller = controllerForSession(ds);
+      if (controller?.acceptsUserInput()) {
+        admittedExecution = controller.admitInput(head.turnId, head.dispatchAttempt);
+      }
+    }
     ds.worker!.send({
       type: 'message',
       content: exactInput.content,
@@ -20204,6 +20253,7 @@ export function promoteQueuedActivationTail(
         : {}),
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
+      ...(admittedExecution ? { sessionCommand: { version: 2 as const, execution: admittedExecution } } : {}),
     } as DaemonToWorker);
     rememberScheduledTurnCaller(ds, head.turnId, exactInput.trustedCaller);
     recordAdmittedOrdinaryUserTurn(ds, head.turnId, {
@@ -20584,6 +20634,106 @@ export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
       && ds.session.queuedActivationInput !== undefined);
 }
 
+export type OfflineQueuedActivationSettlementOutcome =
+  | 'not_applicable'
+  | 'settled_empty'
+  | 'promoted_replay'
+  | 'quarantined'
+  | 'fallback_to_fork';
+
+/** Synchronous offline settlement for provably-dead local sessions during
+ *  `restoreActiveSessions` (missing persistent pane or non-persistent local
+ *  PTY, excluding remote backends and Codex App). Clears only opening heads with
+ *  positive post-submission evidence, promoting any durable tail head
+ *  synchronously with exact rollback on transient SQLite failures (zero
+ *  background retry timers). */
+export function settleOfflineReconciledQueuedActivation(
+  ds: DaemonSession,
+  opts: {
+    isCodexApp: boolean;
+    isRemoteBackend: boolean;
+    isDurableArgvCli?: boolean;
+    backingMode: 'cold_restore' | 'live_reattach' | 'unknown_probe';
+  },
+): OfflineQueuedActivationSettlementOutcome {
+  if (ds.session.status !== 'active'
+    || ds.worker
+    || ds.session.sessionLifecycle === 'closing'
+    || ds.session.sessionLifecycle === 'closed'
+    || isSessionTransferring(ds)) {
+    return 'not_applicable';
+  }
+  const existingController = controllerForSession(ds, false);
+  if (existingController) {
+    const state = existingController.store.read(existingController.ref);
+    if (state && state.lifecycle !== 'active') return 'not_applicable';
+  }
+  const maxSteps = (ds.session.queuedActivationTail?.length ?? 0) + 1;
+  let settledAny = false;
+  for (let step = 0; step < maxSteps; step++) {
+    const effective = resolveQueuedActivationEffectiveTurn(ds.session, {
+      pendingRawInput: ds.pendingRawInput,
+      pendingRawTurnId: ds.pendingRawTurnId,
+    });
+    const contract = readPersistedExecutionContract(ds, effective.turnId, effective.dispatchAttempt);
+    const decision = classifyOfflineColdRestoreSettlement({
+      queuedActivationPending: ds.session.queuedActivationPending === true,
+      isCodexApp: opts.isCodexApp,
+      isRemoteBackend: opts.isRemoteBackend,
+      isDurableArgvCli: opts.isDurableArgvCli,
+      isRawInput: effective.isRawInput,
+      backingMode: opts.backingMode,
+      hasContract: contract.hasContract,
+      turnId: effective.turnId,
+      contractPhase: contract.phase,
+    });
+    if (decision !== 'settle_offline') {
+      return settledAny ? 'promoted_replay' : 'not_applicable';
+    }
+    const priorJournal = snapshotQueuedActivationJournal(ds.session);
+    clearQueuedActivationJournal(ds.session);
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (err) {
+      restoreQueuedActivationJournal(ds.session, priorJournal);
+      logger.error(
+        `[${tag(ds)}] Offline queued activation clear failed; falling back to recovery fork: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return 'fallback_to_fork';
+    }
+    ds.hasHistory = true;
+    ds.pendingRawInput = undefined;
+    ds.pendingRawTurnId = undefined;
+    publishQueuedActivationStatePatch(ds);
+    settledAny = true;
+    logger.info(
+      `[${tag(ds)}] Settled offline cold-restore queued activation `
+      + `(turn=${effective.turnId?.substring(0, 16) ?? '-'}, phase=${contract.phase})`,
+    );
+    if ((ds.session.queuedActivationTail?.length ?? 0) === 0) {
+      ds.initialStartPending = false;
+      ds.initialStartClaimToken = undefined;
+      return 'settled_empty';
+    }
+    let promoted = false;
+    try {
+      promoted = promoteQueuedActivationTail(ds, { send: false });
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Offline queued activation tail promotion threw; quarantining for recovery fork: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (!promoted) {
+      ds.quarantinedActivationTailPromotion = true;
+      ds.initialStartPending = true;
+      return 'quarantined';
+    }
+  }
+  return ds.session.queuedActivationPending ? 'promoted_replay' : 'settled_empty';
+}
+
 export type ForkResumeOrTurnId = boolean | string | {
   resume?: boolean;
   /** Explicit close reactivation asks a Remote Runner provider to replace the
@@ -20762,7 +20912,16 @@ export function resolveQuarantinedForkPlan(
     );
     return { fork: false, promptInput, resumeOrTurnId };
   }
-  if (!promoteQueuedActivationTail(ds, { send: false })) {
+  let promotedQuarantined = false;
+  try {
+    promotedQuarantined = promoteQueuedActivationTail(ds, { send: false });
+  } catch (err) {
+    logger.error(
+      `[${tag(ds)}] Quarantined activation-tail promotion threw at fork boundary; `
+      + `keeping worker:null quarantined owner (no fork): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (!promotedQuarantined) {
     logger.warn(
       `[${tag(ds)}] Quarantined activation-tail promotion still failing at fork boundary; `
       + `keeping worker:null quarantined owner (no fork) to avoid a live worker beside an unpromoted tail`,
@@ -22050,6 +22209,10 @@ function forkWorkerPrepared(
         initialStartPending: ds.initialStartPending,
       }
     : undefined;
+  const priorPendingRawInput = ds.pendingRawInput;
+  const priorPendingRawTurnId = ds.pendingRawTurnId;
+  const priorInitialStartPending = ds.initialStartPending;
+  const priorInitialStartClaimToken = ds.initialStartClaimToken;
   let acceptedForkDispatch: AcceptedWorkerForkDispatch | undefined;
   let spawnedWorker: ChildProcess | undefined;
   let worker!: ChildProcess;
@@ -22071,7 +22234,7 @@ function forkWorkerPrepared(
     ?? (queuedForkSnapshot ? ds.session.pendingRepoSetup?.turnId : undefined);
   // Reply routing is frozen only from the same explicitly accepted turn. A
   // system prompt must not borrow an older mutable currentReplyTarget.
-  const initReplyTurnId = initTurnId;
+  let initReplyTurnId = initTurnId;
   const initReplyContext = prompt.length > 0
     ? frozenReplyContextForTurn(ds, initReplyTurnId)
     : undefined;
@@ -22137,6 +22300,66 @@ function forkWorkerPrepared(
     protectedHttpEgressPolicy,
   );
 
+  // Classify already-submitted queued activations BEFORE freezing sandbox
+  // decisions or reserving worker generation / group-context turn bindings so
+  // legacy rows freeze with `resume: true` and stripped Turn-1 IDs never
+  // pollute replacement-generation turn bindings.
+  let reconcileQueuedActivation: ReconcileQueuedActivationHint | undefined;
+  if (!queuedForkSnapshot && ds.session.queuedActivationPending) {
+    const resolvedReconcileCliId = sessionCliId(ds, botCfg);
+    const effectiveActivation = resolveQueuedActivationEffectiveTurn(ds.session, {
+      initTurnId,
+      initDispatchAttempt,
+      pendingRawInput: ds.pendingRawInput,
+      pendingRawTurnId: ds.pendingRawTurnId,
+      prompt,
+    });
+    const activationContract = readPersistedExecutionContract(
+      ds,
+      effectiveActivation.turnId,
+      effectiveActivation.dispatchAttempt,
+    );
+    const activationPlan = classifyQueuedActivationInitPlan({
+      queuedActivationPending: true,
+      queuedActivationToken: ds.session.queuedActivationToken ?? 'pending-migration',
+      isCodexApp: isCodexAppCliId(resolvedReconcileCliId),
+      hasUnsettledCodexAppDispatch: hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger),
+      isDurableArgvCli: isDurableArgvCliId(resolvedReconcileCliId),
+      hasTextPrompt: effectiveActivation.hasTextPrompt,
+      hasRawInput: effectiveActivation.hasRawInput,
+      turnId: effectiveActivation.turnId,
+      dispatchAttempt: effectiveActivation.dispatchAttempt,
+      hasContract: activationContract.hasContract,
+      contractPhase: activationContract.phase,
+    });
+    if (activationPlan.action === 'reconcile_already_submitted' || activationPlan.action === 'probe_submission') {
+      const submittedText = effectiveActivation.isRawInput
+        ? (ds.pendingRawInput ?? ds.session.queuedActivationRawInput ?? ds.session.pendingRepoSetup?.rawInput ?? '')
+        : (prompt || ds.session.queuedActivationInput?.content || '');
+      reconcileQueuedActivation = {
+        ...activationPlan.hint,
+        ...(activationPlan.action === 'probe_submission' ? { submittedText } : {}),
+      };
+      prompt = '';
+      promptPayload = { content: '' };
+      initTurnId = undefined;
+      initReplyTurnId = undefined;
+      initAttributionTurnId = undefined;
+      initDispatchAttempt = undefined;
+      if (!shouldSkipResumeForReconciledBridge({
+        reattachLiveBackend: opts.reattachLiveBackend === true,
+        hasHistory: ds.hasHistory,
+        cliId: resolvedReconcileCliId,
+      })) {
+        resume = true;
+      }
+      logger.info(
+        `[${t}] ${activationPlan.action === 'probe_submission' ? 'Probing unconfirmed' : 'Reconciling already-submitted'} queued activation on recovery fork `
+        + `(turn=${activationPlan.hint.turnId.substring(0, 16)}, phase=${activationPlan.hint.phase})`,
+      );
+    }
+  }
+
   // Sandbox decision is RECORDED ON THE SESSION at creation and reused on
   // restore — so toggling the live bot flag never retroactively (un)sandboxes a
   // historical session. A brand-new session (resume=false) with no recorded
@@ -22200,18 +22423,25 @@ function forkWorkerPrepared(
   // A fork carries the opening/queued input straight into worker init. Freeze
   // the exact group background after every defer/refusal seam, then admit
   // LinkRefs from that final payload immediately before irreversible
-  // child-launch preparation.
-  commitGroupContextDispatch(ds, promptPayload, initAttributionTurnId);
-  const admittedOpeningLinkRefs = prepareAdmittedLinkRefPayload({
-    ds,
-    payload: promptPayload,
-    turnId: initAttributionTurnId,
-    dispatchAttempt: initDispatchAttempt,
-  });
-  promptPayload = typeof promptInput === 'string'
-    ? admittedOpeningLinkRefs.payload
-    : freezeAdmittedPayloadInPlace(promptInput, admittedOpeningLinkRefs.payload);
-  prompt = promptPayload.content;
+  // child-launch preparation. Skip when reconciling an already-submitted head
+  // so we never mutate the persisted payload or re-register LinkRefs.
+  const admittedOpeningLinkRefs = reconcileQueuedActivation
+    ? { payload: promptPayload, mode: 'disabled' as const }
+    : (() => {
+        commitGroupContextDispatch(ds, promptPayload, initAttributionTurnId);
+        return prepareAdmittedLinkRefPayload({
+          ds,
+          payload: promptPayload,
+          turnId: initAttributionTurnId,
+          dispatchAttempt: initDispatchAttempt,
+        });
+      })();
+  if (!reconcileQueuedActivation) {
+    promptPayload = typeof promptInput === 'string'
+      ? admittedOpeningLinkRefs.payload
+      : freezeAdmittedPayloadInPlace(promptInput, admittedOpeningLinkRefs.payload);
+    prompt = promptPayload.content;
+  }
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride, { configDir: agentCfg.cliConfigDir });
   const initTitlePlan = prepareInputTitle(ds, promptPayload, agentCfg.cliId, !resume && !ds.session.cliSessionId);
   let nativeSessionTitle: string | undefined = initTitlePlan?.nativeTitle;
@@ -22298,20 +22528,34 @@ function forkWorkerPrepared(
     // Migrate journals written before the token/ACK protocol. The queued
     // activation is the newest unsettled FIFO entry; stamp the same token onto
     // both journal and entry before the recovery worker can submit it.
-    let migrated = ds.session.queuedActivationToken !== queuedActivationToken;
+    const priorToken = ds.session.queuedActivationToken;
+    const priorEntryToken = recoveredActivationLedgerEntry?.queuedActivationToken;
+    let migrated = priorToken !== queuedActivationToken;
     ds.session.queuedActivationToken = queuedActivationToken;
     ds.initialStartPending = true;
     if (recoveredActivationLedgerEntry
-      && recoveredActivationLedgerEntry.queuedActivationToken !== queuedActivationToken) {
+      && priorEntryToken !== queuedActivationToken) {
       recoveredActivationLedgerEntry.queuedActivationToken = queuedActivationToken;
       migrated = true;
     }
-    if (migrated) sessionStore.updateSession(ds.session);
+    if (migrated) {
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        ds.session.queuedActivationToken = priorToken;
+        if (recoveredActivationLedgerEntry) {
+          recoveredActivationLedgerEntry.queuedActivationToken = priorEntryToken;
+        }
+        throw err;
+      }
+    }
   }
-  if (queuedActivationToken && ds.pendingRawInput) {
-    // Runtime-only pendingRawInput is cleared at prompt_ready. Persist the exact
-    // literal command with the activation journal so immediate raw starts can
-    // also rebuild it after a daemon restart; the ACK clears this copy.
+  if (queuedActivationToken && ds.pendingRawInput
+    && (!reconcileQueuedActivation
+      || (reconcileQueuedActivation.evidenceRequired && reconcileQueuedActivation.rawInput))) {
+    // Runtime-only pendingRawInput is cleared at prompt_ready or while arming a
+    // read-only reconciliation probe. Persist the exact literal command in both
+    // cases so a later daemon/worker replacement can rebuild the same proof watch.
     retainQueuedActivationRawInput(ds.session, ds.pendingRawInput, ds.pendingRawTurnId ?? ds.session.queuedActivationTurnId);
   }
 
@@ -22418,7 +22662,7 @@ function forkWorkerPrepared(
 
   // Node: fork `dist/worker.js`. Standalone binary: re-exec THIS binary with the
   // hidden `__worker` subcommand over the same IPC channel (see self-spawn.ts).
-  worker = spawnWorker({
+  worker = (workerSpawnerImpl ?? spawnWorker)({
     distDir: join(__dirname, '..'),
     cwd,
     execArgv: workerForkExecArgv(),
@@ -22744,6 +22988,7 @@ function forkWorkerPrepared(
       ? {}
       : { linkRefMode: admittedOpeningLinkRefs.mode }),
     ...(queuedActivationToken ? { queuedActivationToken } : {}),
+    ...(reconcileQueuedActivation ? { reconcileQueuedActivation } : {}),
     resume,
     // One-shot native fork intent (see Session.pendingForkSession). Only the
     // child's FIRST spawn resumes the SOURCE transcript (cliSessionId still
@@ -22934,6 +23179,10 @@ function forkWorkerPrepared(
   // refork, restore, cold resume, queued activation — clears it exactly once.
   ds.cliReady = false;
   ds.worker = worker;
+  if (reconcileQueuedActivation) {
+    ds.pendingRawInput = undefined;
+    ds.pendingRawTurnId = undefined;
+  }
   ds.protectedLoopbackProxyAttestation = protectedLoopbackProxyAttestation;
   initializeWorkerIpcBootstrap(worker);
   rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
@@ -23003,6 +23252,17 @@ function forkWorkerPrepared(
     }
     try {
       rollbackWorkerForkPreInit(ds, queuedForkSnapshot, acceptedForkDispatch);
+      if (!queuedForkSnapshot) {
+        ds.pendingRawInput = priorPendingRawInput;
+        ds.pendingRawTurnId = priorPendingRawTurnId;
+        if (!ds.worker && !ds.quarantinedActivationTailPromotion && ds.session.queuedActivationPending) {
+          ds.initialStartPending = false;
+          ds.initialStartClaimToken = undefined;
+        } else if (!ds.worker) {
+          ds.initialStartPending = priorInitialStartPending;
+          ds.initialStartClaimToken = priorInitialStartClaimToken;
+        }
+      }
     } catch (rollbackErr) {
       logger.error(
         `[${tag(ds)}] Worker pre-init failure could not durably restore queued/FIFO state: `
@@ -23322,6 +23582,94 @@ function setupWorkerHandlers(
     );
   const ownsLifecycleMutation = (): boolean =>
     ownsWorkerSession() && !isSessionTransferring(ds) && (!sessionController || sessionController.currentAuthority());
+  // Warm-reattached Codex App finals settle under `admission.kind === 'historical'`
+  // where `sessionController.currentAuthority()` is false even though this worker
+  // still owns the active non-closing session. Mirror `ownsCodexAppFinalDelivery`
+  // so matched activation journals clear and promote `queuedActivationTail` only
+  // while the session is active, has no active control op, and still belongs to
+  // this worker.
+  const ownsCodexAppSettlementActivation = (): boolean => {
+    if (!ownsWorkerSession() || isSessionTransferring(ds)) return false;
+    if (!sessionController) return true;
+    const state = sessionController.store.read(sessionController.ref);
+    return !!state
+      && state.lifecycle === 'active'
+      && !state.activeOperationId
+      && (!contractWorker || sameWorker(state.worker, contractWorker));
+  };
+  const matchCodexAppSettlementActivationToken = (
+    settledEntry: { queuedActivationToken?: string; turnId?: string; dispatchAttempt?: number } | undefined,
+    nextLedger: readonly CodexAppDispatchLedgerEntry[] | undefined,
+    isDurableReplayCancel = false,
+  ): string | undefined => {
+    if (!ownsCodexAppSettlementActivation()) return undefined;
+    return typeof decideCodexAppSettlementActivationToken === 'function'
+      ? decideCodexAppSettlementActivationToken({
+          queuedActivationPending: ds.session.queuedActivationPending === true,
+          queuedActivationToken: ds.session.queuedActivationToken,
+          queuedActivationTurnId: ds.session.queuedActivationTurnId,
+          queuedActivationDispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+          hasPendingRawInput: Boolean(
+            ds.session.pendingRepoSetup?.rawInput
+            || ds.session.queuedActivationRawInput
+            || ds.pendingRawInput,
+          ),
+          isDurableReplayCancel,
+          settledEntry,
+          ledgerDrained: !hasUnsettledCodexAppDispatch(nextLedger),
+        })
+      : undefined;
+  };
+  const releaseAtomicallySettledCodexAppActivation = async (activationToken: string): Promise<void> => {
+    publishQueuedActivationStatePatch(ds);
+    ds.hasHistory = true;
+    const releaseReservation = async (attempt: number): Promise<void> => {
+      if (!ownsCodexAppSettlementActivation() || !ds.initialStartPending) return;
+      try {
+        if (cb.onQueuedActivationSubmitted) {
+          const released = await cb.onQueuedActivationSubmitted(ds, activationToken);
+          if (released === false && ownsCodexAppSettlementActivation() && ds.initialStartPending) {
+            const delayMs = Math.min(100 * (2 ** Math.min(attempt, 6)), 5_000);
+            logger.warn(
+              `[${t}] Codex App settled activation follow-up was not accepted (attempt ${attempt + 1}); `
+              + `retrying in ${delayMs}ms`,
+            );
+            const timer = setTimeout(() => { void releaseReservation(attempt + 1); }, delayMs);
+            timer.unref?.();
+          }
+        } else {
+          ds.initialStartPending = false;
+          ds.initialStartClaimToken = undefined;
+        }
+      } catch (err) {
+        logger.error(
+          `[${t}] Codex App settled activation follow-up release failed unexpectedly: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    };
+    await releaseReservation(0);
+  };
+  const settleCodexAppQueuedActivationIfMatched = async (
+    settledEntry?: { queuedActivationToken?: string; turnId?: string; dispatchAttempt?: number },
+    isDurableReplayCancel = false,
+  ): Promise<void> => {
+    const token = matchCodexAppSettlementActivationToken(
+      settledEntry,
+      ds.session.codexAppDispatchLedger,
+      isDurableReplayCancel,
+    );
+    if (!token) return;
+    await handleQueuedActivationSubmittedAck({
+      ds,
+      msg: { sessionId: ds.session.sessionId, activationToken: token },
+      tag: t,
+      ownsLifecycleMutation: ownsCodexAppSettlementActivation,
+      updateSession: session => sessionStore.updateSession(session),
+      onQueuedActivationSubmitted: cb.onQueuedActivationSubmitted,
+      publishActivationStatePatch: publishQueuedActivationStatePatch,
+    });
+  };
   const applyNativeTitle = (title: string): boolean => {
     if (ds.worker !== worker || hasManualSessionTitle(ds.session)) return false;
     const committed = commitAcceptedInputTitle(ds, {
@@ -23411,6 +23759,7 @@ function setupWorkerHandlers(
   // can leave a stale card that would otherwise inject keys into the new CLI.
   invalidateStuckWarning(ds, 'new_worker_generation');
   invalidateTuiPrompt(ds, 'new_worker_generation');
+  callbacks?.onCodexCapacitySettle?.(ds, 'new_worker_generation');
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
@@ -24744,6 +25093,19 @@ function setupWorkerHandlers(
               return undefined;
             }
             acknowledge(true);
+            await settleCodexAppQueuedActivationIfMatched({
+              turnId: msg.turnId,
+              ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+            });
+            // If an earlier attempt already committed the atomic journal clear
+            // before throwing in post-commit receipt reconciliation, release the
+            // remaining reservation/tail on this committed retry.
+            if (!ds.session.queuedActivationPending
+              && ds.initialStartPending
+              && !ds.pendingRepo
+              && ownsCodexAppSettlementActivation()) {
+              await releaseAtomicallySettledCodexAppActivation('codex-app-committed-retry');
+            }
             if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
               try { await cb.onCodexAppLedgerDrained?.(ds); }
               catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
@@ -24904,8 +25266,20 @@ function setupWorkerHandlers(
                   return false;
                 }
               }
+              let atomicallyClearedActivationToken: string | undefined;
               try {
-                persistCodexAppRecoverySettlement(ds, committed, msg, preview.settledEntry.deliverySink);
+                const matchedActivationToken = matchCodexAppSettlementActivationToken(
+                  preview.settledEntry,
+                  committed.ledger,
+                );
+                persistCodexAppRecoverySettlement(
+                  ds,
+                  committed,
+                  msg,
+                  preview.settledEntry.deliverySink,
+                  matchedActivationToken,
+                  () => { atomicallyClearedActivationToken = matchedActivationToken; },
+                );
                 if (msg.dispatchAttempt !== undefined) {
                   // Both durable writes succeeded. The frozen ledger sender is
                   // the attribution captured at acceptance; the live reply
@@ -24922,6 +25296,10 @@ function setupWorkerHandlers(
               } catch (err) {
                 logger.error(`[${t}] Failed to persist Codex App final settlement: ${err instanceof Error ? err.message : String(err)}`);
                 return false;
+              } finally {
+                if (atomicallyClearedActivationToken) {
+                  await releaseAtomicallySettledCodexAppActivation(atomicallyClearedActivationToken);
+                }
               }
             })().finally(() => codexAppFinalSettlementInFlight.delete(key));
             codexAppFinalSettlementInFlight.set(key, inFlight);
@@ -24946,6 +25324,11 @@ function setupWorkerHandlers(
             } else if (msg.disposition !== 'steer_superseded' && !msg.codexAppCancelled) {
               fanOutSteerGroupFinal(ds, settlement.generation, msg.content, Date.now(), msg);
             }
+          }
+          if (persisted) {
+            // Idempotent fallback if a concurrent inFlight already persisted the
+            // ledger before this handler observed it (no-op once cleared above).
+            await settleCodexAppQueuedActivationIfMatched(preview.settledEntry);
           }
           if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
             try { await cb.onCodexAppLedgerDrained?.(ds); }
@@ -25425,7 +25808,9 @@ function setupWorkerHandlers(
             if (typeof cb !== 'undefined') cb?.onManagedTurnOriginRevoked?.(ds, msg.turnId);
           }
         }
-        discardTriggerStreamingCard(ds, msg.turnId);
+        const reconciliationOnlyRejection = typeof decideOrdinaryImRejectionAction === 'function'
+          && decideOrdinaryImRejectionAction(msg.reason) === 'clear_without_retry';
+        if (!reconciliationOnlyRejection) discardTriggerStreamingCard(ds, msg.turnId);
         const purgeClick = takePurgeClickRollback(ds, msg.turnId);
         if (purgeClick) {
           if (purgeClick.receipt && refundRetryAttempt(ds.session, purgeClick.receipt)) {
@@ -26458,31 +26843,84 @@ function setupWorkerHandlers(
             : codexAppInputForSession(ds, followUp?.codexAppInput);
           if (rawTurnId) await requireCallbacks().prepareRawInputTurn?.(ds, rawTurnId);
           if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
-          sendWorkerSessionInput(ds, {
-            type: 'raw_input',
-            content: rawInput,
-            ...(trustedSessionController(ds)
-              ? { trustedController: trustedSessionController(ds) }
-              : {}),
-            // Passthrough commands (/compact, /model, ...) become REAL mojo turns,
-            // so they must carry the same credential snapshot a normal message
-            // does — otherwise a cleared or rotated JWT simply did not apply here.
-            ...(mojoLivePatchForSession(ds) ?? {}),
-            ...((ds.session.queuedActivationTurnId ?? rawTurnId)
-              ? { turnId: ds.session.queuedActivationTurnId ?? rawTurnId }
-              : {}),
-            followUpContent: followUp?.cliInput,
-            ...(followUp?.turnId ? { followUpTurnId: followUp.turnId } : {}),
-            ...(followUpCodexAppInput ? { followUpCodexAppInput } : {}),
-            ...(ds.session.queuedActivationToken
-              ? { queuedActivationToken: ds.session.queuedActivationToken }
-              : {}),
-          });
-          logger.info(`[${t}] Sent pending raw input after prompt_ready: ${rawInput.substring(0, 80)}${followUp ? ` (+follow-up ${followUp.cliInput.length} chars)` : ''}`);
-          if (followUp) rememberLastCliInput(ds, followUp.userPrompt, {
-            content: followUp.cliInput,
-            ...(followUpCodexAppInput ? { codexAppInput: followUpCodexAppInput } : {}),
-          }, followUp.turnId, { codexAppInputAccepted: !!followUpCodexAppInput });
+          const effectiveRawTurnId = ds.session.queuedActivationRawTurnId ?? rawTurnId ?? ds.session.queuedActivationTurnId;
+          const rawContract = typeof readPersistedExecutionContract === 'function' && effectiveRawTurnId
+            ? readPersistedExecutionContract(ds, effectiveRawTurnId)
+            : { hasContract: false };
+          const rawAction = typeof decidePendingRawInputAction === 'function'
+            ? decidePendingRawInputAction({
+                isCodexApp: isCodexAppCliId(sessionCliId(ds, botCfg)),
+                hasContract: rawContract.hasContract,
+                contractPhase: rawContract.phase,
+                hasQueuedActivationToken: Boolean(ds.session.queuedActivationPending && ds.session.queuedActivationToken),
+              })
+            : 'send_raw_input';
+          const deliverBundledFollowUp = (): void => {
+            if (!followUp || ds.worker !== worker || ds.workerGeneration !== workerGeneration) return;
+            const sentFollowUp = sendWorkerSessionInput(ds, {
+              type: 'message',
+              content: followUp.cliInput,
+              ...(trustedSessionController(ds)
+                ? { trustedController: trustedSessionController(ds) }
+                : {}),
+              ...(mojoLivePatchForSession(ds) ?? {}),
+              ...(followUp.turnId ? { turnId: followUp.turnId } : {}),
+              ...(followUpCodexAppInput ? { codexAppInput: followUpCodexAppInput } : {}),
+            });
+            if (sentFollowUp) {
+              rememberLastCliInput(ds, followUp.userPrompt, {
+                content: followUp.cliInput,
+                ...(followUpCodexAppInput ? { codexAppInput: followUpCodexAppInput } : {}),
+              }, followUp.turnId, { codexAppInputAccepted: !!followUpCodexAppInput });
+            }
+          };
+          if (rawAction !== 'send_raw_input') {
+            logger.info(
+              `[${t}] Skipped already-submitted pending raw input after prompt_ready `
+              + `(turn=${effectiveRawTurnId?.substring(0, 16) ?? '-'}, phase=${rawContract.phase ?? '-'})`,
+            );
+            if (rawAction === 'reconcile_already_submitted' && ds.session.queuedActivationToken) {
+              // Run bundled followUp inside onAcceptedInput: strictly AFTER the
+              // SQLite journal clear succeeds (never on SQLite error) and
+              // strictly BEFORE releaseReservation promotes queuedActivationTail[0].
+              await handleQueuedActivationSubmittedAck({
+                ds,
+                msg: { sessionId: ds.session.sessionId, activationToken: ds.session.queuedActivationToken },
+                tag: t,
+                ownsLifecycleMutation,
+                updateSession: session => sessionStore.updateSession(session),
+                onQueuedActivationSubmitted: cb.onQueuedActivationSubmitted,
+                onAcceptedInput: () => { deliverBundledFollowUp(); },
+                publishActivationStatePatch: publishQueuedActivationStatePatch,
+              });
+            } else {
+              deliverBundledFollowUp();
+            }
+          } else {
+            const sentRaw = sendWorkerSessionInput(ds, {
+              type: 'raw_input',
+              content: rawInput,
+              ...(trustedSessionController(ds)
+                ? { trustedController: trustedSessionController(ds) }
+                : {}),
+              // Passthrough commands (/compact, /model, ...) become REAL mojo turns,
+              // so they must carry the same credential snapshot a normal message
+              // does — otherwise a cleared or rotated JWT simply did not apply here.
+              ...(mojoLivePatchForSession(ds) ?? {}),
+              ...(effectiveRawTurnId ? { turnId: effectiveRawTurnId } : {}),
+              followUpContent: followUp?.cliInput,
+              ...(followUp?.turnId ? { followUpTurnId: followUp.turnId } : {}),
+              ...(followUpCodexAppInput ? { followUpCodexAppInput } : {}),
+              ...(ds.session.queuedActivationToken
+                ? { queuedActivationToken: ds.session.queuedActivationToken }
+                : {}),
+            });
+            logger.info(`[${t}] Sent pending raw input after prompt_ready: ${rawInput.substring(0, 80)}${followUp ? ` (+follow-up ${followUp.cliInput.length} chars)` : ''}`);
+            if (sentRaw && followUp) rememberLastCliInput(ds, followUp.userPrompt, {
+              content: followUp.cliInput,
+              ...(followUpCodexAppInput ? { codexAppInput: followUpCodexAppInput } : {}),
+            }, followUp.turnId, { codexAppInputAccepted: !!followUpCodexAppInput });
+          }
         }
         // CLI reached its prompt — any previously posted stuck warning is stale.
         invalidateStuckWarning(ds, 'prompt_ready');
@@ -26611,6 +27049,24 @@ function setupWorkerHandlers(
       case 'codex_model_launch': {
         if (!ownsLifecycleMutation()) break;
         if (confirmCodexModelLaunch(ds.session, msg)) sessionStore.updateSession(ds.session);
+        break;
+      }
+
+      case 'codex_capacity_retry': {
+        if (!ownsLifecycleMutation()) break;
+        if (managedAuxUiSuppressed(msg.turnId)) break;
+        callbacks?.onCodexCapacityRetry?.(ds, {
+          turnId: msg.turnId,
+          nativeSessionId: msg.nativeSessionId,
+          ...(msg.model ? { model: msg.model } : {}),
+          ...(msg.codexTurnId ? { codexTurnId: msg.codexTurnId } : {}),
+          ...(msg.retryAttempt !== undefined ? { retryAttempt: msg.retryAttempt } : {}),
+          ...(msg.maxRetries !== undefined ? { maxRetries: msg.maxRetries } : {}),
+          ...(msg.retryDelaySec !== undefined ? { retryDelaySec: msg.retryDelaySec } : {}),
+          observedAtMs: msg.observedAtMs,
+          worker,
+          reply: text => scopedReply(text, 'text', msg.turnId),
+        });
         break;
       }
 
@@ -28381,6 +28837,7 @@ function setupWorkerHandlers(
         // click could inject its keys into the replacement CLI.
         invalidateStuckWarning(ds, 'claude_exit');
         invalidateTuiPrompt(ds, 'claude_exit');
+        callbacks?.onCodexCapacitySettle?.(ds, 'claude_exit');
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
         try {
@@ -29821,6 +30278,7 @@ function setupWorkerHandlers(
           ds.session,
           readonlyTerminal,
         );
+        callbacks?.onCodexCapacitySettle?.(ds, `turn_terminal:${msg.status}`, msg.turnId);
         const ordinaryHttpTerminal = codexCapacityRecoveryCli(sessionCliId(ds, botCfg)) && (ds.pendingWaitPromises?.has(msg.turnId)
           || ds.asyncTriggerResults?.has(msg.turnId)
           || ds.settledHttpTerminalTurns?.has(msg.turnId));
@@ -31117,7 +31575,25 @@ function setupWorkerHandlers(
           break;
         }
         const priorLedger = ds.session.codexAppDispatchLedger;
+        // Durable attempts (dispatchAttempt !== undefined) cancelled via
+        // retireCodexAppDispatchForDurableReplay are fenced for retry/replay
+        // rather than terminalized — never clear queuedActivationPending or
+        // promote queuedActivationTail ahead of attempt 2.
+        const cancelledEntry = msg.operation === 'cancel' ? msg.entries[0] : undefined;
+        const cancelMatchesActivationToken = msg.operation === 'cancel'
+          ? matchCodexAppSettlementActivationToken(
+              cancelledEntry,
+              next.ledger,
+              cancelledEntry?.dispatchAttempt !== undefined,
+            )
+          : undefined;
+        const priorActivationJournal = cancelMatchesActivationToken
+          ? snapshotQueuedActivationJournal(ds.session)
+          : undefined;
         ds.session.codexAppDispatchLedger = next.ledger;
+        if (cancelMatchesActivationToken) {
+          clearQueuedActivationJournal(ds.session);
+        }
         let persisted = false;
         try {
           sessionStore.updateSession(ds.session);
@@ -31125,7 +31601,13 @@ function setupWorkerHandlers(
           acknowledge(true);
         } catch (err: any) {
           ds.session.codexAppDispatchLedger = priorLedger;
+          if (priorActivationJournal) {
+            restoreQueuedActivationJournal(ds.session, priorActivationJournal);
+          }
           acknowledge(false, err?.message ?? 'session_store_write_failed');
+        }
+        if (persisted && cancelMatchesActivationToken) {
+          await releaseAtomicallySettledCodexAppActivation(cancelMatchesActivationToken);
         }
         if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
           try { await cb.onCodexAppLedgerDrained?.(ds); }
@@ -31186,6 +31668,7 @@ function setupWorkerHandlers(
       }
 
       case 'final_output': {
+        if (msg.turnId) callbacks?.onCodexCapacitySettle?.(ds, 'final_output', msg.turnId);
         if (!msg.handoff) {
           if (effectiveCliId === 'codex' && msg.sessionId === ds.session.sessionId) terminateProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
           await processFinalOutput(msg);
@@ -31589,10 +32072,12 @@ function setupWorkerHandlers(
     // which production never has on (2026-11-23).
     const logRejected = (reason: string) => {
       if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked' || msg.type === 'session_identity_decision'
-        || msg.type === 'terminal_turn_started' || msg.type === 'restart_result') && ds.worker === worker) {
+        || msg.type === 'terminal_turn_started' || msg.type === 'restart_result' || msg.type === 'queued_activation_submitted') && ds.worker === worker) {
         const detail = msg.type === 'restart_result'
           ? `attempt=${msg.attemptId.slice(0, 8)} status=${msg.status}`
-          : `turn=${msg.turnId ?? '-'}`;
+          : msg.type === 'queued_activation_submitted'
+            ? `token=${msg.activationToken.slice(0, 8)}`
+            : `turn=${msg.turnId ?? '-'}`;
         logger.warn(`[${t}] Dropped ${msg.type} from current worker ${detail} reason=${reason}`);
       } else if (msg.type === 'final_output' && ds.worker === worker) {
         reportUndeliveredFinal(msg, reason);
@@ -31945,6 +32430,7 @@ function setupWorkerHandlers(
       ds.scheduledControlActors = undefined;
       ds.taskContinuationRpcProof = undefined;
       ds.activeInteractiveTurn = undefined;
+      callbacks?.onCodexCapacitySettle?.(ds, 'worker_exit');
       if (ds.remoteCloseState) {
         ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
         noteRiffCloseWorkerGone(ds, { exited: true });
@@ -32421,12 +32907,20 @@ function persistCodexAppRecoverySettlement(
   committed: { ledger: NonNullable<Session['codexAppDispatchLedger']>; commits: NonNullable<Session['codexAppGenerationCommits']> },
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   sink: string | undefined,
+  matchedActivationToken?: string,
+  onCommitted?: () => void,
 ): void {
   const priorLedger = ds.session.codexAppDispatchLedger;
   const priorCommits = ds.session.codexAppGenerationCommits;
   const priorRecovery = ds.session.ordinaryTurnRecovery;
+  const priorActivationJournal = matchedActivationToken
+    ? snapshotQueuedActivationJournal(ds.session)
+    : undefined;
   ds.session.codexAppDispatchLedger = committed.ledger;
   ds.session.codexAppGenerationCommits = committed.commits;
+  if (matchedActivationToken) {
+    clearQueuedActivationJournal(ds.session);
+  }
   if (sink === 'lark' && ordinaryTurnRecoveryEligible(ds)) {
     stageOrdinaryTurnRecoveryTerminal(ds.session, { turnId: msg.turnId, ...codexAppSettlementOutcome(msg) });
   }
@@ -32435,8 +32929,12 @@ function persistCodexAppRecoverySettlement(
     ds.session.codexAppDispatchLedger = priorLedger;
     ds.session.codexAppGenerationCommits = priorCommits;
     ds.session.ordinaryTurnRecovery = priorRecovery;
+    if (priorActivationJournal) {
+      restoreQueuedActivationJournal(ds.session, priorActivationJournal);
+    }
     throw error;
   }
+  onCommitted?.();
   // A failure here keeps the committed ledger and pending receipt. Both daemon
   // replay and startup reconcile it, without requiring the worker's later IPC.
   reconcileOrdinaryTurnRecoveryTerminalReceipt(ds.session);
