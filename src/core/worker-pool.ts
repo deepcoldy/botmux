@@ -354,7 +354,7 @@ import { readBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { isHumanInboundTurnId, setFinalOutputOriginRecorder } from './reply-target.js';
 import { durableImRepliesEnabled } from '../bot-registry.js';
 import { outputSnapshot } from '../services/universal-output-handoff.js';
-import { outputDeliveryJournal, type OutputDeliveryRecord, type OutputReceipt, type OutputSink } from '../services/output-delivery-journal.js';
+import { outputDeliveryJournal, type OutputDeliveryJournal, type OutputDeliveryRecord, type OutputReceipt, type OutputSink } from '../services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator, OutputDeliveryTerminalError, type OutputDeliveryControl } from '../services/output-delivery-coordinator.js';
 import { TurnSendLedger, FinalPublicationUnknownError } from '../services/turn-send-ledger.js';
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
@@ -13853,7 +13853,7 @@ function isSynthesizedBackgroundTurnId(turnId: string | undefined): boolean {
 function finalizeOrHoldCotMessage(
   ds: DaemonSession,
   msg: CotTerminal,
-  opts?: { finishStatus?: 'completed' | 'failed'; replyPending?: boolean },
+  opts?: { finishStatus?: 'completed' | 'failed'; replyPending?: boolean; preserveEarlierHold?: boolean },
 ): void {
   const requiredKey = requiredReplyCotHoldKey(msg.turnId, msg.dispatchAttempt);
   if (ds.requiredReplyCotHolds?.has(requiredKey) || isReplayOfHeldCotTerminal(ds, msg)) return;
@@ -13866,7 +13866,7 @@ function finalizeOrHoldCotMessage(
     && isSynthesizedBackgroundTurnId(msg.turnId) && !hasCotMessageForTurn(ds, msg)) {
     return;
   }
-  releaseHeldCotMessage(ds);
+  if (!opts?.preserveEarlierHold) releaseHeldCotMessage(ds);
   // A replay of an already finalized turn must not create a fresh hold. In
   // particular, an interrupted CLI exit is terminal, not a new background wait.
   if (cotMessageFinishStatus(ds, msg)) return;
@@ -13938,21 +13938,66 @@ function settleRequiredReplyCotMessage(
   ds: DaemonSession,
   turnId: string,
   dispatchAttempt?: number,
+  status: 'completed' | 'failed' = 'completed',
 ): boolean {
   const key = requiredReplyCotHoldKey(turnId, dispatchAttempt);
   const pendingReceipts = ds.pendingRequiredReplyMissingReceipts;
-  pendingReceipts?.delete(key);
-  if (pendingReceipts?.size === 0) ds.pendingRequiredReplyMissingReceipts = undefined;
+  if (status === 'completed') {
+    pendingReceipts?.delete(key);
+    if (pendingReceipts?.size === 0) ds.pendingRequiredReplyMissingReceipts = undefined;
+  }
   const held = ds.requiredReplyCotHolds?.get(key);
   if (!held) return false;
   held.replyPending = false;
-  held.finishStatus = 'completed';
+  held.finishStatus = status;
   if (!held.backgroundPending) {
     ds.requiredReplyCotHolds!.delete(key);
     finalizeCotMessage(ds, held.turnId, held.finishStatus, held.dispatchAttempt);
     if (ds.requiredReplyCotHolds!.size === 0) ds.requiredReplyCotHolds = undefined;
+    const pendingReceipt = pendingReceipts?.get(key);
+    if (pendingReceipt) {
+      pendingReceipts!.delete(key);
+      if (pendingReceipts!.size === 0) ds.pendingRequiredReplyMissingReceipts = undefined;
+      pendingReceipt.publish();
+    }
   }
   return true;
+}
+
+async function settleHistoricalTurnDisplay(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
+  journal: OutputDeliveryJournal | undefined,
+  send: Parameters<typeof settleTurnReplyCardTerminal>[2],
+  ownsDisplay: () => boolean,
+  suppressCard: boolean,
+): Promise<void> {
+  if (!ownsDisplay()) return;
+  const sink = msg.status === 'completed' ? journal?.sink(msg.sessionId, msg.turnId) : undefined;
+  const requiresReply = sink?.kind === 'im' && sink.answerRequired === true;
+  const hasReply = requiresReply && !!new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
+    larkAppId: ds.larkAppId, sessionId: msg.sessionId, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+  })?.messageId;
+  const missing = requiresReply && !hasReply
+    && (msg.outputDisposition === 'nothing_to_send' || msg.outputDisposition === 'empty_answer'
+      || journal?.forTurn(msg.sessionId, msg.turnId).some(record =>
+        record.output.dispatchAttempt === msg.dispatchAttempt && record.state === 'rejected') === true);
+  const pending = requiresReply && !hasReply && !missing;
+  const terminal = missing ? { ...msg, status: 'failed' as const } : msg;
+  if (!isReplayOfHeldCotTerminal(ds, msg)) {
+    if (pending) {
+      finalizeOrHoldCotMessage(ds, msg, { replyPending: true, preserveEarlierHold: true });
+    } else if (!(requiresReply && settleRequiredReplyCotMessage(ds, msg.turnId, msg.dispatchAttempt, missing ? 'failed' : 'completed'))) {
+      finalizeCotMessage(ds, msg.turnId, terminal.status, msg.dispatchAttempt);
+    }
+  }
+  if (suppressCard) return;
+  if (pending) {
+    await retireReplyCardDisplay(ds, { ...msg, preserveCot: true,
+      message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) }, send, ownsDisplay);
+  } else {
+    await settleTurnReplyCardTerminal(ds, terminal, send, ownsDisplay);
+  }
 }
 
 function failRequiredReplyCotHolds(ds: DaemonSession): void {
@@ -24913,7 +24958,16 @@ function setupWorkerHandlers(
         }
       },
       rejected: record => {
-        if (record.reason !== INTERNAL_BRIDGE_FINAL_REJECTION || !authority()) return;
+        if (!authority()) return;
+        const { turnId, dispatchAttempt } = record.output;
+        const sink = record.sink;
+        if (sink.kind === 'im' && sink.answerRequired && ds.requiredReplyCotHolds?.has(requiredReplyCotHoldKey(turnId, dispatchAttempt))) {
+          const hasReply = !!new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
+            larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId, dispatchAttempt,
+          })?.messageId;
+          settleRequiredReplyCotMessage(ds, turnId, dispatchAttempt, hasReply ? 'completed' : 'failed');
+        }
+        if (record.reason !== INTERNAL_BRIDGE_FINAL_REJECTION) return;
         // This only clears the producer retry. The durable rejection remains
         // visible and never enters the delivered or DONE paths.
         try {
@@ -29442,7 +29496,7 @@ function setupWorkerHandlers(
           const waitingForReply = requiresReply && msg.status === 'completed' && !answered() && !emptyRequiredReply;
           const cardTerminal = emptyRequiredReply && !answered() ? { ...msg, status: 'failed' as const } : msg;
           const settleCard = waitingForReply
-            ? retireReplyCardDisplay(ds, { ...msg, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
+            ? retireReplyCardDisplay(ds, { ...msg, preserveCot: true, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
               replyCardSend, ownsLifecycleMutation)
             : settleTurnReplyCardTerminal(ds, cardTerminal, replyCardSend, ownsLifecycleMutation);
           void settleCard
@@ -31440,13 +31494,20 @@ function setupWorkerHandlers(
     if (admission.kind === 'historical' && msg.type === 'turn_terminal' && !msg.continuationFailure) {
       const ownsDisplay = () => ownsWorkerSession() && !isSessionTransferring(ds);
       const turnId = msg.turnId;
-      if (ownsDisplay() && !isReplayOfHeldCotTerminal(ds, msg)) {
-        finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
-      }
-      if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
-        await settleTurnReplyCardTerminal(ds, msg,
-          (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsDisplay)
+      const send: Parameters<typeof settleTurnReplyCardTerminal>[2] =
+        (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite });
+      const suppressCard = managedAuxUiSuppressed(turnId, msg.dispatchAttempt);
+      if (journal) {
+        await settleHistoricalTurnDisplay(ds, msg, journal, send, ownsDisplay, suppressCard)
           .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
+      } else {
+        if (ownsDisplay() && !isReplayOfHeldCotTerminal(ds, msg)) {
+          finalizeCotMessage(ds, turnId, msg.status, msg.dispatchAttempt);
+        }
+        if (!suppressCard) {
+          await settleTurnReplyCardTerminal(ds, msg, send, ownsDisplay)
+            .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
+        }
       }
     }
     let physicalExitClaimOwner: string | undefined;

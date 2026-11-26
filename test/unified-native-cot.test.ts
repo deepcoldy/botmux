@@ -7,7 +7,7 @@ import { config } from '../src/config.js';
 import { getBot, getBotClient } from '../src/bot-registry.js';
 import { updateMessage, MessageWithdrawnError } from '../src/im/lark/client.js';
 import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnReplyCard, updateReplyCardNativeThinking, prepareReplyCardNativeThinking, retireReplyCardDisplay, supersedeTurnReplyCard, __testOnlyDrainTurnReplyTools } from '../src/core/turn-reply-card.js';
-import { abortCotMessage, handleCotThinkingSuperseded, handleCotThinkingUpdate, finalizeCotMessage } from '../src/im/lark/cot-message.js';
+import { abortCotMessage, handleCotThinkingSuperseded, handleCotThinkingUpdate, finalizeCotMessage, cotMessageFinishStatus } from '../src/im/lark/cot-message.js';
 import { TurnReplyCardStore, ReplyCardWithdrawnError } from '../src/services/turn-reply-card.js';
 import { deliverStructuredNotice, StructuredNoticeCardPendingError } from '../src/services/structured-notice-delivery.js';
 import { stageBridgeTurnNotice, readBridgeTurnJournal, acknowledgeBridgeTurnNotice } from '../src/services/bridge-turn-journal.js';
@@ -454,6 +454,17 @@ describe('unified replies with an independent native CoT channel', () => {
     await __testOnlyDrainTurnReplyTools();
     expect(send).not.toHaveBeenCalled();
     expect(new TurnReplyCardStore(dir).read(key)).toMatchObject({ phase: 'completed', displayRetired: true });
+  });
+
+  it.each(['legacy', 'unified'] as const)('keeps the %s CoT open while a final receipt is pending', async mode => {
+    bot.config.replyCardMode = mode;
+    bot.config.replyCardNativeCot = true;
+    if (mode === 'unified') await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    const turn = { turnId: 'om_turn' };
+    await retireReplyCardDisplay(ds, { ...turn, message: 'reply pending', preserveCot: true }, send, () => true);
+    expect(cotMessageFinishStatus(ds, turn)).toBeUndefined();
+    finalizeCotMessage(ds, turn.turnId, 'completed');
+    expect(cotMessageFinishStatus(ds, turn)).toBe('done');
   });
 
   it('replays the pending first POST through silent retirement and then patches the same card', async () => {
