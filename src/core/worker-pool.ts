@@ -1221,6 +1221,7 @@ import {
   parseScheduledTurnId,
   trustedCallerForScheduledTask,
 } from './scheduled-turn-provenance.js';
+import { admitScheduledInput } from './scheduled-input-admission.js';
 import { scheduledSessionRun } from './scheduled-send.js';
 import { inheritActiveTurnFinalSuppression, isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
@@ -1521,6 +1522,7 @@ export interface WorkerPoolCallbacks {
    *  scheduled turn runs as. Never backed by schedules.json (agent-writable
    *  inside a sandbox). Absent or undefined → the turn carries no identity. */
   loadScheduledTaskForIdentity?: (larkAppId: string, taskId: string) => ScheduledTask | undefined;
+  loadScheduledTaskForInput?: (larkAppId: string, taskId: string) => ScheduledTask | undefined;
   /** Connector-owned live card for a handoff whose exact input has started. */
   onTriggerTurnStarted?: (ds: DaemonSession, title: string, turnId: string) => void;
   /** Direct Web Terminal submission observed on this session (human intervention). */
@@ -19438,6 +19440,7 @@ export function sendWorkerInput(
   // while preserving PR #597's accepted-dispatch ledger + reply-context wiring.
   const message: Extract<DaemonToWorker, { type: 'message' }> = {
     type: 'message',
+    scheduledRun: scheduledSessionRun(ds.session, effectiveTurnId),
     content: normalized.content,
     ...(failedTurnRewind ? { failedTurnRewind } : {}),
     // A parked (crash-loop stopped) worker respawns the CLI from INSIDE the
@@ -22925,6 +22928,8 @@ function forkWorkerPrepared(
   }
   ds.protectedLoopbackProxyAttestation = protectedLoopbackProxyAttestation;
   initializeWorkerIpcBootstrap(worker);
+  initMsg.scheduledRun = scheduledSessionRun(ds.session, initMsg.turnId);
+  initMsg.scheduledRuns = ds.session.scheduledRuns;
   rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
   {
     const initCallerOpenId = turnCallerOpenIdFor(ds, initMsg.turnId);
@@ -25574,6 +25579,16 @@ function setupWorkerHandlers(
         // a later terminal GC once no live structure names it (and always on
         // teardown); a small retention lag beats a fail-closed 77 window.
         collectSessionTurnGarbage(ds);
+        break;
+      }
+      case 'admit_scheduled_input': {
+        let decision: import('./scheduled-input-admission.js').ScheduledInputAdmission = 'retain';
+        if (ds.worker === worker && ds.workerGeneration === workerGeneration
+          && ds.session.workerGeneration === workerGeneration) {
+          try { decision = admitScheduledInput(ds.session, ds.larkAppId, msg.turnId, callbacks?.loadScheduledTaskForInput); }
+          catch (error) { logger.warn(`[${t}] Scheduled input admission unavailable: ${String(error)}`); }
+        }
+        worker.send({ type: 'scheduled_input_admitted', requestId: msg.requestId, decision } satisfies DaemonToWorker);
         break;
       }
       case 'cancel_deployment_continuation': {
@@ -31531,7 +31546,7 @@ function setupWorkerHandlers(
     // Catalog maintenance precedes native spawn, so it cannot require an
     // executor binding. The private child channel, current worker generation,
     // account/config fingerprint and locked policy CAS authorize it instead.
-    if (msg.type === 'traex_model_pool_prune') return handleLegacyWorkerMessage(msg);
+    if (msg.type === 'traex_model_pool_prune' || msg.type === 'admit_scheduled_input') return handleLegacyWorkerMessage(msg);
     // V1 recovery authenticates its frozen offer/token in the existing host
     // store. It cannot acquire executor control from a new worker envelope.
     if (msg.type === 'final_output_offer') return handleLegacyWorkerMessage(msg);
@@ -34666,6 +34681,8 @@ export function forkAdoptWorker(
     const initCallerOpenId = turnCallerOpenIdFor(ds, 'turnId' in initMsg ? initMsg.turnId : undefined);
     if (initCallerOpenId) initMsg = { ...initMsg, turnCallerOpenId: initCallerOpenId };
   }
+  initMsg.scheduledRun = scheduledSessionRun(ds.session, initMsg.turnId);
+  initMsg.scheduledRuns = ds.session.scheduledRuns;
   // IPC handlers capture the contract at registration time, before the child
   // requests its first runtime reservation (including restored adopt sessions).
   ds.initConfig = initMsg;

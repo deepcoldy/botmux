@@ -25,6 +25,83 @@ function session(hidden = false): DaemonSession {
 const now = 100_000_000;
 
 describe('isSilentScheduledTurn', () => {
+  it.each(['scheduledRun', 'scheduledRuns'] as const)('retains exact silent policy after JSON restore using %s', field => {
+    const ds = session();
+    const silentRun = { taskId: 'shared', runId: 'silent', turnId: 'schedule:shared:silent', silent: true };
+    const loudRun = { taskId: 'shared', runId: 'loud', turnId: 'schedule:shared:loud', silent: false };
+    if (field === 'scheduledRun') {
+      ds.session.scheduledRun = silentRun;
+      ds.session.scheduledRuns = { [loudRun.turnId]: loudRun };
+    } else {
+      ds.session.scheduledRun = loudRun;
+      ds.session.scheduledRuns = { [silentRun.turnId]: silentRun };
+    }
+    armSilentScheduledTurn(ds, silentRun.turnId, now);
+    const restored = { session: JSON.parse(JSON.stringify(ds.session)) } as DaemonSession;
+
+    expect(restored.silentScheduledTurns).toBeUndefined();
+    expect(restored.silentScheduledTurnMeta).toBeUndefined();
+    expect(restored.latestSilentScheduledTurn).toBeUndefined();
+    expect(isSilentScheduledTurn(restored, silentRun.turnId, now)).toBe(true);
+    expect(isSilentScheduledTurn(restored, loudRun.turnId, now)).toBe(false);
+    expect(isSilentScheduledTurn(restored, 'schedule:shared:other', now)).toBe(false);
+    expect(isSilentScheduledTurn(restored, 'om_human', now)).toBe(false);
+    expect(isSilentScheduledTurn(restored, undefined, now)).toBe(false);
+  });
+
+  it('retains a persisted silent run after its runtime marker expires', () => {
+    const ds = session();
+    const turnId = 'schedule:shared:expired';
+    ds.session.scheduledRun = { taskId: 'shared', runId: 'expired', turnId, silent: true };
+    armSilentScheduledTurn(ds, turnId, 0);
+    armSilentScheduledTurn(ds, 'schedule:shared:next', now);
+
+    expect(ds.silentScheduledTurns?.has(turnId)).toBe(false);
+    expect(isSilentScheduledTurn(ds, turnId, now)).toBe(true);
+    expect(isSilentScheduledTurn(ds, 'om_human', now)).toBe(false);
+  });
+
+  it('retains an older persisted silent run after more than 256 runtime markers', () => {
+    const ds = session();
+    const turnId = 'schedule:shared:old';
+    ds.session.scheduledRuns = { [turnId]: { taskId: 'shared', runId: 'old', turnId, silent: true } };
+    ds.session.scheduledRun = { taskId: 'shared', runId: 'loud', turnId: 'schedule:shared:loud', silent: false };
+    armSilentScheduledTurn(ds, turnId, now);
+    for (let i = 0; i < 300; i += 1) armSilentScheduledTurn(ds, `schedule:shared:${i}`, now);
+
+    expect(ds.silentScheduledTurns?.has(turnId)).toBe(false);
+    expect(isSilentScheduledTurn(ds, turnId, now)).toBe(true);
+    expect(isSilentScheduledTurn(ds, 'schedule:shared:loud', now)).toBe(false);
+    expect(isSilentScheduledTurn(ds, 'om_human', now)).toBe(false);
+  });
+
+  it.each([false, true])('keeps persisted loud policy non-silent despite stale runtime/deferred state, hidden=%s', hidden => {
+    const ds = session(hidden);
+    const turnId = hidden ? 'schedule:hidden:run' : 'schedule:shared:loud';
+    ds.session.scheduledRun = { taskId: hidden ? 'hidden' : 'shared', runId: 'loud', turnId, silent: false };
+    armSilentScheduledTurn(ds, turnId, now);
+
+    expect(isSilentScheduledTurn(ds, turnId, now)).toBe(false);
+  });
+
+  it('does not inherit persisted silence from a mismatched run stored under another turn', () => {
+    const ds = session();
+    ds.session.scheduledRuns = {
+      om_human: { taskId: 'shared', runId: 'silent', turnId: 'schedule:shared:silent', silent: true },
+    };
+    expect(isSilentScheduledTurn(ds, 'om_human', now)).toBe(false);
+  });
+
+  it('preserves runtime silence and expiry for legacy persisted runs without a policy', () => {
+    const ds = session();
+    const turnId = 'schedule:shared:legacy';
+    ds.session.scheduledRun = { taskId: 'shared', runId: 'legacy', turnId };
+    expect(isSilentScheduledTurn(ds, turnId, 0)).toBe(false);
+    armSilentScheduledTurn(ds, turnId, 0);
+    expect(isSilentScheduledTurn(ds, turnId, 0)).toBe(true);
+    expect(isSilentScheduledTurn(ds, turnId, now)).toBe(false);
+  });
+
   it.each([undefined, 'schedule:hidden:run'])('keeps a dedicated deferred run silent without a registry, turn=%s', turnId => {
     expect(isSilentScheduledTurn(session(true), turnId, now)).toBe(true);
   });

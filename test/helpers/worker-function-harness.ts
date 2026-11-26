@@ -20,6 +20,9 @@ import { awaySummaryFocusRefusal } from '../../src/services/away-summary-focus.j
 import { paneReplyDeliveryFromProcessTree } from '../../src/services/pane-reply-delivery.js';
 import { createUsageLimitTracker } from '../../src/utils/usage-limit-tracker.js';
 import { REPLY_DELIVERY_ENV } from '../../src/services/send-completion-hint.js';
+import { automaticScheduledInputTask, coalesceAutomaticScheduledInputs } from '../../src/utils/pending-input-queue.js';
+import { parseScheduledTurnId } from '../../src/core/scheduled-turn-provenance.js';
+import { removeTakenUnsentInputs } from '../../src/services/unsent-input-journal.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, watch as fsWatch } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -247,6 +250,14 @@ function transpiledWorkerFunction(name: string): string {
  * `undefined` for keys this does not own so callers keep their own fallbacks.
  */
 function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | symbol): unknown {
+  if (key === 'automaticScheduledInputTask') return automaticScheduledInputTask;
+  if (key === 'coalesceAutomaticScheduledInputs') return coalesceAutomaticScheduledInputs;
+  if (key === 'parseScheduledTurnId') return parseScheduledTurnId;
+  if (key === 'removeTakenUnsentInputs') return removeTakenUnsentInputs;
+  if (key === 'pendingAdoptMessages') return (scope.pendingAdoptMessages ??= []);
+  if (key === 'restoredUnsentInputs') return (scope.restoredUnsentInputs ??= new Set());
+  if (key === 'scheduledInputReceipts') return (scope.scheduledInputReceipts ??= new Map());
+  if (['coalescePendingScheduledInputs', 'discardUnwrittenScheduledInput', 'discardScheduledBacklogForStop', 'requestScheduledInputAdmission', 'runScheduledCliInputWrite', 'unsentInputJournalPath'].includes(String(key))) return loadWorkerFunction(String(key), scope);
   if (key === 'inFlightKeepaliveFingerprints') {
     return (scope.inFlightKeepaliveFingerprints ??= new Map<string, number>());
   }

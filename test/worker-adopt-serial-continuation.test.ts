@@ -126,7 +126,7 @@ describe('adopted-pane serial continuation boundary', () => {
 
     expect(writeAdoptMessage).toHaveBeenCalledWith(
       'serial result', 'om_reply', undefined, undefined, undefined,
-      undefined, undefined, expect.anything(), true,
+      undefined, undefined, expect.anything(), true, undefined,
     );
   });
 

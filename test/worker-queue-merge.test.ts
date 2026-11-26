@@ -561,3 +561,54 @@ it('keeps collaborative messages separate even from the same sender', () => {
     expect(tail.turnId).toBe('a');
   }
 });
+
+describe('automatic schedule enqueue coalescing', () => {
+  const caller = { requestUserOpenId: 'ou_owner', requestLarkAppId: 'app', senderType: 'user' as const, source: 'schedule_creator' as const };
+  const item = (n: number, trigger: 'scheduler' | 'dashboard' = 'scheduler', taskId = 'a1b2c3d4') => {
+    const turnId = `schedule:${taskId}:${n.toString(16).padStart(8, '0')}-1234-1234-1234-123456789abc`;
+    return { turnId, content: `complete envelope ${n}`, queueAfterActiveTurn: true as const,
+      trustedCaller: { ...caller, taskId }, replyTurnId: `reply-${n}`,
+      scheduledRun: { taskId, runId: `run-${n}`, turnId, trigger } };
+  };
+  const sender = (scope: Record<string, any>) => loadWorkerFunction<any>('sendToPty', {
+    rememberTurnLinkRefMode: () => {}, inputForcesSerialTurn, activeTurnAuthority: new ActiveTurnAuthority(),
+    traexAutoModelRuntimeEligible: () => false, log: () => {}, ...scope,
+  });
+
+  it.each(['materializing', 'restarting', 'busy'])('keeps only the newest whole envelope while %s', stage => {
+    const pendingMessages: any[] = [];
+    const rejected: any[] = [];
+    const scope = { pendingMessages, send: (msg: any) => rejected.push(msg),
+      initPromptMaterialized: stage !== 'materializing', cliRestartInProgress: stage === 'restarting',
+      backend: {}, cliAdapter: { mergeQueuedInput: true },
+      freshnessInputQueue: { enqueueNormal: (next: any) => pendingMessages.push(next) },
+      runtimePtyInputPolicy: () => ({ supportsTypeAhead: false }), pendingInputAllowsTypeAhead,
+      activeTurnBlocks: () => false, directRpcTurnBlocksTypeAhead: () => false, programStatusBlockedHoldsTypeAhead: () => false,
+      shouldWriteNow: () => false, shouldHoldCodexRunnerInput: () => false, cliName: () => 'codex',
+      scheduleBusyPatternIdleProbe: () => {}, sessionRenameInFlight: () => false,
+      flushPending: () => {}, hasStructuredLifecycleBlock: () => false,
+      mergeQueuedCliInput, preemptActiveTurnForNewMessage: () => false,
+    };
+    const sendToPty = sender(scope);
+    const old = item(1); const latest = item(2);
+    sendToPty(old.content, old.turnId, old);
+    sendToPty(latest.content, latest.turnId, latest);
+    expect(pendingMessages).toHaveLength(1);
+    expect(pendingMessages[0]).toMatchObject(latest);
+    expect(pendingMessages[0].content).toBe(latest.content);
+    expect(rejected).toEqual([expect.objectContaining({ type: 'turn_input_rejected', turnId: old.turnId })]);
+  });
+
+  it('preserves ordinary messages, dashboard/manual turns, other tasks and recovery continuations', () => {
+    const pendingMessages: any[] = [];
+    const sendToPty = sender({ pendingMessages, initPromptMaterialized: false, send: vi.fn() });
+    const old = item(1); const manual = item(2, 'dashboard'); const other = item(3, 'scheduler', 'bbbbbbbb');
+    const recovery = { ...item(4), trustedCaller: { ...caller, source: 'failed_turn_recovery' as const } };
+    sendToPty(old.content, old.turnId, old);
+    sendToPty('human message', 'om_human');
+    const unknownManual = { ...item(6), scheduledRun: { ...item(6).scheduledRun, trigger: undefined } };
+    for (const next of [manual, other, recovery, unknownManual, item(5)]) sendToPty(next.content, next.turnId, next);
+    expect(pendingMessages.map(x => x.turnId)).toEqual(['om_human', manual.turnId, other.turnId, recovery.turnId, unknownManual.turnId, item(5).turnId]);
+    expect(pendingMessages.map(x => x.content)).toEqual(['human message', manual.content, other.content, recovery.content, unknownManual.content, item(5).content]);
+  });
+});

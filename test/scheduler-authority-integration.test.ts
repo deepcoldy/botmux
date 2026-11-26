@@ -1,5 +1,9 @@
+import { loadWorkerPoolClosure } from './helpers/worker-pool-function-harness.js';
+import { admitScheduledInput } from '../src/core/scheduled-input-admission.js';
+import { readScheduledTaskFromAuthority } from '../src/core/scheduled-turn-provenance.js';
+import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
@@ -482,5 +486,95 @@ describe('scheduler host authority integration', () => {
       name: 'new', schedule: 'every 30m', prompt: 'new', workingDir: '/repo',
       chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'ownerless' },
     })).toThrow('schedule_authority_store_unavailable');
+  });
+});
+
+describe('pending schedule host input admission', () => {
+  const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+  function fixture(trigger: 'scheduler' | 'dashboard' = 'scheduler') {
+    const task = scheduler.addTask({ id: 'a1b2c3d4', name: 'check', schedule: 'every 30m', prompt: 'p', workingDir: '/repo',
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'ownerless' } });
+    const session = { sessionId: 's', chatId: task.chatId, larkAppId: APP, workerGeneration: 2,
+      scheduledRun: { taskId: task.id, runId: 'run-1', turnId, trigger } } as Session;
+    const record = store.getRecord(APP, task.id)!;
+    scheduler.updateRuntimeTaskState(task.id, { ...record.task, lastRunId: 'run-1' }, APP);
+    const admit = () => admitScheduledInput(session, APP, turnId, (app, id) => readScheduledTaskFromAuthority(store, app, id));
+    return { task, session, admit };
+  }
+
+  it('rejects done and manually paused inputs even when the agent-visible projection claims enabled', () => {
+    const { task, admit } = fixture(); expect(admit()).toBe('allow');
+    scheduler.setEnabled(task.id, false);
+    const projection = join(dataDir, '..', 'bots', APP, 'schedules.json');
+    mkdirSync(join(dataDir, '..', 'bots', APP), { recursive: true });
+    writeFileSync(projection, JSON.stringify({ [task.id]: { ...task, enabled: true } }));
+    expect(admit()).toBe('reject');
+  });
+
+  it('rejects superseded automatic inputs and preserves an admitted dashboard run behind a later tick', () => {
+    const { task, session, admit } = fixture();
+    const record = store.getRecord(APP, task.id)!;
+    scheduler.updateRuntimeTaskState(task.id, { ...record.task, lastRunId: 'newer-run' }, APP);
+    expect(admit()).toBe('reject');
+    session.scheduledRun!.trigger = 'dashboard'; expect(admit()).toBe('allow');
+  });
+
+  it('requires a paused manual permit bound to this exact run and turn, and rejects it after another manual pause', () => {
+    const { task, session, admit } = fixture('dashboard');
+    scheduler.setEnabled(task.id, false);
+    const record = store.getRecord(APP, task.id)!;
+    scheduler.updateRuntimeTaskState(task.id, { ...record.task, lastRunId: session.scheduledRun!.runId,
+      manualRunAuthorization: { runId: session.scheduledRun!.runId, turnIds: [turnId] } }, APP);
+    expect(admit()).toBe('allow');
+    scheduler.setEnabled(task.id, false); expect(admit()).toBe('reject');
+  });
+
+  it('permits exact auto-completed once and deadline closing runs, while done refuses pending input', () => {
+    const { task, admit } = fixture();
+    const record = store.getRecord(APP, task.id)!;
+    scheduler.updateRuntimeTaskState(task.id, { ...record.task, enabled: false, disabledReason: 'once_completed' }, APP);
+    expect(admit()).toBe('allow');
+    scheduler.updateRuntimeTaskState(task.id, { ...record.task, enabled: false, disabledReason: 'once_completed',
+      untilDone: { status: 'expired', attempts: 1, finalRunId: 'run-1' } }, APP);
+    expect(admit()).toBe('allow');
+    scheduler.updateRuntimeTaskState(task.id, { ...record.task, enabled: false, disabledReason: 'once_completed',
+      untilDone: { status: 'done', attempts: 1, finalRunId: 'run-1' } }, APP);
+    expect(admit()).toBe('reject');
+    scheduler.updateRuntimeTaskState(task.id, { ...record.task, enabled: true,
+      untilDone: { status: 'done', attempts: 1 } }, APP);
+    expect(admit()).toBe('reject');
+  });
+
+  it('authenticates the requesting worker generation and retains on unavailable host storage', () => {
+    const { session } = fixture(); const sent: any[] = [];
+    const worker = { send: (msg: any) => sent.push(msg) };
+    const ds: any = { session, larkAppId: APP, worker, workerGeneration: 2 };
+    const scope: any = { ds, worker, workerGeneration: 2, admitScheduledInput,
+      callbacks: { loadScheduledTaskForInput: (app: string, id: string) => readScheduledTaskFromAuthority(store, app, id) },
+      logger: { warn: vi.fn() }, t: 's' };
+    const receive = loadWorkerPoolMessageHandlers(['admit_scheduled_input'], scope);
+    scope.sessionController = { ingest: vi.fn(() => { throw new Error('unstarted execution must not require an origin'); }) };
+    scope.contractWorker = {};
+    scope.handleLegacyWorkerMessage = receive;
+    const receiveOuter = loadWorkerPoolClosure<any>('handleWorkerMessage', scope);
+    void receiveOuter({ type: 'admit_scheduled_input', turnId, requestId: 'before-runtime-start' });
+    expect(sent.pop()).toMatchObject({ requestId: 'before-runtime-start', decision: 'allow' });
+    expect(scope.sessionController.ingest).not.toHaveBeenCalled();
+    receive({ type: 'admit_scheduled_input', turnId, requestId: 'r1' });
+    expect(sent.pop()).toMatchObject({ requestId: 'r1', decision: 'allow' });
+    scope.workerGeneration = 1;
+    receive({ type: 'admit_scheduled_input', turnId, requestId: 'r2' });
+    expect(sent.pop()).toMatchObject({ requestId: 'r2', decision: 'retain' });
+    scope.workerGeneration = 2; scope.callbacks.loadScheduledTaskForInput = () => { throw new Error('store unavailable'); };
+    receive({ type: 'admit_scheduled_input', turnId, requestId: 'r3' });
+    expect(sent.pop()).toMatchObject({ requestId: 'r3', decision: 'retain' });
+    scope.callbacks.loadScheduledTaskForInput = () => undefined;
+    receive({ type: 'admit_scheduled_input', turnId, requestId: 'r4' });
+    expect(sent.pop()).toMatchObject({ requestId: 'r4', decision: 'reject' });
+  });
+
+  it('never admits a well-formed scheduled prefix without a daemon-owned exact run', () => {
+    const { session, admit } = fixture();
+    session.scheduledRun = undefined; expect(admit()).toBe('reject');
   });
 });

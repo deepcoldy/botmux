@@ -4,11 +4,14 @@ import type {
   TrustedCaller,
   VcMeetingImTurnOrigin,
 } from '../types.js';
+import { parseScheduledTurnId } from '../core/scheduled-turn-provenance.js';
+import type { Session } from '../types.js';
 import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
 import { isPersonActorTurnId } from '../core/workflow-event-turn.js';
 import type { LinkRefMode } from '../services/link-ref-types.js';
 
 export interface PendingCliInput {
+  scheduledRun?: Session['scheduledRun'];
   queueAfterActiveTurn?: true;
   content: string;
   /** Refreshed catalog parked for the TraeX RPC write edge; folded into
@@ -148,6 +151,35 @@ export function inputForcesSerialTurn(
     || !!activeCaller?.taskContinuation;
 }
 
+export function shouldDeferScheduledInitialPrompt(opts: { turnId?: string; adoptMode?: boolean }): boolean {
+  return !opts.adoptMode && !!(opts.turnId && parseScheduledTurnId(opts.turnId));
+}
+
+/** Parsing legacy ids permits queue cleanup only; host admission still authenticates every write. */
+export function automaticScheduledInputTask(item: PendingCliInput): string | undefined {
+  const taskId = item.turnId ? parseScheduledTurnId(item.turnId) : null;
+  if (!taskId || item.dispatchAttempt !== undefined || item.durablePrimaryInbox
+    || item.noReplay || item.taskContinuation || item.traexAutoModelRecovery
+    || item.traexAutoModelContinuation || item.queuedActivationToken
+    || item.vcMeetingImTurnOrigin || item.trustedCaller?.source === 'failed_turn_recovery') return undefined;
+  if (item.scheduledRun) return item.scheduledRun.trigger === 'scheduler'
+    && item.scheduledRun.taskId === taskId && item.scheduledRun.turnId === item.turnId ? taskId : undefined;
+  return item.queueAfterActiveTurn ? taskId : undefined;
+}
+
+export function coalesceAutomaticScheduledInputs(pending: PendingCliInput[]): PendingCliInput[] {
+  const seen = new Set<string>();
+  const dropped: PendingCliInput[] = [];
+  for (let index = pending.length - 1; index >= 0; index--) {
+    const item = pending[index]!;
+    const taskId = automaticScheduledInputTask(item);
+    if (!taskId) continue;
+    if (seen.has(taskId)) dropped.unshift(...pending.splice(index, 1));
+    else seen.add(taskId);
+  }
+  return dropped;
+}
+
 export function mergeQueuedCliInput(
   pending: PendingCliInput[],
   next: PendingCliInput,
@@ -159,7 +191,8 @@ export function mergeQueuedCliInput(
   // must likewise start its own turn). Structured Codex App turns also carry
   // per-message attribution/context, so concatenating only their visible text
   // would drop or mis-attach the sidecar.
-  if (tail.queueAfterActiveTurn || next.queueAfterActiveTurn
+  if (automaticScheduledInputTask(tail) || automaticScheduledInputTask(next)
+    || tail.queueAfterActiveTurn || next.queueAfterActiveTurn
     || tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.codexAppDispatchId || next.codexAppDispatchId
     || tail.traexAutoModelRecovery || next.traexAutoModelRecovery

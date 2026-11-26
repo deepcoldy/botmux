@@ -1,3 +1,4 @@
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +10,7 @@ import {
   saveUnsentInputs,
   settleTakenUnsentInputs,
   takeUnsentInputs,
+  removeTakenUnsentInputs,
 } from '../src/services/unsent-input-journal.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'unsent-input-'));
@@ -94,4 +96,27 @@ describe('unsent input journal', () => {
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(isUnsentInputReplayable({ content: '' })).toBe(false);
   });
+});
+
+it('compacts 341 legacy scheduled inputs at worker restore and never resurrects discarded inputs after another restart', () => {
+  const path = join(dir, 'restore341.unsent.json');
+  const taskId = 'a1b2c3d4';
+  const inputs = Array.from({ length: 341 }, (_, n) => ({
+    turnId: `schedule:${taskId}:${n.toString(16).padStart(8, '0')}-1234-1234-1234-123456789abc`,
+    content: `complete input envelope ${n}`, queueAfterActiveTurn: true as const,
+  }));
+  saveUnsentInputs(path, inputs);
+  const sent: any[] = [];
+  const pendingMessages: any[] = [];
+  const scope = { sessionId: 's', pendingMessages, restoredUnsentInputs: new Set(),
+    unsentInputJournalPath: () => path, takeUnsentInputs, removeTakenUnsentInputs,
+    settleTakenUnsentInputs, log: () => {}, send: (msg: any) => sent.push(msg), t: (x: string) => x,
+  };
+  const restored = loadWorkerFunction<any>('takeUnsentInputsFromPredecessor', scope)({ cliId: 'codex' });
+  expect(restored).toEqual([inputs[340]]);
+  expect(scope.restoredUnsentInputs.size).toBe(1);
+  expect(sent.filter(x => x.type === 'turn_input_rejected')).toHaveLength(340);
+  const afterCrash = takeUnsentInputs(path);
+  expect(afterCrash).toEqual({ inputs: [], expired: [], unconfirmed: [inputs[340]] });
+  expect(takeUnsentInputs(path)).toEqual({ inputs: [], expired: [], unconfirmed: [] });
 });
