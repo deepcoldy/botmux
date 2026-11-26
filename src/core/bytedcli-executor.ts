@@ -45,6 +45,29 @@ interface Waiter { request: BytedcliExecutionRequest; resolve: (release: () => v
 interface Entry { digest: string; tuple: string; sessionId: string; promise: Promise<BytedcliExecResponse>; settled: boolean;
   outputBytes: number; revalidate?: BytedcliCredentialLease['stillCurrent']; controller?: AbortController;
   identity?: BytedcliEffectiveIdentity; dispatched?: boolean }
+/** Response cancellation and underlying resource settlement are separate.
+ * Keep quota and lifecycle ownership until every started provider has ended. */
+class OwnedBytedcliRequest {
+  readonly cleanup: Promise<void>;
+  private complete!: () => void;
+  private readonly pending = new Set<Promise<unknown>>();
+  constructor(readonly sessionId: string, readonly controller: AbortController, private readonly retired: () => void) {
+    this.cleanup = new Promise(resolve => { this.complete = resolve; });
+  }
+  track<T>(promise: Promise<T>): Promise<T> {
+    this.pending.add(promise);
+    void promise.then(() => this.pending.delete(promise), () => this.pending.delete(promise));
+    return promise;
+  }
+  finish(release: () => void): void {
+    void (async () => {
+      try {
+        while (this.pending.size) await Promise.allSettled([...this.pending]);
+        release();
+      } finally { this.retired(); this.complete(); }
+    })();
+  }
+}
 function errorCode(error: unknown): BytedcliExecErrorCode {
   const code = (error as { code?: unknown })?.code;
   return (BYTEDCLI_EXEC_ERROR_CODES as readonly unknown[]).includes(code) ? code as BytedcliExecErrorCode : 'internal_error';
@@ -87,6 +110,8 @@ export class BytedcliExecutor {
   private running = 0; private writes = 0; private outputBytes = 0;
   private admissions = 0; private duplicateWaiters = 0;
   private closed = false;
+  private readonly owners = new Set<OwnedBytedcliRequest>();
+  private readonly retiringSessions = new Set<string>();
   private readonly sessions = new Map<string, { reads: number; writes: number }>();
   private readonly waiters: Waiter[] = []; private readonly entries = new Map<string, Entry>();
   constructor(private readonly deps: BytedcliExecutorDependencies) {}
@@ -121,31 +146,44 @@ export class BytedcliExecutor {
       const entry: Entry = { digest, tuple, sessionId: authority.sessionId, promise: Promise.resolve(rejectResponse(request, 'internal_error')),
         settled: false, outputBytes: 0 };
       this.entries.set(key, entry);
-      entry.promise = this.executeOnce(request, digest, entry, deadline).finally(() => { entry.settled = true; });
+      entry.promise = this.executeOnce(request, digest, entry, deadline);
       return await entry.promise;
     } catch (error) { return rejectResponse(request, errorCode(error)); }
     finally { this.admissions--; }
   }
   private async check(request: BytedcliExecutionRequest): Promise<void> {
     if (this.closed) throw new BytedcliBrokerError('executor_unavailable');
+    if (this.retiringSessions.has(request.authority.sessionId)) throw new BytedcliBrokerError('execution_stale');
     if (request.signal?.aborted) throw new BytedcliBrokerError('cancelled');
     const code = await request.authority.recheck(); if (code) throw new BytedcliBrokerError(code);
     if (this.closed) throw new BytedcliBrokerError('executor_unavailable');
+    if (this.retiringSessions.has(request.authority.sessionId)) throw new BytedcliBrokerError('execution_stale');
     if (request.signal?.aborted) throw new BytedcliBrokerError('cancelled');
   }
   /** Called by host session teardown, after admission has stopped new calls. */
   async retireSession(sessionId: string): Promise<void> {
-    const retired = [...this.entries].filter(([, entry]) => entry.sessionId === sessionId);
-    for (const [, entry] of retired) entry.controller?.abort();
-    await Promise.all(retired.map(([, entry]) => entry.promise));
-    for (const [key, entry] of retired) {
-      if (this.entries.get(key) === entry) { this.outputBytes -= entry.outputBytes; this.entries.delete(key); }
-    }
+    this.retiringSessions.add(sessionId);
+    try {
+      const retired = [...this.entries].filter(([, entry]) => entry.sessionId === sessionId);
+      const owners = [...this.owners].filter(owner => owner.sessionId === sessionId);
+      for (const owner of owners) owner.controller.abort();
+      await Promise.all([...owners.map(owner => owner.cleanup), ...retired.map(([, entry]) => entry.promise)]);
+      for (const [key, entry] of retired) {
+        if (this.entries.get(key) === entry) { this.outputBytes -= entry.outputBytes; this.entries.delete(key); }
+      }
+    } finally { this.retiringSessions.delete(sessionId); }
   }
   /** Daemon-owned lifecycle: cancel/reap requests and discard retained output. */
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all([...new Set([...this.entries.values()].map(entry => entry.sessionId))].map(id => this.retireSession(id)));
+    await Promise.all([...new Set([...this.entries.values()].map(entry => entry.sessionId)
+      .concat([...this.owners].map(owner => owner.sessionId)))].map(id => this.retireSession(id)));
+  }
+  private own(sessionId: string, controller: AbortController): OwnedBytedcliRequest {
+    const owner = new OwnedBytedcliRequest(sessionId, controller, () => this.owners.delete(owner));
+    this.owners.add(owner);
+    if (this.closed || this.retiringSessions.has(sessionId)) controller.abort();
+    return owner;
   }
   private abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
     if (!signal) return promise;
@@ -166,6 +204,7 @@ export class BytedcliExecutor {
     if (this.waiters.length + this.duplicateWaiters >= 64) return rejectResponse(request, 'busy');
     this.duplicateWaiters++; let counted = true; let release: (() => void) | undefined; let timedOut = false;
     const controller = new AbortController(); const abort = () => controller.abort();
+    const owner = this.own(request.authority.sessionId, controller);
     const timer = setTimeout(() => { timedOut = true; controller.abort(); }, Math.max(0, deadline - Date.now()));
     request.signal?.addEventListener('abort', abort, { once: true }); if (request.signal?.aborted) abort();
     const active = { ...request, signal: controller.signal };
@@ -174,19 +213,20 @@ export class BytedcliExecutor {
       this.duplicateWaiters--; counted = false;
       // Result source verification can itself touch the provider. Give it the
       // same quota/deadline as a fresh request, without re-dispatching business.
-      release = await this.acquire(active); await this.abortable(this.check(active), controller.signal);
+      release = await this.acquire(active); await this.abortable(owner.track(this.check(active)), controller.signal);
       if (entry.revalidate) {
-        const current = await this.abortable(entry.revalidate(controller.signal), controller.signal);
+        const current = await this.abortable(owner.track(entry.revalidate(controller.signal)), controller.signal);
         if (current) throw new BytedcliBrokerError(current);
       }
-      await this.abortable(this.check(active), controller.signal);
+      await this.abortable(owner.track(this.check(active)), controller.signal);
       return result;
     } catch (error) {
       return rejectResponse(request, timedOut ? 'timeout' : errorCode(error), entry.identity ?? { kind: 'none' },
         !!entry.dispatched && request.operation.effect === 'write');
     } finally {
-      if (counted) this.duplicateWaiters--; release?.(); clearTimeout(timer);
+      if (counted) this.duplicateWaiters--; clearTimeout(timer);
       request.signal?.removeEventListener('abort', abort);
+      owner.finish(() => release?.());
     }
   }
   private fits(request: BytedcliExecutionRequest): boolean {
@@ -225,6 +265,8 @@ export class BytedcliExecutor {
   }
   private async executeOnce(request: BytedcliExecutionRequest, digest: string, entry: Entry, deadline: number): Promise<BytedcliExecResponse> {
     const controller = new AbortController(); let timeout = false; let dispatched = false;
+    const owner = this.own(request.authority.sessionId, controller);
+    void owner.cleanup.then(() => { entry.settled = true; });
     entry.controller = controller;
     const abort = () => controller.abort(); request.signal?.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(() => { timeout = true; controller.abort(); }, Math.max(0, deadline - Date.now()));
@@ -232,7 +274,7 @@ export class BytedcliExecutor {
     let release: (() => void) | undefined; let root: string | undefined; let lease: BytedcliCredentialLease | undefined;
     let identity: BytedcliEffectiveIdentity = { kind: 'none' }; let auditBase: Omit<BytedcliAuditRecord, 'phase'> | undefined;
     let heldOutput = 0; const started = Date.now();
-    const bounded = <T>(promise: Promise<T>) => this.abortable(promise, controller.signal);
+    const bounded = <T>(promise: Promise<T>) => this.abortable(owner.track(promise), controller.signal);
     try {
       if (request.signal?.aborted) controller.abort();
       release = await this.acquire(active); await bounded(this.check(active));
@@ -323,9 +365,11 @@ export class BytedcliExecutor {
       return response;
     } finally {
       controller.abort(); clearTimeout(timer); request.signal?.removeEventListener('abort', abort);
-      this.outputBytes -= heldOutput;
-      if (root) { try { rmSync(root, { recursive: true, force: true }); } catch { /* private root remains inaccessible to Agent */ } }
-      release?.();
+      owner.finish(() => {
+        this.outputBytes -= heldOutput;
+        if (root) { try { rmSync(root, { recursive: true, force: true }); } catch { /* private root remains inaccessible to Agent */ } }
+        release?.();
+      });
     }
   }
 }

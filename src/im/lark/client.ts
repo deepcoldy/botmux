@@ -664,12 +664,13 @@ export async function removeReaction(larkAppId: string, messageId: string, react
 export async function resolveUnionIdFromOpenId(
   larkAppId: string,
   openId: string,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   const c = getBotClient(larkAppId);
   try {
     const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
       user_id_type: 'open_id',
-    });
+    }, signal ? { signal } : undefined);
     if (res?.code !== 0) {
       logger.debug(`[union_id] resolve failed for ${openId.substring(0, 12)}: code=${res?.code} msg=${res?.msg ?? ''}`);
       return null;

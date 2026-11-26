@@ -226,7 +226,7 @@ export async function createBytedcliHostCredentialResolver(options: BytedcliHost
     platform: { bindingKey: platform.activePlatformCredentialBindingKey, resolve: async request => {
       if (!request.actor || !request.botAppId || !request.sessionId) throw new BytedcliBrokerError('execution_unverified');
       const result = await platform.resolvePlatformIdentity({ botConfig: { larkAppId: request.botAppId }, tool: 'bytedcli',
-        sessionId: request.sessionId, turnId: request.identityTurnId, cloudJwtRegions: ['cn'],
+        sessionId: request.sessionId, turnId: request.identityTurnId, cloudJwtRegions: ['cn'], signal: request.signal,
         ...(request.actor.unionId ? { unionId: request.actor.unionId } : { openId: request.actor.credentialOpenId }) });
       if (result.state === 'denied') throw new BytedcliBrokerError('permission_denied');
       if (result.state !== 'granted' || result.identity.tool !== 'bytedcli') return undefined;

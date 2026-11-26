@@ -22,22 +22,19 @@ export function ensureBytedcliPrivateDirectory(path: string, sync: (fd: number) 
   const ancestors: string[] = []; let cursor = path;
   while (cursor !== parse(cursor).root) { ancestors.unshift(cursor); cursor = dirname(cursor); }
   for (const dir of ancestors) {
-    let created = false;
     try { lstatSync(dir); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      try { mkdirSync(dir, { mode: 0o700 }); created = true; } catch (mkdirError) {
+      try { mkdirSync(dir, { mode: 0o700 }); } catch (mkdirError) {
         if ((mkdirError as NodeJS.ErrnoException).code !== 'EEXIST') throw mkdirError;
       }
     }
     const stat = lstatSync(dir);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('unsafe_private_root');
-    if (created) {
-      // Fsyncing the final audit directory alone does not persist its entry in
-      // a newly created parent. Each mkdir must make that parent entry durable.
-      for (const path of [dir, dirname(dir)]) {
-        const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-        try { sync(fd); } finally { closeSync(fd); }
-      }
+    // Existence is not proof that a previous mkdir's parent fsync succeeded.
+    // Repeat the complete barrier on retry and after daemon reconstruction.
+    for (const path of [dir, dirname(dir)]) {
+      const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try { sync(fd); } finally { closeSync(fd); }
     }
   }
   const stat = lstatSync(path);

@@ -66,7 +66,7 @@ describe('production host credential assembly through fake SDK only', () => {
       actor: { ...s.request.actor, source: 'platform', unionId: 'on_delegated_person' } });
     expect(lease.source).toBe('platform'); expect(lease.jwt).toBe(s.jwt);
     expect(platform.calls).toEqual([{ botConfig: { larkAppId: 'app' }, tool: 'bytedcli', sessionId: 'session',
-      turnId: 'frozen-identity-turn', cloudJwtRegions: ['cn'], unionId: 'on_delegated_person' }]);
+      turnId: 'frozen-identity-turn', cloudJwtRegions: ['cn'], unionId: 'on_delegated_person', signal: s.request.signal }]);
     expect(s.calls).toHaveLength(1); expect(s.calls[0].argv).toContain('userinfo');
   });
   it('returns missing personal auth without probing either local or machine credentials when platform refuses', async () => {

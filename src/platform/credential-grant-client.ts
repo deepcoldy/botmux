@@ -78,6 +78,8 @@ export interface CredentialGrantClientOptions {
   /** Hard cap across the first attempt and its one retry (default {@link TOTAL_BUDGET_MS}). */
   totalBudgetMs?: number;
   http?: { post: typeof postJson };
+  /** Strict broker requests own transport cleanup until this operation ends. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -215,11 +217,14 @@ function classify(status: number, json: unknown, platformUrl: string): Credentia
   return { ok: false, reason: 'client', status, error: error || `http_${status}` };
 }
 
-/** Settle no later than `ms`, whatever the transport underneath does, and
+/** Legacy calls settle no later than `ms`, whatever the transport does, and
  *  abort the request then. The socket's own timeout is an IDLE timeout: a peer
  *  that trickles bytes never trips it, and without the abort the retry would
- *  leave the first request still running against the platform. */
-export function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+ *  leave the first request still running against the platform. A supplied
+ *  parentSignal opts into broker resource ownership: abort at the deadline,
+ *  then settle only when transport cleanup ends. */
+export function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number, parentSignal?: AbortSignal): Promise<T> {
+  if (parentSignal) return withOwnedTimeout(run, ms, parentSignal);
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
@@ -242,6 +247,23 @@ export function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms:
   return Promise.race([started, timeout]).finally(() => clearTimeout(timer));
 }
 
+/** The broker response has its own deadline. This promise represents actual
+ * transport ownership, so cancellation cannot release its slot before cleanup. */
+async function withOwnedTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number, parentSignal: AbortSignal): Promise<T> {
+  const controller = new AbortController(); let failure: Error | undefined;
+  const abort = () => { failure ??= new Error('请求已中止'); controller.abort(); };
+  parentSignal.addEventListener('abort', abort, { once: true }); if (parentSignal.aborted) abort();
+  const timer = setTimeout(() => { failure ??= new Error(`连接超时（${ms}ms）`); controller.abort(); }, ms);
+  try {
+    if (failure) throw failure;
+    const result = await Promise.resolve().then(() => {
+      if (failure) throw failure; return run(controller.signal);
+    });
+    if (failure) throw failure;
+    return result;
+  } finally { clearTimeout(timer); parentSignal.removeEventListener('abort', abort); }
+}
+
 /**
  * Ask the platform for this turn's credentials. Never throws.
  */
@@ -262,6 +284,7 @@ async function requestCredentialGrantInner(
   req: CredentialGrantRequest,
   opts: CredentialGrantClientOptions,
 ): Promise<CredentialGrantResult> {
+  if (opts.signal?.aborted) return { ok: false, reason: 'network', error: '请求已中止' };
   const binding = resolveBinding(opts);
   if (!binding) return { ok: false, reason: 'unbound' };
   if (!UNION_ID_RE.test(req.unionId)) {
@@ -292,6 +315,7 @@ async function requestCredentialGrantInner(
   let status = 0;
   let json: unknown;
   for (let attempt = 0; ; attempt++) {
+    if (opts.signal?.aborted) return { ok: false, reason: 'network', error: '请求已中止' };
     const remaining = deadline - Date.now();
     // The retry gets the rest of the budget: it often starts a mint over on
     // another instance, and capping it at another first attempt would leave
@@ -309,13 +333,13 @@ async function requestCredentialGrantInner(
         timeoutMs,
         freshConnection: true,
         signal,
-      }), timeoutMs);
+      }), timeoutMs, opts.signal);
       status = r.status;
       json = r.json;
       break;
     } catch (e) {
       const error = e instanceof Error ? e.message : String(e);
-      if (attempt === 0 && deadline - Date.now() >= MIN_RETRY_BUDGET_MS) continue;
+      if (!opts.signal?.aborted && attempt === 0 && deadline - Date.now() >= MIN_RETRY_BUDGET_MS) continue;
       return { ok: false, reason: 'network', error: attempt > 0 ? `${error} (after retry)` : error };
     }
   }

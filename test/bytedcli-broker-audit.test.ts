@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { fsyncSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { existsSync, fsyncSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BytedcliBrokerAudit } from '../src/core/bytedcli-broker-audit.js';
@@ -29,11 +29,27 @@ describe('private durable broker audit', () => {
     expect(() => statSync(join(other, 'target'))).toThrow();
   });
   it.skipIf(process.platform !== 'linux')('requires a newly created audit directory entry to survive parent fsync before accepting intent', async () => {
-    const parent = root();
+    const parent = root(); const path = join(parent, 'new-audit');
     const sync = (fd: number) => {
-      if (readlinkSync('/proc/self/fd/' + fd) === parent) throw new Error('parent fsync failed');
+      if (readlinkSync('/proc/self/fd/' + fd) === parent && existsSync(path)) throw new Error('parent fsync failed');
       fsyncSync(fd);
     };
-    await expect(new BytedcliBrokerAudit(join(parent, 'new-audit'), sync).append(record)).rejects.toThrow('parent fsync failed');
+    await expect(new BytedcliBrokerAudit(path, sync).append(record)).rejects.toThrow('parent fsync failed');
+    expect(existsSync(path)).toBe(true);
+  });
+  it.skipIf(process.platform !== 'linux').each([false, true])('retries an incomplete parent barrier before accepting intent, recreated=%s', async recreated => {
+    const parent = root(); const path = join(parent, 'new-parent', 'audit'); let failing = true; const synced: string[] = [];
+    const sync = (fd: number) => {
+      const target = readlinkSync('/proc/self/fd/' + fd); synced.push(target);
+      if (target === parent && existsSync(join(parent, 'new-parent')) && failing) throw new Error('parent fsync failed'); fsyncSync(fd);
+    };
+    let audit = new BytedcliBrokerAudit(path, sync);
+    await expect(audit.append(record)).rejects.toThrow('parent fsync failed');
+    expect(existsSync(join(parent, 'new-parent'))).toBe(true);
+    if (recreated) audit = new BytedcliBrokerAudit(path, sync);
+    await expect(audit.append(record)).rejects.toThrow('parent fsync failed');
+    failing = false; synced.length = 0; await audit.append(record);
+    expect(synced).toContain(parent);
+    expect(readFileSync(join(path, 'audit.jsonl'), 'utf8').trim().split('\n')).toHaveLength(1);
   });
 });
