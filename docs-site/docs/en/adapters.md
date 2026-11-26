@@ -386,7 +386,7 @@ MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 
 Install and configure the local `nca` CLI under the account running the BotMux daemon and confirm it can answer a prompt. Then choose NCA in Setup or set `cliId: "nca"`. PTY and tmux sessions have been tested with NCA 3.0.20.
 
-Set `model` to an ID accepted by NCA's native `/model` command. To customize the session directory, set `NCA_DATA_HOME` in the BotMux daemon environment or pass an absolute path such as `--home /path/to/harness` in `CLI_EXTRA_ARGS`. BotMux binds the native thread by matching its submitted messages. After running `/new` in the writable terminal, send a message from Lark to bind the new thread before closing or resuming the session.
+Set `model` to an ID accepted by NCA's native `/model` command. To customize the session directory, set `NCA_DATA_HOME` in the BotMux daemon environment or pass an absolute path such as `--home /path/to/harness` in `CLI_EXTRA_ARGS`. Directory semantics match native NCA: `NCA_DATA_HOME=X` uses `X/harness`, while `--home X` uses `X` directly. The file sandbox binds the native user-data root (`~/.nca` by default, or the directory selected by `NCA_DATA_HOME`) plus any additional `--home` harness directory to the host, preserving login state and history while keeping transcripts visible to the bridge. BotMux binds the native thread by matching its submitted messages. After running `/new` in the writable terminal, send a message from Lark to bind the new thread before closing or resuming the session.
 
 ### Doubao CLI
 

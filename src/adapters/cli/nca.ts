@@ -1,8 +1,8 @@
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { shellQuote } from '../../core/cli-launch-mode.js';
-import { getChildPids } from '../../core/session-discovery.js';
+import { snapshotChildPids } from '../../core/session-discovery.js';
 import { drainNcaTranscript } from '../../services/nca-transcript.js';
 import { listProcessOpenFiles } from '../../utils/process-open-files.js';
 import { delay } from '../../utils/timing.js';
@@ -23,22 +23,111 @@ function ncaHomeArg(args: readonly string[] = (process.env.CLI_EXTRA_ARGS ?? '')
   return undefined;
 }
 
-function configuredNcaHome(): string | undefined {
+/** NCA_DATA_HOME is NCA's user-data root; the native harness lives one level
+ *  below it. In contrast, --home points DIRECTLY at the harness root. */
+function configuredNcaDataHome(): string | undefined {
   const home = process.env.NCA_DATA_HOME?.trim();
   return home ? resolve(home) : undefined;
+}
+
+function configuredNcaHarnessHome(): string | undefined {
+  const home = configuredNcaDataHome();
+  return home ? join(home, 'harness') : undefined;
+}
+
+function ncaHarnessHome(args?: readonly string[]): string {
+  return ncaHomeArg(args) ?? configuredNcaHarnessHome() ?? join(homedir(), '.nca', 'harness');
+}
+
+function pathIsWithin(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function canonicalExisting(path: string): string {
+  try { return realpathSync(path); } catch { return path; }
+}
+
+function ncaAuthPaths(): readonly string[] {
+  const dataHome = configuredNcaDataHome();
+  const userHome = canonicalExisting(dataHome ?? join(homedir(), '.nca'));
+  const paths: string[] = dataHome ? [userHome] : ['~/.nca'];
+  const harness = canonicalExisting(ncaHarnessHome());
+  // The native user-data root contains auth/config/plugins; the default
+  // harness/history lives there too. An explicit --home carries its own
+  // history and needs a separate bind outside that root. Never bind a
+  // filesystem root, including one reached through a symlink.
+  if (isAbsolute(harness) && dirname(harness) !== harness && !pathIsWithin(userHome, harness)) paths.push(harness);
+  return paths.filter(path => !isAbsolute(path) || dirname(path) !== path);
+}
+
+interface NcaInstallLayout {
+  readonlyRoots: readonly string[];
+  executables: readonly string[];
+}
+
+function ncaPackageName(packageRoot: string): string | undefined {
+  try {
+    const name = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')).name;
+    return typeof name === 'string' ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resolve the files the npm launcher and its owned native host need inside a
+ *  fresh-root file sandbox. Refuse unrecognized single-file/wrapper layouts
+ *  instead of exposing their parent directories. The launcher scope preserves
+ *  pnpm's sibling-package symlink; the native realpath is exposed separately
+ *  when it lives outside that scope. */
+function ncaInstallLayout(bin: string): NcaInstallLayout {
+  const canonical = realpathSync(bin);
+  const packageRoot = dirname(dirname(canonical));
+  const platformPackage = process.platform === 'linux' && process.arch === 'x64'
+    ? 'nca-linux-x64'
+    : process.platform === 'darwin' && process.arch === 'arm64'
+      ? 'nca-darwin-arm64'
+      : undefined;
+  if (basename(canonical) !== 'nca.cjs') {
+    if (!platformPackage || ncaPackageName(packageRoot) !== `@bytedance-dev/${platformPackage}`) {
+      throw new Error('NCA file sandbox requires the native NCA package; an unpackaged cliPathOverride is not supported');
+    }
+    return { readonlyRoots: [packageRoot], executables: [canonical] };
+  }
+  if (ncaPackageName(packageRoot) !== '@bytedance-dev/nca') {
+    throw new Error('NCA file sandbox requires the @bytedance-dev/nca npm launcher; an unpackaged cliPathOverride is not supported');
+  }
+  const launcherScope = dirname(packageRoot);
+  if (!platformPackage) return { readonlyRoots: [launcherScope], executables: [] };
+  const nativeRoot = realpathSync(join(packageRoot, '..', platformPackage));
+  if (ncaPackageName(nativeRoot) !== `@bytedance-dev/${platformPackage}`) {
+    throw new Error('NCA file sandbox requires matching NCA launcher and native packages');
+  }
+  const readonlyRoots = [launcherScope];
+  if (!pathIsWithin(launcherScope, nativeRoot)) readonlyRoots.push(nativeRoot);
+  const executables = ['nca', 'nca-next', 'nca-next-shell-supervisor', 'nca-next-browser-supervisor']
+    .map(name => join(nativeRoot, 'bin', name));
+  return { readonlyRoots, executables };
 }
 
 function isThreadId(id: string | undefined): id is string {
   return id !== undefined && THREAD_ID.test(id);
 }
 
-/** Find the writers owned by the NCA TUI's private host. The npm launcher
- *  adds a process layer before the TUI, so the host can be two hops away. */
+/** Find every writer in the NCA process tree. The npm launcher adds a layer,
+ *  while bwrap can add several more. /new can also leave an old writer open in
+ *  an ancestor, so never stop at the first depth that has a writer. Bound the
+ *  walk by process count rather than assuming a particular launch shape. */
 function findOwnedNcaTranscripts(pid: number): Array<{ id: string; path: string }> {
+  const owned = new Map<string, { id: string; path: string }>();
+  const visited = new Set<number>();
+  const childrenOf = snapshotChildPids();
   let pids = [pid];
-  for (let depth = 0; depth <= 2 && pids.length; depth++) {
-    const owned = new Map<string, { id: string; path: string }>();
+  while (pids.length && visited.size < 64) {
+    const children: number[] = [];
     for (const processId of pids) {
+      if (visited.has(processId) || visited.size >= 64) continue;
+      visited.add(processId);
       for (const file of listProcessOpenFiles(processId, { skipDeleted: true }) ?? []) {
         const id = WRITER_LOCK.exec(file)?.[1];
         if (isThreadId(id)) {
@@ -46,11 +135,11 @@ function findOwnedNcaTranscripts(pid: number): Array<{ id: string; path: string 
           owned.set(path, { id, path });
         }
       }
+      children.push(...childrenOf(processId));
     }
-    if (owned.size > 0) return [...owned.values()];
-    if (depth < 2) pids = pids.flatMap(getChildPids);
+    pids = children.filter(processId => !visited.has(processId));
   }
-  return [];
+  return [...owned.values()];
 }
 
 async function writeNcaInput(pty: PtyHandle, content: string): ReturnType<CliAdapter['writeInput']> {
@@ -102,7 +191,7 @@ export const ncaBridgeSpec: StructuredBridgeSpec = {
     bySessionId(id) {
       if (!isThreadId(id)) return undefined;
       // The npm TUI keeps the owned app server under ~/.nca/harness.
-      const home = ncaHomeArg() ?? configuredNcaHome() ?? join(homedir(), '.nca', 'harness');
+      const home = ncaHarnessHome();
       if (!isAbsolute(home)) return undefined;
       const path = join(home, 'v3', 'sessions', id, 'session.jsonl');
       return existsSync(path) ? path : undefined;
@@ -117,14 +206,23 @@ export const ncaBridgeSpec: StructuredBridgeSpec = {
 
 export function createNcaAdapter(pathOverride?: string): CliAdapter {
   let resolvedBin: string | undefined;
+  let installLayout: NcaInstallLayout | undefined;
+  const layout = () => (installLayout ??= ncaInstallLayout(resolvedBin ??= resolveCommand(pathOverride ?? 'nca')));
   return {
     id: 'nca',
     bridgeSpec: ncaBridgeSpec,
+    // turn-ended is a durable completed/failed/cancelled boundary. Drain it
+    // before exit/restart can claim an ambiguous terminal for the same turn.
+    reliableTurnTerminal: true,
     get resolvedBin() { return (resolvedBin ??= resolveCommand(pathOverride ?? 'nca')); },
+    get authPaths() { return ncaAuthPaths(); },
+    sandboxReadonlyPaths() { return layout().readonlyRoots; },
+    sandboxExtraExecPaths() { return layout().executables; },
 
     buildArgs({ resume, resumeSessionId, workingDir, model, extraArgs, env }) {
       const args = ['--server-target', 'owned'];
-      const home = configuredNcaHome();
+      const dataHome = configuredNcaDataHome();
+      const harnessHome = configuredNcaHarnessHome();
       const explicitHome = ncaHomeArg(extraArgs);
       if (explicitHome !== undefined && !isAbsolute(explicitHome)) {
         throw new Error('NCA --home must be an absolute path');
@@ -132,11 +230,17 @@ export function createNcaAdapter(pathOverride?: string): CliAdapter {
       // The bridge and the closed-session command run outside the NCA child.
       // A child-only home would make completed turns invisible to both.
       const childHome = env?.NCA_DATA_HOME?.trim();
-      if (!explicitHome && childHome && (!home || resolve(childHome) !== home)) {
-        throw new Error('Set NCA_DATA_HOME in the BotMux daemon environment or pass an absolute --home in CLI_EXTRA_ARGS');
+      if (childHome && (!dataHome || resolve(childHome) !== dataHome)) {
+        throw new Error('NCA_DATA_HOME must match the BotMux daemon environment (an absolute --home does not replace it)');
       }
-      // The worker appends CLI_EXTRA_ARGS to this argv.
-      if (home && explicitHome === undefined) args.push('--home', home);
+      // bwrap can only bind existing sources, and its generic authPaths
+      // pre-creation cannot tell a dotted DIRECTORY from a file. Create the
+      // actual native roots here so cold custom homes survive keepExisting.
+      mkdirSync(dataHome ?? join(homedir(), '.nca'), { recursive: true });
+      mkdirSync(explicitHome ?? harnessHome ?? join(homedir(), '.nca', 'harness'), { recursive: true });
+      // The worker appends CLI_EXTRA_ARGS to this argv. Pin the harness to the
+      // same <NCA_DATA_HOME>/harness root that native NCA would choose.
+      if (harnessHome && explicitHome === undefined) args.push('--home', harnessHome);
       if (workingDir) args.push('--cwd', workingDir);
       if (model) args.push('--model', model);
       if (resume && isThreadId(resumeSessionId)) {
@@ -149,9 +253,11 @@ export function createNcaAdapter(pathOverride?: string): CliAdapter {
     checkResumeTargetExists: ({ cliSessionId }) => isThreadId(cliSessionId) ? undefined : false,
     buildResumeCommand({ cliSessionId }) {
       if (!isThreadId(cliSessionId)) return null;
-      const home = ncaHomeArg() ?? configuredNcaHome();
+      const dataHome = configuredNcaDataHome();
+      const home = ncaHomeArg() ?? configuredNcaHarnessHome();
       if (home && !isAbsolute(home)) return null;
-      return `nca${home ? ` --home ${shellQuote(home)}` : ''} --resume ${cliSessionId}`;
+      const envPrefix = dataHome ? `NCA_DATA_HOME=${shellQuote(dataHome)} ` : '';
+      return `${envPrefix}nca${home ? ` --home ${shellQuote(home)}` : ''} --resume ${cliSessionId}`;
     },
 
     writeInput: writeNcaInput,

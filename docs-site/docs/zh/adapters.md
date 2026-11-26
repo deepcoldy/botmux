@@ -386,7 +386,7 @@ MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 
 先用运行 BotMux daemon 的同一账号安装和配置本地 `nca`，并确认它能正常回复，再在 Setup 选择 NCA 或设置 `cliId: "nca"`。已验证 NCA 3.0.20 的 PTY 和 tmux 会话。
 
-`model` 可填 NCA 原生 `/model` 可用的模型 ID。自定义会话目录时，将 `NCA_DATA_HOME` 配到 BotMux daemon 的环境，或在 `CLI_EXTRA_ARGS` 中传绝对路径 `--home /path/to/harness`。BotMux 会匹配它发送的消息和 NCA 会话记录。在可操作终端执行 `/new` 后，从飞书发一条消息来绑定新线程，再关闭或恢复该会话。
+`model` 可填 NCA 原生 `/model` 可用的模型 ID。自定义会话目录时，将 `NCA_DATA_HOME` 配到 BotMux daemon 的环境，或在 `CLI_EXTRA_ARGS` 中传绝对路径 `--home /path/to/harness`。目录语义与原生 NCA 一致：`NCA_DATA_HOME=X` 使用 `X/harness`，而 `--home X` 直接使用 `X`。文件沙盒会把原生用户数据根（默认 `~/.nca`，或 `NCA_DATA_HOME` 指定目录）以及额外的 `--home` harness 目录绑定到宿主，保证登录态和历史持久化，且桥接能读取会话记录。BotMux 会匹配它发送的消息和 NCA 会话记录。在可操作终端执行 `/new` 后，从飞书发一条消息来绑定新线程，再关闭或恢复该会话。
 
 ### Doubao CLI
 
