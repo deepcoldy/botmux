@@ -277,7 +277,7 @@ import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, cotMessageFinishStatus, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
 import { retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
-import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
+import { ReplyCardWithdrawnError, TurnReplyCardStore } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
 import { bindGroupContextWorkerGeneration, readGroupContextDeliveryBinding, hasPreparedGroupContext, type GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
 import { groupContextEpoch, commitGroupContextDispatchIntoPayload } from '../services/group-context-prompt.js';
@@ -1064,6 +1064,8 @@ import {
   type RecoveryNoticeHost,
   type TurnNoticeRecord,
 } from '../services/ordinary-recovery-notice.js';
+import { deliverStructuredNotice, StructuredNoticeCardPendingError } from '../services/structured-notice-delivery.js';
+import { isStructuredNoticeProtocolMessage } from '../services/structured-notice-protocol.js';
 import {
   attachReadonlyTaskContinuation,
   beginReadonlyTaskContinuationDelivery,
@@ -3570,6 +3572,30 @@ function enqueueContinuationFailureNotice(
     catch (error) { ds.session.turnNotices = previous; throw error; }
   }
   resumeTurnNotices(ds);
+}
+
+/** A persisted pending create/patch means the provider may already have applied
+ * the warning. Keep that exact card plan for replay instead of adding a text
+ * notice or ACKing away the worker's recovery owner. */
+async function retireStructuredNoticeCard(
+  ds: DaemonSession,
+  msg: { turnId: string; dispatchAttempt?: number; message: string; silent?: boolean },
+  send: Parameters<typeof retireReplyCardDisplay>[2],
+  owns: () => boolean,
+): Promise<boolean> {
+  try { return await retireReplyCardDisplay(ds, msg, send, owns); }
+  catch (error) {
+    const record = new TurnReplyCardStore(config.session.dataDir).read({
+      larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
+      turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+    });
+    if (!owns()) throw new Error('Reply-card turn no longer owns delivery');
+    if (error instanceof ReplyCardWithdrawnError || record?.withdrawn) return false;
+    if (record?.pendingCreate || record?.pendingPatch || record?.publishPending) {
+      throw new StructuredNoticeCardPendingError();
+    }
+    throw error;
+  }
 }
 
 /** Send a failure card / worker notice. When the send fails transiently (see
@@ -22485,6 +22511,7 @@ function forkWorkerPrepared(
     ...(initStatuslineLaunchGen ? { statuslineLaunchGen: initStatuslineLaunchGen } : {}),
     ...(finalOutputHandoffSupported(ds) ? { finalOutputHandoff: { version: 2 as const, token: randomUUID(), admitNew: finalOutputHandoffAdmitNew(ds),
       ...(!globalFinalOutputHandoffEnabled() ? { frozenImOnly: true as const } : {}) } } : {}),
+    structuredNoticeAck: true as const,
     chatId: ds.chatId,
     chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
@@ -27015,13 +27042,43 @@ function setupWorkerHandlers(
       }
 
       case 'turn_display_retired': {
+        if (msg.noticeId) {
+          const turnId = msg.turnId;
+          const noticeId = msg.noticeId;
+          if (!ownsLifecycleMutation()) break;
+          if (managedAuxUiSuppressed(turnId, msg.dispatchAttempt)) {
+            // Intentional suppression is terminal; unlike ownership loss it must
+            // ACK without UI so the worker can clear its pendingNotice.
+            worker.send({ type: 'structured_turn_not_collected_ack', turnId, noticeId });
+            break;
+          }
+          try {
+            await deliverStructuredNotice({
+              session: ds.session, noticeId, turnId, content: '', allowTextFallback: false,
+              owns: ownsLifecycleMutation,
+              persist: () => sessionStore.updateSession(ds.session),
+              retireCard: () => retireStructuredNoticeCard(ds, msg,
+                (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsLifecycleMutation),
+              // Silent retirement never switches to a text carrier.
+              deliverPending: async () => { throw new Error('silent_notice_text_fallback_forbidden'); },
+              acknowledge: () => worker.send({ type: 'structured_turn_not_collected_ack', turnId, noticeId }),
+              onCardError: error => logger.warn(`[${t}] silent display retirement remains pending: ${String(error)}`),
+            });
+          } catch (error) {
+            logger.warn(`[${t}] Silent display retirement awaits worker retry: ${String(error)}`);
+          }
+          break;
+        }
         if (!ownsLifecycleMutation() || managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         try {
           await retireReplyCardDisplay(ds, msg,
             (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }), ownsLifecycleMutation);
         } catch (error) {
           if (!ownsLifecycleMutation()) break;
-          logger.warn(`[${t}] reply-card retirement failed; delivering the warning through the existing notice path`);
+          logger.warn(msg.silent
+            ? `[${t}] silent reply-card retirement failed; no notice fallback`
+            : `[${t}] reply-card retirement failed; delivering the warning through the existing notice path`);
+          if (msg.silent) break;
           await sendTurnNotice(ds, { kind: 'user_notify', turnId: msg.turnId, msgType: 'text', content: msg.message }, ownsLifecycleMutation);
         }
         break;
@@ -29359,6 +29416,37 @@ function setupWorkerHandlers(
           });
           break;
         }
+        if (msg.kind === 'structured_turn_not_collected' && msg.noticeId && msg.turnId) {
+          const turnId = msg.turnId;
+          const noticeId = msg.noticeId;
+          if (!ownsLifecycleMutation()) break;
+          if (managedAuxUiSuppressed(turnId, msg.dispatchAttempt)) {
+            // Intentional suppression is terminal; unlike ownership loss it must
+            // ACK without UI so the worker can clear its pendingNotice.
+            worker.send({ type: 'structured_turn_not_collected_ack', turnId, noticeId });
+            break;
+          }
+          try {
+            await deliverStructuredNotice({
+              session: ds.session, noticeId, turnId, content: msg.message,
+              owns: ownsLifecycleMutation,
+              persist: () => sessionStore.updateSession(ds.session),
+              retireCard: () => retireStructuredNoticeCard(ds, { ...msg, turnId },
+                (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsLifecycleMutation),
+              deliverPending: id => turnNoticeOutbox.deliver(turnNoticeHost(ds), id),
+              acknowledge: () => worker.send({ type: 'structured_turn_not_collected_ack', turnId, noticeId }),
+              onEnqueued: () => {
+                logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
+                emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'user_notify', message: msg.message });
+              },
+              onCardError: error => logger.warn(`[${t}] durable reply-card warning failed; using the persisted text outbox: ${String(error)}`),
+            });
+          } catch (error) {
+            // No ACK: the worker keeps and retries its pendingNotice journal.
+            logger.warn(`[${t}] Structured notice remains pending worker ACK: ${String(error)}`);
+          }
+          break;
+        }
         if (msg.kind !== 'claude_permission_prompt') {
           logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
           emitSessionLifecycleHook(ds, 'session.requires_attention', {
@@ -31682,7 +31770,7 @@ function setupWorkerHandlers(
     };
     if (admission.kind === 'defer') { logDeferred('ingest'); return; }
     await sessionController.flushPrimary();
-    admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin);
+    admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin, isStructuredNoticeProtocolMessage(msg));
     if (admission.kind === 'reject') {
       logRejected(admission.reason);
       applyLiveWorkerRevokeBackstop(admission.reason);
@@ -34422,6 +34510,7 @@ export function forkAdoptWorker(
     chatId: ds.chatId,
     chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
+    structuredNoticeAck: true as const,
     terminalCardEpoch: ds.session.terminalCardEpoch,
     workingDir: adopted.cwd,
     cliId: adoptedCliId,

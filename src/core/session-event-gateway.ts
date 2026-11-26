@@ -33,7 +33,7 @@ const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'erro
  * to the current execution instance merely because its IPC worker survived. */
 export class SessionEventGateway {
   constructor(readonly store: SessionContractStore, readonly session: ContractSessionRef) {}
-  admit(type: string, context: SessionEventContext | undefined, channel: WorkerRef, recoveredOrigin?: SessionEventContext): SessionEventAdmission {
+  admit(type: string, context: SessionEventContext | undefined, channel: WorkerRef, recoveredOrigin?: SessionEventContext, structuredNotice = false): SessionEventAdmission {
     if (!context || context.version !== 2) return { kind: 'reject', reason: 'session_event_context_missing' };
     if (context.session.appId !== this.session.appId || context.session.sessionId !== this.session.sessionId || !sameWorker(context.producer, channel)) return { kind: 'reject', reason: 'session_event_channel_mismatch' };
     if (!Number.isSafeInteger(context.sequence) || context.sequence < 1 || context.eventId !== `${channel.workerId}:${context.sequence}`) return { kind: 'reject', reason: 'invalid_session_event_sequence' };
@@ -50,7 +50,7 @@ export class SessionEventGateway {
         const execution = this.store.execution(this.session, context.scope.execution.executionId);
         if (!execution || execution.ref.turnId !== context.scope.execution.turnId || execution.ref.dispatchAttempt !== context.scope.execution.dispatchAttempt) return { kind: 'reject', reason: 'execution_scope_unproven' };
       }
-      return workerEvents.has(type) && sameWorker(state.worker, channel) ? { kind: 'worker', context } : { kind: 'reject', reason: 'runtime_scope_missing' };
+      return (workerEvents.has(type) || structuredNotice) && sameWorker(state.worker, channel) ? { kind: 'worker', context } : { kind: 'reject', reason: 'runtime_scope_missing' };
     }
     const recovery = type === 'final_output' && recoveredOrigin
       && recoveredOrigin.session.appId === this.session.appId && recoveredOrigin.session.sessionId === this.session.sessionId

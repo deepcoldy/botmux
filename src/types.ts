@@ -2310,6 +2310,7 @@ type DaemonToWorkerBase =
   | { type: 'execution_contract_assigned'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   | import('./services/universal-output-handoff.js').OutputHandoffReceipt
   | import('./services/final-output-handoff.js').FinalOutputAccepted
+  | { type: 'structured_turn_not_collected_ack'; turnId: string; noticeId: string }
   | { type: 'deployment_continuation_cancelled'; requestId: string; ok: boolean }
   | { type: 'codex_cli_effort'; requestId: string; effort: string; deadline: number }
   | { type: 'codex_cli_effort_cancel'; requestId: string }
@@ -2504,6 +2505,9 @@ type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
         sessionContract?: import('./services/session-contract.js').SessionContractBootstrap;
         settledTurnTerminals?: Array<{ turnId: string; status: 'completed' }>;
         finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean; frozenImOnly?: true };
+        /** Daemon persists and ACKs structured missing-final notices. Without
+         * this bit workers retain legacy single-send/no-silent-display behavior. */
+        structuredNoticeAck?: true;
       }
     : Message
   : never;
@@ -2983,7 +2987,7 @@ export type WorkerToDaemonBase =
    * bridges. Cosmetic channel: it must never influence turn
    * settlement, final_output attribution, or durable receipts. */
   /** Cosmetic closure when a structured attribution lease retires without a task terminal. */
-  | { type: 'turn_display_retired'; turnId: string; dispatchAttempt?: number; message: string }
+  | { type: 'turn_display_retired'; turnId: string; dispatchAttempt?: number; message: string; silent?: boolean; noticeId?: string }
   | { type: 'thinking_update'; sessionId?: string; entries: CotEntry[]; turnId: string; dispatchAttempt?: number }
   /** A confirmed steer retired this exact timeline. Cosmetic only: this is
    * not a turn_terminal or a successful durable-delivery receipt. */
@@ -3066,6 +3070,9 @@ export type WorkerToDaemonBase =
         | 'cli_startup_blocked';
       /** `kind='cli_startup_blocked'`: which dialog matched (core/cli-startup-blocker). */
       startupBlocker?: Pick<import('./core/cli-startup-blocker.js').CliStartupBlocker, 'kind' | 'rule' | 'folder'>;
+      /** Durable missing-final notice UUID. The worker retries until the daemon's
+       * persisted notice record acknowledges it; older notices omit this field. */
+      noticeId?: string
       /** Permission prompt persisted across fresh worker captures; no daemon-side grace needed. */
       permissionPromptStable?: boolean;
       /** Bounded plain-text bottom of the screen for an input_not_submitted
