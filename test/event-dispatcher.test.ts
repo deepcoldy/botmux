@@ -4469,6 +4469,75 @@ describe('message listener polling backfill', () => {
     }
   });
 
+  it('settles a polled owner-absent message without dispatching or repeating owner-left', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX + 'assistant-polled-owner-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      const owner = 'ou_' + 'e'.repeat(32);
+      const other = 'ou_' + 'f'.repeat(32);
+      const chatId = 'oc_' + '1'.repeat(32);
+      const botState = mockGetBot() as any;
+      botState.config.messageListeners = { [chatId]: botState.config.messageListeners.chat_listener };
+      botState.config.assistantMode = true;
+      setAssistantOwner(dataDir, MY_APP_ID, chatId, owner, 'claimed');
+      const handleChatMemberUserDeleted = vi.fn(async () => {});
+      Object.assign(handlers, { handleChatMemberUserDeleted });
+      mockListChatMemberOpenIds.mockResolvedValue([other]);
+      const card = makeHistoryMessage({
+        senderAppId: OTHER_BOT_APP_ID, senderType: 'app', messageType: 'interactive',
+        messageId: 'msg-polled-owner-absent', chatId, content: '{}', createTime: String(Date.now()),
+      });
+      mockListChatMessagesUntil.mockResolvedValue([card]);
+
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handleChatMemberUserDeleted).toHaveBeenCalledWith(chatId, [owner], MY_APP_ID);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      const membershipCallsAfterFirst = mockListChatMemberOpenIds.mock.calls.length;
+
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handleChatMemberUserDeleted).toHaveBeenCalledOnce();
+      expect(mockListChatMemberOpenIds).toHaveBeenCalledTimes(membershipCallsAfterFirst);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('retries a polled message after a transient owner-membership lookup failure', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX + 'assistant-polled-retry-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      const owner = 'ou_' + 'e'.repeat(32);
+      const chatId = 'oc_' + '2'.repeat(32);
+      const botState = mockGetBot() as any;
+      botState.config.messageListeners = { [chatId]: botState.config.messageListeners.chat_listener };
+      botState.config.assistantMode = true;
+      setAssistantOwner(dataDir, MY_APP_ID, chatId, owner, 'claimed');
+      mockListChatMemberOpenIds.mockRejectedValueOnce(new Error('temporary Lark failure'));
+      mockListChatMemberOpenIds.mockResolvedValue([owner]);
+      const card = makeHistoryMessage({
+        senderAppId: OTHER_BOT_APP_ID, senderType: 'app', messageType: 'interactive',
+        messageId: 'msg-polled-owner-retry', chatId, content: '{}', createTime: String(Date.now()),
+      });
+      mockListChatMessagesUntil.mockResolvedValue([card]);
+
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('routes a recent top-level Argos interactive card found in chat history', async () => {
     const card = makeHistoryMessage({
       senderAppId: OTHER_BOT_APP_ID,

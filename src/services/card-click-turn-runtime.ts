@@ -42,14 +42,16 @@ export interface CardClickTurnRuntimeDeps {
     claims: CardClickTurnClaims,
     senderOpenId: string,
     chatType: 'group' | 'p2p',
-  ): Promise<{ ok: true; session: CardClickBoundSession } | { ok: false; reason: string }>;
+  ): Promise<{ ok: true; session: CardClickBoundSession; created: boolean } | { ok: false; reason: string }>;
+  /** 仅回收本次 accept 新建、且仍未被其它入口接管的空会话。 */
+  discardCreatedSession(session: CardClickBoundSession): Promise<void>;
   workingDirReady(dir: string): boolean;
   setWorkingDir(session: CardClickBoundSession, dir: string): void;
   /** `principal_lane` wins over `cross_principal` when both apply. */
   sessionBlockedShape?(session: CardClickBoundSession | undefined): 'ok' | 'principal_lane' | 'cross_principal';
   nextStepCurrent?(session: CardClickBoundSession, turnId: string): boolean;
   /** 个人助理模式不允许多人群时：这个群现在能不能干活（恰好只有主人一个真人）。没注入 = 不限。 */
-  assistantGroupAdmitted?(larkAppId: string, chatId: string): Promise<boolean>;
+  assistantGroupAdmitted?(larkAppId: string, chatId: string, chatType: 'group' | 'p2p'): Promise<boolean>;
   startTurn(
     session: CardClickBoundSession,
     args: { senderOpenId: string; memberUnionId?: string; prompt: string; responseToTurnId?: string },
@@ -144,7 +146,7 @@ export async function acceptCardClickTurn(
   // 已有会话和新建会话都要过：群变成多人、或主人已不在群里时，不能再借卡片进主人的会话。
   if (chatType === 'group' && deps.assistantGroupAdmitted) {
     let admittedGroup = false;
-    try { admittedGroup = await deps.assistantGroupAdmitted(input.larkAppId, chatId); } catch { /* 查不到 → 拒 */ }
+    try { admittedGroup = await deps.assistantGroupAdmitted(input.larkAppId, chatId, chatType); } catch { /* 查不到 → 拒 */ }
     if (!admittedGroup) return { ok: false, reason: 'assistant_group' };
   }
 
@@ -163,7 +165,8 @@ export async function acceptCardClickTurn(
 
   let consumed: 'ok' | 'replayed' | 'expired';
   try {
-    consumed = deps.nonces.consume(claims.nonce, claims.exp, now);
+    // 准入查询可能跨越卡片过期时刻；nonce 核销必须使用 await 之后的当前时间。
+    consumed = deps.nonces.consume(claims.nonce, claims.exp, deps.now());
   } catch {
     return { ok: false, reason: 'delivery_failed' };
   }
@@ -171,6 +174,7 @@ export async function acceptCardClickTurn(
   if (consumed === 'replayed') return { ok: false, reason: 'replayed' };
 
   let assignDir: string | undefined;
+  let createdSession: CardClickBoundSession | undefined;
   if (!session) {
     const created = await deps.createSession(input.larkAppId, claims, admitted.senderOpenId, chatType);
     if (!created.ok) {
@@ -180,7 +184,9 @@ export async function acceptCardClickTurn(
       };
     }
     session = created.session;
+    if (created.created) createdSession = created.session;
     if (claims.workingDir && session.workingDir && pathsDiffer(claims.workingDir, session.workingDir)) {
+      if (createdSession) await deps.discardCreatedSession(createdSession).catch(() => {});
       return { ok: false, reason: 'working_dir_mismatch' };
     }
     if (claims.workingDir && !session.workingDir) assignDir = claims.workingDir;
@@ -208,6 +214,7 @@ export async function acceptCardClickTurn(
       if (!started.ok) {
         // startTurn reports failure only after rolling back: nothing reached
         // the session, so the same button may be clicked again.
+        if (createdSession) await deps.discardCreatedSession(createdSession).catch(() => {});
         try { deps.nonces.release?.(claims.nonce); } catch { /* the button stays used */ }
         return { ok: false, reason: started.reason === 'expired' ? 'expired' : 'delivery_failed' };
       }

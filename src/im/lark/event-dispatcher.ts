@@ -73,7 +73,7 @@ import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSecretaryCommand } from './secretary-command.js';
 import { observeGroupSecretaryMessage } from '../../services/group-secretary-runtime.js';
 import { assistantGroupIsMultiUser, assistantSoloGroupOwnerCheck, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from './assistant-command.js';
-import { assistantMultiUserGroupsOff } from '../../core/assistant-spawn.js';
+import { assistantMultiUserGroupsOff, assistantSoloGroupAdmission } from '../../core/assistant-spawn.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { resolveSubstituteAppMentions, substituteMentionIdentities } from './substitute-app-mentions.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
@@ -89,7 +89,7 @@ import {
 } from '../../services/grant-store.js';
 import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
-import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
+import { claimMessageOnce, hasClaimedMessage, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import {
   acquireReverifySlot,
   contentHasMentionPlaceholder,
@@ -4381,20 +4381,32 @@ async function dispatchPolledMessageListenerMatch(input: {
   chatId: string;
   messageId: string;
 }): Promise<void> {
+  // 只读预检避免合法重复消息每拍重新查成员。真正的 claim 在准入后：明确非法的丢弃是终态，
+  // 但 lookup_failed 只是本轮 fail closed，绝不能消费消息、挡住 Lark 恢复后的重试。
+  if (hasClaimedMessage(input.larkAppId, input.messageId)) {
+    logger.debug(`[message-listener:${input.larkAppId}] polled duplicate ignored msg=${input.messageId.substring(0, 12)}`);
+    return;
+  }
+  if (assistantMultiUserGroupsOff(input.larkAppId)) {
+    const admission = await assistantSoloGroupAdmission(input.larkAppId, input.chatId);
+    if (!admission.ok && admission.reason === 'lookup_failed') {
+      logger.debug(`[message-listener:${input.larkAppId}] owner lookup failed for ${input.chatId.substring(0, 12)}; retry next poll`);
+      return;
+    }
+    if (!admission.ok && admission.reason !== 'unclaimed') {
+      if (admission.reason === 'owner_absent' && admission.ownerOpenId) {
+        logger.info(`[assistant-mode:${input.larkAppId}] owner ${admission.ownerOpenId.slice(0, 12)}… absent before polled routing in ${input.chatId.substring(0, 12)}; treating as left`);
+        await input.handlers.handleChatMemberUserDeleted?.(input.chatId, [admission.ownerOpenId], input.larkAppId);
+      }
+      claimMessageOnce(input.larkAppId, input.messageId);
+      logger.debug(`[message-listener:${input.larkAppId}] polled message ignored permanently: ${admission.reason}`);
+      return;
+    }
+  }
   if (!claimMessageOnce(input.larkAppId, input.messageId)) {
     logger.debug(`[message-listener:${input.larkAppId}] polled duplicate ignored msg=${input.messageId.substring(0, 12)}`);
     return;
   }
-  // 个人助理模式不允许多人群：轮询补到的群消息同样不派发（与实时消息入口的闸一致）。先记已处理再丢，
-  // 免得群变回单人后下一轮轮询把这条旧消息补投出去。
-  if (assistantMultiUserGroupsOff(input.larkAppId) && await assistantGroupIsMultiUser(input.larkAppId, input.chatId)) {
-    logger.debug(`[message-listener:${input.larkAppId}] multi-user group ${input.chatId.substring(0, 12)}; polled message ignored`);
-    return;
-  }
-  // 单人群：轮询补到的消息发言人身份不一定可信，统一现查成员核对主人还在（同实时入口 bot 发言的处理）。
-  const ownerCheck = await assistantSoloGroupOwnerCheck(input.larkAppId, input.data?.message, input.match.senderOpenId, true);
-  if (ownerCheck.drop) return;
-  if (ownerCheck.absentOwner) await input.handlers.handleChatMemberUserDeleted?.(input.chatId, [ownerCheck.absentOwner], input.larkAppId);
   logger.info(
     `[message-listener:${input.larkAppId}] matched polled chat=${input.chatId.substring(0, 12)} ` +
     `msg=${input.messageId.substring(0, 12)} sender=${input.match.senderOpenId?.substring(0, 12) ?? '-'}`,

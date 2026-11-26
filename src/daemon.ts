@@ -38572,6 +38572,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             iso => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }),
           );
           const runPrompt = [additionalPrompt, untilDonePrompt].filter(Boolean).join('\n\n') || undefined;
+          const assertExecutionCurrent = async (targetTask: typeof task, turnId: string) => {
+            // Re-read after preconditions/admission waits. A human can
+            // pause, revoke or edit while those awaits are outstanding.
+            const current = scheduleAuthorityStore?.getRecord(effectiveAppId, targetTask.id);
+            if (!current || (current.state !== 'active'
+              && !(current.state === 'paused'
+                && scheduler.admitManualRunTurn(targetTask.id, executionContext.runId, turnId, effectiveAppId)))) {
+              throw new Error('schedule authority changed before turn admission');
+            }
+            assertScheduledAuthorityCurrent(authority, current, { runId: executionContext.runId });
+            return current;
+          };
           try {
             const results = await executeScheduledTaskForTargets(
               task,
@@ -38584,16 +38596,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   refreshCliVersion,
                   runPrompt,
                   {
+                    assertExecutionCurrent: async (targetTask, turnId) => { await assertExecutionCurrent(targetTask, turnId); },
                     prepareTurnIdentity: async (session, turnId) => {
-                      // Re-read after preconditions/admission waits. A human can
-                      // pause, revoke or edit while those awaits are outstanding.
-                      const current = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
-                      if (!current || (current.state !== 'active'
-                        && !(current.state === 'paused'
-                          && scheduler.admitManualRunTurn(task.id, executionContext.runId, turnId, effectiveAppId)))) {
-                        throw new Error('schedule authority changed before turn admission');
-                      }
-                      assertScheduledAuthorityCurrent(authority, current, { runId: executionContext.runId });
+                      const current = await assertExecutionCurrent(task, turnId);
                       await prepareTurnCliIdentity(session, turnId);
                       const prepared = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
                       assertScheduledAuthorityCurrent(current, prepared, { runId: executionContext.runId, turnId });

@@ -83,6 +83,7 @@ import { codexRpcEligible } from '../codex-rpc-lifecycle.js';
 import type { AcceptedCommandInput, ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
 import { reconcileClosedSessionTurns } from '../services/session-turns.js';
 import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
+import { scheduledTaskRunAs } from './schedule-run-as.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -4854,6 +4855,8 @@ export async function executeScheduledTask(
   refreshCliVersion: RefreshCliVersion,
   additionalPrompt?: string,
   runtime?: {
+    /** 轻量 authority fence：成员/路由查询结束后、任何可见通知之前重读暂停/撤销。 */
+    assertExecutionCurrent?: (task: ScheduledTask, turnId: string) => void | Promise<void>;
     prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
     /** Scheduler run id, kept on a hidden run so a later delivery failure can
      *  amend that run's execution-log record. */
@@ -4908,26 +4911,58 @@ export async function executeScheduledTask(
   const larkClient = await import('../im/lark/client.js');
   const { getChatMode, sendMessage, replyMessage } = larkClient;
 
-  // 个人助理模式不允许多人群：投到群的任务，群里得恰好只有主人一个真人，否则在发任何东西之前就拒掉
-  // （未认领也拒，免得先发横幅再失败）。只有投回建任务那个私聊的任务免查；任务上的 chatType 是建任务时
-  // 来源会话的类型，改过投递目标后不可信，按现查到的群类型往下走。查不到一律拒。
-  if (assistantMultiUserGroupsOff(larkAppId) && !(task.chatType === 'p2p' && task.creatorChatId === task.chatId)) {
-    let refusal: string | undefined = 'lookup_failed';
+  // 个人助理模式不允许多人群：只有 creatorChatId 明确等于目标时才可沿用「自己的私聊」快捷路径。
+  // 群目标用同一次成员列表证明「恰好一人且就是当前 owner」，并绑定已记录的执行者；入口和最终
+  // worker 投递共用这一判定，避免 owner 改绑或成员变化跨过身份准备的长等待窗口。
+  const evaluateAssistantScheduledTarget = async (target: ScheduledTask): Promise<{
+    chatType?: 'group' | 'p2p';
+    refusal?: string;
+  }> => {
+    if (!assistantMultiUserGroupsOff(larkAppId)
+      || (target.chatType === 'p2p' && target.creatorChatId === target.chatId)) return {};
     try {
-      const facts = await larkClient.getChatRoutingFacts(larkAppId, task.chatId);
-      if (facts.mode === 'p2p') {
-        refusal = undefined;
-      } else {
-        const admission = await assistantSoloGroupAdmission(larkAppId, task.chatId);
-        refusal = admission.ok ? undefined : admission.reason;
-        if (admission.ok && task.chatType === 'p2p') task = { ...task, chatType: 'group' };
+      const facts = await larkClient.getChatRoutingFacts(larkAppId, target.chatId);
+      const chatType = facts.mode === 'p2p' ? 'p2p' : 'group';
+      if (chatType === 'p2p') return { chatType };
+      const admission = await assistantSoloGroupAdmission(larkAppId, target.chatId);
+      if (!admission.ok) return { chatType, refusal: admission.reason };
+      const runAs = scheduledTaskRunAs(target, larkAppId);
+      let actorOpenId = runAs?.openId ?? target.ownerOpenId;
+      let actorLarkAppId = runAs?.larkAppId ?? target.creatorLarkAppId ?? target.larkAppId ?? larkAppId;
+      // union-only / 跨 app 执行者必须换算到本 app；查不到或暂时失败都不能当成“没有 actor”放行。
+      if (runAs && (!actorOpenId || actorLarkAppId !== larkAppId)) {
+        const resolved = await larkClient.resolveTargetAppOpenId(larkAppId, runAs.unionId);
+        if (resolved.status !== 'resolved') return { chatType, refusal: 'actor' };
+        actorOpenId = resolved.openId;
+        actorLarkAppId = larkAppId;
       }
-    } catch { /* 查不到 → 拒 */ }
-    if (refusal) {
-      logger.warn(`[scheduler] refusing to fire ${task.id}: assistant mode serves only a group whose one person is its owner (${task.chatId}, ${refusal})`);
-      throw new Error(`assistant mode: group ${task.chatId} is not a one-person group of its owner (${refusal}); scheduled run refused`);
+      if (actorOpenId && (actorLarkAppId !== larkAppId || actorOpenId !== admission.ownerOpenId)) {
+        return { chatType, refusal: 'actor' };
+      }
+      return { chatType };
+    } catch {
+      return { refusal: 'lookup_failed' };
     }
-  }
+  };
+  const assertScheduledTargetCurrent = async (normalizeChatType: boolean): Promise<void> => {
+    const result = await evaluateAssistantScheduledTarget(task);
+    const refusal = result.refusal ?? (result.chatType && !normalizeChatType && result.chatType !== task.chatType ? 'chat_type_changed' : undefined);
+    if (refusal) {
+      logger.warn(`[scheduler] refusing to fire ${task.id}: assistant scheduled target refused (${task.chatId}, ${refusal})`);
+      throw new Error(refusal === 'actor'
+        ? `assistant mode: scheduled actor is not the current chat owner; scheduled run to ${task.chatId} refused`
+        : `assistant mode: group ${task.chatId} is not a one-person group of its owner (${refusal}); scheduled run refused`);
+    }
+    // retarget 可能留下建任务时的 chatType；后续 resolveAssistantSpawn 必须使用目标的真实类型。
+    if (result.chatType && normalizeChatType) task = { ...task, chatType: result.chatType };
+  };
+  await assertScheduledTargetCurrent(true);
+
+  // Every fire gets a stable identity before it enters a worker queue. Besides
+  // silent-output suppression, this identifies the exact shared-topic reply target.
+  const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
+  // 成员/路由查询之后、任何可见通知之前的轻量暂停/撤销 fence；完整身份检查仍在实际投递前执行。
+  await runtime?.assertExecutionCurrent?.(task, scheduledTurnId);
 
   // Prefer the explicit three-state position, with scope/deliver fallbacks for
   // schedules persisted by older versions.
@@ -4939,10 +4974,6 @@ export async function executeScheduledTask(
   // Lark root is materialized only by the first successful `botmux send`.
   const silent = task.silent === true;
 
-  // Every fire gets a stable identity before it enters a worker queue. Besides
-  // silent-output suppression, this identifies the exact shared-topic reply
-  // target when a chat-scope session already has another turn queued.
-  const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
   const rawTopicTitle = task.topicTitle?.trim();
   const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
@@ -5313,6 +5344,9 @@ export async function executeScheduledTask(
         // Identity preparation may reject after a concurrent pause/revocation.
         // Run it before changing the retained conversation's routing or prompt.
         await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
+        // 身份准备后、live 注入或 cold-resume 前复核 owner；authority 是投递前最后一次 await。
+        await assertScheduledTargetCurrent(false);
+        await runtime?.assertExecutionCurrent?.(task, scheduledTurnId);
         if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
@@ -5493,6 +5527,9 @@ export async function executeScheduledTask(
     // its durable row so the next fire can create a fresh candidate.
     try {
       await runtime?.prepareTurnIdentity?.(ds, scheduledTurnId);
+      // 新会话尚未注册；最终复查失败走同一 catch 关闭 durable candidate，不留半建状态。
+      await assertScheduledTargetCurrent(false);
+      await runtime?.assertExecutionCurrent?.(task, scheduledTurnId);
     } catch (err) {
       sessionStore.closeSession(session.sessionId);
       throw err;
