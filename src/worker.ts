@@ -1169,6 +1169,9 @@ const rpcEngagementFence = new RpcEngagementFence();
 interface RpcTurnGeneration {
   engine: CodexRpcEngine;
   cliGeneration: number;
+  /** Exact native turn being steered while this owner awaits activation.
+   * Undefined for an independent turn/start, whose predecessor may still hydrate. */
+  steerNativeTurnId?: string;
 }
 
 interface PendingRpcTerminal {
@@ -1340,6 +1343,17 @@ function stopCodexRpcEngine(): void {
     }
   }
   for (const pending of [...rpcTerminalHydrationTerminals.values()]) {
+    if (pending.terminal.status === 'completed') {
+      // A same-native steer may still await activation. Give its predecessor
+      // one final owned drain BEFORE dropping pending turns: ordinary ACK-race
+      // hydration deferral must not discard an already-readable final at teardown.
+      try {
+        codexBridgeDrainAndMaybeEmit({
+          signalIdle: false,
+          hydrationOwnerKey: rpcTurnOwnerKey(pending.terminal.identity),
+        });
+      } catch { /* teardown still finalizes the exact owner below */ }
+    }
     finalizeRpcTurnTerminal(pending.terminal, pending.generation, true);
   }
   // A dispatched delivery for which the app-server never yielded a native turn
@@ -12806,7 +12820,10 @@ function observeCodexCotSuperseded(turn: CodexPendingTurn): void {
   // A confirmed same-native correction removes its predecessor from the bridge
   // queue. Retire only that RPC lifecycle lease; the merged final still owns
   // the predecessor's completion metadata and no terminal is synthesized here.
-  retireRpcLifecycleFromStructuredTerminal({ turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt });
+  retireRpcLifecycleFromStructuredTerminal(
+    { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt },
+    true,
+  );
   if (!sessionId || turn.isLocal) return;
   const ownsThinking = thinkingTurn?.turnId === turn.turnId
     && thinkingTurn.dispatchAttempt === turn.dispatchAttempt;
@@ -19446,12 +19463,22 @@ function hydrateCompletedRpcTurn(
   // old generation when teardown reaches the engine.
   if (cliSpawnGeneration !== generation.cliGeneration
     || codexRpcEngine !== generation.engine) return;
-  try {
-    codexBridgeDrainAndMaybeEmit({
-      signalIdle: false,
-      hydrationOwnerKey: ownerKey,
-    });
-  } catch { /* retry */ }
+  // A successful steer ACK lets the engine emit predecessor terminals before
+  // the sender continuation activates the correction. Draining now would let a
+  // predecessor consume their shared native turn's assistant_final before the
+  // correction owns a bridge mark. Skip only an exact same-generation steer;
+  // an independent turn/start retains the predecessor-hydration exemption.
+  const awaitingSameNativeSteer = [...rpcTurnsAwaitingActivation.values()].some(awaiting =>
+    awaiting.steerNativeTurnId === terminal.nativeTurnId
+    && sameRpcGeneration(awaiting, generation));
+  if (!awaitingSameNativeSteer) {
+    try {
+      codexBridgeDrainAndMaybeEmit({
+        signalIdle: false,
+        hydrationOwnerKey: ownerKey,
+      });
+    } catch { /* retry */ }
+  }
   if (!codexBridgeQueue.hasPendingTurn(identity.turnId, identity.dispatchAttempt)) {
     // Structured ingest already emitted final_output + terminal in the canonical
     // order. The explicit native terminal below is idempotently suppressed.
@@ -19640,15 +19667,29 @@ function releaseRpcTurnTerminalDeferral(
 
 function retireRpcLifecycleFromStructuredTerminal(
   identity: CodexRpcTurnIdentity,
+  supersededSettlement = false,
 ): void {
   const ownerKey = rpcTurnOwnerKey(identity);
+  const settlingGeneration = settlingRpcTerminalOwners.get(ownerKey);
   // Native completion hydration owns its own finalization after this canonical
-  // drain returns. Do not tear down that generation's settlement underneath it.
-  if (settlingRpcTerminalOwners.has(ownerKey)) return;
-  const generation = rpcActiveOwners.get(ownerKey)
+  // drain returns. A confirmed same-native supersession is the exception: its
+  // merged successor owns the only final, so the deferred predecessor must not
+  // later publish an independent terminal.
+  if (settlingGeneration && !supersededSettlement) return;
+  const generation = settlingGeneration ?? rpcActiveOwners.get(ownerKey)
     ?? rpcLifecycleFailClosedOwners.get(ownerKey)
     ?? rpcTurnsAwaitingActivation.get(ownerKey);
   if (!generation) return;
+  if (supersededSettlement && settlingGeneration) {
+    const timer = rpcTerminalHydrationTimers.get(ownerKey);
+    if (timer) clearTimeout(timer);
+    rpcTerminalHydrationTimers.delete(ownerKey);
+    if (sameRpcGeneration(rpcTerminalHydrationOwners.get(ownerKey), generation)) {
+      rpcTerminalHydrationOwners.delete(ownerKey);
+      rpcTerminalHydrationTerminals.delete(ownerKey);
+    }
+    settlingRpcTerminalOwners.delete(ownerKey);
+  }
   clearAwaitingRpcActivation(identity, generation);
   if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
     rpcActiveOwners.delete(ownerKey);
@@ -30469,6 +30510,7 @@ async function flushPending(): Promise<void> {
                   'rpc_turn_start_active', 'not_sent',
                 );
               }
+              rpcTurnGeneration!.steerNativeTurnId = activeNativeTurnId;
               rpcSteering = true;
               rpcNativeTurnId = (await writeRpcEngine.steerTurn(
                 rpcContext?.content ?? msg, rpcTurnIdentity!, activeNativeTurnId,

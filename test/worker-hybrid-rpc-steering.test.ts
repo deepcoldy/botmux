@@ -196,6 +196,26 @@ describe('hybrid RPC active-turn steering at the actual worker write edge', () =
   });
 });
 
+describe('hybrid RPC steering identity with cross-principal isolation disabled', () => {
+  it.each([
+    ['bot', { ...owner, senderType: 'bot' }],
+    ['unknown sender type', { requestUserOpenId: 'ou_unknown', requestLarkAppId: 'cli_app' }],
+    ['unattributed', undefined],
+  ])('retains %s input at the default-off write edge', async (_label, caller) => {
+    const h = harness();
+    h.scope.isCrossPrincipalInterruptionEnabled = () => false;
+    h.scope.crossPrincipalIsolationOn = loadWorkerFunction('crossPrincipalIsolationOn', h.scope);
+    h.scope.activeTurnBlocks = loadWorkerFunction('activeTurnBlocks', h.scope);
+    const head = h.scope.pendingMessages[0];
+    head.trustedCaller = caller;
+    await h.flush();
+    expect(h.scope.pendingMessages[0]).toBe(head);
+    expect(h.scope.codexRpcEngine.steerTurn).not.toHaveBeenCalled();
+    expect(h.scope.codexRpcEngine.sendTurn).not.toHaveBeenCalled();
+    expect(h.scope.emitTurnTerminal).not.toHaveBeenCalled();
+  });
+});
+
 /** Real engine request/ACK ownership, real bridge queue and real worker RPC
  * lifecycle. Only transport I/O and output presentation are controlled. */
 function lifecycleHarness() {
@@ -331,6 +351,103 @@ describe('hybrid RPC engine and merged bridge lifecycle', () => {
     expect(h.requests.map(r => r.method)).toEqual(['turn/start', 'turn/steer', 'turn/start']);
     expect(h.scope.send.mock.calls.map(([m]: any[]) => m).filter(m => m.type === 'final_output')).toHaveLength(1);
     h.engine.stop();
+  });
+
+  it.each(['terminal-before-ack', 'ack-then-terminal-same-batch'])(
+    'keeps an already-readable combined final on the accepted correction: %s',
+    async ordering => {
+      vi.useFakeTimers();
+      const h = lifecycleHarness();
+      await h.write('om_root', 'Task');
+      h.holdSteer();
+      const steering = h.write('om_correction', 'Use the correction');
+      await vi.waitFor(() => expect(h.requests).toHaveLength(2));
+      if (ordering === 'terminal-before-ack') {
+        h.complete();
+        h.acceptSteer();
+      } else {
+        h.acceptSteer();
+        h.complete();
+      }
+      await steering;
+      await vi.advanceTimersByTimeAsync(40);
+      const messages = h.scope.send.mock.calls.map(([m]: any[]) => m);
+      expect(messages.filter(m => m.type === 'final_output')).toEqual([
+        expect.objectContaining({ turnId: 'om_correction', content: 'Combined answer' }),
+      ]);
+      expect(messages.filter(m => m.type === 'turn_terminal')).toEqual([
+        expect.objectContaining({ turnId: 'om_correction', status: 'completed' }),
+      ]);
+      expect(h.queue.peek()).toEqual([]);
+      expect(h.scope.rpcTerminalHydrationOwners.size).toBe(0);
+      h.engine.stop();
+    },
+  );
+
+  it('attributes an early terminal and final to the newest of multiple accepted steers', async () => {
+    vi.useFakeTimers();
+    const h = lifecycleHarness();
+    await h.write('om_root', 'Task');
+    await h.write('om_second', 'Second');
+    h.holdSteer();
+    const steering = h.write('om_third', 'Third');
+    await vi.waitFor(() => expect(h.requests).toHaveLength(3));
+    h.complete();
+    h.acceptSteer();
+    await steering;
+    await vi.advanceTimersByTimeAsync(40);
+    const messages = h.scope.send.mock.calls.map(([m]: any[]) => m);
+    expect(messages.filter(m => m.type === 'final_output')).toEqual([
+      expect.objectContaining({ turnId: 'om_third', content: 'Combined answer' }),
+    ]);
+    expect(messages.filter(m => m.type === 'turn_terminal')).toEqual([
+      expect.objectContaining({ turnId: 'om_third', status: 'completed' }),
+    ]);
+    expect(h.requests.map(r => r.method)).toEqual(['turn/start', 'turn/steer', 'turn/steer']);
+    expect(h.queue.peek()).toEqual([]);
+    h.engine.stop();
+  });
+
+  it('does not defer predecessor hydration for an independent successor activation', async () => {
+    vi.useFakeTimers();
+    const h = lifecycleHarness();
+    await h.write('om_root', 'Task');
+    const generation = { engine: h.engine, cliGeneration: h.scope.cliSpawnGeneration };
+    h.scope.rpcTurnsAwaitingActivation.set('om_independent\0', generation);
+    h.scope.rpcTurnsAwaitingActivationIdentities.set('om_independent\0', { turnId: 'om_independent' });
+    h.complete();
+    const messages = h.scope.send.mock.calls.map(([m]: any[]) => m);
+    expect(messages.filter(m => m.type === 'final_output')).toEqual([
+      expect.objectContaining({ turnId: 'om_root', content: 'Combined answer' }),
+    ]);
+    expect(messages.filter(m => m.type === 'turn_terminal')).toEqual([
+      expect.objectContaining({ turnId: 'om_root', status: 'completed' }),
+    ]);
+    h.engine.stop();
+  });
+
+  it('delivers an already-readable predecessor final during teardown with an unacknowledged steer', async () => {
+    vi.useFakeTimers();
+    const h = lifecycleHarness();
+    await h.write('om_root', 'Task');
+    h.holdSteer();
+    const steering = h.write('om_correction', 'Use the correction');
+    await vi.waitFor(() => expect(h.requests).toHaveLength(2));
+    h.complete();
+    h.scope.stopCodexRpcEngine();
+    await steering;
+    const messages = h.scope.send.mock.calls.map(([m]: any[]) => m);
+    expect(messages.filter(m => m.type === 'final_output')).toEqual([
+      expect.objectContaining({ turnId: 'om_root', content: 'Combined answer' }),
+    ]);
+    expect(messages.filter(m => m.type === 'turn_terminal' && m.turnId === 'om_root')).toEqual([
+      expect.objectContaining({ status: 'completed' }),
+    ]);
+    expect(messages.filter(m => m.type === 'turn_terminal' && m.turnId === 'om_correction')).toEqual([
+      expect.objectContaining({ status: 'ambiguous' }),
+    ]);
+    expect(h.requests.map(r => r.method)).toEqual(['turn/start', 'turn/steer']);
+    expect(h.queue.peek()).toEqual([]);
   });
 
   it('settles an unknown steer once when engine death tears down the worker before the request catch resumes', async () => {
