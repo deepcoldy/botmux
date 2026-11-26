@@ -24,14 +24,15 @@ export class OutputDeliveryCoordinator {
     owns(): boolean;
     process(record: OutputDeliveryRecord, control: OutputDeliveryControl): Promise<OutputReceipt | undefined>;
     settled(record: OutputDeliveryRecord): void;
+    rejected?(record: OutputDeliveryRecord): void;
     /** terminal=true means the row is now in the permanent rejected state. */
     error(error: unknown, terminal?: boolean): void;
   }): Promise<void> {
     const current = this.journal.read(record.id)!;
     if (current.state === 'settled') { deps.settled(current); return; }
     // Terminal rejection is a durable human-inspection state, not a delivery
-    // success: never invoke the settled callback (no worker ACK) and never retry.
-    if (current.state === 'rejected') return;
+    // success: never invoke the settled callback and never retry delivery.
+    if (current.state === 'rejected') { deps.rejected?.(current); return; }
     if (!deps.owns()) return;
     const owner = this.journal.newOwner();
     if (!this.journal.claim(record.id, owner)) return;
@@ -61,7 +62,10 @@ export class OutputDeliveryCoordinator {
       if (error instanceof OutputDeliveryTerminalError) {
         // A structurally impossible delivery leaves the retry loop for good;
         // the error dep surfaces a stable attention (no 5s re-publish churn).
-        if (this.journal.rejectTerminal(record.id, owner, error.message)) deps.error(error, true);
+        if (this.journal.rejectTerminal(record.id, owner, error.message)) {
+          deps.error(error, true);
+          deps.rejected?.(this.journal.read(record.id)!);
+        }
       } else {
         this.journal.block(record.id, owner, String(error));
         deps.error(error, false);

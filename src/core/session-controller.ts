@@ -393,10 +393,12 @@ export class SessionController {
     const active = this.store.read(this.ref)?.activeRuntime;
     return active && !sameRuntime(runtime, active) && this.store.runtimeContinues(this.ref, runtime, active, channel) ? active : runtime;
   }
-  ingest(message: ControlledWorkerMessage, channel: WorkerRef, recoveredOrigin?: SessionEventContext): SessionEventAdmission {
-    return this.store.atomic(() => this.ingestInside(message, channel, recoveredOrigin));
+  ingest(message: ControlledWorkerMessage, channel: WorkerRef, recoveredOrigin?: SessionEventContext,
+    options?: { suppressOutputProjection?: boolean }): SessionEventAdmission {
+    return this.store.atomic(() => this.ingestInside(message, channel, recoveredOrigin, options?.suppressOutputProjection === true));
   }
-  private ingestInside(message: ControlledWorkerMessage, channel: WorkerRef, recoveredOrigin?: SessionEventContext): SessionEventAdmission {
+  private ingestInside(message: ControlledWorkerMessage, channel: WorkerRef, recoveredOrigin: SessionEventContext | undefined,
+    suppressOutputProjection: boolean): SessionEventAdmission {
     const metadata = message.sessionContract;
     if (!metadata || metadata.version !== 2 || !sameWorker(metadata.producer, channel)) return { kind: 'reject', reason: 'session_event_context_missing' };
     const context: WorkerContractContext = structuredClone(metadata);
@@ -552,7 +554,9 @@ export class SessionController {
         status: contractTerminalStatus(message.status, code),
         evidence: continuationFailure ? 'continuation_abandoned' : code === 'preempted_by_user_message' ? 'caller_interrupt_boundary' : uncertainTerminal ? 'observer_loss' : 'native_terminal', ...(code ? { errorCode: code } : {}) };
     }
-    if (message.type === 'final_output' && execution) event = { type: 'execution_output', execution, output: { availability: message.content ? 'available' : 'empty', ...(typeof message.content === 'string' ? { content: message.content } : {}), completeness: message.turnFailed ? 'partial' : 'final' } };
+    if (message.type === 'final_output' && execution && !suppressOutputProjection) {
+      event = { type: 'execution_output', execution, output: { availability: message.content ? 'available' : 'empty', ...(typeof message.content === 'string' ? { content: message.content } : {}), completeness: message.turnFailed ? 'partial' : 'final' } };
+    }
     if (message.type === 'restart_result' && typeof message.attemptId === 'string') event = { type: 'control_result', operationId: message.attemptId, phase: message.status === 'succeeded' ? 'confirmed' : message.untouched ? 'failed_before_effect' : message.status === 'failed' ? 'rejected' : 'uncertain', ...(runtime ? { runtime } : {}), ...(message.status === 'failed' && typeof message.category === 'string' ? { error: message.category } : {}) };
     if (message.type === 'turn_interrupt_result' && context.scope.operationId) {
       const operation = this.operation(context.scope.operationId);
