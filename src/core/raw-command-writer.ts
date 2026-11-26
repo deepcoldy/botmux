@@ -1,7 +1,11 @@
+import { wrapBracketedPaste } from '../adapters/cli/tui-input.js';
+
 /** Minimal write surface shared by PTY/session backends for literal slash
  * commands. Historical backends return void on success; guarded backends
  * return false when the target pane/process is already unavailable. */
 export interface RawCommandWriter {
+  submitBracketedPaste?: (text: string) => void | boolean;
+  sendBracketedPaste?: (text: string) => void | boolean;
   readonly supportsRawCommandPasteLine?: boolean;
   write(data: string): void | boolean;
   sendText?: (text: string) => void | boolean;
@@ -12,6 +16,8 @@ export interface RawCommandWriter {
 export interface RawCommandWriteOptions {
   coco?: boolean;
   cocoThrottleMs?: number;
+  /** Submit the command as a paste followed by a distinct Enter. */
+  bracketedPaste?: boolean;
   pasteLine?: boolean;
   pasteSettleMs?: number;
   submitBeatMs?: number;
@@ -85,6 +91,14 @@ export async function writeRawCommandLine(
   const current = () => opts.isCurrent?.() !== false;
   if (!current()) return false;
 
+  if (opts.bracketedPaste) {
+    if (backend.submitBracketedPaste) return backend.submitBracketedPaste(content) !== false;
+    const paste = backend.sendBracketedPaste?.bind(backend) ?? pasteText;
+    const accepted = paste ? paste(content) : backend.write(wrapBracketedPaste(content));
+    if (accepted === false) return false;
+    await delay(beatMs);
+    return current() && (sendSpecialKeys ? sendSpecialKeys('Enter') : backend.write('\r')) !== false;
+  }
   if (sendSpecialKeys) {
     if (opts.coco && sendText) {
       const cmd = content.trim();

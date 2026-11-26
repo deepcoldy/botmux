@@ -5629,7 +5629,7 @@ async function sendRawCommandLine(
   const writeGeneration = cliSpawnGeneration;
   const writeLifetime = cliLifetimeNonce;
   const writeOptions = {
-    ...rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
+    ...rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId, content),
     isCurrent: () => backend === be && cliSpawnGeneration === writeGeneration
       && cliLifetimeNonce === writeLifetime && !webTerminalInputWireDirty(),
   };
