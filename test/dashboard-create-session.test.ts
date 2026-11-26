@@ -81,6 +81,7 @@ let activeRegistryMock: Map<string, DaemonSession> | null = null;
 vi.mock('../src/core/worker-pool.js', () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => forkWorkerMock(...a),
+  settleOfflineReconciledQueuedActivation: vi.fn(),
   recordTurnExplicitMention: (...a: any[]) => recordTurnExplicitMentionMock(...a),
   sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
   forkAdoptWorker: vi.fn(),

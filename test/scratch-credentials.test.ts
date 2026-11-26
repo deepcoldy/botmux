@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { enumerateScratchSecretPaths } from '../src/adapters/backend/scratch-credentials.js';
@@ -95,15 +95,52 @@ describe('enumerateScratchSecretPaths', () => {
   it('masks the per-person secret dirs even before they exist, so later tokens inside stay hidden', () => {
     mkdirSync(data(), { recursive: true });
     const got = new Set(enumerateScratchSecretPaths({ botmuxHomes: [home()], dataDirs: [data()], sessionId: 'sess-1' }).denyPaths);
-    for (const dir of ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity']) {
+    for (const dir of ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'session-turns', 'cli-identity']) {
       expect(got.has(join(data(), dir)), dir).toBe(true);
     }
   });
 
-  it('never turns a same-named FILE into a directory mask', () => {
+  it('fails closed on unexpected directory and symlink inspection errors', () => {
+    mkdirSync(data(), { recursive: true });
+    // Following a symlink loop in the PARENT makes lstatSync itself fail ELOOP.
+    const loopingDataDir = join(data(), 'loop');
+    symlinkSync('loop', loopingDataDir);
+    expect(() => enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [loopingDataDir] }))
+      .toThrow(expect.objectContaining({ code: 'ELOOP' }));
+
+    // A loop in the final secret leaf passes lstat but fails statSync (the
+    // directory-symlink branch), covering the second former fail-open return.
+    const linked = join(data(), 'session-turns');
+    symlinkSync('session-turns', linked);
+    expect(() => enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [data()] }))
+      .toThrow(expect.objectContaining({ code: 'ELOOP' }));
+
+    // File-shaped authority and top-level/sidecar enumeration must follow the
+    // same fail-closed rule, not silently return a partial mask.
+    const configLoop = join(root, 'config-loop');
+    symlinkSync('config-loop', configLoop);
+    expect(() => enumerateScratchSecretPaths({
+      botmuxHomes: [], dataDirs: [], botsConfigPath: join(configLoop, 'bots.json'),
+    })).toThrow(expect.objectContaining({ code: 'ELOOP' }));
+    expect(() => enumerateScratchSecretPaths({ botmuxHomes: [configLoop], dataDirs: [] }))
+      .toThrow(expect.objectContaining({ code: 'ELOOP' }));
+  });
+
+  it('never turns a same-named FILE into a directory mask, but DOES mask a symlink to a directory and its target', () => {
     mkdirSync(data(), { recursive: true });
     writeFileSync(join(data(), 'oauth-pending'), 'x');
-    expect(enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [data()] }).denyPaths).not.toContain(join(data(), 'oauth-pending'));
+    const realTurnsTarget = join(root, 'external-turns');
+    mkdirSync(realTurnsTarget, { recursive: true });
+    symlinkSync(realTurnsTarget, join(data(), 'session-turns'));
+    const danglingTarget = join(root, 'future-vc-auth');
+    symlinkSync(danglingTarget, join(data(), 'vc-meeting-daemon-auth'));
+
+    const got = enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [data()] }).denyPaths;
+    expect(got).not.toContain(join(data(), 'oauth-pending'));
+    expect(got).toContain(join(data(), 'session-turns'));
+    expect(got).toContain(realpathSync(realTurnsTarget));
+    expect(got).not.toContain(join(data(), 'vc-meeting-daemon-auth'));
+    expect(got).toContain(danglingTarget);
   });
 
   it('adds external BOTS_CONFIG sidecar siblings outside the botmux home', () => {
@@ -125,7 +162,7 @@ describe('enumerateScratchSecretPaths', () => {
     // unconditionally, independent of SESSION_DATA_DIR), the enumerator returns
     // at most the HOST's own lark-cli keystores (a real secret it must never
     // un-mask), no file from the absent fake homes.
-    const fixedDirs = ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity'].map(d => join(data(), d));
+    const fixedDirs = ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'session-turns', 'cli-identity'].map(d => join(data(), d));
     fixedDirs.push(BACKGROUND_JOBS_HOME_ROOT, MEEGO_HOME_ROOT);
     const got = enumerateScratchSecretPaths({ botmuxHomes: [home(), join(root, 'nope')], dataDirs: [data()] }).denyPaths;
     // The detached-job host root is sealed even though it lives outside the
@@ -152,9 +189,11 @@ describe('enumerateScratchSecretPaths', () => {
   it('masks the per-person secret dirs even when the data dir itself does not exist yet', () => {
     // A custom SESSION_DATA_DIR leaves ~/.botmux/data uncreated until the first
     // login, which may happen while a scratch session runs.
-    const got = new Set(enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [data()], sessionId: 'sess-1' }).denyPaths);
-    for (const dir of ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'cli-identity']) {
+    const customData = join(root, 'custom-state', 'data');
+    const got = new Set(enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [customData, data()], sessionId: 'sess-1' }).denyPaths);
+    for (const dir of ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'session-turns', 'cli-identity']) {
       expect(got.has(join(data(), dir)), dir).toBe(true);
+      expect(got.has(join(customData, dir)), `custom:${dir}`).toBe(true);
     }
   });
 
