@@ -47,7 +47,8 @@ export function replyCardAskTarget(
   const record = new TurnReplyCardStore(config.session.dataDir).read({
     larkAppId: input.larkAppId, sessionId: input.sessionId, ...target,
   });
-  if (!record || record.mode !== 'unified' || record.withdrawn || replyCardIsTerminal(record) || record.finalDelivered) return undefined;
+  if (!record || record.mode !== 'unified' || record.withdrawn || replyCardIsTerminal(record) || record.finalDelivered
+    || (!record.messageId && record.nativeCot && !record.nativeCotReady)) return undefined;
   const groupContextAuthorOrigin = readGroupContextAuthorOrigin({
     appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: target.turnId,
     nativeSessionId: ds.session.cliSessionId, workerGeneration: ds.session.workerGeneration,
@@ -77,16 +78,21 @@ export async function publishReplyCardAsk(ask: PendingAsk, result?: AskResult, c
     const record = store.read(key);
     if (!record || record.chatId !== ask.chatId || getBot(ask.larkAppId).config.apiOnly) throw new Error('Ask reply-card destination unavailable');
   };
+  const replyRoot = typeof ask.cardRootMessageId === 'string' && ask.cardRootMessageId.startsWith('om_')
+    ? ask.cardRootMessageId
+    : typeof ask.rootMessageId === 'string' && ask.rootMessageId.startsWith('om_')
+      ? ask.rootMessageId
+      : undefined;
   const transport: TurnReplyCardTransport = {
     forcePatch,
     beforeEffect,
-    send: (body, uuid) => ask.rootMessageId?.startsWith('om_')
-      ? replyMessage(ask.larkAppId, ask.rootMessageId, body, 'interactive', true, uuid, undefined,
+    send: (body, uuid) => replyRoot
+      ? replyMessage(ask.larkAppId, replyRoot, body, 'interactive', true, uuid, undefined,
           groupContextAuthorOrigin ? { groupContextAuthorOrigin } : undefined)
       : sendMessage(ask.larkAppId, ask.chatId, body, 'interactive', uuid, undefined,
           groupContextAuthorOrigin ? { groupContextAuthorOrigin } : undefined),
     patch: (messageId, body) => patchReplyCardWithAuditRedaction(ask.larkAppId, body, `ask turn=${ask.replyCardTarget!.turnId.substring(0, 8)}`,
-      card => patchPublishedGroupCard(ask.larkAppId, ask.chatId, messageId, card, ask.rootMessageId ?? undefined, groupContextAuthorOrigin)),
+      card => patchPublishedGroupCard(ask.larkAppId, ask.chatId, messageId, card, replyRoot, groupContextAuthorOrigin)),
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     sendOverflow: async (text, uuid) => {
       const path = join(store.directory, `${store.id(key)}-reply.md`);
@@ -94,8 +100,8 @@ export async function publishReplyCardAsk(ask: PendingAsk, result?: AskResult, c
       const fileKey = await uploadFile(ask.larkAppId, path);
       beforeEffect();
       const content = JSON.stringify({ file_key: fileKey });
-      return ask.rootMessageId?.startsWith('om_')
-        ? replyMessage(ask.larkAppId, ask.rootMessageId, content, 'file', true, uuid)
+      return replyRoot
+        ? replyMessage(ask.larkAppId, replyRoot, content, 'file', true, uuid)
         : sendMessage(ask.larkAppId, ask.chatId, content, 'file', uuid);
     },
     render: record => {
