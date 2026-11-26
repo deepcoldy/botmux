@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnTsScript } from './helpers/ts-runner.js';
+import { fileURLToPath } from 'node:url';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import {
   startPluginServices, stopPluginServices, listPluginServiceStatus,
@@ -9,7 +11,7 @@ import {
 } from '../src/core/plugins/service-manager.js';
 import { loadPluginServiceDefinition } from '../src/core/plugins/runtime.js';
 import { changePluginService, readPluginProcesses } from '../src/core/plugins/supervisor-client.js';
-import { readPluginSupervisorDesired, pluginSupervisorStatePath, pluginSupervisorResultPath } from '../src/core/plugins/supervisor-store.js';
+import { readPluginSupervisorDesired, pluginSupervisorStatePath, pluginSupervisorResultPath, pluginSupervisorDir } from '../src/core/plugins/supervisor-store.js';
 import { readFleetState } from '../src/core/fleet-state-store.js';
 import { pidAlive } from '../src/core/fleet-supervisor.js';
 import { userSystemdBusEnv } from '../src/core/session-scope.js';
@@ -96,6 +98,74 @@ describe('plugin services on the built-in supervisor', () => {
     catch { return undefined; }
   };
   const ready = (id: string) => until(() => readyPid(id) !== undefined && readyPid(id) === proc(id)?.pid, `${id} ready`);
+
+  async function stopCli(id?: string) {
+    const args = ['plugin', 'service', 'stop', ...(id ? [id] : [])];
+    // Keep the parent's event loop running so it can reap its supervisor child
+    // while the separate CLI waits for that host to exit.
+    const child = spawnTsScript(fileURLToPath(new URL('../src/cli.ts', import.meta.url)), args, {
+      env: process.env, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr!.on('data', chunk => { stderr += String(chunk); });
+    child.stdout!.resume();
+    const status = await new Promise<number | null>((resolve, reject) => {
+      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('stop CLI timed out')); }, 25_000);
+      child.once('error', error => { clearTimeout(timer); reject(error); });
+      child.once('exit', code => { clearTimeout(timer); resolve(code); });
+    });
+    expect(status, stderr).toBe(0);
+  }
+
+  it('explicit stop --all exits the host and releases its owner lock after stopping members', async () => {
+    fixture('one');
+    fixture('two');
+    await startPluginServices(['one', 'two']);
+    await ready('one');
+    await ready('two');
+    const owner = readFleetState(pluginSupervisorStatePath())!.supervisorPid;
+    const one = proc('one')!.pid!;
+    const two = proc('two')!.pid!;
+    await stopCli('one');
+    expect(pidAlive(one)).toBe(false);
+    expect(proc('two')!.pid).toBe(two);
+    expect(pidAlive(two)).toBe(true);
+    expect(pidAlive(owner)).toBe(true);
+    await stopCli('--all');
+    expect(pidAlive(two)).toBe(false);
+    expect(pidAlive(owner)).toBe(false);
+    expect(existsSync(join(pluginSupervisorDir(), 'owner.lock'))).toBe(false);
+    expect(readFleetState(pluginSupervisorStatePath())!.supervisorPid).toBe(0);
+  }, 60_000);
+
+  it('keeps the host for implicit stop and exits an already idle host only for explicit --all', async () => {
+    fixture('idle');
+    await startPluginServices(['idle']);
+    await ready('idle');
+    const owner = readFleetState(pluginSupervisorStatePath())!.supervisorPid;
+    await stopCli();
+    expect(pidAlive(owner)).toBe(true);
+    expect(proc('idle')!.pid).toBeUndefined();
+    await stopCli('--all');
+    expect(pidAlive(owner)).toBe(false);
+    await stopCli('--all'); // repeated stop must not create a new host
+    expect(existsSync(join(pluginSupervisorDir(), 'owner.lock'))).toBe(false);
+  }, 60_000);
+
+  it('explicit --all cancels a failed start restart even without an installed registry member', async () => {
+    const { record } = fixture('template');
+    const spec = resolvePluginServiceSpec(record, (await loadPluginServiceDefinition(record))!);
+    spec.name = 'botmux-plugin-unregistered';
+    spec.external.command = join(home, 'missing-executable');
+    await expect(changePluginService('unregistered', 'start', spec)).rejects.toThrow();
+    const owner = readFleetState(pluginSupervisorStatePath())!.supervisorPid;
+    await stopCli('--all');
+    expect(readPluginSupervisorDesired().services.unregistered.running).toBe(false);
+    expect(pidAlive(owner)).toBe(false);
+    await delay(800);
+    expect(existsSync(join(pluginSupervisorDir(), 'owner.lock'))).toBe(false);
+    expect(readPluginProcesses().every(p => !p.pid && p.status === 'stopped')).toBe(true);
+  }, 60_000);
 
   it('installs and queries without creating a supervisor; update/uninstall guard checks actual liveness', async () => {
     const { root, runtimeDir } = fixture('demo');

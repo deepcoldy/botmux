@@ -1,12 +1,14 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { closeSync, mkdirSync, openSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { isLinuxZombie, readDurableProcessIdentity } from '../../utils/process-identity.js';
 import { scrubExternalMemberEnv } from '../../utils/child-env.js';
+import { pidNotProvablyGone } from '../../utils/process-alive.js';
+import { signalAttestedFleetProcess } from '../fleet-process-identity.js';
 import { pidAlive } from '../fleet-supervisor.js';
 import { isStandaloneBinary, resolveEntrySpawn } from '../self-spawn.js';
 import { liveGodAt } from '../legacy-pm2-reaper.js';
@@ -104,6 +106,74 @@ function supervisorAlive(): boolean {
   const result = readPluginSupervisorResult();
   return !!result && pidAlive(result.pid) && !!result.processStart
     && readDurableProcessIdentity(result.pid) === result.processStart;
+}
+
+/** Caller holds the service-manager lock. Explicit --all also covers desired
+ * members absent from the installed registry, including failed-start retries.
+ * Reuse the host's signal/finally path; a delivered signal is not completion. */
+export async function shutdownPluginSupervisor(): Promise<void> {
+  assertNoLegacyPluginPm2();
+  readPluginSupervisorDesired(); // validate uncertainty even without a host result
+  const initial = readPluginSupervisorResult();
+  const ownerLock = join(pluginSupervisorDir(), 'owner.lock');
+  const assertIdentity = (result: NonNullable<typeof initial>) => {
+    if (!result.processStart) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+    const identity = readDurableProcessIdentity(result.pid);
+    if (!identity) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+    if (identity !== result.processStart) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+  };
+  const assertComplete = () => {
+    const state = readPluginSupervisorState();
+    if (Object.values(readPluginSupervisorDesired().services).some(item => item.running)
+      || existsSync(ownerLock) || (initial && !state) || state?.supervisorPid
+      || state?.procs.some(proc => proc.pid > 1 || proc.status === 'online' || proc.status === 'launching')) {
+      throw new Error('plugin_supervisor_shutdown_incomplete');
+    }
+  };
+  if (!initial) {
+    if (existsSync(ownerLock)) throw new Error('plugin_supervisor_identity_unknown');
+    assertComplete();
+    return;
+  }
+  if (!pidNotProvablyGone(initial.pid)) {
+    assertComplete();
+    return;
+  }
+  assertIdentity(initial);
+  for (const [id, item] of Object.entries(readPluginSupervisorDesired().services)) {
+    if (item.running) await changePluginService(id, 'stop');
+  }
+  const desired = readPluginSupervisorDesired();
+  const result = readPluginSupervisorResult();
+  if (!result || result.pid !== initial.pid || result.processStart !== initial.processStart) {
+    throw new Error('plugin_supervisor_identity_mismatch');
+  }
+  if (result.error) throw new Error(result.error);
+  if (Object.values(desired.services).some(item => item.running)) throw new Error('plugin_supervisor_members_running');
+  if (!pidNotProvablyGone(result.pid)) {
+    assertComplete();
+    return;
+  }
+  assertIdentity(result);
+  if (!signalAttestedFleetProcess({ pid: result.pid, processStart: result.processStart! }, 'SIGTERM')) {
+    if (pidNotProvablyGone(result.pid)) {
+      assertIdentity(result);
+      throw new Error(`plugin_supervisor_signal_failed:${result.pid}`);
+    }
+    assertComplete();
+    return;
+  }
+  const longestStop = Math.max(8_000, ...Object.values(desired.services).map(item => item.spec.external.killTimeoutMs ?? 8_000));
+  const deadline = Date.now() + longestStop + 6_000;
+  while (Date.now() < deadline) {
+    if (!pidNotProvablyGone(result.pid)) {
+      assertComplete();
+      return;
+    }
+    assertIdentity(result);
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`plugin_supervisor_shutdown_timeout:${result.pid}`);
 }
 
 function launchSupervisor(): void {
