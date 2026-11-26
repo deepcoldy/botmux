@@ -455,4 +455,59 @@ describe('resolvePinnedWorkingDir', () => {
     expect(result.pinnedWorkingDir).toBe(defaultDir);
     expect(result.pinnedFromBotDefault).toBe(true);
   });
+
+  it('prefers /g created-group workingDir above defaultOncall, bot default, and peer inheritance, but below explicit oncall', async () => {
+    const { botRegistry, sessionStore, daemon } = await loadFreshModules();
+    const { recordCreatedGroup } = await import('../src/services/created-groups-store.js');
+    const groupDir = tempDir('group-bound-repo');
+    const defaultDir = tempDir('bot-default-repo');
+    const defaultOncallDir = tempDir('default-oncall-repo');
+    const explicitOncallDir = tempDir('explicit-oncall-repo');
+    const peerDir = tempDir('peer-repo');
+
+    recordCreatedGroup({
+      chatId: 'oc_group_bound',
+      creatorAppId: 'app-creator',
+      ownerOpenId: 'ou_owner',
+      workingDir: groupDir,
+    });
+
+    botRegistry.registerBot({
+      larkAppId: 'app-other',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      defaultWorkingDir: defaultDir,
+      defaultOncall: { enabled: true, workingDir: defaultOncallDir, since: 1 },
+    });
+    await seedPeerSession(sessionStore, peerDir);
+
+    const fromGroup = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'chat',
+      anchor: 'oc_group_bound',
+      chatId: 'oc_group_bound',
+      chatType: 'group',
+      larkAppId: 'app-other',
+    });
+    expect(fromGroup.pinnedWorkingDir).toBe(groupDir);
+    expect(fromGroup.oncallEntry).toBeUndefined();
+    expect(fromGroup.inheritedFrom).toBeNull();
+    expect(fromGroup.pinnedFromBotDefault).toBe(false);
+
+    // An explicit /oncall bind on the chat still outranks created-groups.json.
+    botRegistry.registerBot({
+      larkAppId: 'app-explicit',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      oncallChats: [{ chatId: 'oc_group_bound', workingDir: explicitOncallDir }],
+    });
+    const fromExplicitOncall = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'chat',
+      anchor: 'oc_group_bound',
+      chatId: 'oc_group_bound',
+      chatType: 'group',
+      larkAppId: 'app-explicit',
+    });
+    expect(fromExplicitOncall.pinnedWorkingDir).toBe(explicitOncallDir);
+    expect(fromExplicitOncall.oncallEntry?.workingDir).toBe(explicitOncallDir);
+  });
 });

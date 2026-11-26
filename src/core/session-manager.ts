@@ -1,3 +1,4 @@
+import { createdGroupWorkingDir } from '../services/created-groups-store.js';
 import { renderInboundMessageLocation, type InboundMessageLocation } from './reply-message.js';
 import { isWorkflowNodeSessionMarker, workflowHandoffInputOptions } from './workflow-node-session.js';
 import { isLeadOnlySession } from './lead-only.js';
@@ -26,9 +27,11 @@ import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState }
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, findActiveBySessionId, identityStorageModelForDaemonSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, settleOfflineReconciledQueuedActivation, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, findActiveBySessionId, identityStorageModelForDaemonSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import type { CliAdapter } from '../adapters/cli/types.js';
+import { isCodexAppCliId, type CliAdapter } from '../adapters/cli/types.js';
+import { readPersistedExecutionContract } from './session-controller.js';
+import { isDurableArgvCliId, isExecutionPhaseConfirmedBeyondSubmitting, resolveQueuedActivationEffectiveTurn } from '../services/queued-activation-reconcile.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { credentialSourceForcesBotHome } from '../services/cli-credential-source.js';
 import { resolveSandboxMode, resolveSpawnNetworkShape } from '../adapters/cli/sandbox-mode.js';
@@ -52,6 +55,7 @@ import { compactSkillTriggerSummary } from './skills/prompt.js';
 import { resolveConditionalLine } from '../skills/effective-builtins.js';
 import {
   getSessionPersistentBackendType,
+  isRemoteBackendSession,
   persistentBackendTargetForSession,
   probePersistentBackendTarget,
   probePersistentBackendTargets,
@@ -3911,6 +3915,22 @@ export async function restoreActiveSessions(
       ds.pendingRawInput = session.pendingRepoSetup.rawInput;
       ds.pendingRawTurnId = session.pendingRepoSetup.turnId ?? session.queuedActivationTurnId;
     }
+    if (ds.pendingRawInput !== undefined) {
+      const resolvedRawCliId = session.cliLaunchSnapshot?.cliId
+        ?? session.cliId
+        ?? getAllBots().find(b => b.config.larkAppId === ds.larkAppId)?.config.cliId;
+      if (!isCodexAppCliId(resolvedRawCliId)) {
+        const rawTurn = resolveQueuedActivationEffectiveTurn(session, {
+          pendingRawInput: ds.pendingRawInput,
+          pendingRawTurnId: ds.pendingRawTurnId,
+        });
+        const rawContract = readPersistedExecutionContract(ds, rawTurn.turnId, rawTurn.dispatchAttempt);
+        if (rawContract.hasContract && isExecutionPhaseConfirmedBeyondSubmitting(rawContract.phase)) {
+          ds.pendingRawInput = undefined;
+          ds.pendingRawTurnId = undefined;
+        }
+      }
+    }
     try {
       const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
       if (mismatchClose !== 'not_mismatched') {
@@ -4109,6 +4129,17 @@ export async function restoreActiveSessions(
     if (ds.session.queued) continue;
     const backendType = getSessionPersistentBackendType(ds);
     if (!backendType) {
+      if (ds.session.queuedActivationPending) {
+        const resolvedCliId = ds.session.cliLaunchSnapshot?.cliId
+          ?? ds.session.cliId
+          ?? getAllBots().find(b => b.config.larkAppId === ds.larkAppId)?.config.cliId;
+        settleOfflineReconciledQueuedActivation(ds, {
+          isCodexApp: isCodexAppCliId(resolvedCliId),
+          isRemoteBackend: isRemoteBackendSession(ds),
+          isDurableArgvCli: isDurableArgvCliId(resolvedCliId),
+          backingMode: 'cold_restore',
+        });
+      }
       if (hasProtectedSessionMutationOwnership(ds)) {
         logger.warn(`[${ds.session.sessionId.substring(0, 8)}] non-persistent backend has durable activation ownership — scheduling eager recovery`);
         toReattach.push(ds);
@@ -4139,6 +4170,17 @@ export async function restoreActiveSessions(
       : probeSnapshots.get(persistentBackendTargetKey(backendTarget)) ?? 'unknown';
     if (probe === 'missing') {
       const tag = ds.session.sessionId.substring(0, 8);
+      if (ds.session.queuedActivationPending) {
+        const resolvedCliId = ds.session.cliLaunchSnapshot?.cliId
+          ?? ds.session.cliId
+          ?? getAllBots().find(b => b.config.larkAppId === ds.larkAppId)?.config.cliId;
+        settleOfflineReconciledQueuedActivation(ds, {
+          isCodexApp: isCodexAppCliId(resolvedCliId),
+          isRemoteBackend: isRemoteBackendSession(ds),
+          isDurableArgvCli: isDurableArgvCliId(resolvedCliId),
+          backingMode: 'cold_restore',
+        });
+      }
       if (ds.session.queuedActivationPending) {
         logger.warn(`[${tag}] ${backendType} backing is missing with a tokened activation — scheduling fresh exact recovery`);
         toReattach.push(ds);
@@ -6216,6 +6258,8 @@ export async function deliverWorkflowNodeTurn(
 function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string): string | undefined {
   const oncall = findOncallChat(larkAppId, chatId)?.workingDir;
   if (oncall) return oncall;
+  const groupDir = createdGroupWorkingDir(chatId);
+  if (groupDir) return groupDir;
   const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
   if (!raw) return undefined;
   const resolved = expandHome(raw);
@@ -6280,7 +6324,11 @@ async function forkOrShowRepoCard(
   // 非 git 仓库 / 建失败 → 回退默认目录（提示经 notify 发）。registry 拿不到时兜底走原同步路径。
   const registry = getActiveSessionsRegistry();
   if (registry && ds.workingDir && !ds.worktreeCreating && botAutoWorktreeEnabled(larkAppId)) {
+    // A directory explicitly bound via `/g --dir` (created-groups.json) is a
+    // user-pinned directory even when its path happens to equal the bot default:
+    // it must start in place, never be silently rewritten into an auto-worktree.
     const isBotDefaultDir = !findOncallChat(larkAppId, ds.chatId)?.workingDir
+      && !createdGroupWorkingDir(ds.chatId)
       && ds.workingDir === expandHome(effectiveDefaultWorkingDir(bot.config) ?? '');
     if (isBotDefaultDir) {
       const baseDir = ds.workingDir;

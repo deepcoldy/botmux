@@ -35,6 +35,51 @@
 
 > 想让 agent 帮你查，见 [常见踩坑](/pitfalls) 里的「排查通用手法」：用 `botmux logs` 找到启动命令在本地复现，再用 Web 终端看真实报错。
 
+#### 手动补全开放平台配置 {#manual-open-platform-setup}
+
+以下情况需要自己去开放平台补配置：
+
+- setup 加了 `botmux setup --no-open-platform-auto`，明确跳过自动配置；
+- 自动配置失败。
+
+setup 会列出要补的几项和对应链接：开启机器人能力、配置长连接事件订阅、导入权限、配置重定向 URL、创建并发布版本。完整权限清单写在 `~/.botmux/lark-scopes.json`。可用范围选「仅自己可见」，版本一般会自动通过审核。普通消息必需的机器人能力、`im.message.receive_v1`、`card.action.trigger` 和发版检查见上面的清单。
+
+#### 让 AI 做只读诊断 {#ai-diagnostics}
+
+可以让已安装的 AI CLI 帮你读状态和日志、给出最可能原因。先把排查任务存成变量：
+
+```bash
+DIAG='botmux 在飞书群收不到消息，请只读排查（别改任何东西），依次执行并给出最可能原因+修复步骤：botmux status（daemon 在跑吗）；botmux logs --lines 150 --no-follow（找 WebSocket 连接失败、token 鉴权、权限报错 401/403/411/400、CLI spawn 失败）；cat ~/.botmux/bots.json（确认 AppID/Secret/CLI 配置）；判断长连接是否被公司网/代理/防火墙挡住。最后给结论。'
+```
+
+再按你安装的 CLI 选一条运行：
+
+```bash
+claude -p "$DIAG" --allowedTools "Bash"   # Claude Code
+codex exec "$DIAG"                         # Codex
+coco  -p "$DIAG" --yolo                    # TRAE CLI 1.0 / CoCo（旧版）
+cursor-agent -p "$DIAG"                    # Cursor
+```
+
+这些都是非交互模式，跑完直接打印结论。`--allowedTools` / `--yolo` 只是让 agent 能执行命令读日志。
+
+手动排查时，先看 `botmux status`；改过配置就执行 `botmux restart`。权限不全或用了旧应用建的机器人时，建议用最新 `botmux setup` 扫码重建；长连接出不去时，`botmux logs` 通常会有连接错误。更多见[常见踩坑](/pitfalls)。
+
+#### 可选事件：编辑补 @、撤回同步、群解散 {#optional-events}
+
+下面几个事件缺了**不影响普通消息**，只影响对应的小功能。新建的机器人会自动订阅；老机器人在启动时，botmux 会借本机已有的开放平台登录状态尝试补上。
+
+| 事件 | 用途 |
+|---|---|
+| `im.message.updated_v1` | 编辑一条之前没 @ 机器人的消息、补上 @ 后触发任务 |
+| `im.message.recalled_v1` | 群聊上下文共享（`/context-sharing`）里，撤回的消息同步从记录中标记掉。只在开了这个功能时才会去补 |
+| `im.chat.disbanded_v1` | 群被解散后，结束机器人在这个群里的会话（和 `/close` 一样，之后还能恢复，不删 worktree）。缺了的话，要等 daemon 下次重启时才会把这些会话关掉 |
+
+注意：
+
+- 启动时补订阅只会在现有的长连接配置里加事件，**不会**改接收方式、改权限或发布版本。日志里「更新请求成功」不代表已经生效。正式应用请到开放平台检查待发布的改动、发布版本，再找一条没触发过的消息编辑补 @ 验证。
+- 如果发送者是靠「团队成员」身份获得发言权限的，编辑消息还要查通讯录拿到对方的 `union_id`。这需要应用有通讯录读取权限（默认权限清单里有 `contact:user.id:readonly`），且对方在应用可见范围内。查不到时只按消息原作者的 `open_id` 判断权限，不会借用编辑人的身份。
+
 ### B. 别人用不了
 
 botmux 的权限分两层：

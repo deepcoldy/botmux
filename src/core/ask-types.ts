@@ -182,7 +182,7 @@ export interface CreateAskInput {
   chatId: string;
   /** thread-scope ask → root message_id; chat-scope ask → null. */
   rootMessageId: string | null;
-  /** chat-scope 下发起 turn 冻结的话题根，只决定卡片发到哪；不属于 ask 身份，也不落盘。 */
+  /** chat-scope 下冻结的提问话题，供发卡与文字隔离；不属于调用身份，跨重启保留。 */
   cardRootMessageId?: string;
   /** Session that issued the ask — used for audit + future replay scoping. */
   sessionId: string;

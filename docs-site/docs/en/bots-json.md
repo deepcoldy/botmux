@@ -693,7 +693,7 @@ When off (the default), replies and cards are sent as written and no related rul
 - Reply processing and the per-turn reminder apply immediately; the full rule in the system prompt applies from the next new session.
 - The Dashboard switch "Bot Config → Message Cards → Development host addresses" writes this field.
 
-### Zero prompt injection (`promptInjection: "none"`)
+### Zero prompt injection (`promptInjection: "none"`) {#zero-prompt-injection}
 
 For multi-agent pipelines where a lead bot hands out work and sub-bots just execute, or whenever you don't want botmux adding anything to the prompt.
 
