@@ -20,6 +20,27 @@ import {
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 describe('parseTriggerUserAuthConfig', () => {
+  it('roundtrips the broker mode and preserves per-capability actor sources while disabled', () => {
+    const raw = { enabled: false, capabilities: ['bytecloud'],
+      credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+      bytecloudExecution: 'read-machine-write-actor', allowOwnerActor: true };
+    const config = parseTriggerUserAuthConfig(raw);
+    expect(config).toMatchObject(raw);
+    expect(parseTriggerUserAuthConfig(JSON.parse(JSON.stringify(config)))).toEqual(config);
+    expect(credentialSourceOf(config, 'bytecloud')).toBe('platform');
+  });
+
+  it('rejects an invalid execution enum even when the policy is dormant', () => {
+    for (const bytecloudExecution of ['machine', '', null, true, {}]) {
+      expect(() => parseTriggerUserAuthConfig({ enabled: false, bytecloudExecution })).toThrow(/bytecloudExecution/);
+    }
+  });
+
+  it('preserves explicit legacy execution without adding a mode to absent legacy config', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true, bytecloudExecution: 'trigger-user' }))
+      .toHaveProperty('bytecloudExecution', 'trigger-user');
+    expect(parseTriggerUserAuthConfig({ enabled: true })).not.toHaveProperty('bytecloudExecution');
+  });
   it('treats an absent field as "not configured at all"', () => {
     expect(parseTriggerUserAuthConfig(undefined)).toBeNull();
     expect(parseTriggerUserAuthConfig(null)).toBeNull();

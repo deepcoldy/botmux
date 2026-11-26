@@ -10,10 +10,11 @@
  *
  * A trigger-user call uses the credentials of the current message's sender, or
  * the call is refused with an authorization entry. There is no downgrade to a
- * bot or machine identity, and falling back to *another person's* login is
+ * bot or machine identity for writes, and falling back to *another person's* login is
  * never allowed — not even the owner's. That is what the feature exists to
- * remove, so there is deliberately no config value that asks for it (the old
- * `fallback` field is parsed and ignored).
+ * remove (the old `fallback` field is parsed and ignored). The opt-in ByteCloud
+ * broker mode separately allows catalogued reads with host credentials while
+ * preserving that actor-only rule for writes.
  *
  * Why no owner exception: the moment one exists, "whose permissions ran this?"
  * loses its single answer, and every credential lookup grows a branch. Those
@@ -59,6 +60,9 @@ export type TriggerUserAuthCredentialSourceConfig =
   | TriggerUserAuthCredentialSource
   | Partial<Record<'default' | TriggerUserAuthCredentialSourceCapability, TriggerUserAuthCredentialSource>>;
 
+export const BYTECLOUD_EXECUTION_MODES = ['trigger-user', 'read-machine-write-actor'] as const;
+export type BytecloudExecutionMode = typeof BYTECLOUD_EXECUTION_MODES[number];
+
 /**
  * Per-bot capability switches. Each is either native (off: the CLI runs with
  * this machine's own login, untouched) or trigger-user (on: the message
@@ -83,6 +87,9 @@ export interface TriggerUserAuthConfig {
    *  it; it is optional on the type only so hand-built configs (tests, legacy
    *  callers) keep compiling — read it through {@link credentialSourceOf}. */
   credentialSource?: TriggerUserAuthCredentialSourceConfig;
+  /** Absent retains the legacy whole-capability actor identity. The broker
+   * mode is effective only while ByteCloud and this policy are enabled. */
+  bytecloudExecution?: BytecloudExecutionMode;
   /** The legacy `fallback` value as stored. Never acted on; it only keeps the
    *  background-job policy key of an unedited config what it was. */
   legacyFallback?: 'bot-identity' | 'none';
@@ -256,6 +263,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
   }
 
   const credentialSource = parseCredentialSource(rec.credentialSource);
+  const bytecloudExecution = parseBytecloudExecution(rec.bytecloudExecution);
 
   if (rec.delegateOnMention !== undefined && rec.delegateOnMention !== null
     && typeof rec.delegateOnMention !== 'boolean') {
@@ -315,6 +323,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     tools,
     ...(capabilities ? { capabilities } : {}),
     credentialSource,
+    ...(bytecloudExecution !== undefined ? { bytecloudExecution } : {}),
     ...(rec.fallback === 'none' || rec.fallback === 'bot-identity' ? { legacyFallback: rec.fallback } : {}),
     // Equal to the default → not stored.
     ...(rec.delegateOnMention === false ? { delegateOnMention: false } : {}),
@@ -325,6 +334,14 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
   };
+}
+
+function parseBytecloudExecution(value: unknown): BytecloudExecutionMode | undefined {
+  if (value === undefined) return undefined;
+  if (!(BYTECLOUD_EXECUTION_MODES as readonly unknown[]).includes(value)) {
+    throw new TriggerUserAuthConfigError('triggerUserAuth.bytecloudExecution must be trigger-user | read-machine-write-actor');
+  }
+  return value as BytecloudExecutionMode;
 }
 
 /** Restrict dispatch-only credentials to a direct human or an already verified
