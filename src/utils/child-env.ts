@@ -1114,3 +1114,16 @@ export function scrubExternalMemberEnv(env: NodeJS.ProcessEnv): void {
   delete env.BOTMUX_PM2_GRACEFUL_EXIT_CODE;
   env.TERM = 'xterm-256color';
 }
+
+/** Strict ByteCloud session boundary, applied after config/model env merges.
+ * Keep unrelated model and Lark channels. Never accept SDK store, token, actor,
+ * loader or git credential overrides from a caller. */
+export function scrubBytedcliBrokerEnv(env: NodeJS.ProcessEnv, preserveManagedGit = false): void {
+  for (const key of Object.keys(env)) {
+    if ((!preserveManagedGit && /^(GIT_ASKPASS|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+)$/.test(key))
+      || /^(BYTEDCLI_|BYTECLOUD_|CODEBASE_|BITSCLI_|BITS_|AIME_|AILY_|BOTMUX_IDENTITY_CLOUD_JWT_|BOTMUX_MEEGO_)/i.test(key)
+      || ['BOTMUX_AS', 'NODE_OPTIONS', 'NODE_PATH', 'BUN_OPTIONS', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
+        'CLOUD_JWT', 'CODE_JWT', 'SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_CONFIG_PARAMETERS',
+        'BOTS_CONFIG', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'MEEGO_HOME', 'MEEGO_TOKEN'].includes(key)) delete env[key];
+  }
+}

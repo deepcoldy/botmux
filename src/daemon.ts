@@ -5179,6 +5179,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     noteScheduledIdentityRestored(ds, task, turnId, identity);
   } else noteScheduledIdentityGap(ds, task, turnId, identity);
   const outcomes = await publishTurnCliIdentity({
+    currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
     botConfig: getBot(ds.larkAppId).config,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
@@ -5352,6 +5353,7 @@ async function prepareDelegatedScheduledTurnIdentity(
     noteScheduledIdentityRestored(ds, authorized.task, turnId, identity);
     const publicationSnapshot = scheduledPublicationSnapshot();
     await publishTurnCliIdentity({
+      currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
       botConfig: getBot(ds.larkAppId).config,
       sessionDataDir: config.session.dataDir,
       sessionId: ds.session.sessionId,
@@ -5370,6 +5372,7 @@ async function prepareDelegatedScheduledTurnIdentity(
   } else {
     const publicationSnapshot = scheduledPublicationSnapshot();
     await publishTurnCliIdentity({
+      currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
       botConfig: getBot(ds.larkAppId).config,
       sessionDataDir: config.session.dataDir,
       sessionId: ds.session.sessionId,
@@ -5511,6 +5514,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     delegatedIdentity = { ...delegatedIdentity, tools: [], denialReason: 'task_turn_isolation_required' };
   }
   const outcomes = await publishTurnCliIdentity({
+    currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
     botConfig,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
@@ -8218,6 +8222,7 @@ async function withdrawWorkflowHandoffIdentity(ds: DaemonSession, turnId: string
   // (its attempt not yet closed), yet its delegation is done.
   const { recheck: _recheck, targetOpenId: _target, ...rest } = remembered;
   await publishTurnCliIdentity({
+    currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
     botConfig: getBot(ds.larkAppId).config,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,

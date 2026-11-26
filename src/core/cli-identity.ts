@@ -1,3 +1,4 @@
+import { bytecloudExportBlocked, forgetBytedcliSessionPolicyReader } from './bytedcli-strict-session.js';
 /**
  * Session credential handoff for trigger-user CLI authentication.
  *
@@ -100,6 +101,7 @@ export function rememberProvenIdentityContent(
   tool: IdentityTool,
   body: string,
 ): void {
+  if (tool !== 'lark-cli' && bytecloudExportBlocked(sessionDataDir, sessionId)) return;
   const key = provenSessionKey(sessionDataDir, sessionId);
   const turns = provenSessionMap(key, true)!;
   const tools = turns.get(turnId) ?? {};
@@ -121,6 +123,7 @@ export function recallProvenIdentityContent(
 export function recallProvenIdentitySnapshot(
   sessionDataDir: string, sessionId: string, turnId: string, tool: IdentityTool,
 ): ProvenIdentitySnapshot | undefined {
+  if (tool !== 'lark-cli' && bytecloudExportBlocked(sessionDataDir, sessionId)) return undefined;
   return provenSessionMap(provenSessionKey(sessionDataDir, sessionId), false)?.get(turnId)?.[tool];
 }
 
@@ -1176,6 +1179,9 @@ export function writeSessionIdentity(
   published: CliIdentity,
   model: IdentityStorageModel,
 ): string {
+  if (published.tool !== 'lark-cli' && bytecloudExportBlocked(sessionDataDir, sessionId)) {
+    throw new Error('ByteCloud credential export is unavailable for a strict session');
+  }
   const identity = publishedIdentityShape(sessionDataDir, sessionId, published);
   const body = renderIdentityEnv(identity);
   const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool, identity.turnId);
@@ -1369,6 +1375,7 @@ export function clearSessionIdentity(
  *  only; single-snapshot files and any on-disk leftovers from an older layout
  *  are removed as well. */
 export function clearAllSessionIdentities(sessionDataDir: string, sessionId: string): void {
+  forgetBytedcliSessionPolicyReader(sessionDataDir, sessionId);
   clearLarkToolDelegations(sessionDataDir, sessionId);
   forgetProvenIdentityContent(sessionDataDir, sessionId);
   for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
@@ -1652,6 +1659,8 @@ export interface NativeBytedcliCapabilities {
   meego?: boolean;
   /** Everything except Meego runs natively. */
   bytecloud?: boolean;
+  /** Credential-free host broker entry. Never fall through to a native CLI. */
+  brokerClient?: readonly string[];
 }
 
 const AS_UNAVAILABLE_MSG = 'botmux: 这次调用无法使用 BOTMUX_AS（命令使用本机原生登录，或本会话按单快照模式运行，不逐次向 daemon 取身份），命令未执行；去掉 BOTMUX_AS 重试。';
@@ -1679,6 +1688,13 @@ export function renderIdentityWrapper(
   identityResolver?: readonly string[],
   nativeCapabilities: NativeBytedcliCapabilities = {},
 ): string {
+  if (nativeCapabilities.brokerClient && tool !== 'lark-cli') {
+    return ['#!/bin/sh', IDENTITY_WRAPPER_MARKER, refuseBotmuxAs('exit'),
+      tool === 'bytedcli'
+        ? `exec ${nativeCapabilities.brokerClient.map(shellSingleQuote).join(' ')} "$@"`
+        : `printf '%s\\n' 'botmux: standalone credential tools are unavailable in broker mode' >&2; exit 77`,
+      ''].join('\n');
+  }
   const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
   const governsByteCloud = !(tool === 'bytedcli' && nativeCapabilities.bytecloud);
   const governsMeego = tool === 'bytedcli' && !nativeCapabilities.meego;
@@ -2054,6 +2070,21 @@ export function ensureSessionIdentityStorage(
 
 /** A bytedcli identity file left by a policy that still governed ByteCloud keeps its JWTs in
  *  plaintext; with ByteCloud off, only what Meego needs may stay in it. */
+export function clearStrictBytecloudArtifacts(sessionDataDir: string, sessionId: string): void {
+  const turns = provenSessionMap(provenSessionKey(sessionDataDir, sessionId), false);
+  for (const tools of turns?.values() ?? []) {
+    delete tools.bytedcli; delete tools.codebase; delete tools.bitscli;
+  }
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
+  const dirs = [dir];
+  try { for (const turn of readdirSync(join(dir, 'turns'))) dirs.push(join(dir, 'turns', turn)); } catch { /* no old turn files */ }
+  for (const tool of ['bytedcli', 'codebase', 'bitscli']) {
+    for (const target of [...dirs.map(d => join(d, `${tool}.env`)), join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.${tool}.env`)]) {
+      rmSync(target, { force: true });
+    }
+  }
+}
+
 function stripByteCloudCredentials(sessionDataDir: string, sessionId: string): void {
   const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
   const files = [join(dir, 'bytedcli.env')];
@@ -2593,6 +2624,15 @@ export function prepareTriggerUserCliEnv(
   execution?: { appId: string; ipcPort?: number },
   options?: TriggerUserCliEnvOptions,
 ): Array<[string, string]> {
+  const strictBroker = !!sessionDataDir && bytecloudExportBlocked(sessionDataDir, sessionId, policy);
+  if (strictBroker) {
+    if (process.platform !== 'linux' || model !== 'proven' || !execution?.ipcPort || options?.loopbackShared === false) {
+      throw new Error('ByteCloud broker requires Linux proven identity and host loopback');
+    }
+    // A disabled live mode never relaxes a previously strict session.
+    policy = { ...policy, enabled: true, tools: [...new Set([...(policy?.enabled ? policy.tools : []), 'bytedcli' as const])] };
+    clearStrictBytecloudArtifacts(sessionDataDir!, sessionId);
+  }
   if (policy?.enabled && policy.gitCommitIdentity && options?.loopbackShared === false) {
     throw new Error('triggerUserAuth.gitCommitIdentity 需要会话内可访问 daemon loopback；'
       + '当前沙盒通过 --unshare-net 或 slirp 隔离了 loopback，无法核验当前回合触发人。'
@@ -2656,7 +2696,7 @@ export function prepareTriggerUserCliEnv(
   // (or an older layout) are cleared rather than reused. Expand the governed
   // tool list to include the Codebase companion exactly as publication does.
   const capabilities = capabilitiesOf(policy);
-  const identityTools = identityToolsFor(policy.tools, capabilities);
+  const identityTools = identityToolsFor(policy.tools, strictBroker ? new Set([...capabilities, 'bytecloud']) : capabilities);
   if (!capabilities.has('bytecloud')) stripByteCloudCredentials(sessionDataDir, sessionId);
   try {
     ensureSessionIdentityStorage(
@@ -2666,8 +2706,13 @@ export function prepareTriggerUserCliEnv(
       model,
     );
   } catch (e) {
+    if (strictBroker) throw e;
     log(`[trigger-user-auth] WARN could not initialize identity storage: ${(e as Error).message}`);
   }
+  const brokerRunner = strictBroker
+    ? resolveEntrySpawn('bytedcli-exec-runner', resolve(dirname(fileURLToPath(import.meta.url)), '..')) : undefined;
+  const brokerClient = brokerRunner ? [brokerRunner.command, ...brokerRunner.args,
+    '--session-id', sessionId, '--ipc-port', String(execution!.ipcPort), '--'].map(value => sessionVisiblePath(value, canonicalPaths)) : undefined;
   let installedAny = false;
   if (gitResolver) {
     if (process.platform !== 'linux') {
@@ -2687,19 +2732,20 @@ export function prepareTriggerUserCliEnv(
   for (const [tool, commandName] of identityTools.flatMap(tool =>
     [tool, ...(IDENTITY_WRAPPER_ALIASES[tool] ?? [])].map(name => [tool, name] as const))) {
     try {
-      const real = findRealToolBinary(commandName, childEnv.PATH, [wrapperDir]);
+      const real = strictBroker && tool !== 'lark-cli' ? '/bin/false' : findRealToolBinary(commandName, childEnv.PATH, [wrapperDir]);
       if (!real) {
         log(`[trigger-user-auth] ${commandName} is not installed; no wrapper written`);
         continue;
       }
       const realInSession = sessionVisiblePath(real, canonicalPaths);
       installIdentityWrapper(wrapperDir, tool, realInSession, model, identityResolver,
-        { meego: !capabilities.has('meego'), bytecloud: !capabilities.has('bytecloud') }, commandName);
+        { meego: !capabilities.has('meego'), bytecloud: !capabilities.has('bytecloud'), ...(brokerClient ? { brokerClient } : {}) }, commandName);
       installedAny = true;
       log(`[trigger-user-auth] wrapping ${commandName} -> ${realInSession}`);
     } catch (e) {
       // A missing wrapper means the tool keeps its previous behavior; it must
       // not stop the session from starting.
+      if (strictBroker) throw e;
       log(`[trigger-user-auth] WARN could not wrap ${tool}: ${(e as Error).message}`);
     }
   }
@@ -2728,6 +2774,7 @@ export function prepareTriggerUserCliEnv(
       // Without the shim a login shell resolves the REAL tool, which is the
       // silent-bypass this feature exists to prevent. Say so loudly rather
       // than letting the session look protected while it is not.
+      if (strictBroker) throw e;
       log(`[trigger-user-auth] WARN login-shell PATH shim not installed (${(e as Error).message}); `
         + `tool calls made through a login shell may bypass the identity wrapper`);
     }
@@ -2738,7 +2785,14 @@ export function prepareTriggerUserCliEnv(
   // machine's identity — and "who opened this MR" is exactly what this feature
   // exists to fix. The helper asks the WRAPPED bytedcli, so it inherits the
   // per-turn identity with no second credential path to keep in sync.
-  if (capabilities.has('bytecloud')
+  if (strictBroker) {
+    const denied = join(wrapperDir, GIT_ASKPASS_BASENAME);
+    atomicWriteFileSync(denied, '#!/bin/sh\nexit 77\n', { mode: 0o755 });
+    childEnv.GIT_ASKPASS = denied;
+    childEnv.GIT_TERMINAL_PROMPT = '0';
+    gitConfigPairs = [['credential.helper', ''], ['core.askPass', denied]];
+  }
+  if (!strictBroker && capabilities.has('bytecloud')
       && identityWrapperInstalled(wrapperDir, 'bytedcli')) {
     try {
       const askpass = installGitAskpass(

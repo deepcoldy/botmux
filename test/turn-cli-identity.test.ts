@@ -1854,3 +1854,48 @@ describe('awaitTurnIdentityPublication — waits out a whole platform grant', ()
     }
   });
 });
+
+
+describe('strict ByteCloud publication', () => {
+  it('skips ByteCloud mint and companion publication on shared read turns', async () => {
+    bytedcliJwts.set(ALICE, { cloudJwt: 'never-export', codeJwt: 'never-code' });
+    const policy = { enabled: true, tools: ['bytedcli'], bytecloudExecution: 'read-machine-write-actor' } as const;
+    await publishTurnCliIdentity({ botConfig: { larkAppId: APP, triggerUserAuth: policy } as any,
+      sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE, turnId: 'strict-read', storageModel: 'proven' });
+    expect(recallProvenIdentityContent(dir, SESSION, 'strict-read', 'bytedcli')).toBeUndefined();
+    expect(recallProvenIdentityContent(dir, SESSION, 'strict-read', 'codebase')).toBeUndefined();
+    expect(trackedBytedcliRenewalCount()).toBe(0);
+  });
+});
+
+
+it('fences an old async mint and later legacy publications after live strict mode selection', async () => {
+  const { mintBytedcliJwts } = await import('../src/services/bytedcli-auth.js');
+  let release!: (value: any) => void;
+  vi.mocked(mintBytedcliJwts).mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+  let current = { enabled: true, tools: ['bytedcli'] } as any;
+  const args = { botConfig: botConfig(current), currentPolicy: () => current, sessionDataDir: dir,
+    sessionId: SESSION, senderOpenId: ALICE, turnId: 'racing-mint', storageModel: 'proven' as const };
+  const pending = publishTurnCliIdentity(args);
+  while (!release) await Promise.resolve();
+  current = { ...current, bytecloudExecution: 'read-machine-write-actor' };
+  release({ cloudJwt: 'late-cloud', codeJwt: 'late-code' });
+  await pending;
+  expect(recallProvenIdentityContent(dir, SESSION, 'racing-mint', 'bytedcli')).toBeUndefined();
+  expect(recallProvenIdentityContent(dir, SESSION, 'racing-mint', 'bitscli')).toBeUndefined();
+  const before = vi.mocked(mintBytedcliJwts).mock.calls.length;
+  current = { enabled: true, tools: ['bytedcli'] };
+  await publishTurnCliIdentity({ ...args, turnId: 'after-disable' });
+  expect(vi.mocked(mintBytedcliJwts).mock.calls.length).toBe(before);
+  expect(trackedBytedcliRenewalCount()).toBe(0);
+});
+
+it('records signed delegation without resolving ByteCloud material in strict mode', async () => {
+  const { mintBytedcliJwts } = await import('../src/services/bytedcli-auth.js');
+  const before = vi.mocked(mintBytedcliJwts).mock.calls.length;
+  const delegated = { targetOpenId: BOB, credentialOpenId: ALICE, unionId: 'on_actor', tools: ['bytedcli'] as any, dispatchRoot: 'om_root', recheck: () => undefined };
+  await publishTurnCliIdentity({ botConfig: botConfig({ enabled: true, tools: ['bytedcli'], bytecloudExecution: 'read-machine-write-actor' }),
+    sessionDataDir: dir, sessionId: SESSION, senderOpenId: undefined, delegatedIdentity: delegated, turnId: 'strict-delegation', storageModel: 'proven' });
+  expect(getLarkToolDelegation(dir, SESSION, 'strict-delegation')?.credentialOpenId).toBe(ALICE);
+  expect(vi.mocked(mintBytedcliJwts).mock.calls.length).toBe(before);
+});

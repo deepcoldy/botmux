@@ -1218,6 +1218,8 @@ export function sandboxTarOptions(inherited: string | undefined, uid: number | u
 }
 
 export function prepareDirectSandbox(opts: {
+  /** Broker credentials live on the host: PID namespace degradation is forbidden. */
+  bytedcliBroker?: boolean;
   networkPolicy?: SandboxNetworkPolicy;
   sessionId: string;
   dataDir: string;
@@ -1270,6 +1272,15 @@ export function prepareDirectSandbox(opts: {
   childTarOptions?: string;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
+  if (opts.bytedcliBroker) {
+    for (const path of opts.policy.protectedDenyPaths ?? []) {
+      try {
+        if (lstatSync(path).isSymbolicLink()) throw new Error('ByteCloud broker refuses a symlink at a protected credential root');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+  }
   if (opts.protectedHttpBridge && (!opts.networkPolicy
     || !opts.protectedEgressSocketPath
     || resolve(opts.protectedHttpBridge.socketPath) !== resolve(opts.protectedEgressSocketPath))) {
@@ -1353,6 +1364,22 @@ export function prepareDirectSandbox(opts: {
   const usrmergePaths = new Set(symlinks.map(link => link.path));
   for (const link of relocated.symlinks) if (!usrmergePaths.has(link.path)) symlinks.push(link);
   const policy: FsPolicy = { ...opts.policy, rules: relocated.rules };
+  if (opts.bytedcliBroker) {
+    policy.rules = policy.rules.filter(rule => {
+      if (rule.access !== 'readOnly' || !opts.policy.protectedReadOnlyPaths?.includes(rule.path)) return true;
+      try {
+        if (!lstatSync(rule.path).isSymbolicLink()) return true;
+        const parent = policy.rules.filter(other => other.path !== rule.path
+          && (rule.path.startsWith(other.path + '/') || other.path === '/'))
+          .sort((a, b) => b.path.length - a.path.length)[0];
+        if (parent?.access !== 'readOnly') throw new Error('ByteCloud executable alias has no read-only parent');
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        return true;
+      }
+    });
+  }
   const filePaths = new Set<string>();
   for (const r of policy.rules) {
     if (r.access !== 'deny') continue;
@@ -1371,7 +1398,7 @@ export function prepareDirectSandbox(opts: {
     filePaths,
     chdir: opts.chdir,
     skipPidNamespace: coreOnlyPidNamespaceDegrade({
-      credentialBearingHostChannel: !!opts.mcpGatewaySocketPath || !!opts.localServiceBridges?.length,
+      credentialBearingHostChannel: opts.bytedcliBroker === true || !!opts.mcpGatewaySocketPath || !!opts.localServiceBridges?.length,
     }),
   });
   if (minimaxAlias) {

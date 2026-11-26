@@ -1,3 +1,4 @@
+import { bytecloudExportBlocked, registerBytedcliSessionPolicyReader } from './bytedcli-strict-session.js';
 /**
  * Per-turn publication of the acting CLI identity.
  *
@@ -120,6 +121,7 @@ export function publishDelegationRefusal(args: {
 }
 
 export interface PublishTurnIdentityArgs {
+  currentPolicy?: () => TriggerUserAuthConfig | undefined;
   botConfig: BotConfig;
   sessionDataDir: string;
   sessionId: string;
@@ -212,6 +214,8 @@ export function trackTurnIdentityPublication<T>(sessionDataDir: string, sessionI
 export function publishTurnCliIdentity(
   args: PublishTurnIdentityArgs,
 ): Promise<ToolIdentityOutcome[]> {
+  registerBytedcliSessionPolicyReader(args.sessionDataDir, args.sessionId,
+    args.currentPolicy ?? (() => args.botConfig.triggerUserAuth));
   return trackTurnIdentityPublication(args.sessionDataDir, args.sessionId, publishTurnCliIdentityNow(args));
 }
 
@@ -266,6 +270,7 @@ async function publishToolIdentity(
   if (tool === 'lark-cli' && isLarkToolBound(botConfig, sessionDataDir, sessionId)) {
     return { tool, state: 'off' }; // the new session entry resolves this itself
   }
+  if (tool === 'bytedcli' && bytecloudExportBlocked(sessionDataDir, sessionId, botConfig.triggerUserAuth)) return { tool, state: 'off' };
   const policy = policyFromConfig(botConfig.triggerUserAuth);
   const delegated = args.delegatedIdentity;
   const principal = delegated ? { openId: delegated.credentialOpenId } : senderOpenId ? { openId: senderOpenId } : null;
@@ -596,6 +601,7 @@ function publishedPlatformBytedcli({ sessionDataDir, sessionId, turnId }: Refres
 }
 
 function platformPublicationStillAllowed(entry: PlatformBytedcliPublication, args: RefreshPlatformGrantArgs): boolean {
+  if (bytecloudExportBlocked(entry.sessionDataDir, entry.sessionId, args.currentPolicy())) return false;
   const { sessionDataDir, sessionId, turnId } = entry;
   if (recallProvenIdentitySnapshot(sessionDataDir, sessionId, turnId, 'bytedcli') !== entry.snapshot
     || readCliAuthEpoch(entry.senderOpenId) !== entry.authEpoch
@@ -1005,6 +1011,7 @@ function policyStillWants(
   } else {
     policy = (fallbackConfig ?? entry.botConfig).triggerUserAuth;
   }
+  if (entry.tool === 'bytedcli' && bytecloudExportBlocked(entry.sessionDataDir, entry.sessionId, policy)) return undefined;
   const current = policyFromConfig(policy);
   const capability = capabilityOfTool(entry.tool);
   if (!current.capabilities.has(capability)) return undefined;
@@ -1175,6 +1182,7 @@ export async function adoptLocalBytedcliAuthorization(args: {
   if (isUnattendedIdentityTurnId(turnId) || getLarkToolDelegation(sessionDataDir, sessionId, turnId)) {
     return 'none';
   }
+  if (bytecloudExportBlocked(sessionDataDir, sessionId, currentPolicy?.() ?? botConfig.triggerUserAuth)) return 'none';
   const initialPolicy = localBytedcliPolicy(currentPolicy, botConfig);
   // With no live reader this is simply a caller whose static policy is not
   // locally adoptable. A live reader, however, means the request's config was
@@ -1197,6 +1205,7 @@ export async function adoptLocalBytedcliAuthorization(args: {
     return 'unavailable';
   }
   const after = recallProvenIdentityContent(sessionDataDir, sessionId, turnId, 'bytedcli');
+  if (bytecloudExportBlocked(sessionDataDir, sessionId, currentPolicy?.() ?? botConfig.triggerUserAuth)) return 'superseded';
   const livePolicy = localBytedcliPolicy(currentPolicy, botConfig);
   if (!livePolicy || getLarkToolDelegation(sessionDataDir, sessionId, turnId)) return 'superseded';
   if (readCliAuthEpoch(senderOpenId) !== epochBefore) return 'superseded';

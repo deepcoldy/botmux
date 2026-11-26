@@ -1,3 +1,7 @@
+import { canonicalPathNearest } from './cli-identity.js';
+import { freezeBytedcliHostLayout } from './bytedcli-host-layout.js';
+import { bytecloudExportBlocked, persistBytedcliStrictSession, bytedcliStrictMarkerRoot } from './bytedcli-strict-session.js';
+import { markBytedcliStrictSession, acceptBytedcliWorkerContainment } from './bytedcli-broker-containment.js';
 import { ensureClaudeFolderTrust } from './claude-folder-trust.js';
 export { ensureClaudeFolderTrust } from './claude-folder-trust.js';
 import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecution } from './cli-execution-mode.js';
@@ -100,7 +104,7 @@ import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, se
  * Extracted from daemon.ts for modularity.
  */
 import { execSync, type ChildProcess } from 'node:child_process';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { installCursorUsageHook } from '../services/cursor-usage-hook.js';
 import { statSync, lstatSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
@@ -20973,6 +20977,19 @@ export function forkWorker(
   }
 
   const bot = getBot(ds.larkAppId);
+  if (ds.session.bytecloudBrokerStrict || bytecloudExportBlocked(config.session.dataDir, ds.session.sessionId, bot.config.triggerUserAuth)) {
+    persistBytedcliStrictSession(config.session.dataDir, ds.session.sessionId);
+    markBytedcliStrictSession(ds);
+    if (!ds.session.bytecloudBrokerColdStart && (ds.session.workerGeneration || ds.session.cliSessionId || ds.session.adoptedFrom)) {
+      sessionStore.updateSession(ds.session);
+      throw new Error('ByteCloud strict mode cannot reuse a previously credential-exposed session; create a new session');
+    }
+    ds.session.bytecloudBrokerColdStart = true;
+    sessionStore.updateSession(ds.session);
+    if (ds.worker && !ds.worker.killed && !ds.initConfig?.bytedcliContainment) {
+      throw new Error('ByteCloud strict mode refuses a previously credential-exposed worker; close it and start a fresh session');
+    }
+  }
   let pending = pendingProtectedHttpEgressForks.get(ds.session.sessionId);
   if (pending?.abortCleanupPending) {
     const cleanupRetried = pending.retryAbortCleanup?.() === true;
@@ -22114,6 +22131,15 @@ function forkWorkerPrepared(
   // existing worker. A failed reservation leaves the old worker untouched;
   // a successful reservation immediately invalidates any late old-worker ACK.
   const workerGeneration = reserveWorkerGeneration(ds);
+  const bytedcliLayout = ds.session.bytecloudBrokerStrict ? freezeBytedcliHostLayout() : undefined;
+  const bytedcliContainment = bytedcliLayout ? {
+    workerGeneration,
+    credentialRoots: [...bytedcliLayout.credentialRoots, bytedcliStrictMarkerRoot(config.session.dataDir),
+      ...(getLoadedConfigPath() ? [getLoadedConfigPath()!] : [])],
+    executableReadOnlyRoots: [...new Set([...bytedcliLayout.executableReadOnlyRoots, process.execPath, dirname(process.execPath),
+      ...(isStandaloneBinary() ? [] : [resolve(__dirname, '../..'), resolve(__dirname, '../../node_modules')])]
+      .flatMap(path => [path, canonicalPathNearest(path)]))],
+  } : undefined;
   const protectedLoopbackProxyAttestation = protectedHttpEgressPolicy
     ? { secret: randomBytes(32).toString('hex'), workerGeneration }
     : undefined;
@@ -22616,6 +22642,7 @@ function forkWorkerPrepared(
     // Trigger-user CLI auth: the worker needs the policy to know which tools to
     // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
     ...(botCfg.triggerUserAuth ? { triggerUserAuth: botCfg.triggerUserAuth } : {}),
+    ...(bytedcliContainment ? { bytedcliContainment } : {}),
     larkToolBinding: botCfg.larkToolBinding !== false,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
@@ -25837,6 +25864,12 @@ function setupWorkerHandlers(
           break;
         }
         acknowledgeSessionReady(msg.requestId);
+        break;
+      }
+      case 'bytedcli_containment': {
+        if (!acceptBytedcliWorkerContainment(ds, worker, workerGeneration, msg.report)) {
+          logger.warn(`[${t}] Refused stale or unverified ByteCloud containment report`);
+        }
         break;
       }
       case 'local_process_attestation': {
@@ -34308,6 +34341,7 @@ export function forkAdoptWorker(
     onIpcDispatchAttempted?: () => void;
   },
 ): 'accepted' | 'rejected' {
+  if (ds.session.bytecloudBrokerStrict || bytecloudExportBlocked(config.session.dataDir, ds.session.sessionId, getBot(ds.larkAppId).config.triggerUserAuth)) return 'rejected';
   if (ds.session.cliInstanceBinding) throw new Error('External adoption cannot carry a Codex instance binding');
   if (isSessionTransferring(ds)) {
     logger.warn(`[${tag(ds)}] Adopt worker fork refused during routing transfer`);

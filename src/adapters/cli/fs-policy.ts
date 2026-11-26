@@ -38,6 +38,9 @@ export interface FsRule {
 }
 
 export interface FsPolicy {
+  /** Strict protected roots retained for kernel launch validation. */
+  protectedDenyPaths?: readonly string[];
+  protectedReadOnlyPaths?: readonly string[];
   /** Deduped rules sorted shallow→deep (emission order = precedence order). */
   rules: FsRule[];
   /** Keep network egress (bwrap-only knob; Seatbelt does not confine net here). */
@@ -172,6 +175,10 @@ export interface FsPolicyContext {
   /** Host-only authority roots. Every allow path at or below one of these is
    *  suppressed before longest-prefix merging, then the root is denied. */
   hostOnlyDenyPaths?: readonly string[];
+  /** Strict credential ceilings: no descendant allow from ANY source survives. */
+  protectedDenyPaths?: readonly string[];
+  /** Trusted executable ceilings: descendants can never acquire write access. */
+  protectedReadOnlyPaths?: readonly string[];
   mandatoryDenyRegexes?: readonly string[];
   mandatoryReadOnlyPaths?: readonly string[];
   net?: boolean;
@@ -710,14 +717,27 @@ export function computeNoTransportAuthorityRoots(input: {
  */
 export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const candidates: FsRule[] = [];
+  // A strict trusted installation cannot be developed in-place. Its non-code
+  // secrets stay host-only even when cwd lies inside it; deeper grants cannot
+  // inherit the legacy checkout-development exception below.
+  const strictInstallRoot = ctx.botmuxInstallRoot && normalizeFsPath(ctx.botmuxInstallRoot);
+  const strictInstallMasks = strictInstallRoot && (ctx.protectedReadOnlyPaths ?? []).some(root => {
+    const normalized = normalizeFsPath(root);
+    return normalized !== null && coversPath(normalized, strictInstallRoot);
+  }) ? (ctx.botmuxInstallRootMaskPaths ?? []).filter(path => {
+    const normalized = normalizeFsPath(path);
+    return normalized !== null && normalized !== strictInstallRoot && coversPath(strictInstallRoot, normalized);
+  }) : [];
   const defaultHomeNorm = ctx.defaultBotmuxHome ? normalizeFsPath(ctx.defaultBotmuxHome) : null;
   const hostOnlyDataDirs = [...new Set([
     normalizeFsPath(ctx.sessionDataDir),
     ...(defaultHomeNorm ? [defaultHomeNorm === '/' ? '/data' : `${defaultHomeNorm}/data`] : []),
   ].filter((p): p is string => p !== null))];
   const hostOnlyRoots = [...new Set([
-    ...hostOnlyDataDirs.flatMap(dir => [`${dir}/link-refs`, `${dir}/session-turns`]),
+    ...hostOnlyDataDirs.flatMap(dir => [`${dir}/link-refs`, `${dir}/session-turns`, `${dir}/bytedcli-strict`]),
     ...(ctx.hostOnlyDenyPaths ?? []),
+    ...(ctx.protectedDenyPaths ?? []),
+    ...strictInstallMasks,
   ]
     .map(normalizeFsPath)
     .filter((p): p is string => p !== null))];
@@ -1308,9 +1328,23 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
 
   // Deepest-prefix grants inside a withheld keystore must not survive at all:
   // otherwise a sibling/token/future-file grant would beat the mandatory parent.
-  const rules = mergeFsRules(candidates).filter(rule =>
+  const readonlyCeilings = (ctx.protectedReadOnlyPaths ?? []).map(path => {
+    const normalized = normalizeFsPath(path);
+    if (!normalized) throw new Error('invalid protected read-only root');
+    return normalized;
+  });
+  if ((ctx.protectedDenyPaths ?? []).some(path => !normalizeFsPath(path))) throw new Error('invalid protected credential root');
+  // A RW ancestor can rename a directory containing a protected mount and
+  // replace the host pathname used by a future worker/credential lookup.
+  // Cap that ancestor too; explicit unrelated sibling grants remain writable.
+  const protectedAncestors = [...readonlyCeilings, ...(ctx.protectedDenyPaths ?? []).map(path => normalizeFsPath(path)!)];
+  push(readonlyCeilings, 'readOnly', 'mandatory');
+  const rules = mergeFsRules(candidates.map(rule => rule.access === 'readWrite'
+    && (readonlyCeilings.some(root => coversPath(root, rule.path))
+      || protectedAncestors.some(root => coversPath(rule.path, root)))
+    ? { ...rule, access: 'readOnly' as const } : rule)).filter(rule =>
     rule.access === 'deny'
-    || ![...withheldLarkStores].some(root => coversPath(root, rule.path)));
+    || ![...withheldLarkStores, ...hostOnlyRoots].some(root => coversPath(root, rule.path)));
 
   // Post-merge self-check for the loaded bots-config (codex P1). Being inside a
   // frozen authority root is necessary but NOT sufficient: this is a white-in-black
@@ -1345,6 +1379,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
 
   return {
     rules,
+    protectedDenyPaths: ctx.protectedDenyPaths,
+    protectedReadOnlyPaths: ctx.protectedReadOnlyPaths,
     net: ctx.net !== false,
     ...(ctx.withholdSendCredential ? { hideHostProcessInfo: true } : {}),
     ...(ctx.withholdSendCredential

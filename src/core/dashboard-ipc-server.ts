@@ -1,3 +1,5 @@
+import { freezeBytedcliHostLayout } from './bytedcli-host-layout.js';
+import { bytecloudExportBlocked } from './bytedcli-strict-session.js';
 import { isFeedGroupSelection, setChatFeedGroup } from '../services/chat-feed-groups.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
 import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
@@ -1752,11 +1754,15 @@ ipcRoute('POST', BYTEDCLI_EXEC_ROUTE, (req, res) => requestBytedcliBrokers.get(r
 function strictBytecloudExportRefused(sessionId: string, appId?: string): boolean {
   const ds = findActiveBySessionId(sessionId);
   const row = ds?.session ?? sessionStore.getOwnedSession(sessionId);
-  if (ds && bytedcliSessionWasStrict(ds) || row?.bytecloudBrokerStrict) return true;
+  if (ds && bytedcliSessionWasStrict(ds) || row?.bytecloudBrokerStrict || bytecloudExportBlocked(config.session.dataDir, sessionId)) return true;
   try {
     const policy = getBot(ds?.larkAppId ?? appId ?? row?.larkAppId ?? '').config.triggerUserAuth;
     if (!bytecloudBrokerEnabled(policy)) return false;
     if (ds) markBytedcliStrictSession(ds);
+    try {
+      bytecloudExportBlocked(config.session.dataDir, sessionId, policy);
+      if (ds) sessionStore.updateSession(ds.session);
+    } catch { /* Refuse even if durable storage is unavailable. */ }
     return true;
   } catch { return false; }
 }
@@ -15390,7 +15396,7 @@ export function startIpcServer(opts: {
     canTalk: (ds, openId, unionId) => canTalk(ds.larkAppId, ds.chatId, openId, undefined, unionId, ds.chatType),
     identity: resolveVerifiedUserIdentity, unionIdentity: resolveVerifiedUserIdentityByUnionId,
     schedule: (app, taskId) => scheduler.getScheduleAuthorityRecord(taskId, app),
-  }, opts.bytedcliHostLayout);
+  }, opts.bytedcliHostLayout ? freezeBytedcliHostLayout(opts.bytedcliHostLayout) : undefined);
   const server: Server = createServer(async (req, res) => {
     requestBytedcliBrokers.set(req, bytedcliBroker);
     try {

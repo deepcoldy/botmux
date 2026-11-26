@@ -1,3 +1,4 @@
+import { bytecloudExportBlocked } from './bytedcli-strict-session.js';
 /** Registered scheduled jobs may outlive a turn; a Unix UID is never a job credential. */
 import { randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
@@ -21,7 +22,6 @@ import { backgroundAuthorityKey, backgroundCredentialPolicyKey, backgroundPeerBe
 import { noteSenderUnionId } from './platform-credential-source.js';
 import { resolveScheduledRunIdentity, type ScheduledRunIdentity } from './schedule-identity-claim.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
-import { bytecloudBrokerEnabled } from './identity-policy.js';
 import { bytedcliSessionWasStrict } from './bytedcli-broker-containment.js';
 import * as scheduler from './scheduler.js';
 import { publishTurnCliIdentity } from './turn-cli-identity.js';
@@ -199,7 +199,7 @@ export async function resolveDetachedScheduledExecutionIdentity(input: {
     const row=ds?.session ?? sessionStore.getOwnedSession(input.sessionId);
     let live:BotConfig|undefined;
     try { live=getBot(ctx.larkAppId).config; } catch { return true; }
-    return bytecloudBrokerEnabled(live.triggerUserAuth) || !!row?.bytecloudBrokerStrict || !!(ds && bytedcliSessionWasStrict(ds));
+    return bytecloudExportBlocked(input.sessionDataDir, input.sessionId, live.triggerUserAuth) || !!row?.bytecloudBrokerStrict || !!(ds && bytedcliSessionWasStrict(ds));
   };
   if(input.tool!=='lark-cli' && strict())return null;
   const turnId = `background:${ctx.job.id}`;
@@ -218,7 +218,7 @@ export async function resolveDetachedScheduledExecutionIdentity(input: {
           const safeConfig = strict() ? {...ctx.botConfig,triggerUserAuth:{...ctx.botConfig.triggerUserAuth,
             enabled:true,tools:['lark-cli' as const],capabilities:['lark-user' as const]}} : ctx.botConfig;
           if(input.tool!=='lark-cli' && strict())return;
-          const outcomes = await publishTurnCliIdentity({ botConfig: safeConfig, sessionDataDir: input.sessionDataDir,
+          const outcomes = await publishTurnCliIdentity({ currentPolicy: () => getBot(ctx.larkAppId).config.triggerUserAuth, botConfig: safeConfig, sessionDataDir: input.sessionDataDir,
             sessionId: input.sessionId, senderOpenId: ctx.job.openId,
             locale: localeForBot(ctx.larkAppId), turnId, storageModel: 'proven' });
           clearRestoredLapses({ appId: ctx.larkAppId, taskId: ctx.taskId, openId: ctx.job.openId, outcomes });

@@ -1,7 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { BYTEDCLI_EXEC_LIMITS, BYTEDCLI_EXEC_SCHEMA, BYTEDCLI_EXEC_ERROR_CODES, parseBytedcliExecRequest,
   type BytedcliExecErrorCode, type BytedcliExecResponse } from '../cli/bytedcli-exec-protocol.js';
 import { parseBytedcliOperation, BytedcliOperationPolicyError } from './bytedcli-operation-policy.js';
@@ -9,7 +8,7 @@ import { resolveLoopbackPeerProcesses } from './current-actor-attestation.js';
 import type { BytedcliAuthorityResult, BytedcliAuthorityRequestContext } from './bytedcli-broker-authority.js';
 import { resolveBytedcliAuthority } from './bytedcli-broker-authority.js';
 import { BytedcliExecutor, type BytedcliExecutionRequest } from './bytedcli-executor.js';
-import { createBytedcliHostCredentialResolver, parseBytedcliMachineProfile } from './bytedcli-broker-credentials.js';
+import { createBytedcliHostCredentialResolver } from './bytedcli-broker-credentials.js';
 import { BytedcliBrokerAudit, ensureBytedcliPrivateDirectory } from './bytedcli-broker-audit.js';
 import { discoverBytedcliTrustedCli, type BytedcliTrustedCli } from './bytedcli-broker-process.js';
 import { bytedcliContainmentAvailable, markBytedcliStrictSession } from './bytedcli-broker-containment.js';
@@ -148,45 +147,12 @@ export class BytedcliBroker {
     await joinOwnedWork([Promise.resolve().then(()=>this.deps.executor.close()),...snapshot.map(owner=>owner.work)]);
   }
 }
-/** Frozen once at host assembly. PATH is daemon startup configuration, never
- * Bot/Agent env, and discover validates canonical install/runtime ownership. */
-export function bytedcliTrustedHostLayout(settings:{readonly machineProfile?:string;readonly protectedRoots?:readonly string[]}={}){
-  const machineHome=homedir(),path=process.env.PATH??'/usr/local/bin:/usr/bin:/bin';
-  const directories=path.split(delimiter).filter(isAbsolute);
-  const candidates=directories.map(dir=>join(dir,'bytedcli')).filter(existsSync).flatMap(file=>{try{return [realpathSync(file)];}catch{return [];}});
-  const runtimeCandidates=directories.map(dir=>join(dir,'node')).filter(existsSync);
-  const runtimeExecutable=runtimeCandidates[0]??'/usr/bin/node';
-  const installationRoots=[...new Set(candidates.map(file=>dirname(dirname(file))))];
-  const privateRoot=join(machineHome,'.botmux','host-authority','bytedcli-broker');
-  const auditRoot=join(privateRoot,'audit');
-  const credentialRoots=[join(machineHome,'.local','share','bytedcli'),join(machineHome,'.botmux','data','bytedcli-home'),
-    join(machineHome,'.botmux','data','cli-auth-epoch'),join(machineHome,'.botmux','host-authority'),
-    join(machineHome,'.botmux','device-auth'),join(machineHome,'.botmux','platform.json'),
-    ...['AIME_WORKSPACE_PATH','AILY_WORKSPACE_PATH','AILY_WORKSPACE_DIR'].flatMap(key=>process.env[key]&&isAbsolute(process.env[key]!)?[process.env[key]!]:[]),
-    ...(settings.protectedRoots??[])];
-  const executableReadOnlyRoots=[...installationRoots,...directories.map(dir=>join(dir,'bytedcli')).filter(existsSync),
-    runtimeExecutable,dirname(runtimeExecutable)];
-  const protectedRoots=[...credentialRoots,...executableReadOnlyRoots];
-  if(protectedRoots.some(root=>!isAbsolute(root)||root.startsWith('/$bunfs/')))throw new Error('invalid trusted protected root');
-  const canonicalAliases=(paths:readonly string[])=>Object.freeze([...new Set(paths.flatMap(root=>{
-    let ancestor=root;const suffix:string[]=[];
-    while(!existsSync(ancestor)&&dirname(ancestor)!==ancestor){suffix.unshift(basename(ancestor));ancestor=dirname(ancestor);}
-    try{return [root,join(realpathSync(ancestor),...suffix)];}catch{return [root];}
-  }))]);
-  const aliases=canonicalAliases(protectedRoots);
-  const networkEnv:NodeJS.ProcessEnv={};
-  for(const key of ['HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY','http_proxy','https_proxy','all_proxy','no_proxy','NODE_EXTRA_CA_CERTS','SSL_CERT_FILE','SSL_CERT_DIR']){
-    if(process.env[key])networkEnv[key]=process.env[key];
-  }
-  return Object.freeze({machineHome,path,candidates:Object.freeze(candidates),runtimeExecutable,
-    installationRoots:Object.freeze(installationRoots),privateRoot,auditRoot,machineProfile:parseBytedcliMachineProfile(settings.machineProfile),credentialRoots:canonicalAliases(credentialRoots),
-    executableReadOnlyRoots:canonicalAliases(executableReadOnlyRoots),protectedRoots:aliases,networkEnv:Object.freeze(networkEnv)});
-}
-export type BytedcliHostLayout=ReturnType<typeof bytedcliTrustedHostLayout>;
+export { bytedcliTrustedHostLayout, type BytedcliHostLayout } from './bytedcli-host-layout.js';
+import { freezeBytedcliHostLayout, type BytedcliHostLayout } from './bytedcli-host-layout.js';
 /** The caller supplies only frozen daemon host dependencies. Task4 uses the
  * exact protectedRoots of this same layout when it compiles worker isolation. */
 export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-broker-authority.js').BytedcliAuthorityDependencies,'contains'>,
-  layout:BytedcliHostLayout=bytedcliTrustedHostLayout()):BytedcliBroker{
+  layout:BytedcliHostLayout=freezeBytedcliHostLayout()):BytedcliBroker{
   let executor:BytedcliExecutor|undefined,pending:Promise<BytedcliExecutor>|undefined,closed=false;
   const trustedCli=async(signal:AbortSignal):Promise<BytedcliTrustedCli>=>{
     ensureBytedcliPrivateDirectory(layout.privateRoot);const root=mkdtempSync(join(layout.privateRoot,'probe-'));
