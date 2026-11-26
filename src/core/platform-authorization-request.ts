@@ -14,9 +14,9 @@ import {
   type CredentialRequestResult,
 } from '../platform/credential-request-client.js';
 import { withHardTimeout } from '../platform/credential-grant-client.js';
-import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import { TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import { logger } from '../utils/logger.js';
-import { policyFromConfig } from './identity-policy.js';
+import { capabilityOfTool, policyFromConfig } from './identity-policy.js';
 import { platformUnionIdFor } from './platform-credential-source.js';
 import { LINK_RESEND_MS } from './provider-auth-request.js';
 
@@ -46,6 +46,8 @@ export interface PlatformAuthorizationRequestArgs {
   /** Check this caller before reusing an answer and again after resolving the
    * person, before sending a card. */
   stillAllowed?: () => boolean;
+  /** Recheck the caller and its authorization policy after resolving union_id. */
+  isCurrent?: () => boolean;
 }
 
 interface Deps {
@@ -60,10 +62,10 @@ const realDeps: Deps = {
   now: () => Date.now(),
 };
 
-/** Answers remembered per app, person and scopes for a few minutes, so a repeat is marked as one. */
+/** Answers remembered per app, person, tools and scopes for a few minutes. */
 type Remembered = Extract<PlatformAuthorizationRequestResult, { kind: 'sent' | 'undeliverable' | 'request_cap' }>;
 const recent = new Map<string, { at: number; answer: Remembered }>();
-/** The request in flight per app, person and scopes, shared by concurrent refusals. */
+/** The request in flight per app, person, tools and scopes, shared by concurrent refusals. */
 const inFlight = new Map<string, Promise<PlatformAuthorizationRequestResult>>();
 /** However the union_id lookup or the platform hangs, a refusal is answered within this. */
 const ASK_TIMEOUT_MS = 15_000;
@@ -76,15 +78,19 @@ function asRepeat(answer: PlatformAuthorizationRequestResult): PlatformAuthoriza
 
 /** Every platform-backed tool the bot runs as the person: one card covers all of them. */
 function platformTools(botConfig: Pick<BotConfig, 'triggerUserAuth'>): TriggerUserAuthTool[] {
-  const { capabilities } = policyFromConfig(botConfig.triggerUserAuth);
-  return [
-    ...(capabilities.has('lark-user') ? ['lark-cli' as const] : []),
-    ...(capabilities.has('bytecloud') ? ['bytedcli' as const] : []),
-  ];
+  const { capabilities, credentialSources } = policyFromConfig(botConfig.triggerUserAuth);
+  return TRIGGER_USER_AUTH_TOOLS.filter(tool => {
+    const capability = capabilityOfTool(tool);
+    return capabilities.has(capability) && credentialSources[capability] !== 'local';
+  });
 }
 
 function callerAllowed(args: PlatformAuthorizationRequestArgs): boolean {
-  try { return args.stillAllowed ? args.stillAllowed() === true : true; } catch { return false; }
+  try {
+    if (args.isCurrent && args.isCurrent() === false) return false;
+    if (args.stillAllowed && args.stillAllowed() !== true) return false;
+    return true;
+  } catch { return false; }
 }
 
 export async function askPlatformToAuthorize(
@@ -93,11 +99,13 @@ export async function askPlatformToAuthorize(
 ): Promise<PlatformAuthorizationRequestResult> {
   const d = { ...realDeps, ...deps };
   const who = args.unionId ?? args.openId ?? '';
-  const scopes = [...new Set(args.scopes ?? [])].sort();
-  const key = JSON.stringify([args.botConfig.larkAppId, who, scopes]);
   while (true) {
     // A cached/shared answer is never a substitute for this caller's own fence.
     if (!callerAllowed(args)) return { kind: 'unavailable' };
+    const tools = platformTools(args.botConfig);
+    if (!tools.length) return { kind: 'unavailable' };
+    const scopes = tools.includes('lark-cli') ? [...new Set(args.scopes ?? [])].sort() : [];
+    const key = JSON.stringify([args.botConfig.larkAppId, who, tools, scopes]);
     const now = d.now();
     const hit = recent.get(key);
     if (hit && now - hit.at < LINK_RESEND_MS) return asRepeat(hit.answer);
@@ -114,7 +122,7 @@ export async function askPlatformToAuthorize(
       }
       return result;
     }
-    const pending = withHardTimeout(() => ask(args, scopes, d), ASK_TIMEOUT_MS)
+    const pending = withHardTimeout(() => ask(args, tools, scopes, d), ASK_TIMEOUT_MS)
       .catch(() => unavailable(`no answer within ${ASK_TIMEOUT_MS}ms`));
     inFlight.set(key, pending);
     let result: PlatformAuthorizationRequestResult;
@@ -127,12 +135,17 @@ export async function askPlatformToAuthorize(
 }
 
 async function ask(
-  args: PlatformAuthorizationRequestArgs, scopes: string[], d: Deps,
+  args: PlatformAuthorizationRequestArgs, tools: TriggerUserAuthTool[], scopes: string[], d: Deps,
 ): Promise<PlatformAuthorizationRequestResult> {
-  const tools = platformTools(args.botConfig);
   const unionId = args.unionId ?? (args.openId ? await d.unionIdFor(args.botConfig.larkAppId, args.openId) : null);
   if (!unionId) return unavailable('sender union_id unresolved');
   if (!callerAllowed(args)) return { kind: 'unavailable', guardRefused: true };
+  // A hot edit can change another tool's route without cancelling the Lark
+  // request. Do not send a card with a tool set that belongs to the old policy.
+  const liveTools = platformTools(args.botConfig);
+  if (liveTools.length !== tools.length || liveTools.some((tool, index) => tool !== tools[index])) {
+    return { kind: 'unavailable' };
+  }
   const result = await d.request({
     unionId, appId: args.botConfig.larkAppId, tools,
     ...(scopes.length ? { scopes } : {}),

@@ -3,10 +3,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { OwnerGroupFollowConfig } from '../src/services/owner-group-follow-policy.js';
-const mocks = vi.hoisted(() => ({ config: { larkAppId: 'cli_runtime_probe', larkAppSecret: 'secret', brand: 'feishu', ownerGroupFollow: { enabled: true } as OwnerGroupFollowConfig }, owner: 'ou_owner', token: vi.fn(async (_app: string, _secret: string, _brand: string, _owner: string, _signal?: AbortSignal) => 'owner-token'), bound: vi.fn(), ask: vi.fn(async (_args: unknown): Promise<any> => ({ kind: 'sent', deduped: false })), botList: vi.fn(), notify: vi.fn(async (..._args: any[]) => {}) }));
+const mocks = vi.hoisted(() => ({ config: { larkAppId: 'cli_runtime_probe', larkAppSecret: 'secret', brand: 'feishu', triggerUserAuth: { enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }, ownerGroupFollow: { enabled: true } as OwnerGroupFollowConfig }, owner: 'ou_owner', token: vi.fn(async (_app: string, _secret: string, _brand: string, _owner: string, _signal?: AbortSignal) => 'owner-token'), bound: vi.fn(), ask: vi.fn(async (_args: unknown): Promise<any> => ({ kind: 'sent', deduped: false })), botList: vi.fn(), notify: vi.fn(async (..._args: any[]) => {}) }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: () => ({ config: mocks.config }), getOwnerOpenId: () => mocks.owner, getBotClient: () => ({}) }));
 vi.mock('../src/utils/user-token.js', () => ({ resolveUserToken: mocks.token }));
-vi.mock('../src/core/lark-tool-platform-credential.js', () => ({ resolveBoundLarkUserCredential: mocks.bound, platformIncrementalAuthorizeUrl: (page: string) => page }));
+vi.mock('../src/core/lark-tool-platform-credential.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/core/lark-tool-platform-credential.js')>()),
+  resolveBoundLarkUserCredential: mocks.bound,
+}));
 vi.mock('../src/core/platform-authorization-request.js', () => ({ askPlatformToAuthorize: mocks.ask }));
 vi.mock('../src/core/platform-credential-source.js', () => ({ platformAuthorizeUrl: () => 'https://platform.example/credentials' }));
 vi.mock('../src/im/lark/lark-get.js', () => ({ larkGet: mocks.botList }));

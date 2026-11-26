@@ -11,10 +11,11 @@ import {
 } from '../src/core/platform-authorization-request.js';
 import { LINK_RESEND_MS } from '../src/core/provider-auth-request.js';
 import type { CredentialRequest, CredentialRequestResult } from '../src/platform/credential-request-client.js';
+import type { TriggerUserAuthCredentialSourceConfig } from '../src/services/trigger-user-auth.js';
 
-const bot = (capabilities: string[]) => ({
+const bot = (capabilities: string[], credentialSource?: TriggerUserAuthCredentialSourceConfig) => ({
   larkAppId: 'cli_bot',
-  triggerUserAuth: { enabled: true, capabilities },
+  triggerUserAuth: { enabled: true, capabilities, credentialSource },
 }) as any;
 
 function setup(results: CredentialRequestResult[] = [{ ok: true, status: 'sent', deduped: false }]) {
@@ -37,12 +38,43 @@ describe('askPlatformToAuthorize', () => {
     expect(requests).toEqual([{ unionId: 'on_alice', appId: 'cli_bot', tools: ['lark-cli', 'bytedcli'] }]);
   });
 
-  it('leaves out a tool whose capability is off, and passes scopes through', async () => {
+  it('leaves out a tool whose capability is off, and passes Lark scopes through', async () => {
     const { requests, deps } = setup();
     await askPlatformToAuthorize({
-      botConfig: bot(['bytecloud']), openId: 'ou_a', scopes: ['b:x', 'a:y', 'a:y'],
+      botConfig: bot(['lark-user']), openId: 'ou_a', scopes: ['b:x', 'a:y', 'a:y'],
     }, deps);
-    expect(requests[0]).toMatchObject({ tools: ['bytedcli'], scopes: ['a:y', 'b:x'] });
+    expect(requests[0]).toMatchObject({ tools: ['lark-cli'], scopes: ['a:y', 'b:x'] });
+  });
+
+  it('sends only the platform-backed capability and only attaches scopes to Lark', async () => {
+    const { requests, deps } = setup();
+    const capabilities = ['lark-user', 'bytecloud', 'meego'];
+    await askPlatformToAuthorize({
+      botConfig: bot(capabilities, { 'lark-user': 'local', bytecloud: 'platform' }),
+      openId: 'ou_a', scopes: ['local-app:read'],
+    }, deps);
+    await askPlatformToAuthorize({
+      botConfig: bot(capabilities, { 'lark-user': 'platform', bytecloud: 'local' }),
+      openId: 'ou_a', scopes: ['lark:read'],
+    }, deps);
+    expect(requests).toEqual([
+      { unionId: 'on_alice', appId: 'cli_bot', tools: ['bytedcli'] },
+      { unionId: 'on_alice', appId: 'cli_bot', tools: ['lark-cli'], scopes: ['lark:read'] },
+    ]);
+  });
+
+  it('does not reuse a recent card requested before the effective tool set changed', async () => {
+    const { requests, deps } = setup();
+    const capabilities = ['lark-user', 'bytecloud'];
+    const ask = (credentialSource: TriggerUserAuthCredentialSourceConfig) =>
+      askPlatformToAuthorize({ botConfig: bot(capabilities, credentialSource), openId: 'ou_a' }, deps);
+    expect(await ask({ 'lark-user': 'local', bytecloud: 'platform' })).toEqual({ kind: 'sent', deduped: false });
+    expect(await ask({ 'lark-user': 'platform', bytecloud: 'local' })).toEqual({ kind: 'sent', deduped: false });
+    expect(requests.map(req => req.tools)).toEqual([['bytedcli'], ['lark-cli']]);
+    expect(await ask({ default: 'platform', bytecloud: 'local' })).toEqual({ kind: 'sent', deduped: true });
+
+    expect(await ask({ default: 'local' })).toEqual({ kind: 'unavailable' });
+    expect(requests).toHaveLength(2);
   });
 
   it('uses a union id it was given instead of looking the open id up', async () => {
@@ -50,6 +82,28 @@ describe('askPlatformToAuthorize', () => {
     await askPlatformToAuthorize({ botConfig: bot(['lark-user']), unionId: 'on_given' }, deps);
     expect(deps.unionIdFor).not.toHaveBeenCalled();
     expect(requests[0]!.unionId).toBe('on_given');
+  });
+
+  it('stops before sending when the authorization context changes during the union ID lookup', async () => {
+    const { requests, deps } = setup();
+    let current = true;
+    deps.unionIdFor.mockImplementation(async () => { current = false; return 'on_alice'; });
+    const result = await askPlatformToAuthorize({
+      botConfig: bot(['lark-user']), openId: 'ou_a', isCurrent: () => current,
+    }, deps);
+    expect(result).toEqual({ kind: 'unavailable', guardRefused: true });
+    expect(requests).toEqual([]);
+  });
+
+  it('does not send the old tool set if ByteCloud becomes local during the union ID lookup', async () => {
+    const { requests, deps } = setup();
+    const source: Exclude<TriggerUserAuthCredentialSourceConfig, string> = { 'lark-user': 'platform', bytecloud: 'platform' };
+    deps.unionIdFor.mockImplementation(async () => { source.bytecloud = 'local'; return 'on_alice'; });
+    const args = { botConfig: bot(['lark-user', 'bytecloud'], source), openId: 'ou_a', scopes: ['lark:read'] };
+    expect(await askPlatformToAuthorize(args, deps)).toEqual({ kind: 'unavailable' });
+    expect(requests).toEqual([]);
+    expect(await askPlatformToAuthorize(args, deps)).toEqual({ kind: 'sent', deduped: false });
+    expect(requests).toEqual([{ appId: 'cli_bot', unionId: 'on_alice', tools: ['lark-cli'], scopes: ['lark:read'] }]);
   });
 
   it('a lookup that never answers gives up after 15 s and does not block later requests', async () => {

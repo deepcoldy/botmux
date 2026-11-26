@@ -53,7 +53,24 @@ Botmux 提供的短期 bot token。
 
 ## 凭据来源：中心化平台（`triggerUserAuth.credentialSource`）
 
-按触发人鉴权开启后，该人的凭据可以来自两处：本机的按人 HOME（扫码一次、只在本机有效），或**中心化平台**（在平台凭据页授权一次，平台保管刷新凭据并按轮次向绑定的机器签发短期票，可集中查看与撤销；允许后，这台机器上的 bot 可以用你的身份使用这些服务）。`bots.json` 的 `triggerUserAuth.credentialSource` 决定取法：
+按触发人鉴权开启后，`bots.json` 中的 `triggerUserAuth.credentialSource` 决定使用本机个人凭据还是中心化平台的短期凭据。字符串写法 `"auto"`、`"platform"`、`"local"` 对飞书和 ByteCloud 统一生效。需要单独指定时可写成：
+
+```json
+{
+  "triggerUserAuth": {
+    "enabled": true,
+    "capabilities": ["lark-user", "bytecloud"],
+    "credentialSource": {
+      "lark-user": "local",
+      "bytecloud": "platform"
+    }
+  }
+}
+```
+
+对象中未配置的能力继承 `default`，省略 `default` 时使用 `auto`。Meego 继续使用本机个人授权。上例中，绑定的 `lark-cli --as user` 使用本机器人飞书应用的用户授权，bytedcli 及其派生工具使用平台签发的 ByteCloud 凭据。Dashboard 的「凭据来源」可选择统一配置或按能力配置。
+
+每项能力的来源模式如下：
 
 | 机器状态 | `auto`（默认） | `platform` | `local` |
 |---|---|---|---|
@@ -72,7 +89,7 @@ Botmux 提供的短期 bot token。
   - 平台返回 404（没有该端点的旧平台）：回退到旧流程，由 botmux 私发平台凭据页，行为同旧版（见下条）。
   - 当日请求上限（429 `request_cap`）：会话与 agent 被告知今天已发过好几张授权卡片，请用其中一张或打开平台凭据页，不建议重试。
   - 其他失败（限流、401/403、5xx、超时或网络错误）：命令继续被拒绝，agent 收到「暂时无法让平台发出授权卡片」，不做任何本机兜底；只发一次请求，不重试（超时后重试可能让本人收到两张卡片）。
-  绑定会话里 `--as user` 被拒绝、`botmux auth request --scope` 走平台时同样如此（后者把缺的权限随请求带给平台）。Meego 登录不经过平台，仍由 botmux 私发登录链接；发给本人的消息里不含平台工具的链接。`/login`、`/login lark`、`/login bytedcli` 在绑定机器上（非 `local` 来源）同样请平台发卡片，并回复不含链接的一句话；`/login --scope`、`/login tags` 不变。
+  绑定会话里 `--as user` 被拒绝、`botmux auth request --scope` 走平台时同样如此（后者把缺的权限随请求带给平台）。Meego 登录链接由 botmux 私发。`/login lark` 和 `/login bytedcli` 按各自的来源发起授权。在两个已开启能力分别使用本机与平台时，裸 `/login` 处理两个入口，`/login status` 分别展示状态。授权链接仅发给本人。`/login --scope` 和 `/login tags` 专用于本机器人应用的 OAuth。
 - **旧平台（发送人与机器所有者不同队时返回 `platform_not_teammate`）**：新 daemon 在请求里声明 `machineConsent`，新平台据此返回 `consent_missing` 并发卡片；旧平台仍返回 `not_teammate`，该回答是终态：命令被拒绝，agent 得到的说明是平台不在这台机器上为此人签发，botmux 不发起任何本机授权，也不再发起 `botmux auth request`。`platform_forbidden`（平台拒绝了本机的请求）同样是终态。
 - **旧流程（仅在平台没有 `credential-request` 端点时保留）**：botmux 把平台凭据页（飞书用户身份和 ByteCloud 共用一页）连同缺失的 Meego 登录链接合成**一条**消息发给本人：先私聊，私聊发不出去时在当前群里发一张仅本人可见的卡片；agent 只收到不含链接的状态，同一链接 3 分钟内不重复发。
 - 平台地址来自 `~/.botmux/platform.json`（`botmux bind` 写入），源码不含任何部署专属域名。
@@ -121,6 +138,8 @@ botmux auth wait --request-id <返回的请求ID> --json
 ```
 
 授权链接（设备码、OAuth 授权页）只发给发起人本人：谁打开谁确认，身份就授给谁。所以在群聊（含话题群）里，`/login` 的授权链接、`botmux auth request` 生成的链接都由 botmux 私聊发给本轮发起人，群里只回一句「已私聊你授权链接」，`auth request` 的结果里也不含 `authUrl`（返回 `delivery: "dm"`）；私聊发不出去时提示对方先私聊机器人发 `/login`，链接不会出现在群里。群聊里命令被拒时，拒绝文案也不再附设备码链接，而是提示发 `/login`。只有和发起人的单聊会直接回复链接。
+
+显式申请的用户态权限名也会与当前机器人配置的 `extraScopesFile` 用户权限清单核对。清单只用于校验名称，实际授权取决于所选应用已发布的权限和用户的应用可用范围。
 
 bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不会自动重放业务命令；写入超时或部分成功时，应先确认结果，避免重复创建或发送。
 

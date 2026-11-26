@@ -429,7 +429,7 @@ describe('POST /api/current-execution', () => {
   });
 
   it.each([
-    'renewed', 'stale', 'malformed', 'unavailable', 'turn advanced', 'worker replaced', 'policy changed',
+    'renewed', 'stale', 'malformed', 'unavailable', 'turn advanced', 'worker replaced', 'policy changed', 'split-source policy changed',
     'binding changed', 'snapshot replaced', 'revoked', 'consent missing', 'CN uses default', 'CN has its own JWT', 'default does not claim CN',
   ] as const)('handles default ByteCloud renewal in the proven turn: %s', async scenario => {
     const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
@@ -453,7 +453,9 @@ describe('POST /api/current-execution', () => {
     }));
     const botConfig = {
       larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
-      triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }),
+      triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'],
+        credentialSource: scenario === 'split-source policy changed'
+          ? { 'lark-user': 'platform', bytecloud: 'platform' } : 'platform' }),
     } as any;
     vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: botConfig } as any);
     ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
@@ -555,8 +557,10 @@ describe('POST /api/current-execution', () => {
 
       if (scenario === 'turn advanced') ds.managedTurnOrigin.turnId = 'trigger-next';
       if (scenario === 'worker replaced') ds.workerGeneration++;
-      if (scenario === 'policy changed') {
-        botConfig.triggerUserAuth = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'local' });
+      if (scenario === 'policy changed' || scenario === 'split-source policy changed') {
+        botConfig.triggerUserAuth = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'],
+          credentialSource: scenario === 'split-source policy changed'
+            ? { 'lark-user': 'platform', bytecloud: 'local' } : 'local' });
       }
       if (scenario === 'binding changed') machineId = 'm-2';
       if (scenario === 'snapshot replaced') {

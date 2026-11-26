@@ -26,6 +26,7 @@ import type { CredentialGrantRequest, CredentialGrantResult } from '../src/platf
 import { GRANT_WAIT_CAP_MS } from '../src/platform/credential-grant-budget.js';
 import * as credentialRequestClient from '../src/platform/credential-request-client.js';
 import * as turnCliIdentity from '../src/core/turn-cli-identity.js';
+import type { TriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { t } from '../src/i18n/index.js';
 
 const CAP = 'ab'.repeat(32);
@@ -432,6 +433,40 @@ describe('agent authorization', () => {
     const response = await post();
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
+  });
+
+  it('rejects a Lark source change while creating the device grant', async () => {
+    const source = { 'lark-user': 'local', bytecloud: 'platform' };
+    vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret',
+      triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'], credentialSource: source },
+    } } as any);
+    vi.mocked(tokens.requestUserAuthorization).mockImplementation(async (...args) => {
+      expect(args[5]()).toBe(true);
+      source['lark-user'] = 'platform';
+      expect(args[5]()).toBe(false);
+      return { authUrl: AUTH_URL, scopes: [], expiresIn: 600, poll };
+    });
+    const response = await post();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'auth_request_expired' });
+  });
+
+  it('does not publish a ready local grant if Lark changes source during the poll', async () => {
+    const source = { 'lark-user': 'local', bytecloud: 'platform' };
+    vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret',
+      triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'], credentialSource: source },
+    } } as any);
+    const { requestId } = await (await post()).json();
+    poll.mockImplementation(async () => {
+      source['lark-user'] = 'platform';
+      return { status: 'ready', token: 'obsolete-bot-app-token' };
+    });
+    const response = await post('auth-status', { requestId });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'auth_request_expired' });
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
 
   it('reports a failed grant without refreshing credentials', async () => {
@@ -1009,8 +1044,77 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
       expect(replies).toHaveLength(1);
     });
 
+    it('starts local ByteCloud login when only Feishu uses the platform', async () => {
+      vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+        larkAppId: 'cli_test', larkAppSecret: 'test-secret',
+        triggerUserAuth: {
+          enabled: true, tools: ['bytedcli', 'lark-cli'], capabilities: ['bytecloud', 'lark-user'],
+          credentialSource: { 'lark-user': 'platform', bytecloud: 'local' },
+        },
+      } } as any);
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      const body = await (await ask({ provider: 'bytedcli' })).json();
+      expect(body).toMatchObject({ ok: true, status: 'delivered', delivery: 'dm' });
+      expect(JSON.stringify(body)).not.toContain(DEVICE);
+      expect(platformRequest).not.toHaveBeenCalled();
+      expect(device).toHaveBeenCalledWith('ou_sender');
+      expect(dm.mock.calls[0]?.[2]).toContain(DEVICE);
+    });
+
+    it('requests only a ByteCloud card when Feishu uses local credentials', async () => {
+      vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+        larkAppId: 'cli_test', larkAppSecret: 'test-secret',
+        triggerUserAuth: {
+          enabled: true, tools: ['bytedcli', 'lark-cli'], capabilities: ['bytecloud', 'lark-user'],
+          credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+        },
+      } } as any);
+      expect(await (await ask({ provider: 'bytedcli' })).json()).toMatchObject({ ok: true, delivery: 'platform_dm' });
+      expect(platformRequest).toHaveBeenCalledExactlyOnceWith({ unionId: 'on_sender', appId: 'cli_test', tools: ['bytedcli'] });
+      expectNoDeviceLogin();
+    });
+
+    it.each([
+      { name: 'ByteCloud switches to platform', lark: 'platform', bytecloud: 'platform', refused: true },
+      { name: 'only Feishu switches to local', lark: 'local', bytecloud: 'local', refused: false },
+    ] as const)('rechecks the local ByteCloud route after status awaits when $name', async ({ lark, bytecloud, refused }) => {
+      const policy: TriggerUserAuthConfig = {
+        enabled: true, tools: ['lark-cli', 'bytedcli'], capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'platform', bytecloud: 'local' },
+      };
+      vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+        larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: policy,
+      } } as any);
+      vi.spyOn(bytedcliAuth, 'pendingBytedcliChallenge').mockReturnValue(null);
+      let finishStatus!: () => void;
+      const statusReading = new Promise<void>(observed => {
+        vi.mocked(bytedcliAuth.describeBytedcliAuth).mockImplementationOnce(() => new Promise(resolve => {
+          finishStatus = () => resolve({ state: 'needs-login' });
+          observed();
+        }));
+      });
+      const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+      const pending = ask({ provider: 'bytedcli' });
+      await statusReading;
+      policy.credentialSource = { 'lark-user': lark, bytecloud };
+      finishStatus();
+      const response = await pending;
+      expect(platformRequest).not.toHaveBeenCalled();
+      if (refused) {
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({ ok: false, status: 'refused', error: 'auth_policy_changed' });
+        expect(device).not.toHaveBeenCalled();
+        expect(dm).not.toHaveBeenCalled();
+      } else {
+        expect(await response.json()).toMatchObject({ ok: true, status: 'delivered', delivery: 'dm' });
+        expect(device).toHaveBeenCalledExactlyOnceWith('ou_sender');
+        expect(dm.mock.calls[0]?.[2]).toContain(DEVICE);
+      }
+    });
+
     it('auto: a login asked for by someone this turn already acts as is answered ready, and the platform is not asked', async () => {
       botWith();
+      vi.spyOn(workerPool, 'identityStorageModelForDaemonSession').mockReturnValue('proven');
       vi.spyOn(cliIdentity, 'recallProvenIdentityContent').mockReturnValue("BOTMUX_IDENTITY_MODE='user'\n");
       const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
       const body = await (await ask({ provider: 'bytedcli' })).json();
@@ -1264,6 +1368,7 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
 
     it.each([undefined, 'platform'])('credentialSource %s: an old platform that will not issue for the person is final: refused, no device login, no request', async source => {
       botWith(source);
+      vi.spyOn(workerPool, 'identityStorageModelForDaemonSession').mockReturnValue('proven');
       publish('platform_not_teammate');
       const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
       const response = await ask({ provider: 'bytedcli' });

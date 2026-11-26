@@ -303,7 +303,7 @@ async function publishToolIdentity(
         }, storageModel);
       } catch { clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, storageModel); }
       if (!delegated && senderOpenId && turnId && storageModel === 'proven'
-        && policy.capabilities.has('bytecloud') && localCredentialSourceAllowed(policy)) {
+        && policy.capabilities.has('bytecloud') && localCredentialSourceAllowed(policy, tool)) {
         rememberTransientRefusal({
           source: 'local', botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId,
           validateBeforeWrite: args.validateBeforeWrite, kind: 'unavailable',
@@ -350,7 +350,7 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
   // contact lookup that need not be reachable. On a bound host a non-grant is
   // final and local stores are never read; an unbound `auto` host still
   // honours an already-provisioned local HOME below.
-  const source = policy.credentialSource;
+  const source = policy.credentialSources[capabilityOfTool(tool)];
   if (source !== 'local') {
     const platform = await resolvePlatformIdentity({
       botConfig: args.botConfig, tool, unionId: user.unionId,
@@ -507,7 +507,7 @@ async function gatherCredentials(
   sessionId: string,
   turnId?: string,
 ) {
-  const source = policy.credentialSource;
+  const source = policy.credentialSources[capabilityOfTool(tool)];
   const platform = source !== 'local'
     ? await resolvePlatformIdentity({ botConfig, tool, openId, sessionId, ...(turnId ? { turnId } : {}) })
     : undefined;
@@ -604,7 +604,7 @@ function platformPublicationStillAllowed(entry: PlatformBytedcliPublication, arg
     || !publicationValid(entry.validateBeforeWrite) || !args.executionStillCurrent()) return false;
   const policy = args.currentPolicy();
   const effective = policyFromConfig(policy);
-  return effective.capabilities.has('bytecloud') && effective.credentialSource !== 'local'
+  return effective.capabilities.has('bytecloud') && effective.credentialSources.bytecloud !== 'local'
     && allowsPersonalIdentityForTurn(turnId, policy);
 }
 
@@ -833,9 +833,9 @@ type RetryableRefusalKind = 'unavailable' | 'not_authorized';
  *  membership, unattended, and delegation denials are deliberately excluded. */
 const LOCAL_ADOPTABLE_BYTEDCLI_REASONS = ['not_authorized', 'provider_unavailable'] as const;
 
-function localCredentialSourceAllowed(policy: IdentityPolicy): boolean {
-  return policy.credentialSource === 'local'
-    || (policy.credentialSource === 'auto' && !platformAuthorizeUrl());
+function localCredentialSourceAllowed(policy: IdentityPolicy, tool: TriggerUserAuthTool): boolean {
+  const source = policy.credentialSources[capabilityOfTool(tool)];
+  return source === 'local' || (source === 'auto' && !platformAuthorizeUrl());
 }
 
 function stampedOpenIdOf(body: string | undefined): string | undefined {
@@ -1006,10 +1006,11 @@ function policyStillWants(
     policy = (fallbackConfig ?? entry.botConfig).triggerUserAuth;
   }
   const current = policyFromConfig(policy);
-  if (!current.capabilities.has(capabilityOfTool(entry.tool))) return undefined;
+  const capability = capabilityOfTool(entry.tool);
+  if (!current.capabilities.has(capability)) return undefined;
   return entry.source === 'local'
-    ? (localCredentialSourceAllowed(current) ? current : undefined)
-    : (current.credentialSource !== 'local' ? current : undefined);
+    ? (localCredentialSourceAllowed(current, entry.tool) ? current : undefined)
+    : (current.credentialSources[capability] !== 'local' ? current : undefined);
 }
 
 function localBytedcliPolicy(
@@ -1023,7 +1024,7 @@ function localBytedcliPolicy(
     policy = fallbackConfig.triggerUserAuth;
   }
   const current = policyFromConfig(policy);
-  return current.capabilities.has('bytecloud') && localCredentialSourceAllowed(current) ? current : undefined;
+  return current.capabilities.has('bytecloud') && localCredentialSourceAllowed(current, 'bytedcli') ? current : undefined;
 }
 
 async function runLocalTransientRetry(
