@@ -12,11 +12,15 @@ import { DecisionBoardService, type DecisionBoardServiceDeps } from '../src/core
 import { composeStewardGuide, normalizeStewardConfig, parseBoardTurnId, stewardGuidePreset, type StewardConfig } from '../src/core/decision-board/model.js';
 import {
   evaluateHints,
+  formatHintNoticeCard,
   formatHintTurnId,
+  hintEventText,
+  HINT_NOTICE_MAX_ENTRIES,
   parseCloseWhenSpec,
   parseDependsOnSpec,
   parseHintTurnId,
   parseNextCheckSpec,
+  type HintNoticeEntry,
   type PrMergeState,
 } from '../src/core/decision-board/hints.js';
 import { createPrStateLookup, OPEN_RECHECK_MS } from '../src/core/decision-board/github-pr-state.js';
@@ -84,6 +88,62 @@ function hintEvents(seq: number) {
   return service.store().events(APP, seq).filter(e => e.kind === 'hint');
 }
 
+describe('提示公告卡片', () => {
+  const entry = (seq: number, extra: Partial<HintNoticeEntry> = {}): HintNoticeEntry => ({
+    seq,
+    title: `事项 ${seq}`,
+    hint: { kind: 'stale', reason: '过了复查时间还没有更新' },
+    link: `https://applink.feishu.cn/client/web_url/open?mode=sidebar-semi&item=${seq}`,
+    ...extra,
+  });
+  const parts = (json: string) => {
+    const card = JSON.parse(json);
+    return { card, content: card.body.elements[0].content as string, footer: card.body.elements[1].content as string };
+  };
+
+  it('蓝色紧凑卡片：事项标题是可点击文案，Markdown 特殊字符不会破坏链接', () => {
+    const link = 'https://applink.feishu.cn/client/web_url/open?mode=sidebar-semi&item=7';
+    const hint = { kind: 'close' as const, reason: 'PR o/r#1 已合入' };
+    const { card, content, footer } = parts(formatHintNoticeCard([
+      entry(7, { title: '处理 [支付] (新版) *灰度*', hint, link }),
+    ], 'zh')!);
+    expect(card).toMatchObject({ schema: '2.0', header: { template: 'blue', title: { tag: 'plain_text' } } });
+    expect(card.header.title.content).toContain('1');
+    expect(content).toBe(`[#7 处理 \\[支付\\] \\(新版\\) \\*灰度\\*](${link}) — ${hintEventText(hint, 'zh')}`);
+    expect(content).not.toContain(` ${link}`);
+    expect(footer).toMatch(/^<font color='grey'>.+<\/font>$/);
+  });
+
+  it('英文与无链接事项：保留双语原因，没有链接时退为普通标题文字', () => {
+    const hint = { kind: 'stale' as const, reason: 'past its next check time with no update' };
+    const { card, content, footer } = parts(formatHintNoticeCard([
+      entry(2, { title: 'Review [API]', link: undefined, hint }),
+    ], 'en')!);
+    expect(card.header.title.content).toContain('1');
+    expect(content).toBe(`#2 Review \\[API\\] — ${hintEventText(hint, 'en')}`);
+    expect(content).not.toContain('](');
+    expect(footer).toMatch(/^<font color='grey'>.+<\/font>$/);
+  });
+
+  it('超过 20 项只列前 20 项，并写明剩余数量', () => {
+    const { card, content } = parts(formatHintNoticeCard(Array.from({ length: 23 }, (_, i) => entry(i + 1)), 'zh')!);
+    const lines = content.split('\n');
+    expect(card.header.title.content).toContain('23');
+    expect(lines).toHaveLength(HINT_NOTICE_MAX_ENTRIES + 1);
+    expect(lines[0]).toContain('[#1 事项 1]');
+    expect(lines.at(-2)).toContain(`[#${HINT_NOTICE_MAX_ENTRIES} 事项 ${HINT_NOTICE_MAX_ENTRIES}]`);
+    expect(lines.at(-1)).toContain('3');
+    expect(content).not.toContain('#21 事项 21');
+  });
+
+  it('卡片超过尺寸预算时不截断内容，返回空让投递层走完整纯文本', () => {
+    const entries = Array.from({ length: HINT_NOTICE_MAX_ENTRIES }, (_, i) => entry(i + 1, {
+      hint: { kind: 'stale', reason: '长'.repeat(2_000) },
+    }));
+    expect(formatHintNoticeCard(entries, 'zh')).toBeUndefined();
+  });
+});
+
 describe('巡检提示', () => {
   it('挂了 PR、没写条件：PR 合入后标「建议关闭」、记一条系统历史，状态不变；只通知一次', async () => {
     const seq = await add('修登录', { links: ['pr=o/r#142'] });
@@ -102,6 +162,13 @@ describe('巡检提示', () => {
     expect(delivered[0]!.prompt).toContain('#1 修登录 — 建议关闭：PR o/r#142 已合入');
     expect(delivered[0]!.prompt).toContain('--dismiss-hint');
     expect(delivered[0]!.announcement.texts.join('')).toContain('【决策看板 · 提示】');
+    const promptLine = delivered[0]!.prompt.split('\n').find(line => line.startsWith('#1 修登录'))!;
+    const rawLink = promptLine.split(' ').at(-1)!;
+    expect(rawLink).toMatch(/^https:\/\/applink\.feishu\.cn\//);
+    expect(promptLine).toBe(`#1 修登录 — 建议关闭：PR o/r#142 已合入 ${rawLink}`);
+    const card = JSON.parse(delivered[0]!.announcement.card!);
+    expect(card.header.title.content).toContain('1');
+    expect(card.body.elements[0].content).toBe(`[#1 修登录](${rawLink}) — ${hintEventText({ kind: 'close', reason: 'PR o/r#142 已合入' }, 'zh')}`);
     expect(delivered[0]!.chatId).toBe('oc_steward');
     // 系统提示不冒充 owner：无身份投递。
     expect(delivered[0]).not.toHaveProperty('ownerOpenId');

@@ -5816,8 +5816,9 @@ export interface OwnerBatchTurnInput {
   /**
    * 管家群里的回显（等同 owner 发了一条消息）：texts[0] 是横幅加逐项内容，也是话题群 /
    * new-topic 模式下的落点和 shared 模式的回复根；超长时其余段落与附图按顺序跟在后面。
+   * card 是 texts[0] 的紧凑卡片版，发送失败时用同一个去重键回退纯文本。
    */
-  announcement: { texts: string[]; images: LarkAttachment[] };
+  announcement: { texts: string[]; images: LarkAttachment[]; card?: string };
   attachments: LarkAttachment[];
   /** 提交人 = 管家 bot 的 owner（本 app 视角的 open_id）。拿不到就按无身份投递。 */
   ownerOpenId?: string;
@@ -5879,10 +5880,26 @@ export async function deliverOwnerBatchTurn(
     bannerAttempted = true;
     // 没有横幅正文（群秘书静默回合）：不发任何东西，落点回落 chat 锚点。
     if (!firstText) return undefined;
-    try {
-      bannerId = await sendMessage(larkAppId, chatId, firstText);
-    } catch (err: any) {
-      logger.warn(`[decision-board] Failed to post batch banner in ${chatId} (${err.message})`);
+    const postTextBanner = async (uuid?: string): Promise<void> => {
+      try {
+        // 无卡片的老调用保持原参数形状；卡片降级复用同一个 uuid，避免响应丢失时重复发横幅。
+        bannerId = uuid
+          ? await sendMessage(larkAppId, chatId, firstText, 'text', uuid)
+          : await sendMessage(larkAppId, chatId, firstText);
+      } catch (err: any) {
+        logger.warn(`[decision-board] Failed to post batch banner in ${chatId} (${err.message})`);
+      }
+    };
+    if (input.announcement.card) {
+      const uuid = randomUUID();
+      try {
+        bannerId = await sendMessage(larkAppId, chatId, input.announcement.card, 'interactive', uuid);
+      } catch (err: any) {
+        logger.warn(`[decision-board] Failed to post batch card in ${chatId} (${err.message}); falling back to text`);
+        await postTextBanner(uuid);
+      }
+    } else {
+      await postTextBanner();
     }
     // 其余段落与附图紧跟着发：话题群 / new-topic / shared 模式挂在横幅那条下面（不然每条都会
     // 各开一个话题），其余模式按顺序发在群里。单条失败只记日志，不挡批次投递。
