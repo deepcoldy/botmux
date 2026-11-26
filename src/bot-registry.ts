@@ -2159,6 +2159,12 @@ export interface BotConfig {
    *  用户自己的文件保留）。缺省 = effectiveDefaultWorkingDir。 */
   assistantTemplateDir?: string;
   /**
+   * 助理模式下是否允许多人群（默认关）。关着时只在真人只有 1 个的群里工作（bot 不计）；
+   * 真人 ≥2 的群消息一律不处理，被真人 @ 时回一句「助理模式不支持多人群」（同群 10 分钟最多一次）。
+   * 只在 assistantMode 开着时有意义。
+   */
+  assistantGroupChat?: boolean;
+  /**
    * 是否接受**其他 bot** 通过 `botmux send --slash` 发来的原生斜杠命令
    * （/clear、/model、/close…）。默认开（undefined = 开）；只有显式 false 才关。
    *
@@ -4773,6 +4779,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       assistantTemplateDir: typeof entry.assistantTemplateDir === 'string' && entry.assistantTemplateDir.trim()
         ? entry.assistantTemplateDir.trim()
         : undefined,
+      assistantGroupChat: entry.assistantGroupChat === true || undefined,
       messageQuota,
       grantDefaultDurationMs,
       quotaState,
