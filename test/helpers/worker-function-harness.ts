@@ -1,3 +1,4 @@
+import { PurgeContinuationLease } from '../../src/services/image-purge-recovery.js';
 import { captureTraexPromptCheckpoint, inspectTraexFailedPrompt, withTraexFailedPrompt } from '../../src/services/traex-prompt-checkpoint.js';
 import { traeSessionsRoot } from '../../src/services/traex-paths.js';
 /**
@@ -424,6 +425,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'rewindableErrorCode') return rewindableErrorCode;
     if (key === 'transcriptTurnFailedWithoutOutput') return transcriptTurnFailedWithoutOutput;
     if (key === 'pruneRewindBackupsBeside') return pruneRewindBackupsBeside;
+    if (key === 'PurgeContinuationLease') return PurgeContinuationLease;
     if (key === 'captureTraexPromptCheckpoint') return captureTraexPromptCheckpoint;
     if (key === 'inspectTraexFailedPrompt') return inspectTraexFailedPrompt;
     if (key === 'withTraexFailedPrompt') return withTraexFailedPrompt;
