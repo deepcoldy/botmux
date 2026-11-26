@@ -7,9 +7,10 @@ const mockedCreateSlashGroup = vi.fn();
 const mockedReplyMessage = vi.fn(async () => 'om_fallback');
 const mockedDeleteMessage = vi.fn(async () => true);
 const mockedIsValidBranchName = vi.fn(async (name: string) => !name.includes('..') && !name.includes(' '));
-// Live permission gate re-checked on every card interaction; default allow,
-// individual cases flip it to false to model revocation after the card opened.
-const mockedCanRunDaemonCommand = vi.fn(() => true);
+// Live command-entry gate (grant restriction + canRun) re-checked on every
+// card interaction; default allow, individual cases flip it to false to model
+// revocation / restrictGrantCommands after the card opened.
+const mockedHumanCanRun = vi.fn(() => true);
 
 vi.mock('../src/core/command-handler.js', () => ({
   configWriteFailureText: vi.fn((e: unknown) => String(e)),
@@ -47,9 +48,12 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 vi.mock('../src/im/lark/event-dispatcher.js', () => ({
-  canOperate: (...args: any[]) => mockedCanRunDaemonCommand(...args),
-  canTalk: (...args: any[]) => mockedCanRunDaemonCommand(...args),
-  canRunDaemonCommand: (...args: any[]) => mockedCanRunDaemonCommand(...args),
+  canOperate: vi.fn(() => true),
+  canTalk: vi.fn(() => true),
+  canRunDaemonCommand: vi.fn(() => true),
+  // The group-create branch authorizes through the full command-entry pair
+  // (grantCommandRestriction then canRunDaemonCommand), not the bare predicate.
+  humanCanRunDaemonCommand: (...args: any[]) => mockedHumanCanRun(...args),
 }));
 
 import {
@@ -58,10 +62,11 @@ import {
   buildGroupCreateCard,
   buildGroupCreatedCard,
   buildGroupErrorCard,
-  consumeGroupCreateForm,
+  claimGroupCreateForm,
   formatGroupCreateDirLabels,
   getGroupCreateForm,
   openGroupCreateForm,
+  releaseGroupCreateForm,
   resetGroupCreateForms,
   selectGroupCreateDir,
 } from '../src/core/group-create-card.js';
@@ -90,8 +95,8 @@ beforeEach(() => {
   mockedReplyMessage.mockClear();
   mockedDeleteMessage.mockClear();
   mockedIsValidBranchName.mockClear();
-  mockedCanRunDaemonCommand.mockClear();
-  mockedCanRunDaemonCommand.mockReturnValue(true);
+  mockedHumanCanRun.mockClear();
+  mockedHumanCanRun.mockReturnValue(true);
 });
 
 afterEach(() => {
@@ -111,6 +116,7 @@ describe('group-create-card form lifecycle & rendering', () => {
       rootId: 'om_root',
       sourceChatId: 'oc_source',
       sourceChatType: 'group',
+      sourceCommand: '/g',
     }, t0);
 
     expect(getGroupCreateForm(form.id, 'ou_other', t0)).toEqual({ ok: false, reason: 'not_owner' });
@@ -131,9 +137,33 @@ describe('group-create-card form lifecycle & rendering', () => {
       rootId: 'om_root',
       sourceChatId: 'oc_source',
       sourceChatType: 'group',
+      sourceCommand: '/g',
     }, t0);
-    consumeGroupCreateForm(form2);
+    // A claim removes the form once and only once (single group creation).
+    expect(claimGroupCreateForm(form2)).toBe(true);
+    expect(claimGroupCreateForm(form2)).toBe(false);
     expect(getGroupCreateForm(form2.id, 'ou_owner', t0)).toEqual({ ok: false, reason: 'expired' });
+
+    // releaseGroupCreateForm restores a claimed form while it is still live...
+    const form3 = openGroupCreateForm({
+      creatorAppId: 'app-1',
+      senderOpenId: 'ou_owner',
+      larkAppIdsForGroup: ['app-1'],
+      groupArgs: { name: '', body: '' },
+      appIdToName: {},
+      rootId: 'om_root',
+      sourceChatId: 'oc_source',
+      sourceChatType: 'group',
+      sourceCommand: '/g',
+    }, t0);
+    expect(claimGroupCreateForm(form3)).toBe(true);
+    releaseGroupCreateForm(form3, t0);
+    expect(getGroupCreateForm(form3.id, 'ou_owner', t0).ok).toBe(true);
+    // An expired form is never revived by release.
+    const expired = { ...form3, expiresAt: t0 - 1 };
+    claimGroupCreateForm(form3);
+    releaseGroupCreateForm(expired, t0);
+    expect(getGroupCreateForm(form3.id, 'ou_owner', t0)).toEqual({ ok: false, reason: 'expired' });
   });
 
   it('shortens dropdown directory labels to last 2 segments and disambiguates collisions', () => {
@@ -174,6 +204,7 @@ describe('group-create-card form lifecycle & rendering', () => {
       rootId: 'om_root',
       sourceChatId: 'oc_source',
       sourceChatType: 'group',
+      sourceCommand: '/g',
       selectedDir: '/work/a',
     });
 
@@ -219,6 +250,7 @@ describe('card-handler group_create callbacks', () => {
       rootId: 'om_root',
       sourceChatId: 'oc_source',
       sourceChatType: 'group',
+      sourceCommand: '/g',
     });
     const deps = makeDeps();
 
@@ -281,6 +313,7 @@ describe('card-handler group_create callbacks', () => {
       rootId: 'om_root',
       sourceChatId: 'oc_source',
       sourceChatType: 'group',
+      sourceCommand: '/g',
     });
     const deps = makeDeps();
 
@@ -317,6 +350,7 @@ describe('card-handler group_create callbacks', () => {
       rootId: 'om_root',
       sourceChatId: 'oc_source',
       sourceChatType: 'group',
+      sourceCommand: '/g',
     });
     const deps = makeDeps();
     vi.mocked(deps.sessionReply).mockRejectedValueOnce(new Error('card_failed'));
@@ -353,11 +387,15 @@ describe('card-handler group_create live permission gate and atomic single claim
       rootId: 'om_root',
       sourceChatId: 'oc_source',
       sourceChatType: 'group',
+      sourceCommand: '/g',
       selectedDir: repoDir,
     });
     const deps = makeDeps();
-    // Operator was removed from allowedUsers / added to blockedUsers after the card opened.
-    mockedCanRunDaemonCommand.mockReturnValue(false);
+    // Models the full command-entry gate returning false AFTER the card opened:
+    // either removed from allowedUsers / added to blockedUsers, or blocked by
+    // restrictGrantCommands (grantCommandRestriction) — humanCanRunDaemonCommand
+    // is the pair that covers both, so the card must refuse without re-deriving.
+    mockedHumanCanRun.mockReturnValue(false);
 
     const submit = await handleCardAction({
       operator: { open_id: 'ou_owner' },
@@ -370,6 +408,9 @@ describe('card-handler group_create live permission gate and atomic single claim
     expect(submit.toast.type).toBe('error');
     expect(submit.afterAck).toBeUndefined();
     expect(mockedCreateSlashGroup).not.toHaveBeenCalled();
+    // The gate is the full command-entry pair and is evaluated against the
+    // source chat with the exact command token stored on the form.
+    expect(mockedHumanCanRun).toHaveBeenCalledWith('app-1', 'oc_source', 'ou_owner', undefined, '/g', 'group');
     // The form is not consumed by a refused submit, so re-authorization allows resubmit.
     expect(getGroupCreateForm(form.id, 'ou_owner').ok).toBe(true);
 
@@ -380,6 +421,36 @@ describe('card-handler group_create live permission gate and atomic single claim
     }, deps, 'app-1');
     expect(pick.toast.type).toBe('error');
     expect(pick.afterAck).toBeUndefined();
+  });
+
+  it('P3-a: the permission check uses the stored command token, so a /g-only talk allowance is not rejected', async () => {
+    const repoDir = makeDir('g-only-repo');
+    const form = openGroupCreateForm({
+      creatorAppId: 'app-1',
+      senderOpenId: 'ou_owner',
+      larkAppIdsForGroup: ['app-1'],
+      groupArgs: { name: '', body: '' },
+      appIdToName: {},
+      rootId: 'om_root',
+      sourceChatId: 'oc_source',
+      sourceChatType: 'group',
+      // Opened via the alias; a bot may allow only '/g' in canTalkDaemonCommands.
+      sourceCommand: '/g',
+      selectedDir: repoDir,
+    });
+    const deps = makeDeps();
+    mockedCreateSlashGroup.mockResolvedValueOnce({ ok: true, name: 'g', link: 'https://x/oc', hints: [] });
+
+    const submitted = await handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: GROUP_CREATE_SUBMIT_ACTION, form: form.id }, form_value: { group_name: 'G 群' } },
+      context: { open_message_id: 'om_form_card' },
+    }, deps, 'app-1');
+    expect(typeof submitted.afterAck).toBe('function');
+    // The alias token — not a hardcoded '/group' — reaches the permission gate.
+    expect(mockedHumanCanRun).toHaveBeenCalledWith('app-1', 'oc_source', 'ou_owner', undefined, '/g', 'group');
+    await submitted.afterAck!();
+    expect(mockedCreateSlashGroup).toHaveBeenCalledTimes(1);
   });
 
   it('P2-3: two concurrent branch submits (distinct events) produce one afterAck and one createSlashGroup', async () => {
@@ -393,6 +464,7 @@ describe('card-handler group_create live permission gate and atomic single claim
       rootId: 'om_root',
       sourceChatId: 'oc_source',
       sourceChatType: 'group',
+      sourceCommand: '/g',
       selectedDir: repoDir,
     });
     const deps = makeDeps();
@@ -439,6 +511,7 @@ describe('card-handler group_create live permission gate and atomic single claim
       rootId: 'om_root',
       sourceChatId: 'oc_source',
       sourceChatType: 'group',
+      sourceCommand: '/g',
       selectedDir: repoDir,
     });
     const deps = makeDeps();

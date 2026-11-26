@@ -42,6 +42,13 @@ export interface GroupCreateForm {
   /** Chat where `/g` was sent; the submit callback re-runs the live `/g` permission check against it. */
   sourceChatId: string;
   sourceChatType: 'p2p' | 'group';
+  /**
+   * The exact command token that opened the card (`/g` or `/group`). The
+   * callback's permission check must use it verbatim: a bot may allow only one
+   * spelling via `canTalkDaemonCommands`, and normalizing to the other would
+   * wrongly reject a legitimate talk-level user.
+   */
+  sourceCommand: string;
   selectedDir?: string;
   expiresAt: number;
 }
@@ -90,11 +97,6 @@ export function getGroupCreateForm(
 
 export function selectGroupCreateDir(form: GroupCreateForm, dir: string): void {
   forms.set(form.id, { ...form, selectedDir: dir });
-}
-
-/** Single use: a submitted form cannot create a second group. */
-export function consumeGroupCreateForm(form: GroupCreateForm): void {
-  forms.delete(form.id);
 }
 
 /**

@@ -6502,6 +6502,7 @@ export async function handleCommand(
             rootId,
             sourceChatId: message.chatId ?? '',
             sourceChatType: message.chatType === 'p2p' ? 'p2p' : 'group',
+            sourceCommand: cmd,
             larkAppIdsForGroup,
             groupArgs: { ...groupArgs, workingDir: prefillCheck.workingDir },
             appIdToName: Object.fromEntries(appIdToName),

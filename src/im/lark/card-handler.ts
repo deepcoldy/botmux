@@ -30,7 +30,7 @@ import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/work
 import { failedTurnRewindInFlight } from '../../core/failed-turn-rewind.js';
 import { messageMentionsBot } from './message-parser.js';
 import { validateModelPin } from '../../core/model-pin.js';
-import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
+import { canOperate, canTalk, canRunDaemonCommand, humanCanRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
 import { handleTmuxUpgradeCardAction, isTmuxUpgradeAction } from '../../core/tmux-upgrade.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, getChatModeStrict, getCachedChatModeStrict, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
@@ -2658,15 +2658,20 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return { toast: { type: 'error', content: t(`card.group_create.${opened.reason}`, undefined, loc) } };
     }
     const { form } = opened;
-    // Re-run the live `/g` permission gate on every interaction. The owner id
-    // stored when the card opened is historical: within the 30-min TTL the user
-    // may have lost allowedUsers / entered blockedUsers, and a forwarded card
-    // must not let them create groups, invite bots or worktrees anyway.
-    // Same predicate as the `/g` command entry (canOperate ∪ talk-level /g);
-    // card callbacks carry no union_id, so that leg stays fail-closed.
-    if (!canRunDaemonCommand(
-      larkAppId, form.sourceChatId, operatorOpenId,
-      undefined, '/group', undefined, form.sourceChatType,
+    // Re-run the live command-entry permission gate on every interaction. The
+    // owner id stored when the card opened is historical: within the 30-min
+    // TTL the user may have lost allowedUsers / entered blockedUsers / become
+    // restrictGrantCommands-blocked, and a forwarded card must not let them
+    // create groups, invite bots or worktrees anyway.
+    // humanCanRunDaemonCommand is the exact command-entry pair for a caller
+    // without a real inbound message: grantCommandRestriction (restrictGrantCommands
+    // on chat/global-grant users) FIRST, then canRunDaemonCommand. The command
+    // token is the one that opened the card (`/g` or `/group`) so a bot that
+    // allows only one spelling still authorizes correctly. Card callbacks carry
+    // no union_id, so that leg stays fail-closed; an empty open_id cannot pass.
+    if (!humanCanRunDaemonCommand(
+      larkAppId, form.sourceChatId, operatorOpenId ?? '',
+      undefined, form.sourceCommand, form.sourceChatType,
     )) {
       logger.info(`[group-create-card] blocked card action for unauthorized operator: ${operatorOpenId}`);
       return { toast: { type: 'error', content: t('card.group_create.need_auth', undefined, loc) } };
